@@ -1,0 +1,794 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Markets - Index</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-body: #0e0e0e;
+            --bg-nav: rgba(18,18,18,0.62);
+            --bg-sidebar: #111111;
+            --bg-main: #0e0e0e;
+            --bg-ticker: #111111;
+            --bg-subtab: #181818;
+            --bg-table-header: #131313;
+            --bg-row-hover: rgba(255,255,255,0.03);
+            --bg-search: #1a1a1a;
+            --bg-watchlist-item-hover: #1a1a1a;
+            --border-nav: #242424;
+            --border-subtle: #1c1c1c;
+            --border-sidebar: #1c1c1c;
+            --text-primary: #DADADA;
+            --text-secondary: #8E8E8E;
+            --text-dim: #5a5a5a;
+            --text-nav: #8E8E8E;
+            --text-nav-active: #DADADA;
+            --green: #21C55E;
+            --green-dim: rgba(33,197,94,0.12);
+            --red: #EF4444;
+            --red-dim: rgba(239,68,68,0.12);
+            --accent-green: #21C55E;
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            background: var(--bg-body);
+            color: var(--text-primary);
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            font-size: 14px;
+            line-height: 1.4;
+            overflow: hidden;
+            height: 100vh;
+        }
+
+        /* ===== MAIN NAV BAR (60px) ===== */
+        .main-nav {
+            height: 60px;
+            background: var(--bg-nav);
+            border-bottom: 0.5px solid var(--border-nav);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0 24px;
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            position: relative;
+            z-index: 100;
+        }
+
+        .nav-left {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .nav-logo {
+            font-size: 18px;
+            font-weight: 700;
+            color: var(--text-primary);
+            letter-spacing: -0.3px;
+        }
+
+        .nav-center {
+            display: flex;
+            align-items: center;
+            gap: 0;
+            position: absolute;
+            left: 50%;
+            transform: translateX(-50%);
+        }
+
+        .nav-center a {
+            color: var(--text-nav);
+            text-decoration: none;
+            font-size: 13px;
+            font-weight: 500;
+            padding: 8px 16px;
+            transition: color 0.15s;
+        }
+
+        .nav-center a:hover {
+            color: var(--text-nav-active);
+        }
+
+        .nav-right {
+            display: flex;
+            align-items: center;
+            gap: 20px;
+        }
+
+        .nav-right a {
+            color: var(--text-nav);
+            text-decoration: none;
+            font-size: 13px;
+            font-weight: 500;
+            transition: color 0.15s;
+        }
+
+        .nav-right a:hover {
+            color: var(--text-nav-active);
+        }
+
+        .nav-right a.active {
+            color: var(--accent-green);
+        }
+
+        .nav-market-status {
+            font-size: 12px;
+            color: var(--text-dim);
+            padding: 4px 10px;
+            border: 1px solid var(--border-nav);
+            border-radius: 4px;
+        }
+
+        .nav-profile {
+            width: 32px;
+            height: 32px;
+            border-radius: 50%;
+            background: #2a2a2a;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--text-secondary);
+            cursor: pointer;
+        }
+
+        /* ===== INDEX TICKER BAR (40px) ===== */
+        .ticker-bar {
+            height: 40px;
+            background: var(--bg-ticker);
+            border-bottom: 0.5px solid var(--border-nav);
+            display: flex;
+            align-items: center;
+            padding: 0 16px;
+            overflow-x: auto;
+            gap: 0;
+            white-space: nowrap;
+        }
+
+        .ticker-bar::-webkit-scrollbar { height: 0; }
+
+        .ticker-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 0 16px;
+            border-right: 1px solid var(--border-subtle);
+            flex-shrink: 0;
+        }
+
+        .ticker-item:last-child { border-right: none; }
+
+        .ticker-name {
+            font-size: 12px;
+            font-weight: 500;
+            color: var(--text-secondary);
+        }
+
+        .ticker-price {
+            font-size: 12px;
+            font-weight: 600;
+            color: var(--text-primary);
+        }
+
+        .ticker-change {
+            font-size: 11px;
+            font-weight: 500;
+        }
+
+        .ticker-change.up { color: var(--green); }
+        .ticker-change.down { color: var(--red); }
+
+        /* ===== LAYOUT: SIDEBAR + MAIN ===== */
+        .layout {
+            display: flex;
+            height: calc(100vh - 100px);
+        }
+
+        /* ===== SIDEBAR (348px) ===== */
+        .sidebar {
+            width: 348px;
+            min-width: 348px;
+            background: var(--bg-sidebar);
+            border-right: 1px solid var(--border-sidebar);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        .sidebar-search {
+            padding: 12px;
+        }
+
+        .sidebar-search input {
+            width: 100%;
+            background: var(--bg-search);
+            border: 1px solid var(--border-subtle);
+            border-radius: 6px;
+            padding: 8px 12px 8px 34px;
+            color: var(--text-primary);
+            font-size: 13px;
+            font-family: inherit;
+            outline: none;
+            transition: border-color 0.15s;
+        }
+
+        .sidebar-search input::placeholder {
+            color: var(--text-dim);
+        }
+
+        .sidebar-search input:focus {
+            border-color: #333;
+        }
+
+        .sidebar-search-wrap {
+            position: relative;
+        }
+
+        .sidebar-search-wrap .search-icon {
+            position: absolute;
+            left: 10px;
+            top: 50%;
+            transform: translateY(-50%);
+            color: var(--text-dim);
+            font-size: 14px;
+            pointer-events: none;
+        }
+
+        .sidebar-tabs {
+            display: flex;
+            border-bottom: 1px solid var(--border-subtle);
+            padding: 0 12px;
+        }
+
+        .sidebar-tab {
+            padding: 8px 12px;
+            font-size: 12px;
+            font-weight: 500;
+            color: var(--text-dim);
+            cursor: pointer;
+            border-bottom: 2px solid transparent;
+            transition: all 0.15s;
+        }
+
+        .sidebar-tab:hover { color: var(--text-secondary); }
+        .sidebar-tab.active { color: var(--text-primary); border-bottom-color: var(--accent-green); }
+
+        .watchlist {
+            flex: 1;
+            overflow-y: auto;
+            padding: 4px 0;
+        }
+
+        .watchlist::-webkit-scrollbar { width: 4px; }
+        .watchlist::-webkit-scrollbar-track { background: transparent; }
+        .watchlist::-webkit-scrollbar-thumb { background: #2a2a2a; border-radius: 2px; }
+
+        .watchlist-item {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 10px 16px;
+            cursor: pointer;
+            transition: background 0.1s;
+        }
+
+        .watchlist-item:hover { background: var(--bg-watchlist-item-hover); }
+
+        .wl-left {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+        }
+
+        .wl-symbol {
+            font-size: 13px;
+            font-weight: 500;
+            color: var(--text-primary);
+        }
+
+        .wl-exchange {
+            font-size: 11px;
+            color: var(--text-dim);
+        }
+
+        .wl-right {
+            display: flex;
+            flex-direction: column;
+            align-items: flex-end;
+            gap: 2px;
+        }
+
+        .wl-price {
+            font-size: 13px;
+            font-weight: 600;
+        }
+
+        .wl-change {
+            font-size: 11px;
+            font-weight: 500;
+        }
+
+        .sidebar-footer {
+            padding: 12px 16px;
+            border-top: 1px solid var(--border-subtle);
+            font-size: 11px;
+            color: var(--text-dim);
+            text-align: center;
+        }
+
+        /* ===== MAIN CONTENT ===== */
+        .main-content {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        /* Sub-tabs bar */
+        .sub-tabs {
+            height: 40px;
+            background: var(--bg-subtab);
+            display: flex;
+            align-items: center;
+            padding: 0 20px;
+            gap: 0;
+            border-bottom: 1px solid var(--border-subtle);
+        }
+
+        .sub-tab {
+            padding: 10px 20px;
+            font-size: 13px;
+            font-weight: 500;
+            color: var(--text-secondary);
+            cursor: pointer;
+            border-bottom: 2px solid transparent;
+            transition: all 0.15s;
+            text-decoration: none;
+        }
+
+        .sub-tab:hover { color: var(--text-primary); }
+
+        .sub-tab.active {
+            color: var(--accent-green);
+            border-bottom-color: var(--accent-green);
+        }
+
+        /* Filter tabs */
+        .filter-tabs {
+            display: flex;
+            align-items: center;
+            padding: 8px 20px;
+            gap: 4px;
+            border-bottom: 1px solid var(--border-subtle);
+        }
+
+        .filter-tab {
+            padding: 5px 16px;
+            font-size: 12px;
+            font-weight: 500;
+            color: var(--text-secondary);
+            cursor: pointer;
+            border-radius: 4px;
+            transition: all 0.15s;
+        }
+
+        .filter-tab:hover { color: var(--text-primary); background: rgba(255,255,255,0.04); }
+
+        .filter-tab.active {
+            color: var(--text-primary);
+            background: rgba(255,255,255,0.08);
+        }
+
+        /* Table area */
+        .table-area {
+            flex: 1;
+            overflow-y: auto;
+            padding: 0;
+        }
+
+        .table-area::-webkit-scrollbar { width: 6px; }
+        .table-area::-webkit-scrollbar-track { background: transparent; }
+        .table-area::-webkit-scrollbar-thumb { background: #2a2a2a; border-radius: 3px; }
+
+        .index-table {
+            width: 100%;
+            border-collapse: collapse;
+            table-layout: auto;
+        }
+
+        .index-table thead { position: sticky; top: 0; z-index: 10; }
+
+        .index-table th {
+            height: 42px;
+            background: var(--bg-table-header);
+            padding: 0 16px;
+            text-align: right;
+            font-size: 12px;
+            font-weight: 300;
+            color: var(--text-dim);
+            text-transform: uppercase;
+            letter-spacing: 0.3px;
+            border-bottom: 1px solid var(--border-subtle);
+            white-space: nowrap;
+        }
+
+        .index-table th:first-child {
+            text-align: left;
+            padding-left: 20px;
+        }
+
+        .index-table td {
+            padding: 12px 16px;
+            text-align: right;
+            font-size: 14px;
+            color: var(--text-secondary);
+            border-bottom: 1px solid var(--border-subtle);
+            white-space: nowrap;
+        }
+
+        .index-table td:first-child {
+            text-align: left;
+            padding-left: 20px;
+            color: var(--text-primary);
+            font-weight: 500;
+        }
+
+        .index-table tbody tr {
+            transition: background 0.1s;
+        }
+
+        .index-table tbody tr:hover {
+            background: var(--bg-row-hover);
+        }
+
+        /* Color classes */
+        .text-green { color: var(--green); }
+        .text-red { color: var(--red); }
+
+        .loading-msg {
+            text-align: center;
+            padding: 48px 20px;
+            color: var(--text-dim);
+            font-size: 13px;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- ===== MAIN NAV BAR ===== -->
+    <nav class="main-nav">
+        <div class="nav-left">
+            <span class="nav-logo">dhan</span>
+        </div>
+        <div class="nav-center">
+            <a href="#">Home</a>
+            <a href="#">Portfolio</a>
+            <a href="#">Positions</a>
+            <a href="#">Orders</a>
+            <a href="#">Money</a>
+        </div>
+        <div class="nav-right">
+            <a href="#" class="active">Markets</a>
+            <a href="#">Rent Stocks</a>
+            <a href="#">News</a>
+            <a href="#">IPOs</a>
+            <span class="nav-market-status" id="navMarketStatus">Markets Closed</span>
+            <div class="nav-profile">P</div>
+        </div>
+    </nav>
+
+    <!-- ===== INDEX TICKER BAR ===== -->
+    <div class="ticker-bar" id="tickerBar">
+        <div class="ticker-item">
+            <span class="ticker-name">Loading...</span>
+        </div>
+    </div>
+
+    <!-- ===== LAYOUT: SIDEBAR + MAIN ===== -->
+    <div class="layout">
+
+        <!-- ===== SIDEBAR ===== -->
+        <div class="sidebar">
+            <div class="sidebar-search">
+                <div class="sidebar-search-wrap">
+                    <span class="search-icon">&#x1F50D;</span>
+                    <input type="text" placeholder="Search eg: Infy, Nifty Fut" id="sidebarSearch">
+                </div>
+            </div>
+            <div class="sidebar-tabs">
+                <div class="sidebar-tab active" data-wltab="watchlist1">Watchlist 1</div>
+                <div class="sidebar-tab" data-wltab="watchlist2">Watchlist 2</div>
+                <div class="sidebar-tab" data-wltab="watchlist3">Watchlist 3</div>
+            </div>
+            <div class="watchlist" id="watchlist">
+                <!-- Populated by JS -->
+            </div>
+            <div class="sidebar-footer">
+                <a href="/portal" style="color:var(--accent-green);text-decoration:none;font-size:11px;">Back to DLT Portal</a>
+            </div>
+        </div>
+
+        <!-- ===== MAIN CONTENT ===== -->
+        <div class="main-content">
+            <!-- Sub-tabs -->
+            <div class="sub-tabs">
+                <a class="sub-tab" href="#">Live</a>
+                <a class="sub-tab" href="/portal/markets/options">Options</a>
+                <a class="sub-tab" href="/portal/markets/stocks">Stocks</a>
+                <a class="sub-tab" href="#">Commodity</a>
+                <a class="sub-tab" href="#">Currency</a>
+                <a class="sub-tab active" href="#">Index</a>
+            </div>
+
+            <!-- Filter tabs -->
+            <div class="filter-tabs">
+                <div class="filter-tab active" data-filter="global" onclick="switchFilter('global')">Global</div>
+                <div class="filter-tab" data-filter="nse" onclick="switchFilter('nse')">NSE</div>
+                <div class="filter-tab" data-filter="bse" onclick="switchFilter('bse')">BSE</div>
+            </div>
+
+            <!-- Table -->
+            <div class="table-area">
+                <table class="index-table">
+                    <thead>
+                        <tr>
+                            <th>Name</th>
+                            <th>LTP</th>
+                            <th>Chg (%)</th>
+                            <th>Open</th>
+                            <th>High</th>
+                            <th>Low</th>
+                            <th>Prev. Close</th>
+                        </tr>
+                    </thead>
+                    <tbody id="indexBody">
+                        <tr><td colspan="7" class="loading-msg">Loading index data...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+<script>
+/* ===== STATE ===== */
+var currentFilter = 'global';
+var refreshTimer = null;
+
+/* ===== HARDCODED FALLBACK DATA ===== */
+var fallbackData = {
+    global: [
+        { name: 'Dow Jones Industrial', ltp: 42876.50, change: 312.45, change_pct: 0.73, open: 42564.05, high: 42912.80, low: 42498.20, prev_close: 42564.05 },
+        { name: 'S&P 500', ltp: 5834.25, change: 47.80, change_pct: 0.83, open: 5786.45, high: 5842.60, low: 5778.30, prev_close: 5786.45 },
+        { name: 'NASDAQ Composite', ltp: 18456.90, change: 189.35, change_pct: 1.04, open: 18267.55, high: 18478.20, low: 18234.80, prev_close: 18267.55 },
+        { name: 'FTSE 100', ltp: 8234.15, change: -42.30, change_pct: -0.51, open: 8276.45, high: 8289.60, low: 8218.90, prev_close: 8276.45 },
+        { name: 'Nikkei 225', ltp: 38912.45, change: 567.80, change_pct: 1.48, open: 38344.65, high: 38978.30, low: 38298.40, prev_close: 38344.65 },
+        { name: 'Hang Seng', ltp: 17634.80, change: 234.50, change_pct: 1.35, open: 17400.30, high: 17689.20, low: 17378.50, prev_close: 17400.30 },
+        { name: 'Shanghai Composite', ltp: 3089.45, change: 12.35, change_pct: 0.40, open: 3077.10, high: 3095.80, low: 3068.90, prev_close: 3077.10 },
+        { name: 'DAX', ltp: 18456.70, change: 123.40, change_pct: 0.67, open: 18333.30, high: 18489.50, low: 18312.60, prev_close: 18333.30 },
+        { name: 'CAC 40', ltp: 8012.35, change: -28.90, change_pct: -0.36, open: 8041.25, high: 8056.80, low: 7998.40, prev_close: 8041.25 },
+        { name: 'Gift Nifty', ltp: 23189.00, change: -76.50, change_pct: -0.33, open: 23265.50, high: 23245.00, low: 23156.00, prev_close: 23265.50 }
+    ],
+    nse: [
+        { name: 'Nifty 50', ltp: 23123.65, change: 155.40, change_pct: 0.68, open: 22968.25, high: 23156.80, low: 22934.50, prev_close: 22968.25 },
+        { name: 'Nifty Bank', ltp: 52716.25, change: 107.15, change_pct: 0.20, open: 52609.10, high: 52834.70, low: 52578.30, prev_close: 52609.10 },
+        { name: 'Nifty IT', ltp: 36892.40, change: 412.80, change_pct: 1.13, open: 36479.60, high: 36945.20, low: 36434.80, prev_close: 36479.60 },
+        { name: 'Nifty Fin Service', ltp: 24685.55, change: 82.45, change_pct: 0.34, open: 24603.10, high: 24712.30, low: 24567.80, prev_close: 24603.10 },
+        { name: 'Nifty Midcap 50', ltp: 15234.80, change: 78.65, change_pct: 0.52, open: 15156.15, high: 15267.40, low: 15134.20, prev_close: 15156.15 },
+        { name: 'Nifty Auto', ltp: 24156.30, change: -89.70, change_pct: -0.37, open: 24246.00, high: 24312.50, low: 24098.60, prev_close: 24246.00 },
+        { name: 'Nifty Pharma', ltp: 19834.25, change: 156.80, change_pct: 0.80, open: 19677.45, high: 19867.30, low: 19645.20, prev_close: 19677.45 },
+        { name: 'Nifty Metal', ltp: 8456.70, change: 112.35, change_pct: 1.35, open: 8344.35, high: 8478.90, low: 8312.60, prev_close: 8344.35 },
+        { name: 'India VIX', ltp: 24.70, change: -0.77, change_pct: -3.02, open: 25.47, high: 25.89, low: 24.45, prev_close: 25.47 },
+        { name: 'Nifty Realty', ltp: 934.25, change: 18.45, change_pct: 2.01, open: 915.80, high: 938.60, low: 912.30, prev_close: 915.80 }
+    ],
+    bse: [
+        { name: 'Sensex', ltp: 76234.80, change: 498.65, change_pct: 0.66, open: 75736.15, high: 76312.40, low: 75678.90, prev_close: 75736.15 },
+        { name: 'BSE 500', ltp: 34567.90, change: 234.50, change_pct: 0.68, open: 34333.40, high: 34612.80, low: 34298.60, prev_close: 34333.40 },
+        { name: 'BSE Midcap', ltp: 42189.35, change: 312.80, change_pct: 0.75, open: 41876.55, high: 42234.70, low: 41834.20, prev_close: 41876.55 },
+        { name: 'BSE Smallcap', ltp: 48934.60, change: 189.45, change_pct: 0.39, open: 48745.15, high: 48978.30, low: 48698.40, prev_close: 48745.15 },
+        { name: 'BANKEX', ltp: 58456.25, change: 234.80, change_pct: 0.40, open: 58221.45, high: 58534.70, low: 58178.30, prev_close: 58221.45 }
+    ]
+};
+
+/* Hardcoded watchlist items */
+var watchlistItems = [
+    { symbol: 'NIFTY 50', exchange: 'NSE', price: 23123.65, change: 155.40, change_pct: 0.68 },
+    { symbol: 'BANKNIFTY', exchange: 'NSE', price: 52716.25, change: 107.15, change_pct: 0.20 },
+    { symbol: 'RELIANCE', exchange: 'NSE', price: 2834.50, change: 22.35, change_pct: 0.79 },
+    { symbol: 'TCS', exchange: 'NSE', price: 3456.20, change: -18.60, change_pct: -0.54 },
+    { symbol: 'HDFCBANK', exchange: 'NSE', price: 1645.80, change: 12.45, change_pct: 0.76 },
+    { symbol: 'INFY', exchange: 'NSE', price: 1534.90, change: 28.70, change_pct: 1.90 },
+    { symbol: 'ICICIBANK', exchange: 'NSE', price: 1123.40, change: -5.20, change_pct: -0.46 },
+    { symbol: 'SBIN', exchange: 'NSE', price: 789.25, change: 8.35, change_pct: 1.07 },
+    { symbol: 'BHARTIARTL', exchange: 'NSE', price: 1567.80, change: 34.50, change_pct: 2.25 },
+    { symbol: 'ITC', exchange: 'NSE', price: 456.30, change: -2.15, change_pct: -0.47 },
+    { symbol: 'KOTAKBANK', exchange: 'NSE', price: 1834.60, change: 15.20, change_pct: 0.84 },
+    { symbol: 'LT', exchange: 'NSE', price: 3245.70, change: -28.40, change_pct: -0.87 }
+];
+
+/* Major ticker indices for the ticker bar */
+var tickerIndices = [
+    { name: 'NIFTY 50', ltp: 23123.65, change: 155.40, change_pct: 0.68 },
+    { name: 'SENSEX', ltp: 76234.80, change: 498.65, change_pct: 0.66 },
+    { name: 'NIFTY BANK', ltp: 52716.25, change: 107.15, change_pct: 0.20 },
+    { name: 'NIFTY IT', ltp: 36892.40, change: 412.80, change_pct: 1.13 },
+    { name: 'NIFTY FIN', ltp: 24685.55, change: 82.45, change_pct: 0.34 },
+    { name: 'INDIA VIX', ltp: 24.70, change: -0.77, change_pct: -3.02 }
+];
+
+/* ===== XSS PREVENTION ===== */
+function esc(s) {
+    if (s == null) return '';
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+/* ===== NUMBER FORMATTING (Indian system) ===== */
+function fmtNum(v, d) {
+    if (v == null || !isFinite(v)) return '--';
+    d = (d !== undefined) ? d : 2;
+    return Number(v).toLocaleString('en-IN', { minimumFractionDigits: d, maximumFractionDigits: d });
+}
+
+function fmtSign(v, d) {
+    if (v == null || !isFinite(v)) return '--';
+    d = (d !== undefined) ? d : 2;
+    var prefix = v > 0 ? '+' : '';
+    return prefix + Number(v).toLocaleString('en-IN', { minimumFractionDigits: d, maximumFractionDigits: d });
+}
+
+/* ===== RENDER TICKER BAR ===== */
+function renderTickerBar(indices) {
+    var bar = document.getElementById('tickerBar');
+    var html = '';
+    indices.forEach(function(idx) {
+        var isUp = idx.change >= 0;
+        var cls = isUp ? 'up' : 'down';
+        var arrow = isUp ? '&#9650;' : '&#9660;';
+        html += '<div class="ticker-item">';
+        html += '<span class="ticker-name">' + esc(idx.name) + '</span>';
+        html += '<span class="ticker-price">' + fmtNum(idx.ltp) + '</span>';
+        html += '<span class="ticker-change ' + cls + '">' + arrow + ' ' + fmtSign(idx.change) + ' (' + fmtSign(idx.change_pct) + '%)</span>';
+        html += '</div>';
+    });
+    bar.innerHTML = html || '<div class="ticker-item"><span class="ticker-name">No data</span></div>';
+}
+
+/* ===== RENDER WATCHLIST ===== */
+function renderWatchlist() {
+    var wl = document.getElementById('watchlist');
+    var html = '';
+    watchlistItems.forEach(function(item) {
+        var isUp = item.change >= 0;
+        var priceColor = isUp ? 'text-green' : 'text-red';
+        html += '<div class="watchlist-item">';
+        html += '<div class="wl-left">';
+        html += '<span class="wl-symbol">' + esc(item.symbol) + '</span>';
+        html += '<span class="wl-exchange">' + esc(item.exchange) + '</span>';
+        html += '</div>';
+        html += '<div class="wl-right">';
+        html += '<span class="wl-price ' + priceColor + '">' + fmtNum(item.price) + '</span>';
+        html += '<span class="wl-change ' + priceColor + '">' + fmtSign(item.change) + ' (' + fmtSign(item.change_pct) + '%)</span>';
+        html += '</div>';
+        html += '</div>';
+    });
+    wl.innerHTML = html;
+}
+
+/* ===== RENDER INDEX TABLE ===== */
+function renderIndexTable(data) {
+    var body = document.getElementById('indexBody');
+    if (!data || data.length === 0) {
+        body.innerHTML = '<tr><td colspan="7" class="loading-msg">No index data available</td></tr>';
+        return;
+    }
+    var html = '';
+    data.forEach(function(idx) {
+        var isUp = idx.change >= 0;
+        var chgColor = isUp ? 'text-green' : 'text-red';
+        var chgText = fmtSign(idx.change) + ' (' + fmtSign(idx.change_pct) + '%)';
+
+        html += '<tr>';
+        html += '<td>' + esc(idx.name) + '</td>';
+        html += '<td>' + fmtNum(idx.ltp) + '</td>';
+        html += '<td class="' + chgColor + '">' + chgText + '</td>';
+        html += '<td>' + fmtNum(idx.open) + '</td>';
+        html += '<td>' + fmtNum(idx.high) + '</td>';
+        html += '<td>' + fmtNum(idx.low) + '</td>';
+        html += '<td>' + fmtNum(idx.prev_close) + '</td>';
+        html += '</tr>';
+    });
+    body.innerHTML = html;
+}
+
+/* ===== FILTER SWITCHING ===== */
+function switchFilter(filter) {
+    currentFilter = filter;
+    document.querySelectorAll('.filter-tab').forEach(function(t) {
+        t.classList.toggle('active', t.getAttribute('data-filter') === filter);
+    });
+    loadData();
+}
+
+/* ===== DATA FETCHING ===== */
+function loadData() {
+    /* Try API first, fall back to hardcoded data */
+    fetch('/api/market/indices')
+        .then(function(r) {
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            return r.json();
+        })
+        .then(function(d) {
+            if (d && d.available && d.indices && d.indices.length > 0) {
+                /* Use API data for ticker bar */
+                var majorNames = ['NIFTY 50', 'SENSEX', 'NIFTY BANK', 'NIFTY IT', 'NIFTY FIN SERVICE', 'INDIA VIX'];
+                var tickerData = [];
+                d.indices.forEach(function(idx) {
+                    var upperName = (idx.name || '').toUpperCase();
+                    for (var i = 0; i < majorNames.length; i++) {
+                        if (upperName.indexOf(majorNames[i]) >= 0 || majorNames[i].indexOf(upperName) >= 0) {
+                            tickerData.push(idx);
+                            break;
+                        }
+                    }
+                });
+                if (tickerData.length > 0) {
+                    renderTickerBar(tickerData);
+                }
+
+                /* Render table with API data (filter ignored since API returns all) */
+                renderIndexTable(d.indices);
+            } else {
+                useFallback();
+            }
+        })
+        .catch(function() {
+            useFallback();
+        });
+}
+
+function useFallback() {
+    var data = fallbackData[currentFilter] || fallbackData.global;
+    renderTickerBar(tickerIndices);
+    renderIndexTable(data);
+}
+
+/* ===== SIDEBAR SEARCH ===== */
+function setupSearch() {
+    var input = document.getElementById('sidebarSearch');
+    input.addEventListener('input', function() {
+        var query = input.value.toLowerCase();
+        var items = document.querySelectorAll('.watchlist-item');
+        items.forEach(function(item) {
+            var symbol = item.querySelector('.wl-symbol').textContent.toLowerCase();
+            item.style.display = symbol.indexOf(query) >= 0 ? '' : 'none';
+        });
+    });
+}
+
+/* ===== SIDEBAR TAB SWITCHING ===== */
+function setupSidebarTabs() {
+    document.querySelectorAll('.sidebar-tab').forEach(function(tab) {
+        tab.addEventListener('click', function() {
+            document.querySelectorAll('.sidebar-tab').forEach(function(t) { t.classList.remove('active'); });
+            tab.classList.add('active');
+        });
+    });
+}
+
+/* ===== INIT ===== */
+renderWatchlist();
+renderTickerBar(tickerIndices);
+setupSearch();
+setupSidebarTabs();
+loadData();
+
+/* Auto-refresh every 5 seconds */
+refreshTimer = setInterval(loadData, 5000);
+</script>
+</body>
+</html>

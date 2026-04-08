@@ -19,6 +19,15 @@ const MARKET_DASHBOARD_HTML: &str = include_str!("../../static/market-dashboard.
 /// Live WS connection pool monitoring: 4 pools, subsystem health, limits reference.
 const WS_DASHBOARD_HTML: &str = include_str!("../../static/ws-dashboard.html");
 
+/// Embedded HTML for Markets > Options page (Dhan-styled).
+const MARKETS_OPTIONS_HTML: &str = include_str!("../../static/markets-options.html");
+
+/// Embedded HTML for Markets > Stocks page (Dhan-styled).
+const MARKETS_STOCKS_HTML: &str = include_str!("../../static/markets-stocks.html");
+
+/// Embedded HTML for Markets > Index page (Dhan-styled).
+const MARKETS_INDEX_HTML: &str = include_str!("../../static/markets-index.html");
+
 /// GET /portal — serves the DLT Control Panel with links to all services.
 pub async fn portal() -> impl IntoResponse {
     (
@@ -55,6 +64,36 @@ pub async fn options_chain() -> impl IntoResponse {
         StatusCode::OK,
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
         OPTIONS_CHAIN_HTML,
+    )
+}
+
+/// GET /portal/markets/options — Dhan-styled Markets Options page.
+// TEST-EXEMPT: static HTML serving
+pub async fn markets_options() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        MARKETS_OPTIONS_HTML,
+    )
+}
+
+/// GET /portal/markets/stocks — Dhan-styled Markets Stocks page.
+// TEST-EXEMPT: static HTML serving
+pub async fn markets_stocks() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        MARKETS_STOCKS_HTML,
+    )
+}
+
+/// GET /portal/markets/index — Dhan-styled Markets Index page.
+// TEST-EXEMPT: static HTML serving
+pub async fn markets_index() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        MARKETS_INDEX_HTML,
     )
 }
 
@@ -256,5 +295,48 @@ mod tests {
             !PORTAL_HTML.contains("max 4 connections"),
             "portal must not contain 'max 4 connections'"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // Markets pages (Dhan-styled frontend)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_markets_options_html_not_empty() {
+        assert!(!MARKETS_OPTIONS_HTML.is_empty());
+        assert!(MARKETS_OPTIONS_HTML.contains("<!DOCTYPE html>"));
+        assert!(MARKETS_OPTIONS_HTML.contains("</html>"));
+    }
+
+    #[tokio::test]
+    async fn test_markets_options_handler_returns_ok() {
+        let response = markets_options().await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn test_markets_stocks_html_not_empty() {
+        assert!(!MARKETS_STOCKS_HTML.is_empty());
+        assert!(MARKETS_STOCKS_HTML.contains("<!DOCTYPE html>"));
+        assert!(MARKETS_STOCKS_HTML.contains("</html>"));
+    }
+
+    #[tokio::test]
+    async fn test_markets_stocks_handler_returns_ok() {
+        let response = markets_stocks().await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn test_markets_index_html_not_empty() {
+        assert!(!MARKETS_INDEX_HTML.is_empty());
+        assert!(MARKETS_INDEX_HTML.contains("<!DOCTYPE html>"));
+        assert!(MARKETS_INDEX_HTML.contains("</html>"));
+    }
+
+    #[tokio::test]
+    async fn test_markets_index_handler_returns_ok() {
+        let response = markets_index().await.into_response();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 }
