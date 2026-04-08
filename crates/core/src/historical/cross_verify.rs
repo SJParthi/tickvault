@@ -1050,12 +1050,21 @@ pub async fn cross_match_historical_vs_live(
     let mut missing_views: Vec<String> = Vec::new();
 
     for &(hist_tf, live_table) in CROSS_MATCH_TIMEFRAMES {
-        // M2: Check if the materialized view table exists before JOINing
+        // M2: Check if the materialized view exists before JOINing.
         // SAFETY: live_table is from CROSS_MATCH_TIMEFRAMES constants, not user input.
-        let table_exists_query =
-            format!("SELECT count() FROM tables() WHERE name = '{}'", live_table);
-        let table_count = extract_count(&client, &base_url, &table_exists_query).await;
-        if table_count == 0 {
+        // Use SHOW COLUMNS instead of tables() because QuestDB's tables() does NOT
+        // include materialized views — only base tables. SHOW COLUMNS works for both.
+        let view_probe_query = format!("SHOW COLUMNS FROM {}", live_table);
+        let view_exists = match client
+            .get(&base_url)
+            .query(&[("query", &view_probe_query)])
+            .send()
+            .await
+        {
+            Ok(resp) => resp.status().is_success(),
+            Err(_) => false,
+        };
+        if !view_exists {
             warn!(
                 live_table,
                 timeframe = hist_tf,

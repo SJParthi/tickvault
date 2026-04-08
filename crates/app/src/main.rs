@@ -1689,44 +1689,70 @@ async fn main() -> Result<()> {
     };
 
     // -----------------------------------------------------------------------
-    // Step 10.5: Index constituency data (best-effort)
+    // Step 10.5: Index constituency data (best-effort, NON-BLOCKING)
     // -----------------------------------------------------------------------
-    // During market hours, skip network downloads to niftyindices.com
-    // (they often return HTML instead of CSV) and use the cached JSON.
-    let constituency_map = if is_market_hours {
-        info!("market hours — using cached constituency data (skipping niftyindices.com download)");
-        dhan_live_trader_core::index_constituency::try_load_cache(
-            &config.instrument.csv_cache_directory,
-        )
-        .await
-    } else {
-        dhan_live_trader_core::index_constituency::download_and_build_constituency_map(
-            &config.index_constituency,
-            &config.instrument.csv_cache_directory,
-        )
-        .await
-    };
+    // Constituency downloads are moved to background to prevent boot timeout.
+    // niftyindices.com often returns HTML instead of CSV, causing 91s+ retries
+    // that pushed boot past the 120s deadline.
+    let shared_constituency: dhan_live_trader_api::state::SharedConstituencyMap =
+        std::sync::Arc::new(std::sync::RwLock::new(None));
 
-    // Persist constituency to QuestDB for Grafana (best-effort, non-blocking).
-    // Enrich with security_ids from instrument master for news-based trading.
-    if let Some(ref map) = constituency_map {
-        match dhan_live_trader_storage::constituency_persistence::persist_constituency(
-            map,
-            &config.questdb,
-            slow_boot_universe.as_ref(),
-        ) {
-            Ok(()) => {}
-            Err(err) => {
+    // During market hours: load from cache synchronously (fast, no network).
+    // Outside market hours: spawn background download (non-blocking).
+    if is_market_hours {
+        info!("market hours — using cached constituency data (skipping niftyindices.com download)");
+        let cached = dhan_live_trader_core::index_constituency::try_load_cache(
+            &config.instrument.csv_cache_directory,
+        )
+        .await;
+        if let Some(ref map) = cached
+            && let Err(err) =
+                dhan_live_trader_storage::constituency_persistence::persist_constituency(
+                    map,
+                    &config.questdb,
+                    slow_boot_universe.as_ref(),
+                )
+        {
+            tracing::warn!(
+                ?err,
+                "index constituency QuestDB persistence failed (best-effort)"
+            );
+        }
+        if let Ok(mut lock) = shared_constituency.write() {
+            *lock = cached;
+        }
+    } else {
+        // Background download — does not block boot sequence.
+        let bg_constituency = shared_constituency.clone();
+        let bg_index_config = config.index_constituency.clone();
+        let bg_cache_dir = config.instrument.csv_cache_directory.clone();
+        let bg_questdb_config = config.questdb.clone();
+        let bg_universe = slow_boot_universe.clone();
+        tokio::spawn(async move {
+            let map =
+                dhan_live_trader_core::index_constituency::download_and_build_constituency_map(
+                    &bg_index_config,
+                    &bg_cache_dir,
+                )
+                .await;
+            if let Some(ref m) = map
+                && let Err(err) =
+                    dhan_live_trader_storage::constituency_persistence::persist_constituency(
+                        m,
+                        &bg_questdb_config,
+                        bg_universe.as_ref(),
+                    )
+            {
                 tracing::warn!(
                     ?err,
                     "index constituency QuestDB persistence failed (best-effort)"
                 );
             }
-        }
+            if let Ok(mut lock) = bg_constituency.write() {
+                *lock = map;
+            }
+        });
     }
-
-    let shared_constituency: dhan_live_trader_api::state::SharedConstituencyMap =
-        std::sync::Arc::new(std::sync::RwLock::new(constituency_map));
 
     // -----------------------------------------------------------------------
     // Step 11: Start axum API server
@@ -2171,13 +2197,15 @@ fn spawn_historical_candle_fetch(
             );
 
         // Extended guard: also wait if between 08:00 and data_collection_start (09:00)
-        // This prevents fetching at 8:36 AM when market is about to open
+        // This prevents fetching at 8:36 AM when market is about to open.
+        // IMPORTANT: must NOT catch post-market (after 15:30) — hour >= 16 means
+        // market is closed and we should fetch immediately (signal already fired).
         let is_pre_market_wait_zone = if is_trading_day {
             let now_ist =
                 chrono::Utc::now() + chrono::Duration::hours(5) + chrono::Duration::minutes(30);
             let hour = now_ist.format("%H").to_string().parse::<u32>().unwrap_or(0);
-            // Between 08:00 and 09:00 IST — market about to open, don't fetch
-            hour >= 8 && !is_within_collection_window
+            // Between 08:00 and 15:59 IST only — 16:00+ means post-market, fetch immediately
+            (8..16).contains(&hour) && !is_within_collection_window
         } else {
             false
         };

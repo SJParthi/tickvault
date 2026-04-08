@@ -1,4 +1,4 @@
-# Implementation Plan: Depth WS Market-Hours Guard + Materialized View Diagnostic + Frontend Fix
+# Implementation Plan: Production Log Fixes (6 Issues)
 
 **Status:** IN_PROGRESS
 **Date:** 2026-04-08
@@ -6,48 +6,51 @@
 
 ## Summary
 
-Fix 3 issues from production logs and frontend audit:
-1. Depth WS reconnection storm after market close (590+ attempts per connection)
-2. Materialized views diagnostic — clear ERROR logging when cross-match fails
-3. Frontend: option-chain-v2.html orphaned (not routed)
+Fix 6 production issues identified from runtime logs and Grafana screenshots:
+1. Alloy container DOWN (missing app.log before Docker starts)
+2. Historical candles = 0 (pre-market zone catches post-market too)
+3. Materialized views all missing (tables() doesn't list materialized views)
+4. Grafana missing depth/order WS panels
+5. Boot timeout exceeded (constituency downloads block boot for 91s)
+6. Cross-verify also uses wrong tables() check
 
 ## Plan Items
 
-- [x] Item 1: Add market-hours guard to 20-level depth reconnection (currently missing)
-  - Files: crates/core/src/websocket/depth_connection.rs
-  - Change: Added `is_within_market_data_hours()` check + `calculate_secs_until_market_open()` in 20-level reconnection loop
-  - Tests: test_is_within_market_data_hours_returns_bool, test_is_within_market_data_hours_boundary_constants, test_calculate_secs_until_market_open_always_positive, test_calculate_secs_until_market_open_bounded, test_off_hours_check_interval_reasonable
+- [x] Item 1: Fix Alloy DOWN — create data/logs/app.log before docker compose up
+  - Files: crates/app/src/infra.rs
+  - Change: Added OpenOptions::new().create(true).append(true).open("data/logs/app.log") after create_dir_all
 
-- [x] Item 2: Improve 200-level depth to sleep until market open (was 60s retry)
-  - Files: crates/core/src/websocket/depth_connection.rs
-  - Change: Replaced 60s fixed retry with `calculate_secs_until_market_open()` (5min check interval, up to 24h sleep)
-  - Tests: (covered by same tests as Item 1 — shared helper function)
+- [x] Item 2: Fix historical candle fetch — narrow pre-market zone
+  - Files: crates/app/src/main.rs
+  - Change: Changed `hour >= 8` to `(8..16).contains(&hour)` — 16:00+ means post-market, fetch immediately
 
-- [x] Item 3: Add materialized view post-setup verification with diagnostic logging
+- [x] Item 3: Fix materialized view verification — use SHOW COLUMNS instead of tables()
   - Files: crates/storage/src/materialized_views.rs
-  - Change: Added `verify_views_exist()` with per-view existence check, ERROR for critical missing views
-  - Tests: test_cross_match_critical_views_count, test_cross_match_critical_views_are_defined, test_cross_match_critical_views_exact_names, test_verify_views_exist_with_mock_200_no_panic, test_verify_views_exist_with_mock_400_no_panic, test_verify_views_exist_with_unreachable_no_panic, test_verify_views_exist_with_tracing
+  - Change: Replaced `SELECT count() FROM tables() WHERE name = '...'` with `SHOW COLUMNS FROM <view>` (proven pattern from views_missing_greeks)
 
-- [x] Item 4: Route option-chain-v2.html (orphaned file from frontend audit)
-  - Files: crates/api/src/handlers/static_file.rs, crates/api/src/lib.rs
-  - Change: Added OPTIONS_CHAIN_V2_HTML constant, options_chain_v2() handler, GET /portal/option-chain-v2 route
-  - Tests: test_options_chain_v2_html_not_empty, test_options_chain_v2_handler_returns_ok, test_options_chain_v2_handler_content_type_is_html, test_options_chain_v2_html_has_closing_tags, test_options_chain_v2_html_contains_option_chain_endpoint
+- [x] Item 4: Fix cross-verify also uses wrong tables() check
+  - Files: crates/core/src/historical/cross_verify.rs
+  - Change: Replaced tables() check with SHOW COLUMNS FROM approach
 
-- [x] Item 5: Fix pre-existing clippy warning
-  - Files: crates/storage/src/candle_persistence.rs
-  - Change: Removed needless `return` keyword (clippy::needless_return)
+- [x] Item 5: Fix boot timeout — move constituency downloads to background
+  - Files: crates/app/src/main.rs
+  - Change: Wrapped non-market-hours constituency download in tokio::spawn() (non-blocking). Cache loading during market hours remains synchronous (fast, no network).
 
-- [x] Item 6: Build, clippy, fmt, test — all pass
+- [x] Item 6: Add depth + order update WS metrics and Grafana panels
+  - Files: crates/core/src/websocket/order_update_connection.rs, deploy/docker/grafana/dashboards/trading-pipeline.json
+  - Change: Added dlt_order_update_ws_active gauge + dlt_order_update_messages_total counter. Added 4 Grafana panels for depth 20/200-level connections, depth frames rate, depth frames dropped.
+
+- [ ] Item 7: Build, clippy, fmt, test — verify all pass
   - Files: all modified
-  - Tests: cargo build + cargo clippy + cargo fmt --check + cargo test (all pass)
+  - Tests: cargo test --workspace
 
 ## Scenarios
 
 | # | Scenario | Expected |
 |---|----------|----------|
-| 1 | Market close 15:30 IST, depth WS disconnects | Both 20/200-level log once, sleep ~5min intervals until 08:55 next day |
-| 2 | Market opens 08:55 IST | Both resume normal exponential backoff reconnection |
-| 3 | During market hours, depth WS fails | Normal exponential backoff (unchanged) |
-| 4 | Views fail to create at QuestDB | ERROR log with exact missing view names + critical flag |
-| 5 | Views all created successfully | INFO log confirming all 18 views verified |
-| 6 | option-chain-v2.html accessed | Served at /portal/option-chain-v2 with correct content-type |
+| 1 | App starts after 3:30 PM (17:08 IST) | Historical fetch runs immediately (not blocked by post-market signal wait) |
+| 2 | App starts at 8:30 AM | Still waits for post-market signal (pre-market zone) |
+| 3 | QuestDB materialized views created | SHOW COLUMNS verifies they exist (not tables()) |
+| 4 | Constituency download slow (91s) | Background tokio::spawn, boot completes under 120s |
+| 5 | Fresh Docker start | app.log exists before Alloy → healthcheck passes → UP |
+| 6 | Grafana Trading Pipeline dashboard | Shows depth 20/200-level + order update WS connections |

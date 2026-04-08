@@ -373,7 +373,9 @@ const CROSS_MATCH_CRITICAL_VIEWS: &[&str] = &[
 
 /// Verifies which materialized views actually exist in QuestDB after creation.
 ///
-/// Queries `tables()` for each of the 18 views and logs the result.
+/// Uses `SHOW COLUMNS FROM <view>` instead of `tables()` because QuestDB's
+/// `tables()` function does NOT include materialized views — only base tables.
+/// The `SHOW COLUMNS` approach is proven: `views_missing_greeks()` already uses it.
 /// Missing views are logged at ERROR level to provide clear diagnostics
 /// when cross-match verification fails.
 async fn verify_views_exist(client: &reqwest::Client, base_url: &str) {
@@ -382,7 +384,9 @@ async fn verify_views_exist(client: &reqwest::Client, base_url: &str) {
 
     for def in VIEW_DEFS {
         // SAFETY: def.name is from VIEW_DEFS constants, not user input.
-        let query = format!("SELECT count() FROM tables() WHERE name = '{}'", def.name);
+        // Use SHOW COLUMNS instead of tables() — QuestDB tables() doesn't list
+        // materialized views. SHOW COLUMNS returns 200 if the view exists.
+        let query = format!("SHOW COLUMNS FROM {}", def.name);
         let exists = match client
             .get(base_url)
             .query(&[("query", &query)])
@@ -390,9 +394,9 @@ async fn verify_views_exist(client: &reqwest::Client, base_url: &str) {
             .await
         {
             Ok(response) if response.status().is_success() => {
+                // SHOW COLUMNS succeeded → view exists. Verify response has content.
                 let body = response.text().await.unwrap_or_default();
-                // QuestDB returns CSV: header + data row. count > 0 means table exists.
-                !body.contains(",0\r\n") && !body.ends_with(",0\n") && !body.ends_with(",0")
+                !body.is_empty()
             }
             _ => false,
         };

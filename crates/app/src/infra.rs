@@ -176,14 +176,26 @@ pub async fn ensure_infra_running(questdb_config: &QuestDbConfig) {
         ),
     ];
 
-    // Ensure data/logs/ exists before Docker mounts it (fresh clone won't have it).
+    // Ensure data/logs/app.log exists before Docker mounts it.
     // Alloy container mounts ../../data/logs → /var/log/dlt-app/ to watch app.log.
-    // If the directory doesn't exist, Docker creates it as root-owned, which can
-    // cause permission issues or Alloy file watch failures.
+    // If the directory doesn't exist, Docker creates it as root-owned.
+    // If app.log doesn't exist, Alloy's file watch fails → healthcheck fails → DOWN.
     if let Err(err) = std::fs::create_dir_all("data/logs") {
         warn!(
             ?err,
             "failed to create data/logs directory for Alloy log mount"
+        );
+    }
+    // Create the app.log file itself (Alloy needs it to exist at startup).
+    // OpenOptions with create+append ensures idempotent creation without truncating.
+    if let Err(err) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("data/logs/app.log")
+    {
+        warn!(
+            ?err,
+            "failed to create data/logs/app.log for Alloy file watch"
         );
     }
 

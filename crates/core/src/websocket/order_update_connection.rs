@@ -169,6 +169,10 @@ async fn connect_and_listen(
 
     info!("order update WebSocket connected");
 
+    let m_active = metrics::gauge!("dlt_order_update_ws_active");
+    let m_messages = metrics::counter!("dlt_order_update_messages_total");
+    m_active.set(1.0);
+
     let (mut write, mut read) = ws_stream.split();
 
     // Send login message.
@@ -196,15 +200,18 @@ async fn connect_and_listen(
         let msg = match time::timeout(read_timeout, read.next()).await {
             Ok(Some(Ok(msg))) => msg,
             Ok(Some(Err(err))) => {
-                // O(1) EXEMPT: error path, not hot path
+                m_active.set(0.0);
+                // O(1) EXEMPT: error path, not hot path — .to_string() on cold disconnect
                 return Err(OrderUpdateConnectionError::Read(err.to_string()));
             }
             Ok(None) => {
                 // Stream ended (server closed connection).
+                m_active.set(0.0);
                 return Ok(());
             }
             Err(_) => {
                 // Read timeout — server may have stopped sending pings.
+                m_active.set(0.0);
                 return Err(OrderUpdateConnectionError::ReadTimeout);
             }
         };
@@ -213,6 +220,7 @@ async fn connect_and_listen(
             Message::Text(text) => {
                 match parse_order_update(&text) {
                     Ok(update) => {
+                        m_messages.increment(1);
                         debug!(
                             order_no = %update.order_no,
                             status = %update.status,
@@ -231,6 +239,7 @@ async fn connect_and_listen(
                                     reason = %reason,
                                     "order update WebSocket auth/API error from server"
                                 );
+                                m_active.set(0.0);
                                 return Err(OrderUpdateConnectionError::AuthFailed(reason));
                             }
                             AuthResponseKind::Success => {
@@ -251,6 +260,7 @@ async fn connect_and_listen(
             }
             Message::Close(frame) => {
                 info!(?frame, "order update WebSocket close frame received");
+                m_active.set(0.0);
                 return Ok(());
             }
             _ => {
