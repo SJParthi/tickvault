@@ -2196,16 +2196,20 @@ fn spawn_historical_candle_fetch(
                 &bg_data_collection_end,
             );
 
-        // Extended guard: also wait if between 08:00 and data_collection_start (09:00)
-        // This prevents fetching at 8:36 AM when market is about to open.
-        // IMPORTANT: must NOT catch post-market (after 15:30) — hour >= 16 means
-        // market is closed and we should fetch immediately (signal already fired).
+        // Wait logic for trading days:
+        //   Before 08:00 IST → fetch immediately (pre-market, yesterday's data)
+        //   08:00–15:30 IST  → WAIT for post-market signal (market active)
+        //   After 15:30 IST  → fetch immediately (market closed, today's data ready)
+        //
+        // is_within_collection_window covers 09:00-15:30 (from config).
+        // Pre-market extension: 08:00-08:59 only (hour == 8, before market open).
+        // This ensures starting the app at 5 PM or 7 AM fetches immediately.
         let is_pre_market_wait_zone = if is_trading_day {
             let now_ist =
                 chrono::Utc::now() + chrono::Duration::hours(5) + chrono::Duration::minutes(30);
             let hour = now_ist.format("%H").to_string().parse::<u32>().unwrap_or(0);
-            // Between 08:00 and 15:59 IST only — 16:00+ means post-market, fetch immediately
-            (8..16).contains(&hour) && !is_within_collection_window
+            // Only 08:00-08:59 IST — the gap before data_collection_start (09:00)
+            hour == 8
         } else {
             false
         };
@@ -2217,7 +2221,9 @@ fn spawn_historical_candle_fetch(
             post_market_signal.notified().await;
             info!("post-market signal received — starting historical candle fetch");
         } else if is_trading_day {
-            info!("trading day outside 08:00-15:30 — starting historical candle fetch immediately");
+            info!(
+                "trading day before 08:00 or after 15:30 — fetching historical candles immediately"
+            );
         } else {
             info!("non-trading day — starting historical candle fetch immediately");
         }
