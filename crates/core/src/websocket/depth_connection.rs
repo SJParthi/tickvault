@@ -45,6 +45,10 @@ const DEPTH_RECONNECT_INITIAL_MS: u64 = 1000;
 /// Reconnection backoff max delay (ms).
 const DEPTH_RECONNECT_MAX_MS: u64 = 30000;
 
+/// Pong send timeout (seconds). Matches main feed connection behavior.
+/// If pong send takes longer, the TCP connection is likely dead.
+const DEPTH_PONG_TIMEOUT_SECS: u64 = 10;
+
 /// Subscription batch size for 20-level depth (max 50 per Dhan docs).
 const DEPTH_SUBSCRIPTION_BATCH_SIZE: usize = 50;
 
@@ -275,14 +279,32 @@ async fn connect_and_run_depth(
                     }
                 }
                 Some(Ok(Message::Ping(data))) => {
-                    if let Err(err) = write.send(Message::Pong(data)).await {
-                        m_active.set(0.0);
-                        warn!(?err, "{DEPTH_CONNECTION_PREFIX}: pong send failed");
-                        return Err(WebSocketError::ConnectionFailed {
-                            url: DHAN_TWENTY_DEPTH_WS_BASE_URL.to_string(),
-                            source: err,
-                        });
+                    let pong_timeout = Duration::from_secs(DEPTH_PONG_TIMEOUT_SECS);
+                    match time::timeout(pong_timeout, write.send(Message::Pong(data))).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => {
+                            m_active.set(0.0);
+                            warn!(?err, "{DEPTH_CONNECTION_PREFIX}: pong send failed");
+                            return Err(WebSocketError::ConnectionFailed {
+                                url: DHAN_TWENTY_DEPTH_WS_BASE_URL.to_string(),
+                                source: err,
+                            });
+                        }
+                        Err(_) => {
+                            m_active.set(0.0);
+                            warn!(
+                                timeout_secs = DEPTH_PONG_TIMEOUT_SECS,
+                                "{DEPTH_CONNECTION_PREFIX}: pong send timed out — connection likely dead"
+                            );
+                            return Err(WebSocketError::ReadTimeout {
+                                connection_id: 99,
+                                timeout_secs: DEPTH_PONG_TIMEOUT_SECS,
+                            });
+                        }
                     }
+                }
+                Some(Ok(Message::Pong(_))) => {
+                    // Server echo pong — ignore (keep-alive confirmation)
                 }
                 Some(Ok(Message::Close(_))) => {
                     m_active.set(0.0);
@@ -508,13 +530,31 @@ async fn connect_and_run_200_depth(
                     }
                 }
                 Some(Ok(Message::Ping(data))) => {
-                    if let Err(err) = write.send(Message::Pong(data)).await {
-                        m_active.set(0.0);
-                        return Err(WebSocketError::ConnectionFailed {
-                            url: DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL.to_string(),
-                            source: err,
-                        });
+                    let pong_timeout = Duration::from_secs(DEPTH_PONG_TIMEOUT_SECS);
+                    match time::timeout(pong_timeout, write.send(Message::Pong(data))).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => {
+                            m_active.set(0.0);
+                            return Err(WebSocketError::ConnectionFailed {
+                                url: DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL.to_string(),
+                                source: err,
+                            });
+                        }
+                        Err(_) => {
+                            m_active.set(0.0);
+                            warn!(
+                                timeout_secs = DEPTH_PONG_TIMEOUT_SECS,
+                                "{prefix}: pong send timed out — connection likely dead"
+                            );
+                            return Err(WebSocketError::ReadTimeout {
+                                connection_id: 98,
+                                timeout_secs: DEPTH_PONG_TIMEOUT_SECS,
+                            });
+                        }
                     }
+                }
+                Some(Ok(Message::Pong(_))) => {
+                    // Server echo pong — ignore (keep-alive confirmation)
                 }
                 Some(Ok(Message::Close(_))) => {
                     m_active.set(0.0);

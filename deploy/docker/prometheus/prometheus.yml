@@ -73,6 +73,8 @@ scrape_configs:
     metrics_path: "/metrics"
 
   # Alloy metrics (log collector)
+  # Alloy v1.8+ exposes Prometheus metrics at /metrics on the
+  # --server.http.listen-addr port (12345). Same port as the UI.
   - job_name: "dlt-alloy"
     static_configs:
       - targets: ["dlt-alloy:12345"]
