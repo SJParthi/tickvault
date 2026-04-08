@@ -318,18 +318,18 @@ fn compute_reconnect_backoff_ms(consecutive_failures: u32) -> u64 {
         .min(ORDER_UPDATE_RECONNECT_MAX_DELAY_MS)
 }
 
-/// Selects the appropriate read timeout based on market hours.
+/// Selects the appropriate read timeout for the order update WebSocket.
 ///
-/// During market hours: shorter timeout to detect dead connections quickly.
-/// Outside market hours: longer timeout to avoid reconnect noise.
+/// Always uses the longer timeout (600s) to avoid false reconnects when the
+/// trader is idle — no orders for 2 minutes does NOT mean Dhan is down.
+/// The order update WS only sends messages when orders arrive; idle silence
+/// is normal and expected even during market hours.
 ///
 /// Pure function — no I/O.
-fn select_read_timeout_secs(within_market_hours: bool) -> u64 {
-    if within_market_hours {
-        ORDER_UPDATE_READ_TIMEOUT_SECS
-    } else {
-        ORDER_UPDATE_OFF_HOURS_READ_TIMEOUT_SECS
-    }
+fn select_read_timeout_secs(_within_market_hours: bool) -> u64 {
+    // Always use the longer timeout. The shorter 120s timeout caused
+    // unnecessary reconnects every 2 minutes when no orders were placed.
+    ORDER_UPDATE_OFF_HOURS_READ_TIMEOUT_SECS
 }
 
 // ---------------------------------------------------------------------------
@@ -691,23 +691,14 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_select_read_timeout_during_market_hours() {
-        let secs = select_read_timeout_secs(true);
-        assert_eq!(secs, ORDER_UPDATE_READ_TIMEOUT_SECS);
-    }
-
-    #[test]
-    fn test_select_read_timeout_outside_market_hours() {
-        let secs = select_read_timeout_secs(false);
-        assert_eq!(secs, ORDER_UPDATE_OFF_HOURS_READ_TIMEOUT_SECS);
-    }
-
-    #[test]
-    fn test_off_hours_timeout_greater_than_market_hours() {
-        assert!(
-            select_read_timeout_secs(false) > select_read_timeout_secs(true),
-            "off-hours timeout must be longer than market-hours timeout"
-        );
+    fn test_select_read_timeout_always_uses_long_timeout() {
+        // Always uses 600s to avoid false reconnects when trader is idle.
+        // No market-hours distinction — order WS only sends when orders arrive.
+        let during_hours = select_read_timeout_secs(true);
+        let off_hours = select_read_timeout_secs(false);
+        assert_eq!(during_hours, ORDER_UPDATE_OFF_HOURS_READ_TIMEOUT_SECS);
+        assert_eq!(off_hours, ORDER_UPDATE_OFF_HOURS_READ_TIMEOUT_SECS);
+        assert_eq!(during_hours, off_hours);
     }
 
     // -----------------------------------------------------------------------
@@ -906,11 +897,12 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_select_read_timeout_returns_constants() {
-        // Verify the function returns exact constant values
+    fn test_select_read_timeout_returns_600s_regardless_of_input() {
+        // Both true and false must return the same long timeout (600s).
+        // This prevents false reconnects when no orders are placed.
         assert_eq!(
             select_read_timeout_secs(true),
-            ORDER_UPDATE_READ_TIMEOUT_SECS
+            ORDER_UPDATE_OFF_HOURS_READ_TIMEOUT_SECS
         );
         assert_eq!(
             select_read_timeout_secs(false),

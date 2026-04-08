@@ -584,12 +584,26 @@ async fn execute_ddl_check_stale(
 }
 
 /// Executes a single DDL statement against QuestDB. Returns true on success.
+///
+/// Validates BOTH HTTP status code AND response body — QuestDB can return
+/// HTTP 200 with an error message in the body for some DDL operations.
 async fn execute_ddl(client: &reqwest::Client, base_url: &str, sql: &str, label: &str) -> bool {
     match client.get(base_url).query(&[("query", sql)]).send().await {
         Ok(response) => {
             if response.status().is_success() {
-                debug!(label, "DDL executed successfully");
-                true
+                // QuestDB may return HTTP 200 with error in body — validate content.
+                let body = response.text().await.unwrap_or_default();
+                if body.contains("\"error\"") || body.contains("\"Error\"") {
+                    warn!(
+                        label,
+                        body = body.chars().take(200).collect::<String>(),
+                        "DDL returned HTTP 200 but body contains error — treating as failure"
+                    );
+                    false
+                } else {
+                    debug!(label, "DDL executed successfully");
+                    true
+                }
             } else {
                 let status = response.status();
                 let body = response.text().await.unwrap_or_default();
@@ -1235,6 +1249,21 @@ mod tests {
         let client = reqwest::Client::new();
         let result = execute_ddl(&client, &base_url, "SELECT 1", "test_label").await;
         assert!(!result, "execute_ddl must return false on send error");
+    }
+
+    #[tokio::test]
+    async fn test_execute_ddl_200_with_error_body_returns_false() {
+        // QuestDB can return HTTP 200 with error in body — execute_ddl must detect this.
+        let response_with_error = "HTTP/1.1 200 OK\r\nContent-Length: 42\r\n\r\n{\"error\":\"source table candles_1s not found\"}";
+        let port = spawn_mock_http_server(response_with_error).await;
+        tokio::task::yield_now().await;
+        let base_url = build_questdb_exec_url("127.0.0.1", port);
+        let client = reqwest::Client::new();
+        let result = execute_ddl(&client, &base_url, "CREATE VIEW test", "test_label").await;
+        assert!(
+            !result,
+            "execute_ddl must return false when body contains error despite HTTP 200"
+        );
     }
 
     // -----------------------------------------------------------------------
