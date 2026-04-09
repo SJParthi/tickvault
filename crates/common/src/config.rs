@@ -251,11 +251,13 @@ impl QuestDbConfig {
     /// - Retry timeout: 30s (recovers from transient QuestDB restarts)
     /// - Init buffer size: 64KB (matches WAL segment tuning)
     /// - Request timeout: 60s (generous for large batch flushes)
+    /// Builds the ILP TCP connection string.
+    ///
+    /// NOTE: `retry_timeout`, `init_buf_size`, `request_timeout` are HTTP-only
+    /// parameters in questdb-rs 6.1.0. TCP mode only supports `addr`.
+    /// Connection resilience is handled by our writers (ring buffer + reconnect).
     pub fn build_ilp_conf_string(&self) -> String {
-        format!(
-            "tcp::addr={}:{};retry_timeout=30000;init_buf_size=65536;request_timeout=60000;",
-            self.host, self.ilp_port
-        )
+        format!("tcp::addr={}:{};", self.host, self.ilp_port)
     }
 }
 
@@ -1880,7 +1882,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_ilp_conf_string_contains_retry_and_timeout() {
+    fn test_build_ilp_conf_string_tcp_only() {
         let config = QuestDbConfig {
             host: "dlt-questdb".to_string(),
             http_port: 9000,
@@ -1888,10 +1890,12 @@ mod tests {
             ilp_port: 9009,
         };
         let conf = config.build_ilp_conf_string();
-        assert!(conf.contains("tcp::addr=dlt-questdb:9009;"));
-        assert!(conf.contains("retry_timeout=30000"));
-        assert!(conf.contains("init_buf_size=65536"));
-        assert!(conf.contains("request_timeout=60000"));
+        assert_eq!(conf, "tcp::addr=dlt-questdb:9009;");
+        // TCP mode does NOT support retry_timeout, init_buf_size, request_timeout
+        // (those are HTTP-only in questdb-rs 6.1.0)
+        assert!(!conf.contains("retry_timeout"));
+        assert!(!conf.contains("init_buf_size"));
+        assert!(!conf.contains("request_timeout"));
     }
 
     #[test]

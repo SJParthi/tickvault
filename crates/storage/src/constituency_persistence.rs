@@ -64,12 +64,8 @@ fn build_dedup_sql(table_name: &str, dedup_key: &str) -> String {
 }
 
 /// Builds the ILP TCP connection string from host and port.
-/// Includes retry_timeout and request_timeout for connection resilience.
 fn build_ilp_conf_string(host: &str, ilp_port: u16) -> String {
-    format!(
-        "tcp::addr={}:{};retry_timeout=30000;init_buf_size=65536;request_timeout=60000;",
-        host, ilp_port
-    )
+    format!("tcp::addr={}:{};", host, ilp_port)
 }
 
 /// Resolves the security_id for a constituent from the FnoUniverse.
