@@ -384,25 +384,80 @@ PascalCase top-level keys.
 
 ### 10.2 Open Gaps
 
-| # | Gap | Impact | Priority |
-|---|-----|--------|----------|
-| 1 | `WebSocketDisconnected` event defined but never sent in production | Main feed disconnections not alerted via Telegram | Medium |
-| 2 | `WebSocketReconnected` event defined but never sent | No Telegram on main feed reconnection | Low |
-| 3 | Telegram fires on connection spawn, not on first DATA frame received | Off-hours "connected" alerts are misleading (connected but no data) | Medium |
-| 4 | No Telegram for depth rebalancer ATM strike change | Silent rebalance, hard to audit | Low |
-| 5 | 20-level depth connections stay connected off-hours (no sleep) | Unnecessary open connections, no harm but wasteful | Low |
-| 6 | No exchange timestamp in depth packets | Depth timing depends on local clock + network latency (~1-5ms) | Accepted (Dhan limitation) |
-| 7 | 200-level depth read timeout 40s during market hours may be too aggressive | Could disconnect during low-activity periods for illiquid strikes | Low |
-| 8 | No Telegram alert when depth frame parsing fails | Parse errors logged but not escalated to Telegram | Medium |
+#### CRITICAL
 
-### 10.3 Design Decisions (Not Bugs)
+| # | Gap | File:Line | Impact |
+|---|-----|-----------|--------|
+| C1 | No graceful unsubscribe on shutdown — connections close without sending unsubscribe messages | `connection.rs:193-202` | Dhan keeps instruments subscribed briefly, wasting bandwidth |
+| C2 | Order update auth never validated — code enters read loop immediately after login, waits for implicit error on timeout | `order_update_connection.rs:187-193` | Silent auth failure for 30+ seconds |
+| C3 | Order update token not wrapped in `Zeroizing` — exposed `.to_string()` stays in memory | `order_update_connection.rs:153` | Token not zeroized on drop (security) |
 
-| Decision | Rationale |
-|----------|-----------|
-| Depth timestamps use local receive time | Dhan protocol has no exchange timestamp — all SDKs do this |
-| 200-level uses 1 connection per instrument | Dhan API limitation, not our choice |
-| Depth data only flows during 09:15-15:30 IST | Dhan sends nothing outside market hours |
-| PrevClose packets arrive on any subscription mode | Expected — used for day change % calculations |
+#### HIGH
+
+| # | Gap | File:Line | Impact |
+|---|-----|-----------|--------|
+| H1 | `WebSocketDisconnected` event defined but never sent in production | `connection.rs:228-235` | Main feed disconnections not alerted via Telegram |
+| H2 | No pool-level circuit breaker — if all 5 main feed connections die, no explicit alert fires | `connection_pool.rs` (missing entirely) | Silent total data loss |
+| H3 | No per-security_id stale tick detection — if one instrument stops receiving ticks, no alert | `tick_processor.rs` | Silent data gap for single security while others stream fine |
+| H4 | No dead-letter mechanism for unparseable packets — frames discarded without forensics | `tick_processor.rs:501` | Can't diagnose parse failures post-mortem |
+| H5 | No Telegram alert when depth frame parsing fails | `depth_connection.rs` | Parse errors logged but not escalated |
+
+#### MEDIUM
+
+| # | Gap | File:Line | Impact |
+|---|-----|-----------|--------|
+| M1 | Telegram fires on connection spawn, not on first DATA frame received | `main.rs` (WS spawn) | Off-hours "connected" alerts are misleading |
+| M2 | `WebSocketReconnected` event defined but never sent | `connection.rs` | No Telegram on successful reconnection |
+| M3 | No pool-level health check / heartbeat monitor — passive snapshot only | `connection_pool.rs:191-193` | Single connection hang goes undetected at pool level |
+| M4 | No token refresh acknowledgment log — "waiting for renewal" logged but not "renewal complete" | `connection.rs:225-226` | Hard to audit token refresh flow in logs |
+| M5 | WebSocket URL with `?token=` could leak in error messages | `connection.rs:301-303` | Token visible in log aggregation |
+| M6 | No CRITICAL alert if SPSC backpressure exceeds threshold | `tick_processor.rs:436-441` | Data loss silently accumulates |
+| M7 | Order update JSON parse errors for non-order messages silently dropped | `order_update_connection.rs:248-251` | No metric for dropped messages |
+| M8 | No 20-level depth sequence number validation — packet loss goes undetected | `depth_connection.rs:554` | Missing depth levels not caught |
+
+#### LOW
+
+| # | Gap | File:Line | Impact |
+|---|-----|-----------|--------|
+| L1 | No Telegram for depth rebalancer ATM strike change | `main.rs` (rebalancer spawn) | Silent rebalance, hard to audit |
+| L2 | 20-level depth connections stay connected off-hours (no sleep like 200-level) | `depth_connection.rs` | Unnecessary open connections |
+| L3 | 200-level depth read timeout 40s may be too aggressive for illiquid strikes during market hours | `depth_connection.rs:40` | Could disconnect during low-activity periods |
+| L4 | No URL change detection — if Dhan changes endpoint URL, repeated failures until restart | config-based | No runtime URL override |
+| L5 | No TLS handshake failure classification (transient vs permanent) | `depth_connection.rs` | All TLS errors treated same |
+| L6 | Subscription builder allows duplicate SecurityIds without dedup | `subscription_builder.rs` | Dhan may reject or silently dedupe |
+| L7 | Unknown response codes from Dhan silently treated as errors — no payload sample logged | `tick_processor.rs:540-550` | Can't diagnose new packet types |
+
+#### ACCEPTED (Dhan Limitation / Design Decision)
+
+| # | Decision | Rationale |
+|---|----------|-----------|
+| A1 | No exchange timestamp in depth packets | Dhan protocol has no timestamp — all SDKs use local clock |
+| A2 | 200-level uses 1 connection per instrument | Dhan API limitation, not our choice |
+| A3 | Depth data only flows during 09:15-15:30 IST | Dhan sends nothing outside market hours |
+| A4 | PrevClose packets arrive on any subscription mode | Expected — used for day change % calculations |
+| A5 | Unsubscribe depth = 25 (not SDK's 24) | SDK bug; we follow Dhan docs |
+
+### 10.3 Missing Metrics
+
+| Metric | Purpose |
+|--------|---------|
+| `dlt_websocket_pool_all_dead` | Bool gauge: true if all 5 main feed connections are down |
+| `dlt_websocket_failed_connections_count` | Gauge: number of connections in Reconnecting state |
+| `dlt_depth_20lvl_sequence_gaps_total` | Counter: detected sequence gaps in 20-level packets |
+| `dlt_order_update_non_order_messages_dropped_total` | Counter: JSON messages that weren't order updates |
+| `dlt_unknown_response_codes_total` | Counter: Dhan sent a response code we don't recognize |
+| `dlt_packets_by_response_code` | Histogram: breakdown of all received packet types |
+
+### 10.4 Missing Tests
+
+| Test | Purpose |
+|------|---------|
+| All 5 connections fail simultaneously | Verify pool-level alert fires |
+| Token refresh during active streaming | Verify no frame loss during 807 → refresh → reconnect |
+| 200-level row_count = 500 (malformed) | Verify parser rejects with error (not buffer overflow) |
+| Order update with wrong MsgCode | Verify auth error detection path |
+| Graceful unsubscribe on shutdown | Verify unsubscribe messages sent before close |
+| Per-security stale tick detection | Verify alert after N seconds of no data for one security |
 
 ---
 
