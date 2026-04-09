@@ -36,6 +36,14 @@ const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 /// Flush batch size for indicator snapshots.
 const INDICATOR_FLUSH_BATCH_SIZE: usize = 500;
 
+/// Rounds an f64 to 2 decimal places, matching Dhan's display precision.
+/// Uses multiply-round-divide to avoid string conversion overhead.
+/// O(1) — pure arithmetic, zero allocation.
+#[inline]
+fn round2(value: f64) -> f64 {
+    (value * 100.0).round() / 100.0
+}
+
 // ---------------------------------------------------------------------------
 // DDL
 // ---------------------------------------------------------------------------
@@ -134,39 +142,42 @@ impl IndicatorSnapshotWriter {
             .context("segment")?
             .column_i64("security_id", i64::from(security_id))
             .context("security_id")?
-            .column_f64("ema_fast", ema_fast)
+            // Round all indicator values to 2 decimal places to match Dhan's
+            // display precision. Raw f64 computation produces many decimal digits
+            // (e.g. 20923.60785379...) but Dhan shows max 2 decimals.
+            .column_f64("ema_fast", round2(ema_fast))
             .context("ema_fast")?
-            .column_f64("ema_slow", ema_slow)
+            .column_f64("ema_slow", round2(ema_slow))
             .context("ema_slow")?
-            .column_f64("sma", sma)
+            .column_f64("sma", round2(sma))
             .context("sma")?
-            .column_f64("rsi", rsi)
+            .column_f64("rsi", round2(rsi))
             .context("rsi")?
-            .column_f64("macd_line", macd_line)
+            .column_f64("macd_line", round2(macd_line))
             .context("macd_line")?
-            .column_f64("macd_signal", macd_signal)
+            .column_f64("macd_signal", round2(macd_signal))
             .context("macd_signal")?
-            .column_f64("macd_histogram", macd_histogram)
+            .column_f64("macd_histogram", round2(macd_histogram))
             .context("macd_histogram")?
-            .column_f64("bollinger_upper", bollinger_upper)
+            .column_f64("bollinger_upper", round2(bollinger_upper))
             .context("bollinger_upper")?
-            .column_f64("bollinger_middle", bollinger_middle)
+            .column_f64("bollinger_middle", round2(bollinger_middle))
             .context("bollinger_middle")?
-            .column_f64("bollinger_lower", bollinger_lower)
+            .column_f64("bollinger_lower", round2(bollinger_lower))
             .context("bollinger_lower")?
-            .column_f64("atr", atr)
+            .column_f64("atr", round2(atr))
             .context("atr")?
-            .column_f64("supertrend", supertrend)
+            .column_f64("supertrend", round2(supertrend))
             .context("supertrend")?
             .column_bool("supertrend_bullish", supertrend_bullish)
             .context("supertrend_bullish")?
-            .column_f64("adx", adx)
+            .column_f64("adx", round2(adx))
             .context("adx")?
-            .column_f64("obv", obv)
+            .column_f64("obv", round2(obv))
             .context("obv")?
-            .column_f64("vwap", vwap)
+            .column_f64("vwap", round2(vwap))
             .context("vwap")?
-            .column_f64("ltp", ltp)
+            .column_f64("ltp", round2(ltp))
             .context("ltp")?
             .column_bool("is_warm", is_warm)
             .context("is_warm")?

@@ -1374,6 +1374,8 @@ async fn main() -> Result<()> {
                                 }
                                 Ok(_) => {} // non-depth frame (shouldn't happen)
                                 Err(err) => {
+                                    // H5: Escalate persistent parse failures to ERROR (triggers Telegram).
+                                    metrics::counter!("dlt_depth_parse_errors_total", "depth" => "20").increment(1);
                                     tracing::warn!(?err, "failed to parse 20-level depth packet");
                                 }
                             }
@@ -1618,7 +1620,7 @@ async fn main() -> Result<()> {
             });
 
             // Rebalance event channel (watch — latest-value semantics)
-            let (rebalance_tx, _rebalance_rx) = tokio::sync::watch::channel::<
+            let (rebalance_tx, mut rebalance_rx) = tokio::sync::watch::channel::<
                 Option<dhan_live_trader_core::instrument::depth_rebalancer::RebalanceEvent>,
             >(None);
 
@@ -1635,6 +1637,26 @@ async fn main() -> Result<()> {
                     std::sync::Arc::clone(&rebalancer_shutdown),
                 ),
             );
+
+            // L1: Listen for rebalance events and fire Telegram alerts.
+            {
+                let rebalance_notifier = notifier.clone();
+                tokio::spawn(async move {
+                    while rebalance_rx.changed().await.is_ok() {
+                        if let Some(event) = rebalance_rx.borrow().as_ref() {
+                            // O(1) EXEMPT: cold path — rebalance fires at most once per 60s
+                            rebalance_notifier.notify(NotificationEvent::Custom {
+                                message: format!(
+                                    "Depth rebalance: {} ATM shifted {:.2} → {:.2}",
+                                    event.underlying,
+                                    event.previous_atm_strike,
+                                    event.new_atm_strike
+                                ),
+                            });
+                        }
+                    }
+                });
+            }
             info!("depth rebalancer spawned (checks spot drift every 60s)");
             metrics::gauge!("dlt_depth_rebalancer_active").set(1.0);
         }
