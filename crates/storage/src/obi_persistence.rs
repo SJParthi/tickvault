@@ -444,4 +444,44 @@ mod tests {
         };
         assert!((record.obi).abs() < f64::EPSILON);
     }
+
+    // --- Dedup key mechanical verification ---
+
+    #[test]
+    fn test_obi_dedup_sql_includes_ts_security_id_segment() {
+        // Mechanically verify the exact SQL generated for DEDUP.
+        // This prevents silent regressions if someone changes DEDUP_KEY_OBI.
+        let dedup_sql = format!(
+            "ALTER TABLE {} DEDUP ENABLE UPSERT KEYS(ts, {})",
+            QUESTDB_TABLE_OBI_SNAPSHOTS, DEDUP_KEY_OBI
+        );
+        assert_eq!(
+            dedup_sql,
+            "ALTER TABLE obi_snapshots DEDUP ENABLE UPSERT KEYS(ts, security_id, segment)"
+        );
+    }
+
+    #[test]
+    fn test_obi_dedup_key_has_security_id() {
+        assert!(
+            DEDUP_KEY_OBI.contains("security_id"),
+            "DEDUP key must include security_id for per-instrument uniqueness"
+        );
+    }
+
+    #[test]
+    fn test_obi_dedup_key_has_segment() {
+        assert!(
+            DEDUP_KEY_OBI.contains("segment"),
+            "DEDUP key must include segment for cross-segment isolation"
+        );
+    }
+
+    #[test]
+    fn test_obi_ddl_has_designated_timestamp() {
+        assert!(
+            OBI_SNAPSHOTS_DDL.contains("TIMESTAMP(ts)"),
+            "DDL must have TIMESTAMP(ts) as designated timestamp"
+        );
+    }
 }

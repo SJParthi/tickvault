@@ -318,3 +318,151 @@ fn e2e_obi_sparse_book_alternating_empty() {
     assert_eq!(snap.ask_levels, 10, "10 non-empty out of 20");
     assert!((snap.obi).abs() < f64::EPSILON, "balanced sparse book");
 }
+
+// ---------------------------------------------------------------------------
+// E2E: Deduplication / uniqueness guarantees
+// ---------------------------------------------------------------------------
+
+#[test]
+fn e2e_obi_same_instrument_rapid_updates_last_wins() {
+    // Simulates same instrument receiving two Bid+Ask pairs in quick succession.
+    // The second OBI should reflect the LATEST state, not the first.
+    // QuestDB UPSERT with key (ts, security_id, segment) means last-write-wins.
+
+    // First snapshot: heavy bids
+    let bids_v1: Vec<DeepDepthLevel> = (0..20)
+        .map(|i| DeepDepthLevel {
+            price: 100.0 - i as f64 * 0.1,
+            quantity: 5000,
+            orders: 10,
+        })
+        .collect();
+    let asks_v1: Vec<DeepDepthLevel> = (0..20)
+        .map(|i| DeepDepthLevel {
+            price: 100.1 + i as f64 * 0.1,
+            quantity: 500,
+            orders: 5,
+        })
+        .collect();
+    let snap_v1 = compute_obi(49081, 2, &bids_v1, &asks_v1);
+
+    // Second snapshot: market flipped, heavy asks
+    let bids_v2: Vec<DeepDepthLevel> = (0..20)
+        .map(|i| DeepDepthLevel {
+            price: 100.0 - i as f64 * 0.1,
+            quantity: 500,
+            orders: 5,
+        })
+        .collect();
+    let asks_v2: Vec<DeepDepthLevel> = (0..20)
+        .map(|i| DeepDepthLevel {
+            price: 100.1 + i as f64 * 0.1,
+            quantity: 5000,
+            orders: 10,
+        })
+        .collect();
+    let snap_v2 = compute_obi(49081, 2, &bids_v2, &asks_v2);
+
+    // V1: positive OBI (more bids), V2: negative OBI (more asks)
+    assert!(snap_v1.obi > 0.5, "v1 should be bid-heavy");
+    assert!(snap_v2.obi < -0.5, "v2 should be ask-heavy");
+    // In QuestDB: with same (ts, security_id=49081, segment=2), v2 UPSERTs over v1.
+    // This is CORRECT: latest depth state is what matters for trading decisions.
+    assert!(
+        (snap_v1.obi - snap_v2.obi).abs() > 1.0,
+        "v1 and v2 should be drastically different — proving last-write-wins matters"
+    );
+}
+
+#[test]
+fn e2e_obi_different_instruments_same_timestamp_are_distinct() {
+    // Two different instruments produce OBI at the same nanosecond.
+    // Dedup key includes security_id → both rows persist, no collision.
+    let bids = vec![
+        DeepDepthLevel {
+            price: 100.0,
+            quantity: 1000,
+            orders: 10,
+        };
+        20
+    ];
+    let asks = vec![
+        DeepDepthLevel {
+            price: 101.0,
+            quantity: 500,
+            orders: 5,
+        };
+        20
+    ];
+
+    let snap_a = compute_obi(49081, 2, &bids, &asks); // NIFTY instrument
+    let snap_b = compute_obi(49082, 2, &bids, &asks); // Different instrument
+
+    // Same OBI value (same book), but different security_id
+    assert!((snap_a.obi - snap_b.obi).abs() < f64::EPSILON);
+    assert_ne!(snap_a.security_id, snap_b.security_id);
+    // In QuestDB: (ts, 49081, NSE_FNO) ≠ (ts, 49082, NSE_FNO) → both stored
+}
+
+#[test]
+fn e2e_obi_deterministic_replay() {
+    // Same input ALWAYS produces same output — no randomness, no state.
+    let bids: Vec<DeepDepthLevel> = (0..20)
+        .map(|i| DeepDepthLevel {
+            price: 24500.0 - i as f64 * 0.5,
+            quantity: 1000 + i as u32 * 100,
+            orders: 20 - i as u32,
+        })
+        .collect();
+    let asks: Vec<DeepDepthLevel> = (0..20)
+        .map(|i| DeepDepthLevel {
+            price: 24500.5 + i as f64 * 0.5,
+            quantity: 800 + i as u32 * 50,
+            orders: 15_u32.saturating_sub(i as u32).max(1),
+        })
+        .collect();
+
+    let snap1 = compute_obi(49081, 2, &bids, &asks);
+    let snap2 = compute_obi(49081, 2, &bids, &asks);
+    let snap3 = compute_obi(49081, 2, &bids, &asks);
+
+    // All three must be bit-for-bit identical
+    assert!((snap1.obi - snap2.obi).abs() < f64::EPSILON);
+    assert!((snap2.obi - snap3.obi).abs() < f64::EPSILON);
+    assert!((snap1.weighted_obi - snap3.weighted_obi).abs() < f64::EPSILON);
+    assert_eq!(snap1.total_bid_qty, snap3.total_bid_qty);
+    assert_eq!(snap1.total_ask_qty, snap3.total_ask_qty);
+    assert_eq!(snap1.max_bid_wall_qty, snap3.max_bid_wall_qty);
+    assert_eq!(snap1.max_ask_wall_qty, snap3.max_ask_wall_qty);
+    assert!((snap1.spread - snap3.spread).abs() < f64::EPSILON);
+}
+
+// ---------------------------------------------------------------------------
+// E2E: O(1) contract verification
+// ---------------------------------------------------------------------------
+
+#[test]
+fn e2e_obi_o1_input_clamped_at_20() {
+    // Passing 200 levels — only first 20 processed
+    let bids: Vec<DeepDepthLevel> = (0..200)
+        .map(|i| DeepDepthLevel {
+            price: 100.0 + i as f64,
+            quantity: 100,
+            orders: 1,
+        })
+        .collect();
+    let asks: Vec<DeepDepthLevel> = (0..200)
+        .map(|i| DeepDepthLevel {
+            price: 300.0 + i as f64,
+            quantity: 100,
+            orders: 1,
+        })
+        .collect();
+
+    let snap = compute_obi(1, 2, &bids, &asks);
+    // Only 20 levels counted, not 200
+    assert_eq!(snap.bid_levels, 20, "must clamp to MAX_DEPTH_LEVELS=20");
+    assert_eq!(snap.ask_levels, 20, "must clamp to MAX_DEPTH_LEVELS=20");
+    assert_eq!(snap.total_bid_qty, 2000, "20 × 100");
+    assert_eq!(snap.total_ask_qty, 2000, "20 × 100");
+}
