@@ -1314,7 +1314,12 @@ async fn main() -> Result<()> {
 
                 // Spawn depth frame receiver with QuestDB persistence + OBI computation
                 tokio::spawn(async move {
+                    // Pre-register metric handles to avoid String clone on every frame/OBI computation.
                     let m = metrics::counter!("dlt_depth_20lvl_frames_received", "underlying" => depth_label_recv.clone());
+                    let m_obi_value =
+                        metrics::gauge!("dlt_obi_value", "underlying" => depth_label_recv.clone());
+                    let m_obi_computations = metrics::counter!("dlt_obi_computations_total", "underlying" => depth_label_recv.clone());
+                    let m_obi_errors = metrics::counter!("dlt_obi_persist_errors_total", "underlying" => depth_label_recv.clone());
                     let mut writer =
                         dhan_live_trader_storage::deep_depth_persistence::DeepDepthWriter::new(
                             &depth_questdb,
@@ -1413,17 +1418,9 @@ async fn main() -> Result<()> {
                                                     &levels,
                                                 );
 
-                                                // Update Prometheus gauges
-                                                metrics::gauge!(
-                                                    "dlt_obi_value",
-                                                    "underlying" => depth_label_recv.clone(),
-                                                )
-                                                .set(obi_snap.obi);
-                                                metrics::counter!(
-                                                    "dlt_obi_computations_total",
-                                                    "underlying" => depth_label_recv.clone(),
-                                                )
-                                                .increment(1);
+                                                // Update Prometheus gauges (pre-registered, zero-clone)
+                                                m_obi_value.set(obi_snap.obi);
+                                                m_obi_computations.increment(1);
 
                                                 // Persist OBI snapshot with separate ts and received_at.
                                                 // ts = received_at IST (for QuestDB designated timestamp).
@@ -1447,11 +1444,7 @@ async fn main() -> Result<()> {
                                                         ts_nanos: ts_ist,
                                                     };
                                                     if let Err(err) = ow.append_obi(&obi_record) {
-                                                        metrics::counter!(
-                                                            "dlt_obi_persist_errors_total",
-                                                            "underlying" => depth_label_recv.clone(),
-                                                        )
-                                                        .increment(1);
+                                                        m_obi_errors.increment(1);
                                                         tracing::warn!(?err, "failed to persist OBI snapshot");
                                                     }
                                                 }
@@ -1470,6 +1463,23 @@ async fn main() -> Result<()> {
                             }
                         }
                     }
+
+                    // Flush remaining buffered records on shutdown (channel closed).
+                    // Without this, records buffered since last auto-flush are lost.
+                    if let Some(ref mut w) = writer
+                        && let Err(err) = w.flush()
+                    {
+                        tracing::warn!(?err, "depth writer flush on shutdown failed");
+                    }
+                    if let Some(ref mut ow) = obi_writer
+                        && let Err(err) = ow.flush()
+                    {
+                        tracing::warn!(?err, "OBI writer flush on shutdown failed");
+                    }
+                    tracing::info!(
+                        underlying = depth_label_recv,
+                        "depth frame receiver task exiting"
+                    );
                 });
 
                 // Spawn depth WebSocket connection with Telegram alerts + health updates
