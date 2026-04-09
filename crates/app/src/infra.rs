@@ -789,12 +789,23 @@ fn is_service_reachable(host: &str, port: u16) -> bool {
     .is_ok()
 }
 
-/// Runs `docker compose up -d` with the given environment variables.
+/// Runs `docker compose up -d --force-recreate` with the given environment variables.
+///
+/// `--force-recreate` ensures containers with updated configs (healthchecks,
+/// dashboard JSON, Alloy config) are recreated automatically. Docker only
+/// recreates containers whose config hash actually changed — no-op for unchanged.
 async fn run_docker_compose_up(env_vars: &[(&str, String)]) -> Result<()> {
     use tokio::process::Command;
 
     let mut cmd = Command::new("docker");
-    cmd.args(["compose", "-f", DOCKER_COMPOSE_PATH, "up", "-d"]);
+    cmd.args([
+        "compose",
+        "-f",
+        DOCKER_COMPOSE_PATH,
+        "up",
+        "-d",
+        "--force-recreate",
+    ]);
 
     for (key, value) in env_vars {
         cmd.env(key, value);
