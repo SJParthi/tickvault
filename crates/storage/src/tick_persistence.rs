@@ -1140,15 +1140,16 @@ pub async fn ensure_tick_table_dedup_keys(questdb_config: &QuestDbConfig) {
 struct BufferedDepth {
     security_id: u32,
     exchange_segment_code: u8,
+    exchange_timestamp: u32,
     received_at_nanos: i64,
     depth: [MarketDepthLevel; 5],
 }
 
-/// Fixed record size for disk-spilled depth snapshots: 116 bytes per snapshot.
-/// Layout: security_id(4) + segment(1) + pad(3) + received_nanos(8) +
-///         5 x [bid_qty(4) + ask_qty(4) + bid_orders(2) + ask_orders(2) +
-///              bid_price(4) + ask_price(4)] = 16 + 100 = 116 bytes (aligned).
-const DEPTH_SPILL_RECORD_SIZE: usize = 116;
+/// Fixed record size for disk-spilled depth snapshots: 120 bytes per snapshot.
+/// Layout: security_id(4) + segment(1) + pad(3) + exchange_timestamp(4) + pad(4) +
+///         received_nanos(8) + 5 x [bid_qty(4) + ask_qty(4) + bid_orders(2) +
+///         ask_orders(2) + bid_price(4) + ask_price(4)] = 24 + 100 = 124 bytes.
+const DEPTH_SPILL_RECORD_SIZE: usize = 124;
 
 /// Directory for depth spill files.
 const DEPTH_SPILL_DIR: &str = "data/spill";
@@ -1160,8 +1161,10 @@ fn serialize_depth(d: &BufferedDepth) -> [u8; DEPTH_SPILL_RECORD_SIZE] {
     buf[0..4].copy_from_slice(&d.security_id.to_le_bytes());
     buf[4] = d.exchange_segment_code;
     // buf[5..7] = padding
-    buf[8..16].copy_from_slice(&d.received_at_nanos.to_le_bytes());
-    let mut offset = 16;
+    buf[8..12].copy_from_slice(&d.exchange_timestamp.to_le_bytes());
+    // buf[12..15] = padding
+    buf[16..24].copy_from_slice(&d.received_at_nanos.to_le_bytes());
+    let mut offset = 24;
     for level in &d.depth {
         buf[offset..offset + 4].copy_from_slice(&level.bid_quantity.to_le_bytes());
         buf[offset + 4..offset + 8].copy_from_slice(&level.ask_quantity.to_le_bytes());
@@ -1182,11 +1185,12 @@ fn serialize_depth(d: &BufferedDepth) -> [u8; DEPTH_SPILL_RECORD_SIZE] {
 fn deserialize_depth(buf: &[u8; DEPTH_SPILL_RECORD_SIZE]) -> BufferedDepth {
     let security_id = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
     let exchange_segment_code = buf[4];
+    let exchange_timestamp = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
     let received_at_nanos = i64::from_le_bytes([
-        buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
+        buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23],
     ]);
     let mut depth = [MarketDepthLevel::default(); 5];
-    let mut offset = 16;
+    let mut offset = 24;
     for level in &mut depth {
         level.bid_quantity = u32::from_le_bytes([
             buf[offset],
@@ -1223,6 +1227,7 @@ fn deserialize_depth(buf: &[u8; DEPTH_SPILL_RECORD_SIZE]) -> BufferedDepth {
     BufferedDepth {
         security_id,
         exchange_segment_code,
+        exchange_timestamp,
         received_at_nanos,
         depth,
     }
@@ -1336,6 +1341,7 @@ impl DepthPersistenceWriter {
         &mut self,
         security_id: u32,
         exchange_segment_code: u8,
+        exchange_timestamp: u32,
         received_at_nanos: i64,
         depth: &[MarketDepthLevel; 5],
     ) -> Result<()> {
@@ -1351,6 +1357,7 @@ impl DepthPersistenceWriter {
                     self.buffer_depth(BufferedDepth {
                         security_id,
                         exchange_segment_code,
+                        exchange_timestamp,
                         received_at_nanos,
                         depth: *depth,
                     });
@@ -1363,15 +1370,17 @@ impl DepthPersistenceWriter {
             &mut self.buffer,
             security_id,
             exchange_segment_code,
+            exchange_timestamp,
             received_at_nanos,
             depth,
         )?;
 
         // Track in-flight: save a copy so we can rescue on flush failure.
-        // BufferedDepth is Copy (116 bytes) — this is a memcpy, not a heap alloc.
+        // BufferedDepth is Copy — this is a memcpy, not a heap alloc.
         self.in_flight.push(BufferedDepth {
             security_id,
             exchange_segment_code,
+            exchange_timestamp,
             received_at_nanos,
             depth: *depth,
         });
@@ -1543,7 +1552,7 @@ impl DepthPersistenceWriter {
         let ring_count = self.depth_buffer.len();
         let mut drained: usize = 0;
         while let Some(snapshot) = self.depth_buffer.pop_front() {
-            if let Err(err) = build_depth_rows(&mut self.buffer, snapshot.security_id, snapshot.exchange_segment_code, snapshot.received_at_nanos, &snapshot.depth) {
+            if let Err(err) = build_depth_rows(&mut self.buffer, snapshot.security_id, snapshot.exchange_segment_code, snapshot.exchange_timestamp, snapshot.received_at_nanos, &snapshot.depth) {
                 error!(?err, security_id = snapshot.security_id, "CRITICAL: build_depth_rows failed during drain — snapshot lost"); continue;
             }
             self.in_flight.push(snapshot);
@@ -1585,7 +1594,7 @@ impl DepthPersistenceWriter {
                 Err(err) => { warn!(?err, drained, "depth disk spill read error — stopping drain"); break; }
             }
             let snapshot = deserialize_depth(&record);
-            if let Err(err) = build_depth_rows(&mut self.buffer, snapshot.security_id, snapshot.exchange_segment_code, snapshot.received_at_nanos, &snapshot.depth) {
+            if let Err(err) = build_depth_rows(&mut self.buffer, snapshot.security_id, snapshot.exchange_segment_code, snapshot.exchange_timestamp, snapshot.received_at_nanos, &snapshot.depth) {
                 error!(?err, security_id = snapshot.security_id, "CRITICAL: build_depth_rows failed during spill drain — snapshot lost"); continue;
             }
             self.in_flight.push(snapshot);
@@ -1790,7 +1799,7 @@ impl DepthPersistenceWriter {
                     Err(err) => { warn!(?err, drained, path = %path.display(), "stale depth spill read error — stopping drain"); break; }
                 }
                 let snapshot = deserialize_depth(&record);
-                if let Err(err) = build_depth_rows(&mut self.buffer, snapshot.security_id, snapshot.exchange_segment_code, snapshot.received_at_nanos, &snapshot.depth) {
+                if let Err(err) = build_depth_rows(&mut self.buffer, snapshot.security_id, snapshot.exchange_segment_code, snapshot.exchange_timestamp, snapshot.received_at_nanos, &snapshot.depth) {
                     warn!(?err, security_id = snapshot.security_id, "build_depth_rows failed during stale spill drain — snapshot skipped"); continue;
                 }
                 self.in_flight.push(snapshot);
@@ -1817,16 +1826,26 @@ impl DepthPersistenceWriter {
 /// Writes 5 depth-level rows into the ILP buffer for a single snapshot.
 ///
 /// Table: `market_depth` with columns: segment, security_id, level (1-5),
-/// bid_qty, ask_qty, bid_orders, ask_orders, bid_price, ask_price, received_at, ts.
+/// bid_qty, ask_qty, bid_orders, ask_orders, bid_price, ask_price,
+/// exchange_timestamp (IST epoch secs from Full packet LTT), received_at, ts.
+///
+/// Follows the same timestamp pattern as the `ticks` table:
+/// - `ts` = exchange_timestamp * 1B nanos (IST epoch, NO offset)
+/// - `received_at` = UTC nanos + IST offset
+/// - `exchange_timestamp` = raw IST epoch seconds LONG
 ///
 /// Price fields use `f32_to_f64_clean` to preserve Dhan f32 precision.
 fn build_depth_rows(
     buffer: &mut Buffer,
     security_id: u32,
     exchange_segment_code: u8,
+    exchange_timestamp: u32,
     received_at_nanos: i64,
     depth: &[MarketDepthLevel; 5],
 ) -> Result<()> {
+    // Dhan WebSocket exchange_timestamp (LTT) is already IST epoch seconds.
+    // Store directly — no offset needed. Same rule as ticks table.
+    let ts_nanos = TimestampNanos::new(i64::from(exchange_timestamp).saturating_mul(1_000_000_000));
     // UTC nanos → IST-as-UTC: add IST offset so QuestDB shows IST wall-clock time.
     let received_nanos =
         TimestampNanos::new(received_at_nanos.saturating_add(IST_UTC_OFFSET_NANOS));
@@ -1856,9 +1875,11 @@ fn build_depth_rows(
             .context("depth bid_price")?
             .column_f64("ask_price", f32_to_f64_clean(level.ask_price))
             .context("depth ask_price")?
+            .column_i64("exchange_timestamp", i64::from(exchange_timestamp))
+            .context("depth exchange_timestamp")?
             .column_ts("received_at", received_nanos)
             .context("depth received_at")?
-            .at(received_nanos)
+            .at(ts_nanos)
             .context("depth designated timestamp")?;
     }
 
@@ -1899,6 +1920,8 @@ pub fn build_previous_close_row(
         .context("prev_close price")?
         .column_i64("prev_oi", i64::from(previous_oi))
         .context("prev_close oi")?
+        .column_ts("received_at", received_nanos)
+        .context("prev_close received_at")?
         .at(received_nanos)
         .context("prev_close designated timestamp")?;
 
@@ -1910,6 +1933,8 @@ pub fn build_previous_close_row(
 // ---------------------------------------------------------------------------
 
 /// SQL to create the `market_depth` table with explicit schema.
+/// Matches ticks table pattern: exchange_timestamp (IST epoch secs from LTT),
+/// received_at (local clock IST), ts (designated = exchange_timestamp * 1B).
 const MARKET_DEPTH_CREATE_DDL: &str = "\
     CREATE TABLE IF NOT EXISTS market_depth (\
         segment SYMBOL,\
@@ -1921,18 +1946,22 @@ const MARKET_DEPTH_CREATE_DDL: &str = "\
         ask_orders LONG,\
         bid_price DOUBLE,\
         ask_price DOUBLE,\
+        exchange_timestamp LONG,\
         received_at TIMESTAMP,\
         ts TIMESTAMP\
     ) TIMESTAMP(ts) PARTITION BY HOUR WAL\
 ";
 
 /// SQL to create the `previous_close` table with explicit schema.
+/// PrevClose packets (code 6) have NO exchange timestamp — only received_at is available.
+/// `received_at` added for consistency with ticks/market_depth pattern.
 const PREVIOUS_CLOSE_CREATE_DDL: &str = "\
     CREATE TABLE IF NOT EXISTS previous_close (\
         segment SYMBOL,\
         security_id LONG,\
         prev_close DOUBLE,\
         prev_oi LONG,\
+        received_at TIMESTAMP,\
         ts TIMESTAMP\
     ) TIMESTAMP(ts) PARTITION BY DAY WAL\
 ";
@@ -3612,7 +3641,7 @@ mod tests {
     fn test_build_depth_rows_writes_five_rows() {
         let depth = make_test_depth();
         let mut buf = Buffer::new(ProtocolVersion::V1);
-        build_depth_rows(&mut buf, 13, 2, 1_000_000_000, &depth).unwrap();
+        build_depth_rows(&mut buf, 13, 2, 1_740_556_500, 1_000_000_000, &depth).unwrap();
         let content = String::from_utf8_lossy(buf.as_bytes());
 
         // Should produce exactly 5 ILP lines (one per level)
@@ -3624,7 +3653,7 @@ mod tests {
     fn test_build_depth_rows_contains_table_name() {
         let depth = make_test_depth();
         let mut buf = Buffer::new(ProtocolVersion::V1);
-        build_depth_rows(&mut buf, 13, 2, 1_000_000_000, &depth).unwrap();
+        build_depth_rows(&mut buf, 13, 2, 1_740_556_500, 1_000_000_000, &depth).unwrap();
         let content = String::from_utf8_lossy(buf.as_bytes());
 
         assert!(
@@ -3637,7 +3666,7 @@ mod tests {
     fn test_build_depth_rows_level_numbers() {
         let depth = make_test_depth();
         let mut buf = Buffer::new(ProtocolVersion::V1);
-        build_depth_rows(&mut buf, 42, 2, 1_000_000_000, &depth).unwrap();
+        build_depth_rows(&mut buf, 42, 2, 1_740_556_500, 1_000_000_000, &depth).unwrap();
         let content = String::from_utf8_lossy(buf.as_bytes());
 
         for level in 1..=5 {
@@ -3652,7 +3681,7 @@ mod tests {
     fn test_build_depth_rows_bid_ask_values() {
         let depth = make_test_depth();
         let mut buf = Buffer::new(ProtocolVersion::V1);
-        build_depth_rows(&mut buf, 13, 2, 1_000_000_000, &depth).unwrap();
+        build_depth_rows(&mut buf, 13, 2, 1_740_556_500, 1_000_000_000, &depth).unwrap();
         let content = String::from_utf8_lossy(buf.as_bytes());
 
         // Level 1 values
@@ -3670,7 +3699,7 @@ mod tests {
         depth[0].bid_price = 21004.95;
         depth[0].ask_price = 744.15;
         let mut buf = Buffer::new(ProtocolVersion::V1);
-        build_depth_rows(&mut buf, 13, 2, 1_000_000_000, &depth).unwrap();
+        build_depth_rows(&mut buf, 13, 2, 1_740_556_500, 1_000_000_000, &depth).unwrap();
         let content = String::from_utf8_lossy(buf.as_bytes());
 
         assert!(
@@ -3687,7 +3716,7 @@ mod tests {
     fn test_build_depth_rows_zero_depth() {
         let depth = [MarketDepthLevel::default(); 5];
         let mut buf = Buffer::new(ProtocolVersion::V1);
-        build_depth_rows(&mut buf, 13, 2, 1_000_000_000, &depth).unwrap();
+        build_depth_rows(&mut buf, 13, 2, 1_740_556_500, 1_000_000_000, &depth).unwrap();
         let content = String::from_utf8_lossy(buf.as_bytes());
 
         // All levels should have zero quantities
@@ -3705,6 +3734,7 @@ mod tests {
             &mut buf,
             13,
             EXCHANGE_SEGMENT_NSE_FNO,
+            1_740_556_500,
             1_000_000_000,
             &depth,
         )
@@ -3841,7 +3871,9 @@ mod tests {
         let mut writer = DepthPersistenceWriter::new(&config).unwrap();
         let depth = make_test_depth();
 
-        writer.append_depth(13, 2, 1_000_000_000, &depth).unwrap();
+        writer
+            .append_depth(13, 2, 1_740_556_500, 1_000_000_000, &depth)
+            .unwrap();
         writer.force_flush().unwrap();
     }
 
@@ -4303,7 +4335,9 @@ mod tests {
         };
         let mut writer = DepthPersistenceWriter::new(&config).unwrap();
         let depth = make_test_depth();
-        writer.append_depth(13, 2, 1_000_000_000, &depth).unwrap();
+        writer
+            .append_depth(13, 2, 1_740_556_500, 1_000_000_000, &depth)
+            .unwrap();
         // flush_if_needed checks the time elapsed — exercises the code path.
         let result = writer.flush_if_needed();
         assert!(result.is_ok());
@@ -4323,7 +4357,7 @@ mod tests {
 
         for i in 0..DEPTH_FLUSH_BATCH_SIZE as u32 {
             writer
-                .append_depth(1000 + i, 2, 1_000_000_000 + i as i64, &depth)
+                .append_depth(1000 + i, 2, 1_740_556_500, 1_000_000_000 + i as i64, &depth)
                 .unwrap();
         }
         // After auto-flush at DEPTH_FLUSH_BATCH_SIZE, pending should be 0.
@@ -4618,6 +4652,7 @@ mod tests {
             .append_depth(
                 13,
                 EXCHANGE_SEGMENT_NSE_FNO,
+                1_740_556_500,
                 1_740_556_500_000_000_000,
                 &depth,
             )
@@ -4675,6 +4710,7 @@ mod tests {
             &mut buffer,
             13,
             EXCHANGE_SEGMENT_NSE_FNO,
+            1_740_556_500,
             1_740_556_500_000_000_000,
             &depth,
         )
@@ -4700,6 +4736,7 @@ mod tests {
             &mut buffer,
             42,
             EXCHANGE_SEGMENT_NSE_EQ,
+            1_740_556_500,
             1_000_000_000,
             &depth,
         )
@@ -5028,7 +5065,7 @@ mod tests {
             bid_price: 0.0,
             ask_price: 0.0,
         }; 5];
-        let result = build_depth_rows(&mut buffer, 1, EXCHANGE_SEGMENT_NSE_FNO, 0, &depth);
+        let result = build_depth_rows(&mut buffer, 1, EXCHANGE_SEGMENT_NSE_FNO, 0, 0, &depth);
         assert!(result.is_ok());
         assert_eq!(buffer.row_count(), 5, "5 depth levels = 5 ILP rows");
     }
@@ -5200,7 +5237,14 @@ mod tests {
             EXCHANGE_SEGMENT_BSE_EQ,
         ] {
             let mut buffer = Buffer::new(ProtocolVersion::V1);
-            let result = build_depth_rows(&mut buffer, 42, seg, 1_700_000_000_000_000_000, &depth);
+            let result = build_depth_rows(
+                &mut buffer,
+                42,
+                seg,
+                1_740_556_500,
+                1_700_000_000_000_000_000,
+                &depth,
+            );
             assert!(
                 result.is_ok(),
                 "depth rows must succeed for segment {}",
@@ -5407,6 +5451,7 @@ mod tests {
             .append_depth(
                 42,
                 EXCHANGE_SEGMENT_NSE_EQ,
+                1_740_556_500,
                 1_700_000_000_000_000_000,
                 &depth,
             )
@@ -5561,7 +5606,15 @@ mod tests {
         let depth = make_test_depth();
         let received_at_utc_nanos: i64 = 1_740_556_500_000_000_000;
         let mut buf = Buffer::new(ProtocolVersion::V1);
-        build_depth_rows(&mut buf, 13, 2, received_at_utc_nanos, &depth).unwrap();
+        build_depth_rows(
+            &mut buf,
+            13,
+            2,
+            1_740_556_500,
+            received_at_utc_nanos,
+            &depth,
+        )
+        .unwrap();
         let content = String::from_utf8_lossy(buf.as_bytes());
 
         // received_at is shifted by IST_UTC_OFFSET_NANOS for IST-as-UTC.
@@ -5601,12 +5654,24 @@ mod tests {
 
         let depth = make_test_depth();
         writer
-            .append_depth(13, EXCHANGE_SEGMENT_NSE_FNO, 1_000_000_000, &depth)
+            .append_depth(
+                13,
+                EXCHANGE_SEGMENT_NSE_FNO,
+                1_740_556_500,
+                1_000_000_000,
+                &depth,
+            )
             .unwrap();
         assert_eq!(writer.pending_count, 1);
 
         writer
-            .append_depth(25, EXCHANGE_SEGMENT_NSE_FNO, 1_000_000_000, &depth)
+            .append_depth(
+                25,
+                EXCHANGE_SEGMENT_NSE_FNO,
+                1_740_556_500,
+                1_000_000_000,
+                &depth,
+            )
             .unwrap();
         assert_eq!(writer.pending_count, 2);
 
@@ -5626,12 +5691,16 @@ mod tests {
         let mut writer = DepthPersistenceWriter::new(&config).unwrap();
 
         let depth = make_test_depth();
-        writer.append_depth(13, 2, 1_000_000_000, &depth).unwrap();
+        writer
+            .append_depth(13, 2, 1_740_556_500, 1_000_000_000, &depth)
+            .unwrap();
         writer.force_flush().unwrap();
         assert_eq!(writer.pending_count, 0);
 
         // Reuse after flush
-        writer.append_depth(25, 2, 1_000_000_001, &depth).unwrap();
+        writer
+            .append_depth(25, 2, 1_740_556_500, 1_000_000_001, &depth)
+            .unwrap();
         assert_eq!(writer.pending_count, 1);
         writer.force_flush().unwrap();
         assert_eq!(writer.pending_count, 0);
@@ -5795,7 +5864,9 @@ mod tests {
 
         // Verify the writer is functional after reconnect.
         let depth = make_test_depth();
-        writer.append_depth(13, 2, 1_000_000_000, &depth).unwrap();
+        writer
+            .append_depth(13, 2, 1_740_556_500, 1_000_000_000, &depth)
+            .unwrap();
         writer.force_flush().unwrap();
         assert_eq!(writer.pending_count, 0);
     }
@@ -7393,7 +7464,9 @@ mod tests {
         writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
 
         let depth = make_test_depth();
-        writer.append_depth(42, 2, 1_000_000_000, &depth).unwrap();
+        writer
+            .append_depth(42, 2, 1_740_556_500, 1_000_000_000, &depth)
+            .unwrap();
         assert_eq!(
             writer.buffered_depth_count(),
             1,
@@ -7418,7 +7491,9 @@ mod tests {
 
         // Append a depth snapshot (goes to ILP buffer + in_flight).
         let depth = make_test_depth();
-        writer.append_depth(42, 2, 1_000_000_000, &depth).unwrap();
+        writer
+            .append_depth(42, 2, 1_740_556_500, 1_000_000_000, &depth)
+            .unwrap();
         assert_eq!(writer.in_flight.len(), 1);
         assert_eq!(writer.pending_count, 1);
 
@@ -7452,6 +7527,7 @@ mod tests {
         let buffered = BufferedDepth {
             security_id: 49081,
             exchange_segment_code: 2,
+            exchange_timestamp: 1_740_556_500,
             received_at_nanos: 1_740_556_500_123_456_789,
             depth,
         };
@@ -7503,6 +7579,7 @@ mod tests {
         let buffered = BufferedDepth {
             security_id: 0,
             exchange_segment_code: 0,
+            exchange_timestamp: 0,
             received_at_nanos: 0,
             depth: [MarketDepthLevel::default(); 5],
         };
@@ -7533,6 +7610,7 @@ mod tests {
         writer.buffer_depth(BufferedDepth {
             security_id: 1,
             exchange_segment_code: 1,
+            exchange_timestamp: 0,
             received_at_nanos: 1_000_000,
             depth,
         });
@@ -7541,6 +7619,7 @@ mod tests {
         writer.buffer_depth(BufferedDepth {
             security_id: 2,
             exchange_segment_code: 2,
+            exchange_timestamp: 0,
             received_at_nanos: 2_000_000,
             depth,
         });
@@ -7565,6 +7644,7 @@ mod tests {
             writer.buffer_depth(BufferedDepth {
                 security_id: i,
                 exchange_segment_code: 2,
+                exchange_timestamp: 0,
                 received_at_nanos: i64::from(i) * 1_000_000,
                 depth,
             });
@@ -7597,6 +7677,7 @@ mod tests {
             writer.in_flight.push(BufferedDepth {
                 security_id: 100 + i,
                 exchange_segment_code: 2,
+                exchange_timestamp: 0,
                 received_at_nanos: i64::from(i) * 1_000_000,
                 depth,
             });
@@ -7645,7 +7726,7 @@ mod tests {
         let snapshot_count = 10_usize;
         for i in 0..snapshot_count as u32 {
             writer
-                .append_depth(100 + i, 2, i64::from(i) * 1_000_000, &depth)
+                .append_depth(100 + i, 2, 1_740_556_500, i64::from(i) * 1_000_000, &depth)
                 .unwrap();
         }
         assert_eq!(writer.buffered_depth_count(), snapshot_count);
@@ -7715,6 +7796,7 @@ mod tests {
             writer.buffer_depth(BufferedDepth {
                 security_id: i,
                 exchange_segment_code: 2,
+                exchange_timestamp: 0,
                 received_at_nanos: i64::from(i) * 1_000_000,
                 depth,
             });
@@ -7770,7 +7852,7 @@ mod tests {
         let depth = make_test_depth();
         for i in 0..3u32 {
             writer
-                .append_depth(200 + i, 2, i64::from(i) * 1_000_000, &depth)
+                .append_depth(200 + i, 2, 1_740_556_500, i64::from(i) * 1_000_000, &depth)
                 .unwrap();
         }
         assert_eq!(writer.in_flight.len(), 3);
@@ -7829,6 +7911,7 @@ mod tests {
                 let snapshot = BufferedDepth {
                     security_id: 300 + i,
                     exchange_segment_code: 2,
+                    exchange_timestamp: 0,
                     received_at_nanos: i64::from(i) * 1_000_000,
                     depth,
                 };
@@ -7904,6 +7987,7 @@ mod tests {
                 let snapshot = BufferedDepth {
                     security_id: 400 + i,
                     exchange_segment_code: 2,
+                    exchange_timestamp: 0,
                     received_at_nanos: i64::from(i) * 1_000_000,
                     depth,
                 };
@@ -8154,7 +8238,7 @@ mod tests {
         let depth = make_test_depth();
 
         // append_depth should NOT error — snapshot gets buffered.
-        let result = writer.append_depth(42, 2, 1_000_000_000, &depth);
+        let result = writer.append_depth(42, 2, 1_740_556_500, 1_000_000_000, &depth);
         assert!(
             result.is_ok(),
             "append_depth must succeed by buffering when disconnected"
@@ -8191,7 +8275,7 @@ mod tests {
         let depth = make_test_depth();
         for i in 0..5_u32 {
             writer
-                .append_depth(i, 2, 1_000_000_000 + i as i64, &depth)
+                .append_depth(i, 2, 1_740_556_500, 1_000_000_000 + i as i64, &depth)
                 .unwrap();
         }
         assert_eq!(writer.in_flight.len(), 5);
@@ -8278,6 +8362,7 @@ mod tests {
             writer.buffer_depth(BufferedDepth {
                 security_id: i as u32,
                 exchange_segment_code: 2,
+                exchange_timestamp: 0,
                 received_at_nanos: i64::from(i as u32) * 1_000_000,
                 depth,
             });
@@ -8291,6 +8376,7 @@ mod tests {
             writer.buffer_depth(BufferedDepth {
                 security_id: 100_000 + i,
                 exchange_segment_code: 2,
+                exchange_timestamp: 0,
                 received_at_nanos: i64::from(i) * 1_000_000,
                 depth,
             });
@@ -8352,7 +8438,9 @@ mod tests {
         let mut writer = DepthPersistenceWriter::new(&config).unwrap();
         let depth = make_test_depth();
 
-        writer.append_depth(42, 2, 1_000_000_000, &depth).unwrap();
+        writer
+            .append_depth(42, 2, 1_740_556_500, 1_000_000_000, &depth)
+            .unwrap();
         assert!(writer.pending_count > 0);
 
         // Set last_flush_ms to 0 to force the time elapsed check to pass.
@@ -8564,6 +8652,7 @@ mod tests {
             writer.buffer_depth(BufferedDepth {
                 security_id: i as u32,
                 exchange_segment_code: 2,
+                exchange_timestamp: 0,
                 received_at_nanos: 1_740_556_500_000_000_000 + i as i64,
                 depth,
             });
@@ -8611,6 +8700,7 @@ mod tests {
             writer.buffer_depth(BufferedDepth {
                 security_id: i,
                 exchange_segment_code: 2,
+                exchange_timestamp: 0,
                 received_at_nanos: 1_740_556_500_000_000_000 + i64::from(i),
                 depth,
             });
@@ -8624,7 +8714,7 @@ mod tests {
 
         // Append triggers reconnect then drain.
         let depth = make_test_depth();
-        let result = writer.append_depth(99, 2, 1_740_556_600_000_000_000, &depth);
+        let result = writer.append_depth(99, 2, 1_740_556_600, 1_740_556_600_000_000_000, &depth);
         assert!(result.is_ok());
 
         // After drain, ring buffer should be empty.
@@ -8813,6 +8903,7 @@ mod tests {
             let _ = build_depth_rows(
                 &mut writer.buffer,
                 i as u32,
+                1_740_556_500,
                 2,
                 1_740_556_500_000_000_000 + i as i64,
                 &depth,
@@ -8820,6 +8911,7 @@ mod tests {
             writer.in_flight.push(BufferedDepth {
                 security_id: i as u32,
                 exchange_segment_code: 2,
+                exchange_timestamp: 0,
                 received_at_nanos: 1_740_556_500_000_000_000 + i as i64,
                 depth,
             });
@@ -8922,6 +9014,7 @@ mod tests {
                 &mut writer.buffer,
                 i as u32,
                 2,
+                1_740_556_500,
                 1_740_556_500_000_000_000 + i as i64,
                 &depth,
             )
@@ -8929,6 +9022,7 @@ mod tests {
             writer.in_flight.push(BufferedDepth {
                 security_id: i as u32,
                 exchange_segment_code: 2,
+                exchange_timestamp: 0,
                 received_at_nanos: 1_740_556_500_000_000_000 + i as i64,
                 depth,
             });
@@ -8940,7 +9034,8 @@ mod tests {
         writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
 
         // This should trigger auto-flush at DEPTH_FLUSH_BATCH_SIZE, which will fail.
-        let result = writer.append_depth(99999, 2, 1_740_556_600_000_000_000, &depth);
+        let result =
+            writer.append_depth(99999, 2, 1_740_556_600, 1_740_556_600_000_000_000, &depth);
         assert!(
             result.is_ok(),
             "append_depth must succeed even if auto-flush fails"
@@ -9125,6 +9220,7 @@ mod tests {
             writer.depth_buffer.push_back(BufferedDepth {
                 security_id: i as u32,
                 exchange_segment_code: 2,
+                exchange_timestamp: 0,
                 received_at_nanos: i as i64,
                 depth,
             });
@@ -9136,6 +9232,7 @@ mod tests {
         let snapshot = BufferedDepth {
             security_id: 999_999,
             exchange_segment_code: 2,
+            exchange_timestamp: 0,
             received_at_nanos: 999_999,
             depth,
         };
@@ -9317,6 +9414,7 @@ mod tests {
             writer.in_flight.push(BufferedDepth {
                 security_id: i as u32,
                 exchange_segment_code: 2,
+                exchange_timestamp: 0,
                 received_at_nanos: i as i64,
                 depth,
             });
@@ -9395,6 +9493,7 @@ mod tests {
             writer.depth_buffer.push_back(BufferedDepth {
                 security_id: i as u32,
                 exchange_segment_code: 2,
+                exchange_timestamp: 0,
                 received_at_nanos: 1_740_556_500_000_000_000 + i as i64,
                 depth,
             });
@@ -9490,6 +9589,7 @@ mod tests {
                 let snapshot = BufferedDepth {
                     security_id: i as u32,
                     exchange_segment_code: 2,
+                    exchange_timestamp: 0,
                     received_at_nanos: 1_740_556_500_000_000_000 + i as i64,
                     depth,
                 };
@@ -9572,6 +9672,7 @@ mod tests {
         writer.depth_buffer.push_back(BufferedDepth {
             security_id: 1,
             exchange_segment_code: 2,
+            exchange_timestamp: 0,
             received_at_nanos: 1_000_000,
             depth,
         });
@@ -9678,7 +9779,15 @@ mod tests {
             bid_price: 25600.0,
             ask_price: 25610.0,
         }; 5];
-        build_depth_rows(&mut buffer, 42528, 2, 1_740_556_500_000_000_000, &depth).unwrap();
+        build_depth_rows(
+            &mut buffer,
+            42528,
+            2,
+            1_740_556_500,
+            1_740_556_500_000_000_000,
+            &depth,
+        )
+        .unwrap();
         assert_eq!(buffer.row_count(), 5, "depth must produce 5 ILP rows");
         let content = String::from_utf8_lossy(buffer.as_bytes());
         assert!(content.contains(QUESTDB_TABLE_MARKET_DEPTH));
@@ -9796,6 +9905,7 @@ mod tests {
         let depth = BufferedDepth {
             security_id: 42528,
             exchange_segment_code: 2,
+            exchange_timestamp: 0,
             received_at_nanos: 1_740_556_500_123_456_789,
             depth: [MarketDepthLevel {
                 bid_quantity: 100,
@@ -9827,6 +9937,7 @@ mod tests {
         let depth = BufferedDepth {
             security_id: 0,
             exchange_segment_code: 0,
+            exchange_timestamp: 0,
             received_at_nanos: 0,
             depth: [MarketDepthLevel::default(); 5],
         };
@@ -10352,8 +10463,13 @@ mod tests {
         let depth = make_test_depth();
         // Append enough to trigger auto-flush
         for i in 0..DEPTH_FLUSH_BATCH_SIZE as u32 {
-            let result =
-                writer.append_depth(10000 + i, 2, 1_740_556_500_000_000_000 + i as i64, &depth);
+            let result = writer.append_depth(
+                10000 + i,
+                2,
+                1_740_556_500,
+                1_740_556_500_000_000_000 + i as i64,
+                &depth,
+            );
             assert!(result.is_ok());
         }
         // Auto-flush should have fired — pending should be 0 or low
@@ -10377,7 +10493,7 @@ mod tests {
 
         let depth = make_test_depth();
         writer
-            .append_depth(11536, 2, 1_740_556_500_000_000_000, &depth)
+            .append_depth(11536, 2, 1_740_556_500, 1_740_556_500_000_000_000, &depth)
             .unwrap();
         assert_eq!(writer.pending_count, 1);
 
@@ -10420,7 +10536,7 @@ mod tests {
 
         let depth = make_test_depth();
         writer
-            .append_depth(11536, 2, 1_740_556_500_000_000_000, &depth)
+            .append_depth(11536, 2, 1_740_556_500, 1_740_556_500_000_000_000, &depth)
             .unwrap();
 
         // Disconnect
@@ -10448,7 +10564,7 @@ mod tests {
 
         let depth = make_test_depth();
         writer
-            .append_depth(11536, 2, 1_740_556_500_000_000_000, &depth)
+            .append_depth(11536, 2, 1_740_556_500, 1_740_556_500_000_000_000, &depth)
             .unwrap();
 
         // Drop sender, set to None to simulate broken pipe
@@ -10511,6 +10627,7 @@ mod tests {
         writer.buffer_depth(BufferedDepth {
             security_id: 11536,
             exchange_segment_code: 2,
+            exchange_timestamp: 0,
             received_at_nanos: 1_740_556_500_000_000_000,
             depth,
         });
@@ -10541,6 +10658,7 @@ mod tests {
         let snapshot = BufferedDepth {
             security_id: 11536,
             exchange_segment_code: 2,
+            exchange_timestamp: 0,
             received_at_nanos: 1_740_556_500_000_000_000,
             depth,
         };
@@ -10568,6 +10686,7 @@ mod tests {
         writer.buffer_depth(BufferedDepth {
             security_id: 11536,
             exchange_segment_code: 2,
+            exchange_timestamp: 0,
             received_at_nanos: 1_740_556_500_000_000_000,
             depth,
         });
@@ -10597,6 +10716,7 @@ mod tests {
             writer.buffer_depth(BufferedDepth {
                 security_id: 20000 + i,
                 exchange_segment_code: 2,
+                exchange_timestamp: 0,
                 received_at_nanos: 1_740_556_500_000_000_000 + i as i64,
                 depth,
             });
@@ -10639,6 +10759,7 @@ mod tests {
                 let snapshot = BufferedDepth {
                     security_id: 30000 + i,
                     exchange_segment_code: 2,
+                    exchange_timestamp: 0,
                     received_at_nanos: 1_740_556_500_000_000_000 + i as i64,
                     depth,
                 };
@@ -10757,7 +10878,8 @@ mod tests {
         writer.next_reconnect_allowed = std::time::Instant::now();
 
         let depth = make_test_depth();
-        let result = writer.append_depth(40000, 2, 1_740_556_500_000_000_000, &depth);
+        let result =
+            writer.append_depth(40000, 2, 1_740_556_500, 1_740_556_500_000_000_000, &depth);
         assert!(result.is_ok());
         assert_eq!(writer.buffered_depth_count(), 1);
     }
@@ -10779,6 +10901,7 @@ mod tests {
         writer.buffer_depth(BufferedDepth {
             security_id: 50000,
             exchange_segment_code: 2,
+            exchange_timestamp: 0,
             received_at_nanos: 1_740_556_500_000_000_000,
             depth,
         });
@@ -10790,7 +10913,8 @@ mod tests {
         writer.next_reconnect_allowed = std::time::Instant::now();
 
         // Append should reconnect, drain buffer, then append new
-        let result = writer.append_depth(50001, 2, 1_740_556_500_000_000_001, &depth);
+        let result =
+            writer.append_depth(50001, 2, 1_740_556_500, 1_740_556_500_000_000_001, &depth);
         assert!(result.is_ok());
         assert!(writer.sender.is_some());
         // Buffer should be drained
@@ -10824,6 +10948,7 @@ mod tests {
         let snapshot = BufferedDepth {
             security_id: 60000,
             exchange_segment_code: 2,
+            exchange_timestamp: 0,
             received_at_nanos: 1_740_556_500_000_000_000,
             depth,
         };
@@ -10861,6 +10986,7 @@ mod tests {
         let snapshot = BufferedDepth {
             security_id: 70000,
             exchange_segment_code: 2,
+            exchange_timestamp: 0,
             received_at_nanos: 1_740_556_500_000_000_000,
             depth,
         };
@@ -11311,7 +11437,8 @@ mod tests {
             std::time::Instant::now() + std::time::Duration::from_secs(3600);
 
         let depth = make_test_depth();
-        let result = writer.append_depth(80000, 2, 1_740_556_500_000_000_000, &depth);
+        let result =
+            writer.append_depth(80000, 2, 1_740_556_500, 1_740_556_500_000_000_000, &depth);
         assert!(result.is_ok(), "append must succeed even when disconnected");
         assert_eq!(writer.buffered_depth_count(), 1, "depth must be buffered");
     }
@@ -11332,6 +11459,7 @@ mod tests {
         writer.depth_buffer.push_back(BufferedDepth {
             security_id: 81000,
             exchange_segment_code: 2,
+            exchange_timestamp: 0,
             received_at_nanos: 1_740_556_500_000_000_000,
             depth,
         });
@@ -11342,7 +11470,8 @@ mod tests {
         let port2 = spawn_tcp_drain_server();
         writer.ilp_conf_string = format!("tcp::addr=127.0.0.1:{port2};");
 
-        let result = writer.append_depth(81001, 2, 1_740_556_500_000_000_001, &depth);
+        let result =
+            writer.append_depth(81001, 2, 1_740_556_500, 1_740_556_500_000_000_001, &depth);
         assert!(result.is_ok());
         assert!(writer.sender.is_some());
         assert_eq!(writer.buffered_depth_count(), 0, "buffer must be drained");
@@ -11361,7 +11490,7 @@ mod tests {
 
         let depth = make_test_depth();
         writer
-            .append_depth(82000, 2, 1_740_556_500_000_000_000, &depth)
+            .append_depth(82000, 2, 1_740_556_500, 1_740_556_500_000_000_000, &depth)
             .unwrap();
         assert_eq!(writer.pending_count, 1);
 
@@ -11392,6 +11521,7 @@ mod tests {
             writer.depth_buffer.push_back(BufferedDepth {
                 security_id: 83000 + i,
                 exchange_segment_code: 2,
+                exchange_timestamp: 0,
                 received_at_nanos: 1_740_556_500_000_000_000 + i64::from(i),
                 depth,
             });
@@ -11420,6 +11550,7 @@ mod tests {
         writer.depth_buffer.push_back(BufferedDepth {
             security_id: 84000,
             exchange_segment_code: 2,
+            exchange_timestamp: 0,
             received_at_nanos: 1_740_556_500_000_000_000,
             depth,
         });
@@ -11454,6 +11585,7 @@ mod tests {
                 let snapshot = BufferedDepth {
                     security_id: 85000 + i,
                     exchange_segment_code: 2,
+                    exchange_timestamp: 0,
                     received_at_nanos: 1_740_556_500_000_000_000 + i64::from(i),
                     depth,
                 };
@@ -11508,6 +11640,7 @@ mod tests {
         writer.in_flight.push(BufferedDepth {
             security_id: 86000,
             exchange_segment_code: 2,
+            exchange_timestamp: 0,
             received_at_nanos: 1_740_556_500_000_000_000,
             depth,
         });
@@ -11625,6 +11758,7 @@ mod tests {
         writer.buffer_depth(BufferedDepth {
             security_id: 87000,
             exchange_segment_code: 2,
+            exchange_timestamp: 0,
             received_at_nanos: 1_740_556_500_000_000_000,
             depth,
         });
@@ -11642,6 +11776,7 @@ mod tests {
         let original = BufferedDepth {
             security_id: 88000,
             exchange_segment_code: 2,
+            exchange_timestamp: 0,
             received_at_nanos: 1_740_556_500_000_000_000,
             depth,
         };
@@ -11832,6 +11967,7 @@ mod tests {
                 &mut writer.buffer,
                 90000 + i,
                 2,
+                1_740_556_500,
                 1_740_556_500_000_000_000 + i as i64,
                 &depth,
             );
@@ -12195,7 +12331,13 @@ mod tests {
         let depth = make_test_depth();
         // Append DEPTH_FLUSH_BATCH_SIZE snapshots to trigger auto-flush
         for i in 0..DEPTH_FLUSH_BATCH_SIZE as u32 {
-            let _ = writer.append_depth(9000 + i, 2, 1_740_556_500_000_000_000 + i as i64, &depth);
+            let _ = writer.append_depth(
+                9000 + i,
+                2,
+                1_740_556_500,
+                1_740_556_500_000_000_000 + i as i64,
+                &depth,
+            );
         }
         // After auto-flush failure, in-flight should be rescued
     }
@@ -12211,7 +12353,13 @@ mod tests {
         };
         let depth = make_test_depth();
         for i in 0..3_u32 {
-            let _ = writer.append_depth(9100 + i, 2, 1_740_556_500_000_000_000 + i as i64, &depth);
+            let _ = writer.append_depth(
+                9100 + i,
+                2,
+                1_740_556_500,
+                1_740_556_500_000_000_000 + i as i64,
+                &depth,
+            );
         }
         let result = writer.force_flush();
         if result.is_err() {
@@ -12250,6 +12398,7 @@ mod tests {
             writer.depth_buffer.push_back(BufferedDepth {
                 security_id: i as u32,
                 exchange_segment_code: 2,
+                exchange_timestamp: 0,
                 received_at_nanos: 1_740_556_500_000_000_000,
                 depth,
             });
@@ -12259,6 +12408,7 @@ mod tests {
         let snapshot = BufferedDepth {
             security_id: 99999,
             exchange_segment_code: 2,
+            exchange_timestamp: 0,
             received_at_nanos: 1_740_556_500_000_000_000,
             depth,
         };
@@ -12285,6 +12435,7 @@ mod tests {
         writer.depth_buffer.push_back(BufferedDepth {
             security_id: 10000,
             exchange_segment_code: 2,
+            exchange_timestamp: 0,
             received_at_nanos: 1_740_556_500_000_000_000,
             depth,
         });
@@ -12315,6 +12466,7 @@ mod tests {
             writer.depth_buffer.push_back(BufferedDepth {
                 security_id: 10100 + i,
                 exchange_segment_code: 2,
+                exchange_timestamp: 0,
                 received_at_nanos: 1_740_556_500_000_000_000,
                 depth,
             });
@@ -12371,6 +12523,7 @@ mod tests {
         let snapshot = BufferedDepth {
             security_id: 11000,
             exchange_segment_code: 2,
+            exchange_timestamp: 0,
             received_at_nanos: 1_740_556_500_000_000_000,
             depth,
         };
@@ -12401,6 +12554,7 @@ mod tests {
         let snapshot = BufferedDepth {
             security_id: 11100,
             exchange_segment_code: 2,
+            exchange_timestamp: 0,
             received_at_nanos: 1_740_556_500_000_000_000,
             depth,
         };
@@ -12666,6 +12820,7 @@ mod tests {
         let snapshot = BufferedDepth {
             security_id: 11536,
             exchange_segment_code: 1,
+            exchange_timestamp: 0,
             received_at_nanos: 1_740_556_500_123_456_789,
             depth: [MarketDepthLevel::default(); 5],
         };
@@ -12706,6 +12861,7 @@ mod tests {
         let snapshot = BufferedDepth {
             security_id: 11536,
             exchange_segment_code: 1,
+            exchange_timestamp: 0,
             received_at_nanos: 1_740_556_500_000_000_000,
             depth: [MarketDepthLevel::default(); 5],
         };

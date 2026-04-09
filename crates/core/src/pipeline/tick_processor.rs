@@ -742,6 +742,7 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     && let Err(err) = dw.append_depth(
                         tick.security_id,
                         tick.exchange_segment_code,
+                        tick.exchange_timestamp,
                         tick.received_at_nanos,
                         &depth,
                     )
