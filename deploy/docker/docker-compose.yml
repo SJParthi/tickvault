@@ -65,6 +65,11 @@ services:
       QDB_CAIRO_O3_MAX_LAG: "60000000"
       # ILP connection limit: 20 (default 10). We have ~15 writers (tick, depth, OBI, indicators, candles, etc.).
       QDB_LINE_TCP_NET_ACTIVE_CONNECTION_LIMIT: "20"
+      # ILP idle timeout: 10 minutes (default 5 min = 300000ms). Prevents premature disconnect
+      # during burst-then-idle patterns (depth writers flush every 500 records, may idle 30-60s between).
+      QDB_LINE_TCP_MIN_IDLE_MS_BEFORE_WRITER_RELEASE: "600000"
+      # ILP connection receive buffer: 4MB (default 1MB). Handles burst ILP writes without backpressure.
+      QDB_LINE_TCP_NET_RECV_BUF_SIZE: "4194304"
       QDB_PG_USER: ${DLT_QUESTDB_PG_USER:?Run bootstrap.sh first — QuestDB credentials must come from AWS SSM}
       QDB_PG_PASSWORD: ${DLT_QUESTDB_PG_PASSWORD:?Run bootstrap.sh first — QuestDB credentials must come from AWS SSM}
     logging:

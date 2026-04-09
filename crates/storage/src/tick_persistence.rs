@@ -218,7 +218,7 @@ impl TickPersistenceWriter {
     /// # Errors
     /// Returns error if the ILP connection cannot be established.
     pub fn new(config: &QuestDbConfig) -> Result<Self> {
-        let conf_string = format!("tcp::addr={}:{};", config.host, config.ilp_port);
+        let conf_string = config.build_ilp_conf_string();
         let sender =
             Sender::from_conf(&conf_string).context("failed to connect to QuestDB via ILP")?;
         let buffer = sender.new_buffer();
@@ -249,7 +249,7 @@ impl TickPersistenceWriter {
     /// **Use this when QuestDB is unavailable at startup.** Zero tick loss —
     /// all ticks are buffered until QuestDB comes back.
     pub fn new_disconnected(config: &QuestDbConfig) -> Self {
-        let conf_string = format!("tcp::addr={}:{};", config.host, config.ilp_port);
+        let conf_string = config.build_ilp_conf_string();
         let buffer = Buffer::new(questdb::ingress::ProtocolVersion::V1);
 
         Self {
@@ -1278,7 +1278,7 @@ pub struct DepthPersistenceWriter {
 impl DepthPersistenceWriter {
     /// Creates a new depth writer connected to QuestDB via ILP TCP.
     pub fn new(config: &QuestDbConfig) -> Result<Self> {
-        let conf_string = format!("tcp::addr={}:{};", config.host, config.ilp_port);
+        let conf_string = config.build_ilp_conf_string();
         let sender = Sender::from_conf(&conf_string)
             .context("failed to connect to QuestDB via ILP for depth")?;
         let buffer = sender.new_buffer();
@@ -1305,7 +1305,7 @@ impl DepthPersistenceWriter {
     /// buffered in the ring buffer (`DEPTH_BUFFER_CAPACITY`) + disk spill until
     /// QuestDB becomes available. Auto-reconnect polls every 30 seconds.
     pub fn new_disconnected(config: &QuestDbConfig) -> Self {
-        let conf_string = format!("tcp::addr={}:{};", config.host, config.ilp_port);
+        let conf_string = config.build_ilp_conf_string();
         let buffer = Buffer::new(questdb::ingress::ProtocolVersion::V1);
 
         Self {

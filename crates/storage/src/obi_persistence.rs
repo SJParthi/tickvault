@@ -145,7 +145,7 @@ impl ObiWriter {
     /// Creates a new OBI writer connected to QuestDB via ILP TCP.
     // TEST-EXEMPT: ILP connection — requires live QuestDB
     pub fn new(config: &QuestDbConfig, underlying: &str) -> Result<Self> {
-        let conf_string = format!("tcp::addr={}:{};", config.host, config.ilp_port);
+        let conf_string = config.build_ilp_conf_string();
         let sender = Sender::from_conf(&conf_string)
             .context("failed to connect to QuestDB for OBI snapshots")?;
         let buffer = sender.new_buffer();

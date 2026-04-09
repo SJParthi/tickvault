@@ -280,7 +280,7 @@ impl DeepDepthWriter {
     /// Creates a new deep depth writer connected to QuestDB.
     // TEST-EXEMPT: ILP connection — requires live QuestDB, tested via DDL integration
     pub fn new(config: &QuestDbConfig) -> Result<Self> {
-        let conf_string = format!("tcp::addr={}:{};", config.host, config.ilp_port);
+        let conf_string = config.build_ilp_conf_string();
         let sender = Sender::from_conf(&conf_string)
             .context("failed to connect to QuestDB for deep depth")?;
         let buffer = sender.new_buffer();

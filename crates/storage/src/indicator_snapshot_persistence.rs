@@ -93,7 +93,7 @@ pub struct IndicatorSnapshotWriter {
 impl IndicatorSnapshotWriter {
     /// Creates a new indicator snapshot writer connected to QuestDB via ILP TCP.
     pub fn new(config: &QuestDbConfig) -> Result<Self> {
-        let conf_string = format!("tcp::addr={}:{};", config.host, config.ilp_port);
+        let conf_string = config.build_ilp_conf_string();
         let sender = Sender::from_conf(&conf_string)
             .context("failed to connect to QuestDB for indicator snapshots")?;
         let buffer = sender.new_buffer();
