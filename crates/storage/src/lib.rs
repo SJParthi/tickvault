@@ -27,6 +27,7 @@ pub mod instrument_persistence;
 pub mod materialized_views;
 pub mod movers_persistence;
 pub mod obi_persistence;
+pub mod partition_manager;
 pub mod tick_persistence;
 pub mod valkey_cache;
 

@@ -41,6 +41,8 @@ pub struct ApplicationConfig {
     pub greeks: GreeksConfig,
     #[serde(default)]
     pub infrastructure: InfrastructureConfig,
+    #[serde(default)]
+    pub partition_retention: PartitionRetentionConfig,
 }
 
 /// Trading execution mode — controls how orders are routed.
@@ -239,6 +241,28 @@ pub struct QuestDbConfig {
     pub pg_port: u16,
     /// InfluxDB Line Protocol port (high-speed ingestion).
     pub ilp_port: u16,
+}
+
+/// Partition retention configuration (separate from QuestDbConfig to avoid breaking existing code).
+#[derive(Debug, Clone, Deserialize)]
+pub struct PartitionRetentionConfig {
+    /// Hot partition retention in days. Partitions older than this are detached.
+    /// Default: 90 days. Set to 0 to disable auto-detach.
+    #[serde(default = "default_retention_days")]
+    pub retention_days: u32,
+}
+
+impl Default for PartitionRetentionConfig {
+    fn default() -> Self {
+        Self {
+            retention_days: default_retention_days(),
+        }
+    }
+}
+
+/// Default retention: 90 days of hot data.
+const fn default_retention_days() -> u32 {
+    90
 }
 
 /// Valkey (cache) connection configuration.

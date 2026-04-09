@@ -54,6 +54,17 @@ services:
       # patterns (25K instruments send bursts, then pause between flush cycles).
       QDB_LINE_TCP_DISCONNECT_ON_ERROR: "false"
       QDB_METRICS_ENABLED: "TRUE"
+      # --- WAL Tuning (Phase B: 100-500GB future-proof) ---
+      # WAL segment rollover: 64MB (default 16MB). Fewer file ops for high-throughput ILP.
+      QDB_WAL_SEGMENT_ROLLOVER_SIZE: "67108864"
+      # Max uncommitted rows per WAL writer: 2M (default 500K). Larger batches = fewer commits.
+      QDB_CAIRO_MAX_UNCOMMITTED_ROWS: "2000000"
+      # WAL apply job interval: 100ms (default 300ms). Faster WAL→table merge for freshness.
+      QDB_WAL_APPLY_TABLE_TIME_QUOTA: "100000"
+      # O3 max lag: 60s (default 300s). Tighter out-of-order merge window.
+      QDB_CAIRO_O3_MAX_LAG: "60000000"
+      # ILP connection limit: 20 (default 10). We have ~15 writers (tick, depth, OBI, indicators, candles, etc.).
+      QDB_LINE_TCP_NET_ACTIVE_CONNECTION_LIMIT: "20"
       QDB_PG_USER: ${DLT_QUESTDB_PG_USER:?Run bootstrap.sh first — QuestDB credentials must come from AWS SSM}
       QDB_PG_PASSWORD: ${DLT_QUESTDB_PG_PASSWORD:?Run bootstrap.sh first — QuestDB credentials must come from AWS SSM}
     logging:

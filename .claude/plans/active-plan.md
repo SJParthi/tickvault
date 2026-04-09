@@ -57,20 +57,28 @@ Previous session completed 9 commits fixing:
 
 ### Phase B: QuestDB Scaling (100-500GB Future-Proof)
 
-- [ ] 6. Implement partition management
-  - Files: `crates/storage/src/partition_manager.rs` (new)
-  - Auto-detach partitions older than 90 days (configurable)
-  - Run daily at 16:30 IST (after market close)
-  - Tests: partition age calculation, detach SQL
+- [x] 6. Implement partition management
+  - Files: `crates/storage/src/partition_manager.rs` (new), `crates/storage/src/lib.rs`
+  - `crates/common/src/config.rs`: `PartitionRetentionConfig` struct (default 90 days)
+  - `config/base.toml`: `[partition_retention]` section
+  - Auto-detach partitions older than retention_days (configurable, 0=disabled)
+  - Lists HOUR-partitioned (11 tables) + DAY-partitioned (3 tables) tables
+  - Uses QuestDB `table_partitions()` + `ALTER TABLE DETACH PARTITION LIST`
+  - Tests: 12 tests (table lists, dedup, JSON parsing, retention config)
 
 - [ ] 7. S3 cold storage archival
   - Files: `crates/storage/src/s3_archival.rs` (new)
   - Export to S3 as Parquet before detaching
   - SEBI 5-year retention compliance
 
-- [ ] 8. QuestDB WAL optimization
+- [x] 8. QuestDB WAL optimization
   - Files: `deploy/docker/docker-compose.yml`
-  - Tune WAL segment size, uncommitted rows, connection limits
+  - WAL segment rollover: 64MB (from default 16MB)
+  - Max uncommitted rows: 2M (from default 500K)
+  - WAL apply time quota: 100ms (from default 300ms)
+  - O3 max lag: 60s (from default 300s)
+  - ILP connection limit: 20 (from default 10)
+  - All values chosen for ~270GB/90-day workload with 13 tables
 
 ### Phase C: Remaining WebSocket Gaps
 
