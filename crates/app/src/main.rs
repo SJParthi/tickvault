@@ -417,21 +417,34 @@ async fn main() -> Result<()> {
                 .as_ref()
                 .map(|p| std::sync::Arc::new(p.registry.clone()));
 
-            // Start with None writers — ticks are processed in-memory for trading.
-            // QuestDB persistence reconnects in background (tables already exist
-            // from pre-crash run, DDL is idempotent CREATE IF NOT EXISTS).
+            // CRITICAL: Use new_disconnected() instead of None — ticks buffer in
+            // ring buffer (600K) + disk spill immediately, even before QuestDB connects.
+            // Without this, the only persistence path is the broadcast cold-path consumer,
+            // which CAN drop ticks on lag (broadcast::Lagged). With new_disconnected(),
+            // the hot-path writer buffers ALL ticks and drains when QuestDB is ready.
+            let fast_tick_writer = Some(
+                dhan_live_trader_storage::tick_persistence::TickPersistenceWriter::new_disconnected(
+                    &config.questdb,
+                ),
+            );
+            let fast_depth_writer = Some(
+                dhan_live_trader_storage::tick_persistence::DepthPersistenceWriter::new_disconnected(
+                    &config.questdb,
+                ),
+            );
+
             let handle = tokio::spawn(async move {
                 run_tick_processor(
                     receiver,
-                    None, // tick_writer — QuestDB reconnects in background
-                    None, // depth_writer — QuestDB reconnects in background
+                    fast_tick_writer,
+                    fast_depth_writer,
                     tick_broadcast_for_processor,
                     candle_agg,
                     None, // live_candle_writer — QuestDB reconnects in background
                     movers,
                     snapshot_handle,
                     greeks_enricher,
-                    None, // stock_movers_writer — QuestDB reconnects in background
+                    None, // stock_movers_writer — created in slow boot only
                     None, // option_movers — created in slow boot only
                     None, // option_movers_writer — created in slow boot only
                     fast_registry,
