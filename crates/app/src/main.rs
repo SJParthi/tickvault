@@ -1237,7 +1237,17 @@ async fn main() -> Result<()> {
 
     // Step 8b: NOW spawn WebSocket connections (tick processor is already consuming).
     let ws_handles = if let Some(pool) = ws_pool_ready {
-        spawn_websocket_connections(pool).await
+        let handles = spawn_websocket_connections(pool).await;
+        // Telegram: notify that all main WS connections were spawned.
+        if !handles.is_empty() {
+            let conn_count = handles.len();
+            for i in 0..conn_count {
+                notifier.notify(NotificationEvent::WebSocketConnected {
+                    connection_index: i,
+                });
+            }
+        }
+        handles
     } else {
         Vec::new()
     };
@@ -1662,11 +1672,12 @@ async fn main() -> Result<()> {
         let sender = order_update_sender.clone();
         let cal = trading_calendar.clone();
         let ou_notifier = notifier.clone();
+        let ou_connect_notifier = notifier.clone();
         let ou_health = health_status.clone();
         tokio::spawn(async move {
-            // Connected notification is sent from INSIDE the connection function
-            // after the login handshake succeeds (not here, before connection starts).
             ou_health.set_order_update_connected(true);
+            // Telegram: Order Update WS connected (fires before read loop starts).
+            ou_connect_notifier.notify(NotificationEvent::OrderUpdateConnected);
             run_order_update_connection(url, order_ws_client_id, token, sender, cal).await;
             // If run_order_update_connection returns, connection terminated
             ou_notifier.notify(NotificationEvent::OrderUpdateDisconnected {
@@ -1837,7 +1848,7 @@ async fn main() -> Result<()> {
     // Auto-open Portal and Market Dashboard in browser (API server now ready).
     // Best-effort: non-blocking, logged on failure.
     tokio::spawn(async {
-        crate::infra::open_in_browser("http://localhost:3001/portal/market-dashboard").await;
+        crate::infra::open_in_browser("http://localhost:3001/portal/options-chain").await;
     });
 
     let api_handle = tokio::spawn(async move {
