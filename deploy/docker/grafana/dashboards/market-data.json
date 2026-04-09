@@ -585,7 +585,7 @@
         "showHeader": true,
         "cellHeight": "sm",
         "footer": { "countRows": true, "enablePagination": true, "fields": "", "reducer": ["count"], "show": true },
-        "sortBy": [{ "desc": true, "displayName": "depth_time" }]
+        "sortBy": [{ "desc": true, "displayName": "exchange_time" }]
       },
       "title": "Market Depth (Latest)",
       "description": "5-level bid/ask order book data. Bid in green, ask in red.",
@@ -596,7 +596,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT\n  segment,\n  security_id,\n  level,\n  bid_qty,\n  bid_price,\n  ask_price,\n  ask_qty,\n  to_str(ts, 'yyyy-MM-dd HH:mm:ss.SSS') AS depth_time\nFROM market_depth\nWHERE ts >= dateadd('s', 19800, '${__from:date:iso}')\n  AND ts < dateadd('s', 19800, '${__to:date:iso}')\nORDER BY ts DESC, security_id, level\nLIMIT 500;",
+          "rawSql": "SELECT\n  segment,\n  security_id,\n  level,\n  bid_qty,\n  bid_price,\n  ask_price,\n  ask_qty,\n  to_str(ts, 'yyyy-MM-dd HH:mm:ss.SSS') AS exchange_time,\n  to_str(received_at, 'yyyy-MM-dd HH:mm:ss.SSS') AS received_at\nFROM market_depth\nWHERE ts >= dateadd('s', 19800, '${__from:date:iso}')\n  AND ts < dateadd('s', 19800, '${__to:date:iso}')\nORDER BY ts DESC, security_id, level\nLIMIT 500;",
           "refId": "A"
         }
       ]
@@ -645,7 +645,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT\n  segment,\n  security_id,\n  prev_close,\n  prev_oi,\n  ts AS time\nFROM previous_close\nORDER BY security_id\nLIMIT 500;",
+          "rawSql": "SELECT\n  segment,\n  security_id,\n  prev_close,\n  prev_oi,\n  to_str(received_at, 'yyyy-MM-dd HH:mm:ss.SSS') AS received_at,\n  to_str(ts, 'yyyy-MM-dd HH:mm:ss.SSS') AS time\nFROM previous_close\nORDER BY security_id\nLIMIT 500;",
           "refId": "A"
         }
       ]

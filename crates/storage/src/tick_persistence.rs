@@ -2005,6 +2005,19 @@ pub async fn ensure_depth_and_prev_close_tables(questdb_config: &QuestDbConfig) 
     );
     execute_ddl_best_effort(&client, &base_url, &dedup_depth, "market_depth DEDUP").await;
 
+    // Migration: add exchange_timestamp column to existing market_depth tables (idempotent).
+    let add_exchange_ts = format!(
+        "ALTER TABLE {} ADD COLUMN IF NOT EXISTS exchange_timestamp LONG",
+        QUESTDB_TABLE_MARKET_DEPTH
+    );
+    execute_ddl_best_effort(
+        &client,
+        &base_url,
+        &add_exchange_ts,
+        "market_depth exchange_timestamp migration",
+    )
+    .await;
+
     // --- previous_close table ---
     execute_ddl_best_effort(
         &client,
@@ -2022,6 +2035,19 @@ pub async fn ensure_depth_and_prev_close_tables(questdb_config: &QuestDbConfig) 
         &base_url,
         &dedup_prev_close,
         "previous_close DEDUP",
+    )
+    .await;
+
+    // Migration: add received_at column to existing previous_close tables (idempotent).
+    let add_received_at = format!(
+        "ALTER TABLE {} ADD COLUMN IF NOT EXISTS received_at TIMESTAMP",
+        QUESTDB_TABLE_PREVIOUS_CLOSE
+    );
+    execute_ddl_best_effort(
+        &client,
+        &base_url,
+        &add_received_at,
+        "previous_close received_at migration",
     )
     .await;
 
@@ -5618,11 +5644,13 @@ mod tests {
         let content = String::from_utf8_lossy(buf.as_bytes());
 
         // received_at is shifted by IST_UTC_OFFSET_NANOS for IST-as-UTC.
+        // ILP column_ts writes microseconds (nanos / 1000), so check for the µs value.
         let expected_nanos = received_at_utc_nanos + IST_UTC_OFFSET_NANOS;
-        let expected_str = format!("{expected_nanos}");
+        let expected_micros = expected_nanos / 1000;
+        let expected_str = format!("{expected_micros}t");
         assert!(
             content.contains(&expected_str),
-            "depth received_at must include IST offset. Content: {content}"
+            "depth received_at must include IST offset (µs). Content: {content}"
         );
     }
 
@@ -7569,7 +7597,7 @@ mod tests {
     #[test]
     fn test_depth_spill_record_size() {
         assert_eq!(
-            DEPTH_SPILL_RECORD_SIZE, 116,
+            DEPTH_SPILL_RECORD_SIZE, 124,
             "depth spill record must be exactly 116 bytes"
         );
     }
@@ -8903,8 +8931,8 @@ mod tests {
             let _ = build_depth_rows(
                 &mut writer.buffer,
                 i as u32,
-                1_740_556_500,
                 2,
+                1_740_556_500,
                 1_740_556_500_000_000_000 + i as i64,
                 &depth,
             );
@@ -10030,7 +10058,7 @@ mod tests {
 
     #[test]
     fn test_depth_spill_record_size_is_116() {
-        assert_eq!(DEPTH_SPILL_RECORD_SIZE, 116);
+        assert_eq!(DEPTH_SPILL_RECORD_SIZE, 124);
     }
 
     #[test]
