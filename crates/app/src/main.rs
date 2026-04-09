@@ -2912,6 +2912,33 @@ async fn run_shutdown_fast(
         // Signal historical fetch task to start post-market re-fetch
         post_market_signal.notify_one();
 
+        // Post-market: detach old QuestDB partitions (Phase B).
+        // Runs daily after pipeline stops — keeps hot data bounded to retention_days.
+        {
+            let retention_days = config.partition_retention.retention_days;
+            if retention_days > 0 {
+                match dhan_live_trader_storage::partition_manager::PartitionManager::new(
+                    &config.questdb,
+                    retention_days,
+                ) {
+                    Ok(pm) => match pm.detach_old_partitions().await {
+                        Ok(count) => {
+                            info!(
+                                detached = count,
+                                retention_days, "post-market partition detach complete"
+                            );
+                        }
+                        Err(err) => {
+                            warn!(?err, "post-market partition detach failed (non-critical)");
+                        }
+                    },
+                    Err(err) => {
+                        warn!(?err, "partition manager creation failed (non-critical)");
+                    }
+                }
+            }
+        }
+
         info!(
             "post-market: real-time pipeline stopped, historical fetch + cross-verify in progress"
         );
