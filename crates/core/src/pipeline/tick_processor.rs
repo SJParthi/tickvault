@@ -842,24 +842,33 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     continue;
                 }
 
-                // Persist previous close to QuestDB
-                if let Some(ref mut writer) = tick_writer
-                    && let Err(err) = build_previous_close_row(
+                // Persist previous close to QuestDB.
+                // Previous close packets arrive in a burst at subscription time (once per instrument).
+                // Force flush after each write to prevent data loss — these are reference data that
+                // movers calculations depend on. Without flush, the buffer may not drain before
+                // tick data starts flowing.
+                if let Some(ref mut writer) = tick_writer {
+                    if let Err(err) = build_previous_close_row(
                         writer.buffer_mut(),
                         security_id,
                         exchange_segment_code,
                         previous_close,
                         previous_oi,
                         received_at_nanos,
-                    )
-                {
-                    storage_errors = storage_errors.saturating_add(1);
-                    m_storage_errors.increment(1);
-                    if storage_errors <= 100 {
-                        warn!(
-                            ?err,
-                            security_id, "failed to write previous close to QuestDB"
-                        );
+                    ) {
+                        storage_errors = storage_errors.saturating_add(1);
+                        m_storage_errors.increment(1);
+                        if storage_errors <= 100 {
+                            warn!(
+                                ?err,
+                                security_id, "failed to write previous close to QuestDB"
+                            );
+                        }
+                    }
+                    // Force flush — previous close is critical reference data.
+                    // O(1) EXEMPT: cold path — runs once per instrument at boot, not per tick.
+                    if let Err(err) = writer.force_flush() {
+                        warn!(?err, "failed to flush previous close to QuestDB");
                     }
                 }
 
