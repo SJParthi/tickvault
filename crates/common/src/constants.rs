@@ -972,13 +972,14 @@ pub const DHAN_PNL_EXIT_PATH: &str = "/pnlExit";
 pub const DHAN_TWENTY_DEPTH_WS_BASE_URL: &str = "wss://depth-api-feed.dhan.co/twentydepth"; // APPROVED: infrastructure constant
 
 /// 200-level depth WebSocket base URL.
-/// Full URL: `wss://full-depth-api.dhan.co/twohundreddepth?token=TOKEN&clientId=CLIENT_ID&authType=2`
+/// Full URL: `wss://full-depth-api.dhan.co/?token=TOKEN&clientId=CLIENT_ID&authType=2`
 ///
-/// NOTE: Official Dhan API docs (madefortrade.in/t/responded-api-trading-market-depth)
-/// specify `/twohundreddepth` path. The Python SDK uses root path `/` but this causes
-/// `ResetWithoutClosingHandshake` on the server. Reverted to official docs path.
-/// Updated 2026-04-07 to match official docs after persistent connection failures with root path.
-pub const DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL: &str = "wss://full-depth-api.dhan.co/twohundreddepth"; // APPROVED: infrastructure constant — matches official Dhan API docs
+/// NOTE: DhanHQ Python SDK `fulldepth.py` uses `wss://full-depth-api.dhan.co/` (root path
+/// with trailing slash). Official Dhan docs say `/twohundreddepth` but the SDK is ground truth.
+/// The trailing slash is CRITICAL — without it, the HTTP URI parser may malform the query string.
+/// Previous failure with root path was likely due to missing trailing slash.
+/// Updated 2026-04-09 to match SDK exactly: root path WITH trailing slash.
+pub const DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL: &str = "wss://full-depth-api.dhan.co/"; // APPROVED: infrastructure constant — matches DhanHQ Python SDK fulldepth.py exactly
 
 // ---------------------------------------------------------------------------
 // Historical Data — Candle Fetch Constants

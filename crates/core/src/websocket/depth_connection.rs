@@ -507,11 +507,11 @@ async fn connect_and_run_200_depth(
     }
 
     let access_token = token_state.access_token().expose_secret().to_string();
-    // 200-level URL uses /twohundreddepth path per official Dhan API docs.
-    // SDK used root path but that causes ResetWithoutClosingHandshake on the server.
+    // 200-level URL: root path with trailing slash (matches DhanHQ Python SDK exactly).
+    // Base URL already ends with "/" so query string appends directly.
+    let base = DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL.trim_end_matches('/');
     let authenticated_url = zeroize::Zeroizing::new(format!(
-        "{}?token={access_token}&clientId={client_id}&authType={WEBSOCKET_AUTH_TYPE}",
-        DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL
+        "{base}/?token={access_token}&clientId={client_id}&authType={WEBSOCKET_AUTH_TYPE}",
     ));
 
     let request = authenticated_url
@@ -737,10 +737,10 @@ mod tests {
 
     #[test]
     fn test_two_hundred_depth_ws_url_correct() {
-        // Official Dhan API docs specify /twohundreddepth path
+        // DhanHQ Python SDK uses root path (ground truth for production)
         assert_eq!(
             DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL,
-            "wss://full-depth-api.dhan.co/twohundreddepth"
+            "wss://full-depth-api.dhan.co/"
         );
     }
 
@@ -888,15 +888,14 @@ mod tests {
     }
 
     #[test]
-    fn test_two_hundred_depth_url_uses_twohundreddepth_path() {
-        // Official Dhan API docs: wss://full-depth-api.dhan.co/twohundreddepth?token=...
-        let url = format!(
-            "{}?token=TEST&clientId=TEST&authType=2",
-            DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL
-        );
+    fn test_two_hundred_depth_url_uses_root_path_with_trailing_slash() {
+        // DhanHQ Python SDK: wss://full-depth-api.dhan.co/?token=...
+        // Official docs say /twohundreddepth but SDK is ground truth.
+        let base = DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL.trim_end_matches('/');
+        let url = format!("{base}/?token=TEST&clientId=TEST&authType=2",);
         assert!(
-            url.contains("/twohundreddepth?token="),
-            "200-level must use /twohundreddepth path: {url}"
+            url.contains("full-depth-api.dhan.co/?token="),
+            "200-level must use root path with trailing slash: {url}"
         );
         assert!(
             url.starts_with("wss://full-depth-api.dhan.co/"),
