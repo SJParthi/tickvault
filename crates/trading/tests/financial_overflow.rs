@@ -5,6 +5,8 @@
 //! These tests enforce Principle #1 (zero allocation) and correctness
 //! for real-money financial calculations.
 
+use dhan_live_trader_common::tick_types::DeepDepthLevel;
+use dhan_live_trader_trading::indicator::obi::compute_obi;
 use dhan_live_trader_trading::risk::engine::RiskEngine;
 use dhan_live_trader_trading::risk::types::RiskBreach;
 
@@ -321,4 +323,87 @@ fn property_instruments_independent_pnl() {
     // Realized P&L: A = +2500, B = -5000, total = -2500
     let pnl = engine.total_realized_pnl();
     assert!((pnl - (-2500.0)).abs() < 0.01);
+}
+
+// ---------------------------------------------------------------------------
+// OBI: Financial overflow/boundary tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn obi_overflow_max_u32_qty_all_20_levels() {
+    // 20 levels × u32::MAX quantity = potential u64 overflow on sum
+    let bids = [DeepDepthLevel {
+        price: 100.0,
+        quantity: u32::MAX,
+        orders: 1,
+    }; 20];
+    let asks = [DeepDepthLevel {
+        price: 101.0,
+        quantity: 1,
+        orders: 1,
+    }; 20];
+    let snap = compute_obi(1, 2, &bids, &asks);
+    // 20 × u32::MAX = 85,899,345,900 — fits in u64 with saturating_add
+    assert!(snap.obi.is_finite());
+    assert!(snap.obi > 0.99, "massive bid dominance → OBI near +1.0");
+    assert!(snap.total_bid_qty > 0, "total bid should not overflow to 0");
+}
+
+#[test]
+fn obi_overflow_u32_max_both_sides() {
+    // Both sides at max → OBI should be exactly 0
+    let bids = [DeepDepthLevel {
+        price: 100.0,
+        quantity: u32::MAX,
+        orders: u32::MAX,
+    }; 20];
+    let asks = [DeepDepthLevel {
+        price: 101.0,
+        quantity: u32::MAX,
+        orders: u32::MAX,
+    }; 20];
+    let snap = compute_obi(1, 2, &bids, &asks);
+    assert!((snap.obi).abs() < f64::EPSILON, "equal max qty → OBI=0");
+    assert!(snap.total_bid_qty == snap.total_ask_qty);
+}
+
+#[test]
+fn obi_spread_extreme_prices() {
+    // Very large spread
+    let bids = [DeepDepthLevel {
+        price: 0.01,
+        quantity: 100,
+        orders: 1,
+    }];
+    let asks = [DeepDepthLevel {
+        price: 99999.99,
+        quantity: 100,
+        orders: 1,
+    }];
+    let snap = compute_obi(1, 2, &bids, &asks);
+    assert!(snap.spread.is_finite());
+    assert!((snap.spread - 99999.98).abs() < 0.01);
+}
+
+#[test]
+fn obi_weighted_obi_single_level_each() {
+    // Single level each: weighted OBI should equal simple OBI
+    let bids = [DeepDepthLevel {
+        price: 100.0,
+        quantity: 700,
+        orders: 5,
+    }];
+    let asks = [DeepDepthLevel {
+        price: 101.0,
+        quantity: 300,
+        orders: 3,
+    }];
+    let snap = compute_obi(1, 2, &bids, &asks);
+    // With single level, weight=1.0 for both → weighted = simple
+    assert!(
+        (snap.obi - snap.weighted_obi).abs() < f64::EPSILON,
+        "single-level: simple={}, weighted={} should match",
+        snap.obi,
+        snap.weighted_obi
+    );
 }

@@ -10,6 +10,7 @@ use dhan_live_trader_trading::greeks::black_scholes::*;
 use dhan_live_trader_trading::greeks::buildup::*;
 use dhan_live_trader_trading::greeks::pcr::*;
 use dhan_live_trader_trading::indicator::engine::IndicatorEngine;
+use dhan_live_trader_trading::indicator::obi::compute_obi;
 use dhan_live_trader_trading::indicator::types::IndicatorParams;
 use dhan_live_trader_trading::oms::state_machine::*;
 use dhan_live_trader_trading::risk::engine::RiskEngine;
@@ -809,5 +810,68 @@ proptest! {
                 "BB middle {} > upper {}", snap.bollinger_middle, snap.bollinger_upper
             );
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 29. OBI: always bounded in [-1, +1]
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #[test]
+    fn proptest_obi_bounded(
+        bid_prices in proptest::collection::vec(0.01_f64..100000.0, 1..20),
+        bid_qtys in proptest::collection::vec(1_u32..1000000, 1..20),
+        ask_prices in proptest::collection::vec(0.01_f64..100000.0, 1..20),
+        ask_qtys in proptest::collection::vec(1_u32..1000000, 1..20),
+    ) {
+        use dhan_live_trader_common::tick_types::DeepDepthLevel;
+
+        let bid_count = bid_prices.len().min(bid_qtys.len());
+        let ask_count = ask_prices.len().min(ask_qtys.len());
+
+        let bids: Vec<DeepDepthLevel> = (0..bid_count)
+            .map(|i| DeepDepthLevel { price: bid_prices[i], quantity: bid_qtys[i], orders: 1 })
+            .collect();
+        let asks: Vec<DeepDepthLevel> = (0..ask_count)
+            .map(|i| DeepDepthLevel { price: ask_prices[i], quantity: ask_qtys[i], orders: 1 })
+            .collect();
+
+        let snap = compute_obi(1, 2, &bids, &asks);
+
+        prop_assert!(snap.obi >= -1.0 && snap.obi <= 1.0,
+            "OBI {} out of [-1, +1]", snap.obi);
+        prop_assert!(snap.weighted_obi >= -1.0 && snap.weighted_obi <= 1.0,
+            "Weighted OBI {} out of [-1, +1]", snap.weighted_obi);
+        prop_assert!(snap.spread >= 0.0 || snap.spread.is_finite(),
+            "Spread must be finite: {}", snap.spread);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 30. OBI: total quantities match sum of individual levels
+// ---------------------------------------------------------------------------
+
+proptest! {
+    #[test]
+    fn proptest_obi_quantity_conservation(
+        qtys in proptest::collection::vec(0_u32..100000, 1..20),
+    ) {
+        use dhan_live_trader_common::tick_types::DeepDepthLevel;
+
+        let levels: Vec<DeepDepthLevel> = qtys.iter()
+            .enumerate()
+            .map(|(i, &q)| DeepDepthLevel { price: 100.0 + i as f64, quantity: q, orders: 1 })
+            .collect();
+
+        let snap = compute_obi(1, 2, &levels, &[]);
+
+        let expected_total: u64 = qtys.iter()
+            .filter(|&&q| q > 0)
+            .map(|&q| u64::from(q))
+            .sum();
+
+        prop_assert_eq!(snap.total_bid_qty, expected_total,
+            "Total bid qty mismatch: computed={}, expected={}", snap.total_bid_qty, expected_total);
     }
 }
