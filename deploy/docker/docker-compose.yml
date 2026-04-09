@@ -35,7 +35,14 @@ services:
     hostname: dlt-questdb
     restart: unless-stopped
     mem_limit: 8g
+    mem_reservation: 4g
     cpus: 4.0
+    # OOM protection: prefer killing other containers over QuestDB.
+    # QuestDB holds all trading data — losing it mid-session is catastrophic.
+    oom_score_adj: -500
+    # Shared memory: QuestDB uses mmap heavily for WAL + column storage.
+    # Default 64MB causes SIGBUS on large tables. 2GB matches production needs.
+    shm_size: 2g
     ports:
       # E5 security: bind web console to localhost only (no external access).
       # PG + ILP remain on all interfaces for host app connectivity.
@@ -70,6 +77,11 @@ services:
       QDB_LINE_TCP_MIN_IDLE_MS_BEFORE_WRITER_RELEASE: "600000"
       # ILP connection receive buffer: 4MB (default 1MB). Handles burst ILP writes without backpressure.
       QDB_LINE_TCP_NET_RECV_BUF_SIZE: "4194304"
+      # --- Crash Recovery & Stability ---
+      # Writer append page size: 1MB (default 256KB). Reduces mmap syscalls for large batches.
+      QDB_CAIRO_WRITER_DATA_APPEND_PAGE_SIZE: "1048576"
+      # Parallel WAL apply threads: 4 (match CPU count). Faster WAL→table merge.
+      QDB_WAL_APPLY_WORKER_COUNT: "4"
       QDB_PG_USER: ${DLT_QUESTDB_PG_USER:?Run bootstrap.sh first — QuestDB credentials must come from AWS SSM}
       QDB_PG_PASSWORD: ${DLT_QUESTDB_PG_PASSWORD:?Run bootstrap.sh first — QuestDB credentials must come from AWS SSM}
     logging:
@@ -79,10 +91,12 @@ services:
         max-file: "5"
     healthcheck:
       test: ["CMD-SHELL", "bash -c 'cat < /dev/null > /dev/tcp/localhost/9000 && cat < /dev/null > /dev/tcp/localhost/9009' || exit 1"]
-      interval: 10s
-      timeout: 5s
+      interval: 5s
+      timeout: 3s
       retries: 5
       start_period: 15s
+    # Grace period for WAL flush on docker stop — prevents data loss on graceful shutdown.
+    stop_grace_period: 30s
     networks:
       - dlt-network
 
