@@ -1326,42 +1326,54 @@ async fn main() -> Result<()> {
                     while let Some(frame) = depth_rx.recv().await {
                         m.increment(1);
                         let ts = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-                        match dhan_live_trader_core::parser::dispatcher::dispatch_deep_depth_frame(
-                            &frame, ts,
-                        ) {
-                            Ok(dhan_live_trader_core::parser::types::ParsedFrame::DeepDepth {
-                                security_id,
-                                exchange_segment_code,
-                                side,
-                                levels,
-                                message_sequence,
-                                ..
-                            }) => {
-                                let side_str = match side {
-                                    dhan_live_trader_core::parser::deep_depth::DepthSide::Bid => {
-                                        "BID"
-                                    }
-                                    dhan_live_trader_core::parser::deep_depth::DepthSide::Ask => {
-                                        "ASK"
-                                    }
-                                };
-                                if let Some(ref mut w) = writer
-                                    && let Err(err) = w.append_deep_depth(
-                                        security_id,
-                                        exchange_segment_code,
-                                        side_str,
-                                        &levels,
-                                        "20",
-                                        ts,
-                                        message_sequence,
-                                    )
-                                {
-                                    tracing::warn!(?err, "failed to persist 20-level depth");
-                                }
-                            }
-                            Ok(_) => {} // non-depth frame (shouldn't happen)
+                        // Split stacked packets: Dhan stacks multiple instrument packets
+                        // in a single WS message: [Inst1 Bid][Inst1 Ask][Inst2 Bid]...
+                        // Without splitting, only the first packet would be parsed.
+                        let packets = match dhan_live_trader_core::parser::dispatcher::split_stacked_depth_packets(&frame) {
+                            Ok(p) => p,
                             Err(err) => {
-                                tracing::warn!(?err, "failed to parse 20-level depth frame");
+                                tracing::warn!(?err, "failed to split stacked 20-level depth frame");
+                                continue;
+                            }
+                        };
+                        for packet in packets {
+                            match dhan_live_trader_core::parser::dispatcher::dispatch_deep_depth_frame(
+                                packet, ts,
+                            ) {
+                                Ok(dhan_live_trader_core::parser::types::ParsedFrame::DeepDepth {
+                                    security_id,
+                                    exchange_segment_code,
+                                    side,
+                                    levels,
+                                    message_sequence,
+                                    ..
+                                }) => {
+                                    let side_str = match side {
+                                        dhan_live_trader_core::parser::deep_depth::DepthSide::Bid => {
+                                            "BID"
+                                        }
+                                        dhan_live_trader_core::parser::deep_depth::DepthSide::Ask => {
+                                            "ASK"
+                                        }
+                                    };
+                                    if let Some(ref mut w) = writer
+                                        && let Err(err) = w.append_deep_depth(
+                                            security_id,
+                                            exchange_segment_code,
+                                            side_str,
+                                            &levels,
+                                            "20",
+                                            ts,
+                                            message_sequence,
+                                        )
+                                    {
+                                        tracing::warn!(?err, "failed to persist 20-level depth");
+                                    }
+                                }
+                                Ok(_) => {} // non-depth frame (shouldn't happen)
+                                Err(err) => {
+                                    tracing::warn!(?err, "failed to parse 20-level depth packet");
+                                }
                             }
                         }
                     }
