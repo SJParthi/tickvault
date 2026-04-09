@@ -1384,6 +1384,7 @@ async fn main() -> Result<()> {
                 let d20_health = health_status.clone();
                 let d20_label_for_disconnect = label.clone();
                 let d20_label_for_signal = label.clone();
+                let d20_underlying_label = label.clone();
                 let (signal_tx, signal_rx) = tokio::sync::oneshot::channel::<()>();
                 tokio::spawn(async move {
                     d20_health.set_depth_20_connections(
@@ -1395,6 +1396,7 @@ async fn main() -> Result<()> {
                         depth_client_id,
                         instruments_for_underlying,
                         depth_tx,
+                        d20_underlying_label,
                         Some(signal_tx),
                     )
                     .await
@@ -1411,7 +1413,7 @@ async fn main() -> Result<()> {
                 });
                 // O(1) EXEMPT: end
 
-                // Telegram alert fires ONLY after actual connection + subscription succeeds.
+                // Telegram alert fires ONLY after first data frame received (not just subscription).
                 {
                     let notify_label = d20_label_for_signal;
                     let notify_sender = notifier.clone();
@@ -1538,7 +1540,7 @@ async fn main() -> Result<()> {
                             );
                         }
                     });
-                    // Telegram alert fires ONLY after actual connection + subscription.
+                    // Telegram alert fires ONLY after first data frame received (not just subscription).
                     {
                         let notify_sender = notifier.clone();
                         tokio::spawn(async move {
@@ -2727,20 +2729,11 @@ async fn run_shutdown_fast(
     shared_movers: dhan_live_trader_core::pipeline::SharedTopMoversSnapshot,
     post_market_signal: std::sync::Arc<tokio::sync::Notify>,
 ) -> Result<()> {
-    let bind_addr: SocketAddr = format_bind_addr(&config.api.host, config.api.port)
-        .parse()
-        .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 8080)));
-
     let mode = "LIVE";
     info!(
         mode,
-        "system ready — press Ctrl+C to stop\n\
-         \n\
-           Terminal:   http://{bind_addr}/\n\
-           Health:     http://{bind_addr}/health\n\
-           Stats:      http://{bind_addr}/api/stats\n\
-           Portal:     http://{bind_addr}/portal\n\
-           Rebuild:    POST http://{bind_addr}/api/instruments/rebuild\n"
+        api_port = config.api.port,
+        "system ready — press Ctrl+C to stop"
     );
 
     notifier.notify(NotificationEvent::StartupComplete { mode });

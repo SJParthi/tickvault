@@ -261,7 +261,9 @@
       "type": "timeseries",
       "targets": [
         { "expr": "dlt_websocket_connections_active", "legendFormat": "active connections", "refId": "A" },
-        { "expr": "rate(dlt_websocket_reconnections_total[5m])", "legendFormat": "reconnects/s", "refId": "B" }
+        { "expr": "dlt_depth_20lvl_connection_active", "legendFormat": "depth-20 {{underlying}}", "refId": "C" },
+        { "expr": "dlt_depth_200lvl_connection_active", "legendFormat": "depth-200 {{underlying}}", "refId": "D" },
+        { "expr": "dlt_order_update_ws_active", "legendFormat": "order-update", "refId": "E" }
       ]
     },
     {
@@ -278,7 +280,7 @@
       "options": { "colorMode": "background", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "title": "Depth 20-Level Connections",
       "type": "stat",
-      "targets": [{ "expr": "dlt_depth_20lvl_connection_active", "legendFormat": "{{label}}", "refId": "A" }]
+      "targets": [{ "expr": "dlt_depth_20lvl_connection_active", "legendFormat": "{{underlying}}", "refId": "A" }]
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
@@ -294,7 +296,7 @@
       "options": { "colorMode": "background", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "title": "Depth 200-Level Connections",
       "type": "stat",
-      "targets": [{ "expr": "dlt_depth_200lvl_connection_active", "legendFormat": "{{label}}", "refId": "A" }]
+      "targets": [{ "expr": "dlt_depth_200lvl_connection_active", "legendFormat": "{{underlying}}", "refId": "A" }]
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
@@ -312,8 +314,8 @@
       "title": "Depth Frames Rate",
       "type": "timeseries",
       "targets": [
-        { "expr": "rate(dlt_depth_20lvl_frames_total[1m])", "legendFormat": "20-level", "refId": "A" },
-        { "expr": "rate(dlt_depth_200lvl_frames_total[1m])", "legendFormat": "200-level {{label}}", "refId": "B" }
+        { "expr": "rate(dlt_depth_20lvl_frames_total[1m])", "legendFormat": "20-level {{underlying}}", "refId": "A" },
+        { "expr": "rate(dlt_depth_200lvl_frames_total[1m])", "legendFormat": "200-level {{underlying}}", "refId": "B" }
       ]
     },
     {

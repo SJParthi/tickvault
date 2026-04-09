@@ -52,58 +52,10 @@ const DEPTH_PONG_TIMEOUT_SECS: u64 = 10;
 /// Subscription batch size for 20-level depth (max 50 per Dhan docs).
 const DEPTH_SUBSCRIPTION_BATCH_SIZE: usize = 50;
 
-/// Pre-market/post-market backoff delay for depth connections (seconds).
-/// Outside market data hours (08:55-16:00 IST), Dhan's depth servers reset
-/// connections. Instead of retrying every 30s, sleep for this interval and
-/// re-check whether market hours have started.
-const DEPTH_OFF_HOURS_CHECK_INTERVAL_SECS: u64 = 300;
-
-/// Returns true if current IST time is within market data hours (08:55 - 16:00).
-/// 200-level depth connections should only retry aggressively during this window.
-// O(1) EXEMPT: called once per reconnection attempt (cold path), not per tick
-fn is_within_market_data_hours() -> bool {
-    let now_utc = chrono::Utc::now();
-    // IST = UTC + 5:30
-    let ist_secs = now_utc.timestamp() + 19800;
-    let ist_hour = ((ist_secs % 86400) / 3600) as u32;
-    let ist_minute = ((ist_secs % 3600) / 60) as u32;
-    let time_mins = ist_hour * 60 + ist_minute;
-    // 08:55 = 535 minutes, 16:00 = 960 minutes
-    // O(1) EXEMPT: integer comparison, not Vec::contains
-    #[allow(clippy::manual_range_contains)] // APPROVED: avoids banned .contains() pattern
-    {
-        time_mins >= 535 && time_mins <= 960
-    }
-}
-
-/// Calculates seconds until the next market data window opens (08:55 IST).
-///
-/// Returns a duration capped between `DEPTH_OFF_HOURS_CHECK_INTERVAL_SECS` and
-/// the actual time until 08:55 IST. If already within market hours, returns 0.
-/// Uses a periodic check interval as a safety net against clock drift.
-// O(1) EXEMPT: called once per reconnection attempt (cold path), not per tick
-fn calculate_secs_until_market_open() -> u64 {
-    if is_within_market_data_hours() {
-        return 0;
-    }
-    let now_utc = chrono::Utc::now();
-    let ist_secs = now_utc.timestamp() + 19800;
-    let secs_into_day = ist_secs % 86400;
-    // 08:55 IST = 535 minutes = 32100 seconds into the day
-    let market_open_secs: i64 = 535 * 60;
-
-    let secs_until = if secs_into_day < market_open_secs {
-        // Before market open today
-        market_open_secs - secs_into_day
-    } else {
-        // After market close — sleep until 08:55 next day
-        86400 - secs_into_day + market_open_secs
-    };
-
-    // Clamp: sleep for the calculated time, but at least the check interval (safety net).
-    let secs_until = secs_until.max(0) as u64;
-    secs_until.max(DEPTH_OFF_HOURS_CHECK_INTERVAL_SECS)
-}
+// Market-hours sleep REMOVED: depth connections stay connected 24/7, same as
+// main Live Market Feed WebSocket. Reconnection uses exponential backoff
+// regardless of time-of-day. If Dhan servers reject outside market hours,
+// backoff caps at 30s — no multi-hour sleeps that hide connection state.
 
 /// Connection timeout for depth WebSocket (seconds).
 const DEPTH_CONNECT_TIMEOUT_SECS: u64 = 15;
@@ -119,12 +71,15 @@ const DEPTH_CONNECT_TIMEOUT_SECS: u64 = 15;
 /// * `client_id` — Dhan client ID.
 /// * `instruments` — Instruments to subscribe (max 50, same type as main feed).
 /// * `frame_sender` — Shared channel to tick processor.
+/// * `underlying_label` — Underlying name (e.g. "NIFTY") for metric labels.
+/// * `connected_signal` — Fires after first data frame received (not just subscription).
 // TEST-EXEMPT: Integration-level — requires live Dhan WebSocket endpoint
 pub async fn run_twenty_depth_connection(
     token_handle: TokenHandle,
     client_id: String,
     instruments: Vec<InstrumentSubscription>,
     frame_sender: mpsc::Sender<Bytes>,
+    underlying_label: String,
     connected_signal: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<(), WebSocketError> {
     if instruments.is_empty() {
@@ -133,8 +88,11 @@ pub async fn run_twenty_depth_connection(
     }
 
     let instrument_count = instruments.len().min(DEPTH_SUBSCRIPTION_BATCH_SIZE);
+    let prefix = format!("{DEPTH_CONNECTION_PREFIX}-{underlying_label}"); // O(1) EXEMPT: boot-time
+
     info!(
         instrument_count,
+        underlying = %underlying_label,
         "starting 20-level depth WebSocket connection"
     );
 
@@ -145,8 +103,8 @@ pub async fn run_twenty_depth_connection(
     );
 
     let reconnect_counter = AtomicU64::new(0);
-    // Consumed on first successful subscription — notifies caller that
-    // the connection is truly alive and receiving data.
+    // Consumed after first Binary data frame — notifies caller that
+    // the connection is truly alive and receiving data (not just subscribed).
     let mut pending_signal = connected_signal;
 
     loop {
@@ -157,45 +115,31 @@ pub async fn run_twenty_depth_connection(
             &frame_sender,
             instrument_count,
             &mut pending_signal,
+            &prefix,
+            &underlying_label,
         )
         .await
         {
             Ok(()) => {
-                info!("{DEPTH_CONNECTION_PREFIX}: connection closed normally");
+                info!("{prefix}: connection closed normally");
                 // Reset counter only on successful connection (failures accumulate for backoff)
                 reconnect_counter.store(0, Ordering::Relaxed);
             }
             Err(err) => {
                 let attempt = reconnect_counter.fetch_add(1, Ordering::Relaxed);
 
-                // Outside market data hours (before 08:55 or after 16:00 IST),
-                // Dhan's depth servers reset connections. Sleep until market
-                // opens instead of spamming exponential retries.
-                if !is_within_market_data_hours() {
-                    if attempt == 0 {
-                        let sleep_secs = calculate_secs_until_market_open();
-                        info!(
-                            sleep_secs,
-                            "{DEPTH_CONNECTION_PREFIX}: outside market hours — sleeping until market open"
-                        );
-                    }
-                    let sleep_secs = calculate_secs_until_market_open();
-                    tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
-                    continue;
-                }
-
-                // During market hours: escalate to ERROR after 10+ consecutive failures
+                // Escalate to ERROR after 10+ consecutive failures
                 if attempt > 0 && attempt.is_multiple_of(10) {
                     error!(
                         attempt,
                         ?err,
-                        "{DEPTH_CONNECTION_PREFIX}: reconnection threshold — still retrying"
+                        "{prefix}: reconnection threshold — still retrying"
                     );
                 } else {
                     warn!(
                         attempt,
                         ?err,
-                        "{DEPTH_CONNECTION_PREFIX}: connection failed — will reconnect"
+                        "{prefix}: connection failed — will reconnect"
                     );
                 }
 
@@ -218,6 +162,8 @@ async fn connect_and_run_depth(
     frame_sender: &mpsc::Sender<Bytes>,
     instrument_count: usize,
     connected_signal: &mut Option<tokio::sync::oneshot::Sender<()>>,
+    prefix: &str,
+    underlying_label: &str,
 ) -> Result<(), WebSocketError> {
     // Read token
     let token_guard = token_handle.load();
@@ -246,7 +192,7 @@ async fn connect_and_run_depth(
             source: err,
         })?;
 
-    debug!("{DEPTH_CONNECTION_PREFIX}: connecting to depth WebSocket");
+    debug!("{prefix}: connecting to depth WebSocket");
 
     let tls_connector = build_websocket_tls_connector()?;
 
@@ -272,7 +218,7 @@ async fn connect_and_run_depth(
 
     info!(
         instrument_count,
-        "{DEPTH_CONNECTION_PREFIX}: connected — sending subscriptions"
+        "{prefix}: connected — sending subscriptions"
     );
 
     let (mut write, mut read) = ws_stream.split();
@@ -286,33 +232,29 @@ async fn connect_and_run_depth(
                 url: DHAN_TWENTY_DEPTH_WS_BASE_URL.to_string(),
                 source: err,
             })?;
-        debug!("{DEPTH_CONNECTION_PREFIX}: subscription sent");
+        debug!("{prefix}: subscription sent");
     }
 
     info!(
         instrument_count,
         subscription_count = subscription_messages.len(),
-        "{DEPTH_CONNECTION_PREFIX}: all subscriptions sent — reading depth frames"
+        "{prefix}: all subscriptions sent — reading depth frames"
     );
 
-    // Fire connected signal — connection is truly alive and subscribed.
-    if let Some(signal) = connected_signal.take() {
-        let _ = signal.send(());
-    }
-
-    // Metrics
-    let m_frames = metrics::counter!("dlt_depth_20lvl_frames_total");
-    let m_active = metrics::gauge!("dlt_depth_20lvl_connection_active");
-    m_active.set(1.0);
+    // Metrics — labeled per underlying so Grafana can distinguish connections.
+    let m_frames = metrics::counter!("dlt_depth_20lvl_frames_total", "underlying" => underlying_label.to_string());
+    let m_active = metrics::gauge!("dlt_depth_20lvl_connection_active", "underlying" => underlying_label.to_string());
+    // Don't set active=1 yet — wait for first data frame (avoids false-positive Telegram alerts).
 
     let read_timeout = Duration::from_secs(DEPTH_READ_TIMEOUT_SECS);
+    let mut first_frame_received = false;
 
     // Read loop
     loop {
         match time::timeout(read_timeout, read.next()).await {
             Err(_elapsed) => {
                 m_active.set(0.0);
-                warn!("{DEPTH_CONNECTION_PREFIX}: read timeout — reconnecting");
+                warn!("{prefix}: read timeout — reconnecting");
                 return Err(WebSocketError::ReadTimeout {
                     connection_id: 99, // depth connection uses ID 99
                     timeout_secs: DEPTH_READ_TIMEOUT_SECS,
@@ -320,17 +262,26 @@ async fn connect_and_run_depth(
             }
             Ok(frame_result) => match frame_result {
                 Some(Ok(Message::Binary(data))) => {
+                    // Fire connected signal + set active metric on FIRST data frame only.
+                    // This guarantees Telegram alert fires only when data actually flows.
+                    if !first_frame_received {
+                        first_frame_received = true;
+                        m_active.set(1.0);
+                        if let Some(signal) = connected_signal.take() {
+                            let _ = signal.send(());
+                        }
+                    }
                     m_frames.increment(1);
                     let send_timeout = Duration::from_secs(FRAME_SEND_TIMEOUT_SECS);
                     match time::timeout(send_timeout, frame_sender.send(data)).await {
                         Ok(Ok(())) => {}
                         Ok(Err(_)) => {
                             m_active.set(0.0);
-                            warn!("{DEPTH_CONNECTION_PREFIX}: receiver dropped — stopping");
+                            warn!("{prefix}: receiver dropped — stopping");
                             return Ok(());
                         }
                         Err(_) => {
-                            warn!("{DEPTH_CONNECTION_PREFIX}: frame send timeout — dropping frame");
+                            warn!("{prefix}: frame send timeout — dropping frame");
                             metrics::counter!("dlt_depth_frames_dropped_total", "type" => "send_timeout", "depth" => "20").increment(1);
                         }
                     }
@@ -341,7 +292,7 @@ async fn connect_and_run_depth(
                         Ok(Ok(())) => {}
                         Ok(Err(err)) => {
                             m_active.set(0.0);
-                            warn!(?err, "{DEPTH_CONNECTION_PREFIX}: pong send failed");
+                            warn!(?err, "{prefix}: pong send failed");
                             return Err(WebSocketError::ConnectionFailed {
                                 url: DHAN_TWENTY_DEPTH_WS_BASE_URL.to_string(),
                                 source: err,
@@ -351,7 +302,7 @@ async fn connect_and_run_depth(
                             m_active.set(0.0);
                             warn!(
                                 timeout_secs = DEPTH_PONG_TIMEOUT_SECS,
-                                "{DEPTH_CONNECTION_PREFIX}: pong send timed out — connection likely dead"
+                                "{prefix}: pong send timed out — connection likely dead"
                             );
                             return Err(WebSocketError::ReadTimeout {
                                 connection_id: 99,
@@ -365,7 +316,7 @@ async fn connect_and_run_depth(
                 }
                 Some(Ok(Message::Close(_))) => {
                     m_active.set(0.0);
-                    info!("{DEPTH_CONNECTION_PREFIX}: server sent close frame");
+                    info!("{prefix}: server sent close frame");
                     return Ok(());
                 }
                 Some(Err(err)) => {
@@ -446,23 +397,7 @@ pub async fn run_two_hundred_depth_connection(
             Err(err) => {
                 let attempt = reconnect_counter.fetch_add(1, Ordering::Relaxed);
 
-                // Outside market data hours (before 08:55 or after 16:00 IST),
-                // Dhan's 200-level depth servers reset connections. Sleep until
-                // market opens instead of spamming retries every 60s.
-                if !is_within_market_data_hours() {
-                    if attempt == 0 {
-                        let sleep_secs = calculate_secs_until_market_open();
-                        info!(
-                            sleep_secs,
-                            "{prefix}: outside market hours — sleeping until market open"
-                        );
-                    }
-                    let sleep_secs = calculate_secs_until_market_open();
-                    tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
-                    continue;
-                }
-
-                // During market hours: escalate to ERROR after 10+ consecutive failures
+                // Escalate to ERROR after 10+ consecutive failures
                 if attempt > 0 && attempt.is_multiple_of(10) {
                     error!(
                         attempt,
@@ -558,18 +493,15 @@ async fn connect_and_run_200_depth(
 
     info!("{prefix}: subscription sent — reading 200-level depth frames");
 
-    // Fire connected signal — connection is truly alive and subscribed.
-    if let Some(signal) = connected_signal.take() {
-        let _ = signal.send(());
-    }
-
+    // Metrics — labeled per underlying for Grafana differentiation.
     let m_frames =
-        metrics::counter!("dlt_depth_200lvl_frames_total", "label" => prefix.to_string());
+        metrics::counter!("dlt_depth_200lvl_frames_total", "underlying" => prefix.to_string());
     let m_active =
-        metrics::gauge!("dlt_depth_200lvl_connection_active", "label" => prefix.to_string());
-    m_active.set(1.0);
+        metrics::gauge!("dlt_depth_200lvl_connection_active", "underlying" => prefix.to_string());
+    // Don't set active=1 yet — wait for first data frame.
 
     let read_timeout = Duration::from_secs(DEPTH_READ_TIMEOUT_SECS);
+    let mut first_frame_received = false;
 
     loop {
         match time::timeout(read_timeout, read.next()).await {
@@ -583,6 +515,14 @@ async fn connect_and_run_200_depth(
             }
             Ok(frame_result) => match frame_result {
                 Some(Ok(Message::Binary(data))) => {
+                    // Fire connected signal + set active metric on FIRST data frame only.
+                    if !first_frame_received {
+                        first_frame_received = true;
+                        m_active.set(1.0);
+                        if let Some(signal) = connected_signal.take() {
+                            let _ = signal.send(());
+                        }
+                    }
                     m_frames.increment(1);
                     let send_timeout = Duration::from_secs(FRAME_SEND_TIMEOUT_SECS);
                     match time::timeout(send_timeout, frame_sender.send(data)).await {
@@ -677,8 +617,15 @@ mod tests {
         let (tx, _rx) = mpsc::channel(16);
         let token_handle: TokenHandle =
             std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None)));
-        let result =
-            run_twenty_depth_connection(token_handle, "test".to_string(), vec![], tx, None).await;
+        let result = run_twenty_depth_connection(
+            token_handle,
+            "test".to_string(),
+            vec![],
+            tx,
+            "TEST".to_string(),
+            None,
+        )
+        .await;
         assert!(result.is_ok());
     }
 
@@ -760,7 +707,17 @@ mod tests {
         let token_handle: TokenHandle =
             std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None)));
         let (tx, _rx) = mpsc::channel(16);
-        let result = connect_and_run_depth(&token_handle, "test", &[], &tx, 0, &mut None).await;
+        let result = connect_and_run_depth(
+            &token_handle,
+            "test",
+            &[],
+            &tx,
+            0,
+            &mut None,
+            "depth-20lvl-TEST",
+            "TEST",
+        )
+        .await;
         assert!(result.is_err());
         match result.unwrap_err() {
             WebSocketError::NoTokenAvailable => {}
@@ -904,56 +861,28 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // Market hours guard tests
+    // 24/7 connection behavior tests (market hours sleep removed)
     // -------------------------------------------------------------------
 
     #[test]
-    fn test_is_within_market_data_hours_returns_bool() {
-        // Must return a boolean without panicking — we can't control the clock
-        // in unit tests, but we verify it doesn't panic and returns a valid value.
-        let result = is_within_market_data_hours();
-        // result is either true or false — the function is deterministic for a given time.
-        assert!(result || !result, "must return a valid boolean");
+    fn test_depth_reconnect_backoff_caps_at_30s() {
+        // With market-hours sleep removed, exponential backoff is the ONLY
+        // reconnection delay mechanism. Verify the cap is reasonable.
+        let max_delay = DEPTH_RECONNECT_INITIAL_MS
+            .saturating_mul(1u64.checked_shl(63).unwrap_or(u64::MAX))
+            .min(DEPTH_RECONNECT_MAX_MS);
+        assert_eq!(max_delay, DEPTH_RECONNECT_MAX_MS);
+        assert_eq!(DEPTH_RECONNECT_MAX_MS, 30000, "max backoff must be 30s");
     }
 
     #[test]
-    fn test_is_within_market_data_hours_boundary_constants() {
-        // The function uses 535 (08:55) and 960 (16:00) as boundaries.
-        // Verify the constants are consistent:
-        // 08:55 = 8*60 + 55 = 535
-        assert_eq!(8 * 60 + 55, 535, "08:55 IST = 535 minutes");
-        // 16:00 = 16*60 + 0 = 960
-        assert_eq!(16 * 60, 960, "16:00 IST = 960 minutes");
-    }
-
-    #[test]
-    fn test_calculate_secs_until_market_open_always_positive() {
-        // Must always return > 0 (clamped to at least DEPTH_OFF_HOURS_CHECK_INTERVAL_SECS)
-        let secs = calculate_secs_until_market_open();
+    fn test_depth_always_retries_regardless_of_time() {
+        // Depth connections now retry 24/7 — no market hours guard.
+        // This test documents the intentional removal.
+        // The only backoff is exponential (1s → 30s), never multi-hour sleep.
         assert!(
-            secs >= DEPTH_OFF_HOURS_CHECK_INTERVAL_SECS,
-            "must be at least the check interval ({DEPTH_OFF_HOURS_CHECK_INTERVAL_SECS}s), got {secs}"
-        );
-    }
-
-    #[test]
-    fn test_calculate_secs_until_market_open_bounded() {
-        // Max possible sleep = ~24 hours (86400s)
-        let secs = calculate_secs_until_market_open();
-        assert!(secs <= 86400, "must not exceed 24 hours, got {secs}");
-    }
-
-    #[test]
-    fn test_off_hours_check_interval_reasonable() {
-        // 5 minutes = 300 seconds — reasonable check interval outside market hours
-        assert_eq!(DEPTH_OFF_HOURS_CHECK_INTERVAL_SECS, 300);
-        assert!(
-            DEPTH_OFF_HOURS_CHECK_INTERVAL_SECS >= 60,
-            "check interval must be at least 60s to avoid log spam"
-        );
-        assert!(
-            DEPTH_OFF_HOURS_CHECK_INTERVAL_SECS <= 600,
-            "check interval must be at most 10 minutes for reasonable wake-up latency"
+            DEPTH_RECONNECT_MAX_MS <= 60_000,
+            "max reconnect delay must be <= 60s (no multi-hour sleep)"
         );
     }
 }

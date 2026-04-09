@@ -182,11 +182,14 @@ fn test_all_dhan_rest_endpoint_constants_defined() {
 /// 1. Market feed (config-based): wss://api-feed.dhan.co
 /// 2. Order update (config-based): wss://api-order-update.dhan.co
 /// 3. 20-level depth (constant): wss://depth-api-feed.dhan.co/twentydepth
-/// 4. 200-level depth (constant): wss://full-depth-api.dhan.co/twohundreddepth
+/// 4. 200-level depth (constant): wss://full-depth-api.dhan.co/
+///    NOTE: Dhan docs say `/twohundreddepth` but SDK uses root path `/`.
+///    Root path is confirmed working in production (2026-04-09). Our code
+///    matches the SDK, which is the ground truth for what works.
 ///
 /// Market feed and order update WS URLs are in DhanConfig (not constants)
 /// because they share the same config pattern as rest_api_base_url. The depth
-/// WS URLs are constants because they have fixed paths (/twentydepth, /twohundreddepth).
+/// WS URLs are constants because they have fixed paths.
 #[test]
 fn test_all_websocket_urls_defined() {
     // --- Depth WebSocket constants (docs/dhan-ref/04-full-market-depth-websocket.md) ---
@@ -194,9 +197,11 @@ fn test_all_websocket_urls_defined() {
         DHAN_TWENTY_DEPTH_WS_BASE_URL, "wss://depth-api-feed.dhan.co/twentydepth",
         "20-level depth WS base URL"
     );
+    // 200-level uses root path (matches DhanHQ Python SDK, confirmed live 2026-04-09).
+    // Dhan docs reference /twohundreddepth but the SDK root path is what works.
     assert_eq!(
-        DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL, "wss://full-depth-api.dhan.co/twohundreddepth",
-        "200-level depth WS base URL — official Dhan API docs path"
+        DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL, "wss://full-depth-api.dhan.co/",
+        "200-level depth WS base URL — SDK root path (NOT /twohundreddepth)"
     );
 
     // Both must use wss:// (TLS required)

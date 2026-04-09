@@ -53,8 +53,12 @@ Any change to WebSocket code must check the open gaps in `docs/architecture/webs
 
 Key open gaps:
 - `WebSocketDisconnected` event not wired for main feed
-- Telegram fires on spawn, not first data frame
 - No Telegram for depth rebalancer ATM changes
+
+Resolved gaps:
+- Telegram now fires on first data frame (not just subscription) — fixed 2026-04-09
+- Depth connections stay connected 24/7 (no market-hours sleep) — fixed 2026-04-09
+- Depth metrics labeled per underlying (not shared gauge) — fixed 2026-04-09
 
 ## What This Prevents
 

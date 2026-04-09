@@ -10,7 +10,8 @@
 
 2. **Two SEPARATE endpoints. Never mix them.**
    - 20-level: `wss://depth-api-feed.dhan.co/twentydepth?token=<TOKEN>&clientId=<CLIENT_ID>&authType=2`
-   - 200-level: `wss://full-depth-api.dhan.co/?token=<TOKEN>&clientId=<CLIENT_ID>&authType=2` (SDK uses root path, no `/twohundreddepth`)
+   - 200-level: `wss://full-depth-api.dhan.co/?token=<TOKEN>&clientId=<CLIENT_ID>&authType=2`
+     **IMPORTANT:** Dhan docs say `/twohundreddepth` path, but DhanHQ Python SDK uses root path `/` — and root path is what works in production (confirmed live 2026-04-09). Our code matches the SDK. **NEVER change this URL to `/twohundreddepth`** unless Dhan explicitly breaks the root path.
 
 3. **Connection limits are INDEPENDENT per WebSocket type (confirmed by Dhan 2026-04-06).**
    - Live Market Feed: 5 connections (separate pool)

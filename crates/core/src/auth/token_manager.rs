@@ -501,15 +501,19 @@ impl TokenManager {
             });
         }
 
-        // Check 2: active segment must contain "Derivative" for F&O
-        if !profile.active_segment.contains("Derivative") {
+        // Check 2: active segment must contain derivatives access.
+        // Dhan returns EITHER full names ("Equity, Derivative") OR single-char codes
+        // ("E, D, C, M, ") depending on API version/account type. Accept both.
+        let has_derivative =
+            profile.active_segment.contains("Derivative") || profile.active_segment.contains("D");
+        if !has_derivative {
             error!(
                 active_segment = %profile.active_segment,
                 "pre-market check FAILED: Derivative segment not active"
             );
             return Err(ApplicationError::AuthenticationFailed {
                 reason: format!(
-                    "active segment '{}' does not contain 'Derivative' — F&O trading not enabled",
+                    "active segment '{}' does not indicate F&O access (expected 'Derivative' or 'D')",
                     profile.active_segment
                 ),
             });
