@@ -497,13 +497,95 @@
     {
       "collapsed": false,
       "gridPos": { "h": 1, "w": 24, "x": 0, "y": 40 },
+      "id": 130,
+      "title": "Order Book Imbalance (OBI)",
+      "type": "row"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "continuous-BlYlRd" },
+          "custom": { "axisBorderShow": false, "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "pointSize": 3, "showPoints": "never" },
+          "min": -1,
+          "max": 1,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "yellow", "value": -0.3 }, { "color": "green", "value": 0.3 }] },
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 41 },
+      "id": 131,
+      "options": { "legend": { "calcs": ["lastNotNull", "min", "max"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "title": "OBI by Underlying",
+      "type": "timeseries",
+      "targets": [{ "expr": "dlt_obi_value", "legendFormat": "{{underlying}}", "refId": "A" }]
+    },
+    {
+      "datasource": { "type": "questdb", "uid": "questdb" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "continuous-BlYlRd" },
+          "custom": { "axisBorderShow": false, "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "never" },
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 41 },
+      "id": 132,
+      "options": { "legend": { "calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "title": "Weighted OBI (QuestDB)",
+      "type": "timeseries",
+      "targets": [{ "rawSql": "SELECT ts, underlying, weighted_obi FROM obi_snapshots WHERE ts > dateadd('h', -1, now()) SAMPLE BY 5s FILL(PREV) ORDER BY ts", "refId": "A", "format": "time_series" }]
+    },
+    {
+      "datasource": { "type": "questdb", "uid": "questdb" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "axisBorderShow": false, "drawStyle": "line", "fillOpacity": 5, "lineWidth": 1, "showPoints": "never" },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 49 },
+      "id": 133,
+      "options": { "legend": { "calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "title": "Bid vs Ask Wall Quantities",
+      "type": "timeseries",
+      "targets": [
+        { "rawSql": "SELECT ts, underlying, max_bid_wall_qty as bid_wall, max_ask_wall_qty as ask_wall FROM obi_snapshots WHERE ts > dateadd('h', -1, now()) AND (max_bid_wall_qty > 0 OR max_ask_wall_qty > 0) SAMPLE BY 10s FILL(PREV) ORDER BY ts", "refId": "A", "format": "time_series" }
+      ]
+    },
+    {
+      "datasource": { "type": "questdb", "uid": "questdb" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "axisBorderShow": false, "drawStyle": "line", "fillOpacity": 5, "lineWidth": 1, "showPoints": "never" },
+          "unit": "currencyINR"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 49 },
+      "id": 134,
+      "options": { "legend": { "calcs": ["lastNotNull", "mean"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "title": "Spread by Underlying",
+      "type": "timeseries",
+      "targets": [
+        { "rawSql": "SELECT ts, underlying, spread FROM obi_snapshots WHERE ts > dateadd('h', -1, now()) SAMPLE BY 5s FILL(PREV) ORDER BY ts", "refId": "A", "format": "time_series" }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 57 },
       "id": 104,
       "title": "Application Logs (Trading)",
       "type": "row"
     },
     {
       "datasource": { "type": "loki", "uid": "loki" },
-      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 41 },
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 58 },
       "id": 17,
       "options": {
         "dedupStrategy": "none",

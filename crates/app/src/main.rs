@@ -920,6 +920,7 @@ async fn main() -> Result<()> {
             &config.questdb
         ),
         dhan_live_trader_storage::deep_depth_persistence::ensure_deep_depth_table(&config.questdb),
+        dhan_live_trader_storage::obi_persistence::ensure_obi_table(&config.questdb),
     );
 
     // Persist trading calendar to QuestDB (best-effort, non-blocking).
@@ -1311,7 +1312,7 @@ async fn main() -> Result<()> {
                 let depth_questdb = config.questdb.clone();
                 let depth_label_recv = label.clone();
 
-                // Spawn depth frame receiver with QuestDB persistence
+                // Spawn depth frame receiver with QuestDB persistence + OBI computation
                 tokio::spawn(async move {
                     let m = metrics::counter!("dlt_depth_20lvl_frames_received", "underlying" => depth_label_recv.clone());
                     let mut writer =
@@ -1325,6 +1326,28 @@ async fn main() -> Result<()> {
                             "deep depth QuestDB writer connected"
                         );
                     }
+
+                    // OBI: writer + bid accumulator (per security_id).
+                    // Depth packets arrive as [Bid][Ask] pairs per instrument in each WS message.
+                    // Accumulate bid levels, compute OBI when ask arrives.
+                    let mut obi_writer = dhan_live_trader_storage::obi_persistence::ObiWriter::new(
+                        &depth_questdb,
+                        &depth_label_recv,
+                    )
+                    .ok();
+                    if obi_writer.is_some() {
+                        tracing::info!(
+                            underlying = depth_label_recv,
+                            "OBI QuestDB writer connected"
+                        );
+                    }
+                    // O(1) EXEMPT: begin — HashMap pre-allocated for max 50 instruments per depth connection
+                    let mut bid_accumulator: std::collections::HashMap<
+                        u32,
+                        (u8, Vec<dhan_live_trader_common::tick_types::DeepDepthLevel>),
+                    > = std::collections::HashMap::with_capacity(50);
+                    // O(1) EXEMPT: end
+
                     while let Some(frame) = depth_rx.recv().await {
                         m.increment(1);
                         let ts = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
@@ -1358,6 +1381,7 @@ async fn main() -> Result<()> {
                                             "ASK"
                                         }
                                     };
+                                    // Persist raw depth to QuestDB
                                     if let Some(ref mut w) = writer
                                         && let Err(err) = w.append_deep_depth(
                                             security_id,
@@ -1370,6 +1394,53 @@ async fn main() -> Result<()> {
                                         )
                                     {
                                         tracing::warn!(?err, "failed to persist 20-level depth");
+                                    }
+
+                                    // OBI accumulation: store bid, compute on ask arrival
+                                    match side {
+                                        dhan_live_trader_core::parser::deep_depth::DepthSide::Bid => {
+                                            bid_accumulator.insert(security_id, (exchange_segment_code, levels));
+                                        }
+                                        dhan_live_trader_core::parser::deep_depth::DepthSide::Ask => {
+                                            if let Some((seg_code, bid_levels)) = bid_accumulator.get(&security_id) {
+                                                let obi_snap = dhan_live_trader_trading::indicator::obi::compute_obi(
+                                                    security_id,
+                                                    *seg_code,
+                                                    bid_levels,
+                                                    &levels,
+                                                );
+
+                                                // Update Prometheus gauge
+                                                metrics::gauge!(
+                                                    "dlt_obi_value",
+                                                    "underlying" => depth_label_recv.clone(),
+                                                )
+                                                .set(obi_snap.obi);
+
+                                                // Persist OBI snapshot
+                                                if let Some(ref mut ow) = obi_writer {
+                                                    let obi_record = dhan_live_trader_storage::obi_persistence::ObiRecord {
+                                                        security_id,
+                                                        segment_code: obi_snap.segment_code,
+                                                        obi: obi_snap.obi,
+                                                        weighted_obi: obi_snap.weighted_obi,
+                                                        total_bid_qty: obi_snap.total_bid_qty,
+                                                        total_ask_qty: obi_snap.total_ask_qty,
+                                                        bid_levels: obi_snap.bid_levels,
+                                                        ask_levels: obi_snap.ask_levels,
+                                                        max_bid_wall_price: obi_snap.max_bid_wall_price,
+                                                        max_bid_wall_qty: obi_snap.max_bid_wall_qty,
+                                                        max_ask_wall_price: obi_snap.max_ask_wall_price,
+                                                        max_ask_wall_qty: obi_snap.max_ask_wall_qty,
+                                                        spread: obi_snap.spread,
+                                                        ts_nanos: ts.saturating_add(dhan_live_trader_common::constants::IST_UTC_OFFSET_NANOS),
+                                                    };
+                                                    if let Err(err) = ow.append_obi(&obi_record) {
+                                                        tracing::warn!(?err, "failed to persist OBI snapshot");
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                                 Ok(_) => {} // non-depth frame (shouldn't happen)

@@ -1,8 +1,8 @@
 # Implementation Plan: OBI Indicator + QuestDB Scaling + Remaining Gaps
 
-**Status:** DRAFT
+**Status:** IN_PROGRESS
 **Date:** 2026-04-09
-**Approved by:** pending
+**Approved by:** Parthiban
 **Branch:** `claude/fix-websocket-market-depth-C7poN`
 **Previous session:** 9 commits covering WebSocket depth fixes, timestamps, indicators, infra
 
@@ -23,36 +23,37 @@ Previous session completed 9 commits fixing:
 
 ### Phase A: OBI (Order Book Imbalance) Indicator
 
-- [ ] 1. Create `obi_snapshots` QuestDB table with DDL
+- [x] 1. Create `obi_snapshots` QuestDB table with DDL
   - Files: `crates/storage/src/obi_persistence.rs` (new), `crates/storage/src/lib.rs`
   - Columns: segment, security_id, underlying, obi (f64), weighted_obi, total_bid_qty, total_ask_qty, bid_levels, ask_levels, max_bid_wall_price, max_bid_wall_qty, max_ask_wall_price, max_ask_wall_qty, spread, ts, received_at
-  - Tests: DDL creation, append, flush, roundtrip
+  - Tests: 9 tests (DDL columns, partitioning, WAL, dedup key, record values, extremes, zero qty)
 
-- [ ] 2. Implement OBI computation engine
+- [x] 2. Implement OBI computation engine
   - Files: `crates/trading/src/indicator/obi.rs` (new), `crates/trading/src/indicator/mod.rs`
   - OBI = (total_bid_qty - total_ask_qty) / (total_bid_qty + total_ask_qty)
   - Weighted OBI = weight by distance from LTP (closer levels matter more)
   - Wall detection = level where qty > 10x average
   - Spread = ask_price_1 - bid_price_1
   - All O(1) — fixed 20-level iteration, no allocation
-  - Tests: unit tests for all formulas, edge cases (zero qty, single level)
+  - Tests: 25 tests (OBI formula, weighted OBI, wall detection, spread, edge cases)
 
-- [ ] 3. Wire OBI into depth processing pipeline
+- [x] 3. Wire OBI into depth processing pipeline
   - Files: `crates/app/src/main.rs` (depth frame consumer)
   - On every 20-level depth snapshot (both bid+ask received), compute OBI
-  - Persist to `obi_snapshots` table
+  - Persist to `obi_snapshots` table via ObiWriter
   - Add Prometheus metric: `dlt_obi_value` gauge per underlying
+  - Bid/ask accumulation via HashMap<u32, levels> per connection
 
-- [ ] 4. Grafana OBI dashboard
+- [x] 4. Grafana OBI dashboard
   - Files: `deploy/docker/grafana/dashboards/trading-pipeline.json`
-  - Real-time OBI chart per underlying
-  - Wall detection panel
-  - Spread panel
+  - Real-time OBI chart per underlying (Prometheus)
+  - Weighted OBI chart (QuestDB)
+  - Wall detection panel (QuestDB)
+  - Spread panel (QuestDB)
 
-- [ ] 5. Backtest SQL queries
+- [x] 5. Backtest SQL queries
   - Files: `docs/analysis/obi-backtest-queries.md` (new)
-  - Correlation of OBI with price movement
-  - Wall absorption rate analysis
+  - 9 queries: OBI distribution, correlation, wall detection, wall absorption, spread analysis, momentum, extremes, bid/ask ratio, data quality
 
 ### Phase B: QuestDB Scaling (100-500GB Future-Proof)
 
