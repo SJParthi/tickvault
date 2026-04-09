@@ -34,8 +34,8 @@ services:
     container_name: dlt-questdb
     hostname: dlt-questdb
     restart: unless-stopped
-    mem_limit: 4g
-    cpus: 2.0
+    mem_limit: 8g
+    cpus: 4.0
     ports:
       # E5 security: bind web console to localhost only (no external access).
       # PG + ILP remain on all interfaces for host app connectivity.
@@ -49,6 +49,10 @@ services:
       QDB_LOG_W_STDOUT_LEVEL: ERROR
       QDB_TELEMETRY_ENABLED: "false"
       QDB_LINE_TCP_MAINTENANCE_JOB_INTERVAL: "60000"
+      # Increase ILP connection idle timeout to prevent disconnects during
+      # low-activity periods. Default is too aggressive for burst-then-idle
+      # patterns (25K instruments send bursts, then pause between flush cycles).
+      QDB_LINE_TCP_DISCONNECT_ON_ERROR: "false"
       QDB_METRICS_ENABLED: "TRUE"
       QDB_PG_USER: ${DLT_QUESTDB_PG_USER:?Run bootstrap.sh first — QuestDB credentials must come from AWS SSM}
       QDB_PG_PASSWORD: ${DLT_QUESTDB_PG_PASSWORD:?Run bootstrap.sh first — QuestDB credentials must come from AWS SSM}
