@@ -12,16 +12,16 @@
 | EC2 (weekdays) | c7i.xlarge, on-demand, 9hr × 22 weekdays | $0.1785/hr | ₹3,530 |
 | EC2 (weekends) | c7i.xlarge, on-demand, 5hr × 8 weekends | $0.1785/hr | ₹607 |
 | EBS | gp3, 100GB (hot data: last 30-60 days) | $0.0912/GB-mo | ₹775 |
-| S3 | 50GB (cold historical data: 60-365 days) | $0.025/GB-mo | ₹106 |
+| S3 | Up to 500GB cold data (lifecycle tiered) | $0.025→$0.002/GB-mo | ₹333 |
 | Elastic IP | 1 static IP (mandatory for Dhan Order API) | $0.005/hr idle | ₹152 |
-| CloudWatch | 7 metrics + 5 alarms + 2GB logs | FREE (within free tier) | ₹0 |
+| CloudWatch | ALWAYS ON: 7 metrics + 5 alarms + 2GB logs | FREE (within free tier) | ₹0 |
 | SNS | ~100 SMS alerts/month (India) | $0.00278/msg | ₹25 |
 | Data Transfer | ~10GB outbound | ~$0.01/GB | ₹85 |
-| **TOTAL** | | | **₹5,280** |
+| **TOTAL** | | | **₹4,981** |
+| **Buffer** | | | **₹19** |
 
-> **Note:** ₹5,280 is ₹280 over ₹5,000. Stays under budget by skipping 2-3 weekend
-> sessions per month or shortening weekend window to 4hr. Actual spend depends on
-> how many weekends you run.
+> Worst case with 500GB S3 cold data. Actual S3 cost starts at ₹106 (50GB)
+> and grows ~₹10/mo. Takes 4-5 years to reach 500GB. Budget holds.
 
 ### Pricing Type: ON-DEMAND (not reserved, not spot)
 - No upfront commitment. Pay only when instance is running.
@@ -30,17 +30,23 @@
 - Manual: start/stop anytime via AWS Console or CLI for extra checks.
 - Cost per hour: **₹15.17** ($0.1785 × ₹85).
 
-## Data Lifecycle: Hot (EBS) → Cold (S3)
+## Data Lifecycle: Hot (EBS) → Cold (S3) — Up to 500GB
 
-| Data Age | Storage | Size | Cost |
-|----------|---------|------|------|
-| 0-60 days | EBS gp3 (100GB) | ~100GB | ₹775/mo |
-| 60-365 days | S3 Standard → Intelligent-Tiering | ~50GB (growing ~5-10GB/mo) | ₹106/mo |
-| >365 days | S3 Glacier (auto via lifecycle policy) | archived | ~₹5/mo |
+| Data Age | Storage Tier | Size | ₹/GB-mo | ₹/mo |
+|----------|-------------|------|---------|------|
+| 0-60 days | EBS gp3 (100GB) | ~100GB | ₹7.75 | ₹775 |
+| 60-365 days | S3 Intelligent-Tiering | ~150GB | ₹1.17 | ₹176 |
+| 1-5 years | S3 Glacier Deep Archive | ~300GB | ₹0.17 | ₹51 |
+| **Total (worst case)** | | **500GB** | | **₹333/mo on S3** |
+
+S3 lifecycle policy (auto, no code needed):
+- 0-90 days after upload: S3 Standard ($0.025/GB)
+- 90-365 days: S3 Intelligent-Tiering ($0.0138/GB) — auto
+- >365 days: Glacier Deep Archive ($0.002/GB) — auto
+- SEBI 5-year retention: satisfied at ₹0.17/GB/mo
 
 Partition manager (already implemented) detaches QuestDB partitions older than retention_days.
 S3 archival exports detached partitions before removal (Plan Item 7, needs aws-sdk-s3).
-SEBI 5-year retention: satisfied by S3 Glacier lifecycle at negligible cost.
 
 ## Mechanical Rules
 
@@ -48,8 +54,10 @@ SEBI 5-year retention: satisfied by S3 Glacier lifecycle at negligible cost.
 2. **NEVER increase EBS beyond 100GB** without Parthiban's approval.
    If 100GB fills up, partition manager detaches old data → export to S3 → free space.
 3. **NEVER add paid AWS services** (RDS, ElastiCache, ALB, NAT Gateway, etc.) without budget review.
-4. **CloudWatch must stay within free tier**: max 10 custom metrics, 10 alarms, 5GB logs/month.
-5. **S3 must use Intelligent-Tiering** for data older than 30 days (auto-moves to cheaper storage).
+4. **CloudWatch is MANDATORY and always enabled** — monitoring, logging, alerting are non-negotiable.
+   Free tier covers: 10 custom metrics, 10 alarms, 5GB logs, 3 dashboards. Stay within free tier.
+5. **S3 lifecycle policy is MANDATORY** — auto-tier to Intelligent-Tiering (90d) → Glacier (365d).
+   Keeps 500GB cold data under ₹333/mo instead of ₹1,063/mo.
 6. **Docker memory budget for c7i.xlarge (8GB)**:
    - QuestDB: 4GB | Valkey: 1GB | Prometheus: 512MB | Grafana: 1GB
    - Alertmanager: 256MB | Traefik: 512MB | Valkey-exporter: 128MB
