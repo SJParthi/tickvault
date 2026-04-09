@@ -72,6 +72,7 @@ impl WebSocketConnectionPool {
         ws_config: WebSocketConfig,
         instruments: Vec<InstrumentSubscription>,
         feed_mode: FeedMode,
+        notifier: Option<std::sync::Arc<crate::notification::NotificationService>>,
     ) -> Result<Self, WebSocketError> {
         let total = instruments.len();
 
@@ -124,6 +125,7 @@ impl WebSocketConnectionPool {
                     assigned_instruments,
                     feed_mode,
                     frame_sender.clone(),
+                    notifier.clone(),
                 ))
             })
             .collect();

@@ -242,7 +242,12 @@
       "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "title": "WebSocket Reconnections",
       "type": "stat",
-      "targets": [{ "expr": "dlt_websocket_reconnections_total", "legendFormat": "", "refId": "A" }]
+      "targets": [
+        { "expr": "sum(dlt_websocket_reconnections_total)", "legendFormat": "main-feed", "refId": "A" },
+        { "expr": "sum(dlt_depth_20lvl_reconnections_total)", "legendFormat": "depth-20", "refId": "B" },
+        { "expr": "sum(dlt_depth_200lvl_reconnections_total)", "legendFormat": "depth-200", "refId": "C" },
+        { "expr": "dlt_order_update_reconnections_total", "legendFormat": "order-update", "refId": "D" }
+      ]
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },

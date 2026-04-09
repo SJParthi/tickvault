@@ -61,6 +61,7 @@ pub async fn run_order_update_connection(
     calendar: Arc<TradingCalendar>,
 ) {
     let mut consecutive_failures: u32 = 0;
+    let m_reconnections = metrics::counter!("dlt_order_update_reconnections_total");
 
     info!("order update WebSocket starting");
 
@@ -120,6 +121,7 @@ pub async fn run_order_update_connection(
         }
 
         // Exponential backoff: delay_ms = initial * 2^(failures-1), capped at max.
+        m_reconnections.increment(1);
         let delay_ms = compute_reconnect_backoff_ms(consecutive_failures);
         debug!(delay_ms, "order update WebSocket reconnect backoff");
         time::sleep(Duration::from_millis(delay_ms)).await;

@@ -386,6 +386,7 @@ async fn main() -> Result<()> {
             &subscription_plan,
             &config,
             true,
+            Some(fast_notifier.clone()),
         ) {
             Some((receiver, pool)) => (Some(receiver), Some(pool)),
             None => (None, None),
@@ -1107,6 +1108,7 @@ async fn main() -> Result<()> {
             &subscription_plan,
             &config,
             is_market_hours,
+            Some(notifier.clone()),
         ) {
             Some((receiver, pool)) => (Some(receiver), Some(pool)),
             None => (None, None),
@@ -2134,6 +2136,7 @@ fn create_websocket_pool(
     subscription_plan: &Option<SubscriptionPlan>,
     config: &ApplicationConfig,
     is_market_hours: bool,
+    notifier: Option<std::sync::Arc<NotificationService>>,
 ) -> Option<(
     tokio::sync::mpsc::Receiver<bytes::Bytes>,
     WebSocketConnectionPool,
@@ -2175,6 +2178,7 @@ fn create_websocket_pool(
         ws_config,
         instruments,
         feed_mode,
+        notifier,
     ) {
         Ok(pool) => pool,
         Err(err) => {

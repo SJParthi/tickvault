@@ -36,8 +36,12 @@ use crate::websocket::subscription_builder::build_twenty_depth_subscription_mess
 /// Identifier for depth connections in logs/metrics.
 const DEPTH_CONNECTION_PREFIX: &str = "depth-20lvl";
 
-/// Read timeout for depth connections (seconds). Same as main feed.
-const DEPTH_READ_TIMEOUT_SECS: u64 = 40;
+/// Read timeout for depth connections (seconds).
+/// Per Dhan docs, keepalive is server ping every 10s, auto-pong by library.
+/// This is a SAFETY timeout for when the server truly dies (no pings at all).
+/// NOT for data flow — outside market hours, no data but pings still come.
+/// Set to 300s (5 min) to avoid false timeouts during low-activity periods.
+const DEPTH_READ_TIMEOUT_SECS: u64 = 300;
 
 /// Reconnection backoff initial delay (ms).
 const DEPTH_RECONNECT_INITIAL_MS: u64 = 1000;
@@ -103,6 +107,8 @@ pub async fn run_twenty_depth_connection(
     );
 
     let reconnect_counter = AtomicU64::new(0);
+    // O(1) EXEMPT: metric handle created once at boot, not per tick
+    let m_reconnections = metrics::counter!("dlt_depth_20lvl_reconnections_total", "underlying" => underlying_label.to_string());
     // Consumed after first Binary data frame — notifies caller that
     // the connection is truly alive and receiving data (not just subscribed).
     let mut pending_signal = connected_signal;
@@ -127,6 +133,7 @@ pub async fn run_twenty_depth_connection(
             }
             Err(err) => {
                 let attempt = reconnect_counter.fetch_add(1, Ordering::Relaxed);
+                m_reconnections.increment(1);
 
                 // Escalate to ERROR after 10+ consecutive failures
                 if attempt > 0 && attempt.is_multiple_of(10) {
@@ -376,6 +383,9 @@ pub async fn run_two_hundred_depth_connection(
 
     let reconnect_counter = AtomicU64::new(0);
     let prefix = format!("depth-200lvl-{label}"); // O(1) EXEMPT: boot-time
+    let m_reconnections =
+        // O(1) EXEMPT: metric handle created once at boot, not per tick
+        metrics::counter!("dlt_depth_200lvl_reconnections_total", "underlying" => prefix.to_string());
     let mut pending_signal = connected_signal;
 
     loop {
@@ -396,6 +406,7 @@ pub async fn run_two_hundred_depth_connection(
             }
             Err(err) => {
                 let attempt = reconnect_counter.fetch_add(1, Ordering::Relaxed);
+                m_reconnections.increment(1);
 
                 // Escalate to ERROR after 10+ consecutive failures
                 if attempt > 0 && attempt.is_multiple_of(10) {

@@ -78,6 +78,10 @@ pub struct WebSocketConnection {
     /// Pre-built subscription messages — built once in `new()`, reused on every reconnect.
     /// IDX_I instruments use Ticker mode; all others use the configured feed mode.
     cached_subscription_messages: Vec<String>,
+
+    /// Optional notification service for Telegram alerts on disconnect/reconnect.
+    /// `None` in tests; `Some(Arc<...>)` in production.
+    notifier: Option<Arc<crate::notification::NotificationService>>,
 }
 
 impl WebSocketConnection {
@@ -94,6 +98,7 @@ impl WebSocketConnection {
         instruments: Vec<InstrumentSubscription>,
         feed_mode: FeedMode,
         frame_sender: mpsc::Sender<bytes::Bytes>,
+        notifier: Option<Arc<crate::notification::NotificationService>>,
     ) -> Self {
         let websocket_base_url = dhan_config.websocket_url.clone(); // O(1) EXEMPT: constructor — once
 
@@ -130,6 +135,7 @@ impl WebSocketConnection {
             state: std::sync::Mutex::new(ConnectionState::Disconnected),
             total_reconnections: AtomicU64::new(0),
             cached_subscription_messages,
+            notifier,
         }
     }
 
@@ -185,6 +191,12 @@ impl WebSocketConnection {
                             reconnection_count,
                             "WebSocket reconnected — mid-session candle gap may exist, next post-market fetch will backfill"
                         );
+                        // H1: Fire Telegram alert on reconnection success.
+                        if let Some(ref n) = self.notifier {
+                            n.notify(crate::notification::events::NotificationEvent::WebSocketReconnected {
+                                connection_index: usize::from(self.connection_id),
+                            });
+                        }
                     }
 
                     // Run read + ping loops until disconnect.
@@ -209,6 +221,14 @@ impl WebSocketConnection {
                                 disconnect_code = %code,
                                 "Non-reconnectable disconnect — stopping connection"
                             );
+                            // H1: Critical disconnect — fire Telegram immediately.
+                            if let Some(ref n) = self.notifier {
+                                n.notify(crate::notification::events::NotificationEvent::WebSocketDisconnected {
+                                    connection_index: usize::from(self.connection_id),
+                                    // O(1) EXEMPT: cold path — reconnection error, not per tick
+                                    reason: format!("Non-reconnectable: {code}"),
+                                });
+                            }
                             self.set_state(ConnectionState::Disconnected);
                             m_conn_active.set(0.0);
                             return Err(WebSocketError::NonReconnectableDisconnect { code });
@@ -232,6 +252,14 @@ impl WebSocketConnection {
                                 error = %err,
                                 "WebSocket disconnected — will reconnect"
                             );
+                            // H1: Fire Telegram alert on unexpected disconnect.
+                            if let Some(ref n) = self.notifier {
+                                n.notify(crate::notification::events::NotificationEvent::WebSocketDisconnected {
+                                    connection_index: usize::from(self.connection_id),
+                                    // O(1) EXEMPT: cold path — reconnection error, not per tick
+                                    reason: format!("{err}"),
+                                });
+                            }
                         }
                     }
                 }
