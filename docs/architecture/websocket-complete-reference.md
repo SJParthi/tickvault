@@ -468,7 +468,143 @@ PascalCase top-level keys.
 
 ---
 
-## 11. Code File Map
+## 11. Dhan Document → Code Verification Matrix
+
+> **Purpose:** Every requirement from Dhan's Full Market Depth, Live Market Feed, and Order Update
+> docs is mapped to the exact file:line in our code. If Dhan changes their protocol, update this
+> matrix and the corresponding code. This section must be reviewed on every Dhan release.
+
+### 11.1 Full Market Depth — Line-by-Line Proof
+
+| # | Dhan Requirement | Our Code | File:Line | Tests |
+|---|-----------------|----------|-----------|-------|
+| 1 | NSE Equity and Derivatives only | Subscription filters to `NseFno` | `main.rs:1266` | `subscription_builder::tests` |
+| 2 | 20-level URL: `wss://depth-api-feed.dhan.co/twentydepth` | `DHAN_TWENTY_DEPTH_WS_BASE_URL` | `constants.rs:972` | compile-time |
+| 3 | 200-level URL: `wss://full-depth-api.dhan.co/twohundreddepth` | `DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL` | `constants.rs:981` | compile-time |
+| 4 | Query params: token, clientId, authType=2 | URL built with all 3 | `depth_connection.rs:243-254` | connection tests |
+| 5 | 20-level: max 50 instruments/connection | `DEPTH_SUBSCRIPTION_BATCH_SIZE = 50` | `depth_connection.rs:53` | compile assert |
+| 6 | 200-level: 1 instrument/connection | Flat JSON (no InstrumentList) | `subscription_builder.rs` | unit tests |
+| 7 | 20-level subscribe JSON: `{RequestCode:23, InstrumentCount, InstrumentList}` | `build_twenty_depth_subscription_messages()` | `subscription_builder.rs` | `test_twenty_depth_*` |
+| 8 | 200-level subscribe JSON: `{RequestCode:23, ExchangeSegment, SecurityId}` | `build_two_hundred_depth_subscription_message()` | `subscription_builder.rs` | `test_two_hundred_*` |
+| 9 | SecurityId is STRING in JSON | `SecurityId: security_id.to_string()` | `subscription_builder.rs` | assertion tests |
+| 10 | Ping every 10s, pong within 40s | `DEPTH_READ_TIMEOUT_SECS = 40`, explicit pong handler | `depth_connection.rs:40,338-345` | timeout tests |
+| 11 | 12-byte header (NOT 8) | `DEEP_DEPTH_HEADER_SIZE = 12` | `constants.rs:346` | compile assert `constants.rs:1703` |
+| 12 | Bytes 1-2: int16 message length | `read_u16_le(raw, 0)` | `deep_depth.rs:78` | `test_parse_deep_depth_header_valid` |
+| 13 | Byte 3: feed code (41=Bid, 51=Ask) | `raw[2]` → `feed_code_to_side()` | `deep_depth.rs:79,90-96` | `test_feed_code_to_side_*` |
+| 14 | Byte 4: exchange segment | `raw[3]` | `deep_depth.rs:80` | header tests |
+| 15 | Bytes 5-8: int32 security ID | `read_u32_le(raw, 4)` | `deep_depth.rs:81` | `test_parse_deep_depth_header_valid` |
+| 16 | 20-lvl bytes 9-12: sequence (persisted for ordering) | `read_u32_le(raw, 8)` → `exchange_sequence` in QuestDB | `deep_depth.rs:82`, `deep_depth_persistence.rs` | header tests |
+| 17 | 200-lvl bytes 9-12: row count | `header.seq_or_row_count` used as `row_count` | `deep_depth.rs:200` | `test_parse_two_hundred_depth_partial_row_count` |
+| 18 | Depth level: float64 price (8 bytes) | `read_f64_le()` — NOT f32 | `deep_depth.rs:133` | `test_parse_twenty_depth_bid_packet` |
+| 19 | Depth level: uint32 quantity (4 bytes) | `read_u32_le()` | `deep_depth.rs:134` | all depth tests |
+| 20 | Depth level: uint32 orders (4 bytes) | `read_u32_le()` | `deep_depth.rs:135` | all depth tests |
+| 21 | 20 levels × 16 bytes = 320 body | `TWENTY_DEPTH_BODY_SIZE = 320` | `constants.rs:373` | compile assert |
+| 22 | 20-level total = 332 bytes | `TWENTY_DEPTH_PACKET_SIZE = 332` | `constants.rs:376` | compile assert `constants.rs:1553` |
+| 23 | 200-level: parse only row_count levels | `parse_deep_depth_levels(raw, row_count_usize, expected_size)` | `deep_depth.rs:210` | `test_parse_two_hundred_depth_partial_row_count` |
+| 24 | 200-level: validate row_count <= 200 | `if row_count > TWO_HUNDRED_DEPTH_LEVELS → InvalidRowCount` | `deep_depth.rs:201-206` | `test_parse_two_hundred_depth_row_count_exceeds_max` |
+| 25 | Bid/Ask arrive as SEPARATE packets | `DepthSide::Bid` / `DepthSide::Ask` per packet | `deep_depth.rs:54-58` | `test_parse_twenty_depth_bid/ask_packet` |
+| 26 | **STACKED PACKETS** in single WS message | `split_stacked_depth_packets()` splits by `message_length` | `dispatcher.rs:143-166` | **12 tests** (see below) |
+| 27 | Disconnect: code 50, reason at bytes 12-13 | 14-byte disconnect handling | per `full-market-depth.md` rule 16 | disconnect tests |
+| 28 | Disconnect RequestCode: 12 | `build_disconnect_message()` | `subscription_builder.rs` | unit test |
+| 29 | 805 = too many connections | `DisconnectCode::TooManyRequests` | `disconnect.rs` | `ws_disconnect_codes::*` |
+| 30 | All binary reads Little Endian | `from_le_bytes()` everywhere, NEVER big endian | all parsers | compile-time pattern |
+
+### 11.2 Stacked Packet Tests — Complete List
+
+| Test | What It Proves | File:Line |
+|------|---------------|-----------|
+| `test_split_stacked_single_packet` | 1 packet → Vec of 1 | `dispatcher.rs:676` |
+| `test_split_stacked_bid_ask_pair` | Bid+Ask → Vec of 2 | `dispatcher.rs:684` |
+| `test_split_stacked_multiple_instruments` | 3 inst × 2 sides → Vec of 6 | `dispatcher.rs:698` |
+| `test_split_stacked_empty` | Empty → empty Vec | `dispatcher.rs:718` |
+| `test_split_stacked_trailing_bytes_ignored` | Trailing garbage < 12 bytes → ignored | `dispatcher.rs:724` |
+| `test_split_stacked_zero_msg_length_stops` | 0-length header → stop splitting | `dispatcher.rs:734` |
+| `test_split_stacked_exact_fit_included` | Exact fit → included | `dispatcher.rs:751` |
+| `test_split_stacked_truncated_second_stops` | Truncated 2nd packet → only first returned | `dispatcher.rs:819` |
+| `test_split_stacked_frames_correct_security_ids` | SecurityIDs survive splitting | `dispatcher.rs:888` |
+| `test_dispatch_deep_depth_message_sequence_propagated` | Sequence number preserved | `dispatcher.rs:803` |
+| `test_dispatch_deep_depth_received_at_nanos_propagated` | Timestamp preserved | `dispatcher.rs:788` |
+| `test_dispatch_deep_depth_bid/ask` | Bid/Ask side correctly identified | `dispatcher.rs:630,653` |
+
+### 11.3 Live Market Verification Queries (Run During 09:15-15:30 IST)
+
+```sql
+-- 1. Verify all 50 instruments per underlying have depth data (stacked packets working)
+SELECT count(DISTINCT security_id) as instruments
+FROM deep_market_depth
+WHERE depth_type = '20' AND ts > dateadd('m', -5, now())
+-- Expected: ~200 (50 per underlying × 4 underlyings)
+
+-- 2. Verify both Bid and Ask sides arrive
+SELECT side, count(*) FROM deep_market_depth
+WHERE depth_type = '20' AND ts > dateadd('m', -5, now())
+GROUP BY side
+-- Expected: roughly equal BID and ASK counts
+
+-- 3. Verify sequence numbers are monotonically increasing (gap detection)
+SELECT security_id, exchange_sequence,
+       exchange_sequence - lag(exchange_sequence) OVER (PARTITION BY security_id, side ORDER BY ts) as gap
+FROM deep_market_depth
+WHERE depth_type = '20' AND ts > dateadd('m', -5, now())
+HAVING gap > 1
+-- Expected: 0 rows (no gaps)
+
+-- 4. Verify 200-level has data for ATM strikes
+SELECT security_id, count(*) FROM deep_market_depth
+WHERE depth_type = '200' AND ts > dateadd('m', -5, now())
+GROUP BY security_id
+-- Expected: 4 security_ids (NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY ATM)
+
+-- 5. Verify price type is f64 precision (not truncated f32)
+SELECT price FROM deep_market_depth
+WHERE depth_type = '20' AND price > 0 AND ts > dateadd('m', -1, now())
+LIMIT 10
+-- Expected: prices with full decimal precision (e.g., 24532.75, not 24532.75000000)
+```
+
+### 11.4 Compile-Time Guarantees (Cannot Be Broken)
+
+These are `const` assertions in `constants.rs` — if ANY value changes, the build FAILS:
+
+```rust
+const _: () = assert!(DEEP_DEPTH_HEADER_SIZE == 12);
+const _: () = assert!(DEEP_DEPTH_LEVEL_SIZE == 16);
+const _: () = assert!(TWENTY_DEPTH_PACKET_SIZE == 12 + 20 * 16);  // 332
+const _: () = assert!(TWO_HUNDRED_DEPTH_PACKET_SIZE == 12 + 200 * 16);  // 3212
+const _: () = assert!(DEEP_DEPTH_FEED_CODE_BID == 41);
+const _: () = assert!(DEEP_DEPTH_FEED_CODE_ASK == 51);
+const _: () = assert!(TICKER_PACKET_SIZE == 16);
+const _: () = assert!(QUOTE_PACKET_SIZE == 50);
+const _: () = assert!(FULL_QUOTE_PACKET_SIZE == 162);
+const _: () = assert!(OI_PACKET_SIZE == 12);
+const _: () = assert!(DISCONNECT_PACKET_SIZE == 10);
+const _: () = assert!(MARKET_STATUS_PACKET_SIZE == 8);
+```
+
+### 11.5 O(1) Latency Guarantees
+
+| Operation | Budget | Enforcement |
+|-----------|--------|-------------|
+| Tick parse (main feed) | <10ns | Benchmarked: `tick_parser` bench, budget in `benchmark-budgets.toml` |
+| Depth header parse | O(1) | Fixed 12-byte read, no loops |
+| Depth level parse (20-level) | O(20) = O(1) | Fixed 20 iterations, bounded |
+| Depth level parse (200-level) | O(N), N ≤ 200 | Bounded by `row_count` validation |
+| Stacked packet split | O(K), K ≤ 100 | Bounded by 50 instruments × 2 sides |
+| Instrument lookup | O(1) | papaya concurrent map |
+| QuestDB write | O(1) per level | ILP buffer append, no allocation |
+
+### 11.6 Uniqueness & Deduplication Guarantees
+
+| Layer | Key | Mechanism |
+|-------|-----|-----------|
+| Ticks (main feed) | `(ts, security_id, segment)` | QuestDB DEDUP UPSERT KEYS |
+| Depth (20+200 level) | `(ts, security_id, segment, level, side)` | QuestDB DEDUP UPSERT KEYS |
+| Candles | `(ts, security_id, segment, timeframe)` | QuestDB DEDUP UPSERT KEYS |
+| Historical candles | `(ts, security_id, segment, timeframe)` | QuestDB DEDUP UPSERT KEYS |
+
+---
+
+## 12. Code File Map
 
 | File | Purpose |
 |------|---------|
