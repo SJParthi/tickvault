@@ -151,7 +151,7 @@ wss://depth-api-feed.dhan.co/twentydepth?token=<TOKEN>&clientId=<CLIENT_ID>&auth
 | 2 | u8 | Feed Code: 41=Bid (Buy), 51=Ask (Sell) |
 | 3 | u8 | Exchange Segment |
 | 4-7 | u32 LE | Security ID |
-| 8-11 | u32 LE | Sequence Number (informational, ignore) |
+| 8-11 | u32 LE | Sequence Number (**stored in QuestDB as `exchange_sequence` for ordering + gap detection**) |
 
 **CRITICAL: Byte order DIFFERS from main feed:**
 - Main feed: byte 0 = response code
@@ -177,9 +177,13 @@ Code 41 = Bid side, code 51 = Ask side. Two separate packets. You need BOTH to b
 
 Multiple instruments: `[Inst1 Bid][Inst1 Ask][Inst2 Bid][Inst2 Ask]...`. Split by message length from header.
 
-### 3.8 NO TIMESTAMP
+### 3.8 NO TIMESTAMP — But Sequence Number for Ordering
 
-**Dhan does NOT include any timestamp in depth packets.** We use `received_at_nanos` (local system clock when frame arrives). Same approach as Dhan's own Python SDK.
+**Dhan does NOT include any timestamp (LTT) in depth packets.** However:
+- **20-level header bytes 8-11 = sequence number** from the exchange. This is the ONLY way to determine precise ordering of depth snapshots and detect gaps (missed packets).
+- We store this as `exchange_sequence` (LONG) in the `deep_market_depth` QuestDB table.
+- Gap detection: if `current_seq != last_seq + 1`, a depth snapshot was missed.
+- We also use `received_at_nanos` (local system clock) for QuestDB timestamp partitioning.
 
 ### 3.9 Disconnect
 
@@ -381,6 +385,9 @@ PascalCase top-level keys.
 | 1 | 200-level depth `.min(secs_until)` no-op in sleep calculation | Removed useless self-comparison | 2026-04-09 |
 | 2 | No Telegram for Live Market Feed WS connections | Added `WebSocketConnected` for all 5 | 2026-04-09 |
 | 3 | No Telegram for Order Update WS connection | Added `OrderUpdateConnected` | 2026-04-09 |
+| 4 | Order update token not zeroized (security) | Wrapped in `zeroize::Zeroizing<String>` | 2026-04-09 |
+| 5 | Non-order JSON messages silently dropped (no metric) | Added `dlt_order_update_non_order_messages_total` counter | 2026-04-09 |
+| 6 | 20-level depth sequence number DISCARDED (bytes 8-11 ignored) | Now persisted as `exchange_sequence` LONG in QuestDB | 2026-04-09 |
 
 ### 10.2 Open Gaps
 
@@ -413,7 +420,7 @@ PascalCase top-level keys.
 | M5 | WebSocket URL with `?token=` could leak in error messages | `connection.rs:301-303` | Token visible in log aggregation |
 | M6 | No CRITICAL alert if SPSC backpressure exceeds threshold | `tick_processor.rs:436-441` | Data loss silently accumulates |
 | M7 | Order update JSON parse errors for non-order messages silently dropped | `order_update_connection.rs:248-251` | No metric for dropped messages |
-| M8 | No 20-level depth sequence number validation — packet loss goes undetected | `depth_connection.rs:554` | Missing depth levels not caught |
+| M8 | 20-level sequence stored but no gap detection logic yet — packet loss persisted but not alerted | `deep_depth_persistence.rs` | Query-time detection possible, no real-time alert |
 
 #### LOW
 
