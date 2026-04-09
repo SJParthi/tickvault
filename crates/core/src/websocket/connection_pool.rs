@@ -278,6 +278,7 @@ mod tests {
             make_test_ws_config(),
             vec![],
             FeedMode::Ticker,
+            None,
         )
         .unwrap();
         assert_eq!(pool.connection_count(), 5);
@@ -293,6 +294,7 @@ mod tests {
             make_test_ws_config(),
             make_instruments(3000),
             FeedMode::Quote,
+            None,
         )
         .unwrap();
         assert_eq!(pool.connection_count(), 5);
@@ -308,6 +310,7 @@ mod tests {
             make_test_ws_config(),
             make_instruments(5000),
             FeedMode::Full,
+            None,
         )
         .unwrap();
         assert_eq!(pool.connection_count(), 5);
@@ -322,6 +325,7 @@ mod tests {
             make_test_ws_config(),
             make_instruments(5001),
             FeedMode::Ticker,
+            None,
         )
         .unwrap();
         assert_eq!(pool.connection_count(), 5);
@@ -337,6 +341,7 @@ mod tests {
             make_test_ws_config(),
             make_instruments(25000),
             FeedMode::Full,
+            None,
         )
         .unwrap();
         assert_eq!(pool.connection_count(), 5);
@@ -352,6 +357,7 @@ mod tests {
             make_test_ws_config(),
             make_instruments(25001),
             FeedMode::Ticker,
+            None,
         );
         assert!(result.is_err());
         let (requested, capacity) = unwrap_capacity_exceeded(result.unwrap_err());
@@ -369,6 +375,7 @@ mod tests {
             make_test_ws_config(),
             make_instruments(10001),
             FeedMode::Ticker,
+            None,
         )
         .unwrap();
         assert_eq!(pool.connection_count(), 5);
@@ -392,6 +399,7 @@ mod tests {
             make_test_ws_config(),
             make_instruments(1),
             FeedMode::Ticker,
+            None,
         )
         .unwrap();
         assert_eq!(pool.connection_count(), 5);
@@ -407,6 +415,7 @@ mod tests {
             make_test_ws_config(),
             make_instruments(4999),
             FeedMode::Quote,
+            None,
         )
         .unwrap();
         assert_eq!(pool.connection_count(), 5);
@@ -421,6 +430,7 @@ mod tests {
             make_test_ws_config(),
             make_instruments(10000),
             FeedMode::Ticker,
+            None,
         )
         .unwrap();
         assert_eq!(pool.connection_count(), 5);
@@ -435,6 +445,7 @@ mod tests {
             make_test_ws_config(),
             make_instruments(15000),
             FeedMode::Full,
+            None,
         )
         .unwrap();
         assert_eq!(pool.connection_count(), 5);
@@ -449,6 +460,7 @@ mod tests {
             make_test_ws_config(),
             make_instruments(20000),
             FeedMode::Ticker,
+            None,
         )
         .unwrap();
         assert_eq!(pool.connection_count(), 5);
@@ -463,6 +475,7 @@ mod tests {
             make_test_ws_config(),
             make_instruments(100),
             FeedMode::Ticker,
+            None,
         )
         .unwrap();
 
@@ -487,6 +500,7 @@ mod tests {
             make_test_ws_config(),
             make_instruments(5001),
             FeedMode::Ticker,
+            None,
         )
         .unwrap();
         let debug_str = format!("{pool:?}");
@@ -509,6 +523,7 @@ mod tests {
             make_test_ws_config(),
             make_instruments(5000),
             FeedMode::Full,
+            None,
         )
         .unwrap();
         // Always max connections (5), instruments distributed round-robin
@@ -529,6 +544,7 @@ mod tests {
                 make_test_ws_config(),
                 make_instruments(count),
                 FeedMode::Ticker,
+                None,
             )
             .unwrap();
             assert_eq!(
@@ -548,6 +564,7 @@ mod tests {
             make_test_ws_config(),
             make_instruments(12000),
             FeedMode::Full,
+            None,
         )
         .unwrap();
         let healths = pool.health();
@@ -574,6 +591,7 @@ mod tests {
             make_test_ws_config(),
             make_instruments(5000),
             FeedMode::Ticker,
+            None,
         )
         .unwrap();
         assert_eq!(pool.connection_count(), 3);
@@ -594,6 +612,7 @@ mod tests {
             make_test_ws_config(),
             make_instruments(15000),
             FeedMode::Ticker,
+            None,
         );
         assert!(result.is_err());
         let (requested, capacity) = unwrap_capacity_exceeded(result.unwrap_err());
@@ -615,6 +634,7 @@ mod tests {
             make_test_ws_config(),
             make_instruments(5000),
             FeedMode::Ticker,
+            None,
         )
         .unwrap();
         assert_eq!(pool.connection_count(), 5);
@@ -637,6 +657,7 @@ mod tests {
                     make_test_ws_config(),
                     instruments,
                     FeedMode::Ticker,
+                    None,
                 ).unwrap();
                 prop_assert_eq!(pool.total_instruments(), count);
                 prop_assert_eq!(pool.connection_count(), 5);
@@ -660,6 +681,7 @@ mod tests {
             },
             make_instruments(100),
             FeedMode::Ticker,
+            None,
         )
         .unwrap();
 
@@ -693,6 +715,7 @@ mod tests {
             },
             vec![], // no instruments
             FeedMode::Ticker,
+            None,
         )
         .unwrap();
 
@@ -719,6 +742,7 @@ mod tests {
             },
             make_instruments(10),
             FeedMode::Ticker,
+            None,
         )
         .unwrap();
 
@@ -751,6 +775,7 @@ mod tests {
             make_test_ws_config(),
             make_instruments(100),
             FeedMode::Ticker,
+            None,
         )
         .unwrap();
         assert_eq!(pool.connection_count(), 1);
@@ -776,6 +801,7 @@ mod tests {
             make_test_ws_config(),
             make_instruments(5),
             FeedMode::Ticker,
+            None,
         )
         .unwrap();
         assert_eq!(pool.connection_count(), 5);
@@ -800,6 +826,7 @@ mod tests {
             make_test_ws_config(),
             make_instruments(6),
             FeedMode::Ticker,
+            None,
         );
         assert!(result.is_err());
         let (requested, capacity) = unwrap_capacity_exceeded(result.unwrap_err());
@@ -817,6 +844,7 @@ mod tests {
             make_test_ws_config(),
             make_instruments(500),
             FeedMode::Full,
+            None,
         )
         .unwrap();
         for h in pool.health() {
@@ -835,6 +863,7 @@ mod tests {
             make_test_ws_config(),
             make_instruments(100),
             FeedMode::Ticker,
+            None,
         )
         .unwrap();
         let healths = pool.health();
@@ -853,6 +882,7 @@ mod tests {
             make_test_ws_config(),
             make_instruments(10),
             FeedMode::Ticker,
+            None,
         )
         .unwrap();
 
@@ -881,6 +911,7 @@ mod tests {
                 make_test_ws_config(),
                 make_instruments(count),
                 FeedMode::Ticker,
+                None,
             )
             .unwrap();
             let debug_str = format!("{pool:?}");
@@ -899,6 +930,7 @@ mod tests {
             make_test_ws_config(),
             make_instruments(10),
             FeedMode::Ticker,
+            None,
         )
         .unwrap();
         for h in pool.health() {
@@ -916,6 +948,7 @@ mod tests {
             make_test_ws_config(),
             make_instruments(7),
             FeedMode::Ticker,
+            None,
         )
         .unwrap();
         let healths = pool.health();
@@ -937,6 +970,7 @@ mod tests {
             make_test_ws_config(),
             make_instruments(100),
             FeedMode::Ticker,
+            None,
         )
         .unwrap();
         assert_eq!(pool.connection_count(), 5);
@@ -956,6 +990,7 @@ mod tests {
             make_test_ws_config(),
             make_instruments(25000),
             FeedMode::Ticker,
+            None,
         )
         .unwrap();
         assert_eq!(pool.connection_count(), 5);
@@ -981,6 +1016,7 @@ mod tests {
             },
             make_instruments(5),
             FeedMode::Ticker,
+            None,
         )
         .unwrap();
 
@@ -1008,6 +1044,7 @@ mod tests {
             },
             make_instruments(10),
             FeedMode::Ticker,
+            None,
         )
         .unwrap();
 
@@ -1043,6 +1080,7 @@ mod tests {
             },
             make_instruments(10),
             FeedMode::Ticker,
+            None,
         )
         .unwrap();
 

@@ -751,6 +751,7 @@ mod tests {
             vec![],
             FeedMode::Ticker,
             tx,
+            None,
         );
         let health = conn.health();
         assert_eq!(health.state, ConnectionState::Disconnected);
@@ -771,6 +772,7 @@ mod tests {
             vec![],
             FeedMode::Full,
             tx,
+            None,
         );
         assert_eq!(conn.connection_id(), 3);
     }
@@ -792,6 +794,7 @@ mod tests {
             instruments,
             FeedMode::Quote,
             tx,
+            None,
         );
         assert_eq!(conn.health().subscribed_count, 3);
     }
@@ -813,6 +816,7 @@ mod tests {
             vec![],
             FeedMode::Ticker,
             tx,
+            None,
         );
         let result = conn.run().await;
         assert!(result.is_err());
@@ -835,6 +839,7 @@ mod tests {
             vec![],
             FeedMode::Quote,
             tx,
+            None,
         );
         let result = conn.run().await;
         let (connection_id, attempts) = unwrap_reconnection_exhausted(result);
@@ -854,6 +859,7 @@ mod tests {
             vec![],
             FeedMode::Ticker,
             tx,
+            None,
         );
         assert_eq!(conn.health().state, ConnectionState::Disconnected);
 
@@ -882,6 +888,7 @@ mod tests {
             vec![],
             FeedMode::Ticker,
             tx,
+            None,
         );
         assert_eq!(conn.health().total_reconnections, 0);
 
@@ -902,6 +909,7 @@ mod tests {
             vec![],
             FeedMode::Full,
             tx,
+            None,
         );
         assert_eq!(conn.connection_id(), 4);
         assert_eq!(conn.health().connection_id, 4);
@@ -920,6 +928,7 @@ mod tests {
                 vec![InstrumentSubscription::new(ExchangeSegment::NseFno, 1000)],
                 feed_mode,
                 tx,
+                None,
             );
             // All feed modes should create successfully with 1 instrument
             assert_eq!(conn.health().subscribed_count, 1);
@@ -943,6 +952,7 @@ mod tests {
             vec![],
             FeedMode::Ticker,
             tx,
+            None,
         );
 
         // Simulate 3 reconnections already happened
@@ -969,6 +979,7 @@ mod tests {
             vec![],
             FeedMode::Ticker,
             tx,
+            None,
         );
 
         // Only 2 reconnections — well under limit of 10
@@ -1026,6 +1037,7 @@ mod tests {
             vec![],
             FeedMode::Full,
             tx,
+            None,
         );
         assert!(
             conn.cached_subscription_messages.is_empty(),
@@ -1049,6 +1061,7 @@ mod tests {
             instruments,
             FeedMode::Full,
             tx,
+            None,
         );
         assert_eq!(conn.cached_subscription_messages.len(), 1);
         assert!(conn.cached_subscription_messages[0].contains("\"RequestCode\":21"));
@@ -1071,6 +1084,7 @@ mod tests {
             instruments,
             FeedMode::Full, // Configured as Full, but IDX_I should use Ticker
             tx,
+            None,
         );
         // All IDX_I → only Ticker messages (request_code 15), NOT Full (21)
         assert_eq!(conn.cached_subscription_messages.len(), 1);
@@ -1091,6 +1105,7 @@ mod tests {
             instruments,
             FeedMode::Quote,
             tx,
+            None,
         );
         assert_eq!(conn.cached_subscription_messages.len(), 1);
         assert!(conn.cached_subscription_messages[0].contains("\"RequestCode\":17"));
@@ -1112,6 +1127,7 @@ mod tests {
             instruments,
             FeedMode::Ticker,
             tx,
+            None,
         );
         assert_eq!(conn.cached_subscription_messages.len(), 50);
     }
@@ -1134,6 +1150,7 @@ mod tests {
             instruments,
             FeedMode::Full, // Non-IDX gets Full (21), IDX_I gets Ticker (15)
             tx,
+            None,
         );
         // 2 non-IDX → 1 Full message, 2 IDX_I → 1 Ticker message = 2 total
         assert_eq!(conn.cached_subscription_messages.len(), 2);
@@ -1163,6 +1180,7 @@ mod tests {
             vec![],
             FeedMode::Ticker,
             tx,
+            None,
         );
         // Construction succeeds; empty client_id is a runtime concern at connect time
         assert_eq!(conn.connection_id(), 0);
@@ -1186,6 +1204,7 @@ mod tests {
             vec![], // no instruments means no batching issue
             FeedMode::Ticker,
             tx,
+            None,
         );
         assert!(conn.cached_subscription_messages.is_empty());
     }
@@ -1204,6 +1223,7 @@ mod tests {
             vec![],
             FeedMode::Ticker,
             tx,
+            None,
         );
 
         // Cycle through states multiple times
@@ -1236,6 +1256,7 @@ mod tests {
             vec![],
             FeedMode::Ticker,
             tx,
+            None,
         );
 
         conn.set_state(ConnectionState::Connected);
@@ -1261,6 +1282,7 @@ mod tests {
             instruments,
             FeedMode::Full,
             tx,
+            None,
         );
 
         // Simulate reconnecting state with accumulated reconnections
@@ -1293,6 +1315,7 @@ mod tests {
             vec![],
             FeedMode::Ticker,
             tx,
+            None,
         );
 
         // attempt=0 → delay = initial * 2^0 = initial
@@ -1320,6 +1343,7 @@ mod tests {
             vec![],
             FeedMode::Ticker,
             tx,
+            None,
         );
 
         // attempt=63 → 2^63 would overflow, but saturating_mul + min caps at max_delay
@@ -1347,6 +1371,7 @@ mod tests {
             vec![],
             FeedMode::Ticker,
             tx,
+            None,
         );
 
         // attempt 4 (last allowed when max=5) should succeed
@@ -1379,6 +1404,7 @@ mod tests {
             vec![],
             FeedMode::Ticker,
             tx,
+            None,
         );
 
         // With max_attempts=0 (infinite), even high attempt counts should return true.
@@ -1418,6 +1444,7 @@ mod tests {
             vec![],
             FeedMode::Ticker,
             tx,
+            None,
         );
         assert_eq!(conn.connection_id(), 0);
         assert_eq!(conn.health().connection_id, 0);
@@ -1440,6 +1467,7 @@ mod tests {
             instruments,
             FeedMode::Full,
             tx,
+            None,
         );
         assert_eq!(conn.health().subscribed_count, 5000);
         // 5000 / batch_size(100) = 50 messages
@@ -1461,6 +1489,7 @@ mod tests {
             instruments,
             FeedMode::Ticker, // Same as forced mode for IDX_I
             tx,
+            None,
         );
         assert_eq!(conn.cached_subscription_messages.len(), 1);
         assert!(conn.cached_subscription_messages[0].contains("\"RequestCode\":15"));
@@ -1488,6 +1517,7 @@ mod tests {
             instruments,
             FeedMode::Ticker,
             tx,
+            None,
         );
         // 3 instruments / batch_size 1 = 3 messages
         assert_eq!(conn.cached_subscription_messages.len(), 3);
@@ -1515,6 +1545,7 @@ mod tests {
             vec![],
             FeedMode::Ticker,
             tx,
+            None,
         );
         let result = conn.run().await;
         let (connection_id, attempts) = unwrap_reconnection_exhausted(result);
@@ -1569,6 +1600,7 @@ mod tests {
             vec![InstrumentSubscription::new(ExchangeSegment::NseFno, 1000)],
             FeedMode::Full,
             tx,
+            None,
         );
 
         let result = conn.run().await;
@@ -1604,6 +1636,7 @@ mod tests {
             vec![],
             FeedMode::Ticker,
             tx,
+            None,
         ));
 
         let result = conn.run().await;
@@ -1640,6 +1673,7 @@ mod tests {
             instruments,
             FeedMode::Quote,
             tx,
+            None,
         );
 
         let result = conn.run().await;
@@ -1671,6 +1705,7 @@ mod tests {
             vec![],
             FeedMode::Ticker,
             tx,
+            None,
         );
 
         let result = conn.run().await;
@@ -1709,6 +1744,7 @@ mod tests {
             instruments,
             FeedMode::Full,
             tx,
+            None,
         );
 
         // Verify cached messages were built correctly
@@ -1739,6 +1775,7 @@ mod tests {
             vec![],
             FeedMode::Ticker,
             tx,
+            None,
         );
 
         for attempt in 0..5u64 {
@@ -1773,6 +1810,7 @@ mod tests {
             vec![],
             FeedMode::Ticker,
             tx,
+            None,
         );
 
         // attempt=64 → checked_shl(64) returns None → unwrap_or(u64::MAX)
@@ -1804,6 +1842,7 @@ mod tests {
             vec![],
             FeedMode::Ticker,
             tx,
+            None,
         );
 
         assert_eq!(conn.health().total_reconnections, 0);
@@ -1838,6 +1877,7 @@ mod tests {
             vec![],
             FeedMode::Ticker,
             tx,
+            None,
         );
 
         let result = conn.run().await;
@@ -1861,6 +1901,7 @@ mod tests {
             vec![],
             FeedMode::Ticker,
             tx,
+            None,
         );
         // The websocket_base_url is private, but we can verify via health
         // that construction succeeded.
@@ -1893,6 +1934,7 @@ mod tests {
             instruments,
             FeedMode::Full,
             tx,
+            None,
         );
         assert_eq!(conn.connection_id(), 4);
         assert_eq!(conn.health().subscribed_count, 250);
@@ -1938,6 +1980,7 @@ mod tests {
             vec![],
             FeedMode::Ticker,
             tx,
+            None,
         );
 
         let result = conn.run().await;
@@ -1972,6 +2015,7 @@ mod tests {
             vec![InstrumentSubscription::new(ExchangeSegment::NseFno, 5555)],
             FeedMode::Ticker,
             tx,
+            None,
         );
 
         let result = conn.run().await;
@@ -2001,6 +2045,7 @@ mod tests {
             instruments,
             FeedMode::Full,
             tx,
+            None,
         );
         assert_eq!(conn.cached_subscription_messages.len(), 1);
     }
@@ -2021,6 +2066,7 @@ mod tests {
             instruments,
             FeedMode::Ticker,
             tx,
+            None,
         );
         assert_eq!(conn.cached_subscription_messages.len(), 2);
     }
@@ -2041,6 +2087,7 @@ mod tests {
             instruments,
             FeedMode::Ticker,
             tx,
+            None,
         );
         assert_eq!(conn.cached_subscription_messages.len(), 2);
         // First batch should have 100 instruments
@@ -2119,6 +2166,7 @@ mod tests {
             vec![],
             FeedMode::Ticker,
             frame_sender,
+            None,
         )
     }
 
@@ -2526,6 +2574,7 @@ mod tests {
             vec![InstrumentSubscription::new(ExchangeSegment::NseFno, 1000)],
             FeedMode::Full,
             tx,
+            None,
         );
 
         let result = conn.run().await;
@@ -2681,6 +2730,7 @@ mod tests {
             vec![],
             FeedMode::Full,
             tx,
+            None,
         );
         // No instruments → no subscription messages
         assert!(conn.cached_subscription_messages.is_empty());
@@ -2702,6 +2752,7 @@ mod tests {
             instruments,
             FeedMode::Full,
             tx,
+            None,
         );
         assert!(
             !conn.cached_subscription_messages.is_empty(),
@@ -2722,6 +2773,7 @@ mod tests {
             instruments,
             FeedMode::Full, // Full mode specified but IDX_I should use Ticker
             tx,
+            None,
         );
         assert!(!conn.cached_subscription_messages.is_empty());
         // The subscription message should contain RequestCode 15 (SubscribeTicker)
@@ -2749,6 +2801,7 @@ mod tests {
             instruments,
             FeedMode::Full,
             tx,
+            None,
         );
         // Should have at least 2 messages: one for non-IDX (Full) and one for IDX (Ticker)
         assert!(
@@ -2774,6 +2827,7 @@ mod tests {
             vec![InstrumentSubscription::new(ExchangeSegment::NseFno, 42)],
             FeedMode::Quote,
             tx,
+            None,
         );
         let health = conn.health();
         let debug_str = format!("{:?}", health);
@@ -2796,6 +2850,7 @@ mod tests {
             vec![],
             FeedMode::Ticker,
             tx,
+            None,
         );
         // This will poll for up to 60s but we can't wait that long in tests.
         // Just verify the function exists and can be called.
@@ -2830,6 +2885,7 @@ mod tests {
             vec![],
             FeedMode::Ticker,
             tx,
+            None,
         );
         let start = std::time::Instant::now();
         conn.wait_for_valid_token().await;
@@ -2860,6 +2916,7 @@ mod tests {
             instruments,
             FeedMode::Full,
             tx,
+            None,
         );
         // All instruments are non-IDX, so all messages use Full (code 21)
         assert_eq!(conn.cached_subscription_messages.len(), 1);
@@ -2887,6 +2944,7 @@ mod tests {
             instruments,
             FeedMode::Full,
             tx,
+            None,
         );
         // All instruments are IDX, so all use Ticker (code 15), no Full messages
         assert_eq!(conn.cached_subscription_messages.len(), 1);
@@ -2958,6 +3016,7 @@ mod tests {
             vec![],
             FeedMode::Ticker,
             tx,
+            None,
         );
 
         let result = conn.run().await;
