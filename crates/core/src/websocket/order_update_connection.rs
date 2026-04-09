@@ -150,7 +150,9 @@ async fn connect_and_listen(
     }
 
     // O(1) EXEMPT: begin — cold path, runs once per WebSocket connect
-    let access_token = token_state.access_token().expose_secret().to_string();
+    // SEC-3: Zeroize the access token after use to prevent heap residency.
+    let access_token =
+        zeroize::Zeroizing::new(token_state.access_token().expose_secret().to_string());
 
     // Build TLS connector.
     let tls_connector = build_websocket_tls_connector()
@@ -244,6 +246,8 @@ async fn connect_and_listen(
                             }
                             AuthResponseKind::Success => {
                                 // Login ack or heartbeat — not all messages are order updates.
+                                metrics::counter!("dlt_order_update_non_order_messages_total")
+                                    .increment(1);
                                 debug!(
                                     ?err,
                                     text_preview = &text[..text.len().min(200)],
