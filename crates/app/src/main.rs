@@ -2682,14 +2682,23 @@ async fn run_tick_persistence_consumer(
             }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                 // C2: CRITICAL — ticks permanently lost due to broadcast lag.
-                // This can happen if the persistence consumer is slower than the
-                // tick processor. Track the count and fire metrics.
+                // This fires ERROR log → Loki → Telegram alert automatically.
+                // Root cause: QuestDB ILP flush is slower than tick ingestion rate.
+                // Defense: broadcast capacity 262K + tick writer ring buffer 600K + disk spill.
                 error!(
                     skipped,
                     "CRITICAL: cold-path tick persistence lagged — {} ticks permanently lost",
                     skipped
                 );
                 metrics::counter!("dlt_ticks_permanently_lost").increment(skipped);
+                // Explicit Telegram: ERROR log triggers Loki alert, but also notify directly
+                // in case Loki pipeline is delayed.
+                if let Some(ref n) = notifier {
+                    n.notify(NotificationEvent::QuestDbDisconnected {
+                        writer: format!("tick_persistence (LAGGED: {skipped} ticks lost)"),
+                        buffer_size: skipped as usize,
+                    });
+                }
             }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                 info!(
