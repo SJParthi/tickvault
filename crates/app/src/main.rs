@@ -1334,6 +1334,7 @@ async fn main() -> Result<()> {
                                 exchange_segment_code,
                                 side,
                                 levels,
+                                message_sequence,
                                 ..
                             }) => {
                                 let side_str = match side {
@@ -1352,6 +1353,7 @@ async fn main() -> Result<()> {
                                         &levels,
                                         "20",
                                         ts,
+                                        message_sequence,
                                     )
                                 {
                                     tracing::warn!(?err, "failed to persist 20-level depth");
@@ -1459,6 +1461,7 @@ async fn main() -> Result<()> {
                                         exchange_segment_code,
                                         side,
                                         levels,
+                                        message_sequence,
                                         ..
                                     },
                                 ) => {
@@ -1474,6 +1477,7 @@ async fn main() -> Result<()> {
                                             &levels,
                                             "200",
                                             ts,
+                                            message_sequence,
                                         )
                                     {
                                         tracing::warn!(
