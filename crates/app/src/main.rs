@@ -1352,10 +1352,13 @@ async fn main() -> Result<()> {
                 let instrument_count = instruments_for_underlying.len();
                 let label = (*underlying).to_string();
 
+                // PROOF: log exactly which ATM strike and security_ids are used.
                 info!(
                     underlying,
                     instruments = instrument_count,
-                    "spawning 20-level depth connection"
+                    atm_ce_sid = ?atm_ce_sid,
+                    atm_pe_sid = ?atm_pe_sid,
+                    "PROOF: spawning 20-level depth ({instrument_count} instruments) + 200-level depth (CE+PE ATM)"
                 );
 
                 // O(1) EXEMPT: begin — depth connection + persistence setup at boot

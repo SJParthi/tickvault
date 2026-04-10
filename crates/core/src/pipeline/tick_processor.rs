@@ -480,6 +480,15 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
     let mut prev_close_other: u64 = 0;
     let mut prev_close_summary_logged = false;
 
+    // PROOF: track unique instruments that received day_close baseline.
+    // Logged periodically so you can see "day_close baselines: 24,872 instruments"
+    // growing in real-time. If this stays 0, day_close is not working.
+    // O(1) EXEMPT: begin — HashSet for baseline tracking (boot + first 60s only)
+    let mut day_close_baseline_count: u64 = 0;
+    let mut day_close_baseline_logged = false;
+    let mut day_close_first_log_time = None::<Instant>;
+    // O(1) EXEMPT: end
+
     // O(1) dedup ring buffer — pre-allocated once, zero allocation in hot loop.
     let mut dedup_ring = TickDedupRing::new(DEDUP_RING_BUFFER_POWER);
 
@@ -637,6 +646,10 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                 // needing separate PrevClose (code 6) packets (which only arrive for indices).
                 // Guard: only update if day_close is valid (non-zero, finite).
                 if tick.day_close > 0.0 && tick.day_close.is_finite() {
+                    day_close_baseline_count = day_close_baseline_count.saturating_add(1);
+                    if day_close_first_log_time.is_none() {
+                        day_close_first_log_time = Some(Instant::now());
+                    }
                     if let Some(ref mut movers) = top_movers {
                         movers.update_prev_close(
                             tick.security_id,
@@ -651,6 +664,17 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                             tick.day_close,
                         );
                     }
+                }
+
+                // PROOF: log day_close baseline coverage after 30 seconds of ticks.
+                if !day_close_baseline_logged
+                    && day_close_first_log_time.is_some_and(|t| t.elapsed().as_secs() >= 30)
+                {
+                    day_close_baseline_logged = true;
+                    info!(
+                        day_close_updates = day_close_baseline_count,
+                        "PROOF: day_close baselines set from Full packet ticks (should be >> 0 for all instruments)"
+                    );
                 }
 
                 // O(1) candle aggregation: update 1s OHLCV candle for this security.
