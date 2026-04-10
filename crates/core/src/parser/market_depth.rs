@@ -4,7 +4,7 @@
 //! This packet provides LTP + 5-level market depth but NO timestamp,
 //! volume, OHLC, or OI data.
 //!
-//! Source: Dhan Python SDK `process_market_depth()` in `marketfeed.py`.
+//! Source: Dhan API (Python SDK ref) `process_market_depth()` in `marketfeed.py`.
 
 use dhan_live_trader_common::constants::{
     DEPTH_LEVEL_OFFSET_ASK_ORDERS, DEPTH_LEVEL_OFFSET_ASK_PRICE, DEPTH_LEVEL_OFFSET_ASK_QTY,

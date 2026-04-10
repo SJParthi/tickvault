@@ -12,7 +12,7 @@
 //!
 //! # Error Handling & Zero-Tick-Loss Guarantee
 //! On QuestDB failure, ticks are held in a bounded ring buffer
-//! (`TICK_BUFFER_CAPACITY` = 300K ticks). When the ring buffer fills,
+//! (`TICK_BUFFER_CAPACITY` = 600K ticks). When the ring buffer fills,
 //! overflow ticks spill to disk (`data/spill/ticks-YYYYMMDD.bin`).
 //! On recovery, ring buffer drains first, then disk spill.
 //! On graceful shutdown, remaining ticks flush to QuestDB or disk.
@@ -103,7 +103,10 @@ const _: () = assert!(
     "ParsedTick grew beyond TICK_SPILL_RECORD_SIZE — update serialize/deserialize"
 );
 
-/// Directory for tick spill files.
+/// Directory for tick/depth spill files (WAL on disk).
+/// Relative to CWD: Mac=project root, Docker=/app. Both resolve to same volume.
+/// TODO: Make configurable via QuestDbConfig.spill_dir when needed for
+/// dedicated high-IOPS volume on AWS (EBS io2 for spill, gp3 for data).
 const TICK_SPILL_DIR: &str = "data/spill";
 
 /// Serialize a `ParsedTick` to a fixed-size byte array for disk spill.
@@ -381,8 +384,8 @@ impl TickPersistenceWriter {
     ///
     /// Returns `Ok(())` if the buffer is empty (nothing to flush).
     ///
-    /// DEPRECATED: previous_close table removed. Kept for potential future
-    /// non-tick buffer writes. No production call sites as of 2026-04-10.
+    /// DEPRECATED: previous_close table removed. No production call sites.
+    #[deprecated(note = "previous_close table removed — use day_close from Full ticks")]
     pub fn flush_buffer_direct(&mut self) -> Result<()> {
         // Nothing in buffer → no-op (avoid pointless TCP round-trip).
         if self.buffer.is_empty() {
@@ -609,7 +612,7 @@ impl TickPersistenceWriter {
     #[rustfmt::skip]
     fn drain_disk_spill(&mut self) -> usize {
         if let Some(ref mut writer) = self.spill_writer && let Err(err) = writer.flush() {
-            warn!(?err, "BufWriter flush failed before drain — last ~111 ticks may be lost");
+            warn!(?err, "BufWriter flush failed before drain — last ~73 ticks may be lost (8KB buf / 112B per tick)");
         }
         self.spill_writer = None;
         let spill_path = match self.spill_path.take() { Some(p) => p, None => return 0 };
@@ -904,7 +907,7 @@ const F32_DECIMAL_BUF_SIZE: usize = 24;
 ///   21004.95_f32 → `f64::from()` → 21004.94921875_f64  ← WRONG
 ///   21004.95_f32 → this function → 21004.95_f64         ← CORRECT
 ///
-/// Matches the Dhan Python SDK behavior: `"{:.2f}".format(value)`.
+/// Matches the Dhan API (Python SDK ref) behavior: `"{:.2f}".format(value)`.
 ///
 /// # Performance
 /// Zero heap allocation — uses a stack buffer for the decimal string.
