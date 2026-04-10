@@ -31,8 +31,8 @@
         }
 
         .logo {
-            width: 40px;
-            height: 40px;
+            width: 30px;
+            height: 30px;
             border-radius: 50%;
             background: linear-gradient(135deg, #1e90ff, #4169e1);
             display: flex;
@@ -40,7 +40,8 @@
             justify-content: center;
             font-weight: bold;
             color: white;
-            font-size: 20px;
+            font-size: 14px;
+            flex-shrink: 0;
         }
 
         .search-bar {
@@ -84,12 +85,12 @@
         }
 
         .markets-btn {
-            background-color: #5CA81D;
-            color: white;
-            padding: 6px 12px;
-            border-radius: 4px;
+            background: none;
+            color: #5CA81D;
+            padding: 6px 0;
             cursor: pointer;
-            font-size: 12px;
+            font-size: 14px;
+            font-weight: 500;
             border: none;
         }
 
@@ -280,7 +281,8 @@
         }
 
         .sidebar-item-name {
-            font-size: 12px;
+            font-size: 13px;
+            font-weight: 500;
             color: #e8e8e8;
             white-space: nowrap;
             overflow: hidden;
@@ -288,18 +290,19 @@
         }
 
         .sidebar-item-exchange {
-            font-size: 10px;
+            font-size: 11px;
             color: #8E8E8E;
         }
 
         .sidebar-item-price {
-            font-size: 12px;
+            font-size: 14px;
+            font-weight: 500;
             color: #e8e8e8;
             text-align: right;
         }
 
         .sidebar-item-change {
-            font-size: 11px;
+            font-size: 12px;
             text-align: right;
         }
 
@@ -403,18 +406,30 @@
         }
 
         .dropdown-select {
-            background-color: #242424;
-            border: 1px solid #242424;
+            background-color: #1a1a1a;
+            border: 1px solid #333;
             color: #e8e8e8;
             padding: 6px 12px;
             border-radius: 4px;
             cursor: pointer;
-            font-size: 12px;
-            min-width: 100px;
+            font-size: 13px;
+            min-width: 80px;
+            -webkit-appearance: none;
+            -moz-appearance: none;
+            appearance: none;
+            background-image: url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%238E8E8E' stroke-width='2'%3e%3cpolyline points='6 9 12 15 18 9'%3e%3c/polyline%3e%3c/svg%3e");
+            background-repeat: no-repeat;
+            background-position: right 8px center;
+            background-size: 14px;
+            padding-right: 28px;
+        }
+        .dropdown-select option {
+            background-color: #1a1a1a;
+            color: #e8e8e8;
         }
 
         .dropdown-select:hover {
-            background-color: #2a2a2a;
+            border-color: #555;
         }
 
         .toggle-buttons {
@@ -701,7 +716,8 @@
         <div class="content">
             <!-- MARKET NAV -->
             <div class="market-nav" id="marketNav">
-                <div class="market-nav-item active" data-market="options">Live Options</div>
+                <div class="market-nav-item" data-market="live">Live</div>
+                <div class="market-nav-item active" data-market="options">Options</div>
                 <div class="market-nav-item" data-market="stocks">Stocks</div>
                 <div class="market-nav-item" data-market="commodity">Commodity</div>
                 <div class="market-nav-item" data-market="futures">Futures</div>
@@ -728,7 +744,7 @@
                         <option>June</option>
                     </select>
                     <select class="dropdown-select" id="typeSelect">
-                        <option>All</option>
+                        <option selected>All</option>
                         <option>Index</option>
                         <option>Stock</option>
                         <option>NSE</option>
@@ -853,7 +869,7 @@
                             <div class="sidebar-item-exchange">${item.exchange}</div>
                         </div>
                         <div>
-                            <div class="sidebar-item-price">₹${item.price.toLocaleString('en-IN')}</div>
+                            <div class="sidebar-item-price">${item.price.toLocaleString('en-IN')}</div>
                             <div class="sidebar-item-change ${isUp ? 'up' : 'down'}">
                                 ${isUp ? '+' : ''}${item.changePct.toFixed(2)}%
                             </div>
@@ -923,8 +939,8 @@
                     <tr>
                         <td class="checkbox-cell"><input type="checkbox"></td>
                         <td class="table-name">${row.contract_name}</td>
-                        <td class="table-secondary">₹${formatIndianNumber(row.spot_price)}</td>
-                        <td>₹${row.ltp.toFixed(2)}</td>
+                        <td class="table-secondary">${formatIndianNumber(row.spot_price)}</td>
+                        <td>${row.ltp.toFixed(2)}</td>
                         <td class="table-change ${changeUp ? 'up' : 'down'}">
                             ${changeUp ? '+' : ''}${row.change.toFixed(2)}
                         </td>
@@ -967,7 +983,7 @@
                     <tr>
                         <td class="checkbox-cell"><input type="checkbox"></td>
                         <td class="table-name">${row.symbol}</td>
-                        <td>₹${row.ltp.toFixed(2)}</td>
+                        <td>${row.ltp.toFixed(2)}</td>
                         <td class="table-change ${changeUp ? 'up' : 'down'}">
                             ${changeUp ? '+' : ''}${row.change.toFixed(2)}
                         </td>

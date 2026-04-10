@@ -13,9 +13,10 @@
 
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
-            background: #0a0a0a;
-            color: #e0e0e0;
+            background: #000000;
+            color: #e8e8e8;
             font-size: 14px;
+            overflow: hidden;
         }
 
         .container {
@@ -23,7 +24,7 @@
             height: 100vh;
             display: flex;
             flex-direction: column;
-            background: #0a0a0a;
+            background: #000000;
         }
 
         /* Header Bar */
@@ -33,7 +34,7 @@
             display: flex;
             align-items: center;
             justify-content: space-between;
-            border-bottom: 1px solid #2a2a2a;
+            border-bottom: 1px solid #242424;
             flex-shrink: 0;
         }
 
@@ -45,16 +46,17 @@
         }
 
         .logo {
-            width: 32px;
-            height: 32px;
-            background: #1e90ff;
+            width: 30px;
+            height: 30px;
+            background: linear-gradient(135deg, #1e90ff, #4169e1);
             border-radius: 50%;
             display: flex;
             align-items: center;
             justify-content: center;
             color: white;
             font-weight: bold;
-            font-size: 16px;
+            font-size: 14px;
+            flex-shrink: 0;
         }
 
         .header-symbol {
@@ -66,7 +68,7 @@
         .header-name {
             font-size: 14px;
             font-weight: 600;
-            color: #e0e0e0;
+            color: #e8e8e8;
         }
 
         .header-price {
@@ -78,7 +80,7 @@
         .header-price-value {
             font-size: 16px;
             font-weight: 600;
-            color: #e0e0e0;
+            color: #e8e8e8;
         }
 
         .header-change {
@@ -116,7 +118,7 @@
 
         .header-middle-item-value {
             font-size: 13px;
-            color: #e0e0e0;
+            color: #e8e8e8;
         }
 
         .header-right {
@@ -155,9 +157,9 @@
             display: flex;
             align-items: center;
             justify-content: space-between;
-            border-bottom: 1px solid #2a2a2a;
+            border-bottom: 1px solid #242424;
             flex-shrink: 0;
-            background: #0a0a0a;
+            background: #000000;
         }
 
         .title-left {
@@ -169,7 +171,7 @@
         .title-text {
             font-size: 18px;
             font-weight: 600;
-            color: #e0e0e0;
+            color: #e8e8e8;
         }
 
         .expiry-tabs {
@@ -180,7 +182,7 @@
         .expiry-tab {
             padding: 6px 12px;
             border: none;
-            background: #2a2a2a;
+            background: #242424;
             color: #8E8E8E;
             font-size: 12px;
             cursor: pointer;
@@ -195,7 +197,7 @@
 
         .next-expiry-btn {
             padding: 6px 12px;
-            border: 1px solid #2a2a2a;
+            border: 1px solid #242424;
             background: #121212;
             color: #8E8E8E;
             font-size: 12px;
@@ -234,8 +236,8 @@
         }
 
         .icon-btn:hover {
-            background: #2a2a2a;
-            color: #e0e0e0;
+            background: #242424;
+            color: #e8e8e8;
         }
 
         /* Stats Row */
@@ -244,7 +246,7 @@
             display: flex;
             align-items: center;
             justify-content: space-between;
-            border-bottom: 1px solid #2a2a2a;
+            border-bottom: 1px solid #242424;
             flex-shrink: 0;
             background: #121212;
         }
@@ -269,7 +271,7 @@
         .stat-value {
             font-size: 14px;
             font-weight: 500;
-            color: #e0e0e0;
+            color: #e8e8e8;
         }
 
         .stats-right {
@@ -304,7 +306,7 @@
             display: none;
             position: absolute;
             background: #1a1a1a;
-            border: 1px solid #2a2a2a;
+            border: 1px solid #242424;
             border-radius: 4px;
             padding: 8px 0;
             z-index: 1000;
@@ -326,15 +328,15 @@
         }
 
         .dropdown-menu-item:hover {
-            background: #2a2a2a;
-            color: #e0e0e0;
+            background: #242424;
+            color: #e8e8e8;
         }
 
         /* Table Container */
         .table-wrapper {
             flex: 1;
             overflow: auto;
-            background: #0a0a0a;
+            background: #000000;
             position: relative;
         }
 
@@ -358,7 +360,7 @@
         table {
             width: 100%;
             border-collapse: collapse;
-            background: #0a0a0a;
+            background: #000000;
         }
 
         thead {
@@ -374,7 +376,7 @@
             color: #8E8E8E;
             background: #121212;
             padding: 12px 8px;
-            border-bottom: 1px solid #2a2a2a;
+            border-bottom: 1px solid #242424;
             text-align: center;
         }
 
@@ -398,7 +400,7 @@
             text-align: center;
             border-bottom: 1px solid #1a1a1a;
             font-size: 13px;
-            color: #e0e0e0;
+            color: #e8e8e8;
             height: 42px;
         }
 
@@ -422,7 +424,7 @@
             left: 0;
             background: inherit;
             z-index: 5;
-            border-right: 1px solid #2a2a2a;
+            border-right: 1px solid #242424;
         }
 
         tr.atm-row td.strike-cell {
@@ -534,7 +536,7 @@
             display: flex;
             align-items: center;
             justify-content: space-between;
-            border-top: 1px solid #2a2a2a;
+            border-top: 1px solid #242424;
             background: #121212;
             flex-shrink: 0;
         }
@@ -546,7 +548,7 @@
 
         .bottom-btn {
             padding: 8px 14px;
-            border: 1px solid #2a2a2a;
+            border: 1px solid #242424;
             background: transparent;
             color: #8E8E8E;
             font-size: 12px;
@@ -593,6 +595,97 @@
 
         .next-expiry-container {
             position: relative;
+        }
+
+        /* Sortable columns */
+        th.sortable {
+            cursor: pointer;
+            user-select: none;
+            position: relative;
+        }
+
+        th.sortable:hover {
+            color: #e8e8e8;
+        }
+
+        th.sortable::after {
+            content: '⇅';
+            font-size: 10px;
+            margin-left: 4px;
+            opacity: 0.4;
+        }
+
+        th.sortable.sort-asc::after {
+            content: '↑';
+            opacity: 1;
+        }
+
+        th.sortable.sort-desc::after {
+            content: '↓';
+            opacity: 1;
+        }
+
+        /* Dropdown select styling */
+        .dropdown-select {
+            background-color: #1a1a1a;
+            border: 1px solid #333;
+            color: #e8e8e8;
+            padding: 6px 28px 6px 10px;
+            border-radius: 4px;
+            font-size: 12px;
+            -webkit-appearance: none;
+            -moz-appearance: none;
+            appearance: none;
+            background-image: url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%238E8E8E' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3e%3cpolyline points='6 9 12 15 18 9'%3e%3c/polyline%3e%3c/svg%3e");
+            background-repeat: no-repeat;
+            background-position: right 8px center;
+            background-size: 14px;
+            cursor: pointer;
+        }
+
+        .dropdown-select option {
+            background-color: #1a1a1a;
+            color: #e8e8e8;
+        }
+
+        /* Scrollbar styling */
+        ::-webkit-scrollbar {
+            width: 6px;
+            height: 6px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: #121212;
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: #333;
+            border-radius: 3px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: #444;
+        }
+
+        /* OI bar visualization */
+        .oi-bar-container {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .oi-bar {
+            height: 4px;
+            border-radius: 2px;
+            min-width: 2px;
+        }
+
+        .oi-bar.ce {
+            background: #5CA81D;
+        }
+
+        .oi-bar.pe {
+            background: #DD6565;
         }
     </style>
 </head>
@@ -732,6 +825,8 @@
         let spotPrice = 24003.60;
         let buildupEnabled = true;
         let perLotEnabled = false;
+        let sortColumn = null;
+        let sortDirection = 'desc';
 
         // Initialize
         document.addEventListener('DOMContentLoaded', () => {
@@ -890,22 +985,7 @@
         }
 
         function formatIndianNumber(num) {
-            const str = Math.floor(num).toString();
-            let result = '';
-            let count = 0;
-
-            for (let i = str.length - 1; i >= 0; i--) {
-                if (count > 0 && count % 2 === 0) {
-                    if (count === 2) {
-                        result = ',' + result;
-                    } else {
-                        result = ',' + result;
-                    }
-                }
-                result = str[i] + result;
-                count++;
-            }
-            return result;
+            return num.toLocaleString('en-IN');
         }
 
         function renderTable() {
@@ -928,45 +1008,98 @@
 
             // Build header
             const headerRow = document.getElementById('headerRow');
+            const sortClass = (col) => {
+                if (sortColumn === col) return `sortable ${sortDirection === 'asc' ? 'sort-asc' : 'sort-desc'}`;
+                return 'sortable';
+            };
             headerRow.innerHTML = `
                 <th class="checkbox-header"><input type="checkbox" /></th>
-                <th>Buildup</th>
-                <th>Vega</th>
-                <th>Theta</th>
-                <th>Gamma</th>
-                <th>Delta</th>
-                <th>IV</th>
-                <th>Volume</th>
-                <th>OI</th>
-                <th>LTP Chg %</th>
-                <th>LTP</th>
+                <th ${buildupEnabled ? '' : 'class="hidden"'}>Buildup</th>
+                <th class="${sortClass('ce_vega')}" data-sort="ce_vega">Vega</th>
+                <th class="${sortClass('ce_theta')}" data-sort="ce_theta">Theta</th>
+                <th class="${sortClass('ce_gamma')}" data-sort="ce_gamma">Gamma</th>
+                <th class="${sortClass('ce_delta')}" data-sort="ce_delta">Delta</th>
+                <th class="${sortClass('ce_iv')}" data-sort="ce_iv">IV</th>
+                <th class="${sortClass('ce_volume')}" data-sort="ce_volume">Volume</th>
+                <th class="${sortClass('ce_oi')}" data-sort="ce_oi">OI</th>
+                <th class="${sortClass('ce_change')}" data-sort="ce_change">LTP Chg %</th>
+                <th class="${sortClass('ce_ltp')}" data-sort="ce_ltp">LTP</th>
                 <th class="header-ce">CE</th>
-                <th class="header-strike">Strike Price</th>
+                <th class="header-strike ${sortClass('strike')}" data-sort="strike">Strike</th>
+                <th>PCR</th>
                 <th class="header-pe">PE</th>
-                <th>LTP</th>
-                <th>LTP Chg %</th>
-                <th>OI</th>
-                <th>Volume</th>
-                <th>IV</th>
-                <th>Delta</th>
-                <th>Gamma</th>
-                <th>Theta</th>
-                <th>Vega</th>
-                <th>Buildup</th>
+                <th class="${sortClass('pe_ltp')}" data-sort="pe_ltp">LTP</th>
+                <th class="${sortClass('pe_change')}" data-sort="pe_change">LTP Chg %</th>
+                <th class="${sortClass('pe_oi')}" data-sort="pe_oi">OI</th>
+                <th class="${sortClass('pe_volume')}" data-sort="pe_volume">Volume</th>
+                <th class="${sortClass('pe_iv')}" data-sort="pe_iv">IV</th>
+                <th class="${sortClass('pe_delta')}" data-sort="pe_delta">Delta</th>
+                <th class="${sortClass('pe_gamma')}" data-sort="pe_gamma">Gamma</th>
+                <th class="${sortClass('pe_theta')}" data-sort="pe_theta">Theta</th>
+                <th class="${sortClass('pe_vega')}" data-sort="pe_vega">Vega</th>
+                <th ${buildupEnabled ? '' : 'class="hidden"'}>Buildup</th>
                 <th class="checkbox-header"><input type="checkbox" /></th>
             `;
 
-            // Hide buildup columns if not enabled
-            if (!buildupEnabled) {
-                headerRow.querySelectorAll('th:nth-child(2), th:nth-child(24)').forEach(th => {
-                    th.classList.add('hidden');
+            // Add sort listeners
+            headerRow.querySelectorAll('th.sortable').forEach(th => {
+                th.addEventListener('click', () => {
+                    const col = th.dataset.sort;
+                    if (sortColumn === col) {
+                        sortDirection = sortDirection === 'asc' ? 'desc' : 'asc';
+                    } else {
+                        sortColumn = col;
+                        sortDirection = 'desc';
+                    }
+                    renderTable();
                 });
-            }
+            });
 
             const tbody = document.getElementById('tableBody');
             tbody.innerHTML = '';
 
-            const strikes = Object.keys(strikeGroups).map(Number).sort((a, b) => a - b);
+            let strikes = Object.keys(strikeGroups).map(Number).sort((a, b) => a - b);
+
+            // Apply sorting if a sort column is selected
+            if (sortColumn) {
+                strikes.sort((a, b) => {
+                    const pairA = strikeGroups[a];
+                    const pairB = strikeGroups[b];
+                    let valA = 0, valB = 0;
+
+                    const getVal = (pair, col) => {
+                        const parts = col.split('_');
+                        const side = parts[0]; // ce or pe or strike
+                        const field = parts.slice(1).join('_');
+
+                        if (col === 'strike') return pair ? a : b; // handled separately
+                        const contract = side === 'ce' ? pair.CE : pair.PE;
+                        if (!contract) return -Infinity;
+
+                        switch(field) {
+                            case 'ltp': return contract.ltp || 0;
+                            case 'change': return contract.change_pct || 0;
+                            case 'oi': return contract.oi || 0;
+                            case 'volume': return contract.volume || 0;
+                            case 'iv': return contract.iv || 0;
+                            case 'delta': return contract.delta || 0;
+                            case 'gamma': return contract.gamma || 0;
+                            case 'theta': return contract.theta || 0;
+                            case 'vega': return contract.vega || 0;
+                            default: return 0;
+                        }
+                    };
+
+                    if (sortColumn === 'strike') {
+                        valA = a; valB = b;
+                    } else {
+                        valA = getVal(pairA, sortColumn);
+                        valB = getVal(pairB, sortColumn);
+                    }
+
+                    return sortDirection === 'asc' ? valA - valB : valB - valA;
+                });
+            }
 
             // Find OI ranks for current expiry
             const ceOIs = contracts.filter(c => c.option_type === 'CE').map(c => c.oi).sort((a, b) => b - a);
@@ -982,9 +1115,13 @@
                 const isITM_CE = ceContract && strike < spotPrice;
                 const isITM_PE = peContract && strike > spotPrice;
 
-                let row = `<tr class="${rowClass}">`;
+                const itmClasses = [];
+                if (rowClass) itmClasses.push(rowClass);
+                if (isITM_CE) itmClasses.push('itm-ce');
+                if (isITM_PE) itmClasses.push('itm-pe');
+                let row = `<tr class="${itmClasses.join(' ')}">`;
 
-                // CE Side (right to left from headers)
+                // CE Side
                 row += `<td class="checkbox-header"><input type="checkbox" /></td>`;
 
                 // Buildup CE
@@ -1045,14 +1182,18 @@
                 const ltpCEValue = ceContract ? ceContract.ltp.toFixed(2) : '--';
                 row += `<td class="${isITM_CE ? 'ce-cell' : ''}"><span class="${ltpCEClass}">${ltpCEValue}</span></td>`;
 
-                // CE Checkbox
-                row += `<td class="checkbox-header"><input type="checkbox" /></td>`;
+                // CE label column (empty in data rows)
+                row += `<td></td>`;
 
                 // Strike Price
-                row += `<td class="strike-cell">${isATM ? `<span class="spot-price-badge">${spotPrice.toLocaleString('en-IN', {minimumFractionDigits: 2, maximumFractionDigits: 2})}</span>` : ''}<br/>${(strike).toLocaleString('en-IN', {minimumFractionDigits: 2, maximumFractionDigits: 2})}</td>`;
+                row += `<td class="strike-cell">${isATM ? `<span class="spot-price-badge">${spotPrice.toLocaleString('en-IN', {minimumFractionDigits: 2, maximumFractionDigits: 2})}</span> ` : ''}${(strike).toLocaleString('en-IN', {minimumFractionDigits: 2, maximumFractionDigits: 2})}</td>`;
 
-                // PE Checkbox
-                row += `<td class="checkbox-header"><input type="checkbox" /></td>`;
+                // PCR column
+                let pcrCell = '--';
+                if (ceContract && peContract && ceContract.oi > 0) {
+                    pcrCell = (peContract.oi / ceContract.oi).toFixed(2);
+                }
+                row += `<td><span class="pcr-value">${pcrCell}</span></td>`;
 
                 // LTP PE
                 const ltpPEClass = isATM ? 'ltp atm' : 'ltp';
@@ -1116,15 +1257,6 @@
                 row += `<td class="checkbox-header"><input type="checkbox" /></td>`;
 
                 row += `</tr>`;
-
-                // Add ITM classes
-                if (isITM_CE) {
-                    row = row.replace('<tr', '<tr class="itm-ce');
-                }
-                if (isITM_PE) {
-                    row = row.replace('<tr', '<tr class="itm-pe');
-                }
-
                 tbody.innerHTML += row;
             });
 
@@ -1132,7 +1264,8 @@
             document.getElementById('spotPrice').textContent = spotPrice.toLocaleString('en-IN', {minimumFractionDigits: 2, maximumFractionDigits: 2});
 
             // Update ATM IV
-            const atmContract = atmStrike ? (pair = strikeGroups[atmStrike], pair.CE || pair.PE) : null;
+            const atmPair = atmStrike ? strikeGroups[atmStrike] : null;
+            const atmContract = atmPair ? (atmPair.CE || atmPair.PE) : null;
             if (atmContract) {
                 document.getElementById('atmIv').textContent = atmContract.iv.toFixed(2);
             }
