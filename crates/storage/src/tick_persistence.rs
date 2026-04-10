@@ -904,7 +904,7 @@ const F32_DECIMAL_BUF_SIZE: usize = 24;
 ///   21004.95_f32 → `f64::from()` → 21004.94921875_f64  ← WRONG
 ///   21004.95_f32 → this function → 21004.95_f64         ← CORRECT
 ///
-/// Matches the Dhan Python SDK behavior: `"{:.2f}".format(value)`.
+/// Matches the Dhan API (Python SDK ref) behavior: `"{:.2f}".format(value)`.
 ///
 /// # Performance
 /// Zero heap allocation — uses a stack buffer for the decimal string.
