@@ -631,6 +631,28 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     let _ = sender.send(tick);
                 }
 
+                // O(1) movers baseline: use day_close from Full/Quote packets as previous close.
+                // Dhan confirmed (Ticket #5525125): "close" field = previous trading session's
+                // closing price. This gives us prev_close for ALL 25,000 instruments without
+                // needing separate PrevClose (code 6) packets (which only arrive for indices).
+                // Guard: only update if day_close is valid (non-zero, finite).
+                if tick.day_close > 0.0 && tick.day_close.is_finite() {
+                    if let Some(ref mut movers) = top_movers {
+                        movers.update_prev_close(
+                            tick.security_id,
+                            tick.exchange_segment_code,
+                            tick.day_close,
+                        );
+                    }
+                    if let Some(ref mut opt_movers) = option_movers {
+                        opt_movers.update_prev_close(
+                            tick.security_id,
+                            tick.exchange_segment_code,
+                            tick.day_close,
+                        );
+                    }
+                }
+
                 // O(1) candle aggregation: update 1s OHLCV candle for this security.
                 if let Some(ref mut agg) = candle_aggregator {
                     agg.update(&tick);
@@ -795,6 +817,25 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                 // O(1) broadcast to browser WebSocket clients (if tick has valid LTP).
                 if ltp_valid && let Some(ref sender) = tick_broadcast {
                     let _ = sender.send(tick);
+                }
+
+                // O(1) movers baseline from day_close (= previous session's close).
+                // Same logic as Tick path — Dhan confirmed day_close = prev close.
+                if tick.day_close > 0.0 && tick.day_close.is_finite() {
+                    if let Some(ref mut movers) = top_movers {
+                        movers.update_prev_close(
+                            tick.security_id,
+                            tick.exchange_segment_code,
+                            tick.day_close,
+                        );
+                    }
+                    if let Some(ref mut opt_movers) = option_movers {
+                        opt_movers.update_prev_close(
+                            tick.security_id,
+                            tick.exchange_segment_code,
+                            tick.day_close,
+                        );
+                    }
                 }
 
                 // O(1) candle aggregation (only for ticks with valid exchange timestamps).
