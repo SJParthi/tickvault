@@ -23,7 +23,7 @@
         .top-nav {
             display: flex;
             align-items: center;
-            background-color: #181818;
+            background-color: rgba(18, 18, 18, 0.62);
             border-bottom: 1px solid #242424;
             padding: 12px 20px;
             gap: 20px;
@@ -314,8 +314,9 @@
             display: flex;
             gap: 0;
             padding: 0;
-            border-bottom: 1px solid #242424;
-            background-color: #181818;
+            border-bottom: none;
+            background-color: transparent;
+            height: 36px;
         }
 
         .tab {
@@ -324,13 +325,14 @@
             font-size: 14px;
             font-weight: 400;
             border: none;
-            background: transparent;
+            background-color: #181818;
             cursor: pointer;
-            transition: color 0.2s, border-bottom-color 0.2s;
-            border-bottom: 2px solid transparent;
+            transition: color 0.2s, background-color 0.2s;
             position: relative;
-            top: 1px;
-            margin-bottom: -1px;
+            height: 36px;
+            display: flex;
+            align-items: center;
+            white-space: nowrap;
         }
 
         .tab:hover {
@@ -339,7 +341,10 @@
 
         .tab.active {
             color: #05B878;
-            border-bottom-color: #05B878;
+            background-color: transparent;
+            box-shadow: inset 0 0 0 1px #138C61;
+            border-radius: 8px;
+            background-color: #1C2C27;
         }
 
         /* ============ FILTERS AREA ============ */
@@ -406,8 +411,10 @@
 
         table {
             width: 100%;
-            border-collapse: collapse;
-            background-color: #000000;
+            border-collapse: separate;
+            border-spacing: 0;
+            table-layout: auto;
+            background-color: transparent;
         }
 
         thead {
@@ -418,21 +425,46 @@
         }
 
         th {
-            padding: 12px 16px;
-            text-align: left;
+            padding: 1px 8px 0px 0px;
+            text-align: right;
             font-size: 14px;
             color: #8E8E8E;
-            font-weight: 700;
+            font-weight: 300;
             border-bottom: 1px solid #242424;
             background-color: #181818;
+            cursor: pointer;
+            white-space: nowrap;
+            height: 42px;
+            display: table-cell;
+            vertical-align: middle;
+        }
+
+        th:first-child {
+            text-align: left;
+            padding: 1px 9px 0px 10px;
+            border-right: 1px solid #242424;
         }
 
         td {
-            padding: 12px 16px;
+            padding: 0px 8px 0px 0px;
             font-size: 14px;
             color: #8E8E8E;
             font-weight: 400;
-            border-bottom: 1px solid #242424;
+            border-bottom: 0.5px solid #242424;
+            height: 42px;
+            background-color: #121212;
+            text-align: right;
+        }
+
+        td:first-child {
+            padding: 0px 9px 0px 10px;
+            text-align: left;
+            color: #DADADA;
+            border-right: 1px solid #242424;
+        }
+
+        tbody tr {
+            cursor: pointer;
         }
 
         tbody tr:hover {
@@ -444,11 +476,16 @@
         }
 
         .up {
-            color: #05B878;
+            color: #5CA81D;
         }
 
         .down {
             color: #DD6565;
+        }
+
+        /* Green for active tab */
+        .tab.active {
+            --accent-green: #05B878;
         }
 
         /* ============ SCROLLBAR ============ */
@@ -637,71 +674,53 @@
                     <thead>
                         <tr>
                             <th>Name</th>
-                            <th>Spot Price</th>
                             <th>LTP</th>
                             <th>Change</th>
                             <th>Change %</th>
-                            <th>Open Interest</th>
-                            <th>OI Change</th>
-                            <th>OI Change %</th>
+                            <th>Value (Cr.)</th>
                             <th>Volume</th>
                         </tr>
                     </thead>
                     <tbody>
                         <tr>
-                            <td class="highlighted">NIFTY 50 CE 25000</td>
-                            <td class="highlighted">24,850.50</td>
-                            <td class="highlighted">625.50</td>
+                            <td>Reliance</td>
+                            <td>2,945.50</td>
                             <td class="up">+45.25</td>
-                            <td class="up">+7.80%</td>
-                            <td class="highlighted">2,34,567</td>
-                            <td class="up">+12,345</td>
-                            <td class="up">+5.60%</td>
-                            <td class="highlighted">45,678</td>
+                            <td class="up">+1.56%</td>
+                            <td>45,230</td>
+                            <td>2,34,567</td>
                         </tr>
                         <tr>
-                            <td class="highlighted">NIFTY 50 PE 25000</td>
-                            <td class="highlighted">24,850.50</td>
-                            <td class="highlighted">475.25</td>
-                            <td class="down">-38.50</td>
-                            <td class="down">-7.50%</td>
-                            <td class="highlighted">1,98,234</td>
-                            <td class="down">-8,567</td>
-                            <td class="down">-4.15%</td>
-                            <td class="highlighted">32,145</td>
+                            <td>TCS</td>
+                            <td>3,850.00</td>
+                            <td class="up">+38.50</td>
+                            <td class="up">+1.01%</td>
+                            <td>38,920</td>
+                            <td>1,98,234</td>
                         </tr>
                         <tr>
-                            <td class="highlighted">BANK NIFTY CE 52000</td>
-                            <td class="highlighted">52,100.00</td>
-                            <td class="highlighted">850.75</td>
-                            <td class="up">+62.50</td>
-                            <td class="up">+7.92%</td>
-                            <td class="highlighted">1,45,678</td>
-                            <td class="up">+5,234</td>
-                            <td class="up">+3.73%</td>
-                            <td class="highlighted">28,934</td>
+                            <td>ICICI Bank</td>
+                            <td>680.25</td>
+                            <td class="down">-12.75</td>
+                            <td class="down">-1.84%</td>
+                            <td>28,450</td>
+                            <td>1,45,678</td>
                         </tr>
                         <tr>
-                            <td class="highlighted">BANK NIFTY PE 52000</td>
-                            <td class="highlighted">52,100.00</td>
-                            <td class="highlighted">420.50</td>
-                            <td class="down">-42.75</td>
-                            <td class="down">-9.25%</td>
-                            <td class="highlighted">2,12,345</td>
-                            <td class="down">-15,678</td>
-                            <td class="down">-6.87%</td>
-                            <td class="highlighted">51,234</td>
+                            <td>Infosys</td>
+                            <td>1,625.75</td>
+                            <td class="up">+22.50</td>
+                            <td class="up">+1.40%</td>
+                            <td>35,680</td>
+                            <td>2,12,345</td>
                         </tr>
                         <tr>
-                            <td class="highlighted">FIN NIFTY CE 21600</td>
-                            <td class="highlighted">21,567.80</td>
-                            <td class="highlighted">345.25</td>
-                            <td class="up">+25.50</td>
-                            <td class="up">+7.94%</td>
-                            <td class="highlighted">98,765</td>
-                            <td class="up">+3,456</td>
-                            <td class="up">+3.62%</td>
-                            <td class="highlighted">15,678</td>
+                            <td>Axis Bank</td>
+                            <td>1,025.50</td>
+                            <td class="up">+15.25</td>
+                            <td class="up">+1.51%</td>
+                            <td>21,340</td>
+                            <td>98,765</td>
                         </tr>
                     </tbody>
                 </table>
@@ -710,29 +729,35 @@
     </div>
 
     <script>
+        let currentTab = 'stocks'; // Track current active tab
+
         // Tab navigation
         document.querySelectorAll('.tab').forEach(tab => {
             tab.addEventListener('click', function() {
                 document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
                 this.classList.add('active');
 
-                const tabName = this.getAttribute('data-tab');
-                console.log('Switched to tab:', tabName);
+                currentTab = this.getAttribute('data-tab');
+                console.log('Switched to tab:', currentTab);
 
-                // Update table headers based on selected tab
+                // Update table headers and styling based on selected tab
                 const table = document.getElementById('data-table');
                 const headers = table.querySelector('thead tr');
 
-                if (tabName === 'stocks') {
+                if (currentTab === 'stocks') {
+                    // Stocks: Name, LTP, Change, Change%, Value(Cr.), Volume
                     headers.innerHTML = `
                         <th>Name</th>
                         <th>LTP</th>
                         <th>Change</th>
                         <th>Change %</th>
+                        <th>Value (Cr.)</th>
                         <th>Volume</th>
-                        <th>Market Cap</th>
                     `;
-                } else if (tabName === 'options') {
+                    // Update color scheme for stocks (use #5CA81D for green)
+                    document.documentElement.style.setProperty('--stocks-green', '#5CA81D');
+                } else if (currentTab === 'options') {
+                    // Options: Name, Spot Price, LTP, Change, Change%, Open Interest, OI Change, OI Change%, Volume
                     headers.innerHTML = `
                         <th>Name</th>
                         <th>Spot Price</th>
@@ -744,9 +769,18 @@
                         <th>OI Change %</th>
                         <th>Volume</th>
                     `;
+                    // Options uses #05B878 for green
+                    document.documentElement.style.setProperty('--stocks-green', '#05B878');
                 }
             });
         });
+
+        // Set initial active tab
+        const stocksTab = Array.from(document.querySelectorAll('.tab')).find(t => t.getAttribute('data-tab') === 'stocks');
+        if (stocksTab) {
+            stocksTab.classList.add('active');
+            currentTab = 'stocks';
+        }
 
         // Filter functionality
         document.querySelectorAll('.filter-select').forEach(select => {
