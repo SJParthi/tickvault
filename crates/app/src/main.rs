@@ -1597,10 +1597,11 @@ async fn main() -> Result<()> {
                 if *underlying == "NIFTY" || *underlying == "BANKNIFTY" {
                     for (opt_label, opt_sid) in [("CE", atm_ce_sid), ("PE", atm_pe_sid)] {
                         let Some(depth200_sid) = opt_sid else {
-                            warn!(
+                            // ERROR triggers Telegram — ATM None for major index is actionable
+                            error!(
                                 underlying,
                                 option = opt_label,
-                                "200-level depth: no ATM {opt_label} found — skipping"
+                                "200-level depth: no ATM {opt_label} found — skipping (check subscription planner)"
                             );
                             continue;
                         };

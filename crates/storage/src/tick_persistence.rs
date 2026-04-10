@@ -380,6 +380,9 @@ impl TickPersistenceWriter {
     /// causing data loss if the app crashes or restarts before ticks arrive.
     ///
     /// Returns `Ok(())` if the buffer is empty (nothing to flush).
+    ///
+    /// DEPRECATED: previous_close table removed. Kept for potential future
+    /// non-tick buffer writes. No production call sites as of 2026-04-10.
     pub fn flush_buffer_direct(&mut self) -> Result<()> {
         // Nothing in buffer → no-op (avoid pointless TCP round-trip).
         if self.buffer.is_empty() {
@@ -1934,6 +1937,9 @@ fn build_depth_rows(
 /// `received_at` is kept as a separate column for debugging (shows actual receive time).
 ///
 /// Price field uses `f32_to_f64_clean` to preserve Dhan f32 precision.
+///
+/// DEPRECATED: previous_close table removed (day_close from Full ticks used instead).
+/// Kept for tests and potential future use. No production call sites as of 2026-04-10.
 pub fn build_previous_close_row(
     buffer: &mut Buffer,
     security_id: u32,

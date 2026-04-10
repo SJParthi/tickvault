@@ -104,9 +104,11 @@ pub struct TopMoversSnapshot {
 /// Updated O(1) per tick. Snapshot computation is O(N log N) but only runs
 /// periodically on the cold path (every 5 seconds).
 ///
-/// Previous close prices are populated from PrevClose WebSocket packets
-/// (code 6) which arrive at subscription time. The `day_close` field in
-/// `ParsedTick` is NOT used because the exchange only sets it post-market.
+/// Previous close prices come from two sources:
+/// 1. PrevClose WebSocket packets (code 6) — for indices (IDX_I) only.
+/// 2. `day_close` field in Full packet ticks — for equities and F&O.
+///    Dhan confirmed (Ticket #5525125): day_close = previous session's close.
+///    Used as fallback when prev_close_prices has no entry (first tick).
 pub struct TopMoversTracker {
     /// Per-security state keyed by `(security_id, segment_code)`.
     securities: HashMap<(u32, u8), SecurityState>,
@@ -180,6 +182,8 @@ impl TopMoversTracker {
         let prev_close = if let Some(&pc) = self.prev_close_prices.get(&key) {
             pc
         } else if tick.day_close.is_finite() && tick.day_close > 0.0 {
+            // Store day_close as baseline so compute_snapshot can output correct prev_close
+            self.prev_close_prices.insert(key, tick.day_close);
             tick.day_close
         } else {
             return; // No baseline — skip

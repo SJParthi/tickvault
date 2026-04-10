@@ -39,6 +39,15 @@ fn depth_prices_are_finite(depth: &[MarketDepthLevel; 5]) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/// File path for index prev_close cache (survives mid-day restarts).
+const INDEX_PREV_CLOSE_CACHE_DIR: &str = "data/instrument-cache";
+const INDEX_PREV_CLOSE_CACHE_PATH: &str = "data/instrument-cache/index-prev-close.json";
+const INDEX_PREV_CLOSE_CACHE_TMP: &str = "data/instrument-cache/index-prev-close.json.tmp";
+
+// ---------------------------------------------------------------------------
 // O(1) Market Hours Persist Window
 // ---------------------------------------------------------------------------
 
@@ -500,7 +509,7 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
     // On boot, read cached values and pre-populate movers.
     // O(1) EXEMPT: begin — boot-time file read + HashMap for ~28 indices
     let mut index_prev_close_cache: std::collections::HashMap<u32, f32> = {
-        let path = "data/instrument-cache/index-prev-close.json";
+        let path = INDEX_PREV_CLOSE_CACHE_PATH;
         match std::fs::read_to_string(path) {
             Ok(json) => {
                 match serde_json::from_str::<std::collections::HashMap<u32, f32>>(&json) {
@@ -725,18 +734,6 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                 // Lagging receivers auto-skip — chart only needs latest price.
                 if let Some(ref sender) = tick_broadcast {
                     let _ = sender.send(tick);
-                }
-
-                // PROOF: log day_close baseline coverage after 30 seconds of ticks.
-                // (day_close baseline update is ABOVE the time guards — runs unconditionally)
-                if !day_close_baseline_logged
-                    && day_close_first_log_time.is_some_and(|t| t.elapsed().as_secs() >= 30)
-                {
-                    day_close_baseline_logged = true;
-                    info!(
-                        day_close_updates = day_close_baseline_count,
-                        "PROOF: day_close baselines set from Full packet ticks (should be >> 0 for all instruments)"
-                    );
                 }
 
                 // O(1) candle aggregation: update 1s OHLCV candle for this security.
@@ -1013,9 +1010,9 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     index_prev_close_cache.insert(security_id, previous_close);
                     // Atomic file write: serialize → write to .tmp → rename.
                     // Prevents partial/corrupt cache on crash or disk full.
-                    let cache_dir = "data/instrument-cache";
-                    let cache_path = "data/instrument-cache/index-prev-close.json";
-                    let tmp_path = "data/instrument-cache/index-prev-close.json.tmp";
+                    let cache_dir = INDEX_PREV_CLOSE_CACHE_DIR;
+                    let cache_path = INDEX_PREV_CLOSE_CACHE_PATH;
+                    let tmp_path = INDEX_PREV_CLOSE_CACHE_TMP;
                     if let Ok(json) = serde_json::to_string(&index_prev_close_cache) {
                         let _ = std::fs::create_dir_all(cache_dir);
                         match std::fs::write(tmp_path, &json)
@@ -1071,6 +1068,18 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
 
         m_tick_duration.record(tick_start.elapsed().as_nanos() as f64);
         m_wire_to_done.record(tick_start.elapsed().as_nanos() as f64);
+
+        // PROOF: log day_close baseline coverage after 30 seconds.
+        // Placed AFTER all match arms so it fires for both Tick AND TickWithDepth.
+        if !day_close_baseline_logged
+            && day_close_first_log_time.is_some_and(|t| t.elapsed().as_secs() >= 30)
+        {
+            day_close_baseline_logged = true;
+            info!(
+                day_close_updates = day_close_baseline_count,
+                "PROOF: day_close baselines set from Full packet ticks (should be >> 0 for all instruments)"
+            );
+        }
 
         // Periodic flush check (every ~100ms worth of frames)
         if last_flush_check.elapsed().as_millis() > 100 {
