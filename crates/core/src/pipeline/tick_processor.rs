@@ -309,13 +309,34 @@ fn persist_option_movers_snapshot(
             }
         };
 
-    persist_category(writer, &snapshot.highest_oi, "HIGHEST_OI");
-    persist_category(writer, &snapshot.oi_gainers, "OI_GAINER");
-    persist_category(writer, &snapshot.oi_losers, "OI_LOSER");
-    persist_category(writer, &snapshot.top_volume, "TOP_VOLUME");
-    persist_category(writer, &snapshot.top_value, "TOP_VALUE");
-    persist_category(writer, &snapshot.price_gainers, "PRICE_GAINER");
-    persist_category(writer, &snapshot.price_losers, "PRICE_LOSER");
+    // Split each category into OPTION_* and FUTURE_* with independent rankings.
+    // Registry lookup: option_type Some(CE/PE) = option, None = future.
+    // O(1) EXEMPT: cold path — runs every 60s, max 7 categories × 20 entries each.
+    let split_persist =
+        |writer: &mut dhan_live_trader_storage::movers_persistence::OptionMoversWriter,
+         entries: &[super::option_movers::OptionMoverEntry],
+         base_cat: &str| {
+            let (opts, futs): (Vec<_>, Vec<_>) = entries.iter().cloned().partition(|e| {
+                registry
+                    .as_ref()
+                    .and_then(|r| r.get(e.security_id))
+                    .and_then(|inst| inst.option_type)
+                    .is_some()
+            });
+            // O(1) EXEMPT: format! on cold path (7 calls per snapshot)
+            let opt_cat = format!("OPTION_{base_cat}");
+            let fut_cat = format!("FUTURE_{base_cat}");
+            persist_category(writer, &opts, &opt_cat);
+            persist_category(writer, &futs, &fut_cat);
+        };
+
+    split_persist(writer, &snapshot.highest_oi, "HIGHEST_OI");
+    split_persist(writer, &snapshot.oi_gainers, "OI_GAINER");
+    split_persist(writer, &snapshot.oi_losers, "OI_LOSER");
+    split_persist(writer, &snapshot.top_volume, "TOP_VOLUME");
+    split_persist(writer, &snapshot.top_value, "TOP_VALUE");
+    split_persist(writer, &snapshot.price_gainers, "PRICE_GAINER");
+    split_persist(writer, &snapshot.price_losers, "PRICE_LOSER");
 
     let _ = writer.flush();
 }

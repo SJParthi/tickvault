@@ -1583,54 +1583,59 @@ async fn main() -> Result<()> {
                     });
                 }
 
-                // 200-level: spawn 2 connections per underlying (CE ATM + PE ATM).
-                // 200-level = 1 instrument per connection. Both sides needed for full order book.
-                // Dhan confirmed (Ticket #5519522): must use ATM security_id, far OTM gets no data.
+                // 200-level: spawn 2 connections for NIFTY + BANKNIFTY ONLY (CE ATM + PE ATM).
+                // 200-level = 1 instrument per connection. Dhan limit = 5 connections.
+                // 4 connections: NIFTY CE + NIFTY PE + BANKNIFTY CE + BANKNIFTY PE = within limit.
+                // FINNIFTY + MIDCPNIFTY use 20-level depth only (no 200-level).
+                // Dhan confirmed (Ticket #5519522): must use ATM security_id.
                 // O(1) EXEMPT: begin — boot-time 200-level depth setup (max 2 spawns per underlying)
-                for (opt_label, opt_sid) in [("CE", atm_ce_sid), ("PE", atm_pe_sid)] {
-                    let Some(depth200_sid) = opt_sid else {
-                        warn!(
+                // Only NIFTY + BANKNIFTY get 200-level (4 connections within Dhan's 5 limit).
+                if *underlying == "NIFTY" || *underlying == "BANKNIFTY" {
+                    for (opt_label, opt_sid) in [("CE", atm_ce_sid), ("PE", atm_pe_sid)] {
+                        let Some(depth200_sid) = opt_sid else {
+                            warn!(
+                                underlying,
+                                option = opt_label,
+                                "200-level depth: no ATM {opt_label} found — skipping"
+                            );
+                            continue;
+                        };
+
+                        let depth200_token = token_handle.clone();
+                        let depth200_client_id = ws_client_id.clone();
+                        let depth200_segment =
+                            dhan_live_trader_common::types::ExchangeSegment::NseFno;
+                        let depth200_label = format!("{underlying}-ATM-{opt_label}");
+
+                        info!(
                             underlying,
                             option = opt_label,
-                            "200-level depth: no ATM {opt_label} found — skipping"
+                            security_id = depth200_sid,
+                            "spawning 200-level depth connection"
                         );
-                        continue;
-                    };
 
-                    let depth200_token = token_handle.clone();
-                    let depth200_client_id = ws_client_id.clone();
-                    let depth200_segment = dhan_live_trader_common::types::ExchangeSegment::NseFno;
-                    let depth200_label = format!("{underlying}-ATM-{opt_label}");
+                        let (tx200, mut rx200) = tokio::sync::mpsc::channel::<bytes::Bytes>(1024);
+                        let m200_label = depth200_label.clone();
+                        let depth200_questdb = config.questdb.clone(); // O(1) EXEMPT: boot clone
 
-                    info!(
-                        underlying,
-                        option = opt_label,
-                        security_id = depth200_sid,
-                        "spawning 200-level depth connection"
-                    );
-
-                    let (tx200, mut rx200) = tokio::sync::mpsc::channel::<bytes::Bytes>(1024);
-                    let m200_label = depth200_label.clone();
-                    let depth200_questdb = config.questdb.clone(); // O(1) EXEMPT: boot clone
-
-                    // Spawn 200-level depth receiver with QuestDB persistence
-                    tokio::spawn(async move {
-                        let m = metrics::counter!("dlt_depth_200lvl_frames_received", "underlying" => m200_label.clone());
-                        let mut writer =
+                        // Spawn 200-level depth receiver with QuestDB persistence
+                        tokio::spawn(async move {
+                            let m = metrics::counter!("dlt_depth_200lvl_frames_received", "underlying" => m200_label.clone());
+                            let mut writer =
                             dhan_live_trader_storage::deep_depth_persistence::DeepDepthWriter::new(
                                 &depth200_questdb,
                             )
                             .ok();
-                        if writer.is_some() {
-                            tracing::info!(
-                                label = m200_label,
-                                "200-level deep depth QuestDB writer connected"
-                            );
-                        }
-                        while let Some(frame) = rx200.recv().await {
-                            m.increment(1);
-                            let ts = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-                            match dhan_live_trader_core::parser::dispatcher::dispatch_deep_depth_frame(
+                            if writer.is_some() {
+                                tracing::info!(
+                                    label = m200_label,
+                                    "200-level deep depth QuestDB writer connected"
+                                );
+                            }
+                            while let Some(frame) = rx200.recv().await {
+                                m.increment(1);
+                                let ts = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+                                match dhan_live_trader_core::parser::dispatcher::dispatch_deep_depth_frame(
                                 &frame, ts,
                             ) {
                                 Ok(
@@ -1669,54 +1674,60 @@ async fn main() -> Result<()> {
                                     tracing::warn!(?err, "failed to parse 200-level depth frame");
                                 }
                             }
-                        }
-                    });
-
-                    let d200_health = health_status.clone();
-                    let d200_notifier = notifier.clone();
-                    let d200_label_for_disconnect = depth200_label.clone();
-                    let d200_label_for_signal = depth200_label.clone();
-                    let (d200_signal_tx, d200_signal_rx) = tokio::sync::oneshot::channel::<()>();
-                    tokio::spawn(async move {
-                        d200_health.set_depth_200_connections(
-                            d200_health.depth_200_connections().saturating_add(1),
-                        );
-
-                        if let Err(err) =
-                            dhan_live_trader_core::websocket::run_two_hundred_depth_connection(
-                                depth200_token,
-                                depth200_client_id,
-                                depth200_segment,
-                                depth200_sid,
-                                depth200_label,
-                                tx200,
-                                Some(d200_signal_tx),
-                            )
-                            .await
-                        {
-                            tracing::error!(?err, "200-level depth connection terminated");
-                            d200_notifier.notify(NotificationEvent::DepthTwoHundredDisconnected {
-                                underlying: d200_label_for_disconnect,
-                                reason: format!("{err}"),
-                            });
-                            d200_health.set_depth_200_connections(
-                                d200_health.depth_200_connections().saturating_sub(1),
-                            );
-                        }
-                    });
-                    // Telegram alert fires ONLY after first data frame received.
-                    {
-                        let notify_sender = notifier.clone();
-                        tokio::spawn(async move {
-                            if d200_signal_rx.await.is_ok() {
-                                notify_sender.notify(NotificationEvent::DepthTwoHundredConnected {
-                                    underlying: d200_label_for_signal,
-                                });
                             }
                         });
+
+                        let d200_health = health_status.clone();
+                        let d200_notifier = notifier.clone();
+                        let d200_label_for_disconnect = depth200_label.clone();
+                        let d200_label_for_signal = depth200_label.clone();
+                        let (d200_signal_tx, d200_signal_rx) =
+                            tokio::sync::oneshot::channel::<()>();
+                        tokio::spawn(async move {
+                            d200_health.set_depth_200_connections(
+                                d200_health.depth_200_connections().saturating_add(1),
+                            );
+
+                            if let Err(err) =
+                                dhan_live_trader_core::websocket::run_two_hundred_depth_connection(
+                                    depth200_token,
+                                    depth200_client_id,
+                                    depth200_segment,
+                                    depth200_sid,
+                                    depth200_label,
+                                    tx200,
+                                    Some(d200_signal_tx),
+                                )
+                                .await
+                            {
+                                tracing::error!(?err, "200-level depth connection terminated");
+                                d200_notifier.notify(
+                                    NotificationEvent::DepthTwoHundredDisconnected {
+                                        underlying: d200_label_for_disconnect,
+                                        reason: format!("{err}"),
+                                    },
+                                );
+                                d200_health.set_depth_200_connections(
+                                    d200_health.depth_200_connections().saturating_sub(1),
+                                );
+                            }
+                        });
+                        // Telegram alert fires ONLY after first data frame received.
+                        {
+                            let notify_sender = notifier.clone();
+                            tokio::spawn(async move {
+                                if d200_signal_rx.await.is_ok() {
+                                    notify_sender.notify(
+                                        NotificationEvent::DepthTwoHundredConnected {
+                                            underlying: d200_label_for_signal,
+                                        },
+                                    );
+                                }
+                            });
+                        }
                     }
-                }
-                // O(1) EXEMPT: end
+                    // O(1) EXEMPT: end
+                } // end if NIFTY || BANKNIFTY (200-level guard)
             }
         }
     } else if config.subscription.enable_twenty_depth {
