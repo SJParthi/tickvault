@@ -487,6 +487,10 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
     let mut day_close_baseline_count: u64 = 0;
     let mut day_close_baseline_logged = false;
     let mut day_close_first_log_time = None::<Instant>;
+    // Track which instruments have had day_close persisted to previous_close table.
+    // O(1) lookup per tick. Write once per instrument, not per tick.
+    let mut day_close_persisted: std::collections::HashSet<u32> =
+        std::collections::HashSet::with_capacity(30000);
     // O(1) EXEMPT: end
 
     // O(1) dedup ring buffer — pre-allocated once, zero allocation in hot loop.
@@ -601,6 +605,31 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                             tick.exchange_segment_code,
                             tick.day_close,
                         );
+                    }
+                    // Persist to previous_close QuestDB table ONCE per instrument.
+                    // day_close from Full packets = previous session's close for ALL instruments.
+                    // HashSet lookup = O(1). Write + flush only on first occurrence.
+                    if !day_close_persisted.contains(&tick.security_id) {
+                        day_close_persisted.insert(tick.security_id);
+                        if let Some(ref mut writer) = tick_writer {
+                            if let Err(err) = build_previous_close_row(
+                                writer.buffer_mut(),
+                                tick.security_id,
+                                tick.exchange_segment_code,
+                                tick.day_close,
+                                0, // OI not available from Full packet day_close field
+                                received_at_nanos,
+                            ) {
+                                warn!(
+                                    ?err,
+                                    security_id = tick.security_id,
+                                    "failed to write day_close to previous_close"
+                                );
+                            }
+                            if let Err(err) = writer.flush_buffer_direct() {
+                                warn!(?err, "failed to flush day_close previous_close");
+                            }
+                        }
                     }
                 }
 
@@ -728,6 +757,29 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                             tick.exchange_segment_code,
                             tick.day_close,
                         );
+                    }
+                    // Persist to previous_close QuestDB — same as Tick path.
+                    if !day_close_persisted.contains(&tick.security_id) {
+                        day_close_persisted.insert(tick.security_id);
+                        if let Some(ref mut writer) = tick_writer {
+                            if let Err(err) = build_previous_close_row(
+                                writer.buffer_mut(),
+                                tick.security_id,
+                                tick.exchange_segment_code,
+                                tick.day_close,
+                                0,
+                                received_at_nanos,
+                            ) {
+                                warn!(
+                                    ?err,
+                                    security_id = tick.security_id,
+                                    "failed to write day_close to previous_close"
+                                );
+                            }
+                            if let Err(err) = writer.flush_buffer_direct() {
+                                warn!(?err, "failed to flush day_close previous_close");
+                            }
+                        }
                     }
                 }
 
