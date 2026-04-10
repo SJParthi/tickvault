@@ -313,6 +313,13 @@ const WATCHLIST = [
   { name: 'Nifty Bank', exchange: 'NSE', price: 55821.85, change: 997.55, pct: 1.82, up: true }
 ];
 
+function formatExpiryShort(exp) {
+  if (!exp) return '';
+  const d = new Date(exp + 'T00:00:00');
+  const months = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'];
+  return `${d.getDate()} ${months[d.getMonth()]}`;
+}
+
 function fmt(n, d=2) {
   if (n == null || isNaN(n)) return '--';
   return Number(n).toLocaleString('en-IN', { minimumFractionDigits: d, maximumFractionDigits: d });
@@ -440,10 +447,13 @@ function renderOptionsTable(data) {
     const chgColor = (e.change || 0) >= 0 ? 'green' : 'red';
     const oiChgColor = (e.oi_change || 0) >= 0 ? 'green' : 'red';
     const oiPctColor = (e.oi_change_pct || 0) >= 0 ? 'green' : 'red';
+    // API returns contract_name, underlying, option_type, strike, expiry
+    const displayName = e.contract_name || e.name || `${e.underlying || ''} ${e.expiry ? formatExpiryShort(e.expiry) : ''} ${e.strike || ''} ${e.option_type || ''}`.trim() || '--';
+    const spotDisplay = e.spot_price && e.spot_price > 0 ? fmt(e.spot_price, 2) : '--';
     return `<tr>
       <td class="chk"><input type="checkbox"></td>
-      <td class="left" style="font-weight:500">${e.name || '--'}</td>
-      <td>${e.spot_price ? fmt(e.spot_price, 2) : '--'}</td>
+      <td class="left" style="font-weight:500">${displayName}</td>
+      <td>${spotDisplay}</td>
       <td>${e.ltp ? fmt(e.ltp, 2) : '--'}</td>
       <td class="${chgColor}">${e.change != null ? fmt(e.change, 2) : '--'}</td>
       <td class="${chgColor}">${e.change_pct != null ? fmtPct(e.change_pct) : '--'}</td>
@@ -477,13 +487,16 @@ function renderStocksTable(data) {
 
   tbody.innerHTML = list.map(s => {
     const chgColor = (s.change || 0) >= 0 ? 'green' : 'red';
+    const name = s.symbol || s.name || s.contract_name || '--';
+    // value_cr might not exist, compute from ltp * volume if available
+    const valueCr = s.value_cr != null ? s.value_cr : (s.ltp && s.volume ? (s.ltp * s.volume / 10000000).toFixed(2) : null);
     return `<tr>
       <td class="chk"><input type="checkbox"></td>
-      <td class="left" style="font-weight:500">${s.symbol || s.name || '--'}</td>
+      <td class="left" style="font-weight:500">${name}</td>
       <td>${s.ltp ? fmt(s.ltp, 2) : '--'}</td>
       <td class="${chgColor}">${s.change != null ? fmt(s.change, 2) : '--'}</td>
       <td class="${chgColor}">${s.change_pct != null ? fmtPct(s.change_pct) : '--'}</td>
-      <td>${s.value_cr != null ? fmtVolCr(s.value_cr) : '--'}</td>
+      <td>${valueCr != null ? fmtVolCr(Number(valueCr)) : '--'}</td>
       <td>${s.volume ? fmtInt(s.volume) : '--'}</td>
     </tr>`;
   }).join('');

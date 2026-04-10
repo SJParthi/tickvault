@@ -588,11 +588,13 @@ async function fetchChain() {
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
 
-    state.contracts = data.data?.contracts || data.contracts || [];
-    state.spotPrice = data.data?.spot_price || data.spot_price || 0;
+    // Handle both nested and flat response shapes
+    const payload = data.data || data;
+    state.contracts = payload.contracts || [];
+    state.spotPrice = payload.spot_price || 0;
 
-    const expiries = data.data?.available_expiries || data.available_expiries || [];
-    if (expiries.length > 0 && state.allExpiries.length === 0) {
+    const expiries = payload.available_expiries || [];
+    if (expiries.length > 0) {
       state.allExpiries = expiries;
       if (!state.expiry) state.expiry = expiries[0];
       renderExpiries();
