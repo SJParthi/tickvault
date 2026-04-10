@@ -1309,6 +1309,12 @@ async fn main() -> Result<()> {
                     continue;
                 }
 
+                // Extract ATM security_id for 200-level BEFORE instruments_for_underlying is moved.
+                // O(1) EXEMPT: boot-time string parse
+                let atm_200_sid: Option<u32> = instruments_for_underlying
+                    .first()
+                    .and_then(|sub| sub.security_id.parse().ok());
+
                 let depth_token = token_handle.clone();
                 let depth_client_id = ws_client_id.clone();
                 let instrument_count = instruments_for_underlying.len();
@@ -1542,17 +1548,14 @@ async fn main() -> Result<()> {
                     });
                 }
 
-                // 200-level: spawn 1 connection for ATM CE of this underlying
-                // Pick the first NSE_FNO option for this underlying as ATM proxy
-                if let Some(atm_instrument) = plan.registry.iter().find(|inst| {
-                    inst.exchange_segment == dhan_live_trader_common::types::ExchangeSegment::NseFno
-                        && inst.underlying_symbol == *underlying
-                        && inst.option_type.is_some()
-                }) {
+                // 200-level: spawn 1 connection for the ATM CE of this underlying.
+                // Use the FIRST instrument from the 20-level selection (already ATM-ordered
+                // by the subscription planner). Dhan confirmed (Ticket #5519522): far OTM
+                // contracts get no depth data — must use ATM security_id.
+                if let Some(depth200_sid) = atm_200_sid {
                     let depth200_token = token_handle.clone();
                     let depth200_client_id = ws_client_id.clone();
-                    let depth200_segment = atm_instrument.exchange_segment;
-                    let depth200_sid = atm_instrument.security_id;
+                    let depth200_segment = dhan_live_trader_common::types::ExchangeSegment::NseFno;
                     let depth200_label = format!("{underlying}-ATM");
 
                     info!(
