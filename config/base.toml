@@ -255,7 +255,9 @@ sns_enabled = false
 metrics_port = 9091
 otlp_endpoint = "http://dlt-jaeger:4317"
 metrics_enabled = true
-tracing_enabled = true
+# Jaeger removed from docker-compose (saves 2.5GB RAM, per AWS budget).
+# CloudWatch Logs replaces distributed tracing. Re-enable when Jaeger is deployed.
+tracing_enabled = false
 
 [historical]
 enabled = true

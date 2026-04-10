@@ -472,6 +472,14 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
     let mut movers_persist_count: u64 = 0;
     let m_movers_persisted = counter!("dlt_movers_snapshots_persisted_total");
 
+    // PrevClose diagnostic counters — per-segment tracking + summary log.
+    // Helps confirm exactly how many PrevClose packets Dhan sends per segment.
+    let mut prev_close_idx_i: u64 = 0;
+    let mut prev_close_nse_eq: u64 = 0;
+    let mut prev_close_nse_fno: u64 = 0;
+    let mut prev_close_other: u64 = 0;
+    let mut prev_close_summary_logged = false;
+
     // O(1) dedup ring buffer — pre-allocated once, zero allocation in hot loop.
     let mut dedup_ring = TickDedupRing::new(DEDUP_RING_BUFFER_POWER);
 
@@ -520,6 +528,31 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
             ParsedFrame::Tick(mut tick) => {
                 ticks_processed = ticks_processed.saturating_add(1);
                 m_ticks.increment(1);
+
+                // Log PrevClose summary once, on the first real tick.
+                // By this point the PrevClose burst from subscription is complete.
+                if !prev_close_summary_logged {
+                    prev_close_summary_logged = true;
+                    let total = prev_close_idx_i
+                        .saturating_add(prev_close_nse_eq)
+                        .saturating_add(prev_close_nse_fno)
+                        .saturating_add(prev_close_other);
+                    info!(
+                        total,
+                        idx_i = prev_close_idx_i,
+                        nse_eq = prev_close_nse_eq,
+                        nse_fno = prev_close_nse_fno,
+                        other = prev_close_other,
+                        "PrevClose burst complete — per-segment summary"
+                    );
+                    if prev_close_nse_eq == 0 && prev_close_nse_fno == 0 {
+                        warn!(
+                            "PrevClose: Dhan sent 0 packets for NSE_EQ and NSE_FNO — \
+                             movers will lack baseline for non-index instruments. \
+                             REST API fallback needed."
+                        );
+                    }
+                }
 
                 // Filter junk ticks: NaN/Infinity, zero/negative LTP,
                 // or epoch timestamps (heartbeat/init frames from Dhan).
@@ -804,6 +837,14 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
             } => {
                 m_prev_close_updates.increment(1);
 
+                // Diagnostic: count PrevClose packets per segment.
+                match exchange_segment_code {
+                    0 => prev_close_idx_i = prev_close_idx_i.saturating_add(1),
+                    1 => prev_close_nse_eq = prev_close_nse_eq.saturating_add(1),
+                    2 => prev_close_nse_fno = prev_close_nse_fno.saturating_add(1),
+                    _ => prev_close_other = prev_close_other.saturating_add(1),
+                }
+
                 // Update option movers with previous day OI (always, regardless of market hours).
                 // PrevClose packets set the baseline for OI change calculations.
                 if let Some(ref mut opt_movers) = option_movers {
@@ -865,9 +906,12 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                             );
                         }
                     }
-                    // Force flush — previous close is critical reference data.
+                    // Direct buffer flush — bypasses pending_count guard.
+                    // force_flush() checks pending_count == 0 and returns early because
+                    // build_previous_close_row writes to buffer_mut() without incrementing
+                    // pending_count. flush_buffer_direct() flushes unconditionally.
                     // O(1) EXEMPT: cold path — runs once per instrument at boot, not per tick.
-                    if let Err(err) = writer.force_flush() {
+                    if let Err(err) = writer.flush_buffer_direct() {
                         warn!(?err, "failed to flush previous close to QuestDB");
                     }
                 }

@@ -372,6 +372,39 @@ impl TickPersistenceWriter {
         Ok(())
     }
 
+    /// Flushes the ILP buffer directly, bypassing the `pending_count` guard.
+    ///
+    /// Use this for non-tick writes (e.g., `build_previous_close_row`) that write
+    /// to the buffer via `buffer_mut()` without incrementing `pending_count`.
+    /// Without this, those rows sit in the buffer until the next tick batch flush,
+    /// causing data loss if the app crashes or restarts before ticks arrive.
+    ///
+    /// Returns `Ok(())` if the buffer is empty (nothing to flush).
+    pub fn flush_buffer_direct(&mut self) -> Result<()> {
+        // Nothing in buffer → no-op (avoid pointless TCP round-trip).
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+
+        if self.sender.is_none() {
+            self.try_reconnect_on_error()?;
+        }
+
+        let sender = self
+            .sender
+            .as_mut()
+            .context("sender unavailable in flush_buffer_direct")?;
+
+        if let Err(err) = sender.flush(&mut self.buffer) {
+            self.sender = None;
+            self.last_flush_ms = current_time_ms();
+            return Err(err).context("flush non-tick buffer to QuestDB");
+        }
+
+        self.last_flush_ms = current_time_ms();
+        Ok(())
+    }
+
     /// Rescues in-flight ticks (in the ILP buffer but not yet flushed) back to
     /// the ring buffer / disk spill. Called on flush failure to prevent data loss.
     /// Zero allocation: drains in-flight Vec directly without collecting into a new Vec.
