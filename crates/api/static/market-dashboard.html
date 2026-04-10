@@ -12,9 +12,9 @@
         }
 
         body {
-            background-color: #000;
-            color: #e8e8e8;
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Oxygen', 'Ubuntu', 'Cantarell', sans-serif;
+            background-color: #000000;
+            color: #8E8E8E;
+            font-family: Inter, -apple-system, BlinkMacSystemFont, sans-serif;
             font-size: 14px;
             overflow: hidden;
         }
@@ -23,7 +23,7 @@
         .top-nav {
             display: flex;
             align-items: center;
-            background-color: #121212;
+            background-color: #181818;
             border-bottom: 1px solid #242424;
             padding: 12px 20px;
             gap: 20px;
@@ -74,7 +74,7 @@
         }
 
         .nav-links a:hover {
-            color: #e8e8e8;
+            color: #DADADA;
         }
 
         .right-nav {
@@ -86,7 +86,7 @@
 
         .markets-btn {
             background: none;
-            color: #5CA81D;
+            color: #05B878;
             padding: 6px 0;
             cursor: pointer;
             font-size: 14px;
@@ -104,7 +104,7 @@
         }
 
         .icon-button:hover {
-            color: #e8e8e8;
+            color: #DADADA;
         }
 
         .live-indicator {
@@ -118,7 +118,7 @@
         .live-dot {
             width: 8px;
             height: 8px;
-            background-color: #5CA81D;
+            background-color: #05B878;
             border-radius: 50%;
             animation: pulse 2s infinite;
         }
@@ -145,7 +145,7 @@
         /* ============ INDEX TICKER BAR ============ */
         .index-ticker {
             display: flex;
-            background-color: #121212;
+            background-color: #181818;
             border-bottom: 1px solid #242424;
             padding: 12px 20px;
             gap: 40px;
@@ -166,7 +166,7 @@
         }
 
         .ticker-value {
-            color: #e8e8e8;
+            color: #DADADA;
             font-weight: 500;
         }
 
@@ -175,7 +175,7 @@
         }
 
         .ticker-change.up {
-            color: #5CA81D;
+            color: #05B878;
         }
 
         .ticker-change.down {
@@ -191,7 +191,7 @@
         /* ============ LEFT SIDEBAR ============ */
         .sidebar {
             width: 280px;
-            background-color: #121212;
+            background-color: #000000;
             border-right: 1px solid #242424;
             display: flex;
             flex-direction: column;
@@ -228,17 +228,17 @@
         }
 
         .sidebar-tab {
-            background-color: #242424;
-            border: 1px solid #242424;
+            background-color: transparent;
+            border: none;
             color: #8E8E8E;
             padding: 4px 8px;
-            border-radius: 4px;
+            border-radius: 0px;
             cursor: pointer;
-            transition: background-color 0.2s;
+            transition: color 0.2s;
         }
 
         .sidebar-tab:hover {
-            background-color: #333;
+            color: #DADADA;
         }
 
         .sidebar-items {
@@ -268,7 +268,7 @@
         }
 
         .sidebar-item-color-bar.up {
-            background-color: #5CA81D;
+            background-color: #05B878;
         }
 
         .sidebar-item-color-bar.down {
@@ -281,9 +281,9 @@
         }
 
         .sidebar-item-name {
-            font-size: 13px;
-            font-weight: 500;
-            color: #e8e8e8;
+            font-size: 14px;
+            font-weight: 400;
+            color: #DADADA;
             white-space: nowrap;
             overflow: hidden;
             text-overflow: ellipsis;
@@ -296,36 +296,8 @@
 
         .sidebar-item-price {
             font-size: 14px;
-            font-weight: 500;
-            color: #e8e8e8;
-            text-align: right;
-        }
-
-        .sidebar-item-change {
-            font-size: 12px;
-            text-align: right;
-        }
-
-        .sidebar-item-change.up {
-            color: #5CA81D;
-        }
-
-        .sidebar-item-change.down {
-            color: #DD6565;
-        }
-
-        .sidebar-bottom {
-            padding: 8px 12px;
-            border-top: 1px solid #242424;
-            font-size: 10px;
-            color: #8E8E8E;
-            display: flex;
-            gap: 12px;
-        }
-
-        .sidebar-bottom-link {
-            cursor: pointer;
-            text-decoration: underline;
+            font-weight: 400;
+            color: #DADADA;
         }
 
         /* ============ MAIN CONTENT ============ */
@@ -333,157 +305,113 @@
             flex: 1;
             display: flex;
             flex-direction: column;
+            overflow: hidden;
+            background-color: #000000;
         }
 
-        .market-nav {
+        /* ============ TAB NAVIGATION (Material Style) ============ */
+        .tab-nav {
             display: flex;
-            background-color: #121212;
-            border-bottom: 1px solid #242424;
-            padding: 0 20px;
             gap: 0;
-        }
-
-        .market-nav-item {
-            padding: 12px 16px;
-            cursor: pointer;
-            color: #8E8E8E;
-            font-size: 13px;
-            border-bottom: 2px solid transparent;
-            transition: all 0.2s;
-            position: relative;
-        }
-
-        .market-nav-item.active {
-            color: #5CA81D;
-            border-bottom: 2px solid #5CA81D;
-        }
-
-        .market-nav-item:hover {
-            color: #e8e8e8;
-        }
-
-        /* ============ FILTER TABS ============ */
-        .filter-bar {
-            display: flex;
-            background-color: #121212;
+            padding: 0;
             border-bottom: 1px solid #242424;
-            padding: 12px 20px;
-            gap: 24px;
-            align-items: center;
-            justify-content: space-between;
+            background-color: #181818;
         }
 
-        .filter-tabs {
+        .tab {
+            padding: 5px 20px;
+            color: #8E8E8E;
+            font-size: 14px;
+            font-weight: 400;
+            border: none;
+            background: transparent;
+            cursor: pointer;
+            transition: color 0.2s, border-bottom-color 0.2s;
+            border-bottom: 2px solid transparent;
+            position: relative;
+            top: 1px;
+            margin-bottom: -1px;
+        }
+
+        .tab:hover {
+            color: #DADADA;
+        }
+
+        .tab.active {
+            color: #05B878;
+            border-bottom-color: #05B878;
+        }
+
+        /* ============ FILTERS AREA ============ */
+        .filters {
             display: flex;
             gap: 20px;
+            padding: 16px 20px;
+            border-bottom: 1px solid #242424;
             flex-wrap: wrap;
-        }
-
-        .filter-tab {
-            color: #8E8E8E;
-            font-size: 12px;
-            cursor: pointer;
-            padding-bottom: 2px;
-            border-bottom: 2px solid transparent;
-            transition: all 0.2s;
-            white-space: nowrap;
-        }
-
-        .filter-tab.active {
-            color: #5CA81D;
-            border-bottom-color: #5CA81D;
-        }
-
-        .filter-tab:hover {
-            color: #e8e8e8;
-        }
-
-        .filter-controls {
-            display: flex;
-            gap: 12px;
             align-items: center;
-            margin-left: auto;
+            background-color: #000000;
         }
 
-        .dropdown-select {
-            background-color: #1a1a1a;
-            border: 1px solid #333;
-            color: #e8e8e8;
-            padding: 6px 12px;
-            border-radius: 4px;
-            cursor: pointer;
-            font-size: 13px;
-            min-width: 80px;
-            -webkit-appearance: none;
-            -moz-appearance: none;
-            appearance: none;
-            background-image: url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%238E8E8E' stroke-width='2'%3e%3cpolyline points='6 9 12 15 18 9'%3e%3c/polyline%3e%3c/svg%3e");
-            background-repeat: no-repeat;
-            background-position: right 8px center;
-            background-size: 14px;
-            padding-right: 28px;
-        }
-        .dropdown-select option {
-            background-color: #1a1a1a;
-            color: #e8e8e8;
-        }
-
-        .dropdown-select:hover {
-            border-color: #555;
-        }
-
-        .toggle-buttons {
+        .filter-group {
             display: flex;
             gap: 8px;
-        }
-
-        .toggle-btn {
-            display: flex;
             align-items: center;
-            gap: 6px;
-            background-color: transparent;
-            border: none;
-            color: #8E8E8E;
-            cursor: pointer;
+        }
+
+        .filter-label {
             font-size: 12px;
-            transition: color 0.2s;
+            color: #8E8E8E;
+            font-weight: 400;
         }
 
-        .toggle-btn.active {
-            color: #e8e8e8;
+        .filter-select {
+            background-color: #181818;
+            border: 1px solid #242424;
+            color: #ACACAC;
+            padding: 6px 10px;
+            border-radius: 4px;
+            font-size: 12px;
+            cursor: pointer;
+            transition: color 0.2s, border-color 0.2s;
         }
 
-        .toggle-dot {
-            width: 6px;
-            height: 6px;
-            border-radius: 50%;
-            display: inline-block;
+        .filter-select:hover {
+            border-color: #333;
         }
 
-        .toggle-dot.green {
-            background-color: #5CA81D;
+        .filter-select:focus {
+            outline: none;
+            border-color: #05B878;
+            color: #DADADA;
         }
 
-        .toggle-dot.red {
-            background-color: #DD6565;
+        .filter-select option {
+            background-color: #181818;
+            color: #ACACAC;
+            font-size: 12px;
+        }
+
+        .filter-select option:checked {
+            color: #DADADA;
+            font-weight: 450;
         }
 
         /* ============ TABLE ============ */
         .table-container {
             flex: 1;
-            overflow-y: auto;
-            background-color: #121212;
+            overflow: auto;
+            background-color: #000000;
         }
 
         table {
             width: 100%;
             border-collapse: collapse;
-            background-color: #121212;
+            background-color: #000000;
         }
 
         thead {
-            background-color: #121212;
-            border-bottom: 1px solid #242424;
+            background-color: #181818;
             position: sticky;
             top: 0;
             z-index: 10;
@@ -492,115 +420,35 @@
         th {
             padding: 12px 16px;
             text-align: left;
-            font-weight: 300;
-            font-size: 12px;
+            font-size: 14px;
             color: #8E8E8E;
-            cursor: pointer;
-            user-select: none;
-            white-space: nowrap;
+            font-weight: 700;
             border-bottom: 1px solid #242424;
-        }
-
-        th:hover {
-            color: #e8e8e8;
-            background-color: #1a1a1a;
-        }
-
-        th.sort-active {
-            color: #5CA81D;
+            background-color: #181818;
         }
 
         td {
-            padding: 0 16px;
-            height: 42px;
-            display: table-cell;
-            vertical-align: middle;
-            border-bottom: 1px solid #242424;
-            font-size: 13px;
-        }
-
-        tr:hover {
-            background-color: #1a1a1a;
-        }
-
-        .checkbox-cell {
-            width: 40px;
-            padding: 0 12px;
-        }
-
-        input[type="checkbox"] {
-            cursor: pointer;
-        }
-
-        .table-name {
-            color: #e8e8e8;
-        }
-
-        .table-secondary {
-            color: #8E8E8E;
-            font-size: 12px;
-        }
-
-        .table-change.up {
-            color: #5CA81D;
-        }
-
-        .table-change.down {
-            color: #DD6565;
-        }
-
-        /* ============ BOTTOM BAR ============ */
-        .bottom-bar {
-            display: flex;
-            background-color: #121212;
-            border-top: 1px solid #242424;
-            padding: 12px 20px;
-            gap: 12px;
-            align-items: center;
-            height: 50px;
-        }
-
-        .bottom-btn {
-            background-color: #242424;
-            border: 1px solid #242424;
-            color: #e8e8e8;
-            padding: 6px 12px;
-            border-radius: 4px;
-            cursor: pointer;
-            font-size: 12px;
-            display: flex;
-            align-items: center;
-            gap: 6px;
-            transition: background-color 0.2s;
-        }
-
-        .bottom-btn:hover {
-            background-color: #2a2a2a;
-        }
-
-        .bottom-btn-icon {
+            padding: 12px 16px;
             font-size: 14px;
-        }
-
-        .create-strategy {
-            margin-left: auto;
-            background-color: transparent;
-            border: none;
             color: #8E8E8E;
-            cursor: pointer;
-            font-size: 12px;
-            transition: color 0.2s;
+            font-weight: 400;
+            border-bottom: 1px solid #242424;
         }
 
-        .create-strategy:hover {
-            color: #e8e8e8;
+        tbody tr:hover {
+            background-color: #0a0a0a;
         }
 
-        /* ============ SORT INDICATOR ============ */
-        .sort-indicator {
-            margin-left: 4px;
-            font-size: 10px;
-            display: inline-block;
+        .highlighted {
+            color: #DADADA;
+        }
+
+        .up {
+            color: #05B878;
+        }
+
+        .down {
+            color: #DD6565;
         }
 
         /* ============ SCROLLBAR ============ */
@@ -610,21 +458,41 @@
         }
 
         ::-webkit-scrollbar-track {
-            background: #121212;
+            background: #000000;
         }
 
         ::-webkit-scrollbar-thumb {
-            background: #242424;
+            background: #333;
             border-radius: 4px;
         }
 
         ::-webkit-scrollbar-thumb:hover {
-            background: #2a2a2a;
+            background: #444;
         }
 
-        /* ============ HIDE ELEMENTS ============ */
-        .hidden {
-            display: none !important;
+        /* ============ RESPONSIVE ============ */
+        @media (max-width: 1200px) {
+            .sidebar {
+                width: 240px;
+            }
+        }
+
+        @media (max-width: 768px) {
+            .main-container {
+                flex-direction: column;
+            }
+
+            .sidebar {
+                width: 100%;
+                height: 150px;
+                border-right: none;
+                border-bottom: 1px solid #242424;
+            }
+
+            .filters {
+                flex-direction: column;
+                align-items: flex-start;
+            }
         }
     </style>
 </head>
@@ -632,499 +500,273 @@
     <!-- TOP NAV -->
     <div class="top-nav">
         <div class="logo">D</div>
-        <input type="text" class="search-bar" placeholder="Search for stocks...">
+        <input type="text" class="search-bar" placeholder="Search symbols...">
         <div class="nav-links">
-            <a>Home</a>
-            <a>Portfolio</a>
-            <a>Positions</a>
-            <a>Orders</a>
-            <a>Money</a>
+            <a href="#">Dashboard</a>
+            <a href="#">Markets</a>
+            <a href="#">Watchlist</a>
         </div>
         <div class="right-nav">
-            <button class="markets-btn">Markets</button>
-            <a class="icon-button">📊</a>
-            <a class="icon-button">📰</a>
-            <a class="icon-button">📈</a>
             <div class="live-indicator">
-                <span class="live-dot"></span>
-                <span>Live</span>
+                <div class="live-dot"></div>
+                <span>LIVE</span>
             </div>
             <button class="icon-button">🔔</button>
-            <div class="user-avatar">P</div>
+            <div class="user-avatar">A</div>
         </div>
     </div>
 
-    <!-- INDEX TICKER BAR -->
-    <div class="index-ticker" id="indexTicker">
+    <!-- INDEX TICKER -->
+    <div class="index-ticker">
         <div class="ticker-item">
-            <div class="ticker-name">Nifty 50</div>
-            <div class="ticker-value">24041</div>
-            <div class="ticker-change up">↑ 63 (+0.26%)</div>
+            <div class="ticker-name">NIFTY 50</div>
+            <div class="ticker-value">24,850.50</div>
+            <div class="ticker-change up">+1.25%</div>
         </div>
         <div class="ticker-item">
-            <div class="ticker-name">Nifty Bank</div>
-            <div class="ticker-value">55821</div>
-            <div class="ticker-change up">↑ 997 (+1.82%)</div>
+            <div class="ticker-name">SENSEX</div>
+            <div class="ticker-value">81,234.25</div>
+            <div class="ticker-change up">+0.95%</div>
         </div>
         <div class="ticker-item">
-            <div class="ticker-name">Fin Nifty</div>
-            <div class="ticker-value">26193</div>
-            <div class="ticker-change up">↑ 507 (+1.98%)</div>
+            <div class="ticker-name">BANK NIFTY</div>
+            <div class="ticker-value">52,100.00</div>
+            <div class="ticker-change down">-0.50%</div>
         </div>
         <div class="ticker-item">
-            <div class="ticker-name">India VIX</div>
-            <div class="ticker-value">15.42</div>
-            <div class="ticker-change down">↓ 0.58 (-3.63%)</div>
-        </div>
-        <div class="ticker-item">
-            <div class="ticker-name">Nifty Midcap</div>
-            <div class="ticker-value">13328</div>
-            <div class="ticker-change up">↑ 121 (+0.92%)</div>
+            <div class="ticker-name">FIN NIFTY</div>
+            <div class="ticker-value">21,567.80</div>
+            <div class="ticker-change up">+1.10%</div>
         </div>
     </div>
 
     <!-- MAIN CONTAINER -->
     <div class="main-container">
-        <!-- SIDEBAR -->
+        <!-- LEFT SIDEBAR -->
         <div class="sidebar">
             <div class="sidebar-header">
                 <div class="sidebar-header-title">
-                    First Watchlist
-                    <span class="dropdown-arrow">▼</span>
+                    <span>📋</span>
+                    <span>Watchlist</span>
                 </div>
+                <div class="dropdown-arrow">⋯</div>
             </div>
-            <div class="sidebar-tabs" id="sidebarTabs">
-                <div class="sidebar-tab">1</div>
-                <div class="sidebar-tab">2</div>
-                <div class="sidebar-tab">3</div>
-                <div class="sidebar-tab">4</div>
-                <div class="sidebar-tab">5</div>
-                <div class="sidebar-tab">6</div>
-                <div class="sidebar-tab">f</div>
-                <div class="sidebar-tab">δ</div>
+
+            <div class="sidebar-tabs">
+                <button class="sidebar-tab active">All</button>
+                <button class="sidebar-tab">Favorites</button>
             </div>
-            <div class="sidebar-items" id="sidebarItems"></div>
-            <div class="sidebar-bottom">
-                <span class="sidebar-bottom-link">Name</span>
-                <span class="sidebar-bottom-link">LTP</span>
-                <span class="sidebar-bottom-link">LTP%</span>
-                <span class="sidebar-bottom-link">Color</span>
+
+            <div class="sidebar-items">
+                <div class="sidebar-item">
+                    <div class="sidebar-item-color-bar up"></div>
+                    <div class="sidebar-item-info">
+                        <div class="sidebar-item-name">TCS</div>
+                        <div class="sidebar-item-exchange">NSE</div>
+                    </div>
+                    <div class="sidebar-item-price">3,850.00</div>
+                </div>
+                <div class="sidebar-item">
+                    <div class="sidebar-item-color-bar up"></div>
+                    <div class="sidebar-item-info">
+                        <div class="sidebar-item-name">Reliance</div>
+                        <div class="sidebar-item-exchange">NSE</div>
+                    </div>
+                    <div class="sidebar-item-price">2,945.50</div>
+                </div>
+                <div class="sidebar-item">
+                    <div class="sidebar-item-color-bar down"></div>
+                    <div class="sidebar-item-info">
+                        <div class="sidebar-item-name">ICICI Bank</div>
+                        <div class="sidebar-item-exchange">NSE</div>
+                    </div>
+                    <div class="sidebar-item-price">680.25</div>
+                </div>
+                <div class="sidebar-item">
+                    <div class="sidebar-item-color-bar up"></div>
+                    <div class="sidebar-item-info">
+                        <div class="sidebar-item-name">Infosys</div>
+                        <div class="sidebar-item-exchange">NSE</div>
+                    </div>
+                    <div class="sidebar-item-price">1,625.75</div>
+                </div>
             </div>
         </div>
 
-        <!-- CONTENT -->
+        <!-- MAIN CONTENT -->
         <div class="content">
-            <!-- MARKET NAV -->
-            <div class="market-nav" id="marketNav">
-                <div class="market-nav-item" data-market="live">Live</div>
-                <div class="market-nav-item active" data-market="options">Options</div>
-                <div class="market-nav-item" data-market="stocks">Stocks</div>
-                <div class="market-nav-item" data-market="commodity">Commodity</div>
-                <div class="market-nav-item" data-market="futures">Futures</div>
-                <div class="market-nav-item" data-market="etf">ETFs</div>
-                <div class="market-nav-item" data-market="bonds">Bonds</div>
-                <div class="market-nav-item" data-market="index">Index</div>
+            <!-- TAB NAVIGATION -->
+            <div class="tab-nav">
+                <button class="tab active" data-tab="live">Live</button>
+                <button class="tab" data-tab="options">Options</button>
+                <button class="tab" data-tab="stocks">Stocks</button>
             </div>
 
-            <!-- OPTIONS FILTER BAR -->
-            <div class="filter-bar" id="optionsFilterBar">
-                <div class="filter-tabs">
-                    <div class="filter-tab active" data-category="HIGHEST_OI">Highest OI</div>
-                    <div class="filter-tab" data-category="OI_GAINERS">OI Gainers</div>
-                    <div class="filter-tab" data-category="OI_LOSERS">OI Losers</div>
-                    <div class="filter-tab" data-category="TOP_VOLUME">Top Volume</div>
-                    <div class="filter-tab" data-category="TOP_VALUE">Top Value</div>
-                    <div class="filter-tab" data-category="PRICE_GAINERS">Price Gainers</div>
-                    <div class="filter-tab" data-category="PRICE_LOSERS">Price Losers</div>
-                </div>
-                <div class="filter-controls">
-                    <select class="dropdown-select" id="expirySelect">
-                        <option>April</option>
-                        <option>May</option>
-                        <option>June</option>
-                    </select>
-                    <select class="dropdown-select" id="typeSelect">
-                        <option selected>All</option>
-                        <option>Index</option>
-                        <option>Stock</option>
-                        <option>NSE</option>
-                        <option>BSE</option>
-                    </select>
-                </div>
-            </div>
-
-            <!-- STOCKS FILTER BAR -->
-            <div class="filter-bar hidden" id="stocksFilterBar">
-                <div class="filter-tabs">
-                    <div class="filter-tab" data-tab="intraday">Intraday Movers</div>
-                    <div class="filter-tab" data-tab="outperformers">Outperformers</div>
-                    <div class="filter-tab" data-tab="mtf">MTF</div>
-                    <div class="filter-tab" data-tab="extremeOpenings">Extreme Openings</div>
-                    <div class="filter-tab active" data-tab="pricemovers">Price Movers</div>
-                    <div class="filter-tab" data-tab="breakouts">Breakouts</div>
-                    <div class="filter-tab" data-tab="byvalue">By Value</div>
-                </div>
-                <div class="filter-controls">
-                    <div class="toggle-buttons">
-                        <button class="toggle-btn active" id="gainersBtn">
-                            <span class="toggle-dot green"></span>
-                            Gainers
-                        </button>
-                        <span style="color: #8E8E8E;">•</span>
-                        <button class="toggle-btn" id="losersBtn">
-                            <span class="toggle-dot red"></span>
-                            Losers
-                        </button>
-                    </div>
-                    <select class="dropdown-select" id="nseSelect">
-                        <option>NSE</option>
-                        <option>BSE</option>
-                    </select>
-                    <select class="dropdown-select" id="foSelect">
-                        <option selected>F&O Stocks</option>
+            <!-- FILTERS -->
+            <div class="filters">
+                <div class="filter-group">
+                    <label class="filter-label">Index</label>
+                    <select class="filter-select">
                         <option>All</option>
-                        <option>Nifty 50</option>
-                        <option>Nifty Bank</option>
-                        <option>Fin Nifty</option>
-                        <option>India VIX</option>
-                        <option>Nifty Midcap</option>
+                        <option>NIFTY 50</option>
+                        <option>SENSEX</option>
+                        <option>BANK NIFTY</option>
                     </select>
-                    <select class="dropdown-select" id="allSelect">
+                </div>
+                <div class="filter-group">
+                    <label class="filter-label">Expiry</label>
+                    <select class="filter-select">
                         <option>All</option>
-                        <option>NSE</option>
-                        <option>BSE</option>
+                        <option>Weekly</option>
+                        <option>Monthly</option>
+                    </select>
+                </div>
+                <div class="filter-group">
+                    <label class="filter-label">Type</label>
+                    <select class="filter-select">
+                        <option>All</option>
+                        <option>Call</option>
+                        <option>Put</option>
                     </select>
                 </div>
             </div>
 
-            <!-- TABLE CONTAINER -->
-            <div class="table-container" id="tableContainer">
-                <table id="dataTable">
-                    <thead id="tableHead"></thead>
-                    <tbody id="tableBody"></tbody>
+            <!-- TABLE -->
+            <div class="table-container">
+                <table id="data-table">
+                    <thead>
+                        <tr>
+                            <th>Name</th>
+                            <th>Spot Price</th>
+                            <th>LTP</th>
+                            <th>Change</th>
+                            <th>Change %</th>
+                            <th>Open Interest</th>
+                            <th>OI Change</th>
+                            <th>OI Change %</th>
+                            <th>Volume</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr>
+                            <td class="highlighted">NIFTY 50 CE 25000</td>
+                            <td class="highlighted">24,850.50</td>
+                            <td class="highlighted">625.50</td>
+                            <td class="up">+45.25</td>
+                            <td class="up">+7.80%</td>
+                            <td class="highlighted">2,34,567</td>
+                            <td class="up">+12,345</td>
+                            <td class="up">+5.60%</td>
+                            <td class="highlighted">45,678</td>
+                        </tr>
+                        <tr>
+                            <td class="highlighted">NIFTY 50 PE 25000</td>
+                            <td class="highlighted">24,850.50</td>
+                            <td class="highlighted">475.25</td>
+                            <td class="down">-38.50</td>
+                            <td class="down">-7.50%</td>
+                            <td class="highlighted">1,98,234</td>
+                            <td class="down">-8,567</td>
+                            <td class="down">-4.15%</td>
+                            <td class="highlighted">32,145</td>
+                        </tr>
+                        <tr>
+                            <td class="highlighted">BANK NIFTY CE 52000</td>
+                            <td class="highlighted">52,100.00</td>
+                            <td class="highlighted">850.75</td>
+                            <td class="up">+62.50</td>
+                            <td class="up">+7.92%</td>
+                            <td class="highlighted">1,45,678</td>
+                            <td class="up">+5,234</td>
+                            <td class="up">+3.73%</td>
+                            <td class="highlighted">28,934</td>
+                        </tr>
+                        <tr>
+                            <td class="highlighted">BANK NIFTY PE 52000</td>
+                            <td class="highlighted">52,100.00</td>
+                            <td class="highlighted">420.50</td>
+                            <td class="down">-42.75</td>
+                            <td class="down">-9.25%</td>
+                            <td class="highlighted">2,12,345</td>
+                            <td class="down">-15,678</td>
+                            <td class="down">-6.87%</td>
+                            <td class="highlighted">51,234</td>
+                        </tr>
+                        <tr>
+                            <td class="highlighted">FIN NIFTY CE 21600</td>
+                            <td class="highlighted">21,567.80</td>
+                            <td class="highlighted">345.25</td>
+                            <td class="up">+25.50</td>
+                            <td class="up">+7.94%</td>
+                            <td class="highlighted">98,765</td>
+                            <td class="up">+3,456</td>
+                            <td class="up">+3.62%</td>
+                            <td class="highlighted">15,678</td>
+                        </tr>
+                    </tbody>
                 </table>
-            </div>
-
-            <!-- BOTTOM BAR -->
-            <div class="bottom-bar">
-                <button class="bottom-btn" id="optionChainBtn">
-                    <span class="bottom-btn-icon">⊞</span>
-                    Option Chain
-                    <span>▼</span>
-                </button>
-                <button class="bottom-btn" id="snapshotBtn">
-                    <span class="bottom-btn-icon">📷</span>
-                    Snapshot
-                    <span>▼</span>
-                </button>
-                <button class="bottom-btn" id="chartBtn">
-                    <span class="bottom-btn-icon">📈</span>
-                    Chart
-                    <span>▼</span>
-                </button>
-                <button class="create-strategy">Create Your Strategy →</button>
             </div>
         </div>
     </div>
 
     <script>
-        // State management
-        let state = {
-            currentMarket: 'options',
-            currentCategory: 'HIGHEST_OI',
-            sortColumn: null,
-            sortDirection: 'asc',
-            optionsData: [],
-            stocksData: { gainers: [], losers: [], most_active: [] },
-            showGainers: true
-        };
+        // Tab navigation
+        document.querySelectorAll('.tab').forEach(tab => {
+            tab.addEventListener('click', function() {
+                document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+                this.classList.add('active');
 
-        const API_BASE = 'http://localhost:3001/api/market';
+                const tabName = this.getAttribute('data-tab');
+                console.log('Switched to tab:', tabName);
 
-        // Sidebar data
-        const sidebarData = [
-            { name: 'Adani Ports & SEZ', exchange: 'NSE', price: 1461, change: 13.80, changePct: 0.95 },
-            { name: 'Adani Green Energy', exchange: 'NSE', price: 1057, change: 12.95, changePct: 1.24 },
-            { name: 'Adani Enterprises', exchange: 'NSE', price: 2064, change: 23.80, changePct: 1.17 },
-            { name: 'ICICI Bank', exchange: 'NSE', price: 1319, change: 38.30, changePct: 2.99 },
-            { name: 'HDFC Bank', exchange: 'NSE', price: 811, change: 13.35, changePct: 1.67 },
-            { name: 'Reliance Industries', exchange: 'NSE', price: 1346, change: 16.30, changePct: 1.23 },
-            { name: 'Sensex', exchange: 'BSE', price: 77360, change: 728.97, changePct: 0.95 },
-            { name: 'Gift Nifty', exchange: 'NSE', price: 24041, change: 63, changePct: 0.26 },
-            { name: 'Nifty Midcap Select', exchange: 'NSE', price: 13328, change: 121, changePct: 0.92 },
-            { name: 'FinNifty', exchange: 'NSE', price: 26193, change: 507, changePct: 1.98 },
-            { name: 'Nifty Bank', exchange: 'NSE', price: 55821, change: 997, changePct: 1.82 }
-        ];
+                // Update table headers based on selected tab
+                const table = document.getElementById('data-table');
+                const headers = table.querySelector('thead tr');
 
-        // Initialize sidebar
-        function initSidebar() {
-            const sidebarItems = document.getElementById('sidebarItems');
-            sidebarItems.innerHTML = sidebarData.map(item => {
-                const isUp = item.change >= 0;
-                return `
-                    <div class="sidebar-item">
-                        <div class="sidebar-item-color-bar ${isUp ? 'up' : 'down'}"></div>
-                        <div class="sidebar-item-info">
-                            <div class="sidebar-item-name">${item.name}</div>
-                            <div class="sidebar-item-exchange">${item.exchange}</div>
-                        </div>
-                        <div>
-                            <div class="sidebar-item-price">${item.price.toLocaleString('en-IN')}</div>
-                            <div class="sidebar-item-change ${isUp ? 'up' : 'down'}">
-                                ${isUp ? '+' : ''}${item.changePct.toFixed(2)}%
-                            </div>
-                        </div>
-                    </div>
-                `;
-            }).join('');
-        }
-
-        // Format number as Indian currency
-        function formatIndianNumber(num) {
-            if (num === null || num === undefined) return '-';
-            return num.toLocaleString('en-IN', { maximumFractionDigits: 2, minimumFractionDigits: 0 });
-        }
-
-        // Fetch options data
-        async function fetchOptionsData() {
-            try {
-                const response = await fetch(`${API_BASE}/option-movers?category=${state.currentCategory}`);
-                const data = await response.json();
-                if (data.available && data.entries) {
-                    state.optionsData = data.entries;
-                    renderTable();
+                if (tabName === 'stocks') {
+                    headers.innerHTML = `
+                        <th>Name</th>
+                        <th>LTP</th>
+                        <th>Change</th>
+                        <th>Change %</th>
+                        <th>Volume</th>
+                        <th>Market Cap</th>
+                    `;
+                } else if (tabName === 'options') {
+                    headers.innerHTML = `
+                        <th>Name</th>
+                        <th>Spot Price</th>
+                        <th>LTP</th>
+                        <th>Change</th>
+                        <th>Change %</th>
+                        <th>Open Interest</th>
+                        <th>OI Change</th>
+                        <th>OI Change %</th>
+                        <th>Volume</th>
+                    `;
                 }
-            } catch (error) {
-                console.error('Error fetching options data:', error);
-            }
-        }
-
-        // Fetch stocks data
-        async function fetchStocksData() {
-            try {
-                const response = await fetch(`${API_BASE}/stock-movers`);
-                const data = await response.json();
-                if (data.available) {
-                    state.stocksData = data;
-                    renderTable();
-                }
-            } catch (error) {
-                console.error('Error fetching stocks data:', error);
-            }
-        }
-
-        // Render options table
-        function renderOptionsTable() {
-            const thead = document.getElementById('tableHead');
-            const tbody = document.getElementById('tableBody');
-
-            thead.innerHTML = `
-                <tr>
-                    <th class="checkbox-cell"><input type="checkbox"></th>
-                    <th data-column="contract_name">Name ${state.sortColumn === 'contract_name' ? (state.sortDirection === 'asc' ? '▲' : '▼') : ''}</th>
-                    <th data-column="spot_price">Spot Price ${state.sortColumn === 'spot_price' ? (state.sortDirection === 'asc' ? '▲' : '▼') : ''}</th>
-                    <th data-column="ltp">LTP ${state.sortColumn === 'ltp' ? (state.sortDirection === 'asc' ? '▲' : '▼') : ''}</th>
-                    <th data-column="change">Change ${state.sortColumn === 'change' ? (state.sortDirection === 'asc' ? '▲' : '▼') : ''}</th>
-                    <th data-column="change_pct">Change % ${state.sortColumn === 'change_pct' ? (state.sortDirection === 'asc' ? '▲' : '▼') : ''}</th>
-                    <th data-column="oi">Open Interest ${state.sortColumn === 'oi' ? (state.sortDirection === 'asc' ? '▲' : '▼') : ''}</th>
-                    <th data-column="oi_change">OI Change ${state.sortColumn === 'oi_change' ? (state.sortDirection === 'asc' ? '▲' : '▼') : ''}</th>
-                    <th data-column="oi_change_pct">OI Change % ${state.sortColumn === 'oi_change_pct' ? (state.sortDirection === 'asc' ? '▲' : '▼') : ''}</th>
-                    <th data-column="volume">Volume ${state.sortColumn === 'volume' ? (state.sortDirection === 'asc' ? '▲' : '▼') : ''}</th>
-                </tr>
-            `;
-
-            tbody.innerHTML = state.optionsData.map(row => {
-                const changeUp = row.change >= 0;
-                return `
-                    <tr>
-                        <td class="checkbox-cell"><input type="checkbox"></td>
-                        <td class="table-name">${row.contract_name}</td>
-                        <td class="table-secondary">${formatIndianNumber(row.spot_price)}</td>
-                        <td>${row.ltp.toFixed(2)}</td>
-                        <td class="table-change ${changeUp ? 'up' : 'down'}">
-                            ${changeUp ? '+' : ''}${row.change.toFixed(2)}
-                        </td>
-                        <td class="table-change ${changeUp ? 'up' : 'down'}">
-                            ${changeUp ? '+' : ''}${row.change_pct.toFixed(2)}%
-                        </td>
-                        <td class="table-secondary">${formatIndianNumber(row.oi)}</td>
-                        <td class="table-secondary">${formatIndianNumber(row.oi_change)}</td>
-                        <td class="table-secondary">${row.oi_change_pct.toFixed(2)}%</td>
-                        <td class="table-secondary">${formatIndianNumber(row.volume)}</td>
-                    </tr>
-                `;
-            }).join('');
-
-            attachHeaderClickListeners();
-        }
-
-        // Render stocks table
-        function renderStocksTable() {
-            const thead = document.getElementById('tableHead');
-            const tbody = document.getElementById('tableBody');
-
-            const data = state.showGainers ? state.stocksData.gainers : state.stocksData.losers;
-
-            thead.innerHTML = `
-                <tr>
-                    <th class="checkbox-cell"><input type="checkbox"></th>
-                    <th data-column="symbol">Name ${state.sortColumn === 'symbol' ? (state.sortDirection === 'asc' ? '▲' : '▼') : ''}</th>
-                    <th data-column="ltp">LTP ${state.sortColumn === 'ltp' ? (state.sortDirection === 'asc' ? '▲' : '▼') : ''}</th>
-                    <th data-column="change">Change ${state.sortColumn === 'change' ? (state.sortDirection === 'asc' ? '▲' : '▼') : ''}</th>
-                    <th data-column="change_pct">Change % ${state.sortColumn === 'change_pct' ? (state.sortDirection === 'asc' ? '▲' : '▼') : ''}</th>
-                    <th data-column="value">Value (Cr.) ${state.sortColumn === 'value' ? (state.sortDirection === 'asc' ? '▲' : '▼') : ''}</th>
-                    <th data-column="volume">Volume ${state.sortColumn === 'volume' ? (state.sortDirection === 'asc' ? '▲' : '▼') : ''}</th>
-                </tr>
-            `;
-
-            tbody.innerHTML = data.map(row => {
-                const changeUp = row.change >= 0;
-                return `
-                    <tr>
-                        <td class="checkbox-cell"><input type="checkbox"></td>
-                        <td class="table-name">${row.symbol}</td>
-                        <td>${row.ltp.toFixed(2)}</td>
-                        <td class="table-change ${changeUp ? 'up' : 'down'}">
-                            ${changeUp ? '+' : ''}${row.change.toFixed(2)}
-                        </td>
-                        <td class="table-change ${changeUp ? 'up' : 'down'}">
-                            ${changeUp ? '+' : ''}${row.change_pct.toFixed(2)}%
-                        </td>
-                        <td class="table-secondary">${(Math.random() * 5000).toFixed(2)}</td>
-                        <td class="table-secondary">${formatIndianNumber(row.volume)}</td>
-                    </tr>
-                `;
-            }).join('');
-
-            attachHeaderClickListeners();
-        }
-
-        // Render table based on current market
-        function renderTable() {
-            if (state.currentMarket === 'options') {
-                renderOptionsTable();
-            } else if (state.currentMarket === 'stocks') {
-                renderStocksTable();
-            }
-        }
-
-        // Attach click listeners to table headers
-        function attachHeaderClickListeners() {
-            document.querySelectorAll('th[data-column]').forEach(header => {
-                header.addEventListener('click', function() {
-                    const column = this.getAttribute('data-column');
-                    if (state.sortColumn === column) {
-                        state.sortDirection = state.sortDirection === 'asc' ? 'desc' : 'asc';
-                    } else {
-                        state.sortColumn = column;
-                        state.sortDirection = 'asc';
-                    }
-
-                    // Sort data
-                    const data = state.currentMarket === 'options' ? state.optionsData :
-                                 (state.showGainers ? state.stocksData.gainers : state.stocksData.losers);
-
-                    data.sort((a, b) => {
-                        let aVal = a[column];
-                        let bVal = b[column];
-                        if (typeof aVal === 'string') {
-                            aVal = aVal.toLowerCase();
-                            bVal = bVal.toLowerCase();
-                        }
-                        if (state.sortDirection === 'asc') {
-                            return aVal > bVal ? 1 : -1;
-                        } else {
-                            return aVal < bVal ? 1 : -1;
-                        }
-                    });
-
-                    renderTable();
-                });
             });
-        }
+        });
 
-        // Initialize
-        function init() {
-            initSidebar();
-            setupEventListeners();
-            fetchOptionsData();
-            setupAutoRefresh();
-        }
-
-        // Setup event listeners
-        function setupEventListeners() {
-            // Market navigation
-            document.querySelectorAll('.market-nav-item').forEach(item => {
-                item.addEventListener('click', function() {
-                    document.querySelectorAll('.market-nav-item').forEach(el => el.classList.remove('active'));
-                    this.classList.add('active');
-                    state.currentMarket = this.getAttribute('data-market');
-
-                    // Toggle filter bars
-                    document.getElementById('optionsFilterBar').classList.toggle('hidden', state.currentMarket !== 'options');
-                    document.getElementById('stocksFilterBar').classList.toggle('hidden', state.currentMarket !== 'stocks');
-
-                    if (state.currentMarket === 'options') {
-                        fetchOptionsData();
-                    } else if (state.currentMarket === 'stocks') {
-                        fetchStocksData();
-                    }
-                });
+        // Filter functionality
+        document.querySelectorAll('.filter-select').forEach(select => {
+            select.addEventListener('change', function() {
+                console.log('Filter changed:', this.className, 'Value:', this.value);
             });
+        });
 
-            // Options filter tabs
-            document.querySelectorAll('#optionsFilterBar .filter-tab').forEach(tab => {
-                tab.addEventListener('click', function() {
-                    document.querySelectorAll('#optionsFilterBar .filter-tab').forEach(el => el.classList.remove('active'));
-                    this.classList.add('active');
-                    state.currentCategory = this.getAttribute('data-category');
-                    state.sortColumn = null;
-                    fetchOptionsData();
-                });
+        // Sidebar tab switching
+        document.querySelectorAll('.sidebar-tab').forEach(tab => {
+            tab.addEventListener('click', function() {
+                document.querySelectorAll('.sidebar-tab').forEach(t => t.classList.remove('active'));
+                this.classList.add('active');
             });
+        });
 
-            // Stocks filter tabs
-            document.querySelectorAll('#stocksFilterBar .filter-tab').forEach(tab => {
-                tab.addEventListener('click', function() {
-                    document.querySelectorAll('#stocksFilterBar .filter-tab').forEach(el => el.classList.remove('active'));
-                    this.classList.add('active');
-                });
-            });
-
-            // Gainers/Losers toggle
-            document.getElementById('gainersBtn').addEventListener('click', function() {
-                state.showGainers = true;
-                document.getElementById('gainersBtn').classList.add('active');
-                document.getElementById('losersBtn').classList.remove('active');
-                renderStocksTable();
-            });
-
-            document.getElementById('losersBtn').addEventListener('click', function() {
-                state.showGainers = false;
-                document.getElementById('losersBtn').classList.add('active');
-                document.getElementById('gainersBtn').classList.remove('active');
-                renderStocksTable();
-            });
-
-            // Option Chain button
-            document.getElementById('optionChainBtn').addEventListener('click', function() {
-                window.open('/portal/options-chain', '_blank');
-            });
-        }
-
-        // Setup auto-refresh
-        function setupAutoRefresh() {
-            setInterval(() => {
-                if (state.currentMarket === 'options') {
-                    fetchOptionsData();
-                } else if (state.currentMarket === 'stocks') {
-                    fetchStocksData();
-                }
-            }, 10000);
-        }
-
-        // Start the app
-        init();
+        // Search functionality
+        document.querySelector('.search-bar').addEventListener('input', function(e) {
+            console.log('Search query:', e.target.value);
+        });
     </script>
 </body>
 </html>

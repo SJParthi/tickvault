@@ -12,9 +12,9 @@
         }
 
         body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            font-family: Inter, -apple-system, BlinkMacSystemFont, sans-serif;
             background: #000000;
-            color: #e8e8e8;
+            color: #8E8E8E;
             font-size: 14px;
             overflow: hidden;
         }
@@ -29,13 +29,14 @@
 
         /* Header Bar */
         .header {
-            background: #121212;
+            background: #000000;
             padding: 12px 16px;
             display: flex;
             align-items: center;
             justify-content: space-between;
             border-bottom: 1px solid #242424;
             flex-shrink: 0;
+            height: 50px;
         }
 
         .header-left {
@@ -68,7 +69,7 @@
         .header-name {
             font-size: 14px;
             font-weight: 600;
-            color: #e8e8e8;
+            color: #DADADA;
         }
 
         .header-price {
@@ -80,7 +81,7 @@
         .header-price-value {
             font-size: 16px;
             font-weight: 600;
-            color: #e8e8e8;
+            color: #DADADA;
         }
 
         .header-change {
@@ -89,7 +90,7 @@
             gap: 4px;
             font-size: 14px;
             font-weight: 500;
-            color: #5CA81D;
+            color: #05B878;
         }
 
         .header-change .arrow {
@@ -118,7 +119,7 @@
 
         .header-middle-item-value {
             font-size: 13px;
-            color: #e8e8e8;
+            color: #DADADA;
         }
 
         .header-right {
@@ -171,7 +172,7 @@
         .title-text {
             font-size: 18px;
             font-weight: 600;
-            color: #e8e8e8;
+            color: #DADADA;
         }
 
         .expiry-tabs {
@@ -180,19 +181,20 @@
         }
 
         .expiry-tab {
-            padding: 6px 12px;
-            border: none;
+            padding: 0px 8px;
+            border: 0.5px solid #242424;
             background: #242424;
-            color: #8E8E8E;
-            font-size: 12px;
+            color: #AAAAAA;
+            font-size: 14px;
             cursor: pointer;
-            border-radius: 12px;
+            border-radius: 4px;
             transition: all 0.2s;
         }
 
         .expiry-tab.active {
-            background: #E8590C;
-            color: white;
+            background: #242424;
+            color: #05B878;
+            border: 0.5px solid #05B878;
         }
 
         .next-expiry-btn {
@@ -237,7 +239,7 @@
 
         .icon-btn:hover {
             background: #242424;
-            color: #e8e8e8;
+            color: #DADADA;
         }
 
         /* Stats Row */
@@ -263,15 +265,14 @@
         }
 
         .stat-label {
-            font-size: 10px;
-            color: #666;
-            text-transform: uppercase;
+            font-size: 12px;
+            color: #8E8E8E;
         }
 
         .stat-value {
             font-size: 14px;
             font-weight: 500;
-            color: #e8e8e8;
+            color: #DADADA;
         }
 
         .stats-right {
@@ -329,7 +330,7 @@
 
         .dropdown-menu-item:hover {
             background: #242424;
-            color: #e8e8e8;
+            color: #DADADA;
         }
 
         /* Table Container */
@@ -359,49 +360,53 @@
 
         table {
             width: 100%;
-            border-collapse: collapse;
-            background: #000000;
+            border-collapse: separate;
+            border-spacing: 0;
+            table-layout: auto;
+            background: transparent;
         }
 
         thead {
             position: sticky;
             top: 0;
-            background: #121212;
+            background: #181818;
             z-index: 10;
         }
 
         th {
-            font-weight: 300;
-            font-size: 12px;
+            font-weight: 700;
+            font-size: 14px;
             color: #8E8E8E;
-            background: #121212;
-            padding: 12px 8px;
+            background: #181818;
+            height: 40px;
             border-bottom: 1px solid #242424;
             text-align: center;
         }
 
         th.header-ce {
-            background: #3d6b1e;
-            color: white;
+            background: #181818;
+            color: #8E8E8E;
         }
 
         th.header-pe {
-            background: #8b4049;
-            color: white;
+            background: #181818;
+            color: #8E8E8E;
         }
 
         th.header-strike {
-            background: #121212;
-            font-weight: 600;
+            background: #000000;
+            color: #8E8E8E;
+            font-weight: 700;
         }
 
         td {
-            padding: 12px 8px;
-            text-align: center;
-            border-bottom: 1px solid #1a1a1a;
-            font-size: 13px;
-            color: #e8e8e8;
-            height: 42px;
+            padding: 1px 9px 1px 10px;
+            text-align: right;
+            border-bottom: 0.5px solid #242424;
+            font-size: 14px;
+            font-weight: 400;
+            color: #8E8E8E;
+            height: 56px;
         }
 
         tr.atm-row td {
@@ -411,11 +416,13 @@
         }
 
         tr.itm-ce td.ce-cell {
-            background: rgba(238, 162, 14, 0.08);
+            background: rgba(238, 162, 14, 0.17);
+            color: #DADADA;
         }
 
         tr.itm-pe td.pe-cell {
-            background: rgba(141, 125, 240, 0.06);
+            background: rgba(141, 125, 240, 0.10);
+            color: #DADADA;
         }
 
         td.strike-cell {
@@ -425,6 +432,7 @@
             background: inherit;
             z-index: 5;
             border-right: 1px solid #242424;
+            text-align: center;
         }
 
         tr.atm-row td.strike-cell {
@@ -436,13 +444,13 @@
         }
 
         .ltp.atm {
-            background: #5CA81D;
+            background: #05B878;
             color: white;
             border-radius: 4px;
         }
 
         .change {
-            color: #5CA81D;
+            color: #05B878;
         }
 
         .change.negative {
@@ -466,7 +474,7 @@
 
         .spot-price-badge {
             display: inline-block;
-            background: #5CA81D;
+            background: #05B878;
             color: white;
             padding: 4px 8px;
             border-radius: 4px;
@@ -483,8 +491,8 @@
         }
 
         .buildup-long {
-            background: rgba(92, 168, 29, 0.15);
-            color: #5CA81D;
+            background: rgba(5, 184, 120, 0.15);
+            color: #05B878;
         }
 
         .buildup-short {
@@ -577,7 +585,7 @@
             width: 8px;
             height: 8px;
             border-radius: 50%;
-            background: #5CA81D;
+            background: #05B878;
         }
 
         .connection-indicator.disconnected {
@@ -585,8 +593,9 @@
         }
 
         .delta, .gamma, .theta, .vega, .iv {
-            font-family: 'Courier New', monospace;
-            font-size: 12px;
+            font-family: Inter, -apple-system, BlinkMacSystemFont, sans-serif;
+            font-size: 14px;
+            font-weight: 400;
         }
 
         .dim {
@@ -605,7 +614,7 @@
         }
 
         th.sortable:hover {
-            color: #e8e8e8;
+            color: #DADADA;
         }
 
         th.sortable::after {
@@ -629,7 +638,7 @@
         .dropdown-select {
             background-color: #1a1a1a;
             border: 1px solid #333;
-            color: #e8e8e8;
+            color: #8E8E8E;
             padding: 6px 28px 6px 10px;
             border-radius: 4px;
             font-size: 12px;
@@ -645,7 +654,7 @@
 
         .dropdown-select option {
             background-color: #1a1a1a;
-            color: #e8e8e8;
+            color: #8E8E8E;
         }
 
         /* Scrollbar styling */
@@ -681,13 +690,13 @@
         }
 
         .oi-bar.ce {
-            background: #5CA81D;
+            background: #05B878;
         }
 
         .oi-bar.pe {
             background: #DD6565;
         }
-    </style>
+        </style>
 </head>
 <body>
     <div class="container">
