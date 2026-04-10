@@ -12,7 +12,7 @@
 //!
 //! # Error Handling & Zero-Tick-Loss Guarantee
 //! On QuestDB failure, ticks are held in a bounded ring buffer
-//! (`TICK_BUFFER_CAPACITY` = 300K ticks). When the ring buffer fills,
+//! (`TICK_BUFFER_CAPACITY` = 600K ticks). When the ring buffer fills,
 //! overflow ticks spill to disk (`data/spill/ticks-YYYYMMDD.bin`).
 //! On recovery, ring buffer drains first, then disk spill.
 //! On graceful shutdown, remaining ticks flush to QuestDB or disk.
@@ -609,7 +609,7 @@ impl TickPersistenceWriter {
     #[rustfmt::skip]
     fn drain_disk_spill(&mut self) -> usize {
         if let Some(ref mut writer) = self.spill_writer && let Err(err) = writer.flush() {
-            warn!(?err, "BufWriter flush failed before drain — last ~111 ticks may be lost");
+            warn!(?err, "BufWriter flush failed before drain — last ~73 ticks may be lost (8KB buf / 112B per tick)");
         }
         self.spill_writer = None;
         let spill_path = match self.spill_path.take() { Some(p) => p, None => return 0 };
