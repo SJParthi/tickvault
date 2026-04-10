@@ -26,7 +26,9 @@ pub type SharedTopMoversSnapshot = Arc<RwLock<Option<TopMoversSnapshot>>>;
 // ---------------------------------------------------------------------------
 
 /// Initial capacity for the tracker HashMap.
-const TRACKER_MAP_INITIAL_CAPACITY: usize = 4096;
+/// Pre-sized for ~25,000 instruments to prevent mid-session HashMap resize.
+/// option_movers uses 30,000; this must match to avoid hot-path allocation.
+const TRACKER_MAP_INITIAL_CAPACITY: usize = 30000;
 
 /// Number of top entries to include in each snapshot list.
 const TOP_N: usize = 20;
