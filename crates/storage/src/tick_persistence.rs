@@ -3361,6 +3361,68 @@ mod tests {
         assert_eq!(writer.pending_count(), 0);
     }
 
+    /// flush_buffer_direct() bypasses the pending_count guard so that non-tick
+    /// writes (e.g., build_previous_close_row via buffer_mut()) get flushed
+    /// immediately instead of waiting for tick batch flush.
+    #[test]
+    fn test_flush_buffer_direct_bypasses_pending_count() {
+        let port = spawn_tcp_drain_server();
+
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+        assert_eq!(writer.pending_count(), 0, "no ticks pending");
+
+        // Write a previous_close row directly to buffer (simulates what
+        // tick_processor does for PrevClose packets).
+        build_previous_close_row(writer.buffer_mut(), 13, 2, 24300.5, 120000, 1_000_000_000)
+            .unwrap();
+        assert_eq!(
+            writer.pending_count(),
+            0,
+            "pending_count must NOT increment for non-tick writes"
+        );
+
+        // force_flush would return early here (pending_count == 0).
+        // flush_buffer_direct must actually flush.
+        let result = writer.flush_buffer_direct();
+        assert!(
+            result.is_ok(),
+            "flush_buffer_direct must flush even when pending_count == 0"
+        );
+
+        // Buffer should be empty after flush.
+        assert!(
+            writer.buffer_mut().is_empty(),
+            "buffer must be empty after flush_buffer_direct"
+        );
+    }
+
+    /// flush_buffer_direct() is a no-op when the buffer is truly empty.
+    #[test]
+    fn test_flush_buffer_direct_empty_is_noop() {
+        let port = spawn_tcp_drain_server();
+
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+        let result = writer.flush_buffer_direct();
+        assert!(
+            result.is_ok(),
+            "empty buffer flush_buffer_direct must be Ok"
+        );
+    }
+
     #[test]
     fn test_tick_persistence_writer_flush_if_needed_empty() {
         let port = spawn_tcp_drain_server();
