@@ -87,9 +87,12 @@ mod tests {
     fn empty_response_serialization() {
         let resp = TopMoversResponse {
             available: false,
-            gainers: Vec::new(),
-            losers: Vec::new(),
-            most_active: Vec::new(),
+            equity_gainers: Vec::new(),
+            equity_losers: Vec::new(),
+            equity_most_active: Vec::new(),
+            index_gainers: vec![],
+            index_losers: vec![],
+            index_most_active: vec![],
             total_tracked: 0,
         };
         let json = serde_json::to_string(&resp).unwrap();
@@ -109,9 +112,12 @@ mod tests {
         };
         let resp = TopMoversResponse {
             available: true,
-            gainers: vec![entry],
-            losers: Vec::new(),
-            most_active: vec![entry],
+            equity_gainers: vec![entry],
+            equity_losers: Vec::new(),
+            equity_most_active: vec![entry],
+            index_gainers: vec![],
+            index_losers: vec![],
+            index_most_active: vec![],
             total_tracked: 100,
         };
         let json = serde_json::to_string(&resp).unwrap();
@@ -167,7 +173,7 @@ mod tests {
     #[test]
     fn from_snapshot_conversion() {
         let snapshot = TopMoversSnapshot {
-            gainers: vec![MoverEntry {
+            equity_gainers: vec![MoverEntry {
                 security_id: 1,
                 exchange_segment_code: 2,
                 last_traded_price: 110.0,
@@ -175,8 +181,11 @@ mod tests {
                 change_pct: 10.0,
                 volume: 5000,
             }],
-            losers: vec![],
-            most_active: vec![],
+            equity_losers: vec![],
+            equity_most_active: vec![],
+            index_gainers: vec![],
+            index_losers: vec![],
+            index_most_active: vec![],
             total_tracked: 50,
         };
         let resp = TopMoversResponse::from(&snapshot);
@@ -250,9 +259,12 @@ mod tests {
     fn test_top_movers_response_debug_impl() {
         let resp = TopMoversResponse {
             available: true,
-            gainers: vec![],
-            losers: vec![],
-            most_active: vec![],
+            equity_gainers: vec![],
+            equity_losers: vec![],
+            equity_most_active: vec![],
+            index_gainers: vec![],
+            index_losers: vec![],
+            index_most_active: vec![],
             total_tracked: 42,
         };
         let debug = format!("{resp:?}");
@@ -269,7 +281,7 @@ mod tests {
         use std::sync::{Arc, RwLock};
 
         let snapshot_data = TopMoversSnapshot {
-            gainers: vec![
+            equity_gainers: vec![
                 MoverEntry {
                     security_id: 100,
                     exchange_segment_code: 1,
@@ -287,7 +299,7 @@ mod tests {
                     volume: 50_000,
                 },
             ],
-            losers: vec![MoverEntry {
+            equity_losers: vec![MoverEntry {
                 security_id: 300,
                 exchange_segment_code: 1,
                 last_traded_price: 100.0_f32,
@@ -295,7 +307,7 @@ mod tests {
                 change_pct: -3.1_f32,
                 volume: 75_000,
             }],
-            most_active: vec![MoverEntry {
+            equity_most_active: vec![MoverEntry {
                 security_id: 400,
                 exchange_segment_code: 2,
                 last_traded_price: 1000.0_f32,
@@ -303,6 +315,9 @@ mod tests {
                 change_pct: 1.0_f32,
                 volume: 500_000,
             }],
+            index_gainers: vec![],
+            index_losers: vec![],
+            index_most_active: vec![],
             total_tracked: 200,
         };
 
@@ -358,7 +373,7 @@ mod tests {
     fn response_serialization_round_trip_json_fields() {
         let resp = TopMoversResponse {
             available: true,
-            gainers: vec![MoverEntry {
+            equity_gainers: vec![MoverEntry {
                 security_id: 1,
                 exchange_segment_code: 2,
                 last_traded_price: 100.0_f32,
@@ -366,7 +381,7 @@ mod tests {
                 change_pct: 5.0_f32,
                 volume: 10000,
             }],
-            losers: vec![MoverEntry {
+            equity_losers: vec![MoverEntry {
                 security_id: 2,
                 exchange_segment_code: 1,
                 last_traded_price: 50.0_f32,
@@ -374,7 +389,7 @@ mod tests {
                 change_pct: -3.0_f32,
                 volume: 5000,
             }],
-            most_active: vec![MoverEntry {
+            equity_most_active: vec![MoverEntry {
                 security_id: 3,
                 exchange_segment_code: 2,
                 last_traded_price: 200.0_f32,
@@ -382,12 +397,15 @@ mod tests {
                 change_pct: 0.5_f32,
                 volume: 999999,
             }],
+            index_gainers: vec![],
+            index_losers: vec![],
+            index_most_active: vec![],
             total_tracked: 500,
         };
         let json = serde_json::to_string(&resp).unwrap();
-        assert!(json.contains("\"gainers\""));
-        assert!(json.contains("\"losers\""));
-        assert!(json.contains("\"most_active\""));
+        assert!(json.contains("\"equity_gainers\""));
+        assert!(json.contains("\"equity_losers\""));
+        assert!(json.contains("\"equity_most_active\""));
         assert!(json.contains("\"total_tracked\":500"));
         assert!(json.contains("\"change_pct\""));
         assert!(json.contains("\"volume\":999999"));
@@ -425,9 +443,12 @@ mod tests {
         };
 
         let snapshot = TopMoversSnapshot {
-            gainers: vec![gainer],
-            losers: vec![loser],
-            most_active: vec![active],
+            equity_gainers: vec![gainer],
+            equity_losers: vec![loser],
+            equity_most_active: vec![active],
+            index_gainers: vec![],
+            index_losers: vec![],
+            index_most_active: vec![],
             total_tracked: 999,
         };
 
@@ -457,9 +478,12 @@ mod tests {
     #[test]
     fn from_snapshot_conversion_empty_lists() {
         let snapshot = TopMoversSnapshot {
-            gainers: vec![],
-            losers: vec![],
-            most_active: vec![],
+            equity_gainers: vec![],
+            equity_losers: vec![],
+            equity_most_active: vec![],
+            index_gainers: vec![],
+            index_losers: vec![],
+            index_most_active: vec![],
             total_tracked: 0,
         };
 
@@ -485,9 +509,12 @@ mod tests {
             .collect();
 
         let snapshot = TopMoversSnapshot {
-            gainers: entries.clone(),
-            losers: entries[..2].to_vec(),
-            most_active: entries[..3].to_vec(),
+            equity_gainers: entries.clone(),
+            equity_losers: entries[..2].to_vec(),
+            equity_most_active: entries[..3].to_vec(),
+            index_gainers: vec![],
+            index_losers: vec![],
+            index_most_active: vec![],
             total_tracked: 500,
         };
 
@@ -505,9 +532,12 @@ mod tests {
     #[test]
     fn from_snapshot_always_sets_available_true() {
         let snapshot = TopMoversSnapshot {
-            gainers: vec![],
-            losers: vec![],
-            most_active: vec![],
+            equity_gainers: vec![],
+            equity_losers: vec![],
+            equity_most_active: vec![],
+            index_gainers: vec![],
+            index_losers: vec![],
+            index_most_active: vec![],
             total_tracked: 0,
         };
         let resp = TopMoversResponse::from(&snapshot);
@@ -521,8 +551,8 @@ mod tests {
     #[test]
     fn from_snapshot_preserves_negative_change_pct() {
         let snapshot = TopMoversSnapshot {
-            gainers: vec![],
-            losers: vec![MoverEntry {
+            equity_gainers: vec![],
+            equity_losers: vec![MoverEntry {
                 security_id: 99,
                 exchange_segment_code: 1,
                 last_traded_price: 45.0_f32,
@@ -530,7 +560,10 @@ mod tests {
                 change_pct: -15.75_f32,
                 volume: 200,
             }],
-            most_active: vec![],
+            equity_most_active: vec![],
+            index_gainers: vec![],
+            index_losers: vec![],
+            index_most_active: vec![],
             total_tracked: 1,
         };
         let resp = TopMoversResponse::from(&snapshot);
@@ -545,9 +578,12 @@ mod tests {
     #[test]
     fn from_snapshot_preserves_large_total_tracked() {
         let snapshot = TopMoversSnapshot {
-            gainers: vec![],
-            losers: vec![],
-            most_active: vec![],
+            equity_gainers: vec![],
+            equity_losers: vec![],
+            equity_most_active: vec![],
+            index_gainers: vec![],
+            index_losers: vec![],
+            index_most_active: vec![],
             total_tracked: usize::MAX,
         };
         let resp = TopMoversResponse::from(&snapshot);
@@ -569,9 +605,12 @@ mod tests {
             volume: 50_000,
         };
         let snapshot = TopMoversSnapshot {
-            gainers: vec![entry],
-            losers: vec![],
-            most_active: vec![],
+            equity_gainers: vec![entry],
+            equity_losers: vec![],
+            equity_most_active: vec![],
+            index_gainers: vec![],
+            index_losers: vec![],
+            index_most_active: vec![],
             total_tracked: 10,
         };
         let resp = TopMoversResponse::from(&snapshot);
@@ -579,6 +618,6 @@ mod tests {
         assert_eq!(resp.equity_gainers[0].security_id, 77);
         assert_eq!(resp.equity_gainers[0].volume, 50_000);
         // Original snapshot is still intact (not moved)
-        assert_eq!(snapshot.gainers[0].security_id, 77);
+        assert_eq!(snapshot.equity_gainers[0].security_id, 77);
     }
 }
