@@ -156,6 +156,13 @@ impl TopMoversTracker {
     /// O(1) — single HashMap lookup + one division.
     #[inline]
     pub fn update(&mut self, tick: &ParsedTick) {
+        // Stock movers = equities + indices ONLY. Reject derivatives (F&O, currency, commodity).
+        // Options/futures belong in option_movers, not stock_movers.
+        match tick.exchange_segment_code {
+            0 | 1 | 4 => {} // IDX_I=0, NSE_EQ=1, BSE_EQ=4
+            _ => return,    // NSE_FNO=2, NSE_CURRENCY=3, MCX_COMM=5, BSE_CURRENCY=7, BSE_FNO=8
+        }
+
         // Reject ticks with non-finite or non-positive LTP (NaN, Inf, 0, negative)
         if !tick.last_traded_price.is_finite() || tick.last_traded_price <= 0.0 {
             return;
