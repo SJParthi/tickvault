@@ -47,6 +47,10 @@ const INDEX_PREV_CLOSE_CACHE_DIR: &str = "data/instrument-cache";
 const INDEX_PREV_CLOSE_CACHE_PATH: &str = "data/instrument-cache/index-prev-close.json";
 const INDEX_PREV_CLOSE_CACHE_TMP: &str = "data/instrument-cache/index-prev-close.json.tmp";
 
+/// Movers persist window start: 09:15:00 IST = 33300 seconds of day.
+/// Movers snapshots only persisted during market hours [09:15, 15:30).
+const MOVERS_PERSIST_START_SECS_OF_DAY_IST: u32 = 33_300;
+
 // ---------------------------------------------------------------------------
 // O(1) Market Hours Persist Window
 // ---------------------------------------------------------------------------
@@ -289,7 +293,9 @@ fn persist_option_movers_snapshot(
                 // (Not available from registry — registry is static metadata.
                 //  Spot price requires live tick data. Use 0.0 for now;
                 //  the dashboard API enriches from QuestDB at query time.)
-                let spot_price = 0.0;
+                // Spot price not available from static registry — enriched at query time.
+                const SPOT_PRICE_NOT_AVAILABLE: f64 = 0.0;
+                let spot_price = SPOT_PRICE_NOT_AVAILABLE;
 
                 let _ = writer.append_option_mover(
                     ts_nanos,
@@ -310,8 +316,7 @@ fn persist_option_movers_snapshot(
                     f32_clean(entry.change_pct),
                     i64::from(entry.oi),
                     entry.oi_change,
-                    // DATA-INTEGRITY-EXEMPT: oi_change_pct is a derived calculation, not raw Dhan price
-                    f64::from(entry.oi_change_pct),
+                    f32_clean(entry.oi_change_pct),
                     i64::from(entry.volume),
                     entry.value,
                 );
@@ -1067,7 +1072,13 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
         }
 
         m_tick_duration.record(tick_start.elapsed().as_nanos() as f64);
-        m_wire_to_done.record(tick_start.elapsed().as_nanos() as f64);
+        // Wire-to-done: from WebSocket receive (received_at_nanos) to pipeline completion.
+        // Different from tick_duration which only measures processing time (tick_start).
+        let wire_elapsed_ns = chrono::Utc::now()
+            .timestamp_nanos_opt()
+            .unwrap_or(0)
+            .saturating_sub(received_at_nanos);
+        m_wire_to_done.record(wire_elapsed_ns.max(0) as f64);
 
         // PROOF: log day_close baseline coverage after 30 seconds.
         // Placed AFTER all match arms so it fires for both Tick AND TickWithDepth.
@@ -1175,8 +1186,8 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
             // since movers are a computed aggregate, not a raw tick.
             if last_movers_persist.elapsed().as_secs() >= 60 {
                 let persist_ist_secs = utc_nanos_to_ist_secs_of_day(received_at_nanos);
-                // 09:15:00 IST = 33300 secs of day, 15:30:00 IST = 55800 secs of day
-                let in_movers_window = (33_300..TICK_PERSIST_END_SECS_OF_DAY_IST)
+                let in_movers_window = (MOVERS_PERSIST_START_SECS_OF_DAY_IST
+                    ..TICK_PERSIST_END_SECS_OF_DAY_IST)
                     .contains(&persist_ist_secs)
                     && is_today_ist(
                         utc_nanos_to_ist_epoch_secs(received_at_nanos),

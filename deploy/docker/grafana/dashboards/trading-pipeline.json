@@ -580,28 +580,8 @@
       "collapsed": false,
       "gridPos": { "h": 1, "w": 24, "x": 0, "y": 57 },
       "id": 104,
-      "title": "Application Logs (Trading)",
+      "title": "Logs (CloudWatch — see AWS Console)",
       "type": "row"
-    },
-    {
-      "datasource": { "type": "loki", "uid": "loki" },
-      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 58 },
-      "id": 17,
-      "options": {
-        "dedupStrategy": "none",
-        "enableLogDetails": true,
-        "prettifyLogMessage": false,
-        "showCommonLabels": false,
-        "showLabels": false,
-        "showTime": true,
-        "sortOrder": "Descending",
-        "wrapLogMessage": true
-      },
-      "title": "Trading Pipeline Logs",
-      "type": "logs",
-      "targets": [
-        { "expr": "{container=\"dlt-application\"} |~ `(?i)(tick|pipeline|websocket|order|risk|mover|candle)`", "legendFormat": "", "refId": "A" }
-      ]
     }
   ],
   "schemaVersion": 39,
