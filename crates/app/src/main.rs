@@ -1309,11 +1309,43 @@ async fn main() -> Result<()> {
                     continue;
                 }
 
-                // Extract ATM security_id for 200-level BEFORE instruments_for_underlying is moved.
-                // O(1) EXEMPT: boot-time string parse
-                let atm_200_sid: Option<u32> = instruments_for_underlying
-                    .first()
-                    .and_then(|sub| sub.security_id.parse().ok());
+                // Extract ATM CE + ATM PE security_ids for 200-level depth.
+                // 200-level = 1 instrument per connection. We need BOTH CE and PE for full
+                // order book visibility. Dhan confirmed: must use ATM strikes (Ticket #5519522).
+                // O(1) EXEMPT: boot-time registry scan for ATM CE + PE
+                let (atm_ce_sid, atm_pe_sid) = {
+                    // Find ATM strike from the first instrument in the 20-level selection
+                    // (subscription planner already orders by ATM proximity).
+                    let atm_strike: Option<f64> = instruments_for_underlying
+                        .first()
+                        .and_then(|sub| sub.security_id.parse::<u32>().ok())
+                        .and_then(|sid| plan.registry.get(sid))
+                        .and_then(|r| r.strike_price);
+
+                    match atm_strike {
+                        Some(strike) => {
+                            // Find CE and PE at this strike for the nearest expiry
+                            let ce = plan.registry.iter().find(|r| {
+                                r.underlying_symbol == *underlying
+                                    && r.exchange_segment
+                                        == dhan_live_trader_common::types::ExchangeSegment::NseFno
+                                    && r.option_type
+                                        == Some(dhan_live_trader_common::types::OptionType::Call)
+                                    && r.strike_price.is_some_and(|sp| (sp - strike).abs() < 0.01)
+                            });
+                            let pe = plan.registry.iter().find(|r| {
+                                r.underlying_symbol == *underlying
+                                    && r.exchange_segment
+                                        == dhan_live_trader_common::types::ExchangeSegment::NseFno
+                                    && r.option_type
+                                        == Some(dhan_live_trader_common::types::OptionType::Put)
+                                    && r.strike_price.is_some_and(|sp| (sp - strike).abs() < 0.01)
+                            });
+                            (ce.map(|r| r.security_id), pe.map(|r| r.security_id))
+                        }
+                        None => (None, None),
+                    }
+                };
 
                 let depth_token = token_handle.clone();
                 let depth_client_id = ws_client_id.clone();
@@ -1548,18 +1580,28 @@ async fn main() -> Result<()> {
                     });
                 }
 
-                // 200-level: spawn 1 connection for the ATM CE of this underlying.
-                // Use the FIRST instrument from the 20-level selection (already ATM-ordered
-                // by the subscription planner). Dhan confirmed (Ticket #5519522): far OTM
-                // contracts get no depth data — must use ATM security_id.
-                if let Some(depth200_sid) = atm_200_sid {
+                // 200-level: spawn 2 connections per underlying (CE ATM + PE ATM).
+                // 200-level = 1 instrument per connection. Both sides needed for full order book.
+                // Dhan confirmed (Ticket #5519522): must use ATM security_id, far OTM gets no data.
+                // O(1) EXEMPT: begin — boot-time 200-level depth setup (max 2 spawns per underlying)
+                for (opt_label, opt_sid) in [("CE", atm_ce_sid), ("PE", atm_pe_sid)] {
+                    let Some(depth200_sid) = opt_sid else {
+                        warn!(
+                            underlying,
+                            option = opt_label,
+                            "200-level depth: no ATM {opt_label} found — skipping"
+                        );
+                        continue;
+                    };
+
                     let depth200_token = token_handle.clone();
                     let depth200_client_id = ws_client_id.clone();
                     let depth200_segment = dhan_live_trader_common::types::ExchangeSegment::NseFno;
-                    let depth200_label = format!("{underlying}-ATM");
+                    let depth200_label = format!("{underlying}-ATM-{opt_label}");
 
                     info!(
                         underlying,
+                        option = opt_label,
                         security_id = depth200_sid,
                         "spawning 200-level depth connection"
                     );
@@ -1659,7 +1701,7 @@ async fn main() -> Result<()> {
                             );
                         }
                     });
-                    // Telegram alert fires ONLY after first data frame received (not just subscription).
+                    // Telegram alert fires ONLY after first data frame received.
                     {
                         let notify_sender = notifier.clone();
                         tokio::spawn(async move {
@@ -1671,6 +1713,7 @@ async fn main() -> Result<()> {
                         });
                     }
                 }
+                // O(1) EXEMPT: end
             }
         }
     } else if config.subscription.enable_twenty_depth {
