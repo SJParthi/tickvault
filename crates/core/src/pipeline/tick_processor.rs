@@ -169,7 +169,9 @@ fn persist_stock_movers_snapshot(
         std::sync::Arc<dhan_live_trader_common::instrument_registry::InstrumentRegistry>,
     >,
 ) {
-    if snapshot.gainers.is_empty() && snapshot.losers.is_empty() && snapshot.most_active.is_empty()
+    if snapshot.equity_gainers.is_empty()
+        && snapshot.equity_losers.is_empty()
+        && snapshot.index_gainers.is_empty()
     {
         debug!(
             total_tracked = snapshot.total_tracked,
@@ -215,9 +217,12 @@ fn persist_stock_movers_snapshot(
             }
         };
 
-    persist_entries(writer, &snapshot.gainers, "GAINER");
-    persist_entries(writer, &snapshot.losers, "LOSER");
-    persist_entries(writer, &snapshot.most_active, "MOST_ACTIVE");
+    persist_entries(writer, &snapshot.equity_gainers, "EQUITY_GAINER");
+    persist_entries(writer, &snapshot.equity_losers, "EQUITY_LOSER");
+    persist_entries(writer, &snapshot.equity_most_active, "EQUITY_MOST_ACTIVE");
+    persist_entries(writer, &snapshot.index_gainers, "INDEX_GAINER");
+    persist_entries(writer, &snapshot.index_losers, "INDEX_LOSER");
+    persist_entries(writer, &snapshot.index_most_active, "INDEX_MOST_ACTIVE");
 
     // Best-effort flush
     let _ = writer.flush();

@@ -79,14 +79,18 @@ pub struct MoverEntry {
 // ---------------------------------------------------------------------------
 
 /// A point-in-time snapshot of top gainers, losers, and most active securities.
+/// Separated by segment: equities (NSE_EQ + BSE_EQ) and indices (IDX_I).
+/// Each sub-category has independent top-N rankings.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TopMoversSnapshot {
-    /// Top N gainers sorted by change_pct descending.
-    pub gainers: Vec<MoverEntry>,
-    /// Top N losers sorted by change_pct ascending.
-    pub losers: Vec<MoverEntry>,
-    /// Top N most active sorted by volume descending.
-    pub most_active: Vec<MoverEntry>,
+    // --- Equity rankings (NSE_EQ + BSE_EQ) ---
+    pub equity_gainers: Vec<MoverEntry>,
+    pub equity_losers: Vec<MoverEntry>,
+    pub equity_most_active: Vec<MoverEntry>,
+    // --- Index rankings (IDX_I) ---
+    pub index_gainers: Vec<MoverEntry>,
+    pub index_losers: Vec<MoverEntry>,
+    pub index_most_active: Vec<MoverEntry>,
     /// Total securities being tracked.
     pub total_tracked: usize,
 }
@@ -201,78 +205,102 @@ impl TopMoversTracker {
         }
     }
 
-    /// Computes a ranked snapshot of top gainers, losers, and most active.
+    /// Computes ranked snapshots split by segment: equities vs indices.
     ///
     /// # Performance
     /// O(N log N) where N is the number of tracked securities. Only call periodically.
+    // O(1) EXEMPT: cold path — runs every 5 seconds, not per tick
     pub fn compute_snapshot(&mut self) -> TopMoversSnapshot {
         let total_tracked = self.securities.len();
 
-        // Build entries from all tracked securities
-        let mut entries: Vec<MoverEntry> = self
-            .securities
-            .iter()
-            .filter(|(_, state)| state.change_pct.is_finite())
-            .map(|(&(security_id, segment_code), state)| {
-                let prev_close = self
-                    .prev_close_prices
-                    .get(&(security_id, segment_code))
-                    .copied()
-                    .unwrap_or(0.0);
-                MoverEntry {
-                    security_id,
-                    exchange_segment_code: state.exchange_segment_code,
-                    last_traded_price: state.last_traded_price,
-                    prev_close,
-                    change_pct: state.change_pct,
-                    volume: state.volume,
-                }
-            })
-            .collect();
+        // Build entries from all tracked securities, split by segment
+        let mut equity_entries: Vec<MoverEntry> = Vec::with_capacity(total_tracked);
+        let mut index_entries: Vec<MoverEntry> = Vec::with_capacity(100); // ~30 indices
 
-        // Gainers: sort by change_pct descending, take top N
-        entries.sort_unstable_by(|a, b| {
-            b.change_pct
-                .partial_cmp(&a.change_pct)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        let gainers: Vec<MoverEntry> = entries
-            .iter()
-            .filter(|e| e.change_pct > MIN_CHANGE_PCT_THRESHOLD)
-            .take(TOP_N)
-            .copied()
-            .collect();
+        for (&(security_id, segment_code), state) in &self.securities {
+            if !state.change_pct.is_finite() {
+                continue;
+            }
+            let prev_close = self
+                .prev_close_prices
+                .get(&(security_id, segment_code))
+                .copied()
+                .unwrap_or(0.0);
+            let entry = MoverEntry {
+                security_id,
+                exchange_segment_code: state.exchange_segment_code,
+                last_traded_price: state.last_traded_price,
+                prev_close,
+                change_pct: state.change_pct,
+                volume: state.volume,
+            };
+            match state.exchange_segment_code {
+                0 => index_entries.push(entry),      // IDX_I
+                1 | 4 => equity_entries.push(entry), // NSE_EQ, BSE_EQ
+                _ => {}                              // Should not happen (filtered in update)
+            }
+        }
 
-        // Losers: sort by change_pct ascending, take top N
-        entries.sort_unstable_by(|a, b| {
-            a.change_pct
-                .partial_cmp(&b.change_pct)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        let losers: Vec<MoverEntry> = entries
-            .iter()
-            .filter(|e| e.change_pct < -MIN_CHANGE_PCT_THRESHOLD)
-            .take(TOP_N)
-            .copied()
-            .collect();
+        // Helper: compute top-N gainers, losers, most_active from a mutable slice
+        fn compute_top_n(
+            entries: &mut Vec<MoverEntry>,
+            top_n: usize,
+            min_pct: f32,
+        ) -> (Vec<MoverEntry>, Vec<MoverEntry>, Vec<MoverEntry>) {
+            // Gainers: sort by change_pct descending
+            entries.sort_unstable_by(|a, b| {
+                b.change_pct
+                    .partial_cmp(&a.change_pct)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let gainers: Vec<MoverEntry> = entries
+                .iter()
+                .filter(|e| e.change_pct > min_pct)
+                .take(top_n)
+                .copied()
+                .collect();
 
-        // Most active: sort by volume descending, take top N
-        entries.sort_unstable_by(|a, b| b.volume.cmp(&a.volume));
-        let most_active: Vec<MoverEntry> = entries.iter().take(TOP_N).copied().collect();
+            // Losers: sort by change_pct ascending
+            entries.sort_unstable_by(|a, b| {
+                a.change_pct
+                    .partial_cmp(&b.change_pct)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let losers: Vec<MoverEntry> = entries
+                .iter()
+                .filter(|e| e.change_pct < -min_pct)
+                .take(top_n)
+                .copied()
+                .collect();
+
+            // Most active: sort by volume descending
+            entries.sort_unstable_by(|a, b| b.volume.cmp(&a.volume));
+            let most_active: Vec<MoverEntry> = entries.iter().take(top_n).copied().collect();
+
+            (gainers, losers, most_active)
+        }
+
+        let (equity_gainers, equity_losers, equity_most_active) =
+            compute_top_n(&mut equity_entries, TOP_N, MIN_CHANGE_PCT_THRESHOLD);
+        let (index_gainers, index_losers, index_most_active) =
+            compute_top_n(&mut index_entries, TOP_N, MIN_CHANGE_PCT_THRESHOLD);
 
         let snapshot = TopMoversSnapshot {
-            gainers,
-            losers,
-            most_active,
+            equity_gainers,
+            equity_losers,
+            equity_most_active,
+            index_gainers,
+            index_losers,
+            index_most_active,
             total_tracked,
         };
 
         debug!(
             total_tracked,
-            gainers = snapshot.gainers.len(),
-            losers = snapshot.losers.len(),
-            most_active = snapshot.most_active.len(),
-            "top movers snapshot computed"
+            eq_gainers = snapshot.equity_gainers.len(),
+            eq_losers = snapshot.equity_losers.len(),
+            idx_gainers = snapshot.index_gainers.len(),
+            "stock movers snapshot computed (equity + index separated)"
         );
 
         // O(1) EXEMPT: cold path (every 5s). Clone copies ~1KB (3 × 20 Copy entries).
@@ -354,8 +382,8 @@ mod tests {
         tracker.update(&make_tick(100, 2, 110.0, 100.0, 1000));
 
         let snapshot = tracker.compute_snapshot();
-        assert_eq!(snapshot.gainers.len(), 1);
-        let pct = snapshot.gainers[0].change_pct;
+        assert_eq!(snapshot.equity_gainers.len(), 1);
+        let pct = snapshot.equity_gainers[0].change_pct;
         assert!((pct - 10.0).abs() < 0.01, "expected ~10%, got {pct}");
     }
 
@@ -367,10 +395,10 @@ mod tests {
         tracker.update(&make_tick(3, 2, 110.0, 100.0, 300)); // +10%
 
         let snapshot = tracker.compute_snapshot();
-        assert_eq!(snapshot.gainers.len(), 3);
-        assert_eq!(snapshot.gainers[0].security_id, 2); // +20%
-        assert_eq!(snapshot.gainers[1].security_id, 3); // +10%
-        assert_eq!(snapshot.gainers[2].security_id, 1); // +5%
+        assert_eq!(snapshot.equity_gainers.len(), 3);
+        assert_eq!(snapshot.equity_gainers[0].security_id, 2); // +20%
+        assert_eq!(snapshot.equity_gainers[1].security_id, 3); // +10%
+        assert_eq!(snapshot.equity_gainers[2].security_id, 1); // +5%
     }
 
     #[test]
@@ -381,10 +409,10 @@ mod tests {
         tracker.update(&make_tick(3, 2, 90.0, 100.0, 300)); // -10%
 
         let snapshot = tracker.compute_snapshot();
-        assert_eq!(snapshot.losers.len(), 3);
-        assert_eq!(snapshot.losers[0].security_id, 2); // -20%
-        assert_eq!(snapshot.losers[1].security_id, 3); // -10%
-        assert_eq!(snapshot.losers[2].security_id, 1); // -5%
+        assert_eq!(snapshot.equity_losers.len(), 3);
+        assert_eq!(snapshot.equity_losers[0].security_id, 2); // -20%
+        assert_eq!(snapshot.equity_losers[1].security_id, 3); // -10%
+        assert_eq!(snapshot.equity_losers[2].security_id, 1); // -5%
     }
 
     #[test]
@@ -395,10 +423,10 @@ mod tests {
         tracker.update(&make_tick(3, 2, 100.0, 100.0, 1000));
 
         let snapshot = tracker.compute_snapshot();
-        assert_eq!(snapshot.most_active.len(), 3);
-        assert_eq!(snapshot.most_active[0].security_id, 2); // 5000
-        assert_eq!(snapshot.most_active[1].security_id, 3); // 1000
-        assert_eq!(snapshot.most_active[2].security_id, 1); // 500
+        assert_eq!(snapshot.equity_most_active.len(), 3);
+        assert_eq!(snapshot.equity_most_active[0].security_id, 2); // 5000
+        assert_eq!(snapshot.equity_most_active[1].security_id, 3); // 1000
+        assert_eq!(snapshot.equity_most_active[2].security_id, 1); // 500
     }
 
     #[test]
@@ -411,8 +439,8 @@ mod tests {
         }
 
         let snapshot = tracker.compute_snapshot();
-        assert!(snapshot.gainers.len() <= TOP_N);
-        assert!(snapshot.most_active.len() <= TOP_N);
+        assert!(snapshot.equity_gainers.len() <= TOP_N);
+        assert!(snapshot.equity_most_active.len() <= TOP_N);
     }
 
     #[test]
@@ -469,7 +497,7 @@ mod tests {
 
         assert_eq!(tracker.tracked_count(), 1); // Same security
         let snapshot = tracker.compute_snapshot();
-        let pct = snapshot.gainers[0].change_pct;
+        let pct = snapshot.equity_gainers[0].change_pct;
         assert!((pct - 20.0).abs() < 0.01, "should use latest price");
     }
 
@@ -481,15 +509,15 @@ mod tests {
 
         let snapshot = tracker.compute_snapshot();
         assert!(
-            snapshot.gainers.is_empty(),
+            snapshot.equity_gainers.is_empty(),
             "flat security should not be a gainer"
         );
         assert!(
-            snapshot.losers.is_empty(),
+            snapshot.equity_losers.is_empty(),
             "flat security should not be a loser"
         );
         assert_eq!(
-            snapshot.most_active.len(),
+            snapshot.equity_most_active.len(),
             1,
             "flat security still most active"
         );
@@ -538,9 +566,9 @@ mod tests {
     fn empty_snapshot_when_no_data() {
         let mut tracker = TopMoversTracker::new();
         let snapshot = tracker.compute_snapshot();
-        assert!(snapshot.gainers.is_empty());
-        assert!(snapshot.losers.is_empty());
-        assert!(snapshot.most_active.is_empty());
+        assert!(snapshot.equity_gainers.is_empty());
+        assert!(snapshot.equity_losers.is_empty());
+        assert!(snapshot.equity_most_active.is_empty());
         assert_eq!(snapshot.total_tracked, 0);
     }
 
@@ -551,8 +579,8 @@ mod tests {
         tracker.update(&make_tick(100, 2, 80.0, 100.0, 5000));
 
         let snapshot = tracker.compute_snapshot();
-        assert_eq!(snapshot.losers.len(), 1);
-        let pct = snapshot.losers[0].change_pct;
+        assert_eq!(snapshot.equity_losers.len(), 1);
+        let pct = snapshot.equity_losers[0].change_pct;
         assert!((pct - (-20.0)).abs() < 0.01);
     }
 
@@ -606,8 +634,8 @@ mod tests {
         assert_eq!(tracker2.tracked_count(), 0, "NaN LTP rejected by guard");
 
         let snapshot = tracker2.compute_snapshot();
-        assert!(snapshot.gainers.is_empty());
-        assert!(snapshot.losers.is_empty());
+        assert!(snapshot.equity_gainers.is_empty());
+        assert!(snapshot.equity_losers.is_empty());
     }
 
     // -----------------------------------------------------------------------
@@ -631,9 +659,9 @@ mod tests {
         );
 
         let snapshot = tracker.compute_snapshot();
-        assert_eq!(snapshot.gainers.len(), 1);
+        assert_eq!(snapshot.equity_gainers.len(), 1);
         // Should use the latest values
-        let entry = &snapshot.gainers[0];
+        let entry = &snapshot.equity_gainers[0];
         assert!((entry.change_pct - 20.0).abs() < 0.01);
         assert_eq!(entry.volume, 2000);
         assert!((entry.last_traded_price - 120.0).abs() < 0.01);
@@ -752,10 +780,10 @@ mod tests {
         tracker.update(&make_tick(6, 2, 100.0, 100.0, 6000)); // 0%
 
         let snapshot = tracker.compute_snapshot();
-        assert_eq!(snapshot.gainers.len(), 3, "3 gainers");
-        assert_eq!(snapshot.losers.len(), 2, "2 losers");
+        assert_eq!(snapshot.equity_gainers.len(), 3, "3 gainers");
+        assert_eq!(snapshot.equity_losers.len(), 2, "2 losers");
         assert_eq!(
-            snapshot.most_active.len(),
+            snapshot.equity_most_active.len(),
             6,
             "all 6 securities in most_active"
         );
@@ -772,11 +800,11 @@ mod tests {
         let mut tracker = TopMoversTracker::new();
         tracker.update(&make_tick(1, 2, 100.0, 100.0, 9999));
         let snapshot = tracker.compute_snapshot();
-        assert!(snapshot.gainers.is_empty());
-        assert!(snapshot.losers.is_empty());
-        assert_eq!(snapshot.most_active.len(), 1);
-        assert_eq!(snapshot.most_active[0].security_id, 1);
-        assert_eq!(snapshot.most_active[0].volume, 9999);
+        assert!(snapshot.equity_gainers.is_empty());
+        assert!(snapshot.equity_losers.is_empty());
+        assert_eq!(snapshot.equity_most_active.len(), 1);
+        assert_eq!(snapshot.equity_most_active[0].security_id, 1);
+        assert_eq!(snapshot.equity_most_active[0].volume, 9999);
     }
 
     #[test]
@@ -806,10 +834,16 @@ mod tests {
         assert_eq!(tracker.tracked_count(), 0, "NaN LTP rejected by guard");
 
         let snapshot = tracker.compute_snapshot();
-        assert!(snapshot.gainers.is_empty(), "NaN excluded from gainers");
-        assert!(snapshot.losers.is_empty(), "NaN excluded from losers");
         assert!(
-            snapshot.most_active.is_empty(),
+            snapshot.equity_gainers.is_empty(),
+            "NaN excluded from gainers"
+        );
+        assert!(
+            snapshot.equity_losers.is_empty(),
+            "NaN excluded from losers"
+        );
+        assert!(
+            snapshot.equity_most_active.is_empty(),
             "NaN excluded from most_active"
         );
     }
@@ -885,9 +919,9 @@ mod tests {
         let snapshot = tracker.compute_snapshot();
         let cloned = snapshot.clone();
         assert_eq!(snapshot.total_tracked, cloned.total_tracked);
-        assert_eq!(snapshot.gainers.len(), cloned.gainers.len());
-        assert_eq!(snapshot.losers.len(), cloned.losers.len());
-        assert_eq!(snapshot.most_active.len(), cloned.most_active.len());
+        assert_eq!(snapshot.equity_gainers.len(), cloned.gainers.len());
+        assert_eq!(snapshot.equity_losers.len(), cloned.losers.len());
+        assert_eq!(snapshot.equity_most_active.len(), cloned.most_active.len());
     }
 
     #[test]
@@ -898,7 +932,7 @@ mod tests {
         tracker.update(&make_tick(1, 2, 10001.1, 10000.0, 500));
         let snapshot = tracker.compute_snapshot();
         assert_eq!(
-            snapshot.gainers.len(),
+            snapshot.equity_gainers.len(),
             1,
             "change just above threshold should be a gainer"
         );
@@ -912,7 +946,7 @@ mod tests {
         tracker.update(&make_tick(1, 2, 100_009.0, 100_000.0, 500));
         let snapshot = tracker.compute_snapshot();
         assert!(
-            snapshot.gainers.is_empty(),
+            snapshot.equity_gainers.is_empty(),
             "change just below threshold should be excluded from gainers"
         );
     }
@@ -925,7 +959,7 @@ mod tests {
         tracker.update(&make_tick(1, 2, 9998.9, 10000.0, 500));
         let snapshot = tracker.compute_snapshot();
         assert_eq!(
-            snapshot.losers.len(),
+            snapshot.equity_losers.len(),
             1,
             "change just below neg threshold should be a loser"
         );
@@ -939,7 +973,7 @@ mod tests {
         tracker.update(&make_tick(1, 2, 99_991.0, 100_000.0, 500));
         let snapshot = tracker.compute_snapshot();
         assert!(
-            snapshot.losers.is_empty(),
+            snapshot.equity_losers.is_empty(),
             "change just above neg threshold should be excluded from losers"
         );
     }
@@ -980,8 +1014,8 @@ mod tests {
         tracker.update(&make_tick(1, 2, 110.0, 100.0, 0));
         assert_eq!(tracker.tracked_count(), 1);
         let snapshot = tracker.compute_snapshot();
-        assert_eq!(snapshot.most_active.len(), 1);
-        assert_eq!(snapshot.most_active[0].volume, 0);
+        assert_eq!(snapshot.equity_most_active.len(), 1);
+        assert_eq!(snapshot.equity_most_active[0].volume, 0);
     }
 
     #[test]
@@ -1036,7 +1070,7 @@ mod tests {
 
         let snapshot = tracker.compute_snapshot();
         assert!(
-            snapshot.gainers.is_empty(),
+            snapshot.equity_gainers.is_empty(),
             "inf LTP should not produce any entries"
         );
     }
@@ -1055,9 +1089,9 @@ mod tests {
             tracker.update(&make_tick(i, 2, ltp, 100.0, i * 100));
         }
         let snapshot = tracker.compute_snapshot();
-        assert!(snapshot.gainers.len() <= TOP_N);
-        assert!(snapshot.losers.len() <= TOP_N);
-        assert!(snapshot.most_active.len() <= TOP_N);
+        assert!(snapshot.equity_gainers.len() <= TOP_N);
+        assert!(snapshot.equity_losers.len() <= TOP_N);
+        assert!(snapshot.equity_most_active.len() <= TOP_N);
         assert_eq!(snapshot.total_tracked, 100);
     }
 
@@ -1101,8 +1135,8 @@ mod tests {
         assert_eq!(tracker.tracked_count(), 1);
         let snapshot = tracker.compute_snapshot();
         // Should have updated values from second tick
-        assert!((snapshot.gainers[0].last_traded_price - 210.0).abs() < 0.01);
-        assert_eq!(snapshot.gainers[0].volume, 6000);
+        assert!((snapshot.equity_gainers[0].last_traded_price - 210.0).abs() < 0.01);
+        assert_eq!(snapshot.equity_gainers[0].volume, 6000);
     }
 
     // -----------------------------------------------------------------------
@@ -1118,7 +1152,7 @@ mod tests {
         let snapshot = tracker.compute_snapshot();
         // 0.01 is NOT > 0.01, so excluded
         assert!(
-            snapshot.gainers.is_empty(),
+            snapshot.equity_gainers.is_empty(),
             "change_pct exactly at threshold should be excluded"
         );
     }
@@ -1131,7 +1165,7 @@ mod tests {
         let snapshot = tracker.compute_snapshot();
         // -0.01 is NOT < -0.01, so excluded
         assert!(
-            snapshot.losers.is_empty(),
+            snapshot.equity_losers.is_empty(),
             "change_pct exactly at neg threshold should be excluded"
         );
     }
@@ -1184,7 +1218,7 @@ mod tests {
             "should track via prev_close map"
         );
         let snapshot = tracker.compute_snapshot();
-        let pct = snapshot.gainers[0].change_pct;
+        let pct = snapshot.equity_gainers[0].change_pct;
         assert!(
             (pct - 10.0).abs() < 0.01,
             "expected ~10% from prev_close map, got {pct}"
@@ -1200,7 +1234,7 @@ mod tests {
         let tick = make_tick(100, 2, 220.0, 100.0, 1000);
         tracker.update(&tick);
         let snapshot = tracker.compute_snapshot();
-        let pct = snapshot.gainers[0].change_pct;
+        let pct = snapshot.equity_gainers[0].change_pct;
         // Should use prev_close map (200.0), not day_close (100.0)
         // (220 - 200) / 200 * 100 = 10%
         assert!(
@@ -1244,7 +1278,7 @@ mod tests {
         tracker.update(&tick);
         let snapshot = tracker.compute_snapshot();
         // (55 - 50) / 50 * 100 = 10%, NOT (55 - 500) / 500 * 100
-        let pct = snapshot.gainers[0].change_pct;
+        let pct = snapshot.equity_gainers[0].change_pct;
         assert!(
             (pct - 10.0).abs() < 0.01,
             "should use segment-specific prev_close, got {pct}"

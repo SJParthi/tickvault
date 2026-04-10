@@ -10,17 +10,19 @@ use serde::Serialize;
 use crate::state::SharedAppState;
 use dhan_live_trader_core::pipeline::top_movers::{MoverEntry, TopMoversSnapshot};
 
-/// Top movers API response.
+/// Top movers API response — separated by equity vs index.
 #[derive(Debug, Serialize)]
 pub struct TopMoversResponse {
     /// Whether a snapshot is available (false before first computation).
     pub available: bool,
-    /// Top gainers sorted by change_pct descending.
-    pub gainers: Vec<MoverEntry>,
-    /// Top losers sorted by change_pct ascending.
-    pub losers: Vec<MoverEntry>,
-    /// Most active by volume descending.
-    pub most_active: Vec<MoverEntry>,
+    // --- Equity rankings (NSE_EQ + BSE_EQ) ---
+    pub equity_gainers: Vec<MoverEntry>,
+    pub equity_losers: Vec<MoverEntry>,
+    pub equity_most_active: Vec<MoverEntry>,
+    // --- Index rankings (IDX_I) ---
+    pub index_gainers: Vec<MoverEntry>,
+    pub index_losers: Vec<MoverEntry>,
+    pub index_most_active: Vec<MoverEntry>,
     /// Total securities being tracked.
     pub total_tracked: usize,
 }
@@ -29,9 +31,12 @@ impl From<&TopMoversSnapshot> for TopMoversResponse {
     fn from(snapshot: &TopMoversSnapshot) -> Self {
         Self {
             available: true,
-            gainers: snapshot.gainers.clone(),
-            losers: snapshot.losers.clone(),
-            most_active: snapshot.most_active.clone(),
+            equity_gainers: snapshot.equity_gainers.clone(),
+            equity_losers: snapshot.equity_losers.clone(),
+            equity_most_active: snapshot.equity_most_active.clone(),
+            index_gainers: snapshot.index_gainers.clone(),
+            index_losers: snapshot.index_losers.clone(),
+            index_most_active: snapshot.index_most_active.clone(),
             total_tracked: snapshot.total_tracked,
         }
     }
@@ -46,17 +51,23 @@ pub async fn get_top_movers(State(state): State<SharedAppState>) -> Json<TopMove
             Some(snapshot) => TopMoversResponse::from(snapshot),
             None => TopMoversResponse {
                 available: false,
-                gainers: Vec::new(),
-                losers: Vec::new(),
-                most_active: Vec::new(),
+                equity_gainers: Vec::new(),
+                equity_losers: Vec::new(),
+                equity_most_active: Vec::new(),
+                index_gainers: Vec::new(),
+                index_losers: Vec::new(),
+                index_most_active: Vec::new(),
                 total_tracked: 0,
             },
         },
         Err(_) => TopMoversResponse {
             available: false,
-            gainers: Vec::new(),
-            losers: Vec::new(),
-            most_active: Vec::new(),
+            equity_gainers: Vec::new(),
+            equity_losers: Vec::new(),
+            equity_most_active: Vec::new(),
+            index_gainers: Vec::new(),
+            index_losers: Vec::new(),
+            index_most_active: Vec::new(),
             total_tracked: 0,
         },
     };
@@ -147,9 +158,9 @@ mod tests {
         );
         let Json(result) = get_top_movers(State(state)).await;
         assert!(!result.available);
-        assert!(result.gainers.is_empty());
-        assert!(result.losers.is_empty());
-        assert!(result.most_active.is_empty());
+        assert!(result.equity_gainers.is_empty());
+        assert!(result.equity_losers.is_empty());
+        assert!(result.equity_most_active.is_empty());
         assert_eq!(result.total_tracked, 0);
     }
 
@@ -170,7 +181,7 @@ mod tests {
         };
         let resp = TopMoversResponse::from(&snapshot);
         assert!(resp.available);
-        assert_eq!(resp.gainers.len(), 1);
+        assert_eq!(resp.equity_gainers.len(), 1);
         assert_eq!(resp.total_tracked, 50);
     }
 
@@ -227,7 +238,7 @@ mod tests {
 
         let Json(result) = get_top_movers(State(state)).await;
         assert!(!result.available);
-        assert!(result.gainers.is_empty());
+        assert!(result.equity_gainers.is_empty());
         assert_eq!(result.total_tracked, 0);
     }
 
@@ -331,12 +342,12 @@ mod tests {
 
         let Json(result) = get_top_movers(State(state)).await;
         assert!(result.available);
-        assert_eq!(result.gainers.len(), 2);
-        assert_eq!(result.losers.len(), 1);
-        assert_eq!(result.most_active.len(), 1);
+        assert_eq!(result.equity_gainers.len(), 2);
+        assert_eq!(result.equity_losers.len(), 1);
+        assert_eq!(result.equity_most_active.len(), 1);
         assert_eq!(result.total_tracked, 200);
-        assert_eq!(result.gainers[0].security_id, 100);
-        assert!((result.gainers[0].change_pct - 8.5_f32).abs() < f32::EPSILON);
+        assert_eq!(result.equity_gainers[0].security_id, 100);
+        assert!((result.equity_gainers[0].change_pct - 8.5_f32).abs() < f32::EPSILON);
     }
 
     // -------------------------------------------------------------------
@@ -425,22 +436,22 @@ mod tests {
         assert_eq!(resp.total_tracked, 999);
 
         // Gainers
-        assert_eq!(resp.gainers.len(), 1);
-        assert_eq!(resp.gainers[0].security_id, 10);
-        assert_eq!(resp.gainers[0].exchange_segment_code, 1);
-        assert!((resp.gainers[0].last_traded_price - 250.5_f32).abs() < f32::EPSILON);
-        assert!((resp.gainers[0].change_pct - 12.3_f32).abs() < f32::EPSILON);
-        assert_eq!(resp.gainers[0].volume, 100_000);
+        assert_eq!(resp.equity_gainers.len(), 1);
+        assert_eq!(resp.equity_gainers[0].security_id, 10);
+        assert_eq!(resp.equity_gainers[0].exchange_segment_code, 1);
+        assert!((resp.equity_gainers[0].last_traded_price - 250.5_f32).abs() < f32::EPSILON);
+        assert!((resp.equity_gainers[0].change_pct - 12.3_f32).abs() < f32::EPSILON);
+        assert_eq!(resp.equity_gainers[0].volume, 100_000);
 
         // Losers
-        assert_eq!(resp.losers.len(), 1);
-        assert_eq!(resp.losers[0].security_id, 20);
-        assert!((resp.losers[0].change_pct - (-7.5_f32)).abs() < f32::EPSILON);
+        assert_eq!(resp.equity_losers.len(), 1);
+        assert_eq!(resp.equity_losers[0].security_id, 20);
+        assert!((resp.equity_losers[0].change_pct - (-7.5_f32)).abs() < f32::EPSILON);
 
         // Most active
-        assert_eq!(resp.most_active.len(), 1);
-        assert_eq!(resp.most_active[0].security_id, 30);
-        assert_eq!(resp.most_active[0].volume, 1_000_000);
+        assert_eq!(resp.equity_most_active.len(), 1);
+        assert_eq!(resp.equity_most_active[0].security_id, 30);
+        assert_eq!(resp.equity_most_active[0].volume, 1_000_000);
     }
 
     #[test]
@@ -454,9 +465,9 @@ mod tests {
 
         let resp = TopMoversResponse::from(&snapshot);
         assert!(resp.available); // available is always true when converted from a snapshot
-        assert!(resp.gainers.is_empty());
-        assert!(resp.losers.is_empty());
-        assert!(resp.most_active.is_empty());
+        assert!(resp.equity_gainers.is_empty());
+        assert!(resp.equity_losers.is_empty());
+        assert!(resp.equity_most_active.is_empty());
         assert_eq!(resp.total_tracked, 0);
     }
 
@@ -481,9 +492,9 @@ mod tests {
         };
 
         let resp = TopMoversResponse::from(&snapshot);
-        assert_eq!(resp.gainers.len(), 5);
-        assert_eq!(resp.losers.len(), 2);
-        assert_eq!(resp.most_active.len(), 3);
+        assert_eq!(resp.equity_gainers.len(), 5);
+        assert_eq!(resp.equity_losers.len(), 2);
+        assert_eq!(resp.equity_most_active.len(), 3);
         assert_eq!(resp.total_tracked, 500);
     }
 
@@ -523,8 +534,8 @@ mod tests {
             total_tracked: 1,
         };
         let resp = TopMoversResponse::from(&snapshot);
-        assert_eq!(resp.losers.len(), 1);
-        assert!((resp.losers[0].change_pct - (-15.75_f32)).abs() < f32::EPSILON);
+        assert_eq!(resp.equity_losers.len(), 1);
+        assert!((resp.equity_losers[0].change_pct - (-15.75_f32)).abs() < f32::EPSILON);
     }
 
     // -------------------------------------------------------------------
@@ -565,8 +576,8 @@ mod tests {
         };
         let resp = TopMoversResponse::from(&snapshot);
         // Verify the response has its own copy
-        assert_eq!(resp.gainers[0].security_id, 77);
-        assert_eq!(resp.gainers[0].volume, 50_000);
+        assert_eq!(resp.equity_gainers[0].security_id, 77);
+        assert_eq!(resp.equity_gainers[0].volume, 50_000);
         // Original snapshot is still intact (not moved)
         assert_eq!(snapshot.gainers[0].security_id, 77);
     }
