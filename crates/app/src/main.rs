@@ -1316,15 +1316,17 @@ async fn main() -> Result<()> {
                 let (atm_ce_sid, atm_pe_sid) = {
                     // Find ATM strike from the first instrument in the 20-level selection
                     // (subscription planner already orders by ATM proximity).
-                    let atm_strike: Option<f64> = instruments_for_underlying
+                    // Get ATM strike AND expiry from the first instrument in 20-level selection.
+                    // Both are needed to find the exact CE/PE contract (prevents wrong-expiry match).
+                    let atm_info: Option<(f64, chrono::NaiveDate)> = instruments_for_underlying
                         .first()
                         .and_then(|sub| sub.security_id.parse::<u32>().ok())
                         .and_then(|sid| plan.registry.get(sid))
-                        .and_then(|r| r.strike_price);
+                        .and_then(|r| r.strike_price.zip(r.expiry_date));
 
-                    match atm_strike {
-                        Some(strike) => {
-                            // Find CE and PE at this strike for the nearest expiry
+                    match atm_info {
+                        Some((strike, expiry)) => {
+                            // Find CE and PE at this strike AND expiry (prevents wrong-expiry match)
                             let ce = plan.registry.iter().find(|r| {
                                 r.underlying_symbol == *underlying
                                     && r.exchange_segment
@@ -1332,6 +1334,7 @@ async fn main() -> Result<()> {
                                     && r.option_type
                                         == Some(dhan_live_trader_common::types::OptionType::Call)
                                     && r.strike_price.is_some_and(|sp| (sp - strike).abs() < 0.01)
+                                    && r.expiry_date == Some(expiry)
                             });
                             let pe = plan.registry.iter().find(|r| {
                                 r.underlying_symbol == *underlying
@@ -1340,6 +1343,7 @@ async fn main() -> Result<()> {
                                     && r.option_type
                                         == Some(dhan_live_trader_common::types::OptionType::Put)
                                     && r.strike_price.is_some_and(|sp| (sp - strike).abs() < 0.01)
+                                    && r.expiry_date == Some(expiry)
                             });
                             (ce.map(|r| r.security_id), pe.map(|r| r.security_id))
                         }

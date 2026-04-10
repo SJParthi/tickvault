@@ -617,10 +617,9 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                         "PrevClose burst complete — per-segment summary"
                     );
                     if prev_close_nse_eq == 0 && prev_close_nse_fno == 0 {
-                        warn!(
-                            "PrevClose: Dhan sent 0 packets for NSE_EQ and NSE_FNO — \
-                             movers will lack baseline for non-index instruments. \
-                             REST API fallback needed."
+                        info!(
+                            "PrevClose: Dhan sent 0 packets for NSE_EQ/NSE_FNO (expected). \
+                             Equity/F&O movers use day_close from Full ticks as baseline."
                         );
                     }
                 }
@@ -1008,13 +1007,29 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                 // Cache index prev_close to file for mid-day restart survival.
                 // Indices have day_close=0 in Full ticks, so PrevClose (code 6) is their
                 // ONLY source. File cache survives restarts — read back at boot.
-                // O(1) EXEMPT: cold path — runs once per index at subscription time.
+                // O(1) EXEMPT: cold path — runs once per index at subscription time (~28 calls).
                 if exchange_segment_code == 0 {
                     // IDX_I segment
                     index_prev_close_cache.insert(security_id, previous_close);
-                    // Best-effort file write (non-blocking — serialize + write in background)
+                    // Atomic file write: serialize → write to .tmp → rename.
+                    // Prevents partial/corrupt cache on crash or disk full.
+                    let cache_dir = "data/instrument-cache";
+                    let cache_path = "data/instrument-cache/index-prev-close.json";
+                    let tmp_path = "data/instrument-cache/index-prev-close.json.tmp";
                     if let Ok(json) = serde_json::to_string(&index_prev_close_cache) {
-                        let _ = std::fs::write("data/instrument-cache/index-prev-close.json", json);
+                        let _ = std::fs::create_dir_all(cache_dir);
+                        match std::fs::write(tmp_path, &json)
+                            .and_then(|()| std::fs::rename(tmp_path, cache_path))
+                        {
+                            Ok(()) => {}
+                            Err(err) => {
+                                warn!(
+                                    ?err,
+                                    security_id,
+                                    "failed to write index prev_close cache — mid-day restart may lose index baselines"
+                                );
+                            }
+                        }
                     }
                 }
 
