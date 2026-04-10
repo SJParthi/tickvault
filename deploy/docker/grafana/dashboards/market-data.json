@@ -645,7 +645,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT\n  segment,\n  security_id,\n  prev_close,\n  prev_oi,\n  to_str(ts, 'yyyy-MM-dd HH:mm:ss.SSS') AS time\nFROM previous_close\nWHERE ts > dateadd('d', -3, now())\nORDER BY security_id\nLIMIT 500;",
+          "rawSql": "SELECT\n  segment,\n  security_id,\n  prev_close,\n  prev_oi,\n  to_str(ts, 'yyyy-MM-dd HH:mm:ss.SSS') AS time\nFROM previous_close\nWHERE ts IN (SELECT max(ts) FROM previous_close)\nORDER BY security_id\nLIMIT 500;",
           "refId": "A"
         }
       ]

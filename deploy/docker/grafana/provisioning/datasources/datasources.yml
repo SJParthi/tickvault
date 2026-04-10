@@ -1,7 +1,9 @@
 # =============================================================================
 # dhan-live-trader — Grafana Datasource Provisioning
 # =============================================================================
-# Auto-configures Prometheus, Loki, and Jaeger on first boot.
+# Auto-configures Prometheus and QuestDB on first boot.
+# Loki + Jaeger REMOVED — saves 2.5GB RAM (per AWS budget).
+# CloudWatch Logs replaces distributed tracing/log aggregation.
 # =============================================================================
 
 apiVersion: 1
@@ -17,31 +19,6 @@ datasources:
     jsonData:
       timeInterval: "15s"
       httpMethod: POST
-
-  - name: Loki
-    uid: loki
-    type: loki
-    access: proxy
-    url: http://dlt-loki:3100
-    editable: false
-    jsonData:
-      maxLines: 1000
-      derivedFields:
-        - datasourceUid: jaeger
-          matcherRegex: "\"trace_id\":\"(\\w+)\""
-          name: TraceID
-          url: "$${__value.raw}"
-
-  - name: Jaeger
-    uid: jaeger
-    type: jaeger
-    access: proxy
-    url: http://dlt-jaeger:16686
-    editable: false
-    jsonData:
-      tracesToLogsV2:
-        datasourceUid: loki
-        filterByTraceID: true
 
   # QuestDB via PostgreSQL wire protocol (port 8812).
   # Credentials injected from docker-compose environment (sourced from AWS SSM).

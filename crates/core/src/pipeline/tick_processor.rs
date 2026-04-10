@@ -871,19 +871,13 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     movers.update_prev_close(security_id, exchange_segment_code, previous_close);
                 }
 
-                // PrevClose is reference data — persist ALWAYS regardless of market hours.
-                // These packets arrive on every subscription (typically at boot, before 09:00).
-                // Blocking them with is_within_persist_window() causes "No data" in Grafana.
-                // Stale-day check still applies to prevent cross-day pollution.
-                if !is_today_ist(
-                    utc_nanos_to_ist_epoch_secs(received_at_nanos),
-                    today_ist_day_number,
-                ) {
-                    stale_day_filtered = stale_day_filtered.saturating_add(1);
-                    m_stale_day.increment(1);
-                    continue;
-                }
-
+                // PrevClose is reference data — persist ALWAYS, no time guards.
+                // Unlike ticks (which have exchange_timestamp from LTT), PrevClose has
+                // NO exchange timestamp — only received_at (local clock). The stale-day
+                // and market-hours guards are designed for exchange timestamps and would
+                // incorrectly filter PrevClose packets. PrevClose arrives once per
+                // instrument at subscription time; QuestDB DEDUP handles duplicates.
+                //
                 // Persist previous close to QuestDB.
                 // Previous close packets arrive in a burst at subscription time (once per instrument).
                 // Force flush after each write to prevent data loss — these are reference data that

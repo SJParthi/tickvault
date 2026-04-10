@@ -149,27 +149,31 @@ pub fn compute_obi(
         non_empty_ask = non_empty_ask.saturating_add(1);
     }
 
-    // --- Simple OBI ---
+    // --- Simple OBI --- (round to 4dp: enough precision for -1..+1 range)
     let total = total_bid_qty.saturating_add(total_ask_qty);
     let obi = if total == 0 {
         0.0
     } else {
-        (total_bid_qty as f64 - total_ask_qty as f64) / total as f64
+        let raw = (total_bid_qty as f64 - total_ask_qty as f64) / total as f64;
+        (raw * 10000.0).round() / 10000.0
     };
 
-    // --- Weighted OBI ---
+    // --- Weighted OBI --- (round to 4dp)
     let weighted_total = weighted_bid + weighted_ask;
     let weighted_obi = if weighted_total <= 0.0 || !weighted_total.is_finite() {
         0.0
     } else {
-        (weighted_bid - weighted_ask) / weighted_total
+        let raw = (weighted_bid - weighted_ask) / weighted_total;
+        (raw * 10000.0).round() / 10000.0
     };
 
-    // --- Wall detection ---
-    let (max_bid_wall_price, max_bid_wall_qty) = detect_wall(bid_levels, bid_count);
-    let (max_ask_wall_price, max_ask_wall_qty) = detect_wall(ask_levels, ask_count);
+    // --- Wall detection --- (prices already f64 from Dhan, round to 2dp)
+    let (raw_bid_wall_price, max_bid_wall_qty) = detect_wall(bid_levels, bid_count);
+    let (raw_ask_wall_price, max_ask_wall_qty) = detect_wall(ask_levels, ask_count);
+    let max_bid_wall_price = (raw_bid_wall_price * 100.0).round() / 100.0;
+    let max_ask_wall_price = (raw_ask_wall_price * 100.0).round() / 100.0;
 
-    // --- Spread ---
+    // --- Spread --- (rounded to 2dp inside compute_spread)
     let spread = compute_spread(bid_levels, bid_count, ask_levels, ask_count);
 
     ObiSnapshot {
@@ -259,7 +263,13 @@ fn compute_spread(
     match (best_bid, best_ask) {
         (Some(bid), Some(ask)) => {
             let s = ask - bid;
-            if s.is_finite() { s } else { 0.0 }
+            // Round to 2dp to prevent f64 arithmetic artifacts
+            // (e.g., 2732.3500000000004 → 2732.35).
+            if s.is_finite() {
+                (s * 100.0).round() / 100.0
+            } else {
+                0.0
+            }
         }
         _ => 0.0,
     }

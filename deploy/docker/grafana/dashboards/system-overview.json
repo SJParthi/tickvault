@@ -115,63 +115,6 @@
         "overrides": []
       },
       "gridPos": { "h": 4, "w": 3, "x": 12, "y": 1 },
-      "id": 5,
-      "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
-      "title": "Jaeger",
-      "type": "stat",
-      "targets": [{ "expr": "up{job=\"dlt-jaeger\"}", "legendFormat": "", "refId": "A" }]
-    },
-    {
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "fieldConfig": {
-        "defaults": {
-          "color": { "mode": "thresholds" },
-          "mappings": [
-            { "options": { "0": { "color": "red", "text": "DOWN" }, "1": { "color": "green", "text": "UP" } }, "type": "value" }
-          ],
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] }
-        },
-        "overrides": []
-      },
-      "gridPos": { "h": 4, "w": 3, "x": 15, "y": 1 },
-      "id": 6,
-      "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
-      "title": "Loki",
-      "type": "stat",
-      "targets": [{ "expr": "up{job=\"dlt-loki\"}", "legendFormat": "", "refId": "A" }]
-    },
-    {
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "fieldConfig": {
-        "defaults": {
-          "color": { "mode": "thresholds" },
-          "mappings": [
-            { "options": { "0": { "color": "red", "text": "DOWN" }, "1": { "color": "green", "text": "UP" } }, "type": "value" }
-          ],
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] }
-        },
-        "overrides": []
-      },
-      "gridPos": { "h": 4, "w": 3, "x": 18, "y": 1 },
-      "id": 7,
-      "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
-      "title": "Alloy",
-      "type": "stat",
-      "targets": [{ "expr": "up{job=\"dlt-alloy\"}", "legendFormat": "", "refId": "A" }]
-    },
-    {
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "fieldConfig": {
-        "defaults": {
-          "color": { "mode": "thresholds" },
-          "mappings": [
-            { "options": { "0": { "color": "red", "text": "DOWN" }, "1": { "color": "green", "text": "UP" } }, "type": "value" }
-          ],
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] }
-        },
-        "overrides": []
-      },
-      "gridPos": { "h": 4, "w": 3, "x": 21, "y": 1 },
       "id": 8,
       "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "title": "Valkey",
@@ -402,26 +345,6 @@
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
-          "custom": { "axisBorderShow": false, "axisCenteredZero": false, "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "never", "stacking": { "mode": "none" } },
-          "unit": "bytes"
-        },
-        "overrides": []
-      },
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 32 },
-      "id": 22,
-      "options": { "legend": { "calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
-      "title": "Loki Ingestion",
-      "type": "timeseries",
-      "targets": [
-        { "expr": "rate(loki_distributor_bytes_received_total[5m])", "legendFormat": "bytes/sec (distributor)", "refId": "A" },
-        { "expr": "rate(loki_request_duration_seconds_count{route=\"loki_api_v1_push\"}[5m])", "legendFormat": "push requests/sec", "refId": "B" }
-      ]
-    },
-    {
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "fieldConfig": {
-        "defaults": {
-          "color": { "mode": "palette-classic" },
           "custom": { "axisBorderShow": false, "axisCenteredZero": false, "drawStyle": "bars", "fillOpacity": 80, "lineWidth": 1, "showPoints": "never", "stacking": { "mode": "normal" } },
           "unit": "short",
           "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }] }
@@ -442,26 +365,8 @@
       "collapsed": false,
       "gridPos": { "h": 1, "w": 24, "x": 0, "y": 48 },
       "id": 103,
-      "title": "Logs",
+      "title": "Logs (CloudWatch — see AWS Console)",
       "type": "row"
-    },
-    {
-      "datasource": { "type": "loki", "uid": "loki" },
-      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 49 },
-      "id": 30,
-      "options": {
-        "dedupStrategy": "none",
-        "enableLogDetails": true,
-        "prettifyLogMessage": false,
-        "showCommonLabels": false,
-        "showLabels": false,
-        "showTime": true,
-        "sortOrder": "Descending",
-        "wrapLogMessage": false
-      },
-      "title": "Application Logs (dlt-app)",
-      "type": "logs",
-      "targets": [{ "expr": "{container=\"dlt-app\"} |= ``", "legendFormat": "", "refId": "A" }]
     }
   ],
   "schemaVersion": 39,

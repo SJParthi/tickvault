@@ -56,13 +56,9 @@ scrape_configs:
         labels:
           service: "traefik"
 
-  # Loki metrics
-  - job_name: "dlt-loki"
-    static_configs:
-      - targets: ["dlt-loki:3100"]
-        labels:
-          service: "loki"
-    metrics_path: "/metrics"
+  # Loki REMOVED — saves RAM (per AWS budget). CloudWatch Logs replaces.
+  # Alloy REMOVED — log collector not needed without Loki.
+  # Jaeger REMOVED — distributed tracing disabled. CloudWatch Logs replaces.
 
   # Grafana metrics
   - job_name: "dlt-grafana"
@@ -70,24 +66,6 @@ scrape_configs:
       - targets: ["dlt-grafana:3000"]
         labels:
           service: "grafana"
-    metrics_path: "/metrics"
-
-  # Alloy metrics (log collector)
-  # Alloy v1.8+ exposes Prometheus metrics at /metrics on the
-  # --server.http.listen-addr port (12345). Same port as the UI.
-  - job_name: "dlt-alloy"
-    static_configs:
-      - targets: ["dlt-alloy:12345"]
-        labels:
-          service: "alloy"
-    metrics_path: "/metrics"
-
-  # Jaeger metrics (OTEL Collector internal telemetry)
-  - job_name: "dlt-jaeger"
-    static_configs:
-      - targets: ["dlt-jaeger:8888"]
-        labels:
-          service: "jaeger"
     metrics_path: "/metrics"
 
   # Valkey metrics (via redis_exporter sidecar on :9121)
