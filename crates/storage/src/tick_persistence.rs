@@ -29,8 +29,8 @@ use tracing::{debug, error, info, warn};
 
 use dhan_live_trader_common::config::QuestDbConfig;
 use dhan_live_trader_common::constants::{
-    DEPTH_BUFFER_CAPACITY, DEPTH_FLUSH_BATCH_SIZE, IST_UTC_OFFSET_NANOS,
-    QUESTDB_TABLE_MARKET_DEPTH, QUESTDB_TABLE_PREVIOUS_CLOSE, QUESTDB_TABLE_TICKS,
+    DEPTH_BUFFER_CAPACITY, DEPTH_FLUSH_BATCH_SIZE, IST_UTC_OFFSET_NANOS, IST_UTC_OFFSET_SECONDS,
+    QUESTDB_TABLE_MARKET_DEPTH, QUESTDB_TABLE_PREVIOUS_CLOSE, QUESTDB_TABLE_TICKS, SECONDS_PER_DAY,
     TICK_BUFFER_CAPACITY, TICK_BUFFER_HIGH_WATERMARK, TICK_FLUSH_BATCH_SIZE,
     TICK_FLUSH_INTERVAL_MS, TICK_SPILL_MIN_DISK_SPACE_BYTES,
 };
@@ -1926,8 +1926,12 @@ fn build_depth_rows(
 /// Writes a previous close record to the `previous_close` table.
 ///
 /// Called once per security when a code 6 packet arrives (typically at session start).
-/// Uses `received_at` as designated timestamp since Dhan doesn't send a timestamp
-/// in this packet type. Shifted to IST-as-UTC for consistency with all other tables.
+///
+/// **Dedup guarantee:** The designated timestamp (`ts`) is set to **midnight IST** of
+/// the current date (not `received_at`). This ensures the DEDUP UPSERT KEY
+/// `(ts, security_id, segment)` produces identical keys across app restarts on the
+/// same day. Multiple restarts = same `ts` = QuestDB deduplicates automatically.
+/// `received_at` is kept as a separate column for debugging (shows actual receive time).
 ///
 /// Price field uses `f32_to_f64_clean` to preserve Dhan f32 precision.
 pub fn build_previous_close_row(
@@ -1938,9 +1942,19 @@ pub fn build_previous_close_row(
     previous_oi: u32,
     received_at_nanos: i64,
 ) -> Result<()> {
-    // UTC nanos → IST-as-UTC: add IST offset so QuestDB shows IST wall-clock time.
+    // received_at: actual receive time (UTC → IST-as-UTC for display).
     let received_nanos =
         TimestampNanos::new(received_at_nanos.saturating_add(IST_UTC_OFFSET_NANOS));
+
+    // ts (designated timestamp): midnight IST today.
+    // This makes the DEDUP key deterministic across restarts on the same day.
+    // Same security_id + segment + midnight = same row, deduped by QuestDB.
+    let ist_secs = received_at_nanos
+        .saturating_div(1_000_000_000)
+        .saturating_add(i64::from(IST_UTC_OFFSET_SECONDS));
+    #[allow(clippy::arithmetic_side_effects)] // APPROVED: modulo by 86400 is safe
+    let midnight_ist_secs = ist_secs - (ist_secs % i64::from(SECONDS_PER_DAY));
+    let midnight_nanos = TimestampNanos::new(midnight_ist_secs.saturating_mul(1_000_000_000));
 
     buffer
         .table(QUESTDB_TABLE_PREVIOUS_CLOSE)
@@ -1955,7 +1969,7 @@ pub fn build_previous_close_row(
         .context("prev_close oi")?
         .column_ts("received_at", received_nanos)
         .context("prev_close received_at")?
-        .at(received_nanos)
+        .at(midnight_nanos)
         .context("prev_close designated timestamp")?;
 
     Ok(())
@@ -4506,18 +4520,32 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_build_previous_close_row_received_at_includes_ist_offset() {
+    fn test_build_previous_close_row_ts_is_midnight_ist_for_dedup() {
         let mut buf = Buffer::new(ProtocolVersion::V1);
+        // 2026-03-08 00:00:00 UTC in nanos
         let received_at_utc_nanos: i64 = 1_773_100_800_000_000_000;
         build_previous_close_row(&mut buf, 13, 2, 24300.5, 120000, received_at_utc_nanos).unwrap();
 
         let content = String::from_utf8_lossy(buf.as_bytes());
-        // The designated timestamp should be received_at + IST offset
-        let expected_nanos = received_at_utc_nanos + IST_UTC_OFFSET_NANOS;
-        let expected_ts = format!("{expected_nanos}\n");
+
+        // ts (designated timestamp) must be midnight IST (not received_at).
+        // This guarantees DEDUP across app restarts on the same day.
+        // IST = UTC + 19800s. Midnight IST = floor to day boundary in IST.
+        let ist_secs = received_at_utc_nanos / 1_000_000_000 + i64::from(IST_UTC_OFFSET_SECONDS);
+        let midnight_ist_secs = ist_secs - (ist_secs % i64::from(SECONDS_PER_DAY));
+        let expected_ts_nanos = midnight_ist_secs * 1_000_000_000;
+        let expected_ts = format!("{expected_ts_nanos}\n");
         assert!(
             content.ends_with(&expected_ts),
-            "previous_close designated timestamp must include IST offset. Got: {content}"
+            "previous_close ts must be midnight IST for dedup guarantee. Got: {content}"
+        );
+
+        // received_at column must still contain the actual receive time (with IST offset).
+        // ILP column_ts writes MICROSECONDS (not nanos), so divide by 1000.
+        let expected_received_micros = (received_at_utc_nanos + IST_UTC_OFFSET_NANOS) / 1000;
+        assert!(
+            content.contains(&format!("{expected_received_micros}t")),
+            "previous_close received_at must contain actual receive time. Got: {content}"
         );
     }
 
