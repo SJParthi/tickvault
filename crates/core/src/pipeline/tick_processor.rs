@@ -496,6 +496,44 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
     let mut movers_persist_count: u64 = 0;
     let m_movers_persisted = counter!("dlt_movers_snapshots_persisted_total");
 
+    // Index prev_close file cache — survives mid-day restarts.
+    // On boot, read cached values and pre-populate movers.
+    // O(1) EXEMPT: begin — boot-time file read + HashMap for ~28 indices
+    let mut index_prev_close_cache: std::collections::HashMap<u32, f32> = {
+        let path = "data/instrument-cache/index-prev-close.json";
+        match std::fs::read_to_string(path) {
+            Ok(json) => {
+                match serde_json::from_str::<std::collections::HashMap<u32, f32>>(&json) {
+                    Ok(cached) => {
+                        // Pre-populate movers with cached index prev_close
+                        for (&sid, &pc) in &cached {
+                            if let Some(ref mut movers) = top_movers {
+                                movers.update_prev_close(sid, 0, pc); // 0 = IDX_I
+                            }
+                        }
+                        info!(
+                            cached_indices = cached.len(),
+                            "index prev_close loaded from file cache (mid-day restart recovery)"
+                        );
+                        cached
+                    }
+                    Err(err) => {
+                        warn!(
+                            ?err,
+                            "failed to parse index prev_close cache — starting fresh"
+                        );
+                        std::collections::HashMap::with_capacity(50)
+                    }
+                }
+            }
+            Err(_) => {
+                debug!("no index prev_close cache found — first boot of the day");
+                std::collections::HashMap::with_capacity(50)
+            }
+        }
+    };
+    // O(1) EXEMPT: end
+
     // PrevClose diagnostic counters — per-segment tracking + summary log.
     // Helps confirm exactly how many PrevClose packets Dhan sends per segment.
     let mut prev_close_idx_i: u64 = 0;
@@ -967,9 +1005,18 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     movers.update_prev_close(security_id, exchange_segment_code, previous_close);
                 }
 
-                // No separate previous_close table — day_close from Full packet ticks
-                // provides previous close for ALL instruments (Dhan Ticket #5525125).
-                // PrevClose code-6 packets only update in-memory movers (above).
+                // Cache index prev_close to file for mid-day restart survival.
+                // Indices have day_close=0 in Full ticks, so PrevClose (code 6) is their
+                // ONLY source. File cache survives restarts — read back at boot.
+                // O(1) EXEMPT: cold path — runs once per index at subscription time.
+                if exchange_segment_code == 0 {
+                    // IDX_I segment
+                    index_prev_close_cache.insert(security_id, previous_close);
+                    // Best-effort file write (non-blocking — serialize + write in background)
+                    if let Ok(json) = serde_json::to_string(&index_prev_close_cache) {
+                        let _ = std::fs::write("data/instrument-cache/index-prev-close.json", json);
+                    }
+                }
 
                 debug!(
                     security_id,
