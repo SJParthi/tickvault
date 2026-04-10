@@ -2,7 +2,7 @@
 //!
 //! Separate connections from the Live Market Feed. Connect to:
 //! - 20-level: `wss://depth-api-feed.dhan.co/twentydepth`
-//! - 200-level: `wss://full-depth-api.dhan.co/` (matches DhanHQ Python SDK)
+//! - 200-level: `wss://full-depth-api.dhan.co/twohundreddepth` (confirmed by Dhan Ticket #5519522)
 //!
 //! Frames are sent to the same `mpsc::Sender<Bytes>` channel as the main feed,
 //! so the tick processor handles dispatch via `dispatch_deep_depth_frame()`.
@@ -350,7 +350,7 @@ async fn connect_and_run_depth(
 
 /// Runs a 200-level depth WebSocket connection for a SINGLE instrument.
 ///
-/// Connects to `wss://full-depth-api.dhan.co/` (matches DhanHQ Python SDK).
+/// Connects to `wss://full-depth-api.dhan.co/twohundreddepth` (Dhan Ticket #5519522).
 /// Only 1 instrument per connection (Dhan limitation).
 /// Infinite reconnection with exponential backoff.
 // TEST-EXEMPT: Integration-level — requires live Dhan WebSocket endpoint
@@ -453,11 +453,10 @@ async fn connect_and_run_200_depth(
     }
 
     let access_token = token_state.access_token().expose_secret().to_string();
-    // 200-level URL: root path with trailing slash (matches DhanHQ Python SDK exactly).
-    // Base URL already ends with "/" so query string appends directly.
+    // 200-level URL: /twohundreddepth path confirmed by Dhan support (Ticket #5519522).
     let base = DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL.trim_end_matches('/');
     let authenticated_url = zeroize::Zeroizing::new(format!(
-        "{base}/?token={access_token}&clientId={client_id}&authType={WEBSOCKET_AUTH_TYPE}",
+        "{base}?token={access_token}&clientId={client_id}&authType={WEBSOCKET_AUTH_TYPE}",
     ));
 
     let request = authenticated_url
@@ -695,10 +694,10 @@ mod tests {
 
     #[test]
     fn test_two_hundred_depth_ws_url_correct() {
-        // DhanHQ Python SDK uses root path (ground truth for production)
+        // Dhan support confirmed /twohundreddepth path (Ticket #5519522, 2026-04-10)
         assert_eq!(
             DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL,
-            "wss://full-depth-api.dhan.co/"
+            "wss://full-depth-api.dhan.co/twohundreddepth"
         );
     }
 
@@ -856,18 +855,18 @@ mod tests {
     }
 
     #[test]
-    fn test_two_hundred_depth_url_uses_root_path_with_trailing_slash() {
-        // DhanHQ Python SDK: wss://full-depth-api.dhan.co/?token=...
-        // Official docs say /twohundreddepth but SDK is ground truth.
+    fn test_two_hundred_depth_url_uses_twohundreddepth_path() {
+        // Dhan support confirmed /twohundreddepth (Ticket #5519522, 2026-04-10).
+        // Root path / caused ResetWithoutClosingHandshake.
         let base = DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL.trim_end_matches('/');
-        let url = format!("{base}/?token=TEST&clientId=TEST&authType=2",);
+        let url = format!("{base}?token=TEST&clientId=TEST&authType=2",);
         assert!(
-            url.contains("full-depth-api.dhan.co/?token="),
-            "200-level must use root path with trailing slash: {url}"
+            url.contains("twohundreddepth?token="),
+            "200-level must use /twohundreddepth path: {url}"
         );
         assert!(
-            url.starts_with("wss://full-depth-api.dhan.co/"),
-            "must use correct host: {url}"
+            !url.contains("twohundreddepth/?"),
+            "must NOT have spurious / before query string: {url}"
         );
     }
 

@@ -603,55 +603,6 @@
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 91 },
-      "id": 800,
-      "title": "Previous Close",
-      "type": "row"
-    },
-    {
-      "datasource": { "type": "postgres", "uid": "questdb" },
-      "fieldConfig": {
-        "defaults": {
-          "custom": {
-            "align": "auto",
-            "cellOptions": { "type": "auto" },
-            "filterable": true,
-            "inspect": false
-          },
-          "mappings": [],
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
-        },
-        "overrides": [
-          {
-            "matcher": { "id": "byName", "options": "prev_close" },
-            "properties": [{ "id": "decimals", "value": 2 }]
-          }
-        ]
-      },
-      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 92 },
-      "id": 60,
-      "options": {
-        "showHeader": true,
-        "cellHeight": "sm",
-        "footer": { "countRows": true, "enablePagination": true, "fields": "", "reducer": ["count"], "show": true },
-        "sortBy": [{ "desc": false, "displayName": "security_id" }]
-      },
-      "title": "Previous Close Prices",
-      "description": "Previous session close prices and open interest for all subscribed instruments.",
-      "type": "table",
-      "targets": [
-        {
-          "datasource": { "type": "postgres", "uid": "questdb" },
-          "editorMode": "code",
-          "format": "table",
-          "rawQuery": true,
-          "rawSql": "SELECT\n  segment,\n  security_id,\n  prev_close,\n  prev_oi,\n  to_str(received_at, 'yyyy-MM-dd HH:mm:ss.SSS') AS time\nFROM previous_close\nORDER BY security_id\nLIMIT 500;",
-          "refId": "A"
-        }
-      ]
-    },
-    {
-      "collapsed": false,
       "gridPos": { "h": 1, "w": 24, "x": 0, "y": 102 },
       "id": 900,
       "title": "Instrument Build Metadata",
@@ -886,5 +837,5 @@
   "timezone": "Asia/Kolkata",
   "title": "Market Data Explorer",
   "uid": "dlt-market-data",
-  "version": 8
+  "version": 100
 }

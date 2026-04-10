@@ -380,6 +380,9 @@ impl TickPersistenceWriter {
     /// causing data loss if the app crashes or restarts before ticks arrive.
     ///
     /// Returns `Ok(())` if the buffer is empty (nothing to flush).
+    ///
+    /// DEPRECATED: previous_close table removed. Kept for potential future
+    /// non-tick buffer writes. No production call sites as of 2026-04-10.
     pub fn flush_buffer_direct(&mut self) -> Result<()> {
         // Nothing in buffer → no-op (avoid pointless TCP round-trip).
         if self.buffer.is_empty() {
@@ -1934,6 +1937,9 @@ fn build_depth_rows(
 /// `received_at` is kept as a separate column for debugging (shows actual receive time).
 ///
 /// Price field uses `f32_to_f64_clean` to preserve Dhan f32 precision.
+///
+/// DEPRECATED: previous_close table removed (day_close from Full ticks used instead).
+/// Kept for tests and potential future use. No production call sites as of 2026-04-10.
 pub fn build_previous_close_row(
     buffer: &mut Buffer,
     security_id: u32,
@@ -2065,40 +2071,11 @@ pub async fn ensure_depth_and_prev_close_tables(questdb_config: &QuestDbConfig) 
     )
     .await;
 
-    // --- previous_close table ---
-    execute_ddl_best_effort(
-        &client,
-        &base_url,
-        PREVIOUS_CLOSE_CREATE_DDL,
-        "previous_close CREATE",
-    )
-    .await;
-    let dedup_prev_close = format!(
-        "ALTER TABLE {} DEDUP ENABLE UPSERT KEYS(ts, {})",
-        QUESTDB_TABLE_PREVIOUS_CLOSE, DEDUP_KEY_PREVIOUS_CLOSE
-    );
-    execute_ddl_best_effort(
-        &client,
-        &base_url,
-        &dedup_prev_close,
-        "previous_close DEDUP",
-    )
-    .await;
+    // previous_close table REMOVED — day_close from Full packet ticks provides
+    // previous close for ALL instruments. No separate table needed.
+    // Dhan confirmed (Ticket #5525125): day_close = previous session's close.
 
-    // Migration: add received_at column to existing previous_close tables (idempotent).
-    let add_received_at = format!(
-        "ALTER TABLE {} ADD COLUMN IF NOT EXISTS received_at TIMESTAMP",
-        QUESTDB_TABLE_PREVIOUS_CLOSE
-    );
-    execute_ddl_best_effort(
-        &client,
-        &base_url,
-        &add_received_at,
-        "previous_close received_at migration",
-    )
-    .await;
-
-    info!("market_depth and previous_close table setup complete");
+    info!("market_depth table setup complete (previous_close table removed)");
 }
 
 // ---------------------------------------------------------------------------

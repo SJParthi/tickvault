@@ -37,6 +37,8 @@ const OPTION_MAP_INITIAL_CAPACITY: usize = 30_000;
 const MIN_OI_THRESHOLD: u32 = 100;
 
 /// Exchange segment code for NSE_FNO (derivatives).
+/// INTENTIONAL: BSE_FNO (segment 8) is excluded — Dhan's depth and option chain
+/// APIs only support NSE segments. BSE_FNO instruments have no depth/OI data.
 const NSE_FNO_SEGMENT: u8 = 2;
 
 // ---------------------------------------------------------------------------
