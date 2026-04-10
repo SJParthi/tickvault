@@ -1,892 +1,608 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>DLT Markets</title>
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DLT - Markets</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#000;color:#e8e8e8;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;font-size:14px;overflow:hidden;height:100vh;display:flex;flex-direction:column}
+::-webkit-scrollbar{width:6px;height:6px}
+::-webkit-scrollbar-track{background:#121212}
+::-webkit-scrollbar-thumb{background:#333;border-radius:3px}
+::-webkit-scrollbar-thumb:hover{background:#555}
+a{color:inherit;text-decoration:none}
 
-        body {
-            background-color: #000000;
-            color: #8E8E8E;
-            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            font-weight: 400;
-            font-size: 14px;
-            line-height: 1.5;
-        }
+/* Top nav */
+.top-nav{display:flex;align-items:center;padding:0 16px;background:#121212;border-bottom:1px solid #242424;height:48px;gap:0}
+.nav-logo{display:flex;align-items:center;gap:8px;padding-right:24px}
+.nav-logo .logo-circle{width:28px;height:28px;border-radius:50%;background:#1a73e8;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:13px;color:#fff}
+.nav-logo .logo-text{font-size:14px;font-weight:600;color:#fff}
+.nav-search{display:flex;align-items:center;gap:6px;padding:6px 12px;border-radius:8px;background:#1a1a1a;border:1px solid #333;color:#8E8E8E;font-size:13px;margin-right:24px;min-width:240px;cursor:text}
+.nav-search svg{width:14px;height:14px;flex-shrink:0}
+.nav-links{display:flex;align-items:center;gap:0;flex:1}
+.nav-link{padding:14px 16px;font-size:14px;color:#8E8E8E;cursor:pointer;border-bottom:2px solid transparent;transition:color .2s}
+.nav-link:hover{color:#e8e8e8}
+.nav-link.active{color:#5CA81D;border-bottom-color:#5CA81D}
+.nav-right{display:flex;align-items:center;gap:16px;margin-left:auto}
+.nav-right-link{font-size:13px;color:#8E8E8E;cursor:pointer}
+.nav-right-link:hover{color:#e8e8e8}
+.live-indicator{display:flex;align-items:center;gap:4px;font-size:12px;color:#5CA81D}
+.live-dot{width:6px;height:6px;border-radius:50%;background:#5CA81D}
+.nav-icons{display:flex;align-items:center;gap:12px}
+.nav-icons svg{width:18px;height:18px;color:#8E8E8E;cursor:pointer}
+.user-avatar{width:28px;height:28px;border-radius:50%;background:#7B1FA2;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:600;color:#fff;cursor:pointer}
 
-        /* Header Navigation */
-        .navbar {
-            height: 60px;
-            background: rgba(18, 18, 18, 0.62);
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            padding: 0 30px;
-            border-bottom: 1px solid #242424;
-            position: sticky;
-            top: 0;
-            z-index: 100;
-        }
+/* Index ticker */
+.ticker-bar{display:flex;align-items:center;padding:0 16px;background:#000;border-bottom:1px solid #242424;height:36px;gap:24px;overflow-x:auto;white-space:nowrap}
+.ticker-item{display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer;flex-shrink:0}
+.ticker-name{color:#e8e8e8}
+.ticker-price{color:#e8e8e8;font-weight:500}
+.ticker-change{font-size:12px}
+.ticker-change.positive{color:#5CA81D}
+.ticker-change.negative{color:#DD6565}
+.ticker-arrow{font-size:10px}
 
-        .navbar-brand {
-            font-size: 16px;
-            font-weight: 500;
-            color: #DADADA;
-        }
+/* Main layout */
+.main-layout{display:flex;flex:1;overflow:hidden}
 
-        .navbar-link {
-            color: #8E8E8E;
-            text-decoration: none;
-            font-size: 14px;
-            transition: color 0.2s;
-        }
+/* Left sidebar - Watchlist */
+.sidebar{width:280px;background:#121212;border-right:1px solid #242424;display:flex;flex-direction:column;flex-shrink:0}
+.sidebar-header{display:flex;align-items:center;justify-content:between;padding:12px 12px 8px;gap:8px}
+.watchlist-icon{font-size:16px}
+.watchlist-title{font-size:14px;font-weight:500;color:#e8e8e8;flex:1}
+.watchlist-dropdown svg{width:14px;height:14px;color:#8E8E8E;cursor:pointer}
+.watchlist-tabs{display:flex;padding:0 12px 8px;gap:4px}
+.wl-tab{width:24px;height:24px;display:flex;align-items:center;justify-content:center;border-radius:4px;font-size:12px;color:#8E8E8E;cursor:pointer;border:1px solid #333}
+.wl-tab.active{background:#242424;color:#e8e8e8;border-color:#555}
+.wl-tab.special{font-size:11px;font-style:italic}
+.sidebar-list{flex:1;overflow-y:auto;padding:0}
+.sidebar-item{display:flex;align-items:center;padding:8px 12px;cursor:pointer;border-bottom:1px solid #1a1a1a}
+.sidebar-item:hover{background:#1a1a1a}
+.si-color{width:3px;height:28px;border-radius:2px;margin-right:8px;flex-shrink:0}
+.si-color.green{background:#5CA81D}
+.si-color.red{background:#DD6565}
+.si-info{flex:1}
+.si-name{font-size:13px;color:#e8e8e8;font-weight:500}
+.si-exchange{font-size:11px;color:#8E8E8E}
+.si-right{text-align:right}
+.si-price{font-size:13px;font-weight:500}
+.si-price.green{color:#5CA81D}
+.si-price.red{color:#DD6565}
+.si-chg{font-size:11px}
+.si-chg.green{color:#5CA81D}
+.si-chg.red{color:#DD6565}
 
-        .navbar-link:hover {
-            color: #DADADA;
-        }
+/* Content area */
+.content{flex:1;display:flex;flex-direction:column;overflow:hidden}
 
-        /* Main Container */
-        .container {
-            max-width: 1400px;
-            margin: 0 auto;
-            padding: 30px;
-        }
+/* Market tabs */
+.market-tabs{display:flex;align-items:center;padding:0 16px;background:#000;border-bottom:1px solid #242424;height:40px;gap:0}
+.market-tab{padding:10px 16px;font-size:14px;color:#8E8E8E;cursor:pointer;border-bottom:2px solid transparent;transition:all .2s}
+.market-tab:hover{color:#e8e8e8}
+.market-tab.active{color:#5CA81D;border-bottom-color:#5CA81D}
 
-        /* Tab Navigation */
-        .main-tabs {
-            display: flex;
-            gap: 0;
-            margin-bottom: 30px;
-            border-bottom: 1px solid #242424;
-        }
+/* Sub-filter bar */
+.filter-bar{display:flex;align-items:center;padding:8px 16px;gap:8px;border-bottom:1px solid #242424;background:#000}
+.filter-pill{padding:6px 14px;border-radius:20px;font-size:13px;cursor:pointer;border:1px solid #333;color:#8E8E8E;background:transparent;transition:all .2s;white-space:nowrap}
+.filter-pill:hover{border-color:#555;color:#e8e8e8}
+.filter-pill.active{color:#5CA81D;border-color:#5CA81D}
+.filter-spacer{flex:1}
+.filter-dropdown{display:flex;align-items:center;gap:4px;padding:6px 12px;border-radius:6px;border:1px solid #333;background:transparent;color:#e8e8e8;font-size:13px;cursor:pointer}
+.filter-dropdown svg{width:12px;height:12px;color:#8E8E8E}
 
-        .main-tab {
-            padding: 15px 20px;
-            background: transparent;
-            border: none;
-            color: #8E8E8E;
-            font-size: 14px;
-            cursor: pointer;
-            border-bottom: 2px solid transparent;
-            transition: all 0.3s;
-            font-family: 'Inter', sans-serif;
-        }
+/* Toggle switch */
+.toggle-group{display:flex;align-items:center;gap:0;border:1px solid #333;border-radius:20px;overflow:hidden}
+.toggle-option{padding:5px 14px;font-size:13px;cursor:pointer;color:#8E8E8E;transition:all .2s}
+.toggle-option.active{color:#5CA81D}
+.toggle-option.active-red{color:#DD6565}
+.toggle-dot{width:6px;height:6px;border-radius:50%;display:inline-block;margin-right:4px}
+.toggle-dot.green{background:#5CA81D}
+.toggle-dot.red{background:#DD6565}
 
-        .main-tab.active {
-            color: #DADADA;
-            border-bottom-color: #5CA81D;
-        }
+/* Data table */
+.data-table-wrapper{flex:1;overflow:auto;padding:0}
+table{width:100%;border-collapse:separate;border-spacing:0}
+thead{position:sticky;top:0;z-index:5}
+th{background:#121212;color:#8E8E8E;font-weight:300;font-size:12px;padding:8px 12px;text-align:right;white-space:nowrap;border-bottom:1px solid #242424}
+th:first-child{text-align:left;padding-left:16px}
+th.left{text-align:left}
+td{padding:8px 12px;text-align:right;white-space:nowrap;height:42px;vertical-align:middle;font-size:14px;border-bottom:1px solid #1a1a1a}
+td:first-child{text-align:left;padding-left:16px}
+td.left{text-align:left}
+tr:hover td{background:rgba(255,255,255,0.02)}
+.green{color:#5CA81D}
+.red{color:#DD6565}
+.dim{color:#555}
+td.chk{width:32px;min-width:32px;text-align:center}
+td.chk input{width:14px;height:14px;accent-color:#518EF8}
 
-        .main-tab:hover {
-            color: #DADADA;
-        }
+/* Bottom bar */
+.bottom-bar{display:flex;align-items:center;padding:4px 16px;background:#121212;border-top:1px solid #242424;height:36px;gap:8px}
+.bottom-tab{display:flex;align-items:center;gap:6px;padding:4px 12px;border-radius:6px;font-size:13px;cursor:pointer;color:#8E8E8E;background:transparent;border:1px solid #333}
+.bottom-tab:hover{border-color:#555;color:#e8e8e8}
+.bottom-tab svg{width:14px;height:14px}
+.bottom-tab .dropdown-arrow{width:10px;height:10px}
+.sidebar-bottom{display:flex;align-items:center;padding:4px 12px;background:#121212;border-top:1px solid #242424;height:32px;gap:12px}
+.sb-item{font-size:12px;color:#8E8E8E;cursor:pointer}
+.sb-item:hover{color:#e8e8e8}
+.sb-icons{display:flex;align-items:center;gap:8px;margin-left:auto}
+.sb-icons svg{width:14px;height:14px;color:#8E8E8E;cursor:pointer}
 
-        /* Tab Content */
-        .tab-content {
-            display: none;
-        }
-
-        .tab-content.active {
-            display: block;
-        }
-
-        /* Filter Section */
-        .filter-section {
-            margin-bottom: 20px;
-            display: flex;
-            gap: 15px;
-            align-items: center;
-            flex-wrap: wrap;
-        }
-
-        .filter-tabs {
-            display: flex;
-            gap: 10px;
-            flex-wrap: wrap;
-        }
-
-        .filter-btn {
-            padding: 8px 16px;
-            background: transparent;
-            border: 1px solid #242424;
-            color: #8E8E8E;
-            font-size: 13px;
-            cursor: pointer;
-            border-radius: 4px;
-            transition: all 0.2s;
-            font-family: 'Inter', sans-serif;
-        }
-
-        .filter-btn.active {
-            background: #242424;
-            color: #DADADA;
-            border-color: #5CA81D;
-        }
-
-        .filter-btn:hover {
-            border-color: #5CA81D;
-            color: #DADADA;
-        }
-
-        .filter-dropdown {
-            padding: 8px 12px;
-            background: #121212;
-            border: 1px solid #242424;
-            color: #8E8E8E;
-            font-size: 13px;
-            border-radius: 4px;
-            cursor: pointer;
-            font-family: 'Inter', sans-serif;
-            transition: all 0.2s;
-        }
-
-        .filter-dropdown:hover {
-            border-color: #5CA81D;
-            color: #DADADA;
-        }
-
-        /* Toggle Switch for Gainers/Losers */
-        .toggle-switch {
-            display: flex;
-            gap: 8px;
-            align-items: center;
-        }
-
-        .toggle-btn {
-            padding: 6px 14px;
-            background: transparent;
-            border: 1px solid #242424;
-            color: #8E8E8E;
-            font-size: 12px;
-            cursor: pointer;
-            border-radius: 4px;
-            transition: all 0.2s;
-            font-family: 'Inter', sans-serif;
-        }
-
-        .toggle-btn.active {
-            background: #5CA81D;
-            color: #000000;
-            border-color: #5CA81D;
-        }
-
-        /* Table Styles */
-        .table-wrapper {
-            overflow-x: auto;
-            background: #121212;
-            border: 1px solid #242424;
-            border-radius: 4px;
-        }
-
-        table {
-            width: 100%;
-            table-layout: auto;
-            border-collapse: separate;
-            border-spacing: 0;
-            font-size: 14px;
-        }
-
-        thead {
-            background: #181818;
-            position: sticky;
-            top: 60px;
-            z-index: 10;
-        }
-
-        th {
-            height: 42px;
-            font-weight: 300;
-            font-size: 14px;
-            color: #8E8E8E;
-            text-align: left;
-            cursor: pointer;
-            user-select: none;
-            border-bottom: 1px solid #242424;
-            transition: background-color 0.2s;
-        }
-
-        th:hover {
-            background-color: #242424;
-        }
-
-        th.name-col {
-            padding: 1px 9px 0px 10px;
-            width: 27.5%;
-        }
-
-        th.right-align {
-            text-align: right;
-            padding: 1px 8px 0px 0px;
-        }
-
-        th.last-col {
-            padding: 1px 10px 0px 0px;
-        }
-
-        tbody tr {
-            border-bottom: 1px solid #242424;
-            transition: background-color 0.2s;
-        }
-
-        tbody tr:hover {
-            background-color: #242424;
-        }
-
-        td {
-            height: 42px;
-            font-size: 14px;
-            color: #8E8E8E;
-            vertical-align: middle;
-        }
-
-        td.name-col {
-            padding: 0px 9px 0px 10px;
-            color: #DADADA;
-            display: flex;
-            align-items: center;
-            gap: 8px;
-        }
-
-        td.right-align {
-            text-align: right;
-            padding: 0px 8px 0px 0px;
-        }
-
-        td.last-col {
-            text-align: right;
-            padding: 0px 10px 0px 0px;
-        }
-
-        /* Checkbox */
-        .checkbox {
-            accent-color: #5CA81D;
-            cursor: pointer;
-            margin: 0 0 2px 1px;
-            width: 16px;
-            height: 16px;
-        }
-
-        /* Color coding */
-        .positive {
-            color: #5CA81D;
-        }
-
-        .negative {
-            color: #DD6565;
-        }
-
-        .grey-text {
-            color: #8E8E8E;
-        }
-
-        /* Loading State */
-        .loading {
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            height: 300px;
-            color: #8E8E8E;
-            font-size: 14px;
-        }
-
-        .spinner {
-            border: 2px solid #242424;
-            border-top: 2px solid #5CA81D;
-            border-radius: 50%;
-            width: 24px;
-            height: 24px;
-            animation: spin 0.8s linear infinite;
-            margin-right: 10px;
-        }
-
-        @keyframes spin {
-            to { transform: rotate(360deg); }
-        }
-
-        /* Error State */
-        .error {
-            background: #1a1a1a;
-            border: 1px solid #DD6565;
-            padding: 15px;
-            border-radius: 4px;
-            color: #DD6565;
-            font-size: 13px;
-            margin-bottom: 20px;
-        }
-
-        /* Column widths for Options table */
-        .options-table {
-            /* Name: 27.5%, Spot: 9.8%, LTP: 5%, Change: 8.2%, Change%: 7.2%, OI: 12.1%, OI Change: 7.8%, OI Change%: 8.7%, Volume: 13.6% */
-        }
-
-        .col-spot { width: 9.8%; }
-        .col-ltp { width: 5%; }
-        .col-change { width: 8.2%; }
-        .col-change-pct { width: 7.2%; }
-        .col-oi { width: 12.1%; }
-        .col-oi-change { width: 7.8%; }
-        .col-oi-change-pct { width: 8.7%; }
-        .col-volume { width: 13.6%; }
-
-        /* Column widths for Stocks table */
-        .col-stocks-ltp { width: 12%; }
-        .col-stocks-change { width: 12%; }
-        .col-stocks-change-pct { width: 12%; }
-        .col-value { width: 15%; }
-        .col-stocks-volume { width: 20%; }
-
-        /* Column widths for Index table */
-        .col-index-ltp { width: 12%; }
-        .col-index-change { width: 12%; }
-        .col-index-open { width: 12%; }
-        .col-index-high { width: 12%; }
-        .col-index-low { width: 12%; }
-        .col-index-prev { width: 12%; }
-
-        /* Refresh indicator */
-        .refresh-indicator {
-            display: inline-block;
-            margin-left: 10px;
-            color: #5CA81D;
-            font-size: 12px;
-        }
-
-        .refresh-dot {
-            display: inline-block;
-            width: 4px;
-            height: 4px;
-            background: #5CA81D;
-            border-radius: 50%;
-            margin-right: 4px;
-            animation: pulse 2s infinite;
-        }
-
-        @keyframes pulse {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.3; }
-        }
-    </style>
+/* Empty state */
+.empty-state{display:flex;flex-direction:column;align-items:center;justify-content:center;padding:60px 20px;color:#555}
+.empty-state p{margin-top:8px;font-size:13px}
+</style>
 </head>
 <body>
-    <!-- Navigation Bar -->
-    <nav class="navbar">
-        <div class="navbar-brand">DLT Markets</div>
-        <a href="/portal" class="navbar-link">Back to Control Panel</a>
-    </nav>
 
-    <!-- Main Container -->
-    <div class="container">
-        <!-- Main Tab Navigation -->
-        <div class="main-tabs">
-            <button class="main-tab active" data-tab="options">Options</button>
-            <button class="main-tab" data-tab="stocks">Stocks</button>
-            <button class="main-tab" data-tab="index">Index</button>
-        </div>
+<!-- Top Nav -->
+<div class="top-nav">
+  <div class="nav-logo">
+    <div class="logo-circle">D</div>
+  </div>
+  <div class="nav-search">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+    <span>Search for companies to invest or trade</span>
+  </div>
+  <div class="nav-links">
+    <a class="nav-link" href="/portal">Home</a>
+    <span class="nav-link">Portfolio</span>
+    <span class="nav-link">Positions</span>
+    <span class="nav-link">Orders</span>
+    <span class="nav-link">Money</span>
+  </div>
+  <div class="nav-right">
+    <span class="nav-right-link active" style="color:#5CA81D">Markets</span>
+    <span class="nav-right-link">Rent Stocks</span>
+    <span class="nav-right-link">News</span>
+    <span class="nav-right-link">IPOs</span>
+    <div class="live-indicator"><div class="live-dot"></div> Live</div>
+    <div class="nav-icons">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 8A6 6 0 006 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 01-3.46 0"/></svg>
+    </div>
+    <div class="user-avatar">P</div>
+  </div>
+</div>
 
-        <!-- OPTIONS TAB -->
-        <div id="options" class="tab-content active">
-            <div class="filter-section">
-                <div class="filter-tabs" id="options-filter-tabs">
-                    <button class="filter-btn active" data-filter="highest-oi">Highest OI</button>
-                    <button class="filter-btn" data-filter="oi-gainers">OI Gainers</button>
-                    <button class="filter-btn" data-filter="oi-losers">OI Losers</button>
-                    <button class="filter-btn" data-filter="top-volume">Top Volume</button>
-                    <button class="filter-btn" data-filter="price-gainers">Price Gainers</button>
-                    <button class="filter-btn" data-filter="price-losers">Price Losers</button>
-                </div>
-                <select class="filter-dropdown" id="options-expiry">
-                    <option value="">All Expiries</option>
-                </select>
-                <select class="filter-dropdown" id="options-type">
-                    <option value="">All Types</option>
-                    <option value="index">Index</option>
-                    <option value="stock">Stock</option>
-                </select>
-                <span class="refresh-indicator">
-                    <span class="refresh-dot"></span>Auto-refresh: 10s
-                </span>
-            </div>
-            <div id="options-error" class="error" style="display:none;"></div>
-            <div id="options-loading" class="loading" style="display:none;">
-                <div class="spinner"></div>Loading options data...
-            </div>
-            <div id="options-table-wrapper" class="table-wrapper" style="display:none;">
-                <table class="options-table">
-                    <thead>
-                        <tr>
-                            <th class="name-col">Name</th>
-                            <th class="col-spot right-align">Spot Price</th>
-                            <th class="col-ltp right-align">LTP</th>
-                            <th class="col-change right-align">Change</th>
-                            <th class="col-change-pct right-align">Change %</th>
-                            <th class="col-oi right-align">Open Interest</th>
-                            <th class="col-oi-change right-align">OI Change</th>
-                            <th class="col-oi-change-pct right-align">OI Change %</th>
-                            <th class="col-volume right-align last-col">Volume</th>
-                        </tr>
-                    </thead>
-                    <tbody id="options-tbody">
-                    </tbody>
-                </table>
-            </div>
-        </div>
+<!-- Index Ticker -->
+<div class="ticker-bar" id="tickerBar">
+  <div class="ticker-item"><span class="ticker-name">Nifty 50</span><span class="ticker-price" id="tkNifty">--</span><span class="ticker-change positive" id="tkNiftyChg">--</span></div>
+  <div class="ticker-item"><span class="ticker-name">Nifty Bank</span><span class="ticker-price" id="tkBank">--</span><span class="ticker-change positive" id="tkBankChg">--</span></div>
+  <div class="ticker-item"><span class="ticker-name">Fin Nifty</span><span class="ticker-price" id="tkFin">--</span><span class="ticker-change positive" id="tkFinChg">--</span></div>
+  <div class="ticker-item"><span class="ticker-name">India VIX</span><span class="ticker-price" id="tkVix">--</span><span class="ticker-change negative" id="tkVixChg">--</span></div>
+  <div class="ticker-item"><span class="ticker-name">Nifty Midcap</span><span class="ticker-price" id="tkMid">--</span><span class="ticker-change positive" id="tkMidChg">--</span></div>
+</div>
 
-        <!-- STOCKS TAB -->
-        <div id="stocks" class="tab-content">
-            <div class="filter-section">
-                <div class="toggle-switch">
-                    <button class="toggle-btn active" data-view="gainers">Gainers</button>
-                    <button class="toggle-btn" data-view="losers">Losers</button>
-                </div>
-                <div class="filter-tabs">
-                    <button class="filter-btn" data-stock-filter="mtf">MTF</button>
-                    <button class="filter-btn" data-stock-filter="extreme-openings">Extreme Openings</button>
-                    <button class="filter-btn" data-stock-filter="price-movers">Price Movers</button>
-                    <button class="filter-btn" data-stock-filter="breakouts">Breakouts</button>
-                </div>
-                <span class="refresh-indicator">
-                    <span class="refresh-dot"></span>Auto-refresh: 10s
-                </span>
-            </div>
-            <div id="stocks-error" class="error" style="display:none;"></div>
-            <div id="stocks-loading" class="loading" style="display:none;">
-                <div class="spinner"></div>Loading stocks data...
-            </div>
-            <div id="stocks-table-wrapper" class="table-wrapper" style="display:none;">
-                <table>
-                    <thead>
-                        <tr>
-                            <th class="name-col">Name</th>
-                            <th class="col-stocks-ltp right-align">LTP</th>
-                            <th class="col-stocks-change right-align">Change</th>
-                            <th class="col-stocks-change-pct right-align">Change %</th>
-                            <th class="col-value right-align">Value (Cr.)</th>
-                            <th class="col-stocks-volume right-align last-col">Volume</th>
-                        </tr>
-                    </thead>
-                    <tbody id="stocks-tbody">
-                    </tbody>
-                </table>
-            </div>
-        </div>
+<!-- Expand arrow -->
+<div style="text-align:center;padding:2px;cursor:pointer;border-bottom:1px solid #242424">
+  <svg width="16" height="8" viewBox="0 0 16 8" fill="none"><path d="M1 1l7 6 7-6" stroke="#555" stroke-width="1.5"/></svg>
+</div>
 
-        <!-- INDEX TAB -->
-        <div id="index" class="tab-content">
-            <div class="filter-section">
-                <div class="filter-tabs">
-                    <button class="filter-btn active" data-index-filter="all">All</button>
-                    <button class="filter-btn" data-index-filter="nse">NSE</button>
-                    <button class="filter-btn" data-index-filter="bse">BSE</button>
-                </div>
-                <span class="refresh-indicator">
-                    <span class="refresh-dot"></span>Auto-refresh: 10s
-                </span>
-            </div>
-            <div id="index-error" class="error" style="display:none;"></div>
-            <div id="index-loading" class="loading" style="display:none;">
-                <div class="spinner"></div>Loading index data...
-            </div>
-            <div id="index-table-wrapper" class="table-wrapper" style="display:none;">
-                <table>
-                    <thead>
-                        <tr>
-                            <th class="name-col">Name</th>
-                            <th class="col-index-ltp right-align">LTP</th>
-                            <th class="col-index-change right-align">Chg (%)</th>
-                            <th class="col-index-open right-align">Open</th>
-                            <th class="col-index-high right-align">High</th>
-                            <th class="col-index-low right-align">Low</th>
-                            <th class="col-index-prev right-align last-col">Prev. Close</th>
-                        </tr>
-                    </thead>
-                    <tbody id="index-tbody">
-                    </tbody>
-                </table>
-            </div>
-        </div>
+<!-- Main Layout -->
+<div class="main-layout">
+  <!-- Left Sidebar - Watchlist -->
+  <div class="sidebar">
+    <div class="sidebar-header">
+      <span class="watchlist-icon">📋</span>
+      <span class="watchlist-title">First Watchlist</span>
+      <span class="watchlist-dropdown"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg></span>
+    </div>
+    <div class="watchlist-tabs">
+      <div class="wl-tab active">1</div>
+      <div class="wl-tab">2</div>
+      <div class="wl-tab">3</div>
+      <div class="wl-tab">4</div>
+      <div class="wl-tab">5</div>
+      <div class="wl-tab">6</div>
+      <div class="wl-tab special">f</div>
+      <div class="wl-tab special">δ</div>
+    </div>
+    <div class="sidebar-list" id="watchlist"></div>
+    <div class="sidebar-bottom">
+      <span class="sb-item">Name</span>
+      <span class="sb-item">LTP</span>
+      <span class="sb-item">LTP %</span>
+      <span class="sb-item">Color</span>
+      <div class="sb-icons">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10 13a5 5 0 007.54.54l3-3a5 5 0 00-7.07-7.07l-1.72 1.71"/></svg>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/></svg>
+      </div>
+    </div>
+  </div>
+
+  <!-- Content Area -->
+  <div class="content">
+    <!-- Market Tabs -->
+    <div class="market-tabs">
+      <span class="market-tab" data-tab="live">Live</span>
+      <span class="market-tab active" data-tab="options">Options</span>
+      <span class="market-tab" data-tab="stocks">Stocks</span>
+      <span class="market-tab" data-tab="commodity">Commodity</span>
+      <span class="market-tab" data-tab="futures">Futures</span>
+      <span class="market-tab" data-tab="etfs">ETFs</span>
+      <span class="market-tab" data-tab="bonds">Bonds</span>
+      <span class="market-tab" data-tab="index">Index</span>
     </div>
 
-    <script>
-        // State Management
-        const state = {
-            options: {
-                data: [],
-                filter: 'highest-oi',
-                expiry: '',
-                type: '',
-                sortBy: null,
-                sortDir: 'desc'
-            },
-            stocks: {
-                data: [],
-                view: 'gainers',
-                filter: null,
-                sortBy: null,
-                sortDir: 'desc'
-            },
-            index: {
-                data: [],
-                filter: 'all',
-                sortBy: null,
-                sortDir: 'desc'
-            },
-            currentTab: 'options',
-            autoRefreshInterval: null
-        };
+    <!-- Options Filter Bar -->
+    <div class="filter-bar" id="optionsFilters">
+      <button class="filter-pill active" data-filter="highest-oi">Highest OI</button>
+      <button class="filter-pill" data-filter="oi-gainers">OI Gainers</button>
+      <button class="filter-pill" data-filter="oi-losers">OI Losers</button>
+      <button class="filter-pill" data-filter="top-volume">Top Volume</button>
+      <button class="filter-pill" data-filter="top-value">Top Value</button>
+      <button class="filter-pill" data-filter="price-gainers">Price Gainers</button>
+      <button class="filter-pill" data-filter="price-losers">Price Losers</button>
+      <div class="filter-spacer"></div>
+      <button class="filter-dropdown" id="monthFilter">April <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg></button>
+      <button class="filter-dropdown" id="typeFilter">All <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg></button>
+    </div>
 
-        // Utility Functions
-        function formatIndian(num) {
-            if (num === null || num === undefined) return '-';
-            return parseFloat(num).toLocaleString('en-IN', {
-                minimumFractionDigits: 0,
-                maximumFractionDigits: 2
-            });
-        }
+    <!-- Stocks Filter Bar (hidden by default) -->
+    <div class="filter-bar" id="stocksFilters" style="display:none">
+      <button class="filter-pill" data-sfilter="intraday-movers">Intraday Movers</button>
+      <button class="filter-pill" data-sfilter="outperformers">Outperformers</button>
+      <button class="filter-pill" data-sfilter="mtf">MTF</button>
+      <button class="filter-pill" data-sfilter="extreme-openings">Extreme Openings</button>
+      <button class="filter-pill active" data-sfilter="price-movers">Price Movers</button>
+      <button class="filter-pill" data-sfilter="breakouts">Breakouts</button>
+      <button class="filter-pill" data-sfilter="by-value">By Va...</button>
+      <div class="filter-spacer"></div>
+      <div class="toggle-group">
+        <span class="toggle-option active" id="gainersToggle"><span class="toggle-dot green"></span>Gainers</span>
+        <span class="toggle-option" id="losersToggle"><span class="toggle-dot red"></span>Losers</span>
+      </div>
+      <button class="filter-dropdown">NSE</button>
+      <button class="filter-dropdown">F&O Stocks <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg></button>
+    </div>
 
-        function formatOI(num) {
-            if (num === null || num === undefined) return '-';
-            if (num >= 100000) {
-                return (num / 100000).toFixed(2) + 'L';
-            }
-            return formatIndian(num);
-        }
+    <!-- Index Filter Bar (hidden by default) -->
+    <div class="filter-bar" id="indexFilters" style="display:none">
+      <button class="filter-pill active" data-ifilter="all">All</button>
+      <button class="filter-pill" data-ifilter="nse">NSE</button>
+      <button class="filter-pill" data-ifilter="bse">BSE</button>
+    </div>
 
-        function formatCrore(num) {
-            if (num === null || num === undefined) return '-';
-            if (num >= 10000000) {
-                return (num / 10000000).toFixed(2) + ' Cr.';
-            }
-            return formatIndian(num);
-        }
+    <!-- Data Table -->
+    <div class="data-table-wrapper">
+      <table>
+        <thead id="tableHead"></thead>
+        <tbody id="tableBody"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
 
-        function getColorClass(value) {
-            if (value > 0) return 'positive';
-            if (value < 0) return 'negative';
-            return 'grey-text';
-        }
+<!-- Bottom Bar -->
+<div class="bottom-bar">
+  <button class="bottom-tab" onclick="window.location.href='/portal/options-chain'">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
+    Option Chain <svg class="dropdown-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>
+  </button>
+  <button class="bottom-tab">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="20" rx="2"/><path d="M7 12h10"/><path d="M12 7v10"/></svg>
+    📸 Snapshot <svg class="dropdown-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>
+  </button>
+  <button class="bottom-tab">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+    Chart <svg class="dropdown-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>
+  </button>
+  <div style="flex:1"></div>
+  <span style="font-size:12px;color:#8E8E8E">Create Your Strategy</span>
+</div>
 
-        function showLoading(tabName) {
-            const loader = document.getElementById(`${tabName}-loading`);
-            const wrapper = document.getElementById(`${tabName}-table-wrapper`);
-            if (loader) loader.style.display = 'flex';
-            if (wrapper) wrapper.style.display = 'none';
-        }
+<script>
+// State
+let activeTab = 'options';
+let optionsFilter = 'highest-oi';
+let stocksMode = 'gainers';
+let indexFilter = 'all';
 
-        function hideLoading(tabName) {
-            const loader = document.getElementById(`${tabName}-loading`);
-            if (loader) loader.style.display = 'none';
-        }
+const WATCHLIST = [
+  { name: 'Adani Ports & SEZ', exchange: 'NSE', price: 1461.30, change: 13.80, pct: 0.95, up: true },
+  { name: 'Adani Green Energy', exchange: 'NSE', price: 1057.50, change: 12.95, pct: 1.24, up: true },
+  { name: 'Adani Enterprises', exchange: 'NSE', price: 2064.30, change: 23.80, pct: 1.17, up: true },
+  { name: 'ICICI Bank', exchange: 'NSE', price: 1319.60, change: 38.30, pct: 2.99, up: true },
+  { name: 'HDFC Bank', exchange: 'NSE', price: 811.05, change: 13.35, pct: 1.67, up: true },
+  { name: 'Reliance Industries', exchange: 'NSE', price: 1346.10, change: 16.30, pct: 1.23, up: true },
+  { name: 'Sensex', exchange: 'BSE', price: 77360.62, change: 728.97, pct: 0.95, up: true },
+  { name: 'Gift Nifty', exchange: 'NSE', price: 24041.00, change: 63.00, pct: 0.26, up: true },
+  { name: 'Nifty Midcap Select', exchange: 'NSE', price: 13328.45, change: 121.15, pct: 0.92, up: true },
+  { name: 'FinNifty', exchange: 'NSE', price: 26193.60, change: 507.75, pct: 1.98, up: true },
+  { name: 'Nifty Bank', exchange: 'NSE', price: 55821.85, change: 997.55, pct: 1.82, up: true }
+];
 
-        function showError(tabName, message) {
-            const errorEl = document.getElementById(`${tabName}-error`);
-            if (errorEl) {
-                errorEl.textContent = message;
-                errorEl.style.display = 'block';
-            }
-        }
+function fmt(n, d=2) {
+  if (n == null || isNaN(n)) return '--';
+  return Number(n).toLocaleString('en-IN', { minimumFractionDigits: d, maximumFractionDigits: d });
+}
 
-        function hideError(tabName) {
-            const errorEl = document.getElementById(`${tabName}-error`);
-            if (errorEl) errorEl.style.display = 'none';
-        }
+function fmtInt(n) {
+  if (n == null || isNaN(n)) return '--';
+  return Number(n).toLocaleString('en-IN');
+}
 
-        // API Calls
-        async function fetchOptionsData() {
-            try {
-                showLoading('options');
-                hideError('options');
-                const response = await fetch('/api/market/option-movers');
-                if (!response.ok) throw new Error('Failed to fetch options data');
-                state.options.data = await response.json();
-                renderOptionsTable();
-                hideLoading('options');
-            } catch (error) {
-                console.error('Options fetch error:', error);
-                showError('options', 'Failed to load options data. Please try again.');
-                hideLoading('options');
-            }
-        }
+function fmtOI(n) {
+  if (n == null) return '--';
+  return fmtInt(n);
+}
 
-        async function fetchStocksData() {
-            try {
-                showLoading('stocks');
-                hideError('stocks');
-                const response = await fetch('/api/market/stock-movers');
-                if (!response.ok) throw new Error('Failed to fetch stocks data');
-                state.stocks.data = await response.json();
-                renderStocksTable();
-                hideLoading('stocks');
-            } catch (error) {
-                console.error('Stocks fetch error:', error);
-                showError('stocks', 'Failed to load stocks data. Please try again.');
-                hideLoading('stocks');
-            }
-        }
+function fmtPct(n) {
+  if (n == null || isNaN(n)) return '--';
+  return fmt(Math.abs(n), 2) + ' %';
+}
 
-        async function fetchIndexData() {
-            try {
-                showLoading('index');
-                hideError('index');
-                const response = await fetch('/api/market/indices');
-                if (!response.ok) throw new Error('Failed to fetch index data');
-                state.index.data = await response.json();
-                renderIndexTable();
-                hideLoading('index');
-            } catch (error) {
-                console.error('Index fetch error:', error);
-                showError('index', 'Failed to load index data. Please try again.');
-                hideLoading('index');
-            }
-        }
+function fmtVolCr(n) {
+  if (n == null || isNaN(n)) return '--';
+  return fmt(n, 2);
+}
 
-        // Render Functions
-        function filterOptionsData() {
-            let filtered = [...state.options.data];
+// Render watchlist
+function renderWatchlist() {
+  const el = document.getElementById('watchlist');
+  el.innerHTML = WATCHLIST.map(w => `
+    <div class="sidebar-item">
+      <div class="si-color ${w.up ? 'green' : 'red'}"></div>
+      <div class="si-info">
+        <div class="si-name">${w.name}</div>
+        <div class="si-exchange">${w.exchange}</div>
+      </div>
+      <div class="si-right">
+        <div class="si-price ${w.up ? 'green' : 'red'}">${fmt(w.price, 2)} ${w.up ? '↗' : '↘'}</div>
+        <div class="si-chg ${w.up ? 'green' : 'red'}">${fmt(w.change, 2)} (${fmt(w.pct, 2)}%)</div>
+      </div>
+    </div>
+  `).join('');
+}
 
-            // Apply filter
-            switch (state.options.filter) {
-                case 'oi-gainers':
-                    filtered = filtered.filter(o => o.oi_change_pct > 0);
-                    break;
-                case 'oi-losers':
-                    filtered = filtered.filter(o => o.oi_change_pct < 0);
-                    break;
-                case 'top-volume':
-                    filtered.sort((a, b) => (b.volume || 0) - (a.volume || 0));
-                    break;
-                case 'price-gainers':
-                    filtered = filtered.filter(o => o.change_pct > 0);
-                    break;
-                case 'price-losers':
-                    filtered = filtered.filter(o => o.change_pct < 0);
-                    break;
-                default: // highest-oi
-                    filtered.sort((a, b) => (b.oi || 0) - (a.oi || 0));
-            }
+// Tab switching
+document.querySelectorAll('.market-tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('.market-tab').forEach(t => t.classList.remove('active'));
+    tab.classList.add('active');
+    activeTab = tab.dataset.tab;
 
-            // Apply expiry filter
-            if (state.options.expiry) {
-                filtered = filtered.filter(o => o.name.includes(state.options.expiry));
-            }
+    document.getElementById('optionsFilters').style.display = activeTab === 'options' ? 'flex' : 'none';
+    document.getElementById('stocksFilters').style.display = activeTab === 'stocks' ? 'flex' : 'none';
+    document.getElementById('indexFilters').style.display = activeTab === 'index' ? 'flex' : 'none';
 
-            // Apply type filter
-            if (state.options.type) {
-                filtered = filtered.filter(o => {
-                    if (state.options.type === 'index') return o.name.includes('NIFTY');
-                    if (state.options.type === 'stock') return !o.name.includes('NIFTY');
-                    return true;
-                });
-            }
+    fetchData();
+  });
+});
 
-            return filtered;
-        }
+// Options filter pills
+document.querySelectorAll('[data-filter]').forEach(pill => {
+  pill.addEventListener('click', () => {
+    document.querySelectorAll('[data-filter]').forEach(p => p.classList.remove('active'));
+    pill.classList.add('active');
+    optionsFilter = pill.dataset.filter;
+    fetchData();
+  });
+});
 
-        function renderOptionsTable() {
-            const filtered = filterOptionsData();
-            const tbody = document.getElementById('options-tbody');
-            const wrapper = document.getElementById('options-table-wrapper');
+// Stocks filter pills
+document.querySelectorAll('[data-sfilter]').forEach(pill => {
+  pill.addEventListener('click', () => {
+    document.querySelectorAll('[data-sfilter]').forEach(p => p.classList.remove('active'));
+    pill.classList.add('active');
+  });
+});
 
-            if (!filtered.length) {
-                tbody.innerHTML = '<tr><td colspan="9" style="text-align:center;padding:20px;">No data available</td></tr>';
-                wrapper.style.display = 'block';
-                return;
-            }
+// Gainers/Losers toggle
+document.getElementById('gainersToggle').addEventListener('click', () => {
+  stocksMode = 'gainers';
+  document.getElementById('gainersToggle').classList.add('active');
+  document.getElementById('losersToggle').classList.remove('active', 'active-red');
+  fetchData();
+});
+document.getElementById('losersToggle').addEventListener('click', () => {
+  stocksMode = 'losers';
+  document.getElementById('losersToggle').classList.add('active-red');
+  document.getElementById('gainersToggle').classList.remove('active');
+  fetchData();
+});
 
-            tbody.innerHTML = filtered.map((row, idx) => `
-                <tr>
-                    <td class="name-col">
-                        <input type="checkbox" class="checkbox" data-id="${row.security_id}">
-                        ${row.name}
-                    </td>
-                    <td class="col-spot right-align grey-text">${formatIndian(row.spot_price)}</td>
-                    <td class="col-ltp right-align grey-text">${formatIndian(row.ltp)}</td>
-                    <td class="col-change right-align ${getColorClass(row.change)}">${row.change > 0 ? '' : ''}${formatIndian(row.change)}</td>
-                    <td class="col-change-pct right-align ${getColorClass(row.change_pct)}">${row.change_pct > 0 ? '' : ''}${formatIndian(row.change_pct)}%</td>
-                    <td class="col-oi right-align grey-text">${formatOI(row.oi)}</td>
-                    <td class="col-oi-change right-align ${getColorClass(row.oi_change)}">${row.oi_change > 0 ? '' : ''}${formatIndian(row.oi_change)}</td>
-                    <td class="col-oi-change-pct right-align ${getColorClass(row.oi_change_pct)}">${row.oi_change_pct > 0 ? '' : ''}${formatIndian(row.oi_change_pct)}%</td>
-                    <td class="col-volume right-align last-col grey-text">${formatIndian(row.volume)}</td>
-                </tr>
-            `).join('');
+// Index filter
+document.querySelectorAll('[data-ifilter]').forEach(pill => {
+  pill.addEventListener('click', () => {
+    document.querySelectorAll('[data-ifilter]').forEach(p => p.classList.remove('active'));
+    pill.classList.add('active');
+    indexFilter = pill.dataset.ifilter;
+    fetchData();
+  });
+});
 
-            wrapper.style.display = 'block';
-        }
+function renderOptionsTable(data) {
+  const thead = document.getElementById('tableHead');
+  const tbody = document.getElementById('tableBody');
 
-        function renderStocksTable() {
-            let filtered = [...state.stocks.data];
+  thead.innerHTML = `<tr>
+    <th class="left" style="width:32px"></th>
+    <th class="left">Name</th>
+    <th>Spot Price</th>
+    <th>LTP</th>
+    <th>Change</th>
+    <th>Change %</th>
+    <th>Open Interest</th>
+    <th>OI Change</th>
+    <th>OI Change %</th>
+    <th>Volume</th>
+  </tr>`;
 
-            // Apply view filter
-            if (state.stocks.view === 'gainers') {
-                filtered = filtered.filter(s => s.change_pct > 0)
-                    .sort((a, b) => b.change_pct - a.change_pct);
-            } else if (state.stocks.view === 'losers') {
-                filtered = filtered.filter(s => s.change_pct < 0)
-                    .sort((a, b) => a.change_pct - b.change_pct);
-            }
+  const entries = data.entries || [];
+  if (entries.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="10" style="text-align:center;padding:40px;color:#555">No option movers data available. Waiting for market data...</td></tr>';
+    return;
+  }
 
-            const tbody = document.getElementById('stocks-tbody');
-            const wrapper = document.getElementById('stocks-table-wrapper');
+  tbody.innerHTML = entries.map(e => {
+    const chgColor = (e.change || 0) >= 0 ? 'green' : 'red';
+    const oiChgColor = (e.oi_change || 0) >= 0 ? 'green' : 'red';
+    const oiPctColor = (e.oi_change_pct || 0) >= 0 ? 'green' : 'red';
+    return `<tr>
+      <td class="chk"><input type="checkbox"></td>
+      <td class="left" style="font-weight:500">${e.name || '--'}</td>
+      <td>${e.spot_price ? fmt(e.spot_price, 2) : '--'}</td>
+      <td>${e.ltp ? fmt(e.ltp, 2) : '--'}</td>
+      <td class="${chgColor}">${e.change != null ? fmt(e.change, 2) : '--'}</td>
+      <td class="${chgColor}">${e.change_pct != null ? fmtPct(e.change_pct) : '--'}</td>
+      <td>${e.oi ? fmtInt(e.oi) : '--'}</td>
+      <td class="${oiChgColor}">${e.oi_change != null ? fmtInt(e.oi_change) : '--'}</td>
+      <td class="${oiPctColor}">${e.oi_change_pct != null ? fmtPct(e.oi_change_pct) : '--'}</td>
+      <td>${e.volume ? fmtInt(e.volume) : '--'}</td>
+    </tr>`;
+  }).join('');
+}
 
-            if (!filtered.length) {
-                tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;padding:20px;">No data available</td></tr>';
-                wrapper.style.display = 'block';
-                return;
-            }
+function renderStocksTable(data) {
+  const thead = document.getElementById('tableHead');
+  const tbody = document.getElementById('tableBody');
 
-            tbody.innerHTML = filtered.map((row, idx) => `
-                <tr>
-                    <td class="name-col">
-                        <input type="checkbox" class="checkbox" data-id="${row.security_id}">
-                        ${row.symbol}
-                    </td>
-                    <td class="col-stocks-ltp right-align grey-text">${formatIndian(row.ltp)}</td>
-                    <td class="col-stocks-change right-align ${getColorClass(row.change)}">${row.change > 0 ? '' : ''}${formatIndian(row.change)}</td>
-                    <td class="col-stocks-change-pct right-align ${getColorClass(row.change_pct)}">${row.change_pct > 0 ? '' : ''}${formatIndian(row.change_pct)}%</td>
-                    <td class="col-value right-align grey-text">${formatCrore(row.value_cr)}</td>
-                    <td class="col-stocks-volume right-align last-col grey-text">${formatIndian(row.volume)}</td>
-                </tr>
-            `).join('');
+  thead.innerHTML = `<tr>
+    <th class="left" style="width:32px"></th>
+    <th class="left">Name</th>
+    <th>LTP</th>
+    <th>Change</th>
+    <th>Change %</th>
+    <th>Value (Cr.)</th>
+    <th>Volume</th>
+  </tr>`;
 
-            wrapper.style.display = 'block';
-        }
+  const list = stocksMode === 'gainers' ? (data.gainers || []) : (data.losers || []);
+  if (list.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;padding:40px;color:#555">No stock movers data available. Waiting for market data...</td></tr>';
+    return;
+  }
 
-        function renderIndexTable() {
-            let filtered = [...state.index.data];
+  tbody.innerHTML = list.map(s => {
+    const chgColor = (s.change || 0) >= 0 ? 'green' : 'red';
+    return `<tr>
+      <td class="chk"><input type="checkbox"></td>
+      <td class="left" style="font-weight:500">${s.symbol || s.name || '--'}</td>
+      <td>${s.ltp ? fmt(s.ltp, 2) : '--'}</td>
+      <td class="${chgColor}">${s.change != null ? fmt(s.change, 2) : '--'}</td>
+      <td class="${chgColor}">${s.change_pct != null ? fmtPct(s.change_pct) : '--'}</td>
+      <td>${s.value_cr != null ? fmtVolCr(s.value_cr) : '--'}</td>
+      <td>${s.volume ? fmtInt(s.volume) : '--'}</td>
+    </tr>`;
+  }).join('');
+}
 
-            // Apply filter
-            if (state.index.filter !== 'all') {
-                // Filter logic for NSE/BSE based on index name
-                filtered = filtered.filter(idx => {
-                    if (state.index.filter === 'nse') {
-                        return idx.name.includes('NIFTY') || idx.name.includes('SENSEX');
-                    } else if (state.index.filter === 'bse') {
-                        return idx.name.includes('SENSEX') || idx.name.includes('BSE');
-                    }
-                    return true;
-                });
-            }
+function renderIndexTable(data) {
+  const thead = document.getElementById('tableHead');
+  const tbody = document.getElementById('tableBody');
 
-            const tbody = document.getElementById('index-tbody');
-            const wrapper = document.getElementById('index-table-wrapper');
+  thead.innerHTML = `<tr>
+    <th class="left">Name</th>
+    <th>LTP</th>
+    <th>Change</th>
+    <th>Change %</th>
+    <th>Open</th>
+    <th>High</th>
+    <th>Low</th>
+    <th>Prev Close</th>
+  </tr>`;
 
-            if (!filtered.length) {
-                tbody.innerHTML = '<tr><td colspan="7" style="text-align:center;padding:20px;">No data available</td></tr>';
-                wrapper.style.display = 'block';
-                return;
-            }
+  const indices = data.indices || [];
+  if (indices.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;padding:40px;color:#555">No index data available. Waiting for market data...</td></tr>';
+    return;
+  }
 
-            tbody.innerHTML = filtered.map((row, idx) => `
-                <tr>
-                    <td class="name-col">
-                        <input type="checkbox" class="checkbox" data-id="${row.security_id}">
-                        ${row.name}
-                    </td>
-                    <td class="col-index-ltp right-align grey-text">${formatIndian(row.ltp)}</td>
-                    <td class="col-index-change right-align ${getColorClass(row.change_pct)}">${row.change_pct > 0 ? '' : ''}${formatIndian(row.change_pct)}%</td>
-                    <td class="col-index-open right-align grey-text">${formatIndian(row.open)}</td>
-                    <td class="col-index-high right-align grey-text">${formatIndian(row.high)}</td>
-                    <td class="col-index-low right-align grey-text">${formatIndian(row.low) || '-'}</td>
-                    <td class="col-index-prev right-align last-col grey-text">${formatIndian(row.prev_close) || '-'}</td>
-                </tr>
-            `).join('');
+  tbody.innerHTML = indices.map(idx => {
+    const chgColor = (idx.change || 0) >= 0 ? 'green' : 'red';
+    return `<tr>
+      <td class="left" style="font-weight:500">${idx.name || '--'}</td>
+      <td>${idx.ltp ? fmt(idx.ltp, 2) : '--'}</td>
+      <td class="${chgColor}">${idx.change != null ? fmt(idx.change, 2) : '--'}</td>
+      <td class="${chgColor}">${idx.change_pct != null ? fmtPct(idx.change_pct) : '--'}</td>
+      <td>${idx.open ? fmt(idx.open, 2) : '--'}</td>
+      <td>${idx.high ? fmt(idx.high, 2) : '--'}</td>
+      <td>${idx.low ? fmt(idx.low, 2) : '--'}</td>
+      <td>${idx.prev_close ? fmt(idx.prev_close, 2) : '--'}</td>
+    </tr>`;
+  }).join('');
 
-            wrapper.style.display = 'block';
-        }
+  // Update ticker if we have data
+  if (indices.length > 0) {
+    updateTicker(indices);
+  }
+}
 
-        // Event Listeners
-        document.querySelectorAll('.main-tab').forEach(btn => {
-            btn.addEventListener('click', (e) => {
-                document.querySelectorAll('.main-tab').forEach(b => b.classList.remove('active'));
-                e.target.classList.add('active');
+function updateTicker(indices) {
+  const find = (name) => indices.find(i => i.name && i.name.toLowerCase().includes(name.toLowerCase()));
+  const setTk = (id, chgId, item) => {
+    if (!item) return;
+    const priceEl = document.getElementById(id);
+    const chgEl = document.getElementById(chgId);
+    if (priceEl) priceEl.textContent = fmt(item.ltp, 2);
+    if (chgEl) {
+      const up = (item.change || 0) >= 0;
+      chgEl.textContent = `${up ? '+' : ''}${fmt(item.change, 2)} (${fmt(Math.abs(item.change_pct), 2)}%) ${up ? '↑' : '↓'}`;
+      chgEl.className = `ticker-change ${up ? 'positive' : 'negative'}`;
+    }
+  };
+  setTk('tkNifty', 'tkNiftyChg', find('nifty 50') || find('nifty'));
+  setTk('tkBank', 'tkBankChg', find('bank nifty') || find('banknifty'));
+  setTk('tkFin', 'tkFinChg', find('fin nifty') || find('finnifty'));
+  setTk('tkVix', 'tkVixChg', find('vix'));
+  setTk('tkMid', 'tkMidChg', find('midcap'));
+}
 
-                document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
-                const tab = e.target.dataset.tab;
-                document.getElementById(tab).classList.add('active');
+async function fetchData() {
+  try {
+    if (activeTab === 'options') {
+      const categoryMap = {
+        'highest-oi': 'HIGHEST_OI',
+        'oi-gainers': 'OI_GAINERS',
+        'oi-losers': 'OI_LOSERS',
+        'top-volume': 'TOP_VOLUME',
+        'top-value': 'TOP_VALUE',
+        'price-gainers': 'PRICE_GAINERS',
+        'price-losers': 'PRICE_LOSERS'
+      };
+      const cat = categoryMap[optionsFilter] || 'HIGHEST_OI';
+      const res = await fetch(`/api/market/option-movers?category=${cat}`);
+      const data = await res.json();
+      renderOptionsTable(data);
+    } else if (activeTab === 'stocks') {
+      const res = await fetch('/api/market/stock-movers');
+      const data = await res.json();
+      renderStocksTable(data);
+    } else if (activeTab === 'index') {
+      const res = await fetch('/api/market/indices');
+      const data = await res.json();
+      renderIndexTable(data);
+    } else {
+      // Other tabs show empty state
+      document.getElementById('tableHead').innerHTML = '';
+      document.getElementById('tableBody').innerHTML = '<tr><td style="text-align:center;padding:60px;color:#555">Coming soon...</td></tr>';
+    }
+  } catch (err) {
+    console.error('Fetch error:', err);
+    document.getElementById('tableBody').innerHTML = `<tr><td colspan="10" style="text-align:center;padding:40px;color:#555">Connection error: ${err.message}</td></tr>`;
+  }
+}
 
-                state.currentTab = tab;
+// Also fetch indices for the ticker bar on load
+async function fetchTicker() {
+  try {
+    const res = await fetch('/api/market/indices');
+    if (res.ok) {
+      const data = await res.json();
+      if (data.indices && data.indices.length > 0) {
+        updateTicker(data.indices);
+      }
+    }
+  } catch (e) {}
+}
 
-                // Fetch data for the new tab
-                if (tab === 'options') fetchOptionsData();
-                if (tab === 'stocks') fetchStocksData();
-                if (tab === 'index') fetchIndexData();
-            });
-        });
-
-        // Options filter buttons
-        document.querySelectorAll('#options-filter-tabs .filter-btn').forEach(btn => {
-            btn.addEventListener('click', (e) => {
-                document.querySelectorAll('#options-filter-tabs .filter-btn').forEach(b => b.classList.remove('active'));
-                e.target.classList.add('active');
-                state.options.filter = e.target.dataset.filter;
-                renderOptionsTable();
-            });
-        });
-
-        // Options dropdowns
-        document.getElementById('options-expiry').addEventListener('change', (e) => {
-            state.options.expiry = e.target.value;
-            renderOptionsTable();
-        });
-
-        document.getElementById('options-type').addEventListener('change', (e) => {
-            state.options.type = e.target.value;
-            renderOptionsTable();
-        });
-
-        // Stocks view toggle
-        document.querySelectorAll('.toggle-btn').forEach(btn => {
-            btn.addEventListener('click', (e) => {
-                document.querySelectorAll('.toggle-btn').forEach(b => b.classList.remove('active'));
-                e.target.classList.add('active');
-                state.stocks.view = e.target.dataset.view;
-                renderStocksTable();
-            });
-        });
-
-        // Index filters
-        document.querySelectorAll('[data-index-filter]').forEach(btn => {
-            btn.addEventListener('click', (e) => {
-                document.querySelectorAll('[data-index-filter]').forEach(b => b.classList.remove('active'));
-                e.target.classList.add('active');
-                state.index.filter = e.target.dataset.indexFilter;
-                renderIndexTable();
-            });
-        });
-
-        // Auto-refresh
-        function startAutoRefresh() {
-            if (state.autoRefreshInterval) clearInterval(state.autoRefreshInterval);
-
-            state.autoRefreshInterval = setInterval(() => {
-                if (state.currentTab === 'options') fetchOptionsData();
-                if (state.currentTab === 'stocks') fetchStocksData();
-                if (state.currentTab === 'index') fetchIndexData();
-            }, 10000);
-        }
-
-        // Initialize
-        function init() {
-            fetchOptionsData();
-            startAutoRefresh();
-        }
-
-        // Start on page load
-        if (document.readyState === 'loading') {
-            document.addEventListener('DOMContentLoaded', init);
-        } else {
-            init();
-        }
-
-        // Cleanup on page unload
-        window.addEventListener('beforeunload', () => {
-            if (state.autoRefreshInterval) clearInterval(state.autoRefreshInterval);
-        });
-    </script>
+// Init
+renderWatchlist();
+fetchData();
+fetchTicker();
+setInterval(() => { fetchData(); fetchTicker(); }, 10000);
+</script>
 </body>
 </html>

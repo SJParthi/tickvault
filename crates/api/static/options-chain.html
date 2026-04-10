@@ -1,868 +1,699 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>DLT Options Chain</title>
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DLT - Options Chain</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#000;color:#e8e8e8;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;font-size:14px;overflow:hidden;height:100vh;display:flex;flex-direction:column}
+::-webkit-scrollbar{width:6px;height:6px}
+::-webkit-scrollbar-track{background:#121212}
+::-webkit-scrollbar-thumb{background:#333;border-radius:3px}
+::-webkit-scrollbar-thumb:hover{background:#555}
 
-        body {
-            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-            background-color: #000000;
-            color: #8E8E8E;
-            font-weight: 400;
-            font-size: 14px;
-            line-height: 1.5;
-        }
+/* Header bar */
+.header-bar{display:flex;align-items:center;justify-content:space-between;padding:8px 16px;background:#121212;border-bottom:1px solid #242424;min-height:48px}
+.header-left{display:flex;align-items:center;gap:12px}
+.dhan-logo{width:28px;height:28px;border-radius:50%;background:#1a73e8;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:14px;color:#fff}
+.underlying-name{font-size:16px;font-weight:600;color:#fff}
+.underlying-price{font-size:16px;font-weight:600;color:#fff}
+.underlying-change{font-size:14px;margin-left:4px}
+.underlying-change.positive{color:#5CA81D}
+.underlying-change.negative{color:#DD6565}
+.header-right{display:flex;align-items:center;gap:24px}
+.ohlc-item{display:flex;gap:4px;font-size:13px;color:#8E8E8E}
+.ohlc-item span:last-child{color:#e8e8e8}
+.index-toggle{display:flex;gap:12px;margin-left:16px}
+.index-toggle span{font-size:13px;color:#8E8E8E;cursor:pointer;padding:4px 8px}
+.index-toggle span.active{color:#518EF8;font-weight:500}
 
-        /* Header */
-        .header {
-            background-color: #121212;
-            border-bottom: 1px solid #242424;
-            padding: 16px 24px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            height: 60px;
-        }
+/* Title row */
+.title-row{display:flex;align-items:center;padding:10px 16px;gap:12px;border-bottom:1px solid #242424;background:#000}
+.title-text{font-size:16px;font-weight:600;color:#fff;white-space:nowrap}
+.expiry-tabs{display:flex;gap:6px;margin-left:12px}
+.expiry-tab{padding:5px 14px;border-radius:16px;font-size:13px;cursor:pointer;border:1px solid #333;color:#8E8E8E;background:transparent;transition:all .2s}
+.expiry-tab:hover{border-color:#555}
+.expiry-tab.active{background:#E8590C;color:#fff;border-color:#E8590C}
+.next-expiry-btn{display:flex;align-items:center;gap:4px;padding:5px 12px;border-radius:16px;font-size:13px;cursor:pointer;border:1px solid #333;color:#8E8E8E;background:transparent}
+.next-expiry-btn:hover{border-color:#555}
+.next-expiry-btn svg{width:12px;height:12px}
+.expiry-dropdown{position:absolute;background:#1a1a1a;border:1px solid #333;border-radius:8px;padding:4px 0;z-index:100;min-width:140px;display:none;margin-top:4px}
+.expiry-dropdown.show{display:block}
+.expiry-dropdown-item{padding:8px 16px;font-size:13px;color:#e8e8e8;cursor:pointer}
+.expiry-dropdown-item:hover{background:#242424}
+.settings-icon{margin-left:auto;cursor:pointer;color:#8E8E8E;display:flex;align-items:center;gap:8px}
+.settings-icon svg{width:18px;height:18px}
 
-        .header-left {
-            display: flex;
-            align-items: center;
-            gap: 12px;
-        }
+/* Stats row */
+.stats-row{display:flex;align-items:center;padding:8px 16px;gap:24px;border-bottom:1px solid #242424;background:#000}
+.stat-item{display:flex;flex-direction:column}
+.stat-label{font-size:11px;color:#8E8E8E}
+.stat-value{font-size:14px;color:#fff;font-weight:500}
+.show-options{display:flex;align-items:center;gap:16px;margin-left:24px}
+.show-option{display:flex;align-items:center;gap:6px;font-size:13px;color:#8E8E8E;cursor:pointer}
+.show-option input[type="checkbox"]{width:16px;height:16px;accent-color:#E8590C;cursor:pointer}
+.show-option.checked{color:#e8e8e8}
 
-        .header-title {
-            font-size: 18px;
-            font-weight: 300;
-            color: #FFFFFF;
-            letter-spacing: 0.3px;
-        }
+/* Table container */
+.table-wrapper{flex:1;overflow:hidden;position:relative;display:flex}
+.table-scroll{overflow:auto;flex:1}
+table{width:max-content;min-width:100%;border-collapse:separate;border-spacing:0;table-layout:auto}
+thead{position:sticky;top:0;z-index:10}
+th{background:#121212;color:#8E8E8E;font-weight:300;font-size:12px;padding:6px 10px;text-align:right;white-space:nowrap;border-bottom:1px solid #242424;position:sticky;top:0}
+th.center{text-align:center}
+th.left{text-align:left}
+td{padding:4px 10px;text-align:right;white-space:nowrap;height:42px;vertical-align:middle;font-size:14px;border-bottom:1px solid #1a1a1a}
+td.center{text-align:center}
+td.left{text-align:left}
 
-        .header-right {
-            display: flex;
-            align-items: center;
-            gap: 16px;
-        }
+/* Strike price column - sticky center */
+th.strike-col,td.strike-col{position:sticky;left:50%;transform:translateX(-50%);z-index:5;background:#000;text-align:center;font-weight:600;min-width:110px;padding:4px 16px}
+th.strike-col{background:#121212;z-index:11}
 
-        .back-link {
-            color: #518EF8;
-            text-decoration: none;
-            font-size: 14px;
-            font-weight: 400;
-            cursor: pointer;
-            transition: color 0.2s;
-        }
+/* CE/PE header highlights */
+th.ce-header{background:#3d6b1e;color:#fff;font-weight:500;border-radius:4px 4px 0 0}
+th.pe-header{background:#8b4049;color:#fff;font-weight:500;border-radius:4px 4px 0 0}
 
-        .back-link:hover {
-            color: #6BA3FF;
-        }
+/* Row colors */
+tr.itm-ce td.ce-cell{background:rgba(238,162,14,0.08)}
+tr.itm-pe td.pe-cell{background:rgba(141,125,240,0.06)}
+tr.atm-row td{border-top:1px solid #518EF8;border-bottom:1px solid #518EF8}
+tr:hover td{background:rgba(255,255,255,0.03)}
 
-        /* Controls Bar */
-        .controls-bar {
-            background-color: #121212;
-            border-bottom: 1px solid #242424;
-            padding: 16px 24px;
-            display: flex;
-            gap: 24px;
-            align-items: center;
-        }
+/* Value colors */
+.green{color:#5CA81D}
+.red{color:#DD6565}
+.blue{color:#518EF8}
+.dim{color:#555}
 
-        .control-group {
-            display: flex;
-            flex-direction: column;
-            gap: 6px;
-        }
+/* LTP change with background */
+.ltp-chg-green{color:#5CA81D}
+.ltp-chg-red{color:#DD6565}
+.ltp-chg-paren{font-size:12px}
 
-        .control-label {
-            font-size: 12px;
-            font-weight: 400;
-            color: #8E8E8E;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-        }
+/* OI badges */
+.oi-badge{display:inline-block;padding:1px 6px;border-radius:3px;font-size:10px;font-weight:600;margin-top:2px}
+.oi-badge.oi-1{background:#E8590C;color:#fff}
+.oi-badge.oi-2{background:#E8590C;color:#fff}
+.oi-badge.oi-3{background:#E8590C;color:#fff}
+.oi-badge.oi-4{background:#518EF8;color:#fff}
+.oi-badge.oi-5{background:#518EF8;color:#fff}
 
-        select {
-            background-color: #181818;
-            color: #FFFFFF;
-            border: 1px solid #242424;
-            padding: 8px 12px;
-            border-radius: 4px;
-            font-size: 14px;
-            font-weight: 400;
-            font-family: 'Inter', sans-serif;
-            cursor: pointer;
-            transition: border-color 0.2s, background-color 0.2s;
-            min-width: 140px;
-        }
+/* Buildup tags */
+.buildup-tag{display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:500;white-space:nowrap}
+.buildup-tag.short-covering{background:rgba(232,89,12,0.15);color:#E8590C}
+.buildup-tag.long-buildup{background:rgba(92,168,29,0.15);color:#5CA81D}
+.buildup-tag.short-buildup{background:rgba(221,101,101,0.15);color:#DD6565}
+.buildup-tag.long-unwinding{background:rgba(131,131,131,0.15);color:#8E8E8E}
 
-        select:hover {
-            border-color: #393939;
-            background-color: #242424;
-        }
+/* Spot price badge */
+.spot-badge{display:inline-block;padding:2px 10px;border-radius:4px;font-size:12px;font-weight:600;color:#fff}
+.spot-badge.positive{background:#5CA81D}
+.spot-badge.negative{background:#DD6565}
 
-        select:focus {
-            outline: none;
-            border-color: #518EF8;
-            background-color: #242424;
-        }
+/* Volume suffix */
+.vol-suffix{color:#8E8E8E;font-size:11px;margin-left:2px}
 
-        /* Summary Panel */
-        .summary-panel {
-            background-color: #121212;
-            border-bottom: 1px solid #242424;
-            padding: 16px 24px;
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-            gap: 24px;
-        }
+/* Checkbox in table */
+td.chk-cell{text-align:center;width:32px;min-width:32px}
+td.chk-cell input[type="checkbox"]{width:14px;height:14px;accent-color:#518EF8;cursor:pointer}
 
-        .summary-item {
-            display: flex;
-            flex-direction: column;
-            gap: 4px;
-        }
+/* PCR column */
+td.pcr-cell{text-align:center;color:#8E8E8E;font-size:13px}
 
-        .summary-label {
-            font-size: 12px;
-            font-weight: 400;
-            color: #8E8E8E;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-        }
+/* Bottom bar */
+.bottom-bar{display:flex;align-items:center;padding:8px 16px;background:#121212;border-top:1px solid #242424;gap:16px}
+.bottom-btn{display:flex;align-items:center;gap:6px;padding:6px 14px;border-radius:6px;font-size:13px;cursor:pointer;border:1px solid #333;color:#8E8E8E;background:transparent}
+.bottom-btn:hover{border-color:#555;color:#e8e8e8}
+.bottom-btn svg{width:14px;height:14px}
+.bottom-btn .badge{background:#333;color:#8E8E8E;padding:1px 6px;border-radius:4px;font-size:11px;margin-left:4px}
 
-        .summary-value {
-            font-size: 16px;
-            font-weight: 400;
-            color: #FFFFFF;
-        }
+/* Loading */
+.loading-overlay{position:absolute;top:0;left:0;right:0;bottom:0;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.7);z-index:50}
+.spinner{width:32px;height:32px;border:3px solid #333;border-top-color:#518EF8;border-radius:50%;animation:spin 0.8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
 
-        .summary-positive {
-            color: #5CA81D;
-        }
-
-        .summary-negative {
-            color: #DD6565;
-        }
-
-        /* Expiry Tabs */
-        .expiry-tabs {
-            background-color: #121212;
-            border-bottom: 1px solid #242424;
-            padding: 0 24px;
-            display: flex;
-            gap: 0;
-            overflow-x: auto;
-            scroll-behavior: smooth;
-        }
-
-        .expiry-tab {
-            padding: 12px 16px;
-            border-bottom: 2px solid transparent;
-            cursor: pointer;
-            color: #8E8E8E;
-            font-size: 14px;
-            font-weight: 400;
-            white-space: nowrap;
-            transition: color 0.2s, border-color 0.2s;
-        }
-
-        .expiry-tab:hover {
-            color: #FFFFFF;
-        }
-
-        .expiry-tab.active {
-            color: #518EF8;
-            border-bottom-color: #518EF8;
-        }
-
-        /* Main Content */
-        .main-content {
-            padding: 24px;
-            overflow-x: auto;
-        }
-
-        .loading-message,
-        .error-message,
-        .no-data-message {
-            text-align: center;
-            padding: 48px 24px;
-            font-size: 16px;
-        }
-
-        .loading-message {
-            color: #8E8E8E;
-        }
-
-        .error-message {
-            color: #DD6565;
-        }
-
-        .no-data-message {
-            color: #8E8E8E;
-        }
-
-        /* Table */
-        .options-table {
-            width: 100%;
-            border-collapse: separate;
-            border-spacing: 0;
-            table-layout: auto;
-        }
-
-        .options-table th {
-            height: 42px;
-            font-weight: 300;
-            font-size: 14px;
-            color: #8E8E8E;
-            padding: 1px 8px 0px 0px;
-            text-align: right;
-            background-color: #121212;
-            border-bottom: 1px solid #242424;
-            position: sticky;
-            top: 0;
-            z-index: 10;
-        }
-
-        .options-table th:first-child {
-            text-align: left;
-            padding-left: 8px;
-        }
-
-        .options-table td {
-            height: 42px;
-            font-size: 14px;
-            color: #8E8E8E;
-            padding: 0px 8px 0px 0px;
-            text-align: right;
-            border-bottom: 1px solid #1a1a1a;
-        }
-
-        .options-table td:first-child {
-            text-align: left;
-            padding-left: 8px;
-        }
-
-        /* Call Side */
-        .call-oi,
-        .call-volume,
-        .call-iv,
-        .call-delta,
-        .call-theta,
-        .call-gamma,
-        .call-vega,
-        .call-chg,
-        .call-ltp {
-            text-align: right;
-        }
-
-        .call-chg {
-            font-weight: 400;
-        }
-
-        /* LTP Column - Always Grey */
-        .call-ltp,
-        .put-ltp {
-            color: #8E8E8E !important;
-            font-weight: 400;
-        }
-
-        /* Strike Column - Center */
-        .strike-cell {
-            text-align: center;
-            font-weight: 400;
-            color: #FFFFFF;
-            background-color: #000000;
-            padding: 0px 16px;
-            min-width: 80px;
-        }
-
-        .strike-header {
-            text-align: center;
-            background-color: #121212;
-        }
-
-        /* Put Side */
-        .put-oi,
-        .put-volume,
-        .put-iv,
-        .put-delta,
-        .put-theta,
-        .put-gamma,
-        .put-vega,
-        .put-chg,
-        .put-ltp {
-            text-align: right;
-        }
-
-        .put-chg {
-            font-weight: 400;
-        }
-
-        /* Data Colors */
-        .positive {
-            color: #5CA81D;
-        }
-
-        .negative {
-            color: #DD6565;
-        }
-
-        /* ATM Row */
-        .atm-row {
-            border-top: 1px solid #518EF8;
-            border-bottom: 1px solid #518EF8;
-        }
-
-        .atm-row .strike-cell {
-            border-left: 1px solid #518EF8;
-            border-right: 1px solid #518EF8;
-        }
-
-        /* ITM Backgrounds */
-        .itm-ce {
-            background-color: rgba(238, 162, 14, 0.17);
-        }
-
-        .itm-pe {
-            background-color: rgba(141, 125, 240, 0.14);
-        }
-
-        /* Status Messages */
-        .status-bar {
-            background-color: #121212;
-            border-top: 1px solid #242424;
-            padding: 12px 24px;
-            font-size: 12px;
-            color: #8E8E8E;
-            text-align: right;
-        }
-
-        /* Responsive */
-        @media (max-width: 1024px) {
-            .summary-panel {
-                grid-template-columns: repeat(2, 1fr);
-            }
-        }
-
-        @media (max-width: 640px) {
-            .controls-bar {
-                flex-direction: column;
-                gap: 12px;
-                align-items: flex-start;
-            }
-
-            .control-group {
-                width: 100%;
-            }
-
-            select {
-                width: 100%;
-            }
-
-            .summary-panel {
-                grid-template-columns: 1fr;
-            }
-        }
-    </style>
+/* Connection indicator */
+.conn-indicator{display:flex;align-items:center;gap:4px;font-size:11px}
+.conn-dot{width:6px;height:6px;border-radius:50%}
+.conn-dot.connected{background:#5CA81D}
+.conn-dot.disconnected{background:#DD6565}
+</style>
 </head>
 <body>
-    <!-- Header -->
-    <div class="header">
-        <div class="header-left">
-            <div class="header-title">DLT Options Chain</div>
-        </div>
-        <div class="header-right">
-            <a href="/portal" class="back-link">← Back to Control Panel</a>
-        </div>
+
+<!-- Header Bar -->
+<div class="header-bar">
+  <div class="header-left">
+    <div class="dhan-logo">D</div>
+    <span class="underlying-name" id="hdrUnderlying">NIFTY 50</span>
+    <span class="underlying-price" id="hdrPrice">--</span>
+    <span class="underlying-change positive" id="hdrChange">--</span>
+  </div>
+  <div class="header-right">
+    <div class="ohlc-item"><span>Open:</span><span id="hdrOpen">--</span></div>
+    <div class="ohlc-item"><span>High:</span><span id="hdrHigh">--</span></div>
+    <div class="ohlc-item"><span>Low:</span><span id="hdrLow">--</span></div>
+    <div class="ohlc-item"><span>Close:</span><span id="hdrClose">--</span></div>
+    <div class="index-toggle">
+      <span class="active" data-idx="NIFTY">NIFTY 50</span>
+      <span data-idx="SENSEX">SENSEX</span>
     </div>
-
-    <!-- Controls Bar -->
-    <div class="controls-bar">
-        <div class="control-group">
-            <label class="control-label">Underlying</label>
-            <select id="underlyingSelect">
-                <option value="NIFTY">NIFTY 50</option>
-                <option value="BANKNIFTY">BANK NIFTY</option>
-                <option value="FINNIFTY">FIN NIFTY</option>
-                <option value="MIDCPNIFTY">MIDCP NIFTY</option>
-            </select>
-        </div>
-
-        <div class="control-group">
-            <label class="control-label">Refresh Interval</label>
-            <select id="refreshSelect">
-                <option value="0">Off</option>
-                <option value="5000">5 seconds</option>
-                <option value="10000">10 seconds</option>
-                <option value="30000">30 seconds</option>
-            </select>
-        </div>
-    </div>
-
-    <!-- Summary Panel -->
-    <div class="summary-panel" id="summaryPanel">
-        <div class="summary-item">
-            <div class="summary-label">Spot Price</div>
-            <div class="summary-value" id="spotPrice">—</div>
-        </div>
-        <div class="summary-item">
-            <div class="summary-label">ATM Strike</div>
-            <div class="summary-value" id="atmStrike">—</div>
-        </div>
-        <div class="summary-item">
-            <div class="summary-label">ATM IV (CE)</div>
-            <div class="summary-value" id="atmIvCe">—</div>
-        </div>
-        <div class="summary-item">
-            <div class="summary-label">ATM IV (PE)</div>
-            <div class="summary-value" id="atmIvPe">—</div>
-        </div>
-        <div class="summary-item">
-            <div class="summary-label">PCR Ratio</div>
-            <div class="summary-value" id="pcrRatio">—</div>
-        </div>
-        <div class="summary-item">
-            <div class="summary-label">Total CE OI</div>
-            <div class="summary-value" id="totalCeOi">—</div>
-        </div>
-        <div class="summary-item">
-            <div class="summary-label">Total PE OI</div>
-            <div class="summary-value" id="totalPeOi">—</div>
-        </div>
-        <div class="summary-item">
-            <div class="summary-label">Contracts</div>
-            <div class="summary-value" id="contractCount">—</div>
-        </div>
-    </div>
-
-    <!-- Expiry Tabs -->
-    <div class="expiry-tabs" id="expiryTabs"></div>
-
-    <!-- Main Content -->
-    <div class="main-content">
-        <div id="loadingMessage" class="loading-message">Loading option chain data...</div>
-        <div id="errorMessage" class="error-message" style="display: none;"></div>
-        <div id="tableContainer"></div>
-    </div>
-
-    <!-- Status Bar -->
-    <div class="status-bar" id="statusBar">Ready</div>
-
-    <script>
-        class OptionsChain {
-            constructor() {
-                this.currentUnderlying = 'NIFTY';
-                this.currentExpiry = null;
-                this.data = null;
-                this.refreshInterval = null;
-                this.refreshRate = 0;
-                this.lastUpdate = null;
-
-                this.init();
-            }
-
-            init() {
-                this.setupEventListeners();
-                this.fetchData();
-            }
-
-            setupEventListeners() {
-                document.getElementById('underlyingSelect').addEventListener('change', (e) => {
-                    this.currentUnderlying = e.target.value;
-                    this.currentExpiry = null;
-                    this.fetchData();
-                });
-
-                document.getElementById('refreshSelect').addEventListener('change', (e) => {
-                    this.refreshRate = parseInt(e.target.value);
-                    this.setupAutoRefresh();
-                });
-            }
-
-            async fetchData() {
-                try {
-                    this.showLoading();
-
-                    const response = await fetch(`/api/option-chain?underlying=${this.currentUnderlying}&expiry=${this.currentExpiry || ''}`);
-
-                    if (!response.ok) {
-                        throw new Error(`API Error: ${response.status}`);
-                    }
-
-                    this.data = await response.json();
-                    this.lastUpdate = new Date();
-
-                    // Set default expiry if not set
-                    if (!this.currentExpiry && this.data.available_expiries && this.data.available_expiries.length > 0) {
-                        this.currentExpiry = this.data.available_expiries[0];
-                    }
-
-                    this.renderExpiryTabs();
-                    this.renderSummary();
-                    this.renderTable();
-                    this.hideLoading();
-                    this.updateStatus();
-
-                } catch (error) {
-                    console.error('Error fetching data:', error);
-                    this.showError(`Unable to load option chain data: ${error.message}`);
-                    this.updateStatus();
-                }
-            }
-
-            async fetchPcrData() {
-                try {
-                    const response = await fetch(`/api/pcr?underlying=${this.currentUnderlying}`);
-                    if (response.ok) {
-                        const pcrData = await response.json();
-                        return pcrData.ratio || null;
-                    }
-                    return null;
-                } catch (error) {
-                    console.error('Error fetching PCR data:', error);
-                    return null;
-                }
-            }
-
-            renderExpiryTabs() {
-                if (!this.data || !this.data.available_expiries) return;
-
-                const tabsContainer = document.getElementById('expiryTabs');
-                tabsContainer.innerHTML = '';
-
-                this.data.available_expiries.forEach(expiry => {
-                    const tab = document.createElement('div');
-                    tab.className = 'expiry-tab';
-                    if (expiry === this.currentExpiry) {
-                        tab.classList.add('active');
-                    }
-                    tab.textContent = this.formatDate(expiry);
-                    tab.addEventListener('click', () => {
-                        this.currentExpiry = expiry;
-                        this.fetchData();
-                    });
-                    tabsContainer.appendChild(tab);
-                });
-            }
-
-            renderSummary() {
-                if (!this.data) return;
-
-                const spotPrice = this.data.spot_price || 0;
-                const contracts = this.data.contracts || [];
-
-                // Find ATM strike
-                let atmStrike = null;
-                let atmIvCe = null;
-                let atmIvPe = null;
-                let minDiff = Infinity;
-
-                contracts.forEach(contract => {
-                    const diff = Math.abs(contract.strike_price - spotPrice);
-                    if (diff < minDiff) {
-                        minDiff = diff;
-                        atmStrike = contract.strike_price;
-                    }
-                });
-
-                // Get ATM IVs
-                contracts.forEach(contract => {
-                    if (contract.strike_price === atmStrike) {
-                        if (contract.option_type === 'CE') {
-                            atmIvCe = contract.iv;
-                        } else if (contract.option_type === 'PE') {
-                            atmIvPe = contract.iv;
-                        }
-                    }
-                });
-
-                // Calculate totals
-                let totalCeOi = 0;
-                let totalPeOi = 0;
-
-                contracts.forEach(contract => {
-                    if (contract.option_type === 'CE') {
-                        totalCeOi += contract.oi || 0;
-                    } else if (contract.option_type === 'PE') {
-                        totalPeOi += contract.oi || 0;
-                    }
-                });
-
-                // Fetch PCR ratio
-                this.fetchPcrData().then(pcr => {
-                    const pcrValue = pcr ? pcr.toFixed(2) : '—';
-                    document.getElementById('pcrRatio').textContent = pcrValue;
-                });
-
-                document.getElementById('spotPrice').textContent = spotPrice.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-                document.getElementById('atmStrike').textContent = atmStrike ? atmStrike.toLocaleString('en-IN', { minimumFractionDigits: 0 }) : '—';
-                document.getElementById('atmIvCe').textContent = atmIvCe ? (atmIvCe * 100).toFixed(2) + '%' : '—';
-                document.getElementById('atmIvPe').textContent = atmIvPe ? (atmIvPe * 100).toFixed(2) + '%' : '—';
-                document.getElementById('totalCeOi').textContent = this.formatOi(totalCeOi);
-                document.getElementById('totalPeOi').textContent = this.formatOi(totalPeOi);
-                document.getElementById('contractCount').textContent = contracts.length.toLocaleString('en-IN');
-            }
-
-            renderTable() {
-                if (!this.data || !this.data.contracts || this.data.contracts.length === 0) {
-                    this.showNoData();
-                    return;
-                }
-
-                const spotPrice = this.data.spot_price;
-                const contracts = this.data.contracts;
-
-                // Find ATM strike
-                let atmStrike = null;
-                let minDiff = Infinity;
-
-                contracts.forEach(contract => {
-                    const diff = Math.abs(contract.strike_price - spotPrice);
-                    if (diff < minDiff) {
-                        minDiff = diff;
-                        atmStrike = contract.strike_price;
-                    }
-                });
-
-                // Group contracts by strike
-                const strikeMap = {};
-                contracts.forEach(contract => {
-                    const strike = contract.strike_price;
-                    if (!strikeMap[strike]) {
-                        strikeMap[strike] = { CE: null, PE: null };
-                    }
-                    strikeMap[strike][contract.option_type] = contract;
-                });
-
-                // Create table
-                const table = document.createElement('table');
-                table.className = 'options-table';
-
-                // Header
-                const thead = document.createElement('thead');
-                const headerRow = document.createElement('tr');
-
-                const headers = [
-                    'OI', 'Vol', 'IV', 'Delta', 'Theta', 'Gamma', 'Vega', 'Chg%', 'LTP',
-                    'STRIKE',
-                    'LTP', 'Chg%', 'Vega', 'Gamma', 'Theta', 'Delta', 'IV', 'Vol', 'OI'
-                ];
-
-                headers.forEach((header, idx) => {
-                    const th = document.createElement('th');
-                    if (header === 'STRIKE') {
-                        th.className = 'strike-header';
-                    }
-                    th.textContent = header;
-                    headerRow.appendChild(th);
-                });
-
-                thead.appendChild(headerRow);
-                table.appendChild(thead);
-
-                // Body
-                const tbody = document.createElement('tbody');
-                const strikes = Object.keys(strikeMap).map(Number).sort((a, b) => a - b);
-
-                strikes.forEach(strike => {
-                    const row = document.createElement('tr');
-                    const ceContract = strikeMap[strike].CE;
-                    const peContract = strikeMap[strike].PE;
-                    const isAtm = strike === atmStrike;
-                    const isItmCe = ceContract && ceContract.ltp > 0;
-                    const isItmPe = peContract && peContract.ltp > 0;
-
-                    if (isAtm) {
-                        row.className = 'atm-row';
-                    }
-
-                    // CE Side
-                    const ceFields = [
-                        'oi', 'volume', 'iv', 'delta', 'theta', 'gamma', 'vega', 'change_pct', 'ltp'
-                    ];
-
-                    ceFields.forEach(field => {
-                        const td = document.createElement('td');
-                        const className = `call-${field}`;
-                        td.className = className;
-
-                        if (isItmCe && isAtm) {
-                            td.className += ' itm-ce';
-                        }
-
-                        if (ceContract) {
-                            let value = ceContract[field];
-                            td.textContent = this.formatCellValue(field, value);
-
-                            if ((field === 'change_pct') && value !== null && value !== undefined) {
-                                td.classList.add(value >= 0 ? 'positive' : 'negative');
-                            }
-                        } else {
-                            td.textContent = '—';
-                        }
-
-                        row.appendChild(td);
-                    });
-
-                    // Strike Column
-                    const strikeTd = document.createElement('td');
-                    strikeTd.className = 'strike-cell';
-                    if (isAtm) {
-                        strikeTd.style.borderLeft = '1px solid #518EF8';
-                        strikeTd.style.borderRight = '1px solid #518EF8';
-                    }
-                    if (isItmCe && isAtm) {
-                        strikeTd.className += ' itm-ce';
-                    } else if (isItmPe && isAtm) {
-                        strikeTd.className += ' itm-pe';
-                    }
-                    strikeTd.textContent = strike.toLocaleString('en-IN', { minimumFractionDigits: 0 });
-                    row.appendChild(strikeTd);
-
-                    // PE Side
-                    const peFields = [
-                        'ltp', 'change_pct', 'vega', 'gamma', 'theta', 'delta', 'iv', 'volume', 'oi'
-                    ];
-
-                    peFields.forEach(field => {
-                        const td = document.createElement('td');
-                        const className = `put-${field}`;
-                        td.className = className;
-
-                        if (isItmPe && isAtm) {
-                            td.className += ' itm-pe';
-                        }
-
-                        if (peContract) {
-                            let value = peContract[field];
-                            td.textContent = this.formatCellValue(field, value);
-
-                            if ((field === 'change_pct') && value !== null && value !== undefined) {
-                                td.classList.add(value >= 0 ? 'positive' : 'negative');
-                            }
-                        } else {
-                            td.textContent = '—';
-                        }
-
-                        row.appendChild(td);
-                    });
-
-                    tbody.appendChild(row);
-                });
-
-                table.appendChild(tbody);
-
-                const container = document.getElementById('tableContainer');
-                container.innerHTML = '';
-                container.appendChild(table);
-
-                // Auto-scroll to ATM
-                this.scrollToAtm();
-            }
-
-            scrollToAtm() {
-                const atmRow = document.querySelector('.atm-row');
-                if (atmRow) {
-                    setTimeout(() => {
-                        atmRow.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                    }, 100);
-                }
-            }
-
-            formatCellValue(field, value) {
-                if (value === null || value === undefined) return '—';
-
-                switch (field) {
-                    case 'oi':
-                    case 'volume':
-                        return this.formatOi(value);
-                    case 'iv':
-                        return (value * 100).toFixed(2) + '%';
-                    case 'delta':
-                    case 'gamma':
-                    case 'vega':
-                        return value.toFixed(3);
-                    case 'theta':
-                        return value.toFixed(2);
-                    case 'change_pct':
-                        return value.toFixed(2) + '%';
-                    case 'ltp':
-                        return value.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-                    default:
-                        return value.toString();
-                }
-            }
-
-            formatOi(value) {
-                if (value >= 100000) {
-                    return (value / 100000).toFixed(1) + 'L';
-                } else if (value >= 1000) {
-                    return (value / 1000).toFixed(1) + 'K';
-                }
-                return value.toString();
-            }
-
-            formatDate(dateString) {
-                const date = new Date(dateString);
-                const options = { month: 'short', day: 'numeric', year: 'numeric' };
-                return date.toLocaleDateString('en-IN', options);
-            }
-
-            showLoading() {
-                document.getElementById('loadingMessage').style.display = 'block';
-                document.getElementById('errorMessage').style.display = 'none';
-                document.getElementById('tableContainer').innerHTML = '';
-            }
-
-            hideLoading() {
-                document.getElementById('loadingMessage').style.display = 'none';
-            }
-
-            showError(message) {
-                document.getElementById('errorMessage').textContent = message;
-                document.getElementById('errorMessage').style.display = 'block';
-                document.getElementById('loadingMessage').style.display = 'none';
-                document.getElementById('tableContainer').innerHTML = '';
-            }
-
-            showNoData() {
-                const noDataDiv = document.createElement('div');
-                noDataDiv.className = 'no-data-message';
-                noDataDiv.textContent = 'No option chain data available for the selected underlying and expiry.';
-                document.getElementById('tableContainer').innerHTML = '';
-                document.getElementById('tableContainer').appendChild(noDataDiv);
-            }
-
-            setupAutoRefresh() {
-                if (this.refreshInterval) {
-                    clearInterval(this.refreshInterval);
-                    this.refreshInterval = null;
-                }
-
-                if (this.refreshRate > 0) {
-                    this.refreshInterval = setInterval(() => {
-                        this.fetchData();
-                    }, this.refreshRate);
-                }
-            }
-
-            updateStatus() {
-                const underlying = document.getElementById('underlyingSelect').selectedOptions[0].textContent;
-                const timeStr = this.lastUpdate ? this.lastUpdate.toLocaleTimeString() : '—';
-                document.getElementById('statusBar').textContent = `${underlying} • Updated: ${timeStr}`;
-            }
+  </div>
+</div>
+
+<!-- Title Row -->
+<div class="title-row">
+  <span class="title-text" id="titleText">NIFTY 50 Options Chain</span>
+  <div class="expiry-tabs" id="expiryTabs"></div>
+  <div style="position:relative">
+    <button class="next-expiry-btn" id="nextExpiryBtn">
+      Next Expiry <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 9l6 6 6-6"/></svg>
+    </button>
+    <div class="expiry-dropdown" id="expiryDropdown"></div>
+  </div>
+  <div class="settings-icon">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12.22 2h-.44a2 2 0 00-2 2v.18a2 2 0 01-1 1.73l-.43.25a2 2 0 01-2 0l-.15-.08a2 2 0 00-2.73.73l-.22.38a2 2 0 00.73 2.73l.15.1a2 2 0 011 1.72v.51a2 2 0 01-1 1.74l-.15.09a2 2 0 00-.73 2.73l.22.38a2 2 0 002.73.73l.15-.08a2 2 0 012 0l.43.25a2 2 0 011 1.73V20a2 2 0 002 2h.44a2 2 0 002-2v-.18a2 2 0 011-1.73l.43-.25a2 2 0 012 0l.15.08a2 2 0 002.73-.73l.22-.39a2 2 0 00-.73-2.73l-.15-.08a2 2 0 01-1-1.74v-.5a2 2 0 011-1.74l.15-.09a2 2 0 00.73-2.73l-.22-.38a2 2 0 00-2.73-.73l-.15.08a2 2 0 01-2 0l-.43-.25a2 2 0 01-1-1.73V4a2 2 0 00-2-2z"/><circle cx="12" cy="12" r="3"/></svg>
+  </div>
+</div>
+
+<!-- Stats Row -->
+<div class="stats-row">
+  <div class="stat-item"><span class="stat-label">ATM IV</span><span class="stat-value" id="statAtmIv">--</span></div>
+  <div class="stat-item"><span class="stat-label">Days for Expiry</span><span class="stat-value" id="statDte">--</span></div>
+  <div class="stat-item"><span class="stat-label">Market Lot</span><span class="stat-value" id="statLot">--</span></div>
+  <div class="stat-item"><span class="stat-label">PCR</span><span class="stat-value" id="statPcr">--</span></div>
+  <div class="show-options">
+    <span style="font-size:13px;color:#8E8E8E;margin-right:4px">Show</span>
+    <label class="show-option"><input type="checkbox" id="perLotChk"> Per Lot</label>
+    <label class="show-option checked"><input type="checkbox" id="buildupChk" checked> Buildup</label>
+  </div>
+</div>
+
+<!-- Table -->
+<div class="table-wrapper" id="tableWrapper">
+  <div class="table-scroll" id="tableScroll">
+    <table id="chainTable">
+      <thead>
+        <tr id="headerRow"></tr>
+      </thead>
+      <tbody id="chainBody"></tbody>
+    </table>
+  </div>
+  <div class="loading-overlay" id="loadingOverlay" style="display:none">
+    <div class="spinner"></div>
+  </div>
+</div>
+
+<!-- Bottom Bar -->
+<div class="bottom-bar">
+  <button class="bottom-btn">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21l-7-5-7 5V5a2 2 0 012-2h10a2 2 0 012 2z"/></svg>
+    Add to Watchlist <span class="badge">0</span>
+  </button>
+  <button class="bottom-btn">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M6 2L3 6v14a2 2 0 002 2h14a2 2 0 002-2V6l-3-4z"/><line x1="3" y1="6" x2="21" y2="6"/></svg>
+    Add to Basket <span class="badge">0</span>
+  </button>
+  <div style="flex:1"></div>
+  <div class="conn-indicator">
+    <div class="conn-dot connected" id="connDot"></div>
+    <span id="connText" style="color:#8E8E8E">DLT Backend</span>
+  </div>
+  <span style="font-size:11px;color:#555;margin-left:8px">Your Strategy</span>
+</div>
+
+<script>
+const CONFIG = {
+  underlyings: {
+    'NIFTY': { name: 'NIFTY 50', lot: 75 },
+    'BANKNIFTY': { name: 'BANK NIFTY', lot: 30 },
+    'FINNIFTY': { name: 'FIN NIFTY', lot: 40 },
+    'MIDCPNIFTY': { name: 'MIDCP NIFTY', lot: 50 },
+    'SENSEX': { name: 'SENSEX', lot: 20 },
+    'BANKEX': { name: 'BANKEX', lot: 20 }
+  },
+  refreshMs: 5000
+};
+
+let state = {
+  underlying: 'NIFTY',
+  expiry: null,
+  allExpiries: [],
+  showBuildup: true,
+  showPerLot: false,
+  contracts: [],
+  spotPrice: 0,
+  atmStrike: 0,
+  pcrValue: 0
+};
+
+// Column definitions - matching real Dhan order
+const CE_COLS = [
+  { key: 'ce_buildup', label: 'Buildup', cls: 'left', show: () => state.showBuildup },
+  { key: 'ce_vega', label: 'Vega', cls: '' },
+  { key: 'ce_theta', label: 'Theta', cls: '' },
+  { key: 'ce_gamma', label: 'Gamma', cls: '' },
+  { key: 'ce_delta', label: 'Delta', cls: '' },
+  { key: 'ce_iv', label: 'IV', cls: '' },
+  { key: 'ce_volume', label: 'Volume', cls: '' },
+  { key: 'ce_oi', label: 'OI', cls: '' },
+  { key: 'ce_ltp_chg', label: 'LTP Chg (%)', cls: '' },
+  { key: 'ce_ltp', label: 'LTP', cls: '' },
+  { key: 'ce_chk', label: 'CE', cls: 'center ce-header' }
+];
+
+const PE_COLS = [
+  { key: 'pcr', label: 'PCR', cls: 'center' },
+  { key: 'pe_chk', label: 'PE', cls: 'center pe-header' },
+  { key: 'pe_ltp', label: 'LTP', cls: '' },
+  { key: 'pe_ltp_chg', label: 'LTP Chg (%)', cls: '' },
+  { key: 'pe_oi', label: 'OI', cls: '' },
+  { key: 'pe_volume', label: 'Volume', cls: '' },
+  { key: 'pe_iv', label: 'IV', cls: '' },
+  { key: 'pe_delta', label: 'Delta', cls: '' },
+  { key: 'pe_gamma', label: 'Gamma', cls: '' },
+  { key: 'pe_theta', label: 'Theta', cls: '' },
+  { key: 'pe_vega', label: 'Vega', cls: '' },
+  { key: 'pe_buildup', label: 'Buildup', cls: 'left', show: () => state.showBuildup }
+];
+
+function fmt(n, d=2) {
+  if (n == null || isNaN(n)) return '--';
+  return Number(n).toLocaleString('en-IN', { minimumFractionDigits: d, maximumFractionDigits: d });
+}
+
+function fmtInt(n) {
+  if (n == null || isNaN(n)) return '--';
+  return Number(n).toLocaleString('en-IN');
+}
+
+function fmtVol(n) {
+  if (n == null || isNaN(n)) return '--';
+  const v = Number(n);
+  if (v >= 100000) return (v / 100000).toFixed(2) + '<span class="vol-suffix"> L</span>';
+  if (v >= 1000) return fmtInt(v);
+  return v.toString();
+}
+
+function fmtOI(n) {
+  if (n == null || isNaN(n)) return '--';
+  const v = Number(n);
+  if (v >= 100000) return (v / 100000).toFixed(2) + '<span class="vol-suffix"> L</span>';
+  return fmtInt(v);
+}
+
+function getBuildup(oiChg, priceChg) {
+  if (oiChg == null || priceChg == null) return null;
+  if (oiChg > 0 && priceChg > 0) return { text: 'Long Buildup', cls: 'long-buildup' };
+  if (oiChg > 0 && priceChg < 0) return { text: 'Short Buildup', cls: 'short-buildup' };
+  if (oiChg < 0 && priceChg > 0) return { text: 'Short Covering', cls: 'short-covering' };
+  if (oiChg < 0 && priceChg < 0) return { text: 'Long Unwinding', cls: 'long-unwinding' };
+  return null;
+}
+
+function renderHeaders() {
+  const hr = document.getElementById('headerRow');
+  hr.innerHTML = '';
+  const visibleCE = CE_COLS.filter(c => !c.show || c.show());
+  const visiblePE = PE_COLS.filter(c => !c.show || c.show());
+
+  visibleCE.forEach(c => {
+    const th = document.createElement('th');
+    th.textContent = c.label;
+    th.className = c.cls || '';
+    hr.appendChild(th);
+  });
+
+  const strikeTh = document.createElement('th');
+  strikeTh.textContent = 'Strike Price';
+  strikeTh.className = 'center';
+  strikeTh.style.cssText = 'background:#121212;font-weight:500;min-width:110px';
+  hr.appendChild(strikeTh);
+
+  visiblePE.forEach(c => {
+    const th = document.createElement('th');
+    th.textContent = c.label;
+    th.className = c.cls || '';
+    hr.appendChild(th);
+  });
+}
+
+function renderChain() {
+  const tbody = document.getElementById('chainBody');
+  const contracts = state.contracts;
+  if (!contracts || contracts.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="25" style="text-align:center;padding:40px;color:#555">No option chain data available. Waiting for market data...</td></tr>';
+    return;
+  }
+
+  // Group by strike
+  const strikes = {};
+  contracts.forEach(c => {
+    const s = c.strike_price;
+    if (!strikes[s]) strikes[s] = {};
+    strikes[s][c.option_type] = c;
+  });
+
+  const sortedStrikes = Object.keys(strikes).map(Number).sort((a, b) => a - b);
+  const spot = state.spotPrice || 0;
+
+  // Find ATM strike
+  let atmStrike = sortedStrikes[0];
+  let minDiff = Infinity;
+  sortedStrikes.forEach(s => {
+    const diff = Math.abs(s - spot);
+    if (diff < minDiff) { minDiff = diff; atmStrike = s; }
+  });
+  state.atmStrike = atmStrike;
+
+  // OI rankings for CE and PE
+  const ceOI = sortedStrikes.map(s => ({ strike: s, oi: strikes[s].CE?.oi || 0 })).sort((a, b) => b.oi - a.oi);
+  const peOI = sortedStrikes.map(s => ({ strike: s, oi: strikes[s].PE?.oi || 0 })).sort((a, b) => b.oi - a.oi);
+  const ceOIRank = {};
+  const peOIRank = {};
+  ceOI.slice(0, 5).forEach((item, i) => { if (item.oi > 0) ceOIRank[item.strike] = i + 1; });
+  peOI.slice(0, 5).forEach((item, i) => { if (item.oi > 0) peOIRank[item.strike] = i + 1; });
+
+  const visibleCE = CE_COLS.filter(c => !c.show || c.show());
+  const visiblePE = PE_COLS.filter(c => !c.show || c.show());
+
+  let html = '';
+  sortedStrikes.forEach(strike => {
+    const ce = strikes[strike].CE || {};
+    const pe = strikes[strike].PE || {};
+    const isATM = strike === atmStrike;
+    const isCeITM = spot > strike;
+    const isPeITM = spot < strike;
+
+    let rowClass = '';
+    if (isATM) rowClass = 'atm-row';
+    else if (isCeITM) rowClass = 'itm-ce';
+    else if (isPeITM) rowClass = 'itm-pe';
+
+    const ceBU = getBuildup(ce.oi_change, ce.change);
+    const peBU = getBuildup(pe.oi_change, pe.change);
+
+    html += `<tr class="${rowClass}">`;
+
+    // CE columns
+    visibleCE.forEach(col => {
+      const isCE = col.key.startsWith('ce_') || col.key === 'ce_chk';
+      const cellClass = isCE ? 'ce-cell' : '';
+
+      switch(col.key) {
+        case 'ce_buildup':
+          html += `<td class="${cellClass} left">${ceBU ? `<span class="buildup-tag ${ceBU.cls}">${ceBU.text}</span>` : ''}</td>`;
+          break;
+        case 'ce_vega':
+          html += `<td class="${cellClass}">${ce.vega != null ? fmt(ce.vega, 5) : '--'}</td>`;
+          break;
+        case 'ce_theta':
+          html += `<td class="${cellClass}">${ce.theta != null ? fmt(ce.theta, 2) : '--'}</td>`;
+          break;
+        case 'ce_gamma':
+          html += `<td class="${cellClass}">${ce.gamma != null ? fmt(ce.gamma, 5) : '--'}</td>`;
+          break;
+        case 'ce_delta':
+          html += `<td class="${cellClass}">${ce.delta != null ? fmt(ce.delta, 3) : '--'}</td>`;
+          break;
+        case 'ce_iv':
+          html += `<td class="${cellClass}">${ce.iv != null ? fmt(ce.iv, 2) : '--'}</td>`;
+          break;
+        case 'ce_volume':
+          html += `<td class="${cellClass}">${fmtVol(ce.volume)}</td>`;
+          break;
+        case 'ce_oi':
+          const ceOIBadge = ceOIRank[strike] ? `<br><span class="oi-badge oi-${ceOIRank[strike]}">OI ${ceOIRank[strike]}</span>` : '';
+          html += `<td class="${cellClass}">${fmtOI(ce.oi)}${ceOIBadge}</td>`;
+          break;
+        case 'ce_ltp_chg':
+          const ceChg = ce.change_pct;
+          const ceChgColor = ceChg > 0 ? 'green' : ceChg < 0 ? 'red' : '';
+          const ceChgVal = ce.change != null ? fmt(ce.change, 2) : '--';
+          const ceChgPct = ceChg != null ? `(${fmt(Math.abs(ceChg), 2)}%)` : '';
+          html += `<td class="${cellClass} ${ceChgColor}">${ceChgVal} <span class="ltp-chg-paren ${ceChgColor}">${ceChgPct}</span></td>`;
+          break;
+        case 'ce_ltp':
+          const ceLtp = ce.ltp;
+          const ceLtpBg = isATM && ceLtp ? 'background:rgba(92,168,29,0.2);border-radius:4px;padding:2px 6px' : '';
+          html += `<td class="${cellClass}" style="font-weight:500">${ceLtp != null ? `<span style="${ceLtpBg}">${fmt(ceLtp, 2)}</span>` : '--'}</td>`;
+          break;
+        case 'ce_chk':
+          html += `<td class="chk-cell ${cellClass}"><input type="checkbox"></td>`;
+          break;
+      }
+    });
+
+    // Strike Price
+    if (isATM) {
+      const chgFromClose = spot > 0 ? spot : 0;
+      html += `<td class="center" style="font-weight:600;min-width:110px">`;
+      html += `<div>${fmtInt(strike)}.00</div>`;
+      html += `<div class="spot-badge positive" style="font-size:11px;margin-top:2px">${fmt(spot, 2)}</div>`;
+      html += `</td>`;
+    } else {
+      html += `<td class="center" style="font-weight:500;min-width:110px;color:#e8e8e8">${fmtInt(strike)}.00</td>`;
+    }
+
+    // PE columns
+    visiblePE.forEach(col => {
+      const isPE = col.key.startsWith('pe_') || col.key === 'pe_chk';
+      const cellClass = isPE ? 'pe-cell' : '';
+
+      switch(col.key) {
+        case 'pcr':
+          const pcrVal = (ce.oi && pe.oi) ? (pe.oi / ce.oi).toFixed(2) : '--';
+          html += `<td class="pcr-cell">${pcrVal}</td>`;
+          break;
+        case 'pe_chk':
+          html += `<td class="chk-cell ${cellClass}"><input type="checkbox"></td>`;
+          break;
+        case 'pe_ltp':
+          const peLtp = pe.ltp;
+          const peLtpHighlight = isATM && peLtp;
+          html += `<td class="${cellClass}" style="font-weight:500">${peLtp != null ? fmt(peLtp, 2) : '--'}</td>`;
+          break;
+        case 'pe_ltp_chg':
+          const peChg = pe.change_pct;
+          const peChgColor = peChg > 0 ? 'green' : peChg < 0 ? 'red' : '';
+          const peChgVal = pe.change != null ? fmt(pe.change, 2) : '--';
+          const peChgPct = peChg != null ? `(${fmt(Math.abs(peChg), 2)}%)` : '';
+          html += `<td class="${cellClass} ${peChgColor}">${peChgVal} <span class="ltp-chg-paren ${peChgColor}">${peChgPct}</span></td>`;
+          break;
+        case 'pe_oi':
+          const peOIBadge = peOIRank[strike] ? `<br><span class="oi-badge oi-${peOIRank[strike]}">OI ${peOIRank[strike]}</span>` : '';
+          html += `<td class="${cellClass}">${fmtOI(pe.oi)}${peOIBadge}</td>`;
+          break;
+        case 'pe_volume':
+          html += `<td class="${cellClass}">${fmtVol(pe.volume)}</td>`;
+          break;
+        case 'pe_iv':
+          html += `<td class="${cellClass}">${pe.iv != null ? fmt(pe.iv, 2) : '--'}</td>`;
+          break;
+        case 'pe_delta':
+          html += `<td class="${cellClass}">${pe.delta != null ? fmt(pe.delta, 3) : '--'}</td>`;
+          break;
+        case 'pe_gamma':
+          html += `<td class="${cellClass}">${pe.gamma != null ? fmt(pe.gamma, 5) : '--'}</td>`;
+          break;
+        case 'pe_theta':
+          html += `<td class="${cellClass}">${pe.theta != null ? fmt(pe.theta, 2) : '--'}</td>`;
+          break;
+        case 'pe_vega':
+          html += `<td class="${cellClass}">${pe.vega != null ? fmt(pe.vega, 5) : '--'}</td>`;
+          break;
+        case 'pe_buildup':
+          html += `<td class="${cellClass} left">${peBU ? `<span class="buildup-tag ${peBU.cls}">${peBU.text}</span>` : ''}</td>`;
+          break;
+      }
+    });
+
+    html += '</tr>';
+  });
+
+  tbody.innerHTML = html;
+
+  // Scroll to ATM
+  setTimeout(() => {
+    const atmRow = document.querySelector('.atm-row');
+    if (atmRow) {
+      atmRow.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    }
+  }, 100);
+}
+
+function updateHeader() {
+  const cfg = CONFIG.underlyings[state.underlying] || {};
+  document.getElementById('hdrUnderlying').textContent = cfg.name || state.underlying;
+  document.getElementById('titleText').textContent = `${cfg.name || state.underlying} Options Chain`;
+
+  if (state.spotPrice > 0) {
+    document.getElementById('hdrPrice').textContent = fmt(state.spotPrice, 2);
+  }
+
+  document.getElementById('statLot').textContent = cfg.lot || '--';
+  document.getElementById('statPcr').textContent = state.pcrValue ? fmt(state.pcrValue, 2) : '--';
+}
+
+function renderExpiries() {
+  const container = document.getElementById('expiryTabs');
+  const dropdown = document.getElementById('expiryDropdown');
+  container.innerHTML = '';
+  dropdown.innerHTML = '';
+
+  const expiries = state.allExpiries || [];
+  const nearExpiries = expiries.slice(0, 3);
+  const farExpiries = expiries.slice(3);
+
+  nearExpiries.forEach(exp => {
+    const btn = document.createElement('button');
+    btn.className = 'expiry-tab' + (exp === state.expiry ? ' active' : '');
+    btn.textContent = formatExpiry(exp);
+    btn.onclick = () => selectExpiry(exp);
+    container.appendChild(btn);
+  });
+
+  farExpiries.forEach(exp => {
+    const div = document.createElement('div');
+    div.className = 'expiry-dropdown-item';
+    div.textContent = formatExpiry(exp);
+    div.onclick = () => { selectExpiry(exp); dropdown.classList.remove('show'); };
+    dropdown.appendChild(div);
+  });
+}
+
+function formatExpiry(exp) {
+  if (!exp) return '';
+  const d = new Date(exp + 'T00:00:00');
+  const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  return `${d.getDate()} ${months[d.getMonth()]} ${String(d.getFullYear()).slice(2)}`;
+}
+
+function selectExpiry(exp) {
+  state.expiry = exp;
+  renderExpiries();
+  fetchChain();
+}
+
+async function fetchChain() {
+  document.getElementById('loadingOverlay').style.display = 'flex';
+  try {
+    let url = `/api/option-chain?underlying=${state.underlying}`;
+    if (state.expiry) url += `&expiry=${state.expiry}`;
+
+    const res = await fetch(url);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+
+    state.contracts = data.data?.contracts || data.contracts || [];
+    state.spotPrice = data.data?.spot_price || data.spot_price || 0;
+
+    const expiries = data.data?.available_expiries || data.available_expiries || [];
+    if (expiries.length > 0 && state.allExpiries.length === 0) {
+      state.allExpiries = expiries;
+      if (!state.expiry) state.expiry = expiries[0];
+      renderExpiries();
+    }
+
+    // Calculate ATM IV from nearest strike
+    if (state.contracts.length > 0 && state.spotPrice > 0) {
+      let nearest = state.contracts[0];
+      let minD = Infinity;
+      state.contracts.forEach(c => {
+        if (c.option_type === 'CE') {
+          const d = Math.abs(c.strike_price - state.spotPrice);
+          if (d < minD) { minD = d; nearest = c; }
         }
+      });
+      document.getElementById('statAtmIv').textContent = nearest.iv ? fmt(nearest.iv, 2) : '--';
+    }
 
-        // Initialize on page load
-        document.addEventListener('DOMContentLoaded', () => {
-            new OptionsChain();
-        });
-    </script>
+    // Days to expiry
+    if (state.expiry) {
+      const now = new Date();
+      const exp = new Date(state.expiry + 'T15:30:00+05:30');
+      const dte = Math.max(0, Math.ceil((exp - now) / 86400000));
+      document.getElementById('statDte').textContent = dte;
+    }
+
+    updateHeader();
+    renderChain();
+
+    document.getElementById('connDot').className = 'conn-dot connected';
+    document.getElementById('connText').textContent = 'DLT Backend';
+  } catch (err) {
+    console.error('Fetch error:', err);
+    document.getElementById('connDot').className = 'conn-dot disconnected';
+    document.getElementById('connText').textContent = 'Disconnected';
+
+    const tbody = document.getElementById('chainBody');
+    tbody.innerHTML = `<tr><td colspan="25" style="text-align:center;padding:40px;color:#555">
+      ${err.message.includes('404') ? 'No option chain data found. Start the data collector to populate.' : 'Connection error: ' + err.message}
+    </td></tr>`;
+  }
+  document.getElementById('loadingOverlay').style.display = 'none';
+}
+
+async function fetchPCR() {
+  try {
+    const res = await fetch(`/api/pcr?underlying=${state.underlying}`);
+    if (res.ok) {
+      const data = await res.json();
+      state.pcrValue = data.pcr || data.data?.pcr || 0;
+      document.getElementById('statPcr').textContent = state.pcrValue ? fmt(state.pcrValue, 2) : '--';
+    }
+  } catch (e) {}
+}
+
+// Event handlers
+document.getElementById('nextExpiryBtn').addEventListener('click', (e) => {
+  e.stopPropagation();
+  document.getElementById('expiryDropdown').classList.toggle('show');
+});
+
+document.addEventListener('click', () => {
+  document.getElementById('expiryDropdown').classList.remove('show');
+});
+
+document.getElementById('buildupChk').addEventListener('change', (e) => {
+  state.showBuildup = e.target.checked;
+  renderHeaders();
+  renderChain();
+});
+
+document.getElementById('perLotChk').addEventListener('change', (e) => {
+  state.showPerLot = e.target.checked;
+  renderChain();
+});
+
+document.querySelectorAll('.index-toggle span').forEach(el => {
+  el.addEventListener('click', () => {
+    document.querySelectorAll('.index-toggle span').forEach(s => s.classList.remove('active'));
+    el.classList.add('active');
+    const idx = el.dataset.idx;
+    if (idx === 'SENSEX') {
+      state.underlying = 'SENSEX';
+    } else {
+      state.underlying = 'NIFTY';
+    }
+    state.allExpiries = [];
+    state.expiry = null;
+    updateHeader();
+    renderExpiries();
+    fetchChain();
+    fetchPCR();
+  });
+});
+
+// Init
+renderHeaders();
+updateHeader();
+fetchChain();
+fetchPCR();
+setInterval(() => { fetchChain(); fetchPCR(); }, CONFIG.refreshMs);
+</script>
 </body>
 </html>
