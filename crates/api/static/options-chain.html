@@ -3,274 +3,866 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Options Chain — dhan-live-trader</title>
+    <title>DLT Options Chain</title>
     <style>
-        :root {
-            --bg: #0d1117; --bg-card: #161b22; --border: #30363d;
-            --text: #e6edf3; --text-dim: #8b949e; --text-muted: #484f58;
-            --green: #26a69a; --red: #ef5350; --blue: #2962ff;
-            --yellow: #ffab00; --purple: #7c4dff;
-            --ce-bg: rgba(38,166,154,0.06); --pe-bg: rgba(239,83,80,0.06);
-            --atm-bg: rgba(41,98,255,0.15);
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
         }
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { background: var(--bg); color: var(--text); font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace; font-size: 12px; }
 
-        .header { display: flex; align-items: center; justify-content: space-between; padding: 12px 20px; border-bottom: 1px solid var(--border); background: var(--bg-card); }
-        .header h1 { font-size: 16px; font-weight: 600; }
-        .header h1 span { color: var(--blue); }
-        .header .back { color: var(--text-dim); text-decoration: none; font-size: 13px; }
-        .header .back:hover { color: var(--text); }
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background-color: #000000;
+            color: #8E8E8E;
+            font-weight: 400;
+            font-size: 14px;
+            line-height: 1.5;
+        }
 
-        .controls { display: flex; gap: 12px; align-items: center; padding: 10px 20px; border-bottom: 1px solid var(--border); background: var(--bg-card); flex-wrap: wrap; }
-        .controls label { color: var(--text-dim); font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
-        .controls select, .controls input { background: var(--bg); color: var(--text); border: 1px solid var(--border); padding: 6px 10px; border-radius: 4px; font-family: inherit; font-size: 12px; }
-        .controls select:focus, .controls input:focus { outline: none; border-color: var(--blue); }
+        /* Header */
+        .header {
+            background-color: #121212;
+            border-bottom: 1px solid #242424;
+            padding: 16px 24px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            height: 60px;
+        }
 
-        .summary { display: flex; gap: 24px; padding: 10px 20px; border-bottom: 1px solid var(--border); background: var(--bg-card); }
-        .summary .item { display: flex; flex-direction: column; }
-        .summary .item .label { font-size: 10px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; }
-        .summary .item .value { font-size: 14px; font-weight: 600; }
-        .summary .item .value.green { color: var(--green); }
-        .summary .item .value.red { color: var(--red); }
-        .summary .item .value.blue { color: var(--blue); }
+        .header-left {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
 
-        .chain-table { width: 100%; border-collapse: collapse; }
-        .chain-table th { position: sticky; top: 0; background: var(--bg-card); padding: 6px 8px; text-align: right; font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-muted); border-bottom: 2px solid var(--border); white-space: nowrap; z-index: 10; }
-        .chain-table th.strike { text-align: center; background: var(--bg); }
-        .chain-table th.ce { color: var(--green); }
-        .chain-table th.pe { color: var(--red); }
+        .header-title {
+            font-size: 18px;
+            font-weight: 300;
+            color: #FFFFFF;
+            letter-spacing: 0.3px;
+        }
 
-        .chain-table td { padding: 4px 8px; text-align: right; border-bottom: 1px solid var(--border); white-space: nowrap; }
-        .chain-table td.strike { text-align: center; font-weight: 700; font-size: 13px; background: var(--bg); border-left: 2px solid var(--border); border-right: 2px solid var(--border); }
-        .chain-table tr.ce-row td:not(.strike) { background: var(--ce-bg); }
-        .chain-table tr.pe-row td:not(.strike) { background: var(--pe-bg); }
-        .chain-table tr.atm td.strike { background: var(--atm-bg); color: var(--blue); }
-        .chain-table tr:hover td { filter: brightness(1.2); }
+        .header-right {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
 
-        .positive { color: var(--green); }
-        .negative { color: var(--red); }
-        .dim { color: var(--text-muted); }
+        .back-link {
+            color: #518EF8;
+            text-decoration: none;
+            font-size: 14px;
+            font-weight: 400;
+            cursor: pointer;
+            transition: color 0.2s;
+        }
 
-        .status-bar { display: flex; justify-content: space-between; padding: 6px 20px; border-top: 1px solid var(--border); background: var(--bg-card); font-size: 11px; color: var(--text-muted); position: fixed; bottom: 0; left: 0; right: 0; }
-        .status-bar .live { color: var(--green); }
-        .status-bar .error { color: var(--red); }
+        .back-link:hover {
+            color: #6BA3FF;
+        }
 
-        .loading { text-align: center; padding: 40px; color: var(--text-dim); }
-        .table-wrapper { overflow-y: auto; max-height: calc(100vh - 180px); }
+        /* Controls Bar */
+        .controls-bar {
+            background-color: #121212;
+            border-bottom: 1px solid #242424;
+            padding: 16px 24px;
+            display: flex;
+            gap: 24px;
+            align-items: center;
+        }
 
-        .expiry-tabs { display: flex; gap: 2px; padding: 0 20px; }
-        .expiry-tab { padding: 6px 14px; cursor: pointer; color: var(--text-dim); border-bottom: 2px solid transparent; font-size: 12px; transition: all 0.15s; }
-        .expiry-tab:hover { color: var(--text); }
-        .expiry-tab.active { color: var(--blue); border-bottom-color: var(--blue); }
+        .control-group {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+
+        .control-label {
+            font-size: 12px;
+            font-weight: 400;
+            color: #8E8E8E;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        select {
+            background-color: #181818;
+            color: #FFFFFF;
+            border: 1px solid #242424;
+            padding: 8px 12px;
+            border-radius: 4px;
+            font-size: 14px;
+            font-weight: 400;
+            font-family: 'Inter', sans-serif;
+            cursor: pointer;
+            transition: border-color 0.2s, background-color 0.2s;
+            min-width: 140px;
+        }
+
+        select:hover {
+            border-color: #393939;
+            background-color: #242424;
+        }
+
+        select:focus {
+            outline: none;
+            border-color: #518EF8;
+            background-color: #242424;
+        }
+
+        /* Summary Panel */
+        .summary-panel {
+            background-color: #121212;
+            border-bottom: 1px solid #242424;
+            padding: 16px 24px;
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 24px;
+        }
+
+        .summary-item {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+
+        .summary-label {
+            font-size: 12px;
+            font-weight: 400;
+            color: #8E8E8E;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .summary-value {
+            font-size: 16px;
+            font-weight: 400;
+            color: #FFFFFF;
+        }
+
+        .summary-positive {
+            color: #5CA81D;
+        }
+
+        .summary-negative {
+            color: #DD6565;
+        }
+
+        /* Expiry Tabs */
+        .expiry-tabs {
+            background-color: #121212;
+            border-bottom: 1px solid #242424;
+            padding: 0 24px;
+            display: flex;
+            gap: 0;
+            overflow-x: auto;
+            scroll-behavior: smooth;
+        }
+
+        .expiry-tab {
+            padding: 12px 16px;
+            border-bottom: 2px solid transparent;
+            cursor: pointer;
+            color: #8E8E8E;
+            font-size: 14px;
+            font-weight: 400;
+            white-space: nowrap;
+            transition: color 0.2s, border-color 0.2s;
+        }
+
+        .expiry-tab:hover {
+            color: #FFFFFF;
+        }
+
+        .expiry-tab.active {
+            color: #518EF8;
+            border-bottom-color: #518EF8;
+        }
+
+        /* Main Content */
+        .main-content {
+            padding: 24px;
+            overflow-x: auto;
+        }
+
+        .loading-message,
+        .error-message,
+        .no-data-message {
+            text-align: center;
+            padding: 48px 24px;
+            font-size: 16px;
+        }
+
+        .loading-message {
+            color: #8E8E8E;
+        }
+
+        .error-message {
+            color: #DD6565;
+        }
+
+        .no-data-message {
+            color: #8E8E8E;
+        }
+
+        /* Table */
+        .options-table {
+            width: 100%;
+            border-collapse: separate;
+            border-spacing: 0;
+            table-layout: auto;
+        }
+
+        .options-table th {
+            height: 42px;
+            font-weight: 300;
+            font-size: 14px;
+            color: #8E8E8E;
+            padding: 1px 8px 0px 0px;
+            text-align: right;
+            background-color: #121212;
+            border-bottom: 1px solid #242424;
+            position: sticky;
+            top: 0;
+            z-index: 10;
+        }
+
+        .options-table th:first-child {
+            text-align: left;
+            padding-left: 8px;
+        }
+
+        .options-table td {
+            height: 42px;
+            font-size: 14px;
+            color: #8E8E8E;
+            padding: 0px 8px 0px 0px;
+            text-align: right;
+            border-bottom: 1px solid #1a1a1a;
+        }
+
+        .options-table td:first-child {
+            text-align: left;
+            padding-left: 8px;
+        }
+
+        /* Call Side */
+        .call-oi,
+        .call-volume,
+        .call-iv,
+        .call-delta,
+        .call-theta,
+        .call-gamma,
+        .call-vega,
+        .call-chg,
+        .call-ltp {
+            text-align: right;
+        }
+
+        .call-chg {
+            font-weight: 400;
+        }
+
+        /* LTP Column - Always Grey */
+        .call-ltp,
+        .put-ltp {
+            color: #8E8E8E !important;
+            font-weight: 400;
+        }
+
+        /* Strike Column - Center */
+        .strike-cell {
+            text-align: center;
+            font-weight: 400;
+            color: #FFFFFF;
+            background-color: #000000;
+            padding: 0px 16px;
+            min-width: 80px;
+        }
+
+        .strike-header {
+            text-align: center;
+            background-color: #121212;
+        }
+
+        /* Put Side */
+        .put-oi,
+        .put-volume,
+        .put-iv,
+        .put-delta,
+        .put-theta,
+        .put-gamma,
+        .put-vega,
+        .put-chg,
+        .put-ltp {
+            text-align: right;
+        }
+
+        .put-chg {
+            font-weight: 400;
+        }
+
+        /* Data Colors */
+        .positive {
+            color: #5CA81D;
+        }
+
+        .negative {
+            color: #DD6565;
+        }
+
+        /* ATM Row */
+        .atm-row {
+            border-top: 1px solid #518EF8;
+            border-bottom: 1px solid #518EF8;
+        }
+
+        .atm-row .strike-cell {
+            border-left: 1px solid #518EF8;
+            border-right: 1px solid #518EF8;
+        }
+
+        /* ITM Backgrounds */
+        .itm-ce {
+            background-color: rgba(238, 162, 14, 0.17);
+        }
+
+        .itm-pe {
+            background-color: rgba(141, 125, 240, 0.14);
+        }
+
+        /* Status Messages */
+        .status-bar {
+            background-color: #121212;
+            border-top: 1px solid #242424;
+            padding: 12px 24px;
+            font-size: 12px;
+            color: #8E8E8E;
+            text-align: right;
+        }
+
+        /* Responsive */
+        @media (max-width: 1024px) {
+            .summary-panel {
+                grid-template-columns: repeat(2, 1fr);
+            }
+        }
+
+        @media (max-width: 640px) {
+            .controls-bar {
+                flex-direction: column;
+                gap: 12px;
+                align-items: flex-start;
+            }
+
+            .control-group {
+                width: 100%;
+            }
+
+            select {
+                width: 100%;
+            }
+
+            .summary-panel {
+                grid-template-columns: 1fr;
+            }
+        }
     </style>
 </head>
 <body>
+    <!-- Header -->
     <div class="header">
-        <h1><span>DLT</span> Options Chain</h1>
-        <a href="/portal" class="back">Back to Control Panel</a>
+        <div class="header-left">
+            <div class="header-title">DLT Options Chain</div>
+        </div>
+        <div class="header-right">
+            <a href="/portal" class="back-link">← Back to Control Panel</a>
+        </div>
     </div>
 
-    <div class="controls">
-        <div>
-            <label>Underlying</label>
-            <select id="underlying">
+    <!-- Controls Bar -->
+    <div class="controls-bar">
+        <div class="control-group">
+            <label class="control-label">Underlying</label>
+            <select id="underlyingSelect">
                 <option value="NIFTY">NIFTY 50</option>
                 <option value="BANKNIFTY">BANK NIFTY</option>
                 <option value="FINNIFTY">FIN NIFTY</option>
-                <option value="MIDCPNIFTY">MIDCAP NIFTY</option>
+                <option value="MIDCPNIFTY">MIDCP NIFTY</option>
             </select>
         </div>
-        <div>
-            <label>Refresh</label>
-            <select id="refresh-interval">
-                <option value="5000">5s</option>
-                <option value="10000" selected>10s</option>
-                <option value="30000">30s</option>
+
+        <div class="control-group">
+            <label class="control-label">Refresh Interval</label>
+            <select id="refreshSelect">
                 <option value="0">Off</option>
+                <option value="5000">5 seconds</option>
+                <option value="10000">10 seconds</option>
+                <option value="30000">30 seconds</option>
             </select>
         </div>
     </div>
 
-    <div class="expiry-tabs" id="expiry-tabs"></div>
-
-    <div class="summary" id="summary">
-        <div class="item"><span class="label">Spot</span><span class="value blue" id="spot-price">--</span></div>
-        <div class="item"><span class="label">ATM Strike</span><span class="value" id="atm-strike">--</span></div>
-        <div class="item"><span class="label">ATM IV (CE)</span><span class="value" id="atm-iv-ce">--</span></div>
-        <div class="item"><span class="label">ATM IV (PE)</span><span class="value" id="atm-iv-pe">--</span></div>
-        <div class="item"><span class="label">PCR</span><span class="value" id="pcr-value">--</span></div>
-        <div class="item"><span class="label">Total CE OI</span><span class="value green" id="total-ce-oi">--</span></div>
-        <div class="item"><span class="label">Total PE OI</span><span class="value red" id="total-pe-oi">--</span></div>
-        <div class="item"><span class="label">Contracts</span><span class="value" id="contract-count">--</span></div>
+    <!-- Summary Panel -->
+    <div class="summary-panel" id="summaryPanel">
+        <div class="summary-item">
+            <div class="summary-label">Spot Price</div>
+            <div class="summary-value" id="spotPrice">—</div>
+        </div>
+        <div class="summary-item">
+            <div class="summary-label">ATM Strike</div>
+            <div class="summary-value" id="atmStrike">—</div>
+        </div>
+        <div class="summary-item">
+            <div class="summary-label">ATM IV (CE)</div>
+            <div class="summary-value" id="atmIvCe">—</div>
+        </div>
+        <div class="summary-item">
+            <div class="summary-label">ATM IV (PE)</div>
+            <div class="summary-value" id="atmIvPe">—</div>
+        </div>
+        <div class="summary-item">
+            <div class="summary-label">PCR Ratio</div>
+            <div class="summary-value" id="pcrRatio">—</div>
+        </div>
+        <div class="summary-item">
+            <div class="summary-label">Total CE OI</div>
+            <div class="summary-value" id="totalCeOi">—</div>
+        </div>
+        <div class="summary-item">
+            <div class="summary-label">Total PE OI</div>
+            <div class="summary-value" id="totalPeOi">—</div>
+        </div>
+        <div class="summary-item">
+            <div class="summary-label">Contracts</div>
+            <div class="summary-value" id="contractCount">—</div>
+        </div>
     </div>
 
-    <div class="table-wrapper">
-        <table class="chain-table">
-            <thead>
-                <tr>
-                    <th class="ce">OI</th>
-                    <th class="ce">Volume</th>
-                    <th class="ce">IV</th>
-                    <th class="ce">Delta</th>
-                    <th class="ce">Theta</th>
-                    <th class="ce">Gamma</th>
-                    <th class="ce">Vega</th>
-                    <th class="ce">Chg%</th>
-                    <th class="ce">LTP</th>
-                    <th class="strike">STRIKE</th>
-                    <th class="pe">LTP</th>
-                    <th class="pe">Chg%</th>
-                    <th class="pe">Vega</th>
-                    <th class="pe">Gamma</th>
-                    <th class="pe">Theta</th>
-                    <th class="pe">Delta</th>
-                    <th class="pe">IV</th>
-                    <th class="pe">Volume</th>
-                    <th class="pe">OI</th>
-                </tr>
-            </thead>
-            <tbody id="chain-body">
-                <tr><td colspan="19" class="loading">Loading option chain data...</td></tr>
-            </tbody>
-        </table>
+    <!-- Expiry Tabs -->
+    <div class="expiry-tabs" id="expiryTabs"></div>
+
+    <!-- Main Content -->
+    <div class="main-content">
+        <div id="loadingMessage" class="loading-message">Loading option chain data...</div>
+        <div id="errorMessage" class="error-message" style="display: none;"></div>
+        <div id="tableContainer"></div>
     </div>
 
-    <div class="status-bar">
-        <span id="status-text">Connecting...</span>
-        <span id="last-update">--</span>
-    </div>
+    <!-- Status Bar -->
+    <div class="status-bar" id="statusBar">Ready</div>
 
-<script>
-let refreshTimer = null;
-let currentExpiry = null;
+    <script>
+        class OptionsChain {
+            constructor() {
+                this.currentUnderlying = 'NIFTY';
+                this.currentExpiry = null;
+                this.data = null;
+                this.refreshInterval = null;
+                this.refreshRate = 0;
+                this.lastUpdate = null;
 
-function fmt(v, d=2) { return v != null && isFinite(v) ? v.toFixed(d) : '--'; }
-function fmtOI(v) { return v != null ? (v >= 100000 ? (v/100000).toFixed(2)+'L' : v.toLocaleString('en-IN')) : '--'; }
-function fmtPct(v) { return v != null && isFinite(v) ? (v >= 0 ? '+' : '') + v.toFixed(2) + '%' : '--'; }
-function cls(v) { return v > 0 ? 'positive' : v < 0 ? 'negative' : 'dim'; }
+                this.init();
+            }
 
-async function fetchChain() {
-    const underlying = document.getElementById('underlying').value;
-    const expiryParam = currentExpiry ? `&expiry=${currentExpiry}` : '';
-    const statusEl = document.getElementById('status-text');
+            init() {
+                this.setupEventListeners();
+                this.fetchData();
+            }
 
-    try {
-        const resp = await fetch(`/api/option-chain?underlying=${underlying}${expiryParam}`);
-        if (!resp.ok) {
-            const err = await resp.json().catch(() => ({}));
-            statusEl.innerHTML = `<span class="error">Error: ${err.error || resp.statusText}</span>`;
-            return;
+            setupEventListeners() {
+                document.getElementById('underlyingSelect').addEventListener('change', (e) => {
+                    this.currentUnderlying = e.target.value;
+                    this.currentExpiry = null;
+                    this.fetchData();
+                });
+
+                document.getElementById('refreshSelect').addEventListener('change', (e) => {
+                    this.refreshRate = parseInt(e.target.value);
+                    this.setupAutoRefresh();
+                });
+            }
+
+            async fetchData() {
+                try {
+                    this.showLoading();
+
+                    const response = await fetch(`/api/option-chain?underlying=${this.currentUnderlying}&expiry=${this.currentExpiry || ''}`);
+
+                    if (!response.ok) {
+                        throw new Error(`API Error: ${response.status}`);
+                    }
+
+                    this.data = await response.json();
+                    this.lastUpdate = new Date();
+
+                    // Set default expiry if not set
+                    if (!this.currentExpiry && this.data.available_expiries && this.data.available_expiries.length > 0) {
+                        this.currentExpiry = this.data.available_expiries[0];
+                    }
+
+                    this.renderExpiryTabs();
+                    this.renderSummary();
+                    this.renderTable();
+                    this.hideLoading();
+                    this.updateStatus();
+
+                } catch (error) {
+                    console.error('Error fetching data:', error);
+                    this.showError(`Unable to load option chain data: ${error.message}`);
+                    this.updateStatus();
+                }
+            }
+
+            async fetchPcrData() {
+                try {
+                    const response = await fetch(`/api/pcr?underlying=${this.currentUnderlying}`);
+                    if (response.ok) {
+                        const pcrData = await response.json();
+                        return pcrData.ratio || null;
+                    }
+                    return null;
+                } catch (error) {
+                    console.error('Error fetching PCR data:', error);
+                    return null;
+                }
+            }
+
+            renderExpiryTabs() {
+                if (!this.data || !this.data.available_expiries) return;
+
+                const tabsContainer = document.getElementById('expiryTabs');
+                tabsContainer.innerHTML = '';
+
+                this.data.available_expiries.forEach(expiry => {
+                    const tab = document.createElement('div');
+                    tab.className = 'expiry-tab';
+                    if (expiry === this.currentExpiry) {
+                        tab.classList.add('active');
+                    }
+                    tab.textContent = this.formatDate(expiry);
+                    tab.addEventListener('click', () => {
+                        this.currentExpiry = expiry;
+                        this.fetchData();
+                    });
+                    tabsContainer.appendChild(tab);
+                });
+            }
+
+            renderSummary() {
+                if (!this.data) return;
+
+                const spotPrice = this.data.spot_price || 0;
+                const contracts = this.data.contracts || [];
+
+                // Find ATM strike
+                let atmStrike = null;
+                let atmIvCe = null;
+                let atmIvPe = null;
+                let minDiff = Infinity;
+
+                contracts.forEach(contract => {
+                    const diff = Math.abs(contract.strike_price - spotPrice);
+                    if (diff < minDiff) {
+                        minDiff = diff;
+                        atmStrike = contract.strike_price;
+                    }
+                });
+
+                // Get ATM IVs
+                contracts.forEach(contract => {
+                    if (contract.strike_price === atmStrike) {
+                        if (contract.option_type === 'CE') {
+                            atmIvCe = contract.iv;
+                        } else if (contract.option_type === 'PE') {
+                            atmIvPe = contract.iv;
+                        }
+                    }
+                });
+
+                // Calculate totals
+                let totalCeOi = 0;
+                let totalPeOi = 0;
+
+                contracts.forEach(contract => {
+                    if (contract.option_type === 'CE') {
+                        totalCeOi += contract.oi || 0;
+                    } else if (contract.option_type === 'PE') {
+                        totalPeOi += contract.oi || 0;
+                    }
+                });
+
+                // Fetch PCR ratio
+                this.fetchPcrData().then(pcr => {
+                    const pcrValue = pcr ? pcr.toFixed(2) : '—';
+                    document.getElementById('pcrRatio').textContent = pcrValue;
+                });
+
+                document.getElementById('spotPrice').textContent = spotPrice.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+                document.getElementById('atmStrike').textContent = atmStrike ? atmStrike.toLocaleString('en-IN', { minimumFractionDigits: 0 }) : '—';
+                document.getElementById('atmIvCe').textContent = atmIvCe ? (atmIvCe * 100).toFixed(2) + '%' : '—';
+                document.getElementById('atmIvPe').textContent = atmIvPe ? (atmIvPe * 100).toFixed(2) + '%' : '—';
+                document.getElementById('totalCeOi').textContent = this.formatOi(totalCeOi);
+                document.getElementById('totalPeOi').textContent = this.formatOi(totalPeOi);
+                document.getElementById('contractCount').textContent = contracts.length.toLocaleString('en-IN');
+            }
+
+            renderTable() {
+                if (!this.data || !this.data.contracts || this.data.contracts.length === 0) {
+                    this.showNoData();
+                    return;
+                }
+
+                const spotPrice = this.data.spot_price;
+                const contracts = this.data.contracts;
+
+                // Find ATM strike
+                let atmStrike = null;
+                let minDiff = Infinity;
+
+                contracts.forEach(contract => {
+                    const diff = Math.abs(contract.strike_price - spotPrice);
+                    if (diff < minDiff) {
+                        minDiff = diff;
+                        atmStrike = contract.strike_price;
+                    }
+                });
+
+                // Group contracts by strike
+                const strikeMap = {};
+                contracts.forEach(contract => {
+                    const strike = contract.strike_price;
+                    if (!strikeMap[strike]) {
+                        strikeMap[strike] = { CE: null, PE: null };
+                    }
+                    strikeMap[strike][contract.option_type] = contract;
+                });
+
+                // Create table
+                const table = document.createElement('table');
+                table.className = 'options-table';
+
+                // Header
+                const thead = document.createElement('thead');
+                const headerRow = document.createElement('tr');
+
+                const headers = [
+                    'OI', 'Vol', 'IV', 'Delta', 'Theta', 'Gamma', 'Vega', 'Chg%', 'LTP',
+                    'STRIKE',
+                    'LTP', 'Chg%', 'Vega', 'Gamma', 'Theta', 'Delta', 'IV', 'Vol', 'OI'
+                ];
+
+                headers.forEach((header, idx) => {
+                    const th = document.createElement('th');
+                    if (header === 'STRIKE') {
+                        th.className = 'strike-header';
+                    }
+                    th.textContent = header;
+                    headerRow.appendChild(th);
+                });
+
+                thead.appendChild(headerRow);
+                table.appendChild(thead);
+
+                // Body
+                const tbody = document.createElement('tbody');
+                const strikes = Object.keys(strikeMap).map(Number).sort((a, b) => a - b);
+
+                strikes.forEach(strike => {
+                    const row = document.createElement('tr');
+                    const ceContract = strikeMap[strike].CE;
+                    const peContract = strikeMap[strike].PE;
+                    const isAtm = strike === atmStrike;
+                    const isItmCe = ceContract && ceContract.ltp > 0;
+                    const isItmPe = peContract && peContract.ltp > 0;
+
+                    if (isAtm) {
+                        row.className = 'atm-row';
+                    }
+
+                    // CE Side
+                    const ceFields = [
+                        'oi', 'volume', 'iv', 'delta', 'theta', 'gamma', 'vega', 'change_pct', 'ltp'
+                    ];
+
+                    ceFields.forEach(field => {
+                        const td = document.createElement('td');
+                        const className = `call-${field}`;
+                        td.className = className;
+
+                        if (isItmCe && isAtm) {
+                            td.className += ' itm-ce';
+                        }
+
+                        if (ceContract) {
+                            let value = ceContract[field];
+                            td.textContent = this.formatCellValue(field, value);
+
+                            if ((field === 'change_pct') && value !== null && value !== undefined) {
+                                td.classList.add(value >= 0 ? 'positive' : 'negative');
+                            }
+                        } else {
+                            td.textContent = '—';
+                        }
+
+                        row.appendChild(td);
+                    });
+
+                    // Strike Column
+                    const strikeTd = document.createElement('td');
+                    strikeTd.className = 'strike-cell';
+                    if (isAtm) {
+                        strikeTd.style.borderLeft = '1px solid #518EF8';
+                        strikeTd.style.borderRight = '1px solid #518EF8';
+                    }
+                    if (isItmCe && isAtm) {
+                        strikeTd.className += ' itm-ce';
+                    } else if (isItmPe && isAtm) {
+                        strikeTd.className += ' itm-pe';
+                    }
+                    strikeTd.textContent = strike.toLocaleString('en-IN', { minimumFractionDigits: 0 });
+                    row.appendChild(strikeTd);
+
+                    // PE Side
+                    const peFields = [
+                        'ltp', 'change_pct', 'vega', 'gamma', 'theta', 'delta', 'iv', 'volume', 'oi'
+                    ];
+
+                    peFields.forEach(field => {
+                        const td = document.createElement('td');
+                        const className = `put-${field}`;
+                        td.className = className;
+
+                        if (isItmPe && isAtm) {
+                            td.className += ' itm-pe';
+                        }
+
+                        if (peContract) {
+                            let value = peContract[field];
+                            td.textContent = this.formatCellValue(field, value);
+
+                            if ((field === 'change_pct') && value !== null && value !== undefined) {
+                                td.classList.add(value >= 0 ? 'positive' : 'negative');
+                            }
+                        } else {
+                            td.textContent = '—';
+                        }
+
+                        row.appendChild(td);
+                    });
+
+                    tbody.appendChild(row);
+                });
+
+                table.appendChild(tbody);
+
+                const container = document.getElementById('tableContainer');
+                container.innerHTML = '';
+                container.appendChild(table);
+
+                // Auto-scroll to ATM
+                this.scrollToAtm();
+            }
+
+            scrollToAtm() {
+                const atmRow = document.querySelector('.atm-row');
+                if (atmRow) {
+                    setTimeout(() => {
+                        atmRow.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    }, 100);
+                }
+            }
+
+            formatCellValue(field, value) {
+                if (value === null || value === undefined) return '—';
+
+                switch (field) {
+                    case 'oi':
+                    case 'volume':
+                        return this.formatOi(value);
+                    case 'iv':
+                        return (value * 100).toFixed(2) + '%';
+                    case 'delta':
+                    case 'gamma':
+                    case 'vega':
+                        return value.toFixed(3);
+                    case 'theta':
+                        return value.toFixed(2);
+                    case 'change_pct':
+                        return value.toFixed(2) + '%';
+                    case 'ltp':
+                        return value.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+                    default:
+                        return value.toString();
+                }
+            }
+
+            formatOi(value) {
+                if (value >= 100000) {
+                    return (value / 100000).toFixed(1) + 'L';
+                } else if (value >= 1000) {
+                    return (value / 1000).toFixed(1) + 'K';
+                }
+                return value.toString();
+            }
+
+            formatDate(dateString) {
+                const date = new Date(dateString);
+                const options = { month: 'short', day: 'numeric', year: 'numeric' };
+                return date.toLocaleDateString('en-IN', options);
+            }
+
+            showLoading() {
+                document.getElementById('loadingMessage').style.display = 'block';
+                document.getElementById('errorMessage').style.display = 'none';
+                document.getElementById('tableContainer').innerHTML = '';
+            }
+
+            hideLoading() {
+                document.getElementById('loadingMessage').style.display = 'none';
+            }
+
+            showError(message) {
+                document.getElementById('errorMessage').textContent = message;
+                document.getElementById('errorMessage').style.display = 'block';
+                document.getElementById('loadingMessage').style.display = 'none';
+                document.getElementById('tableContainer').innerHTML = '';
+            }
+
+            showNoData() {
+                const noDataDiv = document.createElement('div');
+                noDataDiv.className = 'no-data-message';
+                noDataDiv.textContent = 'No option chain data available for the selected underlying and expiry.';
+                document.getElementById('tableContainer').innerHTML = '';
+                document.getElementById('tableContainer').appendChild(noDataDiv);
+            }
+
+            setupAutoRefresh() {
+                if (this.refreshInterval) {
+                    clearInterval(this.refreshInterval);
+                    this.refreshInterval = null;
+                }
+
+                if (this.refreshRate > 0) {
+                    this.refreshInterval = setInterval(() => {
+                        this.fetchData();
+                    }, this.refreshRate);
+                }
+            }
+
+            updateStatus() {
+                const underlying = document.getElementById('underlyingSelect').selectedOptions[0].textContent;
+                const timeStr = this.lastUpdate ? this.lastUpdate.toLocaleTimeString() : '—';
+                document.getElementById('statusBar').textContent = `${underlying} • Updated: ${timeStr}`;
+            }
         }
-        const data = await resp.json();
-        renderExpiries(data.available_expiries, data.expiry);
-        renderSummary(data);
-        renderChain(data);
-        statusEl.innerHTML = `<span class="live">LIVE</span> ${underlying} | ${data.contracts.length} contracts`;
-        document.getElementById('last-update').textContent = new Date().toLocaleTimeString('en-IN', {timeZone:'Asia/Kolkata'}) + ' IST';
-    } catch(e) {
-        statusEl.innerHTML = `<span class="error">Fetch failed: ${e.message}</span>`;
-    }
-}
 
-function renderExpiries(expiries, active) {
-    const tabs = document.getElementById('expiry-tabs');
-    tabs.innerHTML = '';
-    (expiries || []).forEach(exp => {
-        const tab = document.createElement('div');
-        tab.className = 'expiry-tab' + (exp === active ? ' active' : '');
-        const d = new Date(exp + 'T00:00:00+05:30');
-        tab.textContent = d.toLocaleDateString('en-IN', {day:'numeric', month:'short'});
-        tab.onclick = () => { currentExpiry = exp; fetchChain(); };
-        tabs.appendChild(tab);
-    });
-}
-
-function renderSummary(data) {
-    document.getElementById('spot-price').textContent = fmt(data.spot_price, 2);
-
-    const strikes = [...new Set(data.contracts.map(c => c.strike_price))].sort((a,b) => a-b);
-    const atmStrike = strikes.reduce((best, s) => Math.abs(s - data.spot_price) < Math.abs(best - data.spot_price) ? s : best, strikes[0] || 0);
-    document.getElementById('atm-strike').textContent = fmt(atmStrike, 0);
-
-    const atmCE = data.contracts.find(c => c.strike_price === atmStrike && c.option_type === 'CE');
-    const atmPE = data.contracts.find(c => c.strike_price === atmStrike && c.option_type === 'PE');
-    document.getElementById('atm-iv-ce').textContent = atmCE ? fmt(atmCE.iv * 100, 1) + '%' : '--';
-    document.getElementById('atm-iv-pe').textContent = atmPE ? fmt(atmPE.iv * 100, 1) + '%' : '--';
-
-    let totalCeOI = 0, totalPeOI = 0;
-    data.contracts.forEach(c => { if(c.option_type==='CE') totalCeOI += c.oi; else totalPeOI += c.oi; });
-    document.getElementById('total-ce-oi').textContent = fmtOI(totalCeOI);
-    document.getElementById('total-pe-oi').textContent = fmtOI(totalPeOI);
-    const pcr = totalCeOI > 0 ? (totalPeOI / totalCeOI) : 0;
-    const pcrEl = document.getElementById('pcr-value');
-    pcrEl.textContent = fmt(pcr, 2);
-    pcrEl.className = 'value ' + (pcr > 1.2 ? 'red' : pcr < 0.8 ? 'green' : 'blue');
-    document.getElementById('contract-count').textContent = data.contracts.length;
-}
-
-function renderChain(data) {
-    const strikes = [...new Set(data.contracts.map(c => c.strike_price))].sort((a,b) => a-b);
-    const atmStrike = strikes.reduce((best, s) => Math.abs(s - data.spot_price) < Math.abs(best - data.spot_price) ? s : best, strikes[0] || 0);
-
-    const ceMap = {}, peMap = {};
-    data.contracts.forEach(c => { if(c.option_type==='CE') ceMap[c.strike_price]=c; else peMap[c.strike_price]=c; });
-
-    const tbody = document.getElementById('chain-body');
-    let html = '';
-    strikes.forEach(strike => {
-        const ce = ceMap[strike] || {};
-        const pe = peMap[strike] || {};
-        const isATM = strike === atmStrike;
-        const itm_ce = strike < data.spot_price;
-        const itm_pe = strike > data.spot_price;
-
-        html += `<tr class="${isATM ? 'atm' : ''}">`;
-        // CE side (left)
-        html += `<td class="${itm_ce ? 'dim' : ''}">${fmtOI(ce.oi)}</td>`;
-        html += `<td class="${itm_ce ? 'dim' : ''}">${fmtOI(ce.volume)}</td>`;
-        html += `<td>${ce.iv ? fmt(ce.iv*100,1)+'%' : '--'}</td>`;
-        html += `<td>${fmt(ce.delta, 3)}</td>`;
-        html += `<td class="negative">${fmt(ce.theta, 2)}</td>`;
-        html += `<td>${fmt(ce.gamma, 4)}</td>`;
-        html += `<td>${fmt(ce.vega, 2)}</td>`;
-        html += `<td class="${cls(ce.change_pct)}">${fmtPct(ce.change_pct)}</td>`;
-        html += `<td style="font-weight:600">${fmt(ce.ltp, 2)}</td>`;
-        // Strike
-        html += `<td class="strike">${fmt(strike, 0)}</td>`;
-        // PE side (right)
-        html += `<td style="font-weight:600">${fmt(pe.ltp, 2)}</td>`;
-        html += `<td class="${cls(pe.change_pct)}">${fmtPct(pe.change_pct)}</td>`;
-        html += `<td>${fmt(pe.vega, 2)}</td>`;
-        html += `<td>${fmt(pe.gamma, 4)}</td>`;
-        html += `<td class="negative">${fmt(pe.theta, 2)}</td>`;
-        html += `<td>${fmt(pe.delta, 3)}</td>`;
-        html += `<td>${pe.iv ? fmt(pe.iv*100,1)+'%' : '--'}</td>`;
-        html += `<td class="${itm_pe ? 'dim' : ''}">${fmtOI(pe.volume)}</td>`;
-        html += `<td class="${itm_pe ? 'dim' : ''}">${fmtOI(pe.oi)}</td>`;
-        html += `</tr>`;
-    });
-    tbody.innerHTML = html || '<tr><td colspan="19" class="loading">No data available</td></tr>';
-
-    // Scroll to ATM
-    if(strikes.length > 0) {
-        const atmIdx = strikes.indexOf(atmStrike);
-        const rows = tbody.querySelectorAll('tr');
-        if(rows[atmIdx]) rows[atmIdx].scrollIntoView({block:'center', behavior:'smooth'});
-    }
-}
-
-function startRefresh() {
-    if(refreshTimer) clearInterval(refreshTimer);
-    const interval = parseInt(document.getElementById('refresh-interval').value);
-    if(interval > 0) refreshTimer = setInterval(fetchChain, interval);
-}
-
-document.getElementById('underlying').addEventListener('change', () => { currentExpiry = null; fetchChain(); });
-document.getElementById('refresh-interval').addEventListener('change', startRefresh);
-
-fetchChain();
-startRefresh();
-</script>
+        // Initialize on page load
+        document.addEventListener('DOMContentLoaded', () => {
+            new OptionsChain();
+        });
+    </script>
 </body>
 </html>
