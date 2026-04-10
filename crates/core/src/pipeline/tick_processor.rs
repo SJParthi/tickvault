@@ -580,6 +580,30 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     continue;
                 }
 
+                // O(1) movers baseline: BEFORE time guards — day_close is reference data.
+                // Must be set regardless of market hours (same principle as PrevClose handler).
+                // Dhan confirmed (Ticket #5525125): day_close = previous session's close.
+                if tick.day_close > 0.0 && tick.day_close.is_finite() {
+                    day_close_baseline_count = day_close_baseline_count.saturating_add(1);
+                    if day_close_first_log_time.is_none() {
+                        day_close_first_log_time = Some(Instant::now());
+                    }
+                    if let Some(ref mut movers) = top_movers {
+                        movers.update_prev_close(
+                            tick.security_id,
+                            tick.exchange_segment_code,
+                            tick.day_close,
+                        );
+                    }
+                    if let Some(ref mut opt_movers) = option_movers {
+                        opt_movers.update_prev_close(
+                            tick.security_id,
+                            tick.exchange_segment_code,
+                            tick.day_close,
+                        );
+                    }
+                }
+
                 // Ingestion gate: drop ALL ticks outside [9:00 AM, 3:30 PM) IST.
                 // WebSocket connects immediately on app start (pre-market warmup),
                 // but stale ticks from previous day are dropped here. At 15:30 PM
@@ -640,33 +664,8 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     let _ = sender.send(tick);
                 }
 
-                // O(1) movers baseline: use day_close from Full/Quote packets as previous close.
-                // Dhan confirmed (Ticket #5525125): "close" field = previous trading session's
-                // closing price. This gives us prev_close for ALL 25,000 instruments without
-                // needing separate PrevClose (code 6) packets (which only arrive for indices).
-                // Guard: only update if day_close is valid (non-zero, finite).
-                if tick.day_close > 0.0 && tick.day_close.is_finite() {
-                    day_close_baseline_count = day_close_baseline_count.saturating_add(1);
-                    if day_close_first_log_time.is_none() {
-                        day_close_first_log_time = Some(Instant::now());
-                    }
-                    if let Some(ref mut movers) = top_movers {
-                        movers.update_prev_close(
-                            tick.security_id,
-                            tick.exchange_segment_code,
-                            tick.day_close,
-                        );
-                    }
-                    if let Some(ref mut opt_movers) = option_movers {
-                        opt_movers.update_prev_close(
-                            tick.security_id,
-                            tick.exchange_segment_code,
-                            tick.day_close,
-                        );
-                    }
-                }
-
                 // PROOF: log day_close baseline coverage after 30 seconds of ticks.
+                // (day_close baseline update is ABOVE the time guards — runs unconditionally)
                 if !day_close_baseline_logged
                     && day_close_first_log_time.is_some_and(|t| t.elapsed().as_secs() >= 30)
                 {
@@ -708,6 +707,29 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                 // exchange timestamp is valid (Full packets, code 8).
                 let ltp_valid = is_valid_ltp(tick.last_traded_price);
                 let tick_is_valid = is_valid_tick(tick.last_traded_price, tick.exchange_timestamp);
+
+                // O(1) movers baseline from day_close — BEFORE time guards (reference data).
+                // Full packets (code 8) are the primary source of day_close for F&O instruments.
+                if tick.day_close > 0.0 && tick.day_close.is_finite() {
+                    day_close_baseline_count = day_close_baseline_count.saturating_add(1);
+                    if day_close_first_log_time.is_none() {
+                        day_close_first_log_time = Some(Instant::now());
+                    }
+                    if let Some(ref mut movers) = top_movers {
+                        movers.update_prev_close(
+                            tick.security_id,
+                            tick.exchange_segment_code,
+                            tick.day_close,
+                        );
+                    }
+                    if let Some(ref mut opt_movers) = option_movers {
+                        opt_movers.update_prev_close(
+                            tick.security_id,
+                            tick.exchange_segment_code,
+                            tick.day_close,
+                        );
+                    }
+                }
 
                 if tick_is_valid {
                     // Ingestion gate: drop Full packet ticks outside [9:00 AM, 3:30 PM) IST.
@@ -843,24 +865,7 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     let _ = sender.send(tick);
                 }
 
-                // O(1) movers baseline from day_close (= previous session's close).
-                // Same logic as Tick path — Dhan confirmed day_close = prev close.
-                if tick.day_close > 0.0 && tick.day_close.is_finite() {
-                    if let Some(ref mut movers) = top_movers {
-                        movers.update_prev_close(
-                            tick.security_id,
-                            tick.exchange_segment_code,
-                            tick.day_close,
-                        );
-                    }
-                    if let Some(ref mut opt_movers) = option_movers {
-                        opt_movers.update_prev_close(
-                            tick.security_id,
-                            tick.exchange_segment_code,
-                            tick.day_close,
-                        );
-                    }
-                }
+                // (day_close baseline already set ABOVE time guards at line ~711)
 
                 // O(1) candle aggregation (only for ticks with valid exchange timestamps).
                 if tick_is_valid && let Some(ref mut agg) = candle_aggregator {
