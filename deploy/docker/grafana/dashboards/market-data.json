@@ -636,8 +636,8 @@
         "footer": { "countRows": true, "enablePagination": true, "fields": "", "reducer": ["count"], "show": true },
         "sortBy": [{ "desc": false, "displayName": "security_id" }]
       },
-      "title": "Previous Close Prices",
-      "description": "Previous session close prices and open interest for all subscribed instruments.",
+      "title": "Previous Close (from day_close in Full ticks)",
+      "description": "Previous session close prices extracted from day_close field in Full packet ticks. Dhan confirmed: day_close = previous trading session close.",
       "type": "table",
       "targets": [
         {
@@ -645,7 +645,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT\n  segment,\n  security_id,\n  prev_close,\n  prev_oi,\n  to_str(received_at, 'yyyy-MM-dd HH:mm:ss.SSS') AS time\nFROM previous_close\nORDER BY security_id\nLIMIT 500;",
+          "rawSql": "SELECT\n  segment,\n  security_id,\n  last(day_close) AS prev_close,\n  last(ltp) AS current_ltp,\n  to_str(max(ts), 'yyyy-MM-dd HH:mm:ss.SSS') AS last_tick_time\nFROM ticks\nWHERE day_close > 0\nSAMPLE BY 1d\nORDER BY security_id\nLIMIT 500;",
           "refId": "A"
         }
       ]

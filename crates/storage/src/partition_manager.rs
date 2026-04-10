@@ -42,7 +42,7 @@ const HOUR_PARTITIONED_TABLES: &[&str] = &[
 ];
 
 /// Tables with DAY partitioning (lower-frequency data).
-const DAY_PARTITIONED_TABLES: &[&str] = &["historical_candles", "candles_1s", "previous_close"];
+const DAY_PARTITIONED_TABLES: &[&str] = &["historical_candles", "candles_1s"];
 
 // ---------------------------------------------------------------------------
 // Partition Manager

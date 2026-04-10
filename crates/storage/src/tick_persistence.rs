@@ -2065,40 +2065,11 @@ pub async fn ensure_depth_and_prev_close_tables(questdb_config: &QuestDbConfig) 
     )
     .await;
 
-    // --- previous_close table ---
-    execute_ddl_best_effort(
-        &client,
-        &base_url,
-        PREVIOUS_CLOSE_CREATE_DDL,
-        "previous_close CREATE",
-    )
-    .await;
-    let dedup_prev_close = format!(
-        "ALTER TABLE {} DEDUP ENABLE UPSERT KEYS(ts, {})",
-        QUESTDB_TABLE_PREVIOUS_CLOSE, DEDUP_KEY_PREVIOUS_CLOSE
-    );
-    execute_ddl_best_effort(
-        &client,
-        &base_url,
-        &dedup_prev_close,
-        "previous_close DEDUP",
-    )
-    .await;
+    // previous_close table REMOVED — day_close from Full packet ticks provides
+    // previous close for ALL instruments. No separate table needed.
+    // Dhan confirmed (Ticket #5525125): day_close = previous session's close.
 
-    // Migration: add received_at column to existing previous_close tables (idempotent).
-    let add_received_at = format!(
-        "ALTER TABLE {} ADD COLUMN IF NOT EXISTS received_at TIMESTAMP",
-        QUESTDB_TABLE_PREVIOUS_CLOSE
-    );
-    execute_ddl_best_effort(
-        &client,
-        &base_url,
-        &add_received_at,
-        "previous_close received_at migration",
-    )
-    .await;
-
-    info!("market_depth and previous_close table setup complete");
+    info!("market_depth table setup complete (previous_close table removed)");
 }
 
 // ---------------------------------------------------------------------------

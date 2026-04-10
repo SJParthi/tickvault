@@ -23,9 +23,7 @@ use dhan_live_trader_common::constants::{
 use dhan_live_trader_common::tick_types::{GreeksEnricher, ParsedTick};
 
 use dhan_live_trader_storage::candle_persistence::LiveCandleWriter;
-use dhan_live_trader_storage::tick_persistence::{
-    DepthPersistenceWriter, TickPersistenceWriter, build_previous_close_row,
-};
+use dhan_live_trader_storage::tick_persistence::{DepthPersistenceWriter, TickPersistenceWriter};
 
 use dhan_live_trader_common::tick_types::MarketDepthLevel;
 
@@ -487,10 +485,6 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
     let mut day_close_baseline_count: u64 = 0;
     let mut day_close_baseline_logged = false;
     let mut day_close_first_log_time = None::<Instant>;
-    // Track which instruments have had day_close persisted to previous_close table.
-    // O(1) lookup per tick. Write once per instrument, not per tick.
-    let mut day_close_persisted: std::collections::HashSet<u32> =
-        std::collections::HashSet::with_capacity(30000);
     // O(1) EXEMPT: end
 
     // O(1) dedup ring buffer — pre-allocated once, zero allocation in hot loop.
@@ -606,31 +600,8 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                             tick.day_close,
                         );
                     }
-                    // Persist to previous_close QuestDB table ONCE per instrument.
-                    // day_close from Full packets = previous session's close for ALL instruments.
-                    // HashSet lookup = O(1). Write + flush only on first occurrence.
-                    if !day_close_persisted.contains(&tick.security_id) {
-                        day_close_persisted.insert(tick.security_id);
-                        if let Some(ref mut writer) = tick_writer {
-                            if let Err(err) = build_previous_close_row(
-                                writer.buffer_mut(),
-                                tick.security_id,
-                                tick.exchange_segment_code,
-                                tick.day_close,
-                                0, // OI not available from Full packet day_close field
-                                received_at_nanos,
-                            ) {
-                                warn!(
-                                    ?err,
-                                    security_id = tick.security_id,
-                                    "failed to write day_close to previous_close"
-                                );
-                            }
-                            if let Err(err) = writer.flush_buffer_direct() {
-                                warn!(?err, "failed to flush day_close previous_close");
-                            }
-                        }
-                    }
+                    // No separate previous_close table — day_close is already in every
+                    // tick persisted to the ticks table. Movers use in-memory baselines.
                 }
 
                 // Ingestion gate: drop ALL ticks outside [9:00 AM, 3:30 PM) IST.
@@ -757,29 +728,6 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                             tick.exchange_segment_code,
                             tick.day_close,
                         );
-                    }
-                    // Persist to previous_close QuestDB — same as Tick path.
-                    if !day_close_persisted.contains(&tick.security_id) {
-                        day_close_persisted.insert(tick.security_id);
-                        if let Some(ref mut writer) = tick_writer {
-                            if let Err(err) = build_previous_close_row(
-                                writer.buffer_mut(),
-                                tick.security_id,
-                                tick.exchange_segment_code,
-                                tick.day_close,
-                                0,
-                                received_at_nanos,
-                            ) {
-                                warn!(
-                                    ?err,
-                                    security_id = tick.security_id,
-                                    "failed to write day_close to previous_close"
-                                );
-                            }
-                            if let Err(err) = writer.flush_buffer_direct() {
-                                warn!(?err, "failed to flush day_close previous_close");
-                            }
-                        }
                     }
                 }
 
@@ -993,52 +941,9 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     movers.update_prev_close(security_id, exchange_segment_code, previous_close);
                 }
 
-                // PrevClose is reference data — persist ALWAYS, no time guards.
-                // Unlike ticks (which have exchange_timestamp from LTT), PrevClose has
-                // NO exchange timestamp — only received_at (local clock). The stale-day
-                // and market-hours guards are designed for exchange timestamps and would
-                // incorrectly filter PrevClose packets. PrevClose arrives once per
-                // instrument at subscription time; QuestDB DEDUP handles duplicates.
-                //
-                // Persist previous close to QuestDB.
-                // Previous close packets arrive in a burst at subscription time (once per instrument).
-                // Force flush after each write to prevent data loss — these are reference data that
-                // movers calculations depend on. Without flush, the buffer may not drain before
-                // tick data starts flowing.
-                if let Some(ref mut writer) = tick_writer {
-                    if let Err(err) = build_previous_close_row(
-                        writer.buffer_mut(),
-                        security_id,
-                        exchange_segment_code,
-                        previous_close,
-                        previous_oi,
-                        received_at_nanos,
-                    ) {
-                        storage_errors = storage_errors.saturating_add(1);
-                        m_storage_errors.increment(1);
-                        if storage_errors <= 100 {
-                            warn!(
-                                ?err,
-                                security_id, "failed to write previous close to QuestDB"
-                            );
-                        }
-                    }
-                    // Direct buffer flush — bypasses pending_count guard.
-                    // force_flush() checks pending_count == 0 and returns early because
-                    // build_previous_close_row writes to buffer_mut() without incrementing
-                    // pending_count. flush_buffer_direct() flushes unconditionally.
-                    // O(1) EXEMPT: cold path — runs once per instrument at boot, not per tick.
-                    if let Err(err) = writer.flush_buffer_direct() {
-                        // ERROR not WARN: PrevClose is reference data for movers baselines.
-                        // Loss here means movers report 0% change for the entire session.
-                        error!(
-                            ?err,
-                            security_id,
-                            exchange_segment_code,
-                            "CRITICAL: failed to flush previous close to QuestDB — movers baseline lost"
-                        );
-                    }
-                }
+                // No separate previous_close table — day_close from Full packet ticks
+                // provides previous close for ALL instruments (Dhan Ticket #5525125).
+                // PrevClose code-6 packets only update in-memory movers (above).
 
                 debug!(
                     security_id,
