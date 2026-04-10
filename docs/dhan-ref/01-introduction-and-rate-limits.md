@@ -14,7 +14,7 @@ DhanHQ API v2 is a set of REST-like APIs + WebSockets for trading and market dat
 
 All requests require `access-token` header. GET/DELETE params go as query params. POST/PUT params as JSON body.
 
-> **SDK note (v2.2.0rc1):** The DhanHQ Python SDK now sends both `access-token` AND `client-id` headers on ALL requests by default (not just Market Quote / Option Chain). Consider sending `client-id` on all requests for forward compatibility.
+> **SDK note (v2.2.0rc1):** The Dhan API (Python SDK ref) now sends both `access-token` AND `client-id` headers on ALL requests by default (not just Market Quote / Option Chain). Consider sending `client-id` on all requests for forward compatibility.
 
 ```
 curl --request POST \

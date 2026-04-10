@@ -103,7 +103,10 @@ const _: () = assert!(
     "ParsedTick grew beyond TICK_SPILL_RECORD_SIZE — update serialize/deserialize"
 );
 
-/// Directory for tick spill files.
+/// Directory for tick/depth spill files (WAL on disk).
+/// Relative to CWD: Mac=project root, Docker=/app. Both resolve to same volume.
+/// TODO: Make configurable via QuestDbConfig.spill_dir when needed for
+/// dedicated high-IOPS volume on AWS (EBS io2 for spill, gp3 for data).
 const TICK_SPILL_DIR: &str = "data/spill";
 
 /// Serialize a `ParsedTick` to a fixed-size byte array for disk spill.
@@ -381,8 +384,8 @@ impl TickPersistenceWriter {
     ///
     /// Returns `Ok(())` if the buffer is empty (nothing to flush).
     ///
-    /// DEPRECATED: previous_close table removed. Kept for potential future
-    /// non-tick buffer writes. No production call sites as of 2026-04-10.
+    /// DEPRECATED: previous_close table removed. No production call sites.
+    #[deprecated(note = "previous_close table removed — use day_close from Full ticks")]
     pub fn flush_buffer_direct(&mut self) -> Result<()> {
         // Nothing in buffer → no-op (avoid pointless TCP round-trip).
         if self.buffer.is_empty() {
