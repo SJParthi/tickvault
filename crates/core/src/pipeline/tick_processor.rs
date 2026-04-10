@@ -837,6 +837,14 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
             } => {
                 m_prev_close_updates.increment(1);
 
+                // Guard: skip non-finite previous_close (NaN/Infinity from corrupted frame).
+                // MUST be before movers updates — NaN propagation corrupts change% baselines.
+                if !previous_close.is_finite() {
+                    junk_ticks_filtered = junk_ticks_filtered.saturating_add(1);
+                    m_junk_filtered.increment(1);
+                    continue;
+                }
+
                 // Diagnostic: count PrevClose packets per segment.
                 match exchange_segment_code {
                     0 => prev_close_idx_i = prev_close_idx_i.saturating_add(1),
@@ -861,13 +869,6 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                 // PrevClose packets provide the correct baseline for change% calculations.
                 if let Some(ref mut movers) = top_movers {
                     movers.update_prev_close(security_id, exchange_segment_code, previous_close);
-                }
-
-                // Guard: skip non-finite previous_close (NaN/Infinity from corrupted frame)
-                if !previous_close.is_finite() {
-                    junk_ticks_filtered = junk_ticks_filtered.saturating_add(1);
-                    m_junk_filtered.increment(1);
-                    continue;
                 }
 
                 // PrevClose is reference data — persist ALWAYS regardless of market hours.
@@ -912,7 +913,14 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     // pending_count. flush_buffer_direct() flushes unconditionally.
                     // O(1) EXEMPT: cold path — runs once per instrument at boot, not per tick.
                     if let Err(err) = writer.flush_buffer_direct() {
-                        warn!(?err, "failed to flush previous close to QuestDB");
+                        // ERROR not WARN: PrevClose is reference data for movers baselines.
+                        // Loss here means movers report 0% change for the entire session.
+                        error!(
+                            ?err,
+                            security_id,
+                            exchange_segment_code,
+                            "CRITICAL: failed to flush previous close to QuestDB — movers baseline lost"
+                        );
                     }
                 }
 
