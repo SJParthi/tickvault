@@ -603,55 +603,6 @@
     },
     {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 91 },
-      "id": 800,
-      "title": "Previous Close",
-      "type": "row"
-    },
-    {
-      "datasource": { "type": "postgres", "uid": "questdb" },
-      "fieldConfig": {
-        "defaults": {
-          "custom": {
-            "align": "auto",
-            "cellOptions": { "type": "auto" },
-            "filterable": true,
-            "inspect": false
-          },
-          "mappings": [],
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
-        },
-        "overrides": [
-          {
-            "matcher": { "id": "byName", "options": "prev_close" },
-            "properties": [{ "id": "decimals", "value": 2 }]
-          }
-        ]
-      },
-      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 92 },
-      "id": 60,
-      "options": {
-        "showHeader": true,
-        "cellHeight": "sm",
-        "footer": { "countRows": true, "enablePagination": true, "fields": "", "reducer": ["count"], "show": true },
-        "sortBy": [{ "desc": false, "displayName": "security_id" }]
-      },
-      "title": "Previous Close (from day_close in Full ticks)",
-      "description": "Previous session close prices extracted from day_close field in Full packet ticks. Dhan confirmed: day_close = previous trading session close.",
-      "type": "table",
-      "targets": [
-        {
-          "datasource": { "type": "postgres", "uid": "questdb" },
-          "editorMode": "code",
-          "format": "table",
-          "rawQuery": true,
-          "rawSql": "SELECT\n  segment,\n  security_id,\n  last(day_close) AS prev_close,\n  last(ltp) AS current_ltp,\n  to_str(max(ts), 'yyyy-MM-dd HH:mm:ss.SSS') AS last_tick_time\nFROM ticks\nWHERE day_close > 0\nSAMPLE BY 1d\nORDER BY security_id\nLIMIT 500;",
-          "refId": "A"
-        }
-      ]
-    },
-    {
-      "collapsed": false,
       "gridPos": { "h": 1, "w": 24, "x": 0, "y": 102 },
       "id": 900,
       "title": "Instrument Build Metadata",
