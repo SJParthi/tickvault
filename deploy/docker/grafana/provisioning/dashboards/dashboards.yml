@@ -1,7 +1,8 @@
 # =============================================================================
 # dhan-live-trader — Grafana Dashboard Provisioning
 # =============================================================================
-# Auto-loads JSON dashboards from /var/lib/grafana/dashboards on first boot.
+# Auto-loads JSON dashboards from /var/lib/grafana/dashboards.
+# Reloads every 10 seconds. File is ALWAYS source of truth.
 # =============================================================================
 
 apiVersion: 1
@@ -12,9 +13,9 @@ providers:
     folder: "dhan-live-trader"
     type: file
     disableDeletion: false
-    editable: true
-    updateIntervalSeconds: 30
-    allowUiUpdates: true
+    editable: false
+    updateIntervalSeconds: 10
+    allowUiUpdates: false
     options:
       path: /var/lib/grafana/dashboards
       foldersFromFilesStructure: false
