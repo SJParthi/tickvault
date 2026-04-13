@@ -627,12 +627,16 @@ impl TickPersistenceWriter {
 
     /// A2: Returns the total number of ticks written to DLQ since the writer
     /// was created. MUST always be 0 in production.
+    // TEST-EXEMPT: trivial field getter, covered by test_dlq_initially_empty,
+    // test_dlq_written_when_spill_write_fails, test_dlq_append_multiple_records
     pub fn dlq_ticks_total(&self) -> u64 {
         self.dlq_ticks_total
     }
 
     /// A2: Returns the path of the current DLQ file, if any has been opened.
     /// Returns `None` if no double-failure has occurred.
+    // TEST-EXEMPT: trivial field getter, covered by test_dlq_initially_empty
+    // and test_dlq_written_when_spill_write_fails
     pub fn dlq_path(&self) -> Option<&std::path::Path> {
         self.dlq_path.as_deref()
     }
