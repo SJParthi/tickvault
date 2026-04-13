@@ -286,6 +286,16 @@ fn test_prolonged_outage_ring_plus_spill_zero_loss() {
     let config = test_config();
     let mut writer = TickPersistenceWriter::new_disconnected(&config);
 
+    // F1: Use a per-test spill directory so parallel tests don't race on the
+    // shared `data/spill/ticks-YYYYMMDD.bin`. Prior to this override, running
+    // tick_resilience in parallel mode could observe `ticks_spilled_total == 499`
+    // instead of 500 because another parallel test wrote to the same file.
+    let tmp_dir =
+        std::env::temp_dir().join(format!("dlt-tick-prolonged-outage-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+    writer.set_spill_dir_for_test(tmp_dir.clone());
+
     let overflow_count = 500_usize;
     let total_ticks = TICK_BUFFER_CAPACITY + overflow_count;
 
@@ -316,8 +326,8 @@ fn test_prolonged_outage_ring_plus_spill_zero_loss() {
         "ZERO ticks must be dropped during prolonged outage"
     );
 
-    // Clean up spill files.
-    let _ = std::fs::remove_dir_all("data/spill");
+    // Clean up per-test spill directory.
+    let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 
 /// Verify that flush_if_needed works correctly during an outage.

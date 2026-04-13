@@ -1,101 +1,91 @@
-# Implementation Plan: Zero Tick Loss Session 1 (DLQ + Chaos + Scoped Testing)
+# Implementation Plan: Zero Tick Loss Session 2 — Full Backlog
 
-**Status:** VERIFIED
+**Status:** APPROVED
 **Date:** 2026-04-13
-**Approved by:** Parthiban ("Skip expired rolling options except this go ahead with everything")
+**Approved by:** Parthiban ("everything bro")
 **Branch:** `claude/websocket-zero-tick-loss-nUAqy`
-**Backlog (follow-up sessions):** `.claude/plans/backlog-zero-tick-loss.md`
-**Prior plan archived:** `archive/2026-04-09-obi-partition-remaining-gaps.md`
+**Session 1 archived:** `archive/2026-04-13-zero-tick-loss-session-1.md` (VERIFIED, 4 commits pushed)
+**Parent backlog:** `backlog-zero-tick-loss.md`
 
-## Context
+## Goal
 
-This is session 1 of the zero-tick-loss hardening effort. The audit confirmed the codebase already has:
-- 600K ring buffer + disk spill in `tick_persistence.rs:16-19` (explicit "no silent drop" contract)
-- 30s reconnect throttle, drain-on-recovery (`tick_persistence.rs:772-786`)
-- Per-security tick gap detection (`trading/src/risk/tick_gap_tracker.rs` — RISK-GAP-03)
-- Dynamic WS read-watchdog + infinite reconnect (`connection.rs:427-448, 585`)
-- 100% coverage enforced (`quality/crate-coverage-thresholds.toml`)
-- Sandbox mode is already the config default
+Burn down the entire zero-tick-loss backlog: F1 + A3 + A4 + A5 + B2 + B3 + C1 + E1 + E2. Commit after each item so any mid-session interruption leaves a clean tree.
 
-This session closes the three most critical gaps that can be done without touching WS code:
-1. Dead-letter fallback when disk spill ALSO fails (last-resort audit log before a tick is permanently lost).
-2. A chaos test file that proves the ring→spill→reconnect→drain sequence works against a real TCP server that really dies and really comes back.
-3. A block-scoped 22-test standard to fix the repeated-session token-waste pain.
+## Order of execution (dependency-aware)
 
-Items A3 (backfill), A4 (pool circuit breaker), A5 (graceful unsub), B2/B3 (disk-full + SIGKILL chaos), C1 (doc diff), E1/E2 (metrics + alerts) are in the backlog for follow-up sessions on the same branch.
+1. **F1** — parallel-test flake fix (quick win, independent, validates scope-config pattern)
+2. **A5** — graceful unsubscribe on shutdown (small, surgical)
+3. **A4** — pool-level circuit breaker (self-contained)
+4. **A3** — backfill worker on tick-gap events (biggest, most dependencies)
+5. **E1** — Prometheus metrics wiring for A2/A3/A4 outputs
+6. **E2** — Grafana alert rules referencing E1 metrics
+7. **B2** — disk-full chaos test (`#[ignore]`)
+8. **B3** — SIGKILL chaos test (`#[ignore]`)
+9. **C1** — Dhan doc + Python SDK verification diff (read-only, no code changes to rule files)
 
-## Extreme automation requirements (applied to every item)
+## Extreme automation requirements (applies to every item)
 
-Every delivered item satisfies all 8 rows:
+Every item must satisfy all 8 rows from session 1:
+auto-track, auto-monitor, auto-debug, auto-log, auto-capture, auto-resolve, auto-alert, auto-configurable.
 
-| Property | Requirement | Satisfied by |
-|---|---|---|
-| Auto-track | Prometheus metric on every new code path | `dlt_dlq_ticks_total` counter in A2 |
-| Auto-monitor | Grafana panel + alert rule | Deferred to E2 (backlog) |
-| Auto-debug | `tracing::error!` with `security_id`, `reason`, `error_chain` | A2 `write_to_dlq` logs |
-| Auto-log | Loki via Alloy | already wired via `observability.rs` |
-| Auto-capture | Audit trail on anomaly | A2 NDJSON at `data/spill/dlq-YYYYMMDD.ndjson` |
-| Auto-resolve | Recovery without human action | A2 ring→spill→DLQ fallback is automatic; reconnect throttle pre-existing |
-| Auto-alert | CRITICAL → Telegram | `tracing::error!` level already triggers Telegram alert via existing `notification` crate |
-| Auto-configurable | Threshold lives in config | `TICK_BUFFER_CAPACITY`, `TICK_SPILL_MIN_DISK_SPACE_BYTES`, `LIVE_TRADING_EARLIEST_*` constants (A1 cutoff) |
+## Plan items
 
-## Plan Items
+- [x] F1. **Parallel-test flake fix — configurable TICK_SPILL_DIR.** Added `spill_dir: PathBuf` field to `TickPersistenceWriter`, default `TICK_SPILL_DIR`, public `set_spill_dir_for_test()` setter. Plumbed through `open_spill_file`, `open_dlq_file`, `recover_stale_spill_files`, and a new `available_disk_space_bytes_for(dir)` helper. Migrated `test_prolonged_outage_ring_plus_spill_zero_loss` to use a per-test tmp dir. Production default unchanged.
+  - Files: crates/storage/src/tick_persistence.rs (spill_dir field, setter, 4 call sites), crates/storage/tests/tick_resilience.rs (per-test dir override)
+  - Tests: test_custom_spill_dir_used_for_spill ✅, test_custom_spill_dir_used_for_dlq ✅, tick_resilience full suite 12/12 ✅
 
-- [x] A1. **Sandbox hard gate — VERIFIED EXISTING.** `crates/common/src/config.rs:905-924` already rejects `strategy.mode == "live"` if IST today < 2026-07-01. Constants `LIVE_TRADING_EARLIEST_{YEAR,MONTH,DAY} = 2026/7/1` in `constants.rs:1366-1368`. Enforced at boot via `config.validate()` called from `main.rs:117`. Default config is `mode = "sandbox"` (`config/base.toml:216`). No new code needed this session.
-  - Files: config.rs, constants.rs, main.rs
-  - Tests: test_sandbox_guard_blocks_live_before_july, test_sandbox_and_paper_modes_always_pass_guard, test_base_config_mode_is_not_live, test_default_config_trading_mode_is_paper_not_live
+- [ ] A5. **Graceful unsubscribe on shutdown.** On SIGTERM, WebSocket pool sends `FeedRequestCode::Disconnect` (12) to each connection before closing the socket. Best-effort, 2-second timeout per connection. Already-dead connections are skipped.
+  - Files: connection.rs, connection_pool.rs
+  - Tests: test_graceful_unsubscribe_sends_disconnect_request, test_graceful_unsub_timeout_does_not_block, test_graceful_unsub_skips_dead_connections
 
-- [x] A2. **Dead-letter NDJSON fallback for double failure.** When `spill_tick_to_disk()` fails (either open or write), the tick is now forwarded to new `write_to_dlq()` which lazy-opens `data/spill/dlq-YYYYMMDD.ndjson` (append-only) and writes one JSON line with full tick fields + failure reason + `ts_ms`. New struct fields `dlq_writer`, `dlq_path`, `dlq_ticks_total`. New public methods `dlq_ticks_total()`, `dlq_path()`. New Prometheus counter `dlt_dlq_ticks_total`. `ticks_dropped_total` now only increments on the truly catastrophic path where DLQ ALSO fails. Existing "ticks_dropped must be 0" contract is strengthened — the only way to drop a tick now is if ring buffer, disk spill, AND DLQ NDJSON all fail simultaneously.
-  - Files: tick_persistence.rs
-  - Tests: test_dlq_initially_empty, test_dlq_written_when_spill_write_fails, test_dlq_format_is_parseable_ndjson, test_dlq_append_multiple_records
+- [ ] A4. **Pool-level circuit breaker.** When ALL WS connections are in `Reconnecting` state simultaneously for more than 60 seconds, emit CRITICAL Telegram and set `pool_health = Degraded`. If still all-down at 300 seconds, return a fatal error (supervisor restarts the process). New Prometheus gauge `dlt_pool_degraded_seconds_total`.
+  - Files: connection_pool.rs, connection.rs (state hook)
+  - Tests: test_pool_detects_all_reconnecting, test_pool_degraded_after_60s, test_pool_fatal_after_300s, test_pool_recovers_on_any_reconnect
 
-- [x] B1. **Chaos test file — real TCP server lifecycle.** New file `crates/storage/tests/chaos_questdb_lifecycle.rs` with a controllable `FakeQuestDb` helper that starts/stops a drain TCP server on demand. Two default-enabled tests prove the contract:
-  - `test_questdb_disappears_ticks_buffer_not_drop` — 100 appends in disconnected state land in ring, drops=0, dlq=0.
-  - `test_questdb_round_trip_preserves_every_tick` — connect to real TCP server, flush 1000 ticks, stop server, append 150 more, `force_flush` fails (expected), rescue to ring, verify ≥150 buffered, drops=0, dlq=0.
-  - Two `#[ignore]`-gated skeletons for follow-up sessions: `chaos_docker_questdb_kill_and_restart` (requires `CI_WITH_DOCKER=1`) and `chaos_sigkill_mid_batch_spill_replay` (requires `CI_WITH_SIGKILL=1`).
-  - Files: chaos_questdb_lifecycle.rs
-  - Tests: questdb_disappears_ticks_buffer_not_drop, questdb_round_trip_preserves_every_tick, chaos_docker_questdb_kill_and_restart, chaos_sigkill_mid_batch_spill_replay
+- [ ] A3. **Live intraday backfill worker.** When `TickGapTracker` emits an ERROR-level gap, publish a `GapDetected { security_id, from_ltt, to_now }` event on a bounded mpsc. A new `backfill_worker` task consumes events, calls the existing `HistoricalCandleFetcher::fetch_intraday_minute` for the gap window, synthesises `ParsedTick` records from minute OHLCV bars (one tick per minute, LTP=close, LTT=candle timestamp), pushes them through the normal `append_tick` path with `backfilled=true` column. QuestDB DEDUP ensures idempotency on replay.
+  - Files: tick_gap_tracker.rs, backfill_worker.rs (new), tick_persistence.rs (add backfilled column DDL + ILP field), trading_pipeline.rs
+  - Tests: test_backfill_event_published_on_error_gap, test_backfill_worker_synthesises_ticks_from_candles, test_backfill_idempotent_via_dedup, test_backfill_rate_limit_respected, test_backfill_warmup_suppressed
 
-- [x] D1. **Block-scoped 22-test rule.** New file `.claude/rules/project/testing-scope.md`. Defines default test scope = only crates in the current diff. Workspace-wide runs only on `/full-qa`, `FULL_QA=1`, or post-merge CI. Escalation triggers: `crates/common/` touched (everyone depends on it), >3 crates touched, `.claude/rules/` changed, workspace `Cargo.toml` changed. `testing.md` header amended to reference this rule.
-  - Files: testing-scope.md, testing.md
+- [ ] E1. **Prometheus metrics for new paths.** Counters/gauges emitted by A2/A3/A4. Most are already wired (dlt_dlq_ticks_total from session 1). Add: dlt_backfill_ticks_total, dlt_backfill_errors_total, dlt_pool_degraded_seconds_total, dlt_sandbox_gate_blocks_total (wire at config-validation point).
+  - Files: backfill_worker.rs, connection_pool.rs, config.rs
+  - Tests: covered via unit tests that assert metric names exist (recorder fixture)
 
-- [x] D2. **Scoped test runner hook + Makefile targets.** New executable `.claude/hooks/scoped-test-runner.sh` implements the scope algorithm. New Makefile targets: `scoped-check` (default = scoped), `full-qa` (forces workspace). Demonstrated working end-to-end: on this session's diff it correctly escalated to WORKSPACE because `.claude/rules/` was changed (this plan file itself).
-  - Files: scoped-test-runner.sh, Makefile
+- [ ] E2. **Grafana alert rules + dashboard panels.** New file `deploy/docker/grafana/provisioning/alerting/zero-tick-loss.yaml` with 5 alerts: DLQ>0 CRITICAL, spill>50% WARN, spill>90% CRITICAL, pool_degraded>60s CRITICAL, backfill_errors>10/min WARN. Dashboard JSON panels for each new metric.
+  - Files: zero-tick-loss.yaml (new), trading-pipeline.json (append panels)
+  - Tests: YAML syntax validation via serde_yaml roundtrip in a small helper test
 
-- [x] Incidental. **Fix pre-existing doc-lint blocker.** `crates/common/src/config.rs:254` had a `clippy::doc_lazy_continuation` violation (doc list item without a blank line before a non-list paragraph). Blocked clippy on the storage crate tests. Added the missing blank line. Not introduced by this session — opportunistic fix.
-  - Files: config.rs
+- [ ] B2. **Disk-full chaos test.** `crates/storage/tests/chaos_disk_full.rs` — fills the spill dir to the low-disk threshold, appends ticks, asserts DLQ records appear and `dlq_ticks_total` increments. Frees space, asserts no further DLQ growth. `#[ignore]` by default, unix-only.
+  - Files: chaos_disk_full.rs (new)
+  - Tests: chaos_disk_full_triggers_dlq, chaos_disk_full_recovery
 
-## Scenarios verified
+- [ ] B3. **SIGKILL mid-batch chaos test.** `crates/storage/tests/chaos_sigkill_replay.rs` — forks a child process that streams ticks to a fake QDB, SIGKILLs it mid-stream, restarts the child with the same spill_dir, verifies the spill file from the killed process is replayed on startup. `#[ignore]` + `CI_WITH_SIGKILL=1` gate.
+  - Files: chaos_sigkill_replay.rs (new)
+  - Tests: chaos_sigkill_spill_replay_zero_loss
+
+- [ ] C1. **Dhan doc + Python SDK verification diff.** Read-only pass: fetch every URL in the session 1 reference list (WebFetch), diff against `docs/dhan-ref/*.md` and `.claude/rules/dhan/*.md`, produce `docs/dhan-ref/verification-2026-04-13.md` with PASS/DIFF per file. NO rule file edits this session — any diffs become follow-up items. Primary = Dhan docs, secondary = Python SDK.
+  - Files: verification-2026-04-13.md (new, docs/dhan-ref/)
+  - Tests: (read-only doc task, no code)
+
+## Scenarios
 
 | # | Scenario | Expected | Verified by |
 |---|----------|----------|-------------|
-| 1 | Writer creates with QDB down | starts in buffering mode, zero errors | existing `test_disconnected_writer_is_not_connected` etc. |
-| 2 | 100 ticks appended while QDB down | all land in ring buffer, drops=0, dlq=0 | new `questdb_disappears_ticks_buffer_not_drop` |
-| 3 | QDB up → 1000 ticks → QDB dies → 150 ticks → force_flush fails | ≥150 rescued into ring, drops=0, dlq=0 | new `questdb_round_trip_preserves_every_tick` |
-| 4 | Disk spill write fails (ENOSPC via /dev/full) | tick forwarded to DLQ NDJSON, drops=0, dlq=1 | new `test_dlq_written_when_spill_write_fails` |
-| 5 | DLQ file format | valid NDJSON, LF-terminated, contains `ts_ms, reason, security_id, segment, ltt, ltp, oi` | new `test_dlq_format_is_parseable_ndjson` |
-| 6 | 3 DLQ writes | all 3 lines present, counter = 3 | new `test_dlq_append_multiple_records` |
-| 7 | Fresh writer | `dlq_ticks_total == 0`, `dlq_path() == None` | new `test_dlq_initially_empty` |
-| 8 | `mode = "live"` on 2026-04-13 | `config.validate()` fails with SANDBOX GUARD error | existing `test_sandbox_guard_blocks_live_before_july` |
-| 9 | Touch only `crates/storage/` | `scoped-test-runner.sh` runs `cargo test -p dhan-live-trader-storage` only | script logic in `scoped-test-runner.sh`, manual demonstration |
-
-## Pre-existing issues surfaced but NOT fixed this session (scope protection)
-
-- **Parallel-test flake** in `crates/storage/tests/tick_resilience.rs::test_prolonged_outage_ring_plus_spill_zero_loss`. Observed `ticks_spilled_total == 499` instead of 500 under parallel execution. **Verified pre-existing** by stashing all session changes and re-running — failure still reproduces without any of the session changes in play. Passes consistently with `--test-threads=1`. Root cause: multiple tests in the same file share the process-level `data/spill/ticks-YYYYMMDD.bin` path. Queued as **F1** in `backlog-zero-tick-loss.md`.
-- **118 pre-existing clippy warnings** in `crates/storage/` under `-D warnings`. Per `pre-push-gate.sh`: "Heavy gates (clippy, test, audit, deny, coverage, loom) are CI-only." Not blocking.
-- **`DepthPersistenceWriter` has no DLQ fallback.** A2 was scoped to ticks only. Queued in backlog.
+| 1 | Parallel tick_resilience tests | No spill file collision | F1 + re-run existing suite |
+| 2 | SIGTERM during active WS | Disconnect request (12) sent to every live connection before socket close | A5 |
+| 3 | All 5 WS simultaneously reconnecting for 65s | Telegram CRITICAL + metric gauge updated | A4 |
+| 4 | All 5 WS simultaneously reconnecting for 305s | Process exits with non-zero for supervisor restart | A4 |
+| 5 | Single instrument 60s gap detected | GapDetected event → backfill_worker → historical fetch → synthetic ticks → DEDUP merges | A3 |
+| 6 | Backfill same gap twice | Second backfill is a no-op (DEDUP) | A3 idempotency test |
+| 7 | Disk full during outage | DLQ NDJSON records written, counter increments | B2 |
+| 8 | SIGKILL during spill write | On restart, spill file drained to QDB | B3 |
+| 9 | Dhan doc check | verification-2026-04-13.md produced with PASS/DIFF per ref file | C1 |
 
 ## Verification
 
 ```bash
-# A2 DLQ unit tests (4 passing)
-cargo test -p dhan-live-trader-storage --lib dlq
-
-# B1 chaos tests (2 active passing + 2 ignored skeletons)
-cargo test -p dhan-live-trader-storage --test chaos_questdb_lifecycle
-
-# D1/D2 scoped runner (demonstrated)
+bash .claude/hooks/plan-verify.sh
+bash .claude/hooks/pub-fn-test-guard.sh .
 bash .claude/hooks/scoped-test-runner.sh
+cargo fmt --check
+cargo test -p dhan-live-trader-storage -p dhan-live-trader-core -p dhan-live-trader-trading
 ```
-
-All pass. See commit message for the exact command outputs.

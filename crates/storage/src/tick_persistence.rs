@@ -105,8 +105,13 @@ const _: () = assert!(
 
 /// Directory for tick/depth spill files (WAL on disk).
 /// Relative to CWD: Mac=project root, Docker=/app. Both resolve to same volume.
-/// TODO: Make configurable via QuestDbConfig.spill_dir when needed for
-/// dedicated high-IOPS volume on AWS (EBS io2 for spill, gp3 for data).
+///
+/// **F1 (2026-04-13):** This is now only the DEFAULT path. Each
+/// `TickPersistenceWriter` carries its own `spill_dir` field that can be
+/// overridden via `set_spill_dir_for_test()` for parallel test isolation.
+/// Production code always uses this default — no configuration change needed.
+/// TODO: Make configurable via `QuestDbConfig.spill_dir` when AWS deployment
+/// needs a dedicated high-IOPS volume (EBS io2 for spill, gp3 for data).
 const TICK_SPILL_DIR: &str = "data/spill";
 
 /// Serialize a `ParsedTick` to a fixed-size byte array for disk spill.
@@ -224,6 +229,11 @@ pub struct TickPersistenceWriter {
     /// This counter MUST always be 0 in production; any non-zero value is a
     /// CRITICAL data integrity incident.
     dlq_ticks_total: u64,
+    /// F1: Base directory for spill + DLQ files.
+    /// Production always uses `TICK_SPILL_DIR`. Tests can override via
+    /// `set_spill_dir_for_test()` to avoid shared-path races under parallel
+    /// execution. All spill/DLQ paths are derived from this directory.
+    spill_dir: std::path::PathBuf,
 }
 
 impl TickPersistenceWriter {
@@ -254,6 +264,7 @@ impl TickPersistenceWriter {
             dlq_writer: None,
             dlq_path: None,
             dlq_ticks_total: 0,
+            spill_dir: std::path::PathBuf::from(TICK_SPILL_DIR),
         })
     }
 
@@ -286,6 +297,7 @@ impl TickPersistenceWriter {
             dlq_writer: None,
             dlq_path: None,
             dlq_ticks_total: 0,
+            spill_dir: std::path::PathBuf::from(TICK_SPILL_DIR),
         }
     }
 
@@ -607,11 +619,12 @@ impl TickPersistenceWriter {
 
     /// A2: Opens (or creates) the DLQ NDJSON file for the current date.
     /// Appends to any existing file — the DLQ is append-only audit log.
+    /// F1: Uses `self.spill_dir` (configurable per-test).
     fn open_dlq_file(&mut self) -> Result<()> {
-        std::fs::create_dir_all(TICK_SPILL_DIR).context("failed to create DLQ directory")?;
+        std::fs::create_dir_all(&self.spill_dir).context("failed to create DLQ directory")?;
 
         let date = chrono::Utc::now().format("%Y%m%d");
-        let path = std::path::PathBuf::from(format!("{TICK_SPILL_DIR}/dlq-{date}.ndjson"));
+        let path = self.spill_dir.join(format!("dlq-{date}.ndjson"));
 
         let file = std::fs::OpenOptions::new()
             .create(true)
@@ -639,13 +652,30 @@ impl TickPersistenceWriter {
         self.dlq_path.as_deref()
     }
 
+    /// F1: Override the spill directory. **Test-only.** Parallel tests must
+    /// use a per-test tmp directory to avoid colliding on the shared default
+    /// `data/spill/ticks-YYYYMMDD.bin` path. Production code never calls
+    /// this — it uses the default `TICK_SPILL_DIR`.
+    // TEST-EXEMPT: test-only setter, exercised by test_custom_spill_dir_used_for_spill and test_custom_spill_dir_used_for_dlq
+    pub fn set_spill_dir_for_test(&mut self, dir: std::path::PathBuf) {
+        self.spill_dir = dir;
+    }
+
+    /// F1: Returns the configured spill directory (default or test override).
+    // TEST-EXEMPT: trivial field getter, exercised by test_custom_spill_dir_used_for_spill
+    pub fn spill_dir(&self) -> &std::path::Path {
+        &self.spill_dir
+    }
+
     /// Opens (or creates) the spill file for the current date.
     /// A4: Checks available disk space and fires alert if low.
+    /// F1: Uses `self.spill_dir` (configurable per-test).
     fn open_spill_file(&mut self) -> Result<()> {
-        std::fs::create_dir_all(TICK_SPILL_DIR).context("failed to create tick spill directory")?;
+        std::fs::create_dir_all(&self.spill_dir)
+            .context("failed to create tick spill directory")?;
 
         // A4: Disk space check before first spill write.
-        if let Some(avail) = Self::available_disk_space_bytes() {
+        if let Some(avail) = Self::available_disk_space_bytes_for(&self.spill_dir) {
             let avail_mb = avail / (1024 * 1024);
             metrics::gauge!("dlt_spill_disk_available_mb").set(avail_mb as f64);
             if avail < TICK_SPILL_MIN_DISK_SPACE_BYTES {
@@ -664,7 +694,7 @@ impl TickPersistenceWriter {
         }
 
         let date = chrono::Utc::now().format("%Y%m%d");
-        let path = std::path::PathBuf::from(format!("{TICK_SPILL_DIR}/ticks-{date}.bin"));
+        let path = self.spill_dir.join(format!("ticks-{date}.bin"));
 
         let file = std::fs::OpenOptions::new()
             .create(true)
@@ -784,11 +814,12 @@ impl TickPersistenceWriter {
     #[rustfmt::skip]
     pub fn recover_stale_spill_files(&mut self) -> usize {
         if self.sender.is_none() { warn!("cannot recover stale spill files — QuestDB not connected"); return 0; }
-        let dir = match std::fs::read_dir(TICK_SPILL_DIR) {
+        // F1: use configurable spill_dir.
+        let dir = match std::fs::read_dir(&self.spill_dir) {
             Ok(d) => d,
             Err(err) => {
                 if err.kind() == std::io::ErrorKind::NotFound { return 0; }
-                warn!(?err, dir = TICK_SPILL_DIR, "cannot read tick spill directory for recovery"); return 0;
+                warn!(?err, dir = %self.spill_dir.display(), "cannot read tick spill directory for recovery"); return 0;
             }
         };
         let mut total_recovered: usize = 0;
@@ -980,14 +1011,18 @@ impl TickPersistenceWriter {
 
     /// Returns available disk space in bytes for the spill directory.
     /// Returns `None` if the check fails (e.g., directory doesn't exist yet).
-    fn available_disk_space_bytes() -> Option<u64> {
+    /// F1: Parameterised by directory so per-test override paths work correctly.
+    /// Returns available disk space in bytes for the given directory. Returns
+    /// `None` if the check fails (directory doesn't exist or df unavailable).
+    fn available_disk_space_bytes_for(dir: &std::path::Path) -> Option<u64> {
         // Create spill dir if needed so df can query it.
-        let _ = std::fs::create_dir_all(TICK_SPILL_DIR);
+        let _ = std::fs::create_dir_all(dir);
         #[cfg(target_family = "unix")]
         {
+            let dir_str = dir.to_str()?;
             // Use `df --output=avail -B1` to get available bytes without libc dependency.
             let output = std::process::Command::new("df")
-                .args(["--output=avail", "-B1", TICK_SPILL_DIR])
+                .args(["--output=avail", "-B1", dir_str])
                 .output()
                 .ok()?;
             if !output.status.success() {
@@ -999,6 +1034,7 @@ impl TickPersistenceWriter {
         }
         #[cfg(not(target_family = "unix"))]
         {
+            let _ = dir;
             None // Disk space check not available on non-Unix.
         }
     }
@@ -10676,6 +10712,82 @@ mod tests {
         assert_eq!(writer.dlq_ticks_total(), 3);
 
         let _ = std::fs::remove_file(&dlq_path);
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    // =======================================================================
+    // F1: Configurable spill directory (test isolation)
+    // =======================================================================
+
+    /// F1: `set_spill_dir_for_test` routes new spill files into the override
+    /// directory instead of the process-wide default.
+    #[test]
+    fn test_custom_spill_dir_used_for_spill() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+
+        let tmp_dir = std::env::temp_dir().join(format!("dlt-f1-spill-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        writer.set_spill_dir_for_test(tmp_dir.clone());
+        assert_eq!(writer.spill_dir(), tmp_dir.as_path());
+
+        // Trigger a real spill: fill the ring buffer to capacity, then spill one tick.
+        for i in 0..TICK_BUFFER_CAPACITY as u32 {
+            writer.tick_buffer.push_back(make_test_tick(i, 1.0));
+        }
+        writer.spill_tick_to_disk(&make_test_tick(999_999, 2.0));
+
+        // The spill file must live under the override directory.
+        let path = writer
+            .spill_path
+            .as_ref()
+            .expect("spill_path must be set after first spill");
+        assert!(
+            path.starts_with(&tmp_dir),
+            "spill file must live under the override directory, got {}",
+            path.display()
+        );
+        assert_eq!(writer.ticks_spilled_total(), 1);
+
+        drop(writer);
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    /// F1: DLQ file also uses the overridden directory.
+    #[test]
+    fn test_custom_spill_dir_used_for_dlq() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+
+        let tmp_dir = std::env::temp_dir().join(format!("dlt-f1-dlq-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        writer.set_spill_dir_for_test(tmp_dir.clone());
+
+        // Directly exercise the DLQ path.
+        writer.write_to_dlq(&make_test_tick(123, 45.6), "f1_dir_test");
+        let dlq_path = writer
+            .dlq_path()
+            .expect("dlq_path must be set after write_to_dlq");
+        assert!(
+            dlq_path.starts_with(&tmp_dir),
+            "DLQ file must live under the override directory, got {}",
+            dlq_path.display()
+        );
+        assert_eq!(writer.dlq_ticks_total(), 1);
+
+        drop(writer);
         let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 
