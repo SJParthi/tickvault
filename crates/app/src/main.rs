@@ -1263,6 +1263,76 @@ async fn main() -> Result<()> {
             dhan_live_trader_common::constants::TICK_BROADCAST_CAPACITY,
         );
 
+    // S4-T1d: Slow-boot backfill infrastructure. Mirrors the fast-boot
+    // wiring at line ~424 so the two boot modes have identical gap
+    // detection + backfill observability surfaces. The slow-boot hot
+    // path (run_tick_processor) owns its own tick writer, so we do NOT
+    // write ticks from the observability task — it only tracks gaps
+    // and HTTP-pings QuestDB for health.
+    let (gap_backfill_tx_slow, gap_backfill_rx_slow) = tokio::sync::mpsc::channel::<
+        dhan_live_trader_core::historical::backfill::GapBackfillRequest,
+    >(64);
+    let (synth_tick_tx_slow, mut synth_tick_rx_slow) =
+        tokio::sync::mpsc::channel::<dhan_live_trader_common::tick_types::ParsedTick>(4096);
+    let backfill_fetcher_slow =
+        |req: dhan_live_trader_core::historical::backfill::GapBackfillRequest| async move {
+            tracing::info!(
+                security_id = req.security_id,
+                gap_secs = req.gap_secs(),
+                "S4-T1d: slow-boot backfill fetcher invoked (placeholder). \
+                 Real Dhan REST call lands in T1e."
+            );
+            Ok::<Vec<dhan_live_trader_common::tick_types::HistoricalCandle>, String>(Vec::new())
+        };
+    let backfill_worker_slow = dhan_live_trader_core::historical::backfill::BackfillWorker::new(
+        gap_backfill_rx_slow,
+        synth_tick_tx_slow,
+        backfill_fetcher_slow,
+    );
+    let backfill_stats_slow = backfill_worker_slow.stats_handle();
+    tokio::spawn(async move {
+        tracing::info!("S4-T1d: slow-boot BackfillWorker started");
+        backfill_worker_slow.run().await;
+    });
+    tokio::spawn(async move {
+        while let Some(tick) = synth_tick_rx_slow.recv().await {
+            tracing::debug!(
+                security_id = tick.security_id,
+                "S4-T1d: slow-boot synth tick received (not yet persisted — T1f)"
+            );
+        }
+    });
+    {
+        let stats = std::sync::Arc::clone(&backfill_stats_slow);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let snap = stats.snapshot();
+                metrics::counter!("dlt_backfill_events_received_total")
+                    .absolute(snap.events_received);
+                metrics::counter!("dlt_backfill_events_succeeded_total")
+                    .absolute(snap.events_succeeded);
+                metrics::counter!("dlt_backfill_events_errored_total")
+                    .absolute(snap.events_errored);
+                metrics::counter!("dlt_backfill_events_empty_total").absolute(snap.events_empty);
+                metrics::counter!("dlt_backfill_ticks_synthesised_total")
+                    .absolute(snap.ticks_synthesised);
+            }
+        });
+    }
+    // Spawn the observability-only consumer (gap tracker + HTTP health).
+    {
+        let obs_rx = tick_broadcast_sender.subscribe();
+        let questdb_cfg = config.questdb.clone();
+        let gap_tx_for_obs = gap_backfill_tx_slow.clone();
+        tokio::spawn(async move {
+            run_slow_boot_observability(obs_rx, questdb_cfg, Some(gap_tx_for_obs)).await;
+        });
+        info!("S4-T1d: slow-boot observability consumer started");
+    }
+
     let processor_handle = if let Some(receiver) = pool_receiver {
         let candle_agg = Some(dhan_live_trader_core::pipeline::CandleAggregator::new());
         let live_candle_writer =
@@ -3058,6 +3128,124 @@ async fn run_tick_persistence_consumer(
                     "cold-path tick persistence consumer shutting down (broadcast closed)"
                 );
                 let _ = tick_writer.flush_if_needed();
+                return;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helper: S4-T1d — Slow-boot observability-only consumer
+// ---------------------------------------------------------------------------
+
+/// S4-T1d: Gap tracker + QuestDB HTTP health observer for the slow-boot
+/// path. In slow-boot mode the hot-path `run_tick_processor` owns its own
+/// `TickPersistenceWriter` and writes ticks directly; adding a second
+/// writer would double-persist every tick. This task is ADDITIVE —
+/// observability only, no writes:
+///
+/// 1. Subscribes to the tick broadcast (cheap read-only clone)
+/// 2. Feeds every tick into `TickGapTracker::record_tick` and publishes
+///    a `GapBackfillRequest` on ERROR-level gaps (same as the fast-boot
+///    consumer)
+/// 3. Every 2 seconds, HTTP-pings QuestDB's `/exec` endpoint and feeds
+///    the result into `QuestDbHealthPoller` so the same metrics +
+///    CRITICAL logs fire as in fast-boot
+///
+/// Matches the zero-tick-loss observability surface in both boot modes
+/// so there is no blind spot.
+async fn run_slow_boot_observability(
+    mut tick_rx: tokio::sync::broadcast::Receiver<dhan_live_trader_common::tick_types::ParsedTick>,
+    questdb_config: dhan_live_trader_common::config::QuestDbConfig,
+    gap_backfill_tx: Option<
+        tokio::sync::mpsc::Sender<dhan_live_trader_core::historical::backfill::GapBackfillRequest>,
+    >,
+) {
+    info!("S4-T1d: slow-boot observability task started");
+
+    let tick_gap_tracker_capacity =
+        dhan_live_trader_common::constants::MAX_INSTRUMENTS_PER_WEBSOCKET_CONNECTION
+            .saturating_mul(dhan_live_trader_common::constants::MAX_WEBSOCKET_CONNECTIONS);
+    let mut tick_gap_tracker =
+        dhan_live_trader_trading::risk::tick_gap_tracker::TickGapTracker::new(
+            tick_gap_tracker_capacity,
+        );
+
+    let mut qdb_health_poller =
+        dhan_live_trader_storage::questdb_health::QuestDbHealthPoller::new();
+    let qdb_health_interval = std::time::Duration::from_secs(2);
+    let mut last_qdb_health_check = std::time::Instant::now();
+
+    // HTTP client for QuestDB /exec health ping. Uses a short timeout so
+    // an unresponsive QDB is treated as disconnected within 1s.
+    let http_client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(1))
+        .build()
+    {
+        Ok(c) => c,
+        Err(err) => {
+            warn!(
+                ?err,
+                "S4-T1d: reqwest client build failed — observability task exiting"
+            );
+            return;
+        }
+    };
+    let questdb_ping_url = format!(
+        "http://{}:{}/exec?query=SELECT%201",
+        questdb_config.host, questdb_config.http_port
+    );
+
+    loop {
+        match tick_rx.recv().await {
+            Ok(tick) => {
+                // Gap detection path — same logic as fast-boot consumer.
+                let gap_result =
+                    tick_gap_tracker.record_tick(tick.security_id, tick.exchange_timestamp);
+                if let dhan_live_trader_trading::risk::tick_gap_tracker::TickGapResult::Error {
+                    gap_secs,
+                } = gap_result
+                    && let Some(ref tx) = gap_backfill_tx
+                {
+                    let from = tick.exchange_timestamp.saturating_sub(gap_secs);
+                    let req = dhan_live_trader_core::historical::backfill::GapBackfillRequest {
+                        security_id: tick.security_id,
+                        exchange_segment_code: tick.exchange_segment_code,
+                        from_ist_secs: from,
+                        to_ist_secs: tick.exchange_timestamp,
+                    };
+                    match tx.try_send(req) {
+                        Ok(()) => {
+                            metrics::counter!("dlt_backfill_gaps_published_total").increment(1);
+                        }
+                        Err(_) => {
+                            metrics::counter!("dlt_backfill_gaps_dropped_total").increment(1);
+                        }
+                    }
+                }
+
+                // QuestDB HTTP health ping every 2 seconds.
+                if last_qdb_health_check.elapsed() >= qdb_health_interval {
+                    let connected = match http_client.get(&questdb_ping_url).send().await {
+                        Ok(resp) => resp.status().is_success(),
+                        Err(_) => false,
+                    };
+                    let verdict = qdb_health_poller.tick(connected, std::time::Instant::now());
+                    dhan_live_trader_storage::questdb_health::emit_metrics_for_verdict(
+                        verdict,
+                        &qdb_health_poller,
+                    );
+                    last_qdb_health_check = std::time::Instant::now();
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                warn!(
+                    skipped,
+                    "S4-T1d: slow-boot observer lagged {skipped} ticks — gap tracker state is still valid"
+                );
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                info!("S4-T1d: slow-boot observer shutting down (broadcast closed)");
                 return;
             }
         }
