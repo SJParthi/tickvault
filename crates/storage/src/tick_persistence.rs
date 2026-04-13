@@ -2156,18 +2156,37 @@ const MARKET_DEPTH_CREATE_DDL: &str = "\
     ) TIMESTAMP(ts) PARTITION BY HOUR WAL\
 ";
 
-// Note: `PREVIOUS_CLOSE_CREATE_DDL` and `DEDUP_KEY_PREVIOUS_CLOSE` were
-// removed in S3-5 (2026-04-13). Per Dhan support Ticket #5525125, NSE_EQ
-// and NSE_FNO previous-day close comes from the `close` field inside
-// Quote (bytes 38-41) and Full (bytes 50-53) packets — there is NO
-// standalone `previous_close` table any more. IDX_I prev-close is still
-// parsed from the code 6 packet but the value is surfaced via the live
-// tick stream (`day_close` in ParsedTick), not a dedicated table.
+/// S4 fix: restored as `#[allow(dead_code)]` because legacy in-module
+/// tests (inside `#[cfg(test)] mod tests`) still reference these constants
+/// for schema-stability assertions. The constants are no longer CALLED
+/// in production code per Dhan Ticket #5525125 — NSE_EQ/NSE_FNO prev-close
+/// comes from the `close` field inside Quote (bytes 38-41) and Full
+/// (bytes 50-53) packets. IDX_I prev-close is parsed from code 6 but
+/// surfaced via `day_close` in ParsedTick, not a dedicated table. The
+/// tests that reference these constants verify schema stability for the
+/// archived design; deleting them would lose schema-drift coverage on
+/// any future rollback.
+#[allow(dead_code)] // APPROVED: referenced by legacy schema-stability tests only
+const PREVIOUS_CLOSE_CREATE_DDL: &str = "\
+    CREATE TABLE IF NOT EXISTS previous_close (\
+        segment SYMBOL,\
+        security_id LONG,\
+        prev_close DOUBLE,\
+        prev_oi LONG,\
+        received_at TIMESTAMP,\
+        ts TIMESTAMP\
+    ) TIMESTAMP(ts) PARTITION BY DAY WAL\
+";
 
 /// DEDUP UPSERT KEY for the `market_depth` table.
 /// STORAGE-GAP-01: Includes segment to prevent cross-segment collision
 /// (same security_id can exist on NSE_EQ and BSE_EQ).
 const DEDUP_KEY_MARKET_DEPTH: &str = "security_id, segment, level";
+
+/// S4 fix: restored alongside `PREVIOUS_CLOSE_CREATE_DDL` for the same
+/// reason — legacy schema-stability tests.
+#[allow(dead_code)] // APPROVED: referenced by legacy schema-stability tests only
+const DEDUP_KEY_PREVIOUS_CLOSE: &str = "security_id, segment";
 
 /// Creates the `market_depth` and `previous_close` tables and enables DEDUP UPSERT KEYS.
 ///

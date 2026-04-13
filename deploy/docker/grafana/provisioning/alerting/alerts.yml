@@ -548,6 +548,115 @@ groups:
         labels:
           severity: critical
 
+      # S4-T4: Order update WebSocket down > 60s — CRITICAL
+      # Fill confirmations can be silently lost during this window.
+      - uid: dlt-order-update-ws-down
+        title: "S4-T4: Order update WebSocket down > 60s"
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 180, to: 0 }
+            datasourceUid: prometheus
+            model:
+              expr: "dlt_order_update_ws_active"
+              intervalMs: 15000
+              maxDataPoints: 43200
+          - refId: B
+            relativeTimeRange: { from: 180, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            relativeTimeRange: { from: 180, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: lt, params: [1] }
+        noDataState: OK
+        execErrState: Alerting
+        for: 1m
+        annotations:
+          summary: "CRITICAL: order update WebSocket disconnected > 60s"
+          description: "dlt_order_update_ws_active below 1 for > 1m. Fill confirmations may be silently lost. Check docker logs dlt-app and Dhan order-update status."
+        labels:
+          severity: critical
+
+      # S4-T4: Valkey errors during market hours — WARNING
+      - uid: dlt-valkey-errors
+        title: "S4-T4: Valkey errors observed"
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model:
+              expr: "increase(dlt_valkey_errors_total[5m])"
+              intervalMs: 15000
+              maxDataPoints: 43200
+          - refId: B
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: gt, params: [10] }
+        noDataState: OK
+        execErrState: Alerting
+        for: 2m
+        annotations:
+          summary: "Valkey errors > 10 in 5 min"
+          description: "dlt_valkey_errors_total increased. Token cache or tick cache operations failing. Check docker logs dlt-valkey."
+        labels:
+          severity: warning
+
+      # S4-T4: Depth frames being dropped — WARNING
+      - uid: dlt-depth-frames-dropped
+        title: "S4-T4: Depth frames dropped"
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model:
+              expr: "sum(increase(dlt_depth_frames_dropped_total[5m]))"
+              intervalMs: 15000
+              maxDataPoints: 43200
+          - refId: B
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: gt, params: [0] }
+        noDataState: OK
+        execErrState: Alerting
+        for: 0m
+        annotations:
+          summary: "Depth frames dropped — downstream consumer can't keep up"
+          description: "dlt_depth_frames_dropped_total > 0 in 5 min. Depth channel full or consumer slow. Investigate depth connection pool."
+        labels:
+          severity: warning
+
       # S3-1: QuestDB disconnected > 30s → CRITICAL
       - uid: dlt-questdb-disconnected
         title: "S3-1: QuestDB disconnected > 30s"

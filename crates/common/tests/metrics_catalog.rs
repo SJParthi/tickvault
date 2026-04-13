@@ -168,6 +168,59 @@ const REQUIRED_METRICS: &[(&str, &str)] = &[
          This is the observable measure that backfill actually closed \
          a gap. Downstream DEDUP merges any overlap with live ticks.",
     ),
+    // --- Session 4 S4-T4 (existing subsystem metrics catalogued for lockdown) ---
+    (
+        "dlt_order_update_ws_active",
+        "S4-T4: Binary gauge for the order update WebSocket (1.0 = connected, \
+         0.0 = not). Goes to 0 when the reconnect loop is between retries.",
+    ),
+    (
+        "dlt_order_update_reconnections_total",
+        "S4-T4: Reconnection attempt counter for the order update WebSocket.",
+    ),
+    (
+        "dlt_order_update_messages_total",
+        "S4-T4: Total order update messages received (any type).",
+    ),
+    (
+        "dlt_depth_20lvl_connection_active",
+        "S4-T4: Binary gauge per underlying for the 20-level depth WebSocket. \
+         Labelled by `underlying` so a single down connection is visible.",
+    ),
+    (
+        "dlt_depth_20lvl_reconnections_total",
+        "S4-T4: Reconnection attempt counter per 20-depth underlying.",
+    ),
+    (
+        "dlt_depth_20lvl_frames_total",
+        "S4-T4: Depth frames received per 20-depth underlying.",
+    ),
+    (
+        "dlt_depth_200lvl_connection_active",
+        "S4-T4: Binary gauge per underlying for the 200-level depth WebSocket.",
+    ),
+    (
+        "dlt_depth_200lvl_reconnections_total",
+        "S4-T4: Reconnection attempt counter per 200-depth underlying.",
+    ),
+    (
+        "dlt_depth_200lvl_frames_total",
+        "S4-T4: Depth frames received per 200-depth underlying.",
+    ),
+    (
+        "dlt_depth_frames_dropped_total",
+        "S4-T4: Depth frames dropped due to channel full or send timeout. \
+         Labelled by type (send_timeout) and depth (20 / 200).",
+    ),
+    (
+        "dlt_valkey_ops_total",
+        "S4-T4: Total Valkey operations attempted. Labelled by op \
+         (get / set / del / exists).",
+    ),
+    (
+        "dlt_valkey_errors_total",
+        "S4-T4: Total Valkey operation failures. Non-zero during an outage.",
+    ),
 ];
 
 // Note: `dlt_sandbox_gate_blocks_total` was intentionally deferred from E1.

@@ -34,6 +34,15 @@ const REQUIRED_ALERT_UIDS: &[(&str, &str)] = &[
         "dlt-questdb-disconnected",
         "S3-1: QuestDB disconnected > 30s",
     ),
+    (
+        "dlt-order-update-ws-down",
+        "S4-T4: Order update WebSocket down > 60s",
+    ),
+    ("dlt-valkey-errors", "S4-T4: Valkey errors during ops"),
+    (
+        "dlt-depth-frames-dropped",
+        "S4-T4: Depth frames dropped (channel full)",
+    ),
 ];
 
 fn read_alerts_yml() -> String {
