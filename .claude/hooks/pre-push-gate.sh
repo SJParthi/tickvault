@@ -192,6 +192,28 @@ else
   echo "  SKIP: scripts/test-coverage-guard.sh not executable" >&2
 fi
 
+# Gate 9: Dhan locked facts (NEVER scoped — runs on every push)
+# These tests pin Dhan-support-confirmed ground truth (Tickets #5519522,
+# #5525125) so reverting a fix silently is impossible. If this gate fails,
+# someone removed a ticket citation or broke the 200-depth path / PrevClose
+# routing. Do NOT skip this gate. If you need to change a locked fact, open
+# a new Dhan ticket, quote the response in the rule file, and update the
+# assertion in the same commit — all three steps.
+echo "  [9/9] Dhan locked facts (Tickets #5519522, #5525125)..." >&2
+LOCKED_OUT=$(timeout 120 cargo test -p dhan-live-trader-common --test dhan_locked_facts --quiet 2>&1)
+LOCKED_EXIT=$?
+if [ "$LOCKED_EXIT" -eq 0 ]; then
+  echo "  PASS: Dhan locked facts (8 invariants held)" >&2
+else
+  echo "$LOCKED_OUT" >&2
+  echo "" >&2
+  echo "  FAIL: Dhan LOCKED FACTS regressed." >&2
+  echo "  These invariants come from Dhan support tickets — see" >&2
+  echo "  crates/common/tests/dhan_locked_facts.rs for the ticket refs." >&2
+  echo "  DO NOT weaken these assertions without a fresh Dhan ticket." >&2
+  FAILED=1
+fi
+
 echo "" >&2
 if [ "$FAILED" -ne 0 ]; then
   echo "╔══════════════════════════════════════════════╗" >&2
@@ -221,6 +243,6 @@ if [ -n "$BRANCH_SAFE_NOW" ]; then
 fi
 
 echo "╔══════════════════════════════════════════════╗" >&2
-echo "║  PUSH ALLOWED (8 fast gates — CI enforces rest)║" >&2
+echo "║  PUSH ALLOWED (9 fast gates — CI enforces rest)║" >&2
 echo "╚══════════════════════════════════════════════╝" >&2
 exit 0

@@ -16,6 +16,7 @@ pub mod connection;
 pub mod connection_pool;
 pub mod depth_connection;
 pub mod order_update_connection;
+pub mod pool_watchdog;
 pub mod subscription_builder;
 pub mod tls;
 pub mod types;
