@@ -251,6 +251,7 @@ impl QuestDbConfig {
     /// - Retry timeout: 30s (recovers from transient QuestDB restarts)
     /// - Init buffer size: 64KB (matches WAL segment tuning)
     /// - Request timeout: 60s (generous for large batch flushes)
+    ///
     /// Builds the ILP TCP connection string.
     ///
     /// NOTE: `retry_timeout`, `init_buf_size`, `request_timeout` are HTTP-only

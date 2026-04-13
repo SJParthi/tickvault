@@ -213,6 +213,17 @@ pub struct TickPersistenceWriter {
     spill_writer: Option<BufWriter<std::fs::File>>,
     /// Path of the current spill file (for drain + cleanup).
     spill_path: Option<std::path::PathBuf>,
+    /// A2: Dead-letter queue writer. Last-resort append-only NDJSON log when
+    /// both ring buffer AND disk spill fail. Every line is one lost tick with
+    /// the reason it couldn't be spilled. MUST always be 0 lines in production.
+    /// Lazy-opened on first double-failure.
+    dlq_writer: Option<BufWriter<std::fs::File>>,
+    /// Path of the current DLQ file (for rotation/audit).
+    dlq_path: Option<std::path::PathBuf>,
+    /// Total ticks written to DLQ (both ring AND spill failed).
+    /// This counter MUST always be 0 in production; any non-zero value is a
+    /// CRITICAL data integrity incident.
+    dlq_ticks_total: u64,
 }
 
 impl TickPersistenceWriter {
@@ -240,6 +251,9 @@ impl TickPersistenceWriter {
             next_reconnect_allowed: std::time::Instant::now(),
             spill_writer: None,
             spill_path: None,
+            dlq_writer: None,
+            dlq_path: None,
+            dlq_ticks_total: 0,
         })
     }
 
@@ -269,6 +283,9 @@ impl TickPersistenceWriter {
             next_reconnect_allowed: std::time::Instant::now(),
             spill_writer: None,
             spill_path: None,
+            dlq_writer: None,
+            dlq_path: None,
+            dlq_ticks_total: 0,
         }
     }
 
@@ -504,27 +521,120 @@ impl TickPersistenceWriter {
     /// Spills a tick to disk when the ring buffer is full.
     /// Creates the spill directory and file lazily on first call.
     /// O(1) amortized — buffered sequential append.
+    ///
+    /// # A2 dead-letter fallback
+    /// If either the spill file cannot be opened OR the write fails, the tick
+    /// is forwarded to `write_to_dlq()` as a last-resort append-only NDJSON
+    /// record before being counted as dropped. Only if the DLQ write ALSO
+    /// fails is the tick permanently lost.
     #[rustfmt::skip]
     fn spill_tick_to_disk(&mut self, tick: &ParsedTick) {
         // Lazy-open the spill file.
         if self.spill_writer.is_none() && let Err(err) = self.open_spill_file() {
-            error!(?err, "CRITICAL: cannot open tick spill file — tick WILL be lost");
-            self.ticks_dropped_total = self.ticks_dropped_total.saturating_add(1);
-            metrics::counter!("dlt_ticks_dropped_total").absolute(self.ticks_dropped_total);
+            error!(?err, "CRITICAL: cannot open tick spill file — falling back to DLQ");
+            self.write_to_dlq(tick, "spill_open_failed");
             return;
         }
         let record = serialize_tick(tick);
         if let Some(ref mut writer) = self.spill_writer && let Err(err) = writer.write_all(&record) {
-            error!(?err, ticks_spilled = self.ticks_spilled_total, "CRITICAL: disk spill write failed — tick lost");
-            self.ticks_dropped_total = self.ticks_dropped_total.saturating_add(1);
-            metrics::counter!("dlt_ticks_dropped_total").absolute(self.ticks_dropped_total);
+            error!(?err, ticks_spilled = self.ticks_spilled_total, "CRITICAL: disk spill write failed — falling back to DLQ");
             self.spill_writer = None;
+            self.write_to_dlq(tick, "spill_write_failed");
             return;
         }
         self.ticks_spilled_total = self.ticks_spilled_total.saturating_add(1);
         if self.ticks_spilled_total.is_multiple_of(10_000) {
             warn!(ticks_spilled = self.ticks_spilled_total, "tick disk spill growing — QuestDB still down");
         }
+    }
+
+    /// A2: Last-resort dead-letter write. Called when both ring buffer AND
+    /// disk spill have failed. Appends a single JSON line to
+    /// `data/spill/dlq-YYYYMMDD.ndjson` so the tick is recoverable by audit.
+    ///
+    /// If the DLQ file itself cannot be opened or written, only then is the
+    /// tick counted as permanently dropped.
+    ///
+    /// # Invariants
+    /// - `dlq_ticks_total` MUST always be 0 in production. Any non-zero value
+    ///   is a CRITICAL data integrity incident and triggers Telegram.
+    /// - The NDJSON format is one JSON object per line, UTF-8, LF-terminated.
+    /// - Fields: `ts_ms`, `reason`, `security_id`, `segment`, `ltt`, `ltp`,
+    ///   `ltq`, `volume`, `atp`, `buy_qty`, `sell_qty`, `open`, `close`,
+    ///   `high`, `low`, `oi`.
+    #[rustfmt::skip]
+    fn write_to_dlq(&mut self, tick: &ParsedTick, reason: &str) {
+        // Lazy-open DLQ file on first failure.
+        if self.dlq_writer.is_none() && let Err(err) = self.open_dlq_file() {
+            error!(?err, security_id = tick.security_id, reason, "CRITICAL: DLQ open failed — tick PERMANENTLY LOST");
+            self.ticks_dropped_total = self.ticks_dropped_total.saturating_add(1);
+            metrics::counter!("dlt_ticks_dropped_total").absolute(self.ticks_dropped_total);
+            return;
+        }
+        // Build one JSON line. Manual construction avoids a serde_json dep on this hot-ish path
+        // and keeps allocations to a single String (which is fine — this is the catastrophic
+        // double-failure path and NOT the hot path).
+        let now_ms = current_time_ms();
+        let segment = segment_code_to_str(tick.exchange_segment_code);
+        let line = format!(
+            "{{\"ts_ms\":{},\"reason\":\"{}\",\"security_id\":{},\"segment\":\"{}\",\"ltt\":{},\"ltp\":{},\"ltq\":{},\"volume\":{},\"atp\":{},\"buy_qty\":{},\"sell_qty\":{},\"open\":{},\"close\":{},\"high\":{},\"low\":{},\"oi\":{}}}\n",
+            now_ms, reason, tick.security_id, segment,
+            tick.exchange_timestamp, tick.last_traded_price, tick.last_trade_quantity,
+            tick.volume, tick.average_traded_price, tick.total_buy_quantity, tick.total_sell_quantity,
+            tick.day_open, tick.day_close, tick.day_high, tick.day_low, tick.open_interest,
+        );
+        if let Some(ref mut writer) = self.dlq_writer && let Err(err) = writer.write_all(line.as_bytes()) {
+            error!(?err, security_id = tick.security_id, reason, "CRITICAL: DLQ write failed — tick PERMANENTLY LOST");
+            self.dlq_writer = None;
+            self.ticks_dropped_total = self.ticks_dropped_total.saturating_add(1);
+            metrics::counter!("dlt_ticks_dropped_total").absolute(self.ticks_dropped_total);
+            return;
+        }
+        // Flush immediately — this path is already broken, durability is worth the fsync cost.
+        if let Some(ref mut writer) = self.dlq_writer && let Err(err) = writer.flush() {
+            error!(?err, "DLQ flush failed — line may not be durable on disk");
+        }
+        self.dlq_ticks_total = self.dlq_ticks_total.saturating_add(1);
+        metrics::counter!("dlt_dlq_ticks_total").absolute(self.dlq_ticks_total);
+        error!(
+            security_id = tick.security_id,
+            reason,
+            dlq_total = self.dlq_ticks_total,
+            "CRITICAL: tick written to DLQ — ring buffer and disk spill both failed. \
+             Manual audit required."
+        );
+    }
+
+    /// A2: Opens (or creates) the DLQ NDJSON file for the current date.
+    /// Appends to any existing file — the DLQ is append-only audit log.
+    fn open_dlq_file(&mut self) -> Result<()> {
+        std::fs::create_dir_all(TICK_SPILL_DIR).context("failed to create DLQ directory")?;
+
+        let date = chrono::Utc::now().format("%Y%m%d");
+        let path = std::path::PathBuf::from(format!("{TICK_SPILL_DIR}/dlq-{date}.ndjson"));
+
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("failed to open DLQ file: {}", path.display()))?;
+
+        error!(path = %path.display(), "opened DLQ file — CRITICAL: ring buffer AND disk spill failed");
+        self.dlq_writer = Some(BufWriter::new(file));
+        self.dlq_path = Some(path);
+        Ok(())
+    }
+
+    /// A2: Returns the total number of ticks written to DLQ since the writer
+    /// was created. MUST always be 0 in production.
+    pub fn dlq_ticks_total(&self) -> u64 {
+        self.dlq_ticks_total
+    }
+
+    /// A2: Returns the path of the current DLQ file, if any has been opened.
+    /// Returns `None` if no double-failure has occurred.
+    pub fn dlq_path(&self) -> Option<&std::path::Path> {
+        self.dlq_path.as_deref()
     }
 
     /// Opens (or creates) the spill file for the current date.
@@ -10418,6 +10528,168 @@ mod tests {
 
         let _ = std::fs::remove_file(&spill_path);
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    // =======================================================================
+    // A2: DLQ (dead-letter queue) coverage — double failure path
+    // =======================================================================
+
+    /// A2: When both ring buffer AND disk spill fail, tick is written to DLQ
+    /// NDJSON. `ticks_dropped_total` stays 0 as long as DLQ succeeds.
+    #[test]
+    fn test_dlq_written_when_spill_write_fails() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+
+        // Force spill_writer to point at /dev/full so write_all() always fails.
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .expect("/dev/full is required for this test (Linux only)");
+        writer.spill_writer = Some(BufWriter::with_capacity(1, file));
+        writer.spill_path = Some(std::path::PathBuf::from("/dev/full"));
+
+        let initial_dropped = writer.ticks_dropped_total();
+        let initial_dlq = writer.dlq_ticks_total();
+
+        let tick = make_test_tick(7777, 42.0);
+        writer.spill_tick_to_disk(&tick);
+
+        // Contract: spill failure → DLQ (not drop).
+        assert_eq!(
+            writer.dlq_ticks_total(),
+            initial_dlq + 1,
+            "DLQ count must increment when spill_write fails"
+        );
+        assert_eq!(
+            writer.ticks_dropped_total(),
+            initial_dropped,
+            "ticks_dropped_total must NOT increment when DLQ succeeds"
+        );
+        assert!(
+            writer.dlq_path().is_some(),
+            "DLQ path must be set after first DLQ write"
+        );
+        assert!(
+            writer.spill_writer.is_none(),
+            "spill_writer must be cleared after write error"
+        );
+
+        // Cleanup: drop the BufWriter backed by /dev/full before removing the
+        // DLQ file so file handles aren't held open.
+        drop(writer);
+    }
+
+    /// A2: DLQ format is one JSON object per line, UTF-8, LF-terminated.
+    #[test]
+    fn test_dlq_format_is_parseable_ndjson() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+
+        // Use a temporary DLQ file so we don't collide with other tests.
+        let tmp_dir = std::env::temp_dir().join(format!("dlt-dlq-format-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let dlq_path = tmp_dir.join("dlq.ndjson");
+        let file = std::fs::File::create(&dlq_path).unwrap();
+        writer.dlq_writer = Some(BufWriter::new(file));
+        writer.dlq_path = Some(dlq_path.clone());
+
+        let tick = make_test_tick(12345, 123.45);
+        writer.write_to_dlq(&tick, "test_reason");
+
+        // Flush explicitly by dropping writer state (BufWriter flushes on drop).
+        writer.dlq_writer = None;
+
+        let content = std::fs::read_to_string(&dlq_path).unwrap();
+        assert!(content.ends_with('\n'), "DLQ line must be LF-terminated");
+        let trimmed = content.trim_end();
+        assert!(
+            trimmed.starts_with('{') && trimmed.ends_with('}'),
+            "DLQ line must be a JSON object: {}",
+            trimmed
+        );
+        // Fields we promised in the public contract:
+        for field in &[
+            "\"ts_ms\":",
+            "\"reason\":\"test_reason\"",
+            "\"security_id\":12345",
+            "\"segment\":",
+            "\"ltt\":",
+            "\"ltp\":",
+            "\"oi\":",
+        ] {
+            assert!(
+                trimmed.contains(field),
+                "DLQ line missing required field {}: {}",
+                field,
+                trimmed
+            );
+        }
+        assert_eq!(writer.dlq_ticks_total(), 1);
+
+        // Cleanup.
+        let _ = std::fs::remove_file(&dlq_path);
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    /// A2: Multiple DLQ writes append, they do not overwrite.
+    #[test]
+    fn test_dlq_append_multiple_records() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+
+        let tmp_dir = std::env::temp_dir().join(format!("dlt-dlq-append-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let dlq_path = tmp_dir.join("dlq.ndjson");
+        let file = std::fs::File::create(&dlq_path).unwrap();
+        writer.dlq_writer = Some(BufWriter::new(file));
+        writer.dlq_path = Some(dlq_path.clone());
+
+        writer.write_to_dlq(&make_test_tick(1, 1.0), "r1");
+        writer.write_to_dlq(&make_test_tick(2, 2.0), "r2");
+        writer.write_to_dlq(&make_test_tick(3, 3.0), "r3");
+        writer.dlq_writer = None;
+
+        let content = std::fs::read_to_string(&dlq_path).unwrap();
+        let line_count = content.lines().count();
+        assert_eq!(line_count, 3, "DLQ must contain exactly 3 lines");
+        assert_eq!(writer.dlq_ticks_total(), 3);
+
+        let _ = std::fs::remove_file(&dlq_path);
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    /// A2: Initially, DLQ counter is 0 and dlq_path is None.
+    #[test]
+    fn test_dlq_initially_empty() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let writer = TickPersistenceWriter::new(&config).unwrap();
+        assert_eq!(writer.dlq_ticks_total(), 0);
+        assert!(writer.dlq_path().is_none());
     }
 
     // =======================================================================
