@@ -192,6 +192,54 @@ else
   echo "  SKIP: scripts/test-coverage-guard.sh not executable" >&2
 fi
 
+# Gate 10: cargo audit + cargo deny (best-effort; CI is authoritative)
+# If cargo-audit and cargo-deny are installed locally, run them and block
+# on failure. If missing, log a WARN and continue — CI will catch it.
+# This gives a fast feedback loop to developers who have the tools
+# installed without blocking pushes for those who don't.
+echo "  [10/10] cargo audit + cargo deny (best-effort)..." >&2
+AUDIT_AVAILABLE=0
+DENY_AVAILABLE=0
+if command -v cargo-audit >/dev/null 2>&1 || cargo audit --version >/dev/null 2>&1; then
+  AUDIT_AVAILABLE=1
+fi
+if command -v cargo-deny >/dev/null 2>&1 || cargo deny --version >/dev/null 2>&1; then
+  DENY_AVAILABLE=1
+fi
+
+if [ "$AUDIT_AVAILABLE" -eq 0 ] && [ "$DENY_AVAILABLE" -eq 0 ]; then
+  echo "  SKIP: cargo-audit and cargo-deny not installed locally." >&2
+  echo "  Install with: cargo install cargo-audit cargo-deny" >&2
+  echo "  CI will still enforce both — this is a local convenience gate." >&2
+else
+  if [ "$AUDIT_AVAILABLE" -eq 1 ]; then
+    AUDIT_OUT=$(timeout 120 cargo audit --deny yanked 2>&1 || true)
+    AUDIT_EXIT=$?
+    if [ "$AUDIT_EXIT" -ne 0 ] && echo "$AUDIT_OUT" | grep -qE 'error: [1-9]|vulnerabilities found: [1-9]'; then
+      echo "$AUDIT_OUT" >&2
+      echo "  FAIL: cargo audit reported vulnerabilities. Fix or pin pre-push." >&2
+      FAILED=1
+    else
+      echo "  PASS: cargo audit clean" >&2
+    fi
+  else
+    echo "  SKIP: cargo-audit not installed" >&2
+  fi
+  if [ "$DENY_AVAILABLE" -eq 1 ]; then
+    DENY_OUT=$(timeout 120 cargo deny check 2>&1 || true)
+    DENY_EXIT=$?
+    if [ "$DENY_EXIT" -ne 0 ] && echo "$DENY_OUT" | grep -qE 'error\[|: [1-9]+ errors'; then
+      echo "$DENY_OUT" >&2
+      echo "  FAIL: cargo deny reported violations." >&2
+      FAILED=1
+    else
+      echo "  PASS: cargo deny clean" >&2
+    fi
+  else
+    echo "  SKIP: cargo-deny not installed" >&2
+  fi
+fi
+
 # Gate 9: Dhan locked facts (NEVER scoped — runs on every push)
 # These tests pin Dhan-support-confirmed ground truth (Tickets #5519522,
 # #5525125) so reverting a fix silently is impossible. If this gate fails,
@@ -243,6 +291,6 @@ if [ -n "$BRANCH_SAFE_NOW" ]; then
 fi
 
 echo "╔══════════════════════════════════════════════╗" >&2
-echo "║  PUSH ALLOWED (9 fast gates — CI enforces rest)║" >&2
+echo "║  PUSH ALLOWED (10 fast gates — CI enforces rest)║" >&2
 echo "╚══════════════════════════════════════════════╝" >&2
 exit 0
