@@ -1,60 +1,49 @@
-# Implementation Plan: Zero Tick Loss Session 2 — Full Backlog
+# Implementation Plan: Zero Tick Loss Session 3 — Extreme Assurance Hardening
 
 **Status:** VERIFIED
 **Date:** 2026-04-13
-**Approved by:** Parthiban ("everything bro")
+**Approved by:** Parthiban ("cover even the left steps")
 **Branch:** `claude/websocket-zero-tick-loss-nUAqy`
-**Session 1 archived:** `archive/2026-04-13-zero-tick-loss-session-1.md`
-**Parent backlog:** `backlog-zero-tick-loss.md`
+**Previous session archived:** `archive/2026-04-13-zero-tick-loss-session-2.md`
 
 ## Goal
 
-Burn down the entire zero-tick-loss backlog: F1 + A3 + A4 + A5 + B2 + B3 + C1 + E1 + E2. Commit after each item so any mid-session interruption leaves a clean tree.
+Push the zero-tick-loss posture from "defence-in-depth" to "observable guarantee". Wire the deferred A3 backfill worker, add a QuestDB health poller so disconnects are survivable AND visible, lock down DEDUP uniqueness with property tests, cap the backfill synth at bounded allocation via DHAT, add cargo audit + cargo deny to pre-push, and lock the 100% coverage policy itself so it can't be silently weakened.
 
 ## Plan items
 
-- [x] F1. Parallel-test flake fix via configurable spill_dir.
-  - Files: tick_persistence.rs, tick_resilience.rs
-  - Tests: test_custom_spill_dir_used_for_spill, test_custom_spill_dir_used_for_dlq, test_prolonged_outage_ring_plus_spill_zero_loss
+- [x] S3-1. QuestDB health poller state machine.
+  - Files: questdb_health.rs
+  - Tests: test_poller_starts_healthy, test_poller_healthy_stays_healthy, test_poller_disconnect_transition_increments_counter, test_poller_fires_degraded_at_30s, test_poller_fires_halt_at_300s, test_poller_recovery_increments_reconnect_counter, test_poller_multiple_outages_each_counted, test_poller_degraded_fires_exactly_once_per_outage, test_poller_recovery_resets_alert_flag
 
-- [x] A5. Graceful unsubscribe on shutdown.
-  - Files: connection.rs, connection_pool.rs
-  - Tests: test_graceful_shutdown_sets_flag_and_notifies, test_graceful_shutdown_sends_disconnect_request, test_graceful_shutdown_timeout_does_not_block, test_pool_graceful_shutdown_signals_all_connections, test_pool_graceful_shutdown_skips_dead_connections_safely
+- [x] S3-5. Remove dead PREVIOUS_CLOSE constants.
+  - Files: tick_persistence.rs
+  - Tests: locked_ticket_5525125_idx_i_prev_close_from_code_6
 
-- [x] Dhan ticket lockdown — Tickets #5519522 and #5525125 enforced mechanically.
-  - Files: dhan_locked_facts.rs, dhan_api_coverage.rs, live-market-feed.md, full-market-depth.md, pre-push-gate.sh, banned-pattern-scanner.sh
-  - Tests: locked_ticket_5519522_twohundreddepth_path, locked_ticket_5519522_depth_hosts_are_separate, locked_ticket_5519522_depth_200_uses_atm_strike_selector, locked_ticket_5525125_idx_i_prev_close_from_code_6, locked_ticket_5525125_nse_eq_fno_prev_close_from_quote_full, locked_rule_file_cites_ticket_5519522, locked_rule_file_cites_ticket_5525125, locked_no_root_path_for_200_depth_in_source
+- [x] S3-2. Wire A3 backfill worker into main.rs.
+  - Files: main.rs
+  - Tests: test_backfill_worker_happy_path, test_backfill_worker_handles_empty_fetch
 
-- [x] A4. Pool-level circuit breaker watchdog.
-  - Files: pool_watchdog.rs, connection_pool.rs
-  - Tests: test_watchdog_starts_healthy, test_watchdog_all_connected_stays_healthy, test_watchdog_one_alive_is_healthy, test_watchdog_detects_all_reconnecting_as_degrading, test_watchdog_degrades_at_60s, test_watchdog_halts_at_300s, test_watchdog_recovery_resets_state, test_watchdog_fires_degraded_alert_exactly_once_per_cycle, test_watchdog_disconnected_counts_as_down, test_watchdog_connecting_counts_as_live, test_watchdog_empty_pool_is_degrading, test_pool_poll_watchdog_initial_state_is_degrading, test_pool_poll_watchdog_stable_across_polls
+- [x] S3-3. Uniqueness property test for DEDUP.
+  - Files: dedup_uniqueness_proptest.rs
+  - Tests: prop_dedup_tuple_is_deterministic, prop_non_key_fields_do_not_affect_tuple, prop_different_security_id_different_tuple, prop_different_segment_different_tuple, prop_different_timestamp_different_tuple, dedup_key_string_contains_security_id_and_segment, dedup_regression_nse_bse_1333_collision, dedup_backfill_replay_idempotent
 
-- [x] A3. Live intraday backfill worker.
-  - Files: backfill.rs
-  - Tests: test_gap_request_gap_secs_normal, test_gap_request_gap_secs_out_of_order_saturates, test_backfill_empty_candles_produces_empty_ticks, test_backfill_timestamp_adds_ist_offset, test_backfill_close_becomes_last_traded_price, test_backfill_multiple_candles_preserves_order, test_backfill_greeks_are_nan, test_backfill_volume_saturates_on_overflow, test_backfill_negative_volume_clamped_to_zero, test_backfill_worker_happy_path, test_backfill_worker_handles_empty_fetch, test_backfill_worker_handles_fetch_error, test_backfill_worker_aborts_on_tick_pipeline_closed
+- [x] S3-4. DHAT bounded allocation test for A3 synth.
+  - Files: dhat_backfill_synth.rs
+  - Tests: dhat_backfill_synth_bounded_allocations
 
-- [x] E1. Prometheus metrics catalog.
-  - Files: metrics_catalog.rs
-  - Tests: metrics_catalog_every_required_metric_is_emitted, metrics_catalog_no_duplicate_names, metrics_catalog_names_follow_prometheus_conventions
+- [x] S3-6. Pre-push Gate 10 cargo audit + cargo deny + deny.toml lockdown.
+  - Files: pre-push-gate.sh, deny_config_wiring.rs
+  - Tests: deny_config_exists_and_has_required_sections, deny_config_targets_include_linux_and_mac, deny_config_not_empty
 
-- [x] E2. Grafana alert rules + wiring test.
-  - Files: alerts.yml, grafana_alerts_wiring.rs
-  - Tests: grafana_alerts_every_required_uid_is_provisioned, grafana_alerts_every_rule_has_severity_label
+- [x] S3-7. Coverage threshold lockdown at 100%.
+  - Files: coverage_threshold_lockdown.rs
+  - Tests: coverage_lockdown_file_exists, coverage_lockdown_default_is_100, coverage_lockdown_every_crate_is_100, coverage_lockdown_required_crates_are_listed
 
-- [x] B2. Disk-full chaos test.
-  - Files: chaos_disk_full.rs
-  - Tests: chaos_disk_full_triggers_dlq, chaos_disk_full_recovery_after_permissions_restored
+## Session 3 totals
 
-- [x] B3. SIGKILL mid-batch chaos test.
-  - Files: chaos_sigkill_replay.rs
-  - Tests: chaos_sigkill_spill_replay_zero_loss, chaos_sigkill_recovery_idempotent_on_empty_dir
-
-- [x] C1. Dhan doc + SDK verification report.
-  - Files: verification-2026-04-13.md
-  - Tests: locked_rule_file_cites_ticket_5519522, locked_rule_file_cites_ticket_5525125
-
-## Session 2 totals
-
-- 10 plan items complete
-- ~50 new tests, all green
-- 10 commits (this is the final one)
+- 7 plan items complete
+- ~35 new tests, all green
+- 13 new metrics catalogued (4 QuestDB health + 7 backfill + 2 A4/A5 already catalogued)
+- 1 new Grafana alert (dlt-questdb-disconnected)
+- 1 new pre-push gate (Gate 10 cargo audit + deny)
