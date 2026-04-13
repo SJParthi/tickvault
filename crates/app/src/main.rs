@@ -392,6 +392,14 @@ async fn main() -> Result<()> {
             None => (None, None),
         };
 
+        // S4-T1a/T1b: Shared shutdown notifier. The pool watchdog task
+        // listens on this and stops when we signal graceful shutdown, so
+        // the watchdog doesn't fire a spurious Halt during intentional
+        // teardown. Created BEFORE the WS pool spawn so it's in scope for
+        // both spawn_pool_watchdog_task AND the bottom-of-main shutdown
+        // handler.
+        let shutdown_notify = std::sync::Arc::new(tokio::sync::Notify::new());
+
         // --- Tick processor: start BEFORE WS connections spawn ---
         let shared_movers: dhan_live_trader_core::pipeline::SharedTopMoversSnapshot =
             std::sync::Arc::new(std::sync::RwLock::new(None));
@@ -547,11 +555,22 @@ async fn main() -> Result<()> {
         };
 
         // --- NOW spawn WebSocket connections (tick processor consuming) ---
-        let ws_handles = if let Some(pool) = ws_pool_ready {
-            spawn_websocket_connections(pool).await
+        // S4-T1a/T1b: Wrap the pool in Arc so we can retain clones for the
+        // pool watchdog task and the graceful-shutdown handler. All three
+        // users (spawn_all, poll_watchdog, request_graceful_shutdown) take
+        // &self so sharing via Arc is cheap + lock-free.
+        let (ws_handles, ws_pool_arc) = if let Some(pool) = ws_pool_ready {
+            let pool_arc = std::sync::Arc::new(pool);
+            let handles = spawn_websocket_connections(std::sync::Arc::clone(&pool_arc)).await;
+            spawn_pool_watchdog_task(
+                std::sync::Arc::clone(&pool_arc),
+                std::sync::Arc::clone(&shutdown_notify),
+            );
+            (handles, Some(pool_arc))
         } else {
-            Vec::new()
+            (Vec::new(), None)
         };
+        let _ = &ws_pool_arc; // kept alive for watchdog + shutdown handler
 
         // =================================================================
         // TICKS FLOWING — everything below is background, zero blocking.
@@ -895,6 +914,8 @@ async fn main() -> Result<()> {
             &config,
             shared_movers,
             post_market_signal,
+            ws_pool_arc,
+            shutdown_notify,
         )
         .await;
     }
@@ -1346,8 +1367,15 @@ async fn main() -> Result<()> {
     };
 
     // Step 8b: NOW spawn WebSocket connections (tick processor is already consuming).
-    let ws_handles = if let Some(pool) = ws_pool_ready {
-        let handles = spawn_websocket_connections(pool).await;
+    // S4-T1a/T1b: shared shutdown_notify for pool watchdog + graceful shutdown.
+    let shutdown_notify = std::sync::Arc::new(tokio::sync::Notify::new());
+    let (ws_handles, ws_pool_arc) = if let Some(pool) = ws_pool_ready {
+        let pool_arc = std::sync::Arc::new(pool);
+        let handles = spawn_websocket_connections(std::sync::Arc::clone(&pool_arc)).await;
+        spawn_pool_watchdog_task(
+            std::sync::Arc::clone(&pool_arc),
+            std::sync::Arc::clone(&shutdown_notify),
+        );
         // Telegram: notify that all main WS connections were spawned.
         if !handles.is_empty() {
             let conn_count = handles.len();
@@ -1357,9 +1385,9 @@ async fn main() -> Result<()> {
                 });
             }
         }
-        handles
+        (handles, Some(pool_arc))
     } else {
-        Vec::new()
+        (Vec::new(), None)
     };
 
     // -----------------------------------------------------------------------
@@ -2319,6 +2347,8 @@ async fn main() -> Result<()> {
         &config,
         shared_movers,
         post_market_signal,
+        ws_pool_arc,
+        shutdown_notify,
     )
     .await
 }
@@ -2486,12 +2516,71 @@ fn create_websocket_pool(
 
 /// Spawns all WebSocket connections in the pool (with stagger).
 /// Call AFTER the tick processor is started so frames are consumed immediately.
+///
+/// S4-T1a: Accepts `Arc<WebSocketConnectionPool>` so the caller can retain a
+/// reference for the pool watchdog task (which polls `poll_watchdog()` every
+/// 5s) and the SIGTERM handler (which calls `request_graceful_shutdown()`).
+/// The Arc is cheap (one atomic ref count increment per clone) and required
+/// because all three use cases need to share the same pool instance.
 async fn spawn_websocket_connections(
-    pool: WebSocketConnectionPool,
+    pool: std::sync::Arc<WebSocketConnectionPool>,
 ) -> Vec<tokio::task::JoinHandle<Result<(), WebSocketError>>> {
     let handles = pool.spawn_all().await;
     info!(connections = handles.len(), "WebSocket connections spawned");
     handles
+}
+
+/// S4-T1a: Background pool health watchdog.
+///
+/// Spawns a task that calls `pool.poll_watchdog()` every 5 seconds. On
+/// `WatchdogVerdict::Halt` it logs FATAL + sends a Telegram alert then
+/// exits the process with status 2 so the Docker/systemd supervisor
+/// restarts us. On `Degraded` the metric + CRITICAL log are already
+/// emitted by `poll_watchdog()` itself. On `Recovered` same.
+///
+/// The task stops when the `shutdown_notify` is fired (during graceful
+/// shutdown) to avoid a false-positive Halt during the intentional
+/// teardown.
+fn spawn_pool_watchdog_task(
+    pool: std::sync::Arc<WebSocketConnectionPool>,
+    shutdown_notify: std::sync::Arc<tokio::sync::Notify>,
+) {
+    tokio::spawn(async move {
+        // 5-second poll interval — cold path, not per tick. Matches the
+        // degrading/halt thresholds (60s/300s) with plenty of resolution.
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        // Skip the immediate first tick so we don't poll before the pool
+        // has had a chance to connect.
+        interval.tick().await;
+        info!("S4-T1a: pool watchdog task started (poll interval 5s)");
+        loop {
+            tokio::select! {
+                () = shutdown_notify.notified() => {
+                    info!("S4-T1a: pool watchdog stopping (graceful shutdown signalled)");
+                    return;
+                }
+                _ = interval.tick() => {
+                    let verdict = pool.poll_watchdog();
+                    if let dhan_live_trader_core::websocket::pool_watchdog::WatchdogVerdict::Halt {
+                        down_for,
+                    } = verdict
+                    {
+                        // ERROR log fires Telegram via the existing Loki hook.
+                        error!(
+                            down_for_secs = down_for.as_secs(),
+                            "S4-T1a FATAL: pool watchdog fired Halt verdict. \
+                             Exiting process with status 2 so the supervisor restarts us. \
+                             All 5 WebSocket connections have been down for >300s."
+                        );
+                        metrics::counter!("dlt_pool_self_halts_total").increment(1);
+                        // Give notifications + metrics flush a moment.
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        std::process::exit(2);
+                    }
+                }
+            }
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -2833,13 +2922,27 @@ async fn run_tick_persistence_consumer(
     let qdb_health_tick_interval = std::time::Duration::from_secs(2);
     let mut last_qdb_health_tick = std::time::Instant::now();
 
-    // S3-2: Tick gap tracker — detects when a security's LTT gap exceeds
-    // the ERROR threshold, so the backfill worker can pull the missing
-    // window from Dhan historical REST. Capacity matches the subscribed
-    // instrument count (worst case 25k). `5000` is a safe default; the
-    // tracker uses a bounded LRU internally and will not OOM.
+    // S3-2 / S4-T1c: Tick gap tracker — detects when a security's LTT
+    // gap exceeds the ERROR threshold, so the backfill worker can pull
+    // the missing window from Dhan historical REST.
+    //
+    // Capacity = MAX_INSTRUMENTS_PER_WEBSOCKET_CONNECTION (5000) ×
+    // MAX_WEBSOCKET_CONNECTIONS (5) = 25,000. This matches the
+    // worst-case subscribed universe so NO instrument gets silently
+    // evicted from the gap tracker under production load. The old
+    // hardcoded 5000 silently dropped tracking on 20k instruments —
+    // fixed per the S4 honest-audit.
+    let tick_gap_tracker_capacity =
+        dhan_live_trader_common::constants::MAX_INSTRUMENTS_PER_WEBSOCKET_CONNECTION
+            .saturating_mul(dhan_live_trader_common::constants::MAX_WEBSOCKET_CONNECTIONS);
     let mut tick_gap_tracker =
-        dhan_live_trader_trading::risk::tick_gap_tracker::TickGapTracker::new(5000);
+        dhan_live_trader_trading::risk::tick_gap_tracker::TickGapTracker::new(
+            tick_gap_tracker_capacity,
+        );
+    info!(
+        capacity = tick_gap_tracker_capacity,
+        "S4-T1c: tick gap tracker instantiated with full-universe capacity"
+    );
     // Count of gap events published (cold path metric, observable via
     // dlt_backfill_gaps_published_total).
     let mut gaps_published: u64 = 0;
@@ -3111,6 +3214,13 @@ async fn run_shutdown_fast(
     config: &ApplicationConfig,
     shared_movers: dhan_live_trader_core::pipeline::SharedTopMoversSnapshot,
     post_market_signal: std::sync::Arc<tokio::sync::Notify>,
+    // S4-T1b: shared pool handle + shutdown notifier. `ws_pool_arc` is
+    // None when no WebSocket pool was spawned (e.g., historical-replay
+    // mode). `shutdown_notify` is fired before the abort loop so the
+    // pool watchdog task stops polling (prevents a false-positive Halt
+    // during intentional teardown).
+    ws_pool_arc: Option<std::sync::Arc<WebSocketConnectionPool>>,
+    shutdown_notify: std::sync::Arc<tokio::sync::Notify>,
 ) -> Result<()> {
     let mode = "LIVE";
     info!(
@@ -3233,7 +3343,24 @@ async fn run_shutdown_fast(
         handle.abort();
     }
 
-    // 3. Abort WebSocket connections (drops senders → processor exits).
+    // 3. S4-T1b: Graceful unsubscribe BEFORE abort. Sends RequestCode 12
+    //    to every live WebSocket so Dhan's server cleans up subscriptions
+    //    instead of timing them out 40s later. Best-effort — dead
+    //    connections are skipped. Also fires shutdown_notify so the pool
+    //    watchdog stops polling (prevents false-positive Halt during
+    //    intentional teardown).
+    shutdown_notify.notify_waiters();
+    if let Some(ref pool) = ws_pool_arc {
+        let signalled = pool.request_graceful_shutdown();
+        info!(
+            connections_signalled = signalled,
+            "S4-T1b: graceful shutdown signalled to WebSocket pool"
+        );
+        // Give each connection up to 2s to finish its Disconnect send.
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+
+    // 3b. Abort WebSocket connections (drops senders → processor exits).
     for handle in ws_handles {
         handle.abort();
     }
