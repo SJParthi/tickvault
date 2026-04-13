@@ -101,6 +101,26 @@ const REQUIRED_METRICS: &[(&str, &str)] = &[
         "dlt_pool_recoveries_total",
         "Number of times the pool recovered from AllDown to Healthy.",
     ),
+    // --- Session 3 S3-1 (QuestDB health poller) ---
+    (
+        "dlt_questdb_connected",
+        "Binary gauge: 1.0 if the tick writer's ILP sender is connected, \
+         0.0 otherwise. Flipping to 0 does NOT imply tick loss — the ring \
+         buffer + spill path absorb writes while QuestDB is down.",
+    ),
+    (
+        "dlt_questdb_disconnected_seconds",
+        "How long the current QuestDB outage has lasted (0 when connected).",
+    ),
+    (
+        "dlt_questdb_reconnects_total",
+        "Total successful QuestDB reconnects since process startup.",
+    ),
+    (
+        "dlt_questdb_disconnect_events_total",
+        "Total Connected → Disconnected transitions observed. Each outage \
+         increments this once.",
+    ),
 ];
 
 // Note: `dlt_sandbox_gate_blocks_total` was intentionally deferred from E1.

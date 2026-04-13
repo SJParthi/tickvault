@@ -548,6 +548,42 @@ groups:
         labels:
           severity: critical
 
+      # S3-1: QuestDB disconnected > 30s → CRITICAL
+      - uid: dlt-questdb-disconnected
+        title: "S3-1: QuestDB disconnected > 30s"
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 120, to: 0 }
+            datasourceUid: prometheus
+            model:
+              expr: "dlt_questdb_disconnected_seconds"
+              intervalMs: 15000
+              maxDataPoints: 43200
+          - refId: B
+            relativeTimeRange: { from: 120, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            relativeTimeRange: { from: 120, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: gt, params: [30] }
+        noDataState: OK
+        execErrState: Alerting
+        for: 0m
+        annotations:
+          summary: "CRITICAL: QuestDB disconnected > 30s"
+          description: "dlt_questdb_disconnected_seconds > 30. The tick writer's ring buffer + spill path are absorbing all writes — zero tick loss is still guaranteed, but operator attention is required. Check docker logs dlt-questdb and docker compose ps."
+        labels:
+          severity: critical
+
       # Pool watchdog fired a halt (process exit expected).
       - uid: dlt-pool-halted
         title: "A4: WebSocket pool halted (process restart expected)"

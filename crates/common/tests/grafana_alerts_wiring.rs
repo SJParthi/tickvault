@@ -30,6 +30,10 @@ const REQUIRED_ALERT_UIDS: &[(&str, &str)] = &[
         "A4: pool watchdog fired 60s degraded alert",
     ),
     ("dlt-pool-halted", "A4: pool watchdog fired 300s halt alert"),
+    (
+        "dlt-questdb-disconnected",
+        "S3-1: QuestDB disconnected > 30s",
+    ),
 ];
 
 fn read_alerts_yml() -> String {
