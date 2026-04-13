@@ -21,6 +21,7 @@ use dhan_live_trader_common::types::FeedMode;
 
 use crate::auth::TokenHandle;
 use crate::websocket::connection::WebSocketConnection;
+use crate::websocket::pool_watchdog::{PoolWatchdog, WatchdogVerdict};
 use crate::websocket::types::{ConnectionHealth, InstrumentSubscription, WebSocketError};
 
 // ---------------------------------------------------------------------------
@@ -41,6 +42,13 @@ pub struct WebSocketConnectionPool {
 
     /// Stagger delay between connection spawns (milliseconds). 0 = no stagger.
     connection_stagger_ms: u64,
+
+    /// A4: Pool-level circuit breaker watchdog. Tracks whether all
+    /// connections have been simultaneously down for > POOL_DEGRADED_ALERT_SECS
+    /// (60s) and > POOL_HALT_SECS (300s). Interior-mutable so the read-only
+    /// `poll_watchdog()` API works from a `&self` reference shared across
+    /// the pool's background task and its owner.
+    watchdog: std::sync::Mutex<PoolWatchdog>,
 }
 
 impl std::fmt::Debug for WebSocketConnectionPool {
@@ -141,6 +149,7 @@ impl WebSocketConnectionPool {
             connections,
             frame_receiver,
             connection_stagger_ms: ws_config.connection_stagger_ms,
+            watchdog: std::sync::Mutex::new(PoolWatchdog::new()),
         })
     }
 
@@ -205,6 +214,77 @@ impl WebSocketConnectionPool {
             .iter()
             .map(|conn| conn.health().subscribed_count)
             .sum()
+    }
+
+    /// A4: Pool-level circuit breaker poll. Call this from a background
+    /// task every ~5 seconds (or whatever your health-poll cadence is).
+    /// Reads all connection states, feeds them to the internal watchdog,
+    /// and returns the verdict. Side effects:
+    ///
+    /// - `WatchdogVerdict::Degraded` → fires Telegram CRITICAL (if a
+    ///   notifier is wired upstream by the caller) and increments
+    ///   `dlt_pool_degraded_seconds_total`
+    /// - `WatchdogVerdict::Halt` → caller MUST exit the process with a
+    ///   non-zero status so the supervisor (systemd / Docker restart
+    ///   policy) brings it back up. The pool cannot self-exit because
+    ///   it doesn't own the runtime.
+    /// - `WatchdogVerdict::Recovered` → INFO log + metric reset
+    /// - `WatchdogVerdict::Degrading` → metric gauge update only
+    ///
+    /// The watchdog itself is in `pool_watchdog.rs` and is a pure state
+    /// machine — this method only wires it to metrics and logs. Thresholds:
+    /// - 60s all-down: CRITICAL alert fired exactly once per down-cycle
+    /// - 300s all-down: Halt requested (caller decides how to exit)
+    ///
+    /// Cold path — runs on a watchdog cadence, not per tick.
+    // TEST-EXEMPT: covered by test_pool_poll_watchdog_* integration tests and pool_watchdog unit tests
+    #[allow(clippy::expect_used)] // APPROVED: lock poison on watchdog is unrecoverable
+    pub fn poll_watchdog(&self) -> WatchdogVerdict {
+        let healths = self.health();
+        let now = std::time::Instant::now();
+        // APPROVED: lock poison is unrecoverable — the process is corrupted anyway
+        let mut wd = self.watchdog.lock().expect("pool watchdog lock poisoned");
+        let verdict = wd.tick(&healths, now);
+        drop(wd);
+
+        match verdict {
+            WatchdogVerdict::Healthy => {
+                metrics::gauge!("dlt_pool_degraded_seconds").set(0.0);
+            }
+            WatchdogVerdict::Recovered { was_down_for } => {
+                info!(
+                    down_for_secs = was_down_for.as_secs(),
+                    "A4: WebSocket pool RECOVERED — at least one connection is live again"
+                );
+                metrics::counter!("dlt_pool_recoveries_total").increment(1);
+                metrics::gauge!("dlt_pool_degraded_seconds").set(0.0);
+            }
+            WatchdogVerdict::Degrading { down_for } => {
+                metrics::gauge!("dlt_pool_degraded_seconds").set(down_for.as_secs_f64());
+            }
+            WatchdogVerdict::Degraded { down_for } => {
+                tracing::error!(
+                    down_for_secs = down_for.as_secs(),
+                    "A4 CRITICAL: WebSocket pool has been FULLY DEGRADED for >60s — ALL connections \
+                     are Reconnecting/Disconnected, no market data flowing. Investigate Dhan \
+                     server status, token validity, network reachability."
+                );
+                metrics::counter!("dlt_pool_degraded_alerts_total").increment(1);
+                metrics::gauge!("dlt_pool_degraded_seconds").set(down_for.as_secs_f64());
+            }
+            WatchdogVerdict::Halt { down_for } => {
+                tracing::error!(
+                    down_for_secs = down_for.as_secs(),
+                    "A4 FATAL: WebSocket pool has been FULLY DEGRADED for >300s — initiating process \
+                     halt so supervisor can restart us. If this fires repeatedly, Dhan is likely \
+                     unreachable or the account/token is locked."
+                );
+                metrics::counter!("dlt_pool_halts_total").increment(1);
+                metrics::gauge!("dlt_pool_degraded_seconds").set(down_for.as_secs_f64());
+            }
+        }
+
+        verdict
     }
 
     /// A5: Graceful shutdown — requests each connection to send a
@@ -1110,6 +1190,59 @@ mod tests {
         for handle in handles {
             let result = handle.await;
             assert!(result.is_ok(), "JoinHandle must not panic");
+        }
+    }
+
+    // =======================================================================
+    // A4: Pool-level circuit breaker (watchdog integration)
+    // =======================================================================
+
+    /// A4: A freshly-constructed pool has all 5 connections in `Disconnected`
+    /// state. The first watchdog poll MUST transition to Degrading (starting
+    /// the all-down cycle), not stay Healthy.
+    #[test]
+    fn test_pool_poll_watchdog_initial_state_is_degrading() {
+        let pool = WebSocketConnectionPool::new(
+            make_test_token_handle(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            make_test_ws_config(),
+            make_instruments(100),
+            FeedMode::Ticker,
+            None,
+        )
+        .unwrap();
+
+        let verdict = pool.poll_watchdog();
+        assert!(
+            matches!(verdict, WatchdogVerdict::Degrading { .. }),
+            "fresh pool with all-Disconnected connections must transition \
+             into Degrading on first poll, got {verdict:?}"
+        );
+    }
+
+    /// A4: Repeated polls on a dead pool stay in Degrading (until 60s
+    /// threshold). We can't simulate 60s of wall-clock in a unit test, so
+    /// we just verify the verdict type is stable across multiple polls.
+    #[test]
+    fn test_pool_poll_watchdog_stable_across_polls() {
+        let pool = WebSocketConnectionPool::new(
+            make_test_token_handle(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            make_test_ws_config(),
+            make_instruments(100),
+            FeedMode::Ticker,
+            None,
+        )
+        .unwrap();
+
+        for _ in 0..5 {
+            let v = pool.poll_watchdog();
+            assert!(
+                matches!(v, WatchdogVerdict::Degrading { .. }),
+                "dead pool must stay in Degrading, got {v:?}"
+            );
         }
     }
 
