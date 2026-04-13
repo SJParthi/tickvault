@@ -153,6 +153,21 @@ const REQUIRED_METRICS: &[(&str, &str)] = &[
         "BackfillStats.ticks_synthesised — total synthetic ticks emitted by \
          the BackfillWorker and fed into the tick pipeline.",
     ),
+    // --- Session 4 S4-T1a (pool self halts) ---
+    (
+        "dlt_pool_self_halts_total",
+        "Number of times the pool watchdog task fired a Halt verdict and \
+         called std::process::exit(2). Should be 0 in healthy operation; \
+         every increment is a supervisor-triggered restart.",
+    ),
+    // --- Session 4 S4-T1f (synth ticks forwarded to broadcast) ---
+    (
+        "dlt_backfill_ticks_forwarded_total",
+        "S4-T1f: Number of synth ticks successfully forwarded from the \
+         BackfillWorker output into the main tick broadcast channel. \
+         This is the observable measure that backfill actually closed \
+         a gap. Downstream DEDUP merges any overlap with live ticks.",
+    ),
 ];
 
 // Note: `dlt_sandbox_gate_blocks_total` was intentionally deferred from E1.

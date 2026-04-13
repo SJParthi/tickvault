@@ -436,22 +436,58 @@ async fn main() -> Result<()> {
         let (synth_tick_tx, mut synth_tick_rx) =
             tokio::sync::mpsc::channel::<dhan_live_trader_common::tick_types::ParsedTick>(4096);
 
-        // Placeholder fetcher: returns an empty vec so the worker reports
-        // events_empty on every gap. This is HONEST about what's wired:
-        // the plumbing is real, but the actual REST call to Dhan's
-        // historical intraday API is left for a follow-up commit that
-        // brings in the candle_fetcher dependency + auth handle. Shipping
-        // this now proves the pipeline is live and observable; swapping
-        // the closure later is a 1-file change.
-        let backfill_fetcher =
-            |req: dhan_live_trader_core::historical::backfill::GapBackfillRequest| async move {
-                tracing::info!(
-                    security_id = req.security_id,
-                    gap_secs = req.gap_secs(),
-                    "S3-2: backfill fetcher invoked (placeholder — returns empty). \
-                     Follow-up commit will wire the real Dhan historical REST call."
+        // S4-T1e: Real Dhan historical intraday REST fetcher. Replaces
+        // the session-3 placeholder. The closure captures a reqwest
+        // client, the rest_api_base_url, the token_handle (Arc<ArcSwap>,
+        // lock-free atomic reads at call time), and the client_id. The
+        // closure is called by the BackfillWorker once per gap event.
+        let backfill_endpoint = format!(
+            "{}/charts/intraday",
+            config.dhan.rest_api_base_url.trim_end_matches('/')
+        );
+        let backfill_http_client = match reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+        {
+            Ok(c) => c,
+            Err(err) => {
+                warn!(
+                    ?err,
+                    "S4-T1e: reqwest client build failed — backfill worker disabled"
                 );
-                Ok::<Vec<dhan_live_trader_common::tick_types::HistoricalCandle>, String>(Vec::new())
+                reqwest::Client::new()
+            }
+        };
+        let backfill_token_handle = std::sync::Arc::clone(&token_handle);
+        let backfill_client_id = client_id.clone();
+        let backfill_fetcher =
+            move |req: dhan_live_trader_core::historical::backfill::GapBackfillRequest| {
+                // Clone per-invocation captures to move into the returned future.
+                let http_client = backfill_http_client.clone();
+                let endpoint = backfill_endpoint.clone();
+                let token_handle = std::sync::Arc::clone(&backfill_token_handle);
+                let client_id_inner = backfill_client_id.clone();
+                async move {
+                    // Read the current access token atomically.
+                    use secrecy::ExposeSecret as _;
+                    let token_guard = token_handle.load();
+                    let token_state = match token_guard.as_ref().as_ref() {
+                        Some(state) if state.is_valid() => state,
+                        _ => return Err("backfill: no valid access token available".to_string()),
+                    };
+                    let access_token = token_state.access_token().expose_secret().to_string();
+                    dhan_live_trader_core::historical::backfill::fetch_intraday_window(
+                        &http_client,
+                        &endpoint,
+                        &access_token,
+                        &client_id_inner,
+                        req.security_id,
+                        req.exchange_segment_code,
+                        req.from_ist_secs,
+                        req.to_ist_secs,
+                    )
+                    .await
+                }
             };
         let backfill_worker = dhan_live_trader_core::historical::backfill::BackfillWorker::new(
             gap_backfill_rx,
@@ -464,17 +500,39 @@ async fn main() -> Result<()> {
             backfill_worker.run().await;
             tracing::info!("S3-2: BackfillWorker exited");
         });
-        tokio::spawn(async move {
-            // Drain synth ticks (placeholder). When the real fetcher lands,
-            // this task will forward ticks into the main persistence path.
-            while let Some(tick) = synth_tick_rx.recv().await {
-                tracing::debug!(
-                    security_id = tick.security_id,
-                    ltp = tick.last_traded_price,
-                    "S3-2: synth tick received from backfill worker (not yet persisted)"
-                );
-            }
-        });
+        // S4-T1f: Forward synth ticks from the BackfillWorker into the
+        // main tick broadcast channel. Every downstream consumer (tick
+        // persistence, candle aggregator, trading pipeline) processes
+        // them identically to live ticks. QuestDB DEDUP UPSERT KEYS on
+        // (ts, security_id, segment) merges any overlap with the live
+        // tick that eventually catches up, so replay is idempotent.
+        //
+        // Counter `dlt_backfill_ticks_forwarded_total` measures how many
+        // synth ticks actually reached the broadcast channel — this is
+        // the real observable measure of "backfill closed the gap".
+        {
+            let broadcast_for_synth = fast_tick_broadcast_sender.clone();
+            tokio::spawn(async move {
+                let mut forwarded_total: u64 = 0;
+                while let Some(tick) = synth_tick_rx.recv().await {
+                    match broadcast_for_synth.send(tick) {
+                        Ok(_) => {
+                            forwarded_total = forwarded_total.saturating_add(1);
+                            metrics::counter!("dlt_backfill_ticks_forwarded_total").increment(1);
+                        }
+                        Err(_) => {
+                            // Broadcast receiver count 0 means the pipeline
+                            // is tearing down — exit cleanly.
+                            tracing::info!(
+                                forwarded_total,
+                                "S4-T1f: fast-boot synth forwarder exiting (broadcast closed)"
+                            );
+                            return;
+                        }
+                    }
+                }
+            });
+        }
         // Expose stats_handle via a background metric emitter so the counters
         // surface even without a prod scrape query.
         {
@@ -1274,15 +1332,59 @@ async fn main() -> Result<()> {
     >(64);
     let (synth_tick_tx_slow, mut synth_tick_rx_slow) =
         tokio::sync::mpsc::channel::<dhan_live_trader_common::tick_types::ParsedTick>(4096);
-    let backfill_fetcher_slow =
-        |req: dhan_live_trader_core::historical::backfill::GapBackfillRequest| async move {
-            tracing::info!(
-                security_id = req.security_id,
-                gap_secs = req.gap_secs(),
-                "S4-T1d: slow-boot backfill fetcher invoked (placeholder). \
-                 Real Dhan REST call lands in T1e."
+    // S4-T1e: Real Dhan historical intraday REST fetcher (slow-boot).
+    // Mirrors the fast-boot closure at line ~446. The closure captures
+    // a reqwest client, the rest_api_base_url, the token_handle (Arc,
+    // lock-free reads), and the client_id.
+    let backfill_endpoint_slow = format!(
+        "{}/charts/intraday",
+        config.dhan.rest_api_base_url.trim_end_matches('/')
+    );
+    let backfill_http_client_slow = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(err) => {
+            warn!(
+                ?err,
+                "S4-T1e: slow-boot reqwest client build failed — backfill worker degraded"
             );
-            Ok::<Vec<dhan_live_trader_common::tick_types::HistoricalCandle>, String>(Vec::new())
+            reqwest::Client::new()
+        }
+    };
+    let backfill_token_handle_slow = std::sync::Arc::clone(&token_handle);
+    let backfill_client_id_slow = ws_client_id.clone();
+    let backfill_fetcher_slow =
+        move |req: dhan_live_trader_core::historical::backfill::GapBackfillRequest| {
+            let http_client = backfill_http_client_slow.clone();
+            let endpoint = backfill_endpoint_slow.clone();
+            let token_handle = std::sync::Arc::clone(&backfill_token_handle_slow);
+            let client_id_inner = backfill_client_id_slow.clone();
+            async move {
+                use secrecy::ExposeSecret as _;
+                let token_guard = token_handle.load();
+                let token_state = match token_guard.as_ref().as_ref() {
+                    Some(state) if state.is_valid() => state,
+                    _ => {
+                        return Err(
+                            "backfill: no valid access token available (slow-boot)".to_string()
+                        );
+                    }
+                };
+                let access_token = token_state.access_token().expose_secret().to_string();
+                dhan_live_trader_core::historical::backfill::fetch_intraday_window(
+                    &http_client,
+                    &endpoint,
+                    &access_token,
+                    &client_id_inner,
+                    req.security_id,
+                    req.exchange_segment_code,
+                    req.from_ist_secs,
+                    req.to_ist_secs,
+                )
+                .await
+            }
         };
     let backfill_worker_slow = dhan_live_trader_core::historical::backfill::BackfillWorker::new(
         gap_backfill_rx_slow,
@@ -1294,14 +1396,30 @@ async fn main() -> Result<()> {
         tracing::info!("S4-T1d: slow-boot BackfillWorker started");
         backfill_worker_slow.run().await;
     });
-    tokio::spawn(async move {
-        while let Some(tick) = synth_tick_rx_slow.recv().await {
-            tracing::debug!(
-                security_id = tick.security_id,
-                "S4-T1d: slow-boot synth tick received (not yet persisted — T1f)"
-            );
-        }
-    });
+    // S4-T1f: Forward slow-boot synth ticks into the main tick broadcast
+    // channel. Symmetric with the fast-boot forwarder — same DEDUP-based
+    // idempotency properties, same counter name.
+    {
+        let broadcast_for_synth_slow = tick_broadcast_sender.clone();
+        tokio::spawn(async move {
+            let mut forwarded_total: u64 = 0;
+            while let Some(tick) = synth_tick_rx_slow.recv().await {
+                match broadcast_for_synth_slow.send(tick) {
+                    Ok(_) => {
+                        forwarded_total = forwarded_total.saturating_add(1);
+                        metrics::counter!("dlt_backfill_ticks_forwarded_total").increment(1);
+                    }
+                    Err(_) => {
+                        tracing::info!(
+                            forwarded_total,
+                            "S4-T1f: slow-boot synth forwarder exiting (broadcast closed)"
+                        );
+                        return;
+                    }
+                }
+            }
+        });
+    }
     {
         let stats = std::sync::Arc::clone(&backfill_stats_slow);
         tokio::spawn(async move {

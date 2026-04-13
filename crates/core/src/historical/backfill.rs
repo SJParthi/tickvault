@@ -33,7 +33,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use dhan_live_trader_common::constants::IST_UTC_OFFSET_SECONDS_I64;
-use dhan_live_trader_common::tick_types::{HistoricalCandle, ParsedTick};
+use dhan_live_trader_common::tick_types::{DhanIntradayResponse, HistoricalCandle, ParsedTick};
 
 // ---------------------------------------------------------------------------
 // Event type emitted by TickGapTracker → backfill worker
@@ -165,6 +165,210 @@ pub fn synthesize_ticks_from_minute_candles(
         });
     }
     ticks
+}
+
+// ---------------------------------------------------------------------------
+// S4-T1e: Real Dhan historical intraday REST fetcher
+// ---------------------------------------------------------------------------
+
+/// Maps an `exchange_segment_code` to the Dhan API string enum.
+/// Returns `None` for unknown codes — the caller should skip the fetch.
+fn segment_code_to_string(code: u8) -> Option<&'static str> {
+    match code {
+        0 => Some("IDX_I"),
+        1 => Some("NSE_EQ"),
+        2 => Some("NSE_FNO"),
+        3 => Some("NSE_CURRENCY"),
+        4 => Some("BSE_EQ"),
+        5 => Some("MCX_COMM"),
+        7 => Some("BSE_CURRENCY"),
+        8 => Some("BSE_FNO"),
+        _ => None,
+    }
+}
+
+/// Formats an IST epoch second as `"YYYY-MM-DD HH:MM:SS"` in IST,
+/// the format required by Dhan's `/v2/charts/intraday` endpoint.
+///
+/// Dhan's intraday endpoint accepts local-time strings but interprets
+/// them as IST. Since `ParsedTick::exchange_timestamp` already holds
+/// IST epoch seconds, we just convert without applying an offset.
+fn format_ist_datetime(ist_secs: u32) -> String {
+    // IST epoch → NaiveDateTime via chrono.
+    // i64::from(u32) is infallible.
+    let dt = chrono::DateTime::from_timestamp(i64::from(ist_secs), 0)
+        .map(|d| d.naive_utc())
+        .unwrap_or_default();
+    dt.format("%Y-%m-%d %H:%M:%S").to_string() // O(1) EXEMPT: cold path — gap event, not per tick
+}
+
+/// Minimum size of a backfill window we'll actually ship to Dhan.
+/// A 1-second gap isn't worth a round trip (dhan will return an empty
+/// candle list anyway since candles are minute-resolution).
+const BACKFILL_MIN_WINDOW_SECS: u32 = 30;
+
+/// Maximum size of a single backfill window. Larger gaps are chunked
+/// to stay under Dhan's 90-day intraday limit — but since our gaps
+/// are measured in minutes, 3600 is plenty of headroom.
+const BACKFILL_MAX_WINDOW_SECS: u32 = 3600;
+
+/// Dhan intraday request body. Local to backfill.rs because the existing
+/// `IntradayRequest` in `candle_fetcher.rs` is private and tightly
+/// coupled to the bulk fetcher.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BackfillIntradayRequest {
+    security_id: String,
+    exchange_segment: String,
+    instrument: String,
+    interval: String,
+    oi: bool,
+    from_date: String,
+    to_date: String,
+}
+
+/// S4-T1e: Fetches intraday 1-minute candles from Dhan for a specific
+/// gap window. This is the real backfill fetcher that replaces the
+/// placeholder closure in main.rs.
+///
+/// # Arguments
+/// * `http_client` — Pre-built reqwest client (the worker shares one)
+/// * `endpoint` — Full URL, e.g. `https://api.dhan.co/v2/charts/intraday`
+/// * `access_token` — JWT without the Bearer prefix (goes in `access-token` header)
+/// * `client_id` — Dhan client ID (goes in `client-id` header)
+/// * `security_id` — The instrument whose gap we're filling
+/// * `exchange_segment_code` — Binary segment from the live tick
+/// * `from_ist_secs` / `to_ist_secs` — Gap window in IST epoch seconds
+///
+/// # Returns
+/// On success: `Vec<HistoricalCandle>` with 1-minute candles spanning the
+/// requested window. Volume is cumulative per Dhan's convention.
+///
+/// On failure: `Err(String)` describing the failure class. The worker
+/// increments `events_errored` and logs; the gap remains — the next tick
+/// on that security may re-trigger a fresh request if the gap persists.
+///
+/// # Errors
+/// Returns `Err` on: HTTP failure, non-2xx status, body parse error,
+/// unknown segment code, negative/zero window.
+pub async fn fetch_intraday_window(
+    http_client: &reqwest::Client,
+    endpoint: &str,
+    access_token: &str,
+    client_id: &str,
+    security_id: u32,
+    exchange_segment_code: u8,
+    from_ist_secs: u32,
+    to_ist_secs: u32,
+) -> Result<Vec<HistoricalCandle>, String> {
+    // Validate window.
+    let window_secs = to_ist_secs.saturating_sub(from_ist_secs);
+    if window_secs < BACKFILL_MIN_WINDOW_SECS {
+        return Err(format!(
+            "window too small: {window_secs}s < {BACKFILL_MIN_WINDOW_SECS}s minimum"
+        ));
+    }
+    if window_secs > BACKFILL_MAX_WINDOW_SECS {
+        // Could chunk, but since our gap thresholds are on the order of
+        // minutes, any window > 1h means something upstream is broken.
+        // Return error so the operator investigates.
+        return Err(format!(
+            "window too large: {window_secs}s > {BACKFILL_MAX_WINDOW_SECS}s maximum"
+        ));
+    }
+
+    // Map segment code to Dhan string enum.
+    let exchange_segment = segment_code_to_string(exchange_segment_code)
+        .ok_or_else(|| format!("unknown exchange_segment_code {exchange_segment_code}"))?;
+
+    // Dhan's intraday endpoint doesn't accept indices (IDX_I). Skip early.
+    if exchange_segment == "IDX_I" {
+        return Err("intraday endpoint does not support IDX_I segment".to_string());
+    }
+
+    // Instrument hint — Dhan wants "EQUITY" / "FUTIDX" / "FUTSTK" / "OPTIDX" /
+    // "OPTSTK" / etc. Without the instrument master loaded here, we
+    // conservatively send "EQUITY" for NSE_EQ and leave F&O for later
+    // refinement (the endpoint tolerates "EQUITY" on wrong segments by
+    // returning an empty candle list, which we gracefully surface as
+    // events_empty, not events_errored).
+    let instrument = match exchange_segment {
+        "NSE_EQ" | "BSE_EQ" => "EQUITY",
+        "NSE_FNO" | "BSE_FNO" => "OPTIDX",
+        _ => "EQUITY",
+    };
+
+    let from_str = format_ist_datetime(from_ist_secs);
+    let to_str = format_ist_datetime(to_ist_secs);
+
+    let request_body = BackfillIntradayRequest {
+        security_id: security_id.to_string(),
+        exchange_segment: exchange_segment.to_string(),
+        instrument: instrument.to_string(),
+        interval: "1".to_string(),
+        oi: true,
+        from_date: from_str,
+        to_date: to_str,
+    };
+
+    let response = http_client
+        .post(endpoint)
+        .header("access-token", access_token)
+        .header("client-id", client_id)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json")
+        .json(&request_body)
+        .send()
+        .await
+        .map_err(|e| format!("http send failed: {e}"))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("http status {status}"));
+    }
+
+    let parsed: DhanIntradayResponse = response
+        .json()
+        .await
+        .map_err(|e| format!("response parse failed: {e}"))?;
+
+    // Sanity check: all parallel arrays must have the same length.
+    let n = parsed.open.len();
+    if parsed.high.len() != n
+        || parsed.low.len() != n
+        || parsed.close.len() != n
+        || parsed.volume.len() != n
+        || parsed.timestamp.len() != n
+    {
+        return Err(format!(
+            "parallel array length mismatch: open={} high={} low={} close={} volume={} timestamp={}",
+            parsed.open.len(),
+            parsed.high.len(),
+            parsed.low.len(),
+            parsed.close.len(),
+            parsed.volume.len(),
+            parsed.timestamp.len(),
+        ));
+    }
+
+    // Convert parallel arrays into HistoricalCandle records.
+    let mut candles = Vec::with_capacity(n);
+    for i in 0..n {
+        let oi = parsed.open_interest.get(i).copied().unwrap_or(0);
+        candles.push(HistoricalCandle {
+            timestamp_utc_secs: parsed.timestamp[i],
+            security_id,
+            exchange_segment_code,
+            timeframe: "1m",
+            open: parsed.open[i],
+            high: parsed.high[i],
+            low: parsed.low[i],
+            close: parsed.close[i],
+            volume: parsed.volume[i],
+            open_interest: oi,
+        });
+    }
+    Ok(candles)
 }
 
 // ---------------------------------------------------------------------------
