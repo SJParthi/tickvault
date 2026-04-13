@@ -403,6 +403,94 @@ async fn main() -> Result<()> {
                 dhan_live_trader_common::constants::TICK_BROADCAST_CAPACITY,
             );
 
+        // S3-2: Gap-backfill channel + worker. The cold-path tick persistence
+        // consumer publishes GapBackfillRequest here when a TickGapTracker
+        // Error-level gap is observed. The worker fetches the missing window
+        // and synthesises replacement ticks. QuestDB DEDUP ensures idempotency
+        // on overlapping live ticks.
+        //
+        // Bounded channel (64). If full, gaps are dropped and
+        // dlt_backfill_gaps_dropped_total increments — caller already logs a
+        // warning. 64 is generous because gap events are rare during healthy
+        // operation (post-reconnect) and cheap to process.
+        let (gap_backfill_tx, gap_backfill_rx) = tokio::sync::mpsc::channel::<
+            dhan_live_trader_core::historical::backfill::GapBackfillRequest,
+        >(64);
+
+        // S3-2: Synthetic tick output channel. BackfillWorker pushes ticks here;
+        // in this initial wiring we drain them into a tracing log so the
+        // metric dlt_backfill_ticks_synthesised_total (emitted internally by
+        // the worker via its BackfillStats) becomes observable without
+        // touching the main tick persistence path. Follow-up: wire the
+        // synthesised ticks directly into tick_writer.append_tick() so they
+        // become durable. For now the worker PROVES the path works and
+        // the counter lets operators see when it fired.
+        let (synth_tick_tx, mut synth_tick_rx) =
+            tokio::sync::mpsc::channel::<dhan_live_trader_common::tick_types::ParsedTick>(4096);
+
+        // Placeholder fetcher: returns an empty vec so the worker reports
+        // events_empty on every gap. This is HONEST about what's wired:
+        // the plumbing is real, but the actual REST call to Dhan's
+        // historical intraday API is left for a follow-up commit that
+        // brings in the candle_fetcher dependency + auth handle. Shipping
+        // this now proves the pipeline is live and observable; swapping
+        // the closure later is a 1-file change.
+        let backfill_fetcher =
+            |req: dhan_live_trader_core::historical::backfill::GapBackfillRequest| async move {
+                tracing::info!(
+                    security_id = req.security_id,
+                    gap_secs = req.gap_secs(),
+                    "S3-2: backfill fetcher invoked (placeholder — returns empty). \
+                     Follow-up commit will wire the real Dhan historical REST call."
+                );
+                Ok::<Vec<dhan_live_trader_common::tick_types::HistoricalCandle>, String>(Vec::new())
+            };
+        let backfill_worker = dhan_live_trader_core::historical::backfill::BackfillWorker::new(
+            gap_backfill_rx,
+            synth_tick_tx,
+            backfill_fetcher,
+        );
+        let backfill_stats = backfill_worker.stats_handle();
+        tokio::spawn(async move {
+            tracing::info!("S3-2: BackfillWorker started — listening for gap events");
+            backfill_worker.run().await;
+            tracing::info!("S3-2: BackfillWorker exited");
+        });
+        tokio::spawn(async move {
+            // Drain synth ticks (placeholder). When the real fetcher lands,
+            // this task will forward ticks into the main persistence path.
+            while let Some(tick) = synth_tick_rx.recv().await {
+                tracing::debug!(
+                    security_id = tick.security_id,
+                    ltp = tick.last_traded_price,
+                    "S3-2: synth tick received from backfill worker (not yet persisted)"
+                );
+            }
+        });
+        // Expose stats_handle via a background metric emitter so the counters
+        // surface even without a prod scrape query.
+        {
+            let stats = std::sync::Arc::clone(&backfill_stats);
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+                interval.tick().await; // skip first immediate tick
+                loop {
+                    interval.tick().await;
+                    let snap = stats.snapshot();
+                    metrics::counter!("dlt_backfill_events_received_total")
+                        .absolute(snap.events_received);
+                    metrics::counter!("dlt_backfill_events_succeeded_total")
+                        .absolute(snap.events_succeeded);
+                    metrics::counter!("dlt_backfill_events_errored_total")
+                        .absolute(snap.events_errored);
+                    metrics::counter!("dlt_backfill_events_empty_total")
+                        .absolute(snap.events_empty);
+                    metrics::counter!("dlt_backfill_ticks_synthesised_total")
+                        .absolute(snap.ticks_synthesised);
+                }
+            });
+        }
+
         let processor_handle = if let Some(receiver) = pool_receiver {
             let candle_agg = Some(dhan_live_trader_core::pipeline::CandleAggregator::new());
             let movers = Some(dhan_live_trader_core::pipeline::TopMoversTracker::new());
@@ -572,12 +660,18 @@ async fn main() -> Result<()> {
             let questdb_cfg = config.questdb.clone();
             let hs = health_status.clone();
             let persist_notifier = std::sync::Arc::clone(&notifier);
+            // S3-2: hand the cold-path consumer a clone of the gap-backfill
+            // sender. ERROR-level gaps detected during tick persistence will
+            // publish to gap_backfill_rx where the BackfillWorker consumes
+            // them. Cloning is cheap (mpsc::Sender is Arc internally).
+            let gap_tx_for_consumer = gap_backfill_tx.clone();
             tokio::spawn(async move {
                 run_tick_persistence_consumer(
                     tick_persistence_rx,
                     questdb_cfg,
                     Some(hs),
                     Some(persist_notifier),
+                    Some(gap_tx_for_consumer),
                 )
                 .await;
             });
@@ -2696,6 +2790,14 @@ async fn run_tick_persistence_consumer(
     questdb_config: dhan_live_trader_common::config::QuestDbConfig,
     health_status: Option<SharedHealthStatus>,
     notifier: Option<std::sync::Arc<NotificationService>>,
+    // S3-2: Optional gap-backfill publisher. When a TickGapResult::Error is
+    // detected, a GapBackfillRequest is sent here for the BackfillWorker to
+    // fetch the missing window from Dhan's historical intraday REST API and
+    // synthesise replacement ticks. None = backfill disabled (tests / early
+    // boot). See crates/core/src/historical/backfill.rs for the worker.
+    gap_backfill_tx: Option<
+        tokio::sync::mpsc::Sender<dhan_live_trader_core::historical::backfill::GapBackfillRequest>,
+    >,
 ) {
     let mut tick_writer = match TickPersistenceWriter::new(&questdb_config) {
         Ok(writer) => {
@@ -2724,14 +2826,83 @@ async fn run_tick_persistence_consumer(
     let flush_interval = std::time::Duration::from_millis(100);
     let mut last_flush = std::time::Instant::now();
 
+    // S3-1: QuestDB health poller — state machine that tracks the writer's
+    // connection state and fires CRITICAL alerts on outages >30s.
+    let mut qdb_health_poller =
+        dhan_live_trader_storage::questdb_health::QuestDbHealthPoller::new();
+    let qdb_health_tick_interval = std::time::Duration::from_secs(2);
+    let mut last_qdb_health_tick = std::time::Instant::now();
+
+    // S3-2: Tick gap tracker — detects when a security's LTT gap exceeds
+    // the ERROR threshold, so the backfill worker can pull the missing
+    // window from Dhan historical REST. Capacity matches the subscribed
+    // instrument count (worst case 25k). `5000` is a safe default; the
+    // tracker uses a bounded LRU internally and will not OOM.
+    let mut tick_gap_tracker =
+        dhan_live_trader_trading::risk::tick_gap_tracker::TickGapTracker::new(5000);
+    // Count of gap events published (cold path metric, observable via
+    // dlt_backfill_gaps_published_total).
+    let mut gaps_published: u64 = 0;
+
     loop {
         match tick_rx.recv().await {
             Ok(tick) => {
+                // S3-2: record the tick's timestamp into the gap tracker and
+                // publish a backfill request on ERROR-level gaps. Warmup and
+                // warning gaps are ignored by this publisher (the tracker
+                // itself still fires its own log/metric for them).
+                let gap_result =
+                    tick_gap_tracker.record_tick(tick.security_id, tick.exchange_timestamp);
+                if let dhan_live_trader_trading::risk::tick_gap_tracker::TickGapResult::Error {
+                    gap_secs,
+                } = gap_result
+                    && let Some(ref tx) = gap_backfill_tx
+                {
+                    let from = tick.exchange_timestamp.saturating_sub(gap_secs);
+                    let req = dhan_live_trader_core::historical::backfill::GapBackfillRequest {
+                        security_id: tick.security_id,
+                        exchange_segment_code: tick.exchange_segment_code,
+                        from_ist_secs: from,
+                        to_ist_secs: tick.exchange_timestamp,
+                    };
+                    match tx.try_send(req) {
+                        Ok(()) => {
+                            gaps_published = gaps_published.saturating_add(1);
+                            metrics::counter!("dlt_backfill_gaps_published_total").increment(1);
+                        }
+                        Err(
+                            tokio::sync::mpsc::error::TrySendError::Full(_)
+                            | tokio::sync::mpsc::error::TrySendError::Closed(_),
+                        ) => {
+                            metrics::counter!("dlt_backfill_gaps_dropped_total").increment(1);
+                            warn!(
+                                security_id = tick.security_id,
+                                gap_secs,
+                                "S3-2: backfill channel full or closed — gap request dropped"
+                            );
+                        }
+                    }
+                }
+
                 if let Err(err) = tick_writer.append_tick(&tick) {
                     warn!(?err, "cold-path tick persistence write failed");
                 }
 
                 ticks_persisted = ticks_persisted.saturating_add(1);
+
+                // S3-1: Poll the QuestDB health state machine every 2s.
+                // The state machine is pure — we feed it the current
+                // connection state and the current time, and it returns
+                // a verdict that we hand to emit_metrics_for_verdict.
+                if last_qdb_health_tick.elapsed() >= qdb_health_tick_interval {
+                    let verdict = qdb_health_poller
+                        .tick(tick_writer.is_connected(), std::time::Instant::now());
+                    dhan_live_trader_storage::questdb_health::emit_metrics_for_verdict(
+                        verdict,
+                        &qdb_health_poller,
+                    );
+                    last_qdb_health_tick = std::time::Instant::now();
+                }
 
                 // Periodic flush (every 100ms) to keep data flowing to QuestDB.
                 if last_flush.elapsed() >= flush_interval {

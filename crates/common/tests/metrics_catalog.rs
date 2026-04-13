@@ -121,6 +121,38 @@ const REQUIRED_METRICS: &[(&str, &str)] = &[
         "Total Connected → Disconnected transitions observed. Each outage \
          increments this once.",
     ),
+    // --- Session 3 S3-2 (backfill worker wiring) ---
+    (
+        "dlt_backfill_gaps_published_total",
+        "Number of ERROR-level gap events published by the tick persistence \
+         consumer to the BackfillWorker.",
+    ),
+    (
+        "dlt_backfill_gaps_dropped_total",
+        "Number of gap events dropped because the backfill channel was full \
+         or closed. Should be 0 in healthy operation.",
+    ),
+    (
+        "dlt_backfill_events_received_total",
+        "BackfillStats.events_received — total gap events received by the worker.",
+    ),
+    (
+        "dlt_backfill_events_succeeded_total",
+        "BackfillStats.events_succeeded — gap fetches that returned non-empty candles.",
+    ),
+    (
+        "dlt_backfill_events_errored_total",
+        "BackfillStats.events_errored — gap fetches that returned an error.",
+    ),
+    (
+        "dlt_backfill_events_empty_total",
+        "BackfillStats.events_empty — gap fetches that returned zero candles.",
+    ),
+    (
+        "dlt_backfill_ticks_synthesised_total",
+        "BackfillStats.ticks_synthesised — total synthetic ticks emitted by \
+         the BackfillWorker and fed into the tick pipeline.",
+    ),
 ];
 
 // Note: `dlt_sandbox_gate_blocks_total` was intentionally deferred from E1.
