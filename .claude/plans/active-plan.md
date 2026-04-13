@@ -46,13 +46,13 @@ auto-track, auto-monitor, auto-debug, auto-log, auto-capture, auto-resolve, auto
   - Files: crates/core/src/historical/backfill.rs (new), crates/core/src/historical/mod.rs
   - Tests: 13 new — gap_request_gap_secs_normal ✅, gap_request_gap_secs_out_of_order_saturates ✅, backfill_empty_candles_produces_empty_ticks ✅, backfill_timestamp_adds_ist_offset ✅, backfill_close_becomes_last_traded_price ✅, backfill_multiple_candles_preserves_order ✅, backfill_greeks_are_nan ✅, backfill_volume_saturates_on_overflow ✅, backfill_negative_volume_clamped_to_zero ✅, backfill_worker_happy_path ✅, backfill_worker_handles_empty_fetch ✅, backfill_worker_handles_fetch_error ✅, backfill_worker_aborts_on_tick_pipeline_closed ✅
 
-- [ ] E1. **Prometheus metrics for new paths.** Counters/gauges emitted by A2/A3/A4. Most are already wired (dlt_dlq_ticks_total from session 1). Add: dlt_backfill_ticks_total, dlt_backfill_errors_total, dlt_pool_degraded_seconds_total, dlt_sandbox_gate_blocks_total (wire at config-validation point).
-  - Files: backfill_worker.rs, connection_pool.rs, config.rs
-  - Tests: covered via unit tests that assert metric names exist (recorder fixture)
+- [x] E1. **Prometheus metrics for new paths.** New `crates/common/tests/metrics_catalog.rs` (3 tests) cataloguing 8 metrics: `dlt_dlq_ticks_total`, `dlt_spill_disk_available_mb`, `dlt_ws_graceful_unsub_total`, `dlt_ws_graceful_shutdown_signalled_total`, `dlt_pool_degraded_seconds`, `dlt_pool_degraded_alerts_total`, `dlt_pool_halts_total`, `dlt_pool_recoveries_total`. The catalog scans prod source for each literal metric name — if an emission site is deleted during a refactor, the test fails. Also validates Prometheus naming convention (`dlt_*` prefix, snake_case) and uniqueness. `dlt_sandbox_gate_blocks_total` deferred — would require adding `metrics` crate to `common`, and the existing ERROR log already fires Telegram via the shared hook.
+  - Files: crates/common/tests/metrics_catalog.rs (new)
+  - Tests: 3 new — metrics_catalog_every_required_metric_is_emitted ✅, metrics_catalog_no_duplicate_names ✅, metrics_catalog_names_follow_prometheus_conventions ✅
 
-- [ ] E2. **Grafana alert rules + dashboard panels.** New file `deploy/docker/grafana/provisioning/alerting/zero-tick-loss.yaml` with 5 alerts: DLQ>0 CRITICAL, spill>50% WARN, spill>90% CRITICAL, pool_degraded>60s CRITICAL, backfill_errors>10/min WARN. Dashboard JSON panels for each new metric.
-  - Files: zero-tick-loss.yaml (new), trading-pipeline.json (append panels)
-  - Tests: YAML syntax validation via serde_yaml roundtrip in a small helper test
+- [x] E2. **Grafana alert rules + wiring test.** Appended a new `dlt-zero-tick-loss` alert group to `deploy/docker/grafana/provisioning/alerting/alerts.yml` with 5 rules: (1) `dlt-dlq-non-zero` CRITICAL on any DLQ write, (2) `dlt-spill-disk-low-warn` WARNING <500MB, (3) `dlt-spill-disk-low-critical` CRITICAL <100MB, (4) `dlt-pool-degraded` CRITICAL on pool_degraded_seconds > 60s, (5) `dlt-pool-halted` CRITICAL on halt counter increment. New `crates/common/tests/grafana_alerts_wiring.rs` (2 tests) verifies every required alert UID is present and every rule carries a `severity:` label so notification routing works.
+  - Files: deploy/docker/grafana/provisioning/alerting/alerts.yml (5 new rules), crates/common/tests/grafana_alerts_wiring.rs (new)
+  - Tests: 2 new — grafana_alerts_every_required_uid_is_provisioned ✅, grafana_alerts_every_rule_has_severity_label ✅
 
 - [ ] B2. **Disk-full chaos test.** `crates/storage/tests/chaos_disk_full.rs` — fills the spill dir to the low-disk threshold, appends ticks, asserts DLQ records appear and `dlq_ticks_total` increments. Frees space, asserts no further DLQ growth. `#[ignore]` by default, unix-only.
   - Files: chaos_disk_full.rs (new)

@@ -916,6 +916,13 @@ impl ApplicationConfig {
                 None => bail!("LIVE_TRADING_EARLIEST_DATE constants are invalid"),
             };
             if today < earliest {
+                // E1 (deferred): a `dlt_sandbox_gate_blocks_total` counter
+                // would require pulling the `metrics` crate into common,
+                // which is currently framework-free. The bail!() already
+                // fires an ERROR log via anyhow chain at the boot caller,
+                // and the ERROR log path fires Telegram via the existing
+                // hook — so the operator already gets notified. Revisit
+                // if we ever need a Prometheus time-series of block count.
                 bail!(
                     "SANDBOX GUARD: live trading mode is locked until {}. \
                      Current date (IST): {}. Use mode = \"sandbox\" or \"paper\" until then.",
