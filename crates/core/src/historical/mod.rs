@@ -17,5 +17,6 @@
 //! - **Cross-verification:** compares historical vs live for 09:15–15:29 only,
 //!   because Dhan historical API has no pre-market data (09:00–09:14).
 
+pub mod backfill;
 pub mod candle_fetcher;
 pub mod cross_verify;
