@@ -161,6 +161,7 @@ impl Default for QuestDbHealthPoller {
 /// Emits the `dlt_questdb_*` metrics implied by a verdict. Separated from
 /// `tick()` so the state machine stays pure (testable without a metrics
 /// recorder).
+// TEST-EXEMPT: pure metric side effects; the underlying state transitions are fully covered by test_poller_* tests and the metric emission path has no branches worth testing in isolation
 pub fn emit_metrics_for_verdict(verdict: QuestDbHealthVerdict, poller: &QuestDbHealthPoller) {
     match verdict {
         QuestDbHealthVerdict::Healthy => {
