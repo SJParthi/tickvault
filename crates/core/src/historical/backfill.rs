@@ -93,6 +93,7 @@ impl GapBackfillRequest {
 ///
 /// O(n) in the number of candles. Cold path — runs once per detected gap,
 /// not per tick. No allocation beyond the returned Vec.
+// TEST-EXEMPT: covered by test_backfill_empty_candles_produces_empty_ticks, test_backfill_timestamp_adds_ist_offset, test_backfill_close_becomes_last_traded_price, test_backfill_multiple_candles_preserves_order, test_backfill_greeks_are_nan, test_backfill_volume_saturates_on_overflow, test_backfill_negative_volume_clamped_to_zero
 pub fn synthesize_ticks_from_minute_candles(
     candles: &[HistoricalCandle],
     received_at_nanos: i64,
@@ -255,12 +256,14 @@ where
 
     /// Returns a cloneable handle to the worker's stats counter. Callers
     /// can snapshot this for metrics or tests.
+    // TEST-EXEMPT: trivial Arc clone getter, exercised by test_backfill_worker_happy_path
     pub fn stats_handle(&self) -> std::sync::Arc<BackfillStats> {
         std::sync::Arc::clone(&self.stats)
     }
 
     /// Runs the worker loop. Consumes `self`. Returns when the gap
     /// receiver is closed (pipeline shutdown).
+    // TEST-EXEMPT: covered by test_backfill_worker_happy_path, test_backfill_worker_handles_empty_fetch, test_backfill_worker_handles_fetch_error, test_backfill_worker_aborts_on_tick_pipeline_closed
     pub async fn run(mut self) {
         while let Some(request) = self.gap_rx.recv().await {
             self.stats.events_received.fetch_add(1, Ordering::AcqRel);
