@@ -1863,6 +1863,7 @@ mod market_hours_tests {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::assertions_on_constants)] // APPROVED: S4 — schema-stability tests intentionally assert on compile-time constants as a regression guard against silent protocol-value drift. Converting to `const { assert!(..) }` blocks compiles away the check message which defeats the guard purpose.
 mod tests {
     use super::*;
 

@@ -13,6 +13,9 @@
 //! pre-push gate explicitly targets `dhan_locked_facts::*`. Do not remove
 //! the file from the pre-push scan; do not mark tests `#[ignore]`; do not
 //! weaken any assertion without the three steps above.
+
+#![allow(clippy::assertions_on_constants)]
+// APPROVED: S4 — locked-facts assertions intentionally compare compile-time constants against Dhan ground truth; const-block conversion would make the failure message unusable
 //!
 //! Purpose: guarantee + assurance + proof that we don't lose these facts.
 

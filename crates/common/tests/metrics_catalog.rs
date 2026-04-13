@@ -45,11 +45,11 @@ fn walk_and_concat(dir: &Path, out: &mut String) {
         let path = entry.path();
         if path.is_dir() {
             walk_and_concat(&path, out);
-        } else if path.extension().is_some_and(|e| e == "rs") {
-            if let Ok(content) = std::fs::read_to_string(&path) {
-                out.push_str(&content);
-                out.push('\n');
-            }
+        } else if path.extension().is_some_and(|e| e == "rs")
+            && let Ok(content) = std::fs::read_to_string(&path)
+        {
+            out.push_str(&content);
+            out.push('\n');
         }
     }
 }
