@@ -53,8 +53,13 @@ fi
 echo "  Verifying active plan: $PLAN_FILE" >&2
 
 # Check 1: Count unchecked items
-UNCHECKED=$(grep -c '^\- \[ \]' "$PLAN_FILE" 2>/dev/null || echo 0)
-CHECKED=$(grep -c '^\- \[x\]' "$PLAN_FILE" 2>/dev/null || echo 0)
+# Note: `grep -c` prints "0" AND exits non-zero on zero matches under set -o pipefail,
+# which made `|| echo 0` append a second "0" → "0\n0" → arithmetic failure.
+# Use `|| true` to swallow the exit code without doubling the output.
+UNCHECKED=$(grep -c '^\- \[ \]' "$PLAN_FILE" 2>/dev/null || true)
+CHECKED=$(grep -c '^\- \[x\]' "$PLAN_FILE" 2>/dev/null || true)
+UNCHECKED=${UNCHECKED:-0}
+CHECKED=${CHECKED:-0}
 TOTAL=$((UNCHECKED + CHECKED))
 
 if [ "$UNCHECKED" -gt 0 ]; then

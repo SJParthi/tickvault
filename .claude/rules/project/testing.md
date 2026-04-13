@@ -7,6 +7,12 @@ paths:
 
 # Testing Rules
 
+> **Scope default:** `.claude/rules/project/testing-scope.md` — the 22-test
+> standard runs **only** for crates touched in the current diff. Workspace-wide
+> execution happens on `/full-qa`, `FULL_QA=1`, or post-merge CI. This saves
+> tokens and session time while preserving every rule in this file for the
+> changed crate(s).
+
 ## Before Every Commit
 1. `cargo fmt` — format all code
 2. `cargo clippy -- -D warnings` — zero warnings

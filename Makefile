@@ -10,7 +10,7 @@
         health status open grafana questdb jaeger prometheus traefik alloy loki \
         obs obs-verify obs-restart obs-open \
         logs app-pid \
-        audit coverage bench geiger typos quality doc bootstrap \
+        audit coverage bench geiger typos quality doc bootstrap scoped-check full-qa \
 
 # ---- Configuration ----
 APP_NAME       := dhan-live-trader
@@ -94,6 +94,12 @@ test: ## Run all tests
 	cargo test
 	@echo ""
 	@echo "  ✅ All tests passed"
+
+scoped-check: ## Run tests ONLY for crates touched by current diff (see .claude/rules/project/testing-scope.md)
+	@bash .claude/hooks/scoped-test-runner.sh
+
+full-qa: ## Force full workspace tests (overrides scoped-check)
+	@FULL_QA=1 bash .claude/hooks/scoped-test-runner.sh
 
 check: fmt clippy test ## Full quality check (fmt + clippy + test)
 	@echo ""
