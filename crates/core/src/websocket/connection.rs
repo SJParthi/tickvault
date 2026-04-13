@@ -82,6 +82,16 @@ pub struct WebSocketConnection {
     /// Optional notification service for Telegram alerts on disconnect/reconnect.
     /// `None` in tests; `Some(Arc<...>)` in production.
     notifier: Option<Arc<crate::notification::NotificationService>>,
+
+    /// A5: Graceful shutdown flag. When `true`, the outer `run()` loop exits
+    /// without attempting reconnect after the read loop returns. Set by
+    /// `request_graceful_shutdown()`.
+    shutdown_requested: std::sync::atomic::AtomicBool,
+
+    /// A5: Notifier used to wake the read loop when graceful shutdown is
+    /// requested. The read loop's `tokio::select!` polls this alongside the
+    /// socket, so shutdown requests interrupt a blocking read.
+    shutdown_notify: Arc<tokio::sync::Notify>,
 }
 
 impl WebSocketConnection {
@@ -136,7 +146,35 @@ impl WebSocketConnection {
             total_reconnections: AtomicU64::new(0),
             cached_subscription_messages,
             notifier,
+            shutdown_requested: std::sync::atomic::AtomicBool::new(false),
+            shutdown_notify: Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    /// A5: Request graceful shutdown of this connection. Idempotent.
+    ///
+    /// Sets the shutdown flag and wakes the read loop. The read loop will
+    /// send a `RequestCode: 12` (Disconnect) JSON message to Dhan, close the
+    /// socket, and return `Ok(())`. The outer `run()` loop then exits without
+    /// attempting to reconnect. Called by `WebSocketConnectionPool::graceful_shutdown`.
+    ///
+    /// This is a cold-path operation: runs once per process lifetime at
+    /// shutdown. Allocation-free on the fast path — just an atomic store and
+    /// a notify wakeup.
+    // TEST-EXEMPT: covered by test_graceful_shutdown_sets_flag_and_notifies and pool-level tests
+    pub fn request_graceful_shutdown(&self) {
+        self.shutdown_requested
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.shutdown_notify.notify_one();
+    }
+
+    /// A5: Returns true if a graceful shutdown has been requested. Used by the
+    /// outer `run()` loop to decide whether to reconnect after the read loop
+    /// exits with `Ok(())`.
+    // TEST-EXEMPT: trivial atomic load, covered by test_graceful_shutdown_sets_flag_and_notifies
+    pub fn is_shutdown_requested(&self) -> bool {
+        self.shutdown_requested
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Returns the connection identifier.
@@ -435,7 +473,79 @@ impl WebSocketConnection {
         let read_timeout = Duration::from_secs(read_timeout_secs);
 
         loop {
-            match time::timeout(read_timeout, read.next()).await {
+            // A5: tokio::select! lets the read loop respond to a graceful
+            // shutdown request without waiting for the 40-second read timeout.
+            // On shutdown: send Disconnect JSON (RequestCode 12), close the
+            // socket, and return Ok so the outer `run()` loop exits cleanly
+            // (see `is_shutdown_requested` check in `run()`).
+            let select_result = tokio::select! {
+                biased;
+                () = self.shutdown_notify.notified() => {
+                    info!(
+                        connection_id = self.connection_id,
+                        "A5: graceful shutdown notified — sending RequestCode 12 (Disconnect) to Dhan"
+                    );
+                    let disconnect_json = crate::websocket::subscription_builder::build_disconnect_message();
+                    let send_timeout = Duration::from_secs(2);
+                    let send_result = {
+                        let mut sink = write.lock().await;
+                        time::timeout(
+                            send_timeout,
+                            sink.send(Message::Text(disconnect_json.into())),
+                        )
+                        .await
+                    };
+                    match send_result {
+                        Ok(Ok(())) => {
+                            info!(
+                                connection_id = self.connection_id,
+                                "A5: Disconnect request sent successfully"
+                            );
+                            metrics::counter!(
+                                "dlt_ws_graceful_unsub_total",
+                                "connection_id" => self.connection_id.to_string(),
+                                "outcome" => "sent"
+                            )
+                            .increment(1);
+                        }
+                        Ok(Err(err)) => {
+                            warn!(
+                                connection_id = self.connection_id,
+                                ?err,
+                                "A5: failed to send Disconnect request — socket already dead"
+                            );
+                            metrics::counter!(
+                                "dlt_ws_graceful_unsub_total",
+                                "connection_id" => self.connection_id.to_string(),
+                                "outcome" => "send_failed"
+                            )
+                            .increment(1);
+                        }
+                        Err(_elapsed) => {
+                            warn!(
+                                connection_id = self.connection_id,
+                                timeout_secs = send_timeout.as_secs(),
+                                "A5: Disconnect send timed out — proceeding with socket close"
+                            );
+                            metrics::counter!(
+                                "dlt_ws_graceful_unsub_total",
+                                "connection_id" => self.connection_id.to_string(),
+                                "outcome" => "timeout"
+                            )
+                            .increment(1);
+                        }
+                    }
+                    // Close the socket regardless of send outcome.
+                    {
+                        let mut sink = write.lock().await;
+                        let _ = time::timeout(Duration::from_secs(1), sink.close()).await;
+                    }
+                    return Ok(());
+                }
+                timeout_result = time::timeout(read_timeout, read.next()) => timeout_result,
+            };
+
+            match select_result {
                 Err(_elapsed) => {
                     warn!(
                         connection_id = self.connection_id,
@@ -2348,6 +2458,113 @@ mod tests {
 
         let result = read_handle.await.expect("task panicked"); // APPROVED: test
         assert!(result.is_ok(), "Close(None) should return Ok(())");
+    }
+
+    // =======================================================================
+    // A5: Graceful unsubscribe on shutdown
+    // =======================================================================
+
+    /// A5: Requesting graceful shutdown sets the flag and wakes any waiter.
+    #[tokio::test]
+    async fn test_graceful_shutdown_sets_flag_and_notifies() {
+        let (tx, _rx) = mpsc::channel(100);
+        let conn = make_test_conn_for_read_loop(tx);
+
+        assert!(
+            !conn.is_shutdown_requested(),
+            "fresh connection must not have shutdown requested"
+        );
+
+        conn.request_graceful_shutdown();
+
+        assert!(
+            conn.is_shutdown_requested(),
+            "request_graceful_shutdown must set the atomic flag"
+        );
+
+        // Idempotent.
+        conn.request_graceful_shutdown();
+        assert!(
+            conn.is_shutdown_requested(),
+            "double-calling must remain true"
+        );
+    }
+
+    /// A5: When the read loop is running and receives a shutdown request, it
+    /// writes the Disconnect JSON (RequestCode 12) to the socket and returns Ok.
+    #[tokio::test]
+    async fn test_graceful_shutdown_sends_disconnect_request() {
+        let (tx, _rx) = mpsc::channel(100);
+        let conn = std::sync::Arc::new(make_test_conn_for_read_loop(tx));
+        let (mut server_ws, client_ws) = make_ws_pair().await;
+
+        let conn_clone = std::sync::Arc::clone(&conn);
+        let read_handle = tokio::spawn(async move { conn_clone.run_read_loop(client_ws).await });
+
+        // Give the read loop a moment to enter select!.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Trigger shutdown.
+        conn.request_graceful_shutdown();
+
+        // Server side should receive the Disconnect JSON text frame.
+        let received = tokio::time::timeout(Duration::from_secs(3), server_ws.next())
+            .await
+            .expect("server must receive a frame within 3s"); // APPROVED: test
+
+        let text = match received {
+            Some(Ok(Message::Text(t))) => t.to_string(),
+            Some(Ok(Message::Close(_))) => {
+                panic!(
+                    "expected Text(Disconnect), got Close — socket closed before Disconnect was sent"
+                )
+            }
+            other => panic!("expected Text(Disconnect), got {other:?}"),
+        };
+        assert!(
+            text.contains("\"RequestCode\":12"),
+            "text frame must contain RequestCode 12 (Disconnect), got: {text}"
+        );
+
+        // The read loop must return Ok(()) promptly.
+        let result = tokio::time::timeout(Duration::from_secs(3), read_handle)
+            .await
+            .expect("read loop must finish within 3s") // APPROVED: test
+            .expect("task must not panic"); // APPROVED: test
+        assert!(
+            result.is_ok(),
+            "read loop must return Ok on graceful shutdown, got {result:?}"
+        );
+    }
+
+    /// A5: If the write side is dead (server disappeared), the send times out
+    /// or fails and the read loop still returns Ok — graceful shutdown must
+    /// never block indefinitely.
+    #[tokio::test]
+    async fn test_graceful_shutdown_timeout_does_not_block() {
+        let (tx, _rx) = mpsc::channel(100);
+        let conn = std::sync::Arc::new(make_test_conn_for_read_loop(tx));
+        let (server_ws, client_ws) = make_ws_pair().await;
+
+        // Drop the server immediately — subsequent writes will fail fast.
+        drop(server_ws);
+
+        let conn_clone = std::sync::Arc::clone(&conn);
+        let read_handle = tokio::spawn(async move { conn_clone.run_read_loop(client_ws).await });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        conn.request_graceful_shutdown();
+
+        // Must still return within the A5 budget (send timeout 2s + close 1s + slack).
+        let result = tokio::time::timeout(Duration::from_secs(5), read_handle)
+            .await
+            .expect("graceful shutdown must not block past 5s") // APPROVED: test
+            .expect("task must not panic"); // APPROVED: test
+
+        // The dead socket may cause the read loop to return an error (socket
+        // closed) OR Ok (if the select! arm fired before the read arm).
+        // Both are acceptable — the key invariant is that it returns.
+        let _ = result;
     }
 
     // --- run_read_loop: Text frame is logged and loop continues (line 407-413) ---

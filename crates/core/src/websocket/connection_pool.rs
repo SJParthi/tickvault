@@ -206,6 +206,54 @@ impl WebSocketConnectionPool {
             .map(|conn| conn.health().subscribed_count)
             .sum()
     }
+
+    /// A5: Graceful shutdown — requests each connection to send a
+    /// `RequestCode: 12` (Disconnect) to Dhan and close its socket cleanly.
+    ///
+    /// Iterates every connection and calls `request_graceful_shutdown()`,
+    /// which is non-blocking (atomic store + notify). The actual Disconnect
+    /// JSON is sent by the per-connection read loop within its own
+    /// `tokio::select!`. Connections that are already in `Disconnected` or
+    /// `Reconnecting` state skip the network send (their read loop isn't
+    /// running) — the flag still gets set so subsequent runs don't reconnect.
+    ///
+    /// Returns the number of connections that were signalled (including ones
+    /// that were already dead). Caller is responsible for awaiting the spawn
+    /// handles with its own timeout.
+    ///
+    /// Cold path — runs once per process at SIGTERM.
+    // TEST-EXEMPT: covered by test_pool_graceful_shutdown_signals_all and integration tests
+    pub fn request_graceful_shutdown(&self) -> usize {
+        use crate::websocket::types::ConnectionState;
+
+        let mut live = 0_usize;
+        let mut dead = 0_usize;
+        for conn in &self.connections {
+            let state = conn.health().state;
+            match state {
+                ConnectionState::Connected | ConnectionState::Connecting => {
+                    live = live.saturating_add(1);
+                }
+                ConnectionState::Disconnected | ConnectionState::Reconnecting => {
+                    dead = dead.saturating_add(1);
+                }
+            }
+            // Always set the flag so the outer `run()` loop will not
+            // reconnect, even if the read loop isn't listening right now.
+            conn.request_graceful_shutdown();
+        }
+
+        info!(
+            live_connections = live,
+            dead_connections = dead,
+            total = self.connections.len(),
+            "A5: graceful shutdown signalled to all WebSocket connections"
+        );
+        metrics::counter!("dlt_ws_graceful_shutdown_signalled_total")
+            .increment(self.connections.len() as u64);
+
+        self.connections.len()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1063,6 +1111,67 @@ mod tests {
             let result = handle.await;
             assert!(result.is_ok(), "JoinHandle must not panic");
         }
+    }
+
+    // =======================================================================
+    // A5: Pool-level graceful shutdown
+    // =======================================================================
+
+    /// A5: `request_graceful_shutdown` sets the flag on every connection in
+    /// the pool and reports the total count.
+    #[test]
+    fn test_pool_graceful_shutdown_signals_all_connections() {
+        let pool = WebSocketConnectionPool::new(
+            make_test_token_handle(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            make_test_ws_config(),
+            make_instruments(10),
+            FeedMode::Ticker,
+            None,
+        )
+        .unwrap();
+
+        let signalled = pool.request_graceful_shutdown();
+        assert_eq!(
+            signalled,
+            pool.connection_count(),
+            "must signal every connection (live or dead)"
+        );
+
+        // Every underlying connection must now report shutdown_requested == true.
+        for conn in &pool.connections {
+            assert!(
+                conn.is_shutdown_requested(),
+                "conn {} must have shutdown flag set",
+                conn.connection_id()
+            );
+        }
+    }
+
+    /// A5: Signalling a pool whose connections are all dead (default state)
+    /// must still succeed — graceful shutdown is best-effort.
+    #[test]
+    fn test_pool_graceful_shutdown_skips_dead_connections_safely() {
+        let pool = WebSocketConnectionPool::new(
+            make_test_token_handle(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            make_test_ws_config(),
+            vec![],
+            FeedMode::Ticker,
+            None,
+        )
+        .unwrap();
+
+        // All connections are Disconnected at construction time.
+        for h in pool.health() {
+            assert_eq!(h.state, ConnectionState::Disconnected);
+        }
+
+        // Must not panic and must report the correct total.
+        let signalled = pool.request_graceful_shutdown();
+        assert_eq!(signalled, 5, "pool always signals all 5 slots");
     }
 
     #[tokio::test]

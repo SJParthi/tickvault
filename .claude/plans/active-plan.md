@@ -34,9 +34,9 @@ auto-track, auto-monitor, auto-debug, auto-log, auto-capture, auto-resolve, auto
   - Files: crates/storage/src/tick_persistence.rs (spill_dir field, setter, 4 call sites), crates/storage/tests/tick_resilience.rs (per-test dir override)
   - Tests: test_custom_spill_dir_used_for_spill ✅, test_custom_spill_dir_used_for_dlq ✅, tick_resilience full suite 12/12 ✅
 
-- [ ] A5. **Graceful unsubscribe on shutdown.** On SIGTERM, WebSocket pool sends `FeedRequestCode::Disconnect` (12) to each connection before closing the socket. Best-effort, 2-second timeout per connection. Already-dead connections are skipped.
-  - Files: connection.rs, connection_pool.rs
-  - Tests: test_graceful_unsubscribe_sends_disconnect_request, test_graceful_unsub_timeout_does_not_block, test_graceful_unsub_skips_dead_connections
+- [x] A5. **Graceful unsubscribe on shutdown.** Added `shutdown_requested: AtomicBool` + `shutdown_notify: Arc<Notify>` to `WebSocketConnection`. The `run_read_loop` now uses `tokio::select!` with a biased shutdown arm that sends `{"RequestCode":12}` as a Text frame, waits 2s max for ack, then closes the socket. Pool exposes `request_graceful_shutdown()` that signals all connections and logs live/dead split. Metrics: `dlt_ws_graceful_unsub_total{outcome=sent|send_failed|timeout}`, `dlt_ws_graceful_shutdown_signalled_total`.
+  - Files: crates/core/src/websocket/connection.rs (fields, getter, read-loop select!), crates/core/src/websocket/connection_pool.rs (pool-level wrapper)
+  - Tests: test_graceful_shutdown_sets_flag_and_notifies ✅, test_graceful_shutdown_sends_disconnect_request ✅, test_graceful_shutdown_timeout_does_not_block ✅, test_pool_graceful_shutdown_signals_all_connections ✅, test_pool_graceful_shutdown_skips_dead_connections_safely ✅
 
 - [ ] A4. **Pool-level circuit breaker.** When ALL WS connections are in `Reconnecting` state simultaneously for more than 60 seconds, emit CRITICAL Telegram and set `pool_health = Degraded`. If still all-down at 300 seconds, return a fatal error (supervisor restarts the process). New Prometheus gauge `dlt_pool_degraded_seconds_total`.
   - Files: connection_pool.rs, connection.rs (state hook)
