@@ -268,6 +268,9 @@ impl OrderManagementSystem {
             const SANDBOX_DEADLINE_EPOCH_SECS: i64 = 1_782_864_000;
             let now_secs = chrono::Utc::now().timestamp();
             if now_secs < SANDBOX_DEADLINE_EPOCH_SECS {
+                // Session 8 C4: count every block so Grafana can alert on
+                // unexpected live-mode attempts during the sandbox window.
+                metrics::counter!("tv_sandbox_gate_blocks_total").increment(1);
                 error!("SANDBOX ENFORCEMENT: live orders blocked until 2026-07-01");
                 return Err(OmsError::SandboxEnforcement);
             }
