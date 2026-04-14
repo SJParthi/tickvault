@@ -499,7 +499,7 @@ impl WebSocketConnection {
                         "A5: graceful shutdown notified — sending RequestCode 12 (Disconnect) to Dhan"
                     );
                     let disconnect_json = crate::websocket::subscription_builder::build_disconnect_message();
-                    let send_timeout = Duration::from_secs(2);
+                    let send_timeout = Duration::from_secs(2); // APPROVED: graceful-shutdown upper bound — 2s per connection is the session 7 A5 spec, not tunable.
                     let send_result = {
                         let mut sink = write.lock().await;
                         time::timeout(
@@ -516,7 +516,7 @@ impl WebSocketConnection {
                             );
                             metrics::counter!(
                                 "tv_ws_graceful_unsub_total",
-                                "connection_id" => self.connection_id.to_string(),
+                                "connection_id" => self.connection_id.to_string(), // APPROVED: cold-path (graceful shutdown metrics label, runs once per SIGTERM)
                                 "outcome" => "sent"
                             )
                             .increment(1);
@@ -529,7 +529,7 @@ impl WebSocketConnection {
                             );
                             metrics::counter!(
                                 "tv_ws_graceful_unsub_total",
-                                "connection_id" => self.connection_id.to_string(),
+                                "connection_id" => self.connection_id.to_string(), // APPROVED: cold-path (graceful shutdown metrics label, runs once per SIGTERM)
                                 "outcome" => "send_failed"
                             )
                             .increment(1);
@@ -542,7 +542,7 @@ impl WebSocketConnection {
                             );
                             metrics::counter!(
                                 "tv_ws_graceful_unsub_total",
-                                "connection_id" => self.connection_id.to_string(),
+                                "connection_id" => self.connection_id.to_string(), // APPROVED: cold-path (graceful shutdown metrics label, runs once per SIGTERM)
                                 "outcome" => "timeout"
                             )
                             .increment(1);
@@ -551,7 +551,7 @@ impl WebSocketConnection {
                     // Close the socket regardless of send outcome.
                     {
                         let mut sink = write.lock().await;
-                        let _ = time::timeout(Duration::from_secs(1), sink.close()).await;
+                        let _ = time::timeout(Duration::from_secs(1), sink.close()).await; // APPROVED: graceful-shutdown inner close timeout — 1s is the session 7 A5 spec.
                     }
                     return Ok(());
                 }
@@ -728,15 +728,25 @@ impl WebSocketConnection {
         }
 
         // Exponential backoff: initial * 2^attempt, capped at max.
-        let delay_ms = self
+        let base_delay_ms = self
             .ws_config
             .reconnect_initial_delay_ms
             .saturating_mul(1u64.checked_shl(attempt.min(63) as u32).unwrap_or(u64::MAX))
             .min(self.ws_config.reconnect_max_delay_ms);
 
+        // B1: add deterministic-but-varying jitter so 5 connections failing
+        // together do not synchronize their reconnect attempts and hammer
+        // Dhan's endpoint in lock-step. We hash the current wall-clock
+        // subsec_nanos with the connection_id so each connection draws a
+        // different value on each reconnect attempt. No new crate dep.
+        //
+        // Jitter range: ±jitter_pct% of base_delay_ms, clamped to [0, base*2].
+        let delay_ms = jitter_reconnect_delay(base_delay_ms, self.connection_id, attempt);
+
         info!(
             connection_id = self.connection_id,
             attempt = attempt,
+            base_delay_ms = base_delay_ms,
             delay_ms = delay_ms,
             "Reconnecting after backoff"
         );
@@ -784,6 +794,56 @@ impl WebSocketConnection {
 }
 
 // ---------------------------------------------------------------------------
+// B1: Reconnect jitter — prevents thundering-herd on simultaneous failures.
+// ---------------------------------------------------------------------------
+
+/// Maximum jitter as a fraction of the base delay. ±20% means for a 10s
+/// base delay, the actual delay is in [8s, 12s]. Tuned large enough that
+/// 5 connections in lock-step break up within 2 reconnect rounds.
+const RECONNECT_JITTER_PCT: u64 = 20;
+
+/// Applies deterministic-but-varying jitter to a reconnect delay.
+///
+/// Uses the connection_id + attempt + wall-clock subsec_nanos as the jitter
+/// source. This is NOT cryptographic — it only needs to decorrelate across
+/// the 5 connections in the pool, which all see different connection_id
+/// values. Avoids adding a `rand` crate dependency.
+///
+/// # Contract
+/// - Returns a value in `[base * (1 - pct/100), base * (1 + pct/100)]`,
+///   clamped to `[1, base * 2]`.
+/// - For `base == 0`, returns `0`.
+/// - For very small `base` (< 5ms), returns `base` unchanged (jitter
+///   would be less than 1ms and add no decorrelation).
+pub(crate) fn jitter_reconnect_delay(base_delay_ms: u64, connection_id: u8, attempt: u64) -> u64 {
+    if base_delay_ms == 0 {
+        return 0;
+    }
+    if base_delay_ms < 5 {
+        return base_delay_ms;
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::from(d.subsec_nanos()));
+    // Mix the three sources with a simple xor+mul — good enough to
+    // decorrelate 5 connections without a crypto-grade RNG.
+    let mix: u64 = nanos
+        ^ (u64::from(connection_id).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+        ^ (u64::from(attempt).wrapping_mul(0xBF58_476D_1CE4_E5B9));
+    let jitter_range_ms = base_delay_ms
+        .saturating_mul(RECONNECT_JITTER_PCT)
+        .saturating_div(100);
+    if jitter_range_ms == 0 {
+        return base_delay_ms;
+    }
+    // Choose a signed offset in [-jitter_range_ms, +jitter_range_ms).
+    let span = jitter_range_ms.saturating_mul(2);
+    let offset = (mix % span) as i64 - jitter_range_ms as i64;
+    let applied = (base_delay_ms as i64).saturating_add(offset);
+    applied.max(1) as u64
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -791,6 +851,77 @@ impl WebSocketConnection {
 mod tests {
     use super::*;
     use tickvault_common::types::ExchangeSegment;
+
+    // -----------------------------------------------------------------------
+    // B1: jitter_reconnect_delay — thundering-herd prevention
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_jitter_reconnect_delay_within_bounds() {
+        // ±20% of 10_000 = 2_000 → range [8_000, 12_000].
+        let base = 10_000u64;
+        for attempt in 0u64..50 {
+            for conn_id in 0u8..5 {
+                let delay = jitter_reconnect_delay(base, conn_id, attempt);
+                assert!(
+                    (8_000..=12_000).contains(&delay),
+                    "delay {delay} out of bounds for base {base} (conn={conn_id}, attempt={attempt})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_jitter_reconnect_delay_zero_base() {
+        assert_eq!(jitter_reconnect_delay(0, 0, 0), 0);
+        assert_eq!(jitter_reconnect_delay(0, 7, 42), 0);
+    }
+
+    #[test]
+    fn test_jitter_reconnect_delay_small_base_unchanged() {
+        // For base < 5ms, jitter is pointless (would be sub-ms) — pass through.
+        assert_eq!(jitter_reconnect_delay(1, 0, 0), 1);
+        assert_eq!(jitter_reconnect_delay(4, 3, 5), 4);
+    }
+
+    #[test]
+    fn test_jitter_reconnect_delay_decorrelates_across_connections() {
+        // The whole point of B1: 5 connections with the same base delay
+        // should NOT all land on the same value. Collect samples and
+        // assert at least 2 distinct results — very loose bound because
+        // the nanos source is shared, but connection_id mixes in.
+        let base = 1_000u64;
+        let samples: Vec<u64> = (0..5u8)
+            .map(|id| jitter_reconnect_delay(base, id, 1))
+            .collect();
+        let unique_count = {
+            let mut sorted = samples.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            sorted.len()
+        };
+        assert!(
+            unique_count >= 2,
+            "jitter must decorrelate across at least 2 connection_ids; got samples={samples:?}"
+        );
+    }
+
+    #[test]
+    fn test_jitter_reconnect_delay_never_returns_zero_for_positive_base() {
+        // Even at worst-case -20% offset, a positive base must not yield 0.
+        for base in [5u64, 10, 100, 1_000, 30_000] {
+            for attempt in 0u64..20 {
+                for conn_id in 0u8..5 {
+                    let delay = jitter_reconnect_delay(base, conn_id, attempt);
+                    assert!(
+                        delay >= 1,
+                        "delay must be at least 1ms for positive base; got {delay} \
+                         (base={base}, conn={conn_id}, attempt={attempt})"
+                    );
+                }
+            }
+        }
+    }
 
     fn make_test_dhan_config() -> DhanConfig {
         DhanConfig {

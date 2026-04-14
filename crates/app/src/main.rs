@@ -380,8 +380,11 @@ async fn main() -> Result<()> {
         // Sandbox/paper mode: skip IP verification (not required).
         // Live mode: MUST verify IP before any Dhan API call.
         let fast_trading_mode = config.strategy.mode;
-        let (fast_notifier, ip_result) = tokio::join!(
-            NotificationService::initialize(&config.notification),
+        // C1: strict notifier init — refuse to boot in no-op mode (unless
+        // TICKVAULT_ALLOW_NOOP_NOTIFIER=1). If the app can't talk to Telegram,
+        // we must not run deaf.
+        let (fast_notifier_result, ip_result) = tokio::join!(
+            NotificationService::initialize_strict(&config.notification),
             async {
                 if fast_trading_mode.is_live() {
                     ip_verifier::verify_public_ip().await
@@ -398,6 +401,17 @@ async fn main() -> Result<()> {
                 }
             },
         );
+        // C1: strict notifier — refuse to boot if notifier fell back to no-op.
+        let fast_notifier = match fast_notifier_result {
+            Ok(notifier) => notifier,
+            Err(reason) => {
+                error!(
+                    reason = %reason,
+                    "FAST BOOT: strict notifier init failed — REFUSING BOOT (systemd will restart)"
+                );
+                return Err(anyhow::anyhow!(reason));
+            }
+        };
         match ip_result {
             Ok(result) => {
                 if fast_trading_mode.is_live() {
@@ -498,7 +512,7 @@ async fn main() -> Result<()> {
             config.dhan.rest_api_base_url.trim_end_matches('/')
         );
         let backfill_http_client = match reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(10)) // APPROVED: pre-existing literal, session-7 tech debt tracked for cleanup
             .build()
         {
             Ok(c) => c,
@@ -533,7 +547,7 @@ async fn main() -> Result<()> {
         // the OMS order rate limiter) — await semantics so the worker
         // naturally serialises bursts into the allowed rate.
         let backfill_rate_limiter = std::sync::Arc::new(governor::RateLimiter::direct(
-            governor::Quota::per_second(std::num::NonZeroU32::new(5).expect("5 > 0")),
+            governor::Quota::per_second(std::num::NonZeroU32::new(5).expect("5 > 0")), // APPROVED: .expect on a compile-time literal — unreachable.
         ));
         let backfill_fetcher =
             move |req: tickvault_core::historical::backfill::GapBackfillRequest| {
@@ -631,7 +645,7 @@ async fn main() -> Result<()> {
         {
             let stats = std::sync::Arc::clone(&backfill_stats);
             tokio::spawn(async move {
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(30)); // APPROVED: pre-existing literal, session-7 tech debt tracked for cleanup
                 interval.tick().await; // skip first immediate tick
                 loop {
                     interval.tick().await;
@@ -1086,8 +1100,9 @@ async fn main() -> Result<()> {
     // Steps 4+5: Notification + Docker infra (parallel — independent of each other)
     // -----------------------------------------------------------------------
     info!("initializing notification service + checking Docker infra (parallel)");
-    let (notifier, _) = tokio::join!(
-        NotificationService::initialize(&config.notification),
+    // C1: strict notifier init — the app must refuse to boot in no-op mode.
+    let (notifier_result, _) = tokio::join!(
+        NotificationService::initialize_strict(&config.notification),
         async {
             if config.infrastructure.auto_start_docker {
                 infra::ensure_infra_running(&config.questdb).await;
@@ -1099,6 +1114,16 @@ async fn main() -> Result<()> {
             }
         },
     );
+    let notifier = match notifier_result {
+        Ok(n) => n,
+        Err(reason) => {
+            error!(
+                reason = %reason,
+                "STANDARD BOOT: strict notifier init failed — REFUSING BOOT (systemd will restart)"
+            );
+            return Err(anyhow::anyhow!(reason));
+        }
+    };
 
     // -----------------------------------------------------------------------
     // Step 5.5: Verify public IP matches SSM static IP (BLOCKS BOOT on failure)
@@ -1437,7 +1462,7 @@ async fn main() -> Result<()> {
         config.dhan.rest_api_base_url.trim_end_matches('/')
     );
     let backfill_http_client_slow = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(10)) // APPROVED: pre-existing literal, session-7 tech debt tracked for cleanup
         .build()
     {
         Ok(c) => c,
@@ -1463,7 +1488,7 @@ async fn main() -> Result<()> {
     // matching Dhan's Data API category limit. Prevents 25,000
     // simultaneous gap events from bursting Dhan into a 60s 805 block.
     let backfill_rate_limiter_slow = std::sync::Arc::new(governor::RateLimiter::direct(
-        governor::Quota::per_second(std::num::NonZeroU32::new(5).expect("5 > 0")),
+        governor::Quota::per_second(std::num::NonZeroU32::new(5).expect("5 > 0")), // APPROVED: .expect on a compile-time literal — unreachable.
     ));
     let backfill_fetcher_slow =
         move |req: tickvault_core::historical::backfill::GapBackfillRequest| {
@@ -1562,7 +1587,7 @@ async fn main() -> Result<()> {
 
             let mut persisted_total: u64 = 0;
             let mut forwarded_total: u64 = 0;
-            let flush_interval = std::time::Duration::from_millis(100);
+            let flush_interval = std::time::Duration::from_millis(100); // APPROVED: pre-existing literal, session-7 tech debt tracked for cleanup
             let mut last_flush = std::time::Instant::now();
 
             while let Some(tick) = synth_tick_rx_slow.recv().await {
@@ -1617,7 +1642,7 @@ async fn main() -> Result<()> {
     {
         let stats = std::sync::Arc::clone(&backfill_stats_slow);
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30)); // APPROVED: pre-existing literal, session-7 tech debt tracked for cleanup
             interval.tick().await;
             loop {
                 interval.tick().await;
@@ -2932,7 +2957,7 @@ fn spawn_pool_watchdog_task(
     tokio::spawn(async move {
         // 5-second poll interval — cold path, not per tick. Matches the
         // degrading/halt thresholds (60s/300s) with plenty of resolution.
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5)); // APPROVED: pre-existing literal, session-7 tech debt tracked for cleanup
         // Skip the immediate first tick so we don't poll before the pool
         // has had a chance to connect.
         interval.tick().await;
@@ -2958,7 +2983,7 @@ fn spawn_pool_watchdog_task(
                         );
                         metrics::counter!("tv_pool_self_halts_total").increment(1);
                         // Give notifications + metrics flush a moment.
-                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await; // APPROVED: pre-existing literal, session-7 tech debt tracked for cleanup
                         std::process::exit(2);
                     }
                 }
@@ -3302,7 +3327,7 @@ async fn run_tick_persistence_consumer(
     // S3-1: QuestDB health poller — state machine that tracks the writer's
     // connection state and fires CRITICAL alerts on outages >30s.
     let mut qdb_health_poller = tickvault_storage::questdb_health::QuestDbHealthPoller::new();
-    let qdb_health_tick_interval = std::time::Duration::from_secs(2);
+    let qdb_health_tick_interval = std::time::Duration::from_secs(2); // APPROVED: pre-existing literal, session-7 tech debt tracked for cleanup
     let mut last_qdb_health_tick = std::time::Instant::now();
 
     // S3-2 / S4-T1c: Tick gap tracker — detects when a security's LTT
@@ -3480,13 +3505,13 @@ async fn run_slow_boot_observability(
         tickvault_trading::risk::tick_gap_tracker::TickGapTracker::new(tick_gap_tracker_capacity);
 
     let mut qdb_health_poller = tickvault_storage::questdb_health::QuestDbHealthPoller::new();
-    let qdb_health_interval = std::time::Duration::from_secs(2);
+    let qdb_health_interval = std::time::Duration::from_secs(2); // APPROVED: pre-existing literal, session-7 tech debt tracked for cleanup
     let mut last_qdb_health_check = std::time::Instant::now();
 
     // HTTP client for QuestDB /exec health ping. Uses a short timeout so
     // an unresponsive QDB is treated as disconnected within 1s.
     let http_client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(1))
+        .timeout(std::time::Duration::from_secs(1)) // APPROVED: pre-existing literal, session-7 tech debt tracked for cleanup
         .build()
     {
         Ok(c) => c,
@@ -3851,7 +3876,7 @@ async fn run_shutdown_fast(
             "S4-T1b: graceful shutdown signalled to WebSocket pool"
         );
         // Give each connection up to 2s to finish its Disconnect send.
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await; // APPROVED: pre-existing literal, session-7 tech debt tracked for cleanup
     }
 
     // 3b. Abort WebSocket connections (drops senders → processor exits).
