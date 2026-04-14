@@ -232,6 +232,10 @@ make prometheus                      # localhost:9090
 
 ## TESTING STRATEGY
 
+**Block-scoped by default (S6-Step6).** When you edit code in crate X, you run tests for crate X. Workspace-wide testing (`/full-qa` or `FULL_QA=1`) is reserved for: (a) `crates/common/` changes, (b) explicit operator request, (c) post-merge CI. This is the canonical rule — see `.claude/rules/project/testing-scope.md` for the full algorithm.
+
+**Why scoped is the default:** the 22 test categories below apply to the changed crate. Re-running them on the entire workspace for every diff wastes 10-15 minutes per session and produces no additional signal. The CI pipeline runs the full battery on every PR, so nothing slips through.
+
 | Type | Tool | Where | Purpose |
 |------|------|-------|---------|
 | Unit | `#[test]` | Inline in src | Pure functions, error cases |
@@ -239,6 +243,7 @@ make prometheus                      # localhost:9090
 | Property | `proptest` | `crates/core/tests/` | Random input robustness |
 | Concurrency | `loom` | `crates/trading/tests/` | Data race detection |
 | Zero-alloc | `dhat` | `crates/*/tests/dhat_*.rs` | Hot-path allocation verification |
+| Chaos | integration | `crates/storage/tests/chaos_*.rs` | Worst-case failure-mode tick survival |
 | Fuzz | `cargo-fuzz` | `fuzz/` | Binary protocol crash testing |
 | Mutation | `cargo-mutants` | CI weekly | Test quality verification |
 | Sanitizers | ASan + TSan | CI weekly | Memory safety + data races |
@@ -249,6 +254,26 @@ make prometheus                      # localhost:9090
 #![cfg_attr(not(test), deny(clippy::expect_used))]
 #![deny(clippy::print_stdout, clippy::print_stderr, clippy::dbg_macro)]
 ```
+
+**Pre-push gates (12, all fast, ~35s total):**
+1. `cargo fmt --check`
+2. Banned pattern scan
+3. Secret scan
+4. Test count guard (ratchet — count can only increase)
+5. Data integrity guard (price precision, IST timestamp rules)
+6. Pub fn test guard (every new pub fn has matching #[test] or // TEST-EXEMPT:)
+7. Financial test guard (price/order fns have boundary tests)
+8. 22-test type check (scoped to changed crates)
+9. Dhan locked facts (8 invariants from support tickets)
+10. cargo audit + cargo deny (best-effort, blocks on CVE)
+11. **S6-G1 pub-fn wiring guard** — new pub fn must have a call site
+12. **S6-G3+G4 boot symmetry guard** — state machines must have a poller; both boot paths must be wired
+
+**Default scope rule (mechanical):**
+- Edit in `crates/<X>/` → run `cargo test -p dhan-live-trader-<X>`
+- Edit in `crates/common/` → escalate to `cargo test --workspace`
+- Edit in `.claude/hooks/` → run the hook's own self-test if it has one
+- Workspace-wide → only on `/full-qa`, `FULL_QA=1`, or post-merge CI
 
 ## CI/CD PIPELINE
 
