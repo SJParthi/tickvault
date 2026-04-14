@@ -18,8 +18,8 @@
 /// a manual `Debug` that prints `[REDACTED]` instead of the raw JWT.
 #[test]
 fn test_token_state_debug_redacts_access_token() {
-    use dhan_live_trader_core::auth::TokenState;
-    use dhan_live_trader_core::auth::types::DhanAuthResponseData;
+    use tickvault_core::auth::TokenState;
+    use tickvault_core::auth::types::DhanAuthResponseData;
 
     let response = DhanAuthResponseData {
         access_token: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.super-secret-payload.sig".to_string(),
@@ -61,8 +61,8 @@ fn test_token_state_debug_redacts_access_token() {
 /// and totp_secret — all three are sensitive SSM-sourced values.
 #[test]
 fn test_dhan_credentials_debug_redacts_all_fields() {
-    use dhan_live_trader_core::auth::DhanCredentials;
     use secrecy::SecretString;
+    use tickvault_core::auth::DhanCredentials;
 
     let creds = DhanCredentials {
         client_id: SecretString::from("1106656882".to_string()),
@@ -109,7 +109,7 @@ fn test_dhan_credentials_debug_redacts_all_fields() {
 /// while preserving non-sensitive fields like client ID.
 #[test]
 fn test_generate_token_response_debug_redacts_token() {
-    use dhan_live_trader_core::auth::types::DhanGenerateTokenResponse;
+    use tickvault_core::auth::types::DhanGenerateTokenResponse;
 
     let response = DhanGenerateTokenResponse {
         dhan_client_id: "1106656882".to_string(),
@@ -144,7 +144,7 @@ fn test_generate_token_response_debug_redacts_token() {
 /// while preserving token_type and expires_in.
 #[test]
 fn test_auth_response_data_debug_redacts_token() {
-    use dhan_live_trader_core::auth::types::DhanAuthResponseData;
+    use tickvault_core::auth::types::DhanAuthResponseData;
 
     let response = DhanAuthResponseData {
         access_token: "eyJ-real-jwt-token-value-here".to_string(),
@@ -184,8 +184,8 @@ fn test_auth_response_data_debug_redacts_token() {
 /// Verify that `QuestDbCredentials::Debug` redacts database credentials.
 #[test]
 fn test_questdb_credentials_debug_redacts() {
-    use dhan_live_trader_core::auth::QuestDbCredentials;
     use secrecy::SecretString;
+    use tickvault_core::auth::QuestDbCredentials;
 
     let creds = QuestDbCredentials {
         pg_user: SecretString::from("admin".to_string()),
@@ -215,8 +215,8 @@ fn test_questdb_credentials_debug_redacts() {
 /// Verify that `GrafanaCredentials::Debug` redacts admin_user and admin_password.
 #[test]
 fn test_grafana_credentials_debug_redacts() {
-    use dhan_live_trader_core::auth::GrafanaCredentials;
     use secrecy::SecretString;
+    use tickvault_core::auth::GrafanaCredentials;
 
     let creds = GrafanaCredentials {
         admin_user: SecretString::from("grafana-admin".to_string()),
@@ -246,8 +246,8 @@ fn test_grafana_credentials_debug_redacts() {
 /// Verify that `TelegramCredentials::Debug` redacts bot_token and chat_id.
 #[test]
 fn test_telegram_credentials_debug_redacts() {
-    use dhan_live_trader_core::auth::TelegramCredentials;
     use secrecy::SecretString;
+    use tickvault_core::auth::TelegramCredentials;
 
     let creds = TelegramCredentials {
         bot_token: SecretString::from("123456789:AABBccDDeeFFggHHiiJJkkLLmmNNooP".to_string()),
@@ -332,7 +332,7 @@ fn test_secret_string_alternate_debug_redacts() {
 /// output itself for awareness.
 #[test]
 fn test_token_never_in_error_display() {
-    use dhan_live_trader_common::error::ApplicationError;
+    use tickvault_common::error::ApplicationError;
 
     // Simulate a scenario where an auth error contains a URL with credentials
     // (this is exactly the real-world bug that was caught in production)
@@ -340,7 +340,7 @@ fn test_token_never_in_error_display() {
 
     // The sanitizer should be applied BEFORE constructing the error.
     // We test that the sanitizer works correctly for this pattern.
-    let sanitized = dhan_live_trader_common::sanitize::redact_url_params(raw_reason);
+    let sanitized = tickvault_common::sanitize::redact_url_params(raw_reason);
     let err = ApplicationError::AuthenticationFailed { reason: sanitized };
 
     let display_output = err.to_string();
@@ -370,10 +370,10 @@ fn test_token_never_in_error_display() {
 /// credential values when the sanitizer has been applied.
 #[test]
 fn test_token_never_in_error_debug() {
-    use dhan_live_trader_common::error::ApplicationError;
+    use tickvault_common::error::ApplicationError;
 
     let raw_reason = "request failed: https://auth.dhan.co/app/generateAccessToken?dhanClientId=SECRET_ID&pin=SECRET_PIN&totp=SECRET_TOTP";
-    let sanitized = dhan_live_trader_common::sanitize::redact_url_params(raw_reason);
+    let sanitized = tickvault_common::sanitize::redact_url_params(raw_reason);
     let err = ApplicationError::AuthenticationFailed { reason: sanitized };
 
     let debug_output = format!("{err:?}");
@@ -395,10 +395,10 @@ fn test_token_never_in_error_debug() {
 /// Verify that token renewal failure errors do not leak token values.
 #[test]
 fn test_token_renewal_error_does_not_leak_token() {
-    use dhan_live_trader_common::error::ApplicationError;
+    use tickvault_common::error::ApplicationError;
 
     let raw_reason = "renew failed at https://api.dhan.co/v2/RenewToken?token=eyJ-secret-jwt-here";
-    let sanitized = dhan_live_trader_common::sanitize::redact_url_params(raw_reason);
+    let sanitized = tickvault_common::sanitize::redact_url_params(raw_reason);
     let err = ApplicationError::TokenRenewalFailed {
         attempts: 3,
         reason: sanitized,
@@ -435,11 +435,11 @@ fn test_credential_types_are_not_display() {
         // but we verify Debug is the only formatting path used.
     }
 
-    assert_not_display::<dhan_live_trader_core::auth::DhanCredentials>();
-    assert_not_display::<dhan_live_trader_core::auth::QuestDbCredentials>();
-    assert_not_display::<dhan_live_trader_core::auth::GrafanaCredentials>();
-    assert_not_display::<dhan_live_trader_core::auth::TelegramCredentials>();
-    assert_not_display::<dhan_live_trader_core::auth::TokenState>();
+    assert_not_display::<tickvault_core::auth::DhanCredentials>();
+    assert_not_display::<tickvault_core::auth::QuestDbCredentials>();
+    assert_not_display::<tickvault_core::auth::GrafanaCredentials>();
+    assert_not_display::<tickvault_core::auth::TelegramCredentials>();
+    assert_not_display::<tickvault_core::auth::TokenState>();
 }
 
 // ---------------------------------------------------------------------------
@@ -449,7 +449,7 @@ fn test_credential_types_are_not_display() {
 /// Verify that an empty token value is still redacted (not shown as "").
 #[test]
 fn test_empty_token_debug_still_redacts() {
-    use dhan_live_trader_core::auth::types::DhanAuthResponseData;
+    use tickvault_core::auth::types::DhanAuthResponseData;
 
     let response = DhanAuthResponseData {
         access_token: String::new(),
@@ -474,7 +474,7 @@ fn test_empty_token_debug_still_redacts() {
 /// Verify that a very long token (1000+ chars) is still fully redacted.
 #[test]
 fn test_long_token_debug_fully_redacts() {
-    use dhan_live_trader_core::auth::types::DhanAuthResponseData;
+    use tickvault_core::auth::types::DhanAuthResponseData;
 
     let long_token = "eyJ".to_string() + &"A".repeat(1000) + ".payload.sig";
 

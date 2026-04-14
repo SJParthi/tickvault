@@ -17,8 +17,8 @@ use reqwest::Client;
 use tokio::fs;
 use tracing::{info, warn};
 
-use dhan_live_trader_common::constants::*;
-use dhan_live_trader_common::error::ApplicationError;
+use tickvault_common::constants::*;
+use tickvault_common::error::ApplicationError;
 
 /// Result of a successful CSV download.
 #[derive(Debug)]
@@ -266,7 +266,7 @@ mod tests {
     #[tokio::test]
     async fn test_write_and_read_cache() {
         let temp_dir = env::temp_dir().join(format!(
-            "dlt-test-csv-cache-{}-{:?}",
+            "tv-test-csv-cache-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
@@ -288,7 +288,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_cache_missing_file_returns_error() {
-        let path = PathBuf::from("/tmp/dlt-nonexistent-cache-12345/missing.csv");
+        let path = PathBuf::from("/tmp/tv-nonexistent-cache-12345/missing.csv");
         let result = read_cache(&path).await;
         assert!(result.is_err());
     }
@@ -296,7 +296,7 @@ mod tests {
     #[tokio::test]
     async fn test_read_cache_too_small_returns_error() {
         let temp_dir = env::temp_dir().join(format!(
-            "dlt-test-csv-small-{}-{:?}",
+            "tv-test-csv-small-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
@@ -321,7 +321,7 @@ mod tests {
         let result = download_instrument_csv(
             "http://127.0.0.1:1/nonexistent-primary",
             "http://127.0.0.1:1/nonexistent-fallback",
-            "/tmp/dlt-nonexistent-cache-99999",
+            "/tmp/tv-nonexistent-cache-99999",
             "missing.csv",
             2,
         )
@@ -339,7 +339,7 @@ mod tests {
     #[tokio::test]
     async fn test_load_cached_csv_success() {
         let temp_dir = env::temp_dir().join(format!(
-            "dlt-test-load-cached-{}-{:?}",
+            "tv-test-load-cached-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
@@ -360,14 +360,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_cached_csv_missing_returns_error() {
-        let result = load_cached_csv("/tmp/dlt-nonexistent-cache-77777", "nonexistent.csv").await;
+        let result = load_cached_csv("/tmp/tv-nonexistent-cache-77777", "nonexistent.csv").await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
     async fn test_download_falls_back_to_cache() {
         let temp_dir = env::temp_dir().join(format!(
-            "dlt-test-fallback-cache-{}-{:?}",
+            "tv-test-fallback-cache-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
@@ -444,7 +444,7 @@ mod tests {
         let url = spawn_test_http_server(200, &fake_csv).await;
 
         let temp_dir = env::temp_dir().join(format!(
-            "dlt-test-dl-primary-ok-{}-{:?}",
+            "tv-test-dl-primary-ok-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
@@ -477,7 +477,7 @@ mod tests {
         let fallback_url = spawn_test_http_server(200, &fake_csv).await;
 
         let temp_dir = env::temp_dir().join(format!(
-            "dlt-test-dl-fallback-ok-{}-{:?}",
+            "tv-test-dl-fallback-ok-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
@@ -551,7 +551,7 @@ mod tests {
     #[tokio::test]
     async fn test_write_cache_creates_directory_if_missing() {
         let temp_dir = env::temp_dir().join(format!(
-            "dlt-test-write-cache-mkdir-{}-{:?}",
+            "tv-test-write-cache-mkdir-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
@@ -574,7 +574,7 @@ mod tests {
     #[tokio::test]
     async fn test_write_cache_overwrite_existing() {
         let temp_dir = env::temp_dir().join(format!(
-            "dlt-test-write-cache-overwrite-{}-{:?}",
+            "tv-test-write-cache-overwrite-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
@@ -598,7 +598,7 @@ mod tests {
         let url = spawn_test_http_server(200, &fake_csv).await;
 
         let temp_dir = env::temp_dir().join(format!(
-            "dlt-test-dl-cache-write-{}-{:?}",
+            "tv-test-dl-cache-write-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
@@ -683,7 +683,7 @@ mod tests {
         let url = spawn_test_http_server(200, &fake_csv).await;
 
         let temp_dir = env::temp_dir().join(format!(
-            "dlt-test-dl-primary-cache-verify-{}-{:?}",
+            "tv-test-dl-primary-cache-verify-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
@@ -719,7 +719,7 @@ mod tests {
         let fallback_url = spawn_test_http_server(200, &fake_csv).await;
 
         let temp_dir = env::temp_dir().join(format!(
-            "dlt-test-dl-fallback-cache-verify-{}-{:?}",
+            "tv-test-dl-fallback-cache-verify-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
@@ -762,7 +762,7 @@ mod tests {
     #[tokio::test]
     async fn test_read_cache_exactly_min_bytes_succeeds() {
         let temp_dir = env::temp_dir().join(format!(
-            "dlt-test-csv-exact-min-{}-{:?}",
+            "tv-test-csv-exact-min-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
@@ -785,7 +785,7 @@ mod tests {
     #[tokio::test]
     async fn test_read_cache_one_below_min_bytes_fails() {
         let temp_dir = env::temp_dir().join(format!(
-            "dlt-test-csv-below-min-{}-{:?}",
+            "tv-test-csv-below-min-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
@@ -832,7 +832,7 @@ mod tests {
         // Create a directory where the "file" name is actually a directory,
         // causing fs::write to fail (covers lines 201-202).
         let temp_dir = env::temp_dir().join(format!(
-            "dlt-test-write-cache-file-fail-{}-{:?}",
+            "tv-test-write-cache-file-fail-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
@@ -873,7 +873,7 @@ mod tests {
         let url = spawn_test_http_server(200, &fake_csv).await;
 
         let temp_dir = env::temp_dir().join(format!(
-            "dlt-test-dl-primary-bytes-log-{}-{:?}",
+            "tv-test-dl-primary-bytes-log-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
@@ -903,7 +903,7 @@ mod tests {
         let fallback_url = spawn_test_http_server(200, &fake_csv).await;
 
         let temp_dir = env::temp_dir().join(format!(
-            "dlt-test-dl-fallback-bytes-log-{}-{:?}",
+            "tv-test-dl-fallback-bytes-log-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
@@ -929,7 +929,7 @@ mod tests {
     async fn test_download_cache_success_logs_byte_count() {
         // Exercises lines 109-110: cache success with byte count in warn log
         let temp_dir = env::temp_dir().join(format!(
-            "dlt-test-dl-cache-bytes-log-{}-{:?}",
+            "tv-test-dl-cache-bytes-log-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
@@ -1066,7 +1066,7 @@ mod tests {
     #[tokio::test]
     async fn test_read_cache_invalid_utf8_returns_error() {
         let temp_dir = env::temp_dir().join(format!(
-            "dlt-test-csv-invalid-utf8-{}-{:?}",
+            "tv-test-csv-invalid-utf8-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
@@ -1138,7 +1138,7 @@ mod tests {
     #[tokio::test]
     async fn test_load_cached_csv_source_field_is_cache() {
         let temp_dir = env::temp_dir().join(format!(
-            "dlt-test-load-cached-source-{}-{:?}",
+            "tv-test-load-cached-source-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));

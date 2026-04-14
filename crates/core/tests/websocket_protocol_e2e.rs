@@ -9,7 +9,7 @@
 
 #![allow(clippy::arithmetic_side_effects)] // APPROVED: test helpers use constant offsets for packet construction
 
-use dhan_live_trader_common::constants::{
+use tickvault_common::constants::{
     // Packet sizes
     BINARY_HEADER_SIZE,
     // Deep depth
@@ -138,10 +138,10 @@ use dhan_live_trader_common::constants::{
     WEBSOCKET_AUTH_TYPE,
     WEBSOCKET_PROTOCOL_VERSION,
 };
-use dhan_live_trader_common::tick_types::{MarketDepthLevel, ParsedTick};
+use tickvault_common::tick_types::{MarketDepthLevel, ParsedTick};
 
-use dhan_live_trader_core::parser::dispatch_frame;
-use dhan_live_trader_core::websocket::types::DisconnectCode;
+use tickvault_core::parser::dispatch_frame;
+use tickvault_core::websocket::types::DisconnectCode;
 
 // =========================================================================
 // SECTION 1: BINARY PROTOCOL — PACKET SIZE VERIFICATION
@@ -779,7 +779,7 @@ fn test_e2e_nifty_ticker_packet() {
     let result = dispatch_frame(&frame, received_nanos).unwrap();
 
     match result {
-        dhan_live_trader_core::parser::types::ParsedFrame::Tick(tick) => {
+        tickvault_core::parser::types::ParsedFrame::Tick(tick) => {
             assert_eq!(tick.security_id, 13, "NIFTY security_id");
             assert_eq!(
                 tick.exchange_segment_code, EXCHANGE_SEGMENT_IDX_I,
@@ -834,7 +834,7 @@ fn test_e2e_nifty_quote_packet() {
 
     let result = dispatch_frame(&frame, 0).unwrap();
     match result {
-        dhan_live_trader_core::parser::types::ParsedFrame::Tick(tick) => {
+        tickvault_core::parser::types::ParsedFrame::Tick(tick) => {
             assert_eq!(tick.security_id, 52432);
             assert_eq!(tick.exchange_segment_code, EXCHANGE_SEGMENT_NSE_FNO);
             assert_eq!(tick.last_traded_price, ltp);
@@ -917,7 +917,7 @@ fn test_e2e_full_packet_with_depth() {
 
     let result = dispatch_frame(&frame, 0).unwrap();
     match result {
-        dhan_live_trader_core::parser::types::ParsedFrame::TickWithDepth(tick, depth) => {
+        tickvault_core::parser::types::ParsedFrame::TickWithDepth(tick, depth) => {
             assert_eq!(tick.security_id, 52432);
             assert_eq!(tick.last_traded_price, ltp);
             assert_eq!(tick.open_interest, oi);
@@ -958,7 +958,7 @@ fn test_e2e_oi_packet() {
 
     let result = dispatch_frame(&frame, 0).unwrap();
     match result {
-        dhan_live_trader_core::parser::types::ParsedFrame::OiUpdate {
+        tickvault_core::parser::types::ParsedFrame::OiUpdate {
             security_id,
             exchange_segment_code,
             open_interest,
@@ -988,7 +988,7 @@ fn test_e2e_previous_close_packet() {
 
     let result = dispatch_frame(&frame, 0).unwrap();
     match result {
-        dhan_live_trader_core::parser::types::ParsedFrame::PreviousClose {
+        tickvault_core::parser::types::ParsedFrame::PreviousClose {
             security_id,
             exchange_segment_code,
             previous_close,
@@ -1009,7 +1009,7 @@ fn test_e2e_market_status_packet() {
 
     let result = dispatch_frame(&frame, 0).unwrap();
     match result {
-        dhan_live_trader_core::parser::types::ParsedFrame::MarketStatus {
+        tickvault_core::parser::types::ParsedFrame::MarketStatus {
             security_id,
             exchange_segment_code,
         } => {
@@ -1039,7 +1039,7 @@ fn test_e2e_disconnect_packet_all_codes() {
 
         let result = dispatch_frame(&frame, 0).unwrap();
         match result {
-            dhan_live_trader_core::parser::types::ParsedFrame::Disconnect(code) => {
+            tickvault_core::parser::types::ParsedFrame::Disconnect(code) => {
                 assert_eq!(code, *expected, "disconnect code {raw_code}");
             }
             other => panic!("expected Disconnect for code {raw_code}, got {other:?}"),
@@ -1065,7 +1065,7 @@ fn test_f32_price_no_division_needed() {
     let result = dispatch_frame(&frame, 0).unwrap();
 
     match result {
-        dhan_live_trader_core::parser::types::ParsedFrame::Tick(tick) => {
+        tickvault_core::parser::types::ParsedFrame::Tick(tick) => {
             // Price must be used AS-IS from wire — no ÷100 or ÷10000
             assert_eq!(
                 tick.last_traded_price, wire_price,
@@ -1087,9 +1087,9 @@ fn test_f32_price_no_division_needed() {
 
 #[test]
 fn test_subscription_json_format() {
-    use dhan_live_trader_common::types::{ExchangeSegment, FeedMode};
-    use dhan_live_trader_core::websocket::subscription_builder::build_subscription_messages;
-    use dhan_live_trader_core::websocket::types::InstrumentSubscription;
+    use tickvault_common::types::{ExchangeSegment, FeedMode};
+    use tickvault_core::websocket::subscription_builder::build_subscription_messages;
+    use tickvault_core::websocket::types::InstrumentSubscription;
 
     let instruments = vec![
         InstrumentSubscription::new(ExchangeSegment::IdxI, 13),
@@ -1119,9 +1119,9 @@ fn test_subscription_json_format() {
 
 #[test]
 fn test_subscription_batch_splitting() {
-    use dhan_live_trader_common::types::{ExchangeSegment, FeedMode};
-    use dhan_live_trader_core::websocket::subscription_builder::build_subscription_messages;
-    use dhan_live_trader_core::websocket::types::InstrumentSubscription;
+    use tickvault_common::types::{ExchangeSegment, FeedMode};
+    use tickvault_core::websocket::subscription_builder::build_subscription_messages;
+    use tickvault_core::websocket::types::InstrumentSubscription;
 
     // 250 instruments should split into 3 batches (100+100+50)
     let instruments: Vec<InstrumentSubscription> = (0..250)
@@ -1143,9 +1143,9 @@ fn test_subscription_batch_splitting() {
 
 #[test]
 fn test_unsubscription_uses_correct_codes() {
-    use dhan_live_trader_common::types::{ExchangeSegment, FeedMode};
-    use dhan_live_trader_core::websocket::subscription_builder::build_unsubscription_messages;
-    use dhan_live_trader_core::websocket::types::InstrumentSubscription;
+    use tickvault_common::types::{ExchangeSegment, FeedMode};
+    use tickvault_core::websocket::subscription_builder::build_unsubscription_messages;
+    use tickvault_core::websocket::types::InstrumentSubscription;
 
     let instruments = vec![InstrumentSubscription::new(
         ExchangeSegment::NseEquity,
@@ -1171,7 +1171,7 @@ fn test_unsubscription_uses_correct_codes() {
 
 #[test]
 fn test_disconnect_message_format() {
-    use dhan_live_trader_core::websocket::subscription_builder::build_disconnect_message;
+    use tickvault_core::websocket::subscription_builder::build_disconnect_message;
 
     let msg = build_disconnect_message();
     let json: serde_json::Value = serde_json::from_str(&msg).unwrap();
@@ -1197,9 +1197,9 @@ fn test_disconnect_message_format() {
 
 #[test]
 fn test_security_id_is_string_in_subscription_json() {
-    use dhan_live_trader_common::types::{ExchangeSegment, FeedMode};
-    use dhan_live_trader_core::websocket::subscription_builder::build_subscription_messages;
-    use dhan_live_trader_core::websocket::types::InstrumentSubscription;
+    use tickvault_common::types::{ExchangeSegment, FeedMode};
+    use tickvault_core::websocket::subscription_builder::build_subscription_messages;
+    use tickvault_core::websocket::types::InstrumentSubscription;
 
     let instruments = vec![InstrumentSubscription::new(
         ExchangeSegment::NseEquity,
@@ -1308,7 +1308,7 @@ fn test_all_exchange_segments_parse_as_ticker() {
         assert!(result.is_ok(), "segment {seg} must parse as ticker");
 
         match result.unwrap() {
-            dhan_live_trader_core::parser::types::ParsedFrame::Tick(tick) => {
+            tickvault_core::parser::types::ParsedFrame::Tick(tick) => {
                 assert_eq!(tick.exchange_segment_code, *seg, "segment code preserved");
             }
             other => panic!("expected Tick for segment {seg}, got {other:?}"),
@@ -1432,7 +1432,7 @@ fn test_all_fields_are_little_endian() {
 
     let result = dispatch_frame(&frame, 0).unwrap();
     match result {
-        dhan_live_trader_core::parser::types::ParsedFrame::Tick(tick) => {
+        tickvault_core::parser::types::ParsedFrame::Tick(tick) => {
             assert_eq!(tick.security_id, security_id, "LE parsed correctly");
         }
         other => panic!("expected Tick, got {other:?}"),
@@ -1445,9 +1445,9 @@ fn test_all_fields_are_little_endian() {
 
 #[test]
 fn test_subscription_empty_instruments() {
-    use dhan_live_trader_common::types::FeedMode;
-    use dhan_live_trader_core::websocket::subscription_builder::build_subscription_messages;
-    use dhan_live_trader_core::websocket::types::InstrumentSubscription;
+    use tickvault_common::types::FeedMode;
+    use tickvault_core::websocket::subscription_builder::build_subscription_messages;
+    use tickvault_core::websocket::types::InstrumentSubscription;
 
     let instruments: Vec<InstrumentSubscription> = vec![];
     let messages =
@@ -1457,9 +1457,9 @@ fn test_subscription_empty_instruments() {
 
 #[test]
 fn test_subscription_exactly_100_instruments_one_batch() {
-    use dhan_live_trader_common::types::{ExchangeSegment, FeedMode};
-    use dhan_live_trader_core::websocket::subscription_builder::build_subscription_messages;
-    use dhan_live_trader_core::websocket::types::InstrumentSubscription;
+    use tickvault_common::types::{ExchangeSegment, FeedMode};
+    use tickvault_core::websocket::subscription_builder::build_subscription_messages;
+    use tickvault_core::websocket::types::InstrumentSubscription;
 
     let instruments: Vec<InstrumentSubscription> = (0..100)
         .map(|i| InstrumentSubscription::new(ExchangeSegment::NseEquity, i as u32))
@@ -1472,9 +1472,9 @@ fn test_subscription_exactly_100_instruments_one_batch() {
 
 #[test]
 fn test_subscription_101_instruments_two_batches() {
-    use dhan_live_trader_common::types::{ExchangeSegment, FeedMode};
-    use dhan_live_trader_core::websocket::subscription_builder::build_subscription_messages;
-    use dhan_live_trader_core::websocket::types::InstrumentSubscription;
+    use tickvault_common::types::{ExchangeSegment, FeedMode};
+    use tickvault_core::websocket::subscription_builder::build_subscription_messages;
+    use tickvault_core::websocket::types::InstrumentSubscription;
 
     let instruments: Vec<InstrumentSubscription> = (0..101)
         .map(|i| InstrumentSubscription::new(ExchangeSegment::NseEquity, i as u32))

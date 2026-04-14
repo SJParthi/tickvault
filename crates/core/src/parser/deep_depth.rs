@@ -13,7 +13,7 @@
 //! # Performance
 //! All parsing is O(1) — fixed number of reads per packet.
 
-use dhan_live_trader_common::constants::{
+use tickvault_common::constants::{
     DEEP_DEPTH_FEED_CODE_ASK, DEEP_DEPTH_FEED_CODE_BID, DEEP_DEPTH_HEADER_OFFSET_EXCHANGE_SEGMENT,
     DEEP_DEPTH_HEADER_OFFSET_FEED_CODE, DEEP_DEPTH_HEADER_OFFSET_MSG_LENGTH,
     DEEP_DEPTH_HEADER_OFFSET_MSG_SEQUENCE, DEEP_DEPTH_HEADER_OFFSET_SECURITY_ID,
@@ -21,7 +21,7 @@ use dhan_live_trader_common::constants::{
     DEEP_DEPTH_LEVEL_OFFSET_QUANTITY, DEEP_DEPTH_LEVEL_SIZE, TWENTY_DEPTH_LEVELS,
     TWENTY_DEPTH_PACKET_SIZE, TWO_HUNDRED_DEPTH_LEVELS,
 };
-use dhan_live_trader_common::tick_types::DeepDepthLevel;
+use tickvault_common::tick_types::DeepDepthLevel;
 
 use super::read_helpers::{read_f64_le, read_u16_le, read_u32_le};
 use super::types::ParseError;
@@ -225,7 +225,7 @@ pub fn parse_two_hundred_depth_packet(
 #[allow(clippy::arithmetic_side_effects)] // APPROVED: test helpers use constant offsets for packet construction
 mod tests {
     use super::*;
-    use dhan_live_trader_common::constants::TWO_HUNDRED_DEPTH_PACKET_SIZE;
+    use tickvault_common::constants::TWO_HUNDRED_DEPTH_PACKET_SIZE;
 
     /// Builds a deep depth packet for testing.
     fn make_deep_depth_packet(

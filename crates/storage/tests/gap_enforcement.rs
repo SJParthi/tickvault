@@ -13,7 +13,7 @@
 /// Without segment in the key, ticks from different segments would overwrite.
 #[test]
 fn test_storage_gap_01_tick_dedup_key_includes_segment() {
-    let key = dhan_live_trader_storage::tick_persistence::tick_dedup_key();
+    let key = tickvault_storage::tick_persistence::tick_dedup_key();
     assert!(
         key.contains("segment"),
         "tick dedup key must include 'segment' (STORAGE-GAP-01), got: {key}"
@@ -34,7 +34,7 @@ fn test_storage_gap_01_tick_dedup_key_includes_segment() {
 fn test_storage_gap_02_f32_to_f64_clean_prevents_widening_artifacts() {
     let val: f32 = 21004.95;
     let widened_raw = val as f64; // BAD: 21004.94921875
-    let cleaned = dhan_live_trader_storage::tick_persistence::f32_to_f64_clean(val);
+    let cleaned = tickvault_storage::tick_persistence::f32_to_f64_clean(val);
 
     // The raw widening introduces artifacts past the f32 precision.
     // f32_to_f64_clean rounds to 2 decimal places (tick price precision).
@@ -54,7 +54,7 @@ fn test_storage_gap_02_f32_to_f64_clean_prevents_widening_artifacts() {
 #[test]
 fn test_storage_gap_02_f32_to_f64_clean_zero() {
     assert_eq!(
-        dhan_live_trader_storage::tick_persistence::f32_to_f64_clean(0.0_f32),
+        tickvault_storage::tick_persistence::f32_to_f64_clean(0.0_f32),
         0.0_f64
     );
 }
@@ -62,19 +62,14 @@ fn test_storage_gap_02_f32_to_f64_clean_zero() {
 /// f32_to_f64_clean handles NaN (returns NaN).
 #[test]
 fn test_storage_gap_02_f32_to_f64_clean_nan() {
-    assert!(dhan_live_trader_storage::tick_persistence::f32_to_f64_clean(f32::NAN).is_nan());
+    assert!(tickvault_storage::tick_persistence::f32_to_f64_clean(f32::NAN).is_nan());
 }
 
 /// f32_to_f64_clean handles infinity.
 #[test]
 fn test_storage_gap_02_f32_to_f64_clean_infinity() {
-    assert!(
-        dhan_live_trader_storage::tick_persistence::f32_to_f64_clean(f32::INFINITY).is_infinite()
-    );
-    assert!(
-        dhan_live_trader_storage::tick_persistence::f32_to_f64_clean(f32::NEG_INFINITY)
-            .is_infinite()
-    );
+    assert!(tickvault_storage::tick_persistence::f32_to_f64_clean(f32::INFINITY).is_infinite());
+    assert!(tickvault_storage::tick_persistence::f32_to_f64_clean(f32::NEG_INFINITY).is_infinite());
 }
 
 /// f32_to_f64_clean handles typical Dhan prices.
@@ -83,7 +78,7 @@ fn test_storage_gap_02_f32_to_f64_clean_typical_prices() {
     // Typical NSE tick prices
     let prices: &[f32] = &[100.50, 24500.0, 0.05, 99999.95, 1234.55, 50000.00, 0.10];
     for &price in prices {
-        let cleaned = dhan_live_trader_storage::tick_persistence::f32_to_f64_clean(price);
+        let cleaned = tickvault_storage::tick_persistence::f32_to_f64_clean(price);
         assert!(
             cleaned.is_finite(),
             "price {price} should produce finite f64"

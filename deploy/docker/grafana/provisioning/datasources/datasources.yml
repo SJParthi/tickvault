@@ -1,5 +1,5 @@
 # =============================================================================
-# dhan-live-trader — Grafana Datasource Provisioning
+# tickvault — Grafana Datasource Provisioning
 # =============================================================================
 # Auto-configures Prometheus and QuestDB on first boot.
 # Loki + Jaeger REMOVED — saves 2.5GB RAM (per AWS budget).
@@ -13,7 +13,7 @@ datasources:
     uid: prometheus
     type: prometheus
     access: proxy
-    url: http://dlt-prometheus:9090
+    url: http://tv-prometheus:9090
     isDefault: true
     editable: false
     jsonData:
@@ -29,11 +29,11 @@ datasources:
     uid: questdb
     type: postgres
     access: proxy
-    url: dlt-questdb:8812
+    url: tv-questdb:8812
     database: qdb
-    user: $DLT_QUESTDB_PG_USER
+    user: $TV_QUESTDB_PG_USER
     secureJsonData:
-      password: $DLT_QUESTDB_PG_PASSWORD
+      password: $TV_QUESTDB_PG_PASSWORD
     editable: false
     jsonData:
       database: qdb

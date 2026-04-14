@@ -163,7 +163,7 @@ fn test_terraform_oidc_role_restricts_to_repo() {
         .expect("oidc.tf must be readable"); // APPROVED: test
     // OIDC role must bind to our specific repo (not a wildcard).
     assert!(
-        content.contains("SJParthi/dhan-live-trader"),
+        content.contains("SJParthi/tickvault"),
         "oidc.tf must pin the GitHub repo full name"
     );
     assert!(
@@ -177,10 +177,10 @@ fn test_terraform_alarms_publish_to_sns() {
     let content = std::fs::read_to_string(workspace_root().join("deploy/aws/terraform/alarms.tf"))
         .expect("alarms.tf must be readable"); // APPROVED: test
     // All 5 alarms must reference the SNS topic for Telegram fan-out.
-    let alarm_count = content.matches("aws_sns_topic.dlt_alerts.arn").count();
+    let alarm_count = content.matches("aws_sns_topic.tv_alerts.arn").count();
     assert!(
         alarm_count >= 5,
-        "alarms.tf must wire >= 5 alarms to dlt_alerts SNS (found {alarm_count})"
+        "alarms.tf must wire >= 5 alarms to tv_alerts SNS (found {alarm_count})"
     );
 }
 
@@ -323,15 +323,16 @@ fn test_dr_runbook_has_11_sections() {
 #[test]
 fn test_systemd_unit_exists() {
     require_file_exists(
-        "deploy/systemd/dlt-app.service",
+        "deploy/systemd/tickvault.service",
         "systemd unit for auto-restart and sd_notify watchdog",
     );
 }
 
 #[test]
 fn test_systemd_unit_restart_policy() {
-    let content = std::fs::read_to_string(workspace_root().join("deploy/systemd/dlt-app.service"))
-        .expect("systemd unit must be readable"); // APPROVED: test
+    let content =
+        std::fs::read_to_string(workspace_root().join("deploy/systemd/tickvault.service"))
+            .expect("systemd unit must be readable"); // APPROVED: test
     assert!(
         content.contains("Restart=always") || content.contains("Restart=on-failure"),
         "systemd unit must auto-restart on crash"

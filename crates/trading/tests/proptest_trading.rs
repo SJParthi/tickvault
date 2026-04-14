@@ -4,16 +4,16 @@
 
 use proptest::prelude::*;
 
-use dhan_live_trader_common::order_types::OrderStatus;
-use dhan_live_trader_common::tick_types::ParsedTick;
-use dhan_live_trader_trading::greeks::black_scholes::*;
-use dhan_live_trader_trading::greeks::buildup::*;
-use dhan_live_trader_trading::greeks::pcr::*;
-use dhan_live_trader_trading::indicator::engine::IndicatorEngine;
-use dhan_live_trader_trading::indicator::obi::compute_obi;
-use dhan_live_trader_trading::indicator::types::IndicatorParams;
-use dhan_live_trader_trading::oms::state_machine::*;
-use dhan_live_trader_trading::risk::engine::RiskEngine;
+use tickvault_common::order_types::OrderStatus;
+use tickvault_common::tick_types::ParsedTick;
+use tickvault_trading::greeks::black_scholes::*;
+use tickvault_trading::greeks::buildup::*;
+use tickvault_trading::greeks::pcr::*;
+use tickvault_trading::indicator::engine::IndicatorEngine;
+use tickvault_trading::indicator::obi::compute_obi;
+use tickvault_trading::indicator::types::IndicatorParams;
+use tickvault_trading::oms::state_machine::*;
+use tickvault_trading::risk::engine::RiskEngine;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -825,7 +825,7 @@ proptest! {
         ask_prices in proptest::collection::vec(0.01_f64..100000.0, 1..20),
         ask_qtys in proptest::collection::vec(1_u32..1000000, 1..20),
     ) {
-        use dhan_live_trader_common::tick_types::DeepDepthLevel;
+        use tickvault_common::tick_types::DeepDepthLevel;
 
         let bid_count = bid_prices.len().min(bid_qtys.len());
         let ask_count = ask_prices.len().min(ask_qtys.len());
@@ -857,7 +857,7 @@ proptest! {
     fn proptest_obi_quantity_conservation(
         qtys in proptest::collection::vec(0_u32..100000, 1..20),
     ) {
-        use dhan_live_trader_common::tick_types::DeepDepthLevel;
+        use tickvault_common::tick_types::DeepDepthLevel;
 
         let levels: Vec<DeepDepthLevel> = qtys.iter()
             .enumerate()

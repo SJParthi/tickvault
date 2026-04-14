@@ -1,7 +1,7 @@
 # Full Project Security Audit Report
 
 **Date:** 2026-03-07
-**Scope:** Entire dhan-live-trader repository — code, dependencies, CI/CD, Docker, docs, hooks
+**Scope:** Entire tickvault repository — code, dependencies, CI/CD, Docker, docs, hooks
 **Method:** 6 parallel deep-scan agents + manual cargo check/clippy/test verification
 **Build Status:** CLEAN (0 clippy warnings, 163 tests passed, 0 failures)
 

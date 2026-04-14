@@ -38,10 +38,10 @@
 
 - [x] O2+O3+O4: Add missing Prometheus metrics (rebalancer heartbeat, pipeline heartbeat, lagged ticks counter)
   - Files: crates/core/src/instrument/depth_rebalancer.rs, crates/app/src/trading_pipeline.rs
-  - Metrics: dlt_depth_rebalancer_active, dlt_trading_pipeline_heartbeat, dlt_trading_pipeline_ticks_lagged_total
+  - Metrics: tv_depth_rebalancer_active, tv_trading_pipeline_heartbeat, tv_trading_pipeline_ticks_lagged_total
 
 - [x] O6-remaining: Add DepthRebalancerDown + TradingPipelineStalled + TradingPipelineLagging alert rules
-  - Files: deploy/docker/prometheus/rules/dlt-alerts.yml
+  - Files: deploy/docker/prometheus/rules/tv-alerts.yml
 
 ### Medium Priority
 

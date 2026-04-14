@@ -20,11 +20,11 @@ use anyhow::{Context, Result};
 use chrono::{NaiveDate, Utc};
 use tracing::{debug, info, warn};
 
-use dhan_live_trader_common::config::InstrumentConfig;
-use dhan_live_trader_common::constants::*;
-use dhan_live_trader_common::instrument_types::*;
-use dhan_live_trader_common::trading_calendar::ist_offset;
-use dhan_live_trader_common::types::{Exchange, ExchangeSegment, OptionType, SecurityId};
+use tickvault_common::config::InstrumentConfig;
+use tickvault_common::constants::*;
+use tickvault_common::instrument_types::*;
+use tickvault_common::trading_calendar::ist_offset;
+use tickvault_common::types::{Exchange, ExchangeSegment, OptionType, SecurityId};
 
 use super::csv_downloader::download_instrument_csv;
 use super::csv_parser::{ParsedInstrumentRow, parse_instrument_csv};
@@ -3633,7 +3633,7 @@ mod tests {
         let url = format!("http://127.0.0.1:{port}/instruments.csv");
 
         let temp_dir = std::env::temp_dir().join(format!(
-            "dlt-test-build-fno-universe-e2e-{}-{:?}",
+            "tv-test-build-fno-universe-e2e-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));

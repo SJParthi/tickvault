@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# dhan-live-trader — Observability Stack: FULL AUTO Setup
+# tickvault — Observability Stack: FULL AUTO Setup
 # =============================================================================
 # ONE COMMAND. ZERO HUMAN INTERVENTION.
 #
@@ -134,7 +134,7 @@ fetch_ssm_secret() {
 # =============================================================================
 echo ""
 echo -e "${CYAN}╔══════════════════════════════════════════════════════╗${NC}"
-echo -e "${CYAN}║   dhan-live-trader — Observability Stack (Auto)      ║${NC}"
+echo -e "${CYAN}║   tickvault — Observability Stack (Auto)      ║${NC}"
 echo -e "${CYAN}╚══════════════════════════════════════════════════════╝${NC}"
 echo ""
 # =============================================================================
@@ -225,19 +225,19 @@ step "Provisioning infrastructure secrets (SSM)"
 ENVIRONMENT="${SSM_ENV}" bash "${SCRIPT_DIR}/provision-infra-secrets.sh"
 
 info "Fetching credentials for docker-compose..."
-DLT_QUESTDB_PG_USER=$(fetch_ssm_secret "/dlt/${SSM_ENV}/questdb/pg-user")
-DLT_QUESTDB_PG_PASSWORD=$(fetch_ssm_secret "/dlt/${SSM_ENV}/questdb/pg-password")
-DLT_GRAFANA_ADMIN_USER=$(fetch_ssm_secret "/dlt/${SSM_ENV}/grafana/admin-user")
-DLT_GRAFANA_ADMIN_PASSWORD=$(fetch_ssm_secret "/dlt/${SSM_ENV}/grafana/admin-password")
-export DLT_QUESTDB_PG_USER DLT_QUESTDB_PG_PASSWORD DLT_GRAFANA_ADMIN_USER DLT_GRAFANA_ADMIN_PASSWORD
+TV_QUESTDB_PG_USER=$(fetch_ssm_secret "/tickvault/${SSM_ENV}/questdb/pg-user")
+TV_QUESTDB_PG_PASSWORD=$(fetch_ssm_secret "/tickvault/${SSM_ENV}/questdb/pg-password")
+TV_GRAFANA_ADMIN_USER=$(fetch_ssm_secret "/tickvault/${SSM_ENV}/grafana/admin-user")
+TV_GRAFANA_ADMIN_PASSWORD=$(fetch_ssm_secret "/tickvault/${SSM_ENV}/grafana/admin-password")
+export TV_QUESTDB_PG_USER TV_QUESTDB_PG_PASSWORD TV_GRAFANA_ADMIN_USER TV_GRAFANA_ADMIN_PASSWORD
 
 # Telegram credentials — used by Grafana alerting contact point (alerts.yml).
 # Same SSM path as the Rust app and notify-telegram.sh — ONE source, everywhere.
-DLT_TELEGRAM_BOT_TOKEN=$(fetch_ssm_secret "/dlt/${SSM_ENV}/telegram/bot-token" 2>/dev/null || echo "")
-DLT_TELEGRAM_CHAT_ID=$(fetch_ssm_secret "/dlt/${SSM_ENV}/telegram/chat-id" 2>/dev/null || echo "")
-export DLT_TELEGRAM_BOT_TOKEN DLT_TELEGRAM_CHAT_ID
+TV_TELEGRAM_BOT_TOKEN=$(fetch_ssm_secret "/tickvault/${SSM_ENV}/telegram/bot-token" 2>/dev/null || echo "")
+TV_TELEGRAM_CHAT_ID=$(fetch_ssm_secret "/tickvault/${SSM_ENV}/telegram/chat-id" 2>/dev/null || echo "")
+export TV_TELEGRAM_BOT_TOKEN TV_TELEGRAM_CHAT_ID
 
-if [ -n "$DLT_TELEGRAM_BOT_TOKEN" ] && [ -n "$DLT_TELEGRAM_CHAT_ID" ]; then
+if [ -n "$TV_TELEGRAM_BOT_TOKEN" ] && [ -n "$TV_TELEGRAM_CHAT_ID" ]; then
     ok "All 6 secrets ready (infra + Telegram)"
 else
     ok "4 infrastructure secrets ready"
@@ -257,15 +257,15 @@ else
         # SQLite DB even after removing it from alerts.yml — causes crash-loop.
         # All dashboards/datasources/alerts are defined in provisioning files, so
         # nothing is lost by clearing the volume.
-        docker volume rm dlt-grafana-data 2>/dev/null || true
+        docker volume rm tv-grafana-data 2>/dev/null || true
         ok "Stack torn down (Grafana volume reset)"
     else
         step "Checking existing stack state"
-        RUNNING=$(docker ps --filter "name=dlt-" --format "{{.Names}}" 2>/dev/null | wc -l | tr -d ' ')
+        RUNNING=$(docker ps --filter "name=tv-" --format "{{.Names}}" 2>/dev/null | wc -l | tr -d ' ')
         if [ "$RUNNING" -gt 0 ]; then
-            info "${RUNNING} dlt-* containers already running"
+            info "${RUNNING} tv-* containers already running"
         else
-            info "No dlt-* containers running — starting fresh"
+            info "No tv-* containers running — starting fresh"
         fi
         ok "State checked"
     fi
@@ -290,7 +290,7 @@ else
         docker compose -f "${COMPOSE_FILE}" ps --all 2>&1 || true
         echo ""
         info "Recent container logs (last 30 lines per failed service):"
-        for svc in dlt-questdb dlt-valkey dlt-prometheus dlt-grafana dlt-loki dlt-alloy dlt-jaeger dlt-traefik; do
+        for svc in tv-questdb tv-valkey tv-prometheus tv-grafana tv-loki tv-alloy tv-jaeger tv-traefik; do
             STATUS=$(docker inspect --format='{{.State.Status}}' "$svc" 2>/dev/null || echo "not_found")
             if [ "$STATUS" != "running" ]; then
                 echo -e "  ${RED}--- ${svc} (${STATUS}) ---${NC}"
@@ -350,7 +350,7 @@ fi
 
 # ---- Step 11: Grafana datasources ----
 step "Validating Grafana datasources"
-GRAFANA_AUTH="$(echo -n "${DLT_GRAFANA_ADMIN_USER}:${DLT_GRAFANA_ADMIN_PASSWORD}" | base64)"
+GRAFANA_AUTH="$(echo -n "${TV_GRAFANA_ADMIN_USER}:${TV_GRAFANA_ADMIN_PASSWORD}" | base64)"
 DS_JSON=$(curl -sf --max-time 5 "http://localhost:3000/api/datasources" \
     -H "Authorization: Basic ${GRAFANA_AUTH}" 2>/dev/null || echo "")
 if [ -n "$DS_JSON" ] && [ "$DS_JSON" != "[]" ]; then
@@ -375,7 +375,7 @@ DASH_JSON=$(curl -sf --max-time 5 "http://localhost:3000/api/search?type=dash-db
 if [ -n "$DASH_JSON" ] && [ "$DASH_JSON" != "[]" ]; then
     DASH_COUNT=$(echo "$DASH_JSON" | grep -o '"uid"' | wc -l | tr -d ' ')
     # Check for expected dashboards by UID
-    for uid in dlt-system-overview dlt-traefik dlt-logs; do
+    for uid in tv-system-overview tv-traefik tv-logs; do
         DASH_TITLE=$(echo "$DASH_JSON" | grep -o "\"uid\":\"${uid}\"[^}]*\"title\":\"[^\"]*\"" | grep -o '"title":"[^"]*"' | head -1 || echo "")
         if [ -n "$DASH_TITLE" ]; then
             info "  ${uid}: loaded"
@@ -402,17 +402,17 @@ fi
 # Configure Telegram contact point via API (not file provisioning — empty tokens crash Grafana)
 CP_JSON=$(curl -sf --max-time 5 "http://localhost:3000/api/v1/provisioning/contact-points" \
     -H "Authorization: Basic ${GRAFANA_AUTH}" 2>/dev/null || echo "")
-if echo "$CP_JSON" | grep -q "dlt-telegram"; then
+if echo "$CP_JSON" | grep -q "tv-telegram"; then
     ok "Telegram contact point already configured"
-elif [ -n "$DLT_TELEGRAM_BOT_TOKEN" ] && [ -n "$DLT_TELEGRAM_CHAT_ID" ]; then
+elif [ -n "$TV_TELEGRAM_BOT_TOKEN" ] && [ -n "$TV_TELEGRAM_CHAT_ID" ]; then
     # Create Telegram contact point via Grafana API
     TELEGRAM_PAYLOAD=$(cat <<EOFPAYLOAD
 {
-  "name": "dlt-telegram",
+  "name": "tv-telegram",
   "type": "telegram",
   "settings": {
-    "bottoken": "${DLT_TELEGRAM_BOT_TOKEN}",
-    "chatid": "${DLT_TELEGRAM_CHAT_ID}",
+    "bottoken": "${TV_TELEGRAM_BOT_TOKEN}",
+    "chatid": "${TV_TELEGRAM_CHAT_ID}",
     "parse_mode": "HTML",
     "message": "{{ if gt (len .Alerts.Firing) 0 }}🔴 FIRING{{ end }}{{ if gt (len .Alerts.Resolved) 0 }}🟢 RESOLVED{{ end }}\n{{ range .Alerts }}\n<b>{{ .Labels.alertname }}</b>\n{{ .Annotations.summary }}\n{{ .Annotations.description }}\nSeverity: {{ .Labels.severity }}\n{{ end }}"
   },
@@ -427,7 +427,7 @@ EOFPAYLOAD
         -d "${TELEGRAM_PAYLOAD}" 2>/dev/null || echo "")
     if echo "$CP_RESULT" | grep -q "uid"; then
         # Update notification policy to use Telegram
-        POLICY_PAYLOAD='{"receiver":"dlt-telegram","group_by":["grafana_folder","alertname"],"group_wait":"30s","group_interval":"5m","repeat_interval":"4h"}'
+        POLICY_PAYLOAD='{"receiver":"tv-telegram","group_by":["grafana_folder","alertname"],"group_wait":"30s","group_interval":"5m","repeat_interval":"4h"}'
         curl -sf --max-time 5 -X PUT "http://localhost:3000/api/v1/provisioning/policies" \
             -H "Authorization: Basic ${GRAFANA_AUTH}" \
             -H "Content-Type: application/json" \
@@ -557,14 +557,14 @@ echo -e "                    http://localhost/questdb"
 echo -e "                    http://localhost/alloy"
 echo ""
 echo -e "  ${BOLD}Grafana Credentials:${NC}"
-echo -e "    User: ${DLT_GRAFANA_ADMIN_USER}"
-echo -e "    Pass: (from AWS SSM /dlt/${SSM_ENV}/grafana/admin-password)"
+echo -e "    User: ${TV_GRAFANA_ADMIN_USER}"
+echo -e "    Pass: (from AWS SSM /tickvault/${SSM_ENV}/grafana/admin-password)"
 echo ""
 
 if [ "$OPEN_BROWSER" = true ] && [ "$FAIL" -eq 0 ]; then
     echo -e "  ${CYAN}Opening dashboards in browser...${NC}"
     sleep 1
-    open_url "http://localhost:3000/d/dlt-system-overview/dlt-system-overview?orgId=1"
+    open_url "http://localhost:3000/d/tv-system-overview/tv-system-overview?orgId=1"
     sleep 0.5
     open_url "http://localhost:9090/targets"
     sleep 0.5
@@ -593,7 +593,7 @@ echo ""
 if curl -sf --max-time 1 "http://169.254.169.254/latest/meta-data/" >/dev/null 2>&1; then
     # Running on EC2 — check if CloudWatch alarms exist
     CW_ALARM=$(aws cloudwatch describe-alarms \
-        --alarm-name-prefix "dlt-${SSM_ENV}-ec2" \
+        --alarm-name-prefix "tv-${SSM_ENV}-ec2" \
         --region "ap-south-1" \
         --query 'MetricAlarms[0].AlarmName' \
         --output text 2>/dev/null || echo "None")

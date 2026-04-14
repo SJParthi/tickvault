@@ -75,7 +75,7 @@ go-live.
     60-second post-deploy monitor, auto-rollback
 - **Smoke test binary** (`crates/app/src/bin/smoke_test.rs`)
   - 5 fail-safe checks, under 500ms, called by deploy workflow
-- **dlt-doctor CLI** (`crates/app/src/bin/dlt_doctor.rs`)
+- **tv-doctor CLI** (`crates/app/src/bin/tv_doctor.rs`)
   - Auto-triage bundle on CRITICAL alerts (5 probes, 3 formats)
 - **Nightly dep-freshness workflow** (`dep-freshness-nightly.yml`)
   - Auto-PR for patches, GitHub issue for minor/major drifts

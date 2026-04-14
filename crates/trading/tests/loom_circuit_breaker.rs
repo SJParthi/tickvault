@@ -12,14 +12,14 @@
 //! interleavings that loom can control.
 //! Test 3 tests the CAS gate pattern directly with loom atomics.
 //!
-//! Run with: cargo test -p dhan-live-trader-trading --features loom --test loom_circuit_breaker
+//! Run with: cargo test -p tickvault-trading --features loom --test loom_circuit_breaker
 
 #[cfg(feature = "loom")]
 mod loom_tests {
     use loom::sync::Arc;
     use loom::thread;
 
-    use dhan_live_trader_trading::oms::circuit_breaker::{CircuitState, OrderCircuitBreaker};
+    use tickvault_trading::oms::circuit_breaker::{CircuitState, OrderCircuitBreaker};
 
     /// Verifies that concurrent record_failure + record_success on the ACTUAL
     /// OrderCircuitBreaker never produces an inconsistent state.
@@ -159,7 +159,7 @@ mod std_concurrency_tests {
     use std::sync::Arc;
     use std::thread;
 
-    use dhan_live_trader_trading::oms::circuit_breaker::{CircuitState, OrderCircuitBreaker};
+    use tickvault_trading::oms::circuit_breaker::{CircuitState, OrderCircuitBreaker};
 
     /// Stress test: concurrent failure recording opens the circuit.
     #[test]

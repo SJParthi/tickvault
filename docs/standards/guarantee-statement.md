@@ -1,4 +1,4 @@
-# Guarantee Statement — dhan-live-trader
+# Guarantee Statement — tickvault
 
 ## 1. Measured Latency Guarantees
 

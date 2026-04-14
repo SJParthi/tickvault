@@ -5,8 +5,8 @@
 
 use crate::indicator::engine::IndicatorEngine;
 use crate::indicator::types::{IndicatorParams, RingBuffer};
-use dhan_live_trader_common::constants::INDICATOR_RING_BUFFER_CAPACITY;
-use dhan_live_trader_common::tick_types::ParsedTick;
+use tickvault_common::constants::INDICATOR_RING_BUFFER_CAPACITY;
+use tickvault_common::tick_types::ParsedTick;
 
 /// Helper: create a tick with the given LTP, high, low, volume.
 fn make_tick(security_id: u32, ltp: f32, high: f32, low: f32, volume: u32) -> ParsedTick {

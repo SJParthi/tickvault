@@ -13,11 +13,11 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::info;
 
-use dhan_live_trader_common::config::{DhanConfig, WebSocketConfig};
-use dhan_live_trader_common::constants::{
+use tickvault_common::config::{DhanConfig, WebSocketConfig};
+use tickvault_common::constants::{
     MAX_INSTRUMENTS_PER_WEBSOCKET_CONNECTION, MAX_WEBSOCKET_CONNECTIONS,
 };
-use dhan_live_trader_common::types::FeedMode;
+use tickvault_common::types::FeedMode;
 
 use crate::auth::TokenHandle;
 use crate::websocket::connection::WebSocketConnection;
@@ -107,7 +107,7 @@ impl WebSocketConnectionPool {
         // At 10K ticks/sec = 13 seconds backpressure-free headroom.
         // On overflow: backpressure (blocks WS read, never drops frames).
         let (frame_sender, frame_receiver) =
-            mpsc::channel(dhan_live_trader_common::constants::FRAME_CHANNEL_CAPACITY);
+            mpsc::channel(tickvault_common::constants::FRAME_CHANNEL_CAPACITY);
 
         // O(1) EXEMPT: begin — pool constructor runs once at startup, not per tick
         // Distribute instruments round-robin across connections.
@@ -223,7 +223,7 @@ impl WebSocketConnectionPool {
     ///
     /// - `WatchdogVerdict::Degraded` → fires Telegram CRITICAL (if a
     ///   notifier is wired upstream by the caller) and increments
-    ///   `dlt_pool_degraded_seconds_total`
+    ///   `tv_pool_degraded_seconds_total`
     /// - `WatchdogVerdict::Halt` → caller MUST exit the process with a
     ///   non-zero status so the supervisor (systemd / Docker restart
     ///   policy) brings it back up. The pool cannot self-exit because
@@ -249,18 +249,18 @@ impl WebSocketConnectionPool {
 
         match verdict {
             WatchdogVerdict::Healthy => {
-                metrics::gauge!("dlt_pool_degraded_seconds").set(0.0);
+                metrics::gauge!("tv_pool_degraded_seconds").set(0.0);
             }
             WatchdogVerdict::Recovered { was_down_for } => {
                 info!(
                     down_for_secs = was_down_for.as_secs(),
                     "A4: WebSocket pool RECOVERED — at least one connection is live again"
                 );
-                metrics::counter!("dlt_pool_recoveries_total").increment(1);
-                metrics::gauge!("dlt_pool_degraded_seconds").set(0.0);
+                metrics::counter!("tv_pool_recoveries_total").increment(1);
+                metrics::gauge!("tv_pool_degraded_seconds").set(0.0);
             }
             WatchdogVerdict::Degrading { down_for } => {
-                metrics::gauge!("dlt_pool_degraded_seconds").set(down_for.as_secs_f64());
+                metrics::gauge!("tv_pool_degraded_seconds").set(down_for.as_secs_f64());
             }
             WatchdogVerdict::Degraded { down_for } => {
                 tracing::error!(
@@ -269,8 +269,8 @@ impl WebSocketConnectionPool {
                      are Reconnecting/Disconnected, no market data flowing. Investigate Dhan \
                      server status, token validity, network reachability."
                 );
-                metrics::counter!("dlt_pool_degraded_alerts_total").increment(1);
-                metrics::gauge!("dlt_pool_degraded_seconds").set(down_for.as_secs_f64());
+                metrics::counter!("tv_pool_degraded_alerts_total").increment(1);
+                metrics::gauge!("tv_pool_degraded_seconds").set(down_for.as_secs_f64());
             }
             WatchdogVerdict::Halt { down_for } => {
                 tracing::error!(
@@ -279,8 +279,8 @@ impl WebSocketConnectionPool {
                      halt so supervisor can restart us. If this fires repeatedly, Dhan is likely \
                      unreachable or the account/token is locked."
                 );
-                metrics::counter!("dlt_pool_halts_total").increment(1);
-                metrics::gauge!("dlt_pool_degraded_seconds").set(down_for.as_secs_f64());
+                metrics::counter!("tv_pool_halts_total").increment(1);
+                metrics::gauge!("tv_pool_degraded_seconds").set(down_for.as_secs_f64());
             }
         }
 
@@ -329,7 +329,7 @@ impl WebSocketConnectionPool {
             total = self.connections.len(),
             "A5: graceful shutdown signalled to all WebSocket connections"
         );
-        metrics::counter!("dlt_ws_graceful_shutdown_signalled_total")
+        metrics::counter!("tv_ws_graceful_shutdown_signalled_total")
             .increment(self.connections.len() as u64);
 
         self.connections.len()
@@ -345,7 +345,7 @@ impl WebSocketConnectionPool {
 mod tests {
     use super::*;
     use crate::websocket::types::ConnectionState;
-    use dhan_live_trader_common::types::ExchangeSegment;
+    use tickvault_common::types::ExchangeSegment;
 
     fn make_test_dhan_config() -> DhanConfig {
         DhanConfig {

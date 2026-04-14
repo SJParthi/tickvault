@@ -1,11 +1,11 @@
 # =============================================================================
-# dhan-live-trader — Alertmanager Configuration
+# tickvault — Alertmanager Configuration
 # =============================================================================
 # Routes Prometheus alerts to Telegram via bot webhook.
 #
 # Secrets: Bot token and chat ID must be set via environment variables:
-#   DLT_TELEGRAM_BOT_TOKEN  — from AWS SSM /dlt/<env>/telegram/bot-token
-#   DLT_TELEGRAM_CHAT_ID    — from AWS SSM /dlt/<env>/telegram/chat-id
+#   TV_TELEGRAM_BOT_TOKEN  — from AWS SSM /tickvault/<env>/telegram/bot-token
+#   TV_TELEGRAM_CHAT_ID    — from AWS SSM /tickvault/<env>/telegram/chat-id
 #
 # To test: curl -XPOST http://localhost:9093/-/reload
 # =============================================================================

@@ -7,7 +7,7 @@ use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 
-use dhan_live_trader_storage::tick_persistence_testing::f32_to_f64_clean_pub;
+use tickvault_storage::tick_persistence_testing::f32_to_f64_clean_pub;
 
 fn bench_f32_to_f64_clean_typical_price(c: &mut Criterion) {
     c.bench_function("f32_to_f64_clean/typical_price", |b| {

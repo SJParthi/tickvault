@@ -12,7 +12,7 @@
       }
     ]
   },
-  "description": "dhan-live-trader trading pipeline — tick processing, candle aggregation, top movers, risk engine, WebSocket health",
+  "description": "tickvault trading pipeline — tick processing, candle aggregation, top movers, risk engine, WebSocket health",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -43,7 +43,7 @@
       "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "title": "Pipeline Status",
       "type": "stat",
-      "targets": [{ "expr": "dlt_pipeline_active", "legendFormat": "", "refId": "A" }]
+      "targets": [{ "expr": "tv_pipeline_active", "legendFormat": "", "refId": "A" }]
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
@@ -61,8 +61,8 @@
       "title": "Tick Throughput",
       "type": "timeseries",
       "targets": [
-        { "expr": "rate(dlt_ticks_processed_total[1m])", "legendFormat": "ticks/s", "refId": "A" },
-        { "expr": "rate(dlt_frames_processed_total[1m])", "legendFormat": "frames/s", "refId": "B" }
+        { "expr": "rate(tv_ticks_processed_total[1m])", "legendFormat": "ticks/s", "refId": "A" },
+        { "expr": "rate(tv_frames_processed_total[1m])", "legendFormat": "frames/s", "refId": "B" }
       ]
     },
     {
@@ -79,7 +79,7 @@
       "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "title": "Total Ticks Processed",
       "type": "stat",
-      "targets": [{ "expr": "dlt_ticks_processed_total", "legendFormat": "", "refId": "A" }]
+      "targets": [{ "expr": "tv_ticks_processed_total", "legendFormat": "", "refId": "A" }]
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
@@ -95,7 +95,7 @@
       "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "title": "Total Frames Processed",
       "type": "stat",
-      "targets": [{ "expr": "dlt_frames_processed_total", "legendFormat": "", "refId": "A" }]
+      "targets": [{ "expr": "tv_frames_processed_total", "legendFormat": "", "refId": "A" }]
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
@@ -113,9 +113,9 @@
       "title": "Tick Processing Latency",
       "type": "timeseries",
       "targets": [
-        { "expr": "histogram_quantile(0.50, rate(dlt_tick_processing_duration_ns_bucket[5m]))", "legendFormat": "p50", "refId": "A" },
-        { "expr": "histogram_quantile(0.90, rate(dlt_tick_processing_duration_ns_bucket[5m]))", "legendFormat": "p90", "refId": "B" },
-        { "expr": "histogram_quantile(0.99, rate(dlt_tick_processing_duration_ns_bucket[5m]))", "legendFormat": "p99", "refId": "C" }
+        { "expr": "histogram_quantile(0.50, rate(tv_tick_processing_duration_ns_bucket[5m]))", "legendFormat": "p50", "refId": "A" },
+        { "expr": "histogram_quantile(0.90, rate(tv_tick_processing_duration_ns_bucket[5m]))", "legendFormat": "p90", "refId": "B" },
+        { "expr": "histogram_quantile(0.99, rate(tv_tick_processing_duration_ns_bucket[5m]))", "legendFormat": "p99", "refId": "C" }
       ]
     },
     {
@@ -147,11 +147,11 @@
       "title": "Error & Filter Rates",
       "type": "timeseries",
       "targets": [
-        { "expr": "rate(dlt_junk_ticks_filtered_total[1m])", "legendFormat": "junk filtered/s", "refId": "A" },
-        { "expr": "rate(dlt_parse_errors_total[1m])", "legendFormat": "parse errors/s", "refId": "B" },
-        { "expr": "rate(dlt_storage_errors_total[1m])", "legendFormat": "storage errors/s", "refId": "C" },
-        { "expr": "rate(dlt_dedup_filtered_total[1m])", "legendFormat": "dedup filtered/s", "refId": "D" },
-        { "expr": "rate(dlt_crossed_market_total[1m])", "legendFormat": "crossed market/s", "refId": "E" }
+        { "expr": "rate(tv_junk_ticks_filtered_total[1m])", "legendFormat": "junk filtered/s", "refId": "A" },
+        { "expr": "rate(tv_parse_errors_total[1m])", "legendFormat": "parse errors/s", "refId": "B" },
+        { "expr": "rate(tv_storage_errors_total[1m])", "legendFormat": "storage errors/s", "refId": "C" },
+        { "expr": "rate(tv_dedup_filtered_total[1m])", "legendFormat": "dedup filtered/s", "refId": "D" },
+        { "expr": "rate(tv_crossed_market_total[1m])", "legendFormat": "crossed market/s", "refId": "E" }
       ]
     },
     {
@@ -168,7 +168,7 @@
       "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "title": "Junk Ticks Filtered",
       "type": "stat",
-      "targets": [{ "expr": "dlt_junk_ticks_filtered_total", "legendFormat": "", "refId": "A" }]
+      "targets": [{ "expr": "tv_junk_ticks_filtered_total", "legendFormat": "", "refId": "A" }]
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
@@ -185,7 +185,7 @@
       "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "title": "Parse Errors",
       "type": "stat",
-      "targets": [{ "expr": "dlt_parse_errors_total", "legendFormat": "", "refId": "A" }]
+      "targets": [{ "expr": "tv_parse_errors_total", "legendFormat": "", "refId": "A" }]
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
@@ -202,7 +202,7 @@
       "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "title": "Storage Errors",
       "type": "stat",
-      "targets": [{ "expr": "dlt_storage_errors_total", "legendFormat": "", "refId": "A" }]
+      "targets": [{ "expr": "tv_storage_errors_total", "legendFormat": "", "refId": "A" }]
     },
     {
       "collapsed": false,
@@ -226,7 +226,7 @@
       "options": { "colorMode": "background", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "title": "Active WebSocket Connections",
       "type": "stat",
-      "targets": [{ "expr": "dlt_websocket_connections_active", "legendFormat": "", "refId": "A" }]
+      "targets": [{ "expr": "tv_websocket_connections_active", "legendFormat": "", "refId": "A" }]
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
@@ -243,10 +243,10 @@
       "title": "WebSocket Reconnections",
       "type": "stat",
       "targets": [
-        { "expr": "sum(dlt_websocket_reconnections_total)", "legendFormat": "main-feed", "refId": "A" },
-        { "expr": "sum(dlt_depth_20lvl_reconnections_total)", "legendFormat": "depth-20", "refId": "B" },
-        { "expr": "sum(dlt_depth_200lvl_reconnections_total)", "legendFormat": "depth-200", "refId": "C" },
-        { "expr": "dlt_order_update_reconnections_total", "legendFormat": "order-update", "refId": "D" }
+        { "expr": "sum(tv_websocket_reconnections_total)", "legendFormat": "main-feed", "refId": "A" },
+        { "expr": "sum(tv_depth_20lvl_reconnections_total)", "legendFormat": "depth-20", "refId": "B" },
+        { "expr": "sum(tv_depth_200lvl_reconnections_total)", "legendFormat": "depth-200", "refId": "C" },
+        { "expr": "tv_order_update_reconnections_total", "legendFormat": "order-update", "refId": "D" }
       ]
     },
     {
@@ -265,10 +265,10 @@
       "title": "WebSocket Connection History",
       "type": "timeseries",
       "targets": [
-        { "expr": "dlt_websocket_connections_active", "legendFormat": "active connections", "refId": "A" },
-        { "expr": "dlt_depth_20lvl_connection_active", "legendFormat": "depth-20 {{underlying}}", "refId": "C" },
-        { "expr": "dlt_depth_200lvl_connection_active", "legendFormat": "depth-200 {{underlying}}", "refId": "D" },
-        { "expr": "dlt_order_update_ws_active", "legendFormat": "order-update", "refId": "E" }
+        { "expr": "tv_websocket_connections_active", "legendFormat": "active connections", "refId": "A" },
+        { "expr": "tv_depth_20lvl_connection_active", "legendFormat": "depth-20 {{underlying}}", "refId": "C" },
+        { "expr": "tv_depth_200lvl_connection_active", "legendFormat": "depth-200 {{underlying}}", "refId": "D" },
+        { "expr": "tv_order_update_ws_active", "legendFormat": "order-update", "refId": "E" }
       ]
     },
     {
@@ -285,7 +285,7 @@
       "options": { "colorMode": "background", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "title": "Depth 20-Level Connections",
       "type": "stat",
-      "targets": [{ "expr": "dlt_depth_20lvl_connection_active", "legendFormat": "{{underlying}}", "refId": "A" }]
+      "targets": [{ "expr": "tv_depth_20lvl_connection_active", "legendFormat": "{{underlying}}", "refId": "A" }]
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
@@ -301,7 +301,7 @@
       "options": { "colorMode": "background", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "title": "Depth 200-Level Connections",
       "type": "stat",
-      "targets": [{ "expr": "dlt_depth_200lvl_connection_active", "legendFormat": "{{underlying}}", "refId": "A" }]
+      "targets": [{ "expr": "tv_depth_200lvl_connection_active", "legendFormat": "{{underlying}}", "refId": "A" }]
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
@@ -319,8 +319,8 @@
       "title": "Depth Frames Rate",
       "type": "timeseries",
       "targets": [
-        { "expr": "rate(dlt_depth_20lvl_frames_total[1m])", "legendFormat": "20-level {{underlying}}", "refId": "A" },
-        { "expr": "rate(dlt_depth_200lvl_frames_total[1m])", "legendFormat": "200-level {{underlying}}", "refId": "B" }
+        { "expr": "rate(tv_depth_20lvl_frames_total[1m])", "legendFormat": "20-level {{underlying}}", "refId": "A" },
+        { "expr": "rate(tv_depth_200lvl_frames_total[1m])", "legendFormat": "200-level {{underlying}}", "refId": "B" }
       ]
     },
     {
@@ -337,7 +337,7 @@
       "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "title": "Depth Frames Dropped",
       "type": "stat",
-      "targets": [{ "expr": "dlt_depth_frames_dropped_total", "legendFormat": "{{depth}} {{type}}", "refId": "A" }]
+      "targets": [{ "expr": "tv_depth_frames_dropped_total", "legendFormat": "{{depth}} {{type}}", "refId": "A" }]
     },
     {
       "collapsed": false,
@@ -360,7 +360,7 @@
       "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "title": "Historical Candles Fetched",
       "type": "stat",
-      "targets": [{ "expr": "dlt_historical_candles_fetched_total", "legendFormat": "", "refId": "A" }]
+      "targets": [{ "expr": "tv_historical_candles_fetched_total", "legendFormat": "", "refId": "A" }]
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
@@ -377,7 +377,7 @@
       "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "title": "Historical API Errors",
       "type": "stat",
-      "targets": [{ "expr": "dlt_historical_api_errors_total", "legendFormat": "", "refId": "A" }]
+      "targets": [{ "expr": "tv_historical_api_errors_total", "legendFormat": "", "refId": "A" }]
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
@@ -394,7 +394,7 @@
       "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "title": "Dedup Filtered Total",
       "type": "stat",
-      "targets": [{ "expr": "dlt_dedup_filtered_total", "legendFormat": "", "refId": "A" }]
+      "targets": [{ "expr": "tv_dedup_filtered_total", "legendFormat": "", "refId": "A" }]
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
@@ -411,7 +411,7 @@
       "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "title": "Crossed Market Events",
       "type": "stat",
-      "targets": [{ "expr": "dlt_crossed_market_total", "legendFormat": "", "refId": "A" }]
+      "targets": [{ "expr": "tv_crossed_market_total", "legendFormat": "", "refId": "A" }]
     },
     {
       "collapsed": false,
@@ -440,9 +440,9 @@
       "title": "Order Flow Rate",
       "type": "timeseries",
       "targets": [
-        { "expr": "rate(dlt_orders_placed_total[1m])", "legendFormat": "placed/s", "refId": "A" },
-        { "expr": "rate(dlt_orders_filled_total[1m])", "legendFormat": "filled/s", "refId": "B" },
-        { "expr": "rate(dlt_orders_rejected_total[1m])", "legendFormat": "rejected/s", "refId": "C" }
+        { "expr": "rate(tv_orders_placed_total[1m])", "legendFormat": "placed/s", "refId": "A" },
+        { "expr": "rate(tv_orders_filled_total[1m])", "legendFormat": "filled/s", "refId": "B" },
+        { "expr": "rate(tv_orders_rejected_total[1m])", "legendFormat": "rejected/s", "refId": "C" }
       ]
     },
     {
@@ -459,7 +459,7 @@
       "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "title": "Orders Placed",
       "type": "stat",
-      "targets": [{ "expr": "dlt_orders_placed_total", "legendFormat": "", "refId": "A" }]
+      "targets": [{ "expr": "tv_orders_placed_total", "legendFormat": "", "refId": "A" }]
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
@@ -475,7 +475,7 @@
       "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "title": "Orders Filled",
       "type": "stat",
-      "targets": [{ "expr": "dlt_orders_filled_total", "legendFormat": "", "refId": "A" }]
+      "targets": [{ "expr": "tv_orders_filled_total", "legendFormat": "", "refId": "A" }]
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
@@ -492,7 +492,7 @@
       "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "title": "Orders Rejected",
       "type": "stat",
-      "targets": [{ "expr": "dlt_orders_rejected_total", "legendFormat": "", "refId": "A" }]
+      "targets": [{ "expr": "tv_orders_rejected_total", "legendFormat": "", "refId": "A" }]
     },
     {
       "collapsed": false,
@@ -519,7 +519,7 @@
       "options": { "legend": { "calcs": ["lastNotNull", "min", "max"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
       "title": "OBI by Underlying",
       "type": "timeseries",
-      "targets": [{ "expr": "dlt_obi_value", "legendFormat": "{{underlying}}", "refId": "A" }]
+      "targets": [{ "expr": "tv_obi_value", "legendFormat": "{{underlying}}", "refId": "A" }]
     },
     {
       "datasource": { "type": "questdb", "uid": "questdb" },
@@ -591,6 +591,6 @@
   "timepicker": {},
   "timezone": "Asia/Kolkata",
   "title": "Trading Pipeline",
-  "uid": "dlt-trading-pipeline",
+  "uid": "tv-trading-pipeline",
   "version": 1
 }

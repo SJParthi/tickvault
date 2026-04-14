@@ -2,7 +2,7 @@
 //!
 //! Format: `<BHBII>` — Header(8) + OI(u32).
 
-use dhan_live_trader_common::constants::{OI_OFFSET_VALUE, OI_PACKET_SIZE};
+use tickvault_common::constants::{OI_OFFSET_VALUE, OI_PACKET_SIZE};
 
 use super::types::{PacketHeader, ParseError};
 

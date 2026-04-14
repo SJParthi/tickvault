@@ -7,7 +7,7 @@
 #![allow(missing_docs)] // TODO: enforce after adding docs to all public items
 
 /// Shared types, constants, configuration, and error definitions
-/// for the `dhan-live-trader` workspace.
+/// for the `tickvault` workspace.
 ///
 /// This crate is imported by every other crate in the workspace.
 /// It contains no business logic — only definitions and data structures.

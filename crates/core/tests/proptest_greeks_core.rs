@@ -6,25 +6,25 @@
 
 #![allow(clippy::unwrap_used, clippy::arithmetic_side_effects)]
 
-use dhan_live_trader_common::constants::{
+use proptest::prelude::*;
+use tickvault_common::constants::{
     BINARY_HEADER_SIZE, DEEP_DEPTH_HEADER_SIZE, DISCONNECT_PACKET_SIZE, FULL_QUOTE_PACKET_SIZE,
     MARKET_DEPTH_PACKET_SIZE, MARKET_STATUS_PACKET_SIZE, OI_PACKET_SIZE,
     PREVIOUS_CLOSE_PACKET_SIZE, QUOTE_PACKET_SIZE, TICKER_PACKET_SIZE,
 };
-use dhan_live_trader_common::tick_types::ParsedTick;
-use dhan_live_trader_common::types::{ExchangeSegment, FeedMode};
-use dhan_live_trader_core::parser::deep_depth::{
+use tickvault_common::tick_types::ParsedTick;
+use tickvault_common::types::{ExchangeSegment, FeedMode};
+use tickvault_core::parser::deep_depth::{
     DepthSide, feed_code_to_side, parse_deep_depth_header, parse_twenty_depth_packet,
     parse_two_hundred_depth_packet,
 };
-use dhan_live_trader_core::parser::dispatch_frame;
-use dhan_live_trader_core::parser::dispatcher::dispatch_deep_depth_frame;
-use dhan_live_trader_core::parser::types::ParsedFrame;
-use dhan_live_trader_core::pipeline::candle_aggregator::CandleAggregator;
-use dhan_live_trader_core::pipeline::top_movers::TopMoversTracker;
-use dhan_live_trader_core::websocket::subscription_builder::build_subscription_messages;
-use dhan_live_trader_core::websocket::types::InstrumentSubscription;
-use proptest::prelude::*;
+use tickvault_core::parser::dispatch_frame;
+use tickvault_core::parser::dispatcher::dispatch_deep_depth_frame;
+use tickvault_core::parser::types::ParsedFrame;
+use tickvault_core::pipeline::candle_aggregator::CandleAggregator;
+use tickvault_core::pipeline::top_movers::TopMoversTracker;
+use tickvault_core::websocket::subscription_builder::build_subscription_messages;
+use tickvault_core::websocket::types::InstrumentSubscription;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -92,7 +92,7 @@ proptest! {
     fn proptest_header_random_8_bytes_never_panics(
         data in prop::collection::vec(any::<u8>(), BINARY_HEADER_SIZE),
     ) {
-        let result = dhan_live_trader_core::parser::header::parse_header(&data);
+        let result = tickvault_core::parser::header::parse_header(&data);
         // Must always succeed on exactly 8 bytes
         prop_assert!(result.is_ok());
     }
@@ -107,8 +107,8 @@ proptest! {
     fn proptest_ticker_random_bytes_never_panics(
         data in prop::collection::vec(any::<u8>(), TICKER_PACKET_SIZE),
     ) {
-        let header = dhan_live_trader_core::parser::header::parse_header(&data).unwrap();
-        let _ = dhan_live_trader_core::parser::ticker::parse_ticker_packet(&data, &header, 0);
+        let header = tickvault_core::parser::header::parse_header(&data).unwrap();
+        let _ = tickvault_core::parser::ticker::parse_ticker_packet(&data, &header, 0);
     }
 }
 
@@ -121,8 +121,8 @@ proptest! {
     fn proptest_quote_random_bytes_never_panics(
         data in prop::collection::vec(any::<u8>(), QUOTE_PACKET_SIZE),
     ) {
-        let header = dhan_live_trader_core::parser::header::parse_header(&data).unwrap();
-        let _ = dhan_live_trader_core::parser::quote::parse_quote_packet(&data, &header, 0);
+        let header = tickvault_core::parser::header::parse_header(&data).unwrap();
+        let _ = tickvault_core::parser::quote::parse_quote_packet(&data, &header, 0);
     }
 }
 
@@ -135,8 +135,8 @@ proptest! {
     fn proptest_full_packet_random_bytes_never_panics(
         data in prop::collection::vec(any::<u8>(), FULL_QUOTE_PACKET_SIZE),
     ) {
-        let header = dhan_live_trader_core::parser::header::parse_header(&data).unwrap();
-        let _ = dhan_live_trader_core::parser::full_packet::parse_full_packet(&data, &header, 0);
+        let header = tickvault_core::parser::header::parse_header(&data).unwrap();
+        let _ = tickvault_core::parser::full_packet::parse_full_packet(&data, &header, 0);
     }
 }
 
@@ -149,8 +149,8 @@ proptest! {
     fn proptest_oi_random_bytes_never_panics(
         data in prop::collection::vec(any::<u8>(), OI_PACKET_SIZE),
     ) {
-        let header = dhan_live_trader_core::parser::header::parse_header(&data).unwrap();
-        let _ = dhan_live_trader_core::parser::oi::parse_oi_packet(&data, &header);
+        let header = tickvault_core::parser::header::parse_header(&data).unwrap();
+        let _ = tickvault_core::parser::oi::parse_oi_packet(&data, &header);
     }
 }
 
@@ -163,8 +163,8 @@ proptest! {
     fn proptest_prev_close_random_bytes_never_panics(
         data in prop::collection::vec(any::<u8>(), PREVIOUS_CLOSE_PACKET_SIZE),
     ) {
-        let header = dhan_live_trader_core::parser::header::parse_header(&data).unwrap();
-        let _ = dhan_live_trader_core::parser::previous_close::parse_previous_close_packet(&data, &header);
+        let header = tickvault_core::parser::header::parse_header(&data).unwrap();
+        let _ = tickvault_core::parser::previous_close::parse_previous_close_packet(&data, &header);
     }
 }
 
@@ -177,8 +177,8 @@ proptest! {
     fn proptest_disconnect_random_bytes_never_panics(
         data in prop::collection::vec(any::<u8>(), DISCONNECT_PACKET_SIZE),
     ) {
-        let header = dhan_live_trader_core::parser::header::parse_header(&data).unwrap();
-        let _ = dhan_live_trader_core::parser::disconnect::parse_disconnect_packet(&data, &header);
+        let header = tickvault_core::parser::header::parse_header(&data).unwrap();
+        let _ = tickvault_core::parser::disconnect::parse_disconnect_packet(&data, &header);
     }
 }
 
@@ -191,8 +191,8 @@ proptest! {
     fn proptest_market_depth_random_bytes_never_panics(
         data in prop::collection::vec(any::<u8>(), MARKET_DEPTH_PACKET_SIZE),
     ) {
-        let header = dhan_live_trader_core::parser::header::parse_header(&data).unwrap();
-        let _ = dhan_live_trader_core::parser::market_depth::parse_market_depth_packet(&data, &header, 0);
+        let header = tickvault_core::parser::header::parse_header(&data).unwrap();
+        let _ = tickvault_core::parser::market_depth::parse_market_depth_packet(&data, &header, 0);
     }
 }
 
@@ -205,14 +205,14 @@ proptest! {
     fn proptest_market_status_random_bytes_never_panics(
         data in prop::collection::vec(any::<u8>(), 0..32),
     ) {
-        let _ = dhan_live_trader_core::parser::market_status::validate_market_status_packet(&data);
+        let _ = tickvault_core::parser::market_status::validate_market_status_packet(&data);
     }
 
     #[test]
     fn proptest_market_status_valid_size_always_ok(
         data in prop::collection::vec(any::<u8>(), MARKET_STATUS_PACKET_SIZE..64),
     ) {
-        let result = dhan_live_trader_core::parser::market_status::validate_market_status_packet(&data);
+        let result = tickvault_core::parser::market_status::validate_market_status_packet(&data);
         prop_assert!(result.is_ok());
     }
 }

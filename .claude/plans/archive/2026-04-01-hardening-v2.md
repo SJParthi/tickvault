@@ -58,7 +58,7 @@
 
 - [x] C2: Add broadcast lag alert (fast boot: ticks permanently lost on Lagged error)
   - Files: `crates/app/src/main.rs`
-  - Change: On `RecvError::Lagged(N)` at line ~1794, fire CRITICAL Telegram alert with count. Add `dlt_ticks_permanently_lost` counter.
+  - Change: On `RecvError::Lagged(N)` at line ~1794, fire CRITICAL Telegram alert with count. Add `tv_ticks_permanently_lost` counter.
   - Tests: `test_broadcast_lag_fires_critical_alert`
 
 - [x] C3: Add periodic health check timer for disk space + memory RSS
@@ -164,7 +164,7 @@ Priority 6: F1 → F2 → F3       (Documentation)
 | 1 | Fast boot with QuestDB down from start | `run_tick_persistence_consumer` uses `new_disconnected`, buffers all ticks. ZERO loss. | A |
 | 2 | Slow boot with QuestDB down — depth | Depth writer starts in disconnected mode, buffers to ring buffer + disk spill. | B |
 | 3 | QuestDB drops mid-session | Telegram CRITICAL alert fired. Ticks buffered. Auto-reconnect + drain on recovery. | C |
-| 4 | Broadcast channel lags in fast boot | CRITICAL Telegram alert with count. `dlt_ticks_permanently_lost` counter incremented. | C |
+| 4 | Broadcast channel lags in fast boot | CRITICAL Telegram alert with count. `tv_ticks_permanently_lost` counter incremented. | C |
 | 5 | Disk space or memory approaching limits | Periodic check fires Telegram warning. | C |
 | 6 | Config changed to `mode = "live"` before July | OMS constructor panics at boot with clear error message. | D |
 | 7 | `dry_run = false` in base.toml committed | Test `test_base_config_dry_run_is_true` fails, CI blocks merge. | D |

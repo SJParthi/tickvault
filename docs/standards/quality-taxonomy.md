@@ -1,6 +1,6 @@
 # Quality Taxonomy — Master Reference
 
-> **Single source of truth** for all quality dimensions in dhan-live-trader.
+> **Single source of truth** for all quality dimensions in tickvault.
 > Open this file at the start of every session. Verify every applicable dimension before committing.
 >
 > **Last updated:** 2026-03-17 | **Total dimensions:** 98 | **Test baseline:** 2439
@@ -217,7 +217,7 @@ cargo fuzz init --fuzz-dir crates/core/fuzz
 cargo install cargo-mutants
 
 # Run on critical crates only (full workspace is too slow)
-cargo mutants -p dlt-core -p dlt-trading --timeout 120
+cargo mutants -p tv-core -p tv-trading --timeout 120
 
 # Target: >80% mutation kill rate on core + trading crates
 ```
@@ -329,7 +329,7 @@ critcmp main pr --threshold 5
 cargo install flamegraph
 
 # Generate (requires perf on Linux, dtrace on macOS)
-cargo flamegraph --bin dlt-app -- --config config/base.toml
+cargo flamegraph --bin tickvault -- --config config/base.toml
 
 # AWS c7i.2xlarge supports perf — run during staging deploy
 ```
@@ -499,7 +499,7 @@ RUN ulimit -c unlimited
 
 # In docker-compose.yml
 services:
-  dlt-app:
+  tickvault:
     ulimits:
       core: -1
     volumes:

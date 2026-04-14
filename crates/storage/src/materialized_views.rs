@@ -16,8 +16,8 @@ use std::time::Duration;
 
 use tracing::{debug, error, info, warn};
 
-use dhan_live_trader_common::config::QuestDbConfig;
-use dhan_live_trader_common::constants::{QUESTDB_IST_ALIGN_OFFSET, QUESTDB_TABLE_CANDLES_1S};
+use tickvault_common::config::QuestDbConfig;
+use tickvault_common::constants::{QUESTDB_IST_ALIGN_OFFSET, QUESTDB_TABLE_CANDLES_1S};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -782,8 +782,8 @@ mod tests {
 
     #[test]
     fn test_build_questdb_exec_url_docker() {
-        let url = build_questdb_exec_url("dlt-questdb", 9000);
-        assert_eq!(url, "http://dlt-questdb:9000/exec");
+        let url = build_questdb_exec_url("tv-questdb", 9000);
+        assert_eq!(url, "http://tv-questdb:9000/exec");
     }
 
     #[test]

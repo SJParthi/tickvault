@@ -25,7 +25,7 @@ enforcement are confirmed correct. Five monitoring/alerting gaps were identified
   - Impl: cleanup_old_spill_files removes files older than SPILL_FILE_MAX_AGE_SECS, called in health loop
 
 - [x] Item 4: Circuit breaker alert rule via Prometheus → Alertmanager → Telegram
-  - Files: dlt-alerts.yml
+  - Files: tv-alerts.yml
   - Impl: Added CircuitBreakerOpen alert rule
 
 - [x] Item 5: Circuit breaker OPEN → halt new orders (ALREADY IMPLEMENTED)

@@ -50,9 +50,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
-use dhan_live_trader_common::config::QuestDbConfig;
-use dhan_live_trader_common::tick_types::ParsedTick;
-use dhan_live_trader_storage::tick_persistence::TickPersistenceWriter;
+use tickvault_common::config::QuestDbConfig;
+use tickvault_common::tick_types::ParsedTick;
+use tickvault_storage::tick_persistence::TickPersistenceWriter;
 
 // ---------------------------------------------------------------------------
 // Test helpers
@@ -316,25 +316,25 @@ fn questdb_round_trip_preserves_every_tick() {
 /// **Ignored** — full docker-backed chaos test.
 ///
 /// Runs only when `CI_WITH_DOCKER=1 cargo test -- --ignored` and a real
-/// `dlt-questdb` container is available on `localhost:9009`. Kills the
-/// container via `docker kill dlt-questdb`, injects 10K ticks, restarts,
+/// `tv-questdb` container is available on `localhost:9009`. Kills the
+/// container via `docker kill tv-questdb`, injects 10K ticks, restarts,
 /// drains, asserts exact count.
 ///
 /// This is the **end-to-end proof** of the zero-tick-loss contract against
 /// real QuestDB. Left as a follow-up — the test infrastructure in this file
 /// is the foundation.
 #[test]
-#[ignore = "requires CI_WITH_DOCKER=1 and a running dlt-questdb container"]
+#[ignore = "requires CI_WITH_DOCKER=1 and a running tv-questdb container"]
 fn chaos_docker_questdb_kill_and_restart() {
     if std::env::var("CI_WITH_DOCKER").is_err() {
         return;
     }
     // TODO(B1-next-session): implement the docker chaos harness:
-    //   1. Verify dlt-questdb is reachable on 9009
+    //   1. Verify tv-questdb is reachable on 9009
     //   2. Connect writer + inject ticks with known hashes
-    //   3. std::process::Command::new("docker").args(["kill", "dlt-questdb"]).status()
+    //   3. std::process::Command::new("docker").args(["kill", "tv-questdb"]).status()
     //   4. Inject more ticks (buffered)
-    //   5. docker start dlt-questdb
+    //   5. docker start tv-questdb
     //   6. Wait for readiness (HTTP 9000 /exec?query=SELECT%201)
     //   7. Query ticks table via HTTP, compare count + hash to injected set
     //   8. Assert every injected tick is present and no duplicates

@@ -1,6 +1,6 @@
 # 22 Test Type Standards — Canonical Definition
 
-> **Single source of truth** for all test type categories in dhan-live-trader.
+> **Single source of truth** for all test type categories in tickvault.
 > Every other document (testing-standards.md, testing.md rule, quality-taxonomy.md) references THIS file.
 >
 > **Enforcement:** `scripts/test-coverage-guard.sh` (mechanical, blocks push)

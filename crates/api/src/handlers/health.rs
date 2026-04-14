@@ -146,7 +146,7 @@ mod tests {
     use crate::state::{SharedHealthStatus, SystemHealthStatus};
     use std::sync::Arc;
 
-    use dhan_live_trader_common::config::{DhanConfig, InstrumentConfig, QuestDbConfig};
+    use tickvault_common::config::{DhanConfig, InstrumentConfig, QuestDbConfig};
 
     fn make_test_state(health: SharedHealthStatus) -> SharedAppState {
         SharedAppState::new(

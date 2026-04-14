@@ -19,7 +19,7 @@
 
 use std::collections::HashMap;
 
-use dhan_live_trader_common::tick_types::ParsedTick;
+use tickvault_common::tick_types::ParsedTick;
 
 // ---------------------------------------------------------------------------
 // Constants

@@ -1,5 +1,5 @@
 # =============================================================================
-# dhan-live-trader — Cargo Configuration
+# tickvault — Cargo Configuration
 # =============================================================================
 # Build settings, aliases, and optimization flags.
 # =============================================================================
@@ -8,7 +8,7 @@
 t = "test --workspace"
 c = "clippy --workspace --all-targets -- -D warnings -W clippy::perf"
 b = "build --release"
-r = "run --package dhan-live-trader-app"
+r = "run --package tickvault-app"
 d = "doc --workspace --no-deps --open"
 a = "audit"
 

@@ -1,5 +1,5 @@
 # =============================================================================
-# dhan-live-trader — Grafana Dashboard Provisioning
+# tickvault — Grafana Dashboard Provisioning
 # =============================================================================
 # Auto-loads JSON dashboards from /var/lib/grafana/dashboards.
 # Reloads every 10 seconds. File is ALWAYS source of truth.
@@ -8,9 +8,9 @@
 apiVersion: 1
 
 providers:
-  - name: "dlt-dashboards"
+  - name: "tv-dashboards"
     orgId: 1
-    folder: "dhan-live-trader"
+    folder: "tickvault"
     type: file
     disableDeletion: false
     editable: false

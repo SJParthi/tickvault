@@ -1,7 +1,7 @@
 # =============================================================================
-# dhan-live-trader — Prometheus Configuration
+# tickvault — Prometheus Configuration
 # =============================================================================
-# Scrapes all dlt-* services. Recording & alert rules in ./rules/
+# Scrapes all tv-* services. Recording & alert rules in ./rules/
 # =============================================================================
 
 global:
@@ -13,46 +13,46 @@ global:
 alerting:
   alertmanagers:
     - static_configs:
-        - targets: ["dlt-alertmanager:9093"]
+        - targets: ["tv-alertmanager:9093"]
 
 # Load recording rules and alert rules
 rule_files:
   - "/etc/prometheus/rules/*.yml"
 
 scrape_configs:
-  # Application metrics (exposed by dhan-live-trader via metrics-exporter-prometheus)
+  # Application metrics (exposed by tickvault via metrics-exporter-prometheus)
   # App runs on the host (IntelliJ / cargo run), not inside Docker.
   # host.docker.internal resolves to the Docker host on both macOS and Linux
   # (Linux requires extra_hosts in docker-compose.yml).
   # NOTE: This target shows DOWN when the Rust app is not running — that is EXPECTED.
   # The app's Prometheus metrics exporter binds to 0.0.0.0:9091 at boot (config/base.toml).
-  - job_name: "dlt-application"
+  - job_name: "tickvault"
     scrape_interval: 15s
     scrape_timeout: 5s
     static_configs:
       - targets: ["host.docker.internal:9091"]
         labels:
-          service: "dhan-live-trader"
+          service: "tickvault"
 
   # Prometheus self-monitoring
-  - job_name: "dlt-prometheus"
+  - job_name: "tv-prometheus"
     static_configs:
       - targets: ["localhost:9090"]
         labels:
           service: "prometheus"
 
   # QuestDB metrics
-  - job_name: "dlt-questdb"
+  - job_name: "tv-questdb"
     static_configs:
-      - targets: ["dlt-questdb:9003"]
+      - targets: ["tv-questdb:9003"]
         labels:
           service: "questdb"
     metrics_path: "/metrics"
 
   # Traefik metrics (via dedicated metrics entrypoint)
-  - job_name: "dlt-traefik"
+  - job_name: "tv-traefik"
     static_configs:
-      - targets: ["dlt-traefik:8082"]
+      - targets: ["tv-traefik:8082"]
         labels:
           service: "traefik"
 
@@ -61,17 +61,17 @@ scrape_configs:
   # Jaeger REMOVED — distributed tracing disabled. CloudWatch Logs replaces.
 
   # Grafana metrics
-  - job_name: "dlt-grafana"
+  - job_name: "tv-grafana"
     static_configs:
-      - targets: ["dlt-grafana:3000"]
+      - targets: ["tv-grafana:3000"]
         labels:
           service: "grafana"
     metrics_path: "/metrics"
 
   # Valkey metrics (via redis_exporter sidecar on :9121)
-  - job_name: "dlt-valkey"
+  - job_name: "tv-valkey"
     static_configs:
-      - targets: ["dlt-valkey-exporter:9121"]
+      - targets: ["tv-valkey-exporter:9121"]
         labels:
           service: "valkey"
     metrics_path: "/metrics"

@@ -13,7 +13,7 @@ use std::sync::{Arc, RwLock};
 
 use tracing::debug;
 
-use dhan_live_trader_common::tick_types::ParsedTick;
+use tickvault_common::tick_types::ParsedTick;
 
 /// Shared handle for the latest top movers snapshot.
 ///

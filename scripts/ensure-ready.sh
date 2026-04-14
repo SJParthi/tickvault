@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # =============================================================================
-# dhan-live-trader — Ensure Ready (Idempotent)
+# tickvault — Ensure Ready (Idempotent)
 # =============================================================================
 # Called by IntelliJ "Before launch" on every Run App / Test All.
 #
-# Fast path: if all 8 dlt-* containers are healthy → exits in <1 second.
+# Fast path: if all 8 tv-* containers are healthy → exits in <1 second.
 # Slow path: runs full setup (Docker + SSM + tables + tools) → 3-5 min first time.
 #
 # This replaces the need for a separate "Bootstrap" step. Clone → Run → Done.
@@ -40,11 +40,11 @@ open_dashboards() {
     open_url "http://localhost:9000"
     sleep 0.3
     # Grafana dashboards (anonymous access enabled — no login required)
-    open_url "http://localhost:3000/d/dlt-system-overview/dlt-system-overview?orgId=1&refresh=5s"
+    open_url "http://localhost:3000/d/tv-system-overview/tv-system-overview?orgId=1&refresh=5s"
     sleep 0.3
-    open_url "http://localhost:3000/d/dlt-market-data/market-data-explorer?orgId=1&from=now-3d&to=now&timezone=Asia%2FKolkata&refresh=5s"
+    open_url "http://localhost:3000/d/tv-market-data/market-data-explorer?orgId=1&from=now-3d&to=now&timezone=Asia%2FKolkata&refresh=5s"
     sleep 0.3
-    open_url "http://localhost:3000/d/dlt-trading-pipeline/trading-pipeline?orgId=1&refresh=5s"
+    open_url "http://localhost:3000/d/tv-trading-pipeline/trading-pipeline?orgId=1&refresh=5s"
     sleep 0.3
     # Jaeger tracing UI
     open_url "http://localhost:16686"
@@ -52,12 +52,12 @@ open_dashboards() {
 }
 
 # ---- Auto-configure ~/.pgpass for IntelliJ QuestDB database tool ----
-# Reads credentials from the running dlt-questdb container (set via AWS SSM).
+# Reads credentials from the running tv-questdb container (set via AWS SSM).
 # pgpass format: hostname:port:database:username:password
 ensure_pgpass() {
     local qdb_user qdb_pass pgpass_entry
-    qdb_user=$(docker exec dlt-questdb printenv QDB_PG_USER 2>/dev/null) || return 0
-    qdb_pass=$(docker exec dlt-questdb printenv QDB_PG_PASSWORD 2>/dev/null) || return 0
+    qdb_user=$(docker exec tv-questdb printenv QDB_PG_USER 2>/dev/null) || return 0
+    qdb_pass=$(docker exec tv-questdb printenv QDB_PG_PASSWORD 2>/dev/null) || return 0
     [ -z "${qdb_pass}" ] && return 0
 
     pgpass_entry="localhost:8812:qdb:${qdb_user}:${qdb_pass}"
@@ -75,14 +75,14 @@ ensure_pgpass() {
 
 # ---- Fast path: check if all 8 containers are running ----
 REQUIRED_CONTAINERS=(
-    "dlt-questdb"
-    "dlt-valkey"
-    "dlt-prometheus"
-    "dlt-grafana"
-    "dlt-loki"
-    "dlt-alloy"
-    "dlt-jaeger"
-    "dlt-traefik"
+    "tv-questdb"
+    "tv-valkey"
+    "tv-prometheus"
+    "tv-grafana"
+    "tv-loki"
+    "tv-alloy"
+    "tv-jaeger"
+    "tv-traefik"
 )
 
 all_running() {
@@ -215,6 +215,6 @@ if all_running; then
     exit 0
 else
     echo -e "${RED}Some containers failed to start. Check Docker Desktop.${NC}"
-    docker ps --filter "name=dlt-" --format "  {{.Names}}\t{{.Status}}" | sort
+    docker ps --filter "name=tv-" --format "  {{.Names}}\t{{.Status}}" | sort
     exit 1
 fi

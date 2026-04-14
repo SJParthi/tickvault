@@ -19,13 +19,13 @@ use arc_swap::ArcSwap;
 use secrecy::ExposeSecret;
 use tracing::{error, info, instrument, warn};
 
-use dhan_live_trader_common::config::{DhanConfig, NetworkConfig, TokenConfig};
-use dhan_live_trader_common::constants::{
+use tickvault_common::config::{DhanConfig, NetworkConfig, TokenConfig};
+use tickvault_common::constants::{
     AUTH_RETRY_MAX_BACKOFF_SECS, DHAN_GENERATE_TOKEN_PATH, DHAN_RENEW_TOKEN_PATH,
     DHAN_TOKEN_GENERATION_COOLDOWN_SECS, TOTP_MAX_RETRIES, TOTP_PERIOD_SECS,
 };
-use dhan_live_trader_common::error::ApplicationError;
-use dhan_live_trader_common::sanitize::redact_url_params;
+use tickvault_common::error::ApplicationError;
+use tickvault_common::sanitize::redact_url_params;
 
 use super::secret_manager;
 use super::token_cache;
@@ -219,7 +219,7 @@ impl TokenManager {
                             );
                             notifier.notify(NotificationEvent::AuthenticationFailed {
                                 reason: format!(
-                                    "TOTP invalid after {TOTP_MAX_RETRIES} retries — check /dlt/<env>/dhan/totp-secret in SSM"
+                                    "TOTP invalid after {TOTP_MAX_RETRIES} retries — check /tickvault/<env>/dhan/totp-secret in SSM"
                                 ),
                             });
                             return Err(err);
@@ -444,7 +444,7 @@ impl TokenManager {
         let url = format!(
             "{}{}",
             self.rest_api_base_url,
-            dhan_live_trader_common::constants::DHAN_USER_PROFILE_PATH
+            tickvault_common::constants::DHAN_USER_PROFILE_PATH
         );
 
         let response = self
@@ -786,7 +786,8 @@ impl TokenManager {
                 error!(
                     attempts,
                     circuit_breaker_cycle = consecutive_circuit_breaker_cycles,
-                    max_cycles = dhan_live_trader_common::constants::TOKEN_RENEWAL_MAX_CIRCUIT_BREAKER_CYCLES,
+                    max_cycles =
+                        tickvault_common::constants::TOKEN_RENEWAL_MAX_CIRCUIT_BREAKER_CYCLES,
                     "ALL token renewal attempts exhausted — token may expire"
                 );
                 self.notifier.notify(NotificationEvent::TokenRenewalFailed {
@@ -794,12 +795,12 @@ impl TokenManager {
                     reason: format!(
                         "all renewal attempts exhausted (cycle {}/{}) — token may expire",
                         consecutive_circuit_breaker_cycles,
-                        dhan_live_trader_common::constants::TOKEN_RENEWAL_MAX_CIRCUIT_BREAKER_CYCLES,
+                        tickvault_common::constants::TOKEN_RENEWAL_MAX_CIRCUIT_BREAKER_CYCLES,
                     ),
                 });
 
                 if consecutive_circuit_breaker_cycles
-                    >= dhan_live_trader_common::constants::TOKEN_RENEWAL_MAX_CIRCUIT_BREAKER_CYCLES
+                    >= tickvault_common::constants::TOKEN_RENEWAL_MAX_CIRCUIT_BREAKER_CYCLES
                 {
                     error!(
                         "token renewal halted after {} consecutive failures — operator must intervene",
@@ -815,7 +816,7 @@ impl TokenManager {
                 }
 
                 tokio::time::sleep(Duration::from_secs(
-                    dhan_live_trader_common::constants::TOKEN_RENEWAL_CIRCUIT_BREAKER_RESET_SECS,
+                    tickvault_common::constants::TOKEN_RENEWAL_CIRCUIT_BREAKER_RESET_SECS,
                 ))
                 .await;
             }
@@ -2328,8 +2329,8 @@ mod tests {
 
     /// Helper: creates a `TokenState` for testing using `from_cached`.
     fn make_test_token_state(token_value: &str) -> TokenState {
-        let now_ist = chrono::Utc::now()
-            .with_timezone(&dhan_live_trader_common::trading_calendar::ist_offset());
+        let now_ist =
+            chrono::Utc::now().with_timezone(&tickvault_common::trading_calendar::ist_offset());
         let expires_at = now_ist + chrono::Duration::hours(24);
         TokenState::from_cached(
             secrecy::SecretString::from(token_value.to_string()),

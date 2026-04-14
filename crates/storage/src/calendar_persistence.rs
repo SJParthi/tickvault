@@ -16,9 +16,9 @@ use questdb::ingress::{Sender, TimestampNanos};
 use reqwest::Client;
 use tracing::{debug, info, warn};
 
-use dhan_live_trader_common::config::QuestDbConfig;
-use dhan_live_trader_common::constants::QUESTDB_TABLE_NSE_HOLIDAYS;
-use dhan_live_trader_common::trading_calendar::TradingCalendar;
+use tickvault_common::config::QuestDbConfig;
+use tickvault_common::constants::QUESTDB_TABLE_NSE_HOLIDAYS;
+use tickvault_common::trading_calendar::TradingCalendar;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -62,9 +62,7 @@ fn build_ilp_conf_string(host: &str, ilp_port: u16) -> String {
 }
 
 /// Classifies a calendar entry as "Holiday", "Muhurat Trading", or "Mock Trading Session".
-fn classify_holiday_type(
-    entry: &dhan_live_trader_common::trading_calendar::HolidayInfo,
-) -> &'static str {
+fn classify_holiday_type(entry: &tickvault_common::trading_calendar::HolidayInfo) -> &'static str {
     if entry.is_mock {
         "Mock Trading Session"
     } else if entry.is_muhurat {
@@ -371,7 +369,7 @@ mod tests {
     fn persist_calendar_returns_ok_on_connection_failure() {
         // persist_calendar is best-effort — it must return Ok(()) even on failure.
         // We can test this by creating a calendar and pointing at a dead QuestDB.
-        use dhan_live_trader_common::config::{NseHolidayEntry, TradingConfig};
+        use tickvault_common::config::{NseHolidayEntry, TradingConfig};
 
         let trading_config = TradingConfig {
             market_open_time: "09:00:00".to_string(),
@@ -407,7 +405,7 @@ mod tests {
 
     #[test]
     fn persist_calendar_empty_calendar_returns_ok() {
-        use dhan_live_trader_common::config::TradingConfig;
+        use tickvault_common::config::TradingConfig;
 
         let trading_config = TradingConfig {
             market_open_time: "09:00:00".to_string(),
@@ -446,14 +444,14 @@ mod tests {
 
     #[test]
     fn ilp_connection_string_format() {
-        let conf_string = build_ilp_conf_string("dlt-questdb", 9009);
-        assert_eq!(conf_string, "tcp::addr=dlt-questdb:9009;");
+        let conf_string = build_ilp_conf_string("tv-questdb", 9009);
+        assert_eq!(conf_string, "tcp::addr=tv-questdb:9009;");
     }
 
     #[test]
     fn http_base_url_format() {
-        let base_url = build_questdb_exec_url("dlt-questdb", 9000);
-        assert_eq!(base_url, "http://dlt-questdb:9000/exec");
+        let base_url = build_questdb_exec_url("tv-questdb", 9000);
+        assert_eq!(base_url, "http://tv-questdb:9000/exec");
     }
 
     // -----------------------------------------------------------------------
@@ -531,7 +529,7 @@ mod tests {
 
     #[test]
     fn test_classify_holiday_type_regular() {
-        use dhan_live_trader_common::trading_calendar::HolidayInfo;
+        use tickvault_common::trading_calendar::HolidayInfo;
         let entry = HolidayInfo {
             date: chrono::NaiveDate::from_ymd_opt(2026, 1, 26).unwrap(),
             name: "Republic Day".to_string(),
@@ -543,7 +541,7 @@ mod tests {
 
     #[test]
     fn test_classify_holiday_type_muhurat() {
-        use dhan_live_trader_common::trading_calendar::HolidayInfo;
+        use tickvault_common::trading_calendar::HolidayInfo;
         let entry = HolidayInfo {
             date: chrono::NaiveDate::from_ymd_opt(2026, 11, 8).unwrap(),
             name: "Diwali".to_string(),
@@ -555,7 +553,7 @@ mod tests {
 
     #[test]
     fn test_classify_holiday_type_mock() {
-        use dhan_live_trader_common::trading_calendar::HolidayInfo;
+        use tickvault_common::trading_calendar::HolidayInfo;
         let entry = HolidayInfo {
             date: chrono::NaiveDate::from_ymd_opt(2026, 1, 3).unwrap(),
             name: "Mock Trading Session 1".to_string(),
@@ -780,7 +778,7 @@ mod tests {
 
     #[test]
     fn test_persist_inner_with_calendar_data_and_tcp_drain() {
-        use dhan_live_trader_common::config::{NseHolidayEntry, TradingConfig};
+        use tickvault_common::config::{NseHolidayEntry, TradingConfig};
 
         let port = spawn_tcp_drain_server();
         let config = QuestDbConfig {
@@ -820,7 +818,7 @@ mod tests {
 
     #[test]
     fn test_persist_inner_with_muhurat_and_holiday() {
-        use dhan_live_trader_common::config::{NseHolidayEntry, TradingConfig};
+        use tickvault_common::config::{NseHolidayEntry, TradingConfig};
 
         let port = spawn_tcp_drain_server();
         let config = QuestDbConfig {
@@ -889,7 +887,7 @@ mod tests {
     #[test]
     fn test_classify_holiday_type_mock_takes_precedence() {
         // If both is_mock and is_muhurat are true, mock wins (checked first)
-        let entry = dhan_live_trader_common::trading_calendar::HolidayInfo {
+        let entry = tickvault_common::trading_calendar::HolidayInfo {
             date: chrono::NaiveDate::from_ymd_opt(2026, 3, 14).unwrap(),
             name: "Both".to_string(),
             is_muhurat: true,
@@ -938,8 +936,8 @@ mod tests {
 
     #[test]
     fn test_build_questdb_exec_url() {
-        let url = build_questdb_exec_url("dlt-questdb", 9000);
-        assert_eq!(url, "http://dlt-questdb:9000/exec");
+        let url = build_questdb_exec_url("tv-questdb", 9000);
+        assert_eq!(url, "http://tv-questdb:9000/exec");
     }
 
     #[test]
@@ -953,8 +951,8 @@ mod tests {
 
     #[test]
     fn test_build_ilp_conf_string() {
-        let conf = build_ilp_conf_string("dlt-questdb", 9009);
-        assert_eq!(conf, "tcp::addr=dlt-questdb:9009;");
+        let conf = build_ilp_conf_string("tv-questdb", 9009);
+        assert_eq!(conf, "tcp::addr=tv-questdb:9009;");
     }
 
     // -----------------------------------------------------------------------

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# dhan-live-trader — Docker Restart (Force)
+# tickvault — Docker Restart (Force)
 # =============================================================================
 # Full restart: down → build → up. Use from IntelliJ run configuration.
 # Preserves volumes (data survives restart). Use docker-down.sh -v for full wipe.
@@ -47,16 +47,16 @@ if ! aws sts get-caller-identity --region "${REGION}" > /dev/null 2>&1; then
 fi
 
 echo -e "${CYAN}Fetching credentials from AWS SSM...${NC}"
-export DLT_QUESTDB_PG_USER=$(fetch_ssm_secret "/dlt/${SSM_ENV}/questdb/pg-user")
-export DLT_QUESTDB_PG_PASSWORD=$(fetch_ssm_secret "/dlt/${SSM_ENV}/questdb/pg-password")
-export DLT_GRAFANA_ADMIN_USER=$(fetch_ssm_secret "/dlt/${SSM_ENV}/grafana/admin-user")
-export DLT_GRAFANA_ADMIN_PASSWORD=$(fetch_ssm_secret "/dlt/${SSM_ENV}/grafana/admin-password")
-export DLT_TELEGRAM_BOT_TOKEN=$(fetch_ssm_secret "/dlt/${SSM_ENV}/telegram/bot-token")
-export DLT_TELEGRAM_CHAT_ID=$(fetch_ssm_secret "/dlt/${SSM_ENV}/telegram/chat-id")
+export TV_QUESTDB_PG_USER=$(fetch_ssm_secret "/tickvault/${SSM_ENV}/questdb/pg-user")
+export TV_QUESTDB_PG_PASSWORD=$(fetch_ssm_secret "/tickvault/${SSM_ENV}/questdb/pg-password")
+export TV_GRAFANA_ADMIN_USER=$(fetch_ssm_secret "/tickvault/${SSM_ENV}/grafana/admin-user")
+export TV_GRAFANA_ADMIN_PASSWORD=$(fetch_ssm_secret "/tickvault/${SSM_ENV}/grafana/admin-password")
+export TV_TELEGRAM_BOT_TOKEN=$(fetch_ssm_secret "/tickvault/${SSM_ENV}/telegram/bot-token")
+export TV_TELEGRAM_CHAT_ID=$(fetch_ssm_secret "/tickvault/${SSM_ENV}/telegram/chat-id")
 echo -e "  ${GREEN}Done${NC}"
 
 echo ""
-echo -e "${CYAN}[1/3] Stopping all dlt-* containers...${NC}"
+echo -e "${CYAN}[1/3] Stopping all tv-* containers...${NC}"
 docker compose -f "${COMPOSE_FILE}" down --remove-orphans
 echo -e "${GREEN}  Done${NC}"
 
@@ -72,14 +72,14 @@ docker compose -f "${COMPOSE_FILE}" up -d
 echo ""
 echo -e "${CYAN}Waiting for containers to become healthy...${NC}"
 REQUIRED_CONTAINERS=(
-    "dlt-questdb"
-    "dlt-valkey"
-    "dlt-prometheus"
-    "dlt-grafana"
-    "dlt-loki"
-    "dlt-alloy"
-    "dlt-jaeger"
-    "dlt-traefik"
+    "tv-questdb"
+    "tv-valkey"
+    "tv-prometheus"
+    "tv-grafana"
+    "tv-loki"
+    "tv-alloy"
+    "tv-jaeger"
+    "tv-traefik"
 )
 
 MAX_WAIT=90
@@ -106,6 +106,6 @@ if $ALL_UP; then
     echo -e "${GREEN}╚════════════════════════════════════════════════╝${NC}"
 else
     echo -e "${RED}Some containers not ready after ${MAX_WAIT}s:${NC}"
-    docker ps --filter "name=dlt-" --format "  {{.Names}}\t{{.Status}}" | sort
+    docker ps --filter "name=tv-" --format "  {{.Names}}\t{{.Status}}" | sort
     exit 1
 fi

@@ -12,7 +12,7 @@
       }
     ]
   },
-  "description": "dhan-live-trader — Live market data explorer. Ticks, candles, instruments, depth, and trading calendar.",
+  "description": "tickvault — Live market data explorer. Ticks, candles, instruments, depth, and trading calendar.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -828,7 +828,7 @@
   ],
   "refresh": "5s",
   "schemaVersion": 40,
-  "tags": ["dhan-live-trader", "market-data", "questdb"],
+  "tags": ["tickvault", "market-data", "questdb"],
   "templating": {
     "list": []
   },
@@ -836,6 +836,6 @@
   "timepicker": {},
   "timezone": "Asia/Kolkata",
   "title": "Market Data Explorer",
-  "uid": "dlt-market-data",
+  "uid": "tv-market-data",
   "version": 100
 }

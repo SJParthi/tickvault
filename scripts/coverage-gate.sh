@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# dhan-live-trader — Per-Crate Coverage Gate
+# tickvault — Per-Crate Coverage Gate
 # =============================================================================
 # Parses cargo-llvm-cov JSON output and enforces per-crate line coverage
 # thresholds. Reads thresholds from quality/crate-coverage-thresholds.toml.

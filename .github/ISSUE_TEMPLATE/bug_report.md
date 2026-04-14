@@ -1,6 +1,6 @@
 ---
 name: Bug Report
-about: Report a bug in dhan-live-trader
+about: Report a bug in tickvault
 title: "fix: "
 labels: bug
 assignees: SJParthi

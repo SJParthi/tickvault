@@ -7,8 +7,8 @@ use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 
-use dhan_live_trader_common::tick_types::DeepDepthLevel;
-use dhan_live_trader_trading::indicator::obi::compute_obi;
+use tickvault_common::tick_types::DeepDepthLevel;
+use tickvault_trading::indicator::obi::compute_obi;
 
 /// Creates a realistic 20-level order book side.
 fn make_levels(base_price: f64, step: f64, base_qty: u32) -> Vec<DeepDepthLevel> {

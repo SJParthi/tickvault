@@ -1,4 +1,4 @@
-# PROJECT SCOPE — dhan-live-trader
+# PROJECT SCOPE — tickvault
 
 > **Last updated:** 2026-03-15
 > **Purpose:** Single-glance reference for what's built, what's pending, and how to approach new work.

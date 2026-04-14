@@ -23,9 +23,9 @@ use questdb::ingress::{Buffer, Sender, TimestampNanos};
 use reqwest::Client;
 use tracing::{debug, error, info, warn};
 
-use dhan_live_trader_common::config::QuestDbConfig;
-use dhan_live_trader_common::constants::IST_UTC_OFFSET_NANOS;
-use dhan_live_trader_common::tick_types::DeepDepthLevel;
+use tickvault_common::config::QuestDbConfig;
+use tickvault_common::constants::IST_UTC_OFFSET_NANOS;
+use tickvault_common::tick_types::DeepDepthLevel;
 
 /// QuestDB table name for deep market depth (20/200 level).
 pub const QUESTDB_TABLE_DEEP_MARKET_DEPTH: &str = "deep_market_depth";
@@ -521,7 +521,7 @@ impl DeepDepthWriter {
                 );
             }
         }
-        metrics::gauge!("dlt_deep_depth_buffer_size").set(self.depth_buffer.len() as f64);
+        metrics::gauge!("tv_deep_depth_buffer_size").set(self.depth_buffer.len() as f64);
         // O(1) EXEMPT: end
     }
 
@@ -536,7 +536,7 @@ impl DeepDepthWriter {
                 "CRITICAL: cannot open deep depth spill file — record WILL be lost"
             );
             self.records_dropped_total = self.records_dropped_total.saturating_add(1);
-            metrics::counter!("dlt_deep_depth_dropped_total").absolute(self.records_dropped_total);
+            metrics::counter!("tv_deep_depth_dropped_total").absolute(self.records_dropped_total);
             return;
         }
         let data = record.serialize();
@@ -549,7 +549,7 @@ impl DeepDepthWriter {
                 "CRITICAL: disk spill write failed — deep depth record lost"
             );
             self.records_dropped_total = self.records_dropped_total.saturating_add(1);
-            metrics::counter!("dlt_deep_depth_dropped_total").absolute(self.records_dropped_total);
+            metrics::counter!("tv_deep_depth_dropped_total").absolute(self.records_dropped_total);
             self.spill_writer = None;
             return;
         }
@@ -603,7 +603,7 @@ impl DeepDepthWriter {
             }
             drained = drained.saturating_add(1);
         }
-        metrics::gauge!("dlt_deep_depth_buffer_size").set(self.depth_buffer.len() as f64);
+        metrics::gauge!("tv_deep_depth_buffer_size").set(self.depth_buffer.len() as f64);
         if drained > 0 {
             info!(
                 drained,
@@ -684,7 +684,7 @@ impl DeepDepthWriter {
 
     /// Returns the number of records held in the resilience ring buffer.
     // TEST-EXEMPT: trivial field getter, tested indirectly by ring buffer tests.
-    // WIRING-EXEMPT: observability getter exposed for future metric scraping + dlt-doctor diagnostic probes.
+    // WIRING-EXEMPT: observability getter exposed for future metric scraping + tv-doctor diagnostic probes.
     pub fn buffered_count(&self) -> usize {
         self.depth_buffer.len()
     }
@@ -910,7 +910,7 @@ mod tests {
 
     #[test]
     fn test_deep_depth_spill_to_disk_roundtrip() {
-        let test_dir = std::path::PathBuf::from("/tmp/dlt-test-deep-depth-spill");
+        let test_dir = std::path::PathBuf::from("/tmp/tv-test-deep-depth-spill");
         let _ = std::fs::remove_dir_all(&test_dir);
         std::fs::create_dir_all(&test_dir).unwrap();
         let spill_path = test_dir.join("deep-depth-test.bin");

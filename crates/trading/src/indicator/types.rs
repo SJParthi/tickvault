@@ -3,9 +3,7 @@
 //! All types are `Copy` for zero-allocation on the hot path.
 //! Every indicator updates in O(1) per tick — no lookback recomputation.
 
-use dhan_live_trader_common::constants::{
-    INDICATOR_RING_BUFFER_CAPACITY, MAX_INDICATOR_WARMUP_TICKS,
-};
+use tickvault_common::constants::{INDICATOR_RING_BUFFER_CAPACITY, MAX_INDICATOR_WARMUP_TICKS};
 
 // ---------------------------------------------------------------------------
 // Ring Buffer — compile-time-sized, zero-allocation

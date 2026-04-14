@@ -1,4 +1,4 @@
-# Implementation Plan: Session 7 — Phase 8 AWS + Dep Auto-Update + dlt-doctor
+# Implementation Plan: Session 7 — Phase 8 AWS + Dep Auto-Update + tv-doctor
 
 **Status:** VERIFIED
 **Date:** 2026-04-14
@@ -8,7 +8,7 @@
 
 ## Goal
 
-Get the repo AWS-deployment-ready before May 1. Wire the dep auto-update nightly. Add `dlt-doctor` CLI for auto-triage on CRITICAL alerts. All three approved plans from session 6 executed together.
+Get the repo AWS-deployment-ready before May 1. Wire the dep auto-update nightly. Add `tv-doctor` CLI for auto-triage on CRITICAL alerts. All three approved plans from session 6 executed together.
 
 ## Plan items (committed after each, push at end)
 
@@ -40,9 +40,9 @@ Get the repo AWS-deployment-ready before May 1. Wire the dep auto-update nightly
   - Files: dep-freshness-nightly.yml
   - Tests: deny_config_targets_include_linux_and_mac
 
-- [x] Step 8: dlt-doctor CLI — auto-triage bundle on alerts.
-  - Files: dlt_doctor.rs, dlt_doctor_binary_wiring.rs
-  - Tests: test_dlt_doctor_binary_exists, test_dlt_doctor_collects_required_probes, test_dlt_doctor_supports_all_output_formats
+- [x] Step 8: tv-doctor CLI — auto-triage bundle on alerts.
+  - Files: tv_doctor.rs, tv_doctor_binary_wiring.rs
+  - Tests: test_tv_doctor_binary_exists, test_tv_doctor_collects_required_probes, test_tv_doctor_supports_all_output_formats
 
 - [x] Step 9: Final plan-verify + push session 7.
   - Files: active-plan.md
@@ -52,5 +52,5 @@ Get the repo AWS-deployment-ready before May 1. Wire the dep auto-update nightly
 
 - Terraform files will be valid HCL but I will NOT run `terraform apply` — that needs your AWS credentials. You'll run it once locally after I land the files.
 - GitHub Actions workflow will be valid YAML. I will NOT run it in this sandbox — you'll see it fire on the next push.
-- `dlt-doctor` CLI uses the existing tracing + metrics infrastructure; no new external tools.
+- `tv-doctor` CLI uses the existing tracing + metrics infrastructure; no new external tools.
 - AWS account creation / credit card / IAM root user setup is human-only. The docs will tell you exactly what to click.

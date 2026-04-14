@@ -1,4 +1,4 @@
-//! Library target for the dhan-live-trader application.
+//! Library target for the tickvault application.
 //!
 //! Exposes infrastructure, observability, and trading pipeline modules
 //! so that `cargo llvm-cov` can instrument them through the lib target.

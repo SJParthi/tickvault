@@ -32,8 +32,8 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use dhan_live_trader_common::constants::IST_UTC_OFFSET_SECONDS_I64;
-use dhan_live_trader_common::tick_types::{DhanIntradayResponse, HistoricalCandle, ParsedTick};
+use tickvault_common::constants::IST_UTC_OFFSET_SECONDS_I64;
+use tickvault_common::tick_types::{DhanIntradayResponse, HistoricalCandle, ParsedTick};
 
 // ---------------------------------------------------------------------------
 // Event type emitted by TickGapTracker → backfill worker

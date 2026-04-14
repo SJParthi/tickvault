@@ -14,9 +14,9 @@
 
 use tracing::info;
 
-use dhan_live_trader_common::instrument_types::FnoUniverse;
+use tickvault_common::instrument_types::FnoUniverse;
 
-use dhan_live_trader_storage::instrument_persistence::{LifecycleEvent, LifecycleEventType};
+use tickvault_storage::instrument_persistence::{LifecycleEvent, LifecycleEventType};
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -279,13 +279,13 @@ pub fn detect_universe_delta(
 mod tests {
     use super::*;
     use chrono::{NaiveDate, Utc};
-    use dhan_live_trader_common::instrument_types::{
+    use std::collections::HashMap;
+    use std::time::Duration;
+    use tickvault_common::instrument_types::{
         DerivativeContract, DhanInstrumentKind, FnoUnderlying, FnoUniverse, UnderlyingKind,
         UniverseBuildMetadata,
     };
-    use dhan_live_trader_common::types::{ExchangeSegment, OptionType, SecurityId};
-    use std::collections::HashMap;
-    use std::time::Duration;
+    use tickvault_common::types::{ExchangeSegment, OptionType, SecurityId};
 
     fn make_contract(security_id: SecurityId, symbol: &str, lot_size: u32) -> DerivativeContract {
         // Use security_id-dependent strike_price to ensure unique compound identity
@@ -324,7 +324,7 @@ mod tests {
         contracts: Vec<DerivativeContract>,
         underlyings: Vec<FnoUnderlying>,
     ) -> FnoUniverse {
-        let ist = dhan_live_trader_common::trading_calendar::ist_offset();
+        let ist = tickvault_common::trading_calendar::ist_offset();
         let derivative_contracts: HashMap<SecurityId, DerivativeContract> =
             contracts.into_iter().map(|c| (c.security_id, c)).collect();
         let underlying_map: HashMap<String, FnoUnderlying> = underlyings

@@ -1,4 +1,4 @@
-//! Common error types used across the dhan-live-trader workspace.
+//! Common error types used across the tickvault workspace.
 //!
 //! Each crate may define its own specific error types using `thiserror`,
 //! but cross-cutting errors live here.
@@ -87,11 +87,11 @@ mod tests {
     #[test]
     fn test_secret_retrieval_error_display() {
         let err = ApplicationError::SecretRetrieval {
-            path: "/dlt/dev/dhan/client-id".to_string(),
+            path: "/tickvault/dev/dhan/client-id".to_string(),
             source: anyhow::anyhow!("not found"),
         };
         let msg = err.to_string();
-        assert!(msg.contains("/dlt/dev/dhan/client-id"));
+        assert!(msg.contains("/tickvault/dev/dhan/client-id"));
         assert!(msg.contains("not found"));
     }
 
@@ -205,11 +205,11 @@ mod tests {
     fn test_infrastructure_unavailable_display() {
         let err = ApplicationError::InfrastructureUnavailable {
             service: "QuestDB".to_string(),
-            endpoint: "dlt-questdb:9009".to_string(),
+            endpoint: "tv-questdb:9009".to_string(),
         };
         let msg = err.to_string();
         assert!(msg.contains("QuestDB"));
-        assert!(msg.contains("dlt-questdb:9009"));
+        assert!(msg.contains("tv-questdb:9009"));
         assert!(msg.contains("infrastructure unavailable"));
     }
 
@@ -289,7 +289,7 @@ mod tests {
     fn test_secret_retrieval_error_source_chain() {
         use std::error::Error;
         let err = ApplicationError::SecretRetrieval {
-            path: "/dlt/dev/key".to_string(),
+            path: "/tickvault/dev/key".to_string(),
             source: anyhow::anyhow!("SSM unreachable"),
         };
         // thiserror wires up the source automatically
@@ -325,7 +325,7 @@ mod tests {
         use std::error::Error;
         let err = ApplicationError::InfrastructureUnavailable {
             service: "Valkey".to_string(),
-            endpoint: "dlt-valkey:6379".to_string(),
+            endpoint: "tv-valkey:6379".to_string(),
         };
         assert!(err.source().is_none());
     }
@@ -452,11 +452,11 @@ mod tests {
     fn test_infrastructure_unavailable_display_format() {
         let err = ApplicationError::InfrastructureUnavailable {
             service: "Prometheus".to_string(),
-            endpoint: "dlt-prometheus:9090".to_string(),
+            endpoint: "tv-prometheus:9090".to_string(),
         };
         assert_eq!(
             err.to_string(),
-            "infrastructure unavailable: Prometheus at dlt-prometheus:9090"
+            "infrastructure unavailable: Prometheus at tv-prometheus:9090"
         );
     }
 

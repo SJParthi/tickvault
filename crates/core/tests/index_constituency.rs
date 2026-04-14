@@ -7,13 +7,13 @@
 //! - Proptest: fuzz constituency map building
 
 use chrono::NaiveDate;
-use dhan_live_trader_common::config::IndexConstituencyConfig;
-use dhan_live_trader_common::instrument_types::{
+use tickvault_common::config::IndexConstituencyConfig;
+use tickvault_common::instrument_types::{
     ConstituencyBuildMetadata, FnoUnderlying, FnoUniverse, IndexCategory, IndexConstituencyMap,
     IndexConstituent, IndexSubcategory, SubscribedIndex, UnderlyingKind, UniverseBuildMetadata,
 };
-use dhan_live_trader_common::types::{Exchange, ExchangeSegment};
-use dhan_live_trader_core::index_constituency::{csv_parser, mapper};
+use tickvault_common::types::{Exchange, ExchangeSegment};
+use tickvault_core::index_constituency::{csv_parser, mapper};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -291,10 +291,10 @@ fn edge_reverse_map_sorted_alphabetically() {
 
 #[tokio::test]
 async fn cache_roundtrip_preserves_all_data() {
-    use dhan_live_trader_core::index_constituency::cache;
+    use tickvault_core::index_constituency::cache;
 
     let cache_dir = format!(
-        "/tmp/dlt-test-constituency-integration-{}",
+        "/tmp/tv-test-constituency-integration-{}",
         std::process::id()
     );
     std::fs::create_dir_all(&cache_dir).unwrap();
@@ -338,7 +338,7 @@ async fn cache_roundtrip_preserves_all_data() {
 
 #[tokio::test]
 async fn cache_load_missing_file_returns_error() {
-    use dhan_live_trader_core::index_constituency::cache;
+    use tickvault_core::index_constituency::cache;
 
     let result = cache::load_constituency_cache("/nonexistent/path", "missing.json").await;
     assert!(result.is_err());
@@ -374,8 +374,8 @@ fn config_defaults_are_sane() {
 
 #[test]
 fn download_url_construction_all_slugs() {
-    use dhan_live_trader_common::constants::INDEX_CONSTITUENCY_SLUGS;
-    use dhan_live_trader_core::index_constituency::csv_downloader::build_download_url;
+    use tickvault_common::constants::INDEX_CONSTITUENCY_SLUGS;
+    use tickvault_core::index_constituency::csv_downloader::build_download_url;
 
     for (name, slug) in INDEX_CONSTITUENCY_SLUGS {
         let url = build_download_url(slug);
@@ -390,9 +390,7 @@ fn download_url_construction_all_slugs() {
 
 #[test]
 fn slug_count_matches_constant() {
-    use dhan_live_trader_common::constants::{
-        INDEX_CONSTITUENCY_SLUG_COUNT, INDEX_CONSTITUENCY_SLUGS,
-    };
+    use tickvault_common::constants::{INDEX_CONSTITUENCY_SLUG_COUNT, INDEX_CONSTITUENCY_SLUGS};
 
     assert_eq!(
         INDEX_CONSTITUENCY_SLUGS.len(),
@@ -406,8 +404,8 @@ fn slug_count_matches_constant() {
 
 #[test]
 fn test_no_duplicate_slugs() {
-    use dhan_live_trader_common::constants::INDEX_CONSTITUENCY_SLUGS;
     use std::collections::HashSet;
+    use tickvault_common::constants::INDEX_CONSTITUENCY_SLUGS;
 
     let mut seen = HashSet::new();
     for (name, slug) in INDEX_CONSTITUENCY_SLUGS {
@@ -420,8 +418,8 @@ fn test_no_duplicate_slugs() {
 
 #[test]
 fn test_no_duplicate_index_names() {
-    use dhan_live_trader_common::constants::INDEX_CONSTITUENCY_SLUGS;
     use std::collections::HashSet;
+    use tickvault_common::constants::INDEX_CONSTITUENCY_SLUGS;
 
     let mut seen = HashSet::new();
     for (name, slug) in INDEX_CONSTITUENCY_SLUGS {
@@ -434,7 +432,7 @@ fn test_no_duplicate_index_names() {
 
 #[test]
 fn test_all_slugs_valid_format() {
-    use dhan_live_trader_common::constants::INDEX_CONSTITUENCY_SLUGS;
+    use tickvault_common::constants::INDEX_CONSTITUENCY_SLUGS;
 
     for (name, slug) in INDEX_CONSTITUENCY_SLUGS {
         // Names must be non-empty
@@ -471,7 +469,7 @@ fn test_all_slugs_valid_format() {
 
 #[test]
 fn test_slug_count_covers_all_categories() {
-    use dhan_live_trader_common::constants::INDEX_CONSTITUENCY_SLUGS;
+    use tickvault_common::constants::INDEX_CONSTITUENCY_SLUGS;
 
     // We must have at least 40 indices to cover broad + sectoral + thematic
     assert!(
@@ -660,14 +658,14 @@ mod proptest_constituency {
 //
 // These tests are #[ignore] by default — they require network access to
 // niftyindices.com and are slow (~30s for all 49 indices).
-// Run manually: cargo test -p dhan-live-trader-core --test index_constituency real_fetch -- --ignored
+// Run manually: cargo test -p tickvault-core --test index_constituency real_fetch -- --ignored
 // ---------------------------------------------------------------------------
 
 mod real_fetch {
-    use dhan_live_trader_common::config::IndexConstituencyConfig;
-    use dhan_live_trader_common::constants::INDEX_CONSTITUENCY_SLUGS;
-    use dhan_live_trader_core::index_constituency::csv_downloader;
-    use dhan_live_trader_core::index_constituency::csv_parser;
+    use tickvault_common::config::IndexConstituencyConfig;
+    use tickvault_common::constants::INDEX_CONSTITUENCY_SLUGS;
+    use tickvault_core::index_constituency::csv_downloader;
+    use tickvault_core::index_constituency::csv_parser;
 
     fn default_config() -> IndexConstituencyConfig {
         IndexConstituencyConfig {
@@ -824,8 +822,8 @@ mod real_fetch {
     #[tokio::test]
     #[ignore]
     async fn real_fetch_end_to_end_download_parse_build_lookup() {
-        use dhan_live_trader_common::instrument_types::ConstituencyBuildMetadata;
-        use dhan_live_trader_core::index_constituency::mapper;
+        use tickvault_common::instrument_types::ConstituencyBuildMetadata;
+        use tickvault_core::index_constituency::mapper;
 
         let config = default_config();
         let slugs: &[(&str, &str)] = &[
@@ -892,11 +890,11 @@ mod real_fetch {
 
 mod instrument_mapping {
     use super::*;
-    use dhan_live_trader_common::instrument_types::{
+    use std::collections::HashMap;
+    use tickvault_common::instrument_types::{
         FnoUnderlying, FnoUniverse, UnderlyingKind, UniverseBuildMetadata,
     };
-    use dhan_live_trader_common::types::ExchangeSegment;
-    use std::collections::HashMap;
+    use tickvault_common::types::ExchangeSegment;
 
     fn empty_build_metadata() -> UniverseBuildMetadata {
         use chrono::{FixedOffset, Utc};

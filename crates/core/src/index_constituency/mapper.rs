@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use tracing::warn;
 
-use dhan_live_trader_common::instrument_types::{
+use tickvault_common::instrument_types::{
     ConstituencyBuildMetadata, IndexConstituencyMap, IndexConstituent,
 };
 

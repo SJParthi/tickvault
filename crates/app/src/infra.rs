@@ -14,8 +14,8 @@ use anyhow::{Context, Result};
 use secrecy::ExposeSecret;
 use tracing::{debug, info, warn};
 
-use dhan_live_trader_common::config::QuestDbConfig;
-use dhan_live_trader_core::auth::secret_manager;
+use tickvault_common::config::QuestDbConfig;
+use tickvault_core::auth::secret_manager;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -151,33 +151,33 @@ pub async fn ensure_infra_running(questdb_config: &QuestDbConfig) {
     // Build env vars for docker-compose.
     let env_vars = [
         (
-            "DLT_QUESTDB_PG_USER",
+            "TV_QUESTDB_PG_USER",
             questdb_creds.pg_user.expose_secret().to_string(),
         ),
         (
-            "DLT_QUESTDB_PG_PASSWORD",
+            "TV_QUESTDB_PG_PASSWORD",
             questdb_creds.pg_password.expose_secret().to_string(),
         ),
         (
-            "DLT_GRAFANA_ADMIN_USER",
+            "TV_GRAFANA_ADMIN_USER",
             grafana_creds.admin_user.expose_secret().to_string(),
         ),
         (
-            "DLT_GRAFANA_ADMIN_PASSWORD",
+            "TV_GRAFANA_ADMIN_PASSWORD",
             grafana_creds.admin_password.expose_secret().to_string(),
         ),
         (
-            "DLT_TELEGRAM_BOT_TOKEN",
+            "TV_TELEGRAM_BOT_TOKEN",
             telegram_creds.bot_token.expose_secret().to_string(),
         ),
         (
-            "DLT_TELEGRAM_CHAT_ID",
+            "TV_TELEGRAM_CHAT_ID",
             telegram_creds.chat_id.expose_secret().to_string(),
         ),
     ];
 
     // Ensure data/logs/app.log exists before Docker mounts it.
-    // Alloy container mounts ../../data/logs → /var/log/dlt-app/ to watch app.log.
+    // Alloy container mounts ../../data/logs → /var/log/tickvault/ to watch app.log.
     // If the directory doesn't exist, Docker creates it as root-owned.
     // If app.log doesn't exist, Alloy's file watch fails → healthcheck fails → DOWN.
     if let Err(err) = std::fs::create_dir_all("data/logs") {
@@ -426,7 +426,7 @@ pub fn check_spill_file_size() -> u64 {
     let dir = match std::fs::read_dir("data/spill") {
         Ok(d) => d,
         Err(_) => {
-            metrics::gauge!("dlt_spill_files_total_bytes").set(0.0);
+            metrics::gauge!("tv_spill_files_total_bytes").set(0.0);
             return 0;
         }
     };
@@ -441,8 +441,8 @@ pub fn check_spill_file_size() -> u64 {
             file_count = file_count.saturating_add(1);
         }
     }
-    metrics::gauge!("dlt_spill_files_total_bytes").set(total_bytes as f64);
-    metrics::gauge!("dlt_spill_file_count").set(file_count as f64);
+    metrics::gauge!("tv_spill_files_total_bytes").set(total_bytes as f64);
+    metrics::gauge!("tv_spill_file_count").set(file_count as f64);
     total_bytes
 }
 
@@ -453,7 +453,7 @@ pub fn check_spill_file_size() -> u64 {
 /// Returns the number of files cleaned up.
 // TEST-EXEMPT: requires data/spill directory — tested by unit test below
 pub fn cleanup_old_spill_files() -> usize {
-    use dhan_live_trader_common::constants::SPILL_FILE_MAX_AGE_SECS;
+    use tickvault_common::constants::SPILL_FILE_MAX_AGE_SECS;
 
     let dir = match std::fs::read_dir("data/spill") {
         Ok(d) => d,
@@ -484,7 +484,7 @@ pub fn cleanup_old_spill_files() -> usize {
     }
 
     if cleaned > 0 {
-        metrics::counter!("dlt_spill_files_cleaned_total").increment(cleaned as u64);
+        metrics::counter!("tv_spill_files_cleaned_total").increment(cleaned as u64);
     }
     cleaned
 }
@@ -505,18 +505,18 @@ pub async fn check_questdb_liveness(config: &QuestDbConfig) -> bool {
     let client = match client {
         Ok(c) => c,
         Err(_) => {
-            metrics::gauge!("dlt_questdb_alive").set(0.0);
+            metrics::gauge!("tv_questdb_alive").set(0.0);
             return false;
         }
     };
 
     match client.get(&url).send().await {
         Ok(resp) if resp.status().is_success() => {
-            metrics::gauge!("dlt_questdb_alive").set(1.0);
+            metrics::gauge!("tv_questdb_alive").set(1.0);
             true
         }
         _ => {
-            metrics::gauge!("dlt_questdb_alive").set(0.0);
+            metrics::gauge!("tv_questdb_alive").set(0.0);
             tracing::error!("QuestDB liveness check failed — SELECT 1 did not respond");
             false
         }
@@ -535,7 +535,7 @@ pub fn export_system_metrics() {
                 && let Some(count_str) = line.split_whitespace().nth(1)
                 && let Ok(count) = count_str.parse::<u64>()
             {
-                metrics::gauge!("dlt_process_threads").set(count as f64);
+                metrics::gauge!("tv_process_threads").set(count as f64);
             }
         }
     }
@@ -544,7 +544,7 @@ pub fn export_system_metrics() {
     #[cfg(unix)]
     if let Ok(entries) = std::fs::read_dir("/proc/self/fd") {
         let count = entries.count();
-        metrics::gauge!("dlt_process_open_fds").set(count as f64);
+        metrics::gauge!("tv_process_open_fds").set(count as f64);
     }
 }
 
@@ -562,7 +562,7 @@ pub async fn check_and_restart_containers() -> usize {
     // Quick check: is Docker daemon even running?
     if !is_docker_daemon_running().await {
         warn!("Docker daemon not running — cannot check container health");
-        metrics::gauge!("dlt_docker_containers_healthy").set(0.0);
+        metrics::gauge!("tv_docker_containers_healthy").set(0.0);
         return 0;
     }
 
@@ -607,8 +607,8 @@ pub async fn check_and_restart_containers() -> usize {
         }
     }
 
-    metrics::gauge!("dlt_docker_containers_total").set(total_containers as f64);
-    metrics::gauge!("dlt_docker_containers_healthy")
+    metrics::gauge!("tv_docker_containers_total").set(total_containers as f64);
+    metrics::gauge!("tv_docker_containers_healthy")
         .set((total_containers.saturating_sub(unhealthy_containers)) as f64);
 
     if unhealthy_containers == 0 {
@@ -1225,7 +1225,7 @@ mod tests {
         // Docker hostname won't resolve in test env — exercises fallback path.
         // macOS may resolve Docker hostnames via mDNS when Docker Desktop is
         // running, so we only assert unreachable on Linux.
-        let host = "dlt-questdb";
+        let host = "tv-questdb";
         let port: u16 = 9000;
         let addr = format!("{host}:{port}");
         assert!(!addr.is_empty());
@@ -1296,12 +1296,12 @@ mod tests {
         // The compose file may not exist in test context, but we exercise
         // the command construction, env var injection, and error handling.
         let env_vars = vec![
-            ("DLT_QUESTDB_PG_USER", "test_user".to_string()),
-            ("DLT_QUESTDB_PG_PASSWORD", "test_pass".to_string()),
-            ("DLT_GRAFANA_ADMIN_USER", "admin".to_string()),
-            ("DLT_GRAFANA_ADMIN_PASSWORD", "admin_pass".to_string()),
-            ("DLT_TELEGRAM_BOT_TOKEN", "bot_token".to_string()),
-            ("DLT_TELEGRAM_CHAT_ID", "chat_id".to_string()),
+            ("TV_QUESTDB_PG_USER", "test_user".to_string()),
+            ("TV_QUESTDB_PG_PASSWORD", "test_pass".to_string()),
+            ("TV_GRAFANA_ADMIN_USER", "admin".to_string()),
+            ("TV_GRAFANA_ADMIN_PASSWORD", "admin_pass".to_string()),
+            ("TV_TELEGRAM_BOT_TOKEN", "bot_token".to_string()),
+            ("TV_TELEGRAM_CHAT_ID", "chat_id".to_string()),
         ];
         let result = run_docker_compose_up(&env_vars).await;
         // May succeed or fail depending on Docker — just verify no panic.
@@ -1370,7 +1370,7 @@ mod tests {
     fn test_is_service_reachable_with_hostname_triggers_fallback_addr() {
         // When a non-IP hostname is used, the parse() fails and the
         // unwrap_or_else fallback creates a 127.0.0.1:port address.
-        let host = "dlt-questdb";
+        let host = "tv-questdb";
         let port: u16 = 9000;
         let addr = format!("{host}:{port}");
         let parsed: Result<std::net::SocketAddr, _> = addr.parse();
@@ -1532,12 +1532,12 @@ mod tests {
     async fn test_run_docker_compose_up_with_all_env_vars_no_panic() {
         // Exercises the full env var injection path.
         let env_vars = vec![
-            ("DLT_QUESTDB_PG_USER", "user".to_string()),
-            ("DLT_QUESTDB_PG_PASSWORD", "pass".to_string()),
-            ("DLT_GRAFANA_ADMIN_USER", "admin".to_string()),
-            ("DLT_GRAFANA_ADMIN_PASSWORD", "secret".to_string()),
-            ("DLT_TELEGRAM_BOT_TOKEN", "123:ABC".to_string()),
-            ("DLT_TELEGRAM_CHAT_ID", "-12345".to_string()),
+            ("TV_QUESTDB_PG_USER", "user".to_string()),
+            ("TV_QUESTDB_PG_PASSWORD", "pass".to_string()),
+            ("TV_GRAFANA_ADMIN_USER", "admin".to_string()),
+            ("TV_GRAFANA_ADMIN_PASSWORD", "secret".to_string()),
+            ("TV_TELEGRAM_BOT_TOKEN", "123:ABC".to_string()),
+            ("TV_TELEGRAM_CHAT_ID", "-12345".to_string()),
         ];
         let result = run_docker_compose_up(&env_vars).await;
         // Docker may or may not be available — just verify the function runs.
@@ -1721,8 +1721,8 @@ mod tests {
     #[test]
     fn test_system_metrics_exported() {
         // Verify metric calls compile without a recorder installed.
-        metrics::gauge!("dlt_process_threads").set(1.0_f64);
-        metrics::gauge!("dlt_process_open_fds").set(10.0_f64);
+        metrics::gauge!("tv_process_threads").set(1.0_f64);
+        metrics::gauge!("tv_process_open_fds").set(10.0_f64);
     }
 
     #[test]

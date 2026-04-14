@@ -4,10 +4,10 @@
 //! the same parsed output and the same dedup/aggregation results.
 //! Essential for debugging production issues with recorded tick data.
 
-use dhan_live_trader_common::constants::{
+use tickvault_common::constants::{
     EXCHANGE_SEGMENT_NSE_FNO, QUOTE_PACKET_SIZE, TICKER_PACKET_SIZE,
 };
-use dhan_live_trader_core::parser::dispatch_frame;
+use tickvault_core::parser::dispatch_frame;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -149,8 +149,8 @@ fn replay_error_sequence_deterministic() {
 
 #[test]
 fn replay_candle_aggregation_deterministic() {
-    use dhan_live_trader_common::tick_types::ParsedTick;
-    use dhan_live_trader_core::pipeline::candle_aggregator::CandleAggregator;
+    use tickvault_common::tick_types::ParsedTick;
+    use tickvault_core::pipeline::candle_aggregator::CandleAggregator;
 
     let ticks = vec![
         ParsedTick {

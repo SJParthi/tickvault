@@ -19,7 +19,7 @@ use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing::info;
 use tracing_opentelemetry::OpenTelemetryLayer;
 
-use dhan_live_trader_common::config::ObservabilityConfig;
+use tickvault_common::config::ObservabilityConfig;
 
 /// Initializes the Prometheus metrics exporter.
 ///
@@ -76,16 +76,14 @@ where
         .build()
         .context("failed to build OTLP span exporter")?;
 
-    let resource = Resource::builder()
-        .with_service_name("dhan-live-trader")
-        .build();
+    let resource = Resource::builder().with_service_name("tickvault").build();
 
     let provider = SdkTracerProvider::builder()
         .with_batch_exporter(exporter)
         .with_resource(resource)
         .build();
 
-    let tracer = provider.tracer("dhan-live-trader");
+    let tracer = provider.tracer("tickvault");
     let layer = OpenTelemetryLayer::new(tracer);
 
     info!(
@@ -99,7 +97,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dhan_live_trader_common::config::ObservabilityConfig;
+    use tickvault_common::config::ObservabilityConfig;
 
     fn disabled_config() -> ObservabilityConfig {
         ObservabilityConfig {

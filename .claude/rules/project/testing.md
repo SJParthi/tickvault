@@ -94,7 +94,7 @@ These test types run weekly (Monday) in CI, not on every push:
 - Run for minimum 1 hour per target per week
 
 ### Loom Concurrency
-- `cargo test -p dhan-live-trader-core --features loom --test loom_tick_dedup`
+- `cargo test -p tickvault-core --features loom --test loom_tick_dedup`
 - Feature-gated: replaces std atomics with Loom mocks for exhaustive interleaving
 - NOT in standard `cargo test` — requires separate compilation
 

@@ -1,13 +1,13 @@
-//! S7-Step8 / Phase 8: dlt-doctor CLI — auto-triage bundle for CRITICAL alerts.
+//! S7-Step8 / Phase 8: tv-doctor CLI — auto-triage bundle for CRITICAL alerts.
 //!
 //! Called automatically by systemd / CloudWatch alarm handlers when a
 //! CRITICAL alert fires. Collects:
 //!
-//!   1. Last 200 lines of dlt-app journal logs
+//!   1. Last 200 lines of tickvault journal logs
 //!   2. Ring buffer + spill + DLQ state (from Prometheus /metrics)
 //!   3. systemd service state (active / inactive / failed)
-//!   4. Disk usage for /opt/dlt/data/spill
-//!   5. Docker service states (dlt-questdb, dlt-valkey)
+//!   4. Disk usage for /opt/tickvault/data/spill
+//!   5. Docker service states (tv-questdb, tv-valkey)
 //!   6. Recent errors grouped by component
 //!
 //! Output: a single markdown bundle to stdout that the caller
@@ -21,10 +21,10 @@
 //! # Invocation
 //!
 //! ```bash
-//! dlt-doctor                         # plain text report
-//! dlt-doctor --format markdown       # markdown-formatted (default)
-//! dlt-doctor --format json           # machine-readable
-//! dlt-doctor --metrics-url http://localhost:9090/metrics   # override
+//! tv-doctor                         # plain text report
+//! tv-doctor --format markdown       # markdown-formatted (default)
+//! tv-doctor --format json           # machine-readable
+//! tv-doctor --metrics-url http://localhost:9090/metrics   # override
 //! ```
 //!
 //! Exit codes:
@@ -40,7 +40,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_JOURNAL_LINES: usize = 200;
 const DEFAULT_METRICS_URL: &str = "http://localhost:9090/metrics";
-const DEFAULT_SPILL_DIR: &str = "/opt/dlt/data/spill";
+const DEFAULT_SPILL_DIR: &str = "/opt/tickvault/data/spill";
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -96,7 +96,7 @@ fn now_utc_iso() -> String {
 // ---------------------------------------------------------------------------
 
 fn collect_systemd_state() -> String {
-    run_cmd(&["systemctl", "is-active", "dlt-app"])
+    run_cmd(&["systemctl", "is-active", "tickvault"])
         .unwrap_or_else(|_| "systemctl-not-available".to_string())
 }
 
@@ -105,7 +105,7 @@ fn collect_docker_state() -> String {
         "docker",
         "ps",
         "--filter",
-        "name=dlt-",
+        "name=tv-",
         "--format",
         "{{.Names}}\t{{.Status}}",
     ])
@@ -121,7 +121,7 @@ fn collect_journal_tail(lines: usize) -> String {
     run_cmd(&[
         "journalctl",
         "-u",
-        "dlt-app",
+        "tickvault",
         "-n",
         &lines.to_string(),
         "--no-pager",
@@ -136,7 +136,7 @@ fn collect_metrics_snapshot(url: &str) -> String {
         Ok(body) => {
             // Filter to just the DLT metrics — ignore process_* / go_*
             body.lines()
-                .filter(|l| l.starts_with("dlt_"))
+                .filter(|l| l.starts_with("tv_"))
                 .take(60)
                 .collect::<Vec<_>>()
                 .join("\n")
@@ -177,7 +177,7 @@ struct Report {
 }
 
 fn print_markdown(r: &Report) {
-    println!("## dlt-doctor report");
+    println!("## tv-doctor report");
     println!();
     println!("_Generated: {}_", r.generated_at);
     println!();
@@ -196,7 +196,7 @@ fn print_markdown(r: &Report) {
     println!("{}", r.disk_usage.trim());
     println!("```");
     println!();
-    println!("### 4. Metrics snapshot (dlt_*)");
+    println!("### 4. Metrics snapshot (tv_*)");
     println!("```");
     println!("{}", r.metrics_snapshot.trim());
     println!("```");
@@ -208,7 +208,7 @@ fn print_markdown(r: &Report) {
 }
 
 fn print_plain(r: &Report) {
-    println!("dlt-doctor report ({})", r.generated_at);
+    println!("tv-doctor report ({})", r.generated_at);
     println!("---");
     println!("systemd: {}", r.systemd_state.trim());
     println!("docker:  {}", r.docker_state.trim());

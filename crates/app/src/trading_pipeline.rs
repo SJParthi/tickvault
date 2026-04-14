@@ -29,21 +29,21 @@ use secrecy::{ExposeSecret, SecretString};
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
-use dhan_live_trader_common::config::ApplicationConfig;
-use dhan_live_trader_common::constants::{IST_UTC_OFFSET_SECONDS, MAX_INDICATOR_INSTRUMENTS};
-use dhan_live_trader_common::order_types::{
+use tickvault_common::config::ApplicationConfig;
+use tickvault_common::constants::{IST_UTC_OFFSET_SECONDS, MAX_INDICATOR_INSTRUMENTS};
+use tickvault_common::order_types::{
     OrderType, OrderUpdate, OrderValidity, ProductType, TransactionType,
 };
-use dhan_live_trader_common::tick_types::ParsedTick;
-use dhan_live_trader_core::auth::token_manager::TokenHandle;
+use tickvault_common::tick_types::ParsedTick;
+use tickvault_core::auth::token_manager::TokenHandle;
 
-use dhan_live_trader_trading::indicator::{IndicatorEngine, IndicatorParams};
-use dhan_live_trader_trading::oms::{
+use tickvault_trading::indicator::{IndicatorEngine, IndicatorParams};
+use tickvault_trading::oms::{
     OrderApiClient, OrderManagementSystem, OrderRateLimiter, PlaceOrderRequest, TokenProvider,
 };
-use dhan_live_trader_trading::risk::engine::RiskEngine;
-use dhan_live_trader_trading::risk::types::RiskCheck;
-use dhan_live_trader_trading::strategy::{Signal, StrategyHotReloader, StrategyInstance};
+use tickvault_trading::risk::engine::RiskEngine;
+use tickvault_trading::risk::types::RiskCheck;
+use tickvault_trading::strategy::{Signal, StrategyHotReloader, StrategyInstance};
 
 // ---------------------------------------------------------------------------
 // TokenProvider bridge — connects core::TokenHandle to trading::TokenProvider
@@ -56,22 +56,22 @@ struct TokenHandleBridge {
 }
 
 impl TokenProvider for TokenHandleBridge {
-    fn get_access_token(&self) -> Result<SecretString, dhan_live_trader_trading::oms::OmsError> {
+    fn get_access_token(&self) -> Result<SecretString, tickvault_trading::oms::OmsError> {
         let guard = self.handle.load();
         match guard.as_ref() {
             Some(token_state) => {
                 // Reject expired tokens — prevents sending orders with stale JWT
                 // that would return DH-901 and enter a retry loop.
                 if !token_state.is_valid() {
-                    return Err(dhan_live_trader_trading::oms::OmsError::TokenExpired);
+                    return Err(tickvault_trading::oms::OmsError::TokenExpired);
                 }
                 let token_str = token_state.access_token().expose_secret();
                 if token_str.is_empty() {
-                    return Err(dhan_live_trader_trading::oms::OmsError::NoToken);
+                    return Err(tickvault_trading::oms::OmsError::NoToken);
                 }
                 Ok(SecretString::from(token_str.to_owned()))
             }
-            None => Err(dhan_live_trader_trading::oms::OmsError::NoToken),
+            None => Err(tickvault_trading::oms::OmsError::NoToken),
         }
     }
 }
@@ -104,7 +104,7 @@ pub struct TradingPipelineConfig {
     pub token_handle: TokenHandle,
     /// Indicator snapshot writer for QuestDB persistence (None = no persistence).
     pub indicator_snapshot_writer:
-        Option<dhan_live_trader_storage::indicator_snapshot_persistence::IndicatorSnapshotWriter>,
+        Option<tickvault_storage::indicator_snapshot_persistence::IndicatorSnapshotWriter>,
 }
 
 /// Spawns the trading pipeline as a background task.
@@ -203,13 +203,13 @@ async fn run_trading_pipeline(
     // Initialize OMS (always starts in dry_run mode by default)
     let oms_http_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(
-            dhan_live_trader_common::constants::OMS_HTTP_TIMEOUT_SECS,
+            tickvault_common::constants::OMS_HTTP_TIMEOUT_SECS,
         ))
         .connect_timeout(std::time::Duration::from_secs(
-            dhan_live_trader_common::constants::OMS_HTTP_CONNECT_TIMEOUT_SECS,
+            tickvault_common::constants::OMS_HTTP_CONNECT_TIMEOUT_SECS,
         ))
         .pool_idle_timeout(std::time::Duration::from_secs(
-            dhan_live_trader_common::constants::OMS_HTTP_POOL_IDLE_TIMEOUT_SECS,
+            tickvault_common::constants::OMS_HTTP_POOL_IDLE_TIMEOUT_SECS,
         ))
         .build()
         .unwrap_or_default();
@@ -250,7 +250,7 @@ async fn run_trading_pipeline(
     // Max ~25K entries (one per subscribed instrument), cleared after each flush.
     let mut indicator_batch: std::collections::HashMap<
         u32,
-        (u8, dhan_live_trader_trading::indicator::IndicatorSnapshot),
+        (u8, tickvault_trading::indicator::IndicatorSnapshot),
     > = std::collections::HashMap::with_capacity(4096);
     // 09:15:00 IST = 33300 secs of day, 15:30:00 IST = 55800 secs of day
     const INDICATOR_PERSIST_START: u32 = 33_300;
@@ -274,9 +274,9 @@ async fn run_trading_pipeline(
     let mut wait_for_market_close = make_reset_future(&market_close_signal);
 
     // O3: Trading pipeline heartbeat gauge — proves the loop is alive.
-    let m_pipeline_heartbeat = metrics::gauge!("dlt_trading_pipeline_heartbeat");
+    let m_pipeline_heartbeat = metrics::gauge!("tv_trading_pipeline_heartbeat");
     // O4: Lagged ticks counter — tracks ticks permanently lost to broadcast lag.
-    let m_pipeline_lagged = metrics::counter!("dlt_trading_pipeline_ticks_lagged_total");
+    let m_pipeline_lagged = metrics::counter!("tv_trading_pipeline_ticks_lagged_total");
 
     loop {
         // O3: Heartbeat on every loop iteration.
@@ -326,7 +326,7 @@ async fn run_trading_pipeline(
                                 let ts_nanos = chrono::Utc::now()
                                     .timestamp_nanos_opt()
                                     .unwrap_or(0)
-                                    .saturating_add(dhan_live_trader_common::constants::IST_UTC_OFFSET_NANOS);
+                                    .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS);
                                 let mut persisted: u64 = 0;
                                 // O(1) EXEMPT: cold path — iterate all accumulated snapshots (max ~25K).
                                 for &(seg, ref snap) in indicator_batch.values() {
@@ -753,16 +753,22 @@ pub fn init_trading_pipeline(
         },
         client_id: client_id.to_owned(),
         token_handle: token_handle.clone(),
-        indicator_snapshot_writer: match dhan_live_trader_storage::indicator_snapshot_persistence::IndicatorSnapshotWriter::new(&config.questdb) {
-            Ok(w) => {
-                info!("QuestDB indicator snapshot writer connected");
-                Some(w)
-            }
-            Err(err) => {
-                tracing::warn!(?err, "indicator snapshot writer unavailable — snapshots will not be persisted");
-                None
-            }
-        },
+        indicator_snapshot_writer:
+            match tickvault_storage::indicator_snapshot_persistence::IndicatorSnapshotWriter::new(
+                &config.questdb,
+            ) {
+                Ok(w) => {
+                    info!("QuestDB indicator snapshot writer connected");
+                    Some(w)
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        ?err,
+                        "indicator snapshot writer unavailable — snapshots will not be persisted"
+                    );
+                    None
+                }
+            },
     };
 
     Some((pipeline_config, hot_reloader))
@@ -781,7 +787,7 @@ mod tests {
     use arc_swap::ArcSwap;
     use secrecy::ExposeSecret;
 
-    use dhan_live_trader_core::auth::types::{DhanAuthResponseData, TokenState};
+    use tickvault_core::auth::types::{DhanAuthResponseData, TokenState};
 
     /// Creates a TokenHandle with a valid token for testing.
     fn make_token_handle_with_value(access_token: &str) -> TokenHandle {
@@ -875,7 +881,7 @@ mod tests {
         assert!(result.is_err(), "None token should return Err(NoToken)");
         let err = result.unwrap_err();
         assert!(
-            matches!(err, dhan_live_trader_trading::oms::OmsError::NoToken),
+            matches!(err, tickvault_trading::oms::OmsError::NoToken),
             "error should be NoToken"
         );
     }
@@ -892,7 +898,7 @@ mod tests {
         );
         let err = result.unwrap_err();
         assert!(
-            matches!(err, dhan_live_trader_trading::oms::OmsError::NoToken),
+            matches!(err, tickvault_trading::oms::OmsError::NoToken),
             "error should be NoToken for empty token"
         );
     }
@@ -962,7 +968,7 @@ mod tests {
     #[test]
     fn test_trading_pipeline_config_dry_run_defaults_true() {
         // The default StrategyConfig has dry_run = true.
-        let default_strategy = dhan_live_trader_common::config::StrategyConfig::default();
+        let default_strategy = tickvault_common::config::StrategyConfig::default();
         assert!(
             default_strategy.dry_run,
             "dry_run must default to true for safety"
@@ -971,7 +977,7 @@ mod tests {
 
     #[test]
     fn test_trading_pipeline_config_default_capital() {
-        let default_strategy = dhan_live_trader_common::config::StrategyConfig::default();
+        let default_strategy = tickvault_common::config::StrategyConfig::default();
         assert!(
             default_strategy.capital > 0.0,
             "default capital must be positive"
@@ -987,7 +993,7 @@ mod tests {
         // init_trading_pipeline requires an ApplicationConfig which is hard
         // to construct without a TOML file. Instead, verify the path check
         // logic directly: a nonexistent path should return None.
-        let nonexistent = Path::new("/tmp/dlt_nonexistent_strategy_file.toml");
+        let nonexistent = Path::new("/tmp/tv_nonexistent_strategy_file.toml");
         assert!(!nonexistent.exists(), "test path must not exist");
         // The function checks strategy_path.exists() — if false, returns None.
         // We verify the path logic is correct by testing Path::exists directly.
@@ -996,7 +1002,7 @@ mod tests {
     #[test]
     fn test_init_trading_pipeline_with_invalid_toml() {
         // Create a temp file with invalid TOML content
-        let tmp_dir = std::env::temp_dir().join("dlt_test_pipeline");
+        let tmp_dir = std::env::temp_dir().join("tv_test_pipeline");
         let _ = std::fs::create_dir_all(&tmp_dir);
         let config_path = tmp_dir.join("invalid_strategies.toml");
         std::fs::write(&config_path, "this is not valid toml {{{{").unwrap();
@@ -1014,7 +1020,7 @@ mod tests {
     #[test]
     fn test_init_trading_pipeline_with_empty_toml() {
         // Empty TOML is valid but produces no strategies
-        let tmp_dir = std::env::temp_dir().join("dlt_test_pipeline_empty");
+        let tmp_dir = std::env::temp_dir().join("tv_test_pipeline_empty");
         let _ = std::fs::create_dir_all(&tmp_dir);
         let config_path = tmp_dir.join("empty_strategies.toml");
         std::fs::write(&config_path, "").unwrap();
@@ -1037,7 +1043,7 @@ mod tests {
     fn test_init_trading_pipeline_with_valid_toml() {
         // Valid TOML with one strategy using correct schema:
         // entry_long/entry_short conditions with field, operator, threshold.
-        let tmp_dir = std::env::temp_dir().join("dlt_test_pipeline_valid");
+        let tmp_dir = std::env::temp_dir().join("tv_test_pipeline_valid");
         let _ = std::fs::create_dir_all(&tmp_dir);
         let config_path = tmp_dir.join("valid_strategies.toml");
         let toml_content = r#"
@@ -1143,7 +1149,7 @@ threshold = 70.0
     fn test_trading_pipeline_config_with_strategies() {
         let handle = make_token_handle_with_value("test");
         // Create a strategy definition from a valid TOML snippet
-        let tmp_dir = std::env::temp_dir().join("dlt_test_pipeline_strategies");
+        let tmp_dir = std::env::temp_dir().join("tv_test_pipeline_strategies");
         let _ = std::fs::create_dir_all(&tmp_dir);
         let config_path = tmp_dir.join("multi_strategies.toml");
         let toml_content = r#"
@@ -1395,7 +1401,7 @@ threshold = 25.0
     #[test]
     fn test_signal_hold_is_default_for_cold_snapshot() {
         // A strategy instance should produce Hold for a non-warm snapshot
-        use dhan_live_trader_trading::strategy::types::StrategyDefinition;
+        use tickvault_trading::strategy::types::StrategyDefinition;
 
         let def = StrategyDefinition {
             name: "test".to_string(),
@@ -1485,14 +1491,14 @@ threshold = 25.0
     async fn test_pipeline_oms_dry_run_place_and_cancel_flow() {
         // Simulates the pipeline's order lifecycle: place -> exit -> cancel
         let handle = make_token_handle_with_value("test_jwt_token");
-        let api_client = dhan_live_trader_trading::oms::OrderApiClient::new(
+        let api_client = tickvault_trading::oms::OrderApiClient::new(
             reqwest::Client::new(),
             "https://api.dhan.co/v2".to_owned(),
             "test_client".to_owned(),
         );
-        let rate_limiter = dhan_live_trader_trading::oms::OrderRateLimiter::new(10);
+        let rate_limiter = tickvault_trading::oms::OrderRateLimiter::new(10);
         let bridge = Box::new(TokenHandleBridge { handle });
-        let mut oms = dhan_live_trader_trading::oms::OrderManagementSystem::new(
+        let mut oms = tickvault_trading::oms::OrderManagementSystem::new(
             api_client,
             rate_limiter,
             bridge,
@@ -1549,14 +1555,14 @@ threshold = 25.0
     async fn test_pipeline_oms_multiple_paper_orders() {
         // Pipeline may place multiple orders across different signals
         let handle = make_token_handle_with_value("jwt");
-        let api_client = dhan_live_trader_trading::oms::OrderApiClient::new(
+        let api_client = tickvault_trading::oms::OrderApiClient::new(
             reqwest::Client::new(),
             "https://api.dhan.co/v2".to_owned(),
             "c1".to_owned(),
         );
-        let rate_limiter = dhan_live_trader_trading::oms::OrderRateLimiter::new(10);
+        let rate_limiter = tickvault_trading::oms::OrderRateLimiter::new(10);
         let bridge = Box::new(TokenHandleBridge { handle });
-        let mut oms = dhan_live_trader_trading::oms::OrderManagementSystem::new(
+        let mut oms = tickvault_trading::oms::OrderManagementSystem::new(
             api_client,
             rate_limiter,
             bridge,
@@ -1780,7 +1786,7 @@ threshold = 25.0
     #[test]
     fn test_signal_exit_with_reason() {
         let signal = Signal::Exit {
-            reason: dhan_live_trader_trading::strategy::ExitReason::TargetHit,
+            reason: tickvault_trading::strategy::ExitReason::TargetHit,
         };
         assert!(matches!(signal, Signal::Exit { .. }));
     }
@@ -1798,7 +1804,7 @@ threshold = 25.0
 
     #[test]
     fn test_hot_reloader_with_entry_short_only() {
-        let tmp_dir = std::env::temp_dir().join("dlt_test_pipeline_short_only");
+        let tmp_dir = std::env::temp_dir().join("tv_test_pipeline_short_only");
         let _ = std::fs::create_dir_all(&tmp_dir);
         let config_path = tmp_dir.join("short_only_strategies.toml");
         let toml_content = r#"
@@ -1837,7 +1843,7 @@ threshold = 40.0
 
     #[test]
     fn test_hot_reloader_with_multiple_conditions_per_strategy() {
-        let tmp_dir = std::env::temp_dir().join("dlt_test_pipeline_multi_cond");
+        let tmp_dir = std::env::temp_dir().join("tv_test_pipeline_multi_cond");
         let _ = std::fs::create_dir_all(&tmp_dir);
         let config_path = tmp_dir.join("multi_condition_strategies.toml");
         let toml_content = r#"
@@ -1882,7 +1888,7 @@ threshold = 70.0
 
     #[test]
     fn test_hot_reloader_with_indicator_param_overrides() {
-        let tmp_dir = std::env::temp_dir().join("dlt_test_pipeline_params");
+        let tmp_dir = std::env::temp_dir().join("tv_test_pipeline_params");
         let _ = std::fs::create_dir_all(&tmp_dir);
         let config_path = tmp_dir.join("param_override_strategies.toml");
         let toml_content = r#"
@@ -1970,7 +1976,7 @@ threshold = 70.0
     #[tokio::test]
     async fn test_spawn_pipeline_with_strategies_and_ticks() {
         let handle = make_token_handle_with_value("jwt");
-        let tmp_dir = std::env::temp_dir().join("dlt_test_pipeline_spawn_with_strategy");
+        let tmp_dir = std::env::temp_dir().join("tv_test_pipeline_spawn_with_strategy");
         let _ = std::fs::create_dir_all(&tmp_dir);
         let config_path = tmp_dir.join("spawn_strategies.toml");
         let toml_content = r#"
@@ -2192,7 +2198,7 @@ threshold = 70.0
     #[test]
     fn test_hot_reloader_strategy_with_only_exit_condition() {
         // A strategy with only exit conditions should parse
-        let tmp_dir = std::env::temp_dir().join("dlt_test_pipeline_exitonly");
+        let tmp_dir = std::env::temp_dir().join("tv_test_pipeline_exitonly");
         let _ = std::fs::create_dir_all(&tmp_dir);
         let config_path = tmp_dir.join("exitonly_strategies.toml");
         let toml_content = r#"
@@ -2230,7 +2236,7 @@ threshold = 70.0
 
     #[test]
     fn test_default_strategy_config_path_is_toml() {
-        let default_config = dhan_live_trader_common::config::StrategyConfig::default();
+        let default_config = tickvault_common::config::StrategyConfig::default();
         assert!(
             default_config.config_path.ends_with(".toml"),
             "default strategy config must be a TOML file"
@@ -2239,7 +2245,7 @@ threshold = 70.0
 
     #[test]
     fn test_default_strategy_config_capital_is_positive() {
-        let default_config = dhan_live_trader_common::config::StrategyConfig::default();
+        let default_config = tickvault_common::config::StrategyConfig::default();
         assert!(
             default_config.capital > 0.0,
             "default capital must be positive"
@@ -2352,7 +2358,7 @@ threshold = 70.0
 
     #[test]
     fn test_init_trading_pipeline_with_nonexistent_strategy_file() {
-        let config = build_test_application_config("/tmp/dlt_nonexistent_strategy_99999.toml");
+        let config = build_test_application_config("/tmp/tv_nonexistent_strategy_99999.toml");
         let handle = make_token_handle_with_value("jwt");
 
         let result = init_trading_pipeline(&config, &handle, "test_client");
@@ -2364,7 +2370,7 @@ threshold = 70.0
 
     #[test]
     fn test_init_trading_pipeline_with_valid_strategy_file() {
-        let tmp_dir = std::env::temp_dir().join("dlt_test_init_pipeline_valid");
+        let tmp_dir = std::env::temp_dir().join("tv_test_init_pipeline_valid");
         let _ = std::fs::create_dir_all(&tmp_dir);
         let config_path = tmp_dir.join("test_strategies.toml");
         let toml_content = r#"
@@ -2400,7 +2406,7 @@ threshold = 70.0
 
     #[test]
     fn test_init_trading_pipeline_with_empty_strategy_file() {
-        let tmp_dir = std::env::temp_dir().join("dlt_test_init_pipeline_empty2");
+        let tmp_dir = std::env::temp_dir().join("tv_test_init_pipeline_empty2");
         let _ = std::fs::create_dir_all(&tmp_dir);
         let config_path = tmp_dir.join("empty_strategies.toml");
         std::fs::write(&config_path, "").unwrap();
@@ -2426,7 +2432,7 @@ threshold = 70.0
 
     #[test]
     fn test_init_trading_pipeline_with_invalid_strategy_file() {
-        let tmp_dir = std::env::temp_dir().join("dlt_test_init_pipeline_invalid2");
+        let tmp_dir = std::env::temp_dir().join("tv_test_init_pipeline_invalid2");
         let _ = std::fs::create_dir_all(&tmp_dir);
         let config_path = tmp_dir.join("invalid_strategies.toml");
         std::fs::write(&config_path, "{{{{invalid toml").unwrap();
@@ -2589,14 +2595,14 @@ threshold = 70.0
     #[tokio::test]
     async fn test_oms_cancel_nonexistent_order() {
         let handle = make_token_handle_with_value("jwt");
-        let api_client = dhan_live_trader_trading::oms::OrderApiClient::new(
+        let api_client = tickvault_trading::oms::OrderApiClient::new(
             reqwest::Client::new(),
             "https://api.dhan.co/v2".to_owned(),
             "test".to_owned(),
         );
-        let rate_limiter = dhan_live_trader_trading::oms::OrderRateLimiter::new(10);
+        let rate_limiter = tickvault_trading::oms::OrderRateLimiter::new(10);
         let bridge = Box::new(TokenHandleBridge { handle });
-        let mut oms = dhan_live_trader_trading::oms::OrderManagementSystem::new(
+        let mut oms = tickvault_trading::oms::OrderManagementSystem::new(
             api_client,
             rate_limiter,
             bridge,
@@ -2614,14 +2620,14 @@ threshold = 70.0
     #[test]
     fn test_oms_total_updates_starts_at_zero() {
         let handle = make_token_handle_with_value("jwt");
-        let api_client = dhan_live_trader_trading::oms::OrderApiClient::new(
+        let api_client = tickvault_trading::oms::OrderApiClient::new(
             reqwest::Client::new(),
             "https://api.dhan.co/v2".to_owned(),
             "test".to_owned(),
         );
-        let rate_limiter = dhan_live_trader_trading::oms::OrderRateLimiter::new(10);
+        let rate_limiter = tickvault_trading::oms::OrderRateLimiter::new(10);
         let bridge = Box::new(TokenHandleBridge { handle });
-        let oms = dhan_live_trader_trading::oms::OrderManagementSystem::new(
+        let oms = tickvault_trading::oms::OrderManagementSystem::new(
             api_client,
             rate_limiter,
             bridge,
@@ -2704,7 +2710,7 @@ threshold = 70.0
 
     #[test]
     fn test_init_trading_pipeline_with_disabled_strategy() {
-        let tmp_dir = std::env::temp_dir().join("dlt_test_init_pipeline_disabled");
+        let tmp_dir = std::env::temp_dir().join("tv_test_init_pipeline_disabled");
         let _ = std::fs::create_dir_all(&tmp_dir);
         let config_path = tmp_dir.join("disabled_strategies.toml");
         let toml_content = r#"
@@ -2748,7 +2754,7 @@ threshold = 70.0
 
     #[test]
     fn test_init_trading_pipeline_with_mixed_enabled_disabled() {
-        let tmp_dir = std::env::temp_dir().join("dlt_test_init_pipeline_mixed");
+        let tmp_dir = std::env::temp_dir().join("tv_test_init_pipeline_mixed");
         let _ = std::fs::create_dir_all(&tmp_dir);
         let config_path = tmp_dir.join("mixed_strategies.toml");
         let toml_content = r#"
@@ -2798,7 +2804,7 @@ threshold = 20.0
 
     #[test]
     fn test_init_trading_pipeline_config_propagation() {
-        let tmp_dir = std::env::temp_dir().join("dlt_test_init_pipeline_cfg_prop");
+        let tmp_dir = std::env::temp_dir().join("tv_test_init_pipeline_cfg_prop");
         let _ = std::fs::create_dir_all(&tmp_dir);
         let config_path = tmp_dir.join("prop_strategies.toml");
         let toml_content = r#"
@@ -2886,14 +2892,14 @@ threshold = 70.0
     #[tokio::test]
     async fn test_oms_handle_order_update_various_statuses() {
         let handle = make_token_handle_with_value("jwt");
-        let api_client = dhan_live_trader_trading::oms::OrderApiClient::new(
+        let api_client = tickvault_trading::oms::OrderApiClient::new(
             reqwest::Client::new(),
             "https://api.dhan.co/v2".to_owned(),
             "test".to_owned(),
         );
-        let rate_limiter = dhan_live_trader_trading::oms::OrderRateLimiter::new(10);
+        let rate_limiter = tickvault_trading::oms::OrderRateLimiter::new(10);
         let bridge = Box::new(TokenHandleBridge { handle });
-        let mut oms = dhan_live_trader_trading::oms::OrderManagementSystem::new(
+        let mut oms = tickvault_trading::oms::OrderManagementSystem::new(
             api_client,
             rate_limiter,
             bridge,
@@ -2937,7 +2943,7 @@ threshold = 70.0
     #[tokio::test]
     async fn test_spawn_pipeline_multiple_securities_multiple_strategies() {
         let handle = make_token_handle_with_value("jwt");
-        let tmp_dir = std::env::temp_dir().join("dlt_test_pipeline_multi_sec_strategy");
+        let tmp_dir = std::env::temp_dir().join("tv_test_pipeline_multi_sec_strategy");
         let _ = std::fs::create_dir_all(&tmp_dir);
         let config_path = tmp_dir.join("multi_sec_strategies.toml");
         let toml_content = r#"
@@ -3026,14 +3032,14 @@ threshold = 30.0
     #[tokio::test]
     async fn test_oms_active_orders_tracks_security_id() {
         let handle = make_token_handle_with_value("jwt");
-        let api_client = dhan_live_trader_trading::oms::OrderApiClient::new(
+        let api_client = tickvault_trading::oms::OrderApiClient::new(
             reqwest::Client::new(),
             "https://api.dhan.co/v2".to_owned(),
             "test".to_owned(),
         );
-        let rate_limiter = dhan_live_trader_trading::oms::OrderRateLimiter::new(10);
+        let rate_limiter = tickvault_trading::oms::OrderRateLimiter::new(10);
         let bridge = Box::new(TokenHandleBridge { handle });
-        let mut oms = dhan_live_trader_trading::oms::OrderManagementSystem::new(
+        let mut oms = tickvault_trading::oms::OrderManagementSystem::new(
             api_client,
             rate_limiter,
             bridge,
@@ -3214,7 +3220,7 @@ threshold = 30.0
         // the file during the test. The pipeline should still process ticks
         // normally when no reload event is pending.
         let handle = make_token_handle_with_value("jwt");
-        let tmp_dir = std::env::temp_dir().join("dlt_test_pipeline_hot_reload");
+        let tmp_dir = std::env::temp_dir().join("tv_test_pipeline_hot_reload");
         let _ = std::fs::create_dir_all(&tmp_dir);
         let config_path = tmp_dir.join("hot_reload_strategies.toml");
         let toml_content = r#"
@@ -3293,7 +3299,7 @@ threshold = 70.0
         // Send enough ticks to potentially warm up the indicator engine,
         // which may cause strategy evaluations to produce non-Hold signals.
         let handle = make_token_handle_with_value("jwt");
-        let tmp_dir = std::env::temp_dir().join("dlt_test_pipeline_warmup");
+        let tmp_dir = std::env::temp_dir().join("tv_test_pipeline_warmup");
         let _ = std::fs::create_dir_all(&tmp_dir);
         let config_path = tmp_dir.join("warmup_strategies.toml");
         let toml_content = r#"
@@ -3430,7 +3436,7 @@ threshold = 50.0
 
     #[test]
     fn test_init_trading_pipeline_propagates_risk_config() {
-        let tmp_dir = std::env::temp_dir().join("dlt_test_init_pipeline_risk");
+        let tmp_dir = std::env::temp_dir().join("tv_test_init_pipeline_risk");
         let _ = std::fs::create_dir_all(&tmp_dir);
         let config_path = tmp_dir.join("risk_strategies.toml");
         std::fs::write(
@@ -3488,7 +3494,7 @@ threshold = 70.0
         // This should warm up the indicator engine (30 ticks) and push RSI below 30,
         // triggering an EnterLong signal from the strategy.
         let handle = make_token_handle_with_value("jwt");
-        let tmp_dir = std::env::temp_dir().join("dlt_test_pipeline_warm_signals");
+        let tmp_dir = std::env::temp_dir().join("tv_test_pipeline_warm_signals");
         let _ = std::fs::create_dir_all(&tmp_dir);
         let config_path = tmp_dir.join("warm_strategies.toml");
         let toml_content = r#"
@@ -3568,7 +3574,7 @@ threshold = 65.0
         // Send ticks with steadily increasing prices to push RSI above 75,
         // triggering an EnterShort signal.
         let handle = make_token_handle_with_value("jwt");
-        let tmp_dir = std::env::temp_dir().join("dlt_test_pipeline_short_entry");
+        let tmp_dir = std::env::temp_dir().join("tv_test_pipeline_short_entry");
         let _ = std::fs::create_dir_all(&tmp_dir);
         let config_path = tmp_dir.join("short_entry_strategies.toml");
         let toml_content = r#"
@@ -3722,7 +3728,7 @@ threshold = 35.0
 
     #[test]
     fn test_init_trading_pipeline_returns_hot_reloader_for_valid_config() {
-        let tmp_dir = std::env::temp_dir().join("dlt_test_init_pipeline_reloader");
+        let tmp_dir = std::env::temp_dir().join("tv_test_init_pipeline_reloader");
         let _ = std::fs::create_dir_all(&tmp_dir);
         let config_path = tmp_dir.join("reloader_strategies.toml");
         std::fs::write(
@@ -3876,7 +3882,7 @@ threshold = 70.0
         assert!(result.is_err(), "empty token must return Err");
         let err = result.unwrap_err();
         assert!(
-            matches!(err, dhan_live_trader_trading::oms::OmsError::NoToken),
+            matches!(err, tickvault_trading::oms::OmsError::NoToken),
             "empty token must be NoToken, got: {err}"
         );
     }
@@ -3889,7 +3895,7 @@ threshold = 70.0
         assert!(result.is_err(), "None handle must return Err");
         let err = result.unwrap_err();
         assert!(
-            matches!(err, dhan_live_trader_trading::oms::OmsError::NoToken),
+            matches!(err, tickvault_trading::oms::OmsError::NoToken),
             "None handle must be NoToken, got: {err}"
         );
     }
@@ -3917,7 +3923,7 @@ threshold = 70.0
         assert!(result.is_err(), "expired token must return Err");
         let err = result.unwrap_err();
         assert!(
-            matches!(err, dhan_live_trader_trading::oms::OmsError::TokenExpired),
+            matches!(err, tickvault_trading::oms::OmsError::TokenExpired),
             "expired token must be TokenExpired, got: {err}"
         );
     }

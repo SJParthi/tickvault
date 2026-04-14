@@ -27,15 +27,15 @@ use questdb::ingress::{Buffer, Sender, TimestampNanos};
 use reqwest::Client;
 use tracing::{debug, error, info, warn};
 
-use dhan_live_trader_common::config::QuestDbConfig;
-use dhan_live_trader_common::constants::{
+use tickvault_common::config::QuestDbConfig;
+use tickvault_common::constants::{
     DEPTH_BUFFER_CAPACITY, DEPTH_FLUSH_BATCH_SIZE, IST_UTC_OFFSET_NANOS, IST_UTC_OFFSET_SECONDS,
     QUESTDB_TABLE_MARKET_DEPTH, QUESTDB_TABLE_PREVIOUS_CLOSE, QUESTDB_TABLE_TICKS, SECONDS_PER_DAY,
     TICK_BUFFER_CAPACITY, TICK_BUFFER_HIGH_WATERMARK, TICK_FLUSH_BATCH_SIZE,
     TICK_FLUSH_INTERVAL_MS, TICK_SPILL_MIN_DISK_SPACE_BYTES,
 };
-use dhan_live_trader_common::segment::segment_code_to_str;
-use dhan_live_trader_common::tick_types::{MarketDepthLevel, ParsedTick};
+use tickvault_common::segment::segment_code_to_str;
+use tickvault_common::tick_types::{MarketDepthLevel, ParsedTick};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -525,8 +525,8 @@ impl TickPersistenceWriter {
                 );
             }
         }
-        metrics::gauge!("dlt_tick_buffer_size").set(self.tick_buffer.len() as f64);
-        metrics::counter!("dlt_ticks_spilled_total").absolute(self.ticks_spilled_total);
+        metrics::gauge!("tv_tick_buffer_size").set(self.tick_buffer.len() as f64);
+        metrics::counter!("tv_ticks_spilled_total").absolute(self.ticks_spilled_total);
         // O(1) EXEMPT: end
     }
 
@@ -580,7 +580,7 @@ impl TickPersistenceWriter {
         if self.dlq_writer.is_none() && let Err(err) = self.open_dlq_file() {
             error!(?err, security_id = tick.security_id, reason, "CRITICAL: DLQ open failed — tick PERMANENTLY LOST");
             self.ticks_dropped_total = self.ticks_dropped_total.saturating_add(1);
-            metrics::counter!("dlt_ticks_dropped_total").absolute(self.ticks_dropped_total);
+            metrics::counter!("tv_ticks_dropped_total").absolute(self.ticks_dropped_total);
             return;
         }
         // Build one JSON line. Manual construction avoids a serde_json dep on this hot-ish path
@@ -599,7 +599,7 @@ impl TickPersistenceWriter {
             error!(?err, security_id = tick.security_id, reason, "CRITICAL: DLQ write failed — tick PERMANENTLY LOST");
             self.dlq_writer = None;
             self.ticks_dropped_total = self.ticks_dropped_total.saturating_add(1);
-            metrics::counter!("dlt_ticks_dropped_total").absolute(self.ticks_dropped_total);
+            metrics::counter!("tv_ticks_dropped_total").absolute(self.ticks_dropped_total);
             return;
         }
         // Flush immediately — this path is already broken, durability is worth the fsync cost.
@@ -607,7 +607,7 @@ impl TickPersistenceWriter {
             error!(?err, "DLQ flush failed — line may not be durable on disk");
         }
         self.dlq_ticks_total = self.dlq_ticks_total.saturating_add(1);
-        metrics::counter!("dlt_dlq_ticks_total").absolute(self.dlq_ticks_total);
+        metrics::counter!("tv_dlq_ticks_total").absolute(self.dlq_ticks_total);
         error!(
             security_id = tick.security_id,
             reason,
@@ -677,7 +677,7 @@ impl TickPersistenceWriter {
         // A4: Disk space check before first spill write.
         if let Some(avail) = Self::available_disk_space_bytes_for(&self.spill_dir) {
             let avail_mb = avail / (1024 * 1024);
-            metrics::gauge!("dlt_spill_disk_available_mb").set(avail_mb as f64);
+            metrics::gauge!("tv_spill_disk_available_mb").set(avail_mb as f64);
             if avail < TICK_SPILL_MIN_DISK_SPACE_BYTES {
                 error!(
                     available_mb = avail_mb,
@@ -746,8 +746,8 @@ impl TickPersistenceWriter {
             info!(total_drained = drained, from_ring = ring_count, from_disk = self.ticks_spilled_total, "recovery drain complete — all ticks written to QuestDB");
             self.just_recovered = true;
         }
-        metrics::gauge!("dlt_tick_buffer_size").set(self.tick_buffer.len() as f64);
-        metrics::counter!("dlt_ticks_spilled_total").absolute(self.ticks_spilled_total);
+        metrics::gauge!("tv_tick_buffer_size").set(self.tick_buffer.len() as f64);
+        metrics::counter!("tv_ticks_spilled_total").absolute(self.ticks_spilled_total);
     }
 
     /// Drains the disk spill file to QuestDB. Returns count of ticks drained.
@@ -1681,8 +1681,8 @@ impl DepthPersistenceWriter {
         } else {
             self.depth_buffer.push_back(snapshot);
         }
-        metrics::gauge!("dlt_depth_buffer_size").set(self.depth_buffer.len() as f64);
-        metrics::counter!("dlt_depth_spilled_total").absolute(self.depth_spilled_total);
+        metrics::gauge!("tv_depth_buffer_size").set(self.depth_buffer.len() as f64);
+        metrics::counter!("tv_depth_spilled_total").absolute(self.depth_spilled_total);
         // O(1) EXEMPT: end
     }
 
@@ -1692,14 +1692,14 @@ impl DepthPersistenceWriter {
         if self.spill_writer.is_none() && let Err(err) = self.open_depth_spill_file() {
             error!(?err, "CRITICAL: cannot open depth spill file — depth snapshot WILL be lost");
             self.depth_dropped_total = self.depth_dropped_total.saturating_add(1);
-            metrics::counter!("dlt_depth_dropped_total").absolute(self.depth_dropped_total);
+            metrics::counter!("tv_depth_dropped_total").absolute(self.depth_dropped_total);
             return;
         }
         let record = serialize_depth(snapshot);
         if let Some(ref mut writer) = self.spill_writer && let Err(err) = writer.write_all(&record) {
             error!(?err, depth_spilled = self.depth_spilled_total, "CRITICAL: depth disk spill write failed — snapshot lost");
             self.depth_dropped_total = self.depth_dropped_total.saturating_add(1);
-            metrics::counter!("dlt_depth_dropped_total").absolute(self.depth_dropped_total);
+            metrics::counter!("tv_depth_dropped_total").absolute(self.depth_dropped_total);
             return;
         }
         self.depth_spilled_total = self.depth_spilled_total.saturating_add(1);
@@ -1754,8 +1754,8 @@ impl DepthPersistenceWriter {
         }
         if drained > 0 { info!(drained, ring_count, "depth ring buffer drained to QuestDB"); }
         if self.depth_spilled_total > 0 { self.drain_depth_disk_spill(); }
-        metrics::gauge!("dlt_depth_buffer_size").set(self.depth_buffer.len() as f64);
-        metrics::counter!("dlt_depth_spilled_total").absolute(self.depth_spilled_total);
+        metrics::gauge!("tv_depth_buffer_size").set(self.depth_buffer.len() as f64);
+        metrics::counter!("tv_depth_spilled_total").absolute(self.depth_spilled_total);
     }
 
     /// Drains the depth disk spill file to QuestDB.
@@ -2379,12 +2379,12 @@ fn current_time_ms() -> u64 {
 #[allow(clippy::arithmetic_side_effects)] // APPROVED: test-only arithmetic is not on hot path
 mod tests {
     use super::*;
-    use dhan_live_trader_common::constants::{
+    use questdb::ingress::ProtocolVersion;
+    use tickvault_common::constants::{
         EXCHANGE_SEGMENT_BSE_CURRENCY, EXCHANGE_SEGMENT_BSE_EQ, EXCHANGE_SEGMENT_BSE_FNO,
         EXCHANGE_SEGMENT_IDX_I, EXCHANGE_SEGMENT_MCX_COMM, EXCHANGE_SEGMENT_NSE_CURRENCY,
         EXCHANGE_SEGMENT_NSE_EQ, EXCHANGE_SEGMENT_NSE_FNO, IST_UTC_OFFSET_SECONDS_I64,
     };
-    use questdb::ingress::ProtocolVersion;
 
     fn make_test_tick(security_id: u32, ltp: f32) -> ParsedTick {
         ParsedTick {
@@ -6278,7 +6278,7 @@ mod tests {
 
         // Pre-set spill to unique temp path.
         let tmp_dir =
-            std::env::temp_dir().join(format!("dlt-spill-drop-test-{}", std::process::id()));
+            std::env::temp_dir().join(format!("tv-spill-drop-test-{}", std::process::id()));
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let spill_path = tmp_dir.join("test-ticks-overflow.bin");
         let file = std::fs::File::create(&spill_path).unwrap();
@@ -6686,7 +6686,7 @@ mod tests {
     #[test]
     fn test_disk_spill_write_read_roundtrip() {
         // Use a unique temp dir for this test.
-        let tmp_dir = std::env::temp_dir().join(format!("dlt-spill-test-{}", std::process::id()));
+        let tmp_dir = std::env::temp_dir().join(format!("tv-spill-test-{}", std::process::id()));
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let spill_path = tmp_dir.join("test-ticks.bin");
 
@@ -6782,7 +6782,7 @@ mod tests {
 
         // Pre-set spill to a unique temp file so we don't collide with other tests.
         let tmp_dir =
-            std::env::temp_dir().join(format!("dlt-zero-loss-test-{}", std::process::id()));
+            std::env::temp_dir().join(format!("tv-zero-loss-test-{}", std::process::id()));
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let spill_path = tmp_dir.join("test-ticks-spill.bin");
         let file = std::fs::File::create(&spill_path).unwrap();
@@ -6971,7 +6971,7 @@ mod tests {
 
         // Pre-set spill to unique temp path.
         let tmp_dir =
-            std::env::temp_dir().join(format!("dlt-e2e-crash-test-{}", std::process::id()));
+            std::env::temp_dir().join(format!("tv-e2e-crash-test-{}", std::process::id()));
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let spill_path = tmp_dir.join("crash-test-spill.bin");
         let file = std::fs::File::create(&spill_path).unwrap();
@@ -7067,7 +7067,7 @@ mod tests {
 
         // Pre-set spill to unique temp path.
         let tmp_dir =
-            std::env::temp_dir().join(format!("dlt-e2e-prolonged-test-{}", std::process::id()));
+            std::env::temp_dir().join(format!("tv-e2e-prolonged-test-{}", std::process::id()));
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let spill_path = tmp_dir.join("prolonged-spill.bin");
         let file = std::fs::File::create(&spill_path).unwrap();
@@ -7195,8 +7195,7 @@ mod tests {
         );
 
         // Pre-set spill file to unique temp path.
-        let tmp_dir =
-            std::env::temp_dir().join(format!("dlt-verbose-proof-{}", std::process::id()));
+        let tmp_dir = std::env::temp_dir().join(format!("tv-verbose-proof-{}", std::process::id()));
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let spill_path = tmp_dir.join("verbose-proof-spill.bin");
         let file = std::fs::File::create(&spill_path).unwrap();
@@ -8068,7 +8067,7 @@ mod tests {
 
         // Pre-set spill to unique temp path to avoid interference.
         let tmp_dir =
-            std::env::temp_dir().join(format!("dlt-depth-spill-drain-{}", std::process::id()));
+            std::env::temp_dir().join(format!("tv-depth-spill-drain-{}", std::process::id()));
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let spill_path = tmp_dir.join("depth-spill-test.bin");
         let file = std::fs::File::create(&spill_path).unwrap();
@@ -8186,7 +8185,7 @@ mod tests {
 
         // Create a temp spill file with depth records.
         let tmp_dir =
-            std::env::temp_dir().join(format!("dlt-depth-partial-drain-{}", std::process::id()));
+            std::env::temp_dir().join(format!("tv-depth-partial-drain-{}", std::process::id()));
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let spill_path = tmp_dir.join("depth-partial.bin");
 
@@ -8262,7 +8261,7 @@ mod tests {
         use std::sync::atomic::Ordering;
 
         let tmp_dir =
-            std::env::temp_dir().join(format!("dlt-depth-recover-stale-{}", std::process::id()));
+            std::env::temp_dir().join(format!("tv-depth-recover-stale-{}", std::process::id()));
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let spill_path = tmp_dir.join("depth-stale.bin");
 
@@ -8424,7 +8423,7 @@ mod tests {
 
         // Set up a temp spill path to avoid polluting the real spill dir.
         let tmp_dir =
-            std::env::temp_dir().join(format!("dlt-spill-create-test-{}", std::process::id()));
+            std::env::temp_dir().join(format!("tv-spill-create-test-{}", std::process::id()));
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let spill_path = tmp_dir.join("test-spill-create.bin");
 
@@ -8633,10 +8632,8 @@ mod tests {
         let mut writer = DepthPersistenceWriter::new(&config).unwrap();
 
         // Set up a temp spill path.
-        let tmp_dir = std::env::temp_dir().join(format!(
-            "dlt-depth-spill-create-test-{}",
-            std::process::id()
-        ));
+        let tmp_dir =
+            std::env::temp_dir().join(format!("tv-depth-spill-create-test-{}", std::process::id()));
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let spill_path = tmp_dir.join("test-depth-spill-create.bin");
         let file = std::fs::File::create(&spill_path).unwrap();
@@ -8796,7 +8793,7 @@ mod tests {
 
         // Set up temp spill file.
         let tmp_dir =
-            std::env::temp_dir().join(format!("dlt-tick-drain-full-{}", std::process::id()));
+            std::env::temp_dir().join(format!("tv-tick-drain-full-{}", std::process::id()));
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let spill_path = tmp_dir.join("test-ticks-drain.bin");
         let file = std::fs::File::create(&spill_path).unwrap();
@@ -8925,7 +8922,7 @@ mod tests {
 
         // Set up temp spill file.
         let tmp_dir =
-            std::env::temp_dir().join(format!("dlt-depth-drain-full-{}", std::process::id()));
+            std::env::temp_dir().join(format!("tv-depth-drain-full-{}", std::process::id()));
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let spill_path = tmp_dir.join("test-depth-drain.bin");
         let file = std::fs::File::create(&spill_path).unwrap();
@@ -9814,7 +9811,7 @@ mod tests {
 
         // Create a spill file with 10 tick records.
         let tmp_dir =
-            std::env::temp_dir().join(format!("dlt-tick-drain-spill-test-{}", std::process::id()));
+            std::env::temp_dir().join(format!("tv-tick-drain-spill-test-{}", std::process::id()));
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let spill_path = tmp_dir.join("test-ticks-drain-spill.bin");
 
@@ -9864,7 +9861,7 @@ mod tests {
         let mut writer = DepthPersistenceWriter::new(&config).unwrap();
 
         let tmp_dir =
-            std::env::temp_dir().join(format!("dlt-depth-drain-spill-test-{}", std::process::id()));
+            std::env::temp_dir().join(format!("tv-depth-drain-spill-test-{}", std::process::id()));
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let spill_path = tmp_dir.join("test-depth-drain-spill.bin");
 
@@ -10561,7 +10558,7 @@ mod tests {
         let mut writer = TickPersistenceWriter::new(&config).unwrap();
 
         let tmp_dir =
-            std::env::temp_dir().join(format!("dlt-tick-spill-10k-{}", std::process::id()));
+            std::env::temp_dir().join(format!("tv-tick-spill-10k-{}", std::process::id()));
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let spill_path = tmp_dir.join("ticks-10k.bin");
         let file = std::fs::File::create(&spill_path).unwrap();
@@ -10646,7 +10643,7 @@ mod tests {
         let mut writer = TickPersistenceWriter::new(&config).unwrap();
 
         // Use a temporary DLQ file so we don't collide with other tests.
-        let tmp_dir = std::env::temp_dir().join(format!("dlt-dlq-format-{}", std::process::id()));
+        let tmp_dir = std::env::temp_dir().join(format!("tv-dlq-format-{}", std::process::id()));
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let dlq_path = tmp_dir.join("dlq.ndjson");
         let file = std::fs::File::create(&dlq_path).unwrap();
@@ -10703,7 +10700,7 @@ mod tests {
         };
         let mut writer = TickPersistenceWriter::new(&config).unwrap();
 
-        let tmp_dir = std::env::temp_dir().join(format!("dlt-dlq-append-{}", std::process::id()));
+        let tmp_dir = std::env::temp_dir().join(format!("tv-dlq-append-{}", std::process::id()));
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let dlq_path = tmp_dir.join("dlq.ndjson");
         let file = std::fs::File::create(&dlq_path).unwrap();
@@ -10741,7 +10738,7 @@ mod tests {
         };
         let mut writer = TickPersistenceWriter::new(&config).unwrap();
 
-        let tmp_dir = std::env::temp_dir().join(format!("dlt-f1-spill-{}", std::process::id()));
+        let tmp_dir = std::env::temp_dir().join(format!("tv-f1-spill-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp_dir);
         writer.set_spill_dir_for_test(tmp_dir.clone());
         assert_eq!(writer.spill_dir(), tmp_dir.as_path());
@@ -10780,7 +10777,7 @@ mod tests {
         };
         let mut writer = TickPersistenceWriter::new(&config).unwrap();
 
-        let tmp_dir = std::env::temp_dir().join(format!("dlt-f1-dlq-{}", std::process::id()));
+        let tmp_dir = std::env::temp_dir().join(format!("tv-f1-dlq-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp_dir);
         writer.set_spill_dir_for_test(tmp_dir.clone());
 
@@ -10870,7 +10867,7 @@ mod tests {
         let mut writer = TickPersistenceWriter::new(&config).unwrap();
 
         let tmp_dir =
-            std::env::temp_dir().join(format!("dlt-tick-drain-spill-{}", std::process::id()));
+            std::env::temp_dir().join(format!("tv-tick-drain-spill-{}", std::process::id()));
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let spill_path = tmp_dir.join("ticks-drain.bin");
 
@@ -11173,7 +11170,7 @@ mod tests {
         let mut writer = DepthPersistenceWriter::new(&config).unwrap();
 
         let tmp_dir =
-            std::env::temp_dir().join(format!("dlt-depth-spill-test-{}", std::process::id()));
+            std::env::temp_dir().join(format!("tv-depth-spill-test-{}", std::process::id()));
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let spill_path = tmp_dir.join("depth-spill.bin");
         let file = std::fs::File::create(&spill_path).unwrap();
@@ -11272,7 +11269,7 @@ mod tests {
         let mut writer = DepthPersistenceWriter::new(&config).unwrap();
 
         let tmp_dir =
-            std::env::temp_dir().join(format!("dlt-depth-drain-spill-{}", std::process::id()));
+            std::env::temp_dir().join(format!("tv-depth-drain-spill-{}", std::process::id()));
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let spill_path = tmp_dir.join("depth-drain.bin");
 
@@ -11500,7 +11497,7 @@ mod tests {
         let mut writer = DepthPersistenceWriter::new(&config).unwrap();
 
         let tmp_dir =
-            std::env::temp_dir().join(format!("dlt-depth-spill-1k-{}", std::process::id()));
+            std::env::temp_dir().join(format!("tv-depth-spill-1k-{}", std::process::id()));
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let spill_path = tmp_dir.join("depth-1k.bin");
         let file = std::fs::File::create(&spill_path).unwrap();
@@ -11749,7 +11746,7 @@ mod tests {
         let mut writer = TickPersistenceWriter::new(&config).unwrap();
 
         let tmp_dir =
-            std::env::temp_dir().join(format!("dlt-tick-drain-test-{}", std::process::id()));
+            std::env::temp_dir().join(format!("tv-tick-drain-test-{}", std::process::id()));
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let spill_path = tmp_dir.join("ticks-test-drain.bin");
 
@@ -11805,7 +11802,7 @@ mod tests {
         };
         let mut writer = TickPersistenceWriter::new(&config).unwrap();
 
-        let tmp_dir = std::env::temp_dir().join(format!("dlt-tick-corrupt-{}", std::process::id()));
+        let tmp_dir = std::env::temp_dir().join(format!("tv-tick-corrupt-{}", std::process::id()));
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let spill_path = tmp_dir.join("ticks-corrupt.bin");
 
@@ -12100,7 +12097,7 @@ mod tests {
         };
         let mut writer = DepthPersistenceWriter::new(&config).unwrap();
 
-        let tmp_dir = std::env::temp_dir().join(format!("dlt-depth-drain-{}", std::process::id()));
+        let tmp_dir = std::env::temp_dir().join(format!("tv-depth-drain-{}", std::process::id()));
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let spill_path = tmp_dir.join("depth-test-drain.bin");
 

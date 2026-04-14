@@ -1,4 +1,4 @@
-# Security Policy — dhan-live-trader
+# Security Policy — tickvault
 
 ## Reporting a Vulnerability
 

@@ -54,13 +54,13 @@
 //! `#[ignore]` by default. Run with:
 //!
 //! ```bash
-//! cargo test -p dhan-live-trader-storage --test chaos_sigkill_replay -- --ignored
+//! cargo test -p tickvault-storage --test chaos_sigkill_replay -- --ignored
 //! ```
 
 #![cfg(test)]
 
-use dhan_live_trader_common::config::QuestDbConfig;
 use std::io::{Read, Write};
+use tickvault_common::config::QuestDbConfig;
 
 const TICK_SPILL_RECORD_SIZE: usize = 112;
 
@@ -109,7 +109,7 @@ fn build_spill_record(security_id: u32, ltp: f32, ts: u32) -> [u8; TICK_SPILL_RE
 #[ignore = "B3 chaos test — run manually with `-- --ignored`"]
 fn chaos_sigkill_spill_replay_zero_loss() {
     let tmp_spill =
-        std::env::temp_dir().join(format!("dlt-b3-chaos-sigkill-{}", std::process::id()));
+        std::env::temp_dir().join(format!("tv-b3-chaos-sigkill-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp_spill);
     std::fs::create_dir_all(&tmp_spill).expect("create tmp spill dir"); // APPROVED: test
 
@@ -145,9 +145,8 @@ fn chaos_sigkill_spill_replay_zero_loss() {
         http_port: port,
         pg_port: port,
     };
-    let mut writer =
-        dhan_live_trader_storage::tick_persistence::TickPersistenceWriter::new(&config)
-            .expect("new writer"); // APPROVED: test
+    let mut writer = tickvault_storage::tick_persistence::TickPersistenceWriter::new(&config)
+        .expect("new writer"); // APPROVED: test
     writer.set_spill_dir_for_test(tmp_spill.clone());
 
     // Run recovery. Must return the number of ticks drained.
@@ -173,7 +172,7 @@ fn chaos_sigkill_spill_replay_zero_loss() {
 #[ignore = "B3 chaos test — run manually with `-- --ignored`"]
 fn chaos_sigkill_recovery_idempotent_on_empty_dir() {
     let tmp_spill =
-        std::env::temp_dir().join(format!("dlt-b3-chaos-idempotent-{}", std::process::id()));
+        std::env::temp_dir().join(format!("tv-b3-chaos-idempotent-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp_spill);
     std::fs::create_dir_all(&tmp_spill).expect("create"); // APPROVED: test
 
@@ -184,9 +183,8 @@ fn chaos_sigkill_recovery_idempotent_on_empty_dir() {
         http_port: port,
         pg_port: port,
     };
-    let mut writer =
-        dhan_live_trader_storage::tick_persistence::TickPersistenceWriter::new(&config)
-            .expect("new writer"); // APPROVED: test
+    let mut writer = tickvault_storage::tick_persistence::TickPersistenceWriter::new(&config)
+        .expect("new writer"); // APPROVED: test
     writer.set_spill_dir_for_test(tmp_spill.clone());
 
     let recovered = writer.recover_stale_spill_files();

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # =============================================================================
-# dhan-live-trader — Bootstrap Script
+# tickvault — Bootstrap Script
 # =============================================================================
 # THE ONE COMMAND. Run once after cloning. Sets up everything.
 #
 # Usage:
-#   git clone https://github.com/SJParthi/dhan-live-trader.git
-#   cd dhan-live-trader
+#   git clone https://github.com/SJParthi/tickvault.git
+#   cd tickvault
 #   ./scripts/bootstrap.sh
 #
 # What it does:
@@ -34,7 +34,7 @@ NC='\033[0m' # No Color
 
 echo ""
 echo -e "${CYAN}╔════════════════════════════════════════════════╗${NC}"
-echo -e "${CYAN}║   dhan-live-trader — Bootstrap                 ║${NC}"
+echo -e "${CYAN}║   tickvault — Bootstrap                 ║${NC}"
 echo -e "${CYAN}╚════════════════════════════════════════════════╝${NC}"
 echo ""
 
@@ -130,21 +130,21 @@ ENVIRONMENT="${SSM_ENV}" bash scripts/provision-infra-secrets.sh
 
 # Fetch credentials and export for docker-compose
 echo -n "  Exporting QuestDB credentials... "
-DLT_QUESTDB_PG_USER=$(fetch_ssm_secret "/dlt/${SSM_ENV}/questdb/pg-user")
-DLT_QUESTDB_PG_PASSWORD=$(fetch_ssm_secret "/dlt/${SSM_ENV}/questdb/pg-password") # ssm_parameter fetch, not hardcoded
-export DLT_QUESTDB_PG_USER DLT_QUESTDB_PG_PASSWORD
+TV_QUESTDB_PG_USER=$(fetch_ssm_secret "/tickvault/${SSM_ENV}/questdb/pg-user")
+TV_QUESTDB_PG_PASSWORD=$(fetch_ssm_secret "/tickvault/${SSM_ENV}/questdb/pg-password") # ssm_parameter fetch, not hardcoded
+export TV_QUESTDB_PG_USER TV_QUESTDB_PG_PASSWORD
 echo -e "${GREEN}OK${NC}"
 
 echo -n "  Exporting Grafana credentials... "
-DLT_GRAFANA_ADMIN_USER=$(fetch_ssm_secret "/dlt/${SSM_ENV}/grafana/admin-user")
-DLT_GRAFANA_ADMIN_PASSWORD=$(fetch_ssm_secret "/dlt/${SSM_ENV}/grafana/admin-password") # ssm_parameter fetch, not hardcoded
-export DLT_GRAFANA_ADMIN_USER DLT_GRAFANA_ADMIN_PASSWORD
+TV_GRAFANA_ADMIN_USER=$(fetch_ssm_secret "/tickvault/${SSM_ENV}/grafana/admin-user")
+TV_GRAFANA_ADMIN_PASSWORD=$(fetch_ssm_secret "/tickvault/${SSM_ENV}/grafana/admin-password") # ssm_parameter fetch, not hardcoded
+export TV_GRAFANA_ADMIN_USER TV_GRAFANA_ADMIN_PASSWORD
 echo -e "${GREEN}OK${NC}"
 
 echo -n "  Exporting Telegram credentials for Grafana alerts... "
-DLT_TELEGRAM_BOT_TOKEN=$(fetch_ssm_secret "/dlt/${SSM_ENV}/telegram/bot-token")
-DLT_TELEGRAM_CHAT_ID=$(fetch_ssm_secret "/dlt/${SSM_ENV}/telegram/chat-id")
-export DLT_TELEGRAM_BOT_TOKEN DLT_TELEGRAM_CHAT_ID
+TV_TELEGRAM_BOT_TOKEN=$(fetch_ssm_secret "/tickvault/${SSM_ENV}/telegram/bot-token")
+TV_TELEGRAM_CHAT_ID=$(fetch_ssm_secret "/tickvault/${SSM_ENV}/telegram/chat-id")
+export TV_TELEGRAM_BOT_TOKEN TV_TELEGRAM_CHAT_ID
 echo -e "${GREEN}OK${NC}"
 
 echo ""
@@ -206,7 +206,7 @@ wait_for_service "Grafana" "http://localhost:3000/api/health"
 
 # Verify QuestDB PostgreSQL wire protocol (port 8812 — used by IntelliJ Database tool)
 echo -n "  Checking QuestDB PG wire (port 8812)... "
-if docker exec dlt-questdb bash -c 'echo | nc -z localhost 8812' > /dev/null 2>&1; then
+if docker exec tv-questdb bash -c 'echo | nc -z localhost 8812' > /dev/null 2>&1; then
     echo -e "${GREEN}OK${NC}"
 else
     echo -e "${YELLOW}NOT READY${NC} (may take a few more seconds)"

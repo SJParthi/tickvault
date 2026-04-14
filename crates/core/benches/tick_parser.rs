@@ -7,10 +7,10 @@ use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 
-use dhan_live_trader_common::constants::{
+use tickvault_common::constants::{
     QUOTE_PACKET_SIZE, RESPONSE_CODE_QUOTE, RESPONSE_CODE_TICKER, TICKER_PACKET_SIZE,
 };
-use dhan_live_trader_core::parser::dispatcher::dispatch_frame;
+use tickvault_core::parser::dispatcher::dispatch_frame;
 
 /// Build a minimal valid binary packet.
 fn build_packet(response_code: u8, size: usize, segment: u8, security_id: u32) -> Vec<u8> {

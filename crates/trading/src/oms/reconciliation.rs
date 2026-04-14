@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use tracing::{error, info, warn};
 
-use dhan_live_trader_common::order_types::OrderStatus;
+use tickvault_common::order_types::OrderStatus;
 
 use super::state_machine::parse_order_status;
 use super::types::{DhanOrderResponse, ManagedOrder, ReconciliationReport};
@@ -144,9 +144,7 @@ pub fn reconcile_orders(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dhan_live_trader_common::order_types::{
-        OrderType, OrderValidity, ProductType, TransactionType,
-    };
+    use tickvault_common::order_types::{OrderType, OrderValidity, ProductType, TransactionType};
 
     fn make_managed_order(order_id: &str, status: OrderStatus) -> ManagedOrder {
         ManagedOrder {

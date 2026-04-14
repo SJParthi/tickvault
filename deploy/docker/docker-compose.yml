@@ -1,40 +1,40 @@
 # =============================================================================
-# dhan-live-trader — Docker Compose
+# tickvault — Docker Compose
 # =============================================================================
 # ALL versions from Tech Stack Bible V6. Same file on Mac and AWS c7i.xlarge.
 # Target: c7i.xlarge (4 vCPUs, 8GB RAM) — 1yr reserved ~₹6,400/mo
 # Memory budget: QuestDB 4GB + App 1GB + Valkey 256MB + Prometheus 512MB
 #   + Grafana 256MB + Traefik 128MB + OS 1GB = ~7.2GB (fits in 8GB)
 # Loki + Alloy + Jaeger REMOVED — saves ~2.5GB RAM.
-# Container prefix: dlt- (dhan-live-trader)
-# Network: dlt-network (all services communicate via Docker DNS)
+# Container prefix: tv- (tickvault)
+# Network: tv-network (all services communicate via Docker DNS)
 # ALL images pinned with SHA256 digest (Bible Section 14 #71)
 # =============================================================================
 
 networks:
-  dlt-network:
-    name: dlt-network
+  tv-network:
+    name: tv-network
     driver: bridge
 
 volumes:
-  dlt-questdb-data:
-    name: dlt-questdb-data
-  dlt-valkey-data:
-    name: dlt-valkey-data
-  dlt-grafana-data:
-    name: dlt-grafana-data
-  dlt-prometheus-data:
-    name: dlt-prometheus-data
+  tv-questdb-data:
+    name: tv-questdb-data
+  tv-valkey-data:
+    name: tv-valkey-data
+  tv-grafana-data:
+    name: tv-grafana-data
+  tv-prometheus-data:
+    name: tv-prometheus-data
 
 services:
   # ---------------------------------------------------------------------------
   # QuestDB — Time-Series Database (tick data, orders, audit trail)
   # Bible #16: questdb/questdb:9.3.2
   # ---------------------------------------------------------------------------
-  dlt-questdb:
+  tv-questdb:
     image: questdb/questdb:9.3.2@sha256:f8802d6ffa8c855fc3f9f69e86aaabcc4ee4d921e6755af4690b0b0290036517
-    container_name: dlt-questdb
-    hostname: dlt-questdb
+    container_name: tv-questdb
+    hostname: tv-questdb
     restart: unless-stopped
     # Memory: 4GB fits c7i.xlarge (8GB total) and Mac dev (48GB).
     # QuestDB mmaps data files — actual RSS is much lower than limit.
@@ -56,7 +56,7 @@ services:
       - "9009:9009"            # InfluxDB Line Protocol (high-speed ingestion)
       - "127.0.0.1:9003:9003" # Prometheus metrics (localhost only)
     volumes:
-      - dlt-questdb-data:/var/lib/questdb
+      - tv-questdb-data:/var/lib/questdb
     environment:
       QDB_LOG_W_STDOUT_LEVEL: ERROR
       QDB_TELEMETRY_ENABLED: "false"
@@ -88,8 +88,8 @@ services:
       # Parallel WAL apply threads: 4 (match CPU count). Faster WAL→table merge.
       # WAL workers: 2 (matches c7i.large vCPUs). Mac has more but 2 is sufficient.
       QDB_WAL_APPLY_WORKER_COUNT: "2"
-      QDB_PG_USER: ${DLT_QUESTDB_PG_USER:?Run bootstrap.sh first — QuestDB credentials must come from AWS SSM}
-      QDB_PG_PASSWORD: ${DLT_QUESTDB_PG_PASSWORD:?Run bootstrap.sh first — QuestDB credentials must come from AWS SSM}
+      QDB_PG_USER: ${TV_QUESTDB_PG_USER:?Run bootstrap.sh first — QuestDB credentials must come from AWS SSM}
+      QDB_PG_PASSWORD: ${TV_QUESTDB_PG_PASSWORD:?Run bootstrap.sh first — QuestDB credentials must come from AWS SSM}
     logging:
       driver: json-file
       options:
@@ -104,26 +104,26 @@ services:
     # Grace period for WAL flush on docker stop — prevents data loss on graceful shutdown.
     stop_grace_period: 30s
     networks:
-      - dlt-network
+      - tv-network
 
   # ---------------------------------------------------------------------------
   # Valkey — Cache (state, lookups, session data)
   # Bible #18: valkey/valkey:9.0.2-alpine
   # ---------------------------------------------------------------------------
-  dlt-valkey:
+  tv-valkey:
     image: valkey/valkey:9.0.2-alpine@sha256:68677f85c863830af7836ff07c4a13b7f085ebeff62f4dedb71499ca27d229f2
-    container_name: dlt-valkey
-    hostname: dlt-valkey
+    container_name: tv-valkey
+    hostname: tv-valkey
     restart: unless-stopped
     mem_limit: 1g
     cpus: 0.5
     ports:
       - "6379:6379"
     volumes:
-      - dlt-valkey-data:/data
+      - tv-valkey-data:/data
     command: >
       valkey-server
-      --requirepass ${DLT_VALKEY_PASSWORD:-dlt-dev-only}
+      --requirepass ${TV_VALKEY_PASSWORD:-tv-dev-only}
       --maxmemory 512mb
       --maxmemory-policy allkeys-lru
       --save 60 1000
@@ -141,25 +141,25 @@ services:
       retries: 5
       start_period: 5s
     networks:
-      - dlt-network
+      - tv-network
 
   # ---------------------------------------------------------------------------
   # Valkey Exporter — Prometheus metrics for Valkey/Redis
   # Exports Valkey INFO stats as Prometheus metrics on :9121/metrics.
   # Bible: oliver006/redis_exporter:v1.67.0
   # ---------------------------------------------------------------------------
-  dlt-valkey-exporter:
+  tv-valkey-exporter:
     image: oliver006/redis_exporter:v1.67.0@sha256:120f7ec77293459ccfdad66bb1db75ab72e8bfeab99f58b1cc2564cadcd7a9e7
-    container_name: dlt-valkey-exporter
-    hostname: dlt-valkey-exporter
+    container_name: tv-valkey-exporter
+    hostname: tv-valkey-exporter
     restart: unless-stopped
     mem_limit: 128m
     cpus: 0.25
     environment:
-      - REDIS_ADDR=redis://dlt-valkey:6379
-      - REDIS_PASSWORD=${DLT_VALKEY_PASSWORD:-dlt-dev-only}
+      - REDIS_ADDR=redis://tv-valkey:6379
+      - REDIS_PASSWORD=${TV_VALKEY_PASSWORD:-tv-dev-only}
     depends_on:
-      dlt-valkey:
+      tv-valkey:
         condition: service_healthy
     logging:
       driver: json-file
@@ -173,16 +173,16 @@ services:
       retries: 5
       start_period: 10s
     networks:
-      - dlt-network
+      - tv-network
 
   # ---------------------------------------------------------------------------
   # Prometheus — Metrics Collection
   # Bible #28: prom/prometheus:v3.9.1
   # ---------------------------------------------------------------------------
-  dlt-prometheus:
+  tv-prometheus:
     image: prom/prometheus:v3.9.1@sha256:1f0f50f06acaceb0f5670d2c8a658a599affe7b0d8e78b898c1035653849a702
-    container_name: dlt-prometheus
-    hostname: dlt-prometheus
+    container_name: tv-prometheus
+    hostname: tv-prometheus
     restart: unless-stopped
     mem_limit: 512m
     cpus: 0.5
@@ -192,7 +192,7 @@ services:
       # E5 security: bind to localhost only (no external access to metrics).
       - "127.0.0.1:9090:9090"
     volumes:
-      - dlt-prometheus-data:/prometheus
+      - tv-prometheus-data:/prometheus
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./prometheus/rules:/etc/prometheus/rules:ro
     command:
@@ -214,17 +214,17 @@ services:
       retries: 10
       start_period: 30s
     networks:
-      - dlt-network
+      - tv-network
 
   # ---------------------------------------------------------------------------
   # Alertmanager — Alert Routing (Prometheus → Telegram)
   # Forwards Prometheus alerts to Telegram via webhook receiver.
   # Pinned: prom/alertmanager:v0.28.1
   # ---------------------------------------------------------------------------
-  dlt-alertmanager:
+  tv-alertmanager:
     image: prom/alertmanager:v0.28.1@sha256:27c475db5fb156cab31d5c18a4251ac7ed567746a2483ff264516437a39b15ba
-    container_name: dlt-alertmanager
-    hostname: dlt-alertmanager
+    container_name: tv-alertmanager
+    hostname: tv-alertmanager
     restart: unless-stopped
     mem_limit: 256m
     cpus: 0.25
@@ -249,12 +249,12 @@ services:
       retries: 5
       start_period: 10s
     networks:
-      - dlt-network
+      - tv-network
 
   # ---------------------------------------------------------------------------
   # Loki + Alloy + Jaeger — REMOVED for c7i.large (4GB) memory budget.
-  # Saves ~2.5GB RAM. Logs available via: docker logs dlt-application
-  # Tracing available via: Prometheus metrics (dlt_tick_processing_duration_ns)
+  # Saves ~2.5GB RAM. Logs available via: docker logs tickvaultlication
+  # Tracing available via: Prometheus metrics (tv_tick_processing_duration_ns)
   # Re-enable on c7i.xlarge+ by uncommenting these services.
   # ---------------------------------------------------------------------------
 
@@ -262,22 +262,22 @@ services:
   # Grafana — Dashboards & Visualization
   # Bible #27: grafana/grafana-oss:12.3.3
   # ---------------------------------------------------------------------------
-  dlt-grafana:
+  tv-grafana:
     image: grafana/grafana-oss:12.3.3@sha256:9e1e77ade304069aee3196e9a4f210830e96e80ce9a2640891eccc324b152faf
-    container_name: dlt-grafana
-    hostname: dlt-grafana
+    container_name: tv-grafana
+    hostname: tv-grafana
     restart: unless-stopped
     mem_limit: 1g
     cpus: 0.5
     ports:
       - "3000:3000"
     volumes:
-      - dlt-grafana-data:/var/lib/grafana
+      - tv-grafana-data:/var/lib/grafana
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
       - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
     environment:
-      GF_SECURITY_ADMIN_USER: ${DLT_GRAFANA_ADMIN_USER:?Run bootstrap.sh first — Grafana credentials must come from AWS SSM}
-      GF_SECURITY_ADMIN_PASSWORD: ${DLT_GRAFANA_ADMIN_PASSWORD:?Run bootstrap.sh first — Grafana credentials must come from AWS SSM}
+      GF_SECURITY_ADMIN_USER: ${TV_GRAFANA_ADMIN_USER:?Run bootstrap.sh first — Grafana credentials must come from AWS SSM}
+      GF_SECURITY_ADMIN_PASSWORD: ${TV_GRAFANA_ADMIN_PASSWORD:?Run bootstrap.sh first — Grafana credentials must come from AWS SSM}
       # E5 security fix: anonymous users get Viewer role (not Admin).
       # Admin access requires SSM-sourced credentials above.
       GF_AUTH_ANONYMOUS_ENABLED: "true"
@@ -288,10 +288,10 @@ services:
       GF_UNIFIED_ALERTING_ENABLED: "true"
       GF_DATE_FORMATS_DEFAULT_TIMEZONE: "Asia/Kolkata"
       # QuestDB credentials for Grafana PostgreSQL datasource provisioning
-      DLT_QUESTDB_PG_USER: ${DLT_QUESTDB_PG_USER:?Run bootstrap.sh first — QuestDB credentials must come from AWS SSM}
-      DLT_QUESTDB_PG_PASSWORD: ${DLT_QUESTDB_PG_PASSWORD:?Run bootstrap.sh first — QuestDB credentials must come from AWS SSM}
+      TV_QUESTDB_PG_USER: ${TV_QUESTDB_PG_USER:?Run bootstrap.sh first — QuestDB credentials must come from AWS SSM}
+      TV_QUESTDB_PG_PASSWORD: ${TV_QUESTDB_PG_PASSWORD:?Run bootstrap.sh first — QuestDB credentials must come from AWS SSM}
     depends_on:
-      dlt-prometheus:
+      tv-prometheus:
         condition: service_healthy
     logging:
       driver: json-file
@@ -306,16 +306,16 @@ services:
       retries: 5
       start_period: 15s
     networks:
-      - dlt-network
+      - tv-network
 
   # ---------------------------------------------------------------------------
   # Traefik — Reverse Proxy & Load Balancer
   # Bible #79: traefik:v3.6.8
   # ---------------------------------------------------------------------------
-  dlt-traefik:
+  tv-traefik:
     image: traefik:v3.6.8@sha256:90099f8948c828ecf0ababd711a4359a2443eba12261c1df2f548a3b1d815938
-    container_name: dlt-traefik
-    hostname: dlt-traefik
+    container_name: tv-traefik
+    hostname: tv-traefik
     restart: unless-stopped
     mem_limit: 512m
     cpus: 0.5
@@ -342,5 +342,5 @@ services:
       retries: 5
       start_period: 10s
     networks:
-      - dlt-network
+      - tv-network
 

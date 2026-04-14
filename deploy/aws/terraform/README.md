@@ -1,6 +1,6 @@
 # DLT AWS Terraform — Phase 8.1
 
-Single-instance deployment of `dhan-live-trader` to AWS ap-south-1 (Mumbai)
+Single-instance deployment of `tickvault` to AWS ap-south-1 (Mumbai)
 per `.claude/rules/project/aws-budget.md` — total monthly cost **₹4,981**
 under the ₹5,000 cap.
 
@@ -24,10 +24,10 @@ under the ₹5,000 cap.
 3. **Create a key pair** for SSH:
    ```bash
    aws ec2 create-key-pair \
-     --key-name dlt-prod-key \
+     --key-name tv-prod-key \
      --region ap-south-1 \
-     --query KeyMaterial --output text > ~/.ssh/dlt-prod-key.pem
-   chmod 400 ~/.ssh/dlt-prod-key.pem
+     --query KeyMaterial --output text > ~/.ssh/tv-prod-key.pem
+   chmod 400 ~/.ssh/tv-prod-key.pem
    ```
 4. **Find the latest Ubuntu 24.04 LTS AMI** in ap-south-1:
    ```bash
@@ -67,7 +67,7 @@ Outputs will show:
    modifiable only once per 7 days.
 2. **Seed SSM parameters** with secrets.
 3. **Trigger the GitHub Actions `deploy-aws` workflow** to scp the first
-   binary and `systemctl start dlt-app`.
+   binary and `systemctl start tickvault`.
 
 ## Cost
 

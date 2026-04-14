@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use tracing::{error, info, warn};
 
-use dhan_live_trader_common::constants::{
+use tickvault_common::constants::{
     OMS_CIRCUIT_BREAKER_FAILURE_THRESHOLD, OMS_CIRCUIT_BREAKER_RESET_SECS,
 };
 
@@ -87,11 +87,11 @@ impl OrderCircuitBreaker {
     pub fn check(&self) -> Result<(), OmsError> {
         match self.state() {
             CircuitState::Closed => {
-                metrics::gauge!("dlt_circuit_breaker_state").set(0.0_f64);
+                metrics::gauge!("tv_circuit_breaker_state").set(0.0_f64);
                 Ok(())
             }
             CircuitState::HalfOpen => {
-                metrics::gauge!("dlt_circuit_breaker_state").set(2.0_f64);
+                metrics::gauge!("tv_circuit_breaker_state").set(2.0_f64);
                 // Only allow one probe request in HalfOpen state.
                 if self
                     .half_open_probe_sent
@@ -106,7 +106,7 @@ impl OrderCircuitBreaker {
                 }
             }
             CircuitState::Open => {
-                metrics::gauge!("dlt_circuit_breaker_state").set(1.0_f64);
+                metrics::gauge!("tv_circuit_breaker_state").set(1.0_f64);
                 warn!("circuit breaker OPEN — Dhan API temporarily unavailable");
                 Err(OmsError::CircuitBreakerOpen)
             }
@@ -121,7 +121,7 @@ impl OrderCircuitBreaker {
         }
         self.opened_at_secs.store(0, Ordering::Relaxed);
         self.half_open_probe_sent.store(false, Ordering::Relaxed);
-        metrics::gauge!("dlt_circuit_breaker_state").set(0.0_f64);
+        metrics::gauge!("tv_circuit_breaker_state").set(0.0_f64);
     }
 
     /// Records a failed API call — increments the failure counter.
@@ -142,7 +142,7 @@ impl OrderCircuitBreaker {
                 .is_ok()
             {
                 self.half_open_probe_sent.store(false, Ordering::Relaxed);
-                metrics::gauge!("dlt_circuit_breaker_state").set(1.0_f64);
+                metrics::gauge!("tv_circuit_breaker_state").set(1.0_f64);
                 // Gap 1 fix: ERROR level triggers Telegram via Loki → Grafana.
                 // Previously WARN — operator was unaware orders were being rejected.
                 error!(
@@ -194,7 +194,7 @@ impl OrderCircuitBreaker {
         self.consecutive_failures.store(0, Ordering::Relaxed);
         self.opened_at_secs.store(0, Ordering::Relaxed);
         self.half_open_probe_sent.store(false, Ordering::Relaxed);
-        metrics::gauge!("dlt_circuit_breaker_state").set(0.0_f64);
+        metrics::gauge!("tv_circuit_breaker_state").set(0.0_f64);
         info!("circuit breaker manually reset to CLOSED");
     }
 }
@@ -697,8 +697,8 @@ mod tests {
 
     #[test]
     fn test_circuit_breaker_metric() {
-        metrics::gauge!("dlt_circuit_breaker_state").set(0.0_f64);
-        metrics::gauge!("dlt_circuit_breaker_state").set(1.0_f64);
-        metrics::gauge!("dlt_circuit_breaker_state").set(2.0_f64);
+        metrics::gauge!("tv_circuit_breaker_state").set(0.0_f64);
+        metrics::gauge!("tv_circuit_breaker_state").set(1.0_f64);
+        metrics::gauge!("tv_circuit_breaker_state").set(2.0_f64);
     }
 }

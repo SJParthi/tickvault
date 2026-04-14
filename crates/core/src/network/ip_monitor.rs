@@ -18,7 +18,7 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tracing::{error, info, warn};
 
-use dhan_live_trader_common::constants::{
+use tickvault_common::constants::{
     PUBLIC_IP_CHECK_FALLBACK_URL, PUBLIC_IP_CHECK_PRIMARY_URL, PUBLIC_IP_CHECK_TIMEOUT_SECS,
 };
 

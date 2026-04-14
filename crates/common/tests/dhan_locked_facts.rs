@@ -19,7 +19,7 @@
 //!
 //! Purpose: guarantee + assurance + proof that we don't lose these facts.
 
-use dhan_live_trader_common::constants::{
+use tickvault_common::constants::{
     DHAN_TWENTY_DEPTH_WS_BASE_URL, DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL, FULL_QUOTE_PACKET_SIZE,
     PREV_CLOSE_OFFSET_OI, PREV_CLOSE_OFFSET_PRICE, PREVIOUS_CLOSE_PACKET_SIZE, QUOTE_PACKET_SIZE,
     RESPONSE_CODE_FULL, RESPONSE_CODE_PREVIOUS_CLOSE, RESPONSE_CODE_QUOTE,

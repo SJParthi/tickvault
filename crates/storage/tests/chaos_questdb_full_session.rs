@@ -43,10 +43,10 @@
 //! exact survivor count for a worst-case 375K-tick session. Any
 //! regression that drops a single tick fails the assertion.
 
-use dhan_live_trader_common::config::QuestDbConfig;
-use dhan_live_trader_common::constants::TICK_BUFFER_CAPACITY;
-use dhan_live_trader_common::tick_types::ParsedTick;
-use dhan_live_trader_storage::tick_persistence::TickPersistenceWriter;
+use tickvault_common::config::QuestDbConfig;
+use tickvault_common::constants::TICK_BUFFER_CAPACITY;
+use tickvault_common::tick_types::ParsedTick;
+use tickvault_storage::tick_persistence::TickPersistenceWriter;
 
 fn make_test_config() -> QuestDbConfig {
     QuestDbConfig {
@@ -75,7 +75,7 @@ fn chaos_questdb_full_session_zero_tick_loss() {
     // F1 isolation: per-test spill directory so this runs cleanly in
     // parallel with tick_resilience and other suites.
     let tmp_dir =
-        std::env::temp_dir().join(format!("dlt-chaos-full-session-{}", std::process::id()));
+        std::env::temp_dir().join(format!("tv-chaos-full-session-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp_dir);
     std::fs::create_dir_all(&tmp_dir).expect("tmp dir create"); // APPROVED: test setup
 
@@ -217,7 +217,7 @@ fn chaos_questdb_full_session_zero_tick_loss() {
 /// pipeline holds under sustained pressure with the writer disconnected.
 #[test]
 fn chaos_questdb_realistic_load_zero_tick_loss() {
-    let tmp_dir = std::env::temp_dir().join(format!("dlt-chaos-realistic-{}", std::process::id()));
+    let tmp_dir = std::env::temp_dir().join(format!("tv-chaos-realistic-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp_dir);
     std::fs::create_dir_all(&tmp_dir).expect("tmp dir"); // APPROVED: test
 
@@ -264,7 +264,7 @@ fn chaos_questdb_realistic_load_zero_tick_loss() {
 /// the other chaos tests above are unreliable.
 #[test]
 fn chaos_setup_sanity_per_test_spill_dir() {
-    let tmp_dir = std::env::temp_dir().join(format!("dlt-chaos-sanity-{}", std::process::id()));
+    let tmp_dir = std::env::temp_dir().join(format!("tv-chaos-sanity-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp_dir);
     std::fs::create_dir_all(&tmp_dir).expect("tmp dir"); // APPROVED: test
 

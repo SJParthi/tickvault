@@ -58,11 +58,11 @@ impl OrderRateLimiter {
     pub fn check(&self) -> Result<(), OmsError> {
         match self.limiter.check() {
             Ok(()) => {
-                metrics::counter!("dlt_rate_limiter_allowed_total").increment(1);
+                metrics::counter!("tv_rate_limiter_allowed_total").increment(1);
                 Ok(())
             }
             Err(_) => {
-                metrics::counter!("dlt_rate_limiter_denied_total").increment(1);
+                metrics::counter!("tv_rate_limiter_denied_total").increment(1);
                 warn!("order rate limit hit — SEBI max orders/sec exceeded, rejecting");
                 Err(OmsError::RateLimited)
             }
@@ -117,7 +117,7 @@ mod tests {
 
     #[test]
     fn test_rate_limiter_metrics() {
-        metrics::counter!("dlt_rate_limiter_allowed_total").increment(1);
-        metrics::counter!("dlt_rate_limiter_denied_total").increment(1);
+        metrics::counter!("tv_rate_limiter_allowed_total").increment(1);
+        metrics::counter!("tv_rate_limiter_denied_total").increment(1);
     }
 }

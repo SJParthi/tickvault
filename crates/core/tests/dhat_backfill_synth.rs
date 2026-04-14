@@ -31,8 +31,8 @@
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
-use dhan_live_trader_common::tick_types::HistoricalCandle;
-use dhan_live_trader_core::historical::backfill::synthesize_ticks_from_minute_candles;
+use tickvault_common::tick_types::HistoricalCandle;
+use tickvault_core::historical::backfill::synthesize_ticks_from_minute_candles;
 
 fn make_candle(ts_utc: i64, close: f64) -> HistoricalCandle {
     HistoricalCandle {

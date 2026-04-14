@@ -1,4 +1,4 @@
-# Technical Flow — dhan-live-trader
+# Technical Flow — tickvault
 
 > **Audience:** Developers, code reviewers, new contributors.
 > **Think of this as:** "HOW does this system work?" — the engineering deep dive.
@@ -435,10 +435,10 @@ Second Ctrl+C during shutdown → immediate exit (code 1)
 [dhan]
 api_base_url = "https://api.dhan.co/v2"
 ws_url = "wss://api-feed.dhan.co"
-client_id_ssm_path = "/dlt/prod/dhan/client-id"
+client_id_ssm_path = "/tickvault/prod/dhan/client-id"
 
 [questdb]
-http_host = "dlt-questdb"
+http_host = "tv-questdb"
 http_port = 9000
 pg_port = 8812
 ilp_port = 9009

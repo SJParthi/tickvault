@@ -16,10 +16,10 @@
 // ===========================================================================
 
 mod i_p0_03_expired_contract_awareness {
-    use dhan_live_trader_common::order_types::{
+    use tickvault_common::order_types::{
         OrderStatus, OrderType, OrderValidity, ProductType, TransactionType,
     };
-    use dhan_live_trader_trading::oms::types::ManagedOrder;
+    use tickvault_trading::oms::types::ManagedOrder;
 
     /// I-P0-03: Verifies that OMS types can represent expiry information.
     ///
@@ -31,7 +31,7 @@ mod i_p0_03_expired_contract_awareness {
     fn test_i_p0_03_expired_contract_rejected() {
         // I-P0-03 RESOLVED: PlaceOrderRequest.expiry_date is checked in
         // validate_order_fields(). Expired contracts return ExpiredContract error.
-        use dhan_live_trader_trading::oms::types::PlaceOrderRequest;
+        use tickvault_trading::oms::types::PlaceOrderRequest;
 
         let yesterday = chrono::Utc::now().date_naive() - chrono::Duration::days(1);
         let request = PlaceOrderRequest {
@@ -137,8 +137,8 @@ mod i_p0_03_expired_contract_awareness {
 // ===========================================================================
 
 mod oms_state_machine {
-    use dhan_live_trader_common::order_types::OrderStatus;
-    use dhan_live_trader_trading::oms::state_machine::{is_valid_transition, parse_order_status};
+    use tickvault_common::order_types::OrderStatus;
+    use tickvault_trading::oms::state_machine::{is_valid_transition, parse_order_status};
 
     // -- All valid transitions verified exhaustively -------------------------
 
@@ -341,11 +341,11 @@ mod oms_state_machine {
 mod oms_reconciliation {
     use std::collections::HashMap;
 
-    use dhan_live_trader_common::order_types::{
+    use tickvault_common::order_types::{
         OrderStatus, OrderType, OrderValidity, ProductType, TransactionType,
     };
-    use dhan_live_trader_trading::oms::reconciliation::{ReconciliationUpdate, reconcile_orders};
-    use dhan_live_trader_trading::oms::types::{DhanOrderResponse, ManagedOrder};
+    use tickvault_trading::oms::reconciliation::{ReconciliationUpdate, reconcile_orders};
+    use tickvault_trading::oms::types::{DhanOrderResponse, ManagedOrder};
 
     fn make_managed(order_id: &str, status: OrderStatus) -> ManagedOrder {
         ManagedOrder {
@@ -564,8 +564,8 @@ mod oms_reconciliation {
 // ===========================================================================
 
 mod oms_circuit_breaker {
-    use dhan_live_trader_common::constants::OMS_CIRCUIT_BREAKER_FAILURE_THRESHOLD;
-    use dhan_live_trader_trading::oms::circuit_breaker::{CircuitState, OrderCircuitBreaker};
+    use tickvault_common::constants::OMS_CIRCUIT_BREAKER_FAILURE_THRESHOLD;
+    use tickvault_trading::oms::circuit_breaker::{CircuitState, OrderCircuitBreaker};
 
     #[test]
     fn initial_state_is_closed() {
@@ -643,8 +643,8 @@ mod oms_circuit_breaker {
 // ===========================================================================
 
 mod oms_rate_limiter {
-    use dhan_live_trader_trading::oms::rate_limiter::OrderRateLimiter;
-    use dhan_live_trader_trading::oms::types::OmsError;
+    use tickvault_trading::oms::rate_limiter::OrderRateLimiter;
+    use tickvault_trading::oms::types::OmsError;
 
     // -- OrderRateLimiter: burst capacity ---------------------------------
 
@@ -686,7 +686,7 @@ mod oms_rate_limiter {
 // ===========================================================================
 
 mod oms_idempotency {
-    use dhan_live_trader_trading::oms::idempotency::CorrelationTracker;
+    use tickvault_trading::oms::idempotency::CorrelationTracker;
 
     #[test]
     fn generate_id_returns_valid_correlation_id() {
@@ -765,7 +765,7 @@ mod oms_idempotency {
 // ===========================================================================
 
 mod risk_engine {
-    use dhan_live_trader_trading::risk::{RiskBreach, RiskCheck, RiskEngine};
+    use tickvault_trading::risk::{RiskBreach, RiskCheck, RiskEngine};
 
     // -- Auto-halt: once halted, ALL subsequent orders rejected ------------
 
@@ -888,7 +888,7 @@ mod risk_engine {
 // ===========================================================================
 
 mod risk_pnl_tracking {
-    use dhan_live_trader_trading::risk::RiskEngine;
+    use tickvault_trading::risk::RiskEngine;
 
     #[test]
     fn record_fill_updates_position() {
@@ -964,11 +964,11 @@ mod risk_pnl_tracking {
 // ===========================================================================
 
 mod risk_tick_gap {
-    use dhan_live_trader_common::constants::{
+    use tickvault_common::constants::{
         TICK_GAP_ALERT_THRESHOLD_SECS, TICK_GAP_ERROR_THRESHOLD_SECS,
         TICK_GAP_MIN_TICKS_BEFORE_ACTIVE,
     };
-    use dhan_live_trader_trading::risk::tick_gap_tracker::{TickGapResult, TickGapTracker};
+    use tickvault_trading::risk::tick_gap_tracker::{TickGapResult, TickGapTracker};
 
     #[test]
     fn warmup_suppresses_alerts() {
@@ -1084,19 +1084,17 @@ mod risk_tick_gap {
 // ===========================================================================
 
 mod oms_dry_run_gate {
-    use dhan_live_trader_common::order_types::{
-        OrderType, OrderValidity, ProductType, TransactionType,
-    };
-    use dhan_live_trader_trading::oms::api_client::OrderApiClient;
-    use dhan_live_trader_trading::oms::engine::OrderManagementSystem;
-    use dhan_live_trader_trading::oms::rate_limiter::OrderRateLimiter;
-    use dhan_live_trader_trading::oms::types::PlaceOrderRequest;
+    use tickvault_common::order_types::{OrderType, OrderValidity, ProductType, TransactionType};
+    use tickvault_trading::oms::api_client::OrderApiClient;
+    use tickvault_trading::oms::engine::OrderManagementSystem;
+    use tickvault_trading::oms::rate_limiter::OrderRateLimiter;
+    use tickvault_trading::oms::types::PlaceOrderRequest;
 
     struct TestTokenProvider;
-    impl dhan_live_trader_trading::oms::engine::TokenProvider for TestTokenProvider {
+    impl tickvault_trading::oms::engine::TokenProvider for TestTokenProvider {
         fn get_access_token(
             &self,
-        ) -> Result<secrecy::SecretString, dhan_live_trader_trading::oms::types::OmsError> {
+        ) -> Result<secrecy::SecretString, tickvault_trading::oms::types::OmsError> {
             Ok(secrecy::SecretString::from("test-token"))
         }
     }

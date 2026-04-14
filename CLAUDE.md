@@ -1,4 +1,4 @@
-# CLAUDE.md — dhan-live-trader
+# CLAUDE.md — tickvault
 
 > **Authority chain (S6-Step8 — Bible deleted):** `Cargo.toml` workspace deps + `deny.toml` + `dhan_locked_facts.rs` are the executable single source of truth for versions and Dhan facts. This file (`CLAUDE.md`) is the workflow + architecture guide. If neither covers a topic, ASK Parthiban.
 
@@ -16,7 +16,7 @@ Every file, function, config decision must pass all three. No exceptions.
 
 - **Purpose:** O(1) latency live F&O trading system for Indian markets (NSE)
 - **Language:** Rust 2024 Edition (stable 1.93.1)
-- **Repo:** `https://github.com/SJParthi/dhan-live-trader` (single source of truth)
+- **Repo:** `https://github.com/SJParthi/tickvault` (single source of truth)
 - **Runtime:** Docker everywhere. Mac (dev) → AWS c7i.2xlarge Mumbai (prod). Same containers, same code, always real AWS SSM.
 - **Owner:** Parthiban (architect). Claude Code (builder).
 
@@ -270,7 +270,7 @@ make prometheus                      # localhost:9090
 12. **S6-G3+G4 boot symmetry guard** — state machines must have a poller; both boot paths must be wired
 
 **Default scope rule (mechanical):**
-- Edit in `crates/<X>/` → run `cargo test -p dhan-live-trader-<X>`
+- Edit in `crates/<X>/` → run `cargo test -p tickvault-<X>`
 - Edit in `crates/common/` → escalate to `cargo test --workspace`
 - Edit in `.claude/hooks/` → run the hook's own self-test if it has one
 - Workspace-wide → only on `/full-qa`, `FULL_QA=1`, or post-merge CI
@@ -305,14 +305,14 @@ make prometheus                      # localhost:9090
 
 | Service | Image Version | Port | Purpose |
 |---------|--------------|------|---------|
-| dlt-questdb | 9.3.2 | 9000/8812/9009 | Time-series DB |
-| dlt-valkey | 9.0.2-alpine | 6379 | Cache (Redis replacement) |
-| dlt-prometheus | v3.9.1 | 9090 | Metrics |
-| dlt-grafana | 12.3.3 | 3000 | Dashboards |
-| dlt-jaeger | 2.15.0 | 16686 | Distributed tracing |
-| dlt-loki | 3.6.6 | 3100 | Log aggregation |
-| dlt-alloy | v1.8.0 | — | Observability collector |
-| dlt-traefik | v3.6.8 | 80/443/8080 | API gateway |
+| tv-questdb | 9.3.2 | 9000/8812/9009 | Time-series DB |
+| tv-valkey | 9.0.2-alpine | 6379 | Cache (Redis replacement) |
+| tv-prometheus | v3.9.1 | 9090 | Metrics |
+| tv-grafana | 12.3.3 | 3000 | Dashboards |
+| tv-jaeger | 2.15.0 | 16686 | Distributed tracing |
+| tv-loki | 3.6.6 | 3100 | Log aggregation |
+| tv-alloy | v1.8.0 | — | Observability collector |
+| tv-traefik | v3.6.8 | 80/443/8080 | API gateway |
 
 All images pinned with SHA256 digest. Config in `deploy/docker/docker-compose.yml`.
 
@@ -371,7 +371,7 @@ Tests in `crates/*/tests/gap_enforcement.rs` verify:
 
 ## OBSERVABILITY
 
-**Metrics (Prometheus):** `dlt_tick_processing_duration_ns`, `dlt_wire_to_done_duration_ns`, `dlt_orders_placed_total`, `dlt_daily_pnl`, `dlt_websocket_connections_active`
+**Metrics (Prometheus):** `tv_tick_processing_duration_ns`, `tv_wire_to_done_duration_ns`, `tv_orders_placed_total`, `tv_daily_pnl`, `tv_websocket_connections_active`
 **Traces (OpenTelemetry → Jaeger):** spans on WS reads, parsing, OMS, risk checks, persistence
 **Logs (tracing → Loki via Alloy):** Structured JSON, ERROR → Telegram alert
 

@@ -15,8 +15,8 @@
 use chrono::Timelike;
 use tracing::warn;
 
-use dhan_live_trader_common::trading_calendar::ist_offset;
-use dhan_live_trader_core::historical::cross_verify::{
+use tickvault_common::trading_calendar::ist_offset;
+use tickvault_core::historical::cross_verify::{
     CrossMatchMismatch, CrossVerificationReport, ViolationDetail,
 };
 
@@ -277,8 +277,8 @@ pub const WATCHDOG_INTERVAL_SECS: u64 = 30;
 ///
 /// Logs ERROR on failure (triggers Telegram via Loki -> Grafana).
 pub fn spawn_heartbeat_watchdog(
-    token_handle: dhan_live_trader_core::auth::token_manager::TokenHandle,
-    tick_sender: tokio::sync::broadcast::Sender<dhan_live_trader_common::tick_types::ParsedTick>,
+    token_handle: tickvault_core::auth::token_manager::TokenHandle,
+    tick_sender: tokio::sync::broadcast::Sender<tickvault_common::tick_types::ParsedTick>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut interval =
@@ -319,8 +319,8 @@ pub fn spawn_heartbeat_watchdog(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dhan_live_trader_core::historical::cross_verify::TimeframeCoverage;
     use std::net::SocketAddr;
+    use tickvault_core::historical::cross_verify::TimeframeCoverage;
 
     fn make_coverage(
         timeframe: &str,
@@ -710,7 +710,7 @@ mod tests {
 
     #[test]
     fn test_create_log_file_writer_with_temp_dir() {
-        let tmp = std::env::temp_dir().join("dlt_test_log_writer");
+        let tmp = std::env::temp_dir().join("tv_test_log_writer");
         let _ = std::fs::create_dir_all(&tmp);
         let log_path = tmp.join("test.log");
         let result = std::fs::OpenOptions::new()
@@ -1468,7 +1468,7 @@ mod tests {
     #[test]
     fn test_create_log_file_writer_at_unwritable_directory_returns_none() {
         // /proc is a read-only pseudo-filesystem on Linux — create_dir_all fails.
-        let result = create_log_file_writer_at("/proc/nonexistent_dlt_dir/app.log");
+        let result = create_log_file_writer_at("/proc/nonexistent_tv_dir/app.log");
         assert!(result.is_none(), "unwritable directory should return None");
     }
 
@@ -1485,7 +1485,7 @@ mod tests {
 
     #[test]
     fn test_create_log_file_writer_at_valid_path_returns_some() {
-        let tmp = std::env::temp_dir().join("dlt_test_writer_at");
+        let tmp = std::env::temp_dir().join("tv_test_writer_at");
         let log_path = tmp.join("test_at.log");
         let path_str = log_path.to_string_lossy().to_string();
         let result = create_log_file_writer_at(&path_str);
@@ -1504,14 +1504,14 @@ mod tests {
 
     #[test]
     fn test_create_log_file_writer_at_deeply_nested_creates_dirs() {
-        let tmp = std::env::temp_dir().join("dlt_test_deep/a/b/c");
+        let tmp = std::env::temp_dir().join("tv_test_deep/a/b/c");
         let log_path = tmp.join("deep.log");
         let path_str = log_path.to_string_lossy().to_string();
         let result = create_log_file_writer_at(&path_str);
         assert!(result.is_some(), "deeply nested path should succeed");
         // Cleanup
         let _ = std::fs::remove_file(&log_path);
-        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("dlt_test_deep"));
+        let _ = std::fs::remove_dir_all(std::env::temp_dir().join("tv_test_deep"));
     }
 
     #[test]
@@ -1537,7 +1537,7 @@ mod tests {
     #[test]
     fn test_create_log_file_writer_at_read_only_fs_returns_none() {
         // /sys is a sysfs pseudo-filesystem — directory creation should fail
-        let result = create_log_file_writer_at("/sys/dlt_impossible/app.log");
+        let result = create_log_file_writer_at("/sys/tv_impossible/app.log");
         assert!(result.is_none(), "read-only filesystem should return None");
     }
 

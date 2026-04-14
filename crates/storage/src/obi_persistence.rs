@@ -16,8 +16,8 @@ use questdb::ingress::{Buffer, Sender, TimestampNanos};
 use reqwest::Client;
 use tracing::{debug, info, warn};
 
-use dhan_live_trader_common::config::QuestDbConfig;
-use dhan_live_trader_common::segment::segment_code_to_str;
+use tickvault_common::config::QuestDbConfig;
+use tickvault_common::segment::segment_code_to_str;
 
 // ---------------------------------------------------------------------------
 // Constants

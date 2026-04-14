@@ -1,5 +1,5 @@
 # =============================================================================
-# dhan-live-trader — Jaeger v2 Configuration
+# tickvault — Jaeger v2 Configuration
 # =============================================================================
 # Jaeger v2 is built on OpenTelemetry Collector. This config defines the
 # OTLP receiver, in-memory storage, and the Jaeger UI extension.

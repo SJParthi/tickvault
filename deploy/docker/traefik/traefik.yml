@@ -1,5 +1,5 @@
 # =============================================================================
-# dhan-live-trader — Traefik Static Configuration
+# tickvault — Traefik Static Configuration
 # =============================================================================
 # Reverse proxy for routing. Dashboard enabled for dev only.
 # Dynamic routing defined in ./dynamic/services.yml
@@ -31,7 +31,7 @@ providers:
   docker:
     endpoint: "unix:///var/run/docker.sock"
     exposedByDefault: false
-    network: dlt-network
+    network: tv-network
     watch: true
   file:
     directory: "/etc/traefik/dynamic"

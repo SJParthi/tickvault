@@ -3,13 +3,13 @@
 //! Routes raw WebSocket binary frames to the appropriate packet parser
 //! based on the response code in the 8-byte header.
 
-use dhan_live_trader_common::constants::{
+use tickvault_common::constants::{
     RESPONSE_CODE_DISCONNECT, RESPONSE_CODE_FULL, RESPONSE_CODE_INDEX_TICKER,
     RESPONSE_CODE_MARKET_DEPTH, RESPONSE_CODE_MARKET_STATUS, RESPONSE_CODE_OI,
     RESPONSE_CODE_PREVIOUS_CLOSE, RESPONSE_CODE_QUOTE, RESPONSE_CODE_TICKER,
 };
 
-use dhan_live_trader_common::constants::DEEP_DEPTH_HEADER_SIZE;
+use tickvault_common::constants::DEEP_DEPTH_HEADER_SIZE;
 
 use super::deep_depth::{parse_deep_depth_header, parse_twenty_depth_packet};
 use super::disconnect::parse_disconnect_packet;
@@ -171,12 +171,12 @@ pub fn split_stacked_depth_packets(raw: &[u8]) -> Result<Vec<&[u8]>, ParseError>
 mod tests {
     use super::*;
     use crate::websocket::types::DisconnectCode;
-    use dhan_live_trader_common::constants::{
+    use tickvault_common::constants::{
         DISCONNECT_PACKET_SIZE, FULL_QUOTE_PACKET_SIZE, MARKET_DEPTH_PACKET_SIZE,
         MARKET_STATUS_PACKET_SIZE, OI_PACKET_SIZE, PREVIOUS_CLOSE_PACKET_SIZE, QUOTE_PACKET_SIZE,
         TICKER_PACKET_SIZE,
     };
-    use dhan_live_trader_common::tick_types::{MarketDepthLevel, ParsedTick};
+    use tickvault_common::tick_types::{MarketDepthLevel, ParsedTick};
 
     // Extraction helpers — each panic arm appears only once.
     fn unwrap_tick(frame: ParsedFrame) -> ParsedTick {
@@ -610,7 +610,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     use crate::parser::deep_depth::DepthSide;
-    use dhan_live_trader_common::constants::{
+    use tickvault_common::constants::{
         DEEP_DEPTH_FEED_CODE_ASK, DEEP_DEPTH_FEED_CODE_BID, DEEP_DEPTH_HEADER_SIZE,
         DEEP_DEPTH_LEVEL_SIZE, TWENTY_DEPTH_LEVELS,
     };

@@ -1,4 +1,4 @@
-# WebSocket Complete Reference — dhan-live-trader
+# WebSocket Complete Reference — tickvault
 
 > **Authority:** This doc + `docs/dhan-ref/03-live-market-feed-websocket.md` + `docs/dhan-ref/04-full-market-depth-websocket.md` + `docs/dhan-ref/10-live-order-update-websocket.md`
 >
@@ -386,7 +386,7 @@ PascalCase top-level keys.
 | 2 | No Telegram for Live Market Feed WS connections | Added `WebSocketConnected` for all 5 | 2026-04-09 |
 | 3 | No Telegram for Order Update WS connection | Added `OrderUpdateConnected` | 2026-04-09 |
 | 4 | Order update token not zeroized (security) | Wrapped in `zeroize::Zeroizing<String>` | 2026-04-09 |
-| 5 | Non-order JSON messages silently dropped (no metric) | Added `dlt_order_update_non_order_messages_total` counter | 2026-04-09 |
+| 5 | Non-order JSON messages silently dropped (no metric) | Added `tv_order_update_non_order_messages_total` counter | 2026-04-09 |
 | 6 | 20-level depth sequence number DISCARDED (bytes 8-11 ignored) | Now persisted as `exchange_sequence` LONG in QuestDB | 2026-04-09 |
 
 ### 10.2 Open Gaps
@@ -448,12 +448,12 @@ PascalCase top-level keys.
 
 | Metric | Purpose |
 |--------|---------|
-| `dlt_websocket_pool_all_dead` | Bool gauge: true if all 5 main feed connections are down |
-| `dlt_websocket_failed_connections_count` | Gauge: number of connections in Reconnecting state |
-| `dlt_depth_20lvl_sequence_gaps_total` | Counter: detected sequence gaps in 20-level packets |
-| `dlt_order_update_non_order_messages_dropped_total` | Counter: JSON messages that weren't order updates |
-| `dlt_unknown_response_codes_total` | Counter: Dhan sent a response code we don't recognize |
-| `dlt_packets_by_response_code` | Histogram: breakdown of all received packet types |
+| `tv_websocket_pool_all_dead` | Bool gauge: true if all 5 main feed connections are down |
+| `tv_websocket_failed_connections_count` | Gauge: number of connections in Reconnecting state |
+| `tv_depth_20lvl_sequence_gaps_total` | Counter: detected sequence gaps in 20-level packets |
+| `tv_order_update_non_order_messages_dropped_total` | Counter: JSON messages that weren't order updates |
+| `tv_unknown_response_codes_total` | Counter: Dhan sent a response code we don't recognize |
+| `tv_packets_by_response_code` | Histogram: breakdown of all received packet types |
 
 ### 10.4 Missing Tests
 

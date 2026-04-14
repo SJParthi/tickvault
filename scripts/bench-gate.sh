@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# dhan-live-trader — Benchmark Budget Gate
+# tickvault — Benchmark Budget Gate
 # =============================================================================
 # Parses Criterion JSON output and enforces absolute latency budgets.
 # Reads budgets from quality/benchmark-budgets.toml.

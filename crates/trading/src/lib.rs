@@ -44,6 +44,6 @@ mod tests {
     #[test]
     fn crate_links_in_workspace() {
         let crate_name = env!("CARGO_PKG_NAME");
-        assert_eq!(crate_name, "dhan-live-trader-trading");
+        assert_eq!(crate_name, "tickvault-trading");
     }
 }

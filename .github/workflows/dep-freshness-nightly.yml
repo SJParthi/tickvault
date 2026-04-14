@@ -131,8 +131,8 @@ jobs:
 
       - name: Run scoped test suites
         run: |
-          cargo test -p dhan-live-trader-common --lib
-          cargo test -p dhan-live-trader-storage --lib
+          cargo test -p tickvault-common --lib
+          cargo test -p tickvault-storage --lib
 
       - name: Create Pull Request
         uses: peter-evans/create-pull-request@v7

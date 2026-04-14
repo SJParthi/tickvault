@@ -1,5 +1,5 @@
 # =============================================================================
-# dhan-live-trader — Base Configuration
+# tickvault — Base Configuration
 # =============================================================================
 # Non-secret runtime configuration. Same file on Mac and AWS.
 # Secrets come from real AWS SSM Parameter Store (ap-south-1) — dev and prod.
@@ -156,7 +156,7 @@ max_instruments_per_connection = 5000
 max_websocket_connections = 5
 
 [questdb]
-host = "dlt-questdb"
+host = "tv-questdb"
 http_port = 9000
 pg_port = 8812
 ilp_port = 9009
@@ -167,15 +167,15 @@ ilp_port = 9009
 retention_days = 90
 
 [valkey]
-host = "dlt-valkey"
+host = "tv-valkey"
 port = 6379
 max_connections = 16
-# Password loaded from AWS SSM at boot (/dlt/{env}/valkey/password)
+# Password loaded from AWS SSM at boot (/tickvault/{env}/valkey/password)
 # Empty string = no auth (NOT recommended for production)
 password = ""
 
 [prometheus]
-host = "dlt-prometheus"
+host = "tv-prometheus"
 port = 9090
 
 [websocket]
@@ -259,7 +259,7 @@ sns_enabled = false
 
 [observability]
 metrics_port = 9091
-otlp_endpoint = "http://dlt-jaeger:4317"
+otlp_endpoint = "http://tv-jaeger:4317"
 metrics_enabled = true
 # Jaeger removed from docker-compose (saves 2.5GB RAM, per AWS budget).
 # CloudWatch Logs replaces distributed tracing. Re-enable when Jaeger is deployed.

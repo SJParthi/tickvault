@@ -1,5 +1,5 @@
 # =============================================================================
-# dhan-live-trader — Mutation Testing (PR Gate for Critical Crates)
+# tickvault — Mutation Testing (PR Gate for Critical Crates)
 # =============================================================================
 # Runs cargo-mutants on PRs that touch .rs files in core/trading/common crates.
 # Mutation testing verifies that tests actually catch bugs — if a mutant survives,
@@ -65,13 +65,13 @@ jobs:
           CHANGED=$(gh pr diff ${{ github.event.pull_request.number }} --name-only 2>/dev/null || git diff --name-only origin/${{ github.base_ref }}...HEAD)
           PACKAGES=""
           if echo "$CHANGED" | grep -q '^crates/core/'; then
-            PACKAGES="$PACKAGES --package dhan-live-trader-core"
+            PACKAGES="$PACKAGES --package tickvault-core"
           fi
           if echo "$CHANGED" | grep -q '^crates/trading/'; then
-            PACKAGES="$PACKAGES --package dhan-live-trader-trading"
+            PACKAGES="$PACKAGES --package tickvault-trading"
           fi
           if echo "$CHANGED" | grep -q '^crates/common/'; then
-            PACKAGES="$PACKAGES --package dhan-live-trader-common"
+            PACKAGES="$PACKAGES --package tickvault-common"
           fi
           echo "packages=$PACKAGES" >> "$GITHUB_OUTPUT"
           if [ -z "$PACKAGES" ]; then

@@ -8,7 +8,7 @@ use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 
-use dhan_live_trader_common::config::ApplicationConfig;
+use tickvault_common::config::ApplicationConfig;
 
 /// Embedded copy of a realistic base.toml for deterministic benchmarking.
 /// Avoids file I/O in the benchmark loop.
@@ -97,18 +97,18 @@ max_instruments_per_connection = 5000
 max_websocket_connections = 5
 
 [questdb]
-host = "dlt-questdb"
+host = "tv-questdb"
 http_port = 9000
 pg_port = 8812
 ilp_port = 9009
 
 [valkey]
-host = "dlt-valkey"
+host = "tv-valkey"
 port = 6379
 max_connections = 16
 
 [prometheus]
-host = "dlt-prometheus"
+host = "tv-prometheus"
 port = 9090
 
 [websocket]
@@ -174,7 +174,7 @@ sns_enabled = false
 
 [observability]
 metrics_port = 9091
-otlp_endpoint = "http://dlt-jaeger:4317"
+otlp_endpoint = "http://tv-jaeger:4317"
 metrics_enabled = true
 tracing_enabled = true
 

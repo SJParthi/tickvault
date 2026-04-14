@@ -106,7 +106,7 @@
 
 ---
 
-## Key Takeaways for dhan-live-trader
+## Key Takeaways for tickvault
 
 1. **Always use v2** — v1 is deprecated
 2. **24-hour tokens** — must auto-renew daily (since v2.4)

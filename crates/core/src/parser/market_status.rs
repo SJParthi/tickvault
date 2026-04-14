@@ -4,7 +4,7 @@
 //! The market status information is encoded in the exchange_segment byte
 //! and security_id fields of the header.
 
-use dhan_live_trader_common::constants::MARKET_STATUS_PACKET_SIZE;
+use tickvault_common::constants::MARKET_STATUS_PACKET_SIZE;
 
 use super::types::ParseError;
 

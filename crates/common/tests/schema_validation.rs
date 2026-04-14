@@ -6,7 +6,7 @@
 //! 3. Data type invariants hold
 //! 4. Wire protocol constants match documented sizes
 
-use dhan_live_trader_common::constants::*;
+use tickvault_common::constants::*;
 
 // ---------------------------------------------------------------------------
 // Wire protocol size constants — must match Dhan V2 binary protocol
@@ -170,7 +170,7 @@ fn schema_feed_unsubscribe_is_subscribe_plus_one() {
 
 #[test]
 fn schema_parsed_tick_is_copy() {
-    use dhan_live_trader_common::tick_types::ParsedTick;
+    use tickvault_common::tick_types::ParsedTick;
 
     let tick = ParsedTick::default();
     let copy = tick; // Copy trait
@@ -179,7 +179,7 @@ fn schema_parsed_tick_is_copy() {
 
 #[test]
 fn schema_market_depth_level_is_copy() {
-    use dhan_live_trader_common::tick_types::MarketDepthLevel;
+    use tickvault_common::tick_types::MarketDepthLevel;
 
     let level = MarketDepthLevel::default();
     let copy = level;
@@ -188,7 +188,7 @@ fn schema_market_depth_level_is_copy() {
 
 #[test]
 fn schema_parsed_tick_reasonable_size() {
-    use dhan_live_trader_common::tick_types::ParsedTick;
+    use tickvault_common::tick_types::ParsedTick;
 
     let size = std::mem::size_of::<ParsedTick>();
     // ParsedTick should be <= 128 bytes (fits in 2 cache lines)
@@ -200,7 +200,7 @@ fn schema_parsed_tick_reasonable_size() {
 
 #[test]
 fn schema_market_depth_array_size() {
-    use dhan_live_trader_common::tick_types::MarketDepthLevel;
+    use tickvault_common::tick_types::MarketDepthLevel;
 
     let size = std::mem::size_of::<[MarketDepthLevel; 5]>();
     // 5 levels × 20 bytes each should be ~100 bytes
@@ -236,7 +236,7 @@ fn schema_dedup_ring_buffer_power_in_range() {
 
 #[test]
 fn schema_intraday_response_json_roundtrip() {
-    use dhan_live_trader_common::tick_types::DhanIntradayResponse;
+    use tickvault_common::tick_types::DhanIntradayResponse;
 
     let json = r#"{
         "open": [100.0, 101.0],
@@ -258,7 +258,7 @@ fn schema_intraday_response_json_roundtrip() {
 
 #[test]
 fn schema_intraday_response_missing_oi() {
-    use dhan_live_trader_common::tick_types::DhanIntradayResponse;
+    use tickvault_common::tick_types::DhanIntradayResponse;
 
     // OI field missing entirely — should deserialize with empty vec
     let json = r#"{

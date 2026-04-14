@@ -1,4 +1,4 @@
-# Diagram Flow — dhan-live-trader
+# Diagram Flow — tickvault
 
 > **Audience:** Visual learners. The "YouTube whiteboard" version.
 > **How to read:** Top to bottom. Each diagram is self-contained.
@@ -18,7 +18,7 @@
                                  ▼
 ┌────────────────────────────────────────────────────────────────────┐
 │                                                                    │
-│                      dhan-live-trader                              │
+│                      tickvault                              │
 │                                                                    │
 │  ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐     │
 │  │  WATCH   │───▶│ ANALYZE  │───▶│  DECIDE  │───▶│ EXECUTE  │     │
@@ -351,9 +351,9 @@ No circular dependencies. common is the foundation.
 ┌──── FIRST RUN ─────────────────────────────────────────────┐
 │                                                            │
 │  AWS SSM                                                   │
-│  /dlt/prod/dhan/totp-secret ──▶ TOTP secret               │
-│  /dlt/prod/dhan/client-id   ──▶ Client ID                 │
-│  /dlt/prod/dhan/pin         ──▶ PIN                       │
+│  /tickvault/prod/dhan/totp-secret ──▶ TOTP secret               │
+│  /tickvault/prod/dhan/client-id   ──▶ Client ID                 │
+│  /tickvault/prod/dhan/pin         ──▶ PIN                       │
 │                                    │                       │
 │                                    ▼                       │
 │                            ┌───────────────┐               │
@@ -572,7 +572,7 @@ Layer 6 │   LIVE MONITORING     │  Tick gap > 30s? → ALERT
 │                    DOCKER COMPOSE                         │
 │                                                          │
 │  ┌──────────────┐    ┌──────────────┐                    │
-│  │  dlt-app     │    │  QuestDB     │                    │
+│  │  tickvault     │    │  QuestDB     │                    │
 │  │              │───▶│  :9000 HTTP  │                    │
 │  │  :8080 API   │    │  :8812 PG    │                    │
 │  │  :9090 Prom  │    │  :9009 ILP   │                    │
@@ -605,7 +605,7 @@ Layer 6 │   LIVE MONITORING     │  Tick gap > 30s? → ALERT
 ## Diagram 12: File Map (Key Files Only)
 
 ```
-dhan-live-trader/
+tickvault/
 │
 ├── crates/
 │   ├── app/src/

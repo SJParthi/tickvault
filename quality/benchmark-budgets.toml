@@ -1,5 +1,5 @@
 # =============================================================================
-# dhan-live-trader — Benchmark Latency Budgets
+# tickvault — Benchmark Latency Budgets
 # =============================================================================
 # Used by: scripts/bench-gate.sh (CI Stage 5)
 # Source: docs/standards/quality-gates.md Gate 5a

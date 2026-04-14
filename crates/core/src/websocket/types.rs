@@ -5,15 +5,15 @@
 
 use std::fmt;
 
-use dhan_live_trader_common::constants::{
+use serde::{Deserialize, Serialize};
+use tickvault_common::constants::{
     DATA_API_ACCESS_TOKEN_EXPIRED, DATA_API_ACCESS_TOKEN_INVALID, DATA_API_AUTHENTICATION_FAILED,
     DATA_API_CLIENT_ID_INVALID, DATA_API_EXCEEDED_ACTIVE_CONNECTIONS,
     DATA_API_INSTRUMENTS_EXCEED_LIMIT, DATA_API_INTERNAL_SERVER_ERROR,
     DATA_API_INVALID_DATE_FORMAT, DATA_API_INVALID_EXPIRY_DATE, DATA_API_INVALID_REQUEST,
     DATA_API_INVALID_SECURITY_ID, DATA_API_NOT_SUBSCRIBED,
 };
-use dhan_live_trader_common::types::ExchangeSegment;
-use serde::{Deserialize, Serialize};
+use tickvault_common::types::ExchangeSegment;
 
 /// Unique identifier for a WebSocket connection within the pool (0–4).
 pub type ConnectionId = u8;

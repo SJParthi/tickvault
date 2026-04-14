@@ -14,33 +14,33 @@ use std::path::Path;
 
 const REQUIRED_ALERT_UIDS: &[(&str, &str)] = &[
     (
-        "dlt-dlq-non-zero",
+        "tv-dlq-non-zero",
         "A2: any write to the dead-letter queue is critical",
     ),
     (
-        "dlt-spill-disk-low-warn",
+        "tv-spill-disk-low-warn",
         "A2: spill dir free space < 500MB warning",
     ),
     (
-        "dlt-spill-disk-low-critical",
+        "tv-spill-disk-low-critical",
         "A2: spill dir free space < 100MB critical",
     ),
     (
-        "dlt-pool-degraded",
+        "tv-pool-degraded",
         "A4: pool watchdog fired 60s degraded alert",
     ),
-    ("dlt-pool-halted", "A4: pool watchdog fired 300s halt alert"),
+    ("tv-pool-halted", "A4: pool watchdog fired 300s halt alert"),
     (
-        "dlt-questdb-disconnected",
+        "tv-questdb-disconnected",
         "S3-1: QuestDB disconnected > 30s",
     ),
     (
-        "dlt-order-update-ws-down",
+        "tv-order-update-ws-down",
         "S4-T4: Order update WebSocket down > 60s",
     ),
-    ("dlt-valkey-errors", "S4-T4: Valkey errors during ops"),
+    ("tv-valkey-errors", "S4-T4: Valkey errors during ops"),
     (
-        "dlt-depth-frames-dropped",
+        "tv-depth-frames-dropped",
         "S4-T4: Depth frames dropped (channel full)",
     ),
 ];

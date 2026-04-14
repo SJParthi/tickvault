@@ -19,10 +19,10 @@ use std::collections::HashMap;
 use chrono::NaiveDate;
 use tracing::{debug, warn};
 
-use dhan_live_trader_common::config::GreeksConfig;
-use dhan_live_trader_common::instrument_registry::InstrumentRegistry;
-use dhan_live_trader_common::tick_types::ParsedTick;
-use dhan_live_trader_common::types::{ExchangeSegment, OptionType, SecurityId};
+use tickvault_common::config::GreeksConfig;
+use tickvault_common::instrument_registry::InstrumentRegistry;
+use tickvault_common::tick_types::ParsedTick;
+use tickvault_common::types::{ExchangeSegment, OptionType, SecurityId};
 
 use crate::greeks::black_scholes::{self, OptionGreeks, OptionSide};
 use crate::greeks::pcr;
@@ -471,11 +471,9 @@ fn compute_time_to_expiry(expiry_date: NaiveDate, current_ist_epoch_secs: u32) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dhan_live_trader_common::instrument_registry::{
-        SubscribedInstrument, SubscriptionCategory,
-    };
-    use dhan_live_trader_common::instrument_types::DhanInstrumentKind;
-    use dhan_live_trader_common::types::FeedMode;
+    use tickvault_common::instrument_registry::{SubscribedInstrument, SubscriptionCategory};
+    use tickvault_common::instrument_types::DhanInstrumentKind;
+    use tickvault_common::types::FeedMode;
 
     fn default_config() -> GreeksConfig {
         GreeksConfig {

@@ -5,7 +5,7 @@
 //! panics, data corruption, or incorrect behavior.
 //!
 //! NOTE: Timing assertions are skipped under instrumented builds
-//! (cargo-careful, sanitizers). Set `DLT_SKIP_PERF_ASSERTIONS=1` to skip.
+//! (cargo-careful, sanitizers). Set `TV_SKIP_PERF_ASSERTIONS=1` to skip.
 
 #![allow(clippy::unwrap_used, clippy::arithmetic_side_effects)]
 
@@ -13,14 +13,14 @@ use std::time::{Duration, Instant};
 
 /// Returns true when running under instrumented builds (cargo-careful, sanitizers).
 fn skip_perf_assertions() -> bool {
-    std::env::var("DLT_SKIP_PERF_ASSERTIONS").is_ok()
+    std::env::var("TV_SKIP_PERF_ASSERTIONS").is_ok()
 }
 
 // ===========================================================================
 // Helpers — packet construction
 // ===========================================================================
 
-use dhan_live_trader_common::constants::{
+use tickvault_common::constants::{
     DISCONNECT_PACKET_SIZE, EXCHANGE_SEGMENT_NSE_FNO, FULL_QUOTE_PACKET_SIZE, OI_PACKET_SIZE,
     PREVIOUS_CLOSE_PACKET_SIZE, QUOTE_PACKET_SIZE, TICKER_PACKET_SIZE,
 };
@@ -62,7 +62,7 @@ fn make_full(security_id: u32, ltp: f32) -> Vec<u8> {
 
 mod stress_parser_malformed {
     use super::*;
-    use dhan_live_trader_core::parser::dispatch_frame;
+    use tickvault_core::parser::dispatch_frame;
 
     #[test]
     fn test_stress_parser_all_zeros_all_sizes() {
@@ -234,7 +234,7 @@ mod stress_parser_malformed {
 
 mod stress_parser_throughput {
     use super::*;
-    use dhan_live_trader_core::parser::dispatch_frame;
+    use tickvault_core::parser::dispatch_frame;
 
     #[test]
     fn test_stress_parse_500k_mixed_packets() {
@@ -291,11 +291,11 @@ mod stress_parser_throughput {
 // ===========================================================================
 
 mod stress_subscription_builder {
-    use dhan_live_trader_common::types::{ExchangeSegment, FeedMode};
-    use dhan_live_trader_core::websocket::subscription_builder::{
+    use tickvault_common::types::{ExchangeSegment, FeedMode};
+    use tickvault_core::websocket::subscription_builder::{
         build_disconnect_message, build_subscription_messages, build_unsubscription_messages,
     };
-    use dhan_live_trader_core::websocket::types::InstrumentSubscription;
+    use tickvault_core::websocket::types::InstrumentSubscription;
 
     fn make_instruments(count: usize) -> Vec<InstrumentSubscription> {
         (0..count)
@@ -466,8 +466,8 @@ mod stress_subscription_builder {
 
 mod stress_parser_specific {
     use super::*;
-    use dhan_live_trader_core::parser::dispatch_frame;
-    use dhan_live_trader_core::parser::types::ParsedFrame;
+    use tickvault_core::parser::dispatch_frame;
+    use tickvault_core::parser::types::ParsedFrame;
 
     #[test]
     fn test_stress_parser_ticker_field_preservation() {
@@ -554,7 +554,7 @@ mod stress_parser_specific {
 // ===========================================================================
 
 mod stress_disconnect_codes {
-    use dhan_live_trader_core::websocket::types::DisconnectCode;
+    use tickvault_core::websocket::types::DisconnectCode;
 
     #[test]
     fn test_stress_disconnect_code_from_all_u16() {
@@ -618,7 +618,7 @@ mod stress_disconnect_codes {
 // ===========================================================================
 
 mod stress_connection_state {
-    use dhan_live_trader_core::websocket::types::ConnectionState;
+    use tickvault_core::websocket::types::ConnectionState;
 
     #[test]
     fn test_stress_connection_state_all_variants_display() {
@@ -666,7 +666,7 @@ mod stress_connection_state {
 // ===========================================================================
 
 mod stress_parser_header {
-    use dhan_live_trader_core::parser::dispatch_frame;
+    use tickvault_core::parser::dispatch_frame;
 
     #[test]
     fn test_stress_header_every_length_0_to_200() {
@@ -704,8 +704,8 @@ mod stress_parser_header {
 
 mod stress_cross_component {
     use super::*;
-    use dhan_live_trader_core::parser::dispatch_frame;
-    use dhan_live_trader_core::parser::types::ParsedFrame;
+    use tickvault_core::parser::dispatch_frame;
+    use tickvault_core::parser::types::ParsedFrame;
 
     #[test]
     fn test_stress_parser_extreme_f32_values() {

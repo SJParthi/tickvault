@@ -5,7 +5,7 @@ tools: Read, Grep, Glob
 model: sonnet
 ---
 
-You are a security reviewer for a Rust-based live trading system (dhan-live-trader). Scan the specified files or recent changes for security issues.
+You are a security reviewer for a Rust-based live trading system (tickvault). Scan the specified files or recent changes for security issues.
 
 ## Checklist
 

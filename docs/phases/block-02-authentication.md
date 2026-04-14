@@ -38,9 +38,9 @@ Source:     AWS SSM Parameter Store (SecureString type)
 Region:     ap-south-1 (always real AWS, dev and prod)
 
 Paths:
-  /dlt/<env>/dhan/client-id         → Dhan Client ID
-  /dlt/<env>/dhan/client-secret     → Dhan password/secret
-  /dlt/<env>/dhan/totp-secret       → TOTP Base32 secret
+  /tickvault/<env>/dhan/client-id         → Dhan Client ID
+  /tickvault/<env>/dhan/client-secret     → Dhan password/secret
+  /tickvault/<env>/dhan/totp-secret       → TOTP Base32 secret
 
 Always real AWS SSM. Same SDK, same code path, same endpoint.
 ```
@@ -245,7 +245,7 @@ pub const DHAN_RENEW_TOKEN_PATH: &str = "/renewToken";
 /// Overridden by ENVIRONMENT env var if present.
 pub const DEFAULT_SSM_ENVIRONMENT: &str = "dev";
 
-/// SSM path template: /dlt/<env>/dhan/<key>
+/// SSM path template: /tickvault/<env>/dhan/<key>
 /// Constructed at runtime using SSM_SECRET_BASE_PATH + env + service + key.
 pub const SSM_DHAN_SERVICE: &str = "dhan";
 
@@ -549,7 +549,7 @@ Already present in core/Cargo.toml:
 | `test_token_state_is_invalid_after_expiry` | is_valid() returns false after expiry |
 | `test_token_state_needs_refresh_in_window` | needs_refresh() true at 23h+ |
 | `test_token_state_no_refresh_before_window` | needs_refresh() false before 23h |
-| `test_ssm_path_construction` | Path format matches /dlt/dev/dhan/client-id |
+| `test_ssm_path_construction` | Path format matches /tickvault/dev/dhan/client-id |
 | `test_ssm_path_prod_environment` | Path uses "prod" when configured |
 | `test_credentials_debug_redacted` | Debug print shows [REDACTED], not secrets |
 | `test_token_debug_redacted` | Debug print shows [REDACTED] for access_token |

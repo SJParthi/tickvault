@@ -1,5 +1,5 @@
 # =============================================================================
-# dhan-live-trader — Auto-Merge Workflow
+# tickvault — Auto-Merge Workflow
 # =============================================================================
 # Automatically enables auto-merge on PRs when all CI checks pass.
 # Zero human intervention — CI is the sole gatekeeper.

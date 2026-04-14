@@ -7,7 +7,7 @@
 
 use libfuzzer_sys::fuzz_target;
 
-use dhan_live_trader_core::parser::dispatcher::dispatch_frame;
+use tickvault_core::parser::dispatcher::dispatch_frame;
 
 fuzz_target!(|data: &[u8]| {
     // dispatch_frame must NEVER panic — only return Ok or Err.

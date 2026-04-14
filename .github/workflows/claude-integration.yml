@@ -1,5 +1,5 @@
 # =============================================================================
-# dhan-live-trader — Claude Session Integration
+# tickvault — Claude Session Integration
 # =============================================================================
 # Watches all claude/* session branches. On any push to a session branch,
 # automatically merges those changes into claude/integration.

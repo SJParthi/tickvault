@@ -1,5 +1,5 @@
 # =============================================================================
-# dhan-live-trader — Prometheus Alerting & Recording Rules
+# tickvault — Prometheus Alerting & Recording Rules
 # =============================================================================
 # Recording rules pre-compute expensive queries. Alert rules fire to
 # Prometheus Alertmanager (if configured) or are scraped by Grafana.
@@ -7,20 +7,20 @@
 
 groups:
   # -- Recording Rules (pre-aggregations for dashboard performance) -----------
-  - name: dlt-recording-rules
+  - name: tv-recording-rules
     interval: 15s
     rules:
       - record: dlt:tick_rate:1m
-        expr: rate(dlt_ticks_processed_total[1m])
+        expr: rate(tv_ticks_processed_total[1m])
 
       - record: dlt:tick_latency_p50:1m
-        expr: histogram_quantile(0.50, rate(dlt_tick_processing_duration_ns_bucket[1m]))
+        expr: histogram_quantile(0.50, rate(tv_tick_processing_duration_ns_bucket[1m]))
 
       - record: dlt:tick_latency_p95:1m
-        expr: histogram_quantile(0.95, rate(dlt_tick_processing_duration_ns_bucket[1m]))
+        expr: histogram_quantile(0.95, rate(tv_tick_processing_duration_ns_bucket[1m]))
 
       - record: dlt:tick_latency_p99:1m
-        expr: histogram_quantile(0.99, rate(dlt_tick_processing_duration_ns_bucket[1m]))
+        expr: histogram_quantile(0.99, rate(tv_tick_processing_duration_ns_bucket[1m]))
 
       - record: dlt:traefik_request_rate:5m
         expr: sum(rate(traefik_entrypoint_requests_total[5m])) by (entrypoint)
@@ -29,7 +29,7 @@ groups:
         expr: sum(rate(traefik_entrypoint_requests_total{code=~"5.."}[5m])) by (entrypoint)
 
   # -- Alert Rules -------------------------------------------------------------
-  - name: dlt-infrastructure-alerts
+  - name: tv-infrastructure-alerts
     rules:
       - alert: TargetDown
         expr: up == 0
@@ -41,7 +41,7 @@ groups:
           description: "{{ $labels.instance }} (job={{ $labels.job }}) has been unreachable for 2+ minutes."
 
       - alert: PrometheusHighMemory
-        expr: process_resident_memory_bytes{job="dlt-prometheus"} > 1073741824
+        expr: process_resident_memory_bytes{job="tv-prometheus"} > 1073741824
         for: 5m
         labels:
           severity: warning
@@ -76,19 +76,19 @@ groups:
           summary: "{{ $labels.job }} is flapping (restarting)"
           description: "{{ $labels.instance }} (job={{ $labels.job }}) has restarted {{ $value }} times in the last 15 minutes. Container may be crash-looping."
 
-  - name: dlt-application-alerts
+  - name: tickvault-alerts
     rules:
       - alert: ApplicationDown
-        expr: up{job="dlt-application"} == 0
+        expr: up{job="tickvault"} == 0
         for: 1m
         labels:
           severity: critical
         annotations:
-          summary: "dhan-live-trader is DOWN"
+          summary: "tickvault is DOWN"
           description: "The trading application has been unreachable for 1+ minute."
 
       - alert: WebSocketDisconnected
-        expr: dlt_websocket_connections_active == 0
+        expr: tv_websocket_connections_active == 0
         for: 2m
         labels:
           severity: critical
@@ -106,7 +106,7 @@ groups:
           description: "p99 tick processing latency is {{ $value }}ns, exceeding 1ms budget."
 
       - alert: PipelineStopped
-        expr: dlt_pipeline_active == 0
+        expr: tv_pipeline_active == 0
         for: 1m
         labels:
           severity: critical
@@ -115,7 +115,7 @@ groups:
           description: "The tick processing pipeline has been inactive for 1+ minute."
 
       - alert: HighParseErrorRate
-        expr: rate(dlt_parse_errors_total[5m]) > 1
+        expr: rate(tv_parse_errors_total[5m]) > 1
         for: 3m
         labels:
           severity: warning
@@ -124,7 +124,7 @@ groups:
           description: "Binary frame parse errors averaging {{ $value }}/sec over 5 minutes."
 
       - alert: HighStorageErrorRate
-        expr: rate(dlt_storage_errors_total[5m]) > 0.1
+        expr: rate(tv_storage_errors_total[5m]) > 0.1
         for: 3m
         labels:
           severity: warning
@@ -133,7 +133,7 @@ groups:
           description: "Tick persistence is failing at {{ $value }}/sec. Check QuestDB connectivity."
 
       - alert: TickBufferActive
-        expr: dlt_tick_buffer_size > 0
+        expr: tv_tick_buffer_size > 0
         for: 1m
         labels:
           severity: warning
@@ -142,7 +142,7 @@ groups:
           description: "{{ $value }} ticks buffered in memory. QuestDB connection likely broken."
 
       - alert: TickDiskSpillActive
-        expr: dlt_ticks_spilled_total > 0
+        expr: tv_ticks_spilled_total > 0
         for: 0m
         labels:
           severity: critical
@@ -151,7 +151,7 @@ groups:
           description: "{{ $value }} ticks spilled to disk. QuestDB has been down for 5+ minutes."
 
       - alert: CandleBufferActive
-        expr: dlt_candle_buffer_size > 0
+        expr: tv_candle_buffer_size > 0
         for: 1m
         labels:
           severity: warning
@@ -160,7 +160,7 @@ groups:
           description: "{{ $value }} candles buffered in memory."
 
       - alert: CandleDiskSpillActive
-        expr: dlt_candles_spilled_total > 0
+        expr: tv_candles_spilled_total > 0
         for: 0m
         labels:
           severity: critical
@@ -169,7 +169,7 @@ groups:
           description: "{{ $value }} candles spilled to disk. QuestDB down for 27+ minutes."
 
       - alert: DepthBufferActive
-        expr: dlt_depth_buffer_size > 0
+        expr: tv_depth_buffer_size > 0
         for: 1m
         labels:
           severity: warning
@@ -178,7 +178,7 @@ groups:
           description: "{{ $value }} depth snapshots buffered in memory."
 
       - alert: DepthDiskSpillActive
-        expr: dlt_depth_spilled_total > 0
+        expr: tv_depth_spilled_total > 0
         for: 0m
         labels:
           severity: critical
@@ -196,7 +196,7 @@ groups:
           description: "Tick processing rate has been zero for 5 minutes during market hours."
 
       - alert: HighHistoricalFetchErrors
-        expr: increase(dlt_historical_api_errors_total[10m]) > 5
+        expr: increase(tv_historical_api_errors_total[10m]) > 5
         for: 0m
         labels:
           severity: warning
@@ -205,7 +205,7 @@ groups:
           description: "{{ $value }} historical API errors in the last 10 minutes. Some instruments may have missing candle data."
 
       - alert: HighWebSocketReconnectRate
-        expr: rate(dlt_websocket_reconnections_total[5m]) > 0.1
+        expr: rate(tv_websocket_reconnections_total[5m]) > 0.1
         for: 5m
         labels:
           severity: warning
@@ -223,7 +223,7 @@ groups:
           description: "More than 10% of requests are returning 4xx client errors."
 
       - alert: HighJunkTickRate
-        expr: rate(dlt_junk_ticks_filtered_total[5m]) > 10
+        expr: rate(tv_junk_ticks_filtered_total[5m]) > 10
         for: 3m
         labels:
           severity: warning
@@ -232,7 +232,7 @@ groups:
           description: "{{ $value }}/sec junk ticks filtered. Possible feed corruption or instrument mismatch."
 
       - alert: HighCrossedMarketRate
-        expr: rate(dlt_crossed_market_total[5m]) > 1
+        expr: rate(tv_crossed_market_total[5m]) > 1
         for: 3m
         labels:
           severity: warning
@@ -241,7 +241,7 @@ groups:
           description: "{{ $value }}/sec crossed-market conditions. Market data integrity may be degraded."
 
       - alert: HighDedupFilterRate
-        expr: rate(dlt_dedup_filtered_total[5m]) / (rate(dlt_ticks_processed_total[5m]) + 1e-10) > 0.50
+        expr: rate(tv_dedup_filtered_total[5m]) / (rate(tv_ticks_processed_total[5m]) + 1e-10) > 0.50
         for: 5m
         labels:
           severity: warning
@@ -251,7 +251,7 @@ groups:
 
       # C2: Spill file growth — QuestDB likely down, ticks spilling to disk
       - alert: TickSpillFilesGrowing
-        expr: dlt_spill_files_total_bytes > 100000000
+        expr: tv_spill_files_total_bytes > 100000000
         for: 1m
         labels:
           severity: warning
@@ -261,7 +261,7 @@ groups:
 
       # C3: QuestDB liveness — SELECT 1 failed
       - alert: QuestDbDown
-        expr: dlt_questdb_alive == 0
+        expr: tv_questdb_alive == 0
         for: 2m
         labels:
           severity: critical
@@ -281,7 +281,7 @@ groups:
 
       # C2: Tick drops — catastrophic (disk spill also failed)
       - alert: TicksDropped
-        expr: dlt_ticks_dropped_total > 0
+        expr: tv_ticks_dropped_total > 0
         for: 0s
         labels:
           severity: critical
@@ -293,7 +293,7 @@ groups:
       # tokio broadcast channel dropped oldest ticks (capacity 65536).
       # These ticks are PERMANENTLY LOST — they never reached ring buffer or disk.
       - alert: BroadcastLagTickLoss
-        expr: dlt_ticks_permanently_lost > 0
+        expr: tv_ticks_permanently_lost > 0
         for: 0s
         labels:
           severity: critical
@@ -303,7 +303,7 @@ groups:
 
       # Circuit breaker opened — Dhan API failures exceeded threshold
       - alert: CircuitBreakerOpen
-        expr: dlt_circuit_breaker_state == 1
+        expr: tv_circuit_breaker_state == 1
         for: 0s
         labels:
           severity: critical
@@ -313,7 +313,7 @@ groups:
 
       # Phase 2 (OMS) — metrics not yet emitted, alert will be inert until then
       - alert: HighOrderRejectionRate
-        expr: rate(dlt_orders_rejected_total[5m]) / (rate(dlt_orders_placed_total[5m]) + 1e-10) > 0.10
+        expr: rate(tv_orders_rejected_total[5m]) / (rate(tv_orders_placed_total[5m]) + 1e-10) > 0.10
         for: 5m
         labels:
           severity: warning
@@ -323,7 +323,7 @@ groups:
 
       # Token expiry — refresh at 23h, warn at 1h remaining
       - alert: TokenExpiryWarning
-        expr: dlt_token_remaining_seconds < 3600
+        expr: tv_token_remaining_seconds < 3600
         for: 0m
         labels:
           severity: warning
@@ -332,7 +332,7 @@ groups:
           description: "Token has {{ $value }}s remaining. Auto-refresh should trigger at 23h mark."
 
       - alert: TokenExpiryCritical
-        expr: dlt_token_remaining_seconds < 600
+        expr: tv_token_remaining_seconds < 600
         for: 0m
         labels:
           severity: critical
@@ -342,7 +342,7 @@ groups:
 
       # Zero ticks for 30 seconds during market hours (more aggressive than NoTicksReceived)
       - alert: ZeroTicksBurst
-        expr: increase(dlt_ticks_processed_total[30s]) == 0 and dlt_pipeline_active == 1
+        expr: increase(tv_ticks_processed_total[30s]) == 0 and tv_pipeline_active == 1
         for: 30s
         labels:
           severity: critical
@@ -352,7 +352,7 @@ groups:
 
       # Memory usage — process RSS
       - alert: HighMemoryUsage
-        expr: process_resident_memory_bytes{job="dlt-application"} > 2147483648
+        expr: process_resident_memory_bytes{job="tickvault"} > 2147483648
         for: 5m
         labels:
           severity: warning
@@ -362,7 +362,7 @@ groups:
 
       # Valkey (cache) down
       - alert: ValkeyDown
-        expr: up{job="dlt-valkey"} == 0
+        expr: up{job="tv-valkey"} == 0
         for: 30s
         labels:
           severity: warning
@@ -372,7 +372,7 @@ groups:
 
       # Alloy (log collector) down — explains empty Logs dashboard
       - alert: AlloyDown
-        expr: up{job="dlt-alloy"} == 0
+        expr: up{job="tv-alloy"} == 0
         for: 2m
         labels:
           severity: warning
@@ -382,7 +382,7 @@ groups:
 
       # 20-level depth connection down (per underlying)
       - alert: Depth20Disconnected
-        expr: dlt_depth_20lvl_connection_active == 0 and on() dlt_pipeline_active == 1
+        expr: tv_depth_20lvl_connection_active == 0 and on() tv_pipeline_active == 1
         for: 2m
         labels:
           severity: warning
@@ -392,7 +392,7 @@ groups:
 
       # 200-level depth connection down (per underlying)
       - alert: Depth200Disconnected
-        expr: dlt_depth_200lvl_connection_active == 0 and on() dlt_pipeline_active == 1
+        expr: tv_depth_200lvl_connection_active == 0 and on() tv_pipeline_active == 1
         for: 2m
         labels:
           severity: warning
@@ -402,7 +402,7 @@ groups:
 
       # Zero depth frames for 60 seconds
       - alert: NoDepthFrames
-        expr: increase(dlt_depth_20lvl_frames_total[60s]) == 0 and dlt_depth_20lvl_connection_active == 1
+        expr: increase(tv_depth_20lvl_frames_total[60s]) == 0 and tv_depth_20lvl_connection_active == 1
         for: 60s
         labels:
           severity: warning
@@ -412,7 +412,7 @@ groups:
 
       # Deep depth data loss — rows dropped on flush failure
       - alert: DeepDepthDataLoss
-        expr: dlt_deep_depth_dropped_total > 0
+        expr: tv_deep_depth_dropped_total > 0
         for: 0s
         labels:
           severity: critical
@@ -422,7 +422,7 @@ groups:
 
       # Depth frames dropped due to send timeout
       - alert: DepthFramesDropped
-        expr: rate(dlt_depth_frames_dropped_total[5m]) > 0
+        expr: rate(tv_depth_frames_dropped_total[5m]) > 0
         for: 60s
         labels:
           severity: warning
@@ -432,7 +432,7 @@ groups:
 
       # Depth rebalancer not running while pipeline is active
       - alert: DepthRebalancerDown
-        expr: dlt_depth_rebalancer_active == 0 and dlt_pipeline_active == 1
+        expr: tv_depth_rebalancer_active == 0 and tv_pipeline_active == 1
         for: 2m
         labels:
           severity: warning
@@ -442,7 +442,7 @@ groups:
 
       # Trading pipeline loop stalled (no heartbeat for 30+ seconds)
       - alert: TradingPipelineStalled
-        expr: time() - dlt_trading_pipeline_heartbeat > 30 and dlt_pipeline_active == 1
+        expr: time() - tv_trading_pipeline_heartbeat > 30 and tv_pipeline_active == 1
         for: 30s
         labels:
           severity: critical
@@ -452,7 +452,7 @@ groups:
 
       # Trading pipeline lagging behind tick producer
       - alert: TradingPipelineLagging
-        expr: rate(dlt_trading_pipeline_ticks_lagged_total[5m]) > 0
+        expr: rate(tv_trading_pipeline_ticks_lagged_total[5m]) > 0
         for: 60s
         labels:
           severity: warning
@@ -462,7 +462,7 @@ groups:
 
       # Daily P&L approaching max loss limit (2% of capital)
       - alert: DailyPnlWarning
-        expr: (dlt_realized_pnl + dlt_unrealized_pnl) < -15000
+        expr: (tv_realized_pnl + tv_unrealized_pnl) < -15000
         for: 0s
         labels:
           severity: warning
@@ -471,7 +471,7 @@ groups:
           description: "Combined P&L is {{ $value }}. Max daily loss limit is 2% of capital."
 
       - alert: DailyPnlCritical
-        expr: (dlt_realized_pnl + dlt_unrealized_pnl) < -18000
+        expr: (tv_realized_pnl + tv_unrealized_pnl) < -18000
         for: 0s
         labels:
           severity: critical
@@ -481,7 +481,7 @@ groups:
 
       # Order placement latency SLA breach
       - alert: HighOrderLatency
-        expr: histogram_quantile(0.99, rate(dlt_order_placement_duration_ns_bucket[5m])) > 100000000
+        expr: histogram_quantile(0.99, rate(tv_order_placement_duration_ns_bucket[5m])) > 100000000
         for: 3m
         labels:
           severity: warning
@@ -491,7 +491,7 @@ groups:
 
       # Valkey cache error rate
       - alert: HighValkeyErrorRate
-        expr: rate(dlt_valkey_errors_total[5m]) > 1
+        expr: rate(tv_valkey_errors_total[5m]) > 1
         for: 2m
         labels:
           severity: warning
@@ -501,7 +501,7 @@ groups:
 
       # WebSocket backpressure — frames queuing
       - alert: WebSocketBackpressure
-        expr: rate(dlt_ws_backpressure_timeout_total[5m]) > 0
+        expr: rate(tv_ws_backpressure_timeout_total[5m]) > 0
         for: 30s
         labels:
           severity: warning
@@ -511,7 +511,7 @@ groups:
 
       # SEBI rate limiter denying orders
       - alert: RateLimiterDenying
-        expr: rate(dlt_rate_limiter_denied_total[5m]) > 0
+        expr: rate(tv_rate_limiter_denied_total[5m]) > 0
         for: 0s
         labels:
           severity: critical

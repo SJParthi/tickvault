@@ -1,5 +1,5 @@
 # =============================================================================
-# dhan-live-trader — cargo-vet Supply Chain Configuration
+# tickvault — cargo-vet Supply Chain Configuration
 # =============================================================================
 # Tracks which dependency versions have been audited/reviewed.
 # Imports audit results from Mozilla, Google, and Bytecode Alliance.

@@ -15,7 +15,7 @@
 # Secrets required (GitHub repo > Settings > Secrets and variables > Actions):
 #   AWS_ROLE_ARN                — OIDC role assumed by the workflow
 #   AWS_ACCOUNT_ID              — used in the role ARN template
-#   EC2_INSTANCE_ID             — the dlt-prod-app instance ID from tf output
+#   EC2_INSTANCE_ID             — the tv-prod-app instance ID from tf output
 #
 # Variables (repo > Settings > Secrets and variables > Variables):
 #   AWS_REGION                  — ap-south-1
@@ -67,12 +67,12 @@ jobs:
           key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build release binary
-        run: cargo build --release --bin dhan-live-trader -p dhan-live-trader-app
+        run: cargo build --release --bin tickvault -p tickvault-app
 
       - name: Verify binary exists + under 15MB
         run: |
-          ls -la target/release/dhan-live-trader
-          SIZE_BYTES=$(stat -c%s target/release/dhan-live-trader)
+          ls -la target/release/tickvault
+          SIZE_BYTES=$(stat -c%s target/release/tickvault)
           SIZE_MB=$((SIZE_BYTES / 1024 / 1024))
           echo "Binary size: ${SIZE_MB}MB (${SIZE_BYTES} bytes)"
           if [ "$SIZE_BYTES" -gt 15728640 ]; then
@@ -84,8 +84,8 @@ jobs:
         id: upload
         uses: actions/upload-artifact@v4
         with:
-          name: dhan-live-trader-binary
-          path: target/release/dhan-live-trader
+          name: tickvault-binary
+          path: target/release/tickvault
           retention-days: 7
 
   guard_market_hours:
@@ -129,7 +129,7 @@ jobs:
       - name: Download built binary
         uses: actions/download-artifact@v4
         with:
-          name: dhan-live-trader-binary
+          name: tickvault-binary
           path: ./dist/
 
       - name: Configure AWS credentials via OIDC
@@ -137,13 +137,13 @@ jobs:
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
-          role-session-name: dlt-github-deploy-${{ github.run_id }}
+          role-session-name: tv-github-deploy-${{ github.run_id }}
 
       - name: Upload binary to S3 staging bucket
         run: |
-          chmod +x ./dist/dhan-live-trader
-          aws s3 cp ./dist/dhan-live-trader \
-            s3://dlt-prod-cold/deploys/${{ github.sha }}/dhan-live-trader \
+          chmod +x ./dist/tickvault
+          aws s3 cp ./dist/tickvault \
+            s3://tv-prod-cold/deploys/${{ github.sha }}/tickvault \
             --region ${{ vars.AWS_REGION }}
 
       - name: Run SSM command — download binary + smoke test + swap
@@ -158,19 +158,19 @@ jobs:
               "set -euo pipefail",
               "cd /opt/dlt",
               "# Back up the current binary so we can roll back",
-              "if [ -f bin/dhan-live-trader ]; then cp bin/dhan-live-trader bin/dhan-live-trader.backup; fi",
+              "if [ -f bin/tickvault ]; then cp bin/tickvault bin/tickvault.backup; fi",
               "# Download the new binary from S3",
-              "aws s3 cp s3://dlt-prod-cold/deploys/${{ github.sha }}/dhan-live-trader bin/dhan-live-trader.new",
-              "chmod +x bin/dhan-live-trader.new",
+              "aws s3 cp s3://tv-prod-cold/deploys/${{ github.sha }}/tickvault bin/tickvault.new",
+              "chmod +x bin/tickvault.new",
               "# Run smoke test (must exit 0 in < 30 seconds)",
-              "timeout 40 bin/dhan-live-trader.new smoke-test --duration 30",
+              "timeout 40 bin/tickvault.new smoke-test --duration 30",
               "# Atomic swap",
-              "mv bin/dhan-live-trader.new bin/dhan-live-trader",
+              "mv bin/tickvault.new bin/tickvault",
               "# Reload systemd unit",
               "systemctl daemon-reload",
-              "systemctl restart dlt-app",
+              "systemctl restart tickvault",
               "sleep 5",
-              "systemctl is-active --quiet dlt-app || (echo FAIL && exit 1)",
+              "systemctl is-active --quiet tickvault || (echo FAIL && exit 1)",
               "echo DEPLOY OK"
             ]' \
             --query 'Command.CommandId' --output text)
@@ -202,7 +202,7 @@ jobs:
               --region ${{ vars.AWS_REGION }} \
               --instance-ids ${{ secrets.EC2_INSTANCE_ID }} \
               --document-name "AWS-RunShellScript" \
-              --parameters 'commands=["systemctl is-active dlt-app"]' \
+              --parameters 'commands=["systemctl is-active tickvault"]' \
               --query 'Command.CommandId' --output text)
             sleep 5
             RESULT=$(aws ssm get-command-invocation \
@@ -218,15 +218,15 @@ jobs:
             sleep 5
           done
           if [ "$FAIL" -eq 1 ]; then
-            echo "ROLLBACK: dlt-app is not active after deploy — rolling back"
+            echo "ROLLBACK: tickvault is not active after deploy — rolling back"
             aws ssm send-command \
               --region ${{ vars.AWS_REGION }} \
               --instance-ids ${{ secrets.EC2_INSTANCE_ID }} \
               --document-name "AWS-RunShellScript" \
-              --parameters 'commands=["set -euo pipefail","cd /opt/dlt","if [ -f bin/dhan-live-trader.backup ]; then mv bin/dhan-live-trader.backup bin/dhan-live-trader; systemctl restart dlt-app; fi"]'
+              --parameters 'commands=["set -euo pipefail","cd /opt/dlt","if [ -f bin/tickvault.backup ]; then mv bin/tickvault.backup bin/tickvault; systemctl restart tickvault; fi"]'
             exit 1
           fi
-          echo "DEPLOY VERIFIED: dlt-app has been active for 60s"
+          echo "DEPLOY VERIFIED: tickvault has been active for 60s"
 
       - name: Notify Telegram on success
         if: success()
@@ -235,7 +235,7 @@ jobs:
           # an INFO-level message so the operator sees the deploy land.
           aws sns publish \
             --region ${{ vars.AWS_REGION }} \
-            --topic-arn arn:aws:sns:${{ vars.AWS_REGION }}:${{ secrets.AWS_ACCOUNT_ID }}:dlt-prod-alerts \
+            --topic-arn arn:aws:sns:${{ vars.AWS_REGION }}:${{ secrets.AWS_ACCOUNT_ID }}:tv-prod-alerts \
             --subject "DLT deploy OK" \
             --message "commit=${{ github.sha }} ref=${{ github.ref }} actor=${{ github.actor }}"
 
@@ -244,6 +244,6 @@ jobs:
         run: |
           aws sns publish \
             --region ${{ vars.AWS_REGION }} \
-            --topic-arn arn:aws:sns:${{ vars.AWS_REGION }}:${{ secrets.AWS_ACCOUNT_ID }}:dlt-prod-alerts \
+            --topic-arn arn:aws:sns:${{ vars.AWS_REGION }}:${{ secrets.AWS_ACCOUNT_ID }}:tv-prod-alerts \
             --subject "DLT deploy FAILED" \
             --message "commit=${{ github.sha }} ref=${{ github.ref }} actor=${{ github.actor }} run=${{ github.run_id }}"

@@ -11,7 +11,7 @@ set -euo pipefail
 ENVIRONMENT="${environment}"
 REGION="${region}"
 
-exec > /var/log/dlt-user-data.log 2>&1
+exec > /var/log/tv-user-data.log 2>&1
 echo "=== dlt user-data starting at $(date -u) ==="
 
 # System update + required packages
@@ -56,7 +56,7 @@ cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<CWCFG
         "collect_list": [
           {
             "file_path": "/var/log/syslog",
-            "log_group_name": "/dlt/\$${environment}/system",
+            "log_group_name": "/tickvault/\$${environment}/system",
             "log_stream_name": "{instance_id}"
           }
         ]
@@ -69,19 +69,19 @@ CWCFG
 systemctl enable --now amazon-cloudwatch-agent
 
 # Create application directories
-mkdir -p /opt/dlt/{config,data/spill,logs,bin}
+mkdir -p /opt/tickvault/{config,data/spill,logs,bin}
 chown -R ubuntu:ubuntu /opt/dlt
 
 # Clone the repo (shallow, main branch)
 sudo -u ubuntu git clone --depth 1 \
-    https://github.com/SJParthi/dhan-live-trader.git /opt/dlt/repo
+    https://github.com/SJParthi/tickvault.git /opt/tickvault/repo
 
 # Start Docker Compose stack (QuestDB, Valkey, Prometheus, Grafana, etc)
-cd /opt/dlt/repo/deploy/docker
+cd /opt/tickvault/repo/deploy/docker
 sudo -u ubuntu docker compose up -d
 
 # Install systemd unit (binary drops in via GitHub Actions after first deploy)
-cp /opt/dlt/repo/deploy/systemd/dlt-app.service /etc/systemd/system/
+cp /opt/tickvault/repo/deploy/systemd/tickvault.service /etc/systemd/system/
 systemctl daemon-reload
 
 echo "=== dlt user-data complete at $(date -u) ==="

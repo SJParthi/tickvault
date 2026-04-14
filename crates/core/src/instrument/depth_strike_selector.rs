@@ -7,10 +7,10 @@
 //! When spot price moves beyond a threshold (e.g., ±3 strikes from previous ATM),
 //! the depth connection unsubscribes old strikes and subscribes new ATM ± N.
 
-use dhan_live_trader_common::instrument_types::{
+use tickvault_common::instrument_types::{
     FnoUniverse, OptionChain, OptionChainEntry, OptionChainKey,
 };
-use dhan_live_trader_common::types::SecurityId;
+use tickvault_common::types::SecurityId;
 
 use chrono::NaiveDate;
 
@@ -245,7 +245,7 @@ fn find_put_at_strike(puts: &[OptionChainEntry], strike_price: f64) -> Option<&O
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dhan_live_trader_common::instrument_types::OptionChainEntry;
+    use tickvault_common::instrument_types::OptionChainEntry;
 
     fn make_chain(strikes: &[f64], underlying: &str, expiry: NaiveDate) -> OptionChain {
         let calls: Vec<OptionChainEntry> = strikes

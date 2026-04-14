@@ -1,5 +1,5 @@
 [package]
-name = "dhan-live-trader-fuzz"
+name = "tickvault-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2024"
@@ -11,8 +11,8 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4.9"
 toml = "1.0.4"
-dhan-live-trader-core = { path = "../crates/core" }
-dhan-live-trader-common = { path = "../crates/common" }
+tickvault-core = { path = "../crates/core" }
+tickvault-common = { path = "../crates/common" }
 
 [[bin]]
 name = "tick_parser"

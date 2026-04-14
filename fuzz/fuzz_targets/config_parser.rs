@@ -7,7 +7,7 @@
 
 use libfuzzer_sys::fuzz_target;
 
-use dhan_live_trader_common::config::ApplicationConfig;
+use tickvault_common::config::ApplicationConfig;
 
 /// Maximum config input size (64 KiB). Real config files are ~2 KiB.
 /// Limits stack depth the TOML parser can reach, preventing stack overflow

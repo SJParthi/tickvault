@@ -15,8 +15,8 @@
 //! - OBV: Running sum with close-vs-prev direction
 //! - VWAP: Cumulative (price × volume) / cumulative volume
 
-use dhan_live_trader_common::constants::MAX_INDICATOR_INSTRUMENTS;
-use dhan_live_trader_common::tick_types::ParsedTick;
+use tickvault_common::constants::MAX_INDICATOR_INSTRUMENTS;
+use tickvault_common::tick_types::ParsedTick;
 
 use super::types::{IndicatorParams, IndicatorSnapshot, IndicatorState};
 
@@ -415,7 +415,7 @@ impl IndicatorEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dhan_live_trader_common::constants::MAX_INDICATOR_WARMUP_TICKS;
+    use tickvault_common::constants::MAX_INDICATOR_WARMUP_TICKS;
 
     fn make_tick(security_id: u32, ltp: f32, high: f32, low: f32, volume: u32) -> ParsedTick {
         ParsedTick {

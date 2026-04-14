@@ -1,5 +1,5 @@
 # =============================================================================
-# dhan-live-trader — Rust Formatter Configuration
+# tickvault — Rust Formatter Configuration
 # =============================================================================
 # Used by `cargo fmt`. Matches CLAUDE.md coding standards.
 # IntelliJ reads this automatically when using the Rust plugin.

@@ -2,7 +2,7 @@
 
 > **Target date:** May 1, 2026 — AWS go-live.
 > **Owner:** Parthiban (you).
-> **Scope:** Everything from "no AWS account" to "dlt-app running in ap-south-1".
+> **Scope:** Everything from "no AWS account" to "tickvault running in ap-south-1".
 
 This runbook covers the **one-time** steps that only a human can do
 (creating accounts, attaching credit cards, clicking "I accept"). After
@@ -21,9 +21,9 @@ this runbook is complete, ongoing deploys are fully automated via the
 
 1. **Create AWS account**
    - Go to https://aws.amazon.com/ and click **Create an AWS Account**
-   - Email: use a dedicated one (e.g., `dlt-ops@yourdomain.com`)
+   - Email: use a dedicated one (e.g., `tv-ops@yourdomain.com`)
    - Password: 16+ characters, stored in a password manager
-   - Account name: `dlt-prod`
+   - Account name: `tv-prod`
    - Payment: attach the Indian credit card. AWS pre-authorises Rs 2
      as verification — this gets refunded.
 2. **Enable MFA on the root user immediately**
@@ -32,7 +32,7 @@ this runbook is complete, ongoing deploys are fully automated via the
    - **After this step, lock the root credentials away. You will
      almost never use root again.**
 3. **Create an IAM user for ongoing operations**
-   - IAM → Users → Create user → `dlt-admin`
+   - IAM → Users → Create user → `tv-admin`
    - Enable programmatic access + console access
    - Attach policy: `AdministratorAccess` (we'll narrow later)
    - Enable MFA on this user too
@@ -67,10 +67,10 @@ this runbook is complete, ongoing deploys are fully automated via the
 1. **Create the EC2 key pair**
    ```bash
    aws ec2 create-key-pair \
-     --key-name dlt-prod-key \
+     --key-name tv-prod-key \
      --region ap-south-1 \
-     --query KeyMaterial --output text > ~/.ssh/dlt-prod-key.pem
-   chmod 400 ~/.ssh/dlt-prod-key.pem
+     --query KeyMaterial --output text > ~/.ssh/tv-prod-key.pem
+   chmod 400 ~/.ssh/tv-prod-key.pem
    ```
 2. **Look up the latest Ubuntu 24.04 AMI in ap-south-1**
    ```bash
@@ -85,25 +85,25 @@ this runbook is complete, ongoing deploys are fully automated via the
    ```bash
    aws ssm put-parameter \
      --region ap-south-1 \
-     --name /dlt/prod/dhan/client-id \
+     --name /tickvault/prod/dhan/client-id \
      --type SecureString \
      --value 'YOUR_DHAN_CLIENT_ID'
 
    aws ssm put-parameter \
      --region ap-south-1 \
-     --name /dlt/prod/dhan/totp-secret \
+     --name /tickvault/prod/dhan/totp-secret \
      --type SecureString \
      --value 'YOUR_TOTP_BASE32_SECRET'
 
    aws ssm put-parameter \
      --region ap-south-1 \
-     --name /dlt/prod/telegram/bot-token \
+     --name /tickvault/prod/telegram/bot-token \
      --type SecureString \
      --value 'YOUR_TELEGRAM_BOT_TOKEN'
 
    aws ssm put-parameter \
      --region ap-south-1 \
-     --name /dlt/prod/telegram/chat-id \
+     --name /tickvault/prod/telegram/chat-id \
      --type SecureString \
      --value 'YOUR_CHAT_ID'
    ```
@@ -164,7 +164,7 @@ curl https://api.dhan.co/v2/ip/getIP \
 ## Phase 5 — First Deploy (~10 minutes, automated)
 
 1. **Configure GitHub Actions OIDC role**
-   - Create an IAM role `dlt-github-deploy-role` that the
+   - Create an IAM role `tv-github-deploy-role` that the
      GitHub Actions workflow can assume. See `docs/runbooks/github-oidc-setup.md`
      (TODO — for now, use long-lived credentials as a temporary workaround).
 2. **Store GitHub secrets**
@@ -181,27 +181,27 @@ curl https://api.dhan.co/v2/ip/getIP \
      --region ap-south-1 \
      --target $(terraform -chdir=deploy/aws/terraform output -raw instance_id)
    # In the session:
-   systemctl status dlt-app
-   journalctl -u dlt-app -f
+   systemctl status tickvault
+   journalctl -u tickvault -f
    ```
 
 ## Phase 6 — Smoke Test (~5 minutes)
 
 1. **Check Grafana is reachable**
-   - SSH port-forward: `ssh -L 3000:localhost:3000 -i ~/.ssh/dlt-prod-key.pem ubuntu@$EIP`
+   - SSH port-forward: `ssh -L 3000:localhost:3000 -i ~/.ssh/tv-prod-key.pem ubuntu@$EIP`
    - Browse to http://localhost:3000 (admin/admin first login)
    - Verify the 4 dashboards load and show data
-2. **Verify Prometheus scrapes dlt-app**
-   - Grafana → Explore → Prometheus datasource → `dlt_questdb_connected`
+2. **Verify Prometheus scrapes tv-app**
+   - Grafana → Explore → Prometheus datasource → `tv_questdb_connected`
    - Should return 1.0
 3. **Verify Telegram alerts**
    - Trigger a test alert: stop QuestDB temporarily
      ```bash
-     docker stop dlt-questdb
+     docker stop tv-questdb
      sleep 40  # wait for S3-1 30s degraded threshold
      ```
    - Confirm Telegram receives the CRITICAL alert
-   - Restart QuestDB: `docker start dlt-questdb`
+   - Restart QuestDB: `docker start tv-questdb`
 
 ## Phase 7 — Schedule Validation (~5 minutes)
 
@@ -209,7 +209,7 @@ The EventBridge rules should auto-start/stop the instance per the budget
 schedule. Verify they're installed:
 
 ```bash
-aws events list-rules --region ap-south-1 --name-prefix dlt-prod
+aws events list-rules --region ap-south-1 --name-prefix tv-prod
 # Expected: 4 rules (weekday-start, weekday-stop, weekend-start, weekend-stop)
 ```
 

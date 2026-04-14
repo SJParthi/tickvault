@@ -3,8 +3,8 @@
 //! Dhan limits each subscription message to 100 instruments. This module
 //! splits a list of instruments into batched JSON messages ready to send.
 
-use dhan_live_trader_common::constants::SUBSCRIPTION_BATCH_SIZE;
-use dhan_live_trader_common::types::{ExchangeSegment, FeedMode};
+use tickvault_common::constants::SUBSCRIPTION_BATCH_SIZE;
+use tickvault_common::types::{ExchangeSegment, FeedMode};
 
 use crate::websocket::types::{
     InstrumentSubscription, SubscriptionRequest, TwoHundredDepthSubscriptionRequest,
@@ -17,9 +17,9 @@ use crate::websocket::types::{
 /// - Full   → 21
 fn feed_mode_to_subscribe_code(mode: FeedMode) -> u8 {
     match mode {
-        FeedMode::Ticker => dhan_live_trader_common::constants::FEED_REQUEST_TICKER,
-        FeedMode::Quote => dhan_live_trader_common::constants::FEED_REQUEST_QUOTE,
-        FeedMode::Full => dhan_live_trader_common::constants::FEED_REQUEST_FULL,
+        FeedMode::Ticker => tickvault_common::constants::FEED_REQUEST_TICKER,
+        FeedMode::Quote => tickvault_common::constants::FEED_REQUEST_QUOTE,
+        FeedMode::Full => tickvault_common::constants::FEED_REQUEST_FULL,
     }
 }
 
@@ -31,9 +31,9 @@ fn feed_mode_to_subscribe_code(mode: FeedMode) -> u8 {
 /// - Full   → 22
 fn feed_mode_to_unsubscribe_code(mode: FeedMode) -> u8 {
     match mode {
-        FeedMode::Ticker => dhan_live_trader_common::constants::FEED_UNSUBSCRIBE_TICKER,
-        FeedMode::Quote => dhan_live_trader_common::constants::FEED_UNSUBSCRIBE_QUOTE,
-        FeedMode::Full => dhan_live_trader_common::constants::FEED_UNSUBSCRIBE_FULL,
+        FeedMode::Ticker => tickvault_common::constants::FEED_UNSUBSCRIBE_TICKER,
+        FeedMode::Quote => tickvault_common::constants::FEED_UNSUBSCRIBE_QUOTE,
+        FeedMode::Full => tickvault_common::constants::FEED_UNSUBSCRIBE_FULL,
     }
 }
 
@@ -115,7 +115,7 @@ pub fn build_unsubscription_messages(
 /// This closes the WebSocket connection gracefully on the server side.
 pub fn build_disconnect_message() -> String {
     serde_json::json!({
-        "RequestCode": dhan_live_trader_common::constants::FEED_REQUEST_DISCONNECT
+        "RequestCode": tickvault_common::constants::FEED_REQUEST_DISCONNECT
     })
     .to_string() // O(1) EXEMPT: disconnect message — once at shutdown
 }
@@ -141,7 +141,7 @@ pub fn build_twenty_depth_subscription_messages(
     }
 
     let effective_batch = batch_size.clamp(1, SUBSCRIPTION_BATCH_SIZE);
-    let request_code = dhan_live_trader_common::constants::FEED_REQUEST_TWENTY_DEPTH;
+    let request_code = tickvault_common::constants::FEED_REQUEST_TWENTY_DEPTH;
 
     #[allow(clippy::expect_used)] // APPROVED: SubscriptionRequest is infallible to serialize
     instruments
@@ -171,7 +171,7 @@ pub fn build_twenty_depth_unsubscription_messages(
     }
 
     let effective_batch = batch_size.clamp(1, SUBSCRIPTION_BATCH_SIZE);
-    let unsubscribe_code = dhan_live_trader_common::constants::FEED_UNSUBSCRIBE_TWENTY_DEPTH;
+    let unsubscribe_code = tickvault_common::constants::FEED_UNSUBSCRIBE_TWENTY_DEPTH;
 
     #[allow(clippy::expect_used)] // APPROVED: SubscriptionRequest is infallible to serialize
     instruments
@@ -209,7 +209,7 @@ pub fn build_two_hundred_depth_subscription_message(
     validate_depth_segment(segment)?;
 
     let request = TwoHundredDepthSubscriptionRequest {
-        request_code: dhan_live_trader_common::constants::FEED_REQUEST_TWENTY_DEPTH, // 23 for both 20 and 200 depth
+        request_code: tickvault_common::constants::FEED_REQUEST_TWENTY_DEPTH, // 23 for both 20 and 200 depth
         exchange_segment: segment.as_str().to_string(),
         security_id: security_id.to_string(),
     };
@@ -233,7 +233,7 @@ pub fn build_two_hundred_depth_unsubscription_message(
     validate_depth_segment(segment)?;
 
     let request = TwoHundredDepthSubscriptionRequest {
-        request_code: dhan_live_trader_common::constants::FEED_UNSUBSCRIBE_TWENTY_DEPTH, // 25
+        request_code: tickvault_common::constants::FEED_UNSUBSCRIBE_TWENTY_DEPTH, // 25
         exchange_segment: segment.as_str().to_string(),
         security_id: security_id.to_string(),
     };
@@ -272,7 +272,7 @@ pub fn validate_depth_segment(segment: ExchangeSegment) -> Result<(), String> {
 #[allow(clippy::arithmetic_side_effects)] // APPROVED: test code
 mod tests {
     use super::*;
-    use dhan_live_trader_common::types::ExchangeSegment;
+    use tickvault_common::types::ExchangeSegment;
 
     fn make_instruments(count: usize) -> Vec<InstrumentSubscription> {
         (0..count)

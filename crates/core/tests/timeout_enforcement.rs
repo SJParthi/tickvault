@@ -11,7 +11,7 @@ use std::time::Duration;
 
 /// Returns true when running under instrumented builds.
 fn skip_perf_assertions() -> bool {
-    std::env::var("DLT_SKIP_PERF_ASSERTIONS").is_ok()
+    std::env::var("TV_SKIP_PERF_ASSERTIONS").is_ok()
 }
 
 use tokio::time::timeout;

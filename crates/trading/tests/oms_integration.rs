@@ -10,14 +10,14 @@
 //! - Modify and cancel flows
 //! - Daily reset
 
-use dhan_live_trader_common::order_types::{
+use secrecy::SecretString;
+use tickvault_common::order_types::{
     OrderStatus, OrderType, OrderUpdate, OrderValidity, ProductType, TransactionType,
 };
-use dhan_live_trader_trading::oms::api_client::OrderApiClient;
-use dhan_live_trader_trading::oms::engine::{OrderManagementSystem, TokenProvider};
-use dhan_live_trader_trading::oms::rate_limiter::OrderRateLimiter;
-use dhan_live_trader_trading::oms::types::{ModifyOrderRequest, OmsError, PlaceOrderRequest};
-use secrecy::SecretString;
+use tickvault_trading::oms::api_client::OrderApiClient;
+use tickvault_trading::oms::engine::{OrderManagementSystem, TokenProvider};
+use tickvault_trading::oms::rate_limiter::OrderRateLimiter;
+use tickvault_trading::oms::types::{ModifyOrderRequest, OmsError, PlaceOrderRequest};
 
 // ---------------------------------------------------------------------------
 // Test Token Provider

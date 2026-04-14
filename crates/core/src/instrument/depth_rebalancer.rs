@@ -20,7 +20,7 @@ use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
 use super::depth_strike_selector::{DEPTH_REBALANCE_STRIKE_THRESHOLD, should_rebalance};
-use dhan_live_trader_common::instrument_types::{FnoUniverse, OptionChainKey};
+use tickvault_common::instrument_types::{FnoUniverse, OptionChainKey};
 
 /// Rebalance check interval (seconds). Checks spot drift every 60 seconds.
 const REBALANCE_CHECK_INTERVAL_SECS: u64 = 60;
@@ -126,13 +126,13 @@ pub async fn run_depth_rebalancer(
         }
 
         // O2: Heartbeat — proves the rebalancer loop is alive.
-        metrics::gauge!("dlt_depth_rebalancer_active").set(1.0);
+        metrics::gauge!("tv_depth_rebalancer_active").set(1.0);
 
         // Recompute today each iteration to handle midnight crossover correctly
         let today = {
             let now_utc = chrono::Utc::now().timestamp();
             let now_ist = now_utc.saturating_add(i64::from(
-                dhan_live_trader_common::constants::IST_UTC_OFFSET_SECONDS,
+                tickvault_common::constants::IST_UTC_OFFSET_SECONDS,
             ));
             chrono::DateTime::from_timestamp(now_ist, 0)
                 .map(|dt| dt.date_naive())

@@ -4,10 +4,10 @@
 //! and functions that should NEVER panic don't even with extreme inputs.
 //! Critical for a trading system where an unhandled panic = process crash.
 
-use dhan_live_trader_common::tick_types::DeepDepthLevel;
-use dhan_live_trader_trading::indicator::obi::compute_obi;
-use dhan_live_trader_trading::indicator::types::{IndicatorParams, IndicatorState, RingBuffer};
-use dhan_live_trader_trading::risk::engine::RiskEngine;
+use tickvault_common::tick_types::DeepDepthLevel;
+use tickvault_trading::indicator::obi::compute_obi;
+use tickvault_trading::indicator::types::{IndicatorParams, IndicatorState, RingBuffer};
+use tickvault_trading::risk::engine::RiskEngine;
 
 // ---------------------------------------------------------------------------
 // Must NOT panic: RiskEngine with extreme inputs
@@ -130,7 +130,7 @@ fn no_panic_indicator_state_new_is_cold() {
 #[test]
 fn no_panic_parser_all_zeros() {
     let packet = vec![0u8; 256];
-    let result = dhan_live_trader_core::parser::dispatch_frame(&packet, 0);
+    let result = tickvault_core::parser::dispatch_frame(&packet, 0);
     // Unknown response code 0 — should return error, not panic
     assert!(result.is_err());
 }
@@ -138,7 +138,7 @@ fn no_panic_parser_all_zeros() {
 #[test]
 fn no_panic_parser_all_ones() {
     let packet = vec![0xFF_u8; 256];
-    let result = dhan_live_trader_core::parser::dispatch_frame(&packet, 0);
+    let result = tickvault_core::parser::dispatch_frame(&packet, 0);
     assert!(result.is_err());
 }
 
@@ -146,7 +146,7 @@ fn no_panic_parser_all_ones() {
 fn no_panic_parser_single_byte() {
     for byte in 0..=255_u8 {
         let packet = vec![byte];
-        let result = dhan_live_trader_core::parser::dispatch_frame(&packet, 0);
+        let result = tickvault_core::parser::dispatch_frame(&packet, 0);
         // Must always return Err, never panic
         assert!(result.is_err());
     }
@@ -159,7 +159,7 @@ fn no_panic_parser_max_size_garbage() {
     packet[0] = 2; // RESPONSE_CODE_TICKER
     packet[1..3].copy_from_slice(&16_u16.to_le_bytes());
     // Rest is zeros — should parse as ticker with zero values, not panic
-    let result = dhan_live_trader_core::parser::dispatch_frame(&packet, 0);
+    let result = tickvault_core::parser::dispatch_frame(&packet, 0);
     assert!(result.is_ok());
 }
 
@@ -169,7 +169,7 @@ fn no_panic_parser_max_size_garbage() {
 
 #[test]
 fn no_panic_oms_error_display_all_variants() {
-    use dhan_live_trader_trading::oms::types::OmsError;
+    use tickvault_trading::oms::types::OmsError;
 
     let errors: Vec<OmsError> = vec![
         OmsError::RiskRejected {

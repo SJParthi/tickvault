@@ -13,7 +13,7 @@ use deadpool_redis::{Config, Pool, Runtime};
 use redis::AsyncCommands;
 use tracing::{debug, info, warn};
 
-use dhan_live_trader_common::config::ValkeyConfig;
+use tickvault_common::config::ValkeyConfig;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -215,9 +215,9 @@ impl ValkeyPool {
             result
         };
 
-        metrics::counter!("dlt_valkey_ops_total", "op" => "get").increment(1);
+        metrics::counter!("tv_valkey_ops_total", "op" => "get").increment(1);
         if result.is_err() {
-            metrics::counter!("dlt_valkey_errors_total", "op" => "get").increment(1);
+            metrics::counter!("tv_valkey_errors_total", "op" => "get").increment(1);
         }
 
         result
@@ -249,9 +249,9 @@ impl ValkeyPool {
             result
         };
 
-        metrics::counter!("dlt_valkey_ops_total", "op" => "set").increment(1);
+        metrics::counter!("tv_valkey_ops_total", "op" => "set").increment(1);
         if result.is_err() {
-            metrics::counter!("dlt_valkey_errors_total", "op" => "set").increment(1);
+            metrics::counter!("tv_valkey_errors_total", "op" => "set").increment(1);
         }
 
         result
@@ -274,9 +274,9 @@ impl ValkeyPool {
             .await
             .with_context(|| format!("Valkey SETEX failed for key={key}"));
 
-        metrics::counter!("dlt_valkey_ops_total", "op" => "set").increment(1);
+        metrics::counter!("tv_valkey_ops_total", "op" => "set").increment(1);
         if result.is_err() {
-            metrics::counter!("dlt_valkey_errors_total", "op" => "set").increment(1);
+            metrics::counter!("tv_valkey_errors_total", "op" => "set").increment(1);
         }
 
         result
@@ -291,9 +291,9 @@ impl ValkeyPool {
             .await
             .with_context(|| format!("Valkey DEL failed for key={key}"));
 
-        metrics::counter!("dlt_valkey_ops_total", "op" => "del").increment(1);
+        metrics::counter!("tv_valkey_ops_total", "op" => "del").increment(1);
         if result.is_err() {
-            metrics::counter!("dlt_valkey_errors_total", "op" => "del").increment(1);
+            metrics::counter!("tv_valkey_errors_total", "op" => "del").increment(1);
         }
 
         result
@@ -308,9 +308,9 @@ impl ValkeyPool {
             .await
             .with_context(|| format!("Valkey EXISTS failed for key={key}"));
 
-        metrics::counter!("dlt_valkey_ops_total", "op" => "exists").increment(1);
+        metrics::counter!("tv_valkey_ops_total", "op" => "exists").increment(1);
         if result.is_err() {
-            metrics::counter!("dlt_valkey_errors_total", "op" => "exists").increment(1);
+            metrics::counter!("tv_valkey_errors_total", "op" => "exists").increment(1);
         }
 
         result
@@ -331,9 +331,9 @@ impl ValkeyPool {
             .await
             .with_context(|| format!("Valkey SET NX EX failed for key={key}"));
 
-        metrics::counter!("dlt_valkey_ops_total", "op" => "set").increment(1);
+        metrics::counter!("tv_valkey_ops_total", "op" => "set").increment(1);
         if result.is_err() {
-            metrics::counter!("dlt_valkey_errors_total", "op" => "set").increment(1);
+            metrics::counter!("tv_valkey_errors_total", "op" => "set").increment(1);
         }
 
         Ok(result?.is_some())
@@ -358,13 +358,13 @@ mod tests {
     #[test]
     fn valkey_url_format_correct() {
         let config = ValkeyConfig {
-            host: "dlt-valkey".to_string(),
+            host: "tv-valkey".to_string(),
             port: 6379,
             max_connections: 16,
             password: String::new(),
         };
         let url = format!("redis://{}:{}", config.host, config.port);
-        assert_eq!(url, "redis://dlt-valkey:6379");
+        assert_eq!(url, "redis://tv-valkey:6379");
     }
 
     #[test]
@@ -450,7 +450,7 @@ mod tests {
     #[test]
     fn url_uses_redis_scheme() {
         let config = ValkeyConfig {
-            host: "dlt-valkey".to_string(),
+            host: "tv-valkey".to_string(),
             port: 6379,
             max_connections: 16,
             password: String::new(),
@@ -487,7 +487,7 @@ mod tests {
     #[test]
     fn url_format_with_docker_hostname() {
         let config = ValkeyConfig {
-            host: "dlt-valkey".to_string(),
+            host: "tv-valkey".to_string(),
             port: 6379,
             max_connections: 16,
             password: String::new(),
@@ -498,7 +498,7 @@ mod tests {
             !url.contains("localhost"),
             "production URLs must use Docker DNS, not localhost"
         );
-        assert_eq!(url, "redis://dlt-valkey:6379");
+        assert_eq!(url, "redis://tv-valkey:6379");
     }
 
     #[test]
@@ -577,7 +577,7 @@ mod tests {
     #[test]
     fn url_never_contains_password_in_basic_config() {
         let config = ValkeyConfig {
-            host: "dlt-valkey".to_string(),
+            host: "tv-valkey".to_string(),
             port: 6379,
             max_connections: 16,
             password: String::new(),
@@ -593,8 +593,8 @@ mod tests {
 
     #[test]
     fn test_build_valkey_url_default() {
-        let url = build_valkey_url("dlt-valkey", 6379, "");
-        assert_eq!(url, "redis://dlt-valkey:6379");
+        let url = build_valkey_url("tv-valkey", 6379, "");
+        assert_eq!(url, "redis://tv-valkey:6379");
     }
 
     #[test]
@@ -623,14 +623,14 @@ mod tests {
 
     #[test]
     fn test_build_valkey_url_with_password() {
-        let url = build_valkey_url("dlt-valkey", 6379, "test-pass");
-        assert_eq!(url, "redis://:test-pass@dlt-valkey:6379");
+        let url = build_valkey_url("tv-valkey", 6379, "test-pass");
+        assert_eq!(url, "redis://:test-pass@tv-valkey:6379");
     }
 
     #[test]
     fn test_build_valkey_url_empty_password_no_auth() {
-        let url = build_valkey_url("dlt-valkey", 6379, "");
-        assert_eq!(url, "redis://dlt-valkey:6379");
+        let url = build_valkey_url("tv-valkey", 6379, "");
+        assert_eq!(url, "redis://tv-valkey:6379");
         assert!(!url.contains('@'));
     }
 
@@ -951,7 +951,7 @@ mod tests {
     #[test]
     fn test_pool_new_returns_ok_with_typical_config() {
         let config = ValkeyConfig {
-            host: "dlt-valkey".to_string(),
+            host: "tv-valkey".to_string(),
             port: 6379,
             max_connections: 16,
             password: String::new(),
@@ -971,7 +971,7 @@ mod tests {
     }
 
     #[test]
-    fn test_all_key_builders_use_dlt_prefix() {
+    fn test_all_key_builders_use_tv_prefix() {
         let instrument = build_instrument_cache_key("test");
         let token = build_token_cache_key("test");
         let tick = build_tick_cache_key(1, "test");
@@ -1213,14 +1213,14 @@ mod tests {
     fn test_valkey_metrics_emitted() {
         // Verify metrics macros compile and don't panic when invoked.
         // O(1) atomic counter calls — safe for hot path.
-        metrics::counter!("dlt_valkey_ops_total", "op" => "get").increment(1);
-        metrics::counter!("dlt_valkey_ops_total", "op" => "set").increment(1);
-        metrics::counter!("dlt_valkey_ops_total", "op" => "del").increment(1);
-        metrics::counter!("dlt_valkey_ops_total", "op" => "exists").increment(1);
-        metrics::counter!("dlt_valkey_errors_total", "op" => "get").increment(1);
-        metrics::counter!("dlt_valkey_errors_total", "op" => "set").increment(1);
-        metrics::counter!("dlt_valkey_errors_total", "op" => "del").increment(1);
-        metrics::counter!("dlt_valkey_errors_total", "op" => "exists").increment(1);
+        metrics::counter!("tv_valkey_ops_total", "op" => "get").increment(1);
+        metrics::counter!("tv_valkey_ops_total", "op" => "set").increment(1);
+        metrics::counter!("tv_valkey_ops_total", "op" => "del").increment(1);
+        metrics::counter!("tv_valkey_ops_total", "op" => "exists").increment(1);
+        metrics::counter!("tv_valkey_errors_total", "op" => "get").increment(1);
+        metrics::counter!("tv_valkey_errors_total", "op" => "set").increment(1);
+        metrics::counter!("tv_valkey_errors_total", "op" => "del").increment(1);
+        metrics::counter!("tv_valkey_errors_total", "op" => "exists").increment(1);
     }
 
     // -----------------------------------------------------------------------
@@ -1261,7 +1261,7 @@ mod tests {
         let Some(pool) = test_pool().await else {
             return;
         };
-        let key = "dlt_test_set_get_roundtrip";
+        let key = "tv_test_set_get_roundtrip";
 
         pool.set(key, "hello_world").await.unwrap();
         let val = pool.get(key).await.unwrap();
@@ -1276,7 +1276,7 @@ mod tests {
         let Some(pool) = test_pool().await else {
             return;
         };
-        let val = pool.get("dlt_test_nonexistent_key_xyz").await.unwrap();
+        let val = pool.get("tv_test_nonexistent_key_xyz").await.unwrap();
         assert_eq!(val, None, "GET on missing key must return None");
     }
 
@@ -1285,7 +1285,7 @@ mod tests {
         let Some(pool) = test_pool().await else {
             return;
         };
-        let key = "dlt_test_set_ex";
+        let key = "tv_test_set_ex";
 
         pool.set_ex(key, "with_ttl", 300).await.unwrap();
         let exists = pool.exists(key).await.unwrap();
@@ -1303,7 +1303,7 @@ mod tests {
         let Some(pool) = test_pool().await else {
             return;
         };
-        let key = "dlt_test_del";
+        let key = "tv_test_del";
 
         pool.set(key, "to_be_deleted").await.unwrap();
         let exists_before = pool.exists(key).await.unwrap();
@@ -1319,7 +1319,7 @@ mod tests {
         let Some(pool) = test_pool().await else {
             return;
         };
-        let exists = pool.exists("dlt_test_does_not_exist").await.unwrap();
+        let exists = pool.exists("tv_test_does_not_exist").await.unwrap();
         assert!(!exists, "EXISTS on missing key must return false");
     }
 
@@ -1328,7 +1328,7 @@ mod tests {
         let Some(pool) = test_pool().await else {
             return;
         };
-        let key = "dlt_test_set_nx_ex";
+        let key = "tv_test_set_nx_ex";
 
         // Ensure clean state.
         let _ = pool.del(key).await;
@@ -1350,7 +1350,7 @@ mod tests {
         let Some(pool) = test_pool().await else {
             return;
         };
-        let key = "dlt_test_overwrite";
+        let key = "tv_test_overwrite";
 
         pool.set(key, "first").await.unwrap();
         pool.set(key, "second").await.unwrap();
@@ -1414,8 +1414,8 @@ mod tests {
 
     #[test]
     fn test_build_valkey_url_docker_dns() {
-        let url = build_valkey_url("dlt-valkey", 6379, "");
-        assert_eq!(url, "redis://dlt-valkey:6379");
+        let url = build_valkey_url("tv-valkey", 6379, "");
+        assert_eq!(url, "redis://tv-valkey:6379");
     }
 
     #[test]
@@ -1476,8 +1476,8 @@ mod tests {
     #[test]
     fn test_build_valkey_url_format() {
         assert_eq!(
-            build_valkey_url("dlt-valkey", 6379, ""),
-            "redis://dlt-valkey:6379"
+            build_valkey_url("tv-valkey", 6379, ""),
+            "redis://tv-valkey:6379"
         );
         assert_eq!(
             build_valkey_url("localhost", 6380, ""),
@@ -1953,8 +1953,8 @@ mod tests {
             "redis://10.0.0.1:6380"
         );
         assert_eq!(
-            build_valkey_url("dlt-valkey", 6379, ""),
-            "redis://dlt-valkey:6379"
+            build_valkey_url("tv-valkey", 6379, ""),
+            "redis://tv-valkey:6379"
         );
     }
 

@@ -8,7 +8,7 @@
 {
   "timestamp": "2026-03-15T10:30:45.123456789+05:30",
   "level": "INFO",
-  "target": "dhan_live_trader::websocket_client",
+  "target": "tickvault::websocket_client",
   "span": "process_tick",
   "message": "Tick processed successfully",
   "fields": { "security_id": 12345, "exchange": "NSE", "latency_ns": 8500 }

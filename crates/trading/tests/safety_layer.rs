@@ -12,8 +12,8 @@
 // ===========================================================================
 
 mod capital_protection {
-    use dhan_live_trader_trading::risk::engine::RiskEngine;
-    use dhan_live_trader_trading::risk::types::RiskBreach;
+    use tickvault_trading::risk::engine::RiskEngine;
+    use tickvault_trading::risk::types::RiskBreach;
 
     fn make_engine() -> RiskEngine {
         // 2% max daily loss, 100 lots max, 10L capital
@@ -173,11 +173,11 @@ mod capital_protection {
 mod reconciliation_safety {
     use std::collections::HashMap;
 
-    use dhan_live_trader_common::order_types::{
+    use tickvault_common::order_types::{
         OrderStatus, OrderType, OrderValidity, ProductType, TransactionType,
     };
-    use dhan_live_trader_trading::oms::reconciliation::reconcile_orders;
-    use dhan_live_trader_trading::oms::types::{DhanOrderResponse, ManagedOrder};
+    use tickvault_trading::oms::reconciliation::reconcile_orders;
+    use tickvault_trading::oms::types::{DhanOrderResponse, ManagedOrder};
 
     fn make_managed_order(order_id: &str, status: OrderStatus) -> ManagedOrder {
         ManagedOrder {
@@ -336,7 +336,7 @@ mod reconciliation_safety {
 // ===========================================================================
 
 mod alert_routing {
-    use dhan_live_trader_core::notification::events::{NotificationEvent, Severity};
+    use tickvault_core::notification::events::{NotificationEvent, Severity};
 
     /// SAFETY-B3-01: Critical events have Critical severity.
     #[test]
@@ -451,8 +451,8 @@ mod alert_routing {
 // ===========================================================================
 
 mod never_requirements {
-    use dhan_live_trader_trading::risk::engine::RiskEngine;
-    use dhan_live_trader_trading::risk::types::RiskBreach;
+    use tickvault_trading::risk::engine::RiskEngine;
+    use tickvault_trading::risk::types::RiskBreach;
 
     fn make_engine() -> RiskEngine {
         RiskEngine::new(2.0, 100, 1_000_000.0)
@@ -590,7 +590,7 @@ mod never_requirements {
 // ===========================================================================
 
 mod dhan_validation {
-    use dhan_live_trader_trading::risk::engine::RiskEngine;
+    use tickvault_trading::risk::engine::RiskEngine;
 
     fn make_engine() -> RiskEngine {
         RiskEngine::new(2.0, 100, 1_000_000.0)
@@ -670,8 +670,8 @@ mod dhan_validation {
 // ===========================================================================
 
 mod risk_edge_cases {
-    use dhan_live_trader_trading::risk::engine::RiskEngine;
-    use dhan_live_trader_trading::risk::types::RiskBreach;
+    use tickvault_trading::risk::engine::RiskEngine;
+    use tickvault_trading::risk::types::RiskBreach;
 
     /// SAFETY-EDGE-01: Reversing through zero (long → short) in one fill.
     #[test]
@@ -741,7 +741,7 @@ mod risk_edge_cases {
         // Check order and verify halt reason in rejection
         let result = engine.check_order(1001, 1);
         match result {
-            dhan_live_trader_trading::risk::types::RiskCheck::Rejected { breach, .. } => {
+            tickvault_trading::risk::types::RiskCheck::Rejected { breach, .. } => {
                 assert_eq!(breach, RiskBreach::ManualHalt);
             }
             _ => panic!("must be rejected"),
@@ -766,8 +766,8 @@ mod risk_edge_cases {
 // ===========================================================================
 
 mod proptest_risk {
-    use dhan_live_trader_trading::risk::engine::RiskEngine;
     use proptest::prelude::*;
+    use tickvault_trading::risk::engine::RiskEngine;
 
     proptest! {
         /// Risk engine must never panic for any valid order parameters.
@@ -813,7 +813,7 @@ mod proptest_risk {
 // ===========================================================================
 
 mod dedup_tests {
-    use dhan_live_trader_trading::oms::idempotency::CorrelationTracker;
+    use tickvault_trading::oms::idempotency::CorrelationTracker;
 
     /// OMS-GAP-05: Duplicate correlation IDs must be detectable.
     #[test]
@@ -852,9 +852,9 @@ mod dedup_tests {
 // ===========================================================================
 
 mod determinism_tests {
-    use dhan_live_trader_common::order_types::OrderStatus;
-    use dhan_live_trader_trading::oms::state_machine::is_valid_transition;
-    use dhan_live_trader_trading::risk::engine::RiskEngine;
+    use tickvault_common::order_types::OrderStatus;
+    use tickvault_trading::oms::state_machine::is_valid_transition;
+    use tickvault_trading::risk::engine::RiskEngine;
 
     /// State machine transitions must be deterministic — same input always
     /// produces same output.
@@ -914,7 +914,7 @@ mod determinism_tests {
 // ===========================================================================
 
 mod regression_tests {
-    use dhan_live_trader_trading::risk::engine::RiskEngine;
+    use tickvault_trading::risk::engine::RiskEngine;
 
     /// Regression: zero-lot fill must not corrupt position state.
     #[test]
@@ -981,9 +981,9 @@ mod regression_tests {
 // ===========================================================================
 
 mod proptest_oms_state_machine {
-    use dhan_live_trader_common::order_types::OrderStatus;
-    use dhan_live_trader_trading::oms::state_machine::{is_valid_transition, parse_order_status};
     use proptest::prelude::*;
+    use tickvault_common::order_types::OrderStatus;
+    use tickvault_trading::oms::state_machine::{is_valid_transition, parse_order_status};
 
     /// Generate a random OrderStatus for property testing.
     fn arb_order_status() -> impl Strategy<Value = OrderStatus> {

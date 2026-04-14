@@ -2,7 +2,7 @@
 //!
 //! Format: `<BHBIH>` — Header(8) + DisconnectCode(u16).
 
-use dhan_live_trader_common::constants::{DISCONNECT_OFFSET_CODE, DISCONNECT_PACKET_SIZE};
+use tickvault_common::constants::{DISCONNECT_OFFSET_CODE, DISCONNECT_PACKET_SIZE};
 
 use crate::websocket::types::DisconnectCode;
 
@@ -34,7 +34,7 @@ pub fn parse_disconnect_packet(
 #[allow(clippy::arithmetic_side_effects)] // APPROVED: test helpers use constant offsets
 mod tests {
     use super::*;
-    use dhan_live_trader_common::constants::{
+    use tickvault_common::constants::{
         DATA_API_ACCESS_TOKEN_EXPIRED, DATA_API_ACCESS_TOKEN_INVALID,
         DATA_API_AUTHENTICATION_FAILED, DATA_API_EXCEEDED_ACTIVE_CONNECTIONS,
         DATA_API_INSTRUMENTS_EXCEED_LIMIT, DATA_API_INTERNAL_SERVER_ERROR, DATA_API_NOT_SUBSCRIBED,

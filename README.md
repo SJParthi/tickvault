@@ -1,4 +1,4 @@
-# dhan-live-trader
+# tickvault
 
 O(1) latency live F&O trading system for Indian markets (NSE), built in Rust 2024 Edition.
 
@@ -15,7 +15,7 @@ Binary WebSocket frames from Dhan are parsed in O(1) via fixed-offset `from_le_b
 ## Directory Structure
 
 ```
-dhan-live-trader/
+tickvault/
 ├── Cargo.toml              # Workspace root — all versions pinned
 ├── CLAUDE.md               # Project rules (auto-loaded by Claude Code)
 ├── config/base.toml        # Runtime config (non-secret)
@@ -38,8 +38,8 @@ dhan-live-trader/
 **Prerequisites:** Rust 1.93.1, Docker, Docker Compose
 
 ```bash
-git clone https://github.com/SJParthi/dhan-live-trader.git
-cd dhan-live-trader
+git clone https://github.com/SJParthi/tickvault.git
+cd tickvault
 ./scripts/bootstrap.sh
 docker compose -f deploy/docker-compose.yml up -d
 cargo run

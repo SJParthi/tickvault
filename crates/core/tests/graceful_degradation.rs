@@ -6,7 +6,7 @@
 //!
 //! These test REAL project code (parser, aggregator), not tokio primitives.
 
-use dhan_live_trader_common::constants::{
+use tickvault_common::constants::{
     DISCONNECT_PACKET_SIZE, EXCHANGE_SEGMENT_NSE_FNO, FULL_QUOTE_PACKET_SIZE,
     MARKET_DEPTH_PACKET_SIZE, OI_PACKET_SIZE, PREVIOUS_CLOSE_PACKET_SIZE, QUOTE_PACKET_SIZE,
     RESPONSE_CODE_DISCONNECT, RESPONSE_CODE_FULL, RESPONSE_CODE_MARKET_DEPTH, RESPONSE_CODE_OI,
@@ -42,7 +42,7 @@ fn degradation_parser_truncated_all_packet_types() {
 
     for &(code, expected_size) in test_cases {
         let header = make_header(code);
-        let result = dhan_live_trader_core::parser::dispatch_frame(&header, 0);
+        let result = tickvault_core::parser::dispatch_frame(&header, 0);
 
         if expected_size > 8 {
             assert!(
@@ -73,7 +73,7 @@ fn degradation_parser_handles_garbage_stream() {
     let mut successes = 0_u32;
 
     for frame in &garbage_frames {
-        match dhan_live_trader_core::parser::dispatch_frame(frame, 0) {
+        match tickvault_core::parser::dispatch_frame(frame, 0) {
             Ok(_) => successes = successes.saturating_add(1),
             Err(_) => errors = errors.saturating_add(1),
         }
@@ -96,10 +96,10 @@ fn degradation_parser_recovers_after_bad_frame() {
     let bad = vec![0xFF; 5];
 
     // Parse good → bad → good: parser must recover
-    assert!(dhan_live_trader_core::parser::dispatch_frame(&good, 0).is_ok());
-    assert!(dhan_live_trader_core::parser::dispatch_frame(&bad, 0).is_err());
+    assert!(tickvault_core::parser::dispatch_frame(&good, 0).is_ok());
+    assert!(tickvault_core::parser::dispatch_frame(&bad, 0).is_err());
     assert!(
-        dhan_live_trader_core::parser::dispatch_frame(&good, 0).is_ok(),
+        tickvault_core::parser::dispatch_frame(&good, 0).is_ok(),
         "parser must recover after bad frame"
     );
 }
@@ -110,8 +110,8 @@ fn degradation_parser_recovers_after_bad_frame() {
 
 #[test]
 fn degradation_candle_aggregator_out_of_order_timestamps() {
-    use dhan_live_trader_common::tick_types::ParsedTick;
-    use dhan_live_trader_core::pipeline::candle_aggregator::CandleAggregator;
+    use tickvault_common::tick_types::ParsedTick;
+    use tickvault_core::pipeline::candle_aggregator::CandleAggregator;
 
     let mut agg = CandleAggregator::new();
 
@@ -148,7 +148,7 @@ fn degradation_candle_aggregator_out_of_order_timestamps() {
 
 #[test]
 fn degradation_candle_aggregator_empty_sweep_no_panic() {
-    use dhan_live_trader_core::pipeline::candle_aggregator::CandleAggregator;
+    use tickvault_core::pipeline::candle_aggregator::CandleAggregator;
 
     let mut agg = CandleAggregator::new();
 
@@ -164,8 +164,8 @@ fn degradation_candle_aggregator_empty_sweep_no_panic() {
 
 #[test]
 fn degradation_candle_aggregator_flush_all_then_reuse() {
-    use dhan_live_trader_common::tick_types::ParsedTick;
-    use dhan_live_trader_core::pipeline::candle_aggregator::CandleAggregator;
+    use tickvault_common::tick_types::ParsedTick;
+    use tickvault_core::pipeline::candle_aggregator::CandleAggregator;
 
     let mut agg = CandleAggregator::new();
 

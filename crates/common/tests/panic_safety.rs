@@ -3,8 +3,8 @@
 //! Verifies that public API functions never panic on arbitrary/garbage input.
 //! Part of the 22 test types: Type 13 (Panic Safety).
 
-use dhan_live_trader_common::types::ExchangeSegment;
 use figment::providers::Format;
+use tickvault_common::types::ExchangeSegment;
 
 // ---------------------------------------------------------------------------
 // ExchangeSegment::from_byte — must never panic on any u8 input
@@ -40,10 +40,9 @@ fn exchange_segment_gap_at_6_returns_none() {
 #[test]
 fn config_from_empty_string_does_not_panic() {
     let result = std::panic::catch_unwind(|| {
-        let _: Result<dhan_live_trader_common::config::ApplicationConfig, _> =
-            figment::Figment::new()
-                .merge(figment::providers::Toml::string(""))
-                .extract();
+        let _: Result<tickvault_common::config::ApplicationConfig, _> = figment::Figment::new()
+            .merge(figment::providers::Toml::string(""))
+            .extract();
     });
     assert!(result.is_ok(), "empty TOML must not panic");
 }
@@ -51,10 +50,9 @@ fn config_from_empty_string_does_not_panic() {
 #[test]
 fn config_from_garbage_toml_does_not_panic() {
     let result = std::panic::catch_unwind(|| {
-        let _: Result<dhan_live_trader_common::config::ApplicationConfig, _> =
-            figment::Figment::new()
-                .merge(figment::providers::Toml::string("{{{invalid toml!!!"))
-                .extract();
+        let _: Result<tickvault_common::config::ApplicationConfig, _> = figment::Figment::new()
+            .merge(figment::providers::Toml::string("{{{invalid toml!!!"))
+            .extract();
     });
     assert!(result.is_ok(), "garbage TOML must not panic");
 }
@@ -66,6 +64,6 @@ fn config_from_garbage_toml_does_not_panic() {
 #[test]
 fn segment_code_to_str_all_256_values_no_panic() {
     for code in 0..=u8::MAX {
-        let _ = dhan_live_trader_common::segment::segment_code_to_str(code);
+        let _ = tickvault_common::segment::segment_code_to_str(code);
     }
 }

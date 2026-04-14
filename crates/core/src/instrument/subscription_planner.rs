@@ -23,19 +23,19 @@ use std::collections::{HashMap, HashSet};
 use chrono::NaiveDate;
 use tracing::{debug, info, warn};
 
-use dhan_live_trader_common::config::SubscriptionConfig;
-use dhan_live_trader_common::constants::{FULL_CHAIN_INDEX_SYMBOLS, MAX_TOTAL_SUBSCRIPTIONS};
-use dhan_live_trader_common::instrument_registry::{
+use tickvault_common::config::SubscriptionConfig;
+use tickvault_common::constants::{FULL_CHAIN_INDEX_SYMBOLS, MAX_TOTAL_SUBSCRIPTIONS};
+use tickvault_common::instrument_registry::{
     InstrumentRegistry, SubscribedInstrument, SubscriptionCategory, make_derivative_instrument,
     make_derivative_instrument_from_archived, make_display_index_instrument,
     make_major_index_instrument, make_stock_equity_instrument,
     make_stock_equity_instrument_from_archived,
 };
-use dhan_live_trader_common::instrument_types::{
+use tickvault_common::instrument_types::{
     ArchivedFnoUniverse, DhanInstrumentKind, FnoUniverse, IndexCategory, OptionChainKey,
     UnderlyingKind, naive_date_from_archived_i32,
 };
-use dhan_live_trader_common::types::FeedMode;
+use tickvault_common::types::FeedMode;
 
 // ---------------------------------------------------------------------------
 // Subscription Plan — output of the planner
@@ -156,8 +156,8 @@ pub fn build_subscription_plan(
         for contract in universe.derivative_contracts.values() {
             let is_index = matches!(
                 contract.instrument_kind,
-                dhan_live_trader_common::instrument_types::DhanInstrumentKind::FutureIndex
-                    | dhan_live_trader_common::instrument_types::DhanInstrumentKind::OptionIndex
+                tickvault_common::instrument_types::DhanInstrumentKind::FutureIndex
+                    | tickvault_common::instrument_types::DhanInstrumentKind::OptionIndex
             );
             if is_index
                 && full_chain_set.contains(contract.underlying_symbol.as_str())
@@ -297,15 +297,15 @@ pub fn build_subscription_plan(
         let count_before_stage2 = instruments.len();
 
         let mut remaining_stock_derivatives: Vec<
-            &dhan_live_trader_common::instrument_types::DerivativeContract,
+            &tickvault_common::instrument_types::DerivativeContract,
         > = universe
             .derivative_contracts
             .values()
             .filter(|c| {
                 matches!(
                     c.instrument_kind,
-                    dhan_live_trader_common::instrument_types::DhanInstrumentKind::FutureStock
-                        | dhan_live_trader_common::instrument_types::DhanInstrumentKind::OptionStock
+                    tickvault_common::instrument_types::DhanInstrumentKind::FutureStock
+                        | tickvault_common::instrument_types::DhanInstrumentKind::OptionStock
                 ) && c.expiry_date >= today
                     && !seen_ids.contains(&c.security_id)
             })
@@ -734,12 +734,12 @@ mod tests {
 
     use chrono::Utc;
 
-    use dhan_live_trader_common::instrument_types::*;
-    use dhan_live_trader_common::types::{Exchange, ExchangeSegment, OptionType, SecurityId};
+    use tickvault_common::instrument_types::*;
+    use tickvault_common::types::{Exchange, ExchangeSegment, OptionType, SecurityId};
 
     /// Builds a minimal FnoUniverse for testing.
     fn make_test_universe() -> FnoUniverse {
-        let ist = dhan_live_trader_common::trading_calendar::ist_offset();
+        let ist = tickvault_common::trading_calendar::ist_offset();
         let expiry = NaiveDate::from_ymd_opt(2026, 3, 27).unwrap();
 
         let mut underlyings = HashMap::new();
@@ -1876,7 +1876,7 @@ mod tests {
     #[test]
     fn test_plan_empty_universe() {
         // Completely empty universe — no instruments
-        let ist = dhan_live_trader_common::trading_calendar::ist_offset();
+        let ist = tickvault_common::trading_calendar::ist_offset();
         let universe = FnoUniverse {
             underlyings: HashMap::new(),
             derivative_contracts: HashMap::new(),
@@ -1916,7 +1916,7 @@ mod tests {
     fn test_plan_exceeds_capacity_triggers_warning() {
         // Build a universe with > 25,000 stock derivative contracts to trigger
         // the capacity limit (line 316: break) and warning (lines 346-347).
-        let ist = dhan_live_trader_common::trading_calendar::ist_offset();
+        let ist = tickvault_common::trading_calendar::ist_offset();
         let expiry = NaiveDate::from_ymd_opt(2026, 3, 27).unwrap();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
@@ -2174,7 +2174,7 @@ mod tests {
             "Sectoral",
             "Thematic",
         ];
-        use dhan_live_trader_common::constants::DISPLAY_INDEX_ENTRIES;
+        use tickvault_common::constants::DISPLAY_INDEX_ENTRIES;
         for &(name, _id, subcategory) in DISPLAY_INDEX_ENTRIES {
             assert!(
                 valid.contains(&subcategory),
@@ -2191,7 +2191,7 @@ mod tests {
 
     #[test]
     fn test_display_index_entries_security_ids_non_zero() {
-        use dhan_live_trader_common::constants::DISPLAY_INDEX_ENTRIES;
+        use tickvault_common::constants::DISPLAY_INDEX_ENTRIES;
         for &(name, security_id, _) in DISPLAY_INDEX_ENTRIES {
             assert!(
                 security_id > 0,
@@ -2207,7 +2207,7 @@ mod tests {
 
     #[test]
     fn test_display_index_entries_names_non_empty() {
-        use dhan_live_trader_common::constants::DISPLAY_INDEX_ENTRIES;
+        use tickvault_common::constants::DISPLAY_INDEX_ENTRIES;
         for &(name, _, _) in DISPLAY_INDEX_ENTRIES {
             assert!(
                 !name.trim().is_empty(),
@@ -2233,7 +2233,7 @@ mod tests {
 
         // Serialize → load as archived → build plan from archived types
         let dir = std::env::temp_dir().join(format!(
-            "dlt-test-planner-parity-{}-{:?}",
+            "tv-test-planner-parity-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
@@ -2440,7 +2440,7 @@ mod tests {
         // `instruments.len() >= MAX_TOTAL_SUBSCRIPTIONS` break in Stage 2.
         // We need > 25,000 instruments total. The existing capacity test does
         // this with 50 stocks x 600 options. Here we verify the exact cap behavior.
-        let ist = dhan_live_trader_common::trading_calendar::ist_offset();
+        let ist = tickvault_common::trading_calendar::ist_offset();
         let expiry = NaiveDate::from_ymd_opt(2026, 3, 27).unwrap();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 

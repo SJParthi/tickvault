@@ -20,12 +20,12 @@ use std::time::Instant;
 use chrono::Utc;
 use tracing::{info, warn};
 
-use dhan_live_trader_common::config::IndexConstituencyConfig;
-use dhan_live_trader_common::constants::{
+use tickvault_common::config::IndexConstituencyConfig;
+use tickvault_common::constants::{
     INDEX_CONSTITUENCY_CSV_CACHE_FILENAME, INDEX_CONSTITUENCY_SLUGS,
 };
-use dhan_live_trader_common::instrument_types::{ConstituencyBuildMetadata, IndexConstituencyMap};
-use dhan_live_trader_common::trading_calendar::ist_offset;
+use tickvault_common::instrument_types::{ConstituencyBuildMetadata, IndexConstituencyMap};
+use tickvault_common::trading_calendar::ist_offset;
 
 /// Download index constituency data and build the bidirectional map.
 ///
@@ -134,7 +134,7 @@ pub async fn try_load_cache(cache_dir: &str) -> Option<IndexConstituencyMap> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dhan_live_trader_common::instrument_types::IndexConstituent;
+    use tickvault_common::instrument_types::IndexConstituent;
 
     fn test_config(enabled: bool) -> IndexConstituencyConfig {
         IndexConstituencyConfig {
@@ -147,7 +147,7 @@ mod tests {
 
     fn test_cache_dir(name: &str) -> String {
         let dir = format!(
-            "/tmp/dlt-test-constituency-mod-{}-{}",
+            "/tmp/tv-test-constituency-mod-{}-{}",
             name,
             std::process::id()
         );
@@ -244,7 +244,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_try_load_cache_missing_file_returns_none() {
-        let result = try_load_cache("/tmp/dlt-test-nonexistent-cache-dir-99999").await;
+        let result = try_load_cache("/tmp/tv-test-nonexistent-cache-dir-99999").await;
         assert!(result.is_none());
     }
 

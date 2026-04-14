@@ -17,7 +17,7 @@ use questdb::ingress::{Buffer, Sender, TimestampNanos};
 use reqwest::Client;
 use tracing::{debug, error, info, warn};
 
-use dhan_live_trader_common::config::QuestDbConfig;
+use tickvault_common::config::QuestDbConfig;
 
 // ---------------------------------------------------------------------------
 // Constants

@@ -3,7 +3,7 @@
 //! Format: `<BHBIfHIfIIIIIIffff100s>` — Header(8) + common fields + OI(3×u32) + OHLC(4×f32) + Depth(100 bytes).
 //! CRITICAL: Diverges from Quote at offset 34. Full has OI fields where Quote has OHLC.
 
-use dhan_live_trader_common::constants::{
+use tickvault_common::constants::{
     DEPTH_LEVEL_OFFSET_ASK_ORDERS, DEPTH_LEVEL_OFFSET_ASK_PRICE, DEPTH_LEVEL_OFFSET_ASK_QTY,
     DEPTH_LEVEL_OFFSET_BID_ORDERS, DEPTH_LEVEL_OFFSET_BID_PRICE, DEPTH_LEVEL_OFFSET_BID_QTY,
     FULL_OFFSET_CLOSE, FULL_OFFSET_DEPTH_START, FULL_OFFSET_HIGH, FULL_OFFSET_LOW, FULL_OFFSET_OI,
@@ -12,7 +12,7 @@ use dhan_live_trader_common::constants::{
     QUOTE_OFFSET_LTQ, QUOTE_OFFSET_LTT, QUOTE_OFFSET_TOTAL_BUY_QTY, QUOTE_OFFSET_TOTAL_SELL_QTY,
     QUOTE_OFFSET_VOLUME,
 };
-use dhan_live_trader_common::tick_types::{MarketDepthLevel, ParsedTick};
+use tickvault_common::tick_types::{MarketDepthLevel, ParsedTick};
 
 use super::read_helpers::{read_f32_le, read_u16_le, read_u32_le};
 use super::types::{PacketHeader, ParseError};
@@ -103,7 +103,7 @@ pub fn parse_full_packet(
 #[allow(clippy::arithmetic_side_effects)] // APPROVED: test helpers use constant offsets for packet construction
 mod tests {
     use super::*;
-    use dhan_live_trader_common::constants::EXCHANGE_SEGMENT_NSE_FNO;
+    use tickvault_common::constants::EXCHANGE_SEGMENT_NSE_FNO;
 
     /// Builds a complete 162-byte Full packet.
     #[allow(clippy::too_many_arguments)]

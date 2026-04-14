@@ -7,13 +7,13 @@
 //!
 //! These test REAL project code, not tokio channel primitives.
 
-use dhan_live_trader_common::constants::{
+use tickvault_common::constants::{
     EXCHANGE_SEGMENT_NSE_FNO, QUOTE_PACKET_SIZE, RESPONSE_CODE_QUOTE, RESPONSE_CODE_TICKER,
     TICKER_PACKET_SIZE,
 };
-use dhan_live_trader_common::tick_types::ParsedTick;
-use dhan_live_trader_core::parser::dispatch_frame;
-use dhan_live_trader_core::pipeline::candle_aggregator::CandleAggregator;
+use tickvault_common::tick_types::ParsedTick;
+use tickvault_core::parser::dispatch_frame;
+use tickvault_core::pipeline::candle_aggregator::CandleAggregator;
 
 // ---------------------------------------------------------------------------
 // Helpers — deterministic packet construction

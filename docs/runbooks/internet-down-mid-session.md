@@ -21,7 +21,7 @@ Home internet fails during market hours.
 
 ### Step 4: If reconnect took > 5 minutes
 - Verify position state via reconciliation
-- Run: `cargo run --bin dhan-live-trader -- --reconcile-only`
+- Run: `cargo run --bin tickvault -- --reconcile-only`
 - Do not trust cached state until reconciliation passes
 
 ## System Requirements Verified By Tests

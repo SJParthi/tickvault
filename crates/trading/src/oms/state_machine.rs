@@ -18,7 +18,7 @@
 //! Confirmed → Expired     (end of validity)
 //! ```
 
-use dhan_live_trader_common::order_types::OrderStatus;
+use tickvault_common::order_types::OrderStatus;
 
 /// Validates whether a state transition is valid according to the order lifecycle DAG.
 ///

@@ -1,7 +1,7 @@
 # =============================================================================
-# dhan-live-trader — Traefik Dynamic Configuration (File Provider)
+# tickvault — Traefik Dynamic Configuration (File Provider)
 # =============================================================================
-# Routes all dlt-* services through Traefik. Each service gets a path-based
+# Routes all tv-* services through Traefik. Each service gets a path-based
 # route so everything is accessible through a single entry point.
 #
 # Access pattern:  http://localhost/<service>
@@ -67,22 +67,22 @@ http:
     grafana:
       loadBalancer:
         servers:
-          - url: "http://dlt-grafana:3000"
+          - url: "http://tv-grafana:3000"
 
     prometheus:
       loadBalancer:
         servers:
-          - url: "http://dlt-prometheus:9090"
+          - url: "http://tv-prometheus:9090"
 
     questdb:
       loadBalancer:
         servers:
-          - url: "http://dlt-questdb:9000"
+          - url: "http://tv-questdb:9000"
 
     jaeger:
       loadBalancer:
         servers:
-          - url: "http://dlt-jaeger:16686"
+          - url: "http://tv-jaeger:16686"
 
     # App runs on the host (IntelliJ / cargo run), not inside Docker.
     # host.docker.internal resolves to the Docker host on both macOS and Linux.
@@ -94,7 +94,7 @@ http:
     alloy:
       loadBalancer:
         servers:
-          - url: "http://dlt-alloy:12345"
+          - url: "http://tv-alloy:12345"
 
   # -- Middlewares -------------------------------------------------------------
   middlewares:
@@ -119,8 +119,8 @@ http:
         prefixes: ["/alloy"]
 
     # BasicAuth for dev-mode dashboard protection.
-    # Credentials: admin / dlt-dev-2026 (htpasswd bcrypt).
-    # Override via DLT_TRAEFIK_BASIC_AUTH env var in production.
+    # Credentials: admin / tv-dev-2026 (htpasswd bcrypt).
+    # Override via TV_TRAEFIK_BASIC_AUTH env var in production.
     # Generate new hash: htpasswd -nB admin
     dev-basic-auth:
       basicAuth:

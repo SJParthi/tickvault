@@ -11,11 +11,11 @@
 | Telegram alert: "QuestDB disconnected > 30s" | [§1. QuestDB outage](#1-questdb-outage) |
 | Telegram alert: "Pool watchdog HALT" | [§2. WebSocket pool halted](#2-websocket-pool-halted) |
 | Telegram alert: "Order update WebSocket down > 60s" | [§3. Order update WS down](#3-order-update-ws-down) |
-| systemctl status dlt-app: inactive (crashed) | [§4. App crash, no auto-restart](#4-app-crash-no-auto-restart) |
+| systemctl status tickvault: inactive (crashed) | [§4. App crash, no auto-restart](#4-app-crash-no-auto-restart) |
 | EC2 instance is unreachable (SSH + SSM both fail) | [§5. Instance unreachable](#5-instance-unreachable) |
 | Dhan 807/DH-901 authentication errors | [§6. Token expired](#6-token-expired) |
 | Dhan 805 "too many requests" | [§7. Rate-limited by Dhan](#7-rate-limited-by-dhan) |
-| Disk full on /opt/dlt/data/spill | [§8. Spill disk full](#8-spill-disk-full) |
+| Disk full on /opt/tickvault/data/spill | [§8. Spill disk full](#8-spill-disk-full) |
 | Running instance unexpectedly during 15:30-08:00 IST (off-hours) | [§9. Unexpected running instance](#9-unexpected-running-instance) |
 | 8+ Dependabot CVEs flagged on branch | [§10. Dependabot CVE surge](#10-dependabot-cve-surge) |
 | Need to roll back a bad deploy mid-day | [§11. Emergency rollback](#11-emergency-rollback) |
@@ -24,7 +24,7 @@
 
 ## §1. QuestDB outage
 
-**Symptom:** Telegram `dlt-questdb-disconnected` alert firing. Ticks are
+**Symptom:** Telegram `tv-questdb-disconnected` alert firing. Ticks are
 still being ingested (ring buffer + spill absorbs them), but the
 `ticks` table is not receiving writes.
 
@@ -36,23 +36,23 @@ aws ssm start-session --region ap-south-1 --target $INSTANCE_ID
 
 # 2. Check docker
 sudo -i
-docker ps | grep dlt-questdb
-docker logs --tail 100 dlt-questdb
+docker ps | grep tv-questdb
+docker logs --tail 100 tv-questdb
 
 # 3. If QuestDB is unresponsive, restart it
-docker restart dlt-questdb
+docker restart tv-questdb
 sleep 10
-docker exec dlt-questdb curl -s localhost:9000/exec?query=SELECT+1
+docker exec tv-questdb curl -s localhost:9000/exec?query=SELECT+1
 
 # 4. Watch the writer reconnect
-journalctl -u dlt-app -f | grep -E 'questdb|QuestDB'
+journalctl -u tickvault -f | grep -E 'questdb|QuestDB'
 # Expected: 'S3-1: QuestDB reconnected' within 2s of docker restart
 ```
 
 **What the app is doing while QDB is down** (verified by
 `chaos_questdb_full_session_zero_tick_loss`):
 - Every incoming tick lands in the ring buffer (600,000 capacity)
-- Overflow spills to `/opt/dlt/data/spill/ticks-YYYYMMDD.bin`
+- Overflow spills to `/opt/tickvault/data/spill/ticks-YYYYMMDD.bin`
 - Zero ticks dropped up to ~1 million ticks
 - On reconnect, ring buffer drains first (oldest-first), then spill file replay
 
@@ -62,9 +62,9 @@ journalctl -u dlt-app -f | grep -E 'questdb|QuestDB'
 - **So: QDB can be down for 20 hours and we still lose zero ticks.**
 
 **Do NOT:**
-- `docker kill` dlt-questdb (use `restart` — kill skips the WAL flush)
+- `docker kill` tv-questdb (use `restart` — kill skips the WAL flush)
 - Delete spill files manually — the app replays them on reconnect
-- Restart dlt-app just because QDB is down — the writer handles it itself
+- Restart tickvault just because QDB is down — the writer handles it itself
 
 ---
 
@@ -72,7 +72,7 @@ journalctl -u dlt-app -f | grep -E 'questdb|QuestDB'
 
 **Symptom:** Telegram alert "S4-T1a FATAL: pool watchdog fired Halt
 verdict". The app exited with status 2. systemd should auto-restart
-within 3 seconds per `deploy/systemd/dlt-app.service:Restart=always`.
+within 3 seconds per `deploy/systemd/tickvault.service:Restart=always`.
 
 **Root causes:**
 1. All 5 Dhan WebSocket connections failed repeatedly for >300 seconds
@@ -84,17 +84,17 @@ within 3 seconds per `deploy/systemd/dlt-app.service:Restart=always`.
 ```bash
 # 1. Verify systemd restarted the app
 aws ssm start-session --region ap-south-1 --target $INSTANCE_ID
-systemctl status dlt-app
+systemctl status tickvault
 # Expected: active (running)
 
 # 2. Check how many times it's been restarted today
-journalctl -u dlt-app --since today | grep 'pool watchdog fired Halt' | wc -l
+journalctl -u tickvault --since today | grep 'pool watchdog fired Halt' | wc -l
 
 # 3. If restart loop > 3 in 10 minutes, halt the app to prevent thrashing
-systemctl stop dlt-app
+systemctl stop tickvault
 
 # 4. Investigate
-journalctl -u dlt-app --since '15 minutes ago' | grep -E 'ERROR|FATAL' | tail -50
+journalctl -u tickvault --since '15 minutes ago' | grep -E 'ERROR|FATAL' | tail -50
 ```
 
 **Common causes + fixes:**
@@ -107,7 +107,7 @@ journalctl -u dlt-app --since '15 minutes ago' | grep -E 'ERROR|FATAL' | tail -5
 
 ## §3. Order update WS down
 
-**Symptom:** Telegram alert `dlt-order-update-ws-down` (> 60 seconds
+**Symptom:** Telegram alert `tv-order-update-ws-down` (> 60 seconds
 disconnected). **Fills may be silently lost.**
 
 This is more serious than §2 because fill confirmations arrive on this
@@ -133,18 +133,18 @@ curl -X POST "https://api.dhan.co/v2/killswitch?killSwitchStatus=ACTIVATE" \
 
 ## §4. App crash, no auto-restart
 
-**Symptom:** `systemctl status dlt-app` shows `inactive (dead)` and
+**Symptom:** `systemctl status tickvault` shows `inactive (dead)` and
 Restart counter is high or hit the burst limit.
 
 ```bash
 # 1. Clear the restart burst counter
-systemctl reset-failed dlt-app
+systemctl reset-failed tickvault
 
 # 2. Start manually
-systemctl start dlt-app
+systemctl start tickvault
 
 # 3. Watch the first 60 seconds
-journalctl -u dlt-app -f
+journalctl -u tickvault -f
 ```
 
 If it immediately crashes again, the issue is a code or config bug —
@@ -191,12 +191,12 @@ curl -X POST "https://auth.dhan.co/app/generateAccessToken?dhanClientId=$CID&pin
 # 2. Update SSM parameter
 aws ssm put-parameter \
   --region ap-south-1 \
-  --name /dlt/prod/dhan/access-token \
+  --name /tickvault/prod/dhan/access-token \
   --type SecureString \
   --value "$NEW_TOKEN" --overwrite
 
 # 3. Signal the app to reload
-systemctl restart dlt-app
+systemctl restart tickvault
 ```
 
 ---
@@ -210,34 +210,34 @@ systemctl restart dlt-app
 (S5-A3). If you're seeing 805 despite that, something is wrong — check:
 
 ```bash
-journalctl -u dlt-app --since '10 minutes ago' | grep -E 'DH-904|805'
+journalctl -u tickvault --since '10 minutes ago' | grep -E 'DH-904|805'
 ```
 
 If 805 persists:
 1. **Stop all requests for 60 seconds** (Dhan's mandate after 805)
-2. **Halt the app**: `systemctl stop dlt-app`
+2. **Halt the app**: `systemctl stop tickvault`
 3. **Wait 60 seconds**: `sleep 60`
 4. **Audit connection count**: `GET /v2/ip/getIP` should show 0 active connections
-5. **Restart**: `systemctl start dlt-app`
+5. **Restart**: `systemctl start tickvault`
 
 ---
 
 ## §8. Spill disk full
 
-**Symptom:** Telegram alert `dlt-spill-disk-low-critical` (< 100MB free).
+**Symptom:** Telegram alert `tv-spill-disk-low-critical` (< 100MB free).
 
 ```bash
 # 1. Check disk usage
-df -h /opt/dlt/data/spill
+df -h /opt/tickvault/data/spill
 
 # 2. Find oldest spill files
-ls -lht /opt/dlt/data/spill/ticks-*.bin | tail -10
+ls -lht /opt/tickvault/data/spill/ticks-*.bin | tail -10
 
 # 3. Archive oldest to S3 cold bucket
-for f in /opt/dlt/data/spill/ticks-*.bin; do
+for f in /opt/tickvault/data/spill/ticks-*.bin; do
   age_days=$(( ( $(date +%s) - $(stat -c%Y "$f") ) / 86400 ))
   if [ "$age_days" -gt 7 ]; then
-    aws s3 cp "$f" s3://dlt-prod-cold/spill-archive/ --region ap-south-1
+    aws s3 cp "$f" s3://tv-prod-cold/spill-archive/ --region ap-south-1
     rm "$f"
   fi
 done
@@ -257,7 +257,7 @@ shows the instance running at 02:00 IST (outside the schedule).
 aws ec2 stop-instances --region ap-south-1 --instance-ids $INSTANCE_ID
 
 # 2. Check which EventBridge rule failed
-aws events describe-rule --region ap-south-1 --name dlt-prod-weekday-stop
+aws events describe-rule --region ap-south-1 --name tv-prod-weekday-stop
 # Expected: ScheduleExpression = cron(30 11 ? * MON-FRI *)
 
 # 3. Review CloudTrail for who started it
@@ -296,14 +296,14 @@ sudo -i
 
 # 2. Swap the backup binary back
 cd /opt/dlt
-if [ -f bin/dhan-live-trader.backup ]; then
-  mv bin/dhan-live-trader.backup bin/dhan-live-trader
-  systemctl restart dlt-app
+if [ -f bin/tickvault.backup ]; then
+  mv bin/tickvault.backup bin/tickvault
+  systemctl restart tickvault
 else
   # No backup — download the previous release from S3
-  aws s3 cp s3://dlt-prod-cold/deploys/<previous-sha>/dhan-live-trader bin/dhan-live-trader
-  chmod +x bin/dhan-live-trader
-  systemctl restart dlt-app
+  aws s3 cp s3://tv-prod-cold/deploys/<previous-sha>/tickvault bin/tickvault
+  chmod +x bin/tickvault
+  systemctl restart tickvault
 fi
 ```
 
@@ -325,6 +325,6 @@ each swap — see `.github/workflows/deploy-aws.yml` step 3.
 4. **The kill switch is your friend.** `POST /v2/killswitch?killSwitchStatus=ACTIVATE`
    halts ALL trading for the day, even on successful reconnects. Use it
    any time you're unsure about OMS state.
-5. **`systemctl stop dlt-app` is safe.** The graceful shutdown handler
+5. **`systemctl stop tickvault` is safe.** The graceful shutdown handler
    sends `RequestCode 12` to Dhan (S4-T1b), flushes the ring buffer,
    and exits cleanly. Use it over `kill` or `pkill`.

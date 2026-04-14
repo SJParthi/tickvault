@@ -40,7 +40,7 @@ use state::SharedAppState;
 pub fn build_router(state: SharedAppState, allowed_origins: &[String], dry_run: bool) -> Router {
     let cors = build_cors_layer(allowed_origins);
 
-    // GAP-SEC-01: Load auth config from DLT_API_TOKEN env var.
+    // GAP-SEC-01: Load auth config from TV_API_TOKEN env var.
     // In dry_run mode: missing token = passthrough (dev mode).
     // In live mode: missing token = auto-generated token, auth still enforced.
     let auth_config = ApiAuthConfig::from_env(dry_run);
@@ -234,13 +234,13 @@ mod tests {
     #[test]
     fn test_build_router_smoke_test_dry_run() {
         let state = state::SharedAppState::new(
-            dhan_live_trader_common::config::QuestDbConfig {
+            tickvault_common::config::QuestDbConfig {
                 host: "127.0.0.1".to_string(),
                 http_port: 1,
                 pg_port: 1,
                 ilp_port: 1,
             },
-            dhan_live_trader_common::config::DhanConfig {
+            tickvault_common::config::DhanConfig {
                 websocket_url: "wss://test".to_string(),
                 order_update_websocket_url: "wss://test".to_string(),
                 rest_api_base_url: "https://test".to_string(),
@@ -251,9 +251,9 @@ mod tests {
                 max_websocket_connections: 5,
                 sandbox_base_url: String::new(),
             },
-            dhan_live_trader_common::config::InstrumentConfig {
+            tickvault_common::config::InstrumentConfig {
                 daily_download_time: "08:55:00".to_string(),
-                csv_cache_directory: "/tmp/dlt-cache".to_string(),
+                csv_cache_directory: "/tmp/tv-cache".to_string(),
                 csv_cache_filename: "instruments.csv".to_string(),
                 csv_download_timeout_secs: 120,
                 build_window_start: "08:25:00".to_string(),
@@ -263,20 +263,20 @@ mod tests {
             std::sync::Arc::new(std::sync::RwLock::new(None)),
             std::sync::Arc::new(state::SystemHealthStatus::new()),
         );
-        // dry_run=true → DLT_API_TOKEN not needed
+        // dry_run=true → TV_API_TOKEN not needed
         let _router = build_router(state, &[], true);
     }
 
     #[test]
     fn test_build_router_with_custom_origins() {
         let state = state::SharedAppState::new(
-            dhan_live_trader_common::config::QuestDbConfig {
+            tickvault_common::config::QuestDbConfig {
                 host: "127.0.0.1".to_string(),
                 http_port: 1,
                 pg_port: 1,
                 ilp_port: 1,
             },
-            dhan_live_trader_common::config::DhanConfig {
+            tickvault_common::config::DhanConfig {
                 websocket_url: "wss://test".to_string(),
                 order_update_websocket_url: "wss://test".to_string(),
                 rest_api_base_url: "https://test".to_string(),
@@ -287,9 +287,9 @@ mod tests {
                 max_websocket_connections: 5,
                 sandbox_base_url: String::new(),
             },
-            dhan_live_trader_common::config::InstrumentConfig {
+            tickvault_common::config::InstrumentConfig {
                 daily_download_time: "08:55:00".to_string(),
-                csv_cache_directory: "/tmp/dlt-cache".to_string(),
+                csv_cache_directory: "/tmp/tv-cache".to_string(),
                 csv_cache_filename: "instruments.csv".to_string(),
                 csv_download_timeout_secs: 120,
                 build_window_start: "08:25:00".to_string(),
@@ -317,13 +317,13 @@ mod tests {
         use tower::ServiceExt;
 
         let state = state::SharedAppState::new(
-            dhan_live_trader_common::config::QuestDbConfig {
+            tickvault_common::config::QuestDbConfig {
                 host: "127.0.0.1".to_string(),
                 http_port: 1,
                 pg_port: 1,
                 ilp_port: 1,
             },
-            dhan_live_trader_common::config::DhanConfig {
+            tickvault_common::config::DhanConfig {
                 websocket_url: "wss://test".to_string(),
                 order_update_websocket_url: "wss://test".to_string(),
                 rest_api_base_url: "https://test".to_string(),
@@ -334,9 +334,9 @@ mod tests {
                 max_websocket_connections: 5,
                 sandbox_base_url: String::new(),
             },
-            dhan_live_trader_common::config::InstrumentConfig {
+            tickvault_common::config::InstrumentConfig {
                 daily_download_time: "08:55:00".to_string(),
-                csv_cache_directory: "/tmp/dlt-cache".to_string(),
+                csv_cache_directory: "/tmp/tv-cache".to_string(),
                 csv_cache_filename: "instruments.csv".to_string(),
                 csv_download_timeout_secs: 120,
                 build_window_start: "08:25:00".to_string(),
@@ -372,13 +372,13 @@ mod tests {
         use tower::ServiceExt;
 
         let state = state::SharedAppState::new(
-            dhan_live_trader_common::config::QuestDbConfig {
+            tickvault_common::config::QuestDbConfig {
                 host: "127.0.0.1".to_string(),
                 http_port: 1,
                 pg_port: 1,
                 ilp_port: 1,
             },
-            dhan_live_trader_common::config::DhanConfig {
+            tickvault_common::config::DhanConfig {
                 websocket_url: "wss://test".to_string(),
                 order_update_websocket_url: "wss://test".to_string(),
                 rest_api_base_url: "https://test".to_string(),
@@ -389,9 +389,9 @@ mod tests {
                 max_websocket_connections: 5,
                 sandbox_base_url: String::new(),
             },
-            dhan_live_trader_common::config::InstrumentConfig {
+            tickvault_common::config::InstrumentConfig {
                 daily_download_time: "08:55:00".to_string(),
-                csv_cache_directory: "/tmp/dlt-cache".to_string(),
+                csv_cache_directory: "/tmp/tv-cache".to_string(),
                 csv_cache_filename: "instruments.csv".to_string(),
                 csv_download_timeout_secs: 120,
                 build_window_start: "08:25:00".to_string(),
@@ -423,13 +423,13 @@ mod tests {
     #[test]
     fn test_build_router_live_mode_with_origins() {
         let state = state::SharedAppState::new(
-            dhan_live_trader_common::config::QuestDbConfig {
+            tickvault_common::config::QuestDbConfig {
                 host: "127.0.0.1".to_string(),
                 http_port: 1,
                 pg_port: 1,
                 ilp_port: 1,
             },
-            dhan_live_trader_common::config::DhanConfig {
+            tickvault_common::config::DhanConfig {
                 websocket_url: "wss://test".to_string(),
                 order_update_websocket_url: "wss://test".to_string(),
                 rest_api_base_url: "https://test".to_string(),
@@ -440,9 +440,9 @@ mod tests {
                 max_websocket_connections: 5,
                 sandbox_base_url: String::new(),
             },
-            dhan_live_trader_common::config::InstrumentConfig {
+            tickvault_common::config::InstrumentConfig {
                 daily_download_time: "08:55:00".to_string(),
-                csv_cache_directory: "/tmp/dlt-cache".to_string(),
+                csv_cache_directory: "/tmp/tv-cache".to_string(),
                 csv_cache_filename: "instruments.csv".to_string(),
                 csv_download_timeout_secs: 120,
                 build_window_start: "08:25:00".to_string(),
@@ -464,13 +464,13 @@ mod tests {
         use tower::ServiceExt;
 
         let state = state::SharedAppState::new(
-            dhan_live_trader_common::config::QuestDbConfig {
+            tickvault_common::config::QuestDbConfig {
                 host: "127.0.0.1".to_string(),
                 http_port: 1,
                 pg_port: 1,
                 ilp_port: 1,
             },
-            dhan_live_trader_common::config::DhanConfig {
+            tickvault_common::config::DhanConfig {
                 websocket_url: "wss://test".to_string(),
                 order_update_websocket_url: "wss://test".to_string(),
                 rest_api_base_url: "https://test".to_string(),
@@ -481,9 +481,9 @@ mod tests {
                 max_websocket_connections: 5,
                 sandbox_base_url: String::new(),
             },
-            dhan_live_trader_common::config::InstrumentConfig {
+            tickvault_common::config::InstrumentConfig {
                 daily_download_time: "08:55:00".to_string(),
-                csv_cache_directory: "/tmp/dlt-cache".to_string(),
+                csv_cache_directory: "/tmp/tv-cache".to_string(),
                 csv_cache_filename: "instruments.csv".to_string(),
                 csv_download_timeout_secs: 120,
                 build_window_start: "08:25:00".to_string(),

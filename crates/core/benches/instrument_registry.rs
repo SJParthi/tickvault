@@ -8,12 +8,10 @@ use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 
-use dhan_live_trader_common::instrument_registry::{
-    InstrumentRegistry, make_display_index_instrument,
-};
-use dhan_live_trader_common::types::{ExchangeSegment, FeedMode};
-use dhan_live_trader_core::websocket::subscription_builder::build_subscription_messages;
-use dhan_live_trader_core::websocket::types::InstrumentSubscription;
+use tickvault_common::instrument_registry::{InstrumentRegistry, make_display_index_instrument};
+use tickvault_common::types::{ExchangeSegment, FeedMode};
+use tickvault_core::websocket::subscription_builder::build_subscription_messages;
+use tickvault_core::websocket::types::InstrumentSubscription;
 
 /// Build a registry with N instruments for benchmarking.
 fn build_registry(count: usize) -> InstrumentRegistry {

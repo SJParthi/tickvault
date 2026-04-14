@@ -10,9 +10,9 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
 
-use dhan_live_trader_api::build_router;
-use dhan_live_trader_api::state::{SharedAppState, SystemHealthStatus};
-use dhan_live_trader_common::config::{DhanConfig, InstrumentConfig, QuestDbConfig};
+use tickvault_api::build_router;
+use tickvault_api::state::{SharedAppState, SystemHealthStatus};
+use tickvault_common::config::{DhanConfig, InstrumentConfig, QuestDbConfig};
 
 // ---------------------------------------------------------------------------
 // Helper — build test app with mock state
@@ -41,7 +41,7 @@ fn test_state() -> SharedAppState {
         },
         InstrumentConfig {
             daily_download_time: "08:55:00".to_string(),
-            csv_cache_directory: "/tmp/dlt-test".to_string(),
+            csv_cache_directory: "/tmp/tv-test".to_string(),
             csv_cache_filename: "instruments.csv".to_string(),
             csv_download_timeout_secs: 120,
             build_window_start: "08:25:00".to_string(),
@@ -165,7 +165,7 @@ async fn contract_unknown_route_returns_404() {
 
 #[test]
 fn contract_place_order_request_camel_case() {
-    use dhan_live_trader_trading::oms::types::DhanPlaceOrderRequest;
+    use tickvault_trading::oms::types::DhanPlaceOrderRequest;
 
     let req = DhanPlaceOrderRequest {
         dhan_client_id: "100".to_owned(),
@@ -240,7 +240,7 @@ fn contract_place_order_request_camel_case() {
 
 #[test]
 fn contract_place_order_response_deserialization() {
-    use dhan_live_trader_trading::oms::types::DhanPlaceOrderResponse;
+    use tickvault_trading::oms::types::DhanPlaceOrderResponse;
 
     // Minimal Dhan response
     let json_str = r#"{"orderId":"ORD-123","orderStatus":"TRANSIT","correlationId":"uuid-1"}"#;
@@ -252,7 +252,7 @@ fn contract_place_order_response_deserialization() {
 
 #[test]
 fn contract_order_response_handles_missing_optional_fields() {
-    use dhan_live_trader_trading::oms::types::DhanOrderResponse;
+    use tickvault_trading::oms::types::DhanOrderResponse;
 
     // Minimal response — most fields missing (serde defaults)
     let json_str = r#"{"orderId":"999","orderStatus":"TRADED"}"#;
@@ -267,7 +267,7 @@ fn contract_order_response_handles_missing_optional_fields() {
 
 #[test]
 fn contract_position_response_deserialization() {
-    use dhan_live_trader_trading::oms::types::DhanPositionResponse;
+    use tickvault_trading::oms::types::DhanPositionResponse;
 
     let json_str = r#"{
         "dhanClientId": "100",

@@ -22,7 +22,7 @@
 
 8. **Timestamps are IST strings** (`YYYY-MM-DD HH:MM:SS`), NOT epoch.
 
-9. **Prefer Live Order Update WebSocket** (`docs/dhan-ref/10-live-order-update-websocket.md`) for dhan-live-trader — no public URL needed.
+9. **Prefer Live Order Update WebSocket** (`docs/dhan-ref/10-live-order-update-websocket.md`) for tickvault — no public URL needed.
 
 ## What This Prevents
 

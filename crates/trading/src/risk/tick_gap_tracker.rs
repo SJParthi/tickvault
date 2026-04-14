@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use dhan_live_trader_common::constants::{
+use tickvault_common::constants::{
     STALE_LTP_THRESHOLD_SECS, TICK_GAP_ALERT_THRESHOLD_SECS, TICK_GAP_ERROR_THRESHOLD_SECS,
     TICK_GAP_MIN_TICKS_BEFORE_ACTIVE,
 };
@@ -175,7 +175,7 @@ impl TickGapTracker {
         }
 
         if newly_stale > 0 {
-            metrics::gauge!("dlt_stale_ltp_instruments").set(f64::from(newly_stale));
+            metrics::gauge!("tv_stale_ltp_instruments").set(f64::from(newly_stale));
         }
 
         newly_stale

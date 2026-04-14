@@ -8,8 +8,8 @@ use std::hint::black_box;
 use chrono::NaiveDate;
 use criterion::{Criterion, criterion_group, criterion_main};
 
-use dhan_live_trader_common::config::{NseHolidayEntry, TradingConfig};
-use dhan_live_trader_common::trading_calendar::TradingCalendar;
+use tickvault_common::config::{NseHolidayEntry, TradingConfig};
+use tickvault_common::trading_calendar::TradingCalendar;
 
 /// Builds a realistic TradingCalendar with 15 holidays (typical NSE year).
 fn build_calendar() -> TradingCalendar {

@@ -1202,179 +1202,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dhan-live-trader-api"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "chrono",
- "dhan-live-trader-common",
- "dhan-live-trader-core",
- "dhan-live-trader-storage",
- "dhan-live-trader-trading",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tower",
- "tower-http",
- "tracing",
- "uuid",
- "zeroize",
-]
-
-[[package]]
-name = "dhan-live-trader-app"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "arc-swap",
- "axum",
- "bytes",
- "chrono",
- "chrono-tz",
- "clap",
- "dhan-live-trader-api",
- "dhan-live-trader-common",
- "dhan-live-trader-core",
- "dhan-live-trader-storage",
- "dhan-live-trader-trading",
- "figment",
- "governor",
- "metrics",
- "metrics-exporter-prometheus",
- "opentelemetry",
- "opentelemetry-otlp",
- "opentelemetry_sdk",
- "reqwest",
- "rustls 0.23.37",
- "secrecy",
- "serde_json",
- "signal-hook",
- "tokio",
- "tracing",
- "tracing-opentelemetry",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "dhan-live-trader-common"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "chrono-tz",
- "criterion",
- "figment",
- "proptest",
- "rkyv",
- "secrecy",
- "serde",
- "serde_json",
- "thiserror",
- "toml 1.1.2+spec-1.1.0",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "dhan-live-trader-core"
-version = "0.1.0"
-dependencies = [
- "ahash",
- "anyhow",
- "arc-swap",
- "arrayvec",
- "aws-config",
- "aws-sdk-sns",
- "aws-sdk-ssm",
- "backon",
- "bytes",
- "chrono",
- "chrono-tz",
- "criterion",
- "csv",
- "dhan-live-trader-common",
- "dhan-live-trader-storage",
- "dhat",
- "failsafe",
- "futures-util",
- "loom",
- "memmap2",
- "metrics",
- "papaya",
- "proptest",
- "reqwest",
- "rkyv",
- "rtrb",
- "rustls 0.23.37",
- "rustls-native-certs",
- "secrecy",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tokio-tungstenite 0.29.0",
- "totp-rs",
- "tracing",
- "zerocopy",
- "zeroize",
-]
-
-[[package]]
-name = "dhan-live-trader-storage"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "chrono-tz",
- "criterion",
- "deadpool-redis",
- "dhan-live-trader-common",
- "dhat",
- "metrics",
- "proptest",
- "questdb-rs",
- "redis",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "dhan-live-trader-trading"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "chrono-tz",
- "criterion",
- "dhan-live-trader-common",
- "dhan-live-trader-core",
- "dhat",
- "governor",
- "jaeckel",
- "loom",
- "metrics",
- "notify",
- "proptest",
- "reqwest",
- "secrecy",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "toml 1.1.2+spec-1.1.0",
- "tracing",
- "uuid",
-]
-
-[[package]]
 name = "dhat"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3963,6 +3790,179 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f60246a4944f24f6e018aa17cdeffb7818b76356965d03b07d6a9886e8962185"
 dependencies = [
  "cfg-if",
+]
+
+[[package]]
+name = "tickvault-api"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tickvault-common",
+ "tickvault-core",
+ "tickvault-storage",
+ "tickvault-trading",
+ "tokio",
+ "tower",
+ "tower-http",
+ "tracing",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
+name = "tickvault-app"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arc-swap",
+ "axum",
+ "bytes",
+ "chrono",
+ "chrono-tz",
+ "clap",
+ "figment",
+ "governor",
+ "metrics",
+ "metrics-exporter-prometheus",
+ "opentelemetry",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
+ "reqwest",
+ "rustls 0.23.37",
+ "secrecy",
+ "serde_json",
+ "signal-hook",
+ "tickvault-api",
+ "tickvault-common",
+ "tickvault-core",
+ "tickvault-storage",
+ "tickvault-trading",
+ "tokio",
+ "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "tickvault-common"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "chrono-tz",
+ "criterion",
+ "figment",
+ "proptest",
+ "rkyv",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "toml 1.1.2+spec-1.1.0",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "tickvault-core"
+version = "0.1.0"
+dependencies = [
+ "ahash",
+ "anyhow",
+ "arc-swap",
+ "arrayvec",
+ "aws-config",
+ "aws-sdk-sns",
+ "aws-sdk-ssm",
+ "backon",
+ "bytes",
+ "chrono",
+ "chrono-tz",
+ "criterion",
+ "csv",
+ "dhat",
+ "failsafe",
+ "futures-util",
+ "loom",
+ "memmap2",
+ "metrics",
+ "papaya",
+ "proptest",
+ "reqwest",
+ "rkyv",
+ "rtrb",
+ "rustls 0.23.37",
+ "rustls-native-certs",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tickvault-common",
+ "tickvault-storage",
+ "tokio",
+ "tokio-tungstenite 0.29.0",
+ "totp-rs",
+ "tracing",
+ "zerocopy",
+ "zeroize",
+]
+
+[[package]]
+name = "tickvault-storage"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "chrono-tz",
+ "criterion",
+ "deadpool-redis",
+ "dhat",
+ "metrics",
+ "proptest",
+ "questdb-rs",
+ "redis",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tickvault-common",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "tickvault-trading"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "chrono-tz",
+ "criterion",
+ "dhat",
+ "governor",
+ "jaeckel",
+ "loom",
+ "metrics",
+ "notify",
+ "proptest",
+ "reqwest",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tickvault-common",
+ "tickvault-core",
+ "tokio",
+ "toml 1.1.2+spec-1.1.0",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

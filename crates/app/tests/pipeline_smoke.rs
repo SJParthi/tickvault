@@ -3,11 +3,11 @@
 //! The app crate is a binary-only crate (no lib.rs), so these tests
 //! verify that key types from dependencies compile and behave as expected.
 
-use dhan_live_trader_common::config::NseHolidayEntry;
-use dhan_live_trader_common::constants::{
+use tickvault_common::config::NseHolidayEntry;
+use tickvault_common::constants::{
     DEDUP_RING_BUFFER_POWER, IST_UTC_OFFSET_SECONDS, MINIMUM_VALID_EXCHANGE_TIMESTAMP,
 };
-use dhan_live_trader_common::trading_calendar::TradingCalendar;
+use tickvault_common::trading_calendar::TradingCalendar;
 
 // ---------------------------------------------------------------------------
 // Constants smoke tests
@@ -105,8 +105,8 @@ fn standard_2026_holidays() -> Vec<NseHolidayEntry> {
     ]
 }
 
-fn test_trading_config() -> dhan_live_trader_common::config::TradingConfig {
-    dhan_live_trader_common::config::TradingConfig {
+fn test_trading_config() -> tickvault_common::config::TradingConfig {
+    tickvault_common::config::TradingConfig {
         market_open_time: "09:00:00".to_string(),
         market_close_time: "15:30:00".to_string(),
         order_cutoff_time: "15:29:00".to_string(),
@@ -167,9 +167,9 @@ fn test_trading_calendar_holiday_is_not_trading_day() {
 
 #[test]
 fn test_smoke_config_loads_from_base_toml() {
-    use dhan_live_trader_common::config::ApplicationConfig;
     use figment::Figment;
     use figment::providers::{Format, Toml};
+    use tickvault_common::config::ApplicationConfig;
 
     // The base.toml file must exist and be parseable.
     // Integration tests run with cwd = workspace root (Cargo convention).
@@ -221,7 +221,7 @@ fn test_smoke_config_loads_from_base_toml() {
 
 #[test]
 fn test_smoke_all_constants_valid() {
-    use dhan_live_trader_common::constants::*;
+    use tickvault_common::constants::*;
 
     // --- Packet sizes: positive and reasonable ---
     const {
@@ -319,13 +319,13 @@ fn test_smoke_all_constants_valid() {
 
 #[test]
 fn test_smoke_error_types_have_display() {
-    use dhan_live_trader_common::error::ApplicationError;
+    use tickvault_common::error::ApplicationError;
 
     // Construct one instance of each variant and verify Display produces non-empty output.
     let variants: Vec<Box<dyn std::fmt::Display>> = vec![
         Box::new(ApplicationError::Configuration("test".to_string())),
         Box::new(ApplicationError::SecretRetrieval {
-            path: "/dlt/dev/test".to_string(),
+            path: "/tickvault/dev/test".to_string(),
             source: anyhow::anyhow!("test error"),
         }),
         Box::new(ApplicationError::MarketHourViolation("test".to_string())),

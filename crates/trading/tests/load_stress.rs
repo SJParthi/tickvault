@@ -5,13 +5,13 @@
 //!
 //! NOTE: Timing assertions are skipped under instrumented builds
 //! (cargo-careful, sanitizers) where execution is 10-100x slower.
-//! Set `DLT_SKIP_PERF_ASSERTIONS=1` to skip timing checks.
+//! Set `TV_SKIP_PERF_ASSERTIONS=1` to skip timing checks.
 
 use std::time::{Duration, Instant};
 
 /// Returns true when running under instrumented builds (cargo-careful, sanitizers).
 fn skip_perf_assertions() -> bool {
-    std::env::var("DLT_SKIP_PERF_ASSERTIONS").is_ok()
+    std::env::var("TV_SKIP_PERF_ASSERTIONS").is_ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -20,7 +20,7 @@ fn skip_perf_assertions() -> bool {
 
 #[test]
 fn stress_risk_engine_100k_checks() {
-    use dhan_live_trader_trading::risk::engine::RiskEngine;
+    use tickvault_trading::risk::engine::RiskEngine;
 
     let mut engine = RiskEngine::new(2.0, 1000, 10_000_000.0);
     let start = Instant::now();
@@ -52,7 +52,7 @@ fn stress_risk_engine_100k_checks() {
 
 #[test]
 fn stress_ring_buffer_1m_pushes() {
-    use dhan_live_trader_trading::indicator::types::RingBuffer;
+    use tickvault_trading::indicator::types::RingBuffer;
 
     let mut ring = RingBuffer::new();
     let start = Instant::now();
@@ -71,7 +71,7 @@ fn stress_ring_buffer_1m_pushes() {
     // Capacity should be stable
     assert_eq!(
         ring.len() as usize,
-        dhan_live_trader_common::constants::INDICATOR_RING_BUFFER_CAPACITY
+        tickvault_common::constants::INDICATOR_RING_BUFFER_CAPACITY
     );
 }
 
@@ -81,7 +81,7 @@ fn stress_ring_buffer_1m_pushes() {
 
 #[test]
 fn stress_no_unbounded_growth_risk_engine() {
-    use dhan_live_trader_trading::risk::engine::RiskEngine;
+    use tickvault_trading::risk::engine::RiskEngine;
 
     let mut engine = RiskEngine::new(2.0, 10000, 100_000_000.0);
 

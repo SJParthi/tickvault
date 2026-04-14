@@ -792,7 +792,7 @@ mod tests {
     /// Diagnostic: prints full Greek values for ATM NIFTY at both day counts (1 and 2)
     /// across key (r, q, dc) combinations so the user can compare against Dhan's website.
     ///
-    /// Run with: `cargo test --package dhan-live-trader-trading --lib greeks::calibration::tests::test_print_greeks_comparison_both_day_counts -- --nocapture`
+    /// Run with: `cargo test --package tickvault-trading --lib greeks::calibration::tests::test_print_greeks_comparison_both_day_counts -- --nocapture`
     // APPROVED: uses println! only in test code for diagnostic comparison against Dhan's website
     #[allow(clippy::print_stdout)]
     #[test]

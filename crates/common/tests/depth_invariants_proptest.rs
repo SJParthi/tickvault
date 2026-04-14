@@ -38,7 +38,8 @@
 //! algorithm makes catastrophically wrong trading decisions. There is NO
 //! recovery from a depth corruption bug short of re-reading every level.
 
-use dhan_live_trader_common::constants::{
+use proptest::prelude::*;
+use tickvault_common::constants::{
     DEEP_DEPTH_HEADER_OFFSET_EXCHANGE_SEGMENT, DEEP_DEPTH_HEADER_OFFSET_FEED_CODE,
     DEEP_DEPTH_HEADER_OFFSET_MSG_LENGTH, DEEP_DEPTH_HEADER_OFFSET_MSG_SEQUENCE,
     DEEP_DEPTH_HEADER_OFFSET_SECURITY_ID, DEEP_DEPTH_HEADER_SIZE, DEEP_DEPTH_LEVEL_OFFSET_ORDERS,
@@ -47,7 +48,6 @@ use dhan_live_trader_common::constants::{
     MAX_TWO_HUNDRED_DEPTH_CONNECTIONS, MAX_WEBSOCKET_CONNECTIONS, TWENTY_DEPTH_LEVELS,
     TWENTY_DEPTH_PACKET_SIZE, TWO_HUNDRED_DEPTH_LEVELS, TWO_HUNDRED_DEPTH_PACKET_SIZE,
 };
-use proptest::prelude::*;
 
 // ---------------------------------------------------------------------------
 // Static invariants (no random input needed)

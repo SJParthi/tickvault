@@ -20,23 +20,23 @@ use anyhow::Result;
 use chrono::{NaiveDate, TimeDelta, Utc};
 use tracing::{debug, error, info, warn};
 
-use dhan_live_trader_common::config::{GreeksConfig, QuestDbConfig};
-use dhan_live_trader_common::constants::{
+use tickvault_common::config::{GreeksConfig, QuestDbConfig};
+use tickvault_common::constants::{
     IST_UTC_OFFSET_NANOS, IST_UTC_OFFSET_SECONDS_I64, TICK_PERSIST_END_SECS_OF_DAY_IST,
     TICK_PERSIST_START_SECS_OF_DAY_IST, VALIDATION_MUST_EXIST_INDICES,
 };
-use dhan_live_trader_core::auth::TokenHandle;
-use dhan_live_trader_core::option_chain::client::OptionChainClient;
-use dhan_live_trader_core::option_chain::types::OptionData;
-use dhan_live_trader_storage::greeks_persistence::{
+use tickvault_core::auth::TokenHandle;
+use tickvault_core::option_chain::client::OptionChainClient;
+use tickvault_core::option_chain::types::OptionData;
+use tickvault_storage::greeks_persistence::{
     DhanRawRow, GreeksPersistenceWriter, OptionGreeksRow, PcrSnapshotRow, VerificationRow,
 };
-use dhan_live_trader_trading::greeks::black_scholes::{self, OptionSide};
-use dhan_live_trader_trading::greeks::buildup::classify_buildup;
-use dhan_live_trader_trading::greeks::calibration::{
+use tickvault_trading::greeks::black_scholes::{self, OptionSide};
+use tickvault_trading::greeks::buildup::classify_buildup;
+use tickvault_trading::greeks::calibration::{
     CalibrationSample, EXACT_MATCH_EPSILON, calibrate_parameters, is_exact_match,
 };
-use dhan_live_trader_trading::greeks::pcr::{classify_pcr, compute_pcr};
+use tickvault_trading::greeks::pcr::{classify_pcr, compute_pcr};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -645,9 +645,9 @@ fn write_pcr_snapshot(
 
     let sentiment = classify_pcr(pcr_oi_val);
     let sentiment_str = match sentiment {
-        dhan_live_trader_trading::greeks::pcr::PcrSentiment::Bullish => "Bullish",
-        dhan_live_trader_trading::greeks::pcr::PcrSentiment::Neutral => "Neutral",
-        dhan_live_trader_trading::greeks::pcr::PcrSentiment::Bearish => "Bearish",
+        tickvault_trading::greeks::pcr::PcrSentiment::Bullish => "Bullish",
+        tickvault_trading::greeks::pcr::PcrSentiment::Neutral => "Neutral",
+        tickvault_trading::greeks::pcr::PcrSentiment::Bearish => "Bearish",
     };
 
     writer.write_pcr_snapshot_row(&PcrSnapshotRow {

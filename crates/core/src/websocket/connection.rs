@@ -19,11 +19,11 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_tls_with_config};
 
-use dhan_live_trader_common::constants::{WEBSOCKET_AUTH_TYPE, WEBSOCKET_PROTOCOL_VERSION};
+use tickvault_common::constants::{WEBSOCKET_AUTH_TYPE, WEBSOCKET_PROTOCOL_VERSION};
 use tracing::{debug, error, info, instrument, warn};
 
-use dhan_live_trader_common::config::{DhanConfig, WebSocketConfig};
-use dhan_live_trader_common::types::FeedMode;
+use tickvault_common::config::{DhanConfig, WebSocketConfig};
+use tickvault_common::types::FeedMode;
 
 use crate::auth::TokenHandle;
 use crate::websocket::subscription_builder::build_subscription_messages;
@@ -200,8 +200,8 @@ impl WebSocketConnection {
     #[instrument(skip_all, fields(conn_id = self.connection_id))]
     pub async fn run(&self) -> Result<(), WebSocketError> {
         // O(1) EXEMPT: begin — metric handles grabbed once before loop, not per-message
-        let m_conn_active = metrics::gauge!("dlt_websocket_connections_active", "connection_id" => self.connection_id.to_string());
-        let m_reconnections = metrics::counter!("dlt_websocket_reconnections_total", "connection_id" => self.connection_id.to_string());
+        let m_conn_active = metrics::gauge!("tv_websocket_connections_active", "connection_id" => self.connection_id.to_string());
+        let m_reconnections = metrics::counter!("tv_websocket_reconnections_total", "connection_id" => self.connection_id.to_string());
         // O(1) EXEMPT: end
 
         loop {
@@ -515,7 +515,7 @@ impl WebSocketConnection {
                                 "A5: Disconnect request sent successfully"
                             );
                             metrics::counter!(
-                                "dlt_ws_graceful_unsub_total",
+                                "tv_ws_graceful_unsub_total",
                                 "connection_id" => self.connection_id.to_string(),
                                 "outcome" => "sent"
                             )
@@ -528,7 +528,7 @@ impl WebSocketConnection {
                                 "A5: failed to send Disconnect request — socket already dead"
                             );
                             metrics::counter!(
-                                "dlt_ws_graceful_unsub_total",
+                                "tv_ws_graceful_unsub_total",
                                 "connection_id" => self.connection_id.to_string(),
                                 "outcome" => "send_failed"
                             )
@@ -541,7 +541,7 @@ impl WebSocketConnection {
                                 "A5: Disconnect send timed out — proceeding with socket close"
                             );
                             metrics::counter!(
-                                "dlt_ws_graceful_unsub_total",
+                                "tv_ws_graceful_unsub_total",
                                 "connection_id" => self.connection_id.to_string(),
                                 "outcome" => "timeout"
                             )
@@ -589,12 +589,12 @@ impl WebSocketConnection {
                                     channel_capacity = self.frame_sender.capacity(),
                                     "SPSC channel full — backpressure active (zero-drop mode)"
                                 );
-                                metrics::counter!("dlt_ws_frame_backpressure_total").increment(1);
+                                metrics::counter!("tv_ws_frame_backpressure_total").increment(1);
                                 // Blocking send with backpressure timeout — if still
                                 // stuck, the WS ping timeout (40s) will kill the
                                 // connection and auto-reconnect will re-establish it.
                                 const BACKPRESSURE_TIMEOUT: Duration = Duration::from_secs(
-                                    dhan_live_trader_common::constants::FRAME_BACKPRESSURE_TIMEOUT_SECS,
+                                    tickvault_common::constants::FRAME_BACKPRESSURE_TIMEOUT_SECS,
                                 );
                                 match time::timeout(
                                     BACKPRESSURE_TIMEOUT,
@@ -622,7 +622,7 @@ impl WebSocketConnection {
                                             connection_id = self.connection_id,
                                             "CRITICAL: 30s backpressure timeout — tick processor frozen"
                                         );
-                                        metrics::counter!("dlt_ws_backpressure_timeout_total")
+                                        metrics::counter!("tv_ws_backpressure_timeout_total")
                                             .increment(1);
                                     }
                                 }
@@ -790,7 +790,7 @@ impl WebSocketConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dhan_live_trader_common::types::ExchangeSegment;
+    use tickvault_common::types::ExchangeSegment;
 
     fn make_test_dhan_config() -> DhanConfig {
         DhanConfig {
@@ -3216,8 +3216,8 @@ mod tests {
     async fn test_run_expired_token_fails_with_no_token_available() {
         use crate::auth::types::TokenState;
         use chrono::{Duration as ChronoDuration, Utc};
-        use dhan_live_trader_common::trading_calendar::ist_offset;
         use secrecy::SecretString;
+        use tickvault_common::trading_calendar::ist_offset;
 
         // Create an expired token.
         let now_ist = Utc::now().with_timezone(&ist_offset());

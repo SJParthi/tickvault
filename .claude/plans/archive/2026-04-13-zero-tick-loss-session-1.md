@@ -30,7 +30,7 @@ Every delivered item satisfies all 8 rows:
 
 | Property | Requirement | Satisfied by |
 |---|---|---|
-| Auto-track | Prometheus metric on every new code path | `dlt_dlq_ticks_total` counter in A2 |
+| Auto-track | Prometheus metric on every new code path | `tv_dlq_ticks_total` counter in A2 |
 | Auto-monitor | Grafana panel + alert rule | Deferred to E2 (backlog) |
 | Auto-debug | `tracing::error!` with `security_id`, `reason`, `error_chain` | A2 `write_to_dlq` logs |
 | Auto-log | Loki via Alloy | already wired via `observability.rs` |
@@ -45,7 +45,7 @@ Every delivered item satisfies all 8 rows:
   - Files: config.rs, constants.rs, main.rs
   - Tests: test_sandbox_guard_blocks_live_before_july, test_sandbox_and_paper_modes_always_pass_guard, test_base_config_mode_is_not_live, test_default_config_trading_mode_is_paper_not_live
 
-- [x] A2. **Dead-letter NDJSON fallback for double failure.** When `spill_tick_to_disk()` fails (either open or write), the tick is now forwarded to new `write_to_dlq()` which lazy-opens `data/spill/dlq-YYYYMMDD.ndjson` (append-only) and writes one JSON line with full tick fields + failure reason + `ts_ms`. New struct fields `dlq_writer`, `dlq_path`, `dlq_ticks_total`. New public methods `dlq_ticks_total()`, `dlq_path()`. New Prometheus counter `dlt_dlq_ticks_total`. `ticks_dropped_total` now only increments on the truly catastrophic path where DLQ ALSO fails. Existing "ticks_dropped must be 0" contract is strengthened — the only way to drop a tick now is if ring buffer, disk spill, AND DLQ NDJSON all fail simultaneously.
+- [x] A2. **Dead-letter NDJSON fallback for double failure.** When `spill_tick_to_disk()` fails (either open or write), the tick is now forwarded to new `write_to_dlq()` which lazy-opens `data/spill/dlq-YYYYMMDD.ndjson` (append-only) and writes one JSON line with full tick fields + failure reason + `ts_ms`. New struct fields `dlq_writer`, `dlq_path`, `dlq_ticks_total`. New public methods `dlq_ticks_total()`, `dlq_path()`. New Prometheus counter `tv_dlq_ticks_total`. `ticks_dropped_total` now only increments on the truly catastrophic path where DLQ ALSO fails. Existing "ticks_dropped must be 0" contract is strengthened — the only way to drop a tick now is if ring buffer, disk spill, AND DLQ NDJSON all fail simultaneously.
   - Files: tick_persistence.rs
   - Tests: test_dlq_initially_empty, test_dlq_written_when_spill_write_fails, test_dlq_format_is_parseable_ndjson, test_dlq_append_multiple_records
 
@@ -77,7 +77,7 @@ Every delivered item satisfies all 8 rows:
 | 6 | 3 DLQ writes | all 3 lines present, counter = 3 | new `test_dlq_append_multiple_records` |
 | 7 | Fresh writer | `dlq_ticks_total == 0`, `dlq_path() == None` | new `test_dlq_initially_empty` |
 | 8 | `mode = "live"` on 2026-04-13 | `config.validate()` fails with SANDBOX GUARD error | existing `test_sandbox_guard_blocks_live_before_july` |
-| 9 | Touch only `crates/storage/` | `scoped-test-runner.sh` runs `cargo test -p dhan-live-trader-storage` only | script logic in `scoped-test-runner.sh`, manual demonstration |
+| 9 | Touch only `crates/storage/` | `scoped-test-runner.sh` runs `cargo test -p tickvault-storage` only | script logic in `scoped-test-runner.sh`, manual demonstration |
 
 ## Pre-existing issues surfaced but NOT fixed this session (scope protection)
 
@@ -89,10 +89,10 @@ Every delivered item satisfies all 8 rows:
 
 ```bash
 # A2 DLQ unit tests (4 passing)
-cargo test -p dhan-live-trader-storage --lib dlq
+cargo test -p tickvault-storage --lib dlq
 
 # B1 chaos tests (2 active passing + 2 ignored skeletons)
-cargo test -p dhan-live-trader-storage --test chaos_questdb_lifecycle
+cargo test -p tickvault-storage --test chaos_questdb_lifecycle
 
 # D1/D2 scoped runner (demonstrated)
 bash .claude/hooks/scoped-test-runner.sh

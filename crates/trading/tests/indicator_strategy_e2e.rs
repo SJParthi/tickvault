@@ -16,16 +16,16 @@
 
 #![allow(clippy::arithmetic_side_effects)] // APPROVED: test helpers use constant values for verification
 
-use dhan_live_trader_common::constants::{
+use tickvault_common::constants::{
     INDICATOR_RING_BUFFER_CAPACITY, MAX_INDICATOR_INSTRUMENTS, MAX_INDICATOR_WARMUP_TICKS,
 };
-use dhan_live_trader_common::tick_types::ParsedTick;
-use dhan_live_trader_trading::indicator::engine::IndicatorEngine;
-use dhan_live_trader_trading::indicator::types::{
+use tickvault_common::tick_types::ParsedTick;
+use tickvault_trading::indicator::engine::IndicatorEngine;
+use tickvault_trading::indicator::types::{
     IndicatorParams, IndicatorSnapshot, IndicatorState, RingBuffer,
 };
-use dhan_live_trader_trading::strategy::evaluator::StrategyInstance;
-use dhan_live_trader_trading::strategy::types::{
+use tickvault_trading::strategy::evaluator::StrategyInstance;
+use tickvault_trading::strategy::types::{
     ComparisonOp, Condition, ExitReason, IndicatorField, Signal, StrategyDefinition, StrategyState,
 };
 
@@ -1554,12 +1554,12 @@ fn test_engine_params_returns_correct_values() {
 // ===========================================================================
 
 mod proptest_strategy {
-    use dhan_live_trader_trading::indicator::IndicatorSnapshot;
-    use dhan_live_trader_trading::strategy::evaluator::StrategyInstance;
-    use dhan_live_trader_trading::strategy::types::{
+    use proptest::prelude::*;
+    use tickvault_trading::indicator::IndicatorSnapshot;
+    use tickvault_trading::strategy::evaluator::StrategyInstance;
+    use tickvault_trading::strategy::types::{
         ComparisonOp, Condition, ExitReason, IndicatorField, Signal, StrategyDefinition,
     };
-    use proptest::prelude::*;
 
     fn test_strategy() -> StrategyDefinition {
         StrategyDefinition {

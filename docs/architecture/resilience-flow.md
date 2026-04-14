@@ -1,7 +1,7 @@
 # Resilience Flow — Zero Human Intervention
 
 > **Last updated:** 2026-03-22
-> **Context:** This document describes how dhan-live-trader survives every crash
+> **Context:** This document describes how tickvault survives every crash
 > scenario automatically. From boot to market close, no human intervention is needed.
 
 ---
@@ -212,7 +212,7 @@ App restarts (3 seconds later)
     │
     ▼
 FAST BOOT (market hours + token cache):
-    Token from data/cache/dlt-token-cache (~2ms)
+    Token from data/cache/tv-token-cache (~2ms)
     Instruments from rkyv binary cache (~5ms)
     WebSocket reconnect (~400ms)
     │
@@ -337,14 +337,14 @@ Next reconnect attempt succeeds
 │  Path 2: Prometheus → Grafana → Telegram (1-5 min)      │
 │  ─────────────────────────────────────────────           │
 │  App metrics → Prometheus scrape → Alert rules →          │
-│  Grafana unified alerting → dlt-telegram contact point   │
+│  Grafana unified alerting → tv-telegram contact point   │
 │  Alerts: TargetDown, AppDown, PipelineStopped,           │
 │          NoTicks, HighParseErrors, ServiceFlapping        │
 │                                                           │
 │  Path 3: Loki ERROR logs → Grafana → Telegram (1-3 min) │
 │  ─────────────────────────────────────────────           │
 │  error!() → file → Alloy → Loki → Grafana alert rule →  │
-│  dlt-telegram contact point                               │
+│  tv-telegram contact point                               │
 │  Covers: tick gaps, QuestDB failures, panics, any ERROR  │
 └─────────────────────────────────────────────────────────┘
 ```

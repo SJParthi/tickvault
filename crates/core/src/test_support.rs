@@ -146,7 +146,7 @@ mod tests {
         }
 
         // Set USERPROFILE to a temp directory that has no .aws/credentials
-        let tmp_dir = format!("/tmp/dlt-test-userprofile-{}", std::process::id());
+        let tmp_dir = format!("/tmp/tv-test-userprofile-{}", std::process::id());
         let _ = std::fs::create_dir_all(&tmp_dir);
         // SAFETY: test is single-threaded for this env var manipulation
         unsafe {
@@ -189,7 +189,7 @@ mod tests {
             std::env::remove_var("HOME");
         }
 
-        let tmp_dir = format!("/tmp/dlt-test-userprofile-creds-{}", std::process::id());
+        let tmp_dir = format!("/tmp/tv-test-userprofile-creds-{}", std::process::id());
         let aws_dir = format!("{tmp_dir}/.aws");
         let _ = std::fs::create_dir_all(&aws_dir);
         let creds_path = format!("{aws_dir}/credentials");
@@ -238,7 +238,7 @@ mod tests {
             std::env::remove_var("USERPROFILE");
         }
 
-        let tmp_dir = format!("/tmp/dlt-test-home-creds-{}", std::process::id());
+        let tmp_dir = format!("/tmp/tv-test-home-creds-{}", std::process::id());
         let aws_dir = format!("{tmp_dir}/.aws");
         let _ = std::fs::create_dir_all(&aws_dir);
         let creds_path = format!("{aws_dir}/credentials");
@@ -283,7 +283,7 @@ mod tests {
             std::env::remove_var("USERPROFILE");
         }
 
-        let tmp_dir = format!("/tmp/dlt-test-home-no-creds-{}", std::process::id());
+        let tmp_dir = format!("/tmp/tv-test-home-no-creds-{}", std::process::id());
         let _ = std::fs::create_dir_all(&tmp_dir);
         // No .aws directory at all
         // SAFETY: test is single-threaded for this env var manipulation
@@ -327,7 +327,7 @@ mod tests {
             // Set env var — should return true immediately without checking file
             std::env::set_var("AWS_ACCESS_KEY_ID", "test-priority-key");
             // Set HOME to a nonexistent path so file check would fail
-            std::env::set_var("HOME", "/tmp/nonexistent-dlt-test-dir-999");
+            std::env::set_var("HOME", "/tmp/nonexistent-tv-test-dir-999");
         }
 
         let result = has_aws_credentials();

@@ -8,11 +8,11 @@
 //! - Config validation never panics on arbitrary strings
 
 use chrono::Datelike;
-use dhan_live_trader_common::config::{NseHolidayEntry, TradingConfig};
-use dhan_live_trader_common::order_types::OrderStatus;
-use dhan_live_trader_common::trading_calendar::TradingCalendar;
-use dhan_live_trader_common::types::ExchangeSegment;
 use proptest::prelude::*;
+use tickvault_common::config::{NseHolidayEntry, TradingConfig};
+use tickvault_common::order_types::OrderStatus;
+use tickvault_common::trading_calendar::TradingCalendar;
+use tickvault_common::types::ExchangeSegment;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -209,9 +209,9 @@ proptest! {
     fn proptest_subscription_config_feed_mode_never_panics(
         feed_mode in "[a-zA-Z0-9 ]{0,20}"
     ) {
-        let config = dhan_live_trader_common::config::SubscriptionConfig {
+        let config = tickvault_common::config::SubscriptionConfig {
             feed_mode,
-            ..dhan_live_trader_common::config::SubscriptionConfig::default()
+            ..tickvault_common::config::SubscriptionConfig::default()
         };
         // parsed_feed_mode must not panic — it returns Result
         let _ = config.parsed_feed_mode();

@@ -7,7 +7,7 @@
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
-use dhan_live_trader_trading::risk::engine::RiskEngine;
+use tickvault_trading::risk::engine::RiskEngine;
 
 #[test]
 fn dhat_check_order_approved_zero_alloc() {

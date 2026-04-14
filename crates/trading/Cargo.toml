@@ -1,12 +1,12 @@
 [package]
-name = "dhan-live-trader-trading"
+name = "tickvault-trading"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-dhan-live-trader-common = { path = "../common" }
+tickvault-common = { path = "../common" }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
@@ -29,7 +29,7 @@ loom = { workspace = true, optional = true }
 loom = ["dep:loom"]
 
 [dev-dependencies]
-dhan-live-trader-core = { path = "../core" }
+tickvault-core = { path = "../core" }
 criterion = { workspace = true }
 dhat = { workspace = true }
 proptest = { workspace = true }
@@ -43,4 +43,4 @@ name = "obi"
 harness = false
 
 [package.metadata.cargo-machete]
-ignored = ["anyhow", "chrono", "chrono-tz", "dhan-live-trader-common", "governor", "jaeckel", "loom", "metrics", "secrecy", "serde", "thiserror", "tokio", "tracing", "uuid"]
+ignored = ["anyhow", "chrono", "chrono-tz", "tickvault-common", "governor", "jaeckel", "loom", "metrics", "secrecy", "serde", "thiserror", "tokio", "tracing", "uuid"]

@@ -192,9 +192,9 @@ fi
 # ─────────────────────────────────────────────
 echo "  [9/9] S6 invariants — DEDUP + depth + Bible lockdown..." >&2
 INVARIANT_FAILED=0
-for INV_TEST in dedup_uniqueness_proptest:dhan-live-trader-storage \
-                bible_deletion_lockdown:dhan-live-trader-common \
-                depth_invariants_proptest:dhan-live-trader-common; do
+for INV_TEST in dedup_uniqueness_proptest:tickvault-storage \
+                bible_deletion_lockdown:tickvault-common \
+                depth_invariants_proptest:tickvault-common; do
   TEST_NAME="${INV_TEST%%:*}"
   CRATE="${INV_TEST##*:}"
   INV_OUT=$(timeout 60 cargo test -p "$CRATE" --test "$TEST_NAME" 2>&1)

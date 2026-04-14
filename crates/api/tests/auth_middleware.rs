@@ -11,7 +11,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::routing::get;
-use dhan_live_trader_api::middleware::{ApiAuthConfig, require_bearer_auth};
+use tickvault_api::middleware::{ApiAuthConfig, require_bearer_auth};
 use tower::ServiceExt;
 
 fn auth_app(config: ApiAuthConfig) -> Router {

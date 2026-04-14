@@ -13,7 +13,7 @@
       "id": 1,
       "options": {
         "code": { "language": "plaintext", "showLineNumbers": false, "showMiniMap": false },
-        "content": "## Loki + Alloy removed (saves 2.5GB RAM)\n\n**View logs via:**\n- `docker logs dlt-app --tail 100 -f` (local)\n- AWS CloudWatch Logs (production)\n- Application JSON logs: `cargo run 2>&1 | jq .`",
+        "content": "## Loki + Alloy removed (saves 2.5GB RAM)\n\n**View logs via:**\n- `docker logs tickvault --tail 100 -f` (local)\n- AWS CloudWatch Logs (production)\n- Application JSON logs: `cargo run 2>&1 | jq .`",
         "mode": "markdown"
       },
       "title": "Log Aggregation Status",
@@ -21,7 +21,7 @@
     }
   ],
   "schemaVersion": 39,
-  "tags": ["dhan-live-trader", "logs"],
+  "tags": ["tickvault", "logs"],
   "templating": { "list": [] },
   "refresh": "",
   "time": { "from": "now-1h", "to": "now" },
@@ -30,6 +30,6 @@
   },
   "timezone": "Asia/Kolkata",
   "title": "DLT — Logs",
-  "uid": "dlt-logs",
+  "uid": "tv-logs",
   "version": 1
 }

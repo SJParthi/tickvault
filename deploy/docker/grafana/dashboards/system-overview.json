@@ -12,7 +12,7 @@
       }
     ]
   },
-  "description": "dhan-live-trader system overview — infrastructure health, application metrics, and trading status",
+  "description": "tickvault system overview — infrastructure health, application metrics, and trading status",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -43,7 +43,7 @@
       "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "title": "Application",
       "type": "stat",
-      "targets": [{ "expr": "up{job=\"dlt-application\"}", "legendFormat": "", "refId": "A" }]
+      "targets": [{ "expr": "up{job=\"tickvault\"}", "legendFormat": "", "refId": "A" }]
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
@@ -62,7 +62,7 @@
       "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "title": "QuestDB",
       "type": "stat",
-      "targets": [{ "expr": "up{job=\"dlt-questdb\"}", "legendFormat": "", "refId": "A" }]
+      "targets": [{ "expr": "up{job=\"tv-questdb\"}", "legendFormat": "", "refId": "A" }]
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
@@ -81,7 +81,7 @@
       "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "title": "Prometheus",
       "type": "stat",
-      "targets": [{ "expr": "up{job=\"dlt-prometheus\"}", "legendFormat": "", "refId": "A" }]
+      "targets": [{ "expr": "up{job=\"tv-prometheus\"}", "legendFormat": "", "refId": "A" }]
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
@@ -100,7 +100,7 @@
       "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "title": "Traefik",
       "type": "stat",
-      "targets": [{ "expr": "up{job=\"dlt-traefik\"}", "legendFormat": "", "refId": "A" }]
+      "targets": [{ "expr": "up{job=\"tv-traefik\"}", "legendFormat": "", "refId": "A" }]
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
@@ -119,7 +119,7 @@
       "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "title": "Valkey",
       "type": "stat",
-      "targets": [{ "expr": "up{job=\"dlt-valkey\"}", "legendFormat": "", "refId": "A" }]
+      "targets": [{ "expr": "up{job=\"tv-valkey\"}", "legendFormat": "", "refId": "A" }]
     },
     {
       "collapsed": false,
@@ -143,7 +143,7 @@
       "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "title": "Tick Processing Rate",
       "type": "timeseries",
-      "targets": [{ "expr": "rate(dlt_ticks_processed_total[1m])", "legendFormat": "ticks/sec", "refId": "A" }]
+      "targets": [{ "expr": "rate(tv_ticks_processed_total[1m])", "legendFormat": "ticks/sec", "refId": "A" }]
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
@@ -161,9 +161,9 @@
       "title": "Tick Processing Latency",
       "type": "timeseries",
       "targets": [
-        { "expr": "histogram_quantile(0.50, rate(dlt_tick_processing_duration_ns_bucket[1m]))", "legendFormat": "p50", "refId": "A" },
-        { "expr": "histogram_quantile(0.95, rate(dlt_tick_processing_duration_ns_bucket[1m]))", "legendFormat": "p95", "refId": "B" },
-        { "expr": "histogram_quantile(0.99, rate(dlt_tick_processing_duration_ns_bucket[1m]))", "legendFormat": "p99", "refId": "C" }
+        { "expr": "histogram_quantile(0.50, rate(tv_tick_processing_duration_ns_bucket[1m]))", "legendFormat": "p50", "refId": "A" },
+        { "expr": "histogram_quantile(0.95, rate(tv_tick_processing_duration_ns_bucket[1m]))", "legendFormat": "p95", "refId": "B" },
+        { "expr": "histogram_quantile(0.99, rate(tv_tick_processing_duration_ns_bucket[1m]))", "legendFormat": "p99", "refId": "C" }
       ]
     },
     {
@@ -182,8 +182,8 @@
       "title": "WebSocket Connections",
       "type": "timeseries",
       "targets": [
-        { "expr": "dlt_websocket_connections_active", "legendFormat": "active", "refId": "A" },
-        { "expr": "rate(dlt_websocket_reconnections_total[5m])", "legendFormat": "reconnections/5m", "refId": "B" }
+        { "expr": "tv_websocket_connections_active", "legendFormat": "active", "refId": "A" },
+        { "expr": "rate(tv_websocket_reconnections_total[5m])", "legendFormat": "reconnections/5m", "refId": "B" }
       ]
     },
     {
@@ -202,9 +202,9 @@
       "title": "Orders (Rate)",
       "type": "timeseries",
       "targets": [
-        { "expr": "rate(dlt_orders_placed_total[5m])", "legendFormat": "placed", "refId": "A" },
-        { "expr": "rate(dlt_orders_filled_total[5m])", "legendFormat": "filled", "refId": "B" },
-        { "expr": "rate(dlt_orders_rejected_total[5m])", "legendFormat": "rejected", "refId": "C" }
+        { "expr": "rate(tv_orders_placed_total[5m])", "legendFormat": "placed", "refId": "A" },
+        { "expr": "rate(tv_orders_filled_total[5m])", "legendFormat": "filled", "refId": "B" },
+        { "expr": "rate(tv_orders_rejected_total[5m])", "legendFormat": "rejected", "refId": "C" }
       ]
     },
     {
@@ -223,8 +223,8 @@
       "title": "Process Memory",
       "type": "timeseries",
       "targets": [
-        { "expr": "process_resident_memory_bytes{job=\"dlt-application\"}", "legendFormat": "RSS", "refId": "A" },
-        { "expr": "process_virtual_memory_bytes{job=\"dlt-application\"}", "legendFormat": "Virtual", "refId": "B" }
+        { "expr": "process_resident_memory_bytes{job=\"tickvault\"}", "legendFormat": "RSS", "refId": "A" },
+        { "expr": "process_virtual_memory_bytes{job=\"tickvault\"}", "legendFormat": "Virtual", "refId": "B" }
       ]
     },
     {
@@ -251,7 +251,7 @@
       "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "title": "Pipeline Status",
       "type": "stat",
-      "targets": [{ "expr": "dlt_pipeline_active", "legendFormat": "", "refId": "A" }]
+      "targets": [{ "expr": "tv_pipeline_active", "legendFormat": "", "refId": "A" }]
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
@@ -269,8 +269,8 @@
       "title": "Frame Processing Rate",
       "type": "timeseries",
       "targets": [
-        { "expr": "rate(dlt_frames_processed_total[1m])", "legendFormat": "frames/sec", "refId": "A" },
-        { "expr": "rate(dlt_ticks_processed_total[1m])", "legendFormat": "ticks/sec", "refId": "B" }
+        { "expr": "rate(tv_frames_processed_total[1m])", "legendFormat": "frames/sec", "refId": "A" },
+        { "expr": "rate(tv_ticks_processed_total[1m])", "legendFormat": "ticks/sec", "refId": "B" }
       ]
     },
     {
@@ -289,12 +289,12 @@
       "title": "Error & Filter Rates",
       "type": "timeseries",
       "targets": [
-        { "expr": "rate(dlt_parse_errors_total[5m])", "legendFormat": "parse errors", "refId": "A" },
-        { "expr": "rate(dlt_storage_errors_total[5m])", "legendFormat": "storage errors", "refId": "B" },
-        { "expr": "rate(dlt_junk_ticks_filtered_total[5m])", "legendFormat": "junk filtered", "refId": "C" },
-        { "expr": "rate(dlt_dedup_filtered_total[5m])", "legendFormat": "dedup filtered", "refId": "D" },
-        { "expr": "rate(dlt_crossed_market_total[5m])", "legendFormat": "crossed market", "refId": "E" },
-        { "expr": "rate(dlt_historical_api_errors_total[5m])", "legendFormat": "historical API errors", "refId": "F" }
+        { "expr": "rate(tv_parse_errors_total[5m])", "legendFormat": "parse errors", "refId": "A" },
+        { "expr": "rate(tv_storage_errors_total[5m])", "legendFormat": "storage errors", "refId": "B" },
+        { "expr": "rate(tv_junk_ticks_filtered_total[5m])", "legendFormat": "junk filtered", "refId": "C" },
+        { "expr": "rate(tv_dedup_filtered_total[5m])", "legendFormat": "dedup filtered", "refId": "D" },
+        { "expr": "rate(tv_crossed_market_total[5m])", "legendFormat": "crossed market", "refId": "E" },
+        { "expr": "rate(tv_historical_api_errors_total[5m])", "legendFormat": "historical API errors", "refId": "F" }
       ]
     },
     {
@@ -370,7 +370,7 @@
     }
   ],
   "schemaVersion": 39,
-  "tags": ["dhan-live-trader", "overview"],
+  "tags": ["tickvault", "overview"],
   "templating": { "list": [] },
   "refresh": "5s",
   "time": { "from": "now-1h", "to": "now" },
@@ -379,6 +379,6 @@
   },
   "timezone": "Asia/Kolkata",
   "title": "DLT — System Overview",
-  "uid": "dlt-system-overview",
+  "uid": "tv-system-overview",
   "version": 100
 }

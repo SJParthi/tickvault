@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
 # =============================================================================
-# dhan-live-trader — Binary Size Gate
+# tickvault — Binary Size Gate
 # =============================================================================
 # Checks that the release binary stays under budget.
 # Stores baseline; fails on >10% growth.
 #
 # Usage: bash scripts/binary-size-gate.sh [binary-path]
 #
-# Default binary: target/release/dhan-live-trader
+# Default binary: target/release/tickvault
 # Max size: 50MB (with AWS SDK + tokio + axum + reqwest + teloxide)
 # Exit 0 = within budget. Exit 1 = too large or >10% growth.
 # =============================================================================
 
 set -euo pipefail
 
-BINARY="${1:-target/release/dhan-live-trader}"
+BINARY="${1:-target/release/tickvault}"
 MAX_BYTES=$((50 * 1024 * 1024))  # 50MB in bytes
 MAX_GROWTH_PCT=10
 BASELINE_FILE="quality/.binary-size-baseline"

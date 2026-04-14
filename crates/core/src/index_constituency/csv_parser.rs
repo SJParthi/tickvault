@@ -6,7 +6,7 @@
 use chrono::NaiveDate;
 use tracing::warn;
 
-use dhan_live_trader_common::instrument_types::IndexConstituent;
+use tickvault_common::instrument_types::IndexConstituent;
 
 /// Parse a constituency CSV into a list of `IndexConstituent` entries.
 ///

@@ -6,8 +6,8 @@
 //! These tests use an unreachable QuestDB config to simulate cold-start
 //! scenarios, verifying the zero-candle-loss guarantee.
 
-use dhan_live_trader_common::config::QuestDbConfig;
-use dhan_live_trader_storage::candle_persistence::LiveCandleWriter;
+use tickvault_common::config::QuestDbConfig;
+use tickvault_storage::candle_persistence::LiveCandleWriter;
 
 /// Returns a `QuestDbConfig` pointing at a non-existent port so that all
 /// ILP connection attempts fail immediately without network delay.

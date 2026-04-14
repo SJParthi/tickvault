@@ -127,7 +127,7 @@
     }
   ],
   "schemaVersion": 39,
-  "tags": ["dhan-live-trader", "traefik"],
+  "tags": ["tickvault", "traefik"],
   "templating": { "list": [] },
   "refresh": "5s",
   "time": { "from": "now-1h", "to": "now" },
@@ -136,6 +136,6 @@
   },
   "timezone": "Asia/Kolkata",
   "title": "DLT — Traefik",
-  "uid": "dlt-traefik",
+  "uid": "tv-traefik",
   "version": 1
 }

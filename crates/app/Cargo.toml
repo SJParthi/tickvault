@@ -1,24 +1,24 @@
 [package]
-name = "dhan-live-trader-app"
+name = "tickvault-app"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [lib]
-name = "dhan_live_trader_app"
+name = "tickvault_app"
 path = "src/lib.rs"
 
 [[bin]]
-name = "dhan-live-trader"
+name = "tickvault"
 path = "src/main.rs"
 
 [dependencies]
-dhan-live-trader-common = { path = "../common" }
-dhan-live-trader-core = { path = "../core" }
-dhan-live-trader-trading = { path = "../trading" }
-dhan-live-trader-storage = { path = "../storage" }
-dhan-live-trader-api = { path = "../api" }
+tickvault-common = { path = "../common" }
+tickvault-core = { path = "../core" }
+tickvault-trading = { path = "../trading" }
+tickvault-storage = { path = "../storage" }
+tickvault-api = { path = "../api" }
 tokio = { workspace = true }
 governor = { workspace = true }
 axum = { workspace = true }

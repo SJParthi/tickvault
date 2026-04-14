@@ -15,8 +15,8 @@ use anyhow::{Context, Result};
 use memmap2::Mmap;
 use tracing::info;
 
-use dhan_live_trader_common::constants::BINARY_CACHE_FILENAME;
-use dhan_live_trader_common::instrument_types::{ArchivedFnoUniverse, FnoUniverse};
+use tickvault_common::constants::BINARY_CACHE_FILENAME;
+use tickvault_common::instrument_types::{ArchivedFnoUniverse, FnoUniverse};
 
 /// Magic bytes at the start of every rkyv cache file.
 const CACHE_MAGIC: &[u8; 4] = b"RKYV";
@@ -242,13 +242,13 @@ impl MappedUniverse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dhan_live_trader_common::instrument_types::UniverseBuildMetadata;
     use std::collections::HashMap;
+    use tickvault_common::instrument_types::UniverseBuildMetadata;
 
     /// Build a minimal FnoUniverse for testing.
     fn test_universe() -> FnoUniverse {
         use chrono::Utc;
-        let ist = dhan_live_trader_common::trading_calendar::ist_offset();
+        let ist = tickvault_common::trading_calendar::ist_offset();
         FnoUniverse {
             underlyings: HashMap::new(),
             derivative_contracts: HashMap::new(),
@@ -273,7 +273,7 @@ mod tests {
 
     fn unique_temp_dir(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
-            "dlt-test-{name}-{}-{:?}",
+            "tv-test-{name}-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ))
@@ -305,7 +305,7 @@ mod tests {
 
     #[test]
     fn test_read_binary_cache_missing_returns_none() {
-        let result = read_binary_cache("/tmp/dlt-nonexistent-rkyv-cache-98765").unwrap();
+        let result = read_binary_cache("/tmp/tv-nonexistent-rkyv-cache-98765").unwrap();
         assert!(result.is_none());
     }
 
@@ -432,7 +432,7 @@ mod tests {
 
     #[test]
     fn test_mapped_universe_load_missing_returns_none() {
-        let result = MappedUniverse::load("/tmp/dlt-nonexistent-mapped-cache-98765").unwrap();
+        let result = MappedUniverse::load("/tmp/tv-nonexistent-mapped-cache-98765").unwrap();
         assert!(result.is_none());
     }
 

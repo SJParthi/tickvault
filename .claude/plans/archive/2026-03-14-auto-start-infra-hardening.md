@@ -49,7 +49,7 @@
 - `fetch_dhan_credentials()` uses `tokio::try_join!()` — ANY single fetch failure = ALL fail, boot halts
 - No metrics on SSM call latency (can't detect degradation)
 - No circuit breaker for repeated SSM failures
-- Token cache at `/tmp/dlt-token-cache` is the fast-boot path — avoids SSM on crash-restart
+- Token cache at `/tmp/tv-token-cache` is the fast-boot path — avoids SSM on crash-restart
 
 ### 5. AWS SSM Failure Modes & Best Practices
 - **Rate limits**: GetParameter = 40 TPS default (can request increase), PutParameter = 10 TPS
@@ -59,7 +59,7 @@
 - **KMS dependency**: SecureString parameters require KMS decrypt. KMS outage = can't read secrets
 - **Credential chain on EC2**: IMDS → IAM role → STS temporary creds (auto-refreshed by SDK)
 - **Credential chain on Mac**: `~/.aws/credentials` file → env vars → no IMDS
-- **Best practice**: Cache secrets locally. Our token cache at `/tmp/dlt-token-cache` already does this for the Dhan token. Infra secrets (QuestDB/Grafana/Valkey passwords) are stable — could also cache
+- **Best practice**: Cache secrets locally. Our token cache at `/tmp/tv-token-cache` already does this for the Dhan token. Infra secrets (QuestDB/Grafana/Valkey passwords) are stable — could also cache
 - **IMDSv2 boot timing**: Instance metadata may take 5-15s to become available after EC2 start
 - **Concurrent SSM calls**: Our `tokio::try_join!` fires 3-5 GetParameter calls simultaneously — well within 40 TPS limit
 
@@ -97,7 +97,7 @@
 - [x] **B1.** Harden `infra.rs` — required vs optional services with container exit code checks (infra.rs:check_required_containers)
   - Files: infra.rs, main.rs
   - Tests: test_required_containers_includes_questdb, test_required_containers_includes_valkey, test_required_containers_does_not_include_grafana
-  - Detail: After `docker compose up -d`, run `docker inspect --format '{{.State.Running}} {{.State.ExitCode}}' <container>` on dlt-questdb and dlt-valkey. ExitCode 137=OOM → HALT, nonzero → HALT. `ensure_infra_running` now returns `bool` — callers in main.rs halt boot on `false`.
+  - Detail: After `docker compose up -d`, run `docker inspect --format '{{.State.Running}} {{.State.ExitCode}}' <container>` on tv-questdb and tv-valkey. ExitCode 137=OOM → HALT, nonzero → HALT. `ensure_infra_running` now returns `bool` — callers in main.rs halt boot on `false`.
 
 - [x] **B2.** Validate QuestDB with actual query (not just TCP port probe) (infra.rs:validate_questdb_query)
   - Files: infra.rs
@@ -140,12 +140,12 @@
 
 ### D. AWS Auto-Start (systemd/infra files — no Rust)
 
-- [x] **D1.** Create systemd service unit (deploy/systemd/dhan-live-trader.service)
-  - Files: deploy/systemd/dhan-live-trader.service
+- [x] **D1.** Create systemd service unit (deploy/systemd/tickvault.service)
+  - Files: deploy/systemd/tickvault.service
   - Tests: (infrastructure file — validated with `systemd-analyze verify`)
 
-- [x] **D2.** Create systemd timer unit (deploy/systemd/dhan-live-trader.timer)
-  - Files: deploy/systemd/dhan-live-trader.timer
+- [x] **D2.** Create systemd timer unit (deploy/systemd/tickvault.timer)
+  - Files: deploy/systemd/tickvault.timer
   - Tests: (infrastructure file — validated with `systemd-analyze verify`)
 
 - [x] **D3.** Create EC2 setup script with Docker + monitoring config (deploy/aws/ec2-setup.sh)
@@ -171,7 +171,7 @@
 08:00  pmset wakeorpoweron fires (safety net for sleep)
 08:15  launchd StartCalendarInterval fires trading-launcher.sh
          |
-         +-- Check ~/.dhan-live-trader-disabled → exit if exists
+         +-- Check ~/.tickvault-disabled → exit if exists
          +-- Flush DNS cache
          +-- Check /Applications/Docker.app exists
          +-- Check docker info (is daemon responsive?)
@@ -207,15 +207,15 @@
          +-- Elastic IP already attached (survives stop/start)
          +-- Boot: 30-60s instance start + 60-90s cloud-init
 08:02  Instance running, Docker daemon up via systemd
-08:15  systemd timer fires dhan-live-trader.service
+08:15  systemd timer fires tickvault.service
          |
          +-- ExecStartPre: docker compose down (cleanup stale containers)
          +-- ExecStartPre: docker compose config --quiet (validate YAML)
-         +-- ExecStart: /opt/dhan-live-trader/bin/dhan-live-trader
+         +-- ExecStart: /opt/tickvault/bin/tickvault
                |
                +-- Same boot sequence as Mac (from Config onward)
                +-- SSM credentials via IAM instance profile (IMDSv2)
-               +-- Token cache at /tmp/dlt-token-cache (survives restarts)
+               +-- Token cache at /tmp/tv-token-cache (survives restarts)
 08:25  Everything ready
 09:00  StorageGate opens
 15:30  Market close → WebSockets disconnect
@@ -261,7 +261,7 @@
 | 29 | Elastic IP detached from EC2 | No public IP → Dhan static IP check fails | IP verification catches it → CRITICAL alert |
 | 30 | EBS volume full (QuestDB WAL) | Disk space check at boot | CRITICAL alert, halt; CloudWatch alarm for >85% |
 | 31 | AWS credentials expired (Mac dev) | SSM fetch returns auth error | Log clear message: "run `aws sso login`" |
-| 32 | Mac auto-start still fires after AWS prod deployed | Kill switch file check | `~/.dhan-live-trader-disabled` → launcher exits cleanly |
+| 32 | Mac auto-start still fires after AWS prod deployed | Kill switch file check | `~/.tickvault-disabled` → launcher exits cleanly |
 
 ## Key Invariants
 
@@ -274,7 +274,7 @@
 7. **Mac: sleep prevented** — `pmset -c sleep 0`, scheduled wake at 08:00 as safety net
 8. **AWS: `Persistent=true`** — missed timer fires on next boot, Elastic IP survives stop/start
 9. **WebSocket has ZERO Docker dependency** — WebSocket connects via Dhan token (SSM/cache) + subscription plan (CSV/binary cache). Docker/QuestDB is cold-path only via StorageGate
-10. **Kill switch for Mac** — `~/.dhan-live-trader-disabled` file disables auto-start when AWS goes live
+10. **Kill switch for Mac** — `~/.tickvault-disabled` file disables auto-start when AWS goes live
 
 ---
 
@@ -359,10 +359,10 @@ sleep 10
 **Steps:**
 ```bash
 # 1. Kill QuestDB with OOM signal (simulates kernel OOM killer)
-docker kill --signal=KILL dlt-questdb
+docker kill --signal=KILL tv-questdb
 
 # 2. Verify ExitCode is 137
-docker inspect dlt-questdb --format '{{.State.ExitCode}}'
+docker inspect tv-questdb --format '{{.State.ExitCode}}'
 # Expected output: 137
 
 # 3. Now start the app — it should detect the dead container
@@ -397,11 +397,11 @@ sleep 10
 **Steps:**
 ```bash
 # 1. Stop QuestDB with error exit (simulates config error)
-docker stop dlt-questdb
+docker stop tv-questdb
 
 # 2. Corrupt QuestDB config to force exit code 1 on restart
 # (Alternative: just check that a stopped container is detected)
-docker inspect dlt-questdb --format '{{.State.ExitCode}}'
+docker inspect tv-questdb --format '{{.State.ExitCode}}'
 
 # 3. Start the app
 cargo run --release 2>&1 | tee /tmp/st-04.log
@@ -432,10 +432,10 @@ grep -i "exit.*code\|required.*service\|CRITICAL" /tmp/st-04.log
 **Steps:**
 ```bash
 # 1. Stop QuestDB if running
-docker stop dlt-questdb 2>/dev/null
+docker stop tv-questdb 2>/dev/null
 
 # 2. Start QuestDB fresh (takes time to initialize)
-docker start dlt-questdb
+docker start tv-questdb
 
 # 3. IMMEDIATELY start the app (race condition — port open, DB not ready)
 cargo run --release 2>&1 | tee /tmp/st-05.log &
@@ -468,7 +468,7 @@ sleep 10
 **Steps:**
 ```bash
 # 1. Stop Valkey (but keep QuestDB running)
-docker stop dlt-valkey
+docker stop tv-valkey
 
 # 2. Start the app
 cargo run --release 2>&1 | tee /tmp/st-06.log
@@ -532,7 +532,7 @@ grep -r "INFRA_HEALTH_TIMEOUT" crates/app/src/infra.rs
 # Expected: Duration::from_secs(120)
 
 # 2. Verify the test assertion
-cargo test -p dhan-live-trader -- test_health_timeout_is_reasonable
+cargo test -p tickvault -- test_health_timeout_is_reasonable
 ```
 
 **Pass criteria:**
@@ -640,7 +640,7 @@ grep -i "NonTradingDay\|no.*websocket\|holiday\|weekend" /tmp/st-11.log
 **Steps:**
 ```bash
 # 1. Create the kill switch file
-touch ~/.dhan-live-trader-disabled
+touch ~/.tickvault-disabled
 
 # 2. Run the launcher script
 bash deploy/launchd/trading-launcher.sh 2>&1 | tee /tmp/st-12.log
@@ -649,7 +649,7 @@ bash deploy/launchd/trading-launcher.sh 2>&1 | tee /tmp/st-12.log
 cat /tmp/st-12.log
 
 # 4. Remove kill switch
-rm ~/.dhan-live-trader-disabled
+rm ~/.tickvault-disabled
 ```
 
 **Pass criteria:**
@@ -772,8 +772,8 @@ launchctl list | grep dhan
 launchctl start co.dhan.live-trader
 
 # 6. Check output logs
-cat /tmp/dlt-launchd-stdout.log
-cat /tmp/dlt-launchd-stderr.log
+cat /tmp/tv-launchd-stdout.log
+cat /tmp/tv-launchd-stderr.log
 
 # 7. Unload after testing
 launchctl unload ~/Library/LaunchAgents/co.dhan.live-trader.plist

@@ -1,5 +1,5 @@
 # =============================================================================
-# dhan-live-trader — Per-Crate Coverage Thresholds
+# tickvault — Per-Crate Coverage Thresholds
 # =============================================================================
 # Used by: scripts/coverage-gate.sh (CI Stage 6)
 #

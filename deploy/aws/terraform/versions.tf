@@ -18,11 +18,11 @@ terraform {
   # creating the bucket, then migrating with `terraform init -migrate-state`.
   #
   # backend "s3" {
-  #   bucket         = "dlt-terraform-state-<your-account-id>"
+  #   bucket         = "tv-terraform-state-<your-account-id>"
   #   key            = "dlt/prod/terraform.tfstate"
   #   region         = "ap-south-1"
   #   encrypt        = true
-  #   dynamodb_table = "dlt-terraform-locks"
+  #   dynamodb_table = "tv-terraform-locks"
   # }
 }
 
@@ -31,10 +31,10 @@ provider "aws" {
 
   default_tags {
     tags = {
-      Project     = "dhan-live-trader"
+      Project     = "tickvault"
       Environment = var.environment
       ManagedBy   = "terraform"
-      Repo        = "github.com/SJParthi/dhan-live-trader"
+      Repo        = "github.com/SJParthi/tickvault"
     }
   }
 }

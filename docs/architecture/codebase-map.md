@@ -1,4 +1,4 @@
-# Codebase Map — dhan-live-trader
+# Codebase Map — tickvault
 
 > Session start: read THIS file only. Skip CLAUDE.md (auto-loads).
 > S6-Step8 (2026-04-14): The Tech Stack Bible was deleted. The single source of truth for all dependency versions is the workspace root `Cargo.toml` `[workspace.dependencies]` block.
@@ -7,7 +7,7 @@
 ## File Tree
 
 ```
-dhan-live-trader/
+tickvault/
 ├── Cargo.toml                          # Workspace root — ALL versions pinned
 ├── CLAUDE.md                           # Project rules (auto-loaded)
 ├── config/
@@ -120,9 +120,9 @@ dhan-live-trader/
 ```toml
 [trading]     # market_open "09:00", market_close "15:30", timezone "Asia/Kolkata"
 [dhan]        # websocket_url, rest_api_base_url, auth_base_url, instrument_csv_urls, max_instruments
-[questdb]     # host "dlt-questdb", http_port 9000, pg_port 8812, ilp_port 9009
-[valkey]      # host "dlt-valkey", port 6379, max_connections 16
-[prometheus]  # host "dlt-prometheus", port 9090
+[questdb]     # host "tv-questdb", http_port 9000, pg_port 8812, ilp_port 9009
+[valkey]      # host "tv-valkey", port 6379, max_connections 16
+[prometheus]  # host "tv-prometheus", port 9090
 [websocket]   # ping 10s, pong_timeout 10s, reconnect backoff, batch_size 100
 [network]     # request_timeout_ms 5000, ws_timeout_ms 10000, backoff, retries
 [token]       # validity_hours 24, refresh_before_expiry_hours 1
