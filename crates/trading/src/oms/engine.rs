@@ -256,10 +256,16 @@ impl OrderManagementSystem {
         // Sandbox enforcement: block live orders before July 2026.
         // This is a mechanical safety gate — no real money should be at risk
         // until the system is fully validated in production.
-        // 2026-07-01T00:00:00 UTC = 1_782_777_600 epoch seconds.
+        // 2026-07-01T00:00:00 UTC = 1_782_864_000 epoch seconds.
+        //
+        // FIX 2026-04-14 (session 8): the previous value 1_782_777_600 was
+        // ONE DAY TOO EARLY (it was 2026-06-30T00:00:00 UTC). Caught by
+        // `sandbox_enforcement_guard::test_sandbox_deadline_matches_known_utc_epoch`.
+        // Regression test now locks both the constant and the chrono-computed
+        // expected value so this class of bug cannot recur silently.
         #[cfg(not(test))]
         {
-            const SANDBOX_DEADLINE_EPOCH_SECS: i64 = 1_782_777_600;
+            const SANDBOX_DEADLINE_EPOCH_SECS: i64 = 1_782_864_000;
             let now_secs = chrono::Utc::now().timestamp();
             if now_secs < SANDBOX_DEADLINE_EPOCH_SECS {
                 error!("SANDBOX ENFORCEMENT: live orders blocked until 2026-07-01");
