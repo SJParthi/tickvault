@@ -1,0 +1,50 @@
+# S7-Step5 / Phase 8.6: Staging config profile.
+#
+# Merged on top of config/base.toml via:
+#   export DLT_ENVIRONMENT=staging
+#   figment picks up config/staging.toml automatically
+#
+# Staging runs the FULL stack (WebSocket → QuestDB → Grafana → Telegram)
+# against Dhan's sandbox endpoints. No real orders ever placed. This is
+# the dress rehearsal environment for the May 1 AWS go-live.
+#
+# Differences vs base.toml:
+#   - Dhan URLs point at sandbox.dhan.co (orders simulated at Rs 100)
+#   - dry_run = true (extra belt on top of mode = sandbox)
+#   - sandbox_only_until pushed to 2099-12-31 so staging can NEVER accidentally
+#     flip to Live — a stale staging binary running in prod would
+#     still fail at boot
+#   - capital = 10_000 (no real money involved but smaller number
+#     catches any "are you sure this is staging?" operator glance)
+#   - logging level = debug for richer observability during dress rehearsal
+#   - api port = 3002 so a local dev can run prod + staging simultaneously
+
+[strategy]
+config_path = "config/strategies.toml"
+capital = 10000.0
+dry_run = true
+mode = "sandbox"
+# Staging can NEVER flip to Live — 2099 cutoff makes accidental
+# promotion mechanically impossible even if dry_run = false gets
+# flipped in a future misedit.
+sandbox_only_until = "2099-12-31"
+
+[dhan]
+# Dhan sandbox endpoints — orders simulate at fixed Rs 100.
+rest_api_base_url = "https://sandbox.dhan.co/v2"
+# WebSocket still uses the live feed URL (sandbox WS = live WS)
+# but we rely on dry_run to block order submission.
+
+[logging]
+level = "debug"
+format = "json"
+
+[api]
+# Different port so staging + prod can coexist on the same machine.
+port = 3002
+
+[strategy]
+# Duplicate block allowed by figment — last-write-wins. Explicitly
+# name the sandbox-only_until here again so a quick grep shows the
+# 2099 cutoff near the top of the file.
+sandbox_only_until = "2099-12-31"
