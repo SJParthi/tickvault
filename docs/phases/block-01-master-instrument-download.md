@@ -463,7 +463,7 @@ lot_size_changed, tick_size_changed, underlying_added, underlying_removed events
 | 2 | `crates/core/src/instrument/delta_detector.rs` | Day-over-day change detection |
 | 3 | `crates/core/src/instrument/validation.rs` | 11 validation checks |
 
-Dependencies: `questdb-rs` (ILP client from Tech Stack Bible).
+Dependencies: `questdb-rs` (ILP client — version pinned in workspace `Cargo.toml`).
 
 ### Queries for Historical Lookups
 

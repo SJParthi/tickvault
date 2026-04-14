@@ -559,7 +559,7 @@ services:
 
 ### If Modifying Dependencies
 
-- [ ] Exact version from Tech Stack Bible V6 (no ^/~/*)
+- [ ] Exact version in workspace `Cargo.toml` `[workspace.dependencies]` (no ^/~/*)
 - [ ] `cargo deny check` passes (licenses + bans + sources + advisories)
 - [ ] `cargo audit` clean (no known CVEs)
 - [ ] License in deny.toml allow-list

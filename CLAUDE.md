@@ -1,6 +1,6 @@
 # CLAUDE.md — dhan-live-trader
 
-> **Authority chain:** Tech Stack Bible V6 > this file > defaults. If neither covers a topic, ASK Parthiban.
+> **Authority chain (S6-Step8 — Bible deleted):** `Cargo.toml` workspace deps + `deny.toml` + `dhan_locked_facts.rs` are the executable single source of truth for versions and Dhan facts. This file (`CLAUDE.md`) is the workflow + architecture guide. If neither covers a topic, ASK Parthiban.
 
 ## THREE PRINCIPLES
 
@@ -25,7 +25,7 @@ Every file, function, config decision must pass all three. No exceptions.
 **Start:** git pull → read CLAUDE.md → read phase doc → git log -20 → Cargo.toml → cargo check → cargo test
 **End:** Run `/quality` skill → commit → push → summary.
 
-Do NOT read Bible at startup. Read it ONLY when adding/updating a dependency.
+Do NOT read reference docs (Dhan refs, standards/) at startup. Read them ONLY when implementing that specific topic.
 
 ## WORKFLOW
 
@@ -163,7 +163,7 @@ Branch protection ON: Build & Verify, Security & Audit, Commit Lint, Secret Scan
 ## CARGO
 
 - Workspace deps in root Cargo.toml, crates use `{ workspace = true }`
-- Exact versions ONLY from Bible. `^`, `~`, `*`, `>=` are BANNED. `cargo update` is BANNED.
+- Exact versions ONLY in workspace `Cargo.toml`. `^`, `~`, `*`, `>=` are BANNED. `cargo update` is BANNED. New dep additions need Parthiban approval.
 - `edition = "2024"`, `rust-version = "1.93.1"` in every crate
 - Release profile: `overflow-checks = true`, `lto = "thin"`, `codegen-units = 1`, `panic = "abort"`, `strip = "symbols"`
 
@@ -398,7 +398,7 @@ Override per environment via `config/{env}.toml` or env vars.
 | Purpose | Path |
 |---------|------|
 | Phase 1 spec | `docs/phases/phase-1-live-trading.md` |
-| Tech Stack Bible | `docs/architecture/tech-stack-bible.md` |
+| Workspace deps (executable truth) | `Cargo.toml` |
 | Dhan API reference | `docs/dhan-ref/*.md` (21 files) |
 | Benchmark budgets | `quality/benchmark-budgets.toml` |
 | Coverage thresholds | `quality/crate-coverage-thresholds.toml` |
@@ -422,7 +422,7 @@ See `.claude/rules/project/plan-enforcement.md` for full protocol.
 
 - Never re-read files already in session. Parallelize reads. Keep responses short.
 - No filler phrases. No repeating rules back. No essays.
-- Bible: read ONLY when adding deps. PDFs: NEVER. Reference docs: ONLY when implementing that topic.
+- Cargo.toml is the version source of truth (Bible deleted in S6-Step8). PDFs: NEVER. Reference docs: ONLY when implementing that topic.
 
 ## COMPACTION
 
