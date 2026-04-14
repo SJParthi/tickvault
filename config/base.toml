@@ -214,6 +214,12 @@ dry_run = true  # SAFETY: never place real orders — paper trading only
 # sandbox = HTTP to sandbox.dhan.co, fills at ₹100, no static IP needed
 # live   = HTTP to api.dhan.co, real exchange, static IP required
 mode = "sandbox"
+# S6-Step4: Sandbox-only enforcement until this date (YYYY-MM-DD).
+# If today_ist <= this date AND mode = "live", boot panics. Set to a past
+# date to disable. Default 2026-06-30 per Parthiban "no real orders until
+# June end". Hard boot gate — protects real money during the validation
+# period.
+sandbox_only_until = "2026-06-30"
 
 [logging]
 level = "info"

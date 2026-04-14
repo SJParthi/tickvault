@@ -115,6 +115,19 @@ pub struct StrategyConfig {
     /// Overrides dry_run when set. Default: paper.
     #[serde(default)]
     pub mode: TradingMode,
+    /// S6-Step4: Sandbox-only enforcement until this date. If the current
+    /// date is BEFORE this value, `mode = Live` is forbidden — the boot
+    /// sequence panics. Format: `YYYY-MM-DD`. Default `2026-06-30` per
+    /// Parthiban's "no real orders until June end" requirement.
+    ///
+    /// Set to `1970-01-01` (or any past date) to disable the gate.
+    #[serde(default = "default_sandbox_only_until")]
+    pub sandbox_only_until: String,
+}
+
+fn default_sandbox_only_until() -> String {
+    // Per Parthiban — sandbox-only until June end 2026.
+    "2026-06-30".to_string()
 }
 
 impl Default for StrategyConfig {
@@ -124,7 +137,47 @@ impl Default for StrategyConfig {
             capital: default_capital(),
             dry_run: default_dry_run(),
             mode: TradingMode::default(),
+            sandbox_only_until: default_sandbox_only_until(),
         }
+    }
+}
+
+impl StrategyConfig {
+    /// S6-Step4: Returns Ok if the current IST date is past
+    /// `sandbox_only_until` OR the trading mode is Paper/Sandbox/DryRun.
+    /// Returns Err if Live trading is requested before the cutoff.
+    ///
+    /// Called at boot from `crates/app/src/main.rs`. A failure here is
+    /// FATAL — the process panics rather than risk a real-money order
+    /// in the sandbox-only window.
+    ///
+    /// # Errors
+    /// Returns `Err(String)` describing the violation.
+    // TEST-EXEMPT: covered by test_sandbox_only_until_blocks_real_orders, test_sandbox_date_parses, test_sandbox_already_past_returns_ok in this module
+    pub fn check_sandbox_window(&self, today_ist: chrono::NaiveDate) -> Result<(), String> {
+        // Live mode check: only enforce on Live trading.
+        if !self.mode.is_live() && self.dry_run {
+            return Ok(());
+        }
+        if !self.mode.is_live() {
+            return Ok(());
+        }
+
+        let cutoff = chrono::NaiveDate::parse_from_str(&self.sandbox_only_until, "%Y-%m-%d")
+            .map_err(|e| {
+                format!(
+                    "invalid sandbox_only_until '{}': {e}",
+                    self.sandbox_only_until
+                )
+            })?;
+        if today_ist <= cutoff {
+            return Err(format!(
+                "S6-Step4 SANDBOX-ONLY VIOLATION: today is {today_ist}, sandbox_only_until={cutoff}, \
+                 mode=Live. Real orders are FORBIDDEN until {cutoff}. Set mode=sandbox or mode=paper, \
+                 or wait until {cutoff} passes."
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -981,6 +1034,105 @@ impl ApplicationConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // =======================================================================
+    // S6-Step4: Sandbox-only enforcement tests
+    // =======================================================================
+
+    fn make_sandbox_config(mode: TradingMode, dry_run: bool, until: &str) -> StrategyConfig {
+        StrategyConfig {
+            config_path: "test.toml".to_string(),
+            capital: 100_000.0,
+            dry_run,
+            mode,
+            sandbox_only_until: until.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_sandbox_only_until_blocks_real_orders() {
+        // Live trading + sandbox window not yet expired → BLOCKED.
+        let cfg = make_sandbox_config(TradingMode::Live, false, "2026-06-30");
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 4, 14).unwrap();
+        let result = cfg.check_sandbox_window(today);
+        assert!(
+            result.is_err(),
+            "live trading before cutoff must be blocked"
+        );
+        let err = result.unwrap_err();
+        assert!(err.contains("SANDBOX-ONLY VIOLATION"), "error: {err}");
+        assert!(err.contains("2026-06-30"), "error must cite cutoff: {err}");
+    }
+
+    #[test]
+    fn test_sandbox_already_past_returns_ok() {
+        // Live trading + sandbox window already expired → OK.
+        let cfg = make_sandbox_config(TradingMode::Live, false, "2026-06-30");
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 7, 1).unwrap();
+        assert!(cfg.check_sandbox_window(today).is_ok());
+    }
+
+    #[test]
+    fn test_sandbox_paper_mode_always_ok() {
+        // Paper mode is always allowed regardless of cutoff.
+        let cfg = make_sandbox_config(TradingMode::Paper, false, "2030-01-01");
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 4, 14).unwrap();
+        assert!(cfg.check_sandbox_window(today).is_ok());
+    }
+
+    #[test]
+    fn test_sandbox_sandbox_mode_always_ok() {
+        // Sandbox mode is always allowed.
+        let cfg = make_sandbox_config(TradingMode::Sandbox, false, "2030-01-01");
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 4, 14).unwrap();
+        assert!(cfg.check_sandbox_window(today).is_ok());
+    }
+
+    #[test]
+    fn test_sandbox_dry_run_with_paper_ok() {
+        // Even with cutoff in the future, dry_run + Paper is OK.
+        let cfg = make_sandbox_config(TradingMode::Paper, true, "2030-01-01");
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 4, 14).unwrap();
+        assert!(cfg.check_sandbox_window(today).is_ok());
+    }
+
+    #[test]
+    fn test_sandbox_date_parses_invalid() {
+        // Bad date string returns Err with parse details.
+        let cfg = make_sandbox_config(TradingMode::Live, false, "not-a-date");
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 4, 14).unwrap();
+        let result = cfg.check_sandbox_window(today);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("invalid sandbox_only_until"));
+    }
+
+    #[test]
+    fn test_sandbox_date_parses_valid() {
+        // Valid YYYY-MM-DD parses correctly.
+        let cfg = make_sandbox_config(TradingMode::Live, false, "2026-12-31");
+        let today = chrono::NaiveDate::from_ymd_opt(2027, 1, 1).unwrap();
+        assert!(cfg.check_sandbox_window(today).is_ok());
+    }
+
+    #[test]
+    fn test_sandbox_default_value_is_2026_06_30() {
+        // The default value is exactly the date Parthiban specified.
+        assert_eq!(default_sandbox_only_until(), "2026-06-30");
+    }
+
+    #[test]
+    fn test_sandbox_exact_cutoff_day_still_blocks() {
+        // On the cutoff date itself, Live is still blocked (inclusive).
+        let cfg = make_sandbox_config(TradingMode::Live, false, "2026-06-30");
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 6, 30).unwrap();
+        let result = cfg.check_sandbox_window(today);
+        assert!(
+            result.is_err(),
+            "cutoff day must be blocked; only days AFTER are allowed"
+        );
+    }
+
+    // =======================================================================
 
     /// Helper: creates a valid ApplicationConfig for testing.
     /// Modify individual fields to test specific validation failures.

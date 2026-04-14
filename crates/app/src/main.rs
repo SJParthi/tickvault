@@ -117,6 +117,33 @@ async fn main() -> Result<()> {
         .validate()
         .context("configuration validation failed")?;
 
+    // S6-Step4: Sandbox-only enforcement until 2026-06-30 (per Parthiban
+    // "no real orders until June end"). This is a HARD boot gate — the
+    // process panics if Live mode is requested before the cutoff date.
+    // Real money is at stake, so we fail loud at boot rather than risk
+    // a single live order slipping through. Uses IST date (not UTC) so
+    // the cutoff matches the operator's calendar in India.
+    let today_ist = (chrono::Utc::now()
+        + chrono::TimeDelta::seconds(
+            dhan_live_trader_common::constants::IST_UTC_OFFSET_SECONDS_I64,
+        ))
+    .date_naive();
+    if let Err(e) = config.strategy.check_sandbox_window(today_ist) {
+        error!(
+            error = %e,
+            "S6-Step4 BOOT BLOCKED: sandbox-only window violation"
+        );
+        return Err(anyhow::anyhow!(
+            "sandbox-only enforcement violated at boot: {e}"
+        ));
+    }
+    info!(
+        today_ist = %today_ist,
+        sandbox_only_until = %config.strategy.sandbox_only_until,
+        mode = ?config.strategy.mode,
+        "S6-Step4: sandbox-only window check passed"
+    );
+
     // Build trading calendar (validated inside config.validate() already).
     let trading_calendar = std::sync::Arc::new(
         TradingCalendar::from_config(&config.trading)
