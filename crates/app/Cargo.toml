@@ -20,6 +20,7 @@ dhan-live-trader-trading = { path = "../trading" }
 dhan-live-trader-storage = { path = "../storage" }
 dhan-live-trader-api = { path = "../api" }
 tokio = { workspace = true }
+governor = { workspace = true }
 axum = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }

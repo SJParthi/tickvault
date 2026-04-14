@@ -47,7 +47,7 @@ HOOKS_DIR="$(dirname "$0")"
 FAILED=0
 
 echo "╔══════════════════════════════════════════════╗" >&2
-echo "║      PRE-COMMIT FAST GATE (8 Gates)          ║" >&2
+echo "║      PRE-COMMIT FAST GATE (9 Gates)          ║" >&2
 echo "╚══════════════════════════════════════════════╝" >&2
 
 # ─────────────────────────────────────────────
@@ -185,6 +185,33 @@ else
 fi
 
 # ─────────────────────────────────────────────
+# GATE 9: S6-Step9 commit-time invariant tests (DEDUP + depth + Bible lockdown)
+# Phase 6.6: cheapest mechanical enforcement we can run at commit time.
+# Catches dedup key drift, depth byte-offset drift, Bible reintroduction.
+# Each test is < 1s on a warm cache.
+# ─────────────────────────────────────────────
+echo "  [9/9] S6 invariants — DEDUP + depth + Bible lockdown..." >&2
+INVARIANT_FAILED=0
+for INV_TEST in dedup_uniqueness_proptest:dhan-live-trader-storage \
+                bible_deletion_lockdown:dhan-live-trader-common \
+                depth_invariants_proptest:dhan-live-trader-common; do
+  TEST_NAME="${INV_TEST%%:*}"
+  CRATE="${INV_TEST##*:}"
+  INV_OUT=$(timeout 60 cargo test -p "$CRATE" --test "$TEST_NAME" 2>&1)
+  INV_EXIT=$?
+  if [ "$INV_EXIT" -ne 0 ]; then
+    echo "$INV_OUT" | tail -10 >&2
+    echo "  FAIL: invariant test $TEST_NAME failed at commit time" >&2
+    INVARIANT_FAILED=1
+  fi
+done
+if [ "$INVARIANT_FAILED" -ne 0 ]; then
+  FAILED=1
+else
+  echo "  PASS: 3 commit-time invariants green (~10k+8k random cases verified)" >&2
+fi
+
+# ─────────────────────────────────────────────
 # GATE 8: Typos check (staged files)
 # ─────────────────────────────────────────────
 echo "  [8/8] Typos check..." >&2
@@ -234,6 +261,6 @@ TEST_COUNT=$(grep -r '#\[test\]' crates/ --include='*.rs' 2>/dev/null | wc -l | 
 echo "$HEAD_HASH $(date +%s) $TEST_COUNT" > "$HOOKS_DIR/.last-quality-pass"
 
 echo "╔══════════════════════════════════════════════╗" >&2
-echo "║  ALL 8 GATES PASSED — Commit allowed           ║" >&2
+echo "║  ALL 9 GATES PASSED — Commit allowed           ║" >&2
 echo "╚══════════════════════════════════════════════╝" >&2
 exit 0

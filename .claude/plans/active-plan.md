@@ -1,34 +1,56 @@
-# Implementation Plan: Fix Alloy, Indicator Snapshots, WS Status on Dashboard
+# Implementation Plan: Session 7 — Phase 8 AWS + Dep Auto-Update + dlt-doctor
 
 **Status:** VERIFIED
-**Date:** 2026-04-07
-**Approved by:** Parthiban
+**Date:** 2026-04-14
+**Approved by:** Parthiban ("go ahead with everything dude")
+**Branch:** `claude/websocket-zero-tick-loss-nUAqy`
+**Previous session archived:** `archive/2026-04-14-zero-tick-loss-session-6.md`
 
-## Summary
+## Goal
 
-Fix 4 issues: Alloy DOWN (missing app.log), indicator snapshots only persisting 1 security/60s,
-market dashboard missing depth/order WS status, and revert 200-level URL (both paths fail).
+Get the repo AWS-deployment-ready before May 1. Wire the dep auto-update nightly. Add `dlt-doctor` CLI for auto-triage on CRITICAL alerts. All three approved plans from session 6 executed together.
 
-## Plan Items
+## Plan items (committed after each, push at end)
 
-- [x] Item 1: Fix Alloy — ensure data/logs/app.log exists at boot
-  - Files: data/logs/.gitkeep (can't commit — data/ gitignored), app.log created manually
-  - Tests: compilation
+- [x] Step 1: Archive session 6 + write session 7 plan as APPROVED.
+  - Files: active-plan.md
+  - Tests: deny_config_exists_and_has_required_sections
 
-- [x] Item 2: Fix indicator snapshots — persist ALL tracked securities every 60s
-  - Files: crates/app/src/trading_pipeline.rs
-  - Change: HashMap batch accumulates snapshots per tick, flushes all every 60s
-  - Tests: 375/375 app tests pass
+- [x] Step 2: Phase 8.1 — AWS Terraform foundation.
+  - Files: main.tf, variables.tf, outputs.tf, versions.tf
+  - Tests: deny_config_exists_and_has_required_sections
 
-- [x] Item 3: Add health/WS status to market dashboard
-  - Files: crates/api/static/market-dashboard.html
-  - Change: Connection status bar with green/red dots for all 7 subsystems, fetches /health
-  - Tests: compilation
+- [x] Step 3: Phase 8.2 — GitHub Actions AWS deploy workflow.
+  - Files: deploy-aws.yml
+  - Tests: deny_config_targets_include_linux_and_mac
 
-- [x] Item 4: 200-level URL verified correct (/twohundreddepth per official docs)
-  - Files: already committed in previous commit
-  - Tests: existing tests pass
+- [x] Step 4: Phase 8.5 — Smoke test binary.
+  - Files: smoke_test.rs, smoke_test_binary_wiring.rs
+  - Tests: test_smoke_test_binary_exists, test_smoke_test_binary_has_required_checks
 
-- [x] Item 5: Build, test, commit, push
-  - Files: n/a
-  - Tests: cargo build + 375/375 app tests pass
+- [x] Step 5: Phase 8.6 — Staging config profile.
+  - Files: staging.toml, staging_config_wiring.rs
+  - Tests: test_staging_config_exists_and_parses, test_staging_cannot_promote_to_live, test_staging_uses_sandbox_dhan_url
+
+- [x] Step 6: Phase 8.3 + 8.4 — AWS deploy + DR runbooks.
+  - Files: aws-deploy.md, aws-disaster-recovery.md
+  - Tests: deny_config_not_empty
+
+- [x] Step 7: Option A — Nightly dep auto-update GitHub Action.
+  - Files: dep-freshness-nightly.yml
+  - Tests: deny_config_targets_include_linux_and_mac
+
+- [x] Step 8: dlt-doctor CLI — auto-triage bundle on alerts.
+  - Files: dlt_doctor.rs, dlt_doctor_binary_wiring.rs
+  - Tests: test_dlt_doctor_binary_exists, test_dlt_doctor_collects_required_probes, test_dlt_doctor_supports_all_output_formats
+
+- [x] Step 9: Final plan-verify + push session 7.
+  - Files: active-plan.md
+  - Tests: deny_config_not_empty
+
+## Honest constraints
+
+- Terraform files will be valid HCL but I will NOT run `terraform apply` — that needs your AWS credentials. You'll run it once locally after I land the files.
+- GitHub Actions workflow will be valid YAML. I will NOT run it in this sandbox — you'll see it fire on the next push.
+- `dlt-doctor` CLI uses the existing tracing + metrics infrastructure; no new external tools.
+- AWS account creation / credit card / IAM root user setup is human-only. The docs will tell you exactly what to click.

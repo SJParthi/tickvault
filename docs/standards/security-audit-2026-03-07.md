@@ -273,7 +273,7 @@ api:
 - Documents: `CryptoProvider -> Config -> Logging -> Auth -> QuestDB -> Universe -> WebSocket -> TickProcessor -> API -> TokenRenewal -> Shutdown`
 - Actual (main.rs): 12 steps including Observability (Step 2) and Notification (Step 4) which are missing
 
-### MEDIUM: Tech Stack Bible Version Mismatches
+### MEDIUM: Workspace Cargo.toml Version Drift (formerly Bible)
 - `deadpool-redis`: Bible says 0.22.1, Cargo.toml has 0.23.0
 - `statrs`, `mockall`, `once_cell`, `parking_lot`: Listed in Bible but not in Cargo.toml or code
 

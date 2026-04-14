@@ -119,6 +119,22 @@ pub fn build_router(state: SharedAppState, allowed_origins: &[String], dry_run: 
         .route(
             "/portal/ws-dashboard",
             axum::routing::get(handlers::static_file::ws_dashboard),
+        )
+        .route(
+            "/portal/markets/options",
+            axum::routing::get(handlers::static_file::markets_options),
+        )
+        .route(
+            "/portal/markets/stocks",
+            axum::routing::get(handlers::static_file::markets_stocks),
+        )
+        .route(
+            "/portal/markets/index",
+            axum::routing::get(handlers::static_file::markets_index),
+        )
+        .route(
+            "/portal/option-chain-v2",
+            axum::routing::get(handlers::static_file::options_chain_v2),
         );
 
     public_routes

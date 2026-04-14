@@ -170,7 +170,7 @@ async fn query_available_expiries(
 ) -> Vec<String> {
     let sql = format!(
         "SELECT DISTINCT expiry_date FROM dhan_option_chain_raw \
-         WHERE underlying = '{underlying}' \
+         WHERE underlying_symbol = '{underlying}' \
          ORDER BY expiry_date ASC \
          LIMIT 10"
     );
@@ -220,21 +220,18 @@ async fn query_option_chain(
 ) -> Option<Vec<OptionContract>> {
     // Join dhan_option_chain_raw with option_greeks for the latest snapshot
     let sql = format!(
-        "SELECT r.security_id, r.strike_price, r.option_type, r.expiry_date, \
-         r.ltp, r.iv, \
-         COALESCE(g.delta, 0) as delta, \
-         COALESCE(g.gamma, 0) as gamma, \
-         COALESCE(g.theta, 0) as theta, \
-         COALESCE(g.vega, 0) as vega, \
-         r.oi, r.volume, r.change_pct, r.spot_price, r.ts \
-         FROM dhan_option_chain_raw r \
-         LEFT JOIN option_greeks g ON r.security_id = g.security_id \
-         WHERE r.underlying = '{underlying}' \
-         AND r.expiry_date = '{expiry}' \
-         LATEST ON r.ts PARTITION BY r.security_id \
-         ORDER BY r.strike_price ASC"
+        "SELECT security_id, strike_price, option_type, expiry_date, \
+         last_price as ltp, implied_volatility as iv, \
+         delta, gamma, theta, vega, \
+         oi, volume, \
+         CASE WHEN previous_close_price > 0 THEN ((last_price - previous_close_price) / previous_close_price) * 100 ELSE 0 END as change_pct, \
+         spot_price, ts \
+         FROM dhan_option_chain_raw \
+         WHERE underlying_symbol = '{underlying}' \
+         AND expiry_date = '{expiry}' \
+         LATEST ON ts PARTITION BY security_id \
+         ORDER BY strike_price ASC"
     );
-
     let url = format!("{base_url}/exec");
     let resp = client
         .get(&url)

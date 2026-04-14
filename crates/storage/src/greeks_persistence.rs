@@ -467,7 +467,7 @@ impl GreeksPersistenceWriter {
     /// skips writes until reconnected.
     // TEST-EXEMPT: requires live QuestDB ILP connection (integration test)
     pub fn new(config: &QuestDbConfig) -> Result<Self> {
-        let conf_string = format!("tcp::addr={}:{};", config.host, config.ilp_port);
+        let conf_string = config.build_ilp_conf_string();
         let (sender, buffer) = match Sender::from_conf(&conf_string) {
             Ok(s) => {
                 let b = s.new_buffer();

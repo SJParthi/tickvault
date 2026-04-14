@@ -1,0 +1,88 @@
+#!/bin/bash
+# S7-Step2 / Phase 8.1: EC2 first-boot user-data script.
+#
+# Runs ONCE the first time the instance boots. Installs Docker, the
+# CloudWatch agent, clones the repo, and sets up the systemd unit.
+# DOES NOT start the app — that's done by the GitHub Actions deploy
+# workflow after the first binary build lands.
+
+set -euo pipefail
+
+ENVIRONMENT="${environment}"
+REGION="${region}"
+
+exec > /var/log/dlt-user-data.log 2>&1
+echo "=== dlt user-data starting at $(date -u) ==="
+
+# System update + required packages
+apt-get update
+apt-get install -y \
+    ca-certificates curl gnupg lsb-release \
+    jq awscli unzip git systemd-timesyncd
+
+# Set system timezone to IST for operator convenience (app still uses UTC internally)
+timedatectl set-timezone Asia/Kolkata
+
+# Install Docker via official convenience script (pinned to a specific release
+# channel — operator pins the exact version post-bootstrap)
+curl -fsSL https://get.docker.com | sh
+systemctl enable --now docker
+usermod -aG docker ubuntu
+
+# Install Docker Compose v2 (plugin)
+apt-get install -y docker-compose-plugin
+
+# CloudWatch agent for system metrics + journald
+curl -O https://s3.amazonaws.com/amazoncloudwatch-agent/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb
+dpkg -i amazon-cloudwatch-agent.deb
+rm amazon-cloudwatch-agent.deb
+
+cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<CWCFG
+{
+  "agent": { "metrics_collection_interval": 60 },
+  "metrics": {
+    "metrics_collected": {
+      "disk": { "measurement": ["used_percent"], "resources": ["/"] },
+      "mem":  { "measurement": ["mem_used_percent"] },
+      "cpu":  { "measurement": ["cpu_usage_active"] }
+    },
+    "append_dimensions": {
+      "InstanceId": "\$${!aws:InstanceId}"
+    }
+  },
+  "logs": {
+    "logs_collected": {
+      "files": {
+        "collect_list": [
+          {
+            "file_path": "/var/log/syslog",
+            "log_group_name": "/dlt/\$${environment}/system",
+            "log_stream_name": "{instance_id}"
+          }
+        ]
+      }
+    }
+  }
+}
+CWCFG
+
+systemctl enable --now amazon-cloudwatch-agent
+
+# Create application directories
+mkdir -p /opt/dlt/{config,data/spill,logs,bin}
+chown -R ubuntu:ubuntu /opt/dlt
+
+# Clone the repo (shallow, main branch)
+sudo -u ubuntu git clone --depth 1 \
+    https://github.com/SJParthi/dhan-live-trader.git /opt/dlt/repo
+
+# Start Docker Compose stack (QuestDB, Valkey, Prometheus, Grafana, etc)
+cd /opt/dlt/repo/deploy/docker
+sudo -u ubuntu docker compose up -d
+
+# Install systemd unit (binary drops in via GitHub Actions after first deploy)
+cp /opt/dlt/repo/deploy/systemd/dlt-app.service /etc/systemd/system/
+systemctl daemon-reload
+
+echo "=== dlt user-data complete at $(date -u) ==="
+echo "Next step: GitHub Actions deploy-aws workflow will scp the first binary."

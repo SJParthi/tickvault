@@ -118,7 +118,7 @@ pub struct StockMoversWriter {
 impl StockMoversWriter {
     /// Creates a new stock movers writer connected to QuestDB via ILP TCP.
     pub fn new(config: &QuestDbConfig) -> Result<Self> {
-        let conf_string = format!("tcp::addr={}:{};", config.host, config.ilp_port);
+        let conf_string = config.build_ilp_conf_string();
         let sender = Sender::from_conf(&conf_string)
             .context("failed to connect to QuestDB for stock movers")?;
         let buffer = sender.new_buffer();
@@ -160,7 +160,11 @@ impl StockMoversWriter {
         change_pct: f64,
         volume: i64,
     ) -> Result<()> {
-        let change_abs = ltp - prev_close;
+        // Round all f64 values to 2dp to prevent IEEE 754 artifacts in QuestDB.
+        let ltp = (ltp * 100.0).round() / 100.0;
+        let prev_close = (prev_close * 100.0).round() / 100.0;
+        let change_abs = ((ltp - prev_close) * 100.0).round() / 100.0;
+        let change_pct = (change_pct * 100.0).round() / 100.0;
         let ts = TimestampNanos::new(ts_nanos);
 
         // ILP requires: table → ALL symbols → ALL columns → at
@@ -262,7 +266,7 @@ pub struct OptionMoversWriter {
 impl OptionMoversWriter {
     /// Creates a new option movers writer connected to QuestDB via ILP TCP.
     pub fn new(config: &QuestDbConfig) -> Result<Self> {
-        let conf_string = format!("tcp::addr={}:{};", config.host, config.ilp_port);
+        let conf_string = config.build_ilp_conf_string();
         let sender = Sender::from_conf(&conf_string)
             .context("failed to connect to QuestDB for option movers")?;
         let buffer = sender.new_buffer();
@@ -306,6 +310,14 @@ impl OptionMoversWriter {
         volume: i64,
         value: f64,
     ) -> Result<()> {
+        // Round all f64 values to 2dp to prevent IEEE 754 artifacts in QuestDB.
+        let strike = (strike * 100.0).round() / 100.0;
+        let spot_price = (spot_price * 100.0).round() / 100.0;
+        let ltp = (ltp * 100.0).round() / 100.0;
+        let change = (change * 100.0).round() / 100.0;
+        let change_pct = (change_pct * 100.0).round() / 100.0;
+        let oi_change_pct = (oi_change_pct * 100.0).round() / 100.0;
+        let value = (value * 100.0).round() / 100.0;
         let ts = TimestampNanos::new(ts_nanos);
 
         // ILP requires: table → ALL symbols → ALL columns → at

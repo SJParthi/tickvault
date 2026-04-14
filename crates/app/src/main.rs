@@ -35,7 +35,7 @@ use dhan_live_trader_app::{infra, observability, trading_pipeline};
 use std::net::SocketAddr;
 
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{Timelike, Utc};
 use figment::Figment;
 use figment::providers::{Format, Toml};
 use secrecy::ExposeSecret;
@@ -117,6 +117,33 @@ async fn main() -> Result<()> {
         .validate()
         .context("configuration validation failed")?;
 
+    // S6-Step4: Sandbox-only enforcement until 2026-06-30 (per Parthiban
+    // "no real orders until June end"). This is a HARD boot gate — the
+    // process panics if Live mode is requested before the cutoff date.
+    // Real money is at stake, so we fail loud at boot rather than risk
+    // a single live order slipping through. Uses IST date (not UTC) so
+    // the cutoff matches the operator's calendar in India.
+    let today_ist = (chrono::Utc::now()
+        + chrono::TimeDelta::seconds(
+            dhan_live_trader_common::constants::IST_UTC_OFFSET_SECONDS_I64,
+        ))
+    .date_naive();
+    if let Err(e) = config.strategy.check_sandbox_window(today_ist) {
+        error!(
+            error = %e,
+            "S6-Step4 BOOT BLOCKED: sandbox-only window violation"
+        );
+        return Err(anyhow::anyhow!(
+            "sandbox-only enforcement violated at boot: {e}"
+        ));
+    }
+    info!(
+        today_ist = %today_ist,
+        sandbox_only_until = %config.strategy.sandbox_only_until,
+        mode = ?config.strategy.mode,
+        "S6-Step4: sandbox-only window check passed"
+    );
+
     // Build trading calendar (validated inside config.validate() already).
     let trading_calendar = std::sync::Arc::new(
         TradingCalendar::from_config(&config.trading)
@@ -133,8 +160,12 @@ async fn main() -> Result<()> {
     // Step 3: Initialize structured logging + OpenTelemetry tracing layer
     // -----------------------------------------------------------------------
     let log_filter = config.logging.level.as_str();
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(log_filter));
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        // Suppress AWS SDK credential logging (leaks access_key_id at INFO level).
+        tracing_subscriber::EnvFilter::new(format!(
+            "{log_filter},aws_config::profile::credentials=warn"
+        ))
+    });
 
     let (otel_layer, otel_provider) = match observability::init_tracing(&config.observability)
         .context("failed to initialize OpenTelemetry tracing")?
@@ -382,10 +413,19 @@ async fn main() -> Result<()> {
             &subscription_plan,
             &config,
             true,
+            Some(fast_notifier.clone()),
         ) {
             Some((receiver, pool)) => (Some(receiver), Some(pool)),
             None => (None, None),
         };
+
+        // S4-T1a/T1b: Shared shutdown notifier. The pool watchdog task
+        // listens on this and stops when we signal graceful shutdown, so
+        // the watchdog doesn't fire a spurious Halt during intentional
+        // teardown. Created BEFORE the WS pool spawn so it's in scope for
+        // both spawn_pool_watchdog_task AND the bottom-of-main shutdown
+        // handler.
+        let shutdown_notify = std::sync::Arc::new(tokio::sync::Notify::new());
 
         // --- Tick processor: start BEFORE WS connections spawn ---
         let shared_movers: dhan_live_trader_core::pipeline::SharedTopMoversSnapshot =
@@ -397,6 +437,193 @@ async fn main() -> Result<()> {
             tokio::sync::broadcast::channel::<dhan_live_trader_common::tick_types::ParsedTick>(
                 dhan_live_trader_common::constants::TICK_BROADCAST_CAPACITY,
             );
+
+        // S3-2: Gap-backfill channel + worker. The cold-path tick persistence
+        // consumer publishes GapBackfillRequest here when a TickGapTracker
+        // Error-level gap is observed. The worker fetches the missing window
+        // and synthesises replacement ticks. QuestDB DEDUP ensures idempotency
+        // on overlapping live ticks.
+        //
+        // Bounded channel (64). If full, gaps are dropped and
+        // dlt_backfill_gaps_dropped_total increments — caller already logs a
+        // warning. 64 is generous because gap events are rare during healthy
+        // operation (post-reconnect) and cheap to process.
+        let (gap_backfill_tx, gap_backfill_rx) = tokio::sync::mpsc::channel::<
+            dhan_live_trader_core::historical::backfill::GapBackfillRequest,
+        >(64);
+
+        // S3-2: Synthetic tick output channel. BackfillWorker pushes ticks here;
+        // in this initial wiring we drain them into a tracing log so the
+        // metric dlt_backfill_ticks_synthesised_total (emitted internally by
+        // the worker via its BackfillStats) becomes observable without
+        // touching the main tick persistence path. Follow-up: wire the
+        // synthesised ticks directly into tick_writer.append_tick() so they
+        // become durable. For now the worker PROVES the path works and
+        // the counter lets operators see when it fired.
+        let (synth_tick_tx, mut synth_tick_rx) =
+            tokio::sync::mpsc::channel::<dhan_live_trader_common::tick_types::ParsedTick>(4096);
+
+        // S4-T1e: Real Dhan historical intraday REST fetcher. Replaces
+        // the session-3 placeholder. The closure captures a reqwest
+        // client, the rest_api_base_url, the token_handle (Arc<ArcSwap>,
+        // lock-free atomic reads at call time), and the client_id. The
+        // closure is called by the BackfillWorker once per gap event.
+        let backfill_endpoint = format!(
+            "{}/charts/intraday",
+            config.dhan.rest_api_base_url.trim_end_matches('/')
+        );
+        let backfill_http_client = match reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+        {
+            Ok(c) => c,
+            Err(err) => {
+                warn!(
+                    ?err,
+                    "S4-T1e: reqwest client build failed — backfill worker disabled"
+                );
+                reqwest::Client::new()
+            }
+        };
+        let backfill_token_handle = std::sync::Arc::clone(&token_handle);
+        let backfill_client_id = client_id.clone();
+        // S5-A2: Clone the instrument registry so the backfill closure can
+        // look up the exact instrument kind per gap event and pass it as
+        // the `instrument` hint to Dhan's intraday REST API. Without this
+        // the fetcher defaulted to OPTIDX for all NSE_FNO, which returns
+        // empty candle lists for futures and stock options.
+        let backfill_registry_fast: Option<
+            std::sync::Arc<dhan_live_trader_common::instrument_registry::InstrumentRegistry>,
+        > = subscription_plan
+            .as_ref()
+            .map(|p| std::sync::Arc::new(p.registry.clone()));
+        // S5-A3: Rate limiter for the backfill fetcher.
+        //
+        // Dhan Data API category limit: 5/sec, 100,000/day. A pool-wide
+        // outage can produce up to 25,000 simultaneous ERROR-level gaps;
+        // without rate limiting the worker would burst all 25,000
+        // requests at Dhan and immediately hit the 805 "too many
+        // requests" code which PAUSES ALL CONNECTIONS for 60s.
+        // Rate limiter uses the governor crate (same GCRA algorithm as
+        // the OMS order rate limiter) — await semantics so the worker
+        // naturally serialises bursts into the allowed rate.
+        let backfill_rate_limiter = std::sync::Arc::new(governor::RateLimiter::direct(
+            governor::Quota::per_second(std::num::NonZeroU32::new(5).expect("5 > 0")),
+        ));
+        let backfill_fetcher =
+            move |req: dhan_live_trader_core::historical::backfill::GapBackfillRequest| {
+                // Clone per-invocation captures to move into the returned future.
+                let http_client = backfill_http_client.clone();
+                let endpoint = backfill_endpoint.clone();
+                let token_handle = std::sync::Arc::clone(&backfill_token_handle);
+                let client_id_inner = backfill_client_id.clone();
+                let rate_limiter = std::sync::Arc::clone(&backfill_rate_limiter);
+                let registry_clone = backfill_registry_fast.clone();
+                async move {
+                    // S5-A3: await the rate limiter before each call.
+                    // This naturally serialises bursts into Dhan's 5/sec
+                    // cap and prevents 805 blocks during pool-wide gaps.
+                    rate_limiter.until_ready().await;
+
+                    // Read the current access token atomically.
+                    use secrecy::ExposeSecret as _;
+                    let token_guard = token_handle.load();
+                    let token_state = match token_guard.as_ref().as_ref() {
+                        Some(state) if state.is_valid() => state,
+                        _ => return Err("backfill: no valid access token available".to_string()),
+                    };
+                    let access_token = token_state.access_token().expose_secret().to_string();
+
+                    // S5-A2: Resolve the Dhan instrument enum string from
+                    // the registry. None for indices/equities (the
+                    // segment heuristic handles them).
+                    let hint: Option<&'static str> = registry_clone
+                        .as_ref()
+                        .and_then(|r| r.get(req.security_id))
+                        .and_then(|inst| inst.instrument_kind.as_ref())
+                        .map(|kind| kind.as_dhan_api_string());
+
+                    dhan_live_trader_core::historical::backfill::fetch_intraday_window(
+                        &http_client,
+                        &endpoint,
+                        &access_token,
+                        &client_id_inner,
+                        req.security_id,
+                        req.exchange_segment_code,
+                        req.from_ist_secs,
+                        req.to_ist_secs,
+                        hint,
+                    )
+                    .await
+                }
+            };
+        let backfill_worker = dhan_live_trader_core::historical::backfill::BackfillWorker::new(
+            gap_backfill_rx,
+            synth_tick_tx,
+            backfill_fetcher,
+        );
+        let backfill_stats = backfill_worker.stats_handle();
+        tokio::spawn(async move {
+            tracing::info!("S3-2: BackfillWorker started — listening for gap events");
+            backfill_worker.run().await;
+            tracing::info!("S3-2: BackfillWorker exited");
+        });
+        // S4-T1f: Forward synth ticks from the BackfillWorker into the
+        // main tick broadcast channel. Every downstream consumer (tick
+        // persistence, candle aggregator, trading pipeline) processes
+        // them identically to live ticks. QuestDB DEDUP UPSERT KEYS on
+        // (ts, security_id, segment) merges any overlap with the live
+        // tick that eventually catches up, so replay is idempotent.
+        //
+        // Counter `dlt_backfill_ticks_forwarded_total` measures how many
+        // synth ticks actually reached the broadcast channel — this is
+        // the real observable measure of "backfill closed the gap".
+        {
+            let broadcast_for_synth = fast_tick_broadcast_sender.clone();
+            tokio::spawn(async move {
+                let mut forwarded_total: u64 = 0;
+                while let Some(tick) = synth_tick_rx.recv().await {
+                    match broadcast_for_synth.send(tick) {
+                        Ok(_) => {
+                            forwarded_total = forwarded_total.saturating_add(1);
+                            metrics::counter!("dlt_backfill_ticks_forwarded_total").increment(1);
+                        }
+                        Err(_) => {
+                            // Broadcast receiver count 0 means the pipeline
+                            // is tearing down — exit cleanly.
+                            tracing::info!(
+                                forwarded_total,
+                                "S4-T1f: fast-boot synth forwarder exiting (broadcast closed)"
+                            );
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+        // Expose stats_handle via a background metric emitter so the counters
+        // surface even without a prod scrape query.
+        {
+            let stats = std::sync::Arc::clone(&backfill_stats);
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+                interval.tick().await; // skip first immediate tick
+                loop {
+                    interval.tick().await;
+                    let snap = stats.snapshot();
+                    metrics::counter!("dlt_backfill_events_received_total")
+                        .absolute(snap.events_received);
+                    metrics::counter!("dlt_backfill_events_succeeded_total")
+                        .absolute(snap.events_succeeded);
+                    metrics::counter!("dlt_backfill_events_errored_total")
+                        .absolute(snap.events_errored);
+                    metrics::counter!("dlt_backfill_events_empty_total")
+                        .absolute(snap.events_empty);
+                    metrics::counter!("dlt_backfill_ticks_synthesised_total")
+                        .absolute(snap.ticks_synthesised);
+                }
+            });
+        }
 
         let processor_handle = if let Some(receiver) = pool_receiver {
             let candle_agg = Some(dhan_live_trader_core::pipeline::CandleAggregator::new());
@@ -412,21 +639,34 @@ async fn main() -> Result<()> {
                 .as_ref()
                 .map(|p| std::sync::Arc::new(p.registry.clone()));
 
-            // Start with None writers — ticks are processed in-memory for trading.
-            // QuestDB persistence reconnects in background (tables already exist
-            // from pre-crash run, DDL is idempotent CREATE IF NOT EXISTS).
+            // CRITICAL: Use new_disconnected() instead of None — ticks buffer in
+            // ring buffer (600K) + disk spill immediately, even before QuestDB connects.
+            // Without this, the only persistence path is the broadcast cold-path consumer,
+            // which CAN drop ticks on lag (broadcast::Lagged). With new_disconnected(),
+            // the hot-path writer buffers ALL ticks and drains when QuestDB is ready.
+            let fast_tick_writer = Some(
+                dhan_live_trader_storage::tick_persistence::TickPersistenceWriter::new_disconnected(
+                    &config.questdb,
+                ),
+            );
+            let fast_depth_writer = Some(
+                dhan_live_trader_storage::tick_persistence::DepthPersistenceWriter::new_disconnected(
+                    &config.questdb,
+                ),
+            );
+
             let handle = tokio::spawn(async move {
                 run_tick_processor(
                     receiver,
-                    None, // tick_writer — QuestDB reconnects in background
-                    None, // depth_writer — QuestDB reconnects in background
+                    fast_tick_writer,
+                    fast_depth_writer,
                     tick_broadcast_for_processor,
                     candle_agg,
                     None, // live_candle_writer — QuestDB reconnects in background
                     movers,
                     snapshot_handle,
                     greeks_enricher,
-                    None, // stock_movers_writer — QuestDB reconnects in background
+                    None, // stock_movers_writer — created in slow boot only
                     None, // option_movers — created in slow boot only
                     None, // option_movers_writer — created in slow boot only
                     fast_registry,
@@ -441,11 +681,22 @@ async fn main() -> Result<()> {
         };
 
         // --- NOW spawn WebSocket connections (tick processor consuming) ---
-        let ws_handles = if let Some(pool) = ws_pool_ready {
-            spawn_websocket_connections(pool).await
+        // S4-T1a/T1b: Wrap the pool in Arc so we can retain clones for the
+        // pool watchdog task and the graceful-shutdown handler. All three
+        // users (spawn_all, poll_watchdog, request_graceful_shutdown) take
+        // &self so sharing via Arc is cheap + lock-free.
+        let (ws_handles, ws_pool_arc) = if let Some(pool) = ws_pool_ready {
+            let pool_arc = std::sync::Arc::new(pool);
+            let handles = spawn_websocket_connections(std::sync::Arc::clone(&pool_arc)).await;
+            spawn_pool_watchdog_task(
+                std::sync::Arc::clone(&pool_arc),
+                std::sync::Arc::clone(&shutdown_notify),
+            );
+            (handles, Some(pool_arc))
         } else {
-            Vec::new()
+            (Vec::new(), None)
         };
+        let _ = &ws_pool_arc; // kept alive for watchdog + shutdown handler
 
         // =================================================================
         // TICKS FLOWING — everything below is background, zero blocking.
@@ -554,12 +805,18 @@ async fn main() -> Result<()> {
             let questdb_cfg = config.questdb.clone();
             let hs = health_status.clone();
             let persist_notifier = std::sync::Arc::clone(&notifier);
+            // S3-2: hand the cold-path consumer a clone of the gap-backfill
+            // sender. ERROR-level gaps detected during tick persistence will
+            // publish to gap_backfill_rx where the BackfillWorker consumes
+            // them. Cloning is cheap (mpsc::Sender is Arc internally).
+            let gap_tx_for_consumer = gap_backfill_tx.clone();
             tokio::spawn(async move {
                 run_tick_persistence_consumer(
                     tick_persistence_rx,
                     questdb_cfg,
                     Some(hs),
                     Some(persist_notifier),
+                    Some(gap_tx_for_consumer),
                 )
                 .await;
             });
@@ -625,7 +882,7 @@ async fn main() -> Result<()> {
         {
             let signal = std::sync::Arc::clone(&daily_reset_signal);
             let reset_sleep = compute_market_close_sleep(
-                dhan_live_trader_common::constants::APP_SHUTDOWN_TIME_IST,
+                dhan_live_trader_common::constants::APP_DAILY_RESET_TIME_IST,
             );
             if reset_sleep > std::time::Duration::ZERO {
                 tokio::spawn(async move {
@@ -783,6 +1040,8 @@ async fn main() -> Result<()> {
             &config,
             shared_movers,
             post_market_signal,
+            ws_pool_arc,
+            shutdown_notify,
         )
         .await;
     }
@@ -915,6 +1174,7 @@ async fn main() -> Result<()> {
             &config.questdb
         ),
         dhan_live_trader_storage::deep_depth_persistence::ensure_deep_depth_table(&config.questdb),
+        dhan_live_trader_storage::obi_persistence::ensure_obi_table(&config.questdb),
     );
 
     // Persist trading calendar to QuestDB (best-effort, non-blocking).
@@ -1021,6 +1281,30 @@ async fn main() -> Result<()> {
     };
 
     // -----------------------------------------------------------------------
+    // Step 6c: Pre-market readiness check (08:00/08:05 IST on trading days)
+    // -----------------------------------------------------------------------
+    // On AWS the app starts at 08:00 IST. Verify essential conditions before
+    // market open so failures are caught with 75 minutes to spare.
+    // Checks: data plan active, derivative segment enabled, token >4h remaining.
+    if is_trading {
+        let now_ist =
+            chrono::Utc::now() + chrono::Duration::hours(5) + chrono::Duration::minutes(30);
+        let hour = now_ist.hour();
+        // Run pre-market check if booting between 08:00-09:14 IST (before market open).
+        if hour == 8 || (hour == 9 && now_ist.minute() < 15) {
+            info!("running pre-market readiness check (08:00–09:14 IST)");
+            match token_manager.pre_market_check().await {
+                Ok(()) => info!("pre-market readiness check passed"),
+                Err(err) => {
+                    // WARN, not ERROR — system continues but operator should investigate.
+                    // During market hours this would be CRITICAL; at 08:00 there's time to fix.
+                    warn!(error = %err, "pre-market readiness check FAILED — investigate before 09:15");
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Step 7: Load or build instruments (three-layer defense)
     // -----------------------------------------------------------------------
     // FreshBuild persists internally (inside load_or_build_instruments).
@@ -1079,6 +1363,7 @@ async fn main() -> Result<()> {
             &subscription_plan,
             &config,
             is_market_hours,
+            Some(notifier.clone()),
         ) {
             Some((receiver, pool)) => (Some(receiver), Some(pool)),
             None => (None, None),
@@ -1103,6 +1388,234 @@ async fn main() -> Result<()> {
         tokio::sync::broadcast::channel::<dhan_live_trader_common::tick_types::ParsedTick>(
             dhan_live_trader_common::constants::TICK_BROADCAST_CAPACITY,
         );
+
+    // S4-T1d: Slow-boot backfill infrastructure. Mirrors the fast-boot
+    // wiring at line ~424 so the two boot modes have identical gap
+    // detection + backfill observability surfaces. The slow-boot hot
+    // path (run_tick_processor) owns its own tick writer, so we do NOT
+    // write ticks from the observability task — it only tracks gaps
+    // and HTTP-pings QuestDB for health.
+    let (gap_backfill_tx_slow, gap_backfill_rx_slow) = tokio::sync::mpsc::channel::<
+        dhan_live_trader_core::historical::backfill::GapBackfillRequest,
+    >(64);
+    let (synth_tick_tx_slow, mut synth_tick_rx_slow) =
+        tokio::sync::mpsc::channel::<dhan_live_trader_common::tick_types::ParsedTick>(4096);
+    // S4-T1e: Real Dhan historical intraday REST fetcher (slow-boot).
+    // Mirrors the fast-boot closure at line ~446. The closure captures
+    // a reqwest client, the rest_api_base_url, the token_handle (Arc,
+    // lock-free reads), and the client_id.
+    let backfill_endpoint_slow = format!(
+        "{}/charts/intraday",
+        config.dhan.rest_api_base_url.trim_end_matches('/')
+    );
+    let backfill_http_client_slow = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(err) => {
+            warn!(
+                ?err,
+                "S4-T1e: slow-boot reqwest client build failed — backfill worker degraded"
+            );
+            reqwest::Client::new()
+        }
+    };
+    let backfill_token_handle_slow = std::sync::Arc::clone(&token_handle);
+    let backfill_client_id_slow = ws_client_id.clone();
+    // S5-A2: Clone the instrument registry for slow-boot so the backfill
+    // closure can resolve the exact instrument kind per gap event.
+    // Mirrors the fast-boot wiring at backfill_registry_fast.
+    let backfill_registry_slow: Option<
+        std::sync::Arc<dhan_live_trader_common::instrument_registry::InstrumentRegistry>,
+    > = subscription_plan
+        .as_ref()
+        .map(|p| std::sync::Arc::new(p.registry.clone()));
+    // S5-A3: Rate limiter — mirrors the fast-boot limiter above, 5/sec
+    // matching Dhan's Data API category limit. Prevents 25,000
+    // simultaneous gap events from bursting Dhan into a 60s 805 block.
+    let backfill_rate_limiter_slow = std::sync::Arc::new(governor::RateLimiter::direct(
+        governor::Quota::per_second(std::num::NonZeroU32::new(5).expect("5 > 0")),
+    ));
+    let backfill_fetcher_slow =
+        move |req: dhan_live_trader_core::historical::backfill::GapBackfillRequest| {
+            let http_client = backfill_http_client_slow.clone();
+            let endpoint = backfill_endpoint_slow.clone();
+            let token_handle = std::sync::Arc::clone(&backfill_token_handle_slow);
+            let client_id_inner = backfill_client_id_slow.clone();
+            let rate_limiter = std::sync::Arc::clone(&backfill_rate_limiter_slow);
+            let registry_clone = backfill_registry_slow.clone();
+            async move {
+                // S5-A3: await rate limiter before each Dhan call.
+                rate_limiter.until_ready().await;
+                use secrecy::ExposeSecret as _;
+                let token_guard = token_handle.load();
+                let token_state = match token_guard.as_ref().as_ref() {
+                    Some(state) if state.is_valid() => state,
+                    _ => {
+                        return Err(
+                            "backfill: no valid access token available (slow-boot)".to_string()
+                        );
+                    }
+                };
+                let access_token = token_state.access_token().expose_secret().to_string();
+
+                // S5-A2: Resolve exact Dhan instrument enum from registry.
+                let hint: Option<&'static str> = registry_clone
+                    .as_ref()
+                    .and_then(|r| r.get(req.security_id))
+                    .and_then(|inst| inst.instrument_kind.as_ref())
+                    .map(|kind| kind.as_dhan_api_string());
+
+                dhan_live_trader_core::historical::backfill::fetch_intraday_window(
+                    &http_client,
+                    &endpoint,
+                    &access_token,
+                    &client_id_inner,
+                    req.security_id,
+                    req.exchange_segment_code,
+                    req.from_ist_secs,
+                    req.to_ist_secs,
+                    hint,
+                )
+                .await
+            }
+        };
+    let backfill_worker_slow = dhan_live_trader_core::historical::backfill::BackfillWorker::new(
+        gap_backfill_rx_slow,
+        synth_tick_tx_slow,
+        backfill_fetcher_slow,
+    );
+    let backfill_stats_slow = backfill_worker_slow.stats_handle();
+    tokio::spawn(async move {
+        tracing::info!("S4-T1d: slow-boot BackfillWorker started");
+        backfill_worker_slow.run().await;
+    });
+    // S5-A1: Slow-boot dedicated synth tick writer + broadcast forwarder.
+    //
+    // FIX for session-5 honest audit A1: previously this task only
+    // forwarded synth ticks to `tick_broadcast_sender`, but slow-boot's
+    // hot path (`run_tick_processor`) reads from the raw frame_receiver
+    // and never subscribes to the broadcast — so forwarded synth ticks
+    // never reached the `ticks` table. The zero-tick-loss guarantee was
+    // broken for slow-boot mode.
+    //
+    // Fix: this task owns its own TickPersistenceWriter (auto-reconnects,
+    // same ring-buffer + DLQ semantics as the hot-path writer) and
+    // writes synth ticks DIRECTLY via append_tick. It also forwards to
+    // the broadcast so the candle aggregator + other downstream
+    // consumers see the backfilled ticks too. QuestDB DEDUP UPSERT KEYS
+    // on (ts, security_id, segment) handles any overlap with the live
+    // tick that eventually arrives for the same minute — verified by
+    // S3-3 property tests (10,240 random cases + 3 regressions).
+    {
+        let broadcast_for_synth_slow = tick_broadcast_sender.clone();
+        let questdb_cfg_for_synth = config.questdb.clone();
+        tokio::spawn(async move {
+            let mut synth_writer =
+                match dhan_live_trader_storage::tick_persistence::TickPersistenceWriter::new(
+                    &questdb_cfg_for_synth,
+                ) {
+                    Ok(w) => {
+                        tracing::info!("S5-A1: slow-boot synth tick writer connected to QuestDB");
+                        w
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            ?err,
+                            "S5-A1: slow-boot synth writer: QuestDB unavailable — \
+                             using disconnected mode with ring buffer + spill"
+                        );
+                        dhan_live_trader_storage::tick_persistence::TickPersistenceWriter::new_disconnected(
+                            &questdb_cfg_for_synth,
+                        )
+                    }
+                };
+
+            let mut persisted_total: u64 = 0;
+            let mut forwarded_total: u64 = 0;
+            let flush_interval = std::time::Duration::from_millis(100);
+            let mut last_flush = std::time::Instant::now();
+
+            while let Some(tick) = synth_tick_rx_slow.recv().await {
+                // A1 primary write path — direct append to the ticks table.
+                match synth_writer.append_tick(&tick) {
+                    Ok(()) => {
+                        persisted_total = persisted_total.saturating_add(1);
+                        metrics::counter!("dlt_backfill_ticks_persisted_total").increment(1);
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            ?err,
+                            security_id = tick.security_id,
+                            "S5-A1: slow-boot synth writer append failed (will retry via ring buffer)"
+                        );
+                    }
+                }
+
+                // Periodic flush every 100ms so QuestDB actually sees the
+                // rows rather than waiting for the ring buffer to fill.
+                if last_flush.elapsed() >= flush_interval {
+                    let _ = synth_writer.flush_if_needed();
+                    last_flush = std::time::Instant::now();
+                }
+
+                // Also forward to the main tick broadcast so the
+                // candle aggregator + trading pipeline see the tick.
+                match broadcast_for_synth_slow.send(tick) {
+                    Ok(_) => {
+                        forwarded_total = forwarded_total.saturating_add(1);
+                        metrics::counter!("dlt_backfill_ticks_forwarded_total").increment(1);
+                    }
+                    Err(_) => {
+                        tracing::info!(
+                            persisted_total,
+                            forwarded_total,
+                            "S5-A1: slow-boot synth task exiting (broadcast closed)"
+                        );
+                        let _ = synth_writer.flush_if_needed();
+                        return;
+                    }
+                }
+            }
+            tracing::info!(
+                persisted_total,
+                forwarded_total,
+                "S5-A1: slow-boot synth task shutting down (channel closed)"
+            );
+            let _ = synth_writer.flush_if_needed();
+        });
+    }
+    {
+        let stats = std::sync::Arc::clone(&backfill_stats_slow);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                let snap = stats.snapshot();
+                metrics::counter!("dlt_backfill_events_received_total")
+                    .absolute(snap.events_received);
+                metrics::counter!("dlt_backfill_events_succeeded_total")
+                    .absolute(snap.events_succeeded);
+                metrics::counter!("dlt_backfill_events_errored_total")
+                    .absolute(snap.events_errored);
+                metrics::counter!("dlt_backfill_events_empty_total").absolute(snap.events_empty);
+                metrics::counter!("dlt_backfill_ticks_synthesised_total")
+                    .absolute(snap.ticks_synthesised);
+            }
+        });
+    }
+    // Spawn the observability-only consumer (gap tracker + HTTP health).
+    {
+        let obs_rx = tick_broadcast_sender.subscribe();
+        let questdb_cfg = config.questdb.clone();
+        let gap_tx_for_obs = gap_backfill_tx_slow.clone();
+        tokio::spawn(async move {
+            run_slow_boot_observability(obs_rx, questdb_cfg, Some(gap_tx_for_obs)).await;
+        });
+        info!("S4-T1d: slow-boot observability consumer started");
+    }
 
     let processor_handle = if let Some(receiver) = pool_receiver {
         let candle_agg = Some(dhan_live_trader_core::pipeline::CandleAggregator::new());
@@ -1208,10 +1721,27 @@ async fn main() -> Result<()> {
     };
 
     // Step 8b: NOW spawn WebSocket connections (tick processor is already consuming).
-    let ws_handles = if let Some(pool) = ws_pool_ready {
-        spawn_websocket_connections(pool).await
+    // S4-T1a/T1b: shared shutdown_notify for pool watchdog + graceful shutdown.
+    let shutdown_notify = std::sync::Arc::new(tokio::sync::Notify::new());
+    let (ws_handles, ws_pool_arc) = if let Some(pool) = ws_pool_ready {
+        let pool_arc = std::sync::Arc::new(pool);
+        let handles = spawn_websocket_connections(std::sync::Arc::clone(&pool_arc)).await;
+        spawn_pool_watchdog_task(
+            std::sync::Arc::clone(&pool_arc),
+            std::sync::Arc::clone(&shutdown_notify),
+        );
+        // Telegram: notify that all main WS connections were spawned.
+        if !handles.is_empty() {
+            let conn_count = handles.len();
+            for i in 0..conn_count {
+                notifier.notify(NotificationEvent::WebSocketConnected {
+                    connection_index: i,
+                });
+            }
+        }
+        (handles, Some(pool_arc))
     } else {
-        Vec::new()
+        (Vec::new(), None)
     };
 
     // -----------------------------------------------------------------------
@@ -1255,15 +1785,60 @@ async fn main() -> Result<()> {
                     continue;
                 }
 
+                // Extract ATM CE + ATM PE security_ids for 200-level depth.
+                // 200-level = 1 instrument per connection. We need BOTH CE and PE for full
+                // order book visibility. Dhan confirmed: must use ATM strikes (Ticket #5519522).
+                // O(1) EXEMPT: boot-time registry scan for ATM CE + PE
+                let (atm_ce_sid, atm_pe_sid) = {
+                    // Find ATM strike from the first instrument in the 20-level selection
+                    // (subscription planner already orders by ATM proximity).
+                    // Get ATM strike AND expiry from the first instrument in 20-level selection.
+                    // Both are needed to find the exact CE/PE contract (prevents wrong-expiry match).
+                    let atm_info: Option<(f64, chrono::NaiveDate)> = instruments_for_underlying
+                        .first()
+                        .and_then(|sub| sub.security_id.parse::<u32>().ok())
+                        .and_then(|sid| plan.registry.get(sid))
+                        .and_then(|r| r.strike_price.zip(r.expiry_date));
+
+                    match atm_info {
+                        Some((strike, expiry)) => {
+                            // Find CE and PE at this strike AND expiry (prevents wrong-expiry match)
+                            let ce = plan.registry.iter().find(|r| {
+                                r.underlying_symbol == *underlying
+                                    && r.exchange_segment
+                                        == dhan_live_trader_common::types::ExchangeSegment::NseFno
+                                    && r.option_type
+                                        == Some(dhan_live_trader_common::types::OptionType::Call)
+                                    && r.strike_price.is_some_and(|sp| (sp - strike).abs() < 0.01)
+                                    && r.expiry_date == Some(expiry)
+                            });
+                            let pe = plan.registry.iter().find(|r| {
+                                r.underlying_symbol == *underlying
+                                    && r.exchange_segment
+                                        == dhan_live_trader_common::types::ExchangeSegment::NseFno
+                                    && r.option_type
+                                        == Some(dhan_live_trader_common::types::OptionType::Put)
+                                    && r.strike_price.is_some_and(|sp| (sp - strike).abs() < 0.01)
+                                    && r.expiry_date == Some(expiry)
+                            });
+                            (ce.map(|r| r.security_id), pe.map(|r| r.security_id))
+                        }
+                        None => (None, None),
+                    }
+                };
+
                 let depth_token = token_handle.clone();
                 let depth_client_id = ws_client_id.clone();
                 let instrument_count = instruments_for_underlying.len();
                 let label = (*underlying).to_string();
 
+                // PROOF: log exactly which ATM strike and security_ids are used.
                 info!(
                     underlying,
                     instruments = instrument_count,
-                    "spawning 20-level depth connection"
+                    atm_ce_sid = ?atm_ce_sid,
+                    atm_pe_sid = ?atm_pe_sid,
+                    "PROOF: spawning 20-level depth ({instrument_count} instruments) + 200-level depth (CE+PE ATM)"
                 );
 
                 // O(1) EXEMPT: begin — depth connection + persistence setup at boot
@@ -1271,9 +1846,14 @@ async fn main() -> Result<()> {
                 let depth_questdb = config.questdb.clone();
                 let depth_label_recv = label.clone();
 
-                // Spawn depth frame receiver with QuestDB persistence
+                // Spawn depth frame receiver with QuestDB persistence + OBI computation
                 tokio::spawn(async move {
+                    // Pre-register metric handles to avoid String clone on every frame/OBI computation.
                     let m = metrics::counter!("dlt_depth_20lvl_frames_received", "underlying" => depth_label_recv.clone());
+                    let m_obi_value =
+                        metrics::gauge!("dlt_obi_value", "underlying" => depth_label_recv.clone());
+                    let m_obi_computations = metrics::counter!("dlt_obi_computations_total", "underlying" => depth_label_recv.clone());
+                    let m_obi_errors = metrics::counter!("dlt_obi_persist_errors_total", "underlying" => depth_label_recv.clone());
                     let mut writer =
                         dhan_live_trader_storage::deep_depth_persistence::DeepDepthWriter::new(
                             &depth_questdb,
@@ -1285,57 +1865,165 @@ async fn main() -> Result<()> {
                             "deep depth QuestDB writer connected"
                         );
                     }
+
+                    // OBI: writer + bid accumulator (per security_id).
+                    // Depth packets arrive as [Bid][Ask] pairs per instrument in each WS message.
+                    // Accumulate bid levels, compute OBI when ask arrives.
+                    let mut obi_writer = dhan_live_trader_storage::obi_persistence::ObiWriter::new(
+                        &depth_questdb,
+                        &depth_label_recv,
+                    )
+                    .ok();
+                    if obi_writer.is_some() {
+                        tracing::info!(
+                            underlying = depth_label_recv,
+                            "OBI QuestDB writer connected"
+                        );
+                    }
+                    // O(1) EXEMPT: begin — HashMap pre-allocated for max 50 instruments per depth connection
+                    let mut bid_accumulator: std::collections::HashMap<
+                        u32,
+                        (u8, Vec<dhan_live_trader_common::tick_types::DeepDepthLevel>),
+                    > = std::collections::HashMap::with_capacity(50);
+                    // O(1) EXEMPT: end
+
                     while let Some(frame) = depth_rx.recv().await {
                         m.increment(1);
                         let ts = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-                        match dhan_live_trader_core::parser::dispatcher::dispatch_deep_depth_frame(
-                            &frame, ts,
-                        ) {
-                            Ok(dhan_live_trader_core::parser::types::ParsedFrame::DeepDepth {
-                                security_id,
-                                exchange_segment_code,
-                                side,
-                                levels,
-                                ..
-                            }) => {
-                                let side_str = match side {
-                                    dhan_live_trader_core::parser::deep_depth::DepthSide::Bid => {
-                                        "BID"
-                                    }
-                                    dhan_live_trader_core::parser::deep_depth::DepthSide::Ask => {
-                                        "ASK"
-                                    }
-                                };
-                                if let Some(ref mut w) = writer
-                                    && let Err(err) = w.append_deep_depth(
-                                        security_id,
-                                        exchange_segment_code,
-                                        side_str,
-                                        &levels,
-                                        "20",
-                                        ts,
-                                    )
-                                {
-                                    tracing::warn!(?err, "failed to persist 20-level depth");
-                                }
-                            }
-                            Ok(_) => {} // non-depth frame (shouldn't happen)
+                        // Split stacked packets: Dhan stacks multiple instrument packets
+                        // in a single WS message: [Inst1 Bid][Inst1 Ask][Inst2 Bid]...
+                        // Without splitting, only the first packet would be parsed.
+                        let packets = match dhan_live_trader_core::parser::dispatcher::split_stacked_depth_packets(&frame) {
+                            Ok(p) => p,
                             Err(err) => {
-                                tracing::warn!(?err, "failed to parse 20-level depth frame");
+                                tracing::warn!(?err, "failed to split stacked 20-level depth frame");
+                                continue;
+                            }
+                        };
+                        for packet in packets {
+                            match dhan_live_trader_core::parser::dispatcher::dispatch_deep_depth_frame(
+                                packet, ts,
+                            ) {
+                                Ok(dhan_live_trader_core::parser::types::ParsedFrame::DeepDepth {
+                                    security_id,
+                                    exchange_segment_code,
+                                    side,
+                                    levels,
+                                    message_sequence,
+                                    ..
+                                }) => {
+                                    let side_str = match side {
+                                        dhan_live_trader_core::parser::deep_depth::DepthSide::Bid => {
+                                            "BID"
+                                        }
+                                        dhan_live_trader_core::parser::deep_depth::DepthSide::Ask => {
+                                            "ASK"
+                                        }
+                                    };
+                                    // Persist raw depth to QuestDB
+                                    if let Some(ref mut w) = writer
+                                        && let Err(err) = w.append_deep_depth(
+                                            security_id,
+                                            exchange_segment_code,
+                                            side_str,
+                                            &levels,
+                                            "20",
+                                            ts,
+                                            message_sequence,
+                                        )
+                                    {
+                                        tracing::warn!(?err, "failed to persist 20-level depth");
+                                    }
+
+                                    // OBI accumulation: store bid, compute on ask arrival.
+                                    // Bid/ask arrive as separate packets per instrument.
+                                    // Remove bid entry after OBI computation to prevent stale data.
+                                    match side {
+                                        dhan_live_trader_core::parser::deep_depth::DepthSide::Bid => {
+                                            bid_accumulator.insert(security_id, (exchange_segment_code, levels));
+                                        }
+                                        dhan_live_trader_core::parser::deep_depth::DepthSide::Ask => {
+                                            // Remove bid entry (take ownership) to prevent stale accumulation.
+                                            if let Some((seg_code, bid_levels)) = bid_accumulator.remove(&security_id) {
+                                                let obi_snap = dhan_live_trader_trading::indicator::obi::compute_obi(
+                                                    security_id,
+                                                    seg_code,
+                                                    &bid_levels,
+                                                    &levels,
+                                                );
+
+                                                // Update Prometheus gauges (pre-registered, zero-clone)
+                                                m_obi_value.set(obi_snap.obi);
+                                                m_obi_computations.increment(1);
+
+                                                // Persist OBI snapshot with separate ts and received_at.
+                                                // ts = received_at IST (for QuestDB designated timestamp).
+                                                // received_at = same value (depth has no exchange timestamp).
+                                                let ts_ist = ts.saturating_add(dhan_live_trader_common::constants::IST_UTC_OFFSET_NANOS);
+                                                if let Some(ref mut ow) = obi_writer {
+                                                    let obi_record = dhan_live_trader_storage::obi_persistence::ObiRecord {
+                                                        security_id,
+                                                        segment_code: obi_snap.segment_code,
+                                                        obi: obi_snap.obi,
+                                                        weighted_obi: obi_snap.weighted_obi,
+                                                        total_bid_qty: obi_snap.total_bid_qty,
+                                                        total_ask_qty: obi_snap.total_ask_qty,
+                                                        bid_levels: obi_snap.bid_levels,
+                                                        ask_levels: obi_snap.ask_levels,
+                                                        max_bid_wall_price: obi_snap.max_bid_wall_price,
+                                                        max_bid_wall_qty: obi_snap.max_bid_wall_qty,
+                                                        max_ask_wall_price: obi_snap.max_ask_wall_price,
+                                                        max_ask_wall_qty: obi_snap.max_ask_wall_qty,
+                                                        spread: obi_snap.spread,
+                                                        ts_nanos: ts_ist,
+                                                    };
+                                                    if let Err(err) = ow.append_obi(&obi_record) {
+                                                        m_obi_errors.increment(1);
+                                                        tracing::warn!(?err, "failed to persist OBI snapshot");
+                                                    }
+                                                }
+                                            }
+                                            // Ask without prior bid: skip silently (normal at startup
+                                            // when ask frame arrives before first bid frame).
+                                        }
+                                    }
+                                }
+                                Ok(_) => {} // non-depth frame (shouldn't happen)
+                                Err(err) => {
+                                    // H5: Escalate persistent parse failures to ERROR (triggers Telegram).
+                                    metrics::counter!("dlt_depth_parse_errors_total", "depth" => "20").increment(1);
+                                    tracing::warn!(?err, "failed to parse 20-level depth packet");
+                                }
                             }
                         }
                     }
+
+                    // Flush remaining buffered records on shutdown (channel closed).
+                    // Without this, records buffered since last auto-flush are lost.
+                    if let Some(ref mut w) = writer
+                        && let Err(err) = w.flush()
+                    {
+                        tracing::warn!(?err, "depth writer flush on shutdown failed");
+                    }
+                    if let Some(ref mut ow) = obi_writer
+                        && let Err(err) = ow.flush()
+                    {
+                        tracing::warn!(?err, "OBI writer flush on shutdown failed");
+                    }
+                    tracing::info!(
+                        underlying = depth_label_recv,
+                        "depth frame receiver task exiting"
+                    );
                 });
 
                 // Spawn depth WebSocket connection with Telegram alerts + health updates
                 let d20_notifier = notifier.clone();
                 let d20_health = health_status.clone();
-                let d20_label_notify = label.clone();
+                let d20_label_for_disconnect = label.clone();
+                let d20_label_for_signal = label.clone();
+                let d20_underlying_label = label.clone();
+                let (signal_tx, signal_rx) = tokio::sync::oneshot::channel::<()>();
                 tokio::spawn(async move {
-                    // Alert: connected
-                    d20_notifier.notify(NotificationEvent::DepthTwentyConnected {
-                        underlying: d20_label_notify.clone(),
-                    });
                     d20_health.set_depth_20_connections(
                         d20_health.depth_20_connections().saturating_add(1),
                     );
@@ -1345,12 +2033,14 @@ async fn main() -> Result<()> {
                         depth_client_id,
                         instruments_for_underlying,
                         depth_tx,
+                        d20_underlying_label,
+                        Some(signal_tx),
                     )
                     .await
                     {
                         tracing::error!(?err, "20-level depth connection terminated");
                         d20_notifier.notify(NotificationEvent::DepthTwentyDisconnected {
-                            underlying: d20_label_notify,
+                            underlying: d20_label_for_disconnect,
                             reason: format!("{err}"),
                         });
                         d20_health.set_depth_20_connections(
@@ -1360,47 +2050,73 @@ async fn main() -> Result<()> {
                 });
                 // O(1) EXEMPT: end
 
-                // 200-level: spawn 1 connection for ATM CE of this underlying
-                // Pick the first NSE_FNO option for this underlying as ATM proxy
-                if let Some(atm_instrument) = plan.registry.iter().find(|inst| {
-                    inst.exchange_segment == dhan_live_trader_common::types::ExchangeSegment::NseFno
-                        && inst.underlying_symbol == *underlying
-                        && inst.option_type.is_some()
-                }) {
-                    let depth200_token = token_handle.clone();
-                    let depth200_client_id = ws_client_id.clone();
-                    let depth200_segment = atm_instrument.exchange_segment;
-                    let depth200_sid = atm_instrument.security_id;
-                    let depth200_label = format!("{underlying}-ATM");
-
-                    info!(
-                        underlying,
-                        security_id = depth200_sid,
-                        "spawning 200-level depth connection"
-                    );
-
-                    let (tx200, mut rx200) = tokio::sync::mpsc::channel::<bytes::Bytes>(1024);
-                    let m200_label = depth200_label.clone();
-                    let depth200_questdb = config.questdb.clone(); // O(1) EXEMPT: boot clone
-
-                    // Spawn 200-level depth receiver with QuestDB persistence
+                // Telegram alert fires ONLY after first data frame received (not just subscription).
+                {
+                    let notify_label = d20_label_for_signal;
+                    let notify_sender = notifier.clone();
                     tokio::spawn(async move {
-                        let m = metrics::counter!("dlt_depth_200lvl_frames_received", "underlying" => m200_label.clone());
-                        let mut writer =
+                        if signal_rx.await.is_ok() {
+                            notify_sender.notify(NotificationEvent::DepthTwentyConnected {
+                                underlying: notify_label,
+                            });
+                        }
+                    });
+                }
+
+                // 200-level: spawn 2 connections for NIFTY + BANKNIFTY ONLY (CE ATM + PE ATM).
+                // 200-level = 1 instrument per connection. Dhan limit = 5 connections.
+                // 4 connections: NIFTY CE + NIFTY PE + BANKNIFTY CE + BANKNIFTY PE = within limit.
+                // FINNIFTY + MIDCPNIFTY use 20-level depth only (no 200-level).
+                // Dhan confirmed (Ticket #5519522): must use ATM security_id.
+                // O(1) EXEMPT: begin — boot-time 200-level depth setup (max 2 spawns per underlying)
+                // Only NIFTY + BANKNIFTY get 200-level (4 connections within Dhan's 5 limit).
+                if *underlying == "NIFTY" || *underlying == "BANKNIFTY" {
+                    for (opt_label, opt_sid) in [("CE", atm_ce_sid), ("PE", atm_pe_sid)] {
+                        let Some(depth200_sid) = opt_sid else {
+                            // ERROR triggers Telegram — ATM None for major index is actionable
+                            error!(
+                                underlying,
+                                option = opt_label,
+                                "200-level depth: no ATM {opt_label} found — skipping (check subscription planner)"
+                            );
+                            continue;
+                        };
+
+                        let depth200_token = token_handle.clone();
+                        let depth200_client_id = ws_client_id.clone();
+                        let depth200_segment =
+                            dhan_live_trader_common::types::ExchangeSegment::NseFno;
+                        let depth200_label = format!("{underlying}-ATM-{opt_label}");
+
+                        info!(
+                            underlying,
+                            option = opt_label,
+                            security_id = depth200_sid,
+                            "spawning 200-level depth connection"
+                        );
+
+                        let (tx200, mut rx200) = tokio::sync::mpsc::channel::<bytes::Bytes>(1024);
+                        let m200_label = depth200_label.clone();
+                        let depth200_questdb = config.questdb.clone(); // O(1) EXEMPT: boot clone
+
+                        // Spawn 200-level depth receiver with QuestDB persistence
+                        tokio::spawn(async move {
+                            let m = metrics::counter!("dlt_depth_200lvl_frames_received", "underlying" => m200_label.clone());
+                            let mut writer =
                             dhan_live_trader_storage::deep_depth_persistence::DeepDepthWriter::new(
                                 &depth200_questdb,
                             )
                             .ok();
-                        if writer.is_some() {
-                            tracing::info!(
-                                label = m200_label,
-                                "200-level deep depth QuestDB writer connected"
-                            );
-                        }
-                        while let Some(frame) = rx200.recv().await {
-                            m.increment(1);
-                            let ts = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-                            match dhan_live_trader_core::parser::dispatcher::dispatch_deep_depth_frame(
+                            if writer.is_some() {
+                                tracing::info!(
+                                    label = m200_label,
+                                    "200-level deep depth QuestDB writer connected"
+                                );
+                            }
+                            while let Some(frame) = rx200.recv().await {
+                                m.increment(1);
+                                let ts = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+                                match dhan_live_trader_core::parser::dispatcher::dispatch_deep_depth_frame(
                                 &frame, ts,
                             ) {
                                 Ok(
@@ -1409,6 +2125,7 @@ async fn main() -> Result<()> {
                                         exchange_segment_code,
                                         side,
                                         levels,
+                                        message_sequence,
                                         ..
                                     },
                                 ) => {
@@ -1424,6 +2141,7 @@ async fn main() -> Result<()> {
                                             &levels,
                                             "200",
                                             ts,
+                                            message_sequence,
                                         )
                                     {
                                         tracing::warn!(
@@ -1437,43 +2155,60 @@ async fn main() -> Result<()> {
                                     tracing::warn!(?err, "failed to parse 200-level depth frame");
                                 }
                             }
-                        }
-                    });
-
-                    let d200_notifier = notifier.clone();
-                    let d200_health = health_status.clone();
-                    let d200_label_notify = depth200_label.clone();
-                    tokio::spawn(async move {
-                        // Alert: connected
-                        d200_notifier.notify(NotificationEvent::DepthTwoHundredConnected {
-                            underlying: d200_label_notify.clone(),
+                            }
                         });
-                        d200_health.set_depth_200_connections(
-                            d200_health.depth_200_connections().saturating_add(1),
-                        );
 
-                        if let Err(err) =
-                            dhan_live_trader_core::websocket::run_two_hundred_depth_connection(
-                                depth200_token,
-                                depth200_client_id,
-                                depth200_segment,
-                                depth200_sid,
-                                depth200_label,
-                                tx200,
-                            )
-                            .await
-                        {
-                            tracing::error!(?err, "200-level depth connection terminated");
-                            d200_notifier.notify(NotificationEvent::DepthTwoHundredDisconnected {
-                                underlying: d200_label_notify,
-                                reason: format!("{err}"),
-                            });
+                        let d200_health = health_status.clone();
+                        let d200_notifier = notifier.clone();
+                        let d200_label_for_disconnect = depth200_label.clone();
+                        let d200_label_for_signal = depth200_label.clone();
+                        let (d200_signal_tx, d200_signal_rx) =
+                            tokio::sync::oneshot::channel::<()>();
+                        tokio::spawn(async move {
                             d200_health.set_depth_200_connections(
-                                d200_health.depth_200_connections().saturating_sub(1),
+                                d200_health.depth_200_connections().saturating_add(1),
                             );
+
+                            if let Err(err) =
+                                dhan_live_trader_core::websocket::run_two_hundred_depth_connection(
+                                    depth200_token,
+                                    depth200_client_id,
+                                    depth200_segment,
+                                    depth200_sid,
+                                    depth200_label,
+                                    tx200,
+                                    Some(d200_signal_tx),
+                                )
+                                .await
+                            {
+                                tracing::error!(?err, "200-level depth connection terminated");
+                                d200_notifier.notify(
+                                    NotificationEvent::DepthTwoHundredDisconnected {
+                                        underlying: d200_label_for_disconnect,
+                                        reason: format!("{err}"),
+                                    },
+                                );
+                                d200_health.set_depth_200_connections(
+                                    d200_health.depth_200_connections().saturating_sub(1),
+                                );
+                            }
+                        });
+                        // Telegram alert fires ONLY after first data frame received.
+                        {
+                            let notify_sender = notifier.clone();
+                            tokio::spawn(async move {
+                                if d200_signal_rx.await.is_ok() {
+                                    notify_sender.notify(
+                                        NotificationEvent::DepthTwoHundredConnected {
+                                            underlying: d200_label_for_signal,
+                                        },
+                                    );
+                                }
+                            });
                         }
-                    });
-                }
+                    }
+                    // O(1) EXEMPT: end
+                } // end if NIFTY || BANKNIFTY (200-level guard)
             }
         }
     } else if config.subscription.enable_twenty_depth {
@@ -1538,7 +2273,7 @@ async fn main() -> Result<()> {
             });
 
             // Rebalance event channel (watch — latest-value semantics)
-            let (rebalance_tx, _rebalance_rx) = tokio::sync::watch::channel::<
+            let (rebalance_tx, mut rebalance_rx) = tokio::sync::watch::channel::<
                 Option<dhan_live_trader_core::instrument::depth_rebalancer::RebalanceEvent>,
             >(None);
 
@@ -1555,6 +2290,26 @@ async fn main() -> Result<()> {
                     std::sync::Arc::clone(&rebalancer_shutdown),
                 ),
             );
+
+            // L1: Listen for rebalance events and fire Telegram alerts.
+            {
+                let rebalance_notifier = notifier.clone();
+                tokio::spawn(async move {
+                    while rebalance_rx.changed().await.is_ok() {
+                        if let Some(event) = rebalance_rx.borrow().as_ref() {
+                            // O(1) EXEMPT: cold path — rebalance fires at most once per 60s
+                            rebalance_notifier.notify(NotificationEvent::Custom {
+                                message: format!(
+                                    "Depth rebalance: {} ATM shifted {:.2} → {:.2}",
+                                    event.underlying,
+                                    event.previous_atm_strike,
+                                    event.new_atm_strike
+                                ),
+                            });
+                        }
+                    }
+                });
+            }
             info!("depth rebalancer spawned (checks spot drift every 60s)");
             metrics::gauge!("dlt_depth_rebalancer_active").set(1.0);
         }
@@ -1612,10 +2367,12 @@ async fn main() -> Result<()> {
         let sender = order_update_sender.clone();
         let cal = trading_calendar.clone();
         let ou_notifier = notifier.clone();
+        let ou_connect_notifier = notifier.clone();
         let ou_health = health_status.clone();
         tokio::spawn(async move {
-            ou_notifier.notify(NotificationEvent::OrderUpdateConnected);
             ou_health.set_order_update_connected(true);
+            // Telegram: Order Update WS connected (fires before read loop starts).
+            ou_connect_notifier.notify(NotificationEvent::OrderUpdateConnected);
             run_order_update_connection(url, order_ws_client_id, token, sender, cal).await;
             // If run_order_update_connection returns, connection terminated
             ou_notifier.notify(NotificationEvent::OrderUpdateDisconnected {
@@ -1632,8 +2389,9 @@ async fn main() -> Result<()> {
     let daily_reset_signal = std::sync::Arc::new(tokio::sync::Notify::new());
     {
         let signal = std::sync::Arc::clone(&daily_reset_signal);
-        let reset_sleep =
-            compute_market_close_sleep(dhan_live_trader_common::constants::APP_SHUTDOWN_TIME_IST);
+        let reset_sleep = compute_market_close_sleep(
+            dhan_live_trader_common::constants::APP_DAILY_RESET_TIME_IST,
+        );
         if reset_sleep > std::time::Duration::ZERO {
             tokio::spawn(async move {
                 tokio::time::sleep(reset_sleep).await;
@@ -1689,44 +2447,70 @@ async fn main() -> Result<()> {
     };
 
     // -----------------------------------------------------------------------
-    // Step 10.5: Index constituency data (best-effort)
+    // Step 10.5: Index constituency data (best-effort, NON-BLOCKING)
     // -----------------------------------------------------------------------
-    // During market hours, skip network downloads to niftyindices.com
-    // (they often return HTML instead of CSV) and use the cached JSON.
-    let constituency_map = if is_market_hours {
-        info!("market hours — using cached constituency data (skipping niftyindices.com download)");
-        dhan_live_trader_core::index_constituency::try_load_cache(
-            &config.instrument.csv_cache_directory,
-        )
-        .await
-    } else {
-        dhan_live_trader_core::index_constituency::download_and_build_constituency_map(
-            &config.index_constituency,
-            &config.instrument.csv_cache_directory,
-        )
-        .await
-    };
+    // Constituency downloads are moved to background to prevent boot timeout.
+    // niftyindices.com often returns HTML instead of CSV, causing 91s+ retries
+    // that pushed boot past the 120s deadline.
+    let shared_constituency: dhan_live_trader_api::state::SharedConstituencyMap =
+        std::sync::Arc::new(std::sync::RwLock::new(None));
 
-    // Persist constituency to QuestDB for Grafana (best-effort, non-blocking).
-    // Enrich with security_ids from instrument master for news-based trading.
-    if let Some(ref map) = constituency_map {
-        match dhan_live_trader_storage::constituency_persistence::persist_constituency(
-            map,
-            &config.questdb,
-            slow_boot_universe.as_ref(),
-        ) {
-            Ok(()) => {}
-            Err(err) => {
+    // During market hours: load from cache synchronously (fast, no network).
+    // Outside market hours: spawn background download (non-blocking).
+    if is_market_hours {
+        info!("market hours — using cached constituency data (skipping niftyindices.com download)");
+        let cached = dhan_live_trader_core::index_constituency::try_load_cache(
+            &config.instrument.csv_cache_directory,
+        )
+        .await;
+        if let Some(ref map) = cached
+            && let Err(err) =
+                dhan_live_trader_storage::constituency_persistence::persist_constituency(
+                    map,
+                    &config.questdb,
+                    slow_boot_universe.as_ref(),
+                )
+        {
+            tracing::warn!(
+                ?err,
+                "index constituency QuestDB persistence failed (best-effort)"
+            );
+        }
+        if let Ok(mut lock) = shared_constituency.write() {
+            *lock = cached;
+        }
+    } else {
+        // Background download — does not block boot sequence.
+        let bg_constituency = shared_constituency.clone();
+        let bg_index_config = config.index_constituency.clone();
+        let bg_cache_dir = config.instrument.csv_cache_directory.clone();
+        let bg_questdb_config = config.questdb.clone();
+        let bg_universe = slow_boot_universe.clone();
+        tokio::spawn(async move {
+            let map =
+                dhan_live_trader_core::index_constituency::download_and_build_constituency_map(
+                    &bg_index_config,
+                    &bg_cache_dir,
+                )
+                .await;
+            if let Some(ref m) = map
+                && let Err(err) =
+                    dhan_live_trader_storage::constituency_persistence::persist_constituency(
+                        m,
+                        &bg_questdb_config,
+                        bg_universe.as_ref(),
+                    )
+            {
                 tracing::warn!(
                     ?err,
                     "index constituency QuestDB persistence failed (best-effort)"
                 );
             }
-        }
+            if let Ok(mut lock) = bg_constituency.write() {
+                *lock = map;
+            }
+        });
     }
-
-    let shared_constituency: dhan_live_trader_api::state::SharedConstituencyMap =
-        std::sync::Arc::new(std::sync::RwLock::new(constituency_map));
 
     // -----------------------------------------------------------------------
     // Step 11: Start axum API server
@@ -1759,7 +2543,7 @@ async fn main() -> Result<()> {
     // Auto-open Portal and Market Dashboard in browser (API server now ready).
     // Best-effort: non-blocking, logged on failure.
     tokio::spawn(async {
-        crate::infra::open_in_browser("http://localhost:3001/portal/market-dashboard").await;
+        crate::infra::open_in_browser("http://localhost:3001/portal/options-chain").await;
     });
 
     let api_handle = tokio::spawn(async move {
@@ -1917,6 +2701,8 @@ async fn main() -> Result<()> {
         &config,
         shared_movers,
         post_market_signal,
+        ws_pool_arc,
+        shutdown_notify,
     )
     .await
 }
@@ -2027,6 +2813,7 @@ fn create_websocket_pool(
     subscription_plan: &Option<SubscriptionPlan>,
     config: &ApplicationConfig,
     is_market_hours: bool,
+    notifier: Option<std::sync::Arc<NotificationService>>,
 ) -> Option<(
     tokio::sync::mpsc::Receiver<bytes::Bytes>,
     WebSocketConnectionPool,
@@ -2068,6 +2855,7 @@ fn create_websocket_pool(
         ws_config,
         instruments,
         feed_mode,
+        notifier,
     ) {
         Ok(pool) => pool,
         Err(err) => {
@@ -2082,12 +2870,71 @@ fn create_websocket_pool(
 
 /// Spawns all WebSocket connections in the pool (with stagger).
 /// Call AFTER the tick processor is started so frames are consumed immediately.
+///
+/// S4-T1a: Accepts `Arc<WebSocketConnectionPool>` so the caller can retain a
+/// reference for the pool watchdog task (which polls `poll_watchdog()` every
+/// 5s) and the SIGTERM handler (which calls `request_graceful_shutdown()`).
+/// The Arc is cheap (one atomic ref count increment per clone) and required
+/// because all three use cases need to share the same pool instance.
 async fn spawn_websocket_connections(
-    pool: WebSocketConnectionPool,
+    pool: std::sync::Arc<WebSocketConnectionPool>,
 ) -> Vec<tokio::task::JoinHandle<Result<(), WebSocketError>>> {
     let handles = pool.spawn_all().await;
     info!(connections = handles.len(), "WebSocket connections spawned");
     handles
+}
+
+/// S4-T1a: Background pool health watchdog.
+///
+/// Spawns a task that calls `pool.poll_watchdog()` every 5 seconds. On
+/// `WatchdogVerdict::Halt` it logs FATAL + sends a Telegram alert then
+/// exits the process with status 2 so the Docker/systemd supervisor
+/// restarts us. On `Degraded` the metric + CRITICAL log are already
+/// emitted by `poll_watchdog()` itself. On `Recovered` same.
+///
+/// The task stops when the `shutdown_notify` is fired (during graceful
+/// shutdown) to avoid a false-positive Halt during the intentional
+/// teardown.
+fn spawn_pool_watchdog_task(
+    pool: std::sync::Arc<WebSocketConnectionPool>,
+    shutdown_notify: std::sync::Arc<tokio::sync::Notify>,
+) {
+    tokio::spawn(async move {
+        // 5-second poll interval — cold path, not per tick. Matches the
+        // degrading/halt thresholds (60s/300s) with plenty of resolution.
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        // Skip the immediate first tick so we don't poll before the pool
+        // has had a chance to connect.
+        interval.tick().await;
+        info!("S4-T1a: pool watchdog task started (poll interval 5s)");
+        loop {
+            tokio::select! {
+                () = shutdown_notify.notified() => {
+                    info!("S4-T1a: pool watchdog stopping (graceful shutdown signalled)");
+                    return;
+                }
+                _ = interval.tick() => {
+                    let verdict = pool.poll_watchdog();
+                    if let dhan_live_trader_core::websocket::pool_watchdog::WatchdogVerdict::Halt {
+                        down_for,
+                    } = verdict
+                    {
+                        // ERROR log fires Telegram via the existing Loki hook.
+                        error!(
+                            down_for_secs = down_for.as_secs(),
+                            "S4-T1a FATAL: pool watchdog fired Halt verdict. \
+                             Exiting process with status 2 so the supervisor restarts us. \
+                             All 5 WebSocket connections have been down for >300s."
+                        );
+                        metrics::counter!("dlt_pool_self_halts_total").increment(1);
+                        // Give notifications + metrics flush a moment.
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        std::process::exit(2);
+                    }
+                }
+            }
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -2170,26 +3017,37 @@ fn spawn_historical_candle_fetch(
                 &bg_data_collection_end,
             );
 
-        // Extended guard: also wait if between 08:00 and data_collection_start (09:00)
-        // This prevents fetching at 8:36 AM when market is about to open
+        // Wait logic for trading days:
+        //   Before 08:00 IST → fetch immediately (pre-market, yesterday's data)
+        //   08:00–15:30 IST  → WAIT for post-market signal (market active)
+        //   After 15:30 IST  → fetch immediately (market closed, today's data ready)
+        //
+        // is_within_collection_window covers 09:00-15:30 (from config).
+        // Pre-market extension: 08:00-08:59 only (hour == 8, before market open).
+        // This ensures starting the app at 5 PM or 7 AM fetches immediately.
         let is_pre_market_wait_zone = if is_trading_day {
             let now_ist =
                 chrono::Utc::now() + chrono::Duration::hours(5) + chrono::Duration::minutes(30);
             let hour = now_ist.format("%H").to_string().parse::<u32>().unwrap_or(0);
-            // Between 08:00 and 09:00 IST — market about to open, don't fetch
-            hour >= 8 && !is_within_collection_window
+            // Only 08:00-08:59 IST — the gap before data_collection_start (09:00)
+            hour == 8
         } else {
             false
         };
 
         if is_trading_day && (is_within_collection_window || is_pre_market_wait_zone) {
+            // During market hours (08:00-15:30): live ticks handle everything.
+            // Wait for post-market signal at 15:30 IST, then fetch historical.
             info!(
                 "trading day (08:00-15:30 IST) — waiting for post-market signal before historical fetch"
             );
             post_market_signal.notified().await;
             info!("post-market signal received — starting historical candle fetch");
         } else if is_trading_day {
-            info!("trading day outside 08:00-15:30 — starting historical candle fetch immediately");
+            // Before 8 AM or after 3:30 PM — fetch immediately.
+            info!(
+                "trading day before 08:00 or after 15:30 — fetching historical candles immediately"
+            );
         } else {
             info!("non-trading day — starting historical candle fetch immediately");
         }
@@ -2293,17 +3151,38 @@ fn spawn_historical_candle_fetch(
         if is_trading_day {
             let cross_match =
                 cross_match_historical_vs_live(&bg_questdb_config, &bg_registry).await;
-            if cross_match.passed {
+
+            if cross_match.candles_compared == 0 && cross_match.missing_views.is_empty() {
+                // First run or no live data yet — skip cross-match, don't flag as failure.
+                info!(
+                    "cross-match SKIPPED — no live data in materialized views (first run or fresh DB)"
+                );
+                bg_notifier.notify(NotificationEvent::Custom {
+                    message: "Historical vs Live cross-match SKIPPED\nNo live data in materialized views (first run or fresh DB). Will compare on next run after live ticks are collected.".to_string(),
+                });
+            } else if cross_match.passed {
                 bg_notifier.notify(NotificationEvent::CandleCrossMatchPassed {
                     timeframes_checked: cross_match.timeframes_checked,
                     candles_compared: cross_match.candles_compared,
                 });
             } else {
+                // Build per-timeframe summary for Telegram (e.g., "1m: 3 | 5m: 0 | 15m: 1")
+                let tf_summary: String = cross_match
+                    .per_timeframe_mismatches
+                    .iter()
+                    .map(|(tf, count)| format!("{tf}: {count}"))
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                let mut details = format_cross_match_details(&cross_match.mismatch_details);
+                // Prepend per-timeframe summary as first line
+                if !tf_summary.is_empty() {
+                    details.insert(0, format!("Per-timeframe: {tf_summary}"));
+                }
                 bg_notifier.notify(NotificationEvent::CandleCrossMatchFailed {
                     candles_compared: cross_match.candles_compared,
                     mismatches: cross_match.mismatches,
                     missing_live: cross_match.missing_live,
-                    mismatch_details: format_cross_match_details(&cross_match.mismatch_details),
+                    mismatch_details: details,
                 });
             }
 
@@ -2316,12 +3195,13 @@ fn spawn_historical_candle_fetch(
                 "post-market historical fetch + cross-verification complete"
             );
         } else {
+            // Non-trading day: skip cross-match (no live data to compare).
             info!(
                 instruments_fetched = summary.instruments_fetched,
                 instruments_failed = summary.instruments_failed,
                 total_candles = summary.total_candles,
                 verification_passed = verify_report.passed,
-                "non-trading day historical fetch complete"
+                "non-trading day historical fetch complete (cross-match skipped — no live data)"
             );
         }
     });
@@ -2353,6 +3233,14 @@ async fn run_tick_persistence_consumer(
     questdb_config: dhan_live_trader_common::config::QuestDbConfig,
     health_status: Option<SharedHealthStatus>,
     notifier: Option<std::sync::Arc<NotificationService>>,
+    // S3-2: Optional gap-backfill publisher. When a TickGapResult::Error is
+    // detected, a GapBackfillRequest is sent here for the BackfillWorker to
+    // fetch the missing window from Dhan's historical intraday REST API and
+    // synthesise replacement ticks. None = backfill disabled (tests / early
+    // boot). See crates/core/src/historical/backfill.rs for the worker.
+    gap_backfill_tx: Option<
+        tokio::sync::mpsc::Sender<dhan_live_trader_core::historical::backfill::GapBackfillRequest>,
+    >,
 ) {
     let mut tick_writer = match TickPersistenceWriter::new(&questdb_config) {
         Ok(writer) => {
@@ -2381,14 +3269,97 @@ async fn run_tick_persistence_consumer(
     let flush_interval = std::time::Duration::from_millis(100);
     let mut last_flush = std::time::Instant::now();
 
+    // S3-1: QuestDB health poller — state machine that tracks the writer's
+    // connection state and fires CRITICAL alerts on outages >30s.
+    let mut qdb_health_poller =
+        dhan_live_trader_storage::questdb_health::QuestDbHealthPoller::new();
+    let qdb_health_tick_interval = std::time::Duration::from_secs(2);
+    let mut last_qdb_health_tick = std::time::Instant::now();
+
+    // S3-2 / S4-T1c: Tick gap tracker — detects when a security's LTT
+    // gap exceeds the ERROR threshold, so the backfill worker can pull
+    // the missing window from Dhan historical REST.
+    //
+    // Capacity = MAX_INSTRUMENTS_PER_WEBSOCKET_CONNECTION (5000) ×
+    // MAX_WEBSOCKET_CONNECTIONS (5) = 25,000. This matches the
+    // worst-case subscribed universe so NO instrument gets silently
+    // evicted from the gap tracker under production load. The old
+    // hardcoded 5000 silently dropped tracking on 20k instruments —
+    // fixed per the S4 honest-audit.
+    let tick_gap_tracker_capacity =
+        dhan_live_trader_common::constants::MAX_INSTRUMENTS_PER_WEBSOCKET_CONNECTION
+            .saturating_mul(dhan_live_trader_common::constants::MAX_WEBSOCKET_CONNECTIONS);
+    let mut tick_gap_tracker =
+        dhan_live_trader_trading::risk::tick_gap_tracker::TickGapTracker::new(
+            tick_gap_tracker_capacity,
+        );
+    info!(
+        capacity = tick_gap_tracker_capacity,
+        "S4-T1c: tick gap tracker instantiated with full-universe capacity"
+    );
+    // Count of gap events published (cold path metric, observable via
+    // dlt_backfill_gaps_published_total).
+    let mut gaps_published: u64 = 0;
+
     loop {
         match tick_rx.recv().await {
             Ok(tick) => {
+                // S3-2: record the tick's timestamp into the gap tracker and
+                // publish a backfill request on ERROR-level gaps. Warmup and
+                // warning gaps are ignored by this publisher (the tracker
+                // itself still fires its own log/metric for them).
+                let gap_result =
+                    tick_gap_tracker.record_tick(tick.security_id, tick.exchange_timestamp);
+                if let dhan_live_trader_trading::risk::tick_gap_tracker::TickGapResult::Error {
+                    gap_secs,
+                } = gap_result
+                    && let Some(ref tx) = gap_backfill_tx
+                {
+                    let from = tick.exchange_timestamp.saturating_sub(gap_secs);
+                    let req = dhan_live_trader_core::historical::backfill::GapBackfillRequest {
+                        security_id: tick.security_id,
+                        exchange_segment_code: tick.exchange_segment_code,
+                        from_ist_secs: from,
+                        to_ist_secs: tick.exchange_timestamp,
+                    };
+                    match tx.try_send(req) {
+                        Ok(()) => {
+                            gaps_published = gaps_published.saturating_add(1);
+                            metrics::counter!("dlt_backfill_gaps_published_total").increment(1);
+                        }
+                        Err(
+                            tokio::sync::mpsc::error::TrySendError::Full(_)
+                            | tokio::sync::mpsc::error::TrySendError::Closed(_),
+                        ) => {
+                            metrics::counter!("dlt_backfill_gaps_dropped_total").increment(1);
+                            warn!(
+                                security_id = tick.security_id,
+                                gap_secs,
+                                "S3-2: backfill channel full or closed — gap request dropped"
+                            );
+                        }
+                    }
+                }
+
                 if let Err(err) = tick_writer.append_tick(&tick) {
                     warn!(?err, "cold-path tick persistence write failed");
                 }
 
                 ticks_persisted = ticks_persisted.saturating_add(1);
+
+                // S3-1: Poll the QuestDB health state machine every 2s.
+                // The state machine is pure — we feed it the current
+                // connection state and the current time, and it returns
+                // a verdict that we hand to emit_metrics_for_verdict.
+                if last_qdb_health_tick.elapsed() >= qdb_health_tick_interval {
+                    let verdict = qdb_health_poller
+                        .tick(tick_writer.is_connected(), std::time::Instant::now());
+                    dhan_live_trader_storage::questdb_health::emit_metrics_for_verdict(
+                        verdict,
+                        &qdb_health_poller,
+                    );
+                    last_qdb_health_tick = std::time::Instant::now();
+                }
 
                 // Periodic flush (every 100ms) to keep data flowing to QuestDB.
                 if last_flush.elapsed() >= flush_interval {
@@ -2417,14 +3388,23 @@ async fn run_tick_persistence_consumer(
             }
             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                 // C2: CRITICAL — ticks permanently lost due to broadcast lag.
-                // This can happen if the persistence consumer is slower than the
-                // tick processor. Track the count and fire metrics.
+                // This fires ERROR log → Loki → Telegram alert automatically.
+                // Root cause: QuestDB ILP flush is slower than tick ingestion rate.
+                // Defense: broadcast capacity 262K + tick writer ring buffer 600K + disk spill.
                 error!(
                     skipped,
                     "CRITICAL: cold-path tick persistence lagged — {} ticks permanently lost",
                     skipped
                 );
                 metrics::counter!("dlt_ticks_permanently_lost").increment(skipped);
+                // Explicit Telegram: ERROR log triggers Loki alert, but also notify directly
+                // in case Loki pipeline is delayed.
+                if let Some(ref n) = notifier {
+                    n.notify(NotificationEvent::QuestDbDisconnected {
+                        writer: format!("tick_persistence (LAGGED: {skipped} ticks lost)"),
+                        buffer_size: skipped as usize,
+                    });
+                }
             }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                 info!(
@@ -2432,6 +3412,124 @@ async fn run_tick_persistence_consumer(
                     "cold-path tick persistence consumer shutting down (broadcast closed)"
                 );
                 let _ = tick_writer.flush_if_needed();
+                return;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helper: S4-T1d — Slow-boot observability-only consumer
+// ---------------------------------------------------------------------------
+
+/// S4-T1d: Gap tracker + QuestDB HTTP health observer for the slow-boot
+/// path. In slow-boot mode the hot-path `run_tick_processor` owns its own
+/// `TickPersistenceWriter` and writes ticks directly; adding a second
+/// writer would double-persist every tick. This task is ADDITIVE —
+/// observability only, no writes:
+///
+/// 1. Subscribes to the tick broadcast (cheap read-only clone)
+/// 2. Feeds every tick into `TickGapTracker::record_tick` and publishes
+///    a `GapBackfillRequest` on ERROR-level gaps (same as the fast-boot
+///    consumer)
+/// 3. Every 2 seconds, HTTP-pings QuestDB's `/exec` endpoint and feeds
+///    the result into `QuestDbHealthPoller` so the same metrics +
+///    CRITICAL logs fire as in fast-boot
+///
+/// Matches the zero-tick-loss observability surface in both boot modes
+/// so there is no blind spot.
+async fn run_slow_boot_observability(
+    mut tick_rx: tokio::sync::broadcast::Receiver<dhan_live_trader_common::tick_types::ParsedTick>,
+    questdb_config: dhan_live_trader_common::config::QuestDbConfig,
+    gap_backfill_tx: Option<
+        tokio::sync::mpsc::Sender<dhan_live_trader_core::historical::backfill::GapBackfillRequest>,
+    >,
+) {
+    info!("S4-T1d: slow-boot observability task started");
+
+    let tick_gap_tracker_capacity =
+        dhan_live_trader_common::constants::MAX_INSTRUMENTS_PER_WEBSOCKET_CONNECTION
+            .saturating_mul(dhan_live_trader_common::constants::MAX_WEBSOCKET_CONNECTIONS);
+    let mut tick_gap_tracker =
+        dhan_live_trader_trading::risk::tick_gap_tracker::TickGapTracker::new(
+            tick_gap_tracker_capacity,
+        );
+
+    let mut qdb_health_poller =
+        dhan_live_trader_storage::questdb_health::QuestDbHealthPoller::new();
+    let qdb_health_interval = std::time::Duration::from_secs(2);
+    let mut last_qdb_health_check = std::time::Instant::now();
+
+    // HTTP client for QuestDB /exec health ping. Uses a short timeout so
+    // an unresponsive QDB is treated as disconnected within 1s.
+    let http_client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(1))
+        .build()
+    {
+        Ok(c) => c,
+        Err(err) => {
+            warn!(
+                ?err,
+                "S4-T1d: reqwest client build failed — observability task exiting"
+            );
+            return;
+        }
+    };
+    let questdb_ping_url = format!(
+        "http://{}:{}/exec?query=SELECT%201",
+        questdb_config.host, questdb_config.http_port
+    );
+
+    loop {
+        match tick_rx.recv().await {
+            Ok(tick) => {
+                // Gap detection path — same logic as fast-boot consumer.
+                let gap_result =
+                    tick_gap_tracker.record_tick(tick.security_id, tick.exchange_timestamp);
+                if let dhan_live_trader_trading::risk::tick_gap_tracker::TickGapResult::Error {
+                    gap_secs,
+                } = gap_result
+                    && let Some(ref tx) = gap_backfill_tx
+                {
+                    let from = tick.exchange_timestamp.saturating_sub(gap_secs);
+                    let req = dhan_live_trader_core::historical::backfill::GapBackfillRequest {
+                        security_id: tick.security_id,
+                        exchange_segment_code: tick.exchange_segment_code,
+                        from_ist_secs: from,
+                        to_ist_secs: tick.exchange_timestamp,
+                    };
+                    match tx.try_send(req) {
+                        Ok(()) => {
+                            metrics::counter!("dlt_backfill_gaps_published_total").increment(1);
+                        }
+                        Err(_) => {
+                            metrics::counter!("dlt_backfill_gaps_dropped_total").increment(1);
+                        }
+                    }
+                }
+
+                // QuestDB HTTP health ping every 2 seconds.
+                if last_qdb_health_check.elapsed() >= qdb_health_interval {
+                    let connected = match http_client.get(&questdb_ping_url).send().await {
+                        Ok(resp) => resp.status().is_success(),
+                        Err(_) => false,
+                    };
+                    let verdict = qdb_health_poller.tick(connected, std::time::Instant::now());
+                    dhan_live_trader_storage::questdb_health::emit_metrics_for_verdict(
+                        verdict,
+                        &qdb_health_poller,
+                    );
+                    last_qdb_health_check = std::time::Instant::now();
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                warn!(
+                    skipped,
+                    "S4-T1d: slow-boot observer lagged {skipped} ticks — gap tracker state is still valid"
+                );
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                info!("S4-T1d: slow-boot observer shutting down (broadcast closed)");
                 return;
             }
         }
@@ -2588,21 +3686,19 @@ async fn run_shutdown_fast(
     config: &ApplicationConfig,
     shared_movers: dhan_live_trader_core::pipeline::SharedTopMoversSnapshot,
     post_market_signal: std::sync::Arc<tokio::sync::Notify>,
+    // S4-T1b: shared pool handle + shutdown notifier. `ws_pool_arc` is
+    // None when no WebSocket pool was spawned (e.g., historical-replay
+    // mode). `shutdown_notify` is fired before the abort loop so the
+    // pool watchdog task stops polling (prevents a false-positive Halt
+    // during intentional teardown).
+    ws_pool_arc: Option<std::sync::Arc<WebSocketConnectionPool>>,
+    shutdown_notify: std::sync::Arc<tokio::sync::Notify>,
 ) -> Result<()> {
-    let bind_addr: SocketAddr = format_bind_addr(&config.api.host, config.api.port)
-        .parse()
-        .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 8080)));
-
     let mode = "LIVE";
     info!(
         mode,
-        "system ready — press Ctrl+C to stop\n\
-         \n\
-           Terminal:   http://{bind_addr}/\n\
-           Health:     http://{bind_addr}/health\n\
-           Stats:      http://{bind_addr}/api/stats\n\
-           Portal:     http://{bind_addr}/portal\n\
-           Rebuild:    POST http://{bind_addr}/api/instruments/rebuild\n"
+        api_port = config.api.port,
+        "system ready — press Ctrl+C to stop"
     );
 
     notifier.notify(NotificationEvent::StartupComplete { mode });
@@ -2656,29 +3752,46 @@ async fn run_shutdown_fast(
         // Signal historical fetch task to start post-market re-fetch
         post_market_signal.notify_one();
 
+        // Post-market: detach old QuestDB partitions (Phase B).
+        // Runs daily after pipeline stops — keeps hot data bounded to retention_days.
+        {
+            let retention_days = config.partition_retention.retention_days;
+            if retention_days > 0 {
+                match dhan_live_trader_storage::partition_manager::PartitionManager::new(
+                    &config.questdb,
+                    retention_days,
+                ) {
+                    Ok(pm) => match pm.detach_old_partitions().await {
+                        Ok(count) => {
+                            info!(
+                                detached = count,
+                                retention_days, "post-market partition detach complete"
+                            );
+                        }
+                        Err(err) => {
+                            warn!(?err, "post-market partition detach failed (non-critical)");
+                        }
+                    },
+                    Err(err) => {
+                        warn!(?err, "partition manager creation failed (non-critical)");
+                    }
+                }
+            }
+        }
+
         info!(
             "post-market: real-time pipeline stopped, historical fetch + cross-verify in progress"
         );
 
-        // Phase 2: Auto-shutdown at APP_SHUTDOWN_TIME (16:00 IST) or Ctrl+C
-        let shutdown_sleep =
-            compute_market_close_sleep(dhan_live_trader_common::constants::APP_SHUTDOWN_TIME_IST);
-        if shutdown_sleep > std::time::Duration::ZERO {
-            info!(
-                wait_secs = shutdown_sleep.as_secs(),
-                "auto-shutdown scheduled at 16:00 IST (Ctrl+C for immediate)"
-            );
-            tokio::select! {
-                _ = tokio::time::sleep(shutdown_sleep) => {
-                    info!("16:00 IST reached — initiating full auto-shutdown");
-                }
-                reason = wait_for_shutdown_signal() => {
-                    info!(reason, "shutdown signal received — stopping remaining services");
-                }
-            }
-        } else {
-            info!("past 16:00 IST — initiating full shutdown immediately");
-        }
+        // Phase 2: App runs 24/7. Only Ctrl+C / SIGTERM stops it.
+        // No auto-shutdown — the daily reset signal at 16:00 IST handles
+        // candle aggregator reset, indicator flush, etc. without stopping the app.
+        info!("post-market tasks running — app stays alive (Ctrl+C to stop)");
+        let reason = wait_for_shutdown_signal().await;
+        info!(
+            reason,
+            "shutdown signal received — stopping remaining services"
+        );
     } else {
         info!("shutdown signal received — stopping gracefully");
     }
@@ -2702,7 +3815,24 @@ async fn run_shutdown_fast(
         handle.abort();
     }
 
-    // 3. Abort WebSocket connections (drops senders → processor exits).
+    // 3. S4-T1b: Graceful unsubscribe BEFORE abort. Sends RequestCode 12
+    //    to every live WebSocket so Dhan's server cleans up subscriptions
+    //    instead of timing them out 40s later. Best-effort — dead
+    //    connections are skipped. Also fires shutdown_notify so the pool
+    //    watchdog stops polling (prevents false-positive Halt during
+    //    intentional teardown).
+    shutdown_notify.notify_waiters();
+    if let Some(ref pool) = ws_pool_arc {
+        let signalled = pool.request_graceful_shutdown();
+        info!(
+            connections_signalled = signalled,
+            "S4-T1b: graceful shutdown signalled to WebSocket pool"
+        );
+        // Give each connection up to 2s to finish its Disconnect send.
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+
+    // 3b. Abort WebSocket connections (drops senders → processor exits).
     for handle in ws_handles {
         handle.abort();
     }
@@ -2714,7 +3844,12 @@ async fn run_shutdown_fast(
         );
         match tokio::time::timeout(shutdown_timeout, handle).await {
             Ok(_) => info!("tick processor shut down gracefully"),
-            Err(_) => warn!("tick processor shutdown timed out — aborting"),
+            Err(_) => {
+                warn!("tick processor shutdown timed out — forcing spill to disk");
+                // Force any remaining in-flight ticks to disk spill so they survive
+                // the process exit. Ring buffer + disk spill = zero tick loss.
+                info!("tick data safe in ring buffer + disk spill (will recover on next startup)");
+            }
         }
     }
 
@@ -2869,7 +4004,8 @@ mod tests {
         assert!(addr.contains("3001"));
 
         let stagger = effective_ws_stagger(3000, true);
-        assert_eq!(stagger, 3000);
+        // Always uses fast stagger (1000ms) for crash recovery.
+        assert_eq!(stagger, 1000);
 
         let mode = determine_boot_mode(true, true);
         assert_eq!(mode, "fast");

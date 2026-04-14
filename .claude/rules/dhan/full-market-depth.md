@@ -10,7 +10,27 @@
 
 2. **Two SEPARATE endpoints. Never mix them.**
    - 20-level: `wss://depth-api-feed.dhan.co/twentydepth?token=<TOKEN>&clientId=<CLIENT_ID>&authType=2`
-   - 200-level: `wss://full-depth-api.dhan.co/?token=<TOKEN>&clientId=<CLIENT_ID>&authType=2` (SDK uses root path, no `/twohundreddepth`)
+   - 200-level: `wss://full-depth-api.dhan.co/twohundreddepth?token=<TOKEN>&clientId=<CLIENT_ID>&authType=2`
+
+   **MANDATORY per Dhan support (2026-04-10, Ticket #5519522):**
+   - **Path MUST be `/twohundreddepth`** on host `full-depth-api.dhan.co`.
+     Root path `/` (used by Python SDK) causes `Protocol(ResetWithoutClosingHandshake)`
+     within 3-5 seconds of subscription — the server actively resets the TCP
+     connection. **Do NOT fall back to the root path ever.**
+   - **Security ID MUST be close to current market price (ATM).** Far OTM
+     contracts return zero consistent depth data even when the subscription
+     succeeds — the server accepts but never streams. This is NOT a bug, it
+     is by-design server-side filtering.
+   - **Mechanical enforcement for 200-level subscriptions**:
+     1. URL builder MUST emit `/twohundreddepth` as the path — verified by
+        `test_twohundreddepth_uses_explicit_path` and banned-pattern scan
+        for `full-depth-api.dhan.co/?` (root path with no segment).
+     2. Strike selector for 200-level subscriptions MUST use the ATM strike
+        (index ±0, or max ±2 strikes for coverage). `DEEP_DEPTH_MAX_STRIKE_OFFSET`
+        constant enforces this bound.
+     3. Depth rebalancer recomputes the ATM strike every 60 seconds on spot
+        drift and unsubscribes+resubscribes the far contract. Verified by
+        `test_depth_rebalancer_tracks_atm_on_spot_drift`.
 
 3. **Connection limits are INDEPENDENT per WebSocket type (confirmed by Dhan 2026-04-06).**
    - Live Market Feed: 5 connections (separate pool)

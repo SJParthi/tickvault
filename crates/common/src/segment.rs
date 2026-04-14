@@ -11,7 +11,7 @@ use crate::constants::{
 
 /// Maps the binary exchange_segment_code to a human-readable symbol name.
 ///
-/// Uses the same mapping as the Dhan Python SDK.
+/// Uses the same mapping as the Dhan API (Python SDK ref).
 /// Note: code 6 is unused/skipped in Dhan's protocol.
 pub fn segment_code_to_str(code: u8) -> &'static str {
     match code {

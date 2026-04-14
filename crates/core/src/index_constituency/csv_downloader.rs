@@ -116,7 +116,11 @@ async fn download_single_csv(client: &Client, name: &str, url: &str) -> Result<S
         let client = client.clone();
         let url = url_owned.clone();
         async move {
-            let response = client.get(&url).send().await?;
+            let response = client
+                .get(&url)
+                .header("Accept", "text/csv, application/csv, text/plain, */*")
+                .send()
+                .await?;
 
             let status = response.status();
             if !status.is_success() {

@@ -242,7 +242,12 @@
       "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "title": "WebSocket Reconnections",
       "type": "stat",
-      "targets": [{ "expr": "dlt_websocket_reconnections_total", "legendFormat": "", "refId": "A" }]
+      "targets": [
+        { "expr": "sum(dlt_websocket_reconnections_total)", "legendFormat": "main-feed", "refId": "A" },
+        { "expr": "sum(dlt_depth_20lvl_reconnections_total)", "legendFormat": "depth-20", "refId": "B" },
+        { "expr": "sum(dlt_depth_200lvl_reconnections_total)", "legendFormat": "depth-200", "refId": "C" },
+        { "expr": "dlt_order_update_reconnections_total", "legendFormat": "order-update", "refId": "D" }
+      ]
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
@@ -261,12 +266,82 @@
       "type": "timeseries",
       "targets": [
         { "expr": "dlt_websocket_connections_active", "legendFormat": "active connections", "refId": "A" },
-        { "expr": "rate(dlt_websocket_reconnections_total[5m])", "legendFormat": "reconnects/s", "refId": "B" }
+        { "expr": "dlt_depth_20lvl_connection_active", "legendFormat": "depth-20 {{underlying}}", "refId": "C" },
+        { "expr": "dlt_depth_200lvl_connection_active", "legendFormat": "depth-200 {{underlying}}", "refId": "D" },
+        { "expr": "dlt_order_update_ws_active", "legendFormat": "order-update", "refId": "E" }
       ]
     },
     {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "fixedColor": "blue", "mode": "fixed" },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 27 },
+      "id": 120,
+      "options": { "colorMode": "background", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "title": "Depth 20-Level Connections",
+      "type": "stat",
+      "targets": [{ "expr": "dlt_depth_20lvl_connection_active", "legendFormat": "{{underlying}}", "refId": "A" }]
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "fixedColor": "purple", "mode": "fixed" },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 27 },
+      "id": 121,
+      "options": { "colorMode": "background", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "title": "Depth 200-Level Connections",
+      "type": "stat",
+      "targets": [{ "expr": "dlt_depth_200lvl_connection_active", "legendFormat": "{{underlying}}", "refId": "A" }]
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "axisBorderShow": false, "axisCenteredZero": false, "fillOpacity": 10, "lineWidth": 2, "scaleDistribution": { "type": "linear" } },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 27 },
+      "id": 122,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "title": "Depth Frames Rate",
+      "type": "timeseries",
+      "targets": [
+        { "expr": "rate(dlt_depth_20lvl_frames_total[1m])", "legendFormat": "20-level {{underlying}}", "refId": "A" },
+        { "expr": "rate(dlt_depth_200lvl_frames_total[1m])", "legendFormat": "200-level {{underlying}}", "refId": "B" }
+      ]
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "fixedColor": "orange", "mode": "fixed" },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 27 },
+      "id": 123,
+      "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "title": "Depth Frames Dropped",
+      "type": "stat",
+      "targets": [{ "expr": "dlt_depth_frames_dropped_total", "legendFormat": "{{depth}} {{type}}", "refId": "A" }]
+    },
+    {
       "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 27 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 31 },
       "id": 110,
       "title": "Historical Candles & Data Integrity",
       "type": "row"
@@ -422,29 +497,91 @@
     {
       "collapsed": false,
       "gridPos": { "h": 1, "w": 24, "x": 0, "y": 40 },
-      "id": 104,
-      "title": "Application Logs (Trading)",
+      "id": 130,
+      "title": "Order Book Imbalance (OBI)",
       "type": "row"
     },
     {
-      "datasource": { "type": "loki", "uid": "loki" },
-      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 41 },
-      "id": 17,
-      "options": {
-        "dedupStrategy": "none",
-        "enableLogDetails": true,
-        "prettifyLogMessage": false,
-        "showCommonLabels": false,
-        "showLabels": false,
-        "showTime": true,
-        "sortOrder": "Descending",
-        "wrapLogMessage": true
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "continuous-BlYlRd" },
+          "custom": { "axisBorderShow": false, "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "pointSize": 3, "showPoints": "never" },
+          "min": -1,
+          "max": 1,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "yellow", "value": -0.3 }, { "color": "green", "value": 0.3 }] },
+          "unit": "none"
+        },
+        "overrides": []
       },
-      "title": "Trading Pipeline Logs",
-      "type": "logs",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 41 },
+      "id": 131,
+      "options": { "legend": { "calcs": ["lastNotNull", "min", "max"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "title": "OBI by Underlying",
+      "type": "timeseries",
+      "targets": [{ "expr": "dlt_obi_value", "legendFormat": "{{underlying}}", "refId": "A" }]
+    },
+    {
+      "datasource": { "type": "questdb", "uid": "questdb" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "continuous-BlYlRd" },
+          "custom": { "axisBorderShow": false, "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "never" },
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 41 },
+      "id": 132,
+      "options": { "legend": { "calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "title": "Weighted OBI (QuestDB)",
+      "type": "timeseries",
+      "targets": [{ "rawSql": "SELECT ts, underlying, weighted_obi FROM obi_snapshots WHERE ts > dateadd('h', -1, now()) SAMPLE BY 5s FILL(PREV) ORDER BY ts", "refId": "A", "format": "time_series" }]
+    },
+    {
+      "datasource": { "type": "questdb", "uid": "questdb" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "axisBorderShow": false, "drawStyle": "line", "fillOpacity": 5, "lineWidth": 1, "showPoints": "never" },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 49 },
+      "id": 133,
+      "options": { "legend": { "calcs": ["lastNotNull"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "title": "Bid vs Ask Wall Quantities",
+      "type": "timeseries",
       "targets": [
-        { "expr": "{container=\"dlt-application\"} |~ `(?i)(tick|pipeline|websocket|order|risk|mover|candle)`", "legendFormat": "", "refId": "A" }
+        { "rawSql": "SELECT ts, underlying, max_bid_wall_qty as bid_wall, max_ask_wall_qty as ask_wall FROM obi_snapshots WHERE ts > dateadd('h', -1, now()) AND (max_bid_wall_qty > 0 OR max_ask_wall_qty > 0) SAMPLE BY 10s FILL(PREV) ORDER BY ts", "refId": "A", "format": "time_series" }
       ]
+    },
+    {
+      "datasource": { "type": "questdb", "uid": "questdb" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "axisBorderShow": false, "drawStyle": "line", "fillOpacity": 5, "lineWidth": 1, "showPoints": "never" },
+          "unit": "currencyINR"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 49 },
+      "id": 134,
+      "options": { "legend": { "calcs": ["lastNotNull", "mean"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "title": "Spread by Underlying",
+      "type": "timeseries",
+      "targets": [
+        { "rawSql": "SELECT ts, underlying, spread FROM obi_snapshots WHERE ts > dateadd('h', -1, now()) SAMPLE BY 5s FILL(PREV) ORDER BY ts", "refId": "A", "format": "time_series" }
+      ]
+    },
+    {
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 57 },
+      "id": 104,
+      "title": "Logs (CloudWatch — see AWS Console)",
+      "type": "row"
     }
   ],
   "schemaVersion": 39,

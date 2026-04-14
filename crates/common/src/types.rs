@@ -96,7 +96,7 @@ impl ExchangeSegment {
 
     /// Returns the binary wire code used in Dhan WebSocket V2 protocol.
     ///
-    /// Codes sourced from Dhan Python SDK: IDX_I=0, NSE_EQ=1, NSE_FNO=2,
+    /// Codes sourced from Dhan API (Python SDK ref): IDX_I=0, NSE_EQ=1, NSE_FNO=2,
     /// NSE_CURRENCY=3, BSE_EQ=4, MCX_COMM=5, BSE_CURRENCY=7, BSE_FNO=8.
     pub fn binary_code(&self) -> u8 {
         match self {

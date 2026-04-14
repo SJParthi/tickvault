@@ -30,7 +30,7 @@ wss://depth-api-feed.dhan.co/twentydepth?token=<TOKEN>&clientId=<CLIENT_ID>&auth
 wss://full-depth-api.dhan.co/?token=<TOKEN>&clientId=<CLIENT_ID>&authType=2
 ```
 
-> **SDK verified (2026-04-06):** DhanHQ Python SDK (fulldepth.py) uses `wss://full-depth-api.dhan.co/` (root path, no `/twohundreddepth`). Our code now matches the SDK. Earlier Dhan documentation referenced `/twohundreddepth` but the SDK is the ground truth for what works in production.
+> **SDK verified (2026-04-06):** Dhan API (Python SDK ref) (fulldepth.py) uses `wss://full-depth-api.dhan.co/` (root path, no `/twohundreddepth`). Our code now matches the SDK. Earlier Dhan documentation referenced `/twohundreddepth` but the Dhan docs are the ground truth for what works in production.
 
 | Parameter   | Required | Value                          |
 |-------------|----------|--------------------------------|
@@ -255,7 +255,7 @@ pub struct TwoHundredDepthPacket {
 
 9. **Disconnect code `805`** — same as Live Market Feed, >5 connections kills the oldest.
 
-10. **SDK Bug**: The DhanHQ Python SDK's `fulldepth.py` uses `subscribe_code + 1` for unsubscribe, which yields RequestCode 24 for depth. The correct unsubscribe code per the Dhan Annexure is **25**, not 24. Our implementation correctly uses 25.
+10. **SDK Bug**: The Dhan API (Python SDK ref)'s `fulldepth.py` uses `subscribe_code + 1` for unsubscribe, which yields RequestCode 24 for depth. The correct unsubscribe code per the Dhan Annexure is **25**, not 24. Our implementation correctly uses 25.
 
 ---
 

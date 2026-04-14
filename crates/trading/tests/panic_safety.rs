@@ -4,6 +4,8 @@
 //! and functions that should NEVER panic don't even with extreme inputs.
 //! Critical for a trading system where an unhandled panic = process crash.
 
+use dhan_live_trader_common::tick_types::DeepDepthLevel;
+use dhan_live_trader_trading::indicator::obi::compute_obi;
 use dhan_live_trader_trading::indicator::types::{IndicatorParams, IndicatorState, RingBuffer};
 use dhan_live_trader_trading::risk::engine::RiskEngine;
 
@@ -203,4 +205,133 @@ fn no_panic_oms_error_display_all_variants() {
         let msg = err.to_string();
         assert!(!msg.is_empty());
     }
+}
+
+// ---------------------------------------------------------------------------
+// Must NOT panic: OBI with extreme / garbage inputs
+// ---------------------------------------------------------------------------
+
+#[test]
+fn no_panic_obi_nan_prices() {
+    let bids = [DeepDepthLevel {
+        price: f64::NAN,
+        quantity: 1000,
+        orders: 1,
+    }];
+    let asks = [DeepDepthLevel {
+        price: f64::NAN,
+        quantity: 1000,
+        orders: 1,
+    }];
+    let snap = compute_obi(1, 2, &bids, &asks);
+    // NaN prices are skipped — OBI should be 0 (both sides empty after filtering)
+    assert!((snap.obi).abs() < f64::EPSILON);
+}
+
+#[test]
+fn no_panic_obi_infinity_prices() {
+    let bids = [DeepDepthLevel {
+        price: f64::INFINITY,
+        quantity: 1000,
+        orders: 1,
+    }];
+    let asks = [DeepDepthLevel {
+        price: f64::NEG_INFINITY,
+        quantity: 1000,
+        orders: 1,
+    }];
+    let snap = compute_obi(1, 2, &bids, &asks);
+    // Infinity and negative infinity prices are skipped
+    assert!(snap.obi.is_finite());
+}
+
+#[test]
+fn no_panic_obi_max_quantity() {
+    let bids = [DeepDepthLevel {
+        price: 100.0,
+        quantity: u32::MAX,
+        orders: 1,
+    }; 20];
+    let asks = [DeepDepthLevel {
+        price: 101.0,
+        quantity: u32::MAX,
+        orders: 1,
+    }; 20];
+    let snap = compute_obi(1, 2, &bids, &asks);
+    assert!(snap.obi.is_finite());
+    assert!((snap.obi).abs() < f64::EPSILON, "equal max qty → OBI=0");
+}
+
+#[test]
+fn no_panic_obi_zero_price_levels() {
+    let bids = [DeepDepthLevel {
+        price: 0.0,
+        quantity: 1000,
+        orders: 1,
+    }; 20];
+    let asks = [DeepDepthLevel {
+        price: -1.0,
+        quantity: 1000,
+        orders: 1,
+    }; 20];
+    let snap = compute_obi(1, 2, &bids, &asks);
+    // Zero and negative prices filtered → empty book
+    assert_eq!(snap.bid_levels, 0);
+    assert_eq!(snap.ask_levels, 0);
+}
+
+#[test]
+fn no_panic_obi_empty_slices() {
+    let snap = compute_obi(0, 0, &[], &[]);
+    assert!((snap.obi).abs() < f64::EPSILON);
+    assert_eq!(snap.security_id, 0);
+}
+
+#[test]
+fn no_panic_obi_single_bid_no_ask() {
+    let bids = [DeepDepthLevel {
+        price: 100.0,
+        quantity: 1,
+        orders: 1,
+    }];
+    let snap = compute_obi(42, 2, &bids, &[]);
+    assert!((snap.obi - 1.0).abs() < f64::EPSILON);
+}
+
+#[test]
+fn no_panic_obi_mixed_valid_invalid() {
+    let bids = [
+        DeepDepthLevel {
+            price: f64::NAN,
+            quantity: 1000,
+            orders: 1,
+        },
+        DeepDepthLevel {
+            price: 100.0,
+            quantity: 500,
+            orders: 5,
+        },
+        DeepDepthLevel {
+            price: 0.0,
+            quantity: 999,
+            orders: 1,
+        },
+    ];
+    let asks = [
+        DeepDepthLevel {
+            price: f64::INFINITY,
+            quantity: 2000,
+            orders: 10,
+        },
+        DeepDepthLevel {
+            price: 101.0,
+            quantity: 500,
+            orders: 5,
+        },
+    ];
+    let snap = compute_obi(1, 2, &bids, &asks);
+    // Only valid levels: 1 bid (100.0, 500), 1 ask (101.0, 500)
+    assert!(snap.obi.is_finite());
+    assert_eq!(snap.bid_levels, 1);
+    assert_eq!(snap.ask_levels, 1);
 }

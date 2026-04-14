@@ -2,7 +2,7 @@
 //!
 //! These feeds use a SEPARATE WebSocket endpoint from the standard feed:
 //! - 20-depth: `wss://depth-api-feed.dhan.co/twentydepth`
-//! - 200-depth: `wss://full-depth-api.dhan.co/` (matches DhanHQ Python SDK)
+//! - 200-depth: `wss://full-depth-api.dhan.co/` (matches Dhan API (Python SDK ref))
 //!
 //! # Protocol differences from standard feed
 //! - 12-byte header (vs 8-byte standard feed header)

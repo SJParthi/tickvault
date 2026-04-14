@@ -5,7 +5,7 @@
 
 // ---------------------------------------------------------------------------
 // Dhan WebSocket V2 Binary Protocol — Packet Sizes
-// Source: DhanHQ Python SDK v2 (src/dhanhq/marketfeed.py)
+// Source: Dhan official API spec; verified in Python SDK v2 (src/dhanhq/marketfeed.py)
 // All sizes verified against struct.calcsize() in the SDK.
 // ---------------------------------------------------------------------------
 
@@ -93,7 +93,7 @@ pub const WEBSOCKET_PROTOCOL_VERSION: &str = "2";
 
 // ---------------------------------------------------------------------------
 // Dhan WebSocket V2 — Exchange Segment Codes (Binary Protocol)
-// Source: DhanHQ Python SDK v2 (src/dhanhq/marketfeed.py)
+// Source: Dhan official API spec; verified in Python SDK v2 (src/dhanhq/marketfeed.py)
 // CRITICAL: These are binary wire codes, NOT subscription JSON strings.
 // ---------------------------------------------------------------------------
 
@@ -192,7 +192,7 @@ pub const DISCONNECT_CLIENT_ID_INVALID: u16 = 810;
 
 // ---------------------------------------------------------------------------
 // Dhan WebSocket V2 — Response Codes (Binary Protocol)
-// Source: DhanHQ Python SDK v2 (src/dhanhq/marketfeed.py)
+// Source: Dhan official API spec; verified in Python SDK v2 (src/dhanhq/marketfeed.py)
 // ---------------------------------------------------------------------------
 
 /// Response code for index ticker packet (16 bytes).
@@ -203,10 +203,10 @@ pub const RESPONSE_CODE_TICKER: u8 = 2;
 
 /// Response code for market depth standalone packet (112 bytes).
 /// Format: `<BHBIf100s>` — Header(8) + LTP(f32) + Depth(5×20 bytes).
-/// Dhan Python SDK: `process_market_depth(data)`.
+/// Dhan API (Python SDK ref): `process_market_depth(data)`.
 ///
 /// NOTE: Not in annexure Section 3 (gap between Ticker(2) and Quote(4)).
-/// Documented and handled in DhanHQ Python SDK v2 `process_market_depth()`.
+/// Documented and handled in Dhan API (Python SDK ref) v2 `process_market_depth()`.
 pub const RESPONSE_CODE_MARKET_DEPTH: u8 = 3;
 
 /// Response code for quote packet (50 bytes).
@@ -245,7 +245,7 @@ pub const MARKET_STATUS_POST_CLOSE: u16 = 3;
 
 // ---------------------------------------------------------------------------
 // Dhan WebSocket V2 — Subscription Request Codes
-// Source: DhanHQ Python SDK v2 (src/dhanhq/marketfeed.py)
+// Source: Dhan official API spec; verified in Python SDK v2 (src/dhanhq/marketfeed.py)
 // Subscribe codes: 15 (Ticker), 17 (Quote), 21 (Full).
 // Unsubscribe = subscribe_code + 1: 16 (Ticker), 18 (Quote), 22 (Full).
 // Disconnect = 12 (closes the WebSocket connection).
@@ -305,7 +305,7 @@ pub const MARKET_DEPTH_LEVELS: usize = 5;
 
 // ---------------------------------------------------------------------------
 // Market Depth — Per-Level Field Offsets (within a single 20-byte level)
-// Source: Dhan Python SDK `<IIHHff>` format string.
+// Source: Dhan API (Python SDK ref) `<IIHHff>` format string.
 // Used in Full (code 8) and Market Depth standalone (code 3) packets.
 // ---------------------------------------------------------------------------
 
@@ -329,7 +329,7 @@ pub const DEPTH_LEVEL_OFFSET_ASK_PRICE: usize = 16;
 
 // ---------------------------------------------------------------------------
 // Deep Depth Protocol — 20-Level & 200-Level WebSocket Feeds
-// Source: DhanHQ Python SDK (src/dhanhq/marketfeed.py), Dhan API docs.
+// Source: Dhan official API spec; verified in Python SDK (src/dhanhq/marketfeed.py), Dhan API docs.
 // Separate WebSocket endpoints from the standard feed.
 // Bid and ask sides arrive as SEPARATE binary packets.
 // ---------------------------------------------------------------------------
@@ -351,7 +351,7 @@ pub const DEEP_DEPTH_LEVEL_SIZE: usize = 16;
 
 // ---------------------------------------------------------------------------
 // Deep Depth — Per-Level Field Offsets (within a single 16-byte level)
-// Source: Dhan Python SDK `<dII>` format string in fulldepth.py.
+// Source: Dhan API (Python SDK ref) `<dII>` format string in fulldepth.py.
 // ---------------------------------------------------------------------------
 
 /// Price (f64 LE) offset within a deep depth level.
@@ -974,11 +974,10 @@ pub const DHAN_TWENTY_DEPTH_WS_BASE_URL: &str = "wss://depth-api-feed.dhan.co/tw
 /// 200-level depth WebSocket base URL.
 /// Full URL: `wss://full-depth-api.dhan.co/twohundreddepth?token=TOKEN&clientId=CLIENT_ID&authType=2`
 ///
-/// NOTE: Official Dhan API docs (madefortrade.in/t/responded-api-trading-market-depth)
-/// specify `/twohundreddepth` path. The Python SDK uses root path `/` but this causes
-/// `ResetWithoutClosingHandshake` on the server. Reverted to official docs path.
-/// Updated 2026-04-07 to match official docs after persistent connection failures with root path.
-pub const DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL: &str = "wss://full-depth-api.dhan.co/twohundreddepth"; // APPROVED: infrastructure constant — matches official Dhan API docs
+/// NOTE: Dhan support confirmed (2026-04-10, Ticket #5519522) the correct path is
+/// `/twohundreddepth`. Previous SDK-based root path `/` caused `ResetWithoutClosingHandshake`.
+/// Dhan also confirmed: use a Security ID close to current market price (ATM), not far OTM.
+pub const DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL: &str = "wss://full-depth-api.dhan.co/twohundreddepth"; // APPROVED: infrastructure constant — confirmed by Dhan support ticket #5519522
 
 // ---------------------------------------------------------------------------
 // Historical Data — Candle Fetch Constants
@@ -1022,10 +1021,12 @@ pub const MARKET_LAST_CANDLE_START_IST: &str = "15:29:00";
 /// meaning the last candle returned starts at 15:29.
 pub const MARKET_CLOSE_TIME_IST_EXCLUSIVE: &str = "15:30:00";
 
-/// Full application auto-shutdown time (IST). After market close at 15:30,
-/// historical re-fetch + cross-verification runs. At 16:00 IST the entire
-/// application shuts down — matching the target AWS instance lifecycle.
-pub const APP_SHUTDOWN_TIME_IST: &str = "16:00:00";
+/// Daily reset signal time (IST). After market close at 15:30,
+/// historical re-fetch + cross-verification runs. At 16:00 IST the daily
+/// reset signal fires (candle aggregator reset, indicator reset, etc.).
+/// NOTE: Auto-shutdown is DISABLED. App runs 24/7 until manual Ctrl+C.
+/// For AWS instance lifecycle, use systemd timer or cron for restart.
+pub const APP_DAILY_RESET_TIME_IST: &str = "16:00:00";
 
 /// Number of 1-minute candles in the cross-verification window (09:15 to 15:29 = 375).
 ///
@@ -1592,7 +1593,7 @@ const _: () = assert!(
 
 // ---------------------------------------------------------------------------
 // Compile-Time Assertions — Binary Protocol Offset Chain Verification
-// Source: Dhan Python SDK struct.unpack format strings.
+// Source: Dhan API (Python SDK ref) struct.unpack format strings.
 // Ensures every offset = previous_offset + previous_field_size.
 // ---------------------------------------------------------------------------
 
@@ -1862,6 +1863,7 @@ mod market_hours_tests {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(clippy::assertions_on_constants)] // APPROVED: S4 — schema-stability tests intentionally assert on compile-time constants as a regression guard against silent protocol-value drift. Converting to `const { assert!(..) }` blocks compiles away the check message which defeats the guard purpose.
 mod tests {
     use super::*;
 

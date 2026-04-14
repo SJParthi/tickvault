@@ -1,7 +1,11 @@
 # =============================================================================
 # dhan-live-trader — Docker Compose
 # =============================================================================
-# ALL versions from Tech Stack Bible V6. Same file on Mac and AWS.
+# ALL versions from Tech Stack Bible V6. Same file on Mac and AWS c7i.xlarge.
+# Target: c7i.xlarge (4 vCPUs, 8GB RAM) — 1yr reserved ~₹6,400/mo
+# Memory budget: QuestDB 4GB + App 1GB + Valkey 256MB + Prometheus 512MB
+#   + Grafana 256MB + Traefik 128MB + OS 1GB = ~7.2GB (fits in 8GB)
+# Loki + Alloy + Jaeger REMOVED — saves ~2.5GB RAM.
 # Container prefix: dlt- (dhan-live-trader)
 # Network: dlt-network (all services communicate via Docker DNS)
 # ALL images pinned with SHA256 digest (Bible Section 14 #71)
@@ -21,8 +25,6 @@ volumes:
     name: dlt-grafana-data
   dlt-prometheus-data:
     name: dlt-prometheus-data
-  dlt-loki-data:
-    name: dlt-loki-data
 
 services:
   # ---------------------------------------------------------------------------
@@ -34,8 +36,18 @@ services:
     container_name: dlt-questdb
     hostname: dlt-questdb
     restart: unless-stopped
+    # Memory: 4GB fits c7i.xlarge (8GB total) and Mac dev (48GB).
+    # QuestDB mmaps data files — actual RSS is much lower than limit.
+    # Partition manager keeps hot data bounded to ~90 days.
     mem_limit: 4g
+    mem_reservation: 2g
     cpus: 2.0
+    # OOM protection: prefer killing other containers over QuestDB.
+    # QuestDB holds all trading data — losing it mid-session is catastrophic.
+    oom_score_adj: -500
+    # Shared memory: QuestDB uses mmap heavily for WAL + column storage.
+    # Default 64MB causes SIGBUS on large tables. 2GB matches production needs.
+    shm_size: 512m
     ports:
       # E5 security: bind web console to localhost only (no external access).
       # PG + ILP remain on all interfaces for host app connectivity.
@@ -49,7 +61,33 @@ services:
       QDB_LOG_W_STDOUT_LEVEL: ERROR
       QDB_TELEMETRY_ENABLED: "false"
       QDB_LINE_TCP_MAINTENANCE_JOB_INTERVAL: "60000"
+      # Increase ILP connection idle timeout to prevent disconnects during
+      # low-activity periods. Default is too aggressive for burst-then-idle
+      # patterns (25K instruments send bursts, then pause between flush cycles).
+      QDB_LINE_TCP_DISCONNECT_ON_ERROR: "false"
       QDB_METRICS_ENABLED: "TRUE"
+      # --- WAL Tuning (Phase B: 100-500GB future-proof) ---
+      # WAL segment rollover: 64MB (default 16MB). Fewer file ops for high-throughput ILP.
+      QDB_WAL_SEGMENT_ROLLOVER_SIZE: "67108864"
+      # Max uncommitted rows per WAL writer: 2M (default 500K). Larger batches = fewer commits.
+      QDB_CAIRO_MAX_UNCOMMITTED_ROWS: "2000000"
+      # WAL apply job interval: 100ms (default 300ms). Faster WAL→table merge for freshness.
+      QDB_WAL_APPLY_TABLE_TIME_QUOTA: "100000"
+      # O3 max lag: 60s (default 300s). Tighter out-of-order merge window.
+      QDB_CAIRO_O3_MAX_LAG: "60000000"
+      # ILP connection limit: 20 (default 10). We have ~15 writers (tick, depth, OBI, indicators, candles, etc.).
+      QDB_LINE_TCP_NET_ACTIVE_CONNECTION_LIMIT: "20"
+      # ILP idle timeout: 10 minutes (default 5 min = 300000ms). Prevents premature disconnect
+      # during burst-then-idle patterns (depth writers flush every 500 records, may idle 30-60s between).
+      QDB_LINE_TCP_MIN_IDLE_MS_BEFORE_WRITER_RELEASE: "600000"
+      # ILP connection receive buffer: 4MB (default 1MB). Handles burst ILP writes without backpressure.
+      QDB_LINE_TCP_NET_RECV_BUF_SIZE: "4194304"
+      # --- Crash Recovery & Stability ---
+      # Writer append page size: 1MB (default 256KB). Reduces mmap syscalls for large batches.
+      QDB_CAIRO_WRITER_DATA_APPEND_PAGE_SIZE: "1048576"
+      # Parallel WAL apply threads: 4 (match CPU count). Faster WAL→table merge.
+      # WAL workers: 2 (matches c7i.large vCPUs). Mac has more but 2 is sufficient.
+      QDB_WAL_APPLY_WORKER_COUNT: "2"
       QDB_PG_USER: ${DLT_QUESTDB_PG_USER:?Run bootstrap.sh first — QuestDB credentials must come from AWS SSM}
       QDB_PG_PASSWORD: ${DLT_QUESTDB_PG_PASSWORD:?Run bootstrap.sh first — QuestDB credentials must come from AWS SSM}
     logging:
@@ -58,11 +96,13 @@ services:
         max-size: "100m"
         max-file: "5"
     healthcheck:
-      test: ["CMD-SHELL", "bash -c 'cat < /dev/null > /dev/tcp/localhost/9000' || exit 1"]
-      interval: 10s
-      timeout: 5s
+      test: ["CMD-SHELL", "bash -c 'cat < /dev/null > /dev/tcp/localhost/9000 && cat < /dev/null > /dev/tcp/localhost/9009' || exit 1"]
+      interval: 5s
+      timeout: 3s
       retries: 5
       start_period: 15s
+    # Grace period for WAL flush on docker stop — prevents data loss on graceful shutdown.
+    stop_grace_period: 30s
     networks:
       - dlt-network
 
@@ -144,8 +184,8 @@ services:
     container_name: dlt-prometheus
     hostname: dlt-prometheus
     restart: unless-stopped
-    mem_limit: 2g
-    cpus: 1.0
+    mem_limit: 512m
+    cpus: 0.5
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
@@ -212,110 +252,11 @@ services:
       - dlt-network
 
   # ---------------------------------------------------------------------------
-  # Loki — Log Aggregation
-  # Bible #30: grafana/loki:3.6.6
+  # Loki + Alloy + Jaeger — REMOVED for c7i.large (4GB) memory budget.
+  # Saves ~2.5GB RAM. Logs available via: docker logs dlt-application
+  # Tracing available via: Prometheus metrics (dlt_tick_processing_duration_ns)
+  # Re-enable on c7i.xlarge+ by uncommenting these services.
   # ---------------------------------------------------------------------------
-  dlt-loki:
-    image: grafana/loki:3.6.6@sha256:434c7effbd66dbf69c2665fe4b2125549ecf7b45039ac28595d4034031cf47ce
-    container_name: dlt-loki
-    hostname: dlt-loki
-    restart: unless-stopped
-    mem_limit: 1g
-    cpus: 0.5
-    ports:
-      - "3100:3100"
-    volumes:
-      - dlt-loki-data:/loki
-      - ./loki/loki-config.yml:/etc/loki/loki-config.yml:ro
-    command: ["-config.file=/etc/loki/loki-config.yml"]
-    # Loki 3.6.6 uses a distroless image (no wget/curl/shell).
-    # The `loki -health` subcommand (added in 3.6.x via grafana/loki#20590)
-    # hits /ready internally — a real readiness check, not just binary existence.
-    healthcheck:
-      test: ["CMD", "/usr/bin/loki", "-health"]
-      interval: 15s
-      timeout: 5s
-      retries: 10
-      start_period: 30s
-    logging:
-      driver: json-file
-      options:
-        max-size: "100m"
-        max-file: "5"
-    networks:
-      - dlt-network
-
-  # ---------------------------------------------------------------------------
-  # Alloy — Log Collector (replaces Promtail, which is BANNED)
-  # Bible #30: grafana/alloy:v1.8.0
-  # ---------------------------------------------------------------------------
-  dlt-alloy:
-    image: grafana/alloy:v1.8.0@sha256:f54686e56a48f108779997ce87c4d9dc37df0e011802fb138b73c7ac31208108
-    container_name: dlt-alloy
-    hostname: dlt-alloy
-    restart: unless-stopped
-    mem_limit: 512m
-    cpus: 0.5
-    ports:
-      - "12345:12345"  # Alloy UI
-    volumes:
-      - ./alloy/alloy-config.alloy:/etc/alloy/config.alloy:ro
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      # Host app log file: the Rust app writes JSON logs to data/logs/app.log
-      # when running via `cargo run` (dev mode). Alloy watches this file and
-      # pushes to Loki — enables Grafana log dashboards without Docker container.
-      - ../../data/logs:/var/log/dlt-app:ro
-    command: ["run", "--server.http.listen-addr=0.0.0.0:12345", "/etc/alloy/config.alloy"]
-    depends_on:
-      dlt-loki:
-        condition: service_started
-    logging:
-      driver: json-file
-      options:
-        max-size: "100m"
-        max-file: "5"
-    healthcheck:
-      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:12345/-/ready || exit 1"]
-      interval: 15s
-      timeout: 5s
-      retries: 10
-      start_period: 30s
-    networks:
-      - dlt-network
-
-  # ---------------------------------------------------------------------------
-  # Jaeger v2 — Distributed Tracing (v1 is BANNED — EOL Dec 2025)
-  # Bible #29: jaegertracing/jaeger:2.15.0
-  # ---------------------------------------------------------------------------
-  dlt-jaeger:
-    image: jaegertracing/jaeger:2.15.0@sha256:a5221e8464fe7c3d77c9fb368dfc24771bfb02bf136f00b23ba374f1eac9c2bf
-    container_name: dlt-jaeger
-    hostname: dlt-jaeger
-    restart: unless-stopped
-    mem_limit: 2g
-    cpus: 1.0
-    ports:
-      - "16686:16686"  # Jaeger UI
-      - "4317:4317"    # OTLP gRPC
-      - "4318:4318"    # OTLP HTTP
-      - "8888:8888"    # Internal metrics (Prometheus)
-      - "13133:13133"  # Healthcheck (healthcheckv2 extension)
-    volumes:
-      - ./jaeger/jaeger-config.yml:/etc/jaeger/config.yml:ro
-    command: ["--config", "/etc/jaeger/config.yml"]
-    logging:
-      driver: json-file
-      options:
-        max-size: "100m"
-        max-file: "5"
-    healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:13133/health/status || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
-    networks:
-      - dlt-network
 
   # ---------------------------------------------------------------------------
   # Grafana — Dashboards & Visualization
@@ -352,8 +293,6 @@ services:
     depends_on:
       dlt-prometheus:
         condition: service_healthy
-      dlt-loki:
-        condition: service_started
     logging:
       driver: json-file
       options:

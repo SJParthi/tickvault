@@ -182,11 +182,14 @@ fn test_all_dhan_rest_endpoint_constants_defined() {
 /// 1. Market feed (config-based): wss://api-feed.dhan.co
 /// 2. Order update (config-based): wss://api-order-update.dhan.co
 /// 3. 20-level depth (constant): wss://depth-api-feed.dhan.co/twentydepth
-/// 4. 200-level depth (constant): wss://full-depth-api.dhan.co/twohundreddepth
+/// 4. 200-level depth (constant): wss://full-depth-api.dhan.co/
+///    NOTE: Dhan docs say `/twohundreddepth` but SDK uses root path `/`.
+///    Root path is confirmed working in production (2026-04-09). Our code
+///    matches the SDK, which is the ground truth for what works.
 ///
 /// Market feed and order update WS URLs are in DhanConfig (not constants)
 /// because they share the same config pattern as rest_api_base_url. The depth
-/// WS URLs are constants because they have fixed paths (/twentydepth, /twohundreddepth).
+/// WS URLs are constants because they have fixed paths.
 #[test]
 fn test_all_websocket_urls_defined() {
     // --- Depth WebSocket constants (docs/dhan-ref/04-full-market-depth-websocket.md) ---
@@ -194,9 +197,14 @@ fn test_all_websocket_urls_defined() {
         DHAN_TWENTY_DEPTH_WS_BASE_URL, "wss://depth-api-feed.dhan.co/twentydepth",
         "20-level depth WS base URL"
     );
+    // 200-level uses /twohundreddepth path per Dhan support ticket #5519522
+    // (2026-04-10). The root path that the Python SDK uses causes
+    // Protocol(ResetWithoutClosingHandshake) within 3-5 seconds — the
+    // server actively resets the TCP connection. /twohundreddepth is the
+    // only path Dhan supports and is mandatory.
     assert_eq!(
         DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL, "wss://full-depth-api.dhan.co/twohundreddepth",
-        "200-level depth WS base URL — official Dhan API docs path"
+        "200-level depth WS base URL — MUST be /twohundreddepth (Dhan Ticket #5519522)"
     );
 
     // Both must use wss:// (TLS required)
@@ -602,10 +610,16 @@ fn test_depth_websocket_urls_correct_hostnames() {
         DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL.contains("full-depth-api.dhan.co"),
         "200-depth must use full-depth-api.dhan.co"
     );
-    // SDK uses root path (no /twohundreddepth) — verified 2026-04-06
+    // 200-depth MUST use the explicit /twohundreddepth path per Dhan support
+    // ticket #5519522 (2026-04-10). Root path causes immediate TCP reset.
     assert!(
-        DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL.starts_with("wss://full-depth-api.dhan.co/"),
-        "200-depth must start with wss://full-depth-api.dhan.co/"
+        DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL.contains("/twohundreddepth"),
+        "200-depth must have /twohundreddepth path (Dhan Ticket #5519522)"
+    );
+    assert!(
+        DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL
+            .starts_with("wss://full-depth-api.dhan.co/twohundreddepth"),
+        "200-depth full URL prefix check"
     );
 
     // 20-depth and 200-depth use DIFFERENT hosts

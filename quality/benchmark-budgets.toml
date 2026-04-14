@@ -25,6 +25,9 @@ f32_to_f64_clean         = 50           # <50ns  — matches f32_to_f64_clean/* 
 # Trading crate — OMS
 oms_state_transition     = 100          # <100ns — matches oms/state_transition
 
+# Trading crate — OBI (Order Book Imbalance)
+obi_compute              = 1000         # <1μs = 1000ns — matches obi_compute_20_levels, obi_compute_with_wall (measured: ~297ns)
+
 # Common crate
 is_trading_day           = 50           # <50ns  — matches calendar/is_trading_day
 config_toml_load         = 10000000     # <10ms = 10,000,000ns — matches config/toml_load

@@ -41,12 +41,19 @@
    | `8-11` | f32 LE | LTP |
    | `12-15` | u32 LE | LTT (IST epoch seconds — NOT UTC; subtract 19800 for UTC) |
 
-7. **PrevClose packet (code 6) — 16 bytes.** Arrives on EVERY subscription, any mode.
+7. **PrevClose packet (code 6) — 16 bytes.** **IDX_I (indices) ONLY.**
+   **CONFIRMED by Dhan support (2026-04-10, Ticket #5525125):** PrevClose as a
+   standalone packet is emitted only for IDX_I instruments. For NSE_EQ and
+   NSE_FNO subscriptions, the previous-day close is delivered inside the
+   Quote and Full packets via the `close` field (bytes 38-41 for Quote,
+   bytes 50-53 for Full). Do NOT wait for code 6 packets on equities or
+   derivatives — they will never arrive, and a 25,000-instrument REST
+   fallback is NOT the answer. Read `close` from Quote/Full instead.
    | Byte (0-based) | Type | Field |
    |---|---|---|
    | `0-7` | header | 8 bytes |
-   | `8-11` | f32 LE | Previous Close Price |
-   | `12-15` | u32 LE | Previous Day OI |
+   | `8-11` | f32 LE | Previous Close Price (IDX_I only) |
+   | `12-15` | u32 LE | Previous Day OI (IDX_I only) |
 
 8. **Quote packet (code 4) — 50 bytes.**
    | Byte (0-based) | Type | Field |
@@ -59,7 +66,7 @@
    | `26-29` | u32 LE | Total Sell Qty |
    | `30-33` | u32 LE | Total Buy Qty |
    | `34-37` | f32 LE | Day Open |
-   | `38-41` | f32 LE | Day Close (post-market only) |
+   | `38-41` | f32 LE | **Previous Day Close** (per Ticket #5525125 — field is labelled `close` in Dhan docs but represents the PREVIOUS trading session's close, not the current day's close) |
    | `42-45` | f32 LE | Day High |
    | `46-49` | f32 LE | Day Low |
 
@@ -82,10 +89,32 @@
     | `38-41` | u32 LE | Highest OI (NSE_FNO only) |
     | `42-45` | u32 LE | Lowest OI (NSE_FNO only) |
     | `46-49` | f32 LE | Day Open |
-    | `50-53` | f32 LE | Day Close (post-market only) |
+    | `50-53` | f32 LE | **Previous Day Close** (per Ticket #5525125 — field is labelled `close` in Dhan docs but represents the PREVIOUS trading session's close) |
     | `54-57` | f32 LE | Day High |
     | `58-61` | f32 LE | Day Low |
     | `62-161` | depth | 5 levels × 20 bytes each |
+
+### MECHANICAL RULE: Previous-Day Close Routing (per Ticket #5525125)
+
+**IDX_I (indices)** — the ONLY source of previous-day close is the standalone
+PrevClose packet (Response Code 6, 16 bytes). Parse `buf[8..12]` as f32 LE.
+No other packet type carries prev-close for indices. Do NOT ignore code 6
+packets on IDX_I subscriptions.
+
+**NSE_EQ (equities) and NSE_FNO (derivatives)** — there is NO standalone
+PrevClose packet. Parse the `close` field from whichever packet type the
+subscription mode delivers:
+- **Quote mode (code 4)**: bytes `38..42` as f32 LE
+- **Full mode (code 8)**: bytes `50..54` as f32 LE
+- **Ticker mode (code 2)**: NOT AVAILABLE — use Quote or Full instead if you
+  need prev-close for equities/derivatives.
+
+Subscribing to Ticker mode on equities/derivatives and then waiting for code 6
+packets is a bug — those packets will never arrive. The symptom is "prev close
+missing for 24,972 of 25,000 instruments, only 28 IDX_I indices have it".
+
+Test that enforces this routing: `test_prev_close_routing_nse_eq_from_quote`,
+`test_prev_close_routing_nse_fno_from_full`, `test_prev_close_routing_idx_i_from_code6`.
 
 11. **Market Depth in Full packet — 20 bytes per level × 5 levels.**
     Each level (byte offset within level, 0-based):

@@ -4,7 +4,11 @@
 //! these tests will catch the discrepancy before it hits production.
 //! Also covers market hour boundaries and trading calendar invariants.
 
-#[allow(clippy::unwrap_used, clippy::arithmetic_side_effects)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::arithmetic_side_effects,
+    clippy::assertions_on_constants
+)] // APPROVED: S4 — schema-stability drift detection tests intentionally assert on compile-time constants as regression guards against Dhan API changes
 mod config_drift_detection {
     use dhan_live_trader_common::constants::*;
 
@@ -241,7 +245,11 @@ mod config_drift_detection {
     }
 }
 
-#[allow(clippy::unwrap_used, clippy::arithmetic_side_effects)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::arithmetic_side_effects,
+    clippy::assertions_on_constants
+)] // APPROVED: S4 schema-drift guards
 mod market_hours_verification {
     use chrono::{Datelike, NaiveDate, Weekday};
     use dhan_live_trader_common::trading_calendar::TradingCalendar;
@@ -392,7 +400,11 @@ mod market_hours_verification {
     }
 }
 
-#[allow(clippy::unwrap_used, clippy::arithmetic_side_effects)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::arithmetic_side_effects,
+    clippy::assertions_on_constants
+)] // APPROVED: S4 schema-drift guards
 mod exchange_segment_ab_tests {
     use dhan_live_trader_common::types::ExchangeSegment;
 
@@ -449,7 +461,11 @@ mod exchange_segment_ab_tests {
     }
 }
 
-#[allow(clippy::unwrap_used, clippy::arithmetic_side_effects)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::arithmetic_side_effects,
+    clippy::assertions_on_constants
+)] // APPROVED: S4 schema-drift guards
 mod order_types_ab_tests {
     use dhan_live_trader_common::order_types::OrderStatus;
 
@@ -506,7 +522,11 @@ mod order_types_ab_tests {
     }
 }
 
-#[allow(clippy::unwrap_used, clippy::arithmetic_side_effects)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::arithmetic_side_effects,
+    clippy::assertions_on_constants
+)] // APPROVED: S4 schema-drift guards
 mod instrument_types_ab_tests {
     use dhan_live_trader_common::types::InstrumentType;
 
@@ -538,7 +558,11 @@ mod instrument_types_ab_tests {
     }
 }
 
-#[allow(clippy::unwrap_used, clippy::arithmetic_side_effects)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::arithmetic_side_effects,
+    clippy::assertions_on_constants
+)] // APPROVED: S4 schema-drift guards
 mod feed_mode_ab_tests {
     use dhan_live_trader_common::types::FeedMode;
 
@@ -567,7 +591,11 @@ mod feed_mode_ab_tests {
     }
 }
 
-#[allow(clippy::unwrap_used, clippy::arithmetic_side_effects)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::arithmetic_side_effects,
+    clippy::assertions_on_constants
+)] // APPROVED: S4 schema-drift guards
 mod packet_structure_ab_tests {
     use dhan_live_trader_common::constants::*;
 

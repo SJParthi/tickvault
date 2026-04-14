@@ -67,15 +67,12 @@ impl tracing_subscriber::fmt::time::FormatTime for IstTimer {
 
 /// Determines the effective WebSocket connection stagger in milliseconds.
 ///
-/// During market hours, uses the configured value. Outside market hours,
-/// uses a reduced stagger (`OFF_HOURS_CONNECTION_STAGGER_MS`) to avoid
-/// unnecessary boot delay.
-pub fn effective_ws_stagger(configured_stagger_ms: u64, is_market_hours: bool) -> u64 {
-    if is_market_hours {
-        configured_stagger_ms
-    } else {
-        OFF_HOURS_CONNECTION_STAGGER_MS
-    }
+/// Always uses `OFF_HOURS_CONNECTION_STAGGER_MS` (1s) for fast boot.
+/// This ensures crash recovery during market hours gets all 5 connections
+/// up in ~5 seconds instead of ~50 seconds with 10s stagger.
+/// Dhan's WebSocket servers handle 5 concurrent connects without issue.
+pub fn effective_ws_stagger(_configured_stagger_ms: u64, _is_market_hours: bool) -> u64 {
+    OFF_HOURS_CONNECTION_STAGGER_MS
 }
 
 /// Formats a host:port pair into a `SocketAddr` string.
@@ -1549,30 +1546,24 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_effective_ws_stagger_market_hours_uses_configured() {
-        let stagger = effective_ws_stagger(3000, true);
-        assert_eq!(stagger, 3000, "market hours should use configured stagger");
-    }
-
-    #[test]
-    fn test_effective_ws_stagger_off_hours_uses_reduced() {
-        let stagger = effective_ws_stagger(3000, false);
+    fn test_effective_ws_stagger_always_uses_fast_stagger() {
+        // Always uses 1s stagger for fast crash recovery during market hours.
         assert_eq!(
-            stagger, OFF_HOURS_CONNECTION_STAGGER_MS,
-            "off-market hours should use reduced stagger"
+            effective_ws_stagger(3000, true),
+            OFF_HOURS_CONNECTION_STAGGER_MS
         );
-    }
-
-    #[test]
-    fn test_effective_ws_stagger_zero_configured_market_hours() {
-        let stagger = effective_ws_stagger(0, true);
-        assert_eq!(stagger, 0, "zero configured stagger in market hours = 0");
-    }
-
-    #[test]
-    fn test_effective_ws_stagger_zero_configured_off_hours() {
-        let stagger = effective_ws_stagger(0, false);
-        assert_eq!(stagger, OFF_HOURS_CONNECTION_STAGGER_MS);
+        assert_eq!(
+            effective_ws_stagger(3000, false),
+            OFF_HOURS_CONNECTION_STAGGER_MS
+        );
+        assert_eq!(
+            effective_ws_stagger(0, true),
+            OFF_HOURS_CONNECTION_STAGGER_MS
+        );
+        assert_eq!(
+            effective_ws_stagger(0, false),
+            OFF_HOURS_CONNECTION_STAGGER_MS
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1750,15 +1741,16 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_effective_ws_stagger_u64_max_market_hours() {
-        let stagger = effective_ws_stagger(u64::MAX, true);
-        assert_eq!(stagger, u64::MAX);
-    }
-
-    #[test]
-    fn test_effective_ws_stagger_u64_max_off_hours() {
-        let stagger = effective_ws_stagger(u64::MAX, false);
-        assert_eq!(stagger, OFF_HOURS_CONNECTION_STAGGER_MS);
+    fn test_effective_ws_stagger_u64_max_always_fast() {
+        // Even with u64::MAX configured, always uses fast stagger.
+        assert_eq!(
+            effective_ws_stagger(u64::MAX, true),
+            OFF_HOURS_CONNECTION_STAGGER_MS
+        );
+        assert_eq!(
+            effective_ws_stagger(u64::MAX, false),
+            OFF_HOURS_CONNECTION_STAGGER_MS
+        );
     }
 
     // -----------------------------------------------------------------------

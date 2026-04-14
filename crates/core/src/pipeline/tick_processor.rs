@@ -23,9 +23,7 @@ use dhan_live_trader_common::constants::{
 use dhan_live_trader_common::tick_types::{GreeksEnricher, ParsedTick};
 
 use dhan_live_trader_storage::candle_persistence::LiveCandleWriter;
-use dhan_live_trader_storage::tick_persistence::{
-    DepthPersistenceWriter, TickPersistenceWriter, build_previous_close_row,
-};
+use dhan_live_trader_storage::tick_persistence::{DepthPersistenceWriter, TickPersistenceWriter};
 
 use dhan_live_trader_common::tick_types::MarketDepthLevel;
 
@@ -39,6 +37,19 @@ fn depth_prices_are_finite(depth: &[MarketDepthLevel; 5]) -> bool {
         .iter()
         .all(|level| level.bid_price.is_finite() && level.ask_price.is_finite())
 }
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/// File path for index prev_close cache (survives mid-day restarts).
+const INDEX_PREV_CLOSE_CACHE_DIR: &str = "data/instrument-cache";
+const INDEX_PREV_CLOSE_CACHE_PATH: &str = "data/instrument-cache/index-prev-close.json";
+const INDEX_PREV_CLOSE_CACHE_TMP: &str = "data/instrument-cache/index-prev-close.json.tmp";
+
+/// Movers persist window start: 09:15:00 IST = 33300 seconds of day.
+/// Movers snapshots only persisted during market hours [09:15, 15:30).
+const MOVERS_PERSIST_START_SECS_OF_DAY_IST: u32 = 33_300;
 
 // ---------------------------------------------------------------------------
 // O(1) Market Hours Persist Window
@@ -171,7 +182,9 @@ fn persist_stock_movers_snapshot(
         std::sync::Arc<dhan_live_trader_common::instrument_registry::InstrumentRegistry>,
     >,
 ) {
-    if snapshot.gainers.is_empty() && snapshot.losers.is_empty() && snapshot.most_active.is_empty()
+    if snapshot.equity_gainers.is_empty()
+        && snapshot.equity_losers.is_empty()
+        && snapshot.index_gainers.is_empty()
     {
         debug!(
             total_tracked = snapshot.total_tracked,
@@ -217,9 +230,12 @@ fn persist_stock_movers_snapshot(
             }
         };
 
-    persist_entries(writer, &snapshot.gainers, "GAINER");
-    persist_entries(writer, &snapshot.losers, "LOSER");
-    persist_entries(writer, &snapshot.most_active, "MOST_ACTIVE");
+    persist_entries(writer, &snapshot.equity_gainers, "EQUITY_GAINER");
+    persist_entries(writer, &snapshot.equity_losers, "EQUITY_LOSER");
+    persist_entries(writer, &snapshot.equity_most_active, "EQUITY_MOST_ACTIVE");
+    persist_entries(writer, &snapshot.index_gainers, "INDEX_GAINER");
+    persist_entries(writer, &snapshot.index_losers, "INDEX_LOSER");
+    persist_entries(writer, &snapshot.index_most_active, "INDEX_MOST_ACTIVE");
 
     // Best-effort flush
     let _ = writer.flush();
@@ -277,7 +293,9 @@ fn persist_option_movers_snapshot(
                 // (Not available from registry — registry is static metadata.
                 //  Spot price requires live tick data. Use 0.0 for now;
                 //  the dashboard API enriches from QuestDB at query time.)
-                let spot_price = 0.0;
+                // Spot price not available from static registry — enriched at query time.
+                const SPOT_PRICE_NOT_AVAILABLE: f64 = 0.0;
+                let spot_price = SPOT_PRICE_NOT_AVAILABLE;
 
                 let _ = writer.append_option_mover(
                     ts_nanos,
@@ -298,21 +316,41 @@ fn persist_option_movers_snapshot(
                     f32_clean(entry.change_pct),
                     i64::from(entry.oi),
                     entry.oi_change,
-                    // DATA-INTEGRITY-EXEMPT: oi_change_pct is a derived calculation, not raw Dhan price
-                    f64::from(entry.oi_change_pct),
+                    f32_clean(entry.oi_change_pct),
                     i64::from(entry.volume),
                     entry.value,
                 );
             }
         };
 
-    persist_category(writer, &snapshot.highest_oi, "HIGHEST_OI");
-    persist_category(writer, &snapshot.oi_gainers, "OI_GAINER");
-    persist_category(writer, &snapshot.oi_losers, "OI_LOSER");
-    persist_category(writer, &snapshot.top_volume, "TOP_VOLUME");
-    persist_category(writer, &snapshot.top_value, "TOP_VALUE");
-    persist_category(writer, &snapshot.price_gainers, "PRICE_GAINER");
-    persist_category(writer, &snapshot.price_losers, "PRICE_LOSER");
+    // Split each category into OPTION_* and FUTURE_* with independent rankings.
+    // Registry lookup: option_type Some(CE/PE) = option, None = future.
+    // O(1) EXEMPT: cold path — runs every 60s, max 7 categories × 20 entries each.
+    let split_persist =
+        |writer: &mut dhan_live_trader_storage::movers_persistence::OptionMoversWriter,
+         entries: &[super::option_movers::OptionMoverEntry],
+         base_cat: &str| {
+            let (opts, futs): (Vec<_>, Vec<_>) = entries.iter().cloned().partition(|e| {
+                registry
+                    .as_ref()
+                    .and_then(|r| r.get(e.security_id))
+                    .and_then(|inst| inst.option_type)
+                    .is_some()
+            });
+            // O(1) EXEMPT: format! on cold path (7 calls per snapshot)
+            let opt_cat = format!("OPTION_{base_cat}");
+            let fut_cat = format!("FUTURE_{base_cat}");
+            persist_category(writer, &opts, &opt_cat);
+            persist_category(writer, &futs, &fut_cat);
+        };
+
+    split_persist(writer, &snapshot.highest_oi, "HIGHEST_OI");
+    split_persist(writer, &snapshot.oi_gainers, "OI_GAINER");
+    split_persist(writer, &snapshot.oi_losers, "OI_LOSER");
+    split_persist(writer, &snapshot.top_volume, "TOP_VOLUME");
+    split_persist(writer, &snapshot.top_value, "TOP_VALUE");
+    split_persist(writer, &snapshot.price_gainers, "PRICE_GAINER");
+    split_persist(writer, &snapshot.price_losers, "PRICE_LOSER");
 
     let _ = writer.flush();
 }
@@ -472,6 +510,61 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
     let mut movers_persist_count: u64 = 0;
     let m_movers_persisted = counter!("dlt_movers_snapshots_persisted_total");
 
+    // Index prev_close file cache — survives mid-day restarts.
+    // On boot, read cached values and pre-populate movers.
+    // O(1) EXEMPT: begin — boot-time file read + HashMap for ~28 indices
+    let mut index_prev_close_cache: std::collections::HashMap<u32, f32> = {
+        let path = INDEX_PREV_CLOSE_CACHE_PATH;
+        match std::fs::read_to_string(path) {
+            Ok(json) => {
+                match serde_json::from_str::<std::collections::HashMap<u32, f32>>(&json) {
+                    Ok(cached) => {
+                        // Pre-populate movers with cached index prev_close
+                        for (&sid, &pc) in &cached {
+                            if let Some(ref mut movers) = top_movers {
+                                movers.update_prev_close(sid, 0, pc); // 0 = IDX_I
+                            }
+                        }
+                        info!(
+                            cached_indices = cached.len(),
+                            "index prev_close loaded from file cache (mid-day restart recovery)"
+                        );
+                        cached
+                    }
+                    Err(err) => {
+                        warn!(
+                            ?err,
+                            "failed to parse index prev_close cache — starting fresh"
+                        );
+                        std::collections::HashMap::with_capacity(50)
+                    }
+                }
+            }
+            Err(_) => {
+                debug!("no index prev_close cache found — first boot of the day");
+                std::collections::HashMap::with_capacity(50)
+            }
+        }
+    };
+    // O(1) EXEMPT: end
+
+    // PrevClose diagnostic counters — per-segment tracking + summary log.
+    // Helps confirm exactly how many PrevClose packets Dhan sends per segment.
+    let mut prev_close_idx_i: u64 = 0;
+    let mut prev_close_nse_eq: u64 = 0;
+    let mut prev_close_nse_fno: u64 = 0;
+    let mut prev_close_other: u64 = 0;
+    let mut prev_close_summary_logged = false;
+
+    // PROOF: track unique instruments that received day_close baseline.
+    // Logged periodically so you can see "day_close baselines: 24,872 instruments"
+    // growing in real-time. If this stays 0, day_close is not working.
+    // O(1) EXEMPT: begin — HashSet for baseline tracking (boot + first 60s only)
+    let mut day_close_baseline_count: u64 = 0;
+    let mut day_close_baseline_logged = false;
+    let mut day_close_first_log_time = None::<Instant>;
+    // O(1) EXEMPT: end
+
     // O(1) dedup ring buffer — pre-allocated once, zero allocation in hot loop.
     let mut dedup_ring = TickDedupRing::new(DEDUP_RING_BUFFER_POWER);
 
@@ -521,6 +614,30 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                 ticks_processed = ticks_processed.saturating_add(1);
                 m_ticks.increment(1);
 
+                // Log PrevClose summary once, on the first real tick.
+                // By this point the PrevClose burst from subscription is complete.
+                if !prev_close_summary_logged {
+                    prev_close_summary_logged = true;
+                    let total = prev_close_idx_i
+                        .saturating_add(prev_close_nse_eq)
+                        .saturating_add(prev_close_nse_fno)
+                        .saturating_add(prev_close_other);
+                    info!(
+                        total,
+                        idx_i = prev_close_idx_i,
+                        nse_eq = prev_close_nse_eq,
+                        nse_fno = prev_close_nse_fno,
+                        other = prev_close_other,
+                        "PrevClose burst complete — per-segment summary"
+                    );
+                    if prev_close_nse_eq == 0 && prev_close_nse_fno == 0 {
+                        info!(
+                            "PrevClose: Dhan sent 0 packets for NSE_EQ/NSE_FNO (expected). \
+                             Equity/F&O movers use day_close from Full ticks as baseline."
+                        );
+                    }
+                }
+
                 // Filter junk ticks: NaN/Infinity, zero/negative LTP,
                 // or epoch timestamps (heartbeat/init frames from Dhan).
                 if !is_valid_tick(tick.last_traded_price, tick.exchange_timestamp) {
@@ -536,6 +653,32 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                         );
                     }
                     continue;
+                }
+
+                // O(1) movers baseline: BEFORE time guards — day_close is reference data.
+                // Must be set regardless of market hours (same principle as PrevClose handler).
+                // Dhan confirmed (Ticket #5525125): day_close = previous session's close.
+                if tick.day_close > 0.0 && tick.day_close.is_finite() {
+                    day_close_baseline_count = day_close_baseline_count.saturating_add(1);
+                    if day_close_first_log_time.is_none() {
+                        day_close_first_log_time = Some(Instant::now());
+                    }
+                    if let Some(ref mut movers) = top_movers {
+                        movers.update_prev_close(
+                            tick.security_id,
+                            tick.exchange_segment_code,
+                            tick.day_close,
+                        );
+                    }
+                    if let Some(ref mut opt_movers) = option_movers {
+                        opt_movers.update_prev_close(
+                            tick.security_id,
+                            tick.exchange_segment_code,
+                            tick.day_close,
+                        );
+                    }
+                    // No separate previous_close table — day_close is already in every
+                    // tick persisted to the ticks table. Movers use in-memory baselines.
                 }
 
                 // Ingestion gate: drop ALL ticks outside [9:00 AM, 3:30 PM) IST.
@@ -629,6 +772,29 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                 // exchange timestamp is valid (Full packets, code 8).
                 let ltp_valid = is_valid_ltp(tick.last_traded_price);
                 let tick_is_valid = is_valid_tick(tick.last_traded_price, tick.exchange_timestamp);
+
+                // O(1) movers baseline from day_close — BEFORE time guards (reference data).
+                // Full packets (code 8) are the primary source of day_close for F&O instruments.
+                if tick.day_close > 0.0 && tick.day_close.is_finite() {
+                    day_close_baseline_count = day_close_baseline_count.saturating_add(1);
+                    if day_close_first_log_time.is_none() {
+                        day_close_first_log_time = Some(Instant::now());
+                    }
+                    if let Some(ref mut movers) = top_movers {
+                        movers.update_prev_close(
+                            tick.security_id,
+                            tick.exchange_segment_code,
+                            tick.day_close,
+                        );
+                    }
+                    if let Some(ref mut opt_movers) = option_movers {
+                        opt_movers.update_prev_close(
+                            tick.security_id,
+                            tick.exchange_segment_code,
+                            tick.day_close,
+                        );
+                    }
+                }
 
                 if tick_is_valid {
                     // Ingestion gate: drop Full packet ticks outside [9:00 AM, 3:30 PM) IST.
@@ -742,6 +908,7 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     && let Err(err) = dw.append_depth(
                         tick.security_id,
                         tick.exchange_segment_code,
+                        tick.exchange_timestamp,
                         tick.received_at_nanos,
                         &depth,
                     )
@@ -762,6 +929,8 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                 if ltp_valid && let Some(ref sender) = tick_broadcast {
                     let _ = sender.send(tick);
                 }
+
+                // (day_close baseline already set ABOVE time guards at line ~711)
 
                 // O(1) candle aggregation (only for ticks with valid exchange timestamps).
                 if tick_is_valid && let Some(ref mut agg) = candle_aggregator {
@@ -803,6 +972,22 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
             } => {
                 m_prev_close_updates.increment(1);
 
+                // Guard: skip non-finite previous_close (NaN/Infinity from corrupted frame).
+                // MUST be before movers updates — NaN propagation corrupts change% baselines.
+                if !previous_close.is_finite() {
+                    junk_ticks_filtered = junk_ticks_filtered.saturating_add(1);
+                    m_junk_filtered.increment(1);
+                    continue;
+                }
+
+                // Diagnostic: count PrevClose packets per segment.
+                match exchange_segment_code {
+                    0 => prev_close_idx_i = prev_close_idx_i.saturating_add(1),
+                    1 => prev_close_nse_eq = prev_close_nse_eq.saturating_add(1),
+                    2 => prev_close_nse_fno = prev_close_nse_fno.saturating_add(1),
+                    _ => prev_close_other = prev_close_other.saturating_add(1),
+                }
+
                 // Update option movers with previous day OI (always, regardless of market hours).
                 // PrevClose packets set the baseline for OI change calculations.
                 if let Some(ref mut opt_movers) = option_movers {
@@ -821,44 +1006,32 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     movers.update_prev_close(security_id, exchange_segment_code, previous_close);
                 }
 
-                // Guard: skip non-finite previous_close (NaN/Infinity from corrupted frame)
-                if !previous_close.is_finite() {
-                    junk_ticks_filtered = junk_ticks_filtered.saturating_add(1);
-                    m_junk_filtered.increment(1);
-                    continue;
-                }
-
-                // PrevClose is reference data — persist ALWAYS regardless of market hours.
-                // These packets arrive on every subscription (typically at boot, before 09:00).
-                // Blocking them with is_within_persist_window() causes "No data" in Grafana.
-                // Stale-day check still applies to prevent cross-day pollution.
-                if !is_today_ist(
-                    utc_nanos_to_ist_epoch_secs(received_at_nanos),
-                    today_ist_day_number,
-                ) {
-                    stale_day_filtered = stale_day_filtered.saturating_add(1);
-                    m_stale_day.increment(1);
-                    continue;
-                }
-
-                // Persist previous close to QuestDB
-                if let Some(ref mut writer) = tick_writer
-                    && let Err(err) = build_previous_close_row(
-                        writer.buffer_mut(),
-                        security_id,
-                        exchange_segment_code,
-                        previous_close,
-                        previous_oi,
-                        received_at_nanos,
-                    )
-                {
-                    storage_errors = storage_errors.saturating_add(1);
-                    m_storage_errors.increment(1);
-                    if storage_errors <= 100 {
-                        warn!(
-                            ?err,
-                            security_id, "failed to write previous close to QuestDB"
-                        );
+                // Cache index prev_close to file for mid-day restart survival.
+                // Indices have day_close=0 in Full ticks, so PrevClose (code 6) is their
+                // ONLY source. File cache survives restarts — read back at boot.
+                // O(1) EXEMPT: cold path — runs once per index at subscription time (~28 calls).
+                if exchange_segment_code == 0 {
+                    // IDX_I segment
+                    index_prev_close_cache.insert(security_id, previous_close);
+                    // Atomic file write: serialize → write to .tmp → rename.
+                    // Prevents partial/corrupt cache on crash or disk full.
+                    let cache_dir = INDEX_PREV_CLOSE_CACHE_DIR;
+                    let cache_path = INDEX_PREV_CLOSE_CACHE_PATH;
+                    let tmp_path = INDEX_PREV_CLOSE_CACHE_TMP;
+                    if let Ok(json) = serde_json::to_string(&index_prev_close_cache) {
+                        let _ = std::fs::create_dir_all(cache_dir);
+                        match std::fs::write(tmp_path, &json)
+                            .and_then(|()| std::fs::rename(tmp_path, cache_path))
+                        {
+                            Ok(()) => {}
+                            Err(err) => {
+                                warn!(
+                                    ?err,
+                                    security_id,
+                                    "failed to write index prev_close cache — mid-day restart may lose index baselines"
+                                );
+                            }
+                        }
                     }
                 }
 
@@ -899,7 +1072,25 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
         }
 
         m_tick_duration.record(tick_start.elapsed().as_nanos() as f64);
-        m_wire_to_done.record(tick_start.elapsed().as_nanos() as f64);
+        // Wire-to-done: from WebSocket receive (received_at_nanos) to pipeline completion.
+        // Different from tick_duration which only measures processing time (tick_start).
+        let wire_elapsed_ns = chrono::Utc::now()
+            .timestamp_nanos_opt()
+            .unwrap_or(0)
+            .saturating_sub(received_at_nanos);
+        m_wire_to_done.record(wire_elapsed_ns.max(0) as f64);
+
+        // PROOF: log day_close baseline coverage after 30 seconds.
+        // Placed AFTER all match arms so it fires for both Tick AND TickWithDepth.
+        if !day_close_baseline_logged
+            && day_close_first_log_time.is_some_and(|t| t.elapsed().as_secs() >= 30)
+        {
+            day_close_baseline_logged = true;
+            info!(
+                day_close_updates = day_close_baseline_count,
+                "PROOF: day_close baselines set from Full packet ticks (should be >> 0 for all instruments)"
+            );
+        }
 
         // Periodic flush check (every ~100ms worth of frames)
         if last_flush_check.elapsed().as_millis() > 100 {
@@ -995,8 +1186,8 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
             // since movers are a computed aggregate, not a raw tick.
             if last_movers_persist.elapsed().as_secs() >= 60 {
                 let persist_ist_secs = utc_nanos_to_ist_secs_of_day(received_at_nanos);
-                // 09:15:00 IST = 33300 secs of day, 15:30:00 IST = 55800 secs of day
-                let in_movers_window = (33_300..TICK_PERSIST_END_SECS_OF_DAY_IST)
+                let in_movers_window = (MOVERS_PERSIST_START_SECS_OF_DAY_IST
+                    ..TICK_PERSIST_END_SECS_OF_DAY_IST)
                     .contains(&persist_ist_secs)
                     && is_today_ist(
                         utc_nanos_to_ist_epoch_secs(received_at_nanos),

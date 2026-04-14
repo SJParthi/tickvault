@@ -3,274 +3,1309 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Options Chain — dhan-live-trader</title>
+    <title>Advanced Options Chain - Dhan</title>
     <style>
-        :root {
-            --bg: #0d1117; --bg-card: #161b22; --border: #30363d;
-            --text: #e6edf3; --text-dim: #8b949e; --text-muted: #484f58;
-            --green: #26a69a; --red: #ef5350; --blue: #2962ff;
-            --yellow: #ffab00; --purple: #7c4dff;
-            --ce-bg: rgba(38,166,154,0.06); --pe-bg: rgba(239,83,80,0.06);
-            --atm-bg: rgba(41,98,255,0.15);
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
         }
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { background: var(--bg); color: var(--text); font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace; font-size: 12px; }
 
-        .header { display: flex; align-items: center; justify-content: space-between; padding: 12px 20px; border-bottom: 1px solid var(--border); background: var(--bg-card); }
-        .header h1 { font-size: 16px; font-weight: 600; }
-        .header h1 span { color: var(--blue); }
-        .header .back { color: var(--text-dim); text-decoration: none; font-size: 13px; }
-        .header .back:hover { color: var(--text); }
+        body {
+            font-family: Inter, -apple-system, BlinkMacSystemFont, sans-serif;
+            background: #000000;
+            color: #8E8E8E;
+            font-size: 14px;
+            overflow: hidden;
+        }
 
-        .controls { display: flex; gap: 12px; align-items: center; padding: 10px 20px; border-bottom: 1px solid var(--border); background: var(--bg-card); flex-wrap: wrap; }
-        .controls label { color: var(--text-dim); font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
-        .controls select, .controls input { background: var(--bg); color: var(--text); border: 1px solid var(--border); padding: 6px 10px; border-radius: 4px; font-family: inherit; font-size: 12px; }
-        .controls select:focus, .controls input:focus { outline: none; border-color: var(--blue); }
+        .container {
+            width: 100%;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            background: #000000;
+        }
 
-        .summary { display: flex; gap: 24px; padding: 10px 20px; border-bottom: 1px solid var(--border); background: var(--bg-card); }
-        .summary .item { display: flex; flex-direction: column; }
-        .summary .item .label { font-size: 10px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; }
-        .summary .item .value { font-size: 14px; font-weight: 600; }
-        .summary .item .value.green { color: var(--green); }
-        .summary .item .value.red { color: var(--red); }
-        .summary .item .value.blue { color: var(--blue); }
+        /* Header Bar */
+        .header {
+            background: #000000;
+            padding: 12px 16px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            border-bottom: 1px solid #242424;
+            flex-shrink: 0;
+            height: 50px;
+        }
 
-        .chain-table { width: 100%; border-collapse: collapse; }
-        .chain-table th { position: sticky; top: 0; background: var(--bg-card); padding: 6px 8px; text-align: right; font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-muted); border-bottom: 2px solid var(--border); white-space: nowrap; z-index: 10; }
-        .chain-table th.strike { text-align: center; background: var(--bg); }
-        .chain-table th.ce { color: var(--green); }
-        .chain-table th.pe { color: var(--red); }
+        .header-left {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            flex: 1;
+        }
 
-        .chain-table td { padding: 4px 8px; text-align: right; border-bottom: 1px solid var(--border); white-space: nowrap; }
-        .chain-table td.strike { text-align: center; font-weight: 700; font-size: 13px; background: var(--bg); border-left: 2px solid var(--border); border-right: 2px solid var(--border); }
-        .chain-table tr.ce-row td:not(.strike) { background: var(--ce-bg); }
-        .chain-table tr.pe-row td:not(.strike) { background: var(--pe-bg); }
-        .chain-table tr.atm td.strike { background: var(--atm-bg); color: var(--blue); }
-        .chain-table tr:hover td { filter: brightness(1.2); }
+        .logo {
+            width: 30px;
+            height: 30px;
+            background: linear-gradient(135deg, #1e90ff, #4169e1);
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-weight: bold;
+            font-size: 14px;
+            flex-shrink: 0;
+        }
 
-        .positive { color: var(--green); }
-        .negative { color: var(--red); }
-        .dim { color: var(--text-muted); }
+        .header-symbol {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+        }
 
-        .status-bar { display: flex; justify-content: space-between; padding: 6px 20px; border-top: 1px solid var(--border); background: var(--bg-card); font-size: 11px; color: var(--text-muted); position: fixed; bottom: 0; left: 0; right: 0; }
-        .status-bar .live { color: var(--green); }
-        .status-bar .error { color: var(--red); }
+        .header-name {
+            font-size: 14px;
+            font-weight: 600;
+            color: #DADADA;
+        }
 
-        .loading { text-align: center; padding: 40px; color: var(--text-dim); }
-        .table-wrapper { overflow-y: auto; max-height: calc(100vh - 180px); }
+        .header-price {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
 
-        .expiry-tabs { display: flex; gap: 2px; padding: 0 20px; }
-        .expiry-tab { padding: 6px 14px; cursor: pointer; color: var(--text-dim); border-bottom: 2px solid transparent; font-size: 12px; transition: all 0.15s; }
-        .expiry-tab:hover { color: var(--text); }
-        .expiry-tab.active { color: var(--blue); border-bottom-color: var(--blue); }
-    </style>
+        .header-price-value {
+            font-size: 16px;
+            font-weight: 600;
+            color: #DADADA;
+        }
+
+        .header-change {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            font-size: 14px;
+            font-weight: 500;
+            color: #05B878;
+        }
+
+        .header-change .arrow {
+            font-size: 12px;
+        }
+
+        .header-middle {
+            display: flex;
+            gap: 24px;
+            padding: 0 24px;
+            font-size: 12px;
+            color: #8E8E8E;
+        }
+
+        .header-middle-item {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+        }
+
+        .header-middle-item-label {
+            font-size: 10px;
+            color: #666;
+            text-transform: uppercase;
+        }
+
+        .header-middle-item-value {
+            font-size: 13px;
+            color: #DADADA;
+        }
+
+        .header-right {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .toggle-buttons {
+            display: flex;
+            gap: 8px;
+            background: #1a1a1a;
+            padding: 4px;
+            border-radius: 4px;
+        }
+
+        .toggle-btn {
+            padding: 6px 12px;
+            border: none;
+            background: transparent;
+            color: #8E8E8E;
+            font-size: 13px;
+            cursor: pointer;
+            border-radius: 3px;
+            transition: all 0.2s;
+        }
+
+        .toggle-btn.active {
+            background: #1e90ff;
+            color: white;
+        }
+
+        /* Title Row */
+        .title-row {
+            padding: 16px 16px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            border-bottom: 1px solid #242424;
+            flex-shrink: 0;
+            background: #000000;
+        }
+
+        .title-left {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+        }
+
+        .title-text {
+            font-size: 18px;
+            font-weight: 600;
+            color: #DADADA;
+        }
+
+        .expiry-tabs {
+            display: flex;
+            gap: 8px;
+        }
+
+        .expiry-tab {
+            padding: 0px 8px;
+            border: 0.5px solid #242424;
+            background: #242424;
+            color: #AAAAAA;
+            font-size: 14px;
+            cursor: pointer;
+            border-radius: 4px;
+            transition: all 0.2s;
+        }
+
+        .expiry-tab.active {
+            background: #242424;
+            color: #05B878;
+            border: 0.5px solid #05B878;
+        }
+
+        .next-expiry-btn {
+            padding: 6px 12px;
+            border: 1px solid #242424;
+            background: #121212;
+            color: #8E8E8E;
+            font-size: 12px;
+            cursor: pointer;
+            border-radius: 4px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            transition: all 0.2s;
+        }
+
+        .next-expiry-btn:hover {
+            border-color: #1e90ff;
+            color: #1e90ff;
+        }
+
+        .title-right {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .icon-btn {
+            width: 32px;
+            height: 32px;
+            border: none;
+            background: #1a1a1a;
+            color: #8E8E8E;
+            border-radius: 4px;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 16px;
+            transition: all 0.2s;
+        }
+
+        .icon-btn:hover {
+            background: #242424;
+            color: #DADADA;
+        }
+
+        /* Stats Row */
+        .stats-row {
+            padding: 12px 16px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            border-bottom: 1px solid #242424;
+            flex-shrink: 0;
+            background: #121212;
+        }
+
+        .stats-left {
+            display: flex;
+            gap: 32px;
+        }
+
+        .stat-item {
+            display: flex;
+            flex-direction: column;
+            gap: 2px;
+        }
+
+        .stat-label {
+            font-size: 12px;
+            color: #8E8E8E;
+        }
+
+        .stat-value {
+            font-size: 14px;
+            font-weight: 500;
+            color: #DADADA;
+        }
+
+        .stats-right {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .show-label {
+            font-size: 12px;
+            color: #8E8E8E;
+        }
+
+        .checkbox-container {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .checkbox-container input {
+            cursor: pointer;
+        }
+
+        .checkbox-container label {
+            font-size: 12px;
+            color: #8E8E8E;
+            cursor: pointer;
+        }
+
+        /* Dropdown */
+        .dropdown-menu {
+            display: none;
+            position: absolute;
+            background: #1a1a1a;
+            border: 1px solid #242424;
+            border-radius: 4px;
+            padding: 8px 0;
+            z-index: 1000;
+            top: 100%;
+            margin-top: 4px;
+            min-width: 120px;
+        }
+
+        .dropdown-menu.active {
+            display: block;
+        }
+
+        .dropdown-menu-item {
+            padding: 8px 16px;
+            cursor: pointer;
+            font-size: 13px;
+            color: #8E8E8E;
+            transition: all 0.2s;
+        }
+
+        .dropdown-menu-item:hover {
+            background: #242424;
+            color: #DADADA;
+        }
+
+        /* Table Container */
+        .table-wrapper {
+            flex: 1;
+            overflow: auto;
+            background: #000000;
+            position: relative;
+        }
+
+        .table-container {
+            min-height: 100%;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .no-data-message {
+            flex: 1;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #666;
+            font-size: 14px;
+            text-align: center;
+            padding: 40px;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: separate;
+            border-spacing: 0;
+            table-layout: auto;
+            background: transparent;
+        }
+
+        thead {
+            position: sticky;
+            top: 0;
+            background: #181818;
+            z-index: 10;
+        }
+
+        th {
+            font-weight: 700;
+            font-size: 14px;
+            color: #8E8E8E;
+            background: #181818;
+            height: 40px;
+            border-bottom: 1px solid #242424;
+            text-align: center;
+        }
+
+        th.header-ce {
+            background: #181818;
+            color: #8E8E8E;
+        }
+
+        th.header-pe {
+            background: #181818;
+            color: #8E8E8E;
+        }
+
+        th.header-strike {
+            background: #000000;
+            color: #8E8E8E;
+            font-weight: 700;
+        }
+
+        td {
+            padding: 1px 9px 1px 10px;
+            text-align: right;
+            border-bottom: 0.5px solid #242424;
+            font-size: 14px;
+            font-weight: 400;
+            color: #8E8E8E;
+            height: 56px;
+        }
+
+        tr.atm-row td {
+            border-top: 2px solid #518EF8;
+            border-bottom: 2px solid #518EF8;
+            background: #121212;
+        }
+
+        tr.itm-ce td.ce-cell {
+            background: rgba(238, 162, 14, 0.17);
+            color: #DADADA;
+        }
+
+        tr.itm-pe td.pe-cell {
+            background: rgba(141, 125, 240, 0.10);
+            color: #DADADA;
+        }
+
+        td.strike-cell {
+            font-weight: 600;
+            position: sticky;
+            left: 0;
+            background: inherit;
+            z-index: 5;
+            border-right: 1px solid #242424;
+            text-align: center;
+        }
+
+        tr.atm-row td.strike-cell {
+            background: #121212;
+        }
+
+        .ltp {
+            font-weight: 500;
+        }
+
+        .ltp.atm {
+            background: #05B878;
+            color: white;
+            border-radius: 4px;
+        }
+
+        .change {
+            color: #05B878;
+        }
+
+        .change.negative {
+            color: #DD6565;
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-size: 10px;
+            font-weight: 500;
+            background: #E8590C;
+            color: white;
+            margin-left: 4px;
+        }
+
+        .badge.blue {
+            background: #518EF8;
+        }
+
+        .spot-price-badge {
+            display: inline-block;
+            background: #05B878;
+            color: white;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-weight: 500;
+            font-size: 12px;
+        }
+
+        .buildup-tag {
+            display: inline-block;
+            padding: 4px 8px;
+            border-radius: 3px;
+            font-size: 11px;
+            font-weight: 500;
+        }
+
+        .buildup-long {
+            background: rgba(5, 184, 120, 0.15);
+            color: #05B878;
+        }
+
+        .buildup-short {
+            background: rgba(221, 101, 101, 0.15);
+            color: #DD6565;
+        }
+
+        .buildup-covering {
+            background: rgba(232, 89, 12, 0.15);
+            color: #E8590C;
+        }
+
+        .buildup-unwinding {
+            background: rgba(80, 80, 80, 0.15);
+            color: #888;
+        }
+
+        .checkbox-header {
+            width: 24px;
+            height: 24px;
+            padding: 0;
+        }
+
+        .checkbox-header input {
+            width: 16px;
+            height: 16px;
+            cursor: pointer;
+        }
+
+        .pcr-value {
+            color: #888;
+        }
+
+        .hidden {
+            display: none !important;
+        }
+
+        tbody tr {
+            transition: background 0.1s;
+        }
+
+        tbody tr:hover {
+            background: #1a1a1a;
+        }
+
+        /* Bottom Bar */
+        .bottom-bar {
+            padding: 12px 16px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            border-top: 1px solid #242424;
+            background: #121212;
+            flex-shrink: 0;
+        }
+
+        .bottom-left {
+            display: flex;
+            gap: 12px;
+        }
+
+        .bottom-btn {
+            padding: 8px 14px;
+            border: 1px solid #242424;
+            background: transparent;
+            color: #8E8E8E;
+            font-size: 12px;
+            cursor: pointer;
+            border-radius: 4px;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            transition: all 0.2s;
+        }
+
+        .bottom-btn:hover {
+            border-color: #1e90ff;
+            color: #1e90ff;
+        }
+
+        .bottom-right {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 12px;
+            color: #8E8E8E;
+        }
+
+        .connection-indicator {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #05B878;
+        }
+
+        .connection-indicator.disconnected {
+            background: #DD6565;
+        }
+
+        .delta, .gamma, .theta, .vega, .iv {
+            font-family: Inter, -apple-system, BlinkMacSystemFont, sans-serif;
+            font-size: 14px;
+            font-weight: 400;
+        }
+
+        .dim {
+            color: #555;
+        }
+
+        .next-expiry-container {
+            position: relative;
+        }
+
+        /* Sortable columns */
+        th.sortable {
+            cursor: pointer;
+            user-select: none;
+            position: relative;
+        }
+
+        th.sortable:hover {
+            color: #DADADA;
+        }
+
+        th.sortable::after {
+            content: '⇅';
+            font-size: 10px;
+            margin-left: 4px;
+            opacity: 0.4;
+        }
+
+        th.sortable.sort-asc::after {
+            content: '↑';
+            opacity: 1;
+        }
+
+        th.sortable.sort-desc::after {
+            content: '↓';
+            opacity: 1;
+        }
+
+        /* Dropdown select styling */
+        .dropdown-select {
+            background-color: #1a1a1a;
+            border: 1px solid #333;
+            color: #8E8E8E;
+            padding: 6px 28px 6px 10px;
+            border-radius: 4px;
+            font-size: 12px;
+            -webkit-appearance: none;
+            -moz-appearance: none;
+            appearance: none;
+            background-image: url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%238E8E8E' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3e%3cpolyline points='6 9 12 15 18 9'%3e%3c/polyline%3e%3c/svg%3e");
+            background-repeat: no-repeat;
+            background-position: right 8px center;
+            background-size: 14px;
+            cursor: pointer;
+        }
+
+        .dropdown-select option {
+            background-color: #1a1a1a;
+            color: #8E8E8E;
+        }
+
+        /* Scrollbar styling */
+        ::-webkit-scrollbar {
+            width: 6px;
+            height: 6px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: #121212;
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: #333;
+            border-radius: 3px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: #444;
+        }
+
+        /* OI bar visualization */
+        .oi-bar-container {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .oi-bar {
+            height: 4px;
+            border-radius: 2px;
+            min-width: 2px;
+        }
+
+        .oi-bar.ce {
+            background: #05B878;
+        }
+
+        .oi-bar.pe {
+            background: #DD6565;
+        }
+        </style>
 </head>
 <body>
-    <div class="header">
-        <h1><span>DLT</span> Options Chain</h1>
-        <a href="/portal" class="back">Back to Control Panel</a>
-    </div>
-
-    <div class="controls">
-        <div>
-            <label>Underlying</label>
-            <select id="underlying">
-                <option value="NIFTY">NIFTY 50</option>
-                <option value="BANKNIFTY">BANK NIFTY</option>
-                <option value="FINNIFTY">FIN NIFTY</option>
-                <option value="MIDCPNIFTY">MIDCAP NIFTY</option>
-            </select>
+    <div class="container">
+        <!-- Header -->
+        <div class="header">
+            <div class="header-left">
+                <div class="logo">D</div>
+                <div class="header-symbol">
+                    <div class="header-name">NIFTY 50</div>
+                    <div class="header-price">
+                        <span class="header-price-value" id="spotPrice">24,003.60</span>
+                        <span class="header-change">
+                            <span id="headerChange">+228.50</span>
+                            <span id="headerChangePct">(0.96%)</span>
+                            <span class="arrow">↑</span>
+                        </span>
+                    </div>
+                </div>
+            </div>
+            <div class="header-middle">
+                <div class="header-middle-item">
+                    <div class="header-middle-item-label">Open</div>
+                    <div class="header-middle-item-value">23,880.55</div>
+                </div>
+                <div class="header-middle-item">
+                    <div class="header-middle-item-label">High</div>
+                    <div class="header-middle-item-value">24,036.20</div>
+                </div>
+                <div class="header-middle-item">
+                    <div class="header-middle-item-label">Low</div>
+                    <div class="header-middle-item-value">23,856.35</div>
+                </div>
+                <div class="header-middle-item">
+                    <div class="header-middle-item-label">Close</div>
+                    <div class="header-middle-item-value">23,775.10</div>
+                </div>
+            </div>
+            <div class="header-right">
+                <div class="toggle-buttons">
+                    <button class="toggle-btn active" id="niftyBtn">NIFTY 50</button>
+                    <button class="toggle-btn" id="sensexBtn">SENSEX</button>
+                </div>
+            </div>
         </div>
-        <div>
-            <label>Refresh</label>
-            <select id="refresh-interval">
-                <option value="5000">5s</option>
-                <option value="10000" selected>10s</option>
-                <option value="30000">30s</option>
-                <option value="0">Off</option>
-            </select>
+
+        <!-- Title Row -->
+        <div class="title-row">
+            <div class="title-left">
+                <div class="title-text">NIFTY 50 Options Chain</div>
+                <div class="expiry-tabs" id="expiryTabs"></div>
+                <div class="next-expiry-container">
+                    <button class="next-expiry-btn" id="nextExpiryBtn">Next Expiry ▲</button>
+                    <div class="dropdown-menu" id="expiryDropdown"></div>
+                </div>
+            </div>
+            <div class="title-right">
+                <button class="icon-btn">🔍</button>
+                <button class="icon-btn">⚙️</button>
+            </div>
+        </div>
+
+        <!-- Stats Row -->
+        <div class="stats-row">
+            <div class="stats-left">
+                <div class="stat-item">
+                    <div class="stat-label">ATM IV</div>
+                    <div class="stat-value" id="atmIv">16.24</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-label">Days for Expiry</div>
+                    <div class="stat-value" id="daysToExpiry">4</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-label">Market Lot</div>
+                    <div class="stat-value" id="marketLot">65</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-label">PCR</div>
+                    <div class="stat-value" id="pcrValue">1.11</div>
+                </div>
+            </div>
+            <div class="stats-right">
+                <span class="show-label">Show</span>
+                <div class="checkbox-container">
+                    <input type="checkbox" id="perLotCheckbox" />
+                    <label for="perLotCheckbox">Per Lot</label>
+                </div>
+                <div class="checkbox-container">
+                    <input type="checkbox" id="buildupCheckbox" checked />
+                    <label for="buildupCheckbox">Buildup</label>
+                </div>
+            </div>
+        </div>
+
+        <!-- Table -->
+        <div class="table-wrapper">
+            <div class="table-container" id="tableContainer">
+                <table id="optionsTable">
+                    <thead>
+                        <tr id="headerRow"></tr>
+                    </thead>
+                    <tbody id="tableBody"></tbody>
+                </table>
+                <div class="no-data-message" id="noDataMessage" style="display: none;">
+                    No option chain data found. Start the data collector to populate.
+                </div>
+            </div>
+        </div>
+
+        <!-- Bottom Bar -->
+        <div class="bottom-bar">
+            <div class="bottom-left">
+                <button class="bottom-btn">🔖 Add to Watchlist <span>[0]</span></button>
+                <button class="bottom-btn">🧺 Add to Basket <span>[0]</span></button>
+            </div>
+            <div class="bottom-right">
+                <div class="connection-indicator" id="connectionIndicator"></div>
+                <span>Your Strategy</span>
+            </div>
         </div>
     </div>
 
-    <div class="expiry-tabs" id="expiry-tabs"></div>
+    <script>
+        const API_URL = 'http://localhost:3001/api';
+        const REFRESH_INTERVAL = 5000;
+        const LOT_SIZE = 65;
 
-    <div class="summary" id="summary">
-        <div class="item"><span class="label">Spot</span><span class="value blue" id="spot-price">--</span></div>
-        <div class="item"><span class="label">ATM Strike</span><span class="value" id="atm-strike">--</span></div>
-        <div class="item"><span class="label">ATM IV (CE)</span><span class="value" id="atm-iv-ce">--</span></div>
-        <div class="item"><span class="label">ATM IV (PE)</span><span class="value" id="atm-iv-pe">--</span></div>
-        <div class="item"><span class="label">PCR</span><span class="value" id="pcr-value">--</span></div>
-        <div class="item"><span class="label">Total CE OI</span><span class="value green" id="total-ce-oi">--</span></div>
-        <div class="item"><span class="label">Total PE OI</span><span class="value red" id="total-pe-oi">--</span></div>
-        <div class="item"><span class="label">Contracts</span><span class="value" id="contract-count">--</span></div>
-    </div>
+        let currentUnderlying = 'NIFTY';
+        let currentExpiry = '2026-04-13';
+        let allExpiresData = {
+            current: [],
+            future: []
+        };
+        let optionChainData = null;
+        let spotPrice = 24003.60;
+        let buildupEnabled = true;
+        let perLotEnabled = false;
+        let sortColumn = null;
+        let sortDirection = 'desc';
 
-    <div class="table-wrapper">
-        <table class="chain-table">
-            <thead>
-                <tr>
-                    <th class="ce">OI</th>
-                    <th class="ce">Volume</th>
-                    <th class="ce">IV</th>
-                    <th class="ce">Delta</th>
-                    <th class="ce">Theta</th>
-                    <th class="ce">Gamma</th>
-                    <th class="ce">Vega</th>
-                    <th class="ce">Chg%</th>
-                    <th class="ce">LTP</th>
-                    <th class="strike">STRIKE</th>
-                    <th class="pe">LTP</th>
-                    <th class="pe">Chg%</th>
-                    <th class="pe">Vega</th>
-                    <th class="pe">Gamma</th>
-                    <th class="pe">Theta</th>
-                    <th class="pe">Delta</th>
-                    <th class="pe">IV</th>
-                    <th class="pe">Volume</th>
-                    <th class="pe">OI</th>
-                </tr>
-            </thead>
-            <tbody id="chain-body">
-                <tr><td colspan="19" class="loading">Loading option chain data...</td></tr>
-            </tbody>
-        </table>
-    </div>
+        // Initialize
+        document.addEventListener('DOMContentLoaded', () => {
+            setupEventListeners();
+            loadOptionChain();
+            setInterval(loadOptionChain, REFRESH_INTERVAL);
+            updateConnectionStatus();
+        });
 
-    <div class="status-bar">
-        <span id="status-text">Connecting...</span>
-        <span id="last-update">--</span>
-    </div>
-
-<script>
-let refreshTimer = null;
-let currentExpiry = null;
-
-function fmt(v, d=2) { return v != null && isFinite(v) ? v.toFixed(d) : '--'; }
-function fmtOI(v) { return v != null ? (v >= 100000 ? (v/100000).toFixed(2)+'L' : v.toLocaleString('en-IN')) : '--'; }
-function fmtPct(v) { return v != null && isFinite(v) ? (v >= 0 ? '+' : '') + v.toFixed(2) + '%' : '--'; }
-function cls(v) { return v > 0 ? 'positive' : v < 0 ? 'negative' : 'dim'; }
-
-async function fetchChain() {
-    const underlying = document.getElementById('underlying').value;
-    const expiryParam = currentExpiry ? `&expiry=${currentExpiry}` : '';
-    const statusEl = document.getElementById('status-text');
-
-    try {
-        const resp = await fetch(`/api/option-chain?underlying=${underlying}${expiryParam}`);
-        if (!resp.ok) {
-            const err = await resp.json().catch(() => ({}));
-            statusEl.innerHTML = `<span class="error">Error: ${err.error || resp.statusText}</span>`;
-            return;
+        function setupEventListeners() {
+            document.getElementById('nextExpiryBtn').addEventListener('click', toggleExpiryDropdown);
+            document.getElementById('buildupCheckbox').addEventListener('change', (e) => {
+                buildupEnabled = e.target.checked;
+                renderTable();
+            });
+            document.getElementById('perLotCheckbox').addEventListener('change', (e) => {
+                perLotEnabled = e.target.checked;
+                renderTable();
+            });
+            document.addEventListener('click', (e) => {
+                if (!e.target.closest('.next-expiry-container')) {
+                    document.getElementById('expiryDropdown').classList.remove('active');
+                }
+            });
         }
-        const data = await resp.json();
-        renderExpiries(data.available_expiries, data.expiry);
-        renderSummary(data);
-        renderChain(data);
-        statusEl.innerHTML = `<span class="live">LIVE</span> ${underlying} | ${data.contracts.length} contracts`;
-        document.getElementById('last-update').textContent = new Date().toLocaleTimeString('en-IN', {timeZone:'Asia/Kolkata'}) + ' IST';
-    } catch(e) {
-        statusEl.innerHTML = `<span class="error">Fetch failed: ${e.message}</span>`;
-    }
-}
 
-function renderExpiries(expiries, active) {
-    const tabs = document.getElementById('expiry-tabs');
-    tabs.innerHTML = '';
-    (expiries || []).forEach(exp => {
-        const tab = document.createElement('div');
-        tab.className = 'expiry-tab' + (exp === active ? ' active' : '');
-        const d = new Date(exp + 'T00:00:00+05:30');
-        tab.textContent = d.toLocaleDateString('en-IN', {day:'numeric', month:'short'});
-        tab.onclick = () => { currentExpiry = exp; fetchChain(); };
-        tabs.appendChild(tab);
-    });
-}
+        function toggleExpiryDropdown() {
+            document.getElementById('expiryDropdown').classList.toggle('active');
+        }
 
-function renderSummary(data) {
-    document.getElementById('spot-price').textContent = fmt(data.spot_price, 2);
+        async function loadOptionChain() {
+            try {
+                const response = await fetch(`${API_URL}/option-chain?underlying=${currentUnderlying}&expiry=${currentExpiry}`);
+                const result = await response.json();
 
-    const strikes = [...new Set(data.contracts.map(c => c.strike_price))].sort((a,b) => a-b);
-    const atmStrike = strikes.reduce((best, s) => Math.abs(s - data.spot_price) < Math.abs(best - data.spot_price) ? s : best, strikes[0] || 0);
-    document.getElementById('atm-strike').textContent = fmt(atmStrike, 0);
+                if (result.error) {
+                    showNoData();
+                    updateConnectionStatus(false);
+                    return;
+                }
 
-    const atmCE = data.contracts.find(c => c.strike_price === atmStrike && c.option_type === 'CE');
-    const atmPE = data.contracts.find(c => c.strike_price === atmStrike && c.option_type === 'PE');
-    document.getElementById('atm-iv-ce').textContent = atmCE ? fmt(atmCE.iv * 100, 1) + '%' : '--';
-    document.getElementById('atm-iv-pe').textContent = atmPE ? fmt(atmPE.iv * 100, 1) + '%' : '--';
+                optionChainData = result.data;
+                spotPrice = result.data.spot_price;
+                populateExpiryTabs(result.data.available_expiries);
+                renderTable();
+                loadPCR();
+                updateConnectionStatus(true);
+            } catch (error) {
+                console.error('Failed to load option chain:', error);
+                updateConnectionStatus(false);
+            }
+        }
 
-    let totalCeOI = 0, totalPeOI = 0;
-    data.contracts.forEach(c => { if(c.option_type==='CE') totalCeOI += c.oi; else totalPeOI += c.oi; });
-    document.getElementById('total-ce-oi').textContent = fmtOI(totalCeOI);
-    document.getElementById('total-pe-oi').textContent = fmtOI(totalPeOI);
-    const pcr = totalCeOI > 0 ? (totalPeOI / totalCeOI) : 0;
-    const pcrEl = document.getElementById('pcr-value');
-    pcrEl.textContent = fmt(pcr, 2);
-    pcrEl.className = 'value ' + (pcr > 1.2 ? 'red' : pcr < 0.8 ? 'green' : 'blue');
-    document.getElementById('contract-count').textContent = data.contracts.length;
-}
+        function populateExpiryTabs(expiries) {
+            if (!expiries || expiries.length === 0) return;
 
-function renderChain(data) {
-    const strikes = [...new Set(data.contracts.map(c => c.strike_price))].sort((a,b) => a-b);
-    const atmStrike = strikes.reduce((best, s) => Math.abs(s - data.spot_price) < Math.abs(best - data.spot_price) ? s : best, strikes[0] || 0);
+            const tabsContainer = document.getElementById('expiryTabs');
+            const dropdownContainer = document.getElementById('expiryDropdown');
 
-    const ceMap = {}, peMap = {};
-    data.contracts.forEach(c => { if(c.option_type==='CE') ceMap[c.strike_price]=c; else peMap[c.strike_price]=c; });
+            // First 3 as tabs
+            const tabExpiries = expiries.slice(0, 3);
+            const futureExpiries = expiries.slice(3);
 
-    const tbody = document.getElementById('chain-body');
-    let html = '';
-    strikes.forEach(strike => {
-        const ce = ceMap[strike] || {};
-        const pe = peMap[strike] || {};
-        const isATM = strike === atmStrike;
-        const itm_ce = strike < data.spot_price;
-        const itm_pe = strike > data.spot_price;
+            tabsContainer.innerHTML = tabExpiries.map(exp => {
+                const isActive = exp === currentExpiry;
+                const date = new Date(exp);
+                const day = date.getDate();
+                const month = date.toLocaleDateString('en-US', { month: 'short' });
+                const label = `${day} ${month}`;
 
-        html += `<tr class="${isATM ? 'atm' : ''}">`;
-        // CE side (left)
-        html += `<td class="${itm_ce ? 'dim' : ''}">${fmtOI(ce.oi)}</td>`;
-        html += `<td class="${itm_ce ? 'dim' : ''}">${fmtOI(ce.volume)}</td>`;
-        html += `<td>${ce.iv ? fmt(ce.iv*100,1)+'%' : '--'}</td>`;
-        html += `<td>${fmt(ce.delta, 3)}</td>`;
-        html += `<td class="negative">${fmt(ce.theta, 2)}</td>`;
-        html += `<td>${fmt(ce.gamma, 4)}</td>`;
-        html += `<td>${fmt(ce.vega, 2)}</td>`;
-        html += `<td class="${cls(ce.change_pct)}">${fmtPct(ce.change_pct)}</td>`;
-        html += `<td style="font-weight:600">${fmt(ce.ltp, 2)}</td>`;
-        // Strike
-        html += `<td class="strike">${fmt(strike, 0)}</td>`;
-        // PE side (right)
-        html += `<td style="font-weight:600">${fmt(pe.ltp, 2)}</td>`;
-        html += `<td class="${cls(pe.change_pct)}">${fmtPct(pe.change_pct)}</td>`;
-        html += `<td>${fmt(pe.vega, 2)}</td>`;
-        html += `<td>${fmt(pe.gamma, 4)}</td>`;
-        html += `<td class="negative">${fmt(pe.theta, 2)}</td>`;
-        html += `<td>${fmt(pe.delta, 3)}</td>`;
-        html += `<td>${pe.iv ? fmt(pe.iv*100,1)+'%' : '--'}</td>`;
-        html += `<td class="${itm_pe ? 'dim' : ''}">${fmtOI(pe.volume)}</td>`;
-        html += `<td class="${itm_pe ? 'dim' : ''}">${fmtOI(pe.oi)}</td>`;
-        html += `</tr>`;
-    });
-    tbody.innerHTML = html || '<tr><td colspan="19" class="loading">No data available</td></tr>';
+                return `<button class="expiry-tab ${isActive ? 'active' : ''}" data-expiry="${exp}">${label}</button>`;
+            }).join('');
 
-    // Scroll to ATM
-    if(strikes.length > 0) {
-        const atmIdx = strikes.indexOf(atmStrike);
-        const rows = tbody.querySelectorAll('tr');
-        if(rows[atmIdx]) rows[atmIdx].scrollIntoView({block:'center', behavior:'smooth'});
-    }
-}
+            dropdownContainer.innerHTML = futureExpiries.map(exp => {
+                const date = new Date(exp);
+                const day = date.getDate();
+                const month = date.toLocaleDateString('en-US', { month: 'short' });
+                const year = date.getFullYear();
+                const label = `${day} ${month} ${year}`;
 
-function startRefresh() {
-    if(refreshTimer) clearInterval(refreshTimer);
-    const interval = parseInt(document.getElementById('refresh-interval').value);
-    if(interval > 0) refreshTimer = setInterval(fetchChain, interval);
-}
+                return `<div class="dropdown-menu-item" data-expiry="${exp}">${label}</div>`;
+            }).join('');
 
-document.getElementById('underlying').addEventListener('change', () => { currentExpiry = null; fetchChain(); });
-document.getElementById('refresh-interval').addEventListener('change', startRefresh);
+            // Attach listeners
+            document.querySelectorAll('.expiry-tab').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    currentExpiry = btn.dataset.expiry;
+                    loadOptionChain();
+                });
+            });
 
-fetchChain();
-startRefresh();
-</script>
+            document.querySelectorAll('.dropdown-menu-item').forEach(item => {
+                item.addEventListener('click', () => {
+                    currentExpiry = item.dataset.expiry;
+                    document.getElementById('expiryDropdown').classList.remove('active');
+                    loadOptionChain();
+                });
+            });
+        }
+
+        async function loadPCR() {
+            try {
+                const response = await fetch(`${API_URL}/pcr?underlying=${currentUnderlying}`);
+                const result = await response.json();
+
+                if (!result.error && result.pcr) {
+                    document.getElementById('pcrValue').textContent = result.pcr.toFixed(2);
+                }
+            } catch (error) {
+                console.error('Failed to load PCR:', error);
+            }
+        }
+
+        function getATMStrike(spot, contracts) {
+            if (!contracts || contracts.length === 0) return null;
+
+            const strikes = [...new Set(contracts.map(c => c.strike_price))].sort((a, b) => a - b);
+            let closestStrike = strikes[0];
+            let minDiff = Math.abs(spot - closestStrike);
+
+            for (const strike of strikes) {
+                const diff = Math.abs(spot - strike);
+                if (diff < minDiff) {
+                    minDiff = diff;
+                    closestStrike = strike;
+                }
+            }
+            return closestStrike;
+        }
+
+        function calculateBuildupTag(contract, spotPrice) {
+            // Determine if ITM or OTM
+            const isITM_CE = contract.strike_price < spotPrice;
+            const isITM_PE = contract.strike_price > spotPrice;
+
+            // OI change and price change
+            const oiIncreased = contract.oi_change > 0 || contract.oi_change === undefined;
+            const priceIncreased = contract.change > 0;
+
+            if (oiIncreased && priceIncreased) {
+                return { tag: 'Long Buildup', class: 'buildup-long' };
+            } else if (oiIncreased && !priceIncreased) {
+                return { tag: 'Short Buildup', class: 'buildup-short' };
+            } else if (!oiIncreased && priceIncreased) {
+                return { tag: 'Short Covering', class: 'buildup-covering' };
+            } else {
+                return { tag: 'Long Unwinding', class: 'buildup-unwinding' };
+            }
+        }
+
+        function formatNumber(num) {
+            if (num >= 100000) {
+                return (num / 100000).toFixed(2) + ' L';
+            }
+            return num.toString();
+        }
+
+        function formatIndianNumber(num) {
+            return num.toLocaleString('en-IN');
+        }
+
+        function renderTable() {
+            if (!optionChainData) {
+                showNoData();
+                return;
+            }
+
+            const contracts = optionChainData.contracts;
+            const atmStrike = getATMStrike(spotPrice, contracts);
+
+            // Group by strike
+            const strikeGroups = {};
+            contracts.forEach(contract => {
+                if (!strikeGroups[contract.strike_price]) {
+                    strikeGroups[contract.strike_price] = { CE: null, PE: null };
+                }
+                strikeGroups[contract.strike_price][contract.option_type] = contract;
+            });
+
+            // Build header
+            const headerRow = document.getElementById('headerRow');
+            const sortClass = (col) => {
+                if (sortColumn === col) return `sortable ${sortDirection === 'asc' ? 'sort-asc' : 'sort-desc'}`;
+                return 'sortable';
+            };
+            headerRow.innerHTML = `
+                <th class="checkbox-header"><input type="checkbox" /></th>
+                <th ${buildupEnabled ? '' : 'class="hidden"'}>Buildup</th>
+                <th class="${sortClass('ce_vega')}" data-sort="ce_vega">Vega</th>
+                <th class="${sortClass('ce_theta')}" data-sort="ce_theta">Theta</th>
+                <th class="${sortClass('ce_gamma')}" data-sort="ce_gamma">Gamma</th>
+                <th class="${sortClass('ce_delta')}" data-sort="ce_delta">Delta</th>
+                <th class="${sortClass('ce_iv')}" data-sort="ce_iv">IV</th>
+                <th class="${sortClass('ce_volume')}" data-sort="ce_volume">Volume</th>
+                <th class="${sortClass('ce_oi')}" data-sort="ce_oi">OI</th>
+                <th class="${sortClass('ce_change')}" data-sort="ce_change">LTP Chg %</th>
+                <th class="${sortClass('ce_ltp')}" data-sort="ce_ltp">LTP</th>
+                <th class="header-ce">CE</th>
+                <th class="header-strike ${sortClass('strike')}" data-sort="strike">Strike</th>
+                <th>PCR</th>
+                <th class="header-pe">PE</th>
+                <th class="${sortClass('pe_ltp')}" data-sort="pe_ltp">LTP</th>
+                <th class="${sortClass('pe_change')}" data-sort="pe_change">LTP Chg %</th>
+                <th class="${sortClass('pe_oi')}" data-sort="pe_oi">OI</th>
+                <th class="${sortClass('pe_volume')}" data-sort="pe_volume">Volume</th>
+                <th class="${sortClass('pe_iv')}" data-sort="pe_iv">IV</th>
+                <th class="${sortClass('pe_delta')}" data-sort="pe_delta">Delta</th>
+                <th class="${sortClass('pe_gamma')}" data-sort="pe_gamma">Gamma</th>
+                <th class="${sortClass('pe_theta')}" data-sort="pe_theta">Theta</th>
+                <th class="${sortClass('pe_vega')}" data-sort="pe_vega">Vega</th>
+                <th ${buildupEnabled ? '' : 'class="hidden"'}>Buildup</th>
+                <th class="checkbox-header"><input type="checkbox" /></th>
+            `;
+
+            // Add sort listeners
+            headerRow.querySelectorAll('th.sortable').forEach(th => {
+                th.addEventListener('click', () => {
+                    const col = th.dataset.sort;
+                    if (sortColumn === col) {
+                        sortDirection = sortDirection === 'asc' ? 'desc' : 'asc';
+                    } else {
+                        sortColumn = col;
+                        sortDirection = 'desc';
+                    }
+                    renderTable();
+                });
+            });
+
+            const tbody = document.getElementById('tableBody');
+            tbody.innerHTML = '';
+
+            let strikes = Object.keys(strikeGroups).map(Number).sort((a, b) => a - b);
+
+            // Apply sorting if a sort column is selected
+            if (sortColumn) {
+                strikes.sort((a, b) => {
+                    const pairA = strikeGroups[a];
+                    const pairB = strikeGroups[b];
+                    let valA = 0, valB = 0;
+
+                    const getVal = (pair, col) => {
+                        const parts = col.split('_');
+                        const side = parts[0]; // ce or pe or strike
+                        const field = parts.slice(1).join('_');
+
+                        if (col === 'strike') return pair ? a : b; // handled separately
+                        const contract = side === 'ce' ? pair.CE : pair.PE;
+                        if (!contract) return -Infinity;
+
+                        switch(field) {
+                            case 'ltp': return contract.ltp || 0;
+                            case 'change': return contract.change_pct || 0;
+                            case 'oi': return contract.oi || 0;
+                            case 'volume': return contract.volume || 0;
+                            case 'iv': return contract.iv || 0;
+                            case 'delta': return contract.delta || 0;
+                            case 'gamma': return contract.gamma || 0;
+                            case 'theta': return contract.theta || 0;
+                            case 'vega': return contract.vega || 0;
+                            default: return 0;
+                        }
+                    };
+
+                    if (sortColumn === 'strike') {
+                        valA = a; valB = b;
+                    } else {
+                        valA = getVal(pairA, sortColumn);
+                        valB = getVal(pairB, sortColumn);
+                    }
+
+                    return sortDirection === 'asc' ? valA - valB : valB - valA;
+                });
+            }
+
+            // Find OI ranks for current expiry
+            const ceOIs = contracts.filter(c => c.option_type === 'CE').map(c => c.oi).sort((a, b) => b - a);
+            const peOIs = contracts.filter(c => c.option_type === 'PE').map(c => c.oi).sort((a, b) => b - a);
+
+            strikes.forEach((strike, index) => {
+                const pair = strikeGroups[strike];
+                const ceContract = pair.CE;
+                const peContract = pair.PE;
+
+                const isATM = strike === atmStrike;
+                const rowClass = isATM ? 'atm-row' : '';
+                const isITM_CE = ceContract && strike < spotPrice;
+                const isITM_PE = peContract && strike > spotPrice;
+
+                const itmClasses = [];
+                if (rowClass) itmClasses.push(rowClass);
+                if (isITM_CE) itmClasses.push('itm-ce');
+                if (isITM_PE) itmClasses.push('itm-pe');
+                let row = `<tr class="${itmClasses.join(' ')}">`;
+
+                // CE Side
+                row += `<td class="checkbox-header"><input type="checkbox" /></td>`;
+
+                // Buildup CE
+                if (buildupEnabled && ceContract) {
+                    const buildup = calculateBuildupTag(ceContract, spotPrice);
+                    row += `<td class="${isITM_CE ? 'ce-cell' : ''}"><span class="buildup-tag ${buildup.class}">${buildup.tag}</span></td>`;
+                } else {
+                    row += `<td class="hidden"></td>`;
+                }
+
+                // Vega CE
+                row += `<td class="${isITM_CE ? 'ce-cell' : ''}"><span class="vega">${ceContract ? ceContract.vega.toFixed(3) : '--'}</span></td>`;
+
+                // Theta CE
+                row += `<td class="${isITM_CE ? 'ce-cell' : ''}"><span class="theta">${ceContract ? ceContract.theta.toFixed(2) : '--'}</span></td>`;
+
+                // Gamma CE
+                row += `<td class="${isITM_CE ? 'ce-cell' : ''}"><span class="gamma">${ceContract ? ceContract.gamma.toFixed(5) : '--'}</span></td>`;
+
+                // Delta CE
+                row += `<td class="${isITM_CE ? 'ce-cell' : ''}"><span class="delta">${ceContract ? ceContract.delta.toFixed(3) : '--'}</span></td>`;
+
+                // IV CE
+                row += `<td class="${isITM_CE ? 'ce-cell' : ''}"><span class="iv">${ceContract ? ceContract.iv.toFixed(2) : '--'}</span></td>`;
+
+                // Volume CE
+                let volumeCE = '--';
+                if (ceContract) {
+                    const vol = perLotEnabled ? ceContract.volume * LOT_SIZE : ceContract.volume;
+                    volumeCE = formatNumber(vol);
+                }
+                row += `<td class="${isITM_CE ? 'ce-cell' : ''}">${volumeCE}</td>`;
+
+                // OI CE with ranking badge
+                let oiCE = '--';
+                let badgeCE = '';
+                if (ceContract) {
+                    const oiValue = perLotEnabled ? ceContract.oi * LOT_SIZE : ceContract.oi;
+                    oiCE = formatIndianNumber(oiValue);
+                    const oiRank = ceOIs.indexOf(ceContract.oi) + 1;
+                    if (oiRank <= 5) {
+                        const badgeClass = oiRank <= 3 ? '' : 'blue';
+                        badgeCE = `<span class="badge ${badgeClass}">OI ${oiRank}</span>`;
+                    }
+                }
+                row += `<td class="${isITM_CE ? 'ce-cell' : ''}">${oiCE}${badgeCE}</td>`;
+
+                // LTP Chg % CE
+                let changeCE = '--';
+                if (ceContract) {
+                    const changeClass = ceContract.change_pct >= 0 ? 'change' : 'change negative';
+                    changeCE = `<span class="${changeClass}">${ceContract.change.toFixed(2)} (${ceContract.change_pct.toFixed(2)}%)</span>`;
+                }
+                row += `<td class="${isITM_CE ? 'ce-cell' : ''}">${changeCE}</td>`;
+
+                // LTP CE
+                const ltpCEClass = isATM ? 'ltp atm' : 'ltp';
+                const ltpCEValue = ceContract ? ceContract.ltp.toFixed(2) : '--';
+                row += `<td class="${isITM_CE ? 'ce-cell' : ''}"><span class="${ltpCEClass}">${ltpCEValue}</span></td>`;
+
+                // CE label column (empty in data rows)
+                row += `<td></td>`;
+
+                // Strike Price
+                row += `<td class="strike-cell">${isATM ? `<span class="spot-price-badge">${spotPrice.toLocaleString('en-IN', {minimumFractionDigits: 2, maximumFractionDigits: 2})}</span> ` : ''}${(strike).toLocaleString('en-IN', {minimumFractionDigits: 2, maximumFractionDigits: 2})}</td>`;
+
+                // PCR column
+                let pcrCell = '--';
+                if (ceContract && peContract && ceContract.oi > 0) {
+                    pcrCell = (peContract.oi / ceContract.oi).toFixed(2);
+                }
+                row += `<td><span class="pcr-value">${pcrCell}</span></td>`;
+
+                // LTP PE
+                const ltpPEClass = isATM ? 'ltp atm' : 'ltp';
+                const ltpPEValue = peContract ? peContract.ltp.toFixed(2) : '--';
+                row += `<td class="${isITM_PE ? 'pe-cell' : ''}"><span class="${ltpPEClass}">${ltpPEValue}</span></td>`;
+
+                // LTP Chg % PE
+                let changePE = '--';
+                if (peContract) {
+                    const changeClass = peContract.change_pct >= 0 ? 'change' : 'change negative';
+                    changePE = `<span class="${changeClass}">${peContract.change.toFixed(2)} (${peContract.change_pct.toFixed(2)}%)</span>`;
+                }
+                row += `<td class="${isITM_PE ? 'pe-cell' : ''}">${changePE}</td>`;
+
+                // OI PE with ranking
+                let oiPE = '--';
+                let badgePE = '';
+                if (peContract) {
+                    const oiValue = perLotEnabled ? peContract.oi * LOT_SIZE : peContract.oi;
+                    oiPE = formatIndianNumber(oiValue);
+                    const oiRank = peOIs.indexOf(peContract.oi) + 1;
+                    if (oiRank <= 5) {
+                        const badgeClass = oiRank <= 3 ? '' : 'blue';
+                        badgePE = `<span class="badge ${badgeClass}">OI ${oiRank}</span>`;
+                    }
+                }
+                row += `<td class="${isITM_PE ? 'pe-cell' : ''}">${oiPE}${badgePE}</td>`;
+
+                // Volume PE
+                let volumePE = '--';
+                if (peContract) {
+                    const vol = perLotEnabled ? peContract.volume * LOT_SIZE : peContract.volume;
+                    volumePE = formatNumber(vol);
+                }
+                row += `<td class="${isITM_PE ? 'pe-cell' : ''}">${volumePE}</td>`;
+
+                // IV PE
+                row += `<td class="${isITM_PE ? 'pe-cell' : ''}"><span class="iv">${peContract ? peContract.iv.toFixed(2) : '--'}</span></td>`;
+
+                // Delta PE
+                row += `<td class="${isITM_PE ? 'pe-cell' : ''}"><span class="delta">${peContract ? peContract.delta.toFixed(3) : '--'}</span></td>`;
+
+                // Gamma PE
+                row += `<td class="${isITM_PE ? 'pe-cell' : ''}"><span class="gamma">${peContract ? peContract.gamma.toFixed(5) : '--'}</span></td>`;
+
+                // Theta PE
+                row += `<td class="${isITM_PE ? 'pe-cell' : ''}"><span class="theta">${peContract ? peContract.theta.toFixed(2) : '--'}</span></td>`;
+
+                // Vega PE
+                row += `<td class="${isITM_PE ? 'pe-cell' : ''}"><span class="vega">${peContract ? peContract.vega.toFixed(3) : '--'}</span></td>`;
+
+                // Buildup PE
+                if (buildupEnabled && peContract) {
+                    const buildup = calculateBuildupTag(peContract, spotPrice);
+                    row += `<td class="${isITM_PE ? 'pe-cell' : ''}"><span class="buildup-tag ${buildup.class}">${buildup.tag}</span></td>`;
+                } else {
+                    row += `<td class="hidden"></td>`;
+                }
+
+                // PE Checkbox
+                row += `<td class="checkbox-header"><input type="checkbox" /></td>`;
+
+                row += `</tr>`;
+                tbody.innerHTML += row;
+            });
+
+            // Update spot price display
+            document.getElementById('spotPrice').textContent = spotPrice.toLocaleString('en-IN', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+
+            // Update ATM IV
+            const atmPair = atmStrike ? strikeGroups[atmStrike] : null;
+            const atmContract = atmPair ? (atmPair.CE || atmPair.PE) : null;
+            if (atmContract) {
+                document.getElementById('atmIv').textContent = atmContract.iv.toFixed(2);
+            }
+
+            // Calculate days to expiry
+            const expiryDate = new Date(currentExpiry);
+            const today = new Date();
+            const daysToExp = Math.ceil((expiryDate - today) / (1000 * 60 * 60 * 24));
+            document.getElementById('daysToExpiry').textContent = daysToExp;
+
+            document.getElementById('optionsTable').style.display = 'table';
+            document.getElementById('noDataMessage').style.display = 'none';
+        }
+
+        function showNoData() {
+            document.getElementById('optionsTable').style.display = 'none';
+            document.getElementById('noDataMessage').style.display = 'flex';
+            document.getElementById('atmIv').textContent = '--';
+            document.getElementById('daysToExpiry').textContent = '--';
+            document.getElementById('marketLot').textContent = '--';
+            document.getElementById('pcrValue').textContent = '--';
+        }
+
+        function updateConnectionStatus(connected = true) {
+            const indicator = document.getElementById('connectionIndicator');
+            if (connected) {
+                indicator.classList.remove('disconnected');
+            } else {
+                indicator.classList.add('disconnected');
+            }
+        }
+    </script>
 </body>
 </html>

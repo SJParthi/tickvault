@@ -47,13 +47,12 @@ pub async fn get_indices(State(state): State<SharedAppState>) -> impl IntoRespon
     let client = state.questdb_http_client();
 
     // Query latest tick for each index instrument (segment = IDX_I, exchange_segment_code = 0)
-    let query = "SELECT t.security_id, t.ltp, t.open, t.high, t.low, t.close, t.volume, \
-                 COALESCE(p.prev_close, 0) as prev_close \
-                 FROM ticks t \
-                 LEFT JOIN previous_close p ON t.security_id = p.security_id AND p.segment = 'IDX_I' \
-                 WHERE t.segment = 'IDX_I' \
-                 LATEST ON t.ts PARTITION BY t.security_id \
-                 ORDER BY t.security_id";
+    let query = "SELECT security_id, ltp, open, high, low, close, volume, \
+                 close as prev_close \
+                 FROM ticks \
+                 WHERE segment = 'IDX_I' \
+                 LATEST ON ts PARTITION BY security_id \
+                 ORDER BY security_id";
 
     let exec_url = format!("{base_url}/exec");
     let resp = match client

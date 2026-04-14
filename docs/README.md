@@ -53,7 +53,7 @@ These 21 files are the **verified source of truth** for every Dhan API endpoint.
 | Document | Purpose |
 |----------|---------|
 | [Codebase Map](architecture/codebase-map.md) | Full file tree, public APIs, byte layouts, boot sequence |
-| [Tech Stack Bible](architecture/tech-stack-bible.md) | All 109 components and technology decisions |
+| Workspace `Cargo.toml` | Single source of truth for all dependency versions (S6-Step8 — Bible deleted) |
 | [Instrument Design](architecture/instrument-technical-design.md) | 5-pass universe build, CSV parsing, registry |
 | [Instrument Dependency Map](architecture/instrument-dhan-dependency-map.md) | How instruments map to Dhan API |
 | [Instrument Guarantee](architecture/instrument-guarantee.md) | Data integrity guarantees |

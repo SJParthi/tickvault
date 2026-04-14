@@ -335,10 +335,7 @@ async fn persist_inner(universe: &FnoUniverse, questdb_config: &QuestDbConfig) -
     // Enable DEDUP UPSERT KEYS before writing — safety net (startup already did this).
     ensure_table_dedup_keys(questdb_config).await;
 
-    let conf_string = format!(
-        "tcp::addr={}:{};",
-        questdb_config.host, questdb_config.ilp_port
-    );
+    let conf_string = questdb_config.build_ilp_conf_string();
     let mut sender =
         Sender::from_conf(&conf_string).context("failed to connect to QuestDB via ILP")?;
     let mut buffer = sender.new_buffer();

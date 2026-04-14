@@ -38,5 +38,9 @@ proptest = { workspace = true }
 name = "oms"
 harness = false
 
+[[bench]]
+name = "obi"
+harness = false
+
 [package.metadata.cargo-machete]
 ignored = ["anyhow", "chrono", "chrono-tz", "dhan-live-trader-common", "governor", "jaeckel", "loom", "metrics", "secrecy", "serde", "thiserror", "tokio", "tracing", "uuid"]

@@ -1,6 +1,6 @@
 {
   "annotations": { "list": [] },
-  "description": "Centralized log viewer — all dlt-* container logs via Loki",
+  "description": "Log aggregation — Loki removed (AWS budget). Use CloudWatch Logs or docker logs.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -8,119 +8,22 @@
   "links": [],
   "panels": [
     {
-      "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
-      "id": 100,
-      "title": "Log Volume",
-      "type": "row"
-    },
-    {
-      "datasource": { "type": "loki", "uid": "loki" },
-      "fieldConfig": {
-        "defaults": {
-          "color": { "mode": "palette-classic" },
-          "custom": { "axisBorderShow": false, "drawStyle": "bars", "fillOpacity": 80, "lineWidth": 1, "showPoints": "never", "stacking": { "mode": "normal" } },
-          "unit": "short"
-        },
-        "overrides": []
-      },
-      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 24, "x": 0, "y": 0 },
       "id": 1,
-      "options": { "legend": { "calcs": [], "displayMode": "list", "placement": "right" }, "tooltip": { "mode": "multi", "sort": "desc" } },
-      "title": "Log Volume by Container",
-      "type": "timeseries",
-      "targets": [
-        { "expr": "sum(count_over_time({job=\"dlt-docker\"} [1m])) by (container)", "legendFormat": "{{container}}", "refId": "A" }
-      ]
-    },
-    {
-      "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 7 },
-      "id": 101,
-      "title": "Application Logs",
-      "type": "row"
-    },
-    {
-      "datasource": { "type": "loki", "uid": "loki" },
-      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 8 },
-      "id": 2,
       "options": {
-        "dedupStrategy": "none",
-        "enableLogDetails": true,
-        "prettifyLogMessage": true,
-        "showCommonLabels": false,
-        "showLabels": true,
-        "showTime": true,
-        "sortOrder": "Descending",
-        "wrapLogMessage": true
+        "code": { "language": "plaintext", "showLineNumbers": false, "showMiniMap": false },
+        "content": "## Loki + Alloy removed (saves 2.5GB RAM)\n\n**View logs via:**\n- `docker logs dlt-app --tail 100 -f` (local)\n- AWS CloudWatch Logs (production)\n- Application JSON logs: `cargo run 2>&1 | jq .`",
+        "mode": "markdown"
       },
-      "title": "dlt-app Logs",
-      "type": "logs",
-      "targets": [
-        { "expr": "{container=\"dlt-app\"} | json | __error__=`` | line_format \"{{.level}} {{.message}}\"", "legendFormat": "", "refId": "A" }
-      ]
-    },
-    {
-      "collapsed": true,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 20 },
-      "id": 102,
-      "title": "Error Logs (all containers)",
-      "type": "row",
-      "panels": [
-        {
-          "datasource": { "type": "loki", "uid": "loki" },
-          "gridPos": { "h": 12, "w": 24, "x": 0, "y": 21 },
-          "id": 3,
-          "options": {
-            "dedupStrategy": "none",
-            "enableLogDetails": true,
-            "prettifyLogMessage": true,
-            "showCommonLabels": false,
-            "showLabels": true,
-            "showTime": true,
-            "sortOrder": "Descending",
-            "wrapLogMessage": true
-          },
-          "title": "Errors Across All Containers",
-          "type": "logs",
-          "targets": [
-            { "expr": "{job=\"dlt-docker\"} |~ \"(?i)(error|panic|fatal|ERRO)\"", "legendFormat": "", "refId": "A" }
-          ]
-        }
-      ]
-    },
-    {
-      "collapsed": true,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 33 },
-      "id": 103,
-      "title": "Infrastructure Logs",
-      "type": "row",
-      "panels": [
-        {
-          "datasource": { "type": "loki", "uid": "loki" },
-          "gridPos": { "h": 10, "w": 12, "x": 0, "y": 34 },
-          "id": 4,
-          "options": { "dedupStrategy": "none", "enableLogDetails": true, "prettifyLogMessage": false, "showLabels": true, "showTime": true, "sortOrder": "Descending", "wrapLogMessage": true },
-          "title": "Traefik Logs",
-          "type": "logs",
-          "targets": [{ "expr": "{container=\"dlt-traefik\"}", "legendFormat": "", "refId": "A" }]
-        },
-        {
-          "datasource": { "type": "loki", "uid": "loki" },
-          "gridPos": { "h": 10, "w": 12, "x": 12, "y": 34 },
-          "id": 5,
-          "options": { "dedupStrategy": "none", "enableLogDetails": true, "prettifyLogMessage": false, "showLabels": true, "showTime": true, "sortOrder": "Descending", "wrapLogMessage": true },
-          "title": "QuestDB Logs",
-          "type": "logs",
-          "targets": [{ "expr": "{container=\"dlt-questdb\"}", "legendFormat": "", "refId": "A" }]
-        }
-      ]
+      "title": "Log Aggregation Status",
+      "type": "text"
     }
   ],
   "schemaVersion": 39,
   "tags": ["dhan-live-trader", "logs"],
   "templating": { "list": [] },
-  "refresh": "5s",
+  "refresh": "",
   "time": { "from": "now-1h", "to": "now" },
   "timepicker": {
     "refresh_intervals": ["5s", "10s", "30s", "1m", "5m"]

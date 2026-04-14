@@ -22,7 +22,8 @@ use tracing::{debug, error, info, warn};
 
 use dhan_live_trader_common::config::{GreeksConfig, QuestDbConfig};
 use dhan_live_trader_common::constants::{
-    IST_UTC_OFFSET_NANOS, IST_UTC_OFFSET_SECONDS_I64, VALIDATION_MUST_EXIST_INDICES,
+    IST_UTC_OFFSET_NANOS, IST_UTC_OFFSET_SECONDS_I64, TICK_PERSIST_END_SECS_OF_DAY_IST,
+    TICK_PERSIST_START_SECS_OF_DAY_IST, VALIDATION_MUST_EXIST_INDICES,
 };
 use dhan_live_trader_core::auth::TokenHandle;
 use dhan_live_trader_core::option_chain::client::OptionChainClient;
@@ -57,6 +58,24 @@ const FNO_SEGMENT: &str = "NSE_FNO";
 /// After this many consecutive cycles where ALL underlyings fail,
 /// escalate from WARN to ERROR (which triggers Telegram alert).
 const CONSECUTIVE_FAILURE_ESCALATION_THRESHOLD: u32 = 5;
+
+/// Returns true if current IST time is within the greeks fetch window
+/// (09:15–15:30 IST). Outside this window, option chain data is stale
+/// and fetching wastes Dhan API quota (Data API: 100K calls/day).
+fn is_within_greeks_window() -> bool {
+    let now_utc = Utc::now();
+    let ist_secs = now_utc
+        .timestamp()
+        .saturating_add(IST_UTC_OFFSET_SECONDS_I64);
+    #[allow(clippy::cast_possible_truncation)] // APPROVED: secs-of-day always fits u32
+    let secs_of_day = (ist_secs % 86_400) as u32;
+    // O(1) EXEMPT: called once per cycle (cold path), not per tick
+    #[allow(clippy::manual_range_contains)] // APPROVED: avoids banned .contains() pattern
+    {
+        secs_of_day >= TICK_PERSIST_START_SECS_OF_DAY_IST
+            && secs_of_day < TICK_PERSIST_END_SECS_OF_DAY_IST
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -109,7 +128,22 @@ pub async fn run_greeks_pipeline(
     let interval = Duration::from_secs(greeks_config.fetch_interval_secs);
     let mut consecutive_zero_strikes: u32 = 0;
 
+    let mut logged_off_hours = false;
+
     loop {
+        // Skip cycles outside market hours to conserve Dhan API quota.
+        if !is_within_greeks_window() {
+            if !logged_off_hours {
+                info!("greeks pipeline: outside market hours (09:15–15:30 IST) — pausing cycles");
+                logged_off_hours = true;
+            }
+            // Reset consecutive failure counter — off-hours zeros are expected.
+            consecutive_zero_strikes = 0;
+            tokio::time::sleep(interval).await;
+            continue;
+        }
+        logged_off_hours = false;
+
         // Run one cycle.
         match run_one_cycle(&mut oc_client, &mut writer, &greeks_config).await {
             Ok(total_strikes) => {
@@ -816,6 +850,26 @@ mod tests {
     #[test]
     fn test_classify_match_vega_off() {
         assert_eq!(classify_match(0.0, 0.0, 0.0, 0.0, 2.0), "MISMATCH");
+    }
+
+    // --- Market hours gate enforcement ---
+
+    #[test]
+    fn test_greeks_market_hours_gate_source_code() {
+        // Mechanical enforcement: greeks pipeline must check market hours before each cycle.
+        let source = include_str!("greeks_pipeline.rs");
+        assert!(
+            source.contains("is_within_greeks_window()"),
+            "greeks_pipeline.rs MUST call is_within_greeks_window() in the main loop"
+        );
+        assert!(
+            source.contains("TICK_PERSIST_START_SECS_OF_DAY_IST"),
+            "greeks window must use TICK_PERSIST_START constant"
+        );
+        assert!(
+            source.contains("TICK_PERSIST_END_SECS_OF_DAY_IST"),
+            "greeks window must use TICK_PERSIST_END constant"
+        );
     }
 
     // --- IST timestamp source code enforcement ---

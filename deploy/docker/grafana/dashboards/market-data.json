@@ -585,7 +585,7 @@
         "showHeader": true,
         "cellHeight": "sm",
         "footer": { "countRows": true, "enablePagination": true, "fields": "", "reducer": ["count"], "show": true },
-        "sortBy": [{ "desc": true, "displayName": "depth_time" }]
+        "sortBy": [{ "desc": true, "displayName": "exchange_time" }]
       },
       "title": "Market Depth (Latest)",
       "description": "5-level bid/ask order book data. Bid in green, ask in red.",
@@ -596,56 +596,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT\n  segment,\n  security_id,\n  level,\n  bid_qty,\n  bid_price,\n  ask_price,\n  ask_qty,\n  to_str(ts, 'yyyy-MM-dd HH:mm:ss.SSS') AS depth_time\nFROM market_depth\nWHERE ts >= dateadd('s', 19800, '${__from:date:iso}')\n  AND ts < dateadd('s', 19800, '${__to:date:iso}')\nORDER BY ts DESC, security_id, level\nLIMIT 500;",
-          "refId": "A"
-        }
-      ]
-    },
-    {
-      "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 91 },
-      "id": 800,
-      "title": "Previous Close",
-      "type": "row"
-    },
-    {
-      "datasource": { "type": "postgres", "uid": "questdb" },
-      "fieldConfig": {
-        "defaults": {
-          "custom": {
-            "align": "auto",
-            "cellOptions": { "type": "auto" },
-            "filterable": true,
-            "inspect": false
-          },
-          "mappings": [],
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
-        },
-        "overrides": [
-          {
-            "matcher": { "id": "byName", "options": "prev_close" },
-            "properties": [{ "id": "decimals", "value": 2 }]
-          }
-        ]
-      },
-      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 92 },
-      "id": 60,
-      "options": {
-        "showHeader": true,
-        "cellHeight": "sm",
-        "footer": { "countRows": true, "enablePagination": true, "fields": "", "reducer": ["count"], "show": true },
-        "sortBy": [{ "desc": false, "displayName": "security_id" }]
-      },
-      "title": "Previous Close Prices",
-      "description": "Previous session close prices and open interest for all subscribed instruments.",
-      "type": "table",
-      "targets": [
-        {
-          "datasource": { "type": "postgres", "uid": "questdb" },
-          "editorMode": "code",
-          "format": "table",
-          "rawQuery": true,
-          "rawSql": "SELECT\n  segment,\n  security_id,\n  prev_close,\n  prev_oi,\n  ts AS time\nFROM previous_close\nORDER BY security_id\nLIMIT 500;",
+          "rawSql": "SELECT\n  segment,\n  security_id,\n  level,\n  bid_qty,\n  bid_price,\n  ask_price,\n  ask_qty,\n  to_str(ts, 'yyyy-MM-dd HH:mm:ss.SSS') AS exchange_time,\n  to_str(received_at, 'yyyy-MM-dd HH:mm:ss.SSS') AS received_at\nFROM market_depth\nWHERE ts >= dateadd('s', 19800, '${__from:date:iso}')\n  AND ts < dateadd('s', 19800, '${__to:date:iso}')\nORDER BY ts DESC, security_id, level\nLIMIT 500;",
           "refId": "A"
         }
       ]
@@ -873,84 +824,6 @@
           "refId": "A"
         }
       ]
-    },
-    {
-      "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 130 },
-      "id": 500,
-      "title": "Stock Movers (Gainers / Losers / Most Active)",
-      "type": "row"
-    },
-    {
-      "datasource": { "type": "postgres", "uid": "questdb" },
-      "fieldConfig": { "defaults": { "custom": { "align": "auto" } }, "overrides": [{ "matcher": { "id": "byName", "options": "change_pct" }, "properties": [{ "id": "custom.cellOptions", "value": { "type": "color-text" } }, { "id": "thresholds", "value": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 0 }] } }] }] },
-      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 131 },
-      "id": 501,
-      "options": { "showHeader": true, "sortBy": [{ "desc": false, "displayName": "rank" }] },
-      "title": "Top Stock Movers (Latest Snapshot)",
-      "type": "table",
-      "targets": [
-        {
-          "datasource": { "type": "postgres", "uid": "questdb" },
-          "editorMode": "code",
-          "format": "table",
-          "rawQuery": true,
-          "rawSql": "SELECT\n  category,\n  rank,\n  security_id,\n  segment,\n  symbol,\n  ltp,\n  prev_close,\n  change_abs,\n  change_pct,\n  volume,\n  ts AS time\nFROM stock_movers\nWHERE ts = (SELECT max(ts) FROM stock_movers)\nORDER BY category, rank;",
-          "refId": "A"
-        }
-      ]
-    },
-    {
-      "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 144 },
-      "id": 510,
-      "title": "Option Movers (OI / Volume / Price)",
-      "type": "row"
-    },
-    {
-      "datasource": { "type": "postgres", "uid": "questdb" },
-      "fieldConfig": { "defaults": { "custom": { "align": "auto" } }, "overrides": [{ "matcher": { "id": "byName", "options": "change_pct" }, "properties": [{ "id": "custom.cellOptions", "value": { "type": "color-text" } }, { "id": "thresholds", "value": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 0 }] } }] }, { "matcher": { "id": "byName", "options": "oi_change_pct" }, "properties": [{ "id": "custom.cellOptions", "value": { "type": "color-text" } }, { "id": "thresholds", "value": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 0 }] } }] }] },
-      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 145 },
-      "id": 511,
-      "options": { "showHeader": true, "sortBy": [{ "desc": false, "displayName": "rank" }] },
-      "title": "Top Option Movers (Latest Snapshot)",
-      "type": "table",
-      "targets": [
-        {
-          "datasource": { "type": "postgres", "uid": "questdb" },
-          "editorMode": "code",
-          "format": "table",
-          "rawQuery": true,
-          "rawSql": "SELECT\n  category,\n  rank,\n  contract_name,\n  underlying,\n  option_type,\n  strike,\n  expiry,\n  spot_price,\n  ltp,\n  change,\n  change_pct,\n  oi,\n  oi_change,\n  oi_change_pct,\n  volume,\n  value,\n  ts AS time\nFROM option_movers\nWHERE ts = (SELECT max(ts) FROM option_movers)\nORDER BY category, rank;",
-          "refId": "A"
-        }
-      ]
-    },
-    {
-      "collapsed": false,
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 158 },
-      "id": 520,
-      "title": "Indicator Snapshots",
-      "type": "row"
-    },
-    {
-      "datasource": { "type": "postgres", "uid": "questdb" },
-      "fieldConfig": { "defaults": { "custom": { "align": "auto" } } },
-      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 159 },
-      "id": 521,
-      "options": { "showHeader": true, "sortBy": [{ "desc": true, "displayName": "rsi" }] },
-      "title": "Indicator Snapshots (Latest per Security)",
-      "type": "table",
-      "targets": [
-        {
-          "datasource": { "type": "postgres", "uid": "questdb" },
-          "editorMode": "code",
-          "format": "table",
-          "rawQuery": true,
-          "rawSql": "SELECT\n  segment,\n  security_id,\n  ltp,\n  ema_fast,\n  ema_slow,\n  sma,\n  rsi,\n  macd_line,\n  macd_signal,\n  macd_histogram,\n  bollinger_upper,\n  bollinger_middle,\n  bollinger_lower,\n  atr,\n  supertrend,\n  supertrend_bullish,\n  adx,\n  obv,\n  vwap,\n  is_warm,\n  ts AS time\nFROM indicator_snapshots\nWHERE ts IN (SELECT max(ts) FROM indicator_snapshots)\nLIMIT 200;",
-          "refId": "A"
-        }
-      ]
     }
   ],
   "refresh": "5s",
@@ -964,5 +837,5 @@
   "timezone": "Asia/Kolkata",
   "title": "Market Data Explorer",
   "uid": "dlt-market-data",
-  "version": 8
+  "version": 100
 }

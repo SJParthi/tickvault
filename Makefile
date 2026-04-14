@@ -10,7 +10,7 @@
         health status open grafana questdb jaeger prometheus traefik alloy loki \
         obs obs-verify obs-restart obs-open \
         logs app-pid \
-        audit coverage bench geiger typos quality doc bootstrap \
+        audit coverage bench geiger typos quality doc bootstrap scoped-check full-qa \
 
 # ---- Configuration ----
 APP_NAME       := dhan-live-trader
@@ -94,6 +94,12 @@ test: ## Run all tests
 	cargo test
 	@echo ""
 	@echo "  ✅ All tests passed"
+
+scoped-check: ## Run tests ONLY for crates touched by current diff (see .claude/rules/project/testing-scope.md)
+	@bash .claude/hooks/scoped-test-runner.sh
+
+full-qa: ## Force full workspace tests (overrides scoped-check)
+	@FULL_QA=1 bash .claude/hooks/scoped-test-runner.sh
 
 check: fmt clippy test ## Full quality check (fmt + clippy + test)
 	@echo ""
@@ -286,3 +292,82 @@ alloy: ## Open Alloy UI (localhost:12345)
 loki: ## Open Loki status (localhost:3100/ready)
 	@open http://localhost:3100/ready 2>/dev/null || xdg-open http://localhost:3100/ready 2>/dev/null || echo "  Open: http://localhost:3100/ready"
 
+
+
+# =============================================================================
+# AWS DEPLOYMENT — Phase 8 one-time bootstrap helpers
+# =============================================================================
+
+aws-bootstrap-check: ## Verify prerequisites for the first terraform apply
+	@echo "Checking AWS deployment prerequisites..."
+	@command -v terraform >/dev/null 2>&1 || { echo "  FAIL: terraform not installed"; exit 1; }
+	@command -v aws >/dev/null 2>&1 || { echo "  FAIL: aws CLI not installed"; exit 1; }
+	@aws sts get-caller-identity >/dev/null 2>&1 || { echo "  FAIL: aws CLI not configured (run 'aws configure')"; exit 1; }
+	@REGION=$$(aws configure get region); [ "$$REGION" = "ap-south-1" ] || { echo "  FAIL: default region must be ap-south-1, got $$REGION"; exit 1; }
+	@echo "  PASS: terraform + aws CLI + ap-south-1 region"
+	@echo ""
+	@echo "Next: run 'make aws-init' to initialize Terraform"
+
+aws-ami: ## Look up the latest Ubuntu 24.04 LTS AMI in ap-south-1 (export TF_VAR_ami_id)
+	@AMI=$$(aws ec2 describe-images \
+		--region ap-south-1 \
+		--owners 099720109477 \
+		--filters 'Name=name,Values=ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*' \
+		--query 'sort_by(Images,&CreationDate)[-1].ImageId' --output text); \
+	echo "Latest Ubuntu 24.04 AMI in ap-south-1: $$AMI"; \
+	echo "export TF_VAR_ami_id=$$AMI"
+
+aws-operator-cidr: ## Print your current public IP CIDR for TF_VAR_operator_cidr
+	@IP=$$(curl -s ifconfig.me); echo "Your public IP: $$IP"; echo "export TF_VAR_operator_cidr=$$IP/32"
+
+aws-keypair: ## Create the dlt-prod-key SSH key pair (stores private key in ~/.ssh)
+	@if [ -f ~/.ssh/dlt-prod-key.pem ]; then \
+		echo "  SKIP: ~/.ssh/dlt-prod-key.pem already exists"; \
+	else \
+		aws ec2 create-key-pair \
+			--key-name dlt-prod-key \
+			--region ap-south-1 \
+			--query KeyMaterial --output text > ~/.ssh/dlt-prod-key.pem && \
+		chmod 400 ~/.ssh/dlt-prod-key.pem && \
+		echo "  Created ~/.ssh/dlt-prod-key.pem"; \
+	fi
+
+aws-init: aws-bootstrap-check ## Initialize Terraform in deploy/aws/terraform/
+	@cd deploy/aws/terraform && terraform init
+
+aws-plan: aws-bootstrap-check ## Show Terraform plan for the DLT AWS stack
+	@cd deploy/aws/terraform && terraform plan
+
+aws-apply: aws-bootstrap-check ## Apply the Terraform stack (requires TF_VAR_ami_id + TF_VAR_operator_cidr)
+	@if [ -z "$$TF_VAR_ami_id" ]; then \
+		echo "FAIL: TF_VAR_ami_id is not set. Run 'make aws-ami' first."; exit 1; \
+	fi
+	@if [ -z "$$TF_VAR_operator_cidr" ]; then \
+		echo "FAIL: TF_VAR_operator_cidr is not set. Run 'make aws-operator-cidr' first."; exit 1; \
+	fi
+	@cd deploy/aws/terraform && terraform apply
+
+aws-outputs: ## Show Terraform outputs (instance_id, elastic_ip, etc.)
+	@cd deploy/aws/terraform && terraform output
+
+aws-ssm: ## Open a Session Manager shell on the DLT instance (no SSH)
+	@cd deploy/aws/terraform && INSTANCE=$$(terraform output -raw instance_id) && \
+	aws ssm start-session --region ap-south-1 --target $$INSTANCE
+
+aws-ssm-command: ## Run 'journalctl -u dlt-app -n 50' on the instance via SSM
+	@cd deploy/aws/terraform && INSTANCE=$$(terraform output -raw instance_id) && \
+	CMD_ID=$$(aws ssm send-command --region ap-south-1 --instance-ids $$INSTANCE \
+		--document-name AWS-RunShellScript \
+		--parameters 'commands=["journalctl -u dlt-app -n 50 --no-pager"]' \
+		--query Command.CommandId --output text) && \
+	sleep 3 && \
+	aws ssm get-command-invocation --region ap-south-1 \
+		--command-id $$CMD_ID --instance-id $$INSTANCE \
+		--query StandardOutputContent --output text
+
+aws-cost: ## Show the current month AWS bill estimate (via Cost Explorer)
+	@aws ce get-cost-and-usage \
+		--region ap-south-1 \
+		--time-period Start=$$(date -u +%Y-%m-01),End=$$(date -u +%Y-%m-%d) \
+		--granularity MONTHLY --metrics UnblendedCost --output text 2>/dev/null || \
+	echo "  (Cost Explorer requires explicit enablement + 24h delay)"

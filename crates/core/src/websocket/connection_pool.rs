@@ -21,6 +21,7 @@ use dhan_live_trader_common::types::FeedMode;
 
 use crate::auth::TokenHandle;
 use crate::websocket::connection::WebSocketConnection;
+use crate::websocket::pool_watchdog::{PoolWatchdog, WatchdogVerdict};
 use crate::websocket::types::{ConnectionHealth, InstrumentSubscription, WebSocketError};
 
 // ---------------------------------------------------------------------------
@@ -41,6 +42,13 @@ pub struct WebSocketConnectionPool {
 
     /// Stagger delay between connection spawns (milliseconds). 0 = no stagger.
     connection_stagger_ms: u64,
+
+    /// A4: Pool-level circuit breaker watchdog. Tracks whether all
+    /// connections have been simultaneously down for > POOL_DEGRADED_ALERT_SECS
+    /// (60s) and > POOL_HALT_SECS (300s). Interior-mutable so the read-only
+    /// `poll_watchdog()` API works from a `&self` reference shared across
+    /// the pool's background task and its owner.
+    watchdog: std::sync::Mutex<PoolWatchdog>,
 }
 
 impl std::fmt::Debug for WebSocketConnectionPool {
@@ -72,6 +80,7 @@ impl WebSocketConnectionPool {
         ws_config: WebSocketConfig,
         instruments: Vec<InstrumentSubscription>,
         feed_mode: FeedMode,
+        notifier: Option<std::sync::Arc<crate::notification::NotificationService>>,
     ) -> Result<Self, WebSocketError> {
         let total = instruments.len();
 
@@ -124,6 +133,7 @@ impl WebSocketConnectionPool {
                     assigned_instruments,
                     feed_mode,
                     frame_sender.clone(),
+                    notifier.clone(),
                 ))
             })
             .collect();
@@ -139,6 +149,7 @@ impl WebSocketConnectionPool {
             connections,
             frame_receiver,
             connection_stagger_ms: ws_config.connection_stagger_ms,
+            watchdog: std::sync::Mutex::new(PoolWatchdog::new()),
         })
     }
 
@@ -203,6 +214,125 @@ impl WebSocketConnectionPool {
             .iter()
             .map(|conn| conn.health().subscribed_count)
             .sum()
+    }
+
+    /// A4: Pool-level circuit breaker poll. Call this from a background
+    /// task every ~5 seconds (or whatever your health-poll cadence is).
+    /// Reads all connection states, feeds them to the internal watchdog,
+    /// and returns the verdict. Side effects:
+    ///
+    /// - `WatchdogVerdict::Degraded` → fires Telegram CRITICAL (if a
+    ///   notifier is wired upstream by the caller) and increments
+    ///   `dlt_pool_degraded_seconds_total`
+    /// - `WatchdogVerdict::Halt` → caller MUST exit the process with a
+    ///   non-zero status so the supervisor (systemd / Docker restart
+    ///   policy) brings it back up. The pool cannot self-exit because
+    ///   it doesn't own the runtime.
+    /// - `WatchdogVerdict::Recovered` → INFO log + metric reset
+    /// - `WatchdogVerdict::Degrading` → metric gauge update only
+    ///
+    /// The watchdog itself is in `pool_watchdog.rs` and is a pure state
+    /// machine — this method only wires it to metrics and logs. Thresholds:
+    /// - 60s all-down: CRITICAL alert fired exactly once per down-cycle
+    /// - 300s all-down: Halt requested (caller decides how to exit)
+    ///
+    /// Cold path — runs on a watchdog cadence, not per tick.
+    // TEST-EXEMPT: covered by test_pool_poll_watchdog_* integration tests and pool_watchdog unit tests
+    #[allow(clippy::expect_used)] // APPROVED: lock poison on watchdog is unrecoverable
+    pub fn poll_watchdog(&self) -> WatchdogVerdict {
+        let healths = self.health();
+        let now = std::time::Instant::now();
+        // APPROVED: lock poison is unrecoverable — the process is corrupted anyway
+        let mut wd = self.watchdog.lock().expect("pool watchdog lock poisoned");
+        let verdict = wd.tick(&healths, now);
+        drop(wd);
+
+        match verdict {
+            WatchdogVerdict::Healthy => {
+                metrics::gauge!("dlt_pool_degraded_seconds").set(0.0);
+            }
+            WatchdogVerdict::Recovered { was_down_for } => {
+                info!(
+                    down_for_secs = was_down_for.as_secs(),
+                    "A4: WebSocket pool RECOVERED — at least one connection is live again"
+                );
+                metrics::counter!("dlt_pool_recoveries_total").increment(1);
+                metrics::gauge!("dlt_pool_degraded_seconds").set(0.0);
+            }
+            WatchdogVerdict::Degrading { down_for } => {
+                metrics::gauge!("dlt_pool_degraded_seconds").set(down_for.as_secs_f64());
+            }
+            WatchdogVerdict::Degraded { down_for } => {
+                tracing::error!(
+                    down_for_secs = down_for.as_secs(),
+                    "A4 CRITICAL: WebSocket pool has been FULLY DEGRADED for >60s — ALL connections \
+                     are Reconnecting/Disconnected, no market data flowing. Investigate Dhan \
+                     server status, token validity, network reachability."
+                );
+                metrics::counter!("dlt_pool_degraded_alerts_total").increment(1);
+                metrics::gauge!("dlt_pool_degraded_seconds").set(down_for.as_secs_f64());
+            }
+            WatchdogVerdict::Halt { down_for } => {
+                tracing::error!(
+                    down_for_secs = down_for.as_secs(),
+                    "A4 FATAL: WebSocket pool has been FULLY DEGRADED for >300s — initiating process \
+                     halt so supervisor can restart us. If this fires repeatedly, Dhan is likely \
+                     unreachable or the account/token is locked."
+                );
+                metrics::counter!("dlt_pool_halts_total").increment(1);
+                metrics::gauge!("dlt_pool_degraded_seconds").set(down_for.as_secs_f64());
+            }
+        }
+
+        verdict
+    }
+
+    /// A5: Graceful shutdown — requests each connection to send a
+    /// `RequestCode: 12` (Disconnect) to Dhan and close its socket cleanly.
+    ///
+    /// Iterates every connection and calls `request_graceful_shutdown()`,
+    /// which is non-blocking (atomic store + notify). The actual Disconnect
+    /// JSON is sent by the per-connection read loop within its own
+    /// `tokio::select!`. Connections that are already in `Disconnected` or
+    /// `Reconnecting` state skip the network send (their read loop isn't
+    /// running) — the flag still gets set so subsequent runs don't reconnect.
+    ///
+    /// Returns the number of connections that were signalled (including ones
+    /// that were already dead). Caller is responsible for awaiting the spawn
+    /// handles with its own timeout.
+    ///
+    /// Cold path — runs once per process at SIGTERM.
+    // TEST-EXEMPT: covered by test_pool_graceful_shutdown_signals_all and integration tests
+    pub fn request_graceful_shutdown(&self) -> usize {
+        use crate::websocket::types::ConnectionState;
+
+        let mut live = 0_usize;
+        let mut dead = 0_usize;
+        for conn in &self.connections {
+            let state = conn.health().state;
+            match state {
+                ConnectionState::Connected | ConnectionState::Connecting => {
+                    live = live.saturating_add(1);
+                }
+                ConnectionState::Disconnected | ConnectionState::Reconnecting => {
+                    dead = dead.saturating_add(1);
+                }
+            }
+            // Always set the flag so the outer `run()` loop will not
+            // reconnect, even if the read loop isn't listening right now.
+            conn.request_graceful_shutdown();
+        }
+
+        info!(
+            live_connections = live,
+            dead_connections = dead,
+            total = self.connections.len(),
+            "A5: graceful shutdown signalled to all WebSocket connections"
+        );
+        metrics::counter!("dlt_ws_graceful_shutdown_signalled_total")
+            .increment(self.connections.len() as u64);
+
+        self.connections.len()
     }
 }
 
@@ -276,6 +406,7 @@ mod tests {
             make_test_ws_config(),
             vec![],
             FeedMode::Ticker,
+            None,
         )
         .unwrap();
         assert_eq!(pool.connection_count(), 5);
@@ -291,6 +422,7 @@ mod tests {
             make_test_ws_config(),
             make_instruments(3000),
             FeedMode::Quote,
+            None,
         )
         .unwrap();
         assert_eq!(pool.connection_count(), 5);
@@ -306,6 +438,7 @@ mod tests {
             make_test_ws_config(),
             make_instruments(5000),
             FeedMode::Full,
+            None,
         )
         .unwrap();
         assert_eq!(pool.connection_count(), 5);
@@ -320,6 +453,7 @@ mod tests {
             make_test_ws_config(),
             make_instruments(5001),
             FeedMode::Ticker,
+            None,
         )
         .unwrap();
         assert_eq!(pool.connection_count(), 5);
@@ -335,6 +469,7 @@ mod tests {
             make_test_ws_config(),
             make_instruments(25000),
             FeedMode::Full,
+            None,
         )
         .unwrap();
         assert_eq!(pool.connection_count(), 5);
@@ -350,6 +485,7 @@ mod tests {
             make_test_ws_config(),
             make_instruments(25001),
             FeedMode::Ticker,
+            None,
         );
         assert!(result.is_err());
         let (requested, capacity) = unwrap_capacity_exceeded(result.unwrap_err());
@@ -367,6 +503,7 @@ mod tests {
             make_test_ws_config(),
             make_instruments(10001),
             FeedMode::Ticker,
+            None,
         )
         .unwrap();
         assert_eq!(pool.connection_count(), 5);
@@ -390,6 +527,7 @@ mod tests {
             make_test_ws_config(),
             make_instruments(1),
             FeedMode::Ticker,
+            None,
         )
         .unwrap();
         assert_eq!(pool.connection_count(), 5);
@@ -405,6 +543,7 @@ mod tests {
             make_test_ws_config(),
             make_instruments(4999),
             FeedMode::Quote,
+            None,
         )
         .unwrap();
         assert_eq!(pool.connection_count(), 5);
@@ -419,6 +558,7 @@ mod tests {
             make_test_ws_config(),
             make_instruments(10000),
             FeedMode::Ticker,
+            None,
         )
         .unwrap();
         assert_eq!(pool.connection_count(), 5);
@@ -433,6 +573,7 @@ mod tests {
             make_test_ws_config(),
             make_instruments(15000),
             FeedMode::Full,
+            None,
         )
         .unwrap();
         assert_eq!(pool.connection_count(), 5);
@@ -447,6 +588,7 @@ mod tests {
             make_test_ws_config(),
             make_instruments(20000),
             FeedMode::Ticker,
+            None,
         )
         .unwrap();
         assert_eq!(pool.connection_count(), 5);
@@ -461,6 +603,7 @@ mod tests {
             make_test_ws_config(),
             make_instruments(100),
             FeedMode::Ticker,
+            None,
         )
         .unwrap();
 
@@ -485,6 +628,7 @@ mod tests {
             make_test_ws_config(),
             make_instruments(5001),
             FeedMode::Ticker,
+            None,
         )
         .unwrap();
         let debug_str = format!("{pool:?}");
@@ -507,6 +651,7 @@ mod tests {
             make_test_ws_config(),
             make_instruments(5000),
             FeedMode::Full,
+            None,
         )
         .unwrap();
         // Always max connections (5), instruments distributed round-robin
@@ -527,6 +672,7 @@ mod tests {
                 make_test_ws_config(),
                 make_instruments(count),
                 FeedMode::Ticker,
+                None,
             )
             .unwrap();
             assert_eq!(
@@ -546,6 +692,7 @@ mod tests {
             make_test_ws_config(),
             make_instruments(12000),
             FeedMode::Full,
+            None,
         )
         .unwrap();
         let healths = pool.health();
@@ -572,6 +719,7 @@ mod tests {
             make_test_ws_config(),
             make_instruments(5000),
             FeedMode::Ticker,
+            None,
         )
         .unwrap();
         assert_eq!(pool.connection_count(), 3);
@@ -592,6 +740,7 @@ mod tests {
             make_test_ws_config(),
             make_instruments(15000),
             FeedMode::Ticker,
+            None,
         );
         assert!(result.is_err());
         let (requested, capacity) = unwrap_capacity_exceeded(result.unwrap_err());
@@ -613,6 +762,7 @@ mod tests {
             make_test_ws_config(),
             make_instruments(5000),
             FeedMode::Ticker,
+            None,
         )
         .unwrap();
         assert_eq!(pool.connection_count(), 5);
@@ -635,6 +785,7 @@ mod tests {
                     make_test_ws_config(),
                     instruments,
                     FeedMode::Ticker,
+                    None,
                 ).unwrap();
                 prop_assert_eq!(pool.total_instruments(), count);
                 prop_assert_eq!(pool.connection_count(), 5);
@@ -658,6 +809,7 @@ mod tests {
             },
             make_instruments(100),
             FeedMode::Ticker,
+            None,
         )
         .unwrap();
 
@@ -691,6 +843,7 @@ mod tests {
             },
             vec![], // no instruments
             FeedMode::Ticker,
+            None,
         )
         .unwrap();
 
@@ -717,6 +870,7 @@ mod tests {
             },
             make_instruments(10),
             FeedMode::Ticker,
+            None,
         )
         .unwrap();
 
@@ -749,6 +903,7 @@ mod tests {
             make_test_ws_config(),
             make_instruments(100),
             FeedMode::Ticker,
+            None,
         )
         .unwrap();
         assert_eq!(pool.connection_count(), 1);
@@ -774,6 +929,7 @@ mod tests {
             make_test_ws_config(),
             make_instruments(5),
             FeedMode::Ticker,
+            None,
         )
         .unwrap();
         assert_eq!(pool.connection_count(), 5);
@@ -798,6 +954,7 @@ mod tests {
             make_test_ws_config(),
             make_instruments(6),
             FeedMode::Ticker,
+            None,
         );
         assert!(result.is_err());
         let (requested, capacity) = unwrap_capacity_exceeded(result.unwrap_err());
@@ -815,6 +972,7 @@ mod tests {
             make_test_ws_config(),
             make_instruments(500),
             FeedMode::Full,
+            None,
         )
         .unwrap();
         for h in pool.health() {
@@ -833,6 +991,7 @@ mod tests {
             make_test_ws_config(),
             make_instruments(100),
             FeedMode::Ticker,
+            None,
         )
         .unwrap();
         let healths = pool.health();
@@ -851,6 +1010,7 @@ mod tests {
             make_test_ws_config(),
             make_instruments(10),
             FeedMode::Ticker,
+            None,
         )
         .unwrap();
 
@@ -879,6 +1039,7 @@ mod tests {
                 make_test_ws_config(),
                 make_instruments(count),
                 FeedMode::Ticker,
+                None,
             )
             .unwrap();
             let debug_str = format!("{pool:?}");
@@ -897,6 +1058,7 @@ mod tests {
             make_test_ws_config(),
             make_instruments(10),
             FeedMode::Ticker,
+            None,
         )
         .unwrap();
         for h in pool.health() {
@@ -914,6 +1076,7 @@ mod tests {
             make_test_ws_config(),
             make_instruments(7),
             FeedMode::Ticker,
+            None,
         )
         .unwrap();
         let healths = pool.health();
@@ -935,6 +1098,7 @@ mod tests {
             make_test_ws_config(),
             make_instruments(100),
             FeedMode::Ticker,
+            None,
         )
         .unwrap();
         assert_eq!(pool.connection_count(), 5);
@@ -954,6 +1118,7 @@ mod tests {
             make_test_ws_config(),
             make_instruments(25000),
             FeedMode::Ticker,
+            None,
         )
         .unwrap();
         assert_eq!(pool.connection_count(), 5);
@@ -979,6 +1144,7 @@ mod tests {
             },
             make_instruments(5),
             FeedMode::Ticker,
+            None,
         )
         .unwrap();
 
@@ -1006,6 +1172,7 @@ mod tests {
             },
             make_instruments(10),
             FeedMode::Ticker,
+            None,
         )
         .unwrap();
 
@@ -1026,6 +1193,120 @@ mod tests {
         }
     }
 
+    // =======================================================================
+    // A4: Pool-level circuit breaker (watchdog integration)
+    // =======================================================================
+
+    /// A4: A freshly-constructed pool has all 5 connections in `Disconnected`
+    /// state. The first watchdog poll MUST transition to Degrading (starting
+    /// the all-down cycle), not stay Healthy.
+    #[test]
+    fn test_pool_poll_watchdog_initial_state_is_degrading() {
+        let pool = WebSocketConnectionPool::new(
+            make_test_token_handle(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            make_test_ws_config(),
+            make_instruments(100),
+            FeedMode::Ticker,
+            None,
+        )
+        .unwrap();
+
+        let verdict = pool.poll_watchdog();
+        assert!(
+            matches!(verdict, WatchdogVerdict::Degrading { .. }),
+            "fresh pool with all-Disconnected connections must transition \
+             into Degrading on first poll, got {verdict:?}"
+        );
+    }
+
+    /// A4: Repeated polls on a dead pool stay in Degrading (until 60s
+    /// threshold). We can't simulate 60s of wall-clock in a unit test, so
+    /// we just verify the verdict type is stable across multiple polls.
+    #[test]
+    fn test_pool_poll_watchdog_stable_across_polls() {
+        let pool = WebSocketConnectionPool::new(
+            make_test_token_handle(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            make_test_ws_config(),
+            make_instruments(100),
+            FeedMode::Ticker,
+            None,
+        )
+        .unwrap();
+
+        for _ in 0..5 {
+            let v = pool.poll_watchdog();
+            assert!(
+                matches!(v, WatchdogVerdict::Degrading { .. }),
+                "dead pool must stay in Degrading, got {v:?}"
+            );
+        }
+    }
+
+    // =======================================================================
+    // A5: Pool-level graceful shutdown
+    // =======================================================================
+
+    /// A5: `request_graceful_shutdown` sets the flag on every connection in
+    /// the pool and reports the total count.
+    #[test]
+    fn test_pool_graceful_shutdown_signals_all_connections() {
+        let pool = WebSocketConnectionPool::new(
+            make_test_token_handle(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            make_test_ws_config(),
+            make_instruments(10),
+            FeedMode::Ticker,
+            None,
+        )
+        .unwrap();
+
+        let signalled = pool.request_graceful_shutdown();
+        assert_eq!(
+            signalled,
+            pool.connection_count(),
+            "must signal every connection (live or dead)"
+        );
+
+        // Every underlying connection must now report shutdown_requested == true.
+        for conn in &pool.connections {
+            assert!(
+                conn.is_shutdown_requested(),
+                "conn {} must have shutdown flag set",
+                conn.connection_id()
+            );
+        }
+    }
+
+    /// A5: Signalling a pool whose connections are all dead (default state)
+    /// must still succeed — graceful shutdown is best-effort.
+    #[test]
+    fn test_pool_graceful_shutdown_skips_dead_connections_safely() {
+        let pool = WebSocketConnectionPool::new(
+            make_test_token_handle(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            make_test_ws_config(),
+            vec![],
+            FeedMode::Ticker,
+            None,
+        )
+        .unwrap();
+
+        // All connections are Disconnected at construction time.
+        for h in pool.health() {
+            assert_eq!(h.state, ConnectionState::Disconnected);
+        }
+
+        // Must not panic and must report the correct total.
+        let signalled = pool.request_graceful_shutdown();
+        assert_eq!(signalled, 5, "pool always signals all 5 slots");
+    }
+
     #[tokio::test]
     async fn test_spawn_all_zero_stagger_is_instant() {
         let pool = WebSocketConnectionPool::new(
@@ -1041,6 +1322,7 @@ mod tests {
             },
             make_instruments(10),
             FeedMode::Ticker,
+            None,
         )
         .unwrap();
 

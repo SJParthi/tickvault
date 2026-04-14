@@ -5,402 +5,1119 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>DLT Market Dashboard</title>
     <style>
-        :root {
-            --bg: #0d1117; --bg-card: #161b22; --border: #30363d;
-            --text: #e6edf3; --text-dim: #8b949e; --text-muted: #484f58;
-            --green: #26a69a; --red: #ef5350; --blue: #2962ff;
-            --yellow: #ffab00; --purple: #7c4dff;
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
         }
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-size: 13px; }
 
-        /* Index Ticker Bar */
-        .ticker-bar { display: flex; gap: 2px; padding: 8px 12px; background: var(--bg-card); border-bottom: 1px solid var(--border); overflow-x: auto; white-space: nowrap; }
-        .ticker-item { display: flex; align-items: baseline; gap: 8px; padding: 4px 14px; border-right: 1px solid var(--border); min-width: 180px; }
-        .ticker-item:last-child { border-right: none; }
-        .ticker-name { font-weight: 600; font-size: 12px; color: var(--text-dim); }
-        .ticker-price { font-weight: 700; font-size: 14px; }
-        .ticker-change { font-size: 12px; }
+        body {
+            background-color: #000000;
+            color: #8E8E8E;
+            font-family: Inter, -apple-system, BlinkMacSystemFont, sans-serif;
+            font-size: 14px;
+            line-height: 20px;
+            overflow: hidden;
+        }
 
-        /* Header */
-        .header { display: flex; align-items: center; justify-content: space-between; padding: 10px 16px; border-bottom: 1px solid var(--border); background: var(--bg-card); }
-        .header h1 { font-size: 16px; font-weight: 600; }
-        .header h1 span { color: var(--blue); }
-        .header .meta { font-size: 11px; color: var(--text-dim); display: flex; gap: 16px; align-items: center; }
-        .header .back { color: var(--text-dim); text-decoration: none; font-size: 12px; }
-        .header .back:hover { color: var(--text); }
+        /* ============ TOP NAV ============ */
+        .top-nav {
+            display: flex;
+            align-items: center;
+            background-color: rgba(18, 18, 18, 0.62);
+            border-bottom: 1px solid #242424;
+            padding: 0 20px;
+            gap: 20px;
+            height: 60px;
+        }
 
-        /* Tabs */
-        .tabs { display: flex; border-bottom: 1px solid var(--border); background: var(--bg-card); }
-        .tab { padding: 10px 24px; cursor: pointer; font-size: 13px; font-weight: 500; color: var(--text-dim); border-bottom: 2px solid transparent; transition: all 0.15s; }
-        .tab:hover { color: var(--text); }
-        .tab.active { color: var(--blue); border-bottom-color: var(--blue); }
+        .logo {
+            width: 30px;
+            height: 30px;
+            border-radius: 50%;
+            background: linear-gradient(135deg, #1e90ff, #4169e1);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: bold;
+            color: white;
+            font-size: 14px;
+            flex-shrink: 0;
+        }
 
-        /* Sub-tabs */
-        .sub-tabs { display: flex; gap: 4px; padding: 8px 16px; background: var(--bg); border-bottom: 1px solid var(--border); flex-wrap: wrap; align-items: center; }
-        .sub-tab { padding: 5px 14px; cursor: pointer; font-size: 12px; border-radius: 4px; color: var(--text-dim); background: var(--bg-card); border: 1px solid var(--border); transition: all 0.15s; }
-        .sub-tab:hover { color: var(--text); border-color: var(--text-dim); }
-        .sub-tab.active { color: var(--blue); border-color: var(--blue); background: rgba(41,98,255,0.1); }
+        .search-bar {
+            background-color: #242424;
+            border: 1px solid #242424;
+            border-radius: 4px;
+            padding: 8px 12px;
+            color: #8E8E8E;
+            width: 220px;
+            font-size: 13px;
+        }
 
-        /* Toggle switch (Gainers/Losers) */
-        .toggle-group { display: flex; align-items: center; gap: 0; margin-left: 16px; border: 1px solid var(--border); border-radius: 4px; overflow: hidden; }
-        .toggle-btn { padding: 4px 12px; cursor: pointer; font-size: 11px; font-weight: 600; background: var(--bg-card); color: var(--text-muted); border: none; transition: all 0.15s; }
-        .toggle-btn.active-green { background: var(--green); color: #fff; }
-        .toggle-btn.active-red { background: var(--red); color: #fff; }
-        .toggle-sep { width: 1px; height: 20px; background: var(--border); }
+        .search-bar::placeholder {
+            color: #8E8E8E;
+        }
 
-        /* Table */
-        .data-table { width: 100%; border-collapse: collapse; }
-        .data-table th { position: sticky; top: 0; background: var(--bg-card); padding: 8px 12px; text-align: right; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-muted); border-bottom: 2px solid var(--border); white-space: nowrap; z-index: 10; }
-        .data-table th:first-child { text-align: left; }
-        .data-table td { padding: 7px 12px; text-align: right; border-bottom: 1px solid var(--border); white-space: nowrap; font-size: 13px; }
-        .data-table td:first-child { text-align: left; font-weight: 500; }
-        .data-table tr:hover { background: rgba(255,255,255,0.03); }
+        .nav-links {
+            display: flex;
+            gap: 28px;
+            margin-left: 10px;
+        }
 
-        .positive { color: var(--green); }
-        .negative { color: var(--red); }
-        .dim { color: var(--text-muted); }
+        .nav-links a {
+            color: #8E8E8E;
+            text-decoration: none;
+            font-size: 13px;
+            cursor: pointer;
+            transition: color 0.2s;
+        }
 
-        .tab-content { display: none; overflow-y: auto; max-height: calc(100vh - 180px); }
-        .tab-content.active { display: block; }
+        .nav-links a:hover {
+            color: #DADADA;
+        }
 
-        .status-bar { display: flex; justify-content: space-between; padding: 6px 16px; background: var(--bg-card); border-top: 1px solid var(--border); font-size: 11px; color: var(--text-muted); position: fixed; bottom: 0; left: 0; right: 0; }
-        .live-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--green); display: inline-block; margin-right: 4px; animation: pulse 2s infinite; }
-        @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+        .nav-links a.active-nav {
+            color: #05B878;
+        }
 
-        .loading { text-align: center; padding: 40px; color: var(--text-muted); }
+        .right-nav {
+            display: flex;
+            align-items: center;
+            gap: 20px;
+            margin-left: auto;
+        }
 
-        /* Connection Status Bar */
-        .conn-bar { display: flex; gap: 12px; padding: 4px 16px; background: var(--bg); border-bottom: 1px solid var(--border); font-size: 11px; align-items: center; flex-wrap: wrap; }
-        .conn-item { display: flex; align-items: center; gap: 4px; }
-        .conn-dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
-        .conn-dot.up { background: var(--green); }
-        .conn-dot.down { background: var(--red); }
-        .conn-dot.partial { background: var(--yellow); }
-        .conn-label { color: var(--text-muted); }
-        .conn-value { color: var(--text-dim); font-weight: 500; }
+        .live-indicator {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            font-size: 12px;
+            color: #8E8E8E;
+        }
+
+        .live-dot {
+            width: 8px;
+            height: 8px;
+            background-color: #05B878;
+            border-radius: 50%;
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        .icon-button {
+            background: none;
+            border: none;
+            color: #8E8E8E;
+            cursor: pointer;
+            font-size: 18px;
+        }
+
+        .user-avatar {
+            width: 32px;
+            height: 32px;
+            border-radius: 50%;
+            background: linear-gradient(135deg, #9370db, #6a4c93);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-weight: bold;
+            font-size: 14px;
+            cursor: pointer;
+        }
+
+        /* ============ INDEX TICKER BAR ============ */
+        .index-ticker {
+            display: flex;
+            background-color: #181818;
+            border-bottom: 1px solid #242424;
+            padding: 8px 20px;
+            gap: 40px;
+            overflow-x: auto;
+            font-size: 12px;
+        }
+
+        .ticker-item {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            min-width: max-content;
+        }
+
+        .ticker-name {
+            color: #8E8E8E;
+            font-size: 12px;
+        }
+
+        .ticker-value {
+            color: #DADADA;
+            font-size: 12px;
+        }
+
+        .ticker-change {
+            font-size: 12px;
+        }
+
+        .ticker-change.up { color: #05B878; }
+        .ticker-change.down { color: #DD6565; }
+
+        /* ============ MAIN CONTAINER ============ */
+        .main-container {
+            display: flex;
+            height: calc(100vh - 60px - 40px);
+        }
+
+        /* ============ LEFT SIDEBAR (WATCHLIST) ============ */
+        .sidebar {
+            width: 348px;
+            min-width: 280px;
+            background-color: #000000;
+            border-right: 1px solid #242424;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        .sidebar-header {
+            padding: 12px 16px;
+            border-bottom: 1px solid #242424;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .sidebar-header-title {
+            font-size: 13px;
+            color: #8E8E8E;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .sidebar-actions {
+            display: flex;
+            gap: 8px;
+        }
+
+        .sidebar-action-btn {
+            background: none;
+            border: none;
+            color: #8E8E8E;
+            cursor: pointer;
+            font-size: 14px;
+        }
+
+        .sidebar-search {
+            padding: 8px 12px;
+            border-bottom: 1px solid #242424;
+        }
+
+        .sidebar-search input {
+            width: 100%;
+            background-color: #181818;
+            border: 1px solid #242424;
+            border-radius: 4px;
+            padding: 6px 10px;
+            color: #DADADA;
+            font-size: 12px;
+        }
+
+        .sidebar-search input::placeholder {
+            color: #8E8E8E;
+        }
+
+        .sidebar-items {
+            flex: 1;
+            overflow-y: auto;
+        }
+
+        .sidebar-item {
+            padding: 8px 12px;
+            border-bottom: 1px solid #1a1a1a;
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            transition: background-color 0.15s;
+        }
+
+        .sidebar-item:hover {
+            background-color: #0a0a0a;
+        }
+
+        .sidebar-item-color-bar {
+            width: 3px;
+            height: 32px;
+            border-radius: 2px;
+            flex-shrink: 0;
+        }
+
+        .sidebar-item-color-bar.up { background-color: #05B878; }
+        .sidebar-item-color-bar.down { background-color: #DD6565; }
+
+        .sidebar-item-info {
+            flex: 1;
+            min-width: 0;
+        }
+
+        .sidebar-item-name {
+            font-size: 13px;
+            color: #DADADA;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .sidebar-item-exchange {
+            font-size: 11px;
+            color: #8E8E8E;
+        }
+
+        .sidebar-item-right {
+            text-align: right;
+        }
+
+        .sidebar-item-price {
+            font-size: 13px;
+            color: #DADADA;
+        }
+
+        .sidebar-item-change {
+            font-size: 11px;
+        }
+
+        .sidebar-item-change.up { color: #05B878; }
+        .sidebar-item-change.down { color: #DD6565; }
+
+        /* ============ MAIN CONTENT ============ */
+        .content {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            background-color: #000000;
+        }
+
+        /* ============ MAIN TABS (8 tabs) ============ */
+        .main-tabs {
+            display: flex;
+            gap: 0;
+            padding: 8px 16px;
+            background-color: #000000;
+            border-bottom: 1px solid #242424;
+            align-items: center;
+        }
+
+        .main-tab {
+            padding: 5px 20px;
+            color: #8E8E8E;
+            font-size: 14px;
+            font-weight: 400;
+            border: none;
+            background-color: #181818;
+            cursor: pointer;
+            transition: color 0.2s, background-color 0.2s;
+            height: 36px;
+            display: flex;
+            align-items: center;
+            white-space: nowrap;
+        }
+
+        .main-tab:hover {
+            color: #DADADA;
+        }
+
+        .main-tab.active {
+            color: #05B878;
+            background-color: #1C2C27;
+            border: 1px solid #138C61;
+            border-radius: 8px;
+        }
+
+        /* ============ SUB-TABS (under Stocks) ============ */
+        .sub-tabs {
+            display: flex;
+            gap: 0;
+            padding: 8px 16px;
+            background-color: #000000;
+            border-bottom: 1px solid #242424;
+            overflow-x: auto;
+            align-items: center;
+        }
+
+        .sub-tab {
+            padding: 4px 16px;
+            color: #8E8E8E;
+            font-size: 13px;
+            font-weight: 400;
+            border: none;
+            background-color: transparent;
+            cursor: pointer;
+            transition: color 0.2s;
+            height: 32px;
+            display: flex;
+            align-items: center;
+            white-space: nowrap;
+        }
+
+        .sub-tab:hover {
+            color: #DADADA;
+        }
+
+        .sub-tab.active {
+            color: #05B878;
+            border-bottom: 2px solid #05B878;
+        }
+
+        /* ============ FILTER BAR ============ */
+        .filter-bar {
+            display: flex;
+            gap: 12px;
+            padding: 10px 16px;
+            background-color: #000000;
+            border-bottom: 1px solid #242424;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+
+        .exchange-filter {
+            display: flex;
+            gap: 0;
+            border: 1px solid #242424;
+            border-radius: 4px;
+            overflow: hidden;
+        }
+
+        .exchange-btn {
+            padding: 5px 14px;
+            font-size: 12px;
+            color: #8E8E8E;
+            background-color: #181818;
+            border: none;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .exchange-btn.active {
+            color: #DADADA;
+            background-color: #242424;
+        }
+
+        .exchange-btn:not(:last-child) {
+            border-right: 1px solid #242424;
+        }
+
+        .mode-filter {
+            display: flex;
+            gap: 0;
+            border: 1px solid #242424;
+            border-radius: 4px;
+            overflow: hidden;
+            margin-left: 8px;
+        }
+
+        .mode-btn {
+            padding: 5px 14px;
+            font-size: 12px;
+            color: #8E8E8E;
+            background-color: #181818;
+            border: none;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .mode-btn.active {
+            color: #DADADA;
+            background-color: #242424;
+        }
+
+        .mode-btn:not(:last-child) {
+            border-right: 1px solid #242424;
+        }
+
+        .filter-separator {
+            width: 1px;
+            height: 20px;
+            background-color: #242424;
+            margin: 0 4px;
+        }
+
+        .data-status {
+            margin-left: auto;
+            font-size: 11px;
+            color: #8E8E8E;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .data-status .dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background-color: #05B878;
+        }
+
+        /* ============ TABLE ============ */
+        .table-container {
+            flex: 1;
+            overflow: auto;
+            background-color: #000000;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: separate;
+            border-spacing: 0;
+            table-layout: auto;
+            background-color: transparent;
+        }
+
+        thead {
+            position: sticky;
+            top: 0;
+            z-index: 10;
+        }
+
+        th {
+            padding: 1px 8px 0px 0px;
+            text-align: right;
+            font-size: 14px;
+            color: #8E8E8E;
+            font-weight: 300;
+            border-bottom: 1px solid #242424;
+            background-color: #181818;
+            cursor: pointer;
+            white-space: nowrap;
+            height: 42px;
+            vertical-align: middle;
+        }
+
+        th:first-child {
+            text-align: left;
+            padding: 1px 9px 0px 10px;
+            border-right: 1px solid #242424;
+        }
+
+        th .sort-icon {
+            font-size: 10px;
+            margin-left: 4px;
+            opacity: 0.5;
+        }
+
+        th:hover .sort-icon {
+            opacity: 1;
+        }
+
+        td {
+            padding: 0px 8px 0px 0px;
+            font-size: 14px;
+            color: #8E8E8E;
+            font-weight: 400;
+            border-bottom: 0.5px solid #242424;
+            height: 42px;
+            background-color: #121212;
+            text-align: right;
+            vertical-align: middle;
+        }
+
+        td:first-child {
+            padding: 0px 9px 0px 10px;
+            text-align: left;
+            color: #DADADA;
+            border-right: 1px solid #242424;
+        }
+
+        tbody tr {
+            cursor: pointer;
+        }
+
+        tbody tr:hover td {
+            background-color: #0a0a0a;
+        }
+
+        .up { color: #5CA81D; }
+        .down { color: #DD6565; }
+
+        /* ============ EMPTY STATE ============ */
+        .empty-state {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 300px;
+            color: #8E8E8E;
+            font-size: 14px;
+            gap: 8px;
+        }
+
+        .empty-state .icon {
+            font-size: 32px;
+            opacity: 0.5;
+        }
+
+        /* ============ LOADING ============ */
+        .loading-row td {
+            text-align: center;
+            color: #8E8E8E;
+            font-size: 13px;
+            height: 60px;
+        }
+
+        @keyframes shimmer {
+            0% { opacity: 0.3; }
+            50% { opacity: 0.7; }
+            100% { opacity: 0.3; }
+        }
+
+        .loading-text {
+            animation: shimmer 1.5s infinite;
+        }
+
+        /* ============ SCROLLBAR ============ */
+        ::-webkit-scrollbar {
+            width: 6px;
+            height: 6px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: #000000;
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: #333;
+            border-radius: 3px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: #444;
+        }
+
+        /* ============ RESPONSIVE ============ */
+        @media (max-width: 1200px) {
+            .sidebar {
+                width: 280px;
+            }
+        }
+
+        @media (max-width: 768px) {
+            .main-container {
+                flex-direction: column;
+            }
+            .sidebar {
+                width: 100%;
+                height: 150px;
+                border-right: none;
+                border-bottom: 1px solid #242424;
+            }
+        }
     </style>
 </head>
 <body>
-    <!-- Index Ticker Bar -->
-    <div class="ticker-bar" id="tickerBar">
-        <div class="ticker-item"><span class="ticker-name">Loading...</span></div>
-    </div>
-
-    <!-- Connection Status Bar -->
-    <div class="conn-bar" id="connBar">
-        <div class="conn-item"><span class="conn-dot down"></span><span class="conn-label">Live Feed:</span><span class="conn-value" id="connWs">--</span></div>
-        <div class="conn-item"><span class="conn-dot down"></span><span class="conn-label">Depth 20:</span><span class="conn-value" id="connD20">--</span></div>
-        <div class="conn-item"><span class="conn-dot down"></span><span class="conn-label">Depth 200:</span><span class="conn-value" id="connD200">--</span></div>
-        <div class="conn-item"><span class="conn-dot down"></span><span class="conn-label">Order WS:</span><span class="conn-value" id="connOrder">--</span></div>
-        <div class="conn-item"><span class="conn-dot down"></span><span class="conn-label">QuestDB:</span><span class="conn-value" id="connQdb">--</span></div>
-        <div class="conn-item"><span class="conn-dot down"></span><span class="conn-label">Token:</span><span class="conn-value" id="connToken">--</span></div>
-        <div class="conn-item"><span class="conn-dot down"></span><span class="conn-label">Pipeline:</span><span class="conn-value" id="connPipeline">--</span></div>
-    </div>
-
-    <!-- Header -->
-    <div class="header">
-        <div style="display:flex;align-items:center;gap:16px">
-            <a class="back" href="/portal">&larr; Portal</a>
-            <h1><span>DLT</span> Market Dashboard</h1>
+    <!-- TOP NAV -->
+    <div class="top-nav">
+        <div class="logo">D</div>
+        <input type="text" class="search-bar" placeholder="Search eg: Infy, Nifty Fut, Nifty 24000 CE">
+        <div class="nav-links">
+            <a href="#">Home</a>
+            <a href="#">Portfolio</a>
+            <a href="#">Positions</a>
+            <a href="#">Orders</a>
+            <a href="#">Money</a>
+            <a href="#" class="active-nav">Markets</a>
+            <a href="#">News</a>
+            <a href="#">IPOs</a>
         </div>
-        <div class="meta">
-            <span><span class="live-dot"></span> <span id="marketStatus">Connecting...</span></span>
-            <span id="lastUpdate">--</span>
+        <div class="right-nav">
+            <div class="live-indicator">
+                <div class="live-dot"></div>
+                <span>LIVE</span>
+            </div>
+            <button class="icon-button">&#9881;</button>
+            <div class="user-avatar">P</div>
         </div>
     </div>
 
-    <!-- Main Tabs -->
-    <div class="tabs">
-        <div class="tab active" onclick="switchTab('stocks')">Stocks</div>
-        <div class="tab" onclick="switchTab('options')">Options</div>
-        <div class="tab" onclick="switchTab('index')">Index</div>
+    <!-- INDEX TICKER BAR -->
+    <div class="index-ticker" id="index-ticker">
+        <div class="ticker-item">
+            <span class="ticker-name">Nifty 50</span>
+            <span class="ticker-value" id="idx-nifty50">--</span>
+            <span class="ticker-change" id="idx-nifty50-chg">--</span>
+        </div>
+        <div class="ticker-item">
+            <span class="ticker-name">Nifty Bank</span>
+            <span class="ticker-value" id="idx-banknifty">--</span>
+            <span class="ticker-change" id="idx-banknifty-chg">--</span>
+        </div>
+        <div class="ticker-item">
+            <span class="ticker-name">Fin Nifty</span>
+            <span class="ticker-value" id="idx-finnifty">--</span>
+            <span class="ticker-change" id="idx-finnifty-chg">--</span>
+        </div>
+        <div class="ticker-item">
+            <span class="ticker-name">India VIX</span>
+            <span class="ticker-value" id="idx-vix">--</span>
+            <span class="ticker-change" id="idx-vix-chg">--</span>
+        </div>
+        <div class="ticker-item">
+            <span class="ticker-name">Sensex</span>
+            <span class="ticker-value" id="idx-sensex">--</span>
+            <span class="ticker-change" id="idx-sensex-chg">--</span>
+        </div>
+        <div class="ticker-item">
+            <span class="ticker-name">Nifty IT</span>
+            <span class="ticker-value" id="idx-niftyit">--</span>
+            <span class="ticker-change" id="idx-niftyit-chg">--</span>
+        </div>
     </div>
 
-    <!-- STOCKS TAB -->
-    <div class="tab-content active" id="tab-stocks">
-        <div class="sub-tabs">
-            <div class="sub-tab active" data-stock-sub="losers" onclick="switchStockSub('losers')">Price Losers</div>
-            <div class="sub-tab" data-stock-sub="gainers" onclick="switchStockSub('gainers')">Price Gainers</div>
-            <div class="sub-tab" data-stock-sub="most_active" onclick="switchStockSub('most_active')">Most Active</div>
-            <div class="toggle-group">
-                <div class="toggle-btn active-green" id="toggleGainers" onclick="toggleGainersLosers('gainers')">Gainers</div>
-                <div class="toggle-sep"></div>
-                <div class="toggle-btn active-red" id="toggleLosers" onclick="toggleGainersLosers('losers')">Losers</div>
+    <!-- MAIN CONTAINER -->
+    <div class="main-container">
+        <!-- LEFT SIDEBAR: WATCHLIST -->
+        <div class="sidebar">
+            <div class="sidebar-header">
+                <div class="sidebar-header-title">
+                    <span>Watchlist</span>
+                    <span style="color:#8E8E8E;font-size:11px;">&#9662;</span>
+                </div>
+                <div class="sidebar-actions">
+                    <button class="sidebar-action-btn" title="Search">&#128269;</button>
+                    <button class="sidebar-action-btn" title="Settings">&#8943;</button>
+                </div>
+            </div>
+            <div class="sidebar-search">
+                <input type="text" placeholder="Search stocks..." id="sidebar-search-input">
+            </div>
+            <div class="sidebar-items" id="sidebar-items">
+                <!-- Populated by JS -->
             </div>
         </div>
-        <table class="data-table">
-            <thead>
-                <tr>
-                    <th>Name</th>
-                    <th>LTP</th>
-                    <th>Change</th>
-                    <th>Change %</th>
-                    <th>Volume</th>
-                </tr>
-            </thead>
-            <tbody id="stockBody">
-                <tr><td colspan="5" class="loading">Loading...</td></tr>
-            </tbody>
-        </table>
-    </div>
 
-    <!-- OPTIONS TAB -->
-    <div class="tab-content" id="tab-options">
-        <div class="sub-tabs">
-            <div class="sub-tab active" data-opt-sub="HIGHEST_OI" onclick="switchOptionSub('HIGHEST_OI')">Highest OI</div>
-            <div class="sub-tab" data-opt-sub="OI_GAINER" onclick="switchOptionSub('OI_GAINER')">OI Gainers</div>
-            <div class="sub-tab" data-opt-sub="OI_LOSER" onclick="switchOptionSub('OI_LOSER')">OI Losers</div>
-            <div class="sub-tab" data-opt-sub="TOP_VOLUME" onclick="switchOptionSub('TOP_VOLUME')">Top Volume</div>
-            <div class="sub-tab" data-opt-sub="PRICE_GAINER" onclick="switchOptionSub('PRICE_GAINER')">Price Gainers</div>
-            <div class="sub-tab" data-opt-sub="PRICE_LOSER" onclick="switchOptionSub('PRICE_LOSER')">Price Losers</div>
+        <!-- MAIN CONTENT AREA -->
+        <div class="content">
+            <!-- 8 MAIN TABS -->
+            <div class="main-tabs">
+                <button class="main-tab" data-tab="live">Live</button>
+                <button class="main-tab" data-tab="options">Options</button>
+                <button class="main-tab active" data-tab="stocks">Stocks</button>
+                <button class="main-tab" data-tab="commodity">Commodity</button>
+                <button class="main-tab" data-tab="futures">Futures</button>
+                <button class="main-tab" data-tab="etfs">ETFs</button>
+                <button class="main-tab" data-tab="bonds">Bonds</button>
+                <button class="main-tab" data-tab="index">Index</button>
+            </div>
+
+            <!-- SUB-TABS (for Stocks tab) -->
+            <div class="sub-tabs" id="stocks-sub-tabs">
+                <button class="sub-tab active" data-subtab="intraday-movers">Intraday Movers</button>
+                <button class="sub-tab" data-subtab="outperformers">Outperformers</button>
+                <button class="sub-tab" data-subtab="mtf">MTF</button>
+                <button class="sub-tab" data-subtab="extreme-openings">Extreme Openings</button>
+                <button class="sub-tab" data-subtab="price-movers">Price Movers</button>
+                <button class="sub-tab" data-subtab="breakouts">Breakouts</button>
+                <button class="sub-tab" data-subtab="by-value">By Value</button>
+                <button class="sub-tab" data-subtab="by-volume">By Volume</button>
+                <button class="sub-tab" data-subtab="circuit-breakers">Circuit Breakers</button>
+            </div>
+
+            <!-- FILTER BAR -->
+            <div class="filter-bar" id="stocks-filter-bar">
+                <div class="exchange-filter">
+                    <button class="exchange-btn active" data-exchange="nse">NSE</button>
+                    <button class="exchange-btn" data-exchange="bse">BSE</button>
+                </div>
+
+                <div class="filter-separator"></div>
+
+                <div class="mode-filter">
+                    <button class="mode-btn active" data-mode="rise-fall">Rise &amp; Fall</button>
+                    <button class="mode-btn" data-mode="recovery">Recovery</button>
+                </div>
+
+                <div class="data-status">
+                    <span class="dot"></span>
+                    <span id="data-timestamp">Live Data</span>
+                </div>
+            </div>
+
+            <!-- DATA TABLE -->
+            <div class="table-container">
+                <table id="data-table">
+                    <thead>
+                        <tr>
+                            <th>Name <span class="sort-icon">&#9650;&#9660;</span></th>
+                            <th>LTP <span class="sort-icon">&#9650;&#9660;</span></th>
+                            <th>Change <span class="sort-icon">&#9650;&#9660;</span></th>
+                            <th>Change % <span class="sort-icon">&#9650;&#9660;</span></th>
+                            <th>Value (Cr.) <span class="sort-icon">&#9650;&#9660;</span></th>
+                            <th>Volume <span class="sort-icon">&#9650;&#9660;</span></th>
+                        </tr>
+                    </thead>
+                    <tbody id="table-body">
+                        <tr class="loading-row">
+                            <td colspan="6" style="text-align:center;">
+                                <span class="loading-text">Loading market data...</span>
+                            </td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
         </div>
-        <table class="data-table">
-            <thead>
-                <tr>
-                    <th>Name</th>
-                    <th>Spot Price</th>
-                    <th>LTP</th>
-                    <th>Change</th>
-                    <th>Change %</th>
-                    <th>Open Interest</th>
-                    <th>OI Change</th>
-                    <th>OI Change %</th>
-                    <th>Volume</th>
-                </tr>
-            </thead>
-            <tbody id="optionBody">
-                <tr><td colspan="9" class="loading">Loading...</td></tr>
-            </tbody>
-        </table>
     </div>
 
-    <!-- INDEX TAB -->
-    <div class="tab-content" id="tab-index">
-        <div class="sub-tabs">
-            <div class="sub-tab active">NSE</div>
-        </div>
-        <table class="data-table">
-            <thead>
-                <tr>
-                    <th>Name</th>
-                    <th>LTP</th>
-                    <th>Change</th>
-                    <th>Change %</th>
-                    <th>Open</th>
-                    <th>High</th>
-                    <th>Low</th>
-                    <th>Prev. Close</th>
-                </tr>
-            </thead>
-            <tbody id="indexBody">
-                <tr><td colspan="8" class="loading">Loading...</td></tr>
-            </tbody>
-        </table>
-    </div>
+    <script>
+        // ============ STATE ============
+        let currentMainTab = 'stocks';
+        let currentSubTab = 'intraday-movers';
+        let currentExchange = 'nse';
+        let currentMode = 'rise-fall';
+        let sortColumn = null;
+        let sortDir = 'desc';
+        let stockData = { gainers: [], losers: [], most_active: [] };
+        let refreshInterval = null;
 
-    <!-- Status Bar -->
-    <div class="status-bar">
-        <span>DLT Market Dashboard v0.2.0</span>
-        <span>Auto-refresh: 3s | <a href="/portal/options-chain" style="color:var(--blue);text-decoration:none">Options Chain</a> | <a href="/portal" style="color:var(--blue);text-decoration:none">Control Panel</a></span>
-    </div>
+        // ============ WATCHLIST DATA ============
+        const watchlistStocks = [
+            { name: 'Adani Ports', exchange: 'NSE', price: 1285.50, change: +18.30, changePct: +1.44 },
+            { name: 'ICICI Bank', exchange: 'NSE', price: 1372.90, change: +12.55, changePct: +0.92 },
+            { name: 'HDFC Bank', exchange: 'NSE', price: 1895.20, change: -8.40, changePct: -0.44 },
+            { name: 'Reliance', exchange: 'NSE', price: 1268.75, change: +22.15, changePct: +1.78 },
+            { name: 'TCS', exchange: 'NSE', price: 3542.00, change: -15.60, changePct: -0.44 },
+            { name: 'Infosys', exchange: 'NSE', price: 1487.30, change: +9.85, changePct: +0.67 },
+            { name: 'Bharti Airtel', exchange: 'NSE', price: 1725.40, change: +31.20, changePct: +1.84 },
+            { name: 'SBI', exchange: 'NSE', price: 812.65, change: -3.90, changePct: -0.48 },
+            { name: 'ITC', exchange: 'NSE', price: 428.50, change: +5.10, changePct: +1.20 },
+            { name: 'Tata Motors', exchange: 'NSE', price: 652.30, change: +14.75, changePct: +2.31 },
+            { name: 'Axis Bank', exchange: 'NSE', price: 1156.80, change: -6.25, changePct: -0.54 },
+            { name: 'HUL', exchange: 'NSE', price: 2378.10, change: +4.50, changePct: +0.19 },
+            { name: 'L&T', exchange: 'NSE', price: 3412.90, change: +28.60, changePct: +0.85 },
+            { name: 'Wipro', exchange: 'NSE', price: 245.70, change: -1.80, changePct: -0.73 },
+            { name: 'Kotak Mahindra', exchange: 'NSE', price: 1834.50, change: +11.20, changePct: +0.61 },
+        ];
 
-<script>
-// State
-var currentStockSub = 'losers';
-var currentOptionSub = 'HIGHEST_OI';
-var refreshTimer = null;
+        // ============ FORMAT HELPERS ============
+        function formatINR(num) {
+            if (num == null || isNaN(num)) return '--';
+            return Number(num).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+        }
 
-// XSS prevention: escape HTML entities in API-sourced strings before innerHTML
-function esc(s) {
-    if (s == null) return '';
-    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
-}
+        function formatVolume(num) {
+            if (num == null || isNaN(num)) return '--';
+            return Number(num).toLocaleString('en-IN');
+        }
 
-// Formatters
-function fmt(v, d) { d = d || 2; return v != null && isFinite(v) ? Number(v).toLocaleString('en-IN', {minimumFractionDigits: d, maximumFractionDigits: d}) : '--'; }
-function fmtInt(v) { return v != null ? Number(v).toLocaleString('en-IN') : '--'; }
-function fmtOI(v) {
-    if (v == null) return '--';
-    var abs = Math.abs(v);
-    if (abs >= 10000000) return (v/10000000).toFixed(2) + 'Cr';
-    if (abs >= 100000) return (v/100000).toFixed(2) + 'L';
-    return Number(v).toLocaleString('en-IN');
-}
-function cls(v) { return v > 0 ? 'positive' : v < 0 ? 'negative' : 'dim'; }
-function sign(v) { return v > 0 ? '+' : ''; }
+        function formatCrore(num) {
+            if (num == null || isNaN(num)) return '--';
+            // Approximate value in crores from volume * ltp
+            const cr = num / 10000000;
+            if (cr >= 1) return cr.toFixed(2);
+            return cr.toFixed(4);
+        }
 
-// Tab switching
-function switchTab(name) {
-    document.querySelectorAll('.tab').forEach(function(t,i) {
-        t.classList.toggle('active', ['stocks','options','index'][i] === name);
-    });
-    document.querySelectorAll('.tab-content').forEach(function(c) {
-        c.classList.toggle('active', c.id === 'tab-' + name);
-    });
-}
+        function getChangeClass(val) {
+            if (val > 0) return 'up';
+            if (val < 0) return 'down';
+            return '';
+        }
 
-function switchStockSub(sub) {
-    currentStockSub = sub;
-    document.querySelectorAll('[data-stock-sub]').forEach(function(t) {
-        t.classList.toggle('active', t.getAttribute('data-stock-sub') === sub);
-    });
-    fetchStockMovers();
-}
+        function getChangeSign(val) {
+            return val > 0 ? '+' : '';
+        }
 
-function switchOptionSub(cat) {
-    currentOptionSub = cat;
-    document.querySelectorAll('[data-opt-sub]').forEach(function(t) {
-        t.classList.toggle('active', t.getAttribute('data-opt-sub') === cat);
-    });
-    fetchOptionMovers();
-}
+        // ============ RENDER WATCHLIST ============
+        function renderWatchlist(filter = '') {
+            const container = document.getElementById('sidebar-items');
+            const filtered = filter
+                ? watchlistStocks.filter(s => s.name.toLowerCase().includes(filter.toLowerCase()))
+                : watchlistStocks;
 
-function toggleGainersLosers(which) {
-    if (which === 'gainers') {
-        switchStockSub('gainers');
-    } else {
-        switchStockSub('losers');
-    }
-}
+            container.innerHTML = filtered.map(s => `
+                <div class="sidebar-item">
+                    <div class="sidebar-item-color-bar ${s.change >= 0 ? 'up' : 'down'}"></div>
+                    <div class="sidebar-item-info">
+                        <div class="sidebar-item-name">${s.name}</div>
+                        <div class="sidebar-item-exchange">${s.exchange}</div>
+                    </div>
+                    <div class="sidebar-item-right">
+                        <div class="sidebar-item-price">${formatINR(s.price)}</div>
+                        <div class="sidebar-item-change ${getChangeClass(s.change)}">${getChangeSign(s.change)}${s.change.toFixed(2)} (${getChangeSign(s.changePct)}${s.changePct.toFixed(2)}%)</div>
+                    </div>
+                </div>
+            `).join('');
+        }
 
-// Data fetchers
-function fetchIndices() {
-    fetch('/api/market/indices')
-        .then(function(r) { return r.json(); })
-        .then(function(d) {
-            if (!d.available) return;
-            // Ticker bar - top 5 major indices
-            var majorIds = [13, 25, 27, 21, 442];
-            var bar = '';
-            var majors = d.indices.filter(function(i) { return majorIds.indexOf(i.security_id) >= 0; });
-            majors.sort(function(a,b) { return majorIds.indexOf(a.security_id) - majorIds.indexOf(b.security_id); });
-            majors.forEach(function(idx) {
-                var c = idx.change >= 0 ? 'positive' : 'negative';
-                var arrow = idx.change >= 0 ? '&#9650;' : '&#9660;';
-                bar += '<div class="ticker-item">';
-                bar += '<span class="ticker-name">' + esc(idx.name) + '</span>';
-                bar += '<span class="ticker-price">' + fmt(idx.ltp, 2) + '</span>';
-                bar += '<span class="ticker-change ' + c + '">' + arrow + ' ' + sign(idx.change) + fmt(idx.change, 2) + ' (' + sign(idx.change_pct) + fmt(idx.change_pct, 2) + '%)</span>';
-                bar += '</div>';
+        // ============ RENDER TABLE ============
+        function renderTable(data) {
+            const tbody = document.getElementById('table-body');
+
+            if (!data || data.length === 0) {
+                tbody.innerHTML = `
+                    <tr>
+                        <td colspan="6" style="text-align:center;height:200px;color:#8E8E8E;">
+                            No data available for this category
+                        </td>
+                    </tr>`;
+                return;
+            }
+
+            // Filter out non-stock items (exclude FUT, CALL, PUT, options from stock movers)
+            let filtered = data.filter(item => {
+                const sym = item.symbol || '';
+                // Exclude anything with CALL, PUT, FUT, CE, PE keywords
+                if (/\b(CALL|PUT|FUT|CE|PE)\b/i.test(sym)) return false;
+                // Exclude anything with date-like patterns (e.g. "28 APR", "13 APR")
+                if (/\d{1,2}\s+(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\b/i.test(sym)) return false;
+                // Exclude anything with strike price patterns (number at end after space)
+                if (/\s\d{3,6}\s/i.test(sym)) return false;
+                return true;
             });
-            document.getElementById('tickerBar').innerHTML = bar || '<div class="ticker-item"><span class="ticker-name">No data</span></div>';
 
-            // Index tab
-            var html = '';
-            d.indices.forEach(function(idx) {
-                var c = cls(idx.change);
-                html += '<tr>';
-                html += '<td>' + esc(idx.name) + '</td>';
-                html += '<td>' + fmt(idx.ltp, 2) + '</td>';
-                html += '<td class="' + c + '">' + sign(idx.change) + fmt(idx.change, 2) + '</td>';
-                html += '<td class="' + c + '">' + sign(idx.change_pct) + fmt(idx.change_pct, 2) + ' %</td>';
-                html += '<td>' + fmt(idx.open, 2) + '</td>';
-                html += '<td>' + fmt(idx.high, 2) + '</td>';
-                html += '<td>' + fmt(idx.low, 2) + '</td>';
-                html += '<td>' + fmt(idx.prev_close, 2) + '</td>';
-                html += '</tr>';
+            // If no pure stocks found, show message (don't fall back to showing derivatives)
+            if (filtered.length === 0) {
+                tbody.innerHTML = `
+                    <tr>
+                        <td colspan="6" style="text-align:center;height:200px;color:#8E8E8E;">
+                            No stock-only data available. API returned ${data.length} items (derivatives/futures excluded).
+                        </td>
+                    </tr>`;
+                return;
+            }
+
+            // Sort if needed
+            if (sortColumn !== null) {
+                filtered.sort((a, b) => {
+                    let valA, valB;
+                    switch (sortColumn) {
+                        case 0: valA = (a.symbol || '').toLowerCase(); valB = (b.symbol || '').toLowerCase();
+                            return sortDir === 'asc' ? valA.localeCompare(valB) : valB.localeCompare(valA);
+                        case 1: valA = a.ltp || 0; valB = b.ltp || 0; break;
+                        case 2: valA = a.change || 0; valB = b.change || 0; break;
+                        case 3: valA = a.change_pct || 0; valB = b.change_pct || 0; break;
+                        case 4: valA = (a.ltp || 0) * (a.volume || 0); valB = (b.ltp || 0) * (b.volume || 0); break;
+                        case 5: valA = a.volume || 0; valB = b.volume || 0; break;
+                        default: return 0;
+                    }
+                    if (sortColumn > 0) return sortDir === 'asc' ? valA - valB : valB - valA;
+                    return 0;
+                });
+            }
+
+            tbody.innerHTML = filtered.map(item => {
+                const chgClass = getChangeClass(item.change_pct);
+                const chgSign = getChangeSign(item.change);
+                const pctSign = getChangeSign(item.change_pct);
+                const valueCr = ((item.ltp || 0) * (item.volume || 0)) / 10000000;
+
+                return `<tr>
+                    <td>${item.symbol || '--'}</td>
+                    <td>${formatINR(item.ltp)}</td>
+                    <td class="${chgClass}">${chgSign}${formatINR(item.change)}</td>
+                    <td class="${chgClass}">${pctSign}${(item.change_pct || 0).toFixed(2)}%</td>
+                    <td>${valueCr >= 0.01 ? valueCr.toFixed(2) : '--'}</td>
+                    <td>${formatVolume(item.volume)}</td>
+                </tr>`;
+            }).join('');
+        }
+
+        // ============ FETCH DATA ============
+        async function fetchStockMovers() {
+            try {
+                const resp = await fetch('/api/market/stock-movers');
+                if (!resp.ok) throw new Error('API error: ' + resp.status);
+                const data = await resp.json();
+                stockData = data;
+
+                // Combine all available data, prioritizing based on mode
+                let displayData = [];
+                if (currentMode === 'rise-fall') {
+                    // Show gainers first, then most_active, then losers
+                    displayData = [
+                        ...(data.gainers || []),
+                        ...(data.most_active || []),
+                        ...(data.losers || [])
+                    ];
+                } else {
+                    // Recovery mode - show losers first, then most_active, then gainers
+                    displayData = [
+                        ...(data.losers || []),
+                        ...(data.most_active || []),
+                        ...(data.gainers || [])
+                    ];
+                }
+                // De-duplicate by symbol
+                const seen = new Set();
+                displayData = displayData.filter(item => {
+                    if (seen.has(item.symbol)) return false;
+                    seen.add(item.symbol);
+                    return true;
+                });
+
+                renderTable(displayData);
+
+                // Update timestamp
+                const now = new Date();
+                document.getElementById('data-timestamp').textContent =
+                    'Updated ' + now.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+
+            } catch (err) {
+                console.error('Failed to fetch stock movers:', err);
+                document.getElementById('table-body').innerHTML = `
+                    <tr>
+                        <td colspan="6" style="text-align:center;height:100px;color:#DD6565;">
+                            Failed to load data. Retrying...
+                        </td>
+                    </tr>`;
+                // Retry after 3 seconds
+                setTimeout(fetchStockMovers, 3000);
+            }
+        }
+
+        async function fetchIndices() {
+            try {
+                const resp = await fetch('/api/market/indices');
+                if (!resp.ok) return;
+                const data = await resp.json();
+                // If the API returns index data, populate the ticker bar
+                if (data && Array.isArray(data.indices)) {
+                    data.indices.forEach(idx => {
+                        // Try to match known indices
+                        const name = (idx.symbol || idx.name || '').toLowerCase();
+                        let elVal, elChg;
+                        if (name.includes('nifty 50') || name.includes('nifty50')) {
+                            elVal = document.getElementById('idx-nifty50');
+                            elChg = document.getElementById('idx-nifty50-chg');
+                        } else if (name.includes('bank') && name.includes('nifty')) {
+                            elVal = document.getElementById('idx-banknifty');
+                            elChg = document.getElementById('idx-banknifty-chg');
+                        } else if (name.includes('fin') && name.includes('nifty')) {
+                            elVal = document.getElementById('idx-finnifty');
+                            elChg = document.getElementById('idx-finnifty-chg');
+                        }
+                        if (elVal && idx.ltp) {
+                            elVal.textContent = formatINR(idx.ltp);
+                        }
+                        if (elChg && idx.change_pct != null) {
+                            const cls = idx.change_pct >= 0 ? 'up' : 'down';
+                            elChg.className = 'ticker-change ' + cls;
+                            elChg.textContent = (idx.change_pct >= 0 ? '+' : '') + idx.change_pct.toFixed(2) + '%';
+                        }
+                    });
+                }
+            } catch (err) {
+                console.error('Failed to fetch indices:', err);
+            }
+        }
+
+        // ============ MAIN TAB SWITCHING ============
+        document.querySelectorAll('.main-tab').forEach(tab => {
+            tab.addEventListener('click', function() {
+                document.querySelectorAll('.main-tab').forEach(t => t.classList.remove('active'));
+                this.classList.add('active');
+                currentMainTab = this.getAttribute('data-tab');
+
+                // Show/hide sub-tabs and filter bar based on main tab
+                const subTabs = document.getElementById('stocks-sub-tabs');
+                const filterBar = document.getElementById('stocks-filter-bar');
+
+                if (currentMainTab === 'stocks') {
+                    subTabs.style.display = 'flex';
+                    filterBar.style.display = 'flex';
+                    fetchStockMovers();
+                } else {
+                    subTabs.style.display = 'none';
+                    filterBar.style.display = 'none';
+
+                    // Show placeholder for non-stocks tabs
+                    document.getElementById('table-body').innerHTML = `
+                        <tr>
+                            <td colspan="6" style="text-align:center;height:200px;color:#8E8E8E;">
+                                ${currentMainTab.charAt(0).toUpperCase() + currentMainTab.slice(1)} data — coming soon
+                            </td>
+                        </tr>`;
+                }
             });
-            document.getElementById('indexBody').innerHTML = html || '<tr><td colspan="8" class="loading">No index data</td></tr>';
-            document.getElementById('marketStatus').textContent = 'Live';
-            document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString('en-IN', {timeZone:'Asia/Kolkata'}) + ' IST';
-        })
-        .catch(function() {
-            document.getElementById('marketStatus').textContent = 'Offline';
         });
-}
 
-function fetchStockMovers() {
-    fetch('/api/market/stock-movers')
-        .then(function(r) { return r.json(); })
-        .then(function(d) {
-            if (!d.available) {
-                document.getElementById('stockBody').innerHTML = '<tr><td colspan="5" class="loading">No stock movers data yet</td></tr>';
-                return;
-            }
-            var list = d[currentStockSub] || [];
-            var html = '';
-            list.forEach(function(s) {
-                var c = cls(s.change_pct);
-                var name = s.symbol || ('SID-' + s.security_id);
-                html += '<tr>';
-                html += '<td>' + esc(name) + '</td>';
-                html += '<td>' + fmt(s.ltp, 2) + '</td>';
-                html += '<td class="' + c + '">' + sign(s.change) + fmt(s.change, 2) + '</td>';
-                html += '<td class="' + c + '">' + sign(s.change_pct) + fmt(s.change_pct, 2) + ' %</td>';
-                html += '<td>' + fmtInt(s.volume) + '</td>';
-                html += '</tr>';
+        // ============ SUB-TAB SWITCHING ============
+        document.querySelectorAll('.sub-tab').forEach(tab => {
+            tab.addEventListener('click', function() {
+                document.querySelectorAll('.sub-tab').forEach(t => t.classList.remove('active'));
+                this.classList.add('active');
+                currentSubTab = this.getAttribute('data-subtab');
+
+                // Re-fetch or re-render based on sub-tab
+                fetchStockMovers();
             });
-            document.getElementById('stockBody').innerHTML = html || '<tr><td colspan="5" class="loading">No data</td></tr>';
-        })
-        .catch(function() {});
-}
+        });
 
-function fetchOptionMovers() {
-    fetch('/api/market/option-movers?category=' + currentOptionSub)
-        .then(function(r) { return r.json(); })
-        .then(function(d) {
-            if (!d.available) {
-                document.getElementById('optionBody').innerHTML = '<tr><td colspan="9" class="loading">No option movers data yet</td></tr>';
-                return;
-            }
-            var html = '';
-            d.entries.forEach(function(o) {
-                var c = cls(o.change_pct);
-                var oic = cls(o.oi_change_pct);
-                var name = o.contract_name || ('SID-' + o.security_id);
-                html += '<tr>';
-                html += '<td>' + esc(name) + '</td>';
-                html += '<td>' + fmt(o.spot_price, 2) + '</td>';
-                html += '<td>' + fmt(o.ltp, 2) + '</td>';
-                html += '<td class="' + c + '">' + sign(o.change) + fmt(o.change, 2) + '</td>';
-                html += '<td class="' + c + '">' + sign(o.change_pct) + fmt(o.change_pct, 2) + ' %</td>';
-                html += '<td>' + fmtOI(o.oi) + '</td>';
-                html += '<td class="' + oic + '">' + fmtOI(o.oi_change) + '</td>';
-                html += '<td class="' + oic + '">' + sign(o.oi_change_pct) + fmt(o.oi_change_pct, 2) + ' %</td>';
-                html += '<td>' + fmtInt(o.volume) + '</td>';
-                html += '</tr>';
+        // ============ EXCHANGE FILTER ============
+        document.querySelectorAll('.exchange-btn').forEach(btn => {
+            btn.addEventListener('click', function() {
+                document.querySelectorAll('.exchange-btn').forEach(b => b.classList.remove('active'));
+                this.classList.add('active');
+                currentExchange = this.getAttribute('data-exchange');
+                fetchStockMovers();
             });
-            document.getElementById('optionBody').innerHTML = html || '<tr><td colspan="9" class="loading">No data</td></tr>';
-        })
-        .catch(function() {});
-}
+        });
 
-function fetchHealth() {
-    fetch('/health')
-        .then(function(r) { return r.json(); })
-        .then(function(d) {
-            var subs = d.subsystems || {};
-            function setConn(id, info) {
-                var el = document.getElementById(id);
-                var dot = el ? el.previousElementSibling : null;
-                if (!el || !dot) return;
-                var s = info ? info.status : 'unknown';
-                var detail = info ? (info.detail || s) : '--';
-                el.textContent = detail;
-                dot.className = 'conn-dot ' + (s === 'connected' || s === 'reachable' || s === 'valid' || s === 'active' ? 'up' : s === 'buffering' ? 'partial' : 'down');
-            }
-            setConn('connWs', subs.websocket);
-            setConn('connD20', subs.depth_20);
-            setConn('connD200', subs.depth_200);
-            setConn('connOrder', subs.order_update);
-            setConn('connQdb', subs.questdb);
-            setConn('connToken', subs.token);
-            setConn('connPipeline', subs.pipeline);
-        })
-        .catch(function() {});
-}
+        // ============ MODE FILTER ============
+        document.querySelectorAll('.mode-btn').forEach(btn => {
+            btn.addEventListener('click', function() {
+                document.querySelectorAll('.mode-btn').forEach(b => b.classList.remove('active'));
+                this.classList.add('active');
+                currentMode = this.getAttribute('data-mode');
+                fetchStockMovers();
+            });
+        });
 
-function fetchAll() {
-    fetchIndices();
-    fetchStockMovers();
-    fetchOptionMovers();
-    fetchHealth();
-}
+        // ============ COLUMN SORTING ============
+        document.querySelectorAll('#data-table thead th').forEach((th, idx) => {
+            th.addEventListener('click', function() {
+                if (sortColumn === idx) {
+                    sortDir = sortDir === 'asc' ? 'desc' : 'asc';
+                } else {
+                    sortColumn = idx;
+                    sortDir = 'desc';
+                }
 
-// Init
-fetchAll();
-refreshTimer = setInterval(fetchAll, 3000);
-</script>
+                // Re-render with current data
+                let displayData;
+                if (currentMode === 'rise-fall') {
+                    displayData = stockData.gainers && stockData.gainers.length > 0 ? stockData.gainers : stockData.most_active || [];
+                } else {
+                    displayData = stockData.losers && stockData.losers.length > 0 ? stockData.losers : stockData.most_active || [];
+                }
+                renderTable(displayData);
+            });
+        });
+
+        // ============ SIDEBAR SEARCH ============
+        document.getElementById('sidebar-search-input').addEventListener('input', function(e) {
+            renderWatchlist(e.target.value);
+        });
+
+        // ============ INIT ============
+        function init() {
+            renderWatchlist();
+            fetchStockMovers();
+            fetchIndices();
+
+            // Auto-refresh every 5 seconds
+            refreshInterval = setInterval(() => {
+                if (currentMainTab === 'stocks') {
+                    fetchStockMovers();
+                }
+                fetchIndices();
+            }, 5000);
+        }
+
+        init();
+    </script>
 </body>
 </html>

@@ -95,6 +95,20 @@ pub async fn ensure_deep_depth_table(questdb_config: &QuestDbConfig) {
         QUESTDB_TABLE_DEEP_MARKET_DEPTH, DEDUP_KEY_DEEP_DEPTH
     );
     execute_ddl(&client, &base_url, &dedup_sql, "deep_market_depth DEDUP").await;
+
+    // Migration: add exchange_sequence column (idempotent — ADD COLUMN IF NOT EXISTS equivalent).
+    // QuestDB's ALTER TABLE ADD COLUMN is no-op if the column already exists.
+    let seq_col_sql = format!(
+        "ALTER TABLE {} ADD COLUMN exchange_sequence LONG",
+        QUESTDB_TABLE_DEEP_MARKET_DEPTH
+    );
+    execute_ddl(
+        &client,
+        &base_url,
+        &seq_col_sql,
+        "deep_market_depth exchange_sequence column",
+    )
+    .await;
 }
 
 /// A buffered depth record for ring buffer / disk spill recovery.
@@ -110,6 +124,10 @@ struct DeepDepthRecord {
     depth_type_code: u8,
     level_count: u8,
     received_at_nanos: i64,
+    /// Exchange sequence number from 20-level header (bytes 8-11).
+    /// For 200-level this is the row_count (stored for audit, not ordering).
+    /// Used for gap detection: expected next_seq = last_seq + 1.
+    exchange_sequence: u32,
     /// Up to 200 levels. Only `level_count` entries are valid.
     levels: [DeepDepthLevel; 200],
 }
@@ -123,6 +141,7 @@ impl DeepDepthRecord {
         levels: &[DeepDepthLevel],
         depth_type: &str,
         received_at_nanos: i64,
+        exchange_sequence: u32,
     ) -> Self {
         let side_code = if side == "ASK" { 1u8 } else { 0u8 };
         let depth_type_code = if depth_type == "200" { 200u8 } else { 20u8 };
@@ -138,6 +157,7 @@ impl DeepDepthRecord {
             depth_type_code,
             level_count,
             received_at_nanos,
+            exchange_sequence,
             levels: arr,
         }
     }
@@ -223,6 +243,7 @@ impl DeepDepthRecord {
             depth_type_code,
             level_count,
             received_at_nanos,
+            exchange_sequence: 0, // Spill files from before this field was added have no sequence
             levels,
         }
     }
@@ -259,7 +280,7 @@ impl DeepDepthWriter {
     /// Creates a new deep depth writer connected to QuestDB.
     // TEST-EXEMPT: ILP connection — requires live QuestDB, tested via DDL integration
     pub fn new(config: &QuestDbConfig) -> Result<Self> {
-        let conf_string = format!("tcp::addr={}:{};", config.host, config.ilp_port);
+        let conf_string = config.build_ilp_conf_string();
         let sender = Sender::from_conf(&conf_string)
             .context("failed to connect to QuestDB for deep depth")?;
         let buffer = sender.new_buffer();
@@ -290,6 +311,8 @@ impl DeepDepthWriter {
     /// * `levels` — Depth levels (20 or up to 200).
     /// * `depth_type` — "20" or "200".
     /// * `received_at_nanos` — UTC receive timestamp in nanoseconds.
+    /// * `exchange_sequence` — sequence number from 20-level header (bytes 8-11),
+    ///   or row_count from 200-level header. Stored for ordering and gap detection.
     pub fn append_deep_depth(
         &mut self,
         security_id: u32,
@@ -298,6 +321,7 @@ impl DeepDepthWriter {
         levels: &[DeepDepthLevel],
         depth_type: &str,
         received_at_nanos: i64,
+        exchange_sequence: u32,
     ) -> Result<()> {
         // If sender is None (previous failure), attempt reconnect before writing.
         if self.sender.is_none() {
@@ -315,6 +339,7 @@ impl DeepDepthWriter {
                         levels,
                         depth_type,
                         received_at_nanos,
+                        exchange_sequence,
                     );
                     self.buffer_record(record);
                     return Ok(());
@@ -329,6 +354,7 @@ impl DeepDepthWriter {
             levels,
             depth_type,
             received_at_nanos,
+            exchange_sequence,
         );
 
         if let Err(err) = self.write_record_to_ilp(&record) {
@@ -393,6 +419,8 @@ impl DeepDepthWriter {
                 .context("quantity")?
                 .column_i64("orders", i64::from(level.orders))
                 .context("orders")?
+                .column_i64("exchange_sequence", i64::from(record.exchange_sequence))
+                .context("exchange_sequence")?
                 .column_ts("received_at", received_nanos)
                 .context("received_at")?
                 .at(received_nanos)
@@ -781,7 +809,7 @@ mod tests {
     fn test_deep_depth_record_from_append() {
         let levels = make_test_levels(20);
         let record =
-            DeepDepthRecord::from_append(12345, 2, "BID", &levels, "20", 1_000_000_000_000);
+            DeepDepthRecord::from_append(12345, 2, "BID", &levels, "20", 1_000_000_000_000, 0);
 
         assert_eq!(record.security_id, 12345);
         assert_eq!(record.segment_code, 2);
@@ -798,7 +826,8 @@ mod tests {
     #[test]
     fn test_deep_depth_record_ask_side() {
         let levels = make_test_levels(5);
-        let record = DeepDepthRecord::from_append(99, 1, "ASK", &levels, "200", 2_000_000_000_000);
+        let record =
+            DeepDepthRecord::from_append(99, 1, "ASK", &levels, "200", 2_000_000_000_000, 0);
 
         assert_eq!(record.side_code, 1); // ASK = 1
         assert_eq!(record.depth_type_code, 200);
@@ -811,7 +840,7 @@ mod tests {
     fn test_deep_depth_record_serialize_deserialize_roundtrip() {
         let levels = make_test_levels(20);
         let original =
-            DeepDepthRecord::from_append(54321, 2, "ASK", &levels, "20", 9_999_999_999_999);
+            DeepDepthRecord::from_append(54321, 2, "ASK", &levels, "20", 9_999_999_999_999, 0);
 
         let serialized = original.serialize();
         assert_eq!(serialized.len(), DEEP_DEPTH_SPILL_RECORD_SIZE);
@@ -838,7 +867,7 @@ mod tests {
     fn test_deep_depth_record_serialize_200_levels() {
         let levels = make_test_levels(200);
         let record =
-            DeepDepthRecord::from_append(11111, 2, "BID", &levels, "200", 5_000_000_000_000);
+            DeepDepthRecord::from_append(11111, 2, "BID", &levels, "200", 5_000_000_000_000, 0);
 
         assert_eq!(record.level_count, 200);
         let serialized = record.serialize();
@@ -862,6 +891,7 @@ mod tests {
                 &levels,
                 "20",
                 i as i64 * 1_000_000,
+                0,
             );
             buffer.push_back(record);
         }
@@ -895,6 +925,7 @@ mod tests {
                 &levels,
                 "20",
                 i as i64 * 1_000_000_000,
+                0,
             );
             std::io::Write::write_all(&mut file, &record.serialize()).unwrap();
         }
@@ -915,7 +946,7 @@ mod tests {
 
     #[test]
     fn test_deep_depth_record_empty_levels() {
-        let record = DeepDepthRecord::from_append(1, 2, "BID", &[], "20", 0);
+        let record = DeepDepthRecord::from_append(1, 2, "BID", &[], "20", 0, 0);
         assert_eq!(record.level_count, 0);
         assert!(record.valid_levels().is_empty());
 
@@ -929,7 +960,7 @@ mod tests {
     fn test_deep_depth_record_clamps_to_200_levels() {
         // Create 250 levels — should be clamped to 200
         let levels = make_test_levels(250);
-        let record = DeepDepthRecord::from_append(1, 2, "BID", &levels, "200", 0);
+        let record = DeepDepthRecord::from_append(1, 2, "BID", &levels, "200", 0, 0);
         assert_eq!(record.level_count, 200);
         assert_eq!(record.valid_levels().len(), 200);
     }

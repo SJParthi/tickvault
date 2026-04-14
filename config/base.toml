@@ -161,6 +161,11 @@ http_port = 9000
 pg_port = 8812
 ilp_port = 9009
 
+[partition_retention]
+# Hot partition retention: partitions older than this are detached daily at 16:30 IST.
+# Set to 0 to disable auto-detach. SEBI requires 5-year retention (via S3 cold storage).
+retention_days = 90
+
 [valkey]
 host = "dlt-valkey"
 port = 6379
@@ -209,6 +214,12 @@ dry_run = true  # SAFETY: never place real orders — paper trading only
 # sandbox = HTTP to sandbox.dhan.co, fills at ₹100, no static IP needed
 # live   = HTTP to api.dhan.co, real exchange, static IP required
 mode = "sandbox"
+# S6-Step4: Sandbox-only enforcement until this date (YYYY-MM-DD).
+# If today_ist <= this date AND mode = "live", boot panics. Set to a past
+# date to disable. Default 2026-06-30 per Parthiban "no real orders until
+# June end". Hard boot gate — protects real money during the validation
+# period.
+sandbox_only_until = "2026-06-30"
 
 [logging]
 level = "info"
@@ -250,7 +261,9 @@ sns_enabled = false
 metrics_port = 9091
 otlp_endpoint = "http://dlt-jaeger:4317"
 metrics_enabled = true
-tracing_enabled = true
+# Jaeger removed from docker-compose (saves 2.5GB RAM, per AWS budget).
+# CloudWatch Logs replaces distributed tracing. Re-enable when Jaeger is deployed.
+tracing_enabled = false
 
 [historical]
 enabled = true

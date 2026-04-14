@@ -90,7 +90,7 @@ curl --location 'https://auth.dhan.co/app/consumeApp-consent?tokenId={Token ID}'
 
 Response: access token + expiry time.
 
-> **SDK note:** DhanHQ Python SDK (v2.2.0) uses GET for this endpoint instead of POST (the curl example above omits `-X POST`). The HTTP method may be flexible; verify with actual API behavior.
+> **SDK note:** Dhan API (Python SDK ref) (v2.2.0) uses GET for this endpoint instead of POST (the curl example above omits `-X POST`). The HTTP method may be flexible; verify with actual API behavior.
 
 ---
 
@@ -206,7 +206,7 @@ Headers: access-token: {JWT}
 }
 ```
 
-> **SDK Note**: The DhanHQ Python SDK (v2.2.0+) sends both `access-token` AND `dhanClientId` headers for the profile endpoint, although the official docs only require `access-token`.
+> **SDK Note**: The Dhan API (Python SDK ref) (v2.2.0+) sends both `access-token` AND `dhanClientId` headers for the profile endpoint, although the official docs only require `access-token`.
 
 ---
 

@@ -1,7 +1,7 @@
 # Codebase Map — dhan-live-trader
 
 > Session start: read THIS file only. Skip CLAUDE.md (auto-loads).
-> Bible: `tech-stack-bible.md` — read ONLY when adding a new dependency.
+> S6-Step8 (2026-04-14): The Tech Stack Bible was deleted. The single source of truth for all dependency versions is the workspace root `Cargo.toml` `[workspace.dependencies]` block.
 > Updated: 2026-03-17 (~2,439 tests).
 
 ## File Tree
@@ -109,7 +109,7 @@ dhan-live-trader/
 │   ├── setup-secrets.sh               # Seeds SSM params in AWS
 │   └── notify-telegram.sh             # Sends Telegram alerts via real AWS SSM
 └── docs/
-    ├── tech-stack-bible.md          # 113 components (converted from PDF)
+    ├── # tech-stack-bible.md DELETED in S6-Step8 — Cargo.toml is the source of truth
     ├── architecture/codebase-map.md     # THIS FILE
     └── phases/
         └── phase-1-live-trading.md     # Full Phase 1 spec (1,412 lines)

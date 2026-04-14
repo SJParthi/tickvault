@@ -239,6 +239,26 @@ scan_prod_code '"wss://[a-zA-Z]' 'Hardcoded WebSocket URL — use config' "$STAG
 scan_prod_code '"https://[a-zA-Z]' 'Hardcoded HTTPS URL — use config' "$STAGED_FILES"
 
 # ─────────────────────────────────────────────
+# CATEGORY 4: Dhan LOCKED FACTS (Tickets #5519522, #5525125)
+# ─────────────────────────────────────────────
+#
+# These patterns cannot appear in production code. Each one represents a
+# known-broken configuration that Dhan support explicitly told us NOT to
+# use. If you need to reintroduce one, open a new Dhan ticket first.
+
+# Ticket #5519522: 200-level depth root path (Python SDK style) causes
+# Protocol(ResetWithoutClosingHandshake) — tested and confirmed broken.
+# The ONLY working path is /twohundreddepth. Any literal of the root path
+# (closing `/` right before the query string or the closing quote) is a
+# regression.
+scan_prod_code '"wss://full-depth-api\.dhan\.co/"' \
+  'Dhan LOCKED FACT #5519522 — 200-depth MUST use /twohundreddepth, not root path' \
+  "$STAGED_FILES"
+scan_prod_code '"wss://full-depth-api\.dhan\.co/?' \
+  'Dhan LOCKED FACT #5519522 — 200-depth MUST use /twohundreddepth, not root path' \
+  "$STAGED_FILES"
+
+# ─────────────────────────────────────────────
 # RESULT
 # ─────────────────────────────────────────────
 

@@ -1484,7 +1484,7 @@ fn persist_intraday_candles(
         build_valid_intraday_candles(data, security_id, segment_code, timeframe_label);
 
     if invalid_count > 0 {
-        warn!(
+        debug!(
             security_id,
             timeframe = timeframe_label,
             invalid_count,
@@ -1538,7 +1538,7 @@ fn persist_daily_candles(
     let (candles, invalid_count) = build_valid_daily_candles(data, security_id, segment_code);
 
     if invalid_count > 0 {
-        warn!(
+        debug!(
             security_id,
             timeframe = TIMEFRAME_1D,
             invalid_count,

@@ -389,3 +389,342 @@ groups:
           description: "Application produced ERROR-level logs in the last 2 minutes. Check Grafana Logs dashboard for details."
         labels:
           severity: critical
+
+  # ----------------------------------------------------------------------
+  # E2: Zero-tick-loss alert group
+  # ----------------------------------------------------------------------
+  #
+  # Alerts for the A2/A3/A4/A5 work. Each rule is linked to a specific
+  # metric catalogued in crates/common/tests/metrics_catalog.rs. If you
+  # delete a metric here, the catalog test will fail at push time and
+  # remind you to update Grafana + code together.
+  - orgId: 1
+    name: dlt-zero-tick-loss
+    folder: dhan-live-trader
+    interval: 1m
+    rules:
+      # Any write to the dead-letter queue is a CRITICAL data-integrity
+      # incident — both the ring buffer and disk spill failed.
+      - uid: dlt-dlq-non-zero
+        title: "A2: Dead-letter queue has ticks"
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model:
+              expr: "increase(dlt_dlq_ticks_total[5m])"
+              intervalMs: 15000
+              maxDataPoints: 43200
+          - refId: B
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: gt, params: [0] }
+        noDataState: OK
+        execErrState: Alerting
+        for: 0m
+        annotations:
+          summary: "CRITICAL: ticks lost to DLQ — zero-tick-loss guarantee breached"
+          description: "dlt_dlq_ticks_total incremented. Both ring buffer AND disk spill failed for at least one tick. Investigate storage subsystem immediately. See data/spill/dlq-*.ndjson for audit trail."
+        labels:
+          severity: critical
+
+      # Spill directory free space below 500 MB — warning.
+      - uid: dlt-spill-disk-low-warn
+        title: "A2: Tick spill disk < 500 MB"
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model:
+              expr: "dlt_spill_disk_available_mb"
+              intervalMs: 15000
+              maxDataPoints: 43200
+          - refId: B
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: lt, params: [500] }
+        noDataState: OK
+        execErrState: Alerting
+        for: 5m
+        annotations:
+          summary: "Tick spill directory has < 500MB free"
+          description: "dlt_spill_disk_available_mb below the warning threshold. A prolonged QuestDB outage may exhaust disk and cause DLQ writes."
+        labels:
+          severity: warning
+
+      # Spill directory free space below 100 MB — critical.
+      - uid: dlt-spill-disk-low-critical
+        title: "A2: Tick spill disk < 100 MB"
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 120, to: 0 }
+            datasourceUid: prometheus
+            model:
+              expr: "dlt_spill_disk_available_mb"
+              intervalMs: 15000
+              maxDataPoints: 43200
+          - refId: B
+            relativeTimeRange: { from: 120, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            relativeTimeRange: { from: 120, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: lt, params: [100] }
+        noDataState: OK
+        execErrState: Alerting
+        for: 0m
+        annotations:
+          summary: "CRITICAL: Tick spill directory has < 100MB free"
+          description: "dlt_spill_disk_available_mb below the CRITICAL threshold. Next outage will cause tick loss via DLQ. Free disk space IMMEDIATELY."
+        labels:
+          severity: critical
+
+      # Pool watchdog declared the pool degraded for > 60 s.
+      - uid: dlt-pool-degraded
+        title: "A4: WebSocket pool fully degraded"
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 180, to: 0 }
+            datasourceUid: prometheus
+            model:
+              expr: "dlt_pool_degraded_seconds"
+              intervalMs: 15000
+              maxDataPoints: 43200
+          - refId: B
+            relativeTimeRange: { from: 180, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            relativeTimeRange: { from: 180, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: gt, params: [60] }
+        noDataState: OK
+        execErrState: Alerting
+        for: 0m
+        annotations:
+          summary: "CRITICAL: ALL WebSocket connections down > 60s"
+          description: "dlt_pool_degraded_seconds > 60 — the pool watchdog (A4) has declared the entire WebSocket pool degraded. No market data flowing. Check Dhan server status, token validity, and network reachability. At 300s the process will self-halt for supervisor restart."
+        labels:
+          severity: critical
+
+      # S4-T4: Order update WebSocket down > 60s — CRITICAL
+      # Fill confirmations can be silently lost during this window.
+      - uid: dlt-order-update-ws-down
+        title: "S4-T4: Order update WebSocket down > 60s"
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 180, to: 0 }
+            datasourceUid: prometheus
+            model:
+              expr: "dlt_order_update_ws_active"
+              intervalMs: 15000
+              maxDataPoints: 43200
+          - refId: B
+            relativeTimeRange: { from: 180, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            relativeTimeRange: { from: 180, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: lt, params: [1] }
+        noDataState: OK
+        execErrState: Alerting
+        for: 1m
+        annotations:
+          summary: "CRITICAL: order update WebSocket disconnected > 60s"
+          description: "dlt_order_update_ws_active below 1 for > 1m. Fill confirmations may be silently lost. Check docker logs dlt-app and Dhan order-update status."
+        labels:
+          severity: critical
+
+      # S4-T4: Valkey errors during market hours — WARNING
+      - uid: dlt-valkey-errors
+        title: "S4-T4: Valkey errors observed"
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model:
+              expr: "increase(dlt_valkey_errors_total[5m])"
+              intervalMs: 15000
+              maxDataPoints: 43200
+          - refId: B
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: gt, params: [10] }
+        noDataState: OK
+        execErrState: Alerting
+        for: 2m
+        annotations:
+          summary: "Valkey errors > 10 in 5 min"
+          description: "dlt_valkey_errors_total increased. Token cache or tick cache operations failing. Check docker logs dlt-valkey."
+        labels:
+          severity: warning
+
+      # S4-T4: Depth frames being dropped — WARNING
+      - uid: dlt-depth-frames-dropped
+        title: "S4-T4: Depth frames dropped"
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model:
+              expr: "sum(increase(dlt_depth_frames_dropped_total[5m]))"
+              intervalMs: 15000
+              maxDataPoints: 43200
+          - refId: B
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: gt, params: [0] }
+        noDataState: OK
+        execErrState: Alerting
+        for: 0m
+        annotations:
+          summary: "Depth frames dropped — downstream consumer can't keep up"
+          description: "dlt_depth_frames_dropped_total > 0 in 5 min. Depth channel full or consumer slow. Investigate depth connection pool."
+        labels:
+          severity: warning
+
+      # S3-1: QuestDB disconnected > 30s → CRITICAL
+      - uid: dlt-questdb-disconnected
+        title: "S3-1: QuestDB disconnected > 30s"
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 120, to: 0 }
+            datasourceUid: prometheus
+            model:
+              expr: "dlt_questdb_disconnected_seconds"
+              intervalMs: 15000
+              maxDataPoints: 43200
+          - refId: B
+            relativeTimeRange: { from: 120, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            relativeTimeRange: { from: 120, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: gt, params: [30] }
+        noDataState: OK
+        execErrState: Alerting
+        for: 0m
+        annotations:
+          summary: "CRITICAL: QuestDB disconnected > 30s"
+          description: "dlt_questdb_disconnected_seconds > 30. The tick writer's ring buffer + spill path are absorbing all writes — zero tick loss is still guaranteed, but operator attention is required. Check docker logs dlt-questdb and docker compose ps."
+        labels:
+          severity: critical
+
+      # Pool watchdog fired a halt (process exit expected).
+      - uid: dlt-pool-halted
+        title: "A4: WebSocket pool halted (process restart expected)"
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model:
+              expr: "increase(dlt_pool_halts_total[5m])"
+              intervalMs: 15000
+              maxDataPoints: 43200
+          - refId: B
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: gt, params: [0] }
+        noDataState: OK
+        execErrState: Alerting
+        for: 0m
+        annotations:
+          summary: "A4 FATAL: pool halt fired — supervisor should restart dlt-app"
+          description: "dlt_pool_halts_total incremented. The pool has been fully down for >300s and the watchdog requested a halt. If the app doesn't come back within 2 min, Dhan is likely unreachable or the account/token is locked. Check docker logs dlt-app."
+        labels:
+          severity: critical

@@ -1,0 +1,270 @@
+# S7-Step7 / Phase 7: Nightly dep auto-update workflow (Option A).
+#
+# Every night at 02:00 IST (20:30 UTC), runs the
+# dep-freshness-scanner.sh hook and:
+#
+#   - PATCH drift: auto-opens a PR that bumps every patch version
+#     + runs the full test suite. Labelled `auto/patch-bump`. The
+#     PR auto-merges when the 12 pre-push gates pass.
+#
+#   - MINOR or MAJOR drift: opens a GitHub Issue tagged
+#     `deps-drift-minor` / `deps-drift-major` for human review.
+#     Never auto-merged — semver minor bumps can technically
+#     change behavior and need explicit test verification.
+#
+#   - UNKNOWN: logs and continues (network issue, not a failure).
+#
+# No human intervention required for the PATCH path. The operator's
+# only job is triage the MINOR / MAJOR issues periodically.
+
+name: dep-freshness-nightly
+
+on:
+  schedule:
+    # 20:30 UTC = 02:00 IST. Runs every day including weekends because
+    # crates.io releases don't care about NSE trading calendar.
+    - cron: '30 20 * * *'
+  workflow_dispatch:
+    # Manual dispatch for operator-triggered runs.
+
+concurrency:
+  group: dep-freshness
+  cancel-in-progress: true
+
+permissions:
+  contents: write       # to commit the bumped Cargo.toml
+  pull-requests: write  # to open auto-update PRs
+  issues: write         # to open minor/major drift issues
+
+jobs:
+  scan:
+    name: Scan + auto-PR patch drift
+    runs-on: ubuntu-24.04
+    outputs:
+      patch_count: ${{ steps.scan.outputs.patch_count }}
+      minor_count: ${{ steps.scan.outputs.minor_count }}
+      major_count: ${{ steps.scan.outputs.major_count }}
+      report: ${{ steps.scan.outputs.report }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.93.1
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run dep freshness scanner
+        id: scan
+        run: |
+          chmod +x .claude/hooks/dep-freshness-scanner.sh
+          bash .claude/hooks/dep-freshness-scanner.sh > /tmp/report.txt 2>&1 || true
+          cat /tmp/report.txt
+
+          PATCH=$(grep -oE '^PATCH drift \([0-9]+' /tmp/report.txt | grep -oE '[0-9]+' || echo 0)
+          MINOR=$(grep -oE '^MINOR drift \([0-9]+' /tmp/report.txt | grep -oE '[0-9]+' || echo 0)
+          MAJOR=$(grep -oE '^MAJOR drift \([0-9]+' /tmp/report.txt | grep -oE '[0-9]+' || echo 0)
+
+          echo "patch_count=${PATCH}" >> $GITHUB_OUTPUT
+          echo "minor_count=${MINOR}" >> $GITHUB_OUTPUT
+          echo "major_count=${MAJOR}" >> $GITHUB_OUTPUT
+
+          # Save the full report as a multi-line output (base64 to avoid
+          # special-character escaping).
+          REPORT_B64=$(base64 -w0 /tmp/report.txt)
+          echo "report=${REPORT_B64}" >> $GITHUB_OUTPUT
+
+  auto_pr_patches:
+    name: Auto-PR for PATCH drift
+    runs-on: ubuntu-24.04
+    needs: scan
+    if: needs.scan.outputs.patch_count != '0' && needs.scan.outputs.patch_count != ''
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.93.1
+
+      - name: Run scanner to identify patch drifts
+        id: identify
+        run: |
+          chmod +x .claude/hooks/dep-freshness-scanner.sh
+          bash .claude/hooks/dep-freshness-scanner.sh > /tmp/report.txt 2>&1
+          # Extract lines in the PATCH section
+          awk '/^PATCH drift/{p=1;next} /^MINOR drift/{p=0} /^MAJOR drift/{p=0} /^UNKNOWN/{p=0} p && /pinned=/{print}' /tmp/report.txt > /tmp/patches.txt
+          cat /tmp/patches.txt
+
+      - name: Apply patch bumps to Cargo.toml
+        run: |
+          while IFS= read -r LINE; do
+            NAME=$(echo "$LINE" | sed -nE 's/^ *([a-z][a-zA-Z0-9_-]*): pinned=.*/\1/p')
+            PINNED=$(echo "$LINE" | grep -oE 'pinned=[0-9]+\.[0-9]+\.[0-9]+' | cut -d= -f2)
+            LATEST=$(echo "$LINE" | grep -oE 'latest=[0-9]+\.[0-9]+\.[0-9]+' | cut -d= -f2)
+            if [ -n "$NAME" ] && [ -n "$PINNED" ] && [ -n "$LATEST" ]; then
+              echo "Bumping $NAME: $PINNED -> $LATEST"
+              # Use sed to replace the exact version string. Handles both
+              #   name = "1.2.3"
+              # and
+              #   name = { version = "1.2.3", ... }
+              sed -i -E \
+                "s|^(${NAME} = (\\{ version = )?)\"${PINNED}\"|\\1\"${LATEST}\"|" \
+                Cargo.toml
+            fi
+          done < /tmp/patches.txt
+
+      - name: Verify Cargo.toml still parses
+        run: cargo metadata --format-version 1 --no-deps > /dev/null
+
+      - name: Run workspace check
+        run: cargo check --workspace
+
+      - name: Run scoped test suites
+        run: |
+          cargo test -p dhan-live-trader-common --lib
+          cargo test -p dhan-live-trader-storage --lib
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v7
+        with:
+          commit-message: |
+            chore(deps): auto-bump ${{ needs.scan.outputs.patch_count }} patch versions
+
+            Generated by dep-freshness-nightly workflow on ${{ github.run_started_at }}.
+            All bumps are PATCH-level (same major.minor). The workspace
+            compiles and scoped test suites pass. Full suite runs on merge.
+          branch: auto/patch-bump-${{ github.run_id }}
+          delete-branch: true
+          title: "chore(deps): auto-bump ${{ needs.scan.outputs.patch_count }} patch versions"
+          body: |
+            Automatic PR from `dep-freshness-nightly` (Phase 7, Option A).
+
+            ### Scanner report
+
+            ```
+            $(base64 -d <<< '${{ needs.scan.outputs.report }}')
+            ```
+
+            ### Safety
+
+            All bumps are PATCH level (same major.minor). `cargo check`
+            and scoped lib tests pass. The 12 pre-push gates run on
+            the merge queue.
+
+            ### Auto-merge policy
+
+            This PR auto-merges if all status checks pass. If you need to
+            block it, add the `do-not-merge` label.
+          labels: |
+            deps
+            auto/patch-bump
+          draft: false
+
+  open_minor_issue:
+    name: Open issue for MINOR drift
+    runs-on: ubuntu-24.04
+    needs: scan
+    if: needs.scan.outputs.minor_count != '0' && needs.scan.outputs.minor_count != ''
+    steps:
+      - name: Create / update issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const report = Buffer.from('${{ needs.scan.outputs.report }}', 'base64').toString();
+            const title = `Dep drift: ${{ needs.scan.outputs.minor_count }} MINOR upgrades available`;
+
+            // Look for existing issue to update instead of spawning duplicates.
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: 'deps-drift-minor',
+              state: 'open',
+            });
+
+            const body = `### MINOR dep drift detected by nightly scan\n\n` +
+              `**Generated:** ${new Date().toISOString()}\n\n` +
+              `\`\`\`\n${report}\n\`\`\`\n\n` +
+              `### What to do\n\n` +
+              `1. Pick one dep at a time (don't batch minors)\n` +
+              `2. Bump in \`Cargo.toml\`\n` +
+              `3. Run \`cargo test --workspace\`\n` +
+              `4. Commit + push\n\n` +
+              `The 12 pre-push gates will catch any regression.`;
+
+            if (existing.data.length > 0) {
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existing.data[0].number,
+                title: title,
+                body: body,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: title,
+                body: body,
+                labels: ['deps', 'deps-drift-minor'],
+              });
+            }
+
+  open_major_issue:
+    name: Open issue for MAJOR drift
+    runs-on: ubuntu-24.04
+    needs: scan
+    if: needs.scan.outputs.major_count != '0' && needs.scan.outputs.major_count != ''
+    steps:
+      - name: Create / update issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const report = Buffer.from('${{ needs.scan.outputs.report }}', 'base64').toString();
+            const title = `Dep drift: ${{ needs.scan.outputs.major_count }} MAJOR upgrades available (API breaking)`;
+
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: 'deps-drift-major',
+              state: 'open',
+            });
+
+            const body = `### MAJOR dep drift detected by nightly scan\n\n` +
+              `**Generated:** ${new Date().toISOString()}\n\n` +
+              `\`\`\`\n${report}\n\`\`\`\n\n` +
+              `### What to do\n\n` +
+              `Major version bumps are API breaking. Each one needs:\n` +
+              `1. Read the upstream CHANGELOG for breaking changes\n` +
+              `2. Open a dedicated branch \`deps/major-<crate>\`\n` +
+              `3. Fix every call site that breaks\n` +
+              `4. Run \`cargo test --workspace\`\n` +
+              `5. Open a PR for explicit review\n\n` +
+              `Never auto-merge major bumps.`;
+
+            if (existing.data.length > 0) {
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existing.data[0].number,
+                title: title,
+                body: body,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: title,
+                body: body,
+                labels: ['deps', 'deps-drift-major'],
+              });
+            }

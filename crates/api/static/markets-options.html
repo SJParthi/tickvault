@@ -1,0 +1,1051 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Markets - Options</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            background: #000000;
+            color: #8E8E8E;
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            font-size: 14px;
+            line-height: 1.4;
+            overflow: hidden;
+            height: 100vh;
+        }
+
+        /* ===== MAIN NAV BAR (60px) ===== */
+        .main-nav {
+            height: 60px;
+            background: rgba(18,18,18,0.62);
+            border-bottom: 0.5px solid #242424;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0 24px;
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            position: relative;
+            z-index: 100;
+        }
+
+        .nav-left {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .nav-logo {
+            font-size: 18px;
+            font-weight: 700;
+            color: #DADADA;
+            letter-spacing: -0.3px;
+        }
+
+        .nav-center {
+            display: flex;
+            align-items: center;
+            gap: 0;
+            position: absolute;
+            left: 50%;
+            transform: translateX(-50%);
+        }
+
+        .nav-center a {
+            color: #8E8E8E;
+            text-decoration: none;
+            font-size: 13px;
+            font-weight: 500;
+            padding: 8px 16px;
+            transition: color 0.15s;
+        }
+
+        .nav-center a:hover { color: #DADADA; }
+
+        .nav-right {
+            display: flex;
+            align-items: center;
+            gap: 20px;
+        }
+
+        .nav-right a {
+            color: #8E8E8E;
+            text-decoration: none;
+            font-size: 13px;
+            font-weight: 500;
+            transition: color 0.15s;
+        }
+
+        .nav-right a:hover { color: #DADADA; }
+        .nav-right a.active { color: #05B878; }
+
+        .nav-market-status {
+            font-size: 12px;
+            color: #5a5a5a;
+            padding: 4px 10px;
+            border: 1px solid #242424;
+            border-radius: 4px;
+        }
+
+        .nav-profile {
+            width: 32px;
+            height: 32px;
+            border-radius: 50%;
+            background: #2a2a2a;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 13px;
+            font-weight: 600;
+            color: #8E8E8E;
+            cursor: pointer;
+        }
+
+        /* ===== INDEX TICKER BAR (40px) ===== */
+        .ticker-bar {
+            height: 40px;
+            background: #111111;
+            border-bottom: 0.5px solid #242424;
+            display: flex;
+            align-items: center;
+            padding: 0 16px;
+            overflow-x: auto;
+            gap: 0;
+            white-space: nowrap;
+        }
+
+        .ticker-bar::-webkit-scrollbar { height: 0; }
+
+        .ticker-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 0 16px;
+            border-right: 1px solid #1c1c1c;
+            flex-shrink: 0;
+        }
+
+        .ticker-item:last-child { border-right: none; }
+
+        .ticker-name {
+            font-size: 12px;
+            font-weight: 500;
+            color: #8E8E8E;
+        }
+
+        .ticker-price {
+            font-size: 12px;
+            font-weight: 600;
+            color: #DADADA;
+        }
+
+        .ticker-change {
+            font-size: 11px;
+            font-weight: 500;
+        }
+
+        .ticker-change.up { color: #5CA81D; }
+        .ticker-change.down { color: #DD6565; }
+
+        /* ===== LAYOUT: SIDEBAR + MAIN ===== */
+        .layout {
+            display: flex;
+            height: calc(100vh - 100px);
+        }
+
+        /* ===== SIDEBAR (348px) ===== */
+        .sidebar {
+            width: 348px;
+            min-width: 348px;
+            background: #121212;
+            border-right: 1px solid #1c1c1c;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        .sidebar-search {
+            padding: 12px;
+        }
+
+        .sidebar-search-wrap {
+            position: relative;
+        }
+
+        .sidebar-search-wrap .search-icon {
+            position: absolute;
+            left: 10px;
+            top: 50%;
+            transform: translateY(-50%);
+            color: #5a5a5a;
+            font-size: 14px;
+            pointer-events: none;
+        }
+
+        .sidebar-search input {
+            width: 100%;
+            background: #1a1a1a;
+            border: 1px solid #1c1c1c;
+            border-radius: 6px;
+            padding: 8px 12px 8px 34px;
+            color: #DADADA;
+            font-size: 13px;
+            font-family: inherit;
+            outline: none;
+            transition: border-color 0.15s;
+        }
+
+        .sidebar-search input::placeholder { color: #5a5a5a; }
+        .sidebar-search input:focus { border-color: #333; }
+
+        .sidebar-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 8px 16px 4px 16px;
+        }
+
+        .sidebar-header-title {
+            font-size: 13px;
+            font-weight: 600;
+            color: #DADADA;
+        }
+
+        .sidebar-tabs {
+            display: flex;
+            border-bottom: 1px solid #1c1c1c;
+            padding: 0 12px;
+            gap: 2px;
+        }
+
+        .sidebar-tab {
+            width: 28px;
+            height: 28px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 11px;
+            font-weight: 500;
+            color: #5a5a5a;
+            cursor: pointer;
+            border-bottom: 2px solid transparent;
+            transition: all 0.15s;
+        }
+
+        .sidebar-tab:hover { color: #8E8E8E; }
+        .sidebar-tab.active { color: #DADADA; border-bottom-color: #05B878; }
+
+        .watchlist {
+            flex: 1;
+            overflow-y: auto;
+            padding: 4px 0;
+        }
+
+        .watchlist::-webkit-scrollbar { width: 4px; }
+        .watchlist::-webkit-scrollbar-track { background: transparent; }
+        .watchlist::-webkit-scrollbar-thumb { background: #2a2a2a; border-radius: 2px; }
+
+        .watchlist-item {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 9px 16px;
+            cursor: pointer;
+            transition: background 0.1s;
+            position: relative;
+        }
+
+        .watchlist-item:hover { background: #1a1a1a; }
+
+        .wl-left {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .wl-bar {
+            width: 3px;
+            height: 24px;
+            border-radius: 2px;
+        }
+
+        .wl-bar.up { background: #5CA81D; }
+        .wl-bar.down { background: #DD6565; }
+
+        .wl-info {
+            display: flex;
+            flex-direction: column;
+            gap: 1px;
+        }
+
+        .wl-symbol {
+            font-size: 13px;
+            font-weight: 500;
+            color: #DADADA;
+        }
+
+        .wl-exchange {
+            font-size: 11px;
+            color: #5a5a5a;
+        }
+
+        .wl-right {
+            display: flex;
+            flex-direction: column;
+            align-items: flex-end;
+            gap: 1px;
+        }
+
+        .wl-price {
+            font-size: 13px;
+            font-weight: 500;
+            color: #DADADA;
+        }
+
+        .wl-change {
+            font-size: 11px;
+            font-weight: 500;
+        }
+
+        .wl-change.up { color: #5CA81D; }
+        .wl-change.down { color: #DD6565; }
+
+        .sidebar-footer {
+            padding: 10px 16px;
+            border-top: 1px solid #1c1c1c;
+            display: flex;
+            justify-content: space-between;
+            font-size: 11px;
+            color: #5a5a5a;
+        }
+
+        .sidebar-footer a {
+            color: #05B878;
+            text-decoration: none;
+            font-size: 11px;
+        }
+
+        /* ===== MAIN CONTENT ===== */
+        .main-content {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        /* Sub-tabs bar (40px) */
+        .sub-tabs {
+            height: 40px;
+            background: #181818;
+            display: flex;
+            align-items: center;
+            padding: 0 20px;
+            gap: 0;
+            border-bottom: 1px solid #1c1c1c;
+        }
+
+        .sub-tab {
+            padding: 10px 20px;
+            font-size: 13px;
+            font-weight: 500;
+            color: #8E8E8E;
+            cursor: pointer;
+            border-bottom: 2px solid transparent;
+            transition: all 0.15s;
+            text-decoration: none;
+        }
+
+        .sub-tab:hover { color: #DADADA; }
+
+        .sub-tab.active {
+            color: #05B878;
+            border-bottom-color: #05B878;
+        }
+
+        /* Filter row */
+        .filter-row {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 8px 20px;
+            border-bottom: 1px solid #1c1c1c;
+        }
+
+        .filter-tabs {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+
+        .filter-tab {
+            padding: 5px 16px;
+            font-size: 12px;
+            font-weight: 500;
+            color: #8E8E8E;
+            cursor: pointer;
+            border-radius: 4px;
+            transition: all 0.15s;
+        }
+
+        .filter-tab:hover { color: #DADADA; background: rgba(255,255,255,0.04); }
+
+        .filter-tab.active {
+            color: #DADADA;
+            background: rgba(255,255,255,0.08);
+        }
+
+        .filter-controls {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        /* Toggle switch (34x18px) */
+        .toggle-wrap {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .toggle-label {
+            font-size: 12px;
+            font-weight: 500;
+            transition: color 0.15s;
+        }
+
+        .toggle-label.active-gain { color: #5CA81D; }
+        .toggle-label.active-loss { color: #DD6565; }
+
+        .toggle-switch {
+            width: 34px;
+            height: 18px;
+            background: #1c1c1c;
+            border-radius: 9px;
+            position: relative;
+            cursor: pointer;
+            transition: background 0.2s;
+        }
+
+        .toggle-dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            position: absolute;
+            top: 3px;
+            transition: all 0.2s;
+        }
+
+        .toggle-dot.gainers {
+            left: 3px;
+            background: #5CA81D;
+        }
+
+        .toggle-dot.losers {
+            left: 19px;
+            background: #DD6565;
+        }
+
+        /* Dropdown selects */
+        .filter-select {
+            background: #121212;
+            border: 1px solid #2a2a2a;
+            border-radius: 4px;
+            padding: 4px 24px 4px 10px;
+            font-size: 12px;
+            font-family: inherit;
+            color: #DADADA;
+            cursor: pointer;
+            outline: none;
+            appearance: none;
+            -webkit-appearance: none;
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%235a5a5a'/%3E%3C/svg%3E");
+            background-repeat: no-repeat;
+            background-position: right 8px center;
+        }
+
+        .filter-select:focus { border-color: #05B878; }
+
+        /* Table area */
+        .table-area {
+            flex: 1;
+            overflow-y: auto;
+            padding: 0;
+        }
+
+        .table-area::-webkit-scrollbar { width: 6px; }
+        .table-area::-webkit-scrollbar-track { background: transparent; }
+        .table-area::-webkit-scrollbar-thumb { background: #2a2a2a; border-radius: 3px; }
+
+        .stock-table {
+            width: 100%;
+            border-collapse: collapse;
+            table-layout: auto;
+        }
+
+        .stock-table thead { position: sticky; top: 0; z-index: 10; }
+
+        .stock-table th {
+            height: 42px;
+            background: #131313;
+            padding: 0 16px;
+            text-align: right;
+            font-size: 12px;
+            font-weight: 300;
+            color: #5a5a5a;
+            text-transform: uppercase;
+            letter-spacing: 0.3px;
+            border-bottom: 1px solid #1c1c1c;
+            white-space: nowrap;
+        }
+
+        .stock-table th:first-child {
+            text-align: left;
+            padding-left: 20px;
+        }
+
+        .stock-table td {
+            height: 42px;
+            padding: 0 16px;
+            text-align: right;
+            font-size: 14px;
+            color: #8E8E8E;
+            border-bottom: 1px solid #1c1c1c;
+            white-space: nowrap;
+        }
+
+        .stock-table td:first-child {
+            text-align: left;
+            padding-left: 20px;
+        }
+
+        .stock-table tbody tr {
+            transition: background 0.1s;
+        }
+
+        .stock-table tbody tr:hover {
+            background: rgba(255,255,255,0.03);
+        }
+
+        /* Name cell with checkbox */
+        .name-cell {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .name-cell input[type="checkbox"] {
+            width: 16px;
+            height: 16px;
+            appearance: none;
+            -webkit-appearance: none;
+            background: #121212;
+            border: 1px solid #817E7E;
+            border-radius: 3px;
+            cursor: pointer;
+            flex-shrink: 0;
+            position: relative;
+        }
+
+        .name-cell input[type="checkbox"]:checked {
+            background: #05B878;
+            border-color: #05B878;
+        }
+
+        .name-cell input[type="checkbox"]:checked::after {
+            content: '';
+            position: absolute;
+            left: 4px;
+            top: 1px;
+            width: 5px;
+            height: 9px;
+            border: solid #000;
+            border-width: 0 2px 2px 0;
+            transform: rotate(45deg);
+        }
+
+        .stock-name {
+            color: #DADADA;
+            font-weight: 500;
+            font-size: 14px;
+        }
+
+        .text-green { color: #5CA81D; }
+        .text-red { color: #DD6565; }
+
+        .loading-msg {
+            text-align: center;
+            padding: 48px 20px;
+            color: #5a5a5a;
+            font-size: 13px;
+        }
+
+        /* ===== BOTTOM BAR (48px) ===== */
+        .bottom-bar {
+            height: 48px;
+            background: #121212;
+            border-top: 1px solid #1c1c1c;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0 20px;
+        }
+
+        .bottom-left {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .bottom-select {
+            background: #1a1a1a;
+            border: 1px solid #2a2a2a;
+            border-radius: 4px;
+            padding: 6px 28px 6px 12px;
+            font-size: 13px;
+            font-family: inherit;
+            color: #DADADA;
+            cursor: pointer;
+            outline: none;
+            appearance: none;
+            -webkit-appearance: none;
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%235a5a5a'/%3E%3C/svg%3E");
+            background-repeat: no-repeat;
+            background-position: right 10px center;
+        }
+
+        .bottom-btn {
+            background: transparent;
+            border: 1px solid #2a2a2a;
+            border-radius: 4px;
+            padding: 6px 16px;
+            font-size: 13px;
+            font-family: inherit;
+            color: #8E8E8E;
+            cursor: pointer;
+            transition: all 0.15s;
+        }
+
+        .bottom-btn:hover {
+            color: #DADADA;
+            border-color: #05B878;
+        }
+    </style>
+</head>
+<body>
+
+    <!-- ===== MAIN NAV BAR ===== -->
+    <nav class="main-nav">
+        <div class="nav-left">
+            <span class="nav-logo">dhan</span>
+        </div>
+        <div class="nav-center">
+            <a href="#">Home</a>
+            <a href="#">Portfolio</a>
+            <a href="#">Positions</a>
+            <a href="#">Orders</a>
+            <a href="#">Money</a>
+        </div>
+        <div class="nav-right">
+            <a href="#" class="active">Markets</a>
+            <a href="#">Rent Stocks</a>
+            <a href="#">News</a>
+            <a href="#">IPOs</a>
+            <span class="nav-market-status" id="navMarketStatus">Markets Closed</span>
+            <div class="nav-profile">P</div>
+        </div>
+    </nav>
+
+    <!-- ===== INDEX TICKER BAR ===== -->
+    <div class="ticker-bar" id="tickerBar">
+        <div class="ticker-item">
+            <span class="ticker-name">Loading...</span>
+        </div>
+    </div>
+
+    <!-- ===== LAYOUT: SIDEBAR + MAIN ===== -->
+    <div class="layout">
+
+        <!-- ===== SIDEBAR ===== -->
+        <div class="sidebar">
+            <div class="sidebar-search">
+                <div class="sidebar-search-wrap">
+                    <span class="search-icon">&#x1F50D;</span>
+                    <input type="text" placeholder="Search eg: Infy, Nifty Fut" id="sidebarSearch">
+                </div>
+            </div>
+            <div class="sidebar-header">
+                <span class="sidebar-header-title">First Watchlist</span>
+            </div>
+            <div class="sidebar-tabs">
+                <div class="sidebar-tab active" data-wltab="1">1</div>
+                <div class="sidebar-tab" data-wltab="2">2</div>
+                <div class="sidebar-tab" data-wltab="3">3</div>
+                <div class="sidebar-tab" data-wltab="4">4</div>
+                <div class="sidebar-tab" data-wltab="5">5</div>
+                <div class="sidebar-tab" data-wltab="6">6</div>
+                <div class="sidebar-tab" data-wltab="7">7</div>
+                <div class="sidebar-tab" data-wltab="8">8</div>
+            </div>
+            <div class="watchlist" id="watchlist">
+                <!-- Populated by JS -->
+            </div>
+            <div class="sidebar-footer">
+                <span>NSE</span>
+                <a href="/portal">DLT Portal</a>
+                <span>BSE</span>
+            </div>
+        </div>
+
+        <!-- ===== MAIN CONTENT ===== -->
+        <div class="main-content">
+            <!-- Sub-tabs -->
+            <div class="sub-tabs">
+                <a class="sub-tab" href="#">Live</a>
+                <a class="sub-tab active" href="/portal/markets/options">Options</a>
+                <a class="sub-tab" href="/portal/markets/stocks">Stocks</a>
+                <a class="sub-tab" href="#">Commodity</a>
+                <a class="sub-tab" href="#">Futures</a>
+                <a class="sub-tab" href="#">ETFs</a>
+                <a class="sub-tab" href="#">Bonds</a>
+                <a class="sub-tab" href="/portal/markets/index">Index</a>
+            </div>
+
+            <!-- Filter row -->
+            <div class="filter-row">
+                <div class="filter-tabs">
+                    <div class="filter-tab active" data-filter="highest_oi" onclick="switchFilter('highest_oi')">Highest OI</div>
+                    <div class="filter-tab" data-filter="oi_gainers" onclick="switchFilter('oi_gainers')">OI Gainers</div>
+                    <div class="filter-tab" data-filter="oi_losers" onclick="switchFilter('oi_losers')">OI Losers</div>
+                    <div class="filter-tab" data-filter="top_volume" onclick="switchFilter('top_volume')">Top Volume</div>
+                    <div class="filter-tab" data-filter="top_value" onclick="switchFilter('top_value')">Top Value</div>
+                    <div class="filter-tab" data-filter="price_gainers" onclick="switchFilter('price_gainers')">Price Gainers</div>
+                    <div class="filter-tab" data-filter="price_losers" onclick="switchFilter('price_losers')">Price Losers</div>
+                </div>
+                <div class="filter-controls">
+                    <select class="filter-select" id="expirySelect">
+                        <option value="all">April</option>
+                        <option value="may">May</option>
+                        <option value="jun">June</option>
+                    </select>
+                    <select class="filter-select" id="typeSelect">
+                        <option value="all">All</option>
+                        <option value="index">Index</option>
+                        <option value="stock">Stock</option>
+                    </select>
+                </div>
+            </div>
+
+            <!-- Table -->
+            <div class="table-area">
+                <table class="stock-table">
+                    <thead>
+                        <tr>
+                            <th>Name</th>
+                            <th>Spot Price</th>
+                            <th>LTP</th>
+                            <th>Change</th>
+                            <th>Change %</th>
+                            <th>Open Interest</th>
+                            <th>OI Change</th>
+                            <th>OI Change %</th>
+                            <th>Volume</th>
+                        </tr>
+                    </thead>
+                    <tbody id="stockBody">
+                        <tr><td colspan="9" class="loading-msg">Loading options data...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+
+            <!-- Bottom bar -->
+            <div class="bottom-bar">
+                <div class="bottom-left">
+                    <select class="bottom-select">
+                        <option>Option Chain</option>
+                    </select>
+                </div>
+                <button class="bottom-btn">Create Your Strategy</button>
+            </div>
+        </div>
+    </div>
+
+<script>
+/* ===== STATE ===== */
+var currentFilter = 'highest_oi';
+var refreshTimer = null;
+
+/* ===== HARDCODED FALLBACK DATA ===== */
+var fallbackOptions = [
+    { name: 'NIFTY 08 APR 23000 CE', spot: 23123.65, ltp: 245.80, change: 44.85, change_pct: 22.33, oi: 4554095, oi_change: 18915, oi_change_pct: 0.42, volume: 6165835 },
+    { name: 'NIFTY 08 APR 23200 PE', spot: 23123.65, ltp: 189.50, change: -80.20, change_pct: -29.73, oi: 3876543, oi_change: -47255, oi_change_pct: -1.62, volume: 3412890 },
+    { name: 'BANKNIFTY 09 APR 52500 PE', spot: 52716.25, ltp: 312.40, change: -45.60, change_pct: -12.74, oi: 2876543, oi_change: -32150, oi_change_pct: -1.11, volume: 2845670 },
+    { name: 'NIFTY 08 APR 23100 CE', spot: 23123.65, ltp: 178.25, change: 32.40, change_pct: 22.22, oi: 5234567, oi_change: 125340, oi_change_pct: 2.45, volume: 5234567 },
+    { name: 'BANKNIFTY 09 APR 53000 CE', spot: 52716.25, ltp: 425.60, change: 78.90, change_pct: 22.76, oi: 1987654, oi_change: 87650, oi_change_pct: 4.61, volume: 1987654 },
+    { name: 'NIFTY 08 APR 22800 PE', spot: 23123.65, ltp: 45.30, change: -28.90, change_pct: -38.95, oi: 6543210, oi_change: -234560, oi_change_pct: -3.46, volume: 4567890 },
+    { name: 'FINNIFTY 08 APR 24700 CE', spot: 24685.55, ltp: 134.70, change: 18.45, change_pct: 15.87, oi: 1234567, oi_change: 56780, oi_change_pct: 4.82, volume: 1234567 },
+    { name: 'RELIANCE 10 APR 2800 CE', spot: 2834.50, ltp: 67.80, change: 12.35, change_pct: 22.27, oi: 987654, oi_change: 34560, oi_change_pct: 3.63, volume: 876543 },
+    { name: 'HDFCBANK 10 APR 1650 PE', spot: 1645.80, ltp: 34.20, change: -8.70, change_pct: -20.28, oi: 2345678, oi_change: -67890, oi_change_pct: -2.81, volume: 1456789 },
+    { name: 'TCS 10 APR 3500 CE', spot: 3456.20, ltp: 89.45, change: 15.80, change_pct: 21.44, oi: 1567890, oi_change: 45670, oi_change_pct: 3.00, volume: 987654 },
+    { name: 'NIFTY 08 APR 23500 CE', spot: 23123.65, ltp: 28.90, change: 8.45, change_pct: 41.32, oi: 7654321, oi_change: 345670, oi_change_pct: 4.73, volume: 8765432 },
+    { name: 'INFY 10 APR 1500 CE', spot: 1534.90, ltp: 52.30, change: 9.85, change_pct: 23.18, oi: 876543, oi_change: 23450, oi_change_pct: 2.75, volume: 654321 },
+    { name: 'BANKNIFTY 09 APR 52000 PE', spot: 52716.25, ltp: 98.70, change: -42.30, change_pct: -30.00, oi: 3456789, oi_change: -123450, oi_change_pct: -3.45, volume: 2345678 },
+    { name: 'TATAMOTORS 10 APR 650 CE', spot: 642.30, ltp: 18.40, change: 4.25, change_pct: 30.04, oi: 1876543, oi_change: 78900, oi_change_pct: 4.39, volume: 1234567 },
+    { name: 'SBIN 10 APR 800 CE', spot: 789.25, ltp: 22.60, change: 5.80, change_pct: 34.52, oi: 2345678, oi_change: 98760, oi_change_pct: 4.40, volume: 1876543 },
+    { name: 'ICICIBANK 10 APR 1100 PE', spot: 1123.40, ltp: 28.90, change: -6.45, change_pct: -18.24, oi: 1654321, oi_change: -45670, oi_change_pct: -2.69, volume: 987654 },
+    { name: 'NIFTY 08 APR 22500 PE', spot: 23123.65, ltp: 12.80, change: -15.45, change_pct: -54.70, oi: 4321098, oi_change: -198760, oi_change_pct: -4.40, volume: 3456789 },
+    { name: 'NIFTY 08 APR 23300 CE', spot: 23123.65, ltp: 65.40, change: 18.90, change_pct: 40.65, oi: 3987654, oi_change: 167890, oi_change_pct: 4.40, volume: 4567890 },
+    { name: 'BAJFINANCE 10 APR 7500 CE', spot: 7234.80, ltp: 145.60, change: -32.40, change_pct: -18.21, oi: 567890, oi_change: -12340, oi_change_pct: -2.13, volume: 345678 },
+    { name: 'AXISBANK 10 APR 1100 CE', spot: 1087.90, ltp: 34.50, change: 7.80, change_pct: 29.21, oi: 1234567, oi_change: 56780, oi_change_pct: 4.82, volume: 876543 }
+];
+
+/* Hardcoded watchlist items */
+var watchlistItems = [
+    { symbol: 'RELIANCE', exchange: 'NSE', price: 2834.50, change: 22.35, change_pct: 0.79 },
+    { symbol: 'TCS', exchange: 'NSE', price: 3456.20, change: -18.60, change_pct: -0.54 },
+    { symbol: 'HDFCBANK', exchange: 'NSE', price: 1645.80, change: 12.45, change_pct: 0.76 },
+    { symbol: 'INFY', exchange: 'NSE', price: 1534.90, change: 28.70, change_pct: 1.90 },
+    { symbol: 'ICICIBANK', exchange: 'NSE', price: 1123.40, change: -5.20, change_pct: -0.46 },
+    { symbol: 'SBIN', exchange: 'NSE', price: 789.25, change: 8.35, change_pct: 1.07 },
+    { symbol: 'BHARTIARTL', exchange: 'NSE', price: 1567.80, change: 34.50, change_pct: 2.25 },
+    { symbol: 'ITC', exchange: 'NSE', price: 456.30, change: -2.15, change_pct: -0.47 },
+    { symbol: 'KOTAKBANK', exchange: 'NSE', price: 1834.60, change: 15.20, change_pct: 0.84 },
+    { symbol: 'LT', exchange: 'NSE', price: 3245.70, change: -28.40, change_pct: -0.87 },
+    { symbol: 'WIPRO', exchange: 'NSE', price: 487.25, change: 28.15, change_pct: 6.14 }
+];
+
+/* Major ticker indices for the ticker bar */
+var tickerIndices = [
+    { name: 'NIFTY 50', ltp: 23123.65, change: 155.40, change_pct: 0.68 },
+    { name: 'SENSEX', ltp: 76234.80, change: 498.65, change_pct: 0.66 },
+    { name: 'NIFTY BANK', ltp: 52716.25, change: 107.15, change_pct: 0.20 },
+    { name: 'NIFTY IT', ltp: 36892.40, change: 412.80, change_pct: 1.13 },
+    { name: 'NIFTY FIN', ltp: 24685.55, change: 82.45, change_pct: 0.34 },
+    { name: 'INDIA VIX', ltp: 24.70, change: -0.77, change_pct: -3.02 }
+];
+
+/* ===== XSS PREVENTION ===== */
+function esc(s) {
+    if (s == null) return '';
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+/* ===== NUMBER FORMATTING (Indian system) ===== */
+function fmtNum(v, d) {
+    if (v == null || !isFinite(v)) return '--';
+    d = (d !== undefined) ? d : 2;
+    return Number(v).toLocaleString('en-IN', { minimumFractionDigits: d, maximumFractionDigits: d });
+}
+
+function fmtSign(v, d) {
+    if (v == null || !isFinite(v)) return '--';
+    d = (d !== undefined) ? d : 2;
+    return Number(v).toLocaleString('en-IN', { minimumFractionDigits: d, maximumFractionDigits: d });
+}
+
+function fmtInt(v) {
+    if (v == null || !isFinite(v)) return '--';
+    return Number(v).toLocaleString('en-IN', { maximumFractionDigits: 0 });
+}
+
+function fmtCr(v) {
+    if (v == null || !isFinite(v)) return '--';
+    return Number(v).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+/* ===== RENDER TICKER BAR ===== */
+function renderTickerBar(indices) {
+    var bar = document.getElementById('tickerBar');
+    var html = '';
+    indices.forEach(function(idx) {
+        var isUp = idx.change >= 0;
+        var cls = isUp ? 'up' : 'down';
+        var arrow = isUp ? '&#9650;' : '&#9660;';
+        html += '<div class="ticker-item">';
+        html += '<span class="ticker-name">' + esc(idx.name) + '</span>';
+        html += '<span class="ticker-price">' + fmtNum(idx.ltp) + '</span>';
+        html += '<span class="ticker-change ' + cls + '">' + arrow + ' ' + fmtSign(idx.change) + ' (' + fmtSign(idx.change_pct) + '%)</span>';
+        html += '</div>';
+    });
+    bar.innerHTML = html || '<div class="ticker-item"><span class="ticker-name">No data</span></div>';
+}
+
+/* ===== RENDER WATCHLIST ===== */
+function renderWatchlist() {
+    var wl = document.getElementById('watchlist');
+    var html = '';
+    watchlistItems.forEach(function(item) {
+        var isUp = item.change >= 0;
+        var barCls = isUp ? 'up' : 'down';
+        var chgCls = isUp ? 'up' : 'down';
+        html += '<div class="watchlist-item">';
+        html += '<div class="wl-left">';
+        html += '<div class="wl-bar ' + barCls + '"></div>';
+        html += '<div class="wl-info">';
+        html += '<span class="wl-symbol">' + esc(item.symbol) + '</span>';
+        html += '<span class="wl-exchange">' + esc(item.exchange) + '</span>';
+        html += '</div>';
+        html += '</div>';
+        html += '<div class="wl-right">';
+        html += '<span class="wl-price">' + fmtNum(item.price) + '</span>';
+        html += '<span class="wl-change ' + chgCls + '">' + fmtSign(item.change) + ' (' + fmtSign(item.change_pct) + '%)</span>';
+        html += '</div>';
+        html += '</div>';
+    });
+    wl.innerHTML = html;
+}
+
+/* ===== RENDER OPTIONS TABLE ===== */
+function renderOptionsTable(data) {
+    var body = document.getElementById('stockBody');
+    if (!data || data.length === 0) {
+        body.innerHTML = '<tr><td colspan="9" class="loading-msg">No options data available</td></tr>';
+        return;
+    }
+    var html = '';
+    data.forEach(function(o) {
+        var isUp = (o.change_pct || 0) >= 0;
+        var chgColor = isUp ? 'text-green' : 'text-red';
+        var oiChgUp = (o.oi_change_pct || 0) >= 0;
+        var oiColor = oiChgUp ? 'text-green' : 'text-red';
+
+        html += '<tr>';
+        html += '<td><div class="name-cell"><input type="checkbox"><span class="stock-name">' + esc(o.name || o.contract_name) + '</span></div></td>';
+        html += '<td>' + fmtNum(o.spot || o.spot_price) + '</td>';
+        html += '<td>' + fmtNum(o.ltp) + '</td>';
+        html += '<td class="' + chgColor + '">' + fmtNum(o.change) + '</td>';
+        html += '<td class="' + chgColor + '">' + fmtNum(o.change_pct) + ' %</td>';
+        html += '<td>' + fmtInt(o.oi) + '</td>';
+        html += '<td>' + fmtInt(o.oi_change) + '</td>';
+        html += '<td class="' + oiColor + '">' + fmtNum(o.oi_change_pct) + ' %</td>';
+        html += '<td>' + fmtInt(o.volume) + '</td>';
+        html += '</tr>';
+    });
+    body.innerHTML = html;
+}
+
+/* ===== SORT DATA BY FILTER ===== */
+function sortByFilter(data, filter) {
+    var sorted = data.slice();
+    switch (filter) {
+        case 'highest_oi': sorted.sort(function(a,b) { return (b.oi||0) - (a.oi||0); }); break;
+        case 'oi_gainers': sorted.sort(function(a,b) { return (b.oi_change_pct||0) - (a.oi_change_pct||0); }); break;
+        case 'oi_losers': sorted.sort(function(a,b) { return (a.oi_change_pct||0) - (b.oi_change_pct||0); }); break;
+        case 'top_volume': sorted.sort(function(a,b) { return (b.volume||0) - (a.volume||0); }); break;
+        case 'top_value': sorted.sort(function(a,b) { return Math.abs(b.change||0) - Math.abs(a.change||0); }); break;
+        case 'price_gainers': sorted.sort(function(a,b) { return (b.change_pct||0) - (a.change_pct||0); }); break;
+        case 'price_losers': sorted.sort(function(a,b) { return (a.change_pct||0) - (b.change_pct||0); }); break;
+    }
+    return sorted;
+}
+
+/* ===== FILTER SWITCHING ===== */
+function switchFilter(filter) {
+    currentFilter = filter;
+    document.querySelectorAll('.filter-tab').forEach(function(t) {
+        t.classList.toggle('active', t.getAttribute('data-filter') === filter);
+    });
+    loadData();
+}
+
+/* ===== DATA FETCHING ===== */
+function loadData() {
+    fetch('/api/market/option-movers?category=' + currentFilter)
+        .then(function(r) {
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            return r.json();
+        })
+        .then(function(d) {
+            if (d && d.available) {
+                var list = d[currentFilter] || d.highest_oi || [];
+                var mapped = list.map(function(o) {
+                    return {
+                        name: o.contract_name || o.name,
+                        spot: o.spot_price || o.spot,
+                        ltp: o.ltp,
+                        change: o.change,
+                        change_pct: o.change_pct,
+                        oi: o.oi,
+                        oi_change: o.oi_change,
+                        oi_change_pct: o.oi_change_pct,
+                        volume: o.volume
+                    };
+                });
+                if (mapped.length > 0) {
+                    renderOptionsTable(sortByFilter(mapped, currentFilter));
+                    return;
+                }
+            }
+            useFallback();
+        })
+        .catch(function() {
+            useFallback();
+        });
+
+    /* Also fetch ticker bar data */
+    fetch('/api/market/indices')
+        .then(function(r) {
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            return r.json();
+        })
+        .then(function(d) {
+            if (d && d.available && d.indices && d.indices.length > 0) {
+                var majorNames = ['NIFTY 50', 'SENSEX', 'NIFTY BANK', 'NIFTY IT', 'NIFTY FIN', 'INDIA VIX'];
+                var tickerData = [];
+                d.indices.forEach(function(idx) {
+                    var upperName = (idx.name || '').toUpperCase();
+                    for (var i = 0; i < majorNames.length; i++) {
+                        if (upperName.indexOf(majorNames[i]) >= 0 || majorNames[i].indexOf(upperName) >= 0) {
+                            tickerData.push(idx);
+                            break;
+                        }
+                    }
+                });
+                if (tickerData.length > 0) renderTickerBar(tickerData);
+            }
+        })
+        .catch(function() { /* keep existing */ });
+}
+
+function useFallback() {
+    renderOptionsTable(sortByFilter(fallbackOptions, currentFilter));
+}
+
+/* ===== SIDEBAR SEARCH ===== */
+function setupSearch() {
+    var input = document.getElementById('sidebarSearch');
+    input.addEventListener('input', function() {
+        var query = input.value.toLowerCase();
+        var items = document.querySelectorAll('.watchlist-item');
+        items.forEach(function(item) {
+            var symbol = item.querySelector('.wl-symbol').textContent.toLowerCase();
+            item.style.display = symbol.indexOf(query) >= 0 ? '' : 'none';
+        });
+    });
+}
+
+/* ===== SIDEBAR TAB SWITCHING ===== */
+function setupSidebarTabs() {
+    document.querySelectorAll('.sidebar-tab').forEach(function(tab) {
+        tab.addEventListener('click', function() {
+            document.querySelectorAll('.sidebar-tab').forEach(function(t) { t.classList.remove('active'); });
+            tab.classList.add('active');
+        });
+    });
+}
+
+/* ===== INIT ===== */
+renderWatchlist();
+renderTickerBar(tickerIndices);
+setupSearch();
+setupSidebarTabs();
+loadData();
+
+/* Auto-refresh every 3 seconds */
+refreshTimer = setInterval(loadData, 3000);
+</script>
+</body>
+</html>

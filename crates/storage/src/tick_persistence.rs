@@ -12,7 +12,7 @@
 //!
 //! # Error Handling & Zero-Tick-Loss Guarantee
 //! On QuestDB failure, ticks are held in a bounded ring buffer
-//! (`TICK_BUFFER_CAPACITY` = 300K ticks). When the ring buffer fills,
+//! (`TICK_BUFFER_CAPACITY` = 600K ticks). When the ring buffer fills,
 //! overflow ticks spill to disk (`data/spill/ticks-YYYYMMDD.bin`).
 //! On recovery, ring buffer drains first, then disk spill.
 //! On graceful shutdown, remaining ticks flush to QuestDB or disk.
@@ -29,8 +29,8 @@ use tracing::{debug, error, info, warn};
 
 use dhan_live_trader_common::config::QuestDbConfig;
 use dhan_live_trader_common::constants::{
-    DEPTH_BUFFER_CAPACITY, DEPTH_FLUSH_BATCH_SIZE, IST_UTC_OFFSET_NANOS,
-    QUESTDB_TABLE_MARKET_DEPTH, QUESTDB_TABLE_PREVIOUS_CLOSE, QUESTDB_TABLE_TICKS,
+    DEPTH_BUFFER_CAPACITY, DEPTH_FLUSH_BATCH_SIZE, IST_UTC_OFFSET_NANOS, IST_UTC_OFFSET_SECONDS,
+    QUESTDB_TABLE_MARKET_DEPTH, QUESTDB_TABLE_PREVIOUS_CLOSE, QUESTDB_TABLE_TICKS, SECONDS_PER_DAY,
     TICK_BUFFER_CAPACITY, TICK_BUFFER_HIGH_WATERMARK, TICK_FLUSH_BATCH_SIZE,
     TICK_FLUSH_INTERVAL_MS, TICK_SPILL_MIN_DISK_SPACE_BYTES,
 };
@@ -56,10 +56,16 @@ pub fn tick_dedup_key() -> &'static str {
 }
 
 /// Maximum number of reconnection attempts for QuestDB ILP sender.
+/// Used in tests to verify reconnect policy. Production reconnect is now
+/// non-blocking (single attempt per 30s throttle window).
+#[cfg(test)]
 const QUESTDB_ILP_MAX_RECONNECT_ATTEMPTS: u32 = 3;
 
 /// Initial reconnect delay for QuestDB ILP sender (milliseconds).
-/// Exponential backoff: 1000ms, 2000ms, 4000ms.
+/// Retained for test assertions. Production reconnect no longer sleeps —
+/// the 30-second throttle gate prevents reconnect storms without blocking
+/// the async executor.
+#[cfg(test)]
 const QUESTDB_ILP_RECONNECT_INITIAL_DELAY_MS: u64 = 1000;
 
 // ---------------------------------------------------------------------------
@@ -97,7 +103,15 @@ const _: () = assert!(
     "ParsedTick grew beyond TICK_SPILL_RECORD_SIZE — update serialize/deserialize"
 );
 
-/// Directory for tick spill files.
+/// Directory for tick/depth spill files (WAL on disk).
+/// Relative to CWD: Mac=project root, Docker=/app. Both resolve to same volume.
+///
+/// **F1 (2026-04-13):** This is now only the DEFAULT path. Each
+/// `TickPersistenceWriter` carries its own `spill_dir` field that can be
+/// overridden via `set_spill_dir_for_test()` for parallel test isolation.
+/// Production code always uses this default — no configuration change needed.
+/// TODO: Make configurable via `QuestDbConfig.spill_dir` when AWS deployment
+/// needs a dedicated high-IOPS volume (EBS io2 for spill, gp3 for data).
 const TICK_SPILL_DIR: &str = "data/spill";
 
 /// Serialize a `ParsedTick` to a fixed-size byte array for disk spill.
@@ -204,6 +218,22 @@ pub struct TickPersistenceWriter {
     spill_writer: Option<BufWriter<std::fs::File>>,
     /// Path of the current spill file (for drain + cleanup).
     spill_path: Option<std::path::PathBuf>,
+    /// A2: Dead-letter queue writer. Last-resort append-only NDJSON log when
+    /// both ring buffer AND disk spill fail. Every line is one lost tick with
+    /// the reason it couldn't be spilled. MUST always be 0 lines in production.
+    /// Lazy-opened on first double-failure.
+    dlq_writer: Option<BufWriter<std::fs::File>>,
+    /// Path of the current DLQ file (for rotation/audit).
+    dlq_path: Option<std::path::PathBuf>,
+    /// Total ticks written to DLQ (both ring AND spill failed).
+    /// This counter MUST always be 0 in production; any non-zero value is a
+    /// CRITICAL data integrity incident.
+    dlq_ticks_total: u64,
+    /// F1: Base directory for spill + DLQ files.
+    /// Production always uses `TICK_SPILL_DIR`. Tests can override via
+    /// `set_spill_dir_for_test()` to avoid shared-path races under parallel
+    /// execution. All spill/DLQ paths are derived from this directory.
+    spill_dir: std::path::PathBuf,
 }
 
 impl TickPersistenceWriter {
@@ -212,7 +242,7 @@ impl TickPersistenceWriter {
     /// # Errors
     /// Returns error if the ILP connection cannot be established.
     pub fn new(config: &QuestDbConfig) -> Result<Self> {
-        let conf_string = format!("tcp::addr={}:{};", config.host, config.ilp_port);
+        let conf_string = config.build_ilp_conf_string();
         let sender =
             Sender::from_conf(&conf_string).context("failed to connect to QuestDB via ILP")?;
         let buffer = sender.new_buffer();
@@ -231,6 +261,10 @@ impl TickPersistenceWriter {
             next_reconnect_allowed: std::time::Instant::now(),
             spill_writer: None,
             spill_path: None,
+            dlq_writer: None,
+            dlq_path: None,
+            dlq_ticks_total: 0,
+            spill_dir: std::path::PathBuf::from(TICK_SPILL_DIR),
         })
     }
 
@@ -243,7 +277,7 @@ impl TickPersistenceWriter {
     /// **Use this when QuestDB is unavailable at startup.** Zero tick loss —
     /// all ticks are buffered until QuestDB comes back.
     pub fn new_disconnected(config: &QuestDbConfig) -> Self {
-        let conf_string = format!("tcp::addr={}:{};", config.host, config.ilp_port);
+        let conf_string = config.build_ilp_conf_string();
         let buffer = Buffer::new(questdb::ingress::ProtocolVersion::V1);
 
         Self {
@@ -260,6 +294,10 @@ impl TickPersistenceWriter {
             next_reconnect_allowed: std::time::Instant::now(),
             spill_writer: None,
             spill_path: None,
+            dlq_writer: None,
+            dlq_path: None,
+            dlq_ticks_total: 0,
+            spill_dir: std::path::PathBuf::from(TICK_SPILL_DIR),
         }
     }
 
@@ -366,6 +404,42 @@ impl TickPersistenceWriter {
         Ok(())
     }
 
+    /// Flushes the ILP buffer directly, bypassing the `pending_count` guard.
+    ///
+    /// Use this for non-tick writes (e.g., `build_previous_close_row`) that write
+    /// to the buffer via `buffer_mut()` without incrementing `pending_count`.
+    /// Without this, those rows sit in the buffer until the next tick batch flush,
+    /// causing data loss if the app crashes or restarts before ticks arrive.
+    ///
+    /// Returns `Ok(())` if the buffer is empty (nothing to flush).
+    ///
+    /// DEPRECATED: previous_close table removed. No production call sites.
+    #[deprecated(note = "previous_close table removed — use day_close from Full ticks")]
+    pub fn flush_buffer_direct(&mut self) -> Result<()> {
+        // Nothing in buffer → no-op (avoid pointless TCP round-trip).
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+
+        if self.sender.is_none() {
+            self.try_reconnect_on_error()?;
+        }
+
+        let sender = self
+            .sender
+            .as_mut()
+            .context("sender unavailable in flush_buffer_direct")?;
+
+        if let Err(err) = sender.flush(&mut self.buffer) {
+            self.sender = None;
+            self.last_flush_ms = current_time_ms();
+            return Err(err).context("flush non-tick buffer to QuestDB");
+        }
+
+        self.last_flush_ms = current_time_ms();
+        Ok(())
+    }
+
     /// Rescues in-flight ticks (in the ILP buffer but not yet flushed) back to
     /// the ring buffer / disk spill. Called on flush failure to prevent data loss.
     /// Zero allocation: drains in-flight Vec directly without collecting into a new Vec.
@@ -459,21 +533,25 @@ impl TickPersistenceWriter {
     /// Spills a tick to disk when the ring buffer is full.
     /// Creates the spill directory and file lazily on first call.
     /// O(1) amortized — buffered sequential append.
+    ///
+    /// # A2 dead-letter fallback
+    /// If either the spill file cannot be opened OR the write fails, the tick
+    /// is forwarded to `write_to_dlq()` as a last-resort append-only NDJSON
+    /// record before being counted as dropped. Only if the DLQ write ALSO
+    /// fails is the tick permanently lost.
     #[rustfmt::skip]
     fn spill_tick_to_disk(&mut self, tick: &ParsedTick) {
         // Lazy-open the spill file.
         if self.spill_writer.is_none() && let Err(err) = self.open_spill_file() {
-            error!(?err, "CRITICAL: cannot open tick spill file — tick WILL be lost");
-            self.ticks_dropped_total = self.ticks_dropped_total.saturating_add(1);
-            metrics::counter!("dlt_ticks_dropped_total").absolute(self.ticks_dropped_total);
+            error!(?err, "CRITICAL: cannot open tick spill file — falling back to DLQ");
+            self.write_to_dlq(tick, "spill_open_failed");
             return;
         }
         let record = serialize_tick(tick);
         if let Some(ref mut writer) = self.spill_writer && let Err(err) = writer.write_all(&record) {
-            error!(?err, ticks_spilled = self.ticks_spilled_total, "CRITICAL: disk spill write failed — tick lost");
-            self.ticks_dropped_total = self.ticks_dropped_total.saturating_add(1);
-            metrics::counter!("dlt_ticks_dropped_total").absolute(self.ticks_dropped_total);
+            error!(?err, ticks_spilled = self.ticks_spilled_total, "CRITICAL: disk spill write failed — falling back to DLQ");
             self.spill_writer = None;
+            self.write_to_dlq(tick, "spill_write_failed");
             return;
         }
         self.ticks_spilled_total = self.ticks_spilled_total.saturating_add(1);
@@ -482,13 +560,122 @@ impl TickPersistenceWriter {
         }
     }
 
+    /// A2: Last-resort dead-letter write. Called when both ring buffer AND
+    /// disk spill have failed. Appends a single JSON line to
+    /// `data/spill/dlq-YYYYMMDD.ndjson` so the tick is recoverable by audit.
+    ///
+    /// If the DLQ file itself cannot be opened or written, only then is the
+    /// tick counted as permanently dropped.
+    ///
+    /// # Invariants
+    /// - `dlq_ticks_total` MUST always be 0 in production. Any non-zero value
+    ///   is a CRITICAL data integrity incident and triggers Telegram.
+    /// - The NDJSON format is one JSON object per line, UTF-8, LF-terminated.
+    /// - Fields: `ts_ms`, `reason`, `security_id`, `segment`, `ltt`, `ltp`,
+    ///   `ltq`, `volume`, `atp`, `buy_qty`, `sell_qty`, `open`, `close`,
+    ///   `high`, `low`, `oi`.
+    #[rustfmt::skip]
+    fn write_to_dlq(&mut self, tick: &ParsedTick, reason: &str) {
+        // Lazy-open DLQ file on first failure.
+        if self.dlq_writer.is_none() && let Err(err) = self.open_dlq_file() {
+            error!(?err, security_id = tick.security_id, reason, "CRITICAL: DLQ open failed — tick PERMANENTLY LOST");
+            self.ticks_dropped_total = self.ticks_dropped_total.saturating_add(1);
+            metrics::counter!("dlt_ticks_dropped_total").absolute(self.ticks_dropped_total);
+            return;
+        }
+        // Build one JSON line. Manual construction avoids a serde_json dep on this hot-ish path
+        // and keeps allocations to a single String (which is fine — this is the catastrophic
+        // double-failure path and NOT the hot path).
+        let now_ms = current_time_ms();
+        let segment = segment_code_to_str(tick.exchange_segment_code);
+        let line = format!(
+            "{{\"ts_ms\":{},\"reason\":\"{}\",\"security_id\":{},\"segment\":\"{}\",\"ltt\":{},\"ltp\":{},\"ltq\":{},\"volume\":{},\"atp\":{},\"buy_qty\":{},\"sell_qty\":{},\"open\":{},\"close\":{},\"high\":{},\"low\":{},\"oi\":{}}}\n",
+            now_ms, reason, tick.security_id, segment,
+            tick.exchange_timestamp, tick.last_traded_price, tick.last_trade_quantity,
+            tick.volume, tick.average_traded_price, tick.total_buy_quantity, tick.total_sell_quantity,
+            tick.day_open, tick.day_close, tick.day_high, tick.day_low, tick.open_interest,
+        );
+        if let Some(ref mut writer) = self.dlq_writer && let Err(err) = writer.write_all(line.as_bytes()) {
+            error!(?err, security_id = tick.security_id, reason, "CRITICAL: DLQ write failed — tick PERMANENTLY LOST");
+            self.dlq_writer = None;
+            self.ticks_dropped_total = self.ticks_dropped_total.saturating_add(1);
+            metrics::counter!("dlt_ticks_dropped_total").absolute(self.ticks_dropped_total);
+            return;
+        }
+        // Flush immediately — this path is already broken, durability is worth the fsync cost.
+        if let Some(ref mut writer) = self.dlq_writer && let Err(err) = writer.flush() {
+            error!(?err, "DLQ flush failed — line may not be durable on disk");
+        }
+        self.dlq_ticks_total = self.dlq_ticks_total.saturating_add(1);
+        metrics::counter!("dlt_dlq_ticks_total").absolute(self.dlq_ticks_total);
+        error!(
+            security_id = tick.security_id,
+            reason,
+            dlq_total = self.dlq_ticks_total,
+            "CRITICAL: tick written to DLQ — ring buffer and disk spill both failed. \
+             Manual audit required."
+        );
+    }
+
+    /// A2: Opens (or creates) the DLQ NDJSON file for the current date.
+    /// Appends to any existing file — the DLQ is append-only audit log.
+    /// F1: Uses `self.spill_dir` (configurable per-test).
+    fn open_dlq_file(&mut self) -> Result<()> {
+        std::fs::create_dir_all(&self.spill_dir).context("failed to create DLQ directory")?;
+
+        let date = chrono::Utc::now().format("%Y%m%d");
+        let path = self.spill_dir.join(format!("dlq-{date}.ndjson"));
+
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("failed to open DLQ file: {}", path.display()))?;
+
+        error!(path = %path.display(), "opened DLQ file — CRITICAL: ring buffer AND disk spill failed");
+        self.dlq_writer = Some(BufWriter::new(file));
+        self.dlq_path = Some(path);
+        Ok(())
+    }
+
+    /// A2: Returns the total number of ticks written to DLQ since the writer
+    /// was created. MUST always be 0 in production.
+    // TEST-EXEMPT: trivial field getter, covered by test_dlq_* suite in tick_persistence::tests
+    pub fn dlq_ticks_total(&self) -> u64 {
+        self.dlq_ticks_total
+    }
+
+    /// A2: Returns the path of the current DLQ file, if any has been opened.
+    /// Returns `None` if no double-failure has occurred.
+    // TEST-EXEMPT: trivial field getter, covered by test_dlq_initially_empty and test_dlq_written_when_spill_write_fails
+    pub fn dlq_path(&self) -> Option<&std::path::Path> {
+        self.dlq_path.as_deref()
+    }
+
+    /// F1: Override the spill directory. **Test-only.** Parallel tests must
+    /// use a per-test tmp directory to avoid colliding on the shared default
+    /// `data/spill/ticks-YYYYMMDD.bin` path. Production code never calls
+    /// this — it uses the default `TICK_SPILL_DIR`.
+    // TEST-EXEMPT: test-only setter, exercised by test_custom_spill_dir_used_for_spill and test_custom_spill_dir_used_for_dlq
+    pub fn set_spill_dir_for_test(&mut self, dir: std::path::PathBuf) {
+        self.spill_dir = dir;
+    }
+
+    /// F1: Returns the configured spill directory (default or test override).
+    // TEST-EXEMPT: trivial field getter, exercised by test_custom_spill_dir_used_for_spill
+    pub fn spill_dir(&self) -> &std::path::Path {
+        &self.spill_dir
+    }
+
     /// Opens (or creates) the spill file for the current date.
     /// A4: Checks available disk space and fires alert if low.
+    /// F1: Uses `self.spill_dir` (configurable per-test).
     fn open_spill_file(&mut self) -> Result<()> {
-        std::fs::create_dir_all(TICK_SPILL_DIR).context("failed to create tick spill directory")?;
+        std::fs::create_dir_all(&self.spill_dir)
+            .context("failed to create tick spill directory")?;
 
         // A4: Disk space check before first spill write.
-        if let Some(avail) = Self::available_disk_space_bytes() {
+        if let Some(avail) = Self::available_disk_space_bytes_for(&self.spill_dir) {
             let avail_mb = avail / (1024 * 1024);
             metrics::gauge!("dlt_spill_disk_available_mb").set(avail_mb as f64);
             if avail < TICK_SPILL_MIN_DISK_SPACE_BYTES {
@@ -507,7 +694,7 @@ impl TickPersistenceWriter {
         }
 
         let date = chrono::Utc::now().format("%Y%m%d");
-        let path = std::path::PathBuf::from(format!("{TICK_SPILL_DIR}/ticks-{date}.bin"));
+        let path = self.spill_dir.join(format!("ticks-{date}.bin"));
 
         let file = std::fs::OpenOptions::new()
             .create(true)
@@ -567,7 +754,7 @@ impl TickPersistenceWriter {
     #[rustfmt::skip]
     fn drain_disk_spill(&mut self) -> usize {
         if let Some(ref mut writer) = self.spill_writer && let Err(err) = writer.flush() {
-            warn!(?err, "BufWriter flush failed before drain — last ~111 ticks may be lost");
+            warn!(?err, "BufWriter flush failed before drain — last ~73 ticks may be lost (8KB buf / 112B per tick)");
         }
         self.spill_writer = None;
         let spill_path = match self.spill_path.take() { Some(p) => p, None => return 0 };
@@ -627,11 +814,12 @@ impl TickPersistenceWriter {
     #[rustfmt::skip]
     pub fn recover_stale_spill_files(&mut self) -> usize {
         if self.sender.is_none() { warn!("cannot recover stale spill files — QuestDB not connected"); return 0; }
-        let dir = match std::fs::read_dir(TICK_SPILL_DIR) {
+        // F1: use configurable spill_dir.
+        let dir = match std::fs::read_dir(&self.spill_dir) {
             Ok(d) => d,
             Err(err) => {
                 if err.kind() == std::io::ErrorKind::NotFound { return 0; }
-                warn!(?err, dir = TICK_SPILL_DIR, "cannot read tick spill directory for recovery"); return 0;
+                warn!(?err, dir = %self.spill_dir.display(), "cannot read tick spill directory for recovery"); return 0;
             }
         };
         let mut total_recovered: usize = 0;
@@ -687,55 +875,37 @@ impl TickPersistenceWriter {
 
     /// Attempts to reconnect to QuestDB by creating a new ILP sender.
     ///
-    /// Uses exponential backoff: 1s, 2s, 4s over 3 attempts.
-    /// On success, replaces the sender and creates a fresh buffer.
-    /// In-flight ticks must be rescued BEFORE calling this method
-    /// (via `rescue_in_flight()`).
+    /// **Non-blocking:** No sleep/backoff in the hot path. Attempts connection
+    /// immediately. If it fails, returns error and the caller buffers ticks to
+    /// the ring buffer. The 30-second throttle in `try_reconnect_on_error()`
+    /// prevents reconnect storms. This design ensures the tick processor task
+    /// is NEVER blocked by QuestDB outages.
     ///
     /// # Errors
-    /// Returns error if all reconnection attempts fail.
+    /// Returns error if reconnection fails.
     fn reconnect(&mut self) -> Result<()> {
-        let mut delay_ms = QUESTDB_ILP_RECONNECT_INITIAL_DELAY_MS;
+        // Single non-blocking attempt — no std::thread::sleep on the hot path.
+        // The RECONNECT_THROTTLE_SECS gate in try_reconnect_on_error() ensures
+        // we only attempt once per 30 seconds during sustained outages.
+        warn!("attempting QuestDB ILP reconnection for tick writer (non-blocking)");
 
-        for attempt in 1..=QUESTDB_ILP_MAX_RECONNECT_ATTEMPTS {
-            warn!(
-                attempt,
-                max_attempts = QUESTDB_ILP_MAX_RECONNECT_ATTEMPTS,
-                delay_ms,
-                "attempting QuestDB ILP reconnection for tick writer"
-            );
-
-            std::thread::sleep(Duration::from_millis(delay_ms));
-
-            match Sender::from_conf(&self.ilp_conf_string) {
-                Ok(new_sender) => {
-                    self.buffer = new_sender.new_buffer();
-                    self.sender = Some(new_sender);
-                    self.pending_count = 0;
-                    self.last_flush_ms = current_time_ms();
-                    info!(
-                        attempt,
-                        "QuestDB ILP reconnection succeeded for tick writer"
-                    );
-                    return Ok(());
-                }
-                Err(err) => {
-                    error!(
-                        attempt,
-                        max_attempts = QUESTDB_ILP_MAX_RECONNECT_ATTEMPTS,
-                        ?err,
-                        "QuestDB ILP reconnection failed for tick writer"
-                    );
-                    // Exponential backoff: double the delay for next attempt.
-                    delay_ms = delay_ms.saturating_mul(2);
-                }
+        match Sender::from_conf(&self.ilp_conf_string) {
+            Ok(new_sender) => {
+                self.buffer = new_sender.new_buffer();
+                self.sender = Some(new_sender);
+                self.pending_count = 0;
+                self.last_flush_ms = current_time_ms();
+                info!("QuestDB ILP reconnection succeeded for tick writer");
+                Ok(())
+            }
+            Err(err) => {
+                error!(
+                    ?err,
+                    "QuestDB ILP reconnection failed for tick writer — ticks buffered in ring"
+                );
+                anyhow::bail!("QuestDB ILP reconnection failed for tick writer")
             }
         }
-
-        anyhow::bail!(
-            "QuestDB ILP reconnection failed after {} attempts for tick writer",
-            QUESTDB_ILP_MAX_RECONNECT_ATTEMPTS,
-        )
     }
 
     /// Attempts reconnection only when the sender is `None` (i.e., after a
@@ -841,14 +1011,18 @@ impl TickPersistenceWriter {
 
     /// Returns available disk space in bytes for the spill directory.
     /// Returns `None` if the check fails (e.g., directory doesn't exist yet).
-    fn available_disk_space_bytes() -> Option<u64> {
+    /// F1: Parameterised by directory so per-test override paths work correctly.
+    /// Returns available disk space in bytes for the given directory. Returns
+    /// `None` if the check fails (directory doesn't exist or df unavailable).
+    fn available_disk_space_bytes_for(dir: &std::path::Path) -> Option<u64> {
         // Create spill dir if needed so df can query it.
-        let _ = std::fs::create_dir_all(TICK_SPILL_DIR);
+        let _ = std::fs::create_dir_all(dir);
         #[cfg(target_family = "unix")]
         {
+            let dir_str = dir.to_str()?;
             // Use `df --output=avail -B1` to get available bytes without libc dependency.
             let output = std::process::Command::new("df")
-                .args(["--output=avail", "-B1", TICK_SPILL_DIR])
+                .args(["--output=avail", "-B1", dir_str])
                 .output()
                 .ok()?;
             if !output.status.success() {
@@ -860,6 +1034,7 @@ impl TickPersistenceWriter {
         }
         #[cfg(not(target_family = "unix"))]
         {
+            let _ = dir;
             None // Disk space check not available on non-Unix.
         }
     }
@@ -880,7 +1055,7 @@ const F32_DECIMAL_BUF_SIZE: usize = 24;
 ///   21004.95_f32 → `f64::from()` → 21004.94921875_f64  ← WRONG
 ///   21004.95_f32 → this function → 21004.95_f64         ← CORRECT
 ///
-/// Matches the Dhan Python SDK behavior: `"{:.2f}".format(value)`.
+/// Matches the Dhan API (Python SDK ref) behavior: `"{:.2f}".format(value)`.
 ///
 /// # Performance
 /// Zero heap allocation — uses a stack buffer for the decimal string.
@@ -1152,15 +1327,16 @@ pub async fn ensure_tick_table_dedup_keys(questdb_config: &QuestDbConfig) {
 struct BufferedDepth {
     security_id: u32,
     exchange_segment_code: u8,
+    exchange_timestamp: u32,
     received_at_nanos: i64,
     depth: [MarketDepthLevel; 5],
 }
 
-/// Fixed record size for disk-spilled depth snapshots: 116 bytes per snapshot.
-/// Layout: security_id(4) + segment(1) + pad(3) + received_nanos(8) +
-///         5 x [bid_qty(4) + ask_qty(4) + bid_orders(2) + ask_orders(2) +
-///              bid_price(4) + ask_price(4)] = 16 + 100 = 116 bytes (aligned).
-const DEPTH_SPILL_RECORD_SIZE: usize = 116;
+/// Fixed record size for disk-spilled depth snapshots: 120 bytes per snapshot.
+/// Layout: security_id(4) + segment(1) + pad(3) + exchange_timestamp(4) + pad(4) +
+///         received_nanos(8) + 5 x [bid_qty(4) + ask_qty(4) + bid_orders(2) +
+///         ask_orders(2) + bid_price(4) + ask_price(4)] = 24 + 100 = 124 bytes.
+const DEPTH_SPILL_RECORD_SIZE: usize = 124;
 
 /// Directory for depth spill files.
 const DEPTH_SPILL_DIR: &str = "data/spill";
@@ -1172,8 +1348,10 @@ fn serialize_depth(d: &BufferedDepth) -> [u8; DEPTH_SPILL_RECORD_SIZE] {
     buf[0..4].copy_from_slice(&d.security_id.to_le_bytes());
     buf[4] = d.exchange_segment_code;
     // buf[5..7] = padding
-    buf[8..16].copy_from_slice(&d.received_at_nanos.to_le_bytes());
-    let mut offset = 16;
+    buf[8..12].copy_from_slice(&d.exchange_timestamp.to_le_bytes());
+    // buf[12..15] = padding
+    buf[16..24].copy_from_slice(&d.received_at_nanos.to_le_bytes());
+    let mut offset = 24;
     for level in &d.depth {
         buf[offset..offset + 4].copy_from_slice(&level.bid_quantity.to_le_bytes());
         buf[offset + 4..offset + 8].copy_from_slice(&level.ask_quantity.to_le_bytes());
@@ -1194,11 +1372,12 @@ fn serialize_depth(d: &BufferedDepth) -> [u8; DEPTH_SPILL_RECORD_SIZE] {
 fn deserialize_depth(buf: &[u8; DEPTH_SPILL_RECORD_SIZE]) -> BufferedDepth {
     let security_id = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
     let exchange_segment_code = buf[4];
+    let exchange_timestamp = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
     let received_at_nanos = i64::from_le_bytes([
-        buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
+        buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23],
     ]);
     let mut depth = [MarketDepthLevel::default(); 5];
-    let mut offset = 16;
+    let mut offset = 24;
     for level in &mut depth {
         level.bid_quantity = u32::from_le_bytes([
             buf[offset],
@@ -1235,6 +1414,7 @@ fn deserialize_depth(buf: &[u8; DEPTH_SPILL_RECORD_SIZE]) -> BufferedDepth {
     BufferedDepth {
         security_id,
         exchange_segment_code,
+        exchange_timestamp,
         received_at_nanos,
         depth,
     }
@@ -1285,7 +1465,7 @@ pub struct DepthPersistenceWriter {
 impl DepthPersistenceWriter {
     /// Creates a new depth writer connected to QuestDB via ILP TCP.
     pub fn new(config: &QuestDbConfig) -> Result<Self> {
-        let conf_string = format!("tcp::addr={}:{};", config.host, config.ilp_port);
+        let conf_string = config.build_ilp_conf_string();
         let sender = Sender::from_conf(&conf_string)
             .context("failed to connect to QuestDB via ILP for depth")?;
         let buffer = sender.new_buffer();
@@ -1312,7 +1492,7 @@ impl DepthPersistenceWriter {
     /// buffered in the ring buffer (`DEPTH_BUFFER_CAPACITY`) + disk spill until
     /// QuestDB becomes available. Auto-reconnect polls every 30 seconds.
     pub fn new_disconnected(config: &QuestDbConfig) -> Self {
-        let conf_string = format!("tcp::addr={}:{};", config.host, config.ilp_port);
+        let conf_string = config.build_ilp_conf_string();
         let buffer = Buffer::new(questdb::ingress::ProtocolVersion::V1);
 
         Self {
@@ -1348,6 +1528,7 @@ impl DepthPersistenceWriter {
         &mut self,
         security_id: u32,
         exchange_segment_code: u8,
+        exchange_timestamp: u32,
         received_at_nanos: i64,
         depth: &[MarketDepthLevel; 5],
     ) -> Result<()> {
@@ -1363,6 +1544,7 @@ impl DepthPersistenceWriter {
                     self.buffer_depth(BufferedDepth {
                         security_id,
                         exchange_segment_code,
+                        exchange_timestamp,
                         received_at_nanos,
                         depth: *depth,
                     });
@@ -1375,15 +1557,17 @@ impl DepthPersistenceWriter {
             &mut self.buffer,
             security_id,
             exchange_segment_code,
+            exchange_timestamp,
             received_at_nanos,
             depth,
         )?;
 
         // Track in-flight: save a copy so we can rescue on flush failure.
-        // BufferedDepth is Copy (116 bytes) — this is a memcpy, not a heap alloc.
+        // BufferedDepth is Copy — this is a memcpy, not a heap alloc.
         self.in_flight.push(BufferedDepth {
             security_id,
             exchange_segment_code,
+            exchange_timestamp,
             received_at_nanos,
             depth: *depth,
         });
@@ -1555,7 +1739,7 @@ impl DepthPersistenceWriter {
         let ring_count = self.depth_buffer.len();
         let mut drained: usize = 0;
         while let Some(snapshot) = self.depth_buffer.pop_front() {
-            if let Err(err) = build_depth_rows(&mut self.buffer, snapshot.security_id, snapshot.exchange_segment_code, snapshot.received_at_nanos, &snapshot.depth) {
+            if let Err(err) = build_depth_rows(&mut self.buffer, snapshot.security_id, snapshot.exchange_segment_code, snapshot.exchange_timestamp, snapshot.received_at_nanos, &snapshot.depth) {
                 error!(?err, security_id = snapshot.security_id, "CRITICAL: build_depth_rows failed during drain — snapshot lost"); continue;
             }
             self.in_flight.push(snapshot);
@@ -1597,7 +1781,7 @@ impl DepthPersistenceWriter {
                 Err(err) => { warn!(?err, drained, "depth disk spill read error — stopping drain"); break; }
             }
             let snapshot = deserialize_depth(&record);
-            if let Err(err) = build_depth_rows(&mut self.buffer, snapshot.security_id, snapshot.exchange_segment_code, snapshot.received_at_nanos, &snapshot.depth) {
+            if let Err(err) = build_depth_rows(&mut self.buffer, snapshot.security_id, snapshot.exchange_segment_code, snapshot.exchange_timestamp, snapshot.received_at_nanos, &snapshot.depth) {
                 error!(?err, security_id = snapshot.security_id, "CRITICAL: build_depth_rows failed during spill drain — snapshot lost"); continue;
             }
             self.in_flight.push(snapshot);
@@ -1622,55 +1806,36 @@ impl DepthPersistenceWriter {
 
     /// Attempts to reconnect to QuestDB by creating a new ILP sender.
     ///
-    /// Uses exponential backoff: 1s, 2s, 4s over 3 attempts.
-    /// On success, replaces the sender and creates a fresh buffer.
-    /// In-flight snapshots must be rescued BEFORE calling this method
-    /// (via `rescue_in_flight()`).
+    /// **Non-blocking:** No sleep/backoff in the hot path. Attempts connection
+    /// immediately. If it fails, returns error and the caller buffers depth
+    /// snapshots to the ring buffer. The 30-second throttle in
+    /// `try_reconnect_on_error()` prevents reconnect storms.
     ///
     /// # Errors
-    /// Returns error if all reconnection attempts fail.
+    /// Returns error if reconnection fails.
     fn reconnect(&mut self) -> Result<()> {
-        let mut delay_ms = QUESTDB_ILP_RECONNECT_INITIAL_DELAY_MS;
+        warn!(
+            buffered_snapshots = self.depth_buffer.len(),
+            "attempting QuestDB ILP reconnection for depth writer (non-blocking)"
+        );
 
-        for attempt in 1..=QUESTDB_ILP_MAX_RECONNECT_ATTEMPTS {
-            warn!(
-                attempt,
-                max_attempts = QUESTDB_ILP_MAX_RECONNECT_ATTEMPTS,
-                delay_ms,
-                buffered_snapshots = self.depth_buffer.len(),
-                "attempting QuestDB ILP reconnection for depth writer"
-            );
-
-            std::thread::sleep(Duration::from_millis(delay_ms));
-
-            match Sender::from_conf(&self.ilp_conf_string) {
-                Ok(new_sender) => {
-                    self.buffer = new_sender.new_buffer();
-                    self.sender = Some(new_sender);
-                    self.pending_count = 0;
-                    self.last_flush_ms = current_time_ms();
-                    info!(
-                        attempt,
-                        "QuestDB ILP reconnection succeeded for depth writer"
-                    );
-                    return Ok(());
-                }
-                Err(err) => {
-                    error!(
-                        attempt,
-                        max_attempts = QUESTDB_ILP_MAX_RECONNECT_ATTEMPTS,
-                        ?err,
-                        "QuestDB ILP reconnection failed for depth writer"
-                    );
-                    delay_ms = delay_ms.saturating_mul(2);
-                }
+        match Sender::from_conf(&self.ilp_conf_string) {
+            Ok(new_sender) => {
+                self.buffer = new_sender.new_buffer();
+                self.sender = Some(new_sender);
+                self.pending_count = 0;
+                self.last_flush_ms = current_time_ms();
+                info!("QuestDB ILP reconnection succeeded for depth writer");
+                Ok(())
+            }
+            Err(err) => {
+                error!(
+                    ?err,
+                    "QuestDB ILP reconnection failed for depth writer — depth buffered in ring"
+                );
+                anyhow::bail!("QuestDB ILP reconnection failed for depth writer")
             }
         }
-
-        anyhow::bail!(
-            "QuestDB ILP reconnection failed after {} attempts for depth writer",
-            QUESTDB_ILP_MAX_RECONNECT_ATTEMPTS,
-        )
     }
 
     /// Attempts reconnection only when the sender is `None`. Throttled to at
@@ -1821,7 +1986,7 @@ impl DepthPersistenceWriter {
                     Err(err) => { warn!(?err, drained, path = %path.display(), "stale depth spill read error — stopping drain"); break; }
                 }
                 let snapshot = deserialize_depth(&record);
-                if let Err(err) = build_depth_rows(&mut self.buffer, snapshot.security_id, snapshot.exchange_segment_code, snapshot.received_at_nanos, &snapshot.depth) {
+                if let Err(err) = build_depth_rows(&mut self.buffer, snapshot.security_id, snapshot.exchange_segment_code, snapshot.exchange_timestamp, snapshot.received_at_nanos, &snapshot.depth) {
                     warn!(?err, security_id = snapshot.security_id, "build_depth_rows failed during stale spill drain — snapshot skipped"); continue;
                 }
                 self.in_flight.push(snapshot);
@@ -1848,16 +2013,26 @@ impl DepthPersistenceWriter {
 /// Writes 5 depth-level rows into the ILP buffer for a single snapshot.
 ///
 /// Table: `market_depth` with columns: segment, security_id, level (1-5),
-/// bid_qty, ask_qty, bid_orders, ask_orders, bid_price, ask_price, received_at, ts.
+/// bid_qty, ask_qty, bid_orders, ask_orders, bid_price, ask_price,
+/// exchange_timestamp (IST epoch secs from Full packet LTT), received_at, ts.
+///
+/// Follows the same timestamp pattern as the `ticks` table:
+/// - `ts` = exchange_timestamp * 1B nanos (IST epoch, NO offset)
+/// - `received_at` = UTC nanos + IST offset
+/// - `exchange_timestamp` = raw IST epoch seconds LONG
 ///
 /// Price fields use `f32_to_f64_clean` to preserve Dhan f32 precision.
 fn build_depth_rows(
     buffer: &mut Buffer,
     security_id: u32,
     exchange_segment_code: u8,
+    exchange_timestamp: u32,
     received_at_nanos: i64,
     depth: &[MarketDepthLevel; 5],
 ) -> Result<()> {
+    // Dhan WebSocket exchange_timestamp (LTT) is already IST epoch seconds.
+    // Store directly — no offset needed. Same rule as ticks table.
+    let ts_nanos = TimestampNanos::new(i64::from(exchange_timestamp).saturating_mul(1_000_000_000));
     // UTC nanos → IST-as-UTC: add IST offset so QuestDB shows IST wall-clock time.
     let received_nanos =
         TimestampNanos::new(received_at_nanos.saturating_add(IST_UTC_OFFSET_NANOS));
@@ -1887,9 +2062,11 @@ fn build_depth_rows(
             .context("depth bid_price")?
             .column_f64("ask_price", f32_to_f64_clean(level.ask_price))
             .context("depth ask_price")?
+            .column_i64("exchange_timestamp", i64::from(exchange_timestamp))
+            .context("depth exchange_timestamp")?
             .column_ts("received_at", received_nanos)
             .context("depth received_at")?
-            .at(received_nanos)
+            .at(ts_nanos)
             .context("depth designated timestamp")?;
     }
 
@@ -1903,10 +2080,17 @@ fn build_depth_rows(
 /// Writes a previous close record to the `previous_close` table.
 ///
 /// Called once per security when a code 6 packet arrives (typically at session start).
-/// Uses `received_at` as designated timestamp since Dhan doesn't send a timestamp
-/// in this packet type. Shifted to IST-as-UTC for consistency with all other tables.
+///
+/// **Dedup guarantee:** The designated timestamp (`ts`) is set to **midnight IST** of
+/// the current date (not `received_at`). This ensures the DEDUP UPSERT KEY
+/// `(ts, security_id, segment)` produces identical keys across app restarts on the
+/// same day. Multiple restarts = same `ts` = QuestDB deduplicates automatically.
+/// `received_at` is kept as a separate column for debugging (shows actual receive time).
 ///
 /// Price field uses `f32_to_f64_clean` to preserve Dhan f32 precision.
+///
+/// DEPRECATED: previous_close table removed (day_close from Full ticks used instead).
+/// Kept for tests and potential future use. No production call sites as of 2026-04-10.
 pub fn build_previous_close_row(
     buffer: &mut Buffer,
     security_id: u32,
@@ -1915,9 +2099,19 @@ pub fn build_previous_close_row(
     previous_oi: u32,
     received_at_nanos: i64,
 ) -> Result<()> {
-    // UTC nanos → IST-as-UTC: add IST offset so QuestDB shows IST wall-clock time.
+    // received_at: actual receive time (UTC → IST-as-UTC for display).
     let received_nanos =
         TimestampNanos::new(received_at_nanos.saturating_add(IST_UTC_OFFSET_NANOS));
+
+    // ts (designated timestamp): midnight IST today.
+    // This makes the DEDUP key deterministic across restarts on the same day.
+    // Same security_id + segment + midnight = same row, deduped by QuestDB.
+    let ist_secs = received_at_nanos
+        .saturating_div(1_000_000_000)
+        .saturating_add(i64::from(IST_UTC_OFFSET_SECONDS));
+    #[allow(clippy::arithmetic_side_effects)] // APPROVED: modulo by 86400 is safe
+    let midnight_ist_secs = ist_secs - (ist_secs % i64::from(SECONDS_PER_DAY));
+    let midnight_nanos = TimestampNanos::new(midnight_ist_secs.saturating_mul(1_000_000_000));
 
     buffer
         .table(QUESTDB_TABLE_PREVIOUS_CLOSE)
@@ -1930,7 +2124,9 @@ pub fn build_previous_close_row(
         .context("prev_close price")?
         .column_i64("prev_oi", i64::from(previous_oi))
         .context("prev_close oi")?
-        .at(received_nanos)
+        .column_ts("received_at", received_nanos)
+        .context("prev_close received_at")?
+        .at(midnight_nanos)
         .context("prev_close designated timestamp")?;
 
     Ok(())
@@ -1941,6 +2137,8 @@ pub fn build_previous_close_row(
 // ---------------------------------------------------------------------------
 
 /// SQL to create the `market_depth` table with explicit schema.
+/// Matches ticks table pattern: exchange_timestamp (IST epoch secs from LTT),
+/// received_at (local clock IST), ts (designated = exchange_timestamp * 1B).
 const MARKET_DEPTH_CREATE_DDL: &str = "\
     CREATE TABLE IF NOT EXISTS market_depth (\
         segment SYMBOL,\
@@ -1952,18 +2150,30 @@ const MARKET_DEPTH_CREATE_DDL: &str = "\
         ask_orders LONG,\
         bid_price DOUBLE,\
         ask_price DOUBLE,\
+        exchange_timestamp LONG,\
         received_at TIMESTAMP,\
         ts TIMESTAMP\
     ) TIMESTAMP(ts) PARTITION BY HOUR WAL\
 ";
 
-/// SQL to create the `previous_close` table with explicit schema.
+/// S4 fix: restored as `#[allow(dead_code)]` because legacy in-module
+/// tests (inside `#[cfg(test)] mod tests`) still reference these constants
+/// for schema-stability assertions. The constants are no longer CALLED
+/// in production code per Dhan Ticket #5525125 — NSE_EQ/NSE_FNO prev-close
+/// comes from the `close` field inside Quote (bytes 38-41) and Full
+/// (bytes 50-53) packets. IDX_I prev-close is parsed from code 6 but
+/// surfaced via `day_close` in ParsedTick, not a dedicated table. The
+/// tests that reference these constants verify schema stability for the
+/// archived design; deleting them would lose schema-drift coverage on
+/// any future rollback.
+#[allow(dead_code)] // APPROVED: referenced by legacy schema-stability tests only
 const PREVIOUS_CLOSE_CREATE_DDL: &str = "\
     CREATE TABLE IF NOT EXISTS previous_close (\
         segment SYMBOL,\
         security_id LONG,\
         prev_close DOUBLE,\
         prev_oi LONG,\
+        received_at TIMESTAMP,\
         ts TIMESTAMP\
     ) TIMESTAMP(ts) PARTITION BY DAY WAL\
 ";
@@ -1973,8 +2183,9 @@ const PREVIOUS_CLOSE_CREATE_DDL: &str = "\
 /// (same security_id can exist on NSE_EQ and BSE_EQ).
 const DEDUP_KEY_MARKET_DEPTH: &str = "security_id, segment, level";
 
-/// DEDUP UPSERT KEY for the `previous_close` table.
-/// STORAGE-GAP-01: Includes segment to prevent cross-segment collision.
+/// S4 fix: restored alongside `PREVIOUS_CLOSE_CREATE_DDL` for the same
+/// reason — legacy schema-stability tests.
+#[allow(dead_code)] // APPROVED: referenced by legacy schema-stability tests only
 const DEDUP_KEY_PREVIOUS_CLOSE: &str = "security_id, segment";
 
 /// Creates the `market_depth` and `previous_close` tables and enables DEDUP UPSERT KEYS.
@@ -2007,27 +2218,24 @@ pub async fn ensure_depth_and_prev_close_tables(questdb_config: &QuestDbConfig) 
     );
     execute_ddl_best_effort(&client, &base_url, &dedup_depth, "market_depth DEDUP").await;
 
-    // --- previous_close table ---
-    execute_ddl_best_effort(
-        &client,
-        &base_url,
-        PREVIOUS_CLOSE_CREATE_DDL,
-        "previous_close CREATE",
-    )
-    .await;
-    let dedup_prev_close = format!(
-        "ALTER TABLE {} DEDUP ENABLE UPSERT KEYS(ts, {})",
-        QUESTDB_TABLE_PREVIOUS_CLOSE, DEDUP_KEY_PREVIOUS_CLOSE
+    // Migration: add exchange_timestamp column to existing market_depth tables (idempotent).
+    let add_exchange_ts = format!(
+        "ALTER TABLE {} ADD COLUMN IF NOT EXISTS exchange_timestamp LONG",
+        QUESTDB_TABLE_MARKET_DEPTH
     );
     execute_ddl_best_effort(
         &client,
         &base_url,
-        &dedup_prev_close,
-        "previous_close DEDUP",
+        &add_exchange_ts,
+        "market_depth exchange_timestamp migration",
     )
     .await;
 
-    info!("market_depth and previous_close table setup complete");
+    // previous_close table REMOVED — day_close from Full packet ticks provides
+    // previous close for ALL instruments. No separate table needed.
+    // Dhan confirmed (Ticket #5525125): day_close = previous session's close.
+
+    info!("market_depth table setup complete (previous_close table removed)");
 }
 
 // ---------------------------------------------------------------------------
@@ -3304,6 +3512,68 @@ mod tests {
         assert_eq!(writer.pending_count(), 0);
     }
 
+    /// flush_buffer_direct() bypasses the pending_count guard so that non-tick
+    /// writes (e.g., build_previous_close_row via buffer_mut()) get flushed
+    /// immediately instead of waiting for tick batch flush.
+    #[test]
+    fn test_flush_buffer_direct_bypasses_pending_count() {
+        let port = spawn_tcp_drain_server();
+
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+        assert_eq!(writer.pending_count(), 0, "no ticks pending");
+
+        // Write a previous_close row directly to buffer (simulates what
+        // tick_processor does for PrevClose packets).
+        build_previous_close_row(writer.buffer_mut(), 13, 2, 24300.5, 120000, 1_000_000_000)
+            .unwrap();
+        assert_eq!(
+            writer.pending_count(),
+            0,
+            "pending_count must NOT increment for non-tick writes"
+        );
+
+        // force_flush would return early here (pending_count == 0).
+        // flush_buffer_direct must actually flush.
+        let result = writer.flush_buffer_direct();
+        assert!(
+            result.is_ok(),
+            "flush_buffer_direct must flush even when pending_count == 0"
+        );
+
+        // Buffer should be empty after flush.
+        assert!(
+            writer.buffer_mut().is_empty(),
+            "buffer must be empty after flush_buffer_direct"
+        );
+    }
+
+    /// flush_buffer_direct() is a no-op when the buffer is truly empty.
+    #[test]
+    fn test_flush_buffer_direct_empty_is_noop() {
+        let port = spawn_tcp_drain_server();
+
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: port,
+            pg_port: port,
+            ilp_port: port,
+        };
+
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+        let result = writer.flush_buffer_direct();
+        assert!(
+            result.is_ok(),
+            "empty buffer flush_buffer_direct must be Ok"
+        );
+    }
+
     #[test]
     fn test_tick_persistence_writer_flush_if_needed_empty() {
         let port = spawn_tcp_drain_server();
@@ -3643,7 +3913,7 @@ mod tests {
     fn test_build_depth_rows_writes_five_rows() {
         let depth = make_test_depth();
         let mut buf = Buffer::new(ProtocolVersion::V1);
-        build_depth_rows(&mut buf, 13, 2, 1_000_000_000, &depth).unwrap();
+        build_depth_rows(&mut buf, 13, 2, 1_740_556_500, 1_000_000_000, &depth).unwrap();
         let content = String::from_utf8_lossy(buf.as_bytes());
 
         // Should produce exactly 5 ILP lines (one per level)
@@ -3655,7 +3925,7 @@ mod tests {
     fn test_build_depth_rows_contains_table_name() {
         let depth = make_test_depth();
         let mut buf = Buffer::new(ProtocolVersion::V1);
-        build_depth_rows(&mut buf, 13, 2, 1_000_000_000, &depth).unwrap();
+        build_depth_rows(&mut buf, 13, 2, 1_740_556_500, 1_000_000_000, &depth).unwrap();
         let content = String::from_utf8_lossy(buf.as_bytes());
 
         assert!(
@@ -3668,7 +3938,7 @@ mod tests {
     fn test_build_depth_rows_level_numbers() {
         let depth = make_test_depth();
         let mut buf = Buffer::new(ProtocolVersion::V1);
-        build_depth_rows(&mut buf, 42, 2, 1_000_000_000, &depth).unwrap();
+        build_depth_rows(&mut buf, 42, 2, 1_740_556_500, 1_000_000_000, &depth).unwrap();
         let content = String::from_utf8_lossy(buf.as_bytes());
 
         for level in 1..=5 {
@@ -3683,7 +3953,7 @@ mod tests {
     fn test_build_depth_rows_bid_ask_values() {
         let depth = make_test_depth();
         let mut buf = Buffer::new(ProtocolVersion::V1);
-        build_depth_rows(&mut buf, 13, 2, 1_000_000_000, &depth).unwrap();
+        build_depth_rows(&mut buf, 13, 2, 1_740_556_500, 1_000_000_000, &depth).unwrap();
         let content = String::from_utf8_lossy(buf.as_bytes());
 
         // Level 1 values
@@ -3701,7 +3971,7 @@ mod tests {
         depth[0].bid_price = 21004.95;
         depth[0].ask_price = 744.15;
         let mut buf = Buffer::new(ProtocolVersion::V1);
-        build_depth_rows(&mut buf, 13, 2, 1_000_000_000, &depth).unwrap();
+        build_depth_rows(&mut buf, 13, 2, 1_740_556_500, 1_000_000_000, &depth).unwrap();
         let content = String::from_utf8_lossy(buf.as_bytes());
 
         assert!(
@@ -3718,7 +3988,7 @@ mod tests {
     fn test_build_depth_rows_zero_depth() {
         let depth = [MarketDepthLevel::default(); 5];
         let mut buf = Buffer::new(ProtocolVersion::V1);
-        build_depth_rows(&mut buf, 13, 2, 1_000_000_000, &depth).unwrap();
+        build_depth_rows(&mut buf, 13, 2, 1_740_556_500, 1_000_000_000, &depth).unwrap();
         let content = String::from_utf8_lossy(buf.as_bytes());
 
         // All levels should have zero quantities
@@ -3736,6 +4006,7 @@ mod tests {
             &mut buf,
             13,
             EXCHANGE_SEGMENT_NSE_FNO,
+            1_740_556_500,
             1_000_000_000,
             &depth,
         )
@@ -3872,7 +4143,9 @@ mod tests {
         let mut writer = DepthPersistenceWriter::new(&config).unwrap();
         let depth = make_test_depth();
 
-        writer.append_depth(13, 2, 1_000_000_000, &depth).unwrap();
+        writer
+            .append_depth(13, 2, 1_740_556_500, 1_000_000_000, &depth)
+            .unwrap();
         writer.force_flush().unwrap();
     }
 
@@ -4334,7 +4607,9 @@ mod tests {
         };
         let mut writer = DepthPersistenceWriter::new(&config).unwrap();
         let depth = make_test_depth();
-        writer.append_depth(13, 2, 1_000_000_000, &depth).unwrap();
+        writer
+            .append_depth(13, 2, 1_740_556_500, 1_000_000_000, &depth)
+            .unwrap();
         // flush_if_needed checks the time elapsed — exercises the code path.
         let result = writer.flush_if_needed();
         assert!(result.is_ok());
@@ -4354,7 +4629,7 @@ mod tests {
 
         for i in 0..DEPTH_FLUSH_BATCH_SIZE as u32 {
             writer
-                .append_depth(1000 + i, 2, 1_000_000_000 + i as i64, &depth)
+                .append_depth(1000 + i, 2, 1_740_556_500, 1_000_000_000 + i as i64, &depth)
                 .unwrap();
         }
         // After auto-flush at DEPTH_FLUSH_BATCH_SIZE, pending should be 0.
@@ -4382,18 +4657,32 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_build_previous_close_row_received_at_includes_ist_offset() {
+    fn test_build_previous_close_row_ts_is_midnight_ist_for_dedup() {
         let mut buf = Buffer::new(ProtocolVersion::V1);
+        // 2026-03-08 00:00:00 UTC in nanos
         let received_at_utc_nanos: i64 = 1_773_100_800_000_000_000;
         build_previous_close_row(&mut buf, 13, 2, 24300.5, 120000, received_at_utc_nanos).unwrap();
 
         let content = String::from_utf8_lossy(buf.as_bytes());
-        // The designated timestamp should be received_at + IST offset
-        let expected_nanos = received_at_utc_nanos + IST_UTC_OFFSET_NANOS;
-        let expected_ts = format!("{expected_nanos}\n");
+
+        // ts (designated timestamp) must be midnight IST (not received_at).
+        // This guarantees DEDUP across app restarts on the same day.
+        // IST = UTC + 19800s. Midnight IST = floor to day boundary in IST.
+        let ist_secs = received_at_utc_nanos / 1_000_000_000 + i64::from(IST_UTC_OFFSET_SECONDS);
+        let midnight_ist_secs = ist_secs - (ist_secs % i64::from(SECONDS_PER_DAY));
+        let expected_ts_nanos = midnight_ist_secs * 1_000_000_000;
+        let expected_ts = format!("{expected_ts_nanos}\n");
         assert!(
             content.ends_with(&expected_ts),
-            "previous_close designated timestamp must include IST offset. Got: {content}"
+            "previous_close ts must be midnight IST for dedup guarantee. Got: {content}"
+        );
+
+        // received_at column must still contain the actual receive time (with IST offset).
+        // ILP column_ts writes MICROSECONDS (not nanos), so divide by 1000.
+        let expected_received_micros = (received_at_utc_nanos + IST_UTC_OFFSET_NANOS) / 1000;
+        assert!(
+            content.contains(&format!("{expected_received_micros}t")),
+            "previous_close received_at must contain actual receive time. Got: {content}"
         );
     }
 
@@ -4649,6 +4938,7 @@ mod tests {
             .append_depth(
                 13,
                 EXCHANGE_SEGMENT_NSE_FNO,
+                1_740_556_500,
                 1_740_556_500_000_000_000,
                 &depth,
             )
@@ -4706,6 +4996,7 @@ mod tests {
             &mut buffer,
             13,
             EXCHANGE_SEGMENT_NSE_FNO,
+            1_740_556_500,
             1_740_556_500_000_000_000,
             &depth,
         )
@@ -4731,6 +5022,7 @@ mod tests {
             &mut buffer,
             42,
             EXCHANGE_SEGMENT_NSE_EQ,
+            1_740_556_500,
             1_000_000_000,
             &depth,
         )
@@ -5059,7 +5351,7 @@ mod tests {
             bid_price: 0.0,
             ask_price: 0.0,
         }; 5];
-        let result = build_depth_rows(&mut buffer, 1, EXCHANGE_SEGMENT_NSE_FNO, 0, &depth);
+        let result = build_depth_rows(&mut buffer, 1, EXCHANGE_SEGMENT_NSE_FNO, 0, 0, &depth);
         assert!(result.is_ok());
         assert_eq!(buffer.row_count(), 5, "5 depth levels = 5 ILP rows");
     }
@@ -5231,7 +5523,14 @@ mod tests {
             EXCHANGE_SEGMENT_BSE_EQ,
         ] {
             let mut buffer = Buffer::new(ProtocolVersion::V1);
-            let result = build_depth_rows(&mut buffer, 42, seg, 1_700_000_000_000_000_000, &depth);
+            let result = build_depth_rows(
+                &mut buffer,
+                42,
+                seg,
+                1_740_556_500,
+                1_700_000_000_000_000_000,
+                &depth,
+            );
             assert!(
                 result.is_ok(),
                 "depth rows must succeed for segment {}",
@@ -5438,6 +5737,7 @@ mod tests {
             .append_depth(
                 42,
                 EXCHANGE_SEGMENT_NSE_EQ,
+                1_740_556_500,
                 1_700_000_000_000_000_000,
                 &depth,
             )
@@ -5592,15 +5892,25 @@ mod tests {
         let depth = make_test_depth();
         let received_at_utc_nanos: i64 = 1_740_556_500_000_000_000;
         let mut buf = Buffer::new(ProtocolVersion::V1);
-        build_depth_rows(&mut buf, 13, 2, received_at_utc_nanos, &depth).unwrap();
+        build_depth_rows(
+            &mut buf,
+            13,
+            2,
+            1_740_556_500,
+            received_at_utc_nanos,
+            &depth,
+        )
+        .unwrap();
         let content = String::from_utf8_lossy(buf.as_bytes());
 
         // received_at is shifted by IST_UTC_OFFSET_NANOS for IST-as-UTC.
+        // ILP column_ts writes microseconds (nanos / 1000), so check for the µs value.
         let expected_nanos = received_at_utc_nanos + IST_UTC_OFFSET_NANOS;
-        let expected_str = format!("{expected_nanos}");
+        let expected_micros = expected_nanos / 1000;
+        let expected_str = format!("{expected_micros}t");
         assert!(
             content.contains(&expected_str),
-            "depth received_at must include IST offset. Content: {content}"
+            "depth received_at must include IST offset (µs). Content: {content}"
         );
     }
 
@@ -5632,12 +5942,24 @@ mod tests {
 
         let depth = make_test_depth();
         writer
-            .append_depth(13, EXCHANGE_SEGMENT_NSE_FNO, 1_000_000_000, &depth)
+            .append_depth(
+                13,
+                EXCHANGE_SEGMENT_NSE_FNO,
+                1_740_556_500,
+                1_000_000_000,
+                &depth,
+            )
             .unwrap();
         assert_eq!(writer.pending_count, 1);
 
         writer
-            .append_depth(25, EXCHANGE_SEGMENT_NSE_FNO, 1_000_000_000, &depth)
+            .append_depth(
+                25,
+                EXCHANGE_SEGMENT_NSE_FNO,
+                1_740_556_500,
+                1_000_000_000,
+                &depth,
+            )
             .unwrap();
         assert_eq!(writer.pending_count, 2);
 
@@ -5657,12 +5979,16 @@ mod tests {
         let mut writer = DepthPersistenceWriter::new(&config).unwrap();
 
         let depth = make_test_depth();
-        writer.append_depth(13, 2, 1_000_000_000, &depth).unwrap();
+        writer
+            .append_depth(13, 2, 1_740_556_500, 1_000_000_000, &depth)
+            .unwrap();
         writer.force_flush().unwrap();
         assert_eq!(writer.pending_count, 0);
 
         // Reuse after flush
-        writer.append_depth(25, 2, 1_000_000_001, &depth).unwrap();
+        writer
+            .append_depth(25, 2, 1_740_556_500, 1_000_000_001, &depth)
+            .unwrap();
         assert_eq!(writer.pending_count, 1);
         writer.force_flush().unwrap();
         assert_eq!(writer.pending_count, 0);
@@ -5826,7 +6152,9 @@ mod tests {
 
         // Verify the writer is functional after reconnect.
         let depth = make_test_depth();
-        writer.append_depth(13, 2, 1_000_000_000, &depth).unwrap();
+        writer
+            .append_depth(13, 2, 1_740_556_500, 1_000_000_000, &depth)
+            .unwrap();
         writer.force_flush().unwrap();
         assert_eq!(writer.pending_count, 0);
     }
@@ -7424,7 +7752,9 @@ mod tests {
         writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
 
         let depth = make_test_depth();
-        writer.append_depth(42, 2, 1_000_000_000, &depth).unwrap();
+        writer
+            .append_depth(42, 2, 1_740_556_500, 1_000_000_000, &depth)
+            .unwrap();
         assert_eq!(
             writer.buffered_depth_count(),
             1,
@@ -7449,7 +7779,9 @@ mod tests {
 
         // Append a depth snapshot (goes to ILP buffer + in_flight).
         let depth = make_test_depth();
-        writer.append_depth(42, 2, 1_000_000_000, &depth).unwrap();
+        writer
+            .append_depth(42, 2, 1_740_556_500, 1_000_000_000, &depth)
+            .unwrap();
         assert_eq!(writer.in_flight.len(), 1);
         assert_eq!(writer.pending_count, 1);
 
@@ -7483,6 +7815,7 @@ mod tests {
         let buffered = BufferedDepth {
             security_id: 49081,
             exchange_segment_code: 2,
+            exchange_timestamp: 1_740_556_500,
             received_at_nanos: 1_740_556_500_123_456_789,
             depth,
         };
@@ -7524,7 +7857,7 @@ mod tests {
     #[test]
     fn test_depth_spill_record_size() {
         assert_eq!(
-            DEPTH_SPILL_RECORD_SIZE, 116,
+            DEPTH_SPILL_RECORD_SIZE, 124,
             "depth spill record must be exactly 116 bytes"
         );
     }
@@ -7534,6 +7867,7 @@ mod tests {
         let buffered = BufferedDepth {
             security_id: 0,
             exchange_segment_code: 0,
+            exchange_timestamp: 0,
             received_at_nanos: 0,
             depth: [MarketDepthLevel::default(); 5],
         };
@@ -7564,6 +7898,7 @@ mod tests {
         writer.buffer_depth(BufferedDepth {
             security_id: 1,
             exchange_segment_code: 1,
+            exchange_timestamp: 0,
             received_at_nanos: 1_000_000,
             depth,
         });
@@ -7572,6 +7907,7 @@ mod tests {
         writer.buffer_depth(BufferedDepth {
             security_id: 2,
             exchange_segment_code: 2,
+            exchange_timestamp: 0,
             received_at_nanos: 2_000_000,
             depth,
         });
@@ -7596,6 +7932,7 @@ mod tests {
             writer.buffer_depth(BufferedDepth {
                 security_id: i,
                 exchange_segment_code: 2,
+                exchange_timestamp: 0,
                 received_at_nanos: i64::from(i) * 1_000_000,
                 depth,
             });
@@ -7628,6 +7965,7 @@ mod tests {
             writer.in_flight.push(BufferedDepth {
                 security_id: 100 + i,
                 exchange_segment_code: 2,
+                exchange_timestamp: 0,
                 received_at_nanos: i64::from(i) * 1_000_000,
                 depth,
             });
@@ -7676,7 +8014,7 @@ mod tests {
         let snapshot_count = 10_usize;
         for i in 0..snapshot_count as u32 {
             writer
-                .append_depth(100 + i, 2, i64::from(i) * 1_000_000, &depth)
+                .append_depth(100 + i, 2, 1_740_556_500, i64::from(i) * 1_000_000, &depth)
                 .unwrap();
         }
         assert_eq!(writer.buffered_depth_count(), snapshot_count);
@@ -7746,6 +8084,7 @@ mod tests {
             writer.buffer_depth(BufferedDepth {
                 security_id: i,
                 exchange_segment_code: 2,
+                exchange_timestamp: 0,
                 received_at_nanos: i64::from(i) * 1_000_000,
                 depth,
             });
@@ -7801,7 +8140,7 @@ mod tests {
         let depth = make_test_depth();
         for i in 0..3u32 {
             writer
-                .append_depth(200 + i, 2, i64::from(i) * 1_000_000, &depth)
+                .append_depth(200 + i, 2, 1_740_556_500, i64::from(i) * 1_000_000, &depth)
                 .unwrap();
         }
         assert_eq!(writer.in_flight.len(), 3);
@@ -7860,6 +8199,7 @@ mod tests {
                 let snapshot = BufferedDepth {
                     security_id: 300 + i,
                     exchange_segment_code: 2,
+                    exchange_timestamp: 0,
                     received_at_nanos: i64::from(i) * 1_000_000,
                     depth,
                 };
@@ -7935,6 +8275,7 @@ mod tests {
                 let snapshot = BufferedDepth {
                     security_id: 400 + i,
                     exchange_segment_code: 2,
+                    exchange_timestamp: 0,
                     received_at_nanos: i64::from(i) * 1_000_000,
                     depth,
                 };
@@ -8185,7 +8526,7 @@ mod tests {
         let depth = make_test_depth();
 
         // append_depth should NOT error — snapshot gets buffered.
-        let result = writer.append_depth(42, 2, 1_000_000_000, &depth);
+        let result = writer.append_depth(42, 2, 1_740_556_500, 1_000_000_000, &depth);
         assert!(
             result.is_ok(),
             "append_depth must succeed by buffering when disconnected"
@@ -8222,7 +8563,7 @@ mod tests {
         let depth = make_test_depth();
         for i in 0..5_u32 {
             writer
-                .append_depth(i, 2, 1_000_000_000 + i as i64, &depth)
+                .append_depth(i, 2, 1_740_556_500, 1_000_000_000 + i as i64, &depth)
                 .unwrap();
         }
         assert_eq!(writer.in_flight.len(), 5);
@@ -8309,6 +8650,7 @@ mod tests {
             writer.buffer_depth(BufferedDepth {
                 security_id: i as u32,
                 exchange_segment_code: 2,
+                exchange_timestamp: 0,
                 received_at_nanos: i64::from(i as u32) * 1_000_000,
                 depth,
             });
@@ -8322,6 +8664,7 @@ mod tests {
             writer.buffer_depth(BufferedDepth {
                 security_id: 100_000 + i,
                 exchange_segment_code: 2,
+                exchange_timestamp: 0,
                 received_at_nanos: i64::from(i) * 1_000_000,
                 depth,
             });
@@ -8383,7 +8726,9 @@ mod tests {
         let mut writer = DepthPersistenceWriter::new(&config).unwrap();
         let depth = make_test_depth();
 
-        writer.append_depth(42, 2, 1_000_000_000, &depth).unwrap();
+        writer
+            .append_depth(42, 2, 1_740_556_500, 1_000_000_000, &depth)
+            .unwrap();
         assert!(writer.pending_count > 0);
 
         // Set last_flush_ms to 0 to force the time elapsed check to pass.
@@ -8595,6 +8940,7 @@ mod tests {
             writer.buffer_depth(BufferedDepth {
                 security_id: i as u32,
                 exchange_segment_code: 2,
+                exchange_timestamp: 0,
                 received_at_nanos: 1_740_556_500_000_000_000 + i as i64,
                 depth,
             });
@@ -8642,6 +8988,7 @@ mod tests {
             writer.buffer_depth(BufferedDepth {
                 security_id: i,
                 exchange_segment_code: 2,
+                exchange_timestamp: 0,
                 received_at_nanos: 1_740_556_500_000_000_000 + i64::from(i),
                 depth,
             });
@@ -8655,7 +9002,7 @@ mod tests {
 
         // Append triggers reconnect then drain.
         let depth = make_test_depth();
-        let result = writer.append_depth(99, 2, 1_740_556_600_000_000_000, &depth);
+        let result = writer.append_depth(99, 2, 1_740_556_600, 1_740_556_600_000_000_000, &depth);
         assert!(result.is_ok());
 
         // After drain, ring buffer should be empty.
@@ -8845,12 +9192,14 @@ mod tests {
                 &mut writer.buffer,
                 i as u32,
                 2,
+                1_740_556_500,
                 1_740_556_500_000_000_000 + i as i64,
                 &depth,
             );
             writer.in_flight.push(BufferedDepth {
                 security_id: i as u32,
                 exchange_segment_code: 2,
+                exchange_timestamp: 0,
                 received_at_nanos: 1_740_556_500_000_000_000 + i as i64,
                 depth,
             });
@@ -8953,6 +9302,7 @@ mod tests {
                 &mut writer.buffer,
                 i as u32,
                 2,
+                1_740_556_500,
                 1_740_556_500_000_000_000 + i as i64,
                 &depth,
             )
@@ -8960,6 +9310,7 @@ mod tests {
             writer.in_flight.push(BufferedDepth {
                 security_id: i as u32,
                 exchange_segment_code: 2,
+                exchange_timestamp: 0,
                 received_at_nanos: 1_740_556_500_000_000_000 + i as i64,
                 depth,
             });
@@ -8971,7 +9322,8 @@ mod tests {
         writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
 
         // This should trigger auto-flush at DEPTH_FLUSH_BATCH_SIZE, which will fail.
-        let result = writer.append_depth(99999, 2, 1_740_556_600_000_000_000, &depth);
+        let result =
+            writer.append_depth(99999, 2, 1_740_556_600, 1_740_556_600_000_000_000, &depth);
         assert!(
             result.is_ok(),
             "append_depth must succeed even if auto-flush fails"
@@ -9156,6 +9508,7 @@ mod tests {
             writer.depth_buffer.push_back(BufferedDepth {
                 security_id: i as u32,
                 exchange_segment_code: 2,
+                exchange_timestamp: 0,
                 received_at_nanos: i as i64,
                 depth,
             });
@@ -9167,6 +9520,7 @@ mod tests {
         let snapshot = BufferedDepth {
             security_id: 999_999,
             exchange_segment_code: 2,
+            exchange_timestamp: 0,
             received_at_nanos: 999_999,
             depth,
         };
@@ -9348,6 +9702,7 @@ mod tests {
             writer.in_flight.push(BufferedDepth {
                 security_id: i as u32,
                 exchange_segment_code: 2,
+                exchange_timestamp: 0,
                 received_at_nanos: i as i64,
                 depth,
             });
@@ -9426,6 +9781,7 @@ mod tests {
             writer.depth_buffer.push_back(BufferedDepth {
                 security_id: i as u32,
                 exchange_segment_code: 2,
+                exchange_timestamp: 0,
                 received_at_nanos: 1_740_556_500_000_000_000 + i as i64,
                 depth,
             });
@@ -9521,6 +9877,7 @@ mod tests {
                 let snapshot = BufferedDepth {
                     security_id: i as u32,
                     exchange_segment_code: 2,
+                    exchange_timestamp: 0,
                     received_at_nanos: 1_740_556_500_000_000_000 + i as i64,
                     depth,
                 };
@@ -9603,6 +9960,7 @@ mod tests {
         writer.depth_buffer.push_back(BufferedDepth {
             security_id: 1,
             exchange_segment_code: 2,
+            exchange_timestamp: 0,
             received_at_nanos: 1_000_000,
             depth,
         });
@@ -9709,7 +10067,15 @@ mod tests {
             bid_price: 25600.0,
             ask_price: 25610.0,
         }; 5];
-        build_depth_rows(&mut buffer, 42528, 2, 1_740_556_500_000_000_000, &depth).unwrap();
+        build_depth_rows(
+            &mut buffer,
+            42528,
+            2,
+            1_740_556_500,
+            1_740_556_500_000_000_000,
+            &depth,
+        )
+        .unwrap();
         assert_eq!(buffer.row_count(), 5, "depth must produce 5 ILP rows");
         let content = String::from_utf8_lossy(buffer.as_bytes());
         assert!(content.contains(QUESTDB_TABLE_MARKET_DEPTH));
@@ -9827,6 +10193,7 @@ mod tests {
         let depth = BufferedDepth {
             security_id: 42528,
             exchange_segment_code: 2,
+            exchange_timestamp: 0,
             received_at_nanos: 1_740_556_500_123_456_789,
             depth: [MarketDepthLevel {
                 bid_quantity: 100,
@@ -9858,6 +10225,7 @@ mod tests {
         let depth = BufferedDepth {
             security_id: 0,
             exchange_segment_code: 0,
+            exchange_timestamp: 0,
             received_at_nanos: 0,
             depth: [MarketDepthLevel::default(); 5],
         };
@@ -9950,7 +10318,7 @@ mod tests {
 
     #[test]
     fn test_depth_spill_record_size_is_116() {
-        assert_eq!(DEPTH_SPILL_RECORD_SIZE, 116);
+        assert_eq!(DEPTH_SPILL_RECORD_SIZE, 124);
     }
 
     #[test]
@@ -10210,6 +10578,244 @@ mod tests {
     }
 
     // =======================================================================
+    // A2: DLQ (dead-letter queue) coverage — double failure path
+    // =======================================================================
+
+    /// A2: When both ring buffer AND disk spill fail, tick is written to DLQ
+    /// NDJSON. `ticks_dropped_total` stays 0 as long as DLQ succeeds.
+    #[test]
+    fn test_dlq_written_when_spill_write_fails() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+
+        // Force spill_writer to point at /dev/full so write_all() always fails.
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .expect("/dev/full is required for this test (Linux only)");
+        writer.spill_writer = Some(BufWriter::with_capacity(1, file));
+        writer.spill_path = Some(std::path::PathBuf::from("/dev/full"));
+
+        let initial_dropped = writer.ticks_dropped_total();
+        let initial_dlq = writer.dlq_ticks_total();
+
+        let tick = make_test_tick(7777, 42.0);
+        writer.spill_tick_to_disk(&tick);
+
+        // Contract: spill failure → DLQ (not drop).
+        assert_eq!(
+            writer.dlq_ticks_total(),
+            initial_dlq + 1,
+            "DLQ count must increment when spill_write fails"
+        );
+        assert_eq!(
+            writer.ticks_dropped_total(),
+            initial_dropped,
+            "ticks_dropped_total must NOT increment when DLQ succeeds"
+        );
+        assert!(
+            writer.dlq_path().is_some(),
+            "DLQ path must be set after first DLQ write"
+        );
+        assert!(
+            writer.spill_writer.is_none(),
+            "spill_writer must be cleared after write error"
+        );
+
+        // Cleanup: drop the BufWriter backed by /dev/full before removing the
+        // DLQ file so file handles aren't held open.
+        drop(writer);
+    }
+
+    /// A2: DLQ format is one JSON object per line, UTF-8, LF-terminated.
+    #[test]
+    fn test_dlq_format_is_parseable_ndjson() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+
+        // Use a temporary DLQ file so we don't collide with other tests.
+        let tmp_dir = std::env::temp_dir().join(format!("dlt-dlq-format-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let dlq_path = tmp_dir.join("dlq.ndjson");
+        let file = std::fs::File::create(&dlq_path).unwrap();
+        writer.dlq_writer = Some(BufWriter::new(file));
+        writer.dlq_path = Some(dlq_path.clone());
+
+        let tick = make_test_tick(12345, 123.45);
+        writer.write_to_dlq(&tick, "test_reason");
+
+        // Flush explicitly by dropping writer state (BufWriter flushes on drop).
+        writer.dlq_writer = None;
+
+        let content = std::fs::read_to_string(&dlq_path).unwrap();
+        assert!(content.ends_with('\n'), "DLQ line must be LF-terminated");
+        let trimmed = content.trim_end();
+        assert!(
+            trimmed.starts_with('{') && trimmed.ends_with('}'),
+            "DLQ line must be a JSON object: {}",
+            trimmed
+        );
+        // Fields we promised in the public contract:
+        for field in &[
+            "\"ts_ms\":",
+            "\"reason\":\"test_reason\"",
+            "\"security_id\":12345",
+            "\"segment\":",
+            "\"ltt\":",
+            "\"ltp\":",
+            "\"oi\":",
+        ] {
+            assert!(
+                trimmed.contains(field),
+                "DLQ line missing required field {}: {}",
+                field,
+                trimmed
+            );
+        }
+        assert_eq!(writer.dlq_ticks_total(), 1);
+
+        // Cleanup.
+        let _ = std::fs::remove_file(&dlq_path);
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    /// A2: Multiple DLQ writes append, they do not overwrite.
+    #[test]
+    fn test_dlq_append_multiple_records() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+
+        let tmp_dir = std::env::temp_dir().join(format!("dlt-dlq-append-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let dlq_path = tmp_dir.join("dlq.ndjson");
+        let file = std::fs::File::create(&dlq_path).unwrap();
+        writer.dlq_writer = Some(BufWriter::new(file));
+        writer.dlq_path = Some(dlq_path.clone());
+
+        writer.write_to_dlq(&make_test_tick(1, 1.0), "r1");
+        writer.write_to_dlq(&make_test_tick(2, 2.0), "r2");
+        writer.write_to_dlq(&make_test_tick(3, 3.0), "r3");
+        writer.dlq_writer = None;
+
+        let content = std::fs::read_to_string(&dlq_path).unwrap();
+        let line_count = content.lines().count();
+        assert_eq!(line_count, 3, "DLQ must contain exactly 3 lines");
+        assert_eq!(writer.dlq_ticks_total(), 3);
+
+        let _ = std::fs::remove_file(&dlq_path);
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    // =======================================================================
+    // F1: Configurable spill directory (test isolation)
+    // =======================================================================
+
+    /// F1: `set_spill_dir_for_test` routes new spill files into the override
+    /// directory instead of the process-wide default.
+    #[test]
+    fn test_custom_spill_dir_used_for_spill() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+
+        let tmp_dir = std::env::temp_dir().join(format!("dlt-f1-spill-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        writer.set_spill_dir_for_test(tmp_dir.clone());
+        assert_eq!(writer.spill_dir(), tmp_dir.as_path());
+
+        // Trigger a real spill: fill the ring buffer to capacity, then spill one tick.
+        for i in 0..TICK_BUFFER_CAPACITY as u32 {
+            writer.tick_buffer.push_back(make_test_tick(i, 1.0));
+        }
+        writer.spill_tick_to_disk(&make_test_tick(999_999, 2.0));
+
+        // The spill file must live under the override directory.
+        let path = writer
+            .spill_path
+            .as_ref()
+            .expect("spill_path must be set after first spill");
+        assert!(
+            path.starts_with(&tmp_dir),
+            "spill file must live under the override directory, got {}",
+            path.display()
+        );
+        assert_eq!(writer.ticks_spilled_total(), 1);
+
+        drop(writer);
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    /// F1: DLQ file also uses the overridden directory.
+    #[test]
+    fn test_custom_spill_dir_used_for_dlq() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let mut writer = TickPersistenceWriter::new(&config).unwrap();
+
+        let tmp_dir = std::env::temp_dir().join(format!("dlt-f1-dlq-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        writer.set_spill_dir_for_test(tmp_dir.clone());
+
+        // Directly exercise the DLQ path.
+        writer.write_to_dlq(&make_test_tick(123, 45.6), "f1_dir_test");
+        let dlq_path = writer
+            .dlq_path()
+            .expect("dlq_path must be set after write_to_dlq");
+        assert!(
+            dlq_path.starts_with(&tmp_dir),
+            "DLQ file must live under the override directory, got {}",
+            dlq_path.display()
+        );
+        assert_eq!(writer.dlq_ticks_total(), 1);
+
+        drop(writer);
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    /// A2: Initially, DLQ counter is 0 and dlq_path is None.
+    #[test]
+    fn test_dlq_initially_empty() {
+        let port = spawn_tcp_drain_server();
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: port,
+            http_port: port,
+            pg_port: port,
+        };
+        let writer = TickPersistenceWriter::new(&config).unwrap();
+        assert_eq!(writer.dlq_ticks_total(), 0);
+        assert!(writer.dlq_path().is_none());
+    }
+
+    // =======================================================================
     // Coverage: drain_tick_buffer + drain_disk_spill (lines 418-501)
     // =======================================================================
 
@@ -10383,8 +10989,13 @@ mod tests {
         let depth = make_test_depth();
         // Append enough to trigger auto-flush
         for i in 0..DEPTH_FLUSH_BATCH_SIZE as u32 {
-            let result =
-                writer.append_depth(10000 + i, 2, 1_740_556_500_000_000_000 + i as i64, &depth);
+            let result = writer.append_depth(
+                10000 + i,
+                2,
+                1_740_556_500,
+                1_740_556_500_000_000_000 + i as i64,
+                &depth,
+            );
             assert!(result.is_ok());
         }
         // Auto-flush should have fired — pending should be 0 or low
@@ -10408,7 +11019,7 @@ mod tests {
 
         let depth = make_test_depth();
         writer
-            .append_depth(11536, 2, 1_740_556_500_000_000_000, &depth)
+            .append_depth(11536, 2, 1_740_556_500, 1_740_556_500_000_000_000, &depth)
             .unwrap();
         assert_eq!(writer.pending_count, 1);
 
@@ -10451,7 +11062,7 @@ mod tests {
 
         let depth = make_test_depth();
         writer
-            .append_depth(11536, 2, 1_740_556_500_000_000_000, &depth)
+            .append_depth(11536, 2, 1_740_556_500, 1_740_556_500_000_000_000, &depth)
             .unwrap();
 
         // Disconnect
@@ -10479,7 +11090,7 @@ mod tests {
 
         let depth = make_test_depth();
         writer
-            .append_depth(11536, 2, 1_740_556_500_000_000_000, &depth)
+            .append_depth(11536, 2, 1_740_556_500, 1_740_556_500_000_000_000, &depth)
             .unwrap();
 
         // Drop sender, set to None to simulate broken pipe
@@ -10542,6 +11153,7 @@ mod tests {
         writer.buffer_depth(BufferedDepth {
             security_id: 11536,
             exchange_segment_code: 2,
+            exchange_timestamp: 0,
             received_at_nanos: 1_740_556_500_000_000_000,
             depth,
         });
@@ -10572,6 +11184,7 @@ mod tests {
         let snapshot = BufferedDepth {
             security_id: 11536,
             exchange_segment_code: 2,
+            exchange_timestamp: 0,
             received_at_nanos: 1_740_556_500_000_000_000,
             depth,
         };
@@ -10599,6 +11212,7 @@ mod tests {
         writer.buffer_depth(BufferedDepth {
             security_id: 11536,
             exchange_segment_code: 2,
+            exchange_timestamp: 0,
             received_at_nanos: 1_740_556_500_000_000_000,
             depth,
         });
@@ -10628,6 +11242,7 @@ mod tests {
             writer.buffer_depth(BufferedDepth {
                 security_id: 20000 + i,
                 exchange_segment_code: 2,
+                exchange_timestamp: 0,
                 received_at_nanos: 1_740_556_500_000_000_000 + i as i64,
                 depth,
             });
@@ -10670,6 +11285,7 @@ mod tests {
                 let snapshot = BufferedDepth {
                     security_id: 30000 + i,
                     exchange_segment_code: 2,
+                    exchange_timestamp: 0,
                     received_at_nanos: 1_740_556_500_000_000_000 + i as i64,
                     depth,
                 };
@@ -10788,7 +11404,8 @@ mod tests {
         writer.next_reconnect_allowed = std::time::Instant::now();
 
         let depth = make_test_depth();
-        let result = writer.append_depth(40000, 2, 1_740_556_500_000_000_000, &depth);
+        let result =
+            writer.append_depth(40000, 2, 1_740_556_500, 1_740_556_500_000_000_000, &depth);
         assert!(result.is_ok());
         assert_eq!(writer.buffered_depth_count(), 1);
     }
@@ -10810,6 +11427,7 @@ mod tests {
         writer.buffer_depth(BufferedDepth {
             security_id: 50000,
             exchange_segment_code: 2,
+            exchange_timestamp: 0,
             received_at_nanos: 1_740_556_500_000_000_000,
             depth,
         });
@@ -10821,7 +11439,8 @@ mod tests {
         writer.next_reconnect_allowed = std::time::Instant::now();
 
         // Append should reconnect, drain buffer, then append new
-        let result = writer.append_depth(50001, 2, 1_740_556_500_000_000_001, &depth);
+        let result =
+            writer.append_depth(50001, 2, 1_740_556_500, 1_740_556_500_000_000_001, &depth);
         assert!(result.is_ok());
         assert!(writer.sender.is_some());
         // Buffer should be drained
@@ -10855,6 +11474,7 @@ mod tests {
         let snapshot = BufferedDepth {
             security_id: 60000,
             exchange_segment_code: 2,
+            exchange_timestamp: 0,
             received_at_nanos: 1_740_556_500_000_000_000,
             depth,
         };
@@ -10892,6 +11512,7 @@ mod tests {
         let snapshot = BufferedDepth {
             security_id: 70000,
             exchange_segment_code: 2,
+            exchange_timestamp: 0,
             received_at_nanos: 1_740_556_500_000_000_000,
             depth,
         };
@@ -11342,7 +11963,8 @@ mod tests {
             std::time::Instant::now() + std::time::Duration::from_secs(3600);
 
         let depth = make_test_depth();
-        let result = writer.append_depth(80000, 2, 1_740_556_500_000_000_000, &depth);
+        let result =
+            writer.append_depth(80000, 2, 1_740_556_500, 1_740_556_500_000_000_000, &depth);
         assert!(result.is_ok(), "append must succeed even when disconnected");
         assert_eq!(writer.buffered_depth_count(), 1, "depth must be buffered");
     }
@@ -11363,6 +11985,7 @@ mod tests {
         writer.depth_buffer.push_back(BufferedDepth {
             security_id: 81000,
             exchange_segment_code: 2,
+            exchange_timestamp: 0,
             received_at_nanos: 1_740_556_500_000_000_000,
             depth,
         });
@@ -11373,7 +11996,8 @@ mod tests {
         let port2 = spawn_tcp_drain_server();
         writer.ilp_conf_string = format!("tcp::addr=127.0.0.1:{port2};");
 
-        let result = writer.append_depth(81001, 2, 1_740_556_500_000_000_001, &depth);
+        let result =
+            writer.append_depth(81001, 2, 1_740_556_500, 1_740_556_500_000_000_001, &depth);
         assert!(result.is_ok());
         assert!(writer.sender.is_some());
         assert_eq!(writer.buffered_depth_count(), 0, "buffer must be drained");
@@ -11392,7 +12016,7 @@ mod tests {
 
         let depth = make_test_depth();
         writer
-            .append_depth(82000, 2, 1_740_556_500_000_000_000, &depth)
+            .append_depth(82000, 2, 1_740_556_500, 1_740_556_500_000_000_000, &depth)
             .unwrap();
         assert_eq!(writer.pending_count, 1);
 
@@ -11423,6 +12047,7 @@ mod tests {
             writer.depth_buffer.push_back(BufferedDepth {
                 security_id: 83000 + i,
                 exchange_segment_code: 2,
+                exchange_timestamp: 0,
                 received_at_nanos: 1_740_556_500_000_000_000 + i64::from(i),
                 depth,
             });
@@ -11451,6 +12076,7 @@ mod tests {
         writer.depth_buffer.push_back(BufferedDepth {
             security_id: 84000,
             exchange_segment_code: 2,
+            exchange_timestamp: 0,
             received_at_nanos: 1_740_556_500_000_000_000,
             depth,
         });
@@ -11485,6 +12111,7 @@ mod tests {
                 let snapshot = BufferedDepth {
                     security_id: 85000 + i,
                     exchange_segment_code: 2,
+                    exchange_timestamp: 0,
                     received_at_nanos: 1_740_556_500_000_000_000 + i64::from(i),
                     depth,
                 };
@@ -11539,6 +12166,7 @@ mod tests {
         writer.in_flight.push(BufferedDepth {
             security_id: 86000,
             exchange_segment_code: 2,
+            exchange_timestamp: 0,
             received_at_nanos: 1_740_556_500_000_000_000,
             depth,
         });
@@ -11656,6 +12284,7 @@ mod tests {
         writer.buffer_depth(BufferedDepth {
             security_id: 87000,
             exchange_segment_code: 2,
+            exchange_timestamp: 0,
             received_at_nanos: 1_740_556_500_000_000_000,
             depth,
         });
@@ -11673,6 +12302,7 @@ mod tests {
         let original = BufferedDepth {
             security_id: 88000,
             exchange_segment_code: 2,
+            exchange_timestamp: 0,
             received_at_nanos: 1_740_556_500_000_000_000,
             depth,
         };
@@ -11863,6 +12493,7 @@ mod tests {
                 &mut writer.buffer,
                 90000 + i,
                 2,
+                1_740_556_500,
                 1_740_556_500_000_000_000 + i as i64,
                 &depth,
             );
@@ -12226,7 +12857,13 @@ mod tests {
         let depth = make_test_depth();
         // Append DEPTH_FLUSH_BATCH_SIZE snapshots to trigger auto-flush
         for i in 0..DEPTH_FLUSH_BATCH_SIZE as u32 {
-            let _ = writer.append_depth(9000 + i, 2, 1_740_556_500_000_000_000 + i as i64, &depth);
+            let _ = writer.append_depth(
+                9000 + i,
+                2,
+                1_740_556_500,
+                1_740_556_500_000_000_000 + i as i64,
+                &depth,
+            );
         }
         // After auto-flush failure, in-flight should be rescued
     }
@@ -12242,7 +12879,13 @@ mod tests {
         };
         let depth = make_test_depth();
         for i in 0..3_u32 {
-            let _ = writer.append_depth(9100 + i, 2, 1_740_556_500_000_000_000 + i as i64, &depth);
+            let _ = writer.append_depth(
+                9100 + i,
+                2,
+                1_740_556_500,
+                1_740_556_500_000_000_000 + i as i64,
+                &depth,
+            );
         }
         let result = writer.force_flush();
         if result.is_err() {
@@ -12281,6 +12924,7 @@ mod tests {
             writer.depth_buffer.push_back(BufferedDepth {
                 security_id: i as u32,
                 exchange_segment_code: 2,
+                exchange_timestamp: 0,
                 received_at_nanos: 1_740_556_500_000_000_000,
                 depth,
             });
@@ -12290,6 +12934,7 @@ mod tests {
         let snapshot = BufferedDepth {
             security_id: 99999,
             exchange_segment_code: 2,
+            exchange_timestamp: 0,
             received_at_nanos: 1_740_556_500_000_000_000,
             depth,
         };
@@ -12316,6 +12961,7 @@ mod tests {
         writer.depth_buffer.push_back(BufferedDepth {
             security_id: 10000,
             exchange_segment_code: 2,
+            exchange_timestamp: 0,
             received_at_nanos: 1_740_556_500_000_000_000,
             depth,
         });
@@ -12346,6 +12992,7 @@ mod tests {
             writer.depth_buffer.push_back(BufferedDepth {
                 security_id: 10100 + i,
                 exchange_segment_code: 2,
+                exchange_timestamp: 0,
                 received_at_nanos: 1_740_556_500_000_000_000,
                 depth,
             });
@@ -12402,6 +13049,7 @@ mod tests {
         let snapshot = BufferedDepth {
             security_id: 11000,
             exchange_segment_code: 2,
+            exchange_timestamp: 0,
             received_at_nanos: 1_740_556_500_000_000_000,
             depth,
         };
@@ -12432,6 +13080,7 @@ mod tests {
         let snapshot = BufferedDepth {
             security_id: 11100,
             exchange_segment_code: 2,
+            exchange_timestamp: 0,
             received_at_nanos: 1_740_556_500_000_000_000,
             depth,
         };
@@ -12697,6 +13346,7 @@ mod tests {
         let snapshot = BufferedDepth {
             security_id: 11536,
             exchange_segment_code: 1,
+            exchange_timestamp: 0,
             received_at_nanos: 1_740_556_500_123_456_789,
             depth: [MarketDepthLevel::default(); 5],
         };
@@ -12737,6 +13387,7 @@ mod tests {
         let snapshot = BufferedDepth {
             security_id: 11536,
             exchange_segment_code: 1,
+            exchange_timestamp: 0,
             received_at_nanos: 1_740_556_500_000_000_000,
             depth: [MarketDepthLevel::default(); 5],
         };

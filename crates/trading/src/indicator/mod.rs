@@ -4,6 +4,7 @@
 //! Pre-allocated at startup — zero allocation on the hot path.
 
 pub mod engine;
+pub mod obi;
 #[cfg(test)]
 mod tests;
 pub mod types;
