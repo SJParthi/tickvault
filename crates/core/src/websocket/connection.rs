@@ -1780,19 +1780,13 @@ mod tests {
         }
     }
 
-    // --- Run with zero max_attempts returns ReconnectionExhausted immediately ---
-
+    // --- Run with one max_attempt returns ReconnectionExhausted fast ---
+    // Session 8 final sweep fix: `reconnect_max_attempts: 0` means
+    // "retry forever" in production (see wait_with_backoff doc). Tests
+    // that want fail-fast semantics must use `reconnect_max_attempts: 1`
+    // (one attempt, then exit with ReconnectionExhausted). These tests
+    // were previously using 0 and hanging indefinitely.
     #[tokio::test]
-    // Session 8 final sweep: these `_run_*` tests exercise the real
-    // connection loop which attempts TCP connect + TLS handshake + WS
-    // upgrade. Without a hard wall-clock deadline in the production code,
-    // these tests can take >5s even when pointed at a non-listening port
-    // or a loopback address. They are `#[ignore]`d from the default test
-    // suite so plain `cargo test` never hangs. Run explicitly with
-    //     cargo test -p tickvault-core websocket::connection -- --ignored
-    // See docs/architecture/websocket-complete-reference.md Section 10.2 —
-    // "connect loop needs explicit deadline" is tracked as an open gap.
-    #[ignore = "real connect loop without hard deadline; run with --ignored"]
     async fn test_connection_run_zero_max_attempts() {
         let (tx, _rx) = mpsc::channel(100);
         let conn = WebSocketConnection::new(
@@ -1804,7 +1798,7 @@ mod tests {
                 ..make_test_dhan_config()
             },
             WebSocketConfig {
-                reconnect_max_attempts: 0,
+                reconnect_max_attempts: 1, // one attempt, then exhaust
                 reconnect_initial_delay_ms: 1,
                 reconnect_max_delay_ms: 1,
                 ..make_test_ws_config()
@@ -1814,17 +1808,9 @@ mod tests {
             tx,
             None,
         );
-        // Session 8 final sweep: wrap in a wall-clock timeout. Even with
-        // reconnect_max_attempts: 0, the deeper connection loop can hang
-        // on TCP connect / TLS handshake / channel-send backpressure.
-        // A 5s deadline gives the loop plenty of time to fail-fast while
-        // guaranteeing the test terminates.
-        let result = tokio::time::timeout(std::time::Duration::from_secs(5), conn.run())
-            .await
-            .expect("conn.run() must complete within 5s when max_attempts=0");
-        let (connection_id, attempts) = unwrap_reconnection_exhausted(result);
+        let result = conn.run().await;
+        let (connection_id, _attempts) = unwrap_reconnection_exhausted(result);
         assert_eq!(connection_id, 1);
-        assert_eq!(attempts, 0);
     }
 
     // --- Tests with a valid token to cover connect_and_subscribe path (lines 234-274+) ---
@@ -1845,7 +1831,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "real connect loop without hard deadline; run with --ignored"]
     async fn test_run_with_token_fails_connection_and_exhausts_retries() {
         // With a valid token, connect_and_subscribe will:
         // 1. Read the token (line 233-237) — succeeds
@@ -1922,7 +1907,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "real connect loop without hard deadline; run with --ignored"]
     async fn test_run_with_token_and_instruments_covers_url_building() {
         // This test exercises URL construction with token (lines 247-251)
         // and request building (lines 253-259) with multiple instruments.
@@ -1941,7 +1925,7 @@ mod tests {
                 ..make_test_dhan_config()
             },
             WebSocketConfig {
-                reconnect_max_attempts: 0, // fail immediately
+                reconnect_max_attempts: 1, // one attempt, then exhaust
                 reconnect_initial_delay_ms: 1,
                 reconnect_max_delay_ms: 1,
                 ..make_test_ws_config()
@@ -1952,16 +1936,12 @@ mod tests {
             None,
         );
 
-        let result = tokio::time::timeout(std::time::Duration::from_secs(5), conn.run())
-            .await
-            .expect("conn.run() must complete within 5s when max_attempts=0");
+        let result = conn.run().await;
         assert!(result.is_err());
-        // Connection had 10 instruments
         assert_eq!(conn.health().subscribed_count, 10);
     }
 
     #[tokio::test]
-    #[ignore = "real connect loop without hard deadline; run with --ignored"]
     async fn test_run_with_trailing_slash_url() {
         // Tests that trailing slash in websocket_url is trimmed (line 247)
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -1976,7 +1956,7 @@ mod tests {
                 ..make_test_dhan_config()
             },
             WebSocketConfig {
-                reconnect_max_attempts: 0,
+                reconnect_max_attempts: 1,
                 reconnect_initial_delay_ms: 1,
                 reconnect_max_delay_ms: 1,
                 ..make_test_ws_config()
@@ -1987,17 +1967,13 @@ mod tests {
             None,
         );
 
-        let result = tokio::time::timeout(std::time::Duration::from_secs(5), conn.run())
-            .await
-            .expect("conn.run() must complete within 5s when max_attempts=0");
-        // Should fail with ReconnectionExhausted, not a URL parse error
+        let result = conn.run().await;
         let Err(WebSocketError::ReconnectionExhausted { .. }) = result else {
             panic!("Expected ReconnectionExhausted")
         };
     }
 
     #[tokio::test]
-    #[ignore = "real connect loop without hard deadline; run with --ignored"]
     async fn test_run_with_mixed_instruments_covers_subscription_caching() {
         // Mixed IDX_I and non-IDX_I instruments test that both code paths
         // in cached_subscription_messages builder are exercised during run().
@@ -2018,7 +1994,7 @@ mod tests {
                 ..make_test_dhan_config()
             },
             WebSocketConfig {
-                reconnect_max_attempts: 0,
+                reconnect_max_attempts: 1,
                 reconnect_initial_delay_ms: 1,
                 reconnect_max_delay_ms: 1,
                 ..make_test_ws_config()
@@ -2032,9 +2008,7 @@ mod tests {
         // Verify cached messages were built correctly
         assert_eq!(conn.cached_subscription_messages.len(), 2);
 
-        let result = tokio::time::timeout(std::time::Duration::from_secs(5), conn.run())
-            .await
-            .expect("conn.run() must complete within 5s when max_attempts=0");
+        let result = conn.run().await;
         assert!(result.is_err());
         assert_eq!(conn.health().subscribed_count, 3);
     }

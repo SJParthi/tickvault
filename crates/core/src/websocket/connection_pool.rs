@@ -819,7 +819,7 @@ mod tests {
             "test-client".to_string(),
             make_test_dhan_config(),
             WebSocketConfig {
-                reconnect_max_attempts: 0, // Fail immediately
+                reconnect_max_attempts: 1, // one attempt, then exhaust (0 = retry forever in prod)
                 reconnect_initial_delay_ms: 1,
                 reconnect_max_delay_ms: 1,
                 ..make_test_ws_config()
@@ -848,7 +848,7 @@ mod tests {
             "test-client".to_string(),
             make_test_dhan_config(),
             WebSocketConfig {
-                reconnect_max_attempts: 0,
+                reconnect_max_attempts: 1, // one attempt, then exhaust (0 = retry forever in prod)
                 reconnect_initial_delay_ms: 1,
                 reconnect_max_delay_ms: 1,
                 ..make_test_ws_config()
@@ -1146,7 +1146,7 @@ mod tests {
             "test-client".to_string(),
             config,
             WebSocketConfig {
-                reconnect_max_attempts: 0,
+                reconnect_max_attempts: 1, // one attempt, then exhaust (0 = retry forever in prod)
                 reconnect_initial_delay_ms: 1,
                 reconnect_max_delay_ms: 1,
                 ..make_test_ws_config()
@@ -1170,7 +1170,7 @@ mod tests {
             "test-client".to_string(),
             make_test_dhan_config(),
             WebSocketConfig {
-                reconnect_max_attempts: 0,
+                reconnect_max_attempts: 1, // one attempt, then exhaust (0 = retry forever in prod)
                 reconnect_initial_delay_ms: 1,
                 reconnect_max_delay_ms: 1,
                 connection_stagger_ms: 50, // 50ms stagger for fast test
@@ -1317,7 +1317,7 @@ mod tests {
             "test-client".to_string(),
             make_test_dhan_config(),
             WebSocketConfig {
-                reconnect_max_attempts: 0,
+                reconnect_max_attempts: 1, // one attempt, then exhaust (0 = retry forever in prod)
                 reconnect_initial_delay_ms: 1,
                 reconnect_max_delay_ms: 1,
                 connection_stagger_ms: 0,
