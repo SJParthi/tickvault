@@ -149,6 +149,24 @@ else
   echo "  SKIP: pub-fn-test-guard.sh not executable" >&2
 fi
 
+# Gate 12: Phase 6.1 G3 + G4 — Boot symmetry + state-machine wiring guard
+# Catches: state machines with poll_*() but no caller, slow-boot blind spots.
+echo "  [12/12] Boot symmetry + state-machine guard (phase 6.1 G3+G4)..." >&2
+if [ -x "$HOOKS_DIR/boot-symmetry-guard.sh" ]; then
+  SYM_OUT=$(timeout 60 "$HOOKS_DIR/boot-symmetry-guard.sh" 2>&1)
+  SYM_EXIT=$?
+  if [ "$SYM_EXIT" -eq 124 ]; then
+    echo "  WARN: boot symmetry guard timed out (60s) — not blocking" >&2
+  elif [ "$SYM_EXIT" -ne 0 ]; then
+    echo "$SYM_OUT" >&2
+    FAILED=1
+  else
+    echo "  PASS: boot paths symmetric, state machines polled" >&2
+  fi
+else
+  echo "  SKIP: boot-symmetry-guard.sh not executable" >&2
+fi
+
 # Gate 11: Phase 6.1 G1 — Wiring guard (new pub fn must have callers)
 # Catches the dormant-pub-fn class of bugs: code that compiles + tests pass
 # but no production call site invokes it. Found 4 such bugs in sessions 3-5.
