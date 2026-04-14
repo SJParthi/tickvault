@@ -149,6 +149,25 @@ else
   echo "  SKIP: pub-fn-test-guard.sh not executable" >&2
 fi
 
+# Gate 11: Phase 6.1 G1 — Wiring guard (new pub fn must have callers)
+# Catches the dormant-pub-fn class of bugs: code that compiles + tests pass
+# but no production call site invokes it. Found 4 such bugs in sessions 3-5.
+echo "  [11/11] Pub fn wiring guard (phase 6.1 G1)..." >&2
+if [ -x "$HOOKS_DIR/pub-fn-wiring-guard.sh" ]; then
+  WIRING_OUT=$(timeout 60 "$HOOKS_DIR/pub-fn-wiring-guard.sh" 2>&1)
+  WIRING_EXIT=$?
+  if [ "$WIRING_EXIT" -eq 124 ]; then
+    echo "  WARN: wiring guard timed out (60s) — not blocking" >&2
+  elif [ "$WIRING_EXIT" -ne 0 ]; then
+    echo "$WIRING_OUT" >&2
+    FAILED=1
+  else
+    echo "  PASS: every new pub fn has a call site" >&2
+  fi
+else
+  echo "  SKIP: pub-fn-wiring-guard.sh not executable" >&2
+fi
+
 # Gate 7: Financial test guard (price/money fns have boundary tests)
 echo "  [7/8] Financial test guard..." >&2
 if [ -x "$HOOKS_DIR/financial-test-guard.sh" ]; then

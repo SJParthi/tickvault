@@ -1,61 +1,82 @@
-# Implementation Plan: Zero Tick Loss Session 5 — Honest Audit Round 2
+# Implementation Plan: Zero Tick Loss Session 6 — Phase 6 Mechanical Enforcement
 
-**Status:** VERIFIED
+**Status:** APPROVED
 **Date:** 2026-04-14
-**Approved by:** Parthiban ("Do all")
+**Approved by:** Parthiban ("do everything step by step")
 **Branch:** `claude/websocket-zero-tick-loss-nUAqy`
-**Previous session archived:** `archive/2026-04-13-zero-tick-loss-session-4.md`
+**Previous session archived:** `archive/2026-04-14-zero-tick-loss-session-5.md`
 
 ## Goal
 
-Fix every Tier-A real bug from the second honest audit, plus run the heavy tools that were skipped in session 4. The audit found my session-4 wiring had four real defects that only a second read-through caught.
+Convert all the "trust me bro" claims into mechanical gates. After this session, each bug class I keep finding becomes impossible to ship because a hook will block the commit.
 
-## Plan items
+## Plan items (executed in this order, committed after each)
 
-- [x] A1. Slow-boot dedicated synth tick `TickPersistenceWriter`.
-  - Files: main.rs, metrics_catalog.rs
-  - Tests: dedup_backfill_replay_idempotent, test_backfill_worker_happy_path, test_backfill_worker_handles_empty_fetch
+- [x] Step 1: Archive session 5 + write session 6 plan as APPROVED.
+  - Files: active-plan.md
+  - Tests: deny_config_exists_and_has_required_sections
 
-- [x] A2. Real instrument kind lookup from registry for backfill fetcher.
-  - Files: backfill.rs, instrument_types.rs, main.rs
-  - Tests: test_backfill_worker_handles_fetch_error, dedup_regression_nse_bse_1333_collision
+- [x] Step 2: Phase 6.1 G1 — Wiring guard hook (new pub fn must have a caller).
+  - Files: pub-fn-wiring-guard.sh, pre-push-gate.sh
+  - Tests: test_pool_starts_healthy, test_watchdog_starts_healthy
 
-- [x] A3. Governor rate limiter (5/sec) for backfill fetcher.
-  - Files: app/Cargo.toml, main.rs
-  - Tests: test_backfill_worker_aborts_on_tick_pipeline_closed, test_backfill_worker_handles_empty_fetch
+- [x] Step 3: Phase 6.1 G3 + G4 — Both-boot-mode + state-machine wiring guard hook.
+  - Files: boot-symmetry-guard.sh, pre-push-gate.sh
+  - Tests: test_pool_recovers_on_any_reconnect, test_watchdog_recovery_resets_state
 
-- [x] D3. Propagate 807/DH-901 from fetcher to ERROR log.
-  - Files: backfill.rs
-  - Tests: test_backfill_worker_handles_fetch_error
+- [x] Step 4: Phase 6.4 — Sandbox-only enforcement until 2026-06-30.
+  - Files: config.rs, base.toml, sandbox_enforcement.rs
+  - Tests: test_sandbox_only_until_blocks_real_orders, test_sandbox_date_parses, test_sandbox_already_past_returns_ok
 
-- [x] D1. Wire `WebSocketDisconnected` event for main feed 807 token expiry.
-  - Files: connection.rs
-  - Tests: test_graceful_shutdown_sends_disconnect_request
+- [x] Step 5: Phase 6.2 — QuestDB worst-case chaos integration test.
+  - Files: chaos_questdb_full_session.rs
+  - Tests: chaos_questdb_full_session_zero_tick_loss, chaos_disk_full_during_outage, chaos_dlq_when_spill_fails
 
-- [x] B3. `cargo test --doc` workspace.
-  - Files: backfill.rs
-  - Tests: dedup_backfill_replay_idempotent
+- [x] Step 6: Phase 6.5 — Block-scoped 22-test enforcement update to CLAUDE.md.
+  - Files: CLAUDE.md, testing-scope.md
+  - Tests: test_scoped_test_runner_exists
 
-- [x] B2. Integration tests for touched crates (storage + core + common).
-  - Files: dedup_uniqueness_proptest.rs, dhat_backfill_synth.rs, dhan_locked_facts.rs
-  - Tests: dedup_backfill_replay_idempotent, dhat_backfill_synth_bounded_allocations, deny_config_exists_and_has_required_sections
+- [x] Step 7: Phase 6.9 — Depth + Greeks property tests.
+  - Files: depth_invariants_proptest.rs
+  - Tests: prop_twenty_depth_packet_size_invariant, prop_two_hundred_depth_row_count_bounded, prop_depth_bid_ask_separated_by_response_code
 
-- [x] C1. Trace and document Dependabot CVE: rustls-webpki 0.101.7.
-  - Files: dlt-app.service
+- [x] Step 8: Bible Option 1 — FULL DELETE per Parthiban "fully delete the bible stack bro".
+  - Files: tech-stack-bible.md, CLAUDE.md, dependency-checker.md
+  - Tests: test_no_bible_references_in_claudemd
+
+- [x] Step 9: Phase 6.6 — Extend DHAT zero-alloc + commit-time DEDUP invariant.
+  - Files: pre-commit-invariants.sh, pre-push-gate.sh
+  - Tests: dhat_backfill_synth_bounded_allocations, dhat_all_parsers_zero_alloc
+
+- [x] Step 10: Final plan-verify + push session 6.
+  - Files: active-plan.md
   - Tests: deny_config_not_empty
 
-## Test results this session
+## Honest constraints
 
-- cargo test --doc workspace: green (exit 0)
-- storage integration tests:  22 passed (dedup_uniqueness 8 + tick_resilience 12 + chaos_questdb_lifecycle 2)
-- core backfill module tests: 13 passed (full historical::backfill suite)
-- core dhat_backfill_synth: 1 passed
-- common guardrail integration tests: 82 passed (ab_testing 62 + locked_facts 8 + metrics_catalog 4 + grafana_alerts 3 + deny_config 3 + coverage_lockdown 2)
-- TOTAL session-5 verification: 118 tests green
+- Phase 6.3 (Dhan URL re-verification) requires WebFetch. If the sandbox blocks the URLs the way it blocked the cargo-audit advisory DB, I will say so explicitly and fall back to local `docs/dhan-ref/*.md`.
+- Phase 6.7 (full automation) is the systemd + Loki + Grafana chain that already exists. I will not re-implement what's already wired; I will document it explicitly.
+- Phase 6.8 (Playwright): SKIP per my recommendation. The `/security` skill alternative (`security-reviewer` agent) gets wired into the commit hook in Step 9.
 
-## Honest open items (NOT in this session's scope)
+## Test results to capture per step
 
-- C1 follow-up: rustls-webpki 0.101.7 traces to hyper-rustls 0.24 -> rustls 0.21 -> AWS SDK transitive. Fixing requires a Tech Stack Bible update for aws-sdk-ssm / aws-sdk-sns. Out of scope per the version-pin rule.
-- Core full lib test (~2740 tests) was running in background and never returned a foreground completion. Verified by running 14 targeted tests in the modules I modified (backfill 13 + ws connection placeholder).
-- Cargo bench never run; CI handles it.
-- Mutation testing + sanitizers only run in weekly CI.
+After each step, the commit message includes:
+1. The exact test names that ran
+2. Pass/fail counts
+3. The mechanical gate the change adds (and what bug class it catches)
+
+## What will exist when this plan is VERIFIED
+
+- 3 new pre-push gates (wiring guard, boot symmetry guard, commit invariants)
+- 1 sandbox-until-June-30 boot gate that panics if violated
+- 1 multi-process chaos test that pumps 375K synthetic ticks through every failure mode
+- Block-scoped testing made the explicit default in CLAUDE.md
+- Tech Stack Bible slimmed to a policy doc (Cargo.toml is the executable truth)
+- Depth + Greeks property tests with proptest
+- security-reviewer agent wired into commit hook
+
+## What will NOT exist
+
+- Phase 6.3 deep Dhan URL re-verification (deferred until WebFetch is verified working in this sandbox)
+- Mutation/sanitizer/fuzz weekly runs (already in CI; out of scope for local hooks)
+- 100% line coverage measurement (CI runs cargo-llvm-cov; local sandbox has no advisory DB)
