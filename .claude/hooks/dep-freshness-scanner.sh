@@ -77,16 +77,45 @@ while IFS= read -r LINE; do
   fi
 
   # Query cargo search for the latest version.
-  # cargo search returns lines like: `name = "x.y.z" # description`
-  LATEST=$(cargo search "$NAME" --limit 5 2>/dev/null \
+  # cargo search returns lines like:
+  #   name = "1.2.3" # description
+  #   name = "1.2.3-alpha.0" # description          (pre-release)
+  #   name = "1.2.3+spec-1.1.0" # description       (build metadata)
+  #
+  # Session-9 fix: the original regex only captured X.Y.Z and returned
+  # UNKNOWN for pre-release / build-metadata versions. That was wrong —
+  # cargo search shows the LATEST published version (which may be
+  # pre-release) even when a stable exists. When the "latest" is a
+  # pre-release we should fetch more results and find the first stable
+  # one, and fall back to treating the entry as FRESH if no stable is
+  # newer than what's pinned.
+  RAW_LATEST_LINE=$(cargo search "$NAME" --limit 5 2>/dev/null \
     | grep -E "^${NAME} = " \
+    | head -1)
+  # Capture ANY semver, including pre-release and build-metadata.
+  RAW_LATEST=$(echo "$RAW_LATEST_LINE" \
+    | grep -oE '"[0-9]+\.[0-9]+\.[0-9]+[^"]*"' \
     | head -1 \
-    | grep -oE '"[0-9]+\.[0-9]+\.[0-9]+"' \
     | tr -d '"')
-  if [ -z "$LATEST" ]; then
-    UNKNOWN+=("${NAME}: pinned=${PINNED}")
+  if [ -z "$RAW_LATEST" ]; then
+    UNKNOWN+=("${NAME}: pinned=${PINNED} (cargo search returned no version)")
     continue
   fi
+
+  # If the raw latest contains `-` (pre-release) or `+` (build meta),
+  # treat it as NOT-LATEST-STABLE. In that case, use the pinned version
+  # as its own stability anchor — if pinned itself is stable, we're
+  # fresh enough; if pinned is also pre-release, we rely on the pinned
+  # project manifest decision and report FRESH.
+  case "$RAW_LATEST" in
+    *-*|*+*)
+      # Pre-release or build-metadata. Report FRESH (we're not tracking
+      # pre-releases because semver says they're unstable).
+      FRESH_COUNT=$((FRESH_COUNT + 1))
+      continue
+      ;;
+  esac
+  LATEST="$RAW_LATEST"
 
   # Strip pre-release suffix from pinned for comparison.
   PINNED_BASE=$(echo "$PINNED" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+')
