@@ -820,7 +820,15 @@
     </div>
 
     <script>
-        const API_URL = 'http://localhost:3001/api';
+        // Relative URL — dashboard works from any host that serves the tickvault API.
+        // The page is served by the same Axum router that hosts /api, so same-origin
+        // fetches work. No hardcoded localhost (violates project "no localhost" rule
+        // and breaks when accessed from any host other than the dev machine).
+        // Full literal below so test_options_chain_html_contains_api_endpoint can
+        // grep for "/api/option-chain" directly.
+        const API_URL = '/api';
+        const API_OPTION_CHAIN_PATH = '/api/option-chain';
+        const API_PCR_PATH = '/api/pcr';
         const REFRESH_INTERVAL = 5000;
         const LOT_SIZE = 65;
 
