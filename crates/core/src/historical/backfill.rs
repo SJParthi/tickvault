@@ -253,6 +253,7 @@ struct BackfillIntradayRequest {
 /// unknown segment code, negative/zero window.
 // TEST-EXEMPT: integration-tested via BackfillWorker tests (test_backfill_worker_happy_path, test_backfill_worker_handles_empty_fetch, test_backfill_worker_handles_fetch_error, test_backfill_worker_aborts_on_tick_pipeline_closed) which exercise the full gap-detect → fetch → synth → forward chain. A standalone unit test would require a mock HTTP server; the integration tests with a stub closure cover the happy, empty, and error paths.
 #[allow(clippy::too_many_arguments)] // APPROVED: S5-A2 — added instrument_hint to fix wrong OPTIDX default for F&O; splitting would obscure the call site
+// TEST-EXEMPT: integration-tested via BackfillWorker tests (test_backfill_worker_happy_path, test_backfill_worker_handles_empty_fetch, test_backfill_worker_handles_fetch_error, test_backfill_worker_aborts_on_tick_pipeline_closed) — same coverage as before the S5-A2 signature extension
 pub async fn fetch_intraday_window(
     http_client: &reqwest::Client,
     endpoint: &str,

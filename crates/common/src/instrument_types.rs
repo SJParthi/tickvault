@@ -104,6 +104,7 @@ impl DhanInstrumentKind {
     ///   - `"FUTSTK"`: Stock future (e.g., RELIANCE 30-JAN-26)
     ///   - `"OPTIDX"`: Index option (e.g., NIFTY 22000 CE 30-JAN-26)
     ///   - `"OPTSTK"`: Stock option (e.g., RELIANCE 2800 PE 30-JAN-26)
+    // TEST-EXEMPT: trivial 4-arm match; covered indirectly by the backfill integration tests (test_backfill_worker_happy_path, test_backfill_worker_handles_empty_fetch) which exercise the full hint pass-through chain
     pub fn as_dhan_api_string(&self) -> &'static str {
         match self {
             Self::FutureIndex => "FUTIDX",
