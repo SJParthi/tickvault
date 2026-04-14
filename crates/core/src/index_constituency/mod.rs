@@ -172,7 +172,15 @@ mod tests {
     // download_and_build_constituency_map: all downloads fail, no cache
     // -----------------------------------------------------------------------
 
+    // Session 8 final sweep: these tests hit real niftyindices.com URLs via
+    // `download_and_build_constituency_map`. On machines with network they
+    // can take 30+ seconds; on machines without network they can hang for
+    // minutes on TCP connect timeouts. They're `#[ignore]`d from the
+    // default suite so they never hang CI. Run explicitly when you want
+    // to verify the full download path:
+    //     cargo test -p tickvault-core download_and_build_constituency -- --ignored
     #[tokio::test]
+    #[ignore = "real network — niftyindices.com; run with --ignored"]
     async fn test_all_downloads_fail_no_cache_returns_none() {
         let config = test_config(true);
         let cache_dir = test_cache_dir("all-fail-no-cache");
@@ -201,6 +209,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
+    #[ignore = "real network — niftyindices.com; run with --ignored"]
     async fn test_all_downloads_fail_with_cache_returns_cached() {
         let cache_dir = test_cache_dir("all-fail-with-cache");
 
@@ -311,6 +320,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
+    #[ignore = "real network — niftyindices.com; run with --ignored"]
     async fn test_enabled_config_does_not_return_none_immediately() {
         let config = test_config(true);
         let cache_dir = test_cache_dir("enabled-check");

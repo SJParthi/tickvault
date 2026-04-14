@@ -497,7 +497,11 @@ pub const STALE_LTP_THRESHOLD_SECS: u64 = 600;
 // ---------------------------------------------------------------------------
 
 /// Base path for all secrets in SSM Parameter Store.
-pub const SSM_SECRET_BASE_PATH: &str = "/dlt";
+/// Renamed from `/dlt` to `/tickvault` in the dhan-live-trader → tickvault
+/// repo rename (commit aad528a). Any SSM parameters that still live under
+/// `/dlt/...` in AWS must be migrated or mirrored before this rename
+/// lands in prod — see `docs/runbooks/secret-rotation.md`.
+pub const SSM_SECRET_BASE_PATH: &str = "/tickvault";
 
 /// SSM service path segment for Dhan credentials.
 pub const SSM_DHAN_SERVICE: &str = "dhan";

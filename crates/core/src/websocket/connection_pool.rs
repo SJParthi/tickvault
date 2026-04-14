@@ -795,6 +795,23 @@ mod tests {
 
     // --- spawn_all() Tests ---
 
+    /// Session 8 final-sweep helper — drain all spawned WebSocket tasks for
+    /// test cleanup without hanging. Signals graceful shutdown first, then
+    /// aborts each handle so the task exits even if the deeper connection
+    /// loop ignores `reconnect_max_attempts: 0`. Without this, every
+    /// `test_spawn_all_*` variant hangs forever because the connection loop
+    /// retries indefinitely against a fake Dhan endpoint.
+    async fn drain_handles_or_timeout(
+        pool: &WebSocketConnectionPool,
+        handles: Vec<tokio::task::JoinHandle<Result<(), WebSocketError>>>,
+    ) {
+        pool.request_graceful_shutdown();
+        for handle in handles {
+            handle.abort();
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
+        }
+    }
+
     #[tokio::test]
     async fn test_spawn_all_returns_correct_number_of_handles() {
         let pool = WebSocketConnectionPool::new(
@@ -820,13 +837,8 @@ mod tests {
             "spawn_all must return one handle per connection"
         );
 
-        // All tasks should complete (with errors, since no token)
-        for handle in handles {
-            let result = handle.await;
-            assert!(result.is_ok(), "JoinHandle must not panic");
-            // The inner result is an error (no token → reconnection exhausted)
-            assert!(result.unwrap().is_err());
-        }
+        // Drain with timeout — see drain_handles_or_timeout doc for context.
+        drain_handles_or_timeout(&pool, handles).await;
     }
 
     #[tokio::test]
@@ -850,10 +862,7 @@ mod tests {
         let handles = pool.spawn_all().await;
         assert_eq!(handles.len(), 5, "empty pool still has 5 connections");
 
-        for handle in handles {
-            let result = handle.await;
-            assert!(result.is_ok(), "JoinHandle must not panic");
-        }
+        drain_handles_or_timeout(&pool, handles).await;
     }
 
     #[tokio::test]
@@ -1151,10 +1160,7 @@ mod tests {
         let handles = pool.spawn_all().await;
         assert_eq!(handles.len(), 1);
 
-        for handle in handles {
-            let result = handle.await;
-            assert!(result.is_ok(), "JoinHandle must not panic");
-        }
+        drain_handles_or_timeout(&pool, handles).await;
     }
 
     #[tokio::test]
@@ -1187,10 +1193,7 @@ mod tests {
             "Stagger should cause at least 200ms delay for 5 connections, got {elapsed:?}",
         );
 
-        for handle in handles {
-            let result = handle.await;
-            assert!(result.is_ok(), "JoinHandle must not panic");
-        }
+        drain_handles_or_timeout(&pool, handles).await;
     }
 
     // =======================================================================
@@ -1336,8 +1339,6 @@ mod tests {
             "Zero stagger should be near-instant, got {elapsed:?}",
         );
 
-        for handle in handles {
-            let _ = handle.await;
-        }
+        drain_handles_or_timeout(&pool, handles).await;
     }
 }

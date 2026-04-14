@@ -768,9 +768,14 @@ mod tests {
     }
 
     #[test]
-    fn test_depth_read_timeout_matches_keepalive() {
-        // Dhan docs: server pings every 10s, connection drops after 40s
-        assert_eq!(DEPTH_READ_TIMEOUT_SECS, 40);
+    fn test_depth_read_timeout_is_safety_bound() {
+        // Dhan docs say server pings every 10s and auto-pong is handled by the
+        // WS library. The depth read timeout is NOT tied to the 40s ping
+        // timeout — it is a SAFETY bound for the case where the server
+        // truly dies (no pings at all), and is deliberately set to 5 min
+        // to avoid false timeouts during low-activity periods outside
+        // market hours. See the const doc comment for the rationale.
+        assert_eq!(DEPTH_READ_TIMEOUT_SECS, 300);
     }
 
     #[test]
