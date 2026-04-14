@@ -50,8 +50,8 @@ for FILE in $SCOPE_FILES; do
 
   # Find pub fn declarations (excluding `pub(crate)` and `pub(super)` for now —
   # those are intentionally module-scoped).
-  while IFS=':' read -r LINENO REST; do
-    [ -n "$LINENO" ] || continue
+  while IFS=':' read -r FN_LINE REST; do
+    [ -n "$FN_LINE" ] || continue
 
     # Extract fn name. Handles `pub fn foo`, `pub async fn foo`,
     # `pub fn foo<T>`, `pub fn foo(`.
@@ -66,7 +66,7 @@ for FILE in $SCOPE_FILES; do
     esac
 
     # Check for // WIRING-EXEMPT: on the line directly above.
-    PREV_LINE=$((LINENO - 1))
+    PREV_LINE=$((FN_LINE - 1))
     if sed -n "${PREV_LINE}p" "$FILE" 2>/dev/null | grep -q 'WIRING-EXEMPT:'; then
       continue
     fi
@@ -85,7 +85,7 @@ for FILE in $SCOPE_FILES; do
 
     # The declaration itself shows up in the count (1 reference). Anything > 1 means a caller exists.
     if [ "$CALL_COUNT" -le 1 ]; then
-      VIOLATIONS+=("${FILE}:${LINENO}: pub fn ${FN_NAME}() has no call sites")
+      VIOLATIONS+=("${FILE}:${FN_LINE}: pub fn ${FN_NAME}() has no call sites")
     fi
   done < <(grep -nE '^\s*pub\s+(async\s+|const\s+|unsafe\s+)?fn\s+[a-zA-Z_]' "$FILE" 2>/dev/null || true)
 done

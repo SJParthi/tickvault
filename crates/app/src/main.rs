@@ -27,8 +27,9 @@
 // Modules are declared in lib.rs for coverage instrumentation.
 use dhan_live_trader_app::boot_helpers::{
     CONFIG_BASE_PATH, CONFIG_LOCAL_PATH, FAST_BOOT_WINDOW_END, FAST_BOOT_WINDOW_START, IstTimer,
-    compute_market_close_sleep, create_log_file_writer, effective_ws_stagger, format_bind_addr,
-    format_cross_match_details, format_timeframe_details, format_violation_details,
+    check_clock_drift, compute_market_close_sleep, create_log_file_writer, effective_ws_stagger,
+    format_bind_addr, format_cross_match_details, format_timeframe_details,
+    format_violation_details, spawn_heartbeat_watchdog,
 };
 use dhan_live_trader_app::{infra, observability, trading_pipeline};
 
@@ -143,6 +144,22 @@ async fn main() -> Result<()> {
         mode = ?config.strategy.mode,
         "S6-Step4: sandbox-only window check passed"
     );
+
+    // S12 wiring: system clock drift check (cold path, boot only).
+    // SEBI + tick timestamp integrity requires the system clock to be
+    // within a few seconds of UTC. Drift > threshold logs WARN (fires
+    // Telegram via Loki hook). Best-effort — network errors return None
+    // and are non-fatal; the check exists to catch gross drifts (NTP
+    // failed, container clock skew, etc.) before market data starts
+    // flowing.
+    if let Some(drift_secs) = check_clock_drift().await {
+        info!(
+            drift_secs,
+            "S12: system clock drift check completed (0 = synced)"
+        );
+    } else {
+        warn!("S12: clock drift check failed (network or parse error) — proceeding");
+    }
 
     // Build trading calendar (validated inside config.validate() already).
     let trading_calendar = std::sync::Arc::new(
@@ -437,6 +454,18 @@ async fn main() -> Result<()> {
             tokio::sync::broadcast::channel::<dhan_live_trader_common::tick_types::ParsedTick>(
                 dhan_live_trader_common::constants::TICK_BROADCAST_CAPACITY,
             );
+
+        // S12 wiring: heartbeat watchdog (fast boot).
+        // Spawns a background task that every 30 seconds checks:
+        //   - Token handle has a non-None token
+        //   - Tick broadcast has > 0 active receivers
+        //   - Emits systemd WATCHDOG=1 ping
+        //   - Exports FD/thread system metrics
+        // Logs ERROR on any failure (fires Telegram via Loki hook).
+        let _fast_heartbeat_handle = spawn_heartbeat_watchdog(
+            std::sync::Arc::clone(&token_handle),
+            fast_tick_broadcast_sender.clone(),
+        );
 
         // S3-2: Gap-backfill channel + worker. The cold-path tick persistence
         // consumer publishes GapBackfillRequest here when a TickGapTracker
@@ -1388,6 +1417,15 @@ async fn main() -> Result<()> {
         tokio::sync::broadcast::channel::<dhan_live_trader_common::tick_types::ParsedTick>(
             dhan_live_trader_common::constants::TICK_BROADCAST_CAPACITY,
         );
+
+    // S12 wiring: heartbeat watchdog (slow boot).
+    // Same responsibilities as the fast-boot watchdog above. Spawned
+    // after token_handle + tick_broadcast_sender are both available.
+    // Runs until the process exits.
+    let _slow_heartbeat_handle = spawn_heartbeat_watchdog(
+        std::sync::Arc::clone(&token_handle),
+        tick_broadcast_sender.clone(),
+    );
 
     // S4-T1d: Slow-boot backfill infrastructure. Mirrors the fast-boot
     // wiring at line ~424 so the two boot modes have identical gap

@@ -683,7 +683,8 @@ impl DeepDepthWriter {
     }
 
     /// Returns the number of records held in the resilience ring buffer.
-    // TEST-EXEMPT: trivial field getter, tested indirectly by ring buffer tests
+    // TEST-EXEMPT: trivial field getter, tested indirectly by ring buffer tests.
+    // WIRING-EXEMPT: observability getter exposed for future metric scraping + dlt-doctor diagnostic probes.
     pub fn buffered_count(&self) -> usize {
         self.depth_buffer.len()
     }
