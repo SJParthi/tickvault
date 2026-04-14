@@ -275,6 +275,19 @@ impl WebSocketConnection {
                             if code.requires_token_refresh() =>
                         {
                             m_conn_active.set(0.0);
+                            // S5-D1: Fire Telegram on token-expired disconnect.
+                            // Previously the 807 branch sat in silence waiting
+                            // for renewal, so the operator only learned about
+                            // token expiry indirectly (missing ticks, late
+                            // auth-related errors). Now they get an explicit
+                            // WebSocketDisconnected event the moment 807 fires.
+                            if let Some(ref n) = self.notifier {
+                                n.notify(crate::notification::events::NotificationEvent::WebSocketDisconnected {
+                                    connection_index: usize::from(self.connection_id),
+                                    // O(1) EXEMPT: cold path, once per 807 event
+                                    reason: format!("Token expired ({code}) — waiting for renewal"),
+                                });
+                            }
                             warn!(
                                 connection_id = self.connection_id,
                                 disconnect_code = %code,
