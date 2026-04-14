@@ -1,7 +1,7 @@
 # S7-Step5 / Phase 8.6: Staging config profile.
 #
 # Merged on top of config/base.toml via:
-#   export DLT_ENVIRONMENT=staging
+#   export TV_ENVIRONMENT=staging
 #   figment picks up config/staging.toml automatically
 #
 # Staging runs the FULL stack (WebSocket → QuestDB → Grafana → Telegram)

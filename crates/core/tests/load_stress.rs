@@ -6,17 +6,17 @@
 //!
 //! NOTE: Timing assertions are skipped under instrumented builds
 //! (cargo-careful, sanitizers) where execution is 10-100x slower.
-//! Set `DLT_SKIP_PERF_ASSERTIONS=1` to skip timing checks.
+//! Set `TV_SKIP_PERF_ASSERTIONS=1` to skip timing checks.
 
 use std::time::{Duration, Instant};
 
 /// Returns true when running under instrumented builds (cargo-careful, sanitizers).
 /// Timing assertions are unreliable under instrumentation overhead.
 fn skip_perf_assertions() -> bool {
-    std::env::var("DLT_SKIP_PERF_ASSERTIONS").is_ok()
+    std::env::var("TV_SKIP_PERF_ASSERTIONS").is_ok()
 }
 
-use dhan_live_trader_common::constants::{
+use tickvault_common::constants::{
     EXCHANGE_SEGMENT_NSE_FNO, QUOTE_PACKET_SIZE, TICKER_PACKET_SIZE,
 };
 
@@ -62,7 +62,7 @@ fn stress_parse_100k_tickers() {
             100.0 + (i as f32 * 0.01),
             1_700_000_000 + i,
         );
-        if dhan_live_trader_core::parser::dispatch_frame(&packet, 0).is_ok() {
+        if tickvault_core::parser::dispatch_frame(&packet, 0).is_ok() {
             success_count += 1;
         }
     }
@@ -86,7 +86,7 @@ fn stress_parse_100k_quotes() {
 
     for i in 0..100_000_u32 {
         let packet = make_quote(50000 + (i % 25000), 200.0 + (i as f32 * 0.01));
-        if dhan_live_trader_core::parser::dispatch_frame(&packet, 0).is_ok() {
+        if tickvault_core::parser::dispatch_frame(&packet, 0).is_ok() {
             success_count += 1;
         }
     }
@@ -119,7 +119,7 @@ fn stress_burst_10k_mixed_packets() {
                 1_700_000_000 + i,
             )
         };
-        let result = dhan_live_trader_core::parser::dispatch_frame(&packet, i as i64);
+        let result = tickvault_core::parser::dispatch_frame(&packet, i as i64);
         assert!(result.is_ok(), "parse failed at iteration {i}");
     }
 
@@ -138,8 +138,8 @@ fn stress_burst_10k_mixed_packets() {
 
 #[test]
 fn stress_candle_aggregator_50k_ticks() {
-    use dhan_live_trader_common::tick_types::ParsedTick;
-    use dhan_live_trader_core::pipeline::candle_aggregator::CandleAggregator;
+    use tickvault_common::tick_types::ParsedTick;
+    use tickvault_core::pipeline::candle_aggregator::CandleAggregator;
 
     let mut agg = CandleAggregator::new();
     let start = Instant::now();
@@ -183,7 +183,7 @@ fn test_stress_parser_throughput_1m_packets() {
             100.0 + (i as f32 * 0.001),
             1_700_000_000 + (i / 100),
         );
-        if dhan_live_trader_core::parser::dispatch_frame(&packet, 0).is_ok() {
+        if tickvault_core::parser::dispatch_frame(&packet, 0).is_ok() {
             success_count += 1;
         }
     }
@@ -208,11 +208,11 @@ fn test_stress_parser_throughput_1m_packets() {
 
 #[test]
 fn test_stress_concurrent_registry_access() {
-    use dhan_live_trader_common::instrument_registry::{
+    use std::sync::Arc;
+    use tickvault_common::instrument_registry::{
         InstrumentRegistry, SubscribedInstrument, SubscriptionCategory,
     };
-    use dhan_live_trader_common::types::{ExchangeSegment, FeedMode};
-    use std::sync::Arc;
+    use tickvault_common::types::{ExchangeSegment, FeedMode};
 
     // Build a registry with 5000 instruments (max per connection).
     let instruments: Vec<SubscribedInstrument> = (0..5000_u32)
@@ -269,8 +269,8 @@ fn test_stress_concurrent_registry_access() {
 
 #[test]
 fn test_stress_candle_aggregator_burst() {
-    use dhan_live_trader_common::tick_types::ParsedTick;
-    use dhan_live_trader_core::pipeline::candle_aggregator::CandleAggregator;
+    use tickvault_common::tick_types::ParsedTick;
+    use tickvault_core::pipeline::candle_aggregator::CandleAggregator;
 
     let mut agg = CandleAggregator::new();
     let start = Instant::now();
@@ -325,9 +325,9 @@ fn test_stress_candle_aggregator_burst() {
 
 #[test]
 fn test_stress_subscription_builder_max_load() {
-    use dhan_live_trader_common::types::{ExchangeSegment, FeedMode};
-    use dhan_live_trader_core::websocket::subscription_builder::build_subscription_messages;
-    use dhan_live_trader_core::websocket::types::InstrumentSubscription;
+    use tickvault_common::types::{ExchangeSegment, FeedMode};
+    use tickvault_core::websocket::subscription_builder::build_subscription_messages;
+    use tickvault_core::websocket::types::InstrumentSubscription;
 
     // Build 5000 instruments (max per connection).
     let instruments: Vec<InstrumentSubscription> = (0..5000_u32)

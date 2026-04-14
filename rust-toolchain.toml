@@ -1,5 +1,5 @@
 # =============================================================================
-# dhan-live-trader — Rust Toolchain Configuration
+# tickvault — Rust Toolchain Configuration
 # =============================================================================
 # Pins the exact Rust version + components for all developers and CI.
 # rustup reads this file automatically on any cargo/rustc command.

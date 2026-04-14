@@ -6,8 +6,8 @@
 
 #![allow(clippy::unwrap_used, clippy::arithmetic_side_effects)]
 
-use dhan_live_trader_common::tick_types::DeepDepthLevel;
-use dhan_live_trader_trading::indicator::obi::{ObiSnapshot, compute_obi};
+use tickvault_common::tick_types::DeepDepthLevel;
+use tickvault_trading::indicator::obi::{ObiSnapshot, compute_obi};
 
 // ---------------------------------------------------------------------------
 // Helpers

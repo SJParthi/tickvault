@@ -13,8 +13,8 @@ use reqwest::Client;
 use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
-use dhan_live_trader_common::config::IndexConstituencyConfig;
-use dhan_live_trader_common::constants::{
+use tickvault_common::config::IndexConstituencyConfig;
+use tickvault_common::constants::{
     INDEX_CONSTITUENCY_BASE_URL, INDEX_CONSTITUENCY_MIN_INDICES,
     INDEX_CONSTITUENCY_RETRY_MAX_DELAY_SECS, INDEX_CONSTITUENCY_RETRY_MAX_TIMES,
     INDEX_CONSTITUENCY_RETRY_MIN_DELAY_SECS, INDEX_CONSTITUENCY_USER_AGENT,

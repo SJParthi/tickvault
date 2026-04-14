@@ -3,10 +3,8 @@
 //! Format: `<BHBIfI>` — Header(8) + LTP(f32) + LTT(u32).
 //! Used for both Index Ticker (response_code 1) and Ticker (response_code 2).
 
-use dhan_live_trader_common::constants::{
-    TICKER_OFFSET_LTP, TICKER_OFFSET_LTT, TICKER_PACKET_SIZE,
-};
-use dhan_live_trader_common::tick_types::ParsedTick;
+use tickvault_common::constants::{TICKER_OFFSET_LTP, TICKER_OFFSET_LTT, TICKER_PACKET_SIZE};
+use tickvault_common::tick_types::ParsedTick;
 
 use super::types::{PacketHeader, ParseError};
 
@@ -57,7 +55,7 @@ pub fn parse_ticker_packet(
 #[allow(clippy::arithmetic_side_effects)] // APPROVED: test helpers use constant offsets for packet construction
 mod tests {
     use super::*;
-    use dhan_live_trader_common::constants::EXCHANGE_SEGMENT_NSE_FNO;
+    use tickvault_common::constants::EXCHANGE_SEGMENT_NSE_FNO;
 
     fn make_ticker_packet(
         segment: u8,

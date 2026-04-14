@@ -20,7 +20,7 @@
 //! All computations are O(1) — fixed 20-level iteration, no heap allocation.
 //! Input is a pair of `&[DeepDepthLevel]` slices (bid + ask sides).
 
-use dhan_live_trader_common::tick_types::DeepDepthLevel;
+use tickvault_common::tick_types::DeepDepthLevel;
 
 // ---------------------------------------------------------------------------
 // Constants

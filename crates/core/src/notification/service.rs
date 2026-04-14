@@ -28,8 +28,8 @@ use std::time::Duration;
 use secrecy::{ExposeSecret, SecretString};
 use tracing::{info, instrument, warn};
 
-use dhan_live_trader_common::config::NotificationConfig;
-use dhan_live_trader_common::constants::{
+use tickvault_common::config::NotificationConfig;
+use tickvault_common::constants::{
     SNS_PHONE_NUMBER_SECRET, SSM_SNS_SERVICE, SSM_TELEGRAM_SERVICE, TELEGRAM_BOT_TOKEN_SECRET,
     TELEGRAM_CHAT_ID_SECRET,
 };

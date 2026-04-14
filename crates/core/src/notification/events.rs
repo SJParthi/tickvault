@@ -8,7 +8,7 @@
 //! `AuthenticationFailed` and `TokenRenewalFailed` reasons to prevent
 //! credential leaks in Telegram even if callers pass unsanitized strings.
 
-use dhan_live_trader_common::sanitize::redact_url_params;
+use tickvault_common::sanitize::redact_url_params;
 
 /// Masks the last two octets of an IPv4 address for safe display in
 /// Telegram messages. Prevents full IP exposure while still confirming
@@ -315,7 +315,7 @@ impl NotificationEvent {
             Self::StartupComplete { mode } => {
                 // SECURITY: Do not expose internal service ports in Telegram.
                 format!(
-                    "<b>dhan-live-trader started</b>\nMode: {mode}\n\n\
+                    "<b>tickvault started</b>\nMode: {mode}\n\n\
                      Dashboards: Grafana / Prometheus / Jaeger / QuestDB available"
                 )
             }
@@ -585,7 +585,7 @@ impl NotificationEvent {
                 )
             }
             Self::ShutdownInitiated => "<b>Shutdown initiated</b>".to_string(),
-            Self::ShutdownComplete => "<b>dhan-live-trader stopped</b>".to_string(),
+            Self::ShutdownComplete => "<b>tickvault stopped</b>".to_string(),
             Self::OrderRejected {
                 correlation_id,
                 reason,

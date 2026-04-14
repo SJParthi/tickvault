@@ -2,7 +2,7 @@
 //!
 //! Format: `<BHBIfI>` — Header(8) + PrevClose(f32) + PrevOI(u32).
 
-use dhan_live_trader_common::constants::{
+use tickvault_common::constants::{
     PREV_CLOSE_OFFSET_OI, PREV_CLOSE_OFFSET_PRICE, PREVIOUS_CLOSE_PACKET_SIZE,
 };
 

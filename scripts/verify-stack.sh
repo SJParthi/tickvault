@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# dhan-live-trader — Verify Observability Stack
+# tickvault — Verify Observability Stack
 # =============================================================================
 # Validates that all infrastructure services are running and healthy.
 # Run after bootstrap.sh or docker compose up.
@@ -71,20 +71,20 @@ check_container() {
 
 echo ""
 echo -e "${CYAN}╔════════════════════════════════════════════════╗${NC}"
-echo -e "${CYAN}║   dhan-live-trader — Stack Verification        ║${NC}"
+echo -e "${CYAN}║   tickvault — Stack Verification        ║${NC}"
 echo -e "${CYAN}╚════════════════════════════════════════════════╝${NC}"
 echo ""
 
 # --- Container Status -------------------------------------------------------
 echo -e "${CYAN}[1/5]${NC} Container Status"
-check_container "dlt-questdb"
-check_container "dlt-valkey"
-check_container "dlt-prometheus"
-check_container "dlt-loki"
-check_container "dlt-alloy"
-check_container "dlt-jaeger"
-check_container "dlt-grafana"
-check_container "dlt-traefik"
+check_container "tv-questdb"
+check_container "tv-valkey"
+check_container "tv-prometheus"
+check_container "tv-loki"
+check_container "tv-alloy"
+check_container "tv-jaeger"
+check_container "tv-grafana"
+check_container "tv-traefik"
 echo ""
 
 # --- HTTP Health Checks ------------------------------------------------------

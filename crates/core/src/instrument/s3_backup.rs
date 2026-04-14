@@ -33,7 +33,7 @@ const S3_CSV_FILENAME: &str = "instruments.csv";
 /// S3 backup is disabled and all operations return [`S3BackupError::NotConfigured`].
 #[derive(Debug, Clone)]
 pub struct S3BackupConfig {
-    /// S3 bucket name (e.g., `"dlt-instrument-backup"`).
+    /// S3 bucket name (e.g., `"tv-instrument-backup"`).
     /// Empty string means S3 backup is disabled.
     pub bucket: String,
     /// Key prefix inside the bucket (e.g., `"instruments"`).
@@ -149,7 +149,7 @@ pub async fn backup_instrument_cache(
     let cache_path = Path::new(cache_dir);
 
     // Verify local files exist before attempting upload
-    let rkyv_path = cache_path.join(dhan_live_trader_common::constants::BINARY_CACHE_FILENAME);
+    let rkyv_path = cache_path.join(tickvault_common::constants::BINARY_CACHE_FILENAME);
     let csv_path = cache_path.join(csv_filename);
 
     if !rkyv_path.exists() {
@@ -274,7 +274,7 @@ mod tests {
     #[test]
     fn test_s3_backup_config_with_bucket_is_configured() {
         let config = S3BackupConfig {
-            bucket: "dlt-instrument-backup".to_owned(),
+            bucket: "tv-instrument-backup".to_owned(),
             prefix: "instruments".to_owned(),
             region: "ap-south-1".to_owned(),
         };
@@ -419,7 +419,7 @@ mod tests {
 
         // Use a path that definitely does not exist
         let result = backup_instrument_cache(
-            "/tmp/dlt-s3-test-nonexistent-12345",
+            "/tmp/tv-s3-test-nonexistent-12345",
             "test.csv",
             date,
             &config,
@@ -480,14 +480,14 @@ mod tests {
 
         // Create temp dir with the expected files
         let dir = std::env::temp_dir().join(format!(
-            "dlt-s3-test-backup-{}-{:?}",
+            "tv-s3-test-backup-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
-            dir.join(dhan_live_trader_common::constants::BINARY_CACHE_FILENAME),
+            dir.join(tickvault_common::constants::BINARY_CACHE_FILENAME),
             b"fake rkyv data",
         )
         .unwrap();
@@ -521,14 +521,14 @@ mod tests {
 
         // Create temp dir with rkyv but NO csv
         let dir = std::env::temp_dir().join(format!(
-            "dlt-s3-test-nocsv-{}-{:?}",
+            "tv-s3-test-nocsv-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
-            dir.join(dhan_live_trader_common::constants::BINARY_CACHE_FILENAME),
+            dir.join(tickvault_common::constants::BINARY_CACHE_FILENAME),
             b"fake rkyv data",
         )
         .unwrap();
@@ -557,7 +557,7 @@ mod tests {
         };
 
         let dir = std::env::temp_dir().join(format!(
-            "dlt-s3-test-restore-mkdir-{}-{:?}",
+            "tv-s3-test-restore-mkdir-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));

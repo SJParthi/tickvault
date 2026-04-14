@@ -11,12 +11,12 @@
 //! writer's ring buffer + spill + DLQ layers handle that), but it must
 //! be **fully visible to the operator**. This module provides:
 //!
-//! 1. A Prometheus gauge `dlt_questdb_connected` (1.0 = connected, 0.0 = not)
-//! 2. A Prometheus gauge `dlt_questdb_disconnected_seconds` (how long the
+//! 1. A Prometheus gauge `tv_questdb_connected` (1.0 = connected, 0.0 = not)
+//! 2. A Prometheus gauge `tv_questdb_disconnected_seconds` (how long the
 //!    current outage has lasted; 0 when connected)
-//! 3. A Prometheus counter `dlt_questdb_reconnects_total` (successful
+//! 3. A Prometheus counter `tv_questdb_reconnects_total` (successful
 //!    reconnects since startup)
-//! 4. A Prometheus counter `dlt_questdb_disconnect_events_total` (transitions
+//! 4. A Prometheus counter `tv_questdb_disconnect_events_total` (transitions
 //!    from Connected → Disconnected)
 //! 5. Verdict enum consumed by the owning task for ERROR-level logs that
 //!    fire Telegram via the shared alert hook
@@ -158,44 +158,44 @@ impl Default for QuestDbHealthPoller {
     }
 }
 
-/// Emits the `dlt_questdb_*` metrics implied by a verdict. Separated from
+/// Emits the `tv_questdb_*` metrics implied by a verdict. Separated from
 /// `tick()` so the state machine stays pure (testable without a metrics
 /// recorder).
 // TEST-EXEMPT: pure metric side effects; the underlying state transitions are fully covered by test_poller_* tests and the metric emission path has no branches worth testing in isolation
 pub fn emit_metrics_for_verdict(verdict: QuestDbHealthVerdict, poller: &QuestDbHealthPoller) {
     match verdict {
         QuestDbHealthVerdict::Healthy => {
-            metrics::gauge!("dlt_questdb_connected").set(1.0);
-            metrics::gauge!("dlt_questdb_disconnected_seconds").set(0.0);
+            metrics::gauge!("tv_questdb_connected").set(1.0);
+            metrics::gauge!("tv_questdb_disconnected_seconds").set(0.0);
         }
         QuestDbHealthVerdict::Recovered { was_down_for } => {
-            metrics::gauge!("dlt_questdb_connected").set(1.0);
-            metrics::gauge!("dlt_questdb_disconnected_seconds").set(0.0);
-            metrics::counter!("dlt_questdb_reconnects_total").increment(1);
+            metrics::gauge!("tv_questdb_connected").set(1.0);
+            metrics::gauge!("tv_questdb_disconnected_seconds").set(0.0);
+            metrics::counter!("tv_questdb_reconnects_total").increment(1);
             tracing::info!(
                 down_for_secs = was_down_for.as_secs(),
                 "S3-1: QuestDB reconnected — write path restored"
             );
         }
         QuestDbHealthVerdict::Degrading { down_for } => {
-            metrics::gauge!("dlt_questdb_connected").set(0.0);
-            metrics::gauge!("dlt_questdb_disconnected_seconds").set(down_for.as_secs_f64());
+            metrics::gauge!("tv_questdb_connected").set(0.0);
+            metrics::gauge!("tv_questdb_disconnected_seconds").set(down_for.as_secs_f64());
         }
         QuestDbHealthVerdict::Degraded { down_for } => {
-            metrics::gauge!("dlt_questdb_connected").set(0.0);
-            metrics::gauge!("dlt_questdb_disconnected_seconds").set(down_for.as_secs_f64());
-            metrics::counter!("dlt_questdb_disconnect_events_total").increment(1);
+            metrics::gauge!("tv_questdb_connected").set(0.0);
+            metrics::gauge!("tv_questdb_disconnected_seconds").set(down_for.as_secs_f64());
+            metrics::counter!("tv_questdb_disconnect_events_total").increment(1);
             tracing::error!(
                 down_for_secs = down_for.as_secs(),
                 disconnect_events_total = poller.disconnect_events_total(),
                 "S3-1 CRITICAL: QuestDB has been disconnected for >30s — tick ring buffer \
                  + spill path are absorbing all writes. No data is lost, but operator \
-                 attention is required. Check Docker logs for dlt-questdb."
+                 attention is required. Check Docker logs for tv-questdb."
             );
         }
         QuestDbHealthVerdict::Halt { down_for } => {
-            metrics::gauge!("dlt_questdb_connected").set(0.0);
-            metrics::gauge!("dlt_questdb_disconnected_seconds").set(down_for.as_secs_f64());
+            metrics::gauge!("tv_questdb_connected").set(0.0);
+            metrics::gauge!("tv_questdb_disconnected_seconds").set(down_for.as_secs_f64());
             tracing::error!(
                 down_for_secs = down_for.as_secs(),
                 "S3-1 FATAL: QuestDB has been disconnected for >300s. Ring buffer and \

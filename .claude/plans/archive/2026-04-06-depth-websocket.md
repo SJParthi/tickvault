@@ -24,7 +24,7 @@
 
 - [ ] Commit and push
   - Files: all modified
-  - Tests: cargo clippy, cargo test -p dhan-live-trader-core
+  - Tests: cargo clippy, cargo test -p tickvault-core
 
 ## Scenarios
 

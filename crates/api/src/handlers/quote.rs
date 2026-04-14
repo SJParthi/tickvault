@@ -346,7 +346,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn mock_state(http_port: u16) -> crate::state::SharedAppState {
-        use dhan_live_trader_common::config::{DhanConfig, InstrumentConfig, QuestDbConfig};
+        use tickvault_common::config::{DhanConfig, InstrumentConfig, QuestDbConfig};
 
         crate::state::SharedAppState::new(
             QuestDbConfig {
@@ -368,7 +368,7 @@ mod tests {
             },
             InstrumentConfig {
                 daily_download_time: "08:55:00".to_string(),
-                csv_cache_directory: "/tmp/dlt-cache".to_string(),
+                csv_cache_directory: "/tmp/tv-cache".to_string(),
                 csv_cache_filename: "instruments.csv".to_string(),
                 csv_download_timeout_secs: 120,
                 build_window_start: "08:25:00".to_string(),

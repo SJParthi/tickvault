@@ -32,7 +32,7 @@
 
 mod s3_backup {
     use chrono::NaiveDate;
-    use dhan_live_trader_core::instrument::s3_backup::*;
+    use tickvault_core::instrument::s3_backup::*;
 
     // -- Config: every possible state ----------------------------------------
 
@@ -112,7 +112,7 @@ mod s3_backup {
 
     fn test_config() -> S3BackupConfig {
         S3BackupConfig {
-            bucket: "dlt-backup".to_owned(),
+            bucket: "tv-backup".to_owned(),
             prefix: "instruments".to_owned(),
             region: "ap-south-1".to_owned(),
         }
@@ -238,7 +238,7 @@ mod s3_backup {
         let config = test_config();
         let date = NaiveDate::from_ymd_opt(2026, 3, 11).expect("valid"); // APPROVED: test constant
         let result = backup_instrument_cache(
-            "/tmp/dlt-gap-test-nonexistent-99999",
+            "/tmp/tv-gap-test-nonexistent-99999",
             "test.csv",
             date,
             &config,
@@ -310,10 +310,10 @@ mod s3_backup {
 mod daily_scheduler {
     use chrono::{DateTime, FixedOffset, NaiveDate, NaiveTime};
 
-    use dhan_live_trader_core::instrument::daily_scheduler::*;
+    use tickvault_core::instrument::daily_scheduler::*;
 
     fn ist_datetime(y: i32, m: u32, d: u32, h: u32, mi: u32, s: u32) -> DateTime<FixedOffset> {
-        let offset = dhan_live_trader_common::trading_calendar::ist_offset();
+        let offset = tickvault_common::trading_calendar::ist_offset();
         let date = NaiveDate::from_ymd_opt(y, m, d).expect("valid date"); // APPROVED: test helper
         let time = NaiveTime::from_hms_opt(h, mi, s).expect("valid time"); // APPROVED: test helper
         date.and_time(time)
@@ -500,7 +500,7 @@ mod daily_scheduler {
 // ===========================================================================
 
 mod ip_monitor {
-    use dhan_live_trader_core::network::ip_monitor::*;
+    use tickvault_core::network::ip_monitor::*;
 
     // -- compare_ips: all variants -------------------------------------------
 
@@ -679,7 +679,7 @@ mod ip_monitor {
 // ===========================================================================
 
 mod ws_disconnect_codes {
-    use dhan_live_trader_core::websocket::types::DisconnectCode;
+    use tickvault_core::websocket::types::DisconnectCode;
 
     // -- from_u16 ↔ as_u16 roundtrip for all 12 annexure Section 11 codes --
 
@@ -845,14 +845,14 @@ mod ws_disconnect_codes {
 // ===========================================================================
 
 mod ws_subscription_builder {
-    use dhan_live_trader_common::constants::{
+    use tickvault_common::constants::{
         FEED_REQUEST_FULL, FEED_REQUEST_QUOTE, FEED_REQUEST_TICKER, FEED_UNSUBSCRIBE_TICKER,
     };
-    use dhan_live_trader_common::types::{ExchangeSegment, FeedMode};
-    use dhan_live_trader_core::websocket::subscription_builder::{
+    use tickvault_common::types::{ExchangeSegment, FeedMode};
+    use tickvault_core::websocket::subscription_builder::{
         build_disconnect_message, build_subscription_messages, build_unsubscription_messages,
     };
-    use dhan_live_trader_core::websocket::types::InstrumentSubscription;
+    use tickvault_core::websocket::types::InstrumentSubscription;
 
     fn make_instruments(count: usize) -> Vec<InstrumentSubscription> {
         (0..count)
@@ -1015,7 +1015,7 @@ mod ws_subscription_builder {
 // ===========================================================================
 
 mod ws_connection_state {
-    use dhan_live_trader_core::websocket::types::ConnectionState;
+    use tickvault_core::websocket::types::ConnectionState;
 
     #[test]
     fn all_four_states_distinct() {
@@ -1150,7 +1150,7 @@ mod i_p0_01_duplicate_security_id {
 // ===========================================================================
 
 mod i_p0_02_minimum_derivative_count {
-    use dhan_live_trader_common::constants::VALIDATION_MIN_DERIVATIVE_COUNT;
+    use tickvault_common::constants::VALIDATION_MIN_DERIVATIVE_COUNT;
 
     /// I-P0-02: Verifies that a universe with zero derivatives is detected.
     ///
@@ -1258,16 +1258,16 @@ mod i_p0_06_emergency_download {
 // ===========================================================================
 
 mod i_p0_04_cache_persistence {
-    use dhan_live_trader_common::constants::BINARY_CACHE_FILENAME;
-    use dhan_live_trader_core::instrument::binary_cache::{read_binary_cache, write_binary_cache};
+    use tickvault_common::constants::BINARY_CACHE_FILENAME;
+    use tickvault_core::instrument::binary_cache::{read_binary_cache, write_binary_cache};
 
-    use dhan_live_trader_common::instrument_types::{FnoUniverse, UniverseBuildMetadata};
     use std::collections::HashMap;
+    use tickvault_common::instrument_types::{FnoUniverse, UniverseBuildMetadata};
 
     /// Build a minimal FnoUniverse for cache testing.
     fn test_universe() -> FnoUniverse {
         use chrono::Utc;
-        let ist = dhan_live_trader_common::trading_calendar::ist_offset();
+        let ist = tickvault_common::trading_calendar::ist_offset();
         FnoUniverse {
             underlyings: HashMap::new(),
             derivative_contracts: HashMap::new(),
@@ -1292,7 +1292,7 @@ mod i_p0_04_cache_persistence {
 
     fn unique_temp_dir(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
-            "dlt-gap-i-p0-04-{name}-{}-{:?}",
+            "tv-gap-i-p0-04-{name}-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ))
@@ -1392,7 +1392,7 @@ mod i_p0_04_cache_persistence {
 
     #[test]
     fn test_i_p0_04_missing_cache_returns_none() {
-        let result = read_binary_cache("/tmp/dlt-gap-test-nonexistent-cache-i-p0-04").unwrap();
+        let result = read_binary_cache("/tmp/tv-gap-test-nonexistent-cache-i-p0-04").unwrap();
         assert!(
             result.is_none(),
             "I-P0-04: missing cache file must return Ok(None)"
@@ -1406,8 +1406,8 @@ mod i_p0_04_cache_persistence {
 
 mod i_p2_02_trading_day_guard {
     use chrono::NaiveDate;
-    use dhan_live_trader_common::config::{NseHolidayEntry, TradingConfig};
-    use dhan_live_trader_common::trading_calendar::TradingCalendar;
+    use tickvault_common::config::{NseHolidayEntry, TradingConfig};
+    use tickvault_common::trading_calendar::TradingCalendar;
 
     fn make_test_config() -> TradingConfig {
         TradingConfig {

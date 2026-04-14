@@ -36,7 +36,7 @@ be captured and available. Nothing missed, nothing dropped.
     b) If channel IS full, it means tick processor is frozen for 13+ seconds
     c) Blocking WS read is better than losing ticks — Dhan pings every 10s,
        timeout at 40s, so WS connection survives up to 40s of backpressure
-    d) Counter `dlt_ws_frame_backpressure_total` tracks occurrences
+    d) Counter `tv_ws_frame_backpressure_total` tracks occurrences
   - Tests: test_connection_backpressure_does_not_drop_frames
 
 - [ ] Item 2: Increase SPSC frame channel from 65,536 to 131,072 (128K)

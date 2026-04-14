@@ -3,12 +3,12 @@
 //! Format: `<BHBIfHIfIIIffff>` — Header(8) + LTP + LTQ + LTT + ATP + Vol + TSQ + TBQ + OHLC.
 //! CRITICAL: OHLC starts at offset 34 (diverges from Full packet at this point).
 
-use dhan_live_trader_common::constants::{
+use tickvault_common::constants::{
     QUOTE_OFFSET_ATP, QUOTE_OFFSET_CLOSE, QUOTE_OFFSET_HIGH, QUOTE_OFFSET_LOW, QUOTE_OFFSET_LTP,
     QUOTE_OFFSET_LTQ, QUOTE_OFFSET_LTT, QUOTE_OFFSET_OPEN, QUOTE_OFFSET_TOTAL_BUY_QTY,
     QUOTE_OFFSET_TOTAL_SELL_QTY, QUOTE_OFFSET_VOLUME, QUOTE_PACKET_SIZE,
 };
-use dhan_live_trader_common::tick_types::ParsedTick;
+use tickvault_common::tick_types::ParsedTick;
 
 use super::read_helpers::{read_f32_le, read_u32_le};
 use super::types::{PacketHeader, ParseError};
@@ -68,7 +68,7 @@ pub fn parse_quote_packet(
 #[allow(clippy::arithmetic_side_effects)] // APPROVED: test helpers use constant offsets for packet construction
 mod tests {
     use super::*;
-    use dhan_live_trader_common::constants::EXCHANGE_SEGMENT_NSE_FNO;
+    use tickvault_common::constants::EXCHANGE_SEGMENT_NSE_FNO;
 
     /// Builds a complete 50-byte Quote packet with all fields.
     #[allow(clippy::too_many_arguments)]

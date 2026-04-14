@@ -12,7 +12,7 @@
 //! # Running
 //! ```bash
 //! # Requires QuestDB running (Docker stack up)
-//! QUESTDB_HTTP_URL=http://localhost:9000 cargo test -p dhan-live-trader-storage \
+//! QUESTDB_HTTP_URL=http://localhost:9000 cargo test -p tickvault-storage \
 //!     --test grafana_query_tests -- --ignored
 //! ```
 //!
@@ -58,7 +58,7 @@ struct QuestDbError {
 
 /// QuestDB HTTP URL from environment or Docker default.
 fn questdb_url() -> String {
-    std::env::var("QUESTDB_HTTP_URL").unwrap_or_else(|_| "http://dlt-questdb:9000".to_string())
+    std::env::var("QUESTDB_HTTP_URL").unwrap_or_else(|_| "http://tv-questdb:9000".to_string())
 }
 
 /// Execute a SQL query against QuestDB HTTP API and return parsed response.

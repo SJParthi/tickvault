@@ -12,7 +12,7 @@
 #        - More than 3 crates touched
 #        - Cargo.toml workspace deps changed
 #        - .claude/rules/ files changed
-#   4. Otherwise run: cargo test -p dhan-live-trader-<crate> for each touched.
+#   4. Otherwise run: cargo test -p tickvault-<crate> for each touched.
 #
 # Exit codes:
 #   0 — all scoped tests passed (or nothing to test)
@@ -128,7 +128,7 @@ fi
 
 STATUS=0
 for crate in ${TOUCHED_CRATES}; do
-    pkg="dhan-live-trader-${crate}"
+    pkg="tickvault-${crate}"
     echo "RUN  : cargo test -p ${pkg} --lib --tests"
     if ! cargo test -p "${pkg}" --lib --tests; then
         STATUS=1

@@ -27,7 +27,7 @@ MacBook crashes or loses power during market hours with open F&O positions.
 
 ### Step 4: After restart
 1. System will reconnect automatically (WebSocket auto-reconnect).
-2. Run manual reconciliation: `cargo run --bin dhan-live-trader -- --reconcile-only`
+2. Run manual reconciliation: `cargo run --bin tickvault -- --reconcile-only`
 3. Verify Valkey, QuestDB, Dhan API all agree.
 4. Check for missed tick gaps in QuestDB:
    ```sql

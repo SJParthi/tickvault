@@ -7,11 +7,11 @@
 //! - buffered_tick_count matches number of appended ticks (disconnected mode)
 //! - Rapid append/flush cycles never corrupt state
 
-use dhan_live_trader_common::config::QuestDbConfig;
-use dhan_live_trader_common::constants::TICK_BUFFER_CAPACITY;
-use dhan_live_trader_common::tick_types::ParsedTick;
-use dhan_live_trader_storage::tick_persistence::TickPersistenceWriter;
 use proptest::prelude::*;
+use tickvault_common::config::QuestDbConfig;
+use tickvault_common::constants::TICK_BUFFER_CAPACITY;
+use tickvault_common::tick_types::ParsedTick;
+use tickvault_storage::tick_persistence::TickPersistenceWriter;
 
 /// Returns a `QuestDbConfig` pointing at a refused port so that all
 /// ILP connection attempts fail immediately (no network timeout delay).

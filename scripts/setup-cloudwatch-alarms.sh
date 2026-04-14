@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# dhan-live-trader — CloudWatch External Health Alarms
+# tickvault — CloudWatch External Health Alarms
 # =============================================================================
 # Covers the 2 scenarios that local monitoring CANNOT self-detect:
 #   1. EC2 instance death (StatusCheckFailed → SNS → your phone)
@@ -16,7 +16,7 @@
 # PREREQUISITES:
 #   - AWS CLI configured with ap-south-1 region
 #   - EC2 instance running with instance ID
-#   - SNS phone number in SSM at /dlt/<env>/sns/phone-number
+#   - SNS phone number in SSM at /tickvault/<env>/sns/phone-number
 #
 # Usage:  ./scripts/setup-cloudwatch-alarms.sh [--env dev|prod] [--instance-id i-xxx]
 # =============================================================================
@@ -50,7 +50,7 @@ done
 
 echo ""
 echo -e "${CYAN}╔════════════════════════════════════════════════════════╗${NC}"
-echo -e "${CYAN}║  dhan-live-trader — CloudWatch External Health Alarms  ║${NC}"
+echo -e "${CYAN}║  tickvault — CloudWatch External Health Alarms  ║${NC}"
 echo -e "${CYAN}╚════════════════════════════════════════════════════════╝${NC}"
 echo ""
 
@@ -80,7 +80,7 @@ fi
 ok "Instance ID: ${INSTANCE_ID}"
 
 # ---- Step 2: Create or find SNS topic ----
-TOPIC_NAME="dlt-${SSM_ENV}-health-alarms"
+TOPIC_NAME="tv-${SSM_ENV}-health-alarms"
 info "Creating SNS topic: ${TOPIC_NAME}"
 
 TOPIC_ARN=$(aws sns create-topic \
@@ -97,7 +97,7 @@ ok "SNS topic: ${TOPIC_ARN}"
 
 # ---- Step 3: Subscribe phone number from SSM ----
 PHONE_NUMBER=$(aws ssm get-parameter \
-    --name "/dlt/${SSM_ENV}/sns/phone-number" \
+    --name "/tickvault/${SSM_ENV}/sns/phone-number" \
     --with-decryption \
     --region "$REGION" \
     --query 'Parameter.Value' \
@@ -113,19 +113,19 @@ if [ -n "$PHONE_NUMBER" ]; then
         --output text >/dev/null 2>&1
     ok "SMS subscription: ${PHONE_NUMBER}"
 else
-    warn "No phone number in SSM at /dlt/${SSM_ENV}/sns/phone-number — alarms will fire but SMS won't deliver"
+    warn "No phone number in SSM at /tickvault/${SSM_ENV}/sns/phone-number — alarms will fire but SMS won't deliver"
 fi
 
 # Also subscribe Telegram via a Lambda (if exists) — future enhancement
 # For now, SNS → SMS is the external alert path.
 
 # ---- Step 4: Alarm 1 — EC2 Instance Death ----
-ALARM_NAME_INSTANCE="dlt-${SSM_ENV}-ec2-instance-health"
+ALARM_NAME_INSTANCE="tv-${SSM_ENV}-ec2-instance-health"
 info "Creating alarm: ${ALARM_NAME_INSTANCE}"
 
 aws cloudwatch put-metric-alarm \
     --alarm-name "$ALARM_NAME_INSTANCE" \
-    --alarm-description "CRITICAL: dlt-${SSM_ENV} EC2 instance has failed status checks. The entire trading system is DOWN. Immediate action required." \
+    --alarm-description "CRITICAL: tv-${SSM_ENV} EC2 instance has failed status checks. The entire trading system is DOWN. Immediate action required." \
     --namespace "AWS/EC2" \
     --metric-name "StatusCheckFailed" \
     --dimensions "Name=InstanceId,Value=${INSTANCE_ID}" \
@@ -144,12 +144,12 @@ ok "Alarm created: EC2 StatusCheckFailed → SMS within 2 minutes"
 # ---- Step 5: Alarm 2 — Docker Daemon Health ----
 # Uses CloudWatch agent custom metric. The agent publishes a heartbeat metric
 # every 60s. If the metric STOPS (missing data = breaching), alarm fires.
-ALARM_NAME_DOCKER="dlt-${SSM_ENV}-docker-daemon-health"
+ALARM_NAME_DOCKER="tv-${SSM_ENV}-docker-daemon-health"
 info "Creating alarm: ${ALARM_NAME_DOCKER}"
 
 aws cloudwatch put-metric-alarm \
     --alarm-name "$ALARM_NAME_DOCKER" \
-    --alarm-description "CRITICAL: Docker daemon on dlt-${SSM_ENV} is not responding. Containers may be down. Check systemd: systemctl status docker." \
+    --alarm-description "CRITICAL: Docker daemon on tv-${SSM_ENV} is not responding. Containers may be down. Check systemd: systemctl status docker." \
     --namespace "DLT/Infrastructure" \
     --metric-name "DockerDaemonHealthy" \
     --dimensions "Name=InstanceId,Value=${INSTANCE_ID}" \
@@ -167,7 +167,7 @@ ok "Alarm created: Docker daemon heartbeat missing → SMS within 3 minutes"
 
 # ---- Step 6: Install CloudWatch agent cron for Docker heartbeat ----
 # This publishes a custom metric every 60s proving Docker is alive.
-CRON_SCRIPT="/opt/dlt/docker-heartbeat.sh"
+CRON_SCRIPT="/opt/tickvault/docker-heartbeat.sh"
 info "Installing Docker heartbeat publisher at ${CRON_SCRIPT}"
 
 sudo mkdir -p /opt/dlt 2>/dev/null || true

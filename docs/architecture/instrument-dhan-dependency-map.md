@@ -397,11 +397,11 @@ DECREASES, we'd over-subscribe → Dhan rejects → **LOUD**.
 | Build succeeded today | `instrument_build_metadata WHERE timestamp = today()` | CSV download or parse failure |
 | Derivative count normal | `SELECT count() FROM derivative_contracts WHERE timestamp = (SELECT max(timestamp) FROM derivative_contracts)` — between 50K-200K | Truncated CSV, format change, cross-day accumulation (I-P1-08) |
 | Underlying count normal | `SELECT count() FROM fno_underlyings WHERE timestamp = (SELECT max(timestamp) FROM fno_underlyings)` — between 150-300 | Major F&O list change, cross-day accumulation (I-P1-08) |
-| Parse error rate = 0 | `dlt_tick_parse_errors_total` | Binary protocol change |
+| Parse error rate = 0 | `tv_tick_parse_errors_total` | Binary protocol change |
 | Unknown segments = 0 | `SELECT count() WHERE segment='UNKNOWN'` | New segment code |
 | Lifecycle events reasonable | < 2000 events/day | Massive CSV format change |
 | All 8 must-exist indices present | Validation Check 1 passes | Index ID change |
-| WebSocket connected | `dlt_websocket_connections_active` | WS URL/auth change |
+| WebSocket connected | `tv_websocket_connections_active` | WS URL/auth change |
 
 > **CRITICAL (I-P1-08):** ALL Grafana queries on instrument snapshot tables
 > (`fno_underlyings`, `derivative_contracts`, `subscribed_indices`) MUST filter

@@ -1,6 +1,6 @@
 # .claude/ — Claude Code Configuration
 
-> This folder configures Claude Code's behavior for the dhan-live-trader project.
+> This folder configures Claude Code's behavior for the tickvault project.
 > Every file and folder here is auto-discovered by Claude Code at specific paths — do not reorganize.
 
 ---

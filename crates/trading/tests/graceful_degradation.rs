@@ -2,8 +2,8 @@
 //!
 //! Verifies risk engine and circuit breaker handle cascading failures.
 
-use dhan_live_trader_trading::oms::circuit_breaker::OrderCircuitBreaker;
-use dhan_live_trader_trading::risk::engine::RiskEngine;
+use tickvault_trading::oms::circuit_breaker::OrderCircuitBreaker;
+use tickvault_trading::risk::engine::RiskEngine;
 
 // ---------------------------------------------------------------------------
 // Risk engine: degradation under cascading failures

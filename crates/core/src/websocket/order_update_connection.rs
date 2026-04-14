@@ -25,13 +25,13 @@ use tracing::{debug, error, info, warn};
 
 use chrono::{NaiveTime, Utc};
 
-use dhan_live_trader_common::constants::{
+use tickvault_common::constants::{
     ORDER_UPDATE_AUTH_TIMEOUT_SECS, ORDER_UPDATE_MAX_RECONNECT_ATTEMPTS,
     ORDER_UPDATE_OFF_HOURS_READ_TIMEOUT_SECS, ORDER_UPDATE_READ_TIMEOUT_SECS,
     ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS, ORDER_UPDATE_RECONNECT_MAX_DELAY_MS,
 };
-use dhan_live_trader_common::order_types::OrderUpdate;
-use dhan_live_trader_common::trading_calendar::{TradingCalendar, ist_offset};
+use tickvault_common::order_types::OrderUpdate;
+use tickvault_common::trading_calendar::{TradingCalendar, ist_offset};
 
 use crate::auth::TokenHandle;
 use crate::parser::order_update::{build_order_update_login, parse_order_update};
@@ -61,7 +61,7 @@ pub async fn run_order_update_connection(
     calendar: Arc<TradingCalendar>,
 ) {
     let mut consecutive_failures: u32 = 0;
-    let m_reconnections = metrics::counter!("dlt_order_update_reconnections_total");
+    let m_reconnections = metrics::counter!("tv_order_update_reconnections_total");
 
     info!("order update WebSocket starting");
 
@@ -173,8 +173,8 @@ async fn connect_and_listen(
 
     info!("order update WebSocket connected");
 
-    let m_active = metrics::gauge!("dlt_order_update_ws_active");
-    let m_messages = metrics::counter!("dlt_order_update_messages_total");
+    let m_active = metrics::gauge!("tv_order_update_ws_active");
+    let m_messages = metrics::counter!("tv_order_update_messages_total");
     m_active.set(1.0);
 
     let (mut write, mut read) = ws_stream.split();
@@ -248,7 +248,7 @@ async fn connect_and_listen(
                             }
                             AuthResponseKind::Success => {
                                 // Login ack or heartbeat — not all messages are order updates.
-                                metrics::counter!("dlt_order_update_non_order_messages_total")
+                                metrics::counter!("tv_order_update_non_order_messages_total")
                                     .increment(1);
                                 debug!(
                                     ?err,

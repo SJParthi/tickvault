@@ -8,7 +8,7 @@ use axum::Json;
 use axum::extract::{Path, State};
 use serde::Serialize;
 
-use dhan_live_trader_common::instrument_types::IndexConstituent;
+use tickvault_common::instrument_types::IndexConstituent;
 
 use crate::state::SharedAppState;
 
@@ -204,11 +204,9 @@ fn unavailable_summary() -> ConstituencySummaryResponse {
 mod tests {
     use super::*;
     use crate::state::SharedConstituencyMap;
-    use dhan_live_trader_common::instrument_types::{
-        ConstituencyBuildMetadata, IndexConstituencyMap,
-    };
     use std::collections::HashMap;
     use std::sync::{Arc, RwLock};
+    use tickvault_common::instrument_types::{ConstituencyBuildMetadata, IndexConstituencyMap};
 
     fn make_test_map() -> IndexConstituencyMap {
         let mut index_to_constituents = HashMap::new();
@@ -269,13 +267,13 @@ mod tests {
 
     fn test_state(constituency: SharedConstituencyMap) -> SharedAppState {
         SharedAppState::new(
-            dhan_live_trader_common::config::QuestDbConfig {
+            tickvault_common::config::QuestDbConfig {
                 host: "127.0.0.1".to_string(),
                 http_port: 1,
                 pg_port: 1,
                 ilp_port: 1,
             },
-            dhan_live_trader_common::config::DhanConfig {
+            tickvault_common::config::DhanConfig {
                 websocket_url: "wss://test".to_string(),
                 order_update_websocket_url: "wss://test".to_string(),
                 rest_api_base_url: "https://test".to_string(),
@@ -286,9 +284,9 @@ mod tests {
                 max_websocket_connections: 5,
                 sandbox_base_url: String::new(),
             },
-            dhan_live_trader_common::config::InstrumentConfig {
+            tickvault_common::config::InstrumentConfig {
                 daily_download_time: "08:55:00".to_string(),
-                csv_cache_directory: "/tmp/dlt-cache".to_string(),
+                csv_cache_directory: "/tmp/tv-cache".to_string(),
                 csv_cache_filename: "instruments.csv".to_string(),
                 csv_download_timeout_secs: 120,
                 build_window_start: "08:25:00".to_string(),

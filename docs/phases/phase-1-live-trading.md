@@ -691,9 +691,9 @@ Note: Code 6 is unused/skipped in the protocol.
 
 ```
 Step 1: Read credentials from AWS SSM Parameter Store
-        - /dlt/<env>/dhan/client-id      → Dhan Client ID
-        - /dlt/<env>/dhan/client-secret   → Dhan Client Secret (password)
-        - /dlt/<env>/dhan/totp-secret     → TOTP Base32 secret
+        - /tickvault/<env>/dhan/client-id      → Dhan Client ID
+        - /tickvault/<env>/dhan/client-secret   → Dhan Client Secret (password)
+        - /tickvault/<env>/dhan/totp-secret     → TOTP Base32 secret
 
 Step 2: Generate TOTP code
         - Library: totp-rs 5.7.0 (from Bible)
@@ -1092,14 +1092,14 @@ app → api → trading → core → storage → common
 
 | Service | Image | Ports | Purpose |
 |---------|-------|-------|---------|
-| `dlt-questdb` | QuestDB (Bible version) | 9000, 8812, 9009 | Time-series DB (HTTP, PG wire, ILP) |
-| `dlt-valkey` | Valkey (Bible version) | 6379 | Cache (session, state, rate limits) |
-| `dlt-prometheus` | Prometheus (Bible version) | 9090 | Metrics collection |
-| `dlt-grafana` | Grafana (Bible version) | 3000 | Dashboards + alerting |
-| `dlt-loki` | Loki (Bible version) | 3100 | Log aggregation |
-| `dlt-alloy` | Grafana Alloy (Bible version) | 4317 | Log/trace collector (replaces Promtail) |
-| `dlt-jaeger` | Jaeger V2 (Bible version) | 16686, 4318 | Distributed tracing |
-| `dlt-traefik` | Traefik (Bible version) | 80, 443, 8080 | Reverse proxy, TLS, blue-green |
+| `tv-questdb` | QuestDB (Bible version) | 9000, 8812, 9009 | Time-series DB (HTTP, PG wire, ILP) |
+| `tv-valkey` | Valkey (Bible version) | 6379 | Cache (session, state, rate limits) |
+| `tv-prometheus` | Prometheus (Bible version) | 9090 | Metrics collection |
+| `tv-grafana` | Grafana (Bible version) | 3000 | Dashboards + alerting |
+| `tv-loki` | Loki (Bible version) | 3100 | Log aggregation |
+| `tv-alloy` | Grafana Alloy (Bible version) | 4317 | Log/trace collector (replaces Promtail) |
+| `tv-jaeger` | Jaeger V2 (Bible version) | 16686, 4318 | Distributed tracing |
+| `tv-traefik` | Traefik (Bible version) | 80, 443, 8080 | Reverse proxy, TLS, blue-green |
 
 ### Health Check Strategy
 

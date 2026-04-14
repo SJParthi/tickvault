@@ -11,9 +11,9 @@ use reqwest::Client;
 use serde::Serialize;
 use tracing::info;
 
-use dhan_live_trader_common::config::InstrumentConfig;
-use dhan_live_trader_common::constants::*;
-use dhan_live_trader_common::trading_calendar::ist_offset;
+use tickvault_common::config::InstrumentConfig;
+use tickvault_common::constants::*;
+use tickvault_common::trading_calendar::ist_offset;
 
 use super::csv_downloader::download_instrument_csv;
 use super::csv_parser::parse_instrument_csv;
@@ -87,7 +87,7 @@ pub(crate) struct SegmentCounts {
 
 /// Counts instruments by exchange + segment from parsed CSV rows.
 fn count_segments(rows: &[super::csv_parser::ParsedInstrumentRow]) -> SegmentCounts {
-    use dhan_live_trader_common::types::Exchange;
+    use tickvault_common::types::Exchange;
 
     let mut counts = SegmentCounts {
         nse_i: 0,
@@ -544,7 +544,7 @@ mod tests {
 
     #[test]
     fn test_check_cache_status_nonexistent_dir() {
-        let result = check_cache_status("/tmp/dlt-nonexistent-diag-99999", "test.csv");
+        let result = check_cache_status("/tmp/tv-nonexistent-diag-99999", "test.csv");
         assert!(result.passed, "cache status is informational");
         assert!(
             result.detail.contains("dir_exists=false"),
@@ -596,7 +596,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn make_row(
-        exchange: dhan_live_trader_common::types::Exchange,
+        exchange: tickvault_common::types::Exchange,
         segment: char,
     ) -> super::super::csv_parser::ParsedInstrumentRow {
         super::super::csv_parser::ParsedInstrumentRow {
@@ -635,7 +635,7 @@ mod tests {
 
     #[test]
     fn test_count_segments_nse_only() {
-        use dhan_live_trader_common::types::Exchange;
+        use tickvault_common::types::Exchange;
 
         let rows = vec![
             make_row(Exchange::NationalStockExchange, 'I'),
@@ -655,7 +655,7 @@ mod tests {
 
     #[test]
     fn test_count_segments_bse_only() {
-        use dhan_live_trader_common::types::Exchange;
+        use tickvault_common::types::Exchange;
 
         let rows = vec![
             make_row(Exchange::BombayStockExchange, 'I'),
@@ -672,7 +672,7 @@ mod tests {
 
     #[test]
     fn test_count_segments_mixed() {
-        use dhan_live_trader_common::types::Exchange;
+        use tickvault_common::types::Exchange;
 
         let rows = vec![
             make_row(Exchange::NationalStockExchange, 'I'),
@@ -691,7 +691,7 @@ mod tests {
 
     #[test]
     fn test_count_segments_unknown_segment_ignored() {
-        use dhan_live_trader_common::types::Exchange;
+        use tickvault_common::types::Exchange;
 
         let rows = vec![
             make_row(Exchange::NationalStockExchange, 'X'), // unknown segment
@@ -983,7 +983,7 @@ mod tests {
 
     #[test]
     fn test_check_cache_status_reports_fresh_and_marker() {
-        let result = check_cache_status("/tmp/dlt-nonexistent-99999", "test.csv");
+        let result = check_cache_status("/tmp/tv-nonexistent-99999", "test.csv");
         assert!(result.detail.contains("fresh="));
         assert!(result.detail.contains("marker="));
         assert!(result.detail.contains("cache_dir="));
@@ -992,7 +992,7 @@ mod tests {
     #[test]
     fn test_check_cache_status_with_actual_csv_file() {
         let temp_dir = std::env::temp_dir().join(format!(
-            "dlt-diag-cache-status-{}-{:?}",
+            "tv-diag-cache-status-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
@@ -1024,9 +1024,9 @@ mod tests {
 
     #[test]
     fn test_check_cache_status_with_fresh_marker() {
-        use dhan_live_trader_common::constants::INSTRUMENT_FRESHNESS_MARKER_FILENAME;
+        use tickvault_common::constants::INSTRUMENT_FRESHNESS_MARKER_FILENAME;
         let temp_dir = std::env::temp_dir().join(format!(
-            "dlt-diag-fresh-marker-{}-{:?}",
+            "tv-diag-fresh-marker-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
@@ -1034,7 +1034,7 @@ mod tests {
 
         // Write today's marker
         let today = chrono::Utc::now()
-            .with_timezone(&dhan_live_trader_common::trading_calendar::ist_offset())
+            .with_timezone(&tickvault_common::trading_calendar::ist_offset())
             .date_naive()
             .to_string();
         std::fs::write(temp_dir.join(INSTRUMENT_FRESHNESS_MARKER_FILENAME), &today).unwrap();

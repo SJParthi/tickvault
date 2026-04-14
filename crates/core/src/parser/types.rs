@@ -3,7 +3,7 @@
 //! These types are internal to the parser module. The `ParsedTick` and
 //! `MarketDepthLevel` types live in `common::tick_types` for cross-crate use.
 
-use dhan_live_trader_common::tick_types::{DeepDepthLevel, MarketDepthLevel, ParsedTick};
+use tickvault_common::tick_types::{DeepDepthLevel, MarketDepthLevel, ParsedTick};
 
 use crate::parser::deep_depth::DepthSide;
 use crate::websocket::types::DisconnectCode;

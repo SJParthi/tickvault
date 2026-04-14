@@ -34,7 +34,7 @@ Otherwise, scoped execution is mandatory.
 1. Compute changed files = git diff --name-only HEAD + unstaged tracked files
 2. Extract touched crates from paths matching crates/<name>/...
 3. For each touched crate, run:
-     cargo test -p dhan-live-trader-<name> --lib --tests
+     cargo test -p tickvault-<name> --lib --tests
 4. If the change touched .claude/hooks/**, also run: bash .claude/hooks/plan-verify.sh
 5. If the change touched crates/common/**, escalate to workspace:
      cargo test --workspace  (because everyone depends on common)

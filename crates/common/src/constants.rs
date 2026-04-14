@@ -1,4 +1,4 @@
-//! Compile-time constants for the dhan-live-trader system.
+//! Compile-time constants for the tickvault system.
 //!
 //! All values known at compile time live here. Runtime values live in config TOML.
 //! If you see a raw number or string literal in application code, it's a bug.
@@ -588,7 +588,7 @@ pub const PUBLIC_IP_CHECK_MAX_RETRIES: u32 = 3;
 // Docker Container Naming
 // ---------------------------------------------------------------------------
 
-/// Container name prefix for all dhan-live-trader Docker services.
+/// Container name prefix for all tickvault Docker services.
 pub const DOCKER_CONTAINER_PREFIX: &str = "dlt";
 
 // ---------------------------------------------------------------------------
@@ -796,7 +796,7 @@ pub const VALIDATION_MIN_DERIVATIVE_COUNT: usize = 100;
 // ---------------------------------------------------------------------------
 
 /// Application name used in logs, metrics, and tracing.
-pub const APPLICATION_NAME: &str = "dhan-live-trader";
+pub const APPLICATION_NAME: &str = "tickvault";
 
 /// Application version (updated with each release).
 pub const APPLICATION_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -1506,7 +1506,7 @@ pub const IV_MAX_BOUND: f64 = 5.0;
 /// Token cache file path. Uses `data/cache/` (persistent filesystem) instead of `/tmp`
 /// which may be tmpfs on Linux (wiped on reboot). The `data/` directory is the app's
 /// persistent data root, also used by rkyv instrument cache and log files.
-pub const TOKEN_CACHE_FILE_PATH: &str = "data/cache/dlt-token-cache";
+pub const TOKEN_CACHE_FILE_PATH: &str = "data/cache/tv-token-cache";
 
 /// Minimum remaining token validity (hours) to accept a cached token.
 ///
@@ -2381,7 +2381,7 @@ mod tests {
 
     #[test]
     fn test_application_name() {
-        assert_eq!(APPLICATION_NAME, "dhan-live-trader");
+        assert_eq!(APPLICATION_NAME, "tickvault");
     }
 
     #[test]

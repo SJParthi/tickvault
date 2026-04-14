@@ -1,5 +1,5 @@
 # =============================================================================
-# dhan-live-trader — Fuzz Testing (Weekly Scheduled)
+# tickvault — Fuzz Testing (Weekly Scheduled)
 # =============================================================================
 # Runs cargo-fuzz targets weekly. Creates GitHub issue on crash.
 # Catches panic/crash bugs from malformed input (WebSocket frames, configs).

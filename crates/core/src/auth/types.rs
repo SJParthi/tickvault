@@ -10,7 +10,7 @@ use secrecy::SecretString;
 use serde::Deserialize;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-use dhan_live_trader_common::trading_calendar::ist_offset;
+use tickvault_common::trading_calendar::ist_offset;
 
 /// Parses `expiryTime` from Dhan's generateAccessToken response.
 ///
@@ -670,7 +670,7 @@ mod tests {
 
     #[test]
     fn test_ssm_path_construction() {
-        use dhan_live_trader_common::constants::{
+        use tickvault_common::constants::{
             DHAN_CLIENT_ID_SECRET, SSM_DHAN_SERVICE, SSM_SECRET_BASE_PATH,
         };
 
@@ -680,12 +680,12 @@ mod tests {
             SSM_SECRET_BASE_PATH, environment, SSM_DHAN_SERVICE, DHAN_CLIENT_ID_SECRET
         );
 
-        assert_eq!(path, "/dlt/dev/dhan/client-id");
+        assert_eq!(path, "/tickvault/dev/dhan/client-id");
     }
 
     #[test]
     fn test_ssm_path_prod_environment() {
-        use dhan_live_trader_common::constants::{
+        use tickvault_common::constants::{
             DHAN_CLIENT_SECRET_SECRET, SSM_DHAN_SERVICE, SSM_SECRET_BASE_PATH,
         };
 
@@ -695,7 +695,7 @@ mod tests {
             SSM_SECRET_BASE_PATH, environment, SSM_DHAN_SERVICE, DHAN_CLIENT_SECRET_SECRET
         );
 
-        assert_eq!(path, "/dlt/prod/dhan/client-secret");
+        assert_eq!(path, "/tickvault/prod/dhan/client-secret");
     }
 
     #[test]

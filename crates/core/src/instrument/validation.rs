@@ -6,9 +6,9 @@
 use anyhow::{Result, bail};
 use tracing::{info, warn};
 
-use dhan_live_trader_common::constants::*;
-use dhan_live_trader_common::error::ApplicationError;
-use dhan_live_trader_common::instrument_types::*;
+use tickvault_common::constants::*;
+use tickvault_common::error::ApplicationError;
+use tickvault_common::instrument_types::*;
 
 /// Validate the built F&O universe against known invariants.
 ///
@@ -263,7 +263,7 @@ mod tests {
 
     use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 
-    use dhan_live_trader_common::types::{Exchange, ExchangeSegment};
+    use tickvault_common::types::{Exchange, ExchangeSegment};
 
     // Extraction helper — panic arm appears only once.
     fn unwrap_equity_security_id(info: &InstrumentInfo) -> u32 {
@@ -370,7 +370,7 @@ mod tests {
             );
         }
 
-        let ist_offset = dhan_live_trader_common::trading_calendar::ist_offset();
+        let ist_offset = tickvault_common::trading_calendar::ist_offset();
         let naive_dt = NaiveDateTime::new(
             NaiveDate::from_ymd_opt(2026, 2, 25).unwrap(),
             NaiveTime::from_hms_opt(8, 45, 0).unwrap(),
@@ -1294,7 +1294,7 @@ mod tests {
     fn test_multiple_orphan_futures_in_option_chains() {
         let mut universe = build_valid_universe();
 
-        use dhan_live_trader_common::instrument_types::OptionChain;
+        use tickvault_common::instrument_types::OptionChain;
         // Add 3 option chains with non-existent future IDs
         for i in 0..3u32 {
             let key = OptionChainKey {
@@ -1331,7 +1331,7 @@ mod tests {
     fn test_multiple_orphan_expiry_calendars() {
         let mut universe = build_valid_universe();
 
-        use dhan_live_trader_common::instrument_types::ExpiryCalendar;
+        use tickvault_common::instrument_types::ExpiryCalendar;
         for i in 0..4u32 {
             universe.expiry_calendars.insert(
                 format!("GHOST_SYMBOL_{}", i),
@@ -1546,7 +1546,7 @@ mod tests {
         let mut universe = build_valid_universe();
 
         // Add an option chain with a future_security_id that doesn't exist in derivative_contracts
-        use dhan_live_trader_common::instrument_types::OptionChain;
+        use tickvault_common::instrument_types::OptionChain;
         let key = OptionChainKey {
             underlying_symbol: "NIFTY".to_owned(),
             expiry_date: NaiveDate::from_ymd_opt(2026, 3, 30).unwrap(),
@@ -1576,7 +1576,7 @@ mod tests {
     fn test_option_chain_with_none_future_passes() {
         let mut universe = build_valid_universe();
 
-        use dhan_live_trader_common::instrument_types::OptionChain;
+        use tickvault_common::instrument_types::OptionChain;
         let key = OptionChainKey {
             underlying_symbol: "NIFTY".to_owned(),
             expiry_date: NaiveDate::from_ymd_opt(2026, 3, 30).unwrap(),
@@ -1608,7 +1608,7 @@ mod tests {
     fn test_orphan_expiry_calendar() {
         let mut universe = build_valid_universe();
 
-        use dhan_live_trader_common::instrument_types::ExpiryCalendar;
+        use tickvault_common::instrument_types::ExpiryCalendar;
         universe.expiry_calendars.insert(
             "NONEXISTENT_SYMBOL".to_owned(),
             ExpiryCalendar {
@@ -1631,7 +1631,7 @@ mod tests {
     fn test_valid_expiry_calendar_passes() {
         let mut universe = build_valid_universe();
 
-        use dhan_live_trader_common::instrument_types::ExpiryCalendar;
+        use tickvault_common::instrument_types::ExpiryCalendar;
         universe.expiry_calendars.insert(
             "NIFTY".to_owned(),
             ExpiryCalendar {
@@ -1707,7 +1707,7 @@ mod tests {
     #[test]
     fn test_option_chain_with_valid_future_passes() {
         let mut universe = build_valid_universe();
-        use dhan_live_trader_common::instrument_types::OptionChain;
+        use tickvault_common::instrument_types::OptionChain;
         // Use the existing derivative contract's security_id (90001)
         let key = OptionChainKey {
             underlying_symbol: "NIFTY".to_owned(),
@@ -1738,7 +1738,7 @@ mod tests {
     #[test]
     fn test_single_orphan_expiry_calendar_fails() {
         let mut universe = build_valid_universe();
-        use dhan_live_trader_common::instrument_types::ExpiryCalendar;
+        use tickvault_common::instrument_types::ExpiryCalendar;
         universe.expiry_calendars.insert(
             "SINGLEORPHAN".to_owned(),
             ExpiryCalendar {
@@ -1825,7 +1825,7 @@ mod tests {
     fn test_more_than_five_orphan_futures_in_option_chains() {
         let mut universe = build_valid_universe();
 
-        use dhan_live_trader_common::instrument_types::OptionChain;
+        use tickvault_common::instrument_types::OptionChain;
         // Add 7 option chains with non-existent future IDs to trigger the <= 5 warn cap
         for i in 0..7u32 {
             let key = OptionChainKey {
@@ -1862,7 +1862,7 @@ mod tests {
     fn test_more_than_five_orphan_expiry_calendars() {
         let mut universe = build_valid_universe();
 
-        use dhan_live_trader_common::instrument_types::ExpiryCalendar;
+        use tickvault_common::instrument_types::ExpiryCalendar;
         // Add 7 orphan calendars to test the <= 5 warn cap
         for i in 0..7u32 {
             universe.expiry_calendars.insert(
@@ -1967,7 +1967,7 @@ mod tests {
     fn test_exactly_five_orphan_futures_in_option_chains() {
         let mut universe = build_valid_universe();
 
-        use dhan_live_trader_common::instrument_types::OptionChain;
+        use tickvault_common::instrument_types::OptionChain;
         for i in 0..5u32 {
             let key = OptionChainKey {
                 underlying_symbol: "NIFTY".to_owned(),
@@ -2003,7 +2003,7 @@ mod tests {
     fn test_exactly_five_orphan_expiry_calendars() {
         let mut universe = build_valid_universe();
 
-        use dhan_live_trader_common::instrument_types::ExpiryCalendar;
+        use tickvault_common::instrument_types::ExpiryCalendar;
         for i in 0..5u32 {
             universe.expiry_calendars.insert(
                 format!("EXACT5CAL{}", i),
@@ -2100,7 +2100,7 @@ mod tests {
     fn test_option_chain_with_none_future_skips_check() {
         let mut universe = build_valid_universe();
 
-        use dhan_live_trader_common::instrument_types::OptionChain;
+        use tickvault_common::instrument_types::OptionChain;
 
         // Add an option chain where future_security_id is None — should be skipped
         let key = OptionChainKey {
@@ -2134,7 +2134,7 @@ mod tests {
     fn test_more_than_five_orphan_futures_warns_first_five() {
         let mut universe = build_valid_universe();
 
-        use dhan_live_trader_common::instrument_types::OptionChain;
+        use tickvault_common::instrument_types::OptionChain;
         for i in 0..7u32 {
             let key = OptionChainKey {
                 underlying_symbol: "NIFTY".to_owned(),
@@ -2170,7 +2170,7 @@ mod tests {
     fn test_more_than_five_orphan_expiry_calendars_warns_first_five() {
         let mut universe = build_valid_universe();
 
-        use dhan_live_trader_common::instrument_types::ExpiryCalendar;
+        use tickvault_common::instrument_types::ExpiryCalendar;
         for i in 0..7u32 {
             universe.expiry_calendars.insert(
                 format!("SEVEN_GHOST_{}", i),
@@ -2263,8 +2263,8 @@ mod tests {
 
     #[test]
     fn test_orphan_future_in_option_chain_fails() {
-        use dhan_live_trader_common::instrument_types::OptionChain;
-        use dhan_live_trader_common::instrument_types::OptionChainKey;
+        use tickvault_common::instrument_types::OptionChain;
+        use tickvault_common::instrument_types::OptionChainKey;
 
         let mut universe = build_valid_universe();
         let key = OptionChainKey {
@@ -2297,7 +2297,7 @@ mod tests {
 
     #[test]
     fn test_orphan_expiry_calendar_fails() {
-        use dhan_live_trader_common::instrument_types::ExpiryCalendar;
+        use tickvault_common::instrument_types::ExpiryCalendar;
         let mut universe = build_valid_universe();
         universe.expiry_calendars.insert(
             "NONEXISTENT_UNDERLYING".to_string(),

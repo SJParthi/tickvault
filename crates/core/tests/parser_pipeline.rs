@@ -4,11 +4,11 @@
 //! verifies ParsedFrame variants are correct with expected field values.
 //! This crosses the parser module boundaries (header + quote + dispatcher).
 
-use dhan_live_trader_common::constants::{
+use tickvault_common::constants::{
     QUOTE_PACKET_SIZE, RESPONSE_CODE_QUOTE, RESPONSE_CODE_TICKER, TICKER_PACKET_SIZE,
 };
-use dhan_live_trader_core::parser::dispatcher::dispatch_frame;
-use dhan_live_trader_core::parser::types::ParsedFrame;
+use tickvault_core::parser::dispatcher::dispatch_frame;
+use tickvault_core::parser::types::ParsedFrame;
 
 /// Build a minimal valid binary packet for a given response code + size.
 fn build_packet(response_code: u8, size: usize, segment: u8, security_id: u32) -> Vec<u8> {

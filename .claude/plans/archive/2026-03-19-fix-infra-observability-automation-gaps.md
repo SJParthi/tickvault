@@ -58,11 +58,11 @@ Eagle's Eye Audit found 22 gaps across Docker, observability, notifications, hea
 
 ## Batch 4: Metrics Gaps (P1 — observability)
 
-- [x] Add OMS placeholder metrics: `dlt_orders_placed_total`, `dlt_orders_rejected_total`, `dlt_orders_filled_total`
+- [x] Add OMS placeholder metrics: `tv_orders_placed_total`, `tv_orders_rejected_total`, `tv_orders_filled_total`
   - Files: crates/trading/src/oms/engine.rs, crates/trading/Cargo.toml
   - Tests: test_oms_metrics_emitted_on_place, test_oms_metrics_emitted_on_reject
 
-- [x] Add `dlt_wire_to_done_duration_ns` histogram in tick processor
+- [x] Add `tv_wire_to_done_duration_ns` histogram in tick processor
   - Files: crates/core/src/pipeline/tick_processor.rs
   - Tests: existing tick processor tests pass
 

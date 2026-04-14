@@ -1,7 +1,7 @@
 //! S7-Step4 / Phase 8.5: Smoke test binary.
 //!
 //! Run after every `deploy-aws` push as the gate between "binary
-//! downloaded to the instance" and "systemctl restart dlt-app".
+//! downloaded to the instance" and "systemctl restart tickvault".
 //!
 //! # What it checks
 //!
@@ -48,7 +48,7 @@ const CONFIG_BASE_PATH: &str = "config/base.toml";
 fn main() -> Result<(), String> {
     let start = Instant::now();
     let duration = parse_duration_flag().unwrap_or(DEFAULT_DURATION_SECS);
-    eprintln!("S7-Step4: dlt-smoke-test starting (budget {}s)", duration);
+    eprintln!("S7-Step4: tv-smoke-test starting (budget {}s)", duration);
 
     // ------------------------------------------------------------------
     // Check 1: config/base.toml exists, parses, validates
@@ -66,7 +66,7 @@ fn main() -> Result<(), String> {
     // Load via figment + validate. Uses the same Figment::new().merge(Toml::file)
     // pattern as crates/app/src/main.rs (canonical).
     use figment::providers::{Format, Toml};
-    let config: dhan_live_trader_common::config::ApplicationConfig = figment::Figment::new()
+    let config: tickvault_common::config::ApplicationConfig = figment::Figment::new()
         .merge(Toml::file(CONFIG_BASE_PATH))
         .extract()
         .map_err(|e| format!("SMOKE FAIL: config parse failed: {e}"))?;
@@ -79,9 +79,7 @@ fn main() -> Result<(), String> {
     // Check 2: sandbox window gate (the S6-Step4 pre-boot check)
     // ------------------------------------------------------------------
     let today_ist = (chrono::Utc::now()
-        + chrono::TimeDelta::seconds(
-            dhan_live_trader_common::constants::IST_UTC_OFFSET_SECONDS_I64,
-        ))
+        + chrono::TimeDelta::seconds(tickvault_common::constants::IST_UTC_OFFSET_SECONDS_I64))
     .date_naive();
     config
         .strategy
@@ -109,7 +107,7 @@ fn main() -> Result<(), String> {
     // ------------------------------------------------------------------
     // Check 4: IST date arithmetic is sane
     // ------------------------------------------------------------------
-    let ist_offset_secs = dhan_live_trader_common::constants::IST_UTC_OFFSET_SECONDS_I64;
+    let ist_offset_secs = tickvault_common::constants::IST_UTC_OFFSET_SECONDS_I64;
     if ist_offset_secs != 19_800 {
         return Err(format!(
             "SMOKE FAIL: IST offset drifted: expected 19800 seconds, got {ist_offset_secs}"
@@ -119,7 +117,7 @@ fn main() -> Result<(), String> {
     // ------------------------------------------------------------------
     // Check 5: Dhan locked facts (packet sizes + dedup key)
     // ------------------------------------------------------------------
-    use dhan_live_trader_common::constants::{
+    use tickvault_common::constants::{
         DEEP_DEPTH_HEADER_SIZE, DEEP_DEPTH_LEVEL_SIZE, FULL_QUOTE_PACKET_SIZE, QUOTE_PACKET_SIZE,
         TICKER_PACKET_SIZE, TWENTY_DEPTH_PACKET_SIZE, TWO_HUNDRED_DEPTH_PACKET_SIZE,
     };
@@ -137,7 +135,7 @@ fn main() -> Result<(), String> {
 
     let elapsed = start.elapsed();
     eprintln!(
-        "S7-Step4: dlt-smoke-test PASSED in {:.0}ms — binary is safe to start",
+        "S7-Step4: tv-smoke-test PASSED in {:.0}ms — binary is safe to start",
         elapsed.as_millis()
     );
     Ok(())

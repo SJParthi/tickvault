@@ -7,8 +7,8 @@ use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 
-use dhan_live_trader_common::order_types::OrderStatus;
-use dhan_live_trader_trading::oms::state_machine::is_valid_transition;
+use tickvault_common::order_types::OrderStatus;
+use tickvault_trading::oms::state_machine::is_valid_transition;
 
 /// All valid transitions in the order lifecycle DAG.
 const VALID_TRANSITIONS: &[(OrderStatus, OrderStatus)] = &[

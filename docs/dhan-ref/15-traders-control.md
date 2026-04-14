@@ -101,4 +101,4 @@ Response:
 1. **Kill Switch disables ALL trading** for the day. Use as emergency stop.
 2. **P&L exit is session-scoped** — must reconfigure daily if needed.
 3. **`enableKillSwitch: true`** in P&L exit = after auto-exit, also activates kill switch to prevent further trading.
-4. **For dhan-live-trader**: Wire kill switch activation into your error handlers. If something goes wrong during July+ live trading, call kill switch immediately.
+4. **For tickvault**: Wire kill switch activation into your error handlers. If something goes wrong during July+ live trading, call kill switch immediately.

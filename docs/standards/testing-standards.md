@@ -1,4 +1,4 @@
-# Testing Standards — dhan-live-trader
+# Testing Standards — tickvault
 
 > Permanent quality bible. Every test must pass all three principles:
 > (1) Zero allocation on hot path (2) O(1) or fail at compile time (3) Every version pinned.

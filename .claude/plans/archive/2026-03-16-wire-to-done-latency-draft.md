@@ -43,14 +43,14 @@ not at WebSocket frame arrival. We cannot measure:
   - Remove: `let received_at_nanos = chrono::Utc::now()...` at line 185 — replaced by `wall_clock_nanos` from frame
   - Pass `wall_clock_nanos` to `dispatch_frame()` instead of locally computed value
   - Three metrics (all in nanoseconds as f64):
-    - `dlt_channel_transit_duration_ns` = `tick_start.duration_since(ws_arrived_at).as_nanos()` — time spent in mpsc channel
-    - `dlt_wire_to_done_duration_ns` = `ws_arrived_at.elapsed().as_nanos()` — recorded at end of tick processing (after existing `tick_start.elapsed()`)
-    - Keep existing `dlt_tick_processing_duration_ns` = `tick_start.elapsed()` — unchanged
+    - `tv_channel_transit_duration_ns` = `tick_start.duration_since(ws_arrived_at).as_nanos()` — time spent in mpsc channel
+    - `tv_wire_to_done_duration_ns` = `ws_arrived_at.elapsed().as_nanos()` — recorded at end of tick processing (after existing `tick_start.elapsed()`)
+    - Keep existing `tv_tick_processing_duration_ns` = `tick_start.elapsed()` — unchanged
   - Tests: `test_channel_transit_metric_exists`, `test_wire_to_done_metric_exists`
 
 - [ ] **5. Build verification**
   - Run `cargo check --workspace` — all types align
-  - Run `cargo test -p dhan-live-trader-common -p dhan-live-trader-core -p dhan-live-trader-storage`
+  - Run `cargo test -p tickvault-common -p tickvault-core -p tickvault-storage`
   - All existing tests pass + new tests pass
 
 ## Architecture After Change
@@ -80,9 +80,9 @@ not at WebSocket frame arrival. We cannot measure:
 
 | Metric | What it measures | Expected range |
 |--------|-----------------|----------------|
-| `dlt_channel_transit_duration_ns` | Time in mpsc channel (WS → tick processor) | 1–10 μs normal, spikes = backpressure |
-| `dlt_tick_processing_duration_ns` | Parse + dedup + store + broadcast | 0.5–5 μs (existing) |
-| `dlt_wire_to_done_duration_ns` | Total: channel transit + processing | 2–15 μs normal |
+| `tv_channel_transit_duration_ns` | Time in mpsc channel (WS → tick processor) | 1–10 μs normal, spikes = backpressure |
+| `tv_tick_processing_duration_ns` | Parse + dedup + store + broadcast | 0.5–5 μs (existing) |
+| `tv_wire_to_done_duration_ns` | Total: channel transit + processing | 2–15 μs normal |
 
 ## Scenarios
 

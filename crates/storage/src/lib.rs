@@ -194,7 +194,7 @@ mod tests {
 
     #[test]
     fn test_cache_pool_creation() {
-        let config = dhan_live_trader_common::config::ValkeyConfig {
+        let config = tickvault_common::config::ValkeyConfig {
             host: "unreachable-host".to_string(),
             port: 6379,
             max_connections: 4,
@@ -207,7 +207,7 @@ mod tests {
 
     #[test]
     fn test_cache_pool_reconnect() {
-        let config = dhan_live_trader_common::config::ValkeyConfig {
+        let config = tickvault_common::config::ValkeyConfig {
             host: "unreachable-host".to_string(),
             port: 6379,
             max_connections: 4,

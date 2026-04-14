@@ -1,4 +1,4 @@
-# dhan-live-trader — Documentation
+# tickvault — Documentation
 
 > Live F&O trading system built in Rust, powered by Dhan V2 API.
 > This page is your starting point — everything is organized into 6 sections below.

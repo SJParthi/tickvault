@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# dhan-live-trader — Flaky Test Detector
+# tickvault — Flaky Test Detector
 # =============================================================================
 # Runs the test suite multiple times to detect intermittent failures.
 # Race conditions, timing bugs, and non-determinism show up as tests that

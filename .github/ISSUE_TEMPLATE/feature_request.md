@@ -1,6 +1,6 @@
 ---
 name: Feature Request
-about: Propose a new feature for dhan-live-trader
+about: Propose a new feature for tickvault
 title: "feat: "
 labels: enhancement
 assignees: SJParthi

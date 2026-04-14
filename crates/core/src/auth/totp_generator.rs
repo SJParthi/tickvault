@@ -8,8 +8,8 @@ use secrecy::{ExposeSecret, SecretString};
 use totp_rs::{Algorithm, Secret as TotpSecret, TOTP};
 use tracing::instrument;
 
-use dhan_live_trader_common::constants::{TOTP_DIGITS, TOTP_PERIOD_SECS, TOTP_SKEW};
-use dhan_live_trader_common::error::ApplicationError;
+use tickvault_common::constants::{TOTP_DIGITS, TOTP_PERIOD_SECS, TOTP_SKEW};
+use tickvault_common::error::ApplicationError;
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -46,7 +46,7 @@ pub fn generate_totp_code(totp_secret: &SecretString) -> Result<String, Applicat
         TOTP_SKEW,
         TOTP_PERIOD_SECS,
         secret_bytes,
-        Some("dhan-live-trader".to_string()),
+        Some("tickvault".to_string()),
         "dhan-auth".to_string(),
     )
     .map_err(|err| ApplicationError::TotpGenerationFailed {

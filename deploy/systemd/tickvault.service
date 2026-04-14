@@ -1,29 +1,29 @@
 # =============================================================================
-# dhan-live-trader — systemd Service Unit
+# tickvault — systemd Service Unit
 # =============================================================================
 # Auto-restarts the trading app on crash. Watchdog kills hung processes.
 #
 # Install:
-#   sudo cp deploy/systemd/dlt-app.service /etc/systemd/system/
+#   sudo cp deploy/systemd/tickvault.service /etc/systemd/system/
 #   sudo systemctl daemon-reload
-#   sudo systemctl enable dlt-app
-#   sudo systemctl start dlt-app
+#   sudo systemctl enable tickvault
+#   sudo systemctl start tickvault
 #
 # Check:
-#   systemctl status dlt-app
-#   journalctl -u dlt-app -f
+#   systemctl status tickvault
+#   journalctl -u tickvault -f
 # =============================================================================
 
 [Unit]
-Description=dhan-live-trader — Live F&O Trading System
-Documentation=https://github.com/SJParthi/dhan-live-trader
+Description=tickvault — Live F&O Trading System
+Documentation=https://github.com/SJParthi/tickvault
 After=network-online.target docker.service
 Wants=network-online.target docker.service
 
 [Service]
 Type=notify
 # The app binary. Adjust path to match your deployment.
-ExecStart=/opt/dlt/dhan-live-trader
+ExecStart=/opt/tickvault/tickvault
 WorkingDirectory=/opt/dlt
 
 # Auto-restart on ANY failure. RestartSec prevents tight restart loops.
@@ -36,7 +36,7 @@ WatchdogSec=60
 
 # Environment
 Environment=RUST_LOG=info
-Environment=DLT_ENVIRONMENT=prod
+Environment=TV_ENVIRONMENT=prod
 
 # Resource limits
 LimitNOFILE=65536
@@ -46,7 +46,7 @@ LimitNPROC=4096
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/opt/dlt/data /opt/dlt/config
+ReadWritePaths=/opt/tickvault/data /opt/tickvault/config
 PrivateTmp=true
 
 # Graceful shutdown: send SIGTERM, wait 30s, then SIGKILL.
@@ -57,7 +57,7 @@ KillSignal=SIGTERM
 # Logging to journald (also captured by Alloy → Loki if configured)
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=dlt-app
+SyslogIdentifier=tickvault
 
 [Install]
 WantedBy=multi-user.target

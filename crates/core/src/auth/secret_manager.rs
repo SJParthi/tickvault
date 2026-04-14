@@ -9,14 +9,14 @@ use aws_sdk_ssm::Client as SsmClient;
 use secrecy::SecretString;
 use tracing::{info, instrument};
 
-use dhan_live_trader_common::constants::{
+use tickvault_common::constants::{
     DEFAULT_SSM_ENVIRONMENT, DHAN_CLIENT_ID_SECRET, DHAN_CLIENT_SECRET_SECRET,
     DHAN_SANDBOX_CLIENT_ID_SECRET, DHAN_SANDBOX_TOKEN_SECRET, DHAN_TOTP_SECRET,
     GRAFANA_ADMIN_PASSWORD_SECRET, GRAFANA_ADMIN_USER_SECRET, QUESTDB_PG_PASSWORD_SECRET,
     QUESTDB_PG_USER_SECRET, SSM_DHAN_SERVICE, SSM_GRAFANA_SERVICE, SSM_QUESTDB_SERVICE,
     SSM_SECRET_BASE_PATH,
 };
-use dhan_live_trader_common::error::ApplicationError;
+use tickvault_common::error::ApplicationError;
 
 use super::types::{DhanCredentials, GrafanaCredentials, QuestDbCredentials, TelegramCredentials};
 
@@ -26,7 +26,7 @@ use super::types::{DhanCredentials, GrafanaCredentials, QuestDbCredentials, Tele
 
 /// Constructs the full SSM parameter path.
 ///
-/// Format: `/dlt/<environment>/<service>/<secret_name>`
+/// Format: `/tickvault/<environment>/<service>/<secret_name>`
 pub(crate) fn build_ssm_path(environment: &str, service: &str, secret_name: &str) -> String {
     format!(
         "{}/{}/{}/{}",
@@ -166,13 +166,14 @@ pub async fn fetch_dhan_credentials() -> Result<DhanCredentials, ApplicationErro
 /// No TOTP or client-secret needed — token generated manually on DevPortal.
 ///
 /// SSM paths:
-/// - `/dlt/{env}/dhan/sandbox-client-id`
-/// - `/dlt/{env}/dhan/sandbox-token`
+/// - `/tickvault/{env}/dhan/sandbox-client-id`
+/// - `/tickvault/{env}/dhan/sandbox-token`
 ///
 /// # Errors
 ///
 /// Returns `ApplicationError::SecretRetrieval` if either secret cannot be fetched.
 #[instrument(skip_all, fields(environment))]
+// WIRING-EXEMPT: reserved for staging profile; wire when staging gets its own SSM path
 pub async fn fetch_sandbox_credentials()
 -> Result<super::types::SandboxCredentials, ApplicationError> {
     let environment = resolve_environment()?;
@@ -301,7 +302,7 @@ pub async fn fetch_grafana_credentials() -> Result<GrafanaCredentials, Applicati
 /// Returns `ApplicationError::SecretRetrieval` if any secret cannot be fetched.
 #[instrument(skip_all, fields(environment))]
 pub async fn fetch_telegram_credentials() -> Result<TelegramCredentials, ApplicationError> {
-    use dhan_live_trader_common::constants::{
+    use tickvault_common::constants::{
         SSM_TELEGRAM_SERVICE, TELEGRAM_BOT_TOKEN_SECRET, TELEGRAM_CHAT_ID_SECRET,
     };
 
@@ -344,19 +345,19 @@ mod tests {
     #[test]
     fn test_build_ssm_path_dev() {
         let path = build_ssm_path("dev", SSM_DHAN_SERVICE, DHAN_CLIENT_ID_SECRET);
-        assert_eq!(path, "/dlt/dev/dhan/client-id");
+        assert_eq!(path, "/tickvault/dev/dhan/client-id");
     }
 
     #[test]
     fn test_build_ssm_path_prod() {
         let path = build_ssm_path("prod", SSM_DHAN_SERVICE, DHAN_CLIENT_SECRET_SECRET);
-        assert_eq!(path, "/dlt/prod/dhan/client-secret");
+        assert_eq!(path, "/tickvault/prod/dhan/client-secret");
     }
 
     #[test]
     fn test_build_ssm_path_totp() {
         let path = build_ssm_path("dev", SSM_DHAN_SERVICE, DHAN_TOTP_SECRET);
-        assert_eq!(path, "/dlt/dev/dhan/totp-secret");
+        assert_eq!(path, "/tickvault/dev/dhan/totp-secret");
     }
 
     // -----------------------------------------------------------------------
@@ -419,15 +420,15 @@ mod tests {
     fn test_build_ssm_path_all_secret_types_dev() {
         assert_eq!(
             build_ssm_path("dev", SSM_DHAN_SERVICE, DHAN_CLIENT_ID_SECRET),
-            "/dlt/dev/dhan/client-id"
+            "/tickvault/dev/dhan/client-id"
         );
         assert_eq!(
             build_ssm_path("dev", SSM_DHAN_SERVICE, DHAN_CLIENT_SECRET_SECRET),
-            "/dlt/dev/dhan/client-secret"
+            "/tickvault/dev/dhan/client-secret"
         );
         assert_eq!(
             build_ssm_path("dev", SSM_DHAN_SERVICE, DHAN_TOTP_SECRET),
-            "/dlt/dev/dhan/totp-secret"
+            "/tickvault/dev/dhan/totp-secret"
         );
     }
 
@@ -435,15 +436,15 @@ mod tests {
     fn test_build_ssm_path_all_secret_types_prod() {
         assert_eq!(
             build_ssm_path("prod", SSM_DHAN_SERVICE, DHAN_CLIENT_ID_SECRET),
-            "/dlt/prod/dhan/client-id"
+            "/tickvault/prod/dhan/client-id"
         );
         assert_eq!(
             build_ssm_path("prod", SSM_DHAN_SERVICE, DHAN_CLIENT_SECRET_SECRET),
-            "/dlt/prod/dhan/client-secret"
+            "/tickvault/prod/dhan/client-secret"
         );
         assert_eq!(
             build_ssm_path("prod", SSM_DHAN_SERVICE, DHAN_TOTP_SECRET),
-            "/dlt/prod/dhan/totp-secret"
+            "/tickvault/prod/dhan/totp-secret"
         );
     }
 
@@ -511,16 +512,16 @@ mod tests {
 
     #[test]
     fn test_build_ssm_path_telegram_bot_token() {
-        use dhan_live_trader_common::constants::{SSM_TELEGRAM_SERVICE, TELEGRAM_BOT_TOKEN_SECRET};
+        use tickvault_common::constants::{SSM_TELEGRAM_SERVICE, TELEGRAM_BOT_TOKEN_SECRET};
         let path = build_ssm_path("dev", SSM_TELEGRAM_SERVICE, TELEGRAM_BOT_TOKEN_SECRET);
-        assert_eq!(path, "/dlt/dev/telegram/bot-token");
+        assert_eq!(path, "/tickvault/dev/telegram/bot-token");
     }
 
     #[test]
     fn test_build_ssm_path_telegram_chat_id() {
-        use dhan_live_trader_common::constants::{SSM_TELEGRAM_SERVICE, TELEGRAM_CHAT_ID_SECRET};
+        use tickvault_common::constants::{SSM_TELEGRAM_SERVICE, TELEGRAM_CHAT_ID_SECRET};
         let path = build_ssm_path("prod", SSM_TELEGRAM_SERVICE, TELEGRAM_CHAT_ID_SECRET);
-        assert_eq!(path, "/dlt/prod/telegram/chat-id");
+        assert_eq!(path, "/tickvault/prod/telegram/chat-id");
     }
 
     // -----------------------------------------------------------------------
@@ -531,11 +532,11 @@ mod tests {
     fn test_build_ssm_path_questdb_dev() {
         assert_eq!(
             build_ssm_path("dev", SSM_QUESTDB_SERVICE, QUESTDB_PG_USER_SECRET),
-            "/dlt/dev/questdb/pg-user"
+            "/tickvault/dev/questdb/pg-user"
         );
         assert_eq!(
             build_ssm_path("dev", SSM_QUESTDB_SERVICE, QUESTDB_PG_PASSWORD_SECRET),
-            "/dlt/dev/questdb/pg-password"
+            "/tickvault/dev/questdb/pg-password"
         );
     }
 
@@ -543,11 +544,11 @@ mod tests {
     fn test_build_ssm_path_questdb_prod() {
         assert_eq!(
             build_ssm_path("prod", SSM_QUESTDB_SERVICE, QUESTDB_PG_USER_SECRET),
-            "/dlt/prod/questdb/pg-user"
+            "/tickvault/prod/questdb/pg-user"
         );
         assert_eq!(
             build_ssm_path("prod", SSM_QUESTDB_SERVICE, QUESTDB_PG_PASSWORD_SECRET),
-            "/dlt/prod/questdb/pg-password"
+            "/tickvault/prod/questdb/pg-password"
         );
     }
 
@@ -559,11 +560,11 @@ mod tests {
     fn test_build_ssm_path_grafana_dev() {
         assert_eq!(
             build_ssm_path("dev", SSM_GRAFANA_SERVICE, GRAFANA_ADMIN_USER_SECRET),
-            "/dlt/dev/grafana/admin-user"
+            "/tickvault/dev/grafana/admin-user"
         );
         assert_eq!(
             build_ssm_path("dev", SSM_GRAFANA_SERVICE, GRAFANA_ADMIN_PASSWORD_SECRET),
-            "/dlt/dev/grafana/admin-password"
+            "/tickvault/dev/grafana/admin-password"
         );
     }
 
@@ -571,11 +572,11 @@ mod tests {
     fn test_build_ssm_path_grafana_prod() {
         assert_eq!(
             build_ssm_path("prod", SSM_GRAFANA_SERVICE, GRAFANA_ADMIN_USER_SECRET),
-            "/dlt/prod/grafana/admin-user"
+            "/tickvault/prod/grafana/admin-user"
         );
         assert_eq!(
             build_ssm_path("prod", SSM_GRAFANA_SERVICE, GRAFANA_ADMIN_PASSWORD_SECRET),
-            "/dlt/prod/grafana/admin-password"
+            "/tickvault/prod/grafana/admin-password"
         );
     }
 
@@ -586,7 +587,7 @@ mod tests {
     #[tokio::test]
     async fn test_fetch_secret_returns_error_without_real_ssm() {
         let ssm_client = create_ssm_client().await;
-        let result = fetch_secret(&ssm_client, "/dlt/test/nonexistent/secret").await;
+        let result = fetch_secret(&ssm_client, "/tickvault/test/nonexistent/secret").await;
         assert!(
             result.is_err(),
             "fetch_secret must fail without real SSM connectivity"
@@ -623,13 +624,13 @@ mod tests {
     #[test]
     fn test_build_ssm_path_with_custom_environment() {
         let path = build_ssm_path("staging-v2", SSM_DHAN_SERVICE, DHAN_CLIENT_ID_SECRET);
-        assert_eq!(path, "/dlt/staging-v2/dhan/client-id");
+        assert_eq!(path, "/tickvault/staging-v2/dhan/client-id");
     }
 
     #[test]
     fn test_build_ssm_path_with_custom_service() {
         let path = build_ssm_path("dev", "custom-svc", "api-key");
-        assert_eq!(path, "/dlt/dev/custom-svc/api-key");
+        assert_eq!(path, "/tickvault/dev/custom-svc/api-key");
     }
 
     // -----------------------------------------------------------------------
@@ -706,7 +707,7 @@ mod tests {
     fn test_build_ssm_path_empty_strings() {
         // Even if inputs are empty, the function still builds the path
         let path = build_ssm_path("", "", "");
-        assert_eq!(path, "/dlt///");
+        assert_eq!(path, "/tickvault///");
     }
 
     #[test]
@@ -723,7 +724,7 @@ mod tests {
     #[test]
     fn test_build_ssm_path_preserves_case() {
         let path = build_ssm_path("DEV", "DHAN", "CLIENT-ID");
-        assert_eq!(path, "/dlt/DEV/DHAN/CLIENT-ID");
+        assert_eq!(path, "/tickvault/DEV/DHAN/CLIENT-ID");
     }
 
     #[test]
@@ -761,7 +762,7 @@ mod tests {
     #[test]
     fn test_build_ssm_path_with_hyphenated_env() {
         let path = build_ssm_path("dev-us-east-1", SSM_DHAN_SERVICE, DHAN_CLIENT_ID_SECRET);
-        assert_eq!(path, "/dlt/dev-us-east-1/dhan/client-id");
+        assert_eq!(path, "/tickvault/dev-us-east-1/dhan/client-id");
     }
 
     #[tokio::test]

@@ -14,7 +14,7 @@
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
-use dhan_live_trader_common::constants::{
+use tickvault_common::constants::{
     DEEP_DEPTH_FEED_CODE_ASK, DEEP_DEPTH_FEED_CODE_BID, DEEP_DEPTH_HEADER_SIZE,
     DEEP_DEPTH_LEVEL_SIZE, TWENTY_DEPTH_LEVELS,
 };
@@ -97,30 +97,27 @@ fn dhat_deep_depth_bounded_allocations() {
     let stats_before = dhat::HeapStats::get();
 
     // 1. Twenty-depth bid parse (1 Vec allocation expected)
-    let result = dhan_live_trader_core::parser::deep_depth::parse_twenty_depth_packet(&bid_20, 0);
+    let result = tickvault_core::parser::deep_depth::parse_twenty_depth_packet(&bid_20, 0);
     assert!(result.is_ok());
     assert_eq!(result.unwrap().levels.len(), 20);
 
     // 2. Twenty-depth ask parse (1 Vec allocation expected)
-    let result = dhan_live_trader_core::parser::deep_depth::parse_twenty_depth_packet(&ask_20, 0);
+    let result = tickvault_core::parser::deep_depth::parse_twenty_depth_packet(&ask_20, 0);
     assert!(result.is_ok());
     assert_eq!(result.unwrap().levels.len(), 20);
 
     // 3. Two-hundred-depth bid parse, 50 rows (1 Vec allocation expected)
-    let result =
-        dhan_live_trader_core::parser::deep_depth::parse_two_hundred_depth_packet(&bid_200, 0);
+    let result = tickvault_core::parser::deep_depth::parse_two_hundred_depth_packet(&bid_200, 0);
     assert!(result.is_ok());
     assert_eq!(result.unwrap().levels.len(), 50);
 
     // 4. Two-hundred-depth ask parse, 100 rows (1 Vec allocation expected)
-    let result =
-        dhan_live_trader_core::parser::deep_depth::parse_two_hundred_depth_packet(&ask_200, 0);
+    let result = tickvault_core::parser::deep_depth::parse_two_hundred_depth_packet(&ask_200, 0);
     assert!(result.is_ok());
     assert_eq!(result.unwrap().levels.len(), 100);
 
     // 5. Two-hundred-depth with 0 rows (1 Vec allocation expected, empty Vec)
-    let result =
-        dhan_live_trader_core::parser::deep_depth::parse_two_hundred_depth_packet(&zero_rows, 0);
+    let result = tickvault_core::parser::deep_depth::parse_two_hundred_depth_packet(&zero_rows, 0);
     assert!(result.is_ok());
     assert_eq!(result.unwrap().levels.len(), 0);
 

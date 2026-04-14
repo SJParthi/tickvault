@@ -13,11 +13,11 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 
 #[test]
 fn dhat_instrument_registry_lookups_zero_alloc() {
-    use dhan_live_trader_common::instrument_registry::{
+    use tickvault_common::instrument_registry::{
         InstrumentRegistry, SubscriptionCategory, make_display_index_instrument,
         make_major_index_instrument,
     };
-    use dhan_live_trader_common::types::FeedMode;
+    use tickvault_common::types::FeedMode;
 
     let _profiler = dhat::Profiler::builder().testing().build();
 

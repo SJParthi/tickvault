@@ -16,16 +16,16 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::parser::dispatch_frame;
 use crate::parser::types::ParsedFrame;
-use dhan_live_trader_common::constants::{
+use tickvault_common::constants::{
     DEDUP_RING_BUFFER_POWER, IST_UTC_OFFSET_SECONDS, MINIMUM_VALID_EXCHANGE_TIMESTAMP,
     SECONDS_PER_DAY, TICK_PERSIST_END_SECS_OF_DAY_IST, TICK_PERSIST_START_SECS_OF_DAY_IST,
 };
-use dhan_live_trader_common::tick_types::{GreeksEnricher, ParsedTick};
+use tickvault_common::tick_types::{GreeksEnricher, ParsedTick};
 
-use dhan_live_trader_storage::candle_persistence::LiveCandleWriter;
-use dhan_live_trader_storage::tick_persistence::{DepthPersistenceWriter, TickPersistenceWriter};
+use tickvault_storage::candle_persistence::LiveCandleWriter;
+use tickvault_storage::tick_persistence::{DepthPersistenceWriter, TickPersistenceWriter};
 
-use dhan_live_trader_common::tick_types::MarketDepthLevel;
+use tickvault_common::tick_types::MarketDepthLevel;
 
 /// Returns `true` if all 5 depth levels have finite bid/ask prices.
 ///
@@ -175,12 +175,10 @@ fn utc_nanos_to_ist_epoch_secs(received_at_nanos: i64) -> u32 {
 /// Each row tagged with category + rank for easy Grafana queries.
 /// Symbol names enriched from InstrumentRegistry O(1) lookups.
 fn persist_stock_movers_snapshot(
-    writer: &mut dhan_live_trader_storage::movers_persistence::StockMoversWriter,
+    writer: &mut tickvault_storage::movers_persistence::StockMoversWriter,
     snapshot: &super::top_movers::TopMoversSnapshot,
     ts_nanos: i64,
-    registry: &Option<
-        std::sync::Arc<dhan_live_trader_common::instrument_registry::InstrumentRegistry>,
-    >,
+    registry: &Option<std::sync::Arc<tickvault_common::instrument_registry::InstrumentRegistry>>,
 ) {
     if snapshot.equity_gainers.is_empty()
         && snapshot.equity_losers.is_empty()
@@ -202,10 +200,10 @@ fn persist_stock_movers_snapshot(
             .unwrap_or("")
     };
 
-    let f32_clean = dhan_live_trader_storage::tick_persistence_testing::f32_to_f64_clean_pub;
+    let f32_clean = tickvault_storage::tick_persistence_testing::f32_to_f64_clean_pub;
 
     let persist_entries =
-        |writer: &mut dhan_live_trader_storage::movers_persistence::StockMoversWriter,
+        |writer: &mut tickvault_storage::movers_persistence::StockMoversWriter,
          entries: &[super::top_movers::MoverEntry],
          category: &str| {
             for (i, entry) in entries.iter().enumerate() {
@@ -218,9 +216,7 @@ fn persist_stock_movers_snapshot(
                     category,
                     (i as i32).saturating_add(1),
                     entry.security_id,
-                    dhan_live_trader_common::segment::segment_code_to_str(
-                        entry.exchange_segment_code,
-                    ),
+                    tickvault_common::segment::segment_code_to_str(entry.exchange_segment_code),
                     symbol,
                     ltp,
                     prev_close,
@@ -246,18 +242,16 @@ fn persist_stock_movers_snapshot(
 /// Writes top 20 entries per category (7 categories × 20 = 140 rows max).
 /// Contract metadata enriched from InstrumentRegistry O(1) lookups.
 fn persist_option_movers_snapshot(
-    writer: &mut dhan_live_trader_storage::movers_persistence::OptionMoversWriter,
+    writer: &mut tickvault_storage::movers_persistence::OptionMoversWriter,
     snapshot: &super::option_movers::OptionMoversSnapshot,
     ts_nanos: i64,
-    registry: &Option<
-        std::sync::Arc<dhan_live_trader_common::instrument_registry::InstrumentRegistry>,
-    >,
+    registry: &Option<std::sync::Arc<tickvault_common::instrument_registry::InstrumentRegistry>>,
 ) {
-    let f32_clean = dhan_live_trader_storage::tick_persistence_testing::f32_to_f64_clean_pub;
+    let f32_clean = tickvault_storage::tick_persistence_testing::f32_to_f64_clean_pub;
 
     // O(1) EXEMPT: cold path — registry lookup per entry (max 140 lookups per snapshot).
     let persist_category =
-        |writer: &mut dhan_live_trader_storage::movers_persistence::OptionMoversWriter,
+        |writer: &mut tickvault_storage::movers_persistence::OptionMoversWriter,
          entries: &[super::option_movers::OptionMoverEntry],
          category: &str| {
             for (i, entry) in entries.iter().enumerate() {
@@ -269,8 +263,8 @@ fn persist_option_movers_snapshot(
                         let ot = inst
                             .option_type
                             .map(|ot| match ot {
-                                dhan_live_trader_common::types::OptionType::Call => "CE",
-                                dhan_live_trader_common::types::OptionType::Put => "PE",
+                                tickvault_common::types::OptionType::Call => "CE",
+                                tickvault_common::types::OptionType::Put => "PE",
                             })
                             .unwrap_or("");
                         (
@@ -302,9 +296,7 @@ fn persist_option_movers_snapshot(
                     category,
                     (i as i32).saturating_add(1),
                     entry.security_id,
-                    dhan_live_trader_common::segment::segment_code_to_str(
-                        entry.exchange_segment_code,
-                    ),
+                    tickvault_common::segment::segment_code_to_str(entry.exchange_segment_code),
                     contract_name,
                     underlying,
                     option_type_str,
@@ -326,23 +318,22 @@ fn persist_option_movers_snapshot(
     // Split each category into OPTION_* and FUTURE_* with independent rankings.
     // Registry lookup: option_type Some(CE/PE) = option, None = future.
     // O(1) EXEMPT: cold path — runs every 60s, max 7 categories × 20 entries each.
-    let split_persist =
-        |writer: &mut dhan_live_trader_storage::movers_persistence::OptionMoversWriter,
-         entries: &[super::option_movers::OptionMoverEntry],
-         base_cat: &str| {
-            let (opts, futs): (Vec<_>, Vec<_>) = entries.iter().cloned().partition(|e| {
-                registry
-                    .as_ref()
-                    .and_then(|r| r.get(e.security_id))
-                    .and_then(|inst| inst.option_type)
-                    .is_some()
-            });
-            // O(1) EXEMPT: format! on cold path (7 calls per snapshot)
-            let opt_cat = format!("OPTION_{base_cat}");
-            let fut_cat = format!("FUTURE_{base_cat}");
-            persist_category(writer, &opts, &opt_cat);
-            persist_category(writer, &futs, &fut_cat);
-        };
+    let split_persist = |writer: &mut tickvault_storage::movers_persistence::OptionMoversWriter,
+                         entries: &[super::option_movers::OptionMoverEntry],
+                         base_cat: &str| {
+        let (opts, futs): (Vec<_>, Vec<_>) = entries.iter().cloned().partition(|e| {
+            registry
+                .as_ref()
+                .and_then(|r| r.get(e.security_id))
+                .and_then(|inst| inst.option_type)
+                .is_some()
+        });
+        // O(1) EXEMPT: format! on cold path (7 calls per snapshot)
+        let opt_cat = format!("OPTION_{base_cat}");
+        let fut_cat = format!("FUTURE_{base_cat}");
+        persist_category(writer, &opts, &opt_cat);
+        persist_category(writer, &futs, &fut_cat);
+    };
 
     split_persist(writer, &snapshot.highest_oi, "HIGHEST_OI");
     split_persist(writer, &snapshot.oi_gainers, "OI_GAINER");
@@ -462,38 +453,34 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
     mut top_movers: Option<super::top_movers::TopMoversTracker>,
     shared_snapshot: Option<crate::pipeline::top_movers::SharedTopMoversSnapshot>,
     mut greeks_enricher: Option<G>,
-    mut stock_movers_writer: Option<
-        dhan_live_trader_storage::movers_persistence::StockMoversWriter,
-    >,
+    mut stock_movers_writer: Option<tickvault_storage::movers_persistence::StockMoversWriter>,
     mut option_movers: Option<super::option_movers::OptionMoversTracker>,
-    mut option_movers_writer: Option<
-        dhan_live_trader_storage::movers_persistence::OptionMoversWriter,
-    >,
+    mut option_movers_writer: Option<tickvault_storage::movers_persistence::OptionMoversWriter>,
     instrument_registry: Option<
-        std::sync::Arc<dhan_live_trader_common::instrument_registry::InstrumentRegistry>,
+        std::sync::Arc<tickvault_common::instrument_registry::InstrumentRegistry>,
     >,
 ) {
     // Grab metric handles once before the hot loop — O(1) per tick after this.
     // These are no-ops if no metrics recorder is installed (e.g., in tests).
-    let m_frames = counter!("dlt_frames_processed_total");
-    let m_ticks = counter!("dlt_ticks_processed_total");
-    let m_parse_errors = counter!("dlt_parse_errors_total");
-    let m_storage_errors = counter!("dlt_storage_errors_total");
-    let m_junk_filtered = counter!("dlt_junk_ticks_filtered_total");
-    let m_depth_snapshots = counter!("dlt_depth_snapshots_total");
-    let m_oi_updates = counter!("dlt_oi_updates_total");
-    let m_prev_close_updates = counter!("dlt_prev_close_updates_total");
-    let m_market_status_updates = counter!("dlt_market_status_updates_total");
-    let m_disconnects = counter!("dlt_disconnect_frames_total");
-    let m_tick_duration = histogram!("dlt_tick_processing_duration_ns");
-    let m_wire_to_done = histogram!("dlt_wire_to_done_duration_ns");
-    let m_pipeline_active = gauge!("dlt_pipeline_active");
-    let m_dedup_filtered = counter!("dlt_dedup_filtered_total");
-    let m_crossed_market = counter!("dlt_crossed_market_total");
-    let m_outside_hours = counter!("dlt_outside_hours_filtered_total");
-    let m_stale_day = counter!("dlt_stale_day_filtered_total");
-    let m_channel_occupancy = gauge!("dlt_tick_channel_occupancy");
-    let m_channel_capacity = gauge!("dlt_tick_channel_capacity");
+    let m_frames = counter!("tv_frames_processed_total");
+    let m_ticks = counter!("tv_ticks_processed_total");
+    let m_parse_errors = counter!("tv_parse_errors_total");
+    let m_storage_errors = counter!("tv_storage_errors_total");
+    let m_junk_filtered = counter!("tv_junk_ticks_filtered_total");
+    let m_depth_snapshots = counter!("tv_depth_snapshots_total");
+    let m_oi_updates = counter!("tv_oi_updates_total");
+    let m_prev_close_updates = counter!("tv_prev_close_updates_total");
+    let m_market_status_updates = counter!("tv_market_status_updates_total");
+    let m_disconnects = counter!("tv_disconnect_frames_total");
+    let m_tick_duration = histogram!("tv_tick_processing_duration_ns");
+    let m_wire_to_done = histogram!("tv_wire_to_done_duration_ns");
+    let m_pipeline_active = gauge!("tv_pipeline_active");
+    let m_dedup_filtered = counter!("tv_dedup_filtered_total");
+    let m_crossed_market = counter!("tv_crossed_market_total");
+    let m_outside_hours = counter!("tv_outside_hours_filtered_total");
+    let m_stale_day = counter!("tv_stale_day_filtered_total");
+    let m_channel_occupancy = gauge!("tv_tick_channel_occupancy");
+    let m_channel_capacity = gauge!("tv_tick_channel_capacity");
 
     let mut frames_processed: u64 = 0;
     let mut ticks_processed: u64 = 0;
@@ -508,7 +495,7 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
     let mut last_snapshot_check = Instant::now();
     let mut last_movers_persist = Instant::now();
     let mut movers_persist_count: u64 = 0;
-    let m_movers_persisted = counter!("dlt_movers_snapshots_persisted_total");
+    let m_movers_persisted = counter!("tv_movers_snapshots_persisted_total");
 
     // Index prev_close file cache — survives mid-day restarts.
     // On boot, read cached values and pre-populate movers.
@@ -1199,7 +1186,7 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                 {
                     let snapshot = movers.compute_snapshot();
                     let ts_nanos = received_at_nanos
-                        .saturating_add(dhan_live_trader_common::constants::IST_UTC_OFFSET_NANOS);
+                        .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS);
                     persist_stock_movers_snapshot(
                         writer,
                         &snapshot,
@@ -1216,7 +1203,7 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                 {
                     let opt_snapshot = opt_movers.compute_snapshot();
                     let ts_nanos = received_at_nanos
-                        .saturating_add(dhan_live_trader_common::constants::IST_UTC_OFFSET_NANOS);
+                        .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS);
                     persist_option_movers_snapshot(
                         opt_writer,
                         &opt_snapshot,
@@ -1327,7 +1314,7 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
 #[allow(clippy::arithmetic_side_effects)] // APPROVED: test-only arithmetic (casts, indexing) is safe
 mod tests {
     use super::*;
-    use dhan_live_trader_common::constants::{
+    use tickvault_common::constants::{
         DISCONNECT_PACKET_SIZE, FULL_QUOTE_PACKET_SIZE, HEADER_OFFSET_EXCHANGE_SEGMENT,
         HEADER_OFFSET_MESSAGE_LENGTH, HEADER_OFFSET_RESPONSE_CODE, HEADER_OFFSET_SECURITY_ID,
         MARKET_DEPTH_PACKET_SIZE, MARKET_STATUS_PACKET_SIZE, OI_PACKET_SIZE,
@@ -1349,15 +1336,11 @@ mod tests {
         live_candle_writer: Option<LiveCandleWriter>,
         top_movers: Option<crate::pipeline::top_movers::TopMoversTracker>,
         shared_snapshot: Option<crate::pipeline::top_movers::SharedTopMoversSnapshot>,
-        stock_movers_writer: Option<
-            dhan_live_trader_storage::movers_persistence::StockMoversWriter,
-        >,
+        stock_movers_writer: Option<tickvault_storage::movers_persistence::StockMoversWriter>,
         option_movers: Option<crate::pipeline::option_movers::OptionMoversTracker>,
-        option_movers_writer: Option<
-            dhan_live_trader_storage::movers_persistence::OptionMoversWriter,
-        >,
+        option_movers_writer: Option<tickvault_storage::movers_persistence::OptionMoversWriter>,
     ) {
-        run_tick_processor::<dhan_live_trader_common::tick_types::NoopGreeksEnricher>(
+        run_tick_processor::<tickvault_common::tick_types::NoopGreeksEnricher>(
             frame_receiver,
             tick_writer,
             depth_writer,
@@ -1961,7 +1944,7 @@ mod tests {
     /// Returns the writer and an abort handle for the listener.
     /// The listener accepts connections and reads data until aborted.
     async fn create_mock_ilp_writer() -> (TickPersistenceWriter, tokio::task::JoinHandle<()>) {
-        use dhan_live_trader_common::config::QuestDbConfig;
+        use tickvault_common::config::QuestDbConfig;
         use tokio::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1999,7 +1982,7 @@ mod tests {
     /// Creates a TickPersistenceWriter connected to a TCP listener that
     /// immediately closes the connection, causing flushes to fail.
     async fn create_broken_ilp_writer() -> TickPersistenceWriter {
-        use dhan_live_trader_common::config::QuestDbConfig;
+        use tickvault_common::config::QuestDbConfig;
         use tokio::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2203,7 +2186,7 @@ mod tests {
         let (tick_writer, listener_handle) = create_mock_ilp_writer().await;
 
         // Create a separate depth writer on its own ILP connection.
-        use dhan_live_trader_common::config::QuestDbConfig;
+        use tickvault_common::config::QuestDbConfig;
         let depth_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let depth_port = depth_listener.local_addr().unwrap().port();
         let depth_listener_handle = tokio::spawn(async move {
@@ -2861,8 +2844,8 @@ mod tests {
 
         // 4. Quote (code 4)
         let quote = make_packet(
-            dhan_live_trader_common::constants::RESPONSE_CODE_QUOTE,
-            dhan_live_trader_common::constants::QUOTE_PACKET_SIZE,
+            tickvault_common::constants::RESPONSE_CODE_QUOTE,
+            tickvault_common::constants::QUOTE_PACKET_SIZE,
         );
         frame_tx.send(bytes::Bytes::from(quote)).await.unwrap();
 
@@ -4248,13 +4231,13 @@ mod tests {
     #[test]
     fn test_channel_occupancy_metric() {
         // Verify metric handle creation compiles without a recorder installed.
-        metrics::gauge!("dlt_tick_channel_occupancy").set(0.0_f64);
-        metrics::gauge!("dlt_tick_channel_capacity").set(65536.0_f64);
+        metrics::gauge!("tv_tick_channel_occupancy").set(0.0_f64);
+        metrics::gauge!("tv_tick_channel_capacity").set(65536.0_f64);
     }
 
     #[test]
     fn test_channel_throughput_metric_compiles() {
         // Verify metric handle creation compiles without a recorder installed.
-        metrics::gauge!("dlt_channel_throughput_tps").set(0.0_f64);
+        metrics::gauge!("tv_channel_throughput_tps").set(0.0_f64);
     }
 }

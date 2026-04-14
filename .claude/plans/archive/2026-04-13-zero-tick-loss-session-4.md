@@ -41,7 +41,7 @@ Fix every dormant-code item from the session-3 honest audit. Move promised featu
   - Tests: metrics_catalog_every_required_metric_is_emitted, grafana_alerts_every_required_uid_is_provisioned
 
 - [x] T5. Verify Docker restart policy + sd_notify wiring.
-  - Files: dlt-app.service
+  - Files: tickvault.service
   - Tests: deny_config_exists_and_has_required_sections
 
 ## Deferred (background jobs at plan-verify time)

@@ -22,11 +22,11 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tracing::{debug, error, info, warn};
 
-use dhan_live_trader_common::constants::{
+use tickvault_common::constants::{
     DHAN_TWENTY_DEPTH_WS_BASE_URL, DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL, FRAME_SEND_TIMEOUT_SECS,
     WEBSOCKET_AUTH_TYPE,
 };
-use dhan_live_trader_common::types::ExchangeSegment;
+use tickvault_common::types::ExchangeSegment;
 
 use super::tls::build_websocket_tls_connector;
 use super::types::{InstrumentSubscription, WebSocketError};
@@ -108,7 +108,7 @@ pub async fn run_twenty_depth_connection(
 
     let reconnect_counter = AtomicU64::new(0);
     // O(1) EXEMPT: metric handle created once at boot, not per tick
-    let m_reconnections = metrics::counter!("dlt_depth_20lvl_reconnections_total", "underlying" => underlying_label.to_string());
+    let m_reconnections = metrics::counter!("tv_depth_20lvl_reconnections_total", "underlying" => underlying_label.to_string());
     // Consumed after first Binary data frame — notifies caller that
     // the connection is truly alive and receiving data (not just subscribed).
     let mut pending_signal = connected_signal;
@@ -249,8 +249,8 @@ async fn connect_and_run_depth(
     );
 
     // Metrics — labeled per underlying so Grafana can distinguish connections.
-    let m_frames = metrics::counter!("dlt_depth_20lvl_frames_total", "underlying" => underlying_label.to_string());
-    let m_active = metrics::gauge!("dlt_depth_20lvl_connection_active", "underlying" => underlying_label.to_string());
+    let m_frames = metrics::counter!("tv_depth_20lvl_frames_total", "underlying" => underlying_label.to_string());
+    let m_active = metrics::gauge!("tv_depth_20lvl_connection_active", "underlying" => underlying_label.to_string());
     // Don't set active=1 yet — wait for first data frame (avoids false-positive Telegram alerts).
 
     let read_timeout = Duration::from_secs(DEPTH_READ_TIMEOUT_SECS);
@@ -289,7 +289,7 @@ async fn connect_and_run_depth(
                         }
                         Err(_) => {
                             warn!("{prefix}: frame send timeout — dropping frame");
-                            metrics::counter!("dlt_depth_frames_dropped_total", "type" => "send_timeout", "depth" => "20").increment(1);
+                            metrics::counter!("tv_depth_frames_dropped_total", "type" => "send_timeout", "depth" => "20").increment(1);
                         }
                     }
                 }
@@ -385,7 +385,7 @@ pub async fn run_two_hundred_depth_connection(
     let prefix = format!("depth-200lvl-{label}"); // O(1) EXEMPT: boot-time
     let m_reconnections =
         // O(1) EXEMPT: metric handle created once at boot, not per tick
-        metrics::counter!("dlt_depth_200lvl_reconnections_total", "underlying" => prefix.to_string());
+        metrics::counter!("tv_depth_200lvl_reconnections_total", "underlying" => prefix.to_string());
     let mut pending_signal = connected_signal;
 
     loop {
@@ -505,9 +505,9 @@ async fn connect_and_run_200_depth(
 
     // Metrics — labeled per underlying for Grafana differentiation.
     let m_frames =
-        metrics::counter!("dlt_depth_200lvl_frames_total", "underlying" => prefix.to_string());
+        metrics::counter!("tv_depth_200lvl_frames_total", "underlying" => prefix.to_string());
     let m_active =
-        metrics::gauge!("dlt_depth_200lvl_connection_active", "underlying" => prefix.to_string());
+        metrics::gauge!("tv_depth_200lvl_connection_active", "underlying" => prefix.to_string());
     // Don't set active=1 yet — wait for first data frame.
 
     let read_timeout = Duration::from_secs(DEPTH_READ_TIMEOUT_SECS);
@@ -543,7 +543,7 @@ async fn connect_and_run_200_depth(
                         }
                         Err(_) => {
                             warn!("{prefix}: frame send timeout — dropping frame");
-                            metrics::counter!("dlt_depth_frames_dropped_total", "type" => "send_timeout", "depth" => "200").increment(1);
+                            metrics::counter!("tv_depth_frames_dropped_total", "type" => "send_timeout", "depth" => "200").increment(1);
                         }
                     }
                 }

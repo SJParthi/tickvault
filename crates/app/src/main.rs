@@ -1,4 +1,4 @@
-//! Binary entry point for the dhan-live-trader application.
+//! Binary entry point for the tickvault application.
 //!
 //! Orchestrates the complete boot sequence:
 //! Config → Observability → Logging → Notification → IP Verify → Auth → Persist → Universe → WebSocket → Pipeline → OrderUpdate → HTTP → Shutdown
@@ -25,13 +25,13 @@
 //! 15. Await shutdown signal
 
 // Modules are declared in lib.rs for coverage instrumentation.
-use dhan_live_trader_app::boot_helpers::{
+use tickvault_app::boot_helpers::{
     CONFIG_BASE_PATH, CONFIG_LOCAL_PATH, FAST_BOOT_WINDOW_END, FAST_BOOT_WINDOW_START, IstTimer,
     check_clock_drift, compute_market_close_sleep, create_log_file_writer, effective_ws_stagger,
     format_bind_addr, format_cross_match_details, format_timeframe_details,
     format_violation_details, spawn_heartbeat_watchdog,
 };
-use dhan_live_trader_app::{infra, observability, trading_pipeline};
+use tickvault_app::{infra, observability, trading_pipeline};
 
 use std::net::SocketAddr;
 
@@ -44,46 +44,46 @@ use tracing::{error, info, warn};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
-use dhan_live_trader_common::config::ApplicationConfig;
-use dhan_live_trader_common::instrument_types::FnoUniverse;
-use dhan_live_trader_common::trading_calendar::{TradingCalendar, ist_offset};
-use dhan_live_trader_core::auth::secret_manager;
-use dhan_live_trader_core::auth::token_cache;
-use dhan_live_trader_core::auth::token_manager::{TokenHandle, TokenManager};
-use dhan_live_trader_core::historical::candle_fetcher::fetch_historical_candles;
-use dhan_live_trader_core::historical::cross_verify::{
+use tickvault_common::config::ApplicationConfig;
+use tickvault_common::instrument_types::FnoUniverse;
+use tickvault_common::trading_calendar::{TradingCalendar, ist_offset};
+use tickvault_core::auth::secret_manager;
+use tickvault_core::auth::token_cache;
+use tickvault_core::auth::token_manager::{TokenHandle, TokenManager};
+use tickvault_core::historical::candle_fetcher::fetch_historical_candles;
+use tickvault_core::historical::cross_verify::{
     cross_match_historical_vs_live, verify_candle_integrity,
 };
-use dhan_live_trader_core::instrument::binary_cache::read_binary_cache;
-use dhan_live_trader_core::instrument::subscription_planner::SubscriptionPlan;
-use dhan_live_trader_core::instrument::{
+use tickvault_core::instrument::binary_cache::read_binary_cache;
+use tickvault_core::instrument::subscription_planner::SubscriptionPlan;
+use tickvault_core::instrument::{
     InstrumentLoadResult, build_subscription_plan, load_or_build_instruments,
     run_instrument_diagnostic,
 };
-use dhan_live_trader_core::network::ip_verifier;
-use dhan_live_trader_core::notification::{NotificationEvent, NotificationService};
-use dhan_live_trader_core::pipeline::run_tick_processor;
-use dhan_live_trader_core::websocket::connection_pool::WebSocketConnectionPool;
-use dhan_live_trader_core::websocket::order_update_connection::run_order_update_connection;
-use dhan_live_trader_core::websocket::types::{InstrumentSubscription, WebSocketError};
+use tickvault_core::network::ip_verifier;
+use tickvault_core::notification::{NotificationEvent, NotificationService};
+use tickvault_core::pipeline::run_tick_processor;
+use tickvault_core::websocket::connection_pool::WebSocketConnectionPool;
+use tickvault_core::websocket::order_update_connection::run_order_update_connection;
+use tickvault_core::websocket::types::{InstrumentSubscription, WebSocketError};
 
-use dhan_live_trader_storage::calendar_persistence;
-use dhan_live_trader_storage::candle_persistence::{
+use tickvault_storage::calendar_persistence;
+use tickvault_storage::candle_persistence::{
     CandlePersistenceWriter, ensure_candle_table_dedup_keys,
 };
-use dhan_live_trader_storage::greeks_persistence::ensure_greeks_tables;
-use dhan_live_trader_storage::instrument_persistence::{
+use tickvault_storage::greeks_persistence::ensure_greeks_tables;
+use tickvault_storage::instrument_persistence::{
     ensure_instrument_tables, persist_instrument_snapshot,
 };
-use dhan_live_trader_storage::tick_persistence::{
+use tickvault_storage::tick_persistence::{
     DepthPersistenceWriter, TickPersistenceWriter, ensure_depth_and_prev_close_tables,
     ensure_tick_table_dedup_keys,
 };
 
-use dhan_live_trader_trading::greeks::inline_computer::InlineGreeksComputer;
+use tickvault_trading::greeks::inline_computer::InlineGreeksComputer;
 
-use dhan_live_trader_api::build_router;
-use dhan_live_trader_api::state::{SharedAppState, SharedHealthStatus, SystemHealthStatus};
+use tickvault_api::build_router;
+use tickvault_api::state::{SharedAppState, SharedHealthStatus, SystemHealthStatus};
 
 // Constants are in boot_helpers module (lib.rs) for coverage instrumentation.
 
@@ -125,9 +125,7 @@ async fn main() -> Result<()> {
     // a single live order slipping through. Uses IST date (not UTC) so
     // the cutoff matches the operator's calendar in India.
     let today_ist = (chrono::Utc::now()
-        + chrono::TimeDelta::seconds(
-            dhan_live_trader_common::constants::IST_UTC_OFFSET_SECONDS_I64,
-        ))
+        + chrono::TimeDelta::seconds(tickvault_common::constants::IST_UTC_OFFSET_SECONDS_I64))
     .date_naive();
     if let Err(e) = config.strategy.check_sandbox_window(today_ist) {
         error!(
@@ -253,7 +251,7 @@ async fn main() -> Result<()> {
         tracing::error!(
             panic_location = %location,
             panic_payload = %payload,
-            "PANIC: dhan-live-trader crashed"
+            "PANIC: tickvault crashed"
         );
         default_panic_hook(panic_info);
     }));
@@ -263,7 +261,7 @@ async fn main() -> Result<()> {
         config_file = CONFIG_BASE_PATH,
         metrics_port = config.observability.metrics_port,
         tracing_enabled = config.observability.tracing_enabled,
-        "dhan-live-trader starting"
+        "tickvault starting"
     );
 
     // Log trading day status — critical for operational awareness.
@@ -336,7 +334,7 @@ async fn main() -> Result<()> {
     // -----------------------------------------------------------------------
     let fast_cache = token_cache::load_token_cache_fast();
     let is_market_hours = trading_calendar.is_trading_day_today()
-        && dhan_live_trader_core::instrument::instrument_loader::is_within_build_window(
+        && tickvault_core::instrument::instrument_loader::is_within_build_window(
             FAST_BOOT_WINDOW_START,
             FAST_BOOT_WINDOW_END,
         );
@@ -394,11 +392,9 @@ async fn main() -> Result<()> {
                         fast_trading_mode.as_str()
                     );
                     // Return a dummy success — no verification needed
-                    Ok(
-                        dhan_live_trader_core::network::ip_verifier::IpVerificationResult {
-                            verified_ip: "skipped".to_string(),
-                        },
-                    )
+                    Ok(tickvault_core::network::ip_verifier::IpVerificationResult {
+                        verified_ip: "skipped".to_string(),
+                    })
                 }
             },
         );
@@ -445,14 +441,14 @@ async fn main() -> Result<()> {
         let shutdown_notify = std::sync::Arc::new(tokio::sync::Notify::new());
 
         // --- Tick processor: start BEFORE WS connections spawn ---
-        let shared_movers: dhan_live_trader_core::pipeline::SharedTopMoversSnapshot =
+        let shared_movers: tickvault_core::pipeline::SharedTopMoversSnapshot =
             std::sync::Arc::new(std::sync::RwLock::new(None));
 
         // Tick broadcast for trading pipeline (cold path consumer).
         // A2: Use constant capacity (65536) to absorb high-volatility bursts without lagging.
         let (fast_tick_broadcast_sender, _fast_tick_broadcast_rx) =
-            tokio::sync::broadcast::channel::<dhan_live_trader_common::tick_types::ParsedTick>(
-                dhan_live_trader_common::constants::TICK_BROADCAST_CAPACITY,
+            tokio::sync::broadcast::channel::<tickvault_common::tick_types::ParsedTick>(
+                tickvault_common::constants::TICK_BROADCAST_CAPACITY,
             );
 
         // S12 wiring: heartbeat watchdog (fast boot).
@@ -474,23 +470,23 @@ async fn main() -> Result<()> {
         // on overlapping live ticks.
         //
         // Bounded channel (64). If full, gaps are dropped and
-        // dlt_backfill_gaps_dropped_total increments — caller already logs a
+        // tv_backfill_gaps_dropped_total increments — caller already logs a
         // warning. 64 is generous because gap events are rare during healthy
         // operation (post-reconnect) and cheap to process.
         let (gap_backfill_tx, gap_backfill_rx) = tokio::sync::mpsc::channel::<
-            dhan_live_trader_core::historical::backfill::GapBackfillRequest,
+            tickvault_core::historical::backfill::GapBackfillRequest,
         >(64);
 
         // S3-2: Synthetic tick output channel. BackfillWorker pushes ticks here;
         // in this initial wiring we drain them into a tracing log so the
-        // metric dlt_backfill_ticks_synthesised_total (emitted internally by
+        // metric tv_backfill_ticks_synthesised_total (emitted internally by
         // the worker via its BackfillStats) becomes observable without
         // touching the main tick persistence path. Follow-up: wire the
         // synthesised ticks directly into tick_writer.append_tick() so they
         // become durable. For now the worker PROVES the path works and
         // the counter lets operators see when it fired.
         let (synth_tick_tx, mut synth_tick_rx) =
-            tokio::sync::mpsc::channel::<dhan_live_trader_common::tick_types::ParsedTick>(4096);
+            tokio::sync::mpsc::channel::<tickvault_common::tick_types::ParsedTick>(4096);
 
         // S4-T1e: Real Dhan historical intraday REST fetcher. Replaces
         // the session-3 placeholder. The closure captures a reqwest
@@ -522,7 +518,7 @@ async fn main() -> Result<()> {
         // the fetcher defaulted to OPTIDX for all NSE_FNO, which returns
         // empty candle lists for futures and stock options.
         let backfill_registry_fast: Option<
-            std::sync::Arc<dhan_live_trader_common::instrument_registry::InstrumentRegistry>,
+            std::sync::Arc<tickvault_common::instrument_registry::InstrumentRegistry>,
         > = subscription_plan
             .as_ref()
             .map(|p| std::sync::Arc::new(p.registry.clone()));
@@ -540,7 +536,7 @@ async fn main() -> Result<()> {
             governor::Quota::per_second(std::num::NonZeroU32::new(5).expect("5 > 0")),
         ));
         let backfill_fetcher =
-            move |req: dhan_live_trader_core::historical::backfill::GapBackfillRequest| {
+            move |req: tickvault_core::historical::backfill::GapBackfillRequest| {
                 // Clone per-invocation captures to move into the returned future.
                 let http_client = backfill_http_client.clone();
                 let endpoint = backfill_endpoint.clone();
@@ -572,7 +568,7 @@ async fn main() -> Result<()> {
                         .and_then(|inst| inst.instrument_kind.as_ref())
                         .map(|kind| kind.as_dhan_api_string());
 
-                    dhan_live_trader_core::historical::backfill::fetch_intraday_window(
+                    tickvault_core::historical::backfill::fetch_intraday_window(
                         &http_client,
                         &endpoint,
                         &access_token,
@@ -586,7 +582,7 @@ async fn main() -> Result<()> {
                     .await
                 }
             };
-        let backfill_worker = dhan_live_trader_core::historical::backfill::BackfillWorker::new(
+        let backfill_worker = tickvault_core::historical::backfill::BackfillWorker::new(
             gap_backfill_rx,
             synth_tick_tx,
             backfill_fetcher,
@@ -604,7 +600,7 @@ async fn main() -> Result<()> {
         // (ts, security_id, segment) merges any overlap with the live
         // tick that eventually catches up, so replay is idempotent.
         //
-        // Counter `dlt_backfill_ticks_forwarded_total` measures how many
+        // Counter `tv_backfill_ticks_forwarded_total` measures how many
         // synth ticks actually reached the broadcast channel — this is
         // the real observable measure of "backfill closed the gap".
         {
@@ -615,7 +611,7 @@ async fn main() -> Result<()> {
                     match broadcast_for_synth.send(tick) {
                         Ok(_) => {
                             forwarded_total = forwarded_total.saturating_add(1);
-                            metrics::counter!("dlt_backfill_ticks_forwarded_total").increment(1);
+                            metrics::counter!("tv_backfill_ticks_forwarded_total").increment(1);
                         }
                         Err(_) => {
                             // Broadcast receiver count 0 means the pipeline
@@ -640,23 +636,22 @@ async fn main() -> Result<()> {
                 loop {
                     interval.tick().await;
                     let snap = stats.snapshot();
-                    metrics::counter!("dlt_backfill_events_received_total")
+                    metrics::counter!("tv_backfill_events_received_total")
                         .absolute(snap.events_received);
-                    metrics::counter!("dlt_backfill_events_succeeded_total")
+                    metrics::counter!("tv_backfill_events_succeeded_total")
                         .absolute(snap.events_succeeded);
-                    metrics::counter!("dlt_backfill_events_errored_total")
+                    metrics::counter!("tv_backfill_events_errored_total")
                         .absolute(snap.events_errored);
-                    metrics::counter!("dlt_backfill_events_empty_total")
-                        .absolute(snap.events_empty);
-                    metrics::counter!("dlt_backfill_ticks_synthesised_total")
+                    metrics::counter!("tv_backfill_events_empty_total").absolute(snap.events_empty);
+                    metrics::counter!("tv_backfill_ticks_synthesised_total")
                         .absolute(snap.ticks_synthesised);
                 }
             });
         }
 
         let processor_handle = if let Some(receiver) = pool_receiver {
-            let candle_agg = Some(dhan_live_trader_core::pipeline::CandleAggregator::new());
-            let movers = Some(dhan_live_trader_core::pipeline::TopMoversTracker::new());
+            let candle_agg = Some(tickvault_core::pipeline::CandleAggregator::new());
+            let movers = Some(tickvault_core::pipeline::TopMoversTracker::new());
             let snapshot_handle = Some(shared_movers.clone());
             let tick_broadcast_for_processor = Some(fast_tick_broadcast_sender.clone());
 
@@ -674,12 +669,12 @@ async fn main() -> Result<()> {
             // which CAN drop ticks on lag (broadcast::Lagged). With new_disconnected(),
             // the hot-path writer buffers ALL ticks and drains when QuestDB is ready.
             let fast_tick_writer = Some(
-                dhan_live_trader_storage::tick_persistence::TickPersistenceWriter::new_disconnected(
+                tickvault_storage::tick_persistence::TickPersistenceWriter::new_disconnected(
                     &config.questdb,
                 ),
             );
             let fast_depth_writer = Some(
-                dhan_live_trader_storage::tick_persistence::DepthPersistenceWriter::new_disconnected(
+                tickvault_storage::tick_persistence::DepthPersistenceWriter::new_disconnected(
                     &config.questdb,
                 ),
             );
@@ -746,12 +741,10 @@ async fn main() -> Result<()> {
                     ensure_instrument_tables(&config.questdb),
                     ensure_candle_table_dedup_keys(&config.questdb),
                     calendar_persistence::ensure_calendar_table(&config.questdb),
-                    dhan_live_trader_storage::constituency_persistence::ensure_constituency_table(
+                    tickvault_storage::constituency_persistence::ensure_constituency_table(
                         &config.questdb
                     ),
-                    dhan_live_trader_storage::materialized_views::ensure_candle_views(
-                        &config.questdb
-                    ),
+                    tickvault_storage::materialized_views::ensure_candle_views(&config.questdb),
                     ensure_greeks_tables(&config.questdb),
                 );
                 // Persist trading calendar to QuestDB (best-effort, non-blocking).
@@ -783,7 +776,7 @@ async fn main() -> Result<()> {
             // SSM validation + TokenManager for renewal
             async {
                 let timeout = std::time::Duration::from_secs(
-                    dhan_live_trader_common::constants::TOKEN_INIT_TIMEOUT_SECS,
+                    tickvault_common::constants::TOKEN_INIT_TIMEOUT_SECS,
                 );
                 tokio::time::timeout(
                     timeout,
@@ -809,8 +802,10 @@ async fn main() -> Result<()> {
             Ok(Err(err)) => {
                 error!(error = %err, "deferred auth failed — token renewal unavailable");
                 notifier.notify(
-                    dhan_live_trader_core::notification::events::NotificationEvent::AuthenticationFailed {
-                        reason: format!("DEFERRED: {err} — ticks still flowing but renewal unavailable"),
+                    tickvault_core::notification::events::NotificationEvent::AuthenticationFailed {
+                        reason: format!(
+                            "DEFERRED: {err} — ticks still flowing but renewal unavailable"
+                        ),
                     },
                 );
                 None
@@ -875,7 +870,7 @@ async fn main() -> Result<()> {
             let greeks_config = config.greeks.clone();
             let greeks_questdb = config.questdb.clone();
             tokio::spawn(async move {
-                dhan_live_trader_app::greeks_pipeline::run_greeks_pipeline(
+                tickvault_app::greeks_pipeline::run_greeks_pipeline(
                     greeks_token,
                     greeks_client_id,
                     greeks_base_url,
@@ -890,9 +885,8 @@ async fn main() -> Result<()> {
         }
 
         // --- Background: Order update WebSocket ---
-        let (order_update_sender, _order_update_receiver) = tokio::sync::broadcast::channel::<
-            dhan_live_trader_common::order_types::OrderUpdate,
-        >(256);
+        let (order_update_sender, _order_update_receiver) =
+            tokio::sync::broadcast::channel::<tickvault_common::order_types::OrderUpdate>(256);
 
         let order_update_handle = {
             let url = config.dhan.order_update_websocket_url.clone();
@@ -910,9 +904,8 @@ async fn main() -> Result<()> {
         let daily_reset_signal = std::sync::Arc::new(tokio::sync::Notify::new());
         {
             let signal = std::sync::Arc::clone(&daily_reset_signal);
-            let reset_sleep = compute_market_close_sleep(
-                dhan_live_trader_common::constants::APP_DAILY_RESET_TIME_IST,
-            );
+            let reset_sleep =
+                compute_market_close_sleep(tickvault_common::constants::APP_DAILY_RESET_TIME_IST);
             if reset_sleep > std::time::Duration::ZERO {
                 tokio::spawn(async move {
                     tokio::time::sleep(reset_sleep).await;
@@ -969,12 +962,12 @@ async fn main() -> Result<()> {
             info!(
                 "market hours — using cached constituency data (skipping niftyindices.com download)"
             );
-            dhan_live_trader_core::index_constituency::try_load_cache(
+            tickvault_core::index_constituency::try_load_cache(
                 &config.instrument.csv_cache_directory,
             )
             .await
         } else {
-            dhan_live_trader_core::index_constituency::download_and_build_constituency_map(
+            tickvault_core::index_constituency::download_and_build_constituency_map(
                 &config.index_constituency,
                 &config.instrument.csv_cache_directory,
             )
@@ -984,7 +977,7 @@ async fn main() -> Result<()> {
         // Persist constituency to QuestDB for Grafana (best-effort, non-blocking).
         // Enrich with security_ids from instrument master for news-based trading.
         if let Some(ref map) = bg_constituency {
-            match dhan_live_trader_storage::constituency_persistence::persist_constituency(
+            match tickvault_storage::constituency_persistence::persist_constituency(
                 map,
                 &config.questdb,
                 fresh_universe.as_ref(),
@@ -999,7 +992,7 @@ async fn main() -> Result<()> {
             }
         }
 
-        let bg_shared_constituency: dhan_live_trader_api::state::SharedConstituencyMap =
+        let bg_shared_constituency: tickvault_api::state::SharedConstituencyMap =
             std::sync::Arc::new(std::sync::RwLock::new(bg_constituency));
 
         // --- Background: API server ---
@@ -1144,7 +1137,7 @@ async fn main() -> Result<()> {
     info!("authenticating with Dhan API via SSM → TOTP → JWT");
 
     let token_init_timeout =
-        std::time::Duration::from_secs(dhan_live_trader_common::constants::TOKEN_INIT_TIMEOUT_SECS);
+        std::time::Duration::from_secs(tickvault_common::constants::TOKEN_INIT_TIMEOUT_SECS);
     let token_manager = match tokio::time::timeout(
         token_init_timeout,
         TokenManager::initialize(&config.dhan, &config.token, &config.network, &notifier),
@@ -1156,7 +1149,7 @@ async fn main() -> Result<()> {
             // Permanent auth error or Ctrl+C.
             error!(error = %err, "authentication failed permanently — exiting");
             notifier.notify(
-                dhan_live_trader_core::notification::events::NotificationEvent::AuthenticationFailed {
+                tickvault_core::notification::events::NotificationEvent::AuthenticationFailed {
                     reason: format!("PERMANENT: {err}"),
                 },
             );
@@ -1164,14 +1157,14 @@ async fn main() -> Result<()> {
         }
         Err(_elapsed) => {
             error!(
-                timeout_secs = dhan_live_trader_common::constants::TOKEN_INIT_TIMEOUT_SECS,
+                timeout_secs = tickvault_common::constants::TOKEN_INIT_TIMEOUT_SECS,
                 "authentication timed out — Dhan API may be unreachable"
             );
             notifier.notify(
-                dhan_live_trader_core::notification::events::NotificationEvent::AuthenticationFailed {
+                tickvault_core::notification::events::NotificationEvent::AuthenticationFailed {
                     reason: format!(
                         "TIMEOUT: initial auth did not complete within {}s — check Dhan API and network",
-                        dhan_live_trader_common::constants::TOKEN_INIT_TIMEOUT_SECS,
+                        tickvault_common::constants::TOKEN_INIT_TIMEOUT_SECS,
                     ),
                 },
             );
@@ -1193,17 +1186,15 @@ async fn main() -> Result<()> {
         ensure_instrument_tables(&config.questdb),
         ensure_candle_table_dedup_keys(&config.questdb),
         calendar_persistence::ensure_calendar_table(&config.questdb),
-        dhan_live_trader_storage::constituency_persistence::ensure_constituency_table(
-            &config.questdb
-        ),
-        dhan_live_trader_storage::materialized_views::ensure_candle_views(&config.questdb),
+        tickvault_storage::constituency_persistence::ensure_constituency_table(&config.questdb),
+        tickvault_storage::materialized_views::ensure_candle_views(&config.questdb),
         ensure_greeks_tables(&config.questdb),
-        dhan_live_trader_storage::movers_persistence::ensure_movers_tables(&config.questdb),
-        dhan_live_trader_storage::indicator_snapshot_persistence::ensure_indicator_snapshot_table(
+        tickvault_storage::movers_persistence::ensure_movers_tables(&config.questdb),
+        tickvault_storage::indicator_snapshot_persistence::ensure_indicator_snapshot_table(
             &config.questdb
         ),
-        dhan_live_trader_storage::deep_depth_persistence::ensure_deep_depth_table(&config.questdb),
-        dhan_live_trader_storage::obi_persistence::ensure_obi_table(&config.questdb),
+        tickvault_storage::deep_depth_persistence::ensure_deep_depth_table(&config.questdb),
+        tickvault_storage::obi_persistence::ensure_obi_table(&config.questdb),
     );
 
     // Persist trading calendar to QuestDB (best-effort, non-blocking).
@@ -1229,7 +1220,7 @@ async fn main() -> Result<()> {
                     "recovered stale tick spill files from previous crashes"
                 );
                 notifier.notify(
-                    dhan_live_trader_core::notification::events::NotificationEvent::Custom {
+                    tickvault_core::notification::events::NotificationEvent::Custom {
                         message: format!(
                             "<b>Tick Recovery</b>\nRecovered {recovered} orphaned ticks from previous crash spill files."
                         ),
@@ -1246,7 +1237,7 @@ async fn main() -> Result<()> {
                 "QuestDB tick writer failed to connect — starting in DISCONNECTED BUFFERING mode"
             );
             notifier.notify(
-                dhan_live_trader_core::notification::events::NotificationEvent::Custom {
+                tickvault_core::notification::events::NotificationEvent::Custom {
                     message: format!(
                         "<b>CRITICAL: QuestDB UNAVAILABLE</b>\nTick writer in BUFFERING mode: {err}\nTicks buffered to ring buffer + disk spill. Will drain when QuestDB recovers."
                     ),
@@ -1408,14 +1399,14 @@ async fn main() -> Result<()> {
     // -----------------------------------------------------------------------
     // Step 9: Spawn tick processor FIRST (before WS connections send frames)
     // -----------------------------------------------------------------------
-    let shared_movers: dhan_live_trader_core::pipeline::SharedTopMoversSnapshot =
+    let shared_movers: tickvault_core::pipeline::SharedTopMoversSnapshot =
         std::sync::Arc::new(std::sync::RwLock::new(None));
 
     // Tick broadcast: fan-out parsed ticks to the trading pipeline (cold path consumer).
     // A2: Use constant capacity (65536) to absorb bursts without lagging cold-path consumers.
     let (tick_broadcast_sender, _tick_broadcast_default_rx) =
-        tokio::sync::broadcast::channel::<dhan_live_trader_common::tick_types::ParsedTick>(
-            dhan_live_trader_common::constants::TICK_BROADCAST_CAPACITY,
+        tokio::sync::broadcast::channel::<tickvault_common::tick_types::ParsedTick>(
+            tickvault_common::constants::TICK_BROADCAST_CAPACITY,
         );
 
     // S12 wiring: heartbeat watchdog (slow boot).
@@ -1433,11 +1424,10 @@ async fn main() -> Result<()> {
     // path (run_tick_processor) owns its own tick writer, so we do NOT
     // write ticks from the observability task — it only tracks gaps
     // and HTTP-pings QuestDB for health.
-    let (gap_backfill_tx_slow, gap_backfill_rx_slow) = tokio::sync::mpsc::channel::<
-        dhan_live_trader_core::historical::backfill::GapBackfillRequest,
-    >(64);
+    let (gap_backfill_tx_slow, gap_backfill_rx_slow) =
+        tokio::sync::mpsc::channel::<tickvault_core::historical::backfill::GapBackfillRequest>(64);
     let (synth_tick_tx_slow, mut synth_tick_rx_slow) =
-        tokio::sync::mpsc::channel::<dhan_live_trader_common::tick_types::ParsedTick>(4096);
+        tokio::sync::mpsc::channel::<tickvault_common::tick_types::ParsedTick>(4096);
     // S4-T1e: Real Dhan historical intraday REST fetcher (slow-boot).
     // Mirrors the fast-boot closure at line ~446. The closure captures
     // a reqwest client, the rest_api_base_url, the token_handle (Arc,
@@ -1465,7 +1455,7 @@ async fn main() -> Result<()> {
     // closure can resolve the exact instrument kind per gap event.
     // Mirrors the fast-boot wiring at backfill_registry_fast.
     let backfill_registry_slow: Option<
-        std::sync::Arc<dhan_live_trader_common::instrument_registry::InstrumentRegistry>,
+        std::sync::Arc<tickvault_common::instrument_registry::InstrumentRegistry>,
     > = subscription_plan
         .as_ref()
         .map(|p| std::sync::Arc::new(p.registry.clone()));
@@ -1476,7 +1466,7 @@ async fn main() -> Result<()> {
         governor::Quota::per_second(std::num::NonZeroU32::new(5).expect("5 > 0")),
     ));
     let backfill_fetcher_slow =
-        move |req: dhan_live_trader_core::historical::backfill::GapBackfillRequest| {
+        move |req: tickvault_core::historical::backfill::GapBackfillRequest| {
             let http_client = backfill_http_client_slow.clone();
             let endpoint = backfill_endpoint_slow.clone();
             let token_handle = std::sync::Arc::clone(&backfill_token_handle_slow);
@@ -1505,7 +1495,7 @@ async fn main() -> Result<()> {
                     .and_then(|inst| inst.instrument_kind.as_ref())
                     .map(|kind| kind.as_dhan_api_string());
 
-                dhan_live_trader_core::historical::backfill::fetch_intraday_window(
+                tickvault_core::historical::backfill::fetch_intraday_window(
                     &http_client,
                     &endpoint,
                     &access_token,
@@ -1519,7 +1509,7 @@ async fn main() -> Result<()> {
                 .await
             }
         };
-    let backfill_worker_slow = dhan_live_trader_core::historical::backfill::BackfillWorker::new(
+    let backfill_worker_slow = tickvault_core::historical::backfill::BackfillWorker::new(
         gap_backfill_rx_slow,
         synth_tick_tx_slow,
         backfill_fetcher_slow,
@@ -1551,7 +1541,7 @@ async fn main() -> Result<()> {
         let questdb_cfg_for_synth = config.questdb.clone();
         tokio::spawn(async move {
             let mut synth_writer =
-                match dhan_live_trader_storage::tick_persistence::TickPersistenceWriter::new(
+                match tickvault_storage::tick_persistence::TickPersistenceWriter::new(
                     &questdb_cfg_for_synth,
                 ) {
                     Ok(w) => {
@@ -1564,7 +1554,7 @@ async fn main() -> Result<()> {
                             "S5-A1: slow-boot synth writer: QuestDB unavailable — \
                              using disconnected mode with ring buffer + spill"
                         );
-                        dhan_live_trader_storage::tick_persistence::TickPersistenceWriter::new_disconnected(
+                        tickvault_storage::tick_persistence::TickPersistenceWriter::new_disconnected(
                             &questdb_cfg_for_synth,
                         )
                     }
@@ -1580,7 +1570,7 @@ async fn main() -> Result<()> {
                 match synth_writer.append_tick(&tick) {
                     Ok(()) => {
                         persisted_total = persisted_total.saturating_add(1);
-                        metrics::counter!("dlt_backfill_ticks_persisted_total").increment(1);
+                        metrics::counter!("tv_backfill_ticks_persisted_total").increment(1);
                     }
                     Err(err) => {
                         tracing::warn!(
@@ -1603,7 +1593,7 @@ async fn main() -> Result<()> {
                 match broadcast_for_synth_slow.send(tick) {
                     Ok(_) => {
                         forwarded_total = forwarded_total.saturating_add(1);
-                        metrics::counter!("dlt_backfill_ticks_forwarded_total").increment(1);
+                        metrics::counter!("tv_backfill_ticks_forwarded_total").increment(1);
                     }
                     Err(_) => {
                         tracing::info!(
@@ -1632,14 +1622,13 @@ async fn main() -> Result<()> {
             loop {
                 interval.tick().await;
                 let snap = stats.snapshot();
-                metrics::counter!("dlt_backfill_events_received_total")
+                metrics::counter!("tv_backfill_events_received_total")
                     .absolute(snap.events_received);
-                metrics::counter!("dlt_backfill_events_succeeded_total")
+                metrics::counter!("tv_backfill_events_succeeded_total")
                     .absolute(snap.events_succeeded);
-                metrics::counter!("dlt_backfill_events_errored_total")
-                    .absolute(snap.events_errored);
-                metrics::counter!("dlt_backfill_events_empty_total").absolute(snap.events_empty);
-                metrics::counter!("dlt_backfill_ticks_synthesised_total")
+                metrics::counter!("tv_backfill_events_errored_total").absolute(snap.events_errored);
+                metrics::counter!("tv_backfill_events_empty_total").absolute(snap.events_empty);
+                metrics::counter!("tv_backfill_ticks_synthesised_total")
                     .absolute(snap.ticks_synthesised);
             }
         });
@@ -1656,11 +1645,9 @@ async fn main() -> Result<()> {
     }
 
     let processor_handle = if let Some(receiver) = pool_receiver {
-        let candle_agg = Some(dhan_live_trader_core::pipeline::CandleAggregator::new());
+        let candle_agg = Some(tickvault_core::pipeline::CandleAggregator::new());
         let live_candle_writer =
-            match dhan_live_trader_storage::candle_persistence::LiveCandleWriter::new(
-                &config.questdb,
-            ) {
+            match tickvault_storage::candle_persistence::LiveCandleWriter::new(&config.questdb) {
                 Ok(mut w) => {
                     // Recover stale candle spill files from previous crashes.
                     let recovered = w.recover_stale_spill_files();
@@ -1681,7 +1668,7 @@ async fn main() -> Result<()> {
                     None
                 }
             };
-        let movers = Some(dhan_live_trader_core::pipeline::TopMoversTracker::new());
+        let movers = Some(tickvault_core::pipeline::TopMoversTracker::new());
         let snapshot_handle = Some(shared_movers.clone());
         let tick_broadcast_for_processor = Some(tick_broadcast_sender.clone());
 
@@ -1690,9 +1677,7 @@ async fn main() -> Result<()> {
 
         // Create stock movers QuestDB writer (cold path, best-effort)
         let stock_movers_writer =
-            match dhan_live_trader_storage::movers_persistence::StockMoversWriter::new(
-                &config.questdb,
-            ) {
+            match tickvault_storage::movers_persistence::StockMoversWriter::new(&config.questdb) {
                 Ok(w) => {
                     info!("QuestDB stock movers writer connected");
                     Some(w)
@@ -1707,12 +1692,9 @@ async fn main() -> Result<()> {
             };
 
         // Create option movers tracker + QuestDB writer
-        let option_movers_tracker =
-            Some(dhan_live_trader_core::pipeline::OptionMoversTracker::new());
+        let option_movers_tracker = Some(tickvault_core::pipeline::OptionMoversTracker::new());
         let option_movers_writer =
-            match dhan_live_trader_storage::movers_persistence::OptionMoversWriter::new(
-                &config.questdb,
-            ) {
+            match tickvault_storage::movers_persistence::OptionMoversWriter::new(&config.questdb) {
                 Ok(w) => {
                     info!("QuestDB option movers writer connected");
                     Some(w)
@@ -1797,18 +1779,17 @@ async fn main() -> Result<()> {
             for underlying in &depth_underlyings {
                 // Collect NSE_FNO instruments for this underlying (ATM strikes first from plan)
                 let instruments_for_underlying: Vec<
-                    dhan_live_trader_core::websocket::types::InstrumentSubscription,
+                    tickvault_core::websocket::types::InstrumentSubscription,
                 > = plan
                     .registry
                     .iter()
                     .filter(|inst| {
-                        inst.exchange_segment
-                            == dhan_live_trader_common::types::ExchangeSegment::NseFno
+                        inst.exchange_segment == tickvault_common::types::ExchangeSegment::NseFno
                             && inst.underlying_symbol == *underlying
                     })
                     .take(config.subscription.twenty_depth_max_instruments)
                     .map(|inst| {
-                        dhan_live_trader_core::websocket::types::InstrumentSubscription::new(
+                        tickvault_core::websocket::types::InstrumentSubscription::new(
                             inst.exchange_segment,
                             inst.security_id,
                         )
@@ -1844,18 +1825,18 @@ async fn main() -> Result<()> {
                             let ce = plan.registry.iter().find(|r| {
                                 r.underlying_symbol == *underlying
                                     && r.exchange_segment
-                                        == dhan_live_trader_common::types::ExchangeSegment::NseFno
+                                        == tickvault_common::types::ExchangeSegment::NseFno
                                     && r.option_type
-                                        == Some(dhan_live_trader_common::types::OptionType::Call)
+                                        == Some(tickvault_common::types::OptionType::Call)
                                     && r.strike_price.is_some_and(|sp| (sp - strike).abs() < 0.01)
                                     && r.expiry_date == Some(expiry)
                             });
                             let pe = plan.registry.iter().find(|r| {
                                 r.underlying_symbol == *underlying
                                     && r.exchange_segment
-                                        == dhan_live_trader_common::types::ExchangeSegment::NseFno
+                                        == tickvault_common::types::ExchangeSegment::NseFno
                                     && r.option_type
-                                        == Some(dhan_live_trader_common::types::OptionType::Put)
+                                        == Some(tickvault_common::types::OptionType::Put)
                                     && r.strike_price.is_some_and(|sp| (sp - strike).abs() < 0.01)
                                     && r.expiry_date == Some(expiry)
                             });
@@ -1887,13 +1868,13 @@ async fn main() -> Result<()> {
                 // Spawn depth frame receiver with QuestDB persistence + OBI computation
                 tokio::spawn(async move {
                     // Pre-register metric handles to avoid String clone on every frame/OBI computation.
-                    let m = metrics::counter!("dlt_depth_20lvl_frames_received", "underlying" => depth_label_recv.clone());
+                    let m = metrics::counter!("tv_depth_20lvl_frames_received", "underlying" => depth_label_recv.clone());
                     let m_obi_value =
-                        metrics::gauge!("dlt_obi_value", "underlying" => depth_label_recv.clone());
-                    let m_obi_computations = metrics::counter!("dlt_obi_computations_total", "underlying" => depth_label_recv.clone());
-                    let m_obi_errors = metrics::counter!("dlt_obi_persist_errors_total", "underlying" => depth_label_recv.clone());
+                        metrics::gauge!("tv_obi_value", "underlying" => depth_label_recv.clone());
+                    let m_obi_computations = metrics::counter!("tv_obi_computations_total", "underlying" => depth_label_recv.clone());
+                    let m_obi_errors = metrics::counter!("tv_obi_persist_errors_total", "underlying" => depth_label_recv.clone());
                     let mut writer =
-                        dhan_live_trader_storage::deep_depth_persistence::DeepDepthWriter::new(
+                        tickvault_storage::deep_depth_persistence::DeepDepthWriter::new(
                             &depth_questdb,
                         )
                         .ok();
@@ -1907,7 +1888,7 @@ async fn main() -> Result<()> {
                     // OBI: writer + bid accumulator (per security_id).
                     // Depth packets arrive as [Bid][Ask] pairs per instrument in each WS message.
                     // Accumulate bid levels, compute OBI when ask arrives.
-                    let mut obi_writer = dhan_live_trader_storage::obi_persistence::ObiWriter::new(
+                    let mut obi_writer = tickvault_storage::obi_persistence::ObiWriter::new(
                         &depth_questdb,
                         &depth_label_recv,
                     )
@@ -1921,7 +1902,7 @@ async fn main() -> Result<()> {
                     // O(1) EXEMPT: begin — HashMap pre-allocated for max 50 instruments per depth connection
                     let mut bid_accumulator: std::collections::HashMap<
                         u32,
-                        (u8, Vec<dhan_live_trader_common::tick_types::DeepDepthLevel>),
+                        (u8, Vec<tickvault_common::tick_types::DeepDepthLevel>),
                     > = std::collections::HashMap::with_capacity(50);
                     // O(1) EXEMPT: end
 
@@ -1931,18 +1912,24 @@ async fn main() -> Result<()> {
                         // Split stacked packets: Dhan stacks multiple instrument packets
                         // in a single WS message: [Inst1 Bid][Inst1 Ask][Inst2 Bid]...
                         // Without splitting, only the first packet would be parsed.
-                        let packets = match dhan_live_trader_core::parser::dispatcher::split_stacked_depth_packets(&frame) {
-                            Ok(p) => p,
-                            Err(err) => {
-                                tracing::warn!(?err, "failed to split stacked 20-level depth frame");
-                                continue;
-                            }
-                        };
+                        let packets =
+                            match tickvault_core::parser::dispatcher::split_stacked_depth_packets(
+                                &frame,
+                            ) {
+                                Ok(p) => p,
+                                Err(err) => {
+                                    tracing::warn!(
+                                        ?err,
+                                        "failed to split stacked 20-level depth frame"
+                                    );
+                                    continue;
+                                }
+                            };
                         for packet in packets {
-                            match dhan_live_trader_core::parser::dispatcher::dispatch_deep_depth_frame(
+                            match tickvault_core::parser::dispatcher::dispatch_deep_depth_frame(
                                 packet, ts,
                             ) {
-                                Ok(dhan_live_trader_core::parser::types::ParsedFrame::DeepDepth {
+                                Ok(tickvault_core::parser::types::ParsedFrame::DeepDepth {
                                     security_id,
                                     exchange_segment_code,
                                     side,
@@ -1951,12 +1938,8 @@ async fn main() -> Result<()> {
                                     ..
                                 }) => {
                                     let side_str = match side {
-                                        dhan_live_trader_core::parser::deep_depth::DepthSide::Bid => {
-                                            "BID"
-                                        }
-                                        dhan_live_trader_core::parser::deep_depth::DepthSide::Ask => {
-                                            "ASK"
-                                        }
+                                        tickvault_core::parser::deep_depth::DepthSide::Bid => "BID",
+                                        tickvault_core::parser::deep_depth::DepthSide::Ask => "ASK",
                                     };
                                     // Persist raw depth to QuestDB
                                     if let Some(ref mut w) = writer
@@ -1977,18 +1960,24 @@ async fn main() -> Result<()> {
                                     // Bid/ask arrive as separate packets per instrument.
                                     // Remove bid entry after OBI computation to prevent stale data.
                                     match side {
-                                        dhan_live_trader_core::parser::deep_depth::DepthSide::Bid => {
-                                            bid_accumulator.insert(security_id, (exchange_segment_code, levels));
+                                        tickvault_core::parser::deep_depth::DepthSide::Bid => {
+                                            bid_accumulator.insert(
+                                                security_id,
+                                                (exchange_segment_code, levels),
+                                            );
                                         }
-                                        dhan_live_trader_core::parser::deep_depth::DepthSide::Ask => {
+                                        tickvault_core::parser::deep_depth::DepthSide::Ask => {
                                             // Remove bid entry (take ownership) to prevent stale accumulation.
-                                            if let Some((seg_code, bid_levels)) = bid_accumulator.remove(&security_id) {
-                                                let obi_snap = dhan_live_trader_trading::indicator::obi::compute_obi(
-                                                    security_id,
-                                                    seg_code,
-                                                    &bid_levels,
-                                                    &levels,
-                                                );
+                                            if let Some((seg_code, bid_levels)) =
+                                                bid_accumulator.remove(&security_id)
+                                            {
+                                                let obi_snap =
+                                                    tickvault_trading::indicator::obi::compute_obi(
+                                                        security_id,
+                                                        seg_code,
+                                                        &bid_levels,
+                                                        &levels,
+                                                    );
 
                                                 // Update Prometheus gauges (pre-registered, zero-clone)
                                                 m_obi_value.set(obi_snap.obi);
@@ -1997,9 +1986,9 @@ async fn main() -> Result<()> {
                                                 // Persist OBI snapshot with separate ts and received_at.
                                                 // ts = received_at IST (for QuestDB designated timestamp).
                                                 // received_at = same value (depth has no exchange timestamp).
-                                                let ts_ist = ts.saturating_add(dhan_live_trader_common::constants::IST_UTC_OFFSET_NANOS);
+                                                let ts_ist = ts.saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS);
                                                 if let Some(ref mut ow) = obi_writer {
-                                                    let obi_record = dhan_live_trader_storage::obi_persistence::ObiRecord {
+                                                    let obi_record = tickvault_storage::obi_persistence::ObiRecord {
                                                         security_id,
                                                         segment_code: obi_snap.segment_code,
                                                         obi: obi_snap.obi,
@@ -2017,7 +2006,10 @@ async fn main() -> Result<()> {
                                                     };
                                                     if let Err(err) = ow.append_obi(&obi_record) {
                                                         m_obi_errors.increment(1);
-                                                        tracing::warn!(?err, "failed to persist OBI snapshot");
+                                                        tracing::warn!(
+                                                            ?err,
+                                                            "failed to persist OBI snapshot"
+                                                        );
                                                     }
                                                 }
                                             }
@@ -2029,7 +2021,7 @@ async fn main() -> Result<()> {
                                 Ok(_) => {} // non-depth frame (shouldn't happen)
                                 Err(err) => {
                                     // H5: Escalate persistent parse failures to ERROR (triggers Telegram).
-                                    metrics::counter!("dlt_depth_parse_errors_total", "depth" => "20").increment(1);
+                                    metrics::counter!("tv_depth_parse_errors_total", "depth" => "20").increment(1);
                                     tracing::warn!(?err, "failed to parse 20-level depth packet");
                                 }
                             }
@@ -2066,7 +2058,7 @@ async fn main() -> Result<()> {
                         d20_health.depth_20_connections().saturating_add(1),
                     );
 
-                    if let Err(err) = dhan_live_trader_core::websocket::run_twenty_depth_connection(
+                    if let Err(err) = tickvault_core::websocket::run_twenty_depth_connection(
                         depth_token,
                         depth_client_id,
                         instruments_for_underlying,
@@ -2122,8 +2114,7 @@ async fn main() -> Result<()> {
 
                         let depth200_token = token_handle.clone();
                         let depth200_client_id = ws_client_id.clone();
-                        let depth200_segment =
-                            dhan_live_trader_common::types::ExchangeSegment::NseFno;
+                        let depth200_segment = tickvault_common::types::ExchangeSegment::NseFno;
                         let depth200_label = format!("{underlying}-ATM-{opt_label}");
 
                         info!(
@@ -2139,12 +2130,12 @@ async fn main() -> Result<()> {
 
                         // Spawn 200-level depth receiver with QuestDB persistence
                         tokio::spawn(async move {
-                            let m = metrics::counter!("dlt_depth_200lvl_frames_received", "underlying" => m200_label.clone());
+                            let m = metrics::counter!("tv_depth_200lvl_frames_received", "underlying" => m200_label.clone());
                             let mut writer =
-                            dhan_live_trader_storage::deep_depth_persistence::DeepDepthWriter::new(
-                                &depth200_questdb,
-                            )
-                            .ok();
+                                tickvault_storage::deep_depth_persistence::DeepDepthWriter::new(
+                                    &depth200_questdb,
+                                )
+                                .ok();
                             if writer.is_some() {
                                 tracing::info!(
                                     label = m200_label,
@@ -2154,45 +2145,50 @@ async fn main() -> Result<()> {
                             while let Some(frame) = rx200.recv().await {
                                 m.increment(1);
                                 let ts = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-                                match dhan_live_trader_core::parser::dispatcher::dispatch_deep_depth_frame(
-                                &frame, ts,
-                            ) {
-                                Ok(
-                                    dhan_live_trader_core::parser::types::ParsedFrame::DeepDepth {
+                                match tickvault_core::parser::dispatcher::dispatch_deep_depth_frame(
+                                    &frame, ts,
+                                ) {
+                                    Ok(tickvault_core::parser::types::ParsedFrame::DeepDepth {
                                         security_id,
                                         exchange_segment_code,
                                         side,
                                         levels,
                                         message_sequence,
                                         ..
-                                    },
-                                ) => {
-                                    let side_str = match side {
-                                        dhan_live_trader_core::parser::deep_depth::DepthSide::Bid => "BID",
-                                        dhan_live_trader_core::parser::deep_depth::DepthSide::Ask => "ASK",
-                                    };
-                                    if let Some(ref mut w) = writer
-                                        && let Err(err) = w.append_deep_depth(
-                                            security_id,
-                                            exchange_segment_code,
-                                            side_str,
-                                            &levels,
-                                            "200",
-                                            ts,
-                                            message_sequence,
-                                        )
-                                    {
+                                    }) => {
+                                        let side_str = match side {
+                                            tickvault_core::parser::deep_depth::DepthSide::Bid => {
+                                                "BID"
+                                            }
+                                            tickvault_core::parser::deep_depth::DepthSide::Ask => {
+                                                "ASK"
+                                            }
+                                        };
+                                        if let Some(ref mut w) = writer
+                                            && let Err(err) = w.append_deep_depth(
+                                                security_id,
+                                                exchange_segment_code,
+                                                side_str,
+                                                &levels,
+                                                "200",
+                                                ts,
+                                                message_sequence,
+                                            )
+                                        {
+                                            tracing::warn!(
+                                                ?err,
+                                                "failed to persist 200-level depth"
+                                            );
+                                        }
+                                    }
+                                    Ok(_) => {}
+                                    Err(err) => {
                                         tracing::warn!(
                                             ?err,
-                                            "failed to persist 200-level depth"
+                                            "failed to parse 200-level depth frame"
                                         );
                                     }
                                 }
-                                Ok(_) => {}
-                                Err(err) => {
-                                    tracing::warn!(?err, "failed to parse 200-level depth frame");
-                                }
-                            }
                             }
                         });
 
@@ -2208,7 +2204,7 @@ async fn main() -> Result<()> {
                             );
 
                             if let Err(err) =
-                                dhan_live_trader_core::websocket::run_two_hundred_depth_connection(
+                                tickvault_core::websocket::run_two_hundred_depth_connection(
                                     depth200_token,
                                     depth200_client_id,
                                     depth200_segment,
@@ -2272,7 +2268,7 @@ async fn main() -> Result<()> {
         if let Some(universe_arc) = rebalancer_universe {
             // SharedSpotPrices: updated by a tick broadcast subscriber, read by rebalancer
             let spot_prices =
-                dhan_live_trader_core::instrument::depth_rebalancer::new_shared_spot_prices();
+                tickvault_core::instrument::depth_rebalancer::new_shared_spot_prices();
             let spot_prices_updater = std::sync::Arc::clone(&spot_prices);
 
             // Spawn spot price updater: subscribes to tick broadcast, extracts index LTPs
@@ -2296,7 +2292,7 @@ async fn main() -> Result<()> {
                                     _ => None,
                                 };
                                 if let Some(sym) = symbol {
-                                    dhan_live_trader_core::instrument::depth_rebalancer::update_spot_price(
+                                    tickvault_core::instrument::depth_rebalancer::update_spot_price(
                                             &spot_prices_updater,
                                             sym,
                                             f64::from(tick.last_traded_price),
@@ -2312,7 +2308,7 @@ async fn main() -> Result<()> {
 
             // Rebalance event channel (watch — latest-value semantics)
             let (rebalance_tx, mut rebalance_rx) = tokio::sync::watch::channel::<
-                Option<dhan_live_trader_core::instrument::depth_rebalancer::RebalanceEvent>,
+                Option<tickvault_core::instrument::depth_rebalancer::RebalanceEvent>,
             >(None);
 
             // Shutdown flag for the rebalancer
@@ -2320,7 +2316,7 @@ async fn main() -> Result<()> {
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
             tokio::spawn(
-                dhan_live_trader_core::instrument::depth_rebalancer::run_depth_rebalancer(
+                tickvault_core::instrument::depth_rebalancer::run_depth_rebalancer(
                     spot_prices,
                     universe_arc,
                     depth_underlyings,
@@ -2349,7 +2345,7 @@ async fn main() -> Result<()> {
                 });
             }
             info!("depth rebalancer spawned (checks spot drift every 60s)");
-            metrics::gauge!("dlt_depth_rebalancer_active").set(1.0);
+            metrics::gauge!("tv_depth_rebalancer_active").set(1.0);
         }
     }
 
@@ -2376,7 +2372,7 @@ async fn main() -> Result<()> {
         let greeks_config = config.greeks.clone();
         let greeks_questdb = config.questdb.clone();
         tokio::spawn(async move {
-            dhan_live_trader_app::greeks_pipeline::run_greeks_pipeline(
+            tickvault_app::greeks_pipeline::run_greeks_pipeline(
                 greeks_token,
                 greeks_client_id,
                 greeks_base_url,
@@ -2394,8 +2390,8 @@ async fn main() -> Result<()> {
     // Step 10: Spawn order update WebSocket connection
     // -----------------------------------------------------------------------
     let (order_update_sender, _order_update_receiver) =
-        tokio::sync::broadcast::channel::<dhan_live_trader_common::order_types::OrderUpdate>(
-            dhan_live_trader_common::constants::ORDER_UPDATE_BROADCAST_CAPACITY,
+        tokio::sync::broadcast::channel::<tickvault_common::order_types::OrderUpdate>(
+            tickvault_common::constants::ORDER_UPDATE_BROADCAST_CAPACITY,
         );
 
     let order_update_handle = {
@@ -2427,9 +2423,8 @@ async fn main() -> Result<()> {
     let daily_reset_signal = std::sync::Arc::new(tokio::sync::Notify::new());
     {
         let signal = std::sync::Arc::clone(&daily_reset_signal);
-        let reset_sleep = compute_market_close_sleep(
-            dhan_live_trader_common::constants::APP_DAILY_RESET_TIME_IST,
-        );
+        let reset_sleep =
+            compute_market_close_sleep(tickvault_common::constants::APP_DAILY_RESET_TIME_IST);
         if reset_sleep > std::time::Duration::ZERO {
             tokio::spawn(async move {
                 tokio::time::sleep(reset_sleep).await;
@@ -2490,24 +2485,23 @@ async fn main() -> Result<()> {
     // Constituency downloads are moved to background to prevent boot timeout.
     // niftyindices.com often returns HTML instead of CSV, causing 91s+ retries
     // that pushed boot past the 120s deadline.
-    let shared_constituency: dhan_live_trader_api::state::SharedConstituencyMap =
+    let shared_constituency: tickvault_api::state::SharedConstituencyMap =
         std::sync::Arc::new(std::sync::RwLock::new(None));
 
     // During market hours: load from cache synchronously (fast, no network).
     // Outside market hours: spawn background download (non-blocking).
     if is_market_hours {
         info!("market hours — using cached constituency data (skipping niftyindices.com download)");
-        let cached = dhan_live_trader_core::index_constituency::try_load_cache(
+        let cached = tickvault_core::index_constituency::try_load_cache(
             &config.instrument.csv_cache_directory,
         )
         .await;
         if let Some(ref map) = cached
-            && let Err(err) =
-                dhan_live_trader_storage::constituency_persistence::persist_constituency(
-                    map,
-                    &config.questdb,
-                    slow_boot_universe.as_ref(),
-                )
+            && let Err(err) = tickvault_storage::constituency_persistence::persist_constituency(
+                map,
+                &config.questdb,
+                slow_boot_universe.as_ref(),
+            )
         {
             tracing::warn!(
                 ?err,
@@ -2525,19 +2519,17 @@ async fn main() -> Result<()> {
         let bg_questdb_config = config.questdb.clone();
         let bg_universe = slow_boot_universe.clone();
         tokio::spawn(async move {
-            let map =
-                dhan_live_trader_core::index_constituency::download_and_build_constituency_map(
-                    &bg_index_config,
-                    &bg_cache_dir,
-                )
-                .await;
+            let map = tickvault_core::index_constituency::download_and_build_constituency_map(
+                &bg_index_config,
+                &bg_cache_dir,
+            )
+            .await;
             if let Some(ref m) = map
-                && let Err(err) =
-                    dhan_live_trader_storage::constituency_persistence::persist_constituency(
-                        m,
-                        &bg_questdb_config,
-                        bg_universe.as_ref(),
-                    )
+                && let Err(err) = tickvault_storage::constituency_persistence::persist_constituency(
+                    m,
+                    &bg_questdb_config,
+                    bg_universe.as_ref(),
+                )
             {
                 tracing::warn!(
                     ?err,
@@ -2600,18 +2592,18 @@ async fn main() -> Result<()> {
     // Boot duration check — alert if boot exceeded BOOT_TIMEOUT_SECS
     // -----------------------------------------------------------------------
     let boot_elapsed = boot_start.elapsed();
-    if boot_elapsed.as_secs() > dhan_live_trader_common::constants::BOOT_TIMEOUT_SECS {
+    if boot_elapsed.as_secs() > tickvault_common::constants::BOOT_TIMEOUT_SECS {
         error!(
             elapsed_secs = boot_elapsed.as_secs(),
-            timeout_secs = dhan_live_trader_common::constants::BOOT_TIMEOUT_SECS,
+            timeout_secs = tickvault_common::constants::BOOT_TIMEOUT_SECS,
             "BOOT TIMEOUT EXCEEDED"
         );
         notifier.notify(NotificationEvent::BootDeadlineMissed {
-            deadline_secs: dhan_live_trader_common::constants::BOOT_TIMEOUT_SECS,
+            deadline_secs: tickvault_common::constants::BOOT_TIMEOUT_SECS,
             step: format!(
                 "boot completed in {}s (over {}s limit)",
                 boot_elapsed.as_secs(),
-                dhan_live_trader_common::constants::BOOT_TIMEOUT_SECS,
+                tickvault_common::constants::BOOT_TIMEOUT_SECS,
             ),
         });
     } else {
@@ -2659,7 +2651,7 @@ async fn main() -> Result<()> {
             }
 
             let interval = std::time::Duration::from_secs(
-                dhan_live_trader_common::constants::PERIODIC_HEALTH_CHECK_INTERVAL_SECS,
+                tickvault_common::constants::PERIODIC_HEALTH_CHECK_INTERVAL_SECS,
             );
             loop {
                 tokio::time::sleep(interval).await;
@@ -2953,7 +2945,7 @@ fn spawn_pool_watchdog_task(
                 }
                 _ = interval.tick() => {
                     let verdict = pool.poll_watchdog();
-                    if let dhan_live_trader_core::websocket::pool_watchdog::WatchdogVerdict::Halt {
+                    if let tickvault_core::websocket::pool_watchdog::WatchdogVerdict::Halt {
                         down_for,
                     } = verdict
                     {
@@ -2964,7 +2956,7 @@ fn spawn_pool_watchdog_task(
                              Exiting process with status 2 so the supervisor restarts us. \
                              All 5 WebSocket connections have been down for >300s."
                         );
-                        metrics::counter!("dlt_pool_self_halts_total").increment(1);
+                        metrics::counter!("tv_pool_self_halts_total").increment(1);
                         // Give notifications + metrics flush a moment.
                         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                         std::process::exit(2);
@@ -3050,7 +3042,7 @@ fn spawn_historical_candle_fetch(
         // -----------------------------------------------------------------
 
         let is_within_collection_window =
-            dhan_live_trader_core::instrument::instrument_loader::is_within_build_window(
+            tickvault_core::instrument::instrument_loader::is_within_build_window(
                 &bg_data_collection_start,
                 &bg_data_collection_end,
             );
@@ -3267,8 +3259,8 @@ fn spawn_historical_candle_fetch(
 /// In fast boot, depth data is not persisted until the next full restart
 /// (depth requires raw frame fields which the broadcast doesn't carry).
 async fn run_tick_persistence_consumer(
-    mut tick_rx: tokio::sync::broadcast::Receiver<dhan_live_trader_common::tick_types::ParsedTick>,
-    questdb_config: dhan_live_trader_common::config::QuestDbConfig,
+    mut tick_rx: tokio::sync::broadcast::Receiver<tickvault_common::tick_types::ParsedTick>,
+    questdb_config: tickvault_common::config::QuestDbConfig,
     health_status: Option<SharedHealthStatus>,
     notifier: Option<std::sync::Arc<NotificationService>>,
     // S3-2: Optional gap-backfill publisher. When a TickGapResult::Error is
@@ -3277,7 +3269,7 @@ async fn run_tick_persistence_consumer(
     // synthesise replacement ticks. None = backfill disabled (tests / early
     // boot). See crates/core/src/historical/backfill.rs for the worker.
     gap_backfill_tx: Option<
-        tokio::sync::mpsc::Sender<dhan_live_trader_core::historical::backfill::GapBackfillRequest>,
+        tokio::sync::mpsc::Sender<tickvault_core::historical::backfill::GapBackfillRequest>,
     >,
 ) {
     let mut tick_writer = match TickPersistenceWriter::new(&questdb_config) {
@@ -3309,8 +3301,7 @@ async fn run_tick_persistence_consumer(
 
     // S3-1: QuestDB health poller — state machine that tracks the writer's
     // connection state and fires CRITICAL alerts on outages >30s.
-    let mut qdb_health_poller =
-        dhan_live_trader_storage::questdb_health::QuestDbHealthPoller::new();
+    let mut qdb_health_poller = tickvault_storage::questdb_health::QuestDbHealthPoller::new();
     let qdb_health_tick_interval = std::time::Duration::from_secs(2);
     let mut last_qdb_health_tick = std::time::Instant::now();
 
@@ -3325,18 +3316,16 @@ async fn run_tick_persistence_consumer(
     // hardcoded 5000 silently dropped tracking on 20k instruments —
     // fixed per the S4 honest-audit.
     let tick_gap_tracker_capacity =
-        dhan_live_trader_common::constants::MAX_INSTRUMENTS_PER_WEBSOCKET_CONNECTION
-            .saturating_mul(dhan_live_trader_common::constants::MAX_WEBSOCKET_CONNECTIONS);
+        tickvault_common::constants::MAX_INSTRUMENTS_PER_WEBSOCKET_CONNECTION
+            .saturating_mul(tickvault_common::constants::MAX_WEBSOCKET_CONNECTIONS);
     let mut tick_gap_tracker =
-        dhan_live_trader_trading::risk::tick_gap_tracker::TickGapTracker::new(
-            tick_gap_tracker_capacity,
-        );
+        tickvault_trading::risk::tick_gap_tracker::TickGapTracker::new(tick_gap_tracker_capacity);
     info!(
         capacity = tick_gap_tracker_capacity,
         "S4-T1c: tick gap tracker instantiated with full-universe capacity"
     );
     // Count of gap events published (cold path metric, observable via
-    // dlt_backfill_gaps_published_total).
+    // tv_backfill_gaps_published_total).
     let mut gaps_published: u64 = 0;
 
     loop {
@@ -3348,13 +3337,12 @@ async fn run_tick_persistence_consumer(
                 // itself still fires its own log/metric for them).
                 let gap_result =
                     tick_gap_tracker.record_tick(tick.security_id, tick.exchange_timestamp);
-                if let dhan_live_trader_trading::risk::tick_gap_tracker::TickGapResult::Error {
-                    gap_secs,
-                } = gap_result
+                if let tickvault_trading::risk::tick_gap_tracker::TickGapResult::Error { gap_secs } =
+                    gap_result
                     && let Some(ref tx) = gap_backfill_tx
                 {
                     let from = tick.exchange_timestamp.saturating_sub(gap_secs);
-                    let req = dhan_live_trader_core::historical::backfill::GapBackfillRequest {
+                    let req = tickvault_core::historical::backfill::GapBackfillRequest {
                         security_id: tick.security_id,
                         exchange_segment_code: tick.exchange_segment_code,
                         from_ist_secs: from,
@@ -3363,13 +3351,13 @@ async fn run_tick_persistence_consumer(
                     match tx.try_send(req) {
                         Ok(()) => {
                             gaps_published = gaps_published.saturating_add(1);
-                            metrics::counter!("dlt_backfill_gaps_published_total").increment(1);
+                            metrics::counter!("tv_backfill_gaps_published_total").increment(1);
                         }
                         Err(
                             tokio::sync::mpsc::error::TrySendError::Full(_)
                             | tokio::sync::mpsc::error::TrySendError::Closed(_),
                         ) => {
-                            metrics::counter!("dlt_backfill_gaps_dropped_total").increment(1);
+                            metrics::counter!("tv_backfill_gaps_dropped_total").increment(1);
                             warn!(
                                 security_id = tick.security_id,
                                 gap_secs,
@@ -3392,7 +3380,7 @@ async fn run_tick_persistence_consumer(
                 if last_qdb_health_tick.elapsed() >= qdb_health_tick_interval {
                     let verdict = qdb_health_poller
                         .tick(tick_writer.is_connected(), std::time::Instant::now());
-                    dhan_live_trader_storage::questdb_health::emit_metrics_for_verdict(
+                    tickvault_storage::questdb_health::emit_metrics_for_verdict(
                         verdict,
                         &qdb_health_poller,
                     );
@@ -3416,7 +3404,7 @@ async fn run_tick_persistence_consumer(
                     }
                     let qdb_config = questdb_config.clone();
                     tokio::spawn(async move {
-                        dhan_live_trader_storage::tick_persistence::check_tick_gaps_after_recovery(
+                        tickvault_storage::tick_persistence::check_tick_gaps_after_recovery(
                             &qdb_config,
                             30, // Check last 30 minutes
                         )
@@ -3434,7 +3422,7 @@ async fn run_tick_persistence_consumer(
                     "CRITICAL: cold-path tick persistence lagged — {} ticks permanently lost",
                     skipped
                 );
-                metrics::counter!("dlt_ticks_permanently_lost").increment(skipped);
+                metrics::counter!("tv_ticks_permanently_lost").increment(skipped);
                 // Explicit Telegram: ERROR log triggers Loki alert, but also notify directly
                 // in case Loki pipeline is delayed.
                 if let Some(ref n) = notifier {
@@ -3477,24 +3465,21 @@ async fn run_tick_persistence_consumer(
 /// Matches the zero-tick-loss observability surface in both boot modes
 /// so there is no blind spot.
 async fn run_slow_boot_observability(
-    mut tick_rx: tokio::sync::broadcast::Receiver<dhan_live_trader_common::tick_types::ParsedTick>,
-    questdb_config: dhan_live_trader_common::config::QuestDbConfig,
+    mut tick_rx: tokio::sync::broadcast::Receiver<tickvault_common::tick_types::ParsedTick>,
+    questdb_config: tickvault_common::config::QuestDbConfig,
     gap_backfill_tx: Option<
-        tokio::sync::mpsc::Sender<dhan_live_trader_core::historical::backfill::GapBackfillRequest>,
+        tokio::sync::mpsc::Sender<tickvault_core::historical::backfill::GapBackfillRequest>,
     >,
 ) {
     info!("S4-T1d: slow-boot observability task started");
 
     let tick_gap_tracker_capacity =
-        dhan_live_trader_common::constants::MAX_INSTRUMENTS_PER_WEBSOCKET_CONNECTION
-            .saturating_mul(dhan_live_trader_common::constants::MAX_WEBSOCKET_CONNECTIONS);
+        tickvault_common::constants::MAX_INSTRUMENTS_PER_WEBSOCKET_CONNECTION
+            .saturating_mul(tickvault_common::constants::MAX_WEBSOCKET_CONNECTIONS);
     let mut tick_gap_tracker =
-        dhan_live_trader_trading::risk::tick_gap_tracker::TickGapTracker::new(
-            tick_gap_tracker_capacity,
-        );
+        tickvault_trading::risk::tick_gap_tracker::TickGapTracker::new(tick_gap_tracker_capacity);
 
-    let mut qdb_health_poller =
-        dhan_live_trader_storage::questdb_health::QuestDbHealthPoller::new();
+    let mut qdb_health_poller = tickvault_storage::questdb_health::QuestDbHealthPoller::new();
     let qdb_health_interval = std::time::Duration::from_secs(2);
     let mut last_qdb_health_check = std::time::Instant::now();
 
@@ -3524,13 +3509,12 @@ async fn run_slow_boot_observability(
                 // Gap detection path — same logic as fast-boot consumer.
                 let gap_result =
                     tick_gap_tracker.record_tick(tick.security_id, tick.exchange_timestamp);
-                if let dhan_live_trader_trading::risk::tick_gap_tracker::TickGapResult::Error {
-                    gap_secs,
-                } = gap_result
+                if let tickvault_trading::risk::tick_gap_tracker::TickGapResult::Error { gap_secs } =
+                    gap_result
                     && let Some(ref tx) = gap_backfill_tx
                 {
                     let from = tick.exchange_timestamp.saturating_sub(gap_secs);
-                    let req = dhan_live_trader_core::historical::backfill::GapBackfillRequest {
+                    let req = tickvault_core::historical::backfill::GapBackfillRequest {
                         security_id: tick.security_id,
                         exchange_segment_code: tick.exchange_segment_code,
                         from_ist_secs: from,
@@ -3538,10 +3522,10 @@ async fn run_slow_boot_observability(
                     };
                     match tx.try_send(req) {
                         Ok(()) => {
-                            metrics::counter!("dlt_backfill_gaps_published_total").increment(1);
+                            metrics::counter!("tv_backfill_gaps_published_total").increment(1);
                         }
                         Err(_) => {
-                            metrics::counter!("dlt_backfill_gaps_dropped_total").increment(1);
+                            metrics::counter!("tv_backfill_gaps_dropped_total").increment(1);
                         }
                     }
                 }
@@ -3553,7 +3537,7 @@ async fn run_slow_boot_observability(
                         Err(_) => false,
                     };
                     let verdict = qdb_health_poller.tick(connected, std::time::Instant::now());
-                    dhan_live_trader_storage::questdb_health::emit_metrics_for_verdict(
+                    tickvault_storage::questdb_health::emit_metrics_for_verdict(
                         verdict,
                         &qdb_health_poller,
                     );
@@ -3588,11 +3572,11 @@ async fn run_slow_boot_observability(
 ///
 /// Materialized views (candles_1m, 5m, 15m, etc.) automatically aggregate from candles_1s.
 async fn run_candle_persistence_consumer(
-    mut tick_rx: tokio::sync::broadcast::Receiver<dhan_live_trader_common::tick_types::ParsedTick>,
-    questdb_config: dhan_live_trader_common::config::QuestDbConfig,
+    mut tick_rx: tokio::sync::broadcast::Receiver<tickvault_common::tick_types::ParsedTick>,
+    questdb_config: tickvault_common::config::QuestDbConfig,
 ) {
     let mut candle_writer =
-        match dhan_live_trader_storage::candle_persistence::LiveCandleWriter::new(&questdb_config) {
+        match tickvault_storage::candle_persistence::LiveCandleWriter::new(&questdb_config) {
             Ok(writer) => {
                 info!("cold-path live candle writer connected to QuestDB (candles_1s)");
                 writer
@@ -3606,7 +3590,7 @@ async fn run_candle_persistence_consumer(
             }
         };
 
-    let mut aggregator = dhan_live_trader_core::pipeline::CandleAggregator::new();
+    let mut aggregator = tickvault_core::pipeline::CandleAggregator::new();
     // O(1) EXEMPT: cold path, pipeline setup
     let sweep_interval = std::time::Duration::from_millis(100);
     let mut last_sweep = std::time::Instant::now();
@@ -3623,7 +3607,7 @@ async fn run_candle_persistence_consumer(
                     skipped,
                     "CRITICAL: cold-path candle consumer lagged — {} ticks not aggregated", skipped
                 );
-                metrics::counter!("dlt_candle_ticks_lagged").increment(skipped);
+                metrics::counter!("tv_candle_ticks_lagged").increment(skipped);
             }
             Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
                 // Shutdown: flush remaining candles
@@ -3667,7 +3651,7 @@ async fn run_candle_persistence_consumer(
             // APPROVED: i64→u32 safe: IST epoch fits u32 until 2106.
             #[allow(clippy::cast_possible_truncation)]
             let now_secs = (chrono::Utc::now().timestamp()
-                + i64::from(dhan_live_trader_common::constants::IST_UTC_OFFSET_SECONDS))
+                + i64::from(tickvault_common::constants::IST_UTC_OFFSET_SECONDS))
                 as u32;
             aggregator.sweep_stale(now_secs);
             let completed = aggregator.completed_slice();
@@ -3722,7 +3706,7 @@ async fn run_shutdown_fast(
     otel_provider: Option<opentelemetry_sdk::trace::SdkTracerProvider>,
     notifier: &std::sync::Arc<NotificationService>,
     config: &ApplicationConfig,
-    shared_movers: dhan_live_trader_core::pipeline::SharedTopMoversSnapshot,
+    shared_movers: tickvault_core::pipeline::SharedTopMoversSnapshot,
     post_market_signal: std::sync::Arc<tokio::sync::Notify>,
     // S4-T1b: shared pool handle + shutdown notifier. `ws_pool_arc` is
     // None when no WebSocket pool was spawned (e.g., historical-replay
@@ -3766,7 +3750,7 @@ async fn run_shutdown_fast(
         // Drain buffer: let in-flight ticks (last 15:29 candle) reach the
         // tick processor channel BEFORE aborting WebSocket read loops.
         let drain = std::time::Duration::from_secs(
-            dhan_live_trader_common::constants::MARKET_CLOSE_DRAIN_BUFFER_SECS,
+            tickvault_common::constants::MARKET_CLOSE_DRAIN_BUFFER_SECS,
         );
         tokio::time::sleep(drain).await;
 
@@ -3779,7 +3763,7 @@ async fn run_shutdown_fast(
         // Give tick processor time to flush remaining ticks before aborting
         if processor_handle.is_some() {
             let flush_timeout = std::time::Duration::from_secs(
-                dhan_live_trader_common::constants::GRACEFUL_SHUTDOWN_TIMEOUT_SECS,
+                tickvault_common::constants::GRACEFUL_SHUTDOWN_TIMEOUT_SECS,
             );
             tokio::time::sleep(flush_timeout).await;
         }
@@ -3795,7 +3779,7 @@ async fn run_shutdown_fast(
         {
             let retention_days = config.partition_retention.retention_days;
             if retention_days > 0 {
-                match dhan_live_trader_storage::partition_manager::PartitionManager::new(
+                match tickvault_storage::partition_manager::PartitionManager::new(
                     &config.questdb,
                     retention_days,
                 ) {
@@ -3878,7 +3862,7 @@ async fn run_shutdown_fast(
     // 4. Wait for tick processor final flush.
     if let Some(handle) = processor_handle {
         let shutdown_timeout = std::time::Duration::from_secs(
-            dhan_live_trader_common::constants::GRACEFUL_SHUTDOWN_TIMEOUT_SECS,
+            tickvault_common::constants::GRACEFUL_SHUTDOWN_TIMEOUT_SECS,
         );
         match tokio::time::timeout(shutdown_timeout, handle).await {
             Ok(_) => info!("tick processor shut down gracefully"),
@@ -3905,7 +3889,7 @@ async fn run_shutdown_fast(
     drop(otel_provider);
     drop(shared_movers);
 
-    info!("dhan-live-trader stopped");
+    info!("tickvault stopped");
     Ok(())
 }
 
@@ -3979,9 +3963,7 @@ fn build_inline_greeks_enricher(
 
     // Compute today's date in IST for time-to-expiry calculation.
     let today = (Utc::now()
-        + chrono::TimeDelta::seconds(
-            dhan_live_trader_common::constants::IST_UTC_OFFSET_SECONDS_I64,
-        ))
+        + chrono::TimeDelta::seconds(tickvault_common::constants::IST_UTC_OFFSET_SECONDS_I64))
     .date_naive();
 
     // O(1) EXEMPT: cold path — clone registry once at startup for enricher.
@@ -4009,7 +3991,7 @@ fn build_inline_greeks_enricher(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dhan_live_trader_app::boot_helpers::{
+    use tickvault_app::boot_helpers::{
         APP_LOG_FILE_PATH, OFF_HOURS_CONNECTION_STAGGER_MS, determine_boot_mode, should_fast_boot,
     };
 
@@ -4074,8 +4056,8 @@ mod tests {
 
     #[test]
     fn test_boot_timeout_configured() {
-        assert!(dhan_live_trader_common::constants::BOOT_TIMEOUT_SECS > 0);
-        assert!(dhan_live_trader_common::constants::BOOT_TIMEOUT_SECS <= 300);
+        assert!(tickvault_common::constants::BOOT_TIMEOUT_SECS > 0);
+        assert!(tickvault_common::constants::BOOT_TIMEOUT_SECS <= 300);
     }
 
     #[tokio::test]

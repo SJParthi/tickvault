@@ -18,7 +18,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-use dhan_live_trader_common::trading_calendar::{TradingCalendar, ist_offset};
+use tickvault_common::trading_calendar::{TradingCalendar, ist_offset};
 
 // I-P1-01: Full day in seconds for next-day wrapping
 const SECS_PER_DAY: i64 = 86_400;
@@ -416,8 +416,8 @@ mod tests {
     #[tokio::test]
     async fn test_spawn_daily_refresh_task_disabled_exits_on_shutdown() {
         let config = DailyRefreshConfig::default(); // disabled
-        let calendar = dhan_live_trader_common::trading_calendar::TradingCalendar::from_config(
-            &dhan_live_trader_common::config::TradingConfig {
+        let calendar = tickvault_common::trading_calendar::TradingCalendar::from_config(
+            &tickvault_common::config::TradingConfig {
                 market_open_time: "09:00:00".to_string(),
                 market_close_time: "15:30:00".to_string(),
                 order_cutoff_time: "15:29:00".to_string(),
@@ -480,8 +480,8 @@ mod tests {
             download_time: hms(23, 59, 59),
             enabled: true,
         };
-        let calendar = dhan_live_trader_common::trading_calendar::TradingCalendar::from_config(
-            &dhan_live_trader_common::config::TradingConfig {
+        let calendar = tickvault_common::trading_calendar::TradingCalendar::from_config(
+            &tickvault_common::config::TradingConfig {
                 market_open_time: "09:00:00".to_string(),
                 market_close_time: "15:30:00".to_string(),
                 order_cutoff_time: "15:29:00".to_string(),
@@ -530,7 +530,7 @@ mod tests {
         // Calendar that treats today as non-trading.
         // On weekdays: add today as a holiday. On weekends: it's already non-trading.
         use chrono::Datelike;
-        use dhan_live_trader_common::config::NseHolidayEntry;
+        use tickvault_common::config::NseHolidayEntry;
         let today_ist = Utc::now().with_timezone(&ist_offset()).date_naive();
         let is_weekday = today_ist.weekday().num_days_from_monday() < 5;
         let holidays = if is_weekday {
@@ -541,8 +541,8 @@ mod tests {
         } else {
             vec![]
         };
-        let calendar = dhan_live_trader_common::trading_calendar::TradingCalendar::from_config(
-            &dhan_live_trader_common::config::TradingConfig {
+        let calendar = tickvault_common::trading_calendar::TradingCalendar::from_config(
+            &tickvault_common::config::TradingConfig {
                 market_open_time: "09:00:00".to_string(),
                 market_close_time: "15:30:00".to_string(),
                 order_cutoff_time: "15:29:00".to_string(),
@@ -643,8 +643,8 @@ mod tests {
         };
 
         // No holidays — today is a trading day (if weekday)
-        let calendar = dhan_live_trader_common::trading_calendar::TradingCalendar::from_config(
-            &dhan_live_trader_common::config::TradingConfig {
+        let calendar = tickvault_common::trading_calendar::TradingCalendar::from_config(
+            &tickvault_common::config::TradingConfig {
                 market_open_time: "09:00:00".to_string(),
                 market_close_time: "15:30:00".to_string(),
                 order_cutoff_time: "15:29:00".to_string(),

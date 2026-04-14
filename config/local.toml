@@ -1,5 +1,5 @@
 # =============================================================================
-# dhan-live-trader — Host Development Configuration
+# tickvault — Host Development Configuration
 # =============================================================================
 # Overrides base.toml for running from IntelliJ / host (outside Docker).
 # Docker-internal hostnames → localhost (where Docker exposes ports).

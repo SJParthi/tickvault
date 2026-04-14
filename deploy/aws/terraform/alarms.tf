@@ -1,7 +1,7 @@
-# S9: CloudWatch alarms that publish to dlt-${env}-alerts SNS topic.
+# S9: CloudWatch alarms that publish to tv-${env}-alerts SNS topic.
 #
 # The Grafana alerts in deploy/docker/grafana/provisioning/alerting/
-# fire for in-app metrics (dlt_*). These CloudWatch alarms fire for
+# fire for in-app metrics (tv_*). These CloudWatch alarms fire for
 # INFRASTRUCTURE signals — the machine / disk / network layer —
 # which Grafana can't see because the app itself might be down.
 #
@@ -15,7 +15,7 @@
 # ---------------------------------------------------------------------------
 
 resource "aws_cloudwatch_metric_alarm" "instance_status_check" {
-  alarm_name          = "dlt-${var.environment}-instance-status-failed"
+  alarm_name          = "tv-${var.environment}-instance-status-failed"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 2
   metric_name         = "StatusCheckFailed_Instance"
@@ -27,11 +27,11 @@ resource "aws_cloudwatch_metric_alarm" "instance_status_check" {
   treat_missing_data  = "breaching"
 
   dimensions = {
-    InstanceId = aws_instance.dlt_app.id
+    InstanceId = aws_instance.tv_app.id
   }
 
-  alarm_actions = [aws_sns_topic.dlt_alerts.arn]
-  ok_actions    = [aws_sns_topic.dlt_alerts.arn]
+  alarm_actions = [aws_sns_topic.tv_alerts.arn]
+  ok_actions    = [aws_sns_topic.tv_alerts.arn]
 }
 
 # ---------------------------------------------------------------------------
@@ -39,7 +39,7 @@ resource "aws_cloudwatch_metric_alarm" "instance_status_check" {
 # ---------------------------------------------------------------------------
 
 resource "aws_cloudwatch_metric_alarm" "system_status_check" {
-  alarm_name          = "dlt-${var.environment}-system-status-failed"
+  alarm_name          = "tv-${var.environment}-system-status-failed"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 2
   metric_name         = "StatusCheckFailed_System"
@@ -51,10 +51,10 @@ resource "aws_cloudwatch_metric_alarm" "system_status_check" {
   treat_missing_data  = "breaching"
 
   dimensions = {
-    InstanceId = aws_instance.dlt_app.id
+    InstanceId = aws_instance.tv_app.id
   }
 
-  alarm_actions = [aws_sns_topic.dlt_alerts.arn]
+  alarm_actions = [aws_sns_topic.tv_alerts.arn]
 }
 
 # ---------------------------------------------------------------------------
@@ -63,7 +63,7 @@ resource "aws_cloudwatch_metric_alarm" "system_status_check" {
 # ---------------------------------------------------------------------------
 
 resource "aws_cloudwatch_metric_alarm" "high_cpu" {
-  alarm_name          = "dlt-${var.environment}-cpu-high-5min"
+  alarm_name          = "tv-${var.environment}-cpu-high-5min"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 5
   metric_name         = "CPUUtilization"
@@ -75,11 +75,11 @@ resource "aws_cloudwatch_metric_alarm" "high_cpu" {
   treat_missing_data  = "notBreaching"
 
   dimensions = {
-    InstanceId = aws_instance.dlt_app.id
+    InstanceId = aws_instance.tv_app.id
   }
 
-  alarm_actions = [aws_sns_topic.dlt_alerts.arn]
-  ok_actions    = [aws_sns_topic.dlt_alerts.arn]
+  alarm_actions = [aws_sns_topic.tv_alerts.arn]
+  ok_actions    = [aws_sns_topic.tv_alerts.arn]
 }
 
 # ---------------------------------------------------------------------------
@@ -88,7 +88,7 @@ resource "aws_cloudwatch_metric_alarm" "high_cpu" {
 # ---------------------------------------------------------------------------
 
 resource "aws_cloudwatch_metric_alarm" "ebs_write_latency" {
-  alarm_name          = "dlt-${var.environment}-ebs-write-latency-high"
+  alarm_name          = "tv-${var.environment}-ebs-write-latency-high"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 3
   metric_name         = "VolumeTotalWriteTime"
@@ -100,10 +100,10 @@ resource "aws_cloudwatch_metric_alarm" "ebs_write_latency" {
   treat_missing_data  = "notBreaching"
 
   dimensions = {
-    VolumeId = aws_instance.dlt_app.root_block_device[0].volume_id
+    VolumeId = aws_instance.tv_app.root_block_device[0].volume_id
   }
 
-  alarm_actions = [aws_sns_topic.dlt_alerts.arn]
+  alarm_actions = [aws_sns_topic.tv_alerts.arn]
 }
 
 # ---------------------------------------------------------------------------
@@ -112,7 +112,7 @@ resource "aws_cloudwatch_metric_alarm" "ebs_write_latency" {
 # ---------------------------------------------------------------------------
 
 resource "aws_cloudwatch_metric_alarm" "network_out_high" {
-  alarm_name          = "dlt-${var.environment}-network-out-runaway"
+  alarm_name          = "tv-${var.environment}-network-out-runaway"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 5
   metric_name         = "NetworkOut"
@@ -124,10 +124,10 @@ resource "aws_cloudwatch_metric_alarm" "network_out_high" {
   treat_missing_data  = "notBreaching"
 
   dimensions = {
-    InstanceId = aws_instance.dlt_app.id
+    InstanceId = aws_instance.tv_app.id
   }
 
-  alarm_actions = [aws_sns_topic.dlt_alerts.arn]
+  alarm_actions = [aws_sns_topic.tv_alerts.arn]
 }
 
 # ---------------------------------------------------------------------------
@@ -135,7 +135,7 @@ resource "aws_cloudwatch_metric_alarm" "network_out_high" {
 # ---------------------------------------------------------------------------
 
 output "cloudwatch_alarms" {
-  description = "Names of the 5 CloudWatch alarms. All publish to dlt-alerts SNS."
+  description = "Names of the 5 CloudWatch alarms. All publish to tv-alerts SNS."
   value = [
     aws_cloudwatch_metric_alarm.instance_status_check.alarm_name,
     aws_cloudwatch_metric_alarm.system_status_check.alarm_name,

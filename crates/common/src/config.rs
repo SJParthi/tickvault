@@ -347,7 +347,7 @@ pub struct ValkeyConfig {
     /// Maximum connections in the connection pool.
     pub max_connections: u32,
     /// Authentication password (matches `--requirepass` in Valkey server config).
-    /// Empty string = no auth (NOT recommended). Default: "dlt-dev-only".
+    /// Empty string = no auth (NOT recommended). Default: "tv-dev-only".
     #[serde(default = "default_valkey_password")]
     pub password: String,
 }
@@ -455,7 +455,7 @@ pub struct NotificationConfig {
     /// HTTP send timeout in milliseconds for notification POSTs.
     pub send_timeout_ms: u64,
     /// Enable SMS alerts via AWS SNS for Critical/High severity events.
-    /// Phone number is fetched from SSM at `/dlt/{env}/sns/phone-number`.
+    /// Phone number is fetched from SSM at `/tickvault/{env}/sns/phone-number`.
     pub sns_enabled: bool,
 }
 
@@ -479,7 +479,7 @@ impl Default for NotificationConfig {
 pub struct ObservabilityConfig {
     /// Port for the Prometheus metrics HTTP endpoint served by the application.
     pub metrics_port: u16,
-    /// OTLP gRPC endpoint for trace export (e.g., dlt-jaeger:4317).
+    /// OTLP gRPC endpoint for trace export (e.g., tv-jaeger:4317).
     pub otlp_endpoint: String,
     /// Enable Prometheus metrics export.
     pub metrics_enabled: bool,
@@ -491,7 +491,7 @@ impl Default for ObservabilityConfig {
     fn default() -> Self {
         Self {
             metrics_port: 9091,
-            otlp_endpoint: "http://dlt-jaeger:4317".to_string(), // APPROVED: Docker DNS hostname for OTLP collector
+            otlp_endpoint: "http://tv-jaeger:4317".to_string(), // APPROVED: Docker DNS hostname for OTLP collector
             metrics_enabled: true,
             tracing_enabled: true,
         }
@@ -969,7 +969,7 @@ impl ApplicationConfig {
                 None => bail!("LIVE_TRADING_EARLIEST_DATE constants are invalid"),
             };
             if today < earliest {
-                // E1 (deferred): a `dlt_sandbox_gate_blocks_total` counter
+                // E1 (deferred): a `tv_sandbox_gate_blocks_total` counter
                 // would require pulling the `metrics` crate into common,
                 // which is currently framework-free. The bail!() already
                 // fires an ERROR log via anyhow chain at the boot caller,
@@ -1186,19 +1186,19 @@ mod tests {
                 connection_stagger_ms: 10000,
             },
             questdb: QuestDbConfig {
-                host: "dlt-questdb".to_string(),
+                host: "tv-questdb".to_string(),
                 http_port: 9000,
                 pg_port: 8812,
                 ilp_port: 9009,
             },
             valkey: ValkeyConfig {
-                host: "dlt-valkey".to_string(),
+                host: "tv-valkey".to_string(),
                 port: 6379,
                 max_connections: 16,
                 password: String::new(),
             },
             prometheus: PrometheusConfig {
-                host: "dlt-prometheus".to_string(),
+                host: "tv-prometheus".to_string(),
                 port: 9090,
             },
             network: NetworkConfig {
@@ -1222,7 +1222,7 @@ mod tests {
             },
             instrument: InstrumentConfig {
                 daily_download_time: "08:55:00".to_string(),
-                csv_cache_directory: "/tmp/dlt-cache".to_string(),
+                csv_cache_directory: "/tmp/tv-cache".to_string(),
                 csv_cache_filename: "instruments.csv".to_string(),
                 csv_download_timeout_secs: 120,
                 build_window_start: "08:25:00".to_string(),
@@ -2044,13 +2044,13 @@ mod tests {
     #[test]
     fn test_build_ilp_conf_string_tcp_only() {
         let config = QuestDbConfig {
-            host: "dlt-questdb".to_string(),
+            host: "tv-questdb".to_string(),
             http_port: 9000,
             pg_port: 8812,
             ilp_port: 9009,
         };
         let conf = config.build_ilp_conf_string();
-        assert_eq!(conf, "tcp::addr=dlt-questdb:9009;");
+        assert_eq!(conf, "tcp::addr=tv-questdb:9009;");
         // TCP mode does NOT support retry_timeout, init_buf_size, request_timeout
         // (those are HTTP-only in questdb-rs 6.1.0)
         assert!(!conf.contains("retry_timeout"));

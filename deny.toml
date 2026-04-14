@@ -1,5 +1,5 @@
 # =============================================================================
-# dhan-live-trader — cargo-deny Configuration
+# tickvault — cargo-deny Configuration
 # =============================================================================
 # Checks dependencies for: security advisories, banned licenses,
 # banned crates, and duplicate versions.

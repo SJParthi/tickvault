@@ -1,4 +1,4 @@
-# Functional Flow — dhan-live-trader
+# Functional Flow — tickvault
 
 > **Audience:** Anyone. No code knowledge needed.
 > **Think of this as:** "What does this system DO?" — explained like a YouTube video.
@@ -268,4 +268,4 @@ No manual intervention needed during market hours. If something goes wrong, it s
 
 ## One Sentence Summary
 
-> **dhan-live-trader watches 1,500+ stock options in real-time, runs math on every price change, executes trades when conditions are met, and protects your money with multiple safety layers — all automatically, all day, every trading day.**
+> **tickvault watches 1,500+ stock options in real-time, runs math on every price change, executes trades when conditions are met, and protects your money with multiple safety layers — all automatically, all day, every trading day.**

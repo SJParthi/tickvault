@@ -10,7 +10,7 @@
 #
 # How it works:
 #   1. GitHub's OIDC provider issues a short-lived JWT for every workflow run
-#   2. The JWT contains claims like `repo:SJParthi/dhan-live-trader:ref:...`
+#   2. The JWT contains claims like `repo:SJParthi/tickvault:ref:...`
 #   3. This role's trust policy says "assume me ONLY if the claim matches
 #      our repo + the workflow is deploy-aws.yml"
 #   4. The workflow uses aws-actions/configure-aws-credentials@v4 to swap
@@ -23,9 +23,9 @@
 #   - Only on the main branch or v*.*.* tags (ref match)
 
 variable "github_repo_full_name" {
-  description = "GitHub repo full name, e.g. SJParthi/dhan-live-trader"
+  description = "GitHub repo full name, e.g. SJParthi/tickvault"
   type        = string
-  default     = "SJParthi/dhan-live-trader"
+  default     = "SJParthi/tickvault"
 }
 
 # ---------------------------------------------------------------------------
@@ -52,7 +52,7 @@ data "aws_iam_openid_connect_provider" "github" {
 # ---------------------------------------------------------------------------
 
 resource "aws_iam_role" "github_deploy" {
-  name = "dlt-${var.environment}-github-deploy"
+  name = "tv-${var.environment}-github-deploy"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -87,7 +87,7 @@ resource "aws_iam_role" "github_deploy" {
 # ---------------------------------------------------------------------------
 
 resource "aws_iam_role_policy" "github_deploy" {
-  name = "dlt-${var.environment}-github-deploy-policy"
+  name = "tv-${var.environment}-github-deploy-policy"
   role = aws_iam_role.github_deploy.id
 
   policy = jsonencode({
@@ -102,7 +102,7 @@ resource "aws_iam_role_policy" "github_deploy" {
           "ssm:StartSession",
         ]
         Resource = [
-          aws_instance.dlt_app.arn,
+          aws_instance.tv_app.arn,
           "arn:aws:ssm:${var.aws_region}::document/AWS-RunShellScript",
           "arn:aws:ssm:${var.aws_region}:*:session/*"
         ]
@@ -116,8 +116,8 @@ resource "aws_iam_role_policy" "github_deploy" {
           "s3:ListBucket",
         ]
         Resource = [
-          aws_s3_bucket.dlt_cold.arn,
-          "${aws_s3_bucket.dlt_cold.arn}/deploys/*"
+          aws_s3_bucket.tv_cold.arn,
+          "${aws_s3_bucket.tv_cold.arn}/deploys/*"
         ]
       },
       {
@@ -126,7 +126,7 @@ resource "aws_iam_role_policy" "github_deploy" {
         Action = [
           "sns:Publish",
         ]
-        Resource = aws_sns_topic.dlt_alerts.arn
+        Resource = aws_sns_topic.tv_alerts.arn
       },
       {
         # EC2 describe — read-only, used by the workflow to fetch
@@ -159,7 +159,7 @@ output "github_oidc_setup_instructions" {
     3. Create 3 secrets:
        AWS_ROLE_ARN    = ${aws_iam_role.github_deploy.arn}
        AWS_ACCOUNT_ID  = <run 'aws sts get-caller-identity --query Account --output text'>
-       EC2_INSTANCE_ID = ${aws_instance.dlt_app.id}
+       EC2_INSTANCE_ID = ${aws_instance.tv_app.id}
     4. Open 'Variables' tab, create:
        AWS_REGION      = ${var.aws_region}
   EOT

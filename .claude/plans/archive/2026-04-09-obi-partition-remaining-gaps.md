@@ -41,7 +41,7 @@ Previous session completed 9 commits fixing:
   - Files: `crates/app/src/main.rs` (depth frame consumer)
   - On every 20-level depth snapshot (both bid+ask received), compute OBI
   - Persist to `obi_snapshots` table via ObiWriter
-  - Add Prometheus metric: `dlt_obi_value` gauge per underlying
+  - Add Prometheus metric: `tv_obi_value` gauge per underlying
   - Bid/ask accumulation via HashMap<u32, levels> per connection
 
 - [x] 4. Grafana OBI dashboard

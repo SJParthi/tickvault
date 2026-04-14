@@ -15,7 +15,7 @@
                     BOOT SEQUENCE
                     =============
 
-AWS SSM (/dlt/<env>/network/static-ip)
+AWS SSM (/tickvault/<env>/network/static-ip)
     │
     ▼
 fetch_expected_ip_from_ssm()
@@ -170,7 +170,7 @@ PUBLIC_IP_CHECK_TIMEOUT_SECS = 10
 PUBLIC_IP_CHECK_MAX_RETRIES = 3
 ```
 
-SSM path: `/dlt/{env}/network/static-ip`
+SSM path: `/tickvault/{env}/network/static-ip`
 
 ---
 
@@ -262,7 +262,7 @@ PUBLIC_IP_CHECK_MAX_RETRIES = 3
 
 SSM path constructed from environment:
 ```
-/dlt/{ENVIRONMENT}/network/static-ip
+/tickvault/{ENVIRONMENT}/network/static-ip
 ```
 
 ---

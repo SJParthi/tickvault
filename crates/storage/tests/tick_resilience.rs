@@ -5,10 +5,10 @@
 //!
 //! Plan item: E2 (tick persistence cold-start resilience).
 
-use dhan_live_trader_common::config::QuestDbConfig;
-use dhan_live_trader_common::constants::TICK_BUFFER_CAPACITY;
-use dhan_live_trader_common::tick_types::ParsedTick;
-use dhan_live_trader_storage::tick_persistence::{DepthPersistenceWriter, TickPersistenceWriter};
+use tickvault_common::config::QuestDbConfig;
+use tickvault_common::constants::TICK_BUFFER_CAPACITY;
+use tickvault_common::tick_types::ParsedTick;
+use tickvault_storage::tick_persistence::{DepthPersistenceWriter, TickPersistenceWriter};
 
 /// Returns a `QuestDbConfig` pointing at a non-existent port so that all
 /// ILP connection attempts fail immediately without network delay.
@@ -291,7 +291,7 @@ fn test_prolonged_outage_ring_plus_spill_zero_loss() {
     // tick_resilience in parallel mode could observe `ticks_spilled_total == 499`
     // instead of 500 because another parallel test wrote to the same file.
     let tmp_dir =
-        std::env::temp_dir().join(format!("dlt-tick-prolonged-outage-{}", std::process::id()));
+        std::env::temp_dir().join(format!("tv-tick-prolonged-outage-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp_dir);
     std::fs::create_dir_all(&tmp_dir).unwrap();
     writer.set_spill_dir_for_test(tmp_dir.clone());

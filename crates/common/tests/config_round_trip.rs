@@ -6,8 +6,8 @@
 //! - Default value correctness for optional config sections
 
 use chrono::NaiveDate;
-use dhan_live_trader_common::config::{ApplicationConfig, NseHolidayEntry, TradingConfig};
-use dhan_live_trader_common::trading_calendar::TradingCalendar;
+use tickvault_common::config::{ApplicationConfig, NseHolidayEntry, TradingConfig};
+use tickvault_common::trading_calendar::TradingCalendar;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -80,18 +80,18 @@ max_instruments_per_connection = 5000
 max_websocket_connections = 5
 
 [questdb]
-host = "dlt-questdb"
+host = "tv-questdb"
 http_port = 9000
 pg_port = 8812
 ilp_port = 9009
 
 [valkey]
-host = "dlt-valkey"
+host = "tv-valkey"
 port = 6379
 max_connections = 16
 
 [prometheus]
-host = "dlt-prometheus"
+host = "tv-prometheus"
 port = 9090
 
 [websocket]
@@ -365,7 +365,7 @@ fn test_config_default_values() {
 #[test]
 fn test_strategy_dry_run_defaults_true() {
     // Critical safety check: dry_run must default to true.
-    let strategy = dhan_live_trader_common::config::StrategyConfig::default();
+    let strategy = tickvault_common::config::StrategyConfig::default();
     assert!(strategy.dry_run, "dry_run must default to true for safety");
 }
 

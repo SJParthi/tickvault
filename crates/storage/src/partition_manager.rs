@@ -17,7 +17,7 @@ use anyhow::{Context, Result};
 use reqwest::Client;
 use tracing::{debug, info, warn};
 
-use dhan_live_trader_common::config::QuestDbConfig;
+use tickvault_common::config::QuestDbConfig;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -367,7 +367,7 @@ mod tests {
 
     #[test]
     fn test_default_retention_config() {
-        use dhan_live_trader_common::config::PartitionRetentionConfig;
+        use tickvault_common::config::PartitionRetentionConfig;
         let config = PartitionRetentionConfig::default();
         assert_eq!(config.retention_days, 90);
     }

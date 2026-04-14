@@ -6,7 +6,7 @@
 use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 
-use dhan_live_trader_common::order_types::{
+use tickvault_common::order_types::{
     OrderStatus, OrderType, OrderValidity, ProductType, TransactionType,
 };
 

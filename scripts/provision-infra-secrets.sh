@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# dhan-live-trader — Infrastructure Secret Provisioner
+# tickvault — Infrastructure Secret Provisioner
 # =============================================================================
 # Auto-creates QuestDB and Grafana credentials in AWS SSM if they don't exist.
 # Generates cryptographically random passwords. Idempotent — safe to re-run.
@@ -81,7 +81,7 @@ provision_secret() {
         --name "${ssm_path}" \
         --type "SecureString" \
         --value "${value}" \
-        --description "${description} (auto-provisioned by dhan-live-trader)" \
+        --description "${description} (auto-provisioned by tickvault)" \
         --no-cli-pager > /dev/null 2>&1; then
         echo -e "${GREEN}CREATED${NC}" >&2
         CREATED=$((CREATED + 1))
@@ -93,13 +93,13 @@ provision_secret() {
 
 # ---- QuestDB PG wire credentials ----
 QUESTDB_PASSWORD=$(generate_password)
-provision_secret "/dlt/${ENVIRONMENT}/questdb/pg-user" "QuestDB PG User" "admin"
-provision_secret "/dlt/${ENVIRONMENT}/questdb/pg-password" "QuestDB PG Password" "${QUESTDB_PASSWORD}"
+provision_secret "/tickvault/${ENVIRONMENT}/questdb/pg-user" "QuestDB PG User" "admin"
+provision_secret "/tickvault/${ENVIRONMENT}/questdb/pg-password" "QuestDB PG Password" "${QUESTDB_PASSWORD}"
 
 # ---- Grafana admin credentials ----
 GRAFANA_PASSWORD=$(generate_password)
-provision_secret "/dlt/${ENVIRONMENT}/grafana/admin-user" "Grafana Admin User" "admin"
-provision_secret "/dlt/${ENVIRONMENT}/grafana/admin-password" "Grafana Admin Password" "${GRAFANA_PASSWORD}"
+provision_secret "/tickvault/${ENVIRONMENT}/grafana/admin-user" "Grafana Admin User" "admin"
+provision_secret "/tickvault/${ENVIRONMENT}/grafana/admin-password" "Grafana Admin Password" "${GRAFANA_PASSWORD}"
 
 # ---- Summary ----
 echo "" >&2

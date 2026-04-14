@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# dhan-live-trader — End-to-End Smoke Test
+# tickvault — End-to-End Smoke Test
 # =============================================================================
 # Tests the FULL boot sequence on any day (including weekends/holidays).
 # Launches Docker Desktop if needed, starts infrastructure, boots the binary,
@@ -44,12 +44,12 @@ set -uo pipefail
 # Configuration
 # -------------------------------------------------------------------------
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-BINARY="${PROJECT_DIR}/target/release/dhan-live-trader"
+BINARY="${PROJECT_DIR}/target/release/tickvault"
 API_PORT=3001
 BOOT_TIMEOUT=120  # seconds to wait for binary boot
 API_POLL_INTERVAL=2
 DOCKER_TIMEOUT=120
-LOG_FILE="/tmp/dlt-smoke-test-$(date +%Y%m%d-%H%M%S).log"
+LOG_FILE="/tmp/tv-smoke-test-$(date +%Y%m%d-%H%M%S).log"
 
 # Flags
 SKIP_BUILD=false
@@ -114,7 +114,7 @@ trap cleanup EXIT
 # -------------------------------------------------------------------------
 echo ""
 echo -e "${CYAN}${BOLD}╔══════════════════════════════════════════════════════════╗${NC}"
-echo -e "${CYAN}${BOLD}║   dhan-live-trader — End-to-End Smoke Test              ║${NC}"
+echo -e "${CYAN}${BOLD}║   tickvault — End-to-End Smoke Test              ║${NC}"
 echo -e "${CYAN}${BOLD}╚══════════════════════════════════════════════════════════╝${NC}"
 echo ""
 echo -e "  Date:     $(date '+%Y-%m-%d %H:%M:%S %Z')"
@@ -246,13 +246,13 @@ SSM_ARGS="--region ap-south-1 --with-decryption --output text --query Parameter.
 # If SSM fetch fails, docker compose will use empty values and containers
 # will start with defaults (acceptable for smoke test only).
 fetch_ssm_secret() { aws ssm get-parameter --name "$1" ${SSM_ARGS} 2>/dev/null || echo ""; }
-export DLT_QUESTDB_PG_USER=$(fetch_ssm_secret "/dlt/dev/questdb/pg-user")
-export DLT_QUESTDB_PG_PASSWORD=$(fetch_ssm_secret "/dlt/dev/questdb/pg-password")
-export DLT_GRAFANA_ADMIN_USER=$(fetch_ssm_secret "/dlt/dev/grafana/admin-user")
-export DLT_GRAFANA_ADMIN_PASSWORD=$(fetch_ssm_secret "/dlt/dev/grafana/admin-password")
-export DLT_TELEGRAM_BOT_TOKEN=$(fetch_ssm_secret "/dlt/dev/telegram/bot-token")
-export DLT_TELEGRAM_CHAT_ID=$(fetch_ssm_secret "/dlt/dev/telegram/chat-id")
-export DLT_VALKEY_PASSWORD=$(fetch_ssm_secret "/dlt/dev/valkey/password")
+export TV_QUESTDB_PG_USER=$(fetch_ssm_secret "/tickvault/dev/questdb/pg-user")
+export TV_QUESTDB_PG_PASSWORD=$(fetch_ssm_secret "/tickvault/dev/questdb/pg-password")
+export TV_GRAFANA_ADMIN_USER=$(fetch_ssm_secret "/tickvault/dev/grafana/admin-user")
+export TV_GRAFANA_ADMIN_PASSWORD=$(fetch_ssm_secret "/tickvault/dev/grafana/admin-password")
+export TV_TELEGRAM_BOT_TOKEN=$(fetch_ssm_secret "/tickvault/dev/telegram/bot-token")
+export TV_TELEGRAM_CHAT_ID=$(fetch_ssm_secret "/tickvault/dev/telegram/chat-id")
+export TV_VALKEY_PASSWORD=$(fetch_ssm_secret "/tickvault/dev/valkey/password")
 
 echo -e "  Starting Docker Compose infrastructure..."
 if docker compose -f "${PROJECT_DIR}/deploy/docker/docker-compose.yml" up -d 2>&1 | tail -15; then
@@ -310,7 +310,7 @@ else
 fi
 
 # 3f. Container exit code check
-for container in dlt-questdb dlt-valkey; do
+for container in tv-questdb tv-valkey; do
     STATUS=$(docker inspect --format='{{.State.Running}} {{.State.ExitCode}}' "$container" 2>/dev/null || echo "false -1")
     IS_RUNNING=$(echo "$STATUS" | awk '{print $1}')
     EXIT_CODE=$(echo "$STATUS" | awk '{print $2}')
@@ -391,7 +391,7 @@ if [ -f "$LOG_FILE" ]; then
     fi
 
     # Check for config loaded
-    if grep -q "dhan-live-trader starting" "$LOG_FILE" 2>/dev/null; then
+    if grep -q "tickvault starting" "$LOG_FILE" 2>/dev/null; then
         check_pass "config loaded successfully"
     else
         check_warn "startup log message not found"
@@ -447,11 +447,11 @@ if [ "$API_READY" = "true" ]; then
 fi
 
 # 5b. Test Telegram notification
-if [ -n "${DLT_TELEGRAM_BOT_TOKEN}" ] && [ -n "${DLT_TELEGRAM_CHAT_ID}" ]; then
+if [ -n "${TV_TELEGRAM_BOT_TOKEN}" ] && [ -n "${TV_TELEGRAM_CHAT_ID}" ]; then
     echo -e "  Sending test Telegram notification..."
-    TELEGRAM_RESPONSE=$(curl -sf -X POST "https://api.telegram.org/bot${DLT_TELEGRAM_BOT_TOKEN}/sendMessage" \
-        -d "chat_id=${DLT_TELEGRAM_CHAT_ID}" \
-        -d "text=SMOKE TEST: dhan-live-trader boot successful ($(date '+%Y-%m-%d %H:%M:%S') - $(uname -n))" \
+    TELEGRAM_RESPONSE=$(curl -sf -X POST "https://api.telegram.org/bot${TV_TELEGRAM_BOT_TOKEN}/sendMessage" \
+        -d "chat_id=${TV_TELEGRAM_CHAT_ID}" \
+        -d "text=SMOKE TEST: tickvault boot successful ($(date '+%Y-%m-%d %H:%M:%S') - $(uname -n))" \
         -d "parse_mode=HTML" \
         --max-time 10 2>/dev/null || echo "")
 
@@ -466,8 +466,8 @@ fi
 
 # 5c. Verify stack (if services are running)
 if docker info > /dev/null 2>&1; then
-    RUNNING_COUNT=$(docker ps --format '{{.Names}}' 2>/dev/null | grep -c "^dlt-" || echo "0")
-    check_pass "${RUNNING_COUNT} dlt-* containers running"
+    RUNNING_COUNT=$(docker ps --format '{{.Names}}' 2>/dev/null | grep -c "^tv-" || echo "0")
+    check_pass "${RUNNING_COUNT} tv-* containers running"
 fi
 
 echo ""

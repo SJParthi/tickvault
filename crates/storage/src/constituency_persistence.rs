@@ -13,9 +13,9 @@ use questdb::ingress::{Sender, TimestampNanos};
 use reqwest::Client;
 use tracing::{info, warn};
 
-use dhan_live_trader_common::config::QuestDbConfig;
-use dhan_live_trader_common::constants::QUESTDB_TABLE_INDEX_CONSTITUENTS;
-use dhan_live_trader_common::instrument_types::{FnoUniverse, IndexConstituencyMap};
+use tickvault_common::config::QuestDbConfig;
+use tickvault_common::constants::QUESTDB_TABLE_INDEX_CONSTITUENTS;
+use tickvault_common::instrument_types::{FnoUniverse, IndexConstituencyMap};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -326,8 +326,8 @@ mod tests {
 
     #[test]
     fn test_build_questdb_exec_url_docker() {
-        let url = build_questdb_exec_url("dlt-questdb", 9000);
-        assert_eq!(url, "http://dlt-questdb:9000/exec");
+        let url = build_questdb_exec_url("tv-questdb", 9000);
+        assert_eq!(url, "http://tv-questdb:9000/exec");
     }
 
     #[test]
@@ -371,8 +371,8 @@ mod tests {
 
     #[test]
     fn test_build_ilp_conf_string_docker() {
-        let conf = build_ilp_conf_string("dlt-questdb", 9009);
-        assert_eq!(conf, "tcp::addr=dlt-questdb:9009;");
+        let conf = build_ilp_conf_string("tv-questdb", 9009);
+        assert_eq!(conf, "tcp::addr=tv-questdb:9009;");
     }
 
     #[test]
@@ -412,10 +412,8 @@ mod tests {
 
     #[test]
     fn test_count_total_constituents_with_data() {
-        use dhan_live_trader_common::instrument_types::{
-            ConstituencyBuildMetadata, IndexConstituent,
-        };
         use std::collections::HashMap;
+        use tickvault_common::instrument_types::{ConstituencyBuildMetadata, IndexConstituent};
 
         let today = chrono::Utc::now().date_naive();
         let mut index_to_constituents = HashMap::new();
@@ -548,10 +546,10 @@ mod tests {
 
     #[test]
     fn test_persist_inner_enriches_with_security_id() {
-        use dhan_live_trader_common::instrument_types::{
+        use tickvault_common::instrument_types::{
             FnoUnderlying, FnoUniverse, UnderlyingKind, UniverseBuildMetadata,
         };
-        use dhan_live_trader_common::types::ExchangeSegment;
+        use tickvault_common::types::ExchangeSegment;
 
         let mut underlyings = std::collections::HashMap::new();
         underlyings.insert(
@@ -792,10 +790,8 @@ mod tests {
 
     #[test]
     fn test_persist_constituency_inner_with_data() {
-        use dhan_live_trader_common::instrument_types::{
-            ConstituencyBuildMetadata, IndexConstituent,
-        };
         use std::collections::HashMap;
+        use tickvault_common::instrument_types::{ConstituencyBuildMetadata, IndexConstituent};
 
         let port = spawn_tcp_drain_server();
         let config = QuestDbConfig {
@@ -945,7 +941,7 @@ mod tests {
 
     #[test]
     fn test_count_total_constituents_empty_map() {
-        use dhan_live_trader_common::instrument_types::ConstituencyBuildMetadata;
+        use tickvault_common::instrument_types::ConstituencyBuildMetadata;
         let map = IndexConstituencyMap {
             index_to_constituents: std::collections::HashMap::new(),
             stock_to_indices: std::collections::HashMap::new(),
@@ -956,9 +952,7 @@ mod tests {
 
     #[test]
     fn test_count_total_constituents_single_index() {
-        use dhan_live_trader_common::instrument_types::{
-            ConstituencyBuildMetadata, IndexConstituent,
-        };
+        use tickvault_common::instrument_types::{ConstituencyBuildMetadata, IndexConstituent};
         let today = chrono::Utc::now().date_naive();
         let mut index_map = std::collections::HashMap::new();
         index_map.insert(
@@ -992,9 +986,7 @@ mod tests {
 
     #[test]
     fn test_count_total_constituents_multiple_indices() {
-        use dhan_live_trader_common::instrument_types::{
-            ConstituencyBuildMetadata, IndexConstituent,
-        };
+        use tickvault_common::instrument_types::{ConstituencyBuildMetadata, IndexConstituent};
         let today = chrono::Utc::now().date_naive();
         let mut index_map = std::collections::HashMap::new();
         index_map.insert(

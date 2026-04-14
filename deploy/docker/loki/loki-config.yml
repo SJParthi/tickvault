@@ -1,5 +1,5 @@
 # =============================================================================
-# dhan-live-trader — Loki Configuration (single-node, dev mode)
+# tickvault — Loki Configuration (single-node, dev mode)
 # =============================================================================
 
 auth_enabled: false

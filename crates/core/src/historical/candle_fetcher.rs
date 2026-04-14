@@ -26,20 +26,18 @@ use secrecy::{ExposeSecret, SecretString};
 use tracing::{debug, error, info, warn};
 use zeroize::Zeroizing;
 
-use dhan_live_trader_common::config::{DhanConfig, HistoricalDataConfig};
-use dhan_live_trader_common::constants::{
+use tickvault_common::config::{DhanConfig, HistoricalDataConfig};
+use tickvault_common::constants::{
     DHAN_CHARTS_HISTORICAL_PATH, DHAN_CHARTS_INTRADAY_PATH, INTRADAY_TIMEFRAMES,
     IST_UTC_OFFSET_SECONDS_I64, MARKET_CLOSE_TIME_IST_EXCLUSIVE, MARKET_OPEN_TIME_IST,
     TICK_PERSIST_END_SECS_OF_DAY_IST, TIMEFRAME_1D,
 };
-use dhan_live_trader_common::instrument_registry::{InstrumentRegistry, SubscriptionCategory};
-use dhan_live_trader_common::instrument_types::ExpiryCode;
-use dhan_live_trader_common::tick_types::{
-    DhanDailyResponse, DhanIntradayResponse, HistoricalCandle,
-};
-use dhan_live_trader_common::trading_calendar::ist_offset;
+use tickvault_common::instrument_registry::{InstrumentRegistry, SubscriptionCategory};
+use tickvault_common::instrument_types::ExpiryCode;
+use tickvault_common::tick_types::{DhanDailyResponse, DhanIntradayResponse, HistoricalCandle};
+use tickvault_common::trading_calendar::ist_offset;
 
-use dhan_live_trader_storage::candle_persistence::CandlePersistenceWriter;
+use tickvault_storage::candle_persistence::CandlePersistenceWriter;
 
 use crate::auth::types::TokenState;
 
@@ -607,8 +605,8 @@ pub async fn fetch_historical_candles(
     client_id: &SecretString,
     candle_writer: &mut CandlePersistenceWriter,
 ) -> CandleFetchSummary {
-    let m_fetched = counter!("dlt_historical_candles_fetched_total");
-    let m_api_errors = counter!("dlt_historical_api_errors_total");
+    let m_fetched = counter!("tv_historical_candles_fetched_total");
+    let m_api_errors = counter!("tv_historical_api_errors_total");
 
     let now_ist = Utc::now().with_timezone(&ist_offset());
     let today = now_ist.date_naive();
@@ -709,7 +707,7 @@ pub async fn fetch_historical_candles(
 
     // Track which target indices still need fetching
     let mut pending_indices: Vec<usize> = (0..targets.len()).collect();
-    let m_token_expired = counter!("dlt_historical_token_expired_total");
+    let m_token_expired = counter!("tv_historical_token_expired_total");
 
     // Per-instrument token-expired retry count
     let mut token_expired_counts: Vec<usize> = vec![0; targets.len()];
@@ -1867,7 +1865,7 @@ mod tests {
     /// and is NOT skipped by the category filter.
     #[test]
     fn test_display_index_maps_to_index_type() {
-        use dhan_live_trader_common::instrument_registry::SubscriptionCategory;
+        use tickvault_common::instrument_registry::SubscriptionCategory;
 
         let categories_that_fetch = [
             SubscriptionCategory::MajorIndexValue,

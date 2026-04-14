@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use tokio::fs;
 use tracing::info;
 
-use dhan_live_trader_common::instrument_types::IndexConstituencyMap;
+use tickvault_common::instrument_types::IndexConstituencyMap;
 
 /// Save constituency map to a JSON cache file.
 ///
@@ -88,7 +88,7 @@ mod tests {
     /// Create a unique temp directory for each test.
     fn test_cache_dir(test_name: &str) -> String {
         let dir = format!(
-            "/tmp/dlt-test-constituency-{}-{}",
+            "/tmp/tv-test-constituency-{}-{}",
             test_name,
             std::process::id()
         );
@@ -103,16 +103,14 @@ mod tests {
         let mut map = IndexConstituencyMap::default();
         map.index_to_constituents.insert(
             "Nifty 50".to_string(),
-            vec![
-                dhan_live_trader_common::instrument_types::IndexConstituent {
-                    index_name: "Nifty 50".to_string(),
-                    symbol: "RELIANCE".to_string(),
-                    isin: "INE002A01018".to_string(),
-                    weight: 10.0,
-                    sector: "Energy".to_string(),
-                    last_updated: chrono::NaiveDate::from_ymd_opt(2026, 3, 15).unwrap(),
-                },
-            ],
+            vec![tickvault_common::instrument_types::IndexConstituent {
+                index_name: "Nifty 50".to_string(),
+                symbol: "RELIANCE".to_string(),
+                isin: "INE002A01018".to_string(),
+                weight: 10.0,
+                sector: "Energy".to_string(),
+                last_updated: chrono::NaiveDate::from_ymd_opt(2026, 3, 15).unwrap(),
+            }],
         );
         map.stock_to_indices
             .insert("RELIANCE".to_string(), vec!["Nifty 50".to_string()]);
@@ -159,8 +157,8 @@ mod tests {
 
     #[test]
     fn test_cache_path_construction() {
-        let path = cache_path("/tmp/dlt-cache", "constituency.json");
-        assert_eq!(path, PathBuf::from("/tmp/dlt-cache/constituency.json"));
+        let path = cache_path("/tmp/tv-cache", "constituency.json");
+        assert_eq!(path, PathBuf::from("/tmp/tv-cache/constituency.json"));
     }
 
     #[test]
@@ -225,7 +223,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_save_creates_nested_dir() {
-        let cache_dir = format!("/tmp/dlt-test-nested-{}/sub/dir", std::process::id());
+        let cache_dir = format!("/tmp/tv-test-nested-{}/sub/dir", std::process::id());
         let map = IndexConstituencyMap::default();
         save_constituency_cache(&map, &cache_dir, "test.json")
             .await
@@ -236,6 +234,6 @@ mod tests {
             .unwrap();
         assert_eq!(loaded.index_count(), 0);
 
-        let _ = std::fs::remove_dir_all(format!("/tmp/dlt-test-nested-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(format!("/tmp/tv-test-nested-{}", std::process::id()));
     }
 }

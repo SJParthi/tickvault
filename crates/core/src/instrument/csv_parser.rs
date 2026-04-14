@@ -8,9 +8,9 @@ use anyhow::{Context, Result, bail};
 use chrono::NaiveDate;
 use tracing::{debug, info, warn};
 
-use dhan_live_trader_common::constants::*;
-use dhan_live_trader_common::error::ApplicationError;
-use dhan_live_trader_common::types::{Exchange, OptionType, SecurityId};
+use tickvault_common::constants::*;
+use tickvault_common::error::ApplicationError;
+use tickvault_common::types::{Exchange, OptionType, SecurityId};
 
 // ---------------------------------------------------------------------------
 // Column Indices (auto-detected from header)

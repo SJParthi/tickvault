@@ -4,7 +4,7 @@
 //! Read-only endpoints (health, stats, quote) remain unauthenticated.
 //!
 //! # Token Source
-//! The API bearer token is read from the environment variable `DLT_API_TOKEN`
+//! The API bearer token is read from the environment variable `TV_API_TOKEN`
 //! at startup.
 //!
 //! # Auth Behavior
@@ -77,7 +77,7 @@ impl ApiAuthConfig {
         }
     }
 
-    /// Loads the API token from the `DLT_API_TOKEN` environment variable.
+    /// Loads the API token from the `TV_API_TOKEN` environment variable.
     ///
     /// # Behavior
     /// - Token set and non-empty: auth enabled with that token.
@@ -87,7 +87,7 @@ impl ApiAuthConfig {
     ///   prevents accidentally running live with unprotected mutating endpoints.
     // O(1) EXEMPT: begin — cold path, called once at boot
     pub fn from_env(dry_run: bool) -> Self {
-        match std::env::var("DLT_API_TOKEN") {
+        match std::env::var("TV_API_TOKEN") {
             Ok(token) if !token.is_empty() => {
                 info!("GAP-SEC-01: API bearer token authentication enabled");
                 Self::new(token)
@@ -95,7 +95,7 @@ impl ApiAuthConfig {
             _ => {
                 if dry_run {
                     warn!(
-                        "GAP-SEC-01: DLT_API_TOKEN not set — API authentication disabled (dry-run mode)"
+                        "GAP-SEC-01: TV_API_TOKEN not set — API authentication disabled (dry-run mode)"
                     );
                     Self::disabled()
                 } else {
@@ -105,11 +105,11 @@ impl ApiAuthConfig {
                     // the /api/instruments/rebuild endpoint. Log only the fact
                     // that one was generated.
                     error!(
-                        "GAP-SEC-01 CRITICAL: DLT_API_TOKEN not set in LIVE mode — \
-                         auto-generated bearer token for this session (set DLT_API_TOKEN env var)"
+                        "GAP-SEC-01 CRITICAL: TV_API_TOKEN not set in LIVE mode — \
+                         auto-generated bearer token for this session (set TV_API_TOKEN env var)"
                     );
                     warn!(
-                        "GAP-SEC-01: Set DLT_API_TOKEN environment variable to suppress this warning"
+                        "GAP-SEC-01: Set TV_API_TOKEN environment variable to suppress this warning"
                     );
                     Self::new(generated_token)
                 }
@@ -702,8 +702,8 @@ mod tests {
 
     #[test]
     fn test_from_env_dry_run_no_token_disables_auth() {
-        // Remove DLT_API_TOKEN to simulate unset
-        unsafe { std::env::remove_var("DLT_API_TOKEN") };
+        // Remove TV_API_TOKEN to simulate unset
+        unsafe { std::env::remove_var("TV_API_TOKEN") };
         let config = ApiAuthConfig::from_env(true);
         assert!(!config.enabled, "dry_run + no token = auth disabled");
         assert!(config.bearer_token.is_empty());
@@ -711,8 +711,8 @@ mod tests {
 
     #[test]
     fn test_from_env_live_mode_no_token_generates_token() {
-        // Remove DLT_API_TOKEN to simulate unset
-        unsafe { std::env::remove_var("DLT_API_TOKEN") };
+        // Remove TV_API_TOKEN to simulate unset
+        unsafe { std::env::remove_var("TV_API_TOKEN") };
         let config = ApiAuthConfig::from_env(false);
         assert!(
             config.enabled,
@@ -728,7 +728,7 @@ mod tests {
 
     #[test]
     fn test_from_env_live_mode_no_token_generates_unique_tokens() {
-        unsafe { std::env::remove_var("DLT_API_TOKEN") };
+        unsafe { std::env::remove_var("TV_API_TOKEN") };
         let config1 = ApiAuthConfig::from_env(false);
         let config2 = ApiAuthConfig::from_env(false);
         assert_ne!(
@@ -864,13 +864,13 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // from_env: DLT_API_TOKEN set with a non-empty value
+    // from_env: TV_API_TOKEN set with a non-empty value
     // -------------------------------------------------------------------
 
     #[test]
     fn test_from_env_with_explicit_token_set() {
-        // Set DLT_API_TOKEN so from_env() takes the Ok(token) path
-        unsafe { std::env::set_var("DLT_API_TOKEN", "test-explicit-token-12345") };
+        // Set TV_API_TOKEN so from_env() takes the Ok(token) path
+        unsafe { std::env::set_var("TV_API_TOKEN", "test-explicit-token-12345") };
         let config = ApiAuthConfig::from_env(true);
         assert!(config.enabled);
         assert_eq!(config.bearer_token, "test-explicit-token-12345");
@@ -881,25 +881,25 @@ mod tests {
         assert_eq!(config_live.bearer_token, "test-explicit-token-12345");
 
         // Clean up
-        unsafe { std::env::remove_var("DLT_API_TOKEN") };
+        unsafe { std::env::remove_var("TV_API_TOKEN") };
     }
 
     // -------------------------------------------------------------------
-    // from_env: DLT_API_TOKEN set to empty string
+    // from_env: TV_API_TOKEN set to empty string
     // -------------------------------------------------------------------
 
     #[test]
     fn test_from_env_empty_token_string_dry_run_disables_auth() {
-        unsafe { std::env::set_var("DLT_API_TOKEN", "") };
+        unsafe { std::env::set_var("TV_API_TOKEN", "") };
         let config = ApiAuthConfig::from_env(true);
         assert!(!config.enabled, "empty token + dry_run = disabled");
         assert!(config.bearer_token.is_empty());
-        unsafe { std::env::remove_var("DLT_API_TOKEN") };
+        unsafe { std::env::remove_var("TV_API_TOKEN") };
     }
 
     #[test]
     fn test_from_env_empty_token_string_live_generates_token() {
-        unsafe { std::env::set_var("DLT_API_TOKEN", "") };
+        unsafe { std::env::set_var("TV_API_TOKEN", "") };
         let config = ApiAuthConfig::from_env(false);
         assert!(
             config.enabled,
@@ -911,7 +911,7 @@ mod tests {
             36,
             "generated UUID v4 is 36 chars"
         );
-        unsafe { std::env::remove_var("DLT_API_TOKEN") };
+        unsafe { std::env::remove_var("TV_API_TOKEN") };
     }
 
     // -------------------------------------------------------------------

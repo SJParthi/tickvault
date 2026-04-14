@@ -7,11 +7,11 @@ use std::sync::{Arc, RwLock};
 
 use axum::Json;
 use axum::extract::State;
-use dhan_live_trader_api::handlers::health::{HealthResponse, health_check};
-use dhan_live_trader_api::handlers::stats::{StatsResponse, get_stats};
-use dhan_live_trader_api::handlers::top_movers::{TopMoversResponse, get_top_movers};
-use dhan_live_trader_api::state::{SharedAppState, SystemHealthStatus};
-use dhan_live_trader_common::config::{DhanConfig, InstrumentConfig, QuestDbConfig};
+use tickvault_api::handlers::health::{HealthResponse, health_check};
+use tickvault_api::handlers::stats::{StatsResponse, get_stats};
+use tickvault_api::handlers::top_movers::{TopMoversResponse, get_top_movers};
+use tickvault_api::state::{SharedAppState, SystemHealthStatus};
+use tickvault_common::config::{DhanConfig, InstrumentConfig, QuestDbConfig};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -45,7 +45,7 @@ fn test_dhan_config() -> DhanConfig {
 fn test_instrument_config() -> InstrumentConfig {
     InstrumentConfig {
         daily_download_time: "08:55:00".to_string(),
-        csv_cache_directory: "/tmp/dlt-cache".to_string(),
+        csv_cache_directory: "/tmp/tv-cache".to_string(),
         csv_cache_filename: "instruments.csv".to_string(),
         csv_download_timeout_secs: 120,
         build_window_start: "08:25:00".to_string(),
@@ -53,11 +53,11 @@ fn test_instrument_config() -> InstrumentConfig {
     }
 }
 
-fn empty_snapshot() -> dhan_live_trader_core::pipeline::top_movers::SharedTopMoversSnapshot {
+fn empty_snapshot() -> tickvault_core::pipeline::top_movers::SharedTopMoversSnapshot {
     Arc::new(RwLock::new(None))
 }
 
-fn empty_constituency() -> dhan_live_trader_api::state::SharedConstituencyMap {
+fn empty_constituency() -> tickvault_api::state::SharedConstituencyMap {
     Arc::new(RwLock::new(None))
 }
 
@@ -87,7 +87,7 @@ async fn no_panic_health_check_returns_ok() {
 
 #[test]
 fn no_panic_health_response_serialization() {
-    use dhan_live_trader_api::handlers::health::{SubsystemInfo, SubsystemStatus};
+    use tickvault_api::handlers::health::{SubsystemInfo, SubsystemStatus};
     let resp = HealthResponse {
         status: "healthy",
         version: "0.1.0",
@@ -147,7 +147,7 @@ async fn no_panic_top_movers_empty_snapshot() {
 
 #[tokio::test]
 async fn no_panic_top_movers_with_populated_snapshot() {
-    use dhan_live_trader_core::pipeline::top_movers::{MoverEntry, TopMoversSnapshot};
+    use tickvault_core::pipeline::top_movers::{MoverEntry, TopMoversSnapshot};
 
     let snapshot = TopMoversSnapshot {
         gainers: vec![MoverEntry {

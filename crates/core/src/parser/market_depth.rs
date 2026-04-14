@@ -6,13 +6,13 @@
 //!
 //! Source: Dhan API (Python SDK ref) `process_market_depth()` in `marketfeed.py`.
 
-use dhan_live_trader_common::constants::{
+use tickvault_common::constants::{
     DEPTH_LEVEL_OFFSET_ASK_ORDERS, DEPTH_LEVEL_OFFSET_ASK_PRICE, DEPTH_LEVEL_OFFSET_ASK_QTY,
     DEPTH_LEVEL_OFFSET_BID_ORDERS, DEPTH_LEVEL_OFFSET_BID_PRICE, DEPTH_LEVEL_OFFSET_BID_QTY,
     MARKET_DEPTH_LEVEL_SIZE, MARKET_DEPTH_LEVELS, MARKET_DEPTH_OFFSET_DEPTH_START,
     MARKET_DEPTH_OFFSET_LTP, MARKET_DEPTH_PACKET_SIZE,
 };
-use dhan_live_trader_common::tick_types::{MarketDepthLevel, ParsedTick};
+use tickvault_common::tick_types::{MarketDepthLevel, ParsedTick};
 
 use super::read_helpers::{read_f32_le, read_u16_le, read_u32_le};
 use super::types::{PacketHeader, ParseError};
@@ -71,7 +71,7 @@ pub fn parse_market_depth_packet(
 #[allow(clippy::arithmetic_side_effects)] // APPROVED: test helpers use constant offsets for packet construction
 mod tests {
     use super::*;
-    use dhan_live_trader_common::constants::EXCHANGE_SEGMENT_NSE_FNO;
+    use tickvault_common::constants::EXCHANGE_SEGMENT_NSE_FNO;
 
     fn make_market_depth_packet(
         segment: u8,

@@ -30,12 +30,12 @@ NEVER:             Never cache token to disk. Never log token value.
 ## SSM Parameter Store Secret Names
 
 ```
-Secret naming convention:  /dlt/<environment>/<service>/<key>
+Secret naming convention:  /tickvault/<environment>/<service>/<key>
 Examples:
-  /dlt/prod/dhan/client-id
-  /dlt/prod/dhan/client-secret
-  /dlt/prod/dhan/totp-secret
-  /dlt/dev/dhan/client-id
+  /tickvault/prod/dhan/client-id
+  /tickvault/prod/dhan/client-secret
+  /tickvault/prod/dhan/totp-secret
+  /tickvault/dev/dhan/client-id
 ```
 
 ## Security Requirements

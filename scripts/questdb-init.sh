@@ -299,7 +299,7 @@ show_dashboard() {
     if [ "${FAIL}" -gt 0 ]; then
         echo ""
         echo "  WARNING: ${FAIL} DDL statement(s) failed."
-        echo "  Check QuestDB logs: docker logs dlt-questdb"
+        echo "  Check QuestDB logs: docker logs tv-questdb"
         echo ""
         exit 1
     fi

@@ -6,16 +6,16 @@ Create an isolated git worktree for parallel Claude Code sessions.
 2. Generate a worktree name: `worktree-<branch>-<timestamp>`
 3. Create the worktree:
    ```
-   git worktree add ../dhan-live-trader-<N> -b worktree/<branch>-<N>
+   git worktree add ../tickvault-<N> -b worktree/<branch>-<N>
    ```
    Where `<N>` is 1, 2, 3... (find next available)
 4. Print instructions:
    ```
-   Worktree created at: ../dhan-live-trader-<N>
+   Worktree created at: ../tickvault-<N>
    Branch: worktree/<branch>-<N>
 
    To start a parallel Claude session:
-     cd ../dhan-live-trader-<N>
+     cd ../tickvault-<N>
      claude
 
    When done, merge changes back:
@@ -23,7 +23,7 @@ Create an isolated git worktree for parallel Claude Code sessions.
      git merge worktree/<branch>-<N>
 
    To clean up:
-     git worktree remove ../dhan-live-trader-<N>
+     git worktree remove ../tickvault-<N>
      git branch -d worktree/<branch>-<N>
    ```
 5. List all active worktrees: `git worktree list`

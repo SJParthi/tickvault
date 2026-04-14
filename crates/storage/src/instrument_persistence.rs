@@ -35,16 +35,16 @@ use questdb::ingress::{Buffer, Sender, TimestampMicros, TimestampNanos};
 use reqwest::Client;
 use tracing::{debug, info, warn};
 
-use dhan_live_trader_common::config::QuestDbConfig;
-use dhan_live_trader_common::constants::{
+use tickvault_common::config::QuestDbConfig;
+use tickvault_common::constants::{
     ILP_FLUSH_BATCH_SIZE, QUESTDB_TABLE_BUILD_METADATA, QUESTDB_TABLE_DERIVATIVE_CONTRACTS,
     QUESTDB_TABLE_FNO_UNDERLYINGS, QUESTDB_TABLE_SUBSCRIBED_INDICES,
 };
-use dhan_live_trader_common::instrument_types::{
+use tickvault_common::instrument_types::{
     DerivativeContract, FnoUnderlying, FnoUniverse, SubscribedIndex, UniverseBuildMetadata,
 };
-use dhan_live_trader_common::trading_calendar::ist_offset;
-use dhan_live_trader_common::types::SecurityId;
+use tickvault_common::trading_calendar::ist_offset;
+use tickvault_common::types::SecurityId;
 
 // ---------------------------------------------------------------------------
 // Instrument Lifecycle Event Types
@@ -748,12 +748,12 @@ fn write_single_subscribed_index(
 mod tests {
     use super::*;
     use chrono::NaiveDate;
-    use dhan_live_trader_common::instrument_types::{
-        DhanInstrumentKind, IndexCategory, IndexSubcategory, UnderlyingKind, UniverseBuildMetadata,
-    };
-    use dhan_live_trader_common::types::{Exchange, ExchangeSegment, OptionType};
     use questdb::ingress::ProtocolVersion;
     use std::time::Duration;
+    use tickvault_common::instrument_types::{
+        DhanInstrumentKind, IndexCategory, IndexSubcategory, UnderlyingKind, UniverseBuildMetadata,
+    };
+    use tickvault_common::types::{Exchange, ExchangeSegment, OptionType};
 
     /// Helper: create a minimal FnoUnderlying for testing.
     fn make_test_underlying(symbol: &str, security_id: SecurityId) -> FnoUnderlying {

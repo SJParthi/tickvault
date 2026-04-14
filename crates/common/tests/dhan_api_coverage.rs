@@ -7,7 +7,7 @@
 //!
 //! Reference: docs/dhan-ref/*.md (21 reference files)
 
-use dhan_live_trader_common::constants::{
+use tickvault_common::constants::{
     // Historical data (2)
     DHAN_CHARTS_HISTORICAL_PATH,
     DHAN_CHARTS_INTRADAY_PATH,

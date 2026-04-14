@@ -5,10 +5,10 @@
 //! These tests enforce Principle #1 (zero allocation) and correctness
 //! for real-money financial calculations.
 
-use dhan_live_trader_common::tick_types::DeepDepthLevel;
-use dhan_live_trader_trading::indicator::obi::compute_obi;
-use dhan_live_trader_trading::risk::engine::RiskEngine;
-use dhan_live_trader_trading::risk::types::RiskBreach;
+use tickvault_common::tick_types::DeepDepthLevel;
+use tickvault_trading::indicator::obi::compute_obi;
+use tickvault_trading::risk::engine::RiskEngine;
+use tickvault_trading::risk::types::RiskBreach;
 
 // ---------------------------------------------------------------------------
 // Helpers

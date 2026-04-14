@@ -7,10 +7,10 @@
 
 #[allow(clippy::unwrap_used, clippy::arithmetic_side_effects)]
 mod greeks_mutations {
-    use dhan_live_trader_trading::greeks::black_scholes::*;
-    use dhan_live_trader_trading::greeks::buildup::*;
-    use dhan_live_trader_trading::greeks::calibration::*;
-    use dhan_live_trader_trading::greeks::pcr::*;
+    use tickvault_trading::greeks::black_scholes::*;
+    use tickvault_trading::greeks::buildup::*;
+    use tickvault_trading::greeks::calibration::*;
+    use tickvault_trading::greeks::pcr::*;
 
     // === PCR boundary mutations ===
 
@@ -346,8 +346,8 @@ mod greeks_mutations {
 
 #[allow(clippy::unwrap_used, clippy::arithmetic_side_effects)]
 mod oms_mutations {
-    use dhan_live_trader_common::order_types::OrderStatus;
-    use dhan_live_trader_trading::oms::state_machine::is_valid_transition;
+    use tickvault_common::order_types::OrderStatus;
+    use tickvault_trading::oms::state_machine::is_valid_transition;
 
     /// Terminal states must reject ALL outgoing transitions.
     #[test]
@@ -500,7 +500,7 @@ mod oms_mutations {
 
 #[allow(clippy::unwrap_used, clippy::arithmetic_side_effects)]
 mod risk_mutations {
-    use dhan_live_trader_trading::risk::engine::RiskEngine;
+    use tickvault_trading::risk::engine::RiskEngine;
 
     #[test]
     fn mutation_risk_halt_is_permanent() {
@@ -573,9 +573,9 @@ mod risk_mutations {
 
 #[allow(clippy::unwrap_used, clippy::arithmetic_side_effects)]
 mod indicator_mutations {
-    use dhan_live_trader_common::tick_types::ParsedTick;
-    use dhan_live_trader_trading::indicator::engine::IndicatorEngine;
-    use dhan_live_trader_trading::indicator::types::IndicatorParams;
+    use tickvault_common::tick_types::ParsedTick;
+    use tickvault_trading::indicator::engine::IndicatorEngine;
+    use tickvault_trading::indicator::types::IndicatorParams;
 
     fn default_params() -> IndicatorParams {
         IndicatorParams::default()
@@ -692,7 +692,7 @@ mod indicator_mutations {
 
 #[allow(clippy::unwrap_used, clippy::arithmetic_side_effects)]
 mod neumaier_mutations {
-    use dhan_live_trader_trading::greeks::neumaier_sum;
+    use tickvault_trading::greeks::neumaier_sum;
 
     #[test]
     fn mutation_neumaier_empty_is_zero() {
@@ -734,7 +734,7 @@ mod neumaier_mutations {
 #[allow(clippy::unwrap_used, clippy::arithmetic_side_effects)]
 mod historical_rates_mutations {
     use chrono::NaiveDate;
-    use dhan_live_trader_trading::greeks::historical_rates::*;
+    use tickvault_trading::greeks::historical_rates::*;
 
     fn date(y: i32, m: u32, d: u32) -> NaiveDate {
         NaiveDate::from_ymd_opt(y, m, d).unwrap()

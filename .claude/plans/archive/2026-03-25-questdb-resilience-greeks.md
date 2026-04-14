@@ -112,12 +112,12 @@ Both touch the same files (tick_processor.rs, candle_persistence.rs, greeks_pers
 
 - [ ] **F1.** Add Prometheus metrics for resilience state
   - Files: crates/storage/src/candle_persistence.rs, crates/storage/src/tick_persistence.rs, crates/storage/src/greeks_persistence.rs, crates/common/src/constants.rs
-  - `dlt_candle_buffer_size` — candle ring buffer occupancy
-  - `dlt_candles_dropped_total` — candles dropped from buffer overflow
-  - `dlt_greeks_write_errors_total` — greeks write failures
-  - `dlt_disk_spill_bytes_written` — bytes written to disk spill
-  - `dlt_disk_spill_records_drained` — records drained from disk spill
-  - `dlt_reconnect_attempts_total` — total reconnect attempts per writer
+  - `tv_candle_buffer_size` — candle ring buffer occupancy
+  - `tv_candles_dropped_total` — candles dropped from buffer overflow
+  - `tv_greeks_write_errors_total` — greeks write failures
+  - `tv_disk_spill_bytes_written` — bytes written to disk spill
+  - `tv_disk_spill_records_drained` — records drained from disk spill
+  - `tv_reconnect_attempts_total` — total reconnect attempts per writer
   - Tests: (metrics emission verified in integration tests)
 
 ### Phase G: Per-Tick Greeks Implementation

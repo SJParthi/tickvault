@@ -9,14 +9,14 @@
 //! verify the ENTIRE output structure — catching subtle changes that
 //! per-field assertions might miss.
 
-use dhan_live_trader_common::constants::{
+use tickvault_common::constants::{
     DISCONNECT_PACKET_SIZE, EXCHANGE_SEGMENT_NSE_FNO, FULL_QUOTE_PACKET_SIZE,
     MARKET_DEPTH_PACKET_SIZE, MARKET_STATUS_PACKET_SIZE, OI_PACKET_SIZE,
     PREVIOUS_CLOSE_PACKET_SIZE, QUOTE_PACKET_SIZE, TICKER_PACKET_SIZE,
 };
-use dhan_live_trader_core::parser::dispatch_frame;
-use dhan_live_trader_core::parser::types::ParsedFrame;
-use dhan_live_trader_core::websocket::types::DisconnectCode;
+use tickvault_core::parser::dispatch_frame;
+use tickvault_core::parser::types::ParsedFrame;
+use tickvault_core::websocket::types::DisconnectCode;
 
 // ---------------------------------------------------------------------------
 // Helpers — deterministic packet construction
@@ -112,7 +112,7 @@ fn golden_ticker_round_trip_exact() {
 
     // Extract tick from ParsedFrame
     match parsed {
-        dhan_live_trader_core::parser::types::ParsedFrame::Tick(tick) => {
+        tickvault_core::parser::types::ParsedFrame::Tick(tick) => {
             assert_eq!(tick.security_id, 12345);
             assert_eq!(tick.exchange_segment_code, EXCHANGE_SEGMENT_NSE_FNO);
             assert_eq!(tick.last_traded_price, 99.75);
@@ -221,7 +221,7 @@ fn golden_quote_round_trip_exact() {
     let parsed = dispatch_frame(&packet, 99).unwrap();
 
     match parsed {
-        dhan_live_trader_core::parser::types::ParsedFrame::Tick(tick) => {
+        tickvault_core::parser::types::ParsedFrame::Tick(tick) => {
             assert_eq!(tick.security_id, 52432);
             assert_eq!(tick.exchange_segment_code, EXCHANGE_SEGMENT_NSE_FNO);
             assert_eq!(tick.last_traded_price, 245.50);
@@ -259,7 +259,7 @@ fn golden_oi_round_trip_exact() {
     let parsed = dispatch_frame(&buf, 0).unwrap();
 
     match parsed {
-        dhan_live_trader_core::parser::types::ParsedFrame::OiUpdate {
+        tickvault_core::parser::types::ParsedFrame::OiUpdate {
             security_id,
             exchange_segment_code,
             open_interest,
@@ -289,7 +289,7 @@ fn golden_prev_close_round_trip_exact() {
     let parsed = dispatch_frame(&buf, 0).unwrap();
 
     match parsed {
-        dhan_live_trader_core::parser::types::ParsedFrame::PreviousClose {
+        tickvault_core::parser::types::ParsedFrame::PreviousClose {
             security_id,
             exchange_segment_code,
             previous_close,
@@ -355,7 +355,7 @@ fn golden_full_round_trip_exact() {
     let parsed = dispatch_frame(&packet, 77).unwrap();
 
     match parsed {
-        dhan_live_trader_core::parser::types::ParsedFrame::TickWithDepth(tick, depth) => {
+        tickvault_core::parser::types::ParsedFrame::TickWithDepth(tick, depth) => {
             // Tick fields
             assert_eq!(tick.security_id, 52432);
             assert_eq!(tick.exchange_segment_code, EXCHANGE_SEGMENT_NSE_FNO);
@@ -599,10 +599,10 @@ fn golden_disconnect_unknown_code_preserved() {
 // Golden value tests — Deep Depth (20-level): separate WebSocket parser
 // ---------------------------------------------------------------------------
 
-use dhan_live_trader_common::constants::{
+use tickvault_common::constants::{
     DEEP_DEPTH_HEADER_SIZE, DEEP_DEPTH_LEVEL_SIZE, TWENTY_DEPTH_LEVELS, TWENTY_DEPTH_PACKET_SIZE,
 };
-use dhan_live_trader_core::parser::{DepthSide, parse_twenty_depth_packet};
+use tickvault_core::parser::{DepthSide, parse_twenty_depth_packet};
 
 #[allow(clippy::arithmetic_side_effects)]
 fn make_golden_twenty_depth_bid() -> Vec<u8> {

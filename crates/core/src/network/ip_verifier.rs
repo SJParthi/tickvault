@@ -26,11 +26,11 @@ use std::time::Duration;
 use secrecy::ExposeSecret;
 use tracing::{error, info, instrument, warn};
 
-use dhan_live_trader_common::constants::{
+use tickvault_common::constants::{
     PUBLIC_IP_CHECK_FALLBACK_URL, PUBLIC_IP_CHECK_MAX_RETRIES, PUBLIC_IP_CHECK_PRIMARY_URL,
     PUBLIC_IP_CHECK_TIMEOUT_SECS, SSM_NETWORK_SERVICE, STATIC_IP_SECRET,
 };
-use dhan_live_trader_common::error::ApplicationError;
+use tickvault_common::error::ApplicationError;
 
 use crate::auth::secret_manager::{
     build_ssm_path, create_ssm_client, fetch_secret, resolve_environment,
@@ -49,7 +49,7 @@ pub struct IpVerificationResult {
 
 /// Verifies the machine's public IP matches the expected static IP from SSM.
 ///
-/// 1. Fetches expected IP from SSM (`/dlt/<env>/network/static-ip`)
+/// 1. Fetches expected IP from SSM (`/tickvault/<env>/network/static-ip`)
 /// 2. Detects actual public IP via HTTPS (primary + fallback)
 /// 3. Compares — match = Ok, mismatch = Err (hard block)
 ///
@@ -105,7 +105,7 @@ pub async fn verify_public_ip() -> Result<IpVerificationResult, ApplicationError
 
 /// Fetches the expected static IP from AWS SSM Parameter Store.
 ///
-/// Path: `/dlt/<env>/network/static-ip`
+/// Path: `/tickvault/<env>/network/static-ip`
 async fn fetch_expected_ip_from_ssm() -> Result<String, ApplicationError> {
     let environment = resolve_environment()?;
     let ssm_client = create_ssm_client().await;
@@ -332,7 +332,7 @@ pub async fn set_ip(
     let url = format!(
         "{}{}",
         rest_api_base_url,
-        dhan_live_trader_common::constants::DHAN_SET_IP_PATH
+        tickvault_common::constants::DHAN_SET_IP_PATH
     );
 
     let client = reqwest::Client::new();
@@ -375,7 +375,7 @@ pub async fn modify_ip(
     let url = format!(
         "{}{}",
         rest_api_base_url,
-        dhan_live_trader_common::constants::DHAN_MODIFY_IP_PATH
+        tickvault_common::constants::DHAN_MODIFY_IP_PATH
     );
 
     warn!("modifying Dhan IP — 7-day cooldown applies after this operation");
@@ -418,7 +418,7 @@ pub async fn get_ip(
     let url = format!(
         "{}{}",
         rest_api_base_url,
-        dhan_live_trader_common::constants::DHAN_GET_IP_PATH
+        tickvault_common::constants::DHAN_GET_IP_PATH
     );
 
     let client = reqwest::Client::new();
@@ -525,13 +525,13 @@ mod tests {
     #[test]
     fn test_ssm_path_for_static_ip_dev() {
         let path = build_ssm_path("dev", SSM_NETWORK_SERVICE, STATIC_IP_SECRET);
-        assert_eq!(path, "/dlt/dev/network/static-ip");
+        assert_eq!(path, "/tickvault/dev/network/static-ip");
     }
 
     #[test]
     fn test_ssm_path_for_static_ip_prod() {
         let path = build_ssm_path("prod", SSM_NETWORK_SERVICE, STATIC_IP_SECRET);
-        assert_eq!(path, "/dlt/prod/network/static-ip");
+        assert_eq!(path, "/tickvault/prod/network/static-ip");
     }
 
     // -----------------------------------------------------------------------
@@ -725,17 +725,19 @@ mod tests {
 
     #[test]
     fn test_validate_ssm_ip_not_empty_valid() {
-        assert!(validate_ssm_ip_not_empty("203.0.113.42", "/dlt/dev/network/static-ip").is_ok());
+        assert!(
+            validate_ssm_ip_not_empty("203.0.113.42", "/tickvault/dev/network/static-ip").is_ok()
+        );
     }
 
     #[test]
     fn test_validate_ssm_ip_not_empty_empty_string() {
-        let result = validate_ssm_ip_not_empty("", "/dlt/dev/network/static-ip");
+        let result = validate_ssm_ip_not_empty("", "/tickvault/dev/network/static-ip");
         assert!(result.is_err());
         let reason = result.unwrap_err();
         assert!(reason.contains("SSM parameter"));
         assert!(reason.contains("empty"));
-        assert!(reason.contains("/dlt/dev/network/static-ip"));
+        assert!(reason.contains("/tickvault/dev/network/static-ip"));
     }
 
     // -----------------------------------------------------------------------
@@ -780,8 +782,9 @@ mod tests {
 
     #[test]
     fn test_classify_ip_error_ssm_empty() {
-        let kind =
-            classify_ip_error("SSM parameter '/dlt/dev/network/static-ip' exists but is empty");
+        let kind = classify_ip_error(
+            "SSM parameter '/tickvault/dev/network/static-ip' exists but is empty",
+        );
         assert_eq!(kind, IpVerificationErrorKind::InvalidSsmIp);
     }
 
@@ -956,12 +959,12 @@ mod tests {
     fn test_validate_ssm_ip_not_empty_whitespace_only() {
         // Whitespace-only is NOT empty — returns Ok
         // (caller should trim before calling)
-        assert!(validate_ssm_ip_not_empty("  ", "/dlt/dev/network/static-ip").is_ok());
+        assert!(validate_ssm_ip_not_empty("  ", "/tickvault/dev/network/static-ip").is_ok());
     }
 
     #[test]
     fn test_validate_ssm_ip_not_empty_error_contains_path() {
-        let path = "/dlt/prod/network/static-ip";
+        let path = "/tickvault/prod/network/static-ip";
         let err = validate_ssm_ip_not_empty("", path).unwrap_err();
         assert!(err.contains(path));
     }
@@ -1005,7 +1008,7 @@ mod tests {
 
     #[test]
     fn test_classify_ip_error_ssm_parameter_not_found() {
-        let kind = classify_ip_error("SSM parameter not found: /dlt/dev/network/static-ip");
+        let kind = classify_ip_error("SSM parameter not found: /tickvault/dev/network/static-ip");
         assert_eq!(kind, IpVerificationErrorKind::SsmError);
     }
 
@@ -1090,16 +1093,16 @@ mod tests {
 
     #[test]
     fn test_validate_ssm_ip_not_empty_ok() {
-        assert!(validate_ssm_ip_not_empty("10.0.0.1", "/dlt/dev/network/static-ip").is_ok());
+        assert!(validate_ssm_ip_not_empty("10.0.0.1", "/tickvault/dev/network/static-ip").is_ok());
     }
 
     #[test]
     fn test_validate_ssm_ip_not_empty_err() {
-        let result = validate_ssm_ip_not_empty("", "/dlt/dev/network/static-ip");
+        let result = validate_ssm_ip_not_empty("", "/tickvault/dev/network/static-ip");
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.contains("empty"), "error should mention empty: {err}");
-        assert!(err.contains("/dlt/dev/network/static-ip"));
+        assert!(err.contains("/tickvault/dev/network/static-ip"));
     }
 
     // -----------------------------------------------------------------------

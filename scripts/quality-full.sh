@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# dhan-live-trader — Full Quality Gates (All 7 CI Stages)
+# tickvault — Full Quality Gates (All 7 CI Stages)
 # =============================================================================
 # Runs the same stages that CI runs on GitHub Actions, plus local-only checks.
 # If this passes locally, it will pass in CI.

@@ -25,7 +25,7 @@
 use reqwest::{Client, RequestBuilder};
 use tracing::{debug, warn};
 
-use dhan_live_trader_common::constants;
+use tickvault_common::constants;
 
 use super::types::{
     DhanConditionalTriggerRequest, DhanConditionalTriggerResponse, DhanConvertPositionRequest,
@@ -60,7 +60,7 @@ fn record_dh_error_metric(body: &str) {
         let after = &body[start + 13..]; // skip past `"errorCode":"`
         if let Some(end) = after.find('"') {
             let code = &after[..end];
-            metrics::counter!("dlt_dhan_error_total", "code" => code.to_owned()).increment(1);
+            metrics::counter!("tv_dhan_error_total", "code" => code.to_owned()).increment(1);
         }
     }
 }
@@ -4502,7 +4502,7 @@ mod tests {
     #[test]
     fn test_error_code_counters() {
         for code in ["DH-901", "DH-904", "DH-905", "DH-906"] {
-            metrics::counter!("dlt_dhan_error_total", "code" => code).increment(1);
+            metrics::counter!("tv_dhan_error_total", "code" => code).increment(1);
         }
     }
 

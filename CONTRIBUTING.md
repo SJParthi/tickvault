@@ -1,10 +1,10 @@
-# Contributing to dhan-live-trader
+# Contributing to tickvault
 
 ## Setup
 
 ```bash
-git clone https://github.com/SJParthi/dhan-live-trader.git
-cd dhan-live-trader
+git clone https://github.com/SJParthi/tickvault.git
+cd tickvault
 ./scripts/bootstrap.sh
 ```
 

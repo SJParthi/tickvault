@@ -45,5 +45,5 @@ Push the zero-tick-loss posture from "defence-in-depth" to "observable guarantee
 - 7 plan items complete
 - ~35 new tests, all green
 - 13 new metrics catalogued (4 QuestDB health + 7 backfill + 2 A4/A5 already catalogued)
-- 1 new Grafana alert (dlt-questdb-disconnected)
+- 1 new Grafana alert (tv-questdb-disconnected)
 - 1 new pre-push gate (Gate 10 cargo audit + deny)

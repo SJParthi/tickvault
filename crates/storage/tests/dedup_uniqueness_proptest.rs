@@ -22,9 +22,9 @@
 //! 4. **Cross-bit-pattern stability:** changing non-key fields (price,
 //!    volume) does NOT change the key
 
-use dhan_live_trader_common::tick_types::ParsedTick;
-use dhan_live_trader_storage::tick_persistence::tick_dedup_key;
 use proptest::prelude::*;
+use tickvault_common::tick_types::ParsedTick;
+use tickvault_storage::tick_persistence::tick_dedup_key;
 
 /// Computes the canonical dedup "tuple" for a tick — matches the QuestDB
 /// DEDUP UPSERT KEYS semantics.

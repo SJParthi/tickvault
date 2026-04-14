@@ -3,7 +3,7 @@
 //! All packets share an 8-byte header:
 //! `response_code(u8) + msg_length(u16 LE) + exchange_segment(u8) + security_id(u32 LE)`.
 
-use dhan_live_trader_common::constants::{
+use tickvault_common::constants::{
     BINARY_HEADER_SIZE, HEADER_OFFSET_EXCHANGE_SEGMENT, HEADER_OFFSET_MESSAGE_LENGTH,
     HEADER_OFFSET_RESPONSE_CODE, HEADER_OFFSET_SECURITY_ID,
 };
@@ -51,7 +51,7 @@ pub fn parse_header(raw: &[u8]) -> Result<PacketHeader, ParseError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dhan_live_trader_common::constants::{
+    use tickvault_common::constants::{
         EXCHANGE_SEGMENT_IDX_I, EXCHANGE_SEGMENT_NSE_FNO, RESPONSE_CODE_QUOTE, RESPONSE_CODE_TICKER,
     };
 
@@ -143,7 +143,7 @@ mod tests {
         let hdr = parse_header(&buf).unwrap();
         assert_eq!(hdr.exchange_segment_code, 6);
         // Verify ExchangeSegment::from_byte rejects 6
-        use dhan_live_trader_common::types::ExchangeSegment;
+        use tickvault_common::types::ExchangeSegment;
         assert!(
             ExchangeSegment::from_byte(6).is_none(),
             "segment byte 6 must return None (gap in Dhan enum)"
@@ -214,7 +214,7 @@ mod tests {
         // Bytes 6 and 9-255 are all unknown exchange segments.
         // parse_header reads the raw byte without validation.
         // ExchangeSegment::from_byte should reject them.
-        use dhan_live_trader_common::types::ExchangeSegment;
+        use tickvault_common::types::ExchangeSegment;
 
         let invalid_bytes = [6u8, 9, 10, 50, 100, 128, 200, 254, 255];
         for &seg in &invalid_bytes {
@@ -289,7 +289,7 @@ mod tests {
 
     #[test]
     fn test_parse_header_all_valid_exchange_segments_accepted() {
-        use dhan_live_trader_common::types::ExchangeSegment;
+        use tickvault_common::types::ExchangeSegment;
 
         // Valid segments: 0=IDX_I, 1=NSE_EQ, 2=NSE_FNO, 3=NSE_CURRENCY,
         // 4=BSE_EQ, 5=MCX_COMM, 7=BSE_CURRENCY, 8=BSE_FNO

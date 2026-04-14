@@ -1,12 +1,12 @@
 [package]
-name = "dhan-live-trader-storage"
+name = "tickvault-storage"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-dhan-live-trader-common = { path = "../common" }
+tickvault-common = { path = "../common" }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }

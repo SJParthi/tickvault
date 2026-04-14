@@ -10,8 +10,8 @@ use axum::extract::State;
 use serde::Serialize;
 use tracing::{info, warn};
 
-use dhan_live_trader_core::instrument::run_instrument_diagnostic;
-use dhan_live_trader_core::instrument::try_rebuild_instruments;
+use tickvault_core::instrument::run_instrument_diagnostic;
+use tickvault_core::instrument::try_rebuild_instruments;
 
 use crate::state::SharedAppState;
 
@@ -75,7 +75,7 @@ pub async fn rebuild_instruments(State(state): State<SharedAppState>) -> Json<Re
 /// `try_rebuild_instruments`, but this function can be tested with a
 /// hand-constructed `FnoUniverse`.
 fn build_rebuild_response(
-    result: Result<Option<dhan_live_trader_common::instrument_types::FnoUniverse>, anyhow::Error>,
+    result: Result<Option<tickvault_common::instrument_types::FnoUniverse>, anyhow::Error>,
 ) -> Json<RebuildResponse> {
     match result {
         Ok(Some(universe)) => {
@@ -238,7 +238,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn test_state() -> crate::state::SharedAppState {
-        use dhan_live_trader_common::config::{DhanConfig, InstrumentConfig, QuestDbConfig};
+        use tickvault_common::config::{DhanConfig, InstrumentConfig, QuestDbConfig};
 
         crate::state::SharedAppState::new(
             QuestDbConfig {
@@ -260,7 +260,7 @@ mod tests {
             },
             InstrumentConfig {
                 daily_download_time: "08:55:00".to_string(),
-                csv_cache_directory: "/tmp/dlt-test-instruments".to_string(),
+                csv_cache_directory: "/tmp/tv-test-instruments".to_string(),
                 csv_cache_filename: "test-instruments.csv".to_string(),
                 csv_download_timeout_secs: 1,
                 build_window_start: "00:00:00".to_string(),
@@ -349,12 +349,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_rebuild_instruments_already_built_today_returns_already_built() {
-        use dhan_live_trader_common::config::{DhanConfig, InstrumentConfig, QuestDbConfig};
-        use dhan_live_trader_common::constants::INSTRUMENT_FRESHNESS_MARKER_FILENAME;
+        use tickvault_common::config::{DhanConfig, InstrumentConfig, QuestDbConfig};
+        use tickvault_common::constants::INSTRUMENT_FRESHNESS_MARKER_FILENAME;
 
         // Create a unique temp dir with today's freshness marker
         let temp_dir =
-            std::env::temp_dir().join(format!("dlt-test-already-built-{}", std::process::id()));
+            std::env::temp_dir().join(format!("tv-test-already-built-{}", std::process::id()));
         std::fs::create_dir_all(&temp_dir).unwrap();
 
         // Write today's IST date as the freshness marker
@@ -430,12 +430,12 @@ mod tests {
 
     #[test]
     fn test_build_rebuild_response_success_with_universe() {
-        use dhan_live_trader_common::instrument_types::{
+        use std::collections::HashMap;
+        use tickvault_common::instrument_types::{
             DerivativeContract, DhanInstrumentKind, FnoUnderlying, FnoUniverse, UnderlyingKind,
             UniverseBuildMetadata,
         };
-        use dhan_live_trader_common::types::ExchangeSegment;
-        use std::collections::HashMap;
+        use tickvault_common::types::ExchangeSegment;
 
         let ist = chrono::FixedOffset::east_opt(5 * 3600 + 30 * 60).unwrap();
         let now = chrono::Utc::now().with_timezone(&ist);
@@ -466,7 +466,7 @@ mod tests {
                 exchange_segment: ExchangeSegment::NseFno,
                 expiry_date: chrono::NaiveDate::from_ymd_opt(2026, 4, 30).unwrap(),
                 strike_price: 25000.0,
-                option_type: Some(dhan_live_trader_common::types::OptionType::Call),
+                option_type: Some(tickvault_common::types::OptionType::Call),
                 lot_size: 75,
                 tick_size: 0.05,
                 symbol_name: "NIFTY-CE-25000".to_string(),

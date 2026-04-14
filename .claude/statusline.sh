@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# dhan-live-trader — Claude Code Status Line
+# tickvault — Claude Code Status Line
 # =============================================================================
 # Shows: model | branch | context usage bar | cost | duration | dirty state
 #

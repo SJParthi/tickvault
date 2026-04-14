@@ -21,7 +21,7 @@ cross-matched, and violation details are capped globally instead of per-timefram
     - In retry wave loop: if any result is `TokenExpired`, sleep 30s for token refresh then retry
     - Token handle re-read on every attempt (already happens via `token_handle.load()`)
     - If token still expired after 2 retries → mark as `Failed` (give up)
-    - Add metric `dlt_historical_token_expired_total`
+    - Add metric `tv_historical_token_expired_total`
   - Tests: test_token_expired_variant_exists, test_token_expired_distinct_from_failed
 
 - [x] 2. C2: Consecutive persist failure circuit breaker

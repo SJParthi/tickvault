@@ -20,7 +20,7 @@
 //! Run explicitly with:
 //!
 //! ```bash
-//! cargo test -p dhan-live-trader-storage --test chaos_disk_full -- --ignored
+//! cargo test -p tickvault-storage --test chaos_disk_full -- --ignored
 //! ```
 //!
 //! Unix-only — skipped on Windows via `#[cfg(target_family = "unix")]`.
@@ -37,11 +37,11 @@
 #![cfg(target_family = "unix")]
 #![cfg(test)]
 
-use dhan_live_trader_common::config::QuestDbConfig;
-use dhan_live_trader_common::constants::TICK_BUFFER_CAPACITY;
-use dhan_live_trader_common::tick_types::ParsedTick;
-use dhan_live_trader_storage::tick_persistence::TickPersistenceWriter;
 use std::os::unix::fs::PermissionsExt;
+use tickvault_common::config::QuestDbConfig;
+use tickvault_common::constants::TICK_BUFFER_CAPACITY;
+use tickvault_common::tick_types::ParsedTick;
+use tickvault_storage::tick_persistence::TickPersistenceWriter;
 
 fn test_config() -> QuestDbConfig {
     QuestDbConfig {
@@ -71,7 +71,7 @@ fn make_tick(security_id: u32, price: f32) -> ParsedTick {
 #[test]
 #[ignore = "B2 chaos test — run manually with `-- --ignored`"]
 fn chaos_disk_full_triggers_dlq() {
-    let tmp_spill = std::env::temp_dir().join(format!("dlt-b2-chaos-spill-{}", std::process::id()));
+    let tmp_spill = std::env::temp_dir().join(format!("tv-b2-chaos-spill-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp_spill);
     std::fs::create_dir_all(&tmp_spill).expect("create tmp spill dir"); // APPROVED: test
 
@@ -123,7 +123,7 @@ fn chaos_disk_full_triggers_dlq() {
 #[ignore = "B2 chaos test — run manually with `-- --ignored`"]
 fn chaos_disk_full_recovery_after_permissions_restored() {
     let tmp_spill =
-        std::env::temp_dir().join(format!("dlt-b2-chaos-recover-{}", std::process::id()));
+        std::env::temp_dir().join(format!("tv-b2-chaos-recover-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp_spill);
     std::fs::create_dir_all(&tmp_spill).expect("create tmp spill dir"); // APPROVED: test
 

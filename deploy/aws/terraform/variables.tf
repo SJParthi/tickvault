@@ -61,7 +61,7 @@ variable "ebs_gp3_size_gb" {
 variable "key_name" {
   description = "Name of the existing EC2 key pair for SSH. Operator creates via `aws ec2 create-key-pair`."
   type        = string
-  default     = "dlt-prod-key"
+  default     = "tv-prod-key"
 }
 
 variable "operator_cidr" {
@@ -78,11 +78,11 @@ variable "operator_cidr" {
 variable "telegram_bot_token_ssm_param" {
   description = "SSM parameter name where the Telegram bot token is stored."
   type        = string
-  default     = "/dlt/prod/telegram/bot-token"
+  default     = "/tickvault/prod/telegram/bot-token"
 }
 
 variable "dhan_access_token_ssm_param" {
   description = "SSM parameter name where the Dhan access token cache is stored."
   type        = string
-  default     = "/dlt/prod/dhan/access-token"
+  default     = "/tickvault/prod/dhan/access-token"
 }

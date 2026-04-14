@@ -143,7 +143,7 @@ Mac NEVER needs S3 because:
 |----------|-------|
 | **Cache directory** | `/app/data/instrument-cache/` (on EBS volume) |
 | **Primary storage** | EBS gp3 volume (persistent, survives reboot/stop/start) |
-| **S3 backup** | `s3://dlt-<env>/instrument-cache/` (cross-AZ disaster recovery) |
+| **S3 backup** | `s3://tv-<env>/instrument-cache/` (cross-AZ disaster recovery) |
 | **rkyv mmap latency** | sub-0.5ms (EBS gp3 = ~0.1ms random read) |
 | **S3 GET latency** | 5-20ms from ap-south-1 (Mumbai) — NOT used on hot path |
 
@@ -208,11 +208,11 @@ After every successful instrument build (outside market hours):
 2. Write CSV to local disk (already done by downloader)
 3. Upload rkyv to S3:
    aws s3 cp /app/data/instrument-cache/fno-universe.rkyv \
-     s3://dlt-prod/instrument-cache/fno-universe.rkyv \
+     s3://tv-prod/instrument-cache/fno-universe.rkyv \
      --storage-class STANDARD
 4. Upload CSV to S3:
    aws s3 cp /app/data/instrument-cache/api-scrip-master-detailed.csv \
-     s3://dlt-prod/instrument-cache/api-scrip-master-detailed.csv \
+     s3://tv-prod/instrument-cache/api-scrip-master-detailed.csv \
      --storage-class STANDARD
 5. Write freshness marker (local only — S3 has LastModified)
 ```
@@ -228,12 +228,12 @@ After every successful instrument build (outside market hours):
 Market hours + no local cache (EBS lost):
 
 1. Check S3 for rkyv:
-   aws s3 cp s3://dlt-prod/instrument-cache/fno-universe.rkyv \
+   aws s3 cp s3://tv-prod/instrument-cache/fno-universe.rkyv \
      /app/data/instrument-cache/fno-universe.rkyv
    → If found: write to local EBS → mmap → sub-0.5ms from now on
 
 2. If S3 rkyv missing, check S3 for CSV:
-   aws s3 cp s3://dlt-prod/instrument-cache/api-scrip-master-detailed.csv \
+   aws s3 cp s3://tv-prod/instrument-cache/api-scrip-master-detailed.csv \
      /app/data/instrument-cache/api-scrip-master-detailed.csv
    → If found: parse → build → write local rkyv → mmap
 
@@ -272,8 +272,8 @@ Market hours + no local cache (EBS lost):
 │                    BACKUP WRITE PATH                          │
 │                (after every build, best-effort)                │
 │                                                               │
-│  local rkyv → S3://dlt-<env>/instrument-cache/               │
-│  local CSV  → S3://dlt-<env>/instrument-cache/               │
+│  local rkyv → S3://tv-<env>/instrument-cache/               │
+│  local CSV  → S3://tv-<env>/instrument-cache/               │
 │                                                               │
 │  Non-blocking. Failure = WARN log. Trading continues.        │
 └─────────────────────────────────────────────────────────────┘

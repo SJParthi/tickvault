@@ -12,7 +12,7 @@
 /// If this fails, the middleware was removed or renamed — all API routes are unprotected.
 #[test]
 fn test_gap_sec_01_auth_config_exists_with_required_fields() {
-    let config = dhan_live_trader_api::middleware::ApiAuthConfig::new("test-token".to_string());
+    let config = tickvault_api::middleware::ApiAuthConfig::new("test-token".to_string());
     assert!(config.enabled, "auth config with token must be enabled");
     assert_eq!(config.bearer_token, "test-token");
 }
@@ -20,14 +20,14 @@ fn test_gap_sec_01_auth_config_exists_with_required_fields() {
 /// Verify disabled auth mode exists (dev passthrough).
 #[test]
 fn test_gap_sec_01_auth_config_disabled_mode() {
-    let config = dhan_live_trader_api::middleware::ApiAuthConfig::disabled();
+    let config = tickvault_api::middleware::ApiAuthConfig::disabled();
     assert!(!config.enabled, "disabled auth config must not be enabled");
 }
 
 /// Verify empty token produces disabled auth (fail-safe: no token = passthrough, not panic).
 #[test]
 fn test_gap_sec_01_empty_token_is_disabled() {
-    let config = dhan_live_trader_api::middleware::ApiAuthConfig::new(String::new());
+    let config = tickvault_api::middleware::ApiAuthConfig::new(String::new());
     assert!(
         !config.enabled,
         "empty token must produce disabled auth (fail-safe)"

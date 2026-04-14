@@ -17,8 +17,8 @@
 //! ```
 //! Then order updates arrive automatically as JSON with a `"Data"` key.
 
-use dhan_live_trader_common::constants::ORDER_UPDATE_LOGIN_MSG_CODE;
-use dhan_live_trader_common::order_types::{OrderUpdate, OrderUpdateMessage};
+use tickvault_common::constants::ORDER_UPDATE_LOGIN_MSG_CODE;
+use tickvault_common::order_types::{OrderUpdate, OrderUpdateMessage};
 
 /// Error type for order update parsing.
 #[derive(Debug, thiserror::Error)]

@@ -1,5 +1,5 @@
 # =============================================================================
-# dhan-live-trader — Scheduled Security Audit
+# tickvault — Scheduled Security Audit
 # =============================================================================
 # Runs weekly to catch new CVEs discovered after code was committed.
 # Separate from CI — this catches vulnerabilities in existing dependencies.

@@ -6,7 +6,7 @@
 //!
 //! # Cache File Location
 //!
-//! `/tmp/dlt-token-cache` — survives process crashes but is wiped on container
+//! `/tmp/tv-token-cache` — survives process crashes but is wiped on container
 //! restart. This is intentional: the cache is for crash recovery only.
 
 use std::collections::hash_map::DefaultHasher;
@@ -19,8 +19,8 @@ use tracing::{debug, info, warn};
 use zeroize::Zeroizing;
 
 use super::types::TokenState;
-use dhan_live_trader_common::constants::{TOKEN_CACHE_FILE_PATH, TOKEN_CACHE_MIN_REMAINING_HOURS};
-use dhan_live_trader_common::trading_calendar::ist_offset;
+use tickvault_common::constants::{TOKEN_CACHE_FILE_PATH, TOKEN_CACHE_MIN_REMAINING_HOURS};
+use tickvault_common::trading_calendar::ist_offset;
 
 // ---------------------------------------------------------------------------
 // Cache File Format
@@ -352,7 +352,7 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    /// All tests that read/write `/tmp/dlt-token-cache` must hold this lock.
+    /// All tests that read/write `/tmp/tv-token-cache` must hold this lock.
     /// Cargo runs tests in the same binary in parallel threads; without
     /// serialization, one test's `save` can be overwritten by another before
     /// the matching `load`, causing spurious failures.

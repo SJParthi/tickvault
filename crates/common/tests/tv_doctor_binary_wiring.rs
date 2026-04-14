@@ -1,4 +1,4 @@
-//! S7-Step8 / Phase 8: Lockdown test for the dlt_doctor CLI binary.
+//! S7-Step8 / Phase 8: Lockdown test for the tv_doctor CLI binary.
 //!
 //! Prevents accidental deletion of the triage CLI that the AWS
 //! disaster-recovery runbook depends on for "one-command incident
@@ -15,24 +15,23 @@ fn workspace_root() -> std::path::PathBuf {
 }
 
 #[test]
-fn test_dlt_doctor_binary_exists() {
+fn test_tv_doctor_binary_exists() {
     let path = workspace_root()
         .join("crates")
         .join("app")
         .join("src")
         .join("bin")
-        .join("dlt_doctor.rs");
+        .join("tv_doctor.rs");
     assert!(
         path.exists(),
-        "S7-Step8: dlt_doctor.rs missing — DR runbook §1-§11 depend on it"
+        "S7-Step8: tv_doctor.rs missing — DR runbook §1-§11 depend on it"
     );
 }
 
 #[test]
-fn test_dlt_doctor_collects_required_probes() {
-    let content =
-        std::fs::read_to_string(workspace_root().join("crates/app/src/bin/dlt_doctor.rs"))
-            .expect("dlt_doctor.rs must be readable"); // APPROVED: test
+fn test_tv_doctor_collects_required_probes() {
+    let content = std::fs::read_to_string(workspace_root().join("crates/app/src/bin/tv_doctor.rs"))
+        .expect("tv_doctor.rs must be readable"); // APPROVED: test
 
     // The 5 required probes per the session 7 plan.
     for probe in &[
@@ -44,21 +43,20 @@ fn test_dlt_doctor_collects_required_probes() {
     ] {
         assert!(
             content.contains(probe),
-            "dlt_doctor missing probe '{probe}' — runbook invariant"
+            "tv_doctor missing probe '{probe}' — runbook invariant"
         );
     }
 }
 
 #[test]
-fn test_dlt_doctor_supports_all_output_formats() {
-    let content =
-        std::fs::read_to_string(workspace_root().join("crates/app/src/bin/dlt_doctor.rs"))
-            .expect("dlt_doctor.rs must be readable"); // APPROVED: test
+fn test_tv_doctor_supports_all_output_formats() {
+    let content = std::fs::read_to_string(workspace_root().join("crates/app/src/bin/tv_doctor.rs"))
+        .expect("tv_doctor.rs must be readable"); // APPROVED: test
 
     for renderer in &["print_markdown", "print_json", "print_plain"] {
         assert!(
             content.contains(renderer),
-            "dlt_doctor must support {renderer} output format"
+            "tv_doctor must support {renderer} output format"
         );
     }
 }

@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# claude-launch.sh — Full-featured Claude Code launcher for dhan-live-trader
+# claude-launch.sh — Full-featured Claude Code launcher for tickvault
 # =============================================================================
 # Launches Claude Code with ALL features enabled:
 #   - Chrome integration (browser automation)
@@ -50,7 +50,7 @@ if [ $# -gt 0 ]; then
 fi
 
 echo "╔══════════════════════════════════════════════════════╗"
-echo "║  dhan-live-trader — Claude Code (Full Features)     ║"
+echo "║  tickvault — Claude Code (Full Features)     ║"
 echo "╠══════════════════════════════════════════════════════╣"
 echo "║  Chrome: ON | Effort: HIGH | Agent Teams: ON        ║"
 echo "║  Hooks: 14 active | Agents: 5 custom                ║"

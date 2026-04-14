@@ -216,4 +216,4 @@ Headers: access-token: {JWT}
 2. **One active token at a time** — generating new token invalidates the old one.
 3. **Static IP only for orders** — data APIs, market feed, portfolio all work without IP whitelisting.
 4. **TOTP enables automation** — without TOTP, token must be manually generated from web UI daily.
-5. **For dhan-live-trader**: Use TOTP method for daily auto-renewal. Generate token at pre-market (before 9:00 AM IST), renew before expiry.
+5. **For tickvault**: Use TOTP method for daily auto-renewal. Generate token at pre-market (before 9:00 AM IST), renew before expiry.

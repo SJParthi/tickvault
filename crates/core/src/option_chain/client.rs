@@ -17,7 +17,7 @@ use reqwest::Client;
 use secrecy::ExposeSecret;
 use tracing::{debug, warn};
 
-use dhan_live_trader_common::constants::{
+use tickvault_common::constants::{
     OPTION_CHAIN_MIN_REQUEST_INTERVAL_SECS, OPTION_CHAIN_REQUEST_TIMEOUT_SECS,
 };
 

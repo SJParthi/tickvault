@@ -16,7 +16,7 @@ use metrics::counter;
 use secrecy::{ExposeSecret, SecretString};
 use tracing::{debug, error, info, instrument, warn};
 
-use dhan_live_trader_common::order_types::{OrderStatus, OrderUpdate};
+use tickvault_common::order_types::{OrderStatus, OrderUpdate};
 
 use super::api_client::OrderApiClient;
 use super::circuit_breaker::OrderCircuitBreaker;
@@ -235,8 +235,8 @@ impl OrderManagementSystem {
             self.orders.insert(paper_order_id.clone(), order);
             self.total_placed = self.total_placed.saturating_add(1);
 
-            counter!("dlt_orders_placed_total", "mode" => "paper").increment(1);
-            metrics::histogram!("dlt_order_placement_duration_ns")
+            counter!("tv_orders_placed_total", "mode" => "paper").increment(1);
+            metrics::histogram!("tv_order_placement_duration_ns")
                 .record(start.elapsed().as_nanos() as f64);
 
             info!(
@@ -346,8 +346,8 @@ impl OrderManagementSystem {
         self.orders.insert(response.order_id.clone(), order);
         self.total_placed = self.total_placed.saturating_add(1);
 
-        counter!("dlt_orders_placed_total", "mode" => "live").increment(1);
-        metrics::histogram!("dlt_order_placement_duration_ns")
+        counter!("tv_orders_placed_total", "mode" => "live").increment(1);
+        metrics::histogram!("tv_order_placement_duration_ns")
             .record(start.elapsed().as_nanos() as f64);
 
         info!(
@@ -631,10 +631,10 @@ impl OrderManagementSystem {
         // Emit metrics for terminal states
         match new_status {
             OrderStatus::Traded => {
-                counter!("dlt_orders_filled_total").increment(1);
+                counter!("tv_orders_filled_total").increment(1);
             }
             OrderStatus::Rejected => {
-                counter!("dlt_orders_rejected_total").increment(1);
+                counter!("tv_orders_rejected_total").increment(1);
             }
             _ => {}
         }
@@ -735,7 +735,7 @@ impl OrderManagementSystem {
 /// - MARKET orders must have price = 0.0 (Dhan rejects non-zero → DH-905)
 /// - STOP_LOSS / STOP_LOSS_MARKET orders require triggerPrice > 0.0
 fn validate_order_fields(request: &PlaceOrderRequest) -> Result<(), OmsError> {
-    use dhan_live_trader_common::order_types::OrderType;
+    use tickvault_common::order_types::OrderType;
 
     // MARKET orders: price must be 0 (Dhan API spec)
     if request.order_type == OrderType::Market && request.price != 0.0 {
@@ -774,7 +774,7 @@ fn validate_order_fields(request: &PlaceOrderRequest) -> Result<(), OmsError> {
 ///
 /// Same rules as place: MARKET→price=0, SL→triggerPrice>0.
 fn validate_modify_fields(request: &ModifyOrderRequest) -> Result<(), OmsError> {
-    use dhan_live_trader_common::order_types::OrderType;
+    use tickvault_common::order_types::OrderType;
 
     if request.order_type == OrderType::Market && request.price != 0.0 {
         return Err(OmsError::RiskRejected {
@@ -935,9 +935,7 @@ fn now_epoch_us() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dhan_live_trader_common::order_types::{
-        OrderType, OrderValidity, ProductType, TransactionType,
-    };
+    use tickvault_common::order_types::{OrderType, OrderValidity, ProductType, TransactionType};
 
     /// Test token provider that always returns a fixed token.
     struct TestTokenProvider;
@@ -1631,7 +1629,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_oms_metrics_emitted_on_place() {
-        // Dry-run place_order should increment dlt_orders_placed_total.
+        // Dry-run place_order should increment tv_orders_placed_total.
         // We can't easily inspect the metrics crate's internal state,
         // but we verify the place_order path that includes counter! doesn't panic.
         let api_client = OrderApiClient::new(
@@ -1667,7 +1665,7 @@ mod tests {
     #[test]
     fn test_oms_metrics_emitted_on_reject() {
         // handle_order_update with Rejected status should increment
-        // dlt_orders_rejected_total without panicking.
+        // tv_orders_rejected_total without panicking.
         let mut oms = make_oms_with_order("1", OrderStatus::Pending);
         let update = make_order_update("1", "REJECTED");
 
@@ -2412,7 +2410,7 @@ mod tests {
         let result = oms.handle_order_update(&update);
         assert!(result.is_ok());
         assert_eq!(oms.order("1").unwrap().status, OrderStatus::Traded);
-        // The counter!("dlt_orders_filled_total").increment(1) path is exercised
+        // The counter!("tv_orders_filled_total").increment(1) path is exercised
     }
 
     // -----------------------------------------------------------------------
@@ -3178,7 +3176,7 @@ mod tests {
     fn test_order_latency_metric() {
         // Verify histogram macro compiles and doesn't panic when invoked.
         // O(1) atomic call — safe for cold path (order placement).
-        metrics::histogram!("dlt_order_placement_duration_ns").record(1000.0_f64);
+        metrics::histogram!("tv_order_placement_duration_ns").record(1000.0_f64);
     }
 
     // -----------------------------------------------------------------------

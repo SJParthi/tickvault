@@ -24,13 +24,13 @@ use questdb::ingress::{Buffer, ProtocolVersion, Sender, TimestampNanos};
 use reqwest::Client;
 use tracing::{debug, error, info, warn};
 
-use dhan_live_trader_common::config::QuestDbConfig;
-use dhan_live_trader_common::constants::{
+use tickvault_common::config::QuestDbConfig;
+use tickvault_common::constants::{
     CANDLE_BUFFER_CAPACITY, CANDLE_FLUSH_BATCH_SIZE, IST_UTC_OFFSET_SECONDS_I64,
     QUESTDB_TABLE_CANDLES_1S, QUESTDB_TABLE_HISTORICAL_CANDLES,
 };
-use dhan_live_trader_common::segment::segment_code_to_str;
-use dhan_live_trader_common::tick_types::HistoricalCandle;
+use tickvault_common::segment::segment_code_to_str;
+use tickvault_common::tick_types::HistoricalCandle;
 
 use crate::tick_persistence::f32_to_f64_clean;
 
@@ -613,8 +613,8 @@ impl LiveCandleWriter {
         } else {
             self.candle_buffer.push_back(candle);
         }
-        metrics::gauge!("dlt_candle_buffer_size").set(self.candle_buffer.len() as f64);
-        metrics::counter!("dlt_candles_spilled_total").absolute(self.candles_spilled_total);
+        metrics::gauge!("tv_candle_buffer_size").set(self.candle_buffer.len() as f64);
+        metrics::counter!("tv_candles_spilled_total").absolute(self.candles_spilled_total);
     }
 
     /// Spills a candle to disk when ring buffer is full.
@@ -682,8 +682,8 @@ impl LiveCandleWriter {
         self.in_flight.clear();
         if drained > 0 { info!(drained, ring_count, "candle ring buffer drained to QuestDB"); }
         if self.candles_spilled_total > 0 { self.drain_candle_disk_spill(); }
-        metrics::gauge!("dlt_candle_buffer_size").set(self.candle_buffer.len() as f64);
-        metrics::counter!("dlt_candles_spilled_total").absolute(self.candles_spilled_total);
+        metrics::gauge!("tv_candle_buffer_size").set(self.candle_buffer.len() as f64);
+        metrics::counter!("tv_candles_spilled_total").absolute(self.candles_spilled_total);
     }
 
     /// Builds an ILP row for a buffered candle. Returns Err on ILP buffer error.
@@ -1053,7 +1053,7 @@ pub async fn ensure_candle_table_dedup_keys(questdb_config: &QuestDbConfig) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dhan_live_trader_common::constants::{
+    use tickvault_common::constants::{
         EXCHANGE_SEGMENT_BSE_CURRENCY, EXCHANGE_SEGMENT_BSE_EQ, EXCHANGE_SEGMENT_BSE_FNO,
         EXCHANGE_SEGMENT_IDX_I, EXCHANGE_SEGMENT_MCX_COMM, EXCHANGE_SEGMENT_NSE_CURRENCY,
         EXCHANGE_SEGMENT_NSE_EQ, EXCHANGE_SEGMENT_NSE_FNO,
@@ -1257,8 +1257,8 @@ mod tests {
 
     #[test]
     fn test_build_questdb_exec_url_docker() {
-        let url = build_questdb_exec_url("dlt-questdb", 9000);
-        assert_eq!(url, "http://dlt-questdb:9000/exec");
+        let url = build_questdb_exec_url("tv-questdb", 9000);
+        assert_eq!(url, "http://tv-questdb:9000/exec");
     }
 
     #[test]
@@ -1293,8 +1293,8 @@ mod tests {
 
     #[test]
     fn test_build_ilp_conf_string_docker() {
-        let conf = build_ilp_conf_string("dlt-questdb", 9009);
-        assert_eq!(conf, "tcp::addr=dlt-questdb:9009;");
+        let conf = build_ilp_conf_string("tv-questdb", 9009);
+        assert_eq!(conf, "tcp::addr=tv-questdb:9009;");
     }
 
     #[test]
@@ -1804,7 +1804,7 @@ mod tests {
 
         // Pre-set spill to unique temp path.
         let tmp_dir =
-            std::env::temp_dir().join(format!("dlt-candle-spill-test-{}", std::process::id()));
+            std::env::temp_dir().join(format!("tv-candle-spill-test-{}", std::process::id()));
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let spill_path = tmp_dir.join("test-candles-overflow.bin");
         let file = std::fs::File::create(&spill_path).unwrap();
@@ -2583,10 +2583,8 @@ mod tests {
         writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
 
         // Pre-set spill to unique temp path (avoid interference with other tests).
-        let tmp_dir = std::env::temp_dir().join(format!(
-            "dlt-candle-spill-drain-test-{}",
-            std::process::id()
-        ));
+        let tmp_dir =
+            std::env::temp_dir().join(format!("tv-candle-spill-drain-test-{}", std::process::id()));
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let spill_path = tmp_dir.join("test-candles-spill-drain.bin");
         let file = std::fs::File::create(&spill_path).unwrap();
@@ -3011,7 +3009,7 @@ mod tests {
 
         // Set up temp spill path.
         let tmp_dir = std::env::temp_dir().join(format!(
-            "dlt-candle-spill-create-test-{}",
+            "tv-candle-spill-create-test-{}",
             std::process::id()
         ));
         std::fs::create_dir_all(&tmp_dir).unwrap();
@@ -3471,7 +3469,7 @@ mod tests {
 
         // Set up a temp spill file to avoid collisions.
         let tmp_dir =
-            std::env::temp_dir().join(format!("dlt-candle-spill-drain-{}", std::process::id()));
+            std::env::temp_dir().join(format!("tv-candle-spill-drain-{}", std::process::id()));
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let spill_path = tmp_dir.join("test-candles-spill.bin");
         let file = std::fs::File::create(&spill_path).unwrap();
@@ -3534,7 +3532,7 @@ mod tests {
 
         // Create a stale spill file with some candle records.
         let tmp_dir =
-            std::env::temp_dir().join(format!("dlt-candle-stale-recover-{}", std::process::id()));
+            std::env::temp_dir().join(format!("tv-candle-stale-recover-{}", std::process::id()));
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let stale_path = tmp_dir.join("candles-20260101.bin");
 
@@ -4175,10 +4173,8 @@ mod tests {
         };
         let mut writer = LiveCandleWriter::new(&config).unwrap();
 
-        let tmp_dir = std::env::temp_dir().join(format!(
-            "dlt-candle-drain-spill-full-{}",
-            std::process::id()
-        ));
+        let tmp_dir =
+            std::env::temp_dir().join(format!("tv-candle-drain-spill-full-{}", std::process::id()));
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let spill_path = tmp_dir.join("test-candles-drain-spill.bin");
 
@@ -4222,7 +4218,7 @@ mod tests {
         let mut writer = LiveCandleWriter::new(&config).unwrap();
 
         let tmp_dir =
-            std::env::temp_dir().join(format!("dlt-candle-drain-active-{}", std::process::id()));
+            std::env::temp_dir().join(format!("tv-candle-drain-active-{}", std::process::id()));
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let spill_path = tmp_dir.join("test-candles-active-drain.bin");
 
@@ -5034,7 +5030,7 @@ mod tests {
 
         // Create temp spill file
         let tmp_dir =
-            std::env::temp_dir().join(format!("dlt-candle-spill-1k-{}", std::process::id()));
+            std::env::temp_dir().join(format!("tv-candle-spill-1k-{}", std::process::id()));
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let spill_path = tmp_dir.join("candles-1k.bin");
         let file = std::fs::File::create(&spill_path).unwrap();
@@ -5208,7 +5204,7 @@ mod tests {
         let mut writer = LiveCandleWriter::new(&config).unwrap();
 
         let tmp_dir =
-            std::env::temp_dir().join(format!("dlt-candle-drain-spill-{}", std::process::id()));
+            std::env::temp_dir().join(format!("tv-candle-drain-spill-{}", std::process::id()));
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let spill_path = tmp_dir.join("candles-drain.bin");
 
@@ -5705,7 +5701,7 @@ mod tests {
 
         // Write a spill file with known candle data
         let tmp_dir =
-            std::env::temp_dir().join(format!("dlt-candle-drain-test-{}", std::process::id()));
+            std::env::temp_dir().join(format!("tv-candle-drain-test-{}", std::process::id()));
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let spill_path = tmp_dir.join("candles-test-drain.bin");
 
@@ -5783,7 +5779,7 @@ mod tests {
         let mut writer = LiveCandleWriter::new(&config).unwrap();
 
         let tmp_dir =
-            std::env::temp_dir().join(format!("dlt-candle-corrupt-{}", std::process::id()));
+            std::env::temp_dir().join(format!("tv-candle-corrupt-{}", std::process::id()));
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let spill_path = tmp_dir.join("candles-corrupt.bin");
 
@@ -5813,7 +5809,7 @@ mod tests {
         let mut writer = LiveCandleWriter::new(&config).unwrap();
 
         let tmp_dir =
-            std::env::temp_dir().join(format!("dlt-candle-build-err-{}", std::process::id()));
+            std::env::temp_dir().join(format!("tv-candle-build-err-{}", std::process::id()));
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let spill_path = tmp_dir.join("candles-build-err.bin");
 
@@ -5859,7 +5855,7 @@ mod tests {
         writer.sender = None;
 
         let tmp_dir =
-            std::env::temp_dir().join(format!("dlt-candle-flush-fail-{}", std::process::id()));
+            std::env::temp_dir().join(format!("tv-candle-flush-fail-{}", std::process::id()));
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let spill_path = tmp_dir.join("candles-flush-fail.bin");
 

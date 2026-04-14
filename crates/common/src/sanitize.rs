@@ -27,7 +27,7 @@
 /// # Examples
 ///
 /// ```
-/// use dhan_live_trader_common::sanitize::redact_url_params;
+/// use tickvault_common::sanitize::redact_url_params;
 ///
 /// let raw = "error for url (https://auth.dhan.co/app/gen?dhanClientId=123&pin=456)";
 /// let safe = redact_url_params(raw);

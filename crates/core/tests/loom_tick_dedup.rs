@@ -8,7 +8,7 @@
 //! These tests verify correctness under all possible thread interleavings
 //! using the Loom model checker.
 //!
-//! Run with: cargo test -p dhan-live-trader-core --features loom --test loom_tick_dedup
+//! Run with: cargo test -p tickvault-core --features loom --test loom_tick_dedup
 
 #[cfg(feature = "loom")]
 mod loom_tests {

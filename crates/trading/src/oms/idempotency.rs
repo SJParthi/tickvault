@@ -19,7 +19,7 @@
 
 use std::collections::HashMap;
 
-use dhan_live_trader_common::constants::DHAN_CORRELATION_ID_MAX_LENGTH;
+use tickvault_common::constants::DHAN_CORRELATION_ID_MAX_LENGTH;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------

@@ -38,13 +38,13 @@ Once found, update config defaults → our IV solver also produces matching resu
 - [x] P1: Fix IST timestamp offset for all 4 tables
   - Files: crates/app/src/greeks_pipeline.rs
   - Change line 128: add `IST_UTC_OFFSET_NANOS` to `now_nanos`
-  - Import: `use dhan_live_trader_common::constants::IST_UTC_OFFSET_NANOS;`
+  - Import: `use tickvault_common::constants::IST_UTC_OFFSET_NANOS;`
   - Tests: test_critical_greeks_timestamp_includes_ist_offset
 
 - [x] P2: Fix IST-based today date for time-to-expiry
   - Files: crates/app/src/greeks_pipeline.rs
   - Change line 129: use IST-based date instead of UTC
-  - Import: `use dhan_live_trader_common::constants::IST_UTC_OFFSET_SECONDS_I64;`
+  - Import: `use tickvault_common::constants::IST_UTC_OFFSET_SECONDS_I64;`
   - Tests: test_today_uses_ist_date
 
 - [x] P3: Populate symbol_name from available data

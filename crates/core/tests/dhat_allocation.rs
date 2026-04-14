@@ -10,7 +10,7 @@
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
-use dhan_live_trader_common::constants::{
+use tickvault_common::constants::{
     EXCHANGE_SEGMENT_NSE_FNO, FULL_QUOTE_PACKET_SIZE, MARKET_DEPTH_PACKET_SIZE, QUOTE_PACKET_SIZE,
     TICKER_PACKET_SIZE,
 };
@@ -123,24 +123,24 @@ fn dhat_all_parsers_zero_alloc() {
     let stats_before = dhat::HeapStats::get();
 
     // 1. Ticker parse
-    assert!(dhan_live_trader_core::parser::dispatch_frame(&ticker_pkt, 0).is_ok());
+    assert!(tickvault_core::parser::dispatch_frame(&ticker_pkt, 0).is_ok());
 
     // 2. Quote parse
-    assert!(dhan_live_trader_core::parser::dispatch_frame(&quote_pkt, 0).is_ok());
+    assert!(tickvault_core::parser::dispatch_frame(&quote_pkt, 0).is_ok());
 
     // 3. Market depth parse
-    assert!(dhan_live_trader_core::parser::dispatch_frame(&depth_pkt, 0).is_ok());
+    assert!(tickvault_core::parser::dispatch_frame(&depth_pkt, 0).is_ok());
 
     // 4. Full packet parse
-    assert!(dhan_live_trader_core::parser::dispatch_frame(&full_pkt, 0).is_ok());
+    assert!(tickvault_core::parser::dispatch_frame(&full_pkt, 0).is_ok());
 
     // 5. Burst: 100 ticker parses
     for pkt in &burst_pkts {
-        assert!(dhan_live_trader_core::parser::dispatch_frame(pkt, 0).is_ok());
+        assert!(tickvault_core::parser::dispatch_frame(pkt, 0).is_ok());
     }
 
     // 6. Error path: empty frame
-    assert!(dhan_live_trader_core::parser::dispatch_frame(empty, 0).is_err());
+    assert!(tickvault_core::parser::dispatch_frame(empty, 0).is_err());
 
     // ---- End measurement ----
     let stats_after = dhat::HeapStats::get();

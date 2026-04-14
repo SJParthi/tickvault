@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# dhan-live-trader — Secret Verification
+# tickvault — Secret Verification
 # =============================================================================
 # Verifies all secrets exist in real AWS SSM (ap-south-1).
 # Secrets are managed by Parthiban via AWS Console — this script only READS.
@@ -74,15 +74,15 @@ verify_secret() {
     fi
 }
 
-verify_secret "/dlt/${ENVIRONMENT}/dhan/client-id" "Dhan Client ID"
-verify_secret "/dlt/${ENVIRONMENT}/dhan/client-secret" "Dhan Access Token"
-verify_secret "/dlt/${ENVIRONMENT}/dhan/totp-secret" "Dhan TOTP Secret"
-verify_secret "/dlt/${ENVIRONMENT}/telegram/bot-token" "Telegram Bot Token"
-verify_secret "/dlt/${ENVIRONMENT}/telegram/chat-id" "Telegram Chat ID"
-verify_secret "/dlt/${ENVIRONMENT}/questdb/pg-user" "QuestDB PG User"
-verify_secret "/dlt/${ENVIRONMENT}/questdb/pg-password" "QuestDB PG Password"
-verify_secret "/dlt/${ENVIRONMENT}/grafana/admin-user" "Grafana Admin User"
-verify_secret "/dlt/${ENVIRONMENT}/grafana/admin-password" "Grafana Admin Password"
+verify_secret "/tickvault/${ENVIRONMENT}/dhan/client-id" "Dhan Client ID"
+verify_secret "/tickvault/${ENVIRONMENT}/dhan/client-secret" "Dhan Access Token"
+verify_secret "/tickvault/${ENVIRONMENT}/dhan/totp-secret" "Dhan TOTP Secret"
+verify_secret "/tickvault/${ENVIRONMENT}/telegram/bot-token" "Telegram Bot Token"
+verify_secret "/tickvault/${ENVIRONMENT}/telegram/chat-id" "Telegram Chat ID"
+verify_secret "/tickvault/${ENVIRONMENT}/questdb/pg-user" "QuestDB PG User"
+verify_secret "/tickvault/${ENVIRONMENT}/questdb/pg-password" "QuestDB PG Password"
+verify_secret "/tickvault/${ENVIRONMENT}/grafana/admin-user" "Grafana Admin User"
+verify_secret "/tickvault/${ENVIRONMENT}/grafana/admin-password" "Grafana Admin Password"
 
 echo ""
 
@@ -97,12 +97,12 @@ echo -e "  ${GREEN}All 9 secrets verified in AWS SSM${NC}"
 # ---- Step 4: Test Telegram notification ----
 echo ""
 echo -n "  Sending test Telegram notification... "
-TG_TOKEN=$(aws ssm get-parameter --region "${REGION}" --name "/dlt/${ENVIRONMENT}/telegram/bot-token" --with-decryption --output text --query "Parameter.Value" --no-cli-pager 2>/dev/null)
-TG_CHAT=$(aws ssm get-parameter --region "${REGION}" --name "/dlt/${ENVIRONMENT}/telegram/chat-id" --with-decryption --output text --query "Parameter.Value" --no-cli-pager 2>/dev/null)
+TG_TOKEN=$(aws ssm get-parameter --region "${REGION}" --name "/tickvault/${ENVIRONMENT}/telegram/bot-token" --with-decryption --output text --query "Parameter.Value" --no-cli-pager 2>/dev/null)
+TG_CHAT=$(aws ssm get-parameter --region "${REGION}" --name "/tickvault/${ENVIRONMENT}/telegram/chat-id" --with-decryption --output text --query "Parameter.Value" --no-cli-pager 2>/dev/null)
 
 RESPONSE=$(curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
     -H "Content-Type: application/json" \
-    -d "{\"chat_id\": \"${TG_CHAT}\", \"text\": \"dhan-live-trader: Bootstrap complete. Telegram active.\", \"parse_mode\": \"HTML\"}" 2>/dev/null)
+    -d "{\"chat_id\": \"${TG_CHAT}\", \"text\": \"tickvault: Bootstrap complete. Telegram active.\", \"parse_mode\": \"HTML\"}" 2>/dev/null)
 
 OK=$(echo "${RESPONSE}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('ok', False))" 2>/dev/null || echo "False")
 

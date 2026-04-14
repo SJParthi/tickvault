@@ -23,17 +23,17 @@ use anyhow::{Context, Result};
 use chrono::{NaiveTime, Utc};
 use tracing::{error, info, warn};
 
-use dhan_live_trader_common::config::{InstrumentConfig, QuestDbConfig, SubscriptionConfig};
-use dhan_live_trader_common::constants::INSTRUMENT_FRESHNESS_MARKER_FILENAME;
-use dhan_live_trader_common::instrument_types::FnoUniverse;
-use dhan_live_trader_common::trading_calendar::ist_offset;
+use tickvault_common::config::{InstrumentConfig, QuestDbConfig, SubscriptionConfig};
+use tickvault_common::constants::INSTRUMENT_FRESHNESS_MARKER_FILENAME;
+use tickvault_common::instrument_types::FnoUniverse;
+use tickvault_common::trading_calendar::ist_offset;
 
 use super::binary_cache::{MappedUniverse, read_binary_cache, write_binary_cache};
 use super::csv_downloader::{download_instrument_csv, load_cached_csv};
 use super::subscription_planner::{SubscriptionPlan, build_subscription_plan_from_archived};
 use super::universe_builder::build_fno_universe_from_csv;
 
-use dhan_live_trader_storage::instrument_persistence::persist_instrument_snapshot;
+use tickvault_storage::instrument_persistence::persist_instrument_snapshot;
 
 // ---------------------------------------------------------------------------
 // Load Result
@@ -442,14 +442,14 @@ fn now_ist_date_string() -> String {
 mod tests {
     use super::*;
     use chrono::Timelike;
-    use dhan_live_trader_common::config::SubscriptionConfig;
-    use dhan_live_trader_common::constants::BINARY_CACHE_FILENAME;
-    use dhan_live_trader_common::instrument_types::UniverseBuildMetadata;
     use std::collections::HashMap;
+    use tickvault_common::config::SubscriptionConfig;
+    use tickvault_common::constants::BINARY_CACHE_FILENAME;
+    use tickvault_common::instrument_types::UniverseBuildMetadata;
 
     fn unique_temp_dir(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
-            "dlt-test-loader-{name}-{}-{:?}",
+            "tv-test-loader-{name}-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ))
@@ -534,7 +534,7 @@ mod tests {
 
     #[test]
     fn test_is_instrument_fresh_no_marker() {
-        assert!(!is_instrument_fresh("/tmp/dlt-nonexistent-marker-98765"));
+        assert!(!is_instrument_fresh("/tmp/tv-nonexistent-marker-98765"));
     }
 
     #[test]

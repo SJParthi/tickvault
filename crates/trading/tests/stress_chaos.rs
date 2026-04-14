@@ -5,7 +5,7 @@
 //! without panics, data corruption, or incorrect behavior.
 //!
 //! NOTE: Timing assertions are skipped under instrumented builds
-//! (cargo-careful, sanitizers). Set `DLT_SKIP_PERF_ASSERTIONS=1` to skip.
+//! (cargo-careful, sanitizers). Set `TV_SKIP_PERF_ASSERTIONS=1` to skip.
 
 #![allow(clippy::unwrap_used, clippy::arithmetic_side_effects)]
 
@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 /// Returns true when running under instrumented builds (cargo-careful, sanitizers).
 fn skip_perf_assertions() -> bool {
-    std::env::var("DLT_SKIP_PERF_ASSERTIONS").is_ok()
+    std::env::var("TV_SKIP_PERF_ASSERTIONS").is_ok()
 }
 
 // ===========================================================================
@@ -21,7 +21,7 @@ fn skip_perf_assertions() -> bool {
 // ===========================================================================
 
 mod stress_rate_limiter {
-    use dhan_live_trader_trading::oms::rate_limiter::OrderRateLimiter;
+    use tickvault_trading::oms::rate_limiter::OrderRateLimiter;
 
     #[test]
     fn test_stress_rate_limiter_10k_rapid_submissions() {
@@ -97,9 +97,9 @@ mod stress_rate_limiter {
 
 mod chaos_circuit_breaker {
     use super::*;
-    use dhan_live_trader_common::constants::OMS_CIRCUIT_BREAKER_FAILURE_THRESHOLD;
-    use dhan_live_trader_trading::oms::circuit_breaker::{CircuitState, OrderCircuitBreaker};
     use std::sync::Arc;
+    use tickvault_common::constants::OMS_CIRCUIT_BREAKER_FAILURE_THRESHOLD;
+    use tickvault_trading::oms::circuit_breaker::{CircuitState, OrderCircuitBreaker};
 
     #[test]
     fn test_chaos_circuit_breaker_rapid_failure_success_alternation() {
@@ -244,8 +244,8 @@ mod chaos_circuit_breaker {
 
 mod stress_risk_engine {
     use super::*;
-    use dhan_live_trader_trading::risk::engine::RiskEngine;
-    use dhan_live_trader_trading::risk::types::RiskBreach;
+    use tickvault_trading::risk::engine::RiskEngine;
+    use tickvault_trading::risk::types::RiskBreach;
 
     #[test]
     fn test_stress_risk_engine_multiple_fills_same_security() {
@@ -420,9 +420,9 @@ mod stress_risk_engine {
 
 mod stress_indicator_engine {
     use super::*;
-    use dhan_live_trader_common::tick_types::ParsedTick;
-    use dhan_live_trader_trading::indicator::engine::IndicatorEngine;
-    use dhan_live_trader_trading::indicator::types::IndicatorParams;
+    use tickvault_common::tick_types::ParsedTick;
+    use tickvault_trading::indicator::engine::IndicatorEngine;
+    use tickvault_trading::indicator::types::IndicatorParams;
 
     fn make_tick(security_id: u32, ltp: f32, volume: u32) -> ParsedTick {
         ParsedTick {
@@ -539,7 +539,7 @@ mod stress_indicator_engine {
         let mut engine = IndicatorEngine::new(params);
 
         // Feed exactly MAX_INDICATOR_WARMUP_TICKS ticks to one instrument.
-        let warmup = dhan_live_trader_common::constants::MAX_INDICATOR_WARMUP_TICKS;
+        let warmup = tickvault_common::constants::MAX_INDICATOR_WARMUP_TICKS;
         for i in 0..warmup {
             let tick = make_tick(1, 100.0 + (i as f32), 100);
             let snapshot = engine.update(&tick);
@@ -610,8 +610,8 @@ mod stress_indicator_engine {
 // ===========================================================================
 
 mod stress_state_machine {
-    use dhan_live_trader_common::order_types::OrderStatus;
-    use dhan_live_trader_trading::oms::state_machine::{is_valid_transition, parse_order_status};
+    use tickvault_common::order_types::OrderStatus;
+    use tickvault_trading::oms::state_machine::{is_valid_transition, parse_order_status};
 
     /// All 10 OrderStatus variants.
     const ALL_STATUSES: [OrderStatus; 10] = [
@@ -809,9 +809,9 @@ mod stress_state_machine {
 
 mod stress_cross_component {
     use super::*;
-    use dhan_live_trader_trading::indicator::types::{IndicatorParams, RingBuffer};
-    use dhan_live_trader_trading::oms::circuit_breaker::OrderCircuitBreaker;
-    use dhan_live_trader_trading::risk::engine::RiskEngine;
+    use tickvault_trading::indicator::types::{IndicatorParams, RingBuffer};
+    use tickvault_trading::oms::circuit_breaker::OrderCircuitBreaker;
+    use tickvault_trading::risk::engine::RiskEngine;
 
     #[test]
     fn test_stress_ring_buffer_10m_pushes() {
@@ -835,7 +835,7 @@ mod stress_cross_component {
     #[test]
     fn test_stress_ring_buffer_eviction_correctness() {
         let mut ring = RingBuffer::new();
-        let cap = dhan_live_trader_common::constants::INDICATOR_RING_BUFFER_CAPACITY;
+        let cap = tickvault_common::constants::INDICATOR_RING_BUFFER_CAPACITY;
 
         // Fill the buffer, then overwrite with known values.
         for i in 0..(cap * 3) {

@@ -1,5 +1,5 @@
 # =============================================================================
-# dhan-live-trader — Safety Net (Weekly Scheduled)
+# tickvault — Safety Net (Weekly Scheduled)
 # =============================================================================
 # UB detection, memory safety, concurrency bugs.
 # Runs weekly (Monday 6 AM UTC). Creates GitHub issue on failure.
@@ -70,10 +70,10 @@ jobs:
         id: test
         if: steps.build.outcome == 'success'
         env:
-          DLT_SKIP_PERF_ASSERTIONS: "1"
+          TV_SKIP_PERF_ASSERTIONS: "1"
         run: |
           # --test-threads=1: reduces memory pressure on CI runners
-          # DLT_SKIP_PERF_ASSERTIONS: skip timing assertions (instrumentation = 10-100x slower)
+          # TV_SKIP_PERF_ASSERTIONS: skip timing assertions (instrumentation = 10-100x slower)
           cargo +${{ env.NIGHTLY_VERSION }} careful test --workspace \
             -- --test-threads=1 2>&1 | tee /tmp/careful-test.log || {
             echo "test_failed=true" >> "$GITHUB_OUTPUT"
@@ -185,7 +185,7 @@ jobs:
         if: steps.build.outcome == 'success'
         env:
           RUSTFLAGS: "-Z sanitizer=address"
-          DLT_SKIP_PERF_ASSERTIONS: "1"
+          TV_SKIP_PERF_ASSERTIONS: "1"
         run: |
           cargo +${{ env.NIGHTLY_VERSION }} test --workspace \
             --target x86_64-unknown-linux-gnu \
@@ -296,7 +296,7 @@ jobs:
         if: steps.build.outcome == 'success'
         env:
           RUSTFLAGS: "-Z sanitizer=thread"
-          DLT_SKIP_PERF_ASSERTIONS: "1"
+          TV_SKIP_PERF_ASSERTIONS: "1"
         run: |
           cargo +${{ env.NIGHTLY_VERSION }} test --workspace \
             --target x86_64-unknown-linux-gnu \

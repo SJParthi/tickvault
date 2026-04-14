@@ -87,7 +87,7 @@ Every rule here is checked by tests, hooks, or clippy — never by human review 
 - Test: all `ip_monitor::tests::*`
 
 ## GAP-SEC-01: API Auth Middleware
-- Bearer token from `DLT_API_TOKEN` env var
+- Bearer token from `TV_API_TOKEN` env var
 - Disabled = passthrough (dev mode)
 - Case-sensitive "Bearer " prefix (not "bearer ")
 - Empty/missing/wrong token = 401 Unauthorized

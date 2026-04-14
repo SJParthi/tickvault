@@ -303,4 +303,4 @@ pub struct LoginReq {
 
 7. **`Remarks: "Super Order"`** — indicates the order belongs to a Super Order group.
 
-8. **For dhan-live-trader monitoring phase**: Connect this WebSocket alongside market feed. Log all order updates for debugging without executing any orders.
+8. **For tickvault monitoring phase**: Connect this WebSocket alongside market feed. Log all order updates for debugging without executing any orders.

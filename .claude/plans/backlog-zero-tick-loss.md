@@ -32,7 +32,7 @@ New test `crates/storage/tests/chaos_disk_full.rs`. Fills spill dir to `TICK_SPI
 New test `crates/storage/tests/chaos_sigkill_replay.rs`. Forks child process, streams ticks, SIGKILLs mid-stream, restarts child, asserts spill file is replayed on startup and every pre-kill tick is in QuestDB. `#[ignore]`, unix-only.
 
 ### B4 — Docker chaos harness
-Expand `chaos_questdb_lifecycle::chaos_docker_questdb_kill_and_restart` (skeleton in place) to actually kill/restart a real `dlt-questdb` container. Needs `CI_WITH_DOCKER=1`.
+Expand `chaos_questdb_lifecycle::chaos_docker_questdb_kill_and_restart` (skeleton in place) to actually kill/restart a real `tv-questdb` container. Needs `CI_WITH_DOCKER=1`.
 
 ## Doc verification
 
@@ -42,7 +42,7 @@ Fetch every URL from the user's list (WebFetch) + clone DhanHQ-py, diff against 
 ## Observability
 
 ### E1 — Prometheus metrics for new paths
-Add counters/gauges: `dlt_backfill_ticks_total`, `dlt_backfill_errors_total`, `dlt_dlq_ticks_total` (already emitted from A2 — just wire into scrape), `dlt_pool_degraded_seconds_total`, `dlt_sandbox_gate_blocks_total`.
+Add counters/gauges: `tv_backfill_ticks_total`, `tv_backfill_errors_total`, `tv_dlq_ticks_total` (already emitted from A2 — just wire into scrape), `tv_pool_degraded_seconds_total`, `tv_sandbox_gate_blocks_total`.
 
 ### E2 — Grafana alert rules
 Append to `deploy/docker/grafana/provisioning/alerting/*.yaml`:

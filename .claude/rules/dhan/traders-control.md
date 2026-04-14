@@ -41,7 +41,7 @@
 
 13. **P&L exit DELETE response:** `{ "pnlExitStatus": "DISABLED", "message": "..." }`.
 
-14. **For dhan-live-trader:** Wire kill switch activation into error handlers. On critical errors during live trading → call kill switch immediately.
+14. **For tickvault:** Wire kill switch activation into error handlers. On critical errors during live trading → call kill switch immediately.
 
 ## What This Prevents
 

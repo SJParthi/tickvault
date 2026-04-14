@@ -408,7 +408,7 @@ threshold = 25.0
 "#;
 
     let dir = std::env::temp_dir();
-    let path = dir.join("dlt_test_strategy_config.toml");
+    let path = dir.join("tv_test_strategy_config.toml");
     std::fs::write(&path, toml_content).unwrap();
 
     let result = load_strategy_config_file(&path);
@@ -441,7 +441,7 @@ threshold = 0.0
 "#;
 
     let dir = std::env::temp_dir();
-    let path = dir.join("dlt_test_hot_reload.toml");
+    let path = dir.join("tv_test_hot_reload.toml");
     std::fs::write(&path, toml_content).unwrap();
 
     let result = StrategyHotReloader::new(&path);

@@ -15,7 +15,7 @@
 //! - Otherwise → `AllDown(since=first observation)` OR keep existing since
 //!
 //! **Alerts emitted by `tick()`:**
-//! - At 60s in `AllDown` → fire CRITICAL Telegram + set `dlt_pool_degraded_seconds_total`
+//! - At 60s in `AllDown` → fire CRITICAL Telegram + set `tv_pool_degraded_seconds_total`
 //! - At 300s in `AllDown` → return `WatchdogVerdict::Halt` so the caller
 //!   can exit the process and let the supervisor (systemd / Docker restart
 //!   policy) restart it
@@ -60,7 +60,7 @@ pub enum WatchdogVerdict {
     Degrading { down_for: Duration },
     /// All connections have been down longer than `POOL_DEGRADED_ALERT_SECS`.
     /// Caller must fire a CRITICAL Telegram alert and update the
-    /// `dlt_pool_degraded_seconds_total` counter. Fired once per
+    /// `tv_pool_degraded_seconds_total` counter. Fired once per
     /// down-cycle unless `Recovered` resets it.
     Degraded { down_for: Duration },
     /// All connections have been down longer than `POOL_HALT_SECS`. Caller

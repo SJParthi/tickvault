@@ -285,7 +285,7 @@ fi
 # a new Dhan ticket, quote the response in the rule file, and update the
 # assertion in the same commit — all three steps.
 echo "  [9/9] Dhan locked facts (Tickets #5519522, #5525125)..." >&2
-LOCKED_OUT=$(timeout 120 cargo test -p dhan-live-trader-common --test dhan_locked_facts --quiet 2>&1)
+LOCKED_OUT=$(timeout 120 cargo test -p tickvault-common --test dhan_locked_facts --quiet 2>&1)
 LOCKED_EXIT=$?
 if [ "$LOCKED_EXIT" -eq 0 ]; then
   echo "  PASS: Dhan locked facts (8 invariants held)" >&2

@@ -41,7 +41,7 @@ Fix every Tier-A real bug from the second honest audit, plus run the heavy tools
   - Tests: dedup_backfill_replay_idempotent, dhat_backfill_synth_bounded_allocations, deny_config_exists_and_has_required_sections
 
 - [x] C1. Trace and document Dependabot CVE: rustls-webpki 0.101.7.
-  - Files: dlt-app.service
+  - Files: tickvault.service
   - Tests: deny_config_not_empty
 
 ## Test results this session

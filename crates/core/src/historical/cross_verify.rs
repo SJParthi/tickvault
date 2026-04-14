@@ -25,11 +25,11 @@ use std::time::Duration;
 use reqwest::Client;
 use tracing::{debug, error, info, warn};
 
-use dhan_live_trader_common::config::QuestDbConfig;
-use dhan_live_trader_common::constants::{
+use tickvault_common::config::QuestDbConfig;
+use tickvault_common::constants::{
     CANDLES_PER_TRADING_DAY, QUESTDB_TABLE_HISTORICAL_CANDLES, TIMEFRAME_1M,
 };
-use dhan_live_trader_common::instrument_registry::InstrumentRegistry;
+use tickvault_common::instrument_registry::InstrumentRegistry;
 
 // ---------------------------------------------------------------------------
 // Violation Detail — per-candle diagnostic record

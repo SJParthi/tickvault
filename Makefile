@@ -1,5 +1,5 @@
 # =============================================================================
-# dhan-live-trader — Development & Operations Makefile
+# tickvault — Development & Operations Makefile
 # =============================================================================
 # Usage: make <target>
 # Run `make help` to see all available targets.
@@ -13,7 +13,7 @@
         audit coverage bench geiger typos quality doc bootstrap scoped-check full-qa \
 
 # ---- Configuration ----
-APP_NAME       := dhan-live-trader
+APP_NAME       := tickvault
 APP_PORT       := 3001
 DOCKER_DIR     := deploy/docker
 COMPOSE_FILE   := $(DOCKER_DIR)/docker-compose.yml
@@ -21,7 +21,7 @@ COMPOSE_FILE   := $(DOCKER_DIR)/docker-compose.yml
 # ---- Help ----
 help: ## Show this help
 	@echo ""
-	@echo "  dhan-live-trader — Development & Operations"
+	@echo "  tickvault — Development & Operations"
 	@echo "  ════════════════════════════════════════════"
 	@echo ""
 	@echo "  APPLICATION:"
@@ -146,7 +146,7 @@ docker-status: ## Show Docker container health
 	@echo ""
 	@echo "  Docker Container Status"
 	@echo "  ───────────────────────"
-	@docker ps --format "  {{.Names}}\t{{.Status}}" --filter "name=dlt-" | sort
+	@docker ps --format "  {{.Names}}\t{{.Status}}" --filter "name=tv-" | sort
 	@echo ""
 
 docker-logs: ## Tail Docker logs (all services)
@@ -166,11 +166,11 @@ health: ## Check app health endpoint
 status: ## Full system status (Docker + App + QuestDB + Valkey)
 	@echo ""
 	@echo "  ╔════════════════════════════════════════╗"
-	@echo "  ║   dhan-live-trader — System Status     ║"
+	@echo "  ║   tickvault — System Status     ║"
 	@echo "  ╚════════════════════════════════════════╝"
 	@echo ""
 	@echo "  📦 Docker Services:"
-	@docker ps --format "     {{.Names}}\t{{.Status}}" --filter "name=dlt-" 2>/dev/null | sort || echo "     ⚠️  Docker not running"
+	@docker ps --format "     {{.Names}}\t{{.Status}}" --filter "name=tv-" 2>/dev/null | sort || echo "     ⚠️  Docker not running"
 	@echo ""
 	@echo "  🚀 Application:"
 	@if curl -s http://localhost:$(APP_PORT)/health > /dev/null 2>&1; then \
@@ -186,7 +186,7 @@ status: ## Full system status (Docker + App + QuestDB + Valkey)
 		|| echo "     ⚠️  Not reachable on port 9000"
 	@echo ""
 	@echo "  💾 Valkey:"
-	@docker exec dlt-valkey valkey-cli ping 2>/dev/null | grep -q PONG \
+	@docker exec tv-valkey valkey-cli ping 2>/dev/null | grep -q PONG \
 		&& echo "     ✅ PONG — connected" \
 		|| echo "     ⚠️  Not reachable"
 	@echo ""
@@ -273,7 +273,7 @@ obs-restart: ## Tear down + fresh restart of observability stack
 obs-open: ## Open all monitoring dashboards in browser
 	@./scripts/setup-observability.sh --verify --no-open
 	@echo "  Opening dashboards..."
-	@open http://localhost:3000/d/dlt-system-overview 2>/dev/null || xdg-open http://localhost:3000/d/dlt-system-overview 2>/dev/null || echo "  Open: http://localhost:3000/d/dlt-system-overview"
+	@open http://localhost:3000/d/tv-system-overview 2>/dev/null || xdg-open http://localhost:3000/d/tv-system-overview 2>/dev/null || echo "  Open: http://localhost:3000/d/tv-system-overview"
 	@open http://localhost:9090/targets 2>/dev/null || xdg-open http://localhost:9090/targets 2>/dev/null || true
 	@open http://localhost:16686 2>/dev/null || xdg-open http://localhost:16686 2>/dev/null || true
 	@open http://localhost:8080 2>/dev/null || xdg-open http://localhost:8080 2>/dev/null || true
@@ -320,16 +320,16 @@ aws-ami: ## Look up the latest Ubuntu 24.04 LTS AMI in ap-south-1 (export TF_VAR
 aws-operator-cidr: ## Print your current public IP CIDR for TF_VAR_operator_cidr
 	@IP=$$(curl -s ifconfig.me); echo "Your public IP: $$IP"; echo "export TF_VAR_operator_cidr=$$IP/32"
 
-aws-keypair: ## Create the dlt-prod-key SSH key pair (stores private key in ~/.ssh)
-	@if [ -f ~/.ssh/dlt-prod-key.pem ]; then \
-		echo "  SKIP: ~/.ssh/dlt-prod-key.pem already exists"; \
+aws-keypair: ## Create the tv-prod-key SSH key pair (stores private key in ~/.ssh)
+	@if [ -f ~/.ssh/tv-prod-key.pem ]; then \
+		echo "  SKIP: ~/.ssh/tv-prod-key.pem already exists"; \
 	else \
 		aws ec2 create-key-pair \
-			--key-name dlt-prod-key \
+			--key-name tv-prod-key \
 			--region ap-south-1 \
-			--query KeyMaterial --output text > ~/.ssh/dlt-prod-key.pem && \
-		chmod 400 ~/.ssh/dlt-prod-key.pem && \
-		echo "  Created ~/.ssh/dlt-prod-key.pem"; \
+			--query KeyMaterial --output text > ~/.ssh/tv-prod-key.pem && \
+		chmod 400 ~/.ssh/tv-prod-key.pem && \
+		echo "  Created ~/.ssh/tv-prod-key.pem"; \
 	fi
 
 aws-init: aws-bootstrap-check ## Initialize Terraform in deploy/aws/terraform/
@@ -354,11 +354,11 @@ aws-ssm: ## Open a Session Manager shell on the DLT instance (no SSH)
 	@cd deploy/aws/terraform && INSTANCE=$$(terraform output -raw instance_id) && \
 	aws ssm start-session --region ap-south-1 --target $$INSTANCE
 
-aws-ssm-command: ## Run 'journalctl -u dlt-app -n 50' on the instance via SSM
+aws-ssm-command: ## Run 'journalctl -u tickvault -n 50' on the instance via SSM
 	@cd deploy/aws/terraform && INSTANCE=$$(terraform output -raw instance_id) && \
 	CMD_ID=$$(aws ssm send-command --region ap-south-1 --instance-ids $$INSTANCE \
 		--document-name AWS-RunShellScript \
-		--parameters 'commands=["journalctl -u dlt-app -n 50 --no-pager"]' \
+		--parameters 'commands=["journalctl -u tickvault -n 50 --no-pager"]' \
 		--query Command.CommandId --output text) && \
 	sleep 3 && \
 	aws ssm get-command-invocation --region ap-south-1 \

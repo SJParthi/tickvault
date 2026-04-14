@@ -20,9 +20,9 @@ use std::collections::HashMap;
 use chrono::NaiveDate;
 use tracing::warn;
 
-use dhan_live_trader_common::instrument_registry::InstrumentRegistry;
-use dhan_live_trader_common::tick_types::{GreeksEnricher, ParsedTick};
-use dhan_live_trader_common::types::{ExchangeSegment, OptionType};
+use tickvault_common::instrument_registry::InstrumentRegistry;
+use tickvault_common::tick_types::{GreeksEnricher, ParsedTick};
+use tickvault_common::types::{ExchangeSegment, OptionType};
 
 use super::black_scholes::{self, OptionSide};
 
@@ -257,11 +257,11 @@ impl GreeksEnricher for InlineGreeksComputer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dhan_live_trader_common::instrument_registry::{
+    use tickvault_common::instrument_registry::{
         InstrumentRegistry, SubscribedInstrument, SubscriptionCategory,
     };
-    use dhan_live_trader_common::instrument_types::DhanInstrumentKind;
-    use dhan_live_trader_common::types::FeedMode;
+    use tickvault_common::instrument_types::DhanInstrumentKind;
+    use tickvault_common::types::FeedMode;
 
     /// Helper: create a basic underlying instrument (index/equity).
     fn make_underlying(

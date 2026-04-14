@@ -22,7 +22,7 @@ resource "aws_vpc" "dlt" {
   enable_dns_support   = true
 
   tags = {
-    Name = "dlt-${var.environment}-vpc"
+    Name = "tv-${var.environment}-vpc"
   }
 }
 
@@ -30,7 +30,7 @@ resource "aws_internet_gateway" "dlt" {
   vpc_id = aws_vpc.dlt.id
 
   tags = {
-    Name = "dlt-${var.environment}-igw"
+    Name = "tv-${var.environment}-igw"
   }
 }
 
@@ -41,7 +41,7 @@ resource "aws_subnet" "public" {
   map_public_ip_on_launch = false # we use a static EIP
 
   tags = {
-    Name = "dlt-${var.environment}-public-a"
+    Name = "tv-${var.environment}-public-a"
   }
 }
 
@@ -54,7 +54,7 @@ resource "aws_route_table" "public" {
   }
 
   tags = {
-    Name = "dlt-${var.environment}-public-rt"
+    Name = "tv-${var.environment}-public-rt"
   }
 }
 
@@ -67,8 +67,8 @@ resource "aws_route_table_association" "public" {
 # Security
 # ---------------------------------------------------------------------------
 
-resource "aws_security_group" "dlt_app" {
-  name        = "dlt-${var.environment}-app"
+resource "aws_security_group" "tv_app" {
+  name        = "tv-${var.environment}-app"
   description = "DLT app: SSH from operator, egress to Dhan + AWS services"
   vpc_id      = aws_vpc.dlt.id
 
@@ -89,7 +89,7 @@ resource "aws_security_group" "dlt_app" {
   }
 
   tags = {
-    Name = "dlt-${var.environment}-app-sg"
+    Name = "tv-${var.environment}-app-sg"
   }
 }
 
@@ -97,8 +97,8 @@ resource "aws_security_group" "dlt_app" {
 # IAM
 # ---------------------------------------------------------------------------
 
-resource "aws_iam_role" "dlt_instance" {
-  name = "dlt-${var.environment}-instance-role"
+resource "aws_iam_role" "tv_instance" {
+  name = "tv-${var.environment}-instance-role"
 
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
@@ -112,9 +112,9 @@ resource "aws_iam_role" "dlt_instance" {
   })
 }
 
-resource "aws_iam_role_policy" "dlt_instance" {
-  name = "dlt-${var.environment}-instance-policy"
-  role = aws_iam_role.dlt_instance.id
+resource "aws_iam_role_policy" "tv_instance" {
+  name = "tv-${var.environment}-instance-policy"
+  role = aws_iam_role.tv_instance.id
 
   policy = jsonencode({
     Version = "2012-10-17"
@@ -127,7 +127,7 @@ resource "aws_iam_role_policy" "dlt_instance" {
           "ssm:PutParameter",
         ]
         Resource = [
-          "arn:aws:ssm:${var.aws_region}:*:parameter/dlt/${var.environment}/*"
+          "arn:aws:ssm:${var.aws_region}:*:parameter/tickvault/${var.environment}/*"
         ]
       },
       {
@@ -135,7 +135,7 @@ resource "aws_iam_role_policy" "dlt_instance" {
         Action = [
           "sns:Publish",
         ]
-        Resource = aws_sns_topic.dlt_alerts.arn
+        Resource = aws_sns_topic.tv_alerts.arn
       },
       {
         Effect = "Allow"
@@ -154,30 +154,30 @@ resource "aws_iam_role_policy" "dlt_instance" {
           "s3:ListBucket",
         ]
         Resource = [
-          "arn:aws:s3:::dlt-${var.environment}-cold/*",
-          "arn:aws:s3:::dlt-${var.environment}-cold"
+          "arn:aws:s3:::tv-${var.environment}-cold/*",
+          "arn:aws:s3:::tv-${var.environment}-cold"
         ]
       }
     ]
   })
 }
 
-resource "aws_iam_instance_profile" "dlt_instance" {
-  name = "dlt-${var.environment}-instance-profile"
-  role = aws_iam_role.dlt_instance.name
+resource "aws_iam_instance_profile" "tv_instance" {
+  name = "tv-${var.environment}-instance-profile"
+  role = aws_iam_role.tv_instance.name
 }
 
 # ---------------------------------------------------------------------------
 # EC2 instance + EIP
 # ---------------------------------------------------------------------------
 
-resource "aws_instance" "dlt_app" {
+resource "aws_instance" "tv_app" {
   ami                    = var.ami_id
   instance_type          = var.instance_type
   subnet_id              = aws_subnet.public.id
-  vpc_security_group_ids = [aws_security_group.dlt_app.id]
+  vpc_security_group_ids = [aws_security_group.tv_app.id]
   key_name               = var.key_name
-  iam_instance_profile   = aws_iam_instance_profile.dlt_instance.name
+  iam_instance_profile   = aws_iam_instance_profile.tv_instance.name
   monitoring             = true
 
   metadata_options {
@@ -194,7 +194,7 @@ resource "aws_instance" "dlt_app" {
     encrypted             = true
     delete_on_termination = false
     tags = {
-      Name = "dlt-${var.environment}-root"
+      Name = "tv-${var.environment}-root"
     }
   }
 
@@ -205,7 +205,7 @@ resource "aws_instance" "dlt_app" {
   })
 
   tags = {
-    Name = "dlt-${var.environment}-app"
+    Name = "tv-${var.environment}-app"
   }
 
   lifecycle {
@@ -213,12 +213,12 @@ resource "aws_instance" "dlt_app" {
   }
 }
 
-resource "aws_eip" "dlt_app" {
+resource "aws_eip" "tv_app" {
   domain   = "vpc"
-  instance = aws_instance.dlt_app.id
+  instance = aws_instance.tv_app.id
 
   tags = {
-    Name = "dlt-${var.environment}-eip"
+    Name = "tv-${var.environment}-eip"
   }
 }
 
@@ -226,16 +226,16 @@ resource "aws_eip" "dlt_app" {
 # SNS topic for CRITICAL alerts
 # ---------------------------------------------------------------------------
 
-resource "aws_sns_topic" "dlt_alerts" {
-  name = "dlt-${var.environment}-alerts"
+resource "aws_sns_topic" "tv_alerts" {
+  name = "tv-${var.environment}-alerts"
 }
 
 # ---------------------------------------------------------------------------
 # CloudWatch log group
 # ---------------------------------------------------------------------------
 
-resource "aws_cloudwatch_log_group" "dlt_app" {
-  name              = "/dlt/${var.environment}/app"
+resource "aws_cloudwatch_log_group" "tv_app" {
+  name              = "/tickvault/${var.environment}/app"
   retention_in_days = 14 # 14 days hot, S3 lifecycle handles cold
 }
 
@@ -251,36 +251,36 @@ resource "aws_cloudwatch_log_group" "dlt_app" {
 # ---------------------------------------------------------------------------
 
 resource "aws_cloudwatch_event_rule" "weekday_start" {
-  name                = "dlt-${var.environment}-weekday-start"
+  name                = "tv-${var.environment}-weekday-start"
   description         = "Start DLT instance at 08:00 IST on weekdays"
   schedule_expression = "cron(30 2 ? * MON-FRI *)"
 }
 
 resource "aws_cloudwatch_event_rule" "weekday_stop" {
-  name                = "dlt-${var.environment}-weekday-stop"
+  name                = "tv-${var.environment}-weekday-stop"
   description         = "Stop DLT instance at 17:00 IST on weekdays"
   schedule_expression = "cron(30 11 ? * MON-FRI *)"
 }
 
 resource "aws_cloudwatch_event_rule" "weekend_start" {
-  name                = "dlt-${var.environment}-weekend-start"
+  name                = "tv-${var.environment}-weekend-start"
   description         = "Start DLT instance at 08:00 IST on weekends"
   schedule_expression = "cron(30 2 ? * SAT-SUN *)"
 }
 
 resource "aws_cloudwatch_event_rule" "weekend_stop" {
-  name                = "dlt-${var.environment}-weekend-stop"
+  name                = "tv-${var.environment}-weekend-stop"
   description         = "Stop DLT instance at 13:00 IST on weekends"
   schedule_expression = "cron(30 7 ? * SAT-SUN *)"
 }
 
 # S3 cold-storage bucket for tick data > 14 days old.
-resource "aws_s3_bucket" "dlt_cold" {
-  bucket = "dlt-${var.environment}-cold"
+resource "aws_s3_bucket" "tv_cold" {
+  bucket = "tv-${var.environment}-cold"
 }
 
-resource "aws_s3_bucket_lifecycle_configuration" "dlt_cold" {
-  bucket = aws_s3_bucket.dlt_cold.id
+resource "aws_s3_bucket_lifecycle_configuration" "tv_cold" {
+  bucket = aws_s3_bucket.tv_cold.id
 
   rule {
     id     = "tick-cold-tiering"
@@ -304,8 +304,8 @@ resource "aws_s3_bucket_lifecycle_configuration" "dlt_cold" {
   }
 }
 
-resource "aws_s3_bucket_public_access_block" "dlt_cold" {
-  bucket                  = aws_s3_bucket.dlt_cold.id
+resource "aws_s3_bucket_public_access_block" "tv_cold" {
+  bucket                  = aws_s3_bucket.tv_cold.id
   block_public_acls       = true
   block_public_policy     = true
   ignore_public_acls      = true

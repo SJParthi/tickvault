@@ -5,14 +5,14 @@
 //! - Valid packets parse with correct security_id and segment
 //! - Parsed fields are within valid ranges
 
-use dhan_live_trader_common::constants::{
+use proptest::prelude::*;
+use tickvault_common::constants::{
     DISCONNECT_PACKET_SIZE, EXCHANGE_SEGMENT_NSE_FNO, FULL_QUOTE_PACKET_SIZE,
     MARKET_DEPTH_PACKET_SIZE, OI_PACKET_SIZE, PREVIOUS_CLOSE_PACKET_SIZE, QUOTE_PACKET_SIZE,
     TICKER_PACKET_SIZE,
 };
-use dhan_live_trader_core::parser::dispatch_frame;
-use dhan_live_trader_core::parser::types::ParsedFrame;
-use proptest::prelude::*;
+use tickvault_core::parser::dispatch_frame;
+use tickvault_core::parser::types::ParsedFrame;
 
 // ---------------------------------------------------------------------------
 // Helpers — construct valid packets with random field values

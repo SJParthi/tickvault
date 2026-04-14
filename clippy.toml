@@ -1,5 +1,5 @@
 # =============================================================================
-# dhan-live-trader — Clippy Linter Configuration
+# tickvault — Clippy Linter Configuration
 # =============================================================================
 # Used by `cargo clippy`. Thresholds for lint rules.
 # =============================================================================

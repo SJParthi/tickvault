@@ -1,8 +1,8 @@
 # =============================================================================
-# dhan-live-trader — Production Configuration Override
+# tickvault — Production Configuration Override
 # =============================================================================
 # Layer on top of base.toml. Only settings that DIFFER from dev go here.
-# Secrets come from AWS SSM Parameter Store (/dlt/prod/...).
+# Secrets come from AWS SSM Parameter Store (/tickvault/prod/...).
 # Deploy: config/base.toml + config/production.toml merged via figment.
 # =============================================================================
 
@@ -29,7 +29,7 @@ ip_verification_enabled = true
 ip_check_interval_secs = 300
 
 [valkey]
-# Password loaded from SSM at boot: /dlt/prod/valkey/password
+# Password loaded from SSM at boot: /tickvault/prod/valkey/password
 password = ""
 
 [logging]

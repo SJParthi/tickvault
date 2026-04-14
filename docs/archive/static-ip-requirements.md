@@ -54,7 +54,7 @@ Layer 1: AWS Elastic IP (Infrastructure)
   └─ Free when attached to running instance
 
 Layer 2: SSM Parameter (Configuration)
-  └─ /dlt/<env>/network/static-ip
+  └─ /tickvault/<env>/network/static-ip
   └─ Set by DevOps after Elastic IP provisioning
   └─ App reads this to know what IP to expect
 
@@ -89,7 +89,7 @@ and BEFORE auth (so no Dhan API call happens from a wrong IP).
 ### 3.2 Verification Steps
 
 ```
-1. Fetch expected IP from SSM (/dlt/<env>/network/static-ip)
+1. Fetch expected IP from SSM (/tickvault/<env>/network/static-ip)
 2. Validate expected IP format (IPv4 only)
 3. Detect actual public IP via HTTPS (primary + fallback)
 4. Compare expected vs actual

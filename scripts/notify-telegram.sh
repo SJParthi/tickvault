@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# dhan-live-trader — Send Telegram notification
+# tickvault — Send Telegram notification
 # =============================================================================
 # Reads bot token + chat ID from AWS SSM Parameter Store.
 #
@@ -21,8 +21,8 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 REGION="ap-south-1"
 ENV="${ENVIRONMENT:-dev}"
-SSM_BOT_TOKEN="/dlt/${ENV}/telegram/bot-token"
-SSM_CHAT_ID="/dlt/${ENV}/telegram/chat-id"
+SSM_BOT_TOKEN="/tickvault/${ENV}/telegram/bot-token"
+SSM_CHAT_ID="/tickvault/${ENV}/telegram/chat-id"
 TELEGRAM_API="https://api.telegram.org"
 
 # Always uses real AWS SSM in ap-south-1.

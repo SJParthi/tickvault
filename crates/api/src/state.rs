@@ -6,9 +6,9 @@ use std::sync::{Arc, RwLock};
 /// Timeout for QuestDB HTTP queries from API handlers (seconds).
 const QUESTDB_HTTP_CLIENT_TIMEOUT_SECS: u64 = 10;
 
-use dhan_live_trader_common::config::{DhanConfig, InstrumentConfig, QuestDbConfig};
-use dhan_live_trader_common::instrument_types::IndexConstituencyMap;
-use dhan_live_trader_core::pipeline::top_movers::SharedTopMoversSnapshot;
+use tickvault_common::config::{DhanConfig, InstrumentConfig, QuestDbConfig};
+use tickvault_common::instrument_types::IndexConstituencyMap;
+use tickvault_core::pipeline::top_movers::SharedTopMoversSnapshot;
 
 /// Shared handle to the index constituency map (Arc<RwLock<Option<...>>>).
 pub type SharedConstituencyMap = Arc<RwLock<Option<IndexConstituencyMap>>>;
@@ -311,7 +311,7 @@ impl SharedAppState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dhan_live_trader_common::config::{DhanConfig, InstrumentConfig, QuestDbConfig};
+    use tickvault_common::config::{DhanConfig, InstrumentConfig, QuestDbConfig};
 
     fn test_dhan_config() -> DhanConfig {
         DhanConfig {
@@ -332,7 +332,7 @@ mod tests {
     fn test_instrument_config() -> InstrumentConfig {
         InstrumentConfig {
             daily_download_time: "08:55:00".to_string(),
-            csv_cache_directory: "/tmp/dlt-cache".to_string(),
+            csv_cache_directory: "/tmp/tv-cache".to_string(),
             csv_cache_filename: "instruments.csv".to_string(),
             csv_download_timeout_secs: 120,
             build_window_start: "08:25:00".to_string(),

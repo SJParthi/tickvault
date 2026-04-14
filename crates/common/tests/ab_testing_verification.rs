@@ -10,7 +10,7 @@
     clippy::assertions_on_constants
 )] // APPROVED: S4 — schema-stability drift detection tests intentionally assert on compile-time constants as regression guards against Dhan API changes
 mod config_drift_detection {
-    use dhan_live_trader_common::constants::*;
+    use tickvault_common::constants::*;
 
     /// DRIFT-01: Packet sizes must match Dhan protocol spec.
     #[test]
@@ -252,10 +252,10 @@ mod config_drift_detection {
 )] // APPROVED: S4 schema-drift guards
 mod market_hours_verification {
     use chrono::{Datelike, NaiveDate, Weekday};
-    use dhan_live_trader_common::trading_calendar::TradingCalendar;
+    use tickvault_common::trading_calendar::TradingCalendar;
 
     fn make_calendar() -> TradingCalendar {
-        let config = dhan_live_trader_common::config::TradingConfig {
+        let config = tickvault_common::config::TradingConfig {
             market_open_time: "09:15:00".to_string(),
             market_close_time: "15:30:00".to_string(),
             order_cutoff_time: "15:29:00".to_string(),
@@ -309,7 +309,7 @@ mod market_hours_verification {
     /// SIM-04: Holiday is not a trading day.
     #[test]
     fn sim_holiday_not_trading() {
-        use dhan_live_trader_common::config::{NseHolidayEntry, TradingConfig};
+        use tickvault_common::config::{NseHolidayEntry, TradingConfig};
 
         let config = TradingConfig {
             market_open_time: "09:15:00".to_string(),
@@ -382,7 +382,7 @@ mod market_hours_verification {
     /// SIM-09: ist_offset returns +05:30.
     #[test]
     fn sim_ist_offset() {
-        let offset = dhan_live_trader_common::trading_calendar::ist_offset();
+        let offset = tickvault_common::trading_calendar::ist_offset();
         assert_eq!(
             offset.local_minus_utc(),
             19800,
@@ -406,7 +406,7 @@ mod market_hours_verification {
     clippy::assertions_on_constants
 )] // APPROVED: S4 schema-drift guards
 mod exchange_segment_ab_tests {
-    use dhan_live_trader_common::types::ExchangeSegment;
+    use tickvault_common::types::ExchangeSegment;
 
     /// AB-SEG-01: Exchange segment enum covers all Dhan segments.
     #[test]
@@ -467,7 +467,7 @@ mod exchange_segment_ab_tests {
     clippy::assertions_on_constants
 )] // APPROVED: S4 schema-drift guards
 mod order_types_ab_tests {
-    use dhan_live_trader_common::order_types::OrderStatus;
+    use tickvault_common::order_types::OrderStatus;
 
     /// AB-ORD-01: All 10 order status variants exist (includes Confirmed).
     #[test]
@@ -528,7 +528,7 @@ mod order_types_ab_tests {
     clippy::assertions_on_constants
 )] // APPROVED: S4 schema-drift guards
 mod instrument_types_ab_tests {
-    use dhan_live_trader_common::types::InstrumentType;
+    use tickvault_common::types::InstrumentType;
 
     /// AB-INST-01: All 4 instrument type variants exist.
     #[test]
@@ -564,7 +564,7 @@ mod instrument_types_ab_tests {
     clippy::assertions_on_constants
 )] // APPROVED: S4 schema-drift guards
 mod feed_mode_ab_tests {
-    use dhan_live_trader_common::types::FeedMode;
+    use tickvault_common::types::FeedMode;
 
     /// AB-FEED-01: All feed modes exist.
     #[test]
@@ -597,7 +597,7 @@ mod feed_mode_ab_tests {
     clippy::assertions_on_constants
 )] // APPROVED: S4 schema-drift guards
 mod packet_structure_ab_tests {
-    use dhan_live_trader_common::constants::*;
+    use tickvault_common::constants::*;
 
     /// AB-PKT-01: Full packet = header + LTP/LTQ/LTT/... + 5 depth levels.
     #[test]

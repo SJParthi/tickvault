@@ -210,7 +210,7 @@ threshold = 30.0
         let unique_id = COUNTER.fetch_add(1, Ordering::Relaxed);
 
         let dir = std::env::temp_dir().join(format!(
-            "dlt_hot_reload_test_{}_{}",
+            "tv_hot_reload_test_{}_{}",
             std::process::id(),
             unique_id,
         ));
@@ -284,7 +284,7 @@ threshold = 30.0
 
     #[test]
     fn new_fails_with_nonexistent_file() {
-        let nonexistent = Path::new("/tmp/dlt_hot_reload_nonexistent_file_12345.toml");
+        let nonexistent = Path::new("/tmp/tv_hot_reload_nonexistent_file_12345.toml");
 
         let result = StrategyHotReloader::new(nonexistent);
         assert!(
@@ -456,7 +456,7 @@ threshold = 0.0
 
     #[test]
     fn handle_file_change_missing_file_does_not_send_event() {
-        let nonexistent = Path::new("/tmp/dlt_hot_reload_deleted_file_99999.toml");
+        let nonexistent = Path::new("/tmp/tv_hot_reload_deleted_file_99999.toml");
 
         let (sender, receiver) = mpsc::channel::<ReloadEvent>();
         handle_file_change(nonexistent, &sender);
@@ -934,7 +934,7 @@ threshold = 25.0
     fn new_fails_when_parent_directory_missing() {
         // A config path whose parent directory does not exist should fail
         // at either file read or watcher setup.
-        let path = Path::new("/tmp/dlt_hot_reload_no_such_parent_dir_12345/nested/config.toml");
+        let path = Path::new("/tmp/tv_hot_reload_no_such_parent_dir_12345/nested/config.toml");
         let result = StrategyHotReloader::new(path);
         assert!(
             result.is_err(),
@@ -1061,7 +1061,7 @@ threshold = 25.0
     #[test]
     fn handle_file_change_missing_file_with_subscriber() {
         with_tracing(|| {
-            let nonexistent = Path::new("/tmp/dlt_nonexistent_subscriber_test.toml");
+            let nonexistent = Path::new("/tmp/tv_nonexistent_subscriber_test.toml");
             let (sender, receiver) = mpsc::channel::<ReloadEvent>();
             handle_file_change(nonexistent, &sender);
             assert!(receiver.try_recv().is_err());
