@@ -460,6 +460,29 @@ async fn main() -> Result<()> {
         };
         let backfill_token_handle = std::sync::Arc::clone(&token_handle);
         let backfill_client_id = client_id.clone();
+        // S5-A2: Clone the instrument registry so the backfill closure can
+        // look up the exact instrument kind per gap event and pass it as
+        // the `instrument` hint to Dhan's intraday REST API. Without this
+        // the fetcher defaulted to OPTIDX for all NSE_FNO, which returns
+        // empty candle lists for futures and stock options.
+        let backfill_registry_fast: Option<
+            std::sync::Arc<dhan_live_trader_common::instrument_registry::InstrumentRegistry>,
+        > = subscription_plan
+            .as_ref()
+            .map(|p| std::sync::Arc::new(p.registry.clone()));
+        // S5-A3: Rate limiter for the backfill fetcher.
+        //
+        // Dhan Data API category limit: 5/sec, 100,000/day. A pool-wide
+        // outage can produce up to 25,000 simultaneous ERROR-level gaps;
+        // without rate limiting the worker would burst all 25,000
+        // requests at Dhan and immediately hit the 805 "too many
+        // requests" code which PAUSES ALL CONNECTIONS for 60s.
+        // Rate limiter uses the governor crate (same GCRA algorithm as
+        // the OMS order rate limiter) — await semantics so the worker
+        // naturally serialises bursts into the allowed rate.
+        let backfill_rate_limiter = std::sync::Arc::new(governor::RateLimiter::direct(
+            governor::Quota::per_second(std::num::NonZeroU32::new(5).expect("5 > 0")),
+        ));
         let backfill_fetcher =
             move |req: dhan_live_trader_core::historical::backfill::GapBackfillRequest| {
                 // Clone per-invocation captures to move into the returned future.
@@ -467,7 +490,14 @@ async fn main() -> Result<()> {
                 let endpoint = backfill_endpoint.clone();
                 let token_handle = std::sync::Arc::clone(&backfill_token_handle);
                 let client_id_inner = backfill_client_id.clone();
+                let rate_limiter = std::sync::Arc::clone(&backfill_rate_limiter);
+                let registry_clone = backfill_registry_fast.clone();
                 async move {
+                    // S5-A3: await the rate limiter before each call.
+                    // This naturally serialises bursts into Dhan's 5/sec
+                    // cap and prevents 805 blocks during pool-wide gaps.
+                    rate_limiter.until_ready().await;
+
                     // Read the current access token atomically.
                     use secrecy::ExposeSecret as _;
                     let token_guard = token_handle.load();
@@ -476,6 +506,16 @@ async fn main() -> Result<()> {
                         _ => return Err("backfill: no valid access token available".to_string()),
                     };
                     let access_token = token_state.access_token().expose_secret().to_string();
+
+                    // S5-A2: Resolve the Dhan instrument enum string from
+                    // the registry. None for indices/equities (the
+                    // segment heuristic handles them).
+                    let hint: Option<&'static str> = registry_clone
+                        .as_ref()
+                        .and_then(|r| r.get(req.security_id))
+                        .and_then(|inst| inst.instrument_kind.as_ref())
+                        .map(|kind| kind.as_dhan_api_string());
+
                     dhan_live_trader_core::historical::backfill::fetch_intraday_window(
                         &http_client,
                         &endpoint,
@@ -485,6 +525,7 @@ async fn main() -> Result<()> {
                         req.exchange_segment_code,
                         req.from_ist_secs,
                         req.to_ist_secs,
+                        hint,
                     )
                     .await
                 }
@@ -1355,13 +1396,31 @@ async fn main() -> Result<()> {
     };
     let backfill_token_handle_slow = std::sync::Arc::clone(&token_handle);
     let backfill_client_id_slow = ws_client_id.clone();
+    // S5-A2: Clone the instrument registry for slow-boot so the backfill
+    // closure can resolve the exact instrument kind per gap event.
+    // Mirrors the fast-boot wiring at backfill_registry_fast.
+    let backfill_registry_slow: Option<
+        std::sync::Arc<dhan_live_trader_common::instrument_registry::InstrumentRegistry>,
+    > = subscription_plan
+        .as_ref()
+        .map(|p| std::sync::Arc::new(p.registry.clone()));
+    // S5-A3: Rate limiter — mirrors the fast-boot limiter above, 5/sec
+    // matching Dhan's Data API category limit. Prevents 25,000
+    // simultaneous gap events from bursting Dhan into a 60s 805 block.
+    let backfill_rate_limiter_slow = std::sync::Arc::new(governor::RateLimiter::direct(
+        governor::Quota::per_second(std::num::NonZeroU32::new(5).expect("5 > 0")),
+    ));
     let backfill_fetcher_slow =
         move |req: dhan_live_trader_core::historical::backfill::GapBackfillRequest| {
             let http_client = backfill_http_client_slow.clone();
             let endpoint = backfill_endpoint_slow.clone();
             let token_handle = std::sync::Arc::clone(&backfill_token_handle_slow);
             let client_id_inner = backfill_client_id_slow.clone();
+            let rate_limiter = std::sync::Arc::clone(&backfill_rate_limiter_slow);
+            let registry_clone = backfill_registry_slow.clone();
             async move {
+                // S5-A3: await rate limiter before each Dhan call.
+                rate_limiter.until_ready().await;
                 use secrecy::ExposeSecret as _;
                 let token_guard = token_handle.load();
                 let token_state = match token_guard.as_ref().as_ref() {
@@ -1373,6 +1432,14 @@ async fn main() -> Result<()> {
                     }
                 };
                 let access_token = token_state.access_token().expose_secret().to_string();
+
+                // S5-A2: Resolve exact Dhan instrument enum from registry.
+                let hint: Option<&'static str> = registry_clone
+                    .as_ref()
+                    .and_then(|r| r.get(req.security_id))
+                    .and_then(|inst| inst.instrument_kind.as_ref())
+                    .map(|kind| kind.as_dhan_api_string());
+
                 dhan_live_trader_core::historical::backfill::fetch_intraday_window(
                     &http_client,
                     &endpoint,
@@ -1382,6 +1449,7 @@ async fn main() -> Result<()> {
                     req.exchange_segment_code,
                     req.from_ist_secs,
                     req.to_ist_secs,
+                    hint,
                 )
                 .await
             }
@@ -1396,14 +1464,77 @@ async fn main() -> Result<()> {
         tracing::info!("S4-T1d: slow-boot BackfillWorker started");
         backfill_worker_slow.run().await;
     });
-    // S4-T1f: Forward slow-boot synth ticks into the main tick broadcast
-    // channel. Symmetric with the fast-boot forwarder — same DEDUP-based
-    // idempotency properties, same counter name.
+    // S5-A1: Slow-boot dedicated synth tick writer + broadcast forwarder.
+    //
+    // FIX for session-5 honest audit A1: previously this task only
+    // forwarded synth ticks to `tick_broadcast_sender`, but slow-boot's
+    // hot path (`run_tick_processor`) reads from the raw frame_receiver
+    // and never subscribes to the broadcast — so forwarded synth ticks
+    // never reached the `ticks` table. The zero-tick-loss guarantee was
+    // broken for slow-boot mode.
+    //
+    // Fix: this task owns its own TickPersistenceWriter (auto-reconnects,
+    // same ring-buffer + DLQ semantics as the hot-path writer) and
+    // writes synth ticks DIRECTLY via append_tick. It also forwards to
+    // the broadcast so the candle aggregator + other downstream
+    // consumers see the backfilled ticks too. QuestDB DEDUP UPSERT KEYS
+    // on (ts, security_id, segment) handles any overlap with the live
+    // tick that eventually arrives for the same minute — verified by
+    // S3-3 property tests (10,240 random cases + 3 regressions).
     {
         let broadcast_for_synth_slow = tick_broadcast_sender.clone();
+        let questdb_cfg_for_synth = config.questdb.clone();
         tokio::spawn(async move {
+            let mut synth_writer =
+                match dhan_live_trader_storage::tick_persistence::TickPersistenceWriter::new(
+                    &questdb_cfg_for_synth,
+                ) {
+                    Ok(w) => {
+                        tracing::info!("S5-A1: slow-boot synth tick writer connected to QuestDB");
+                        w
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            ?err,
+                            "S5-A1: slow-boot synth writer: QuestDB unavailable — \
+                             using disconnected mode with ring buffer + spill"
+                        );
+                        dhan_live_trader_storage::tick_persistence::TickPersistenceWriter::new_disconnected(
+                            &questdb_cfg_for_synth,
+                        )
+                    }
+                };
+
+            let mut persisted_total: u64 = 0;
             let mut forwarded_total: u64 = 0;
+            let flush_interval = std::time::Duration::from_millis(100);
+            let mut last_flush = std::time::Instant::now();
+
             while let Some(tick) = synth_tick_rx_slow.recv().await {
+                // A1 primary write path — direct append to the ticks table.
+                match synth_writer.append_tick(&tick) {
+                    Ok(()) => {
+                        persisted_total = persisted_total.saturating_add(1);
+                        metrics::counter!("dlt_backfill_ticks_persisted_total").increment(1);
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            ?err,
+                            security_id = tick.security_id,
+                            "S5-A1: slow-boot synth writer append failed (will retry via ring buffer)"
+                        );
+                    }
+                }
+
+                // Periodic flush every 100ms so QuestDB actually sees the
+                // rows rather than waiting for the ring buffer to fill.
+                if last_flush.elapsed() >= flush_interval {
+                    let _ = synth_writer.flush_if_needed();
+                    last_flush = std::time::Instant::now();
+                }
+
+                // Also forward to the main tick broadcast so the
+                // candle aggregator + trading pipeline see the tick.
                 match broadcast_for_synth_slow.send(tick) {
                     Ok(_) => {
                         forwarded_total = forwarded_total.saturating_add(1);
@@ -1411,13 +1542,21 @@ async fn main() -> Result<()> {
                     }
                     Err(_) => {
                         tracing::info!(
+                            persisted_total,
                             forwarded_total,
-                            "S4-T1f: slow-boot synth forwarder exiting (broadcast closed)"
+                            "S5-A1: slow-boot synth task exiting (broadcast closed)"
                         );
+                        let _ = synth_writer.flush_if_needed();
                         return;
                     }
                 }
             }
+            tracing::info!(
+                persisted_total,
+                forwarded_total,
+                "S5-A1: slow-boot synth task shutting down (channel closed)"
+            );
+            let _ = synth_writer.flush_if_needed();
         });
     }
     {

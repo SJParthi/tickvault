@@ -94,6 +94,24 @@ impl DhanInstrumentKind {
             Self::OptionStock => "OptionStock",
         }
     }
+
+    /// S5-A2: Returns the Dhan REST API enum value for the `instrument`
+    /// request field on `/v2/charts/intraday` and `/v2/charts/historical`.
+    ///
+    /// These are the exact strings Dhan expects per
+    /// `docs/dhan-ref/05-historical-data.md`:
+    ///   - `"FUTIDX"`: Index future (e.g., NIFTY 30-JAN-26)
+    ///   - `"FUTSTK"`: Stock future (e.g., RELIANCE 30-JAN-26)
+    ///   - `"OPTIDX"`: Index option (e.g., NIFTY 22000 CE 30-JAN-26)
+    ///   - `"OPTSTK"`: Stock option (e.g., RELIANCE 2800 PE 30-JAN-26)
+    pub fn as_dhan_api_string(&self) -> &'static str {
+        match self {
+            Self::FutureIndex => "FUTIDX",
+            Self::FutureStock => "FUTSTK",
+            Self::OptionIndex => "OPTIDX",
+            Self::OptionStock => "OPTSTK",
+        }
+    }
 }
 
 impl fmt::Display for DhanInstrumentKind {

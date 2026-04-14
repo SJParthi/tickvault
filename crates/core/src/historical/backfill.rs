@@ -252,6 +252,7 @@ struct BackfillIntradayRequest {
 /// Returns `Err` on: HTTP failure, non-2xx status, body parse error,
 /// unknown segment code, negative/zero window.
 // TEST-EXEMPT: integration-tested via BackfillWorker tests (test_backfill_worker_happy_path, test_backfill_worker_handles_empty_fetch, test_backfill_worker_handles_fetch_error, test_backfill_worker_aborts_on_tick_pipeline_closed) which exercise the full gap-detect → fetch → synth → forward chain. A standalone unit test would require a mock HTTP server; the integration tests with a stub closure cover the happy, empty, and error paths.
+#[allow(clippy::too_many_arguments)] // APPROVED: S5-A2 — added instrument_hint to fix wrong OPTIDX default for F&O; splitting would obscure the call site
 pub async fn fetch_intraday_window(
     http_client: &reqwest::Client,
     endpoint: &str,
@@ -261,6 +262,12 @@ pub async fn fetch_intraday_window(
     exchange_segment_code: u8,
     from_ist_secs: u32,
     to_ist_secs: u32,
+    // S5-A2: Optional exact instrument type from the InstrumentRegistry.
+    // When provided (e.g., "FUTSTK", "OPTIDX"), it overrides the
+    // segment-based heuristic. Fixes the S5-A2 audit bug where all
+    // NSE_FNO requests used OPTIDX even for futures and stock options,
+    // causing Dhan to return empty candle lists for 3 of 4 F&O classes.
+    instrument_hint: Option<&str>,
 ) -> Result<Vec<HistoricalCandle>, String> {
     // Validate window.
     let window_secs = to_ist_secs.saturating_sub(from_ist_secs);
@@ -287,16 +294,17 @@ pub async fn fetch_intraday_window(
         return Err("intraday endpoint does not support IDX_I segment".to_string());
     }
 
-    // Instrument hint — Dhan wants "EQUITY" / "FUTIDX" / "FUTSTK" / "OPTIDX" /
-    // "OPTSTK" / etc. Without the instrument master loaded here, we
-    // conservatively send "EQUITY" for NSE_EQ and leave F&O for later
-    // refinement (the endpoint tolerates "EQUITY" on wrong segments by
-    // returning an empty candle list, which we gracefully surface as
-    // events_empty, not events_errored).
-    let instrument = match exchange_segment {
-        "NSE_EQ" | "BSE_EQ" => "EQUITY",
-        "NSE_FNO" | "BSE_FNO" => "OPTIDX",
-        _ => "EQUITY",
+    // S5-A2: Prefer the exact instrument type from the caller (registry
+    // lookup) over the segment heuristic. Segment heuristic is only a
+    // fallback for segments where we don't have a registry entry yet
+    // (e.g., emergency untracked universe reloads).
+    let instrument = match instrument_hint {
+        Some(hint) => hint,
+        None => match exchange_segment {
+            "NSE_EQ" | "BSE_EQ" => "EQUITY",
+            "NSE_FNO" | "BSE_FNO" => "OPTIDX",
+            _ => "EQUITY",
+        },
     };
 
     let from_str = format_ist_datetime(from_ist_secs);
@@ -325,7 +333,33 @@ pub async fn fetch_intraday_window(
 
     let status = response.status();
     if !status.is_success() {
-        return Err(format!("http status {status}"));
+        // S5-D3: Read error body to detect token expiry (807/DH-901)
+        // and rate-limit (805/DH-904). Different codes map to different
+        // follow-up actions, but ALL of them surface as ERR return —
+        // the caller's tracing::error!() fires Telegram automatically.
+        let body_bytes = response.bytes().await.unwrap_or_default();
+        let body_str = String::from_utf8_lossy(&body_bytes);
+        // Dhan returns 3-string error envelope:
+        //   { "errorType": "...", "errorCode": "DH-901", "errorMessage": "..." }
+        // Data API errors are numeric: 807 = AccessTokenExpired, etc.
+        if body_str.contains("DH-901") || body_str.contains("\"807\"") || body_str.contains("807") {
+            tracing::error!(
+                %status,
+                "S5-D3 CRITICAL: backfill fetcher saw access-token expired (DH-901/807). \
+                 Token manager's own renewal loop handles refresh; this error fires \
+                 Telegram via the Loki hook so the operator is aware."
+            );
+            return Err(format!("TOKEN_EXPIRED_807: {status} {body_str}"));
+        }
+        if body_str.contains("DH-904") || body_str.contains("\"805\"") {
+            tracing::warn!(
+                %status,
+                "S5-D3: backfill fetcher rate-limited (DH-904/805). \
+                 Governor limiter should prevent this — if seen, widen the limiter."
+            );
+            return Err(format!("RATE_LIMITED_805: {status}"));
+        }
+        return Err(format!("http status {status} body={body_str}"));
     }
 
     let parsed: DhanIntradayResponse = response

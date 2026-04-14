@@ -168,6 +168,15 @@ const REQUIRED_METRICS: &[(&str, &str)] = &[
          This is the observable measure that backfill actually closed \
          a gap. Downstream DEDUP merges any overlap with live ticks.",
     ),
+    // --- Session 5 A1 (slow-boot synth tick direct persistence) ---
+    (
+        "dlt_backfill_ticks_persisted_total",
+        "S5-A1: Number of synth ticks directly persisted by the slow-boot \
+         dedicated synth TickPersistenceWriter. Fast-boot persists synth \
+         ticks via the cold-path consumer; slow-boot's hot-path writer \
+         only sees raw WS frames, so this dedicated writer is required \
+         for backfill to actually reach QuestDB in slow-boot mode.",
+    ),
     // --- Session 4 S4-T4 (existing subsystem metrics catalogued for lockdown) ---
     (
         "dlt_order_update_ws_active",
