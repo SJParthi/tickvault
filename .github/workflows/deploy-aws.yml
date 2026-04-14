@@ -1,0 +1,249 @@
+# S7-Step3 / Phase 8.2: AWS deploy workflow.
+#
+# Builds the release binary on GitHub Actions, ships it to the EC2
+# instance via SSM Session Manager (no SSH key in the workflow),
+# runs the smoke test, then swaps the systemd unit and monitors the
+# first 60 seconds for crashes. Rolls back on failure.
+#
+# Triggers:
+#   - Manual dispatch (workflow_dispatch) — operator clicks "Run"
+#   - Push of a tag matching v*.*.* (release builds)
+#
+# Never fires automatically on push to a branch — deploys to real
+# infrastructure are always explicit.
+#
+# Secrets required (GitHub repo > Settings > Secrets and variables > Actions):
+#   AWS_ROLE_ARN                — OIDC role assumed by the workflow
+#   AWS_ACCOUNT_ID              — used in the role ARN template
+#   EC2_INSTANCE_ID             — the dlt-prod-app instance ID from tf output
+#
+# Variables (repo > Settings > Secrets and variables > Variables):
+#   AWS_REGION                  — ap-south-1
+
+name: deploy-aws
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_market_hours:
+        description: 'Deploying during market hours? Type "yes" to override the guard.'
+        required: false
+        default: 'no'
+  push:
+    tags:
+      - 'v*.*.*'
+
+concurrency:
+  group: deploy-aws-prod
+  cancel-in-progress: false  # never interrupt an in-flight deploy
+
+permissions:
+  id-token: write   # OIDC for AWS role assumption
+  contents: read
+
+jobs:
+  build:
+    name: Build release binary
+    runs-on: ubuntu-24.04
+    outputs:
+      binary_artifact_name: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.93.1
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build release binary
+        run: cargo build --release --bin dhan-live-trader -p dhan-live-trader-app
+
+      - name: Verify binary exists + under 15MB
+        run: |
+          ls -la target/release/dhan-live-trader
+          SIZE_BYTES=$(stat -c%s target/release/dhan-live-trader)
+          SIZE_MB=$((SIZE_BYTES / 1024 / 1024))
+          echo "Binary size: ${SIZE_MB}MB (${SIZE_BYTES} bytes)"
+          if [ "$SIZE_BYTES" -gt 15728640 ]; then
+            echo "FAIL: binary exceeds 15MB cap"
+            exit 1
+          fi
+
+      - name: Upload artifact
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: dhan-live-trader-binary
+          path: target/release/dhan-live-trader
+          retention-days: 7
+
+  guard_market_hours:
+    name: Market-hours guard
+    runs-on: ubuntu-24.04
+    needs: build
+    steps:
+      - name: Check current IST time against market window
+        run: |
+          # 09:15-15:30 IST = 03:45-10:00 UTC.
+          # Monday-Friday only (NSE trading days, ignoring holidays for now).
+          UTC_HOUR=$(date -u +%H)
+          UTC_MINUTE=$(date -u +%M)
+          UTC_DOW=$(date -u +%u)  # 1=Mon, 7=Sun
+          UTC_TIME_NUM=$((10#$UTC_HOUR * 100 + 10#$UTC_MINUTE))
+
+          echo "UTC time: $UTC_HOUR:$UTC_MINUTE (day $UTC_DOW), numeric $UTC_TIME_NUM"
+
+          # Market open window in UTC: 0345 to 1000
+          if [ "$UTC_DOW" -le 5 ] && [ "$UTC_TIME_NUM" -ge 345 ] && [ "$UTC_TIME_NUM" -lt 1000 ]; then
+            if [ "${{ github.event.inputs.confirm_market_hours }}" = "yes" ]; then
+              echo "WARNING: deploying during market hours with explicit override"
+            else
+              echo "BLOCK: deploying during 09:15-15:30 IST is forbidden without override."
+              echo "Re-run with confirm_market_hours=yes if this is an emergency fix."
+              exit 1
+            fi
+          else
+            echo "OK: outside market hours, deploy can proceed"
+          fi
+
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-24.04
+    needs: [build, guard_market_hours]
+    environment: prod
+    steps:
+      - name: Checkout (for deploy scripts)
+        uses: actions/checkout@v4
+
+      - name: Download built binary
+        uses: actions/download-artifact@v4
+        with:
+          name: dhan-live-trader-binary
+          path: ./dist/
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: dlt-github-deploy-${{ github.run_id }}
+
+      - name: Upload binary to S3 staging bucket
+        run: |
+          chmod +x ./dist/dhan-live-trader
+          aws s3 cp ./dist/dhan-live-trader \
+            s3://dlt-prod-cold/deploys/${{ github.sha }}/dhan-live-trader \
+            --region ${{ vars.AWS_REGION }}
+
+      - name: Run SSM command — download binary + smoke test + swap
+        id: ssm
+        run: |
+          CMD_ID=$(aws ssm send-command \
+            --region ${{ vars.AWS_REGION }} \
+            --instance-ids ${{ secrets.EC2_INSTANCE_ID }} \
+            --document-name "AWS-RunShellScript" \
+            --comment "DLT deploy sha=${{ github.sha }}" \
+            --parameters 'commands=[
+              "set -euo pipefail",
+              "cd /opt/dlt",
+              "# Back up the current binary so we can roll back",
+              "if [ -f bin/dhan-live-trader ]; then cp bin/dhan-live-trader bin/dhan-live-trader.backup; fi",
+              "# Download the new binary from S3",
+              "aws s3 cp s3://dlt-prod-cold/deploys/${{ github.sha }}/dhan-live-trader bin/dhan-live-trader.new",
+              "chmod +x bin/dhan-live-trader.new",
+              "# Run smoke test (must exit 0 in < 30 seconds)",
+              "timeout 40 bin/dhan-live-trader.new smoke-test --duration 30",
+              "# Atomic swap",
+              "mv bin/dhan-live-trader.new bin/dhan-live-trader",
+              "# Reload systemd unit",
+              "systemctl daemon-reload",
+              "systemctl restart dlt-app",
+              "sleep 5",
+              "systemctl is-active --quiet dlt-app || (echo FAIL && exit 1)",
+              "echo DEPLOY OK"
+            ]' \
+            --query 'Command.CommandId' --output text)
+          echo "command_id=$CMD_ID" >> $GITHUB_OUTPUT
+
+      - name: Wait for SSM command completion
+        run: |
+          aws ssm wait command-executed \
+            --region ${{ vars.AWS_REGION }} \
+            --command-id ${{ steps.ssm.outputs.command_id }} \
+            --instance-id ${{ secrets.EC2_INSTANCE_ID }}
+
+      - name: Fetch SSM command output
+        run: |
+          aws ssm get-command-invocation \
+            --region ${{ vars.AWS_REGION }} \
+            --command-id ${{ steps.ssm.outputs.command_id }} \
+            --instance-id ${{ secrets.EC2_INSTANCE_ID }} \
+            --query '[Status,StandardOutputContent,StandardErrorContent]' \
+            --output text
+
+      - name: Monitor first 60 seconds for crashes
+        run: |
+          # Poll the app systemd state every 10 seconds for 60 seconds.
+          # If it goes inactive, the deploy failed — roll back.
+          FAIL=0
+          for i in 1 2 3 4 5 6; do
+            STATE=$(aws ssm send-command \
+              --region ${{ vars.AWS_REGION }} \
+              --instance-ids ${{ secrets.EC2_INSTANCE_ID }} \
+              --document-name "AWS-RunShellScript" \
+              --parameters 'commands=["systemctl is-active dlt-app"]' \
+              --query 'Command.CommandId' --output text)
+            sleep 5
+            RESULT=$(aws ssm get-command-invocation \
+              --region ${{ vars.AWS_REGION }} \
+              --command-id "$STATE" \
+              --instance-id ${{ secrets.EC2_INSTANCE_ID }} \
+              --query 'StandardOutputContent' --output text | tr -d '[:space:]')
+            echo "Check $i: systemd state = $RESULT"
+            if [ "$RESULT" != "active" ]; then
+              FAIL=1
+              break
+            fi
+            sleep 5
+          done
+          if [ "$FAIL" -eq 1 ]; then
+            echo "ROLLBACK: dlt-app is not active after deploy — rolling back"
+            aws ssm send-command \
+              --region ${{ vars.AWS_REGION }} \
+              --instance-ids ${{ secrets.EC2_INSTANCE_ID }} \
+              --document-name "AWS-RunShellScript" \
+              --parameters 'commands=["set -euo pipefail","cd /opt/dlt","if [ -f bin/dhan-live-trader.backup ]; then mv bin/dhan-live-trader.backup bin/dhan-live-trader; systemctl restart dlt-app; fi"]'
+            exit 1
+          fi
+          echo "DEPLOY VERIFIED: dlt-app has been active for 60s"
+
+      - name: Notify Telegram on success
+        if: success()
+        run: |
+          # The SNS topic has a Telegram webhook subscription; publish
+          # an INFO-level message so the operator sees the deploy land.
+          aws sns publish \
+            --region ${{ vars.AWS_REGION }} \
+            --topic-arn arn:aws:sns:${{ vars.AWS_REGION }}:${{ secrets.AWS_ACCOUNT_ID }}:dlt-prod-alerts \
+            --subject "DLT deploy OK" \
+            --message "commit=${{ github.sha }} ref=${{ github.ref }} actor=${{ github.actor }}"
+
+      - name: Notify Telegram on failure
+        if: failure()
+        run: |
+          aws sns publish \
+            --region ${{ vars.AWS_REGION }} \
+            --topic-arn arn:aws:sns:${{ vars.AWS_REGION }}:${{ secrets.AWS_ACCOUNT_ID }}:dlt-prod-alerts \
+            --subject "DLT deploy FAILED" \
+            --message "commit=${{ github.sha }} ref=${{ github.ref }} actor=${{ github.actor }} run=${{ github.run_id }}"
