@@ -1241,6 +1241,7 @@ dependencies = [
  "dhan-live-trader-storage",
  "dhan-live-trader-trading",
  "figment",
+ "governor",
  "metrics",
  "metrics-exporter-prometheus",
  "opentelemetry",
