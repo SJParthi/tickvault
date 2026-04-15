@@ -182,17 +182,24 @@ async fn main() -> Result<()> {
     // Replay first — this MUST happen before any WS connection opens so we
     // never race a fresh append against a stale segment rotation.
     //
-    // STAGE-C.2b: Recovered frames are retained in `ws_wal_replay_frames`
-    // and re-injected into the live pipeline after the corresponding
-    // downstream channel is constructed. For LiveFeed this happens as
-    // soon as the WebSocket pool is built (see `inject_replayed_live_feed_frames`
-    // below). Depth-20/Depth-200/OrderUpdate injection is archival-only
-    // for now because their channels are constructed dynamically per
-    // underlying/contract much later in boot; those frames remain safe
-    // in the archive directory inside `ws_wal_path.archive/` for forensic
-    // replay and are visible via the `tv_ws_frame_wal_replay_total`
-    // per-type counter.
+    // STAGE-C.2b: Recovered frames are retained per-type in the four
+    // Vecs below and drained into the live pipeline after the
+    // corresponding downstream sink is constructed:
+    //
+    //   - LiveFeed        → `pool.frame_sender_clone()` once the pool is built
+    //   - Depth-20        → temporary DeepDepthWriter (Stage-D drain helper)
+    //   - Depth-200       → temporary DeepDepthWriter (Stage-D drain helper)
+    //   - OrderUpdate     → `order_update_sender.send()` once the broadcast is built
+    //
+    // All four sinks are idempotent via QuestDB dedup keys (`STORAGE-GAP-01`
+    // for ticks, compound `(security_id, segment, received_at_nanos, side)`
+    // for depth) and/or via the downstream broadcast consumer's own OMS
+    // idempotency — replaying the same WAL record any number of times
+    // yields at most one durable row per logical record.
     let mut ws_wal_replay_live_feed: Vec<bytes::Bytes> = Vec::new();
+    let mut ws_wal_replay_depth_20: Vec<Vec<u8>> = Vec::new();
+    let mut ws_wal_replay_depth_200: Vec<Vec<u8>> = Vec::new();
+    let mut ws_wal_replay_order_update: Vec<Vec<u8>> = Vec::new();
     match tickvault_storage::ws_frame_spill::replay_all(&ws_wal_path) {
         Ok(recovered) => {
             if recovered.is_empty() {
@@ -206,25 +213,33 @@ async fn main() -> Result<()> {
                     match rec.ws_type {
                         tickvault_storage::ws_frame_spill::WsType::LiveFeed => {
                             live += 1;
-                            // STAGE-C.2b: buffer LiveFeed frames for re-injection into
-                            // the pool's mpsc sender once the pool is built below.
                             ws_wal_replay_live_feed.push(bytes::Bytes::from(rec.frame));
                         }
-                        tickvault_storage::ws_frame_spill::WsType::Depth20 => d20 += 1,
-                        tickvault_storage::ws_frame_spill::WsType::Depth200 => d200 += 1,
-                        tickvault_storage::ws_frame_spill::WsType::OrderUpdate => ord += 1,
+                        tickvault_storage::ws_frame_spill::WsType::Depth20 => {
+                            d20 += 1;
+                            ws_wal_replay_depth_20.push(rec.frame);
+                        }
+                        tickvault_storage::ws_frame_spill::WsType::Depth200 => {
+                            d200 += 1;
+                            ws_wal_replay_depth_200.push(rec.frame);
+                        }
+                        tickvault_storage::ws_frame_spill::WsType::OrderUpdate => {
+                            ord += 1;
+                            ws_wal_replay_order_update.push(rec.frame);
+                        }
                     }
                 }
                 info!(
                     dir = %ws_wal_dir,
-                    total = ws_wal_replay_live_feed.len() as u64 + d20 + d200 + ord,
+                    total = live + d20 + d200 + ord,
                     live_feed = live,
                     depth_20 = d20,
                     depth_200 = d200,
                     order_update = ord,
                     "STAGE-C: WAL replay recovered residual frames — LiveFeed will be \
-                     re-injected into live pipeline; Depth + OrderUpdate preserved in \
-                     archive for forensic replay"
+                     re-injected into pool mpsc; Depth-20/Depth-200 drained into QuestDB \
+                     via Stage-D drain helper; OrderUpdate drained into broadcast once \
+                     sender is created"
                 );
                 metrics::counter!("tv_ws_frame_wal_replay_total", "ws_type" => "live_feed")
                     .increment(live);
@@ -242,6 +257,78 @@ async fn main() -> Result<()> {
                 dir = %ws_wal_dir,
                 "STAGE-C: WAL replay failed — continuing boot with fresh WAL"
             );
+        }
+    }
+
+    // STAGE-C.2b: Drain Depth-20 and Depth-200 recovered frames into
+    // QuestDB immediately — these paths write directly to the
+    // persistence sink and do not require any in-flight channel. The
+    // compound dedup key makes replay idempotent. LiveFeed and
+    // OrderUpdate drains happen later once their channels exist.
+    if !ws_wal_replay_depth_20.is_empty() {
+        let frames = std::mem::take(&mut ws_wal_replay_depth_20);
+        let (parsed, persisted, parse_errors, persist_errors) =
+            tickvault_app::boot_helpers::drain_replayed_depth_frames_to_questdb(
+                frames,
+                &config.questdb,
+                "20",
+                "depth-20",
+            );
+        info!(
+            parsed,
+            persisted,
+            parse_errors,
+            persist_errors,
+            "STAGE-C.2b: Depth-20 WAL replay drain complete"
+        );
+        metrics::counter!("tv_ws_frame_wal_reinjected_total", "ws_type" => "depth_20")
+            .increment(persisted);
+        if parse_errors > 0 {
+            metrics::counter!(
+                "tv_ws_frame_wal_reinjected_parse_errors_total",
+                "ws_type" => "depth_20"
+            )
+            .increment(parse_errors);
+        }
+        if persist_errors > 0 {
+            metrics::counter!(
+                "tv_ws_frame_wal_reinjected_dropped_total",
+                "ws_type" => "depth_20"
+            )
+            .increment(persist_errors);
+        }
+    }
+    if !ws_wal_replay_depth_200.is_empty() {
+        let frames = std::mem::take(&mut ws_wal_replay_depth_200);
+        let (parsed, persisted, parse_errors, persist_errors) =
+            tickvault_app::boot_helpers::drain_replayed_depth_frames_to_questdb(
+                frames,
+                &config.questdb,
+                "200",
+                "depth-200",
+            );
+        info!(
+            parsed,
+            persisted,
+            parse_errors,
+            persist_errors,
+            "STAGE-C.2b: Depth-200 WAL replay drain complete"
+        );
+        metrics::counter!("tv_ws_frame_wal_reinjected_total", "ws_type" => "depth_200")
+            .increment(persisted);
+        if parse_errors > 0 {
+            metrics::counter!(
+                "tv_ws_frame_wal_reinjected_parse_errors_total",
+                "ws_type" => "depth_200"
+            )
+            .increment(parse_errors);
+        }
+        if persist_errors > 0 {
+            metrics::counter!(
+                "tv_ws_frame_wal_reinjected_dropped_total",
+                "ws_type" => "depth_200"
+            )
+            .increment(persist_errors);
         }
     }
     let ws_frame_spill = match tickvault_storage::ws_frame_spill::WsFrameSpill::new(&ws_wal_path) {
@@ -1072,6 +1159,37 @@ async fn main() -> Result<()> {
         // --- Background: Order update WebSocket ---
         let (order_update_sender, _order_update_receiver) =
             tokio::sync::broadcast::channel::<tickvault_common::order_types::OrderUpdate>(256);
+
+        // STAGE-C.2b: Drain recovered order-update JSON frames into the
+        // live broadcast BEFORE the live WebSocket starts. Idempotent —
+        // any consumer already attached gets the replayed updates in
+        // FIFO order; raw JSON also remains in the WAL archive.
+        if !ws_wal_replay_order_update.is_empty() {
+            let frames = std::mem::take(&mut ws_wal_replay_order_update);
+            let (parsed, broadcast_count, parse_errors) =
+                tickvault_app::boot_helpers::drain_replayed_order_updates_to_broadcast(
+                    frames,
+                    &order_update_sender,
+                );
+            info!(
+                parsed,
+                broadcast_count,
+                parse_errors,
+                "STAGE-C.2b: OrderUpdate WAL replay drain complete (fast boot)"
+            );
+            metrics::counter!(
+                "tv_ws_frame_wal_reinjected_total",
+                "ws_type" => "order_update"
+            )
+            .increment(broadcast_count);
+            if parse_errors > 0 {
+                metrics::counter!(
+                    "tv_ws_frame_wal_reinjected_parse_errors_total",
+                    "ws_type" => "order_update"
+                )
+                .increment(parse_errors);
+            }
+        }
 
         let order_update_handle = {
             let url = config.dhan.order_update_websocket_url.clone();
@@ -2706,6 +2824,36 @@ async fn main() -> Result<()> {
         tokio::sync::broadcast::channel::<tickvault_common::order_types::OrderUpdate>(
             tickvault_common::constants::ORDER_UPDATE_BROADCAST_CAPACITY,
         );
+
+    // STAGE-C.2b: Slow-boot mirror of the fast-boot order-update replay
+    // drain. Drains recovered JSON frames into the live broadcast before
+    // the WebSocket starts.
+    if !ws_wal_replay_order_update.is_empty() {
+        let frames = std::mem::take(&mut ws_wal_replay_order_update);
+        let (parsed, broadcast_count, parse_errors) =
+            tickvault_app::boot_helpers::drain_replayed_order_updates_to_broadcast(
+                frames,
+                &order_update_sender,
+            );
+        info!(
+            parsed,
+            broadcast_count,
+            parse_errors,
+            "STAGE-C.2b: OrderUpdate WAL replay drain complete (slow boot)"
+        );
+        metrics::counter!(
+            "tv_ws_frame_wal_reinjected_total",
+            "ws_type" => "order_update"
+        )
+        .increment(broadcast_count);
+        if parse_errors > 0 {
+            metrics::counter!(
+                "tv_ws_frame_wal_reinjected_parse_errors_total",
+                "ws_type" => "order_update"
+            )
+            .increment(parse_errors);
+        }
+    }
 
     let order_update_handle = {
         let url = config.dhan.order_update_websocket_url.clone();

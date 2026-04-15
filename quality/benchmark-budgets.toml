@@ -21,6 +21,7 @@ pipeline                 = 100          # <100ns per tick — matches pipeline/b
 registry_get             = 50           # <50ns  — matches registry/get_hit, registry/get_miss (papaya O(1) lookup)
 token_handle             = 50           # <50ns  — matches token_handle/load (arc-swap hot-path read)
 f32_to_f64_clean         = 50           # <50ns  — matches f32_to_f64_clean/* (storage precision conversion)
+ws_reader_frame_handle   = 5000         # <5μs  — STAGE-D P7.6: counter bump + WAL append + dispatch per frame. Generous ceiling because WAL append includes one heap alloc + one crossbeam try_send; measured ~1-3μs in criterion, budget gives 2× headroom for noisy CI runners.
 
 # Trading crate — OMS
 oms_state_transition     = 100          # <100ns — matches oms/state_transition

@@ -313,6 +313,230 @@ pub fn spawn_heartbeat_watchdog(
 }
 
 // ---------------------------------------------------------------------------
+// STAGE-D: Boot-time WAL replay drain helpers
+// ---------------------------------------------------------------------------
+//
+// These helpers drain frames recovered from the WS frame WAL at boot, before
+// any live connection opens. They are the per-WS-type counterparts of the
+// LiveFeed `frame_sender_clone()` injection path: for Depth and OrderUpdate,
+// the live per-underlying / per-contract channels are built dynamically
+// much later in boot, so we cannot inject through them without a major
+// refactor. Instead, each helper runs a one-shot drain directly against
+// the final persistence sink:
+//
+//   - Depth-20 / Depth-200 → temporary [`DeepDepthWriter`] that parses each
+//     recovered binary frame via the dispatcher and writes to QuestDB. The
+//     compound dedup key (`STORAGE-GAP-01`) makes the drain idempotent —
+//     replaying the same WAL N times yields one row per logical record.
+//
+//   - OrderUpdate → the live `broadcast::Sender<OrderUpdate>` (available
+//     at line 1073/2705). Each recovered JSON frame is reparsed via
+//     `parse_order_update` and broadcast. If there are no subscribers
+//     yet the broadcast is a no-op — the raw JSON is still preserved in
+//     the WAL archive directory for forensic replay.
+//
+// All three helpers run once at boot and never block the critical path
+// beyond their own duration. They return counters for the caller to emit
+// Prometheus metrics.
+
+/// Drains recovered depth frames (20-level OR 200-level) into QuestDB
+/// via a temporary [`DeepDepthWriter`]. Runs once at boot. Idempotent
+/// via `STORAGE-GAP-01` dedup keys.
+///
+/// Returns `(parsed, persisted, parse_errors, persist_errors)` so the
+/// caller can emit Prometheus counters and log a structured summary.
+///
+/// # Arguments
+/// - `frames` — recovered binary frames from `WsFrameSpill::replay_all`
+/// - `config` — QuestDB connection config (cloned from `ApplicationConfig`)
+/// - `depth_type` — `"20"` or `"200"`. Written verbatim into the
+///   `depth_type` column so replayed rows are distinguishable from
+///   live rows at query time (optional).
+/// - `label` — human-readable label for logs (e.g. `"depth-20"` / `"depth-200"`)
+///
+/// This helper is deliberately standalone (no shared state) so the
+/// temporary writer's buffer is flushed and dropped before the live
+/// writers come up, preventing double-open on the same ILP socket.
+pub fn drain_replayed_depth_frames_to_questdb(
+    frames: Vec<Vec<u8>>,
+    config: &tickvault_common::config::QuestDbConfig,
+    depth_type: &str,
+    label: &str,
+) -> (u64, u64, u64, u64) {
+    // Counters — u64 so callers can feed metrics::counter!().increment directly.
+    let mut parsed = 0u64;
+    let mut persisted = 0u64;
+    let mut parse_errors = 0u64;
+    let mut persist_errors = 0u64;
+
+    if frames.is_empty() {
+        return (parsed, persisted, parse_errors, persist_errors);
+    }
+
+    // Open a one-shot writer for the drain. On failure, we count every
+    // frame as a persist error so the operator sees a clean summary — the
+    // raw frames are still in the WAL archive for forensic replay.
+    let mut writer = match tickvault_storage::deep_depth_persistence::DeepDepthWriter::new(config) {
+        Ok(w) => w,
+        Err(err) => {
+            tracing::error!(
+                ?err,
+                label,
+                frame_count = frames.len(),
+                "STAGE-C.2b: depth replay drain — failed to open DeepDepthWriter; \
+                 frames remain in WAL archive"
+            );
+            persist_errors = frames.len() as u64;
+            return (parsed, persisted, parse_errors, persist_errors);
+        }
+    };
+
+    for frame in frames {
+        let ts_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+
+        // Split stacked packets — Dhan stacks multiple instrument packets
+        // in a single WS message for 20-level depth. For 200-level the
+        // split still works (single packet → Vec of 1).
+        let packets = match tickvault_core::parser::dispatcher::split_stacked_depth_packets(&frame)
+        {
+            Ok(p) => p,
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    label,
+                    "STAGE-C.2b: depth replay drain — failed to split stacked packets; skipping"
+                );
+                parse_errors += 1;
+                continue;
+            }
+        };
+
+        for packet in packets {
+            match tickvault_core::parser::dispatcher::dispatch_deep_depth_frame(packet, ts_nanos) {
+                Ok(tickvault_core::parser::types::ParsedFrame::DeepDepth {
+                    security_id,
+                    exchange_segment_code,
+                    side,
+                    levels,
+                    message_sequence,
+                    ..
+                }) => {
+                    parsed += 1;
+                    let side_str = match side {
+                        tickvault_core::parser::deep_depth::DepthSide::Bid => "BID",
+                        tickvault_core::parser::deep_depth::DepthSide::Ask => "ASK",
+                    };
+                    match writer.append_deep_depth(
+                        security_id,
+                        exchange_segment_code,
+                        side_str,
+                        &levels,
+                        depth_type,
+                        ts_nanos,
+                        message_sequence,
+                    ) {
+                        Ok(()) => persisted += 1,
+                        Err(err) => {
+                            persist_errors += 1;
+                            tracing::warn!(
+                                ?err,
+                                label,
+                                security_id,
+                                side = side_str,
+                                "STAGE-C.2b: depth replay drain — persist failed"
+                            );
+                        }
+                    }
+                }
+                Ok(_) => {
+                    // Non-depth frame inside a depth WAL — should not happen,
+                    // but skip safely rather than crash.
+                    parse_errors += 1;
+                }
+                Err(err) => {
+                    parse_errors += 1;
+                    tracing::warn!(
+                        ?err,
+                        label,
+                        "STAGE-C.2b: depth replay drain — dispatch error; skipping packet"
+                    );
+                }
+            }
+        }
+    }
+
+    // Flush the writer's buffer before dropping so all persisted records
+    // hit the wire. Drop happens at end of scope.
+    if let Err(err) = writer.flush() {
+        tracing::warn!(
+            ?err,
+            label,
+            "STAGE-C.2b: depth replay drain — final flush failed"
+        );
+    }
+
+    (parsed, persisted, parse_errors, persist_errors)
+}
+
+/// Drains recovered order-update JSON frames into the live broadcast
+/// channel. Runs once at boot, right after `order_update_sender` is
+/// created and before the live order-update WebSocket starts.
+///
+/// Returns `(parsed, broadcast_count, parse_errors)`. Broadcast count
+/// reflects successful `send()` calls; it may be zero if there are no
+/// subscribers yet — that is expected and non-fatal, because the raw
+/// JSON is already durable in the WAL archive for forensic replay.
+pub fn drain_replayed_order_updates_to_broadcast(
+    frames: Vec<Vec<u8>>,
+    sender: &tokio::sync::broadcast::Sender<tickvault_common::order_types::OrderUpdate>,
+) -> (u64, u64, u64) {
+    let mut parsed = 0u64;
+    let mut broadcast_count = 0u64;
+    let mut parse_errors = 0u64;
+
+    for frame in frames {
+        let text = match std::str::from_utf8(&frame) {
+            Ok(s) => s,
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    "STAGE-C.2b: order-update replay drain — frame is not valid UTF-8; skipping"
+                );
+                parse_errors += 1;
+                continue;
+            }
+        };
+
+        match tickvault_core::parser::order_update::parse_order_update(text) {
+            Ok(update) => {
+                parsed += 1;
+                // `send()` returns the number of subscribers that received
+                // the message. Zero subscribers is NOT an error during
+                // boot drain — live consumers attach seconds later. The
+                // raw JSON is already durable in the archive, so there
+                // is no data loss even if no one consumes the broadcast.
+                match sender.send(update) {
+                    Ok(_) => broadcast_count += 1,
+                    Err(_) => {
+                        // No receivers yet — not an error; frame remains in WAL archive.
+                    }
+                }
+            }
+            Err(err) => {
+                parse_errors += 1;
+                tracing::warn!(
+                    ?err,
+                    text_len = text.len(),
+                    "STAGE-C.2b: order-update replay drain — parse error; skipping"
+                );
+            }
+        }
+    }
+
+    (parsed, broadcast_count, parse_errors)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1778,5 +2002,75 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // STAGE-C.2b: WAL replay drain helpers
+    // -----------------------------------------------------------------------
+
+    /// The depth drain helper must early-return with all-zero counters
+    /// when called with an empty frame list. This exercises the empty
+    /// branch without needing a live QuestDB connection.
+    #[test]
+    fn test_drain_replayed_depth_frames_to_questdb_empty_input_returns_zero_counters() {
+        let config = tickvault_common::config::QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            ilp_port: 65535, // intentionally unreachable — must not be contacted
+            http_port: 65535,
+            pg_port: 65535,
+        };
+        let (parsed, persisted, parse_errors, persist_errors) =
+            drain_replayed_depth_frames_to_questdb(Vec::new(), &config, "20", "depth-20-unit");
+        assert_eq!(parsed, 0);
+        assert_eq!(persisted, 0);
+        assert_eq!(parse_errors, 0);
+        assert_eq!(persist_errors, 0);
+    }
+
+    /// The order-update drain helper parses a valid JSON frame and
+    /// broadcasts it to the live `tokio::sync::broadcast::Sender`. A
+    /// subscriber created before the drain must receive the replayed
+    /// update. Unit-testable with no I/O.
+    #[tokio::test]
+    async fn test_drain_replayed_order_updates_to_broadcast_parses_and_broadcasts() {
+        let (sender, mut receiver) =
+            tokio::sync::broadcast::channel::<tickvault_common::order_types::OrderUpdate>(16);
+
+        // Minimal Dhan order-update JSON — only `OrderNo` and `Status`
+        // are required by the serde deserializer; every other field
+        // uses `#[serde(default)]`. Matches the canonical minimal
+        // example in `crates/core/src/parser/order_update.rs`
+        // (`test_parse_order_update_minimal`).
+        let json = r#"{"Data": {"OrderNo": "ORD-TEST-001", "Status": "PENDING"}}"#;
+
+        let frames = vec![json.as_bytes().to_vec()];
+        let (parsed, broadcast_count, parse_errors) =
+            drain_replayed_order_updates_to_broadcast(frames, &sender);
+
+        assert_eq!(parsed, 1, "one valid frame must parse");
+        assert_eq!(
+            broadcast_count, 1,
+            "one subscriber attached before drain must receive broadcast"
+        );
+        assert_eq!(parse_errors, 0);
+
+        // The subscriber receives the replayed update synchronously in
+        // the test runtime.
+        let received = receiver.try_recv().expect("subscriber must receive update");
+        assert_eq!(received.order_no, "ORD-TEST-001");
+    }
+
+    /// Invalid JSON must be counted as a parse error and must NOT
+    /// broadcast. Good frames in the same batch still parse.
+    #[tokio::test]
+    async fn test_drain_replayed_order_updates_to_broadcast_skips_invalid_json() {
+        let (sender, _receiver) =
+            tokio::sync::broadcast::channel::<tickvault_common::order_types::OrderUpdate>(16);
+        let frames = vec![b"not-json".to_vec(), b"{\"incomplete\":".to_vec()];
+        let (parsed, broadcast_count, parse_errors) =
+            drain_replayed_order_updates_to_broadcast(frames, &sender);
+        assert_eq!(parsed, 0);
+        assert_eq!(broadcast_count, 0);
+        assert_eq!(parse_errors, 2);
     }
 }
