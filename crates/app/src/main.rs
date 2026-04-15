@@ -1917,20 +1917,42 @@ async fn main() -> Result<()> {
                     continue;
                 }
 
-                // Extract ATM CE + ATM PE security_ids for 200-level depth.
+                // Extract ATM CE + ATM PE security_ids + precise contract labels for 200-level depth.
                 // 200-level = 1 instrument per connection. We need BOTH CE and PE for full
                 // order book visibility. Dhan confirmed: must use ATM strikes (Ticket #5519522).
+                //
+                // Labels are built as `{UNDERLYING}-{MmmYYYY}-{Strike}-{CE|PE}` (e.g.
+                // `MAXHEALTH-Apr2026-660-CE`) so every log line and Telegram alert carries
+                // the PRECISE contract — the user can quote it verbatim to Dhan support
+                // without any ambiguity (200-depth is 1 instrument per connection, so a
+                // generic "NIFTY-ATM-CE" label would hide which expiry and strike actually
+                // stalled).
                 // O(1) EXEMPT: boot-time registry scan for ATM CE + PE
-                let (atm_ce_sid, atm_pe_sid) = {
-                    // Find ATM strike from the first instrument in the 20-level selection
+                let (atm_ce, atm_pe): (Option<(u32, String)>, Option<(u32, String)>) = {
+                    // Get ATM strike AND expiry from the first instrument in 20-level selection
                     // (subscription planner already orders by ATM proximity).
-                    // Get ATM strike AND expiry from the first instrument in 20-level selection.
                     // Both are needed to find the exact CE/PE contract (prevents wrong-expiry match).
                     let atm_info: Option<(f64, chrono::NaiveDate)> = instruments_for_underlying
                         .first()
                         .and_then(|sub| sub.security_id.parse::<u32>().ok())
                         .and_then(|sid| plan.registry.get(sid))
                         .and_then(|r| r.strike_price.zip(r.expiry_date));
+
+                    // Build a precise contract label from registry fields.
+                    // Format: `MAXHEALTH-Apr2026-660-CE` — underlying + Mmm YYYY expiry + strike + side.
+                    fn build_precise_label(
+                        underlying: &str,
+                        expiry: chrono::NaiveDate,
+                        strike: f64,
+                        side: &str,
+                    ) -> String {
+                        let strike_str = if (strike.fract()).abs() < 0.0001 {
+                            format!("{}", strike as i64)
+                        } else {
+                            format!("{strike}")
+                        };
+                        format!("{underlying}-{}-{strike_str}-{side}", expiry.format("%b%Y"))
+                    }
 
                     match atm_info {
                         Some((strike, expiry)) => {
@@ -1953,24 +1975,44 @@ async fn main() -> Result<()> {
                                     && r.strike_price.is_some_and(|sp| (sp - strike).abs() < 0.01)
                                     && r.expiry_date == Some(expiry)
                             });
-                            (ce.map(|r| r.security_id), pe.map(|r| r.security_id))
+                            let ce_out = ce.map(|r| {
+                                (
+                                    r.security_id,
+                                    build_precise_label(underlying, expiry, strike, "CE"),
+                                )
+                            });
+                            let pe_out = pe.map(|r| {
+                                (
+                                    r.security_id,
+                                    build_precise_label(underlying, expiry, strike, "PE"),
+                                )
+                            });
+                            (ce_out, pe_out)
                         }
                         None => (None, None),
                     }
                 };
+                let atm_ce_sid = atm_ce.as_ref().map(|(sid, _)| *sid);
+                let atm_pe_sid = atm_pe.as_ref().map(|(sid, _)| *sid);
 
                 let depth_token = token_handle.clone();
                 let depth_client_id = ws_client_id.clone();
                 let instrument_count = instruments_for_underlying.len();
                 let label = (*underlying).to_string();
 
-                // PROOF: log exactly which ATM strike and security_ids are used.
+                // PROOF: log exactly which ATM strike and security_ids are used
+                // — include the precise contract labels so the log line can be
+                // pasted verbatim into a Dhan support ticket.
+                let atm_ce_label = atm_ce.as_ref().map(|(_, lbl)| lbl.as_str()).unwrap_or("-");
+                let atm_pe_label = atm_pe.as_ref().map(|(_, lbl)| lbl.as_str()).unwrap_or("-");
                 info!(
                     underlying,
                     instruments = instrument_count,
                     atm_ce_sid = ?atm_ce_sid,
                     atm_pe_sid = ?atm_pe_sid,
-                    "PROOF: spawning 20-level depth ({instrument_count} instruments) + 200-level depth (CE+PE ATM)"
+                    atm_ce_contract = atm_ce_label,
+                    atm_pe_contract = atm_pe_label,
+                    "PROOF: spawning 20-level depth ({instrument_count} instruments) + 200-level depth (CE={atm_ce_label}, PE={atm_pe_label})"
                 );
 
                 // O(1) EXEMPT: begin — depth connection + persistence setup at boot
@@ -2216,13 +2258,17 @@ async fn main() -> Result<()> {
                 // O(1) EXEMPT: begin — boot-time 200-level depth setup (max 2 spawns per underlying)
                 // Only NIFTY + BANKNIFTY get 200-level (4 connections within Dhan's 5 limit).
                 if *underlying == "NIFTY" || *underlying == "BANKNIFTY" {
-                    for (opt_label, opt_sid) in [("CE", atm_ce_sid), ("PE", atm_pe_sid)] {
-                        let Some(depth200_sid) = opt_sid else {
+                    // Pair the precise CE/PE labels with their security_ids so every
+                    // downstream log line + Telegram alert identifies the exact
+                    // contract (e.g. `NIFTY-Apr2026-22500-CE`).
+                    let atm_ce_entry = atm_ce.as_ref().map(|(sid, lbl)| ("CE", *sid, lbl.clone()));
+                    let atm_pe_entry = atm_pe.as_ref().map(|(sid, lbl)| ("PE", *sid, lbl.clone()));
+                    for opt_entry in [atm_ce_entry, atm_pe_entry] {
+                        let Some((opt_label, depth200_sid, depth200_label)) = opt_entry else {
                             // ERROR triggers Telegram — ATM None for major index is actionable
                             error!(
                                 underlying,
-                                option = opt_label,
-                                "200-level depth: no ATM {opt_label} found — skipping (check subscription planner)"
+                                "200-level depth: no ATM CE/PE found — skipping (check subscription planner)"
                             );
                             continue;
                         };
@@ -2230,13 +2276,13 @@ async fn main() -> Result<()> {
                         let depth200_token = token_handle.clone();
                         let depth200_client_id = ws_client_id.clone();
                         let depth200_segment = tickvault_common::types::ExchangeSegment::NseFno;
-                        let depth200_label = format!("{underlying}-ATM-{opt_label}");
 
                         info!(
                             underlying,
                             option = opt_label,
                             security_id = depth200_sid,
-                            "spawning 200-level depth connection"
+                            contract = %depth200_label,
+                            "spawning 200-level depth connection (contract={depth200_label}, sid={depth200_sid})"
                         );
 
                         let (tx200, mut rx200) = tokio::sync::mpsc::channel::<bytes::Bytes>(1024);
@@ -2311,6 +2357,8 @@ async fn main() -> Result<()> {
                         let d200_notifier = notifier.clone();
                         let d200_label_for_disconnect = depth200_label.clone();
                         let d200_label_for_signal = depth200_label.clone();
+                        let d200_sid_for_disconnect = depth200_sid;
+                        let d200_sid_for_signal = depth200_sid;
                         let d200_wal_spill = ws_frame_spill.clone();
                         let (d200_signal_tx, d200_signal_rx) =
                             tokio::sync::oneshot::channel::<()>();
@@ -2332,10 +2380,16 @@ async fn main() -> Result<()> {
                                 )
                                 .await
                             {
-                                tracing::error!(?err, "200-level depth connection terminated");
+                                tracing::error!(
+                                    ?err,
+                                    contract = %d200_label_for_disconnect,
+                                    security_id = d200_sid_for_disconnect,
+                                    "200-level depth connection terminated"
+                                );
                                 d200_notifier.notify(
                                     NotificationEvent::DepthTwoHundredDisconnected {
-                                        underlying: d200_label_for_disconnect,
+                                        contract: d200_label_for_disconnect,
+                                        security_id: d200_sid_for_disconnect,
                                         reason: format!("{err}"),
                                     },
                                 );
@@ -2351,7 +2405,8 @@ async fn main() -> Result<()> {
                                 if d200_signal_rx.await.is_ok() {
                                     notify_sender.notify(
                                         NotificationEvent::DepthTwoHundredConnected {
-                                            underlying: d200_label_for_signal,
+                                            contract: d200_label_for_signal,
+                                            security_id: d200_sid_for_signal,
                                         },
                                     );
                                 }

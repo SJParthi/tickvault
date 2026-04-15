@@ -86,11 +86,21 @@ pub enum NotificationEvent {
     /// 20-level depth WebSocket disconnected.
     DepthTwentyDisconnected { underlying: String, reason: String },
 
-    /// 200-level depth WebSocket connected for an underlying.
-    DepthTwoHundredConnected { underlying: String },
+    /// 200-level depth WebSocket connected.
+    ///
+    /// `contract` is the precise contract label (e.g. `NIFTY-Apr2026-22500-CE`)
+    /// and `security_id` is the exact Dhan security ID — both are required so
+    /// the operator can quote the exact instrument when escalating to Dhan
+    /// support. 200-depth is 1 instrument per connection, so a generic
+    /// underlying label would lose the strike/expiry/side information.
+    DepthTwoHundredConnected { contract: String, security_id: u32 },
 
     /// 200-level depth WebSocket disconnected.
-    DepthTwoHundredDisconnected { underlying: String, reason: String },
+    DepthTwoHundredDisconnected {
+        contract: String,
+        security_id: u32,
+        reason: String,
+    },
 
     /// Order update WebSocket connected.
     OrderUpdateConnected,
@@ -351,11 +361,22 @@ impl NotificationEvent {
             Self::DepthTwentyDisconnected { underlying, reason } => {
                 format!("<b>Depth 20-level DISCONNECTED</b>\nUnderlying: {underlying}\n{reason}")
             }
-            Self::DepthTwoHundredConnected { underlying } => {
-                format!("<b>Depth 200-level connected</b>\nUnderlying: {underlying}")
+            Self::DepthTwoHundredConnected {
+                contract,
+                security_id,
+            } => {
+                format!(
+                    "<b>Depth 200-level connected</b>\nContract: {contract}\nSecurityId: {security_id}"
+                )
             }
-            Self::DepthTwoHundredDisconnected { underlying, reason } => {
-                format!("<b>Depth 200-level DISCONNECTED</b>\nUnderlying: {underlying}\n{reason}")
+            Self::DepthTwoHundredDisconnected {
+                contract,
+                security_id,
+                reason,
+            } => {
+                format!(
+                    "<b>Depth 200-level DISCONNECTED</b>\nContract: {contract}\nSecurityId: {security_id}\n{reason}"
+                )
             }
             Self::OrderUpdateConnected => "<b>Order Update WS connected</b>".to_string(),
             Self::OrderUpdateDisconnected { reason } => {
