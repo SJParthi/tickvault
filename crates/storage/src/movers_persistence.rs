@@ -34,8 +34,23 @@ pub const QUESTDB_TABLE_STOCK_MOVERS: &str = "stock_movers";
 pub const QUESTDB_TABLE_OPTION_MOVERS: &str = "option_movers";
 
 /// DEDUP UPSERT KEY for movers tables.
-/// (ts, security_id, category) prevents duplicate entries on restart/reconnect.
-const DEDUP_KEY_MOVERS: &str = "security_id, category";
+///
+/// Compound key: `(ts, security_id, category, segment)` prevents duplicate entries
+/// on restart/reconnect AND prevents cross-segment collision.
+///
+/// **Why `segment` is required** (audit gap DB-3/DB-4, ticket 2026-04-15):
+/// The same `security_id` is reused by Dhan across exchange segments. For
+/// example, `security_id = 13` is `NIFTY` in both `IDX_I` (index) and `NSE_EQ`
+/// (equity — no such instrument in real life, but the collision exists at the
+/// schema level and has been observed for other IDs like 25 / BANKNIFTY). If
+/// `segment` is omitted from the DEDUP key, two legitimate distinct movers
+/// rows in the same 1-minute snapshot bucket will silently UPSERT each other.
+/// Both DDL schemas (`stock_movers`, `option_movers`) declare `segment SYMBOL`
+/// — the DEDUP key must reference every column that contributes to row identity.
+///
+/// Enforced by `test_dedup_key_movers_includes_segment` +
+/// `test_dedup_key_movers_matches_ddl_identity_columns`.
+const DEDUP_KEY_MOVERS: &str = "security_id, category, segment";
 
 /// Timeout for QuestDB DDL HTTP requests.
 const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
@@ -568,6 +583,51 @@ mod tests {
     #[test]
     fn test_dedup_key_includes_category() {
         assert!(DEDUP_KEY_MOVERS.contains("category"));
+    }
+
+    // DB-3/DB-4: Cross-segment collision prevention.
+    // Must include `segment` because the same security_id exists across
+    // `IDX_I` / `NSE_EQ` / `NSE_FNO` with different real-world meanings.
+    // Dropping this test is equivalent to re-introducing silent data corruption.
+    #[test]
+    fn test_dedup_key_movers_includes_segment() {
+        assert!(
+            DEDUP_KEY_MOVERS.contains("segment"),
+            "DEDUP_KEY_MOVERS must include `segment` — same security_id exists \
+             across IDX_I/NSE_EQ/NSE_FNO and would collide otherwise (audit DB-3/DB-4). \
+             Got: {DEDUP_KEY_MOVERS}"
+        );
+    }
+
+    /// Both stock_movers and option_movers share the same DEDUP constant,
+    /// so both tables MUST apply the same identity-column set. This test
+    /// pins the constant format and will fail loudly if anyone re-orders or
+    /// drops a column — forcing a conscious review.
+    #[test]
+    fn test_dedup_key_movers_exact_format() {
+        assert_eq!(
+            DEDUP_KEY_MOVERS, "security_id, category, segment",
+            "DEDUP_KEY_MOVERS regression — changing this string silently \
+             corrupts data; update the test only after the DDL and migration \
+             are confirmed safe."
+        );
+    }
+
+    /// Cross-check: every column referenced in DEDUP_KEY_MOVERS MUST appear
+    /// in both the stock_movers and option_movers DDLs. Prevents the class
+    /// of bug where DEDUP lists a column the table doesn't even have.
+    #[test]
+    fn test_dedup_key_movers_columns_exist_in_both_ddls() {
+        for col in DEDUP_KEY_MOVERS.split(',').map(|s| s.trim()) {
+            assert!(
+                STOCK_MOVERS_CREATE_DDL.contains(col),
+                "DEDUP column `{col}` is missing from STOCK_MOVERS_CREATE_DDL"
+            );
+            assert!(
+                OPTION_MOVERS_CREATE_DDL.contains(col),
+                "DEDUP column `{col}` is missing from OPTION_MOVERS_CREATE_DDL"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
