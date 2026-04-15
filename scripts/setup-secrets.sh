@@ -74,15 +74,15 @@ verify_secret() {
     fi
 }
 
-verify_secret "/dlt/${ENVIRONMENT}/dhan/client-id" "Dhan Client ID"
-verify_secret "/dlt/${ENVIRONMENT}/dhan/client-secret" "Dhan Access Token"
-verify_secret "/dlt/${ENVIRONMENT}/dhan/totp-secret" "Dhan TOTP Secret"
-verify_secret "/dlt/${ENVIRONMENT}/telegram/bot-token" "Telegram Bot Token"
-verify_secret "/dlt/${ENVIRONMENT}/telegram/chat-id" "Telegram Chat ID"
-verify_secret "/dlt/${ENVIRONMENT}/questdb/pg-user" "QuestDB PG User"
-verify_secret "/dlt/${ENVIRONMENT}/questdb/pg-password" "QuestDB PG Password"
-verify_secret "/dlt/${ENVIRONMENT}/grafana/admin-user" "Grafana Admin User"
-verify_secret "/dlt/${ENVIRONMENT}/grafana/admin-password" "Grafana Admin Password"
+verify_secret "/tickvault/${ENVIRONMENT}/dhan/client-id" "Dhan Client ID"
+verify_secret "/tickvault/${ENVIRONMENT}/dhan/client-secret" "Dhan Access Token"
+verify_secret "/tickvault/${ENVIRONMENT}/dhan/totp-secret" "Dhan TOTP Secret"
+verify_secret "/tickvault/${ENVIRONMENT}/telegram/bot-token" "Telegram Bot Token"
+verify_secret "/tickvault/${ENVIRONMENT}/telegram/chat-id" "Telegram Chat ID"
+verify_secret "/tickvault/${ENVIRONMENT}/questdb/pg-user" "QuestDB PG User"
+verify_secret "/tickvault/${ENVIRONMENT}/questdb/pg-password" "QuestDB PG Password"
+verify_secret "/tickvault/${ENVIRONMENT}/grafana/admin-user" "Grafana Admin User"
+verify_secret "/tickvault/${ENVIRONMENT}/grafana/admin-password" "Grafana Admin Password"
 
 echo ""
 
@@ -97,8 +97,8 @@ echo -e "  ${GREEN}All 9 secrets verified in AWS SSM${NC}"
 # ---- Step 4: Test Telegram notification ----
 echo ""
 echo -n "  Sending test Telegram notification... "
-TG_TOKEN=$(aws ssm get-parameter --region "${REGION}" --name "/dlt/${ENVIRONMENT}/telegram/bot-token" --with-decryption --output text --query "Parameter.Value" --no-cli-pager 2>/dev/null)
-TG_CHAT=$(aws ssm get-parameter --region "${REGION}" --name "/dlt/${ENVIRONMENT}/telegram/chat-id" --with-decryption --output text --query "Parameter.Value" --no-cli-pager 2>/dev/null)
+TG_TOKEN=$(aws ssm get-parameter --region "${REGION}" --name "/tickvault/${ENVIRONMENT}/telegram/bot-token" --with-decryption --output text --query "Parameter.Value" --no-cli-pager 2>/dev/null)
+TG_CHAT=$(aws ssm get-parameter --region "${REGION}" --name "/tickvault/${ENVIRONMENT}/telegram/chat-id" --with-decryption --output text --query "Parameter.Value" --no-cli-pager 2>/dev/null)
 
 RESPONSE=$(curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
     -H "Content-Type: application/json" \

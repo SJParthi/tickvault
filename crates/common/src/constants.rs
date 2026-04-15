@@ -498,18 +498,12 @@ pub const STALE_LTP_THRESHOLD_SECS: u64 = 600;
 
 /// Base path for all secrets in SSM Parameter Store.
 ///
-/// **Kept as `/dlt`** — the production AWS account has all working
-/// credentials (Dhan client-id, TOTP secret, Telegram bot-token, etc.)
-/// under this prefix. A prior session attempted to rename to `/tickvault`
-/// but that broke the production boot because the existing parameters
-/// were never migrated. The repo name change (dhan-live-trader →
-/// tickvault) is cosmetic; the SSM namespace is load-bearing and must
-/// match what's actually in AWS Parameter Store.
-///
-/// If you ever need to migrate: `aws ssm get-parameters-by-path --path /dlt/`
-/// → re-put under the new prefix → update this constant → deploy.
-/// Until then, DO NOT change this value.
-pub const SSM_SECRET_BASE_PATH: &str = "/dlt";
+/// Matches the repo name `tickvault`. The prior namespace was `/dlt` (from
+/// the dhan-live-trader legacy name). Run `scripts/migrate-ssm-dlt-to-
+/// tickvault.sh` once per environment to copy `/dlt/*` → `/tickvault/*`
+/// before this code is deployed; the script is idempotent and a `--delete`
+/// flag removes the old namespace after you verify the app boots cleanly.
+pub const SSM_SECRET_BASE_PATH: &str = "/tickvault";
 
 /// SSM service path segment for Dhan credentials.
 pub const SSM_DHAN_SERVICE: &str = "dhan";

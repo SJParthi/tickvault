@@ -97,7 +97,7 @@ ok "SNS topic: ${TOPIC_ARN}"
 
 # ---- Step 3: Subscribe phone number from SSM ----
 PHONE_NUMBER=$(aws ssm get-parameter \
-    --name "/dlt/${SSM_ENV}/sns/phone-number" \
+    --name "/tickvault/${SSM_ENV}/sns/phone-number" \
     --with-decryption \
     --region "$REGION" \
     --query 'Parameter.Value' \
@@ -113,7 +113,7 @@ if [ -n "$PHONE_NUMBER" ]; then
         --output text >/dev/null 2>&1
     ok "SMS subscription: ${PHONE_NUMBER}"
 else
-    warn "No phone number in SSM at /dlt/${SSM_ENV}/sns/phone-number — alarms will fire but SMS won't deliver"
+    warn "No phone number in SSM at /tickvault/${SSM_ENV}/sns/phone-number — alarms will fire but SMS won't deliver"
 fi
 
 # Also subscribe Telegram via a Lambda (if exists) — future enhancement

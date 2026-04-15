@@ -246,13 +246,13 @@ SSM_ARGS="--region ap-south-1 --with-decryption --output text --query Parameter.
 # If SSM fetch fails, docker compose will use empty values and containers
 # will start with defaults (acceptable for smoke test only).
 fetch_ssm_secret() { aws ssm get-parameter --name "$1" ${SSM_ARGS} 2>/dev/null || echo ""; }
-export TV_QUESTDB_PG_USER=$(fetch_ssm_secret "/dlt/dev/questdb/pg-user")
-export TV_QUESTDB_PG_PASSWORD=$(fetch_ssm_secret "/dlt/dev/questdb/pg-password")
-export TV_GRAFANA_ADMIN_USER=$(fetch_ssm_secret "/dlt/dev/grafana/admin-user")
-export TV_GRAFANA_ADMIN_PASSWORD=$(fetch_ssm_secret "/dlt/dev/grafana/admin-password")
-export TV_TELEGRAM_BOT_TOKEN=$(fetch_ssm_secret "/dlt/dev/telegram/bot-token")
-export TV_TELEGRAM_CHAT_ID=$(fetch_ssm_secret "/dlt/dev/telegram/chat-id")
-export TV_VALKEY_PASSWORD=$(fetch_ssm_secret "/dlt/dev/valkey/password")
+export TV_QUESTDB_PG_USER=$(fetch_ssm_secret "/tickvault/dev/questdb/pg-user")
+export TV_QUESTDB_PG_PASSWORD=$(fetch_ssm_secret "/tickvault/dev/questdb/pg-password")
+export TV_GRAFANA_ADMIN_USER=$(fetch_ssm_secret "/tickvault/dev/grafana/admin-user")
+export TV_GRAFANA_ADMIN_PASSWORD=$(fetch_ssm_secret "/tickvault/dev/grafana/admin-password")
+export TV_TELEGRAM_BOT_TOKEN=$(fetch_ssm_secret "/tickvault/dev/telegram/bot-token")
+export TV_TELEGRAM_CHAT_ID=$(fetch_ssm_secret "/tickvault/dev/telegram/chat-id")
+export TV_VALKEY_PASSWORD=$(fetch_ssm_secret "/tickvault/dev/valkey/password")
 
 echo -e "  Starting Docker Compose infrastructure..."
 if docker compose -f "${PROJECT_DIR}/deploy/docker/docker-compose.yml" up -d 2>&1 | tail -15; then

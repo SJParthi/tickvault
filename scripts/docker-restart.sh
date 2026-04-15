@@ -47,12 +47,12 @@ if ! aws sts get-caller-identity --region "${REGION}" > /dev/null 2>&1; then
 fi
 
 echo -e "${CYAN}Fetching credentials from AWS SSM...${NC}"
-export TV_QUESTDB_PG_USER=$(fetch_ssm_secret "/dlt/${SSM_ENV}/questdb/pg-user")
-export TV_QUESTDB_PG_PASSWORD=$(fetch_ssm_secret "/dlt/${SSM_ENV}/questdb/pg-password")
-export TV_GRAFANA_ADMIN_USER=$(fetch_ssm_secret "/dlt/${SSM_ENV}/grafana/admin-user")
-export TV_GRAFANA_ADMIN_PASSWORD=$(fetch_ssm_secret "/dlt/${SSM_ENV}/grafana/admin-password")
-export TV_TELEGRAM_BOT_TOKEN=$(fetch_ssm_secret "/dlt/${SSM_ENV}/telegram/bot-token")
-export TV_TELEGRAM_CHAT_ID=$(fetch_ssm_secret "/dlt/${SSM_ENV}/telegram/chat-id")
+export TV_QUESTDB_PG_USER=$(fetch_ssm_secret "/tickvault/${SSM_ENV}/questdb/pg-user")
+export TV_QUESTDB_PG_PASSWORD=$(fetch_ssm_secret "/tickvault/${SSM_ENV}/questdb/pg-password")
+export TV_GRAFANA_ADMIN_USER=$(fetch_ssm_secret "/tickvault/${SSM_ENV}/grafana/admin-user")
+export TV_GRAFANA_ADMIN_PASSWORD=$(fetch_ssm_secret "/tickvault/${SSM_ENV}/grafana/admin-password")
+export TV_TELEGRAM_BOT_TOKEN=$(fetch_ssm_secret "/tickvault/${SSM_ENV}/telegram/bot-token")
+export TV_TELEGRAM_CHAT_ID=$(fetch_ssm_secret "/tickvault/${SSM_ENV}/telegram/chat-id")
 echo -e "  ${GREEN}Done${NC}"
 
 echo ""

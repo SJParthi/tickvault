@@ -93,13 +93,13 @@ provision_secret() {
 
 # ---- QuestDB PG wire credentials ----
 QUESTDB_PASSWORD=$(generate_password)
-provision_secret "/dlt/${ENVIRONMENT}/questdb/pg-user" "QuestDB PG User" "admin"
-provision_secret "/dlt/${ENVIRONMENT}/questdb/pg-password" "QuestDB PG Password" "${QUESTDB_PASSWORD}"
+provision_secret "/tickvault/${ENVIRONMENT}/questdb/pg-user" "QuestDB PG User" "admin"
+provision_secret "/tickvault/${ENVIRONMENT}/questdb/pg-password" "QuestDB PG Password" "${QUESTDB_PASSWORD}"
 
 # ---- Grafana admin credentials ----
 GRAFANA_PASSWORD=$(generate_password)
-provision_secret "/dlt/${ENVIRONMENT}/grafana/admin-user" "Grafana Admin User" "admin"
-provision_secret "/dlt/${ENVIRONMENT}/grafana/admin-password" "Grafana Admin Password" "${GRAFANA_PASSWORD}"
+provision_secret "/tickvault/${ENVIRONMENT}/grafana/admin-user" "Grafana Admin User" "admin"
+provision_secret "/tickvault/${ENVIRONMENT}/grafana/admin-password" "Grafana Admin Password" "${GRAFANA_PASSWORD}"
 
 # ---- Summary ----
 echo "" >&2
