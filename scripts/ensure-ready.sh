@@ -21,7 +21,89 @@ NC='\033[0m'
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-# ---- Cross-platform browser opener ----
+# ---- Telegram alert helper ----
+# Fires a CRITICAL Telegram alert when automation cannot proceed.
+# Never blocks the main flow — but PRINTS the reason if delivery fails,
+# so the operator can see why Telegram was silent.
+send_telegram_alert() {
+    local message="$1"
+    local notify_script="${SCRIPT_DIR}/notify-telegram.sh"
+    if [ ! -x "${notify_script}" ]; then
+        echo -e "${YELLOW}WARN: notify-telegram.sh not found or not executable — alert silently lost${NC}" >&2
+        echo -e "${YELLOW}  Message was: ${message}${NC}" >&2
+        return 0
+    fi
+    # Do NOT swallow stderr — if Telegram is misconfigured the warning
+    # from notify-telegram.sh is how the operator learns about it.
+    # Swallow only non-zero exit so ensure-ready continues.
+    if ! bash "${notify_script}" "${message}"; then
+        echo -e "${YELLOW}WARN: Telegram delivery failed (see message above)${NC}" >&2
+    fi
+}
+
+# ---- Docker daemon auto-start ----
+# IntelliJ "Run tickvault" and the AWS EventBridge cron (8 AM IST) both call
+# this script. Neither of them can tolerate a "Docker daemon is not running"
+# hard failure — the whole point of automation is that it starts Docker for
+# you. This function:
+#   1. Checks if docker daemon is up (fast path)
+#   2. If not, actively starts it (Darwin: open -a Docker, Linux: systemctl)
+#   3. Polls for up to DOCKER_START_TIMEOUT seconds
+#   4. Fires a Telegram alert if it still fails, then exits non-zero
+DOCKER_START_TIMEOUT=120
+
+ensure_docker_daemon_running() {
+    if docker info > /dev/null 2>&1; then
+        return 0
+    fi
+
+    echo -e "${CYAN}Docker daemon not running — auto-starting...${NC}"
+
+    if [ "$(uname)" = "Darwin" ]; then
+        # macOS dev: launch Docker Desktop
+        if [ -d "/Applications/Docker.app" ]; then
+            open -a Docker --background 2>/dev/null || true
+            echo -e "  ${CYAN}Launched Docker Desktop (macOS)${NC}"
+        else
+            echo -e "${RED}Docker Desktop not installed at /Applications/Docker.app${NC}"
+            send_telegram_alert "CRITICAL: ensure-ready.sh could not auto-start Docker — Docker Desktop is not installed at /Applications/Docker.app. Install Docker Desktop and rerun."
+            return 1
+        fi
+    else
+        # Linux / AWS EC2: systemctl (requires passwordless sudo for the user,
+        # which the AWS user-data.sh.tftpl already configures via `systemctl
+        # enable --now docker`. Local systemd users may need to run
+        # `sudo systemctl enable docker` once.)
+        if command -v systemctl > /dev/null 2>&1; then
+            sudo systemctl start docker 2>/dev/null \
+                || systemctl --user start docker 2>/dev/null \
+                || true
+            echo -e "  ${CYAN}Started docker.service (systemd)${NC}"
+        else
+            echo -e "${RED}No systemctl found — cannot auto-start docker daemon${NC}"
+            send_telegram_alert "CRITICAL: ensure-ready.sh could not auto-start Docker — no systemctl available on $(uname -a)."
+            return 1
+        fi
+    fi
+
+    # Poll until ready or timeout
+    local elapsed=0
+    while ! docker info > /dev/null 2>&1 && [ $elapsed -lt $DOCKER_START_TIMEOUT ]; do
+        sleep 2
+        elapsed=$((elapsed + 2))
+        printf "\r  ${CYAN}Waiting for Docker daemon... %ds / %ds${NC}" "$elapsed" "$DOCKER_START_TIMEOUT"
+    done
+    echo ""
+
+    if docker info > /dev/null 2>&1; then
+        echo -e "  ${GREEN}Docker daemon ready (took ${elapsed}s)${NC}"
+        return 0
+    else
+        echo -e "${RED}Docker daemon failed to start after ${DOCKER_START_TIMEOUT}s${NC}"
+        send_telegram_alert "CRITICAL: ensure-ready.sh auto-started Docker but the daemon did not become ready within ${DOCKER_START_TIMEOUT}s. Manual investigation needed. Host: $(hostname), user: ${USER:-unknown}."
+        return 1
+    fi
+}
 open_url() {
     local url="$1"
     if command -v xdg-open > /dev/null 2>&1; then
@@ -34,7 +116,15 @@ open_url() {
 }
 
 # ---- Auto-open all monitoring dashboards ----
+# Opens the monitoring stack in the default browser. Jaeger was removed in
+# the aws-budget.md RAM-saving pass so its URL is no longer opened — it
+# would 404 otherwise. Call is guarded by TV_SKIP_DASHBOARDS=1 for when
+# you don't want the browser to pop up (CI, AWS EventBridge, headless).
 open_dashboards() {
+    if [ "${TV_SKIP_DASHBOARDS:-0}" = "1" ]; then
+        echo -e "${CYAN}Skipping dashboard auto-open (TV_SKIP_DASHBOARDS=1)${NC}"
+        return 0
+    fi
     echo -e "${CYAN}Opening monitoring dashboards...${NC}"
     # QuestDB web console — primary SQL tool
     open_url "http://localhost:9000"
@@ -45,10 +135,7 @@ open_dashboards() {
     open_url "http://localhost:3000/d/tv-market-data/market-data-explorer?orgId=1&from=now-3d&to=now&timezone=Asia%2FKolkata&refresh=5s"
     sleep 0.3
     open_url "http://localhost:3000/d/tv-trading-pipeline/trading-pipeline?orgId=1&refresh=5s"
-    sleep 0.3
-    # Jaeger tracing UI
-    open_url "http://localhost:16686"
-    echo -e "${GREEN}Opened: QuestDB, Grafana (3 dashboards), Jaeger${NC}"
+    echo -e "${GREEN}Opened: QuestDB + Grafana (3 dashboards)${NC}"
 }
 
 # ---- Auto-configure ~/.pgpass for IntelliJ QuestDB database tool ----
@@ -73,15 +160,20 @@ ensure_pgpass() {
     chmod 600 ~/.pgpass
 }
 
-# ---- Fast path: check if all 8 containers are running ----
+# ---- Fast path: check if all 7 containers are running ----
+# Loki, Alloy, and Jaeger were removed per `.claude/rules/project/aws-budget.md`
+# to save 2.5GB RAM on the c7i.xlarge AWS budget. Previously this list
+# still contained them, so `all_running` always returned false, the fast
+# path never fired, and `open_dashboards()` was never reached — that's
+# why "auto-open dashboards" was silently broken. Keep this list in sync
+# with `deploy/docker/docker-compose.yml` services.
 REQUIRED_CONTAINERS=(
     "tv-questdb"
     "tv-valkey"
+    "tv-valkey-exporter"
     "tv-prometheus"
+    "tv-alertmanager"
     "tv-grafana"
-    "tv-loki"
-    "tv-alloy"
-    "tv-jaeger"
     "tv-traefik"
 )
 
@@ -93,6 +185,14 @@ all_running() {
     done
     return 0
 }
+
+# Before the fast-path check we must ensure Docker itself is reachable —
+# otherwise `docker ps` (called by all_running) silently returns empty and
+# we fall into the slow path. Auto-start the daemon here so both paths
+# benefit from the no-human-intervention guarantee.
+if ! ensure_docker_daemon_running; then
+    exit 1
+fi
 
 # Quick check — if everything is already running, still ensure schema is up-to-date
 if all_running; then
@@ -114,16 +214,18 @@ fi
 echo -e "${CYAN}Infrastructure not ready — running full auto-setup...${NC}"
 echo ""
 
-# 1. Check Docker is running
+# 1. Ensure Docker daemon is running — auto-start if needed
 if ! command -v docker > /dev/null 2>&1; then
     echo -e "${RED}Docker CLI not found!${NC}"
     echo -e "${RED}Install Docker Desktop: https://docker.com/products/docker-desktop${NC}"
+    send_telegram_alert "CRITICAL: ensure-ready.sh — Docker CLI not installed on $(hostname). Automation cannot proceed."
     exit 1
 fi
 
-if ! docker info > /dev/null 2>&1; then
-    echo -e "${RED}Docker daemon is not running!${NC}"
-    echo -e "${RED}Start Docker Desktop first, then re-run.${NC}"
+# Replaces the old "tell the user to start Docker" hard-fail. The automation
+# plan (8 AM IST EventBridge on AWS, IntelliJ Run tickvault locally) cannot
+# tolerate a human-in-the-loop Docker start step.
+if ! ensure_docker_daemon_running; then
     exit 1
 fi
 

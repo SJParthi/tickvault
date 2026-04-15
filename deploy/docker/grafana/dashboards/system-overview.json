@@ -378,7 +378,7 @@
     "refresh_intervals": ["5s", "10s", "30s", "1m", "5m"]
   },
   "timezone": "Asia/Kolkata",
-  "title": "DLT — System Overview",
+  "title": "tickvault — System Overview",
   "uid": "tv-system-overview",
   "version": 100
 }

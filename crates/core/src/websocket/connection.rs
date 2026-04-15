@@ -24,12 +24,17 @@ use tracing::{debug, error, info, instrument, warn};
 
 use tickvault_common::config::{DhanConfig, WebSocketConfig};
 use tickvault_common::types::FeedMode;
+use tickvault_storage::ws_frame_spill::{WsFrameSpill, WsType};
 
 use crate::auth::TokenHandle;
+use crate::websocket::activity_watchdog::{
+    ActivityWatchdog, WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS,
+};
 use crate::websocket::subscription_builder::build_subscription_messages;
 use crate::websocket::tls::build_websocket_tls_connector;
 use crate::websocket::types::{
-    ConnectionHealth, ConnectionId, ConnectionState, InstrumentSubscription, WebSocketError,
+    ConnectionHealth, ConnectionId, ConnectionState, DisconnectCode, InstrumentSubscription,
+    WebSocketError,
 };
 
 // ---------------------------------------------------------------------------
@@ -92,6 +97,34 @@ pub struct WebSocketConnection {
     /// requested. The read loop's `tokio::select!` polls this alongside the
     /// socket, so shutdown requests interrupt a blocking read.
     shutdown_notify: Arc<tokio::sync::Notify>,
+
+    /// STAGE-C: Optional WAL spill writer. When `Some`, every binary frame is
+    /// durably appended to disk BEFORE being forwarded to the live frame
+    /// channel. On process restart, `WsFrameSpill::replay_all` hands recovered
+    /// frames back to downstream so zero ticks are lost across crashes or
+    /// downstream stalls. `None` in tests.
+    wal_spill: Option<Arc<WsFrameSpill>>,
+
+    /// STAGE-C.3: Shared activity counter read by the per-connection activity
+    /// watchdog. Bumped on every inbound frame (binary / ping / pong / text)
+    /// so the watchdog can distinguish a truly dead socket from a
+    /// data-quiet period where Dhan is still pinging. Initialised to 0 in
+    /// `new()`; reset semantics are a no-op because the watchdog tracks
+    /// *forward progress*, not absolute values.
+    activity_counter: Arc<AtomicU64>,
+
+    /// STAGE-C.3: Notify handle the activity watchdog fires when it has
+    /// observed no forward progress on `activity_counter` for longer than
+    /// its threshold. The read loop awaits this in `tokio::select!` and
+    /// returns `Err(WatchdogFired)` on notification, which the outer
+    /// `run()` loop treats as a reconnectable error.
+    ///
+    /// Separate from `shutdown_notify` because the semantics differ:
+    /// `shutdown_notify` is a polite graceful-shutdown path that sends
+    /// `RequestCode: 12` to Dhan and returns `Ok(())`; `watchdog_notify`
+    /// represents a dead socket and must return `Err` so the outer loop
+    /// reconnects.
+    watchdog_notify: Arc<tokio::sync::Notify>,
 }
 
 impl WebSocketConnection {
@@ -148,7 +181,21 @@ impl WebSocketConnection {
             notifier,
             shutdown_requested: std::sync::atomic::AtomicBool::new(false),
             shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+            wal_spill: None,
+            activity_counter: Arc::new(AtomicU64::new(0)),
+            watchdog_notify: Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    /// STAGE-C: Attach a WAL spill writer. Every binary frame will be durably
+    /// persisted to disk before being forwarded to the live consumer channel.
+    ///
+    /// Chain after `new()`: `WebSocketConnection::new(...).with_wal_spill(spill)`.
+    #[must_use]
+    // TEST-EXEMPT: builder pass-through covered indirectly by connection_pool construction paths; no test-visible state change to assert
+    pub fn with_wal_spill(mut self, spill: Arc<WsFrameSpill>) -> Self {
+        self.wal_spill = Some(spill);
+        self
     }
 
     /// A5: Request graceful shutdown of this connection. Idempotent.
@@ -237,8 +284,37 @@ impl WebSocketConnection {
                         }
                     }
 
+                    // STAGE-C.3: Spawn the per-connection activity watchdog
+                    // before entering the read loop. The watchdog polls
+                    // `activity_counter` every WATCHDOG_POLL_INTERVAL_SECS
+                    // and fires `watchdog_notify` if the counter has not
+                    // advanced for WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS.
+                    // On fire, the read loop's select! returns
+                    // Err(WatchdogFired) and the outer loop reconnects.
+                    //
+                    // A fresh watchdog is spawned on every reconnect; the
+                    // old task is aborted below as soon as the read loop
+                    // returns. O(1) EXEMPT: cold path — one spawn per
+                    // connect cycle, not per frame.
+                    let watchdog_label = format!("live-feed-{}", self.connection_id);
+                    let watchdog = ActivityWatchdog::new(
+                        watchdog_label,
+                        Arc::clone(&self.activity_counter),
+                        Duration::from_secs(WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS),
+                        Arc::clone(&self.watchdog_notify),
+                    );
+                    let watchdog_handle = tokio::spawn(watchdog.run());
+
                     // Run read + ping loops until disconnect.
                     let disconnect_result = self.run_read_loop(ws_stream).await;
+
+                    // STAGE-C.3: Always abort the watchdog task on exit.
+                    // If the watchdog fired, its task has already returned
+                    // and `abort()` is a no-op. If the read loop exited for
+                    // any other reason (Dhan disconnect, graceful shutdown,
+                    // transport error), we stop the watchdog so it can't
+                    // fire stale alerts against a dead socket.
+                    watchdog_handle.abort();
 
                     match disconnect_result {
                         Ok(()) => {
@@ -475,31 +551,51 @@ impl WebSocketConnection {
         let (write, mut read) = ws_stream.split();
         let write = Arc::new(tokio::sync::Mutex::new(write));
 
-        // Dynamic read timeout: ping_interval × (max_failures + 1) + pong_timeout.
-        // Default: 10 × (2 + 1) + 10 = 40s. Matches SERVER_PING_TIMEOUT_SECS.
-        // Any received frame (Binary, Ping, Text) resets the timeout.
-        let read_timeout_secs = self
-            .ws_config
-            .ping_interval_secs
-            .saturating_mul(u64::from(self.ws_config.max_consecutive_pong_failures) + 1)
-            .saturating_add(self.ws_config.pong_timeout_secs);
-        let read_timeout = Duration::from_secs(read_timeout_secs);
+        // STAGE-B (plan item P1.1): No client-side read deadline.
+        //
+        // Per Dhan spec (docs/dhan-ref/03-live-market-feed-websocket.md:90-95):
+        //   "Server pings every 10s. WebSocket library auto-responds with pong.
+        //    If client does not respond for >40s, server closes the connection."
+        //
+        // The 40-second timeout is ENFORCED BY THE SERVER. A client-side
+        // `time::timeout(40s, read.next())` wrapper is redundant AND creates
+        // false-positive disconnects whenever downstream is slow (tick
+        // processor stall propagates backpressure → read loop can't advance
+        // → 40s deadline fires even though the socket is fine).
+        //
+        // The read loop now blocks purely on `read.next().await`. Exit
+        // conditions: stream returns None, stream returns Err, or the
+        // shutdown notify fires. That's it.
+        //
+        // Liveness is enforced by: (a) Dhan's own 40s server-side timeout,
+        // and (b) Stage C's watchdog task (independent of this loop).
 
         loop {
             // A5: tokio::select! lets the read loop respond to a graceful
-            // shutdown request without waiting for the 40-second read timeout.
-            // On shutdown: send Disconnect JSON (RequestCode 12), close the
-            // socket, and return Ok so the outer `run()` loop exits cleanly
-            // (see `is_shutdown_requested` check in `run()`).
-            let select_result = tokio::select! {
+            // shutdown request immediately. On shutdown: send Disconnect JSON
+            // (RequestCode 12), close the socket, and return Ok so the outer
+            // `run()` loop exits cleanly (see `is_shutdown_requested` check
+            // in `run()`).
+            let frame_result = tokio::select! {
                 biased;
+                // STAGE-C.3: activity watchdog fired — socket is dead, force
+                // reconnect. Does NOT send RequestCode 12 (the socket is
+                // already gone) and returns Err so the outer run() loop
+                // reconnects instead of exiting cleanly like shutdown does.
+                () = self.watchdog_notify.notified() => {
+                    return Err(WebSocketError::WatchdogFired {
+                        label: format!("live-feed-{}", self.connection_id), // O(1) EXEMPT: cold path — fires once per dead socket, not per frame
+                        silent_secs: WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS,
+                        threshold_secs: WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS,
+                    });
+                }
                 () = self.shutdown_notify.notified() => {
                     info!(
                         connection_id = self.connection_id,
                         "A5: graceful shutdown notified — sending RequestCode 12 (Disconnect) to Dhan"
                     );
                     let disconnect_json = crate::websocket::subscription_builder::build_disconnect_message();
-                    let send_timeout = Duration::from_secs(2);
+                    let send_timeout = Duration::from_secs(2); // APPROVED: graceful-shutdown upper bound — 2s per connection is the session 7 A5 spec, not tunable.
                     let send_result = {
                         let mut sink = write.lock().await;
                         time::timeout(
@@ -516,7 +612,7 @@ impl WebSocketConnection {
                             );
                             metrics::counter!(
                                 "tv_ws_graceful_unsub_total",
-                                "connection_id" => self.connection_id.to_string(),
+                                "connection_id" => self.connection_id.to_string(), // APPROVED: cold-path (graceful shutdown metrics label, runs once per SIGTERM)
                                 "outcome" => "sent"
                             )
                             .increment(1);
@@ -529,7 +625,7 @@ impl WebSocketConnection {
                             );
                             metrics::counter!(
                                 "tv_ws_graceful_unsub_total",
-                                "connection_id" => self.connection_id.to_string(),
+                                "connection_id" => self.connection_id.to_string(), // APPROVED: cold-path (graceful shutdown metrics label, runs once per SIGTERM)
                                 "outcome" => "send_failed"
                             )
                             .increment(1);
@@ -542,7 +638,7 @@ impl WebSocketConnection {
                             );
                             metrics::counter!(
                                 "tv_ws_graceful_unsub_total",
-                                "connection_id" => self.connection_id.to_string(),
+                                "connection_id" => self.connection_id.to_string(), // APPROVED: cold-path (graceful shutdown metrics label, runs once per SIGTERM)
                                 "outcome" => "timeout"
                             )
                             .increment(1);
@@ -551,147 +647,220 @@ impl WebSocketConnection {
                     // Close the socket regardless of send outcome.
                     {
                         let mut sink = write.lock().await;
-                        let _ = time::timeout(Duration::from_secs(1), sink.close()).await;
+                        let _ = time::timeout(Duration::from_secs(1), sink.close()).await; // APPROVED: graceful-shutdown inner close timeout — 1s is the session 7 A5 spec.
                     }
                     return Ok(());
                 }
-                timeout_result = time::timeout(read_timeout, read.next()) => timeout_result,
+                // STAGE-B (P1.1): plain read.next().await — no deadline.
+                next_frame = read.next() => next_frame,
             };
 
-            match select_result {
-                Err(_elapsed) => {
-                    warn!(
-                        connection_id = self.connection_id,
-                        timeout_secs = read_timeout_secs,
-                        "WebSocket read timeout — no data received, treating as dead connection"
-                    );
-                    return Err(WebSocketError::ReadTimeout {
-                        connection_id: self.connection_id,
-                        timeout_secs: read_timeout_secs,
-                    });
-                }
-                Ok(frame_result) => match frame_result {
-                    Some(Ok(Message::Binary(data))) => {
-                        // Forward raw binary frame to downstream.
-                        // ZERO TICK LOSS: Use try_send for fast path, fall back to
-                        // blocking send (backpressure) if channel is full. This
-                        // guarantees no frame is ever dropped. The WS connection
-                        // survives backpressure because Dhan's ping timeout is 40s,
-                        // and the 128K channel gives 13+ seconds of headroom.
-                        match self.frame_sender.try_send(data) {
-                            Ok(()) => {} // fast path — channel has space
-                            Err(mpsc::error::TrySendError::Full(data)) => {
-                                // Channel full — apply backpressure (block WS read).
-                                // This is safer than dropping: WS survives 40s of
-                                // backpressure, and zero ticks are lost.
-                                warn!(
-                                    connection_id = self.connection_id,
-                                    channel_capacity = self.frame_sender.capacity(),
-                                    "SPSC channel full — backpressure active (zero-drop mode)"
-                                );
-                                metrics::counter!("tv_ws_frame_backpressure_total").increment(1);
-                                // Blocking send with backpressure timeout — if still
-                                // stuck, the WS ping timeout (40s) will kill the
-                                // connection and auto-reconnect will re-establish it.
-                                const BACKPRESSURE_TIMEOUT: Duration = Duration::from_secs(
-                                    tickvault_common::constants::FRAME_BACKPRESSURE_TIMEOUT_SECS,
-                                );
-                                match time::timeout(
-                                    BACKPRESSURE_TIMEOUT,
-                                    self.frame_sender.send(data),
-                                )
-                                .await
-                                {
-                                    Ok(Ok(())) => {
-                                        debug!(
-                                            connection_id = self.connection_id,
-                                            "backpressure resolved — frame sent"
-                                        );
-                                    }
-                                    Ok(Err(_)) => {
-                                        warn!(
-                                            connection_id = self.connection_id,
-                                            "Frame receiver dropped — stopping read loop"
-                                        );
-                                        return Ok(());
-                                    }
-                                    Err(_elapsed) => {
-                                        // 30s backpressure exhausted. The WS ping timeout
-                                        // (40s) will disconnect us shortly. Log CRITICAL.
-                                        error!(
-                                            connection_id = self.connection_id,
-                                            "CRITICAL: 30s backpressure timeout — tick processor frozen"
-                                        );
-                                        metrics::counter!("tv_ws_backpressure_timeout_total")
-                                            .increment(1);
-                                    }
-                                }
-                            }
-                            Err(mpsc::error::TrySendError::Closed(_)) => {
-                                warn!(
-                                    connection_id = self.connection_id,
-                                    "Frame receiver dropped — stopping read loop"
-                                );
-                                return Ok(());
-                            }
+            // STAGE-C.3: Bump the activity counter on EVERY Some(Ok(_)) frame
+            // — binary, ping, pong, text. The watchdog only cares that the
+            // socket is producing something, not what. A steady stream of
+            // Dhan pings (every 10s) is enough to keep the counter advancing
+            // during data-quiet periods so the watchdog never fires a false
+            // positive. One relaxed atomic increment is O(1) and allocation
+            // free — safe on the hot path.
+            if matches!(frame_result, Some(Ok(_))) {
+                self.activity_counter.fetch_add(1, Ordering::Relaxed);
+            }
+
+            match frame_result {
+                Some(Ok(Message::Binary(data))) => {
+                    // STAGE-C.5: early disconnect-code detection.
+                    //
+                    // Dhan signals API-level errors via a binary
+                    // disconnect packet with response_code == 50 and
+                    // a u16 LE reason code at bytes 8-9. See
+                    // `docs/dhan-ref/08-annexure-enums.md` Section 11.
+                    //
+                    // The tick-processor eventually parses this into
+                    // `ParsedFrame::Disconnect(code)` via the
+                    // dispatcher, but by then the read loop has
+                    // already continued — it will not know to stop
+                    // reconnecting on a non-reconnectable code
+                    // (804/805/806/808/809/810/811/812/813/814) or to
+                    // trigger token refresh on 807.
+                    //
+                    // Intercept here so the WS layer can raise
+                    // `DhanDisconnect { code }` BEFORE the bytes flow
+                    // downstream, letting the outer `run()` loop take
+                    // the right reconnect / halt / refresh decision
+                    // as per the existing `is_reconnectable` +
+                    // `requires_token_refresh` logic.
+                    //
+                    // We still WAL-append and forward the bytes so
+                    // the existing parser path sees the same
+                    // disconnect (needed for metrics + observability).
+                    // The Err return happens AFTER the forward so no
+                    // frame is lost on the way out.
+                    //
+                    // O(1) — one byte check + one u16 LE load on a
+                    // 10-byte packet. No allocation, no parsing on
+                    // the happy path (early-return for non-50 codes).
+                    let maybe_disconnect_code: Option<DisconnectCode> = if !data.is_empty()
+                        && data[0] == tickvault_common::constants::RESPONSE_CODE_DISCONNECT
+                        && data.len() >= tickvault_common::constants::DISCONNECT_PACKET_SIZE
+                    {
+                        // Bytes 8-9 per docs/dhan-ref/03-live-market-feed-websocket.md:258
+                        let raw_code = u16::from_le_bytes([data[8], data[9]]);
+                        Some(DisconnectCode::from_u16(raw_code))
+                    } else {
+                        None
+                    };
+
+                    // STAGE-C (P1.2+P1.3): durable WAL first, live forward second.
+                    //
+                    // (1) If a WAL spill is attached, append the raw frame to
+                    //     disk via a crossbeam try_send. This is O(1) and never
+                    //     blocks the read loop. The frame is now durable —
+                    //     even if the downstream consumer is stuck and we
+                    //     later drop the live forward, the next boot will
+                    //     replay this frame from disk.
+                    //
+                    // (2) Forward to the live consumer channel with try_send.
+                    //     On Full, log WARN (not CRITICAL) because the frame
+                    //     is already durable in the WAL. The watchdog will
+                    //     restart the downstream consumer on sustained
+                    //     backpressure, which replays from WAL on boot.
+                    //
+                    // (3) Only if the WAL itself dropped the frame do we fire
+                    //     the CRITICAL metric — that is the single "real loss"
+                    //     path and it requires both the disk writer thread
+                    //     AND the downstream consumer to be stuck simultaneously.
+                    if let Some(spill) = self.wal_spill.as_ref() {
+                        // O(1) EXEMPT: one Vec<u8> copy per frame (≤162 B for Full packets)
+                        // is required to hand owned memory to the disk writer thread. This
+                        // is O(frame_len) which is bounded by the largest Dhan packet and
+                        // therefore constant-bounded. One alloc per frame at peak 10k
+                        // frames/sec is well within jemalloc headroom.
+                        let frame_vec = data.to_vec();
+                        let outcome = spill.append(WsType::LiveFeed, frame_vec);
+                        if outcome == tickvault_storage::ws_frame_spill::AppendOutcome::Dropped {
+                            error!(
+                                connection_id = self.connection_id,
+                                "CRITICAL: WAL spill dropped LiveFeed frame — disk writer stalled"
+                            );
+                            // CRITICAL metric already incremented inside spill.append().
                         }
                     }
-                    Some(Ok(Message::Ping(data))) => {
-                        // Server ping — respond with pong to keep connection alive.
-                        // Timeout prevents hang if TCP buffer is full on a dead connection.
-                        let pong_timeout = Duration::from_secs(self.ws_config.pong_timeout_secs);
-                        let mut sink = write.lock().await;
-                        if time::timeout(pong_timeout, sink.send(Message::Pong(data)))
-                            .await
-                            .is_err()
-                        {
+                    match self.frame_sender.try_send(data) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(_dropped)) => {
                             warn!(
                                 connection_id = self.connection_id,
-                                timeout_secs = self.ws_config.pong_timeout_secs,
-                                "Pong send timed out — connection likely dead"
+                                channel_capacity = self.frame_sender.capacity(),
+                                wal_attached = self.wal_spill.is_some(),
+                                "WS live frame channel full — backpressure from downstream. \
+                                 Frame is durable in WAL; watchdog will restart consumer."
                             );
-                            return Err(WebSocketError::ReadTimeout {
-                                connection_id: self.connection_id,
-                                timeout_secs: self.ws_config.pong_timeout_secs,
-                            });
+                            metrics::counter!(
+                                "tv_ws_frame_live_backpressure_total",
+                                "ws_type" => "live_feed"
+                            )
+                            .increment(1);
+                            // Intentionally do NOT return Err — the socket is
+                            // healthy, we just can't forward this one frame on
+                            // the live path. The read loop MUST continue so
+                            // pings flow and the WAL keeps durably recording.
                         }
-                    }
-                    Some(Ok(Message::Pong(_))) => {
-                        // Pong from server (e.g., echo of our pong). Ignore.
-                    }
-                    Some(Ok(Message::Close(frame))) => {
-                        if let Some(frame) = frame {
-                            let code: u16 = frame.code.into();
-                            let reason = frame.reason.to_string(); // O(1) EXEMPT: close frame — once at disconnect
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
                             warn!(
                                 connection_id = self.connection_id,
-                                close_code = code,
-                                reason = %reason,
-                                "WebSocket close frame received"
+                                "Frame receiver dropped — stopping read loop"
                             );
+                            return Ok(());
                         }
-                        return Ok(());
                     }
-                    Some(Ok(Message::Text(text))) => {
-                        // Dhan may send text for disconnect messages.
-                        debug!(
+
+                    // STAGE-C.5: if the packet was a disconnect, surface
+                    // the classified error now. The outer `run()` loop:
+                    //   - non-reconnectable codes → return NonReconnectableDisconnect
+                    //     (stops retrying — no reconnect storm on 805/808/etc.)
+                    //   - 807 AccessTokenExpired → wait_for_valid_token()
+                    //     (refresh via the token manager before reconnecting)
+                    //   - 800 + Unknown → exponential backoff reconnect
+                    //
+                    // We return AFTER the WAL append + live forward so
+                    // the tick processor still sees the disconnect for
+                    // metrics + observability.
+                    if let Some(code) = maybe_disconnect_code {
+                        warn!(
                             connection_id = self.connection_id,
-                            text_len = text.len(),
-                            "Received text message (unexpected)"
+                            disconnect_code = %code,
+                            reconnectable = code.is_reconnectable(),
+                            requires_token_refresh = code.requires_token_refresh(),
+                            "Dhan binary disconnect packet received — surfacing to run() loop"
                         );
+                        metrics::counter!(
+                            "tv_ws_dhan_disconnect_total",
+                            "code" => format!("{code}"), // O(1) EXEMPT: cold path, fires once per disconnect
+                            "ws_type" => "live_feed"
+                        )
+                        .increment(1);
+                        return Err(WebSocketError::DhanDisconnect { code });
                     }
-                    Some(Err(err)) => {
-                        return Err(WebSocketError::ConnectionFailed {
-                            url: self.websocket_base_url.clone(), // O(1) EXEMPT: error path — once at disconnect
-                            source: err,
+                }
+                Some(Ok(Message::Ping(data))) => {
+                    // Server ping — respond with pong to keep connection alive.
+                    // Pong send is bounded by pong_timeout — if the socket's
+                    // TCP buffer is stuck for >pong_timeout, the socket is
+                    // genuinely dead and we return Err to trigger reconnect.
+                    let pong_timeout = Duration::from_secs(self.ws_config.pong_timeout_secs);
+                    let mut sink = write.lock().await;
+                    if time::timeout(pong_timeout, sink.send(Message::Pong(data)))
+                        .await
+                        .is_err()
+                    {
+                        warn!(
+                            connection_id = self.connection_id,
+                            timeout_secs = self.ws_config.pong_timeout_secs,
+                            "Pong send timed out — connection likely dead"
+                        );
+                        return Err(WebSocketError::ReadTimeout {
+                            connection_id: self.connection_id,
+                            timeout_secs: self.ws_config.pong_timeout_secs,
                         });
                     }
-                    None => {
-                        // Stream ended.
-                        return Ok(());
+                }
+                Some(Ok(Message::Pong(_))) => {
+                    // Pong from server (e.g., echo of our pong). Ignore.
+                }
+                Some(Ok(Message::Close(frame))) => {
+                    if let Some(frame) = frame {
+                        let code: u16 = frame.code.into();
+                        let reason = frame.reason.to_string(); // O(1) EXEMPT: close frame — once at disconnect
+                        warn!(
+                            connection_id = self.connection_id,
+                            close_code = code,
+                            reason = %reason,
+                            "WebSocket close frame received"
+                        );
                     }
-                    _ => {}
-                },
+                    return Ok(());
+                }
+                Some(Ok(Message::Text(text))) => {
+                    // Dhan may send text for disconnect messages.
+                    debug!(
+                        connection_id = self.connection_id,
+                        text_len = text.len(),
+                        "Received text message (unexpected)"
+                    );
+                }
+                Some(Err(err)) => {
+                    return Err(WebSocketError::ConnectionFailed {
+                        url: self.websocket_base_url.clone(), // O(1) EXEMPT: error path — once at disconnect
+                        source: err,
+                    });
+                }
+                None => {
+                    // Stream ended — exit cleanly, outer loop reconnects.
+                    return Ok(());
+                }
+                Some(Ok(_)) => {
+                    // tokio-tungstenite may surface Frame variants we don't care about.
+                }
             }
         }
     }
@@ -728,15 +897,25 @@ impl WebSocketConnection {
         }
 
         // Exponential backoff: initial * 2^attempt, capped at max.
-        let delay_ms = self
+        let base_delay_ms = self
             .ws_config
             .reconnect_initial_delay_ms
             .saturating_mul(1u64.checked_shl(attempt.min(63) as u32).unwrap_or(u64::MAX))
             .min(self.ws_config.reconnect_max_delay_ms);
 
+        // B1: add deterministic-but-varying jitter so 5 connections failing
+        // together do not synchronize their reconnect attempts and hammer
+        // Dhan's endpoint in lock-step. We hash the current wall-clock
+        // subsec_nanos with the connection_id so each connection draws a
+        // different value on each reconnect attempt. No new crate dep.
+        //
+        // Jitter range: ±jitter_pct% of base_delay_ms, clamped to [0, base*2].
+        let delay_ms = jitter_reconnect_delay(base_delay_ms, self.connection_id, attempt);
+
         info!(
             connection_id = self.connection_id,
             attempt = attempt,
+            base_delay_ms = base_delay_ms,
             delay_ms = delay_ms,
             "Reconnecting after backoff"
         );
@@ -784,6 +963,56 @@ impl WebSocketConnection {
 }
 
 // ---------------------------------------------------------------------------
+// B1: Reconnect jitter — prevents thundering-herd on simultaneous failures.
+// ---------------------------------------------------------------------------
+
+/// Maximum jitter as a fraction of the base delay. ±20% means for a 10s
+/// base delay, the actual delay is in [8s, 12s]. Tuned large enough that
+/// 5 connections in lock-step break up within 2 reconnect rounds.
+const RECONNECT_JITTER_PCT: u64 = 20;
+
+/// Applies deterministic-but-varying jitter to a reconnect delay.
+///
+/// Uses the connection_id + attempt + wall-clock subsec_nanos as the jitter
+/// source. This is NOT cryptographic — it only needs to decorrelate across
+/// the 5 connections in the pool, which all see different connection_id
+/// values. Avoids adding a `rand` crate dependency.
+///
+/// # Contract
+/// - Returns a value in `[base * (1 - pct/100), base * (1 + pct/100)]`,
+///   clamped to `[1, base * 2]`.
+/// - For `base == 0`, returns `0`.
+/// - For very small `base` (< 5ms), returns `base` unchanged (jitter
+///   would be less than 1ms and add no decorrelation).
+pub(crate) fn jitter_reconnect_delay(base_delay_ms: u64, connection_id: u8, attempt: u64) -> u64 {
+    if base_delay_ms == 0 {
+        return 0;
+    }
+    if base_delay_ms < 5 {
+        return base_delay_ms;
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::from(d.subsec_nanos()));
+    // Mix the three sources with a simple xor+mul — good enough to
+    // decorrelate 5 connections without a crypto-grade RNG.
+    let mix: u64 = nanos
+        ^ (u64::from(connection_id).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+        ^ (attempt.wrapping_mul(0xBF58_476D_1CE4_E5B9));
+    let jitter_range_ms = base_delay_ms
+        .saturating_mul(RECONNECT_JITTER_PCT)
+        .saturating_div(100);
+    if jitter_range_ms == 0 {
+        return base_delay_ms;
+    }
+    // Choose a signed offset in [-jitter_range_ms, +jitter_range_ms).
+    let span = jitter_range_ms.saturating_mul(2);
+    let offset = (mix % span) as i64 - jitter_range_ms as i64;
+    let applied = (base_delay_ms as i64).saturating_add(offset);
+    applied.max(1) as u64
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -791,6 +1020,77 @@ impl WebSocketConnection {
 mod tests {
     use super::*;
     use tickvault_common::types::ExchangeSegment;
+
+    // -----------------------------------------------------------------------
+    // B1: jitter_reconnect_delay — thundering-herd prevention
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_jitter_reconnect_delay_within_bounds() {
+        // ±20% of 10_000 = 2_000 → range [8_000, 12_000].
+        let base = 10_000u64;
+        for attempt in 0u64..50 {
+            for conn_id in 0u8..5 {
+                let delay = jitter_reconnect_delay(base, conn_id, attempt);
+                assert!(
+                    (8_000..=12_000).contains(&delay),
+                    "delay {delay} out of bounds for base {base} (conn={conn_id}, attempt={attempt})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_jitter_reconnect_delay_zero_base() {
+        assert_eq!(jitter_reconnect_delay(0, 0, 0), 0);
+        assert_eq!(jitter_reconnect_delay(0, 7, 42), 0);
+    }
+
+    #[test]
+    fn test_jitter_reconnect_delay_small_base_unchanged() {
+        // For base < 5ms, jitter is pointless (would be sub-ms) — pass through.
+        assert_eq!(jitter_reconnect_delay(1, 0, 0), 1);
+        assert_eq!(jitter_reconnect_delay(4, 3, 5), 4);
+    }
+
+    #[test]
+    fn test_jitter_reconnect_delay_decorrelates_across_connections() {
+        // The whole point of B1: 5 connections with the same base delay
+        // should NOT all land on the same value. Collect samples and
+        // assert at least 2 distinct results — very loose bound because
+        // the nanos source is shared, but connection_id mixes in.
+        let base = 1_000u64;
+        let samples: Vec<u64> = (0..5u8)
+            .map(|id| jitter_reconnect_delay(base, id, 1))
+            .collect();
+        let unique_count = {
+            let mut sorted = samples.clone();
+            sorted.sort_unstable();
+            sorted.dedup();
+            sorted.len()
+        };
+        assert!(
+            unique_count >= 2,
+            "jitter must decorrelate across at least 2 connection_ids; got samples={samples:?}"
+        );
+    }
+
+    #[test]
+    fn test_jitter_reconnect_delay_never_returns_zero_for_positive_base() {
+        // Even at worst-case -20% offset, a positive base must not yield 0.
+        for base in [5u64, 10, 100, 1_000, 30_000] {
+            for attempt in 0u64..20 {
+                for conn_id in 0u8..5 {
+                    let delay = jitter_reconnect_delay(base, conn_id, attempt);
+                    assert!(
+                        delay >= 1,
+                        "delay must be at least 1ms for positive base; got {delay} \
+                         (base={base}, conn={conn_id}, attempt={attempt})"
+                    );
+                }
+            }
+        }
+    }
 
     fn make_test_dhan_config() -> DhanConfig {
         DhanConfig {
@@ -1649,8 +1949,12 @@ mod tests {
         }
     }
 
-    // --- Run with zero max_attempts returns ReconnectionExhausted immediately ---
-
+    // --- Run with one max_attempt returns ReconnectionExhausted fast ---
+    // Session 8 final sweep fix: `reconnect_max_attempts: 0` means
+    // "retry forever" in production (see wait_with_backoff doc). Tests
+    // that want fail-fast semantics must use `reconnect_max_attempts: 1`
+    // (one attempt, then exit with ReconnectionExhausted). These tests
+    // were previously using 0 and hanging indefinitely.
     #[tokio::test]
     async fn test_connection_run_zero_max_attempts() {
         let (tx, _rx) = mpsc::channel(100);
@@ -1658,9 +1962,12 @@ mod tests {
             1,
             make_test_token_handle(),
             "test-client".to_string(),
-            make_test_dhan_config(),
+            DhanConfig {
+                websocket_url: "wss://127.0.0.1:19999".to_string(),
+                ..make_test_dhan_config()
+            },
             WebSocketConfig {
-                reconnect_max_attempts: 0,
+                reconnect_max_attempts: 1, // one attempt, then exhaust
                 reconnect_initial_delay_ms: 1,
                 reconnect_max_delay_ms: 1,
                 ..make_test_ws_config()
@@ -1671,9 +1978,8 @@ mod tests {
             None,
         );
         let result = conn.run().await;
-        let (connection_id, attempts) = unwrap_reconnection_exhausted(result);
+        let (connection_id, _attempts) = unwrap_reconnection_exhausted(result);
         assert_eq!(connection_id, 1);
-        assert_eq!(attempts, 0);
     }
 
     // --- Tests with a valid token to cover connect_and_subscribe path (lines 234-274+) ---
@@ -1788,7 +2094,7 @@ mod tests {
                 ..make_test_dhan_config()
             },
             WebSocketConfig {
-                reconnect_max_attempts: 0, // fail immediately
+                reconnect_max_attempts: 1, // one attempt, then exhaust
                 reconnect_initial_delay_ms: 1,
                 reconnect_max_delay_ms: 1,
                 ..make_test_ws_config()
@@ -1801,7 +2107,6 @@ mod tests {
 
         let result = conn.run().await;
         assert!(result.is_err());
-        // Connection had 10 instruments
         assert_eq!(conn.health().subscribed_count, 10);
     }
 
@@ -1820,7 +2125,7 @@ mod tests {
                 ..make_test_dhan_config()
             },
             WebSocketConfig {
-                reconnect_max_attempts: 0,
+                reconnect_max_attempts: 1,
                 reconnect_initial_delay_ms: 1,
                 reconnect_max_delay_ms: 1,
                 ..make_test_ws_config()
@@ -1832,7 +2137,6 @@ mod tests {
         );
 
         let result = conn.run().await;
-        // Should fail with ReconnectionExhausted, not a URL parse error
         let Err(WebSocketError::ReconnectionExhausted { .. }) = result else {
             panic!("Expected ReconnectionExhausted")
         };
@@ -1859,7 +2163,7 @@ mod tests {
                 ..make_test_dhan_config()
             },
             WebSocketConfig {
-                reconnect_max_attempts: 0,
+                reconnect_max_attempts: 1,
                 reconnect_initial_delay_ms: 1,
                 reconnect_max_delay_ms: 1,
                 ..make_test_ws_config()

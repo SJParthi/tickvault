@@ -440,6 +440,126 @@ groups:
         labels:
           severity: critical
 
+      # Session 8: backfill channel dropped a gap request. This means the
+      # tick gap tracker detected an ERROR-level gap, published to the
+      # gap_backfill channel, and the channel was full or closed. A
+      # dropped request means the gap WILL NOT be backfilled — it's a real
+      # data integrity concern. Investigate why the backfill worker is not
+      # draining (Dhan REST rate-limited? Worker task panicked?).
+      - uid: tv-backfill-gaps-dropped
+        title: "Session 8: Backfill gap request dropped"
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model:
+              expr: "increase(tv_backfill_gaps_dropped_total[5m])"
+              intervalMs: 15000
+              maxDataPoints: 43200
+          - refId: B
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: gt, params: [0] }
+        noDataState: OK
+        execErrState: Alerting
+        for: 0m
+        annotations:
+          summary: "Backfill channel dropped a gap request"
+          description: "tv_backfill_gaps_dropped_total increased. The tick gap tracker detected an ERROR-level gap but the backfill channel was full or closed, so the gap will NOT be backfilled. Check tv_backfill_gaps_published_total to confirm the worker is draining. Investigate Dhan REST rate-limit status and backfill worker task health."
+        labels:
+          severity: critical
+
+      # Session 8: sandbox gate blocked a live order. This should NEVER
+      # happen during the sandbox window (before 2026-07-01 UTC). If it
+      # does, a caller code path is trying to place live orders when it
+      # should not — investigate which strategy / which call site.
+      - uid: tv-sandbox-gate-blocked
+        title: "Session 8: Sandbox gate blocked a live-order attempt"
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model:
+              expr: "increase(tv_sandbox_gate_blocks_total[5m])"
+              intervalMs: 15000
+              maxDataPoints: 43200
+          - refId: B
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: gt, params: [0] }
+        noDataState: OK
+        execErrState: Alerting
+        for: 0m
+        annotations:
+          summary: "Sandbox gate blocked a live-order attempt"
+          description: "tv_sandbox_gate_blocks_total increased. The sandbox enforcement guard in OMS engine.rs refused a live order request. Before 2026-07-01 UTC this is a bug in the calling strategy — orders should never reach the live path during the sandbox window. After 2026-07-01 UTC this alert becomes irrelevant and should be removed."
+        labels:
+          severity: warning
+
+      # A4: Early-warning alert — any tick spilled to disk means ring buffer
+      # overflowed. By itself this is not a data-loss event (the tick is still
+      # on disk and will be replayed), but it signals a prolonged QuestDB
+      # outage and must be investigated immediately. DLQ (the critical alert
+      # above) fires only if disk ALSO fails — this is the canary before that.
+      - uid: tv-tick-spillover-active
+        title: "A4: Ring buffer spilled to disk — QuestDB outage active"
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model:
+              expr: "increase(tv_ticks_spilled_total[5m])"
+              intervalMs: 15000
+              maxDataPoints: 43200
+          - refId: B
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: gt, params: [0] }
+        noDataState: OK
+        execErrState: Alerting
+        for: 0m
+        annotations:
+          summary: "Ring buffer overflow — ticks now writing to disk spill"
+          description: "tv_ticks_spilled_total increased. QuestDB is down or the write path is blocked long enough to fill the in-memory ring buffer (600K ticks). Ticks are safe on disk and will replay on reconnect, but you have minutes, not hours, before disk fills. Check docker ps tv-questdb, docker logs tv-questdb, and consider restarting the QuestDB container."
+        labels:
+          severity: critical
+
       # Spill directory free space below 500 MB — warning.
       - uid: tv-spill-disk-low-warn
         title: "A2: Tick spill disk < 500 MB"

@@ -38,9 +38,9 @@ checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
 
 [[package]]
 name = "arc-swap"
-version = "1.9.0"
+version = "1.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a07d1f37ff60921c83bdfc7407723bdefe89b44b98a9b772f225c8f9d67141a6"
+checksum = "6a3a1fd6f75306b68087b831f025c712524bcb19aad54e557b1129cfa0a2b207"
 dependencies = [
  "rustversion",
 ]
@@ -720,6 +720,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crossbeam-channel"
+version = "0.5.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "82b8f8f868b36967f9606790d1903570de9ceaf870a7bf9fbbd3016d636a2cb2"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
 name = "crossbeam-utils"
 version = "0.8.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -799,94 +808,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7cd812cc2bc1d69d4764bd80df88b4317eaef9e773c75226407d9bc0876b211c"
 dependencies = [
  "powerfmt",
-]
-
-[[package]]
-name = "dhan-live-trader-common"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "chrono-tz",
- "figment",
- "rkyv",
- "secrecy",
- "serde",
- "serde_json",
- "thiserror",
- "toml 1.1.0+spec-1.1.0",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "dhan-live-trader-core"
-version = "0.1.0"
-dependencies = [
- "ahash",
- "anyhow",
- "arc-swap",
- "arrayvec",
- "aws-config",
- "aws-sdk-sns",
- "aws-sdk-ssm",
- "backon",
- "bytes",
- "chrono",
- "chrono-tz",
- "csv",
- "dhan-live-trader-common",
- "dhan-live-trader-storage",
- "failsafe",
- "futures-util",
- "memmap2",
- "metrics",
- "papaya",
- "reqwest",
- "rkyv",
- "rtrb",
- "rustls 0.23.37",
- "rustls-native-certs",
- "secrecy",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tokio-tungstenite",
- "totp-rs",
- "tracing",
- "zerocopy",
- "zeroize",
-]
-
-[[package]]
-name = "dhan-live-trader-fuzz"
-version = "0.0.0"
-dependencies = [
- "dhan-live-trader-common",
- "dhan-live-trader-core",
- "libfuzzer-sys",
- "toml 1.1.0+spec-1.1.0",
-]
-
-[[package]]
-name = "dhan-live-trader-storage"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "chrono-tz",
- "deadpool-redis",
- "dhan-live-trader-common",
- "metrics",
- "questdb-rs",
- "redis",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -1677,9 +1598,9 @@ dependencies = [
 
 [[package]]
 name = "mio"
-version = "1.1.1"
+version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a69bcab0ad47271a0234d9422b131806bf3968021e5dc9328caf2d4cd58557fc"
+checksum = "50b7e5b27aa02a74bac8c3f23f448f8d87ff11f92d3aac1a6ed369ee08cc56c1"
 dependencies = [
  "libc",
  "wasi",
@@ -1770,9 +1691,9 @@ checksum = "1a80800c0488c3a21695ea981a54918fbb37abf04f4d0720c453632255e2ff0e"
 
 [[package]]
 name = "papaya"
-version = "0.2.3"
+version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f92dd0b07c53a0a0c764db2ace8c541dc47320dad97c2200c2a637ab9dd2328f"
+checksum = "997ee03cd38c01469a7046643714f0ad28880bcb9e6679ff0666e24817ca19b7"
 dependencies = [
  "equivalent",
  "seize",
@@ -2512,9 +2433,9 @@ dependencies = [
 
 [[package]]
 name = "serde_spanned"
-version = "1.1.0"
+version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "876ac351060d4f882bb1032b6369eb0aef79ad9df1ea8bc404874d8cc3d0cd98"
+checksum = "6662b5879511e06e8999a8a235d848113e942c9124f211511b16466ee2995f26"
 dependencies = [
  "serde_core",
 ]
@@ -2692,6 +2613,96 @@ dependencies = [
 ]
 
 [[package]]
+name = "tickvault-common"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "chrono-tz",
+ "figment",
+ "rkyv",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "toml 1.1.2+spec-1.1.0",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "tickvault-core"
+version = "0.1.0"
+dependencies = [
+ "ahash",
+ "anyhow",
+ "arc-swap",
+ "arrayvec",
+ "aws-config",
+ "aws-sdk-sns",
+ "aws-sdk-ssm",
+ "backon",
+ "bytes",
+ "chrono",
+ "chrono-tz",
+ "csv",
+ "failsafe",
+ "futures-util",
+ "memmap2",
+ "metrics",
+ "papaya",
+ "reqwest",
+ "rkyv",
+ "rtrb",
+ "rustls 0.23.37",
+ "rustls-native-certs",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tickvault-common",
+ "tickvault-storage",
+ "tokio",
+ "tokio-tungstenite",
+ "totp-rs",
+ "tracing",
+ "zerocopy",
+ "zeroize",
+]
+
+[[package]]
+name = "tickvault-fuzz"
+version = "0.0.0"
+dependencies = [
+ "libfuzzer-sys",
+ "tickvault-common",
+ "tickvault-core",
+ "tickvault-storage",
+ "toml 1.1.2+spec-1.1.0",
+]
+
+[[package]]
+name = "tickvault-storage"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "chrono-tz",
+ "crossbeam-channel",
+ "deadpool-redis",
+ "metrics",
+ "questdb-rs",
+ "redis",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tickvault-common",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "time"
 version = "0.3.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2748,9 +2759,9 @@ checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
 
 [[package]]
 name = "tokio"
-version = "1.50.0"
+version = "1.52.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "27ad5e34374e03cfffefc301becb44e9dc3c17584f414349ebe29ed26661822d"
+checksum = "a91135f59b1cbf38c91e73cf3386fca9bb77915c45ce2771460c9d92f0f3d776"
 dependencies = [
  "bytes",
  "libc",
@@ -2765,9 +2776,9 @@ dependencies = [
 
 [[package]]
 name = "tokio-macros"
-version = "2.6.1"
+version = "2.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5c55a2eff8b69ce66c84f85e1da1c233edc36ceb85a2058d11b0d6a3c7e7569c"
+checksum = "385a6cb71ab9ab790c5fe8d67f1645e6c450a7ce006a33de03daa956cf70a496"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2837,14 +2848,14 @@ dependencies = [
 
 [[package]]
 name = "toml"
-version = "1.1.0+spec-1.1.0"
+version = "1.1.2+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f8195ca05e4eb728f4ba94f3e3291661320af739c4e43779cbdfae82ab239fcc"
+checksum = "81f3d15e84cbcd896376e6730314d59fb5a87f31e4b038454184435cd57defee"
 dependencies = [
  "indexmap",
  "serde_core",
- "serde_spanned 1.1.0",
- "toml_datetime 1.1.0+spec-1.1.0",
+ "serde_spanned 1.1.1",
+ "toml_datetime 1.1.1+spec-1.1.0",
  "toml_parser",
  "toml_writer",
  "winnow 1.0.1",
@@ -2861,9 +2872,9 @@ dependencies = [
 
 [[package]]
 name = "toml_datetime"
-version = "1.1.0+spec-1.1.0"
+version = "1.1.1+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "97251a7c317e03ad83774a8752a7e81fb6067740609f75ea2b585b569a59198f"
+checksum = "3165f65f62e28e0115a00b2ebdd37eb6f3b641855f9d636d3cd4103767159ad7"
 dependencies = [
  "serde_core",
 ]
@@ -2884,9 +2895,9 @@ dependencies = [
 
 [[package]]
 name = "toml_parser"
-version = "1.1.0+spec-1.1.0"
+version = "1.1.2+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2334f11ee363607eb04df9b8fc8a13ca1715a72ba8662a26ac285c98aabb4011"
+checksum = "a2abe9b86193656635d2411dc43050282ca48aa31c2451210f4202550afb7526"
 dependencies = [
  "winnow 1.0.1",
 ]
@@ -2899,9 +2910,9 @@ checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 
 [[package]]
 name = "toml_writer"
-version = "1.1.0+spec-1.1.0"
+version = "1.1.1+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d282ade6016312faf3e41e57ebbba0c073e4056dab1232ab1cb624199648f8ed"
+checksum = "756daf9b1013ebe47a8776667b466417e2d4c5679d441c26230efd9ef78692db"
 
 [[package]]
 name = "totp-rs"

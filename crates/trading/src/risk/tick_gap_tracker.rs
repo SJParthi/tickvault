@@ -188,6 +188,76 @@ impl TickGapTracker {
         self.total_errors = 0;
         self.total_stale_alerts = 0;
     }
+
+    /// **P8.1 primitive** — snapshots the set of securities that have
+    /// received at least one tick within the last `window_secs` of
+    /// wall-clock time, along with each one's last exchange timestamp.
+    ///
+    /// Intended caller: the WebSocket reconnect handler. On every
+    /// reconnect event the handler calls this and, for each returned
+    /// `(security_id, last_exchange_ts)` pair, emits a
+    /// `GapBackfillRequest` whose `from_ist_secs = last_exchange_ts`
+    /// and `to_ist_secs = now_ist_secs`. The backfill worker then
+    /// issues a one-shot historical-candle fetch to close the gap.
+    ///
+    /// Cold path — runs once per reconnect, not per tick. O(n) in
+    /// the number of tracked securities (typically ≤ 25,000) — a
+    /// full scan is acceptable because reconnects are rare (< 1/hr
+    /// in healthy ops).
+    ///
+    /// # Arguments
+    /// * `window_secs` — how far back to look. 300 s (5 min) is the
+    ///   plan default: any security that was active in the last 5
+    ///   minutes is worth backfilling.
+    ///
+    /// # Returns
+    /// Pairs of `(security_id, last_exchange_timestamp)` suitable for
+    /// feeding directly into [`GapBackfillRequest`] construction.
+    /// Securities still in warmup are excluded (they have no real
+    /// gap history yet).
+    pub fn snapshot_active_window(&self, window_secs: u64) -> Vec<(u32, u32)> {
+        let now = Instant::now();
+        let window = std::time::Duration::from_secs(window_secs);
+        let mut out = Vec::with_capacity(self.states.len());
+        for (&sid, state) in &self.states {
+            if state.tick_count <= TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
+                continue;
+            }
+            let age = now.duration_since(state.last_wall_clock);
+            if age <= window {
+                out.push((sid, state.last_exchange_timestamp));
+            }
+        }
+        out
+    }
+
+    /// **P8.1 accompaniment** — records that a WebSocket reconnect
+    /// event was observed. Emits a structured error log with the
+    /// recently-active security count (which auto-fires Telegram via
+    /// the Loki hook) and increments a Prometheus counter so Grafana
+    /// can correlate reconnect frequency against missed-tick volume.
+    ///
+    /// Returns the list of recently-active securities for the caller
+    /// to feed into the backfill pipeline.
+    pub fn record_reconnect_event(
+        &self,
+        connection_label: &str,
+        window_secs: u64,
+    ) -> Vec<(u32, u32)> {
+        let active = self.snapshot_active_window(window_secs);
+        metrics::counter!(
+            "tv_ws_reconnect_recently_active_securities_total",
+            "label" => connection_label.to_string() // O(1) EXEMPT: cold path — fires once per reconnect
+        )
+        .increment(active.len() as u64);
+        tracing::error!(
+            connection_label = connection_label,
+            recently_active_count = active.len(),
+            window_secs = window_secs,
+            "WS reconnect detected — backfill window opened for recently-active securities"
+        );
+        active
+    }
 }
 
 /// Result of a tick gap check.
@@ -853,5 +923,93 @@ mod tests {
 
         tracker.detect_stale_instruments();
         assert_eq!(tracker.total_stale_alerts(), u64::MAX);
+    }
+
+    // ------------------------------------------------------------------
+    // P8.1 — snapshot_active_window + record_reconnect_event
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn test_tick_gap_tracker_snapshot_active_window_empty_tracker_returns_empty() {
+        let tracker = TickGapTracker::new(10);
+        let snapshot = tracker.snapshot_active_window(300);
+        assert!(
+            snapshot.is_empty(),
+            "empty tracker must produce empty active-window snapshot"
+        );
+    }
+
+    #[test]
+    fn test_tick_gap_tracker_snapshot_active_window_excludes_warmup_securities() {
+        let mut tracker = TickGapTracker::new(10);
+        // One security, still in warmup (tick_count ≤ TICK_GAP_MIN_TICKS_BEFORE_ACTIVE).
+        for i in 0..TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
+            tracker.record_tick(1001, 1_700_000_000 + i);
+        }
+        let snapshot = tracker.snapshot_active_window(300);
+        assert!(
+            snapshot.is_empty(),
+            "warmup-only security must not appear in active window"
+        );
+    }
+
+    #[test]
+    fn test_tick_gap_tracker_snapshot_active_window_includes_active_security() {
+        let mut tracker = TickGapTracker::new(10);
+        // Push past warmup.
+        let base_ts = 1_700_000_000;
+        for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
+            tracker.record_tick(2002, base_ts + i);
+        }
+        let snapshot = tracker.snapshot_active_window(300);
+        assert_eq!(
+            snapshot.len(),
+            1,
+            "active security must appear exactly once in snapshot"
+        );
+        assert_eq!(snapshot[0].0, 2002);
+        assert_eq!(
+            snapshot[0].1,
+            base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE,
+            "last_exchange_timestamp must match the most recent tick"
+        );
+    }
+
+    #[test]
+    fn test_tick_gap_tracker_snapshot_active_window_excludes_stale_security() {
+        let mut tracker = TickGapTracker::new(10);
+        let base_ts = 1_700_000_000;
+        for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
+            tracker.record_tick(3003, base_ts + i);
+        }
+        // Artificially age the last_wall_clock so it falls outside the window.
+        tracker.states.get_mut(&3003).unwrap().last_wall_clock =
+            Instant::now() - std::time::Duration::from_secs(600);
+        let snapshot = tracker.snapshot_active_window(300);
+        assert!(
+            snapshot.is_empty(),
+            "security last seen >5 min ago must not be in 300s window"
+        );
+    }
+
+    #[test]
+    fn test_tick_gap_tracker_record_reconnect_event_returns_active_securities() {
+        let mut tracker = TickGapTracker::new(10);
+        let base_ts = 1_700_000_000;
+        // Two distinct active securities.
+        for sid in [4004, 5005] {
+            for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
+                tracker.record_tick(sid, base_ts + i);
+            }
+        }
+        let active = tracker.record_reconnect_event("live-feed-0", 300);
+        assert_eq!(
+            active.len(),
+            2,
+            "both active securities must be returned on reconnect event"
+        );
+        let ids: Vec<u32> = active.iter().map(|(s, _)| *s).collect();
+        assert!(ids.contains(&4004));
+        assert!(ids.contains(&5005));
     }
 }

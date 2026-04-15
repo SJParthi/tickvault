@@ -7,12 +7,14 @@
 //! Frames are sent to the same `mpsc::Sender<Bytes>` channel as the main feed,
 //! so the tick processor handles dispatch via `dispatch_deep_depth_frame()`.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use secrecy::ExposeSecret;
+use tickvault_storage::ws_frame_spill::{AppendOutcome, WsFrameSpill, WsType};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time;
@@ -23,25 +25,32 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tracing::{debug, error, info, warn};
 
 use tickvault_common::constants::{
-    DHAN_TWENTY_DEPTH_WS_BASE_URL, DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL, FRAME_SEND_TIMEOUT_SECS,
-    WEBSOCKET_AUTH_TYPE,
+    DHAN_TWENTY_DEPTH_WS_BASE_URL, DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL, WEBSOCKET_AUTH_TYPE,
 };
 use tickvault_common::types::ExchangeSegment;
 
 use super::tls::build_websocket_tls_connector;
 use super::types::{InstrumentSubscription, WebSocketError};
 use crate::auth::TokenHandle;
+use crate::websocket::activity_watchdog::{
+    ActivityWatchdog, WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS,
+};
 use crate::websocket::subscription_builder::build_twenty_depth_subscription_messages;
 
 /// Identifier for depth connections in logs/metrics.
 const DEPTH_CONNECTION_PREFIX: &str = "depth-20lvl";
 
-/// Read timeout for depth connections (seconds).
-/// Per Dhan docs, keepalive is server ping every 10s, auto-pong by library.
-/// This is a SAFETY timeout for when the server truly dies (no pings at all).
-/// NOT for data flow — outside market hours, no data but pings still come.
-/// Set to 300s (5 min) to avoid false timeouts during low-activity periods.
-const DEPTH_READ_TIMEOUT_SECS: u64 = 300;
+// Read timeout for depth connections (seconds).
+// STAGE-B (P1.3): `DEPTH_READ_TIMEOUT_SECS` removed.
+//
+// Per Dhan spec (docs/dhan-ref/04-full-market-depth-websocket.md), depth
+// WebSockets follow the same ping/pong as the live market feed — server
+// pings, library auto-pongs, server closes on >40s silence. Our own
+// client-side deadline is redundant and was the root cause of false
+// reconnect storms whenever downstream stalled.
+//
+// Liveness is now enforced by: (a) Dhan's server-side timeout, and (b)
+// Stage C's watchdog task (independent of the read loop).
 
 /// Reconnection backoff initial delay (ms).
 const DEPTH_RECONNECT_INITIAL_MS: u64 = 1000;
@@ -77,6 +86,7 @@ const DEPTH_CONNECT_TIMEOUT_SECS: u64 = 15;
 /// * `frame_sender` — Shared channel to tick processor.
 /// * `underlying_label` — Underlying name (e.g. "NIFTY") for metric labels.
 /// * `connected_signal` — Fires after first data frame received (not just subscription).
+#[allow(clippy::too_many_arguments)] // APPROVED: STAGE-C added wal_spill param
 // TEST-EXEMPT: Integration-level — requires live Dhan WebSocket endpoint
 pub async fn run_twenty_depth_connection(
     token_handle: TokenHandle,
@@ -85,6 +95,7 @@ pub async fn run_twenty_depth_connection(
     frame_sender: mpsc::Sender<Bytes>,
     underlying_label: String,
     connected_signal: Option<tokio::sync::oneshot::Sender<()>>,
+    wal_spill: Option<Arc<WsFrameSpill>>,
 ) -> Result<(), WebSocketError> {
     if instruments.is_empty() {
         info!("20-level depth: no instruments to subscribe — skipping");
@@ -123,6 +134,7 @@ pub async fn run_twenty_depth_connection(
             &mut pending_signal,
             &prefix,
             &underlying_label,
+            wal_spill.as_ref(),
         )
         .await
         {
@@ -132,6 +144,24 @@ pub async fn run_twenty_depth_connection(
                 reconnect_counter.store(0, Ordering::Relaxed);
             }
             Err(err) => {
+                // STAGE-C.5: classify Dhan disconnect errors so we do
+                // not retry into a ban window (805) or loop on a
+                // permanently-rejected subscription (808/809/810/etc).
+                // 807 (access token expired) IS reconnectable — the
+                // outer run() loop will re-read the token_handle on
+                // the next connect attempt, which picks up whatever
+                // the token renewal task has swapped in.
+                if let WebSocketError::DhanDisconnect { code } = &err
+                    && !code.is_reconnectable()
+                {
+                    error!(
+                        underlying = %underlying_label,
+                        disconnect_code = %code,
+                        "{prefix}: non-reconnectable Dhan disconnect — halting reconnect loop"
+                    );
+                    return Err(WebSocketError::NonReconnectableDisconnect { code: *code });
+                }
+
                 let attempt = reconnect_counter.fetch_add(1, Ordering::Relaxed);
                 m_reconnections.increment(1);
 
@@ -162,6 +192,7 @@ pub async fn run_twenty_depth_connection(
 
 /// Connects to the depth WebSocket, subscribes, and runs the read loop.
 // O(1) EXEMPT: begin — connection lifecycle runs once per connect/reconnect, not per tick
+#[allow(clippy::too_many_arguments)] // APPROVED: STAGE-C added wal_spill param
 async fn connect_and_run_depth(
     token_handle: &TokenHandle,
     client_id: &str,
@@ -171,6 +202,7 @@ async fn connect_and_run_depth(
     connected_signal: &mut Option<tokio::sync::oneshot::Sender<()>>,
     prefix: &str,
     underlying_label: &str,
+    wal_spill: Option<&Arc<WsFrameSpill>>,
 ) -> Result<(), WebSocketError> {
     // Read token
     let token_guard = token_handle.load();
@@ -253,94 +285,204 @@ async fn connect_and_run_depth(
     let m_active = metrics::gauge!("tv_depth_20lvl_connection_active", "underlying" => underlying_label.to_string());
     // Don't set active=1 yet — wait for first data frame (avoids false-positive Telegram alerts).
 
-    let read_timeout = Duration::from_secs(DEPTH_READ_TIMEOUT_SECS);
+    // STAGE-B (P1.1): no client-side read deadline — tokio-tungstenite +
+    // Dhan's server-side 40s pong timeout are the only liveness checks.
     let mut first_frame_received = false;
 
-    // Read loop
-    loop {
-        match time::timeout(read_timeout, read.next()).await {
-            Err(_elapsed) => {
+    // STAGE-C.3: per-connection activity watchdog. The counter is bumped on
+    // every Some(Ok(_)) frame; the watchdog task fires `watchdog_notify`
+    // when it observes no forward progress for 50s (40s server ping timeout
+    // + 10s margin), and the select! below returns Err(WatchdogFired) so
+    // the outer reconnect loop kicks in.
+    let activity_counter = Arc::new(AtomicU64::new(0));
+    let watchdog_notify = Arc::new(tokio::sync::Notify::new());
+    let watchdog_label = format!("depth-20-{underlying_label}"); // O(1) EXEMPT: one alloc per connect cycle
+    let watchdog = ActivityWatchdog::new(
+        watchdog_label.clone(),
+        Arc::clone(&activity_counter),
+        Duration::from_secs(WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS),
+        Arc::clone(&watchdog_notify),
+    );
+    let watchdog_handle = tokio::spawn(watchdog.run());
+
+    // Helper: construct the WatchdogFired error uniformly from both the
+    // select! branch (below) and any other watchdog-triggered return path.
+    // O(1) EXEMPT: cold path, one per dead socket.
+    let make_watchdog_err = || WebSocketError::WatchdogFired {
+        label: watchdog_label.clone(),
+        silent_secs: WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS,
+        threshold_secs: WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS,
+    };
+
+    let loop_result: Result<(), WebSocketError> = loop {
+        let frame_result = tokio::select! {
+            biased;
+            () = watchdog_notify.notified() => {
                 m_active.set(0.0);
-                warn!("{prefix}: read timeout — reconnecting");
-                return Err(WebSocketError::ReadTimeout {
-                    connection_id: 99, // depth connection uses ID 99
-                    timeout_secs: DEPTH_READ_TIMEOUT_SECS,
+                break Err(make_watchdog_err());
+            }
+            next_frame = read.next() => next_frame,
+        };
+        // STAGE-C.3: bump the activity counter on every Some(Ok(_)) event so
+        // the watchdog can distinguish a truly dead socket from a data-quiet
+        // period with pings still flowing. One relaxed atomic increment is
+        // O(1) and allocation-free.
+        if matches!(frame_result, Some(Ok(_))) {
+            activity_counter.fetch_add(1, Ordering::Relaxed);
+        }
+        match frame_result {
+            Some(Ok(Message::Binary(data))) => {
+                // STAGE-C.5: Dhan depth-WS disconnect packet is 14 bytes:
+                // 12-byte header (bytes 0-1 = message length LE, byte 2 =
+                // feed code, byte 3 = segment, bytes 4-7 = security_id LE,
+                // bytes 8-11 = sequence/row_count LE) + u16 LE reason code
+                // at bytes 12-13. See
+                // `docs/dhan-ref/04-full-market-depth-websocket.md:168`.
+                //
+                // Feed code 50 signals a disconnect frame. Intercept here
+                // so the outer reconnect loop can classify the reason via
+                // `DisconnectCode::from_u16()` and apply the same
+                // is_reconnectable / requires_token_refresh logic as the
+                // Live Market Feed connection.
+                //
+                // O(1) — one byte check + one u16 LE load. Happy path
+                // (feed code != 50) is a single byte compare + early fall
+                // through.
+                let maybe_disconnect_code: Option<crate::websocket::types::DisconnectCode> =
+                    if data.len() >= 14
+                        && data[2] == tickvault_common::constants::RESPONSE_CODE_DISCONNECT
+                    {
+                        let raw = u16::from_le_bytes([data[12], data[13]]);
+                        Some(crate::websocket::types::DisconnectCode::from_u16(raw))
+                    } else {
+                        None
+                    };
+
+                // Fire connected signal + set active metric on FIRST data frame only.
+                // This guarantees Telegram alert fires only when data actually flows.
+                if !first_frame_received {
+                    first_frame_received = true;
+                    m_active.set(1.0);
+                    if let Some(signal) = connected_signal.take() {
+                        let _ = signal.send(());
+                    }
+                }
+                m_frames.increment(1);
+
+                // STAGE-C (P1.2+P1.3): durable WAL first, live forward second.
+                // See connection.rs for the full rationale — mirrored here.
+                if let Some(spill) = wal_spill {
+                    // O(1) EXEMPT: one Vec<u8> copy per frame (≤332 B for 20-depth)
+                    // to hand owned memory to the disk writer thread. Bounded allocation.
+                    let frame_vec = data.to_vec();
+                    let outcome = spill.append(WsType::Depth20, frame_vec);
+                    if outcome == AppendOutcome::Dropped {
+                        error!(
+                            underlying = %underlying_label,
+                            "CRITICAL: WAL spill dropped Depth20 frame — disk writer stalled"
+                        );
+                        // CRITICAL metric already incremented inside spill.append().
+                    }
+                }
+                match frame_sender.try_send(data) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_dropped)) => {
+                        warn!(
+                            underlying = %underlying_label,
+                            channel_capacity = frame_sender.capacity(),
+                            wal_attached = wal_spill.is_some(),
+                            "20-depth live frame channel full — backpressure from downstream. \
+                             Frame is durable in WAL; watchdog will restart consumer."
+                        );
+                        metrics::counter!(
+                            "tv_ws_frame_live_backpressure_total",
+                            "ws_type" => "depth_20",
+                            "underlying" => underlying_label.to_string()
+                        )
+                        .increment(1);
+                        // Do NOT return — socket is healthy.
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        m_active.set(0.0);
+                        warn!("{prefix}: receiver dropped — stopping");
+                        break Ok(());
+                    }
+                }
+
+                // STAGE-C.5: surface disconnect AFTER WAL + forward so
+                // observability still sees the frame. Return Err so the
+                // outer reconnect loop either backs off, halts on
+                // non-reconnectable, or waits for token refresh on 807.
+                if let Some(code) = maybe_disconnect_code {
+                    warn!(
+                        underlying = %underlying_label,
+                        disconnect_code = %code,
+                        reconnectable = code.is_reconnectable(),
+                        requires_token_refresh = code.requires_token_refresh(),
+                        "20-depth: Dhan binary disconnect packet — surfacing to reconnect loop"
+                    );
+                    metrics::counter!(
+                        "tv_ws_dhan_disconnect_total",
+                        "code" => format!("{code}"), // O(1) EXEMPT: cold path, once per disconnect
+                        "ws_type" => "depth_20"
+                    )
+                    .increment(1);
+                    m_active.set(0.0);
+                    break Err(WebSocketError::DhanDisconnect { code });
+                }
+            }
+            Some(Ok(Message::Ping(data))) => {
+                let pong_timeout = Duration::from_secs(DEPTH_PONG_TIMEOUT_SECS);
+                match time::timeout(pong_timeout, write.send(Message::Pong(data))).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => {
+                        m_active.set(0.0);
+                        warn!(?err, "{prefix}: pong send failed");
+                        break Err(WebSocketError::ConnectionFailed {
+                            url: DHAN_TWENTY_DEPTH_WS_BASE_URL.to_string(),
+                            source: err,
+                        });
+                    }
+                    Err(_) => {
+                        m_active.set(0.0);
+                        warn!(
+                            timeout_secs = DEPTH_PONG_TIMEOUT_SECS,
+                            "{prefix}: pong send timed out — connection likely dead"
+                        );
+                        break Err(WebSocketError::ReadTimeout {
+                            connection_id: 99,
+                            timeout_secs: DEPTH_PONG_TIMEOUT_SECS,
+                        });
+                    }
+                }
+            }
+            Some(Ok(Message::Pong(_))) => {
+                // Server echo pong — ignore (keep-alive confirmation)
+            }
+            Some(Ok(Message::Close(_))) => {
+                m_active.set(0.0);
+                info!("{prefix}: server sent close frame");
+                break Ok(());
+            }
+            Some(Err(err)) => {
+                m_active.set(0.0);
+                break Err(WebSocketError::ConnectionFailed {
+                    url: DHAN_TWENTY_DEPTH_WS_BASE_URL.to_string(),
+                    source: err,
                 });
             }
-            Ok(frame_result) => match frame_result {
-                Some(Ok(Message::Binary(data))) => {
-                    // Fire connected signal + set active metric on FIRST data frame only.
-                    // This guarantees Telegram alert fires only when data actually flows.
-                    if !first_frame_received {
-                        first_frame_received = true;
-                        m_active.set(1.0);
-                        if let Some(signal) = connected_signal.take() {
-                            let _ = signal.send(());
-                        }
-                    }
-                    m_frames.increment(1);
-                    let send_timeout = Duration::from_secs(FRAME_SEND_TIMEOUT_SECS);
-                    match time::timeout(send_timeout, frame_sender.send(data)).await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(_)) => {
-                            m_active.set(0.0);
-                            warn!("{prefix}: receiver dropped — stopping");
-                            return Ok(());
-                        }
-                        Err(_) => {
-                            warn!("{prefix}: frame send timeout — dropping frame");
-                            metrics::counter!("tv_depth_frames_dropped_total", "type" => "send_timeout", "depth" => "20").increment(1);
-                        }
-                    }
-                }
-                Some(Ok(Message::Ping(data))) => {
-                    let pong_timeout = Duration::from_secs(DEPTH_PONG_TIMEOUT_SECS);
-                    match time::timeout(pong_timeout, write.send(Message::Pong(data))).await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(err)) => {
-                            m_active.set(0.0);
-                            warn!(?err, "{prefix}: pong send failed");
-                            return Err(WebSocketError::ConnectionFailed {
-                                url: DHAN_TWENTY_DEPTH_WS_BASE_URL.to_string(),
-                                source: err,
-                            });
-                        }
-                        Err(_) => {
-                            m_active.set(0.0);
-                            warn!(
-                                timeout_secs = DEPTH_PONG_TIMEOUT_SECS,
-                                "{prefix}: pong send timed out — connection likely dead"
-                            );
-                            return Err(WebSocketError::ReadTimeout {
-                                connection_id: 99,
-                                timeout_secs: DEPTH_PONG_TIMEOUT_SECS,
-                            });
-                        }
-                    }
-                }
-                Some(Ok(Message::Pong(_))) => {
-                    // Server echo pong — ignore (keep-alive confirmation)
-                }
-                Some(Ok(Message::Close(_))) => {
-                    m_active.set(0.0);
-                    info!("{prefix}: server sent close frame");
-                    return Ok(());
-                }
-                Some(Err(err)) => {
-                    m_active.set(0.0);
-                    return Err(WebSocketError::ConnectionFailed {
-                        url: DHAN_TWENTY_DEPTH_WS_BASE_URL.to_string(),
-                        source: err,
-                    });
-                }
-                None => {
-                    m_active.set(0.0);
-                    return Ok(());
-                }
-                _ => {}
-            },
+            None => {
+                m_active.set(0.0);
+                break Ok(());
+            }
+            _ => {}
         }
-    }
+    };
+
+    // STAGE-C.3: Always abort the watchdog task when the read loop exits
+    // for any reason. If the watchdog already fired, `abort()` is a no-op.
+    watchdog_handle.abort();
+    loop_result
     // O(1) EXEMPT: end
 }
 
@@ -353,6 +495,7 @@ async fn connect_and_run_depth(
 /// Connects to `wss://full-depth-api.dhan.co/twohundreddepth` (Dhan Ticket #5519522).
 /// Only 1 instrument per connection (Dhan limitation).
 /// Infinite reconnection with exponential backoff.
+#[allow(clippy::too_many_arguments)] // APPROVED: STAGE-C added wal_spill param
 // TEST-EXEMPT: Integration-level — requires live Dhan WebSocket endpoint
 pub async fn run_two_hundred_depth_connection(
     token_handle: TokenHandle,
@@ -362,6 +505,7 @@ pub async fn run_two_hundred_depth_connection(
     label: String,
     frame_sender: mpsc::Sender<Bytes>,
     connected_signal: Option<tokio::sync::oneshot::Sender<()>>,
+    wal_spill: Option<Arc<WsFrameSpill>>,
 ) -> Result<(), WebSocketError> {
     let segment_str = exchange_segment.as_str();
     let sid_str = security_id.to_string(); // O(1) EXEMPT: boot-time
@@ -396,27 +540,47 @@ pub async fn run_two_hundred_depth_connection(
             &frame_sender,
             &prefix,
             &mut pending_signal,
+            security_id,
+            &label,
+            wal_spill.as_ref(),
         )
         .await
         {
             Ok(()) => {
-                info!("{prefix}: connection closed normally");
+                info!(security_id, label = %label, "{prefix}: connection closed normally");
                 // Reset counter only on successful connection (failures accumulate for backoff)
                 reconnect_counter.store(0, Ordering::Relaxed);
             }
             Err(err) => {
+                // STAGE-C.5: classify Dhan disconnect errors.
+                if let WebSocketError::DhanDisconnect { code } = &err
+                    && !code.is_reconnectable()
+                {
+                    error!(
+                        security_id,
+                        label = %label,
+                        disconnect_code = %code,
+                        "{prefix}: non-reconnectable Dhan disconnect — halting reconnect loop"
+                    );
+                    return Err(WebSocketError::NonReconnectableDisconnect { code: *code });
+                }
+
                 let attempt = reconnect_counter.fetch_add(1, Ordering::Relaxed);
                 m_reconnections.increment(1);
 
                 // Escalate to ERROR after 10+ consecutive failures
                 if attempt > 0 && attempt.is_multiple_of(10) {
                     error!(
+                        security_id,
+                        label = %label,
                         attempt,
                         ?err,
                         "{prefix}: reconnection threshold — still retrying"
                     );
                 } else {
                     warn!(
+                        security_id,
+                        label = %label,
                         attempt,
                         ?err,
                         "{prefix}: connection failed — will reconnect"
@@ -434,6 +598,7 @@ pub async fn run_two_hundred_depth_connection(
 
 /// Connects to the 200-level depth WebSocket and runs the read loop.
 // O(1) EXEMPT: begin — connection lifecycle
+#[allow(clippy::too_many_arguments)] // APPROVED: STAGE-C added security_id/label/wal_spill params
 async fn connect_and_run_200_depth(
     token_handle: &TokenHandle,
     client_id: &str,
@@ -441,6 +606,9 @@ async fn connect_and_run_200_depth(
     frame_sender: &mpsc::Sender<Bytes>,
     prefix: &str,
     connected_signal: &mut Option<tokio::sync::oneshot::Sender<()>>,
+    security_id: u32,
+    label: &str,
+    wal_spill: Option<&Arc<WsFrameSpill>>,
 ) -> Result<(), WebSocketError> {
     let token_guard = token_handle.load();
     let token_state = token_guard
@@ -489,7 +657,11 @@ async fn connect_and_run_200_depth(
             source: err,
         })?;
 
-    info!("{prefix}: connected — sending subscription");
+    info!(
+        security_id,
+        label = %label,
+        "{prefix}: connected — sending subscription"
+    );
 
     let (mut write, mut read) = ws_stream.split();
 
@@ -501,7 +673,11 @@ async fn connect_and_run_200_depth(
             source: err,
         })?;
 
-    info!("{prefix}: subscription sent — reading 200-level depth frames");
+    info!(
+        security_id,
+        label = %label,
+        "{prefix}: subscription sent — reading 200-level depth frames"
+    );
 
     // Metrics — labeled per underlying for Grafana differentiation.
     let m_frames =
@@ -510,90 +686,175 @@ async fn connect_and_run_200_depth(
         metrics::gauge!("tv_depth_200lvl_connection_active", "underlying" => prefix.to_string());
     // Don't set active=1 yet — wait for first data frame.
 
-    let read_timeout = Duration::from_secs(DEPTH_READ_TIMEOUT_SECS);
+    // STAGE-B (P1.1): no client-side read deadline.
     let mut first_frame_received = false;
 
-    loop {
-        match time::timeout(read_timeout, read.next()).await {
-            Err(_elapsed) => {
+    // STAGE-C.3: per-connection activity watchdog — same semantics as the
+    // 20-level depth path above. 50s threshold (40s Dhan server ping timeout
+    // + 10s margin). The label carries the security_id so a fired alert
+    // points directly at the dead contract.
+    let activity_counter = Arc::new(AtomicU64::new(0));
+    let watchdog_notify = Arc::new(tokio::sync::Notify::new());
+    let watchdog_label = format!("depth-200-{label}-sid{security_id}"); // O(1) EXEMPT: one alloc per connect cycle
+    let watchdog = ActivityWatchdog::new(
+        watchdog_label.clone(),
+        Arc::clone(&activity_counter),
+        Duration::from_secs(WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS),
+        Arc::clone(&watchdog_notify),
+    );
+    let watchdog_handle = tokio::spawn(watchdog.run());
+    // O(1) EXEMPT: cold path, one per dead socket.
+    let make_watchdog_err = || WebSocketError::WatchdogFired {
+        label: watchdog_label.clone(),
+        silent_secs: WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS,
+        threshold_secs: WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS,
+    };
+
+    let loop_result: Result<(), WebSocketError> = loop {
+        let frame_result = tokio::select! {
+            biased;
+            () = watchdog_notify.notified() => {
                 m_active.set(0.0);
-                warn!("{prefix}: read timeout — reconnecting");
-                return Err(WebSocketError::ReadTimeout {
-                    connection_id: 98,
-                    timeout_secs: DEPTH_READ_TIMEOUT_SECS,
+                break Err(make_watchdog_err());
+            }
+            next_frame = read.next() => next_frame,
+        };
+        if matches!(frame_result, Some(Ok(_))) {
+            activity_counter.fetch_add(1, Ordering::Relaxed);
+        }
+        match frame_result {
+            Some(Ok(Message::Binary(data))) => {
+                // STAGE-C.5: Depth-200 disconnect packet parse.
+                // Same 14-byte layout as Depth-20 (12-byte header +
+                // u16 LE reason code at bytes 12-13). Feed code 50
+                // at byte 2 signals a disconnect frame.
+                let maybe_disconnect_code: Option<crate::websocket::types::DisconnectCode> =
+                    if data.len() >= 14
+                        && data[2] == tickvault_common::constants::RESPONSE_CODE_DISCONNECT
+                    {
+                        let raw = u16::from_le_bytes([data[12], data[13]]);
+                        Some(crate::websocket::types::DisconnectCode::from_u16(raw))
+                    } else {
+                        None
+                    };
+
+                if !first_frame_received {
+                    first_frame_received = true;
+                    m_active.set(1.0);
+                    if let Some(signal) = connected_signal.take() {
+                        let _ = signal.send(());
+                    }
+                }
+                m_frames.increment(1);
+
+                // STAGE-C (P1.2+P1.3): durable WAL first, live forward second.
+                if let Some(spill) = wal_spill {
+                    // O(1) EXEMPT: one Vec<u8> copy per frame (≤3212 B for 200-depth,
+                    // bounded by protocol max) to hand owned memory to the disk writer.
+                    let frame_vec = data.to_vec();
+                    let outcome = spill.append(WsType::Depth200, frame_vec);
+                    if outcome == AppendOutcome::Dropped {
+                        error!(
+                            security_id,
+                            label = %label,
+                            "CRITICAL: WAL spill dropped Depth200 frame — disk writer stalled"
+                        );
+                    }
+                }
+                match frame_sender.try_send(data) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_dropped)) => {
+                        warn!(
+                            security_id,
+                            label = %label,
+                            channel_capacity = frame_sender.capacity(),
+                            wal_attached = wal_spill.is_some(),
+                            "200-depth live frame channel full — backpressure from downstream. \
+                             Frame is durable in WAL; watchdog will restart consumer."
+                        );
+                        metrics::counter!(
+                            "tv_ws_frame_live_backpressure_total",
+                            "ws_type" => "depth_200",
+                            "label" => label.to_string()
+                        )
+                        .increment(1);
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        m_active.set(0.0);
+                        break Ok(());
+                    }
+                }
+
+                // STAGE-C.5: surface disconnect after forward.
+                if let Some(code) = maybe_disconnect_code {
+                    warn!(
+                        security_id,
+                        label = %label,
+                        disconnect_code = %code,
+                        reconnectable = code.is_reconnectable(),
+                        requires_token_refresh = code.requires_token_refresh(),
+                        "200-depth: Dhan binary disconnect packet — surfacing to reconnect loop"
+                    );
+                    metrics::counter!(
+                        "tv_ws_dhan_disconnect_total",
+                        "code" => format!("{code}"), // O(1) EXEMPT: cold path, once per disconnect
+                        "ws_type" => "depth_200"
+                    )
+                    .increment(1);
+                    m_active.set(0.0);
+                    break Err(WebSocketError::DhanDisconnect { code });
+                }
+            }
+            Some(Ok(Message::Ping(data))) => {
+                let pong_timeout = Duration::from_secs(DEPTH_PONG_TIMEOUT_SECS);
+                match time::timeout(pong_timeout, write.send(Message::Pong(data))).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => {
+                        m_active.set(0.0);
+                        break Err(WebSocketError::ConnectionFailed {
+                            url: DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL.to_string(),
+                            source: err,
+                        });
+                    }
+                    Err(_) => {
+                        m_active.set(0.0);
+                        warn!(
+                            security_id,
+                            label = %label,
+                            timeout_secs = DEPTH_PONG_TIMEOUT_SECS,
+                            "{prefix}: pong send timed out — connection likely dead"
+                        );
+                        break Err(WebSocketError::ReadTimeout {
+                            connection_id: 98,
+                            timeout_secs: DEPTH_PONG_TIMEOUT_SECS,
+                        });
+                    }
+                }
+            }
+            Some(Ok(Message::Pong(_))) => {}
+            Some(Ok(Message::Close(_))) => {
+                m_active.set(0.0);
+                info!(security_id, label = %label, "{prefix}: server sent close frame");
+                break Ok(());
+            }
+            Some(Err(err)) => {
+                m_active.set(0.0);
+                break Err(WebSocketError::ConnectionFailed {
+                    url: DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL.to_string(),
+                    source: err,
                 });
             }
-            Ok(frame_result) => match frame_result {
-                Some(Ok(Message::Binary(data))) => {
-                    // Fire connected signal + set active metric on FIRST data frame only.
-                    if !first_frame_received {
-                        first_frame_received = true;
-                        m_active.set(1.0);
-                        if let Some(signal) = connected_signal.take() {
-                            let _ = signal.send(());
-                        }
-                    }
-                    m_frames.increment(1);
-                    let send_timeout = Duration::from_secs(FRAME_SEND_TIMEOUT_SECS);
-                    match time::timeout(send_timeout, frame_sender.send(data)).await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(_)) => {
-                            m_active.set(0.0);
-                            return Ok(());
-                        }
-                        Err(_) => {
-                            warn!("{prefix}: frame send timeout — dropping frame");
-                            metrics::counter!("tv_depth_frames_dropped_total", "type" => "send_timeout", "depth" => "200").increment(1);
-                        }
-                    }
-                }
-                Some(Ok(Message::Ping(data))) => {
-                    let pong_timeout = Duration::from_secs(DEPTH_PONG_TIMEOUT_SECS);
-                    match time::timeout(pong_timeout, write.send(Message::Pong(data))).await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(err)) => {
-                            m_active.set(0.0);
-                            return Err(WebSocketError::ConnectionFailed {
-                                url: DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL.to_string(),
-                                source: err,
-                            });
-                        }
-                        Err(_) => {
-                            m_active.set(0.0);
-                            warn!(
-                                timeout_secs = DEPTH_PONG_TIMEOUT_SECS,
-                                "{prefix}: pong send timed out — connection likely dead"
-                            );
-                            return Err(WebSocketError::ReadTimeout {
-                                connection_id: 98,
-                                timeout_secs: DEPTH_PONG_TIMEOUT_SECS,
-                            });
-                        }
-                    }
-                }
-                Some(Ok(Message::Pong(_))) => {
-                    // Server echo pong — ignore (keep-alive confirmation)
-                }
-                Some(Ok(Message::Close(_))) => {
-                    m_active.set(0.0);
-                    info!("{prefix}: server sent close frame");
-                    return Ok(());
-                }
-                Some(Err(err)) => {
-                    m_active.set(0.0);
-                    return Err(WebSocketError::ConnectionFailed {
-                        url: DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL.to_string(),
-                        source: err,
-                    });
-                }
-                None => {
-                    m_active.set(0.0);
-                    return Ok(());
-                }
-                _ => {}
-            },
+            None => {
+                m_active.set(0.0);
+                break Ok(());
+            }
+            _ => {}
         }
-    }
+    };
+
+    // STAGE-C.3: Always abort the watchdog task when the read loop exits.
+    watchdog_handle.abort();
+    loop_result
     // O(1) EXEMPT: end
 }
 
@@ -604,7 +865,8 @@ mod tests {
     #[test]
     fn test_depth_constants() {
         assert_eq!(DEPTH_SUBSCRIPTION_BATCH_SIZE, 50);
-        assert!(DEPTH_READ_TIMEOUT_SECS >= 30);
+        // STAGE-B: DEPTH_READ_TIMEOUT_SECS removed — client-side read deadline
+        // was redundant with Dhan's own 40s server-side pong timeout.
         assert!(DEPTH_RECONNECT_MAX_MS <= 60000);
     }
 
@@ -633,6 +895,7 @@ mod tests {
             vec![],
             tx,
             "TEST".to_string(),
+            None,
             None,
         )
         .await;
@@ -726,6 +989,7 @@ mod tests {
             &mut None,
             "depth-20lvl-TEST",
             "TEST",
+            None,
         )
         .await;
         assert!(result.is_err());
@@ -740,9 +1004,18 @@ mod tests {
         let token_handle: TokenHandle =
             std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None)));
         let (tx, _rx) = mpsc::channel(16);
-        let result =
-            connect_and_run_200_depth(&token_handle, "test", "{}", &tx, "test-label", &mut None)
-                .await;
+        let result = connect_and_run_200_depth(
+            &token_handle,
+            "test",
+            "{}",
+            &tx,
+            "test-label",
+            &mut None,
+            12345,
+            "TEST-LABEL",
+            None,
+        )
+        .await;
         assert!(result.is_err());
         match result.unwrap_err() {
             WebSocketError::NoTokenAvailable => {}
@@ -768,9 +1041,27 @@ mod tests {
     }
 
     #[test]
-    fn test_depth_read_timeout_matches_keepalive() {
-        // Dhan docs: server pings every 10s, connection drops after 40s
-        assert_eq!(DEPTH_READ_TIMEOUT_SECS, 40);
+    fn test_depth_read_loops_have_no_client_side_deadline() {
+        // STAGE-B (P1.1): assert that neither depth read loop wraps
+        // `read.next()` in a `time::timeout(...)`. This was the root cause of
+        // false reconnects whenever downstream stalled. The only allowed
+        // `time::timeout` calls in the depth loops are:
+        //   - pong send timeout (DEPTH_PONG_TIMEOUT_SECS, not a read deadline)
+        //   - connection establishment timeout (DEPTH_CONNECT_TIMEOUT_SECS)
+        // A regression that re-adds a read deadline must fail this test.
+        //
+        // STAGE-C.2 fix: the forbidden pattern is assembled at runtime from
+        // fragments so the literal string never appears verbatim in this
+        // source file — otherwise `include_str!` + `.contains()` would match
+        // itself and the test would always fail.
+        let source = include_str!("depth_connection.rs");
+        let fragment_a = "time::timeout(read_";
+        let fragment_b = "timeout, read.next()";
+        let forbidden = format!("{fragment_a}{fragment_b})");
+        assert!(
+            !source.contains(&forbidden),
+            "depth read loop must not wrap read.next() in a client-side read timeout"
+        );
     }
 
     #[test]

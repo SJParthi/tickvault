@@ -86,11 +86,21 @@ pub enum NotificationEvent {
     /// 20-level depth WebSocket disconnected.
     DepthTwentyDisconnected { underlying: String, reason: String },
 
-    /// 200-level depth WebSocket connected for an underlying.
-    DepthTwoHundredConnected { underlying: String },
+    /// 200-level depth WebSocket connected.
+    ///
+    /// `contract` is the precise contract label (e.g. `NIFTY-Apr2026-22500-CE`)
+    /// and `security_id` is the exact Dhan security ID — both are required so
+    /// the operator can quote the exact instrument when escalating to Dhan
+    /// support. 200-depth is 1 instrument per connection, so a generic
+    /// underlying label would lose the strike/expiry/side information.
+    DepthTwoHundredConnected { contract: String, security_id: u32 },
 
     /// 200-level depth WebSocket disconnected.
-    DepthTwoHundredDisconnected { underlying: String, reason: String },
+    DepthTwoHundredDisconnected {
+        contract: String,
+        security_id: u32,
+        reason: String,
+    },
 
     /// Order update WebSocket connected.
     OrderUpdateConnected,
@@ -287,10 +297,18 @@ pub enum NotificationEvent {
 
     /// QuestDB persistence disconnected — ticks being buffered, not persisted.
     QuestDbDisconnected {
-        /// Which writer lost connection (e.g., "tick", "depth", "candle").
+        /// Which writer lost connection (e.g., "tick", "depth", "candle",
+        /// "liveness-check").
         writer: String,
-        /// Current ring buffer size at disconnect time.
-        buffer_size: usize,
+        /// Numeric degradation signal. Interpretation depends on `signal_kind`:
+        /// for the liveness-check path this is the consecutive-failure count;
+        /// for the tick-writer lag path it's the number of dropped records.
+        /// Never a hardcoded zero — always reflects reality at alert time.
+        signal: u64,
+        /// Human-readable description of what `signal` represents (e.g.
+        /// `"consecutive liveness failures"`, `"ticks dropped by broadcast lag"`).
+        /// Rendered in the Telegram message so operators aren't guessing.
+        signal_kind: String,
     },
 
     /// QuestDB persistence reconnected — buffered data draining.
@@ -351,11 +369,22 @@ impl NotificationEvent {
             Self::DepthTwentyDisconnected { underlying, reason } => {
                 format!("<b>Depth 20-level DISCONNECTED</b>\nUnderlying: {underlying}\n{reason}")
             }
-            Self::DepthTwoHundredConnected { underlying } => {
-                format!("<b>Depth 200-level connected</b>\nUnderlying: {underlying}")
+            Self::DepthTwoHundredConnected {
+                contract,
+                security_id,
+            } => {
+                format!(
+                    "<b>Depth 200-level connected</b>\nContract: {contract}\nSecurityId: {security_id}"
+                )
             }
-            Self::DepthTwoHundredDisconnected { underlying, reason } => {
-                format!("<b>Depth 200-level DISCONNECTED</b>\nUnderlying: {underlying}\n{reason}")
+            Self::DepthTwoHundredDisconnected {
+                contract,
+                security_id,
+                reason,
+            } => {
+                format!(
+                    "<b>Depth 200-level DISCONNECTED</b>\nContract: {contract}\nSecurityId: {security_id}\n{reason}"
+                )
             }
             Self::OrderUpdateConnected => "<b>Order Update WS connected</b>".to_string(),
             Self::OrderUpdateDisconnected { reason } => {
@@ -623,12 +652,19 @@ impl NotificationEvent {
             }
             Self::QuestDbDisconnected {
                 writer,
-                buffer_size,
+                signal,
+                signal_kind,
             } => {
+                // The numeric `signal` is factual at alert time — either a
+                // consecutive-failure count (liveness-check path) or a dropped
+                // record count (tick-writer lag path). `signal_kind` names
+                // which one so operators can read the alert without guessing.
+                // No hardcoded zero, no fake auto-reconnect cadence.
                 format!(
-                    "<b>CRITICAL: QuestDB {writer} DISCONNECTED</b>\n\
-                     Buffering data in ring buffer ({buffer_size} records). \
-                     Auto-reconnect every 30s."
+                    "<b>CRITICAL: QuestDB {writer} DEGRADED</b>\n\
+                     {signal_kind}: {signal}.\n\
+                     Ticks remain durable via WAL — no data loss.\n\
+                     Investigate QuestDB container + disk + CPU."
                 )
             }
             Self::QuestDbReconnected {

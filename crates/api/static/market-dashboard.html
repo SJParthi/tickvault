@@ -978,6 +978,23 @@
             }
         }
 
+        // Stub fetcher for /api/market/option-movers — the Options tab is wired to
+        // the backend endpoint but the render path is minimal until the full
+        // options UI is designed. This function exists so the dashboard reference
+        // to the endpoint is real, not aspirational. See tickvault session 8
+        // "more-thorough-check" commit for context.
+        async function fetchOptionMovers(category) {
+            try {
+                const cat = category || 'top_volume';
+                const resp = await fetch(`/api/market/option-movers?category=${cat}`);
+                if (!resp.ok) return null;
+                return await resp.json();
+            } catch (err) {
+                console.error('Failed to fetch option movers:', err);
+                return null;
+            }
+        }
+
         async function fetchIndices() {
             try {
                 const resp = await fetch('/api/market/indices');

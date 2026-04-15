@@ -139,9 +139,12 @@ async fn no_panic_top_movers_empty_snapshot() {
     let state = make_test_state(test_questdb_config_unreachable());
     let Json(result) = get_top_movers(State(state)).await;
     assert!(!result.available);
-    assert!(result.gainers.is_empty());
-    assert!(result.losers.is_empty());
-    assert!(result.most_active.is_empty());
+    assert!(result.equity_gainers.is_empty());
+    assert!(result.equity_losers.is_empty());
+    assert!(result.equity_most_active.is_empty());
+    assert!(result.index_gainers.is_empty());
+    assert!(result.index_losers.is_empty());
+    assert!(result.index_most_active.is_empty());
     assert_eq!(result.total_tracked, 0);
 }
 
@@ -150,7 +153,7 @@ async fn no_panic_top_movers_with_populated_snapshot() {
     use tickvault_core::pipeline::top_movers::{MoverEntry, TopMoversSnapshot};
 
     let snapshot = TopMoversSnapshot {
-        gainers: vec![MoverEntry {
+        equity_gainers: vec![MoverEntry {
             security_id: u32::MAX,
             exchange_segment_code: 255,
             last_traded_price: f32::MAX,
@@ -158,7 +161,7 @@ async fn no_panic_top_movers_with_populated_snapshot() {
             change_pct: f32::INFINITY,
             volume: u32::MAX,
         }],
-        losers: vec![MoverEntry {
+        equity_losers: vec![MoverEntry {
             security_id: 0,
             exchange_segment_code: 0,
             last_traded_price: 0.0,
@@ -166,7 +169,7 @@ async fn no_panic_top_movers_with_populated_snapshot() {
             change_pct: f32::NEG_INFINITY,
             volume: 0,
         }],
-        most_active: vec![MoverEntry {
+        equity_most_active: vec![MoverEntry {
             security_id: 1,
             exchange_segment_code: 2,
             last_traded_price: f32::NAN,
@@ -174,6 +177,9 @@ async fn no_panic_top_movers_with_populated_snapshot() {
             change_pct: f32::NAN,
             volume: 1,
         }],
+        index_gainers: Vec::new(),
+        index_losers: Vec::new(),
+        index_most_active: Vec::new(),
         total_tracked: usize::MAX,
     };
 
@@ -189,9 +195,9 @@ async fn no_panic_top_movers_with_populated_snapshot() {
 
     let Json(result) = get_top_movers(State(state)).await;
     assert!(result.available);
-    assert_eq!(result.gainers.len(), 1);
-    assert_eq!(result.losers.len(), 1);
-    assert_eq!(result.most_active.len(), 1);
+    assert_eq!(result.equity_gainers.len(), 1);
+    assert_eq!(result.equity_losers.len(), 1);
+    assert_eq!(result.equity_most_active.len(), 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -246,9 +252,12 @@ fn no_panic_stats_response_serialization_extreme_values() {
 fn no_panic_top_movers_response_serialization_empty() {
     let resp = TopMoversResponse {
         available: false,
-        gainers: Vec::new(),
-        losers: Vec::new(),
-        most_active: Vec::new(),
+        equity_gainers: Vec::new(),
+        equity_losers: Vec::new(),
+        equity_most_active: Vec::new(),
+        index_gainers: Vec::new(),
+        index_losers: Vec::new(),
+        index_most_active: Vec::new(),
         total_tracked: 0,
     };
     let json = serde_json::to_string(&resp).unwrap();

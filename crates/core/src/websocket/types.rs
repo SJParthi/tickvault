@@ -298,6 +298,24 @@ pub enum WebSocketError {
         connection_id: ConnectionId,
         timeout_secs: u64,
     },
+
+    /// Per-connection activity watchdog fired — no frames or pings have
+    /// been received within the watchdog threshold. The connection is
+    /// treated as dead and the outer `run()` loop reconnects. This is the
+    /// ONLY deadline in the WS pipeline; the read loop itself has no
+    /// client-side read timeout.
+    #[error(
+        "WebSocket activity watchdog fired on {label} after {silent_secs}s of silence \
+         (threshold={threshold_secs}s)"
+    )]
+    WatchdogFired {
+        /// Human-readable label (e.g. "live-feed-3", "depth-200-NIFTY-ATM-CE").
+        label: String,
+        /// How many seconds of silence were observed before firing.
+        silent_secs: u64,
+        /// Configured watchdog threshold.
+        threshold_secs: u64,
+    },
 }
 
 // ---------------------------------------------------------------------------

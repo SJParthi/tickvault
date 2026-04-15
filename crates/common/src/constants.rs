@@ -497,7 +497,13 @@ pub const STALE_LTP_THRESHOLD_SECS: u64 = 600;
 // ---------------------------------------------------------------------------
 
 /// Base path for all secrets in SSM Parameter Store.
-pub const SSM_SECRET_BASE_PATH: &str = "/dlt";
+///
+/// Matches the repo name `tickvault`. The prior namespace was `/dlt` (from
+/// the dhan-live-trader legacy name). Run `scripts/migrate-ssm-dlt-to-
+/// tickvault.sh` once per environment to copy `/dlt/*` → `/tickvault/*`
+/// before this code is deployed; the script is idempotent and a `--delete`
+/// flag removes the old namespace after you verify the app boots cleanly.
+pub const SSM_SECRET_BASE_PATH: &str = "/tickvault";
 
 /// SSM service path segment for Dhan credentials.
 pub const SSM_DHAN_SERVICE: &str = "dhan";

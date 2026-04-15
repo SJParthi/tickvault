@@ -274,6 +274,138 @@ resource "aws_cloudwatch_event_rule" "weekend_stop" {
   schedule_expression = "cron(30 7 ? * SAT-SUN *)"
 }
 
+# ---------------------------------------------------------------------------
+# EventBridge → SSM Automation → EC2 start/stop targets
+#
+# Without targets the schedule rules above are dormant — they fire on cron
+# but nothing happens. These resources wire each rule to AWS-managed SSM
+# Automation documents that actually call ec2:StartInstances /
+# ec2:StopInstances on our specific instance.
+#
+# IAM flow:
+#   EventBridge (events.amazonaws.com)
+#     → assumes `eventbridge_ec2_scheduler` role
+#     → starts SSM Automation document `AWS-StartEC2Instance`
+#     → SSM Automation uses the same role to call ec2:StartInstances
+#
+# The 4 rules (weekday start/stop + weekend start/stop) share the same
+# role — scoped to this one instance ARN.
+# ---------------------------------------------------------------------------
+
+data "aws_region" "current" {}
+data "aws_caller_identity" "current" {}
+
+resource "aws_iam_role" "eventbridge_ec2_scheduler" {
+  name = "tv-${var.environment}-eventbridge-ec2-scheduler"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Principal = {
+          Service = ["events.amazonaws.com", "ssm.amazonaws.com"]
+        }
+        Action = "sts:AssumeRole"
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy" "eventbridge_ec2_scheduler" {
+  name = "tv-${var.environment}-eventbridge-ec2-scheduler"
+  role = aws_iam_role.eventbridge_ec2_scheduler.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "ec2:StartInstances",
+          "ec2:StopInstances",
+          "ec2:DescribeInstances",
+          "ec2:DescribeInstanceStatus"
+        ]
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "ssm:StartAutomationExecution"
+        ]
+        Resource = [
+          "arn:aws:ssm:${data.aws_region.current.name}::automation-definition/AWS-StartEC2Instance:*",
+          "arn:aws:ssm:${data.aws_region.current.name}::automation-definition/AWS-StopEC2Instance:*"
+        ]
+      },
+      {
+        Effect   = "Allow"
+        Action   = "iam:PassRole"
+        Resource = "*"
+        Condition = {
+          StringEquals = {
+            "iam:PassedToService" = "ssm.amazonaws.com"
+          }
+        }
+      }
+    ]
+  })
+}
+
+locals {
+  ssm_start_arn = "arn:aws:ssm:${data.aws_region.current.name}::automation-definition/AWS-StartEC2Instance:$DEFAULT"
+  ssm_stop_arn  = "arn:aws:ssm:${data.aws_region.current.name}::automation-definition/AWS-StopEC2Instance:$DEFAULT"
+}
+
+resource "aws_cloudwatch_event_target" "weekday_start" {
+  rule      = aws_cloudwatch_event_rule.weekday_start.name
+  target_id = "start-instance"
+  arn       = local.ssm_start_arn
+  role_arn  = aws_iam_role.eventbridge_ec2_scheduler.arn
+
+  input = jsonencode({
+    InstanceId             = [aws_instance.tv_app.id]
+    AutomationAssumeRole   = [aws_iam_role.eventbridge_ec2_scheduler.arn]
+  })
+}
+
+resource "aws_cloudwatch_event_target" "weekday_stop" {
+  rule      = aws_cloudwatch_event_rule.weekday_stop.name
+  target_id = "stop-instance"
+  arn       = local.ssm_stop_arn
+  role_arn  = aws_iam_role.eventbridge_ec2_scheduler.arn
+
+  input = jsonencode({
+    InstanceId             = [aws_instance.tv_app.id]
+    AutomationAssumeRole   = [aws_iam_role.eventbridge_ec2_scheduler.arn]
+  })
+}
+
+resource "aws_cloudwatch_event_target" "weekend_start" {
+  rule      = aws_cloudwatch_event_rule.weekend_start.name
+  target_id = "start-instance"
+  arn       = local.ssm_start_arn
+  role_arn  = aws_iam_role.eventbridge_ec2_scheduler.arn
+
+  input = jsonencode({
+    InstanceId             = [aws_instance.tv_app.id]
+    AutomationAssumeRole   = [aws_iam_role.eventbridge_ec2_scheduler.arn]
+  })
+}
+
+resource "aws_cloudwatch_event_target" "weekend_stop" {
+  rule      = aws_cloudwatch_event_rule.weekend_stop.name
+  target_id = "stop-instance"
+  arn       = local.ssm_stop_arn
+  role_arn  = aws_iam_role.eventbridge_ec2_scheduler.arn
+
+  input = jsonencode({
+    InstanceId             = [aws_instance.tv_app.id]
+    AutomationAssumeRole   = [aws_iam_role.eventbridge_ec2_scheduler.arn]
+  })
+}
+
 # S3 cold-storage bucket for tick data > 14 days old.
 resource "aws_s3_bucket" "tv_cold" {
   bucket = "tv-${var.environment}-cold"

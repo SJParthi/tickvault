@@ -12,6 +12,7 @@
 //! # Boot Sequence Position
 //! Auth → **WebSocket** → Parse → Route → Indicators
 
+pub mod activity_watchdog;
 pub mod connection;
 pub mod connection_pool;
 pub mod depth_connection;

@@ -32,10 +32,13 @@ use tickvault_common::constants::{
 };
 use tickvault_common::order_types::OrderUpdate;
 use tickvault_common::trading_calendar::{TradingCalendar, ist_offset};
+use tickvault_storage::ws_frame_spill::{AppendOutcome, WsFrameSpill, WsType};
 
 use crate::auth::TokenHandle;
 use crate::parser::order_update::{build_order_update_login, parse_order_update};
+use crate::websocket::activity_watchdog::{ActivityWatchdog, WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS};
 use crate::websocket::tls::build_websocket_tls_connector;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -53,12 +56,14 @@ use crate::websocket::tls::build_websocket_tls_connector;
 /// * `order_sender` — Broadcast channel for order updates.
 ///
 /// Runs until the task is aborted or reconnection attempts are exhausted.
+#[allow(clippy::too_many_arguments)] // APPROVED: STAGE-C added wal_spill param
 pub async fn run_order_update_connection(
     order_update_url: String,
     client_id: String,
     token_handle: TokenHandle,
     order_sender: broadcast::Sender<OrderUpdate>,
     calendar: Arc<TradingCalendar>,
+    wal_spill: Option<Arc<WsFrameSpill>>,
 ) {
     let mut consecutive_failures: u32 = 0;
     let m_reconnections = metrics::counter!("tv_order_update_reconnections_total");
@@ -72,6 +77,7 @@ pub async fn run_order_update_connection(
             &token_handle,
             &order_sender,
             &calendar,
+            wal_spill.as_ref(),
         )
         .await
         {
@@ -133,12 +139,14 @@ pub async fn run_order_update_connection(
 // ---------------------------------------------------------------------------
 
 /// Single connection lifecycle: connect → login → read loop.
+#[allow(clippy::too_many_arguments)] // APPROVED: STAGE-C added wal_spill param
 async fn connect_and_listen(
     url: &str,
     client_id: &str,
     token_handle: &TokenHandle,
     order_sender: &broadcast::Sender<OrderUpdate>,
     calendar: &TradingCalendar,
+    wal_spill: Option<&Arc<WsFrameSpill>>,
 ) -> Result<(), OrderUpdateConnectionError> {
     // Read current token.
     let token_guard = token_handle.load();
@@ -195,33 +203,83 @@ async fn connect_and_listen(
     // that may never come (causes false AuthTimeout reconnect loops).
     info!("order update WebSocket login sent — entering read loop");
 
-    // Use longer timeout outside market hours to avoid reconnect noise.
-    let timeout_secs = select_read_timeout_secs(is_within_market_hours(calendar));
-    let read_timeout = Duration::from_secs(timeout_secs);
+    // STAGE-B (P1.1): no client-side read deadline on the order update WS.
+    //
+    // Order update is a JSON stream, not binary. Silence is NORMAL — no
+    // orders means no messages, sometimes for hours. A read deadline here
+    // was the root cause of the 2-minute reconnect storm we saw earlier.
+    // Dhan's server-side ping/pong keeps the connection alive; our reader
+    // only wakes on real data, real errors, or real stream closure.
+    //
+    // Stage C's watchdog provides a liveness backstop at 660s (11 min).
+    let _ = calendar; // market-hours flag no longer needed
+    let _ = select_read_timeout_secs; // kept for backwards-compat test coverage
 
-    // Read loop — receive order updates until disconnect.
-    loop {
-        let msg = match time::timeout(read_timeout, read.next()).await {
-            Ok(Some(Ok(msg))) => msg,
-            Ok(Some(Err(err))) => {
+    // STAGE-C.3: per-connection activity watchdog. 660s threshold (600s
+    // allowable silence between orders + 60s safety margin). The counter
+    // is bumped on every Some(Ok(_)) message — Text, Ping, Pong, Close,
+    // Binary. Dhan's server pings every 10s, so even in a no-order window
+    // the counter advances constantly and the watchdog never fires a
+    // false positive. It only fires when the socket is truly dead.
+    let activity_counter = Arc::new(AtomicU64::new(0));
+    let watchdog_notify = Arc::new(tokio::sync::Notify::new());
+    let watchdog = ActivityWatchdog::new(
+        "order-update".to_string(),
+        Arc::clone(&activity_counter),
+        Duration::from_secs(WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS),
+        Arc::clone(&watchdog_notify),
+    );
+    let watchdog_handle = tokio::spawn(watchdog.run());
+
+    // The read loop is wrapped in a helper closure so every exit path can
+    // abort the watchdog handle exactly once. This avoids sprinkling
+    // `watchdog_handle.abort()` at every `return` site.
+    let loop_result: Result<(), OrderUpdateConnectionError> = loop {
+        let frame_result = tokio::select! {
+            biased;
+            () = watchdog_notify.notified() => {
+                m_active.set(0.0);
+                break Err(OrderUpdateConnectionError::WatchdogFired(
+                    WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS,
+                ));
+            }
+            next_frame = read.next() => next_frame,
+        };
+        // STAGE-C.3: bump the activity counter on every Some(Ok(_)) event.
+        if matches!(frame_result, Some(Ok(_))) {
+            activity_counter.fetch_add(1, Ordering::Relaxed);
+        }
+
+        let msg = match frame_result {
+            Some(Ok(msg)) => msg,
+            Some(Err(err)) => {
                 m_active.set(0.0);
                 // O(1) EXEMPT: error path, not hot path — .to_string() on cold disconnect
-                return Err(OrderUpdateConnectionError::Read(err.to_string()));
+                break Err(OrderUpdateConnectionError::Read(err.to_string()));
             }
-            Ok(None) => {
+            None => {
                 // Stream ended (server closed connection).
                 m_active.set(0.0);
-                return Ok(());
-            }
-            Err(_) => {
-                // Read timeout — server may have stopped sending pings.
-                m_active.set(0.0);
-                return Err(OrderUpdateConnectionError::ReadTimeout);
+                break Ok(());
             }
         };
 
         match msg {
             Message::Text(text) => {
+                // STAGE-C: persist raw JSON frame to WAL first, so even if
+                // the parser rejects it or the broadcast has no subscribers,
+                // the frame is durable for boot-time replay.
+                if let Some(spill) = wal_spill {
+                    // O(1) EXEMPT: one allocation per frame on a cold path
+                    // (orders are sparse — ~1-100/day).
+                    let frame_vec = text.as_bytes().to_vec();
+                    let outcome = spill.append(WsType::OrderUpdate, frame_vec);
+                    if outcome == AppendOutcome::Dropped {
+                        error!(
+                            "CRITICAL: WAL spill dropped OrderUpdate frame — disk writer stalled"
+                        );
+                    }
+                }
                 match parse_order_update(&text) {
                     Ok(update) => {
                         m_messages.increment(1);
@@ -244,7 +302,7 @@ async fn connect_and_listen(
                                     "order update WebSocket auth/API error from server"
                                 );
                                 m_active.set(0.0);
-                                return Err(OrderUpdateConnectionError::AuthFailed(reason));
+                                break Err(OrderUpdateConnectionError::AuthFailed(reason));
                             }
                             AuthResponseKind::Success => {
                                 // Login ack or heartbeat — not all messages are order updates.
@@ -267,13 +325,17 @@ async fn connect_and_listen(
             Message::Close(frame) => {
                 info!(?frame, "order update WebSocket close frame received");
                 m_active.set(0.0);
-                return Ok(());
+                break Ok(());
             }
             _ => {
                 // Binary, Pong, Frame — ignore.
             }
         }
-    }
+    };
+
+    // STAGE-C.3: Always abort the watchdog task when the read loop exits.
+    watchdog_handle.abort();
+    loop_result
 }
 
 // ---------------------------------------------------------------------------
@@ -501,8 +563,18 @@ enum OrderUpdateConnectionError {
     #[error("read error: {0}")]
     Read(String),
 
+    #[allow(dead_code)] // APPROVED: STAGE-B removed client-side read deadline; kept for Stage C watchdog
     #[error("read timeout — no messages for {ORDER_UPDATE_READ_TIMEOUT_SECS}s")]
     ReadTimeout,
+
+    /// STAGE-C.3: per-connection activity watchdog fired. No frames or
+    /// pings received within the 660s (11 min) threshold — the socket is
+    /// dead and the outer loop must reconnect. Distinct from
+    /// `ReadTimeout` because the watchdog enforces a TRUE silence check
+    /// (frames + pings), whereas `ReadTimeout` was a client-side read
+    /// deadline that fired on any silence, including legitimate idle.
+    #[error("order update WebSocket activity watchdog fired after {0}s of silence")]
+    WatchdogFired(u64),
 }
 
 // ---------------------------------------------------------------------------

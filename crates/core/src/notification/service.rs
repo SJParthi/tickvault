@@ -97,6 +97,9 @@ impl NotificationService {
     /// Called once at boot. Not on hot path.
     #[instrument(skip_all, name = "notification_service_init")]
     pub async fn initialize(config: &NotificationConfig) -> Arc<Self> {
+        // AWS SSM is the single source of truth for all secrets. No env-var
+        // fallback — production config, dev config, CI config all read from
+        // the same place so behavior is identical everywhere.
         let environment = match resolve_environment() {
             Ok(env) => env,
             Err(err) => {
@@ -225,6 +228,45 @@ impl NotificationService {
         Arc::new(Self {
             mode: NotificationMode::NoOp,
         })
+    }
+
+    /// Strict initialization — returns `Err` if the service would fall back
+    /// to no-op mode. This is the default path for production boot: if the
+    /// notifier is dead, the app must refuse to start so systemd restarts it
+    /// and an operator notices the loop.
+    ///
+    /// Escape hatch: set `TICKVAULT_ALLOW_NOOP_NOTIFIER=1` to allow no-op
+    /// mode (used by tests and dev runs without SSM access).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(String)` with a human-readable reason if any of the
+    /// following fail:
+    /// - AWS SSM environment cannot be resolved
+    /// - Telegram bot-token fetch fails
+    /// - Telegram chat-id fetch fails
+    /// - HTTP client cannot be built
+    ///
+    /// C1: closes the silent-degradation class by panicking at boot instead
+    /// of running deaf.
+    #[instrument(skip_all, name = "notification_service_init_strict")]
+    pub async fn initialize_strict(config: &NotificationConfig) -> Result<Arc<Self>, String> {
+        let service = Self::initialize(config).await;
+        if service.is_active() {
+            return Ok(service);
+        }
+        if std::env::var("TICKVAULT_ALLOW_NOOP_NOTIFIER").is_ok() {
+            warn!(
+                "notification: strict mode overridden by TICKVAULT_ALLOW_NOOP_NOTIFIER — \
+                 running in no-op mode (dev/test only)"
+            );
+            return Ok(service);
+        }
+        Err("NotificationService fell back to no-op mode. \
+             SSM is unreachable or Telegram credentials are missing. \
+             Refusing to boot — the app must not run deaf. \
+             Set TICKVAULT_ALLOW_NOOP_NOTIFIER=1 to override (dev/test only)."
+            .to_string())
     }
 
     /// Sends a notification event. Spawns background tasks — returns immediately.
@@ -440,6 +482,67 @@ mod tests {
     fn test_disabled_service_is_not_active() {
         let service = NotificationService::disabled();
         assert!(!service.is_active());
+    }
+
+    // -----------------------------------------------------------------------
+    // C1: Strict init must refuse no-op fallback unless env var is set
+    // -----------------------------------------------------------------------
+
+    /// C1: `initialize_strict` MUST return `Err` when SSM is unreachable
+    /// (simulated here by the unit-test environment which has no AWS creds)
+    /// and `TICKVAULT_ALLOW_NOOP_NOTIFIER` is NOT set, AND MUST return `Ok`
+    /// when the escape hatch env var is set.
+    ///
+    /// Both paths are in one test because they mutate the same process-global
+    /// env var; running as separate tests races under parallel cargo test.
+    /// Order: refuse → set → allow → remove → refuse again (sanity).
+    ///
+    /// This is the mechanical enforcement for "don't run deaf".
+    #[tokio::test]
+    async fn test_c1_initialize_strict_refuses_noop_and_respects_override() {
+        let config = NotificationConfig {
+            telegram_api_base_url: "http://127.0.0.1:1".to_string(),
+            send_timeout_ms: 50,
+            sns_enabled: false,
+        };
+
+        // Phase 1: refuse when env var is NOT set.
+        // SAFETY: removing an env var is safe.
+        unsafe {
+            std::env::remove_var("TICKVAULT_ALLOW_NOOP_NOTIFIER");
+        }
+        let refuse_result = NotificationService::initialize_strict(&config).await;
+        assert!(
+            refuse_result.is_err(),
+            "Phase 1: initialize_strict must refuse no-op fallback when SSM is unreachable"
+        );
+        let err = refuse_result.err().unwrap();
+        assert!(
+            err.contains("no-op") || err.contains("SSM") || err.contains("Refusing"),
+            "Phase 1: error message must explain why boot is refused: {err}"
+        );
+
+        // Phase 2: allow when env var IS set.
+        // SAFETY: setting an env var is safe.
+        unsafe {
+            std::env::set_var("TICKVAULT_ALLOW_NOOP_NOTIFIER", "1");
+        }
+        let allow_result = NotificationService::initialize_strict(&config).await;
+        // SAFETY: clean up so other tests don't inherit the override.
+        unsafe {
+            std::env::remove_var("TICKVAULT_ALLOW_NOOP_NOTIFIER");
+        }
+        assert!(
+            allow_result.is_ok(),
+            "Phase 2: initialize_strict must allow no-op when TICKVAULT_ALLOW_NOOP_NOTIFIER=1"
+        );
+
+        // Phase 3: sanity — post-override, refuse path is restored.
+        let refuse_again = NotificationService::initialize_strict(&config).await;
+        assert!(
+            refuse_again.is_err(),
+            "Phase 3: cleanup must restore the refuse path"
+        );
     }
 
     #[test]

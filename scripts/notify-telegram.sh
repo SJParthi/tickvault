@@ -2,13 +2,15 @@
 # =============================================================================
 # tickvault — Send Telegram notification
 # =============================================================================
-# Reads bot token + chat ID from AWS SSM Parameter Store.
+# Reads bot token + chat ID from AWS SSM Parameter Store only. No env var
+# fallback: AWS SSM is the single source of truth for all secrets.
 #
 # Usage:
 #   ./scripts/notify-telegram.sh "Task completed: environment setup done"
 #   ./scripts/notify-telegram.sh "Error: QuestDB write failed"
 #
-# Prerequisites: Run bootstrap.sh once — it handles all secret setup automatically.
+# Prerequisites: AWS CLI configured with credentials that can read
+# /dlt/<env>/telegram/{bot-token,chat-id} from SSM Parameter Store.
 #
 # Environment:
 #   ENVIRONMENT — "dev" (default) or "prod"
@@ -21,49 +23,46 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 REGION="ap-south-1"
 ENV="${ENVIRONMENT:-dev}"
-SSM_BOT_TOKEN="/tickvault/${ENV}/telegram/bot-token"
-SSM_CHAT_ID="/tickvault/${ENV}/telegram/chat-id"
+SSM_BOT_TOKEN_PATH="/dlt/${ENV}/telegram/bot-token"
+SSM_CHAT_ID_PATH="/dlt/${ENV}/telegram/chat-id"
 TELEGRAM_API="https://api.telegram.org"
-
-# Always uses real AWS SSM in ap-south-1.
 
 # ---------------------------------------------------------------------------
 # Validate input
 # ---------------------------------------------------------------------------
 if [ $# -eq 0 ]; then
-    echo "Usage: $0 <message>"
-    echo "Example: $0 'Task completed: environment setup done'"
+    echo "Usage: $0 <message>" >&2
+    echo "Example: $0 'Task completed: environment setup done'" >&2
     exit 1
 fi
 
 MESSAGE="$1"
 
 # ---------------------------------------------------------------------------
-# Ensure AWS CLI is available (auto-install if missing)
+# Require AWS CLI — SSM is the single source of truth
 # ---------------------------------------------------------------------------
 if ! command -v aws > /dev/null 2>&1; then
-    pip3 install awscli --quiet 2>/dev/null || pip install awscli --quiet 2>/dev/null || true
-    if ! command -v aws > /dev/null 2>&1; then
-        echo "SKIP: aws CLI not available — Telegram notification not sent"
-        exit 0
-    fi
+    echo "ERROR: aws CLI not available — Telegram notification NOT sent" >&2
+    echo "  Message was: ${MESSAGE}" >&2
+    echo "  Install aws CLI and configure credentials with SSM read access." >&2
+    exit 2
 fi
 
-# ---------------------------------------------------------------------------
-# Fetch secrets from real AWS SSM
-# ---------------------------------------------------------------------------
 SSM_ARGS="--region ${REGION} --with-decryption --output text --query Parameter.Value --no-cli-pager"
 
-BOT_TOKEN=$(aws ssm get-parameter --name "${SSM_BOT_TOKEN}" ${SSM_ARGS} 2>/dev/null) || true
+BOT_TOKEN=$(aws ssm get-parameter --name "${SSM_BOT_TOKEN_PATH}" ${SSM_ARGS} 2>/dev/null) || true
+CHAT_ID=$(aws ssm get-parameter --name "${SSM_CHAT_ID_PATH}" ${SSM_ARGS} 2>/dev/null) || true
+
 if [ -z "${BOT_TOKEN}" ]; then
-    echo "SKIP: Bot token not in SSM — run bootstrap.sh to set up"
-    exit 0
+    echo "ERROR: Telegram bot-token missing from SSM (${SSM_BOT_TOKEN_PATH})" >&2
+    echo "  Message was: ${MESSAGE}" >&2
+    exit 2
 fi
 
-CHAT_ID=$(aws ssm get-parameter --name "${SSM_CHAT_ID}" ${SSM_ARGS} 2>/dev/null) || true
 if [ -z "${CHAT_ID}" ]; then
-    echo "SKIP: Chat ID not in SSM — run bootstrap.sh to set up"
-    exit 0
+    echo "ERROR: Telegram chat-id missing from SSM (${SSM_CHAT_ID_PATH})" >&2
+    echo "  Message was: ${MESSAGE}" >&2
+    exit 2
 fi
 
 # ---------------------------------------------------------------------------

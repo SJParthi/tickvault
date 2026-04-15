@@ -247,7 +247,7 @@ impl TopMoversTracker {
 
         // Helper: compute top-N gainers, losers, most_active from a mutable slice
         fn compute_top_n(
-            entries: &mut Vec<MoverEntry>,
+            entries: &mut [MoverEntry],
             top_n: usize,
             min_pct: f32,
         ) -> (Vec<MoverEntry>, Vec<MoverEntry>, Vec<MoverEntry>) {

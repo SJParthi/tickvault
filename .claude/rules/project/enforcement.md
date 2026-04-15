@@ -6,6 +6,12 @@ paths:
 
 # Enforcement Architecture
 
+> **Test scope default:** `.claude/rules/project/testing-scope.md` — tests run
+> **only** for crates touched in the current diff. Workspace-wide execution is
+> reserved for `/full-qa`, `FULL_QA=1`, `crates/common/` changes, or post-merge
+> CI. This is the mechanically enforced default; do not escalate to the full
+> workspace unless one of those triggers fires.
+
 ## Active Hooks (simplified until AWS deployment)
 - **PreToolUse (Edit|Write):** block-env-files.sh — prevents .env file creation
 - **PostToolUse (Edit|Write):** REMOVED — pre-commit gate enforces fmt; no per-edit rustfmt

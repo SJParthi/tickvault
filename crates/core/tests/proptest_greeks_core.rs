@@ -545,7 +545,8 @@ proptest! {
         prev_close in 0.01_f32..100_000.0,
     ) {
         let mut tracker = TopMoversTracker::new();
-        let tick = make_tick(42, 2, ltp, prev_close, 1000, 1_700_000_000);
+        // Segment 1 = NSE_EQ — TopMoversTracker rejects derivatives (segment 2)
+        let tick = make_tick(42, 1, ltp, prev_close, 1000, 1_700_000_000);
         tracker.update(&tick);
 
         let snapshot = tracker.compute_snapshot();
@@ -556,15 +557,15 @@ proptest! {
 
         // The security should appear in either gainers, losers, or most_active
         let all_entries: Vec<_> = snapshot
-            .gainers
+            .equity_gainers
             .iter()
-            .chain(snapshot.losers.iter())
-            .chain(snapshot.most_active.iter())
+            .chain(snapshot.equity_losers.iter())
+            .chain(snapshot.equity_most_active.iter())
             .filter(|e| e.security_id == 42)
             .collect();
 
         // Must be in most_active at minimum
-        let in_most_active = snapshot.most_active.iter().any(|e| e.security_id == 42);
+        let in_most_active = snapshot.equity_most_active.iter().any(|e| e.security_id == 42);
         prop_assert!(in_most_active, "security should be in most_active");
 
         // Verify change_pct matches if in any list
@@ -591,7 +592,8 @@ proptest! {
         invalid_close in prop_oneof![Just(0.0_f32), Just(-1.0_f32), Just(f32::NAN)],
     ) {
         let mut tracker = TopMoversTracker::new();
-        let tick = make_tick(42, 2, ltp, invalid_close, 1000, 1_700_000_000);
+        // Segment 1 = NSE_EQ — TopMoversTracker rejects derivatives (segment 2)
+        let tick = make_tick(42, 1, ltp, invalid_close, 1000, 1_700_000_000);
         tracker.update(&tick);
 
         prop_assert_eq!(tracker.tracked_count(), 0);
@@ -612,7 +614,8 @@ proptest! {
         let mut tracker = TopMoversTracker::new();
 
         for i in 0..count {
-            let tick = make_tick(i as u32 + 1, 2, ltp, prev_close, 1000 * (i as u32 + 1), 1_700_000_000);
+            // Segment 1 = NSE_EQ — TopMoversTracker rejects derivatives (segment 2)
+            let tick = make_tick(i as u32 + 1, 1, ltp, prev_close, 1000 * (i as u32 + 1), 1_700_000_000);
             tracker.update(&tick);
         }
 

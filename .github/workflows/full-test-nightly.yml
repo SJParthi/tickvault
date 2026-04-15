@@ -1,0 +1,128 @@
+# Nightly full-workspace test run — catches cross-crate regressions.
+#
+# Why this exists:
+# The pre-push gate runs SCOPED tests (only the crates touched in the
+# current diff). That's intentional — workspace-wide testing takes 10-15
+# minutes per push, which is friction the scoped runner was built to
+# eliminate. But the scoped runner misses a specific class of bug: a
+# rename or signature change in crate A that silently breaks test code
+# in crate B. Session 8 found 18 such bugs (stale TopMovers fields, SSM
+# base path rename, hanging test fleet) — all of them invisible to the
+# scoped runner and only caught by `cargo test --workspace`.
+#
+# This workflow runs the full workspace test suite once per night
+# regardless of commit activity. If anything breaks cross-crate, we
+# see it within 24 hours of the offending commit, not at the next
+# release review.
+#
+# Scope:
+#   - cargo fmt --check        (format drift)
+#   - cargo check --workspace --tests --all-targets  (compile-time bugs)
+#   - cargo test --workspace --no-fail-fast          (runtime bugs)
+#
+# Failure handling:
+#   - Opens a GitHub issue tagged `nightly-regression` with the failing
+#     test log. Manual triage from there — same flow as the dep-freshness
+#     workflow.
+#
+# Runtime: ~12 minutes on a 2-core CI runner with a warm cache.
+# Cost: marginal (GitHub Actions free tier covers 2,000 min/month).
+
+name: full-test-nightly
+
+on:
+  schedule:
+    # 19:30 UTC = 01:00 IST. One hour before dep-freshness-nightly so
+    # the two jobs don't compete for the same runner. Runs every day.
+    - cron: '30 19 * * *'
+  workflow_dispatch:
+    # Manual dispatch for operator-triggered runs.
+
+concurrency:
+  group: full-test-nightly
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  issues: write  # to open a regression issue on failure
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.93.1'
+          components: rustfmt
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: full-test-nightly
+
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+      - name: cargo check --workspace --tests --all-targets
+        run: cargo check --workspace --tests --all-targets
+
+      - name: cargo test --workspace --no-fail-fast
+        id: test
+        run: |
+          set -o pipefail
+          cargo test --workspace --no-fail-fast 2>&1 | tee /tmp/test-output.log
+
+      - name: Collect failure summary
+        if: failure() && steps.test.conclusion == 'failure'
+        id: summary
+        run: |
+          {
+            echo "body<<EOF"
+            echo "## Nightly full-workspace test regression"
+            echo ""
+            echo "**Commit:** ${GITHUB_SHA}"
+            echo "**Run:** ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo ""
+            echo "### Failing tests"
+            echo ""
+            echo '```'
+            grep -E "^(failures:|test result:|FAILED|error\[)" /tmp/test-output.log | tail -80 || echo "(no failure markers found)"
+            echo '```'
+            echo ""
+            echo "### Last 60 lines of output"
+            echo ""
+            echo '```'
+            tail -60 /tmp/test-output.log
+            echo '```'
+            echo ""
+            echo "This regression was caught by the nightly full-workspace"
+            echo "test run. The scoped pre-push gate runs only on changed"
+            echo "crates and misses cross-crate breakage (struct renames,"
+            echo "constant changes, API signature changes) when the"
+            echo "downstream test lives in an untouched crate."
+            echo ""
+            echo "Triage steps:"
+            echo "1. Bisect the last 24h of commits to find the offending change."
+            echo "2. Fix the test or the production code, not the workflow."
+            echo "3. Close this issue with a reference to the fix commit."
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Open regression issue on failure
+        if: failure() && steps.test.conclusion == 'failure'
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const body = `${{ steps.summary.outputs.body }}`;
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `nightly regression: full-workspace test failed @ ${context.sha.substring(0, 7)}`,
+              body,
+              labels: ['nightly-regression', 'auto-triage'],
+            });

@@ -2,9 +2,13 @@
 # S7-Step2 / Phase 8.1: EC2 first-boot user-data script.
 #
 # Runs ONCE the first time the instance boots. Installs Docker, the
-# CloudWatch agent, clones the repo, and sets up the systemd unit.
-# DOES NOT start the app — that's done by the GitHub Actions deploy
-# workflow after the first binary build lands.
+# CloudWatch agent, clones the repo, sets up the systemd unit, AND
+# enables tickvault.service so every subsequent boot (triggered by
+# the EventBridge 8 AM IST cron) auto-starts the binary. The unit
+# is only *enabled* here, not started — the binary doesn't exist on
+# first boot. The GitHub Actions deploy-aws workflow drops the first
+# binary onto the instance, and from then on every EC2 start-stop
+# cycle controlled by EventBridge will auto-run tickvault.
 
 set -euo pipefail
 
@@ -70,19 +74,30 @@ systemctl enable --now amazon-cloudwatch-agent
 
 # Create application directories
 mkdir -p /opt/tickvault/{config,data/spill,logs,bin}
-chown -R ubuntu:ubuntu /opt/dlt
+chown -R ubuntu:ubuntu /opt/tickvault
 
 # Clone the repo (shallow, main branch)
 sudo -u ubuntu git clone --depth 1 \
     https://github.com/SJParthi/tickvault.git /opt/tickvault/repo
 
-# Start Docker Compose stack (QuestDB, Valkey, Prometheus, Grafana, etc)
+# Start Docker Compose stack (QuestDB, Valkey, Prometheus, Grafana, etc).
+# `restart: unless-stopped` policy in docker-compose.yml ensures containers
+# come back up automatically after every EC2 stop/start cycle triggered by
+# the 8 AM / 5 PM IST EventBridge schedule — no manual intervention needed.
 cd /opt/tickvault/repo/deploy/docker
 sudo -u ubuntu docker compose up -d
 
-# Install systemd unit (binary drops in via GitHub Actions after first deploy)
+# Install and ENABLE the systemd unit so tickvault auto-starts on every
+# subsequent EC2 boot. Without `enable`, a restart from EventBridge would
+# boot the instance but leave the binary dormant — exactly the "Docker
+# started but app didn't" failure mode the user called out.
 cp /opt/tickvault/repo/deploy/systemd/tickvault.service /etc/systemd/system/
 systemctl daemon-reload
+systemctl enable tickvault.service
+# NOTE: `enable` only — do NOT start the unit here. The binary doesn't
+# exist yet on first boot; the deploy-aws workflow will scp it, then
+# subsequent EC2 starts will auto-start the service.
 
-echo "=== dlt user-data complete at $(date -u) ==="
+echo "=== tickvault user-data complete at $(date -u) ==="
 echo "Next step: GitHub Actions deploy-aws workflow will scp the first binary."
+echo "After that, every EC2 start (8 AM IST cron) will auto-launch tickvault."

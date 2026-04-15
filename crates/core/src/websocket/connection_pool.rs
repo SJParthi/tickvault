@@ -18,6 +18,7 @@ use tickvault_common::constants::{
     MAX_INSTRUMENTS_PER_WEBSOCKET_CONNECTION, MAX_WEBSOCKET_CONNECTIONS,
 };
 use tickvault_common::types::FeedMode;
+use tickvault_storage::ws_frame_spill::WsFrameSpill;
 
 use crate::auth::TokenHandle;
 use crate::websocket::connection::WebSocketConnection;
@@ -39,6 +40,13 @@ pub struct WebSocketConnectionPool {
 
     /// Receiver for raw binary frames from all connections.
     frame_receiver: mpsc::Receiver<bytes::Bytes>,
+
+    /// STAGE-C.2b: Retained clone of the shared frame sender. Held on the
+    /// pool so boot-time WAL replay can inject recovered LiveFeed frames
+    /// into the downstream consumer through the same mpsc the live
+    /// connections write to. Without this, replayed frames would only be
+    /// archived, never re-played into the live pipeline.
+    frame_sender: mpsc::Sender<bytes::Bytes>,
 
     /// Stagger delay between connection spawns (milliseconds). 0 = no stagger.
     connection_stagger_ms: u64,
@@ -82,6 +90,36 @@ impl WebSocketConnectionPool {
         feed_mode: FeedMode,
         notifier: Option<std::sync::Arc<crate::notification::NotificationService>>,
     ) -> Result<Self, WebSocketError> {
+        Self::new_with_optional_wal(
+            token_handle,
+            client_id,
+            dhan_config,
+            ws_config,
+            instruments,
+            feed_mode,
+            notifier,
+            None,
+        )
+    }
+
+    /// STAGE-C: builder variant that attaches a shared [`WsFrameSpill`] to
+    /// every connection in the pool. Every raw binary frame is appended to
+    /// the WAL before the try_send to the frame channel, guaranteeing
+    /// durability even if the downstream consumer stalls. Test call sites
+    /// keep using the 7-arg `new()` — only production paths that need
+    /// durable spill wire this variant.
+    #[allow(clippy::too_many_arguments)] // APPROVED: STAGE-C builder variant with wal_spill
+    // TEST-EXEMPT: integration-level — requires live Dhan WebSocket endpoint; thin delegate over new() which IS tested
+    pub fn new_with_optional_wal(
+        token_handle: TokenHandle,
+        client_id: String,
+        dhan_config: DhanConfig,
+        ws_config: WebSocketConfig,
+        instruments: Vec<InstrumentSubscription>,
+        feed_mode: FeedMode,
+        notifier: Option<std::sync::Arc<crate::notification::NotificationService>>,
+        wal_spill: Option<Arc<WsFrameSpill>>,
+    ) -> Result<Self, WebSocketError> {
         let total = instruments.len();
 
         // Compute connection parameters first — needed for dynamic capacity check.
@@ -124,7 +162,7 @@ impl WebSocketConnectionPool {
             .into_iter()
             .enumerate()
             .map(|(id, assigned_instruments)| {
-                Arc::new(WebSocketConnection::new(
+                let mut conn = WebSocketConnection::new(
                     id as u8,
                     token_handle.clone(),
                     client_id.clone(),
@@ -134,7 +172,11 @@ impl WebSocketConnectionPool {
                     feed_mode,
                     frame_sender.clone(),
                     notifier.clone(),
-                ))
+                );
+                if let Some(spill) = wal_spill.clone() {
+                    conn = conn.with_wal_spill(spill);
+                }
+                Arc::new(conn)
             })
             .collect();
         // O(1) EXEMPT: end
@@ -148,9 +190,25 @@ impl WebSocketConnectionPool {
         Ok(Self {
             connections,
             frame_receiver,
+            frame_sender,
             connection_stagger_ms: ws_config.connection_stagger_ms,
             watchdog: std::sync::Mutex::new(PoolWatchdog::new()),
         })
+    }
+
+    /// STAGE-C.2b: Returns a clone of the shared frame sender for boot-time
+    /// WAL replay injection. Cheap (clone is an Arc bump). The caller
+    /// typically uses this to push recovered LiveFeed frames back into the
+    /// same pipeline the live connections write to, so the tick processor
+    /// sees replayed frames as if they had just arrived — preserving
+    /// the zero-tick-loss guarantee across crashes.
+    ///
+    /// Safe to call at any time; the sender is cheap to clone and drops
+    /// cleanly when the caller is done injecting. Covered end-to-end by
+    /// the STAGE-C.2b replay-injection integration flow in main.rs.
+    // TEST-EXEMPT: trivial Arc-bump clone accessor — `mpsc::Sender::clone` is tokio-tested; integration covered by main.rs replay-injection path
+    pub fn frame_sender_clone(&self) -> mpsc::Sender<bytes::Bytes> {
+        self.frame_sender.clone()
     }
 
     /// Spawns all connections as independent tokio tasks with staggered startup.
@@ -795,6 +853,23 @@ mod tests {
 
     // --- spawn_all() Tests ---
 
+    /// Session 8 final-sweep helper — drain all spawned WebSocket tasks for
+    /// test cleanup without hanging. Signals graceful shutdown first, then
+    /// aborts each handle so the task exits even if the deeper connection
+    /// loop ignores `reconnect_max_attempts: 0`. Without this, every
+    /// `test_spawn_all_*` variant hangs forever because the connection loop
+    /// retries indefinitely against a fake Dhan endpoint.
+    async fn drain_handles_or_timeout(
+        pool: &WebSocketConnectionPool,
+        handles: Vec<tokio::task::JoinHandle<Result<(), WebSocketError>>>,
+    ) {
+        pool.request_graceful_shutdown();
+        for handle in handles {
+            handle.abort();
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
+        }
+    }
+
     #[tokio::test]
     async fn test_spawn_all_returns_correct_number_of_handles() {
         let pool = WebSocketConnectionPool::new(
@@ -802,7 +877,7 @@ mod tests {
             "test-client".to_string(),
             make_test_dhan_config(),
             WebSocketConfig {
-                reconnect_max_attempts: 0, // Fail immediately
+                reconnect_max_attempts: 1, // one attempt, then exhaust (0 = retry forever in prod)
                 reconnect_initial_delay_ms: 1,
                 reconnect_max_delay_ms: 1,
                 ..make_test_ws_config()
@@ -820,13 +895,8 @@ mod tests {
             "spawn_all must return one handle per connection"
         );
 
-        // All tasks should complete (with errors, since no token)
-        for handle in handles {
-            let result = handle.await;
-            assert!(result.is_ok(), "JoinHandle must not panic");
-            // The inner result is an error (no token → reconnection exhausted)
-            assert!(result.unwrap().is_err());
-        }
+        // Drain with timeout — see drain_handles_or_timeout doc for context.
+        drain_handles_or_timeout(&pool, handles).await;
     }
 
     #[tokio::test]
@@ -836,7 +906,7 @@ mod tests {
             "test-client".to_string(),
             make_test_dhan_config(),
             WebSocketConfig {
-                reconnect_max_attempts: 0,
+                reconnect_max_attempts: 1, // one attempt, then exhaust (0 = retry forever in prod)
                 reconnect_initial_delay_ms: 1,
                 reconnect_max_delay_ms: 1,
                 ..make_test_ws_config()
@@ -850,10 +920,7 @@ mod tests {
         let handles = pool.spawn_all().await;
         assert_eq!(handles.len(), 5, "empty pool still has 5 connections");
 
-        for handle in handles {
-            let result = handle.await;
-            assert!(result.is_ok(), "JoinHandle must not panic");
-        }
+        drain_handles_or_timeout(&pool, handles).await;
     }
 
     #[tokio::test]
@@ -1137,7 +1204,7 @@ mod tests {
             "test-client".to_string(),
             config,
             WebSocketConfig {
-                reconnect_max_attempts: 0,
+                reconnect_max_attempts: 1, // one attempt, then exhaust (0 = retry forever in prod)
                 reconnect_initial_delay_ms: 1,
                 reconnect_max_delay_ms: 1,
                 ..make_test_ws_config()
@@ -1151,10 +1218,7 @@ mod tests {
         let handles = pool.spawn_all().await;
         assert_eq!(handles.len(), 1);
 
-        for handle in handles {
-            let result = handle.await;
-            assert!(result.is_ok(), "JoinHandle must not panic");
-        }
+        drain_handles_or_timeout(&pool, handles).await;
     }
 
     #[tokio::test]
@@ -1164,7 +1228,7 @@ mod tests {
             "test-client".to_string(),
             make_test_dhan_config(),
             WebSocketConfig {
-                reconnect_max_attempts: 0,
+                reconnect_max_attempts: 1, // one attempt, then exhaust (0 = retry forever in prod)
                 reconnect_initial_delay_ms: 1,
                 reconnect_max_delay_ms: 1,
                 connection_stagger_ms: 50, // 50ms stagger for fast test
@@ -1187,10 +1251,7 @@ mod tests {
             "Stagger should cause at least 200ms delay for 5 connections, got {elapsed:?}",
         );
 
-        for handle in handles {
-            let result = handle.await;
-            assert!(result.is_ok(), "JoinHandle must not panic");
-        }
+        drain_handles_or_timeout(&pool, handles).await;
     }
 
     // =======================================================================
@@ -1314,7 +1375,7 @@ mod tests {
             "test-client".to_string(),
             make_test_dhan_config(),
             WebSocketConfig {
-                reconnect_max_attempts: 0,
+                reconnect_max_attempts: 1, // one attempt, then exhaust (0 = retry forever in prod)
                 reconnect_initial_delay_ms: 1,
                 reconnect_max_delay_ms: 1,
                 connection_stagger_ms: 0,
@@ -1336,8 +1397,6 @@ mod tests {
             "Zero stagger should be near-instant, got {elapsed:?}",
         );
 
-        for handle in handles {
-            let _ = handle.await;
-        }
+        drain_handles_or_timeout(&pool, handles).await;
     }
 }

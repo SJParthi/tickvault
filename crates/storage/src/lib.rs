@@ -31,6 +31,7 @@ pub mod partition_manager;
 pub mod questdb_health;
 pub mod tick_persistence;
 pub mod valkey_cache;
+pub mod ws_frame_spill;
 
 /// Test support: re-exports internal functions for DHAT and benchmark tests.
 pub mod tick_persistence_testing {

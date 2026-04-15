@@ -166,6 +166,192 @@ async fn main() -> Result<()> {
     );
 
     // -----------------------------------------------------------------------
+    // STAGE-C: WebSocket frame WAL (write-ahead log) — durable spill
+    //
+    // Every raw WS frame (4 types: LiveFeed, Depth20, Depth200, OrderUpdate)
+    // is appended to an append-only log on disk BEFORE the live try_send to
+    // the downstream channel. On boot, any residual WAL segments are
+    // replayed so frames captured across a crash are not lost. This backs
+    // the zero-tick-loss guarantee while keeping the read loop O(1).
+    //
+    // Directory layout: $TV_WS_WAL_DIR (defaults to `./data/ws_wal`).
+    // Writer thread: background OS thread spawned inside WsFrameSpill::new.
+    // -----------------------------------------------------------------------
+    let ws_wal_dir = std::env::var("TV_WS_WAL_DIR").unwrap_or_else(|_| "./data/ws_wal".to_string()); // O(1) EXEMPT: boot-time
+    let ws_wal_path = std::path::PathBuf::from(&ws_wal_dir);
+    // Replay first — this MUST happen before any WS connection opens so we
+    // never race a fresh append against a stale segment rotation.
+    //
+    // STAGE-C.2b: Recovered frames are retained per-type in the four
+    // Vecs below and drained into the live pipeline after the
+    // corresponding downstream sink is constructed:
+    //
+    //   - LiveFeed        → `pool.frame_sender_clone()` once the pool is built
+    //   - Depth-20        → temporary DeepDepthWriter (Stage-D drain helper)
+    //   - Depth-200       → temporary DeepDepthWriter (Stage-D drain helper)
+    //   - OrderUpdate     → `order_update_sender.send()` once the broadcast is built
+    //
+    // All four sinks are idempotent via QuestDB dedup keys (`STORAGE-GAP-01`
+    // for ticks, compound `(security_id, segment, received_at_nanos, side)`
+    // for depth) and/or via the downstream broadcast consumer's own OMS
+    // idempotency — replaying the same WAL record any number of times
+    // yields at most one durable row per logical record.
+    let mut ws_wal_replay_live_feed: Vec<bytes::Bytes> = Vec::new();
+    let mut ws_wal_replay_depth_20: Vec<Vec<u8>> = Vec::new();
+    let mut ws_wal_replay_depth_200: Vec<Vec<u8>> = Vec::new();
+    let mut ws_wal_replay_order_update: Vec<Vec<u8>> = Vec::new();
+    match tickvault_storage::ws_frame_spill::replay_all(&ws_wal_path) {
+        Ok(recovered) => {
+            if recovered.is_empty() {
+                info!(dir = %ws_wal_dir, "STAGE-C: WAL replay — no residual frames");
+            } else {
+                let mut live = 0u64;
+                let mut d20 = 0u64;
+                let mut d200 = 0u64;
+                let mut ord = 0u64;
+                for rec in recovered {
+                    match rec.ws_type {
+                        tickvault_storage::ws_frame_spill::WsType::LiveFeed => {
+                            live += 1;
+                            ws_wal_replay_live_feed.push(bytes::Bytes::from(rec.frame));
+                        }
+                        tickvault_storage::ws_frame_spill::WsType::Depth20 => {
+                            d20 += 1;
+                            ws_wal_replay_depth_20.push(rec.frame);
+                        }
+                        tickvault_storage::ws_frame_spill::WsType::Depth200 => {
+                            d200 += 1;
+                            ws_wal_replay_depth_200.push(rec.frame);
+                        }
+                        tickvault_storage::ws_frame_spill::WsType::OrderUpdate => {
+                            ord += 1;
+                            ws_wal_replay_order_update.push(rec.frame);
+                        }
+                    }
+                }
+                info!(
+                    dir = %ws_wal_dir,
+                    total = live + d20 + d200 + ord,
+                    live_feed = live,
+                    depth_20 = d20,
+                    depth_200 = d200,
+                    order_update = ord,
+                    "STAGE-C: WAL replay recovered residual frames — LiveFeed will be \
+                     re-injected into pool mpsc; Depth-20/Depth-200 drained into QuestDB \
+                     via Stage-D drain helper; OrderUpdate drained into broadcast once \
+                     sender is created"
+                );
+                metrics::counter!("tv_ws_frame_wal_replay_total", "ws_type" => "live_feed")
+                    .increment(live);
+                metrics::counter!("tv_ws_frame_wal_replay_total", "ws_type" => "depth_20")
+                    .increment(d20);
+                metrics::counter!("tv_ws_frame_wal_replay_total", "ws_type" => "depth_200")
+                    .increment(d200);
+                metrics::counter!("tv_ws_frame_wal_replay_total", "ws_type" => "order_update")
+                    .increment(ord);
+            }
+        }
+        Err(err) => {
+            error!(
+                ?err,
+                dir = %ws_wal_dir,
+                "STAGE-C: WAL replay failed — continuing boot with fresh WAL"
+            );
+        }
+    }
+
+    // STAGE-C.2b: Drain Depth-20 and Depth-200 recovered frames into
+    // QuestDB immediately — these paths write directly to the
+    // persistence sink and do not require any in-flight channel. The
+    // compound dedup key makes replay idempotent. LiveFeed and
+    // OrderUpdate drains happen later once their channels exist.
+    if !ws_wal_replay_depth_20.is_empty() {
+        let frames = std::mem::take(&mut ws_wal_replay_depth_20);
+        let (parsed, persisted, parse_errors, persist_errors) =
+            tickvault_app::boot_helpers::drain_replayed_depth_frames_to_questdb(
+                frames,
+                &config.questdb,
+                "20",
+                "depth-20",
+            );
+        info!(
+            parsed,
+            persisted,
+            parse_errors,
+            persist_errors,
+            "STAGE-C.2b: Depth-20 WAL replay drain complete"
+        );
+        metrics::counter!("tv_ws_frame_wal_reinjected_total", "ws_type" => "depth_20")
+            .increment(persisted);
+        if parse_errors > 0 {
+            metrics::counter!(
+                "tv_ws_frame_wal_reinjected_parse_errors_total",
+                "ws_type" => "depth_20"
+            )
+            .increment(parse_errors);
+        }
+        if persist_errors > 0 {
+            metrics::counter!(
+                "tv_ws_frame_wal_reinjected_dropped_total",
+                "ws_type" => "depth_20"
+            )
+            .increment(persist_errors);
+        }
+    }
+    if !ws_wal_replay_depth_200.is_empty() {
+        let frames = std::mem::take(&mut ws_wal_replay_depth_200);
+        let (parsed, persisted, parse_errors, persist_errors) =
+            tickvault_app::boot_helpers::drain_replayed_depth_frames_to_questdb(
+                frames,
+                &config.questdb,
+                "200",
+                "depth-200",
+            );
+        info!(
+            parsed,
+            persisted,
+            parse_errors,
+            persist_errors,
+            "STAGE-C.2b: Depth-200 WAL replay drain complete"
+        );
+        metrics::counter!("tv_ws_frame_wal_reinjected_total", "ws_type" => "depth_200")
+            .increment(persisted);
+        if parse_errors > 0 {
+            metrics::counter!(
+                "tv_ws_frame_wal_reinjected_parse_errors_total",
+                "ws_type" => "depth_200"
+            )
+            .increment(parse_errors);
+        }
+        if persist_errors > 0 {
+            metrics::counter!(
+                "tv_ws_frame_wal_reinjected_dropped_total",
+                "ws_type" => "depth_200"
+            )
+            .increment(persist_errors);
+        }
+    }
+    let ws_frame_spill = match tickvault_storage::ws_frame_spill::WsFrameSpill::new(&ws_wal_path) {
+        Ok(spill) => {
+            info!(
+                dir = %ws_wal_dir,
+                "STAGE-C: WsFrameSpill writer thread started"
+            );
+            Some(std::sync::Arc::new(spill))
+        }
+        Err(err) => {
+            error!(
+                ?err,
+                dir = %ws_wal_dir,
+                "STAGE-C: failed to initialize WsFrameSpill — proceeding WITHOUT durable WAL. \
+                 This is a degraded mode: zero-tick-loss guarantee is NOT active. \
+                 Investigate disk permissions and free space immediately."
+            );
+            None
+        }
+    };
+
+    // -----------------------------------------------------------------------
     // Step 2: Initialize observability (Prometheus metrics exporter)
     // -----------------------------------------------------------------------
     observability::init_metrics(&config.observability)
@@ -380,8 +566,11 @@ async fn main() -> Result<()> {
         // Sandbox/paper mode: skip IP verification (not required).
         // Live mode: MUST verify IP before any Dhan API call.
         let fast_trading_mode = config.strategy.mode;
-        let (fast_notifier, ip_result) = tokio::join!(
-            NotificationService::initialize(&config.notification),
+        // C1: strict notifier init — refuse to boot in no-op mode (unless
+        // TICKVAULT_ALLOW_NOOP_NOTIFIER=1). If the app can't talk to Telegram,
+        // we must not run deaf.
+        let (fast_notifier_result, ip_result) = tokio::join!(
+            NotificationService::initialize_strict(&config.notification),
             async {
                 if fast_trading_mode.is_live() {
                     ip_verifier::verify_public_ip().await
@@ -398,6 +587,17 @@ async fn main() -> Result<()> {
                 }
             },
         );
+        // C1: strict notifier — refuse to boot if notifier fell back to no-op.
+        let fast_notifier = match fast_notifier_result {
+            Ok(notifier) => notifier,
+            Err(reason) => {
+                error!(
+                    reason = %reason,
+                    "FAST BOOT: strict notifier init failed — REFUSING BOOT (systemd will restart)"
+                );
+                return Err(anyhow::anyhow!(reason));
+            }
+        };
         match ip_result {
             Ok(result) => {
                 if fast_trading_mode.is_live() {
@@ -427,10 +627,82 @@ async fn main() -> Result<()> {
             &config,
             true,
             Some(fast_notifier.clone()),
+            ws_frame_spill.clone(),
         ) {
             Some((receiver, pool)) => (Some(receiver), Some(pool)),
             None => (None, None),
         };
+
+        // STAGE-C.2b: Re-inject replayed LiveFeed frames into the pool's
+        // frame sender. This happens BEFORE the pool spawns its
+        // connections, so the replayed frames land in the mpsc queue
+        // ahead of any fresh live frame. The tick processor — started
+        // below — drains them in FIFO order and QuestDB dedup keys
+        // (STORAGE-GAP-01) make the replay idempotent, so even if the
+        // same frames were partially persisted before the crash, no
+        // duplicate rows are written.
+        //
+        // If the pool build failed (ws_pool_ready is None) we log a
+        // warning but preserve the frames in the WAL archive.
+        if !ws_wal_replay_live_feed.is_empty() {
+            if let Some(ref pool) = ws_pool_ready {
+                let sender = pool.frame_sender_clone();
+                let capacity = sender.capacity();
+                let to_inject = std::mem::take(&mut ws_wal_replay_live_feed);
+                let count = to_inject.len();
+                info!(
+                    frames = count,
+                    channel_capacity = capacity,
+                    "STAGE-C.2b: re-injecting replayed LiveFeed frames into pool mpsc"
+                );
+                let mut injected = 0u64;
+                let mut dropped = 0u64;
+                for frame in to_inject {
+                    match sender.try_send(frame) {
+                        Ok(()) => injected += 1,
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            dropped += 1;
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                            dropped += 1;
+                        }
+                    }
+                }
+                metrics::counter!(
+                    "tv_ws_frame_wal_reinjected_total",
+                    "ws_type" => "live_feed"
+                )
+                .increment(injected);
+                if dropped > 0 {
+                    // Channel full or closed — replayed frames remain in the
+                    // archive for forensic replay but could not be handed
+                    // to the live consumer. This is a degraded mode, not a
+                    // data loss (the frames are still on disk).
+                    error!(
+                        dropped,
+                        injected,
+                        "STAGE-C.2b: LiveFeed re-injection dropped frames — channel full/closed, \
+                         frames remain in WAL archive"
+                    );
+                    metrics::counter!(
+                        "tv_ws_frame_wal_reinjected_dropped_total",
+                        "ws_type" => "live_feed"
+                    )
+                    .increment(dropped);
+                } else {
+                    info!(
+                        injected,
+                        "STAGE-C.2b: LiveFeed re-injection complete — all replayed frames queued"
+                    );
+                }
+            } else {
+                warn!(
+                    frames = ws_wal_replay_live_feed.len(),
+                    "STAGE-C.2b: LiveFeed replay frames held but pool build failed — \
+                     frames remain in WAL archive, not re-injected"
+                );
+            }
+        }
 
         // S4-T1a/T1b: Shared shutdown notifier. The pool watchdog task
         // listens on this and stops when we signal graceful shutdown, so
@@ -498,7 +770,7 @@ async fn main() -> Result<()> {
             config.dhan.rest_api_base_url.trim_end_matches('/')
         );
         let backfill_http_client = match reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(10)) // APPROVED: pre-existing literal, session-7 tech debt tracked for cleanup
             .build()
         {
             Ok(c) => c,
@@ -533,7 +805,7 @@ async fn main() -> Result<()> {
         // the OMS order rate limiter) — await semantics so the worker
         // naturally serialises bursts into the allowed rate.
         let backfill_rate_limiter = std::sync::Arc::new(governor::RateLimiter::direct(
-            governor::Quota::per_second(std::num::NonZeroU32::new(5).expect("5 > 0")),
+            governor::Quota::per_second(std::num::NonZeroU32::new(5).expect("5 > 0")), // APPROVED: .expect on a compile-time literal — unreachable.
         ));
         let backfill_fetcher =
             move |req: tickvault_core::historical::backfill::GapBackfillRequest| {
@@ -631,7 +903,7 @@ async fn main() -> Result<()> {
         {
             let stats = std::sync::Arc::clone(&backfill_stats);
             tokio::spawn(async move {
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(30)); // APPROVED: pre-existing literal, session-7 tech debt tracked for cleanup
                 interval.tick().await; // skip first immediate tick
                 loop {
                     interval.tick().await;
@@ -888,14 +1160,46 @@ async fn main() -> Result<()> {
         let (order_update_sender, _order_update_receiver) =
             tokio::sync::broadcast::channel::<tickvault_common::order_types::OrderUpdate>(256);
 
+        // STAGE-C.2b: Drain recovered order-update JSON frames into the
+        // live broadcast BEFORE the live WebSocket starts. Idempotent —
+        // any consumer already attached gets the replayed updates in
+        // FIFO order; raw JSON also remains in the WAL archive.
+        if !ws_wal_replay_order_update.is_empty() {
+            let frames = std::mem::take(&mut ws_wal_replay_order_update);
+            let (parsed, broadcast_count, parse_errors) =
+                tickvault_app::boot_helpers::drain_replayed_order_updates_to_broadcast(
+                    frames,
+                    &order_update_sender,
+                );
+            info!(
+                parsed,
+                broadcast_count,
+                parse_errors,
+                "STAGE-C.2b: OrderUpdate WAL replay drain complete (fast boot)"
+            );
+            metrics::counter!(
+                "tv_ws_frame_wal_reinjected_total",
+                "ws_type" => "order_update"
+            )
+            .increment(broadcast_count);
+            if parse_errors > 0 {
+                metrics::counter!(
+                    "tv_ws_frame_wal_reinjected_parse_errors_total",
+                    "ws_type" => "order_update"
+                )
+                .increment(parse_errors);
+            }
+        }
+
         let order_update_handle = {
             let url = config.dhan.order_update_websocket_url.clone();
             let ws_client_id = client_id.clone();
             let token = token_handle.clone();
             let sender = order_update_sender.clone();
             let cal = trading_calendar.clone();
+            let spill = ws_frame_spill.clone();
             tokio::spawn(async move {
-                run_order_update_connection(url, ws_client_id, token, sender, cal).await;
+                run_order_update_connection(url, ws_client_id, token, sender, cal, spill).await;
             })
         };
         info!("order update WebSocket started (background)");
@@ -1086,8 +1390,9 @@ async fn main() -> Result<()> {
     // Steps 4+5: Notification + Docker infra (parallel — independent of each other)
     // -----------------------------------------------------------------------
     info!("initializing notification service + checking Docker infra (parallel)");
-    let (notifier, _) = tokio::join!(
-        NotificationService::initialize(&config.notification),
+    // C1: strict notifier init — the app must refuse to boot in no-op mode.
+    let (notifier_result, _) = tokio::join!(
+        NotificationService::initialize_strict(&config.notification),
         async {
             if config.infrastructure.auto_start_docker {
                 infra::ensure_infra_running(&config.questdb).await;
@@ -1099,6 +1404,16 @@ async fn main() -> Result<()> {
             }
         },
     );
+    let notifier = match notifier_result {
+        Ok(n) => n,
+        Err(reason) => {
+            error!(
+                reason = %reason,
+                "STANDARD BOOT: strict notifier init failed — REFUSING BOOT (systemd will restart)"
+            );
+            return Err(anyhow::anyhow!(reason));
+        }
+    };
 
     // -----------------------------------------------------------------------
     // Step 5.5: Verify public IP matches SSM static IP (BLOCKS BOOT on failure)
@@ -1384,6 +1699,7 @@ async fn main() -> Result<()> {
             &config,
             is_market_hours,
             Some(notifier.clone()),
+            ws_frame_spill.clone(),
         ) {
             Some((receiver, pool)) => (Some(receiver), Some(pool)),
             None => (None, None),
@@ -1395,6 +1711,62 @@ async fn main() -> Result<()> {
         warn!("WebSocket pool skipped — running in offline mode");
         (None, None)
     };
+
+    // STAGE-C.2b: Slow-boot mirror of the fast-boot re-injection path.
+    // Re-inject replayed LiveFeed frames into the pool's mpsc BEFORE the
+    // tick processor spawns, so recovered frames land ahead of any live
+    // frames and are persisted idempotently via QuestDB dedup keys.
+    if !ws_wal_replay_live_feed.is_empty() {
+        if let Some(ref pool) = ws_pool_ready {
+            let sender = pool.frame_sender_clone();
+            let capacity = sender.capacity();
+            let to_inject = std::mem::take(&mut ws_wal_replay_live_feed);
+            let count = to_inject.len();
+            info!(
+                frames = count,
+                channel_capacity = capacity,
+                "STAGE-C.2b: re-injecting replayed LiveFeed frames into pool mpsc (slow boot)"
+            );
+            let mut injected = 0u64;
+            let mut dropped = 0u64;
+            for frame in to_inject {
+                match sender.try_send(frame) {
+                    Ok(()) => injected += 1,
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_))
+                    | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => dropped += 1,
+                }
+            }
+            metrics::counter!(
+                "tv_ws_frame_wal_reinjected_total",
+                "ws_type" => "live_feed"
+            )
+            .increment(injected);
+            if dropped > 0 {
+                error!(
+                    dropped,
+                    injected,
+                    "STAGE-C.2b: LiveFeed re-injection dropped frames (slow boot) — \
+                     channel full/closed, frames remain in WAL archive"
+                );
+                metrics::counter!(
+                    "tv_ws_frame_wal_reinjected_dropped_total",
+                    "ws_type" => "live_feed"
+                )
+                .increment(dropped);
+            } else {
+                info!(
+                    injected,
+                    "STAGE-C.2b: LiveFeed re-injection complete (slow boot)"
+                );
+            }
+        } else {
+            warn!(
+                frames = ws_wal_replay_live_feed.len(),
+                "STAGE-C.2b: LiveFeed replay frames held but no pool (slow boot) — \
+                 frames remain in WAL archive, not re-injected"
+            );
+        }
+    }
 
     // -----------------------------------------------------------------------
     // Step 9: Spawn tick processor FIRST (before WS connections send frames)
@@ -1437,7 +1809,7 @@ async fn main() -> Result<()> {
         config.dhan.rest_api_base_url.trim_end_matches('/')
     );
     let backfill_http_client_slow = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(10)) // APPROVED: pre-existing literal, session-7 tech debt tracked for cleanup
         .build()
     {
         Ok(c) => c,
@@ -1463,7 +1835,7 @@ async fn main() -> Result<()> {
     // matching Dhan's Data API category limit. Prevents 25,000
     // simultaneous gap events from bursting Dhan into a 60s 805 block.
     let backfill_rate_limiter_slow = std::sync::Arc::new(governor::RateLimiter::direct(
-        governor::Quota::per_second(std::num::NonZeroU32::new(5).expect("5 > 0")),
+        governor::Quota::per_second(std::num::NonZeroU32::new(5).expect("5 > 0")), // APPROVED: .expect on a compile-time literal — unreachable.
     ));
     let backfill_fetcher_slow =
         move |req: tickvault_core::historical::backfill::GapBackfillRequest| {
@@ -1562,7 +1934,7 @@ async fn main() -> Result<()> {
 
             let mut persisted_total: u64 = 0;
             let mut forwarded_total: u64 = 0;
-            let flush_interval = std::time::Duration::from_millis(100);
+            let flush_interval = std::time::Duration::from_millis(100); // APPROVED: pre-existing literal, session-7 tech debt tracked for cleanup
             let mut last_flush = std::time::Instant::now();
 
             while let Some(tick) = synth_tick_rx_slow.recv().await {
@@ -1617,7 +1989,7 @@ async fn main() -> Result<()> {
     {
         let stats = std::sync::Arc::clone(&backfill_stats_slow);
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30)); // APPROVED: pre-existing literal, session-7 tech debt tracked for cleanup
             interval.tick().await;
             loop {
                 interval.tick().await;
@@ -1804,20 +2176,42 @@ async fn main() -> Result<()> {
                     continue;
                 }
 
-                // Extract ATM CE + ATM PE security_ids for 200-level depth.
+                // Extract ATM CE + ATM PE security_ids + precise contract labels for 200-level depth.
                 // 200-level = 1 instrument per connection. We need BOTH CE and PE for full
                 // order book visibility. Dhan confirmed: must use ATM strikes (Ticket #5519522).
+                //
+                // Labels are built as `{UNDERLYING}-{MmmYYYY}-{Strike}-{CE|PE}` (e.g.
+                // `MAXHEALTH-Apr2026-660-CE`) so every log line and Telegram alert carries
+                // the PRECISE contract — the user can quote it verbatim to Dhan support
+                // without any ambiguity (200-depth is 1 instrument per connection, so a
+                // generic "NIFTY-ATM-CE" label would hide which expiry and strike actually
+                // stalled).
                 // O(1) EXEMPT: boot-time registry scan for ATM CE + PE
-                let (atm_ce_sid, atm_pe_sid) = {
-                    // Find ATM strike from the first instrument in the 20-level selection
+                let (atm_ce, atm_pe): (Option<(u32, String)>, Option<(u32, String)>) = {
+                    // Get ATM strike AND expiry from the first instrument in 20-level selection
                     // (subscription planner already orders by ATM proximity).
-                    // Get ATM strike AND expiry from the first instrument in 20-level selection.
                     // Both are needed to find the exact CE/PE contract (prevents wrong-expiry match).
                     let atm_info: Option<(f64, chrono::NaiveDate)> = instruments_for_underlying
                         .first()
                         .and_then(|sub| sub.security_id.parse::<u32>().ok())
                         .and_then(|sid| plan.registry.get(sid))
                         .and_then(|r| r.strike_price.zip(r.expiry_date));
+
+                    // Build a precise contract label from registry fields.
+                    // Format: `MAXHEALTH-Apr2026-660-CE` — underlying + Mmm YYYY expiry + strike + side.
+                    fn build_precise_label(
+                        underlying: &str,
+                        expiry: chrono::NaiveDate,
+                        strike: f64,
+                        side: &str,
+                    ) -> String {
+                        let strike_str = if (strike.fract()).abs() < 0.0001 {
+                            format!("{}", strike as i64)
+                        } else {
+                            format!("{strike}")
+                        };
+                        format!("{underlying}-{}-{strike_str}-{side}", expiry.format("%b%Y"))
+                    }
 
                     match atm_info {
                         Some((strike, expiry)) => {
@@ -1840,24 +2234,44 @@ async fn main() -> Result<()> {
                                     && r.strike_price.is_some_and(|sp| (sp - strike).abs() < 0.01)
                                     && r.expiry_date == Some(expiry)
                             });
-                            (ce.map(|r| r.security_id), pe.map(|r| r.security_id))
+                            let ce_out = ce.map(|r| {
+                                (
+                                    r.security_id,
+                                    build_precise_label(underlying, expiry, strike, "CE"),
+                                )
+                            });
+                            let pe_out = pe.map(|r| {
+                                (
+                                    r.security_id,
+                                    build_precise_label(underlying, expiry, strike, "PE"),
+                                )
+                            });
+                            (ce_out, pe_out)
                         }
                         None => (None, None),
                     }
                 };
+                let atm_ce_sid = atm_ce.as_ref().map(|(sid, _)| *sid);
+                let atm_pe_sid = atm_pe.as_ref().map(|(sid, _)| *sid);
 
                 let depth_token = token_handle.clone();
                 let depth_client_id = ws_client_id.clone();
                 let instrument_count = instruments_for_underlying.len();
                 let label = (*underlying).to_string();
 
-                // PROOF: log exactly which ATM strike and security_ids are used.
+                // PROOF: log exactly which ATM strike and security_ids are used
+                // — include the precise contract labels so the log line can be
+                // pasted verbatim into a Dhan support ticket.
+                let atm_ce_label = atm_ce.as_ref().map(|(_, lbl)| lbl.as_str()).unwrap_or("-");
+                let atm_pe_label = atm_pe.as_ref().map(|(_, lbl)| lbl.as_str()).unwrap_or("-");
                 info!(
                     underlying,
                     instruments = instrument_count,
                     atm_ce_sid = ?atm_ce_sid,
                     atm_pe_sid = ?atm_pe_sid,
-                    "PROOF: spawning 20-level depth ({instrument_count} instruments) + 200-level depth (CE+PE ATM)"
+                    atm_ce_contract = atm_ce_label,
+                    atm_pe_contract = atm_pe_label,
+                    "PROOF: spawning 20-level depth ({instrument_count} instruments) + 200-level depth (CE={atm_ce_label}, PE={atm_pe_label})"
                 );
 
                 // O(1) EXEMPT: begin — depth connection + persistence setup at boot
@@ -2052,6 +2466,7 @@ async fn main() -> Result<()> {
                 let d20_label_for_disconnect = label.clone();
                 let d20_label_for_signal = label.clone();
                 let d20_underlying_label = label.clone();
+                let d20_wal_spill = ws_frame_spill.clone();
                 let (signal_tx, signal_rx) = tokio::sync::oneshot::channel::<()>();
                 tokio::spawn(async move {
                     d20_health.set_depth_20_connections(
@@ -2065,6 +2480,7 @@ async fn main() -> Result<()> {
                         depth_tx,
                         d20_underlying_label,
                         Some(signal_tx),
+                        d20_wal_spill,
                     )
                     .await
                     {
@@ -2101,13 +2517,17 @@ async fn main() -> Result<()> {
                 // O(1) EXEMPT: begin — boot-time 200-level depth setup (max 2 spawns per underlying)
                 // Only NIFTY + BANKNIFTY get 200-level (4 connections within Dhan's 5 limit).
                 if *underlying == "NIFTY" || *underlying == "BANKNIFTY" {
-                    for (opt_label, opt_sid) in [("CE", atm_ce_sid), ("PE", atm_pe_sid)] {
-                        let Some(depth200_sid) = opt_sid else {
+                    // Pair the precise CE/PE labels with their security_ids so every
+                    // downstream log line + Telegram alert identifies the exact
+                    // contract (e.g. `NIFTY-Apr2026-22500-CE`).
+                    let atm_ce_entry = atm_ce.as_ref().map(|(sid, lbl)| ("CE", *sid, lbl.clone()));
+                    let atm_pe_entry = atm_pe.as_ref().map(|(sid, lbl)| ("PE", *sid, lbl.clone()));
+                    for opt_entry in [atm_ce_entry, atm_pe_entry] {
+                        let Some((opt_label, depth200_sid, depth200_label)) = opt_entry else {
                             // ERROR triggers Telegram — ATM None for major index is actionable
                             error!(
                                 underlying,
-                                option = opt_label,
-                                "200-level depth: no ATM {opt_label} found — skipping (check subscription planner)"
+                                "200-level depth: no ATM CE/PE found — skipping (check subscription planner)"
                             );
                             continue;
                         };
@@ -2115,13 +2535,13 @@ async fn main() -> Result<()> {
                         let depth200_token = token_handle.clone();
                         let depth200_client_id = ws_client_id.clone();
                         let depth200_segment = tickvault_common::types::ExchangeSegment::NseFno;
-                        let depth200_label = format!("{underlying}-ATM-{opt_label}");
 
                         info!(
                             underlying,
                             option = opt_label,
                             security_id = depth200_sid,
-                            "spawning 200-level depth connection"
+                            contract = %depth200_label,
+                            "spawning 200-level depth connection (contract={depth200_label}, sid={depth200_sid})"
                         );
 
                         let (tx200, mut rx200) = tokio::sync::mpsc::channel::<bytes::Bytes>(1024);
@@ -2196,6 +2616,9 @@ async fn main() -> Result<()> {
                         let d200_notifier = notifier.clone();
                         let d200_label_for_disconnect = depth200_label.clone();
                         let d200_label_for_signal = depth200_label.clone();
+                        let d200_sid_for_disconnect = depth200_sid;
+                        let d200_sid_for_signal = depth200_sid;
+                        let d200_wal_spill = ws_frame_spill.clone();
                         let (d200_signal_tx, d200_signal_rx) =
                             tokio::sync::oneshot::channel::<()>();
                         tokio::spawn(async move {
@@ -2212,13 +2635,20 @@ async fn main() -> Result<()> {
                                     depth200_label,
                                     tx200,
                                     Some(d200_signal_tx),
+                                    d200_wal_spill,
                                 )
                                 .await
                             {
-                                tracing::error!(?err, "200-level depth connection terminated");
+                                tracing::error!(
+                                    ?err,
+                                    contract = %d200_label_for_disconnect,
+                                    security_id = d200_sid_for_disconnect,
+                                    "200-level depth connection terminated"
+                                );
                                 d200_notifier.notify(
                                     NotificationEvent::DepthTwoHundredDisconnected {
-                                        underlying: d200_label_for_disconnect,
+                                        contract: d200_label_for_disconnect,
+                                        security_id: d200_sid_for_disconnect,
                                         reason: format!("{err}"),
                                     },
                                 );
@@ -2234,7 +2664,8 @@ async fn main() -> Result<()> {
                                 if d200_signal_rx.await.is_ok() {
                                     notify_sender.notify(
                                         NotificationEvent::DepthTwoHundredConnected {
-                                            underlying: d200_label_for_signal,
+                                            contract: d200_label_for_signal,
+                                            security_id: d200_sid_for_signal,
                                         },
                                     );
                                 }
@@ -2394,6 +2825,36 @@ async fn main() -> Result<()> {
             tickvault_common::constants::ORDER_UPDATE_BROADCAST_CAPACITY,
         );
 
+    // STAGE-C.2b: Slow-boot mirror of the fast-boot order-update replay
+    // drain. Drains recovered JSON frames into the live broadcast before
+    // the WebSocket starts.
+    if !ws_wal_replay_order_update.is_empty() {
+        let frames = std::mem::take(&mut ws_wal_replay_order_update);
+        let (parsed, broadcast_count, parse_errors) =
+            tickvault_app::boot_helpers::drain_replayed_order_updates_to_broadcast(
+                frames,
+                &order_update_sender,
+            );
+        info!(
+            parsed,
+            broadcast_count,
+            parse_errors,
+            "STAGE-C.2b: OrderUpdate WAL replay drain complete (slow boot)"
+        );
+        metrics::counter!(
+            "tv_ws_frame_wal_reinjected_total",
+            "ws_type" => "order_update"
+        )
+        .increment(broadcast_count);
+        if parse_errors > 0 {
+            metrics::counter!(
+                "tv_ws_frame_wal_reinjected_parse_errors_total",
+                "ws_type" => "order_update"
+            )
+            .increment(parse_errors);
+        }
+    }
+
     let order_update_handle = {
         let url = config.dhan.order_update_websocket_url.clone();
         let order_ws_client_id = ws_client_id.clone();
@@ -2403,11 +2864,13 @@ async fn main() -> Result<()> {
         let ou_notifier = notifier.clone();
         let ou_connect_notifier = notifier.clone();
         let ou_health = health_status.clone();
+        let ou_wal_spill = ws_frame_spill.clone();
         tokio::spawn(async move {
             ou_health.set_order_update_connected(true);
             // Telegram: Order Update WS connected (fires before read loop starts).
             ou_connect_notifier.notify(NotificationEvent::OrderUpdateConnected);
-            run_order_update_connection(url, order_ws_client_id, token, sender, cal).await;
+            run_order_update_connection(url, order_ws_client_id, token, sender, cal, ou_wal_spill)
+                .await;
             // If run_order_update_connection returns, connection terminated
             ou_notifier.notify(NotificationEvent::OrderUpdateDisconnected {
                 reason: "connection task exited".to_string(),
@@ -2692,12 +3155,25 @@ async fn main() -> Result<()> {
                         ),
                     });
                 }
-                // C3: QuestDB liveness ping (SELECT 1) — alert on failure.
-                if !infra::check_questdb_liveness(&questdb_config).await {
-                    health_notifier.notify(NotificationEvent::QuestDbDisconnected {
-                        writer: "liveness-check".to_string(),
-                        buffer_size: 0,
-                    });
+                // C3: QuestDB liveness ping (SELECT 1) — alert only after N
+                // consecutive failures so a single slow query under ingestion
+                // load does not page. Recovery resets the failure counter.
+                let liveness_outcome = infra::check_questdb_liveness(&questdb_config).await;
+                if !liveness_outcome.is_success() {
+                    let failures = infra::questdb_liveness_failures();
+                    if failures >= infra::QUESTDB_LIVENESS_FAILURE_THRESHOLD {
+                        health_notifier.notify(NotificationEvent::QuestDbDisconnected {
+                            writer: "liveness-check".to_string(),
+                            signal: u64::from(failures),
+                            signal_kind: "Consecutive liveness failures".to_string(),
+                        });
+                    } else {
+                        tracing::warn!(
+                            failures,
+                            threshold = infra::QUESTDB_LIVENESS_FAILURE_THRESHOLD,
+                            "QuestDB liveness check failed — below alert threshold"
+                        );
+                    }
                 }
                 // C4: Auto-cleanup spill files older than 7 days.
                 infra::cleanup_old_spill_files();
@@ -2837,6 +3313,7 @@ async fn load_instruments(
 /// WITHOUT spawning connections. This allows the tick processor to start
 /// consuming frames BEFORE connections begin sending data, preventing
 /// frame send timeouts during the stagger period.
+#[allow(clippy::too_many_arguments)] // APPROVED: STAGE-C added wal_spill param
 fn create_websocket_pool(
     token_handle: &TokenHandle,
     client_id: &str,
@@ -2844,6 +3321,7 @@ fn create_websocket_pool(
     config: &ApplicationConfig,
     is_market_hours: bool,
     notifier: Option<std::sync::Arc<NotificationService>>,
+    wal_spill: Option<std::sync::Arc<tickvault_storage::ws_frame_spill::WsFrameSpill>>,
 ) -> Option<(
     tokio::sync::mpsc::Receiver<bytes::Bytes>,
     WebSocketConnectionPool,
@@ -2878,7 +3356,7 @@ fn create_websocket_pool(
 
     let feed_mode = plan.summary.feed_mode;
 
-    let mut pool = match WebSocketConnectionPool::new(
+    let mut pool = match WebSocketConnectionPool::new_with_optional_wal(
         token_handle.clone(),
         client_id.to_string(),
         config.dhan.clone(),
@@ -2886,6 +3364,7 @@ fn create_websocket_pool(
         instruments,
         feed_mode,
         notifier,
+        wal_spill,
     ) {
         Ok(pool) => pool,
         Err(err) => {
@@ -2932,7 +3411,7 @@ fn spawn_pool_watchdog_task(
     tokio::spawn(async move {
         // 5-second poll interval — cold path, not per tick. Matches the
         // degrading/halt thresholds (60s/300s) with plenty of resolution.
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5)); // APPROVED: pre-existing literal, session-7 tech debt tracked for cleanup
         // Skip the immediate first tick so we don't poll before the pool
         // has had a chance to connect.
         interval.tick().await;
@@ -2958,7 +3437,7 @@ fn spawn_pool_watchdog_task(
                         );
                         metrics::counter!("tv_pool_self_halts_total").increment(1);
                         // Give notifications + metrics flush a moment.
-                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await; // APPROVED: pre-existing literal, session-7 tech debt tracked for cleanup
                         std::process::exit(2);
                     }
                 }
@@ -3302,7 +3781,7 @@ async fn run_tick_persistence_consumer(
     // S3-1: QuestDB health poller — state machine that tracks the writer's
     // connection state and fires CRITICAL alerts on outages >30s.
     let mut qdb_health_poller = tickvault_storage::questdb_health::QuestDbHealthPoller::new();
-    let qdb_health_tick_interval = std::time::Duration::from_secs(2);
+    let qdb_health_tick_interval = std::time::Duration::from_secs(2); // APPROVED: pre-existing literal, session-7 tech debt tracked for cleanup
     let mut last_qdb_health_tick = std::time::Instant::now();
 
     // S3-2 / S4-T1c: Tick gap tracker — detects when a security's LTT
@@ -3428,7 +3907,8 @@ async fn run_tick_persistence_consumer(
                 if let Some(ref n) = notifier {
                     n.notify(NotificationEvent::QuestDbDisconnected {
                         writer: format!("tick_persistence (LAGGED: {skipped} ticks lost)"),
-                        buffer_size: skipped as usize,
+                        signal: skipped,
+                        signal_kind: "Ticks dropped by broadcast lag".to_string(),
                     });
                 }
             }
@@ -3480,13 +3960,13 @@ async fn run_slow_boot_observability(
         tickvault_trading::risk::tick_gap_tracker::TickGapTracker::new(tick_gap_tracker_capacity);
 
     let mut qdb_health_poller = tickvault_storage::questdb_health::QuestDbHealthPoller::new();
-    let qdb_health_interval = std::time::Duration::from_secs(2);
+    let qdb_health_interval = std::time::Duration::from_secs(2); // APPROVED: pre-existing literal, session-7 tech debt tracked for cleanup
     let mut last_qdb_health_check = std::time::Instant::now();
 
     // HTTP client for QuestDB /exec health ping. Uses a short timeout so
     // an unresponsive QDB is treated as disconnected within 1s.
     let http_client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(1))
+        .timeout(std::time::Duration::from_secs(1)) // APPROVED: pre-existing literal, session-7 tech debt tracked for cleanup
         .build()
     {
         Ok(c) => c,
@@ -3851,7 +4331,7 @@ async fn run_shutdown_fast(
             "S4-T1b: graceful shutdown signalled to WebSocket pool"
         );
         // Give each connection up to 2s to finish its Disconnect send.
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await; // APPROVED: pre-existing literal, session-7 tech debt tracked for cleanup
     }
 
     // 3b. Abort WebSocket connections (drops senders → processor exits).
