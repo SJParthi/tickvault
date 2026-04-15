@@ -1,0 +1,22 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="Run tickvault" type="CargoCommandRunConfiguration" factoryName="Cargo Command">
+    <option name="command" value="run --bin tickvault -p tickvault-app" />
+    <option name="workingDirectory" value="file://$PROJECT_DIR$" />
+    <option name="channel" value="DEFAULT" />
+    <option name="requiredFeatures" value="true" />
+    <option name="allFeatures" value="false" />
+    <option name="emulateTerminal" value="true" />
+    <option name="withSudo" value="false" />
+    <option name="buildTarget" value="REMOTE" />
+    <option name="backtrace" value="SHORT" />
+    <envs>
+      <env name="RUST_LOG" value="info,tickvault=debug" />
+      <env name="RUST_BACKTRACE" value="1" />
+    </envs>
+    <option name="isRedirectInput" value="false" />
+    <option name="redirectInputPath" value="" />
+    <method v="2">
+      <option name="RunConfigurationTask" enabled="true" run_configuration_type="ShConfigurationType" run_configuration_name="Ensure Ready" />
+    </method>
+  </configuration>
+</component>
