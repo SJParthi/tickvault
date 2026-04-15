@@ -10,7 +10,7 @@
 #   3.  Auto-install missing prerequisites where possible
 #   4.  Validate AWS credentials exist (for Grafana/QuestDB secrets)
 #   5.  Fetch/provision all SSM secrets (idempotent)
-#   6.  Pull all Docker images (8 services, pinned SHA256)
+#   6.  Pull all Docker images (7 services, pinned SHA256)
 #   7.  Start the full stack (docker compose up -d)
 #   8.  Health-wait every service with exponential backoff
 #   9.  Validate Prometheus scrape targets are UP
@@ -271,7 +271,7 @@ else
     fi
 
     # ---- Step 7: Pull images ----
-    step "Pulling Docker images (8 services, SHA256-pinned)"
+    step "Pulling Docker images (7 services, SHA256-pinned)"
     info "This may take a few minutes on first run (~2GB)..."
     if ! docker compose -f "${COMPOSE_FILE}" pull --quiet 2>&1; then
         fail "Docker image pull failed. Check network connectivity."
@@ -313,9 +313,15 @@ fi
 step "Waiting for services to be healthy"
 HEALTH_FAIL=0
 # Jaeger, Alloy, Loki removed per aws-budget.md (2.5GB RAM saving).
-wait_for_http "QuestDB"         "http://localhost:9000"            120 || HEALTH_FAIL=$((HEALTH_FAIL + 1))
+# QuestDB readiness: use /exec?query=SELECT%201 instead of the root URL.
+# The root URL returns the full web console HTML (hundreds of KB) which can
+# time out curl's --max-time 3 on first boot while QuestDB is WAL-initializing.
+# The /exec endpoint returns ~30 bytes of JSON and is a true "SQL engine
+# ready" signal, not just "web server accepting connections".
+wait_for_http "QuestDB"         "http://localhost:9000/exec?query=SELECT%201" 120 || HEALTH_FAIL=$((HEALTH_FAIL + 1))
 wait_for_http "Prometheus"      "http://localhost:9090/-/healthy"    30 || HEALTH_FAIL=$((HEALTH_FAIL + 1))
 wait_for_http "Grafana"         "http://localhost:3000/api/health"  45 || HEALTH_FAIL=$((HEALTH_FAIL + 1))
+wait_for_http "Alertmanager"    "http://localhost:9093/-/healthy"    30 || HEALTH_FAIL=$((HEALTH_FAIL + 1))
 wait_for_http "Traefik"         "http://localhost:8080/api/rawdata" 20 || HEALTH_FAIL=$((HEALTH_FAIL + 1))
 wait_for_http "Traefik Metrics" "http://localhost:8082/metrics"     20 || HEALTH_FAIL=$((HEALTH_FAIL + 1))
 
