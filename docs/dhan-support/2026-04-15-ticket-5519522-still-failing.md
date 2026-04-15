@@ -61,13 +61,24 @@ Sec-WebSocket-Version: 13
 {"RequestCode":23,"ExchangeSegment":"NSE_FNO","SecurityId":"<ATM_CE_OR_PE_SID>"}
 ```
 
-Exactly one instrument per connection. 4 parallel connections total:
-- NIFTY ATM CE (current-week expiry)
-- NIFTY ATM PE (current-week expiry)
-- BANKNIFTY ATM CE (current-week expiry)
-- BANKNIFTY ATM PE (current-week expiry)
+Exactly one instrument per connection. **4 parallel connections total, with the exact SecurityIds currently failing** (extracted from the same log run on 2026-04-15, IST):
 
-The ATM strike is re-derived every 60 seconds from live spot LTP and rebalanced on drift, so the SecurityId is always at the money — exactly what you asked us to test with.
+| # | Underlying | Option | Expiry | SecurityId | ExchangeSegment | Subscription Frame Sent |
+|---|---|---|---|---|---|---|
+| 1 | NIFTY      | CE (ATM) | `<CURRENT_WEEK_EXPIRY_YYYY-MM-DD>` | **`<NIFTY_ATM_CE_SID>`**      | `NSE_FNO` | `{"RequestCode":23,"ExchangeSegment":"NSE_FNO","SecurityId":"<NIFTY_ATM_CE_SID>"}`      |
+| 2 | NIFTY      | PE (ATM) | `<CURRENT_WEEK_EXPIRY_YYYY-MM-DD>` | **`<NIFTY_ATM_PE_SID>`**      | `NSE_FNO` | `{"RequestCode":23,"ExchangeSegment":"NSE_FNO","SecurityId":"<NIFTY_ATM_PE_SID>"}`      |
+| 3 | BANKNIFTY  | CE (ATM) | `<CURRENT_WEEK_EXPIRY_YYYY-MM-DD>` | **`<BANKNIFTY_ATM_CE_SID>`**  | `NSE_FNO` | `{"RequestCode":23,"ExchangeSegment":"NSE_FNO","SecurityId":"<BANKNIFTY_ATM_CE_SID>"}`  |
+| 4 | BANKNIFTY  | PE (ATM) | `<CURRENT_WEEK_EXPIRY_YYYY-MM-DD>` | **`<BANKNIFTY_ATM_PE_SID>`**  | `NSE_FNO` | `{"RequestCode":23,"ExchangeSegment":"NSE_FNO","SecurityId":"<BANKNIFTY_ATM_PE_SID>"}`  |
+
+> **Operator note:** Before sending this email, replace the four `<..._SID>` placeholders above with the exact integers from today's boot log. One-line extraction:
+>
+> ```bash
+> grep "spawning 200-level depth connection" /path/to/tickvault.log | tail -4
+> ```
+>
+> These are the SecurityIds that Dhan's server is actively TCP-resetting at the timestamps in the timeline table further down.
+
+The ATM strike is re-derived at boot from the live option chain API (`POST /v2/optionchain`) using the current NIFTY and BANKNIFTY spot LTP, and it is rebalanced every 60 seconds on spot drift — so the `SecurityId` is guaranteed to be at-the-money for the current-week expiry at the moment of subscription, exactly as you instructed on April 10.
 
 ---
 
@@ -95,16 +106,16 @@ Both NIFTY and BANKNIFTY ATM CE/PE are failing repeatedly. Attempt counters are 
 
 #### Per-instrument reset timeline (2026-04-15, IST)
 
-| # | Timestamp (IST) | Instrument (Connection Label) | Underlying | Option Type | Strike | Attempt # | URL | Error |
-|---|---|---|---|---|---|---|---|---|
-| 1 | `09:39:20.125754` | `depth-200lvl-BANKNIFTY-ATM-CE` | BANKNIFTY | CE | ATM (current-week, live-derived) | 4 | `wss://full-depth-api.dhan.co/twohundreddepth` | `Protocol(ResetWithoutClosingHandshake)` |
-| 2 | `09:39:20.129789` | `depth-200lvl-NIFTY-ATM-PE`      | NIFTY     | PE | ATM (current-week, live-derived) | 4 | `wss://full-depth-api.dhan.co/twohundreddepth` | `Protocol(ResetWithoutClosingHandshake)` |
-| 3 | `09:39:20.129800` | `depth-200lvl-BANKNIFTY-ATM-PE` | BANKNIFTY | PE | ATM (current-week, live-derived) | 4 | `wss://full-depth-api.dhan.co/twohundreddepth` | `Protocol(ResetWithoutClosingHandshake)` |
-| 4 | `09:39:20.129814` | `depth-200lvl-NIFTY-ATM-CE`      | NIFTY     | CE | ATM (current-week, live-derived) | 4 | `wss://full-depth-api.dhan.co/twohundreddepth` | `Protocol(ResetWithoutClosingHandshake)` |
-| 5 | `09:40:21.455422` | `depth-200lvl-BANKNIFTY-ATM-CE` | BANKNIFTY | CE | ATM (current-week, live-derived) | 6 | `wss://full-depth-api.dhan.co/twohundreddepth` | `Protocol(ResetWithoutClosingHandshake)` |
-| 6 | `09:40:21.457279` | `depth-200lvl-NIFTY-ATM-CE`      | NIFTY     | CE | ATM (current-week, live-derived) | 6 | `wss://full-depth-api.dhan.co/twohundreddepth` | `Protocol(ResetWithoutClosingHandshake)` |
-| 7 | `09:40:21.457318` | `depth-200lvl-BANKNIFTY-ATM-PE` | BANKNIFTY | PE | ATM (current-week, live-derived) | 6 | `wss://full-depth-api.dhan.co/twohundreddepth` | `Protocol(ResetWithoutClosingHandshake)` |
-| 8 | `09:40:21.459613` | `depth-200lvl-NIFTY-ATM-PE`      | NIFTY     | PE | ATM (current-week, live-derived) | 6 | `wss://full-depth-api.dhan.co/twohundreddepth` | `Protocol(ResetWithoutClosingHandshake)` |
+| # | Timestamp (IST) | Instrument (Connection Label) | Underlying | Option | **SecurityId** | Segment | Attempt # | URL | Error |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | `09:39:20.125754` | `depth-200lvl-BANKNIFTY-ATM-CE` | BANKNIFTY | CE | **`<BANKNIFTY_ATM_CE_SID>`** | `NSE_FNO` | 4 | `wss://full-depth-api.dhan.co/twohundreddepth` | `Protocol(ResetWithoutClosingHandshake)` |
+| 2 | `09:39:20.129789` | `depth-200lvl-NIFTY-ATM-PE`     | NIFTY     | PE | **`<NIFTY_ATM_PE_SID>`**     | `NSE_FNO` | 4 | `wss://full-depth-api.dhan.co/twohundreddepth` | `Protocol(ResetWithoutClosingHandshake)` |
+| 3 | `09:39:20.129800` | `depth-200lvl-BANKNIFTY-ATM-PE` | BANKNIFTY | PE | **`<BANKNIFTY_ATM_PE_SID>`** | `NSE_FNO` | 4 | `wss://full-depth-api.dhan.co/twohundreddepth` | `Protocol(ResetWithoutClosingHandshake)` |
+| 4 | `09:39:20.129814` | `depth-200lvl-NIFTY-ATM-CE`     | NIFTY     | CE | **`<NIFTY_ATM_CE_SID>`**     | `NSE_FNO` | 4 | `wss://full-depth-api.dhan.co/twohundreddepth` | `Protocol(ResetWithoutClosingHandshake)` |
+| 5 | `09:40:21.455422` | `depth-200lvl-BANKNIFTY-ATM-CE` | BANKNIFTY | CE | **`<BANKNIFTY_ATM_CE_SID>`** | `NSE_FNO` | 6 | `wss://full-depth-api.dhan.co/twohundreddepth` | `Protocol(ResetWithoutClosingHandshake)` |
+| 6 | `09:40:21.457279` | `depth-200lvl-NIFTY-ATM-CE`     | NIFTY     | CE | **`<NIFTY_ATM_CE_SID>`**     | `NSE_FNO` | 6 | `wss://full-depth-api.dhan.co/twohundreddepth` | `Protocol(ResetWithoutClosingHandshake)` |
+| 7 | `09:40:21.457318` | `depth-200lvl-BANKNIFTY-ATM-PE` | BANKNIFTY | PE | **`<BANKNIFTY_ATM_PE_SID>`** | `NSE_FNO` | 6 | `wss://full-depth-api.dhan.co/twohundreddepth` | `Protocol(ResetWithoutClosingHandshake)` |
+| 8 | `09:40:21.459613` | `depth-200lvl-NIFTY-ATM-PE`     | NIFTY     | PE | **`<NIFTY_ATM_PE_SID>`**     | `NSE_FNO` | 6 | `wss://full-depth-api.dhan.co/twohundreddepth` | `Protocol(ResetWithoutClosingHandshake)` |
 
 **Pattern (very consistent):**
 - All 4 ATM contracts fail in a tight **~4 ms window**, twice in a row (09:39:20 and 09:40:21 IST).
@@ -215,10 +226,10 @@ UCC: NWXF17021Q
 ### Appendix B — Exact Subscription Frames On Wire (from our serializer)
 
 ```json
-{"RequestCode":23,"ExchangeSegment":"NSE_FNO","SecurityId":"<NIFTY_ATM_CE_current_week>"}
-{"RequestCode":23,"ExchangeSegment":"NSE_FNO","SecurityId":"<NIFTY_ATM_PE_current_week>"}
-{"RequestCode":23,"ExchangeSegment":"NSE_FNO","SecurityId":"<BANKNIFTY_ATM_CE_current_week>"}
-{"RequestCode":23,"ExchangeSegment":"NSE_FNO","SecurityId":"<BANKNIFTY_ATM_PE_current_week>"}
+{"RequestCode":23,"ExchangeSegment":"NSE_FNO","SecurityId":"<NIFTY_ATM_CE_SID>"}
+{"RequestCode":23,"ExchangeSegment":"NSE_FNO","SecurityId":"<NIFTY_ATM_PE_SID>"}
+{"RequestCode":23,"ExchangeSegment":"NSE_FNO","SecurityId":"<BANKNIFTY_ATM_CE_SID>"}
+{"RequestCode":23,"ExchangeSegment":"NSE_FNO","SecurityId":"<BANKNIFTY_ATM_PE_SID>"}
 ```
 
-Each frame is sent on its own TCP/TLS connection (1 instrument per connection, as per your spec). The SecurityIds are re-derived from the live option chain every boot and every 60 seconds. On request, we can share the exact 4 SecurityIds used at the 09:39 IST reset window from today's run.
+Each frame is sent on its own TCP/TLS connection (1 instrument per connection, as per your spec). The placeholders above are filled in with the live ATM SecurityIds at the top of this email (under "Precise Request Being Sent") — those are the **exact 4 numeric SecurityIds** your server is TCP-resetting in the timestamps shown in the timeline table.
