@@ -194,14 +194,19 @@ impl CandlePersistenceWriter {
     /// # Errors
     /// Returns error if the HTTP ILP connection cannot be established (invalid
     /// host, DNS failure, TLS handshake failure, auth failure, etc.).
-    // TEST-EXEMPT: thin 5-line wrapper over the fully-tested pure helper
-    // `build_historical_ilp_conf_string` (7 unit tests cover every conf-string
-    // invariant). The only non-helper line is `Sender::from_conf(conf)` which
-    // belongs to questdb-rs. A live-server smoke test is not feasible from a
-    // unit test because questdb-rs HTTP `from_conf` validates the endpoint
-    // against the real QuestDB `/ping` handshake, which a dumb TCP/HTTP mock
-    // cannot satisfy. Integration coverage lives in the prod code path
-    // (`spawn_historical_candle_fetch` in crates/app/src/main.rs).
+    ///
+    /// # Testing
+    /// Thin wrapper over the pure helper `build_historical_ilp_conf_string`,
+    /// which is covered by 7 unit tests (http-not-tcp, docker defaults, custom
+    /// port, auto_flush=off, retry_timeout=30000, terminator, distinct-from-tcp).
+    /// The only non-helper line is `Sender::from_conf(conf)` which belongs to
+    /// questdb-rs. A live-server smoke test is not feasible from a unit test
+    /// because questdb-rs HTTP `from_conf` validates the endpoint against the
+    /// real QuestDB `/ping` handshake, which an in-process mock cannot satisfy
+    /// (verified empirically: the naive mock test panicked on `from_conf`).
+    /// Integration coverage lives in `spawn_historical_candle_fetch` in
+    /// `crates/app/src/main.rs`, exercised by the real backfill workload.
+    // TEST-EXEMPT: thin wrapper — see `# Testing` doc above for full rationale.
     pub fn new_http(config: &QuestDbConfig) -> Result<Self> {
         let conf_string = build_historical_ilp_conf_string(&config.host, config.http_port);
         let sender = Sender::from_conf(&conf_string)
