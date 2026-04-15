@@ -144,6 +144,24 @@ pub async fn run_twenty_depth_connection(
                 reconnect_counter.store(0, Ordering::Relaxed);
             }
             Err(err) => {
+                // STAGE-C.5: classify Dhan disconnect errors so we do
+                // not retry into a ban window (805) or loop on a
+                // permanently-rejected subscription (808/809/810/etc).
+                // 807 (access token expired) IS reconnectable — the
+                // outer run() loop will re-read the token_handle on
+                // the next connect attempt, which picks up whatever
+                // the token renewal task has swapped in.
+                if let WebSocketError::DhanDisconnect { code } = &err
+                    && !code.is_reconnectable()
+                {
+                    error!(
+                        underlying = %underlying_label,
+                        disconnect_code = %code,
+                        "{prefix}: non-reconnectable Dhan disconnect — halting reconnect loop"
+                    );
+                    return Err(WebSocketError::NonReconnectableDisconnect { code: *code });
+                }
+
                 let attempt = reconnect_counter.fetch_add(1, Ordering::Relaxed);
                 m_reconnections.increment(1);
 
@@ -314,6 +332,32 @@ async fn connect_and_run_depth(
         }
         match frame_result {
             Some(Ok(Message::Binary(data))) => {
+                // STAGE-C.5: Dhan depth-WS disconnect packet is 14 bytes:
+                // 12-byte header (bytes 0-1 = message length LE, byte 2 =
+                // feed code, byte 3 = segment, bytes 4-7 = security_id LE,
+                // bytes 8-11 = sequence/row_count LE) + u16 LE reason code
+                // at bytes 12-13. See
+                // `docs/dhan-ref/04-full-market-depth-websocket.md:168`.
+                //
+                // Feed code 50 signals a disconnect frame. Intercept here
+                // so the outer reconnect loop can classify the reason via
+                // `DisconnectCode::from_u16()` and apply the same
+                // is_reconnectable / requires_token_refresh logic as the
+                // Live Market Feed connection.
+                //
+                // O(1) — one byte check + one u16 LE load. Happy path
+                // (feed code != 50) is a single byte compare + early fall
+                // through.
+                let maybe_disconnect_code: Option<crate::websocket::types::DisconnectCode> =
+                    if data.len() >= 14
+                        && data[2] == tickvault_common::constants::RESPONSE_CODE_DISCONNECT
+                    {
+                        let raw = u16::from_le_bytes([data[12], data[13]]);
+                        Some(crate::websocket::types::DisconnectCode::from_u16(raw))
+                    } else {
+                        None
+                    };
+
                 // Fire connected signal + set active metric on FIRST data frame only.
                 // This guarantees Telegram alert fires only when data actually flows.
                 if !first_frame_received {
@@ -363,6 +407,28 @@ async fn connect_and_run_depth(
                         warn!("{prefix}: receiver dropped — stopping");
                         break Ok(());
                     }
+                }
+
+                // STAGE-C.5: surface disconnect AFTER WAL + forward so
+                // observability still sees the frame. Return Err so the
+                // outer reconnect loop either backs off, halts on
+                // non-reconnectable, or waits for token refresh on 807.
+                if let Some(code) = maybe_disconnect_code {
+                    warn!(
+                        underlying = %underlying_label,
+                        disconnect_code = %code,
+                        reconnectable = code.is_reconnectable(),
+                        requires_token_refresh = code.requires_token_refresh(),
+                        "20-depth: Dhan binary disconnect packet — surfacing to reconnect loop"
+                    );
+                    metrics::counter!(
+                        "tv_ws_dhan_disconnect_total",
+                        "code" => format!("{code}"), // O(1) EXEMPT: cold path, once per disconnect
+                        "ws_type" => "depth_20"
+                    )
+                    .increment(1);
+                    m_active.set(0.0);
+                    break Err(WebSocketError::DhanDisconnect { code });
                 }
             }
             Some(Ok(Message::Ping(data))) => {
@@ -486,6 +552,19 @@ pub async fn run_two_hundred_depth_connection(
                 reconnect_counter.store(0, Ordering::Relaxed);
             }
             Err(err) => {
+                // STAGE-C.5: classify Dhan disconnect errors.
+                if let WebSocketError::DhanDisconnect { code } = &err
+                    && !code.is_reconnectable()
+                {
+                    error!(
+                        security_id,
+                        label = %label,
+                        disconnect_code = %code,
+                        "{prefix}: non-reconnectable Dhan disconnect — halting reconnect loop"
+                    );
+                    return Err(WebSocketError::NonReconnectableDisconnect { code: *code });
+                }
+
                 let attempt = reconnect_counter.fetch_add(1, Ordering::Relaxed);
                 m_reconnections.increment(1);
 
@@ -645,6 +724,20 @@ async fn connect_and_run_200_depth(
         }
         match frame_result {
             Some(Ok(Message::Binary(data))) => {
+                // STAGE-C.5: Depth-200 disconnect packet parse.
+                // Same 14-byte layout as Depth-20 (12-byte header +
+                // u16 LE reason code at bytes 12-13). Feed code 50
+                // at byte 2 signals a disconnect frame.
+                let maybe_disconnect_code: Option<crate::websocket::types::DisconnectCode> =
+                    if data.len() >= 14
+                        && data[2] == tickvault_common::constants::RESPONSE_CODE_DISCONNECT
+                    {
+                        let raw = u16::from_le_bytes([data[12], data[13]]);
+                        Some(crate::websocket::types::DisconnectCode::from_u16(raw))
+                    } else {
+                        None
+                    };
+
                 if !first_frame_received {
                     first_frame_received = true;
                     m_active.set(1.0);
@@ -690,6 +783,26 @@ async fn connect_and_run_200_depth(
                         m_active.set(0.0);
                         break Ok(());
                     }
+                }
+
+                // STAGE-C.5: surface disconnect after forward.
+                if let Some(code) = maybe_disconnect_code {
+                    warn!(
+                        security_id,
+                        label = %label,
+                        disconnect_code = %code,
+                        reconnectable = code.is_reconnectable(),
+                        requires_token_refresh = code.requires_token_refresh(),
+                        "200-depth: Dhan binary disconnect packet — surfacing to reconnect loop"
+                    );
+                    metrics::counter!(
+                        "tv_ws_dhan_disconnect_total",
+                        "code" => format!("{code}"), // O(1) EXEMPT: cold path, once per disconnect
+                        "ws_type" => "depth_200"
+                    )
+                    .increment(1);
+                    m_active.set(0.0);
+                    break Err(WebSocketError::DhanDisconnect { code });
                 }
             }
             Some(Ok(Message::Ping(data))) => {

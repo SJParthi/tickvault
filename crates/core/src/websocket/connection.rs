@@ -33,7 +33,8 @@ use crate::websocket::activity_watchdog::{
 use crate::websocket::subscription_builder::build_subscription_messages;
 use crate::websocket::tls::build_websocket_tls_connector;
 use crate::websocket::types::{
-    ConnectionHealth, ConnectionId, ConnectionState, InstrumentSubscription, WebSocketError,
+    ConnectionHealth, ConnectionId, ConnectionState, DisconnectCode, InstrumentSubscription,
+    WebSocketError,
 };
 
 // ---------------------------------------------------------------------------
@@ -667,6 +668,48 @@ impl WebSocketConnection {
 
             match frame_result {
                 Some(Ok(Message::Binary(data))) => {
+                    // STAGE-C.5: early disconnect-code detection.
+                    //
+                    // Dhan signals API-level errors via a binary
+                    // disconnect packet with response_code == 50 and
+                    // a u16 LE reason code at bytes 8-9. See
+                    // `docs/dhan-ref/08-annexure-enums.md` Section 11.
+                    //
+                    // The tick-processor eventually parses this into
+                    // `ParsedFrame::Disconnect(code)` via the
+                    // dispatcher, but by then the read loop has
+                    // already continued — it will not know to stop
+                    // reconnecting on a non-reconnectable code
+                    // (804/805/806/808/809/810/811/812/813/814) or to
+                    // trigger token refresh on 807.
+                    //
+                    // Intercept here so the WS layer can raise
+                    // `DhanDisconnect { code }` BEFORE the bytes flow
+                    // downstream, letting the outer `run()` loop take
+                    // the right reconnect / halt / refresh decision
+                    // as per the existing `is_reconnectable` +
+                    // `requires_token_refresh` logic.
+                    //
+                    // We still WAL-append and forward the bytes so
+                    // the existing parser path sees the same
+                    // disconnect (needed for metrics + observability).
+                    // The Err return happens AFTER the forward so no
+                    // frame is lost on the way out.
+                    //
+                    // O(1) — one byte check + one u16 LE load on a
+                    // 10-byte packet. No allocation, no parsing on
+                    // the happy path (early-return for non-50 codes).
+                    let maybe_disconnect_code: Option<DisconnectCode> = if !data.is_empty()
+                        && data[0] == tickvault_common::constants::RESPONSE_CODE_DISCONNECT
+                        && data.len() >= tickvault_common::constants::DISCONNECT_PACKET_SIZE
+                    {
+                        // Bytes 8-9 per docs/dhan-ref/03-live-market-feed-websocket.md:258
+                        let raw_code = u16::from_le_bytes([data[8], data[9]]);
+                        Some(DisconnectCode::from_u16(raw_code))
+                    } else {
+                        None
+                    };
+
                     // STAGE-C (P1.2+P1.3): durable WAL first, live forward second.
                     //
                     // (1) If a WAL spill is attached, append the raw frame to
@@ -729,6 +772,34 @@ impl WebSocketConnection {
                             );
                             return Ok(());
                         }
+                    }
+
+                    // STAGE-C.5: if the packet was a disconnect, surface
+                    // the classified error now. The outer `run()` loop:
+                    //   - non-reconnectable codes → return NonReconnectableDisconnect
+                    //     (stops retrying — no reconnect storm on 805/808/etc.)
+                    //   - 807 AccessTokenExpired → wait_for_valid_token()
+                    //     (refresh via the token manager before reconnecting)
+                    //   - 800 + Unknown → exponential backoff reconnect
+                    //
+                    // We return AFTER the WAL append + live forward so
+                    // the tick processor still sees the disconnect for
+                    // metrics + observability.
+                    if let Some(code) = maybe_disconnect_code {
+                        warn!(
+                            connection_id = self.connection_id,
+                            disconnect_code = %code,
+                            reconnectable = code.is_reconnectable(),
+                            requires_token_refresh = code.requires_token_refresh(),
+                            "Dhan binary disconnect packet received — surfacing to run() loop"
+                        );
+                        metrics::counter!(
+                            "tv_ws_dhan_disconnect_total",
+                            "code" => format!("{code}"), // O(1) EXEMPT: cold path, fires once per disconnect
+                            "ws_type" => "live_feed"
+                        )
+                        .increment(1);
+                        return Err(WebSocketError::DhanDisconnect { code });
                     }
                 }
                 Some(Ok(Message::Ping(data))) => {
