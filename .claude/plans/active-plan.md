@@ -1,9 +1,33 @@
 # Implementation Plan: WebSocket + QuestDB Zero-Loss, Zero-Stall, Zero-Artificial-Disconnect
 
-**Status:** DRAFT
+**Status:** APPROVED
 **Date:** 2026-04-15
-**Approved by:** pending
+**Approved by:** Parthiban (2026-04-15, via session chat)
 **Owner:** Claude Code (builder), Parthiban (architect)
+
+## Answers to open questions (locked in on approval)
+
+| # | Question | Answer |
+|---|---|---|
+| 1 | WAL storage location | **Local disk** (`./data/wal/` on Mac dev, container bind mount). EBS only when we migrate to AWS c7i.xlarge in prod — handled via `WsFrameWalConfig` struct (path is config-driven, no code change for the move). |
+| 2 | WAL retention | **Delete WAL segment as soon as QuestDB confirms every record inside it has been durably persisted** (ack comes from the consumer task after dedup-safe insert). This keeps disk usage bounded under 100GB EBS budget. Optional 24h retention flag added to config, default off. |
+| 3 | Watchdog threshold | **50s** for live-feed / depth-20 / depth-200 (40s server timeout + 10s safety buffer). **660s** for order-update (600s idle tolerance + 60s safety — matches existing `ORDER_UPDATE_OFF_HOURS_READ_TIMEOUT_SECS` but now as a sidecar check, not a read deadline). |
+| 4 | Gap backfill scope on reconnect | **Only instruments that had at least one tick in the previous 5 minutes** (active tradables). Full universe backfill is too expensive against Dhan's Data API rate limits. Configurable via `reconnect_backfill_active_window_secs` default 300. |
+| 5 | `tv_ws_frame_spill_drop_critical` contract | **HALT the process** on first increment, with CRITICAL Telegram alert + stack trace. Zero tick loss is the bar — we do not "graceful degrade" past this point. The counter existing is a safety floor; it must always be zero in healthy ops. |
+
+## Implementation staging (each stage = own bisectable commit, pushed + verified before next)
+
+To keep risk low on a ~9-file-new / 12-file-modified plan, implementation is split into 5 ordered stages:
+
+| Stage | Scope | Risk | Est size |
+|---|---|---|---|
+| **A** | P4 (QuestDB liveness fix) + P5.1/P5.2 (200-depth logging) — quick wins, zero architectural risk | LOW | 1-2 commits, ~300 LoC |
+| **B** | P1.1 (delete client-side read deadlines on all 4 WS types) + P1.3 (delete dead constants) + P5.3/P5.4/P5.5 (logging for other WS types) — mechanical edit, no new infra | MED | 2-3 commits, ~600 LoC |
+| **C** | P3 (WAL infra) + P1.2 (WS→WAL decoupling, all 4 types) + P2 (watchdog) — new architecture | HIGH | 5-6 commits, ~3,500 LoC |
+| **D** | P6 (enforcement) + P7 (chaos/loom/dhat/criterion test battery) — prove the guarantees | MED | 3-4 commits, ~4,500 LoC |
+| **E** | P8 (gap detection + historical backfill) — physical-limit mitigation | LOW | 1-2 commits, ~400 LoC |
+
+After each stage I push, run `plan-verify.sh`, report status, and wait for any course-correction from you before starting the next stage.
 
 ---
 

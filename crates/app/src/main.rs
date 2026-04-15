@@ -2717,12 +2717,24 @@ async fn main() -> Result<()> {
                         ),
                     });
                 }
-                // C3: QuestDB liveness ping (SELECT 1) — alert on failure.
-                if !infra::check_questdb_liveness(&questdb_config).await {
-                    health_notifier.notify(NotificationEvent::QuestDbDisconnected {
-                        writer: "liveness-check".to_string(),
-                        buffer_size: 0,
-                    });
+                // C3: QuestDB liveness ping (SELECT 1) — alert only after N
+                // consecutive failures so a single slow query under ingestion
+                // load does not page. Recovery resets the failure counter.
+                let liveness_outcome = infra::check_questdb_liveness(&questdb_config).await;
+                if !liveness_outcome.is_success() {
+                    let failures = infra::questdb_liveness_failures();
+                    if failures >= infra::QUESTDB_LIVENESS_FAILURE_THRESHOLD {
+                        health_notifier.notify(NotificationEvent::QuestDbDisconnected {
+                            writer: "liveness-check".to_string(),
+                            buffer_size: failures as usize,
+                        });
+                    } else {
+                        tracing::warn!(
+                            failures,
+                            threshold = infra::QUESTDB_LIVENESS_FAILURE_THRESHOLD,
+                            "QuestDB liveness check failed — below alert threshold"
+                        );
+                    }
                 }
                 // C4: Auto-cleanup spill files older than 7 days.
                 infra::cleanup_old_spill_files();

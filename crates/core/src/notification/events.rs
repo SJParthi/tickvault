@@ -625,10 +625,16 @@ impl NotificationEvent {
                 writer,
                 buffer_size,
             } => {
+                // NOTE: `buffer_size` carries the consecutive-failure count
+                // for the liveness check path (not a literal buffered record
+                // count). The tick-writer path passes its real buffer depth.
+                // Either way, the number reflects "how bad is it" factually —
+                // no hardcoded zero, no fake auto-reconnect cadence.
                 format!(
-                    "<b>CRITICAL: QuestDB {writer} DISCONNECTED</b>\n\
-                     Buffering data in ring buffer ({buffer_size} records). \
-                     Auto-reconnect every 30s."
+                    "<b>CRITICAL: QuestDB {writer} DEGRADED</b>\n\
+                     Signal strength: {buffer_size}.\n\
+                     Ticks remain durable via WAL — no data loss.\n\
+                     Investigate QuestDB container + disk + CPU."
                 )
             }
             Self::QuestDbReconnected {
