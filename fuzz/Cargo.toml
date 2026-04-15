@@ -13,6 +13,7 @@ libfuzzer-sys = "0.4.9"
 toml = "1.0.4"
 tickvault-core = { path = "../crates/core" }
 tickvault-common = { path = "../crates/common" }
+tickvault-storage = { path = "../crates/storage" }
 
 [[bin]]
 name = "tick_parser"
@@ -22,4 +23,9 @@ doc = false
 [[bin]]
 name = "config_parser"
 path = "fuzz_targets/config_parser.rs"
+doc = false
+
+[[bin]]
+name = "ws_frame_wal_replay"
+path = "fuzz_targets/ws_frame_wal_replay.rs"
 doc = false
