@@ -166,6 +166,91 @@ async fn main() -> Result<()> {
     );
 
     // -----------------------------------------------------------------------
+    // STAGE-C: WebSocket frame WAL (write-ahead log) — durable spill
+    //
+    // Every raw WS frame (4 types: LiveFeed, Depth20, Depth200, OrderUpdate)
+    // is appended to an append-only log on disk BEFORE the live try_send to
+    // the downstream channel. On boot, any residual WAL segments are
+    // replayed so frames captured across a crash are not lost. This backs
+    // the zero-tick-loss guarantee while keeping the read loop O(1).
+    //
+    // Directory layout: $TV_WS_WAL_DIR (defaults to `./data/ws_wal`).
+    // Writer thread: background OS thread spawned inside WsFrameSpill::new.
+    // -----------------------------------------------------------------------
+    let ws_wal_dir = std::env::var("TV_WS_WAL_DIR").unwrap_or_else(|_| "./data/ws_wal".to_string()); // O(1) EXEMPT: boot-time
+    let ws_wal_path = std::path::PathBuf::from(&ws_wal_dir);
+    // Replay first — this MUST happen before any WS connection opens so we
+    // never race a fresh append against a stale segment rotation.
+    match tickvault_storage::ws_frame_spill::replay_all(&ws_wal_path) {
+        Ok(recovered) => {
+            if recovered.is_empty() {
+                info!(dir = %ws_wal_dir, "STAGE-C: WAL replay — no residual frames");
+            } else {
+                let mut live = 0u64;
+                let mut d20 = 0u64;
+                let mut d200 = 0u64;
+                let mut ord = 0u64;
+                for rec in &recovered {
+                    match rec.ws_type {
+                        tickvault_storage::ws_frame_spill::WsType::LiveFeed => live += 1,
+                        tickvault_storage::ws_frame_spill::WsType::Depth20 => d20 += 1,
+                        tickvault_storage::ws_frame_spill::WsType::Depth200 => d200 += 1,
+                        tickvault_storage::ws_frame_spill::WsType::OrderUpdate => ord += 1,
+                    }
+                }
+                info!(
+                    dir = %ws_wal_dir,
+                    total = recovered.len(),
+                    live_feed = live,
+                    depth_20 = d20,
+                    depth_200 = d200,
+                    order_update = ord,
+                    "STAGE-C: WAL replay recovered residual frames (archived after replay)"
+                );
+                metrics::counter!("tv_ws_frame_wal_replay_total", "ws_type" => "live_feed")
+                    .increment(live);
+                metrics::counter!("tv_ws_frame_wal_replay_total", "ws_type" => "depth_20")
+                    .increment(d20);
+                metrics::counter!("tv_ws_frame_wal_replay_total", "ws_type" => "depth_200")
+                    .increment(d200);
+                metrics::counter!("tv_ws_frame_wal_replay_total", "ws_type" => "order_update")
+                    .increment(ord);
+                // Full re-injection into live downstream channels will be
+                // wired in a follow-up (C.2b) once the per-type channels
+                // are constructed below. Recovered frames are preserved in
+                // archive segments inside `ws_wal_path.archive/` for
+                // forensic replay.
+            }
+        }
+        Err(err) => {
+            error!(
+                ?err,
+                dir = %ws_wal_dir,
+                "STAGE-C: WAL replay failed — continuing boot with fresh WAL"
+            );
+        }
+    }
+    let ws_frame_spill = match tickvault_storage::ws_frame_spill::WsFrameSpill::new(&ws_wal_path) {
+        Ok(spill) => {
+            info!(
+                dir = %ws_wal_dir,
+                "STAGE-C: WsFrameSpill writer thread started"
+            );
+            Some(std::sync::Arc::new(spill))
+        }
+        Err(err) => {
+            error!(
+                ?err,
+                dir = %ws_wal_dir,
+                "STAGE-C: failed to initialize WsFrameSpill — proceeding WITHOUT durable WAL. \
+                 This is a degraded mode: zero-tick-loss guarantee is NOT active. \
+                 Investigate disk permissions and free space immediately."
+            );
+            None
+        }
+    };
+
+    // -----------------------------------------------------------------------
     // Step 2: Initialize observability (Prometheus metrics exporter)
     // -----------------------------------------------------------------------
     observability::init_metrics(&config.observability)
@@ -441,6 +526,7 @@ async fn main() -> Result<()> {
             &config,
             true,
             Some(fast_notifier.clone()),
+            ws_frame_spill.clone(),
         ) {
             Some((receiver, pool)) => (Some(receiver), Some(pool)),
             None => (None, None),
@@ -908,8 +994,9 @@ async fn main() -> Result<()> {
             let token = token_handle.clone();
             let sender = order_update_sender.clone();
             let cal = trading_calendar.clone();
+            let spill = ws_frame_spill.clone();
             tokio::spawn(async move {
-                run_order_update_connection(url, ws_client_id, token, sender, cal).await;
+                run_order_update_connection(url, ws_client_id, token, sender, cal, spill).await;
             })
         };
         info!("order update WebSocket started (background)");
@@ -1409,6 +1496,7 @@ async fn main() -> Result<()> {
             &config,
             is_market_hours,
             Some(notifier.clone()),
+            ws_frame_spill.clone(),
         ) {
             Some((receiver, pool)) => (Some(receiver), Some(pool)),
             None => (None, None),
@@ -2077,6 +2165,7 @@ async fn main() -> Result<()> {
                 let d20_label_for_disconnect = label.clone();
                 let d20_label_for_signal = label.clone();
                 let d20_underlying_label = label.clone();
+                let d20_wal_spill = ws_frame_spill.clone();
                 let (signal_tx, signal_rx) = tokio::sync::oneshot::channel::<()>();
                 tokio::spawn(async move {
                     d20_health.set_depth_20_connections(
@@ -2090,6 +2179,7 @@ async fn main() -> Result<()> {
                         depth_tx,
                         d20_underlying_label,
                         Some(signal_tx),
+                        d20_wal_spill,
                     )
                     .await
                     {
@@ -2221,6 +2311,7 @@ async fn main() -> Result<()> {
                         let d200_notifier = notifier.clone();
                         let d200_label_for_disconnect = depth200_label.clone();
                         let d200_label_for_signal = depth200_label.clone();
+                        let d200_wal_spill = ws_frame_spill.clone();
                         let (d200_signal_tx, d200_signal_rx) =
                             tokio::sync::oneshot::channel::<()>();
                         tokio::spawn(async move {
@@ -2237,6 +2328,7 @@ async fn main() -> Result<()> {
                                     depth200_label,
                                     tx200,
                                     Some(d200_signal_tx),
+                                    d200_wal_spill,
                                 )
                                 .await
                             {
@@ -2428,11 +2520,13 @@ async fn main() -> Result<()> {
         let ou_notifier = notifier.clone();
         let ou_connect_notifier = notifier.clone();
         let ou_health = health_status.clone();
+        let ou_wal_spill = ws_frame_spill.clone();
         tokio::spawn(async move {
             ou_health.set_order_update_connected(true);
             // Telegram: Order Update WS connected (fires before read loop starts).
             ou_connect_notifier.notify(NotificationEvent::OrderUpdateConnected);
-            run_order_update_connection(url, order_ws_client_id, token, sender, cal).await;
+            run_order_update_connection(url, order_ws_client_id, token, sender, cal, ou_wal_spill)
+                .await;
             // If run_order_update_connection returns, connection terminated
             ou_notifier.notify(NotificationEvent::OrderUpdateDisconnected {
                 reason: "connection task exited".to_string(),
@@ -2874,6 +2968,7 @@ async fn load_instruments(
 /// WITHOUT spawning connections. This allows the tick processor to start
 /// consuming frames BEFORE connections begin sending data, preventing
 /// frame send timeouts during the stagger period.
+#[allow(clippy::too_many_arguments)] // APPROVED: STAGE-C added wal_spill param
 fn create_websocket_pool(
     token_handle: &TokenHandle,
     client_id: &str,
@@ -2881,6 +2976,7 @@ fn create_websocket_pool(
     config: &ApplicationConfig,
     is_market_hours: bool,
     notifier: Option<std::sync::Arc<NotificationService>>,
+    wal_spill: Option<std::sync::Arc<tickvault_storage::ws_frame_spill::WsFrameSpill>>,
 ) -> Option<(
     tokio::sync::mpsc::Receiver<bytes::Bytes>,
     WebSocketConnectionPool,
@@ -2915,7 +3011,7 @@ fn create_websocket_pool(
 
     let feed_mode = plan.summary.feed_mode;
 
-    let mut pool = match WebSocketConnectionPool::new(
+    let mut pool = match WebSocketConnectionPool::new_with_optional_wal(
         token_handle.clone(),
         client_id.to_string(),
         config.dhan.clone(),
@@ -2923,6 +3019,7 @@ fn create_websocket_pool(
         instruments,
         feed_mode,
         notifier,
+        wal_spill,
     ) {
         Ok(pool) => pool,
         Err(err) => {

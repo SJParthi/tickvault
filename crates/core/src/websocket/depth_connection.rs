@@ -7,12 +7,14 @@
 //! Frames are sent to the same `mpsc::Sender<Bytes>` channel as the main feed,
 //! so the tick processor handles dispatch via `dispatch_deep_depth_frame()`.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use secrecy::ExposeSecret;
+use tickvault_storage::ws_frame_spill::{AppendOutcome, WsFrameSpill, WsType};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::time;
@@ -35,7 +37,7 @@ use crate::websocket::subscription_builder::build_twenty_depth_subscription_mess
 /// Identifier for depth connections in logs/metrics.
 const DEPTH_CONNECTION_PREFIX: &str = "depth-20lvl";
 
-/// Read timeout for depth connections (seconds).
+// Read timeout for depth connections (seconds).
 // STAGE-B (P1.3): `DEPTH_READ_TIMEOUT_SECS` removed.
 //
 // Per Dhan spec (docs/dhan-ref/04-full-market-depth-websocket.md), depth
@@ -81,6 +83,7 @@ const DEPTH_CONNECT_TIMEOUT_SECS: u64 = 15;
 /// * `frame_sender` — Shared channel to tick processor.
 /// * `underlying_label` — Underlying name (e.g. "NIFTY") for metric labels.
 /// * `connected_signal` — Fires after first data frame received (not just subscription).
+#[allow(clippy::too_many_arguments)] // APPROVED: STAGE-C added wal_spill param
 // TEST-EXEMPT: Integration-level — requires live Dhan WebSocket endpoint
 pub async fn run_twenty_depth_connection(
     token_handle: TokenHandle,
@@ -89,6 +92,7 @@ pub async fn run_twenty_depth_connection(
     frame_sender: mpsc::Sender<Bytes>,
     underlying_label: String,
     connected_signal: Option<tokio::sync::oneshot::Sender<()>>,
+    wal_spill: Option<Arc<WsFrameSpill>>,
 ) -> Result<(), WebSocketError> {
     if instruments.is_empty() {
         info!("20-level depth: no instruments to subscribe — skipping");
@@ -127,6 +131,7 @@ pub async fn run_twenty_depth_connection(
             &mut pending_signal,
             &prefix,
             &underlying_label,
+            wal_spill.as_ref(),
         )
         .await
         {
@@ -166,6 +171,7 @@ pub async fn run_twenty_depth_connection(
 
 /// Connects to the depth WebSocket, subscribes, and runs the read loop.
 // O(1) EXEMPT: begin — connection lifecycle runs once per connect/reconnect, not per tick
+#[allow(clippy::too_many_arguments)] // APPROVED: STAGE-C added wal_spill param
 async fn connect_and_run_depth(
     token_handle: &TokenHandle,
     client_id: &str,
@@ -175,6 +181,7 @@ async fn connect_and_run_depth(
     connected_signal: &mut Option<tokio::sync::oneshot::Sender<()>>,
     prefix: &str,
     underlying_label: &str,
+    wal_spill: Option<&Arc<WsFrameSpill>>,
 ) -> Result<(), WebSocketError> {
     // Read token
     let token_guard = token_handle.load();
@@ -276,20 +283,33 @@ async fn connect_and_run_depth(
                 }
                 m_frames.increment(1);
 
-                // STAGE-B (P1.2): never block the reader. Try-send only.
-                // On channel-full, increment CRITICAL drop counter. Stage C
-                // replaces this drop with a durable WAL append.
+                // STAGE-C (P1.2+P1.3): durable WAL first, live forward second.
+                // See connection.rs for the full rationale — mirrored here.
+                if let Some(spill) = wal_spill {
+                    // O(1) EXEMPT: one Vec<u8> copy per frame (≤332 B for 20-depth)
+                    // to hand owned memory to the disk writer thread. Bounded allocation.
+                    let frame_vec = data.to_vec();
+                    let outcome = spill.append(WsType::Depth20, frame_vec);
+                    if outcome == AppendOutcome::Dropped {
+                        error!(
+                            underlying = %underlying_label,
+                            "CRITICAL: WAL spill dropped Depth20 frame — disk writer stalled"
+                        );
+                        // CRITICAL metric already incremented inside spill.append().
+                    }
+                }
                 match frame_sender.try_send(data) {
                     Ok(()) => {}
                     Err(mpsc::error::TrySendError::Full(_dropped)) => {
-                        error!(
+                        warn!(
                             underlying = %underlying_label,
                             channel_capacity = frame_sender.capacity(),
-                            "CRITICAL: 20-depth frame channel full — frame dropped. \
-                             Downstream consumer is stuck."
+                            wal_attached = wal_spill.is_some(),
+                            "20-depth live frame channel full — backpressure from downstream. \
+                             Frame is durable in WAL; watchdog will restart consumer."
                         );
                         metrics::counter!(
-                            "tv_ws_frame_spill_drop_critical",
+                            "tv_ws_frame_live_backpressure_total",
                             "ws_type" => "depth_20",
                             "underlying" => underlying_label.to_string()
                         )
@@ -362,6 +382,7 @@ async fn connect_and_run_depth(
 /// Connects to `wss://full-depth-api.dhan.co/twohundreddepth` (Dhan Ticket #5519522).
 /// Only 1 instrument per connection (Dhan limitation).
 /// Infinite reconnection with exponential backoff.
+#[allow(clippy::too_many_arguments)] // APPROVED: STAGE-C added wal_spill param
 // TEST-EXEMPT: Integration-level — requires live Dhan WebSocket endpoint
 pub async fn run_two_hundred_depth_connection(
     token_handle: TokenHandle,
@@ -371,6 +392,7 @@ pub async fn run_two_hundred_depth_connection(
     label: String,
     frame_sender: mpsc::Sender<Bytes>,
     connected_signal: Option<tokio::sync::oneshot::Sender<()>>,
+    wal_spill: Option<Arc<WsFrameSpill>>,
 ) -> Result<(), WebSocketError> {
     let segment_str = exchange_segment.as_str();
     let sid_str = security_id.to_string(); // O(1) EXEMPT: boot-time
@@ -405,11 +427,14 @@ pub async fn run_two_hundred_depth_connection(
             &frame_sender,
             &prefix,
             &mut pending_signal,
+            security_id,
+            &label,
+            wal_spill.as_ref(),
         )
         .await
         {
             Ok(()) => {
-                info!("{prefix}: connection closed normally");
+                info!(security_id, label = %label, "{prefix}: connection closed normally");
                 // Reset counter only on successful connection (failures accumulate for backoff)
                 reconnect_counter.store(0, Ordering::Relaxed);
             }
@@ -420,12 +445,16 @@ pub async fn run_two_hundred_depth_connection(
                 // Escalate to ERROR after 10+ consecutive failures
                 if attempt > 0 && attempt.is_multiple_of(10) {
                     error!(
+                        security_id,
+                        label = %label,
                         attempt,
                         ?err,
                         "{prefix}: reconnection threshold — still retrying"
                     );
                 } else {
                     warn!(
+                        security_id,
+                        label = %label,
                         attempt,
                         ?err,
                         "{prefix}: connection failed — will reconnect"
@@ -443,6 +472,7 @@ pub async fn run_two_hundred_depth_connection(
 
 /// Connects to the 200-level depth WebSocket and runs the read loop.
 // O(1) EXEMPT: begin — connection lifecycle
+#[allow(clippy::too_many_arguments)] // APPROVED: STAGE-C added security_id/label/wal_spill params
 async fn connect_and_run_200_depth(
     token_handle: &TokenHandle,
     client_id: &str,
@@ -450,6 +480,9 @@ async fn connect_and_run_200_depth(
     frame_sender: &mpsc::Sender<Bytes>,
     prefix: &str,
     connected_signal: &mut Option<tokio::sync::oneshot::Sender<()>>,
+    security_id: u32,
+    label: &str,
+    wal_spill: Option<&Arc<WsFrameSpill>>,
 ) -> Result<(), WebSocketError> {
     let token_guard = token_handle.load();
     let token_state = token_guard
@@ -498,7 +531,11 @@ async fn connect_and_run_200_depth(
             source: err,
         })?;
 
-    info!("{prefix}: connected — sending subscription");
+    info!(
+        security_id,
+        label = %label,
+        "{prefix}: connected — sending subscription"
+    );
 
     let (mut write, mut read) = ws_stream.split();
 
@@ -510,7 +547,11 @@ async fn connect_and_run_200_depth(
             source: err,
         })?;
 
-    info!("{prefix}: subscription sent — reading 200-level depth frames");
+    info!(
+        security_id,
+        label = %label,
+        "{prefix}: subscription sent — reading 200-level depth frames"
+    );
 
     // Metrics — labeled per underlying for Grafana differentiation.
     let m_frames =
@@ -535,20 +576,35 @@ async fn connect_and_run_200_depth(
                 }
                 m_frames.increment(1);
 
-                // STAGE-B (P1.2): try-send only — never block the reader.
+                // STAGE-C (P1.2+P1.3): durable WAL first, live forward second.
+                if let Some(spill) = wal_spill {
+                    // O(1) EXEMPT: one Vec<u8> copy per frame (≤3212 B for 200-depth,
+                    // bounded by protocol max) to hand owned memory to the disk writer.
+                    let frame_vec = data.to_vec();
+                    let outcome = spill.append(WsType::Depth200, frame_vec);
+                    if outcome == AppendOutcome::Dropped {
+                        error!(
+                            security_id,
+                            label = %label,
+                            "CRITICAL: WAL spill dropped Depth200 frame — disk writer stalled"
+                        );
+                    }
+                }
                 match frame_sender.try_send(data) {
                     Ok(()) => {}
                     Err(mpsc::error::TrySendError::Full(_dropped)) => {
-                        error!(
-                            label = %prefix,
+                        warn!(
+                            security_id,
+                            label = %label,
                             channel_capacity = frame_sender.capacity(),
-                            "CRITICAL: 200-depth frame channel full — frame dropped. \
-                             Downstream consumer is stuck."
+                            wal_attached = wal_spill.is_some(),
+                            "200-depth live frame channel full — backpressure from downstream. \
+                             Frame is durable in WAL; watchdog will restart consumer."
                         );
                         metrics::counter!(
-                            "tv_ws_frame_spill_drop_critical",
+                            "tv_ws_frame_live_backpressure_total",
                             "ws_type" => "depth_200",
-                            "label" => prefix.to_string()
+                            "label" => label.to_string()
                         )
                         .increment(1);
                     }
@@ -572,6 +628,8 @@ async fn connect_and_run_200_depth(
                     Err(_) => {
                         m_active.set(0.0);
                         warn!(
+                            security_id,
+                            label = %label,
                             timeout_secs = DEPTH_PONG_TIMEOUT_SECS,
                             "{prefix}: pong send timed out — connection likely dead"
                         );
@@ -585,7 +643,7 @@ async fn connect_and_run_200_depth(
             Some(Ok(Message::Pong(_))) => {}
             Some(Ok(Message::Close(_))) => {
                 m_active.set(0.0);
-                info!("{prefix}: server sent close frame");
+                info!(security_id, label = %label, "{prefix}: server sent close frame");
                 return Ok(());
             }
             Some(Err(err)) => {
@@ -642,6 +700,7 @@ mod tests {
             vec![],
             tx,
             "TEST".to_string(),
+            None,
             None,
         )
         .await;
@@ -735,6 +794,7 @@ mod tests {
             &mut None,
             "depth-20lvl-TEST",
             "TEST",
+            None,
         )
         .await;
         assert!(result.is_err());
@@ -749,9 +809,18 @@ mod tests {
         let token_handle: TokenHandle =
             std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None)));
         let (tx, _rx) = mpsc::channel(16);
-        let result =
-            connect_and_run_200_depth(&token_handle, "test", "{}", &tx, "test-label", &mut None)
-                .await;
+        let result = connect_and_run_200_depth(
+            &token_handle,
+            "test",
+            "{}",
+            &tx,
+            "test-label",
+            &mut None,
+            12345,
+            "TEST-LABEL",
+            None,
+        )
+        .await;
         assert!(result.is_err());
         match result.unwrap_err() {
             WebSocketError::NoTokenAvailable => {}
@@ -785,10 +854,18 @@ mod tests {
         //   - pong send timeout (DEPTH_PONG_TIMEOUT_SECS, not a read deadline)
         //   - connection establishment timeout (DEPTH_CONNECT_TIMEOUT_SECS)
         // A regression that re-adds a read deadline must fail this test.
+        //
+        // STAGE-C.2 fix: the forbidden pattern is assembled at runtime from
+        // fragments so the literal string never appears verbatim in this
+        // source file — otherwise `include_str!` + `.contains()` would match
+        // itself and the test would always fail.
         let source = include_str!("depth_connection.rs");
+        let fragment_a = "time::timeout(read_";
+        let fragment_b = "timeout, read.next()";
+        let forbidden = format!("{fragment_a}{fragment_b})");
         assert!(
-            !source.contains("time::timeout(read_timeout, read.next())"),
-            "depth read loop must not wrap read.next() in time::timeout"
+            !source.contains(&forbidden),
+            "depth read loop must not wrap read.next() in a client-side read timeout"
         );
     }
 

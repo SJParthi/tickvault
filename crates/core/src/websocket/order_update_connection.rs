@@ -32,6 +32,7 @@ use tickvault_common::constants::{
 };
 use tickvault_common::order_types::OrderUpdate;
 use tickvault_common::trading_calendar::{TradingCalendar, ist_offset};
+use tickvault_storage::ws_frame_spill::{AppendOutcome, WsFrameSpill, WsType};
 
 use crate::auth::TokenHandle;
 use crate::parser::order_update::{build_order_update_login, parse_order_update};
@@ -53,12 +54,14 @@ use crate::websocket::tls::build_websocket_tls_connector;
 /// * `order_sender` — Broadcast channel for order updates.
 ///
 /// Runs until the task is aborted or reconnection attempts are exhausted.
+#[allow(clippy::too_many_arguments)] // APPROVED: STAGE-C added wal_spill param
 pub async fn run_order_update_connection(
     order_update_url: String,
     client_id: String,
     token_handle: TokenHandle,
     order_sender: broadcast::Sender<OrderUpdate>,
     calendar: Arc<TradingCalendar>,
+    wal_spill: Option<Arc<WsFrameSpill>>,
 ) {
     let mut consecutive_failures: u32 = 0;
     let m_reconnections = metrics::counter!("tv_order_update_reconnections_total");
@@ -72,6 +75,7 @@ pub async fn run_order_update_connection(
             &token_handle,
             &order_sender,
             &calendar,
+            wal_spill.as_ref(),
         )
         .await
         {
@@ -133,12 +137,14 @@ pub async fn run_order_update_connection(
 // ---------------------------------------------------------------------------
 
 /// Single connection lifecycle: connect → login → read loop.
+#[allow(clippy::too_many_arguments)] // APPROVED: STAGE-C added wal_spill param
 async fn connect_and_listen(
     url: &str,
     client_id: &str,
     token_handle: &TokenHandle,
     order_sender: &broadcast::Sender<OrderUpdate>,
     calendar: &TradingCalendar,
+    wal_spill: Option<&Arc<WsFrameSpill>>,
 ) -> Result<(), OrderUpdateConnectionError> {
     // Read current token.
     let token_guard = token_handle.load();
@@ -224,6 +230,20 @@ async fn connect_and_listen(
 
         match msg {
             Message::Text(text) => {
+                // STAGE-C: persist raw JSON frame to WAL first, so even if
+                // the parser rejects it or the broadcast has no subscribers,
+                // the frame is durable for boot-time replay.
+                if let Some(spill) = wal_spill {
+                    // O(1) EXEMPT: one allocation per frame on a cold path
+                    // (orders are sparse — ~1-100/day).
+                    let frame_vec = text.as_bytes().to_vec();
+                    let outcome = spill.append(WsType::OrderUpdate, frame_vec);
+                    if outcome == AppendOutcome::Dropped {
+                        error!(
+                            "CRITICAL: WAL spill dropped OrderUpdate frame — disk writer stalled"
+                        );
+                    }
+                }
                 match parse_order_update(&text) {
                     Ok(update) => {
                         m_messages.increment(1);

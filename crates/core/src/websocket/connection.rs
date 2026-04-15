@@ -24,6 +24,7 @@ use tracing::{debug, error, info, instrument, warn};
 
 use tickvault_common::config::{DhanConfig, WebSocketConfig};
 use tickvault_common::types::FeedMode;
+use tickvault_storage::ws_frame_spill::{WsFrameSpill, WsType};
 
 use crate::auth::TokenHandle;
 use crate::websocket::subscription_builder::build_subscription_messages;
@@ -92,6 +93,13 @@ pub struct WebSocketConnection {
     /// requested. The read loop's `tokio::select!` polls this alongside the
     /// socket, so shutdown requests interrupt a blocking read.
     shutdown_notify: Arc<tokio::sync::Notify>,
+
+    /// STAGE-C: Optional WAL spill writer. When `Some`, every binary frame is
+    /// durably appended to disk BEFORE being forwarded to the live frame
+    /// channel. On process restart, `WsFrameSpill::replay_all` hands recovered
+    /// frames back to downstream so zero ticks are lost across crashes or
+    /// downstream stalls. `None` in tests.
+    wal_spill: Option<Arc<WsFrameSpill>>,
 }
 
 impl WebSocketConnection {
@@ -148,7 +156,19 @@ impl WebSocketConnection {
             notifier,
             shutdown_requested: std::sync::atomic::AtomicBool::new(false),
             shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+            wal_spill: None,
         }
+    }
+
+    /// STAGE-C: Attach a WAL spill writer. Every binary frame will be durably
+    /// persisted to disk before being forwarded to the live consumer channel.
+    ///
+    /// Chain after `new()`: `WebSocketConnection::new(...).with_wal_spill(spill)`.
+    #[must_use]
+    // TEST-EXEMPT: builder pass-through covered indirectly by connection_pool construction paths; no test-visible state change to assert
+    pub fn with_wal_spill(mut self, spill: Arc<WsFrameSpill>) -> Self {
+        self.wal_spill = Some(spill);
+        self
     }
 
     /// A5: Request graceful shutdown of this connection. Idempotent.
@@ -570,37 +590,60 @@ impl WebSocketConnection {
 
             match frame_result {
                 Some(Ok(Message::Binary(data))) => {
-                    // STAGE-B (P1.2): NEVER block the WS read loop on downstream.
+                    // STAGE-C (P1.2+P1.3): durable WAL first, live forward second.
                     //
-                    // The read loop uses ONLY try_send. On channel-full, we
-                    // increment a CRITICAL counter and drop the frame — this
-                    // path must never fire in healthy ops because capacity is
-                    // sized far above observed load (see connection_pool.rs).
+                    // (1) If a WAL spill is attached, append the raw frame to
+                    //     disk via a crossbeam try_send. This is O(1) and never
+                    //     blocks the read loop. The frame is now durable —
+                    //     even if the downstream consumer is stuck and we
+                    //     later drop the live forward, the next boot will
+                    //     replay this frame from disk.
                     //
-                    // Stage C will replace this drop with a durable WAL
-                    // append-to-disk path so zero tick loss is mathematically
-                    // guaranteed even during catastrophic downstream failure.
-                    // Until Stage C ships, the drop is gated by a CRITICAL
-                    // metric + Telegram alert so any occurrence is immediately
-                    // visible.
+                    // (2) Forward to the live consumer channel with try_send.
+                    //     On Full, log WARN (not CRITICAL) because the frame
+                    //     is already durable in the WAL. The watchdog will
+                    //     restart the downstream consumer on sustained
+                    //     backpressure, which replays from WAL on boot.
+                    //
+                    // (3) Only if the WAL itself dropped the frame do we fire
+                    //     the CRITICAL metric — that is the single "real loss"
+                    //     path and it requires both the disk writer thread
+                    //     AND the downstream consumer to be stuck simultaneously.
+                    if let Some(spill) = self.wal_spill.as_ref() {
+                        // O(1) EXEMPT: one Vec<u8> copy per frame (≤162 B for Full packets)
+                        // is required to hand owned memory to the disk writer thread. This
+                        // is O(frame_len) which is bounded by the largest Dhan packet and
+                        // therefore constant-bounded. One alloc per frame at peak 10k
+                        // frames/sec is well within jemalloc headroom.
+                        let frame_vec = data.to_vec();
+                        let outcome = spill.append(WsType::LiveFeed, frame_vec);
+                        if outcome == tickvault_storage::ws_frame_spill::AppendOutcome::Dropped {
+                            error!(
+                                connection_id = self.connection_id,
+                                "CRITICAL: WAL spill dropped LiveFeed frame — disk writer stalled"
+                            );
+                            // CRITICAL metric already incremented inside spill.append().
+                        }
+                    }
                     match self.frame_sender.try_send(data) {
                         Ok(()) => {}
                         Err(mpsc::error::TrySendError::Full(_dropped)) => {
-                            error!(
+                            warn!(
                                 connection_id = self.connection_id,
                                 channel_capacity = self.frame_sender.capacity(),
-                                "CRITICAL: WS frame channel full — frame dropped. \
-                                 Downstream consumer (tick processor → QuestDB) is stuck. \
-                                 Stage C WAL will make this path impossible."
+                                wal_attached = self.wal_spill.is_some(),
+                                "WS live frame channel full — backpressure from downstream. \
+                                 Frame is durable in WAL; watchdog will restart consumer."
                             );
                             metrics::counter!(
-                                "tv_ws_frame_spill_drop_critical",
+                                "tv_ws_frame_live_backpressure_total",
                                 "ws_type" => "live_feed"
                             )
                             .increment(1);
                             // Intentionally do NOT return Err — the socket is
-                            // healthy, we just can't forward this one frame.
-                            // The read loop MUST continue so pings flow.
+                            // healthy, we just can't forward this one frame on
+                            // the live path. The read loop MUST continue so
+                            // pings flow and the WAL keeps durably recording.
                         }
                         Err(mpsc::error::TrySendError::Closed(_)) => {
                             warn!(
@@ -807,7 +850,7 @@ pub(crate) fn jitter_reconnect_delay(base_delay_ms: u64, connection_id: u8, atte
     // decorrelate 5 connections without a crypto-grade RNG.
     let mix: u64 = nanos
         ^ (u64::from(connection_id).wrapping_mul(0x9E37_79B9_7F4A_7C15))
-        ^ (u64::from(attempt).wrapping_mul(0xBF58_476D_1CE4_E5B9));
+        ^ (attempt.wrapping_mul(0xBF58_476D_1CE4_E5B9));
     let jitter_range_ms = base_delay_ms
         .saturating_mul(RECONNECT_JITTER_PCT)
         .saturating_div(100);

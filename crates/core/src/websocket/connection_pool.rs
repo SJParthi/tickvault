@@ -18,6 +18,7 @@ use tickvault_common::constants::{
     MAX_INSTRUMENTS_PER_WEBSOCKET_CONNECTION, MAX_WEBSOCKET_CONNECTIONS,
 };
 use tickvault_common::types::FeedMode;
+use tickvault_storage::ws_frame_spill::WsFrameSpill;
 
 use crate::auth::TokenHandle;
 use crate::websocket::connection::WebSocketConnection;
@@ -82,6 +83,36 @@ impl WebSocketConnectionPool {
         feed_mode: FeedMode,
         notifier: Option<std::sync::Arc<crate::notification::NotificationService>>,
     ) -> Result<Self, WebSocketError> {
+        Self::new_with_optional_wal(
+            token_handle,
+            client_id,
+            dhan_config,
+            ws_config,
+            instruments,
+            feed_mode,
+            notifier,
+            None,
+        )
+    }
+
+    /// STAGE-C: builder variant that attaches a shared [`WsFrameSpill`] to
+    /// every connection in the pool. Every raw binary frame is appended to
+    /// the WAL before the try_send to the frame channel, guaranteeing
+    /// durability even if the downstream consumer stalls. Test call sites
+    /// keep using the 7-arg `new()` — only production paths that need
+    /// durable spill wire this variant.
+    #[allow(clippy::too_many_arguments)] // APPROVED: STAGE-C builder variant with wal_spill
+    // TEST-EXEMPT: integration-level — requires live Dhan WebSocket endpoint; thin delegate over new() which IS tested
+    pub fn new_with_optional_wal(
+        token_handle: TokenHandle,
+        client_id: String,
+        dhan_config: DhanConfig,
+        ws_config: WebSocketConfig,
+        instruments: Vec<InstrumentSubscription>,
+        feed_mode: FeedMode,
+        notifier: Option<std::sync::Arc<crate::notification::NotificationService>>,
+        wal_spill: Option<Arc<WsFrameSpill>>,
+    ) -> Result<Self, WebSocketError> {
         let total = instruments.len();
 
         // Compute connection parameters first — needed for dynamic capacity check.
@@ -124,7 +155,7 @@ impl WebSocketConnectionPool {
             .into_iter()
             .enumerate()
             .map(|(id, assigned_instruments)| {
-                Arc::new(WebSocketConnection::new(
+                let mut conn = WebSocketConnection::new(
                     id as u8,
                     token_handle.clone(),
                     client_id.clone(),
@@ -134,7 +165,11 @@ impl WebSocketConnectionPool {
                     feed_mode,
                     frame_sender.clone(),
                     notifier.clone(),
-                ))
+                );
+                if let Some(spill) = wal_spill.clone() {
+                    conn = conn.with_wal_spill(spill);
+                }
+                Arc::new(conn)
             })
             .collect();
         // O(1) EXEMPT: end
