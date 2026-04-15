@@ -195,28 +195,30 @@ async fn connect_and_listen(
     // that may never come (causes false AuthTimeout reconnect loops).
     info!("order update WebSocket login sent — entering read loop");
 
-    // Use longer timeout outside market hours to avoid reconnect noise.
-    let timeout_secs = select_read_timeout_secs(is_within_market_hours(calendar));
-    let read_timeout = Duration::from_secs(timeout_secs);
+    // STAGE-B (P1.1): no client-side read deadline on the order update WS.
+    //
+    // Order update is a JSON stream, not binary. Silence is NORMAL — no
+    // orders means no messages, sometimes for hours. A read deadline here
+    // was the root cause of the 2-minute reconnect storm we saw earlier.
+    // Dhan's server-side ping/pong keeps the connection alive; our reader
+    // only wakes on real data, real errors, or real stream closure.
+    //
+    // Stage C's watchdog provides a liveness backstop at 660s (11 min).
+    let _ = calendar; // market-hours flag no longer needed
+    let _ = select_read_timeout_secs; // kept for backwards-compat test coverage
 
-    // Read loop — receive order updates until disconnect.
     loop {
-        let msg = match time::timeout(read_timeout, read.next()).await {
-            Ok(Some(Ok(msg))) => msg,
-            Ok(Some(Err(err))) => {
+        let msg = match read.next().await {
+            Some(Ok(msg)) => msg,
+            Some(Err(err)) => {
                 m_active.set(0.0);
                 // O(1) EXEMPT: error path, not hot path — .to_string() on cold disconnect
                 return Err(OrderUpdateConnectionError::Read(err.to_string()));
             }
-            Ok(None) => {
+            None => {
                 // Stream ended (server closed connection).
                 m_active.set(0.0);
                 return Ok(());
-            }
-            Err(_) => {
-                // Read timeout — server may have stopped sending pings.
-                m_active.set(0.0);
-                return Err(OrderUpdateConnectionError::ReadTimeout);
             }
         };
 
@@ -501,6 +503,7 @@ enum OrderUpdateConnectionError {
     #[error("read error: {0}")]
     Read(String),
 
+    #[allow(dead_code)] // APPROVED: STAGE-B removed client-side read deadline; kept for Stage C watchdog
     #[error("read timeout — no messages for {ORDER_UPDATE_READ_TIMEOUT_SECS}s")]
     ReadTimeout,
 }

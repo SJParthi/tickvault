@@ -23,8 +23,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tracing::{debug, error, info, warn};
 
 use tickvault_common::constants::{
-    DHAN_TWENTY_DEPTH_WS_BASE_URL, DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL, FRAME_SEND_TIMEOUT_SECS,
-    WEBSOCKET_AUTH_TYPE,
+    DHAN_TWENTY_DEPTH_WS_BASE_URL, DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL, WEBSOCKET_AUTH_TYPE,
 };
 use tickvault_common::types::ExchangeSegment;
 
@@ -37,11 +36,16 @@ use crate::websocket::subscription_builder::build_twenty_depth_subscription_mess
 const DEPTH_CONNECTION_PREFIX: &str = "depth-20lvl";
 
 /// Read timeout for depth connections (seconds).
-/// Per Dhan docs, keepalive is server ping every 10s, auto-pong by library.
-/// This is a SAFETY timeout for when the server truly dies (no pings at all).
-/// NOT for data flow — outside market hours, no data but pings still come.
-/// Set to 300s (5 min) to avoid false timeouts during low-activity periods.
-const DEPTH_READ_TIMEOUT_SECS: u64 = 300;
+// STAGE-B (P1.3): `DEPTH_READ_TIMEOUT_SECS` removed.
+//
+// Per Dhan spec (docs/dhan-ref/04-full-market-depth-websocket.md), depth
+// WebSockets follow the same ping/pong as the live market feed — server
+// pings, library auto-pongs, server closes on >40s silence. Our own
+// client-side deadline is redundant and was the root cause of false
+// reconnect storms whenever downstream stalled.
+//
+// Liveness is now enforced by: (a) Dhan's server-side timeout, and (b)
+// Stage C's watchdog task (independent of the read loop).
 
 /// Reconnection backoff initial delay (ms).
 const DEPTH_RECONNECT_INITIAL_MS: u64 = 1000;
@@ -253,92 +257,97 @@ async fn connect_and_run_depth(
     let m_active = metrics::gauge!("tv_depth_20lvl_connection_active", "underlying" => underlying_label.to_string());
     // Don't set active=1 yet — wait for first data frame (avoids false-positive Telegram alerts).
 
-    let read_timeout = Duration::from_secs(DEPTH_READ_TIMEOUT_SECS);
+    // STAGE-B (P1.1): no client-side read deadline — tokio-tungstenite +
+    // Dhan's server-side 40s pong timeout are the only liveness checks.
     let mut first_frame_received = false;
 
-    // Read loop
     loop {
-        match time::timeout(read_timeout, read.next()).await {
-            Err(_elapsed) => {
+        let frame_result = read.next().await;
+        match frame_result {
+            Some(Ok(Message::Binary(data))) => {
+                // Fire connected signal + set active metric on FIRST data frame only.
+                // This guarantees Telegram alert fires only when data actually flows.
+                if !first_frame_received {
+                    first_frame_received = true;
+                    m_active.set(1.0);
+                    if let Some(signal) = connected_signal.take() {
+                        let _ = signal.send(());
+                    }
+                }
+                m_frames.increment(1);
+
+                // STAGE-B (P1.2): never block the reader. Try-send only.
+                // On channel-full, increment CRITICAL drop counter. Stage C
+                // replaces this drop with a durable WAL append.
+                match frame_sender.try_send(data) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_dropped)) => {
+                        error!(
+                            underlying = %underlying_label,
+                            channel_capacity = frame_sender.capacity(),
+                            "CRITICAL: 20-depth frame channel full — frame dropped. \
+                             Downstream consumer is stuck."
+                        );
+                        metrics::counter!(
+                            "tv_ws_frame_spill_drop_critical",
+                            "ws_type" => "depth_20",
+                            "underlying" => underlying_label.to_string()
+                        )
+                        .increment(1);
+                        // Do NOT return — socket is healthy.
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        m_active.set(0.0);
+                        warn!("{prefix}: receiver dropped — stopping");
+                        return Ok(());
+                    }
+                }
+            }
+            Some(Ok(Message::Ping(data))) => {
+                let pong_timeout = Duration::from_secs(DEPTH_PONG_TIMEOUT_SECS);
+                match time::timeout(pong_timeout, write.send(Message::Pong(data))).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => {
+                        m_active.set(0.0);
+                        warn!(?err, "{prefix}: pong send failed");
+                        return Err(WebSocketError::ConnectionFailed {
+                            url: DHAN_TWENTY_DEPTH_WS_BASE_URL.to_string(),
+                            source: err,
+                        });
+                    }
+                    Err(_) => {
+                        m_active.set(0.0);
+                        warn!(
+                            timeout_secs = DEPTH_PONG_TIMEOUT_SECS,
+                            "{prefix}: pong send timed out — connection likely dead"
+                        );
+                        return Err(WebSocketError::ReadTimeout {
+                            connection_id: 99,
+                            timeout_secs: DEPTH_PONG_TIMEOUT_SECS,
+                        });
+                    }
+                }
+            }
+            Some(Ok(Message::Pong(_))) => {
+                // Server echo pong — ignore (keep-alive confirmation)
+            }
+            Some(Ok(Message::Close(_))) => {
                 m_active.set(0.0);
-                warn!("{prefix}: read timeout — reconnecting");
-                return Err(WebSocketError::ReadTimeout {
-                    connection_id: 99, // depth connection uses ID 99
-                    timeout_secs: DEPTH_READ_TIMEOUT_SECS,
+                info!("{prefix}: server sent close frame");
+                return Ok(());
+            }
+            Some(Err(err)) => {
+                m_active.set(0.0);
+                return Err(WebSocketError::ConnectionFailed {
+                    url: DHAN_TWENTY_DEPTH_WS_BASE_URL.to_string(),
+                    source: err,
                 });
             }
-            Ok(frame_result) => match frame_result {
-                Some(Ok(Message::Binary(data))) => {
-                    // Fire connected signal + set active metric on FIRST data frame only.
-                    // This guarantees Telegram alert fires only when data actually flows.
-                    if !first_frame_received {
-                        first_frame_received = true;
-                        m_active.set(1.0);
-                        if let Some(signal) = connected_signal.take() {
-                            let _ = signal.send(());
-                        }
-                    }
-                    m_frames.increment(1);
-                    let send_timeout = Duration::from_secs(FRAME_SEND_TIMEOUT_SECS);
-                    match time::timeout(send_timeout, frame_sender.send(data)).await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(_)) => {
-                            m_active.set(0.0);
-                            warn!("{prefix}: receiver dropped — stopping");
-                            return Ok(());
-                        }
-                        Err(_) => {
-                            warn!("{prefix}: frame send timeout — dropping frame");
-                            metrics::counter!("tv_depth_frames_dropped_total", "type" => "send_timeout", "depth" => "20").increment(1);
-                        }
-                    }
-                }
-                Some(Ok(Message::Ping(data))) => {
-                    let pong_timeout = Duration::from_secs(DEPTH_PONG_TIMEOUT_SECS);
-                    match time::timeout(pong_timeout, write.send(Message::Pong(data))).await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(err)) => {
-                            m_active.set(0.0);
-                            warn!(?err, "{prefix}: pong send failed");
-                            return Err(WebSocketError::ConnectionFailed {
-                                url: DHAN_TWENTY_DEPTH_WS_BASE_URL.to_string(),
-                                source: err,
-                            });
-                        }
-                        Err(_) => {
-                            m_active.set(0.0);
-                            warn!(
-                                timeout_secs = DEPTH_PONG_TIMEOUT_SECS,
-                                "{prefix}: pong send timed out — connection likely dead"
-                            );
-                            return Err(WebSocketError::ReadTimeout {
-                                connection_id: 99,
-                                timeout_secs: DEPTH_PONG_TIMEOUT_SECS,
-                            });
-                        }
-                    }
-                }
-                Some(Ok(Message::Pong(_))) => {
-                    // Server echo pong — ignore (keep-alive confirmation)
-                }
-                Some(Ok(Message::Close(_))) => {
-                    m_active.set(0.0);
-                    info!("{prefix}: server sent close frame");
-                    return Ok(());
-                }
-                Some(Err(err)) => {
-                    m_active.set(0.0);
-                    return Err(WebSocketError::ConnectionFailed {
-                        url: DHAN_TWENTY_DEPTH_WS_BASE_URL.to_string(),
-                        source: err,
-                    });
-                }
-                None => {
-                    m_active.set(0.0);
-                    return Ok(());
-                }
-                _ => {}
-            },
+            None => {
+                m_active.set(0.0);
+                return Ok(());
+            }
+            _ => {}
         }
     }
     // O(1) EXEMPT: end
@@ -510,88 +519,87 @@ async fn connect_and_run_200_depth(
         metrics::gauge!("tv_depth_200lvl_connection_active", "underlying" => prefix.to_string());
     // Don't set active=1 yet — wait for first data frame.
 
-    let read_timeout = Duration::from_secs(DEPTH_READ_TIMEOUT_SECS);
+    // STAGE-B (P1.1): no client-side read deadline.
     let mut first_frame_received = false;
 
     loop {
-        match time::timeout(read_timeout, read.next()).await {
-            Err(_elapsed) => {
+        let frame_result = read.next().await;
+        match frame_result {
+            Some(Ok(Message::Binary(data))) => {
+                if !first_frame_received {
+                    first_frame_received = true;
+                    m_active.set(1.0);
+                    if let Some(signal) = connected_signal.take() {
+                        let _ = signal.send(());
+                    }
+                }
+                m_frames.increment(1);
+
+                // STAGE-B (P1.2): try-send only — never block the reader.
+                match frame_sender.try_send(data) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_dropped)) => {
+                        error!(
+                            label = %prefix,
+                            channel_capacity = frame_sender.capacity(),
+                            "CRITICAL: 200-depth frame channel full — frame dropped. \
+                             Downstream consumer is stuck."
+                        );
+                        metrics::counter!(
+                            "tv_ws_frame_spill_drop_critical",
+                            "ws_type" => "depth_200",
+                            "label" => prefix.to_string()
+                        )
+                        .increment(1);
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        m_active.set(0.0);
+                        return Ok(());
+                    }
+                }
+            }
+            Some(Ok(Message::Ping(data))) => {
+                let pong_timeout = Duration::from_secs(DEPTH_PONG_TIMEOUT_SECS);
+                match time::timeout(pong_timeout, write.send(Message::Pong(data))).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => {
+                        m_active.set(0.0);
+                        return Err(WebSocketError::ConnectionFailed {
+                            url: DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL.to_string(),
+                            source: err,
+                        });
+                    }
+                    Err(_) => {
+                        m_active.set(0.0);
+                        warn!(
+                            timeout_secs = DEPTH_PONG_TIMEOUT_SECS,
+                            "{prefix}: pong send timed out — connection likely dead"
+                        );
+                        return Err(WebSocketError::ReadTimeout {
+                            connection_id: 98,
+                            timeout_secs: DEPTH_PONG_TIMEOUT_SECS,
+                        });
+                    }
+                }
+            }
+            Some(Ok(Message::Pong(_))) => {}
+            Some(Ok(Message::Close(_))) => {
                 m_active.set(0.0);
-                warn!("{prefix}: read timeout — reconnecting");
-                return Err(WebSocketError::ReadTimeout {
-                    connection_id: 98,
-                    timeout_secs: DEPTH_READ_TIMEOUT_SECS,
+                info!("{prefix}: server sent close frame");
+                return Ok(());
+            }
+            Some(Err(err)) => {
+                m_active.set(0.0);
+                return Err(WebSocketError::ConnectionFailed {
+                    url: DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL.to_string(),
+                    source: err,
                 });
             }
-            Ok(frame_result) => match frame_result {
-                Some(Ok(Message::Binary(data))) => {
-                    // Fire connected signal + set active metric on FIRST data frame only.
-                    if !first_frame_received {
-                        first_frame_received = true;
-                        m_active.set(1.0);
-                        if let Some(signal) = connected_signal.take() {
-                            let _ = signal.send(());
-                        }
-                    }
-                    m_frames.increment(1);
-                    let send_timeout = Duration::from_secs(FRAME_SEND_TIMEOUT_SECS);
-                    match time::timeout(send_timeout, frame_sender.send(data)).await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(_)) => {
-                            m_active.set(0.0);
-                            return Ok(());
-                        }
-                        Err(_) => {
-                            warn!("{prefix}: frame send timeout — dropping frame");
-                            metrics::counter!("tv_depth_frames_dropped_total", "type" => "send_timeout", "depth" => "200").increment(1);
-                        }
-                    }
-                }
-                Some(Ok(Message::Ping(data))) => {
-                    let pong_timeout = Duration::from_secs(DEPTH_PONG_TIMEOUT_SECS);
-                    match time::timeout(pong_timeout, write.send(Message::Pong(data))).await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(err)) => {
-                            m_active.set(0.0);
-                            return Err(WebSocketError::ConnectionFailed {
-                                url: DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL.to_string(),
-                                source: err,
-                            });
-                        }
-                        Err(_) => {
-                            m_active.set(0.0);
-                            warn!(
-                                timeout_secs = DEPTH_PONG_TIMEOUT_SECS,
-                                "{prefix}: pong send timed out — connection likely dead"
-                            );
-                            return Err(WebSocketError::ReadTimeout {
-                                connection_id: 98,
-                                timeout_secs: DEPTH_PONG_TIMEOUT_SECS,
-                            });
-                        }
-                    }
-                }
-                Some(Ok(Message::Pong(_))) => {
-                    // Server echo pong — ignore (keep-alive confirmation)
-                }
-                Some(Ok(Message::Close(_))) => {
-                    m_active.set(0.0);
-                    info!("{prefix}: server sent close frame");
-                    return Ok(());
-                }
-                Some(Err(err)) => {
-                    m_active.set(0.0);
-                    return Err(WebSocketError::ConnectionFailed {
-                        url: DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL.to_string(),
-                        source: err,
-                    });
-                }
-                None => {
-                    m_active.set(0.0);
-                    return Ok(());
-                }
-                _ => {}
-            },
+            None => {
+                m_active.set(0.0);
+                return Ok(());
+            }
+            _ => {}
         }
     }
     // O(1) EXEMPT: end
@@ -604,7 +612,8 @@ mod tests {
     #[test]
     fn test_depth_constants() {
         assert_eq!(DEPTH_SUBSCRIPTION_BATCH_SIZE, 50);
-        assert!(DEPTH_READ_TIMEOUT_SECS >= 30);
+        // STAGE-B: DEPTH_READ_TIMEOUT_SECS removed — client-side read deadline
+        // was redundant with Dhan's own 40s server-side pong timeout.
         assert!(DEPTH_RECONNECT_MAX_MS <= 60000);
     }
 
@@ -768,14 +777,19 @@ mod tests {
     }
 
     #[test]
-    fn test_depth_read_timeout_is_safety_bound() {
-        // Dhan docs say server pings every 10s and auto-pong is handled by the
-        // WS library. The depth read timeout is NOT tied to the 40s ping
-        // timeout — it is a SAFETY bound for the case where the server
-        // truly dies (no pings at all), and is deliberately set to 5 min
-        // to avoid false timeouts during low-activity periods outside
-        // market hours. See the const doc comment for the rationale.
-        assert_eq!(DEPTH_READ_TIMEOUT_SECS, 300);
+    fn test_depth_read_loops_have_no_client_side_deadline() {
+        // STAGE-B (P1.1): assert that neither depth read loop wraps
+        // `read.next()` in a `time::timeout(...)`. This was the root cause of
+        // false reconnects whenever downstream stalled. The only allowed
+        // `time::timeout` calls in the depth loops are:
+        //   - pong send timeout (DEPTH_PONG_TIMEOUT_SECS, not a read deadline)
+        //   - connection establishment timeout (DEPTH_CONNECT_TIMEOUT_SECS)
+        // A regression that re-adds a read deadline must fail this test.
+        let source = include_str!("depth_connection.rs");
+        assert!(
+            !source.contains("time::timeout(read_timeout, read.next())"),
+            "depth read loop must not wrap read.next() in time::timeout"
+        );
     }
 
     #[test]

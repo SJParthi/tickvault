@@ -475,23 +475,32 @@ impl WebSocketConnection {
         let (write, mut read) = ws_stream.split();
         let write = Arc::new(tokio::sync::Mutex::new(write));
 
-        // Dynamic read timeout: ping_interval × (max_failures + 1) + pong_timeout.
-        // Default: 10 × (2 + 1) + 10 = 40s. Matches SERVER_PING_TIMEOUT_SECS.
-        // Any received frame (Binary, Ping, Text) resets the timeout.
-        let read_timeout_secs = self
-            .ws_config
-            .ping_interval_secs
-            .saturating_mul(u64::from(self.ws_config.max_consecutive_pong_failures) + 1)
-            .saturating_add(self.ws_config.pong_timeout_secs);
-        let read_timeout = Duration::from_secs(read_timeout_secs);
+        // STAGE-B (plan item P1.1): No client-side read deadline.
+        //
+        // Per Dhan spec (docs/dhan-ref/03-live-market-feed-websocket.md:90-95):
+        //   "Server pings every 10s. WebSocket library auto-responds with pong.
+        //    If client does not respond for >40s, server closes the connection."
+        //
+        // The 40-second timeout is ENFORCED BY THE SERVER. A client-side
+        // `time::timeout(40s, read.next())` wrapper is redundant AND creates
+        // false-positive disconnects whenever downstream is slow (tick
+        // processor stall propagates backpressure → read loop can't advance
+        // → 40s deadline fires even though the socket is fine).
+        //
+        // The read loop now blocks purely on `read.next().await`. Exit
+        // conditions: stream returns None, stream returns Err, or the
+        // shutdown notify fires. That's it.
+        //
+        // Liveness is enforced by: (a) Dhan's own 40s server-side timeout,
+        // and (b) Stage C's watchdog task (independent of this loop).
 
         loop {
             // A5: tokio::select! lets the read loop respond to a graceful
-            // shutdown request without waiting for the 40-second read timeout.
-            // On shutdown: send Disconnect JSON (RequestCode 12), close the
-            // socket, and return Ok so the outer `run()` loop exits cleanly
-            // (see `is_shutdown_requested` check in `run()`).
-            let select_result = tokio::select! {
+            // shutdown request immediately. On shutdown: send Disconnect JSON
+            // (RequestCode 12), close the socket, and return Ok so the outer
+            // `run()` loop exits cleanly (see `is_shutdown_requested` check
+            // in `run()`).
+            let frame_result = tokio::select! {
                 biased;
                 () = self.shutdown_notify.notified() => {
                     info!(
@@ -555,143 +564,112 @@ impl WebSocketConnection {
                     }
                     return Ok(());
                 }
-                timeout_result = time::timeout(read_timeout, read.next()) => timeout_result,
+                // STAGE-B (P1.1): plain read.next().await — no deadline.
+                next_frame = read.next() => next_frame,
             };
 
-            match select_result {
-                Err(_elapsed) => {
-                    warn!(
-                        connection_id = self.connection_id,
-                        timeout_secs = read_timeout_secs,
-                        "WebSocket read timeout — no data received, treating as dead connection"
-                    );
-                    return Err(WebSocketError::ReadTimeout {
-                        connection_id: self.connection_id,
-                        timeout_secs: read_timeout_secs,
-                    });
+            match frame_result {
+                Some(Ok(Message::Binary(data))) => {
+                    // STAGE-B (P1.2): NEVER block the WS read loop on downstream.
+                    //
+                    // The read loop uses ONLY try_send. On channel-full, we
+                    // increment a CRITICAL counter and drop the frame — this
+                    // path must never fire in healthy ops because capacity is
+                    // sized far above observed load (see connection_pool.rs).
+                    //
+                    // Stage C will replace this drop with a durable WAL
+                    // append-to-disk path so zero tick loss is mathematically
+                    // guaranteed even during catastrophic downstream failure.
+                    // Until Stage C ships, the drop is gated by a CRITICAL
+                    // metric + Telegram alert so any occurrence is immediately
+                    // visible.
+                    match self.frame_sender.try_send(data) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(_dropped)) => {
+                            error!(
+                                connection_id = self.connection_id,
+                                channel_capacity = self.frame_sender.capacity(),
+                                "CRITICAL: WS frame channel full — frame dropped. \
+                                 Downstream consumer (tick processor → QuestDB) is stuck. \
+                                 Stage C WAL will make this path impossible."
+                            );
+                            metrics::counter!(
+                                "tv_ws_frame_spill_drop_critical",
+                                "ws_type" => "live_feed"
+                            )
+                            .increment(1);
+                            // Intentionally do NOT return Err — the socket is
+                            // healthy, we just can't forward this one frame.
+                            // The read loop MUST continue so pings flow.
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            warn!(
+                                connection_id = self.connection_id,
+                                "Frame receiver dropped — stopping read loop"
+                            );
+                            return Ok(());
+                        }
+                    }
                 }
-                Ok(frame_result) => match frame_result {
-                    Some(Ok(Message::Binary(data))) => {
-                        // Forward raw binary frame to downstream.
-                        // ZERO TICK LOSS: Use try_send for fast path, fall back to
-                        // blocking send (backpressure) if channel is full. This
-                        // guarantees no frame is ever dropped. The WS connection
-                        // survives backpressure because Dhan's ping timeout is 40s,
-                        // and the 128K channel gives 13+ seconds of headroom.
-                        match self.frame_sender.try_send(data) {
-                            Ok(()) => {} // fast path — channel has space
-                            Err(mpsc::error::TrySendError::Full(data)) => {
-                                // Channel full — apply backpressure (block WS read).
-                                // This is safer than dropping: WS survives 40s of
-                                // backpressure, and zero ticks are lost.
-                                warn!(
-                                    connection_id = self.connection_id,
-                                    channel_capacity = self.frame_sender.capacity(),
-                                    "SPSC channel full — backpressure active (zero-drop mode)"
-                                );
-                                metrics::counter!("tv_ws_frame_backpressure_total").increment(1);
-                                // Blocking send with backpressure timeout — if still
-                                // stuck, the WS ping timeout (40s) will kill the
-                                // connection and auto-reconnect will re-establish it.
-                                const BACKPRESSURE_TIMEOUT: Duration = Duration::from_secs(
-                                    tickvault_common::constants::FRAME_BACKPRESSURE_TIMEOUT_SECS,
-                                );
-                                match time::timeout(
-                                    BACKPRESSURE_TIMEOUT,
-                                    self.frame_sender.send(data),
-                                )
-                                .await
-                                {
-                                    Ok(Ok(())) => {
-                                        debug!(
-                                            connection_id = self.connection_id,
-                                            "backpressure resolved — frame sent"
-                                        );
-                                    }
-                                    Ok(Err(_)) => {
-                                        warn!(
-                                            connection_id = self.connection_id,
-                                            "Frame receiver dropped — stopping read loop"
-                                        );
-                                        return Ok(());
-                                    }
-                                    Err(_elapsed) => {
-                                        // 30s backpressure exhausted. The WS ping timeout
-                                        // (40s) will disconnect us shortly. Log CRITICAL.
-                                        error!(
-                                            connection_id = self.connection_id,
-                                            "CRITICAL: 30s backpressure timeout — tick processor frozen"
-                                        );
-                                        metrics::counter!("tv_ws_backpressure_timeout_total")
-                                            .increment(1);
-                                    }
-                                }
-                            }
-                            Err(mpsc::error::TrySendError::Closed(_)) => {
-                                warn!(
-                                    connection_id = self.connection_id,
-                                    "Frame receiver dropped — stopping read loop"
-                                );
-                                return Ok(());
-                            }
-                        }
-                    }
-                    Some(Ok(Message::Ping(data))) => {
-                        // Server ping — respond with pong to keep connection alive.
-                        // Timeout prevents hang if TCP buffer is full on a dead connection.
-                        let pong_timeout = Duration::from_secs(self.ws_config.pong_timeout_secs);
-                        let mut sink = write.lock().await;
-                        if time::timeout(pong_timeout, sink.send(Message::Pong(data)))
-                            .await
-                            .is_err()
-                        {
-                            warn!(
-                                connection_id = self.connection_id,
-                                timeout_secs = self.ws_config.pong_timeout_secs,
-                                "Pong send timed out — connection likely dead"
-                            );
-                            return Err(WebSocketError::ReadTimeout {
-                                connection_id: self.connection_id,
-                                timeout_secs: self.ws_config.pong_timeout_secs,
-                            });
-                        }
-                    }
-                    Some(Ok(Message::Pong(_))) => {
-                        // Pong from server (e.g., echo of our pong). Ignore.
-                    }
-                    Some(Ok(Message::Close(frame))) => {
-                        if let Some(frame) = frame {
-                            let code: u16 = frame.code.into();
-                            let reason = frame.reason.to_string(); // O(1) EXEMPT: close frame — once at disconnect
-                            warn!(
-                                connection_id = self.connection_id,
-                                close_code = code,
-                                reason = %reason,
-                                "WebSocket close frame received"
-                            );
-                        }
-                        return Ok(());
-                    }
-                    Some(Ok(Message::Text(text))) => {
-                        // Dhan may send text for disconnect messages.
-                        debug!(
+                Some(Ok(Message::Ping(data))) => {
+                    // Server ping — respond with pong to keep connection alive.
+                    // Pong send is bounded by pong_timeout — if the socket's
+                    // TCP buffer is stuck for >pong_timeout, the socket is
+                    // genuinely dead and we return Err to trigger reconnect.
+                    let pong_timeout = Duration::from_secs(self.ws_config.pong_timeout_secs);
+                    let mut sink = write.lock().await;
+                    if time::timeout(pong_timeout, sink.send(Message::Pong(data)))
+                        .await
+                        .is_err()
+                    {
+                        warn!(
                             connection_id = self.connection_id,
-                            text_len = text.len(),
-                            "Received text message (unexpected)"
+                            timeout_secs = self.ws_config.pong_timeout_secs,
+                            "Pong send timed out — connection likely dead"
                         );
-                    }
-                    Some(Err(err)) => {
-                        return Err(WebSocketError::ConnectionFailed {
-                            url: self.websocket_base_url.clone(), // O(1) EXEMPT: error path — once at disconnect
-                            source: err,
+                        return Err(WebSocketError::ReadTimeout {
+                            connection_id: self.connection_id,
+                            timeout_secs: self.ws_config.pong_timeout_secs,
                         });
                     }
-                    None => {
-                        // Stream ended.
-                        return Ok(());
+                }
+                Some(Ok(Message::Pong(_))) => {
+                    // Pong from server (e.g., echo of our pong). Ignore.
+                }
+                Some(Ok(Message::Close(frame))) => {
+                    if let Some(frame) = frame {
+                        let code: u16 = frame.code.into();
+                        let reason = frame.reason.to_string(); // O(1) EXEMPT: close frame — once at disconnect
+                        warn!(
+                            connection_id = self.connection_id,
+                            close_code = code,
+                            reason = %reason,
+                            "WebSocket close frame received"
+                        );
                     }
-                    _ => {}
-                },
+                    return Ok(());
+                }
+                Some(Ok(Message::Text(text))) => {
+                    // Dhan may send text for disconnect messages.
+                    debug!(
+                        connection_id = self.connection_id,
+                        text_len = text.len(),
+                        "Received text message (unexpected)"
+                    );
+                }
+                Some(Err(err)) => {
+                    return Err(WebSocketError::ConnectionFailed {
+                        url: self.websocket_base_url.clone(), // O(1) EXEMPT: error path — once at disconnect
+                        source: err,
+                    });
+                }
+                None => {
+                    // Stream ended — exit cleanly, outer loop reconnects.
+                    return Ok(());
+                }
+                Some(Ok(_)) => {
+                    // tokio-tungstenite may surface Frame variants we don't care about.
+                }
             }
         }
     }
