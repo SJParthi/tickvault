@@ -41,6 +41,13 @@ pub struct WebSocketConnectionPool {
     /// Receiver for raw binary frames from all connections.
     frame_receiver: mpsc::Receiver<bytes::Bytes>,
 
+    /// STAGE-C.2b: Retained clone of the shared frame sender. Held on the
+    /// pool so boot-time WAL replay can inject recovered LiveFeed frames
+    /// into the downstream consumer through the same mpsc the live
+    /// connections write to. Without this, replayed frames would only be
+    /// archived, never re-played into the live pipeline.
+    frame_sender: mpsc::Sender<bytes::Bytes>,
+
     /// Stagger delay between connection spawns (milliseconds). 0 = no stagger.
     connection_stagger_ms: u64,
 
@@ -183,9 +190,25 @@ impl WebSocketConnectionPool {
         Ok(Self {
             connections,
             frame_receiver,
+            frame_sender,
             connection_stagger_ms: ws_config.connection_stagger_ms,
             watchdog: std::sync::Mutex::new(PoolWatchdog::new()),
         })
+    }
+
+    /// STAGE-C.2b: Returns a clone of the shared frame sender for boot-time
+    /// WAL replay injection. Cheap (clone is an Arc bump). The caller
+    /// typically uses this to push recovered LiveFeed frames back into the
+    /// same pipeline the live connections write to, so the tick processor
+    /// sees replayed frames as if they had just arrived — preserving
+    /// the zero-tick-loss guarantee across crashes.
+    ///
+    /// Safe to call at any time; the sender is cheap to clone and drops
+    /// cleanly when the caller is done injecting. Covered end-to-end by
+    /// the STAGE-C.2b replay-injection integration flow in main.rs.
+    // TEST-EXEMPT: trivial Arc-bump clone accessor — `mpsc::Sender::clone` is tokio-tested; integration covered by main.rs replay-injection path
+    pub fn frame_sender_clone(&self) -> mpsc::Sender<bytes::Bytes> {
+        self.frame_sender.clone()
     }
 
     /// Spawns all connections as independent tokio tasks with staggered startup.

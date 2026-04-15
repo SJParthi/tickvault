@@ -36,7 +36,9 @@ use tickvault_storage::ws_frame_spill::{AppendOutcome, WsFrameSpill, WsType};
 
 use crate::auth::TokenHandle;
 use crate::parser::order_update::{build_order_update_login, parse_order_update};
+use crate::websocket::activity_watchdog::{ActivityWatchdog, WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS};
 use crate::websocket::tls::build_websocket_tls_connector;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -213,18 +215,52 @@ async fn connect_and_listen(
     let _ = calendar; // market-hours flag no longer needed
     let _ = select_read_timeout_secs; // kept for backwards-compat test coverage
 
-    loop {
-        let msg = match read.next().await {
+    // STAGE-C.3: per-connection activity watchdog. 660s threshold (600s
+    // allowable silence between orders + 60s safety margin). The counter
+    // is bumped on every Some(Ok(_)) message — Text, Ping, Pong, Close,
+    // Binary. Dhan's server pings every 10s, so even in a no-order window
+    // the counter advances constantly and the watchdog never fires a
+    // false positive. It only fires when the socket is truly dead.
+    let activity_counter = Arc::new(AtomicU64::new(0));
+    let watchdog_notify = Arc::new(tokio::sync::Notify::new());
+    let watchdog = ActivityWatchdog::new(
+        "order-update".to_string(),
+        Arc::clone(&activity_counter),
+        Duration::from_secs(WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS),
+        Arc::clone(&watchdog_notify),
+    );
+    let watchdog_handle = tokio::spawn(watchdog.run());
+
+    // The read loop is wrapped in a helper closure so every exit path can
+    // abort the watchdog handle exactly once. This avoids sprinkling
+    // `watchdog_handle.abort()` at every `return` site.
+    let loop_result: Result<(), OrderUpdateConnectionError> = loop {
+        let frame_result = tokio::select! {
+            biased;
+            () = watchdog_notify.notified() => {
+                m_active.set(0.0);
+                break Err(OrderUpdateConnectionError::WatchdogFired(
+                    WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS,
+                ));
+            }
+            next_frame = read.next() => next_frame,
+        };
+        // STAGE-C.3: bump the activity counter on every Some(Ok(_)) event.
+        if matches!(frame_result, Some(Ok(_))) {
+            activity_counter.fetch_add(1, Ordering::Relaxed);
+        }
+
+        let msg = match frame_result {
             Some(Ok(msg)) => msg,
             Some(Err(err)) => {
                 m_active.set(0.0);
                 // O(1) EXEMPT: error path, not hot path — .to_string() on cold disconnect
-                return Err(OrderUpdateConnectionError::Read(err.to_string()));
+                break Err(OrderUpdateConnectionError::Read(err.to_string()));
             }
             None => {
                 // Stream ended (server closed connection).
                 m_active.set(0.0);
-                return Ok(());
+                break Ok(());
             }
         };
 
@@ -266,7 +302,7 @@ async fn connect_and_listen(
                                     "order update WebSocket auth/API error from server"
                                 );
                                 m_active.set(0.0);
-                                return Err(OrderUpdateConnectionError::AuthFailed(reason));
+                                break Err(OrderUpdateConnectionError::AuthFailed(reason));
                             }
                             AuthResponseKind::Success => {
                                 // Login ack or heartbeat — not all messages are order updates.
@@ -289,13 +325,17 @@ async fn connect_and_listen(
             Message::Close(frame) => {
                 info!(?frame, "order update WebSocket close frame received");
                 m_active.set(0.0);
-                return Ok(());
+                break Ok(());
             }
             _ => {
                 // Binary, Pong, Frame — ignore.
             }
         }
-    }
+    };
+
+    // STAGE-C.3: Always abort the watchdog task when the read loop exits.
+    watchdog_handle.abort();
+    loop_result
 }
 
 // ---------------------------------------------------------------------------
@@ -526,6 +566,15 @@ enum OrderUpdateConnectionError {
     #[allow(dead_code)] // APPROVED: STAGE-B removed client-side read deadline; kept for Stage C watchdog
     #[error("read timeout — no messages for {ORDER_UPDATE_READ_TIMEOUT_SECS}s")]
     ReadTimeout,
+
+    /// STAGE-C.3: per-connection activity watchdog fired. No frames or
+    /// pings received within the 660s (11 min) threshold — the socket is
+    /// dead and the outer loop must reconnect. Distinct from
+    /// `ReadTimeout` because the watchdog enforces a TRUE silence check
+    /// (frames + pings), whereas `ReadTimeout` was a client-side read
+    /// deadline that fired on any silence, including legitimate idle.
+    #[error("order update WebSocket activity watchdog fired after {0}s of silence")]
+    WatchdogFired(u64),
 }
 
 // ---------------------------------------------------------------------------

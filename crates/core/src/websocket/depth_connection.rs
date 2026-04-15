@@ -32,6 +32,9 @@ use tickvault_common::types::ExchangeSegment;
 use super::tls::build_websocket_tls_connector;
 use super::types::{InstrumentSubscription, WebSocketError};
 use crate::auth::TokenHandle;
+use crate::websocket::activity_watchdog::{
+    ActivityWatchdog, WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS,
+};
 use crate::websocket::subscription_builder::build_twenty_depth_subscription_messages;
 
 /// Identifier for depth connections in logs/metrics.
@@ -268,8 +271,47 @@ async fn connect_and_run_depth(
     // Dhan's server-side 40s pong timeout are the only liveness checks.
     let mut first_frame_received = false;
 
-    loop {
-        let frame_result = read.next().await;
+    // STAGE-C.3: per-connection activity watchdog. The counter is bumped on
+    // every Some(Ok(_)) frame; the watchdog task fires `watchdog_notify`
+    // when it observes no forward progress for 50s (40s server ping timeout
+    // + 10s margin), and the select! below returns Err(WatchdogFired) so
+    // the outer reconnect loop kicks in.
+    let activity_counter = Arc::new(AtomicU64::new(0));
+    let watchdog_notify = Arc::new(tokio::sync::Notify::new());
+    let watchdog_label = format!("depth-20-{underlying_label}"); // O(1) EXEMPT: one alloc per connect cycle
+    let watchdog = ActivityWatchdog::new(
+        watchdog_label.clone(),
+        Arc::clone(&activity_counter),
+        Duration::from_secs(WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS),
+        Arc::clone(&watchdog_notify),
+    );
+    let watchdog_handle = tokio::spawn(watchdog.run());
+
+    // Helper: construct the WatchdogFired error uniformly from both the
+    // select! branch (below) and any other watchdog-triggered return path.
+    // O(1) EXEMPT: cold path, one per dead socket.
+    let make_watchdog_err = || WebSocketError::WatchdogFired {
+        label: watchdog_label.clone(),
+        silent_secs: WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS,
+        threshold_secs: WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS,
+    };
+
+    let loop_result: Result<(), WebSocketError> = loop {
+        let frame_result = tokio::select! {
+            biased;
+            () = watchdog_notify.notified() => {
+                m_active.set(0.0);
+                break Err(make_watchdog_err());
+            }
+            next_frame = read.next() => next_frame,
+        };
+        // STAGE-C.3: bump the activity counter on every Some(Ok(_)) event so
+        // the watchdog can distinguish a truly dead socket from a data-quiet
+        // period with pings still flowing. One relaxed atomic increment is
+        // O(1) and allocation-free.
+        if matches!(frame_result, Some(Ok(_))) {
+            activity_counter.fetch_add(1, Ordering::Relaxed);
+        }
         match frame_result {
             Some(Ok(Message::Binary(data))) => {
                 // Fire connected signal + set active metric on FIRST data frame only.
@@ -319,7 +361,7 @@ async fn connect_and_run_depth(
                     Err(mpsc::error::TrySendError::Closed(_)) => {
                         m_active.set(0.0);
                         warn!("{prefix}: receiver dropped — stopping");
-                        return Ok(());
+                        break Ok(());
                     }
                 }
             }
@@ -330,7 +372,7 @@ async fn connect_and_run_depth(
                     Ok(Err(err)) => {
                         m_active.set(0.0);
                         warn!(?err, "{prefix}: pong send failed");
-                        return Err(WebSocketError::ConnectionFailed {
+                        break Err(WebSocketError::ConnectionFailed {
                             url: DHAN_TWENTY_DEPTH_WS_BASE_URL.to_string(),
                             source: err,
                         });
@@ -341,7 +383,7 @@ async fn connect_and_run_depth(
                             timeout_secs = DEPTH_PONG_TIMEOUT_SECS,
                             "{prefix}: pong send timed out — connection likely dead"
                         );
-                        return Err(WebSocketError::ReadTimeout {
+                        break Err(WebSocketError::ReadTimeout {
                             connection_id: 99,
                             timeout_secs: DEPTH_PONG_TIMEOUT_SECS,
                         });
@@ -354,22 +396,27 @@ async fn connect_and_run_depth(
             Some(Ok(Message::Close(_))) => {
                 m_active.set(0.0);
                 info!("{prefix}: server sent close frame");
-                return Ok(());
+                break Ok(());
             }
             Some(Err(err)) => {
                 m_active.set(0.0);
-                return Err(WebSocketError::ConnectionFailed {
+                break Err(WebSocketError::ConnectionFailed {
                     url: DHAN_TWENTY_DEPTH_WS_BASE_URL.to_string(),
                     source: err,
                 });
             }
             None => {
                 m_active.set(0.0);
-                return Ok(());
+                break Ok(());
             }
             _ => {}
         }
-    }
+    };
+
+    // STAGE-C.3: Always abort the watchdog task when the read loop exits
+    // for any reason. If the watchdog already fired, `abort()` is a no-op.
+    watchdog_handle.abort();
+    loop_result
     // O(1) EXEMPT: end
 }
 
@@ -563,8 +610,39 @@ async fn connect_and_run_200_depth(
     // STAGE-B (P1.1): no client-side read deadline.
     let mut first_frame_received = false;
 
-    loop {
-        let frame_result = read.next().await;
+    // STAGE-C.3: per-connection activity watchdog — same semantics as the
+    // 20-level depth path above. 50s threshold (40s Dhan server ping timeout
+    // + 10s margin). The label carries the security_id so a fired alert
+    // points directly at the dead contract.
+    let activity_counter = Arc::new(AtomicU64::new(0));
+    let watchdog_notify = Arc::new(tokio::sync::Notify::new());
+    let watchdog_label = format!("depth-200-{label}-sid{security_id}"); // O(1) EXEMPT: one alloc per connect cycle
+    let watchdog = ActivityWatchdog::new(
+        watchdog_label.clone(),
+        Arc::clone(&activity_counter),
+        Duration::from_secs(WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS),
+        Arc::clone(&watchdog_notify),
+    );
+    let watchdog_handle = tokio::spawn(watchdog.run());
+    // O(1) EXEMPT: cold path, one per dead socket.
+    let make_watchdog_err = || WebSocketError::WatchdogFired {
+        label: watchdog_label.clone(),
+        silent_secs: WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS,
+        threshold_secs: WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS,
+    };
+
+    let loop_result: Result<(), WebSocketError> = loop {
+        let frame_result = tokio::select! {
+            biased;
+            () = watchdog_notify.notified() => {
+                m_active.set(0.0);
+                break Err(make_watchdog_err());
+            }
+            next_frame = read.next() => next_frame,
+        };
+        if matches!(frame_result, Some(Ok(_))) {
+            activity_counter.fetch_add(1, Ordering::Relaxed);
+        }
         match frame_result {
             Some(Ok(Message::Binary(data))) => {
                 if !first_frame_received {
@@ -610,7 +688,7 @@ async fn connect_and_run_200_depth(
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => {
                         m_active.set(0.0);
-                        return Ok(());
+                        break Ok(());
                     }
                 }
             }
@@ -620,7 +698,7 @@ async fn connect_and_run_200_depth(
                     Ok(Ok(())) => {}
                     Ok(Err(err)) => {
                         m_active.set(0.0);
-                        return Err(WebSocketError::ConnectionFailed {
+                        break Err(WebSocketError::ConnectionFailed {
                             url: DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL.to_string(),
                             source: err,
                         });
@@ -633,7 +711,7 @@ async fn connect_and_run_200_depth(
                             timeout_secs = DEPTH_PONG_TIMEOUT_SECS,
                             "{prefix}: pong send timed out — connection likely dead"
                         );
-                        return Err(WebSocketError::ReadTimeout {
+                        break Err(WebSocketError::ReadTimeout {
                             connection_id: 98,
                             timeout_secs: DEPTH_PONG_TIMEOUT_SECS,
                         });
@@ -644,22 +722,26 @@ async fn connect_and_run_200_depth(
             Some(Ok(Message::Close(_))) => {
                 m_active.set(0.0);
                 info!(security_id, label = %label, "{prefix}: server sent close frame");
-                return Ok(());
+                break Ok(());
             }
             Some(Err(err)) => {
                 m_active.set(0.0);
-                return Err(WebSocketError::ConnectionFailed {
+                break Err(WebSocketError::ConnectionFailed {
                     url: DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL.to_string(),
                     source: err,
                 });
             }
             None => {
                 m_active.set(0.0);
-                return Ok(());
+                break Ok(());
             }
             _ => {}
         }
-    }
+    };
+
+    // STAGE-C.3: Always abort the watchdog task when the read loop exits.
+    watchdog_handle.abort();
+    loop_result
     // O(1) EXEMPT: end
 }
 

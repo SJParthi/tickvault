@@ -297,10 +297,18 @@ pub enum NotificationEvent {
 
     /// QuestDB persistence disconnected — ticks being buffered, not persisted.
     QuestDbDisconnected {
-        /// Which writer lost connection (e.g., "tick", "depth", "candle").
+        /// Which writer lost connection (e.g., "tick", "depth", "candle",
+        /// "liveness-check").
         writer: String,
-        /// Current ring buffer size at disconnect time.
-        buffer_size: usize,
+        /// Numeric degradation signal. Interpretation depends on `signal_kind`:
+        /// for the liveness-check path this is the consecutive-failure count;
+        /// for the tick-writer lag path it's the number of dropped records.
+        /// Never a hardcoded zero — always reflects reality at alert time.
+        signal: u64,
+        /// Human-readable description of what `signal` represents (e.g.
+        /// `"consecutive liveness failures"`, `"ticks dropped by broadcast lag"`).
+        /// Rendered in the Telegram message so operators aren't guessing.
+        signal_kind: String,
     },
 
     /// QuestDB persistence reconnected — buffered data draining.
@@ -644,16 +652,17 @@ impl NotificationEvent {
             }
             Self::QuestDbDisconnected {
                 writer,
-                buffer_size,
+                signal,
+                signal_kind,
             } => {
-                // NOTE: `buffer_size` carries the consecutive-failure count
-                // for the liveness check path (not a literal buffered record
-                // count). The tick-writer path passes its real buffer depth.
-                // Either way, the number reflects "how bad is it" factually —
-                // no hardcoded zero, no fake auto-reconnect cadence.
+                // The numeric `signal` is factual at alert time — either a
+                // consecutive-failure count (liveness-check path) or a dropped
+                // record count (tick-writer lag path). `signal_kind` names
+                // which one so operators can read the alert without guessing.
+                // No hardcoded zero, no fake auto-reconnect cadence.
                 format!(
                     "<b>CRITICAL: QuestDB {writer} DEGRADED</b>\n\
-                     Signal strength: {buffer_size}.\n\
+                     {signal_kind}: {signal}.\n\
                      Ticks remain durable via WAL — no data loss.\n\
                      Investigate QuestDB container + disk + CPU."
                 )

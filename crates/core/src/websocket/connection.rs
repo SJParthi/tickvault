@@ -27,6 +27,9 @@ use tickvault_common::types::FeedMode;
 use tickvault_storage::ws_frame_spill::{WsFrameSpill, WsType};
 
 use crate::auth::TokenHandle;
+use crate::websocket::activity_watchdog::{
+    ActivityWatchdog, WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS,
+};
 use crate::websocket::subscription_builder::build_subscription_messages;
 use crate::websocket::tls::build_websocket_tls_connector;
 use crate::websocket::types::{
@@ -100,6 +103,27 @@ pub struct WebSocketConnection {
     /// frames back to downstream so zero ticks are lost across crashes or
     /// downstream stalls. `None` in tests.
     wal_spill: Option<Arc<WsFrameSpill>>,
+
+    /// STAGE-C.3: Shared activity counter read by the per-connection activity
+    /// watchdog. Bumped on every inbound frame (binary / ping / pong / text)
+    /// so the watchdog can distinguish a truly dead socket from a
+    /// data-quiet period where Dhan is still pinging. Initialised to 0 in
+    /// `new()`; reset semantics are a no-op because the watchdog tracks
+    /// *forward progress*, not absolute values.
+    activity_counter: Arc<AtomicU64>,
+
+    /// STAGE-C.3: Notify handle the activity watchdog fires when it has
+    /// observed no forward progress on `activity_counter` for longer than
+    /// its threshold. The read loop awaits this in `tokio::select!` and
+    /// returns `Err(WatchdogFired)` on notification, which the outer
+    /// `run()` loop treats as a reconnectable error.
+    ///
+    /// Separate from `shutdown_notify` because the semantics differ:
+    /// `shutdown_notify` is a polite graceful-shutdown path that sends
+    /// `RequestCode: 12` to Dhan and returns `Ok(())`; `watchdog_notify`
+    /// represents a dead socket and must return `Err` so the outer loop
+    /// reconnects.
+    watchdog_notify: Arc<tokio::sync::Notify>,
 }
 
 impl WebSocketConnection {
@@ -157,6 +181,8 @@ impl WebSocketConnection {
             shutdown_requested: std::sync::atomic::AtomicBool::new(false),
             shutdown_notify: Arc::new(tokio::sync::Notify::new()),
             wal_spill: None,
+            activity_counter: Arc::new(AtomicU64::new(0)),
+            watchdog_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -257,8 +283,37 @@ impl WebSocketConnection {
                         }
                     }
 
+                    // STAGE-C.3: Spawn the per-connection activity watchdog
+                    // before entering the read loop. The watchdog polls
+                    // `activity_counter` every WATCHDOG_POLL_INTERVAL_SECS
+                    // and fires `watchdog_notify` if the counter has not
+                    // advanced for WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS.
+                    // On fire, the read loop's select! returns
+                    // Err(WatchdogFired) and the outer loop reconnects.
+                    //
+                    // A fresh watchdog is spawned on every reconnect; the
+                    // old task is aborted below as soon as the read loop
+                    // returns. O(1) EXEMPT: cold path — one spawn per
+                    // connect cycle, not per frame.
+                    let watchdog_label = format!("live-feed-{}", self.connection_id);
+                    let watchdog = ActivityWatchdog::new(
+                        watchdog_label,
+                        Arc::clone(&self.activity_counter),
+                        Duration::from_secs(WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS),
+                        Arc::clone(&self.watchdog_notify),
+                    );
+                    let watchdog_handle = tokio::spawn(watchdog.run());
+
                     // Run read + ping loops until disconnect.
                     let disconnect_result = self.run_read_loop(ws_stream).await;
+
+                    // STAGE-C.3: Always abort the watchdog task on exit.
+                    // If the watchdog fired, its task has already returned
+                    // and `abort()` is a no-op. If the read loop exited for
+                    // any other reason (Dhan disconnect, graceful shutdown,
+                    // transport error), we stop the watchdog so it can't
+                    // fire stale alerts against a dead socket.
+                    watchdog_handle.abort();
 
                     match disconnect_result {
                         Ok(()) => {
@@ -522,6 +577,17 @@ impl WebSocketConnection {
             // in `run()`).
             let frame_result = tokio::select! {
                 biased;
+                // STAGE-C.3: activity watchdog fired — socket is dead, force
+                // reconnect. Does NOT send RequestCode 12 (the socket is
+                // already gone) and returns Err so the outer run() loop
+                // reconnects instead of exiting cleanly like shutdown does.
+                () = self.watchdog_notify.notified() => {
+                    return Err(WebSocketError::WatchdogFired {
+                        label: format!("live-feed-{}", self.connection_id), // O(1) EXEMPT: cold path — fires once per dead socket, not per frame
+                        silent_secs: WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS,
+                        threshold_secs: WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS,
+                    });
+                }
                 () = self.shutdown_notify.notified() => {
                     info!(
                         connection_id = self.connection_id,
@@ -587,6 +653,17 @@ impl WebSocketConnection {
                 // STAGE-B (P1.1): plain read.next().await — no deadline.
                 next_frame = read.next() => next_frame,
             };
+
+            // STAGE-C.3: Bump the activity counter on EVERY Some(Ok(_)) frame
+            // — binary, ping, pong, text. The watchdog only cares that the
+            // socket is producing something, not what. A steady stream of
+            // Dhan pings (every 10s) is enough to keep the counter advancing
+            // during data-quiet periods so the watchdog never fires a false
+            // positive. One relaxed atomic increment is O(1) and allocation
+            // free — safe on the hot path.
+            if matches!(frame_result, Some(Ok(_))) {
+                self.activity_counter.fetch_add(1, Ordering::Relaxed);
+            }
 
             match frame_result {
                 Some(Ok(Message::Binary(data))) => {

@@ -181,6 +181,18 @@ async fn main() -> Result<()> {
     let ws_wal_path = std::path::PathBuf::from(&ws_wal_dir);
     // Replay first — this MUST happen before any WS connection opens so we
     // never race a fresh append against a stale segment rotation.
+    //
+    // STAGE-C.2b: Recovered frames are retained in `ws_wal_replay_frames`
+    // and re-injected into the live pipeline after the corresponding
+    // downstream channel is constructed. For LiveFeed this happens as
+    // soon as the WebSocket pool is built (see `inject_replayed_live_feed_frames`
+    // below). Depth-20/Depth-200/OrderUpdate injection is archival-only
+    // for now because their channels are constructed dynamically per
+    // underlying/contract much later in boot; those frames remain safe
+    // in the archive directory inside `ws_wal_path.archive/` for forensic
+    // replay and are visible via the `tv_ws_frame_wal_replay_total`
+    // per-type counter.
+    let mut ws_wal_replay_live_feed: Vec<bytes::Bytes> = Vec::new();
     match tickvault_storage::ws_frame_spill::replay_all(&ws_wal_path) {
         Ok(recovered) => {
             if recovered.is_empty() {
@@ -190,9 +202,14 @@ async fn main() -> Result<()> {
                 let mut d20 = 0u64;
                 let mut d200 = 0u64;
                 let mut ord = 0u64;
-                for rec in &recovered {
+                for rec in recovered {
                     match rec.ws_type {
-                        tickvault_storage::ws_frame_spill::WsType::LiveFeed => live += 1,
+                        tickvault_storage::ws_frame_spill::WsType::LiveFeed => {
+                            live += 1;
+                            // STAGE-C.2b: buffer LiveFeed frames for re-injection into
+                            // the pool's mpsc sender once the pool is built below.
+                            ws_wal_replay_live_feed.push(bytes::Bytes::from(rec.frame));
+                        }
                         tickvault_storage::ws_frame_spill::WsType::Depth20 => d20 += 1,
                         tickvault_storage::ws_frame_spill::WsType::Depth200 => d200 += 1,
                         tickvault_storage::ws_frame_spill::WsType::OrderUpdate => ord += 1,
@@ -200,12 +217,14 @@ async fn main() -> Result<()> {
                 }
                 info!(
                     dir = %ws_wal_dir,
-                    total = recovered.len(),
+                    total = ws_wal_replay_live_feed.len() as u64 + d20 + d200 + ord,
                     live_feed = live,
                     depth_20 = d20,
                     depth_200 = d200,
                     order_update = ord,
-                    "STAGE-C: WAL replay recovered residual frames (archived after replay)"
+                    "STAGE-C: WAL replay recovered residual frames — LiveFeed will be \
+                     re-injected into live pipeline; Depth + OrderUpdate preserved in \
+                     archive for forensic replay"
                 );
                 metrics::counter!("tv_ws_frame_wal_replay_total", "ws_type" => "live_feed")
                     .increment(live);
@@ -215,11 +234,6 @@ async fn main() -> Result<()> {
                     .increment(d200);
                 metrics::counter!("tv_ws_frame_wal_replay_total", "ws_type" => "order_update")
                     .increment(ord);
-                // Full re-injection into live downstream channels will be
-                // wired in a follow-up (C.2b) once the per-type channels
-                // are constructed below. Recovered frames are preserved in
-                // archive segments inside `ws_wal_path.archive/` for
-                // forensic replay.
             }
         }
         Err(err) => {
@@ -531,6 +545,77 @@ async fn main() -> Result<()> {
             Some((receiver, pool)) => (Some(receiver), Some(pool)),
             None => (None, None),
         };
+
+        // STAGE-C.2b: Re-inject replayed LiveFeed frames into the pool's
+        // frame sender. This happens BEFORE the pool spawns its
+        // connections, so the replayed frames land in the mpsc queue
+        // ahead of any fresh live frame. The tick processor — started
+        // below — drains them in FIFO order and QuestDB dedup keys
+        // (STORAGE-GAP-01) make the replay idempotent, so even if the
+        // same frames were partially persisted before the crash, no
+        // duplicate rows are written.
+        //
+        // If the pool build failed (ws_pool_ready is None) we log a
+        // warning but preserve the frames in the WAL archive.
+        if !ws_wal_replay_live_feed.is_empty() {
+            if let Some(ref pool) = ws_pool_ready {
+                let sender = pool.frame_sender_clone();
+                let capacity = sender.capacity();
+                let to_inject = std::mem::take(&mut ws_wal_replay_live_feed);
+                let count = to_inject.len();
+                info!(
+                    frames = count,
+                    channel_capacity = capacity,
+                    "STAGE-C.2b: re-injecting replayed LiveFeed frames into pool mpsc"
+                );
+                let mut injected = 0u64;
+                let mut dropped = 0u64;
+                for frame in to_inject {
+                    match sender.try_send(frame) {
+                        Ok(()) => injected += 1,
+                        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                            dropped += 1;
+                        }
+                        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                            dropped += 1;
+                        }
+                    }
+                }
+                metrics::counter!(
+                    "tv_ws_frame_wal_reinjected_total",
+                    "ws_type" => "live_feed"
+                )
+                .increment(injected);
+                if dropped > 0 {
+                    // Channel full or closed — replayed frames remain in the
+                    // archive for forensic replay but could not be handed
+                    // to the live consumer. This is a degraded mode, not a
+                    // data loss (the frames are still on disk).
+                    error!(
+                        dropped,
+                        injected,
+                        "STAGE-C.2b: LiveFeed re-injection dropped frames — channel full/closed, \
+                         frames remain in WAL archive"
+                    );
+                    metrics::counter!(
+                        "tv_ws_frame_wal_reinjected_dropped_total",
+                        "ws_type" => "live_feed"
+                    )
+                    .increment(dropped);
+                } else {
+                    info!(
+                        injected,
+                        "STAGE-C.2b: LiveFeed re-injection complete — all replayed frames queued"
+                    );
+                }
+            } else {
+                warn!(
+                    frames = ws_wal_replay_live_feed.len(),
+                    "STAGE-C.2b: LiveFeed replay frames held but pool build failed — \
+                     frames remain in WAL archive, not re-injected"
+                );
+            }
+        }
 
         // S4-T1a/T1b: Shared shutdown notifier. The pool watchdog task
         // listens on this and stops when we signal graceful shutdown, so
@@ -1508,6 +1593,62 @@ async fn main() -> Result<()> {
         warn!("WebSocket pool skipped — running in offline mode");
         (None, None)
     };
+
+    // STAGE-C.2b: Slow-boot mirror of the fast-boot re-injection path.
+    // Re-inject replayed LiveFeed frames into the pool's mpsc BEFORE the
+    // tick processor spawns, so recovered frames land ahead of any live
+    // frames and are persisted idempotently via QuestDB dedup keys.
+    if !ws_wal_replay_live_feed.is_empty() {
+        if let Some(ref pool) = ws_pool_ready {
+            let sender = pool.frame_sender_clone();
+            let capacity = sender.capacity();
+            let to_inject = std::mem::take(&mut ws_wal_replay_live_feed);
+            let count = to_inject.len();
+            info!(
+                frames = count,
+                channel_capacity = capacity,
+                "STAGE-C.2b: re-injecting replayed LiveFeed frames into pool mpsc (slow boot)"
+            );
+            let mut injected = 0u64;
+            let mut dropped = 0u64;
+            for frame in to_inject {
+                match sender.try_send(frame) {
+                    Ok(()) => injected += 1,
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_))
+                    | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => dropped += 1,
+                }
+            }
+            metrics::counter!(
+                "tv_ws_frame_wal_reinjected_total",
+                "ws_type" => "live_feed"
+            )
+            .increment(injected);
+            if dropped > 0 {
+                error!(
+                    dropped,
+                    injected,
+                    "STAGE-C.2b: LiveFeed re-injection dropped frames (slow boot) — \
+                     channel full/closed, frames remain in WAL archive"
+                );
+                metrics::counter!(
+                    "tv_ws_frame_wal_reinjected_dropped_total",
+                    "ws_type" => "live_feed"
+                )
+                .increment(dropped);
+            } else {
+                info!(
+                    injected,
+                    "STAGE-C.2b: LiveFeed re-injection complete (slow boot)"
+                );
+            }
+        } else {
+            warn!(
+                frames = ws_wal_replay_live_feed.len(),
+                "STAGE-C.2b: LiveFeed replay frames held but no pool (slow boot) — \
+                 frames remain in WAL archive, not re-injected"
+            );
+        }
+    }
 
     // -----------------------------------------------------------------------
     // Step 9: Spawn tick processor FIRST (before WS connections send frames)
@@ -2875,7 +3016,8 @@ async fn main() -> Result<()> {
                     if failures >= infra::QUESTDB_LIVENESS_FAILURE_THRESHOLD {
                         health_notifier.notify(NotificationEvent::QuestDbDisconnected {
                             writer: "liveness-check".to_string(),
-                            buffer_size: failures as usize,
+                            signal: u64::from(failures),
+                            signal_kind: "Consecutive liveness failures".to_string(),
                         });
                     } else {
                         tracing::warn!(
@@ -3617,7 +3759,8 @@ async fn run_tick_persistence_consumer(
                 if let Some(ref n) = notifier {
                     n.notify(NotificationEvent::QuestDbDisconnected {
                         writer: format!("tick_persistence (LAGGED: {skipped} ticks lost)"),
-                        buffer_size: skipped as usize,
+                        signal: skipped,
+                        signal_kind: "Ticks dropped by broadcast lag".to_string(),
                     });
                 }
             }
