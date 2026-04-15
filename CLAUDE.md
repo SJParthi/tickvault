@@ -400,6 +400,7 @@ Override per environment via `config/{env}.toml` or env vars.
 | Phase 1 spec | `docs/phases/phase-1-live-trading.md` |
 | Workspace deps (executable truth) | `Cargo.toml` |
 | Dhan API reference | `docs/dhan-ref/*.md` (21 files) |
+| Dhan support comms archive | `docs/dhan-support/` (README + TEMPLATE + incidents) |
 | Benchmark budgets | `quality/benchmark-budgets.toml` |
 | Coverage thresholds | `quality/crate-coverage-thresholds.toml` |
 | Docker compose | `deploy/docker/docker-compose.yml` |
@@ -407,6 +408,35 @@ Override per environment via `config/{env}.toml` or env vars.
 | Pre-push gates | `.claude/hooks/pre-push-gate.sh` |
 | Active plan | `.claude/plans/active-plan.md` |
 | Codebase map | `docs/architecture/codebase-map.md` |
+
+## DHAN SUPPORT COMMUNICATIONS
+
+Every technical email to Dhan API support (`apihelp@dhan.co`) MUST be
+drafted as a markdown file in `docs/dhan-support/`, committed to git,
+and shared with Dhan as a **GitHub rendered link** — never as pasted
+plain text in Gmail (proportional font destroys ASCII tables).
+
+**Mandatory workflow** (enforced — see `docs/dhan-support/README.md`):
+
+1. `cp docs/dhan-support/TEMPLATE.md docs/dhan-support/YYYY-MM-DD-<ticket>-<topic>.md`
+2. Fill in every `<PLACEHOLDER>` (use `grep -n '<[A-Z_]' <file>`)
+3. Commit + push
+4. Share the `https://github.com/.../blob/<branch>/docs/dhan-support/<file>.md` URL in the Gmail reply with ONE short line
+5. Never paste the markdown body into Gmail directly
+
+**Every support email MUST include:**
+- Client ID `1106656882`, Name, UCC `NWXF17021Q`
+- Precise contract labels (e.g. `NIFTY-Jun2026-28500-CE`) — NEVER generic (`NIFTY-ATM-CE`)
+- SecurityId for every contract cited
+- Microsecond IST timestamps
+- Verbatim JSON logs in fenced code blocks
+- "What works" vs "what fails" table (rules out account/token/IP issues)
+- Numbered specific questions (not "please help")
+- Diagnostic offer (tcpdump, different SIDs, secondary IP, etc.)
+
+Precise contract labels are already produced by the app logs + Telegram
+alerts as of commit `3903193` — so future emails can be drafted straight
+from the Telegram alert text with zero manual lookup.
 
 ## PLAN ENFORCEMENT
 
