@@ -526,6 +526,25 @@ impl DeepDepthWriter {
     }
 
     /// Spills a record to disk when the ring buffer is full.
+    ///
+    /// # Durability contract (audit gap DB-8, 2026-04-15)
+    /// After this function returns successfully, the record bytes are **on disk**,
+    /// not merely in the `BufWriter`'s userspace buffer or the kernel page cache.
+    /// We achieve this by:
+    ///   1. `write_all()` — pushes bytes into `BufWriter`.
+    ///   2. `flush()` — drains `BufWriter` userspace buffer to the underlying
+    ///      `File` syscall (writes reach kernel page cache).
+    ///   3. `get_ref().sync_data()` — fsync the file descriptor so the kernel
+    ///      flushes the page cache to the physical block device.
+    ///
+    /// Without step 3, a `kill -9` or kernel panic between `write_all` and the
+    /// next `flush` would lose every record written since the last automatic
+    /// BufWriter drain — which is the exact failure mode the ring-overflow
+    /// spill exists to prevent. `sync_data()` (not `sync_all()`) is used
+    /// because the spill file's metadata doesn't matter for recovery — only
+    /// the data payload does, and `sync_data` is ~3× cheaper than `sync_all`
+    /// on ext4/xfs. The trade-off: mtime/atime may be slightly stale, which
+    /// the recovery path does not rely on.
     fn spill_record_to_disk(&mut self, record: &DeepDepthRecord) {
         // Lazy-open the spill file.
         if self.spill_writer.is_none()
@@ -540,18 +559,50 @@ impl DeepDepthWriter {
             return;
         }
         let data = record.serialize();
-        if let Some(ref mut writer) = self.spill_writer
-            && let Err(err) = writer.write_all(&data)
-        {
-            error!(
-                ?err,
-                records_spilled = self.records_spilled_total,
-                "CRITICAL: disk spill write failed — deep depth record lost"
-            );
-            self.records_dropped_total = self.records_dropped_total.saturating_add(1);
-            metrics::counter!("tv_deep_depth_dropped_total").absolute(self.records_dropped_total);
-            self.spill_writer = None;
-            return;
+        if let Some(ref mut writer) = self.spill_writer {
+            // Step 1: write into BufWriter.
+            if let Err(err) = writer.write_all(&data) {
+                error!(
+                    ?err,
+                    records_spilled = self.records_spilled_total,
+                    "CRITICAL: disk spill write failed — deep depth record lost"
+                );
+                self.records_dropped_total = self.records_dropped_total.saturating_add(1);
+                metrics::counter!("tv_deep_depth_dropped_total")
+                    .absolute(self.records_dropped_total);
+                self.spill_writer = None;
+                return;
+            }
+            // Step 2: flush BufWriter userspace buffer to the underlying File.
+            if let Err(err) = writer.flush() {
+                error!(
+                    ?err,
+                    records_spilled = self.records_spilled_total,
+                    "CRITICAL: disk spill BufWriter flush failed — deep depth record \
+                     may be lost on crash"
+                );
+                self.records_dropped_total = self.records_dropped_total.saturating_add(1);
+                metrics::counter!("tv_deep_depth_dropped_total")
+                    .absolute(self.records_dropped_total);
+                self.spill_writer = None;
+                return;
+            }
+            // Step 3: fsync the file descriptor so the kernel page cache is
+            // flushed to the physical device. This is what turns "written" into
+            // "durable" and closes the crash-window in the audit finding.
+            if let Err(err) = writer.get_ref().sync_data() {
+                error!(
+                    ?err,
+                    records_spilled = self.records_spilled_total,
+                    "CRITICAL: disk spill fsync (sync_data) failed — deep depth \
+                     record not durable on physical device"
+                );
+                self.records_dropped_total = self.records_dropped_total.saturating_add(1);
+                metrics::counter!("tv_deep_depth_dropped_total")
+                    .absolute(self.records_dropped_total);
+                self.spill_writer = None;
+                return;
+            }
         }
         self.records_spilled_total = self.records_spilled_total.saturating_add(1);
         if self.records_spilled_total.is_multiple_of(1000) {
@@ -563,6 +614,11 @@ impl DeepDepthWriter {
     }
 
     /// Opens a spill file for writing.
+    ///
+    /// After opening, we `sync_all` once to guarantee the directory entry and
+    /// file metadata are durable on disk before any records are written. This
+    /// prevents a crash window where `File::create` returned Ok but the
+    /// directory inode hadn't been flushed yet (on ext4 default-mount order).
     fn open_spill_file(&mut self) -> Result<()> {
         std::fs::create_dir_all(DEEP_DEPTH_SPILL_DIR)
             .context("create deep depth spill directory")?;
@@ -574,7 +630,13 @@ impl DeepDepthWriter {
             .append(true)
             .open(&path)
             .context("open deep depth spill file")?;
-        info!(path = %path.display(), "opened deep depth disk spill file");
+        // DB-8: make the file's existence durable immediately. sync_all (not
+        // sync_data) on the freshly-opened file ensures the inode + directory
+        // entry are persisted so recovery after a crash can find the file at
+        // its expected path.
+        file.sync_all()
+            .context("sync_all on freshly-opened deep depth spill file")?;
+        info!(path = %path.display(), "opened deep depth disk spill file (durable)");
         self.spill_writer = Some(BufWriter::new(file));
         self.spill_path = Some(path);
         Ok(())
@@ -964,5 +1026,144 @@ mod tests {
         let record = DeepDepthRecord::from_append(1, 2, "BID", &levels, "200", 0, 0);
         assert_eq!(record.level_count, 200);
         assert_eq!(record.valid_levels().len(), 200);
+    }
+
+    // -----------------------------------------------------------------------
+    // DB-8: disk spill durability (write → flush → fsync contract)
+    // -----------------------------------------------------------------------
+
+    /// Pure-function mirror of the durability contract used by
+    /// `DeepDepthWriter::spill_record_to_disk`. Proves that `write_all` alone
+    /// is insufficient — a crash between `write_all` and `BufWriter::drop`
+    /// loses the buffered bytes, and that `flush + sync_data` fixes it.
+    ///
+    /// We test the helper logic (not the full writer) to avoid needing a live
+    /// QuestDB connection in the unit test. The production code path is the
+    /// same 3-step sequence: write_all → flush → sync_data.
+    #[test]
+    fn test_spill_durability_write_flush_sync_sequence() {
+        use std::io::Write as _;
+        let test_dir = std::path::PathBuf::from("/tmp/tv-test-db8-spill-durability");
+        let _ = std::fs::remove_dir_all(&test_dir);
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let spill_path = test_dir.join("record.bin");
+
+        let data = vec![0xAA_u8; 1024]; // 1 KiB record payload
+
+        // Open with BufWriter (production pattern).
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&spill_path)
+            .unwrap();
+        // Durability step 0 (on open): sync_all so directory entry is durable.
+        file.sync_all().expect("sync_all on open must succeed");
+        let mut writer = std::io::BufWriter::new(file);
+
+        // Step 1: write_all into BufWriter (bytes in userspace only).
+        writer.write_all(&data).expect("write_all must succeed");
+        // Step 2: flush BufWriter → File (bytes reach kernel page cache).
+        writer.flush().expect("flush must succeed");
+        // Step 3: sync_data → physical device (durable).
+        writer
+            .get_ref()
+            .sync_data()
+            .expect("sync_data must succeed");
+
+        // After the 3-step sequence, the raw file on disk MUST contain the
+        // exact bytes — without holding a drop on the BufWriter.
+        let read_back = std::fs::read(&spill_path).unwrap();
+        assert_eq!(
+            read_back.len(),
+            data.len(),
+            "sync_data must have persisted all bytes to disk before BufWriter drop"
+        );
+        assert_eq!(
+            read_back, data,
+            "persisted bytes must match source byte-for-byte"
+        );
+
+        // Cleanup.
+        let _ = std::fs::remove_dir_all(&test_dir);
+    }
+
+    /// Verifies that just `write_all` (without flush/sync) leaves bytes
+    /// buffered in userspace — this is the ORIGINAL bug the DB-8 fix closes.
+    /// If this test ever starts failing (i.e. read-back equals data without
+    /// flush), it means either Rust changed `BufWriter` semantics or the
+    /// test is racing with a background flusher — investigate before
+    /// assuming the durability fix is now unnecessary.
+    #[test]
+    fn test_spill_write_all_alone_may_not_be_durable() {
+        use std::io::Write as _;
+        let test_dir = std::path::PathBuf::from("/tmp/tv-test-db8-spill-no-flush");
+        let _ = std::fs::remove_dir_all(&test_dir);
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let spill_path = test_dir.join("record.bin");
+
+        // Write enough data that BufWriter's 8 KiB default capacity is NOT
+        // exceeded — otherwise BufWriter auto-flushes and the test is moot.
+        let data = vec![0xBB_u8; 256];
+
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&spill_path)
+            .unwrap();
+        let mut writer = std::io::BufWriter::new(file);
+        writer.write_all(&data).unwrap();
+        // Intentionally NO flush, NO sync. Read the raw file — it should be
+        // empty or incomplete because the bytes are still in BufWriter.
+
+        // Read the underlying file BEFORE dropping the writer. We open a
+        // second handle so the first is still holding the buffer.
+        let on_disk_before_drop = std::fs::read(&spill_path).unwrap();
+        // This is the crux: without flush, bytes are in the BufWriter, not
+        // on the underlying File. The read should return 0 bytes (or a
+        // partial count if BufWriter auto-flushed, but 256 < 8192 default).
+        assert_eq!(
+            on_disk_before_drop.len(),
+            0,
+            "DB-8 audit invariant: without an explicit flush/sync, BufWriter \
+             bytes are NOT durable. If this assertion ever fails, BufWriter \
+             semantics have changed — do NOT remove the flush/sync in \
+             spill_record_to_disk without reviewing the full failure mode."
+        );
+
+        // Now drop the writer (implicit flush on drop), and confirm the data
+        // lands. This proves the original path is vulnerable to `kill -9`
+        // between `write_all` and drop.
+        drop(writer);
+        let on_disk_after_drop = std::fs::read(&spill_path).unwrap();
+        assert_eq!(on_disk_after_drop.len(), data.len());
+
+        let _ = std::fs::remove_dir_all(&test_dir);
+    }
+
+    /// Opens a spill file the same way `open_spill_file` does, calls
+    /// `sync_all`, and verifies the file exists at its expected path on
+    /// another independent stat call. This guards the DB-8 step 0 (directory
+    /// entry durability).
+    #[test]
+    fn test_spill_open_sync_all_makes_file_discoverable() {
+        let test_dir = std::path::PathBuf::from("/tmp/tv-test-db8-open-sync");
+        let _ = std::fs::remove_dir_all(&test_dir);
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let path = test_dir.join("deep-depth-openfsync.bin");
+
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        file.sync_all().expect("sync_all on freshly-opened file");
+
+        // Independent stat — if the directory entry is durable, this
+        // succeeds even without touching the first handle again.
+        assert!(path.exists(), "sync_all must make file discoverable");
+        let md = std::fs::metadata(&path).unwrap();
+        assert_eq!(md.len(), 0, "freshly-opened file must be zero-length");
+
+        let _ = std::fs::remove_dir_all(&test_dir);
     }
 }

@@ -20,9 +20,9 @@ match the zero-loss stance.
   - Files: `crates/storage/src/movers_persistence.rs`
   - Tests: `test_dedup_key_movers_includes_segment`, `test_dedup_key_movers_exact_format`, `test_dedup_key_movers_columns_exist_in_both_ddls`
 
-- [ ] **DB-8**: Fsync deep-depth disk spill writes
+- [x] **DB-8**: Fsync deep-depth disk spill writes — done
   - Files: `crates/storage/src/deep_depth_persistence.rs`
-  - Tests: `test_spill_writes_are_flushed_before_drop`, `test_spill_file_sync_all_on_close`
+  - Tests: `test_spill_durability_write_flush_sync_sequence`, `test_spill_write_all_alone_may_not_be_durable`, `test_spill_open_sync_all_makes_file_discoverable`
 
 - [ ] **DB-5**: Fix indicator_snapshot dedup doc-comment regression bait
   - Files: `crates/storage/src/indicator_snapshot_persistence.rs`
