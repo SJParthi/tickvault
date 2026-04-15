@@ -135,7 +135,7 @@
     "refresh_intervals": ["5s", "10s", "30s", "1m", "5m"]
   },
   "timezone": "Asia/Kolkata",
-  "title": "DLT — Traefik",
+  "title": "tickvault — Traefik",
   "uid": "tv-traefik",
   "version": 1
 }

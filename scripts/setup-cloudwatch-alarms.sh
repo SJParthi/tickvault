@@ -150,7 +150,7 @@ info "Creating alarm: ${ALARM_NAME_DOCKER}"
 aws cloudwatch put-metric-alarm \
     --alarm-name "$ALARM_NAME_DOCKER" \
     --alarm-description "CRITICAL: Docker daemon on tv-${SSM_ENV} is not responding. Containers may be down. Check systemd: systemctl status docker." \
-    --namespace "DLT/Infrastructure" \
+    --namespace "tickvault/Infrastructure" \
     --metric-name "DockerDaemonHealthy" \
     --dimensions "Name=InstanceId,Value=${INSTANCE_ID}" \
     --statistic "Minimum" \
@@ -170,7 +170,7 @@ ok "Alarm created: Docker daemon heartbeat missing → SMS within 3 minutes"
 CRON_SCRIPT="/opt/tickvault/docker-heartbeat.sh"
 info "Installing Docker heartbeat publisher at ${CRON_SCRIPT}"
 
-sudo mkdir -p /opt/dlt 2>/dev/null || true
+sudo mkdir -p /opt/tickvault 2>/dev/null || true
 
 sudo tee "$CRON_SCRIPT" > /dev/null << 'HEARTBEAT_EOF'
 #!/usr/bin/env bash
@@ -185,7 +185,7 @@ INSTANCE_ID=$(curl -sf --max-time 2 -X PUT "http://169.254.169.254/latest/api/to
     xargs -I{} curl -sf --max-time 2 "http://169.254.169.254/latest/meta-data/instance-id" \
     -H "X-aws-ec2-metadata-token: {}" 2>/dev/null || echo "unknown")
 aws cloudwatch put-metric-data \
-    --namespace "DLT/Infrastructure" \
+    --namespace "tickvault/Infrastructure" \
     --metric-name "DockerDaemonHealthy" \
     --dimensions "InstanceId=${INSTANCE_ID}" \
     --value "$VALUE" \

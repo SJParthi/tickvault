@@ -290,7 +290,9 @@ else
         docker compose -f "${COMPOSE_FILE}" ps --all 2>&1 || true
         echo ""
         info "Recent container logs (last 30 lines per failed service):"
-        for svc in tv-questdb tv-valkey tv-prometheus tv-grafana tv-loki tv-alloy tv-jaeger tv-traefik; do
+        # Loki, Alloy, Jaeger removed per aws-budget.md (saves 2.5GB RAM).
+        # Keep in sync with docker-compose.yml services.
+        for svc in tv-questdb tv-valkey tv-valkey-exporter tv-prometheus tv-alertmanager tv-grafana tv-traefik; do
             STATUS=$(docker inspect --format='{{.State.Status}}' "$svc" 2>/dev/null || echo "not_found")
             if [ "$STATUS" != "running" ]; then
                 echo -e "  ${RED}--- ${svc} (${STATUS}) ---${NC}"
@@ -310,14 +312,12 @@ fi
 # ---- Step 9: Wait for all services ----
 step "Waiting for services to be healthy"
 HEALTH_FAIL=0
+# Jaeger, Alloy, Loki removed per aws-budget.md (2.5GB RAM saving).
 wait_for_http "QuestDB"         "http://localhost:9000"            120 || HEALTH_FAIL=$((HEALTH_FAIL + 1))
 wait_for_http "Prometheus"      "http://localhost:9090/-/healthy"    30 || HEALTH_FAIL=$((HEALTH_FAIL + 1))
 wait_for_http "Grafana"         "http://localhost:3000/api/health"  45 || HEALTH_FAIL=$((HEALTH_FAIL + 1))
-wait_for_http "Jaeger UI"       "http://localhost:16686"            30 || HEALTH_FAIL=$((HEALTH_FAIL + 1))
 wait_for_http "Traefik"         "http://localhost:8080/api/rawdata" 20 || HEALTH_FAIL=$((HEALTH_FAIL + 1))
 wait_for_http "Traefik Metrics" "http://localhost:8082/metrics"     20 || HEALTH_FAIL=$((HEALTH_FAIL + 1))
-wait_for_http "Alloy"           "http://localhost:12345"            30 || true  # non-critical
-wait_for_http "Loki"            "http://localhost:3100/ready"       30 || true  # non-critical
 
 if [ "$HEALTH_FAIL" -gt 0 ]; then
     warn "$HEALTH_FAIL services slow to start (may still be initializing)"
@@ -467,7 +467,7 @@ if [ -n "$TRAEFIK_ROUTERS" ]; then
     ROUTER_COUNT=$(echo "$TRAEFIK_ROUTERS" | grep -o '"name"' | wc -l | tr -d ' ')
     info "HTTP routers: ${ROUTER_COUNT}"
     # Check for expected routes
-    for route in grafana prometheus questdb jaeger; do
+    for route in grafana prometheus questdb; do
         if echo "$TRAEFIK_ROUTERS" | grep -qi "$route"; then
             info "  /${route}: routed"
         else
@@ -513,24 +513,15 @@ else
     fi
 fi
 
-# ---- Step 17: Loki + Alloy log pipeline ----
-step "Validating Loki log ingestion pipeline"
-# Check Loki is ready
-LOKI_READY=$(curl -sf --max-time 3 "http://localhost:3100/ready" 2>/dev/null || echo "")
-if echo "$LOKI_READY" | grep -qi "ready"; then
-    info "Loki: ready"
-else
-    info "Loki: warming up (non-blocking)"
-fi
-
-# Check Alloy is forwarding to Loki (query for any recent logs)
-LOKI_LABELS=$(curl -sf --max-time 5 "http://localhost:3100/loki/api/v1/labels" 2>/dev/null || echo "")
-if echo "$LOKI_LABELS" | grep -q "container"; then
-    info "Alloy -> Loki pipeline: active (container labels present)"
-    ok "Log pipeline operational"
-else
-    warn "No container labels in Loki yet (Alloy may still be discovering containers)"
-fi
+# ---- Step 17: Log pipeline (Loki + Alloy removed per aws-budget.md) ----
+# Loki and Alloy were removed to save 2.5GB RAM on the c7i.xlarge budget.
+# Logs are now read directly via `docker logs tickvault --tail 100 -f`
+# locally, and via CloudWatch journald collection on AWS (see
+# user-data.sh.tftpl). This step is intentionally a no-op — kept so
+# step numbering matches prior runbook references.
+step "Log pipeline (Loki + Alloy removed — see aws-budget.md)"
+info "Local: docker logs tickvault --tail 100 -f"
+info "AWS:   CloudWatch Logs /tickvault/<env>/system via journald"
 
 # ---- Step 18: Summary + auto-open ----
 step "Final report"
@@ -543,18 +534,14 @@ echo ""
 echo -e "  ${BOLD}Service URLs:${NC}"
 echo -e "    ${CYAN}Grafana${NC}         http://localhost:3000"
 echo -e "    ${CYAN}Prometheus${NC}      http://localhost:9090"
-echo -e "    ${CYAN}Jaeger${NC}          http://localhost:16686"
+echo -e "    ${CYAN}Alertmanager${NC}    http://localhost:9093"
 echo -e "    ${CYAN}Traefik${NC}         http://localhost:8080"
 echo -e "    ${CYAN}QuestDB${NC}         http://localhost:9000"
-echo -e "    ${CYAN}Loki${NC}            http://localhost:3100"
-echo -e "    ${CYAN}Alloy${NC}           http://localhost:12345"
 echo ""
 echo -e "  ${BOLD}Traefik Unified Routes:${NC}"
 echo -e "    ${CYAN}All Services${NC}    http://localhost/grafana"
 echo -e "                    http://localhost/prometheus"
-echo -e "                    http://localhost/jaeger"
 echo -e "                    http://localhost/questdb"
-echo -e "                    http://localhost/alloy"
 echo ""
 echo -e "  ${BOLD}Grafana Credentials:${NC}"
 echo -e "    User: ${TV_GRAFANA_ADMIN_USER}"
@@ -568,12 +555,10 @@ if [ "$OPEN_BROWSER" = true ] && [ "$FAIL" -eq 0 ]; then
     sleep 0.5
     open_url "http://localhost:9090/targets"
     sleep 0.5
-    open_url "http://localhost:16686"
-    sleep 0.5
     open_url "http://localhost:8080"
     sleep 0.5
     open_url "http://localhost:9000"
-    echo -e "  ${GREEN}Opened: Grafana, Prometheus, Jaeger, Traefik, QuestDB${NC}"
+    echo -e "  ${GREEN}Opened: Grafana, Prometheus, Traefik, QuestDB${NC}"
 fi
 
 echo ""

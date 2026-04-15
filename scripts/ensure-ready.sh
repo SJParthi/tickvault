@@ -21,15 +21,23 @@ NC='\033[0m'
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-# ---- Telegram alert helper (best-effort) ----
+# ---- Telegram alert helper ----
 # Fires a CRITICAL Telegram alert when automation cannot proceed.
-# Silent no-op if notify-telegram.sh isn't installed or SSM isn't reachable —
-# never let alerting failure block the main flow.
+# Never blocks the main flow — but PRINTS the reason if delivery fails,
+# so the operator can see why Telegram was silent.
 send_telegram_alert() {
     local message="$1"
     local notify_script="${SCRIPT_DIR}/notify-telegram.sh"
-    if [ -x "${notify_script}" ]; then
-        bash "${notify_script}" "${message}" >/dev/null 2>&1 || true
+    if [ ! -x "${notify_script}" ]; then
+        echo -e "${YELLOW}WARN: notify-telegram.sh not found or not executable — alert silently lost${NC}" >&2
+        echo -e "${YELLOW}  Message was: ${message}${NC}" >&2
+        return 0
+    fi
+    # Do NOT swallow stderr — if Telegram is misconfigured the warning
+    # from notify-telegram.sh is how the operator learns about it.
+    # Swallow only non-zero exit so ensure-ready continues.
+    if ! bash "${notify_script}" "${message}"; then
+        echo -e "${YELLOW}WARN: Telegram delivery failed (see message above)${NC}" >&2
     fi
 }
 
@@ -108,7 +116,15 @@ open_url() {
 }
 
 # ---- Auto-open all monitoring dashboards ----
+# Opens the monitoring stack in the default browser. Jaeger was removed in
+# the aws-budget.md RAM-saving pass so its URL is no longer opened — it
+# would 404 otherwise. Call is guarded by TV_SKIP_DASHBOARDS=1 for when
+# you don't want the browser to pop up (CI, AWS EventBridge, headless).
 open_dashboards() {
+    if [ "${TV_SKIP_DASHBOARDS:-0}" = "1" ]; then
+        echo -e "${CYAN}Skipping dashboard auto-open (TV_SKIP_DASHBOARDS=1)${NC}"
+        return 0
+    fi
     echo -e "${CYAN}Opening monitoring dashboards...${NC}"
     # QuestDB web console — primary SQL tool
     open_url "http://localhost:9000"
@@ -119,10 +135,7 @@ open_dashboards() {
     open_url "http://localhost:3000/d/tv-market-data/market-data-explorer?orgId=1&from=now-3d&to=now&timezone=Asia%2FKolkata&refresh=5s"
     sleep 0.3
     open_url "http://localhost:3000/d/tv-trading-pipeline/trading-pipeline?orgId=1&refresh=5s"
-    sleep 0.3
-    # Jaeger tracing UI
-    open_url "http://localhost:16686"
-    echo -e "${GREEN}Opened: QuestDB, Grafana (3 dashboards), Jaeger${NC}"
+    echo -e "${GREEN}Opened: QuestDB + Grafana (3 dashboards)${NC}"
 }
 
 # ---- Auto-configure ~/.pgpass for IntelliJ QuestDB database tool ----
@@ -147,15 +160,20 @@ ensure_pgpass() {
     chmod 600 ~/.pgpass
 }
 
-# ---- Fast path: check if all 8 containers are running ----
+# ---- Fast path: check if all 7 containers are running ----
+# Loki, Alloy, and Jaeger were removed per `.claude/rules/project/aws-budget.md`
+# to save 2.5GB RAM on the c7i.xlarge AWS budget. Previously this list
+# still contained them, so `all_running` always returned false, the fast
+# path never fired, and `open_dashboards()` was never reached — that's
+# why "auto-open dashboards" was silently broken. Keep this list in sync
+# with `deploy/docker/docker-compose.yml` services.
 REQUIRED_CONTAINERS=(
     "tv-questdb"
     "tv-valkey"
+    "tv-valkey-exporter"
     "tv-prometheus"
+    "tv-alertmanager"
     "tv-grafana"
-    "tv-loki"
-    "tv-alloy"
-    "tv-jaeger"
     "tv-traefik"
 )
 
