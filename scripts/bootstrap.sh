@@ -130,20 +130,20 @@ ENVIRONMENT="${SSM_ENV}" bash scripts/provision-infra-secrets.sh
 
 # Fetch credentials and export for docker-compose
 echo -n "  Exporting QuestDB credentials... "
-TV_QUESTDB_PG_USER=$(fetch_ssm_secret "/tickvault/${SSM_ENV}/questdb/pg-user")
-TV_QUESTDB_PG_PASSWORD=$(fetch_ssm_secret "/tickvault/${SSM_ENV}/questdb/pg-password") # ssm_parameter fetch, not hardcoded
+TV_QUESTDB_PG_USER=$(fetch_ssm_secret "/dlt/${SSM_ENV}/questdb/pg-user")
+TV_QUESTDB_PG_PASSWORD=$(fetch_ssm_secret "/dlt/${SSM_ENV}/questdb/pg-password") # ssm_parameter fetch, not hardcoded
 export TV_QUESTDB_PG_USER TV_QUESTDB_PG_PASSWORD
 echo -e "${GREEN}OK${NC}"
 
 echo -n "  Exporting Grafana credentials... "
-TV_GRAFANA_ADMIN_USER=$(fetch_ssm_secret "/tickvault/${SSM_ENV}/grafana/admin-user")
-TV_GRAFANA_ADMIN_PASSWORD=$(fetch_ssm_secret "/tickvault/${SSM_ENV}/grafana/admin-password") # ssm_parameter fetch, not hardcoded
+TV_GRAFANA_ADMIN_USER=$(fetch_ssm_secret "/dlt/${SSM_ENV}/grafana/admin-user")
+TV_GRAFANA_ADMIN_PASSWORD=$(fetch_ssm_secret "/dlt/${SSM_ENV}/grafana/admin-password") # ssm_parameter fetch, not hardcoded
 export TV_GRAFANA_ADMIN_USER TV_GRAFANA_ADMIN_PASSWORD
 echo -e "${GREEN}OK${NC}"
 
 echo -n "  Exporting Telegram credentials for Grafana alerts... "
-TV_TELEGRAM_BOT_TOKEN=$(fetch_ssm_secret "/tickvault/${SSM_ENV}/telegram/bot-token")
-TV_TELEGRAM_CHAT_ID=$(fetch_ssm_secret "/tickvault/${SSM_ENV}/telegram/chat-id")
+TV_TELEGRAM_BOT_TOKEN=$(fetch_ssm_secret "/dlt/${SSM_ENV}/telegram/bot-token")
+TV_TELEGRAM_CHAT_ID=$(fetch_ssm_secret "/dlt/${SSM_ENV}/telegram/chat-id")
 export TV_TELEGRAM_BOT_TOKEN TV_TELEGRAM_CHAT_ID
 echo -e "${GREEN}OK${NC}"
 

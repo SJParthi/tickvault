@@ -345,19 +345,19 @@ mod tests {
     #[test]
     fn test_build_ssm_path_dev() {
         let path = build_ssm_path("dev", SSM_DHAN_SERVICE, DHAN_CLIENT_ID_SECRET);
-        assert_eq!(path, "/tickvault/dev/dhan/client-id");
+        assert_eq!(path, "/dlt/dev/dhan/client-id");
     }
 
     #[test]
     fn test_build_ssm_path_prod() {
         let path = build_ssm_path("prod", SSM_DHAN_SERVICE, DHAN_CLIENT_SECRET_SECRET);
-        assert_eq!(path, "/tickvault/prod/dhan/client-secret");
+        assert_eq!(path, "/dlt/prod/dhan/client-secret");
     }
 
     #[test]
     fn test_build_ssm_path_totp() {
         let path = build_ssm_path("dev", SSM_DHAN_SERVICE, DHAN_TOTP_SECRET);
-        assert_eq!(path, "/tickvault/dev/dhan/totp-secret");
+        assert_eq!(path, "/dlt/dev/dhan/totp-secret");
     }
 
     // -----------------------------------------------------------------------
@@ -420,15 +420,15 @@ mod tests {
     fn test_build_ssm_path_all_secret_types_dev() {
         assert_eq!(
             build_ssm_path("dev", SSM_DHAN_SERVICE, DHAN_CLIENT_ID_SECRET),
-            "/tickvault/dev/dhan/client-id"
+            "/dlt/dev/dhan/client-id"
         );
         assert_eq!(
             build_ssm_path("dev", SSM_DHAN_SERVICE, DHAN_CLIENT_SECRET_SECRET),
-            "/tickvault/dev/dhan/client-secret"
+            "/dlt/dev/dhan/client-secret"
         );
         assert_eq!(
             build_ssm_path("dev", SSM_DHAN_SERVICE, DHAN_TOTP_SECRET),
-            "/tickvault/dev/dhan/totp-secret"
+            "/dlt/dev/dhan/totp-secret"
         );
     }
 
@@ -436,15 +436,15 @@ mod tests {
     fn test_build_ssm_path_all_secret_types_prod() {
         assert_eq!(
             build_ssm_path("prod", SSM_DHAN_SERVICE, DHAN_CLIENT_ID_SECRET),
-            "/tickvault/prod/dhan/client-id"
+            "/dlt/prod/dhan/client-id"
         );
         assert_eq!(
             build_ssm_path("prod", SSM_DHAN_SERVICE, DHAN_CLIENT_SECRET_SECRET),
-            "/tickvault/prod/dhan/client-secret"
+            "/dlt/prod/dhan/client-secret"
         );
         assert_eq!(
             build_ssm_path("prod", SSM_DHAN_SERVICE, DHAN_TOTP_SECRET),
-            "/tickvault/prod/dhan/totp-secret"
+            "/dlt/prod/dhan/totp-secret"
         );
     }
 
@@ -514,14 +514,14 @@ mod tests {
     fn test_build_ssm_path_telegram_bot_token() {
         use tickvault_common::constants::{SSM_TELEGRAM_SERVICE, TELEGRAM_BOT_TOKEN_SECRET};
         let path = build_ssm_path("dev", SSM_TELEGRAM_SERVICE, TELEGRAM_BOT_TOKEN_SECRET);
-        assert_eq!(path, "/tickvault/dev/telegram/bot-token");
+        assert_eq!(path, "/dlt/dev/telegram/bot-token");
     }
 
     #[test]
     fn test_build_ssm_path_telegram_chat_id() {
         use tickvault_common::constants::{SSM_TELEGRAM_SERVICE, TELEGRAM_CHAT_ID_SECRET};
         let path = build_ssm_path("prod", SSM_TELEGRAM_SERVICE, TELEGRAM_CHAT_ID_SECRET);
-        assert_eq!(path, "/tickvault/prod/telegram/chat-id");
+        assert_eq!(path, "/dlt/prod/telegram/chat-id");
     }
 
     // -----------------------------------------------------------------------
@@ -532,11 +532,11 @@ mod tests {
     fn test_build_ssm_path_questdb_dev() {
         assert_eq!(
             build_ssm_path("dev", SSM_QUESTDB_SERVICE, QUESTDB_PG_USER_SECRET),
-            "/tickvault/dev/questdb/pg-user"
+            "/dlt/dev/questdb/pg-user"
         );
         assert_eq!(
             build_ssm_path("dev", SSM_QUESTDB_SERVICE, QUESTDB_PG_PASSWORD_SECRET),
-            "/tickvault/dev/questdb/pg-password"
+            "/dlt/dev/questdb/pg-password"
         );
     }
 
@@ -544,11 +544,11 @@ mod tests {
     fn test_build_ssm_path_questdb_prod() {
         assert_eq!(
             build_ssm_path("prod", SSM_QUESTDB_SERVICE, QUESTDB_PG_USER_SECRET),
-            "/tickvault/prod/questdb/pg-user"
+            "/dlt/prod/questdb/pg-user"
         );
         assert_eq!(
             build_ssm_path("prod", SSM_QUESTDB_SERVICE, QUESTDB_PG_PASSWORD_SECRET),
-            "/tickvault/prod/questdb/pg-password"
+            "/dlt/prod/questdb/pg-password"
         );
     }
 
@@ -560,11 +560,11 @@ mod tests {
     fn test_build_ssm_path_grafana_dev() {
         assert_eq!(
             build_ssm_path("dev", SSM_GRAFANA_SERVICE, GRAFANA_ADMIN_USER_SECRET),
-            "/tickvault/dev/grafana/admin-user"
+            "/dlt/dev/grafana/admin-user"
         );
         assert_eq!(
             build_ssm_path("dev", SSM_GRAFANA_SERVICE, GRAFANA_ADMIN_PASSWORD_SECRET),
-            "/tickvault/dev/grafana/admin-password"
+            "/dlt/dev/grafana/admin-password"
         );
     }
 
@@ -572,11 +572,11 @@ mod tests {
     fn test_build_ssm_path_grafana_prod() {
         assert_eq!(
             build_ssm_path("prod", SSM_GRAFANA_SERVICE, GRAFANA_ADMIN_USER_SECRET),
-            "/tickvault/prod/grafana/admin-user"
+            "/dlt/prod/grafana/admin-user"
         );
         assert_eq!(
             build_ssm_path("prod", SSM_GRAFANA_SERVICE, GRAFANA_ADMIN_PASSWORD_SECRET),
-            "/tickvault/prod/grafana/admin-password"
+            "/dlt/prod/grafana/admin-password"
         );
     }
 
@@ -630,7 +630,7 @@ mod tests {
     #[test]
     fn test_build_ssm_path_with_custom_service() {
         let path = build_ssm_path("dev", "custom-svc", "api-key");
-        assert_eq!(path, "/tickvault/dev/custom-svc/api-key");
+        assert_eq!(path, "/dlt/dev/custom-svc/api-key");
     }
 
     // -----------------------------------------------------------------------

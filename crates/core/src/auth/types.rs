@@ -680,7 +680,7 @@ mod tests {
             SSM_SECRET_BASE_PATH, environment, SSM_DHAN_SERVICE, DHAN_CLIENT_ID_SECRET
         );
 
-        assert_eq!(path, "/tickvault/dev/dhan/client-id");
+        assert_eq!(path, "/dlt/dev/dhan/client-id");
     }
 
     #[test]
@@ -695,7 +695,7 @@ mod tests {
             SSM_SECRET_BASE_PATH, environment, SSM_DHAN_SERVICE, DHAN_CLIENT_SECRET_SECRET
         );
 
-        assert_eq!(path, "/tickvault/prod/dhan/client-secret");
+        assert_eq!(path, "/dlt/prod/dhan/client-secret");
     }
 
     #[test]

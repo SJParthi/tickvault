@@ -2,23 +2,18 @@
 # =============================================================================
 # tickvault — Send Telegram notification
 # =============================================================================
-# Reads bot token + chat ID from one of (in priority order):
-#   1. Environment variables TV_TELEGRAM_BOT_TOKEN + TV_TELEGRAM_CHAT_ID
-#      (local dev — set these in ~/.zshrc or wherever; no AWS required)
-#   2. AWS SSM Parameter Store /tickvault/<env>/telegram/{bot-token,chat-id}
-#      (production path — AWS EC2 uses this via instance IAM role)
+# Reads bot token + chat ID from AWS SSM Parameter Store only. No env var
+# fallback: AWS SSM is the single source of truth for all secrets.
 #
 # Usage:
 #   ./scripts/notify-telegram.sh "Task completed: environment setup done"
 #   ./scripts/notify-telegram.sh "Error: QuestDB write failed"
 #
-# Local dev setup (one-time, no AWS needed):
-#   export TV_TELEGRAM_BOT_TOKEN="<your bot token from @BotFather>"
-#   export TV_TELEGRAM_CHAT_ID="<your chat ID from @userinfobot>"
-#   # Add both lines to ~/.zshrc so every shell picks them up.
+# Prerequisites: AWS CLI configured with credentials that can read
+# /dlt/<env>/telegram/{bot-token,chat-id} from SSM Parameter Store.
 #
 # Environment:
-#   ENVIRONMENT — "dev" (default) or "prod"  (used for SSM path only)
+#   ENVIRONMENT — "dev" (default) or "prod"
 # =============================================================================
 
 set -euo pipefail
@@ -28,8 +23,8 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 REGION="ap-south-1"
 ENV="${ENVIRONMENT:-dev}"
-SSM_BOT_TOKEN_PATH="/tickvault/${ENV}/telegram/bot-token"
-SSM_CHAT_ID_PATH="/tickvault/${ENV}/telegram/chat-id"
+SSM_BOT_TOKEN_PATH="/dlt/${ENV}/telegram/bot-token"
+SSM_CHAT_ID_PATH="/dlt/${ENV}/telegram/chat-id"
 TELEGRAM_API="https://api.telegram.org"
 
 # ---------------------------------------------------------------------------
@@ -44,47 +39,30 @@ fi
 MESSAGE="$1"
 
 # ---------------------------------------------------------------------------
-# Resolve credentials — try env vars first (local dev), then SSM (AWS)
+# Require AWS CLI — SSM is the single source of truth
 # ---------------------------------------------------------------------------
-BOT_TOKEN="${TV_TELEGRAM_BOT_TOKEN:-}"
-CHAT_ID="${TV_TELEGRAM_CHAT_ID:-}"
+if ! command -v aws > /dev/null 2>&1; then
+    echo "ERROR: aws CLI not available — Telegram notification NOT sent" >&2
+    echo "  Message was: ${MESSAGE}" >&2
+    echo "  Install aws CLI and configure credentials with SSM read access." >&2
+    exit 2
+fi
 
-if [ -z "${BOT_TOKEN}" ] || [ -z "${CHAT_ID}" ]; then
-    # Fallback to AWS SSM
-    if ! command -v aws > /dev/null 2>&1; then
-        cat >&2 <<WARN_EOF
-WARN: Telegram notification NOT sent
-  Message was: ${MESSAGE}
-  Reason: Neither local env vars nor AWS CLI are configured.
-  Fix (one-time):
-    export TV_TELEGRAM_BOT_TOKEN="<token from @BotFather>"
-    export TV_TELEGRAM_CHAT_ID="<chat ID from @userinfobot>"
-  Then add both to ~/.zshrc and restart your terminal.
-WARN_EOF
-        exit 2
-    fi
+SSM_ARGS="--region ${REGION} --with-decryption --output text --query Parameter.Value --no-cli-pager"
 
-    SSM_ARGS="--region ${REGION} --with-decryption --output text --query Parameter.Value --no-cli-pager"
+BOT_TOKEN=$(aws ssm get-parameter --name "${SSM_BOT_TOKEN_PATH}" ${SSM_ARGS} 2>/dev/null) || true
+CHAT_ID=$(aws ssm get-parameter --name "${SSM_CHAT_ID_PATH}" ${SSM_ARGS} 2>/dev/null) || true
 
-    if [ -z "${BOT_TOKEN}" ]; then
-        BOT_TOKEN=$(aws ssm get-parameter --name "${SSM_BOT_TOKEN_PATH}" ${SSM_ARGS} 2>/dev/null) || true
-    fi
-    if [ -z "${CHAT_ID}" ]; then
-        CHAT_ID=$(aws ssm get-parameter --name "${SSM_CHAT_ID_PATH}" ${SSM_ARGS} 2>/dev/null) || true
-    fi
+if [ -z "${BOT_TOKEN}" ]; then
+    echo "ERROR: Telegram bot-token missing from SSM (${SSM_BOT_TOKEN_PATH})" >&2
+    echo "  Message was: ${MESSAGE}" >&2
+    exit 2
+fi
 
-    if [ -z "${BOT_TOKEN}" ] || [ -z "${CHAT_ID}" ]; then
-        cat >&2 <<WARN_EOF
-WARN: Telegram notification NOT sent
-  Message was: ${MESSAGE}
-  Reason: Neither local env vars nor SSM parameters are configured.
-  Local dev fix (recommended, fastest):
-    export TV_TELEGRAM_BOT_TOKEN="<token from @BotFather>"
-    export TV_TELEGRAM_CHAT_ID="<chat ID from @userinfobot>"
-  AWS fix: run bootstrap.sh once to provision /tickvault/${ENV}/telegram/*
-WARN_EOF
-        exit 2
-    fi
+if [ -z "${CHAT_ID}" ]; then
+    echo "ERROR: Telegram chat-id missing from SSM (${SSM_CHAT_ID_PATH})" >&2
+    echo "  Message was: ${MESSAGE}" >&2
+    exit 2
 fi
 
 # ---------------------------------------------------------------------------

@@ -225,16 +225,16 @@ step "Provisioning infrastructure secrets (SSM)"
 ENVIRONMENT="${SSM_ENV}" bash "${SCRIPT_DIR}/provision-infra-secrets.sh"
 
 info "Fetching credentials for docker-compose..."
-TV_QUESTDB_PG_USER=$(fetch_ssm_secret "/tickvault/${SSM_ENV}/questdb/pg-user")
-TV_QUESTDB_PG_PASSWORD=$(fetch_ssm_secret "/tickvault/${SSM_ENV}/questdb/pg-password")
-TV_GRAFANA_ADMIN_USER=$(fetch_ssm_secret "/tickvault/${SSM_ENV}/grafana/admin-user")
-TV_GRAFANA_ADMIN_PASSWORD=$(fetch_ssm_secret "/tickvault/${SSM_ENV}/grafana/admin-password")
+TV_QUESTDB_PG_USER=$(fetch_ssm_secret "/dlt/${SSM_ENV}/questdb/pg-user")
+TV_QUESTDB_PG_PASSWORD=$(fetch_ssm_secret "/dlt/${SSM_ENV}/questdb/pg-password")
+TV_GRAFANA_ADMIN_USER=$(fetch_ssm_secret "/dlt/${SSM_ENV}/grafana/admin-user")
+TV_GRAFANA_ADMIN_PASSWORD=$(fetch_ssm_secret "/dlt/${SSM_ENV}/grafana/admin-password")
 export TV_QUESTDB_PG_USER TV_QUESTDB_PG_PASSWORD TV_GRAFANA_ADMIN_USER TV_GRAFANA_ADMIN_PASSWORD
 
 # Telegram credentials — used by Grafana alerting contact point (alerts.yml).
 # Same SSM path as the Rust app and notify-telegram.sh — ONE source, everywhere.
-TV_TELEGRAM_BOT_TOKEN=$(fetch_ssm_secret "/tickvault/${SSM_ENV}/telegram/bot-token" 2>/dev/null || echo "")
-TV_TELEGRAM_CHAT_ID=$(fetch_ssm_secret "/tickvault/${SSM_ENV}/telegram/chat-id" 2>/dev/null || echo "")
+TV_TELEGRAM_BOT_TOKEN=$(fetch_ssm_secret "/dlt/${SSM_ENV}/telegram/bot-token" 2>/dev/null || echo "")
+TV_TELEGRAM_CHAT_ID=$(fetch_ssm_secret "/dlt/${SSM_ENV}/telegram/chat-id" 2>/dev/null || echo "")
 export TV_TELEGRAM_BOT_TOKEN TV_TELEGRAM_CHAT_ID
 
 if [ -n "$TV_TELEGRAM_BOT_TOKEN" ] && [ -n "$TV_TELEGRAM_CHAT_ID" ]; then
@@ -551,7 +551,7 @@ echo -e "                    http://localhost/questdb"
 echo ""
 echo -e "  ${BOLD}Grafana Credentials:${NC}"
 echo -e "    User: ${TV_GRAFANA_ADMIN_USER}"
-echo -e "    Pass: (from AWS SSM /tickvault/${SSM_ENV}/grafana/admin-password)"
+echo -e "    Pass: (from AWS SSM /dlt/${SSM_ENV}/grafana/admin-password)"
 echo ""
 
 if [ "$OPEN_BROWSER" = true ] && [ "$FAIL" -eq 0 ]; then

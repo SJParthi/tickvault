@@ -97,6 +97,9 @@ impl NotificationService {
     /// Called once at boot. Not on hot path.
     #[instrument(skip_all, name = "notification_service_init")]
     pub async fn initialize(config: &NotificationConfig) -> Arc<Self> {
+        // AWS SSM is the single source of truth for all secrets. No env-var
+        // fallback — production config, dev config, CI config all read from
+        // the same place so behavior is identical everywhere.
         let environment = match resolve_environment() {
             Ok(env) => env,
             Err(err) => {
