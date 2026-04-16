@@ -1,6 +1,6 @@
 //! Infrastructure orchestrator — auto-starts Docker services if not running.
 //!
-//! On startup, probes QuestDB and Jaeger. If unreachable, fetches infra
+//! On startup, probes QuestDB and Grafana. If unreachable, fetches infra
 //! credentials from AWS SSM and runs `docker compose up -d`. Waits for
 //! services to be healthy before returning.
 //!
@@ -82,7 +82,6 @@ const DASHBOARD_SERVICES: &[(&str, &str, &str, u16)] = &[
     ("Grafana", "http://localhost:3000", LOCAL_HOST, 3000),
     ("QuestDB", "http://localhost:9000", LOCAL_HOST, 9000),
     ("Prometheus", "http://localhost:9090", LOCAL_HOST, 9090),
-    ("Jaeger", "http://localhost:16686", LOCAL_HOST, 16686),
     ("Traefik", "http://localhost:8080", LOCAL_HOST, 8080),
     ("Portal", "http://localhost:3001/portal", LOCAL_HOST, 3001),
     (
@@ -261,7 +260,7 @@ pub async fn ensure_infra_running(questdb_config: &QuestDbConfig) {
 
 /// Opens all reachable monitoring dashboards in the default browser.
 ///
-/// Opens: Grafana, QuestDB Console, Prometheus, Jaeger, Traefik, and Portal.
+/// Opens: Grafana, QuestDB Console, Prometheus, Traefik, and Portal.
 /// Best-effort: if a service is not running or the browser cannot be launched,
 /// logs a warning and skips it — does not block boot.
 async fn open_all_dashboards() {
@@ -1288,8 +1287,9 @@ mod tests {
 
     #[test]
     fn test_dashboard_services_count() {
-        // 7 services: Grafana, QuestDB, Prometheus, Jaeger, Traefik, Portal, Market Dashboard
-        assert_eq!(DASHBOARD_SERVICES.len(), 7, "expected 7 dashboard services");
+        // 6 services: Grafana, QuestDB, Prometheus, Traefik, Portal, Market Dashboard
+        // Jaeger removed per aws-budget.md (saves 2.5GB RAM on c7i.xlarge)
+        assert_eq!(DASHBOARD_SERVICES.len(), 6, "expected 6 dashboard services");
     }
 
     #[tokio::test]
