@@ -536,6 +536,7 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
     let mut last_movers_persist = Instant::now();
     let mut movers_persist_count: u64 = 0;
     let m_movers_persisted = counter!("tv_movers_snapshots_persisted_total");
+    let m_ticks_persisted = counter!("tv_ticks_persisted_total");
 
     // Index prev_close file cache — survives mid-day restarts.
     // On boot, read cached values and pre-populate movers.
@@ -763,18 +764,23 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                 // Persist tick to QuestDB — ingestion gate above already verified
                 // [09:00, 15:30) IST and today's date. This block only handles
                 // QuestDB write errors (connection down, buffer full, etc.).
-                if let Some(ref mut writer) = tick_writer
-                    && let Err(err) = writer.append_tick(&tick)
-                {
-                    storage_errors = storage_errors.saturating_add(1);
-                    m_storage_errors.increment(1);
-                    if storage_errors <= 100 {
-                        warn!(
-                            ?err,
-                            security_id = tick.security_id,
-                            total_errors = storage_errors,
-                            "failed to append tick to QuestDB"
-                        );
+                if let Some(ref mut writer) = tick_writer {
+                    match writer.append_tick(&tick) {
+                        Ok(()) => {
+                            m_ticks_persisted.increment(1);
+                        }
+                        Err(err) => {
+                            storage_errors = storage_errors.saturating_add(1);
+                            m_storage_errors.increment(1);
+                            if storage_errors <= 100 {
+                                warn!(
+                                    ?err,
+                                    security_id = tick.security_id,
+                                    total_errors = storage_errors,
+                                    "failed to append tick to QuestDB"
+                                );
+                            }
+                        }
                     }
                 }
 
@@ -874,18 +880,23 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
 
                     // Persist tick to QuestDB — ingestion gate above already verified
                     // [09:00, 15:30) IST and today's date.
-                    if let Some(ref mut writer) = tick_writer
-                        && let Err(err) = writer.append_tick(&tick)
-                    {
-                        storage_errors = storage_errors.saturating_add(1);
-                        m_storage_errors.increment(1);
-                        if storage_errors <= 100 {
-                            warn!(
-                                ?err,
-                                security_id = tick.security_id,
-                                total_errors = storage_errors,
-                                "failed to append tick to QuestDB"
-                            );
+                    if let Some(ref mut writer) = tick_writer {
+                        match writer.append_tick(&tick) {
+                            Ok(()) => {
+                                m_ticks_persisted.increment(1);
+                            }
+                            Err(err) => {
+                                storage_errors = storage_errors.saturating_add(1);
+                                m_storage_errors.increment(1);
+                                if storage_errors <= 100 {
+                                    warn!(
+                                        ?err,
+                                        security_id = tick.security_id,
+                                        total_errors = storage_errors,
+                                        "failed to append tick to QuestDB"
+                                    );
+                                }
+                            }
                         }
                     }
                 } else if !ltp_valid {

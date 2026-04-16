@@ -177,6 +177,46 @@ pub async fn require_bearer_auth(
 }
 
 // ---------------------------------------------------------------------------
+// Request Tracing Middleware (L5)
+// ---------------------------------------------------------------------------
+
+/// Request tracing middleware — logs every HTTP request with method, path,
+/// status code, and duration. Emits `tv_api_request_duration_ms` histogram
+/// for Prometheus/Grafana dashboards.
+///
+/// # Performance
+/// O(1) per request — one `Instant::now()` + one histogram observe.
+/// No allocation beyond what axum already does for request routing.
+pub async fn request_tracing(request: Request, next: Next) -> Response {
+    let start = std::time::Instant::now();
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+
+    let response = next.run(request).await;
+
+    let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let status = response.status().as_u16();
+
+    // Emit histogram for Grafana dashboards (P99 latency, throughput, etc.)
+    metrics::histogram!("tv_api_request_duration_ms",
+        "method" => method.to_string(),
+        "status" => status.to_string(),
+    )
+    .record(duration_ms);
+
+    // Structured log for audit trail — includes all 5W fields.
+    tracing::info!(
+        http.method = %method,
+        http.path = %path,
+        http.status = status,
+        duration_ms = format!("{duration_ms:.2}"),
+        "API request completed"
+    );
+
+    response
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

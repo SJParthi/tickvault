@@ -539,6 +539,12 @@ pub async fn run_two_hundred_depth_connection(
     let m_reconnections =
         // O(1) EXEMPT: metric handle created once at boot, not per tick
         metrics::counter!("tv_depth_200lvl_reconnections_total", "underlying" => prefix.to_string());
+    // L7: Consecutive reset gauge — tracks current streak without success.
+    // Resets to 0 on successful connection, climbs on consecutive failures.
+    // Drives Depth200ResetLoop alert in tickvault-alerts.yml.
+    let m_consecutive_resets =
+        // O(1) EXEMPT: metric handle created once at boot
+        metrics::gauge!("tv_depth_200lvl_consecutive_resets", "label" => label.to_string());
     let mut pending_signal = connected_signal;
 
     loop {
@@ -559,6 +565,7 @@ pub async fn run_two_hundred_depth_connection(
                 info!(security_id, label = %label, "{prefix}: connection closed normally");
                 // Reset counter only on successful connection (failures accumulate for backoff)
                 reconnect_counter.store(0, Ordering::Relaxed);
+                m_consecutive_resets.set(0.0);
             }
             Err(err) => {
                 // STAGE-C.5: classify Dhan disconnect errors.
@@ -576,6 +583,7 @@ pub async fn run_two_hundred_depth_connection(
 
                 let attempt = reconnect_counter.fetch_add(1, Ordering::Relaxed);
                 m_reconnections.increment(1);
+                m_consecutive_resets.set(attempt.saturating_add(1) as f64);
 
                 // Escalate to ERROR after 10+ consecutive failures
                 if attempt > 0 && attempt.is_multiple_of(10) {
