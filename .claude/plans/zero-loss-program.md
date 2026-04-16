@@ -22,15 +22,9 @@
   - Tests: `test_zl_p0_2_canary_underlyings_table_is_bounded`, `test_zl_p0_2_canary_underlyings_contains_nifty_banknifty_sensex`, `test_zl_p0_2_canary_underlyings_have_non_empty_labels`, `test_zl_p0_2_canary_metric_name_stable`, `test_zl_p0_2_canary_metric_builds_without_recorder`
   - Impact: end-to-end "alive but not flowing" detection.
 
-- [ ] **ZL-P0-3**: End-of-day reconciliation — compare QuestDB tick counts vs Dhan historical REST candles
-  - Files: `crates/core/src/reconciliation/end_of_day.rs` (new module), `crates/storage/src/reconciliation_persistence.rs` (new), boot wiring in `crates/app/src/main.rs`
-  - Tests: `test_zl_p0_3_reconciliation_computes_mismatch_correctly`, `test_zl_p0_3_reconciliation_zero_ticks_fires_critical`, `test_zl_p0_3_reconciliation_writes_to_questdb`
-  - Impact: the ONLY way to go from "likely zero loss" to "provably zero loss".
+- [x] **ZL-P0-3**: ~~End-of-day reconciliation~~ — SKIPPED per Parthiban (2026-04-16). Existing cross_verify.rs candle cross-verification is sufficient for a retail solo system.
 
-- [ ] **ZL-P0-4**: Dual live-feed redundancy — subscribe same instruments on 2 WS connections, merge + dedup by `(security_id, exchange_timestamp)` with 200ms window
-  - Files: `crates/core/src/websocket/dedup_merger.rs` (new), `crates/core/src/websocket/connection_pool.rs`, `crates/app/src/trading_pipeline.rs`
-  - Tests: `test_zl_p0_4_dedup_drops_duplicate_within_window`, `test_zl_p0_4_dedup_forwards_distinct_ticks`, `test_zl_p0_4_dedup_forwards_late_duplicate_after_window`, `test_zl_p0_4_bounded_dedup_map_eviction`
-  - Impact: single-connection failure is no longer a data loss event.
+- [x] **ZL-P0-4**: ~~Dual live-feed redundancy~~ — SKIPPED per Parthiban (2026-04-16). All 4 WS types already have WAL + watchdog + panic-safe spawn + heartbeat gauge. Single-connection resilience is sufficient.
 
 ### P1 — high value, ship after P0
 
