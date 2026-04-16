@@ -306,6 +306,152 @@ async def test_200_depth(url_base, client_id, access_token, security_id, label):
         return False
 
 
+async def test_200_depth_numeric_segment(url_base, client_id, access_token, security_id, label):
+    """
+    Same as test_200_depth but sends ExchangeSegment as numeric 2 instead of "NSE_FNO".
+    Tests whether Dhan's server expects the numeric code (like in their Python input)
+    rather than the string (like in their docs and SDK's get_exchange_segment()).
+    """
+    url = f"{url_base}?token={access_token}&clientId={client_id}&authType=2"
+    safe_url = url.replace(access_token, f"{access_token[:8]}...REDACTED")
+
+    print(f"\n{'='*70}")
+    print(f"TEST: {label}")
+    print(f"{'='*70}")
+    print(f"URL:  {safe_url}")
+
+    # KEY DIFFERENCE: ExchangeSegment is numeric 2 instead of string "NSE_FNO"
+    subscribe_msg = json.dumps({
+        "RequestCode": 23,
+        "ExchangeSegment": 2,
+        "SecurityId": security_id,
+    })
+    print(f"SUB:  {subscribe_msg}")
+    print(f"NOTE: ExchangeSegment=2 (numeric) instead of \"NSE_FNO\" (string)")
+
+    try:
+        print(f"[...] Connecting...")
+        ws = await asyncio.wait_for(websockets.connect(url), timeout=10.0)
+        print(f"[OK]  WebSocket connected!")
+
+        await ws.send(subscribe_msg)
+        print(f"[OK]  Subscription sent")
+
+        frames_received = 0
+        start = time.time()
+        timeout_secs = 30
+
+        print(f"[...] Waiting for depth frames (up to {timeout_secs}s)...")
+
+        while time.time() - start < timeout_secs:
+            try:
+                data = await asyncio.wait_for(ws.recv(), timeout=5.0)
+                if isinstance(data, bytes):
+                    frames_received += 1
+                    if len(data) >= 12:
+                        header = struct.unpack('<hBBiI', data[0:12])
+                        code_name = {41: "BID", 51: "ASK", 50: "DISCONNECT"}.get(header[1], f"UNKNOWN({header[1]})")
+                        print(f"[FRAME #{frames_received}] code={code_name} sid={header[3]} len={header[0]} rows={header[4]}")
+                        if header[1] == 50:
+                            if len(data) >= 14:
+                                print(f"[DISCONNECT] Reason: {struct.unpack('<H', data[12:14])[0]}")
+                            break
+                        if frames_received >= 4:
+                            print(f"\n[SUCCESS] Received {frames_received} depth frames with numeric segment!")
+                            await ws.close()
+                            return True
+                elif isinstance(data, str):
+                    print(f"[TEXT] {data[:200]}")
+            except asyncio.TimeoutError:
+                print(f"[...] No frame in 5s (elapsed: {time.time()-start:.1f}s, frames: {frames_received})")
+
+        if frames_received > 0:
+            await ws.close()
+            return True
+        print(f"[FAIL] Zero frames received in {time.time()-start:.1f}s")
+        await ws.close()
+        return False
+
+    except asyncio.TimeoutError:
+        print(f"[FAIL] Connection timed out")
+        return False
+    except Exception as e:
+        if "reset" in str(e).lower() or "ResetWithoutClosingHandshake" in str(e):
+            print(f"[FAIL] TCP RESET")
+        else:
+            print(f"[FAIL] {type(e).__name__}: {e}")
+        return False
+
+
+async def test_dhan_sdk(client_id, access_token, security_id, label):
+    """
+    Test 3: Run Dhan's EXACT recommended Python SDK script.
+    Uses dhanhq.FullDepth class exactly as Dhan support provided.
+    """
+    print(f"\n{'='*70}")
+    print(f"TEST: Dhan Python SDK (dhanhq v2.2.0rc1) — {label}")
+    print(f"{'='*70}")
+
+    try:
+        from dhanhq import DhanContext, FullDepth
+    except ImportError:
+        print("[SKIP] dhanhq not installed. Run: pip3 install dhanhq==2.2.0rc1")
+        return False
+
+    print(f"SDK:  dhanhq FullDepth(depth_level=200)")
+    print(f"SID:  {security_id} (segment: NSE_FNO, numeric code: 2)")
+
+    try:
+        dhan_context = DhanContext(client_id, access_token)
+        instruments = [(2, security_id)]
+        depth_level = 200
+
+        response = FullDepth(dhan_context, instruments, depth_level)
+
+        # run_forever() is blocking — run in executor with timeout
+        loop = asyncio.get_event_loop()
+
+        def run_sdk():
+            try:
+                response.run_forever()
+                frames = 0
+                start = time.time()
+                while time.time() - start < 30:
+                    try:
+                        response.get_data()
+                        frames += 1
+                        if frames >= 4:
+                            return True
+                    except Exception:
+                        break
+                    if response.on_close:
+                        print(f"[SDK] Server disconnection detected after {frames} frames")
+                        return frames > 0
+                return frames > 0
+            except Exception as e:
+                print(f"[SDK] Exception: {type(e).__name__}: {e}")
+                return False
+
+        print(f"[...] Running Dhan SDK FullDepth (30s timeout)...")
+        try:
+            result = await asyncio.wait_for(
+                loop.run_in_executor(None, run_sdk),
+                timeout=35.0,
+            )
+            if result:
+                print(f"[SUCCESS] Dhan SDK received depth data!")
+            else:
+                print(f"[FAIL] Dhan SDK received zero depth data")
+            return result
+        except asyncio.TimeoutError:
+            print(f"[FAIL] Dhan SDK timed out after 35s — no data received")
+            return False
+
+    except Exception as e:
+        print(f"[FAIL] {type(e).__name__}: {e}")
+        return False
+
+
 async def run_all_tests():
     """Run tests on both URL paths using live ATM SecurityId."""
     client_id, access_token = load_credentials()
@@ -375,6 +521,35 @@ async def run_all_tests():
         print(f"200-level depth is likely not enabled on account {client_id}.")
         print(f"Tested with live ATM SecurityId — this rules out stale/OTM contracts.")
         print(f"Escalate to Dhan: 'Enable 200-level Full Market Depth on our account.'")
+
+    # Test 3: Numeric segment code (2 instead of "NSE_FNO") on /twohundreddepth
+    await asyncio.sleep(2)
+    numeric_ok = await test_200_depth_numeric_segment(
+        "wss://full-depth-api.dhan.co/twohundreddepth",
+        client_id, access_token, security_id,
+        f"NUMERIC segment (2) instead of string — {label}"
+    )
+
+    # Test 4: Dhan's exact Python SDK script (their recommended approach)
+    await asyncio.sleep(2)
+    sdk_ok = await test_dhan_sdk(client_id, access_token, security_id, label)
+
+    print(f"\n{'='*70}")
+    print(f"FINAL SUMMARY (all 4 tests)")
+    print(f"{'='*70}")
+    print(f"Security ID tested:     {security_id} ({label})")
+    if spot_ltp:
+        print(f"NIFTY Spot at test:     {spot_ltp}")
+    print(f"1. Root path (/)             : {'WORKS' if root_ok else 'FAILED'}")
+    print(f"2. /twohundreddepth          : {'WORKS' if explicit_ok else 'FAILED'}")
+    print(f"3. Numeric segment (2)       : {'WORKS' if numeric_ok else 'FAILED'}")
+    print(f"4. Dhan Python SDK v2.2.0    : {'WORKS' if sdk_ok else 'FAILED'}")
+
+    if not root_ok and not explicit_ok and not numeric_ok and not sdk_ok:
+        print(f"\nALL 4 TESTS FAILED — 200-level depth is NOT working on account {client_id}.")
+        print(f"Tested: both URLs, string + numeric segment, Dhan's own SDK.")
+        print(f"SecurityId: {security_id} (live ATM, not stale).")
+        print(f"Please enable 200-level Full Market Depth on this account.")
 
     print(f"\nCopy this ENTIRE output and share with Dhan support.")
 
