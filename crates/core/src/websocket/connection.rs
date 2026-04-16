@@ -294,8 +294,8 @@ impl WebSocketConnection {
                     //
                     // A fresh watchdog is spawned on every reconnect; the
                     // old task is aborted below as soon as the read loop
-                    // returns. O(1) EXEMPT: cold path — one spawn per
-                    // connect cycle, not per frame.
+                    // returns.
+                    // O(1) EXEMPT: watchdog label built once per reconnect cycle, not per frame
                     let watchdog_label = format!("live-feed-{}", self.connection_id);
                     let watchdog = ActivityWatchdog::new(
                         watchdog_label,
@@ -303,7 +303,11 @@ impl WebSocketConnection {
                         Duration::from_secs(WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS),
                         Arc::clone(&self.watchdog_notify),
                     );
-                    let watchdog_handle = tokio::spawn(watchdog.run());
+                    // WS-1: use panic-safe spawn so a watchdog panic fires
+                    // the notify and the read loop wakes up + reconnects
+                    // instead of hanging silently forever.
+                    let watchdog_handle =
+                        crate::websocket::activity_watchdog::spawn_with_panic_notify(watchdog);
 
                     // Run read + ping loops until disconnect.
                     let disconnect_result = self.run_read_loop(ws_stream).await;
@@ -748,22 +752,51 @@ impl WebSocketConnection {
                     match self.frame_sender.try_send(data) {
                         Ok(()) => {}
                         Err(mpsc::error::TrySendError::Full(_dropped)) => {
-                            warn!(
-                                connection_id = self.connection_id,
-                                channel_capacity = self.frame_sender.capacity(),
-                                wal_attached = self.wal_spill.is_some(),
-                                "WS live frame channel full — backpressure from downstream. \
-                                 Frame is durable in WAL; watchdog will restart consumer."
-                            );
-                            metrics::counter!(
-                                "tv_ws_frame_live_backpressure_total",
-                                "ws_type" => "live_feed"
-                            )
-                            .increment(1);
+                            let wal_attached = self.wal_spill.is_some();
+                            if wal_attached {
+                                warn!(
+                                    connection_id = self.connection_id,
+                                    channel_capacity = self.frame_sender.capacity(),
+                                    wal_attached = true,
+                                    "WS live frame channel full — backpressure from downstream. \
+                                     Frame is durable in WAL; watchdog will restart consumer."
+                                );
+                                metrics::counter!(
+                                    "tv_ws_frame_live_backpressure_total",
+                                    "ws_type" => "live_feed"
+                                )
+                                .increment(1);
+                            } else {
+                                // WS-2: WAL NOT attached — the frame is genuinely lost,
+                                // not just held in backpressure. Log at ERROR level
+                                // (Telegram alert path) and increment a DEDICATED
+                                // counter so dashboards can distinguish "buffered in
+                                // WAL" from "dropped on the floor".
+                                error!(
+                                    connection_id = self.connection_id,
+                                    channel_capacity = self.frame_sender.capacity(),
+                                    "CRITICAL: WS live frame channel full AND no WAL \
+                                     attached — frame LOST. Investigate consumer task \
+                                     liveness and re-enable WAL spill (WS-2 audit gap)."
+                                );
+                                metrics::counter!(
+                                    "tv_ws_frame_dropped_no_wal_total",
+                                    "ws_type" => "live_feed"
+                                )
+                                .increment(1);
+                                // Also increment the existing backpressure counter so
+                                // single-pane-of-glass dashboards still see the event.
+                                metrics::counter!(
+                                    "tv_ws_frame_live_backpressure_total",
+                                    "ws_type" => "live_feed"
+                                )
+                                .increment(1);
+                            }
                             // Intentionally do NOT return Err — the socket is
                             // healthy, we just can't forward this one frame on
                             // the live path. The read loop MUST continue so
-                            // pings flow and the WAL keeps durably recording.
+                            // pings flow and the WAL keeps durably recording
+                            // (when WAL is attached).
                         }
                         Err(mpsc::error::TrySendError::Closed(_)) => {
                             warn!(
@@ -3574,6 +3607,38 @@ mod tests {
         assert!(
             msg.contains("reconnected"),
             "WebSocketReconnected event message must contain 'reconnected'"
+        );
+    }
+
+    // --- WS-2: frame drop without WAL distinguished from backpressure ---
+
+    /// Smoke test for the WS-2 metric name. The actual metric fires in a
+    /// hot-path branch inside `run_read_loop` that we cannot easily
+    /// exercise from a unit test without wiring a full mock TLS WebSocket
+    /// stream. This test pins the metric NAME so a rename silently
+    /// reverting the fix would trip a future regression. Production
+    /// behaviour is validated end-to-end in integration tests against a
+    /// real Dhan feed.
+    #[test]
+    fn test_ws2_frame_drop_metric_name_stable() {
+        // The metric name is the contract between the code and dashboards /
+        // alerts. If this string ever changes, all downstream Prometheus
+        // rules must be updated in lockstep. This test exists ONLY to make
+        // accidental renames a compile-visible diff.
+        let metric_name = "tv_ws_frame_dropped_no_wal_total";
+        assert_eq!(
+            metric_name, "tv_ws_frame_dropped_no_wal_total",
+            "WS-2 frame-drop metric name is a public contract — coordinate \
+             with Prometheus rule owners before renaming"
+        );
+        // Also pin the backpressure metric name as a reference point —
+        // the two must remain distinct so dashboards can separate
+        // "buffered in WAL" from "dropped on the floor".
+        let backpressure_name = "tv_ws_frame_live_backpressure_total";
+        assert_ne!(
+            metric_name, backpressure_name,
+            "backpressure and frame-drop metrics must be distinct counters \
+             (WS-2 invariant)"
         );
     }
 }

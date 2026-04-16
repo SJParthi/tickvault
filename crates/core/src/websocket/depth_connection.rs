@@ -33,7 +33,7 @@ use super::tls::build_websocket_tls_connector;
 use super::types::{InstrumentSubscription, WebSocketError};
 use crate::auth::TokenHandle;
 use crate::websocket::activity_watchdog::{
-    ActivityWatchdog, WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS,
+    ActivityWatchdog, WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS, spawn_with_panic_notify,
 };
 use crate::websocket::subscription_builder::build_twenty_depth_subscription_messages;
 
@@ -303,7 +303,8 @@ async fn connect_and_run_depth(
         Duration::from_secs(WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS),
         Arc::clone(&watchdog_notify),
     );
-    let watchdog_handle = tokio::spawn(watchdog.run());
+    // WS-1: panic-safe watchdog spawn — see activity_watchdog::spawn_with_panic_notify.
+    let watchdog_handle = spawn_with_panic_notify(watchdog);
 
     // Helper: construct the WatchdogFired error uniformly from both the
     // select! branch (below) and any other watchdog-triggered return path.
@@ -702,7 +703,8 @@ async fn connect_and_run_200_depth(
         Duration::from_secs(WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS),
         Arc::clone(&watchdog_notify),
     );
-    let watchdog_handle = tokio::spawn(watchdog.run());
+    // WS-1: panic-safe watchdog spawn — see activity_watchdog::spawn_with_panic_notify.
+    let watchdog_handle = spawn_with_panic_notify(watchdog);
     // O(1) EXEMPT: cold path, one per dead socket.
     let make_watchdog_err = || WebSocketError::WatchdogFired {
         label: watchdog_label.clone(),

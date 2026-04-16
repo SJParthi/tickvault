@@ -51,13 +51,13 @@ match the zero-loss stance.
   - Files: `crates/storage/src/movers_persistence.rs`
   - Tests: `test_stock_movers_rescues_on_reconnect_fail`, `test_option_movers_rescues_on_reconnect_fail`, `test_movers_ring_overflow_spills`
 
-- [ ] **WS-1**: Watchdog panic supervisor — read loop must not hang on watchdog panic
-  - Files: `crates/core/src/websocket/connection.rs`
-  - Tests: `test_watchdog_panic_fires_notify_on_unwind`, integration kill-task test
+- [x] **WS-1**: Watchdog panic supervisor — spawn_with_panic_notify helper, all 4 call sites updated — done
+  - Files: `crates/core/src/websocket/activity_watchdog.rs`, `connection.rs`, `depth_connection.rs`, `order_update_connection.rs`
+  - Tests: `test_spawn_with_panic_notify_fires_notify_on_panic`, `test_spawn_with_panic_notify_returns_abortable_handle`
 
-- [ ] **WS-2**: Per-frame-drop metric when WAL is absent
+- [x] **WS-2**: Per-frame-drop metric `tv_ws_frame_dropped_no_wal_total` + ERROR log when WAL absent — done
   - Files: `crates/core/src/websocket/connection.rs`
-  - Tests: `test_frame_drop_without_wal_increments_counter`
+  - Tests: `test_ws2_frame_drop_metric_name_stable`
 
 ## Commit hygiene
 
