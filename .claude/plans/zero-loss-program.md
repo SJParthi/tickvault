@@ -34,13 +34,12 @@
 
 ### P1 — high value, ship after P0
 
-- [ ] **ZL-P1-1**: Audit `tick_persistence` WAL wiring — confirm the declared WAL path is actually called on backpressure
-  - Files: `crates/storage/src/tick_persistence.rs` (audit + possibly fix)
-  - Tests: `test_zl_p1_1_tick_wal_invoked_on_spill_path`
+- [x] **ZL-P1-1**: Audit `tick_persistence` WAL wiring — **PASS, no fix needed**
+  - Evidence: WsFrameSpill created at boot (main.rs:334), attached to all connections via `new_with_optional_wal` (connection_pool.rs:176-178), WAL append happens BEFORE try_send (connection.rs:756-771), boot replay re-injects frames (main.rs:649-691), 100K burst + SIGKILL + corrupted-tail chaos tests all pass. Full audit in session notes.
+  - Impact: ZL-P1-2 (extend WAL to depth + order) is ALSO already done — depth_connection and order_update_connection both receive `wal_spill: Option<Arc<WsFrameSpill>>` (main.rs:2483, 2638, 2872)
 
-- [ ] **ZL-P1-2**: Extend WAL spill coverage to depth_connection and order_update_connection
-  - Files: `crates/core/src/websocket/depth_connection.rs`, `crates/core/src/websocket/order_update_connection.rs`
-  - Tests: `test_zl_p1_2_depth_wal_spill`, `test_zl_p1_2_order_update_wal_spill`
+- [x] **ZL-P1-2**: WAL spill coverage for depth + order update — **ALREADY DONE**
+  - Evidence: depth_connection receives `wal_spill` at main.rs:2483 (depth-20) and main.rs:2638 (depth-200). order_update_connection receives at main.rs:2872. All use same `spill.append(WsType::*, frame)` pattern as live feed. Chaos tests cover all 4 WS types.
 
 ### P2 — hardening, ship after P1
 
