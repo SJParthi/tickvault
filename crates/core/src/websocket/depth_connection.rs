@@ -33,7 +33,8 @@ use super::tls::build_websocket_tls_connector;
 use super::types::{InstrumentSubscription, WebSocketError};
 use crate::auth::TokenHandle;
 use crate::websocket::activity_watchdog::{
-    ActivityWatchdog, WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS, spawn_with_panic_notify,
+    ActivityWatchdog, WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS, build_heartbeat_gauge,
+    spawn_with_panic_notify,
 };
 use crate::websocket::subscription_builder::build_twenty_depth_subscription_messages;
 
@@ -306,6 +307,11 @@ async fn connect_and_run_depth(
     // WS-1: panic-safe watchdog spawn — see activity_watchdog::spawn_with_panic_notify.
     let watchdog_handle = spawn_with_panic_notify(watchdog);
 
+    // ZL-P0-1: heartbeat gauge handle for this depth-20 connection.
+    // O(1) EXEMPT: one gauge lookup per reconnect cycle
+    // O(1) EXEMPT: one allocation per reconnect cycle
+    let m_last_frame_epoch = build_heartbeat_gauge("depth_20", underlying_label.to_string());
+
     // Helper: construct the WatchdogFired error uniformly from both the
     // select! branch (below) and any other watchdog-triggered return path.
     // O(1) EXEMPT: cold path, one per dead socket.
@@ -328,8 +334,10 @@ async fn connect_and_run_depth(
         // the watchdog can distinguish a truly dead socket from a data-quiet
         // period with pings still flowing. One relaxed atomic increment is
         // O(1) and allocation-free.
+        // ZL-P0-1: also set the heartbeat gauge (single atomic store).
         if matches!(frame_result, Some(Ok(_))) {
             activity_counter.fetch_add(1, Ordering::Relaxed);
+            m_last_frame_epoch.set(chrono::Utc::now().timestamp() as f64);
         }
         match frame_result {
             Some(Ok(Message::Binary(data))) => {
@@ -705,6 +713,11 @@ async fn connect_and_run_200_depth(
     );
     // WS-1: panic-safe watchdog spawn — see activity_watchdog::spawn_with_panic_notify.
     let watchdog_handle = spawn_with_panic_notify(watchdog);
+
+    // ZL-P0-1: heartbeat gauge handle for this depth-200 connection.
+    // O(1) EXEMPT: one gauge lookup per reconnect cycle
+    let m_last_frame_epoch = build_heartbeat_gauge("depth_200", watchdog_label.clone());
+
     // O(1) EXEMPT: cold path, one per dead socket.
     let make_watchdog_err = || WebSocketError::WatchdogFired {
         label: watchdog_label.clone(),
@@ -721,8 +734,10 @@ async fn connect_and_run_200_depth(
             }
             next_frame = read.next() => next_frame,
         };
+        // ZL-P0-1: also set the heartbeat gauge on every frame.
         if matches!(frame_result, Some(Ok(_))) {
             activity_counter.fetch_add(1, Ordering::Relaxed);
+            m_last_frame_epoch.set(chrono::Utc::now().timestamp() as f64);
         }
         match frame_result {
             Some(Ok(Message::Binary(data))) => {

@@ -555,6 +555,15 @@ impl WebSocketConnection {
         let (write, mut read) = ws_stream.split();
         let write = Arc::new(tokio::sync::Mutex::new(write));
 
+        // ZL-P0-1: pre-build the heartbeat gauge handle ONCE so the hot
+        // per-frame update is a single atomic store.
+        // O(1) EXEMPT: begin
+        let m_last_frame_epoch = crate::websocket::activity_watchdog::build_heartbeat_gauge(
+            "live_feed",
+            self.connection_id.to_string(),
+        );
+        // O(1) EXEMPT: end
+
         // STAGE-B (plan item P1.1): No client-side read deadline.
         //
         // Per Dhan spec (docs/dhan-ref/03-live-market-feed-websocket.md:90-95):
@@ -666,8 +675,19 @@ impl WebSocketConnection {
             // during data-quiet periods so the watchdog never fires a false
             // positive. One relaxed atomic increment is O(1) and allocation
             // free — safe on the hot path.
+            //
+            // ZL-P0-1: also update the heartbeat gauge with the current
+            // wall-clock epoch seconds. Grafana rule fires if
+            // `time() - tv_ws_last_frame_epoch_secs > 5` during market
+            // hours — this catches frozen event loops the watchdog
+            // cannot see (watchdog only fires after 50s of NO frames;
+            // this catches "frames every 60s" which is alive-but-dead).
             if matches!(frame_result, Some(Ok(_))) {
                 self.activity_counter.fetch_add(1, Ordering::Relaxed);
+                // chrono::Utc::now().timestamp() is a clock_gettime
+                // syscall (~20ns) — acceptable on this path; the
+                // downstream parse + dispatch is ~10 μs anyway.
+                m_last_frame_epoch.set(chrono::Utc::now().timestamp() as f64);
             }
 
             match frame_result {
