@@ -162,6 +162,23 @@ fn utc_nanos_to_ist_secs_of_day(received_at_nanos: i64) -> u32 {
         .rem_euclid(i64::from(SECONDS_PER_DAY)) as u32
 }
 
+/// Returns `true` if the wall-clock time (received_at_nanos) falls within
+/// the tick persist window [09:00, 15:30) IST.
+///
+/// Defense-in-depth: rejects stale snapshot ticks that arrive after market
+/// close. The WebSocket continues to stream snapshot data post-market with
+/// exchange_timestamp from during market hours. Without this check, those
+/// stale ticks pass `is_within_persist_window` (which only checks the
+/// exchange_timestamp) and pollute the `ticks` table.
+///
+/// O(1) — reuses `utc_nanos_to_ist_secs_of_day` + 1 range check.
+#[inline(always)]
+fn is_wall_clock_within_persist_window(received_at_nanos: i64) -> bool {
+    let wall_clock_ist_secs_of_day = utc_nanos_to_ist_secs_of_day(received_at_nanos);
+    (TICK_PERSIST_START_SECS_OF_DAY_IST..TICK_PERSIST_END_SECS_OF_DAY_IST)
+        .contains(&wall_clock_ist_secs_of_day)
+}
+
 /// Selects the depth timestamp: exchange_timestamp if valid, else wall-clock.
 ///
 /// Full packets (code 8) have exchange_timestamp > 0. Market Depth standalone
@@ -725,6 +742,14 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     m_outside_hours.increment(1);
                     continue;
                 }
+                // Wall-clock guard: reject stale WebSocket snapshots received
+                // outside market hours (post-market data has valid exchange_timestamp
+                // from today's session but arrives after 15:30 IST).
+                if !is_wall_clock_within_persist_window(tick.received_at_nanos) {
+                    outside_hours_filtered = outside_hours_filtered.saturating_add(1);
+                    m_outside_hours.increment(1);
+                    continue;
+                }
 
                 // O(1) dedup: skip exact duplicate ticks (same security_id +
                 // timestamp + LTP) resent by Dhan on reconnection.
@@ -855,6 +880,13 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                         continue;
                     }
                     if !is_within_persist_window(tick.exchange_timestamp) {
+                        outside_hours_filtered = outside_hours_filtered.saturating_add(1);
+                        m_outside_hours.increment(1);
+                        continue;
+                    }
+                    // Wall-clock guard: reject stale WebSocket snapshots received
+                    // outside market hours (same as Ticker/Quote path above).
+                    if !is_wall_clock_within_persist_window(tick.received_at_nanos) {
                         outside_hours_filtered = outside_hours_filtered.saturating_add(1);
                         m_outside_hours.increment(1);
                         continue;
