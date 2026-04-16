@@ -162,6 +162,23 @@ fn utc_nanos_to_ist_secs_of_day(received_at_nanos: i64) -> u32 {
         .rem_euclid(i64::from(SECONDS_PER_DAY)) as u32
 }
 
+/// Returns `true` if the wall-clock time (received_at_nanos) falls within
+/// the tick persist window [09:00, 15:30) IST.
+///
+/// Defense-in-depth: rejects stale snapshot ticks that arrive after market
+/// close. The WebSocket continues to stream snapshot data post-market with
+/// exchange_timestamp from during market hours. Without this check, those
+/// stale ticks pass `is_within_persist_window` (which only checks the
+/// exchange_timestamp) and pollute the `ticks` table.
+///
+/// O(1) — reuses `utc_nanos_to_ist_secs_of_day` + 1 range check.
+#[inline(always)]
+fn is_wall_clock_within_persist_window(received_at_nanos: i64) -> bool {
+    let wall_clock_ist_secs_of_day = utc_nanos_to_ist_secs_of_day(received_at_nanos);
+    (TICK_PERSIST_START_SECS_OF_DAY_IST..TICK_PERSIST_END_SECS_OF_DAY_IST)
+        .contains(&wall_clock_ist_secs_of_day)
+}
+
 /// Selects the depth timestamp: exchange_timestamp if valid, else wall-clock.
 ///
 /// Full packets (code 8) have exchange_timestamp > 0. Market Depth standalone
@@ -624,13 +641,34 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
             Err(err) => {
                 parse_errors = parse_errors.saturating_add(1);
                 m_parse_errors.increment(1);
+                // H4: Log hex dump of first 64 bytes for post-mortem forensics.
+                // ERROR level triggers Telegram so persistent parse failures
+                // are visible to operators, not just in log aggregation.
                 if parse_errors <= 100 {
-                    warn!(
-                        ?err,
-                        frame_len = raw_frame.len(),
-                        total_errors = parse_errors,
-                        "failed to parse binary frame"
-                    );
+                    let hex_len = raw_frame.len().min(64);
+                    let hex_dump: String = raw_frame[..hex_len]
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<Vec<_>>()
+                        .join(" "); // O(1) EXEMPT: cold path, parse errors are rare
+                    if parse_errors.is_multiple_of(10) {
+                        // Escalate every 10th error to ERROR (triggers Telegram)
+                        error!(
+                            ?err,
+                            frame_len = raw_frame.len(),
+                            frame_hex = %hex_dump,
+                            total_errors = parse_errors,
+                            "H4: persistent parse failures — {parse_errors} total (hex dump of first {hex_len} bytes)"
+                        );
+                    } else {
+                        warn!(
+                            ?err,
+                            frame_len = raw_frame.len(),
+                            frame_hex = %hex_dump,
+                            total_errors = parse_errors,
+                            "failed to parse binary frame (hex dump of first {hex_len} bytes)"
+                        );
+                    }
                 }
                 continue;
             }
@@ -721,6 +759,14 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     continue;
                 }
                 if !is_within_persist_window(tick.exchange_timestamp) {
+                    outside_hours_filtered = outside_hours_filtered.saturating_add(1);
+                    m_outside_hours.increment(1);
+                    continue;
+                }
+                // Wall-clock guard: reject stale WebSocket snapshots received
+                // outside market hours (post-market data has valid exchange_timestamp
+                // from today's session but arrives after 15:30 IST).
+                if !is_wall_clock_within_persist_window(tick.received_at_nanos) {
                     outside_hours_filtered = outside_hours_filtered.saturating_add(1);
                     m_outside_hours.increment(1);
                     continue;
@@ -855,6 +901,13 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                         continue;
                     }
                     if !is_within_persist_window(tick.exchange_timestamp) {
+                        outside_hours_filtered = outside_hours_filtered.saturating_add(1);
+                        m_outside_hours.increment(1);
+                        continue;
+                    }
+                    // Wall-clock guard: reject stale WebSocket snapshots received
+                    // outside market hours (same as Ticker/Quote path above).
+                    if !is_wall_clock_within_persist_window(tick.received_at_nanos) {
                         outside_hours_filtered = outside_hours_filtered.saturating_add(1);
                         m_outside_hours.increment(1);
                         continue;

@@ -14,8 +14,9 @@ use tickvault_common::types::SecurityId;
 
 use chrono::NaiveDate;
 
-/// Number of strikes above and below ATM to subscribe for depth.
-pub const DEPTH_ATM_STRIKES_EACH_SIDE: usize = 10;
+/// Number of strikes above and below ATM to subscribe for 20-level depth.
+/// 24 CE above + ATM + 24 PE below = 49 instruments per underlying.
+pub const DEPTH_ATM_STRIKES_EACH_SIDE: usize = 24;
 
 /// Spot price movement threshold (in strikes) before triggering rebalance.
 /// If spot moves ±3 strikes from the previously selected ATM, re-subscribe.

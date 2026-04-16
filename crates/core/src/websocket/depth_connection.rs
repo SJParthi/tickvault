@@ -41,6 +41,25 @@ use crate::websocket::subscription_builder::build_twenty_depth_subscription_mess
 /// Identifier for depth connections in logs/metrics.
 const DEPTH_CONNECTION_PREFIX: &str = "depth-20lvl";
 
+/// Command sent to a live depth connection to swap instruments without disconnecting.
+/// Unsubscribes old instruments (RequestCode 25) then subscribes new ones (RequestCode 23).
+/// Zero disconnect, zero reconnect, zero tick gap.
+#[derive(Debug)]
+pub enum DepthCommand {
+    /// Swap 20-level instruments: unsubscribe old list, subscribe new list.
+    /// Both lists are pre-built JSON messages ready to send.
+    Swap20 {
+        unsubscribe_messages: Vec<String>,
+        subscribe_messages: Vec<String>,
+    },
+    /// Swap 200-level instrument: unsubscribe old, subscribe new.
+    /// Single JSON message each (200-level = 1 instrument per connection).
+    Swap200 {
+        unsubscribe_message: String,
+        subscribe_message: String,
+    },
+}
+
 // Read timeout for depth connections (seconds).
 // STAGE-B (P1.3): `DEPTH_READ_TIMEOUT_SECS` removed.
 //
@@ -59,17 +78,18 @@ const DEPTH_RECONNECT_INITIAL_MS: u64 = 1000;
 /// Reconnection backoff max delay (ms).
 const DEPTH_RECONNECT_MAX_MS: u64 = 30000;
 
+/// Maximum consecutive reconnection attempts before giving up.
+/// At 30s max backoff, 20 attempts ≈ 10 minutes of retrying.
+/// Prevents infinite retry loops after market close or on permanently
+/// unreachable instruments.
+const DEPTH_RECONNECT_MAX_ATTEMPTS: u64 = 20;
+
 /// Pong send timeout (seconds). Matches main feed connection behavior.
 /// If pong send takes longer, the TCP connection is likely dead.
 const DEPTH_PONG_TIMEOUT_SECS: u64 = 10;
 
 /// Subscription batch size for 20-level depth (max 50 per Dhan docs).
 const DEPTH_SUBSCRIPTION_BATCH_SIZE: usize = 50;
-
-// Market-hours sleep REMOVED: depth connections stay connected 24/7, same as
-// main Live Market Feed WebSocket. Reconnection uses exponential backoff
-// regardless of time-of-day. If Dhan servers reject outside market hours,
-// backoff caps at 30s — no multi-hour sleeps that hide connection state.
 
 /// Connection timeout for depth WebSocket (seconds).
 const DEPTH_CONNECT_TIMEOUT_SECS: u64 = 15;
@@ -97,6 +117,7 @@ pub async fn run_twenty_depth_connection(
     underlying_label: String,
     connected_signal: Option<tokio::sync::oneshot::Sender<()>>,
     wal_spill: Option<Arc<WsFrameSpill>>,
+    mut cmd_rx: mpsc::Receiver<DepthCommand>,
 ) -> Result<(), WebSocketError> {
     if instruments.is_empty() {
         info!("20-level depth: no instruments to subscribe — skipping");
@@ -136,6 +157,7 @@ pub async fn run_twenty_depth_connection(
             &prefix,
             &underlying_label,
             wal_spill.as_ref(),
+            &mut cmd_rx,
         )
         .await
         {
@@ -166,6 +188,21 @@ pub async fn run_twenty_depth_connection(
                 let attempt = reconnect_counter.fetch_add(1, Ordering::Relaxed);
                 m_reconnections.increment(1);
 
+                // Give up after max attempts — prevents infinite retry loops
+                // after market close or on permanently unreachable instruments.
+                if attempt >= DEPTH_RECONNECT_MAX_ATTEMPTS {
+                    error!(
+                        attempt,
+                        instrument_count,
+                        ?err,
+                        "{prefix}: exhausted {DEPTH_RECONNECT_MAX_ATTEMPTS} reconnection attempts — giving up"
+                    );
+                    return Err(WebSocketError::ReconnectionExhausted {
+                        connection_id: 0, // depth connections don't use pool IDs
+                        attempts: attempt.min(u64::from(u32::MAX)) as u32,
+                    });
+                }
+
                 // Escalate to ERROR after 10+ consecutive failures
                 if attempt > 0 && attempt.is_multiple_of(10) {
                     error!(
@@ -194,8 +231,11 @@ pub async fn run_twenty_depth_connection(
 }
 
 /// Connects to the depth WebSocket, subscribes, and runs the read loop.
+///
+/// Accepts an optional `cmd_rx` for live instrument swaps (unsubscribe old +
+/// subscribe new on the SAME connection, zero disconnect, zero gap).
 // O(1) EXEMPT: begin — connection lifecycle runs once per connect/reconnect, not per tick
-#[allow(clippy::too_many_arguments)] // APPROVED: STAGE-C added wal_spill param
+#[allow(clippy::too_many_arguments)] // APPROVED: STAGE-C added wal_spill + cmd_rx params
 async fn connect_and_run_depth(
     token_handle: &TokenHandle,
     client_id: &str,
@@ -206,6 +246,7 @@ async fn connect_and_run_depth(
     prefix: &str,
     underlying_label: &str,
     wal_spill: Option<&Arc<WsFrameSpill>>,
+    cmd_rx: &mut mpsc::Receiver<DepthCommand>,
 ) -> Result<(), WebSocketError> {
     // Read token
     let token_guard = token_handle.load();
@@ -329,6 +370,37 @@ async fn connect_and_run_depth(
             () = watchdog_notify.notified() => {
                 m_active.set(0.0);
                 break Err(make_watchdog_err());
+            }
+            // O(1) EXEMPT: cold path — command arrives at most once per 60s rebalance
+            Some(cmd) = cmd_rx.recv() => {
+                match cmd {
+                    DepthCommand::Swap20 { unsubscribe_messages, subscribe_messages } => {
+                        info!("{prefix}: REBALANCE — sending {} unsubscribe + {} subscribe messages (zero disconnect)",
+                            unsubscribe_messages.len(), subscribe_messages.len());
+                        for msg in &unsubscribe_messages {
+                            if let Err(err) = write.send(Message::Text(msg.clone().into())).await {
+                                warn!(?err, "{prefix}: rebalance unsubscribe send failed");
+                            }
+                        }
+                        for msg in &subscribe_messages {
+                            if let Err(err) = write.send(Message::Text(msg.clone().into())).await {
+                                warn!(?err, "{prefix}: rebalance subscribe send failed");
+                            }
+                        }
+                        info!("{prefix}: REBALANCE complete — instrument swap done");
+                    }
+                    DepthCommand::Swap200 { unsubscribe_message, subscribe_message } => {
+                        info!("{prefix}: REBALANCE — unsubscribing old + subscribing new ATM (zero disconnect)");
+                        if let Err(err) = write.send(Message::Text(unsubscribe_message.into())).await {
+                            warn!(?err, "{prefix}: rebalance 200-level unsubscribe failed");
+                        }
+                        if let Err(err) = write.send(Message::Text(subscribe_message.into())).await {
+                            warn!(?err, "{prefix}: rebalance 200-level subscribe failed");
+                        }
+                        info!("{prefix}: REBALANCE complete — 200-level ATM swap done");
+                    }
+                }
+                continue;
             }
             next_frame = read.next() => next_frame,
         };
@@ -517,6 +589,7 @@ pub async fn run_two_hundred_depth_connection(
     frame_sender: mpsc::Sender<Bytes>,
     connected_signal: Option<tokio::sync::oneshot::Sender<()>>,
     wal_spill: Option<Arc<WsFrameSpill>>,
+    mut cmd_rx: mpsc::Receiver<DepthCommand>,
 ) -> Result<(), WebSocketError> {
     let segment_str = exchange_segment.as_str();
     let sid_str = security_id.to_string(); // O(1) EXEMPT: boot-time
@@ -560,6 +633,7 @@ pub async fn run_two_hundred_depth_connection(
             security_id,
             &label,
             wal_spill.as_ref(),
+            &mut cmd_rx,
         )
         .await
         {
@@ -586,6 +660,22 @@ pub async fn run_two_hundred_depth_connection(
                 let attempt = reconnect_counter.fetch_add(1, Ordering::Relaxed);
                 m_reconnections.increment(1);
                 m_consecutive_resets.set(attempt.saturating_add(1) as f64);
+
+                // Give up after max attempts — prevents infinite retry loops
+                // after market close or on permanently unreachable instruments.
+                if attempt >= DEPTH_RECONNECT_MAX_ATTEMPTS {
+                    error!(
+                        security_id,
+                        label = %label,
+                        attempt,
+                        ?err,
+                        "{prefix}: exhausted {DEPTH_RECONNECT_MAX_ATTEMPTS} reconnection attempts — giving up"
+                    );
+                    return Err(WebSocketError::ReconnectionExhausted {
+                        connection_id: 0, // depth connections don't use pool IDs
+                        attempts: attempt.min(u64::from(u32::MAX)) as u32,
+                    });
+                }
 
                 // Escalate to ERROR after 10+ consecutive failures
                 if attempt > 0 && attempt.is_multiple_of(10) {
@@ -628,6 +718,7 @@ async fn connect_and_run_200_depth(
     security_id: u32,
     label: &str,
     wal_spill: Option<&Arc<WsFrameSpill>>,
+    cmd_rx: &mut mpsc::Receiver<DepthCommand>,
 ) -> Result<(), WebSocketError> {
     let token_guard = token_handle.load();
     let token_state = token_guard
@@ -741,6 +832,20 @@ async fn connect_and_run_200_depth(
             () = watchdog_notify.notified() => {
                 m_active.set(0.0);
                 break Err(make_watchdog_err());
+            }
+            // O(1) EXEMPT: cold path — rebalance command at most once per 60s
+            Some(cmd) = cmd_rx.recv() => {
+                if let DepthCommand::Swap200 { unsubscribe_message, subscribe_message } = cmd {
+                    info!("{prefix}: REBALANCE — swapping 200-level ATM instrument (zero disconnect)");
+                    if let Err(err) = write.send(Message::Text(unsubscribe_message.into())).await {
+                        warn!(?err, "{prefix}: rebalance 200-level unsubscribe failed");
+                    }
+                    if let Err(err) = write.send(Message::Text(subscribe_message.into())).await {
+                        warn!(?err, "{prefix}: rebalance 200-level subscribe failed");
+                    }
+                    info!("{prefix}: REBALANCE complete — 200-level ATM swap done, zero disconnect");
+                }
+                continue;
             }
             next_frame = read.next() => next_frame,
         };
@@ -916,6 +1021,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(16);
         let token_handle: TokenHandle =
             std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None)));
+        let (_cmd_tx, cmd_rx) = mpsc::channel(4);
         let result = run_twenty_depth_connection(
             token_handle,
             "test".to_string(),
@@ -924,6 +1030,7 @@ mod tests {
             "TEST".to_string(),
             None,
             None,
+            cmd_rx,
         )
         .await;
         assert!(result.is_ok());
@@ -1007,6 +1114,7 @@ mod tests {
         let token_handle: TokenHandle =
             std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None)));
         let (tx, _rx) = mpsc::channel(16);
+        let (_cmd_tx, mut cmd_rx) = mpsc::channel(4);
         let result = connect_and_run_depth(
             &token_handle,
             "test",
@@ -1017,6 +1125,7 @@ mod tests {
             "depth-20lvl-TEST",
             "TEST",
             None,
+            &mut cmd_rx,
         )
         .await;
         assert!(result.is_err());
@@ -1031,6 +1140,7 @@ mod tests {
         let token_handle: TokenHandle =
             std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None)));
         let (tx, _rx) = mpsc::channel(16);
+        let (_cmd_tx, mut cmd_rx) = mpsc::channel(4);
         let result = connect_and_run_200_depth(
             &token_handle,
             "test",
@@ -1041,6 +1151,7 @@ mod tests {
             12345,
             "TEST-LABEL",
             None,
+            &mut cmd_rx,
         )
         .await;
         assert!(result.is_err());

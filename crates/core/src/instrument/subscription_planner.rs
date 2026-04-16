@@ -104,10 +104,18 @@ pub struct SubscriptionPlanSummary {
 ///
 /// # Feed Mode
 /// All instruments use the same feed mode from config (Ticker by default).
+///
+/// # Spot Prices
+/// Map of underlying_symbol → LTP. When a stock's LTP is present, ATM is
+/// calculated from the real spot price (binary search on sorted chain).
+/// When absent AND the map is non-empty, that stock's F&O is SKIPPED.
+/// When the map is empty, falls back to median strike (boot-time behavior
+/// before pre-market prices are available).
 pub fn build_subscription_plan(
     universe: &FnoUniverse,
     config: &SubscriptionConfig,
     today: NaiveDate,
+    spot_prices: &std::collections::HashMap<String, f64>,
 ) -> SubscriptionPlan {
     let feed_mode = config.parsed_feed_mode().unwrap_or(FeedMode::Ticker);
 
@@ -224,18 +232,51 @@ pub fn build_subscription_plan(
                 ));
             }
 
-            // ATM ± N strike filtering
-            // At startup we don't have live prices, so use the middle strike
-            // of the chain as ATM approximation.
+            // ATM ± N strike filtering.
+            // When spot_prices map is non-empty → use real spot price (binary search).
+            // When spot_prices map is empty → use median strike (boot-time fallback).
+            // When map is non-empty but stock missing → skip that stock's options.
             let atm_above = config.stock_atm_strikes_above;
             let atm_below = config.stock_atm_strikes_below;
 
-            // Calls — sorted ascending by strike
+            let spot = spot_prices.get(&underlying.underlying_symbol).copied();
             let call_count = chain.calls.len();
-            if call_count > 0 {
-                let mid_idx = call_count / 2;
-                let start = mid_idx.saturating_sub(atm_below);
-                let end = mid_idx
+            let put_count = chain.puts.len();
+
+            // ATM index for calls (binary search on sorted strikes).
+            let call_atm_idx: Option<usize> = if call_count > 0 {
+                match spot {
+                    Some(price) if price > 0.0 && price.is_finite() => {
+                        // Binary search: find strike closest to spot price.
+                        let idx = chain.calls.partition_point(|e| e.strike_price < price);
+                        let candidates = [idx.saturating_sub(1), idx.min(call_count - 1)];
+                        let best = candidates.iter().copied().min_by(|&a, &b| {
+                            let da = (chain.calls[a].strike_price - price).abs();
+                            let db = (chain.calls[b].strike_price - price).abs();
+                            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                        best
+                    }
+                    _ => {
+                        // No pre-market price available — skip this stock's options.
+                        // At 9:12 AM, every traded stock has an LTP from the
+                        // pre-market auction. If missing, the stock didn't trade
+                        // in pre-market — skip it (no median fallback).
+                        debug!(
+                            underlying = %underlying.underlying_symbol,
+                            "No pre-market price — skipping stock options"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            // Subscribe calls: ATM ± N
+            if let Some(atm_idx) = call_atm_idx {
+                let start = atm_idx.saturating_sub(atm_below);
+                let end = atm_idx
                     .saturating_add(atm_above)
                     .saturating_add(1)
                     .min(call_count);
@@ -250,14 +291,44 @@ pub fn build_subscription_plan(
                         ));
                     }
                 }
+
+                // PROOF: log ATM selection for this stock (cold path — once per stock at boot)
+                if let Some(sp) = spot {
+                    info!(
+                        underlying = %underlying.underlying_symbol,
+                        spot = sp,
+                        atm_strike = chain.calls[atm_idx].strike_price,
+                        expiry = %expiry,
+                        calls = end.saturating_sub(start),
+                        "PROOF: stock ATM selection — spot {sp:.2} → ATM strike {}, ± {atm_above}/{atm_below} calls",
+                        chain.calls[atm_idx].strike_price,
+                    );
+                }
             }
 
-            // Puts — sorted ascending by strike
-            let put_count = chain.puts.len();
-            if put_count > 0 {
-                let mid_idx = put_count / 2;
-                let start = mid_idx.saturating_sub(atm_below);
-                let end = mid_idx
+            // ATM index for puts (same binary search as calls).
+            let put_atm_idx: Option<usize> = if put_count > 0 {
+                match spot {
+                    Some(price) if price > 0.0 && price.is_finite() => {
+                        let idx = chain.puts.partition_point(|e| e.strike_price < price);
+                        let candidates = [idx.saturating_sub(1), idx.min(put_count - 1)];
+                        let best = candidates.iter().copied().min_by(|&a, &b| {
+                            let da = (chain.puts[a].strike_price - price).abs();
+                            let db = (chain.puts[b].strike_price - price).abs();
+                            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                        best
+                    }
+                    _ => None, // No pre-market price — skipped (same as calls)
+                }
+            } else {
+                None
+            };
+
+            // Subscribe puts: ATM ± N
+            if let Some(atm_idx) = put_atm_idx {
+                let start = atm_idx.saturating_sub(atm_below);
+                let end = atm_idx
                     .saturating_add(atm_above)
                     .saturating_add(1)
                     .min(put_count);
@@ -1010,7 +1081,8 @@ mod tests {
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan = build_subscription_plan(&universe, &config, today);
+        let plan =
+            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
 
         // NIFTY is a major index → its IDX_I feed + ALL derivatives subscribed
         assert_eq!(plan.summary.major_index_values, 1); // NIFTY (only 1 of the 5 is in test universe)
@@ -1033,7 +1105,8 @@ mod tests {
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan = build_subscription_plan(&universe, &config, today);
+        let plan =
+            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
 
         // NIFTY: 1 future + 5 CE + 5 PE = 11 derivatives
         assert_eq!(plan.summary.index_derivatives, 11);
@@ -1045,7 +1118,8 @@ mod tests {
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan = build_subscription_plan(&universe, &config, today);
+        let plan =
+            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
 
         // RELIANCE: 1 future + 5 CE + 5 PE = 11 (all 5 strikes within ATM±10)
         assert_eq!(plan.summary.stock_derivatives, 11);
@@ -1058,7 +1132,8 @@ mod tests {
         // Set today AFTER the expiry date → no current expiry
         let today = NaiveDate::from_ymd_opt(2026, 4, 1).unwrap();
 
-        let plan = build_subscription_plan(&universe, &config, today);
+        let plan =
+            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
 
         // RELIANCE has no valid expiry → skipped
         assert_eq!(plan.summary.stock_derivatives, 0);
@@ -1074,7 +1149,8 @@ mod tests {
         };
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan = build_subscription_plan(&universe, &config, today);
+        let plan =
+            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
 
         assert_eq!(plan.summary.stock_derivatives, 0);
         assert_eq!(plan.summary.stock_equities, 1); // Equity feed still subscribed
@@ -1089,7 +1165,8 @@ mod tests {
         };
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan = build_subscription_plan(&universe, &config, today);
+        let plan =
+            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
 
         assert_eq!(plan.summary.display_indices, 0);
     }
@@ -1103,7 +1180,8 @@ mod tests {
         };
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan = build_subscription_plan(&universe, &config, today);
+        let plan =
+            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
 
         assert_eq!(plan.summary.index_derivatives, 0);
         assert_eq!(plan.summary.major_index_values, 1); // Index value feed still subscribed
@@ -1118,7 +1196,8 @@ mod tests {
         };
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan = build_subscription_plan(&universe, &config, today);
+        let plan =
+            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
 
         assert_eq!(plan.summary.stock_equities, 0);
         // Stock derivatives still subscribed
@@ -1131,7 +1210,8 @@ mod tests {
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan = build_subscription_plan(&universe, &config, today);
+        let plan =
+            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
 
         // Verify no duplicates by checking total equals unique count
         let ids: Vec<u32> = plan.registry.iter().map(|i| i.security_id).collect();
@@ -1145,7 +1225,8 @@ mod tests {
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan = build_subscription_plan(&universe, &config, today);
+        let plan =
+            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
 
         // NIFTY index value
         let nifty = plan.registry.get(13).unwrap();
@@ -1177,7 +1258,8 @@ mod tests {
         };
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan = build_subscription_plan(&universe, &config, today);
+        let plan =
+            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
 
         assert_eq!(plan.summary.feed_mode, FeedMode::Quote);
         // Verify individual instruments have Quote mode
@@ -1194,7 +1276,8 @@ mod tests {
         };
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan = build_subscription_plan(&universe, &config, today);
+        let plan =
+            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
 
         assert_eq!(plan.summary.feed_mode, FeedMode::Full);
     }
@@ -1208,7 +1291,8 @@ mod tests {
         };
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan = build_subscription_plan(&universe, &config, today);
+        let plan =
+            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
 
         // Invalid feed mode falls back to Ticker (see build_subscription_plan line 112)
         assert_eq!(plan.summary.feed_mode, FeedMode::Ticker);
@@ -1224,7 +1308,8 @@ mod tests {
         };
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan = build_subscription_plan(&universe, &config, today);
+        let plan =
+            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
 
         // Stage 1: RELIANCE 1 future + 3 CE (mid+-1) + 3 PE (mid+-1) = 7
         // Stage 2: remaining 4 CE + 4 PE = 8 (progressive fill adds the rest)
@@ -1243,7 +1328,8 @@ mod tests {
         };
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan = build_subscription_plan(&universe, &config, today);
+        let plan =
+            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
 
         // Stage 1: RELIANCE 1 future + 1 CE (ATM only) + 1 PE (ATM only) = 3
         // Stage 2: remaining 4 CE + 4 PE = 8 (progressive fill adds the rest)
@@ -1257,7 +1343,8 @@ mod tests {
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan = build_subscription_plan(&universe, &config, today);
+        let plan =
+            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
 
         let expected_total = plan.summary.major_index_values
             + plan.summary.display_indices
@@ -1274,7 +1361,8 @@ mod tests {
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan = build_subscription_plan(&universe, &config, today);
+        let plan =
+            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
         let grouped = plan.registry.by_exchange_segment();
 
         // IDX_I: NIFTY value (13) + INDIA VIX (21) = 2
@@ -1299,7 +1387,8 @@ mod tests {
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan = build_subscription_plan(&universe, &config, today);
+        let plan =
+            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
 
         let expected_pct = (plan.summary.total as f64 / 25000.0) * 100.0;
         assert!(
@@ -1316,7 +1405,8 @@ mod tests {
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan = build_subscription_plan(&universe, &config, today);
+        let plan =
+            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
 
         // Small universe: all RELIANCE contracts already in Stage 1 (ATM+-10)
         // Stage 2 has 0 remaining → 0 available, 0 skipped
@@ -1331,8 +1421,10 @@ mod tests {
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan1 = build_subscription_plan(&universe, &config, today);
-        let plan2 = build_subscription_plan(&universe, &config, today);
+        let plan1 =
+            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
+        let plan2 =
+            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
 
         let mut ids1: Vec<u32> = plan1.registry.iter().map(|i| i.security_id).collect();
         let mut ids2: Vec<u32> = plan2.registry.iter().map(|i| i.security_id).collect();
@@ -1349,7 +1441,8 @@ mod tests {
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan = build_subscription_plan(&universe, &config, today);
+        let plan =
+            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
 
         let ids: Vec<u32> = plan.registry.iter().map(|i| i.security_id).collect();
         let unique: HashSet<u32> = ids.iter().copied().collect();
@@ -1415,7 +1508,8 @@ mod tests {
 
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
-        let plan = build_subscription_plan(&universe, &config, today);
+        let plan =
+            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
 
         // Stage 1 subscribes near expiry ATM+-N (all 11 RELIANCE near contracts).
         // Stage 2 should add far expiry contracts (future + 3 CE = 4).
@@ -1524,7 +1618,8 @@ mod tests {
 
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
-        let plan = build_subscription_plan(&universe, &config, today);
+        let plan =
+            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
 
         // INFY: 1 future + 3 CE + 0 PE = 4 (Stage 1 ATM+-10 covers all 3 calls)
         // Verify INFY instruments are in the plan
@@ -1570,7 +1665,8 @@ mod tests {
 
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
-        let plan = build_subscription_plan(&universe, &config, today);
+        let plan =
+            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
 
         // SBIN equity should still be subscribed
         assert!(
@@ -1608,7 +1704,8 @@ mod tests {
 
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
-        let plan = build_subscription_plan(&universe, &config, today);
+        let plan =
+            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
 
         // HDFC equity should be subscribed
         assert!(
@@ -1631,7 +1728,8 @@ mod tests {
         };
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan = build_subscription_plan(&universe, &config, today);
+        let plan =
+            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
 
         // Only major index values should remain
         assert_eq!(plan.summary.display_indices, 0);
@@ -1648,7 +1746,8 @@ mod tests {
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan = build_subscription_plan(&universe, &config, today);
+        let plan =
+            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
 
         assert!(
             plan.summary.capacity_utilization_pct >= 0.0,
@@ -1666,7 +1765,8 @@ mod tests {
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan = build_subscription_plan(&universe, &config, today);
+        let plan =
+            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
 
         // stock_derivatives_available + stock_derivatives_skipped >= 0
         // and stock_derivatives_skipped is always consistent
@@ -1682,7 +1782,8 @@ mod tests {
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan = build_subscription_plan(&universe, &config, today);
+        let plan =
+            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
 
         let debug_str = format!("{:?}", plan);
         assert!(
@@ -1697,7 +1798,8 @@ mod tests {
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan = build_subscription_plan(&universe, &config, today);
+        let plan =
+            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
 
         let debug_str = format!("{:?}", plan.summary);
         assert!(
@@ -1769,7 +1871,8 @@ mod tests {
 
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
-        let plan = build_subscription_plan(&universe, &config, today);
+        let plan =
+            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
 
         // TATA future should be subscribed
         assert!(
@@ -1812,7 +1915,8 @@ mod tests {
 
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
-        let plan = build_subscription_plan(&universe, &config, today);
+        let plan =
+            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
 
         // EXPIRED stock should increment stocks_skipped_no_chain
         assert!(plan.summary.stocks_skipped_no_chain >= 1);
@@ -1826,7 +1930,8 @@ mod tests {
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan = build_subscription_plan(&universe, &config, today);
+        let plan =
+            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
 
         // INDIA VIX is a display index, not a major index
         // Its derivatives (if any) should NOT be in IndexDerivative category
@@ -1847,7 +1952,8 @@ mod tests {
         // Set today to the exact expiry date
         let today = NaiveDate::from_ymd_opt(2026, 3, 27).unwrap();
 
-        let plan = build_subscription_plan(&universe, &config, today);
+        let plan =
+            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
 
         // RELIANCE derivatives should still be subscribed (expiry >= today)
         assert!(
@@ -1863,7 +1969,8 @@ mod tests {
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 12, 31).unwrap();
 
-        let plan = build_subscription_plan(&universe, &config, today);
+        let plan =
+            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
 
         // RELIANCE has expiry 2026-03-27, which is < today
         // All stock derivatives should be skipped
@@ -1901,7 +2008,8 @@ mod tests {
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan = build_subscription_plan(&universe, &config, today);
+        let plan =
+            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
 
         assert_eq!(plan.summary.total, 0);
         assert_eq!(plan.summary.major_index_values, 0);
@@ -2067,7 +2175,8 @@ mod tests {
         };
 
         let config = SubscriptionConfig::default();
-        let plan = build_subscription_plan(&universe, &config, today);
+        let plan =
+            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
 
         // The plan should be capped at MAX_TOTAL_SUBSCRIPTIONS
         assert!(
@@ -2119,7 +2228,8 @@ mod tests {
         );
 
         let config = SubscriptionConfig::default();
-        let plan = build_subscription_plan(&universe, &config, today);
+        let plan =
+            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
 
         // Single call + single put should be subscribed (mid_idx=0 for both)
         assert!(
@@ -2149,7 +2259,8 @@ mod tests {
         }
 
         let config = SubscriptionConfig::default();
-        let plan = build_subscription_plan(&universe, &config, today);
+        let plan =
+            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
 
         // Should still include options even without a future linked in the chain
         assert!(
@@ -2229,7 +2340,8 @@ mod tests {
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap(); // APPROVED: test constant
 
         // Build plan from owned types
-        let plan_owned = build_subscription_plan(&universe, &config, today);
+        let plan_owned =
+            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
 
         // Serialize → load as archived → build plan from archived types
         let dir = std::env::temp_dir().join(format!(
@@ -2302,7 +2414,8 @@ mod tests {
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan = build_subscription_plan(&universe, &config, today);
+        let plan =
+            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
 
         // NIFTY (security_id 13) should be subscribed with IDX_I segment
         let nifty = plan.registry.get(13).unwrap();
@@ -2320,7 +2433,8 @@ mod tests {
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan = build_subscription_plan(&universe, &config, today);
+        let plan =
+            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
 
         // INDIA VIX (security_id 21) should use IDX_I segment
         let vix = plan.registry.get(21).unwrap();
@@ -2342,7 +2456,8 @@ mod tests {
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan = build_subscription_plan(&universe, &config, today);
+        let plan =
+            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
 
         // RELIANCE equity (security_id 2885) should use NSE_EQ segment
         let reliance = plan.registry.get(2885).unwrap();
@@ -2364,7 +2479,8 @@ mod tests {
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan = build_subscription_plan(&universe, &config, today);
+        let plan =
+            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
 
         // NIFTY future (50001) should use NSE_FNO segment
         let nifty_fut = plan.registry.get(50001).unwrap();
@@ -2389,7 +2505,8 @@ mod tests {
         };
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan = build_subscription_plan(&universe, &config, today);
+        let plan =
+            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
 
         assert_eq!(plan.summary.feed_mode, FeedMode::Full);
 
@@ -2418,7 +2535,8 @@ mod tests {
         };
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan = build_subscription_plan(&universe, &config, today);
+        let plan =
+            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
 
         for instrument in plan.registry.iter() {
             assert_eq!(
@@ -2559,7 +2677,8 @@ mod tests {
         };
 
         let config = SubscriptionConfig::default();
-        let plan = build_subscription_plan(&universe, &config, today);
+        let plan =
+            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
 
         // Total must not exceed MAX_TOTAL_SUBSCRIPTIONS
         assert!(
@@ -2597,7 +2716,8 @@ mod tests {
         };
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan = build_subscription_plan(&universe, &config, today);
+        let plan =
+            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
 
         assert_eq!(plan.summary.feed_mode, FeedMode::Quote);
         for instrument in plan.registry.iter() {
@@ -2620,7 +2740,8 @@ mod tests {
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan = build_subscription_plan(&universe, &config, today);
+        let plan =
+            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
 
         // RELIANCE future (60001) should be StockDerivative
         let rel_fut = plan.registry.get(60001).unwrap();
@@ -2641,7 +2762,8 @@ mod tests {
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan = build_subscription_plan(&universe, &config, today);
+        let plan =
+            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
 
         // NIFTY index value
         let nifty = plan.registry.get(13).unwrap();
@@ -2666,7 +2788,8 @@ mod tests {
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan = build_subscription_plan(&universe, &config, today);
+        let plan =
+            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
 
         // NIFTY CE option (50100) should be IndexDerivative
         let nifty_ce = plan.registry.get(50100).unwrap();

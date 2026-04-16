@@ -760,191 +760,12 @@ async fn main() -> Result<()> {
             fast_tick_broadcast_sender.clone(),
         );
 
-        // S3-2: Gap-backfill channel + worker. The cold-path tick persistence
-        // consumer publishes GapBackfillRequest here when a TickGapTracker
-        // Error-level gap is observed. The worker fetches the missing window
-        // and synthesises replacement ticks. QuestDB DEDUP ensures idempotency
-        // on overlapping live ticks.
-        //
-        // Bounded channel (64). If full, gaps are dropped and
-        // tv_backfill_gaps_dropped_total increments — caller already logs a
-        // warning. 64 is generous because gap events are rare during healthy
-        // operation (post-reconnect) and cheap to process.
-        let (gap_backfill_tx, gap_backfill_rx) = tokio::sync::mpsc::channel::<
-            tickvault_core::historical::backfill::GapBackfillRequest,
-        >(64);
-
-        // S3-2: Synthetic tick output channel. BackfillWorker pushes ticks here;
-        // in this initial wiring we drain them into a tracing log so the
-        // metric tv_backfill_ticks_synthesised_total (emitted internally by
-        // the worker via its BackfillStats) becomes observable without
-        // touching the main tick persistence path. Follow-up: wire the
-        // synthesised ticks directly into tick_writer.append_tick() so they
-        // become durable. For now the worker PROVES the path works and
-        // the counter lets operators see when it fired.
-        let (synth_tick_tx, mut synth_tick_rx) =
-            tokio::sync::mpsc::channel::<tickvault_common::tick_types::ParsedTick>(4096);
-
-        // S4-T1e: Real Dhan historical intraday REST fetcher. Replaces
-        // the session-3 placeholder. The closure captures a reqwest
-        // client, the rest_api_base_url, the token_handle (Arc<ArcSwap>,
-        // lock-free atomic reads at call time), and the client_id. The
-        // closure is called by the BackfillWorker once per gap event.
-        let backfill_endpoint = format!(
-            "{}/charts/intraday",
-            config.dhan.rest_api_base_url.trim_end_matches('/')
-        );
-        let backfill_http_client = match reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10)) // APPROVED: pre-existing literal, session-7 tech debt tracked for cleanup
-            .build()
-        {
-            Ok(c) => c,
-            Err(err) => {
-                warn!(
-                    ?err,
-                    "S4-T1e: reqwest client build failed — backfill worker disabled"
-                );
-                reqwest::Client::new()
-            }
-        };
-        let backfill_token_handle = std::sync::Arc::clone(&token_handle);
-        let backfill_client_id = client_id.clone();
-        // S5-A2: Clone the instrument registry so the backfill closure can
-        // look up the exact instrument kind per gap event and pass it as
-        // the `instrument` hint to Dhan's intraday REST API. Without this
-        // the fetcher defaulted to OPTIDX for all NSE_FNO, which returns
-        // empty candle lists for futures and stock options.
-        let backfill_registry_fast: Option<
-            std::sync::Arc<tickvault_common::instrument_registry::InstrumentRegistry>,
-        > = subscription_plan
-            .as_ref()
-            .map(|p| std::sync::Arc::new(p.registry.clone()));
-        // S5-A3: Rate limiter for the backfill fetcher.
-        //
-        // Dhan Data API category limit: 5/sec, 100,000/day. A pool-wide
-        // outage can produce up to 25,000 simultaneous ERROR-level gaps;
-        // without rate limiting the worker would burst all 25,000
-        // requests at Dhan and immediately hit the 805 "too many
-        // requests" code which PAUSES ALL CONNECTIONS for 60s.
-        // Rate limiter uses the governor crate (same GCRA algorithm as
-        // the OMS order rate limiter) — await semantics so the worker
-        // naturally serialises bursts into the allowed rate.
-        let backfill_rate_limiter = std::sync::Arc::new(governor::RateLimiter::direct(
-            governor::Quota::per_second(std::num::NonZeroU32::new(5).expect("5 > 0")), // APPROVED: .expect on a compile-time literal — unreachable.
-        ));
-        let backfill_fetcher =
-            move |req: tickvault_core::historical::backfill::GapBackfillRequest| {
-                // Clone per-invocation captures to move into the returned future.
-                let http_client = backfill_http_client.clone();
-                let endpoint = backfill_endpoint.clone();
-                let token_handle = std::sync::Arc::clone(&backfill_token_handle);
-                let client_id_inner = backfill_client_id.clone();
-                let rate_limiter = std::sync::Arc::clone(&backfill_rate_limiter);
-                let registry_clone = backfill_registry_fast.clone();
-                async move {
-                    // S5-A3: await the rate limiter before each call.
-                    // This naturally serialises bursts into Dhan's 5/sec
-                    // cap and prevents 805 blocks during pool-wide gaps.
-                    rate_limiter.until_ready().await;
-
-                    // Read the current access token atomically.
-                    use secrecy::ExposeSecret as _;
-                    let token_guard = token_handle.load();
-                    let token_state = match token_guard.as_ref().as_ref() {
-                        Some(state) if state.is_valid() => state,
-                        _ => return Err("backfill: no valid access token available".to_string()),
-                    };
-                    let access_token = token_state.access_token().expose_secret().to_string();
-
-                    // S5-A2: Resolve the Dhan instrument enum string from
-                    // the registry. None for indices/equities (the
-                    // segment heuristic handles them).
-                    let hint: Option<&'static str> = registry_clone
-                        .as_ref()
-                        .and_then(|r| r.get(req.security_id))
-                        .and_then(|inst| inst.instrument_kind.as_ref())
-                        .map(|kind| kind.as_dhan_api_string());
-
-                    tickvault_core::historical::backfill::fetch_intraday_window(
-                        &http_client,
-                        &endpoint,
-                        &access_token,
-                        &client_id_inner,
-                        req.security_id,
-                        req.exchange_segment_code,
-                        req.from_ist_secs,
-                        req.to_ist_secs,
-                        hint,
-                    )
-                    .await
-                }
-            };
-        let backfill_worker = tickvault_core::historical::backfill::BackfillWorker::new(
-            gap_backfill_rx,
-            synth_tick_tx,
-            backfill_fetcher,
-        );
-        let backfill_stats = backfill_worker.stats_handle();
-        tokio::spawn(async move {
-            tracing::info!("S3-2: BackfillWorker started — listening for gap events");
-            backfill_worker.run().await;
-            tracing::info!("S3-2: BackfillWorker exited");
-        });
-        // S4-T1f: Forward synth ticks from the BackfillWorker into the
-        // main tick broadcast channel. Every downstream consumer (tick
-        // persistence, candle aggregator, trading pipeline) processes
-        // them identically to live ticks. QuestDB DEDUP UPSERT KEYS on
-        // (ts, security_id, segment) merges any overlap with the live
-        // tick that eventually catches up, so replay is idempotent.
-        //
-        // Counter `tv_backfill_ticks_forwarded_total` measures how many
-        // synth ticks actually reached the broadcast channel — this is
-        // the real observable measure of "backfill closed the gap".
-        {
-            let broadcast_for_synth = fast_tick_broadcast_sender.clone();
-            tokio::spawn(async move {
-                let mut forwarded_total: u64 = 0;
-                while let Some(tick) = synth_tick_rx.recv().await {
-                    match broadcast_for_synth.send(tick) {
-                        Ok(_) => {
-                            forwarded_total = forwarded_total.saturating_add(1);
-                            metrics::counter!("tv_backfill_ticks_forwarded_total").increment(1);
-                        }
-                        Err(_) => {
-                            // Broadcast receiver count 0 means the pipeline
-                            // is tearing down — exit cleanly.
-                            tracing::info!(
-                                forwarded_total,
-                                "S4-T1f: fast-boot synth forwarder exiting (broadcast closed)"
-                            );
-                            return;
-                        }
-                    }
-                }
-            });
-        }
-        // Expose stats_handle via a background metric emitter so the counters
-        // surface even without a prod scrape query.
-        {
-            let stats = std::sync::Arc::clone(&backfill_stats);
-            tokio::spawn(async move {
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(30)); // APPROVED: pre-existing literal, session-7 tech debt tracked for cleanup
-                interval.tick().await; // skip first immediate tick
-                loop {
-                    interval.tick().await;
-                    let snap = stats.snapshot();
-                    metrics::counter!("tv_backfill_events_received_total")
-                        .absolute(snap.events_received);
-                    metrics::counter!("tv_backfill_events_succeeded_total")
-                        .absolute(snap.events_succeeded);
-                    metrics::counter!("tv_backfill_events_errored_total")
-                        .absolute(snap.events_errored);
-                    metrics::counter!("tv_backfill_events_empty_total").absolute(snap.events_empty);
-                    metrics::counter!("tv_backfill_ticks_synthesised_total")
-                        .absolute(snap.ticks_synthesised);
-                }
-            });
-        }
+        // Gap-backfill worker DISABLED. Historical candle data and live
+        // WebSocket ticks are separate concerns — the backfill worker was
+        // injecting synthetic ticks from Dhan's REST API into the live
+        // `ticks` table, causing stale 9:15 AM data to appear on fresh
+        // starts at 6 PM. Historical candles belong in `historical_candles`
+        // only; the WebSocket pipeline must contain ONLY live ticks.
 
         let processor_handle = if let Some(receiver) = pool_receiver {
             let candle_agg = Some(tickvault_core::pipeline::CandleAggregator::new());
@@ -1126,18 +947,13 @@ async fn main() -> Result<()> {
             let questdb_cfg = config.questdb.clone();
             let hs = health_status.clone();
             let persist_notifier = std::sync::Arc::clone(&notifier);
-            // S3-2: hand the cold-path consumer a clone of the gap-backfill
-            // sender. ERROR-level gaps detected during tick persistence will
-            // publish to gap_backfill_rx where the BackfillWorker consumes
-            // them. Cloning is cheap (mpsc::Sender is Arc internally).
-            let gap_tx_for_consumer = gap_backfill_tx.clone();
             tokio::spawn(async move {
                 run_tick_persistence_consumer(
                     tick_persistence_rx,
                     questdb_cfg,
                     Some(hs),
                     Some(persist_notifier),
-                    Some(gap_tx_for_consumer),
+                    None, // gap backfill disabled — historical data is separate from live ticks
                 )
                 .await;
             });
@@ -1815,230 +1631,18 @@ async fn main() -> Result<()> {
         tick_broadcast_sender.clone(),
     );
 
-    // S4-T1d: Slow-boot backfill infrastructure. Mirrors the fast-boot
-    // wiring at line ~424 so the two boot modes have identical gap
-    // detection + backfill observability surfaces. The slow-boot hot
-    // path (run_tick_processor) owns its own tick writer, so we do NOT
-    // write ticks from the observability task — it only tracks gaps
-    // and HTTP-pings QuestDB for health.
-    let (gap_backfill_tx_slow, gap_backfill_rx_slow) =
-        tokio::sync::mpsc::channel::<tickvault_core::historical::backfill::GapBackfillRequest>(64);
-    let (synth_tick_tx_slow, mut synth_tick_rx_slow) =
-        tokio::sync::mpsc::channel::<tickvault_common::tick_types::ParsedTick>(4096);
-    // S4-T1e: Real Dhan historical intraday REST fetcher (slow-boot).
-    // Mirrors the fast-boot closure at line ~446. The closure captures
-    // a reqwest client, the rest_api_base_url, the token_handle (Arc,
-    // lock-free reads), and the client_id.
-    let backfill_endpoint_slow = format!(
-        "{}/charts/intraday",
-        config.dhan.rest_api_base_url.trim_end_matches('/')
-    );
-    let backfill_http_client_slow = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10)) // APPROVED: pre-existing literal, session-7 tech debt tracked for cleanup
-        .build()
-    {
-        Ok(c) => c,
-        Err(err) => {
-            warn!(
-                ?err,
-                "S4-T1e: slow-boot reqwest client build failed — backfill worker degraded"
-            );
-            reqwest::Client::new()
-        }
-    };
-    let backfill_token_handle_slow = std::sync::Arc::clone(&token_handle);
-    let backfill_client_id_slow = ws_client_id.clone();
-    // S5-A2: Clone the instrument registry for slow-boot so the backfill
-    // closure can resolve the exact instrument kind per gap event.
-    // Mirrors the fast-boot wiring at backfill_registry_fast.
-    let backfill_registry_slow: Option<
-        std::sync::Arc<tickvault_common::instrument_registry::InstrumentRegistry>,
-    > = subscription_plan
-        .as_ref()
-        .map(|p| std::sync::Arc::new(p.registry.clone()));
-    // S5-A3: Rate limiter — mirrors the fast-boot limiter above, 5/sec
-    // matching Dhan's Data API category limit. Prevents 25,000
-    // simultaneous gap events from bursting Dhan into a 60s 805 block.
-    let backfill_rate_limiter_slow = std::sync::Arc::new(governor::RateLimiter::direct(
-        governor::Quota::per_second(std::num::NonZeroU32::new(5).expect("5 > 0")), // APPROVED: .expect on a compile-time literal — unreachable.
-    ));
-    let backfill_fetcher_slow =
-        move |req: tickvault_core::historical::backfill::GapBackfillRequest| {
-            let http_client = backfill_http_client_slow.clone();
-            let endpoint = backfill_endpoint_slow.clone();
-            let token_handle = std::sync::Arc::clone(&backfill_token_handle_slow);
-            let client_id_inner = backfill_client_id_slow.clone();
-            let rate_limiter = std::sync::Arc::clone(&backfill_rate_limiter_slow);
-            let registry_clone = backfill_registry_slow.clone();
-            async move {
-                // S5-A3: await rate limiter before each Dhan call.
-                rate_limiter.until_ready().await;
-                use secrecy::ExposeSecret as _;
-                let token_guard = token_handle.load();
-                let token_state = match token_guard.as_ref().as_ref() {
-                    Some(state) if state.is_valid() => state,
-                    _ => {
-                        return Err(
-                            "backfill: no valid access token available (slow-boot)".to_string()
-                        );
-                    }
-                };
-                let access_token = token_state.access_token().expose_secret().to_string();
+    // Gap-backfill worker DISABLED (slow-boot). Same reasoning as
+    // fast-boot: historical candle data must NOT be injected into the
+    // live `ticks` table via synthetic tick synthesis.
 
-                // S5-A2: Resolve exact Dhan instrument enum from registry.
-                let hint: Option<&'static str> = registry_clone
-                    .as_ref()
-                    .and_then(|r| r.get(req.security_id))
-                    .and_then(|inst| inst.instrument_kind.as_ref())
-                    .map(|kind| kind.as_dhan_api_string());
-
-                tickvault_core::historical::backfill::fetch_intraday_window(
-                    &http_client,
-                    &endpoint,
-                    &access_token,
-                    &client_id_inner,
-                    req.security_id,
-                    req.exchange_segment_code,
-                    req.from_ist_secs,
-                    req.to_ist_secs,
-                    hint,
-                )
-                .await
-            }
-        };
-    let backfill_worker_slow = tickvault_core::historical::backfill::BackfillWorker::new(
-        gap_backfill_rx_slow,
-        synth_tick_tx_slow,
-        backfill_fetcher_slow,
-    );
-    let backfill_stats_slow = backfill_worker_slow.stats_handle();
-    tokio::spawn(async move {
-        tracing::info!("S4-T1d: slow-boot BackfillWorker started");
-        backfill_worker_slow.run().await;
-    });
-    // S5-A1: Slow-boot dedicated synth tick writer + broadcast forwarder.
-    //
-    // FIX for session-5 honest audit A1: previously this task only
-    // forwarded synth ticks to `tick_broadcast_sender`, but slow-boot's
-    // hot path (`run_tick_processor`) reads from the raw frame_receiver
-    // and never subscribes to the broadcast — so forwarded synth ticks
-    // never reached the `ticks` table. The zero-tick-loss guarantee was
-    // broken for slow-boot mode.
-    //
-    // Fix: this task owns its own TickPersistenceWriter (auto-reconnects,
-    // same ring-buffer + DLQ semantics as the hot-path writer) and
-    // writes synth ticks DIRECTLY via append_tick. It also forwards to
-    // the broadcast so the candle aggregator + other downstream
-    // consumers see the backfilled ticks too. QuestDB DEDUP UPSERT KEYS
-    // on (ts, security_id, segment) handles any overlap with the live
-    // tick that eventually arrives for the same minute — verified by
-    // S3-3 property tests (10,240 random cases + 3 regressions).
-    {
-        let broadcast_for_synth_slow = tick_broadcast_sender.clone();
-        let questdb_cfg_for_synth = config.questdb.clone();
-        tokio::spawn(async move {
-            let mut synth_writer =
-                match tickvault_storage::tick_persistence::TickPersistenceWriter::new(
-                    &questdb_cfg_for_synth,
-                ) {
-                    Ok(w) => {
-                        tracing::info!("S5-A1: slow-boot synth tick writer connected to QuestDB");
-                        w
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            ?err,
-                            "S5-A1: slow-boot synth writer: QuestDB unavailable — \
-                             using disconnected mode with ring buffer + spill"
-                        );
-                        tickvault_storage::tick_persistence::TickPersistenceWriter::new_disconnected(
-                            &questdb_cfg_for_synth,
-                        )
-                    }
-                };
-
-            let mut persisted_total: u64 = 0;
-            let mut forwarded_total: u64 = 0;
-            let flush_interval = std::time::Duration::from_millis(100); // APPROVED: pre-existing literal, session-7 tech debt tracked for cleanup
-            let mut last_flush = std::time::Instant::now();
-
-            while let Some(tick) = synth_tick_rx_slow.recv().await {
-                // A1 primary write path — direct append to the ticks table.
-                match synth_writer.append_tick(&tick) {
-                    Ok(()) => {
-                        persisted_total = persisted_total.saturating_add(1);
-                        metrics::counter!("tv_backfill_ticks_persisted_total").increment(1);
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            ?err,
-                            security_id = tick.security_id,
-                            "S5-A1: slow-boot synth writer append failed (will retry via ring buffer)"
-                        );
-                    }
-                }
-
-                // Periodic flush every 100ms so QuestDB actually sees the
-                // rows rather than waiting for the ring buffer to fill.
-                if last_flush.elapsed() >= flush_interval {
-                    let _ = synth_writer.flush_if_needed();
-                    last_flush = std::time::Instant::now();
-                }
-
-                // Also forward to the main tick broadcast so the
-                // candle aggregator + trading pipeline see the tick.
-                match broadcast_for_synth_slow.send(tick) {
-                    Ok(_) => {
-                        forwarded_total = forwarded_total.saturating_add(1);
-                        metrics::counter!("tv_backfill_ticks_forwarded_total").increment(1);
-                    }
-                    Err(_) => {
-                        tracing::info!(
-                            persisted_total,
-                            forwarded_total,
-                            "S5-A1: slow-boot synth task exiting (broadcast closed)"
-                        );
-                        let _ = synth_writer.flush_if_needed();
-                        return;
-                    }
-                }
-            }
-            tracing::info!(
-                persisted_total,
-                forwarded_total,
-                "S5-A1: slow-boot synth task shutting down (channel closed)"
-            );
-            let _ = synth_writer.flush_if_needed();
-        });
-    }
-    {
-        let stats = std::sync::Arc::clone(&backfill_stats_slow);
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30)); // APPROVED: pre-existing literal, session-7 tech debt tracked for cleanup
-            interval.tick().await;
-            loop {
-                interval.tick().await;
-                let snap = stats.snapshot();
-                metrics::counter!("tv_backfill_events_received_total")
-                    .absolute(snap.events_received);
-                metrics::counter!("tv_backfill_events_succeeded_total")
-                    .absolute(snap.events_succeeded);
-                metrics::counter!("tv_backfill_events_errored_total").absolute(snap.events_errored);
-                metrics::counter!("tv_backfill_events_empty_total").absolute(snap.events_empty);
-                metrics::counter!("tv_backfill_ticks_synthesised_total")
-                    .absolute(snap.ticks_synthesised);
-            }
-        });
-    }
     // Spawn the observability-only consumer (gap tracker + HTTP health).
     {
         let obs_rx = tick_broadcast_sender.subscribe();
         let questdb_cfg = config.questdb.clone();
-        let gap_tx_for_obs = gap_backfill_tx_slow.clone();
         tokio::spawn(async move {
-            run_slow_boot_observability(obs_rx, questdb_cfg, Some(gap_tx_for_obs)).await;
+            run_slow_boot_observability(obs_rx, questdb_cfg, None).await;
         });
-        info!("S4-T1d: slow-boot observability consumer started");
+        info!("slow-boot observability consumer started");
     }
 
     let processor_handle = if let Some(receiver) = pool_receiver {
@@ -2162,120 +1766,246 @@ async fn main() -> Result<()> {
     };
 
     // -----------------------------------------------------------------------
+    // Step 8c.0: SharedSpotPrices — capture index LTP for depth ATM selection
+    // -----------------------------------------------------------------------
+    // Must be created BEFORE depth connections so we can wait for the first
+    // index LTP before selecting ATM strikes. The spot price updater subscribes
+    // to the tick broadcast and extracts index LTPs.
+    let shared_spot_prices = tickvault_core::instrument::depth_rebalancer::new_shared_spot_prices();
+    let spot_prices_for_depth = std::sync::Arc::clone(&shared_spot_prices);
+    if should_connect_ws {
+        let spot_prices_updater = std::sync::Arc::clone(&shared_spot_prices);
+        let mut spot_rx = tick_broadcast_sender.subscribe();
+        tokio::spawn(async move {
+            loop {
+                match spot_rx.recv().await {
+                    Ok(tick) => {
+                        // IDX_I segment code = 0 — index ticks carry the spot price
+                        if tick.exchange_segment_code == 0
+                            && tick.last_traded_price > 0.0
+                            && tick.last_traded_price.is_finite()
+                        {
+                            let symbol = match tick.security_id {
+                                13 => Some("NIFTY"),
+                                25 => Some("BANKNIFTY"),
+                                27 => Some("FINNIFTY"),
+                                442 => Some("MIDCPNIFTY"),
+                                _ => None,
+                            };
+                            if let Some(sym) = symbol {
+                                tickvault_core::instrument::depth_rebalancer::update_spot_price(
+                                    &spot_prices_updater,
+                                    sym,
+                                    f64::from(tick.last_traded_price),
+                                )
+                                .await;
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+        info!("spot price updater started — capturing index LTPs for depth ATM selection");
+    }
+
+    // -----------------------------------------------------------------------
     // Step 8c: Spawn 20-level + 200-level depth WebSocket connections
     // -----------------------------------------------------------------------
-    // 20-level: 4 connections (NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY), 50 instruments each
-    // 200-level: 4 connections, 1 ATM instrument each
+    // 20-level: 4 connections (NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY), 49 instruments each
+    //   = ATM + 24 CE above + 24 PE below (nearest expiry only)
+    // 200-level: 2 underlyings (NIFTY, BANKNIFTY), 1 ATM CE + 1 ATM PE each
+    //   (nearest expiry only)
     // NSE only — BSE (SENSEX) depth not supported by Dhan depth endpoint.
     // SENSEX gets 5-level depth from main Live Market Feed.
+    // 200-level depth task handles — abort+respawn on ATM rebalance.
+    // Key: "NIFTY-CE", "NIFTY-PE", etc. Value: JoinHandle of the WS connection task.
+    // Protected by tokio Mutex for async-safe abort+spawn cycle.
+    let depth_200_handles: std::sync::Arc<
+        tokio::sync::Mutex<std::collections::HashMap<String, tokio::task::JoinHandle<()>>>,
+    > = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+
+    // Command senders for live depth instrument swaps (unsubscribe+resubscribe, zero disconnect).
+    // Key: "NIFTY" for 20-level, "NIFTY-CE"/"NIFTY-PE" for 200-level.
+    let depth_cmd_senders: std::sync::Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<
+                String,
+                tokio::sync::mpsc::Sender<tickvault_core::websocket::DepthCommand>,
+            >,
+        >,
+    > = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+
     // O(1) EXEMPT: begin — boot-time depth connection setup
     if should_connect_ws && config.subscription.enable_twenty_depth {
-        if let Some(ref plan) = subscription_plan {
+        if let Some(ref _plan) = subscription_plan {
             let depth_underlyings = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"];
 
+            // Wait for the first index LTP before selecting depth strikes.
+            // Without a real spot price, we cannot determine ATM. The main
+            // WebSocket feed streams index LTPs continuously — we poll the
+            // SharedSpotPrices map every 500ms up to 30 seconds.
+            {
+                let wait_start = std::time::Instant::now();
+                let max_wait = std::time::Duration::from_secs(30); // APPROVED: boot-time wait
+                let poll_interval = std::time::Duration::from_millis(500); // APPROVED: boot-time poll
+                loop {
+                    let prices = spot_prices_for_depth.read().await;
+                    let have_nifty = prices.contains_key("NIFTY");
+                    let have_banknifty = prices.contains_key("BANKNIFTY");
+                    drop(prices);
+                    if have_nifty && have_banknifty {
+                        info!(
+                            "depth ATM: received NIFTY + BANKNIFTY index LTPs — proceeding with depth setup"
+                        );
+                        break;
+                    }
+                    if wait_start.elapsed() >= max_wait {
+                        warn!(
+                            "depth ATM: timed out waiting for index LTPs (30s) — using median strike fallback"
+                        );
+                        break;
+                    }
+                    tokio::time::sleep(poll_interval).await;
+                }
+            }
+
+            // Read current spot prices for ATM calculation.
+            let spot_snapshot: std::collections::HashMap<String, f64> = {
+                let prices = spot_prices_for_depth.read().await;
+                prices.clone() // O(1) EXEMPT: 4 entries max
+            };
+
+            // Build FnoUniverse reference for select_depth_instruments.
+            let depth_universe: Option<&tickvault_common::instrument_types::FnoUniverse> =
+                slow_boot_universe.as_ref();
+
+            let today = chrono::Utc::now()
+                .with_timezone(
+                    &chrono::FixedOffset::east_opt(19800).expect("IST offset"), // APPROVED: compile-time literal
+                )
+                .date_naive();
+
+            // Use select_depth_instruments for ATM ± 24 selection when universe + spot prices available.
+            // Falls back to nearest-expiry median when spot price unavailable.
+            let depth_selections: Vec<
+                tickvault_core::instrument::depth_strike_selector::DepthStrikeSelection,
+            > = if let Some(universe) = depth_universe {
+                let ul_refs: Vec<&str> = depth_underlyings.iter().copied().collect();
+                tickvault_core::instrument::depth_strike_selector::select_depth_instruments(
+                    universe,
+                    &ul_refs,
+                    &spot_snapshot,
+                    today,
+                    tickvault_core::instrument::depth_strike_selector::DEPTH_ATM_STRIKES_EACH_SIDE,
+                )
+            } else {
+                Vec::new()
+            };
+
+            // Log PROOF of ATM selection for every underlying.
+            for sel in &depth_selections {
+                info!(
+                    underlying = %sel.underlying_symbol,
+                    atm_strike = sel.atm_strike,
+                    expiry = %sel.expiry_date,
+                    calls = sel.call_security_ids.len(),
+                    puts = sel.put_security_ids.len(),
+                    total = sel.all_security_ids.len(),
+                    spot = spot_snapshot.get(&sel.underlying_symbol).copied().unwrap_or(0.0),
+                    "PROOF: depth ATM selection — nearest expiry {}, ATM strike {}, {} CE + {} PE = {} instruments",
+                    sel.expiry_date, sel.atm_strike,
+                    sel.call_security_ids.len(), sel.put_security_ids.len(), sel.all_security_ids.len()
+                );
+            }
+
             for underlying in &depth_underlyings {
-                // Collect NSE_FNO instruments for this underlying (ATM strikes first from plan)
+                // Look up the ATM selection for this underlying.
+                let selection = depth_selections
+                    .iter()
+                    .find(|s| s.underlying_symbol == *underlying);
+
+                // Build 20-level instrument list from ATM ± 24 selection.
                 let instruments_for_underlying: Vec<
                     tickvault_core::websocket::types::InstrumentSubscription,
-                > = plan
-                    .registry
-                    .iter()
-                    .filter(|inst| {
-                        inst.exchange_segment == tickvault_common::types::ExchangeSegment::NseFno
-                            && inst.underlying_symbol == *underlying
-                    })
-                    .take(config.subscription.twenty_depth_max_instruments)
-                    .map(|inst| {
-                        tickvault_core::websocket::types::InstrumentSubscription::new(
-                            inst.exchange_segment,
-                            inst.security_id,
-                        )
-                    })
-                    .collect();
+                > = if let Some(sel) = selection {
+                    sel.all_security_ids
+                        .iter()
+                        .take(config.subscription.twenty_depth_max_instruments)
+                        .map(|&sid| {
+                            tickvault_core::websocket::types::InstrumentSubscription::new(
+                                tickvault_common::types::ExchangeSegment::NseFno,
+                                sid,
+                            )
+                        })
+                        .collect()
+                } else {
+                    warn!(
+                        underlying,
+                        "depth: no ATM selection available — no spot price or no option chain"
+                    );
+                    Vec::new()
+                };
 
                 if instruments_for_underlying.is_empty() {
                     info!(
                         underlying,
-                        "20-level depth: no instruments found — skipping"
+                        "20-level depth: no instruments selected — skipping"
                     );
                     continue;
                 }
 
-                // Extract ATM CE + ATM PE security_ids + precise contract labels for 200-level depth.
-                // 200-level = 1 instrument per connection. We need BOTH CE and PE for full
-                // order book visibility. Dhan confirmed: must use ATM strikes (Ticket #5519522).
-                //
-                // Labels are built as `{UNDERLYING}-{MmmYYYY}-{Strike}-{CE|PE}` (e.g.
-                // `MAXHEALTH-Apr2026-660-CE`) so every log line and Telegram alert carries
-                // the PRECISE contract — the user can quote it verbatim to Dhan support
-                // without any ambiguity (200-depth is 1 instrument per connection, so a
-                // generic "NIFTY-ATM-CE" label would hide which expiry and strike actually
-                // stalled).
-                // O(1) EXEMPT: boot-time registry scan for ATM CE + PE
-                let (atm_ce, atm_pe): (Option<(u32, String)>, Option<(u32, String)>) = {
-                    // Get ATM strike AND expiry from the first instrument in 20-level selection
-                    // (subscription planner already orders by ATM proximity).
-                    // Both are needed to find the exact CE/PE contract (prevents wrong-expiry match).
-                    let atm_info: Option<(f64, chrono::NaiveDate)> = instruments_for_underlying
-                        .first()
-                        .and_then(|sub| sub.security_id.parse::<u32>().ok())
-                        .and_then(|sid| plan.registry.get(sid))
-                        .and_then(|r| r.strike_price.zip(r.expiry_date));
-
-                    // Build a precise contract label from registry fields.
-                    // Format: `MAXHEALTH-Apr2026-660-CE` — underlying + Mmm YYYY expiry + strike + side.
-                    fn build_precise_label(
-                        underlying: &str,
-                        expiry: chrono::NaiveDate,
-                        strike: f64,
-                        side: &str,
-                    ) -> String {
-                        let strike_str = if (strike.fract()).abs() < 0.0001 {
+                // Extract ATM CE + ATM PE for 200-level depth.
+                // 200-level = 1 instrument per connection (nearest expiry, exact ATM only).
+                // O(1) EXEMPT: boot-time ATM lookup
+                fn build_precise_label(
+                    underlying: &str,
+                    expiry: chrono::NaiveDate,
+                    strike: f64,
+                    side: &str,
+                ) -> String {
+                    let strike_str = if (strike.fract()).abs() < 0.0001 {
+                        #[allow(clippy::cast_possible_truncation)]
+                        // APPROVED: strike prices fit i64
+                        {
                             format!("{}", strike as i64)
-                        } else {
-                            format!("{strike}")
-                        };
-                        format!("{underlying}-{}-{strike_str}-{side}", expiry.format("%b%Y"))
-                    }
-
-                    match atm_info {
-                        Some((strike, expiry)) => {
-                            // Find CE and PE at this strike AND expiry (prevents wrong-expiry match)
-                            let ce = plan.registry.iter().find(|r| {
-                                r.underlying_symbol == *underlying
-                                    && r.exchange_segment
-                                        == tickvault_common::types::ExchangeSegment::NseFno
-                                    && r.option_type
-                                        == Some(tickvault_common::types::OptionType::Call)
-                                    && r.strike_price.is_some_and(|sp| (sp - strike).abs() < 0.01)
-                                    && r.expiry_date == Some(expiry)
-                            });
-                            let pe = plan.registry.iter().find(|r| {
-                                r.underlying_symbol == *underlying
-                                    && r.exchange_segment
-                                        == tickvault_common::types::ExchangeSegment::NseFno
-                                    && r.option_type
-                                        == Some(tickvault_common::types::OptionType::Put)
-                                    && r.strike_price.is_some_and(|sp| (sp - strike).abs() < 0.01)
-                                    && r.expiry_date == Some(expiry)
-                            });
-                            let ce_out = ce.map(|r| {
-                                (
-                                    r.security_id,
-                                    build_precise_label(underlying, expiry, strike, "CE"),
-                                )
-                            });
-                            let pe_out = pe.map(|r| {
-                                (
-                                    r.security_id,
-                                    build_precise_label(underlying, expiry, strike, "PE"),
-                                )
-                            });
-                            (ce_out, pe_out)
                         }
-                        None => (None, None),
-                    }
-                };
+                    } else {
+                        format!("{strike}")
+                    };
+                    format!("{underlying}-{}-{strike_str}-{side}", expiry.format("%b%Y"))
+                }
+
+                let (atm_ce, atm_pe): (Option<(u32, String)>, Option<(u32, String)>) =
+                    if let Some(sel) = selection {
+                        // ATM CE = first call in selection (ATM index), PE = first put
+                        let ce = sel.call_security_ids.first().map(|&sid| {
+                            (
+                                sid,
+                                build_precise_label(
+                                    underlying,
+                                    sel.expiry_date,
+                                    sel.atm_strike,
+                                    "CE",
+                                ),
+                            )
+                        });
+                        let pe = sel.put_security_ids.first().map(|&sid| {
+                            (
+                                sid,
+                                build_precise_label(
+                                    underlying,
+                                    sel.expiry_date,
+                                    sel.atm_strike,
+                                    "PE",
+                                ),
+                            )
+                        });
+                        (ce, pe)
+                    } else {
+                        (None, None)
+                    };
                 let atm_ce_sid = atm_ce.as_ref().map(|(sid, _)| *sid);
                 let atm_pe_sid = atm_pe.as_ref().map(|(sid, _)| *sid);
 
@@ -2345,6 +2075,9 @@ async fn main() -> Result<()> {
                     > = std::collections::HashMap::with_capacity(50);
                     // O(1) EXEMPT: end
 
+                    // H5: consecutive parse error counter for Telegram escalation.
+                    let mut consecutive_parse_errors: u32 = 0;
+
                     while let Some(frame) = depth_rx.recv().await {
                         m.increment(1);
                         let ts = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
@@ -2376,6 +2109,7 @@ async fn main() -> Result<()> {
                                     message_sequence,
                                     ..
                                 }) => {
+                                    consecutive_parse_errors = 0; // H5: reset on success
                                     let side_str = match side {
                                         tickvault_core::parser::deep_depth::DepthSide::Bid => "BID",
                                         tickvault_core::parser::deep_depth::DepthSide::Ask => "ASK",
@@ -2460,8 +2194,22 @@ async fn main() -> Result<()> {
                                 Ok(_) => {} // non-depth frame (shouldn't happen)
                                 Err(err) => {
                                     // H5: Escalate persistent parse failures to ERROR (triggers Telegram).
+                                    consecutive_parse_errors =
+                                        consecutive_parse_errors.saturating_add(1);
                                     metrics::counter!("tv_depth_parse_errors_total", "depth" => "20").increment(1);
-                                    tracing::warn!(?err, "failed to parse 20-level depth packet");
+                                    if consecutive_parse_errors >= 5 {
+                                        tracing::error!(
+                                            ?err,
+                                            consecutive = consecutive_parse_errors,
+                                            "H5: 20-level depth parse failures persisting — {consecutive_parse_errors} consecutive errors"
+                                        );
+                                        consecutive_parse_errors = 0;
+                                    } else {
+                                        tracing::warn!(
+                                            ?err,
+                                            "failed to parse 20-level depth packet"
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -2493,6 +2241,16 @@ async fn main() -> Result<()> {
                 let d20_underlying_label = label.clone();
                 let d20_wal_spill = ws_frame_spill.clone();
                 let (signal_tx, signal_rx) = tokio::sync::oneshot::channel::<()>();
+                // Command channel for live rebalance (unsubscribe+resubscribe, zero disconnect).
+                let (d20_cmd_tx, d20_cmd_rx) =
+                    tokio::sync::mpsc::channel::<tickvault_core::websocket::DepthCommand>(4);
+                {
+                    let senders = std::sync::Arc::clone(&depth_cmd_senders);
+                    let key = (*underlying).to_string();
+                    tokio::spawn(async move {
+                        senders.lock().await.insert(key, d20_cmd_tx);
+                    });
+                }
                 tokio::spawn(async move {
                     d20_health.set_depth_20_connections(
                         d20_health.depth_20_connections().saturating_add(1),
@@ -2506,6 +2264,7 @@ async fn main() -> Result<()> {
                         d20_underlying_label,
                         Some(signal_tx),
                         d20_wal_spill,
+                        d20_cmd_rx,
                     )
                     .await
                     {
@@ -2587,6 +2346,9 @@ async fn main() -> Result<()> {
                                     "200-level deep depth QuestDB writer connected"
                                 );
                             }
+                            // H5: consecutive parse error counter.
+                            let mut consecutive_parse_errors_200: u32 = 0;
+
                             while let Some(frame) = rx200.recv().await {
                                 m.increment(1);
                                 let ts = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
@@ -2601,6 +2363,7 @@ async fn main() -> Result<()> {
                                         message_sequence,
                                         ..
                                     }) => {
+                                        consecutive_parse_errors_200 = 0; // H5: reset on success
                                         let side_str = match side {
                                             tickvault_core::parser::deep_depth::DepthSide::Bid => {
                                                 "BID"
@@ -2628,10 +2391,22 @@ async fn main() -> Result<()> {
                                     }
                                     Ok(_) => {}
                                     Err(err) => {
-                                        tracing::warn!(
-                                            ?err,
-                                            "failed to parse 200-level depth frame"
-                                        );
+                                        consecutive_parse_errors_200 =
+                                            consecutive_parse_errors_200.saturating_add(1);
+                                        metrics::counter!("tv_depth_parse_errors_total", "depth" => "200").increment(1);
+                                        if consecutive_parse_errors_200 >= 5 {
+                                            tracing::error!(
+                                                ?err,
+                                                consecutive = consecutive_parse_errors_200,
+                                                "H5: 200-level depth parse failures persisting — {consecutive_parse_errors_200} consecutive errors"
+                                            );
+                                            consecutive_parse_errors_200 = 0;
+                                        } else {
+                                            tracing::warn!(
+                                                ?err,
+                                                "failed to parse 200-level depth frame"
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -2646,7 +2421,19 @@ async fn main() -> Result<()> {
                         let d200_wal_spill = ws_frame_spill.clone();
                         let (d200_signal_tx, d200_signal_rx) =
                             tokio::sync::oneshot::channel::<()>();
-                        tokio::spawn(async move {
+                        // Command channel for live 200-level rebalance (zero disconnect).
+                        let d200_handle_key = format!("{underlying}-{opt_label}"); // e.g. "NIFTY-CE"
+                        let (d200_cmd_tx, d200_cmd_rx) = tokio::sync::mpsc::channel::<
+                            tickvault_core::websocket::DepthCommand,
+                        >(4);
+                        {
+                            let senders = std::sync::Arc::clone(&depth_cmd_senders);
+                            let key = d200_handle_key.clone();
+                            tokio::spawn(async move {
+                                senders.lock().await.insert(key, d200_cmd_tx);
+                            });
+                        }
+                        let d200_handle = tokio::spawn(async move {
                             d200_health.set_depth_200_connections(
                                 d200_health.depth_200_connections().saturating_add(1),
                             );
@@ -2661,6 +2448,7 @@ async fn main() -> Result<()> {
                                     tx200,
                                     Some(d200_signal_tx),
                                     d200_wal_spill,
+                                    d200_cmd_rx,
                                 )
                                 .await
                             {
@@ -2682,6 +2470,14 @@ async fn main() -> Result<()> {
                                 );
                             }
                         });
+                        // Store handle for rebalance abort+respawn.
+                        {
+                            let handles = std::sync::Arc::clone(&depth_200_handles);
+                            let key = d200_handle_key;
+                            tokio::spawn(async move {
+                                handles.lock().await.insert(key, d200_handle);
+                            });
+                        }
                         // Telegram alert fires ONLY after first data frame received.
                         {
                             let notify_sender = notifier.clone();
@@ -2722,45 +2518,9 @@ async fn main() -> Result<()> {
             });
 
         if let Some(universe_arc) = rebalancer_universe {
-            // SharedSpotPrices: updated by a tick broadcast subscriber, read by rebalancer
-            let spot_prices =
-                tickvault_core::instrument::depth_rebalancer::new_shared_spot_prices();
-            let spot_prices_updater = std::sync::Arc::clone(&spot_prices);
-
-            // Spawn spot price updater: subscribes to tick broadcast, extracts index LTPs
-            let mut spot_rx = tick_broadcast_sender.subscribe();
-            tokio::spawn(async move {
-                loop {
-                    match spot_rx.recv().await {
-                        Ok(tick) => {
-                            // IDX_I segment code = 0 — these are index ticks (NIFTY, BANKNIFTY, etc.)
-                            if tick.exchange_segment_code == 0
-                                && tick.last_traded_price > 0.0
-                                && tick.last_traded_price.is_finite()
-                            {
-                                // Look up symbol from security_id via the plan registry
-                                // For indices, we use a simple mapping from the known security IDs
-                                let symbol = match tick.security_id {
-                                    13 => Some("NIFTY"),
-                                    25 => Some("BANKNIFTY"),
-                                    27 => Some("FINNIFTY"),
-                                    442 => Some("MIDCPNIFTY"),
-                                    _ => None,
-                                };
-                                if let Some(sym) = symbol {
-                                    tickvault_core::instrument::depth_rebalancer::update_spot_price(
-                                            &spot_prices_updater,
-                                            sym,
-                                            f64::from(tick.last_traded_price),
-                                        ).await;
-                                }
-                            }
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    }
-                }
-            });
+            // Reuse the SharedSpotPrices created in Step 8c.0 — the spot price
+            // updater is already running and updating it with live index LTPs.
+            let spot_prices = std::sync::Arc::clone(&shared_spot_prices);
 
             // Rebalance event channel (watch — latest-value semantics)
             let (rebalance_tx, mut rebalance_rx) = tokio::sync::watch::channel::<
@@ -2781,57 +2541,124 @@ async fn main() -> Result<()> {
                 ),
             );
 
-            // L1: Listen for rebalance events and fire Telegram alerts.
+            // L1: Listen for rebalance events → Telegram alert + send swap commands (zero disconnect).
             {
                 let rebalance_notifier = notifier.clone();
+                let rebal_cmd_senders = std::sync::Arc::clone(&depth_cmd_senders);
                 tokio::spawn(async move {
                     while rebalance_rx.changed().await.is_ok() {
-                        if let Some(event) = rebalance_rx.borrow().as_ref() {
-                            // O(1) EXEMPT: cold path — rebalance fires at most once per 60s
-                            let ul = &event.underlying;
-                            let expiry_str = event
-                                .expiry
-                                .map_or_else(|| "?".to_string(), |e| e.format("%b%Y").to_string());
+                        let event = match rebalance_rx.borrow().clone() {
+                            Some(e) => e,
+                            None => continue,
+                        };
+                        // O(1) EXEMPT: cold path — rebalance fires at most once per 60s
+                        let ul = event.underlying.clone();
+                        let expiry_str = event
+                            .expiry
+                            .map_or_else(|| "?".to_string(), |e| e.format("%b%Y").to_string());
 
-                            // Build full contract labels: NIFTY-Apr2026-24400-CE (SID 35246)
-                            let fmt_contract = |atm: &Option<
-                                tickvault_core::instrument::depth_strike_selector::AtmIds,
-                            >,
-                                                opt: &str|
-                             -> String {
-                                match atm {
-                                    Some(ids) => {
-                                        let sid = if opt == "CE" {
-                                            ids.ce_id
-                                        } else {
-                                            ids.pe_id.unwrap_or(0)
-                                        };
-                                        format!(
-                                            "{}-{}-{:.0}-{} ({})",
-                                            ul, expiry_str, ids.strike, opt, sid
-                                        )
-                                    }
-                                    None => "—".to_string(),
+                        let fmt_contract = |atm: &Option<
+                            tickvault_core::instrument::depth_strike_selector::AtmIds,
+                        >,
+                                            opt: &str|
+                         -> String {
+                            match atm {
+                                Some(ids) => {
+                                    let sid = if opt == "CE" {
+                                        ids.ce_id
+                                    } else {
+                                        ids.pe_id.unwrap_or(0)
+                                    };
+                                    format!(
+                                        "{}-{}-{:.0}-{} ({})",
+                                        ul, expiry_str, ids.strike, opt, sid
+                                    )
                                 }
-                            };
+                                None => "—".to_string(),
+                            }
+                        };
 
-                            let old_ce = fmt_contract(&event.prev_atm, "CE");
-                            let old_pe = fmt_contract(&event.prev_atm, "PE");
-                            let new_ce = fmt_contract(&event.new_atm, "CE");
-                            let new_pe = fmt_contract(&event.new_atm, "PE");
+                        let old_ce = fmt_contract(&event.prev_atm, "CE");
+                        let old_pe = fmt_contract(&event.prev_atm, "PE");
+                        let new_ce = fmt_contract(&event.new_atm, "CE");
+                        let new_pe = fmt_contract(&event.new_atm, "PE");
 
-                            rebalance_notifier.notify(NotificationEvent::Custom {
-                                message: format!(
-                                    "<b>Depth rebalance: {ul}</b>\n\
-                                     Spot: {:.2} → {:.2}\n\
-                                     Old CE: {old_ce}\n\
-                                     Old PE: {old_pe}\n\
-                                     New CE: {new_ce}\n\
-                                     New PE: {new_pe}\n\
-                                     Affects: depth-20 + depth-200",
-                                    event.previous_spot, event.current_spot,
-                                ),
-                            });
+                        rebalance_notifier.notify(NotificationEvent::Custom {
+                            message: format!(
+                                "<b>Depth rebalance: {ul}</b>\n\
+                                 Spot: {:.2} → {:.2}\n\
+                                 Old CE: {old_ce}\n\
+                                 Old PE: {old_pe}\n\
+                                 New CE: {new_ce}\n\
+                                 New PE: {new_pe}\n\
+                                 Action: aborting old 200-level → spawning new ATM",
+                                event.previous_spot, event.current_spot,
+                            ),
+                        });
+
+                        // --- 200-level rebalance via command channel (zero disconnect) ---
+                        // Only NIFTY and BANKNIFTY have 200-level connections.
+                        if ul != "NIFTY" && ul != "BANKNIFTY" {
+                            continue;
+                        }
+                        let Some(new_atm) = &event.new_atm else {
+                            warn!(underlying = %ul, "rebalance: new_atm is None — cannot swap 200-level");
+                            continue;
+                        };
+
+                        // Send Swap200 command to each CE/PE connection.
+                        let segment_str = tickvault_common::types::ExchangeSegment::NseFno.as_str();
+                        let entries_200: Vec<(&str, u32)> = [
+                            Some(("CE", new_atm.ce_id)),
+                            new_atm.pe_id.map(|pe_id| ("PE", pe_id)),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .collect();
+
+                        for (opt_label, sid) in entries_200 {
+                            let swap_key = format!("{ul}-{opt_label}");
+                            let sid_str = sid.to_string();
+                            let unsubscribe_msg = serde_json::json!({
+                                "RequestCode": 25,
+                                "ExchangeSegment": segment_str,
+                                "SecurityId": "0",
+                            })
+                            .to_string();
+                            let subscribe_msg = serde_json::json!({
+                                "RequestCode": 23,
+                                "ExchangeSegment": segment_str,
+                                "SecurityId": sid_str,
+                            })
+                            .to_string();
+
+                            let senders = rebal_cmd_senders.lock().await;
+                            if let Some(tx) = senders.get(&swap_key) {
+                                let cmd = tickvault_core::websocket::DepthCommand::Swap200 {
+                                    unsubscribe_message: unsubscribe_msg,
+                                    subscribe_message: subscribe_msg,
+                                };
+                                if let Err(err) = tx.send(cmd).await {
+                                    warn!(
+                                        ?err,
+                                        key = %swap_key,
+                                        "rebalance: Swap200 command send failed"
+                                    );
+                                } else {
+                                    info!(
+                                        underlying = %ul,
+                                        option = opt_label,
+                                        security_id = sid,
+                                        spot = event.current_spot,
+                                        "PROOF: rebalance Swap200 sent — {swap_key} → sid {sid} (zero disconnect)"
+                                    );
+                                }
+                            } else {
+                                warn!(
+                                    key = %swap_key,
+                                    "rebalance: no cmd sender for {swap_key} — 200-level not spawned?"
+                                );
+                            }
                         }
                     }
                 });
@@ -3306,7 +3133,12 @@ async fn load_instruments(
     {
         Ok(InstrumentLoadResult::FreshBuild(universe)) => {
             let today = Utc::now().with_timezone(&ist_offset()).date_naive();
-            let plan = build_subscription_plan(&universe, &config.subscription, today);
+            // Boot-time: pass empty spot prices — stock F&O will be subscribed
+            // at 9:12 AM once pre-market finalized prices are available.
+            // Indices get ALL contracts regardless. Stock equities subscribe immediately.
+            let empty_spot_prices = std::collections::HashMap::new();
+            let plan =
+                build_subscription_plan(&universe, &config.subscription, today, &empty_spot_prices);
 
             info!(
                 total = plan.summary.total,

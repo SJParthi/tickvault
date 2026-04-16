@@ -560,7 +560,7 @@ impl NotificationEvent {
                 candles_compared,
             } => {
                 format!(
-                    "<b>Historical vs Live cross-match OK</b>\nTimeframes: {timeframes_checked} | Candles compared: {candles_compared}\nAll OHLCV values match (epsilon tolerance, volume ±10%, OI ±10%)"
+                    "<b>Historical vs Live cross-match OK</b>\nTimeframes: {timeframes_checked} | Candles compared: {candles_compared}\nAll OHLCV values match exactly (zero tolerance, precision-verified)"
                 )
             }
             Self::CandleCrossMatchFailed {
@@ -576,14 +576,16 @@ impl NotificationEvent {
                     msg.push_str(&format!("\nMissing live: {missing_live}"));
                 }
                 if !mismatch_details.is_empty() {
-                    msg.push_str("\n\n<b>Mismatches:</b>");
-                    let show_count = mismatch_details.len().min(10);
+                    msg.push_str("\n\n<b>Mismatches (every timestamp with OHLCV diff):</b>");
+                    let show_count = mismatch_details.len().min(50);
                     for line in &mismatch_details[..show_count] {
                         msg.push_str(&format!("\n{line}"));
                     }
-                    if mismatch_details.len() > 10 {
-                        let remaining = mismatch_details.len().saturating_sub(10);
-                        msg.push_str(&format!("\n... +{remaining} more"));
+                    if mismatch_details.len() > 50 {
+                        let remaining = mismatch_details.len().saturating_sub(50);
+                        msg.push_str(&format!(
+                            "\n... +{remaining} more (full list in structured logs — query Loki/Grafana)"
+                        ));
                     }
                 }
                 msg

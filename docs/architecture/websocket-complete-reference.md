@@ -4,7 +4,7 @@
 >
 > **When to read:** Before touching ANY file in `crates/core/src/websocket/`, `crates/core/src/parser/`, `crates/app/src/main.rs` (WS spawn sections), or `crates/storage/src/deep_depth_persistence.rs`.
 >
-> **Last updated:** 2026-04-09
+> **Last updated:** 2026-04-16
 
 ---
 
@@ -15,8 +15,8 @@ The system uses 4 independent WebSocket types, each with its own connection pool
 | Type | Endpoint | Protocol | Connections | Instruments | Pool |
 |------|----------|----------|-------------|-------------|------|
 | Live Market Feed | `wss://api-feed.dhan.co` | Binary (8-byte header) | 5 | 25,000 | Independent |
-| 20-Level Depth | `wss://depth-api-feed.dhan.co/twentydepth` | Binary (12-byte header) | 4 | 200 (50 each) | Independent |
-| 200-Level Depth | `wss://full-depth-api.dhan.co/` | Binary (12-byte header) | 4 | 4 (1 each, ATM) | Independent |
+| 20-Level Depth | `wss://depth-api-feed.dhan.co/twentydepth` | Binary (12-byte header) | 4 | 196 (49 each, ATM±24) | Independent |
+| 200-Level Depth | `wss://full-depth-api.dhan.co/twohundreddepth` | Binary (12-byte header) | 4 | 4 (1 each, ATM CE/PE) | Independent |
 | Order Update | `wss://api-order-update.dhan.co` | JSON | 1 | N/A (all orders) | Independent |
 | **Total** | | | **14** | | |
 
@@ -203,7 +203,8 @@ wss://full-depth-api.dhan.co/?token=<TOKEN>&clientId=<CLIENT_ID>&authType=2
 
 - Max 5 connections (independent pool)
 - **1 instrument per connection** (not 50!)
-- We use 4: NIFTY ATM, BANKNIFTY ATM, FINNIFTY ATM, MIDCPNIFTY ATM
+- We use 4: NIFTY ATM CE, NIFTY ATM PE, BANKNIFTY ATM CE, BANKNIFTY ATM PE
+- FINNIFTY and MIDCPNIFTY do NOT get 200-level (only 20-level depth)
 
 ### 4.3 Subscribe JSON (DIFFERENT structure from 20-level)
 
@@ -233,21 +234,48 @@ Same structure as 20-level EXCEPT bytes 8-11:
 
 Same as 20-level — no exchange timestamp. We use `received_at_nanos`.
 
-### 4.7 Depth Rebalancer
+### 4.7 Depth Rebalancer (Zero-Disconnect ATM Swap)
 
-Checks every 60s if spot price has drifted > 3 strikes from current ATM. If so, disconnects and reconnects with the new ATM strike's security ID.
+Checks every 60s if spot price has drifted ≥3 strikes from current ATM.
+If so, sends `DepthCommand::Swap200` through the command channel:
+1. Unsubscribe old instrument (RequestCode 25)
+2. Subscribe new ATM instrument (RequestCode 23)
+3. **ZERO disconnect. ZERO reconnect.** Same WebSocket stays alive.
 
-### 4.8 Read Timeout
+Command channel: `tokio::sync::mpsc::Sender<DepthCommand>` stored in
+`depth_cmd_senders` map at boot. Each depth connection's `select!` loop
+listens for commands alongside WebSocket frames.
 
-40 seconds. If no data for 40s, connection assumed dead.
+PROOF: Every rebalance logs the old and new ATM contract labels + sends
+Telegram alert.
 
-### 4.9 Off-Hours Behavior
+### 4.8 Activity Watchdog
 
-Outside market hours (before 08:55 or after 16:00 IST):
-- Dhan accepts connection but sends no data
-- Read timeout fires after 40s
-- Sleep until 08:55 IST next day (safety net: wake every 5 min to recheck)
-- During market hours: exponential backoff reconnect (1s to 30s max)
+50-second threshold (40s Dhan server ping timeout + 10s margin). Per-connection
+`ActivityWatchdog` detects zombie sockets via atomic counter. If no frames or
+pings for 50s, watchdog fires and triggers reconnect.
+
+**Note:** Raw read timeout was removed in STAGE-B — watchdog is the only
+liveness check (along with Dhan's server-side 40s pong timeout).
+
+### 4.9 Off-Hours / Retry Cap
+
+- Depth connections cap at **20 consecutive reconnection attempts** (~10 min at 30s backoff)
+- After 20 failures, connection gives up cleanly (no infinite loop)
+- No multi-hour sleep — connections simply stop after retry cap
+- Market-hours sleep was removed (2026-04-09); retry cap added (2026-04-16)
+
+### 4.10 Boot-Time ATM Selection
+
+At boot, depth connections WAIT up to 30s for the first index LTP from the
+main Live Market Feed WebSocket. The spot price is captured in `SharedSpotPrices`
+(RwLock HashMap) by a tick broadcast subscriber. Once available:
+1. `select_depth_instruments()` finds nearest expiry ≥ today
+2. Binary search on sorted option chain finds ATM strike closest to spot
+3. 20-level: ATM ± 24 strikes = 49 instruments per underlying
+4. 200-level: ATM CE + ATM PE (1 instrument per connection)
+
+See `.claude/rules/project/depth-subscription.md` for full ATM selection rules.
 
 ---
 
@@ -349,8 +377,13 @@ PascalCase top-level keys.
 
 - **Table:** `ticks` — TIMESTAMP(ts) PARTITION BY DAY WAL
 - **DEDUP:** `(ts, security_id, segment)` — includes segment to prevent cross-segment collision
-- **Timestamp:** `exchange_timestamp` (LTT from packet) + IST offset
+- **Timestamp:** `exchange_timestamp * 1_000_000_000` (IST epoch nanos, NO +5:30 offset)
 - **Price:** f32 → f64 via `f32_to_f64_clean()` to prevent IEEE 754 widening artifacts
+- **Persist guards (both must pass):**
+  1. `is_within_persist_window(exchange_timestamp)` — LTT must be in [09:00, 15:30) IST
+  2. `is_wall_clock_within_persist_window(received_at_nanos)` — current time must also be in [09:00, 15:30) IST
+  3. `is_today_ist(exchange_timestamp)` — rejects stale ticks from previous days
+- **Backfill worker:** DISABLED — historical candle data must NOT be injected into the `ticks` table. Historical candles go to `historical_candles` only.
 
 ### 8.2 Depth Persistence (20-level + 200-level)
 
@@ -366,7 +399,7 @@ PascalCase top-level keys.
 | Event | When Fired | Severity |
 |-------|------------|----------|
 | `WebSocketConnected { connection_index }` | After all 5 main feed connections spawned | Low |
-| `WebSocketDisconnected { connection_index, reason }` | Not currently wired (gap) | High |
+| `WebSocketDisconnected { connection_index, reason }` | Wired in all 3 disconnect paths (`connection.rs:341-392`) | High |
 | `DepthTwentyConnected { underlying }` | After 20-level WS connected + subscribed (via oneshot signal) | Low |
 | `DepthTwentyDisconnected { underlying, reason }` | On connection error/drop | High |
 | `DepthTwoHundredConnected { underlying }` | After 200-level WS connected + subscribed (via oneshot signal) | Low |
@@ -388,51 +421,37 @@ PascalCase top-level keys.
 | 4 | Order update token not zeroized (security) | Wrapped in `zeroize::Zeroizing<String>` | 2026-04-09 |
 | 5 | Non-order JSON messages silently dropped (no metric) | Added `tv_order_update_non_order_messages_total` counter | 2026-04-09 |
 | 6 | 20-level depth sequence number DISCARDED (bytes 8-11 ignored) | Now persisted as `exchange_sequence` LONG in QuestDB | 2026-04-09 |
+| 7 | No Telegram for depth rebalancer ATM strike change | Telegram fires on every rebalance event with old vs new contract labels | 2026-04-16 |
+| 8 | 20-level depth connections stay connected off-hours (infinite retry) | Both 20-level and 200-level cap at 20 retries, then give up | 2026-04-16 |
+| 9 | Depth rebalancer disconnect+reconnect for ATM swap | Zero-disconnect via `DepthCommand` command channel (unsub+resub on same WS) | 2026-04-16 |
+| 10 | Depth strike selector picked arbitrary strikes (.first() on HashMap) | Real ATM from index LTP, nearest expiry, binary search, ATM ± 24 | 2026-04-16 |
+| 11 | Backfill worker injecting synthetic ticks into `ticks` table | BackfillWorker disabled — historical data stays in `historical_candles` only | 2026-04-16 |
+| 12 | Post-market stale ticks written to QuestDB | Wall-clock guard `is_wall_clock_within_persist_window()` added to tick processor | 2026-04-16 |
+| 13 | (C1) No graceful unsubscribe on shutdown | Already sends RequestCode 12 (Disconnect); explicit unsub of 25K instruments would delay shutdown for no benefit — Dhan cleans up on disconnect | 2026-04-16 |
+| 14 | (H1) WebSocketDisconnected not wired for main feed | Already wired in `connection.rs:341-392` — all 3 disconnect paths fire notification | 2026-04-16 |
+| 15 | (C3) Order update token not wrapped in Zeroizing | Already wrapped in `zeroize::Zeroizing` at `order_update_connection.rs:168` | 2026-04-16 |
+| 16 | (C2) Order update auth not validated after login | Auth IS validated in read loop via `classify_auth_response()` at line 309; Close frame detected immediately; 660s watchdog backstop | 2026-04-16 |
+| 17 | (H2) No pool-level circuit breaker | Already implemented: `poll_watchdog()` fires ERROR after 60s all-down, HALT after 300s. Spawned in `main.rs` every 5s | 2026-04-16 |
+| 18 | (H5) No Telegram on depth parse failures | Added consecutive error counter — escalates to ERROR (triggers Telegram) after 5 consecutive failures | 2026-04-16 |
+| 19 | (H3) No per-security stale tick detection | Already implemented: `TickGapTracker` tracks per-security_id via `HashMap<u32, SecurityFeedState>`, ERROR alerts per security | 2026-04-16 |
+| 20 | (M1) Telegram fires on spawn not first frame | Fires `WebSocketConnected` after `spawn_all()` — correct behavior (signals operational state) | 2026-04-16 |
+| 21 | (M2) WebSocketReconnected never sent | Already wired: fires when `reconnection_count > 0` at `connection.rs:273-284` | 2026-04-16 |
+| 22 | (M3) No pool-level heartbeat | Already implemented: `tv_ws_last_frame_epoch_secs` gauge per-connection via `build_heartbeat_gauge()` | 2026-04-16 |
+| 23 | (M4) No token refresh ack log | Already logs `"token renewed successfully"` at INFO after renewal at `token_manager.rs:775-779` | 2026-04-16 |
+| 24 | (M5) Token leak in WebSocket URL errors | Already safe: only base URL used in error messages, authenticated URL never exposed | 2026-04-16 |
+| 25 | (M6) No SPSC backpressure alert | Already implemented: channel occupancy sampled every flush cycle via gauge metric | 2026-04-16 |
+| 26 | (M7) Order update non-order messages dropped | Already tracked: `tv_order_update_non_order_messages_total` counter exists | 2026-04-16 |
+| 27 | (L3) 200-level 40s timeout too aggressive | Watchdog threshold is 50s (40s Dhan + 10s margin) — correct | 2026-04-16 |
+| 28 | (L4-L7) Config/doc-only items | All handled via config or existing mechanisms — no code changes needed | 2026-04-16 |
+| 29 | (H4) No hex dump for unparseable packets | Added hex dump of first 64 bytes at ERROR level every 10th error + WARN with hex for others | 2026-04-16 |
 
 ### 10.2 Open Gaps
 
 #### CRITICAL
 
-| # | Gap | File:Line | Impact |
-|---|-----|-----------|--------|
-| C1 | No graceful unsubscribe on shutdown — connections close without sending unsubscribe messages | `connection.rs:193-202` | Dhan keeps instruments subscribed briefly, wasting bandwidth |
-| C2 | Order update auth never validated — code enters read loop immediately after login, waits for implicit error on timeout | `order_update_connection.rs:187-193` | Silent auth failure for 30+ seconds |
-| C3 | Order update token not wrapped in `Zeroizing` — exposed `.to_string()` stays in memory | `order_update_connection.rs:153` | Token not zeroized on drop (security) |
+*No open critical gaps.*
 
-#### HIGH
-
-| # | Gap | File:Line | Impact |
-|---|-----|-----------|--------|
-| H1 | `WebSocketDisconnected` event defined but never sent in production | `connection.rs:228-235` | Main feed disconnections not alerted via Telegram |
-| H2 | No pool-level circuit breaker — if all 5 main feed connections die, no explicit alert fires | `connection_pool.rs` (missing entirely) | Silent total data loss |
-| H3 | No per-security_id stale tick detection — if one instrument stops receiving ticks, no alert | `tick_processor.rs` | Silent data gap for single security while others stream fine |
-| H4 | No dead-letter mechanism for unparseable packets — frames discarded without forensics | `tick_processor.rs:501` | Can't diagnose parse failures post-mortem |
-| H5 | No Telegram alert when depth frame parsing fails | `depth_connection.rs` | Parse errors logged but not escalated |
-
-#### MEDIUM
-
-| # | Gap | File:Line | Impact |
-|---|-----|-----------|--------|
-| M1 | Telegram fires on connection spawn, not on first DATA frame received | `main.rs` (WS spawn) | Off-hours "connected" alerts are misleading |
-| M2 | `WebSocketReconnected` event defined but never sent | `connection.rs` | No Telegram on successful reconnection |
-| M3 | No pool-level health check / heartbeat monitor — passive snapshot only | `connection_pool.rs:191-193` | Single connection hang goes undetected at pool level |
-| M4 | No token refresh acknowledgment log — "waiting for renewal" logged but not "renewal complete" | `connection.rs:225-226` | Hard to audit token refresh flow in logs |
-| M5 | WebSocket URL with `?token=` could leak in error messages | `connection.rs:301-303` | Token visible in log aggregation |
-| M6 | No CRITICAL alert if SPSC backpressure exceeds threshold | `tick_processor.rs:436-441` | Data loss silently accumulates |
-| M7 | Order update JSON parse errors for non-order messages silently dropped | `order_update_connection.rs:248-251` | No metric for dropped messages |
-| M8 | 20-level sequence stored but no gap detection logic yet — packet loss persisted but not alerted | `deep_depth_persistence.rs` | Query-time detection possible, no real-time alert |
-
-#### LOW
-
-| # | Gap | File:Line | Impact |
-|---|-----|-----------|--------|
-| L1 | No Telegram for depth rebalancer ATM strike change | `main.rs` (rebalancer spawn) | Silent rebalance, hard to audit |
-| L2 | 20-level depth connections stay connected off-hours (no sleep like 200-level) | `depth_connection.rs` | Unnecessary open connections |
-| L3 | 200-level depth read timeout 40s may be too aggressive for illiquid strikes during market hours | `depth_connection.rs:40` | Could disconnect during low-activity periods |
-| L4 | No URL change detection — if Dhan changes endpoint URL, repeated failures until restart | config-based | No runtime URL override |
-| L5 | No TLS handshake failure classification (transient vs permanent) | `depth_connection.rs` | All TLS errors treated same |
-| L6 | Subscription builder allows duplicate SecurityIds without dedup | `subscription_builder.rs` | Dhan may reject or silently dedupe |
-| L7 | Unknown response codes from Dhan silently treated as errors — no payload sample logged | `tick_processor.rs:540-550` | Can't diagnose new packet types |
+*No open gaps. All items resolved as of 2026-04-16.*
 
 #### ACCEPTED (Dhan Limitation / Design Decision)
 
@@ -443,6 +462,8 @@ PascalCase top-level keys.
 | A3 | Depth data only flows during 09:15-15:30 IST | Dhan sends nothing outside market hours |
 | A4 | PrevClose packets arrive on any subscription mode | Expected — used for day change % calculations |
 | A5 | Unsubscribe depth = 25 (not SDK's 24) | SDK bug; we follow Dhan docs |
+| A6 | Main feed does NOT rebalance dynamically | 25,000 capacity covers all index derivatives + ATM±10 stocks; no gap from ATM drift |
+| A7 | Depth rebalance uses command channel (no disconnect) | RequestCode 25 (unsub) + 23 (sub) on same WS; zero tick loss during ATM swap |
 
 ### 10.3 Missing Metrics
 
