@@ -224,6 +224,10 @@ sandbox_only_until = "2026-06-30"
 [logging]
 level = "info"
 format = "json"
+# Disable stdout logging to prevent IntelliJ console OOM.
+# Logs always go to data/logs/app.YYYY-MM-DD.log (7-day rotation).
+# Set to true for docker runs where stdout is the only log sink.
+log_to_stdout = false
 
 [instrument]
 daily_download_time = "08:00:00"
