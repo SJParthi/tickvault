@@ -23,6 +23,7 @@ pub struct SubsystemStatus {
     pub order_update: SubsystemInfo,
     pub questdb: SubsystemInfo,
     pub token: SubsystemInfo,
+    pub valkey: SubsystemInfo,
     pub pipeline: SubsystemInfo,
     pub tick_persistence: SubsystemInfo,
 }
@@ -87,11 +88,25 @@ pub async fn health_check(State(state): State<SharedAppState>) -> Json<HealthRes
         detail: None,
     };
 
+    let remaining = health.token_remaining_secs();
     let token = SubsystemInfo {
         status: if health.token_valid() {
             "valid"
         } else {
             "invalid"
+        },
+        detail: if remaining > 0 {
+            Some(format!("expires in {remaining}s"))
+        } else {
+            None
+        },
+    };
+
+    let valkey = SubsystemInfo {
+        status: if health.valkey_reachable() {
+            "reachable"
+        } else {
+            "unreachable"
         },
         detail: None,
     };
@@ -134,6 +149,7 @@ pub async fn health_check(State(state): State<SharedAppState>) -> Json<HealthRes
             order_update,
             questdb,
             token,
+            valkey,
             pipeline,
             tick_persistence,
         },
@@ -274,6 +290,10 @@ mod tests {
                 },
                 token: SubsystemInfo {
                     status: "valid",
+                    detail: None,
+                },
+                valkey: SubsystemInfo {
+                    status: "reachable",
                     detail: None,
                 },
                 pipeline: SubsystemInfo {

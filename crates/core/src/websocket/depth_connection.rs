@@ -170,12 +170,14 @@ pub async fn run_twenty_depth_connection(
                 if attempt > 0 && attempt.is_multiple_of(10) {
                     error!(
                         attempt,
+                        instrument_count,
                         ?err,
                         "{prefix}: reconnection threshold — still retrying"
                     );
                 } else {
                     warn!(
                         attempt,
+                        instrument_count,
                         ?err,
                         "{prefix}: connection failed — will reconnect"
                     );

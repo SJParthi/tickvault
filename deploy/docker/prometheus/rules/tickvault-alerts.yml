@@ -509,6 +509,16 @@ groups:
           summary: "WebSocket frame send timeouts detected"
           description: "{{ $value }} send timeouts/sec. Tick processor may be overloaded."
 
+      # L2: Tick persistence stalled — ticks being processed but nothing persisted
+      - alert: TickPersistenceStalled
+        expr: rate(tv_ticks_persisted_total[5m]) == 0 and rate(tv_ticks_processed_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Tick persistence stalled — processing but not writing to QuestDB"
+          description: "Ticks are being processed but zero ticks persisted for 5 minutes. Check QuestDB connection."
+
       # L2: 200-level depth stuck in reset loop (Dhan Ticket #5519522)
       - alert: Depth200ResetLoop
         expr: tv_depth_200lvl_consecutive_resets > 5
