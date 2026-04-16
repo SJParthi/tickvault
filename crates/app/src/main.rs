@@ -1819,6 +1819,13 @@ async fn main() -> Result<()> {
     //   (nearest expiry only)
     // NSE only — BSE (SENSEX) depth not supported by Dhan depth endpoint.
     // SENSEX gets 5-level depth from main Live Market Feed.
+    // 200-level depth task handles — abort+respawn on ATM rebalance.
+    // Key: "NIFTY-CE", "NIFTY-PE", etc. Value: JoinHandle of the WS connection task.
+    // Protected by tokio Mutex for async-safe abort+spawn cycle.
+    let depth_200_handles: std::sync::Arc<
+        tokio::sync::Mutex<std::collections::HashMap<String, tokio::task::JoinHandle<()>>>,
+    > = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+
     // O(1) EXEMPT: begin — boot-time depth connection setup
     if should_connect_ws && config.subscription.enable_twenty_depth {
         if let Some(ref _plan) = subscription_plan {
@@ -2358,7 +2365,9 @@ async fn main() -> Result<()> {
                         let d200_wal_spill = ws_frame_spill.clone();
                         let (d200_signal_tx, d200_signal_rx) =
                             tokio::sync::oneshot::channel::<()>();
-                        tokio::spawn(async move {
+                        // Track handle for rebalance abort+respawn.
+                        let d200_handle_key = format!("{underlying}-{opt_label}"); // e.g. "NIFTY-CE"
+                        let d200_handle = tokio::spawn(async move {
                             d200_health.set_depth_200_connections(
                                 d200_health.depth_200_connections().saturating_add(1),
                             );
@@ -2394,6 +2403,14 @@ async fn main() -> Result<()> {
                                 );
                             }
                         });
+                        // Store handle for rebalance abort+respawn.
+                        {
+                            let handles = std::sync::Arc::clone(&depth_200_handles);
+                            let key = d200_handle_key;
+                            tokio::spawn(async move {
+                                handles.lock().await.insert(key, d200_handle);
+                            });
+                        }
                         // Telegram alert fires ONLY after first data frame received.
                         {
                             let notify_sender = notifier.clone();
@@ -2457,57 +2474,231 @@ async fn main() -> Result<()> {
                 ),
             );
 
-            // L1: Listen for rebalance events and fire Telegram alerts.
+            // L1: Listen for rebalance events → Telegram alert + abort/respawn 200-level depth.
             {
                 let rebalance_notifier = notifier.clone();
+                let rebal_handles = std::sync::Arc::clone(&depth_200_handles);
+                let rebal_token = token_handle.clone();
+                let rebal_client_id = ws_client_id.clone();
+                let rebal_wal_spill = ws_frame_spill.clone();
+                let rebal_questdb = config.questdb.clone();
+                let rebal_health = health_status.clone();
+                let rebal_notifier_spawn = notifier.clone();
                 tokio::spawn(async move {
                     while rebalance_rx.changed().await.is_ok() {
-                        if let Some(event) = rebalance_rx.borrow().as_ref() {
-                            // O(1) EXEMPT: cold path — rebalance fires at most once per 60s
-                            let ul = &event.underlying;
-                            let expiry_str = event
-                                .expiry
-                                .map_or_else(|| "?".to_string(), |e| e.format("%b%Y").to_string());
+                        let event = match rebalance_rx.borrow().clone() {
+                            Some(e) => e,
+                            None => continue,
+                        };
+                        // O(1) EXEMPT: cold path — rebalance fires at most once per 60s
+                        let ul = event.underlying.clone();
+                        let expiry_str = event
+                            .expiry
+                            .map_or_else(|| "?".to_string(), |e| e.format("%b%Y").to_string());
 
-                            // Build full contract labels: NIFTY-Apr2026-24400-CE (SID 35246)
-                            let fmt_contract = |atm: &Option<
-                                tickvault_core::instrument::depth_strike_selector::AtmIds,
-                            >,
-                                                opt: &str|
-                             -> String {
-                                match atm {
-                                    Some(ids) => {
-                                        let sid = if opt == "CE" {
-                                            ids.ce_id
-                                        } else {
-                                            ids.pe_id.unwrap_or(0)
-                                        };
-                                        format!(
-                                            "{}-{}-{:.0}-{} ({})",
-                                            ul, expiry_str, ids.strike, opt, sid
-                                        )
-                                    }
-                                    None => "—".to_string(),
+                        let fmt_contract = |atm: &Option<
+                            tickvault_core::instrument::depth_strike_selector::AtmIds,
+                        >,
+                                            opt: &str|
+                         -> String {
+                            match atm {
+                                Some(ids) => {
+                                    let sid = if opt == "CE" {
+                                        ids.ce_id
+                                    } else {
+                                        ids.pe_id.unwrap_or(0)
+                                    };
+                                    format!(
+                                        "{}-{}-{:.0}-{} ({})",
+                                        ul, expiry_str, ids.strike, opt, sid
+                                    )
                                 }
+                                None => "—".to_string(),
+                            }
+                        };
+
+                        let old_ce = fmt_contract(&event.prev_atm, "CE");
+                        let old_pe = fmt_contract(&event.prev_atm, "PE");
+                        let new_ce = fmt_contract(&event.new_atm, "CE");
+                        let new_pe = fmt_contract(&event.new_atm, "PE");
+
+                        rebalance_notifier.notify(NotificationEvent::Custom {
+                            message: format!(
+                                "<b>Depth rebalance: {ul}</b>\n\
+                                 Spot: {:.2} → {:.2}\n\
+                                 Old CE: {old_ce}\n\
+                                 Old PE: {old_pe}\n\
+                                 New CE: {new_ce}\n\
+                                 New PE: {new_pe}\n\
+                                 Action: aborting old 200-level → spawning new ATM",
+                                event.previous_spot, event.current_spot,
+                            ),
+                        });
+
+                        // --- 200-level abort + respawn ---
+                        // Only NIFTY and BANKNIFTY have 200-level connections.
+                        if ul != "NIFTY" && ul != "BANKNIFTY" {
+                            continue;
+                        }
+                        let Some(new_atm) = &event.new_atm else {
+                            warn!(underlying = %ul, "rebalance: new_atm is None — cannot respawn 200-level");
+                            continue;
+                        };
+                        let new_expiry = match event.expiry {
+                            Some(e) => e,
+                            None => {
+                                warn!(underlying = %ul, "rebalance: no expiry — cannot respawn 200-level");
+                                continue;
+                            }
+                        };
+
+                        // Abort old CE + PE connections.
+                        {
+                            let mut handles = rebal_handles.lock().await;
+                            for side in ["CE", "PE"] {
+                                let key = format!("{ul}-{side}");
+                                if let Some(old_handle) = handles.remove(&key) {
+                                    info!(
+                                        underlying = %ul,
+                                        side,
+                                        "PROOF: rebalance — aborting old 200-level depth connection ({key})"
+                                    );
+                                    old_handle.abort();
+                                }
+                            }
+                        }
+
+                        // Build new CE + PE entries.
+                        let strike = new_atm.strike;
+                        let build_label = |side: &str| -> String {
+                            let strike_str = if (strike.fract()).abs() < 0.0001 {
+                                #[allow(clippy::cast_possible_truncation)]
+                                // APPROVED: strike prices fit i64
+                                {
+                                    format!("{}", strike as i64)
+                                }
+                            } else {
+                                format!("{strike}")
                             };
+                            format!("{ul}-{}-{strike_str}-{side}", new_expiry.format("%b%Y"))
+                        };
 
-                            let old_ce = fmt_contract(&event.prev_atm, "CE");
-                            let old_pe = fmt_contract(&event.prev_atm, "PE");
-                            let new_ce = fmt_contract(&event.new_atm, "CE");
-                            let new_pe = fmt_contract(&event.new_atm, "PE");
+                        let entries: Vec<(&str, u32, String)> = [
+                            Some(("CE", new_atm.ce_id, build_label("CE"))),
+                            new_atm.pe_id.map(|pe_id| ("PE", pe_id, build_label("PE"))),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .collect();
 
-                            rebalance_notifier.notify(NotificationEvent::Custom {
-                                message: format!(
-                                    "<b>Depth rebalance: {ul}</b>\n\
-                                     Spot: {:.2} → {:.2}\n\
-                                     Old CE: {old_ce}\n\
-                                     Old PE: {old_pe}\n\
-                                     New CE: {new_ce}\n\
-                                     New PE: {new_pe}\n\
-                                     Affects: depth-20 + depth-200",
-                                    event.previous_spot, event.current_spot,
-                                ),
+                        for (opt_label, sid, label) in entries {
+                            info!(
+                                underlying = %ul,
+                                option = opt_label,
+                                security_id = sid,
+                                contract = %label,
+                                spot = event.current_spot,
+                                "PROOF: rebalance — spawning new 200-level depth (contract={label}, sid={sid}, spot={:.2})",
+                                event.current_spot
+                            );
+
+                            let (tx200, mut rx200) =
+                                tokio::sync::mpsc::channel::<bytes::Bytes>(1024);
+                            let label_recv = label.clone();
+                            let questdb_cfg = rebal_questdb.clone();
+
+                            // Spawn 200-level receiver (persistence).
+                            tokio::spawn(async move {
+                                let m = metrics::counter!(
+                                    "tv_depth_200lvl_frames_received",
+                                    "underlying" => label_recv.clone()
+                                );
+                                let mut writer =
+                                    tickvault_storage::deep_depth_persistence::DeepDepthWriter::new(
+                                        &questdb_cfg,
+                                    )
+                                    .ok();
+                                while let Some(frame) = rx200.recv().await {
+                                    m.increment(1);
+                                    let ts = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+                                    match tickvault_core::parser::dispatcher::dispatch_deep_depth_frame(&frame, ts) {
+                                        Ok(tickvault_core::parser::types::ParsedFrame::DeepDepth {
+                                            security_id,
+                                            exchange_segment_code,
+                                            side,
+                                            levels,
+                                            message_sequence,
+                                            ..
+                                        }) => {
+                                            let side_str = match side {
+                                                tickvault_core::parser::deep_depth::DepthSide::Bid => "BID",
+                                                tickvault_core::parser::deep_depth::DepthSide::Ask => "ASK",
+                                            };
+                                            if let Some(ref mut w) = writer
+                                                && let Err(err) = w.append_deep_depth(
+                                                    security_id, exchange_segment_code,
+                                                    side_str, &levels, "200", ts, message_sequence,
+                                                )
+                                            {
+                                                tracing::warn!(?err, "rebalance: failed to persist 200-level depth");
+                                            }
+                                        }
+                                        Ok(_) => {}
+                                        Err(err) => {
+                                            tracing::warn!(?err, "rebalance: failed to parse 200-level depth frame");
+                                        }
+                                    }
+                                }
                             });
+
+                            // Spawn 200-level WebSocket connection.
+                            let d200_token = rebal_token.clone();
+                            let d200_client_id = rebal_client_id.clone();
+                            let d200_label = label.clone();
+                            let d200_wal = rebal_wal_spill.clone();
+                            let d200_health = rebal_health.clone();
+                            let d200_notifier = rebal_notifier_spawn.clone();
+                            let d200_label_dc = label.clone();
+                            let segment = tickvault_common::types::ExchangeSegment::NseFno;
+                            let handle = tokio::spawn(async move {
+                                d200_health.set_depth_200_connections(
+                                    d200_health.depth_200_connections().saturating_add(1),
+                                );
+                                if let Err(err) =
+                                    tickvault_core::websocket::run_two_hundred_depth_connection(
+                                        d200_token,
+                                        d200_client_id,
+                                        segment,
+                                        sid,
+                                        d200_label,
+                                        tx200,
+                                        None,
+                                        d200_wal,
+                                    )
+                                    .await
+                                {
+                                    tracing::error!(
+                                        ?err,
+                                        contract = %d200_label_dc,
+                                        security_id = sid,
+                                        "rebalance: 200-level depth connection terminated"
+                                    );
+                                    d200_notifier.notify(
+                                        NotificationEvent::DepthTwoHundredDisconnected {
+                                            contract: d200_label_dc,
+                                            security_id: sid,
+                                            reason: format!("{err}"),
+                                        },
+                                    );
+                                    d200_health.set_depth_200_connections(
+                                        d200_health.depth_200_connections().saturating_sub(1),
+                                    );
+                                }
+                            });
+
+                            // Store new handle.
+                            let key = format!("{ul}-{opt_label}");
+                            rebal_handles.lock().await.insert(key, handle);
                         }
                     }
                 });
