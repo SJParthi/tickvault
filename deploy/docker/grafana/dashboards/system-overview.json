@@ -220,7 +220,7 @@
       "gridPos": { "h": 8, "w": 8, "x": 16, "y": 14 },
       "id": 14,
       "options": { "legend": { "calcs": ["lastNotNull", "max"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
-      "title": "Process Memory",
+      "title": "Process Memory (AWS only — Mac dev: use Activity Monitor)",
       "type": "timeseries",
       "targets": [
         { "expr": "process_resident_memory_bytes{job=\"tickvault\"}", "legendFormat": "RSS", "refId": "A" },

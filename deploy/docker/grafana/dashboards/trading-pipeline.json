@@ -112,6 +112,7 @@
       "options": { "legend": { "calcs": ["mean", "max", "lastNotNull"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "title": "Tick Processing Latency",
       "type": "timeseries",
+      "options": { "legend": { "calcs": ["mean", "max", "lastNotNull"], "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [
         { "expr": "histogram_quantile(0.50, rate(tv_tick_processing_duration_ns_bucket[5m]))", "legendFormat": "p50", "refId": "A" },
         { "expr": "histogram_quantile(0.90, rate(tv_tick_processing_duration_ns_bucket[5m]))", "legendFormat": "p90", "refId": "B" },
@@ -351,6 +352,7 @@
       "fieldConfig": {
         "defaults": {
           "color": { "fixedColor": "green", "mode": "fixed" },
+          "noValue": "0 (fetch not triggered yet)",
           "unit": "short"
         },
         "overrides": []
@@ -367,6 +369,7 @@
       "fieldConfig": {
         "defaults": {
           "color": { "fixedColor": "red", "mode": "fixed" },
+          "noValue": "0",
           "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }] },
           "unit": "short"
         },
