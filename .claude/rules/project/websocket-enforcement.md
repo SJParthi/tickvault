@@ -47,18 +47,47 @@ paths:
 
 12. **Unsubscribe depth = code 25, NOT 24.** Dhan SDK has a bug here (subscribe_code + 1 = 24). Our code correctly uses 25.
 
+## Depth Rebalancing Rules (added 2026-04-16)
+
+13. **Depth rebalancing uses command channel — NEVER disconnect+reconnect for ATM swap.**
+    - `DepthCommand::Swap20` for 20-level, `DepthCommand::Swap200` for 200-level
+    - Sends RequestCode 25 (unsub old) then 23 (sub new) on same WebSocket
+    - Zero disconnect, zero reconnect, zero tick gap, O(1) latency
+
+14. **Depth connections cap at 20 retry attempts.** No infinite retry loops.
+    - After 20 consecutive failures (~10 min), gives up via `ReconnectionExhausted`
+
+15. **Depth ATM selection uses real index LTP, not median or arbitrary.** See `depth-subscription.md`.
+    - Boot: waits up to 30s for first index LTP from main WebSocket
+    - Runtime: rebalancer checks every 60s, swaps on ≥3 strike drift
+
+16. **Tick persistence requires BOTH exchange_timestamp AND wall-clock within [09:00, 15:30) IST.**
+    - `is_within_persist_window(exchange_timestamp)` — checks LTT
+    - `is_wall_clock_within_persist_window(received_at_nanos)` — checks current time
+    - Prevents post-market stale WebSocket snapshots from polluting `ticks` table
+
+17. **Backfill worker is DISABLED.** Historical candle data must NOT be injected into the `ticks` table.
+    - `ticks` table = live WebSocket data only
+    - `historical_candles` table = REST API historical data only
+
 ## Gaps to Track
 
 Any change to WebSocket code must check the open gaps in `docs/architecture/websocket-complete-reference.md` Section 10.2 and not introduce regressions.
 
 Key open gaps:
-- `WebSocketDisconnected` event not wired for main feed
-- No Telegram for depth rebalancer ATM changes
+- `WebSocketDisconnected` event not wired for main feed (H1)
+- No pool-level circuit breaker for main feed (H2)
 
 Resolved gaps:
 - Telegram now fires on first data frame (not just subscription) — fixed 2026-04-09
 - Depth connections stay connected 24/7 (no market-hours sleep) — fixed 2026-04-09
 - Depth metrics labeled per underlying (not shared gauge) — fixed 2026-04-09
+- Telegram for depth rebalancer ATM changes — fixed 2026-04-16
+- Depth connections infinite retry after market close — fixed 2026-04-16 (capped at 20)
+- Depth disconnect+reconnect for ATM swap — fixed 2026-04-16 (command channel, zero disconnect)
+- Depth strike selector picking wrong strikes — fixed 2026-04-16 (real ATM from index LTP)
+- Backfill worker injecting synthetic ticks — fixed 2026-04-16 (disabled)
+- Post-market stale ticks — fixed 2026-04-16 (wall-clock guard)
 
 ## What This Prevents
 
@@ -74,4 +103,4 @@ Resolved gaps:
 ## Trigger
 
 This rule activates when editing files matching the paths above, or any file containing:
-`WebSocketConnection`, `WebSocketConnectionPool`, `DepthConnection`, `OrderUpdateConnection`, `parse_ticker_packet`, `parse_quote_packet`, `parse_full_packet`, `parse_oi_packet`, `parse_prev_close_packet`, `parse_disconnect_packet`, `parse_twenty_depth_packet`, `parse_two_hundred_depth_packet`, `parse_deep_depth_header`, `dispatch_deep_depth_frame`, `run_twenty_depth_connection`, `run_two_hundred_depth_connection`, `run_order_update_connection`, `build_subscription_messages`, `SubscribeRequest`, `InstrumentSubscription`, `api-feed.dhan.co`, `depth-api-feed.dhan.co`, `full-depth-api.dhan.co`, `api-order-update.dhan.co`
+`WebSocketConnection`, `WebSocketConnectionPool`, `DepthConnection`, `OrderUpdateConnection`, `parse_ticker_packet`, `parse_quote_packet`, `parse_full_packet`, `parse_oi_packet`, `parse_prev_close_packet`, `parse_disconnect_packet`, `parse_twenty_depth_packet`, `parse_two_hundred_depth_packet`, `parse_deep_depth_header`, `dispatch_deep_depth_frame`, `run_twenty_depth_connection`, `run_two_hundred_depth_connection`, `run_order_update_connection`, `build_subscription_messages`, `SubscribeRequest`, `InstrumentSubscription`, `api-feed.dhan.co`, `depth-api-feed.dhan.co`, `full-depth-api.dhan.co`, `api-order-update.dhan.co`, `DepthCommand`, `Swap200`, `Swap20`, `SharedSpotPrices`, `depth_cmd_senders`, `is_wall_clock_within_persist_window`, `select_depth_instruments`, `DEPTH_ATM_STRIKES_EACH_SIDE`

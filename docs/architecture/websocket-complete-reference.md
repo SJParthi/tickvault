@@ -4,7 +4,7 @@
 >
 > **When to read:** Before touching ANY file in `crates/core/src/websocket/`, `crates/core/src/parser/`, `crates/app/src/main.rs` (WS spawn sections), or `crates/storage/src/deep_depth_persistence.rs`.
 >
-> **Last updated:** 2026-04-09
+> **Last updated:** 2026-04-16
 
 ---
 
@@ -15,8 +15,8 @@ The system uses 4 independent WebSocket types, each with its own connection pool
 | Type | Endpoint | Protocol | Connections | Instruments | Pool |
 |------|----------|----------|-------------|-------------|------|
 | Live Market Feed | `wss://api-feed.dhan.co` | Binary (8-byte header) | 5 | 25,000 | Independent |
-| 20-Level Depth | `wss://depth-api-feed.dhan.co/twentydepth` | Binary (12-byte header) | 4 | 200 (50 each) | Independent |
-| 200-Level Depth | `wss://full-depth-api.dhan.co/` | Binary (12-byte header) | 4 | 4 (1 each, ATM) | Independent |
+| 20-Level Depth | `wss://depth-api-feed.dhan.co/twentydepth` | Binary (12-byte header) | 4 | 196 (49 each, ATM±24) | Independent |
+| 200-Level Depth | `wss://full-depth-api.dhan.co/twohundreddepth` | Binary (12-byte header) | 4 | 4 (1 each, ATM CE/PE) | Independent |
 | Order Update | `wss://api-order-update.dhan.co` | JSON | 1 | N/A (all orders) | Independent |
 | **Total** | | | **14** | | |
 
@@ -203,7 +203,8 @@ wss://full-depth-api.dhan.co/?token=<TOKEN>&clientId=<CLIENT_ID>&authType=2
 
 - Max 5 connections (independent pool)
 - **1 instrument per connection** (not 50!)
-- We use 4: NIFTY ATM, BANKNIFTY ATM, FINNIFTY ATM, MIDCPNIFTY ATM
+- We use 4: NIFTY ATM CE, NIFTY ATM PE, BANKNIFTY ATM CE, BANKNIFTY ATM PE
+- FINNIFTY and MIDCPNIFTY do NOT get 200-level (only 20-level depth)
 
 ### 4.3 Subscribe JSON (DIFFERENT structure from 20-level)
 
@@ -233,21 +234,48 @@ Same structure as 20-level EXCEPT bytes 8-11:
 
 Same as 20-level — no exchange timestamp. We use `received_at_nanos`.
 
-### 4.7 Depth Rebalancer
+### 4.7 Depth Rebalancer (Zero-Disconnect ATM Swap)
 
-Checks every 60s if spot price has drifted > 3 strikes from current ATM. If so, disconnects and reconnects with the new ATM strike's security ID.
+Checks every 60s if spot price has drifted ≥3 strikes from current ATM.
+If so, sends `DepthCommand::Swap200` through the command channel:
+1. Unsubscribe old instrument (RequestCode 25)
+2. Subscribe new ATM instrument (RequestCode 23)
+3. **ZERO disconnect. ZERO reconnect.** Same WebSocket stays alive.
 
-### 4.8 Read Timeout
+Command channel: `tokio::sync::mpsc::Sender<DepthCommand>` stored in
+`depth_cmd_senders` map at boot. Each depth connection's `select!` loop
+listens for commands alongside WebSocket frames.
 
-40 seconds. If no data for 40s, connection assumed dead.
+PROOF: Every rebalance logs the old and new ATM contract labels + sends
+Telegram alert.
 
-### 4.9 Off-Hours Behavior
+### 4.8 Activity Watchdog
 
-Outside market hours (before 08:55 or after 16:00 IST):
-- Dhan accepts connection but sends no data
-- Read timeout fires after 40s
-- Sleep until 08:55 IST next day (safety net: wake every 5 min to recheck)
-- During market hours: exponential backoff reconnect (1s to 30s max)
+50-second threshold (40s Dhan server ping timeout + 10s margin). Per-connection
+`ActivityWatchdog` detects zombie sockets via atomic counter. If no frames or
+pings for 50s, watchdog fires and triggers reconnect.
+
+**Note:** Raw read timeout was removed in STAGE-B — watchdog is the only
+liveness check (along with Dhan's server-side 40s pong timeout).
+
+### 4.9 Off-Hours / Retry Cap
+
+- Depth connections cap at **20 consecutive reconnection attempts** (~10 min at 30s backoff)
+- After 20 failures, connection gives up cleanly (no infinite loop)
+- No multi-hour sleep — connections simply stop after retry cap
+- Market-hours sleep was removed (2026-04-09); retry cap added (2026-04-16)
+
+### 4.10 Boot-Time ATM Selection
+
+At boot, depth connections WAIT up to 30s for the first index LTP from the
+main Live Market Feed WebSocket. The spot price is captured in `SharedSpotPrices`
+(RwLock HashMap) by a tick broadcast subscriber. Once available:
+1. `select_depth_instruments()` finds nearest expiry ≥ today
+2. Binary search on sorted option chain finds ATM strike closest to spot
+3. 20-level: ATM ± 24 strikes = 49 instruments per underlying
+4. 200-level: ATM CE + ATM PE (1 instrument per connection)
+
+See `.claude/rules/project/depth-subscription.md` for full ATM selection rules.
 
 ---
 
@@ -349,8 +377,13 @@ PascalCase top-level keys.
 
 - **Table:** `ticks` — TIMESTAMP(ts) PARTITION BY DAY WAL
 - **DEDUP:** `(ts, security_id, segment)` — includes segment to prevent cross-segment collision
-- **Timestamp:** `exchange_timestamp` (LTT from packet) + IST offset
+- **Timestamp:** `exchange_timestamp * 1_000_000_000` (IST epoch nanos, NO +5:30 offset)
 - **Price:** f32 → f64 via `f32_to_f64_clean()` to prevent IEEE 754 widening artifacts
+- **Persist guards (both must pass):**
+  1. `is_within_persist_window(exchange_timestamp)` — LTT must be in [09:00, 15:30) IST
+  2. `is_wall_clock_within_persist_window(received_at_nanos)` — current time must also be in [09:00, 15:30) IST
+  3. `is_today_ist(exchange_timestamp)` — rejects stale ticks from previous days
+- **Backfill worker:** DISABLED — historical candle data must NOT be injected into the `ticks` table. Historical candles go to `historical_candles` only.
 
 ### 8.2 Depth Persistence (20-level + 200-level)
 
@@ -388,6 +421,12 @@ PascalCase top-level keys.
 | 4 | Order update token not zeroized (security) | Wrapped in `zeroize::Zeroizing<String>` | 2026-04-09 |
 | 5 | Non-order JSON messages silently dropped (no metric) | Added `tv_order_update_non_order_messages_total` counter | 2026-04-09 |
 | 6 | 20-level depth sequence number DISCARDED (bytes 8-11 ignored) | Now persisted as `exchange_sequence` LONG in QuestDB | 2026-04-09 |
+| 7 | No Telegram for depth rebalancer ATM strike change | Telegram fires on every rebalance event with old vs new contract labels | 2026-04-16 |
+| 8 | 20-level depth connections stay connected off-hours (infinite retry) | Both 20-level and 200-level cap at 20 retries, then give up | 2026-04-16 |
+| 9 | Depth rebalancer disconnect+reconnect for ATM swap | Zero-disconnect via `DepthCommand` command channel (unsub+resub on same WS) | 2026-04-16 |
+| 10 | Depth strike selector picked arbitrary strikes (.first() on HashMap) | Real ATM from index LTP, nearest expiry, binary search, ATM ± 24 | 2026-04-16 |
+| 11 | Backfill worker injecting synthetic ticks into `ticks` table | BackfillWorker disabled — historical data stays in `historical_candles` only | 2026-04-16 |
+| 12 | Post-market stale ticks written to QuestDB | Wall-clock guard `is_wall_clock_within_persist_window()` added to tick processor | 2026-04-16 |
 
 ### 10.2 Open Gaps
 
@@ -426,8 +465,6 @@ PascalCase top-level keys.
 
 | # | Gap | File:Line | Impact |
 |---|-----|-----------|--------|
-| L1 | No Telegram for depth rebalancer ATM strike change | `main.rs` (rebalancer spawn) | Silent rebalance, hard to audit |
-| L2 | 20-level depth connections stay connected off-hours (no sleep like 200-level) | `depth_connection.rs` | Unnecessary open connections |
 | L3 | 200-level depth read timeout 40s may be too aggressive for illiquid strikes during market hours | `depth_connection.rs:40` | Could disconnect during low-activity periods |
 | L4 | No URL change detection — if Dhan changes endpoint URL, repeated failures until restart | config-based | No runtime URL override |
 | L5 | No TLS handshake failure classification (transient vs permanent) | `depth_connection.rs` | All TLS errors treated same |
@@ -443,6 +480,8 @@ PascalCase top-level keys.
 | A3 | Depth data only flows during 09:15-15:30 IST | Dhan sends nothing outside market hours |
 | A4 | PrevClose packets arrive on any subscription mode | Expected — used for day change % calculations |
 | A5 | Unsubscribe depth = 25 (not SDK's 24) | SDK bug; we follow Dhan docs |
+| A6 | Main feed does NOT rebalance dynamically | 25,000 capacity covers all index derivatives + ATM±10 stocks; no gap from ATM drift |
+| A7 | Depth rebalance uses command channel (no disconnect) | RequestCode 25 (unsub) + 23 (sub) on same WS; zero tick loss during ATM swap |
 
 ### 10.3 Missing Metrics
 
