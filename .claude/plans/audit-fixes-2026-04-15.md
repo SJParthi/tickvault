@@ -28,14 +28,20 @@ match the zero-loss stance.
   - Files: `crates/storage/src/indicator_snapshot_persistence.rs`
   - Tests: `test_db5_dedup_key_matches_doc_comment`, `test_db5_dedup_key_exact_format`
 
-- [x] **DB-6** (indicator_snapshot): Reconnect throttle (30s window) on indicator_snapshot — done
-  - Files: `crates/storage/src/indicator_snapshot_persistence.rs`
-  - Tests: `test_db6_reconnect_throttle_is_nonzero`, `test_db6_reconnect_throttle_bounded`, `test_db7_reconnect_throttle_blocks_within_window`
-  - NOTE: movers portion still pending as separate commit.
+- [x] **DB-6**: Reconnect throttle (30s window) on indicator_snapshot + movers — done
+  - Files: `indicator_snapshot_persistence.rs`, `movers_persistence.rs`
+  - Tests: `test_db6_reconnect_throttle_is_nonzero`, `test_db6_reconnect_throttle_bounded`,
+    `test_db7_reconnect_throttle_blocks_within_window`,
+    `test_db6_movers_reconnect_throttle_nonzero_and_bounded`,
+    `test_db6_stock_movers_reconnect_throttle_blocks_within_window`,
+    `test_db6_option_movers_reconnect_throttle_blocks_within_window`
 
-- [x] **DB-7** (indicator_snapshot): Flush-failure metric counter + upgrade log level to ERROR — done
-  - Files: `crates/storage/src/indicator_snapshot_persistence.rs`
-  - Tests: `test_db7_record_drop_increments_counter`, `test_db7_record_drop_saturates_on_overflow`
+- [x] **DB-7**: Flush-failure metric counter + upgrade log level to ERROR — done
+  - Files: `indicator_snapshot_persistence.rs`, `movers_persistence.rs`
+  - Tests: `test_db7_record_drop_increments_counter`, `test_db7_record_drop_saturates_on_overflow`,
+    `test_db7_stock_movers_record_drop_increments_counter`,
+    `test_db7_option_movers_record_drop_increments_counter`,
+    `test_db7_stock_movers_record_drop_saturates`
 
 - [ ] **DB-1**: Ring-buffer + disk-spill rescue on `IndicatorSnapshotWriter`
   - Files: `crates/storage/src/indicator_snapshot_persistence.rs`

@@ -8,18 +8,26 @@
 //! - `option_movers` — top 20 per 7 categories per minute
 //!
 //! # Idempotency
-//! DEDUP UPSERT KEYS on `(ts, security_id, category)` prevent duplicates on restart.
+//! DEDUP UPSERT KEYS on `(ts, security_id, category, segment)` prevent
+//! duplicates on restart. `segment` is required because the same
+//! `security_id` exists across `IDX_I` / `NSE_EQ` / `NSE_FNO` — see audit
+//! gaps DB-3/DB-4.
 //!
-//! # Error Handling
+//! # Error Handling (DB-6/DB-7)
 //! Movers persistence is cold-path observability data, NOT critical path.
-//! On QuestDB failure, logs WARN and continues — no ring buffer needed.
+//! Reconnect attempts are throttled to one per
+//! `MOVERS_RECONNECT_THROTTLE_SECS` (30s) to prevent tight reconnect loops
+//! when QuestDB flaps. Every dropped batch is counted via
+//! `rows_dropped_total` + `tv_{stock,option}_movers_dropped_total` +
+//! `tv_{stock,option}_movers_flush_failures_total` and logged at ERROR
+//! level so the Telegram alert path fires.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use questdb::ingress::{Buffer, Sender, TimestampNanos};
 use reqwest::Client;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use tickvault_common::config::QuestDbConfig;
 
@@ -57,6 +65,15 @@ const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 
 /// Flush batch size for movers (much smaller than ticks — max 20×10 = 200 rows per snapshot).
 const MOVERS_FLUSH_BATCH_SIZE: usize = 250;
+
+/// Minimum interval between reconnect attempts when QuestDB is down.
+///
+/// Audit gap DB-6: the previous flush path called `Sender::from_conf`
+/// on every failed batch with zero backoff, creating a tight reconnect
+/// loop when QuestDB flapped. Caps reconnect attempts at one per 30s
+/// per writer, matching the pattern used by `LiveCandleWriter` and
+/// `IndicatorSnapshotWriter`.
+const MOVERS_RECONNECT_THROTTLE_SECS: u64 = 30;
 
 /// Flush interval for movers (60 seconds — aligned with snapshot interval).
 /// Used by future flush_if_needed() implementation.
@@ -121,13 +138,19 @@ const OPTION_MOVERS_CREATE_DDL: &str = "\
 
 /// Batched writer for stock movers snapshots to QuestDB via ILP.
 ///
-/// Simpler than TickPersistenceWriter — no ring buffer, no spill.
-/// Movers are cold-path observability data; loss of a snapshot is acceptable.
+/// # Resilience (DB-6/DB-7)
+/// - Reconnect attempts throttled to one per `MOVERS_RECONNECT_THROTTLE_SECS` (30s).
+/// - Dropped batches are counted and logged at ERROR level (Telegram alert fires).
+/// - No in-memory rescue ring yet — DB-2 will add one in a separate commit.
 pub struct StockMoversWriter {
     sender: Option<Sender>,
     buffer: Buffer,
     pending_count: usize,
     ilp_conf_string: String,
+    /// Earliest time at which the next reconnect attempt is allowed. DB-6.
+    next_reconnect_allowed: Instant,
+    /// Total rows dropped (never written to QuestDB). DB-7.
+    rows_dropped_total: u64,
 }
 
 impl StockMoversWriter {
@@ -143,7 +166,38 @@ impl StockMoversWriter {
             buffer,
             pending_count: 0,
             ilp_conf_string: conf_string,
+            next_reconnect_allowed: Instant::now(),
+            rows_dropped_total: 0,
         })
+    }
+
+    /// Total rows dropped since startup (never persisted to QuestDB).
+    pub fn rows_dropped_total(&self) -> u64 {
+        self.rows_dropped_total
+    }
+
+    /// Records a dropped batch — increments counter + metric + ERROR log. DB-7.
+    fn record_drop(&mut self, count: usize, reason: &'static str, err: &anyhow::Error) {
+        let dropped = u64::try_from(count).unwrap_or(u64::MAX);
+        self.rows_dropped_total = self.rows_dropped_total.saturating_add(dropped);
+        metrics::counter!("tv_stock_movers_dropped_total").absolute(self.rows_dropped_total);
+        metrics::counter!("tv_stock_movers_flush_failures_total").increment(1);
+        error!(
+            ?err,
+            dropped_rows = count,
+            total_dropped = self.rows_dropped_total,
+            reason,
+            "stock movers batch dropped — data loss (cold-path observability)"
+        );
+    }
+
+    fn reconnect_allowed_now(&self) -> bool {
+        Instant::now() >= self.next_reconnect_allowed
+    }
+
+    fn bump_reconnect_throttle(&mut self) {
+        self.next_reconnect_allowed =
+            Instant::now() + Duration::from_secs(MOVERS_RECONNECT_THROTTLE_SECS);
     }
 
     /// Appends a single stock mover entry to the ILP buffer.
@@ -214,40 +268,64 @@ impl StockMoversWriter {
         if self.pending_count >= MOVERS_FLUSH_BATCH_SIZE
             && let Err(err) = self.flush()
         {
-            warn!(?err, "stock movers auto-flush failed");
+            // flush() has already routed the error through record_drop().
+            // This breadcrumb marks the auto-flush boundary specifically.
+            error!(?err, "stock movers auto-flush failed at batch boundary");
         }
 
         Ok(())
     }
 
     /// Flushes buffered rows to QuestDB.
+    ///
+    /// DB-6/DB-7: reconnect attempts throttled to 1 per
+    /// `MOVERS_RECONNECT_THROTTLE_SECS` (30s). Every drop path routes
+    /// through `record_drop` (metric + ERROR log).
     pub fn flush(&mut self) -> Result<()> {
         if self.pending_count == 0 {
             return Ok(());
         }
 
-        let sender = match self.sender.as_mut() {
-            Some(s) => s,
-            None => {
-                // Try reconnect
-                match Sender::from_conf(&self.ilp_conf_string) {
-                    Ok(s) => {
-                        self.sender = Some(s);
-                        self.sender.as_mut().context("sender after reconnect")?
-                    }
-                    Err(err) => {
-                        warn!(?err, "stock movers reconnect failed — dropping batch");
-                        self.buffer.clear();
-                        self.pending_count = 0;
-                        return Ok(());
-                    }
+        // Reconnect path — throttled.
+        if self.sender.is_none() {
+            if !self.reconnect_allowed_now() {
+                let count = self.pending_count;
+                let err = anyhow::anyhow!(
+                    "reconnect throttled ({}s window not elapsed)",
+                    MOVERS_RECONNECT_THROTTLE_SECS
+                );
+                self.record_drop(count, "reconnect_throttled", &err);
+                self.buffer.clear();
+                self.pending_count = 0;
+                return Ok(());
+            }
+            // Bump throttle BEFORE the attempt so a failure immediately
+            // blocks the next try by the full window.
+            self.bump_reconnect_throttle();
+            match Sender::from_conf(&self.ilp_conf_string) {
+                Ok(s) => {
+                    info!("stock movers writer reconnected to QuestDB");
+                    self.sender = Some(s);
+                }
+                Err(err) => {
+                    let count = self.pending_count;
+                    let wrapped = anyhow::Error::from(err);
+                    self.record_drop(count, "reconnect_failed", &wrapped);
+                    self.buffer.clear();
+                    self.pending_count = 0;
+                    return Ok(());
                 }
             }
-        };
+        }
 
+        let sender = self
+            .sender
+            .as_mut()
+            .context("stock movers sender present after reconnect branch")?;
         let count = self.pending_count;
         if let Err(err) = sender.flush(&mut self.buffer) {
-            warn!(?err, count, "stock movers flush failed — dropping batch");
+            let wrapped = anyhow::Error::from(err);
+            self.record_drop(count, "flush_failed", &wrapped);
             self.sender = None;
             self.buffer.clear();
             self.pending_count = 0;
@@ -276,6 +354,10 @@ pub struct OptionMoversWriter {
     buffer: Buffer,
     pending_count: usize,
     ilp_conf_string: String,
+    /// Earliest time at which the next reconnect attempt is allowed. DB-6.
+    next_reconnect_allowed: Instant,
+    /// Total rows dropped (never written to QuestDB). DB-7.
+    rows_dropped_total: u64,
 }
 
 impl OptionMoversWriter {
@@ -291,7 +373,38 @@ impl OptionMoversWriter {
             buffer,
             pending_count: 0,
             ilp_conf_string: conf_string,
+            next_reconnect_allowed: Instant::now(),
+            rows_dropped_total: 0,
         })
+    }
+
+    /// Total rows dropped since startup (never persisted to QuestDB).
+    pub fn rows_dropped_total(&self) -> u64 {
+        self.rows_dropped_total
+    }
+
+    /// Records a dropped batch — increments counter + metric + ERROR log. DB-7.
+    fn record_drop(&mut self, count: usize, reason: &'static str, err: &anyhow::Error) {
+        let dropped = u64::try_from(count).unwrap_or(u64::MAX);
+        self.rows_dropped_total = self.rows_dropped_total.saturating_add(dropped);
+        metrics::counter!("tv_option_movers_dropped_total").absolute(self.rows_dropped_total);
+        metrics::counter!("tv_option_movers_flush_failures_total").increment(1);
+        error!(
+            ?err,
+            dropped_rows = count,
+            total_dropped = self.rows_dropped_total,
+            reason,
+            "option movers batch dropped — data loss (cold-path observability)"
+        );
+    }
+
+    fn reconnect_allowed_now(&self) -> bool {
+        Instant::now() >= self.next_reconnect_allowed
+    }
+
+    fn bump_reconnect_throttle(&mut self) {
+        self.next_reconnect_allowed =
+            Instant::now() + Duration::from_secs(MOVERS_RECONNECT_THROTTLE_SECS);
     }
 
     /// Appends a single option mover entry to the ILP buffer.
@@ -385,37 +498,62 @@ impl OptionMoversWriter {
         if self.pending_count >= MOVERS_FLUSH_BATCH_SIZE
             && let Err(err) = self.flush()
         {
-            warn!(?err, "option movers auto-flush failed");
+            error!(?err, "option movers auto-flush failed at batch boundary");
         }
 
         Ok(())
     }
 
     /// Flushes buffered rows to QuestDB.
+    ///
+    /// DB-6/DB-7: reconnect attempts throttled to 1 per
+    /// `MOVERS_RECONNECT_THROTTLE_SECS` (30s). Every drop path routes
+    /// through `record_drop` (metric + ERROR log).
     pub fn flush(&mut self) -> Result<()> {
         if self.pending_count == 0 {
             return Ok(());
         }
 
-        let sender = match self.sender.as_mut() {
-            Some(s) => s,
-            None => match Sender::from_conf(&self.ilp_conf_string) {
+        // Reconnect path — throttled.
+        if self.sender.is_none() {
+            if !self.reconnect_allowed_now() {
+                let count = self.pending_count;
+                let err = anyhow::anyhow!(
+                    "reconnect throttled ({}s window not elapsed)",
+                    MOVERS_RECONNECT_THROTTLE_SECS
+                );
+                self.record_drop(count, "reconnect_throttled", &err);
+                self.buffer.clear();
+                self.pending_count = 0;
+                return Ok(());
+            }
+            // Bump throttle BEFORE the attempt so a failure immediately
+            // blocks the next try by the full window.
+            self.bump_reconnect_throttle();
+            match Sender::from_conf(&self.ilp_conf_string) {
                 Ok(s) => {
+                    info!("option movers writer reconnected to QuestDB");
                     self.sender = Some(s);
-                    self.sender.as_mut().context("sender after reconnect")?
                 }
                 Err(err) => {
-                    warn!(?err, "option movers reconnect failed — dropping batch");
+                    let count = self.pending_count;
+                    let wrapped = anyhow::Error::from(err);
+                    self.record_drop(count, "reconnect_failed", &wrapped);
                     self.buffer.clear();
                     self.pending_count = 0;
                     return Ok(());
                 }
-            },
-        };
+            }
+        }
 
+        let sender = self
+            .sender
+            .as_mut()
+            .context("option movers sender present after reconnect branch")?;
         let count = self.pending_count;
         if let Err(err) = sender.flush(&mut self.buffer) {
-            warn!(?err, count, "option movers flush failed — dropping batch");
+            let wrapped = anyhow::Error::from(err);
+            self.record_drop(count, "flush_failed", &wrapped);
             self.sender = None;
             self.buffer.clear();
             self.pending_count = 0;
@@ -744,5 +882,158 @@ mod tests {
             assert!(!cat.is_empty());
             assert!(cat.chars().all(|c| c.is_ascii_uppercase() || c == '_'));
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // DB-6 + DB-7: reconnect throttle + drop counter (movers)
+    // -----------------------------------------------------------------------
+
+    /// Shared bound check — reconnect throttle must be non-zero to prevent
+    /// tight reconnect loops (audit gap DB-6).
+    #[test]
+    fn test_db6_movers_reconnect_throttle_nonzero_and_bounded() {
+        assert!(
+            MOVERS_RECONNECT_THROTTLE_SECS >= 1,
+            "throttle must be >= 1s"
+        );
+        assert!(
+            MOVERS_RECONNECT_THROTTLE_SECS <= 300,
+            "throttle must be <= 5min"
+        );
+    }
+
+    /// `StockMoversWriter::record_drop` must saturate-add into
+    /// `rows_dropped_total` and increment the counter by exactly the
+    /// dropped-row count (DB-7).
+    #[test]
+    fn test_db7_stock_movers_record_drop_increments_counter() {
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: 9000,
+            ilp_port: 9009,
+            pg_port: 8812,
+        };
+        let mut writer = match StockMoversWriter::new(&config) {
+            Ok(w) => w,
+            Err(_) => StockMoversWriter {
+                sender: None,
+                buffer: questdb::ingress::Buffer::new(questdb::ingress::ProtocolVersion::V1),
+                pending_count: 0,
+                ilp_conf_string: config.build_ilp_conf_string(),
+                next_reconnect_allowed: Instant::now(),
+                rows_dropped_total: 0,
+            },
+        };
+        assert_eq!(writer.rows_dropped_total(), 0);
+        let err = anyhow::anyhow!("synthetic flush failure");
+        writer.record_drop(100, "test", &err);
+        assert_eq!(writer.rows_dropped_total(), 100);
+        writer.record_drop(200, "test", &err);
+        assert_eq!(writer.rows_dropped_total(), 300);
+    }
+
+    /// Same contract for `OptionMoversWriter`.
+    #[test]
+    fn test_db7_option_movers_record_drop_increments_counter() {
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: 9000,
+            ilp_port: 9009,
+            pg_port: 8812,
+        };
+        let mut writer = match OptionMoversWriter::new(&config) {
+            Ok(w) => w,
+            Err(_) => OptionMoversWriter {
+                sender: None,
+                buffer: questdb::ingress::Buffer::new(questdb::ingress::ProtocolVersion::V1),
+                pending_count: 0,
+                ilp_conf_string: config.build_ilp_conf_string(),
+                next_reconnect_allowed: Instant::now(),
+                rows_dropped_total: 0,
+            },
+        };
+        assert_eq!(writer.rows_dropped_total(), 0);
+        let err = anyhow::anyhow!("synthetic flush failure");
+        writer.record_drop(50, "test", &err);
+        assert_eq!(writer.rows_dropped_total(), 50);
+    }
+
+    /// Throttle blocks within window (DB-6).
+    #[test]
+    fn test_db6_stock_movers_reconnect_throttle_blocks_within_window() {
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: 9000,
+            ilp_port: 9009,
+            pg_port: 8812,
+        };
+        let mut writer = match StockMoversWriter::new(&config) {
+            Ok(w) => w,
+            Err(_) => StockMoversWriter {
+                sender: None,
+                buffer: questdb::ingress::Buffer::new(questdb::ingress::ProtocolVersion::V1),
+                pending_count: 0,
+                ilp_conf_string: config.build_ilp_conf_string(),
+                next_reconnect_allowed: Instant::now(),
+                rows_dropped_total: 0,
+            },
+        };
+        assert!(writer.reconnect_allowed_now());
+        writer.bump_reconnect_throttle();
+        assert!(
+            !writer.reconnect_allowed_now(),
+            "after bump, stock movers writer must block reconnect within throttle window"
+        );
+    }
+
+    /// Same for option movers.
+    #[test]
+    fn test_db6_option_movers_reconnect_throttle_blocks_within_window() {
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: 9000,
+            ilp_port: 9009,
+            pg_port: 8812,
+        };
+        let mut writer = match OptionMoversWriter::new(&config) {
+            Ok(w) => w,
+            Err(_) => OptionMoversWriter {
+                sender: None,
+                buffer: questdb::ingress::Buffer::new(questdb::ingress::ProtocolVersion::V1),
+                pending_count: 0,
+                ilp_conf_string: config.build_ilp_conf_string(),
+                next_reconnect_allowed: Instant::now(),
+                rows_dropped_total: 0,
+            },
+        };
+        assert!(writer.reconnect_allowed_now());
+        writer.bump_reconnect_throttle();
+        assert!(!writer.reconnect_allowed_now());
+    }
+
+    /// Stock movers counter must saturate at u64::MAX on overflow.
+    #[test]
+    fn test_db7_stock_movers_record_drop_saturates() {
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: 9000,
+            ilp_port: 9009,
+            pg_port: 8812,
+        };
+        let mut writer = match StockMoversWriter::new(&config) {
+            Ok(w) => w,
+            Err(_) => StockMoversWriter {
+                sender: None,
+                buffer: questdb::ingress::Buffer::new(questdb::ingress::ProtocolVersion::V1),
+                pending_count: 0,
+                ilp_conf_string: config.build_ilp_conf_string(),
+                next_reconnect_allowed: Instant::now(),
+                rows_dropped_total: 0,
+            },
+        };
+        writer.rows_dropped_total = u64::MAX - 1;
+        let err = anyhow::anyhow!("overflow");
+        writer.record_drop(100, "overflow", &err);
+        assert_eq!(writer.rows_dropped_total(), u64::MAX);
     }
 }
