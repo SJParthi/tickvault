@@ -27,9 +27,9 @@
 // Modules are declared in lib.rs for coverage instrumentation.
 use tickvault_app::boot_helpers::{
     CONFIG_BASE_PATH, CONFIG_LOCAL_PATH, FAST_BOOT_WINDOW_END, FAST_BOOT_WINDOW_START, IstTimer,
-    check_clock_drift, compute_market_close_sleep, create_log_file_writer, effective_ws_stagger,
-    format_bind_addr, format_cross_match_details, format_timeframe_details,
-    format_violation_details, spawn_heartbeat_watchdog,
+    check_clock_drift, compute_market_close_sleep, create_error_log_writer,
+    create_rolling_log_writer, effective_ws_stagger, format_bind_addr, format_cross_match_details,
+    format_timeframe_details, format_violation_details, spawn_heartbeat_watchdog,
 };
 use tickvault_app::{infra, observability, trading_pipeline};
 
@@ -395,20 +395,40 @@ async fn main() -> Result<()> {
         };
 
     // File-based JSON log layer for Alloy → Loki ingestion.
-    // Enables Grafana log dashboards to work even in dev mode (cargo run).
-    // Alloy watches this file and pushes logs to Loki automatically.
+    // Daily-rotated: data/logs/app.YYYY-MM-DD.log. Old files beyond
+    // LOG_MAX_FILES are cleaned up at boot.
     let file_log_layer: Option<Box<dyn tracing_subscriber::Layer<_> + Send + Sync + 'static>> =
-        match create_log_file_writer() {
+        match create_rolling_log_writer() {
             Some(file) => {
                 let file_fmt = tracing_subscriber::fmt::layer()
                     .with_target(true)
                     .with_thread_ids(true)
                     .with_file(false)
                     .with_line_number(false)
-                    .with_timer(ist_timer)
+                    .with_timer(ist_timer.clone())
                     .json()
                     .with_writer(std::sync::Mutex::new(file));
                 Some(Box::new(file_fmt))
+            }
+            None => None,
+        };
+
+    // Error-only file layer: data/logs/errors.log (WARN + ERROR only).
+    // Small, grep-friendly file containing ONLY problems for fast debugging.
+    let error_log_layer: Option<Box<dyn tracing_subscriber::Layer<_> + Send + Sync + 'static>> =
+        match create_error_log_writer() {
+            Some(file) => {
+                use tracing_subscriber::Layer as _;
+                let error_fmt = tracing_subscriber::fmt::layer()
+                    .with_target(true)
+                    .with_thread_ids(true)
+                    .with_file(true)
+                    .with_line_number(true)
+                    .with_timer(ist_timer)
+                    .json()
+                    .with_writer(std::sync::Mutex::new(file))
+                    .with_filter(tracing_subscriber::filter::LevelFilter::WARN);
+                Some(Box::new(error_fmt))
             }
             None => None,
         };
@@ -417,6 +437,7 @@ async fn main() -> Result<()> {
         .with(env_filter)
         .with(fmt_boxed)
         .with(file_log_layer)
+        .with(error_log_layer)
         .with(otel_layer)
         .init();
 
@@ -4513,7 +4534,8 @@ fn build_inline_greeks_enricher(
 mod tests {
     use super::*;
     use tickvault_app::boot_helpers::{
-        APP_LOG_FILE_PATH, OFF_HOURS_CONNECTION_STAGGER_MS, determine_boot_mode, should_fast_boot,
+        APP_LOG_FILE_PATH, OFF_HOURS_CONNECTION_STAGGER_MS, create_log_file_writer,
+        determine_boot_mode, should_fast_boot,
     };
 
     // All pure helper tests moved to boot_helpers.rs in the lib target.

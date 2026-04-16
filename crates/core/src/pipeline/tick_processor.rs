@@ -917,7 +917,7 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                 // Occurs during auction periods — metric only, do NOT filter.
                 if is_crossed_market(depth[0].bid_price, depth[0].ask_price) {
                     m_crossed_market.increment(1);
-                    debug!(
+                    trace!(
                         security_id = tick.security_id,
                         bid = depth[0].bid_price,
                         ask = depth[0].ask_price,
@@ -1002,7 +1002,7 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                 open_interest,
             } => {
                 m_oi_updates.increment(1);
-                debug!(
+                trace!(
                     security_id,
                     exchange_segment_code, open_interest, "OI update received"
                 );
@@ -1078,7 +1078,7 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     }
                 }
 
-                debug!(
+                trace!(
                     security_id,
                     exchange_segment_code, previous_close, previous_oi, "previous close persisted"
                 );
@@ -1098,7 +1098,7 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
             } => {
                 // Deep depth frames are from a separate WS connection.
                 // Log receipt; full order book assembly is done downstream.
-                debug!(
+                trace!(
                     security_id,
                     exchange_segment_code,
                     ?side,
