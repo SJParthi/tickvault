@@ -71,6 +71,14 @@ breaker limit. Mathematically guaranteed sufficient.
 Unsubscribe codes 16/18/22 are built by `subscription_builder.rs` but only used
 during graceful shutdown (A5). No live instrument swaps are performed.
 
+### Post-Market Behavior
+
+After 3 consecutive reconnection failures outside [09:00, 15:30) IST, the main
+feed connections **stop reconnecting** and give up cleanly. This prevents Telegram
+spam from the watchdog disconnect/reconnect cycle that occurs when Dhan sends no
+data after market close. During market hours, infinite retries are maintained
+(Dhan pings every 10s, so consecutive failures = real problem worth retrying).
+
 ### IDX_I Special Case
 
 Indices (segment code 0) are forced to Ticker mode regardless of configured feed
