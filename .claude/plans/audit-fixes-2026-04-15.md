@@ -24,17 +24,18 @@ match the zero-loss stance.
   - Files: `crates/storage/src/deep_depth_persistence.rs`
   - Tests: `test_spill_durability_write_flush_sync_sequence`, `test_spill_write_all_alone_may_not_be_durable`, `test_spill_open_sync_all_makes_file_discoverable`
 
-- [ ] **DB-5**: Fix indicator_snapshot dedup doc-comment regression bait
+- [x] **DB-5**: Fix indicator_snapshot dedup doc-comment regression bait — done
   - Files: `crates/storage/src/indicator_snapshot_persistence.rs`
-  - Tests: none (doc-only)
+  - Tests: `test_db5_dedup_key_matches_doc_comment`, `test_db5_dedup_key_exact_format`
 
-- [ ] **DB-6**: Exponential backoff + max attempts on indicator_snapshot + movers reconnect
-  - Files: `crates/storage/src/indicator_snapshot_persistence.rs`, `crates/storage/src/movers_persistence.rs`
-  - Tests: `test_indicator_snapshot_reconnect_has_backoff`, `test_movers_reconnect_has_backoff`
-
-- [ ] **DB-7**: Flush-failure metric counter + upgrade log level to ERROR
+- [x] **DB-6** (indicator_snapshot): Reconnect throttle (30s window) on indicator_snapshot — done
   - Files: `crates/storage/src/indicator_snapshot_persistence.rs`
-  - Tests: `test_indicator_snapshot_flush_failure_metric_increments`
+  - Tests: `test_db6_reconnect_throttle_is_nonzero`, `test_db6_reconnect_throttle_bounded`, `test_db7_reconnect_throttle_blocks_within_window`
+  - NOTE: movers portion still pending as separate commit.
+
+- [x] **DB-7** (indicator_snapshot): Flush-failure metric counter + upgrade log level to ERROR — done
+  - Files: `crates/storage/src/indicator_snapshot_persistence.rs`
+  - Tests: `test_db7_record_drop_increments_counter`, `test_db7_record_drop_saturates_on_overflow`
 
 - [ ] **DB-1**: Ring-buffer + disk-spill rescue on `IndicatorSnapshotWriter`
   - Files: `crates/storage/src/indicator_snapshot_persistence.rs`

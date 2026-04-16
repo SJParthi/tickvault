@@ -8,14 +8,17 @@
 //! - `indicator_snapshots` — one row per security per minute with all indicator values
 //!
 //! # Idempotency
-//! DEDUP UPSERT KEYS on `(ts, security_id)` prevent duplicates on restart.
+//! DEDUP UPSERT KEYS on `(ts, security_id, segment)` prevent duplicates on
+//! restart. `segment` is required because the same `security_id` exists in
+//! multiple exchange segments (IDX_I, NSE_EQ, NSE_FNO) — omitting it causes
+//! silent cross-segment UPSERT collision. See audit gap DB-5.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use questdb::ingress::{Buffer, Sender, TimestampNanos};
 use reqwest::Client;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::segment::segment_code_to_str;
@@ -35,6 +38,15 @@ const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 
 /// Flush batch size for indicator snapshots.
 const INDICATOR_FLUSH_BATCH_SIZE: usize = 500;
+
+/// Minimum interval between reconnect attempts when QuestDB is down.
+///
+/// Audit gap DB-6: the previous implementation called `Sender::from_conf`
+/// on every failed flush with zero backoff, creating a tight reconnect loop
+/// whenever QuestDB was unreachable. This constant caps reconnect attempts
+/// at one per 30 seconds per writer, matching the pattern used by
+/// `LiveCandleWriter` (see `LIVE_CANDLE_RECONNECT_THROTTLE_SECS`).
+const INDICATOR_RECONNECT_THROTTLE_SECS: u64 = 30;
 
 /// Rounds an f64 to 2 decimal places, matching Dhan's display precision.
 /// Uses multiply-round-divide to avoid string conversion overhead.
@@ -83,11 +95,27 @@ const INDICATOR_SNAPSHOTS_DDL: &str = "\
 // ---------------------------------------------------------------------------
 
 /// Batched writer for indicator snapshots to QuestDB via ILP.
+///
+/// # Resilience (DB-1/DB-6/DB-7)
+/// - Reconnect attempts are throttled to one per `INDICATOR_RECONNECT_THROTTLE_SECS`
+///   (30s). A tight `Sender::from_conf` loop when QuestDB is down is prevented.
+/// - Flush failures increment `tv_indicator_snapshot_flush_failures_total` and
+///   log at ERROR level (triggers Telegram alert per `rust-code.md`).
+/// - Dropped batches increment `tv_indicator_snapshot_dropped_total` as the
+///   observability floor for data loss.
 pub struct IndicatorSnapshotWriter {
     sender: Option<Sender>,
     buffer: Buffer,
     pending_count: usize,
     ilp_conf_string: String,
+    /// Earliest time (monotonic) at which the next reconnect attempt is allowed.
+    /// Starts at `Instant::now()` (immediately eligible), bumped to
+    /// `now + INDICATOR_RECONNECT_THROTTLE_SECS` after every failed reconnect.
+    /// DB-6.
+    next_reconnect_allowed: Instant,
+    /// Total rows dropped (never written to QuestDB). Exposed via metric;
+    /// non-zero in healthy ops = data loss alarm. DB-7.
+    rows_dropped_total: u64,
 }
 
 impl IndicatorSnapshotWriter {
@@ -103,7 +131,42 @@ impl IndicatorSnapshotWriter {
             buffer,
             pending_count: 0,
             ilp_conf_string: conf_string,
+            next_reconnect_allowed: Instant::now(),
+            rows_dropped_total: 0,
         })
+    }
+
+    /// Total rows dropped since startup (never persisted to QuestDB).
+    /// Exposed for tests and observability; in prod this is also exported
+    /// as a Prometheus metric `tv_indicator_snapshot_dropped_total`.
+    pub fn rows_dropped_total(&self) -> u64 {
+        self.rows_dropped_total
+    }
+
+    /// Records a dropped batch — increments counter + metric + ERROR log.
+    fn record_drop(&mut self, count: usize, reason: &'static str, err: &anyhow::Error) {
+        let dropped = u64::try_from(count).unwrap_or(u64::MAX);
+        self.rows_dropped_total = self.rows_dropped_total.saturating_add(dropped);
+        metrics::counter!("tv_indicator_snapshot_dropped_total").absolute(self.rows_dropped_total);
+        metrics::counter!("tv_indicator_snapshot_flush_failures_total").increment(1);
+        error!(
+            ?err,
+            dropped_rows = count,
+            total_dropped = self.rows_dropped_total,
+            reason,
+            "CRITICAL: indicator snapshot batch dropped — data loss"
+        );
+    }
+
+    /// Returns whether a reconnect attempt is currently allowed (throttle window).
+    fn reconnect_allowed_now(&self) -> bool {
+        Instant::now() >= self.next_reconnect_allowed
+    }
+
+    /// Bumps the reconnect throttle forward by `INDICATOR_RECONNECT_THROTTLE_SECS`.
+    fn bump_reconnect_throttle(&mut self) {
+        self.next_reconnect_allowed =
+            Instant::now() + Duration::from_secs(INDICATOR_RECONNECT_THROTTLE_SECS);
     }
 
     /// Appends a single indicator snapshot row to the ILP buffer.
@@ -186,43 +249,88 @@ impl IndicatorSnapshotWriter {
 
         self.pending_count = self.pending_count.saturating_add(1);
 
+        // Auto-flush on batch boundary. If this fails, the row is already
+        // buffered but the flush path has already recorded the drop + metric
+        // + ERROR log; we return Ok here because the append itself succeeded
+        // and the error has been observably recorded. DB-7.
         if self.pending_count >= INDICATOR_FLUSH_BATCH_SIZE
             && let Err(err) = self.flush()
         {
-            warn!(?err, "indicator snapshot auto-flush failed");
+            // flush() already called record_drop + ERROR-logged. This is a
+            // breadcrumb for the auto-flush boundary specifically.
+            error!(
+                ?err,
+                "indicator snapshot auto-flush failed at batch boundary"
+            );
         }
 
         Ok(())
     }
 
     /// Flushes buffered rows to QuestDB.
+    ///
+    /// # Resilience contract (DB-1/DB-6/DB-7)
+    /// - Reconnect attempts are throttled to one per
+    ///   `INDICATOR_RECONNECT_THROTTLE_SECS`. When the throttle is engaged,
+    ///   the current batch is dropped (as before) but the drop is recorded
+    ///   against `tv_indicator_snapshot_dropped_total` + ERROR log.
+    /// - Every drop path increments `tv_indicator_snapshot_flush_failures_total`.
+    /// - Drops log at ERROR level (triggers Telegram alert) instead of the
+    ///   previous WARN.
+    ///
+    /// A follow-up audit item (DB-1) will add a bounded in-memory ring that
+    /// rescues dropped batches instead of discarding them outright. Until
+    /// that lands, this function's best behaviour is "make every drop loud
+    /// and observable" — which is strictly better than the prior "silently
+    /// return Ok(()) on WARN".
     pub fn flush(&mut self) -> Result<()> {
         if self.pending_count == 0 {
             return Ok(());
         }
 
-        let sender = match self.sender.as_mut() {
-            Some(s) => s,
-            None => match Sender::from_conf(&self.ilp_conf_string) {
+        // Reconnect path — throttled.
+        if self.sender.is_none() {
+            if !self.reconnect_allowed_now() {
+                // Throttle window is still closed. Drop the batch loudly.
+                let count = self.pending_count;
+                let err = anyhow::anyhow!(
+                    "reconnect throttled ({}s window not elapsed)",
+                    INDICATOR_RECONNECT_THROTTLE_SECS
+                );
+                self.record_drop(count, "reconnect_throttled", &err);
+                self.buffer.clear();
+                self.pending_count = 0;
+                return Ok(());
+            }
+            // Attempt reconnect. Bump the throttle BEFORE the attempt so a
+            // failure immediately holds off the next try by the full window.
+            self.bump_reconnect_throttle();
+            match Sender::from_conf(&self.ilp_conf_string) {
                 Ok(s) => {
+                    info!("indicator snapshot writer reconnected to QuestDB");
                     self.sender = Some(s);
-                    self.sender.as_mut().context("sender after reconnect")?
                 }
                 Err(err) => {
-                    warn!(?err, "indicator snapshot reconnect failed — dropping batch");
+                    let count = self.pending_count;
+                    let wrapped = anyhow::Error::from(err);
+                    self.record_drop(count, "reconnect_failed", &wrapped);
                     self.buffer.clear();
                     self.pending_count = 0;
                     return Ok(());
                 }
-            },
-        };
+            }
+        }
 
+        let sender = self
+            .sender
+            .as_mut()
+            .context("sender present after reconnect branch")?;
         let count = self.pending_count;
         if let Err(err) = sender.flush(&mut self.buffer) {
-            warn!(
-                ?err,
-                count, "indicator snapshot flush failed — dropping batch"
-            );
+            let wrapped = anyhow::Error::from(err);
+            self.record_drop(count, "flush_failed", &wrapped);
+            // Drop the sender so the next flush attempts a reconnect
+            // (throttled by the window above).
             self.sender = None;
             self.buffer.clear();
             self.pending_count = 0;
@@ -394,5 +502,176 @@ mod tests {
             pg_port: 8812,
         };
         let _result = IndicatorSnapshotWriter::new(&config);
+    }
+
+    // -----------------------------------------------------------------------
+    // DB-5: doc-comment truthfulness
+    // -----------------------------------------------------------------------
+
+    /// The module-level doc comment claims the DEDUP key is
+    /// `(ts, security_id, segment)`. The actual constant must match.
+    /// Prevents the doc-drift regression bait flagged in audit gap DB-5.
+    #[test]
+    fn test_db5_dedup_key_matches_doc_comment() {
+        assert!(
+            DEDUP_KEY_INDICATORS.contains("security_id")
+                && DEDUP_KEY_INDICATORS.contains("segment"),
+            "DEDUP_KEY_INDICATORS must include security_id AND segment to \
+             match the module doc comment (DB-5). Got: {DEDUP_KEY_INDICATORS}"
+        );
+    }
+
+    #[test]
+    fn test_db5_dedup_key_exact_format() {
+        assert_eq!(
+            DEDUP_KEY_INDICATORS, "security_id, segment",
+            "DEDUP_KEY_INDICATORS regression — if you need to change this, \
+             also update the doc comment and add a migration plan."
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // DB-6: reconnect throttle
+    // -----------------------------------------------------------------------
+
+    /// The reconnect throttle constant must be non-zero. A zero throttle =
+    /// tight reconnect loop = the original DB-6 bug.
+    #[test]
+    fn test_db6_reconnect_throttle_is_nonzero() {
+        assert!(
+            INDICATOR_RECONNECT_THROTTLE_SECS >= 1,
+            "reconnect throttle must be >= 1s to prevent tight reconnect loops"
+        );
+    }
+
+    /// The throttle must be bounded sanely (at least 1s, at most 5 min).
+    /// Too low = DoS QuestDB with reconnects; too high = bad recovery.
+    #[test]
+    fn test_db6_reconnect_throttle_bounded() {
+        assert!(INDICATOR_RECONNECT_THROTTLE_SECS >= 1);
+        assert!(INDICATOR_RECONNECT_THROTTLE_SECS <= 300);
+    }
+
+    // -----------------------------------------------------------------------
+    // DB-7: flush-failure observability (drop counter + reconnect throttle state)
+    // -----------------------------------------------------------------------
+
+    /// Proves `next_reconnect_allowed` advances forward on a failed
+    /// reconnect and that `reconnect_allowed_now()` returns false inside
+    /// the throttle window. No live QuestDB needed — operates on the
+    /// struct's internal state.
+    #[test]
+    fn test_db7_reconnect_throttle_blocks_within_window() {
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: 9000,
+            ilp_port: 9009,
+            pg_port: 8812,
+        };
+        // We don't actually connect — use a test-only construction path
+        // that mirrors `new` but skips the Sender. We do this by calling
+        // `new` with a valid host-port; if it happens to succeed we
+        // immediately drop the sender. If it fails, we synthesize the
+        // struct directly below.
+        let writer_result = IndicatorSnapshotWriter::new(&config);
+        let mut writer = match writer_result {
+            Ok(mut w) => {
+                // Drop the real sender so the reconnect path engages.
+                w.sender = None;
+                w
+            }
+            Err(_) => {
+                // Build the writer struct manually for test purposes.
+                // This is a test-only synthesis path — production code
+                // cannot do this because the fields are private.
+                IndicatorSnapshotWriter {
+                    sender: None,
+                    buffer: questdb::ingress::Buffer::new(questdb::ingress::ProtocolVersion::V1),
+                    pending_count: 0,
+                    ilp_conf_string: config.build_ilp_conf_string(),
+                    next_reconnect_allowed: Instant::now(),
+                    rows_dropped_total: 0,
+                }
+            }
+        };
+
+        // Initially allowed.
+        assert!(
+            writer.reconnect_allowed_now(),
+            "freshly-constructed writer must allow immediate reconnect"
+        );
+
+        // Bump the throttle — now disallowed for ~30s.
+        writer.bump_reconnect_throttle();
+        assert!(
+            !writer.reconnect_allowed_now(),
+            "after bump, reconnect must be blocked inside the throttle window \
+             (DB-6 invariant)"
+        );
+    }
+
+    /// `record_drop` must increment the rows_dropped_total counter by the
+    /// exact dropped-row count — proves no off-by-one and no lossy cast.
+    #[test]
+    fn test_db7_record_drop_increments_counter() {
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: 9000,
+            ilp_port: 9009,
+            pg_port: 8812,
+        };
+        let mut writer = match IndicatorSnapshotWriter::new(&config) {
+            Ok(w) => w,
+            Err(_) => IndicatorSnapshotWriter {
+                sender: None,
+                buffer: questdb::ingress::Buffer::new(questdb::ingress::ProtocolVersion::V1),
+                pending_count: 0,
+                ilp_conf_string: config.build_ilp_conf_string(),
+                next_reconnect_allowed: Instant::now(),
+                rows_dropped_total: 0,
+            },
+        };
+        assert_eq!(writer.rows_dropped_total(), 0);
+        let err = anyhow::anyhow!("synthetic flush failure");
+        writer.record_drop(500, "test", &err);
+        assert_eq!(
+            writer.rows_dropped_total(),
+            500,
+            "record_drop must increment the counter by exactly the dropped count"
+        );
+        writer.record_drop(250, "test", &err);
+        assert_eq!(writer.rows_dropped_total(), 750);
+    }
+
+    /// Saturating arithmetic: an impossibly-large drop count must not
+    /// overflow `rows_dropped_total`.
+    #[test]
+    fn test_db7_record_drop_saturates_on_overflow() {
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: 9000,
+            ilp_port: 9009,
+            pg_port: 8812,
+        };
+        let mut writer = match IndicatorSnapshotWriter::new(&config) {
+            Ok(w) => w,
+            Err(_) => IndicatorSnapshotWriter {
+                sender: None,
+                buffer: questdb::ingress::Buffer::new(questdb::ingress::ProtocolVersion::V1),
+                pending_count: 0,
+                ilp_conf_string: config.build_ilp_conf_string(),
+                next_reconnect_allowed: Instant::now(),
+                rows_dropped_total: u64::MAX - 10,
+            },
+        };
+        // Force start near the ceiling.
+        writer.rows_dropped_total = u64::MAX - 10;
+        let err = anyhow::anyhow!("synthetic overflow");
+        writer.record_drop(100, "overflow", &err);
+        assert_eq!(
+            writer.rows_dropped_total(),
+            u64::MAX,
+            "saturating_add must clamp at u64::MAX, not wrap"
+        );
     }
 }
