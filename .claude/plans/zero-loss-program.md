@@ -17,9 +17,9 @@
   - Tests: `test_zl_p0_1_heartbeat_metric_name_stable`, `test_zl_p0_1_heartbeat_gauge_builds_for_all_ws_types`, `test_zl_p0_1_heartbeat_gauge_accepts_extreme_values`
   - Impact: catches frozen event loop the watchdog cannot see.
 
-- [ ] **ZL-P0-2**: Per-underlying canary gauge for NIFTY/BANKNIFTY/SENSEX spots (`tv_ws_canary_last_tick_epoch_secs{underlying}`)
+- [x] **ZL-P0-2**: Per-underlying canary gauge for NIFTY/BANKNIFTY/SENSEX spots — done
   - Files: `crates/core/src/pipeline/tick_processor.rs`
-  - Tests: `test_zl_p0_2_canary_metric_labeled_by_underlying`, `test_zl_p0_2_canary_metric_updated_on_spot_tick`
+  - Tests: `test_zl_p0_2_canary_underlyings_table_is_bounded`, `test_zl_p0_2_canary_underlyings_contains_nifty_banknifty_sensex`, `test_zl_p0_2_canary_underlyings_have_non_empty_labels`, `test_zl_p0_2_canary_metric_name_stable`, `test_zl_p0_2_canary_metric_builds_without_recorder`
   - Impact: end-to-end "alive but not flowing" detection.
 
 - [ ] **ZL-P0-3**: End-of-day reconciliation — compare QuestDB tick counts vs Dhan historical REST candles
