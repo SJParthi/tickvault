@@ -2763,12 +2763,38 @@ async fn main() -> Result<()> {
                     while rebalance_rx.changed().await.is_ok() {
                         if let Some(event) = rebalance_rx.borrow().as_ref() {
                             // O(1) EXEMPT: cold path — rebalance fires at most once per 60s
+                            let expiry_str = event.expiry.map_or_else(
+                                || "?".to_string(),
+                                |e| e.format("%d-%b-%Y").to_string(),
+                            );
+                            let prev_ce = event
+                                .prev_ce_security_id
+                                .map_or_else(|| "—".to_string(), |id| id.to_string());
+                            let prev_pe = event
+                                .prev_pe_security_id
+                                .map_or_else(|| "—".to_string(), |id| id.to_string());
+                            let new_ce = event
+                                .new_ce_security_id
+                                .map_or_else(|| "—".to_string(), |id| id.to_string());
+                            let new_pe = event
+                                .new_pe_security_id
+                                .map_or_else(|| "—".to_string(), |id| id.to_string());
                             rebalance_notifier.notify(NotificationEvent::Custom {
                                 message: format!(
-                                    "Depth rebalance: {} ATM shifted {:.2} → {:.2}",
+                                    "<b>Depth rebalance: {}</b>\n\
+                                     Expiry: {}\n\
+                                     ATM: {:.2} → {:.2}\n\
+                                     Old CE/PE: {} / {}\n\
+                                     New CE/PE: {} / {}\n\
+                                     Affects: depth-20 + depth-200",
                                     event.underlying,
+                                    expiry_str,
                                     event.previous_atm_strike,
-                                    event.new_atm_strike
+                                    event.new_atm_strike,
+                                    prev_ce,
+                                    prev_pe,
+                                    new_ce,
+                                    new_pe,
                                 ),
                             });
                         }

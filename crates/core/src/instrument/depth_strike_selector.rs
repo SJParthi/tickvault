@@ -197,6 +197,21 @@ pub fn should_rebalance(
     curr_idx.abs_diff(prev_idx) >= threshold
 }
 
+/// Returns the CE and PE security IDs at the strike nearest to `spot_price`.
+///
+/// Used by the depth rebalancer to include contract identifiers in Telegram
+/// notifications so operators can see exactly which contracts shifted.
+pub fn find_atm_security_ids(chain: &OptionChain, spot_price: f64) -> (Option<u32>, Option<u32>) {
+    if chain.calls.is_empty() || !spot_price.is_finite() || spot_price <= 0.0 {
+        return (None, None);
+    }
+    let atm_idx = find_atm_index(&chain.calls, spot_price);
+    let ce_id = Some(chain.calls[atm_idx].security_id);
+    let pe_id =
+        find_put_at_strike(&chain.puts, chain.calls[atm_idx].strike_price).map(|p| p.security_id);
+    (ce_id, pe_id)
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
@@ -471,5 +486,46 @@ mod tests {
         let has_pe = selection.all_security_ids.iter().any(|&id| id >= 20000);
         assert!(has_ce, "must have CE security IDs");
         assert!(has_pe, "must have PE security IDs");
+    }
+
+    #[test]
+    fn test_find_atm_security_ids_returns_ce_pe() {
+        let strikes: Vec<f64> = (0..5).map(|i| 23000.0 + (i as f64) * 100.0).collect();
+        let chain = make_chain(
+            &strikes,
+            "NIFTY",
+            NaiveDate::from_ymd_opt(2026, 4, 9).unwrap(),
+        );
+        let (ce, pe) = find_atm_security_ids(&chain, 23200.0);
+        // ATM at 23200 → index 2 → CE=10002, PE=20002
+        assert_eq!(ce, Some(10002));
+        assert_eq!(pe, Some(20002));
+    }
+
+    #[test]
+    fn test_find_atm_security_ids_empty_chain() {
+        let chain = OptionChain {
+            underlying_symbol: "NIFTY".to_string(),
+            expiry_date: NaiveDate::from_ymd_opt(2026, 4, 9).unwrap(),
+            calls: vec![],
+            puts: vec![],
+            future_security_id: None,
+        };
+        let (ce, pe) = find_atm_security_ids(&chain, 23200.0);
+        assert_eq!(ce, None);
+        assert_eq!(pe, None);
+    }
+
+    #[test]
+    fn test_find_atm_security_ids_invalid_spot() {
+        let strikes: Vec<f64> = (0..5).map(|i| 23000.0 + (i as f64) * 100.0).collect();
+        let chain = make_chain(
+            &strikes,
+            "NIFTY",
+            NaiveDate::from_ymd_opt(2026, 4, 9).unwrap(),
+        );
+        let (ce, pe) = find_atm_security_ids(&chain, 0.0);
+        assert_eq!(ce, None);
+        assert_eq!(pe, None);
     }
 }
