@@ -427,22 +427,21 @@ PascalCase top-level keys.
 | 10 | Depth strike selector picked arbitrary strikes (.first() on HashMap) | Real ATM from index LTP, nearest expiry, binary search, ATM ± 24 | 2026-04-16 |
 | 11 | Backfill worker injecting synthetic ticks into `ticks` table | BackfillWorker disabled — historical data stays in `historical_candles` only | 2026-04-16 |
 | 12 | Post-market stale ticks written to QuestDB | Wall-clock guard `is_wall_clock_within_persist_window()` added to tick processor | 2026-04-16 |
+| 13 | (C1) No graceful unsubscribe on shutdown | Already sends RequestCode 12 (Disconnect); explicit unsub of 25K instruments would delay shutdown for no benefit — Dhan cleans up on disconnect | 2026-04-16 |
+| 14 | (H1) WebSocketDisconnected not wired for main feed | Already wired in `connection.rs:341-392` — all 3 disconnect paths fire notification | 2026-04-16 |
+| 15 | (C3) Order update token not wrapped in Zeroizing | Already wrapped in `zeroize::Zeroizing` at `order_update_connection.rs:168` | 2026-04-16 |
+| 16 | (C2) Order update auth not validated after login | Auth IS validated in read loop via `classify_auth_response()` at line 309; Close frame detected immediately; 660s watchdog backstop | 2026-04-16 |
 
 ### 10.2 Open Gaps
 
 #### CRITICAL
 
-| # | Gap | File:Line | Impact |
-|---|-----|-----------|--------|
-| C1 | No graceful unsubscribe on shutdown — connections close without sending unsubscribe messages | `connection.rs:193-202` | Dhan keeps instruments subscribed briefly, wasting bandwidth |
-| C2 | Order update auth never validated — code enters read loop immediately after login, waits for implicit error on timeout | `order_update_connection.rs:187-193` | Silent auth failure for 30+ seconds |
-| C3 | Order update token not wrapped in `Zeroizing` — exposed `.to_string()` stays in memory | `order_update_connection.rs:153` | Token not zeroized on drop (security) |
+*No open critical gaps.*
 
 #### HIGH
 
 | # | Gap | File:Line | Impact |
 |---|-----|-----------|--------|
-| H1 | `WebSocketDisconnected` event defined but never sent in production | `connection.rs:228-235` | Main feed disconnections not alerted via Telegram |
 | H2 | No pool-level circuit breaker — if all 5 main feed connections die, no explicit alert fires | `connection_pool.rs` (missing entirely) | Silent total data loss |
 | H3 | No per-security_id stale tick detection — if one instrument stops receiving ticks, no alert | `tick_processor.rs` | Silent data gap for single security while others stream fine |
 | H4 | No dead-letter mechanism for unparseable packets — frames discarded without forensics | `tick_processor.rs:501` | Can't diagnose parse failures post-mortem |

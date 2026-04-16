@@ -2075,6 +2075,9 @@ async fn main() -> Result<()> {
                     > = std::collections::HashMap::with_capacity(50);
                     // O(1) EXEMPT: end
 
+                    // H5: consecutive parse error counter for Telegram escalation.
+                    let mut consecutive_parse_errors: u32 = 0;
+
                     while let Some(frame) = depth_rx.recv().await {
                         m.increment(1);
                         let ts = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
@@ -2106,6 +2109,7 @@ async fn main() -> Result<()> {
                                     message_sequence,
                                     ..
                                 }) => {
+                                    consecutive_parse_errors = 0; // H5: reset on success
                                     let side_str = match side {
                                         tickvault_core::parser::deep_depth::DepthSide::Bid => "BID",
                                         tickvault_core::parser::deep_depth::DepthSide::Ask => "ASK",
@@ -2190,8 +2194,22 @@ async fn main() -> Result<()> {
                                 Ok(_) => {} // non-depth frame (shouldn't happen)
                                 Err(err) => {
                                     // H5: Escalate persistent parse failures to ERROR (triggers Telegram).
+                                    consecutive_parse_errors =
+                                        consecutive_parse_errors.saturating_add(1);
                                     metrics::counter!("tv_depth_parse_errors_total", "depth" => "20").increment(1);
-                                    tracing::warn!(?err, "failed to parse 20-level depth packet");
+                                    if consecutive_parse_errors >= 5 {
+                                        tracing::error!(
+                                            ?err,
+                                            consecutive = consecutive_parse_errors,
+                                            "H5: 20-level depth parse failures persisting — {consecutive_parse_errors} consecutive errors"
+                                        );
+                                        consecutive_parse_errors = 0;
+                                    } else {
+                                        tracing::warn!(
+                                            ?err,
+                                            "failed to parse 20-level depth packet"
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -2328,6 +2346,9 @@ async fn main() -> Result<()> {
                                     "200-level deep depth QuestDB writer connected"
                                 );
                             }
+                            // H5: consecutive parse error counter.
+                            let mut consecutive_parse_errors_200: u32 = 0;
+
                             while let Some(frame) = rx200.recv().await {
                                 m.increment(1);
                                 let ts = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
@@ -2342,6 +2363,7 @@ async fn main() -> Result<()> {
                                         message_sequence,
                                         ..
                                     }) => {
+                                        consecutive_parse_errors_200 = 0; // H5: reset on success
                                         let side_str = match side {
                                             tickvault_core::parser::deep_depth::DepthSide::Bid => {
                                                 "BID"
@@ -2369,10 +2391,22 @@ async fn main() -> Result<()> {
                                     }
                                     Ok(_) => {}
                                     Err(err) => {
-                                        tracing::warn!(
-                                            ?err,
-                                            "failed to parse 200-level depth frame"
-                                        );
+                                        consecutive_parse_errors_200 =
+                                            consecutive_parse_errors_200.saturating_add(1);
+                                        metrics::counter!("tv_depth_parse_errors_total", "depth" => "200").increment(1);
+                                        if consecutive_parse_errors_200 >= 5 {
+                                            tracing::error!(
+                                                ?err,
+                                                consecutive = consecutive_parse_errors_200,
+                                                "H5: 200-level depth parse failures persisting — {consecutive_parse_errors_200} consecutive errors"
+                                            );
+                                            consecutive_parse_errors_200 = 0;
+                                        } else {
+                                            tracing::warn!(
+                                                ?err,
+                                                "failed to parse 200-level depth frame"
+                                            );
+                                        }
                                     }
                                 }
                             }
