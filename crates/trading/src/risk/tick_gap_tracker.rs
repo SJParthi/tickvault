@@ -37,6 +37,12 @@ struct SecurityFeedState {
 ///
 /// Cold-path component — called once per tick from the trading pipeline.
 /// Pre-allocate capacity based on expected universe size.
+///
+/// # Log Noise Reduction
+/// WARN-level gaps are aggregated into a periodic summary (every 30 seconds)
+/// instead of emitting one log line per instrument. Only ERROR-level gaps
+/// (>= 120s, possible disconnection) are logged immediately per-instrument.
+/// This prevents console flooding from illiquid F&O instruments.
 pub struct TickGapTracker {
     /// Per-security feed state.
     states: HashMap<u32, SecurityFeedState>,
@@ -46,7 +52,15 @@ pub struct TickGapTracker {
     total_errors: u64,
     /// Total stale LTP alerts emitted (for metrics/alerting).
     total_stale_alerts: u64,
+    /// Aggregated warning gaps since last summary log (security_id, gap_secs).
+    /// Flushed every LOG_SUMMARY_INTERVAL_SECS into a single summary line.
+    pending_warn_gaps: Vec<(u32, u32)>,
+    /// Wall-clock of last summary log emission.
+    last_summary_log: Instant,
 }
+
+/// Interval between aggregated warning summary log emissions.
+const LOG_SUMMARY_INTERVAL_SECS: u64 = 30;
 
 impl TickGapTracker {
     /// Creates a new tracker with the specified initial capacity.
@@ -59,6 +73,8 @@ impl TickGapTracker {
             total_warnings: 0,
             total_errors: 0,
             total_stale_alerts: 0,
+            pending_warn_gaps: Vec::with_capacity(64),
+            last_summary_log: Instant::now(),
         }
     }
 
@@ -93,6 +109,7 @@ impl TickGapTracker {
         let gap_secs = exchange_timestamp.saturating_sub(state.last_exchange_timestamp);
 
         let result = if gap_secs >= TICK_GAP_ERROR_THRESHOLD_SECS {
+            // ERROR: possible disconnection — log immediately per-instrument.
             error!(
                 security_id = security_id,
                 gap_secs = gap_secs,
@@ -103,13 +120,9 @@ impl TickGapTracker {
             self.total_errors = self.total_errors.saturating_add(1);
             TickGapResult::Error { gap_secs }
         } else if gap_secs >= TICK_GAP_ALERT_THRESHOLD_SECS {
-            warn!(
-                security_id = security_id,
-                gap_secs = gap_secs,
-                last_ts = state.last_exchange_timestamp,
-                current_ts = exchange_timestamp,
-                "tick feed gap detected"
-            );
+            // WARN: normal illiquidity gap — aggregate into periodic summary
+            // instead of flooding the console with one line per instrument.
+            self.pending_warn_gaps.push((security_id, gap_secs));
             self.total_warnings = self.total_warnings.saturating_add(1);
             TickGapResult::Warning { gap_secs }
         } else {
@@ -117,7 +130,66 @@ impl TickGapTracker {
         };
 
         state.last_exchange_timestamp = exchange_timestamp;
+
+        // Flush aggregated warning summary every LOG_SUMMARY_INTERVAL_SECS.
+        // Must be AFTER state borrow ends (state.last_exchange_timestamp above).
+        if !self.pending_warn_gaps.is_empty()
+            && self.last_summary_log.elapsed()
+                >= std::time::Duration::from_secs(LOG_SUMMARY_INTERVAL_SECS)
+        {
+            self.flush_warning_summary();
+        }
+
         result
+    }
+
+    /// Flushes accumulated warning gaps into a single summary log line.
+    ///
+    /// Instead of `N` separate WARN lines (one per illiquid instrument),
+    /// emits ONE summary: "42 instruments had feed gaps (30-90s) in last 30s".
+    /// The worst 3 security_ids are included for debugging.
+    fn flush_warning_summary(&mut self) {
+        let count = self.pending_warn_gaps.len();
+        if count == 0 {
+            return;
+        }
+
+        // Find the worst gap (largest gap_secs) for the summary.
+        let max_gap = self
+            .pending_warn_gaps
+            .iter()
+            .map(|(_, g)| *g)
+            .max()
+            .unwrap_or(0);
+        let min_gap = self
+            .pending_warn_gaps
+            .iter()
+            .map(|(_, g)| *g)
+            .min()
+            .unwrap_or(0);
+
+        // Include up to 3 worst security_ids for debugging.
+        // O(1) EXEMPT: begin — cold path, called once every 30s (not per tick)
+        self.pending_warn_gaps
+            .sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        let worst_3: Vec<_> = self.pending_warn_gaps.iter().take(3).collect();
+        let sample_str: String = worst_3
+            .iter()
+            .map(|(sid, gap)| format!("SID {sid}={gap}s"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        // O(1) EXEMPT: end
+
+        warn!(
+            gap_count = count,
+            min_gap_secs = min_gap,
+            max_gap_secs = max_gap,
+            worst = %sample_str,
+            "tick feed gaps (30s summary): {count} instruments had gaps ({min_gap}-{max_gap}s)"
+        );
+
+        self.pending_warn_gaps.clear();
+        self.last_summary_log = Instant::now();
     }
 
     /// Returns the total number of gap warnings emitted.
@@ -183,10 +255,13 @@ impl TickGapTracker {
 
     /// Resets all tracking state (call at daily reset).
     pub fn reset(&mut self) {
+        // Flush any pending warnings before clearing state.
+        self.flush_warning_summary();
         self.states.clear();
         self.total_warnings = 0;
         self.total_errors = 0;
         self.total_stale_alerts = 0;
+        self.pending_warn_gaps.clear();
     }
 
     /// **P8.1 primitive** — snapshots the set of securities that have
