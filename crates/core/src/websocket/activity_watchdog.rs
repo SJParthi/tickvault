@@ -215,6 +215,7 @@ impl ActivityWatchdog {
 /// ```
 /// Fires if no frame arrived within the last 5 seconds during market
 /// hours on any live feed connection.
+// TEST-EXEMPT: covered by test_zl_p0_1_heartbeat_gauge_builds_for_all_ws_types which exercises the full construction path
 pub fn build_heartbeat_gauge(ws_type: &'static str, connection_label: String) -> metrics::Gauge {
     metrics::gauge!(
         "tv_ws_last_frame_epoch_secs",
