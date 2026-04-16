@@ -1415,17 +1415,9 @@ pub const TOKEN_INIT_TIMEOUT_SECS: u64 = 300;
 /// halts and raises a critical alert. Prevents infinite retry with expired token.
 pub const TOKEN_RENEWAL_MAX_CIRCUIT_BREAKER_CYCLES: u32 = 5;
 
-/// Timeout for sending a frame into the tick processor channel (seconds).
-/// Used as backpressure timeout: if channel is full, WS read blocks for
-/// up to this duration. Must be less than Dhan's ping timeout (40s).
-pub const FRAME_SEND_TIMEOUT_SECS: u64 = 5;
-
-/// Maximum backpressure wait time (seconds) when SPSC channel is full.
-/// If the tick processor is frozen for this long, the frame is lost and a
-/// CRITICAL error is logged. Must be less than Dhan's ping timeout (40s)
-/// to prevent WebSocket disconnection during backpressure.
-/// 30s < 40s (Dhan timeout) gives 10s safety margin.
-pub const FRAME_BACKPRESSURE_TIMEOUT_SECS: u64 = 30;
+// DELETED: FRAME_SEND_TIMEOUT_SECS and FRAME_BACKPRESSURE_TIMEOUT_SECS
+// Removed per P1.3 — WS readers use non-blocking try_send() + WAL spill,
+// no backpressure timeout needed. Activity watchdog handles dead sockets.
 
 /// SPSC frame channel capacity (WebSocket reader → tick processor).
 /// All 5 WS connections multiplex frames into this single channel.
