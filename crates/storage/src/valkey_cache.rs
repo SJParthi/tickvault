@@ -518,6 +518,7 @@ impl ValkeyPool {
     }
 
     /// Returns the current circuit breaker state (for health endpoint).
+    // WIRING-EXEMPT: called from app crate's boot sequence to feed SharedHealthStatus
     pub fn circuit_state(&self) -> CircuitState {
         self.circuit.state()
     }
