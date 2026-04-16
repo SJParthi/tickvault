@@ -399,7 +399,7 @@ PascalCase top-level keys.
 | Event | When Fired | Severity |
 |-------|------------|----------|
 | `WebSocketConnected { connection_index }` | After all 5 main feed connections spawned | Low |
-| `WebSocketDisconnected { connection_index, reason }` | Not currently wired (gap) | High |
+| `WebSocketDisconnected { connection_index, reason }` | Wired in all 3 disconnect paths (`connection.rs:341-392`) | High |
 | `DepthTwentyConnected { underlying }` | After 20-level WS connected + subscribed (via oneshot signal) | Low |
 | `DepthTwentyDisconnected { underlying, reason }` | On connection error/drop | High |
 | `DepthTwoHundredConnected { underlying }` | After 200-level WS connected + subscribed (via oneshot signal) | Low |
@@ -431,6 +431,8 @@ PascalCase top-level keys.
 | 14 | (H1) WebSocketDisconnected not wired for main feed | Already wired in `connection.rs:341-392` — all 3 disconnect paths fire notification | 2026-04-16 |
 | 15 | (C3) Order update token not wrapped in Zeroizing | Already wrapped in `zeroize::Zeroizing` at `order_update_connection.rs:168` | 2026-04-16 |
 | 16 | (C2) Order update auth not validated after login | Auth IS validated in read loop via `classify_auth_response()` at line 309; Close frame detected immediately; 660s watchdog backstop | 2026-04-16 |
+| 17 | (H2) No pool-level circuit breaker | Already implemented: `poll_watchdog()` fires ERROR after 60s all-down, HALT after 300s. Spawned in `main.rs` every 5s | 2026-04-16 |
+| 18 | (H5) No Telegram on depth parse failures | Added consecutive error counter — escalates to ERROR (triggers Telegram) after 5 consecutive failures | 2026-04-16 |
 
 ### 10.2 Open Gaps
 
@@ -442,10 +444,8 @@ PascalCase top-level keys.
 
 | # | Gap | File:Line | Impact |
 |---|-----|-----------|--------|
-| H2 | No pool-level circuit breaker — if all 5 main feed connections die, no explicit alert fires | `connection_pool.rs` (missing entirely) | Silent total data loss |
 | H3 | No per-security_id stale tick detection — if one instrument stops receiving ticks, no alert | `tick_processor.rs` | Silent data gap for single security while others stream fine |
 | H4 | No dead-letter mechanism for unparseable packets — frames discarded without forensics | `tick_processor.rs:501` | Can't diagnose parse failures post-mortem |
-| H5 | No Telegram alert when depth frame parsing fails | `depth_connection.rs` | Parse errors logged but not escalated |
 
 #### MEDIUM
 
