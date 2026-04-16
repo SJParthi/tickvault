@@ -1766,174 +1766,228 @@ async fn main() -> Result<()> {
     };
 
     // -----------------------------------------------------------------------
+    // Step 8c.0: SharedSpotPrices — capture index LTP for depth ATM selection
+    // -----------------------------------------------------------------------
+    // Must be created BEFORE depth connections so we can wait for the first
+    // index LTP before selecting ATM strikes. The spot price updater subscribes
+    // to the tick broadcast and extracts index LTPs.
+    let shared_spot_prices = tickvault_core::instrument::depth_rebalancer::new_shared_spot_prices();
+    let spot_prices_for_depth = std::sync::Arc::clone(&shared_spot_prices);
+    if should_connect_ws {
+        let spot_prices_updater = std::sync::Arc::clone(&shared_spot_prices);
+        let mut spot_rx = tick_broadcast_sender.subscribe();
+        tokio::spawn(async move {
+            loop {
+                match spot_rx.recv().await {
+                    Ok(tick) => {
+                        // IDX_I segment code = 0 — index ticks carry the spot price
+                        if tick.exchange_segment_code == 0
+                            && tick.last_traded_price > 0.0
+                            && tick.last_traded_price.is_finite()
+                        {
+                            let symbol = match tick.security_id {
+                                13 => Some("NIFTY"),
+                                25 => Some("BANKNIFTY"),
+                                27 => Some("FINNIFTY"),
+                                442 => Some("MIDCPNIFTY"),
+                                _ => None,
+                            };
+                            if let Some(sym) = symbol {
+                                tickvault_core::instrument::depth_rebalancer::update_spot_price(
+                                    &spot_prices_updater,
+                                    sym,
+                                    f64::from(tick.last_traded_price),
+                                )
+                                .await;
+                            }
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+        info!("spot price updater started — capturing index LTPs for depth ATM selection");
+    }
+
+    // -----------------------------------------------------------------------
     // Step 8c: Spawn 20-level + 200-level depth WebSocket connections
     // -----------------------------------------------------------------------
-    // 20-level: 4 connections (NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY), 50 instruments each
-    // 200-level: 4 connections, 1 ATM instrument each
+    // 20-level: 4 connections (NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY), 49 instruments each
+    //   = ATM + 24 CE above + 24 PE below (nearest expiry only)
+    // 200-level: 2 underlyings (NIFTY, BANKNIFTY), 1 ATM CE + 1 ATM PE each
+    //   (nearest expiry only)
     // NSE only — BSE (SENSEX) depth not supported by Dhan depth endpoint.
     // SENSEX gets 5-level depth from main Live Market Feed.
     // O(1) EXEMPT: begin — boot-time depth connection setup
     if should_connect_ws && config.subscription.enable_twenty_depth {
-        if let Some(ref plan) = subscription_plan {
+        if let Some(ref _plan) = subscription_plan {
             let depth_underlyings = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"];
 
+            // Wait for the first index LTP before selecting depth strikes.
+            // Without a real spot price, we cannot determine ATM. The main
+            // WebSocket feed streams index LTPs continuously — we poll the
+            // SharedSpotPrices map every 500ms up to 30 seconds.
+            {
+                let wait_start = std::time::Instant::now();
+                let max_wait = std::time::Duration::from_secs(30); // APPROVED: boot-time wait
+                let poll_interval = std::time::Duration::from_millis(500); // APPROVED: boot-time poll
+                loop {
+                    let prices = spot_prices_for_depth.read().await;
+                    let have_nifty = prices.contains_key("NIFTY");
+                    let have_banknifty = prices.contains_key("BANKNIFTY");
+                    drop(prices);
+                    if have_nifty && have_banknifty {
+                        info!(
+                            "depth ATM: received NIFTY + BANKNIFTY index LTPs — proceeding with depth setup"
+                        );
+                        break;
+                    }
+                    if wait_start.elapsed() >= max_wait {
+                        warn!(
+                            "depth ATM: timed out waiting for index LTPs (30s) — using median strike fallback"
+                        );
+                        break;
+                    }
+                    tokio::time::sleep(poll_interval).await;
+                }
+            }
+
+            // Read current spot prices for ATM calculation.
+            let spot_snapshot: std::collections::HashMap<String, f64> = {
+                let prices = spot_prices_for_depth.read().await;
+                prices.clone() // O(1) EXEMPT: 4 entries max
+            };
+
+            // Build FnoUniverse reference for select_depth_instruments.
+            let depth_universe: Option<&tickvault_common::instrument_types::FnoUniverse> =
+                slow_boot_universe.as_ref();
+
+            let today = chrono::Utc::now()
+                .with_timezone(
+                    &chrono::FixedOffset::east_opt(19800).expect("IST offset"), // APPROVED: compile-time literal
+                )
+                .date_naive();
+
+            // Use select_depth_instruments for ATM ± 24 selection when universe + spot prices available.
+            // Falls back to nearest-expiry median when spot price unavailable.
+            let depth_selections: Vec<
+                tickvault_core::instrument::depth_strike_selector::DepthStrikeSelection,
+            > = if let Some(universe) = depth_universe {
+                let ul_refs: Vec<&str> = depth_underlyings.iter().copied().collect();
+                tickvault_core::instrument::depth_strike_selector::select_depth_instruments(
+                    universe,
+                    &ul_refs,
+                    &spot_snapshot,
+                    today,
+                    tickvault_core::instrument::depth_strike_selector::DEPTH_ATM_STRIKES_EACH_SIDE,
+                )
+            } else {
+                Vec::new()
+            };
+
+            // Log PROOF of ATM selection for every underlying.
+            for sel in &depth_selections {
+                info!(
+                    underlying = %sel.underlying_symbol,
+                    atm_strike = sel.atm_strike,
+                    expiry = %sel.expiry_date,
+                    calls = sel.call_security_ids.len(),
+                    puts = sel.put_security_ids.len(),
+                    total = sel.all_security_ids.len(),
+                    spot = spot_snapshot.get(&sel.underlying_symbol).copied().unwrap_or(0.0),
+                    "PROOF: depth ATM selection — nearest expiry {}, ATM strike {}, {} CE + {} PE = {} instruments",
+                    sel.expiry_date, sel.atm_strike,
+                    sel.call_security_ids.len(), sel.put_security_ids.len(), sel.all_security_ids.len()
+                );
+            }
+
             for underlying in &depth_underlyings {
-                // Collect NSE_FNO instruments for this underlying, sorted by
-                // nearest expiry first so the 20-level subscription gets
-                // current-month contracts (not arbitrary far-expiry strikes
-                // from unordered HashMap iteration).
-                let mut candidates: Vec<_> = plan
-                    .registry
+                // Look up the ATM selection for this underlying.
+                let selection = depth_selections
                     .iter()
-                    .filter(|inst| {
-                        inst.exchange_segment == tickvault_common::types::ExchangeSegment::NseFno
-                            && inst.underlying_symbol == *underlying
-                    })
-                    .collect();
-                candidates.sort_by(|a, b| {
-                    a.expiry_date.cmp(&b.expiry_date).then_with(|| {
-                        a.strike_price
-                            .partial_cmp(&b.strike_price)
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    })
-                });
+                    .find(|s| s.underlying_symbol == *underlying);
+
+                // Build 20-level instrument list from ATM ± 24 selection.
                 let instruments_for_underlying: Vec<
                     tickvault_core::websocket::types::InstrumentSubscription,
-                > = candidates
-                    .into_iter()
-                    .take(config.subscription.twenty_depth_max_instruments)
-                    .map(|inst| {
-                        tickvault_core::websocket::types::InstrumentSubscription::new(
-                            inst.exchange_segment,
-                            inst.security_id,
-                        )
-                    })
-                    .collect();
+                > = if let Some(sel) = selection {
+                    sel.all_security_ids
+                        .iter()
+                        .take(config.subscription.twenty_depth_max_instruments)
+                        .map(|&sid| {
+                            tickvault_core::websocket::types::InstrumentSubscription::new(
+                                tickvault_common::types::ExchangeSegment::NseFno,
+                                sid,
+                            )
+                        })
+                        .collect()
+                } else {
+                    warn!(
+                        underlying,
+                        "depth: no ATM selection available — no spot price or no option chain"
+                    );
+                    Vec::new()
+                };
 
                 if instruments_for_underlying.is_empty() {
                     info!(
                         underlying,
-                        "20-level depth: no instruments found — skipping"
+                        "20-level depth: no instruments selected — skipping"
                     );
                     continue;
                 }
 
-                // Extract ATM CE + ATM PE security_ids + precise contract labels for 200-level depth.
-                // 200-level = 1 instrument per connection. We need BOTH CE and PE for full
-                // order book visibility. Dhan confirmed: must use ATM strikes (Ticket #5519522).
-                //
-                // Labels are built as `{UNDERLYING}-{MmmYYYY}-{Strike}-{CE|PE}` (e.g.
-                // `MAXHEALTH-Apr2026-660-CE`) so every log line and Telegram alert carries
-                // the PRECISE contract — the user can quote it verbatim to Dhan support
-                // without any ambiguity (200-depth is 1 instrument per connection, so a
-                // generic "NIFTY-ATM-CE" label would hide which expiry and strike actually
-                // stalled).
-                // O(1) EXEMPT: boot-time registry scan for ATM CE + PE
-                let (atm_ce, atm_pe): (Option<(u32, String)>, Option<(u32, String)>) = {
-                    // Find the nearest expiry and median strike for this underlying.
-                    // Registry iteration is unordered (HashMap), so we MUST sort
-                    // explicitly. Previous code used .first() which picked an
-                    // arbitrary instrument (e.g. NIFTY Dec2027 4500 instead of
-                    // current-month ATM).
-                    let today = chrono::Utc::now()
-                        .with_timezone(&chrono::FixedOffset::east_opt(19800).expect("IST offset")) // APPROVED: compile-time literal
-                        .date_naive();
-
-                    // Step 1: Find the nearest expiry >= today for this underlying.
-                    let nearest_expiry: Option<chrono::NaiveDate> = plan
-                        .registry
-                        .iter()
-                        .filter(|r| {
-                            r.underlying_symbol == *underlying
-                                && r.exchange_segment
-                                    == tickvault_common::types::ExchangeSegment::NseFno
-                                && r.expiry_date.is_some_and(|e| e >= today)
-                                && r.strike_price.is_some()
-                        })
-                        .filter_map(|r| r.expiry_date)
-                        .min();
-
-                    // Step 2: Collect all call strikes at that expiry, find median as ATM proxy.
-                    let atm_info: Option<(f64, chrono::NaiveDate)> =
-                        nearest_expiry.and_then(|expiry| {
-                            let mut strikes: Vec<f64> = plan
-                                .registry
-                                .iter()
-                                .filter(|r| {
-                                    r.underlying_symbol == *underlying
-                                        && r.exchange_segment
-                                            == tickvault_common::types::ExchangeSegment::NseFno
-                                        && r.expiry_date == Some(expiry)
-                                        && r.option_type
-                                            == Some(tickvault_common::types::OptionType::Call)
-                                        && r.strike_price.is_some()
-                                })
-                                .filter_map(|r| r.strike_price)
-                                .collect();
-                            strikes.sort_by(|a, b| {
-                                a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-                            });
-                            if strikes.is_empty() {
-                                return None;
-                            }
-                            let median_strike = strikes[strikes.len() / 2];
-                            Some((median_strike, expiry))
-                        });
-
-                    // Build a precise contract label from registry fields.
-                    // Format: `MAXHEALTH-Apr2026-660-CE` — underlying + Mmm YYYY expiry + strike + side.
-                    fn build_precise_label(
-                        underlying: &str,
-                        expiry: chrono::NaiveDate,
-                        strike: f64,
-                        side: &str,
-                    ) -> String {
-                        let strike_str = if (strike.fract()).abs() < 0.0001 {
+                // Extract ATM CE + ATM PE for 200-level depth.
+                // 200-level = 1 instrument per connection (nearest expiry, exact ATM only).
+                // O(1) EXEMPT: boot-time ATM lookup
+                fn build_precise_label(
+                    underlying: &str,
+                    expiry: chrono::NaiveDate,
+                    strike: f64,
+                    side: &str,
+                ) -> String {
+                    let strike_str = if (strike.fract()).abs() < 0.0001 {
+                        #[allow(clippy::cast_possible_truncation)]
+                        // APPROVED: strike prices fit i64
+                        {
                             format!("{}", strike as i64)
-                        } else {
-                            format!("{strike}")
-                        };
-                        format!("{underlying}-{}-{strike_str}-{side}", expiry.format("%b%Y"))
-                    }
-
-                    match atm_info {
-                        Some((strike, expiry)) => {
-                            // Find CE and PE at this strike AND expiry (prevents wrong-expiry match)
-                            let ce = plan.registry.iter().find(|r| {
-                                r.underlying_symbol == *underlying
-                                    && r.exchange_segment
-                                        == tickvault_common::types::ExchangeSegment::NseFno
-                                    && r.option_type
-                                        == Some(tickvault_common::types::OptionType::Call)
-                                    && r.strike_price.is_some_and(|sp| (sp - strike).abs() < 0.01)
-                                    && r.expiry_date == Some(expiry)
-                            });
-                            let pe = plan.registry.iter().find(|r| {
-                                r.underlying_symbol == *underlying
-                                    && r.exchange_segment
-                                        == tickvault_common::types::ExchangeSegment::NseFno
-                                    && r.option_type
-                                        == Some(tickvault_common::types::OptionType::Put)
-                                    && r.strike_price.is_some_and(|sp| (sp - strike).abs() < 0.01)
-                                    && r.expiry_date == Some(expiry)
-                            });
-                            let ce_out = ce.map(|r| {
-                                (
-                                    r.security_id,
-                                    build_precise_label(underlying, expiry, strike, "CE"),
-                                )
-                            });
-                            let pe_out = pe.map(|r| {
-                                (
-                                    r.security_id,
-                                    build_precise_label(underlying, expiry, strike, "PE"),
-                                )
-                            });
-                            (ce_out, pe_out)
                         }
-                        None => (None, None),
-                    }
-                };
+                    } else {
+                        format!("{strike}")
+                    };
+                    format!("{underlying}-{}-{strike_str}-{side}", expiry.format("%b%Y"))
+                }
+
+                let (atm_ce, atm_pe): (Option<(u32, String)>, Option<(u32, String)>) =
+                    if let Some(sel) = selection {
+                        // ATM CE = first call in selection (ATM index), PE = first put
+                        let ce = sel.call_security_ids.first().map(|&sid| {
+                            (
+                                sid,
+                                build_precise_label(
+                                    underlying,
+                                    sel.expiry_date,
+                                    sel.atm_strike,
+                                    "CE",
+                                ),
+                            )
+                        });
+                        let pe = sel.put_security_ids.first().map(|&sid| {
+                            (
+                                sid,
+                                build_precise_label(
+                                    underlying,
+                                    sel.expiry_date,
+                                    sel.atm_strike,
+                                    "PE",
+                                ),
+                            )
+                        });
+                        (ce, pe)
+                    } else {
+                        (None, None)
+                    };
                 let atm_ce_sid = atm_ce.as_ref().map(|(sid, _)| *sid);
                 let atm_pe_sid = atm_pe.as_ref().map(|(sid, _)| *sid);
 
@@ -2380,45 +2434,9 @@ async fn main() -> Result<()> {
             });
 
         if let Some(universe_arc) = rebalancer_universe {
-            // SharedSpotPrices: updated by a tick broadcast subscriber, read by rebalancer
-            let spot_prices =
-                tickvault_core::instrument::depth_rebalancer::new_shared_spot_prices();
-            let spot_prices_updater = std::sync::Arc::clone(&spot_prices);
-
-            // Spawn spot price updater: subscribes to tick broadcast, extracts index LTPs
-            let mut spot_rx = tick_broadcast_sender.subscribe();
-            tokio::spawn(async move {
-                loop {
-                    match spot_rx.recv().await {
-                        Ok(tick) => {
-                            // IDX_I segment code = 0 — these are index ticks (NIFTY, BANKNIFTY, etc.)
-                            if tick.exchange_segment_code == 0
-                                && tick.last_traded_price > 0.0
-                                && tick.last_traded_price.is_finite()
-                            {
-                                // Look up symbol from security_id via the plan registry
-                                // For indices, we use a simple mapping from the known security IDs
-                                let symbol = match tick.security_id {
-                                    13 => Some("NIFTY"),
-                                    25 => Some("BANKNIFTY"),
-                                    27 => Some("FINNIFTY"),
-                                    442 => Some("MIDCPNIFTY"),
-                                    _ => None,
-                                };
-                                if let Some(sym) = symbol {
-                                    tickvault_core::instrument::depth_rebalancer::update_spot_price(
-                                            &spot_prices_updater,
-                                            sym,
-                                            f64::from(tick.last_traded_price),
-                                        ).await;
-                                }
-                            }
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    }
-                }
-            });
+            // Reuse the SharedSpotPrices created in Step 8c.0 — the spot price
+            // updater is already running and updating it with live index LTPs.
+            let spot_prices = std::sync::Arc::clone(&shared_spot_prices);
 
             // Rebalance event channel (watch — latest-value semantics)
             let (rebalance_tx, mut rebalance_rx) = tokio::sync::watch::channel::<

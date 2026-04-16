@@ -545,12 +545,13 @@ pub struct SubscriptionConfig {
     pub enable_twenty_depth: bool,
 
     /// Maximum instruments to subscribe on the 20-level depth feed (max 50 per connection).
+    /// Default 49 = ATM + 24 CE above + 24 PE below.
     #[serde(default = "default_twenty_depth_max_instruments")]
     pub twenty_depth_max_instruments: usize,
 }
 
 fn default_twenty_depth_max_instruments() -> usize {
-    50
+    49
 }
 
 impl Default for SubscriptionConfig {
@@ -565,7 +566,7 @@ impl Default for SubscriptionConfig {
             stock_atm_strikes_below: 10,
             stock_default_atm_fallback_enabled: true,
             enable_twenty_depth: false,
-            twenty_depth_max_instruments: 50,
+            twenty_depth_max_instruments: 49,
         }
     }
 }
@@ -2012,12 +2013,13 @@ mod tests {
     #[test]
     fn test_subscription_config_default_depth_max_instruments() {
         let config = SubscriptionConfig::default();
-        assert_eq!(config.twenty_depth_max_instruments, 50);
+        assert_eq!(config.twenty_depth_max_instruments, 49);
     }
 
     #[test]
     fn test_subscription_config_depth_max_instruments_matches_dhan_limit() {
         // Dhan docs: max 50 instruments per 20-level depth connection
+        // We use 49 = ATM + 24 CE above + 24 PE below
         let config = SubscriptionConfig::default();
         assert!(config.twenty_depth_max_instruments <= 50);
     }
@@ -2035,7 +2037,7 @@ mod tests {
         assert!(config.stock_default_atm_fallback_enabled);
         // Depth fields
         assert!(!config.enable_twenty_depth);
-        assert_eq!(config.twenty_depth_max_instruments, 50);
+        assert_eq!(config.twenty_depth_max_instruments, 49);
     }
 
     #[test]
