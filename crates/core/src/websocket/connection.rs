@@ -940,6 +940,31 @@ impl WebSocketConnection {
             return false;
         }
 
+        // Post-market guard: if current IST time is outside [09:00, 15:30) AND
+        // we've had 3+ consecutive failures, stop reconnecting. During market
+        // hours, Dhan streams data + pings every 10s, so consecutive failures
+        // mean a real problem worth retrying. After market close, silence is
+        // EXPECTED — retrying just spams Telegram with disconnect/reconnect.
+        if attempt >= 3 {
+            let now_utc_secs = chrono::Utc::now().timestamp();
+            let now_ist_secs_of_day = (now_utc_secs.saturating_add(i64::from(
+                tickvault_common::constants::IST_UTC_OFFSET_SECONDS,
+            )))
+            .rem_euclid(86400) as u32;
+            let outside_market = now_ist_secs_of_day
+                < tickvault_common::constants::TICK_PERSIST_START_SECS_OF_DAY_IST
+                || now_ist_secs_of_day
+                    >= tickvault_common::constants::TICK_PERSIST_END_SECS_OF_DAY_IST;
+            if outside_market {
+                info!(
+                    connection_id = self.connection_id,
+                    attempt,
+                    "Post-market: stopping reconnect after {attempt} failures — market is closed, reconnect is pointless"
+                );
+                return false;
+            }
+        }
+
         // CRITICAL alert every 10 consecutive failures (triggers Telegram).
         if attempt.is_multiple_of(10) {
             error!(
