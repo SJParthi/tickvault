@@ -530,25 +530,36 @@ async def run_all_tests():
         f"NUMERIC segment (2) instead of string — {label}"
     )
 
-    # Test 4: Dhan's exact Python SDK script (their recommended approach)
+    # Test 4: Dhan's EXACT SecurityId 63424 from their email (NIFTY 21 APR 24150 CALL)
+    dhan_sid = "63424"
+    await asyncio.sleep(2)
+    dhan_sid_ok = await test_200_depth(
+        "wss://full-depth-api.dhan.co/",
+        client_id, access_token, dhan_sid,
+        f"Dhan's exact SID {dhan_sid} (NIFTY 21 APR 24150 CALL) on root path"
+    )
+
+    # Test 5: Dhan's exact Python SDK script (their recommended approach)
     await asyncio.sleep(2)
     sdk_ok = await test_dhan_sdk(client_id, access_token, security_id, label)
 
     print(f"\n{'='*70}")
-    print(f"FINAL SUMMARY (all 4 tests)")
+    print(f"FINAL SUMMARY (all 5 tests)")
     print(f"{'='*70}")
-    print(f"Security ID tested:     {security_id} ({label})")
+    print(f"ATM SecurityId:         {security_id} ({label})")
+    print(f"Dhan's SecurityId:      {dhan_sid} (NIFTY 21 APR 24150 CALL)")
     if spot_ltp:
         print(f"NIFTY Spot at test:     {spot_ltp}")
-    print(f"1. Root path (/)             : {'WORKS' if root_ok else 'FAILED'}")
-    print(f"2. /twohundreddepth          : {'WORKS' if explicit_ok else 'FAILED'}")
-    print(f"3. Numeric segment (2)       : {'WORKS' if numeric_ok else 'FAILED'}")
-    print(f"4. Dhan Python SDK v2.2.0    : {'WORKS' if sdk_ok else 'FAILED'}")
+    print(f"1. Root path (/) + ATM SID       : {'WORKS' if root_ok else 'FAILED'}")
+    print(f"2. /twohundreddepth + ATM SID    : {'WORKS' if explicit_ok else 'FAILED'}")
+    print(f"3. Numeric segment (2) + ATM SID : {'WORKS' if numeric_ok else 'FAILED'}")
+    print(f"4. Root path + Dhan's SID {dhan_sid}  : {'WORKS' if dhan_sid_ok else 'FAILED'}")
+    print(f"5. Dhan Python SDK v2.2.0rc1     : {'WORKS' if sdk_ok else 'FAILED'}")
 
-    if not root_ok and not explicit_ok and not numeric_ok and not sdk_ok:
-        print(f"\nALL 4 TESTS FAILED — 200-level depth is NOT working on account {client_id}.")
-        print(f"Tested: both URLs, string + numeric segment, Dhan's own SDK.")
-        print(f"SecurityId: {security_id} (live ATM, not stale).")
+    all_failed = not root_ok and not explicit_ok and not numeric_ok and not dhan_sid_ok and not sdk_ok
+    if all_failed:
+        print(f"\nALL 5 TESTS FAILED — 200-level depth is NOT working on account {client_id}.")
+        print(f"Tested: both URLs, string + numeric segment, Dhan's own SID, Dhan's own SDK.")
         print(f"Please enable 200-level Full Market Depth on this account.")
 
     print(f"\nCopy this ENTIRE output and share with Dhan support.")
