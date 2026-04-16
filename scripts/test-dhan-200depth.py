@@ -1,0 +1,258 @@
+#!/usr/bin/env python3
+"""
+Dhan 200-Level Full Market Depth — Diagnostic Test Script
+==========================================================
+
+Tests BOTH URL paths (root `/` and `/twohundreddepth`) to determine which
+one actually works on your account. Logs the exact WebSocket URL, subscription
+JSON, and server response for debugging.
+
+Usage:
+    # Option 1: Pass token from the running app's token cache
+    python3 scripts/test-dhan-200depth.py
+
+    # Option 2: Pass token explicitly
+    DHAN_ACCESS_TOKEN="eyJ..." DHAN_CLIENT_ID="1106656882" python3 scripts/test-dhan-200depth.py
+
+    # Option 3: Use a specific SecurityId
+    DHAN_SECURITY_ID="63424" python3 scripts/test-dhan-200depth.py
+
+Prerequisites:
+    pip install dhanhq==2.2.0rc1
+
+What this script does:
+    1. Reads token from token cache file OR environment variable
+    2. Tests 200-level depth with ROOT PATH (/) — what Python SDK uses
+    3. Tests 200-level depth with /twohundreddepth — what Dhan support recommended
+    4. Prints exact URL, subscription JSON, and result for each test
+    5. If either works, captures the first few depth frames as proof
+
+Ticket: #5519522 (third consecutive day of TCP resets)
+"""
+
+import asyncio
+import json
+import os
+import struct
+import sys
+import time
+
+try:
+    import websockets
+except ImportError:
+    print("ERROR: websockets not installed. Run: pip install websockets")
+    sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+# Read from env or token cache file
+TOKEN_CACHE_PATH = "data/cache/tv-token-cache"
+
+def load_credentials():
+    """Load credentials from env vars or token cache file."""
+    client_id = os.environ.get("DHAN_CLIENT_ID", "")
+    access_token = os.environ.get("DHAN_ACCESS_TOKEN", "")
+
+    if client_id and access_token:
+        print(f"[OK] Credentials from environment variables (client_id={client_id})")
+        return client_id, access_token
+
+    # Try token cache file
+    if os.path.exists(TOKEN_CACHE_PATH):
+        try:
+            with open(TOKEN_CACHE_PATH, "r") as f:
+                cache = json.load(f)
+            access_token = cache.get("access_token", "")
+            client_id = cache.get("client_id", "")
+            if access_token and client_id:
+                print(f"[OK] Credentials from token cache ({TOKEN_CACHE_PATH})")
+                print(f"     client_id={client_id}, token={access_token[:20]}...{access_token[-10:]}")
+                return client_id, access_token
+        except Exception as e:
+            print(f"[WARN] Failed to read token cache: {e}")
+
+    print("ERROR: No credentials found.")
+    print("Set DHAN_ACCESS_TOKEN and DHAN_CLIENT_ID environment variables,")
+    print("or ensure the app has written data/cache/tv-token-cache.")
+    sys.exit(1)
+
+
+# Default: NIFTY ATM CE — use the SecurityId from Dhan's email or override via env
+SECURITY_ID = os.environ.get("DHAN_SECURITY_ID", "63424")
+EXCHANGE_SEGMENT = "NSE_FNO"  # String, not numeric — confirmed by SDK comparison
+
+
+# ---------------------------------------------------------------------------
+# Test Functions
+# ---------------------------------------------------------------------------
+
+async def test_200_depth(url_base, client_id, access_token, label):
+    """
+    Test a 200-level depth WebSocket connection.
+    Returns True if frames were received, False otherwise.
+    """
+    url = f"{url_base}?token={access_token}&clientId={client_id}&authType=2"
+
+    # Redact token in log
+    safe_url = url.replace(access_token, f"{access_token[:8]}...REDACTED")
+    print(f"\n{'='*70}")
+    print(f"TEST: {label}")
+    print(f"{'='*70}")
+    print(f"URL:  {safe_url}")
+
+    subscribe_msg = json.dumps({
+        "RequestCode": 23,
+        "ExchangeSegment": EXCHANGE_SEGMENT,
+        "SecurityId": SECURITY_ID,
+    })
+    print(f"SUB:  {subscribe_msg}")
+    print(f"SID:  {SECURITY_ID} (segment: {EXCHANGE_SEGMENT})")
+
+    try:
+        print(f"[...] Connecting...")
+        ws = await asyncio.wait_for(
+            websockets.connect(url),
+            timeout=10.0,
+        )
+        print(f"[OK]  WebSocket connected!")
+
+        # Send subscription
+        await ws.send(subscribe_msg)
+        print(f"[OK]  Subscription sent")
+
+        # Wait for frames (up to 15 seconds)
+        frames_received = 0
+        start = time.time()
+        timeout_secs = 15
+
+        print(f"[...] Waiting for binary depth frames (up to {timeout_secs}s)...")
+
+        while time.time() - start < timeout_secs:
+            try:
+                data = await asyncio.wait_for(ws.recv(), timeout=5.0)
+
+                if isinstance(data, bytes):
+                    frames_received += 1
+                    # Parse the 12-byte header
+                    if len(data) >= 12:
+                        header = struct.unpack('<hBBiI', data[0:12])
+                        msg_len = header[0]
+                        response_code = header[1]
+                        exchange_seg = header[2]
+                        sec_id = header[3]
+                        rows_or_seq = header[4]
+
+                        code_name = {41: "BID", 51: "ASK", 50: "DISCONNECT"}.get(response_code, f"UNKNOWN({response_code})")
+                        print(f"[FRAME #{frames_received}] code={code_name} seg={exchange_seg} sid={sec_id} "
+                              f"len={msg_len} rows/seq={rows_or_seq} raw_bytes={len(data)}")
+
+                        if response_code == 50:
+                            # Disconnect packet
+                            if len(data) >= 14:
+                                reason = struct.unpack('<H', data[12:14])[0]
+                                print(f"[DISCONNECT] Reason code: {reason}")
+                            else:
+                                print(f"[DISCONNECT] No reason code (only {len(data)} bytes)")
+                            break
+
+                        # If we got 3+ real frames, that's proof it works
+                        if frames_received >= 4:
+                            print(f"\n[SUCCESS] Received {frames_received} depth frames!")
+                            await ws.close()
+                            return True
+                    else:
+                        print(f"[FRAME #{frames_received}] raw_bytes={len(data)} (too short for header)")
+
+                elif isinstance(data, str):
+                    print(f"[TEXT] {data[:200]}")
+
+            except asyncio.TimeoutError:
+                elapsed = time.time() - start
+                print(f"[...] No frame in 5s (elapsed: {elapsed:.1f}s, frames so far: {frames_received})")
+
+        elapsed = time.time() - start
+        if frames_received > 0:
+            print(f"\n[PARTIAL] {frames_received} frames in {elapsed:.1f}s")
+            await ws.close()
+            return frames_received > 0
+        else:
+            print(f"\n[FAIL] Zero frames received in {elapsed:.1f}s")
+            await ws.close()
+            return False
+
+    except asyncio.TimeoutError:
+        print(f"[FAIL] Connection timed out (10s)")
+        return False
+    except websockets.exceptions.ConnectionClosedError as e:
+        print(f"[FAIL] Connection closed: {e}")
+        return False
+    except Exception as e:
+        error_str = str(e)
+        if "ResetWithoutClosingHandshake" in error_str or "reset" in error_str.lower():
+            print(f"[FAIL] TCP RESET — Protocol(ResetWithoutClosingHandshake)")
+            print(f"       Server actively rejected this connection.")
+        else:
+            print(f"[FAIL] {type(e).__name__}: {e}")
+        return False
+
+
+async def run_all_tests():
+    """Run tests on both URL paths."""
+    client_id, access_token = load_credentials()
+
+    print(f"\nDhan 200-Level Depth Diagnostic")
+    print(f"Client ID:   {client_id}")
+    print(f"Security ID: {SECURITY_ID}")
+    print(f"Segment:     {EXCHANGE_SEGMENT}")
+    print(f"Timestamp:   {time.strftime('%Y-%m-%d %H:%M:%S IST')}")
+
+    # Test 1: Root path (what Python SDK uses)
+    root_ok = await test_200_depth(
+        "wss://full-depth-api.dhan.co/",
+        client_id, access_token,
+        "ROOT PATH (/) — Python SDK default"
+    )
+
+    # Small delay between tests
+    await asyncio.sleep(2)
+
+    # Test 2: /twohundreddepth (what Dhan support recommended in Ticket #5519522)
+    explicit_ok = await test_200_depth(
+        "wss://full-depth-api.dhan.co/twohundreddepth",
+        client_id, access_token,
+        "/twohundreddepth — Dhan support Ticket #5519522"
+    )
+
+    # Summary
+    print(f"\n{'='*70}")
+    print(f"SUMMARY")
+    print(f"{'='*70}")
+    print(f"Root path (/)           : {'WORKS' if root_ok else 'FAILED'}")
+    print(f"/twohundreddepth        : {'WORKS' if explicit_ok else 'FAILED'}")
+
+    if root_ok and not explicit_ok:
+        print(f"\nRECOMMENDATION: Switch to root path (/)")
+        print(f"Dhan support gave wrong advice on Ticket #5519522.")
+        print(f"Their own Python SDK v2.2.0rc1 uses root path and it works.")
+    elif explicit_ok and not root_ok:
+        print(f"\nRECOMMENDATION: Keep /twohundreddepth (current)")
+        print(f"Dhan support was correct — /twohundreddepth is the right path.")
+    elif root_ok and explicit_ok:
+        print(f"\nBOTH WORK — keep /twohundreddepth (more explicit)")
+    else:
+        print(f"\nBOTH FAILED — issue is NOT the URL path.")
+        print(f"Likely account-level feature flag or server-side issue.")
+        print(f"Escalate to Dhan with this diagnostic output.")
+
+    print(f"\nCopy this output and share with Dhan support if needed.")
+
+
+# ---------------------------------------------------------------------------
+# Entry Point
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    asyncio.run(run_all_tests())
