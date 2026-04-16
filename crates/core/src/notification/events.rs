@@ -560,7 +560,7 @@ impl NotificationEvent {
                 candles_compared,
             } => {
                 format!(
-                    "<b>Historical vs Live cross-match OK</b>\nTimeframes: {timeframes_checked} | Candles compared: {candles_compared}\nAll OHLCV values match (epsilon tolerance, volume ±10%, OI ±10%)"
+                    "<b>Historical vs Live cross-match OK</b>\nTimeframes: {timeframes_checked} | Candles compared: {candles_compared}\nAll OHLCV values match exactly (zero tolerance, precision-verified)"
                 )
             }
             Self::CandleCrossMatchFailed {
