@@ -228,12 +228,14 @@ async def test_200_depth(url_base, client_id, access_token, security_id, label):
         await ws.send(subscribe_msg)
         print(f"[OK]  Subscription sent")
 
-        # Wait for frames (up to 15 seconds)
+        # Wait for frames — Dhan server pings every 10s, closes at 40s.
+        # websockets library auto-responds to pings (RFC 6455 compliant).
+        # We wait 60s to survive multiple ping/pong cycles before declaring failure.
         frames_received = 0
         start = time.time()
-        timeout_secs = 15
+        timeout_secs = 60
 
-        print(f"[...] Waiting for binary depth frames (up to {timeout_secs}s)...")
+        print(f"[...] Waiting for depth frames (up to {timeout_secs}s, ping/pong handled by library)...")
 
         while time.time() - start < timeout_secs:
             try:
