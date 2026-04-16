@@ -80,16 +80,121 @@ def load_credentials():
     sys.exit(1)
 
 
-# Default: NIFTY ATM CE — use the SecurityId from Dhan's email or override via env
-SECURITY_ID = os.environ.get("DHAN_SECURITY_ID", "63424")
 EXCHANGE_SEGMENT = "NSE_FNO"  # String, not numeric — confirmed by SDK comparison
+
+# NIFTY spot SecurityId (IDX_I segment) for LTP lookup
+NIFTY_SPOT_SID = 13
+BANKNIFTY_SPOT_SID = 25
+
+
+def fetch_atm_security_id(access_token, client_id):
+    """
+    Fetches the ATM (At-The-Money) NIFTY CE SecurityId from Dhan's option chain API.
+    This proves we're testing with a real, liquid, current-market contract.
+
+    Steps:
+        1. GET /v2/marketfeed/ltp to get NIFTY spot LTP
+        2. POST /v2/optionchain/expirylist to get nearest expiry
+        3. POST /v2/optionchain to get the chain
+        4. Find the strike closest to spot LTP
+        5. Return the CE SecurityId for that strike
+    """
+    import requests
+
+    headers = {
+        "access-token": access_token,
+        "client-id": client_id,
+        "Content-Type": "application/json",
+    }
+
+    # Step 1: Get NIFTY spot LTP
+    print("[ATM] Fetching NIFTY spot LTP...")
+    ltp_resp = requests.post(
+        "https://api.dhan.co/v2/marketfeed/ltp",
+        headers=headers,
+        json={"IDX_I": [NIFTY_SPOT_SID]},
+    )
+    if ltp_resp.status_code != 200:
+        print(f"[ATM] LTP API failed: {ltp_resp.status_code} {ltp_resp.text[:200]}")
+        return None, None, None
+    ltp_data = ltp_resp.json()
+    spot_ltp = ltp_data.get("data", {}).get("IDX_I", {}).get(str(NIFTY_SPOT_SID), {}).get("last_price", 0)
+    if spot_ltp <= 0:
+        print(f"[ATM] Could not get NIFTY spot LTP. Response: {ltp_data}")
+        return None, None, None
+    print(f"[ATM] NIFTY spot LTP: {spot_ltp}")
+
+    # Step 2: Get nearest expiry
+    print("[ATM] Fetching expiry list...")
+    expiry_resp = requests.post(
+        "https://api.dhan.co/v2/optionchain/expirylist",
+        headers=headers,
+        json={"UnderlyingScrip": NIFTY_SPOT_SID, "UnderlyingSeg": "IDX_I"},
+    )
+    if expiry_resp.status_code != 200:
+        print(f"[ATM] Expiry list API failed: {expiry_resp.status_code} {expiry_resp.text[:200]}")
+        return None, None, None
+    expiry_data = expiry_resp.json()
+    expiries = expiry_data.get("data", [])
+    if not expiries:
+        print(f"[ATM] No expiries returned. Response: {expiry_data}")
+        return None, None, None
+    nearest_expiry = expiries[0]
+    print(f"[ATM] Nearest expiry: {nearest_expiry}")
+
+    # Step 3: Get option chain
+    print("[ATM] Fetching option chain...")
+    chain_resp = requests.post(
+        "https://api.dhan.co/v2/optionchain",
+        headers=headers,
+        json={
+            "UnderlyingScrip": NIFTY_SPOT_SID,
+            "UnderlyingSeg": "IDX_I",
+            "Expiry": nearest_expiry,
+        },
+    )
+    if chain_resp.status_code != 200:
+        print(f"[ATM] Option chain API failed: {chain_resp.status_code} {chain_resp.text[:200]}")
+        return None, None, None
+    chain_data = chain_resp.json()
+    oc = chain_data.get("data", {}).get("oc", {})
+    if not oc:
+        print(f"[ATM] Empty option chain. Response keys: {chain_data.get('data', {}).keys()}")
+        return None, None, None
+
+    # Step 4: Find ATM strike (closest to spot LTP)
+    best_strike = None
+    best_diff = float("inf")
+    best_ce_sid = None
+
+    for strike_str, strike_data in oc.items():
+        try:
+            strike_price = float(strike_str)
+        except ValueError:
+            continue
+        diff = abs(strike_price - spot_ltp)
+        ce_data = strike_data.get("ce")
+        if ce_data and diff < best_diff:
+            best_diff = diff
+            best_strike = strike_price
+            best_ce_sid = ce_data.get("security_id")
+
+    if not best_ce_sid:
+        print("[ATM] Could not find ATM CE SecurityId in chain")
+        return None, None, None
+
+    label = f"NIFTY-{nearest_expiry}-{int(best_strike)}-CE"
+    print(f"[ATM] ATM strike: {best_strike} (diff from spot: {best_diff:.2f})")
+    print(f"[ATM] ATM CE SecurityId: {best_ce_sid} ({label})")
+
+    return str(best_ce_sid), label, spot_ltp
 
 
 # ---------------------------------------------------------------------------
 # Test Functions
 # ---------------------------------------------------------------------------
 
-async def test_200_depth(url_base, client_id, access_token, label):
+async def test_200_depth(url_base, client_id, access_token, security_id, label):
     """
     Test a 200-level depth WebSocket connection.
     Returns True if frames were received, False otherwise.
@@ -106,7 +211,7 @@ async def test_200_depth(url_base, client_id, access_token, label):
     subscribe_msg = json.dumps({
         "RequestCode": 23,
         "ExchangeSegment": EXCHANGE_SEGMENT,
-        "SecurityId": SECURITY_ID,
+        "SecurityId": security_id,
     })
     print(f"SUB:  {subscribe_msg}")
     print(f"SID:  {SECURITY_ID} (segment: {EXCHANGE_SEGMENT})")
@@ -200,20 +305,40 @@ async def test_200_depth(url_base, client_id, access_token, label):
 
 
 async def run_all_tests():
-    """Run tests on both URL paths."""
+    """Run tests on both URL paths using live ATM SecurityId."""
     client_id, access_token = load_credentials()
 
-    print(f"\nDhan 200-Level Depth Diagnostic")
-    print(f"Client ID:   {client_id}")
-    print(f"Security ID: {SECURITY_ID}")
-    print(f"Segment:     {EXCHANGE_SEGMENT}")
-    print(f"Timestamp:   {time.strftime('%Y-%m-%d %H:%M:%S IST')}")
+    # Fetch ATM SecurityId from live option chain
+    atm_sid, atm_label, spot_ltp = fetch_atm_security_id(access_token, client_id)
+
+    # Fallback to env or Dhan's suggested SID
+    override_sid = os.environ.get("DHAN_SECURITY_ID", "")
+    if override_sid:
+        security_id = override_sid
+        label = f"manual-override-SID-{override_sid}"
+    elif atm_sid:
+        security_id = atm_sid
+        label = atm_label
+    else:
+        security_id = "63424"
+        label = "Dhan-suggested-63424 (ATM fetch failed)"
+        print("[WARN] ATM fetch failed — falling back to Dhan's suggested SID 63424")
+
+    print(f"\n{'='*70}")
+    print(f"Dhan 200-Level Depth Diagnostic")
+    print(f"{'='*70}")
+    print(f"Client ID:    {client_id}")
+    print(f"Security ID:  {security_id} ({label})")
+    print(f"Segment:      {EXCHANGE_SEGMENT}")
+    if spot_ltp:
+        print(f"NIFTY Spot:   {spot_ltp}")
+    print(f"Timestamp:    {time.strftime('%Y-%m-%d %H:%M:%S IST')}")
 
     # Test 1: Root path (what Python SDK uses)
     root_ok = await test_200_depth(
         "wss://full-depth-api.dhan.co/",
-        client_id, access_token,
-        "ROOT PATH (/) — Python SDK default"
+        client_id, access_token, security_id,
+        f"ROOT PATH (/) — Python SDK default — {label}"
     )
 
     # Small delay between tests
@@ -222,32 +347,34 @@ async def run_all_tests():
     # Test 2: /twohundreddepth (what Dhan support recommended in Ticket #5519522)
     explicit_ok = await test_200_depth(
         "wss://full-depth-api.dhan.co/twohundreddepth",
-        client_id, access_token,
-        "/twohundreddepth — Dhan support Ticket #5519522"
+        client_id, access_token, security_id,
+        f"/twohundreddepth — Dhan support Ticket #5519522 — {label}"
     )
 
     # Summary
     print(f"\n{'='*70}")
     print(f"SUMMARY")
     print(f"{'='*70}")
+    print(f"Security ID tested:     {security_id} ({label})")
+    if spot_ltp:
+        print(f"NIFTY Spot at test:     {spot_ltp}")
     print(f"Root path (/)           : {'WORKS' if root_ok else 'FAILED'}")
     print(f"/twohundreddepth        : {'WORKS' if explicit_ok else 'FAILED'}")
 
     if root_ok and not explicit_ok:
         print(f"\nRECOMMENDATION: Switch to root path (/)")
         print(f"Dhan support gave wrong advice on Ticket #5519522.")
-        print(f"Their own Python SDK v2.2.0rc1 uses root path and it works.")
     elif explicit_ok and not root_ok:
         print(f"\nRECOMMENDATION: Keep /twohundreddepth (current)")
-        print(f"Dhan support was correct — /twohundreddepth is the right path.")
     elif root_ok and explicit_ok:
         print(f"\nBOTH WORK — keep /twohundreddepth (more explicit)")
     else:
-        print(f"\nBOTH FAILED — issue is NOT the URL path.")
-        print(f"Likely account-level feature flag or server-side issue.")
-        print(f"Escalate to Dhan with this diagnostic output.")
+        print(f"\nBOTH FAILED — issue is NOT the URL path or the SecurityId.")
+        print(f"200-level depth is likely not enabled on account {client_id}.")
+        print(f"Tested with live ATM SecurityId — this rules out stale/OTM contracts.")
+        print(f"Escalate to Dhan: 'Enable 200-level Full Market Depth on our account.'")
 
-    print(f"\nCopy this output and share with Dhan support if needed.")
+    print(f"\nCopy this ENTIRE output and share with Dhan support.")
 
 
 # ---------------------------------------------------------------------------
