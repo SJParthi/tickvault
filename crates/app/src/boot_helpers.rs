@@ -264,6 +264,8 @@ pub fn create_error_log_writer() -> Option<std::fs::File> {
 /// date descending, and removes files older than `max_files` days.
 /// Best-effort — errors are printed to stderr (tracing not yet initialized).
 ///
+// TEST-EXEMPT: cold-path boot function — runs once before tracing is initialized,
+// deletes old log files via std::fs. Best-effort, no side effects on failure.
 /// O(1) EXEMPT: cold path, runs once at boot before tracing is initialized.
 pub fn cleanup_old_log_files(log_dir: &str, prefix: &str, max_files: u32) {
     let dir = std::path::Path::new(log_dir);
