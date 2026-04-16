@@ -90,8 +90,38 @@ fn build_dedup_sql(table_name: &str, dedup_key: &str) -> String {
 }
 
 /// Builds the ILP TCP connection string from host and port.
+///
+/// **Used for the hot path only** (live tick/candle streaming). The TCP transport
+/// holds a persistent socket — efficient for continuous writes but vulnerable to
+/// broken-pipe between batches when QuestDB rotates/releases idle writers.
+/// The hot path compensates with a ring buffer + disk spill.
 fn build_ilp_conf_string(host: &str, ilp_port: u16) -> String {
     format!("tcp::addr={}:{};", host, ilp_port)
+}
+
+/// Builds the ILP **HTTP** connection string from host and HTTP port.
+///
+/// **Used for the cold/historical path** ([`CandlePersistenceWriter`]).
+///
+/// HTTP ILP is stateless: every `flush()` is a single transactional POST to
+/// QuestDB's `/write` endpoint. There is no persistent TCP socket between
+/// batches, which architecturally eliminates the "broken pipe after every
+/// successful flush" failure mode observed with TCP ILP on bursty cold-path
+/// workloads (historical candle backfill has natural pauses between REST calls
+/// to Dhan that cause QuestDB's line.tcp writer to release idle sockets).
+///
+/// Parameters:
+/// - `auto_flush=off` — we control batching explicitly via `CANDLE_FLUSH_BATCH_SIZE`.
+/// - `retry_timeout=30000` — HTTP sender retries transient 5xx / network errors
+///   for up to 30s internally, so callers rarely see transient failures.
+///
+/// Reference: QuestDB ILP transport comparison
+/// <https://questdb.io/docs/clients/ingest-rust/#transport-selection>.
+fn build_historical_ilp_conf_string(host: &str, http_port: u16) -> String {
+    format!(
+        "http::addr={}:{};auto_flush=off;retry_timeout=30000;",
+        host, http_port
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -116,7 +146,15 @@ pub struct CandlePersistenceWriter {
 }
 
 impl CandlePersistenceWriter {
-    /// Creates a new candle writer connected to QuestDB via ILP TCP.
+    /// Creates a new candle writer connected to QuestDB via **TCP ILP**.
+    ///
+    /// # Deprecated for production
+    /// Production code MUST use [`CandlePersistenceWriter::new_http`] instead.
+    /// TCP ILP is only retained here for the extensive unit-test suite, which
+    /// uses an in-process `TcpListener` drain server as a cheap fake. On the
+    /// real historical backfill workload (bursty writes with natural pauses
+    /// between Dhan REST calls), QuestDB `line.tcp` rotates idle sockets,
+    /// causing every subsequent batch to fail with `Broken pipe (os error 32)`.
     ///
     /// # Errors
     /// Returns error if the ILP connection cannot be established.
@@ -124,6 +162,55 @@ impl CandlePersistenceWriter {
         let conf_string = build_ilp_conf_string(&config.host, config.ilp_port);
         let sender =
             Sender::from_conf(&conf_string).context("failed to connect to QuestDB via ILP")?;
+        let buffer = sender.new_buffer();
+
+        Ok(Self {
+            sender: Some(sender),
+            buffer,
+            pending_count: 0,
+            ilp_conf_string: conf_string,
+        })
+    }
+
+    /// Creates a new historical candle writer connected to QuestDB via **HTTP ILP**.
+    ///
+    /// **This is the production constructor for the historical cold-path writer.**
+    ///
+    /// HTTP ILP is the correct transport for this workload: historical backfill
+    /// has natural pauses between Dhan REST calls, during which QuestDB's
+    /// `line.tcp` writer releases idle sockets. With TCP ILP, every subsequent
+    /// batch then fails with `Broken pipe (os error 32)` — the failure mode
+    /// observed in prod logs at 2026-04-15T19:42+ (every 500-row batch failed
+    /// immediately after a successful flush, forcing a reconnect storm). HTTP
+    /// ILP is stateless: each `flush()` is a single transactional POST to
+    /// QuestDB's `/write` endpoint, so there is no persistent socket that can
+    /// break between batches.
+    ///
+    /// Parameters baked into the conf string:
+    /// - `auto_flush=off` — we control batching via `CANDLE_FLUSH_BATCH_SIZE`.
+    /// - `retry_timeout=30000` — internal retries for transient 5xx / network
+    ///   errors, so callers rarely see transient failures surface through the API.
+    ///
+    /// # Errors
+    /// Returns error if the HTTP ILP connection cannot be established (invalid
+    /// host, DNS failure, TLS handshake failure, auth failure, etc.).
+    ///
+    /// # Testing
+    /// Thin wrapper over the pure helper `build_historical_ilp_conf_string`,
+    /// which is covered by 7 unit tests (http-not-tcp, docker defaults, custom
+    /// port, auto_flush=off, retry_timeout=30000, terminator, distinct-from-tcp).
+    /// The only non-helper line is `Sender::from_conf(conf)` which belongs to
+    /// questdb-rs. A live-server smoke test is not feasible from a unit test
+    /// because questdb-rs HTTP `from_conf` validates the endpoint against the
+    /// real QuestDB `/ping` handshake, which an in-process mock cannot satisfy
+    /// (verified empirically: the naive mock test panicked on `from_conf`).
+    /// Integration coverage lives in `spawn_historical_candle_fetch` in
+    /// `crates/app/src/main.rs`, exercised by the real backfill workload.
+    // TEST-EXEMPT: thin wrapper — see `# Testing` doc above for full rationale.
+    pub fn new_http(config: &QuestDbConfig) -> Result<Self> {
+        let conf_string = build_historical_ilp_conf_string(&config.host, config.http_port);
+        let sender = Sender::from_conf(&conf_string)
+            .context("failed to connect to QuestDB via HTTP ILP (historical writer)")?;
         let buffer = sender.new_buffer();
 
         Ok(Self {
@@ -1318,6 +1405,87 @@ mod tests {
         assert!(
             conf.starts_with("tcp::addr="),
             "ILP conf string must start with tcp::addr="
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // build_historical_ilp_conf_string — cold-path HTTP ILP (broken-pipe fix)
+    // -----------------------------------------------------------------------
+
+    /// Historical candle writer MUST use HTTP ILP, not TCP ILP.
+    /// TCP ILP causes "broken pipe after every successful flush" on bursty
+    /// cold-path workloads because QuestDB rotates idle line.tcp sockets.
+    #[test]
+    fn test_build_historical_ilp_conf_string_uses_http_not_tcp() {
+        let conf = build_historical_ilp_conf_string("tv-questdb", 9000);
+        assert!(
+            conf.starts_with("http::addr="),
+            "historical writer MUST use http:: transport, got: {conf}"
+        );
+        assert!(
+            !conf.contains("tcp::addr="),
+            "historical writer MUST NOT use tcp:: transport, got: {conf}"
+        );
+    }
+
+    #[test]
+    fn test_build_historical_ilp_conf_string_docker_defaults() {
+        let conf = build_historical_ilp_conf_string("tv-questdb", 9000);
+        assert_eq!(
+            conf, "http::addr=tv-questdb:9000;auto_flush=off;retry_timeout=30000;",
+            "historical ILP conf string format regression"
+        );
+    }
+
+    /// `auto_flush=off` is critical: we control batching via
+    /// `CANDLE_FLUSH_BATCH_SIZE` and do NOT want questdb-rs auto-flushing
+    /// half-built batches on its own schedule.
+    #[test]
+    fn test_build_historical_ilp_conf_string_disables_auto_flush() {
+        let conf = build_historical_ilp_conf_string("host", 9000);
+        assert!(
+            conf.contains("auto_flush=off"),
+            "historical writer must disable auto_flush, got: {conf}"
+        );
+    }
+
+    /// Retry timeout is critical: HTTP ILP retries transient 5xx / network
+    /// errors internally before surfacing a failure to the caller, so the
+    /// reconnect path stays a rare exception rather than every-batch.
+    #[test]
+    fn test_build_historical_ilp_conf_string_sets_retry_timeout() {
+        let conf = build_historical_ilp_conf_string("host", 9000);
+        assert!(
+            conf.contains("retry_timeout=30000"),
+            "historical writer must set retry_timeout=30000ms, got: {conf}"
+        );
+    }
+
+    #[test]
+    fn test_build_historical_ilp_conf_string_custom_port() {
+        let conf = build_historical_ilp_conf_string("10.0.0.5", 19000);
+        assert!(
+            conf.starts_with("http::addr=10.0.0.5:19000;"),
+            "host:port must reflect config, got: {conf}"
+        );
+    }
+
+    #[test]
+    fn test_build_historical_ilp_conf_string_ends_with_semicolon() {
+        let conf = build_historical_ilp_conf_string("host", 1234);
+        assert!(
+            conf.ends_with(';'),
+            "ILP conf string must end with semicolon"
+        );
+    }
+
+    #[test]
+    fn test_tcp_and_http_conf_strings_are_distinct() {
+        let tcp = build_ilp_conf_string("tv-questdb", 9009);
+        let http = build_historical_ilp_conf_string("tv-questdb", 9000);
+        assert_ne!(
+            tcp, http,
+            "hot path (TCP) and cold path (HTTP) conf strings must not collide"
         );
     }
 

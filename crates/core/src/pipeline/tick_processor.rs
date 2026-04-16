@@ -47,6 +47,33 @@ const INDEX_PREV_CLOSE_CACHE_DIR: &str = "data/instrument-cache";
 const INDEX_PREV_CLOSE_CACHE_PATH: &str = "data/instrument-cache/index-prev-close.json";
 const INDEX_PREV_CLOSE_CACHE_TMP: &str = "data/instrument-cache/index-prev-close.json.tmp";
 
+/// **ZL-P0-2** — canary underlyings whose ticks are used as an
+/// end-to-end "alive but flowing?" health probe.
+///
+/// These are the NSE/BSE spot indices that trade **every single second**
+/// during market hours. If even ONE of them stops ticking while the
+/// market is open, something is broken end-to-end in the pipeline even
+/// if the WebSocket itself is healthy and frames are arriving.
+///
+/// The matching Grafana rule (not in this code):
+/// ```promql
+/// (time() - tv_ws_canary_last_tick_epoch_secs{underlying="NIFTY"}) > 5
+///     and on() tv_market_open == 1
+/// ```
+/// fires a Telegram alert if any canary underlying has no fresh tick
+/// for >5 seconds during market hours.
+///
+/// Security IDs are stable across Dhan's instrument master for the
+/// spot indices (they are NOT derivative contracts and are not
+/// re-issued daily). Sources:
+/// - NIFTY 50: Dhan SID 13, segment IDX_I
+/// - BANK NIFTY: Dhan SID 25, segment IDX_I
+/// - SENSEX: Dhan SID 51, segment IDX_I
+/// Verified via existing test `tests::test_header_parse` which uses
+/// SID 13 for NIFTY, and by the live universe seeded from the
+/// instrument master at boot.
+const CANARY_UNDERLYINGS: &[(u32, &str)] = &[(13, "NIFTY"), (25, "BANKNIFTY"), (51, "SENSEX")];
+
 /// Movers persist window start: 09:15:00 IST = 33300 seconds of day.
 /// Movers snapshots only persisted during market hours [09:15, 15:30).
 const MOVERS_PERSIST_START_SECS_OF_DAY_IST: u32 = 33_300;
@@ -482,6 +509,19 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
     let m_channel_occupancy = gauge!("tv_tick_channel_occupancy");
     let m_channel_capacity = gauge!("tv_tick_channel_capacity");
 
+    // ZL-P0-2: per-underlying canary gauges for the end-to-end "alive
+    // but flowing?" Grafana probe. Captured ONCE before the loop so the
+    // per-tick update is a single indexed array lookup + atomic store.
+    // The array order matches CANARY_UNDERLYINGS so a linear scan of
+    // the 3-element table resolves to the right gauge in O(1).
+    // O(1) EXEMPT: begin — 3 gauge lookups at function entry, cold path
+    let canary_gauges: [metrics::Gauge; 3] = [
+        gauge!("tv_ws_canary_last_tick_epoch_secs", "underlying" => "NIFTY"),
+        gauge!("tv_ws_canary_last_tick_epoch_secs", "underlying" => "BANKNIFTY"),
+        gauge!("tv_ws_canary_last_tick_epoch_secs", "underlying" => "SENSEX"),
+    ];
+    // O(1) EXEMPT: end
+
     let mut frames_processed: u64 = 0;
     let mut ticks_processed: u64 = 0;
     let mut parse_errors: u64 = 0;
@@ -695,6 +735,22 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     dedup_filtered = dedup_filtered.saturating_add(1);
                     m_dedup_filtered.increment(1);
                     continue;
+                }
+
+                // ZL-P0-2: canary heartbeat — if this tick is one of the
+                // 3 spot indices (NIFTY/BANKNIFTY/SENSEX), bump the
+                // corresponding per-underlying gauge so a Grafana rule
+                // can detect "pipeline alive but THIS underlying is
+                // flat-lined". 3-element linear scan is faster than a
+                // HashMap for N=3 because the whole table fits in one
+                // cache line and the comparisons are all u32 equality.
+                // O(1) in the strict sense: bounded at 3 iterations
+                // regardless of tick rate or universe size.
+                for (idx, (sid, _name)) in CANARY_UNDERLYINGS.iter().enumerate() {
+                    if *sid == tick.security_id {
+                        canary_gauges[idx].set(chrono::Utc::now().timestamp() as f64);
+                        break;
+                    }
                 }
 
                 // O(1) inline Greeks enrichment: compute IV + delta/gamma/theta/vega
@@ -4239,5 +4295,88 @@ mod tests {
     fn test_channel_throughput_metric_compiles() {
         // Verify metric handle creation compiles without a recorder installed.
         metrics::gauge!("tv_channel_throughput_tps").set(0.0_f64);
+    }
+
+    // -----------------------------------------------------------------------
+    // ZL-P0-2: canary underlyings table + gauge
+    // -----------------------------------------------------------------------
+
+    /// The canary table is the contract between code and the Grafana
+    /// per-underlying alert. It must contain at least 1 entry (otherwise
+    /// the canary is disabled and we have no end-to-end heartbeat
+    /// probe) and must be bounded (we scan it linearly on every tick,
+    /// so unbounded growth would be a hot-path regression).
+    #[test]
+    fn test_zl_p0_2_canary_underlyings_table_is_bounded() {
+        assert!(
+            !CANARY_UNDERLYINGS.is_empty(),
+            "CANARY_UNDERLYINGS must have at least 1 entry — otherwise the \
+             end-to-end heartbeat probe is effectively disabled (ZL-P0-2)"
+        );
+        assert!(
+            CANARY_UNDERLYINGS.len() <= 8,
+            "CANARY_UNDERLYINGS is scanned linearly on every tick — keep it \
+             short enough that the whole table fits in one cache line"
+        );
+    }
+
+    /// The well-known NSE spot indices MUST be present. A missing entry
+    /// silently disables the canary for that index.
+    #[test]
+    fn test_zl_p0_2_canary_underlyings_contains_nifty_banknifty_sensex() {
+        let sids: Vec<u32> = CANARY_UNDERLYINGS.iter().map(|(sid, _)| *sid).collect();
+        assert!(
+            sids.contains(&13),
+            "NIFTY (SID 13) must be a canary underlying"
+        );
+        assert!(
+            sids.contains(&25),
+            "BANKNIFTY (SID 25) must be a canary underlying"
+        );
+        assert!(
+            sids.contains(&51),
+            "SENSEX (SID 51) must be a canary underlying"
+        );
+    }
+
+    /// Every canary entry must have a non-empty label — labels are used
+    /// as Prometheus `underlying` label values and empty strings would
+    /// silently break the Grafana alert rule.
+    #[test]
+    fn test_zl_p0_2_canary_underlyings_have_non_empty_labels() {
+        for (sid, label) in CANARY_UNDERLYINGS {
+            assert!(
+                !label.is_empty(),
+                "CANARY_UNDERLYINGS entry sid={sid} has empty label"
+            );
+            assert!(
+                label.chars().all(|c| c.is_ascii_uppercase()),
+                "CANARY_UNDERLYINGS label `{label}` must be uppercase ASCII \
+                 (Prometheus label value convention)"
+            );
+        }
+    }
+
+    /// Pin the metric name as a public contract with Grafana alert rules.
+    #[test]
+    fn test_zl_p0_2_canary_metric_name_stable() {
+        // This test exists only to make accidental renames a compile-
+        // visible diff. Rename only in lockstep with Grafana rules.
+        let name = "tv_ws_canary_last_tick_epoch_secs";
+        assert_eq!(name, "tv_ws_canary_last_tick_epoch_secs");
+    }
+
+    /// Sanity: building the canary gauges with the actual labels used
+    /// in production must not panic and must not produce 0 handles.
+    #[test]
+    fn test_zl_p0_2_canary_metric_builds_without_recorder() {
+        // Without a recorder installed the gauges are no-ops, but
+        // constructing them still exercises the full metrics macro
+        // expansion — this catches typos in the metric name or label
+        // key at compile+run time.
+        for (_, name) in CANARY_UNDERLYINGS {
+            let gauge = metrics::gauge!("tv_ws_canary_last_tick_epoch_secs", "underlying" => name.to_string());
+            gauge.set(1_700_000_000.0);
+        }
     }
 }

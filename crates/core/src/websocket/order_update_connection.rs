@@ -36,7 +36,10 @@ use tickvault_storage::ws_frame_spill::{AppendOutcome, WsFrameSpill, WsType};
 
 use crate::auth::TokenHandle;
 use crate::parser::order_update::{build_order_update_login, parse_order_update};
-use crate::websocket::activity_watchdog::{ActivityWatchdog, WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS};
+use crate::websocket::activity_watchdog::{
+    ActivityWatchdog, WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS, build_heartbeat_gauge,
+    spawn_with_panic_notify,
+};
 use crate::websocket::tls::build_websocket_tls_connector;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -224,12 +227,18 @@ async fn connect_and_listen(
     let activity_counter = Arc::new(AtomicU64::new(0));
     let watchdog_notify = Arc::new(tokio::sync::Notify::new());
     let watchdog = ActivityWatchdog::new(
+        // O(1) EXEMPT: watchdog label built once per spawn, not per frame (cold path)
         "order-update".to_string(),
         Arc::clone(&activity_counter),
         Duration::from_secs(WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS),
         Arc::clone(&watchdog_notify),
     );
-    let watchdog_handle = tokio::spawn(watchdog.run());
+    // WS-1: panic-safe watchdog spawn — see activity_watchdog::spawn_with_panic_notify.
+    let watchdog_handle = spawn_with_panic_notify(watchdog);
+
+    // ZL-P0-1: heartbeat gauge handle for the order update WS.
+    // O(1) EXEMPT: one gauge lookup per reconnect cycle
+    let m_last_frame_epoch = build_heartbeat_gauge("order_update", "order-update".to_string());
 
     // The read loop is wrapped in a helper closure so every exit path can
     // abort the watchdog handle exactly once. This avoids sprinkling
@@ -246,8 +255,10 @@ async fn connect_and_listen(
             next_frame = read.next() => next_frame,
         };
         // STAGE-C.3: bump the activity counter on every Some(Ok(_)) event.
+        // ZL-P0-1: also set heartbeat gauge.
         if matches!(frame_result, Some(Ok(_))) {
             activity_counter.fetch_add(1, Ordering::Relaxed);
+            m_last_frame_epoch.set(chrono::Utc::now().timestamp() as f64);
         }
 
         let msg = match frame_result {

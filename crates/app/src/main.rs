@@ -3496,7 +3496,11 @@ fn spawn_historical_candle_fetch(
             }
         };
 
-        let candle_writer = match CandlePersistenceWriter::new(&bg_questdb_config) {
+        // Historical fetch uses HTTP ILP (not TCP) — HTTP ILP is stateless and
+        // immune to the "broken pipe after every flush" failure mode caused by
+        // QuestDB line.tcp rotating idle sockets between bursty cold-path writes.
+        // See: CandlePersistenceWriter::new_http doc comment.
+        let candle_writer = match CandlePersistenceWriter::new_http(&bg_questdb_config) {
             Ok(writer) => writer,
             Err(err) => {
                 warn!(?err, "failed to create candle writer for background fetch");
@@ -3579,9 +3583,10 @@ fn spawn_historical_candle_fetch(
             client_id
         };
 
-        // Re-create writer if we waited (previous may have timed out)
+        // Re-create writer if we waited (previous may have timed out).
+        // HTTP ILP (see new_http doc) — same reason as above.
         let mut fetch_writer = if is_trading_day {
-            match CandlePersistenceWriter::new(&bg_questdb_config) {
+            match CandlePersistenceWriter::new_http(&bg_questdb_config) {
                 Ok(writer) => writer,
                 Err(err) => {
                     warn!(?err, "failed to create candle writer for post-market fetch");

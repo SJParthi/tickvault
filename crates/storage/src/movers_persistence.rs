@@ -8,18 +8,27 @@
 //! - `option_movers` — top 20 per 7 categories per minute
 //!
 //! # Idempotency
-//! DEDUP UPSERT KEYS on `(ts, security_id, category)` prevent duplicates on restart.
+//! DEDUP UPSERT KEYS on `(ts, security_id, category, segment)` prevent
+//! duplicates on restart. `segment` is required because the same
+//! `security_id` exists across `IDX_I` / `NSE_EQ` / `NSE_FNO` — see audit
+//! gaps DB-3/DB-4.
 //!
-//! # Error Handling
+//! # Error Handling (DB-6/DB-7)
 //! Movers persistence is cold-path observability data, NOT critical path.
-//! On QuestDB failure, logs WARN and continues — no ring buffer needed.
+//! Reconnect attempts are throttled to one per
+//! `MOVERS_RECONNECT_THROTTLE_SECS` (30s) to prevent tight reconnect loops
+//! when QuestDB flaps. Every dropped batch is counted via
+//! `rows_dropped_total` + `tv_{stock,option}_movers_dropped_total` +
+//! `tv_{stock,option}_movers_flush_failures_total` and logged at ERROR
+//! level so the Telegram alert path fires.
 
-use std::time::Duration;
+use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use questdb::ingress::{Buffer, Sender, TimestampNanos};
+use questdb::ingress::{Buffer, ProtocolVersion, Sender, TimestampNanos};
 use reqwest::Client;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use tickvault_common::config::QuestDbConfig;
 
@@ -34,14 +43,47 @@ pub const QUESTDB_TABLE_STOCK_MOVERS: &str = "stock_movers";
 pub const QUESTDB_TABLE_OPTION_MOVERS: &str = "option_movers";
 
 /// DEDUP UPSERT KEY for movers tables.
-/// (ts, security_id, category) prevents duplicate entries on restart/reconnect.
-const DEDUP_KEY_MOVERS: &str = "security_id, category";
+///
+/// Compound key: `(ts, security_id, category, segment)` prevents duplicate entries
+/// on restart/reconnect AND prevents cross-segment collision.
+///
+/// **Why `segment` is required** (audit gap DB-3/DB-4, ticket 2026-04-15):
+/// The same `security_id` is reused by Dhan across exchange segments. For
+/// example, `security_id = 13` is `NIFTY` in both `IDX_I` (index) and `NSE_EQ`
+/// (equity — no such instrument in real life, but the collision exists at the
+/// schema level and has been observed for other IDs like 25 / BANKNIFTY). If
+/// `segment` is omitted from the DEDUP key, two legitimate distinct movers
+/// rows in the same 1-minute snapshot bucket will silently UPSERT each other.
+/// Both DDL schemas (`stock_movers`, `option_movers`) declare `segment SYMBOL`
+/// — the DEDUP key must reference every column that contributes to row identity.
+///
+/// Enforced by `test_dedup_key_movers_includes_segment` +
+/// `test_dedup_key_movers_matches_ddl_identity_columns`.
+const DEDUP_KEY_MOVERS: &str = "security_id, category, segment";
 
 /// Timeout for QuestDB DDL HTTP requests.
 const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 
 /// Flush batch size for movers (much smaller than ticks — max 20×10 = 200 rows per snapshot).
 const MOVERS_FLUSH_BATCH_SIZE: usize = 250;
+
+/// Minimum interval between reconnect attempts when QuestDB is down.
+///
+/// Audit gap DB-6: the previous flush path called `Sender::from_conf`
+/// on every failed batch with zero backoff, creating a tight reconnect
+/// loop when QuestDB flapped. Caps reconnect attempts at one per 30s
+/// per writer, matching the pattern used by `LiveCandleWriter` and
+/// `IndicatorSnapshotWriter`.
+const MOVERS_RECONNECT_THROTTLE_SECS: u64 = 30;
+
+/// Capacity of the in-memory rescue ring for movers writers (DB-2).
+///
+/// Movers are emitted at ~200 rows/min max (20 entries × 10 categories).
+/// A 5,000-entry ring covers ~25 minutes of snapshot backlog — comfortably
+/// longer than any routine QuestDB restart. At ~200 bytes per stock
+/// record and ~280 bytes per option record, the per-writer footprint is
+/// ~1 MB stock + ~1.4 MB option = 2.4 MB total — bounded and affordable.
+const MOVERS_RESCUE_RING_CAPACITY: usize = 5_000;
 
 /// Flush interval for movers (60 seconds — aligned with snapshot interval).
 /// Used by future flush_if_needed() implementation.
@@ -101,18 +143,74 @@ const OPTION_MOVERS_CREATE_DDL: &str = "\
 ";
 
 // ---------------------------------------------------------------------------
+// Rescue-ring records (DB-2)
+// ---------------------------------------------------------------------------
+
+/// A buffered stock mover entry, kept in an in-memory FIFO rescue ring
+/// so it can be re-sent to QuestDB after a flush failure or reconnect.
+/// Stored verbatim so the re-send path is byte-identical to the original.
+/// `Clone` (not `Copy`) because of the owned `String` fields — acceptable
+/// because this writer is cold path (1 row/sec max, see movers flow rate
+/// in `MOVERS_RESCUE_RING_CAPACITY` comment).
+#[derive(Clone)]
+struct BufferedStockMover {
+    ts_nanos: i64,
+    category: String,
+    rank: i32,
+    security_id: u32,
+    segment: String,
+    symbol: String,
+    ltp: f64,
+    prev_close: f64,
+    change_pct: f64,
+    volume: i64,
+}
+
+/// A buffered option mover entry — same rationale as `BufferedStockMover`.
+#[derive(Clone)]
+struct BufferedOptionMover {
+    ts_nanos: i64,
+    category: String,
+    rank: i32,
+    security_id: u32,
+    segment: String,
+    contract_name: String,
+    underlying: String,
+    option_type: String,
+    strike: f64,
+    expiry: String,
+    spot_price: f64,
+    ltp: f64,
+    change: f64,
+    change_pct: f64,
+    oi: i64,
+    oi_change: i64,
+    oi_change_pct: f64,
+    volume: i64,
+    value: f64,
+}
+
+// ---------------------------------------------------------------------------
 // Stock Movers Writer
 // ---------------------------------------------------------------------------
 
 /// Batched writer for stock movers snapshots to QuestDB via ILP.
 ///
-/// Simpler than TickPersistenceWriter — no ring buffer, no spill.
-/// Movers are cold-path observability data; loss of a snapshot is acceptable.
+/// # Resilience (DB-6/DB-7)
+/// - Reconnect attempts throttled to one per `MOVERS_RECONNECT_THROTTLE_SECS` (30s).
+/// - Dropped batches are counted and logged at ERROR level (Telegram alert fires).
+/// - No in-memory rescue ring yet — DB-2 will add one in a separate commit.
 pub struct StockMoversWriter {
     sender: Option<Sender>,
     buffer: Buffer,
     pending_count: usize,
     ilp_conf_string: String,
+    /// Earliest time at which the next reconnect attempt is allowed. DB-6.
+    next_reconnect_allowed: Instant,
+    /// Total rows dropped (never written to QuestDB). DB-7.
+    rows_dropped_total: u64,
+    /// Bounded FIFO rescue ring for flush-failure replay. DB-2.
+    rescue_ring: VecDeque<BufferedStockMover>,
 }
 
 impl StockMoversWriter {
@@ -128,7 +226,60 @@ impl StockMoversWriter {
             buffer,
             pending_count: 0,
             ilp_conf_string: conf_string,
+            next_reconnect_allowed: Instant::now(),
+            rows_dropped_total: 0,
+            rescue_ring: VecDeque::with_capacity(MOVERS_RESCUE_RING_CAPACITY),
         })
+    }
+
+    /// Current rescue ring occupancy (for tests + observability). DB-2.
+    pub fn rescue_ring_len(&self) -> usize {
+        self.rescue_ring.len()
+    }
+
+    /// Pushes a stock mover into the rescue ring, evicting the oldest
+    /// entry if the ring is full. Overflow routes through `record_drop`
+    /// + `tv_stock_movers_ring_overflow_total` metric. DB-2.
+    fn push_to_rescue_ring(&mut self, row: BufferedStockMover) {
+        if self.rescue_ring.len() >= MOVERS_RESCUE_RING_CAPACITY {
+            self.rescue_ring.pop_front();
+            let err = anyhow::anyhow!(
+                "stock movers rescue ring full at capacity {} — oldest row evicted",
+                MOVERS_RESCUE_RING_CAPACITY
+            );
+            self.record_drop(1, "ring_overflow", &err);
+            metrics::counter!("tv_stock_movers_ring_overflow_total").increment(1);
+        }
+        self.rescue_ring.push_back(row);
+    }
+
+    /// Total rows dropped since startup (never persisted to QuestDB).
+    pub fn rows_dropped_total(&self) -> u64 {
+        self.rows_dropped_total
+    }
+
+    /// Records a dropped batch — increments counter + metric + ERROR log. DB-7.
+    fn record_drop(&mut self, count: usize, reason: &'static str, err: &anyhow::Error) {
+        let dropped = u64::try_from(count).unwrap_or(u64::MAX);
+        self.rows_dropped_total = self.rows_dropped_total.saturating_add(dropped);
+        metrics::counter!("tv_stock_movers_dropped_total").absolute(self.rows_dropped_total);
+        metrics::counter!("tv_stock_movers_flush_failures_total").increment(1);
+        error!(
+            ?err,
+            dropped_rows = count,
+            total_dropped = self.rows_dropped_total,
+            reason,
+            "stock movers batch dropped — data loss (cold-path observability)"
+        );
+    }
+
+    fn reconnect_allowed_now(&self) -> bool {
+        Instant::now() >= self.next_reconnect_allowed
+    }
+
+    fn bump_reconnect_throttle(&mut self) {
+        self.next_reconnect_allowed =
+            Instant::now() + Duration::from_secs(MOVERS_RECONNECT_THROTTLE_SECS);
     }
 
     /// Appends a single stock mover entry to the ILP buffer.
@@ -147,6 +298,40 @@ impl StockMoversWriter {
     // TEST-EXEMPT: ILP buffer append — requires live QuestDB, tested via ensure_movers_tables integration
     #[allow(clippy::too_many_arguments)]
     // APPROVED: 10 params — each maps to a QuestDB column, no abstraction reduces this
+    /// Writes a `BufferedStockMover` into an ILP `Buffer`. Single source
+    /// of truth for column order + rounding policy — both live append
+    /// and rescue drain call this helper. DB-2.
+    fn append_stock_row_to_buffer(buffer: &mut Buffer, row: &BufferedStockMover) -> Result<()> {
+        let change_abs = ((row.ltp - row.prev_close) * 100.0).round() / 100.0;
+        let ts = TimestampNanos::new(row.ts_nanos);
+        buffer
+            .table(QUESTDB_TABLE_STOCK_MOVERS)
+            .context("table")?
+            .symbol("category", &row.category)
+            .context("category")?
+            .symbol("segment", &row.segment)
+            .context("segment")?
+            .symbol("symbol", &row.symbol)
+            .context("symbol")?
+            .column_i64("security_id", i64::from(row.security_id))
+            .context("security_id")?
+            .column_f64("ltp", row.ltp)
+            .context("ltp")?
+            .column_f64("prev_close", row.prev_close)
+            .context("prev_close")?
+            .column_f64("change_abs", change_abs)
+            .context("change_abs")?
+            .column_f64("change_pct", row.change_pct)
+            .context("change_pct")?
+            .column_i64("volume", row.volume)
+            .context("volume")?
+            .column_i64("rank", i64::from(row.rank))
+            .context("rank")?
+            .at(ts)
+            .context("timestamp")?;
+        Ok(())
+    }
+
     pub fn append_stock_mover(
         &mut self,
         ts_nanos: i64,
@@ -161,84 +346,153 @@ impl StockMoversWriter {
         volume: i64,
     ) -> Result<()> {
         // Round all f64 values to 2dp to prevent IEEE 754 artifacts in QuestDB.
-        let ltp = (ltp * 100.0).round() / 100.0;
-        let prev_close = (prev_close * 100.0).round() / 100.0;
-        let change_abs = ((ltp - prev_close) * 100.0).round() / 100.0;
-        let change_pct = (change_pct * 100.0).round() / 100.0;
-        let ts = TimestampNanos::new(ts_nanos);
+        let row = BufferedStockMover {
+            ts_nanos,
+            category: category.to_string(),
+            rank,
+            security_id,
+            segment: segment.to_string(),
+            symbol: symbol.to_string(),
+            ltp: (ltp * 100.0).round() / 100.0,
+            prev_close: (prev_close * 100.0).round() / 100.0,
+            change_pct: (change_pct * 100.0).round() / 100.0,
+            volume,
+        };
 
-        // ILP requires: table → ALL symbols → ALL columns → at
-        self.buffer
-            .table(QUESTDB_TABLE_STOCK_MOVERS)
-            .context("table")?
-            .symbol("category", category)
-            .context("category")?
-            .symbol("segment", segment)
-            .context("segment")?
-            .symbol("symbol", symbol)
-            .context("symbol")?
-            .column_i64("security_id", i64::from(security_id))
-            .context("security_id")?
-            .column_f64("ltp", ltp)
-            .context("ltp")?
-            .column_f64("prev_close", prev_close)
-            .context("prev_close")?
-            .column_f64("change_abs", change_abs)
-            .context("change_abs")?
-            .column_f64("change_pct", change_pct)
-            .context("change_pct")?
-            .column_i64("volume", volume)
-            .context("volume")?
-            .column_i64("rank", i64::from(rank))
-            .context("rank")?
-            .at(ts)
-            .context("timestamp")?;
+        // DB-2: push to rescue ring BEFORE the ILP buffer. If the ring
+        // overflows, the oldest row is evicted and counted as a drop.
+        self.push_to_rescue_ring(row.clone());
+
+        // Then append to the current in-flight ILP batch.
+        Self::append_stock_row_to_buffer(&mut self.buffer, &row)?;
 
         self.pending_count = self.pending_count.saturating_add(1);
 
         if self.pending_count >= MOVERS_FLUSH_BATCH_SIZE
             && let Err(err) = self.flush()
         {
-            warn!(?err, "stock movers auto-flush failed");
+            error!(?err, "stock movers auto-flush failed at batch boundary");
         }
 
         Ok(())
     }
 
+    /// Drains the stock movers rescue ring by rebuilding a fresh ILP
+    /// batch (oldest first) and flushing it. Called after a successful
+    /// reconnect. DB-2.
+    fn drain_rescue_ring_to_sender(&mut self) -> Result<()> {
+        if self.rescue_ring.is_empty() {
+            return Ok(());
+        }
+        let drained = self.rescue_ring.len();
+        info!(
+            buffered = drained,
+            "draining stock movers rescue ring after reconnect"
+        );
+
+        let sender = self
+            .sender
+            .as_mut()
+            .context("sender required for stock movers rescue drain")?;
+        let mut rescue_buffer = Buffer::new(ProtocolVersion::V1);
+        for row in self.rescue_ring.iter() {
+            Self::append_stock_row_to_buffer(&mut rescue_buffer, row)?;
+        }
+        sender
+            .flush(&mut rescue_buffer)
+            .context("flush stock movers rescue batch to QuestDB")?;
+        self.rescue_ring.clear();
+        info!(drained, "stock movers rescue ring drained after reconnect");
+        Ok(())
+    }
+
     /// Flushes buffered rows to QuestDB.
+    ///
+    /// DB-6/DB-7: reconnect attempts throttled to 1 per
+    /// `MOVERS_RECONNECT_THROTTLE_SECS` (30s). Every drop path routes
+    /// through `record_drop` (metric + ERROR log).
     pub fn flush(&mut self) -> Result<()> {
-        if self.pending_count == 0 {
+        if self.pending_count == 0 && self.rescue_ring.is_empty() {
             return Ok(());
         }
 
-        let sender = match self.sender.as_mut() {
-            Some(s) => s,
-            None => {
-                // Try reconnect
-                match Sender::from_conf(&self.ilp_conf_string) {
-                    Ok(s) => {
-                        self.sender = Some(s);
-                        self.sender.as_mut().context("sender after reconnect")?
-                    }
-                    Err(err) => {
-                        warn!(?err, "stock movers reconnect failed — dropping batch");
-                        self.buffer.clear();
-                        self.pending_count = 0;
-                        return Ok(());
-                    }
+        // Reconnect path — throttled. On throttle closed, rows stay in
+        // the rescue ring (DB-2) so no data is lost.
+        if self.sender.is_none() {
+            if !self.reconnect_allowed_now() {
+                self.buffer.clear();
+                self.pending_count = 0;
+                debug!(
+                    ring_depth = self.rescue_ring.len(),
+                    "stock movers flush deferred — reconnect throttled, \
+                     rows retained in rescue ring"
+                );
+                return Ok(());
+            }
+            self.bump_reconnect_throttle();
+            match Sender::from_conf(&self.ilp_conf_string) {
+                Ok(s) => {
+                    info!("stock movers writer reconnected to QuestDB");
+                    self.sender = Some(s);
+                }
+                Err(err) => {
+                    let wrapped = anyhow::Error::from(err);
+                    warn!(
+                        ?wrapped,
+                        ring_depth = self.rescue_ring.len(),
+                        "stock movers reconnect failed — rows retained in \
+                         rescue ring; will retry after throttle window"
+                    );
+                    self.buffer.clear();
+                    self.pending_count = 0;
+                    return Ok(());
                 }
             }
-        };
+        }
 
-        let count = self.pending_count;
-        if let Err(err) = sender.flush(&mut self.buffer) {
-            warn!(?err, count, "stock movers flush failed — dropping batch");
+        // Connected. Drain the rescue ring FIRST so oldest rows land at
+        // QuestDB before the in-flight batch. DB-2.
+        if !self.rescue_ring.is_empty()
+            && let Err(err) = self.drain_rescue_ring_to_sender()
+        {
             self.sender = None;
             self.buffer.clear();
             self.pending_count = 0;
+            warn!(
+                ?err,
+                ring_depth = self.rescue_ring.len(),
+                "stock movers rescue drain failed — will retry on next flush"
+            );
             return Ok(());
         }
 
+        if self.pending_count == 0 {
+            return Ok(());
+        }
+        let sender = self
+            .sender
+            .as_mut()
+            .context("stock movers sender present after reconnect branch")?;
+        let count = self.pending_count;
+        if let Err(err) = sender.flush(&mut self.buffer) {
+            let wrapped = anyhow::Error::from(err);
+            // Rows are still in the rescue ring — don't record_drop.
+            self.sender = None;
+            self.buffer.clear();
+            self.pending_count = 0;
+            warn!(
+                ?wrapped,
+                count,
+                ring_depth = self.rescue_ring.len(),
+                "stock movers flush failed — rows retained in rescue ring"
+            );
+            return Ok(());
+        }
+
+        // Pop the successfully-flushed rows from the ring.
+        for _ in 0..count {
+            self.rescue_ring.pop_front();
+        }
         self.pending_count = 0;
         debug!(flushed_rows = count, "stock movers flushed to QuestDB");
         Ok(())
@@ -261,6 +515,12 @@ pub struct OptionMoversWriter {
     buffer: Buffer,
     pending_count: usize,
     ilp_conf_string: String,
+    /// Earliest time at which the next reconnect attempt is allowed. DB-6.
+    next_reconnect_allowed: Instant,
+    /// Total rows dropped (never written to QuestDB). DB-7.
+    rows_dropped_total: u64,
+    /// Bounded FIFO rescue ring for flush-failure replay. DB-2.
+    rescue_ring: VecDeque<BufferedOptionMover>,
 }
 
 impl OptionMoversWriter {
@@ -276,7 +536,60 @@ impl OptionMoversWriter {
             buffer,
             pending_count: 0,
             ilp_conf_string: conf_string,
+            next_reconnect_allowed: Instant::now(),
+            rows_dropped_total: 0,
+            rescue_ring: VecDeque::with_capacity(MOVERS_RESCUE_RING_CAPACITY),
         })
+    }
+
+    /// Current rescue ring occupancy (for tests + observability). DB-2.
+    pub fn rescue_ring_len(&self) -> usize {
+        self.rescue_ring.len()
+    }
+
+    /// Pushes an option mover into the rescue ring, evicting the oldest
+    /// entry if the ring is full. Overflow routes through `record_drop`
+    /// + `tv_option_movers_ring_overflow_total` metric. DB-2.
+    fn push_to_rescue_ring(&mut self, row: BufferedOptionMover) {
+        if self.rescue_ring.len() >= MOVERS_RESCUE_RING_CAPACITY {
+            self.rescue_ring.pop_front();
+            let err = anyhow::anyhow!(
+                "option movers rescue ring full at capacity {} — oldest row evicted",
+                MOVERS_RESCUE_RING_CAPACITY
+            );
+            self.record_drop(1, "ring_overflow", &err);
+            metrics::counter!("tv_option_movers_ring_overflow_total").increment(1);
+        }
+        self.rescue_ring.push_back(row);
+    }
+
+    /// Total rows dropped since startup (never persisted to QuestDB).
+    pub fn rows_dropped_total(&self) -> u64 {
+        self.rows_dropped_total
+    }
+
+    /// Records a dropped batch — increments counter + metric + ERROR log. DB-7.
+    fn record_drop(&mut self, count: usize, reason: &'static str, err: &anyhow::Error) {
+        let dropped = u64::try_from(count).unwrap_or(u64::MAX);
+        self.rows_dropped_total = self.rows_dropped_total.saturating_add(dropped);
+        metrics::counter!("tv_option_movers_dropped_total").absolute(self.rows_dropped_total);
+        metrics::counter!("tv_option_movers_flush_failures_total").increment(1);
+        error!(
+            ?err,
+            dropped_rows = count,
+            total_dropped = self.rows_dropped_total,
+            reason,
+            "option movers batch dropped — data loss (cold-path observability)"
+        );
+    }
+
+    fn reconnect_allowed_now(&self) -> bool {
+        Instant::now() >= self.next_reconnect_allowed
+    }
+
+    fn bump_reconnect_throttle(&mut self) {
+        self.next_reconnect_allowed =
+            Instant::now() + Duration::from_secs(MOVERS_RECONNECT_THROTTLE_SECS);
     }
 
     /// Appends a single option mover entry to the ILP buffer.
@@ -288,6 +601,54 @@ impl OptionMoversWriter {
     // TEST-EXEMPT: ILP buffer append — requires live QuestDB, tested via ensure_movers_tables integration
     #[allow(clippy::too_many_arguments)]
     // APPROVED: 17 params — each maps to a QuestDB column, no abstraction reduces this
+    /// Writes a `BufferedOptionMover` into an ILP `Buffer`. Single source
+    /// of truth for column order + rounding. DB-2.
+    fn append_option_row_to_buffer(buffer: &mut Buffer, row: &BufferedOptionMover) -> Result<()> {
+        let ts = TimestampNanos::new(row.ts_nanos);
+        buffer
+            .table(QUESTDB_TABLE_OPTION_MOVERS)
+            .context("table")?
+            .symbol("category", &row.category)
+            .context("category")?
+            .symbol("segment", &row.segment)
+            .context("segment")?
+            .symbol("contract_name", &row.contract_name)
+            .context("contract_name")?
+            .symbol("underlying", &row.underlying)
+            .context("underlying")?
+            .symbol("option_type", &row.option_type)
+            .context("option_type")?
+            .symbol("expiry", &row.expiry)
+            .context("expiry")?
+            .column_i64("security_id", i64::from(row.security_id))
+            .context("security_id")?
+            .column_f64("strike", row.strike)
+            .context("strike")?
+            .column_f64("spot_price", row.spot_price)
+            .context("spot_price")?
+            .column_f64("ltp", row.ltp)
+            .context("ltp")?
+            .column_f64("change", row.change)
+            .context("change")?
+            .column_f64("change_pct", row.change_pct)
+            .context("change_pct")?
+            .column_i64("oi", row.oi)
+            .context("oi")?
+            .column_i64("oi_change", row.oi_change)
+            .context("oi_change")?
+            .column_f64("oi_change_pct", row.oi_change_pct)
+            .context("oi_change_pct")?
+            .column_i64("volume", row.volume)
+            .context("volume")?
+            .column_f64("value", row.value)
+            .context("value")?
+            .column_i64("rank", i64::from(row.rank))
+            .context("rank")?
+            .at(ts)
+            .context("timestamp")?;
+        Ok(())
+    }
+
     pub fn append_option_mover(
         &mut self,
         ts_nanos: i64,
@@ -311,102 +672,155 @@ impl OptionMoversWriter {
         value: f64,
     ) -> Result<()> {
         // Round all f64 values to 2dp to prevent IEEE 754 artifacts in QuestDB.
-        let strike = (strike * 100.0).round() / 100.0;
-        let spot_price = (spot_price * 100.0).round() / 100.0;
-        let ltp = (ltp * 100.0).round() / 100.0;
-        let change = (change * 100.0).round() / 100.0;
-        let change_pct = (change_pct * 100.0).round() / 100.0;
-        let oi_change_pct = (oi_change_pct * 100.0).round() / 100.0;
-        let value = (value * 100.0).round() / 100.0;
-        let ts = TimestampNanos::new(ts_nanos);
+        let row = BufferedOptionMover {
+            ts_nanos,
+            category: category.to_string(),
+            rank,
+            security_id,
+            segment: segment.to_string(),
+            contract_name: contract_name.to_string(),
+            underlying: underlying.to_string(),
+            option_type: option_type.to_string(),
+            strike: (strike * 100.0).round() / 100.0,
+            expiry: expiry.to_string(),
+            spot_price: (spot_price * 100.0).round() / 100.0,
+            ltp: (ltp * 100.0).round() / 100.0,
+            change: (change * 100.0).round() / 100.0,
+            change_pct: (change_pct * 100.0).round() / 100.0,
+            oi,
+            oi_change,
+            oi_change_pct: (oi_change_pct * 100.0).round() / 100.0,
+            volume,
+            value: (value * 100.0).round() / 100.0,
+        };
 
-        // ILP requires: table → ALL symbols → ALL columns → at
-        self.buffer
-            .table(QUESTDB_TABLE_OPTION_MOVERS)
-            .context("table")?
-            // Symbols first
-            .symbol("category", category)
-            .context("category")?
-            .symbol("segment", segment)
-            .context("segment")?
-            .symbol("contract_name", contract_name)
-            .context("contract_name")?
-            .symbol("underlying", underlying)
-            .context("underlying")?
-            .symbol("option_type", option_type)
-            .context("option_type")?
-            .symbol("expiry", expiry)
-            .context("expiry")?
-            // Then columns
-            .column_i64("security_id", i64::from(security_id))
-            .context("security_id")?
-            .column_f64("strike", strike)
-            .context("strike")?
-            .column_f64("spot_price", spot_price)
-            .context("spot_price")?
-            .column_f64("ltp", ltp)
-            .context("ltp")?
-            .column_f64("change", change)
-            .context("change")?
-            .column_f64("change_pct", change_pct)
-            .context("change_pct")?
-            .column_i64("oi", oi)
-            .context("oi")?
-            .column_i64("oi_change", oi_change)
-            .context("oi_change")?
-            .column_f64("oi_change_pct", oi_change_pct)
-            .context("oi_change_pct")?
-            .column_i64("volume", volume)
-            .context("volume")?
-            .column_f64("value", value)
-            .context("value")?
-            .column_i64("rank", i64::from(rank))
-            .context("rank")?
-            .at(ts)
-            .context("timestamp")?;
+        // DB-2: push to rescue ring before ILP buffer.
+        self.push_to_rescue_ring(row.clone());
+
+        Self::append_option_row_to_buffer(&mut self.buffer, &row)?;
 
         self.pending_count = self.pending_count.saturating_add(1);
 
         if self.pending_count >= MOVERS_FLUSH_BATCH_SIZE
             && let Err(err) = self.flush()
         {
-            warn!(?err, "option movers auto-flush failed");
+            error!(?err, "option movers auto-flush failed at batch boundary");
         }
 
         Ok(())
     }
 
+    /// Drains the option movers rescue ring by rebuilding a fresh ILP
+    /// batch (oldest first) and flushing it. DB-2.
+    fn drain_rescue_ring_to_sender(&mut self) -> Result<()> {
+        if self.rescue_ring.is_empty() {
+            return Ok(());
+        }
+        let drained = self.rescue_ring.len();
+        info!(
+            buffered = drained,
+            "draining option movers rescue ring after reconnect"
+        );
+
+        let sender = self
+            .sender
+            .as_mut()
+            .context("sender required for option movers rescue drain")?;
+        let mut rescue_buffer = Buffer::new(ProtocolVersion::V1);
+        for row in self.rescue_ring.iter() {
+            Self::append_option_row_to_buffer(&mut rescue_buffer, row)?;
+        }
+        sender
+            .flush(&mut rescue_buffer)
+            .context("flush option movers rescue batch to QuestDB")?;
+        self.rescue_ring.clear();
+        info!(drained, "option movers rescue ring drained after reconnect");
+        Ok(())
+    }
+
     /// Flushes buffered rows to QuestDB.
+    ///
+    /// DB-2/DB-6/DB-7: rescue-ring drain-on-reconnect + pop-on-success
+    /// + retain-on-failure. See `StockMoversWriter::flush` for the
+    /// identical contract.
     pub fn flush(&mut self) -> Result<()> {
-        if self.pending_count == 0 {
+        if self.pending_count == 0 && self.rescue_ring.is_empty() {
             return Ok(());
         }
 
-        let sender = match self.sender.as_mut() {
-            Some(s) => s,
-            None => match Sender::from_conf(&self.ilp_conf_string) {
+        // Reconnect path — throttled.
+        if self.sender.is_none() {
+            if !self.reconnect_allowed_now() {
+                self.buffer.clear();
+                self.pending_count = 0;
+                debug!(
+                    ring_depth = self.rescue_ring.len(),
+                    "option movers flush deferred — reconnect throttled, \
+                     rows retained in rescue ring"
+                );
+                return Ok(());
+            }
+            self.bump_reconnect_throttle();
+            match Sender::from_conf(&self.ilp_conf_string) {
                 Ok(s) => {
+                    info!("option movers writer reconnected to QuestDB");
                     self.sender = Some(s);
-                    self.sender.as_mut().context("sender after reconnect")?
                 }
                 Err(err) => {
-                    warn!(?err, "option movers reconnect failed — dropping batch");
+                    let wrapped = anyhow::Error::from(err);
+                    warn!(
+                        ?wrapped,
+                        ring_depth = self.rescue_ring.len(),
+                        "option movers reconnect failed — rows retained in \
+                         rescue ring; will retry after throttle window"
+                    );
                     self.buffer.clear();
                     self.pending_count = 0;
                     return Ok(());
                 }
-            },
-        };
+            }
+        }
 
-        let count = self.pending_count;
-        if let Err(err) = sender.flush(&mut self.buffer) {
-            warn!(?err, count, "option movers flush failed — dropping batch");
+        // Drain rescue ring first (oldest first).
+        if !self.rescue_ring.is_empty()
+            && let Err(err) = self.drain_rescue_ring_to_sender()
+        {
             self.sender = None;
             self.buffer.clear();
             self.pending_count = 0;
+            warn!(
+                ?err,
+                ring_depth = self.rescue_ring.len(),
+                "option movers rescue drain failed — will retry on next flush"
+            );
             return Ok(());
         }
 
+        if self.pending_count == 0 {
+            return Ok(());
+        }
+        let sender = self
+            .sender
+            .as_mut()
+            .context("option movers sender present after reconnect branch")?;
+        let count = self.pending_count;
+        if let Err(err) = sender.flush(&mut self.buffer) {
+            let wrapped = anyhow::Error::from(err);
+            self.sender = None;
+            self.buffer.clear();
+            self.pending_count = 0;
+            warn!(
+                ?wrapped,
+                count,
+                ring_depth = self.rescue_ring.len(),
+                "option movers flush failed — rows retained in rescue ring"
+            );
+            return Ok(());
+        }
+
+        for _ in 0..count {
+            self.rescue_ring.pop_front();
+        }
         self.pending_count = 0;
         debug!(flushed_rows = count, "option movers flushed to QuestDB");
         Ok(())
@@ -570,6 +984,51 @@ mod tests {
         assert!(DEDUP_KEY_MOVERS.contains("category"));
     }
 
+    // DB-3/DB-4: Cross-segment collision prevention.
+    // Must include `segment` because the same security_id exists across
+    // `IDX_I` / `NSE_EQ` / `NSE_FNO` with different real-world meanings.
+    // Dropping this test is equivalent to re-introducing silent data corruption.
+    #[test]
+    fn test_dedup_key_movers_includes_segment() {
+        assert!(
+            DEDUP_KEY_MOVERS.contains("segment"),
+            "DEDUP_KEY_MOVERS must include `segment` — same security_id exists \
+             across IDX_I/NSE_EQ/NSE_FNO and would collide otherwise (audit DB-3/DB-4). \
+             Got: {DEDUP_KEY_MOVERS}"
+        );
+    }
+
+    /// Both stock_movers and option_movers share the same DEDUP constant,
+    /// so both tables MUST apply the same identity-column set. This test
+    /// pins the constant format and will fail loudly if anyone re-orders or
+    /// drops a column — forcing a conscious review.
+    #[test]
+    fn test_dedup_key_movers_exact_format() {
+        assert_eq!(
+            DEDUP_KEY_MOVERS, "security_id, category, segment",
+            "DEDUP_KEY_MOVERS regression — changing this string silently \
+             corrupts data; update the test only after the DDL and migration \
+             are confirmed safe."
+        );
+    }
+
+    /// Cross-check: every column referenced in DEDUP_KEY_MOVERS MUST appear
+    /// in both the stock_movers and option_movers DDLs. Prevents the class
+    /// of bug where DEDUP lists a column the table doesn't even have.
+    #[test]
+    fn test_dedup_key_movers_columns_exist_in_both_ddls() {
+        for col in DEDUP_KEY_MOVERS.split(',').map(|s| s.trim()) {
+            assert!(
+                STOCK_MOVERS_CREATE_DDL.contains(col),
+                "DEDUP column `{col}` is missing from STOCK_MOVERS_CREATE_DDL"
+            );
+            assert!(
+                OPTION_MOVERS_CREATE_DDL.contains(col),
+                "DEDUP column `{col}` is missing from OPTION_MOVERS_CREATE_DDL"
+            );
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Table name constants
     // -----------------------------------------------------------------------
@@ -684,5 +1143,397 @@ mod tests {
             assert!(!cat.is_empty());
             assert!(cat.chars().all(|c| c.is_ascii_uppercase() || c == '_'));
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // DB-6 + DB-7: reconnect throttle + drop counter (movers)
+    // -----------------------------------------------------------------------
+
+    /// Shared bound check — reconnect throttle must be non-zero to prevent
+    /// tight reconnect loops (audit gap DB-6).
+    #[test]
+    fn test_db6_movers_reconnect_throttle_nonzero_and_bounded() {
+        assert!(
+            MOVERS_RECONNECT_THROTTLE_SECS >= 1,
+            "throttle must be >= 1s"
+        );
+        assert!(
+            MOVERS_RECONNECT_THROTTLE_SECS <= 300,
+            "throttle must be <= 5min"
+        );
+    }
+
+    /// `StockMoversWriter::record_drop` must saturate-add into
+    /// `rows_dropped_total` and increment the counter by exactly the
+    /// dropped-row count (DB-7).
+    #[test]
+    fn test_db7_stock_movers_record_drop_increments_counter() {
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: 9000,
+            ilp_port: 9009,
+            pg_port: 8812,
+        };
+        let mut writer = match StockMoversWriter::new(&config) {
+            Ok(w) => w,
+            Err(_) => StockMoversWriter {
+                sender: None,
+                buffer: questdb::ingress::Buffer::new(questdb::ingress::ProtocolVersion::V1),
+                pending_count: 0,
+                ilp_conf_string: config.build_ilp_conf_string(),
+                next_reconnect_allowed: Instant::now(),
+                rows_dropped_total: 0,
+                rescue_ring: VecDeque::new(),
+            },
+        };
+        assert_eq!(writer.rows_dropped_total(), 0);
+        let err = anyhow::anyhow!("synthetic flush failure");
+        writer.record_drop(100, "test", &err);
+        assert_eq!(writer.rows_dropped_total(), 100);
+        writer.record_drop(200, "test", &err);
+        assert_eq!(writer.rows_dropped_total(), 300);
+    }
+
+    /// Same contract for `OptionMoversWriter`.
+    #[test]
+    fn test_db7_option_movers_record_drop_increments_counter() {
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: 9000,
+            ilp_port: 9009,
+            pg_port: 8812,
+        };
+        let mut writer = match OptionMoversWriter::new(&config) {
+            Ok(w) => w,
+            Err(_) => OptionMoversWriter {
+                sender: None,
+                buffer: questdb::ingress::Buffer::new(questdb::ingress::ProtocolVersion::V1),
+                pending_count: 0,
+                ilp_conf_string: config.build_ilp_conf_string(),
+                next_reconnect_allowed: Instant::now(),
+                rows_dropped_total: 0,
+                rescue_ring: VecDeque::new(),
+            },
+        };
+        assert_eq!(writer.rows_dropped_total(), 0);
+        let err = anyhow::anyhow!("synthetic flush failure");
+        writer.record_drop(50, "test", &err);
+        assert_eq!(writer.rows_dropped_total(), 50);
+    }
+
+    /// Throttle blocks within window (DB-6).
+    #[test]
+    fn test_db6_stock_movers_reconnect_throttle_blocks_within_window() {
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: 9000,
+            ilp_port: 9009,
+            pg_port: 8812,
+        };
+        let mut writer = match StockMoversWriter::new(&config) {
+            Ok(w) => w,
+            Err(_) => StockMoversWriter {
+                sender: None,
+                buffer: questdb::ingress::Buffer::new(questdb::ingress::ProtocolVersion::V1),
+                pending_count: 0,
+                ilp_conf_string: config.build_ilp_conf_string(),
+                next_reconnect_allowed: Instant::now(),
+                rows_dropped_total: 0,
+                rescue_ring: VecDeque::new(),
+            },
+        };
+        assert!(writer.reconnect_allowed_now());
+        writer.bump_reconnect_throttle();
+        assert!(
+            !writer.reconnect_allowed_now(),
+            "after bump, stock movers writer must block reconnect within throttle window"
+        );
+    }
+
+    /// Same for option movers.
+    #[test]
+    fn test_db6_option_movers_reconnect_throttle_blocks_within_window() {
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: 9000,
+            ilp_port: 9009,
+            pg_port: 8812,
+        };
+        let mut writer = match OptionMoversWriter::new(&config) {
+            Ok(w) => w,
+            Err(_) => OptionMoversWriter {
+                sender: None,
+                buffer: questdb::ingress::Buffer::new(questdb::ingress::ProtocolVersion::V1),
+                pending_count: 0,
+                ilp_conf_string: config.build_ilp_conf_string(),
+                next_reconnect_allowed: Instant::now(),
+                rows_dropped_total: 0,
+                rescue_ring: VecDeque::new(),
+            },
+        };
+        assert!(writer.reconnect_allowed_now());
+        writer.bump_reconnect_throttle();
+        assert!(!writer.reconnect_allowed_now());
+    }
+
+    /// Stock movers counter must saturate at u64::MAX on overflow.
+    #[test]
+    fn test_db7_stock_movers_record_drop_saturates() {
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: 9000,
+            ilp_port: 9009,
+            pg_port: 8812,
+        };
+        let mut writer = match StockMoversWriter::new(&config) {
+            Ok(w) => w,
+            Err(_) => StockMoversWriter {
+                sender: None,
+                buffer: questdb::ingress::Buffer::new(questdb::ingress::ProtocolVersion::V1),
+                pending_count: 0,
+                ilp_conf_string: config.build_ilp_conf_string(),
+                next_reconnect_allowed: Instant::now(),
+                rows_dropped_total: 0,
+                rescue_ring: VecDeque::new(),
+            },
+        };
+        writer.rows_dropped_total = u64::MAX - 1;
+        let err = anyhow::anyhow!("overflow");
+        writer.record_drop(100, "overflow", &err);
+        assert_eq!(writer.rows_dropped_total(), u64::MAX);
+    }
+
+    /// Pub-fn coverage: `StockMoversWriter::rows_dropped_total()` getter
+    /// on a freshly-constructed writer returns zero.
+    #[test]
+    fn test_db7_stock_movers_rows_dropped_total_starts_zero() {
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: 9000,
+            ilp_port: 9009,
+            pg_port: 8812,
+        };
+        let writer = match StockMoversWriter::new(&config) {
+            Ok(w) => w,
+            Err(_) => StockMoversWriter {
+                sender: None,
+                buffer: questdb::ingress::Buffer::new(questdb::ingress::ProtocolVersion::V1),
+                pending_count: 0,
+                ilp_conf_string: config.build_ilp_conf_string(),
+                next_reconnect_allowed: Instant::now(),
+                rows_dropped_total: 0,
+                rescue_ring: VecDeque::new(),
+            },
+        };
+        assert_eq!(writer.rows_dropped_total(), 0);
+    }
+
+    /// Pub-fn coverage: `OptionMoversWriter::rows_dropped_total()` getter
+    /// on a freshly-constructed writer returns zero.
+    #[test]
+    fn test_db7_option_movers_rows_dropped_total_starts_zero() {
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: 9000,
+            ilp_port: 9009,
+            pg_port: 8812,
+        };
+        let writer = match OptionMoversWriter::new(&config) {
+            Ok(w) => w,
+            Err(_) => OptionMoversWriter {
+                sender: None,
+                buffer: questdb::ingress::Buffer::new(questdb::ingress::ProtocolVersion::V1),
+                pending_count: 0,
+                ilp_conf_string: config.build_ilp_conf_string(),
+                next_reconnect_allowed: Instant::now(),
+                rows_dropped_total: 0,
+                rescue_ring: VecDeque::new(),
+            },
+        };
+        assert_eq!(writer.rows_dropped_total(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // DB-2: rescue ring (movers)
+    // -----------------------------------------------------------------------
+
+    fn synth_stock_writer() -> StockMoversWriter {
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: 9000,
+            ilp_port: 9009,
+            pg_port: 8812,
+        };
+        StockMoversWriter {
+            sender: None,
+            buffer: questdb::ingress::Buffer::new(questdb::ingress::ProtocolVersion::V1),
+            pending_count: 0,
+            ilp_conf_string: config.build_ilp_conf_string(),
+            next_reconnect_allowed: Instant::now(),
+            rows_dropped_total: 0,
+            rescue_ring: VecDeque::with_capacity(MOVERS_RESCUE_RING_CAPACITY),
+        }
+    }
+
+    fn synth_option_writer() -> OptionMoversWriter {
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: 9000,
+            ilp_port: 9009,
+            pg_port: 8812,
+        };
+        OptionMoversWriter {
+            sender: None,
+            buffer: questdb::ingress::Buffer::new(questdb::ingress::ProtocolVersion::V1),
+            pending_count: 0,
+            ilp_conf_string: config.build_ilp_conf_string(),
+            next_reconnect_allowed: Instant::now(),
+            rows_dropped_total: 0,
+            rescue_ring: VecDeque::with_capacity(MOVERS_RESCUE_RING_CAPACITY),
+        }
+    }
+
+    fn mk_stock_row(ts_nanos: i64) -> BufferedStockMover {
+        BufferedStockMover {
+            ts_nanos,
+            category: "GAINER".to_string(),
+            rank: 1,
+            security_id: 1,
+            segment: "NSE_EQ".to_string(),
+            symbol: "RELIANCE".to_string(),
+            ltp: 100.0,
+            prev_close: 99.0,
+            change_pct: 1.0,
+            volume: 100_000,
+        }
+    }
+
+    fn mk_option_row(ts_nanos: i64) -> BufferedOptionMover {
+        BufferedOptionMover {
+            ts_nanos,
+            category: "HIGHEST_OI".to_string(),
+            rank: 1,
+            security_id: 1,
+            segment: "NSE_FNO".to_string(),
+            contract_name: "NIFTY-Jun2026-28500-CE".to_string(),
+            underlying: "NIFTY".to_string(),
+            option_type: "CE".to_string(),
+            strike: 28500.0,
+            expiry: "2026-06-26".to_string(),
+            spot_price: 28550.0,
+            ltp: 150.0,
+            change: 5.0,
+            change_pct: 3.4,
+            oi: 100_000,
+            oi_change: 1_000,
+            oi_change_pct: 1.0,
+            volume: 50_000,
+            value: 7_500_000.0,
+        }
+    }
+
+    #[test]
+    fn test_db2_movers_rescue_ring_capacity_is_bounded() {
+        assert!(MOVERS_RESCUE_RING_CAPACITY >= 500);
+        assert!(MOVERS_RESCUE_RING_CAPACITY <= 50_000);
+    }
+
+    #[test]
+    fn test_db2_stock_rescue_ring_len_starts_zero_and_increments() {
+        let mut writer = synth_stock_writer();
+        assert_eq!(writer.rescue_ring_len(), 0);
+        writer.push_to_rescue_ring(mk_stock_row(1));
+        assert_eq!(writer.rescue_ring_len(), 1);
+        writer.push_to_rescue_ring(mk_stock_row(2));
+        assert_eq!(writer.rescue_ring_len(), 2);
+    }
+
+    #[test]
+    fn test_db2_option_rescue_ring_len_starts_zero_and_increments() {
+        let mut writer = synth_option_writer();
+        assert_eq!(writer.rescue_ring_len(), 0);
+        writer.push_to_rescue_ring(mk_option_row(1));
+        assert_eq!(writer.rescue_ring_len(), 1);
+    }
+
+    #[test]
+    fn test_db2_stock_rescue_ring_is_fifo() {
+        let mut writer = synth_stock_writer();
+        writer.push_to_rescue_ring(mk_stock_row(100));
+        writer.push_to_rescue_ring(mk_stock_row(200));
+        writer.push_to_rescue_ring(mk_stock_row(300));
+        let a = writer.rescue_ring.pop_front().unwrap();
+        let b = writer.rescue_ring.pop_front().unwrap();
+        let c = writer.rescue_ring.pop_front().unwrap();
+        assert_eq!(a.ts_nanos, 100);
+        assert_eq!(b.ts_nanos, 200);
+        assert_eq!(c.ts_nanos, 300);
+    }
+
+    #[test]
+    fn test_db2_option_rescue_ring_is_fifo() {
+        let mut writer = synth_option_writer();
+        writer.push_to_rescue_ring(mk_option_row(100));
+        writer.push_to_rescue_ring(mk_option_row(200));
+        let first = writer.rescue_ring.pop_front().unwrap();
+        let second = writer.rescue_ring.pop_front().unwrap();
+        assert_eq!(first.ts_nanos, 100);
+        assert_eq!(second.ts_nanos, 200);
+    }
+
+    #[test]
+    fn test_db2_stock_rescue_ring_overflow_evicts_oldest_and_counts_drop() {
+        let mut writer = synth_stock_writer();
+        // Pre-fill to capacity directly (bypass push_to_rescue_ring so
+        // we don't run the overflow check N times during setup).
+        for i in 0..MOVERS_RESCUE_RING_CAPACITY {
+            writer
+                .rescue_ring
+                .push_back(mk_stock_row(i64::try_from(i).unwrap_or(i64::MAX)));
+        }
+        assert_eq!(writer.rescue_ring_len(), MOVERS_RESCUE_RING_CAPACITY);
+        assert_eq!(writer.rows_dropped_total(), 0);
+
+        // Push one more — oldest (ts=0) must be evicted.
+        writer.push_to_rescue_ring(mk_stock_row(i64::MAX));
+        assert_eq!(writer.rescue_ring_len(), MOVERS_RESCUE_RING_CAPACITY);
+        assert_eq!(writer.rows_dropped_total(), 1);
+        assert_eq!(writer.rescue_ring.back().unwrap().ts_nanos, i64::MAX);
+        assert_eq!(writer.rescue_ring.front().unwrap().ts_nanos, 1);
+    }
+
+    #[test]
+    fn test_db2_option_rescue_ring_overflow_evicts_oldest_and_counts_drop() {
+        let mut writer = synth_option_writer();
+        for i in 0..MOVERS_RESCUE_RING_CAPACITY {
+            writer
+                .rescue_ring
+                .push_back(mk_option_row(i64::try_from(i).unwrap_or(i64::MAX)));
+        }
+        assert_eq!(writer.rescue_ring_len(), MOVERS_RESCUE_RING_CAPACITY);
+        assert_eq!(writer.rows_dropped_total(), 0);
+        writer.push_to_rescue_ring(mk_option_row(i64::MAX));
+        assert_eq!(writer.rescue_ring_len(), MOVERS_RESCUE_RING_CAPACITY);
+        assert_eq!(writer.rows_dropped_total(), 1);
+    }
+
+    #[test]
+    fn test_db2_buffered_stock_row_size_is_bounded() {
+        let size = std::mem::size_of::<BufferedStockMover>();
+        assert!(
+            size <= 160,
+            "BufferedStockMover size is {size} bytes — if this grows, \
+             re-tune MOVERS_RESCUE_RING_CAPACITY"
+        );
+    }
+
+    #[test]
+    fn test_db2_buffered_option_row_size_is_bounded() {
+        let size = std::mem::size_of::<BufferedOptionMover>();
+        assert!(
+            size <= 320,
+            "BufferedOptionMover size is {size} bytes — if this grows, \
+             re-tune MOVERS_RESCUE_RING_CAPACITY"
+        );
     }
 }
