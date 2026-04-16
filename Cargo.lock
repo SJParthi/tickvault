@@ -3808,6 +3808,7 @@ dependencies = [
  "anyhow",
  "axum",
  "chrono",
+ "metrics",
  "reqwest",
  "serde",
  "serde_json",

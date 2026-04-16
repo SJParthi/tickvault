@@ -24,7 +24,7 @@ pub mod state;
 use axum::Router;
 use tower_http::cors::CorsLayer;
 
-use middleware::{ApiAuthConfig, require_bearer_auth};
+use middleware::{ApiAuthConfig, request_tracing, require_bearer_auth};
 use state::SharedAppState;
 
 /// Builds the full axum router with all routes and middleware.
@@ -139,6 +139,7 @@ pub fn build_router(state: SharedAppState, allowed_origins: &[String], dry_run: 
 
     public_routes
         .merge(protected_routes)
+        .layer(axum::middleware::from_fn(request_tracing))
         .layer(cors)
         .with_state(state)
 }

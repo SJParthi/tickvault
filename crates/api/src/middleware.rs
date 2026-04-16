@@ -177,6 +177,46 @@ pub async fn require_bearer_auth(
 }
 
 // ---------------------------------------------------------------------------
+// Request Tracing Middleware (L5)
+// ---------------------------------------------------------------------------
+
+/// Request tracing middleware — logs every HTTP request with method, path,
+/// status code, and duration. Emits `tv_api_request_duration_ms` histogram
+/// for Prometheus/Grafana dashboards.
+///
+/// # Performance
+/// O(1) per request — one `Instant::now()` + one histogram observe.
+/// No allocation beyond what axum already does for request routing.
+pub async fn request_tracing(request: Request, next: Next) -> Response {
+    let start = std::time::Instant::now();
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+
+    let response = next.run(request).await;
+
+    let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let status = response.status().as_u16();
+
+    // Emit histogram for Grafana dashboards (P99 latency, throughput, etc.)
+    metrics::histogram!("tv_api_request_duration_ms",
+        "method" => method.to_string(),
+        "status" => status.to_string(),
+    )
+    .record(duration_ms);
+
+    // Structured log for audit trail — includes all 5W fields.
+    tracing::info!(
+        http.method = %method,
+        http.path = %path,
+        http.status = status,
+        duration_ms = format!("{duration_ms:.2}"),
+        "API request completed"
+    );
+
+    response
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -986,5 +1026,59 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // -----------------------------------------------------------------------
+    // Request tracing middleware (L5)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_request_tracing_returns_response_and_preserves_status() {
+        use axum::Router;
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let app = Router::new()
+            .route("/health", axum::routing::get(mock_handler))
+            .layer(axum::middleware::from_fn(super::request_tracing));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_request_tracing_404_for_unknown_route() {
+        use axum::Router;
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let app = Router::new()
+            .route("/health", axum::routing::get(mock_handler))
+            .layer(axum::middleware::from_fn(super::request_tracing));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/nonexistent")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }

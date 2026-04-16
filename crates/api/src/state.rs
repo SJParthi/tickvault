@@ -34,6 +34,10 @@ pub struct SystemHealthStatus {
     questdb_reachable: AtomicBool,
     /// Whether the auth token is currently valid.
     token_valid: AtomicBool,
+    /// Seconds remaining until token expiry (0 = expired or unknown).
+    token_remaining_secs: AtomicU64,
+    /// Whether Valkey cache is reachable.
+    valkey_reachable: AtomicBool,
     /// Whether the tick persistence writer is connected to QuestDB.
     tick_persistence_connected: AtomicBool,
     /// Number of ticks currently buffered in the ring buffer (waiting for QuestDB).
@@ -55,6 +59,8 @@ impl SystemHealthStatus {
             pipeline_active: AtomicBool::new(false),
             questdb_reachable: AtomicBool::new(false),
             token_valid: AtomicBool::new(false),
+            token_remaining_secs: AtomicU64::new(0),
+            valkey_reachable: AtomicBool::new(false),
             tick_persistence_connected: AtomicBool::new(false),
             tick_buffer_size: AtomicU64::new(0),
             ticks_spilled: AtomicU64::new(0),
@@ -137,6 +143,30 @@ impl SystemHealthStatus {
     /// Returns whether the auth token is valid.
     pub fn token_valid(&self) -> bool {
         self.token_valid.load(Ordering::Relaxed)
+    }
+
+    /// Updates token remaining seconds (for health endpoint).
+    // TEST-EXEMPT: trivial AtomicU64 store, tested indirectly by health endpoint tests
+    pub fn set_token_remaining_secs(&self, secs: u64) {
+        self.token_remaining_secs.store(secs, Ordering::Relaxed);
+    }
+
+    /// Returns seconds until token expiry (0 = expired or unknown).
+    // TEST-EXEMPT: trivial AtomicU64 load, tested indirectly by health endpoint tests
+    pub fn token_remaining_secs(&self) -> u64 {
+        self.token_remaining_secs.load(Ordering::Relaxed)
+    }
+
+    /// Marks Valkey cache as reachable/unreachable.
+    // TEST-EXEMPT: trivial AtomicBool store, tested indirectly by health endpoint tests
+    pub fn set_valkey_reachable(&self, reachable: bool) {
+        self.valkey_reachable.store(reachable, Ordering::Relaxed);
+    }
+
+    /// Returns whether Valkey is reachable.
+    // TEST-EXEMPT: trivial AtomicBool load, tested indirectly by health endpoint tests
+    pub fn valkey_reachable(&self) -> bool {
+        self.valkey_reachable.load(Ordering::Relaxed)
     }
 
     /// Marks tick persistence as connected/disconnected.

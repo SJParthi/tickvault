@@ -509,6 +509,56 @@ groups:
           summary: "WebSocket frame send timeouts detected"
           description: "{{ $value }} send timeouts/sec. Tick processor may be overloaded."
 
+      # L2: Tick persistence stalled — ticks being processed but nothing persisted
+      - alert: TickPersistenceStalled
+        expr: rate(tv_ticks_persisted_total[5m]) == 0 and rate(tv_ticks_processed_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Tick persistence stalled — processing but not writing to QuestDB"
+          description: "Ticks are being processed but zero ticks persisted for 5 minutes. Check QuestDB connection."
+
+      # L2: 200-level depth stuck in reset loop (Dhan Ticket #5519522)
+      - alert: Depth200ResetLoop
+        expr: tv_depth_200lvl_consecutive_resets > 5
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "200-level depth stuck in reset loop: {{ $labels.label }}"
+          description: "{{ $labels.label }} has {{ $value }} consecutive TCP resets. Dhan server rejecting all connection attempts."
+
+      # L2: Tick data loss — received vs persisted reconciliation gap
+      - alert: TickDataLoss
+        expr: (tv_ticks_processed_total - tv_ticks_persisted_total - tv_storage_errors_total) > 1000
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Tick reconciliation gap detected"
+          description: "{{ $value }} ticks processed but not persisted. Possible silent data loss in pipeline."
+
+      # L2: Canary tick stale during market hours
+      - alert: CanaryTickStale
+        expr: (time() - tv_ws_canary_last_tick_epoch_secs) > 15 and tv_pipeline_active == 1
+        for: 15s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Canary tick stale: {{ $labels.underlying }}"
+          description: "{{ $labels.underlying }} has not received a tick for {{ $value }}s while pipeline is active. End-to-end feed may be broken."
+
+      # L5: API request latency SLA
+      - alert: HighApiLatency
+        expr: histogram_quantile(0.99, rate(tv_api_request_duration_ms_bucket[5m])) > 500
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "API p99 latency > 500ms"
+          description: "API request p99 latency is {{ $value }}ms. Check QuestDB or downstream services."
+
       # SEBI rate limiter denying orders
       - alert: RateLimiterDenying
         expr: rate(tv_rate_limiter_denied_total[5m]) > 0

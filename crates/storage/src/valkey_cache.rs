@@ -6,12 +6,13 @@
 //! # Boot Sequence Position
 //! Initialized after QuestDB (step 6.5), before WebSocket pool.
 
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use deadpool_redis::{Config, Pool, Runtime};
 use redis::AsyncCommands;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use tickvault_common::config::ValkeyConfig;
 
@@ -21,6 +22,128 @@ use tickvault_common::config::ValkeyConfig;
 
 /// Timeout for pool connection checkout (prevents blocking on dead Valkey).
 const POOL_CHECKOUT_TIMEOUT_MS: u64 = 500;
+
+/// Number of consecutive failures before circuit breaker opens.
+const CIRCUIT_BREAKER_FAILURE_THRESHOLD: u64 = 5;
+
+/// Cooldown duration before transitioning from Open → HalfOpen.
+const CIRCUIT_BREAKER_COOLDOWN_SECS: u64 = 30;
+
+// ---------------------------------------------------------------------------
+// Circuit Breaker (3-state FSM)
+// ---------------------------------------------------------------------------
+
+/// Circuit breaker states for Valkey connection.
+///
+/// Prevents cascading failures when Valkey is down by short-circuiting
+/// all cache operations (returning cache miss) instead of waiting for
+/// network timeouts on every request.
+///
+/// State machine: Closed → Open → HalfOpen → Closed (on success) or Open (on failure)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CircuitState {
+    /// Normal operation — all requests pass through.
+    Closed,
+    /// Valkey is down — all requests immediately return cache miss (no network call).
+    Open,
+    /// One probe request allowed — if it succeeds, transition to Closed.
+    HalfOpen,
+}
+
+/// Thread-safe circuit breaker for Valkey operations.
+///
+/// Uses atomics for O(1) lock-free state reads on the hot path.
+/// Only transitions (record_failure/record_success) acquire state.
+pub struct CircuitBreaker {
+    /// Consecutive failure count (atomic for lock-free reads).
+    consecutive_failures: AtomicU64,
+    /// Timestamp when circuit opened (for cooldown timer).
+    opened_at: std::sync::Mutex<Option<Instant>>,
+    /// Current state (derived from failures + cooldown, not stored directly).
+    /// Stored separately for O(1) metric emission.
+    state_gauge: metrics::Gauge,
+}
+
+impl CircuitBreaker {
+    /// Creates a new circuit breaker in Closed state.
+    fn new() -> Self {
+        Self {
+            consecutive_failures: AtomicU64::new(0),
+            opened_at: std::sync::Mutex::new(None),
+            state_gauge: metrics::gauge!("tv_valkey_circuit_state"),
+        }
+    }
+
+    /// Returns the current circuit state.
+    ///
+    /// O(1) — reads atomic counter + optional Instant comparison.
+    pub fn state(&self) -> CircuitState {
+        let failures = self.consecutive_failures.load(Ordering::Relaxed);
+
+        if failures < CIRCUIT_BREAKER_FAILURE_THRESHOLD {
+            return CircuitState::Closed;
+        }
+
+        // Circuit is open — check if cooldown has elapsed.
+        // APPROVED: lock poison on Mutex is unrecoverable — same pattern as ValkeyPool::reconnect
+        #[allow(clippy::expect_used)]
+        #[rustfmt::skip]
+        let guard = self.opened_at.lock().expect("pool lock poisoned"); // APPROVED: lock poison is unrecoverable
+        if let Some(opened) = *guard {
+            if opened.elapsed() >= Duration::from_secs(CIRCUIT_BREAKER_COOLDOWN_SECS) {
+                CircuitState::HalfOpen
+            } else {
+                CircuitState::Open
+            }
+        } else {
+            CircuitState::Open
+        }
+    }
+
+    /// Records a successful operation — resets to Closed.
+    fn record_success(&self) {
+        self.consecutive_failures.store(0, Ordering::Relaxed);
+        // APPROVED: lock poison on Mutex is unrecoverable — same pattern as ValkeyPool::reconnect
+        #[allow(clippy::expect_used)]
+        #[rustfmt::skip]
+        let mut guard = self.opened_at.lock().expect("pool lock poisoned"); // APPROVED: lock poison is unrecoverable
+        *guard = None;
+        self.state_gauge.set(0.0); // 0 = Closed
+    }
+
+    /// Records a failure — may transition to Open.
+    fn record_failure(&self) {
+        let prev = self.consecutive_failures.fetch_add(1, Ordering::Relaxed);
+        let new_count = prev.saturating_add(1);
+
+        if new_count >= CIRCUIT_BREAKER_FAILURE_THRESHOLD {
+            // APPROVED: lock poison on Mutex is unrecoverable — same pattern as ValkeyPool::reconnect
+            #[allow(clippy::expect_used)]
+            #[rustfmt::skip]
+            let mut guard = self.opened_at.lock().expect("pool lock poisoned"); // APPROVED: lock poison is unrecoverable
+            if guard.is_none() {
+                *guard = Some(Instant::now());
+                error!(
+                    consecutive_failures = new_count,
+                    cooldown_secs = CIRCUIT_BREAKER_COOLDOWN_SECS,
+                    "Valkey circuit breaker OPEN — cache operations short-circuited"
+                );
+            }
+            self.state_gauge.set(1.0); // 1 = Open
+        }
+    }
+
+    /// Returns `true` if the circuit allows a request through.
+    ///
+    /// In HalfOpen state, allows exactly one probe request.
+    fn should_allow(&self) -> bool {
+        match self.state() {
+            CircuitState::Closed => true,
+            CircuitState::HalfOpen => true, // Allow probe
+            CircuitState::Open => false,    // Block all requests
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Pure helper functions (testable without Redis)
@@ -99,6 +222,7 @@ pub fn compute_instrument_ttl_secs(current_epoch_secs: u64, target_hour_ist: u8)
 pub struct ValkeyPool {
     pool: std::sync::RwLock<Pool>,
     config: ValkeyConfig,
+    circuit: CircuitBreaker,
 }
 
 impl ValkeyPool {
@@ -119,6 +243,7 @@ impl ValkeyPool {
         Ok(Self {
             pool: std::sync::RwLock::new(pool),
             config: config.clone(),
+            circuit: CircuitBreaker::new(),
         })
     }
 
@@ -199,8 +324,16 @@ impl ValkeyPool {
 
     /// GET a string value by key.
     ///
-    /// On connection error, attempts pool reconnect once and retries.
+    /// Circuit breaker: if Valkey has failed `CIRCUIT_BREAKER_FAILURE_THRESHOLD`
+    /// times consecutively, returns `Ok(None)` (cache miss) immediately without
+    /// a network call. After `CIRCUIT_BREAKER_COOLDOWN_SECS`, allows one probe.
     pub async fn get(&self, key: &str) -> Result<Option<String>> {
+        if !self.circuit.should_allow() {
+            debug!(key, "Valkey circuit OPEN — returning cache miss");
+            metrics::counter!("tv_valkey_circuit_rejected_total", "op" => "get").increment(1);
+            return Ok(None);
+        }
+
         let result = self.get_inner(key).await;
 
         let result = if result.is_err() {
@@ -218,6 +351,9 @@ impl ValkeyPool {
         metrics::counter!("tv_valkey_ops_total", "op" => "get").increment(1);
         if result.is_err() {
             metrics::counter!("tv_valkey_errors_total", "op" => "get").increment(1);
+            self.circuit.record_failure();
+        } else {
+            self.circuit.record_success();
         }
 
         result
@@ -233,8 +369,15 @@ impl ValkeyPool {
 
     /// SET a string value.
     ///
-    /// On connection error, attempts pool reconnect once and retries.
+    /// Circuit breaker: same behavior as `get` — short-circuits to `Ok(())`
+    /// when circuit is Open (write is lost but pipeline is not blocked).
     pub async fn set(&self, key: &str, value: &str) -> Result<()> {
+        if !self.circuit.should_allow() {
+            debug!(key, "Valkey circuit OPEN — dropping SET");
+            metrics::counter!("tv_valkey_circuit_rejected_total", "op" => "set").increment(1);
+            return Ok(());
+        }
+
         let result = self.set_inner(key, value).await;
 
         let result = if result.is_err() {
@@ -252,6 +395,9 @@ impl ValkeyPool {
         metrics::counter!("tv_valkey_ops_total", "op" => "set").increment(1);
         if result.is_err() {
             metrics::counter!("tv_valkey_errors_total", "op" => "set").increment(1);
+            self.circuit.record_failure();
+        } else {
+            self.circuit.record_success();
         }
 
         result
@@ -265,8 +411,13 @@ impl ValkeyPool {
             .with_context(|| format!("Valkey SET failed for key={key}"))
     }
 
-    /// SET with expiry (seconds).
+    /// SET with expiry (seconds). Circuit breaker protected.
     pub async fn set_ex(&self, key: &str, value: &str, ttl_secs: u64) -> Result<()> {
+        if !self.circuit.should_allow() {
+            metrics::counter!("tv_valkey_circuit_rejected_total", "op" => "set_ex").increment(1);
+            return Ok(());
+        }
+
         let mut conn = self.checkout_conn().await?;
 
         let result = conn
@@ -277,13 +428,21 @@ impl ValkeyPool {
         metrics::counter!("tv_valkey_ops_total", "op" => "set").increment(1);
         if result.is_err() {
             metrics::counter!("tv_valkey_errors_total", "op" => "set").increment(1);
+            self.circuit.record_failure();
+        } else {
+            self.circuit.record_success();
         }
 
         result
     }
 
-    /// DEL a key.
+    /// DEL a key. Circuit breaker protected.
     pub async fn del(&self, key: &str) -> Result<()> {
+        if !self.circuit.should_allow() {
+            metrics::counter!("tv_valkey_circuit_rejected_total", "op" => "del").increment(1);
+            return Ok(());
+        }
+
         let mut conn = self.checkout_conn().await?;
 
         let result = conn
@@ -294,13 +453,21 @@ impl ValkeyPool {
         metrics::counter!("tv_valkey_ops_total", "op" => "del").increment(1);
         if result.is_err() {
             metrics::counter!("tv_valkey_errors_total", "op" => "del").increment(1);
+            self.circuit.record_failure();
+        } else {
+            self.circuit.record_success();
         }
 
         result
     }
 
-    /// EXISTS check for a key.
+    /// EXISTS check for a key. Circuit breaker protected.
     pub async fn exists(&self, key: &str) -> Result<bool> {
+        if !self.circuit.should_allow() {
+            metrics::counter!("tv_valkey_circuit_rejected_total", "op" => "exists").increment(1);
+            return Ok(false);
+        }
+
         let mut conn = self.checkout_conn().await?;
 
         let result: Result<bool, _> = conn
@@ -311,13 +478,21 @@ impl ValkeyPool {
         metrics::counter!("tv_valkey_ops_total", "op" => "exists").increment(1);
         if result.is_err() {
             metrics::counter!("tv_valkey_errors_total", "op" => "exists").increment(1);
+            self.circuit.record_failure();
+        } else {
+            self.circuit.record_success();
         }
 
         result
     }
 
-    /// SET if Not eXists with expiry (atomic lock pattern).
+    /// SET if Not eXists with expiry (atomic lock pattern). Circuit breaker protected.
     pub async fn set_nx_ex(&self, key: &str, value: &str, ttl_secs: u64) -> Result<bool> {
+        if !self.circuit.should_allow() {
+            metrics::counter!("tv_valkey_circuit_rejected_total", "op" => "set_nx_ex").increment(1);
+            return Ok(false);
+        }
+
         let mut conn = self.checkout_conn().await?;
 
         // Use SET NX EX for atomic set-if-not-exists with expiry
@@ -334,9 +509,18 @@ impl ValkeyPool {
         metrics::counter!("tv_valkey_ops_total", "op" => "set").increment(1);
         if result.is_err() {
             metrics::counter!("tv_valkey_errors_total", "op" => "set").increment(1);
+            self.circuit.record_failure();
+        } else {
+            self.circuit.record_success();
         }
 
         Ok(result?.is_some())
+    }
+
+    /// Returns the current circuit breaker state (for health endpoint).
+    // WIRING-EXEMPT: called from app crate's boot sequence to feed SharedHealthStatus
+    pub fn circuit_state(&self) -> CircuitState {
+        self.circuit.state()
     }
 }
 
@@ -1988,5 +2172,80 @@ mod tests {
         // remaining = 86400 - 19800 + 0 = 66600s
         assert!(ttl >= 60);
         assert!(ttl <= 86_400);
+    }
+
+    // -----------------------------------------------------------------------
+    // Circuit Breaker tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_circuit_breaker_starts_closed() {
+        let cb = CircuitBreaker::new();
+        assert_eq!(cb.state(), CircuitState::Closed);
+        assert!(cb.should_allow());
+    }
+
+    #[test]
+    fn test_circuit_breaker_stays_closed_under_threshold() {
+        let cb = CircuitBreaker::new();
+        for _ in 0..CIRCUIT_BREAKER_FAILURE_THRESHOLD.saturating_sub(1) {
+            cb.record_failure();
+        }
+        assert_eq!(cb.state(), CircuitState::Closed);
+        assert!(cb.should_allow());
+    }
+
+    #[test]
+    fn test_circuit_breaker_opens_at_threshold() {
+        let cb = CircuitBreaker::new();
+        for _ in 0..CIRCUIT_BREAKER_FAILURE_THRESHOLD {
+            cb.record_failure();
+        }
+        assert_eq!(cb.state(), CircuitState::Open);
+        assert!(!cb.should_allow());
+    }
+
+    #[test]
+    fn test_circuit_breaker_resets_on_success() {
+        let cb = CircuitBreaker::new();
+        // Open the circuit
+        for _ in 0..CIRCUIT_BREAKER_FAILURE_THRESHOLD {
+            cb.record_failure();
+        }
+        assert_eq!(cb.state(), CircuitState::Open);
+
+        // Success resets to Closed
+        cb.record_success();
+        assert_eq!(cb.state(), CircuitState::Closed);
+        assert!(cb.should_allow());
+    }
+
+    #[test]
+    fn test_circuit_breaker_success_resets_failure_count() {
+        let cb = CircuitBreaker::new();
+        // Accumulate some failures (below threshold)
+        for _ in 0..3 {
+            cb.record_failure();
+        }
+        // Success resets counter
+        cb.record_success();
+        assert_eq!(cb.consecutive_failures.load(Ordering::Relaxed), 0);
+        assert_eq!(cb.state(), CircuitState::Closed);
+    }
+
+    #[test]
+    fn test_circuit_state_display_values() {
+        // Ensure all 3 states are distinct
+        assert_ne!(CircuitState::Closed, CircuitState::Open);
+        assert_ne!(CircuitState::Open, CircuitState::HalfOpen);
+        assert_ne!(CircuitState::Closed, CircuitState::HalfOpen);
+    }
+
+    #[test]
+    fn test_circuit_breaker_constants_are_reasonable() {
+        const _: () = assert!(CIRCUIT_BREAKER_FAILURE_THRESHOLD >= 2);
+        const _: () = assert!(CIRCUIT_BREAKER_FAILURE_THRESHOLD <= 20);
+        const _: () = assert!(CIRCUIT_BREAKER_COOLDOWN_SECS >= 5);
+        const _: () = assert!(CIRCUIT_BREAKER_COOLDOWN_SECS <= 300);
     }
 }

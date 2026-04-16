@@ -731,6 +731,17 @@ impl TokenManager {
         loop {
             let sleep_duration = self.time_until_next_refresh();
 
+            // L4: Emit token remaining seconds gauge for Prometheus alert rules.
+            // tv_token_remaining_seconds drives TokenExpiryWarning (<1h) and
+            // TokenExpiryCritical (<10min) alerts in tickvault-alerts.yml.
+            {
+                let guard = self.token.load();
+                if let Some(state) = guard.as_ref().as_ref() {
+                    let remaining = state.time_until_refresh(0);
+                    metrics::gauge!("tv_token_remaining_seconds").set(remaining.as_secs() as f64);
+                }
+            }
+
             if sleep_duration > Duration::ZERO {
                 info!(
                     sleep_secs = sleep_duration.as_secs(),
@@ -752,6 +763,15 @@ impl TokenManager {
 
                 match self.renew_with_fallback().await {
                     Ok(()) => {
+                        // Update token remaining gauge after successful renewal.
+                        {
+                            let guard = self.token.load();
+                            if let Some(state) = guard.as_ref().as_ref() {
+                                let remaining = state.time_until_refresh(0);
+                                metrics::gauge!("tv_token_remaining_seconds")
+                                    .set(remaining.as_secs() as f64);
+                            }
+                        }
                         info!(
                             attempts,
                             expires_at = %self.current_expiry_display(),
