@@ -197,19 +197,35 @@ pub fn should_rebalance(
     curr_idx.abs_diff(prev_idx) >= threshold
 }
 
-/// Returns the CE and PE security IDs at the strike nearest to `spot_price`.
+/// ATM contract identifiers at a given spot price — CE + PE security IDs
+/// and the actual ATM strike price from the chain (not the raw spot price).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AtmIds {
+    /// CE security ID at ATM strike.
+    pub ce_id: u32,
+    /// PE security ID at ATM strike (None if no matching put).
+    pub pe_id: Option<u32>,
+    /// The actual strike price in the chain closest to spot.
+    pub strike: f64,
+}
+
+/// Returns the CE and PE security IDs + actual strike at the ATM nearest to `spot_price`.
 ///
-/// Used by the depth rebalancer to include contract identifiers in Telegram
-/// notifications so operators can see exactly which contracts shifted.
-pub fn find_atm_security_ids(chain: &OptionChain, spot_price: f64) -> (Option<u32>, Option<u32>) {
+/// Used by the depth rebalancer to include full contract labels in Telegram
+/// notifications (e.g. `NIFTY-24Apr2026-24400-CE (SID 35246)`).
+pub fn find_atm_security_ids(chain: &OptionChain, spot_price: f64) -> Option<AtmIds> {
     if chain.calls.is_empty() || !spot_price.is_finite() || spot_price <= 0.0 {
-        return (None, None);
+        return None;
     }
     let atm_idx = find_atm_index(&chain.calls, spot_price);
-    let ce_id = Some(chain.calls[atm_idx].security_id);
-    let pe_id =
-        find_put_at_strike(&chain.puts, chain.calls[atm_idx].strike_price).map(|p| p.security_id);
-    (ce_id, pe_id)
+    let strike = chain.calls[atm_idx].strike_price;
+    let ce_id = chain.calls[atm_idx].security_id;
+    let pe_id = find_put_at_strike(&chain.puts, strike).map(|p| p.security_id);
+    Some(AtmIds {
+        ce_id,
+        pe_id,
+        strike,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -489,17 +505,31 @@ mod tests {
     }
 
     #[test]
-    fn test_find_atm_security_ids_returns_ce_pe() {
+    fn test_find_atm_security_ids_returns_ce_pe_and_strike() {
         let strikes: Vec<f64> = (0..5).map(|i| 23000.0 + (i as f64) * 100.0).collect();
         let chain = make_chain(
             &strikes,
             "NIFTY",
             NaiveDate::from_ymd_opt(2026, 4, 9).unwrap(),
         );
-        let (ce, pe) = find_atm_security_ids(&chain, 23200.0);
-        // ATM at 23200 → index 2 → CE=10002, PE=20002
-        assert_eq!(ce, Some(10002));
-        assert_eq!(pe, Some(20002));
+        let atm = find_atm_security_ids(&chain, 23200.0).unwrap();
+        // ATM at 23200 → index 2 → CE=10002, PE=20002, strike=23200.0
+        assert_eq!(atm.ce_id, 10002);
+        assert_eq!(atm.pe_id, Some(20002));
+        assert!((atm.strike - 23200.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_find_atm_security_ids_between_strikes() {
+        let strikes: Vec<f64> = (0..5).map(|i| 23000.0 + (i as f64) * 100.0).collect();
+        let chain = make_chain(
+            &strikes,
+            "NIFTY",
+            NaiveDate::from_ymd_opt(2026, 4, 9).unwrap(),
+        );
+        // Spot 23170 → nearest strike is 23200 (not 23100)
+        let atm = find_atm_security_ids(&chain, 23170.0).unwrap();
+        assert!((atm.strike - 23200.0).abs() < 0.01);
     }
 
     #[test]
@@ -511,9 +541,7 @@ mod tests {
             puts: vec![],
             future_security_id: None,
         };
-        let (ce, pe) = find_atm_security_ids(&chain, 23200.0);
-        assert_eq!(ce, None);
-        assert_eq!(pe, None);
+        assert!(find_atm_security_ids(&chain, 23200.0).is_none());
     }
 
     #[test]
@@ -524,8 +552,6 @@ mod tests {
             "NIFTY",
             NaiveDate::from_ymd_opt(2026, 4, 9).unwrap(),
         );
-        let (ce, pe) = find_atm_security_ids(&chain, 0.0);
-        assert_eq!(ce, None);
-        assert_eq!(pe, None);
+        assert!(find_atm_security_ids(&chain, 0.0).is_none());
     }
 }
