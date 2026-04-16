@@ -1027,4 +1027,58 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
+
+    // -----------------------------------------------------------------------
+    // Request tracing middleware (L5)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_request_tracing_returns_response_and_preserves_status() {
+        use axum::Router;
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let app = Router::new()
+            .route("/health", axum::routing::get(mock_handler))
+            .layer(axum::middleware::from_fn(super::request_tracing));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_request_tracing_404_for_unknown_route() {
+        use axum::Router;
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let app = Router::new()
+            .route("/health", axum::routing::get(mock_handler))
+            .layer(axum::middleware::from_fn(super::request_tracing));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/nonexistent")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
 }
