@@ -214,7 +214,7 @@ async def test_200_depth(url_base, client_id, access_token, security_id, label):
         "SecurityId": security_id,
     })
     print(f"SUB:  {subscribe_msg}")
-    print(f"SID:  {SECURITY_ID} (segment: {EXCHANGE_SEGMENT})")
+    print(f"SID:  {security_id} (segment: {EXCHANGE_SEGMENT})")
 
     try:
         print(f"[...] Connecting...")
