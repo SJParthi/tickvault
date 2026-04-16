@@ -48,9 +48,10 @@ match the zero-loss stance.
   - Tests: `test_db1_rescue_ring_capacity_is_bounded`, `test_db1_rescue_ring_len_starts_zero_and_increments`, `test_db1_rescue_ring_is_fifo`, `test_db1_rescue_ring_overflow_evicts_oldest_and_counts_drop`, `test_db1_buffered_snapshot_is_copy`, `test_db1_buffered_snapshot_size_is_bounded`
   - NOTE: pragmatic in-memory ring (20K capacity = 3.2 MB, FIFO drain on reconnect). Disk-spill WAL is a separate follow-up when the global WAL architecture lands; the in-memory ring covers QuestDB outages up to ~40 min which matches the typical restart window.
 
-- [ ] **DB-2**: Ring-buffer + disk-spill rescue on `MoversWriter` (stock + option)
+- [x] **DB-2**: Bounded in-memory rescue ring on `StockMoversWriter` + `OptionMoversWriter` — done
   - Files: `crates/storage/src/movers_persistence.rs`
-  - Tests: `test_stock_movers_rescues_on_reconnect_fail`, `test_option_movers_rescues_on_reconnect_fail`, `test_movers_ring_overflow_spills`
+  - Tests: `test_db2_movers_rescue_ring_capacity_is_bounded`, `test_db2_stock_rescue_ring_len_starts_zero_and_increments`, `test_db2_option_rescue_ring_len_starts_zero_and_increments`, `test_db2_stock_rescue_ring_is_fifo`, `test_db2_option_rescue_ring_is_fifo`, `test_db2_stock_rescue_ring_overflow_evicts_oldest_and_counts_drop`, `test_db2_option_rescue_ring_overflow_evicts_oldest_and_counts_drop`, `test_db2_buffered_stock_row_size_is_bounded`, `test_db2_buffered_option_row_size_is_bounded`
+  - NOTE: 5,000 capacity per writer (~3 MB combined). Disk-spill WAL is a separate follow-up pending the global WAL architecture; the in-memory ring covers routine QuestDB restarts.
 
 - [x] **WS-1**: Watchdog panic supervisor — spawn_with_panic_notify helper, all 4 call sites updated — done
   - Files: `crates/core/src/websocket/activity_watchdog.rs`, `connection.rs`, `depth_connection.rs`, `order_update_connection.rs`
