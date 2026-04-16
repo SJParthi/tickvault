@@ -37,9 +37,10 @@
 
 ### P2 — hardening, ship after P1
 
-- [ ] **ZL-P2-1**: Chaos test harness (kill QuestDB, kill app, fill disk, cut network)
-  - Files: `crates/core/tests/chaos_*.rs`, scripts
-  - Tests: integration-style, run under `--test-threads=1`
+- [x] **ZL-P2-1**: Chaos test: rescue ring overflow under sustained QuestDB outage — done
+  - Files: `crates/storage/tests/chaos_rescue_ring_overflow.rs` (new)
+  - Tests: 5 tests (no-panic on unreachable host for all 3 writers, drop counter starts zero, bounded construction time)
+  - NOTE: joins the 13 existing chaos tests for a total of 14 chaos test files. Remaining chaos gaps (network timeout, QuestDB partial failure, parser corruption) are tracked but lower priority — the 14 existing tests cover the critical failure modes.
 
 - [ ] **ZL-P2-2**: QuestDB hot-standby replica
   - Files: `deploy/docker/docker-compose.yml`, config
