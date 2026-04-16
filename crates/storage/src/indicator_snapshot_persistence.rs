@@ -643,6 +643,30 @@ mod tests {
         assert_eq!(writer.rows_dropped_total(), 750);
     }
 
+    /// Pub-fn coverage: the `rows_dropped_total()` getter starts at zero
+    /// on a freshly-constructed (or test-synthesized) writer.
+    #[test]
+    fn test_db7_rows_dropped_total_starts_zero() {
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: 9000,
+            ilp_port: 9009,
+            pg_port: 8812,
+        };
+        let writer = match IndicatorSnapshotWriter::new(&config) {
+            Ok(w) => w,
+            Err(_) => IndicatorSnapshotWriter {
+                sender: None,
+                buffer: questdb::ingress::Buffer::new(questdb::ingress::ProtocolVersion::V1),
+                pending_count: 0,
+                ilp_conf_string: config.build_ilp_conf_string(),
+                next_reconnect_allowed: Instant::now(),
+                rows_dropped_total: 0,
+            },
+        };
+        assert_eq!(writer.rows_dropped_total(), 0);
+    }
+
     /// Saturating arithmetic: an impossibly-large drop count must not
     /// overflow `rows_dropped_total`.
     #[test]

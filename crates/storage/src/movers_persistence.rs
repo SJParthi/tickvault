@@ -1036,4 +1036,52 @@ mod tests {
         writer.record_drop(100, "overflow", &err);
         assert_eq!(writer.rows_dropped_total(), u64::MAX);
     }
+
+    /// Pub-fn coverage: `StockMoversWriter::rows_dropped_total()` getter
+    /// on a freshly-constructed writer returns zero.
+    #[test]
+    fn test_db7_stock_movers_rows_dropped_total_starts_zero() {
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: 9000,
+            ilp_port: 9009,
+            pg_port: 8812,
+        };
+        let writer = match StockMoversWriter::new(&config) {
+            Ok(w) => w,
+            Err(_) => StockMoversWriter {
+                sender: None,
+                buffer: questdb::ingress::Buffer::new(questdb::ingress::ProtocolVersion::V1),
+                pending_count: 0,
+                ilp_conf_string: config.build_ilp_conf_string(),
+                next_reconnect_allowed: Instant::now(),
+                rows_dropped_total: 0,
+            },
+        };
+        assert_eq!(writer.rows_dropped_total(), 0);
+    }
+
+    /// Pub-fn coverage: `OptionMoversWriter::rows_dropped_total()` getter
+    /// on a freshly-constructed writer returns zero.
+    #[test]
+    fn test_db7_option_movers_rows_dropped_total_starts_zero() {
+        let config = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: 9000,
+            ilp_port: 9009,
+            pg_port: 8812,
+        };
+        let writer = match OptionMoversWriter::new(&config) {
+            Ok(w) => w,
+            Err(_) => OptionMoversWriter {
+                sender: None,
+                buffer: questdb::ingress::Buffer::new(questdb::ingress::ProtocolVersion::V1),
+                pending_count: 0,
+                ilp_conf_string: config.build_ilp_conf_string(),
+                next_reconnect_allowed: Instant::now(),
+                rows_dropped_total: 0,
+            },
+        };
+        assert_eq!(writer.rows_dropped_total(), 0);
+    }
 }
