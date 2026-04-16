@@ -59,17 +59,18 @@ const DEPTH_RECONNECT_INITIAL_MS: u64 = 1000;
 /// Reconnection backoff max delay (ms).
 const DEPTH_RECONNECT_MAX_MS: u64 = 30000;
 
+/// Maximum consecutive reconnection attempts before giving up.
+/// At 30s max backoff, 20 attempts ≈ 10 minutes of retrying.
+/// Prevents infinite retry loops after market close or on permanently
+/// unreachable instruments.
+const DEPTH_RECONNECT_MAX_ATTEMPTS: u64 = 20;
+
 /// Pong send timeout (seconds). Matches main feed connection behavior.
 /// If pong send takes longer, the TCP connection is likely dead.
 const DEPTH_PONG_TIMEOUT_SECS: u64 = 10;
 
 /// Subscription batch size for 20-level depth (max 50 per Dhan docs).
 const DEPTH_SUBSCRIPTION_BATCH_SIZE: usize = 50;
-
-// Market-hours sleep REMOVED: depth connections stay connected 24/7, same as
-// main Live Market Feed WebSocket. Reconnection uses exponential backoff
-// regardless of time-of-day. If Dhan servers reject outside market hours,
-// backoff caps at 30s — no multi-hour sleeps that hide connection state.
 
 /// Connection timeout for depth WebSocket (seconds).
 const DEPTH_CONNECT_TIMEOUT_SECS: u64 = 15;
@@ -165,6 +166,21 @@ pub async fn run_twenty_depth_connection(
 
                 let attempt = reconnect_counter.fetch_add(1, Ordering::Relaxed);
                 m_reconnections.increment(1);
+
+                // Give up after max attempts — prevents infinite retry loops
+                // after market close or on permanently unreachable instruments.
+                if attempt >= DEPTH_RECONNECT_MAX_ATTEMPTS {
+                    error!(
+                        attempt,
+                        instrument_count,
+                        ?err,
+                        "{prefix}: exhausted {DEPTH_RECONNECT_MAX_ATTEMPTS} reconnection attempts — giving up"
+                    );
+                    return Err(WebSocketError::ReconnectionExhausted {
+                        connection_id: 0, // depth connections don't use pool IDs
+                        attempts: attempt.min(u64::from(u32::MAX)) as u32,
+                    });
+                }
 
                 // Escalate to ERROR after 10+ consecutive failures
                 if attempt > 0 && attempt.is_multiple_of(10) {
@@ -586,6 +602,22 @@ pub async fn run_two_hundred_depth_connection(
                 let attempt = reconnect_counter.fetch_add(1, Ordering::Relaxed);
                 m_reconnections.increment(1);
                 m_consecutive_resets.set(attempt.saturating_add(1) as f64);
+
+                // Give up after max attempts — prevents infinite retry loops
+                // after market close or on permanently unreachable instruments.
+                if attempt >= DEPTH_RECONNECT_MAX_ATTEMPTS {
+                    error!(
+                        security_id,
+                        label = %label,
+                        attempt,
+                        ?err,
+                        "{prefix}: exhausted {DEPTH_RECONNECT_MAX_ATTEMPTS} reconnection attempts — giving up"
+                    );
+                    return Err(WebSocketError::ReconnectionExhausted {
+                        connection_id: 0, // depth connections don't use pool IDs
+                        attempts: attempt.min(u64::from(u32::MAX)) as u32,
+                    });
+                }
 
                 // Escalate to ERROR after 10+ consecutive failures
                 if attempt > 0 && attempt.is_multiple_of(10) {
