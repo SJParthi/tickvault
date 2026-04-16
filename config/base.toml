@@ -248,8 +248,8 @@ subscribe_index_derivatives = true
 subscribe_stock_derivatives = true
 subscribe_display_indices = true
 subscribe_stock_equities = true
-stock_atm_strikes_above = 10
-stock_atm_strikes_below = 10
+stock_atm_strikes_above = 25
+stock_atm_strikes_below = 25
 stock_default_atm_fallback_enabled = true
 # 20-level depth: separate WS endpoint (wss://depth-api-feed.dhan.co).
 # Does NOT use main feed connection slots — separate endpoint, separate connections.

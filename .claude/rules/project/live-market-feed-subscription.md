@@ -13,34 +13,48 @@
 - **Distribution:** Round-robin at boot (static, pre-allocated)
 - **Endpoint:** `wss://api-feed.dhan.co?version=2&token=<TOKEN>&clientId=<CLIENT_ID>&authType=2`
 
-### Subscription Strategy (Two-Stage)
+### Subscription Strategy (Two-Phase)
 
-**Stage 1 — Priority/ATM-Based:**
+**Phase 1 — Boot (before 9:00 AM):**
 | Category | What's subscribed | Mode |
 |----------|------------------|------|
 | Major index values | NIFTY, BANKNIFTY, SENSEX, MIDCPNIFTY, FINNIFTY | Ticker (IDX_I forced) |
 | Major index derivatives | ALL contracts (every expiry, every strike) | Quote/Full |
 | Display indices | INDIA VIX, sector indices (~23) | Ticker |
 | Stock equities | All NSE_EQ (~206 stocks) | Quote/Full |
-| Stock derivatives | Current expiry, ATM ± 10 strikes per underlying | Quote/Full |
+| Stock derivatives | NOT subscribed yet — waiting for pre-market price | — |
+
+**Phase 2 — 9:12 AM (pre-market finalized price available):**
+| Category | What's subscribed | Mode |
+|----------|------------------|------|
+| Stock derivatives | Current expiry only, ATM ± 25 CE + PE + Future | Quote/Full |
+
+ATM is calculated from the **9:08 AM finalized pre-market price** (or the latest
+available LTP at 9:12 AM — whichever Dhan sent most recently). Binary search on
+sorted option chain finds the nearest strike to the spot price. No median fallback.
+If a stock has no pre-market price at 9:12 (didn't trade in pre-market), its F&O
+is SKIPPED.
+
+**Fixed for the entire day.** No dynamic resubscription for stocks — ATM ± 25
+covers ± 18-62% of price depending on stock, which exceeds the NSE 20% circuit
+breaker limit. Mathematically guaranteed sufficient.
 
 **Stage 2 — Progressive Fill:**
-- Remaining stock derivatives (further expiries)
+- Remaining stock derivatives (further expiries) fill remaining capacity to 25K
 - Sorted: nearest expiry first, then by symbol, then by security_id
-- Fills remaining capacity up to 25,000 instruments
 - Skipped instruments logged with count
 
-### Why NO Dynamic Rebalancing (by design)
+### Why NO Dynamic Rebalancing for Stocks (by design)
 
-The main feed subscribes to ~20,000-25,000 instruments. With this capacity:
-- Index derivatives: ALL strikes ALL expiries — ATM shift doesn't matter
-- Stock derivatives: ATM ± 10 at boot — 10-strike buffer covers typical intraday drift
-- Progressive fill adds more stock derivatives by nearest expiry
+- ATM ± 25 covers ≥ 18% of stock price (even for highest-priced stocks)
+- NSE circuit breaker = 20% — no stock can move beyond that intraday
+- Therefore ATM ± 25 is **mathematically guaranteed** to cover any intraday move
+- ATM is recalculated fresh every day at 9:12 AM from real pre-market price
 
 **Contrast with depth feed:**
-- Depth 20-level = 49 instruments (precise ATM ± 24, needs rebalancing)
+- Depth 20-level = 49 instruments (ATM ± 24, needs rebalancing — narrow band)
 - Depth 200-level = 1 instrument (exact ATM, needs rebalancing)
-- Main feed = 25,000 instruments (broad coverage, no rebalancing needed)
+- Main feed stocks = ATM ± 25 (wide band, no rebalancing needed)
 
 ### RequestCodes
 

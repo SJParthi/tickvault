@@ -562,8 +562,8 @@ impl Default for SubscriptionConfig {
             subscribe_stock_derivatives: true,
             subscribe_display_indices: true,
             subscribe_stock_equities: true,
-            stock_atm_strikes_above: 10,
-            stock_atm_strikes_below: 10,
+            stock_atm_strikes_above: 25,
+            stock_atm_strikes_below: 25,
             stock_default_atm_fallback_enabled: true,
             enable_twenty_depth: false,
             twenty_depth_max_instruments: 49,
@@ -1863,8 +1863,8 @@ mod tests {
         assert!(config.subscribe_stock_derivatives);
         assert!(config.subscribe_display_indices);
         assert!(config.subscribe_stock_equities);
-        assert_eq!(config.stock_atm_strikes_above, 10);
-        assert_eq!(config.stock_atm_strikes_below, 10);
+        assert_eq!(config.stock_atm_strikes_above, 25);
+        assert_eq!(config.stock_atm_strikes_below, 25);
         assert!(config.stock_default_atm_fallback_enabled);
     }
 
@@ -2032,8 +2032,8 @@ mod tests {
         assert!(config.subscribe_stock_derivatives);
         assert!(config.subscribe_display_indices);
         assert!(config.subscribe_stock_equities);
-        assert_eq!(config.stock_atm_strikes_above, 10);
-        assert_eq!(config.stock_atm_strikes_below, 10);
+        assert_eq!(config.stock_atm_strikes_above, 25);
+        assert_eq!(config.stock_atm_strikes_below, 25);
         assert!(config.stock_default_atm_fallback_enabled);
         // Depth fields
         assert!(!config.enable_twenty_depth);

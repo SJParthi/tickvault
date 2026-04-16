@@ -3133,7 +3133,12 @@ async fn load_instruments(
     {
         Ok(InstrumentLoadResult::FreshBuild(universe)) => {
             let today = Utc::now().with_timezone(&ist_offset()).date_naive();
-            let plan = build_subscription_plan(&universe, &config.subscription, today);
+            // Boot-time: pass empty spot prices — stock F&O will be subscribed
+            // at 9:12 AM once pre-market finalized prices are available.
+            // Indices get ALL contracts regardless. Stock equities subscribe immediately.
+            let empty_spot_prices = std::collections::HashMap::new();
+            let plan =
+                build_subscription_plan(&universe, &config.subscription, today, &empty_spot_prices);
 
             info!(
                 total = plan.summary.total,
