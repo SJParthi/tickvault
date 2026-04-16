@@ -46,6 +46,12 @@ const CONSTITUENCY_PERSIST_MAX_RETRIES: u32 = 3;
 /// Delay between constituency persistence retries (seconds).
 const CONSTITUENCY_PERSIST_RETRY_DELAY_SECS: u64 = 2;
 
+/// Flush batch size for constituency ILP persistence.
+/// Flushing 4000+ rows in one TCP ILP buffer causes `Broken pipe` on
+/// fresh QuestDB boots. Batching at 500 rows matches the pattern used
+/// by OBI persistence (100 rows) while keeping the number of flushes low.
+const CONSTITUENCY_FLUSH_BATCH_SIZE: usize = 500;
+
 // ---------------------------------------------------------------------------
 // Pure helper functions (testable without DB)
 // ---------------------------------------------------------------------------
@@ -229,6 +235,7 @@ fn persist_constituency_inner(
     let snapshot_ts = TimestampNanos::new(build_epoch_nanos);
 
     let mut count = 0_usize;
+    let mut batch_pending = 0_usize;
 
     for (index_name, constituents) in &constituency_map.index_to_constituents {
         for constituent in constituents {
@@ -254,10 +261,20 @@ fn persist_constituency_inner(
                 .context("designated timestamp")?;
 
             count = count.saturating_add(1);
+            batch_pending = batch_pending.saturating_add(1);
+
+            // Flush in batches to avoid broken pipe on large payloads.
+            if batch_pending >= CONSTITUENCY_FLUSH_BATCH_SIZE {
+                sender
+                    .flush(&mut buffer)
+                    .context("failed to flush constituency batch to QuestDB")?;
+                batch_pending = 0;
+            }
         }
     }
 
-    if count > 0 {
+    // Flush remaining rows.
+    if batch_pending > 0 {
         sender
             .flush(&mut buffer)
             .context("failed to flush constituency data to QuestDB")?;
@@ -928,6 +945,8 @@ mod tests {
         assert_eq!(CONSTITUENCY_PERSIST_MAX_RETRIES, 3);
         assert_eq!(CONSTITUENCY_PERSIST_RETRY_DELAY_SECS, 2);
         assert_eq!(QUESTDB_DDL_TIMEOUT_SECS, 10);
+        assert!(CONSTITUENCY_FLUSH_BATCH_SIZE > 0);
+        assert!(CONSTITUENCY_FLUSH_BATCH_SIZE <= 1000);
     }
 
     #[test]
