@@ -340,8 +340,8 @@ if [ -n "$PROM_TARGETS" ]; then
     TOTAL_TARGETS=$((UP_COUNT + DOWN_COUNT))
     info "Targets: ${UP_COUNT}/${TOTAL_TARGETS} UP"
     if [ "$DOWN_COUNT" -gt 0 ]; then
-        # Extract down job names
-        echo "$PROM_TARGETS" | grep -o '"job":"[^"]*"[^}]*"health":"down"' | grep -o '"job":"[^"]*"' | sort -u | while read -r line; do
+        # Extract down job names (best-effort — JSON field order may vary)
+        echo "$PROM_TARGETS" | { grep -o '"job":"[^"]*"[^}]*"health":"down"' || true; } | { grep -o '"job":"[^"]*"' || true; } | sort -u | while read -r line; do
             warn "Target DOWN: $line"
         done
     fi
@@ -382,7 +382,7 @@ if [ -n "$DASH_JSON" ] && [ "$DASH_JSON" != "[]" ]; then
     DASH_COUNT=$(echo "$DASH_JSON" | { grep -o '"uid"' || true; } | wc -l | tr -d ' ')
     # Check for expected dashboards by UID
     for uid in tv-system-overview tv-traefik tv-logs; do
-        DASH_TITLE=$(echo "$DASH_JSON" | grep -o "\"uid\":\"${uid}\"[^}]*\"title\":\"[^\"]*\"" | grep -o '"title":"[^"]*"' | head -1 || echo "")
+        DASH_TITLE=$(echo "$DASH_JSON" | { grep -o "\"uid\":\"${uid}\"[^}]*\"title\":\"[^\"]*\"" || true; } | { grep -o '"title":"[^"]*"' || true; } | head -1)
         if [ -n "$DASH_TITLE" ]; then
             info "  ${uid}: loaded"
         else
