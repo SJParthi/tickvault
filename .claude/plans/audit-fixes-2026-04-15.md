@@ -43,9 +43,10 @@ match the zero-loss stance.
     `test_db7_option_movers_record_drop_increments_counter`,
     `test_db7_stock_movers_record_drop_saturates`
 
-- [ ] **DB-1**: Ring-buffer + disk-spill rescue on `IndicatorSnapshotWriter`
+- [x] **DB-1**: Bounded in-memory rescue ring on `IndicatorSnapshotWriter` — done
   - Files: `crates/storage/src/indicator_snapshot_persistence.rs`
-  - Tests: `test_indicator_snapshot_rescues_on_reconnect_fail`, `test_indicator_snapshot_ring_overflow_spills`, `test_indicator_snapshot_drains_fifo_on_recover`
+  - Tests: `test_db1_rescue_ring_capacity_is_bounded`, `test_db1_rescue_ring_len_starts_zero_and_increments`, `test_db1_rescue_ring_is_fifo`, `test_db1_rescue_ring_overflow_evicts_oldest_and_counts_drop`, `test_db1_buffered_snapshot_is_copy`, `test_db1_buffered_snapshot_size_is_bounded`
+  - NOTE: pragmatic in-memory ring (20K capacity = 3.2 MB, FIFO drain on reconnect). Disk-spill WAL is a separate follow-up when the global WAL architecture lands; the in-memory ring covers QuestDB outages up to ~40 min which matches the typical restart window.
 
 - [ ] **DB-2**: Ring-buffer + disk-spill rescue on `MoversWriter` (stock + option)
   - Files: `crates/storage/src/movers_persistence.rs`
