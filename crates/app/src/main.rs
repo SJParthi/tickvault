@@ -1826,6 +1826,17 @@ async fn main() -> Result<()> {
         tokio::sync::Mutex<std::collections::HashMap<String, tokio::task::JoinHandle<()>>>,
     > = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
 
+    // Command senders for live depth instrument swaps (unsubscribe+resubscribe, zero disconnect).
+    // Key: "NIFTY" for 20-level, "NIFTY-CE"/"NIFTY-PE" for 200-level.
+    let depth_cmd_senders: std::sync::Arc<
+        tokio::sync::Mutex<
+            std::collections::HashMap<
+                String,
+                tokio::sync::mpsc::Sender<tickvault_core::websocket::DepthCommand>,
+            >,
+        >,
+    > = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+
     // O(1) EXEMPT: begin — boot-time depth connection setup
     if should_connect_ws && config.subscription.enable_twenty_depth {
         if let Some(ref _plan) = subscription_plan {
@@ -2212,6 +2223,16 @@ async fn main() -> Result<()> {
                 let d20_underlying_label = label.clone();
                 let d20_wal_spill = ws_frame_spill.clone();
                 let (signal_tx, signal_rx) = tokio::sync::oneshot::channel::<()>();
+                // Command channel for live rebalance (unsubscribe+resubscribe, zero disconnect).
+                let (d20_cmd_tx, d20_cmd_rx) =
+                    tokio::sync::mpsc::channel::<tickvault_core::websocket::DepthCommand>(4);
+                {
+                    let senders = std::sync::Arc::clone(&depth_cmd_senders);
+                    let key = (*underlying).to_string();
+                    tokio::spawn(async move {
+                        senders.lock().await.insert(key, d20_cmd_tx);
+                    });
+                }
                 tokio::spawn(async move {
                     d20_health.set_depth_20_connections(
                         d20_health.depth_20_connections().saturating_add(1),
@@ -2225,6 +2246,7 @@ async fn main() -> Result<()> {
                         d20_underlying_label,
                         Some(signal_tx),
                         d20_wal_spill,
+                        d20_cmd_rx,
                     )
                     .await
                     {
@@ -2365,8 +2387,18 @@ async fn main() -> Result<()> {
                         let d200_wal_spill = ws_frame_spill.clone();
                         let (d200_signal_tx, d200_signal_rx) =
                             tokio::sync::oneshot::channel::<()>();
-                        // Track handle for rebalance abort+respawn.
+                        // Command channel for live 200-level rebalance (zero disconnect).
                         let d200_handle_key = format!("{underlying}-{opt_label}"); // e.g. "NIFTY-CE"
+                        let (d200_cmd_tx, d200_cmd_rx) = tokio::sync::mpsc::channel::<
+                            tickvault_core::websocket::DepthCommand,
+                        >(4);
+                        {
+                            let senders = std::sync::Arc::clone(&depth_cmd_senders);
+                            let key = d200_handle_key.clone();
+                            tokio::spawn(async move {
+                                senders.lock().await.insert(key, d200_cmd_tx);
+                            });
+                        }
                         let d200_handle = tokio::spawn(async move {
                             d200_health.set_depth_200_connections(
                                 d200_health.depth_200_connections().saturating_add(1),
@@ -2382,6 +2414,7 @@ async fn main() -> Result<()> {
                                     tx200,
                                     Some(d200_signal_tx),
                                     d200_wal_spill,
+                                    d200_cmd_rx,
                                 )
                                 .await
                             {
@@ -2474,16 +2507,10 @@ async fn main() -> Result<()> {
                 ),
             );
 
-            // L1: Listen for rebalance events → Telegram alert + abort/respawn 200-level depth.
+            // L1: Listen for rebalance events → Telegram alert + send swap commands (zero disconnect).
             {
                 let rebalance_notifier = notifier.clone();
-                let rebal_handles = std::sync::Arc::clone(&depth_200_handles);
-                let rebal_token = token_handle.clone();
-                let rebal_client_id = ws_client_id.clone();
-                let rebal_wal_spill = ws_frame_spill.clone();
-                let rebal_questdb = config.questdb.clone();
-                let rebal_health = health_status.clone();
-                let rebal_notifier_spawn = notifier.clone();
+                let rebal_cmd_senders = std::sync::Arc::clone(&depth_cmd_senders);
                 tokio::spawn(async move {
                     while rebalance_rx.changed().await.is_ok() {
                         let event = match rebalance_rx.borrow().clone() {
@@ -2535,170 +2562,69 @@ async fn main() -> Result<()> {
                             ),
                         });
 
-                        // --- 200-level abort + respawn ---
+                        // --- 200-level rebalance via command channel (zero disconnect) ---
                         // Only NIFTY and BANKNIFTY have 200-level connections.
                         if ul != "NIFTY" && ul != "BANKNIFTY" {
                             continue;
                         }
                         let Some(new_atm) = &event.new_atm else {
-                            warn!(underlying = %ul, "rebalance: new_atm is None — cannot respawn 200-level");
+                            warn!(underlying = %ul, "rebalance: new_atm is None — cannot swap 200-level");
                             continue;
                         };
-                        let new_expiry = match event.expiry {
-                            Some(e) => e,
-                            None => {
-                                warn!(underlying = %ul, "rebalance: no expiry — cannot respawn 200-level");
-                                continue;
-                            }
-                        };
 
-                        // Abort old CE + PE connections.
-                        {
-                            let mut handles = rebal_handles.lock().await;
-                            for side in ["CE", "PE"] {
-                                let key = format!("{ul}-{side}");
-                                if let Some(old_handle) = handles.remove(&key) {
-                                    info!(
-                                        underlying = %ul,
-                                        side,
-                                        "PROOF: rebalance — aborting old 200-level depth connection ({key})"
-                                    );
-                                    old_handle.abort();
-                                }
-                            }
-                        }
-
-                        // Build new CE + PE entries.
-                        let strike = new_atm.strike;
-                        let build_label = |side: &str| -> String {
-                            let strike_str = if (strike.fract()).abs() < 0.0001 {
-                                #[allow(clippy::cast_possible_truncation)]
-                                // APPROVED: strike prices fit i64
-                                {
-                                    format!("{}", strike as i64)
-                                }
-                            } else {
-                                format!("{strike}")
-                            };
-                            format!("{ul}-{}-{strike_str}-{side}", new_expiry.format("%b%Y"))
-                        };
-
-                        let entries: Vec<(&str, u32, String)> = [
-                            Some(("CE", new_atm.ce_id, build_label("CE"))),
-                            new_atm.pe_id.map(|pe_id| ("PE", pe_id, build_label("PE"))),
+                        // Send Swap200 command to each CE/PE connection.
+                        let segment_str = tickvault_common::types::ExchangeSegment::NseFno.as_str();
+                        let entries_200: Vec<(&str, u32)> = [
+                            Some(("CE", new_atm.ce_id)),
+                            new_atm.pe_id.map(|pe_id| ("PE", pe_id)),
                         ]
                         .into_iter()
                         .flatten()
                         .collect();
 
-                        for (opt_label, sid, label) in entries {
-                            info!(
-                                underlying = %ul,
-                                option = opt_label,
-                                security_id = sid,
-                                contract = %label,
-                                spot = event.current_spot,
-                                "PROOF: rebalance — spawning new 200-level depth (contract={label}, sid={sid}, spot={:.2})",
-                                event.current_spot
-                            );
+                        for (opt_label, sid) in entries_200 {
+                            let swap_key = format!("{ul}-{opt_label}");
+                            let sid_str = sid.to_string();
+                            let unsubscribe_msg = serde_json::json!({
+                                "RequestCode": 25,
+                                "ExchangeSegment": segment_str,
+                                "SecurityId": "0",
+                            })
+                            .to_string();
+                            let subscribe_msg = serde_json::json!({
+                                "RequestCode": 23,
+                                "ExchangeSegment": segment_str,
+                                "SecurityId": sid_str,
+                            })
+                            .to_string();
 
-                            let (tx200, mut rx200) =
-                                tokio::sync::mpsc::channel::<bytes::Bytes>(1024);
-                            let label_recv = label.clone();
-                            let questdb_cfg = rebal_questdb.clone();
-
-                            // Spawn 200-level receiver (persistence).
-                            tokio::spawn(async move {
-                                let m = metrics::counter!(
-                                    "tv_depth_200lvl_frames_received",
-                                    "underlying" => label_recv.clone()
-                                );
-                                let mut writer =
-                                    tickvault_storage::deep_depth_persistence::DeepDepthWriter::new(
-                                        &questdb_cfg,
-                                    )
-                                    .ok();
-                                while let Some(frame) = rx200.recv().await {
-                                    m.increment(1);
-                                    let ts = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-                                    match tickvault_core::parser::dispatcher::dispatch_deep_depth_frame(&frame, ts) {
-                                        Ok(tickvault_core::parser::types::ParsedFrame::DeepDepth {
-                                            security_id,
-                                            exchange_segment_code,
-                                            side,
-                                            levels,
-                                            message_sequence,
-                                            ..
-                                        }) => {
-                                            let side_str = match side {
-                                                tickvault_core::parser::deep_depth::DepthSide::Bid => "BID",
-                                                tickvault_core::parser::deep_depth::DepthSide::Ask => "ASK",
-                                            };
-                                            if let Some(ref mut w) = writer
-                                                && let Err(err) = w.append_deep_depth(
-                                                    security_id, exchange_segment_code,
-                                                    side_str, &levels, "200", ts, message_sequence,
-                                                )
-                                            {
-                                                tracing::warn!(?err, "rebalance: failed to persist 200-level depth");
-                                            }
-                                        }
-                                        Ok(_) => {}
-                                        Err(err) => {
-                                            tracing::warn!(?err, "rebalance: failed to parse 200-level depth frame");
-                                        }
-                                    }
-                                }
-                            });
-
-                            // Spawn 200-level WebSocket connection.
-                            let d200_token = rebal_token.clone();
-                            let d200_client_id = rebal_client_id.clone();
-                            let d200_label = label.clone();
-                            let d200_wal = rebal_wal_spill.clone();
-                            let d200_health = rebal_health.clone();
-                            let d200_notifier = rebal_notifier_spawn.clone();
-                            let d200_label_dc = label.clone();
-                            let segment = tickvault_common::types::ExchangeSegment::NseFno;
-                            let handle = tokio::spawn(async move {
-                                d200_health.set_depth_200_connections(
-                                    d200_health.depth_200_connections().saturating_add(1),
-                                );
-                                if let Err(err) =
-                                    tickvault_core::websocket::run_two_hundred_depth_connection(
-                                        d200_token,
-                                        d200_client_id,
-                                        segment,
-                                        sid,
-                                        d200_label,
-                                        tx200,
-                                        None,
-                                        d200_wal,
-                                    )
-                                    .await
-                                {
-                                    tracing::error!(
+                            let senders = rebal_cmd_senders.lock().await;
+                            if let Some(tx) = senders.get(&swap_key) {
+                                let cmd = tickvault_core::websocket::DepthCommand::Swap200 {
+                                    unsubscribe_message: unsubscribe_msg,
+                                    subscribe_message: subscribe_msg,
+                                };
+                                if let Err(err) = tx.send(cmd).await {
+                                    warn!(
                                         ?err,
-                                        contract = %d200_label_dc,
+                                        key = %swap_key,
+                                        "rebalance: Swap200 command send failed"
+                                    );
+                                } else {
+                                    info!(
+                                        underlying = %ul,
+                                        option = opt_label,
                                         security_id = sid,
-                                        "rebalance: 200-level depth connection terminated"
-                                    );
-                                    d200_notifier.notify(
-                                        NotificationEvent::DepthTwoHundredDisconnected {
-                                            contract: d200_label_dc,
-                                            security_id: sid,
-                                            reason: format!("{err}"),
-                                        },
-                                    );
-                                    d200_health.set_depth_200_connections(
-                                        d200_health.depth_200_connections().saturating_sub(1),
+                                        spot = event.current_spot,
+                                        "PROOF: rebalance Swap200 sent — {swap_key} → sid {sid} (zero disconnect)"
                                     );
                                 }
-                            });
-
-                            // Store new handle.
-                            let key = format!("{ul}-{opt_label}");
-                            rebal_handles.lock().await.insert(key, handle);
+                            } else {
+                                warn!(
+                                    key = %swap_key,
+                                    "rebalance: no cmd sender for {swap_key} — 200-level not spawned?"
+                                );
+                            }
                         }
                     }
                 });
