@@ -406,6 +406,11 @@ pub struct LoggingConfig {
     pub level: String,
     /// Log output format (json, pretty).
     pub format: String,
+    /// Write logs to stdout (IntelliJ console / docker logs).
+    /// Default: false — prevents unbounded console buffer growth.
+    /// File logging (`data/logs/`) is always active regardless of this flag.
+    #[serde(default)]
+    pub log_to_stdout: bool,
 }
 
 /// API server configuration.
@@ -1219,6 +1224,7 @@ mod tests {
             logging: LoggingConfig {
                 level: "info".to_string(),
                 format: "json".to_string(),
+                log_to_stdout: false,
             },
             instrument: InstrumentConfig {
                 daily_download_time: "08:55:00".to_string(),

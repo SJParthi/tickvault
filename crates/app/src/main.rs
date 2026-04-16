@@ -378,20 +378,24 @@ async fn main() -> Result<()> {
     // IST timestamp formatter — all log timestamps show +05:30 offset.
     let ist_timer = IstTimer;
 
-    let fmt_layer = tracing_subscriber::fmt::layer()
-        .with_target(true)
-        .with_thread_ids(true)
-        .with_file(false)
-        .with_line_number(false)
-        .with_timer(ist_timer.clone());
-
-    // Box the fmt layer so both JSON and text branches produce the same type,
-    // allowing a single subscriber chain (required for OpenTelemetryLayer<S> inference).
-    let fmt_boxed: Box<dyn tracing_subscriber::Layer<_> + Send + Sync + 'static> =
-        if config.logging.format == "json" {
-            Box::new(fmt_layer.json())
+    // Stdout layer — only when config.logging.log_to_stdout is true.
+    // Disabled by default to prevent unbounded IntelliJ console buffer growth.
+    // File logging (data/logs/) is always active regardless of this flag.
+    let fmt_boxed: Option<Box<dyn tracing_subscriber::Layer<_> + Send + Sync + 'static>> =
+        if config.logging.log_to_stdout {
+            let fmt_layer = tracing_subscriber::fmt::layer()
+                .with_target(true)
+                .with_thread_ids(true)
+                .with_file(false)
+                .with_line_number(false)
+                .with_timer(ist_timer.clone());
+            if config.logging.format == "json" {
+                Some(Box::new(fmt_layer.json()))
+            } else {
+                Some(Box::new(fmt_layer))
+            }
         } else {
-            Box::new(fmt_layer)
+            None
         };
 
     // File-based JSON log layer for Alloy → Loki ingestion.
