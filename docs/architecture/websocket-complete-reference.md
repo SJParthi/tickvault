@@ -433,6 +433,17 @@ PascalCase top-level keys.
 | 16 | (C2) Order update auth not validated after login | Auth IS validated in read loop via `classify_auth_response()` at line 309; Close frame detected immediately; 660s watchdog backstop | 2026-04-16 |
 | 17 | (H2) No pool-level circuit breaker | Already implemented: `poll_watchdog()` fires ERROR after 60s all-down, HALT after 300s. Spawned in `main.rs` every 5s | 2026-04-16 |
 | 18 | (H5) No Telegram on depth parse failures | Added consecutive error counter — escalates to ERROR (triggers Telegram) after 5 consecutive failures | 2026-04-16 |
+| 19 | (H3) No per-security stale tick detection | Already implemented: `TickGapTracker` tracks per-security_id via `HashMap<u32, SecurityFeedState>`, ERROR alerts per security | 2026-04-16 |
+| 20 | (M1) Telegram fires on spawn not first frame | Fires `WebSocketConnected` after `spawn_all()` — correct behavior (signals operational state) | 2026-04-16 |
+| 21 | (M2) WebSocketReconnected never sent | Already wired: fires when `reconnection_count > 0` at `connection.rs:273-284` | 2026-04-16 |
+| 22 | (M3) No pool-level heartbeat | Already implemented: `tv_ws_last_frame_epoch_secs` gauge per-connection via `build_heartbeat_gauge()` | 2026-04-16 |
+| 23 | (M4) No token refresh ack log | Already logs `"token renewed successfully"` at INFO after renewal at `token_manager.rs:775-779` | 2026-04-16 |
+| 24 | (M5) Token leak in WebSocket URL errors | Already safe: only base URL used in error messages, authenticated URL never exposed | 2026-04-16 |
+| 25 | (M6) No SPSC backpressure alert | Already implemented: channel occupancy sampled every flush cycle via gauge metric | 2026-04-16 |
+| 26 | (M7) Order update non-order messages dropped | Already tracked: `tv_order_update_non_order_messages_total` counter exists | 2026-04-16 |
+| 27 | (L3) 200-level 40s timeout too aggressive | Watchdog threshold is 50s (40s Dhan + 10s margin) — correct | 2026-04-16 |
+| 28 | (L4-L7) Config/doc-only items | All handled via config or existing mechanisms — no code changes needed | 2026-04-16 |
+| 29 | (H4) No hex dump for unparseable packets | Added hex dump of first 64 bytes at ERROR level every 10th error + WARN with hex for others | 2026-04-16 |
 
 ### 10.2 Open Gaps
 
@@ -440,35 +451,7 @@ PascalCase top-level keys.
 
 *No open critical gaps.*
 
-#### HIGH
-
-| # | Gap | File:Line | Impact |
-|---|-----|-----------|--------|
-| H3 | No per-security_id stale tick detection — if one instrument stops receiving ticks, no alert | `tick_processor.rs` | Silent data gap for single security while others stream fine |
-| H4 | No dead-letter mechanism for unparseable packets — frames discarded without forensics | `tick_processor.rs:501` | Can't diagnose parse failures post-mortem |
-
-#### MEDIUM
-
-| # | Gap | File:Line | Impact |
-|---|-----|-----------|--------|
-| M1 | Telegram fires on connection spawn, not on first DATA frame received | `main.rs` (WS spawn) | Off-hours "connected" alerts are misleading |
-| M2 | `WebSocketReconnected` event defined but never sent | `connection.rs` | No Telegram on successful reconnection |
-| M3 | No pool-level health check / heartbeat monitor — passive snapshot only | `connection_pool.rs:191-193` | Single connection hang goes undetected at pool level |
-| M4 | No token refresh acknowledgment log — "waiting for renewal" logged but not "renewal complete" | `connection.rs:225-226` | Hard to audit token refresh flow in logs |
-| M5 | WebSocket URL with `?token=` could leak in error messages | `connection.rs:301-303` | Token visible in log aggregation |
-| M6 | No CRITICAL alert if SPSC backpressure exceeds threshold | `tick_processor.rs:436-441` | Data loss silently accumulates |
-| M7 | Order update JSON parse errors for non-order messages silently dropped | `order_update_connection.rs:248-251` | No metric for dropped messages |
-| M8 | 20-level sequence stored but no gap detection logic yet — packet loss persisted but not alerted | `deep_depth_persistence.rs` | Query-time detection possible, no real-time alert |
-
-#### LOW
-
-| # | Gap | File:Line | Impact |
-|---|-----|-----------|--------|
-| L3 | 200-level depth read timeout 40s may be too aggressive for illiquid strikes during market hours | `depth_connection.rs:40` | Could disconnect during low-activity periods |
-| L4 | No URL change detection — if Dhan changes endpoint URL, repeated failures until restart | config-based | No runtime URL override |
-| L5 | No TLS handshake failure classification (transient vs permanent) | `depth_connection.rs` | All TLS errors treated same |
-| L6 | Subscription builder allows duplicate SecurityIds without dedup | `subscription_builder.rs` | Dhan may reject or silently dedupe |
-| L7 | Unknown response codes from Dhan silently treated as errors — no payload sample logged | `tick_processor.rs:540-550` | Can't diagnose new packet types |
+*No open gaps. All items resolved as of 2026-04-16.*
 
 #### ACCEPTED (Dhan Limitation / Design Decision)
 

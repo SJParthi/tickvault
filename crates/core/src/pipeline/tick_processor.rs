@@ -641,13 +641,34 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
             Err(err) => {
                 parse_errors = parse_errors.saturating_add(1);
                 m_parse_errors.increment(1);
+                // H4: Log hex dump of first 64 bytes for post-mortem forensics.
+                // ERROR level triggers Telegram so persistent parse failures
+                // are visible to operators, not just in log aggregation.
                 if parse_errors <= 100 {
-                    warn!(
-                        ?err,
-                        frame_len = raw_frame.len(),
-                        total_errors = parse_errors,
-                        "failed to parse binary frame"
-                    );
+                    let hex_len = raw_frame.len().min(64);
+                    let hex_dump: String = raw_frame[..hex_len]
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<Vec<_>>()
+                        .join(" "); // O(1) EXEMPT: cold path, parse errors are rare
+                    if parse_errors.is_multiple_of(10) {
+                        // Escalate every 10th error to ERROR (triggers Telegram)
+                        error!(
+                            ?err,
+                            frame_len = raw_frame.len(),
+                            frame_hex = %hex_dump,
+                            total_errors = parse_errors,
+                            "H4: persistent parse failures — {parse_errors} total (hex dump of first {hex_len} bytes)"
+                        );
+                    } else {
+                        warn!(
+                            ?err,
+                            frame_len = raw_frame.len(),
+                            frame_hex = %hex_dump,
+                            total_errors = parse_errors,
+                            "failed to parse binary frame (hex dump of first {hex_len} bytes)"
+                        );
+                    }
                 }
                 continue;
             }
