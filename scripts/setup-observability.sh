@@ -335,13 +335,13 @@ fi
 step "Validating Prometheus scrape targets"
 PROM_TARGETS=$(curl -sf --max-time 5 "http://localhost:9090/api/v1/targets" 2>/dev/null || echo "")
 if [ -n "$PROM_TARGETS" ]; then
-    UP_COUNT=$(echo "$PROM_TARGETS" | grep -o '"health":"up"' | wc -l | tr -d ' ')
-    DOWN_COUNT=$(echo "$PROM_TARGETS" | grep -o '"health":"down"' | wc -l | tr -d ' ')
+    UP_COUNT=$(echo "$PROM_TARGETS" | { grep -o '"health":"up"' || true; } | wc -l | tr -d ' ')
+    DOWN_COUNT=$(echo "$PROM_TARGETS" | { grep -o '"health":"down"' || true; } | wc -l | tr -d ' ')
     TOTAL_TARGETS=$((UP_COUNT + DOWN_COUNT))
     info "Targets: ${UP_COUNT}/${TOTAL_TARGETS} UP"
     if [ "$DOWN_COUNT" -gt 0 ]; then
-        # Extract down job names
-        echo "$PROM_TARGETS" | grep -o '"job":"[^"]*"[^}]*"health":"down"' | grep -o '"job":"[^"]*"' | sort -u | while read -r line; do
+        # Extract down job names (best-effort — JSON field order may vary)
+        echo "$PROM_TARGETS" | { grep -o '"job":"[^"]*"[^}]*"health":"down"' || true; } | { grep -o '"job":"[^"]*"' || true; } | sort -u | while read -r line; do
             warn "Target DOWN: $line"
         done
     fi
@@ -360,7 +360,7 @@ GRAFANA_AUTH="$(echo -n "${TV_GRAFANA_ADMIN_USER}:${TV_GRAFANA_ADMIN_PASSWORD}" 
 DS_JSON=$(curl -sf --max-time 5 "http://localhost:3000/api/datasources" \
     -H "Authorization: Basic ${GRAFANA_AUTH}" 2>/dev/null || echo "")
 if [ -n "$DS_JSON" ] && [ "$DS_JSON" != "[]" ]; then
-    DS_COUNT=$(echo "$DS_JSON" | grep -o '"name"' | wc -l | tr -d ' ')
+    DS_COUNT=$(echo "$DS_JSON" | { grep -o '"name"' || true; } | wc -l | tr -d ' ')
     # Check each expected datasource
     for ds in Prometheus Loki Jaeger QuestDB; do
         if echo "$DS_JSON" | grep -q "\"name\":\"${ds}\""; then
@@ -379,10 +379,10 @@ step "Validating Grafana dashboards"
 DASH_JSON=$(curl -sf --max-time 5 "http://localhost:3000/api/search?type=dash-db" \
     -H "Authorization: Basic ${GRAFANA_AUTH}" 2>/dev/null || echo "")
 if [ -n "$DASH_JSON" ] && [ "$DASH_JSON" != "[]" ]; then
-    DASH_COUNT=$(echo "$DASH_JSON" | grep -o '"uid"' | wc -l | tr -d ' ')
+    DASH_COUNT=$(echo "$DASH_JSON" | { grep -o '"uid"' || true; } | wc -l | tr -d ' ')
     # Check for expected dashboards by UID
     for uid in tv-system-overview tv-traefik tv-logs; do
-        DASH_TITLE=$(echo "$DASH_JSON" | grep -o "\"uid\":\"${uid}\"[^}]*\"title\":\"[^\"]*\"" | grep -o '"title":"[^"]*"' | head -1 || echo "")
+        DASH_TITLE=$(echo "$DASH_JSON" | { grep -o "\"uid\":\"${uid}\"[^}]*\"title\":\"[^\"]*\"" || true; } | { grep -o '"title":"[^"]*"' || true; } | head -1)
         if [ -n "$DASH_TITLE" ]; then
             info "  ${uid}: loaded"
         else
@@ -399,7 +399,7 @@ step "Validating Grafana alert rules + Telegram contact point"
 ALERT_RULES=$(curl -sf --max-time 5 "http://localhost:3000/api/v1/provisioning/alert-rules" \
     -H "Authorization: Basic ${GRAFANA_AUTH}" 2>/dev/null || echo "")
 if [ -n "$ALERT_RULES" ] && [ "$ALERT_RULES" != "[]" ]; then
-    ALERT_COUNT=$(echo "$ALERT_RULES" | grep -o '"uid"' | wc -l | tr -d ' ')
+    ALERT_COUNT=$(echo "$ALERT_RULES" | { grep -o '"uid"' || true; } | wc -l | tr -d ' ')
     ok "${ALERT_COUNT} alert rules provisioned"
 else
     warn "Alert rules not yet loaded (Grafana unified alerting may need time)"
@@ -451,9 +451,9 @@ fi
 step "Validating Prometheus recording & alert rules"
 PROM_RULES=$(curl -sf --max-time 5 "http://localhost:9090/api/v1/rules" 2>/dev/null || echo "")
 if [ -n "$PROM_RULES" ]; then
-    RULE_GROUPS=$(echo "$PROM_RULES" | grep -o '"name"' | wc -l | tr -d ' ')
-    RECORDING=$(echo "$PROM_RULES" | grep -o '"type":"recording"' | wc -l | tr -d ' ')
-    ALERTING=$(echo "$PROM_RULES" | grep -o '"type":"alerting"' | wc -l | tr -d ' ')
+    RULE_GROUPS=$(echo "$PROM_RULES" | { grep -o '"name"' || true; } | wc -l | tr -d ' ')
+    RECORDING=$(echo "$PROM_RULES" | { grep -o '"type":"recording"' || true; } | wc -l | tr -d ' ')
+    ALERTING=$(echo "$PROM_RULES" | { grep -o '"type":"alerting"' || true; } | wc -l | tr -d ' ')
     info "Rule groups: ${RULE_GROUPS}"
     info "Recording rules: ${RECORDING}"
     info "Alert rules: ${ALERTING}"
@@ -470,7 +470,7 @@ fi
 step "Validating Traefik dynamic routes"
 TRAEFIK_ROUTERS=$(curl -sf --max-time 5 "http://localhost:8080/api/http/routers" 2>/dev/null || echo "")
 if [ -n "$TRAEFIK_ROUTERS" ]; then
-    ROUTER_COUNT=$(echo "$TRAEFIK_ROUTERS" | grep -o '"name"' | wc -l | tr -d ' ')
+    ROUTER_COUNT=$(echo "$TRAEFIK_ROUTERS" | { grep -o '"name"' || true; } | wc -l | tr -d ' ')
     info "HTTP routers: ${ROUTER_COUNT}"
     # Check for expected routes
     for route in grafana prometheus questdb; do

@@ -334,7 +334,7 @@ impl NotificationEvent {
                 // SECURITY: Do not expose internal service ports in Telegram.
                 format!(
                     "<b>tickvault started</b>\nMode: {mode}\n\n\
-                     Dashboards: Grafana / Prometheus / Jaeger / QuestDB available"
+                     Dashboards: Grafana / Prometheus / QuestDB available"
                 )
             }
             Self::AuthenticationSuccess => "<b>Auth OK</b> — Dhan JWT acquired".to_string(),

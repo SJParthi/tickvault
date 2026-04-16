@@ -19,7 +19,9 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
-use super::depth_strike_selector::{DEPTH_REBALANCE_STRIKE_THRESHOLD, should_rebalance};
+use super::depth_strike_selector::{
+    AtmIds, DEPTH_REBALANCE_STRIKE_THRESHOLD, find_atm_security_ids, should_rebalance,
+};
 use tickvault_common::instrument_types::{FnoUniverse, OptionChainKey};
 
 /// Rebalance check interval (seconds). Checks spot drift every 60 seconds.
@@ -65,12 +67,18 @@ pub async fn get_spot_price(prices: &SharedSpotPrices, symbol: &str) -> Option<f
 pub struct RebalanceEvent {
     /// Which underlying needs rebalancing.
     pub underlying: String,
-    /// New ATM strike price.
-    pub new_atm_strike: f64,
-    /// Previous ATM strike price.
-    pub previous_atm_strike: f64,
+    /// New ATM contract identifiers (CE/PE security IDs + actual strike).
+    pub new_atm: Option<AtmIds>,
+    /// Previous ATM contract identifiers.
+    pub prev_atm: Option<AtmIds>,
+    /// Current spot price that triggered the rebalance.
+    pub current_spot: f64,
+    /// Previous spot price (at last rebalance).
+    pub previous_spot: f64,
     /// Number of strikes drifted.
     pub drift_strikes: usize,
+    /// Expiry date of the selected chain.
+    pub expiry: Option<chrono::NaiveDate>,
 }
 
 /// Runs the depth rebalancer as a background task.
@@ -184,17 +192,27 @@ pub async fn run_depth_rebalancer(
                 current_spot,
                 DEPTH_REBALANCE_STRIKE_THRESHOLD,
             ) {
+                // Look up old/new ATM CE/PE security IDs + strike for the notification.
+                let new_atm_ids = find_atm_security_ids(chain, current_spot);
+                let prev_atm_ids = find_atm_security_ids(chain, prev_atm);
+
                 let event = RebalanceEvent {
                     underlying: symbol.clone(), // O(1) EXEMPT: rebalance event
-                    new_atm_strike: current_spot,
-                    previous_atm_strike: prev_atm,
+                    new_atm: new_atm_ids,
+                    prev_atm: prev_atm_ids,
+                    current_spot,
+                    previous_spot: prev_atm,
                     drift_strikes: DEPTH_REBALANCE_STRIKE_THRESHOLD,
+                    expiry: Some(expiry),
                 };
 
                 info!(
                     symbol,
-                    previous_atm = prev_atm,
+                    previous_spot = prev_atm,
                     current_spot,
+                    ?new_atm_ids,
+                    ?prev_atm_ids,
+                    %expiry,
                     "depth rebalance triggered — ATM drifted beyond threshold"
                 );
 
@@ -283,14 +301,29 @@ mod tests {
 
     #[test]
     fn test_rebalance_event_debug() {
+        use super::super::depth_strike_selector::AtmIds;
         let event = RebalanceEvent {
             underlying: "NIFTY".to_string(),
-            new_atm_strike: 23600.0,
-            previous_atm_strike: 23450.0,
+            new_atm: Some(AtmIds {
+                ce_id: 35246,
+                pe_id: Some(35247),
+                strike: 23600.0,
+            }),
+            prev_atm: Some(AtmIds {
+                ce_id: 35100,
+                pe_id: Some(35101),
+                strike: 23450.0,
+            }),
+            current_spot: 23620.0,
+            previous_spot: 23430.0,
             drift_strikes: 3,
+            expiry: Some(chrono::NaiveDate::from_ymd_opt(2026, 4, 24).unwrap()),
         };
         let debug = format!("{event:?}");
         assert!(debug.contains("NIFTY"));
-        assert!(debug.contains("23600"));
+        assert!(debug.contains("35246"));
+        assert!(debug.contains("35247"));
+        assert!(debug.contains("23600")); // new ATM strike
+        assert!(debug.contains("23450")); // prev ATM strike
     }
 }
