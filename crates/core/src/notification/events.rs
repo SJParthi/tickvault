@@ -97,6 +97,13 @@ pub enum NotificationEvent {
     /// giving up.
     DepthIndexLtpTimeout { waited_secs: u64 },
 
+    /// Option C (2026-04-17): Depth setup dropped a specific underlying —
+    /// the grace window expired without a valid spot price OR the option
+    /// chain was missing. Complements `DepthIndexLtpTimeout` which fires
+    /// once for the bundle; this fires per missing underlying so operators
+    /// see exactly which ones were skipped (e.g. FINNIFTY).
+    DepthUnderlyingMissing { underlying: String, reason: String },
+
     /// O3 (2026-04-17): The depth rebalancer detected a stale spot price
     /// for this underlying and skipped the rebalance decision. A stale
     /// price likely means the main-feed WebSocket isn't delivering index
@@ -447,8 +454,16 @@ impl NotificationEvent {
             Self::DepthIndexLtpTimeout { waited_secs } => {
                 format!(
                     "<b>Depth ATM timeout</b>\nWaited {waited_secs}s for index LTPs \
-                     (NIFTY/BANKNIFTY). Depth connections will use fallback strike \
-                     (median) instead of real ATM."
+                     — proceeding with partial set. See DepthUnderlyingMissing \
+                     alerts for the specific symbols that were dropped."
+                )
+            }
+            Self::DepthUnderlyingMissing { underlying, reason } => {
+                format!(
+                    "<b>Depth underlying missing</b>\nUnderlying: {underlying}\n\
+                     Reason: {reason}\nDepth connections for this symbol were NOT \
+                     spawned this boot — feed will have no order-book depth for \
+                     {underlying} until the next restart."
                 )
             }
             Self::DepthSpotPriceStale {
@@ -867,6 +882,7 @@ impl NotificationEvent {
             Self::WebSocketPoolRecovered { .. } => Severity::Medium,
             Self::WebSocketPoolHalt { .. } => Severity::High,
             Self::DepthIndexLtpTimeout { .. } => Severity::High,
+            Self::DepthUnderlyingMissing { .. } => Severity::High,
             Self::DepthSpotPriceStale { .. } => Severity::High,
             Self::Phase2Started { .. } => Severity::Medium,
             Self::Phase2RunImmediate { .. } => Severity::Medium,

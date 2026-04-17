@@ -1874,34 +1874,56 @@ async fn main() -> Result<()> {
         if let Some(ref _plan) = subscription_plan {
             let depth_underlyings = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"];
 
-            // Wait for the first index LTP before selecting depth strikes.
-            // Without a real spot price, we cannot determine ATM. The main
-            // WebSocket feed streams index LTPs continuously — we poll the
-            // SharedSpotPrices map every 500ms up to 30 seconds.
+            // Option C (2026-04-17): wait for ALL 4 depth underlyings' LTPs
+            // instead of just NIFTY+BANKNIFTY. After the grace window each
+            // missing underlying gets a dedicated `DepthUnderlyingMissing`
+            // Telegram so operators see exactly what was dropped.
             {
                 let wait_start = std::time::Instant::now();
                 let max_wait = std::time::Duration::from_secs(30); // APPROVED: boot-time wait
                 let poll_interval = std::time::Duration::from_millis(500); // APPROVED: boot-time poll
                 loop {
                     let prices = spot_prices_for_depth.read().await;
-                    let have_nifty = prices.contains_key("NIFTY");
-                    let have_banknifty = prices.contains_key("BANKNIFTY");
+                    let have_all = depth_underlyings
+                        .iter()
+                        .all(|sym| prices.contains_key(*sym));
                     drop(prices);
-                    if have_nifty && have_banknifty {
+                    if have_all {
                         info!(
-                            "depth ATM: received NIFTY + BANKNIFTY index LTPs — proceeding with depth setup"
+                            underlyings = ?depth_underlyings,
+                            "depth ATM: all 4 index LTPs present — proceeding with depth setup"
                         );
                         break;
                     }
                     if wait_start.elapsed() >= max_wait {
                         let waited = wait_start.elapsed().as_secs();
+                        // Option C: enumerate exactly which ones are missing
+                        // and fire a typed event per missing underlying so the
+                        // operator sees "FINNIFTY missing" not just "timeout".
+                        let prices = spot_prices_for_depth.read().await;
+                        let missing: Vec<&str> = depth_underlyings
+                            .iter()
+                            .copied()
+                            .filter(|sym| !prices.contains_key(*sym))
+                            .collect();
+                        drop(prices);
                         error!(
                             waited_secs = waited,
-                            "depth ATM: timed out waiting for index LTPs — using median strike fallback"
+                            missing = ?missing,
+                            "depth ATM: timed out waiting for index LTPs — proceeding with partial set"
                         );
                         notifier.notify(NotificationEvent::DepthIndexLtpTimeout {
                             waited_secs: waited,
                         });
+                        for sym in &missing {
+                            notifier.notify(NotificationEvent::DepthUnderlyingMissing {
+                                underlying: (*sym).to_string(),
+                                reason: format!(
+                                    "no spot price in {}s grace window — index feed stalled or symbol inactive",
+                                    waited
+                                ),
+                            });
+                        }
                         break;
                     }
                     tokio::time::sleep(poll_interval).await;
