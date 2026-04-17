@@ -1874,14 +1874,72 @@ async fn main() -> Result<()> {
         if let Some(ref _plan) = subscription_plan {
             let depth_underlyings = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"];
 
-            // Option C (2026-04-17): wait for ALL 4 depth underlyings' LTPs
-            // instead of just NIFTY+BANKNIFTY. After the grace window each
-            // missing underlying gets a dedicated `DepthUnderlyingMissing`
-            // Telegram so operators see exactly what was dropped.
+            // Option C v2 (2026-04-17, Parthiban feedback): do NOT treat all
+            // 4 underlyings equally. NIFTY + BANKNIFTY are MANDATORY (they
+            // have 200-level depth connections + full option chains); we
+            // wait up to 5 minutes for their LTPs because a wrong ATM is
+            // worse than a slow boot on these. FINNIFTY + MIDCPNIFTY are
+            // OPTIONAL (20-level only); we give them the original 30s
+            // grace window and drop+alert if they miss it.
+            const MANDATORY_UNDERLYINGS: &[&str] = &["NIFTY", "BANKNIFTY"];
+            const OPTIONAL_UNDERLYINGS: &[&str] = &["FINNIFTY", "MIDCPNIFTY"];
+            const MANDATORY_WAIT_SECS: u64 = 300; // 5 min hard cap on mandatory wait
+            const OPTIONAL_WAIT_SECS: u64 = 30;
             {
                 let wait_start = std::time::Instant::now();
-                let max_wait = std::time::Duration::from_secs(30); // APPROVED: boot-time wait
                 let poll_interval = std::time::Duration::from_millis(500); // APPROVED: boot-time poll
+
+                // Phase A: wait for MANDATORY underlyings (NIFTY+BANKNIFTY)
+                // up to 5 minutes. These MUST be present before we proceed.
+                loop {
+                    let prices = spot_prices_for_depth.read().await;
+                    let mandatory_ok = MANDATORY_UNDERLYINGS
+                        .iter()
+                        .all(|sym| prices.contains_key(*sym));
+                    drop(prices);
+                    if mandatory_ok {
+                        let waited = wait_start.elapsed().as_secs();
+                        info!(
+                            waited_secs = waited,
+                            "depth ATM: mandatory index LTPs (NIFTY+BANKNIFTY) present"
+                        );
+                        break;
+                    }
+                    if wait_start.elapsed() >= std::time::Duration::from_secs(MANDATORY_WAIT_SECS) {
+                        let waited = wait_start.elapsed().as_secs();
+                        let prices = spot_prices_for_depth.read().await;
+                        let missing: Vec<&str> = MANDATORY_UNDERLYINGS
+                            .iter()
+                            .copied()
+                            .filter(|s| !prices.contains_key(*s))
+                            .collect();
+                        drop(prices);
+                        error!(
+                            waited_secs = waited,
+                            missing = ?missing,
+                            "depth ATM: MANDATORY index LTPs still missing after 5 min — \
+                             proceeding with partial set (this should never happen during \
+                             market hours unless main feed is degraded)"
+                        );
+                        for sym in &missing {
+                            notifier.notify(NotificationEvent::DepthUnderlyingMissing {
+                                underlying: (*sym).to_string(),
+                                reason: format!(
+                                    "MANDATORY underlying — no spot price after {}s \
+                                     (5 min hard cap) — main feed likely degraded",
+                                    waited
+                                ),
+                            });
+                        }
+                        break;
+                    }
+                    tokio::time::sleep(poll_interval).await;
+                }
+
+                // Phase B: shorter 30s top-up for OPTIONAL underlyings
+                // (FINNIFTY, MIDCPNIFTY). If still missing after this, drop
+                // them with a per-symbol Telegram alert.
+                let phase_b_start = std::time::Instant::now();
                 loop {
                     let prices = spot_prices_for_depth.read().await;
                     let have_all = depth_underlyings
@@ -1891,38 +1949,41 @@ async fn main() -> Result<()> {
                     if have_all {
                         info!(
                             underlyings = ?depth_underlyings,
-                            "depth ATM: all 4 index LTPs present — proceeding with depth setup"
+                            "depth ATM: all 4 index LTPs present — proceeding"
                         );
                         break;
                     }
-                    if wait_start.elapsed() >= max_wait {
+                    if phase_b_start.elapsed() >= std::time::Duration::from_secs(OPTIONAL_WAIT_SECS)
+                    {
                         let waited = wait_start.elapsed().as_secs();
-                        // Option C: enumerate exactly which ones are missing
-                        // and fire a typed event per missing underlying so the
-                        // operator sees "FINNIFTY missing" not just "timeout".
                         let prices = spot_prices_for_depth.read().await;
-                        let missing: Vec<&str> = depth_underlyings
+                        let missing: Vec<&str> = OPTIONAL_UNDERLYINGS
                             .iter()
                             .copied()
-                            .filter(|sym| !prices.contains_key(*sym))
+                            .filter(|s| !prices.contains_key(*s))
                             .collect();
                         drop(prices);
-                        error!(
-                            waited_secs = waited,
-                            missing = ?missing,
-                            "depth ATM: timed out waiting for index LTPs — proceeding with partial set"
-                        );
-                        notifier.notify(NotificationEvent::DepthIndexLtpTimeout {
-                            waited_secs: waited,
-                        });
-                        for sym in &missing {
-                            notifier.notify(NotificationEvent::DepthUnderlyingMissing {
-                                underlying: (*sym).to_string(),
-                                reason: format!(
-                                    "no spot price in {}s grace window — index feed stalled or symbol inactive",
-                                    waited
-                                ),
+                        if !missing.is_empty() {
+                            warn!(
+                                waited_secs = waited,
+                                missing = ?missing,
+                                "depth ATM: OPTIONAL index LTPs not present after \
+                                 30s top-up — dropping those underlyings"
+                            );
+                            notifier.notify(NotificationEvent::DepthIndexLtpTimeout {
+                                waited_secs: waited,
                             });
+                            for sym in &missing {
+                                notifier.notify(NotificationEvent::DepthUnderlyingMissing {
+                                    underlying: (*sym).to_string(),
+                                    reason: format!(
+                                        "OPTIONAL underlying — no spot price in 30s \
+                                             top-up window after {}s total — symbol inactive \
+                                             or low-liquidity pre-market",
+                                        waited
+                                    ),
+                                });
+                            }
                         }
                         break;
                     }
