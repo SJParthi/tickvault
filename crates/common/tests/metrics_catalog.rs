@@ -121,38 +121,16 @@ const REQUIRED_METRICS: &[(&str, &str)] = &[
         "Total Connected → Disconnected transitions observed. Each outage \
          increments this once.",
     ),
-    // --- Session 3 S3-2 (backfill worker wiring) ---
-    (
-        "tv_backfill_gaps_published_total",
-        "Number of ERROR-level gap events published by the tick persistence \
-         consumer to the BackfillWorker.",
-    ),
-    (
-        "tv_backfill_gaps_dropped_total",
-        "Number of gap events dropped because the backfill channel was full \
-         or closed. Should be 0 in healthy operation.",
-    ),
-    (
-        "tv_backfill_events_received_total",
-        "BackfillStats.events_received — total gap events received by the worker.",
-    ),
-    (
-        "tv_backfill_events_succeeded_total",
-        "BackfillStats.events_succeeded — gap fetches that returned non-empty candles.",
-    ),
-    (
-        "tv_backfill_events_errored_total",
-        "BackfillStats.events_errored — gap fetches that returned an error.",
-    ),
-    (
-        "tv_backfill_events_empty_total",
-        "BackfillStats.events_empty — gap fetches that returned zero candles.",
-    ),
-    (
-        "tv_backfill_ticks_synthesised_total",
-        "BackfillStats.ticks_synthesised — total synthetic ticks emitted by \
-         the BackfillWorker and fed into the tick pipeline.",
-    ),
+    // --- Session 3 S3-2 (backfill worker wiring) — REMOVED 2026-04-17.
+    //     Parthiban directive: the BackfillWorker is permanently DELETED.
+    //     `ticks` table contains live WebSocket data only; historical
+    //     candles live in `historical_candles`. See
+    //     .claude/rules/project/live-feed-purity.md for the hard ban.
+    //     The 7 `tv_backfill_*` metrics and `tv_backfill_ticks_persisted_total`
+    //     have been de-registered along with the module.
+    //     (Metric names intentionally left dangling in this catalog so
+    //     Grafana queries referring to them raise a missing-metric error
+    //     loudly rather than silently returning 0.)
     // --- Session 4 S4-T1a (pool self halts) ---
     (
         "tv_pool_self_halts_total",
@@ -161,22 +139,8 @@ const REQUIRED_METRICS: &[(&str, &str)] = &[
          every increment is a supervisor-triggered restart.",
     ),
     // --- Session 4 S4-T1f (synth ticks forwarded to broadcast) ---
-    (
-        "tv_backfill_ticks_forwarded_total",
-        "S4-T1f: Number of synth ticks successfully forwarded from the \
-         BackfillWorker output into the main tick broadcast channel. \
-         This is the observable measure that backfill actually closed \
-         a gap. Downstream DEDUP merges any overlap with live ticks.",
-    ),
-    // --- Session 5 A1 (slow-boot synth tick direct persistence) ---
-    (
-        "tv_backfill_ticks_persisted_total",
-        "S5-A1: Number of synth ticks directly persisted by the slow-boot \
-         dedicated synth TickPersistenceWriter. Fast-boot persists synth \
-         ticks via the cold-path consumer; slow-boot's hot-path writer \
-         only sees raw WS frames, so this dedicated writer is required \
-         for backfill to actually reach QuestDB in slow-boot mode.",
-    ),
+    // tv_backfill_ticks_forwarded_total + tv_backfill_ticks_persisted_total
+    // removed with the BackfillWorker deletion on 2026-04-17. See above.
     // --- Session 4 S4-T4 (existing subsystem metrics catalogued for lockdown) ---
     (
         "tv_order_update_ws_active",

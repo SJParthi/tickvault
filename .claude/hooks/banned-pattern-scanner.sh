@@ -316,6 +316,58 @@ scan_instrument_paths '\.registry\.contains([^_]' \
   "$STAGED_FILES"
 
 # ─────────────────────────────────────────────
+# CATEGORY 6: LIVE-FEED PURITY (Parthiban directive 2026-04-17)
+# ─────────────────────────────────────────────
+#
+# "nowhere the backfill should happen ... live market feed should contain
+#  only live market feed data alone ... historical candle data fetch is a
+#  separate functionality"
+#
+# Hard ban on synthesising ticks from historical candles and writing them
+# into the `ticks` QuestDB table. The BackfillWorker module was DELETED
+# on 2026-04-17; these patterns block anyone from re-introducing it.
+#
+# Rule: `ticks` table is populated EXCLUSIVELY by WebSocket-sourced
+# `ParsedTick` structs flowing through `crates/core/src/pipeline/`.
+# Historical candle data lives in `historical_candles` + `candles_*`
+# materialized views and MUST NOT cross into `ticks`.
+
+scan_live_feed_purity() {
+  local pattern="$1"
+  local description="$2"
+  local files="$3"
+  local target_files
+
+  # Ban applies to the `historical/` module tree and any new REST backfill path.
+  target_files=$(echo "$files" | grep -E \
+    '^crates/core/src/historical/|^crates/(core|trading|app)/src/.*/(backfill|synth)' \
+    || true)
+  if [ -z "$target_files" ]; then
+    return
+  fi
+
+  scan_prod_code "$pattern" "$description" "$target_files"
+}
+
+# Hard bans — these symbols MUST NOT appear inside any historical/ or
+# backfill-named file. If they reappear, the backfill worker is being
+# re-introduced and the commit is blocked.
+scan_live_feed_purity 'TickPersistenceWriter' \
+  'LIVE-FEED-PURITY: TickPersistenceWriter MUST NOT be used from historical/backfill paths (2026-04-17 directive). ticks table = live WS data only.' \
+  "$STAGED_FILES"
+scan_live_feed_purity 'append_tick\b' \
+  'LIVE-FEED-PURITY: append_tick() MUST NOT be called from historical/backfill paths. Historical data belongs in historical_candles only.' \
+  "$STAGED_FILES"
+scan_live_feed_purity 'BackfillWorker\|run_backfill\|synthesize_ticks' \
+  'LIVE-FEED-PURITY: BackfillWorker / synth-tick pipeline was DELETED 2026-04-17. Re-introducing it is forbidden by Parthiban directive.' \
+  "$STAGED_FILES"
+
+# Also ban the historical module re-exporting a `backfill` submodule.
+scan_prod_code 'pub mod backfill' \
+  'LIVE-FEED-PURITY: pub mod backfill is banned — the module was DELETED 2026-04-17.' \
+  "$STAGED_FILES"
+
+# ─────────────────────────────────────────────
 # RESULT
 # ─────────────────────────────────────────────
 
