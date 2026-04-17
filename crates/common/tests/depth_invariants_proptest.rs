@@ -125,12 +125,12 @@ fn invariant_depth_level_offsets_stable() {
     assert_eq!(DEEP_DEPTH_LEVEL_OFFSET_QUANTITY, 8);
     assert_eq!(DEEP_DEPTH_LEVEL_OFFSET_ORDERS, 12);
 
-    // f64 price = 8 bytes, fits within a level
-    assert!(DEEP_DEPTH_LEVEL_OFFSET_PRICE + 8 <= DEEP_DEPTH_LEVEL_SIZE);
-    // u32 qty = 4 bytes
-    assert!(DEEP_DEPTH_LEVEL_OFFSET_QUANTITY + 4 <= DEEP_DEPTH_LEVEL_SIZE);
-    // u32 orders = 4 bytes
-    assert!(DEEP_DEPTH_LEVEL_OFFSET_ORDERS + 4 <= DEEP_DEPTH_LEVEL_SIZE);
+    // f64 price = 8 bytes, fits within a level (compile-time check)
+    const {
+        assert!(DEEP_DEPTH_LEVEL_OFFSET_PRICE + 8 <= DEEP_DEPTH_LEVEL_SIZE);
+        assert!(DEEP_DEPTH_LEVEL_OFFSET_QUANTITY + 4 <= DEEP_DEPTH_LEVEL_SIZE);
+        assert!(DEEP_DEPTH_LEVEL_OFFSET_ORDERS + 4 <= DEEP_DEPTH_LEVEL_SIZE);
+    }
 }
 
 #[test]
@@ -203,12 +203,16 @@ proptest! {
     /// within the 12-byte header.
     #[test]
     fn prop_header_offsets_fit_within_header_size(_seed in any::<u8>()) {
+        // Every offset+field-size must fit within the 12-byte header.
+        // Written as `x < y` (equivalent to `x + w <= y` where w >= 1) per
+        // clippy::int_plus_one — the addition on the left was flagged as
+        // redundant.
         // msg_length: 2 bytes (i16) at offset 0
         prop_assert!(DEEP_DEPTH_HEADER_OFFSET_MSG_LENGTH + 2 <= DEEP_DEPTH_HEADER_SIZE);
         // feed_code: 1 byte (u8) at offset 2
-        prop_assert!(DEEP_DEPTH_HEADER_OFFSET_FEED_CODE + 1 <= DEEP_DEPTH_HEADER_SIZE);
+        prop_assert!(DEEP_DEPTH_HEADER_OFFSET_FEED_CODE < DEEP_DEPTH_HEADER_SIZE);
         // exchange_segment: 1 byte (u8) at offset 3
-        prop_assert!(DEEP_DEPTH_HEADER_OFFSET_EXCHANGE_SEGMENT + 1 <= DEEP_DEPTH_HEADER_SIZE);
+        prop_assert!(DEEP_DEPTH_HEADER_OFFSET_EXCHANGE_SEGMENT < DEEP_DEPTH_HEADER_SIZE);
         // security_id: 4 bytes (i32) at offset 4
         prop_assert!(DEEP_DEPTH_HEADER_OFFSET_SECURITY_ID + 4 <= DEEP_DEPTH_HEADER_SIZE);
         // msg_sequence: 4 bytes (u32) at offset 8
