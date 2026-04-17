@@ -52,6 +52,29 @@ const BUILD_HISTORY_TABLE: &str = "instrument_build_metadata";
 /// alone under-counts when Dhan reuses a numeric id across segments.
 /// Any aggregation over one of these tables MUST include `segment` (or
 /// `exchange_segment`) alongside `security_id` in the distinct clause.
+/// Audit finding #5 (2026-04-17): critical metrics that MUST appear on
+/// at least one dashboard panel so the operator sees them in Grafana.
+/// Every entry here must be a prefix (or exact name) that we scan the
+/// Grafana dashboard JSON for. A missing entry = silent dashboard gap
+/// = operator can't triage without SSH into Prometheus.
+///
+/// The rule is deliberately PREFIX-based so derived label variants
+/// (e.g. `tv_depth_20lvl_packets_total` matches `tv_depth_`) don't
+/// force per-variant updates.
+const REQUIRED_DASHBOARD_METRIC_PREFIXES: &[&str] = &[
+    // Depth feed health — 20-level, 200-level, rebalancer.
+    "tv_depth_",
+    // QuestDB connectivity (commits e05e66c, earlier).
+    "tv_questdb_",
+    // Main feed WebSocket pool health.
+    "tv_pool_",
+    // Tick persistence write path (catches the WARN→ERROR fixes
+    // shipped in audit finding #2 — need a panel to see flush errors).
+    "tv_tick_flush_errors_total",
+    // I-P1-11 cross-segment collision detector (commit d049bd6).
+    "tv_instrument_registry_cross_segment_collisions",
+];
+
 const CROSS_SEGMENT_TABLES: &[&str] = &[
     "ticks",
     "market_depth",
@@ -310,6 +333,89 @@ fn dashboard_distinct_security_id_must_include_segment() {
          under-count instruments.\n\n{}\n\n\
          Rule: .claude/rules/project/security-id-uniqueness.md (I-P1-11).",
         violations.join("\n\n")
+    );
+}
+
+// ============================================================================
+// Audit finding #5 — critical metrics must appear on at least one dashboard
+// ============================================================================
+
+/// Ratchet allow-list: metrics KNOWN to be missing from dashboards as of
+/// 2026-04-17. The test FAILS if this list grows — adding a new required
+/// metric without a dashboard panel is blocked. Items should be REMOVED
+/// from this list as operator adds dashboard panels; each removal is a
+/// one-way ratchet improvement.
+const KNOWN_DASHBOARD_GAPS: &[&str] = &[
+    "tv_questdb_",
+    "tv_pool_",
+    "tv_tick_flush_errors_total",
+    "tv_instrument_registry_cross_segment_collisions",
+];
+
+#[test]
+fn critical_metric_prefixes_appear_on_at_least_one_dashboard() {
+    let dashboards = read_all_dashboards();
+    // Concatenate every dashboard's raw JSON so we can scan for substring
+    // matches. This matches metric names referenced anywhere in PromQL
+    // expressions, panel titles, legend formats, etc.
+    let all_content: String = dashboards
+        .iter()
+        .map(|(_, content)| content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let mut missing: Vec<&str> = Vec::new();
+    for &prefix in REQUIRED_DASHBOARD_METRIC_PREFIXES {
+        if !all_content.contains(prefix) {
+            // Allow the known-gap ratchet; any NEW gap blocks the build.
+            if KNOWN_DASHBOARD_GAPS.contains(&prefix) {
+                continue;
+            }
+            missing.push(prefix);
+        }
+    }
+
+    assert!(
+        missing.is_empty(),
+        "Audit finding #5 violation — the following critical metric \
+         prefix(es) are emitted by the app but have NO Grafana dashboard \
+         panel referencing them, AND they are not in the known-gap \
+         ratchet. Operators cannot triage the underlying subsystem from \
+         the dashboards. Fix by adding at least one panel per prefix to \
+         `deploy/docker/grafana/dashboards/*.json`.\n\n\
+         Missing prefixes: {:?}\n\n\
+         (Or, if the prefix is intentionally retired, remove it from \
+         REQUIRED_DASHBOARD_METRIC_PREFIXES in this test.)",
+        missing
+    );
+}
+
+/// Guard that the known-gap list can only shrink (ratchet). If an operator
+/// adds a panel for a known gap, they MUST remove it from the list — this
+/// test enforces that the list doesn't accumulate stale entries.
+#[test]
+fn known_dashboard_gaps_must_actually_be_missing() {
+    let dashboards = read_all_dashboards();
+    let all_content: String = dashboards
+        .iter()
+        .map(|(_, content)| content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let mut stale_gaps: Vec<&str> = Vec::new();
+    for &prefix in KNOWN_DASHBOARD_GAPS {
+        if all_content.contains(prefix) {
+            stale_gaps.push(prefix);
+        }
+    }
+
+    assert!(
+        stale_gaps.is_empty(),
+        "Ratchet violation — the following metric prefix(es) are in \
+         KNOWN_DASHBOARD_GAPS but actually DO appear on a dashboard. \
+         Remove them from the list to tighten the ratchet:\n\n\
+         Stale gaps: {:?}",
+        stale_gaps
     );
 }
 
