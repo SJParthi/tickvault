@@ -629,6 +629,19 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
     m_channel_capacity.set(frame_receiver.max_capacity() as f64);
     info!(today_ist_day_number, "tick processor started");
 
+    // §10.3 metric: per-(security_id, side) last-seen sequence for 20-level
+    // depth frames. Increments `tv_depth_20lvl_sequence_gaps_total` when a
+    // frame arrives with `message_sequence != last + 1` — indicates Dhan
+    // dropped a packet or our WebSocket missed a frame.
+    //
+    // Capacity: 4 depth underlyings × ~50 strikes × 2 sides = 400; plus
+    // headroom for 20-level equity subscriptions if those ever enable.
+    // O(1) EXEMPT: allocated once at task start, NOT per tick. O(1) HashMap
+    // lookup + insert on the hot path per frame.
+    let mut deep_depth_seq_tracker: std::collections::HashMap<(u32, u8), u32> =
+        std::collections::HashMap::with_capacity(512);
+    let m_seq_gaps = metrics::counter!("tv_depth_20lvl_sequence_gaps_total");
+
     while let Some(raw_frame) = frame_receiver.recv().await {
         let tick_start = Instant::now();
         frames_processed = frames_processed.saturating_add(1);
@@ -1158,14 +1171,47 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                 security_id,
                 exchange_segment_code,
                 side,
+                message_sequence,
                 ..
             } => {
-                // Deep depth frames are from a separate WS connection.
-                // Log receipt; full order book assembly is done downstream.
+                // §10.3 sequence-gap detection (20-level only — 200-level
+                // reuses this field as row_count, so gap math is meaningless
+                // there; we trust the dispatcher already discriminated).
+                // The side is folded into the key via its discriminant byte
+                // so a gap in Bid doesn't poison Ask tracking for the same
+                // security.
+                //
+                // O(1): HashMap get+insert, bounded capacity. Runs only on
+                // DeepDepth frames (cold relative to ticks).
+                let side_byte: u8 = match side {
+                    crate::parser::DepthSide::Bid => 41,
+                    crate::parser::DepthSide::Ask => 51,
+                };
+                let key = (security_id, side_byte);
+                if let Some(prev) = deep_depth_seq_tracker.get(&key).copied() {
+                    // Saturating math: if Dhan resets sequence (reconnect),
+                    // `message_sequence < prev + 1` is detected and counted
+                    // as one gap event.
+                    if message_sequence != prev.saturating_add(1) {
+                        m_seq_gaps.increment(1);
+                        warn!(
+                            security_id,
+                            exchange_segment_code,
+                            ?side,
+                            prev_seq = prev,
+                            current_seq = message_sequence,
+                            "20-level depth sequence gap detected"
+                        );
+                    }
+                }
+                // Insert regardless (new baseline for next comparison).
+                deep_depth_seq_tracker.insert(key, message_sequence);
+
                 trace!(
                     security_id,
                     exchange_segment_code,
                     ?side,
+                    message_sequence,
                     "deep depth frame received"
                 );
             }

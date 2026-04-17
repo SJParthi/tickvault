@@ -495,10 +495,10 @@ PascalCase top-level keys.
 | `tv_phase2_run_ms` | Histogram: Phase 2 scheduler run duration | ✅ **landed 2026-04-17** |
 | `tv_pool_degraded_alerts_total` | Counter: 60s-all-down Telegrams fired | ✅ **landed 2026-04-17** |
 | `tv_pool_recoveries_total` | Counter: pool-recovered transitions | ✅ **landed 2026-04-17** |
-| `tv_depth_20lvl_sequence_gaps_total` | Counter: detected sequence gaps in 20-level packets | ⏳ parser hook pending |
-| `tv_order_update_non_order_messages_dropped_total` | Counter: JSON messages that weren't order updates | ⏳ |
-| `tv_unknown_response_codes_total` | Counter: Dhan sent a response code we don't recognize | ⏳ dispatcher hook pending |
-| `tv_packets_by_response_code` | Histogram: breakdown of all received packet types | ⏳ |
+| `tv_depth_20lvl_sequence_gaps_total` | Counter: detected sequence gaps in 20-level packets | ✅ **landed 2026-04-17** — `tick_processor.rs` per-`(security_id, side)` tracker, increments when `message_sequence != prev + 1` |
+| `tv_order_update_non_order_messages_dropped_total` | Counter: JSON messages that weren't order updates | ✅ tracked via existing `tv_order_update_non_order_messages_total` |
+| `tv_unknown_response_codes_total` | Counter: Dhan sent a response code we don't recognize | ✅ **landed 2026-04-17** — dispatcher `_` arm increments before returning `ParseError::UnknownResponseCode` |
+| `tv_packets_by_response_code` | Counter (labelled): breakdown of all received packet types | ✅ **landed 2026-04-17** — labelled counter, every dispatch increments the matching label (`ticker`, `quote`, `full`, `oi`, `prev_close`, `market_status`, `disconnect`, `market_depth_v1`, `index_ticker`, or `unknown`) |
 
 ### 10.4 Missing Tests
 
