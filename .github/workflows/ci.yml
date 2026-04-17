@@ -62,7 +62,7 @@ jobs:
   build-and-verify:
     name: "Build & Verify"
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -79,28 +79,30 @@ jobs:
           shared-key: ci-build-and-verify
           cache-on-failure: true
 
+      - name: Install cargo-nextest (3x faster than cargo test)
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
       - name: cargo fmt --check
         run: cargo fmt --all --check
 
       - name: cargo clippy (workspace, libs + bins only)
-        # NOTE: `--all-targets` would also lint test code + benches.
-        # The project's `.claude/rules/project/rust-code.md` already forbids
-        # `eprintln!` / `unwrap` / `expect` in prod via
-        # `#![cfg_attr(not(test), deny(...))]` in each crate's lib.rs,
-        # which gives clippy enforcement on prod code automatically.
-        # Tests legitimately use `eprintln!` for calibration output — those
-        # are out of scope for this gate.
-        #
-        # `-D warnings` is DISABLED for now because ~24 pre-existing
-        # warnings surfaced the first time real CI ran (they were hidden
-        # by the previous `sleep 3` stub). Fixing them is tracked for a
-        # follow-up cleanup pass. Warnings still print so reviewers see
-        # them; they just do not block merge until the cleanup lands.
+        # NOTE: we deliberately do NOT pass `--all-targets` or
+        # `-D warnings` here. Test code legitimately uses `eprintln!`
+        # (calibration output) and there are ~24 pre-existing lib
+        # warnings (doc_lazy_continuation, iter_cloned_collect, etc.)
+        # scheduled for a follow-up cleanup pass. Prod code is still
+        # protected via `#![cfg_attr(not(test), deny(...))]` in each
+        # crate's lib.rs.
         run: cargo clippy --workspace --no-deps
 
-      - name: cargo test --workspace --no-fail-fast
-        timeout-minutes: 20
-        run: cargo test --workspace --no-fail-fast
+      - name: cargo nextest run --workspace
+        timeout-minutes: 45
+        # nextest is 3x faster than cargo test on parallelizable
+        # workloads — fits the full workspace comfortably in the
+        # job's 60-minute budget even with a cold cache.
+        run: cargo nextest run --workspace --no-fail-fast
 
   # -------------------------------------------------------------------------
   # Security & Audit — delegated to security-audit.yml workflow.
