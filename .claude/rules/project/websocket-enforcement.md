@@ -74,9 +74,10 @@ paths:
 
 Any change to WebSocket code must check the open gaps in `docs/architecture/websocket-complete-reference.md` Section 10.2 and not introduce regressions.
 
-Key open gaps:
-- `WebSocketDisconnected` event not wired for main feed (H1)
-- No pool-level circuit breaker for main feed (H2)
+Key open gaps (high severity, not yet implemented — see ref §10.2 for design sketches):
+- **O1** — 9:12 AM Phase 2 stock F&O subscription scheduler: spec in `live-market-feed-subscription.md`, NO code implementation
+- **O2** — `OrderUpdateConnected` fires on spawn, not after successful auth ACK
+- **O3** — No stale-spot-price detection on depth rebalancer (may swap to wrong strike on index feed outage)
 
 Resolved gaps:
 - Telegram now fires on first data frame (not just subscription) — fixed 2026-04-09
@@ -88,6 +89,9 @@ Resolved gaps:
 - Depth strike selector picking wrong strikes — fixed 2026-04-16 (real ATM from index LTP)
 - Backfill worker injecting synthetic ticks — fixed 2026-04-16 (disabled)
 - Post-market stale ticks — fixed 2026-04-16 (wall-clock guard)
+- FAST BOOT emitted zero `WebSocketConnected` alerts — fixed 2026-04-17 (shared helper + guard test)
+- Pool watchdog `Degraded`/`Recovered` verdicts silently discarded — fixed 2026-04-17 (typed events wired)
+- Depth index-LTP timeout warned silently — fixed 2026-04-17 (ERROR + `DepthIndexLtpTimeout` event)
 
 ## What This Prevents
 

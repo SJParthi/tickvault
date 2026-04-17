@@ -444,14 +444,30 @@ PascalCase top-level keys.
 | 27 | (L3) 200-level 40s timeout too aggressive | Watchdog threshold is 50s (40s Dhan + 10s margin) — correct | 2026-04-16 |
 | 28 | (L4-L7) Config/doc-only items | All handled via config or existing mechanisms — no code changes needed | 2026-04-16 |
 | 29 | (H4) No hex dump for unparseable packets | Added hex dump of first 64 bytes at ERROR level every 10th error + WARN with hex for others | 2026-04-16 |
+| 30 | FAST BOOT path emitted zero `WebSocketConnected` Telegram alerts | Extracted `emit_websocket_connected_alerts(notifier, count)` helper, called from BOTH boot paths; added `WebSocketPoolOnline { connected, total }` summary event to survive Telegram rate-limit drops; mechanical guard test `crates/app/tests/boot_path_notify_parity.rs` | 2026-04-17 |
+| 31 | Pool watchdog `Degraded` + `Recovered` verdicts silently discarded (only `Halt` was handled) | `spawn_pool_watchdog_task` now takes a notifier and fires `WebSocketPoolDegraded`, `WebSocketPoolRecovered`, `WebSocketPoolHalt` events with matching counters | 2026-04-17 |
+| 32 | Depth index-LTP 30s timeout warned only via `warn!` — no Telegram, no ERROR log | Promoted to `error!` (auto-telegrams via Loki pipeline) and fires typed `NotificationEvent::DepthIndexLtpTimeout { waited_secs }` event | 2026-04-17 |
 
 ### 10.2 Open Gaps
 
-#### CRITICAL
+#### HIGH — Not Yet Implemented
 
-*No open critical gaps.*
+| # | Gap | Design Sketch | Est. Effort |
+|---|-----|---------------|-------------|
+| O1 | **9:12 AM Phase 2 stock F&O subscription scheduler** — `.claude/rules/project/live-market-feed-subscription.md` spec exists but NO code implements it. Boot-time passes empty spot prices to `build_subscription_plan`; stock F&O never subscribed. | (1) New `SubscribeCommand { to_add: Vec<InstrumentSubscription> }` channel on each main-feed `WebSocketConnection` (mirrors depth's `DepthCommand`). (2) New `crates/core/src/instrument/phase2_scheduler.rs` task spawned from both boot paths: sleep until 9:12 IST on next trading day (or run immediately if already past 9:12 / FAST BOOT mid-market), read `SharedSpotPrices`, rebuild plan, compute delta vs boot plan, fan out `SubscribeCommand` to connections with spare capacity. (3) New `NotificationEvent::Phase2SubscriptionComplete { added_count }` + `Phase2SubscriptionFailed { reason }` events. | 2–3 days |
+| O2 | `OrderUpdateConnected` fires on task spawn, not after successful auth ACK — operator sees "connected" seconds before orders are actually being processed | Add `authenticated_signal: Option<tokio::sync::oneshot::Sender<()>>` parameter to `run_order_update_connection`. Fire once on first successful `parse_order_update` OR first `classify_auth_response` → Success (login ACK). Caller awaits the signal and fires new `NotificationEvent::OrderUpdateAuthenticated` event. | 0.5 day |
+| O3 | Stale spot-price detection on depth rebalancer — if index LTP feed stops, rebalancer reads a stale price every 60s and may swap to wrong strike | Store `(price, timestamp)` in `SharedSpotPrices` (currently just `price`). Rebalancer checks age; if > N seconds, log WARN + fire `NotificationEvent::DepthSpotPriceStale { underlying, age_secs }` and skip the rebalance cycle. | 0.5 day |
 
-*No open gaps. All items resolved as of 2026-04-16.*
+#### MEDIUM — Observability
+
+| # | Gap | Fix Shape |
+|---|-----|-----------|
+| M1 | Missing metrics per §10.3 (5 metrics) | Add counters/gauges, increment at relevant sites |
+| M2 | Missing tests per §10.4 (6 tests) | Add integration tests in `crates/core/tests/` |
+
+#### ACCEPTED (No Open Critical Gaps)
+
+*No open critical gaps as of 2026-04-17.*
 
 #### ACCEPTED (Dhan Limitation / Design Decision)
 
