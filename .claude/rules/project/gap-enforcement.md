@@ -114,6 +114,33 @@ was no clean way to answer "what's active right now?".
 - `crates/storage/tests/grafana_dashboard_snapshot_filter_guard.rs` — scans
   every dashboard JSON for missing `status =`-style predicates
 
+## I-P1-11: segment-aware security_id uniqueness (NEW 2026-04-17)
+**Rationale:** Dhan reuses the same numeric `security_id` across different
+`ExchangeSegment` values — e.g. FINNIFTY's IDX_I index value and an
+NSE_EQ instrument both had `security_id = 27` in the live CSV on
+2026-04-17. Any collection keyed on `security_id` alone silently
+drops one of the two, leading to missing WebSocket subscriptions,
+incorrect tick enrichment, and silent data loss.
+
+**Rule:** `security_id` alone is NOT unique. The only unique instrument
+key is `(security_id, exchange_segment)`. See the full rule body in
+`.claude/rules/project/security-id-uniqueness.md` (auto-loaded).
+
+**Fixed sites:**
+- `crates/core/src/instrument/subscription_planner.rs` — planner dedup
+  uses `HashSet<(u32, ExchangeSegment)>` (commit `cef501c`)
+- `crates/core/src/instrument/universe_builder.rs` — CSV parse dedup
+  uses `HashSet<(SecurityId, char)>` with CSV segment char
+  (commit `b46ee8b`)
+- `crates/common/src/instrument_registry.rs` — emits WARN per
+  cross-segment collision; full key refactor tracked as follow-up PR
+
+**Tests:**
+- `subscription_planner::tests::test_regression_seen_ids_key_type_is_pair`
+  — compile-time guard; fails to compile if someone regresses the key
+- `subscription_planner::tests::test_regression_finnifty_id27_both_segments_are_kept`
+  — scenario repro using NIFTY id=13 IDX_I + synthetic stock id=13 NSE_EQ
+
 ## I-P2-02: Trading Day Guard on Download
 - `instrument_loader.rs` must log when downloading on weekends
 - Weekend detection uses IST timezone, not UTC
