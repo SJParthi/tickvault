@@ -198,19 +198,27 @@ impl InstrumentRegistry {
             }
         }
 
-        // Count categories from the deduplicated map (handles duplicate security_ids correctly).
+        // I-P1-11: Count categories from the SEGMENT-AWARE composite map so
+        // both colliding entries (e.g. NIFTY IDX_I id=13 + some NSE_EQ id=13)
+        // contribute to their respective category counts. Using the legacy
+        // `map` here would under-count whenever a cross-segment collision
+        // silently overwrote one entry.
         let mut category_counts: HashMap<SubscriptionCategory, usize> = HashMap::new();
-        for instrument in map.values() {
+        for instrument in by_composite.values() {
             let count = category_counts.entry(instrument.category).or_insert(0);
             *count = count.saturating_add(1);
         }
 
-        let total_count = map.len();
+        // I-P1-11: total count = composite map len (both colliding entries counted).
+        let total_count = by_composite.len();
 
-        // Build reverse lookup: underlying_symbol → price_feed_security_id.
+        // I-P1-11: Build reverse lookup from the composite map so that when
+        // NIFTY IDX_I id=13 and some NSE_EQ stock id=13 collide, the NIFTY
+        // entry (distinct `underlying_symbol`) still registers its price feed
+        // correctly regardless of insertion order.
         // Only indices and equities serve as price feeds for F&O underlyings.
         let mut underlying_symbol_to_security_id = HashMap::new();
-        for instrument in map.values() {
+        for instrument in by_composite.values() {
             match instrument.category {
                 SubscriptionCategory::MajorIndexValue | SubscriptionCategory::StockEquity => {
                     underlying_symbol_to_security_id
@@ -297,8 +305,16 @@ impl InstrumentRegistry {
     }
 
     /// Returns an iterator over all subscribed instruments.
+    ///
+    /// I-P1-11 (2026-04-17): Iterates the SEGMENT-AWARE composite index so
+    /// callers such as the WebSocket subscribe-message builder emit messages
+    /// for BOTH entries when Dhan reuses a numeric `security_id` across
+    /// segments. Iterating the legacy `self.instruments.values()` here caused
+    /// NIFTY IDX_I id=13 to never receive a subscribe message (overwritten in
+    /// the single-segment HashMap by an NSE_EQ id=13 instrument) and the
+    /// main feed delivered zero index ticks to the tick table.
     pub fn iter(&self) -> impl Iterator<Item = &SubscribedInstrument> {
-        self.instruments.values()
+        self.by_composite.values()
     }
 
     /// O(1) reverse lookup: returns the price_feed_security_id for an underlying symbol.
@@ -313,9 +329,14 @@ impl InstrumentRegistry {
     /// Returns all security_ids grouped by exchange segment.
     ///
     /// Used by the subscription planner to build WebSocket subscription messages.
+    ///
+    /// I-P1-11 (2026-04-17): Iterates the SEGMENT-AWARE composite index so
+    /// both colliding entries (e.g. NIFTY IDX_I id=13 AND some NSE_EQ id=13)
+    /// are emitted into their respective segment buckets. Previously this
+    /// used the legacy single-segment map and dropped one entry.
     pub fn by_exchange_segment(&self) -> HashMap<ExchangeSegment, Vec<SecurityId>> {
         let mut grouped: HashMap<ExchangeSegment, Vec<SecurityId>> = HashMap::new();
-        for instrument in self.instruments.values() {
+        for instrument in self.by_composite.values() {
             grouped
                 .entry(instrument.exchange_segment)
                 .or_default()
@@ -1150,5 +1171,107 @@ mod tests {
     fn test_underlying_reverse_lookup_empty_registry() {
         let registry = InstrumentRegistry::empty();
         assert_eq!(registry.get_underlying_security_id("NIFTY"), None);
+    }
+
+    // I-P1-11 (2026-04-17): Regression tests for segment-aware iteration.
+    // Dhan reuses numeric `security_id` across different segments
+    // (e.g. NIFTY IDX_I id=13 + some NSE_EQ id=13). The subscription builder
+    // in `main.rs` pipes `registry.iter()` into `InstrumentSubscription`.
+    // If `iter()` returned the legacy `self.instruments.values()` only one
+    // of the two colliding entries would receive a subscribe message to
+    // Dhan — the symptom observed live on 2026-04-17 where NIFTY IDX_I
+    // ticks never arrived in the tick table even though the registry
+    // nominally contained the entry.
+
+    #[test]
+    fn test_iter_returns_both_colliding_segments() {
+        let mut nifty_idx = sample_instrument(13, SubscriptionCategory::MajorIndexValue);
+        nifty_idx.exchange_segment = ExchangeSegment::IdxI;
+        nifty_idx.underlying_symbol = "NIFTY".to_string();
+        nifty_idx.display_label = "NIFTY".to_string();
+
+        let mut stock_id13 = sample_instrument(13, SubscriptionCategory::StockEquity);
+        stock_id13.exchange_segment = ExchangeSegment::NseEquity;
+        stock_id13.underlying_symbol = "ZZSTOCK".to_string();
+        stock_id13.display_label = "ZZSTOCK".to_string();
+
+        let registry = InstrumentRegistry::from_instruments(vec![nifty_idx, stock_id13]);
+
+        // iter() MUST yield BOTH entries — one per (id, segment) pair.
+        let collected: Vec<(SecurityId, ExchangeSegment)> = registry
+            .iter()
+            .map(|i| (i.security_id, i.exchange_segment))
+            .collect();
+        assert_eq!(
+            collected.len(),
+            2,
+            "iter() must yield both colliding entries"
+        );
+        assert!(collected.contains(&(13, ExchangeSegment::IdxI)));
+        assert!(collected.contains(&(13, ExchangeSegment::NseEquity)));
+    }
+
+    #[test]
+    fn test_by_exchange_segment_returns_both_colliding_segments() {
+        let mut nifty_idx = sample_instrument(13, SubscriptionCategory::MajorIndexValue);
+        nifty_idx.exchange_segment = ExchangeSegment::IdxI;
+        let mut stock_id13 = sample_instrument(13, SubscriptionCategory::StockEquity);
+        stock_id13.exchange_segment = ExchangeSegment::NseEquity;
+
+        let registry = InstrumentRegistry::from_instruments(vec![nifty_idx, stock_id13]);
+        let grouped = registry.by_exchange_segment();
+
+        // Both segments present, each holds the id=13 entry.
+        assert_eq!(grouped.get(&ExchangeSegment::IdxI).unwrap(), &vec![13]);
+        assert_eq!(grouped.get(&ExchangeSegment::NseEquity).unwrap(), &vec![13]);
+    }
+
+    #[test]
+    fn test_len_counts_both_colliding_segments() {
+        let mut nifty_idx = sample_instrument(13, SubscriptionCategory::MajorIndexValue);
+        nifty_idx.exchange_segment = ExchangeSegment::IdxI;
+        let mut stock_id13 = sample_instrument(13, SubscriptionCategory::StockEquity);
+        stock_id13.exchange_segment = ExchangeSegment::NseEquity;
+
+        let registry = InstrumentRegistry::from_instruments(vec![nifty_idx, stock_id13]);
+        // Composite map holds both; len() reflects that.
+        assert_eq!(registry.len(), 2);
+    }
+
+    #[test]
+    fn test_category_counts_include_both_colliding_segments() {
+        let mut nifty_idx = sample_instrument(13, SubscriptionCategory::MajorIndexValue);
+        nifty_idx.exchange_segment = ExchangeSegment::IdxI;
+        let mut stock_id13 = sample_instrument(13, SubscriptionCategory::StockEquity);
+        stock_id13.exchange_segment = ExchangeSegment::NseEquity;
+
+        let registry = InstrumentRegistry::from_instruments(vec![nifty_idx, stock_id13]);
+        // Each entry's category is counted independently.
+        assert_eq!(
+            registry.category_count(SubscriptionCategory::MajorIndexValue),
+            1
+        );
+        assert_eq!(
+            registry.category_count(SubscriptionCategory::StockEquity),
+            1
+        );
+    }
+
+    #[test]
+    fn test_underlying_reverse_lookup_distinct_symbols_across_colliding_ids() {
+        // NIFTY IDX_I id=13 AND a stock named ZZSTOCK id=13 in NSE_EQ.
+        // Both should register their own symbol → id mapping regardless
+        // of HashMap insertion order (by_composite iteration is order-
+        // independent for distinct symbols).
+        let mut nifty_idx = sample_instrument(13, SubscriptionCategory::MajorIndexValue);
+        nifty_idx.exchange_segment = ExchangeSegment::IdxI;
+        nifty_idx.underlying_symbol = "NIFTY".to_string();
+        let mut stock_id13 = sample_instrument(13, SubscriptionCategory::StockEquity);
+        stock_id13.exchange_segment = ExchangeSegment::NseEquity;
+        stock_id13.underlying_symbol = "ZZSTOCK".to_string();
+
+        let registry = InstrumentRegistry::from_instruments(vec![nifty_idx, stock_id13]);
+        assert_eq!(registry.get_underlying_security_id("NIFTY"), Some(13));
+        assert_eq!(registry.get_underlying_security_id("ZZSTOCK"), Some(13));
     }
 }
