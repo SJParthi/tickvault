@@ -22,7 +22,30 @@ all-features = true
 # are outside our control and should not block CI.
 [advisories]
 unmaintained = "workspace"
-ignore = []
+# Temporary advisory ignores — waiting on stable upstream fixes.
+# Review at every dependency-bump pass; remove once the fix ships in a
+# non-alpha release and we bump the relevant workspace dep.
+ignore = [
+    # rustls-webpki name-constraints advisories. Fix is 0.103.12 OR
+    # 0.104.0-alpha.6. 0.103.12 is NOT yet released on crates.io (latest
+    # stable is 0.103.9 as of 2026-04-17); 0.104 is alpha which we do
+    # NOT ship in a regulated trading system.
+    { id = "RUSTSEC-2026-0098", reason = "rustls-webpki URI name-constraint bug; 0.103.12 not released yet, 0.104 is alpha" },
+    { id = "RUSTSEC-2026-0099", reason = "rustls-webpki wildcard name-constraint bug; 0.103.12 not released yet, 0.104 is alpha" },
+    # rustls-webpki 0.103.9 CRL authority matching — fix is 0.103.10,
+    # but our rustls 0.23.37 pins 0.103.9. Needs a rustls patch bump.
+    { id = "RUSTSEC-2026-0049", reason = "rustls-webpki 0.103.10 fix requires rustls 0.23 patch bump — pending" },
+    # rand unsoundness. Triggers only when a *custom global logger*
+    # reads RNG state. tickvault's custom tracing layer never reads
+    # rand — we use rand transitively only for tungstenite reconnect
+    # jitter and failsafe circuit-breaker probability. Non-exploitable.
+    { id = "RUSTSEC-2026-0097", reason = "unsound only with custom logger reading RNG; tickvault never does this" },
+    # AWS-LC advisories (X.509 bypass + CRL scope). Fix is aws-lc-sys
+    # 0.39.0+, but aws-lc-rs 1.16.1 pins <0.39. aws-lc-rs 1.17 not yet
+    # released. Ignore until aws-lc-rs ships the bump.
+    { id = "RUSTSEC-2026-0044", reason = "aws-lc-rs 1.17 not released yet; fix is transitive via aws-lc-sys 0.39" },
+    { id = "RUSTSEC-2026-0048", reason = "aws-lc-rs 1.17 not released yet; fix is transitive via aws-lc-sys 0.39" },
+]
 
 # --- Licenses: Block incompatible licenses ---
 [licenses]

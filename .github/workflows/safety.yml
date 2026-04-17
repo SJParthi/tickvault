@@ -31,7 +31,7 @@ env:
   RUST_BACKTRACE: 1
   # Pin nightly to a specific date for reproducible builds.
   # Update periodically after verifying the new nightly compiles cleanly.
-  NIGHTLY_VERSION: nightly-2026-03-15
+  NIGHTLY_VERSION: nightly-2026-04-15
 
 jobs:
   # ---- cargo-careful: Extra debug checks ----
