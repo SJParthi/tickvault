@@ -48,20 +48,27 @@ pub async fn get_stats(State(state): State<SharedAppState>) -> Json<StatsRespons
     Json(StatsResponse {
         questdb_reachable,
         tables: tables.unwrap_or(0),
-        underlyings: query_count(&client, &base_url, "SELECT count() FROM fno_underlyings")
-            .await
-            .unwrap_or(0),
+        // I-P1-08 (rewritten 2026-04-17): Lifecycle tables hold active + expired
+        // rows forever. Dashboard counts must filter `status = 'active'` or
+        // expired contracts from prior sessions inflate the number.
+        underlyings: query_count(
+            &client,
+            &base_url,
+            "SELECT count() FROM fno_underlyings WHERE status = 'active'",
+        )
+        .await
+        .unwrap_or(0),
         derivatives: query_count(
             &client,
             &base_url,
-            "SELECT count() FROM derivative_contracts",
+            "SELECT count() FROM derivative_contracts WHERE status = 'active'",
         )
         .await
         .unwrap_or(0),
         subscribed_indices: query_count(
             &client,
             &base_url,
-            "SELECT count() FROM subscribed_indices",
+            "SELECT count() FROM subscribed_indices WHERE status = 'active'",
         )
         .await
         .unwrap_or(0),

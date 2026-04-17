@@ -67,35 +67,52 @@ Every rule here is checked by tests, hooks, or clippy — never by human review 
 - Test: `test_tick_dedup_key_includes_segment`
 
 ## I-P1-08: Single-Row-Per-Instrument with Constant Designated Timestamp (REWRITTEN 2026-04-17)
-**Rationale:** Old design accumulated one snapshot row per day per instrument.
-Running the app on 2 days = 2x rows. Dashboard showed 442 underlyings (2x 221)
-and 207,796 contracts (2x ~104k) looking like duplicates. Root cause: designated
-timestamp was today's IST midnight, which is part of QuestDB DEDUP key, so
-same business key on different days = different rows.
+**Rationale:** Pre-Phase-2 the snapshot tables accumulated one row per day
+per instrument. Running the app on 2 days = 2x rows. Dashboard showed 442
+underlyings (2x 221) and 207,796 contracts (2x ~104k) looking like duplicates.
+Root cause: designated timestamp was today's IST midnight, which is part of
+the QuestDB DEDUP key, so same business key on different days = different rows.
+Phase 1 pinned the designated timestamp to constant epoch 0 so DEDUP fired on
+the business key alone, but the `1970-01-01` display was confusing and there
+was no clean way to answer "what's active right now?".
 
-**New design:**
-- `build_snapshot_timestamp()` returns CONSTANT epoch 0 for all snapshot writes
-- QuestDB DEDUP UPSERT KEYS effectively operate on business key alone
-  (fno_underlyings: underlying_symbol; derivative_contracts: security_id +
-  underlying_symbol; subscribed_indices: security_id)
-- Running the app 1000 times same day → 221 rows (idempotent)
-- Running on a new day → 221 rows (UPSERT, no accumulation)
-- `instrument_persistence.rs` MUST NOT contain `DELETE FROM` for snapshot tables
-- `naive_date_to_timestamp_nanos()` retained for historical-query helpers only
-- Grafana dashboard queries should NOT include `WHERE timestamp = max(timestamp)`
-  (harmless but redundant; prefer simple `SELECT count() FROM <table>`)
+**Phase 2 design (live since 2026-04-17):**
+- `fno_underlyings`, `derivative_contracts`, `subscribed_indices` each gain
+  three lifecycle columns:
+  - `status SYMBOL` — `active` or `expired`
+  - `last_seen_date TIMESTAMP` — last IST date today's CSV contained this row
+  - `expired_date TIMESTAMP` — IST date the row flipped to expired (null for active)
+- `build_snapshot_timestamp()` still returns CONSTANT epoch 0 (QuestDB DEDUP
+  must include the designated timestamp in the key, so we pin it to 0 and let
+  the business key columns do the deduplication).
+- Every write emits `status='active'`, `last_seen_date=today_ist`. After the
+  ILP flush, `mark_missing_as_expired(today)` runs three UPDATE statements
+  that flip any row with `status='active' AND last_seen_date < today` to
+  `status='expired'`, `expired_date=today`.
+- Reappearing contracts are auto-reactivated on the next write — ILP UPSERT
+  replaces every column, so `status` flips back to `active` and `expired_date`
+  is reset to null.
+- `instrument_persistence.rs` MUST NOT contain `DELETE FROM` for lifecycle
+  tables — SEBI 5-year retention applies.
+- Dashboard + operator queries MUST include `WHERE status = 'active'`.
+  Enforced mechanically by
+  `crates/storage/tests/grafana_dashboard_snapshot_filter_guard.rs`.
+- `instrument_build_metadata` is NOT a lifecycle table — it intentionally
+  accumulates one row per daily build (build history).
+- Migration: run `scripts/migrate-instrument-tables-phase2.sql` once before
+  first deployment of the new code. It `DROP TABLE IF EXISTS` the three
+  lifecycle tables (safe — rebuilt from Dhan CSV on every app start).
 
-**Phase 2 (planned):** Add `status`, `first_seen_date`, `last_seen_date`,
-`expired_date` columns for lifecycle tracking. See
-`.claude/plans/instrument-uniqueness-redesign.md`.
-
-**Tests (in `crates/storage/src/instrument_persistence.rs`):**
+**Tests (in `crates/storage/src/instrument_persistence.rs` unless noted):**
 - `test_build_snapshot_timestamp_returns_epoch_zero_constant`
 - `test_build_snapshot_timestamp_is_constant_across_calls`
 - `test_build_snapshot_timestamp_is_zero_not_positive`
-- `test_build_snapshot_epoch_nanos_is_zero_regardless_of_today`
-- `test_no_delete_from_snapshot_tables_in_persist_path`
-- Dashboard guard: `crates/storage/tests/grafana_dashboard_snapshot_filter_guard.rs`
+- `test_ddl_contains_status_column_all_three_tables`
+- `test_ddl_contains_last_seen_and_expired_date_columns`
+- `test_instrument_status_active_and_expired_constants`
+- `crates/storage/tests/instrument_uniqueness_guard.rs` — property guard
+- `crates/storage/tests/grafana_dashboard_snapshot_filter_guard.rs` — scans
+  every dashboard JSON for missing `status =`-style predicates
 
 ## I-P2-02: Trading Day Guard on Download
 - `instrument_loader.rs` must log when downloading on weekends

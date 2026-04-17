@@ -151,9 +151,12 @@ const BUILD_METADATA_CREATE_DDL: &str = "\
 
 /// DDL for `fno_underlyings` — one row per underlying_symbol FOREVER.
 /// I-P1-08 (rewritten 2026-04-17): constant designated_ts + business-key DEDUP.
+/// Lifecycle columns (`status`, `last_seen_date`, `expired_date`) encode the
+/// active/expired state without cross-day row accumulation.
 const FNO_UNDERLYINGS_CREATE_DDL: &str = "\
     CREATE TABLE IF NOT EXISTS fno_underlyings (\
         underlying_symbol SYMBOL,\
+        status SYMBOL,\
         price_feed_segment SYMBOL,\
         derivative_segment SYMBOL,\
         kind SYMBOL,\
@@ -161,15 +164,19 @@ const FNO_UNDERLYINGS_CREATE_DDL: &str = "\
         price_feed_security_id LONG,\
         lot_size LONG,\
         contract_count LONG,\
+        last_seen_date TIMESTAMP,\
+        expired_date TIMESTAMP,\
         timestamp TIMESTAMP\
     ) TIMESTAMP(timestamp) PARTITION BY DAY WAL\
 ";
 
 /// DDL for `derivative_contracts` — one row per (security_id, underlying_symbol) FOREVER.
+/// Lifecycle columns added 2026-04-17 (see FNO_UNDERLYINGS_CREATE_DDL notes).
 const DERIVATIVE_CONTRACTS_CREATE_DDL: &str = "\
     CREATE TABLE IF NOT EXISTS derivative_contracts (\
         underlying_symbol SYMBOL,\
         instrument_kind SYMBOL,\
+        status SYMBOL,\
         exchange_segment SYMBOL,\
         option_type SYMBOL,\
         symbol_name SYMBOL,\
@@ -179,21 +186,34 @@ const DERIVATIVE_CONTRACTS_CREATE_DDL: &str = "\
         lot_size LONG,\
         tick_size DOUBLE,\
         display_name STRING,\
+        last_seen_date TIMESTAMP,\
+        expired_date TIMESTAMP,\
         timestamp TIMESTAMP\
     ) TIMESTAMP(timestamp) PARTITION BY DAY WAL\
 ";
 
 /// DDL for `subscribed_indices` — one row per security_id FOREVER.
+/// Lifecycle columns added 2026-04-17 (see FNO_UNDERLYINGS_CREATE_DDL notes).
 const SUBSCRIBED_INDICES_CREATE_DDL: &str = "\
     CREATE TABLE IF NOT EXISTS subscribed_indices (\
         symbol SYMBOL,\
+        status SYMBOL,\
         exchange SYMBOL,\
         category SYMBOL,\
         subcategory SYMBOL,\
         security_id LONG,\
+        last_seen_date TIMESTAMP,\
+        expired_date TIMESTAMP,\
         timestamp TIMESTAMP\
     ) TIMESTAMP(timestamp) PARTITION BY DAY WAL\
 ";
+
+/// SYMBOL value for an instrument currently present in today's universe.
+pub const INSTRUMENT_STATUS_ACTIVE: &str = "active";
+
+/// SYMBOL value for an instrument absent from today's universe (stopped
+/// trading, expired, delisted). Rows are never deleted — SEBI 5-year retention.
+pub const INSTRUMENT_STATUS_EXPIRED: &str = "expired";
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -342,6 +362,8 @@ async fn persist_inner(universe: &FnoUniverse, questdb_config: &QuestDbConfig) -
     let mut buffer = sender.new_buffer();
 
     let snapshot_nanos = build_snapshot_timestamp()?;
+    let today_ist = today_ist_date();
+    let today_ist_nanos = naive_date_to_timestamp_nanos(today_ist)?;
 
     write_build_metadata(
         &mut sender,
@@ -355,6 +377,7 @@ async fn persist_inner(universe: &FnoUniverse, questdb_config: &QuestDbConfig) -
         &mut buffer,
         &universe.underlyings,
         snapshot_nanos,
+        today_ist_nanos,
     )?;
 
     write_derivative_contracts(
@@ -362,6 +385,7 @@ async fn persist_inner(universe: &FnoUniverse, questdb_config: &QuestDbConfig) -
         &mut buffer,
         &universe.derivative_contracts,
         snapshot_nanos,
+        today_ist_nanos,
     )?;
 
     write_subscribed_indices(
@@ -369,9 +393,20 @@ async fn persist_inner(universe: &FnoUniverse, questdb_config: &QuestDbConfig) -
         &mut buffer,
         &universe.subscribed_indices,
         snapshot_nanos,
+        today_ist_nanos,
     )?;
 
+    // Lifecycle sweep: any row still marked `active` but not written today
+    // becomes `expired`. This is what turns the snapshot tables into a
+    // single-row-per-instrument lifecycle log (I-P1-08 rewrite 2026-04-17).
+    mark_missing_as_expired(questdb_config, today_ist).await;
+
     Ok(())
+}
+
+/// Returns today's IST calendar date. IST = UTC + 5:30.
+fn today_ist_date() -> NaiveDate {
+    (Utc::now() + ist_offset()).date_naive()
 }
 
 // ---------------------------------------------------------------------------
@@ -456,11 +491,79 @@ async fn ensure_table_dedup_keys(questdb_config: &QuestDbConfig) {
 /// - New contracts auto-added as new rows
 /// - Expired contracts marked via `status='expired'` by `mark_missing_as_expired()`
 ///
-/// Historical "what was the universe on date X" queries use `last_seen_date`
-/// and `expired_date` columns, not cross-day timestamp duplication.
+/// The designated `timestamp` column therefore shows `1970-01-01` for every
+/// row — this is by design and NOT the business last-seen date. Human-readable
+/// lifecycle dates live in `last_seen_date` / `expired_date` columns.
 fn build_snapshot_timestamp() -> Result<TimestampNanos> {
     // Constant epoch 0 — DEDUP key becomes effectively the business key alone.
     Ok(TimestampNanos::new(0))
+}
+
+/// Flips rows that were written in a previous session but are absent from
+/// today's universe from `status='active'` to `status='expired'`.
+///
+/// Rules:
+/// - Only touches rows with `status = 'active'` AND `last_seen_date < today`.
+/// - Sets `expired_date = today`.
+/// - Runs three independent UPDATE statements — one per lifecycle table.
+/// - Best-effort: QuestDB errors are logged and swallowed (trading continues).
+///
+/// Idempotent: running twice the same day is a no-op because the first run
+/// flips everything with `last_seen_date < today` to `expired`, and the
+/// predicate is false on the second run.
+async fn mark_missing_as_expired(questdb_config: &QuestDbConfig, today: NaiveDate) {
+    let base_url = format!(
+        "http://{}:{}/exec",
+        questdb_config.host, questdb_config.http_port
+    );
+
+    let today_micros = match today.and_hms_opt(0, 0, 0) {
+        Some(t) => t.and_utc().timestamp_micros(),
+        None => {
+            warn!(%today, "mark_missing_as_expired: invalid IST date");
+            return;
+        }
+    };
+
+    let client = Client::builder()
+        .timeout(Duration::from_secs(QUESTDB_DDL_TIMEOUT_SECS))
+        .build()
+        .unwrap_or_else(|_| Client::new());
+
+    for table in [
+        QUESTDB_TABLE_FNO_UNDERLYINGS,
+        QUESTDB_TABLE_DERIVATIVE_CONTRACTS,
+        QUESTDB_TABLE_SUBSCRIBED_INDICES,
+    ] {
+        let sql = format!(
+            "UPDATE {table} SET status = '{INSTRUMENT_STATUS_EXPIRED}', \
+             expired_date = {today_micros} \
+             WHERE status = '{INSTRUMENT_STATUS_ACTIVE}' AND last_seen_date < {today_micros}"
+        );
+        match client.get(&base_url).query(&[("query", &sql)]).send().await {
+            Ok(response) => {
+                if response.status().is_success() {
+                    debug!(table, %today, "mark_missing_as_expired: UPDATE completed");
+                } else {
+                    let status = response.status();
+                    let body = response.text().await.unwrap_or_default();
+                    warn!(
+                        table,
+                        %status,
+                        body = body.chars().take(200).collect::<String>(),
+                        "mark_missing_as_expired: UPDATE returned non-success"
+                    );
+                }
+            }
+            Err(err) => {
+                warn!(
+                    table,
+                    ?err,
+                    "mark_missing_as_expired: UPDATE request failed"
+                );
+            }
+        }
+    }
 }
 
 /// Converts a `NaiveDate` to `TimestampNanos` at midnight (IST-as-UTC convention).
@@ -568,14 +671,17 @@ fn write_single_build_metadata(
 /// Writes all F&O underlyings as UPSERT rows (one per underlying_symbol forever).
 /// I-P1-08 (rewritten 2026-04-17): constant designated_ts + business-key DEDUP
 /// guarantees no cross-day duplication. Same-day + cross-day reload = idempotent.
+/// Every row is emitted with `status = 'active'` and `last_seen_date = today`.
 fn write_underlyings(
     sender: &mut Sender,
     buffer: &mut Buffer,
     underlyings: &std::collections::HashMap<String, FnoUnderlying>,
     snapshot_nanos: TimestampNanos,
+    today_ist_nanos: TimestampNanos,
 ) -> Result<()> {
+    let today_micros = nanos_to_micros(today_ist_nanos);
     for underlying in underlyings.values() {
-        write_single_underlying(buffer, underlying, snapshot_nanos)?;
+        write_single_underlying(buffer, underlying, snapshot_nanos, today_micros)?;
     }
 
     sender.flush(buffer).context("flush fno_underlyings")?;
@@ -588,12 +694,15 @@ fn write_single_underlying(
     buffer: &mut Buffer,
     underlying: &FnoUnderlying,
     snapshot_nanos: TimestampNanos,
+    today_micros: TimestampMicros,
 ) -> Result<()> {
     buffer
         .table(QUESTDB_TABLE_FNO_UNDERLYINGS)
         .context("table name")?
         .symbol("underlying_symbol", &underlying.underlying_symbol)
         .context("underlying_symbol")?
+        .symbol("status", INSTRUMENT_STATUS_ACTIVE)
+        .context("status")?
         .symbol("price_feed_segment", underlying.price_feed_segment.as_str())
         .context("price_feed_segment")?
         .symbol("derivative_segment", underlying.derivative_segment.as_str())
@@ -617,6 +726,8 @@ fn write_single_underlying(
             i64::try_from(underlying.contract_count).context("contract_count overflows i64")?,
         )
         .context("contract_count")?
+        .column_ts("last_seen_date", today_micros)
+        .context("last_seen_date")?
         .at(snapshot_nanos)
         .context("designated timestamp")?;
 
@@ -633,9 +744,11 @@ fn write_derivative_contracts(
     buffer: &mut Buffer,
     contracts: &std::collections::HashMap<SecurityId, DerivativeContract>,
     snapshot_nanos: TimestampNanos,
+    today_ist_nanos: TimestampNanos,
 ) -> Result<()> {
+    let today_micros = nanos_to_micros(today_ist_nanos);
     for (index, contract) in contracts.values().enumerate() {
-        write_single_contract(buffer, contract, snapshot_nanos)?;
+        write_single_contract(buffer, contract, snapshot_nanos, today_micros)?;
 
         // Flush in batches to prevent unbounded memory growth.
         if index.saturating_add(1) % ILP_FLUSH_BATCH_SIZE == 0 {
@@ -660,6 +773,7 @@ fn write_single_contract(
     buffer: &mut Buffer,
     contract: &DerivativeContract,
     snapshot_nanos: TimestampNanos,
+    today_micros: TimestampMicros,
 ) -> Result<()> {
     let option_type_str = contract
         .option_type
@@ -678,6 +792,8 @@ fn write_single_contract(
         .context("underlying_symbol")?
         .symbol("instrument_kind", contract.instrument_kind.as_str())
         .context("instrument_kind")?
+        .symbol("status", INSTRUMENT_STATUS_ACTIVE)
+        .context("status")?
         .symbol("exchange_segment", contract.exchange_segment.as_str())
         .context("exchange_segment")?
         .symbol("option_type", option_type_str)
@@ -696,6 +812,8 @@ fn write_single_contract(
         .context("tick_size")?
         .column_str("display_name", &contract.display_name)
         .context("display_name")?
+        .column_ts("last_seen_date", today_micros)
+        .context("last_seen_date")?
         .at(snapshot_nanos)
         .context("designated timestamp")?;
 
@@ -712,9 +830,11 @@ fn write_subscribed_indices(
     buffer: &mut Buffer,
     indices: &[SubscribedIndex],
     snapshot_nanos: TimestampNanos,
+    today_ist_nanos: TimestampNanos,
 ) -> Result<()> {
+    let today_micros = nanos_to_micros(today_ist_nanos);
     for index in indices {
-        write_single_subscribed_index(buffer, index, snapshot_nanos)?;
+        write_single_subscribed_index(buffer, index, snapshot_nanos, today_micros)?;
     }
 
     if !buffer.is_empty() {
@@ -729,12 +849,15 @@ fn write_single_subscribed_index(
     buffer: &mut Buffer,
     index: &SubscribedIndex,
     snapshot_nanos: TimestampNanos,
+    today_micros: TimestampMicros,
 ) -> Result<()> {
     buffer
         .table(QUESTDB_TABLE_SUBSCRIBED_INDICES)
         .context("table name")?
         .symbol("symbol", &index.symbol)
         .context("symbol")?
+        .symbol("status", INSTRUMENT_STATUS_ACTIVE)
+        .context("status")?
         .symbol("exchange", index.exchange.as_str())
         .context("exchange")?
         .symbol("category", index.category.as_str())
@@ -743,10 +866,18 @@ fn write_single_subscribed_index(
         .context("subcategory")?
         .column_i64("security_id", i64::from(index.security_id))
         .context("security_id")?
+        .column_ts("last_seen_date", today_micros)
+        .context("last_seen_date")?
         .at(snapshot_nanos)
         .context("designated timestamp")?;
 
     Ok(())
+}
+
+/// Converts TimestampNanos → TimestampMicros for ILP `column_ts`.
+fn nanos_to_micros(ts: TimestampNanos) -> TimestampMicros {
+    // TimestampNanos::as_i64() returns nanoseconds since epoch.
+    TimestampMicros::new(ts.as_i64() / 1_000)
 }
 
 // ---------------------------------------------------------------------------
@@ -964,7 +1095,13 @@ mod tests {
         ];
 
         for underlying in &underlyings {
-            write_single_underlying(&mut buffer, underlying, snapshot_nanos).unwrap();
+            write_single_underlying(
+                &mut buffer,
+                underlying,
+                snapshot_nanos,
+                TimestampMicros::new(0),
+            )
+            .unwrap();
         }
 
         assert_eq!(buffer.row_count(), 3);
@@ -980,7 +1117,13 @@ mod tests {
         let mut buffer = Buffer::new(ProtocolVersion::V1);
         for security_id in 1000..1010_u32 {
             let contract = make_test_contract(security_id);
-            write_single_contract(&mut buffer, &contract, snapshot_nanos).unwrap();
+            write_single_contract(
+                &mut buffer,
+                &contract,
+                snapshot_nanos,
+                TimestampMicros::new(0),
+            )
+            .unwrap();
         }
 
         assert_eq!(buffer.row_count(), 10);
@@ -1001,7 +1144,13 @@ mod tests {
         contract.symbol_name = "NIFTY-Mar2026-FUT".to_string();
         contract.display_name = "NIFTY 27 Mar FUT".to_string();
 
-        write_single_contract(&mut buffer, &contract, snapshot_nanos).unwrap();
+        write_single_contract(
+            &mut buffer,
+            &contract,
+            snapshot_nanos,
+            TimestampMicros::new(0),
+        )
+        .unwrap();
         assert_eq!(buffer.row_count(), 1);
     }
 
@@ -1023,7 +1172,13 @@ mod tests {
 
         let mut buffer = Buffer::new(ProtocolVersion::V1);
         let underlying = make_test_underlying("NIFTY", 26000);
-        write_single_underlying(&mut buffer, &underlying, snapshot_nanos).unwrap();
+        write_single_underlying(
+            &mut buffer,
+            &underlying,
+            snapshot_nanos,
+            TimestampMicros::new(0),
+        )
+        .unwrap();
 
         let content = String::from_utf8_lossy(buffer.as_bytes());
         assert!(content.contains(QUESTDB_TABLE_FNO_UNDERLYINGS));
@@ -1041,7 +1196,13 @@ mod tests {
 
         let mut buffer = Buffer::new(ProtocolVersion::V1);
         let contract = make_test_contract(12345);
-        write_single_contract(&mut buffer, &contract, snapshot_nanos).unwrap();
+        write_single_contract(
+            &mut buffer,
+            &contract,
+            snapshot_nanos,
+            TimestampMicros::new(0),
+        )
+        .unwrap();
 
         let content = String::from_utf8_lossy(buffer.as_bytes());
         assert!(content.contains(QUESTDB_TABLE_DERIVATIVE_CONTRACTS));
@@ -1129,7 +1290,13 @@ mod tests {
         ];
 
         for index in &indices {
-            write_single_subscribed_index(&mut buffer, index, snapshot_nanos).unwrap();
+            write_single_subscribed_index(
+                &mut buffer,
+                index,
+                snapshot_nanos,
+                TimestampMicros::new(0),
+            )
+            .unwrap();
         }
 
         assert_eq!(buffer.row_count(), 4);
@@ -1144,7 +1311,8 @@ mod tests {
 
         let mut buffer = Buffer::new(ProtocolVersion::V1);
         let index = make_test_fno_index("NIFTY", 13);
-        write_single_subscribed_index(&mut buffer, &index, snapshot_nanos).unwrap();
+        write_single_subscribed_index(&mut buffer, &index, snapshot_nanos, TimestampMicros::new(0))
+            .unwrap();
 
         let content = String::from_utf8_lossy(buffer.as_bytes());
         assert!(content.contains(QUESTDB_TABLE_SUBSCRIBED_INDICES));
@@ -1163,7 +1331,8 @@ mod tests {
 
         let mut buffer = Buffer::new(ProtocolVersion::V1);
         let index = make_test_display_index("INDIA VIX", 21, IndexSubcategory::Volatility);
-        write_single_subscribed_index(&mut buffer, &index, snapshot_nanos).unwrap();
+        write_single_subscribed_index(&mut buffer, &index, snapshot_nanos, TimestampMicros::new(0))
+            .unwrap();
 
         let content = String::from_utf8_lossy(buffer.as_bytes());
         assert!(content.contains("DisplayIndex"));
@@ -1538,7 +1707,13 @@ mod tests {
         };
 
         let mut buffer = Buffer::new(ProtocolVersion::V1);
-        write_single_underlying(&mut buffer, &underlying, snapshot_nanos).unwrap();
+        write_single_underlying(
+            &mut buffer,
+            &underlying,
+            snapshot_nanos,
+            TimestampMicros::new(0),
+        )
+        .unwrap();
 
         let content = String::from_utf8_lossy(buffer.as_bytes());
         assert!(content.contains("RELIANCE"));
@@ -1566,7 +1741,13 @@ mod tests {
         };
 
         let mut buffer = Buffer::new(ProtocolVersion::V1);
-        write_single_underlying(&mut buffer, &underlying, snapshot_nanos).unwrap();
+        write_single_underlying(
+            &mut buffer,
+            &underlying,
+            snapshot_nanos,
+            TimestampMicros::new(0),
+        )
+        .unwrap();
 
         let content = String::from_utf8_lossy(buffer.as_bytes());
         assert!(content.contains("SENSEX"));
@@ -1594,7 +1775,13 @@ mod tests {
         };
 
         let mut buffer = Buffer::new(ProtocolVersion::V1);
-        write_single_underlying(&mut buffer, &underlying, snapshot_nanos).unwrap();
+        write_single_underlying(
+            &mut buffer,
+            &underlying,
+            snapshot_nanos,
+            TimestampMicros::new(0),
+        )
+        .unwrap();
         assert_eq!(buffer.row_count(), 1);
     }
 
@@ -1616,7 +1803,13 @@ mod tests {
         };
 
         let mut buffer = Buffer::new(ProtocolVersion::V1);
-        write_single_underlying(&mut buffer, &underlying, snapshot_nanos).unwrap();
+        write_single_underlying(
+            &mut buffer,
+            &underlying,
+            snapshot_nanos,
+            TimestampMicros::new(0),
+        )
+        .unwrap();
 
         let content = String::from_utf8_lossy(buffer.as_bytes());
         assert!(content.contains("CRUDEOIL"));
@@ -1666,7 +1859,8 @@ mod tests {
         ];
 
         for u in &underlyings {
-            write_single_underlying(&mut buffer, u, snapshot_nanos).unwrap();
+            write_single_underlying(&mut buffer, u, snapshot_nanos, TimestampMicros::new(0))
+                .unwrap();
         }
 
         assert_eq!(buffer.row_count(), 3);
@@ -1702,7 +1896,13 @@ mod tests {
         };
 
         let mut buffer = Buffer::new(ProtocolVersion::V1);
-        write_single_contract(&mut buffer, &contract, snapshot_nanos).unwrap();
+        write_single_contract(
+            &mut buffer,
+            &contract,
+            snapshot_nanos,
+            TimestampMicros::new(0),
+        )
+        .unwrap();
 
         let content = String::from_utf8_lossy(buffer.as_bytes());
         assert!(content.contains("BANKNIFTY"));
@@ -1732,7 +1932,13 @@ mod tests {
         };
 
         let mut buffer = Buffer::new(ProtocolVersion::V1);
-        write_single_contract(&mut buffer, &contract, snapshot_nanos).unwrap();
+        write_single_contract(
+            &mut buffer,
+            &contract,
+            snapshot_nanos,
+            TimestampMicros::new(0),
+        )
+        .unwrap();
 
         let content = String::from_utf8_lossy(buffer.as_bytes());
         assert!(content.contains("RELIANCE"));
@@ -1763,7 +1969,13 @@ mod tests {
         };
 
         let mut buffer = Buffer::new(ProtocolVersion::V1);
-        write_single_contract(&mut buffer, &contract, snapshot_nanos).unwrap();
+        write_single_contract(
+            &mut buffer,
+            &contract,
+            snapshot_nanos,
+            TimestampMicros::new(0),
+        )
+        .unwrap();
 
         let content = String::from_utf8_lossy(buffer.as_bytes());
         assert!(content.contains("TCS"));
@@ -1793,7 +2005,13 @@ mod tests {
         };
 
         let mut buffer = Buffer::new(ProtocolVersion::V1);
-        write_single_contract(&mut buffer, &contract, snapshot_nanos).unwrap();
+        write_single_contract(
+            &mut buffer,
+            &contract,
+            snapshot_nanos,
+            TimestampMicros::new(0),
+        )
+        .unwrap();
 
         let content = String::from_utf8_lossy(buffer.as_bytes());
         assert!(content.contains("BSE_FNO"));
@@ -1810,7 +2028,13 @@ mod tests {
 
         let contract = make_test_contract(12345);
         let mut buffer = Buffer::new(ProtocolVersion::V1);
-        write_single_contract(&mut buffer, &contract, snapshot_nanos).unwrap();
+        write_single_contract(
+            &mut buffer,
+            &contract,
+            snapshot_nanos,
+            TimestampMicros::new(0),
+        )
+        .unwrap();
 
         let content = String::from_utf8_lossy(buffer.as_bytes());
         // The ILP string column format uses double quotes: expiry_date="2026-03-27"
@@ -1836,7 +2060,13 @@ mod tests {
         for security_id in 10000..10100_u32 {
             let mut contract = make_test_contract(security_id);
             contract.strike_price = f64::from(security_id) * 10.0;
-            write_single_contract(&mut buffer, &contract, snapshot_nanos).unwrap();
+            write_single_contract(
+                &mut buffer,
+                &contract,
+                snapshot_nanos,
+                TimestampMicros::new(0),
+            )
+            .unwrap();
         }
 
         assert_eq!(buffer.row_count(), 100);
@@ -1854,7 +2084,8 @@ mod tests {
 
         let index = make_test_display_index("NIFTY 100", 101, IndexSubcategory::BroadMarket);
         let mut buffer = Buffer::new(ProtocolVersion::V1);
-        write_single_subscribed_index(&mut buffer, &index, snapshot_nanos).unwrap();
+        write_single_subscribed_index(&mut buffer, &index, snapshot_nanos, TimestampMicros::new(0))
+            .unwrap();
 
         let content = String::from_utf8_lossy(buffer.as_bytes());
         assert!(content.contains("BroadMarket"));
@@ -1870,7 +2101,8 @@ mod tests {
 
         let index = make_test_display_index("NIFTYMCAP50", 102, IndexSubcategory::MidCap);
         let mut buffer = Buffer::new(ProtocolVersion::V1);
-        write_single_subscribed_index(&mut buffer, &index, snapshot_nanos).unwrap();
+        write_single_subscribed_index(&mut buffer, &index, snapshot_nanos, TimestampMicros::new(0))
+            .unwrap();
 
         let content = String::from_utf8_lossy(buffer.as_bytes());
         assert!(content.contains("MidCap"));
@@ -1885,7 +2117,8 @@ mod tests {
 
         let index = make_test_display_index("NIFTYSMLCAP50", 103, IndexSubcategory::SmallCap);
         let mut buffer = Buffer::new(ProtocolVersion::V1);
-        write_single_subscribed_index(&mut buffer, &index, snapshot_nanos).unwrap();
+        write_single_subscribed_index(&mut buffer, &index, snapshot_nanos, TimestampMicros::new(0))
+            .unwrap();
 
         let content = String::from_utf8_lossy(buffer.as_bytes());
         assert!(content.contains("SmallCap"));
@@ -1900,7 +2133,8 @@ mod tests {
 
         let index = make_test_display_index("NIFTY CONSUMPTION", 104, IndexSubcategory::Thematic);
         let mut buffer = Buffer::new(ProtocolVersion::V1);
-        write_single_subscribed_index(&mut buffer, &index, snapshot_nanos).unwrap();
+        write_single_subscribed_index(&mut buffer, &index, snapshot_nanos, TimestampMicros::new(0))
+            .unwrap();
 
         let content = String::from_utf8_lossy(buffer.as_bytes());
         assert!(content.contains("Thematic"));
@@ -1922,7 +2156,8 @@ mod tests {
         };
 
         let mut buffer = Buffer::new(ProtocolVersion::V1);
-        write_single_subscribed_index(&mut buffer, &index, snapshot_nanos).unwrap();
+        write_single_subscribed_index(&mut buffer, &index, snapshot_nanos, TimestampMicros::new(0))
+            .unwrap();
 
         let content = String::from_utf8_lossy(buffer.as_bytes());
         assert!(content.contains("BSE"));
@@ -1943,7 +2178,13 @@ mod tests {
         // 8 F&O underlying indices.
         for i in 0..8_u32 {
             let idx = make_test_fno_index(&format!("FNO_IDX_{i}"), i + 1);
-            write_single_subscribed_index(&mut buffer, &idx, snapshot_nanos).unwrap();
+            write_single_subscribed_index(
+                &mut buffer,
+                &idx,
+                snapshot_nanos,
+                TimestampMicros::new(0),
+            )
+            .unwrap();
         }
 
         // 23 Display indices with mixed subcategories.
@@ -1964,7 +2205,13 @@ mod tests {
                 category: IndexCategory::DisplayIndex,
                 subcategory: *sub,
             };
-            write_single_subscribed_index(&mut buffer, &idx, snapshot_nanos).unwrap();
+            write_single_subscribed_index(
+                &mut buffer,
+                &idx,
+                snapshot_nanos,
+                TimestampMicros::new(0),
+            )
+            .unwrap();
         }
 
         assert_eq!(buffer.row_count(), 31);
@@ -2163,7 +2410,13 @@ mod tests {
 
         let mut buffer = Buffer::new(ProtocolVersion::V1);
         let underlying = make_test_underlying("NIFTY", 26000);
-        write_single_underlying(&mut buffer, &underlying, snapshot_nanos).unwrap();
+        write_single_underlying(
+            &mut buffer,
+            &underlying,
+            snapshot_nanos,
+            TimestampMicros::new(0),
+        )
+        .unwrap();
         assert_eq!(buffer.row_count(), 1);
 
         buffer.clear();
@@ -2190,18 +2443,26 @@ mod tests {
             &mut buffer,
             &make_test_underlying("NIFTY", 26000),
             snapshot_nanos,
+            TimestampMicros::new(0),
         )
         .unwrap();
         write_single_underlying(
             &mut buffer,
             &make_test_underlying("BANKNIFTY", 26009),
             snapshot_nanos,
+            TimestampMicros::new(0),
         )
         .unwrap();
         assert_eq!(buffer.row_count(), 3);
 
         // Write 1 contract row.
-        write_single_contract(&mut buffer, &make_test_contract(12345), snapshot_nanos).unwrap();
+        write_single_contract(
+            &mut buffer,
+            &make_test_contract(12345),
+            snapshot_nanos,
+            TimestampMicros::new(0),
+        )
+        .unwrap();
         assert_eq!(buffer.row_count(), 4);
 
         // Write 1 subscribed index row.
@@ -2209,6 +2470,7 @@ mod tests {
             &mut buffer,
             &make_test_fno_index("NIFTY", 13),
             snapshot_nanos,
+            TimestampMicros::new(0),
         )
         .unwrap();
         assert_eq!(buffer.row_count(), 5);
@@ -2500,7 +2762,14 @@ mod tests {
         underlyings.insert("NIFTY".to_string(), make_test_underlying("NIFTY", 26000));
 
         // write_underlyings iterates, writes rows, then flushes.
-        write_underlyings(&mut sender, &mut buffer, &underlyings, snapshot_nanos).unwrap();
+        write_underlyings(
+            &mut sender,
+            &mut buffer,
+            &underlyings,
+            snapshot_nanos,
+            TimestampNanos::new(0),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -2518,7 +2787,14 @@ mod tests {
         contracts.insert(10001_u32, make_test_contract(10001));
 
         // write_derivative_contracts iterates, writes rows, batch-flushes, final flush.
-        write_derivative_contracts(&mut sender, &mut buffer, &contracts, snapshot_nanos).unwrap();
+        write_derivative_contracts(
+            &mut sender,
+            &mut buffer,
+            &contracts,
+            snapshot_nanos,
+            TimestampNanos::new(0),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -2535,7 +2811,14 @@ mod tests {
         let indices = vec![make_test_fno_index("NIFTY", 13)];
 
         // write_subscribed_indices iterates, writes rows, then flushes.
-        write_subscribed_indices(&mut sender, &mut buffer, &indices, snapshot_nanos).unwrap();
+        write_subscribed_indices(
+            &mut sender,
+            &mut buffer,
+            &indices,
+            snapshot_nanos,
+            TimestampNanos::new(0),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -2554,8 +2837,13 @@ mod tests {
             std::collections::HashMap::new();
 
         // With empty contracts, no rows are written and no flush is needed.
-        let result =
-            write_derivative_contracts(&mut sender, &mut buffer, &contracts, snapshot_nanos);
+        let result = write_derivative_contracts(
+            &mut sender,
+            &mut buffer,
+            &contracts,
+            snapshot_nanos,
+            TimestampNanos::new(0),
+        );
         assert!(result.is_ok(), "empty contracts should not trigger flush");
     }
 
@@ -2573,7 +2861,13 @@ mod tests {
 
         let indices: Vec<SubscribedIndex> = Vec::new();
 
-        let result = write_subscribed_indices(&mut sender, &mut buffer, &indices, snapshot_nanos);
+        let result = write_subscribed_indices(
+            &mut sender,
+            &mut buffer,
+            &indices,
+            snapshot_nanos,
+            TimestampNanos::new(0),
+        );
         assert!(result.is_ok(), "empty indices should not trigger flush");
     }
 
@@ -2602,8 +2896,13 @@ mod tests {
 
         // This exercises the batch flush at ILP_FLUSH_BATCH_SIZE boundary
         // and the final flush for remaining rows — both succeed with the TCP server.
-        let result =
-            write_derivative_contracts(&mut sender, &mut buffer, &contracts, snapshot_nanos);
+        let result = write_derivative_contracts(
+            &mut sender,
+            &mut buffer,
+            &contracts,
+            snapshot_nanos,
+            TimestampNanos::new(0),
+        );
         assert!(
             result.is_ok(),
             "batch flush must succeed with live TCP server"
@@ -2635,21 +2934,42 @@ mod tests {
             "BANKNIFTY".to_string(),
             make_test_underlying("BANKNIFTY", 26009),
         );
-        write_underlyings(&mut sender, &mut buffer, &underlyings, snapshot_nanos).unwrap();
+        write_underlyings(
+            &mut sender,
+            &mut buffer,
+            &underlyings,
+            snapshot_nanos,
+            TimestampNanos::new(0),
+        )
+        .unwrap();
 
         // Write derivative contracts
         let mut contracts = std::collections::HashMap::new();
         contracts.insert(50001, make_test_contract(50001));
         contracts.insert(50002, make_test_contract(50002));
         contracts.insert(50003, make_test_contract(50003));
-        write_derivative_contracts(&mut sender, &mut buffer, &contracts, snapshot_nanos).unwrap();
+        write_derivative_contracts(
+            &mut sender,
+            &mut buffer,
+            &contracts,
+            snapshot_nanos,
+            TimestampNanos::new(0),
+        )
+        .unwrap();
 
         // Write subscribed indices
         let indices = vec![
             make_test_fno_index("NIFTY 50", 13),
             make_test_display_index("SENSEX", 1, IndexSubcategory::BroadMarket),
         ];
-        write_subscribed_indices(&mut sender, &mut buffer, &indices, snapshot_nanos).unwrap();
+        write_subscribed_indices(
+            &mut sender,
+            &mut buffer,
+            &indices,
+            snapshot_nanos,
+            TimestampNanos::new(0),
+        )
+        .unwrap();
     }
 
     #[tokio::test]
@@ -2974,7 +3294,13 @@ mod tests {
 
         // No rows written for empty input.
         for underlying in underlyings.values() {
-            write_single_underlying(&mut buffer, underlying, snapshot_nanos).unwrap();
+            write_single_underlying(
+                &mut buffer,
+                underlying,
+                snapshot_nanos,
+                TimestampMicros::new(0),
+            )
+            .unwrap();
         }
         assert_eq!(
             buffer.row_count(),
@@ -3239,7 +3565,13 @@ mod tests {
             naive_date_to_timestamp_nanos(NaiveDate::from_ymd_opt(2026, 3, 15).unwrap()).unwrap();
 
         let mut buffer = Buffer::new(ProtocolVersion::V1);
-        write_single_underlying(&mut buffer, &underlying, snapshot_nanos).unwrap();
+        write_single_underlying(
+            &mut buffer,
+            &underlying,
+            snapshot_nanos,
+            TimestampMicros::new(0),
+        )
+        .unwrap();
         assert_eq!(buffer.row_count(), 1);
         let content = String::from_utf8_lossy(buffer.as_bytes());
         assert!(content.contains("FINNIFTY"));
@@ -3255,7 +3587,13 @@ mod tests {
         contract.strike_price = 22000.0;
 
         let mut buffer = Buffer::new(ProtocolVersion::V1);
-        write_single_contract(&mut buffer, &contract, snapshot_nanos).unwrap();
+        write_single_contract(
+            &mut buffer,
+            &contract,
+            snapshot_nanos,
+            TimestampMicros::new(0),
+        )
+        .unwrap();
         assert_eq!(buffer.row_count(), 1);
         let content = String::from_utf8_lossy(buffer.as_bytes());
         assert!(content.contains("PE"));
@@ -3272,7 +3610,13 @@ mod tests {
         contract.strike_price = 0.0;
 
         let mut buffer = Buffer::new(ProtocolVersion::V1);
-        write_single_contract(&mut buffer, &contract, snapshot_nanos).unwrap();
+        write_single_contract(
+            &mut buffer,
+            &contract,
+            snapshot_nanos,
+            TimestampMicros::new(0),
+        )
+        .unwrap();
         assert_eq!(buffer.row_count(), 1);
         // Empty option_type should not cause issues
         let content = String::from_utf8_lossy(buffer.as_bytes());
@@ -3286,7 +3630,8 @@ mod tests {
 
         let index = make_test_display_index("NIFTY IT", 19, IndexSubcategory::Sectoral);
         let mut buffer = Buffer::new(ProtocolVersion::V1);
-        write_single_subscribed_index(&mut buffer, &index, snapshot_nanos).unwrap();
+        write_single_subscribed_index(&mut buffer, &index, snapshot_nanos, TimestampMicros::new(0))
+            .unwrap();
         assert_eq!(buffer.row_count(), 1);
     }
 
@@ -3299,7 +3644,13 @@ mod tests {
         let symbols = ["NIFTY", "BANKNIFTY", "FINNIFTY", "RELIANCE", "TCS"];
         for (i, sym) in symbols.iter().enumerate() {
             let underlying = make_test_underlying(sym, 26000 + i as u32);
-            write_single_underlying(&mut buffer, &underlying, snapshot_nanos).unwrap();
+            write_single_underlying(
+                &mut buffer,
+                &underlying,
+                snapshot_nanos,
+                TimestampMicros::new(0),
+            )
+            .unwrap();
         }
         assert_eq!(buffer.row_count(), 5);
     }
@@ -3312,7 +3663,13 @@ mod tests {
         let mut buffer = Buffer::new(ProtocolVersion::V1);
         for id in 10000..10020_u32 {
             let contract = make_test_contract(id);
-            write_single_contract(&mut buffer, &contract, snapshot_nanos).unwrap();
+            write_single_contract(
+                &mut buffer,
+                &contract,
+                snapshot_nanos,
+                TimestampMicros::new(0),
+            )
+            .unwrap();
         }
         assert_eq!(buffer.row_count(), 20);
     }
@@ -3327,7 +3684,13 @@ mod tests {
         underlying.price_feed_segment = ExchangeSegment::NseEquity;
 
         let mut buffer = Buffer::new(ProtocolVersion::V1);
-        write_single_underlying(&mut buffer, &underlying, snapshot_nanos).unwrap();
+        write_single_underlying(
+            &mut buffer,
+            &underlying,
+            snapshot_nanos,
+            TimestampMicros::new(0),
+        )
+        .unwrap();
         let content = String::from_utf8_lossy(buffer.as_bytes());
         assert!(content.contains("Stock"));
         assert!(content.contains("NSE_EQ"));
@@ -3342,7 +3705,13 @@ mod tests {
         contract.exchange_segment = ExchangeSegment::BseFno;
 
         let mut buffer = Buffer::new(ProtocolVersion::V1);
-        write_single_contract(&mut buffer, &contract, snapshot_nanos).unwrap();
+        write_single_contract(
+            &mut buffer,
+            &contract,
+            snapshot_nanos,
+            TimestampMicros::new(0),
+        )
+        .unwrap();
         let content = String::from_utf8_lossy(buffer.as_bytes());
         assert!(content.contains("BSE_FNO"));
     }
@@ -3472,7 +3841,13 @@ mod tests {
         contract.instrument_kind = DhanInstrumentKind::FutureIndex;
 
         let mut buffer = Buffer::new(ProtocolVersion::V1);
-        write_single_contract(&mut buffer, &contract, snapshot_nanos).unwrap();
+        write_single_contract(
+            &mut buffer,
+            &contract,
+            snapshot_nanos,
+            TimestampMicros::new(0),
+        )
+        .unwrap();
         let content = String::from_utf8_lossy(buffer.as_bytes());
         // Verify the buffer was written (non-empty)
         assert!(!content.is_empty());
@@ -3486,7 +3861,13 @@ mod tests {
 
         let contract = make_test_contract(11111);
         let mut buffer = Buffer::new(ProtocolVersion::V1);
-        write_single_contract(&mut buffer, &contract, snapshot_nanos).unwrap();
+        write_single_contract(
+            &mut buffer,
+            &contract,
+            snapshot_nanos,
+            TimestampMicros::new(0),
+        )
+        .unwrap();
         let content = String::from_utf8_lossy(buffer.as_bytes());
         // expiry_date should be in YYYY-MM-DD format
         assert!(
@@ -3504,7 +3885,13 @@ mod tests {
         contract.strike_price = 25650.5;
 
         let mut buffer = Buffer::new(ProtocolVersion::V1);
-        write_single_contract(&mut buffer, &contract, snapshot_nanos).unwrap();
+        write_single_contract(
+            &mut buffer,
+            &contract,
+            snapshot_nanos,
+            TimestampMicros::new(0),
+        )
+        .unwrap();
         // If we get here without error, the f64 strike price was written successfully
         assert!(buffer.row_count() > 0);
     }
@@ -3601,7 +3988,13 @@ mod tests {
         underlying.contract_count = 0;
 
         let mut buffer = Buffer::new(ProtocolVersion::V1);
-        write_single_underlying(&mut buffer, &underlying, snapshot_nanos).unwrap();
+        write_single_underlying(
+            &mut buffer,
+            &underlying,
+            snapshot_nanos,
+            TimestampMicros::new(0),
+        )
+        .unwrap();
         assert_eq!(
             buffer.row_count(),
             1,
@@ -3620,7 +4013,13 @@ mod tests {
         contract.tick_size = 0.0;
 
         let mut buffer = Buffer::new(ProtocolVersion::V1);
-        write_single_contract(&mut buffer, &contract, snapshot_nanos).unwrap();
+        write_single_contract(
+            &mut buffer,
+            &contract,
+            snapshot_nanos,
+            TimestampMicros::new(0),
+        )
+        .unwrap();
         assert_eq!(buffer.row_count(), 1);
     }
 
@@ -3631,7 +4030,13 @@ mod tests {
 
         let contract = make_test_contract(u32::MAX);
         let mut buffer = Buffer::new(ProtocolVersion::V1);
-        write_single_contract(&mut buffer, &contract, snapshot_nanos).unwrap();
+        write_single_contract(
+            &mut buffer,
+            &contract,
+            snapshot_nanos,
+            TimestampMicros::new(0),
+        )
+        .unwrap();
         assert_eq!(buffer.row_count(), 1);
     }
 
@@ -3829,7 +4234,13 @@ mod tests {
         let snapshot_nanos =
             naive_date_to_timestamp_nanos(NaiveDate::from_ymd_opt(2026, 3, 1).unwrap()).unwrap();
 
-        let result = write_underlyings(&mut sender, &mut buffer, &underlyings, snapshot_nanos);
+        let result = write_underlyings(
+            &mut sender,
+            &mut buffer,
+            &underlyings,
+            snapshot_nanos,
+            TimestampNanos::new(0),
+        );
         assert!(
             result.is_ok(),
             "write_underlyings must succeed with TCP drain: {:?}",
@@ -3852,8 +4263,13 @@ mod tests {
         let snapshot_nanos =
             naive_date_to_timestamp_nanos(NaiveDate::from_ymd_opt(2026, 3, 1).unwrap()).unwrap();
 
-        let result =
-            write_derivative_contracts(&mut sender, &mut buffer, &contracts, snapshot_nanos);
+        let result = write_derivative_contracts(
+            &mut sender,
+            &mut buffer,
+            &contracts,
+            snapshot_nanos,
+            TimestampNanos::new(0),
+        );
         assert!(
             result.is_ok(),
             "write_derivative_contracts must succeed with TCP drain: {:?}",
@@ -3877,7 +4293,13 @@ mod tests {
         let snapshot_nanos =
             naive_date_to_timestamp_nanos(NaiveDate::from_ymd_opt(2026, 3, 1).unwrap()).unwrap();
 
-        let result = write_subscribed_indices(&mut sender, &mut buffer, &indices, snapshot_nanos);
+        let result = write_subscribed_indices(
+            &mut sender,
+            &mut buffer,
+            &indices,
+            snapshot_nanos,
+            TimestampNanos::new(0),
+        );
         assert!(
             result.is_ok(),
             "write_subscribed_indices must succeed with TCP drain: {:?}",
@@ -3896,7 +4318,13 @@ mod tests {
         let snapshot_nanos =
             naive_date_to_timestamp_nanos(NaiveDate::from_ymd_opt(2026, 3, 1).unwrap()).unwrap();
 
-        let result = write_subscribed_indices(&mut sender, &mut buffer, &indices, snapshot_nanos);
+        let result = write_subscribed_indices(
+            &mut sender,
+            &mut buffer,
+            &indices,
+            snapshot_nanos,
+            TimestampNanos::new(0),
+        );
         assert!(
             result.is_ok(),
             "empty indices list should not attempt to flush"
@@ -3915,8 +4343,13 @@ mod tests {
         let snapshot_nanos =
             naive_date_to_timestamp_nanos(NaiveDate::from_ymd_opt(2026, 3, 1).unwrap()).unwrap();
 
-        let result =
-            write_derivative_contracts(&mut sender, &mut buffer, &contracts, snapshot_nanos);
+        let result = write_derivative_contracts(
+            &mut sender,
+            &mut buffer,
+            &contracts,
+            snapshot_nanos,
+            TimestampNanos::new(0),
+        );
         assert!(
             result.is_ok(),
             "empty contracts should not attempt to flush"
@@ -3948,7 +4381,13 @@ mod tests {
         let snapshot_nanos =
             naive_date_to_timestamp_nanos(NaiveDate::from_ymd_opt(2026, 3, 1).unwrap()).unwrap();
 
-        let result = write_underlyings(&mut sender, &mut buffer, &underlyings, snapshot_nanos);
+        let result = write_underlyings(
+            &mut sender,
+            &mut buffer,
+            &underlyings,
+            snapshot_nanos,
+            TimestampNanos::new(0),
+        );
         assert!(
             result.is_ok(),
             "single underlying write must succeed: {:?}",
