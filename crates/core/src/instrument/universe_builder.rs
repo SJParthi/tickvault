@@ -307,20 +307,27 @@ fn build_derivatives_and_chains(
     // Track contract count per underlying
     let mut contract_counts: HashMap<String, usize> = HashMap::with_capacity(256);
 
-    // Dedup tracker: detect duplicate security_ids across all rows
-    let mut seen_security_ids: HashSet<SecurityId> = HashSet::with_capacity(170_000);
+    // BUG FIX (2026-04-17, spotted live by Parthiban): dedup tracker must
+    // include the CSV segment character, because Dhan reuses the same
+    // numeric security_id across segments (e.g. id=27 is FINNIFTY in 'I'
+    // AND some NSE_EQ equity in 'E'). An old `HashSet<SecurityId>` keyed
+    // on `security_id` alone would silently drop the second-seen one at
+    // parse time, so the whole downstream pipeline (subscription planner,
+    // registry, WebSocket subscribe messages) never saw the dropped
+    // instrument. Correct key is `(security_id, segment_char)`.
+    let mut seen_security_ids: HashSet<(SecurityId, char)> = HashSet::with_capacity(170_000);
     let mut duplicate_count: usize = 0;
 
     // --- Step 1: Instrument info for indices and equities ---
     for row in rows {
         match row.segment {
             'I' => {
-                if !seen_security_ids.insert(row.security_id) {
+                if !seen_security_ids.insert((row.security_id, 'I')) {
                     debug!(
                         security_id = row.security_id,
                         symbol = %row.underlying_symbol,
                         segment = "I",
-                        "duplicate security_id in CSV — keeping first occurrence"
+                        "duplicate security_id in CSV (same segment) — keeping first occurrence"
                     );
                     duplicate_count = duplicate_count.saturating_add(1);
                     continue;
@@ -337,12 +344,12 @@ fn build_derivatives_and_chains(
             'E' if row.exchange == Exchange::NationalStockExchange
                 && row.series == CSV_SERIES_EQUITY =>
             {
-                if !seen_security_ids.insert(row.security_id) {
+                if !seen_security_ids.insert((row.security_id, 'E')) {
                     debug!(
                         security_id = row.security_id,
                         symbol = %row.underlying_symbol,
                         segment = "E",
-                        "duplicate security_id in CSV — keeping first occurrence"
+                        "duplicate security_id in CSV (same segment) — keeping first occurrence"
                     );
                     duplicate_count = duplicate_count.saturating_add(1);
                     continue;
@@ -439,13 +446,16 @@ fn build_derivatives_and_chains(
             row.strike_price
         };
 
-        // Dedup: skip if security_id already seen (keep first occurrence)
-        if !seen_security_ids.insert(row.security_id) {
+        // Dedup: skip if (security_id, 'D') already seen (keep first
+        // occurrence). Derivatives use segment 'D' so they dedup among
+        // themselves; an 'I' or 'E' row with the same numeric id is a
+        // distinct instrument and retained (segment-aware key).
+        if !seen_security_ids.insert((row.security_id, 'D')) {
             debug!(
                 security_id = row.security_id,
                 symbol = %row.underlying_symbol,
                 segment = "D",
-                "duplicate security_id in CSV — keeping first occurrence"
+                "duplicate security_id in CSV (same segment) — keeping first occurrence"
             );
             duplicate_count = duplicate_count.saturating_add(1);
             continue;
