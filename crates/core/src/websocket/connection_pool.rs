@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
-use tracing::info;
+use tracing::{error, info};
 
 use tickvault_common::config::{DhanConfig, WebSocketConfig};
 use tickvault_common::constants::{
@@ -320,23 +320,87 @@ impl WebSocketConnectionPool {
     ) -> Option<usize> {
         // O(1) EXEMPT: cold path — runs once per Phase 2 trigger or
         // operator override, not per tick.
+        //
+        // Audit finding #9 (2026-04-17): every `None` return path below
+        // ERROR-logs + increments a counter so a missed Phase 2 dispatch
+        // is visible to the operator. Previously the function returned
+        // None silently, so the caller couldn't distinguish "no channels
+        // installed" from "dispatch succeeded but all full".
         let healths = self.health();
         let Ok(senders_guard) = self.subscribe_senders.lock() else {
+            metrics::counter!("tv_dispatch_subscribe_errors_total", "reason" => "lock_poisoned")
+                .increment(1);
+            error!(
+                "dispatch_subscribe: senders lock poisoned — pool rebalance impossible. \
+                 Restart required."
+            );
             return None;
         };
         if senders_guard.is_empty() {
+            metrics::counter!(
+                "tv_dispatch_subscribe_errors_total",
+                "reason" => "channels_not_installed"
+            )
+            .increment(1);
+            error!(
+                "dispatch_subscribe: no subscribe channels installed — \
+                 install_subscribe_channels() was not called at boot. \
+                 Phase 2 stock F&O subscription will not happen."
+            );
             return None;
         }
         // Pick the connection with the smallest current subscribed_count.
-        let target_idx = healths
+        let target_idx = match healths
             .iter()
             .enumerate()
             .min_by_key(|(_, h)| h.subscribed_count)
-            .map(|(i, _)| i)?;
-        let sender = senders_guard.get(target_idx)?.as_ref()?;
+            .map(|(i, _)| i)
+        {
+            Some(i) => i,
+            None => {
+                metrics::counter!(
+                    "tv_dispatch_subscribe_errors_total",
+                    "reason" => "empty_healths"
+                )
+                .increment(1);
+                error!(
+                    "dispatch_subscribe: no connection health snapshots — \
+                     pool has zero connections spawned."
+                );
+                return None;
+            }
+        };
+        let sender = match senders_guard.get(target_idx).and_then(|s| s.as_ref()) {
+            Some(s) => s,
+            None => {
+                metrics::counter!(
+                    "tv_dispatch_subscribe_errors_total",
+                    "reason" => "sender_missing"
+                )
+                .increment(1);
+                error!(
+                    target_idx,
+                    "dispatch_subscribe: sender slot missing — pool/sender state out of sync."
+                );
+                return None;
+            }
+        };
         match sender.try_send(cmd) {
             Ok(()) => Some(target_idx),
-            Err(_e) => None,
+            Err(err) => {
+                metrics::counter!(
+                    "tv_dispatch_subscribe_errors_total",
+                    "reason" => "channel_full"
+                )
+                .increment(1);
+                error!(
+                    target_idx,
+                    ?err,
+                    "dispatch_subscribe: channel send failed — connection \
+                     at capacity or closed. Phase 2 subscription dropped."
+                );
+                None
+            }
         }
     }
 
