@@ -123,10 +123,11 @@ pub fn build_subscription_plan(
     // BUG FIX (2026-04-17, spotted by Parthiban): dedup was keyed on
     // `security_id` alone, but Dhan CAN reuse the same numeric security_id
     // across different segments (e.g. id=13 is FINNIFTY in IDX_I AND is
-    // some other instrument in NSE_EQ / NSE_FNO). The old HashSet<u32>
-    // silently skipped the second-seen instance — which is why FINNIFTY's
-    // IDX_I subscription never went out and the depth ATM selector had no
-    // spot price for it. Correct dedup key is `(security_id, segment)`.
+    // some other instrument in NSE_EQ / NSE_FNO). The old single-key set
+    // on the numeric id silently skipped the second-seen instance — which
+    // is why FINNIFTY's IDX_I subscription never went out and the depth
+    // ATM selector had no spot price for it. Correct dedup key is
+    // `(security_id, segment)`.
     let mut seen_ids: HashSet<(u32, ExchangeSegment)> =
         HashSet::with_capacity(MAX_TOTAL_SUBSCRIPTIONS);
     let mut stocks_skipped_no_chain: usize = 0;
@@ -435,6 +436,14 @@ pub fn build_subscription_plan(
     // Build the registry and summary
     // -----------------------------------------------------------------------
     let registry = InstrumentRegistry::from_instruments(instruments);
+
+    // I-P1-11 gap G (2026-04-17): expose registry composite-index health
+    // as Prometheus gauges so the operator sees cross-segment collisions
+    // in Grafana + receives Telegram alerts on ERROR logs emitted during
+    // construction.
+    metrics::gauge!("tv_instrument_registry_cross_segment_collisions")
+        .set(registry.cross_segment_collisions() as f64);
+    metrics::gauge!("tv_instrument_registry_total_entries").set(registry.len() as f64);
 
     let exceeds_capacity = registry.len() > MAX_TOTAL_SUBSCRIPTIONS;
     if exceeds_capacity {
@@ -771,6 +780,14 @@ pub fn build_subscription_plan_from_archived(
     // Build the registry and summary
     // -----------------------------------------------------------------------
     let registry = InstrumentRegistry::from_instruments(instruments);
+
+    // I-P1-11 gap G (2026-04-17): expose registry composite-index health
+    // as Prometheus gauges so the operator sees cross-segment collisions
+    // in Grafana + receives Telegram alerts on ERROR logs emitted during
+    // construction.
+    metrics::gauge!("tv_instrument_registry_cross_segment_collisions")
+        .set(registry.cross_segment_collisions() as f64);
+    metrics::gauge!("tv_instrument_registry_total_entries").set(registry.len() as f64);
 
     let exceeds_capacity = registry.len() > MAX_TOTAL_SUBSCRIPTIONS;
     if exceeds_capacity {

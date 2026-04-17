@@ -138,6 +138,15 @@ pub struct InstrumentRegistry {
     /// Built at construction time from MajorIndexValue + StockEquity instruments.
     /// Used by GreeksAggregator to map F&O tick → underlying spot price.
     underlying_symbol_to_security_id: HashMap<String, SecurityId>,
+
+    /// I-P1-11 gap G: count of cross-segment security_id collisions
+    /// detected at construction time. Exposed via
+    /// [`cross_segment_collisions`](Self::cross_segment_collisions)
+    /// so callers in metrics-enabled crates can emit a Prometheus
+    /// counter. `0` is the healthy baseline — any non-zero value on
+    /// startup means Dhan's CSV reused an id across segments and the
+    /// operator should verify both segments are streaming ticks.
+    cross_segment_collisions: u64,
 }
 
 impl InstrumentRegistry {
@@ -149,6 +158,7 @@ impl InstrumentRegistry {
             category_counts: HashMap::new(),
             total_count: 0,
             underlying_symbol_to_security_id: HashMap::new(),
+            cross_segment_collisions: 0,
         }
     }
 
@@ -171,6 +181,11 @@ impl InstrumentRegistry {
         let mut map = HashMap::with_capacity(instruments.len());
         let mut by_composite: HashMap<(SecurityId, ExchangeSegment), SubscribedInstrument> =
             HashMap::with_capacity(instruments.len());
+        // I-P1-11 gap G (2026-04-17): count cross-segment collisions
+        // detected during build so callers in metrics-enabled crates
+        // can emit a Prometheus counter without this common crate
+        // taking a metrics dependency.
+        let mut cross_segment_collisions: u64 = 0;
 
         for instrument in instruments {
             // Composite index: stores every unique (id, segment) pair,
@@ -181,19 +196,28 @@ impl InstrumentRegistry {
             );
 
             // Legacy index: keyed on security_id alone; collisions fire
-            // a WARN log and only one entry wins (second-seen overwrites).
+            // an ERROR log (routed to Telegram by Loki) and only one
+            // entry wins (second-seen overwrites). The count is
+            // exposed via the `cross_segment_collisions()` getter so
+            // callers in crates that depend on `metrics` can emit a
+            // Prometheus counter without this common crate taking a
+            // new dependency.
             if let Some(prev) = map.insert(instrument.security_id, instrument.clone()) {
                 if prev.exchange_segment != instrument.exchange_segment {
-                    tracing::warn!(
+                    cross_segment_collisions = cross_segment_collisions.saturating_add(1);
+                    tracing::error!(
                         security_id = instrument.security_id,
                         prev_segment = ?prev.exchange_segment,
                         new_segment = ?instrument.exchange_segment,
                         prev_symbol = %prev.underlying_symbol,
                         new_symbol = %instrument.underlying_symbol,
-                        "InstrumentRegistry: cross-segment security_id collision on \
-                         legacy get(id) index — use get_with_segment(id, segment) for \
-                         disambiguated lookup. BOTH entries ARE stored in the composite \
-                         index and can be retrieved correctly."
+                        "I-P1-11: InstrumentRegistry cross-segment security_id \
+                         collision — BOTH entries stored in composite index; \
+                         legacy get(id) callers will receive whichever entry \
+                         won the HashMap insert race. Operator action: run \
+                         `SELECT segment, security_id FROM ticks GROUP BY segment, \
+                         security_id HAVING count() > 0` to confirm both segments \
+                         are receiving live ticks."
                     );
                 }
             }
@@ -235,7 +259,20 @@ impl InstrumentRegistry {
             category_counts,
             total_count,
             underlying_symbol_to_security_id,
+            cross_segment_collisions,
         }
+    }
+
+    /// I-P1-11 gap G: returns the number of cross-segment `security_id`
+    /// collisions detected during construction. Callers in metrics-enabled
+    /// crates should emit this as a Prometheus gauge (not a counter — the
+    /// value is a SNAPSHOT at registry-build time, not a running total).
+    ///
+    /// `0` is the healthy baseline.
+    #[inline]
+    // TEST-EXEMPT: covered by subscription_planner::tests::test_regression_finnifty_id27_both_segments_are_kept (integration test)
+    pub fn cross_segment_collisions(&self) -> u64 {
+        self.cross_segment_collisions
     }
 
     /// O(1) lookup: returns instrument metadata for a security_id, or `None` if not subscribed.
@@ -1256,6 +1293,63 @@ mod tests {
             registry.category_count(SubscriptionCategory::StockEquity),
             1
         );
+    }
+
+    // I-P1-11 gap G (2026-04-17): cross-segment collision counter
+    // is exposed for Prometheus metric emission by callers.
+
+    #[test]
+    fn test_cross_segment_collisions_zero_when_no_collisions() {
+        let registry = InstrumentRegistry::from_instruments(vec![
+            sample_instrument(13, SubscriptionCategory::MajorIndexValue),
+            sample_instrument(25, SubscriptionCategory::MajorIndexValue),
+        ]);
+        assert_eq!(
+            registry.cross_segment_collisions(),
+            0,
+            "no collisions in a clean universe"
+        );
+    }
+
+    #[test]
+    fn test_cross_segment_collisions_counts_both_colliding_pairs() {
+        // Two distinct id-level collisions: id=13 and id=27.
+        let mut nifty = sample_instrument(13, SubscriptionCategory::MajorIndexValue);
+        nifty.exchange_segment = ExchangeSegment::IdxI;
+        let mut stock13 = sample_instrument(13, SubscriptionCategory::StockEquity);
+        stock13.exchange_segment = ExchangeSegment::NseEquity;
+        let mut finnifty = sample_instrument(27, SubscriptionCategory::MajorIndexValue);
+        finnifty.exchange_segment = ExchangeSegment::IdxI;
+        let mut stock27 = sample_instrument(27, SubscriptionCategory::StockEquity);
+        stock27.exchange_segment = ExchangeSegment::NseEquity;
+
+        let registry =
+            InstrumentRegistry::from_instruments(vec![nifty, stock13, finnifty, stock27]);
+        assert_eq!(
+            registry.cross_segment_collisions(),
+            2,
+            "two colliding id-pairs must report count=2"
+        );
+    }
+
+    #[test]
+    fn test_cross_segment_collisions_ignores_same_segment_duplicates() {
+        // Two entries with same id AND same segment — this is a different
+        // bug class (non-unique id within a segment). The cross-segment
+        // counter must NOT increment for this.
+        let inst1 = sample_instrument(13, SubscriptionCategory::MajorIndexValue);
+        let inst2 = sample_instrument(13, SubscriptionCategory::MajorIndexValue);
+        let registry = InstrumentRegistry::from_instruments(vec![inst1, inst2]);
+        assert_eq!(
+            registry.cross_segment_collisions(),
+            0,
+            "same-segment duplicate is NOT a cross-segment collision"
+        );
+    }
+
+    #[test]
+    fn test_empty_registry_cross_segment_collisions_is_zero() {
+        assert_eq!(InstrumentRegistry::empty().cross_segment_collisions(), 0);
     }
 
     #[test]
