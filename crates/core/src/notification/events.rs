@@ -97,6 +97,14 @@ pub enum NotificationEvent {
     /// giving up.
     DepthIndexLtpTimeout { waited_secs: u64 },
 
+    /// O3 (2026-04-17): The depth rebalancer detected a stale spot price
+    /// for this underlying and skipped the rebalance decision. A stale
+    /// price likely means the main-feed WebSocket isn't delivering index
+    /// LTPs for this symbol — acting on it would swap the 200-level
+    /// connection to the wrong ATM strike. `age_secs` is the observed age
+    /// at the moment of detection.
+    DepthSpotPriceStale { underlying: String, age_secs: u64 },
+
     /// WebSocket disconnected (unexpected, will reconnect).
     WebSocketDisconnected {
         connection_index: usize,
@@ -405,6 +413,16 @@ impl NotificationEvent {
                     "<b>Depth ATM timeout</b>\nWaited {waited_secs}s for index LTPs \
                      (NIFTY/BANKNIFTY). Depth connections will use fallback strike \
                      (median) instead of real ATM."
+                )
+            }
+            Self::DepthSpotPriceStale {
+                underlying,
+                age_secs,
+            } => {
+                format!(
+                    "<b>Depth spot price STALE</b>\nUnderlying: {underlying}\n\
+                     Age: {age_secs}s (threshold 180s). Depth rebalance skipped — \
+                     main-feed LTP feed may be stalled for this symbol."
                 )
             }
             Self::WebSocketDisconnected {
@@ -775,6 +793,7 @@ impl NotificationEvent {
             Self::WebSocketPoolRecovered { .. } => Severity::Medium,
             Self::WebSocketPoolHalt { .. } => Severity::High,
             Self::DepthIndexLtpTimeout { .. } => Severity::High,
+            Self::DepthSpotPriceStale { .. } => Severity::High,
             Self::DepthTwentyConnected { .. } => Severity::Low,
             Self::DepthTwoHundredConnected { .. } => Severity::Low,
             Self::OrderUpdateConnected => Severity::Low,

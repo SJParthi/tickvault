@@ -1879,7 +1879,11 @@ async fn main() -> Result<()> {
             // Read current spot prices for ATM calculation.
             let spot_snapshot: std::collections::HashMap<String, f64> = {
                 let prices = spot_prices_for_depth.read().await;
-                prices.clone() // O(1) EXEMPT: 4 entries max
+                // O3: strip freshness timestamps for the boot-time ATM selector
+                // which only needs (underlying -> price). Staleness is enforced
+                // by the rebalancer at runtime.
+                prices.iter().map(|(k, e)| (k.clone(), e.price)).collect()
+                // O(1) EXEMPT: 4 entries max (one per index)
             };
 
             // Build FnoUniverse reference for select_depth_instruments.
@@ -2532,6 +2536,14 @@ async fn main() -> Result<()> {
                 Option<tickvault_core::instrument::depth_rebalancer::RebalanceEvent>,
             >(None);
 
+            // O3 (2026-04-17): Stale-spot-price event channel. The rebalancer
+            // publishes here when an underlying's LTP is older than
+            // `STALE_SPOT_THRESHOLD_SECS`; a listener below fires a Telegram
+            // alert and skips the tainted rebalance cycle.
+            let (stale_spot_tx, mut stale_spot_rx) = tokio::sync::watch::channel::<
+                Option<tickvault_core::instrument::depth_rebalancer::StaleSpotPriceEvent>,
+            >(None);
+
             // Shutdown flag for the rebalancer
             let rebalancer_shutdown =
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2542,9 +2554,27 @@ async fn main() -> Result<()> {
                     universe_arc,
                     depth_underlyings,
                     rebalance_tx,
+                    stale_spot_tx,
                     std::sync::Arc::clone(&rebalancer_shutdown),
                 ),
             );
+
+            // O3 listener: Telegram on stale spot price.
+            {
+                let stale_notifier = notifier.clone();
+                tokio::spawn(async move {
+                    while stale_spot_rx.changed().await.is_ok() {
+                        let event = match stale_spot_rx.borrow().clone() {
+                            Some(e) => e,
+                            None => continue,
+                        };
+                        stale_notifier.notify(NotificationEvent::DepthSpotPriceStale {
+                            underlying: event.underlying,
+                            age_secs: event.age_secs,
+                        });
+                    }
+                });
+            }
 
             // L1: Listen for rebalance events → Telegram alert + send swap commands (zero disconnect).
             {
