@@ -104,6 +104,11 @@ impl PoolWatchdog {
     ///
     /// This is a cold path: called at most once every 5 seconds from the
     /// pool watchdog task, not per tick.
+    ///
+    /// Side effect: updates observability gauges on every tick —
+    /// `tv_websocket_pool_all_dead` (0/1) and
+    /// `tv_websocket_failed_connections_count` — so Prometheus has fresh
+    /// values regardless of verdict transitions.
     pub fn tick(&mut self, healths: &[ConnectionHealth], now: Instant) -> WatchdogVerdict {
         let any_live = healths.iter().any(|h| {
             matches!(
@@ -111,6 +116,20 @@ impl PoolWatchdog {
                 ConnectionState::Connected | ConnectionState::Connecting
             )
         });
+
+        // Observability: emit per-tick gauges so Grafana can trend them.
+        let failed_count = healths
+            .iter()
+            .filter(|h| {
+                matches!(
+                    h.state,
+                    ConnectionState::Reconnecting | ConnectionState::Disconnected
+                )
+            })
+            .count();
+        // O(1) EXEMPT: 5 connections max; runs every 5s not per tick.
+        metrics::gauge!("tv_websocket_pool_all_dead").set(if any_live { 0.0 } else { 1.0 });
+        metrics::gauge!("tv_websocket_failed_connections_count").set(failed_count as f64);
 
         match (self.state, any_live) {
             // Still healthy

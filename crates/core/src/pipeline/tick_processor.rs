@@ -162,6 +162,26 @@ fn utc_nanos_to_ist_secs_of_day(received_at_nanos: i64) -> u32 {
         .rem_euclid(i64::from(SECONDS_PER_DAY)) as u32
 }
 
+/// Audit finding #11 (2026-04-17): maximum backward NTP clock step we
+/// accept. A backward jump smaller than this is tolerated; a larger
+/// jump is considered a clock-skew anomaly and fires a metric so the
+/// operator can investigate (e.g. the VM was suspended and resumed).
+///
+/// Threshold = 60 s chosen so a typical chrony/ntpd slew (millisecond-
+/// scale) never trips it, but a step correction or VM time jump does.
+pub const CLOCK_SKEW_BACKWARD_THRESHOLD_NANOS: i64 = 60_000_000_000;
+
+/// Largest `received_at_nanos` seen so far, used to detect NTP backward
+/// jumps in `is_wall_clock_within_persist_window`. Because `received_at`
+/// is set by the WebSocket read loop using `Utc::now()`, a monotonic
+/// stream should never go backward by more than the arrival jitter.
+///
+/// Single-process atomic: zero contention on the hot path, loaded with
+/// `Relaxed` (no happens-before needed for a best-effort monitoring
+/// counter).
+static MAX_WALL_CLOCK_SEEN_NANOS: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(0);
+
 /// Returns `true` if the wall-clock time (received_at_nanos) falls within
 /// the tick persist window [09:00, 15:30) IST.
 ///
@@ -171,9 +191,43 @@ fn utc_nanos_to_ist_secs_of_day(received_at_nanos: i64) -> u32 {
 /// stale ticks pass `is_within_persist_window` (which only checks the
 /// exchange_timestamp) and pollute the `ticks` table.
 ///
-/// O(1) — reuses `utc_nanos_to_ist_secs_of_day` + 1 range check.
+/// I-P1-AUDIT-11 (2026-04-17): also monitors NTP clock skew. If the
+/// wall-clock goes BACKWARD by more than `CLOCK_SKEW_BACKWARD_THRESHOLD_NANOS`
+/// versus the largest value seen so far, it logs ERROR + increments
+/// `tv_clock_skew_detections_total` so the operator sees it in Grafana
+/// + Telegram. The tick is still evaluated against the window (we do
+/// NOT reject it on the basis of skew alone — that would drop
+/// legitimate ticks during a one-off correction).
+///
+/// O(1) — reuses `utc_nanos_to_ist_secs_of_day` + 1 range check + 1
+/// relaxed atomic load + 1 CAS on rising edge.
 #[inline(always)]
 fn is_wall_clock_within_persist_window(received_at_nanos: i64) -> bool {
+    // I-P1-AUDIT-11: clock-skew monitor.
+    use std::sync::atomic::Ordering;
+    let prev_max = MAX_WALL_CLOCK_SEEN_NANOS.load(Ordering::Relaxed);
+    if received_at_nanos > prev_max {
+        // Rising edge: update max (relaxed CAS — lost races only mean
+        // we miss an update, which is fine for a monitoring counter).
+        let _ = MAX_WALL_CLOCK_SEEN_NANOS.compare_exchange(
+            prev_max,
+            received_at_nanos,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+    } else if prev_max.saturating_sub(received_at_nanos) > CLOCK_SKEW_BACKWARD_THRESHOLD_NANOS {
+        // Backward jump beyond threshold — log + count but don't reject.
+        metrics::counter!("tv_clock_skew_detections_total").increment(1);
+        tracing::error!(
+            prev_max_nanos = prev_max,
+            received_at_nanos,
+            backward_jump_nanos = prev_max.saturating_sub(received_at_nanos),
+            threshold_nanos = CLOCK_SKEW_BACKWARD_THRESHOLD_NANOS,
+            "NTP clock skew detected — wall-clock jumped backward by >60s. \
+             Tick kept but flagged; investigate VM suspend/resume or NTP step."
+        );
+    }
+
     let wall_clock_ist_secs_of_day = utc_nanos_to_ist_secs_of_day(received_at_nanos);
     (TICK_PERSIST_START_SECS_OF_DAY_IST..TICK_PERSIST_END_SECS_OF_DAY_IST)
         .contains(&wall_clock_ist_secs_of_day)
@@ -236,10 +290,18 @@ fn persist_stock_movers_snapshot(
     }
 
     // O(1) EXEMPT: cold path — registry lookup per entry (max 60 lookups per snapshot).
-    let lookup_symbol = |security_id: u32| -> &str {
+    // I-P1-11: segment-aware lookup — Dhan reuses security_id across segments
+    // (e.g. NIFTY IDX_I id=13 vs some NSE_EQ id=13). Using the legacy get(id)
+    // would return the wrong-segment entry and write a wrong symbol to the
+    // movers table. Segment byte comes from the MoverEntry header byte 3.
+    let lookup_symbol = |security_id: u32, segment_code: u8| -> &str {
+        let segment = match tickvault_common::types::ExchangeSegment::from_byte(segment_code) {
+            Some(s) => s,
+            None => return "",
+        };
         registry
             .as_ref()
-            .and_then(|r| r.get(security_id))
+            .and_then(|r| r.get_with_segment(security_id, segment))
             .map(|inst| inst.display_label.as_str())
             .unwrap_or("")
     };
@@ -251,7 +313,7 @@ fn persist_stock_movers_snapshot(
          entries: &[super::top_movers::MoverEntry],
          category: &str| {
             for (i, entry) in entries.iter().enumerate() {
-                let symbol = lookup_symbol(entry.security_id);
+                let symbol = lookup_symbol(entry.security_id, entry.exchange_segment_code);
                 let prev_close = f32_clean(entry.prev_close);
                 let ltp = f32_clean(entry.last_traded_price);
                 let change_pct = f32_clean(entry.change_pct);
@@ -300,9 +362,16 @@ fn persist_option_movers_snapshot(
          category: &str| {
             for (i, entry) in entries.iter().enumerate() {
                 // Enrich from registry — O(1) lookup on cold path, flattened with and_then
-                let enriched = registry
-                    .as_ref()
-                    .and_then(|reg| reg.get(entry.security_id))
+                // I-P1-11: segment-aware lookup (see lookup_symbol for rationale).
+                let seg_for_lookup = tickvault_common::types::ExchangeSegment::from_byte(
+                    entry.exchange_segment_code,
+                );
+                let enriched = seg_for_lookup
+                    .and_then(|seg| {
+                        registry
+                            .as_ref()
+                            .and_then(|reg| reg.get_with_segment(entry.security_id, seg))
+                    })
                     .map(|inst| {
                         let ot = inst
                             .option_type
@@ -366,11 +435,16 @@ fn persist_option_movers_snapshot(
                          entries: &[super::option_movers::OptionMoverEntry],
                          base_cat: &str| {
         let (opts, futs): (Vec<_>, Vec<_>) = entries.iter().cloned().partition(|e| {
-            registry
-                .as_ref()
-                .and_then(|r| r.get(e.security_id))
-                .and_then(|inst| inst.option_type)
-                .is_some()
+            // I-P1-11: segment-aware lookup so CE/PE classification works
+            // even when id collides with an index/equity in a different segment.
+            let seg = tickvault_common::types::ExchangeSegment::from_byte(e.exchange_segment_code);
+            seg.and_then(|s| {
+                registry
+                    .as_ref()
+                    .and_then(|r| r.get_with_segment(e.security_id, s))
+            })
+            .and_then(|inst| inst.option_type)
+            .is_some()
         });
         // O(1) EXEMPT: format! on cold path (7 calls per snapshot)
         let opt_cat = format!("OPTION_{base_cat}");
@@ -629,6 +703,19 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
     m_channel_capacity.set(frame_receiver.max_capacity() as f64);
     info!(today_ist_day_number, "tick processor started");
 
+    // §10.3 metric: per-(security_id, side) last-seen sequence for 20-level
+    // depth frames. Increments `tv_depth_20lvl_sequence_gaps_total` when a
+    // frame arrives with `message_sequence != last + 1` — indicates Dhan
+    // dropped a packet or our WebSocket missed a frame.
+    //
+    // Capacity: 4 depth underlyings × ~50 strikes × 2 sides = 400; plus
+    // headroom for 20-level equity subscriptions if those ever enable.
+    // O(1) EXEMPT: allocated once at task start, NOT per tick. O(1) HashMap
+    // lookup + insert on the hot path per frame.
+    let mut deep_depth_seq_tracker: std::collections::HashMap<(u32, u8), u32> =
+        std::collections::HashMap::with_capacity(512);
+    let m_seq_gaps = metrics::counter!("tv_depth_20lvl_sequence_gaps_total");
+
     while let Some(raw_frame) = frame_receiver.recv().await {
         let tick_start = Instant::now();
         frames_processed = frames_processed.saturating_add(1);
@@ -832,8 +919,22 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
 
                 // O(1) broadcast to browser WebSocket clients (if any are connected).
                 // Lagging receivers auto-skip — chart only needs latest price.
-                if let Some(ref sender) = tick_broadcast {
-                    let _ = sender.send(tick);
+                //
+                // Audit finding #1/#19 (2026-04-17): `sender.send()` returns
+                // `Err(SendError)` ONLY when ALL receivers have closed (not
+                // on lag — lag is surfaced to each receiver individually).
+                // A closed-all-receivers state means downstream trading
+                // signals are dead. Count + error-log so operator sees it.
+                if let Some(ref sender) = tick_broadcast
+                    && sender.send(tick).is_err()
+                {
+                    metrics::counter!("tv_tick_broadcast_send_errors_total").increment(1);
+                    // O(1) EXEMPT: error path — tracing static dispatch is
+                    // the only allocation and it's off the zero-loss fast path.
+                    error!(
+                        "tick broadcast send failed — ALL subscribers closed; \
+                         trading pipeline + browser feed are dead"
+                    );
                 }
 
                 // O(1) candle aggregation: update 1s OHLCV candle for this security.
@@ -1008,6 +1109,18 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     m_outside_hours.increment(1);
                     continue;
                 }
+                // Audit finding #6 (2026-04-17): wall-clock guard for depth.
+                // Ticks already have this at line ~802; depth was missing
+                // it. A Full packet (code 8) can carry an exchange_timestamp
+                // from inside market hours but actually arrive post-close
+                // (server-side replay / buffer). Without this guard the
+                // stale packet pollutes `market_depth` table. Same guard
+                // shape used by ticks.
+                if !is_wall_clock_within_persist_window(tick.received_at_nanos) {
+                    outside_hours_filtered = outside_hours_filtered.saturating_add(1);
+                    m_outside_hours.increment(1);
+                    continue;
+                }
 
                 // Within market hours — persist depth to QuestDB.
                 m_depth_snapshots.increment(1);
@@ -1033,8 +1146,14 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                 }
 
                 // O(1) broadcast to browser WebSocket clients (if tick has valid LTP).
-                if ltp_valid && let Some(ref sender) = tick_broadcast {
-                    let _ = sender.send(tick);
+                // See audit finding #1/#19 rationale at the other broadcast
+                // send site earlier in this file — same guard.
+                if ltp_valid
+                    && let Some(ref sender) = tick_broadcast
+                    && sender.send(tick).is_err()
+                {
+                    metrics::counter!("tv_tick_broadcast_send_errors_total").increment(1);
+                    error!("tick broadcast send failed (valid-LTP path) — ALL subscribers closed");
                 }
 
                 // (day_close baseline already set ABOVE time guards at line ~711)
@@ -1158,14 +1277,47 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                 security_id,
                 exchange_segment_code,
                 side,
+                message_sequence,
                 ..
             } => {
-                // Deep depth frames are from a separate WS connection.
-                // Log receipt; full order book assembly is done downstream.
+                // §10.3 sequence-gap detection (20-level only — 200-level
+                // reuses this field as row_count, so gap math is meaningless
+                // there; we trust the dispatcher already discriminated).
+                // The side is folded into the key via its discriminant byte
+                // so a gap in Bid doesn't poison Ask tracking for the same
+                // security.
+                //
+                // O(1): HashMap get+insert, bounded capacity. Runs only on
+                // DeepDepth frames (cold relative to ticks).
+                let side_byte: u8 = match side {
+                    crate::parser::DepthSide::Bid => 41,
+                    crate::parser::DepthSide::Ask => 51,
+                };
+                let key = (security_id, side_byte);
+                if let Some(prev) = deep_depth_seq_tracker.get(&key).copied() {
+                    // Saturating math: if Dhan resets sequence (reconnect),
+                    // `message_sequence < prev + 1` is detected and counted
+                    // as one gap event.
+                    if message_sequence != prev.saturating_add(1) {
+                        m_seq_gaps.increment(1);
+                        warn!(
+                            security_id,
+                            exchange_segment_code,
+                            ?side,
+                            prev_seq = prev,
+                            current_seq = message_sequence,
+                            "20-level depth sequence gap detected"
+                        );
+                    }
+                }
+                // Insert regardless (new baseline for next comparison).
+                deep_depth_seq_tracker.insert(key, message_sequence);
+
                 trace!(
                     security_id,
                     exchange_segment_code,
                     ?side,
+                    message_sequence,
                     "deep depth frame received"
                 );
             }
@@ -1204,12 +1356,25 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
             if let Some(ref mut writer) = tick_writer
                 && let Err(err) = writer.flush_if_needed()
             {
-                warn!(?err, "periodic tick flush failed");
+                // Audit finding #2 (2026-04-17): must be ERROR, not WARN —
+                // Telegram alert path is keyed on log level. A persistent
+                // flush failure means ticks are stuck in the ring buffer
+                // or spill path with no operator visibility at WARN level.
+                error!(
+                    ?err,
+                    "periodic tick flush failed — QuestDB write path broken"
+                );
+                metrics::counter!("tv_tick_flush_errors_total").increment(1);
             }
             if let Some(ref mut dw) = depth_writer
                 && let Err(err) = dw.flush_if_needed()
             {
-                warn!(?err, "periodic depth flush failed");
+                // Audit finding #2: see above.
+                error!(
+                    ?err,
+                    "periodic depth flush failed — QuestDB write path broken"
+                );
+                metrics::counter!("tv_depth_flush_errors_total").increment(1);
             }
 
             // Sweep stale candles and persist completed 1s candles to QuestDB
@@ -1272,7 +1437,13 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
             if let Some(ref mut cw) = live_candle_writer
                 && let Err(err) = cw.flush_if_needed()
             {
-                warn!(?err, "periodic live candle flush failed");
+                // Audit finding #4 (2026-04-17): ERROR not WARN so Telegram
+                // fires when candle persistence degrades.
+                error!(
+                    ?err,
+                    "periodic live candle flush failed — QuestDB write path broken"
+                );
+                metrics::counter!("tv_live_candle_flush_errors_total").increment(1);
             }
 
             // Compute top movers snapshot every ~5 seconds (cold path, O(N log N))

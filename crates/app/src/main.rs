@@ -829,11 +829,21 @@ async fn main() -> Result<()> {
         // &self so sharing via Arc is cheap + lock-free.
         let (ws_handles, ws_pool_arc) = if let Some(pool) = ws_pool_ready {
             let pool_arc = std::sync::Arc::new(pool);
+            // O1-B (2026-04-17): install per-connection runtime subscribe
+            // channels BEFORE spawn so the read loop sees the receivers on
+            // its first iteration. The Phase 2 scheduler reads the matching
+            // senders via `pool_arc.dispatch_subscribe(...)`.
+            pool_arc.install_subscribe_channels().await;
             let handles = spawn_websocket_connections(std::sync::Arc::clone(&pool_arc)).await;
             spawn_pool_watchdog_task(
                 std::sync::Arc::clone(&pool_arc),
                 std::sync::Arc::clone(&shutdown_notify),
+                std::sync::Arc::clone(&fast_notifier),
             );
+            // FAST BOOT parity with slow boot (main.rs ~1760):
+            // emit per-connection + aggregate Telegram alerts so an operator
+            // can see the pool came up after a crash-recovery restart.
+            emit_websocket_connected_alerts(&fast_notifier, handles.len()).await;
             (handles, Some(pool_arc))
         } else {
             (Vec::new(), None)
@@ -848,7 +858,7 @@ async fn main() -> Result<()> {
         // Background: Docker infra + QuestDB DDL + SSM validation
         // Notification already initialized above (needed for IP verification).
         // All run concurrently. None of them block tick processing.
-        let notifier = fast_notifier;
+        let notifier = fast_notifier.clone();
         let (_, deferred_token_manager) = tokio::join!(
             // Docker infra + QuestDB DDL
             async {
@@ -1038,8 +1048,32 @@ async fn main() -> Result<()> {
             let sender = order_update_sender.clone();
             let cal = trading_calendar.clone();
             let spill = ws_frame_spill.clone();
+            // O2 (2026-04-17): FAST BOOT parity — fires OrderUpdateAuthenticated
+            // Telegram event once Dhan accepts the token (first real message).
+            let auth_signal = std::sync::Arc::new(tokio::sync::Notify::new());
+            let auth_latch = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            {
+                let listener_signal = std::sync::Arc::clone(&auth_signal);
+                let listener_notifier = fast_notifier.clone();
+                tokio::spawn(async move {
+                    listener_signal.notified().await;
+                    listener_notifier.notify(NotificationEvent::OrderUpdateAuthenticated);
+                });
+            }
+            let run_signal = Some(std::sync::Arc::clone(&auth_signal));
+            let run_latch = Some(std::sync::Arc::clone(&auth_latch));
             tokio::spawn(async move {
-                run_order_update_connection(url, ws_client_id, token, sender, cal, spill).await;
+                run_order_update_connection(
+                    url,
+                    ws_client_id,
+                    token,
+                    sender,
+                    cal,
+                    spill,
+                    run_signal,
+                    run_latch,
+                )
+                .await;
             })
         };
         info!("order update WebSocket started (background)");
@@ -1746,20 +1780,18 @@ async fn main() -> Result<()> {
     let shutdown_notify = std::sync::Arc::new(tokio::sync::Notify::new());
     let (ws_handles, ws_pool_arc) = if let Some(pool) = ws_pool_ready {
         let pool_arc = std::sync::Arc::new(pool);
+        // O1-B (2026-04-17): install per-connection runtime subscribe
+        // channels BEFORE spawn — same as the FAST BOOT path (main.rs ~830).
+        pool_arc.install_subscribe_channels().await;
         let handles = spawn_websocket_connections(std::sync::Arc::clone(&pool_arc)).await;
         spawn_pool_watchdog_task(
             std::sync::Arc::clone(&pool_arc),
             std::sync::Arc::clone(&shutdown_notify),
+            std::sync::Arc::clone(&notifier),
         );
-        // Telegram: notify that all main WS connections were spawned.
-        if !handles.is_empty() {
-            let conn_count = handles.len();
-            for i in 0..conn_count {
-                notifier.notify(NotificationEvent::WebSocketConnected {
-                    connection_index: i,
-                });
-            }
-        }
+        // FAST BOOT parity: helper emits per-connection + aggregate Telegram
+        // alerts on BOTH boot paths (main.rs ~830 for FAST BOOT, here for slow).
+        emit_websocket_connected_alerts(&notifier, handles.len()).await;
         (handles, Some(pool_arc))
     } else {
         (Vec::new(), None)
@@ -1842,29 +1874,183 @@ async fn main() -> Result<()> {
         if let Some(ref _plan) = subscription_plan {
             let depth_underlyings = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"];
 
-            // Wait for the first index LTP before selecting depth strikes.
-            // Without a real spot price, we cannot determine ATM. The main
-            // WebSocket feed streams index LTPs continuously — we poll the
-            // SharedSpotPrices map every 500ms up to 30 seconds.
+            // Option C v2 (2026-04-17, Parthiban feedback): do NOT treat all
+            // 4 underlyings equally. NIFTY + BANKNIFTY are MANDATORY (they
+            // have 200-level depth connections + full option chains); we
+            // wait up to 5 minutes for their LTPs because a wrong ATM is
+            // worse than a slow boot on these. FINNIFTY + MIDCPNIFTY are
+            // OPTIONAL (20-level only); we give them the original 30s
+            // grace window and drop+alert if they miss it.
+            //
+            // Option C v3 (2026-04-17, Parthiban live feedback at 16:59 IST):
+            // the boot-time depth wait MUST be market-hours aware. A post-
+            // market boot (like the one at 16:53 IST) wasted 5 full minutes
+            // waiting for index LTPs that will never arrive because the main
+            // feed doesn't stream after 15:30 IST. Boot completed in 342s,
+            // triggered BOOT DEADLINE MISSED alert, and spammed 4 false
+            // MANDATORY/OPTIONAL-missing alerts. Fix: detect market hours and
+            // short-circuit the wait during post-market boots, dropping to
+            // 10 seconds of best-effort pickup. During market hours the
+            // original 5-minute hard cap still applies (correct behaviour —
+            // a genuinely degraded main feed mid-market is a real problem).
+            const MANDATORY_UNDERLYINGS: &[&str] = &["NIFTY", "BANKNIFTY"];
+            const OPTIONAL_UNDERLYINGS: &[&str] = &["FINNIFTY", "MIDCPNIFTY"];
+            const MANDATORY_WAIT_MARKET_HOURS_SECS: u64 = 300; // 5 min — during session
+            const MANDATORY_WAIT_POST_MARKET_SECS: u64 = 10; // 10 s — off-hours boot
+            const OPTIONAL_WAIT_SECS: u64 = 30;
+
+            // Off-hours = outside 09:00-15:30 IST using the same constants
+            // as tick_persistence + depth_rebalancer so market-hours logic
+            // stays DRY across the codebase.
+            let is_market_hours = {
+                use tickvault_common::constants::{
+                    IST_UTC_OFFSET_SECONDS, SECONDS_PER_DAY, TICK_PERSIST_END_SECS_OF_DAY_IST,
+                    TICK_PERSIST_START_SECS_OF_DAY_IST,
+                };
+                let now_utc = chrono::Utc::now().timestamp();
+                let now_ist = now_utc.saturating_add(i64::from(IST_UTC_OFFSET_SECONDS));
+                let sec_of_day = now_ist.rem_euclid(i64::from(SECONDS_PER_DAY)) as u32;
+                (TICK_PERSIST_START_SECS_OF_DAY_IST..TICK_PERSIST_END_SECS_OF_DAY_IST)
+                    .contains(&sec_of_day)
+            };
+            let mandatory_wait_secs = if is_market_hours {
+                MANDATORY_WAIT_MARKET_HOURS_SECS
+            } else {
+                info!(
+                    "depth ATM: off-market-hours boot detected — using 10s \
+                     best-effort wait instead of 5-minute hard cap (Option C v3)"
+                );
+                MANDATORY_WAIT_POST_MARKET_SECS
+            };
             {
                 let wait_start = std::time::Instant::now();
-                let max_wait = std::time::Duration::from_secs(30); // APPROVED: boot-time wait
                 let poll_interval = std::time::Duration::from_millis(500); // APPROVED: boot-time poll
+
+                // Phase A: wait for MANDATORY underlyings (NIFTY+BANKNIFTY)
+                // up to 5 minutes. These MUST be present before we proceed.
                 loop {
                     let prices = spot_prices_for_depth.read().await;
-                    let have_nifty = prices.contains_key("NIFTY");
-                    let have_banknifty = prices.contains_key("BANKNIFTY");
+                    let mandatory_ok = MANDATORY_UNDERLYINGS
+                        .iter()
+                        .all(|sym| prices.contains_key(*sym));
                     drop(prices);
-                    if have_nifty && have_banknifty {
+                    if mandatory_ok {
+                        let waited = wait_start.elapsed().as_secs();
                         info!(
-                            "depth ATM: received NIFTY + BANKNIFTY index LTPs — proceeding with depth setup"
+                            waited_secs = waited,
+                            "depth ATM: mandatory index LTPs (NIFTY+BANKNIFTY) present"
                         );
                         break;
                     }
-                    if wait_start.elapsed() >= max_wait {
-                        warn!(
-                            "depth ATM: timed out waiting for index LTPs (30s) — using median strike fallback"
+                    if wait_start.elapsed() >= std::time::Duration::from_secs(mandatory_wait_secs) {
+                        let waited = wait_start.elapsed().as_secs();
+                        let prices = spot_prices_for_depth.read().await;
+                        let missing: Vec<&str> = MANDATORY_UNDERLYINGS
+                            .iter()
+                            .copied()
+                            .filter(|s| !prices.contains_key(*s))
+                            .collect();
+                        drop(prices);
+                        // Option C v3: downgrade ERROR to WARN when we're
+                        // outside market hours — the timeout is EXPECTED
+                        // during a post-market/pre-market boot and firing
+                        // ERROR (Telegram-routed) spams false alerts.
+                        if is_market_hours {
+                            error!(
+                                waited_secs = waited,
+                                missing = ?missing,
+                                "depth ATM: MANDATORY index LTPs still missing after 5 min — \
+                                 proceeding with partial set (this should never happen during \
+                                 market hours unless main feed is degraded)"
+                            );
+                            for sym in &missing {
+                                notifier.notify(NotificationEvent::DepthUnderlyingMissing {
+                                    underlying: (*sym).to_string(),
+                                    reason: format!(
+                                        "MANDATORY underlying — no spot price after {}s \
+                                         (5 min hard cap) — main feed likely degraded",
+                                        waited
+                                    ),
+                                });
+                            }
+                        } else {
+                            warn!(
+                                waited_secs = waited,
+                                missing = ?missing,
+                                "depth ATM: off-market-hours boot — mandatory index \
+                                 LTPs not available (expected; main feed does not \
+                                 stream outside 09:00-15:30 IST). Depth connections \
+                                 for these symbols will NOT be spawned this boot; \
+                                 restart the app during market hours to pick them up."
+                            );
+                        }
+                        break;
+                    }
+                    tokio::time::sleep(poll_interval).await;
+                }
+
+                // Phase B: shorter 30s top-up for OPTIONAL underlyings
+                // (FINNIFTY, MIDCPNIFTY). If still missing after this, drop
+                // them with a per-symbol Telegram alert.
+                let phase_b_start = std::time::Instant::now();
+                loop {
+                    let prices = spot_prices_for_depth.read().await;
+                    let have_all = depth_underlyings
+                        .iter()
+                        .all(|sym| prices.contains_key(*sym));
+                    drop(prices);
+                    if have_all {
+                        info!(
+                            underlyings = ?depth_underlyings,
+                            "depth ATM: all 4 index LTPs present — proceeding"
                         );
+                        break;
+                    }
+                    if phase_b_start.elapsed() >= std::time::Duration::from_secs(OPTIONAL_WAIT_SECS)
+                    {
+                        let waited = wait_start.elapsed().as_secs();
+                        let prices = spot_prices_for_depth.read().await;
+                        let missing: Vec<&str> = OPTIONAL_UNDERLYINGS
+                            .iter()
+                            .copied()
+                            .filter(|s| !prices.contains_key(*s))
+                            .collect();
+                        drop(prices);
+                        if !missing.is_empty() {
+                            // Option C v3: suppress Telegram during off-market
+                            // boots — OPTIONAL underlyings missing post-market
+                            // is expected, not a real failure. Keep the WARN
+                            // for audit but drop the Telegram-routed events.
+                            if is_market_hours {
+                                warn!(
+                                    waited_secs = waited,
+                                    missing = ?missing,
+                                    "depth ATM: OPTIONAL index LTPs not present after \
+                                     30s top-up — dropping those underlyings"
+                                );
+                                notifier.notify(NotificationEvent::DepthIndexLtpTimeout {
+                                    waited_secs: waited,
+                                });
+                                for sym in &missing {
+                                    notifier.notify(NotificationEvent::DepthUnderlyingMissing {
+                                        underlying: (*sym).to_string(),
+                                        reason: format!(
+                                            "OPTIONAL underlying — no spot price in 30s \
+                                             top-up window after {}s total — symbol inactive \
+                                             or low-liquidity pre-market",
+                                            waited
+                                        ),
+                                    });
+                                }
+                            } else {
+                                info!(
+                                    waited_secs = waited,
+                                    missing = ?missing,
+                                    "depth ATM: off-market-hours — OPTIONAL LTPs expected \
+                                     absent; not firing Telegram (Option C v3)"
+                                );
+                            }
+                        }
                         break;
                     }
                     tokio::time::sleep(poll_interval).await;
@@ -1874,7 +2060,11 @@ async fn main() -> Result<()> {
             // Read current spot prices for ATM calculation.
             let spot_snapshot: std::collections::HashMap<String, f64> = {
                 let prices = spot_prices_for_depth.read().await;
-                prices.clone() // O(1) EXEMPT: 4 entries max
+                // O3: strip freshness timestamps for the boot-time ATM selector
+                // which only needs (underlying -> price). Staleness is enforced
+                // by the rebalancer at runtime.
+                prices.iter().map(|(k, e)| (k.clone(), e.price)).collect()
+                // O(1) EXEMPT: 4 entries max (one per index)
             };
 
             // Build FnoUniverse reference for select_depth_instruments.
@@ -2527,6 +2717,14 @@ async fn main() -> Result<()> {
                 Option<tickvault_core::instrument::depth_rebalancer::RebalanceEvent>,
             >(None);
 
+            // O3 (2026-04-17): Stale-spot-price event channel. The rebalancer
+            // publishes here when an underlying's LTP is older than
+            // `STALE_SPOT_THRESHOLD_SECS`; a listener below fires a Telegram
+            // alert and skips the tainted rebalance cycle.
+            let (stale_spot_tx, mut stale_spot_rx) = tokio::sync::watch::channel::<
+                Option<tickvault_core::instrument::depth_rebalancer::StaleSpotPriceEvent>,
+            >(None);
+
             // Shutdown flag for the rebalancer
             let rebalancer_shutdown =
                 std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2537,9 +2735,57 @@ async fn main() -> Result<()> {
                     universe_arc,
                     depth_underlyings,
                     rebalance_tx,
+                    stale_spot_tx,
                     std::sync::Arc::clone(&rebalancer_shutdown),
                 ),
             );
+
+            // O3 listener: Telegram on stale spot price.
+            {
+                let stale_notifier = notifier.clone();
+                tokio::spawn(async move {
+                    while stale_spot_rx.changed().await.is_ok() {
+                        let event = match stale_spot_rx.borrow().clone() {
+                            Some(e) => e,
+                            None => continue,
+                        };
+                        stale_notifier.notify(NotificationEvent::DepthSpotPriceStale {
+                            underlying: event.underlying,
+                            age_secs: event.age_secs,
+                        });
+                    }
+                });
+            }
+
+            // O1 (2026-04-17) Phase A: Phase 2 subscription scheduler.
+            // Sleeps until 09:12 IST (or runs immediately if already past 9:12
+            // and within market hours), then waits for NIFTY/BANKNIFTY LTPs,
+            // then emits Phase2Complete/Failed. Actual SubscribeCommand dispatch
+            // O1-B (2026-04-17): the scheduler now dispatches a real
+            // `SubscribeCommand` to the pool when the LTPs arrive. The
+            // `phase2_instruments` argument here is `None` for v1 — the
+            // delta computation (which derivative_contracts to subscribe
+            // given the live spot price + boot universe) is the next step
+            // and ships in a follow-up commit. With `phase2_instruments=None`
+            // the scheduler falls back to alert-only mode (logs + Telegram
+            // with `added_count=0`) so operators still get the 9:12 signal.
+            {
+                let phase2_spot_prices = std::sync::Arc::clone(&shared_spot_prices);
+                let phase2_calendar = std::sync::Arc::clone(&trading_calendar);
+                let phase2_notifier = notifier.clone();
+                let phase2_pool = ws_pool_arc.clone();
+                tokio::spawn(async move {
+                    tickvault_core::instrument::phase2_scheduler::run_phase2_scheduler(
+                        phase2_spot_prices,
+                        phase2_calendar,
+                        phase2_notifier,
+                        phase2_pool,
+                        None, // O1-B v2: real instrument list lands with delta computation
+                        tickvault_common::types::FeedMode::Quote,
+                    )
+                    .await;
+                });
+            }
 
             // L1: Listen for rebalance events → Telegram alert + send swap commands (zero disconnect).
             {
@@ -2753,12 +2999,39 @@ async fn main() -> Result<()> {
         let ou_connect_notifier = notifier.clone();
         let ou_health = health_status.clone();
         let ou_wal_spill = ws_frame_spill.clone();
+        // O2 (2026-04-17): authenticated signal — fires once after first
+        // successful parse_order_update or AuthResponseKind::Success. The
+        // `OrderUpdateConnected` event below is "task spawned" semantics;
+        // `OrderUpdateAuthenticated` is "Dhan accepted the token and is
+        // streaming". Operators see both so they know where in the handshake
+        // they are.
+        let auth_signal = std::sync::Arc::new(tokio::sync::Notify::new());
+        let auth_latch = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let listener_signal = std::sync::Arc::clone(&auth_signal);
+            let listener_notifier = notifier.clone();
+            tokio::spawn(async move {
+                listener_signal.notified().await;
+                listener_notifier.notify(NotificationEvent::OrderUpdateAuthenticated);
+            });
+        }
+        let run_signal = Some(std::sync::Arc::clone(&auth_signal));
+        let run_latch = Some(std::sync::Arc::clone(&auth_latch));
         tokio::spawn(async move {
             ou_health.set_order_update_connected(true);
             // Telegram: Order Update WS connected (fires before read loop starts).
             ou_connect_notifier.notify(NotificationEvent::OrderUpdateConnected);
-            run_order_update_connection(url, order_ws_client_id, token, sender, cal, ou_wal_spill)
-                .await;
+            run_order_update_connection(
+                url,
+                order_ws_client_id,
+                token,
+                sender,
+                cal,
+                ou_wal_spill,
+                run_signal,
+                run_latch,
+            )
+            .await;
             // If run_order_update_connection returns, connection terminated
             ou_notifier.notify(NotificationEvent::OrderUpdateDisconnected {
                 reason: "connection task exited".to_string(),
@@ -3286,13 +3559,57 @@ async fn spawn_websocket_connections(
     handles
 }
 
+/// Stagger in milliseconds between per-connection `WebSocketConnected` events.
+/// Telegram rate-limits bursts of identical-from messages; spacing the emits
+/// avoids silent drops. A 5-connection pool at 150 ms adds ~750 ms to boot,
+/// which is negligible against the 15-step boot budget.
+const WS_CONNECTED_ALERT_STAGGER_MS: u64 = 150;
+
+/// Emits per-connection `WebSocketConnected` Telegram events plus a single
+/// aggregate `WebSocketPoolOnline` summary. Called from BOTH boot paths
+/// (FAST BOOT and slow boot) so an operator sees the same signal regardless
+/// of which path ran.
+///
+/// Why the summary: when 5 per-connection events fire in a tight loop,
+/// Telegram can drop individual messages (observed live on 2026-04-17 —
+/// only 3 of 5 arrived). The aggregate is delivered with a small stagger
+/// after the individuals so even if all per-connection drops happen, a
+/// single "N/total online" message still reaches the operator chat.
+async fn emit_websocket_connected_alerts(
+    notifier: &std::sync::Arc<NotificationService>,
+    handle_count: usize,
+) {
+    if handle_count == 0 {
+        return;
+    }
+    for i in 0..handle_count {
+        notifier.notify(NotificationEvent::WebSocketConnected {
+            connection_index: i,
+        });
+        if i + 1 < handle_count {
+            tokio::time::sleep(std::time::Duration::from_millis(
+                WS_CONNECTED_ALERT_STAGGER_MS,
+            ))
+            .await;
+        }
+    }
+    notifier.notify(NotificationEvent::WebSocketPoolOnline {
+        connected: handle_count,
+        total: handle_count,
+    });
+}
+
 /// S4-T1a: Background pool health watchdog.
 ///
-/// Spawns a task that calls `pool.poll_watchdog()` every 5 seconds. On
-/// `WatchdogVerdict::Halt` it logs FATAL + sends a Telegram alert then
-/// exits the process with status 2 so the Docker/systemd supervisor
-/// restarts us. On `Degraded` the metric + CRITICAL log are already
-/// emitted by `poll_watchdog()` itself. On `Recovered` same.
+/// Spawns a task that calls `pool.poll_watchdog()` every 5 seconds and
+/// translates each `WatchdogVerdict` into the matching Telegram event:
+/// - `Degraded` → `WebSocketPoolDegraded { down_secs }` (High severity,
+///   fires once per down-cycle — the watchdog's internal
+///   `degraded_alert_fired` flag de-duplicates).
+/// - `Recovered` → `WebSocketPoolRecovered { was_down_secs }`.
+/// - `Halt` → `WebSocketPoolHalt { down_secs }` + `std::process::exit(2)`
+///   so the supervisor restarts us.
+/// - `Degrading` / `Healthy` → gauge update only, no Telegram.
 ///
 /// The task stops when the `shutdown_notify` is fired (during graceful
 /// shutdown) to avoid a false-positive Halt during the intentional
@@ -3300,6 +3617,7 @@ async fn spawn_websocket_connections(
 fn spawn_pool_watchdog_task(
     pool: std::sync::Arc<WebSocketConnectionPool>,
     shutdown_notify: std::sync::Arc<tokio::sync::Notify>,
+    notifier: std::sync::Arc<NotificationService>,
 ) {
     tokio::spawn(async move {
         // 5-second poll interval — cold path, not per tick. Matches the
@@ -3317,21 +3635,48 @@ fn spawn_pool_watchdog_task(
                 }
                 _ = interval.tick() => {
                     let verdict = pool.poll_watchdog();
-                    if let tickvault_core::websocket::pool_watchdog::WatchdogVerdict::Halt {
-                        down_for,
-                    } = verdict
-                    {
-                        // ERROR log fires Telegram via the existing Loki hook.
-                        error!(
-                            down_for_secs = down_for.as_secs(),
-                            "S4-T1a FATAL: pool watchdog fired Halt verdict. \
-                             Exiting process with status 2 so the supervisor restarts us. \
-                             All 5 WebSocket connections have been down for >300s."
-                        );
-                        metrics::counter!("tv_pool_self_halts_total").increment(1);
-                        // Give notifications + metrics flush a moment.
-                        tokio::time::sleep(std::time::Duration::from_secs(2)).await; // APPROVED: pre-existing literal, session-7 tech debt tracked for cleanup
-                        std::process::exit(2);
+                    use tickvault_core::websocket::pool_watchdog::WatchdogVerdict;
+                    match verdict {
+                        WatchdogVerdict::Degraded { down_for } => {
+                            error!(
+                                down_for_secs = down_for.as_secs(),
+                                "S4-T1a CRITICAL: pool watchdog Degraded verdict — \
+                                 all main-feed WebSocket connections down >= 60s."
+                            );
+                            metrics::counter!("tv_pool_degraded_alerts_total").increment(1);
+                            notifier.notify(NotificationEvent::WebSocketPoolDegraded {
+                                down_secs: down_for.as_secs(),
+                            });
+                        }
+                        WatchdogVerdict::Recovered { was_down_for } => {
+                            info!(
+                                was_down_for_secs = was_down_for.as_secs(),
+                                "S4-T1a: pool watchdog Recovered verdict — pool back online"
+                            );
+                            metrics::counter!("tv_pool_recoveries_total").increment(1);
+                            notifier.notify(NotificationEvent::WebSocketPoolRecovered {
+                                was_down_secs: was_down_for.as_secs(),
+                            });
+                        }
+                        WatchdogVerdict::Halt { down_for } => {
+                            error!(
+                                down_for_secs = down_for.as_secs(),
+                                "S4-T1a FATAL: pool watchdog fired Halt verdict. \
+                                 Exiting process with status 2 so the supervisor restarts us. \
+                                 All main-feed WebSocket connections have been down for >300s."
+                            );
+                            metrics::counter!("tv_pool_self_halts_total").increment(1);
+                            notifier.notify(NotificationEvent::WebSocketPoolHalt {
+                                down_secs: down_for.as_secs(),
+                            });
+                            // Give notifications + metrics flush a moment.
+                            tokio::time::sleep(std::time::Duration::from_secs(2)).await; // APPROVED: pre-existing literal, session-7 tech debt tracked for cleanup
+                            std::process::exit(2);
+                        }
+                        WatchdogVerdict::Degrading { .. } | WatchdogVerdict::Healthy => {
+                            // No alert; watchdog's internal state machine
+                            // will upgrade to Degraded / Halt if this persists.
+                        }
                     }
                 }
             }

@@ -67,35 +67,169 @@ Every rule here is checked by tests, hooks, or clippy — never by human review 
 - Test: `test_tick_dedup_key_includes_segment`
 
 ## I-P1-08: Single-Row-Per-Instrument with Constant Designated Timestamp (REWRITTEN 2026-04-17)
-**Rationale:** Old design accumulated one snapshot row per day per instrument.
-Running the app on 2 days = 2x rows. Dashboard showed 442 underlyings (2x 221)
-and 207,796 contracts (2x ~104k) looking like duplicates. Root cause: designated
-timestamp was today's IST midnight, which is part of QuestDB DEDUP key, so
-same business key on different days = different rows.
+**Rationale:** Pre-Phase-2 the snapshot tables accumulated one row per day
+per instrument. Running the app on 2 days = 2x rows. Dashboard showed 442
+underlyings (2x 221) and 207,796 contracts (2x ~104k) looking like duplicates.
+Root cause: designated timestamp was today's IST midnight, which is part of
+the QuestDB DEDUP key, so same business key on different days = different rows.
+Phase 1 pinned the designated timestamp to constant epoch 0 so DEDUP fired on
+the business key alone, but the `1970-01-01` display was confusing and there
+was no clean way to answer "what's active right now?".
 
-**New design:**
-- `build_snapshot_timestamp()` returns CONSTANT epoch 0 for all snapshot writes
-- QuestDB DEDUP UPSERT KEYS effectively operate on business key alone
-  (fno_underlyings: underlying_symbol; derivative_contracts: security_id +
-  underlying_symbol; subscribed_indices: security_id)
-- Running the app 1000 times same day → 221 rows (idempotent)
-- Running on a new day → 221 rows (UPSERT, no accumulation)
-- `instrument_persistence.rs` MUST NOT contain `DELETE FROM` for snapshot tables
-- `naive_date_to_timestamp_nanos()` retained for historical-query helpers only
-- Grafana dashboard queries should NOT include `WHERE timestamp = max(timestamp)`
-  (harmless but redundant; prefer simple `SELECT count() FROM <table>`)
+**Phase 2 design (live since 2026-04-17):**
+- `fno_underlyings`, `derivative_contracts`, `subscribed_indices` each gain
+  three lifecycle columns:
+  - `status SYMBOL` — `active` or `expired`
+  - `last_seen_date TIMESTAMP` — last IST date today's CSV contained this row
+  - `expired_date TIMESTAMP` — IST date the row flipped to expired (null for active)
+- `build_snapshot_timestamp()` still returns CONSTANT epoch 0 (QuestDB DEDUP
+  must include the designated timestamp in the key, so we pin it to 0 and let
+  the business key columns do the deduplication).
+- Every write emits `status='active'`, `last_seen_date=today_ist`. After the
+  ILP flush, `mark_missing_as_expired(today)` runs three UPDATE statements
+  that flip any row with `status='active' AND last_seen_date < today` to
+  `status='expired'`, `expired_date=today`.
+- Reappearing contracts are auto-reactivated on the next write — ILP UPSERT
+  replaces every column, so `status` flips back to `active` and `expired_date`
+  is reset to null.
+- `instrument_persistence.rs` MUST NOT contain `DELETE FROM` for lifecycle
+  tables — SEBI 5-year retention applies.
+- Dashboard + operator queries MUST include `WHERE status = 'active'`.
+  Enforced mechanically by
+  `crates/storage/tests/grafana_dashboard_snapshot_filter_guard.rs`.
+- `instrument_build_metadata` is NOT a lifecycle table — it intentionally
+  accumulates one row per daily build (build history).
+- Migration: run `scripts/migrate-instrument-tables-phase2.sql` once before
+  first deployment of the new code. It `DROP TABLE IF EXISTS` the three
+  lifecycle tables (safe — rebuilt from Dhan CSV on every app start).
 
-**Phase 2 (planned):** Add `status`, `first_seen_date`, `last_seen_date`,
-`expired_date` columns for lifecycle tracking. See
-`.claude/plans/instrument-uniqueness-redesign.md`.
-
-**Tests (in `crates/storage/src/instrument_persistence.rs`):**
+**Tests (in `crates/storage/src/instrument_persistence.rs` unless noted):**
 - `test_build_snapshot_timestamp_returns_epoch_zero_constant`
 - `test_build_snapshot_timestamp_is_constant_across_calls`
 - `test_build_snapshot_timestamp_is_zero_not_positive`
-- `test_build_snapshot_epoch_nanos_is_zero_regardless_of_today`
-- `test_no_delete_from_snapshot_tables_in_persist_path`
-- Dashboard guard: `crates/storage/tests/grafana_dashboard_snapshot_filter_guard.rs`
+- `test_ddl_contains_status_column_all_three_tables`
+- `test_ddl_contains_last_seen_and_expired_date_columns`
+- `test_instrument_status_active_and_expired_constants`
+- `crates/storage/tests/instrument_uniqueness_guard.rs` — property guard
+- `crates/storage/tests/grafana_dashboard_snapshot_filter_guard.rs` — scans
+  every dashboard JSON for missing `status =`-style predicates
+
+## I-P1-11: segment-aware security_id uniqueness (NEW 2026-04-17)
+**Rationale:** Dhan reuses the same numeric `security_id` across different
+`ExchangeSegment` values — e.g. FINNIFTY's IDX_I index value and an
+NSE_EQ instrument both had `security_id = 27` in the live CSV on
+2026-04-17. Any collection keyed on `security_id` alone silently
+drops one of the two, leading to missing WebSocket subscriptions,
+incorrect tick enrichment, and silent data loss.
+
+**Rule:** `security_id` alone is NOT unique. The only unique instrument
+key is `(security_id, exchange_segment)`. See the full rule body in
+`.claude/rules/project/security-id-uniqueness.md` (auto-loaded).
+
+**Fixed sites (7 commits on 2026-04-17 branch `claude/fix-duplicate-timestamps-3M2o0`):**
+- **Planner dedup** (`subscription_planner.rs`): `HashSet<(u32, ExchangeSegment)>`
+- **CSV parse dedup** (`universe_builder.rs`): `HashSet<(SecurityId, char)>`
+- **InstrumentRegistry composite index** (`instrument_registry.rs`):
+  `by_composite: HashMap<(SecurityId, ExchangeSegment), _>` stores BOTH
+  entries; `iter()`, `by_exchange_segment()`, `len()`, category counts
+  and `underlying_symbol_to_security_id` all iterate the composite map
+  (NOT the legacy single-segment map). Commit `d8bfce5`.
+- **Production lookup migration** (commit `c7397b3`): 5 sites migrated
+  `registry.get(id)` → `registry.get_with_segment(id, segment)`:
+  - `crates/core/src/pipeline/tick_processor.rs` (3 movers lookups)
+  - `crates/trading/src/greeks/aggregator.rs:364`
+  - `crates/trading/src/greeks/inline_computer.rs:187`
+- **Banned-pattern hook** (commit `e05e66c`): `.claude/hooks/banned-pattern-scanner.sh`
+  category 5 blocks new `HashSet<u32>` / `HashSet<SecurityId>` /
+  `HashMap<u32, _>` / `HashMap<SecurityId, _>` / `.registry.get(id)` /
+  `.registry.contains(id)` in instrument paths without a `// APPROVED:`
+  comment.
+- **Storage DEDUP keys** (commit `6f5e5c3`):
+  - `DEDUP_KEY_DERIVATIVE_CONTRACTS` = `"security_id, underlying_symbol, exchange_segment"`
+  - `DEDUP_KEY_SUBSCRIBED_INDICES` = `"security_id, exchange"`
+  - Meta-guard `crates/storage/tests/dedup_segment_meta_guard.rs` scans
+    every `DEDUP_KEY_*` constant and fails if any mentions `security_id`
+    without `segment`/`exchange_segment`/`exchange`.
+- **FnoUniverse runtime collision detection** (commit `01bd833`):
+  `universe_builder.rs` emits WARN + counter `tv_fno_universe_derivative_collisions_total`
+  when NSE_FNO/BSE_FNO derivative ids collide. `delta_detector.rs` has
+  documented single-segment assumption referencing this counter.
+- **Prometheus metrics** (commit `d049bd6`): `InstrumentRegistry`
+  exposes `cross_segment_collisions()` getter. `subscription_planner`
+  emits gauges `tv_instrument_registry_cross_segment_collisions`
+  and `tv_instrument_registry_total_entries`. The construction WARN
+  was upgraded to `error!` so Loki routes it to Telegram.
+
+**Tests (19 total):**
+- `subscription_planner::tests::test_regression_seen_ids_key_type_is_pair`
+  — compile-time guard; fails to compile if someone regresses the key
+- `subscription_planner::tests::test_regression_finnifty_id27_both_segments_are_kept`
+  — scenario repro using NIFTY id=13 IDX_I + synthetic stock id=13 NSE_EQ
+- `instrument_registry::tests::test_iter_returns_both_colliding_segments`
+- `instrument_registry::tests::test_by_exchange_segment_returns_both_colliding_segments`
+- `instrument_registry::tests::test_len_counts_both_colliding_segments`
+- `instrument_registry::tests::test_category_counts_include_both_colliding_segments`
+- `instrument_registry::tests::test_underlying_reverse_lookup_distinct_symbols_across_colliding_ids`
+- `instrument_registry::tests::test_cross_segment_collisions_zero_when_no_collisions`
+- `instrument_registry::tests::test_cross_segment_collisions_counts_both_colliding_pairs`
+- `instrument_registry::tests::test_cross_segment_collisions_ignores_same_segment_duplicates`
+- `instrument_registry::tests::test_empty_registry_cross_segment_collisions_is_zero`
+- `crates/core/tests/regression_cross_segment_subscribe.rs` (4 integration tests)
+  — asserts the full pipeline `registry.iter() → InstrumentSubscription →
+  build_subscription_messages()` emits BOTH colliding entries in the
+  serialized WebSocket subscribe JSON
+- `crates/storage/tests/dedup_segment_meta_guard.rs` (4 meta-guard tests)
+  — workspace-scanning guard
+- `crates/storage/tests/grafana_dashboard_snapshot_filter_guard.rs`
+  `dashboard_distinct_security_id_must_include_segment` — blocks any
+  `count_distinct(security_id)` on cross-segment tables without
+  segment-qualified distinct.
+
+## LIVE-FEED-PURITY: no historical→ticks backfill (NEW 2026-04-17)
+**Directive:** Parthiban, 2026-04-17 verbatim: "in our live market feed
+websockets nowhere the backfill should happen, make it as hard
+enforcement ... live market feed should contain only live market feed
+data alone ... historical candle data fetch is a separate functionality".
+
+**Rule:** the `ticks` QuestDB table is populated EXCLUSIVELY from live
+WebSocket frames. Historical REST-API data NEVER crosses into `ticks`.
+
+**Three enforcement layers:**
+1. **Source deleted** (commit `8d527ab`): `crates/core/src/historical/backfill.rs`
+   (836 lines) + `crates/core/tests/dhat_backfill_synth.rs` (119 lines) removed.
+   9 `tv_backfill_*` Prometheus metrics removed from the catalog.
+2. **Banned-pattern hook category 6**: any file under `crates/core/src/historical/`
+   or a `backfill`/`synth` named file that references
+   `TickPersistenceWriter`, `append_tick(`, `BackfillWorker`,
+   `run_backfill`, `synthesize_ticks`, `GapBackfillRequest`, or
+   `pub mod backfill` — commit blocked.
+3. **Runtime guard** `crates/storage/tests/live_feed_purity_guard.rs`
+   (6 tests): fails build if `backfill.rs` is recreated, if
+   `pub mod backfill` reappears in `historical/mod.rs`, if any banned
+   symbol appears in the historical flow, or if `cross_verify.rs`
+   ever writes to ticks.
+
+Full rule: `.claude/rules/project/live-feed-purity.md` (auto-loaded).
+
+## DEPTH-STALE-ALERT: market-hours + edge-trigger suppression (HOTFIX 2026-04-17)
+**Trigger:** Parthiban reported 15+ Telegram alerts `Depth spot price STALE`
+for FINNIFTY + MIDCPNIFTY starting at 15:45 IST, post-market close.
+
+**Rule:** `run_depth_rebalancer` (commit `e7926d9`) now enforces:
+- **Market-hours gate**: `is_within_market_hours_ist()` reads
+  `TICK_PERSIST_START/END_SECS_OF_DAY_IST` constants. Outside
+  09:00-15:30 IST the loop `continue`s, clearing the stale-set so
+  next market-open detects rising edge correctly.
+- **Edge-triggered alerts**: `currently_stale: HashSet<String>` tracks
+  which underlyings have already fired a Telegram alert. Rising edge
+  (was_stale=false, is_stale=true) fires ONCE. Falling edge emits an
+  INFO log only (no Telegram — operator already alerted).
+
+**Tests** (4 in `depth_rebalancer::tests`):
+- `test_is_within_market_hours_at_0830_ist_is_false`
+- `test_is_within_market_hours_helper_exists_and_returns_bool`
+- `test_market_hours_gate_is_wired_into_rebalancer_loop` (source scan)
+- `test_edge_triggered_stale_alert_suppression_is_wired` (source scan)
 
 ## I-P2-02: Trading Day Guard on Download
 - `instrument_loader.rs` must log when downloading on weekends

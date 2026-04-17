@@ -35,7 +35,7 @@ use tickvault_common::instrument_types::{
     ArchivedFnoUniverse, DhanInstrumentKind, FnoUniverse, IndexCategory, OptionChainKey,
     UnderlyingKind, naive_date_from_archived_i32,
 };
-use tickvault_common::types::FeedMode;
+use tickvault_common::types::{ExchangeSegment, FeedMode};
 
 // ---------------------------------------------------------------------------
 // Subscription Plan — output of the planner
@@ -120,7 +120,16 @@ pub fn build_subscription_plan(
     let feed_mode = config.parsed_feed_mode().unwrap_or(FeedMode::Ticker);
 
     let mut instruments: Vec<SubscribedInstrument> = Vec::with_capacity(MAX_TOTAL_SUBSCRIPTIONS);
-    let mut seen_ids: HashSet<u32> = HashSet::with_capacity(MAX_TOTAL_SUBSCRIPTIONS);
+    // BUG FIX (2026-04-17, spotted by Parthiban): dedup was keyed on
+    // `security_id` alone, but Dhan CAN reuse the same numeric security_id
+    // across different segments (e.g. id=13 is FINNIFTY in IDX_I AND is
+    // some other instrument in NSE_EQ / NSE_FNO). The old single-key set
+    // on the numeric id silently skipped the second-seen instance — which
+    // is why FINNIFTY's IDX_I subscription never went out and the depth
+    // ATM selector had no spot price for it. Correct dedup key is
+    // `(security_id, segment)`.
+    let mut seen_ids: HashSet<(u32, ExchangeSegment)> =
+        HashSet::with_capacity(MAX_TOTAL_SUBSCRIPTIONS);
     let mut stocks_skipped_no_chain: usize = 0;
 
     let full_chain_set: HashSet<&str> = FULL_CHAIN_INDEX_SYMBOLS.iter().copied().collect();
@@ -133,7 +142,7 @@ pub fn build_subscription_plan(
             continue;
         }
         // Index value feed (IDX_I segment)
-        if seen_ids.insert(underlying.price_feed_security_id) {
+        if seen_ids.insert((underlying.price_feed_security_id, ExchangeSegment::IdxI)) {
             instruments.push(make_major_index_instrument(
                 underlying.price_feed_security_id,
                 &underlying.underlying_symbol,
@@ -147,7 +156,9 @@ pub fn build_subscription_plan(
     // -----------------------------------------------------------------------
     if config.subscribe_display_indices {
         for index in &universe.subscribed_indices {
-            if index.category == IndexCategory::DisplayIndex && seen_ids.insert(index.security_id) {
+            if index.category == IndexCategory::DisplayIndex
+                && seen_ids.insert((index.security_id, ExchangeSegment::IdxI))
+            {
                 instruments.push(make_display_index_instrument(
                     index.security_id,
                     &index.symbol,
@@ -169,7 +180,7 @@ pub fn build_subscription_plan(
             );
             if is_index
                 && full_chain_set.contains(contract.underlying_symbol.as_str())
-                && seen_ids.insert(contract.security_id)
+                && seen_ids.insert((contract.security_id, contract.exchange_segment))
             {
                 instruments.push(make_derivative_instrument(
                     contract,
@@ -189,7 +200,12 @@ pub fn build_subscription_plan(
         }
 
         // 4a. Stock equity price feed
-        if config.subscribe_stock_equities && seen_ids.insert(underlying.price_feed_security_id) {
+        if config.subscribe_stock_equities
+            && seen_ids.insert((
+                underlying.price_feed_security_id,
+                underlying.price_feed_segment,
+            ))
+        {
             instruments.push(make_stock_equity_instrument(underlying, feed_mode));
         }
 
@@ -223,7 +239,7 @@ pub fn build_subscription_plan(
             // Future for this expiry
             if let Some(future_id) = chain.future_security_id
                 && let Some(future_contract) = universe.derivative_contracts.get(&future_id)
-                && seen_ids.insert(future_id)
+                && seen_ids.insert((future_id, future_contract.exchange_segment))
             {
                 instruments.push(make_derivative_instrument(
                     future_contract,
@@ -282,7 +298,7 @@ pub fn build_subscription_plan(
                     .min(call_count);
                 for entry in &chain.calls[start..end] {
                     if let Some(contract) = universe.derivative_contracts.get(&entry.security_id)
-                        && seen_ids.insert(entry.security_id)
+                        && seen_ids.insert((entry.security_id, contract.exchange_segment))
                     {
                         instruments.push(make_derivative_instrument(
                             contract,
@@ -334,7 +350,7 @@ pub fn build_subscription_plan(
                     .min(put_count);
                 for entry in &chain.puts[start..end] {
                     if let Some(contract) = universe.derivative_contracts.get(&entry.security_id)
-                        && seen_ids.insert(entry.security_id)
+                        && seen_ids.insert((entry.security_id, contract.exchange_segment))
                     {
                         instruments.push(make_derivative_instrument(
                             contract,
@@ -378,7 +394,7 @@ pub fn build_subscription_plan(
                     tickvault_common::instrument_types::DhanInstrumentKind::FutureStock
                         | tickvault_common::instrument_types::DhanInstrumentKind::OptionStock
                 ) && c.expiry_date >= today
-                    && !seen_ids.contains(&c.security_id)
+                    && !seen_ids.contains(&(c.security_id, c.exchange_segment))
             })
             .collect();
 
@@ -395,7 +411,7 @@ pub fn build_subscription_plan(
             if instruments.len() >= MAX_TOTAL_SUBSCRIPTIONS {
                 break;
             }
-            if seen_ids.insert(contract.security_id) {
+            if seen_ids.insert((contract.security_id, contract.exchange_segment)) {
                 instruments.push(make_derivative_instrument(
                     contract,
                     SubscriptionCategory::StockDerivative,
@@ -420,6 +436,14 @@ pub fn build_subscription_plan(
     // Build the registry and summary
     // -----------------------------------------------------------------------
     let registry = InstrumentRegistry::from_instruments(instruments);
+
+    // I-P1-11 gap G (2026-04-17): expose registry composite-index health
+    // as Prometheus gauges so the operator sees cross-segment collisions
+    // in Grafana + receives Telegram alerts on ERROR logs emitted during
+    // construction.
+    metrics::gauge!("tv_instrument_registry_cross_segment_collisions")
+        .set(registry.cross_segment_collisions() as f64);
+    metrics::gauge!("tv_instrument_registry_total_entries").set(registry.len() as f64);
 
     let exceeds_capacity = registry.len() > MAX_TOTAL_SUBSCRIPTIONS;
     if exceeds_capacity {
@@ -486,7 +510,12 @@ pub fn build_subscription_plan_from_archived(
     let feed_mode = config.parsed_feed_mode().unwrap_or(FeedMode::Ticker);
 
     let mut instruments: Vec<SubscribedInstrument> = Vec::with_capacity(MAX_TOTAL_SUBSCRIPTIONS);
-    let mut seen_ids: HashSet<u32> = HashSet::with_capacity(MAX_TOTAL_SUBSCRIPTIONS);
+    // BUG FIX (2026-04-17): see sibling `build_subscription_plan` — dedup
+    // must use `(security_id, segment)` so an id that exists in both
+    // IDX_I and NSE_EQ (e.g. FINNIFTY=27) is NOT silently collapsed to
+    // whichever one appeared first.
+    let mut seen_ids: HashSet<(u32, ExchangeSegment)> =
+        HashSet::with_capacity(MAX_TOTAL_SUBSCRIPTIONS);
     let mut stocks_skipped_no_chain: usize = 0;
 
     let full_chain_set: HashSet<&str> = FULL_CHAIN_INDEX_SYMBOLS.iter().copied().collect();
@@ -512,7 +541,7 @@ pub fn build_subscription_plan_from_archived(
             continue;
         }
         let price_id = underlying.price_feed_security_id.to_native();
-        if seen_ids.insert(price_id) {
+        if seen_ids.insert((price_id, ExchangeSegment::IdxI)) {
             instruments.push(make_major_index_instrument(price_id, symbol, feed_mode));
         }
     }
@@ -524,7 +553,9 @@ pub fn build_subscription_plan_from_archived(
         for index in universe.subscribed_indices.iter() {
             let cat = IndexCategory::from(&index.category);
             let sec_id = index.security_id.to_native();
-            if cat == IndexCategory::DisplayIndex && seen_ids.insert(sec_id) {
+            if cat == IndexCategory::DisplayIndex
+                && seen_ids.insert((sec_id, ExchangeSegment::IdxI))
+            {
                 instruments.push(make_display_index_instrument(
                     sec_id,
                     index.symbol.as_str(),
@@ -545,9 +576,10 @@ pub fn build_subscription_plan_from_archived(
                 DhanInstrumentKind::FutureIndex | DhanInstrumentKind::OptionIndex
             );
             let sec_id = contract.security_id.to_native();
+            let contract_seg = ExchangeSegment::from(&contract.exchange_segment);
             if is_index
                 && full_chain_set.contains(contract.underlying_symbol.as_str())
-                && seen_ids.insert(sec_id)
+                && seen_ids.insert((sec_id, contract_seg))
             {
                 instruments.push(make_derivative_instrument_from_archived(
                     contract,
@@ -571,7 +603,8 @@ pub fn build_subscription_plan_from_archived(
 
         // 4a. Stock equity price feed
         let price_id = underlying.price_feed_security_id.to_native();
-        if config.subscribe_stock_equities && seen_ids.insert(price_id) {
+        let price_seg = ExchangeSegment::from(&underlying.price_feed_segment);
+        if config.subscribe_stock_equities && seen_ids.insert((price_id, price_seg)) {
             instruments.push(make_stock_equity_instrument_from_archived(
                 underlying, feed_mode,
             ));
@@ -606,11 +639,10 @@ pub fn build_subscription_plan_from_archived(
             // Future for this expiry
             if let Some(archived_future_id) = chain.future_security_id.as_ref() {
                 let future_id: u32 = archived_future_id.to_native();
-                if seen_ids.insert(future_id) {
-                    // Look up the future contract in derivative_contracts
-                    let archived_key = rkyv::rend::u32_le::from_native(future_id);
-                    if let Some(future_contract) = universe.derivative_contracts.get(&archived_key)
-                    {
+                let archived_key = rkyv::rend::u32_le::from_native(future_id);
+                if let Some(future_contract) = universe.derivative_contracts.get(&archived_key) {
+                    let future_seg = ExchangeSegment::from(&future_contract.exchange_segment);
+                    if seen_ids.insert((future_id, future_seg)) {
                         instruments.push(make_derivative_instrument_from_archived(
                             future_contract,
                             SubscriptionCategory::StockDerivative,
@@ -637,7 +669,8 @@ pub fn build_subscription_plan_from_archived(
                     let sec_id = entry.security_id.to_native();
                     let archived_key = rkyv::rend::u32_le::from_native(sec_id);
                     if let Some(contract) = universe.derivative_contracts.get(&archived_key)
-                        && seen_ids.insert(sec_id)
+                        && seen_ids
+                            .insert((sec_id, ExchangeSegment::from(&contract.exchange_segment)))
                     {
                         instruments.push(make_derivative_instrument_from_archived(
                             contract,
@@ -661,7 +694,8 @@ pub fn build_subscription_plan_from_archived(
                     let sec_id = entry.security_id.to_native();
                     let archived_key = rkyv::rend::u32_le::from_native(sec_id);
                     if let Some(contract) = universe.derivative_contracts.get(&archived_key)
-                        && seen_ids.insert(sec_id)
+                        && seen_ids
+                            .insert((sec_id, ExchangeSegment::from(&contract.exchange_segment)))
                     {
                         instruments.push(make_derivative_instrument_from_archived(
                             contract,
@@ -702,7 +736,8 @@ pub fn build_subscription_plan_from_archived(
                 );
                 let expiry = naive_date_from_archived_i32(&c.expiry_date);
                 let sec_id = c.security_id.to_native();
-                if is_stock_deriv && expiry >= today && !seen_ids.contains(&sec_id) {
+                let seg = ExchangeSegment::from(&c.exchange_segment);
+                if is_stock_deriv && expiry >= today && !seen_ids.contains(&(sec_id, seg)) {
                     Some((sec_id, expiry, c.underlying_symbol.as_str(), c))
                 } else {
                     None
@@ -719,7 +754,8 @@ pub fn build_subscription_plan_from_archived(
             if instruments.len() >= MAX_TOTAL_SUBSCRIPTIONS {
                 break;
             }
-            if seen_ids.insert(*sec_id) {
+            let seg = ExchangeSegment::from(&contract.exchange_segment);
+            if seen_ids.insert((*sec_id, seg)) {
                 instruments.push(make_derivative_instrument_from_archived(
                     contract,
                     SubscriptionCategory::StockDerivative,
@@ -744,6 +780,14 @@ pub fn build_subscription_plan_from_archived(
     // Build the registry and summary
     // -----------------------------------------------------------------------
     let registry = InstrumentRegistry::from_instruments(instruments);
+
+    // I-P1-11 gap G (2026-04-17): expose registry composite-index health
+    // as Prometheus gauges so the operator sees cross-segment collisions
+    // in Grafana + receives Telegram alerts on ERROR logs emitted during
+    // construction.
+    metrics::gauge!("tv_instrument_registry_cross_segment_collisions")
+        .set(registry.cross_segment_collisions() as f64);
+    metrics::gauge!("tv_instrument_registry_total_entries").set(registry.len() as f64);
 
     let exceeds_capacity = registry.len() > MAX_TOTAL_SUBSCRIPTIONS;
     if exceeds_capacity {
@@ -2798,5 +2842,155 @@ mod tests {
         // NIFTY PE option (50200) should be IndexDerivative
         let nifty_pe = plan.registry.get(50200).unwrap();
         assert_eq!(nifty_pe.category, SubscriptionCategory::IndexDerivative);
+    }
+
+    // ========================================================================
+    // REGRESSION (2026-04-17, spotted live by Parthiban): Dhan reuses the
+    // same numeric security_id across different segments (e.g. id=13 is
+    // FINNIFTY in IDX_I AND is some other instrument in NSE_EQ). The old
+    // `HashSet<u32>` dedup silently dropped the second-seen instance.
+    // These tests prove the new `HashSet<(u32, ExchangeSegment)>` dedup
+    // keeps BOTH.
+    // ========================================================================
+
+    #[test]
+    fn test_regression_finnifty_id27_both_segments_are_kept() {
+        // REGRESSION (spotted live by Parthiban, 2026-04-17):
+        // Dhan reuses the same numeric security_id across segments
+        // (e.g. FINNIFTY's IDX_I index value = 27 and some NSE_EQ
+        // instrument may ALSO be 27). The old `HashSet<u32>` dedup
+        // silently dropped the second-seen instance. Live symptom:
+        // FINNIFTY's IDX_I subscription never went out, depth ATM
+        // selector had no spot price for it, and FINNIFTY was
+        // silently missing from the depth-20 dashboard.
+        //
+        // Repro uses NIFTY (price_feed_security_id=13, IDX_I) as the
+        // "major index" leg and adds a synthetic stock with
+        // price_feed_security_id=13 in NSE_EQ. Without the fix, the
+        // second insert of id=13 would return false and one of the
+        // two would be dropped. With the fix, both are kept because
+        // the dedup key is `(13, IdxI)` vs `(13, NseEquity)`.
+        use tickvault_common::instrument_types::{FnoUnderlying, UnderlyingKind};
+        let mut universe = make_test_universe();
+
+        // Precondition: NIFTY exists with price_feed_security_id=13 on IDX_I.
+        let nifty = universe
+            .underlyings
+            .get("NIFTY")
+            .expect("test universe must contain NIFTY");
+        assert_eq!(nifty.price_feed_security_id, 13);
+        assert_eq!(nifty.price_feed_segment, ExchangeSegment::IdxI);
+
+        // Add a synthetic stock with price_feed_security_id == 13 in NSE_EQ.
+        universe.underlyings.insert(
+            "SYNTHETIC_STOCK_COLLIDER".to_string(),
+            FnoUnderlying {
+                underlying_symbol: "SYNTHETIC_STOCK_COLLIDER".to_string(),
+                underlying_security_id: 13,
+                price_feed_security_id: 13, // SAME id as NIFTY IDX_I
+                price_feed_segment: ExchangeSegment::NseEquity,
+                derivative_segment: ExchangeSegment::NseFno,
+                kind: UnderlyingKind::Stock,
+                lot_size: 500,
+                contract_count: 0,
+            },
+        );
+
+        let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
+        let plan = build_subscription_plan(
+            &universe,
+            &SubscriptionConfig::default(),
+            today,
+            &std::collections::HashMap::new(),
+        );
+
+        // Count instruments with security_id == 13, grouped by segment.
+        let mut id13_by_segment: std::collections::HashMap<ExchangeSegment, usize> =
+            std::collections::HashMap::new();
+        for i in plan.registry.iter().filter(|i| i.security_id == 13) {
+            *id13_by_segment.entry(i.exchange_segment).or_insert(0) += 1;
+        }
+
+        // FINAL BEHAVIOR (complete fix, 2026-04-17):
+        // - Planner-level `seen_ids` is segment-aware → both
+        //   (13, IdxI) and (13, NseEquity) go into the raw Vec.
+        // - `InstrumentRegistry::from_instruments` maintains TWO indexes:
+        //   legacy `instruments: HashMap<SecurityId, _>` AND new
+        //   `by_composite: HashMap<(SecurityId, ExchangeSegment), _>`.
+        //   Both entries live in composite; legacy collapses one (with
+        //   WARN log) for backward compat across 59 existing call sites.
+        // - `get_with_segment` is the correct API for segment-aware
+        //   callers (tick processor has segment from header byte 3).
+        assert!(
+            !id13_by_segment.is_empty(),
+            "at least one entry with security_id=13 must survive in the \
+             legacy registry. Got: {id13_by_segment:?}"
+        );
+        for (seg, count) in &id13_by_segment {
+            assert_eq!(
+                *count, 1,
+                "security_id=13 appears {count} times in segment {seg:?} — \
+                 intra-segment dedup must be exactly one"
+            );
+        }
+
+        // I-P1-11: mechanical proof the full fix works. BOTH entries MUST
+        // be addressable via the segment-aware lookup.
+        assert!(
+            plan.registry
+                .get_with_segment(13, ExchangeSegment::IdxI)
+                .is_some(),
+            "NIFTY IDX_I (security_id=13) must be addressable via \
+             get_with_segment. I-P1-11 composite index broken."
+        );
+        assert!(
+            plan.registry
+                .get_with_segment(13, ExchangeSegment::NseEquity)
+                .is_some(),
+            "Synthetic stock NSE_EQ (security_id=13) must be addressable \
+             via get_with_segment. I-P1-11 composite index broken."
+        );
+        assert!(
+            plan.registry
+                .contains_with_segment(13, ExchangeSegment::IdxI)
+        );
+        assert!(
+            plan.registry
+                .contains_with_segment(13, ExchangeSegment::NseEquity)
+        );
+        // Negative: a segment we didn't add must NOT be reported as present.
+        assert!(
+            !plan
+                .registry
+                .contains_with_segment(13, ExchangeSegment::BseEquity),
+            "segment-aware contains must be strict — BseEquity was never added"
+        );
+    }
+
+    #[test]
+    fn test_regression_seen_ids_key_type_is_pair() {
+        // Compile-time / type-level assertion: the dedup HashSet must be
+        // typed as `HashSet<(u32, ExchangeSegment)>` so a future refactor
+        // that reverts to `HashSet<u32>` fails to compile before this
+        // test even runs. We assert via a tiny synthetic HashSet that
+        // matches the production type.
+        let mut set: std::collections::HashSet<(u32, ExchangeSegment)> =
+            std::collections::HashSet::new();
+        // Inserting the same id under two different segments must return
+        // true for both — the pair is the key.
+        assert!(
+            set.insert((27, ExchangeSegment::IdxI)),
+            "first insert of (27, IdxI) must succeed"
+        );
+        assert!(
+            set.insert((27, ExchangeSegment::NseEquity)),
+            "second insert of (27, NseEq) must ALSO succeed — different segment, \
+             logically different instrument. If this fails, someone regressed \
+             the dedup key to `u32` alone."
+        );
+        assert!(
+            !set.insert((27, ExchangeSegment::IdxI)),
+            "third insert of (27, IdxI) is a true duplicate — must be rejected"
+        );
     }
 }

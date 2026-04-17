@@ -142,9 +142,17 @@ pub struct GreeksEmission {
 /// Phase B: on `CandleCloseEvent`, compute and emit Greeks/PCR snapshots.
 pub struct GreeksAggregator {
     /// Per-option state, updated on every F&O tick.
+    /// I-P1-11 context: option_state is keyed by F&O security_id;
+    /// populated only from NSE_FNO/BSE_FNO ticks inside
+    /// update_option_tick() after segment check.
+    // APPROVED: single-segment F&O-id cache — I-P1-11.
     option_state: HashMap<SecurityId, OptionTickState>,
 
     /// Underlying spot prices, updated on every IDX_I / NSE_EQ tick.
+    /// I-P1-11 context: each underlying_symbol owns a UNIQUE
+    /// price_feed_security_id (indices and equities never share id
+    /// across their own segments for distinct underlyings).
+    // APPROVED: single-segment underlying-id cache — I-P1-11.
     underlying_ltp: HashMap<SecurityId, f32>,
 
     /// Instrument registry for enrichment (shared, immutable).
@@ -360,8 +368,18 @@ impl GreeksAggregator {
             return;
         }
 
-        // Slow path: first tick for this security_id — enrich from registry
-        let inst = match self.registry.get(tick.security_id) {
+        // Slow path: first tick for this security_id — enrich from registry.
+        // I-P1-11 (2026-04-17): segment-aware lookup. Dhan reuses security_id
+        // across segments; the tick header carries the correct segment in
+        // `tick.exchange_segment_code` (byte 3 of the 8-byte header). Using
+        // the legacy `get(id)` would return a wrong-segment entry (e.g. a
+        // NIFTY IDX_I entry for an NSE_FNO derivative tick with same id) and
+        // produce incorrect Greeks.
+        let segment = match ExchangeSegment::from_byte(tick.exchange_segment_code) {
+            Some(s) => s,
+            None => return, // Invalid segment byte — skip defensively
+        };
+        let inst = match self.registry.get_with_segment(tick.security_id, segment) {
             Some(i) => i,
             None => return, // Not in registry (unlikely)
         };

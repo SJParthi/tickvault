@@ -43,6 +43,15 @@ use super::types::{ParseError, ParsedFrame};
 pub fn dispatch_frame(raw: &[u8], received_at_nanos: i64) -> Result<ParsedFrame, ParseError> {
     let header = parse_header(raw)?;
 
+    // Observability (§10.3): per-response-code packet counter so operators
+    // can trend traffic mix in Grafana without scraping logs. Labelled by
+    // the numeric code; the `unknown` bucket catches protocol drift.
+    metrics::counter!(
+        "tv_packets_by_response_code",
+        "code" => response_code_label(header.response_code)
+    )
+    .increment(1);
+
     match header.response_code {
         RESPONSE_CODE_INDEX_TICKER | RESPONSE_CODE_TICKER => {
             let tick = parse_ticker_packet(raw, &header, received_at_nanos)?;
@@ -88,7 +97,32 @@ pub fn dispatch_frame(raw: &[u8], received_at_nanos: i64) -> Result<ParsedFrame,
             let code = parse_disconnect_packet(raw, &header)?;
             Ok(ParsedFrame::Disconnect(code))
         }
-        code => Err(ParseError::UnknownResponseCode(code)),
+        code => {
+            // Observability (§10.3): protocol drift / Dhan sending a code
+            // we don't handle. ERROR-level log triggers Telegram via Loki.
+            metrics::counter!("tv_unknown_response_codes_total").increment(1);
+            Err(ParseError::UnknownResponseCode(code))
+        }
+    }
+}
+
+/// Returns a static label for `tv_packets_by_response_code`. Returns
+/// `&'static str` so Prometheus doesn't see a high-cardinality explosion
+/// from unknown codes — everything unrecognized maps to the `unknown`
+/// bucket (the actual numeric code is captured separately by
+/// `tv_unknown_response_codes_total`).
+fn response_code_label(code: u8) -> &'static str {
+    match code {
+        RESPONSE_CODE_INDEX_TICKER => "index_ticker",
+        RESPONSE_CODE_TICKER => "ticker",
+        RESPONSE_CODE_MARKET_DEPTH => "market_depth_v1",
+        RESPONSE_CODE_QUOTE => "quote",
+        RESPONSE_CODE_OI => "oi",
+        RESPONSE_CODE_PREVIOUS_CLOSE => "prev_close",
+        RESPONSE_CODE_MARKET_STATUS => "market_status",
+        RESPONSE_CODE_FULL => "full",
+        RESPONSE_CODE_DISCONNECT => "disconnect",
+        _ => "unknown",
     }
 }
 

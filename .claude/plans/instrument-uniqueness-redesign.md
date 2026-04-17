@@ -1,8 +1,8 @@
 # Implementation Plan: Instrument Tables — Single-Row-Per-Instrument Redesign
 
-**Status:** DRAFT — awaiting Parthiban approval
+**Status:** APPROVED
 **Date:** 2026-04-17
-**Approved by:** pending
+**Approved by:** Parthiban (2026-04-17)
 
 ## Problem (Parthiban, 2026-04-17)
 

@@ -96,7 +96,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT count() AS total FROM fno_underlyings WHERE timestamp = (SELECT max(timestamp) FROM fno_underlyings);",
+          "rawSql": "SELECT count() AS total FROM fno_underlyings WHERE status = 'active';",
           "refId": "A"
         }
       ]
@@ -121,7 +121,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT count() AS total FROM derivative_contracts WHERE timestamp = (SELECT max(timestamp) FROM derivative_contracts);",
+          "rawSql": "SELECT count() AS total FROM derivative_contracts WHERE status = 'active';",
           "refId": "A"
         }
       ]
@@ -146,7 +146,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT count() AS total FROM subscribed_indices WHERE timestamp = (SELECT max(timestamp) FROM subscribed_indices);",
+          "rawSql": "SELECT count() AS total FROM subscribed_indices WHERE status = 'active';",
           "refId": "A"
         }
       ]
@@ -171,7 +171,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT count_distinct(security_id) AS total FROM ticks;",
+          "rawSql": "SELECT count(*) AS total FROM (SELECT DISTINCT security_id, segment FROM ticks);",
           "refId": "A"
         }
       ]
@@ -433,7 +433,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT\n  underlying_symbol,\n  underlying_security_id,\n  price_feed_segment,\n  price_feed_security_id,\n  derivative_segment,\n  kind,\n  lot_size,\n  contract_count,\n  to_str(timestamp, 'yyyy-MM-dd') AS loaded_at\nFROM fno_underlyings\nWHERE timestamp = (SELECT max(timestamp) FROM fno_underlyings)\nORDER BY underlying_symbol;",
+          "rawSql": "SELECT\n  underlying_symbol,\n  status,\n  underlying_security_id,\n  price_feed_segment,\n  price_feed_security_id,\n  derivative_segment,\n  kind,\n  lot_size,\n  contract_count,\n  to_str(last_seen_date, 'yyyy-MM-dd') AS last_seen,\n  to_str(expired_date, 'yyyy-MM-dd') AS expired_on\nFROM fno_underlyings\nWHERE status = 'active'\nORDER BY underlying_symbol;",
           "refId": "A"
         }
       ]
@@ -475,7 +475,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT\n  underlying_symbol,\n  instrument_kind,\n  exchange_segment,\n  security_id,\n  symbol_name,\n  option_type,\n  strike_price,\n  expiry_date,\n  lot_size,\n  display_name,\n  to_str(timestamp, 'yyyy-MM-dd') AS loaded_at\nFROM derivative_contracts\nWHERE timestamp = (SELECT max(timestamp) FROM derivative_contracts)\nORDER BY underlying_symbol, expiry_date, strike_price\nLIMIT 1000;",
+          "rawSql": "SELECT\n  underlying_symbol,\n  instrument_kind,\n  status,\n  exchange_segment,\n  security_id,\n  symbol_name,\n  option_type,\n  strike_price,\n  expiry_date,\n  lot_size,\n  display_name,\n  to_str(last_seen_date, 'yyyy-MM-dd') AS last_seen,\n  to_str(expired_date, 'yyyy-MM-dd') AS expired_on\nFROM derivative_contracts\nWHERE status = 'active'\nORDER BY underlying_symbol, expiry_date, strike_price\nLIMIT 1000;",
           "refId": "A"
         }
       ]
@@ -519,7 +519,7 @@
           "editorMode": "code",
           "format": "table",
           "rawQuery": true,
-          "rawSql": "SELECT\n  symbol,\n  security_id,\n  exchange,\n  category,\n  subcategory,\n  to_str(timestamp, 'yyyy-MM-dd') AS loaded_at\nFROM subscribed_indices\nWHERE timestamp = (SELECT max(timestamp) FROM subscribed_indices)\nORDER BY symbol;",
+          "rawSql": "SELECT\n  symbol,\n  status,\n  security_id,\n  exchange,\n  category,\n  subcategory,\n  to_str(last_seen_date, 'yyyy-MM-dd') AS last_seen,\n  to_str(expired_date, 'yyyy-MM-dd') AS expired_on\nFROM subscribed_indices\nWHERE status = 'active'\nORDER BY symbol;",
           "refId": "A"
         }
       ]

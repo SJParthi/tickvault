@@ -444,14 +444,33 @@ PascalCase top-level keys.
 | 27 | (L3) 200-level 40s timeout too aggressive | Watchdog threshold is 50s (40s Dhan + 10s margin) — correct | 2026-04-16 |
 | 28 | (L4-L7) Config/doc-only items | All handled via config or existing mechanisms — no code changes needed | 2026-04-16 |
 | 29 | (H4) No hex dump for unparseable packets | Added hex dump of first 64 bytes at ERROR level every 10th error + WARN with hex for others | 2026-04-16 |
+| 30 | FAST BOOT path emitted zero `WebSocketConnected` Telegram alerts | Extracted `emit_websocket_connected_alerts(notifier, count)` helper, called from BOTH boot paths; added `WebSocketPoolOnline { connected, total }` summary event to survive Telegram rate-limit drops; mechanical guard test `crates/app/tests/boot_path_notify_parity.rs` | 2026-04-17 |
+| 31 | Pool watchdog `Degraded` + `Recovered` verdicts silently discarded (only `Halt` was handled) | `spawn_pool_watchdog_task` now takes a notifier and fires `WebSocketPoolDegraded`, `WebSocketPoolRecovered`, `WebSocketPoolHalt` events with matching counters | 2026-04-17 |
+| 32 | Depth index-LTP 30s timeout warned only via `warn!` — no Telegram, no ERROR log | Promoted to `error!` (auto-telegrams via Loki pipeline) and fires typed `NotificationEvent::DepthIndexLtpTimeout { waited_secs }` event | 2026-04-17 |
+| 33 | (O3) Depth rebalancer could swap to wrong ATM if index LTP feed stalled — no freshness check on `SharedSpotPrices` | `SharedSpotPrices` now stores `SpotPriceEntry { price, updated_at }`. Rebalancer reads via `get_spot_price_entry`; if age ≥ 180s, skips + fires `DepthSpotPriceStale { underlying, age_secs }`. Counter `tv_depth_rebalancer_stale_spot_skips_total`. 6 new tests. | 2026-04-17 |
+| 34 | (O2) `OrderUpdateConnected` fired on task spawn, not after Dhan auth ACK — operator saw "connected" seconds before orders were being processed | New `OrderUpdateAuthenticated { }` event fires exactly once per process lifetime via a `Notify` + `AtomicBool` CAS latch on first successful `parse_order_update` OR first `AuthResponseKind::Success`. 4 new tests. | 2026-04-17 |
+| 35 | (O1-A) No Phase 2 scheduler — 09:12 IST spec was documented but zero code ran at that time | New `phase2_scheduler.rs` with pure `next_phase2_trigger` decision fn covering weekday / weekend / holiday / before-912 / at-912 / crash-recovery / late-start / post-market cases. `run_phase2_scheduler` async driver waits for LTPs (3 retries × 30s), emits `Phase2Started / Phase2RunImmediate / Phase2Complete / Phase2Failed / Phase2Skipped` events + `tv_phase2_runs_total{outcome}` + `tv_phase2_run_ms` histogram. Wired into the depth-rebalancer spawn block (runs on both boot paths). 15 new tests. Actual subscribe dispatch is the still-open O1-B. | 2026-04-17 |
 
 ### 10.2 Open Gaps
 
-#### CRITICAL
+#### HIGH — Not Yet Implemented
 
-*No open critical gaps.*
+| # | Gap | Design Sketch | Est. Effort |
+|---|-----|---------------|-------------|
+| O1-B | **9:12 AM Phase 2 stock F&O subscription plumbing** — O1-A (scheduler + events) landed in commit TBD. The scheduler correctly wakes at 09:12 IST (or runs immediately on late-start / crash-recovery), waits for LTPs, retries up to 3×, and emits `Phase2Complete { added_count }` / `Phase2Failed`. The remaining work is the **actual `SubscribeCommand` channel** on each main-feed `WebSocketConnection` (mirrors depth's `DepthCommand`): new `mpsc::Receiver<SubscribeCommand>` integrated into the `run()` `select!` loop, pool-level fan-out to the connection with spare capacity, delta computation from boot plan to new plan. | 1 day |
+| ~~O2~~ | ~~OrderUpdateConnected fires on task spawn, not after successful auth ACK~~ | **✅ CLOSED 2026-04-17 (O2)** — new `OrderUpdateAuthenticated` event fires once per process lifetime after first successful parse or Dhan ACK. | — |
+| ~~O3~~ | ~~Stale spot-price detection on depth rebalancer~~ | **✅ CLOSED 2026-04-17 (O3)** — `SharedSpotPrices` now stores `(price, updated_at: Instant)`. Rebalancer skips + emits `DepthSpotPriceStale` if age > 180s. | — |
 
-*No open gaps. All items resolved as of 2026-04-16.*
+#### MEDIUM — Observability
+
+| # | Gap | Fix Shape |
+|---|-----|-----------|
+| M1 | Missing metrics per §10.3 (5 metrics) | Add counters/gauges, increment at relevant sites |
+| M2 | Missing tests per §10.4 (6 tests) | Add integration tests in `crates/core/tests/` |
+
+#### ACCEPTED (No Open Critical Gaps)
+
+*No open critical gaps as of 2026-04-17.*
 
 #### ACCEPTED (Dhan Limitation / Design Decision)
 
@@ -467,14 +486,19 @@ PascalCase top-level keys.
 
 ### 10.3 Missing Metrics
 
-| Metric | Purpose |
-|--------|---------|
-| `tv_websocket_pool_all_dead` | Bool gauge: true if all 5 main feed connections are down |
-| `tv_websocket_failed_connections_count` | Gauge: number of connections in Reconnecting state |
-| `tv_depth_20lvl_sequence_gaps_total` | Counter: detected sequence gaps in 20-level packets |
-| `tv_order_update_non_order_messages_dropped_total` | Counter: JSON messages that weren't order updates |
-| `tv_unknown_response_codes_total` | Counter: Dhan sent a response code we don't recognize |
-| `tv_packets_by_response_code` | Histogram: breakdown of all received packet types |
+| Metric | Purpose | Status |
+|--------|---------|--------|
+| `tv_websocket_pool_all_dead` | Bool gauge: true if all 5 main feed connections are down | ✅ **landed 2026-04-17** — set in `pool_watchdog::PoolWatchdog::tick` every 5s |
+| `tv_websocket_failed_connections_count` | Gauge: number of connections in Reconnecting state | ✅ **landed 2026-04-17** — set in `pool_watchdog::PoolWatchdog::tick` |
+| `tv_depth_rebalancer_stale_spot_skips_total` | Counter: rebalance cycles skipped due to stale spot (O3) | ✅ **landed 2026-04-17** |
+| `tv_phase2_runs_total{outcome}` | Counter: Phase 2 scheduler outcomes (O1-A) | ✅ **landed 2026-04-17** |
+| `tv_phase2_run_ms` | Histogram: Phase 2 scheduler run duration | ✅ **landed 2026-04-17** |
+| `tv_pool_degraded_alerts_total` | Counter: 60s-all-down Telegrams fired | ✅ **landed 2026-04-17** |
+| `tv_pool_recoveries_total` | Counter: pool-recovered transitions | ✅ **landed 2026-04-17** |
+| `tv_depth_20lvl_sequence_gaps_total` | Counter: detected sequence gaps in 20-level packets | ✅ **landed 2026-04-17** — `tick_processor.rs` per-`(security_id, side)` tracker, increments when `message_sequence != prev + 1` |
+| `tv_order_update_non_order_messages_dropped_total` | Counter: JSON messages that weren't order updates | ✅ tracked via existing `tv_order_update_non_order_messages_total` |
+| `tv_unknown_response_codes_total` | Counter: Dhan sent a response code we don't recognize | ✅ **landed 2026-04-17** — dispatcher `_` arm increments before returning `ParseError::UnknownResponseCode` |
+| `tv_packets_by_response_code` | Counter (labelled): breakdown of all received packet types | ✅ **landed 2026-04-17** — labelled counter, every dispatch increments the matching label (`ticker`, `quote`, `full`, `oi`, `prev_close`, `market_status`, `disconnect`, `market_depth_v1`, `index_ticker`, or `unknown`) |
 
 ### 10.4 Missing Tests
 

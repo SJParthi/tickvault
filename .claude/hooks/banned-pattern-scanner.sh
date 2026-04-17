@@ -259,6 +259,115 @@ scan_prod_code '"wss://full-depth-api\.dhan\.co/?' \
   "$STAGED_FILES"
 
 # ─────────────────────────────────────────────
+# CATEGORY 5: I-P1-11 segment-aware security_id uniqueness
+# ─────────────────────────────────────────────
+#
+# Dhan reuses numeric security_id across different ExchangeSegment values
+# (e.g. NIFTY IDX_I id=13 vs some NSE_EQ id=13). Any collection keyed on
+# security_id ALONE silently drops one of the two — leading to missing
+# WebSocket subscriptions, wrong tick enrichment, and silent data loss.
+#
+# Every HashSet<u32> / HashSet<SecurityId> / HashMap<u32, _> / HashMap<SecurityId, _>
+# in instrument-handling paths must either:
+#  (a) use the composite key (u32, ExchangeSegment) / (SecurityId, ExchangeSegment), OR
+#  (b) carry a `// APPROVED: single-segment context — <reason>` comment
+#      proving every value belongs to one known segment.
+#
+# Scope: paths where cross-segment instruments can appear.
+scan_instrument_paths() {
+  local pattern="$1"
+  local description="$2"
+  local files="$3"
+  local instrument_files
+
+  instrument_files=$(echo "$files" | grep -E \
+    '^crates/(common|core|trading)/src/(instrument|pipeline|websocket|greeks)/|^crates/common/src/instrument_registry\.rs$' \
+    || true)
+  if [ -z "$instrument_files" ]; then
+    return
+  fi
+
+  scan_prod_code "$pattern" "$description" "$instrument_files"
+}
+
+# Ban single-key collections on u32 / SecurityId — the exact bug class from
+# Parthiban's 2026-04-17 live finding (NIFTY IDX_I id=13 dropped).
+scan_instrument_paths 'HashSet<u32>' \
+  'I-P1-11: HashSet<u32> — use HashSet<(u32, ExchangeSegment)> or add // APPROVED: comment' \
+  "$STAGED_FILES"
+scan_instrument_paths 'HashSet<SecurityId>' \
+  'I-P1-11: HashSet<SecurityId> — use HashSet<(SecurityId, ExchangeSegment)> or add // APPROVED: comment' \
+  "$STAGED_FILES"
+scan_instrument_paths 'HashMap<u32,' \
+  'I-P1-11: HashMap<u32, _> — use HashMap<(u32, ExchangeSegment), _> or add // APPROVED: comment' \
+  "$STAGED_FILES"
+scan_instrument_paths 'HashMap<SecurityId,' \
+  'I-P1-11: HashMap<SecurityId, _> — use HashMap<(SecurityId, ExchangeSegment), _> or add // APPROVED: comment' \
+  "$STAGED_FILES"
+
+# Also ban legacy registry.get(id) / registry.contains(id) in production
+# — use get_with_segment / contains_with_segment. Single-segment callers
+# that genuinely cannot know the segment must add // APPROVED: comment.
+scan_instrument_paths '\.registry\.get([^_]' \
+  'I-P1-11: registry.get(id) — use registry.get_with_segment(id, segment) or add // APPROVED: comment' \
+  "$STAGED_FILES"
+scan_instrument_paths '\.registry\.contains([^_]' \
+  'I-P1-11: registry.contains(id) — use registry.contains_with_segment(id, segment) or add // APPROVED: comment' \
+  "$STAGED_FILES"
+
+# ─────────────────────────────────────────────
+# CATEGORY 6: LIVE-FEED PURITY (Parthiban directive 2026-04-17)
+# ─────────────────────────────────────────────
+#
+# "nowhere the backfill should happen ... live market feed should contain
+#  only live market feed data alone ... historical candle data fetch is a
+#  separate functionality"
+#
+# Hard ban on synthesising ticks from historical candles and writing them
+# into the `ticks` QuestDB table. The BackfillWorker module was DELETED
+# on 2026-04-17; these patterns block anyone from re-introducing it.
+#
+# Rule: `ticks` table is populated EXCLUSIVELY by WebSocket-sourced
+# `ParsedTick` structs flowing through `crates/core/src/pipeline/`.
+# Historical candle data lives in `historical_candles` + `candles_*`
+# materialized views and MUST NOT cross into `ticks`.
+
+scan_live_feed_purity() {
+  local pattern="$1"
+  local description="$2"
+  local files="$3"
+  local target_files
+
+  # Ban applies to the `historical/` module tree and any new REST backfill path.
+  target_files=$(echo "$files" | grep -E \
+    '^crates/core/src/historical/|^crates/(core|trading|app)/src/.*/(backfill|synth)' \
+    || true)
+  if [ -z "$target_files" ]; then
+    return
+  fi
+
+  scan_prod_code "$pattern" "$description" "$target_files"
+}
+
+# Hard bans — these symbols MUST NOT appear inside any historical/ or
+# backfill-named file. If they reappear, the backfill worker is being
+# re-introduced and the commit is blocked.
+scan_live_feed_purity 'TickPersistenceWriter' \
+  'LIVE-FEED-PURITY: TickPersistenceWriter MUST NOT be used from historical/backfill paths (2026-04-17 directive). ticks table = live WS data only.' \
+  "$STAGED_FILES"
+scan_live_feed_purity 'append_tick\b' \
+  'LIVE-FEED-PURITY: append_tick() MUST NOT be called from historical/backfill paths. Historical data belongs in historical_candles only.' \
+  "$STAGED_FILES"
+scan_live_feed_purity 'BackfillWorker\|run_backfill\|synthesize_ticks' \
+  'LIVE-FEED-PURITY: BackfillWorker / synth-tick pipeline was DELETED 2026-04-17. Re-introducing it is forbidden by Parthiban directive.' \
+  "$STAGED_FILES"
+
+# Also ban the historical module re-exporting a `backfill` submodule.
+scan_prod_code 'pub mod backfill' \
+  'LIVE-FEED-PURITY: pub mod backfill is banned — the module was DELETED 2026-04-17.' \
+  "$STAGED_FILES"
+
+# ─────────────────────────────────────────────
 # RESULT
 # ─────────────────────────────────────────────
 

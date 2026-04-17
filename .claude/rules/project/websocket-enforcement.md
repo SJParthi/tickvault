@@ -74,9 +74,8 @@ paths:
 
 Any change to WebSocket code must check the open gaps in `docs/architecture/websocket-complete-reference.md` Section 10.2 and not introduce regressions.
 
-Key open gaps:
-- `WebSocketDisconnected` event not wired for main feed (H1)
-- No pool-level circuit breaker for main feed (H2)
+Key open gaps (high severity — see ref §10.2 for design sketches):
+- **O1-B** — Phase 2 `SubscribeCommand` channel on main-feed `WebSocketConnection` (scheduler + events shipped in O1-A, 2026-04-17; actual subscribe dispatch is the remaining piece)
 
 Resolved gaps:
 - Telegram now fires on first data frame (not just subscription) — fixed 2026-04-09
@@ -88,6 +87,9 @@ Resolved gaps:
 - Depth strike selector picking wrong strikes — fixed 2026-04-16 (real ATM from index LTP)
 - Backfill worker injecting synthetic ticks — fixed 2026-04-16 (disabled)
 - Post-market stale ticks — fixed 2026-04-16 (wall-clock guard)
+- FAST BOOT emitted zero `WebSocketConnected` alerts — fixed 2026-04-17 (shared helper + guard test)
+- Pool watchdog `Degraded`/`Recovered` verdicts silently discarded — fixed 2026-04-17 (typed events wired)
+- Depth index-LTP timeout warned silently — fixed 2026-04-17 (ERROR + `DepthIndexLtpTimeout` event)
 
 ## What This Prevents
 

@@ -44,6 +44,26 @@ pub enum Severity {
     Critical,
 }
 
+impl Severity {
+    /// UX tag prefixed to every Telegram message so the operator can
+    /// instantly tell at-a-glance how urgent an alert is. Added 2026-04-17
+    /// after Parthiban noted he couldn't distinguish boot-progress pings
+    /// from real incidents without reading the full message body.
+    ///
+    /// Mapping: emoji icon + square-bracket tag + exact severity name.
+    /// Operator workflow: any `[HIGH]` or `[CRITICAL]` message goes to
+    /// Claude Code for debugging; `[INFO]`/`[LOW]`/`[MEDIUM]` is scroll-by.
+    pub fn tag(&self) -> &'static str {
+        match self {
+            Self::Info => "\u{2139}\u{fe0f} [INFO]",  // ℹ️
+            Self::Low => "\u{2705} [LOW]",            // ✅
+            Self::Medium => "\u{1f535} [MEDIUM]",     // 🔵
+            Self::High => "\u{26a0}\u{fe0f} [HIGH]",  // ⚠️
+            Self::Critical => "\u{1f6a8} [CRITICAL]", // 🚨
+        }
+    }
+}
+
 /// All events that produce a Telegram alert.
 ///
 /// Adding a new event: add a variant here, add its message arm in
@@ -70,6 +90,75 @@ pub enum NotificationEvent {
 
     /// WebSocket connection established.
     WebSocketConnected { connection_index: usize },
+
+    /// Aggregate summary of the live-market-feed pool after spawn.
+    /// Emitted once per boot path so operators survive Telegram rate-limit
+    /// drops of the per-connection `WebSocketConnected` events.
+    /// `total` is the expected count (== connected on healthy boot).
+    WebSocketPoolOnline { connected: usize, total: usize },
+
+    /// Pool-level CRITICAL alert: every connection has been down longer than
+    /// `POOL_DEGRADED_ALERT_SECS` (default 60). One alert per down-cycle.
+    /// Fired by the pool watchdog on `WatchdogVerdict::Degraded`.
+    WebSocketPoolDegraded { down_secs: u64 },
+
+    /// Pool-level INFO: the pool recovered from an all-down state.
+    /// Fired on `WatchdogVerdict::Recovered`.
+    WebSocketPoolRecovered { was_down_secs: u64 },
+
+    /// Pool-level FATAL: down longer than `POOL_HALT_SECS` (default 300).
+    /// The process will exit with status 2 so the supervisor restarts.
+    /// Fired on `WatchdogVerdict::Halt`.
+    WebSocketPoolHalt { down_secs: u64 },
+
+    /// Depth setup timed out waiting for the main-feed index LTPs needed
+    /// for ATM strike selection. Depth connections proceed with a fallback
+    /// strike (median). `waited_secs` reflects how long we waited before
+    /// giving up.
+    DepthIndexLtpTimeout { waited_secs: u64 },
+
+    /// Option C (2026-04-17): Depth setup dropped a specific underlying —
+    /// the grace window expired without a valid spot price OR the option
+    /// chain was missing. Complements `DepthIndexLtpTimeout` which fires
+    /// once for the bundle; this fires per missing underlying so operators
+    /// see exactly which ones were skipped (e.g. FINNIFTY).
+    DepthUnderlyingMissing { underlying: String, reason: String },
+
+    /// O3 (2026-04-17): The depth rebalancer detected a stale spot price
+    /// for this underlying and skipped the rebalance decision. A stale
+    /// price likely means the main-feed WebSocket isn't delivering index
+    /// LTPs for this symbol — acting on it would swap the 200-level
+    /// connection to the wrong ATM strike. `age_secs` is the observed age
+    /// at the moment of detection.
+    DepthSpotPriceStale { underlying: String, age_secs: u64 },
+
+    /// O1 (2026-04-17): The Phase 2 scheduler woke up to do its run.
+    /// `minutes_late` = 0 on the normal 09:12 path, > 0 when fired via the
+    /// `RunImmediate` recovery path (crash mid-market or fresh late start).
+    Phase2Started { minutes_late: u64 },
+
+    /// O1: The Phase 2 scheduler fired via the `RunImmediate` path instead
+    /// of the normal 09:12 schedule — this is informational so operators
+    /// know the system crashed or started late and is catching up.
+    Phase2RunImmediate { minutes_late: u64 },
+
+    /// O1: Phase 2 completed — stock F&O delta was issued. `added_count`
+    /// is the number of instruments that would have been subscribed
+    /// (until the SubscribeCommand plumbing lands the count is best-effort
+    /// based on the precomputed plan).
+    Phase2Complete {
+        added_count: usize,
+        duration_ms: u64,
+    },
+
+    /// O1: Phase 2 failed — LTPs never arrived within `MAX_LTP_ATTEMPTS`
+    /// × `LTP_WAIT_SECS_PER_ATTEMPT`. Stock F&O remains unsubscribed for
+    /// this session. Operator should investigate the main-feed WebSocket.
+    Phase2Failed { reason: String, attempts: u32 },
+
+    /// O1: Phase 2 was skipped today (weekend, holiday, or post-market
+    /// restart). Low-noise — informational only.
+    Phase2Skipped { reason: String },
 
     /// WebSocket disconnected (unexpected, will reconnect).
     WebSocketDisconnected {
@@ -104,6 +193,14 @@ pub enum NotificationEvent {
 
     /// Order update WebSocket connected.
     OrderUpdateConnected,
+
+    /// O2 (2026-04-17): Order Update WebSocket has completed the Dhan auth
+    /// handshake — fires exactly once per process lifetime when the server
+    /// sends the first message that classifies as `AuthResponseKind::Success`
+    /// OR the first successful `parse_order_update`. This is the earliest
+    /// proof Dhan accepted the token; the earlier `OrderUpdateConnected`
+    /// event only signals that the tokio task started.
+    OrderUpdateAuthenticated,
 
     /// Order update WebSocket disconnected.
     OrderUpdateDisconnected { reason: String },
@@ -352,16 +449,108 @@ impl NotificationEvent {
                 )
             }
             Self::WebSocketConnected { connection_index } => {
-                format!("<b>WebSocket #{connection_index} connected</b>")
+                // UX fix 2026-04-17: display as 1-indexed (WebSocket 1/5)
+                // so operators read a natural 1..N range instead of 0..N-1.
+                // Internal `connection_index` stays 0-based (array index).
+                let display = connection_index.saturating_add(1);
+                let total = tickvault_common::constants::MAX_WEBSOCKET_CONNECTIONS;
+                format!("<b>WebSocket {display}/{total} connected</b>")
+            }
+            Self::WebSocketPoolOnline { connected, total } => {
+                format!("<b>WS pool online:</b> {connected}/{total} connected")
+            }
+            Self::WebSocketPoolDegraded { down_secs } => {
+                format!(
+                    "<b>WS POOL DEGRADED</b>\nAll connections down for {down_secs}s. \
+                     Investigate immediately."
+                )
+            }
+            Self::WebSocketPoolRecovered { was_down_secs } => {
+                format!(
+                    "<b>WS pool recovered</b>\nAll connections back up (was down {was_down_secs}s)."
+                )
+            }
+            Self::WebSocketPoolHalt { down_secs } => {
+                format!(
+                    "<b>WS POOL HALT</b>\nAll connections down for {down_secs}s. \
+                     Exiting process so the supervisor restarts us."
+                )
+            }
+            Self::DepthIndexLtpTimeout { waited_secs } => {
+                format!(
+                    "<b>Depth ATM timeout</b>\nWaited {waited_secs}s for index LTPs \
+                     — proceeding with partial set. See DepthUnderlyingMissing \
+                     alerts for the specific symbols that were dropped."
+                )
+            }
+            Self::DepthUnderlyingMissing { underlying, reason } => {
+                format!(
+                    "<b>Depth underlying missing</b>\nUnderlying: {underlying}\n\
+                     Reason: {reason}\nDepth connections for this symbol were NOT \
+                     spawned this boot — feed will have no order-book depth for \
+                     {underlying} until the next restart."
+                )
+            }
+            Self::DepthSpotPriceStale {
+                underlying,
+                age_secs,
+            } => {
+                format!(
+                    "<b>Depth spot price STALE</b>\nUnderlying: {underlying}\n\
+                     Age: {age_secs}s (threshold 180s). Depth rebalance skipped — \
+                     main-feed LTP feed may be stalled for this symbol."
+                )
+            }
+            Self::Phase2Started { minutes_late } => {
+                if *minutes_late == 0 {
+                    "<b>Phase 2 started</b>\nSubscribing stock F&O (09:12 IST trigger).".to_string()
+                } else {
+                    format!(
+                        "<b>Phase 2 started</b>\nSubscribing stock F&O — {minutes_late} min late \
+                         (crash-recovery or late-start path)."
+                    )
+                }
+            }
+            Self::Phase2RunImmediate { minutes_late } => {
+                format!(
+                    "<b>Phase 2 RunImmediate</b>\n{minutes_late} min past 09:12 IST — \
+                     running now to catch up after restart."
+                )
+            }
+            Self::Phase2Complete {
+                added_count,
+                duration_ms,
+            } => {
+                format!(
+                    "<b>Phase 2 complete</b>\nAdded {added_count} stock F&O instruments \
+                     in {duration_ms} ms."
+                )
+            }
+            Self::Phase2Failed { reason, attempts } => {
+                format!(
+                    "<b>Phase 2 FAILED</b> after {attempts} attempts\n{reason}\n\
+                     Stock F&O remains unsubscribed for this session — investigate main feed."
+                )
+            }
+            Self::Phase2Skipped { reason } => {
+                format!("<b>Phase 2 skipped</b>\n{reason}")
             }
             Self::WebSocketDisconnected {
                 connection_index,
                 reason,
             } => {
-                format!("<b>WebSocket #{connection_index} disconnected</b>\n{reason}")
+                format!(
+                    "<b>WebSocket {}/{} disconnected</b>\n{reason}",
+                    connection_index.saturating_add(1),
+                    tickvault_common::constants::MAX_WEBSOCKET_CONNECTIONS
+                )
             }
             Self::WebSocketReconnected { connection_index } => {
-                format!("<b>WebSocket #{connection_index} reconnected</b>")
+                format!(
+                    "<b>WebSocket {}/{} reconnected</b>",
+                    connection_index.saturating_add(1),
+                    tickvault_common::constants::MAX_WEBSOCKET_CONNECTIONS
+                )
             }
             Self::DepthTwentyConnected { underlying } => {
                 format!("<b>Depth 20-level connected</b>\nUnderlying: {underlying}")
@@ -387,6 +576,10 @@ impl NotificationEvent {
                 )
             }
             Self::OrderUpdateConnected => "<b>Order Update WS connected</b>".to_string(),
+            Self::OrderUpdateAuthenticated => {
+                "<b>Order Update WS authenticated</b>\nDhan accepted token — streaming live."
+                    .to_string()
+            }
             Self::OrderUpdateDisconnected { reason } => {
                 format!("<b>Order Update WS DISCONNECTED</b>\n{reason}")
             }
@@ -644,7 +837,9 @@ impl NotificationEvent {
                 attempts,
             } => {
                 format!(
-                    "<b>WebSocket #{connection_index} RECONNECTION EXHAUSTED</b>\nAttempts: {attempts}\nNo market data"
+                    "<b>WebSocket {}/{} RECONNECTION EXHAUSTED</b>\nAttempts: {attempts}\nNo market data",
+                    connection_index.saturating_add(1),
+                    tickvault_common::constants::MAX_WEBSOCKET_CONNECTIONS
                 )
             }
             Self::TokenRenewalDeadlineMissed { deadline_hour_ist } => {
@@ -717,9 +912,22 @@ impl NotificationEvent {
             Self::ShutdownInitiated => Severity::Medium,
             Self::CircuitBreakerClosed => Severity::Medium,
             Self::WebSocketConnected { .. } => Severity::Low,
+            Self::WebSocketPoolOnline { .. } => Severity::Medium,
+            Self::WebSocketPoolDegraded { .. } => Severity::High,
+            Self::WebSocketPoolRecovered { .. } => Severity::Medium,
+            Self::WebSocketPoolHalt { .. } => Severity::High,
+            Self::DepthIndexLtpTimeout { .. } => Severity::High,
+            Self::DepthUnderlyingMissing { .. } => Severity::High,
+            Self::DepthSpotPriceStale { .. } => Severity::High,
+            Self::Phase2Started { .. } => Severity::Medium,
+            Self::Phase2RunImmediate { .. } => Severity::Medium,
+            Self::Phase2Complete { .. } => Severity::Medium,
+            Self::Phase2Failed { .. } => Severity::High,
+            Self::Phase2Skipped { .. } => Severity::Low,
             Self::DepthTwentyConnected { .. } => Severity::Low,
             Self::DepthTwoHundredConnected { .. } => Severity::Low,
             Self::OrderUpdateConnected => Severity::Low,
+            Self::OrderUpdateAuthenticated => Severity::Medium,
             Self::TokenRenewed => Severity::Low,
             Self::IpVerificationSuccess { .. } => Severity::Low,
             Self::AuthenticationSuccess => Severity::Low,
@@ -842,32 +1050,35 @@ mod tests {
 
     #[test]
     fn test_websocket_connected_includes_index() {
+        // UX fix 2026-04-17: display is 1-indexed (connection_index=2 → "3/5")
         let event = NotificationEvent::WebSocketConnected {
             connection_index: 2,
         };
         let msg = event.to_message();
-        assert!(msg.contains("2"));
+        assert!(msg.contains("3"), "1-indexed display: 2 -> 3; got: {msg}");
         assert!(msg.contains("connected"));
     }
 
     #[test]
     fn test_websocket_disconnected_includes_index_and_reason() {
+        // UX fix 2026-04-17: display is 1-indexed (connection_index=1 → "2/5")
         let event = NotificationEvent::WebSocketDisconnected {
             connection_index: 1,
             reason: "connection reset by peer".to_string(),
         };
         let msg = event.to_message();
-        assert!(msg.contains("1"));
+        assert!(msg.contains("2"), "1-indexed display: 1 -> 2; got: {msg}");
         assert!(msg.contains("connection reset by peer"));
     }
 
     #[test]
     fn test_websocket_reconnected_includes_index() {
+        // UX fix 2026-04-17: display is 1-indexed (connection_index=0 → "1/5")
         let event = NotificationEvent::WebSocketReconnected {
             connection_index: 0,
         };
         let msg = event.to_message();
-        assert!(msg.contains("0"));
+        assert!(msg.contains("1"), "1-indexed display: 0 -> 1; got: {msg}");
         assert!(msg.contains("reconnected"));
     }
 
@@ -1483,13 +1694,17 @@ mod tests {
 
     #[test]
     fn test_ws_reconnection_exhausted_notification() {
+        // UX fix 2026-04-17: display is 1-indexed "3/5" (no # prefix).
         let event = NotificationEvent::WebSocketReconnectionExhausted {
             connection_index: 2,
             attempts: 10,
         };
         let msg = event.to_message();
         assert!(msg.contains("RECONNECTION EXHAUSTED"));
-        assert!(msg.contains("#2"));
+        assert!(
+            msg.contains("3/"),
+            "1-indexed display: 2 -> 3/N; got: {msg}"
+        );
         assert!(msg.contains("10"));
         assert_eq!(event.severity(), Severity::Critical);
     }
@@ -1734,17 +1949,20 @@ mod tests {
 
     #[test]
     fn test_cross_match_failed_truncates_long_mismatch_details() {
-        let details: Vec<String> = (0..20).map(|i| format!("mismatch {i}")).collect();
+        // Truncation limit raised to 50 in a previous refactor; update the
+        // test to match. Test now uses 60 entries so the +10 more overflow
+        // is still exercised.
+        let details: Vec<String> = (0..60).map(|i| format!("mismatch {i}")).collect();
         let event = NotificationEvent::CandleCrossMatchFailed {
             candles_compared: 100,
-            mismatches: 20,
+            mismatches: 60,
             missing_live: 0,
             mismatch_details: details,
         };
         let msg = event.to_message();
         assert!(msg.contains("mismatch 0"));
-        assert!(msg.contains("mismatch 9"));
-        assert!(!msg.contains("mismatch 10"));
+        assert!(msg.contains("mismatch 49"));
+        assert!(!msg.contains("mismatch 50"));
         assert!(msg.contains("+10 more"));
     }
 

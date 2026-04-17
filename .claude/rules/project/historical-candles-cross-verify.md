@@ -102,11 +102,25 @@ These represent missed ticks during the trading session.
 - **Live WebSocket**: `exchange_timestamp` is IST epoch seconds → store directly, NO offset
 - **QuestDB `ts`**: always IST epoch nanos (both sources produce same representation)
 
-## Backfill Worker: DISABLED
+## Backfill Worker: DELETED (2026-04-17)
 
 The BackfillWorker that injected synthetic ticks from historical candles into the
-live `ticks` table is **permanently disabled**. Historical candles go to
-`historical_candles` table ONLY. The `ticks` table contains ONLY live WebSocket data.
+live `ticks` table has been **permanently DELETED** — not just disabled. The
+source file `crates/core/src/historical/backfill.rs` (836 lines) was removed
+along with the DHAT test `crates/core/tests/dhat_backfill_synth.rs`.
+
+Historical candles go to the `historical_candles` table ONLY. The `ticks` table
+contains ONLY live WebSocket-sourced data.
+
+**Hard enforcement** (per Parthiban directive 2026-04-17):
+- `.claude/rules/project/live-feed-purity.md` — authoritative rule file.
+- `.claude/hooks/banned-pattern-scanner.sh` category 6 — blocks commits that
+  re-introduce `BackfillWorker`, `run_backfill`, `synthesize_ticks`,
+  `TickPersistenceWriter` or `append_tick` in any historical/backfill/synth path.
+- `crates/storage/tests/live_feed_purity_guard.rs` — 6 runtime tests that fail
+  the build if `backfill.rs` is recreated, if `pub mod backfill;` reappears in
+  `historical/mod.rs`, or if any banned symbol appears inside the historical
+  flow.
 
 ## Key Files
 

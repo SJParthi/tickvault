@@ -17,6 +17,21 @@
 //! - **Cross-verification:** compares historical vs live for 09:15–15:29 only,
 //!   because Dhan historical API has no pre-market data (09:00–09:14).
 
-pub mod backfill;
+// `backfill` module DELETED 2026-04-17 — Parthiban directive:
+// "live market feed websockets nowhere the backfill should happen, make it
+// as hard enforcement ... live market feed should contain only live market
+// feed data alone ... historical candle data fetch is a separate functionality".
+//
+// Rationale: the `ticks` QuestDB table is reserved for WebSocket-sourced
+// live data. Historical REST-API data lives in `historical_candles` and
+// `candles_*` materialized views, never in `ticks`. Synthesising ticks
+// from historical candles and writing them to the `ticks` table would
+// violate data-source provenance and SEBI audit trail expectations.
+//
+// Mechanical guards live in:
+//   - `.claude/hooks/banned-pattern-scanner.sh` (live-feed-purity category)
+//   - `crates/storage/tests/live_feed_purity_guard.rs`
+//   - `.claude/rules/project/live-feed-purity.md`
+
 pub mod candle_fetcher;
 pub mod cross_verify;
