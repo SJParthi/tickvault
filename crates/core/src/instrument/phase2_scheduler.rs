@@ -95,8 +95,23 @@ pub enum SkipReason {
 impl SkipReason {
     pub fn as_str(&self) -> &'static str {
         match self {
-            Self::NonTradingDay => "non-trading day (weekend/holiday)",
-            Self::PostMarket => "already past 15:30 IST (post-market)",
+            Self::NonTradingDay => {
+                "Phase 2 = the 09:12 IST stock-F&O ATM \u{00b1} 25 subscription \
+                 burst (subscribes option chains for every F&O stock once \
+                 pre-market price is finalised). Skipped because today is \
+                 a non-trading day (weekend / NSE holiday). \
+                 Action required: NONE \u{2014} Phase 2 will run on the next \
+                 trading day's boot automatically."
+            }
+            Self::PostMarket => {
+                "Phase 2 = the 09:12 IST stock-F&O ATM \u{00b1} 25 subscription \
+                 burst (subscribes option chains for every F&O stock once \
+                 pre-market price is finalised). Skipped because the app \
+                 booted AFTER 15:30 IST (post-market window). \
+                 Action required: NONE \u{2014} stock F&O contracts will subscribe \
+                 automatically on the next market-open boot (next trading \
+                 day 09:00 IST)."
+            }
         }
     }
 }

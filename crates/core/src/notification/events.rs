@@ -44,6 +44,26 @@ pub enum Severity {
     Critical,
 }
 
+impl Severity {
+    /// UX tag prefixed to every Telegram message so the operator can
+    /// instantly tell at-a-glance how urgent an alert is. Added 2026-04-17
+    /// after Parthiban noted he couldn't distinguish boot-progress pings
+    /// from real incidents without reading the full message body.
+    ///
+    /// Mapping: emoji icon + square-bracket tag + exact severity name.
+    /// Operator workflow: any `[HIGH]` or `[CRITICAL]` message goes to
+    /// Claude Code for debugging; `[INFO]`/`[LOW]`/`[MEDIUM]` is scroll-by.
+    pub fn tag(&self) -> &'static str {
+        match self {
+            Self::Info => "\u{2139}\u{fe0f} [INFO]",  // ℹ️
+            Self::Low => "\u{2705} [LOW]",            // ✅
+            Self::Medium => "\u{1f535} [MEDIUM]",     // 🔵
+            Self::High => "\u{26a0}\u{fe0f} [HIGH]",  // ⚠️
+            Self::Critical => "\u{1f6a8} [CRITICAL]", // 🚨
+        }
+    }
+}
+
 /// All events that produce a Telegram alert.
 ///
 /// Adding a new event: add a variant here, add its message arm in
@@ -429,7 +449,12 @@ impl NotificationEvent {
                 )
             }
             Self::WebSocketConnected { connection_index } => {
-                format!("<b>WebSocket #{connection_index} connected</b>")
+                // UX fix 2026-04-17: display as 1-indexed (WebSocket 1/5)
+                // so operators read a natural 1..N range instead of 0..N-1.
+                // Internal `connection_index` stays 0-based (array index).
+                let display = connection_index.saturating_add(1);
+                let total = tickvault_common::constants::MAX_WEBSOCKET_CONNECTIONS;
+                format!("<b>WebSocket {display}/{total} connected</b>")
             }
             Self::WebSocketPoolOnline { connected, total } => {
                 format!("<b>WS pool online:</b> {connected}/{total} connected")
@@ -514,10 +539,18 @@ impl NotificationEvent {
                 connection_index,
                 reason,
             } => {
-                format!("<b>WebSocket #{connection_index} disconnected</b>\n{reason}")
+                format!(
+                    "<b>WebSocket {}/{} disconnected</b>\n{reason}",
+                    connection_index.saturating_add(1),
+                    tickvault_common::constants::MAX_WEBSOCKET_CONNECTIONS
+                )
             }
             Self::WebSocketReconnected { connection_index } => {
-                format!("<b>WebSocket #{connection_index} reconnected</b>")
+                format!(
+                    "<b>WebSocket {}/{} reconnected</b>",
+                    connection_index.saturating_add(1),
+                    tickvault_common::constants::MAX_WEBSOCKET_CONNECTIONS
+                )
             }
             Self::DepthTwentyConnected { underlying } => {
                 format!("<b>Depth 20-level connected</b>\nUnderlying: {underlying}")
@@ -804,7 +837,9 @@ impl NotificationEvent {
                 attempts,
             } => {
                 format!(
-                    "<b>WebSocket #{connection_index} RECONNECTION EXHAUSTED</b>\nAttempts: {attempts}\nNo market data"
+                    "<b>WebSocket {}/{} RECONNECTION EXHAUSTED</b>\nAttempts: {attempts}\nNo market data",
+                    connection_index.saturating_add(1),
+                    tickvault_common::constants::MAX_WEBSOCKET_CONNECTIONS
                 )
             }
             Self::TokenRenewalDeadlineMissed { deadline_hour_ist } => {
@@ -1015,32 +1050,35 @@ mod tests {
 
     #[test]
     fn test_websocket_connected_includes_index() {
+        // UX fix 2026-04-17: display is 1-indexed (connection_index=2 → "3/5")
         let event = NotificationEvent::WebSocketConnected {
             connection_index: 2,
         };
         let msg = event.to_message();
-        assert!(msg.contains("2"));
+        assert!(msg.contains("3"), "1-indexed display: 2 -> 3; got: {msg}");
         assert!(msg.contains("connected"));
     }
 
     #[test]
     fn test_websocket_disconnected_includes_index_and_reason() {
+        // UX fix 2026-04-17: display is 1-indexed (connection_index=1 → "2/5")
         let event = NotificationEvent::WebSocketDisconnected {
             connection_index: 1,
             reason: "connection reset by peer".to_string(),
         };
         let msg = event.to_message();
-        assert!(msg.contains("1"));
+        assert!(msg.contains("2"), "1-indexed display: 1 -> 2; got: {msg}");
         assert!(msg.contains("connection reset by peer"));
     }
 
     #[test]
     fn test_websocket_reconnected_includes_index() {
+        // UX fix 2026-04-17: display is 1-indexed (connection_index=0 → "1/5")
         let event = NotificationEvent::WebSocketReconnected {
             connection_index: 0,
         };
         let msg = event.to_message();
-        assert!(msg.contains("0"));
+        assert!(msg.contains("1"), "1-indexed display: 0 -> 1; got: {msg}");
         assert!(msg.contains("reconnected"));
     }
 
@@ -1656,13 +1694,17 @@ mod tests {
 
     #[test]
     fn test_ws_reconnection_exhausted_notification() {
+        // UX fix 2026-04-17: display is 1-indexed "3/5" (no # prefix).
         let event = NotificationEvent::WebSocketReconnectionExhausted {
             connection_index: 2,
             attempts: 10,
         };
         let msg = event.to_message();
         assert!(msg.contains("RECONNECTION EXHAUSTED"));
-        assert!(msg.contains("#2"));
+        assert!(
+            msg.contains("3/"),
+            "1-indexed display: 2 -> 3/N; got: {msg}"
+        );
         assert!(msg.contains("10"));
         assert_eq!(event.severity(), Severity::Critical);
     }
@@ -1907,17 +1949,20 @@ mod tests {
 
     #[test]
     fn test_cross_match_failed_truncates_long_mismatch_details() {
-        let details: Vec<String> = (0..20).map(|i| format!("mismatch {i}")).collect();
+        // Truncation limit raised to 50 in a previous refactor; update the
+        // test to match. Test now uses 60 entries so the +10 more overflow
+        // is still exercised.
+        let details: Vec<String> = (0..60).map(|i| format!("mismatch {i}")).collect();
         let event = NotificationEvent::CandleCrossMatchFailed {
             candles_compared: 100,
-            mismatches: 20,
+            mismatches: 60,
             missing_live: 0,
             mismatch_details: details,
         };
         let msg = event.to_message();
         assert!(msg.contains("mismatch 0"));
-        assert!(msg.contains("mismatch 9"));
-        assert!(!msg.contains("mismatch 10"));
+        assert!(msg.contains("mismatch 49"));
+        assert!(!msg.contains("mismatch 50"));
         assert!(msg.contains("+10 more"));
     }
 

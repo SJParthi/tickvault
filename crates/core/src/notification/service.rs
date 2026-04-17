@@ -292,7 +292,12 @@ impl NotificationService {
                 sns_phone_number,
             } => {
                 let severity = event.severity();
-                let message = event.to_message();
+                // UX fix 2026-04-17: prefix every Telegram message with a
+                // severity tag + emoji so the operator can visually scan
+                // a long chat list and pick out incidents at a glance.
+                // Parthiban workflow: any [HIGH] / [CRITICAL] message goes
+                // straight to Claude Code for debugging.
+                let message = format!("{} {}", severity.tag(), event.to_message());
 
                 // Always: Telegram
                 {
