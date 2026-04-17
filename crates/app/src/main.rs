@@ -834,6 +834,10 @@ async fn main() -> Result<()> {
                 std::sync::Arc::clone(&pool_arc),
                 std::sync::Arc::clone(&shutdown_notify),
             );
+            // FAST BOOT parity with slow boot (main.rs ~1760):
+            // emit per-connection + aggregate Telegram alerts so an operator
+            // can see the pool came up after a crash-recovery restart.
+            emit_websocket_connected_alerts(&fast_notifier, handles.len()).await;
             (handles, Some(pool_arc))
         } else {
             (Vec::new(), None)
@@ -1751,15 +1755,9 @@ async fn main() -> Result<()> {
             std::sync::Arc::clone(&pool_arc),
             std::sync::Arc::clone(&shutdown_notify),
         );
-        // Telegram: notify that all main WS connections were spawned.
-        if !handles.is_empty() {
-            let conn_count = handles.len();
-            for i in 0..conn_count {
-                notifier.notify(NotificationEvent::WebSocketConnected {
-                    connection_index: i,
-                });
-            }
-        }
+        // FAST BOOT parity: helper emits per-connection + aggregate Telegram
+        // alerts on BOTH boot paths (main.rs ~830 for FAST BOOT, here for slow).
+        emit_websocket_connected_alerts(&notifier, handles.len()).await;
         (handles, Some(pool_arc))
     } else {
         (Vec::new(), None)
@@ -3284,6 +3282,46 @@ async fn spawn_websocket_connections(
     let handles = pool.spawn_all().await;
     info!(connections = handles.len(), "WebSocket connections spawned");
     handles
+}
+
+/// Stagger in milliseconds between per-connection `WebSocketConnected` events.
+/// Telegram rate-limits bursts of identical-from messages; spacing the emits
+/// avoids silent drops. A 5-connection pool at 150 ms adds ~750 ms to boot,
+/// which is negligible against the 15-step boot budget.
+const WS_CONNECTED_ALERT_STAGGER_MS: u64 = 150;
+
+/// Emits per-connection `WebSocketConnected` Telegram events plus a single
+/// aggregate `WebSocketPoolOnline` summary. Called from BOTH boot paths
+/// (FAST BOOT and slow boot) so an operator sees the same signal regardless
+/// of which path ran.
+///
+/// Why the summary: when 5 per-connection events fire in a tight loop,
+/// Telegram can drop individual messages (observed live on 2026-04-17 —
+/// only 3 of 5 arrived). The aggregate is delivered with a small stagger
+/// after the individuals so even if all per-connection drops happen, a
+/// single "N/total online" message still reaches the operator chat.
+async fn emit_websocket_connected_alerts(
+    notifier: &std::sync::Arc<NotificationService>,
+    handle_count: usize,
+) {
+    if handle_count == 0 {
+        return;
+    }
+    for i in 0..handle_count {
+        notifier.notify(NotificationEvent::WebSocketConnected {
+            connection_index: i,
+        });
+        if i + 1 < handle_count {
+            tokio::time::sleep(std::time::Duration::from_millis(
+                WS_CONNECTED_ALERT_STAGGER_MS,
+            ))
+            .await;
+        }
+    }
+    notifier.notify(NotificationEvent::WebSocketPoolOnline {
+        connected: handle_count,
+        total: handle_count,
+    });
 }
 
 /// S4-T1a: Background pool health watchdog.

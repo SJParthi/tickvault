@@ -71,6 +71,12 @@ pub enum NotificationEvent {
     /// WebSocket connection established.
     WebSocketConnected { connection_index: usize },
 
+    /// Aggregate summary of the live-market-feed pool after spawn.
+    /// Emitted once per boot path so operators survive Telegram rate-limit
+    /// drops of the per-connection `WebSocketConnected` events.
+    /// `total` is the expected count (== connected on healthy boot).
+    WebSocketPoolOnline { connected: usize, total: usize },
+
     /// WebSocket disconnected (unexpected, will reconnect).
     WebSocketDisconnected {
         connection_index: usize,
@@ -353,6 +359,9 @@ impl NotificationEvent {
             }
             Self::WebSocketConnected { connection_index } => {
                 format!("<b>WebSocket #{connection_index} connected</b>")
+            }
+            Self::WebSocketPoolOnline { connected, total } => {
+                format!("<b>WS pool online:</b> {connected}/{total} connected")
             }
             Self::WebSocketDisconnected {
                 connection_index,
@@ -717,6 +726,7 @@ impl NotificationEvent {
             Self::ShutdownInitiated => Severity::Medium,
             Self::CircuitBreakerClosed => Severity::Medium,
             Self::WebSocketConnected { .. } => Severity::Low,
+            Self::WebSocketPoolOnline { .. } => Severity::Medium,
             Self::DepthTwentyConnected { .. } => Severity::Low,
             Self::DepthTwoHundredConnected { .. } => Severity::Low,
             Self::OrderUpdateConnected => Severity::Low,

@@ -1,142 +1,64 @@
-# Implementation Plan: Instrument Tables — Single-Row-Per-Instrument Redesign
+# Implementation Plan: WebSocket Boot-Path Parity + 9:12 Phase 2 Scheduler
 
 **Status:** APPROVED
 **Date:** 2026-04-17
-**Approved by:** Parthiban (2026-04-17)
+**Approved by:** Parthiban ("Execute everything bro")
 
-## Problem (Parthiban, 2026-04-17)
+## Problem (from live telegram 2026-04-17)
 
-Current design: snapshot tables accumulate one row per day per instrument.
-Running on Day 1 + Day 2 = 2x rows. Dashboard showed 442 underlyings (2x 221)
-and 207,796 contracts (2x ~104k). This is fragile — every new query must
-remember the `WHERE timestamp = max(timestamp)` filter or it shows duplicates.
+At 8:57 AM Parthiban saw only 3 of 5 `WebSocket #N connected` alerts. At 9:04
+AM the app crashed (shutdown initiated after depth rebalance). At 9:05 AM it
+restarted via FAST BOOT path and reported `ticks flowing, all services ready`
+— but **zero per-connection alerts**. Root-cause audit exposed three separate
+bugs plus a missing feature.
 
-**Correct design per Parthiban:**
-- Tables must have UNIQUE rows always
-- Same-day OR cross-day reload = NO duplicates
-- New contracts auto-added as unique rows
-- Expired contracts auto-deactivated (NOT deleted, for SEBI audit)
+## Gaps being closed
 
-## Target Design — Lifecycle Columns, No Timestamp in Dedup Key
-
-### `fno_underlyings`
-| Column | Type | Purpose |
-|---|---|---|
-| underlying_symbol | SYMBOL | **Business key (DEDUP)** |
-| status | SYMBOL | `active` \| `expired` |
-| underlying_security_id | LONG | From CSV |
-| price_feed_segment | SYMBOL | From CSV |
-| price_feed_security_id | LONG | From CSV |
-| derivative_segment | SYMBOL | From CSV |
-| kind | SYMBOL | NseIndex / BseIndex / Stock |
-| lot_size | LONG | From CSV |
-| contract_count | LONG | Current active contracts |
-| first_seen_date | TIMESTAMP | When row was first inserted |
-| last_seen_date | TIMESTAMP | Last day CSV had this symbol |
-| expired_date | TIMESTAMP | null if active, date if expired |
-| ts | TIMESTAMP (designated) | = last_seen_date |
-
-**DEDUP key:** `underlying_symbol` (one row per symbol, period)
-
-### `derivative_contracts`
-Similar lifecycle columns. DEDUP: `security_id, underlying_symbol`.
-
-### `subscribed_indices`
-Similar lifecycle columns. DEDUP: `security_id`.
-
-### `instrument_build_metadata`
-UNCHANGED — build history table, one row per run is correct by design.
-
-## Write Semantics (daily build)
-
-```
-1. Load today's CSV → universe builder → FnoUniverse (today's active set)
-2. For each instrument in today's universe:
-     UPSERT (DEDUP on business key):
-       - new row → INSERT with status='active', first_seen_date=today, last_seen_date=today
-       - existing row → UPDATE fields, status='active', last_seen_date=today, expired_date=null
-3. For each row in DB with status='active' not in today's universe:
-     UPDATE: status='expired', expired_date=today
-```
-
-**Idempotency proofs:**
-- Run same day N times: identical final state (DEDUP + deterministic inputs)
-- Run cross-day: rows UPSERTed, never duplicated
-- Expired contract reappears: reactivated (status='active', expired_date=null)
-- Corporate action (lot_size change): UPDATE single row, last_seen bumped
+| # | Gap | Fix |
+|---|-----|-----|
+| A | FAST BOOT path (`main.rs:830-840`) emits zero `WebSocketConnected` alerts while slow boot (`main.rs:1747-1766`) emits 5 | Extract helper + call from both paths; mechanical guard test for parity |
+| B | When 5 alerts fire in a tight loop, Telegram drops some | Aggregate "N/5 online" summary alert so operator still gets signal even if individuals drop |
+| C | 9:12 AM Phase 2 stock F&O subscription is commented / documented but not implemented in code | New `phase2_scheduler.rs`: tokio task spawned from both boot paths that waits until 9:12 IST, rebuilds subscription plan with real spot prices, issues subscribe messages, telegram-alerts on success + failure |
+| D | `docs/architecture/websocket-complete-reference.md` §10.2 claims "no open gaps" — stale | Update to reflect A/B/C fix record |
 
 ## Plan Items
 
-- [ ] **1. Update DDLs** in `crates/storage/src/instrument_persistence.rs`
-  - Add `status`, `first_seen_date`, `last_seen_date`, `expired_date` columns
-  - Change DEDUP keys to business key only (no timestamp-in-key)
-  - Tests: `test_ddl_status_column`, `test_ddl_lifecycle_dates`, `test_dedup_business_key`
+- [ ] **A1**: Extract `emit_websocket_connected_alerts(notifier, count)` helper.
+  - Files: `crates/app/src/main.rs`
+  - Tests: `test_emit_websocket_connected_alerts_fires_n_events`
 
-- [ ] **2. Rewrite `persist_instrument_snapshot` → `persist_instrument_universe`**
-  - UPSERT today's universe
-  - Call `mark_missing_as_expired(today)` to flip absent rows to expired
-  - Remove `build_snapshot_timestamp()` (no longer a PK component)
-  - Tests: `test_upsert_idempotent_same_day`, `test_cross_day_no_duplication`,
-    `test_new_added_as_active`, `test_missing_marked_expired`, `test_reappearing_reactivated`
+- [ ] **A2**: Mechanical guard test for parity.
+  - Files: `crates/app/tests/boot_path_notify_parity.rs` (new)
+  - Tests: `fast_boot_and_slow_boot_both_call_emit_websocket_connected_alerts`
 
-- [ ] **3. Update Grafana dashboards** — remove timestamp filters
-  - `deploy/docker/grafana/dashboards/market-data.json`
-  - Count queries: `SELECT count() FROM fno_underlyings WHERE status = 'active'`
-  - Table queries: add `WHERE status = 'active'` for operational views
-  - Guard test (`grafana_dashboard_snapshot_filter_guard`) updated:
-    now checks for `WHERE status` filter instead of timestamp filter
+- [ ] **B1**: Aggregate summary alert + small stagger between per-connection alerts.
+  - Files: `crates/app/src/main.rs` (helper from A1), `crates/core/src/notification/events.rs`
+  - Tests: `test_websocket_pool_online_summary_event`
 
-- [ ] **4. Update `verify_instrument_row_counts`**
-  - Count `WHERE status = 'active'` only
-  - Tests: `test_verify_active_count_matches_universe`
+- [ ] **C1**: New `NotificationEvent::Phase2SubscriptionComplete` + failure variant.
+  - Files: `crates/core/src/notification/events.rs`
+  - Tests: `test_phase2_events_format`, `test_phase2_events_roundtrip`
 
-- [ ] **5. Rewrite I-P1-08 rule** in `.claude/rules/project/gap-enforcement.md`
-  - OLD: "cross-day snapshot accumulation by design"
-  - NEW: "single-row-per-instrument with lifecycle status, UPSERT semantics"
+- [ ] **C2**: New `phase2_scheduler.rs` — tokio task.
+  - Files: `crates/core/src/instrument/phase2_scheduler.rs` (new), `crates/core/src/instrument/mod.rs`
+  - Tests: `test_phase2_wait_duration_before_912`, `test_phase2_wait_duration_after_912_runs_immediately`, `test_phase2_skips_weekend`
 
-- [ ] **6. Migration script** `scripts/migrate-instrument-tables.sql`
-  - Keep only latest snapshot per business key
-  - Add lifecycle columns, set status='active' for kept rows
-  - Rename old tables `*_pre_migration` (kept 7 days, then drop)
+- [ ] **C3**: Wire scheduler into both boot paths.
+  - Files: `crates/app/src/main.rs`
 
-- [ ] **7. Update delta_detector.rs**
-  - Delta events derived from DB status transitions, not universe-vs-universe diff
-  - All 29 existing delta_detector tests updated/kept
-
-- [ ] **8. Update docs**
-  - `CLAUDE.md` — codebase structure section
-  - `docs/dhan-ref/09-instrument-master.md` — add "lifecycle" section
-  - `.claude/rules/dhan/instrument-master.md` — update rules
-
-- [ ] **9. Add mechanical uniqueness guard**
-  - `crates/storage/tests/instrument_uniqueness_guard.rs`
-  - Property test: simulate N days × M runs per day, assert
-    `count(distinct underlying_symbol) == count(*)` always
+- [ ] **D1**: Update WS reference doc + websocket-enforcement.md gap tables.
+  - Files: `docs/architecture/websocket-complete-reference.md`, `.claude/rules/project/websocket-enforcement.md`
 
 ## Scenarios
 
 | # | Scenario | Expected |
 |---|----------|----------|
-| 1 | Day 1 run once (221 underlyings) | 221 rows, all active |
-| 2 | Day 1 run 100 times (same CSV) | Still 221 rows |
-| 3 | Day 2 run (220 same + 2 new + 1 expired overnight) | 223 rows total: 220 active, 1 expired, 2 new active |
-| 4 | Day 3 run (expired one reappears) | Row reactivated: status=active, expired_date=null |
-| 5 | Dashboard count query | Returns exact active count, no filter needed |
-| 6 | Historical query "what was active on 2026-03-01?" | `WHERE first_seen_date <= '2026-03-01' AND (expired_date IS NULL OR expired_date > '2026-03-01')` |
-| 7 | SecurityId reused across underlyings | SecurityIdReused event fires (compound identity) |
-| 8 | Corporate action: lot_size changes | UPDATE single row, last_seen bumped, delta event emitted |
-| 9 | SEBI audit "list all contracts traded since 2026-01-01" | Join with orders table on security_id |
-| 10 | Migration from old design | One-time script: keep latest snapshot per key |
+| 1 | Slow boot at 8:57 AM with 5 WS | 5 `WebSocketConnected` alerts + 1 summary "5/5 online" |
+| 2 | Crash + FAST BOOT at 9:05 AM | Same 5 + 1 summary alerts (parity with slow boot) |
+| 3 | FAST BOOT after 9:12 AM | Phase 2 scheduler detects past-due, runs immediately |
+| 4 | Telegram drops some per-connection alerts | Summary alert still tells operator "5/5 online" |
+| 5 | Phase 2 runs on Sunday | Scheduler no-ops, no bogus subscription |
 
 ## Rollback
 
-- Old tables kept as `*_pre_migration` for 7 days
-- Revert commit → restore old DDL → copy data back from `*_pre_migration`
-
-## Approval Required
-
-**This is a schema-level redesign.** Estimated effort: 1 focused session
-(~3 hours). Touches: storage DDL, persistence functions, delta detector,
-Grafana dashboards, 5 docs, ~40 tests.
-
-**I will NOT touch any code until you approve this plan.**
+Each fix = separate commit. Revert any one independently.
