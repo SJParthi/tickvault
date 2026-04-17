@@ -865,8 +865,22 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
 
                 // O(1) broadcast to browser WebSocket clients (if any are connected).
                 // Lagging receivers auto-skip — chart only needs latest price.
-                if let Some(ref sender) = tick_broadcast {
-                    let _ = sender.send(tick);
+                //
+                // Audit finding #1/#19 (2026-04-17): `sender.send()` returns
+                // `Err(SendError)` ONLY when ALL receivers have closed (not
+                // on lag — lag is surfaced to each receiver individually).
+                // A closed-all-receivers state means downstream trading
+                // signals are dead. Count + error-log so operator sees it.
+                if let Some(ref sender) = tick_broadcast
+                    && sender.send(tick).is_err()
+                {
+                    metrics::counter!("tv_tick_broadcast_send_errors_total").increment(1);
+                    // O(1) EXEMPT: error path — tracing static dispatch is
+                    // the only allocation and it's off the zero-loss fast path.
+                    error!(
+                        "tick broadcast send failed — ALL subscribers closed; \
+                         trading pipeline + browser feed are dead"
+                    );
                 }
 
                 // O(1) candle aggregation: update 1s OHLCV candle for this security.
@@ -1041,6 +1055,18 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     m_outside_hours.increment(1);
                     continue;
                 }
+                // Audit finding #6 (2026-04-17): wall-clock guard for depth.
+                // Ticks already have this at line ~802; depth was missing
+                // it. A Full packet (code 8) can carry an exchange_timestamp
+                // from inside market hours but actually arrive post-close
+                // (server-side replay / buffer). Without this guard the
+                // stale packet pollutes `market_depth` table. Same guard
+                // shape used by ticks.
+                if !is_wall_clock_within_persist_window(tick.received_at_nanos) {
+                    outside_hours_filtered = outside_hours_filtered.saturating_add(1);
+                    m_outside_hours.increment(1);
+                    continue;
+                }
 
                 // Within market hours — persist depth to QuestDB.
                 m_depth_snapshots.increment(1);
@@ -1066,8 +1092,14 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                 }
 
                 // O(1) broadcast to browser WebSocket clients (if tick has valid LTP).
-                if ltp_valid && let Some(ref sender) = tick_broadcast {
-                    let _ = sender.send(tick);
+                // See audit finding #1/#19 rationale at the other broadcast
+                // send site earlier in this file — same guard.
+                if ltp_valid
+                    && let Some(ref sender) = tick_broadcast
+                    && sender.send(tick).is_err()
+                {
+                    metrics::counter!("tv_tick_broadcast_send_errors_total").increment(1);
+                    error!("tick broadcast send failed (valid-LTP path) — ALL subscribers closed");
                 }
 
                 // (day_close baseline already set ABOVE time guards at line ~711)
@@ -1270,12 +1302,25 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
             if let Some(ref mut writer) = tick_writer
                 && let Err(err) = writer.flush_if_needed()
             {
-                warn!(?err, "periodic tick flush failed");
+                // Audit finding #2 (2026-04-17): must be ERROR, not WARN —
+                // Telegram alert path is keyed on log level. A persistent
+                // flush failure means ticks are stuck in the ring buffer
+                // or spill path with no operator visibility at WARN level.
+                error!(
+                    ?err,
+                    "periodic tick flush failed — QuestDB write path broken"
+                );
+                metrics::counter!("tv_tick_flush_errors_total").increment(1);
             }
             if let Some(ref mut dw) = depth_writer
                 && let Err(err) = dw.flush_if_needed()
             {
-                warn!(?err, "periodic depth flush failed");
+                // Audit finding #2: see above.
+                error!(
+                    ?err,
+                    "periodic depth flush failed — QuestDB write path broken"
+                );
+                metrics::counter!("tv_depth_flush_errors_total").increment(1);
             }
 
             // Sweep stale candles and persist completed 1s candles to QuestDB
@@ -1338,7 +1383,13 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
             if let Some(ref mut cw) = live_candle_writer
                 && let Err(err) = cw.flush_if_needed()
             {
-                warn!(?err, "periodic live candle flush failed");
+                // Audit finding #4 (2026-04-17): ERROR not WARN so Telegram
+                // fires when candle persistence degrades.
+                error!(
+                    ?err,
+                    "periodic live candle flush failed — QuestDB write path broken"
+                );
+                metrics::counter!("tv_live_candle_flush_errors_total").increment(1);
             }
 
             // Compute top movers snapshot every ~5 seconds (cold path, O(N log N))
