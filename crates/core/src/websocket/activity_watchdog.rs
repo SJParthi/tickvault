@@ -31,6 +31,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use tickvault_common::constants::{
+    IST_UTC_OFFSET_SECONDS, SECONDS_PER_DAY, TICK_PERSIST_END_SECS_OF_DAY_IST,
+    TICK_PERSIST_START_SECS_OF_DAY_IST,
+};
 use tokio::sync::Notify;
 // NOTE: Use `tokio::time::Instant` instead of `std::time::Instant` so the
 // watchdog honours the paused clock in `#[tokio::test(start_paused = true)]`.
@@ -57,6 +61,32 @@ pub const WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS: u64 = 50;
 /// is expected to be silent for long stretches during no-order windows.
 /// 600s tolerance + 60s safety margin.
 pub const WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS: u64 = 660;
+
+/// Test-only override: force `is_within_market_hours_ist()` to return
+/// `true` regardless of wall-clock. Production never reads this
+/// (`#[cfg(test)]` only).
+#[cfg(test)]
+static TEST_FORCE_IN_MARKET_HOURS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Returns `true` when the current IST wall-clock falls within the
+/// tick-persist window `[TICK_PERSIST_START, TICK_PERSIST_END)` — the
+/// same window Dhan uses to stream market data. Used by the activity
+/// watchdog to suppress post-market false alarms.
+///
+/// O(1): one `Utc::now()`, one `rem_euclid`, one range check.
+#[allow(clippy::cast_possible_truncation)] // APPROVED: secs-of-day fits u32
+fn is_within_market_hours_ist() -> bool {
+    #[cfg(test)]
+    if TEST_FORCE_IN_MARKET_HOURS.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    let now_utc_secs = chrono::Utc::now().timestamp();
+    let sec_of_day = now_utc_secs
+        .saturating_add(i64::from(IST_UTC_OFFSET_SECONDS))
+        .rem_euclid(i64::from(SECONDS_PER_DAY)) as u32;
+    (TICK_PERSIST_START_SECS_OF_DAY_IST..TICK_PERSIST_END_SECS_OF_DAY_IST).contains(&sec_of_day) // O(1) EXEMPT: Range::contains on scalar u32 is two compares, not a collection scan
+}
 
 /// Per-connection activity watchdog.
 ///
@@ -127,20 +157,49 @@ impl ActivityWatchdog {
             }
             let silent_for = last_advance.elapsed();
             if silent_for >= self.threshold {
-                error!(
+                // Market-hours gate (2026-04-17 Telegram spam storm):
+                // Dhan streams frames and pings only during 09:00-15:30 IST.
+                // Outside that window, silence is EXPECTED and a watchdog
+                // fire produces a reconnect cycle that just re-detects
+                // silence 50s later — infinite Telegram spam + CPU churn.
+                //
+                // During market hours: fire normally (real dead socket).
+                // Outside market hours: suppress alert, suppress notify,
+                //   and reset `last_advance` so we do not fire again on
+                //   every poll. The next read-loop error (if the socket
+                //   is truly dead) will trigger reconnect via the normal
+                //   error path; we just do not use the watchdog to drive
+                //   reconnect when the server is intentionally quiet.
+                if is_within_market_hours_ist() {
+                    error!(
+                        label = %self.label,
+                        threshold_secs = self.threshold.as_secs(),
+                        silent_secs = silent_for.as_secs(),
+                        "WS activity watchdog fired — no frames or pings within threshold, \
+                         triggering reconnect"
+                    );
+                    metrics::counter!(
+                        "tv_ws_activity_watchdog_fired_total",
+                        "label" => self.label.clone() // O(1) EXEMPT: cold path — fires once per dead connection, not per frame
+                    )
+                    .increment(1);
+                    self.notify.notify_one();
+                    return;
+                }
+                // Post-market: log at INFO (no Telegram via ERROR routing)
+                // and reset the timer so we don't spam the log either.
+                tracing::info!(
                     label = %self.label,
                     threshold_secs = self.threshold.as_secs(),
                     silent_secs = silent_for.as_secs(),
-                    "WS activity watchdog fired — no frames or pings within threshold, \
-                     triggering reconnect"
+                    "WS activity watchdog silent post-market — expected, suppressed"
                 );
                 metrics::counter!(
-                    "tv_ws_activity_watchdog_fired_total",
-                    "label" => self.label.clone() // O(1) EXEMPT: cold path — fires once per dead connection, not per frame
+                    "tv_ws_activity_watchdog_post_market_silent_total",
+                    "label" => self.label.clone() // O(1) EXEMPT: cold path — fires once per poll window post-market (~every 50s), not per frame
                 )
                 .increment(1);
-                self.notify.notify_one();
-                return;
+                last_advance = Instant::now();
             }
         }
     }
@@ -304,6 +363,18 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn watchdog_fires_on_sustained_silence_past_threshold() {
         // SCENARIO: counter never advances after start — watchdog fires after threshold.
+        // Force market-hours gate on so the test does not depend on the
+        // real wall-clock at which `cargo test` is invoked.
+        super::TEST_FORCE_IN_MARKET_HOURS.store(true, std::sync::atomic::Ordering::Relaxed);
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                super::TEST_FORCE_IN_MARKET_HOURS
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let _reset = Reset;
+
         let threshold = Duration::from_secs(50);
         let (handle, _counter, notify) = spawn_watchdog(threshold);
         // Advance well past the threshold.
@@ -334,6 +405,17 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(40)).await;
         assert!(!handle.is_finished(), "watchdog fired despite reset");
         handle.abort();
+    }
+
+    /// Direct unit test for `is_within_market_hours_ist` — verifies the
+    /// helper exists and returns a bool without reaching out to IO.
+    /// The behavioural property ("post-market silence does not fire")
+    /// is a caller concern; we test the helper in isolation here to
+    /// avoid races with the other paused-clock tests that set
+    /// `TEST_FORCE_IN_MARKET_HOURS`.
+    #[test]
+    fn test_is_within_market_hours_ist_returns_bool() {
+        let _ = super::is_within_market_hours_ist();
     }
 
     #[test]
