@@ -483,6 +483,16 @@ async fn connect_and_run_depth(
                             "underlying" => underlying_label.to_string()
                         )
                         .increment(1);
+                        // Catalog-aligned metric (tv_depth_frames_dropped_total,
+                        // 2026-04-17 audit cleanup): emits the per-type / per-
+                        // depth-level drop count that the metrics_catalog.rs
+                        // required list expects.
+                        metrics::counter!(
+                            "tv_depth_frames_dropped_total",
+                            "type" => "channel_full",
+                            "depth" => "20"
+                        )
+                        .increment(1);
                         // Do NOT return — socket is healthy.
                     }
                     Err(mpsc::error::TrySendError::Closed(_)) => {
@@ -908,6 +918,13 @@ async fn connect_and_run_200_depth(
                             "tv_ws_frame_live_backpressure_total",
                             "ws_type" => "depth_200",
                             "label" => label.to_string()
+                        )
+                        .increment(1);
+                        // Catalog-aligned metric (see depth_20 site above).
+                        metrics::counter!(
+                            "tv_depth_frames_dropped_total",
+                            "type" => "channel_full",
+                            "depth" => "200"
                         )
                         .increment(1);
                     }
