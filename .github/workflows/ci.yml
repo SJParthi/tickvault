@@ -97,7 +97,7 @@ jobs:
         # crate's lib.rs.
         run: cargo clippy --workspace --no-deps
 
-      - name: cargo nextest run --workspace --lib
+      - name: cargo nextest run --workspace --lib (profile=ci)
         timeout-minutes: 30
         # We run LIB unit tests only on the PR gate. Integration tests
         # (`tests/*.rs`) in this repo include chaos / grafana / websocket
@@ -105,15 +105,11 @@ jobs:
         # those belong to the nightly workflow (full-test-nightly.yml)
         # with docker-compose up, not a stateless GitHub runner.
         #
-        # Lib tests alone cover ~4,300 of the ~7,250 total tests and
-        # exercise every pure-function + in-memory invariant. The
-        # integration tests that DON'T need services are marked
-        # `#[ignore]` or use mock servers; nextest picks those up
-        # automatically via the crate's own test harness.
-        #
-        # When docker-in-docker lands on CI we can flip this back to
-        # `--all-targets` and drop the nightly fallback.
-        run: cargo nextest run --workspace --lib --no-fail-fast
+        # Profile `ci` (.config/nextest.toml) caps per-test wall-clock
+        # at 90 s so runaway / hung tests fail fast instead of blowing
+        # the step budget. Flaky integration tests get one automatic
+        # retry before being marked FAIL.
+        run: cargo nextest run --workspace --lib --no-fail-fast --profile ci
 
   # -------------------------------------------------------------------------
   # Security & Audit — delegated to security-audit.yml workflow.
