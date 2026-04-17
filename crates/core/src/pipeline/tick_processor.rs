@@ -162,6 +162,26 @@ fn utc_nanos_to_ist_secs_of_day(received_at_nanos: i64) -> u32 {
         .rem_euclid(i64::from(SECONDS_PER_DAY)) as u32
 }
 
+/// Audit finding #11 (2026-04-17): maximum backward NTP clock step we
+/// accept. A backward jump smaller than this is tolerated; a larger
+/// jump is considered a clock-skew anomaly and fires a metric so the
+/// operator can investigate (e.g. the VM was suspended and resumed).
+///
+/// Threshold = 60 s chosen so a typical chrony/ntpd slew (millisecond-
+/// scale) never trips it, but a step correction or VM time jump does.
+pub const CLOCK_SKEW_BACKWARD_THRESHOLD_NANOS: i64 = 60_000_000_000;
+
+/// Largest `received_at_nanos` seen so far, used to detect NTP backward
+/// jumps in `is_wall_clock_within_persist_window`. Because `received_at`
+/// is set by the WebSocket read loop using `Utc::now()`, a monotonic
+/// stream should never go backward by more than the arrival jitter.
+///
+/// Single-process atomic: zero contention on the hot path, loaded with
+/// `Relaxed` (no happens-before needed for a best-effort monitoring
+/// counter).
+static MAX_WALL_CLOCK_SEEN_NANOS: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(0);
+
 /// Returns `true` if the wall-clock time (received_at_nanos) falls within
 /// the tick persist window [09:00, 15:30) IST.
 ///
@@ -171,9 +191,43 @@ fn utc_nanos_to_ist_secs_of_day(received_at_nanos: i64) -> u32 {
 /// stale ticks pass `is_within_persist_window` (which only checks the
 /// exchange_timestamp) and pollute the `ticks` table.
 ///
-/// O(1) — reuses `utc_nanos_to_ist_secs_of_day` + 1 range check.
+/// I-P1-AUDIT-11 (2026-04-17): also monitors NTP clock skew. If the
+/// wall-clock goes BACKWARD by more than `CLOCK_SKEW_BACKWARD_THRESHOLD_NANOS`
+/// versus the largest value seen so far, it logs ERROR + increments
+/// `tv_clock_skew_detections_total` so the operator sees it in Grafana
+/// + Telegram. The tick is still evaluated against the window (we do
+/// NOT reject it on the basis of skew alone — that would drop
+/// legitimate ticks during a one-off correction).
+///
+/// O(1) — reuses `utc_nanos_to_ist_secs_of_day` + 1 range check + 1
+/// relaxed atomic load + 1 CAS on rising edge.
 #[inline(always)]
 fn is_wall_clock_within_persist_window(received_at_nanos: i64) -> bool {
+    // I-P1-AUDIT-11: clock-skew monitor.
+    use std::sync::atomic::Ordering;
+    let prev_max = MAX_WALL_CLOCK_SEEN_NANOS.load(Ordering::Relaxed);
+    if received_at_nanos > prev_max {
+        // Rising edge: update max (relaxed CAS — lost races only mean
+        // we miss an update, which is fine for a monitoring counter).
+        let _ = MAX_WALL_CLOCK_SEEN_NANOS.compare_exchange(
+            prev_max,
+            received_at_nanos,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+    } else if prev_max.saturating_sub(received_at_nanos) > CLOCK_SKEW_BACKWARD_THRESHOLD_NANOS {
+        // Backward jump beyond threshold — log + count but don't reject.
+        metrics::counter!("tv_clock_skew_detections_total").increment(1);
+        tracing::error!(
+            prev_max_nanos = prev_max,
+            received_at_nanos,
+            backward_jump_nanos = prev_max.saturating_sub(received_at_nanos),
+            threshold_nanos = CLOCK_SKEW_BACKWARD_THRESHOLD_NANOS,
+            "NTP clock skew detected — wall-clock jumped backward by >60s. \
+             Tick kept but flagged; investigate VM suspend/resume or NTP step."
+        );
+    }
+
     let wall_clock_ist_secs_of_day = utc_nanos_to_ist_secs_of_day(received_at_nanos);
     (TICK_PERSIST_START_SECS_OF_DAY_IST..TICK_PERSIST_END_SECS_OF_DAY_IST)
         .contains(&wall_clock_ist_secs_of_day)
