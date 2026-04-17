@@ -340,17 +340,17 @@ fn dashboard_distinct_security_id_must_include_segment() {
 // Audit finding #5 — critical metrics must appear on at least one dashboard
 // ============================================================================
 
-/// Ratchet allow-list: metrics KNOWN to be missing from dashboards as of
-/// 2026-04-17. The test FAILS if this list grows — adding a new required
-/// metric without a dashboard panel is blocked. Items should be REMOVED
-/// from this list as operator adds dashboard panels; each removal is a
-/// one-way ratchet improvement.
-const KNOWN_DASHBOARD_GAPS: &[&str] = &[
-    "tv_questdb_",
-    "tv_pool_",
-    "tv_tick_flush_errors_total",
-    "tv_instrument_registry_cross_segment_collisions",
-];
+/// Ratchet allow-list: metrics KNOWN to be missing from dashboards.
+/// The test FAILS if this list grows — adding a new required metric
+/// without a dashboard panel is blocked. Items should be REMOVED
+/// from this list as operator adds dashboard panels; each removal is
+/// a one-way ratchet improvement.
+///
+/// Empty as of 2026-04-17 commit that shipped `tv-health.json` —
+/// all 4 previously-missing prefixes now have panels on that
+/// dashboard. Adding a new required metric requires adding a
+/// panel (or re-populating this list if tech debt is acceptable).
+const KNOWN_DASHBOARD_GAPS: &[&str] = &[];
 
 #[test]
 fn critical_metric_prefixes_appear_on_at_least_one_dashboard() {
