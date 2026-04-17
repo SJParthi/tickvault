@@ -57,12 +57,17 @@ jobs:
           exit $failed
 
   # -------------------------------------------------------------------------
-  # Build & Verify — fmt, clippy, full workspace test
+  # Build & Verify — fmt + clippy + lib tests per crate.
+  #
+  # Split fmt + clippy (fast, one runner) from per-crate `cargo nextest run
+  # -p <crate>` so the 7,250-test workspace parallelizes across 6 runners
+  # instead of serializing on one. Each crate finishes inside the runner's
+  # 60-minute budget even on a cold cache.
   # -------------------------------------------------------------------------
   build-and-verify:
     name: "Build & Verify"
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -76,13 +81,8 @@ jobs:
       - name: Cache cargo registry + build
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: ci-build-and-verify
+          shared-key: ci-build-and-verify-fmt-clippy
           cache-on-failure: true
-
-      - name: Install cargo-nextest (3x faster than cargo test)
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-nextest
 
       - name: cargo fmt --check
         run: cargo fmt --all --check
@@ -91,26 +91,49 @@ jobs:
         # NOTE: we deliberately do NOT pass `--all-targets` or
         # `-D warnings` here. Test code legitimately uses `eprintln!`
         # (calibration output) and there are ~24 pre-existing lib
-        # warnings (doc_lazy_continuation, iter_cloned_collect, etc.)
-        # scheduled for a follow-up cleanup pass. Prod code is still
-        # protected via `#![cfg_attr(not(test), deny(...))]` in each
-        # crate's lib.rs.
+        # warnings scheduled for a follow-up cleanup pass. Prod code is
+        # still protected via `#![cfg_attr(not(test), deny(...))]` in
+        # each crate's lib.rs.
         run: cargo clippy --workspace --no-deps
 
-      - name: Pre-build test binaries (keeps `run` step from hitting its own timeout on cold cache)
-        timeout-minutes: 30
-        run: cargo nextest run --workspace --lib --no-run
+  # -------------------------------------------------------------------------
+  # Test — one job per crate, parallel. Matrix + fail-fast: false so a
+  # failure in one crate surfaces the failure signal without cancelling
+  # the others.
+  # -------------------------------------------------------------------------
+  test:
+    name: "Test (${{ matrix.crate }})"
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: [common, storage, core, trading, api, app]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
 
-      - name: cargo nextest run --workspace --lib (profile=ci)
-        timeout-minutes: 25
-        # Lib-only tests against a warm build. Compile happens in the
-        # previous step; this one only runs the already-built binaries.
-        #
+      - name: Install Rust toolchain 1.93.1
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.93.1'
+
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-test-${{ matrix.crate }}
+          cache-on-failure: true
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - name: cargo nextest run -p tickvault-${{ matrix.crate }} --lib (profile=ci)
         # Profile `ci` (.config/nextest.toml) caps per-test wall-clock
-        # at 90 s so runaway / hung tests fail fast instead of blowing
-        # the step budget. Flaky integration tests get one automatic
-        # retry before being marked FAIL.
-        run: cargo nextest run --workspace --lib --no-fail-fast --profile ci
+        # at 90 s so runaway tests fail fast. Flaky tests get 1 retry
+        # before being marked FAIL.
+        run: cargo nextest run -p tickvault-${{ matrix.crate }} --lib --no-fail-fast --profile ci
 
   # -------------------------------------------------------------------------
   # Security & Audit — delegated to security-audit.yml workflow.
