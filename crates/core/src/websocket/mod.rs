@@ -22,7 +22,7 @@ pub mod subscription_builder;
 pub mod tls;
 pub mod types;
 
-pub use connection::WebSocketConnection;
+pub use connection::{SubscribeCommand, WebSocketConnection};
 pub use connection_pool::WebSocketConnectionPool;
 pub use depth_connection::{
     DepthCommand, run_twenty_depth_connection, run_two_hundred_depth_connection,

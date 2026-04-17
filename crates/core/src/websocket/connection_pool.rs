@@ -57,6 +57,15 @@ pub struct WebSocketConnectionPool {
     /// `poll_watchdog()` API works from a `&self` reference shared across
     /// the pool's background task and its owner.
     watchdog: std::sync::Mutex<PoolWatchdog>,
+
+    /// O1-B (2026-04-17): Per-connection runtime subscribe-command senders.
+    /// Index `i` matches `connections[i]`. `None` means "no subscribe
+    /// channel was wired for this connection" (e.g. test pools or the
+    /// pre-O1-B legacy boot path). `dispatch_subscribe()` picks the
+    /// connection with the most spare instrument capacity and uses its
+    /// sender. Empty Vec when no channels installed.
+    subscribe_senders:
+        std::sync::Mutex<Vec<Option<mpsc::Sender<crate::websocket::connection::SubscribeCommand>>>>,
 }
 
 impl std::fmt::Debug for WebSocketConnectionPool {
@@ -193,6 +202,9 @@ impl WebSocketConnectionPool {
             frame_sender,
             connection_stagger_ms: ws_config.connection_stagger_ms,
             watchdog: std::sync::Mutex::new(PoolWatchdog::new()),
+            // O1-B: empty until `install_subscribe_channels()` is called.
+            // APPROVED: cold path — pool constructor, runs once at boot.
+            subscribe_senders: std::sync::Mutex::new(Vec::with_capacity(MAX_WEBSOCKET_CONNECTIONS)),
         })
     }
 
@@ -208,7 +220,7 @@ impl WebSocketConnectionPool {
     /// the STAGE-C.2b replay-injection integration flow in main.rs.
     // TEST-EXEMPT: trivial Arc-bump clone accessor — `mpsc::Sender::clone` is tokio-tested; integration covered by main.rs replay-injection path
     pub fn frame_sender_clone(&self) -> mpsc::Sender<bytes::Bytes> {
-        self.frame_sender.clone()
+        self.frame_sender.clone() // APPROVED: cold path — Arc bump for boot-time WAL replay, not per-tick
     }
 
     /// Spawns all connections as independent tokio tasks with staggered startup.
@@ -264,6 +276,68 @@ impl WebSocketConnectionPool {
     /// Number of connections in the pool.
     pub fn connection_count(&self) -> usize {
         self.connections.len()
+    }
+
+    /// O1-B (2026-04-17): Install runtime subscribe-command channels on
+    /// every connection in the pool. Creates one bounded mpsc per
+    /// connection (capacity 8 — Phase 2 plus a safety margin), gives the
+    /// receiver to the connection, retains the sender on the pool for
+    /// `dispatch_subscribe`. Idempotent: calling twice re-creates all
+    /// channels (and the prior senders are dropped, which closes the old
+    /// receivers cleanly).
+    ///
+    /// Spawn `spawn_all` AFTER this so the read loop sees the receiver
+    /// when it calls `subscribe_cmd_rx.lock().take()`. If called after
+    /// spawn, the new receiver is only seen on the NEXT reconnect cycle.
+    ///
+    /// Cold path — runs once at boot. O(N) over connection count.
+    // TEST-EXEMPT: O1-B pool installation; integration covered via main.rs both boot paths
+    pub async fn install_subscribe_channels(&self) {
+        let mut new_senders = Vec::with_capacity(self.connections.len()); // O(1) EXEMPT: cold path
+        for conn in &self.connections {
+            let (tx, rx) = mpsc::channel::<crate::websocket::connection::SubscribeCommand>(8);
+            let _previous = conn.install_subscribe_channel(rx).await;
+            new_senders.push(Some(tx));
+        }
+        // Replace any previously installed senders.
+        if let Ok(mut guard) = self.subscribe_senders.lock() {
+            *guard = new_senders;
+        }
+    }
+
+    /// O1-B: Dispatches a `SubscribeCommand` to the connection with the
+    /// most spare instrument capacity. Returns `Some(connection_id)` on
+    /// success, `None` if no channels are installed or every connection
+    /// is at the per-connection cap.
+    ///
+    /// Capacity is read from `health()` snapshots and compared against
+    /// the dhan-config cap captured by each connection — no global cap
+    /// stored on the pool.
+    // TEST-EXEMPT: O1-B pool dispatch; covered by phase2_scheduler integration in main.rs
+    pub fn dispatch_subscribe(
+        &self,
+        cmd: crate::websocket::connection::SubscribeCommand,
+    ) -> Option<usize> {
+        // O(1) EXEMPT: cold path — runs once per Phase 2 trigger or
+        // operator override, not per tick.
+        let healths = self.health();
+        let Ok(senders_guard) = self.subscribe_senders.lock() else {
+            return None;
+        };
+        if senders_guard.is_empty() {
+            return None;
+        }
+        // Pick the connection with the smallest current subscribed_count.
+        let target_idx = healths
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, h)| h.subscribed_count)
+            .map(|(i, _)| i)?;
+        let sender = senders_guard.get(target_idx)?.as_ref()?;
+        match sender.try_send(cmd) {
+            Ok(()) => Some(target_idx),
+            Err(_e) => None,
+        }
     }
 
     /// Total instruments across all connections.

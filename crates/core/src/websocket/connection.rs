@@ -38,6 +38,27 @@ use crate::websocket::types::{
 };
 
 // ---------------------------------------------------------------------------
+// O1-B (2026-04-17): Runtime subscribe-add command
+// ---------------------------------------------------------------------------
+
+/// Runtime subscribe-add command for main-feed connections.
+///
+/// Mirrors `DepthCommand::Swap20` / `DepthCommand::Swap200` for depth.
+/// Used by the 9:12 IST Phase 2 scheduler to subscribe stock F&O via the
+/// existing pool — zero disconnect, RequestCode 17/21 sent on the same
+/// WebSocket the connection is already running on.
+#[derive(Debug, Clone)]
+pub enum SubscribeCommand {
+    /// Subscribe these instruments on this connection. The connection's
+    /// read loop builds the JSON subscribe messages with the given feed
+    /// mode and sends them via the existing write sink.
+    AddInstruments {
+        instruments: Vec<InstrumentSubscription>,
+        feed_mode: FeedMode,
+    },
+}
+
+// ---------------------------------------------------------------------------
 // WebSocket Connection
 // ---------------------------------------------------------------------------
 
@@ -125,6 +146,15 @@ pub struct WebSocketConnection {
     /// represents a dead socket and must return `Err` so the outer loop
     /// reconnects.
     watchdog_notify: Arc<tokio::sync::Notify>,
+
+    /// O1-B (2026-04-17): Optional runtime subscribe-command receiver.
+    /// `None` after `new()`; installed via `with_subscribe_channel`. The
+    /// read loop's `select!` polls this alongside the socket; on receipt
+    /// it builds subscribe messages (RequestCode 17/21) and sends them
+    /// via the existing write sink. The `Mutex<Option<...>>` lets the
+    /// run loop `.take()` the receiver once at startup without making the
+    /// constructor signature heavier.
+    subscribe_cmd_rx: tokio::sync::Mutex<Option<mpsc::Receiver<SubscribeCommand>>>,
 }
 
 impl WebSocketConnection {
@@ -184,6 +214,8 @@ impl WebSocketConnection {
             wal_spill: None,
             activity_counter: Arc::new(AtomicU64::new(0)),
             watchdog_notify: Arc::new(tokio::sync::Notify::new()),
+            // O1-B: subscribe command channel installed lazily via builder.
+            subscribe_cmd_rx: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -196,6 +228,34 @@ impl WebSocketConnection {
     pub fn with_wal_spill(mut self, spill: Arc<WsFrameSpill>) -> Self {
         self.wal_spill = Some(spill);
         self
+    }
+
+    /// O1-B (2026-04-17): Attach a runtime subscribe-command channel.
+    ///
+    /// Builder form — chain after `new()` before Arc-wrapping. For
+    /// post-Arc installation (the production path where the pool
+    /// constructs connections then wraps them in `Arc<...>`), use
+    /// `install_subscribe_channel(&self, rx)` instead.
+    // TEST-EXEMPT: builder pass-through; behavior covered by integration tests
+    pub fn with_subscribe_channel(self, rx: mpsc::Receiver<SubscribeCommand>) -> Self {
+        if let Ok(mut guard) = self.subscribe_cmd_rx.try_lock() {
+            *guard = Some(rx);
+        }
+        self
+    }
+
+    /// O1-B: Install the subscribe-command receiver via shared reference.
+    /// Used by `WebSocketConnectionPool::install_subscribe_channels` after
+    /// connections have been Arc-wrapped. Idempotent on a per-connection
+    /// basis: a second call replaces the prior receiver.
+    /// Returns the previous receiver if any was installed.
+    // TEST-EXEMPT: O1-B installation API; covered by pool.install_subscribe_channels integration via main.rs
+    pub async fn install_subscribe_channel(
+        &self,
+        rx: mpsc::Receiver<SubscribeCommand>,
+    ) -> Option<mpsc::Receiver<SubscribeCommand>> {
+        let mut guard = self.subscribe_cmd_rx.lock().await;
+        guard.replace(rx)
     }
 
     /// A5: Request graceful shutdown of this connection. Idempotent.
@@ -555,6 +615,17 @@ impl WebSocketConnection {
         let (write, mut read) = ws_stream.split();
         let write = Arc::new(tokio::sync::Mutex::new(write));
 
+        // O1-B (2026-04-17): take the subscribe-command receiver once at
+        // read-loop start. If the pool installed a channel, this is `Some`
+        // for the duration of this connect cycle; if the connection
+        // reconnects, `subscribe_cmd_rx` is `None` (we already took it).
+        // Pool can re-install via `with_subscribe_channel` between
+        // connect cycles — but the typical case is one channel per
+        // process lifetime.
+        let mut subscribe_rx = self.subscribe_cmd_rx.lock().await.take();
+        let m_subscribe_dispatched = metrics::counter!("tv_ws_subscribe_command_dispatched_total");
+        let m_subscribe_failed = metrics::counter!("tv_ws_subscribe_command_failed_total");
+
         // ZL-P0-1: pre-build the heartbeat gauge handle ONCE so the hot
         // per-frame update is a single atomic store.
         // O(1) EXEMPT: begin
@@ -663,6 +734,73 @@ impl WebSocketConnection {
                         let _ = time::timeout(Duration::from_secs(1), sink.close()).await; // APPROVED: graceful-shutdown inner close timeout — 1s is the session 7 A5 spec.
                     }
                     return Ok(());
+                }
+                // O1-B (2026-04-17): runtime subscribe-command arm.
+                // When the pool dispatches a `SubscribeCommand::AddInstruments`
+                // here, build subscribe messages (RequestCode 17/21) and
+                // send them via the existing write sink. Zero disconnect,
+                // single round-trip per batch. If `subscribe_rx` is None
+                // (no channel ever installed), `pending()` keeps the arm
+                // dormant forever — the rest of select! is unaffected.
+                maybe_cmd = async {
+                    match subscribe_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending::<Option<SubscribeCommand>>().await,
+                    }
+                } => {
+                    if let Some(SubscribeCommand::AddInstruments { instruments, feed_mode }) = maybe_cmd {
+                        let count = instruments.len();
+                        let messages = build_subscription_messages(
+                            &instruments,
+                            feed_mode,
+                            self.ws_config.subscription_batch_size,
+                        );
+                        let msg_count = messages.len();
+                        let mut sink = write.lock().await;
+                        let mut send_failures: u32 = 0;
+                        // Consume messages by value to avoid an extra alloc
+                        // — the Vec is built per dispatch, no reuse needed.
+                        // O(1) EXEMPT: cold path — at most a handful
+                        // of messages per Phase 2 dispatch (max 100
+                        // instruments per message per Dhan rule).
+                        for msg in messages {
+                            match sink.send(Message::Text(msg.into())).await {
+                                Ok(()) => {}
+                                Err(e) => {
+                                    error!(
+                                        connection_id = self.connection_id,
+                                        ?e,
+                                        "O1-B: subscribe-command send failed — Dhan socket likely dead"
+                                    );
+                                    send_failures = send_failures.saturating_add(1);
+                                }
+                            }
+                        }
+                        drop(sink);
+                        if send_failures == 0 {
+                            info!(
+                                connection_id = self.connection_id,
+                                added_count = count,
+                                msg_count,
+                                "O1-B: subscribe-command dispatched successfully"
+                            );
+                            m_subscribe_dispatched.increment(1);
+                        } else {
+                            warn!(
+                                connection_id = self.connection_id,
+                                send_failures,
+                                "O1-B: subscribe-command had partial failures"
+                            );
+                            m_subscribe_failed.increment(1);
+                        }
+                        // Loop back to the read arm — do NOT consume a
+                        // frame this iteration.
+                        continue;
+                    }
+                    // Channel closed → leave the arm dormant for the rest
+                    // of this connect cycle.
+                    subscribe_rx = None;
+                    continue;
                 }
                 // STAGE-B (P1.1): plain read.next().await — no deadline.
                 next_frame = read.next() => next_frame,

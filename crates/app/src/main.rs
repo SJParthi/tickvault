@@ -829,6 +829,11 @@ async fn main() -> Result<()> {
         // &self so sharing via Arc is cheap + lock-free.
         let (ws_handles, ws_pool_arc) = if let Some(pool) = ws_pool_ready {
             let pool_arc = std::sync::Arc::new(pool);
+            // O1-B (2026-04-17): install per-connection runtime subscribe
+            // channels BEFORE spawn so the read loop sees the receivers on
+            // its first iteration. The Phase 2 scheduler reads the matching
+            // senders via `pool_arc.dispatch_subscribe(...)`.
+            pool_arc.install_subscribe_channels().await;
             let handles = spawn_websocket_connections(std::sync::Arc::clone(&pool_arc)).await;
             spawn_pool_watchdog_task(
                 std::sync::Arc::clone(&pool_arc),
@@ -1775,6 +1780,9 @@ async fn main() -> Result<()> {
     let shutdown_notify = std::sync::Arc::new(tokio::sync::Notify::new());
     let (ws_handles, ws_pool_arc) = if let Some(pool) = ws_pool_ready {
         let pool_arc = std::sync::Arc::new(pool);
+        // O1-B (2026-04-17): install per-connection runtime subscribe
+        // channels BEFORE spawn — same as the FAST BOOT path (main.rs ~830).
+        pool_arc.install_subscribe_channels().await;
         let handles = spawn_websocket_connections(std::sync::Arc::clone(&pool_arc)).await;
         spawn_pool_watchdog_task(
             std::sync::Arc::clone(&pool_arc),
@@ -2604,20 +2612,27 @@ async fn main() -> Result<()> {
             // Sleeps until 09:12 IST (or runs immediately if already past 9:12
             // and within market hours), then waits for NIFTY/BANKNIFTY LTPs,
             // then emits Phase2Complete/Failed. Actual SubscribeCommand dispatch
-            // is Phase B — this commit ships observability first.
+            // O1-B (2026-04-17): the scheduler now dispatches a real
+            // `SubscribeCommand` to the pool when the LTPs arrive. The
+            // `phase2_instruments` argument here is `None` for v1 — the
+            // delta computation (which derivative_contracts to subscribe
+            // given the live spot price + boot universe) is the next step
+            // and ships in a follow-up commit. With `phase2_instruments=None`
+            // the scheduler falls back to alert-only mode (logs + Telegram
+            // with `added_count=0`) so operators still get the 9:12 signal.
             {
                 let phase2_spot_prices = std::sync::Arc::clone(&shared_spot_prices);
                 let phase2_calendar = std::sync::Arc::clone(&trading_calendar);
                 let phase2_notifier = notifier.clone();
-                // Planned count is 0 until Phase B lands the delta computation —
-                // the Phase2Complete alert's `added_count` will be accurate then.
-                let planned_phase2_count = 0usize;
+                let phase2_pool = ws_pool_arc.clone();
                 tokio::spawn(async move {
                     tickvault_core::instrument::phase2_scheduler::run_phase2_scheduler(
                         phase2_spot_prices,
                         phase2_calendar,
                         phase2_notifier,
-                        planned_phase2_count,
+                        phase2_pool,
+                        None, // O1-B v2: real instrument list lands with delta computation
+                        tickvault_common::types::FeedMode::Quote,
                     )
                     .await;
                 });

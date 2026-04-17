@@ -206,18 +206,28 @@ fn current_ist() -> (NaiveDate, NaiveTime) {
 /// proceed, waits for LTPs and fires `Phase2Complete` (or `Phase2Failed`
 /// after `MAX_LTP_ATTEMPTS`).
 ///
-/// **Actual subscribe dispatch is stubbed in this commit** — the scheduler
-/// knows what it WOULD subscribe (via `compute_phase2_delta`) and emits the
-/// count in the completion event. The matching `SubscribeCommand` plumbing
-/// into `WebSocketConnection` is the next commit (O1-B).
+/// O1-B (2026-04-17): if `pool` and `phase2_instruments` are both `Some`,
+/// the scheduler dispatches a real `SubscribeCommand::AddInstruments` to
+/// the connection with the most spare capacity. If either is `None`, the
+/// scheduler runs in alert-only mode (logs what it would subscribe, fires
+/// `Phase2Complete` with the planned count for visibility). The
+/// alert-only path is used by tests + the legacy code path that hasn't
+/// yet computed the delta.
 // TEST-EXEMPT: async driver with time-dependent sleep loop — decision logic covered by test_next_trigger_*, readiness by test_has_required_ltps_*
 pub async fn run_phase2_scheduler(
     spot_prices: crate::instrument::depth_rebalancer::SharedSpotPrices,
     calendar: Arc<TradingCalendar>,
     notifier: Arc<NotificationService>,
-    planned_phase2_count: usize,
+    pool: Option<Arc<crate::websocket::WebSocketConnectionPool>>,
+    phase2_instruments: Option<Vec<crate::websocket::types::InstrumentSubscription>>,
+    feed_mode: tickvault_common::types::FeedMode,
 ) {
-    info!(planned_phase2_count, "Phase 2 scheduler starting");
+    let planned_phase2_count = phase2_instruments.as_ref().map(|v| v.len()).unwrap_or(0);
+    info!(
+        planned_phase2_count,
+        has_pool = pool.is_some(),
+        "Phase 2 scheduler starting"
+    );
 
     let (today_ist, time_ist) = current_ist();
     let decision = next_phase2_trigger(today_ist, time_ist, &calendar);
@@ -252,17 +262,65 @@ pub async fn run_phase2_scheduler(
     for attempt in 1..=MAX_LTP_ATTEMPTS {
         if wait_for_ltps_once(&spot_prices).await {
             let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-            info!(
-                attempt,
-                duration_ms,
-                planned_phase2_count,
-                "Phase 2: LTPs present — would subscribe (stub: actual SubscribeCommand \
-                 dispatch is a follow-up commit)"
-            );
+
+            // O1-B (2026-04-17): real dispatch path. If we have both a
+            // pool reference AND a precomputed instrument list, send a
+            // SubscribeCommand to the pool. Otherwise fall through to
+            // alert-only.
+            let dispatched_count = match (pool.as_ref(), phase2_instruments.as_ref()) {
+                (Some(pool_ref), Some(instruments)) if !instruments.is_empty() => {
+                    let cmd = crate::websocket::SubscribeCommand::AddInstruments {
+                        instruments: instruments.clone(),
+                        feed_mode,
+                    };
+                    match pool_ref.dispatch_subscribe(cmd) {
+                        Some(conn_id) => {
+                            info!(
+                                attempt,
+                                duration_ms,
+                                target_connection = conn_id,
+                                added_count = instruments.len(),
+                                "Phase 2: SubscribeCommand dispatched to pool"
+                            );
+                            instruments.len()
+                        }
+                        None => {
+                            error!(
+                                attempt,
+                                instrument_count = instruments.len(),
+                                "Phase 2: dispatch_subscribe returned None — pool has \
+                                     no spare capacity or no channels installed"
+                            );
+                            metrics::counter!(
+                                "tv_phase2_runs_total",
+                                "outcome" => "dispatch_failed"
+                            )
+                            .increment(1);
+                            notifier.notify(NotificationEvent::Phase2Failed {
+                                reason: "pool dispatch returned None — no capacity or \
+                                             no channels installed"
+                                    .to_string(),
+                                attempts: attempt,
+                            });
+                            return;
+                        }
+                    }
+                }
+                _ => {
+                    info!(
+                        attempt,
+                        duration_ms,
+                        planned_phase2_count,
+                        "Phase 2: LTPs present — alert-only mode (no pool or \
+                             empty instrument list)"
+                    );
+                    planned_phase2_count
+                }
+            };
             metrics::counter!("tv_phase2_runs_total", "outcome" => "complete").increment(1);
             metrics::histogram!("tv_phase2_run_ms").record(duration_ms as f64);
             notifier.notify(NotificationEvent::Phase2Complete {
-                added_count: planned_phase2_count,
+                added_count: dispatched_count,
                 duration_ms,
             });
             return;
