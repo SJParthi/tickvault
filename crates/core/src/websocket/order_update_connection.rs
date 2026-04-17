@@ -59,7 +59,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// * `order_sender` — Broadcast channel for order updates.
 ///
 /// Runs until the task is aborted or reconnection attempts are exhausted.
-#[allow(clippy::too_many_arguments)] // APPROVED: STAGE-C added wal_spill param
+#[allow(clippy::too_many_arguments)] // APPROVED: STAGE-C + O2 authenticated signal
 pub async fn run_order_update_connection(
     order_update_url: String,
     client_id: String,
@@ -67,6 +67,8 @@ pub async fn run_order_update_connection(
     order_sender: broadcast::Sender<OrderUpdate>,
     calendar: Arc<TradingCalendar>,
     wal_spill: Option<Arc<WsFrameSpill>>,
+    authenticated_signal: Option<Arc<tokio::sync::Notify>>,
+    authenticated_latch: Option<Arc<std::sync::atomic::AtomicBool>>,
 ) {
     let mut consecutive_failures: u32 = 0;
     let m_reconnections = metrics::counter!("tv_order_update_reconnections_total");
@@ -81,6 +83,8 @@ pub async fn run_order_update_connection(
             &order_sender,
             &calendar,
             wal_spill.as_ref(),
+            authenticated_signal.as_ref(),
+            authenticated_latch.as_ref(),
         )
         .await
         {
@@ -143,6 +147,7 @@ pub async fn run_order_update_connection(
 
 /// Single connection lifecycle: connect → login → read loop.
 #[allow(clippy::too_many_arguments)] // APPROVED: STAGE-C added wal_spill param
+#[allow(clippy::too_many_arguments)] // APPROVED: STAGE-C + O2 authenticated signal
 async fn connect_and_listen(
     url: &str,
     client_id: &str,
@@ -150,6 +155,8 @@ async fn connect_and_listen(
     order_sender: &broadcast::Sender<OrderUpdate>,
     calendar: &TradingCalendar,
     wal_spill: Option<&Arc<WsFrameSpill>>,
+    authenticated_signal: Option<&Arc<tokio::sync::Notify>>,
+    authenticated_latch: Option<&Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<(), OrderUpdateConnectionError> {
     // Read current token.
     let token_guard = token_handle.load();
@@ -294,6 +301,11 @@ async fn connect_and_listen(
                 match parse_order_update(&text) {
                     Ok(update) => {
                         m_messages.increment(1);
+                        // O2 (2026-04-17): First successful order-update parse
+                        // proves Dhan accepted our auth and is streaming. Fire
+                        // the authenticated signal exactly once per process
+                        // lifetime (CAS latch).
+                        fire_authenticated_signal_once(authenticated_signal, authenticated_latch);
                         debug!(
                             order_no = %update.order_no,
                             status = %update.status,
@@ -319,6 +331,13 @@ async fn connect_and_listen(
                                 // Login ack or heartbeat — not all messages are order updates.
                                 metrics::counter!("tv_order_update_non_order_messages_total")
                                     .increment(1);
+                                // O2: a Success classification (typical: the
+                                // first login ACK from Dhan) is the earliest
+                                // proof of authentication. Fire the signal.
+                                fire_authenticated_signal_once(
+                                    authenticated_signal,
+                                    authenticated_latch,
+                                );
                                 debug!(
                                     ?err,
                                     text_preview = &text[..text.len().min(200)],
@@ -422,6 +441,32 @@ enum AuthResponseKind {
     Success,
     /// Auth handshake failed with the given reason.
     Failed(String),
+}
+
+/// O2 (2026-04-17): Fires the authenticated-signal notify exactly once per
+/// process lifetime. Uses a CAS latch so repeated calls (many successful
+/// messages in a row) are a no-op after the first. Called from both
+/// successful `parse_order_update` and `AuthResponseKind::Success` paths
+/// — whichever arrives first.
+fn fire_authenticated_signal_once(
+    signal: Option<&Arc<tokio::sync::Notify>>,
+    latch: Option<&Arc<std::sync::atomic::AtomicBool>>,
+) {
+    if let (Some(sig), Some(lat)) = (signal, latch) {
+        // Ordering: Release so the notify_waiters happens-before any
+        // observer that later sees `latch = true`.
+        if lat
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            sig.notify_waiters();
+        }
+    }
 }
 
 /// Classifies the server's first text response after sending the LoginReq.
@@ -595,6 +640,79 @@ enum OrderUpdateConnectionError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ========================================================================
+    // O2 (2026-04-17) — Authenticated-signal latch tests
+    // ========================================================================
+
+    #[tokio::test]
+    async fn test_fire_authenticated_signal_once_wakes_waiter() {
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let latch = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Spawn a waiter BEFORE firing to avoid the notify-before-await race.
+        let waiter_notify = Arc::clone(&notify);
+        let wait_handle = tokio::spawn(async move {
+            waiter_notify.notified().await;
+            true
+        });
+        // Give the waiter a moment to register.
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        fire_authenticated_signal_once(Some(&notify), Some(&latch));
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), wait_handle)
+            .await
+            .expect("notify must wake waiter within 1s")
+            .expect("task must not panic");
+        assert!(result);
+        assert!(latch.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn test_fire_authenticated_signal_latch_is_one_shot() {
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let latch = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        // First fire flips the latch.
+        fire_authenticated_signal_once(Some(&notify), Some(&latch));
+        assert!(latch.load(std::sync::atomic::Ordering::Acquire));
+
+        // Second fire is a no-op. We verify by attaching a waiter AFTER the
+        // second fire — if the second fire notified waiters, the waiter
+        // would never be woken by anything else and the timeout would fire.
+        fire_authenticated_signal_once(Some(&notify), Some(&latch));
+        let waiter_notify = Arc::clone(&notify);
+        let wait = tokio::spawn(async move {
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                waiter_notify.notified(),
+            )
+            .await
+            .is_ok()
+        });
+        let woken = wait.await.unwrap();
+        assert!(
+            !woken,
+            "second fire must be a no-op — late waiter should NOT wake"
+        );
+    }
+
+    #[test]
+    fn test_fire_authenticated_signal_accepts_none() {
+        // Both signal and latch absent — must not panic.
+        fire_authenticated_signal_once(None, None);
+    }
+
+    #[test]
+    fn test_fire_authenticated_signal_partial_none_is_safe() {
+        // Only one side present — still a no-op, must not panic.
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let latch = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        fire_authenticated_signal_once(Some(&notify), None);
+        fire_authenticated_signal_once(None, Some(&latch));
+        // Neither side should have been flipped because the helper requires
+        // BOTH to be present (atomic-latch semantics need the pair).
+        assert!(!latch.load(std::sync::atomic::Ordering::Acquire));
+    }
 
     #[test]
     fn test_order_update_connection_error_display_variants() {

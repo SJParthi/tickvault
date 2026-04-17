@@ -139,6 +139,14 @@ pub enum NotificationEvent {
     /// Order update WebSocket connected.
     OrderUpdateConnected,
 
+    /// O2 (2026-04-17): Order Update WebSocket has completed the Dhan auth
+    /// handshake — fires exactly once per process lifetime when the server
+    /// sends the first message that classifies as `AuthResponseKind::Success`
+    /// OR the first successful `parse_order_update`. This is the earliest
+    /// proof Dhan accepted the token; the earlier `OrderUpdateConnected`
+    /// event only signals that the tokio task started.
+    OrderUpdateAuthenticated,
+
     /// Order update WebSocket disconnected.
     OrderUpdateDisconnected { reason: String },
 
@@ -458,6 +466,10 @@ impl NotificationEvent {
                 )
             }
             Self::OrderUpdateConnected => "<b>Order Update WS connected</b>".to_string(),
+            Self::OrderUpdateAuthenticated => {
+                "<b>Order Update WS authenticated</b>\nDhan accepted token — streaming live."
+                    .to_string()
+            }
             Self::OrderUpdateDisconnected { reason } => {
                 format!("<b>Order Update WS DISCONNECTED</b>\n{reason}")
             }
@@ -797,6 +809,7 @@ impl NotificationEvent {
             Self::DepthTwentyConnected { .. } => Severity::Low,
             Self::DepthTwoHundredConnected { .. } => Severity::Low,
             Self::OrderUpdateConnected => Severity::Low,
+            Self::OrderUpdateAuthenticated => Severity::Medium,
             Self::TokenRenewed => Severity::Low,
             Self::IpVerificationSuccess { .. } => Severity::Low,
             Self::AuthenticationSuccess => Severity::Low,

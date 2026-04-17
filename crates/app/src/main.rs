@@ -853,7 +853,7 @@ async fn main() -> Result<()> {
         // Background: Docker infra + QuestDB DDL + SSM validation
         // Notification already initialized above (needed for IP verification).
         // All run concurrently. None of them block tick processing.
-        let notifier = fast_notifier;
+        let notifier = fast_notifier.clone();
         let (_, deferred_token_manager) = tokio::join!(
             // Docker infra + QuestDB DDL
             async {
@@ -1043,8 +1043,32 @@ async fn main() -> Result<()> {
             let sender = order_update_sender.clone();
             let cal = trading_calendar.clone();
             let spill = ws_frame_spill.clone();
+            // O2 (2026-04-17): FAST BOOT parity — fires OrderUpdateAuthenticated
+            // Telegram event once Dhan accepts the token (first real message).
+            let auth_signal = std::sync::Arc::new(tokio::sync::Notify::new());
+            let auth_latch = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            {
+                let listener_signal = std::sync::Arc::clone(&auth_signal);
+                let listener_notifier = fast_notifier.clone();
+                tokio::spawn(async move {
+                    listener_signal.notified().await;
+                    listener_notifier.notify(NotificationEvent::OrderUpdateAuthenticated);
+                });
+            }
+            let run_signal = Some(std::sync::Arc::clone(&auth_signal));
+            let run_latch = Some(std::sync::Arc::clone(&auth_latch));
             tokio::spawn(async move {
-                run_order_update_connection(url, ws_client_id, token, sender, cal, spill).await;
+                run_order_update_connection(
+                    url,
+                    ws_client_id,
+                    token,
+                    sender,
+                    cal,
+                    spill,
+                    run_signal,
+                    run_latch,
+                )
+                .await;
             })
         };
         info!("order update WebSocket started (background)");
@@ -2788,12 +2812,39 @@ async fn main() -> Result<()> {
         let ou_connect_notifier = notifier.clone();
         let ou_health = health_status.clone();
         let ou_wal_spill = ws_frame_spill.clone();
+        // O2 (2026-04-17): authenticated signal — fires once after first
+        // successful parse_order_update or AuthResponseKind::Success. The
+        // `OrderUpdateConnected` event below is "task spawned" semantics;
+        // `OrderUpdateAuthenticated` is "Dhan accepted the token and is
+        // streaming". Operators see both so they know where in the handshake
+        // they are.
+        let auth_signal = std::sync::Arc::new(tokio::sync::Notify::new());
+        let auth_latch = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let listener_signal = std::sync::Arc::clone(&auth_signal);
+            let listener_notifier = notifier.clone();
+            tokio::spawn(async move {
+                listener_signal.notified().await;
+                listener_notifier.notify(NotificationEvent::OrderUpdateAuthenticated);
+            });
+        }
+        let run_signal = Some(std::sync::Arc::clone(&auth_signal));
+        let run_latch = Some(std::sync::Arc::clone(&auth_latch));
         tokio::spawn(async move {
             ou_health.set_order_update_connected(true);
             // Telegram: Order Update WS connected (fires before read loop starts).
             ou_connect_notifier.notify(NotificationEvent::OrderUpdateConnected);
-            run_order_update_connection(url, order_ws_client_id, token, sender, cal, ou_wal_spill)
-                .await;
+            run_order_update_connection(
+                url,
+                order_ws_client_id,
+                token,
+                sender,
+                cal,
+                ou_wal_spill,
+                run_signal,
+                run_latch,
+            )
+            .await;
             // If run_order_update_connection returns, connection terminated
             ou_notifier.notify(NotificationEvent::OrderUpdateDisconnected {
                 reason: "connection task exited".to_string(),
