@@ -1363,7 +1363,7 @@ mod tests {
             .timeout(Duration::from_millis(100))
             .build()
             .unwrap();
-        let base_url = "http://192.0.2.1:1/exec";
+        let base_url = "http://127.0.0.1:1/exec";
         let result = views_missing_greeks(&client, base_url).await;
         assert!(!result);
     }
@@ -1422,7 +1422,7 @@ mod tests {
             .timeout(Duration::from_millis(100))
             .build()
             .unwrap();
-        let base_url = "http://192.0.2.1:1/exec";
+        let base_url = "http://127.0.0.1:1/exec";
         drop_all_views(&client, base_url).await;
     }
 
@@ -1443,7 +1443,7 @@ mod tests {
             .timeout(Duration::from_millis(100))
             .build()
             .unwrap();
-        let base_url = "http://192.0.2.1:1/exec";
+        let base_url = "http://127.0.0.1:1/exec";
         ensure_greeks_columns_on_table(&client, base_url, "test_table").await;
     }
 
@@ -1508,7 +1508,7 @@ mod tests {
             .timeout(Duration::from_millis(100))
             .build()
             .unwrap();
-        let base_url = "http://192.0.2.1:1/exec";
+        let base_url = "http://127.0.0.1:1/exec";
         verify_views_exist(&client, base_url).await;
     }
 

@@ -2645,7 +2645,7 @@ mod tests {
     #[tokio::test]
     async fn test_ensure_tick_table_dedup_keys_does_not_panic_unreachable() {
         let config = QuestDbConfig {
-            host: "192.0.2.1".to_string(), // RFC 5737 TEST-NET
+            host: "127.0.0.1".to_string(), // RFC 5737 TEST-NET
             http_port: 9000,
             pg_port: 8812,
             ilp_port: 9009,
@@ -5238,7 +5238,7 @@ mod tests {
     #[tokio::test]
     async fn test_ensure_depth_and_prev_close_tables_unreachable() {
         let config = QuestDbConfig {
-            host: "192.0.2.1".to_string(),
+            host: "127.0.0.1".to_string(),
             http_port: 1,
             pg_port: 1,
             ilp_port: 1,
@@ -6082,7 +6082,7 @@ mod tests {
 
         // Set sender to None and point to unreachable host.
         writer.sender = None;
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
 
         // Reconnect should fail after 3 attempts.
         let result = writer.try_reconnect_on_error();
@@ -6504,7 +6504,7 @@ mod tests {
 
         // Simulate disconnected state.
         writer.sender = None;
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
 
         // Set next_reconnect_allowed to far in the future.
         writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
@@ -6539,7 +6539,7 @@ mod tests {
 
         // Simulate disconnected state.
         writer.sender = None;
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
 
         // Allow reconnect immediately.
         writer.next_reconnect_allowed = std::time::Instant::now();
@@ -6566,7 +6566,7 @@ mod tests {
         let mut writer = DepthPersistenceWriter::new(&config).unwrap();
 
         writer.sender = None;
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
         writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
 
         let result = writer.try_reconnect_on_error();
@@ -6779,7 +6779,7 @@ mod tests {
 
         // Simulate disconnect.
         writer.sender = None;
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
         writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
 
         // Pre-set spill to a unique temp file so we don't collide with other tests.
@@ -6968,7 +6968,7 @@ mod tests {
 
         // Phase 2: CRASH QuestDB (kill sender, point to unreachable host).
         writer.sender = None;
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
         writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
 
         // Pre-set spill to unique temp path.
@@ -7064,7 +7064,7 @@ mod tests {
 
         // Phase 1: Kill QuestDB immediately.
         writer.sender = None;
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
         writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
 
         // Pre-set spill to unique temp path.
@@ -7188,7 +7188,7 @@ mod tests {
         // ---- PHASE 2: QuestDB CRASHES ----
         eprintln!("--- PHASE 2: QuestDB CRASHES (connection dead) ---");
         writer.sender = None;
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
         writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
         eprintln!("  [!] Killed sender (simulates QuestDB crash)");
         eprintln!(
@@ -7433,7 +7433,7 @@ mod tests {
 
         // Kill the sender to simulate QuestDB crash.
         writer.sender = None;
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
         writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
 
         // force_flush should rescue in-flight ticks to ring buffer.
@@ -7500,7 +7500,7 @@ mod tests {
 
         // Disconnect immediately.
         writer.sender = None;
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
         writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
 
         // Buffer 50 ticks in ring buffer.
@@ -7750,7 +7750,7 @@ mod tests {
         // Set throttle far in future to prevent reconnect.
         writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
         // Unreachable endpoint for reconnect.
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
 
         let depth = make_test_depth();
         writer
@@ -8007,7 +8007,7 @@ mod tests {
 
         // Simulate disconnect — block reconnect.
         writer.sender = None;
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
         writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
 
         // Buffer 10 depth snapshots while disconnected.
@@ -8064,7 +8064,7 @@ mod tests {
 
         // Simulate disconnect — block reconnect.
         writer.sender = None;
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
         writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
 
         // Pre-set spill to unique temp path to avoid interference.
@@ -8215,7 +8215,7 @@ mod tests {
 
         // Kill sender so that flush during drain will fail.
         writer.sender = None;
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
         writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
 
         // Attempt drain — it should detect no sender, rescue in-flight,
@@ -8350,7 +8350,7 @@ mod tests {
 
         // Kill sender to simulate connection break.
         writer.sender = None;
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
         writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
 
         // force_flush with None sender rescues in-flight ticks.
@@ -8521,7 +8521,7 @@ mod tests {
 
         // Simulate disconnect.
         writer.sender = None;
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
         writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
 
         let depth = make_test_depth();
@@ -8571,7 +8571,7 @@ mod tests {
 
         // Kill sender.
         writer.sender = None;
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
         writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
 
         // force_flush with None sender rescues in-flight.
@@ -8790,7 +8790,7 @@ mod tests {
 
         // Simulate disconnect and buffer ticks.
         writer.sender = None;
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
         writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
 
         // Set up temp spill file.
@@ -8919,7 +8919,7 @@ mod tests {
 
         // Simulate disconnect and buffer depth snapshots.
         writer.sender = None;
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
         writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
 
         // Set up temp spill file.
@@ -8979,7 +8979,7 @@ mod tests {
 
         // Simulate disconnect and buffer some depth snapshots.
         writer.sender = None;
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
         writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
 
         for i in 0..5_u32 {
@@ -9143,7 +9143,7 @@ mod tests {
 
         // Block reconnect so we can inspect state after failure.
         writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
 
         // force_flush — may or may not detect broken pipe depending on OS TCP buffer.
         let result = writer.force_flush();
@@ -9207,7 +9207,7 @@ mod tests {
 
         // Block reconnect.
         writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
 
         let result = writer.force_flush();
         if result.is_err() {
@@ -9257,7 +9257,7 @@ mod tests {
 
         // Block reconnect so broken sender stays broken.
         writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
 
         // This append should push count to TICK_FLUSH_BATCH_SIZE, triggering auto-flush
         // which will fail. The warn is logged, and append_tick returns Ok anyway.
@@ -9318,7 +9318,7 @@ mod tests {
 
         // Block reconnect.
         writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
 
         // This should trigger auto-flush at DEPTH_FLUSH_BATCH_SIZE, which will fail.
         let result =
@@ -9346,7 +9346,7 @@ mod tests {
 
         // Simulate disconnect and point to unreachable host.
         writer.sender = None;
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
 
         // reconnect() should try 3 times with exponential backoff and fail.
         // This takes ~7s (1s + 2s + 4s).
@@ -9377,7 +9377,7 @@ mod tests {
         let mut writer = DepthPersistenceWriter::new(&config).unwrap();
 
         writer.sender = None;
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
 
         let result = writer.reconnect();
         assert!(
@@ -10408,7 +10408,7 @@ mod tests {
 
         // Disconnect, buffer a tick
         writer.sender = None;
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
         writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
         writer.tick_buffer.push_back(make_test_tick(100, 500.0));
         assert_eq!(writer.buffered_tick_count(), 1);
@@ -10429,7 +10429,7 @@ mod tests {
     fn test_tick_append_reconnect_failure_buffers_tick() {
         // Exercise lines 220-224: reconnect fails → buffer the tick.
         let config = QuestDbConfig {
-            host: "192.0.2.1".to_string(),
+            host: "127.0.0.1".to_string(),
             ilp_port: 1,
             http_port: 1,
             pg_port: 1,
@@ -10471,7 +10471,7 @@ mod tests {
 
         // Simulate: sender is None, some ticks in-flight
         writer.sender = None;
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
         writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
         writer.pending_count = 2;
         writer.in_flight.push(make_test_tick(300, 700.0));
@@ -10508,7 +10508,7 @@ mod tests {
         // Now disconnect and call force_flush — the sender was moved but
         // pending_count > 0 and sender is None, so it rescues.
         writer.sender = None;
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
         writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
 
         let _result = writer.force_flush();
@@ -11066,7 +11066,7 @@ mod tests {
 
         // Disconnect
         writer.sender = None;
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
         writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
 
         let _result = writer.force_flush();
@@ -11094,7 +11094,7 @@ mod tests {
 
         // Drop sender, set to None to simulate broken pipe
         writer.sender = None;
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
         writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
 
         let _result = writer.force_flush();
@@ -11399,7 +11399,7 @@ mod tests {
         };
         let mut writer = DepthPersistenceWriter::new(&config).unwrap();
         writer.sender = None;
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
         writer.next_reconnect_allowed = std::time::Instant::now();
 
         let depth = make_test_depth();
@@ -11578,7 +11578,7 @@ mod tests {
 
         // Disconnect and point to unreachable host
         writer.sender = None;
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
         writer.next_reconnect_allowed = std::time::Instant::now();
 
         let tick = make_test_tick(44, 24520.0);
@@ -12207,7 +12207,7 @@ mod tests {
         };
         let mut writer = DepthPersistenceWriter::new(&config).unwrap();
         writer.sender = None;
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
 
         let result = writer.reconnect();
         assert!(result.is_err(), "reconnect to unreachable host must fail");
