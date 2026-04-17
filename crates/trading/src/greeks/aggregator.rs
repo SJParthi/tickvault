@@ -360,8 +360,18 @@ impl GreeksAggregator {
             return;
         }
 
-        // Slow path: first tick for this security_id — enrich from registry
-        let inst = match self.registry.get(tick.security_id) {
+        // Slow path: first tick for this security_id — enrich from registry.
+        // I-P1-11 (2026-04-17): segment-aware lookup. Dhan reuses security_id
+        // across segments; the tick header carries the correct segment in
+        // `tick.exchange_segment_code` (byte 3 of the 8-byte header). Using
+        // the legacy `get(id)` would return a wrong-segment entry (e.g. a
+        // NIFTY IDX_I entry for an NSE_FNO derivative tick with same id) and
+        // produce incorrect Greeks.
+        let segment = match ExchangeSegment::from_byte(tick.exchange_segment_code) {
+            Some(s) => s,
+            None => return, // Invalid segment byte — skip defensively
+        };
+        let inst = match self.registry.get_with_segment(tick.security_id, segment) {
             Some(i) => i,
             None => return, // Not in registry (unlikely)
         };

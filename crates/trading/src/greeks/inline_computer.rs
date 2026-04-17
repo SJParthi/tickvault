@@ -127,7 +127,9 @@ impl InlineGreeksComputer {
         // Lazy populate option metadata from registry on first tick.
         // After first tick, this is a single HashMap lookup — O(1).
         if !self.option_meta.contains_key(&tick.security_id) {
-            if let Some(meta) = self.resolve_option_meta(tick.security_id) {
+            if let Some(meta) =
+                self.resolve_option_meta(tick.security_id, tick.exchange_segment_code)
+            {
                 self.option_meta.insert(tick.security_id, meta);
             } else {
                 return; // Cannot resolve — future (not option) or missing data
@@ -184,8 +186,14 @@ impl InlineGreeksComputer {
     ///
     /// Returns `None` for futures (no option_type) or instruments
     /// with missing strike/expiry/underlying data.
-    fn resolve_option_meta(&self, security_id: u32) -> Option<OptionMeta> {
-        let inst = self.registry.get(security_id)?;
+    ///
+    /// I-P1-11 (2026-04-17): segment-aware lookup. The tick header carries
+    /// the segment in byte 3 (`tick.exchange_segment_code`). Using the
+    /// legacy `get(id)` would misresolve F&O contracts whose numeric id
+    /// collides with an index/equity in a different segment.
+    fn resolve_option_meta(&self, security_id: u32, segment_code: u8) -> Option<OptionMeta> {
+        let segment = ExchangeSegment::from_byte(segment_code)?;
+        let inst = self.registry.get_with_segment(security_id, segment)?;
 
         // Must be an option (CE/PE), not a future.
         let option_type = inst.option_type?;

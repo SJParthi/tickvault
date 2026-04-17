@@ -236,10 +236,18 @@ fn persist_stock_movers_snapshot(
     }
 
     // O(1) EXEMPT: cold path — registry lookup per entry (max 60 lookups per snapshot).
-    let lookup_symbol = |security_id: u32| -> &str {
+    // I-P1-11: segment-aware lookup — Dhan reuses security_id across segments
+    // (e.g. NIFTY IDX_I id=13 vs some NSE_EQ id=13). Using the legacy get(id)
+    // would return the wrong-segment entry and write a wrong symbol to the
+    // movers table. Segment byte comes from the MoverEntry header byte 3.
+    let lookup_symbol = |security_id: u32, segment_code: u8| -> &str {
+        let segment = match tickvault_common::types::ExchangeSegment::from_byte(segment_code) {
+            Some(s) => s,
+            None => return "",
+        };
         registry
             .as_ref()
-            .and_then(|r| r.get(security_id))
+            .and_then(|r| r.get_with_segment(security_id, segment))
             .map(|inst| inst.display_label.as_str())
             .unwrap_or("")
     };
@@ -251,7 +259,7 @@ fn persist_stock_movers_snapshot(
          entries: &[super::top_movers::MoverEntry],
          category: &str| {
             for (i, entry) in entries.iter().enumerate() {
-                let symbol = lookup_symbol(entry.security_id);
+                let symbol = lookup_symbol(entry.security_id, entry.exchange_segment_code);
                 let prev_close = f32_clean(entry.prev_close);
                 let ltp = f32_clean(entry.last_traded_price);
                 let change_pct = f32_clean(entry.change_pct);
@@ -300,9 +308,16 @@ fn persist_option_movers_snapshot(
          category: &str| {
             for (i, entry) in entries.iter().enumerate() {
                 // Enrich from registry — O(1) lookup on cold path, flattened with and_then
-                let enriched = registry
-                    .as_ref()
-                    .and_then(|reg| reg.get(entry.security_id))
+                // I-P1-11: segment-aware lookup (see lookup_symbol for rationale).
+                let seg_for_lookup = tickvault_common::types::ExchangeSegment::from_byte(
+                    entry.exchange_segment_code,
+                );
+                let enriched = seg_for_lookup
+                    .and_then(|seg| {
+                        registry
+                            .as_ref()
+                            .and_then(|reg| reg.get_with_segment(entry.security_id, seg))
+                    })
                     .map(|inst| {
                         let ot = inst
                             .option_type
@@ -366,11 +381,16 @@ fn persist_option_movers_snapshot(
                          entries: &[super::option_movers::OptionMoverEntry],
                          base_cat: &str| {
         let (opts, futs): (Vec<_>, Vec<_>) = entries.iter().cloned().partition(|e| {
-            registry
-                .as_ref()
-                .and_then(|r| r.get(e.security_id))
-                .and_then(|inst| inst.option_type)
-                .is_some()
+            // I-P1-11: segment-aware lookup so CE/PE classification works
+            // even when id collides with an index/equity in a different segment.
+            let seg = tickvault_common::types::ExchangeSegment::from_byte(e.exchange_segment_code);
+            seg.and_then(|s| {
+                registry
+                    .as_ref()
+                    .and_then(|r| r.get_with_segment(e.security_id, s))
+            })
+            .and_then(|inst| inst.option_type)
+            .is_some()
         });
         // O(1) EXEMPT: format! on cold path (7 calls per snapshot)
         let opt_cat = format!("OPTION_{base_cat}");
