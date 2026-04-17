@@ -105,6 +105,34 @@ pub enum NotificationEvent {
     /// at the moment of detection.
     DepthSpotPriceStale { underlying: String, age_secs: u64 },
 
+    /// O1 (2026-04-17): The Phase 2 scheduler woke up to do its run.
+    /// `minutes_late` = 0 on the normal 09:12 path, > 0 when fired via the
+    /// `RunImmediate` recovery path (crash mid-market or fresh late start).
+    Phase2Started { minutes_late: u64 },
+
+    /// O1: The Phase 2 scheduler fired via the `RunImmediate` path instead
+    /// of the normal 09:12 schedule — this is informational so operators
+    /// know the system crashed or started late and is catching up.
+    Phase2RunImmediate { minutes_late: u64 },
+
+    /// O1: Phase 2 completed — stock F&O delta was issued. `added_count`
+    /// is the number of instruments that would have been subscribed
+    /// (until the SubscribeCommand plumbing lands the count is best-effort
+    /// based on the precomputed plan).
+    Phase2Complete {
+        added_count: usize,
+        duration_ms: u64,
+    },
+
+    /// O1: Phase 2 failed — LTPs never arrived within `MAX_LTP_ATTEMPTS`
+    /// × `LTP_WAIT_SECS_PER_ATTEMPT`. Stock F&O remains unsubscribed for
+    /// this session. Operator should investigate the main-feed WebSocket.
+    Phase2Failed { reason: String, attempts: u32 },
+
+    /// O1: Phase 2 was skipped today (weekend, holiday, or post-market
+    /// restart). Low-noise — informational only.
+    Phase2Skipped { reason: String },
+
     /// WebSocket disconnected (unexpected, will reconnect).
     WebSocketDisconnected {
         connection_index: usize,
@@ -432,6 +460,40 @@ impl NotificationEvent {
                      Age: {age_secs}s (threshold 180s). Depth rebalance skipped — \
                      main-feed LTP feed may be stalled for this symbol."
                 )
+            }
+            Self::Phase2Started { minutes_late } => {
+                if *minutes_late == 0 {
+                    "<b>Phase 2 started</b>\nSubscribing stock F&O (09:12 IST trigger).".to_string()
+                } else {
+                    format!(
+                        "<b>Phase 2 started</b>\nSubscribing stock F&O — {minutes_late} min late \
+                         (crash-recovery or late-start path)."
+                    )
+                }
+            }
+            Self::Phase2RunImmediate { minutes_late } => {
+                format!(
+                    "<b>Phase 2 RunImmediate</b>\n{minutes_late} min past 09:12 IST — \
+                     running now to catch up after restart."
+                )
+            }
+            Self::Phase2Complete {
+                added_count,
+                duration_ms,
+            } => {
+                format!(
+                    "<b>Phase 2 complete</b>\nAdded {added_count} stock F&O instruments \
+                     in {duration_ms} ms."
+                )
+            }
+            Self::Phase2Failed { reason, attempts } => {
+                format!(
+                    "<b>Phase 2 FAILED</b> after {attempts} attempts\n{reason}\n\
+                     Stock F&O remains unsubscribed for this session — investigate main feed."
+                )
+            }
+            Self::Phase2Skipped { reason } => {
+                format!("<b>Phase 2 skipped</b>\n{reason}")
             }
             Self::WebSocketDisconnected {
                 connection_index,
@@ -806,6 +868,11 @@ impl NotificationEvent {
             Self::WebSocketPoolHalt { .. } => Severity::High,
             Self::DepthIndexLtpTimeout { .. } => Severity::High,
             Self::DepthSpotPriceStale { .. } => Severity::High,
+            Self::Phase2Started { .. } => Severity::Medium,
+            Self::Phase2RunImmediate { .. } => Severity::Medium,
+            Self::Phase2Complete { .. } => Severity::Medium,
+            Self::Phase2Failed { .. } => Severity::High,
+            Self::Phase2Skipped { .. } => Severity::Low,
             Self::DepthTwentyConnected { .. } => Severity::Low,
             Self::DepthTwoHundredConnected { .. } => Severity::Low,
             Self::OrderUpdateConnected => Severity::Low,

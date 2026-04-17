@@ -2600,6 +2600,29 @@ async fn main() -> Result<()> {
                 });
             }
 
+            // O1 (2026-04-17) Phase A: Phase 2 subscription scheduler.
+            // Sleeps until 09:12 IST (or runs immediately if already past 9:12
+            // and within market hours), then waits for NIFTY/BANKNIFTY LTPs,
+            // then emits Phase2Complete/Failed. Actual SubscribeCommand dispatch
+            // is Phase B — this commit ships observability first.
+            {
+                let phase2_spot_prices = std::sync::Arc::clone(&shared_spot_prices);
+                let phase2_calendar = std::sync::Arc::clone(&trading_calendar);
+                let phase2_notifier = notifier.clone();
+                // Planned count is 0 until Phase B lands the delta computation —
+                // the Phase2Complete alert's `added_count` will be accurate then.
+                let planned_phase2_count = 0usize;
+                tokio::spawn(async move {
+                    tickvault_core::instrument::phase2_scheduler::run_phase2_scheduler(
+                        phase2_spot_prices,
+                        phase2_calendar,
+                        phase2_notifier,
+                        planned_phase2_count,
+                    )
+                    .await;
+                });
+            }
+
             // L1: Listen for rebalance events → Telegram alert + send swap commands (zero disconnect).
             {
                 let rebalance_notifier = notifier.clone();

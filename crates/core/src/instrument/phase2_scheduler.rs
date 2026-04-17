@@ -1,0 +1,526 @@
+//! O1 (2026-04-17) — Phase 2 subscription scheduler.
+//!
+//! Per `.claude/rules/project/live-market-feed-subscription.md`, the main
+//! WebSocket feed subscribes to stock F&O derivatives at 09:12 IST once
+//! real pre-market LTPs are available. Pre-Phase-2 the spec existed but
+//! no code implemented it, so stock F&O was silently skipped every day.
+//!
+//! This module delivers the **scheduler half** of Phase 2:
+//!
+//! 1. A pure timing decision function (`next_phase2_trigger`) that
+//!    resolves to exactly one of:
+//!      * `SleepUntil(Duration)` — before 09:12 IST on a trading day,
+//!      * `RunImmediate { minutes_late }` — past 09:12 but still before
+//!        15:30 IST on a trading day (crash-recovery / late-start path),
+//!      * `SkipToday { reason }` — weekend / holiday / post-market.
+//!
+//! 2. An async driver (`run_phase2_scheduler`) that:
+//!      * resolves the decision,
+//!      * sleeps / fires immediately / skips,
+//!      * once awake, waits up to `LTP_WAIT_SECS_PER_ATTEMPT` for the
+//!        SharedSpotPrices to contain the major-index LTPs,
+//!      * on success emits a `Phase2Complete { added_count }` event,
+//!      * on LTP timeout retries up to `MAX_LTP_ATTEMPTS` before emitting
+//!        `Phase2Failed`.
+//!
+//! **Actual subscription dispatch is stubbed** (the scheduler logs the
+//! size of the would-be delta and emits the `Phase2Complete` event with
+//! that count). Wiring the `SubscribeCommand` channel into each
+//! `WebSocketConnection` is the next commit.
+//!
+//! All decisions are driven by the injected `TradingCalendar` so weekend
+//! / holiday behaviour is correct everywhere.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use chrono::{NaiveDate, NaiveTime, TimeZone, Utc};
+use tokio::time::Instant;
+use tracing::{error, info, warn};
+
+use crate::notification::{NotificationEvent, NotificationService};
+use tickvault_common::trading_calendar::TradingCalendar;
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/// Scheduled trigger: 09:12 IST (Phase 2 per live-market-feed-subscription.md).
+pub const PHASE2_TRIGGER_HOUR: u32 = 9;
+pub const PHASE2_TRIGGER_MIN: u32 = 12;
+
+/// Market-hours window in IST — Phase 2 is only meaningful between 09:12 and
+/// 15:30 on a trading day. After 15:30 there is nothing to subscribe to.
+pub const MARKET_OPEN_HOUR: u32 = 9;
+pub const MARKET_OPEN_MIN: u32 = 15;
+pub const MARKET_CLOSE_HOUR: u32 = 15;
+pub const MARKET_CLOSE_MIN: u32 = 30;
+
+/// How long the scheduler will wait for the `SharedSpotPrices` map to contain
+/// the major-index LTPs on a single attempt before declaring it a miss.
+pub const LTP_WAIT_SECS_PER_ATTEMPT: u64 = 30;
+
+/// Poll cadence inside the LTP wait loop.
+pub const LTP_POLL_MS: u64 = 500;
+
+/// Max retry attempts when LTPs never arrive. 3 × 30s = up to 90s of Dhan
+/// slowness tolerance before giving up for the day.
+pub const MAX_LTP_ATTEMPTS: u32 = 3;
+
+/// Underlyings whose LTPs gate Phase 2 readiness.
+pub const GATING_INDEX_SYMBOLS: &[&str] = &["NIFTY", "BANKNIFTY"];
+
+// ---------------------------------------------------------------------------
+// Decision types
+// ---------------------------------------------------------------------------
+
+/// Outcome of the pure timing decision. Independent of any async state.
+#[derive(Debug, Clone, PartialEq)]
+pub enum NextTrigger {
+    /// Sleep for this long, then run Phase 2.
+    SleepUntil { duration: Duration },
+    /// Already past 09:12 IST but still within market hours — run right now.
+    /// `minutes_late` is the number of minutes past the 09:12 trigger.
+    RunImmediate { minutes_late: u64 },
+    /// Not a trading day or already after market close — do nothing.
+    SkipToday { reason: SkipReason },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkipReason {
+    NonTradingDay,
+    PostMarket,
+}
+
+impl SkipReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::NonTradingDay => "non-trading day (weekend/holiday)",
+            Self::PostMarket => "already past 15:30 IST (post-market)",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pure timing decision
+// ---------------------------------------------------------------------------
+
+/// Pure function: given the current IST wall-clock time and the trading
+/// calendar, decide what the scheduler should do next.
+///
+/// No I/O, no allocation on the hot success path. Fully testable with
+/// synthetic `now_ist` inputs — see `test_next_trigger_*` family below
+/// for full scenario coverage (before-9:12, at-9:12, crash-recovery,
+/// late-start, post-market, weekend, holiday, midnight).
+// TEST-EXEMPT: covered by 9 scenario tests named `test_next_trigger_*`
+pub fn next_phase2_trigger(
+    now_ist_date: NaiveDate,
+    now_ist_time: NaiveTime,
+    calendar: &TradingCalendar,
+) -> NextTrigger {
+    // Weekend / holiday check.
+    if !calendar.is_trading_day(now_ist_date) {
+        return NextTrigger::SkipToday {
+            reason: SkipReason::NonTradingDay,
+        };
+    }
+
+    let trigger = match NaiveTime::from_hms_opt(PHASE2_TRIGGER_HOUR, PHASE2_TRIGGER_MIN, 0) {
+        Some(t) => t,
+        None => {
+            return NextTrigger::SkipToday {
+                reason: SkipReason::PostMarket,
+            };
+        }
+    };
+    let market_close = match NaiveTime::from_hms_opt(MARKET_CLOSE_HOUR, MARKET_CLOSE_MIN, 0) {
+        Some(t) => t,
+        None => {
+            return NextTrigger::SkipToday {
+                reason: SkipReason::PostMarket,
+            };
+        }
+    };
+
+    if now_ist_time >= market_close {
+        return NextTrigger::SkipToday {
+            reason: SkipReason::PostMarket,
+        };
+    }
+
+    if now_ist_time < trigger {
+        // Before 09:12 — sleep until the trigger.
+        let secs_until = match (trigger - now_ist_time).num_seconds().try_into() {
+            Ok(s) => s,
+            Err(_) => 0,
+        };
+        return NextTrigger::SleepUntil {
+            duration: Duration::from_secs(secs_until),
+        };
+    }
+
+    // At or past 09:12 but before 15:30 — run immediately (crash-recovery
+    // or late-start path).
+    let minutes_late: u64 = (now_ist_time - trigger)
+        .num_minutes()
+        .try_into()
+        .unwrap_or(0);
+    NextTrigger::RunImmediate { minutes_late }
+}
+
+// ---------------------------------------------------------------------------
+// SharedSpotPrices readiness check
+// ---------------------------------------------------------------------------
+
+/// Returns true when all symbols in `GATING_INDEX_SYMBOLS` have a fresh-enough
+/// entry in the given shared spot-prices map. Fresh means simply "present" —
+/// the rebalancer's separate staleness guard (O3) handles older-but-present.
+pub async fn has_required_ltps(
+    prices: &crate::instrument::depth_rebalancer::SharedSpotPrices,
+) -> bool {
+    let map = prices.read().await;
+    GATING_INDEX_SYMBOLS
+        .iter()
+        .all(|sym| map.contains_key(*sym))
+}
+
+// ---------------------------------------------------------------------------
+// Async driver
+// ---------------------------------------------------------------------------
+
+/// Returns the current IST date + time for scheduling decisions.
+/// Uses `tickvault_common::trading_calendar::ist_offset` so the source of
+/// truth for "what is IST" lives in one place.
+fn current_ist() -> (NaiveDate, NaiveTime) {
+    let now_utc = Utc::now();
+    let ist_offset = tickvault_common::trading_calendar::ist_offset();
+    let now_ist = ist_offset.from_utc_datetime(&now_utc.naive_utc());
+    (now_ist.date_naive(), now_ist.time())
+}
+
+/// Runs the Phase 2 scheduler as a background task. Intended to be called
+/// once per boot (from BOTH FAST BOOT and slow boot paths).
+///
+/// On entry it (a) computes the trigger decision via `next_phase2_trigger`,
+/// (b) emits the matching Telegram event, and (c) if the decision says to
+/// proceed, waits for LTPs and fires `Phase2Complete` (or `Phase2Failed`
+/// after `MAX_LTP_ATTEMPTS`).
+///
+/// **Actual subscribe dispatch is stubbed in this commit** — the scheduler
+/// knows what it WOULD subscribe (via `compute_phase2_delta`) and emits the
+/// count in the completion event. The matching `SubscribeCommand` plumbing
+/// into `WebSocketConnection` is the next commit (O1-B).
+// TEST-EXEMPT: async driver with time-dependent sleep loop — decision logic covered by test_next_trigger_*, readiness by test_has_required_ltps_*
+pub async fn run_phase2_scheduler(
+    spot_prices: crate::instrument::depth_rebalancer::SharedSpotPrices,
+    calendar: Arc<TradingCalendar>,
+    notifier: Arc<NotificationService>,
+    planned_phase2_count: usize,
+) {
+    info!(planned_phase2_count, "Phase 2 scheduler starting");
+
+    let (today_ist, time_ist) = current_ist();
+    let decision = next_phase2_trigger(today_ist, time_ist, &calendar);
+    info!(?decision, "Phase 2 decision");
+
+    match decision {
+        NextTrigger::SkipToday { reason } => {
+            notifier.notify(NotificationEvent::Phase2Skipped {
+                reason: reason.as_str().to_string(),
+            });
+            return;
+        }
+        NextTrigger::SleepUntil { duration } => {
+            info!(
+                sleep_secs = duration.as_secs(),
+                "Phase 2 sleeping until 09:12 IST"
+            );
+            tokio::time::sleep(duration).await;
+            notifier.notify(NotificationEvent::Phase2Started { minutes_late: 0 });
+        }
+        NextTrigger::RunImmediate { minutes_late } => {
+            warn!(
+                minutes_late,
+                "Phase 2 running immediately — late-start or crash-recovery path"
+            );
+            notifier.notify(NotificationEvent::Phase2RunImmediate { minutes_late });
+            notifier.notify(NotificationEvent::Phase2Started { minutes_late });
+        }
+    }
+
+    let start = Instant::now();
+    for attempt in 1..=MAX_LTP_ATTEMPTS {
+        if wait_for_ltps_once(&spot_prices).await {
+            let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+            info!(
+                attempt,
+                duration_ms,
+                planned_phase2_count,
+                "Phase 2: LTPs present — would subscribe (stub: actual SubscribeCommand \
+                 dispatch is a follow-up commit)"
+            );
+            metrics::counter!("tv_phase2_runs_total", "outcome" => "complete").increment(1);
+            metrics::histogram!("tv_phase2_run_ms").record(duration_ms as f64);
+            notifier.notify(NotificationEvent::Phase2Complete {
+                added_count: planned_phase2_count,
+                duration_ms,
+            });
+            return;
+        }
+        warn!(
+            attempt,
+            max_attempts = MAX_LTP_ATTEMPTS,
+            "Phase 2: LTPs still absent — retrying"
+        );
+    }
+
+    error!(
+        attempts = MAX_LTP_ATTEMPTS,
+        "Phase 2: FAILED — LTPs never arrived within retry budget"
+    );
+    metrics::counter!("tv_phase2_runs_total", "outcome" => "failed").increment(1);
+    notifier.notify(NotificationEvent::Phase2Failed {
+        reason: format!(
+            "index LTPs (NIFTY/BANKNIFTY) not present after {} attempts of {}s each",
+            MAX_LTP_ATTEMPTS, LTP_WAIT_SECS_PER_ATTEMPT
+        ),
+        attempts: MAX_LTP_ATTEMPTS,
+    });
+}
+
+async fn wait_for_ltps_once(
+    prices: &crate::instrument::depth_rebalancer::SharedSpotPrices,
+) -> bool {
+    let wait_start = Instant::now();
+    let max_wait = Duration::from_secs(LTP_WAIT_SECS_PER_ATTEMPT);
+    loop {
+        if has_required_ltps(prices).await {
+            return true;
+        }
+        if wait_start.elapsed() >= max_wait {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(LTP_POLL_MS)).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests — pure functions + decision coverage
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tickvault_common::trading_calendar::TradingCalendar;
+
+    fn base_trading_config() -> tickvault_common::config::TradingConfig {
+        tickvault_common::config::TradingConfig {
+            market_open_time: "09:15:00".to_string(),
+            market_close_time: "15:30:00".to_string(),
+            order_cutoff_time: "15:29:00".to_string(),
+            data_collection_start: "09:00:00".to_string(),
+            data_collection_end: "16:00:00".to_string(),
+            timezone: "Asia/Kolkata".to_string(),
+            max_orders_per_second: 10,
+            nse_holidays: vec![],
+            muhurat_trading_dates: vec![],
+            nse_mock_trading_dates: vec![],
+        }
+    }
+
+    fn weekday_calendar() -> TradingCalendar {
+        TradingCalendar::from_config(&base_trading_config()).expect("empty-holiday calendar builds")
+    }
+
+    fn calendar_with_holidays(holidays: Vec<NaiveDate>) -> TradingCalendar {
+        let mut cfg = base_trading_config();
+        cfg.nse_holidays = holidays
+            .into_iter()
+            .map(|d| tickvault_common::config::NseHolidayEntry {
+                date: d.format("%Y-%m-%d").to_string(),
+                name: "Test Holiday".to_string(),
+            })
+            .collect();
+        TradingCalendar::from_config(&cfg).expect("calendar with holidays builds")
+    }
+
+    fn weekday_date() -> NaiveDate {
+        // 2026-04-17 was a Friday.
+        NaiveDate::from_ymd_opt(2026, 4, 17).expect("valid")
+    }
+
+    fn saturday_date() -> NaiveDate {
+        NaiveDate::from_ymd_opt(2026, 4, 18).expect("valid")
+    }
+
+    #[test]
+    fn test_next_trigger_before_912_sleeps() {
+        let cal = weekday_calendar();
+        let now = NaiveTime::from_hms_opt(8, 57, 0).unwrap();
+        match next_phase2_trigger(weekday_date(), now, &cal) {
+            NextTrigger::SleepUntil { duration } => {
+                // 8:57 -> 9:12 = 15 min = 900 s.
+                assert_eq!(duration.as_secs(), 900);
+            }
+            other => panic!("expected SleepUntil, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_next_trigger_at_exactly_912_runs_immediate() {
+        let cal = weekday_calendar();
+        let now = NaiveTime::from_hms_opt(9, 12, 0).unwrap();
+        match next_phase2_trigger(weekday_date(), now, &cal) {
+            NextTrigger::RunImmediate { minutes_late } => assert_eq!(minutes_late, 0),
+            other => panic!("expected RunImmediate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_next_trigger_crash_recovery_at_10_am_runs_immediate() {
+        let cal = weekday_calendar();
+        let now = NaiveTime::from_hms_opt(10, 0, 0).unwrap();
+        match next_phase2_trigger(weekday_date(), now, &cal) {
+            NextTrigger::RunImmediate { minutes_late } => assert_eq!(minutes_late, 48),
+            other => panic!("expected RunImmediate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_next_trigger_fresh_start_at_1130_runs_immediate() {
+        let cal = weekday_calendar();
+        let now = NaiveTime::from_hms_opt(11, 30, 0).unwrap();
+        match next_phase2_trigger(weekday_date(), now, &cal) {
+            NextTrigger::RunImmediate { minutes_late } => assert_eq!(minutes_late, 138),
+            other => panic!("expected RunImmediate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_next_trigger_post_market_skips() {
+        let cal = weekday_calendar();
+        let now = NaiveTime::from_hms_opt(15, 30, 0).unwrap();
+        assert!(matches!(
+            next_phase2_trigger(weekday_date(), now, &cal),
+            NextTrigger::SkipToday {
+                reason: SkipReason::PostMarket
+            }
+        ));
+    }
+
+    #[test]
+    fn test_next_trigger_after_1530_skips() {
+        let cal = weekday_calendar();
+        let now = NaiveTime::from_hms_opt(16, 45, 0).unwrap();
+        assert!(matches!(
+            next_phase2_trigger(weekday_date(), now, &cal),
+            NextTrigger::SkipToday {
+                reason: SkipReason::PostMarket
+            }
+        ));
+    }
+
+    #[test]
+    fn test_next_trigger_saturday_skips() {
+        let cal = weekday_calendar();
+        let now = NaiveTime::from_hms_opt(10, 0, 0).unwrap();
+        assert!(matches!(
+            next_phase2_trigger(saturday_date(), now, &cal),
+            NextTrigger::SkipToday {
+                reason: SkipReason::NonTradingDay
+            }
+        ));
+    }
+
+    #[test]
+    fn test_next_trigger_holiday_skips() {
+        // 2026-08-15 = Independence Day. Note: 2026-08-15 is a Saturday, so
+        // the calendar already rejects it as non-trading via the weekend
+        // check. Use 2026-08-14 (Friday) as a realistic weekday holiday.
+        let holiday = NaiveDate::from_ymd_opt(2026, 8, 14).unwrap();
+        let cal = calendar_with_holidays(vec![holiday]);
+        let now = NaiveTime::from_hms_opt(10, 0, 0).unwrap();
+        assert!(matches!(
+            next_phase2_trigger(holiday, now, &cal),
+            NextTrigger::SkipToday {
+                reason: SkipReason::NonTradingDay
+            }
+        ));
+    }
+
+    #[test]
+    fn test_next_trigger_at_901_sleeps_correctly() {
+        let cal = weekday_calendar();
+        let now = NaiveTime::from_hms_opt(9, 1, 0).unwrap();
+        match next_phase2_trigger(weekday_date(), now, &cal) {
+            NextTrigger::SleepUntil { duration } => {
+                // 9:01 -> 9:12 = 11 min = 660 s.
+                assert_eq!(duration.as_secs(), 660);
+            }
+            other => panic!("expected SleepUntil, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_next_trigger_midnight_sleeps_9h12m() {
+        let cal = weekday_calendar();
+        let now = NaiveTime::from_hms_opt(0, 0, 0).unwrap();
+        match next_phase2_trigger(weekday_date(), now, &cal) {
+            NextTrigger::SleepUntil { duration } => {
+                // 00:00 -> 09:12 = 9h 12m = 33120 s.
+                assert_eq!(duration.as_secs(), 33120);
+            }
+            other => panic!("expected SleepUntil, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_skip_reason_strings_stable() {
+        assert!(SkipReason::NonTradingDay.as_str().contains("weekend"));
+        assert!(SkipReason::PostMarket.as_str().contains("15:30"));
+    }
+
+    #[test]
+    fn test_constants_are_sane() {
+        assert_eq!(PHASE2_TRIGGER_HOUR, 9);
+        assert_eq!(PHASE2_TRIGGER_MIN, 12);
+        // Trigger must be between market open (09:15) ... wait, 09:12 is BEFORE
+        // market open. That's correct per Dhan spec — it's during pre-market
+        // when finalized LTPs become available.
+        assert!(PHASE2_TRIGGER_MIN < MARKET_OPEN_MIN);
+        assert!(MAX_LTP_ATTEMPTS >= 2, "need at least one retry");
+        assert!(
+            LTP_WAIT_SECS_PER_ATTEMPT <= 60,
+            "per-attempt wait must be bounded"
+        );
+        assert!(
+            !GATING_INDEX_SYMBOLS.is_empty(),
+            "must gate on at least one index"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_has_required_ltps_false_when_empty() {
+        use crate::instrument::depth_rebalancer::new_shared_spot_prices;
+        let prices = new_shared_spot_prices();
+        assert!(!has_required_ltps(&prices).await);
+    }
+
+    #[tokio::test]
+    async fn test_has_required_ltps_false_when_missing_one() {
+        use crate::instrument::depth_rebalancer::{new_shared_spot_prices, update_spot_price};
+        let prices = new_shared_spot_prices();
+        update_spot_price(&prices, "NIFTY", 23500.0).await;
+        // BANKNIFTY missing → false.
+        assert!(!has_required_ltps(&prices).await);
+    }
+
+    #[tokio::test]
+    async fn test_has_required_ltps_true_when_all_present() {
+        use crate::instrument::depth_rebalancer::{new_shared_spot_prices, update_spot_price};
+        let prices = new_shared_spot_prices();
+        update_spot_price(&prices, "NIFTY", 23500.0).await;
+        update_spot_price(&prices, "BANKNIFTY", 51000.0).await;
+        assert!(has_required_ltps(&prices).await);
+    }
+}

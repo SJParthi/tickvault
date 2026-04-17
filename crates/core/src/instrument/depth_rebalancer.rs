@@ -88,6 +88,9 @@ pub async fn get_spot_price(prices: &SharedSpotPrices, symbol: &str) -> Option<f
 }
 
 /// Reads the current spot price entry (price + last-update `Instant`).
+// TEST-EXEMPT: covered by `test_update_spot_price_stamps_fresh_instant`,
+// `test_update_spot_price_refreshes_timestamp_on_overwrite`, and
+// `test_get_spot_price_entry_missing_is_none`.
 pub async fn get_spot_price_entry(
     prices: &SharedSpotPrices,
     symbol: &str,

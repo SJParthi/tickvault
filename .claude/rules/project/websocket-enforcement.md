@@ -74,10 +74,8 @@ paths:
 
 Any change to WebSocket code must check the open gaps in `docs/architecture/websocket-complete-reference.md` Section 10.2 and not introduce regressions.
 
-Key open gaps (high severity, not yet implemented — see ref §10.2 for design sketches):
-- **O1** — 9:12 AM Phase 2 stock F&O subscription scheduler: spec in `live-market-feed-subscription.md`, NO code implementation
-- **O2** — `OrderUpdateConnected` fires on spawn, not after successful auth ACK
-- **O3** — No stale-spot-price detection on depth rebalancer (may swap to wrong strike on index feed outage)
+Key open gaps (high severity — see ref §10.2 for design sketches):
+- **O1-B** — Phase 2 `SubscribeCommand` channel on main-feed `WebSocketConnection` (scheduler + events shipped in O1-A, 2026-04-17; actual subscribe dispatch is the remaining piece)
 
 Resolved gaps:
 - Telegram now fires on first data frame (not just subscription) — fixed 2026-04-09
