@@ -268,8 +268,17 @@ fn link_price_ids(
 // ---------------------------------------------------------------------------
 
 /// Output of Pass 5.
+///
+/// I-P1-11 context (2026-04-17): `derivative_contracts` is keyed on
+/// `SecurityId` alone. Cross-segment id collisions are detected at
+/// runtime via WARN + `tv_fno_universe_derivative_collisions_total`
+/// counter in `build_derivatives_and_chains` below. The global
+/// `instrument_info` map across indices/equities/derivatives is
+/// protected at CSV-parse time by the `(SecurityId, char)` seen set.
 struct Pass5Result {
+    // APPROVED: single-segment derivative-id map — I-P1-11.
     derivative_contracts: HashMap<SecurityId, DerivativeContract>,
+    // APPROVED: single-segment global instrument-info map — I-P1-11.
     instrument_info: HashMap<SecurityId, InstrumentInfo>,
     option_chains: HashMap<OptionChainKey, OptionChain>,
     expiry_calendars: HashMap<String, ExpiryCalendar>,
@@ -288,8 +297,10 @@ fn build_derivatives_and_chains(
     today: NaiveDate,
 ) -> Pass5Result {
     // Estimate: ~150K derivative contracts, ~160K instrument_info (indices + equities + derivatives)
+    // APPROVED: single-segment — see Pass5Result doc above — I-P1-11.
     let mut derivative_contracts: HashMap<SecurityId, DerivativeContract> =
         HashMap::with_capacity(160_000);
+    // APPROVED: single-segment — see Pass5Result doc above — I-P1-11.
     let mut instrument_info: HashMap<SecurityId, InstrumentInfo> = HashMap::with_capacity(170_000);
 
     // Intermediate: option chain accumulator — (calls, puts) per chain key
@@ -310,11 +321,11 @@ fn build_derivatives_and_chains(
     // BUG FIX (2026-04-17, spotted live by Parthiban): dedup tracker must
     // include the CSV segment character, because Dhan reuses the same
     // numeric security_id across segments (e.g. id=27 is FINNIFTY in 'I'
-    // AND some NSE_EQ equity in 'E'). An old `HashSet<SecurityId>` keyed
-    // on `security_id` alone would silently drop the second-seen one at
-    // parse time, so the whole downstream pipeline (subscription planner,
-    // registry, WebSocket subscribe messages) never saw the dropped
-    // instrument. Correct key is `(security_id, segment_char)`.
+    // AND some NSE_EQ equity in 'E'). A single-key set on the numeric id
+    // alone would silently drop the second-seen one at parse time, so
+    // the whole downstream pipeline (subscription planner, registry,
+    // WebSocket subscribe messages) never saw the dropped instrument.
+    // Correct key is `(security_id, segment_char)`.
     let mut seen_security_ids: HashSet<(SecurityId, char)> = HashSet::with_capacity(170_000);
     let mut duplicate_count: usize = 0;
 
@@ -476,7 +487,30 @@ fn build_derivatives_and_chains(
             display_name: row.display_name.clone(),
         };
 
-        derivative_contracts.insert(row.security_id, contract);
+        // I-P1-11 (2026-04-17): derivative_contracts is keyed on
+        // security_id alone. If Dhan ever ships a CSV where NSE_FNO and
+        // BSE_FNO derivatives collide on the numeric id, one would
+        // silently overwrite the other. Warn loudly so the operator can
+        // investigate before the collision causes a downstream bug
+        // (wrong subscription, wrong Greeks, wrong delta-detector pass).
+        if let Some(prev) = derivative_contracts.insert(row.security_id, contract.clone()) {
+            if prev.exchange_segment != contract.exchange_segment
+                || prev.underlying_symbol != contract.underlying_symbol
+            {
+                tracing::warn!(
+                    security_id = row.security_id,
+                    prev_segment = ?prev.exchange_segment,
+                    new_segment = ?contract.exchange_segment,
+                    prev_underlying = %prev.underlying_symbol,
+                    new_underlying = %contract.underlying_symbol,
+                    "I-P1-11: FnoUniverse.derivative_contracts cross-key collision — \
+                     two distinct contracts share the same security_id. One will be \
+                     dropped; delta_detector lookups on this id are ambiguous until \
+                     the FnoUniverse map is refactored to (id, segment) key."
+                );
+                metrics::counter!("tv_fno_universe_derivative_collisions_total").increment(1);
+            }
+        }
 
         // Add to instrument_info
         instrument_info.insert(

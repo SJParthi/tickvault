@@ -40,6 +40,17 @@ pub fn detect_universe_delta(
 
     let mut events = Vec::new();
 
+    // I-P1-11 (2026-04-17): yesterday.derivative_contracts and
+    // today.derivative_contracts are both keyed on security_id alone.
+    // Cross-segment id collisions inside this map are detected at
+    // BUILD time by universe_builder (tv_fno_universe_derivative_collisions_total)
+    // which emits a WARN log. If you observe this counter increment,
+    // the FnoUniverse map must be refactored to a composite
+    // `(security_id, segment)` key before delta_detector can correctly
+    // compare across both segments. For now, this function operates
+    // under the single-segment-per-id assumption enforced by the
+    // upstream WARN.
+
     // 1. Detect expired/removed contracts (in yesterday, not in today)
     for (security_id, contract) in &yesterday.derivative_contracts {
         if !today.derivative_contracts.contains_key(security_id) {
