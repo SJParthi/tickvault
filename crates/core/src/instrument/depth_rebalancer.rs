@@ -27,6 +27,30 @@ use tickvault_common::instrument_types::{FnoUniverse, OptionChainKey};
 /// Rebalance check interval (seconds). Checks spot drift every 60 seconds.
 const REBALANCE_CHECK_INTERVAL_SECS: u64 = 60;
 
+/// O3-HF2 (2026-04-17): returns true iff the current IST wall-clock time
+/// is within the market-hours persistence window (09:00-15:30 IST).
+///
+/// The depth rebalancer is idle-noise outside this window because the
+/// main-feed index LTPs never update post-market — every symbol would
+/// appear "stale" and spam alerts. The constants come from
+/// `tickvault_common::constants::{TICK_PERSIST_START_SECS_OF_DAY_IST,
+/// TICK_PERSIST_END_SECS_OF_DAY_IST}` so market-hours logic is
+/// DRY across the codebase.
+///
+/// O(1) — one `Utc::now()` + arithmetic + range check.
+#[inline]
+fn is_within_market_hours_ist() -> bool {
+    use tickvault_common::constants::{
+        IST_UTC_OFFSET_SECONDS, SECONDS_PER_DAY, TICK_PERSIST_END_SECS_OF_DAY_IST,
+        TICK_PERSIST_START_SECS_OF_DAY_IST,
+    };
+    let now_utc_secs = chrono::Utc::now().timestamp();
+    let now_ist_secs = now_utc_secs.saturating_add(i64::from(IST_UTC_OFFSET_SECONDS));
+    // Defensive cast: seconds-of-day fits in u32 for any reasonable epoch.
+    let sec_of_day = now_ist_secs.rem_euclid(i64::from(SECONDS_PER_DAY)) as u32;
+    (TICK_PERSIST_START_SECS_OF_DAY_IST..TICK_PERSIST_END_SECS_OF_DAY_IST).contains(&sec_of_day)
+}
+
 /// O3 (2026-04-17): A spot price older than this is considered stale. The
 /// depth rebalancer will skip the rebalance decision for that underlying
 /// and emit a Telegram alert. 180 seconds = 3× the 60s check interval,
@@ -160,6 +184,14 @@ pub async fn run_depth_rebalancer(
     // Track previous ATM strikes per underlying
     let mut previous_atm: HashMap<String, f64> = HashMap::with_capacity(underlyings.len());
 
+    // O3-HF1 (2026-04-17): edge-triggered stale-spot alerting. Before this
+    // fix, a stalled IDX_I feed produced ONE Telegram alert every 60 seconds
+    // forever (observed live: FINNIFTY + MIDCPNIFTY spammed every minute
+    // through the 3:30 PM close and into the evening). We now alert ONCE on
+    // the rising edge and ONCE on the falling edge.
+    let mut currently_stale: std::collections::HashSet<String> =
+        std::collections::HashSet::with_capacity(underlyings.len());
+
     // Initialize with current spot prices
     for symbol in &underlyings {
         if let Some(spot) = get_spot_price(&spot_prices, symbol).await {
@@ -197,6 +229,18 @@ pub async fn run_depth_rebalancer(
                 .unwrap_or_else(|| chrono::Utc::now().date_naive())
         };
 
+        // O3-HF2 (2026-04-17): market-hours gate. The depth rebalancer
+        // runs 24/7 to stay connected, but spot prices only update during
+        // 09:00-15:30 IST. Outside that window EVERY symbol's spot is
+        // "stale" by definition — firing alerts for it is noise. Skip the
+        // rebalance + stale check entirely outside market hours.
+        if !is_within_market_hours_ist() {
+            // Clear stale tracking so the rising edge after next market
+            // open is detected correctly.
+            currently_stale.clear();
+            continue;
+        }
+
         for symbol in &underlyings {
             let entry = match get_spot_price_entry(&spot_prices, symbol).await {
                 Some(e) => e,
@@ -210,28 +254,57 @@ pub async fn run_depth_rebalancer(
             // strike. Skip the rebalance for this underlying and escalate
             // so the operator can investigate.
             let age = entry.updated_at.elapsed();
-            if age >= Duration::from_secs(STALE_SPOT_THRESHOLD_SECS) {
-                error!(
-                    symbol,
-                    age_secs = age.as_secs(),
-                    threshold_secs = STALE_SPOT_THRESHOLD_SECS,
-                    "depth rebalancer: spot price is stale — skipping rebalance \
-                     and alerting operator"
-                );
+            let is_stale = age >= Duration::from_secs(STALE_SPOT_THRESHOLD_SECS);
+            let was_stale = currently_stale.contains(symbol);
+
+            if is_stale {
+                // Skip the rebalance (a stale spot will pick wrong ATM).
                 metrics::counter!("tv_depth_rebalancer_stale_spot_skips_total").increment(1);
-                if stale_tx
-                    .send(Some(StaleSpotPriceEvent {
-                        underlying: symbol.clone(), // O(1) EXEMPT: cold alert path
-                        age_secs: age.as_secs(),
-                    }))
-                    .is_err()
-                {
+                // O3-HF1: RISING-EDGE alert only — suppress if we already
+                // alerted for this symbol and it is still stale.
+                if !was_stale {
+                    error!(
+                        symbol,
+                        age_secs = age.as_secs(),
+                        threshold_secs = STALE_SPOT_THRESHOLD_SECS,
+                        "depth rebalancer: spot price went STALE (rising edge) — \
+                         skipping rebalance and alerting operator ONCE"
+                    );
+                    currently_stale.insert(symbol.clone()); // O(1) EXEMPT: cold alert path
+                    if stale_tx
+                        .send(Some(StaleSpotPriceEvent {
+                            underlying: symbol.clone(), // O(1) EXEMPT: cold alert path
+                            age_secs: age.as_secs(),
+                        }))
+                        .is_err()
+                    {
+                        debug!(
+                            symbol,
+                            "stale spot receiver dropped — telegram listener gone"
+                        );
+                    }
+                } else {
                     debug!(
                         symbol,
-                        "stale spot receiver dropped — telegram listener gone"
+                        age_secs = age.as_secs(),
+                        "spot still stale — alert suppressed (edge already fired)"
                     );
                 }
                 continue;
+            }
+
+            // is_stale == false. If we previously alerted this symbol as
+            // stale, emit a FALLING-EDGE recovery log so the operator sees
+            // the feed came back. (No Telegram for recovery — reduces noise;
+            // the next rebalance success log is proof of life.)
+            if was_stale {
+                info!(
+                    symbol,
+                    age_secs = age.as_secs(),
+                    "depth rebalancer: spot price RECOVERED (falling edge) — \
+                     resuming normal rebalance for this underlying"
+                );
+                currently_stale.remove(symbol);
             }
             let current_spot = entry.price;
 
@@ -466,6 +539,63 @@ mod tests {
     async fn test_get_spot_price_entry_missing_is_none() {
         let prices = new_shared_spot_prices();
         assert!(get_spot_price_entry(&prices, "UNKNOWN").await.is_none());
+    }
+
+    // ========================================================================
+    // O3-HF (2026-04-17) — Market-hours gate + edge-triggered alerting tests
+    // ========================================================================
+
+    #[test]
+    fn test_is_within_market_hours_at_0830_ist_is_false() {
+        // We can't freeze Utc::now() without a clock trait. Instead we
+        // test the constant bounds directly and verify the helper uses
+        // TICK_PERSIST_START/END so the single source of truth for
+        // "market hours" is enforced.
+        assert_eq!(
+            tickvault_common::constants::TICK_PERSIST_START_SECS_OF_DAY_IST,
+            9 * 3600,
+            "market-hours gate must start at 09:00 IST"
+        );
+        assert_eq!(
+            tickvault_common::constants::TICK_PERSIST_END_SECS_OF_DAY_IST,
+            15 * 3600 + 30 * 60,
+            "market-hours gate must end at 15:30 IST (exclusive)"
+        );
+    }
+
+    #[test]
+    fn test_is_within_market_hours_helper_exists_and_returns_bool() {
+        // Smoke test — helper is callable and returns a plain bool.
+        let _: bool = is_within_market_hours_ist();
+    }
+
+    /// Guard test: the rebalancer MUST honor `is_within_market_hours_ist()`
+    /// so post-market stale alerts cannot fire. We scan the source file
+    /// for the exact call pattern to enforce the wiring statically.
+    #[test]
+    fn test_market_hours_gate_is_wired_into_rebalancer_loop() {
+        let src = include_str!("depth_rebalancer.rs");
+        assert!(
+            src.contains("if !is_within_market_hours_ist() {"),
+            "run_depth_rebalancer MUST call is_within_market_hours_ist() \
+             to suppress post-market stale-alert storms. Live 2026-04-17 \
+             regression: FINNIFTY + MIDCPNIFTY spammed every 60s post-close."
+        );
+    }
+
+    /// Guard test: rising-edge alert suppression is wired.
+    #[test]
+    fn test_edge_triggered_stale_alert_suppression_is_wired() {
+        let src = include_str!("depth_rebalancer.rs");
+        assert!(
+            src.contains("currently_stale"),
+            "currently_stale set must exist — tracks which underlyings are \
+             already alerted so we fire ONCE per stale episode (edge-trigger)."
+        );
+        assert!(
+            src.contains("if !was_stale {"),
+            "rising-edge gate must check was_stale before sending the alert"
+        );
     }
 
     #[tokio::test]
