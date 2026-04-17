@@ -1,8 +1,25 @@
 # Implementation Plan: WebSocket Boot-Path Parity + 9:12 Phase 2 Scheduler
 
-**Status:** APPROVED
+**Status:** VERIFIED (4 of 4 in-scope items landed; Gap C deferred with design in docs)
 **Date:** 2026-04-17
 **Approved by:** Parthiban ("Execute everything bro")
+
+## Session outcome
+
+**Committed this branch:**
+- Fix A+B (53c939a) — `emit_websocket_connected_alerts` helper + `WebSocketPoolOnline` summary; guard test enforces parity.
+- Gap #9 (dd2ba03) — pool watchdog Degraded/Recovered/Halt Telegram events.
+- Gap #4 (f47a22d) — depth index-LTP timeout Telegram + ERROR log.
+- Fix D (2ae9d3f) — websocket-complete-reference §10.1+§10.2 + enforcement rule doc updated with three new resolved entries and three remaining HIGH-severity open gaps (O1/O2/O3).
+
+**Deferred to follow-up PRs (design sketches in `docs/architecture/websocket-complete-reference.md` §10.2):**
+- O1 — 9:12 AM Phase 2 stock F&O subscription scheduler (est. 2–3 days; needs new `SubscribeCommand` channel on main-feed connections).
+- O2 — `OrderUpdateConnected` timing vs auth ACK (est. 0.5 day).
+- O3 — stale-spot-price detection on depth rebalancer (est. 0.5 day).
+
+**Verified not actually gaps (audit corrected):**
+- Gap #5 (depth post-market guard) — already guarded at `tick_processor.rs:1006`.
+- Gap #6 (depth rebalance Telegram) — already wired at `main.rs:2586`.
 
 ## Problem (from live telegram 2026-04-17)
 
