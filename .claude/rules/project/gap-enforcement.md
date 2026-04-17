@@ -66,13 +66,36 @@ Every rule here is checked by tests, hooks, or clippy — never by human review 
 - Prevents cross-segment tick collision
 - Test: `test_tick_dedup_key_includes_segment`
 
-## I-P1-08: Cross-Day Snapshot Accumulation (RESOLVED)
-- `instrument_persistence.rs` MUST NOT contain `DELETE FROM` for snapshot tables (`fno_underlyings`, `derivative_contracts`, `subscribed_indices`)
-- Historical snapshot rows are PRESERVED across days (audit trail, SEBI compliance, security_id reuse tracking)
-- Data retention handled by QuestDB partition management (DETACH PARTITION), NOT application DELETE
-- `verify_instrument_row_counts()` must filter by today's snapshot timestamp
-- All Grafana queries on snapshot tables MUST include `WHERE timestamp = (SELECT max(timestamp) FROM table)`
-- Test: `test_build_snapshot_epoch_nanos_returns_midnight_ist`, `test_build_snapshot_epoch_nanos_matches_naive_date_function`, `test_query_table_count_with_snapshot_filter_generates_where_clause`, `test_query_table_count_without_filter_has_no_where_clause`, `test_no_delete_from_snapshot_tables_in_persist_path`, `test_snapshot_nanos_for_different_dates_are_distinct`, `test_snapshot_nanos_cross_day_accumulation_by_design`, `test_security_id_reuse_across_days_produces_distinct_rows`, `test_snapshot_timestamp_past_date_valid`, `test_snapshot_timestamp_future_date_valid`, `test_snapshot_weekday_and_weekend_produce_different_timestamps`, `test_parse_questdb_count_response_handles_multi_day_count`, `test_query_table_count_filtered_vs_unfiltered_sql_structure`
+## I-P1-08: Single-Row-Per-Instrument with Constant Designated Timestamp (REWRITTEN 2026-04-17)
+**Rationale:** Old design accumulated one snapshot row per day per instrument.
+Running the app on 2 days = 2x rows. Dashboard showed 442 underlyings (2x 221)
+and 207,796 contracts (2x ~104k) looking like duplicates. Root cause: designated
+timestamp was today's IST midnight, which is part of QuestDB DEDUP key, so
+same business key on different days = different rows.
+
+**New design:**
+- `build_snapshot_timestamp()` returns CONSTANT epoch 0 for all snapshot writes
+- QuestDB DEDUP UPSERT KEYS effectively operate on business key alone
+  (fno_underlyings: underlying_symbol; derivative_contracts: security_id +
+  underlying_symbol; subscribed_indices: security_id)
+- Running the app 1000 times same day → 221 rows (idempotent)
+- Running on a new day → 221 rows (UPSERT, no accumulation)
+- `instrument_persistence.rs` MUST NOT contain `DELETE FROM` for snapshot tables
+- `naive_date_to_timestamp_nanos()` retained for historical-query helpers only
+- Grafana dashboard queries should NOT include `WHERE timestamp = max(timestamp)`
+  (harmless but redundant; prefer simple `SELECT count() FROM <table>`)
+
+**Phase 2 (planned):** Add `status`, `first_seen_date`, `last_seen_date`,
+`expired_date` columns for lifecycle tracking. See
+`.claude/plans/instrument-uniqueness-redesign.md`.
+
+**Tests (in `crates/storage/src/instrument_persistence.rs`):**
+- `test_build_snapshot_timestamp_returns_epoch_zero_constant`
+- `test_build_snapshot_timestamp_is_constant_across_calls`
+- `test_build_snapshot_timestamp_is_zero_not_positive`
+- `test_build_snapshot_epoch_nanos_is_zero_regardless_of_today`
+- `test_no_delete_from_snapshot_tables_in_persist_path`
+- Dashboard guard: `crates/storage/tests/grafana_dashboard_snapshot_filter_guard.rs`
 
 ## I-P2-02: Trading Day Guard on Download
 - `instrument_loader.rs` must log when downloading on weekends

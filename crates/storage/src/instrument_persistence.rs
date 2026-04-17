@@ -149,7 +149,8 @@ const BUILD_METADATA_CREATE_DDL: &str = "\
     ) TIMESTAMP(timestamp) PARTITION BY DAY WAL\
 ";
 
-/// DDL for `fno_underlyings` — ~215 rows per day.
+/// DDL for `fno_underlyings` — one row per underlying_symbol FOREVER.
+/// I-P1-08 (rewritten 2026-04-17): constant designated_ts + business-key DEDUP.
 const FNO_UNDERLYINGS_CREATE_DDL: &str = "\
     CREATE TABLE IF NOT EXISTS fno_underlyings (\
         underlying_symbol SYMBOL,\
@@ -164,7 +165,7 @@ const FNO_UNDERLYINGS_CREATE_DDL: &str = "\
     ) TIMESTAMP(timestamp) PARTITION BY DAY WAL\
 ";
 
-/// DDL for `derivative_contracts` — ~150K rows per day.
+/// DDL for `derivative_contracts` — one row per (security_id, underlying_symbol) FOREVER.
 const DERIVATIVE_CONTRACTS_CREATE_DDL: &str = "\
     CREATE TABLE IF NOT EXISTS derivative_contracts (\
         underlying_symbol SYMBOL,\
@@ -182,7 +183,7 @@ const DERIVATIVE_CONTRACTS_CREATE_DDL: &str = "\
     ) TIMESTAMP(timestamp) PARTITION BY DAY WAL\
 ";
 
-/// DDL for `subscribed_indices` — 31 rows per day.
+/// DDL for `subscribed_indices` — one row per security_id FOREVER.
 const SUBSCRIBED_INDICES_CREATE_DDL: &str = "\
     CREATE TABLE IF NOT EXISTS subscribed_indices (\
         symbol SYMBOL,\
@@ -446,13 +447,20 @@ async fn ensure_table_dedup_keys(questdb_config: &QuestDbConfig) {
     info!("DEDUP UPSERT KEYS ensured for all instrument tables");
 }
 
-/// Builds the designated timestamp for the snapshot: today's IST date at midnight.
+/// I-P1-08 (rewritten 2026-04-17): Builds the designated timestamp for snapshot
+/// tables. Returns a CONSTANT epoch-0 value so QuestDB DEDUP UPSERT operates
+/// purely on the business key (underlying_symbol / security_id) rather than on
+/// (date, business_key). This guarantees:
+/// - Running the app N times same day → same row count (idempotent)
+/// - Running on a new day → UPSERT existing rows (no accumulation)
+/// - New contracts auto-added as new rows
+/// - Expired contracts marked via `status='expired'` by `mark_missing_as_expired()`
 ///
-/// All rows for a single day share the same designated timestamp, making
-/// date-based queries clean (e.g., `WHERE snapshot_date = '2026-03-15'`).
+/// Historical "what was the universe on date X" queries use `last_seen_date`
+/// and `expired_date` columns, not cross-day timestamp duplication.
 fn build_snapshot_timestamp() -> Result<TimestampNanos> {
-    let today_ist = Utc::now().with_timezone(&ist_offset()).date_naive();
-    naive_date_to_timestamp_nanos(today_ist)
+    // Constant epoch 0 — DEDUP key becomes effectively the business key alone.
+    Ok(TimestampNanos::new(0))
 }
 
 /// Converts a `NaiveDate` to `TimestampNanos` at midnight (IST-as-UTC convention).
@@ -557,7 +565,9 @@ fn write_single_build_metadata(
 // Table 2: fno_underlyings (~215 rows)
 // ---------------------------------------------------------------------------
 
-/// Writes all F&O underlyings as a daily snapshot.
+/// Writes all F&O underlyings as UPSERT rows (one per underlying_symbol forever).
+/// I-P1-08 (rewritten 2026-04-17): constant designated_ts + business-key DEDUP
+/// guarantees no cross-day duplication. Same-day + cross-day reload = idempotent.
 fn write_underlyings(
     sender: &mut Sender,
     buffer: &mut Buffer,
@@ -1965,19 +1975,38 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_build_snapshot_timestamp_returns_valid_value() {
-        // build_snapshot_timestamp uses Utc::now(), so we just verify it returns
-        // a reasonable value (today in IST, as nanos).
+    fn test_build_snapshot_timestamp_returns_epoch_zero_constant() {
+        // I-P1-08 (rewritten 2026-04-17): build_snapshot_timestamp() returns
+        // CONSTANT epoch 0 so QuestDB DEDUP UPSERT operates purely on the
+        // business key (underlying_symbol / security_id). This guarantees:
+        // - Same-day reload → same row count (no duplicates)
+        // - Cross-day reload → same row count (no accumulation)
+        // - Running the app N times → same final state
         let ts = build_snapshot_timestamp().unwrap();
-        // Must be after 2020-01-01 and before 2100-01-01.
-        assert!(ts.as_i64() > 1_577_836_800_000_000_000);
-        assert!(ts.as_i64() < 4_102_444_800_000_000_000);
+        assert_eq!(
+            ts.as_i64(),
+            0,
+            "snapshot timestamp must be constant epoch 0 (DEDUP by business key)"
+        );
+    }
+
+    #[test]
+    fn test_build_snapshot_timestamp_is_constant_across_calls() {
+        // Two consecutive calls must return identical value (constant semantics).
+        let ts1 = build_snapshot_timestamp().unwrap();
+        let ts2 = build_snapshot_timestamp().unwrap();
+        assert_eq!(
+            ts1.as_i64(),
+            ts2.as_i64(),
+            "snapshot timestamp must be constant (identical across calls)"
+        );
+        assert_eq!(ts1.as_i64(), 0);
     }
 
     #[test]
     fn test_build_snapshot_timestamp_is_at_ist_midnight() {
-        // IST-as-UTC convention: snapshot timestamp is midnight of the IST date.
-        // The nanos value should be exactly divisible by nanos_per_day (no offset).
+        // I-P1-08 (rewritten): epoch 0 IS divisible by nanos_per_day (it is
+        // itself midnight of 1970-01-01). This property still holds.
         let ts = build_snapshot_timestamp().unwrap();
         let nanos = ts.as_i64();
 
@@ -3013,13 +3042,19 @@ mod tests {
     }
 
     #[test]
-    fn test_build_snapshot_epoch_nanos_matches_naive_date_function() {
-        // I-P1-08: build_snapshot_timestamp and naive_date_to_timestamp_nanos
-        // must produce the same result for today's IST date.
-        let ts1 = build_snapshot_timestamp().unwrap();
+    fn test_build_snapshot_epoch_nanos_is_zero_regardless_of_today() {
+        // I-P1-08 (rewritten 2026-04-17): build_snapshot_timestamp() is now
+        // CONSTANT epoch 0 — it does NOT depend on today's IST date. This is
+        // intentional: DEDUP operates on business key alone, no timestamp
+        // involvement means no cross-day row accumulation.
+        let ts = build_snapshot_timestamp().unwrap();
+        assert_eq!(ts.as_i64(), 0);
+
+        // naive_date_to_timestamp_nanos is still useful for historical-query
+        // helpers; it is independent of build_snapshot_timestamp now.
         let today_ist = chrono::Utc::now().with_timezone(&ist_offset()).date_naive();
-        let ts2 = naive_date_to_timestamp_nanos(today_ist).unwrap();
-        assert_eq!(ts1.as_i64(), ts2.as_i64());
+        let ts_today = naive_date_to_timestamp_nanos(today_ist).unwrap();
+        assert!(ts_today.as_i64() > 0, "today's IST date must be > 0");
     }
 
     // -----------------------------------------------------------------------
@@ -3313,9 +3348,16 @@ mod tests {
     }
 
     #[test]
-    fn test_build_snapshot_timestamp_is_positive() {
+    fn test_build_snapshot_timestamp_is_zero_not_positive() {
+        // I-P1-08 (rewritten 2026-04-17): snapshot_timestamp is now CONSTANT
+        // epoch 0, not today's IST midnight. This is BY DESIGN — DEDUP must
+        // operate on business key alone to prevent cross-day duplication.
         let ts = build_snapshot_timestamp().unwrap();
-        assert!(ts.as_i64() > 0, "snapshot timestamp must be positive");
+        assert_eq!(
+            ts.as_i64(),
+            0,
+            "snapshot timestamp must be epoch 0 (constant, not today's date)"
+        );
     }
 
     #[test]
