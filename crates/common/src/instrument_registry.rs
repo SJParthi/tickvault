@@ -202,24 +202,24 @@ impl InstrumentRegistry {
             // callers in crates that depend on `metrics` can emit a
             // Prometheus counter without this common crate taking a
             // new dependency.
-            if let Some(prev) = map.insert(instrument.security_id, instrument.clone()) {
-                if prev.exchange_segment != instrument.exchange_segment {
-                    cross_segment_collisions = cross_segment_collisions.saturating_add(1);
-                    tracing::error!(
-                        security_id = instrument.security_id,
-                        prev_segment = ?prev.exchange_segment,
-                        new_segment = ?instrument.exchange_segment,
-                        prev_symbol = %prev.underlying_symbol,
-                        new_symbol = %instrument.underlying_symbol,
-                        "I-P1-11: InstrumentRegistry cross-segment security_id \
-                         collision — BOTH entries stored in composite index; \
-                         legacy get(id) callers will receive whichever entry \
-                         won the HashMap insert race. Operator action: run \
-                         `SELECT segment, security_id FROM ticks GROUP BY segment, \
-                         security_id HAVING count() > 0` to confirm both segments \
-                         are receiving live ticks."
-                    );
-                }
+            if let Some(prev) = map.insert(instrument.security_id, instrument.clone())
+                && prev.exchange_segment != instrument.exchange_segment
+            {
+                cross_segment_collisions = cross_segment_collisions.saturating_add(1);
+                tracing::error!(
+                    security_id = instrument.security_id,
+                    prev_segment = ?prev.exchange_segment,
+                    new_segment = ?instrument.exchange_segment,
+                    prev_symbol = %prev.underlying_symbol,
+                    new_symbol = %instrument.underlying_symbol,
+                    "I-P1-11: InstrumentRegistry cross-segment security_id \
+                     collision — BOTH entries stored in composite index; \
+                     legacy get(id) callers will receive whichever entry \
+                     won the HashMap insert race. Operator action: run \
+                     `SELECT segment, security_id FROM ticks GROUP BY segment, \
+                     security_id HAVING count() > 0` to confirm both segments \
+                     are receiving live ticks."
+                );
             }
         }
 

@@ -104,6 +104,13 @@ pub struct CrossMatchReport {
     pub per_timeframe_mismatches: Vec<(String, usize)>,
     /// Whether the cross-match passed (mismatches within tolerance).
     pub passed: bool,
+    /// True if at least one live materialized view contains rows in the
+    /// last 3 days. When `false`, the cross-match is meaningless —
+    /// the `candles_compared` counter comes from a `LEFT JOIN` that
+    /// preserves historical rows even when the live side is empty, so
+    /// the caller MUST treat "candles_compared > 0 but
+    /// live_candles_present = false" as SKIP, not as a pass.
+    pub live_candles_present: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1042,6 +1049,13 @@ pub async fn cross_match_historical_vs_live(
     let mut timeframes_checked = 0_usize;
     let mut missing_views: Vec<String> = Vec::new();
     let mut per_timeframe_mismatches: Vec<(String, usize)> = Vec::new();
+    // Explicit live-data presence flag. The per-timeframe count queries
+    // use LEFT JOIN which preserves historical rows even when the live
+    // MV is empty, so `candles_compared` alone cannot distinguish
+    // "N candles joined against live data" from "N historical rows and
+    // zero matching live rows". Track whether any live MV has rows in
+    // the last 3 days separately.
+    let mut live_candles_present = false;
 
     for &(hist_tf, live_table) in CROSS_MATCH_TIMEFRAMES {
         // M2: Check if the materialized view exists before JOINing.
@@ -1066,6 +1080,20 @@ pub async fn cross_match_historical_vs_live(
             );
             missing_views.push(live_table.to_string());
             continue;
+        }
+
+        // Direct live-MV row count (NOT a LEFT JOIN). Determines whether
+        // there is any live data at all to compare against. If zero,
+        // we still run the per-timeframe LEFT JOIN below for completeness
+        // but the caller will refuse to emit "OK" without at least one
+        // timeframe reporting live rows.
+        let live_count_query = format!(
+            "SELECT count() FROM {} WHERE ts > dateadd('d', -3, now())",
+            live_table
+        );
+        let live_tf_rows = extract_count(&client, &base_url, &live_count_query).await;
+        if live_tf_rows > 0 {
+            live_candles_present = true;
         }
 
         // Count total comparable candles for this timeframe
@@ -1155,6 +1183,7 @@ pub async fn cross_match_historical_vs_live(
         missing_views,
         per_timeframe_mismatches,
         passed,
+        live_candles_present,
     }
 }
 
@@ -1171,6 +1200,7 @@ fn failed_cross_match_report() -> CrossMatchReport {
         missing_views: Vec::new(),
         per_timeframe_mismatches: Vec::new(),
         passed: false,
+        live_candles_present: false,
     }
 }
 
@@ -1549,6 +1579,7 @@ mod tests {
             missing_views: vec![],
             per_timeframe_mismatches: vec![],
             passed: false,
+            live_candles_present: true,
         };
         assert_eq!(report.timeframes_checked, 5);
         assert_eq!(report.mismatches, 12);
@@ -1660,6 +1691,7 @@ mod tests {
             missing_views: vec!["candles_1d".to_string()],
             per_timeframe_mismatches: vec![],
             passed: false,
+            live_candles_present: true,
         };
         assert_eq!(report.oi_mismatches, 3);
         assert_eq!(report.missing_views.len(), 1);
@@ -1679,9 +1711,43 @@ mod tests {
             missing_views: vec!["candles_5m".to_string(), "candles_1d".to_string()],
             per_timeframe_mismatches: vec![],
             passed: false,
+            live_candles_present: false,
         };
         assert!(!report.passed, "missing views must fail cross-match");
         assert_eq!(report.missing_views.len(), 2);
+    }
+
+    /// Regression: fresh Friday-evening boot (no live ticks) must NOT be
+    /// reported as a pass.
+    ///
+    /// Before the fix at cross_verify.rs + main.rs:3907, the per-timeframe
+    /// LEFT JOIN count would return all historical rows even with an
+    /// empty live MV, so `candles_compared > 0` while no actual
+    /// comparison occurred. `live_candles_present` is the explicit
+    /// signal the caller must use to skip the pass/fail decision.
+    #[test]
+    fn test_cross_match_report_live_candles_present_flag_is_required() {
+        // When live MV is empty, live_candles_present = false. The caller
+        // at main.rs MUST treat this as SKIP regardless of the
+        // `candles_compared` number, which is a meaningless LEFT JOIN
+        // count when there is no live data.
+        let report = CrossMatchReport {
+            timeframes_checked: 0,
+            candles_compared: 348_968, // LEFT JOIN count of historical rows
+            mismatches: 0,
+            missing_live: 0,
+            missing_historical: 0,
+            oi_mismatches: 0,
+            mismatch_details: vec![],
+            missing_views: vec![],
+            per_timeframe_mismatches: vec![],
+            passed: false, // determine_cross_match_passed sees 0 compared+mismatches correctly
+            live_candles_present: false, // <-- the new explicit signal
+        };
+        assert!(
+            !report.live_candles_present,
+            "fresh boot with empty MV must not claim live candles are present"
+        );
     }
 
     #[test]

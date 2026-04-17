@@ -3904,13 +3904,22 @@ fn spawn_historical_candle_fetch(
             let cross_match =
                 cross_match_historical_vs_live(&bg_questdb_config, &bg_registry).await;
 
-            if cross_match.candles_compared == 0 && cross_match.missing_views.is_empty() {
-                // First run or no live data yet — skip cross-match, don't flag as failure.
+            if !cross_match.live_candles_present || cross_match.candles_compared == 0 {
+                // First run / fresh DB / post-market boot with no live ticks yet.
+                //
+                // `candles_compared` alone is NOT a sufficient signal —
+                // the per-timeframe count query uses LEFT JOIN which
+                // preserves historical rows even when the live MV is
+                // empty. Trust `live_candles_present`, which is computed
+                // from a direct `SELECT count() FROM candles_1m ...`
+                // query against the live view only.
                 info!(
-                    "cross-match SKIPPED — no live data in materialized views (first run or fresh DB)"
+                    live_candles_present = cross_match.live_candles_present,
+                    candles_compared = cross_match.candles_compared,
+                    "cross-match SKIPPED — no live data in materialized views (first run, fresh DB, or post-market boot)"
                 );
                 bg_notifier.notify(NotificationEvent::Custom {
-                    message: "Historical vs Live cross-match SKIPPED\nNo live data in materialized views (first run or fresh DB). Will compare on next run after live ticks are collected.".to_string(),
+                    message: "Historical vs Live cross-match SKIPPED\nNo live data in materialized views (first run, fresh DB, or post-market boot). Will compare on next run after live ticks are collected during market hours.".to_string(),
                 });
             } else if cross_match.passed {
                 bg_notifier.notify(NotificationEvent::CandleCrossMatchPassed {

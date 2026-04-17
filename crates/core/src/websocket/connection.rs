@@ -10,6 +10,17 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+/// Test-only override: force the post-market guard inside
+/// `wait_with_backoff` to treat the wall-clock as "inside market hours".
+///
+/// Production never reads this flag (`#[cfg(test)]` compilation only).
+/// Tests that exercise the infinite-retry math path set it to `true`
+/// before running and reset to `false` after, so the test result does
+/// not depend on when `cargo test` was invoked.
+#[cfg(test)]
+static TEST_FORCE_IN_MARKET_HOURS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 use futures_util::{SinkExt, StreamExt};
 use secrecy::ExposeSecret;
 use tokio::net::TcpStream;
@@ -1083,16 +1094,28 @@ impl WebSocketConnection {
         // hours, Dhan streams data + pings every 10s, so consecutive failures
         // mean a real problem worth retrying. After market close, silence is
         // EXPECTED — retrying just spams Telegram with disconnect/reconnect.
-        if attempt >= 3 {
+        //
+        // Only applies to infinite-retry mode (reconnect_max_attempts == 0,
+        // the production default). When an explicit finite budget is set
+        // (tests, debug runs), the caller has already bounded retries and
+        // the math path should run regardless of wall-clock.
+        if attempt >= 3 && self.ws_config.reconnect_max_attempts == 0 {
             let now_utc_secs = chrono::Utc::now().timestamp();
             let now_ist_secs_of_day = (now_utc_secs.saturating_add(i64::from(
                 tickvault_common::constants::IST_UTC_OFFSET_SECONDS,
             )))
             .rem_euclid(86400) as u32;
-            let outside_market = now_ist_secs_of_day
+            let raw_outside_market = now_ist_secs_of_day
                 < tickvault_common::constants::TICK_PERSIST_START_SECS_OF_DAY_IST
                 || now_ist_secs_of_day
                     >= tickvault_common::constants::TICK_PERSIST_END_SECS_OF_DAY_IST;
+            // Test-only escape hatch so the "infinite retries math" path
+            // can be exercised by `cargo test` regardless of wall-clock.
+            #[cfg(test)]
+            let outside_market = raw_outside_market
+                && !TEST_FORCE_IN_MARKET_HOURS.load(std::sync::atomic::Ordering::Relaxed);
+            #[cfg(not(test))]
+            let outside_market = raw_outside_market;
             if outside_market {
                 info!(
                     connection_id = self.connection_id,
@@ -1362,19 +1385,6 @@ mod tests {
         match msg {
             Some(Ok(Message::Pong(data))) => data,
             other => panic!("expected Pong, got {other:?}"),
-        }
-    }
-
-    /// Extract `ReadTimeout` fields from a `Result`, panicking if the variant
-    /// doesn't match.
-    #[track_caller]
-    fn unwrap_read_timeout(result: Result<(), WebSocketError>) -> (u8, u64) {
-        match result {
-            Err(WebSocketError::ReadTimeout {
-                connection_id,
-                timeout_secs,
-            }) => (connection_id, timeout_secs),
-            other => panic!("expected ReadTimeout, got {other:?}"),
         }
     }
 
@@ -2028,6 +2038,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_wait_with_backoff_zero_max_attempts_means_infinite() {
+        // Force the post-market guard to treat wall-clock as in-market so
+        // this test exercises the pure infinite-retry math path regardless
+        // of when `cargo test` is invoked.
+        super::TEST_FORCE_IN_MARKET_HOURS.store(true, std::sync::atomic::Ordering::Relaxed);
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                super::TEST_FORCE_IN_MARKET_HOURS
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let _reset = Reset;
+
         let (tx, _rx) = mpsc::channel(100);
         let conn = WebSocketConnection::new(
             0,
@@ -3143,22 +3166,14 @@ mod tests {
         let _ = result;
     }
 
-    // --- run_read_loop: Read timeout (line 363-374) ---
-
-    #[tokio::test]
-    async fn test_read_loop_timeout_returns_read_timeout_error() {
-        let (tx, _rx) = mpsc::channel(100);
-        // Use very small timeout: ping_interval=1 * (0+1) + pong_timeout=0 = 1s
-        let conn = make_test_conn_for_read_loop(tx);
-        let (_server_ws, client_ws) = make_ws_pair().await;
-
-        // Server is connected but sends nothing — read loop should timeout.
-        let result = conn.run_read_loop(client_ws).await;
-
-        let (connection_id, timeout_secs) = unwrap_read_timeout(result);
-        assert_eq!(connection_id, 0);
-        assert_eq!(timeout_secs, 1); // 1*(0+1)+0 = 1
-    }
+    // Removed 2026-04-17: `test_read_loop_timeout_returns_read_timeout_error`
+    // relied on a client-side `time::timeout(read.next())` wrapper that
+    // STAGE-B (plan item P1.1) deleted. `run_read_loop` now blocks on
+    // `read.next().await` indefinitely and relies on the server's 40s
+    // server-side timeout + the watchdog for liveness — so this test
+    // simply hung forever waiting for a timeout path that no longer
+    // exists in production code. The `WatchdogFired` code path is
+    // covered by the watchdog tests in `activity_watchdog.rs`.
 
     // --- run_read_loop: Error from stream (line 415-420) ---
 

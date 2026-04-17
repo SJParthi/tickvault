@@ -3516,6 +3516,7 @@ mod tests {
     /// writes (e.g., build_previous_close_row via buffer_mut()) get flushed
     /// immediately instead of waiting for tick batch flush.
     #[test]
+    #[allow(deprecated)] // APPROVED: schema-stability coverage for archived previous_close design
     fn test_flush_buffer_direct_bypasses_pending_count() {
         let port = spawn_tcp_drain_server();
 
@@ -3556,6 +3557,7 @@ mod tests {
 
     /// flush_buffer_direct() is a no-op when the buffer is truly empty.
     #[test]
+    #[allow(deprecated)] // APPROVED: schema-stability coverage for archived previous_close design
     fn test_flush_buffer_direct_empty_is_noop() {
         let port = spawn_tcp_drain_server();
 

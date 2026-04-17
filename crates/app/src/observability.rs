@@ -11,7 +11,7 @@
 //! - OpenTelemetry layer: only exports spans on drop, no allocation per-event on hot path.
 
 use anyhow::{Context, Result};
-use metrics_exporter_prometheus::PrometheusBuilder;
+use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 use opentelemetry::trace::TracerProvider;
 use opentelemetry_otlp::{SpanExporter, WithExportConfig};
 use opentelemetry_sdk::Resource;
@@ -20,6 +20,57 @@ use tracing::info;
 use tracing_opentelemetry::OpenTelemetryLayer;
 
 use tickvault_common::config::ObservabilityConfig;
+
+/// Bucket boundaries (upper bounds) for nanosecond-scale duration histograms.
+///
+/// Without these, `metrics-exporter-prometheus` renders histograms as
+/// Prometheus **summaries** — which lack the `_bucket` series that
+/// `histogram_quantile(...)` Grafana queries require, producing "No data".
+///
+/// Range: 100 ns → 10 s, logarithmic spacing. Covers:
+/// - Tick parse (<1 µs)
+/// - Full tick processing (~10 µs target, alert at >100 µs)
+/// - Pipeline stalls (>10 ms indicates backpressure)
+/// - Wire-to-done (>1 s indicates a broken socket)
+const TICK_NS_HISTOGRAM_BUCKETS: &[f64] = &[
+    100.0,            // 100 ns
+    500.0,            // 500 ns
+    1_000.0,          // 1 µs
+    5_000.0,          // 5 µs
+    10_000.0,         // 10 µs — zero-allocation hot-path budget
+    50_000.0,         // 50 µs
+    100_000.0,        // 100 µs
+    500_000.0,        // 500 µs
+    1_000_000.0,      // 1 ms
+    10_000_000.0,     // 10 ms
+    100_000_000.0,    // 100 ms
+    1_000_000_000.0,  // 1 s
+    10_000_000_000.0, // 10 s
+];
+
+/// Bucket boundaries (upper bounds in milliseconds) for REST + DB latency
+/// histograms ending in `_ms` (e.g., `tv_api_request_duration_ms`,
+/// `tv_questdb_liveness_latency_ms`, `tv_phase2_run_ms`). Same rationale
+/// as the `_ns` buckets: without these the exporter emits summaries and
+/// Grafana `histogram_quantile` queries show "No data".
+///
+/// Range: 1 ms → 60 s, roughly log-spaced.
+const API_MS_HISTOGRAM_BUCKETS: &[f64] = &[
+    1.0,      // 1 ms
+    5.0,      // 5 ms
+    10.0,     // 10 ms
+    25.0,     // 25 ms
+    50.0,     // 50 ms
+    100.0,    // 100 ms
+    250.0,    // 250 ms
+    500.0,    // 500 ms
+    1_000.0,  // 1 s — Dhan rate-limit window
+    2_500.0,  // 2.5 s
+    5_000.0,  // 5 s
+    10_000.0, // 10 s
+    30_000.0, // 30 s
+    60_000.0, // 60 s
+];
 
 /// Initializes the Prometheus metrics exporter.
 ///
@@ -36,6 +87,18 @@ pub fn init_metrics(config: &ObservabilityConfig) -> Result<()> {
 
     PrometheusBuilder::new()
         .with_http_listener(([0, 0, 0, 0], config.metrics_port))
+        // Force every `*_duration_ns` histogram to render as a Prometheus
+        // histogram (with `_bucket` series) instead of the exporter's
+        // default summary. Grafana's `histogram_quantile(rate(*_bucket))`
+        // queries need `_bucket` to exist — without this, the latency
+        // panels show "No data" forever.
+        .set_buckets_for_metric(
+            Matcher::Suffix("_duration_ns".to_string()),
+            TICK_NS_HISTOGRAM_BUCKETS,
+        )
+        .context("failed to set histogram buckets for _duration_ns metrics")?
+        .set_buckets_for_metric(Matcher::Suffix("_ms".to_string()), API_MS_HISTOGRAM_BUCKETS)
+        .context("failed to set histogram buckets for _ms metrics")?
         .install()
         .context("failed to install Prometheus metrics exporter")?;
 
@@ -105,6 +168,28 @@ mod tests {
             otlp_endpoint: String::new(),
             metrics_enabled: false,
             tracing_enabled: false,
+        }
+    }
+
+    /// Regression: both bucket-boundary arrays must be non-empty and
+    /// monotonically increasing. `set_buckets_for_metric` returns
+    /// `BuildError::EmptyBucketsOrQuantiles` on empty arrays, which
+    /// would silently kill `init_metrics` at boot.
+    #[test]
+    fn test_histogram_buckets_are_non_empty_and_monotonic() {
+        for (name, buckets) in [
+            ("TICK_NS_HISTOGRAM_BUCKETS", TICK_NS_HISTOGRAM_BUCKETS),
+            ("API_MS_HISTOGRAM_BUCKETS", API_MS_HISTOGRAM_BUCKETS),
+        ] {
+            assert!(!buckets.is_empty(), "{name} must not be empty");
+            for window in buckets.windows(2) {
+                assert!(
+                    window[0] < window[1],
+                    "{name} must be strictly increasing: {} not < {}",
+                    window[0],
+                    window[1]
+                );
+            }
         }
     }
 
