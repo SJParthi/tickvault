@@ -1,10 +1,16 @@
-//! I-P1-08 mechanical enforcement — Grafana dashboard lifecycle filter guard.
+//! I-P1-08 + I-P1-11 mechanical enforcement — Grafana dashboard filter guards.
 //!
-//! Scans every `.json` file under `deploy/docker/grafana/dashboards/` and
-//! verifies that ANY SQL query referencing a lifecycle snapshot table
-//! (`fno_underlyings`, `derivative_contracts`, `subscribed_indices`)
-//! includes the mandatory `WHERE status = 'active'` filter (or an explicit
-//! `status IN (...)` / `status = 'expired'` for lifecycle-history panels).
+//! Two distinct guards ride this file:
+//!
+//! * **I-P1-08** — any query on a lifecycle snapshot table
+//!   (`fno_underlyings`, `derivative_contracts`, `subscribed_indices`) must
+//!   include an explicit `status` filter.
+//! * **I-P1-11 (2026-04-17)** — any `count_distinct(security_id)` aggregation
+//!   on a cross-segment table (`ticks`, `market_depth`, `deep_market_depth`,
+//!   live candles, `historical_candles`) MUST also qualify by segment.
+//!   Without the segment qualifier, a collision like NIFTY IDX_I id=13 and
+//!   an NSE_EQ stock id=13 collapses into ONE distinct id in the count,
+//!   silently hiding missing-subscription bugs on the operator dashboard.
 //!
 //! # Why this exists
 //!
@@ -41,6 +47,22 @@ const LIFECYCLE_TABLES: &[&str] = &[
 /// lifecycle filter rule. Historical build panels use `ORDER BY timestamp DESC
 /// LIMIT N` instead.
 const BUILD_HISTORY_TABLE: &str = "instrument_build_metadata";
+
+/// I-P1-11: cross-segment data tables where `count_distinct(security_id)`
+/// alone under-counts when Dhan reuses a numeric id across segments.
+/// Any aggregation over one of these tables MUST include `segment` (or
+/// `exchange_segment`) alongside `security_id` in the distinct clause.
+const CROSS_SEGMENT_TABLES: &[&str] = &[
+    "ticks",
+    "market_depth",
+    "deep_market_depth",
+    "candles_1m",
+    "candles_5m",
+    "candles_15m",
+    "candles_60m",
+    "candles_1d",
+    "historical_candles",
+];
 
 /// Absolute path to the Grafana dashboards directory, rooted at workspace root.
 fn dashboards_dir() -> PathBuf {
@@ -136,6 +158,57 @@ fn lifecycle_table_referenced(sql: &str) -> Option<&'static str> {
     None
 }
 
+/// I-P1-11: returns the cross-segment table referenced by this SQL if any.
+fn cross_segment_table_referenced(sql: &str) -> Option<&'static str> {
+    let lower = sql.to_lowercase();
+    for &table in CROSS_SEGMENT_TABLES {
+        let needle = format!("from {table}");
+        if lower.contains(&needle) {
+            return Some(table);
+        }
+    }
+    None
+}
+
+/// I-P1-11: returns true if the SQL uses `count_distinct(security_id)` or
+/// `count(DISTINCT security_id)` without pairing with `segment` /
+/// `exchange_segment` inside the same distinct expression.
+///
+/// Catches the exact dashboard bug-class from 2026-04-17: the Grafana
+/// panel `SELECT count_distinct(security_id) AS total FROM ticks` would
+/// report 1 instead of 2 when NIFTY IDX_I id=13 and some NSE_EQ id=13
+/// both have ticks.
+fn distinct_security_id_missing_segment(sql: &str) -> bool {
+    let normalized = sql
+        .to_lowercase()
+        .replace('\n', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    // Find any `count_distinct(...)` or `count(distinct ...)` expression
+    // and check its body for security_id without segment.
+    let mut offending = false;
+    for pattern in ["count_distinct(", "count(distinct "] {
+        let mut search_from = 0;
+        while let Some(idx) = normalized[search_from..].find(pattern) {
+            let body_start = search_from + idx + pattern.len();
+            // Find matching close-paren — assumes no nested parens.
+            let rest = &normalized[body_start..];
+            let close = match rest.find(')') {
+                Some(p) => p,
+                None => break,
+            };
+            let body = &rest[..close];
+            if body.contains("security_id") && !body.contains("segment") {
+                offending = true;
+            }
+            search_from = body_start + close;
+        }
+    }
+    offending
+}
+
 /// Returns true if the SQL contains an explicit `status` predicate.
 fn has_status_filter(sql: &str) -> bool {
     // Normalise whitespace. Accept any of:
@@ -195,6 +268,47 @@ fn dashboard_lifecycle_queries_must_include_status_filter() {
          operational views). Without it, expired contracts from years past \
          inflate the result. Fix by adding the filter to each query below.\n\n{}\n\n\
          Rule: .claude/rules/project/gap-enforcement.md (I-P1-08).",
+        violations.join("\n\n")
+    );
+}
+
+// ============================================================================
+// I-P1-11 — Dashboard segment-aware distinct-security_id guard
+// ============================================================================
+
+#[test]
+fn dashboard_distinct_security_id_must_include_segment() {
+    let dashboards = read_all_dashboards();
+    let mut violations: Vec<String> = Vec::new();
+
+    for (file, json) in &dashboards {
+        let queries = extract_raw_sql_queries(json);
+        for (idx, sql) in queries.iter().enumerate() {
+            if let Some(table) = cross_segment_table_referenced(sql)
+                && distinct_security_id_missing_segment(sql)
+            {
+                violations.push(format!(
+                    "[{file}] query #{} on cross-segment table `{table}` uses \
+                     `count_distinct(security_id)` without including `segment` in \
+                     the distinct expression. When Dhan reuses a numeric id across \
+                     segments (e.g. NIFTY IDX_I id=13 and NSE_EQ id=13), the count \
+                     collapses the two into one. Fix by using \
+                     `count(DISTINCT security_id || '|' || segment)` or \
+                     `count(*) FROM (SELECT DISTINCT security_id, segment FROM {table})`.\n    {}",
+                    idx,
+                    sql.replace('\n', " ").chars().take(200).collect::<String>()
+                ));
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "I-P1-11 violation — Grafana dashboard `count_distinct(security_id)` \
+         aggregations on cross-segment tables MUST also include `segment` in the \
+         distinct clause. Without it, cross-segment id collisions silently \
+         under-count instruments.\n\n{}\n\n\
+         Rule: .claude/rules/project/security-id-uniqueness.md (I-P1-11).",
         violations.join("\n\n")
     );
 }
@@ -275,6 +389,64 @@ fn self_test_extract_raw_sql_queries_finds_all() {
     assert_eq!(queries.len(), 2);
     assert!(queries[0].contains("ticks"));
     assert!(queries[1].contains("fno_underlyings"));
+}
+
+#[test]
+fn self_test_cross_segment_table_detects_ticks() {
+    let sql = "SELECT count_distinct(security_id) FROM ticks;";
+    assert_eq!(cross_segment_table_referenced(sql), Some("ticks"));
+}
+
+#[test]
+fn self_test_cross_segment_table_detects_historical_candles() {
+    let sql = "SELECT count() FROM historical_candles WHERE timeframe='1m';";
+    assert_eq!(
+        cross_segment_table_referenced(sql),
+        Some("historical_candles")
+    );
+}
+
+#[test]
+fn self_test_cross_segment_table_ignores_lifecycle_tables() {
+    let sql = "SELECT count() FROM fno_underlyings WHERE status = 'active';";
+    assert_eq!(cross_segment_table_referenced(sql), None);
+}
+
+#[test]
+fn self_test_distinct_security_id_flags_bare_count_distinct() {
+    let sql = "SELECT count_distinct(security_id) AS total FROM ticks;";
+    assert!(
+        distinct_security_id_missing_segment(sql),
+        "bare count_distinct(security_id) must be flagged"
+    );
+}
+
+#[test]
+fn self_test_distinct_security_id_flags_sql_distinct_form() {
+    let sql = "SELECT count(DISTINCT security_id) AS total FROM ticks;";
+    assert!(distinct_security_id_missing_segment(sql));
+}
+
+#[test]
+fn self_test_distinct_security_id_accepts_segment_qualified() {
+    let sql = "SELECT count_distinct(security_id || '|' || segment) FROM ticks;";
+    assert!(!distinct_security_id_missing_segment(sql));
+}
+
+#[test]
+fn self_test_distinct_security_id_accepts_wrapped_distinct() {
+    let sql = "SELECT count(*) FROM (SELECT DISTINCT security_id, segment FROM ticks);";
+    // No count_distinct on top level — our regex doesn't fire; this is fine
+    // because the inner SELECT DISTINCT includes segment.
+    assert!(!distinct_security_id_missing_segment(sql));
+}
+
+#[test]
+fn self_test_distinct_security_id_ignores_unrelated_aggregations() {
+    let sql = "SELECT count() FROM ticks;";
+    assert!(!distinct_security_id_missing_segment(sql));
+    let sql2 = "SELECT max(ltp) FROM ticks;";
+    assert!(!distinct_security_id_missing_segment(sql2));
 }
 
 #[test]
