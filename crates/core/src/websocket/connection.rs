@@ -1388,19 +1388,6 @@ mod tests {
         }
     }
 
-    /// Extract `ReadTimeout` fields from a `Result`, panicking if the variant
-    /// doesn't match.
-    #[track_caller]
-    fn unwrap_read_timeout(result: Result<(), WebSocketError>) -> (u8, u64) {
-        match result {
-            Err(WebSocketError::ReadTimeout {
-                connection_id,
-                timeout_secs,
-            }) => (connection_id, timeout_secs),
-            other => panic!("expected ReadTimeout, got {other:?}"),
-        }
-    }
-
     #[test]
     fn test_connection_initial_state_disconnected() {
         let (tx, _rx) = mpsc::channel(100);
@@ -3179,22 +3166,14 @@ mod tests {
         let _ = result;
     }
 
-    // --- run_read_loop: Read timeout (line 363-374) ---
-
-    #[tokio::test]
-    async fn test_read_loop_timeout_returns_read_timeout_error() {
-        let (tx, _rx) = mpsc::channel(100);
-        // Use very small timeout: ping_interval=1 * (0+1) + pong_timeout=0 = 1s
-        let conn = make_test_conn_for_read_loop(tx);
-        let (_server_ws, client_ws) = make_ws_pair().await;
-
-        // Server is connected but sends nothing — read loop should timeout.
-        let result = conn.run_read_loop(client_ws).await;
-
-        let (connection_id, timeout_secs) = unwrap_read_timeout(result);
-        assert_eq!(connection_id, 0);
-        assert_eq!(timeout_secs, 1); // 1*(0+1)+0 = 1
-    }
+    // Removed 2026-04-17: `test_read_loop_timeout_returns_read_timeout_error`
+    // relied on a client-side `time::timeout(read.next())` wrapper that
+    // STAGE-B (plan item P1.1) deleted. `run_read_loop` now blocks on
+    // `read.next().await` indefinitely and relies on the server's 40s
+    // server-side timeout + the watchdog for liveness — so this test
+    // simply hung forever waiting for a timeout path that no longer
+    // exists in production code. The `WatchdogFired` code path is
+    // covered by the watchdog tests in `activity_watchdog.rs`.
 
     // --- run_read_loop: Error from stream (line 415-420) ---
 
