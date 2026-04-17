@@ -486,14 +486,19 @@ PascalCase top-level keys.
 
 ### 10.3 Missing Metrics
 
-| Metric | Purpose |
-|--------|---------|
-| `tv_websocket_pool_all_dead` | Bool gauge: true if all 5 main feed connections are down |
-| `tv_websocket_failed_connections_count` | Gauge: number of connections in Reconnecting state |
-| `tv_depth_20lvl_sequence_gaps_total` | Counter: detected sequence gaps in 20-level packets |
-| `tv_order_update_non_order_messages_dropped_total` | Counter: JSON messages that weren't order updates |
-| `tv_unknown_response_codes_total` | Counter: Dhan sent a response code we don't recognize |
-| `tv_packets_by_response_code` | Histogram: breakdown of all received packet types |
+| Metric | Purpose | Status |
+|--------|---------|--------|
+| `tv_websocket_pool_all_dead` | Bool gauge: true if all 5 main feed connections are down | ✅ **landed 2026-04-17** — set in `pool_watchdog::PoolWatchdog::tick` every 5s |
+| `tv_websocket_failed_connections_count` | Gauge: number of connections in Reconnecting state | ✅ **landed 2026-04-17** — set in `pool_watchdog::PoolWatchdog::tick` |
+| `tv_depth_rebalancer_stale_spot_skips_total` | Counter: rebalance cycles skipped due to stale spot (O3) | ✅ **landed 2026-04-17** |
+| `tv_phase2_runs_total{outcome}` | Counter: Phase 2 scheduler outcomes (O1-A) | ✅ **landed 2026-04-17** |
+| `tv_phase2_run_ms` | Histogram: Phase 2 scheduler run duration | ✅ **landed 2026-04-17** |
+| `tv_pool_degraded_alerts_total` | Counter: 60s-all-down Telegrams fired | ✅ **landed 2026-04-17** |
+| `tv_pool_recoveries_total` | Counter: pool-recovered transitions | ✅ **landed 2026-04-17** |
+| `tv_depth_20lvl_sequence_gaps_total` | Counter: detected sequence gaps in 20-level packets | ⏳ parser hook pending |
+| `tv_order_update_non_order_messages_dropped_total` | Counter: JSON messages that weren't order updates | ⏳ |
+| `tv_unknown_response_codes_total` | Counter: Dhan sent a response code we don't recognize | ⏳ dispatcher hook pending |
+| `tv_packets_by_response_code` | Histogram: breakdown of all received packet types | ⏳ |
 
 ### 10.4 Missing Tests
 
