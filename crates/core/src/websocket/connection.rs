@@ -267,14 +267,14 @@ impl WebSocketConnection {
                         "WebSocket connected and subscribed"
                     );
 
-                    // M1: After a reconnection (not initial connect), log that a
-                    // mid-session candle gap may exist. The existing post-market
-                    // historical fetch will backfill any missing data.
+                    // Post-reconnect notification. In-market backfill is explicitly
+                    // disabled (user policy); only post-market historical candle
+                    // fetch runs, and that path is independent of the live WS.
                     if reconnection_count > 0 {
                         info!(
                             connection_id = self.connection_id,
                             reconnection_count,
-                            "WebSocket reconnected — mid-session candle gap may exist, next post-market fetch will backfill"
+                            "WebSocket reconnected (in-market backfill disabled — post-market historical fetch handles any gap)"
                         );
                         // H1: Fire Telegram alert on reconnection success.
                         if let Some(ref n) = self.notifier {

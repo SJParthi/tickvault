@@ -953,7 +953,6 @@ async fn main() -> Result<()> {
                     questdb_cfg,
                     Some(hs),
                     Some(persist_notifier),
-                    None, // gap backfill disabled — historical data is separate from live ticks
                 )
                 .await;
             });
@@ -1631,16 +1630,17 @@ async fn main() -> Result<()> {
         tick_broadcast_sender.clone(),
     );
 
-    // Gap-backfill worker DISABLED (slow-boot). Same reasoning as
-    // fast-boot: historical candle data must NOT be injected into the
-    // live `ticks` table via synthetic tick synthesis.
+    // In-market gap-backfill is DISABLED by user policy. Historical
+    // candle data must NOT be injected into the live `ticks` table.
+    // Post-market historical fetch runs on a separate cold path and
+    // writes only to `historical_candles`.
 
     // Spawn the observability-only consumer (gap tracker + HTTP health).
     {
         let obs_rx = tick_broadcast_sender.subscribe();
         let questdb_cfg = config.questdb.clone();
         tokio::spawn(async move {
-            run_slow_boot_observability(obs_rx, questdb_cfg, None).await;
+            run_slow_boot_observability(obs_rx, questdb_cfg).await;
         });
         info!("slow-boot observability consumer started");
     }
@@ -3640,14 +3640,6 @@ async fn run_tick_persistence_consumer(
     questdb_config: tickvault_common::config::QuestDbConfig,
     health_status: Option<SharedHealthStatus>,
     notifier: Option<std::sync::Arc<NotificationService>>,
-    // S3-2: Optional gap-backfill publisher. When a TickGapResult::Error is
-    // detected, a GapBackfillRequest is sent here for the BackfillWorker to
-    // fetch the missing window from Dhan's historical intraday REST API and
-    // synthesise replacement ticks. None = backfill disabled (tests / early
-    // boot). See crates/core/src/historical/backfill.rs for the worker.
-    gap_backfill_tx: Option<
-        tokio::sync::mpsc::Sender<tickvault_core::historical::backfill::GapBackfillRequest>,
-    >,
 ) {
     let mut tick_writer = match TickPersistenceWriter::new(&questdb_config) {
         Ok(writer) => {
@@ -3682,16 +3674,14 @@ async fn run_tick_persistence_consumer(
     let qdb_health_tick_interval = std::time::Duration::from_secs(2); // APPROVED: pre-existing literal, session-7 tech debt tracked for cleanup
     let mut last_qdb_health_tick = std::time::Instant::now();
 
-    // S3-2 / S4-T1c: Tick gap tracker — detects when a security's LTT
-    // gap exceeds the ERROR threshold, so the backfill worker can pull
-    // the missing window from Dhan historical REST.
+    // Tick gap tracker — detects when a security's LTT gap exceeds the
+    // ERROR threshold. Fires its own log/metric/alert; gap backfill is
+    // explicitly disabled inside the WebSocket path (user policy:
+    // in-market backfill must never run; post-market historical fetch
+    // handles the cold path separately).
     //
     // Capacity = MAX_INSTRUMENTS_PER_WEBSOCKET_CONNECTION (5000) ×
-    // MAX_WEBSOCKET_CONNECTIONS (5) = 25,000. This matches the
-    // worst-case subscribed universe so NO instrument gets silently
-    // evicted from the gap tracker under production load. The old
-    // hardcoded 5000 silently dropped tracking on 20k instruments —
-    // fixed per the S4 honest-audit.
+    // MAX_WEBSOCKET_CONNECTIONS (5) = 25,000.
     let tick_gap_tracker_capacity =
         tickvault_common::constants::MAX_INSTRUMENTS_PER_WEBSOCKET_CONNECTION
             .saturating_mul(tickvault_common::constants::MAX_WEBSOCKET_CONNECTIONS);
@@ -3699,50 +3689,16 @@ async fn run_tick_persistence_consumer(
         tickvault_trading::risk::tick_gap_tracker::TickGapTracker::new(tick_gap_tracker_capacity);
     info!(
         capacity = tick_gap_tracker_capacity,
-        "S4-T1c: tick gap tracker instantiated with full-universe capacity"
+        "tick gap tracker instantiated with full-universe capacity (in-market backfill disabled)"
     );
-    // Count of gap events published (cold path metric, observable via
-    // tv_backfill_gaps_published_total).
-    let mut gaps_published: u64 = 0;
 
     loop {
         match tick_rx.recv().await {
             Ok(tick) => {
-                // S3-2: record the tick's timestamp into the gap tracker and
-                // publish a backfill request on ERROR-level gaps. Warmup and
-                // warning gaps are ignored by this publisher (the tracker
-                // itself still fires its own log/metric for them).
-                let gap_result =
-                    tick_gap_tracker.record_tick(tick.security_id, tick.exchange_timestamp);
-                if let tickvault_trading::risk::tick_gap_tracker::TickGapResult::Error { gap_secs } =
-                    gap_result
-                    && let Some(ref tx) = gap_backfill_tx
-                {
-                    let from = tick.exchange_timestamp.saturating_sub(gap_secs);
-                    let req = tickvault_core::historical::backfill::GapBackfillRequest {
-                        security_id: tick.security_id,
-                        exchange_segment_code: tick.exchange_segment_code,
-                        from_ist_secs: from,
-                        to_ist_secs: tick.exchange_timestamp,
-                    };
-                    match tx.try_send(req) {
-                        Ok(()) => {
-                            gaps_published = gaps_published.saturating_add(1);
-                            metrics::counter!("tv_backfill_gaps_published_total").increment(1);
-                        }
-                        Err(
-                            tokio::sync::mpsc::error::TrySendError::Full(_)
-                            | tokio::sync::mpsc::error::TrySendError::Closed(_),
-                        ) => {
-                            metrics::counter!("tv_backfill_gaps_dropped_total").increment(1);
-                            warn!(
-                                security_id = tick.security_id,
-                                gap_secs,
-                                "S3-2: backfill channel full or closed — gap request dropped"
-                            );
-                        }
-                    }
-                }
+                // Record the tick into the gap tracker. The tracker fires
+                // its own log/metric on gap thresholds; we do NOT publish
+                // any backfill request (in-market backfill disabled).
+                let _ = tick_gap_tracker.record_tick(tick.security_id, tick.exchange_timestamp);
 
                 if let Err(err) = tick_writer.append_tick(&tick) {
                     warn!(?err, "cold-path tick persistence write failed");
@@ -3845,9 +3801,6 @@ async fn run_tick_persistence_consumer(
 async fn run_slow_boot_observability(
     mut tick_rx: tokio::sync::broadcast::Receiver<tickvault_common::tick_types::ParsedTick>,
     questdb_config: tickvault_common::config::QuestDbConfig,
-    gap_backfill_tx: Option<
-        tokio::sync::mpsc::Sender<tickvault_core::historical::backfill::GapBackfillRequest>,
-    >,
 ) {
     info!("S4-T1d: slow-boot observability task started");
 
@@ -3884,29 +3837,11 @@ async fn run_slow_boot_observability(
     loop {
         match tick_rx.recv().await {
             Ok(tick) => {
-                // Gap detection path — same logic as fast-boot consumer.
-                let gap_result =
-                    tick_gap_tracker.record_tick(tick.security_id, tick.exchange_timestamp);
-                if let tickvault_trading::risk::tick_gap_tracker::TickGapResult::Error { gap_secs } =
-                    gap_result
-                    && let Some(ref tx) = gap_backfill_tx
-                {
-                    let from = tick.exchange_timestamp.saturating_sub(gap_secs);
-                    let req = tickvault_core::historical::backfill::GapBackfillRequest {
-                        security_id: tick.security_id,
-                        exchange_segment_code: tick.exchange_segment_code,
-                        from_ist_secs: from,
-                        to_ist_secs: tick.exchange_timestamp,
-                    };
-                    match tx.try_send(req) {
-                        Ok(()) => {
-                            metrics::counter!("tv_backfill_gaps_published_total").increment(1);
-                        }
-                        Err(_) => {
-                            metrics::counter!("tv_backfill_gaps_dropped_total").increment(1);
-                        }
-                    }
-                }
+                // Gap detection — same logic as fast-boot consumer. Gap
+                // tracker fires its own log/metric on ERROR thresholds;
+                // no backfill request is published (in-market backfill
+                // disabled by user policy).
+                let _ = tick_gap_tracker.record_tick(tick.security_id, tick.exchange_timestamp);
 
                 // QuestDB HTTP health ping every 2 seconds.
                 if last_qdb_health_check.elapsed() >= qdb_health_interval {
