@@ -182,6 +182,33 @@ pub const CLOCK_SKEW_BACKWARD_THRESHOLD_NANOS: i64 = 60_000_000_000;
 static MAX_WALL_CLOCK_SEEN_NANOS: std::sync::atomic::AtomicI64 =
     std::sync::atomic::AtomicI64::new(0);
 
+/// Test-only override for `received_at_nanos` used by `run_tick_processor`.
+///
+/// Production always uses `Utc::now()` via the `else` branch in
+/// `current_received_at_nanos()` — zero runtime cost. Tests can set this
+/// atomic to inject a deterministic wall-clock so the post-market
+/// `is_wall_clock_within_persist_window` guard does not filter every
+/// test tick when `cargo test` is invoked outside 09:00-15:30 IST.
+///
+/// Sentinel `0` means "no override — use `Utc::now()`".
+#[cfg(test)]
+pub(crate) static TEST_RECEIVED_AT_OVERRIDE_NANOS: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(0);
+
+/// Returns the current wall-clock in UTC nanoseconds, or a test override.
+#[inline]
+fn current_received_at_nanos() -> i64 {
+    #[cfg(test)]
+    {
+        let override_val =
+            TEST_RECEIVED_AT_OVERRIDE_NANOS.load(std::sync::atomic::Ordering::Relaxed);
+        if override_val != 0 {
+            return override_val;
+        }
+    }
+    chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+}
+
 /// Returns `true` if the wall-clock time (received_at_nanos) falls within
 /// the tick persist window [09:00, 15:30) IST.
 ///
@@ -720,7 +747,7 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
         let tick_start = Instant::now();
         frames_processed = frames_processed.saturating_add(1);
         m_frames.increment(1);
-        let received_at_nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let received_at_nanos = current_received_at_nanos();
 
         // Parse the binary frame
         let parsed = match dispatch_frame(&raw_frame, received_at_nanos) {
@@ -1664,6 +1691,25 @@ mod tests {
         // Today's IST midnight = strip time-of-day.
         let today_midnight_ist = (now_ist / SECONDS_PER_DAY) * SECONDS_PER_DAY;
         today_midnight_ist + hours * 3600 + minutes * 60 + seconds
+    }
+
+    /// RAII helper that sets the test-only `TEST_RECEIVED_AT_OVERRIDE_NANOS`
+    /// and resets it to `0` (disabled) on drop. Scopes the override to a
+    /// single test so parallel tests do not see each other's clock.
+    struct TestClockGuard;
+
+    impl TestClockGuard {
+        fn set(received_at_utc_nanos: i64) -> Self {
+            super::TEST_RECEIVED_AT_OVERRIDE_NANOS
+                .store(received_at_utc_nanos, std::sync::atomic::Ordering::Relaxed);
+            Self
+        }
+    }
+
+    impl Drop for TestClockGuard {
+        fn drop(&mut self) {
+            super::TEST_RECEIVED_AT_OVERRIDE_NANOS.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// Build a valid ticker binary frame for testing.
@@ -4136,6 +4182,17 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let (tick_broadcast_tx, mut tick_broadcast_rx) = broadcast::channel::<ParsedTick>(100);
 
+        // Pin the wall-clock to 10:00 AM IST today so the post-market
+        // wall-clock guard does not filter the tick when this test runs
+        // outside 09:00-15:30 IST. Override is scoped to this test via
+        // `TestClockGuard` below — it resets on drop so later tests see
+        // the real `Utc::now()`.
+        let valid_ts_ist = today_ist_epoch_at(10, 0, 0);
+        #[allow(clippy::cast_lossless)]
+        let valid_received_at_utc_nanos: i64 =
+            (i64::from(valid_ts_ist) - 19_800_i64).saturating_mul(1_000_000_000);
+        let _clock_guard = TestClockGuard::set(valid_received_at_utc_nanos);
+
         let handle = tokio::spawn(async move {
             run_test_tick_processor(
                 frame_rx,
@@ -4155,8 +4212,7 @@ mod tests {
 
         // Send valid tick — should be broadcast.
         // Timestamp must be today + within [09:00, 15:30) IST to pass ingestion gate.
-        let valid_ts = today_ist_epoch_at(10, 0, 0);
-        let frame = make_ticker_frame(13, 24500.0, valid_ts);
+        let frame = make_ticker_frame(13, 24500.0, valid_ts_ist);
         frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
 
         // Receive from broadcast
