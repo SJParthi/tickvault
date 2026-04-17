@@ -27,7 +27,14 @@ use std::path::Path;
 
 use secrecy::{ExposeSecret, SecretString};
 use tokio::sync::broadcast;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
+
+/// Audit finding #8 (2026-04-17): threshold above which a single
+/// broadcast-lag event is escalated from WARN to ERROR (Telegram).
+/// 1_000 ticks/event = ~1 second of traffic at steady state; beyond
+/// that means the receive loop blocked on something slow (GC, disk,
+/// network) and many signals were missed.
+const TRADING_PIPELINE_LAG_ERROR_THRESHOLD: u64 = 1_000;
 
 use tickvault_common::config::ApplicationConfig;
 use tickvault_common::constants::{IST_UTC_OFFSET_SECONDS, MAX_INDICATOR_INSTRUMENTS};
@@ -580,8 +587,27 @@ async fn run_trading_pipeline(
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        warn!(skipped, "trading pipeline lagged — skipped ticks, signals may be missed");
+                        // Audit finding #8 (2026-04-17): the pipeline is
+                        // allowed to lag briefly (GC pause, transient CPU
+                        // spike), but a sustained lag means trading
+                        // signals are silently missed. Threshold-based
+                        // escalation — a single lag of >1k ticks or
+                        // cumulative >10k across a session is
+                        // upgraded to ERROR (→ Telegram via Loki).
                         m_pipeline_lagged.increment(skipped);
+                        if skipped >= TRADING_PIPELINE_LAG_ERROR_THRESHOLD {
+                            error!(
+                                skipped,
+                                threshold = TRADING_PIPELINE_LAG_ERROR_THRESHOLD,
+                                "trading pipeline SEVERE lag — >1k ticks skipped \
+                                 in one recv cycle; signals likely missed"
+                            );
+                        } else {
+                            warn!(
+                                skipped,
+                                "trading pipeline lagged — skipped ticks, signals may be missed"
+                            );
+                        }
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         info!("tick broadcast closed — trading pipeline stopping");

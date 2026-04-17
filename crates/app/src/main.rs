@@ -1881,10 +1881,47 @@ async fn main() -> Result<()> {
             // worse than a slow boot on these. FINNIFTY + MIDCPNIFTY are
             // OPTIONAL (20-level only); we give them the original 30s
             // grace window and drop+alert if they miss it.
+            //
+            // Option C v3 (2026-04-17, Parthiban live feedback at 16:59 IST):
+            // the boot-time depth wait MUST be market-hours aware. A post-
+            // market boot (like the one at 16:53 IST) wasted 5 full minutes
+            // waiting for index LTPs that will never arrive because the main
+            // feed doesn't stream after 15:30 IST. Boot completed in 342s,
+            // triggered BOOT DEADLINE MISSED alert, and spammed 4 false
+            // MANDATORY/OPTIONAL-missing alerts. Fix: detect market hours and
+            // short-circuit the wait during post-market boots, dropping to
+            // 10 seconds of best-effort pickup. During market hours the
+            // original 5-minute hard cap still applies (correct behaviour —
+            // a genuinely degraded main feed mid-market is a real problem).
             const MANDATORY_UNDERLYINGS: &[&str] = &["NIFTY", "BANKNIFTY"];
             const OPTIONAL_UNDERLYINGS: &[&str] = &["FINNIFTY", "MIDCPNIFTY"];
-            const MANDATORY_WAIT_SECS: u64 = 300; // 5 min hard cap on mandatory wait
+            const MANDATORY_WAIT_MARKET_HOURS_SECS: u64 = 300; // 5 min — during session
+            const MANDATORY_WAIT_POST_MARKET_SECS: u64 = 10; // 10 s — off-hours boot
             const OPTIONAL_WAIT_SECS: u64 = 30;
+
+            // Off-hours = outside 09:00-15:30 IST using the same constants
+            // as tick_persistence + depth_rebalancer so market-hours logic
+            // stays DRY across the codebase.
+            let is_market_hours = {
+                use tickvault_common::constants::{
+                    IST_UTC_OFFSET_SECONDS, SECONDS_PER_DAY, TICK_PERSIST_END_SECS_OF_DAY_IST,
+                    TICK_PERSIST_START_SECS_OF_DAY_IST,
+                };
+                let now_utc = chrono::Utc::now().timestamp();
+                let now_ist = now_utc.saturating_add(i64::from(IST_UTC_OFFSET_SECONDS));
+                let sec_of_day = now_ist.rem_euclid(i64::from(SECONDS_PER_DAY)) as u32;
+                (TICK_PERSIST_START_SECS_OF_DAY_IST..TICK_PERSIST_END_SECS_OF_DAY_IST)
+                    .contains(&sec_of_day)
+            };
+            let mandatory_wait_secs = if is_market_hours {
+                MANDATORY_WAIT_MARKET_HOURS_SECS
+            } else {
+                info!(
+                    "depth ATM: off-market-hours boot detected — using 10s \
+                     best-effort wait instead of 5-minute hard cap (Option C v3)"
+                );
+                MANDATORY_WAIT_POST_MARKET_SECS
+            };
             {
                 let wait_start = std::time::Instant::now();
                 let poll_interval = std::time::Duration::from_millis(500); // APPROVED: boot-time poll
@@ -1905,7 +1942,7 @@ async fn main() -> Result<()> {
                         );
                         break;
                     }
-                    if wait_start.elapsed() >= std::time::Duration::from_secs(MANDATORY_WAIT_SECS) {
+                    if wait_start.elapsed() >= std::time::Duration::from_secs(mandatory_wait_secs) {
                         let waited = wait_start.elapsed().as_secs();
                         let prices = spot_prices_for_depth.read().await;
                         let missing: Vec<&str> = MANDATORY_UNDERLYINGS
@@ -1914,22 +1951,38 @@ async fn main() -> Result<()> {
                             .filter(|s| !prices.contains_key(*s))
                             .collect();
                         drop(prices);
-                        error!(
-                            waited_secs = waited,
-                            missing = ?missing,
-                            "depth ATM: MANDATORY index LTPs still missing after 5 min — \
-                             proceeding with partial set (this should never happen during \
-                             market hours unless main feed is degraded)"
-                        );
-                        for sym in &missing {
-                            notifier.notify(NotificationEvent::DepthUnderlyingMissing {
-                                underlying: (*sym).to_string(),
-                                reason: format!(
-                                    "MANDATORY underlying — no spot price after {}s \
-                                     (5 min hard cap) — main feed likely degraded",
-                                    waited
-                                ),
-                            });
+                        // Option C v3: downgrade ERROR to WARN when we're
+                        // outside market hours — the timeout is EXPECTED
+                        // during a post-market/pre-market boot and firing
+                        // ERROR (Telegram-routed) spams false alerts.
+                        if is_market_hours {
+                            error!(
+                                waited_secs = waited,
+                                missing = ?missing,
+                                "depth ATM: MANDATORY index LTPs still missing after 5 min — \
+                                 proceeding with partial set (this should never happen during \
+                                 market hours unless main feed is degraded)"
+                            );
+                            for sym in &missing {
+                                notifier.notify(NotificationEvent::DepthUnderlyingMissing {
+                                    underlying: (*sym).to_string(),
+                                    reason: format!(
+                                        "MANDATORY underlying — no spot price after {}s \
+                                         (5 min hard cap) — main feed likely degraded",
+                                        waited
+                                    ),
+                                });
+                            }
+                        } else {
+                            warn!(
+                                waited_secs = waited,
+                                missing = ?missing,
+                                "depth ATM: off-market-hours boot — mandatory index \
+                                 LTPs not available (expected; main feed does not \
+                                 stream outside 09:00-15:30 IST). Depth connections \
+                                 for these symbols will NOT be spawned this boot; \
+                                 restart the app during market hours to pick them up."
+                            );
                         }
                         break;
                     }
@@ -1964,25 +2017,38 @@ async fn main() -> Result<()> {
                             .collect();
                         drop(prices);
                         if !missing.is_empty() {
-                            warn!(
-                                waited_secs = waited,
-                                missing = ?missing,
-                                "depth ATM: OPTIONAL index LTPs not present after \
-                                 30s top-up — dropping those underlyings"
-                            );
-                            notifier.notify(NotificationEvent::DepthIndexLtpTimeout {
-                                waited_secs: waited,
-                            });
-                            for sym in &missing {
-                                notifier.notify(NotificationEvent::DepthUnderlyingMissing {
-                                    underlying: (*sym).to_string(),
-                                    reason: format!(
-                                        "OPTIONAL underlying — no spot price in 30s \
+                            // Option C v3: suppress Telegram during off-market
+                            // boots — OPTIONAL underlyings missing post-market
+                            // is expected, not a real failure. Keep the WARN
+                            // for audit but drop the Telegram-routed events.
+                            if is_market_hours {
+                                warn!(
+                                    waited_secs = waited,
+                                    missing = ?missing,
+                                    "depth ATM: OPTIONAL index LTPs not present after \
+                                     30s top-up — dropping those underlyings"
+                                );
+                                notifier.notify(NotificationEvent::DepthIndexLtpTimeout {
+                                    waited_secs: waited,
+                                });
+                                for sym in &missing {
+                                    notifier.notify(NotificationEvent::DepthUnderlyingMissing {
+                                        underlying: (*sym).to_string(),
+                                        reason: format!(
+                                            "OPTIONAL underlying — no spot price in 30s \
                                              top-up window after {}s total — symbol inactive \
                                              or low-liquidity pre-market",
-                                        waited
-                                    ),
-                                });
+                                            waited
+                                        ),
+                                    });
+                                }
+                            } else {
+                                info!(
+                                    waited_secs = waited,
+                                    missing = ?missing,
+                                    "depth ATM: off-market-hours — OPTIONAL LTPs expected \
+                                     absent; not firing Telegram (Option C v3)"
+                                );
                             }
                         }
                         break;
