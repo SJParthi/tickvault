@@ -91,6 +91,12 @@ pub enum NotificationEvent {
     /// Fired on `WatchdogVerdict::Halt`.
     WebSocketPoolHalt { down_secs: u64 },
 
+    /// Depth setup timed out waiting for the main-feed index LTPs needed
+    /// for ATM strike selection. Depth connections proceed with a fallback
+    /// strike (median). `waited_secs` reflects how long we waited before
+    /// giving up.
+    DepthIndexLtpTimeout { waited_secs: u64 },
+
     /// WebSocket disconnected (unexpected, will reconnect).
     WebSocketDisconnected {
         connection_index: usize,
@@ -392,6 +398,13 @@ impl NotificationEvent {
                 format!(
                     "<b>WS POOL HALT</b>\nAll connections down for {down_secs}s. \
                      Exiting process so the supervisor restarts us."
+                )
+            }
+            Self::DepthIndexLtpTimeout { waited_secs } => {
+                format!(
+                    "<b>Depth ATM timeout</b>\nWaited {waited_secs}s for index LTPs \
+                     (NIFTY/BANKNIFTY). Depth connections will use fallback strike \
+                     (median) instead of real ATM."
                 )
             }
             Self::WebSocketDisconnected {
@@ -761,6 +774,7 @@ impl NotificationEvent {
             Self::WebSocketPoolDegraded { .. } => Severity::High,
             Self::WebSocketPoolRecovered { .. } => Severity::Medium,
             Self::WebSocketPoolHalt { .. } => Severity::High,
+            Self::DepthIndexLtpTimeout { .. } => Severity::High,
             Self::DepthTwentyConnected { .. } => Severity::Low,
             Self::DepthTwoHundredConnected { .. } => Severity::Low,
             Self::OrderUpdateConnected => Severity::Low,

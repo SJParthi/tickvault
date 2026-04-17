@@ -1862,9 +1862,14 @@ async fn main() -> Result<()> {
                         break;
                     }
                     if wait_start.elapsed() >= max_wait {
-                        warn!(
-                            "depth ATM: timed out waiting for index LTPs (30s) — using median strike fallback"
+                        let waited = wait_start.elapsed().as_secs();
+                        error!(
+                            waited_secs = waited,
+                            "depth ATM: timed out waiting for index LTPs — using median strike fallback"
                         );
+                        notifier.notify(NotificationEvent::DepthIndexLtpTimeout {
+                            waited_secs: waited,
+                        });
                         break;
                     }
                     tokio::time::sleep(poll_interval).await;
