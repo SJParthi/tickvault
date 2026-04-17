@@ -123,10 +123,17 @@ const DEDUP_KEY_FNO_UNDERLYINGS: &str = "underlying_symbol";
 /// DEDUP UPSERT KEY for `derivative_contracts` table.
 /// I-P1-05: Includes `underlying_symbol` to prevent security_id reuse collision
 /// across different underlyings (e.g., same ID reused for NIFTY → BANKNIFTY).
-const DEDUP_KEY_DERIVATIVE_CONTRACTS: &str = "security_id, underlying_symbol";
+/// I-P1-11 (2026-04-17): Also includes `exchange_segment` so NSE_FNO and
+/// BSE_FNO contracts with the same numeric security_id CANNOT collapse into
+/// one row. Dhan reuses ids across segments; without this the cross-segment
+/// meta-guard (dedup_segment_meta_guard.rs) fails the build.
+const DEDUP_KEY_DERIVATIVE_CONTRACTS: &str = "security_id, underlying_symbol, exchange_segment";
 
 /// DEDUP UPSERT KEY for `subscribed_indices` table.
-const DEDUP_KEY_SUBSCRIBED_INDICES: &str = "security_id";
+/// I-P1-11 (2026-04-17): Includes `exchange` (the segment string column)
+/// so an index id that collides with an equity/F&O id in a different
+/// segment cannot silently overwrite the index row.
+const DEDUP_KEY_SUBSCRIBED_INDICES: &str = "security_id, exchange";
 
 // ---------------------------------------------------------------------------
 // CREATE TABLE DDL — Explicit schemas for all 4 instrument tables
@@ -3024,9 +3031,16 @@ mod tests {
             "I-P1-05: DEDUP_KEY_DERIVATIVE_CONTRACTS must include underlying_symbol \
              to prevent cross-underlying security_id collisions"
         );
+        // I-P1-11 (2026-04-17): now also includes `exchange_segment` to
+        // prevent NSE_FNO and BSE_FNO contracts with the same numeric id
+        // from collapsing.
+        assert!(
+            DEDUP_KEY_DERIVATIVE_CONTRACTS.contains("exchange_segment"),
+            "I-P1-11: DEDUP_KEY_DERIVATIVE_CONTRACTS must include exchange_segment"
+        );
         assert_eq!(
-            DEDUP_KEY_DERIVATIVE_CONTRACTS, "security_id, underlying_symbol",
-            "I-P1-05: exact dedup key value"
+            DEDUP_KEY_DERIVATIVE_CONTRACTS, "security_id, underlying_symbol, exchange_segment",
+            "I-P1-05 + I-P1-11: exact dedup key value"
         );
     }
 
@@ -3045,7 +3059,10 @@ mod tests {
 
     #[test]
     fn test_dedup_key_subscribed_indices_is_security_id() {
-        assert_eq!(DEDUP_KEY_SUBSCRIBED_INDICES, "security_id");
+        // I-P1-11 (2026-04-17): now also includes `exchange` so an index
+        // id that collides with an equity/F&O id in a different segment
+        // cannot silently overwrite the index row.
+        assert_eq!(DEDUP_KEY_SUBSCRIBED_INDICES, "security_id, exchange");
     }
 
     // -----------------------------------------------------------------------
@@ -3460,7 +3477,8 @@ mod tests {
 
     #[test]
     fn test_dedup_key_subscribed_indices_value() {
-        assert_eq!(DEDUP_KEY_SUBSCRIBED_INDICES, "security_id");
+        // I-P1-11: now also includes `exchange` (see constant doc-comment).
+        assert_eq!(DEDUP_KEY_SUBSCRIBED_INDICES, "security_id, exchange");
     }
 
     #[test]
@@ -4633,10 +4651,13 @@ mod tests {
         assert_eq!(DEDUP_KEY_BUILD_METADATA, "csv_source");
         assert_eq!(DEDUP_KEY_FNO_UNDERLYINGS, "underlying_symbol");
         assert_eq!(
-            DEDUP_KEY_DERIVATIVE_CONTRACTS, "security_id, underlying_symbol",
-            "I-P1-05: must include underlying_symbol"
+            DEDUP_KEY_DERIVATIVE_CONTRACTS, "security_id, underlying_symbol, exchange_segment",
+            "I-P1-05 + I-P1-11: must include underlying_symbol + exchange_segment"
         );
-        assert_eq!(DEDUP_KEY_SUBSCRIBED_INDICES, "security_id");
+        assert_eq!(
+            DEDUP_KEY_SUBSCRIBED_INDICES, "security_id, exchange",
+            "I-P1-11: must include exchange"
+        );
     }
 
     #[test]
@@ -4825,15 +4846,17 @@ mod tests {
 
     #[test]
     fn test_dedup_key_derivative_contracts_exact() {
+        // I-P1-11 (2026-04-17): includes exchange_segment.
         assert_eq!(
             DEDUP_KEY_DERIVATIVE_CONTRACTS,
-            "security_id, underlying_symbol"
+            "security_id, underlying_symbol, exchange_segment"
         );
     }
 
     #[test]
     fn test_dedup_key_subscribed_indices_exact() {
-        assert_eq!(DEDUP_KEY_SUBSCRIBED_INDICES, "security_id");
+        // I-P1-11 (2026-04-17): includes exchange.
+        assert_eq!(DEDUP_KEY_SUBSCRIBED_INDICES, "security_id, exchange");
     }
 
     // -----------------------------------------------------------------------
