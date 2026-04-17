@@ -142,9 +142,17 @@ pub struct GreeksEmission {
 /// Phase B: on `CandleCloseEvent`, compute and emit Greeks/PCR snapshots.
 pub struct GreeksAggregator {
     /// Per-option state, updated on every F&O tick.
+    /// I-P1-11 context: option_state is keyed by F&O security_id;
+    /// populated only from NSE_FNO/BSE_FNO ticks inside
+    /// update_option_tick() after segment check.
+    // APPROVED: single-segment F&O-id cache — I-P1-11.
     option_state: HashMap<SecurityId, OptionTickState>,
 
     /// Underlying spot prices, updated on every IDX_I / NSE_EQ tick.
+    /// I-P1-11 context: each underlying_symbol owns a UNIQUE
+    /// price_feed_security_id (indices and equities never share id
+    /// across their own segments for distinct underlyings).
+    // APPROVED: single-segment underlying-id cache — I-P1-11.
     underlying_ltp: HashMap<SecurityId, f32>,
 
     /// Instrument registry for enrichment (shared, immutable).

@@ -71,8 +71,17 @@ struct OptionMeta {
 /// in `crates/core` without creating a circular dependency.
 pub struct InlineGreeksComputer {
     /// Underlying spot prices: security_id -> f32 LTP.
+    /// I-P1-11 context: populated only from underlying ticks
+    /// (MajorIndexValue/IDX_I or StockEquity/NSE_EQ); each underlying
+    /// symbol owns a UNIQUE price_feed_security_id resolved via
+    /// registry.get_underlying_security_id(), so no cross-segment
+    /// collision is possible inside this cache.
+    // APPROVED: single-segment underlying-id cache — I-P1-11.
     underlying_ltp: HashMap<u32, f32>,
     /// Per-option metadata cache: security_id -> OptionMeta.
+    /// I-P1-11 context: populated only from F&O ticks inside
+    /// compute_for_fno(), invoked exclusively for NSE_FNO segment ticks.
+    // APPROVED: single-segment F&O-id cache — I-P1-11.
     option_meta: HashMap<u32, OptionMeta>,
     /// Instrument registry for lazy metadata resolution.
     registry: InstrumentRegistry,

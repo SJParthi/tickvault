@@ -117,6 +117,7 @@ pub struct InstrumentRegistry {
     /// share the same `security_id` across different segments, one wins
     /// this map (a WARN log fires per collision) — callers that need the
     /// correct disambiguated lookup use `get_with_segment` instead.
+    // APPROVED: legacy single-segment index — I-P1-11.
     instruments: HashMap<SecurityId, SubscribedInstrument>,
 
     /// I-P1-11 (2026-04-17): O(1) segment-aware lookup. Stores BOTH
