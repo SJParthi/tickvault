@@ -137,11 +137,38 @@ impl InstrumentRegistry {
     }
 
     /// Creates a registry from a pre-built instrument map.
+    ///
+    /// SEGMENT-COLLISION WARNING (2026-04-17): Dhan reuses the same numeric
+    /// `security_id` across different `ExchangeSegment` values. If the
+    /// input `instruments` contains two entries with the same `security_id`
+    /// but different segments (e.g. FINNIFTY IDX_I id=27 + some NSE_EQ
+    /// stock id=27), the second one overwrites the first in this registry
+    /// because the current storage is keyed on `security_id` alone. We
+    /// emit a WARN log per detected collision so operators see the drop
+    /// in observability rather than failing silently. A follow-up PR will
+    /// switch the storage key to `(security_id, segment)` end-to-end;
+    /// until then, the subscription-planner's `seen_ids` is
+    /// segment-aware (it keeps BOTH in the Vec) so only the lookup layer
+    /// loses one copy — the subscribe messages DO go out for both.
     pub fn from_instruments(instruments: Vec<SubscribedInstrument>) -> Self {
         let mut map = HashMap::with_capacity(instruments.len());
 
         for instrument in instruments {
-            map.insert(instrument.security_id, instrument);
+            if let Some(prev) = map.insert(instrument.security_id, instrument.clone()) {
+                if prev.exchange_segment != instrument.exchange_segment {
+                    tracing::warn!(
+                        security_id = instrument.security_id,
+                        prev_segment = ?prev.exchange_segment,
+                        new_segment = ?instrument.exchange_segment,
+                        prev_symbol = %prev.underlying_symbol,
+                        new_symbol = %instrument.underlying_symbol,
+                        "InstrumentRegistry: cross-segment security_id collision — \
+                         retaining the second entry. Follow-up PR will switch the \
+                         registry key to (security_id, segment) so BOTH are looked \
+                         up independently."
+                    );
+                }
+            }
         }
 
         // Count categories from the deduplicated map (handles duplicate security_ids correctly).
