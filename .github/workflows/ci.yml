@@ -97,13 +97,14 @@ jobs:
         # crate's lib.rs.
         run: cargo clippy --workspace --no-deps
 
-      - name: cargo nextest run --workspace --lib (profile=ci)
+      - name: Pre-build test binaries (keeps `run` step from hitting its own timeout on cold cache)
         timeout-minutes: 30
-        # We run LIB unit tests only on the PR gate. Integration tests
-        # (`tests/*.rs`) in this repo include chaos / grafana / websocket
-        # suites that need a live QuestDB + Valkey + Grafana stack —
-        # those belong to the nightly workflow (full-test-nightly.yml)
-        # with docker-compose up, not a stateless GitHub runner.
+        run: cargo nextest run --workspace --lib --no-run
+
+      - name: cargo nextest run --workspace --lib (profile=ci)
+        timeout-minutes: 25
+        # Lib-only tests against a warm build. Compile happens in the
+        # previous step; this one only runs the already-built binaries.
         #
         # Profile `ci` (.config/nextest.toml) caps per-test wall-clock
         # at 90 s so runaway / hung tests fail fast instead of blowing
