@@ -2894,19 +2894,20 @@ mod tests {
             *id13_by_segment.entry(i.exchange_segment).or_insert(0) += 1;
         }
 
-        // CURRENT BEHAVIOR (partial fix, 2026-04-17):
-        // - Planner-level `seen_ids` is now segment-aware → both
+        // FINAL BEHAVIOR (complete fix, 2026-04-17):
+        // - Planner-level `seen_ids` is segment-aware → both
         //   (13, IdxI) and (13, NseEquity) go into the raw Vec.
-        // - Downstream `InstrumentRegistry::from_instruments` is still
-        //   keyed on `security_id` alone → one of the two is
-        //   overwritten on construction (a WARN log fires per collision).
-        // - At least ONE of the two must survive. Follow-up PR flips
-        //   the registry key to `(security_id, segment)` so BOTH are
-        //   addressable at lookup time.
+        // - `InstrumentRegistry::from_instruments` maintains TWO indexes:
+        //   legacy `instruments: HashMap<SecurityId, _>` AND new
+        //   `by_composite: HashMap<(SecurityId, ExchangeSegment), _>`.
+        //   Both entries live in composite; legacy collapses one (with
+        //   WARN log) for backward compat across 59 existing call sites.
+        // - `get_with_segment` is the correct API for segment-aware
+        //   callers (tick processor has segment from header byte 3).
         assert!(
             !id13_by_segment.is_empty(),
-            "at least one entry with security_id=13 must survive into the \
-             registry. Got: {id13_by_segment:?}"
+            "at least one entry with security_id=13 must survive in the \
+             legacy registry. Got: {id13_by_segment:?}"
         );
         for (seg, count) in &id13_by_segment {
             assert_eq!(
@@ -2915,6 +2916,38 @@ mod tests {
                  intra-segment dedup must be exactly one"
             );
         }
+
+        // I-P1-11: mechanical proof the full fix works. BOTH entries MUST
+        // be addressable via the segment-aware lookup.
+        assert!(
+            plan.registry
+                .get_with_segment(13, ExchangeSegment::IdxI)
+                .is_some(),
+            "NIFTY IDX_I (security_id=13) must be addressable via \
+             get_with_segment. I-P1-11 composite index broken."
+        );
+        assert!(
+            plan.registry
+                .get_with_segment(13, ExchangeSegment::NseEquity)
+                .is_some(),
+            "Synthetic stock NSE_EQ (security_id=13) must be addressable \
+             via get_with_segment. I-P1-11 composite index broken."
+        );
+        assert!(
+            plan.registry
+                .contains_with_segment(13, ExchangeSegment::IdxI)
+        );
+        assert!(
+            plan.registry
+                .contains_with_segment(13, ExchangeSegment::NseEquity)
+        );
+        // Negative: a segment we didn't add must NOT be reported as present.
+        assert!(
+            !plan
+                .registry
+                .contains_with_segment(13, ExchangeSegment::BseEquity),
+            "segment-aware contains must be strict — BseEquity was never added"
+        );
     }
 
     #[test]

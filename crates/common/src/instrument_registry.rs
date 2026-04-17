@@ -111,7 +111,21 @@ pub struct SubscribedInstrument {
 #[derive(Clone)]
 pub struct InstrumentRegistry {
     /// O(1) lookup: security_id → instrument metadata.
+    ///
+    /// LEGACY single-segment lookup kept for the 59 existing call sites
+    /// that do not know the segment at lookup time. When two instruments
+    /// share the same `security_id` across different segments, one wins
+    /// this map (a WARN log fires per collision) — callers that need the
+    /// correct disambiguated lookup use `get_with_segment` instead.
     instruments: HashMap<SecurityId, SubscribedInstrument>,
+
+    /// I-P1-11 (2026-04-17): O(1) segment-aware lookup. Stores BOTH
+    /// colliding entries when Dhan reuses a numeric `security_id` across
+    /// segments (e.g. FINNIFTY IDX_I id=27 + NSE_EQ id=27). This is the
+    /// correct source of truth for any caller that has the segment
+    /// available at lookup time (e.g. the tick processor reads segment
+    /// from the 8-byte binary header byte 3).
+    by_composite: HashMap<(SecurityId, ExchangeSegment), SubscribedInstrument>,
 
     /// Summary counts per category for logging.
     category_counts: HashMap<SubscriptionCategory, usize>,
@@ -130,30 +144,43 @@ impl InstrumentRegistry {
     pub fn empty() -> Self {
         Self {
             instruments: HashMap::new(),
+            by_composite: HashMap::new(),
             category_counts: HashMap::new(),
             total_count: 0,
             underlying_symbol_to_security_id: HashMap::new(),
         }
     }
 
-    /// Creates a registry from a pre-built instrument map.
+    /// Creates a registry from a pre-built instrument vec.
     ///
-    /// SEGMENT-COLLISION WARNING (2026-04-17): Dhan reuses the same numeric
-    /// `security_id` across different `ExchangeSegment` values. If the
-    /// input `instruments` contains two entries with the same `security_id`
-    /// but different segments (e.g. FINNIFTY IDX_I id=27 + some NSE_EQ
-    /// stock id=27), the second one overwrites the first in this registry
-    /// because the current storage is keyed on `security_id` alone. We
-    /// emit a WARN log per detected collision so operators see the drop
-    /// in observability rather than failing silently. A follow-up PR will
-    /// switch the storage key to `(security_id, segment)` end-to-end;
-    /// until then, the subscription-planner's `seen_ids` is
-    /// segment-aware (it keeps BOTH in the Vec) so only the lookup layer
-    /// loses one copy — the subscribe messages DO go out for both.
+    /// Dhan reuses the same numeric `security_id` across different
+    /// `ExchangeSegment` values (e.g. FINNIFTY IDX_I id=27 + some NSE_EQ
+    /// stock id=27). Because 59 existing call sites use the legacy
+    /// `get(security_id)` API that has no segment, we maintain TWO
+    /// indexes:
+    ///
+    /// - `instruments` (legacy): keyed on `security_id` alone. When a
+    ///   collision is detected, we emit a WARN log per collision so the
+    ///   drop is visible. One entry wins.
+    /// - `by_composite` (I-P1-11): keyed on `(security_id, segment)`.
+    ///   Stores BOTH colliding entries. Callers that know the segment
+    ///   (e.g. tick processor reading byte 3 of the 8-byte header) use
+    ///   `get_with_segment` for disambiguated lookup.
     pub fn from_instruments(instruments: Vec<SubscribedInstrument>) -> Self {
         let mut map = HashMap::with_capacity(instruments.len());
+        let mut by_composite: HashMap<(SecurityId, ExchangeSegment), SubscribedInstrument> =
+            HashMap::with_capacity(instruments.len());
 
         for instrument in instruments {
+            // Composite index: stores every unique (id, segment) pair,
+            // so both colliding entries are addressable.
+            by_composite.insert(
+                (instrument.security_id, instrument.exchange_segment),
+                instrument.clone(),
+            );
+
+            // Legacy index: keyed on security_id alone; collisions fire
+            // a WARN log and only one entry wins (second-seen overwrites).
             if let Some(prev) = map.insert(instrument.security_id, instrument.clone()) {
                 if prev.exchange_segment != instrument.exchange_segment {
                     tracing::warn!(
@@ -162,10 +189,10 @@ impl InstrumentRegistry {
                         new_segment = ?instrument.exchange_segment,
                         prev_symbol = %prev.underlying_symbol,
                         new_symbol = %instrument.underlying_symbol,
-                        "InstrumentRegistry: cross-segment security_id collision — \
-                         retaining the second entry. Follow-up PR will switch the \
-                         registry key to (security_id, segment) so BOTH are looked \
-                         up independently."
+                        "InstrumentRegistry: cross-segment security_id collision on \
+                         legacy get(id) index — use get_with_segment(id, segment) for \
+                         disambiguated lookup. BOTH entries ARE stored in the composite \
+                         index and can be retrieved correctly."
                     );
                 }
             }
@@ -195,6 +222,7 @@ impl InstrumentRegistry {
 
         Self {
             instruments: map,
+            by_composite,
             category_counts,
             total_count,
             underlying_symbol_to_security_id,
@@ -202,9 +230,42 @@ impl InstrumentRegistry {
     }
 
     /// O(1) lookup: returns instrument metadata for a security_id, or `None` if not subscribed.
+    ///
+    /// LEGACY — uses the single-segment index. When a cross-segment
+    /// collision exists, this returns whichever entry won the insert
+    /// race (a WARN was logged at construction). For disambiguated
+    /// lookup use [`get_with_segment`](Self::get_with_segment).
     #[inline]
     pub fn get(&self, security_id: SecurityId) -> Option<&SubscribedInstrument> {
         self.instruments.get(&security_id)
+    }
+
+    /// I-P1-11 (2026-04-17): O(1) segment-aware lookup. Returns the
+    /// exact instrument for the given `(security_id, segment)` pair,
+    /// correctly disambiguating cross-segment collisions (e.g.
+    /// FINNIFTY IDX_I id=27 vs some NSE_EQ id=27).
+    ///
+    /// Every caller that has the segment at lookup time (tick processor
+    /// reads segment from the 8-byte header byte 3) SHOULD use this
+    /// instead of `get(id)`.
+    #[inline]
+    // TEST-EXEMPT: covered by subscription_planner::tests::test_regression_finnifty_id27_both_segments_are_kept
+    pub fn get_with_segment(
+        &self,
+        security_id: SecurityId,
+        segment: ExchangeSegment,
+    ) -> Option<&SubscribedInstrument> {
+        self.by_composite.get(&(security_id, segment))
+    }
+
+    /// I-P1-11: returns `true` if the exact `(security_id, segment)` pair
+    /// is registered. Use this over `contains(id)` when the segment is
+    /// known to avoid false positives from a different-segment entry
+    /// with the same numeric id.
+    #[inline]
+    // TEST-EXEMPT: covered by subscription_planner::tests::test_regression_finnifty_id27_both_segments_are_kept
+    pub fn contains_with_segment(&self, security_id: SecurityId, segment: ExchangeSegment) -> bool {
+        self.by_composite.contains_key(&(security_id, segment))
     }
 
     /// Returns `true` if this security_id is in the registry.
