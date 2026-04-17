@@ -108,6 +108,14 @@ skip = [
     { crate = "serde_spanned", reason = "figment + toml crate version split" },
     { crate = "toml", reason = "figment uses older toml, we pin newer" },
     { crate = "toml_datetime", reason = "follows toml version split" },
+    # axum 0.8.8 (tickvault-api) pins tokio-tungstenite 0.28.0 while
+    # crates/core pins 0.29.0 directly for Dhan WebSocket. Two distinct
+    # call sites, intentional.
+    { crate = "tokio-tungstenite", reason = "axum 0.8 uses 0.28, core uses 0.29 for Dhan WS" },
+    { crate = "tungstenite", reason = "follows tokio-tungstenite version split" },
+    # toml_edit 0.22 (direct) + toml_edit 0.23 (via cargo-deny internal) etc.
+    # causes winnow 0.6 + 0.7 duplicate through toml_edit's parser stack.
+    { crate = "winnow", reason = "toml_edit + figment parser version split" },
 ]
 skip-tree = []
 
