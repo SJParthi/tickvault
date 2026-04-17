@@ -77,6 +77,20 @@ pub enum NotificationEvent {
     /// `total` is the expected count (== connected on healthy boot).
     WebSocketPoolOnline { connected: usize, total: usize },
 
+    /// Pool-level CRITICAL alert: every connection has been down longer than
+    /// `POOL_DEGRADED_ALERT_SECS` (default 60). One alert per down-cycle.
+    /// Fired by the pool watchdog on `WatchdogVerdict::Degraded`.
+    WebSocketPoolDegraded { down_secs: u64 },
+
+    /// Pool-level INFO: the pool recovered from an all-down state.
+    /// Fired on `WatchdogVerdict::Recovered`.
+    WebSocketPoolRecovered { was_down_secs: u64 },
+
+    /// Pool-level FATAL: down longer than `POOL_HALT_SECS` (default 300).
+    /// The process will exit with status 2 so the supervisor restarts.
+    /// Fired on `WatchdogVerdict::Halt`.
+    WebSocketPoolHalt { down_secs: u64 },
+
     /// WebSocket disconnected (unexpected, will reconnect).
     WebSocketDisconnected {
         connection_index: usize,
@@ -362,6 +376,23 @@ impl NotificationEvent {
             }
             Self::WebSocketPoolOnline { connected, total } => {
                 format!("<b>WS pool online:</b> {connected}/{total} connected")
+            }
+            Self::WebSocketPoolDegraded { down_secs } => {
+                format!(
+                    "<b>WS POOL DEGRADED</b>\nAll connections down for {down_secs}s. \
+                     Investigate immediately."
+                )
+            }
+            Self::WebSocketPoolRecovered { was_down_secs } => {
+                format!(
+                    "<b>WS pool recovered</b>\nAll connections back up (was down {was_down_secs}s)."
+                )
+            }
+            Self::WebSocketPoolHalt { down_secs } => {
+                format!(
+                    "<b>WS POOL HALT</b>\nAll connections down for {down_secs}s. \
+                     Exiting process so the supervisor restarts us."
+                )
             }
             Self::WebSocketDisconnected {
                 connection_index,
@@ -727,6 +758,9 @@ impl NotificationEvent {
             Self::CircuitBreakerClosed => Severity::Medium,
             Self::WebSocketConnected { .. } => Severity::Low,
             Self::WebSocketPoolOnline { .. } => Severity::Medium,
+            Self::WebSocketPoolDegraded { .. } => Severity::High,
+            Self::WebSocketPoolRecovered { .. } => Severity::Medium,
+            Self::WebSocketPoolHalt { .. } => Severity::High,
             Self::DepthTwentyConnected { .. } => Severity::Low,
             Self::DepthTwoHundredConnected { .. } => Severity::Low,
             Self::OrderUpdateConnected => Severity::Low,

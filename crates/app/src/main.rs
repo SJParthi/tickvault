@@ -833,6 +833,7 @@ async fn main() -> Result<()> {
             spawn_pool_watchdog_task(
                 std::sync::Arc::clone(&pool_arc),
                 std::sync::Arc::clone(&shutdown_notify),
+                std::sync::Arc::clone(&fast_notifier),
             );
             // FAST BOOT parity with slow boot (main.rs ~1760):
             // emit per-connection + aggregate Telegram alerts so an operator
@@ -1754,6 +1755,7 @@ async fn main() -> Result<()> {
         spawn_pool_watchdog_task(
             std::sync::Arc::clone(&pool_arc),
             std::sync::Arc::clone(&shutdown_notify),
+            std::sync::Arc::clone(&notifier),
         );
         // FAST BOOT parity: helper emits per-connection + aggregate Telegram
         // alerts on BOTH boot paths (main.rs ~830 for FAST BOOT, here for slow).
@@ -3326,11 +3328,15 @@ async fn emit_websocket_connected_alerts(
 
 /// S4-T1a: Background pool health watchdog.
 ///
-/// Spawns a task that calls `pool.poll_watchdog()` every 5 seconds. On
-/// `WatchdogVerdict::Halt` it logs FATAL + sends a Telegram alert then
-/// exits the process with status 2 so the Docker/systemd supervisor
-/// restarts us. On `Degraded` the metric + CRITICAL log are already
-/// emitted by `poll_watchdog()` itself. On `Recovered` same.
+/// Spawns a task that calls `pool.poll_watchdog()` every 5 seconds and
+/// translates each `WatchdogVerdict` into the matching Telegram event:
+/// - `Degraded` → `WebSocketPoolDegraded { down_secs }` (High severity,
+///   fires once per down-cycle — the watchdog's internal
+///   `degraded_alert_fired` flag de-duplicates).
+/// - `Recovered` → `WebSocketPoolRecovered { was_down_secs }`.
+/// - `Halt` → `WebSocketPoolHalt { down_secs }` + `std::process::exit(2)`
+///   so the supervisor restarts us.
+/// - `Degrading` / `Healthy` → gauge update only, no Telegram.
 ///
 /// The task stops when the `shutdown_notify` is fired (during graceful
 /// shutdown) to avoid a false-positive Halt during the intentional
@@ -3338,6 +3344,7 @@ async fn emit_websocket_connected_alerts(
 fn spawn_pool_watchdog_task(
     pool: std::sync::Arc<WebSocketConnectionPool>,
     shutdown_notify: std::sync::Arc<tokio::sync::Notify>,
+    notifier: std::sync::Arc<NotificationService>,
 ) {
     tokio::spawn(async move {
         // 5-second poll interval — cold path, not per tick. Matches the
@@ -3355,21 +3362,48 @@ fn spawn_pool_watchdog_task(
                 }
                 _ = interval.tick() => {
                     let verdict = pool.poll_watchdog();
-                    if let tickvault_core::websocket::pool_watchdog::WatchdogVerdict::Halt {
-                        down_for,
-                    } = verdict
-                    {
-                        // ERROR log fires Telegram via the existing Loki hook.
-                        error!(
-                            down_for_secs = down_for.as_secs(),
-                            "S4-T1a FATAL: pool watchdog fired Halt verdict. \
-                             Exiting process with status 2 so the supervisor restarts us. \
-                             All 5 WebSocket connections have been down for >300s."
-                        );
-                        metrics::counter!("tv_pool_self_halts_total").increment(1);
-                        // Give notifications + metrics flush a moment.
-                        tokio::time::sleep(std::time::Duration::from_secs(2)).await; // APPROVED: pre-existing literal, session-7 tech debt tracked for cleanup
-                        std::process::exit(2);
+                    use tickvault_core::websocket::pool_watchdog::WatchdogVerdict;
+                    match verdict {
+                        WatchdogVerdict::Degraded { down_for } => {
+                            error!(
+                                down_for_secs = down_for.as_secs(),
+                                "S4-T1a CRITICAL: pool watchdog Degraded verdict — \
+                                 all main-feed WebSocket connections down >= 60s."
+                            );
+                            metrics::counter!("tv_pool_degraded_alerts_total").increment(1);
+                            notifier.notify(NotificationEvent::WebSocketPoolDegraded {
+                                down_secs: down_for.as_secs(),
+                            });
+                        }
+                        WatchdogVerdict::Recovered { was_down_for } => {
+                            info!(
+                                was_down_for_secs = was_down_for.as_secs(),
+                                "S4-T1a: pool watchdog Recovered verdict — pool back online"
+                            );
+                            metrics::counter!("tv_pool_recoveries_total").increment(1);
+                            notifier.notify(NotificationEvent::WebSocketPoolRecovered {
+                                was_down_secs: was_down_for.as_secs(),
+                            });
+                        }
+                        WatchdogVerdict::Halt { down_for } => {
+                            error!(
+                                down_for_secs = down_for.as_secs(),
+                                "S4-T1a FATAL: pool watchdog fired Halt verdict. \
+                                 Exiting process with status 2 so the supervisor restarts us. \
+                                 All main-feed WebSocket connections have been down for >300s."
+                            );
+                            metrics::counter!("tv_pool_self_halts_total").increment(1);
+                            notifier.notify(NotificationEvent::WebSocketPoolHalt {
+                                down_secs: down_for.as_secs(),
+                            });
+                            // Give notifications + metrics flush a moment.
+                            tokio::time::sleep(std::time::Duration::from_secs(2)).await; // APPROVED: pre-existing literal, session-7 tech debt tracked for cleanup
+                            std::process::exit(2);
+                        }
+                        WatchdogVerdict::Degrading { .. } | WatchdogVerdict::Healthy => {
+                            // No alert; watchdog's internal state machine
+                            // will upgrade to Degraded / Halt if this persists.
+                        }
                     }
                 }
             }
