@@ -126,20 +126,110 @@ incorrect tick enrichment, and silent data loss.
 key is `(security_id, exchange_segment)`. See the full rule body in
 `.claude/rules/project/security-id-uniqueness.md` (auto-loaded).
 
-**Fixed sites:**
-- `crates/core/src/instrument/subscription_planner.rs` — planner dedup
-  uses `HashSet<(u32, ExchangeSegment)>` (commit `cef501c`)
-- `crates/core/src/instrument/universe_builder.rs` — CSV parse dedup
-  uses `HashSet<(SecurityId, char)>` with CSV segment char
-  (commit `b46ee8b`)
-- `crates/common/src/instrument_registry.rs` — emits WARN per
-  cross-segment collision; full key refactor tracked as follow-up PR
+**Fixed sites (7 commits on 2026-04-17 branch `claude/fix-duplicate-timestamps-3M2o0`):**
+- **Planner dedup** (`subscription_planner.rs`): `HashSet<(u32, ExchangeSegment)>`
+- **CSV parse dedup** (`universe_builder.rs`): `HashSet<(SecurityId, char)>`
+- **InstrumentRegistry composite index** (`instrument_registry.rs`):
+  `by_composite: HashMap<(SecurityId, ExchangeSegment), _>` stores BOTH
+  entries; `iter()`, `by_exchange_segment()`, `len()`, category counts
+  and `underlying_symbol_to_security_id` all iterate the composite map
+  (NOT the legacy single-segment map). Commit `d8bfce5`.
+- **Production lookup migration** (commit `c7397b3`): 5 sites migrated
+  `registry.get(id)` → `registry.get_with_segment(id, segment)`:
+  - `crates/core/src/pipeline/tick_processor.rs` (3 movers lookups)
+  - `crates/trading/src/greeks/aggregator.rs:364`
+  - `crates/trading/src/greeks/inline_computer.rs:187`
+- **Banned-pattern hook** (commit `e05e66c`): `.claude/hooks/banned-pattern-scanner.sh`
+  category 5 blocks new `HashSet<u32>` / `HashSet<SecurityId>` /
+  `HashMap<u32, _>` / `HashMap<SecurityId, _>` / `.registry.get(id)` /
+  `.registry.contains(id)` in instrument paths without a `// APPROVED:`
+  comment.
+- **Storage DEDUP keys** (commit `6f5e5c3`):
+  - `DEDUP_KEY_DERIVATIVE_CONTRACTS` = `"security_id, underlying_symbol, exchange_segment"`
+  - `DEDUP_KEY_SUBSCRIBED_INDICES` = `"security_id, exchange"`
+  - Meta-guard `crates/storage/tests/dedup_segment_meta_guard.rs` scans
+    every `DEDUP_KEY_*` constant and fails if any mentions `security_id`
+    without `segment`/`exchange_segment`/`exchange`.
+- **FnoUniverse runtime collision detection** (commit `01bd833`):
+  `universe_builder.rs` emits WARN + counter `tv_fno_universe_derivative_collisions_total`
+  when NSE_FNO/BSE_FNO derivative ids collide. `delta_detector.rs` has
+  documented single-segment assumption referencing this counter.
+- **Prometheus metrics** (commit `d049bd6`): `InstrumentRegistry`
+  exposes `cross_segment_collisions()` getter. `subscription_planner`
+  emits gauges `tv_instrument_registry_cross_segment_collisions`
+  and `tv_instrument_registry_total_entries`. The construction WARN
+  was upgraded to `error!` so Loki routes it to Telegram.
 
-**Tests:**
+**Tests (19 total):**
 - `subscription_planner::tests::test_regression_seen_ids_key_type_is_pair`
   — compile-time guard; fails to compile if someone regresses the key
 - `subscription_planner::tests::test_regression_finnifty_id27_both_segments_are_kept`
   — scenario repro using NIFTY id=13 IDX_I + synthetic stock id=13 NSE_EQ
+- `instrument_registry::tests::test_iter_returns_both_colliding_segments`
+- `instrument_registry::tests::test_by_exchange_segment_returns_both_colliding_segments`
+- `instrument_registry::tests::test_len_counts_both_colliding_segments`
+- `instrument_registry::tests::test_category_counts_include_both_colliding_segments`
+- `instrument_registry::tests::test_underlying_reverse_lookup_distinct_symbols_across_colliding_ids`
+- `instrument_registry::tests::test_cross_segment_collisions_zero_when_no_collisions`
+- `instrument_registry::tests::test_cross_segment_collisions_counts_both_colliding_pairs`
+- `instrument_registry::tests::test_cross_segment_collisions_ignores_same_segment_duplicates`
+- `instrument_registry::tests::test_empty_registry_cross_segment_collisions_is_zero`
+- `crates/core/tests/regression_cross_segment_subscribe.rs` (4 integration tests)
+  — asserts the full pipeline `registry.iter() → InstrumentSubscription →
+  build_subscription_messages()` emits BOTH colliding entries in the
+  serialized WebSocket subscribe JSON
+- `crates/storage/tests/dedup_segment_meta_guard.rs` (4 meta-guard tests)
+  — workspace-scanning guard
+- `crates/storage/tests/grafana_dashboard_snapshot_filter_guard.rs`
+  `dashboard_distinct_security_id_must_include_segment` — blocks any
+  `count_distinct(security_id)` on cross-segment tables without
+  segment-qualified distinct.
+
+## LIVE-FEED-PURITY: no historical→ticks backfill (NEW 2026-04-17)
+**Directive:** Parthiban, 2026-04-17 verbatim: "in our live market feed
+websockets nowhere the backfill should happen, make it as hard
+enforcement ... live market feed should contain only live market feed
+data alone ... historical candle data fetch is a separate functionality".
+
+**Rule:** the `ticks` QuestDB table is populated EXCLUSIVELY from live
+WebSocket frames. Historical REST-API data NEVER crosses into `ticks`.
+
+**Three enforcement layers:**
+1. **Source deleted** (commit `8d527ab`): `crates/core/src/historical/backfill.rs`
+   (836 lines) + `crates/core/tests/dhat_backfill_synth.rs` (119 lines) removed.
+   9 `tv_backfill_*` Prometheus metrics removed from the catalog.
+2. **Banned-pattern hook category 6**: any file under `crates/core/src/historical/`
+   or a `backfill`/`synth` named file that references
+   `TickPersistenceWriter`, `append_tick(`, `BackfillWorker`,
+   `run_backfill`, `synthesize_ticks`, `GapBackfillRequest`, or
+   `pub mod backfill` — commit blocked.
+3. **Runtime guard** `crates/storage/tests/live_feed_purity_guard.rs`
+   (6 tests): fails build if `backfill.rs` is recreated, if
+   `pub mod backfill` reappears in `historical/mod.rs`, if any banned
+   symbol appears in the historical flow, or if `cross_verify.rs`
+   ever writes to ticks.
+
+Full rule: `.claude/rules/project/live-feed-purity.md` (auto-loaded).
+
+## DEPTH-STALE-ALERT: market-hours + edge-trigger suppression (HOTFIX 2026-04-17)
+**Trigger:** Parthiban reported 15+ Telegram alerts `Depth spot price STALE`
+for FINNIFTY + MIDCPNIFTY starting at 15:45 IST, post-market close.
+
+**Rule:** `run_depth_rebalancer` (commit `e7926d9`) now enforces:
+- **Market-hours gate**: `is_within_market_hours_ist()` reads
+  `TICK_PERSIST_START/END_SECS_OF_DAY_IST` constants. Outside
+  09:00-15:30 IST the loop `continue`s, clearing the stale-set so
+  next market-open detects rising edge correctly.
+- **Edge-triggered alerts**: `currently_stale: HashSet<String>` tracks
+  which underlyings have already fired a Telegram alert. Rising edge
+  (was_stale=false, is_stale=true) fires ONCE. Falling edge emits an
+  INFO log only (no Telegram — operator already alerted).
+
+**Tests** (4 in `depth_rebalancer::tests`):
+- `test_is_within_market_hours_at_0830_ist_is_false`
+- `test_is_within_market_hours_helper_exists_and_returns_bool`
+- `test_market_hours_gate_is_wired_into_rebalancer_loop` (source scan)
+- `test_edge_triggered_stale_alert_suppression_is_wired` (source scan)
 
 ## I-P2-02: Trading Day Guard on Download
 - `instrument_loader.rs` must log when downloading on weekends

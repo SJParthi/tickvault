@@ -56,17 +56,49 @@ one of them, leading to:
    `(security_id, ExchangeSegment)` for dedup. Regression tests
    `subscription_planner::tests::test_regression_*` enforce this.
 
-## Enforcement
+## Enforcement (7 layers, all merged 2026-04-17)
 
-- `subscription_planner::build_subscription_plan` uses
-  `HashSet<(u32, ExchangeSegment)>`. Guard test
-  `test_regression_seen_ids_key_type_is_pair` fails to compile if
-  someone regresses the key.
-- `universe_builder::build_fno_universe_from_csv` uses
-  `HashSet<(SecurityId, char)>` with the CSV segment character.
-- `InstrumentRegistry::from_instruments` emits WARN per detected
-  cross-segment collision. A follow-up PR will refactor the storage
-  key itself to `(SecurityId, ExchangeSegment)`.
+1. **Planner dedup** — `subscription_planner::build_subscription_plan`
+   uses `HashSet<(u32, ExchangeSegment)>`. Compile-time guard test
+   `test_regression_seen_ids_key_type_is_pair` fails if regressed.
+2. **CSV-parse dedup** — `universe_builder::build_fno_universe_from_csv`
+   uses `HashSet<(SecurityId, char)>` with the CSV segment character.
+3. **InstrumentRegistry composite index** — `by_composite:
+   HashMap<(SecurityId, ExchangeSegment), _>`. `iter()`,
+   `by_exchange_segment()`, `len()`, category counts and the
+   `underlying_symbol_to_security_id` map all iterate this map so
+   downstream consumers (subscribe builder, Greeks, dashboards) see
+   BOTH colliding entries.
+4. **Storage DEDUP keys** — every `DEDUP_KEY_*` constant that
+   mentions `security_id` also mentions `segment` / `exchange_segment`
+   / `exchange`. Meta-guard
+   `crates/storage/tests/dedup_segment_meta_guard.rs` scans the
+   storage crate and fails the build on regression.
+5. **Banned-pattern hook** — `.claude/hooks/banned-pattern-scanner.sh`
+   category 5 rejects new `HashSet<u32>`, `HashSet<SecurityId>`,
+   `HashMap<u32, _>`, `HashMap<SecurityId, _>`, `.registry.get(id)`,
+   `.registry.contains(id)` inside instrument paths without an
+   `// APPROVED:` comment on the immediately preceding line.
+6. **FnoUniverse runtime detection** — `universe_builder.rs` emits
+   `tv_fno_universe_derivative_collisions_total` when NSE_FNO/BSE_FNO
+   derivative ids collide.
+7. **Prometheus visibility** — `InstrumentRegistry::cross_segment_collisions()`
+   getter exposes the count. `subscription_planner` emits gauges
+   `tv_instrument_registry_cross_segment_collisions` and
+   `tv_instrument_registry_total_entries`. Construction WARN upgraded
+   to `error!` so Loki routes it to Telegram.
+
+## Dashboard enforcement
+
+- Grafana dashboards must not use `count_distinct(security_id)` on
+  cross-segment tables (ticks, market_depth, deep_market_depth,
+  candles_*, historical_candles) without also qualifying by
+  `segment`. Enforced by
+  `crates/storage/tests/grafana_dashboard_snapshot_filter_guard.rs::
+  dashboard_distinct_security_id_must_include_segment`.
+- The offending query in `market-data.json` was rewritten to
+  `SELECT count(*) AS total FROM (SELECT DISTINCT security_id,
+  segment FROM ticks)`.
 
 ## Where this rule fires (auto-loaded paths)
 
@@ -81,9 +113,22 @@ one of them, leading to:
 
 ## Historical context
 
-- Commit `cef501c` (2026-04-17) — fixed planner-level dedup.
-- Commit `b46ee8b` (2026-04-17) — fixed universe-builder CSV dedup.
-- Follow-up PR pending — registry storage-key refactor (59 call sites).
+All commits on branch `claude/fix-duplicate-timestamps-3M2o0` / PR #273:
+
+- `cef501c` (2026-04-17) — planner-level dedup `HashSet<(u32, ExchangeSegment)>`
+- `b46ee8b` (2026-04-17) — universe-builder CSV dedup `HashSet<(SecurityId, char)>`
+- `d8bfce5` (2026-04-17) — `InstrumentRegistry` composite index +
+  `iter()`/`by_exchange_segment()`/`len()`/category counts all
+  iterate `by_composite` + 5 unit regression tests
+- `c7397b3` (2026-04-17) — 5 production `registry.get(id)` sites
+  migrated to `get_with_segment(id, segment)`
+- `e05e66c` (2026-04-17) — banned-pattern hook category 5
+- `49a6b5a` (2026-04-17) — 4 integration regression tests
+- `f28378b` (2026-04-17) — dashboard guard + `market-data.json` fix
+- `6f5e5c3` (2026-04-17) — storage DEDUP keys include segment + meta-guard
+- `01bd833` (2026-04-17) — FnoUniverse runtime collision detection
+- `d049bd6` (2026-04-17) — Prometheus gauges +
+  `cross_segment_collisions()` getter
 
 ## Verification
 
