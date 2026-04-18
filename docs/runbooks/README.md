@@ -17,6 +17,7 @@ the remediation steps.
 | Auth / token failures | [auth.md](./auth.md) | DH-901, DATA-807/808/809/810, AUTH-GAP-* |
 | Zero-tick-loss chain | [zero-tick-loss.md](./zero-tick-loss.md) | TicksDropped, TickBuffer/DiskSpill active, BroadcastLagTickLoss |
 | WebSocket / Depth failures | [websocket-depth.md](./websocket-depth.md) | WS disconnects, DATA-804/805, Depth200ResetLoop |
+| OMS / Risk failures | [oms-risk.md](./oms-risk.md) | Circuit breaker, rate limiter, daily P&L, DH-904/905/906 |
 | Dashboards map | [dashboards.md](./dashboards.md) | Morning-ops glance + drill-down navigation |
 
 ## Table — all 54 ErrorCode variants mapped to actions
