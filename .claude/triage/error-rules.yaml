@@ -1,0 +1,150 @@
+# Zero-Touch Error Triage Rules — Phase 6 of active-plan.md
+#
+# The triage hook (`.claude/hooks/error-triage.sh`) reads this file on every
+# run, walks the current `data/logs/errors.summary.md`, and for each
+# signature chooses ONE of:
+#
+#   action: silence       -> noop, mark as seen (expected recurring noise)
+#   action: auto_restart  -> run scripts/auto-fix-restart-*.sh (dry-run first)
+#   action: auto_fix      -> run scripts/auto-fix-<name>.sh (dry-run first)
+#   action: escalate      -> Telegram + open draft GitHub Issue
+#
+# Conservative defaults:
+# - Unknown signature -> escalate (always ask the operator first)
+# - severity=critical  -> escalate (never auto-action, per ErrorCode
+#                         `is_auto_triage_safe`)
+# - confidence < 0.95  -> escalate (never auto-action low-confidence rules)
+#
+# Schema contract:
+#
+#   rules:
+#     - name:                 <stable identifier, unique, kebab-case>
+#       match:
+#         code:               <ErrorCode::X.code_str() — exact match>
+#         message_contains:   <optional substring filter>
+#         target_contains:    <optional substring filter>
+#       action:               silence | auto_restart | auto_fix | escalate
+#       auto_fix_script:      <path relative to repo root, required for
+#                              auto_fix / auto_restart>
+#       runbook_path:         <.claude/rules/...md — for operator context>
+#       confidence:           0.0..=1.0 (default 1.0)
+#       cooldown_secs:        <min seconds between triggers, default 3600>
+#       justification:        <one-line human-readable why>
+#
+# Adding new rules is the primary growth path. Every addition MUST be
+# accompanied by:
+#   1. A sample event in the signature-hash regression test
+#      (crates/core/src/notification/summary_writer.rs tests)
+#   2. The auto-fix script actually existing under scripts/
+#   3. A runbook path that the cross-ref tests can resolve
+#
+# Current rule count: 6 seeds. The YAML parser is deliberately strict —
+# unknown fields fail the hook rather than silently ignoring a typo.
+
+version: 1
+rules:
+
+  # -----------------------------------------------------------------------
+  # Expected recurring noise — silence, track, never Telegram
+  # -----------------------------------------------------------------------
+
+  - name: i-p1-11-cross-segment-collision-expected
+    match:
+      code: I-P1-11
+    action: silence
+    runbook_path: .claude/rules/project/security-id-uniqueness.md
+    confidence: 1.0
+    cooldown_secs: 86400
+    justification: >-
+      Dhan's CSV reuses security_id across segments (NIFTY id=13 IDX_I +
+      some NSE_EQ id=13). The composite index in InstrumentRegistry
+      handles this correctly; the ERROR log is visibility-only. Silence
+      after the first-seen per day, don't Telegram.
+
+  # -----------------------------------------------------------------------
+  # Rate-limit backoff — auto-handled by DH-904 backoff logic
+  # -----------------------------------------------------------------------
+
+  - name: dh-904-rate-limit-during-backoff
+    match:
+      code: DH-904
+    action: silence
+    runbook_path: .claude/rules/dhan/api-introduction.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      DH-904 triggers the 10s->20s->40s->80s exponential backoff in
+      api_client.rs. The backoff is working as intended; we only escalate
+      if the same signature fires >5x in 60s (approximated via cooldown).
+
+  # -----------------------------------------------------------------------
+  # Depth spot stale — auto-restart the rebalancer (market-hours only)
+  # -----------------------------------------------------------------------
+
+  - name: depth-spot-stale-auto-restart
+    match:
+      code: I-P1-11       # placeholder until DepthSpotStale code exists
+      message_contains: "Depth spot price STALE"
+    action: auto_restart
+    auto_fix_script: scripts/auto-fix-restart-depth.sh
+    runbook_path: .claude/rules/project/depth-subscription.md
+    confidence: 0.90
+    cooldown_secs: 1800
+    justification: >-
+      Depth rebalancer occasionally stalls when the main feed misses a
+      heartbeat. Restarting the rebalancer subscription is idempotent
+      and resolves the stall 90% of the time. Still escalates if the
+      stall recurs within the cooldown window.
+
+  # -----------------------------------------------------------------------
+  # Instrument rebuild — auto-fix on SecurityId-invalid data API error
+  # -----------------------------------------------------------------------
+
+  - name: data-813-invalid-security-id-rebuild
+    match:
+      code: DATA-813
+    action: auto_fix
+    auto_fix_script: scripts/auto-fix-refresh-instruments.sh
+    runbook_path: .claude/rules/dhan/instrument-master.md
+    confidence: 0.85
+    cooldown_secs: 3600
+    justification: >-
+      DATA-813 (invalid SecurityId) most often means our instrument
+      master is stale. Re-downloading the daily CSV and rebuilding the
+      universe fixes this; the existing idempotent POST /api/instruments/
+      rebuild endpoint is safe to call. 0.85 confidence — below our
+      auto-action threshold of 0.95, so by the global policy this
+      escalates instead of auto-running. Kept here as a documented
+      upgrade path when the confidence rises.
+
+  # -----------------------------------------------------------------------
+  # Critical auth failures — NEVER auto-action
+  # -----------------------------------------------------------------------
+
+  - name: dh-901-invalid-auth-escalate
+    match:
+      code: DH-901
+    action: escalate
+    runbook_path: .claude/rules/dhan/authentication.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      DH-901 means our token was rejected. The system already tries a
+      single rotation; if that fails, the app halts. Triage MUST escalate
+      to operator — no auto-action is safe here.
+
+  # -----------------------------------------------------------------------
+  # OMS circuit breaker open — escalate to operator immediately
+  # -----------------------------------------------------------------------
+
+  - name: oms-gap-03-circuit-open-escalate
+    match:
+      code: OMS-GAP-03
+    action: escalate
+    runbook_path: .claude/rules/project/gap-enforcement.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      Circuit breaker opened means 3 consecutive order failures. Never
+      auto-reset — the operator must diagnose whether the underlying
+      issue is authentication, rate limiting, or a bad order payload.
