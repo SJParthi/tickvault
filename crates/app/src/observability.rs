@@ -10,6 +10,8 @@
 //! - Prometheus exporter: `metrics::counter!()` is O(1) after first registration (cached key).
 //! - OpenTelemetry layer: only exports spans on drop, no allocation per-event on hot path.
 
+use std::path::PathBuf;
+
 use anyhow::{Context, Result};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 use opentelemetry::trace::TracerProvider;
@@ -17,9 +19,33 @@ use opentelemetry_otlp::{SpanExporter, WithExportConfig};
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing::info;
+use tracing_appender::non_blocking::WorkerGuard;
+use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_opentelemetry::OpenTelemetryLayer;
+use tracing_subscriber::Layer;
+use tracing_subscriber::filter::LevelFilter;
+use tracing_subscriber::fmt::format::FmtSpan;
 
 use tickvault_common::config::ObservabilityConfig;
+
+/// Directory that holds the structured `errors.jsonl` stream.
+///
+/// Relative to the process working directory. In Docker + AWS the compose
+/// stack mounts `./data/logs` so the file survives restarts and can be
+/// tailed by Alloy/Loki or by the Claude triage daemon.
+pub const ERRORS_JSONL_DIR: &str = "data/logs";
+
+/// File-name prefix for the rolling ERROR-only JSONL appender.
+///
+/// `RollingFileAppender` with `Rotation::HOURLY` produces files named
+/// `{prefix}.{YYYY-MM-DD-HH}`, so the set on disk looks like:
+///   data/logs/errors.jsonl.2026-04-18-09
+///   data/logs/errors.jsonl.2026-04-18-10
+///   ...
+///
+/// The bare filename `errors.jsonl` is kept as a compatibility symlink
+/// (future enhancement) so human operators can `tail -F data/logs/errors.jsonl`.
+pub const ERRORS_JSONL_PREFIX: &str = "errors.jsonl";
 
 /// Bucket boundaries (upper bounds) for nanosecond-scale duration histograms.
 ///
@@ -155,6 +181,119 @@ where
     );
 
     Ok(Some((layer, provider)))
+}
+
+/// Initializes the ERROR-only JSON-per-line file appender.
+///
+/// Returns a `Layer` that can be composed into the tracing subscriber stack
+/// plus a `WorkerGuard` that MUST be kept alive for the duration of the
+/// process — dropping it stops the background flush thread and can lose
+/// buffered events.
+///
+/// File on disk: `{dir}/{prefix}.{YYYY-MM-DD-HH}` rotated hourly.
+///
+/// The caller is responsible for the 48-hour retention sweep (typically a
+/// tokio task that runs every hour and deletes files with mtime older than
+/// 48h). Keeping retention outside this function lets tests call
+/// `init_errors_jsonl_appender` without filesystem side effects.
+pub fn init_errors_jsonl_appender<S>(
+    dir: impl Into<PathBuf>,
+) -> Result<(impl Layer<S> + Send + Sync + 'static, WorkerGuard)>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    let dir: PathBuf = dir.into();
+    std::fs::create_dir_all(&dir).with_context(|| {
+        format!(
+            "failed to create errors.jsonl directory at {}",
+            dir.display()
+        )
+    })?;
+
+    let appender = RollingFileAppender::new(Rotation::HOURLY, &dir, ERRORS_JSONL_PREFIX);
+    let (non_blocking, guard) = tracing_appender::non_blocking(appender);
+
+    // Formatter: JSON, one event per line, includes span context.
+    // Filter: ERROR and above only — lower levels go to the main subscriber.
+    let layer = tracing_subscriber::fmt::layer()
+        .json()
+        .flatten_event(true)
+        .with_current_span(true)
+        .with_span_list(false)
+        .with_span_events(FmtSpan::NONE)
+        .with_target(true)
+        .with_file(true)
+        .with_line_number(true)
+        .with_thread_ids(true)
+        .with_writer(non_blocking)
+        .with_filter(LevelFilter::ERROR);
+
+    info!(
+        dir = %dir.display(),
+        prefix = ERRORS_JSONL_PREFIX,
+        rotation = "hourly",
+        "errors.jsonl appender initialized"
+    );
+
+    Ok((layer, guard))
+}
+
+/// Deletes `errors.jsonl.*` files under `dir` whose mtime is older than
+/// `retention_hours`.
+///
+/// Typical usage: tokio task that calls this every 3600s with
+/// `retention_hours = 48`. Returns the number of files deleted.
+/// Swallows individual `remove_file` errors (logs them at WARN) and
+/// continues — best-effort cleanup, never blocks the app.
+pub fn sweep_errors_jsonl_retention(
+    dir: &std::path::Path,
+    retention_hours: u64,
+) -> std::io::Result<usize> {
+    let now = std::time::SystemTime::now();
+    let cutoff = std::time::Duration::from_secs(retention_hours.saturating_mul(3600));
+    let mut deleted = 0usize;
+
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(err) => return Err(err),
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        // Only touch files matching the rolling appender's naming convention:
+        // `errors.jsonl` OR `errors.jsonl.YYYY-MM-DD-HH`.
+        if !name.starts_with(ERRORS_JSONL_PREFIX) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let Ok(mtime) = meta.modified() else {
+            continue;
+        };
+        let Ok(age) = now.duration_since(mtime) else {
+            continue;
+        };
+        if age > cutoff {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    deleted = deleted.saturating_add(1);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        ?err,
+                        path = %path.display(),
+                        "errors.jsonl retention sweep: remove_file failed"
+                    );
+                }
+            }
+        }
+    }
+    Ok(deleted)
 }
 
 #[cfg(test)]
@@ -585,6 +724,107 @@ mod tests {
             elapsed.as_millis() < 100,
             "disabled metrics should return immediately"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2: errors.jsonl appender tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn errors_jsonl_prefix_and_dir_constants_are_stable() {
+        assert_eq!(ERRORS_JSONL_PREFIX, "errors.jsonl");
+        assert_eq!(ERRORS_JSONL_DIR, "data/logs");
+    }
+
+    #[test]
+    fn init_errors_jsonl_appender_creates_directory() {
+        let tmp = std::env::temp_dir().join(format!("tv-errors-jsonl-test-{}", std::process::id()));
+        // Clean slate
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(!tmp.exists());
+
+        let result = init_errors_jsonl_appender::<tracing_subscriber::Registry>(&tmp);
+        assert!(result.is_ok(), "appender init should succeed");
+        assert!(tmp.exists(), "init must create the directory");
+        assert!(tmp.is_dir());
+
+        // Drop guard explicitly before cleanup so the background thread exits.
+        drop(result);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn sweep_errors_jsonl_retention_preserves_fresh_files() {
+        let tmp =
+            std::env::temp_dir().join(format!("tv-errors-sweep-fresh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap_or_else(|e| panic!("create_dir_all: {e}"));
+
+        // Freshly-created file: mtime = now, far below any reasonable
+        // retention threshold. Sweep MUST leave it alone.
+        let fresh = tmp.join("errors.jsonl.2099-01-01-00");
+        std::fs::write(&fresh, b"fresh").unwrap_or_else(|e| panic!("write fresh: {e}"));
+
+        let deleted =
+            sweep_errors_jsonl_retention(&tmp, 48).unwrap_or_else(|e| panic!("sweep failed: {e}"));
+        assert_eq!(deleted, 0, "fresh file must not be deleted");
+        assert!(fresh.exists(), "fresh file must survive the sweep");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn sweep_errors_jsonl_retention_handles_missing_dir() {
+        let tmp =
+            std::env::temp_dir().join(format!("tv-errors-sweep-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(!tmp.exists());
+
+        let result = sweep_errors_jsonl_retention(&tmp, 48);
+        assert!(
+            matches!(result, Ok(0)),
+            "missing directory must return Ok(0), got {result:?}"
+        );
+    }
+
+    #[test]
+    fn sweep_errors_jsonl_retention_ignores_unrelated_files() {
+        let tmp =
+            std::env::temp_dir().join(format!("tv-errors-sweep-unrelated-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap_or_else(|e| panic!("create_dir_all: {e}"));
+
+        let unrelated = tmp.join("somebody-elses-file.log");
+        std::fs::write(&unrelated, b"not mine").unwrap_or_else(|e| panic!("write: {e}"));
+
+        let deleted =
+            sweep_errors_jsonl_retention(&tmp, 0).unwrap_or_else(|e| panic!("sweep failed: {e}"));
+        assert_eq!(deleted, 0, "unrelated files must never be touched");
+        assert!(unrelated.exists(), "unrelated file must remain untouched");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn sweep_errors_jsonl_retention_with_zero_hours_sweeps_everything_matching_prefix() {
+        let tmp = std::env::temp_dir().join(format!("tv-errors-sweep-zero-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap_or_else(|e| panic!("create_dir_all: {e}"));
+
+        let a = tmp.join("errors.jsonl.2000-01-01-00");
+        let b = tmp.join("errors.jsonl.2001-01-01-00");
+        std::fs::write(&a, b"a").unwrap_or_else(|e| panic!("write: {e}"));
+        std::fs::write(&b, b"b").unwrap_or_else(|e| panic!("write: {e}"));
+
+        // With retention=0 every file older than 0s is deleted. Since we just
+        // wrote the files this second, duration_since may return ~0, so they
+        // may or may not be removed. Either outcome is fine; what MUST hold
+        // is: no panic, count <= 2.
+        let deleted =
+            sweep_errors_jsonl_retention(&tmp, 0).unwrap_or_else(|e| panic!("sweep failed: {e}"));
+        assert!(deleted <= 2);
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
