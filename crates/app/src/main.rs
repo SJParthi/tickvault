@@ -716,7 +716,15 @@ async fn main() -> Result<()> {
                 }
             }
             Err(err) => {
-                error!(error = %err, "FAST BOOT: IP verification failed — BLOCKING BOOT");
+                // GAP-NET-01: static-IP verification rejected boot.
+                error!(
+                    code = tickvault_common::error_code::ErrorCode::GapNetIpMonitor.code_str(),
+                    severity = tickvault_common::error_code::ErrorCode::GapNetIpMonitor
+                        .severity()
+                        .as_str(),
+                    error = %err,
+                    "GAP-NET-01: FAST BOOT — IP verification failed, BLOCKING BOOT"
+                );
                 fast_notifier.notify(NotificationEvent::IpVerificationFailed {
                     reason: err.to_string(),
                 });
@@ -1012,7 +1020,16 @@ async fn main() -> Result<()> {
                 Some(manager)
             }
             Ok(Err(err)) => {
-                error!(error = %err, "deferred auth failed — token renewal unavailable");
+                // AUTH-GAP-01: deferred auth failed; token renewal unavailable.
+                error!(
+                    code = tickvault_common::error_code::ErrorCode::AuthGapTokenExpiry
+                        .code_str(),
+                    severity = tickvault_common::error_code::ErrorCode::AuthGapTokenExpiry
+                        .severity()
+                        .as_str(),
+                    error = %err,
+                    "AUTH-GAP-01: deferred auth failed — token renewal unavailable"
+                );
                 notifier.notify(
                     tickvault_core::notification::events::NotificationEvent::AuthenticationFailed {
                         reason: format!(
@@ -1023,7 +1040,14 @@ async fn main() -> Result<()> {
                 None
             }
             Err(_elapsed) => {
-                error!("deferred auth timed out — token renewal unavailable");
+                // AUTH-GAP-01: deferred auth hit its timeout.
+                error!(
+                    code = tickvault_common::error_code::ErrorCode::AuthGapTokenExpiry.code_str(),
+                    severity = tickvault_common::error_code::ErrorCode::AuthGapTokenExpiry
+                        .severity()
+                        .as_str(),
+                    "AUTH-GAP-01: deferred auth timed out — token renewal unavailable"
+                );
                 None
             }
         };
@@ -1389,7 +1413,15 @@ async fn main() -> Result<()> {
                 });
             }
             Err(err) => {
-                error!(error = %err, "IP verification failed — BLOCKING BOOT");
+                // GAP-NET-01: static-IP verification rejected boot.
+                error!(
+                    code = tickvault_common::error_code::ErrorCode::GapNetIpMonitor.code_str(),
+                    severity = tickvault_common::error_code::ErrorCode::GapNetIpMonitor
+                        .severity()
+                        .as_str(),
+                    error = %err,
+                    "GAP-NET-01: IP verification failed, BLOCKING BOOT"
+                );
                 notifier.notify(NotificationEvent::IpVerificationFailed {
                     reason: err.to_string(),
                 });
@@ -1420,7 +1452,15 @@ async fn main() -> Result<()> {
         Ok(Ok(manager)) => manager,
         Ok(Err(err)) => {
             // Permanent auth error or Ctrl+C.
-            error!(error = %err, "authentication failed permanently — exiting");
+            // DH-901: auth attempt exhausted; app is halting.
+            error!(
+                code = tickvault_common::error_code::ErrorCode::Dh901InvalidAuth.code_str(),
+                severity = tickvault_common::error_code::ErrorCode::Dh901InvalidAuth
+                    .severity()
+                    .as_str(),
+                error = %err,
+                "DH-901: authentication failed permanently — exiting"
+            );
             notifier.notify(
                 tickvault_core::notification::events::NotificationEvent::AuthenticationFailed {
                     reason: format!("PERMANENT: {err}"),
