@@ -1,8 +1,39 @@
 # Implementation Plan: Zero-Touch Error Observability & Auto-Triage
 
-**Status:** DRAFT
+**Status:** APPROVED
 **Date:** 2026-04-18
-**Approved by:** pending
+**Approved by:** Parthiban ("go ahead with all the approach ... 100 percent automation dude")
+
+**Decisions confirmed:**
+- A: all phases, phased rollout (one PR per phase, Phase 0 first)
+- B: yes, trim QuestDB 4GB → 3.5GB to fit Loki + Alloy
+- C: Claude ALWAYS pings Parthiban first for novel errors; auto-PR only when classifier confidence ≥ 0.95 AND runbook rule explicitly opts in
+- D: AWS SNS vars deferred (no AWS instance bought yet); Phase 4 becomes mechanical-only, activated when instance provisioned
+
+## Honesty clause on "100%"
+
+The operator requested 100% guarantees on coverage, testing, bug-fixing, monitoring, logging, alerting, security, uniqueness, dedup, O(1), zero-tick-loss, zero-WS-disconnect, zero-QuestDB-fail.
+
+**PROVABLE 100%s (each = a mechanical CI gate or compile-time constraint):**
+- Line + branch coverage 100% via `cargo llvm-cov --fail-under 100`
+- Mutation score 100% (zero survivors) via `cargo-mutants`
+- Fuzz coverage — 24h clean run in nightly CI via `cargo-fuzz`
+- Banned-pattern scan 100% via `.claude/hooks/banned-pattern-scanner.sh`
+- Every pub fn has test via `pub-fn-test-guard`
+- Every error path has `error!` via new meta-guard
+- Every Result has `?` or explicit `match` via `#![deny(unused_must_use)]`
+- Every shared collection keyed by `security_id` uses `(id, segment)` via hook category 5
+- Every DEDUP key has segment via `dedup_segment_meta_guard`
+- Every dashboard has status filter + segment via `grafana_dashboard_snapshot_filter_guard`
+- O(1) hot path — zero alloc DHAT test + banned `.clone()/Vec::new()/format!/.collect()/dyn` hook
+- Wire-to-done latency ≤ 10µs — Criterion benchmark budget gate
+- Zero tick loss DURING normal operation — `tv_ticks_lost_total` assert-0 in market-hours integration test
+
+**NON-PROVABLE (physics/external), replaced by MEASURABLE SLAs:**
+- "WebSocket never disconnects" → "Reconnect ≤ 500ms, zero-loss via WAL replay, chaos test enforces"
+- "QuestDB never fails" → "Backpressure → disk spill → auto-resume within 30s, chaos test enforces"
+- "No future bug" → "Zero known bugs at HEAD + every pattern we've seen is a CI block"
+- "Every scenario covered" → "Every enumerated scenario tested + fuzz finds unknowns + mutation verifies non-vacuity"
 
 ## Goal
 
@@ -181,6 +212,68 @@ CloudWatch ──(5 alarms) ── SNS topic ───────────�
 - [ ] 8.2 CloudWatch webhook → Claude Code session (AWS only)
   - Lambda function: receives SNS → invokes `tmux send-keys 'claude --resume <session_id> "triage $ALARM"'` on the EC2 via SSM RunCommand
   - File: `deploy/aws/terraform/claude-triage-lambda.tf` + `deploy/aws/lambda/claude-triage.py`
+
+### Phase 10 — Zero-tick-loss hardening (explicit SLA)
+
+- [ ] 10.1 Three-tier buffer proof
+  - `crates/core/src/pipeline/tick_processor.rs` — SPSC 65K ring → disk spill (rkyv) → WAL replay on reconnect
+  - Metric: `tv_ticks_lost_total` — must remain 0 during market hours; increments only on explicit drop decision with root cause label
+  - Test: `crates/storage/tests/zero_tick_loss_invariant.rs` — integration test kills + resumes QuestDB, drops + resumes WS, asserts final stored count = emitted count
+
+- [ ] 10.2 Sequence-hole detector
+  - For each (security_id, segment), maintain last-exchange-timestamp; gap > 2s during market hours fires `TickGapDetected` with exact missed window
+  - Already partially in `crates/trading/src/risk/tick_gap.rs` — extend + wire test
+
+- [ ] 10.3 End-to-end "no lost tick" chaos test (nightly CI only)
+  - `crates/storage/tests/chaos_zero_loss.rs`
+  - Simulates: WS random disconnect (1% per minute), QuestDB SIGSTOP for 30s, disk near-full, Valkey down
+  - Asserts: emitted = persisted after cool-down; never panic
+
+### Phase 11 — WebSocket + QuestDB resilience SLAs (chaos)
+
+- [ ] 11.1 WS liveness SLA
+  - Reconnect latency histogram `tv_ws_reconnect_duration_ms` — p99 < 500ms
+  - Prometheus alert: `WsReconnectSlowP99` fires at > 1s for 2m
+  - Chaos test: kill WS every 5 min × 10 iterations, assert p99 SLA
+
+- [ ] 11.2 QuestDB backpressure SLA
+  - `tv_questdb_backpressure_duration_ms`; app stays up, spills to disk
+  - Alert: `QuestDbBackpressureCritical` > 10s
+  - Chaos test: SIGSTOP QuestDB for 30s, unSTOP, assert: 0 panics + all buffered data flushed within 30s + `tv_ticks_lost_total` still 0
+
+- [ ] 11.3 Valkey cache fallback
+  - On Valkey down, non-critical features degrade gracefully; trading continues; alert fires
+  - Chaos test: `docker kill tv-valkey`, assert app stays healthy, auto-reconnect on restart
+
+### Phase 12 — Coverage / Mutation / Fuzz ratchet (100% or fail)
+
+- [ ] 12.1 Line + branch coverage 100%
+  - CI gate: `cargo llvm-cov --workspace --fail-under-lines 100 --fail-under-regions 100`
+  - File: `quality/crate-coverage-thresholds.toml` — set all crates to 100
+  - Any exemption requires a `// COVERAGE-EXEMPT: <reason>` comment + operator sign-off
+
+- [ ] 12.2 Mutation score 100% (zero survivors)
+  - CI gate: `cargo mutants --workspace --error-exit-code 1 -- --release`
+  - Schedule: nightly, PR blocks if new survivor introduced
+  - File: `.github/workflows/mutation.yml` (extend)
+
+- [ ] 12.3 Fuzz 24h clean
+  - CI gate: nightly runs `cargo fuzz run tick_parser` + `cargo fuzz run config_parser` for 8h each
+  - Zero crash + zero hang = pass
+  - File: `.github/workflows/fuzz.yml` (extend duration)
+
+- [ ] 12.4 `#![deny(warnings)]` workspace-wide (prod builds)
+  - All `crates/*/src/lib.rs` get `#![cfg_attr(not(test), deny(warnings))]`
+  - Any dep warning blocks the build
+
+- [ ] 12.5 O(1) hot-path ratchet
+  - DHAT test budget: zero heap alloc per tick in `crates/core/tests/dhat_tick_processor.rs`
+  - Benchmark budget: `tick_pipeline_routing < 100ns`, `papaya_lookup < 50ns`, `full_tick_processing < 10µs` in `quality/benchmark-budgets.toml`
+  - CI gate: 5% regression on any budget = block
+
+- [ ] 12.6 Real-time self-check on every boot
+  - `crates/app/src/main.rs` runs a 30-second smoke test at boot during market hours: synthesizes N synthetic ticks through the non-prod test pipeline, asserts they arrive in QuestDB, asserts O(1) latency samples within budget
+  - On failure → HALT + CRITICAL Telegram
 
 ### Phase 9 — Dashboards + validation
 
