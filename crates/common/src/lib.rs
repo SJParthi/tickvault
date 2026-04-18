@@ -17,6 +17,7 @@
 pub mod config;
 pub mod constants;
 pub mod error;
+pub mod error_code;
 pub mod instrument_registry;
 pub mod instrument_types;
 pub mod order_types;
