@@ -7606,6 +7606,9 @@ mod tests {
 
     #[test]
     fn test_recover_stale_spill_file_on_startup() {
+        let _guard = crate::spill_dir_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Create a fake stale spill file with known ticks, call recover,
         // verify count returned matches ticks written.
         let real_spill_dir = std::path::Path::new(TICK_SPILL_DIR);
@@ -7714,6 +7717,9 @@ mod tests {
 
     #[test]
     fn test_recover_returns_zero_when_no_spill_dir() {
+        let _guard = crate::spill_dir_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // If the spill directory does not exist, recovery should return 0
         // without error.
         let port = spawn_tcp_drain_server();
@@ -8499,6 +8505,9 @@ mod tests {
 
     #[test]
     fn test_open_spill_file_creates_directory_and_file() {
+        let _guard = crate::spill_dir_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let port = spawn_tcp_drain_server();
         let config = QuestDbConfig {
             host: "127.0.0.1".to_string(),
@@ -8857,6 +8866,9 @@ mod tests {
 
     #[test]
     fn test_recover_stale_tick_spill_file() {
+        let _guard = crate::spill_dir_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let port = spawn_tcp_drain_server();
         let config = QuestDbConfig {
             host: "127.0.0.1".to_string(),
@@ -8906,6 +8918,9 @@ mod tests {
 
     #[test]
     fn test_recover_stale_tick_spill_when_disconnected() {
+        let _guard = crate::spill_dir_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Create a working writer, then set sender to None to simulate disconnect.
         let port = spawn_tcp_drain_server();
         let config = QuestDbConfig {
@@ -9921,6 +9936,9 @@ mod tests {
 
     #[test]
     fn test_tick_recover_stale_skips_active_spill_file() {
+        let _guard = crate::spill_dir_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let port = spawn_tcp_drain_server();
         let config = QuestDbConfig {
             host: "127.0.0.1".to_string(),
@@ -10919,6 +10937,9 @@ mod tests {
 
     #[test]
     fn test_recover_stale_tick_spill_when_sender_none() {
+        let _guard = crate::spill_dir_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let port = spawn_tcp_drain_server();
         let config = QuestDbConfig {
             host: "127.0.0.1".to_string(),
@@ -10935,6 +10956,9 @@ mod tests {
 
     #[test]
     fn test_recover_stale_tick_spill_nonexistent_dir_not_found() {
+        let _guard = crate::spill_dir_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Exercise line 518: NotFound error returns 0
         let port = spawn_tcp_drain_server();
         let config = QuestDbConfig {
@@ -10950,6 +10974,9 @@ mod tests {
 
     #[test]
     fn test_recover_stale_tick_spill_with_data() {
+        let _guard = crate::spill_dir_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         use std::io::Write as _;
 
         let real_spill_dir = std::path::Path::new(TICK_SPILL_DIR);
@@ -11844,6 +11871,9 @@ mod tests {
 
     #[test]
     fn test_tick_recover_stale_spill_no_sender() {
+        let _guard = crate::spill_dir_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let port = spawn_tcp_drain_server();
         let config = QuestDbConfig {
             host: "127.0.0.1".to_string(),
@@ -11860,6 +11890,9 @@ mod tests {
 
     #[test]
     fn test_tick_recover_stale_spill_no_directory() {
+        let _guard = crate::spill_dir_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let port = spawn_tcp_drain_server();
         let config = QuestDbConfig {
             host: "127.0.0.1".to_string(),
@@ -11877,6 +11910,9 @@ mod tests {
 
     #[test]
     fn test_tick_recover_stale_spill_with_valid_file() {
+        let _guard = crate::spill_dir_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let port = spawn_tcp_drain_server();
         let config = QuestDbConfig {
             host: "127.0.0.1".to_string(),
@@ -11911,6 +11947,9 @@ mod tests {
 
     #[test]
     fn test_tick_recover_stale_spill_skips_active() {
+        let _guard = crate::spill_dir_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let port = spawn_tcp_drain_server();
         let config = QuestDbConfig {
             host: "127.0.0.1".to_string(),
@@ -11934,6 +11973,9 @@ mod tests {
 
     #[test]
     fn test_tick_recover_stale_spill_corrupt_file() {
+        let _guard = crate::spill_dir_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let port = spawn_tcp_drain_server();
         let config = QuestDbConfig {
             host: "127.0.0.1".to_string(),
@@ -12780,6 +12822,9 @@ mod tests {
 
     #[test]
     fn test_cov_tick_recover_stale_spill_dir_read_error() {
+        let _guard = crate::spill_dir_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let port = spawn_tcp_drain_server();
         let config = QuestDbConfig {
             host: "127.0.0.1".to_string(),
@@ -12806,6 +12851,9 @@ mod tests {
 
     #[test]
     fn test_cov_tick_recover_stale_spill_build_error() {
+        let _guard = crate::spill_dir_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let port = spawn_tcp_drain_server();
         let config = QuestDbConfig {
             host: "127.0.0.1".to_string(),
@@ -12837,6 +12885,9 @@ mod tests {
 
     #[test]
     fn test_cov_tick_recover_stale_spill_flush_failure() {
+        let _guard = crate::spill_dir_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let Some(mut writer) = make_broken_tick_writer() else {
             return;
         };

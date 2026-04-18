@@ -346,6 +346,113 @@ pub enum TickGapResult {
     Error { gap_secs: u32 },
 }
 
+/// Result of a backwards-jump check (out-of-order tick delivery).
+///
+/// Distinct from `TickGapResult` — gaps describe forward jumps (time skipped
+/// forward), backwards jumps describe time going *backward*, which cannot
+/// happen in a correctly ordered feed. Out-of-order delivery corrupts
+/// candle aggregation and must be flagged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackwardsJumpResult {
+    /// Monotonic / equal timestamp — no backward motion.
+    Normal,
+    /// Timestamp moved backward by `delta_secs` relative to `last_seen`.
+    Backwards { delta_secs: u32, last_seen: u32 },
+    /// First time this security_id has been seen by the detector.
+    FirstSeen,
+}
+
+impl TickGapTracker {
+    // RISK-GAP-03: out-of-order tick delivery detector.
+    /// Flags when a tick arrives with `exchange_timestamp` *earlier* than
+    /// the last-seen timestamp for the same `security_id`.
+    ///
+    /// Complements `record_tick` (which flags forward gaps between
+    /// consecutive ticks). Backwards jumps are never legitimate in the
+    /// Dhan live feed — they indicate out-of-order delivery that would
+    /// otherwise corrupt candle aggregation downstream.
+    ///
+    /// # Arguments
+    /// * `security_id` — Dhan security identifier.
+    /// * `exchange_timestamp` — Exchange timestamp in IST epoch seconds.
+    ///
+    /// # Returns
+    /// `BackwardsJumpResult::FirstSeen` if this security_id has no prior
+    /// state, `Normal` on monotonic or equal timestamps, or `Backwards`
+    /// with the size of the jump and the prior timestamp.
+    ///
+    /// # Side effects
+    /// * Emits `tv_tick_backwards_jump_total` on every `Backwards` result
+    ///   with label `security_id_bucket` (id / 1000).
+    /// * Emits a tracing `error!` with `code = "RISK-GAP-03"` when the
+    ///   delta is at or above `TICK_GAP_ERROR_THRESHOLD_SECS` — Loki then
+    ///   routes to Telegram.
+    pub fn detect_timestamp_backwards_jump(
+        &mut self,
+        security_id: u32,
+        exchange_timestamp: u32,
+    ) -> BackwardsJumpResult {
+        use std::collections::hash_map::Entry;
+
+        match self.states.entry(security_id) {
+            Entry::Vacant(v) => {
+                v.insert(SecurityFeedState {
+                    last_exchange_timestamp: exchange_timestamp,
+                    tick_count: 0,
+                    last_wall_clock: Instant::now(),
+                    stale_alerted: false,
+                });
+                BackwardsJumpResult::FirstSeen
+            }
+            Entry::Occupied(mut o) => {
+                let last_seen = o.get().last_exchange_timestamp;
+                if exchange_timestamp >= last_seen {
+                    o.get_mut().last_exchange_timestamp = exchange_timestamp;
+                    BackwardsJumpResult::Normal
+                } else {
+                    let delta_secs = last_seen.saturating_sub(exchange_timestamp);
+
+                    // RISK-GAP-03: coarse &'static str bucket keeps label
+                    // cardinality at 4 and avoids allocation on the
+                    // (rare but still per-tick-gated) backwards path.
+                    let bucket: &'static str = if security_id < 10_000 {
+                        "0-9999"
+                    } else if security_id < 100_000 {
+                        "10000-99999"
+                    } else if security_id < 1_000_000 {
+                        "100000-999999"
+                    } else {
+                        "1000000+"
+                    };
+                    metrics::counter!(
+                        "tv_tick_backwards_jump_total",
+                        "security_id_bucket" => bucket,
+                    )
+                    .increment(1);
+
+                    if delta_secs >= TICK_GAP_ERROR_THRESHOLD_SECS {
+                        // RISK-GAP-03: Telegram-routed ERROR on large backward jump.
+                        error!(
+                            code = "RISK-GAP-03",
+                            security_id = security_id,
+                            delta_secs = delta_secs,
+                            last_seen = last_seen,
+                            current_ts = exchange_timestamp,
+                            "tick exchange_timestamp moved backward — out-of-order delivery"
+                        );
+                        self.total_errors = self.total_errors.saturating_add(1);
+                    }
+
+                    BackwardsJumpResult::Backwards {
+                        delta_secs,
+                        last_seen,
+                    }
+                }
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1086,5 +1193,121 @@ mod tests {
         let ids: Vec<u32> = active.iter().map(|(s, _)| *s).collect();
         assert!(ids.contains(&4004));
         assert!(ids.contains(&5005));
+    }
+
+    // -----------------------------------------------------------------------
+    // RISK-GAP-03: detect_timestamp_backwards_jump tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_backwards_jump_first_seen_returns_firstseen() {
+        let mut tracker = TickGapTracker::new(10);
+        let result = tracker.detect_timestamp_backwards_jump(9001, 1_700_000_000);
+        assert_eq!(result, BackwardsJumpResult::FirstSeen);
+    }
+
+    #[test]
+    fn test_backwards_jump_monotonic_returns_normal() {
+        let mut tracker = TickGapTracker::new(10);
+        let base_ts = 1_700_000_000;
+        let _ = tracker.detect_timestamp_backwards_jump(9002, base_ts);
+        let r1 = tracker.detect_timestamp_backwards_jump(9002, base_ts + 1);
+        assert_eq!(r1, BackwardsJumpResult::Normal);
+        // Equal timestamp is still considered Normal (not backward).
+        let r2 = tracker.detect_timestamp_backwards_jump(9002, base_ts + 1);
+        assert_eq!(r2, BackwardsJumpResult::Normal);
+    }
+
+    #[test]
+    fn test_backwards_jump_backwards_returns_backwards_with_correct_delta() {
+        let mut tracker = TickGapTracker::new(10);
+        let base_ts = 1_700_000_000;
+        let _ = tracker.detect_timestamp_backwards_jump(9003, base_ts + 100);
+        let result = tracker.detect_timestamp_backwards_jump(9003, base_ts + 10);
+        assert_eq!(
+            result,
+            BackwardsJumpResult::Backwards {
+                delta_secs: 90,
+                last_seen: base_ts + 100,
+            }
+        );
+    }
+
+    #[test]
+    fn test_backwards_jump_saturating_sub_never_panics_on_zero_timestamp() {
+        let mut tracker = TickGapTracker::new(10);
+        // Seed with a large timestamp, then send 0 — delta must saturate
+        // (last - 0 = last) without panic.
+        let _ = tracker.detect_timestamp_backwards_jump(9004, u32::MAX);
+        let result = tracker.detect_timestamp_backwards_jump(9004, 0);
+        match result {
+            BackwardsJumpResult::Backwards {
+                delta_secs,
+                last_seen,
+            } => {
+                assert_eq!(delta_secs, u32::MAX);
+                assert_eq!(last_seen, u32::MAX);
+            }
+            other => panic!("expected Backwards, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_backwards_jump_error_level_fires_above_threshold() {
+        let mut tracker = TickGapTracker::new(10);
+        let errors_before = tracker.total_errors();
+        let base_ts = 1_700_000_000;
+        // Seed.
+        let _ = tracker.detect_timestamp_backwards_jump(9005, base_ts);
+        // Jump backwards by the error threshold — must increment total_errors.
+        let jumped_ts = base_ts.saturating_sub(TICK_GAP_ERROR_THRESHOLD_SECS);
+        let result = tracker.detect_timestamp_backwards_jump(9005, jumped_ts);
+        match result {
+            BackwardsJumpResult::Backwards { delta_secs, .. } => {
+                assert!(delta_secs >= TICK_GAP_ERROR_THRESHOLD_SECS);
+            }
+            other => panic!("expected Backwards, got {other:?}"),
+        }
+        assert_eq!(
+            tracker.total_errors(),
+            errors_before + 1,
+            "delta >= ERROR threshold must increment total_errors"
+        );
+
+        // A small backward nudge below threshold must NOT increment errors.
+        let errors_after_first = tracker.total_errors();
+        // Reset the security to a known ts, then jump a tiny bit backward.
+        let _ = tracker.detect_timestamp_backwards_jump(9006, base_ts);
+        let _ = tracker.detect_timestamp_backwards_jump(9006, base_ts - 1);
+        assert_eq!(
+            tracker.total_errors(),
+            errors_after_first,
+            "delta below ERROR threshold must NOT increment total_errors"
+        );
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn test_backwards_jump_delta_is_saturating_sub(a in 0u32..=u32::MAX, b in 0u32..=u32::MAX) {
+            let mut tracker = TickGapTracker::new(2);
+            // Seed with the larger value so the second call is either Normal
+            // (a >= b case becomes Normal for a-then-b when b >= a) or Backwards.
+            let (hi, lo) = if a >= b { (a, b) } else { (b, a) };
+            let sid = 9_999_u32;
+            let _ = tracker.detect_timestamp_backwards_jump(sid, hi);
+            let result = tracker.detect_timestamp_backwards_jump(sid, lo);
+            if hi == lo {
+                proptest::prop_assert_eq!(result, BackwardsJumpResult::Normal);
+            } else {
+                let expected_delta = hi.saturating_sub(lo);
+                match result {
+                    BackwardsJumpResult::Backwards { delta_secs, last_seen } => {
+                        proptest::prop_assert_eq!(delta_secs, expected_delta);
+                        proptest::prop_assert_eq!(last_seen, hi);
+                    }
+                    other => proptest::prop_assert!(false, "expected Backwards, got {:?}", other),
+                }
+            }
+        }
     }
 }
