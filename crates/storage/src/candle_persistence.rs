@@ -887,11 +887,13 @@ impl LiveCandleWriter {
                 if self.build_candle_row(&candle).is_err() { continue; }
                 drained = drained.saturating_add(1);
                 if drained.is_multiple_of(LIVE_CANDLE_FLUSH_BATCH_SIZE) && let Some(ref mut sender) = self.sender && let Err(err) = sender.flush(&mut self.buffer) {
-                    warn!(?err, drained, path = %path.display(), "stale candle spill drain flush failed"); flush_failed = true; break;
+                    // Phase 0 / Rule 5: flush failures are ERROR (route to Telegram).
+                    error!(?err, drained, path = %path.display(), "stale candle spill drain flush failed"); flush_failed = true; break;
                 }
             }
             if !flush_failed && let Some(ref mut sender) = self.sender && let Err(err) = sender.flush(&mut self.buffer) {
-                warn!(?err, drained, path = %path.display(), "stale candle spill drain final flush failed"); flush_failed = true;
+                // Phase 0 / Rule 5: flush failures are ERROR (route to Telegram).
+                error!(?err, drained, path = %path.display(), "stale candle spill drain final flush failed"); flush_failed = true;
             }
 
             if !flush_failed {

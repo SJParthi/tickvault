@@ -862,11 +862,13 @@ impl TickPersistenceWriter {
                 self.pending_count = self.pending_count.saturating_add(1);
                 drained = drained.saturating_add(1);
                 if self.pending_count >= TICK_FLUSH_BATCH_SIZE && let Err(err) = self.force_flush() {
-                    warn!(?err, drained, path = %path.display(), "flush during stale spill drain failed"); flush_failed = true; break;
+                    // Phase 0 / Rule 5: flush failures are ERROR (route to Telegram).
+                    error!(?err, drained, path = %path.display(), "flush during stale spill drain failed"); flush_failed = true; break;
                 }
             }
             if !flush_failed && self.pending_count > 0 && let Err(err) = self.force_flush() {
-                warn!(?err, drained, path = %path.display(), "stale spill drain final flush failed"); flush_failed = true;
+                // Phase 0 / Rule 5: flush failures are ERROR (route to Telegram).
+                error!(?err, drained, path = %path.display(), "stale spill drain final flush failed"); flush_failed = true;
             }
             if !flush_failed {
                 if let Err(err) = std::fs::remove_file(&path) { warn!(?err, path = %path.display(), "failed to delete stale tick spill file"); }
@@ -2002,11 +2004,13 @@ impl DepthPersistenceWriter {
                 self.pending_count = self.pending_count.saturating_add(1);
                 drained = drained.saturating_add(1);
                 if self.pending_count >= DEPTH_FLUSH_BATCH_SIZE && let Err(err) = self.force_flush() {
-                    warn!(?err, drained, path = %path.display(), "flush during stale depth spill drain failed"); flush_failed = true; break;
+                    // Phase 0 / Rule 5: flush failures are ERROR (route to Telegram).
+                    error!(?err, drained, path = %path.display(), "flush during stale depth spill drain failed"); flush_failed = true; break;
                 }
             }
             if !flush_failed && self.pending_count > 0 && let Err(err) = self.force_flush() {
-                warn!(?err, drained, path = %path.display(), "stale depth spill drain final flush failed"); flush_failed = true;
+                // Phase 0 / Rule 5: flush failures are ERROR (route to Telegram).
+                error!(?err, drained, path = %path.display(), "stale depth spill drain final flush failed"); flush_failed = true;
             }
             if !flush_failed {
                 if let Err(err) = std::fs::remove_file(&path) { warn!(?err, path = %path.display(), "failed to delete stale depth spill file"); }
