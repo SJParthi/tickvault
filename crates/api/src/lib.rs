@@ -138,6 +138,12 @@ pub fn build_router(state: SharedAppState, allowed_origins: &[String], dry_run: 
         .route(
             "/portal/option-chain-v2",
             axum::routing::get(handlers::static_file::options_chain_v2),
+        )
+        // Design-system static assets: serves ui_kits/ (dashboard mockups, CSS, SVGs).
+        // Path is resolved relative to the process cwd at runtime.
+        .nest_service(
+            "/portal/design",
+            tower_http::services::ServeDir::new("ui_kits"),
         );
 
     public_routes
