@@ -1,0 +1,19 @@
+# =============================================================================
+# tickvault — cargo-audit Configuration
+# =============================================================================
+# Centralizes the advisory ignore list so both `cargo audit` and
+# `cargo deny check advisories` see the same set. Each entry's full
+# reason + upstream-release condition for removal lives in deny.toml.
+#
+# When removing an ignore here, also remove it from deny.toml.
+# =============================================================================
+
+[advisories]
+ignore = [
+    "RUSTSEC-2026-0098", # rustls-webpki URI name-constraint; 0.103.12 not released yet
+    "RUSTSEC-2026-0099", # rustls-webpki wildcard name-constraint; 0.103.12 not released yet
+    "RUSTSEC-2026-0049", # rustls-webpki CRL matching; requires rustls 0.23 patch bump
+    "RUSTSEC-2026-0044", # AWS-LC X.509 bypass; requires aws-lc-rs 1.17 (not yet released)
+    "RUSTSEC-2026-0048", # AWS-LC CRL scope; requires aws-lc-rs 1.17 (not yet released)
+    "RUSTSEC-2026-0097", # rand unsoundness; only with custom logger reading RNG — N/A here
+]

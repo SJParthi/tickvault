@@ -22,6 +22,12 @@ on:
       - 'crates/core/**/*.rs'
       - 'crates/trading/**/*.rs'
       - 'crates/common/**/*.rs'
+  push:
+    branches: [main]
+    paths:
+      - 'crates/core/**/*.rs'
+      - 'crates/trading/**/*.rs'
+      - 'crates/common/**/*.rs'
 
 permissions:
   contents: read

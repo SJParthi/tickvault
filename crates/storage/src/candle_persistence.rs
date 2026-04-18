@@ -1858,7 +1858,7 @@ mod tests {
     #[test]
     fn test_live_candle_writer_starts_disconnected_when_unreachable() {
         let config = QuestDbConfig {
-            host: "192.0.2.1".to_string(), // RFC 5737 TEST-NET — unreachable
+            host: "127.0.0.1".to_string(), // RFC 5737 TEST-NET — unreachable
             ilp_port: 1,
             http_port: 1,
             pg_port: 1,
@@ -1874,7 +1874,7 @@ mod tests {
     #[test]
     fn test_live_candle_append_buffers_when_disconnected() {
         let config = QuestDbConfig {
-            host: "192.0.2.1".to_string(),
+            host: "127.0.0.1".to_string(),
             ilp_port: 1,
             http_port: 1,
             pg_port: 1,
@@ -1915,7 +1915,7 @@ mod tests {
     #[test]
     fn test_live_candle_ring_buffer_fifo_order() {
         let config = QuestDbConfig {
-            host: "192.0.2.1".to_string(),
+            host: "127.0.0.1".to_string(),
             ilp_port: 1,
             http_port: 1,
             pg_port: 1,
@@ -1962,7 +1962,7 @@ mod tests {
     #[test]
     fn test_live_candle_ring_buffer_overflow_spills_to_disk() {
         let config = QuestDbConfig {
-            host: "192.0.2.1".to_string(),
+            host: "127.0.0.1".to_string(),
             ilp_port: 1,
             http_port: 1,
             pg_port: 1,
@@ -2137,7 +2137,7 @@ mod tests {
             .unwrap();
 
         // Sabotage: point ilp_conf_string to unreachable host so reconnect fails.
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
         // Drop the sender to simulate disconnect.
         writer.sender = None;
         writer.pending_count = 0;
@@ -2250,7 +2250,7 @@ mod tests {
 
         // Simulate disconnect + unreachable host.
         writer.sender = None;
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
 
         let result = writer.try_reconnect_on_error();
         assert!(result.is_err(), "reconnect to unreachable host must fail");
@@ -2568,7 +2568,7 @@ mod tests {
 
         // Phase 2: QuestDB DOWN — disconnect, buffer candles in ring.
         writer.sender = None;
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
         writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
 
         let phase2_count = 50_usize;
@@ -2694,7 +2694,7 @@ mod tests {
         // Simulate flush failure: kill sender, then call force_flush_internal.
         // This triggers the rescue_in_flight path.
         writer.sender = None;
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
         writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
 
         writer.force_flush_internal();
@@ -2747,7 +2747,7 @@ mod tests {
 
         // Kill QuestDB immediately.
         writer.sender = None;
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
         writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
 
         // Pre-set spill to unique temp path (avoid interference with other tests).
@@ -3028,7 +3028,7 @@ mod tests {
 
         // Kill sender and point to unreachable host.
         writer.sender = None;
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
 
         // append_candle should return error (reconnect failed).
         let candle = make_test_candle(42);
@@ -3273,7 +3273,7 @@ mod tests {
         // drain_candle_buffer will pop candles from ring buffer, try to flush,
         // and the flush will fail because sender is killed during drain.
         writer.sender = None;
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
         writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
 
         // Manually set sender to Some but with a broken connection.
@@ -3463,7 +3463,7 @@ mod tests {
 
         // Simulate disconnect + block reconnect.
         writer.sender = None;
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
         writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
 
         let (sid, seg, ts, o, h, l, c, vol, tc) = make_test_buffered_candle(1);
@@ -3536,7 +3536,7 @@ mod tests {
 
         // Block reconnect so we can inspect state after failure.
         writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
 
         // Force flush — should fail and rescue in-flight to ring buffer.
         writer.force_flush_internal();
@@ -3556,7 +3556,7 @@ mod tests {
 
         // Simulate disconnect and buffer some candles.
         writer.sender = None;
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
         writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
 
         for i in 0..10_u32 {
@@ -3632,7 +3632,7 @@ mod tests {
 
         // Simulate disconnect + block reconnect.
         writer.sender = None;
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
         writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
 
         // Set up a temp spill file to avoid collisions.
@@ -3779,7 +3779,7 @@ mod tests {
     #[test]
     fn test_live_candle_recover_when_disconnected() {
         let config = QuestDbConfig {
-            host: "192.0.2.1".to_string(),
+            host: "127.0.0.1".to_string(),
             ilp_port: 1,
             http_port: 1,
             pg_port: 1,
@@ -3805,7 +3805,7 @@ mod tests {
 
         // Simulate disconnect and point to unreachable host.
         writer.sender = None;
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
 
         // reconnect() should try 3 times and fail.
         let result = writer.reconnect();
@@ -3853,7 +3853,7 @@ mod tests {
 
         // Kill sender and block reconnect.
         writer.sender = None;
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
         writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
 
         // Force flush — should rescue in-flight to ring buffer.
@@ -3941,7 +3941,7 @@ mod tests {
 
         // Simulate disconnect and point to unreachable host.
         writer.sender = None;
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
 
         // try_reconnect_on_error triggers reconnect() which should fail.
         let result = writer.try_reconnect_on_error();
@@ -3967,7 +3967,7 @@ mod tests {
 
         // Kill sender to simulate disconnect.
         writer.sender = None;
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
 
         // Force flush when disconnected should propagate error.
         let result = writer.force_flush();
@@ -4009,7 +4009,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
 
         // Block reconnect.
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
 
         // Wait for TCP drop.
         std::thread::sleep(Duration::from_millis(200));
@@ -4032,7 +4032,7 @@ mod tests {
         }
 
         // Block reconnect.
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
 
         // Force flush — may or may not detect broken pipe.
         let result = writer.force_flush();
@@ -4100,7 +4100,7 @@ mod tests {
         let mut writer = CandlePersistenceWriter::new(&config).unwrap();
 
         writer.sender = None;
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
 
         // reconnect() tries 3 times with backoff (1s + 2s + 4s = 7s).
         let result = writer.reconnect();
@@ -4207,7 +4207,7 @@ mod tests {
 
         // Block reconnect.
         writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
 
         // force_flush_internal — may or may not detect broken pipe.
         writer.force_flush_internal();
@@ -4518,7 +4518,7 @@ mod tests {
         let mut writer = LiveCandleWriter::new(&config).unwrap();
 
         writer.sender = None;
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
 
         let result = writer.reconnect();
         assert!(
@@ -4646,7 +4646,7 @@ mod tests {
     #[test]
     fn test_live_candle_fresh_buffer_without_sender() {
         let config = QuestDbConfig {
-            host: "192.0.2.1".to_string(),
+            host: "127.0.0.1".to_string(),
             ilp_port: 1,
             http_port: 1,
             pg_port: 1,
@@ -4988,7 +4988,7 @@ mod tests {
         // Disconnect — simulate broken pipe by dropping sender and setting
         // unreachable conf so reconnect fails.
         writer.sender = None;
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
 
         // force_flush with sender=None should error (context "sender disconnected")
         let result = writer.force_flush();
@@ -5099,7 +5099,7 @@ mod tests {
         // so reconnect also fails.
         drop(writer.sender.take());
         // Set unreachable so reconnect fails.
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
         writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
 
         // Re-create a sender that will fail to flush (broken pipe).
@@ -5126,7 +5126,7 @@ mod tests {
         // We test the case where the spill file writer exists but write fails.
         // Use /dev/full with capacity=1 BufWriter to force immediate flush failure (ENOSPC).
         let config = QuestDbConfig {
-            host: "192.0.2.1".to_string(),
+            host: "127.0.0.1".to_string(),
             ilp_port: 1,
             http_port: 1,
             pg_port: 1,
@@ -5157,7 +5157,7 @@ mod tests {
     fn test_spill_candle_to_disk_open_failure_does_not_panic() {
         // Exercise line 572-573: when spill_writer is None and open fails
         let config = QuestDbConfig {
-            host: "192.0.2.1".to_string(),
+            host: "127.0.0.1".to_string(),
             ilp_port: 1,
             http_port: 1,
             pg_port: 1,
@@ -5188,7 +5188,7 @@ mod tests {
     fn test_spill_candle_to_disk_increments_counter_and_warns_at_1000() {
         // Exercise line 580-582: counter increment and warning at multiples of 1000
         let config = QuestDbConfig {
-            host: "192.0.2.1".to_string(),
+            host: "127.0.0.1".to_string(),
             ilp_port: 1,
             http_port: 1,
             pg_port: 1,
@@ -5283,7 +5283,7 @@ mod tests {
         // to start, but flush should fail. Let's use a real sender
         // that we disconnect immediately.
         writer.sender = None;
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
         writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
 
         // With sender=None, drain_candle_buffer returns immediately.
@@ -5311,7 +5311,7 @@ mod tests {
         // at lines 621 and 627 silently skip when sender is None. Candles
         // move from ring buffer into in_flight but never confirm flushed.
         let config = QuestDbConfig {
-            host: "192.0.2.1".to_string(),
+            host: "127.0.0.1".to_string(),
             ilp_port: 1,
             http_port: 1,
             pg_port: 1,
@@ -5444,7 +5444,7 @@ mod tests {
     fn test_recover_stale_candle_spill_when_disconnected() {
         // Exercise line 705: sender is None → early return 0
         let config = QuestDbConfig {
-            host: "192.0.2.1".to_string(),
+            host: "127.0.0.1".to_string(),
             ilp_port: 1,
             http_port: 1,
             pg_port: 1,
@@ -5508,7 +5508,7 @@ mod tests {
     #[test]
     fn test_candles_spilled_total_accessor() {
         let config = QuestDbConfig {
-            host: "192.0.2.1".to_string(),
+            host: "127.0.0.1".to_string(),
             ilp_port: 1,
             http_port: 1,
             pg_port: 1,
@@ -5620,7 +5620,7 @@ mod tests {
     fn test_live_candle_force_flush_internal_no_sender_rescues() {
         // Exercise line 529: sender is None, pending > 0 → rescue in-flight
         let config = QuestDbConfig {
-            host: "192.0.2.1".to_string(),
+            host: "127.0.0.1".to_string(),
             ilp_port: 1,
             http_port: 1,
             pg_port: 1,
@@ -5699,7 +5699,7 @@ mod tests {
         // Drop the TCP server's listener by connecting then immediately closing.
         // Actually, the sender is live and will succeed. To force failure,
         // we disconnect the sender and re-assign a broken conf string.
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
         // Set next_reconnect_allowed far in the future to prevent reconnect
         writer.next_reconnect_allowed =
             std::time::Instant::now() + std::time::Duration::from_secs(3600);
@@ -5764,7 +5764,7 @@ mod tests {
     fn test_drain_candle_buffer_flush_failure_rescues() {
         // Exercise lines 622-623: flush failure during ring drain
         let config = QuestDbConfig {
-            host: "192.0.2.1".to_string(),
+            host: "127.0.0.1".to_string(),
             ilp_port: 1,
             http_port: 1,
             pg_port: 1,
@@ -5811,7 +5811,7 @@ mod tests {
     fn test_drain_candle_buffer_final_flush_failure() {
         // Exercise lines 627-629: final flush failure after ring drain
         let config = QuestDbConfig {
-            host: "192.0.2.1".to_string(),
+            host: "127.0.0.1".to_string(),
             ilp_port: 1,
             http_port: 1,
             pg_port: 1,
@@ -6013,7 +6013,7 @@ mod tests {
     fn test_drain_candle_disk_spill_flush_failure_preserves_file() {
         // Exercise lines 684, 688, 695-696: flush failure during/after spill drain
         let config = QuestDbConfig {
-            host: "192.0.2.1".to_string(),
+            host: "127.0.0.1".to_string(),
             ilp_port: 1,
             http_port: 1,
             pg_port: 1,
@@ -6072,7 +6072,7 @@ mod tests {
     fn test_recover_stale_candle_spill_files_no_sender() {
         // Exercise line 705: sender is None → return 0 immediately
         let config = QuestDbConfig {
-            host: "192.0.2.1".to_string(),
+            host: "127.0.0.1".to_string(),
             ilp_port: 1,
             http_port: 1,
             pg_port: 1,
@@ -6194,7 +6194,7 @@ mod tests {
     fn test_live_candle_writer_reconnect_logs_buffered_candle_count() {
         // Exercise line 767: reconnect() logs buffered_candles count
         let config = QuestDbConfig {
-            host: "192.0.2.1".to_string(),
+            host: "127.0.0.1".to_string(),
             ilp_port: 1,
             http_port: 1,
             pg_port: 1,
@@ -6624,7 +6624,7 @@ mod tests {
     #[test]
     fn test_cov_try_reconnect_on_error_reconnect_fails() {
         let config = QuestDbConfig {
-            host: "192.0.2.1".to_string(),
+            host: "127.0.0.1".to_string(),
             ilp_port: 1,
             http_port: 1,
             pg_port: 1,

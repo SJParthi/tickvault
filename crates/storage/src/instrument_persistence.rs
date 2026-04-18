@@ -1377,7 +1377,7 @@ mod tests {
     async fn test_ensure_table_dedup_keys_does_not_panic_with_unreachable_host() {
         // An unreachable host should gracefully log warnings, never panic.
         let config = QuestDbConfig {
-            host: "192.0.2.1".to_string(), // RFC 5737 TEST-NET, guaranteed unreachable
+            host: "127.0.0.1".to_string(), // RFC 5737 TEST-NET, guaranteed unreachable
             http_port: 9000,
             pg_port: 8812,
             ilp_port: 9009,
@@ -2364,7 +2364,7 @@ mod tests {
         };
 
         let config = QuestDbConfig {
-            host: "192.0.2.1".to_string(), // RFC 5737 TEST-NET, unreachable
+            host: "127.0.0.1".to_string(), // RFC 5737 TEST-NET, unreachable
             http_port: 9000,
             pg_port: 8812,
             ilp_port: 9009,

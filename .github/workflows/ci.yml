@@ -5,33 +5,207 @@ on:
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened, ready_for_review]
+
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # NOTE: we intentionally do NOT set `RUSTFLAGS: "-D warnings"` at the
+  # env level. That would make every rustc warning across the workspace
+  # fatal (including in test builds), and there are ~24 pre-existing
+  # warnings that need a dedicated cleanup pass. The project's per-crate
+  # `#![cfg_attr(not(test), deny(...))]` in lib.rs already enforces the
+  # strictest lints on prod code. Once the cleanup PR lands, set this
+  # to "-D warnings" and tighten clippy back up.
+
 jobs:
+  # -------------------------------------------------------------------------
+  # Commit Lint — conventional-commit format check on PR commits
+  # -------------------------------------------------------------------------
   commit-lint:
     name: "Commit Lint"
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - run: echo "Commit lint enforced by local pre-commit hooks" && sleep 3
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Verify every commit on the PR follows conventional format
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="${{ github.event.pull_request.base.sha }}"
+          head="${{ github.event.pull_request.head.sha }}"
+          pattern='^(feat|fix|refactor|test|docs|chore|perf|security|ci|build|style)(\([a-z0-9_/,-]+\))?: .+'
+          failed=0
+          for sha in $(git log --format=%H "$base..$head"); do
+            subject=$(git log -1 --format=%s "$sha")
+            if ! [[ "$subject" =~ $pattern ]]; then
+              echo "::error::Commit $sha does not follow conventional format: $subject"
+              failed=1
+            fi
+          done
+          exit $failed
+
+  # -------------------------------------------------------------------------
+  # Build & Verify — fmt + clippy + lib tests per crate.
+  #
+  # Split fmt + clippy (fast, one runner) from per-crate `cargo nextest run
+  # -p <crate>` so the 7,250-test workspace parallelizes across 6 runners
+  # instead of serializing on one. Each crate finishes inside the runner's
+  # 60-minute budget even on a cold cache.
+  # -------------------------------------------------------------------------
   build-and-verify:
     name: "Build & Verify"
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 30
     steps:
-      - run: echo "Build verified by local pre-push hooks (18 gates)" && sleep 3
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain 1.93.1
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.93.1'
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-build-and-verify-fmt-clippy
+          cache-on-failure: true
+
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+      - name: cargo clippy (workspace, libs + bins only)
+        # NOTE: we deliberately do NOT pass `--all-targets` or
+        # `-D warnings` here. Test code legitimately uses `eprintln!`
+        # (calibration output) and there are ~24 pre-existing lib
+        # warnings scheduled for a follow-up cleanup pass. Prod code is
+        # still protected via `#![cfg_attr(not(test), deny(...))]` in
+        # each crate's lib.rs.
+        run: cargo clippy --workspace --no-deps
+
+  # -------------------------------------------------------------------------
+  # Test — one job per crate, parallel. Matrix + fail-fast: false so a
+  # failure in one crate surfaces the failure signal without cancelling
+  # the others.
+  # -------------------------------------------------------------------------
+  test:
+    name: "Test (${{ matrix.crate }})"
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        crate: [common, storage, core, trading, api, app]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain 1.93.1
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.93.1'
+
+      - name: Cache cargo registry + build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-test-${{ matrix.crate }}
+          cache-on-failure: true
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - name: cargo nextest run -p tickvault-${{ matrix.crate }} --lib (profile=ci)
+        # Profile `ci` (.config/nextest.toml) caps per-test wall-clock
+        # at 90 s so runaway tests fail fast. Flaky tests get 1 retry
+        # before being marked FAIL.
+        run: cargo nextest run -p tickvault-${{ matrix.crate }} --lib --no-fail-fast --profile ci
+
+  # -------------------------------------------------------------------------
+  # Security & Audit — delegated to security-audit.yml workflow.
+  # Kept as a required check so branch protection continues to match; the
+  # actual audit job lives in security-audit.yml to stay modular.
+  # -------------------------------------------------------------------------
   security-and-audit:
     name: "Security & Audit"
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 15
     steps:
-      - run: echo "Security audit runs via separate workflow" && sleep 3
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain 1.93.1
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.93.1'
+
+      - name: Install cargo-audit + cargo-deny
+        run: |
+          cargo install --locked cargo-audit
+          cargo install --locked cargo-deny
+
+      - name: cargo deny check
+        run: cargo deny check
+
+      - name: cargo audit
+        run: cargo audit --deny yanked
+
+  # -------------------------------------------------------------------------
+  # Coverage & Perf — post-merge only. Runs cargo-llvm-cov and enforces
+  # the per-crate 100% thresholds in quality/crate-coverage-thresholds.toml.
+  # -------------------------------------------------------------------------
   coverage-and-perf:
     name: "Coverage & Perf"
     needs: build-and-verify
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 45
     steps:
-      - run: echo "Coverage runs post-merge" && sleep 3
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain 1.93.1 + llvm-tools
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.93.1'
+          components: llvm-tools-preview
+
+      - name: Cache cargo + llvm-cov build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-coverage
+          cache-on-failure: true
+
+      - name: Install cargo-llvm-cov
+        run: cargo install --locked cargo-llvm-cov
+
+      - name: Run coverage (workspace, JSON output)
+        run: |
+          cargo llvm-cov clean --workspace
+          cargo llvm-cov --workspace --no-fail-fast --json \
+            --output-path target/llvm-cov/coverage.json
+
+      - name: Enforce per-crate coverage thresholds
+        run: bash scripts/coverage-gate.sh target/llvm-cov/coverage.json
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: target/llvm-cov/coverage.json
+          retention-days: 14

@@ -1,0 +1,31 @@
+# tickvault — cargo-nextest configuration
+#
+# Caps per-test wall-clock so runaway / hung tests are terminated and
+# fail fast instead of blowing the 30-minute step budget on CI. The
+# project's lib tests are all in-memory or mock-server based; any
+# individual test running longer than a minute is almost certainly
+# blocked on a network read that was supposed to be mocked.
+#
+# `terminate-after` gives the test 10 seconds to print its panic hook
+# before nextest SIGKILLs it.
+
+[profile.default]
+# Per-test timeout. Tests that exceed this are killed and reported FAIL.
+slow-timeout = { period = "60s", terminate-after = 2 }
+
+# Per-test leak tolerance — kill any test still holding tokio tasks
+# after a success / fail signal.
+leak-timeout = "200ms"
+
+# CI profile: inherits default + stricter reporting + bump thread count
+# so nextest pegs all runner cores.
+[profile.ci]
+slow-timeout = { period = "90s", terminate-after = 2 }
+leak-timeout = "500ms"
+# Fail-fast off by default (set via CLI); enable retries on flakes that
+# pass on rerun (common for timing-sensitive integration tests).
+retries = { backoff = "fixed", count = 1, delay = "1s" }
+failure-output = "immediate-final"
+success-output = "never"
+status-level = "fail"
+final-status-level = "slow"

@@ -1874,7 +1874,7 @@ mod tests {
     #[test]
     fn test_greeks_writer_starts_disconnected_when_unreachable() {
         let config = QuestDbConfig {
-            host: "192.0.2.1".to_string(),
+            host: "127.0.0.1".to_string(),
             ilp_port: 1,
             http_port: 1,
             pg_port: 1,
@@ -1889,7 +1889,7 @@ mod tests {
     #[test]
     fn test_greeks_writer_flush_ok_when_disconnected() {
         let config = QuestDbConfig {
-            host: "192.0.2.1".to_string(),
+            host: "127.0.0.1".to_string(),
             ilp_port: 1,
             http_port: 1,
             pg_port: 1,
@@ -2152,7 +2152,7 @@ mod tests {
         // Kill sender to simulate broken connection, then replace with
         // unreachable endpoint to prevent reconnect.
         writer.sender = None;
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
         writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
 
         // Flush — should gracefully handle missing sender.
@@ -2177,7 +2177,7 @@ mod tests {
         // When disconnected, writes should still succeed (buffered in ILP
         // buffer). On flush, they are discarded (Greeks are recomputed).
         let config = QuestDbConfig {
-            host: "192.0.2.1".to_string(),
+            host: "127.0.0.1".to_string(),
             ilp_port: 1,
             http_port: 1,
             pg_port: 1,
@@ -2287,7 +2287,7 @@ mod tests {
 
         // Simulate disconnect and point to unreachable host.
         writer.sender = None;
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
 
         // reconnect() should try 3 times and fail.
         let result = writer.reconnect();
@@ -2656,7 +2656,7 @@ mod tests {
 
         // Kill sender and point to unreachable host.
         writer.sender = None;
-        writer.ilp_conf_string = "tcp::addr=192.0.2.1:1;".to_string();
+        writer.ilp_conf_string = "tcp::addr=127.0.0.1:1;".to_string();
         writer.next_reconnect_allowed = std::time::Instant::now() + Duration::from_secs(3600);
 
         // flush() should clear pending even though reconnect fails.
@@ -2692,7 +2692,7 @@ mod tests {
     #[test]
     fn test_fresh_buffer_without_sender_returns_standalone_v1() {
         let config = QuestDbConfig {
-            host: "192.0.2.1".to_string(),
+            host: "127.0.0.1".to_string(),
             ilp_port: 1,
             http_port: 1,
             pg_port: 1,
@@ -3172,7 +3172,7 @@ mod tests {
         // Exercise lines 537-541: flush() when sender is None (no live QuestDB).
         // Should discard pending rows and return Ok (Greeks recomputed next second).
         let config = QuestDbConfig {
-            host: "192.0.2.1".to_string(), // unreachable
+            host: "127.0.0.1".to_string(), // unreachable
             ilp_port: 1,
             http_port: 1,
             pg_port: 1,
@@ -3204,7 +3204,7 @@ mod tests {
         // After reconnect (or failed reconnect), old buffer is replaced with fresh,
         // pending count reset to 0.
         let config = QuestDbConfig {
-            host: "192.0.2.1".to_string(),
+            host: "127.0.0.1".to_string(),
             ilp_port: 1,
             http_port: 1,
             pg_port: 1,
@@ -3310,7 +3310,7 @@ mod tests {
     #[test]
     fn test_greeks_writer_new_disconnected() {
         let config = QuestDbConfig {
-            host: "192.0.2.1".to_string(),
+            host: "127.0.0.1".to_string(),
             ilp_port: 1,
             http_port: 1,
             pg_port: 1,
@@ -3325,7 +3325,7 @@ mod tests {
     #[test]
     fn test_greeks_try_reconnect_throttled_when_too_soon() {
         let config = QuestDbConfig {
-            host: "192.0.2.1".to_string(),
+            host: "127.0.0.1".to_string(),
             ilp_port: 1,
             http_port: 1,
             pg_port: 1,
@@ -3385,7 +3385,7 @@ mod tests {
     #[test]
     fn test_greeks_fresh_buffer_without_sender() {
         let config = QuestDbConfig {
-            host: "192.0.2.1".to_string(),
+            host: "127.0.0.1".to_string(),
             ilp_port: 1,
             http_port: 1,
             pg_port: 1,
