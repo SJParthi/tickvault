@@ -185,18 +185,41 @@ summary file and drives the above flow.
       provisioned; Terraform stays ready)
 - [x] **Phase 5** — `errors.summary.md` writer (60s refresh,
       signature-hash grouping, lookback filter, 18 unit tests, wired
-      as a background tokio task from main.rs)
-- [x] **Phase 6** — `.claude/triage/error-rules.yaml` (6 seed rules),
-      `.claude/triage/claude-loop-prompt.md`, `error-triage.sh` shell
-      hook, auto-fix-{restart-depth,refresh-instruments}.sh scripts,
-      7-test triage_rules_guard meta-test
-- [ ] **Phase 7** — `/loop` prompt wired to cron / scheduler + log-query MCP server
-- [ ] **Phase 8** — Remaining auto-fix scripts + AWS Lambda bridge
-- [ ] **Phase 9** — Operator Health dashboard + e2e validation script
-- [ ] **Phase 10** — Zero-tick-loss hardening (three-tier buffer proof,
-      chaos test, sequence-hole detector)
-- [ ] **Phase 11** — WS + QuestDB resilience SLAs
-- [ ] **Phase 12** — Coverage/mutation/fuzz 100% ratchet
+      as a background tokio task from main.rs) + `make errors-summary`
+- [x] **Phase 6** — `.claude/triage/error-rules.yaml` (7 seed rules
+      incl. clear-spill), `.claude/triage/claude-loop-prompt.md`,
+      `error-triage.sh` shell hook, 3 auto-fix scripts, triage_rules_guard
+      meta-test, `make triage-dry-run/triage-execute`
+- [x] **Phase 7.1** — `/loop` runbook prompt (claude-loop-prompt.md);
+      Phase 7.2 MCP server still pending
+- [~] **Phase 8.1** — Common auto-fix scripts (restart-depth, refresh-
+      instruments, clear-spill — all three scaffolded, refresh-instruments
+      fully functional today); Phase 8.2 Lambda bridge deferred until
+      AWS instance provisioned
+- [x] **Phase 9.2** — `scripts/validate-automation.sh` + `make
+      validate-automation` runs 20 end-to-end checks;
+      Phase 9.1 Grafana Operator Health dashboard still pending
+- [~] **Phase 10.1** — Zero-tick-loss alert guard (4 Prometheus alerts
+      pinned, 7 source-invariant tests); Phase 10.2 sequence-hole
+      detector and 10.3 chaos test still pending
+- [ ] **Phase 11** — WS + QuestDB resilience SLAs (chaos tests nightly)
+- [x] **Phase 12.1** — 100% line coverage threshold set in
+      `quality/crate-coverage-thresholds.toml`, enforced by
+      `scripts/coverage-gate.sh` in CI
+- [x] **Phase 12.5** — O(1) hot-path ratchet: DHAT zero-alloc tests +
+      `quality/benchmark-budgets.toml` (Criterion ≤10ns/50ns/100ns
+      budgets, 5% regression gate, enforced by
+      `scripts/bench-gate.sh`)
+- [x] **Phase 12.6** — Boot-time/process-time self-check via the e2e
+      chain test (`crates/app/tests/observability_chain_e2e.rs`)
+      asserting error! → JSONL → summary.md in-process
+- [ ] **Phase 12.2/12.3** — Tighten mutation (zero-survivor gate) +
+      fuzz 24h duration bump (extensions of existing CI workflows)
+- [x] ~~**Phase 12.4** `#![deny(warnings)]` workspace-wide~~ SKIPPED —
+      future toolchain deprecation warnings would silently break
+      prod builds; the targeted lints already in place
+      (`unused_must_use`, `unwrap_used`, `expect_used`, `print_*`,
+      `dbg_macro`, `let_underscore_must_use`) are strictly better.
 
 ## Commit pointers (so sessions can jump to a specific change)
 
@@ -215,6 +238,9 @@ Branch: `claude/debug-expired-update-error-p5jSL` (PR #276)
 | `d942695` | Wire JSONL layer + retention sweeper into main.rs |
 | `7b87ab2` | Phase 5 summary_writer + this architecture doc |
 | `a3145e9` | Phase 6 triage YAML + auto-fix scripts + shell hook |
+| `9e807ca` | Phase 12.6 observability_chain_e2e (+ flatten_event fix) |
+| `275157a` | Phase 10.1 zero-tick-loss alert guard (7 pins) |
+| `a81206f` | Phase 2.2 / 5.2 / 8.1 / 9.2 operator commands + 20-check validation |
 
 ## Trigger (auto-loaded paths)
 

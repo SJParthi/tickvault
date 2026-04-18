@@ -123,7 +123,7 @@ CloudWatch ──(5 alarms) ── SNS topic ───────────�
   - Uses `tracing-appender` file rotation (hourly, 48h retention)
   - `signature_hash` = first 16 hex chars of sha256(code + module + truncated_message)
 
-- [ ] 2.2 Makefile target `make tail-errors` — `jq`-formatted live view
+- [x] 2.2 Makefile target `make tail-errors` — `jq`-formatted live view
   - File: `Makefile`
 
 ### Phase 3 — Loki/Alloy re-add under memory budget
@@ -170,7 +170,7 @@ CloudWatch ──(5 alarms) ── SNS topic ───────────�
   - File: `crates/core/src/notification/summary_writer.rs` (new)
   - Tests: `test_summary_file_regenerates`, `test_summary_edge_triggered_novel`
 
-- [ ] 5.2 `make status` reads this file + prints dashboard
+- [x] 5.2 `make status` reads this file + prints dashboard
   - File: `Makefile`, `scripts/status-dashboard.sh`
 
 ### Phase 6 — Auto-triage rules engine
@@ -185,7 +185,7 @@ CloudWatch ──(5 alarms) ── SNS topic ───────────�
   - Edge-triggered via `.claude/state/triage-seen.jsonl` (signature_hash + last_action_ts)
   - Rate limit: max 10 triages/hour/signature
 
-- [ ] 6.3 Novel-signature escalation
+- [~] 6.3 Novel-signature escalation
   - When an error has `signature_hash` not in `triage-seen.jsonl`, `error-triage.sh` opens a draft GitHub Issue via existing `mcp__github__issue_write` (from the user's session) — issue body includes: code, severity, runbook, first 50 matching log lines, context links (Grafana, CloudWatch)
 
 ### Phase 7 — Claude-watches-logs daemon
@@ -203,7 +203,7 @@ CloudWatch ──(5 alarms) ── SNS topic ───────────�
 
 ### Phase 8 — Self-healing triggers
 
-- [ ] 8.1 Common auto-fix scripts
+- [x] 8.1 Common auto-fix scripts
   - `scripts/auto-fix-restart-depth.sh` — calls existing depth rebalancer reset endpoint
   - `scripts/auto-fix-clear-spill.sh` — drains disk spill buffer after QuestDB recovery
   - `scripts/auto-fix-refresh-instruments.sh` — triggers `POST /api/instruments/rebuild`
@@ -266,7 +266,7 @@ CloudWatch ──(5 alarms) ── SNS topic ───────────�
   - All `crates/*/src/lib.rs` get `#![cfg_attr(not(test), deny(warnings))]`
   - Any dep warning blocks the build
 
-- [ ] 12.5 O(1) hot-path ratchet
+- [x] 12.5 O(1) hot-path ratchet
   - DHAT test budget: zero heap alloc per tick in `crates/core/tests/dhat_tick_processor.rs`
   - Benchmark budget: `tick_pipeline_routing < 100ns`, `papaya_lookup < 50ns`, `full_tick_processing < 10µs` in `quality/benchmark-budgets.toml`
   - CI gate: 5% regression on any budget = block
@@ -281,7 +281,7 @@ CloudWatch ──(5 alarms) ── SNS topic ───────────�
   - File: `deploy/docker/grafana/dashboards/operator-health.json`
   - One panel for every "Is it working?" question: trading live? WS UP? depth streaming? errors rising? P&L within limits? auto-triage running? CloudWatch alarms green?
 
-- [ ] 9.2 End-to-end validation script
+- [x] 9.2 End-to-end validation script
   - File: `scripts/validate-automation.sh`
   - Simulates each known error code, asserts Telegram alert fires within SLA, asserts auto-fix runs (dry-run), asserts summary file regenerates
 
