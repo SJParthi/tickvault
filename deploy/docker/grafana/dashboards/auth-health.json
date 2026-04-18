@@ -1,0 +1,215 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "Dhan authentication + token lifecycle health. Red panels = auth failing or token expiring. Runbook: .claude/rules/dhan/authentication.md. JWT valid 24h, refresh at 23h, TOTP required for programmatic gen.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "uid": "tv-auth-health",
+  "title": "tickvault — Auth Health",
+  "tags": ["tickvault", "auth", "dhan"],
+  "timezone": "Asia/Kolkata",
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "time": { "from": "now-6h", "to": "now" },
+  "panels": [
+    {
+      "type": "text",
+      "id": 100,
+      "gridPos": { "h": 3, "w": 24, "x": 0, "y": 0 },
+      "options": {
+        "mode": "markdown",
+        "content": "## Auth Health — Dhan JWT + TOTP\n\nDhan tokens are 24h JWT. App refreshes at 23h via arc-swap atomic swap. TOTP required for programmatic generation (RFC 6238, 30s window). **Red panels during market hours = halt imminent.** Runbook: [authentication.md](/files/claude/rules/dhan/authentication.md). Error codes covered: DH-901, DATA-807/808/809/810, AUTH-GAP-01, AUTH-GAP-02."
+      }
+    },
+    {
+      "type": "row",
+      "id": 110,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 3 },
+      "title": "Token lifecycle",
+      "collapsed": false
+    },
+    {
+      "type": "stat",
+      "id": 1,
+      "title": "Token remaining hours",
+      "description": "Dhan JWT remaining validity. Red < 1h, orange < 4h, green >= 4h.",
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "tv_token_remaining_seconds / 3600", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "unit": "h",
+          "decimals": 1,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red" }, { "color": "orange", "value": 1 }, { "color": "green", "value": 4 }] }
+        }
+      },
+      "options": { "colorMode": "background_solid", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "type": "stat",
+      "id": 2,
+      "title": "Token renewals (24h)",
+      "description": "Healthy baseline: ~1/day (scheduled 23h refresh). Spike = retry loop.",
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "increase(tv_token_renewals_total[24h])", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "unit": "none",
+          "decimals": 0,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red" }, { "color": "green", "value": 1 }, { "color": "orange", "value": 5 }] }
+        }
+      },
+      "options": { "colorMode": "background_solid", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "type": "stat",
+      "id": 3,
+      "title": "Token renewal failures (24h)",
+      "description": "Any non-zero = DH-901 path hit. 2 consecutive = app halt.",
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "increase(tv_token_renewal_failures_total[24h])", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "unit": "none",
+          "decimals": 0,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green" }, { "color": "orange", "value": 1 }, { "color": "red", "value": 3 }] }
+        }
+      },
+      "options": { "colorMode": "background_solid", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "type": "stat",
+      "id": 4,
+      "title": "Auth circuit breaker state",
+      "description": "0=Closed (healthy), 1=Open (halt), 2=Half-Open (probe). Opens after N consecutive failures.",
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "tv_auth_circuit_breaker_state", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [
+            { "options": { "0": { "color": "green", "text": "CLOSED" } }, "type": "value" },
+            { "options": { "1": { "color": "red", "text": "OPEN" } }, "type": "value" },
+            { "options": { "2": { "color": "orange", "text": "HALF" } }, "type": "value" }
+          ],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green" }, { "color": "red", "value": 1 }] }
+        }
+      },
+      "options": { "colorMode": "background_solid", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "type": "row",
+      "id": 120,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 9 },
+      "title": "API call authentication",
+      "collapsed": false
+    },
+    {
+      "type": "stat",
+      "id": 5,
+      "title": "HTTP 401s (last 10m)",
+      "description": "401 Unauthorized responses from Dhan REST APIs. Indicates stale token or IP mismatch.",
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 10 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "increase(tv_api_401_total[10m])", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "unit": "none",
+          "decimals": 0,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green" }, { "color": "orange", "value": 1 }, { "color": "red", "value": 3 }] }
+        }
+      },
+      "options": { "colorMode": "background_solid", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "type": "stat",
+      "id": 6,
+      "title": "WS disconnect 807 (10m)",
+      "description": "WebSocket disconnect code 807 = AccessTokenExpired. Only 807 triggers token refresh (AUTH-GAP-02).",
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 10 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "increase(tv_ws_disconnect_807_total[10m])", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "unit": "none",
+          "decimals": 0,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green" }, { "color": "orange", "value": 1 }] }
+        }
+      },
+      "options": { "colorMode": "background_solid", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "type": "stat",
+      "id": 7,
+      "title": "IP mismatch events",
+      "description": "GAP-NET-01: detected public IP != registered static IP. Orders rejected from unregistered IPs (enforced Apr 1 2026).",
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 10 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "tv_ip_mismatch_total", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "unit": "none",
+          "decimals": 0,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green" }, { "color": "red", "value": 1 }] }
+        }
+      },
+      "options": { "colorMode": "background_solid", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "type": "stat",
+      "id": 8,
+      "title": "TOTP generations (24h)",
+      "description": "Programmatic TOTP generation count. Baseline: 1-3/day.",
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 10 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "increase(tv_totp_generations_total[24h])", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "unit": "none",
+          "decimals": 0,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green" }, { "color": "orange", "value": 10 }, { "color": "red", "value": 30 }] }
+        }
+      },
+      "options": { "colorMode": "background_solid", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    }
+  ]
+}
