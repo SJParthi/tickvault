@@ -1,0 +1,236 @@
+/* =============================================================
+   Tickvault Design System — tokens
+   Canonical palette: GitHub-dark ("ws-dashboard" family).
+   Secondary palette: "market-dashboard" (pure black bg) — kept as vars for screens that need it.
+   ============================================================= */
+
+/* Web fonts (Inter + JetBrains Mono). Flagged substitutions — see README. */
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
+
+:root {
+  /* ---- Base color palette (canonical, ws-dashboard / option-chain-v2) ---- */
+  --tv-bg:              #0d1117;
+  --tv-bg-card:         #161b22;
+  --tv-bg-card-hover:   #1c2228;
+  --tv-bg-input:        #0d1117;
+  --tv-border:          #30363d;
+  --tv-border-subtle:   #242424;
+
+  /* ---- Secondary surface (market-dashboard family) ---- */
+  --tv-bg-deep:         #000000;   /* pure black main bg (markets screens) */
+  --tv-bg-elevated:     #181818;   /* raised surface on black bg */
+  --tv-bg-elevated-2:   #242424;   /* search / segmented button fill */
+  --tv-nav-translucent: rgba(18, 18, 18, 0.62); /* top nav overlay */
+
+  /* ---- Text ---- */
+  --tv-text:            #e6edf3;   /* primary content */
+  --tv-text-strong:     #dadada;   /* used on market-dashboard body */
+  --tv-text-dim:        #8b949e;   /* secondary / labels / nav */
+  --tv-text-dim-2:      #8e8e8e;   /* market-dashboard dim */
+  --tv-text-muted:      #484f58;   /* disabled / tertiary */
+  --tv-text-faint:      #555555;   /* portal "text-dim" equivalent */
+
+  /* ---- Semantic / market colors ---- */
+  --tv-green:           #26a69a;   /* up / connected / CE side */
+  --tv-green-alt:       #5ca81d;   /* table-body up (market-dashboard) */
+  --tv-green-strong:    #05b878;   /* active-nav, LIVE indicator */
+  --tv-green-dark:      #138c61;   /* active pill border */
+  --tv-green-wash:      #1c2c27;   /* active pill fill */
+
+  --tv-red:             #ef5350;   /* down / error */
+  --tv-red-soft:        #dd6565;   /* table-body down (market-dashboard) */
+
+  --tv-blue:            #2962ff;   /* primary accent / link / ATM */
+  --tv-blue-lift:       #4169e1;   /* gradient stop for logo chip */
+  --tv-blue-dodger:     #1e90ff;   /* gradient stop for logo chip */
+
+  --tv-yellow:          #ffab00;   /* warning / buffering / credentials */
+  --tv-purple:          #7c4dff;   /* database accent */
+  --tv-purple-avatar:   #9370db;
+  --tv-purple-avatar-2: #6a4c93;
+
+  /* ---- Tinted backgrounds (15% of semantic, for badges / rows) ---- */
+  --tv-green-tint:      rgba(38, 166, 154, 0.15);
+  --tv-green-tint-lo:   rgba(38, 166, 154, 0.06); /* CE row wash */
+  --tv-red-tint:        rgba(239, 83, 80, 0.15);
+  --tv-red-tint-lo:     rgba(239, 83, 80, 0.06);  /* PE row wash */
+  --tv-blue-tint:       rgba(41, 98, 255, 0.15);
+  --tv-yellow-tint:     rgba(255, 171, 0, 0.15);
+  --tv-purple-tint:     rgba(124, 77, 255, 0.15);
+  --tv-row-hover:       rgba(255, 255, 255, 0.03);
+
+  /* ---- Brand gradients (logo chip + user avatar — the only gradients allowed) ---- */
+  --tv-gradient-logo:   linear-gradient(135deg, #1e90ff, #4169e1);
+  --tv-gradient-avatar: linear-gradient(135deg, #9370db, #6a4c93);
+
+  /* ---- Font families ---- */
+  --tv-font-sans:  'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --tv-font-mono:  'JetBrains Mono', 'SF Mono', Monaco, Consolas, 'Cascadia Code', monospace;
+
+  /* ---- Type scale (raw) ---- */
+  --tv-fs-10:      10px;
+  --tv-fs-11:      11px;
+  --tv-fs-12:      12px;
+  --tv-fs-13:      13px;
+  --tv-fs-14:      14px;   /* base body */
+  --tv-fs-16:      16px;
+  --tv-fs-18:      18px;
+  --tv-fs-24:      24px;
+  --tv-fs-28:      28px;   /* portal H1 */
+
+  --tv-lh-tight:   1.2;
+  --tv-lh-body:    1.45;
+  --tv-lh-loose:   1.6;
+
+  --tv-tracking-ui:      0.5px;
+  --tv-tracking-section: 2px;
+  --tv-tracking-hero:    2px;
+
+  /* ---- Spacing (4-point scale) ---- */
+  --tv-space-1:  4px;
+  --tv-space-2:  6px;
+  --tv-space-3:  8px;
+  --tv-space-4:  10px;
+  --tv-space-5:  12px;
+  --tv-space-6:  16px;
+  --tv-space-7:  20px;
+  --tv-space-8:  24px;
+  --tv-space-9:  30px;
+  --tv-space-10: 40px;
+
+  /* ---- Radii ---- */
+  --tv-radius-xs: 3px;   /* tiny badges */
+  --tv-radius-sm: 4px;   /* buttons, inputs */
+  --tv-radius-md: 6px;   /* stat cards */
+  --tv-radius-lg: 8px;   /* portal tiles, active pill tab */
+  --tv-radius-pill: 999px;
+
+  /* ---- Shadows (rare — hover-only) ---- */
+  --tv-shadow-hover:  0 4px 12px rgba(41, 98, 255, 0.15);
+  --tv-shadow-green:  0 0 6px var(--tv-green-strong);
+  --tv-shadow-red:    0 0 6px var(--tv-red);
+  --tv-shadow-yellow: 0 0 6px var(--tv-yellow);
+
+  /* ---- Motion ---- */
+  --tv-dur-fast: 0.15s;
+  --tv-dur-med:  0.20s;
+  --tv-dur-slow: 0.30s;
+  --tv-ease:     ease;
+
+  /* ---- Z-index ---- */
+  --tv-z-sticky: 10;
+  --tv-z-nav:    20;
+  --tv-z-overlay:100;
+
+  /* =========================================================
+     Semantic aliases (what you import in components)
+     ========================================================= */
+
+  /* Backgrounds */
+  --fg1: var(--tv-text);
+  --fg2: var(--tv-text-dim);
+  --fg3: var(--tv-text-muted);
+  --bg1: var(--tv-bg);
+  --bg2: var(--tv-bg-card);
+  --bg3: var(--tv-bg-card-hover);
+
+  /* Semantic signals */
+  --signal-up:       var(--tv-green);
+  --signal-down:     var(--tv-red);
+  --signal-warn:     var(--tv-yellow);
+  --signal-info:     var(--tv-blue);
+  --signal-neutral:  var(--tv-text-dim);
+
+  /* Typographic roles */
+  --type-display:  var(--tv-font-sans);
+  --type-body:     var(--tv-font-sans);
+  --type-mono:     var(--tv-font-mono);
+}
+
+/* =========================================================
+   Semantic typography classes / element defaults
+   ========================================================= */
+
+html, body {
+  background: var(--tv-bg);
+  color: var(--tv-text);
+  font-family: var(--tv-font-sans);
+  font-size: var(--tv-fs-14);
+  line-height: var(--tv-lh-body);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+.tv-h1 {
+  font-family: var(--tv-font-sans);
+  font-size: var(--tv-fs-28);
+  font-weight: 300;
+  letter-spacing: var(--tv-tracking-hero);
+  color: var(--tv-text);
+  line-height: var(--tv-lh-tight);
+}
+.tv-h1 .accent { color: var(--tv-blue); font-weight: 600; }
+
+.tv-h2 {
+  font-size: var(--tv-fs-16);
+  font-weight: 600;
+  color: var(--tv-text);
+  line-height: var(--tv-lh-tight);
+}
+
+.tv-card-title {
+  font-size: var(--tv-fs-16);
+  font-weight: 600;
+  color: var(--tv-text);
+}
+
+.tv-section-header {
+  font-size: var(--tv-fs-11);
+  font-weight: 600;
+  color: var(--tv-text-muted);
+  text-transform: uppercase;
+  letter-spacing: var(--tv-tracking-section);
+}
+
+.tv-label {
+  font-size: var(--tv-fs-11);
+  color: var(--tv-text-dim);
+  text-transform: uppercase;
+  letter-spacing: var(--tv-tracking-ui);
+}
+
+.tv-body   { font-size: var(--tv-fs-14); color: var(--tv-text); }
+.tv-body-s { font-size: var(--tv-fs-13); color: var(--tv-text-dim); }
+.tv-body-xs{ font-size: var(--tv-fs-12); color: var(--tv-text-dim); }
+.tv-caption{ font-size: var(--tv-fs-11); color: var(--tv-text-muted); }
+
+.tv-mono {
+  font-family: var(--tv-font-mono);
+  font-size: var(--tv-fs-11);
+  color: var(--tv-blue);
+}
+
+.tv-stat-value { font-size: var(--tv-fs-24); font-weight: 700; color: var(--tv-green); }
+.tv-stat-label { font-size: var(--tv-fs-11); color: var(--tv-text-dim); text-transform: uppercase; letter-spacing: var(--tv-tracking-ui); }
+
+.tv-up   { color: var(--tv-green); }
+.tv-down { color: var(--tv-red); }
+.tv-dim  { color: var(--tv-text-muted); }
+
+/* Keyframes used across the system */
+@keyframes tv-pulse   { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
+@keyframes tv-shimmer { 0% { opacity: 0.3; } 50% { opacity: 0.7; } 100% { opacity: 0.3; } }
+
+.tv-live-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--tv-green-strong);
+  box-shadow: var(--tv-shadow-green);
+  animation: tv-pulse 2s infinite;
+  display: inline-block;
+}
+
+/* Scrollbar (match ws-dashboard) */
+.tv-scroll::-webkit-scrollbar        { width: 6px; height: 6px; }
+.tv-scroll::-webkit-scrollbar-track  { background: var(--tv-bg); }
+.tv-scroll::-webkit-scrollbar-thumb  { background: #333; border-radius: 3px; }
+.tv-scroll::-webkit-scrollbar-thumb:hover { background: #444; }

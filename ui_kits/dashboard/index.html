@@ -1,0 +1,654 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Tickvault UI Kit — Operator Dashboards</title>
+<link rel="stylesheet" href="../../colors_and_type.css">
+<style>
+  body { margin: 0; padding: 0; background: var(--tv-bg); color: var(--tv-text); }
+  .page { max-width: 1400px; margin: 0 auto; padding: 40px 32px 80px; }
+  .section { margin-bottom: 64px; }
+  .section > h2 {
+    font-size: 11px; color: var(--tv-text-muted); text-transform: uppercase;
+    letter-spacing: 2px; font-weight: 600; margin: 0 0 4px 0;
+  }
+  .section > .sub { color: var(--tv-text-dim); font-size: 13px; margin: 0 0 20px 0; max-width: 780px; }
+  .frame {
+    background: var(--tv-bg); border: 1px solid var(--tv-border);
+    border-radius: 8px; overflow: hidden;
+  }
+  .frame.tight { border-radius: 0; }
+
+  /* ---------- HERO ---------- */
+  .hero {
+    display: flex; justify-content: space-between; align-items: flex-end;
+    padding: 56px 0 40px; border-bottom: 1px solid var(--tv-border); margin-bottom: 56px;
+  }
+  .hero h1 { margin: 0; font-size: 28px; font-weight: 300; letter-spacing: 2px; line-height: 1.1; }
+  .hero h1 .accent { color: var(--tv-blue); font-weight: 600; }
+  .hero .meta { text-align: right; font-family: var(--tv-font-mono); font-size: 11px; color: var(--tv-text-dim); line-height: 1.8; }
+  .hero .meta .k { color: var(--tv-text-muted); }
+
+  /* ---------- TOP NAV (portal) ---------- */
+  .nav {
+    display: flex; align-items: center; height: 60px;
+    padding: 0 20px; gap: 20px;
+    background: var(--tv-nav-translucent);
+    border-bottom: 1px solid var(--tv-border-subtle);
+  }
+  .logo-chip { width: 30px; height: 30px; border-radius: 50%;
+    background: var(--tv-gradient-logo);
+    display: flex; align-items: center; justify-content: center;
+    color: #fff; font-weight: 700; font-size: 14px; }
+  .nav .search {
+    background: var(--tv-bg-elevated-2); border: 1px solid var(--tv-bg-elevated-2);
+    border-radius: 4px; padding: 8px 12px; color: var(--tv-text-dim-2);
+    width: 240px; font-size: 13px; font-family: inherit;
+  }
+  .nav-links { display: flex; gap: 28px; }
+  .nav-links a { color: var(--tv-text-dim-2); text-decoration: none; font-size: 13px; }
+  .nav-links a.on { color: var(--tv-green-strong); }
+  .nav .right { margin-left: auto; display: flex; align-items: center; gap: 16px; }
+  .live-indicator { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--tv-text-dim-2); }
+  .avatar { width: 32px; height: 32px; border-radius: 50%;
+    background: var(--tv-gradient-avatar);
+    display: flex; align-items: center; justify-content: center;
+    color: #fff; font-weight: 700; font-size: 14px; }
+
+  /* ---------- INDEX TICKER ---------- */
+  .ticker-bar {
+    display: flex; gap: 30px; padding: 10px 20px; font-size: 12px;
+    background: var(--tv-bg-elevated); border-bottom: 1px solid var(--tv-border-subtle);
+    overflow-x: auto;
+  }
+  .ticker-item { display: flex; gap: 10px; align-items: center; white-space: nowrap; font-family: var(--tv-font-mono); }
+  .ticker-item .n { color: var(--tv-text-dim-2); font-family: var(--tv-font-sans); }
+  .ticker-item .v { color: var(--tv-text-strong); }
+
+  /* ---------- PORTAL GRID ---------- */
+  .portal {
+    background: #0a0a0a; padding: 40px 32px;
+  }
+  .portal-head {
+    display: flex; justify-content: space-between; align-items: flex-end; margin-bottom: 40px;
+  }
+  .portal-head h2 { font-size: 28px; font-weight: 300; letter-spacing: 2px; color: var(--tv-text); margin: 0; }
+  .portal-head h2 .accent { color: var(--tv-blue); font-weight: 600; }
+  .portal-head .clock { font-family: var(--tv-font-mono); font-size: 14px; color: var(--tv-text-dim); }
+  .portal-section { margin-bottom: 40px; }
+  .portal-section-title {
+    font-size: 11px; color: var(--tv-text-faint); text-transform: uppercase;
+    letter-spacing: 2px; font-weight: 600; margin-bottom: 16px;
+    padding-bottom: 8px; border-bottom: 1px solid #1a1a1a;
+  }
+  .tile-grid {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 16px;
+  }
+  .tile {
+    background: var(--tv-bg-card); border: 1px solid var(--tv-border); border-radius: 8px;
+    padding: 20px; text-decoration: none; color: inherit; cursor: pointer;
+    transition: all var(--tv-dur-fast) var(--tv-ease); display: block;
+  }
+  .tile:hover {
+    background: var(--tv-bg-card-hover); border-color: var(--tv-blue);
+    transform: translateY(-2px); box-shadow: var(--tv-shadow-hover);
+  }
+  .tile .t-title { font-size: 16px; font-weight: 600; margin-bottom: 6px; }
+  .tile .t-desc { font-size: 12px; color: var(--tv-text-dim); line-height: 1.5; margin-bottom: 10px; }
+  .tile .t-url { font-family: var(--tv-font-mono); font-size: 11px; color: var(--tv-blue); margin-bottom: 10px; }
+  .tile .t-badge {
+    display: inline-block; font-size: 10px; font-weight: 700; padding: 3px 8px;
+    border-radius: 3px; letter-spacing: 0.5px; text-transform: uppercase;
+  }
+  .b-live { background: var(--tv-green-tint); color: var(--tv-green); }
+  .b-api  { background: var(--tv-blue-tint);  color: var(--tv-blue); }
+  .b-db   { background: var(--tv-purple-tint);color: var(--tv-purple); }
+  .b-warn { background: var(--tv-yellow-tint);color: var(--tv-yellow); }
+  .b-down { background: var(--tv-red-tint);   color: var(--tv-red); }
+
+  /* ---------- WS DASHBOARD ---------- */
+  .ws-dash { padding: 24px; }
+  .ws-head {
+    display: flex; justify-content: space-between; align-items: center;
+    padding-bottom: 14px; border-bottom: 1px solid var(--tv-border); margin-bottom: 24px;
+  }
+  .ws-head h3 { margin: 0; font-size: 16px; font-weight: 600; }
+  .ws-head .tagline { font-size: 11px; color: var(--tv-text-muted); font-family: var(--tv-font-mono); }
+  .kpi-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 24px; }
+  .kpi {
+    background: var(--tv-bg-card); border: 1px solid var(--tv-border); border-radius: 6px;
+    padding: 14px; text-align: left;
+  }
+  .kpi .label { font-size: 10px; color: var(--tv-text-dim); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 6px; }
+  .kpi .value { font-size: 22px; font-weight: 700; font-family: var(--tv-font-mono); color: var(--tv-green); }
+  .kpi .value.down { color: var(--tv-red); }
+  .kpi .value.info { color: var(--tv-blue); }
+  .kpi .value.warn { color: var(--tv-yellow); }
+  .kpi .sub { font-size: 11px; color: var(--tv-text-muted); margin-top: 4px; }
+
+  /* pool cards */
+  .pool-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; }
+  .pool {
+    background: var(--tv-bg-card); border: 1px solid var(--tv-border);
+    border-left: 3px solid var(--tv-green-strong);
+    border-radius: 6px; padding: 14px;
+  }
+  .pool.down { border-left-color: var(--tv-red); }
+  .pool.warn { border-left-color: var(--tv-yellow); }
+  .pool-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+  .pool-name { font-size: 13px; font-weight: 600; }
+  .pool-stats { display: flex; gap: 14px; font-size: 11px; color: var(--tv-text-dim); font-family: var(--tv-font-mono); }
+  .pool-stats b { color: var(--tv-text); font-weight: 500; }
+  .meter { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
+  .meter-bar { flex: 1; height: 4px; background: #1a1a1a; border-radius: 2px; overflow: hidden; }
+  .meter-fill { height: 100%; background: var(--tv-green); border-radius: 2px; transition: width var(--tv-dur-slow) var(--tv-ease); }
+  .meter-fill.y { background: var(--tv-yellow); }
+  .meter-fill.r { background: var(--tv-red); }
+  .meter-pct { font-family: var(--tv-font-mono); font-size: 11px; color: var(--tv-text-dim); min-width: 40px; text-align: right; }
+
+  /* ---------- MARKET DASHBOARD ---------- */
+  .md { background: var(--tv-bg-deep); }
+  .md-layout { display: grid; grid-template-columns: 300px 1fr; min-height: 520px; }
+  .watchlist { border-right: 1px solid var(--tv-border-subtle); padding: 16px; }
+  .wl-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; }
+  .wl-head .title { font-size: 13px; font-weight: 600; color: var(--tv-text-strong); }
+  .wl-head .count { font-size: 11px; color: var(--tv-text-dim-2); font-family: var(--tv-font-mono); }
+  .wl-search { width: 100%; background: var(--tv-bg-elevated); border: 1px solid var(--tv-bg-elevated);
+    color: var(--tv-text-strong); padding: 7px 10px; border-radius: 4px; font-size: 12px;
+    font-family: inherit; margin-bottom: 10px; box-sizing: border-box; }
+  .wl-item {
+    display: flex; align-items: center; gap: 10px; padding: 10px 8px; border-left: 3px solid transparent;
+    transition: background var(--tv-dur-fast); cursor: pointer;
+  }
+  .wl-item:hover { background: rgba(255,255,255,0.03); }
+  .wl-item.up { border-left-color: var(--tv-green-strong); }
+  .wl-item.down { border-left-color: var(--tv-red-soft); }
+  .wl-info { flex: 1; }
+  .wl-name { font-size: 13px; color: var(--tv-text-strong); }
+  .wl-ex { font-size: 10px; color: var(--tv-text-dim-2); font-family: var(--tv-font-mono); }
+  .wl-price { text-align: right; font-family: var(--tv-font-mono); }
+  .wl-ltp { font-size: 13px; color: var(--tv-text-strong); }
+  .wl-chg { font-size: 10px; }
+  .wl-chg.up { color: var(--tv-green-alt); }
+  .wl-chg.down { color: var(--tv-red-soft); }
+
+  .md-main { padding: 0; }
+  .md-tabs { display: flex; padding: 12px 20px; gap: 4px; border-bottom: 1px solid var(--tv-border-subtle); }
+  .p-tab {
+    padding: 6px 20px; color: var(--tv-text-dim-2); font-size: 13px; background: var(--tv-bg-elevated);
+    border: 1px solid transparent; cursor: pointer; height: 32px; display: inline-flex; align-items: center;
+    font-family: inherit; border-radius: 4px;
+  }
+  .p-tab.on {
+    color: var(--tv-green-strong); background: var(--tv-green-wash);
+    border: 1px solid var(--tv-green-dark); border-radius: 8px;
+  }
+  .md-sub-tabs { display: flex; gap: 4px; padding: 10px 20px; border-bottom: 1px solid var(--tv-border-subtle); }
+  .s-tab { padding: 5px 14px; font-size: 12px; color: var(--tv-text-dim-2); background: var(--tv-bg-elevated);
+    border: 1px solid var(--tv-border-subtle); border-radius: 4px; cursor: pointer; font-family: inherit; }
+  .s-tab.on { color: var(--tv-blue); border-color: var(--tv-blue); background: var(--tv-blue-tint); }
+
+  .md-table-wrap { padding: 16px 20px; }
+  table.md-table { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 13px; }
+  .md-table th {
+    position: sticky; top: 0; background: var(--tv-bg-card); padding: 10px 12px;
+    text-align: right; font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px;
+    color: var(--tv-text-muted); border-bottom: 2px solid var(--tv-border); font-weight: 600;
+  }
+  .md-table th:first-child { text-align: left; }
+  .md-table td {
+    padding: 9px 12px; text-align: right; border-bottom: 1px solid var(--tv-border-subtle);
+    color: var(--tv-text-dim-2); font-family: var(--tv-font-mono);
+  }
+  .md-table td:first-child { text-align: left; color: var(--tv-text-strong); font-weight: 500; font-family: var(--tv-font-sans); }
+  .md-table tr:hover td { background: rgba(255,255,255,0.03); }
+  .md-table .up { color: var(--tv-green-alt); }
+  .md-table .down { color: var(--tv-red-soft); }
+
+  /* ---------- OPTION CHAIN ---------- */
+  .oc-frame { padding: 20px; font-family: var(--tv-font-mono); }
+  .oc-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; }
+  .oc-head h3 { margin: 0; font-family: var(--tv-font-sans); font-size: 16px; font-weight: 600; }
+  .oc-head .controls { display: flex; gap: 8px; }
+  .oc-select {
+    background: var(--tv-bg-card); color: var(--tv-text); border: 1px solid var(--tv-border);
+    padding: 6px 10px; border-radius: 4px; font-size: 12px; font-family: var(--tv-font-sans);
+  }
+  table.oc { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 11px; }
+  .oc th {
+    background: var(--tv-bg-card); padding: 7px 8px; color: var(--tv-text-muted);
+    font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; font-weight: 600;
+    border-bottom: 2px solid var(--tv-border); text-align: right;
+  }
+  .oc th.center, .oc td.center { text-align: center; }
+  .oc th.strike { background: var(--tv-bg-card-hover); color: var(--tv-text); }
+  .oc td { padding: 6px 8px; text-align: right; border-bottom: 1px solid var(--tv-border); color: var(--tv-text-dim); }
+  .oc tr.ce td:not(.strike) { background: var(--tv-green-tint-lo); }
+  .oc tr.pe td:not(.strike) { background: var(--tv-red-tint-lo); }
+  .oc tr.atm td { background: var(--tv-blue-tint); }
+  .oc td.strike { text-align: center; color: var(--tv-text); font-weight: 600; background: var(--tv-bg-card); }
+  .oc td.up { color: var(--tv-green); }
+  .oc td.down { color: var(--tv-red); }
+
+  /* ---------- STATUS BAR ---------- */
+  .status-bar {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 8px 20px; background: var(--tv-bg-card); border-top: 1px solid var(--tv-border);
+    font-size: 11px; color: var(--tv-text-dim);
+  }
+  .status-bar .group { display: flex; align-items: center; gap: 14px; }
+  .status-bar a { color: var(--tv-blue); text-decoration: none; }
+  .status-bar .clock { font-family: var(--tv-font-mono); }
+
+  /* ---------- DOC ---------- */
+  .doc-callout {
+    margin-top: 16px; font-size: 12px; color: var(--tv-text-dim); line-height: 1.6;
+    background: var(--tv-bg-card); border: 1px solid var(--tv-border); border-left: 3px solid var(--tv-blue);
+    padding: 12px 14px; border-radius: 4px;
+  }
+  .doc-callout b { color: var(--tv-text); font-weight: 600; }
+  .doc-callout code { font-family: var(--tv-font-mono); color: var(--tv-blue); }
+</style>
+</head>
+<body>
+<div class="page">
+
+  <header class="hero">
+    <h1><span class="accent">DLT</span> Operator UI Kit</h1>
+    <div class="meta">
+      <div><span class="k">palette</span> &nbsp;GitHub-dark #0d1117</div>
+      <div><span class="k">type</span> &nbsp;&nbsp;&nbsp;&nbsp;Inter · JetBrains Mono</div>
+      <div><span class="k">screens</span> &nbsp;portal · ws · markets · option-chain</div>
+      <div><span class="k">source</span> &nbsp;&nbsp;SJParthi/tickvault@main</div>
+    </div>
+  </header>
+
+  <!-- =========================================================
+       1. TOP NAV + TICKER  (market-dashboard)
+       ========================================================= -->
+  <section class="section">
+    <h2>01 · Chrome</h2>
+    <p class="sub">Global shell for any trading surface: 60 px nav with logo chip + search + live indicator, and a 40 px ticker strip of indices. The nav background is a 62% dark wash (no blur) — the only translucent surface in the system.</p>
+    <div class="frame">
+      <div class="nav">
+        <div class="logo-chip">D</div>
+        <input class="search" placeholder="Search eg: Infy, Nifty Fut, Nifty 24000 CE">
+        <div class="nav-links">
+          <a>Home</a><a>Portfolio</a><a>Positions</a><a>Orders</a>
+          <a class="on">Markets</a><a>Funds</a><a>Bids</a>
+        </div>
+        <div class="right">
+          <div class="live-indicator"><span class="tv-live-dot"></span>LIVE</div>
+          <div class="avatar">P</div>
+        </div>
+      </div>
+      <div class="ticker-bar">
+        <div class="ticker-item"><span class="n">Nifty 50</span><span class="v">24,862.05</span><span class="tv-up">+0.42%</span></div>
+        <div class="ticker-item"><span class="n">Nifty Bank</span><span class="v">52,104.30</span><span class="tv-down">-0.18%</span></div>
+        <div class="ticker-item"><span class="n">India VIX</span><span class="v">14.22</span><span class="tv-up">+1.24%</span></div>
+        <div class="ticker-item"><span class="n">Sensex</span><span class="v">81,402.11</span><span class="tv-up">+0.38%</span></div>
+        <div class="ticker-item"><span class="n">Nifty IT</span><span class="v">39,212.85</span><span class="tv-down">-0.27%</span></div>
+        <div class="ticker-item"><span class="n">Nifty Fin</span><span class="v">23,518.40</span><span class="tv-up">+0.19%</span></div>
+        <div class="ticker-item"><span class="n">USD/INR</span><span class="v">83.54</span><span class="tv-up">+0.04%</span></div>
+      </div>
+    </div>
+    <div class="doc-callout">
+      <b>Logo chip</b> is a 30 px circle with the only permitted gradient (<code>linear-gradient(135deg,#1e90ff,#4169e1)</code>) and a bold single letter. The <b>avatar</b> uses the purple gradient. <b>LIVE</b> always sits directly right of the nav links, pulsing at 2 s.
+    </div>
+  </section>
+
+  <!-- =========================================================
+       2. PORTAL (control panel)
+       ========================================================= -->
+  <section class="section">
+    <h2>02 · Control Panel</h2>
+    <p class="sub">The DLT home grid. A thin pure-black surface with 11 px uppercase section dividers and 8 px rounded tiles that lift 2 px on hover. Tile composition is fixed: title, description, blue mono URL, small uppercase badge.</p>
+    <div class="frame">
+      <div class="portal">
+        <div class="portal-head">
+          <h2><span class="accent">DLT</span> Control Panel</h2>
+          <div class="clock">Mon 06 Apr · 14:38:22 IST</div>
+        </div>
+        <div class="portal-section">
+          <div class="portal-section-title">📊 Application</div>
+          <div class="tile-grid">
+            <a class="tile">
+              <div class="t-title">Market Dashboard</div>
+              <div class="t-desc">Live index tickers, stock movers (gainers/losers), option movers (OI/Volume).</div>
+              <div class="t-url">/portal/market-dashboard</div>
+              <div class="t-badge b-live">Live</div>
+            </a>
+            <a class="tile">
+              <div class="t-title">Option Chain</div>
+              <div class="t-desc">CE/PE side-by-side with Greeks, IV, and per-strike OI change.</div>
+              <div class="t-url">/portal/option-chain-v2</div>
+              <div class="t-badge b-api">API</div>
+            </a>
+            <a class="tile">
+              <div class="t-title">Watchlists</div>
+              <div class="t-desc">Per-user symbol groups, max 5, arc-swap refresh.</div>
+              <div class="t-url">/portal/watchlists</div>
+              <div class="t-badge b-api">API</div>
+            </a>
+          </div>
+        </div>
+        <div class="portal-section">
+          <div class="portal-section-title">🔌 WebSocket</div>
+          <div class="tile-grid">
+            <a class="tile">
+              <div class="t-title">Market Feed WS</div>
+              <div class="t-desc">5,000 instruments per conn · 100 per message · independent per type.</div>
+              <div class="t-url">wss://api-feed.dhan.co</div>
+              <div class="t-badge b-live">Connected</div>
+            </a>
+            <a class="tile">
+              <div class="t-title">Order Update WS</div>
+              <div class="t-desc">Single connection · auto-reconnect · 1 s backoff.</div>
+              <div class="t-url">wss://api-order-update.dhan.co</div>
+              <div class="t-badge b-down">Down</div>
+            </a>
+            <a class="tile">
+              <div class="t-title">WS Dashboard</div>
+              <div class="t-desc">Pool utilization, subsystem health, rate-limit reference.</div>
+              <div class="t-url">/portal/ws-dashboard</div>
+              <div class="t-badge b-api">API</div>
+            </a>
+          </div>
+        </div>
+        <div class="portal-section">
+          <div class="portal-section-title">🗄️ Database &amp; Storage</div>
+          <div class="tile-grid">
+            <a class="tile">
+              <div class="t-title">QuestDB Console</div>
+              <div class="t-desc">14 tables · ILP ingest · WAL retention 24 h.</div>
+              <div class="t-url">http://localhost:9000</div>
+              <div class="t-badge b-db">Database</div>
+            </a>
+            <a class="tile">
+              <div class="t-title">Credentials Vault</div>
+              <div class="t-desc">JWT · 24 h validity · arc-swap refresh.</div>
+              <div class="t-url">/portal/credentials</div>
+              <div class="t-badge b-warn">Monitoring</div>
+            </a>
+            <a class="tile">
+              <div class="t-title">Redis Sessions</div>
+              <div class="t-desc">redis-cli -h localhost -p 6379 · TTL 24 h.</div>
+              <div class="t-url">redis://localhost:6379</div>
+              <div class="t-badge b-db">Database</div>
+            </a>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="doc-callout">
+      <b>Hover</b> on a tile moves the border to <code>--tv-blue</code>, shifts the bg to <code>--tv-bg-card-hover</code>, translates <code>-2px</code>, and applies the one allowed shadow (<code>0 4 12 rgba(41,98,255,.15)</code>). This is the only elevation pattern in the system.
+    </div>
+  </section>
+
+  <!-- =========================================================
+       3. WS DASHBOARD
+       ========================================================= -->
+  <section class="section">
+    <h2>03 · WebSocket Dashboard</h2>
+    <p class="sub">The densest operator view. KPI row, pool grid with left-bar status, meter-bar utilization. Down states use both a red left-bar and a red value. No icons — the bar colour <i>is</i> the icon.</p>
+    <div class="frame">
+      <div class="ws-dash">
+        <div class="ws-head">
+          <div>
+            <h3>DLT WebSocket Dashboard</h3>
+            <div class="tagline">max 5 connections · 5,000 instruments/conn · 100/msg · independent per WS type</div>
+          </div>
+          <div class="live-indicator"><span class="tv-live-dot"></span>LIVE · auto-refresh 5 s</div>
+        </div>
+        <div class="kpi-row">
+          <div class="kpi"><div class="label">Active Pools</div><div class="value">4 / 5</div><div class="sub">market-feed pool</div></div>
+          <div class="kpi"><div class="label">Subscribed Symbols</div><div class="value info">12,482</div><div class="sub">across 4 conns</div></div>
+          <div class="kpi"><div class="label">Order WS</div><div class="value down">DOWN</div><div class="sub">retry in 0.8 s</div></div>
+          <div class="kpi"><div class="label">Dedup Ring</div><div class="value warn">43%</div><div class="sub">ok · below watermark</div></div>
+        </div>
+
+        <div class="ws-head" style="border-bottom: none; margin-bottom: 14px; padding-bottom: 0;">
+          <h3 style="font-size: 13px; color: var(--tv-text-dim);">Connection Pools</h3>
+          <div class="tagline">sorted by utilization</div>
+        </div>
+        <div class="pool-grid">
+          <div class="pool">
+            <div class="pool-head">
+              <div class="pool-name">market-feed-0</div>
+              <span class="t-badge b-live" style="font-size:10px;padding:2px 8px;border-radius:3px;font-weight:700;letter-spacing:.5px;">Connected</span>
+            </div>
+            <div class="pool-stats">
+              <span>subs <b>2,047</b>/5,000</span>
+              <span>tps <b>4,218</b></span>
+              <span>uptime <b>03:42:11</b></span>
+            </div>
+            <div class="meter"><div class="meter-bar"><div class="meter-fill" style="width:40%"></div></div><div class="meter-pct">40%</div></div>
+          </div>
+          <div class="pool warn">
+            <div class="pool-head">
+              <div class="pool-name">market-feed-1</div>
+              <span class="t-badge b-warn" style="font-size:10px;padding:2px 8px;border-radius:3px;font-weight:700;letter-spacing:.5px;">Buffering</span>
+            </div>
+            <div class="pool-stats">
+              <span>subs <b>4,250</b>/5,000</span>
+              <span>tps <b>7,412</b></span>
+              <span>uptime <b>03:42:09</b></span>
+            </div>
+            <div class="meter"><div class="meter-bar"><div class="meter-fill y" style="width:85%"></div></div><div class="meter-pct">85%</div></div>
+          </div>
+          <div class="pool">
+            <div class="pool-head">
+              <div class="pool-name">market-feed-2</div>
+              <span class="t-badge b-live" style="font-size:10px;padding:2px 8px;border-radius:3px;font-weight:700;letter-spacing:.5px;">Connected</span>
+            </div>
+            <div class="pool-stats">
+              <span>subs <b>3,165</b>/5,000</span>
+              <span>tps <b>5,108</b></span>
+              <span>uptime <b>03:42:08</b></span>
+            </div>
+            <div class="meter"><div class="meter-bar"><div class="meter-fill" style="width:63%"></div></div><div class="meter-pct">63%</div></div>
+          </div>
+          <div class="pool down">
+            <div class="pool-head">
+              <div class="pool-name">order-update-0</div>
+              <span class="t-badge b-down" style="font-size:10px;padding:2px 8px;border-radius:3px;font-weight:700;letter-spacing:.5px;">Down</span>
+            </div>
+            <div class="pool-stats">
+              <span>subs <b>--</b></span>
+              <span>tps <b>0</b></span>
+              <span>retry <b>0.8 s</b></span>
+            </div>
+            <div class="meter"><div class="meter-bar"><div class="meter-fill r" style="width:100%"></div></div><div class="meter-pct">--</div></div>
+          </div>
+        </div>
+      </div>
+      <div class="status-bar">
+        <div class="group">
+          <span class="tv-live-dot"></span>
+          <span>2,439 tests passing</span>
+          <span>· zero allocation on hot path</span>
+          <span>· <a>docs/flow-diagrams.md</a></span>
+        </div>
+        <div class="group">
+          <span class="clock">14:38:22 IST</span>
+          <span>· verified 2026-04-06</span>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- =========================================================
+       4. MARKETS
+       ========================================================= -->
+  <section class="section">
+    <h2>04 · Markets</h2>
+    <p class="sub">Pure-black (<code>#000</code>) dashboard — the only surface where we step off <code>#0d1117</code>. Left watchlist with 3 px colour bar; primary content is a right-aligned numeric table with sticky head. Active pill tab is green on green-wash with an 8 px radius.</p>
+    <div class="frame tight" style="border: 1px solid var(--tv-border-subtle);">
+      <div class="md">
+        <div class="md-layout">
+          <div class="watchlist tv-scroll">
+            <div class="wl-head">
+              <div class="title">Watchlist 1</div>
+              <div class="count">12 / 50</div>
+            </div>
+            <input class="wl-search" placeholder="🔎 Add symbol">
+            <div class="wl-item up">
+              <div class="wl-info"><div class="wl-name">Reliance</div><div class="wl-ex">NSE</div></div>
+              <div class="wl-price"><div class="wl-ltp">1,268.75</div><div class="wl-chg up">+1.78%</div></div>
+            </div>
+            <div class="wl-item down">
+              <div class="wl-info"><div class="wl-name">HDFC Bank</div><div class="wl-ex">NSE</div></div>
+              <div class="wl-price"><div class="wl-ltp">1,895.20</div><div class="wl-chg down">-0.44%</div></div>
+            </div>
+            <div class="wl-item up">
+              <div class="wl-info"><div class="wl-name">Tata Motors</div><div class="wl-ex">NSE</div></div>
+              <div class="wl-price"><div class="wl-ltp">652.30</div><div class="wl-chg up">+2.31%</div></div>
+            </div>
+            <div class="wl-item down">
+              <div class="wl-info"><div class="wl-name">Infosys</div><div class="wl-ex">NSE</div></div>
+              <div class="wl-price"><div class="wl-ltp">1,487.30</div><div class="wl-chg down">-0.12%</div></div>
+            </div>
+            <div class="wl-item up">
+              <div class="wl-info"><div class="wl-name">ICICI Bank</div><div class="wl-ex">NSE</div></div>
+              <div class="wl-price"><div class="wl-ltp">1,242.90</div><div class="wl-chg up">+0.88%</div></div>
+            </div>
+            <div class="wl-item down">
+              <div class="wl-info"><div class="wl-name">SBIN</div><div class="wl-ex">NSE</div></div>
+              <div class="wl-price"><div class="wl-ltp">812.40</div><div class="wl-chg down">-0.71%</div></div>
+            </div>
+            <div class="wl-item up">
+              <div class="wl-info"><div class="wl-name">Bharti Airtel</div><div class="wl-ex">NSE</div></div>
+              <div class="wl-price"><div class="wl-ltp">1,589.05</div><div class="wl-chg up">+1.12%</div></div>
+            </div>
+          </div>
+          <div class="md-main">
+            <div class="md-tabs">
+              <button class="p-tab">Live</button>
+              <button class="p-tab on">Stocks</button>
+              <button class="p-tab">Options</button>
+              <button class="p-tab">Futures</button>
+              <button class="p-tab">Indices</button>
+            </div>
+            <div class="md-sub-tabs">
+              <button class="s-tab on">Gainers</button>
+              <button class="s-tab">Losers</button>
+              <button class="s-tab">Most Active</button>
+              <button class="s-tab">52-wk High</button>
+            </div>
+            <div class="md-table-wrap tv-scroll">
+              <table class="md-table">
+                <thead>
+                  <tr>
+                    <th>Symbol</th>
+                    <th>LTP</th>
+                    <th>Chg</th>
+                    <th>Chg %</th>
+                    <th>Volume</th>
+                    <th>OI</th>
+                    <th>OI Chg%</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr><td>Reliance</td><td>1,268.75</td><td class="up">+22.15</td><td class="up">+1.78%</td><td>12,84,502</td><td>12.45L</td><td class="up">+3.12%</td></tr>
+                  <tr><td>Tata Motors</td><td>652.30</td><td class="up">+14.75</td><td class="up">+2.31%</td><td>18,02,187</td><td>8.74L</td><td class="up">+4.88%</td></tr>
+                  <tr><td>Bharti Airtel</td><td>1,589.05</td><td class="up">+17.60</td><td class="up">+1.12%</td><td>6,25,014</td><td>3.12L</td><td class="up">+0.94%</td></tr>
+                  <tr><td>ICICI Bank</td><td>1,242.90</td><td class="up">+10.85</td><td class="up">+0.88%</td><td>5,48,221</td><td>6.08L</td><td class="down">-0.22%</td></tr>
+                  <tr><td>Infosys</td><td>1,487.30</td><td class="down">-1.82</td><td class="down">-0.12%</td><td>4,12,998</td><td>6.74L</td><td class="up">+0.41%</td></tr>
+                  <tr><td>HDFC Bank</td><td>1,895.20</td><td class="down">-8.40</td><td class="down">-0.44%</td><td>7,31,502</td><td>8.12L</td><td class="down">-1.08%</td></tr>
+                  <tr><td>SBIN</td><td>812.40</td><td class="down">-5.80</td><td class="down">-0.71%</td><td>9,12,774</td><td>4.39L</td><td class="down">-0.56%</td></tr>
+                  <tr><td>TCS</td><td>3,542.00</td><td class="down">-15.60</td><td class="down">-0.44%</td><td>1,48,221</td><td>3.09L</td><td class="up">+0.17%</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- =========================================================
+       5. OPTION CHAIN
+       ========================================================= -->
+  <section class="section">
+    <h2>05 · Option Chain</h2>
+    <p class="sub">Mono-set dense table. Entire CE side gets a 6 %-green wash; PE side a 6 %-red wash. The ATM strike is highlighted with the 15 % blue-tint row. The strike column is centred and always reads full brightness.</p>
+    <div class="frame">
+      <div class="oc-frame">
+        <div class="oc-head">
+          <h3>NIFTY · 30-Apr-2026 · Spot 24,862.05</h3>
+          <div class="controls">
+            <select class="oc-select"><option>NIFTY</option></select>
+            <select class="oc-select"><option>30-Apr-2026</option></select>
+            <select class="oc-select"><option>All Strikes</option></select>
+          </div>
+        </div>
+        <table class="oc">
+          <thead>
+            <tr>
+              <th colspan="5" style="text-align:center;background:var(--tv-green-tint);color:var(--tv-green);">CE</th>
+              <th class="center strike">Strike</th>
+              <th colspan="5" style="text-align:center;background:var(--tv-red-tint);color:var(--tv-red);">PE</th>
+            </tr>
+            <tr>
+              <th>OI</th><th>OI Chg</th><th>IV</th><th>Vol</th><th>LTP</th>
+              <th class="strike center">—</th>
+              <th>LTP</th><th>Vol</th><th>IV</th><th>OI Chg</th><th>OI</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr class="ce"><td>24.8L</td><td class="up">+1.2L</td><td>12.14</td><td>84,210</td><td>372.15</td><td class="strike">24,700</td><td>28.40</td><td>1,24,058</td><td>11.92</td><td class="down">-0.6L</td><td>18.4L</td></tr>
+            <tr class="ce"><td>22.1L</td><td class="up">+2.4L</td><td>12.02</td><td>92,188</td><td>284.25</td><td class="strike">24,750</td><td>41.85</td><td>1,58,712</td><td>12.11</td><td class="up">+0.8L</td><td>21.2L</td></tr>
+            <tr class="ce"><td>18.7L</td><td class="up">+4.1L</td><td>11.88</td><td>1,42,014</td><td>208.60</td><td class="strike">24,800</td><td>62.40</td><td>1,92,408</td><td>12.24</td><td class="up">+1.4L</td><td>24.5L</td></tr>
+            <tr class="atm ce"><td>14.2L</td><td class="up">+6.8L</td><td>11.62</td><td>2,08,412</td><td>144.70</td><td class="strike">24,850</td><td>96.80</td><td>2,14,008</td><td>12.41</td><td class="up">+2.1L</td><td>26.8L</td></tr>
+            <tr class="pe"><td>11.8L</td><td class="down">-0.9L</td><td>11.48</td><td>1,78,208</td><td>99.40</td><td class="strike">24,900</td><td>148.25</td><td>1,82,004</td><td>12.62</td><td class="up">+1.8L</td><td>22.1L</td></tr>
+            <tr class="pe"><td>8.4L</td><td class="down">-2.1L</td><td>11.32</td><td>1,12,884</td><td>68.10</td><td class="strike">24,950</td><td>212.50</td><td>1,42,218</td><td>12.84</td><td class="up">+0.9L</td><td>18.2L</td></tr>
+            <tr class="pe"><td>5.9L</td><td class="down">-3.4L</td><td>11.18</td><td>82,114</td><td>44.25</td><td class="strike">25,000</td><td>284.40</td><td>1,02,884</td><td>13.08</td><td class="down">-0.4L</td><td>14.8L</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="status-bar">
+        <div class="group">
+          <span>PCR: <b style="color:var(--tv-text);">1.14</b></span>
+          <span>Max Pain: <b style="color:var(--tv-text);">24,850</b></span>
+          <span>Total CE OI: <b style="color:var(--tv-text);">105.9L</b></span>
+          <span>Total PE OI: <b style="color:var(--tv-text);">146.0L</b></span>
+        </div>
+        <div class="group">
+          <span class="clock">Auto-refresh 3 s · 14:38:22 IST</span>
+        </div>
+      </div>
+    </div>
+    <div class="doc-callout">
+      <b>Row wash</b> (6 % green/red) applies to the entire side, not individual cells. The <b>ATM row</b> overrides with 15 % blue-tint across both sides. The strike cell is always centred and always reads <code>--tv-text</code> brightness so the eye tracks the axis.
+    </div>
+  </section>
+
+  <!-- =========================================================
+       6. COMPOSITIONAL RULES
+       ========================================================= -->
+  <section class="section">
+    <h2>06 · Composition Rules</h2>
+    <p class="sub">A short recipe for building a new operator screen without drifting from the system.</p>
+    <div class="doc-callout">
+      <p style="margin:0 0 10px;"><b>Do</b></p>
+      <ul style="margin:0 0 12px 18px;padding:0;">
+        <li>Start from <code>#0d1117</code>. Only step to <code>#000</code> if the surface is explicitly "markets".</li>
+        <li>Right-align every number. First column is always left-aligned and brighter than the numerics.</li>
+        <li>Pair every status word with a colour (green/red/yellow) and, where live, a 2 s-pulse dot.</li>
+        <li>Use 14 px body, 11 px uppercase section headers with 2 px tracking. No headings above 28 px.</li>
+        <li>Use <code>--tv-shadow-hover</code> only on primary portal tiles, and only on hover.</li>
+      </ul>
+      <p style="margin:0 0 10px;"><b>Don't</b></p>
+      <ul style="margin:0 0 0 18px;padding:0;">
+        <li>Introduce a new gradient. The logo and avatar gradients are the only two in the system.</li>
+        <li>Use icon sets beyond the unicode glyphs + optional Lucide. Never mix sets.</li>
+        <li>Pad empty cells with placeholder prose — use <code>--</code> dashes.</li>
+        <li>Animate list entries, fade routes, or add backdrop-filter blurs. Utilitarian motion only.</li>
+        <li>Use warm tones (amber-brown, peach, pastel). The system reads cool-black-and-blue with semantic green/red accents.</li>
+      </ul>
+    </div>
+  </section>
+
+</div>
+</body>
+</html>
