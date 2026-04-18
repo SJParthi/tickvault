@@ -90,6 +90,8 @@ run_check "operator_health_dashboard_guard" \
     cargo test -p tickvault-storage --test operator_health_dashboard_guard
 run_check "resilience_sla_alert_guard" \
     cargo test -p tickvault-storage --test resilience_sla_alert_guard
+run_check "tickvault_logs_mcp_guard" \
+    cargo test -p tickvault-common --test tickvault_logs_mcp_guard
 
 echo ""
 echo "--- file-level invariants ---"
@@ -109,6 +111,10 @@ run_check "error-triage hook executable" \
     test -x .claude/hooks/error-triage.sh
 run_check "operator-health dashboard present" \
     test -f deploy/docker/grafana/dashboards/operator-health.json
+run_check "tickvault-logs MCP server present + executable" \
+    test -x scripts/mcp-servers/tickvault-logs/server.py
+run_check "tickvault-logs MCP self-test passes" \
+    python3 scripts/mcp-servers/tickvault-logs/server.py --self-test
 
 echo ""
 echo "--- source-code invariants ---"

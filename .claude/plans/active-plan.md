@@ -195,7 +195,7 @@ CloudWatch ──(5 alarms) ── SNS topic ───────────�
   - Prompt: "Read data/logs/errors.summary.md. For each row flagged 'ACTION_REQUIRED': investigate root cause, propose fix if tractable, open draft PR; otherwise ping operator with context."
   - Invoked via: `/loop 5m .claude/triage/claude-loop-prompt.md`
 
-- [ ] 7.2 MCP server for log access
+- [x] 7.2 MCP server for log access
   - File: `scripts/mcp-servers/tickvault-logs/server.py` (new)
   - Exposes: `tail_errors(signature, limit)`, `query_loki(logql)`, `query_cloudwatch(expression)`, `list_novel_signatures(since)`
   - Registered in `.mcp.json`
