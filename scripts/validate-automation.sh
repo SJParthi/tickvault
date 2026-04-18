@@ -98,6 +98,8 @@ run_check "loki_alloy_profile_guard" \
     cargo test -p tickvault-common --test loki_alloy_profile_guard
 run_check "runbook_cross_link_guard" \
     cargo test -p tickvault-common --test runbook_cross_link_guard
+run_check "recording_rules_guard" \
+    cargo test -p tickvault-common --test recording_rules_guard
 
 echo ""
 echo "--- file-level invariants ---"
