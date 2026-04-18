@@ -33,6 +33,11 @@ const REQUIRED_TOOL_NAMES: &[&str] = &[
     "prometheus_query",
     "find_runbook_for_code",
     "list_active_alerts",
+    // Phase 7.2 workspace-wide expansion — SQL / grep / doctor / git
+    "questdb_sql",
+    "grep_codebase",
+    "run_doctor",
+    "git_recent_log",
 ];
 
 fn workspace_root() -> PathBuf {
@@ -137,6 +142,10 @@ fn tickvault_logs_mcp_server_is_stdlib_only() {
         // Added for Phase 7.2 expansion (prometheus_query, list_active_alerts)
         "import urllib.parse",
         "import urllib.request",
+        // Phase 7.2 workspace-wide (grep_codebase, run_doctor, git_recent_log)
+        "import re",
+        "import fnmatch",
+        "import subprocess",
     ];
     for line in src.lines() {
         let trimmed = line.trim_start();

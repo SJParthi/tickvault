@@ -361,6 +361,192 @@ def tool_find_runbook_for_code(code: str) -> dict[str, Any]:
     }
 
 
+def tool_questdb_sql(query: str, base_url: str | None = None) -> dict[str, Any]:
+    """Run an arbitrary SQL query against QuestDB via the HTTP /exec
+    endpoint. Returns the columnar JSON response.
+
+    Gives Claude read/write access to the trading data plane — the
+    `ticks` table, `orders`, `historical_candles`, materialized views,
+    instrument snapshots, etc. — without needing the pg CLI.
+
+    WARNING: this tool can execute DDL (DROP TABLE etc.) on a live
+    QuestDB. The caller is responsible for query safety. In production,
+    consider wrapping with a read-only user.
+    """
+    import urllib.parse
+    import urllib.request
+
+    qdb = base_url or os.environ.get(
+        "TICKVAULT_QUESTDB_URL", "http://127.0.0.1:9000"
+    )
+    full = f"{qdb}/exec?query={urllib.parse.quote(query)}"
+    try:
+        with urllib.request.urlopen(full, timeout=15) as resp:  # noqa: S310
+            body = resp.read().decode("utf-8")
+        return {"ok": True, "query": query, "response": json.loads(body)}
+    except Exception as err:  # noqa: BLE001
+        return {"ok": False, "query": query, "error": str(err)}
+
+
+def tool_grep_codebase(
+    pattern: str,
+    path: str | None = None,
+    file_glob: str | None = None,
+    max_matches: int = 200,
+) -> dict[str, Any]:
+    """Regex-search the repo for `pattern`. Uses the stdlib `re` module
+    so no ripgrep dependency. Returns a list of {file, line, text}
+    matches.
+
+    Lets Claude find any function, error string, config key, or test
+    name across the workspace in one tool call.
+    """
+    import re
+
+    here = Path(__file__).resolve()
+    root = here.parent.parent.parent.parent
+    search_root = (root / path) if path else root
+
+    # Compile once
+    try:
+        regex = re.compile(pattern)
+    except re.error as err:
+        return {"ok": False, "pattern": pattern, "error": f"invalid regex: {err}"}
+
+    matches: list[dict[str, Any]] = []
+    skip_dirs = {"target", ".git", "node_modules", "data", ".terraform"}
+
+    for dirpath, dirnames, filenames in os.walk(search_root):
+        dirnames[:] = [d for d in dirnames if d not in skip_dirs]
+        for name in filenames:
+            if file_glob:
+                import fnmatch
+                if not fnmatch.fnmatch(name, file_glob):
+                    continue
+            full_path = Path(dirpath) / name
+            # Skip binaries + huge files
+            try:
+                if full_path.stat().st_size > 2_000_000:
+                    continue
+            except OSError:
+                continue
+            try:
+                with open(full_path, "r", encoding="utf-8", errors="ignore") as f:
+                    for idx, line in enumerate(f, 1):
+                        if regex.search(line):
+                            matches.append(
+                                {
+                                    "file": str(full_path.relative_to(root)),
+                                    "line": idx,
+                                    "text": line.rstrip("\n")[:500],
+                                }
+                            )
+                            if len(matches) >= max_matches:
+                                break
+            except OSError:
+                continue
+        if len(matches) >= max_matches:
+            break
+
+    return {
+        "ok": True,
+        "pattern": pattern,
+        "match_count": len(matches),
+        "truncated": len(matches) >= max_matches,
+        "matches": matches,
+    }
+
+
+def tool_run_doctor() -> dict[str, Any]:
+    """Run `bash scripts/doctor.sh` and return the parsed output as
+    JSON. Gives Claude a one-call total-system health check.
+
+    Runs with a 120s timeout. If doctor hangs (bug), this returns
+    {"ok": false, "error": "timeout"} instead of blocking Claude.
+    """
+    import subprocess
+
+    here = Path(__file__).resolve()
+    root = here.parent.parent.parent.parent
+    try:
+        out = subprocess.run(
+            ["bash", "scripts/doctor.sh"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": "doctor.sh timed out after 120s"}
+    except FileNotFoundError as err:
+        return {"ok": False, "error": f"bash not available: {err}"}
+
+    # Parse [PASS]/[FAIL]/[WARN]/[SKIP] lines into structured rows.
+    rows: list[dict[str, str]] = []
+    pass_count = 0
+    fail_count = 0
+    for line in out.stdout.splitlines():
+        line = line.rstrip()
+        for status in ("[PASS]", "[FAIL]", "[WARN]", "[SKIP]"):
+            if line.startswith(status):
+                rest = line[len(status):].strip()
+                rows.append({"status": status.strip("[]"), "detail": rest})
+                if status == "[PASS]":
+                    pass_count += 1
+                elif status == "[FAIL]":
+                    fail_count += 1
+                break
+
+    return {
+        "ok": out.returncode == 0,
+        "exit_code": out.returncode,
+        "pass_count": pass_count,
+        "fail_count": fail_count,
+        "rows": rows,
+        "raw_stdout_tail": out.stdout[-2000:] if out.stdout else "",
+    }
+
+
+def tool_git_recent_log(limit: int = 20) -> dict[str, Any]:
+    """Last `limit` commits on the current branch with subject +
+    author + ISO date. Lets Claude investigate "what changed recently"
+    without leaving the MCP surface.
+    """
+    import subprocess
+
+    here = Path(__file__).resolve()
+    root = here.parent.parent.parent.parent
+    fmt = "%H%x1f%an%x1f%aI%x1f%s"
+    try:
+        out = subprocess.run(
+            ["git", "log", f"-{int(limit)}", f"--pretty=format:{fmt}"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": "git log timed out"}
+    except FileNotFoundError:
+        return {"ok": False, "error": "git not available"}
+    if out.returncode != 0:
+        return {"ok": False, "error": out.stderr.strip()}
+    commits: list[dict[str, str]] = []
+    for line in out.stdout.splitlines():
+        parts = line.split("\x1f")
+        if len(parts) != 4:
+            continue
+        commits.append(
+            {
+                "sha": parts[0][:12],
+                "author": parts[1],
+                "date": parts[2],
+                "subject": parts[3],
+            }
+        )
+    return {"ok": True, "count": len(commits), "commits": commits}
+
+
 def tool_list_active_alerts(base_url: str | None = None) -> dict[str, Any]:
     """List every active (firing) Alertmanager alert. Gives Claude a
     live view of WHAT is currently broken without parsing
@@ -555,6 +741,88 @@ TOOLS: list[ToolSpec] = [
         ),
         input_schema={"type": "object", "properties": {}},
         handler=lambda _args: tool_list_active_alerts(),
+    ),
+    ToolSpec(
+        name="questdb_sql",
+        description=(
+            "Run arbitrary SQL against the local QuestDB (HTTP /exec). "
+            "Returns columnar JSON. Lets Claude query the trading data "
+            "plane — ticks, orders, historical_candles, materialized "
+            "views — without pg CLI."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "SQL query (e.g. 'SELECT count() FROM ticks')",
+                },
+            },
+            "required": ["query"],
+        },
+        handler=lambda args: tool_questdb_sql(query=args["query"]),
+    ),
+    ToolSpec(
+        name="grep_codebase",
+        description=(
+            "Regex-search the repo for a pattern. Skips target/, .git/, "
+            "node_modules/, data/, .terraform/. Returns up to 200 "
+            "matches of {file, line, text}. Lets Claude find any "
+            "function, error string, config key, test name across the "
+            "workspace in one call."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": "Python regex (anchors, character classes supported)",
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Optional relative path to narrow the search",
+                },
+                "file_glob": {
+                    "type": "string",
+                    "description": "Optional glob like '*.rs' to limit file types",
+                },
+            },
+            "required": ["pattern"],
+        },
+        handler=lambda args: tool_grep_codebase(
+            pattern=args["pattern"],
+            path=args.get("path"),
+            file_glob=args.get("file_glob"),
+        ),
+    ),
+    ToolSpec(
+        name="run_doctor",
+        description=(
+            "Invoke `bash scripts/doctor.sh` and return the parsed "
+            "output as {pass_count, fail_count, rows[{status, detail}]}. "
+            "One-call total-system health check for Claude."
+        ),
+        input_schema={"type": "object", "properties": {}},
+        handler=lambda _args: tool_run_doctor(),
+    ),
+    ToolSpec(
+        name="git_recent_log",
+        description=(
+            "Return the last N commits on the current branch with "
+            "sha/author/date/subject. Lets Claude investigate 'what "
+            "changed recently' without leaving the MCP surface."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "limit": {
+                    "type": "integer",
+                    "description": "Number of commits (default 20)",
+                    "default": 20,
+                },
+            },
+        },
+        handler=lambda args: tool_git_recent_log(limit=int(args.get("limit", 20))),
     ),
 ]
 
