@@ -88,6 +88,8 @@ run_check "observability_chain_e2e" \
     cargo test -p tickvault-app --test observability_chain_e2e
 run_check "operator_health_dashboard_guard" \
     cargo test -p tickvault-storage --test operator_health_dashboard_guard
+run_check "resilience_sla_alert_guard" \
+    cargo test -p tickvault-storage --test resilience_sla_alert_guard
 
 echo ""
 echo "--- file-level invariants ---"

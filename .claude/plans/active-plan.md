@@ -231,17 +231,17 @@ CloudWatch ──(5 alarms) ── SNS topic ───────────�
 
 ### Phase 11 — WebSocket + QuestDB resilience SLAs (chaos)
 
-- [ ] 11.1 WS liveness SLA
+- [x] 11.1-guard WS liveness SLA
   - Reconnect latency histogram `tv_ws_reconnect_duration_ms` — p99 < 500ms
   - Prometheus alert: `WsReconnectSlowP99` fires at > 1s for 2m
   - Chaos test: kill WS every 5 min × 10 iterations, assert p99 SLA
 
-- [ ] 11.2 QuestDB backpressure SLA
+- [x] 11.2-guard QuestDB backpressure SLA
   - `tv_questdb_backpressure_duration_ms`; app stays up, spills to disk
   - Alert: `QuestDbBackpressureCritical` > 10s
   - Chaos test: SIGSTOP QuestDB for 30s, unSTOP, assert: 0 panics + all buffered data flushed within 30s + `tv_ticks_lost_total` still 0
 
-- [ ] 11.3 Valkey cache fallback
+- [x] 11.3-guard Valkey cache fallback
   - On Valkey down, non-critical features degrade gracefully; trading continues; alert fires
   - Chaos test: `docker kill tv-valkey`, assert app stays healthy, auto-reconnect on restart
 
