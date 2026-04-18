@@ -401,3 +401,6 @@ triage-execute: ## Run the error-triage hook WITH auto-fix execution
 
 validate-automation: ## End-to-end validation of the zero-touch chain (20 checks)
 	@bash scripts/validate-automation.sh
+
+doctor: ## Total-system health check (one command — every section explicit pass/fail)
+	@bash scripts/doctor.sh
