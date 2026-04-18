@@ -95,3 +95,29 @@ fi
 echo "" >&2
 echo "Three principles: (1) Zero alloc hot path (2) O(1) or compile fail (3) All versions pinned" >&2
 echo "Current phase: docs/phases/phase-1-live-trading.md" >&2
+
+# AUTOMATION BRIEF — every session sees the zero-touch entry points
+echo "" >&2
+echo "ZERO-TOUCH AUTOMATION (use these BEFORE grepping or tailing logs):" >&2
+echo "  make doctor              # 7-section system health (docker + endpoints + logs)" >&2
+echo "  make validate-automation # 30 guard-suite checks (proves the chain is intact)" >&2
+echo "  make tail-errors         # live JSONL tail of structured ERROR events" >&2
+echo "  make errors-summary      # human-readable snapshot (refreshed every 60s by the app)" >&2
+echo "  make triage-dry-run      # what would auto-fix do? (inspect before execute)" >&2
+echo "  make triage-execute      # run the auto-fix against today's novel signatures" >&2
+echo "MCP live tools (auto-loaded via .mcp.json — 12 tools, prefix mcp__tickvault-logs__):" >&2
+echo "  tail_errors, list_novel_signatures, summary_snapshot, triage_log_tail," >&2
+echo "  signature_history, prometheus_query, find_runbook_for_code, list_active_alerts," >&2
+echo "  questdb_sql, grep_codebase, run_doctor, git_recent_log" >&2
+echo "Runbooks (for operator + any AI session): docs/runbooks/README.md (54-code index)" >&2
+echo "Architecture + guarantees: docs/architecture/{zero-touch-stack,guarantees,claude-cowork}.md" >&2
+
+# ERROR SUMMARY GLANCE — one-line answer to "anything broken?"
+SUMMARY_FILE="$CWD/data/logs/errors.summary.md"
+if [ -f "$SUMMARY_FILE" ]; then
+  TOTAL=$(grep -oE 'Total events: [0-9]+' "$SUMMARY_FILE" 2>/dev/null | head -1 | awk '{print $3}')
+  NOVEL=$(grep -oE 'Novel signatures: [0-9]+' "$SUMMARY_FILE" 2>/dev/null | head -1 | awk '{print $3}')
+  if [ -n "$TOTAL" ] || [ -n "$NOVEL" ]; then
+    echo "Error snapshot: total=${TOTAL:-?}  novel=${NOVEL:-?}  (open data/logs/errors.summary.md)" >&2
+  fi
+fi
