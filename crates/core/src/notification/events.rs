@@ -1497,6 +1497,22 @@ mod tests {
         assert_eq!(event.severity(), Severity::Low);
     }
 
+    #[test]
+    fn test_cross_match_skipped_weekend_reason_renders() {
+        // Regression: weekend / non-trading-day boot must emit the typed
+        // SKIPPED event so Telegram always shows closure for the
+        // post-fetch cross-match step.
+        let event = NotificationEvent::CandleCrossMatchSkipped {
+            reason: "weekend or holiday — not a trading day".to_string(),
+            candles_compared: 0,
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("SKIPPED"));
+        assert!(msg.contains("weekend or holiday"));
+        assert!(msg.contains("not a trading day"));
+        assert_eq!(event.severity(), Severity::Low);
+    }
+
     // -- Severity tests --
 
     #[test]

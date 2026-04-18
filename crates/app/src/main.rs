@@ -4085,6 +4085,9 @@ fn spawn_historical_candle_fetch(
             );
         } else {
             // Non-trading day: skip cross-match (no live data to compare).
+            // Emit the typed SKIPPED notification so the operator gets
+            // explicit closure on Telegram instead of silently missing
+            // the post-fetch cross-match step on weekends / holidays.
             info!(
                 instruments_fetched = summary.instruments_fetched,
                 instruments_failed = summary.instruments_failed,
@@ -4092,6 +4095,10 @@ fn spawn_historical_candle_fetch(
                 verification_passed = verify_report.passed,
                 "non-trading day historical fetch complete (cross-match skipped — no live data)"
             );
+            bg_notifier.notify(NotificationEvent::CandleCrossMatchSkipped {
+                reason: "weekend or holiday — not a trading day".to_string(),
+                candles_compared: 0,
+            });
         }
     });
 
