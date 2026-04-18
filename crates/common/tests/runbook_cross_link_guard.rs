@@ -136,6 +136,14 @@ fn extract_repo_paths(text: &str) -> Vec<String> {
                     cursor = absolute + prefix.len();
                     continue;
                 }
+                // Skip placeholder patterns like `YYYY-MM-DD-` or
+                // `<slug>` that appear in templates, not real paths.
+                // Heuristic: path ends with `-` (unfilled placeholder)
+                // OR contains obvious placeholder tokens.
+                if path_str.ends_with('-') || path_str.contains("YYYY") || path_str.contains("<") {
+                    cursor = absolute + prefix.len();
+                    continue;
+                }
                 // Skip trailing dot (sentence terminator) or comma.
                 let cleaned = path_str.trim_end_matches(['.', ',', ':', ';']);
                 if !cleaned.is_empty() {

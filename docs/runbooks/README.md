@@ -18,6 +18,9 @@ the remediation steps.
 | Zero-tick-loss chain | [zero-tick-loss.md](./zero-tick-loss.md) | TicksDropped, TickBuffer/DiskSpill active, BroadcastLagTickLoss |
 | WebSocket / Depth failures | [websocket-depth.md](./websocket-depth.md) | WS disconnects, DATA-804/805, Depth200ResetLoop |
 | OMS / Risk failures | [oms-risk.md](./oms-risk.md) | Circuit breaker, rate limiter, daily P&L, DH-904/905/906 |
+| Historical data | [historical-data.md](./historical-data.md) | Dhan historical fetch errors, cross-match gaps, DH-904 bursts |
+| Instrument master | [instrument-master.md](./instrument-master.md) | Universe rebuild, I-P1-11 collisions, DATA-813, InstrumentBuildFailed |
+| Postmortem template | [postmortem-template.md](./postmortem-template.md) | Copy for any high/critical-severity incident |
 | Dashboards map | [dashboards.md](./dashboards.md) | Morning-ops glance + drill-down navigation |
 
 ## Table — all 54 ErrorCode variants mapped to actions
