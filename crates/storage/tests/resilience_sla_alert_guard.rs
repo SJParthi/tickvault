@@ -46,12 +46,19 @@ fn load_alerts_yaml() -> String {
 /// Every required SLA alert name. Adding a new resilience alert?
 /// Add its name here so future edits can't silently remove it.
 const REQUIRED_ALERT_NAMES: &[&str] = &[
+    // Original 6 — WS / QuestDB / Valkey
     "WebSocketDisconnected",
     "HighWebSocketReconnectRate",
     "WebSocketBackpressure",
     "QuestDbDown",
     "ValkeyDown",
     "HighValkeyErrorRate",
+    // Defense-in-depth auth + IP + collision alerts (added 2026-04-18
+    // so these fire without needing the opt-in Loki profile)
+    "TokenRenewalFailureBurst",
+    "AuthCircuitBreakerOpen",
+    "IpMismatchDetected",
+    "InstrumentRegistryCollisionDrift",
 ];
 
 #[test]
