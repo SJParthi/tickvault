@@ -4045,8 +4045,9 @@ fn spawn_historical_candle_fetch(
                     candles_compared = cross_match.candles_compared,
                     "cross-match SKIPPED — no live data in materialized views (first run, fresh DB, or post-market boot)"
                 );
-                bg_notifier.notify(NotificationEvent::Custom {
-                    message: "Historical vs Live cross-match SKIPPED\nNo live data in materialized views (first run, fresh DB, or post-market boot). Will compare on next run after live ticks are collected during market hours.".to_string(),
+                bg_notifier.notify(NotificationEvent::CandleCrossMatchSkipped {
+                    reason: "no live data in materialized views".to_string(),
+                    candles_compared: cross_match.candles_compared,
                 });
             } else if cross_match.passed {
                 bg_notifier.notify(NotificationEvent::CandleCrossMatchPassed {

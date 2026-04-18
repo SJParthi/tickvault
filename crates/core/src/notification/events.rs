@@ -321,6 +321,18 @@ pub enum NotificationEvent {
         mismatch_details: Vec<String>,
     },
 
+    /// Historical vs Live candle cross-match skipped — no live data in
+    /// materialized views yet (first run, fresh DB, or post-market boot
+    /// before any live ticks have been collected during market hours).
+    CandleCrossMatchSkipped {
+        /// Human-readable reason for skipping (e.g. "no live data in materialized views").
+        reason: String,
+        /// LEFT JOIN row count from the cross-match query. Meaningless on its
+        /// own when no live data exists, but surfaced for diagnostic parity
+        /// with `CandleCrossMatchPassed`/`Failed`.
+        candles_compared: usize,
+    },
+
     /// Public IP verification failed — static IP mismatch or detection failure.
     IpVerificationFailed {
         /// Human-readable reason for the failure.
@@ -783,6 +795,14 @@ impl NotificationEvent {
                 }
                 msg
             }
+            Self::CandleCrossMatchSkipped {
+                reason,
+                candles_compared,
+            } => {
+                format!(
+                    "<b>Historical vs Live cross-match SKIPPED</b>\nReason: {reason}\n(first run, fresh DB, or post-market boot — no live ticks yet)\nLEFT JOIN rows: {candles_compared} (diagnostic only)\nWill compare on next run after live ticks during market hours."
+                )
+            }
             Self::IpVerificationFailed { reason } => {
                 format!(
                     "<b>IP VERIFICATION FAILED</b>\n{reason}\n\nBoot blocked — no Dhan API calls will be made."
@@ -896,6 +916,7 @@ impl NotificationEvent {
             Self::HistoricalFetchComplete { .. } => Severity::Low,
             Self::CandleVerificationPassed { .. } => Severity::Low,
             Self::CandleCrossMatchPassed { .. } => Severity::Low,
+            Self::CandleCrossMatchSkipped { .. } => Severity::Low,
             Self::Custom { .. } => Severity::High,
             Self::RiskHalt { .. } => Severity::Critical,
             Self::WebSocketReconnectionExhausted { .. } => Severity::Critical,
@@ -1439,6 +1460,39 @@ mod tests {
         let event = NotificationEvent::CandleCrossMatchPassed {
             timeframes_checked: 5,
             candles_compared: 187500,
+        };
+        assert_eq!(event.severity(), Severity::Low);
+    }
+
+    #[test]
+    fn test_cross_match_skipped_message() {
+        let event = NotificationEvent::CandleCrossMatchSkipped {
+            reason: "no live data in materialized views".to_string(),
+            candles_compared: 0,
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("cross-match SKIPPED"));
+        assert!(msg.contains("no live data"));
+        assert!(msg.contains("first run"));
+        assert!(msg.contains("Will compare on next run"));
+    }
+
+    #[test]
+    fn test_cross_match_skipped_shows_reason() {
+        let event = NotificationEvent::CandleCrossMatchSkipped {
+            reason: "fresh DB after migration".to_string(),
+            candles_compared: 348_968,
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("fresh DB after migration"));
+        assert!(msg.contains("348968"));
+    }
+
+    #[test]
+    fn test_cross_match_skipped_is_low() {
+        let event = NotificationEvent::CandleCrossMatchSkipped {
+            reason: "no live data".to_string(),
+            candles_compared: 0,
         };
         assert_eq!(event.severity(), Severity::Low);
     }
