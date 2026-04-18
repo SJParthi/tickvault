@@ -22,9 +22,6 @@ use tracing::info;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_opentelemetry::OpenTelemetryLayer;
-use tracing_subscriber::Layer;
-use tracing_subscriber::filter::LevelFilter;
-use tracing_subscriber::fmt::format::FmtSpan;
 
 use tickvault_common::config::ObservabilityConfig;
 
@@ -196,12 +193,9 @@ where
 /// tokio task that runs every hour and deletes files with mtime older than
 /// 48h). Keeping retention outside this function lets tests call
 /// `init_errors_jsonl_appender` without filesystem side effects.
-pub fn init_errors_jsonl_appender<S>(
+pub fn init_errors_jsonl_appender(
     dir: impl Into<PathBuf>,
-) -> Result<(impl Layer<S> + Send + Sync + 'static, WorkerGuard)>
-where
-    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
-{
+) -> Result<(tracing_appender::non_blocking::NonBlocking, WorkerGuard)> {
     let dir: PathBuf = dir.into();
     std::fs::create_dir_all(&dir).with_context(|| {
         format!(
@@ -213,21 +207,6 @@ where
     let appender = RollingFileAppender::new(Rotation::HOURLY, &dir, ERRORS_JSONL_PREFIX);
     let (non_blocking, guard) = tracing_appender::non_blocking(appender);
 
-    // Formatter: JSON, one event per line, includes span context.
-    // Filter: ERROR and above only — lower levels go to the main subscriber.
-    let layer = tracing_subscriber::fmt::layer()
-        .json()
-        .flatten_event(true)
-        .with_current_span(true)
-        .with_span_list(false)
-        .with_span_events(FmtSpan::NONE)
-        .with_target(true)
-        .with_file(true)
-        .with_line_number(true)
-        .with_thread_ids(true)
-        .with_writer(non_blocking)
-        .with_filter(LevelFilter::ERROR);
-
     info!(
         dir = %dir.display(),
         prefix = ERRORS_JSONL_PREFIX,
@@ -235,7 +214,7 @@ where
         "errors.jsonl appender initialized"
     );
 
-    Ok((layer, guard))
+    Ok((non_blocking, guard))
 }
 
 /// Deletes `errors.jsonl.*` files under `dir` whose mtime is older than
@@ -743,7 +722,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         assert!(!tmp.exists());
 
-        let result = init_errors_jsonl_appender::<tracing_subscriber::Registry>(&tmp);
+        let result = init_errors_jsonl_appender(&tmp);
         assert!(result.is_ok(), "appender init should succeed");
         assert!(tmp.exists(), "init must create the directory");
         assert!(tmp.is_dir());

@@ -437,13 +437,79 @@ async fn main() -> Result<()> {
             None => None,
         };
 
+    // Phase 2 of active-plan: ERROR-only JSONL stream at
+    // data/logs/errors.jsonl.YYYY-MM-DD-HH for Claude triage daemon,
+    // Loki/Alloy scraper, and the upcoming summary_writer. Hourly rotation,
+    // 48h retention enforced by the background sweeper below.
+    //
+    // The WorkerGuard MUST live for the whole process — it owns the
+    // non-blocking flush thread. Leaking into the static binds it to
+    // program lifetime without needing to thread it through shutdown.
+    let errors_jsonl_layer: Option<Box<dyn tracing_subscriber::Layer<_> + Send + Sync + 'static>> =
+        match observability::init_errors_jsonl_appender(observability::ERRORS_JSONL_DIR) {
+            Ok((writer, guard)) => {
+                use tracing_subscriber::Layer as _;
+                // Keep the worker guard alive for the process lifetime —
+                // dropping it stops the background flush thread.
+                Box::leak(Box::new(guard));
+                let layer = tracing_subscriber::fmt::layer()
+                    .json()
+                    .with_current_span(true)
+                    .with_span_list(false)
+                    .with_target(true)
+                    .with_file(true)
+                    .with_line_number(true)
+                    .with_thread_ids(true)
+                    .with_writer(writer)
+                    .with_filter(tracing_subscriber::filter::LevelFilter::ERROR);
+                Some(Box::new(layer))
+            }
+            Err(err) => {
+                // Never block boot on an ancillary logging target.
+                tracing::warn!(
+                    ?err,
+                    "errors.jsonl appender init failed — continuing without structured ERROR stream"
+                );
+                None
+            }
+        };
+
     tracing_subscriber::registry()
         .with(env_filter)
         .with(fmt_boxed)
         .with(file_log_layer)
         .with(error_log_layer)
+        .with(errors_jsonl_layer)
         .with(otel_layer)
         .init();
+
+    // Phase 2: hourly retention sweeper for errors.jsonl. Keeps ~48h of
+    // rotated files on disk (~= 500KB at ERROR-only volume). Runs as a
+    // best-effort background task — failures log at WARN, never halt.
+    tokio::spawn(async {
+        use std::path::Path;
+        use std::time::Duration;
+        const SWEEP_INTERVAL_SECS: u64 = 3600;
+        const RETENTION_HOURS: u64 = 48;
+        let dir = Path::new(observability::ERRORS_JSONL_DIR);
+        loop {
+            tokio::time::sleep(Duration::from_secs(SWEEP_INTERVAL_SECS)).await;
+            match observability::sweep_errors_jsonl_retention(dir, RETENTION_HOURS) {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(
+                    deleted = n,
+                    dir = %dir.display(),
+                    retention_hours = RETENTION_HOURS,
+                    "errors.jsonl retention sweep"
+                ),
+                Err(err) => tracing::warn!(
+                    ?err,
+                    dir = %dir.display(),
+                    "errors.jsonl retention sweep failed"
+                ),
+            }
+        }
+    });
 
     // Install panic hook: log at ERROR level (triggers Telegram via Loki → Grafana alerting).
     let default_panic_hook = std::panic::take_hook();
