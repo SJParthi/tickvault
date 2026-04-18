@@ -390,6 +390,50 @@ fn atomic_write(path: &Path, contents: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn test_spawn_summary_writer_produces_output_file() {
+        let tmp = std::env::temp_dir().join(format!(
+            "tv-spawn-smoke-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap_or_else(|e| panic!("mkdir: {e}"));
+
+        let cfg = SummaryWriterConfig {
+            errors_dir: tmp.clone(),
+            refresh_interval: Duration::from_millis(50),
+            lookback_minutes: DEFAULT_LOOKBACK_MINUTES,
+            top_signatures: DEFAULT_TOP_SIGNATURES,
+        };
+        let handle = spawn(cfg);
+
+        // Wait long enough for at least one refresh tick.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Summary file should now exist — spawn drove regenerate_summary
+        // at least once via the interval tick.
+        let summary_path = tmp.join(SUMMARY_FILENAME);
+        assert!(
+            summary_path.exists(),
+            "spawn() should have produced {} within 200ms",
+            summary_path.display()
+        );
+        // Content should include either the empty marker or a populated
+        // table — both indicate the writer ran.
+        let body = fs::read_to_string(&summary_path).unwrap_or_default();
+        assert!(
+            !body.is_empty(),
+            "summary file produced by spawn() must not be empty"
+        );
+
+        handle.abort();
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
     #[test]
     fn constants_are_stable() {
         assert_eq!(SUMMARY_FILENAME, "errors.summary.md");
