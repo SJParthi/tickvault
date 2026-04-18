@@ -2293,6 +2293,9 @@ mod tests {
 
     #[test]
     fn test_recover_stale_candle_spill_file_on_startup() {
+        let _guard = crate::spill_dir_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Create a fake stale spill file with known candles, call recover,
         // verify count returned matches candles written.
         let real_spill_dir = std::path::Path::new(CANDLE_SPILL_DIR);
@@ -2822,6 +2825,9 @@ mod tests {
 
     #[test]
     fn test_candle_recover_stale_files() {
+        let _guard = crate::spill_dir_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Create fake stale spill files with known candles, call recover,
         // verify count matches total candles written across all files.
         let real_spill_dir = std::path::Path::new(CANDLE_SPILL_DIR);
@@ -2907,6 +2913,9 @@ mod tests {
 
     #[test]
     fn test_recover_candle_skips_current_active_spill() {
+        let _guard = crate::spill_dir_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Set spill_path to today's file, create that file plus an older one.
         // Verify the active file is NOT drained but the older one IS.
         let real_spill_dir = std::path::Path::new(CANDLE_SPILL_DIR);
@@ -3689,6 +3698,11 @@ mod tests {
 
     #[test]
     fn test_live_candle_recover_stale_spill_files() {
+        // Serialize with other tests that touch the global spill dir so
+        // parallel cargo test runs don't race on filesystem state.
+        let _guard = crate::spill_dir_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let port = spawn_tcp_drain_server();
         let config = QuestDbConfig {
             host: "127.0.0.1".to_string(),
@@ -3759,6 +3773,9 @@ mod tests {
 
     #[test]
     fn test_live_candle_recover_no_spill_dir() {
+        let _guard = crate::spill_dir_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let port = spawn_tcp_drain_server();
         let config = QuestDbConfig {
             host: "127.0.0.1".to_string(),
@@ -3778,6 +3795,9 @@ mod tests {
 
     #[test]
     fn test_live_candle_recover_when_disconnected() {
+        let _guard = crate::spill_dir_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let config = QuestDbConfig {
             host: "127.0.0.1".to_string(),
             ilp_port: 1,
@@ -4424,6 +4444,9 @@ mod tests {
 
     #[test]
     fn test_live_candle_recover_stale_spill_files_full_path() {
+        let _guard = crate::spill_dir_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let port = spawn_tcp_drain_server();
         let config = QuestDbConfig {
             host: "127.0.0.1".to_string(),
@@ -4468,6 +4491,9 @@ mod tests {
 
     #[test]
     fn test_live_candle_recover_skips_active_spill() {
+        let _guard = crate::spill_dir_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let port = spawn_tcp_drain_server();
         let config = QuestDbConfig {
             host: "127.0.0.1".to_string(),
@@ -5442,6 +5468,9 @@ mod tests {
 
     #[test]
     fn test_recover_stale_candle_spill_when_disconnected() {
+        let _guard = crate::spill_dir_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Exercise line 705: sender is None → early return 0
         let config = QuestDbConfig {
             host: "127.0.0.1".to_string(),
@@ -5458,6 +5487,9 @@ mod tests {
 
     #[test]
     fn test_recover_stale_candle_spill_nonexistent_dir() {
+        let _guard = crate::spill_dir_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Exercise lines 708-710: spill dir doesn't exist (NotFound) → return 0
         let port = spawn_tcp_drain_server();
         let config = QuestDbConfig {
@@ -5476,6 +5508,9 @@ mod tests {
 
     #[test]
     fn test_recover_candle_active_spill_skipped_in_stale_recovery() {
+        let _guard = crate::spill_dir_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Exercise line 721-722: active spill file is skipped during recovery.
         let port = spawn_tcp_drain_server();
         let config = QuestDbConfig {
@@ -6070,6 +6105,9 @@ mod tests {
 
     #[test]
     fn test_recover_stale_candle_spill_files_no_sender() {
+        let _guard = crate::spill_dir_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Exercise line 705: sender is None → return 0 immediately
         let config = QuestDbConfig {
             host: "127.0.0.1".to_string(),
@@ -6086,6 +6124,9 @@ mod tests {
 
     #[test]
     fn test_recover_stale_candle_spill_files_no_directory() {
+        let _guard = crate::spill_dir_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Exercise lines 708-710: spill directory does not exist
         let port = spawn_tcp_drain_server();
         let config = QuestDbConfig {
@@ -6105,6 +6146,9 @@ mod tests {
 
     #[test]
     fn test_recover_stale_candle_spill_files_with_valid_file() {
+        let _guard = crate::spill_dir_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Exercise lines 735, 741, 745, 752: full stale spill recovery
         let port = spawn_tcp_drain_server();
         let config = QuestDbConfig {
@@ -6160,6 +6204,9 @@ mod tests {
 
     #[test]
     fn test_recover_stale_candle_spill_files_corrupt_file() {
+        let _guard = crate::spill_dir_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Exercise line 735: read error on corrupt stale spill file
         let port = spawn_tcp_drain_server();
         let config = QuestDbConfig {
@@ -6422,6 +6469,9 @@ mod tests {
 
     #[test]
     fn test_cov_drain_candle_disk_spill_bufwriter_flush_error() {
+        let _guard = crate::spill_dir_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let port = spawn_tcp_drain_server();
         let config = QuestDbConfig {
             host: "127.0.0.1".to_string(),
@@ -6458,6 +6508,9 @@ mod tests {
 
     #[test]
     fn test_cov_drain_candle_disk_spill_read_error() {
+        let _guard = crate::spill_dir_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let port = spawn_tcp_drain_server();
         let config = QuestDbConfig {
             host: "127.0.0.1".to_string(),
@@ -6487,6 +6540,9 @@ mod tests {
 
     #[test]
     fn test_cov_drain_candle_disk_spill_build_error() {
+        let _guard = crate::spill_dir_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let port = spawn_tcp_drain_server();
         let config = QuestDbConfig {
             host: "127.0.0.1".to_string(),
@@ -6520,6 +6576,9 @@ mod tests {
 
     #[test]
     fn test_cov_drain_candle_disk_spill_flush_failure() {
+        let _guard = crate::spill_dir_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let Some(mut writer) = make_broken_candle_writer() else {
             return;
         };
@@ -6549,6 +6608,9 @@ mod tests {
 
     #[test]
     fn test_cov_recover_stale_candle_spill_dir_read_error() {
+        let _guard = crate::spill_dir_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let port = spawn_tcp_drain_server();
         let config = QuestDbConfig {
             host: "127.0.0.1".to_string(),
@@ -6569,6 +6631,9 @@ mod tests {
 
     #[test]
     fn test_cov_recover_stale_candle_spill_read_error() {
+        let _guard = crate::spill_dir_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let port = spawn_tcp_drain_server();
         let config = QuestDbConfig {
             host: "127.0.0.1".to_string(),
@@ -6594,6 +6659,9 @@ mod tests {
 
     #[test]
     fn test_cov_recover_stale_candle_spill_flush_failure() {
+        let _guard = crate::spill_dir_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let Some(mut writer) = make_broken_candle_writer() else {
             return;
         };
