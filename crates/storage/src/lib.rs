@@ -41,6 +41,29 @@ pub mod tick_persistence_testing {
     }
 }
 
+/// Shared process-wide mutex for tests that touch the real global
+/// `data/spill/` directory (TICK_SPILL_DIR / CANDLE_SPILL_DIR).
+///
+/// The two recovery tests
+///   - `tick_persistence::tests::test_recover_skips_current_active_spill`
+///   - `candle_persistence::tests::test_live_candle_recover_stale_spill_files`
+/// both call `recover_stale_spill_files()`, which drains EVERY matching
+/// `{ticks,candles}-*.bin` file under the global spill directory. When
+/// cargo runs these tests in parallel inside the same binary, they race
+/// on filesystem state: one test drains the other test's artefacts
+/// before the assertion runs, causing flaky CI failures under
+/// `cargo test --workspace`.
+///
+/// Any test that creates files under `data/spill/` MUST acquire this
+/// lock first. Holding it for the duration of the test serializes
+/// access without needing a new dev-dep.
+#[cfg(test)]
+pub(crate) fn spill_dir_test_lock() -> &'static std::sync::Mutex<()> {
+    use std::sync::{Mutex, OnceLock};
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
