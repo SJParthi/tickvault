@@ -1,0 +1,210 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "Depth subscription flow — 20-level (49 instruments per NIFTY/BANKNIFTY/FINNIFTY/MIDCPNIFTY) and 200-level (ATM CE + PE for NIFTY/BANKNIFTY only). Red panels indicate depth connection failures, rebalancer stalls, or dropped frames. Runbook: .claude/rules/project/depth-subscription.md.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "uid": "tv-depth-flow",
+  "title": "tickvault — Depth Flow",
+  "tags": ["tickvault", "depth", "websocket"],
+  "timezone": "Asia/Kolkata",
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "time": { "from": "now-1h", "to": "now" },
+  "panels": [
+    {
+      "type": "text",
+      "id": 100,
+      "gridPos": { "h": 3, "w": 24, "x": 0, "y": 0 },
+      "options": {
+        "mode": "markdown",
+        "content": "## Depth Flow — 20-level + 200-level\n\nDepth connections are pool-independent from main feed (separate 5-connection cap per Dhan). 20-level = 49 instruments per underlying (ATM ± 24 strikes). 200-level = ATM CE + ATM PE for NIFTY and BANKNIFTY only. Rebalancer runs every 60s on spot drift. **All panels must be green during market hours (09:15-15:30 IST).**"
+      }
+    },
+    {
+      "type": "row",
+      "id": 110,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 3 },
+      "title": "Connections",
+      "collapsed": false
+    },
+    {
+      "type": "stat",
+      "id": 1,
+      "title": "Depth-20 connections active",
+      "description": "Target: 4/4 (NIFTY / BANKNIFTY / FINNIFTY / MIDCPNIFTY).",
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "tv_depth_20_connections_active", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "unit": "none",
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red" }, { "color": "orange", "value": 1 }, { "color": "green", "value": 4 }] }
+        }
+      },
+      "options": { "colorMode": "background_solid", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "type": "stat",
+      "id": 2,
+      "title": "Depth-200 connections active",
+      "description": "Target: 4/4 (NIFTY CE + PE, BANKNIFTY CE + PE).",
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "tv_depth_200_connections_active", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "unit": "none",
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red" }, { "color": "orange", "value": 1 }, { "color": "green", "value": 4 }] }
+        }
+      },
+      "options": { "colorMode": "background_solid", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "type": "stat",
+      "id": 3,
+      "title": "Depth reconnects (last 1h)",
+      "description": "High values = depth socket instability. Runbook: scripts/auto-fix-restart-depth.sh",
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "increase(tv_depth_reconnects_total[1h])", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "unit": "none",
+          "decimals": 0,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green" }, { "color": "orange", "value": 5 }, { "color": "red", "value": 20 }] }
+        }
+      },
+      "options": { "colorMode": "background_solid", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "type": "stat",
+      "id": 4,
+      "title": "Depth frames dropped",
+      "description": "Dropped depth frames indicate backpressure in the depth pipeline.",
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "tv_deep_depth_dropped_total", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "unit": "none",
+          "decimals": 0,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green" }, { "color": "red", "value": 1 }] }
+        }
+      },
+      "options": { "colorMode": "background_solid", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "type": "row",
+      "id": 120,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 9 },
+      "title": "Rebalancer",
+      "collapsed": false
+    },
+    {
+      "type": "stat",
+      "id": 5,
+      "title": "Depth rebalancer ticks / min",
+      "description": "Rebalancer checks spot drift every 60s. Target: ~1/min steady state.",
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 10 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "rate(tv_depth_rebalancer_ticks_total[5m]) * 60", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "unit": "none",
+          "decimals": 1,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red" }, { "color": "orange", "value": 0.5 }, { "color": "green", "value": 0.8 }] }
+        }
+      },
+      "options": { "colorMode": "background_solid", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "type": "stat",
+      "id": 6,
+      "title": "Stale spot detections",
+      "description": "Rising edge = spot LTP hasn't updated in 5+ min. Critical during market hours.",
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 10 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "tv_depth_stale_spot_total", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "unit": "none",
+          "decimals": 0,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green" }, { "color": "red", "value": 1 }] }
+        }
+      },
+      "options": { "colorMode": "background_solid", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "type": "stat",
+      "id": 7,
+      "title": "ATM swaps (last 1h)",
+      "description": "Number of ATM rebalance events. Normal: 0-5 during a trending session.",
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 10 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "increase(tv_depth_atm_swaps_total[1h])", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "unit": "none",
+          "decimals": 0,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green" }, { "color": "orange", "value": 20 }] }
+        }
+      },
+      "options": { "colorMode": "background_solid", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "type": "stat",
+      "id": 8,
+      "title": "Depth WAL spilled",
+      "description": "Depth WAL spill count. Non-zero = Alloy/QuestDB backpressure; spill-to-disk catches it.",
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 10 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "tv_depth_spilled_total", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "unit": "none",
+          "decimals": 0,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green" }, { "color": "orange", "value": 1 }] }
+        }
+      },
+      "options": { "colorMode": "background_solid", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    }
+  ]
+}

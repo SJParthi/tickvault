@@ -1592,12 +1592,14 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
     if let Some(ref mut writer) = stock_movers_writer
         && let Err(err) = writer.flush()
     {
-        warn!(?err, "stock movers flush on shutdown failed");
+        // Phase 0 / Rule 5: flush failures are ERROR (route to Telegram).
+        error!(?err, "stock movers flush on shutdown failed");
     }
     if let Some(ref mut writer) = option_movers_writer
         && let Err(err) = writer.flush()
     {
-        warn!(?err, "option movers flush on shutdown failed");
+        // Phase 0 / Rule 5: flush failures are ERROR (route to Telegram).
+        error!(?err, "option movers flush on shutdown failed");
     }
 
     // Log final top movers state

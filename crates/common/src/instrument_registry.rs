@@ -207,6 +207,8 @@ impl InstrumentRegistry {
             {
                 cross_segment_collisions = cross_segment_collisions.saturating_add(1);
                 tracing::error!(
+                    code = crate::error_code::ErrorCode::InstrumentP1CrossSegmentCollision.code_str(),
+                    severity = crate::error_code::ErrorCode::InstrumentP1CrossSegmentCollision.severity().as_str(),
                     security_id = instrument.security_id,
                     prev_segment = ?prev.exchange_segment,
                     new_segment = ?instrument.exchange_segment,

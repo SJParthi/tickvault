@@ -199,7 +199,16 @@ impl TokenManager {
 
                     // Permanent errors — fail fast with clear notification.
                     if is_permanent_auth_error(&reason) {
-                        error!(attempt, error = %reason, "permanent auth error — cannot retry");
+                        // DH-901: credentials/account-level rejection; no retry.
+                        error!(
+                            code = tickvault_common::error_code::ErrorCode::Dh901InvalidAuth.code_str(),
+                            severity = tickvault_common::error_code::ErrorCode::Dh901InvalidAuth
+                                .severity()
+                                .as_str(),
+                            attempt,
+                            error = %reason,
+                            "DH-901: permanent auth error — cannot retry"
+                        );
                         notifier.notify(NotificationEvent::AuthenticationFailed {
                             reason: format!("PERMANENT: {reason} — check SSM credentials"),
                         });
@@ -378,7 +387,15 @@ impl TokenManager {
             warn!("deferred auth: cached client_id mismatch — re-authenticating");
             token_cache::delete_cache_file();
             manager.acquire_token().await.map_err(|err| {
-                error!(error = %err, "deferred auth: re-authentication failed");
+                // AUTH-GAP-01: deferred re-auth path failed.
+                error!(
+                    code = tickvault_common::error_code::ErrorCode::AuthGapTokenExpiry.code_str(),
+                    severity = tickvault_common::error_code::ErrorCode::AuthGapTokenExpiry
+                        .severity()
+                        .as_str(),
+                    error = %err,
+                    "AUTH-GAP-01: deferred auth — re-authentication failed"
+                );
                 err
             })?;
             info!(
@@ -489,9 +506,14 @@ impl TokenManager {
 
         // Check 1: data plan must be Active
         if profile.data_plan != "Active" {
+            // DATA-806: data plan missing; trading cannot start.
             error!(
+                code = tickvault_common::error_code::ErrorCode::Data806NotSubscribed.code_str(),
+                severity = tickvault_common::error_code::ErrorCode::Data806NotSubscribed
+                    .severity()
+                    .as_str(),
                 data_plan = %profile.data_plan,
-                "pre-market check FAILED: data plan is not Active"
+                "DATA-806: pre-market check FAILED — data plan is not Active"
             );
             return Err(ApplicationError::AuthenticationFailed {
                 reason: format!(
@@ -507,9 +529,14 @@ impl TokenManager {
         let has_derivative =
             profile.active_segment.contains("Derivative") || profile.active_segment.contains("D");
         if !has_derivative {
+            // DATA-806: Derivative segment not active on this Dhan plan.
             error!(
+                code = tickvault_common::error_code::ErrorCode::Data806NotSubscribed.code_str(),
+                severity = tickvault_common::error_code::ErrorCode::Data806NotSubscribed
+                    .severity()
+                    .as_str(),
                 active_segment = %profile.active_segment,
-                "pre-market check FAILED: Derivative segment not active"
+                "DATA-806: pre-market check FAILED — Derivative segment not active"
             );
             return Err(ApplicationError::AuthenticationFailed {
                 reason: format!(

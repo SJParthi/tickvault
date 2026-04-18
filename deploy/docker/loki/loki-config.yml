@@ -1,11 +1,15 @@
 # =============================================================================
 # tickvault — Loki Configuration (single-node, dev mode)
 # =============================================================================
+# Phase 3 of active-plan.md. Re-added under `profile: logs` in docker-compose
+# so it only starts when the operator explicitly opts in via
+# `docker-compose --profile logs up -d`. Default stack is unaffected.
 
 auth_enabled: false
 
 server:
   http_listen_port: 3100
+  grpc_listen_port: 9096
 
 common:
   path_prefix: /loki
@@ -17,6 +21,7 @@ common:
   ring:
     kvstore:
       store: inmemory
+  instance_addr: 127.0.0.1
 
 schema_config:
   configs:
@@ -42,3 +47,19 @@ compactor:
   retention_delete_delay: 2h
   retention_delete_worker_count: 150
   delete_request_store: filesystem
+
+# Log-pattern alert rules — Phase 3.2. Fire when error signatures spike,
+# when a novel signature appears, or when flush errors storm. Routes
+# through Alertmanager -> existing NotificationService webhook so the
+# zero-touch chain works end-to-end.
+ruler:
+  storage:
+    type: local
+    local:
+      directory: /loki/rules
+  rule_path: /loki/rules-tmp
+  alertmanager_url: http://tv-alertmanager:9093
+  ring:
+    kvstore:
+      store: inmemory
+  enable_api: true

@@ -69,7 +69,13 @@ pub fn reconcile_orders(
                         > f64::EPSILON;
 
                 if status_mismatch {
+                    // OMS-GAP-02: order book divergence between local + Dhan.
                     error!(
+                        code = tickvault_common::error_code::ErrorCode::OmsGapReconciliation
+                            .code_str(),
+                        severity = tickvault_common::error_code::ErrorCode::OmsGapReconciliation
+                            .severity()
+                            .as_str(),
                         order_id = %dhan_order.order_id,
                         oms_status = %oms_order.status.as_str(),
                         dhan_status = %dhan_status.as_str(),
@@ -120,11 +126,16 @@ pub fn reconcile_orders(
     }
 
     if report.mismatches_found > 0 || report.missing_from_dhan > 0 {
+        // OMS-GAP-02: reconciliation pass uncovered divergence(s).
         error!(
+            code = tickvault_common::error_code::ErrorCode::OmsGapReconciliation.code_str(),
+            severity = tickvault_common::error_code::ErrorCode::OmsGapReconciliation
+                .severity()
+                .as_str(),
             mismatches = report.mismatches_found,
             missing_from_dhan = report.missing_from_dhan,
             total_checked = report.total_checked,
-            "RECONCILIATION COMPLETE — issues found (see above for details)"
+            "OMS-GAP-02: RECONCILIATION COMPLETE — issues found (see above for details)"
         );
     } else {
         info!(

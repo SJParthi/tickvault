@@ -1,0 +1,303 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "End-to-end trading flow — order placement, fills, rejections, risk checks, P&L. Fourth operator dashboard. Focus: live OMS state + risk engine + pipeline lag. Runbook: .claude/rules/dhan/orders.md + .claude/rules/project/gap-enforcement.md",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "uid": "tv-trading-flow",
+  "title": "tickvault — Trading Flow",
+  "tags": ["tickvault", "trading", "oms", "risk"],
+  "timezone": "Asia/Kolkata",
+  "refresh": "15s",
+  "schemaVersion": 39,
+  "time": { "from": "now-1h", "to": "now" },
+  "panels": [
+    {
+      "type": "text",
+      "id": 100,
+      "gridPos": { "h": 3, "w": 24, "x": 0, "y": 0 },
+      "options": {
+        "mode": "markdown",
+        "content": "## Trading Flow — OMS + Risk + Pipeline\n\nEnd-to-end order → fill visibility. SEBI rate limit: 10 orders/sec. Daily loss auto-halt wired to risk engine. Circuit breaker opens after 3 consecutive failures. All P&L figures in INR. **Dry-run mode is default** — if `orders placed > 0` during a dry-run session, investigate immediately."
+      }
+    },
+    {
+      "type": "row",
+      "id": 110,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 3 },
+      "title": "Orders",
+      "collapsed": false
+    },
+    {
+      "type": "stat",
+      "id": 1,
+      "title": "Orders placed (1h)",
+      "description": "Real-mode orders sent to Dhan. Dry-run mode emits synthetic PAPER-N IDs that don't count here.",
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "increase(tv_orders_placed_total[1h])", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "unit": "none",
+          "decimals": 0,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green" }, { "color": "orange", "value": 100 }] }
+        }
+      },
+      "options": { "colorMode": "background_solid", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "type": "stat",
+      "id": 2,
+      "title": "Orders filled (1h)",
+      "description": "Orders that reached TRADED state.",
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "increase(tv_orders_filled_total[1h])", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "unit": "none",
+          "decimals": 0,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green" }] }
+        }
+      },
+      "options": { "colorMode": "background_solid", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "type": "stat",
+      "id": 3,
+      "title": "Orders rejected (1h)",
+      "description": "Rejections >5% of placed = systemic issue. DH-905/906 typically means bad request payload.",
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "increase(tv_orders_rejected_total[1h])", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "unit": "none",
+          "decimals": 0,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green" }, { "color": "orange", "value": 5 }, { "color": "red", "value": 20 }] }
+        }
+      },
+      "options": { "colorMode": "background_solid", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "type": "stat",
+      "id": 4,
+      "title": "Order latency p99 (ms)",
+      "description": "Round-trip to Dhan. >500ms = DH-908 or network issue. Sustained >1s = trading stall risk.",
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "histogram_quantile(0.99, rate(tv_order_placement_duration_ns_bucket[5m])) / 1e6", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "unit": "ms",
+          "decimals": 1,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green" }, { "color": "orange", "value": 500 }, { "color": "red", "value": 1000 }] }
+        }
+      },
+      "options": { "colorMode": "background_solid", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "type": "row",
+      "id": 120,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 9 },
+      "title": "Risk & P&L",
+      "collapsed": false
+    },
+    {
+      "type": "stat",
+      "id": 5,
+      "title": "Realized P&L (today)",
+      "description": "Booked P&L for the current trading session in INR.",
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 10 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "tv_realized_pnl", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "unit": "currencyINR",
+          "decimals": 0,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red" }, { "color": "orange", "value": -10000 }, { "color": "green", "value": 0 }] }
+        }
+      },
+      "options": { "colorMode": "background_solid", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "type": "stat",
+      "id": 6,
+      "title": "Unrealized P&L",
+      "description": "Mark-to-market P&L for open positions.",
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 10 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "tv_unrealized_pnl", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "unit": "currencyINR",
+          "decimals": 0,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red" }, { "color": "orange", "value": -5000 }, { "color": "green", "value": 0 }] }
+        }
+      },
+      "options": { "colorMode": "background_solid", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "type": "stat",
+      "id": 7,
+      "title": "Risk halted?",
+      "description": "Risk engine auto-halt. Non-zero = daily-loss threshold hit.",
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 10 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "tv_risk_halted", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [
+            { "options": { "0": { "color": "green", "text": "OK" } }, "type": "value" },
+            { "options": { "1": { "color": "red", "text": "HALTED" } }, "type": "value" }
+          ],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green" }, { "color": "red", "value": 1 }] }
+        }
+      },
+      "options": { "colorMode": "background_solid", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "type": "stat",
+      "id": 8,
+      "title": "Rate limiter denies (5m)",
+      "description": "SEBI 10/sec cap hit. Non-zero = regulatory compliance risk.",
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 10 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "increase(tv_rate_limiter_denied_total[5m])", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "unit": "none",
+          "decimals": 0,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green" }, { "color": "red", "value": 1 }] }
+        }
+      },
+      "options": { "colorMode": "background_solid", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "type": "row",
+      "id": 130,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 15 },
+      "title": "Pipeline health",
+      "collapsed": false
+    },
+    {
+      "type": "stat",
+      "id": 9,
+      "title": "Strategy evaluations / min",
+      "description": "FSM strategy evaluator tick rate. 0 during market hours = strategy stalled.",
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "rate(tv_strategy_evaluations_total[1m]) * 60", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "unit": "none",
+          "decimals": 0,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red" }, { "color": "green", "value": 1 }] }
+        }
+      },
+      "options": { "colorMode": "background_solid", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "type": "stat",
+      "id": 10,
+      "title": "Pipeline lagged (5m)",
+      "description": "Trading pipeline consumer lagged events. Non-zero = backpressure in signal flow.",
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "increase(tv_trading_pipeline_ticks_lagged_total[5m])", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "unit": "none",
+          "decimals": 0,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green" }, { "color": "orange", "value": 100 }, { "color": "red", "value": 1000 }] }
+        }
+      },
+      "options": { "colorMode": "background_solid", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "type": "stat",
+      "id": 11,
+      "title": "Reconciliation mismatches",
+      "description": "OMS-GAP-02. Any non-zero = local vs Dhan order book diverged. Critical.",
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "tv_oms_reconciliation_mismatches_total", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "unit": "none",
+          "decimals": 0,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green" }, { "color": "red", "value": 1 }] }
+        }
+      },
+      "options": { "colorMode": "background_solid", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "type": "stat",
+      "id": 12,
+      "title": "Dry-run mode?",
+      "description": "Safety gate. 1 = orders simulated (no real Dhan calls). 0 = LIVE. Default is dry-run.",
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "tv_oms_dry_run", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [
+            { "options": { "0": { "color": "red", "text": "LIVE" } }, "type": "value" },
+            { "options": { "1": { "color": "green", "text": "DRY-RUN" } }, "type": "value" }
+          ],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green" }, { "color": "red", "value": 1 }] }
+        }
+      },
+      "options": { "colorMode": "background_solid", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    }
+  ]
+}

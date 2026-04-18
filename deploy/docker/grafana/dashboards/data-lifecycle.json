@@ -1,0 +1,299 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "Data lifecycle — instrument universe build, candle aggregation, persistence throughput, dedup filtering, materialized-view freshness. Runbook: .claude/rules/project/observability-architecture.md + .claude/rules/project/gap-enforcement.md",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "uid": "tv-data-lifecycle",
+  "title": "tickvault — Data Lifecycle",
+  "tags": ["tickvault", "instruments", "candles", "persistence"],
+  "timezone": "Asia/Kolkata",
+  "refresh": "1m",
+  "schemaVersion": 39,
+  "time": { "from": "now-6h", "to": "now" },
+  "panels": [
+    {
+      "type": "text",
+      "id": 100,
+      "gridPos": { "h": 3, "w": 24, "x": 0, "y": 0 },
+      "options": {
+        "mode": "markdown",
+        "content": "## Data Lifecycle — instruments → ticks → candles → views\n\nInstrument universe builds daily from Dhan CSV (~157K rows parsed, F&O filter -> ~106K contracts). Live ticks stream through the 3-tier buffer to QuestDB. 18 materialized views aggregate into candles_{1s..1M}. 5-year SEBI retention. **Green = pipeline flowing; red = stalled upstream or QuestDB pressure**."
+      }
+    },
+    {
+      "type": "row",
+      "id": 110,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 3 },
+      "title": "Instrument universe",
+      "collapsed": false
+    },
+    {
+      "type": "stat",
+      "id": 1,
+      "title": "Total contracts",
+      "description": "Derivative contracts in the instrument registry (composite index).",
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "tv_instrument_registry_total_entries", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "unit": "none",
+          "decimals": 0,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red" }, { "color": "orange", "value": 10000 }, { "color": "green", "value": 100000 }] }
+        }
+      },
+      "options": { "colorMode": "background_solid", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "type": "stat",
+      "id": 2,
+      "title": "F&O underlyings",
+      "description": "Distinct underlyings currently subscribed to F&O depth (typically ~221).",
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "tv_fno_universe_derivative_contracts_total", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "unit": "none",
+          "decimals": 0,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red" }, { "color": "orange", "value": 100 }, { "color": "green", "value": 200 }] }
+        }
+      },
+      "options": { "colorMode": "background_solid", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "type": "stat",
+      "id": 3,
+      "title": "Last universe build",
+      "description": "Seconds since last successful instrument universe build. Should be < 24h.",
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "time() - tv_instrument_universe_last_build_epoch_secs", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "unit": "s",
+          "decimals": 0,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green" }, { "color": "orange", "value": 86400 }, { "color": "red", "value": 172800 }] }
+        }
+      },
+      "options": { "colorMode": "background_solid", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "type": "stat",
+      "id": 4,
+      "title": "Cross-seg collisions",
+      "description": "I-P1-11. Expected baseline is 2 (NIFTY/ABB + BANKNIFTY/ADANIENT). >5 = new ID reused.",
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 4 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "tv_instrument_registry_cross_segment_collisions", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "unit": "none",
+          "decimals": 0,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green" }, { "color": "orange", "value": 5 }, { "color": "red", "value": 10 }] }
+        }
+      },
+      "options": { "colorMode": "background_solid", "graphMode": "none", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "type": "row",
+      "id": 120,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 9 },
+      "title": "Tick persistence",
+      "collapsed": false
+    },
+    {
+      "type": "stat",
+      "id": 5,
+      "title": "Ticks persisted / sec",
+      "description": "ILP writes to QuestDB ticks table.",
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 10 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "rate(tv_ticks_persisted_total[1m])", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "unit": "none",
+          "decimals": 0,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red" }, { "color": "orange", "value": 10 }, { "color": "green", "value": 100 }] }
+        }
+      },
+      "options": { "colorMode": "background_solid", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "type": "stat",
+      "id": 6,
+      "title": "Junk ticks filtered (5m)",
+      "description": "Malformed ticks the parser rejected. Non-zero during market hours = protocol drift.",
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 10 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "increase(tv_junk_ticks_filtered_total[5m])", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "unit": "none",
+          "decimals": 0,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green" }, { "color": "orange", "value": 10 }, { "color": "red", "value": 100 }] }
+        }
+      },
+      "options": { "colorMode": "background_solid", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "type": "stat",
+      "id": 7,
+      "title": "Dedup filtered (5m)",
+      "description": "Duplicate ticks blocked by 4-layer dedup. Expected non-zero (exchange resends).",
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 10 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "increase(tv_dedup_filter_total[5m])", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "unit": "none",
+          "decimals": 0,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green" }, { "color": "orange", "value": 10000 }] }
+        }
+      },
+      "options": { "colorMode": "background_solid", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "type": "stat",
+      "id": 8,
+      "title": "ILP flush errors (5m)",
+      "description": "QuestDB ILP flush failures. Non-zero = QuestDB pressure, buffer active.",
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 10 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "increase(tv_ilp_flush_errors_total[5m])", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "unit": "none",
+          "decimals": 0,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green" }, { "color": "red", "value": 1 }] }
+        }
+      },
+      "options": { "colorMode": "background_solid", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "type": "row",
+      "id": 130,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 15 },
+      "title": "Candle aggregation",
+      "collapsed": false
+    },
+    {
+      "type": "stat",
+      "id": 9,
+      "title": "Candles emitted / min",
+      "description": "Live candle aggregator output (across all 21 timeframes).",
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "rate(tv_candles_emitted_total[1m]) * 60", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "unit": "none",
+          "decimals": 0,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red" }, { "color": "green", "value": 1 }] }
+        }
+      },
+      "options": { "colorMode": "background_solid", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "type": "stat",
+      "id": 10,
+      "title": "Materialized views lag",
+      "description": "Seconds behind live for candles_1m view. Should be < 60s.",
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "tv_materialized_view_lag_seconds", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "unit": "s",
+          "decimals": 0,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green" }, { "color": "orange", "value": 60 }, { "color": "red", "value": 300 }] }
+        }
+      },
+      "options": { "colorMode": "background_solid", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "type": "stat",
+      "id": 11,
+      "title": "Historical fetch errors (1h)",
+      "description": "Dhan historical candle API error rate. Known-OK baseline ~10K/day due to DH-904 retries.",
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "increase(tv_historical_fetch_errors_total[1h])", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "unit": "none",
+          "decimals": 0,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green" }, { "color": "orange", "value": 500 }, { "color": "red", "value": 5000 }] }
+        }
+      },
+      "options": { "colorMode": "background_solid", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    },
+    {
+      "type": "stat",
+      "id": 12,
+      "title": "QuestDB disk free (GB)",
+      "description": "Available disk space for QuestDB. SEBI 5-year retention requires generous headroom.",
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 16 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "tv_questdb_disk_free_bytes / 1073741824", "refId": "A" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "unit": "decgbytes",
+          "decimals": 1,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red" }, { "color": "orange", "value": 20 }, { "color": "green", "value": 50 }] }
+        }
+      },
+      "options": { "colorMode": "background_solid", "graphMode": "area", "reduceOptions": { "calcs": ["lastNotNull"] } }
+    }
+  ]
+}

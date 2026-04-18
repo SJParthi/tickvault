@@ -54,6 +54,10 @@ opentelemetry-otlp = { version = "0.31.1", features = ["grpc-tonic"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["json", "env-filter"] }
 tracing-opentelemetry = "0.32.1"
+# Phase 2 of plans/active-plan.md: hourly-rotated ERROR-only JSONL stream
+# at data/logs/errors.jsonl so Claude Code / Loki / summary_writer can tail
+# a structured, append-only file instead of parsing journald prose.
+tracing-appender = "0.2.3"
 
 # ---- Section 6: Trading Domain — Auth ----
 arc-swap = "1.9.1"

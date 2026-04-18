@@ -661,7 +661,8 @@ impl LiveCandleWriter {
         let count = self.pending_count;
         if let Some(ref mut sender) = self.sender {
             if let Err(err) = sender.flush(&mut self.buffer) {
-                warn!(?err, pending = count, "live candle flush failed — rescuing in-flight candles");
+                // Phase 0 / Rule 5: flush failures are ERROR (route to Telegram).
+                error!(?err, pending = count, "live candle flush failed — rescuing in-flight candles");
                 self.sender = None; self.buffer = self.fresh_buffer(); self.rescue_in_flight(); return;
             }
         } else { self.buffer = self.fresh_buffer(); self.rescue_in_flight(); return; }
@@ -757,13 +758,15 @@ impl LiveCandleWriter {
             self.in_flight.push(c);
             drained = drained.saturating_add(1);
             if drained.is_multiple_of(LIVE_CANDLE_FLUSH_BATCH_SIZE) && let Some(ref mut sender) = self.sender && let Err(err) = sender.flush(&mut self.buffer) {
-                warn!(?err, drained, "candle ring drain flush failed");
+                // Phase 0 / Rule 5: flush failures are ERROR (route to Telegram).
+                error!(?err, drained, "candle ring drain flush failed");
                 self.sender = None; self.buffer = self.fresh_buffer(); self.rescue_in_flight(); return;
             }
             if drained.is_multiple_of(LIVE_CANDLE_FLUSH_BATCH_SIZE) { self.in_flight.clear(); }
         }
         if !self.in_flight.is_empty() && let Some(ref mut sender) = self.sender && let Err(err) = sender.flush(&mut self.buffer) {
-            warn!(?err, drained, "candle ring drain final flush failed");
+            // Phase 0 / Rule 5: flush failures are ERROR (route to Telegram).
+            error!(?err, drained, "candle ring drain final flush failed");
             self.sender = None; self.buffer = self.fresh_buffer(); self.rescue_in_flight(); return;
         }
         self.in_flight.clear();
@@ -801,7 +804,8 @@ impl LiveCandleWriter {
     #[rustfmt::skip]
     fn drain_candle_disk_spill(&mut self) {
         if let Some(ref mut writer) = self.spill_writer && let Err(err) = writer.flush() {
-            warn!(?err, "candle BufWriter flush failed before drain — last candles may be lost");
+            // Phase 0 / Rule 5: explicit potential data loss — ERROR.
+            error!(?err, "candle BufWriter flush failed before drain — last candles may be lost");
         }
         self.spill_writer = None;
         let spill_path = match self.spill_path.take() { Some(p) => p, None => return };
@@ -824,11 +828,13 @@ impl LiveCandleWriter {
             }
             drained = drained.saturating_add(1);
             if drained.is_multiple_of(LIVE_CANDLE_FLUSH_BATCH_SIZE) && let Some(ref mut sender) = self.sender && let Err(err) = sender.flush(&mut self.buffer) {
-                warn!(?err, drained, "candle spill drain flush failed"); flush_failed = true; break;
+                // Phase 0 / Rule 5: flush failures are ERROR (route to Telegram).
+                error!(?err, drained, "candle spill drain flush failed"); flush_failed = true; break;
             }
         }
         if !flush_failed && let Some(ref mut sender) = self.sender && let Err(err) = sender.flush(&mut self.buffer) {
-            warn!(?err, drained, "candle spill drain final flush failed"); flush_failed = true;
+            // Phase 0 / Rule 5: flush failures are ERROR (route to Telegram).
+            error!(?err, drained, "candle spill drain final flush failed"); flush_failed = true;
         }
         if !flush_failed {
             if let Err(err) = std::fs::remove_file(&spill_path) { warn!(?err, path = %spill_path.display(), "failed to delete candle spill file"); }
@@ -881,11 +887,13 @@ impl LiveCandleWriter {
                 if self.build_candle_row(&candle).is_err() { continue; }
                 drained = drained.saturating_add(1);
                 if drained.is_multiple_of(LIVE_CANDLE_FLUSH_BATCH_SIZE) && let Some(ref mut sender) = self.sender && let Err(err) = sender.flush(&mut self.buffer) {
-                    warn!(?err, drained, path = %path.display(), "stale candle spill drain flush failed"); flush_failed = true; break;
+                    // Phase 0 / Rule 5: flush failures are ERROR (route to Telegram).
+                    error!(?err, drained, path = %path.display(), "stale candle spill drain flush failed"); flush_failed = true; break;
                 }
             }
             if !flush_failed && let Some(ref mut sender) = self.sender && let Err(err) = sender.flush(&mut self.buffer) {
-                warn!(?err, drained, path = %path.display(), "stale candle spill drain final flush failed"); flush_failed = true;
+                // Phase 0 / Rule 5: flush failures are ERROR (route to Telegram).
+                error!(?err, drained, path = %path.display(), "stale candle spill drain final flush failed"); flush_failed = true;
             }
 
             if !flush_failed {

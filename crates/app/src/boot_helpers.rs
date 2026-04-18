@@ -381,7 +381,14 @@ pub fn spawn_heartbeat_watchdog(
                 guard.as_ref().is_some()
             };
             if !token_ok {
-                tracing::error!("WATCHDOG: token handle is None — authentication may have failed");
+                // AUTH-GAP-01: token watchdog observed a None handle mid-session.
+                tracing::error!(
+                    code = tickvault_common::error_code::ErrorCode::AuthGapTokenExpiry.code_str(),
+                    severity = tickvault_common::error_code::ErrorCode::AuthGapTokenExpiry
+                        .severity()
+                        .as_str(),
+                    "AUTH-GAP-01: WATCHDOG — token handle is None, authentication may have failed"
+                );
             }
 
             let receiver_count = tick_sender.receiver_count();

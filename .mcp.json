@@ -20,6 +20,12 @@
       "env": {
         "QUESTDB_PG_URL": "${QUESTDB_PG_URL}"
       }
+    },
+    "tickvault-logs": {
+      "command": "python3",
+      "args": [
+        "scripts/mcp-servers/tickvault-logs/server.py"
+      ]
     }
   }
 }

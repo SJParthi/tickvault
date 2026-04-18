@@ -105,6 +105,10 @@ impl ApiAuthConfig {
                     // the /api/instruments/rebuild endpoint. Log only the fact
                     // that one was generated.
                     error!(
+                        code = tickvault_common::error_code::ErrorCode::GapSecApiAuth.code_str(),
+                        severity = tickvault_common::error_code::ErrorCode::GapSecApiAuth
+                            .severity()
+                            .as_str(),
                         "GAP-SEC-01 CRITICAL: TV_API_TOKEN not set in LIVE mode — \
                          auto-generated bearer token for this session (set TV_API_TOKEN env var)"
                     );

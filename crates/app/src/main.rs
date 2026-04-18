@@ -437,13 +437,97 @@ async fn main() -> Result<()> {
             None => None,
         };
 
+    // Phase 2 of active-plan: ERROR-only JSONL stream at
+    // data/logs/errors.jsonl.YYYY-MM-DD-HH for Claude triage daemon,
+    // Loki/Alloy scraper, and the upcoming summary_writer. Hourly rotation,
+    // 48h retention enforced by the background sweeper below.
+    //
+    // The WorkerGuard MUST live for the whole process — it owns the
+    // non-blocking flush thread. Leaking into the static binds it to
+    // program lifetime without needing to thread it through shutdown.
+    let errors_jsonl_layer: Option<Box<dyn tracing_subscriber::Layer<_> + Send + Sync + 'static>> =
+        match observability::init_errors_jsonl_appender(observability::ERRORS_JSONL_DIR) {
+            Ok((writer, guard)) => {
+                use tracing_subscriber::Layer as _;
+                // Keep the worker guard alive for the process lifetime —
+                // dropping it stops the background flush thread.
+                Box::leak(Box::new(guard));
+                let layer = tracing_subscriber::fmt::layer()
+                    .json()
+                    // CRITICAL: flatten_event(true) hoists `code`, `severity`,
+                    // `message` from under "fields" to the top level so
+                    // summary_writer + Claude can pattern-match them without
+                    // walking a nested object. The e2e test
+                    // `observability_chain_e2e` regresses on this flag.
+                    .flatten_event(true)
+                    .with_current_span(true)
+                    .with_span_list(false)
+                    .with_target(true)
+                    .with_file(true)
+                    .with_line_number(true)
+                    .with_thread_ids(true)
+                    .with_writer(writer)
+                    .with_filter(tracing_subscriber::filter::LevelFilter::ERROR);
+                Some(Box::new(layer))
+            }
+            Err(err) => {
+                // Never block boot on an ancillary logging target.
+                tracing::warn!(
+                    ?err,
+                    "errors.jsonl appender init failed — continuing without structured ERROR stream"
+                );
+                None
+            }
+        };
+
     tracing_subscriber::registry()
         .with(env_filter)
         .with(fmt_boxed)
         .with(file_log_layer)
         .with(error_log_layer)
+        .with(errors_jsonl_layer)
         .with(otel_layer)
         .init();
+
+    // Phase 5: background summary_writer task. Emits a human + Claude
+    // readable `data/logs/errors.summary.md` every 60s so `/loop` polling
+    // reads ONE file instead of parsing JSONL, and so `make status` can
+    // cat it for an instant health view.
+    {
+        use tickvault_core::notification::summary_writer::{
+            SummaryWriterConfig, spawn as spawn_summary,
+        };
+        let cfg = SummaryWriterConfig::new(observability::ERRORS_JSONL_DIR);
+        let _summary_task = spawn_summary(cfg);
+    }
+
+    // Phase 2: hourly retention sweeper for errors.jsonl. Keeps ~48h of
+    // rotated files on disk (~= 500KB at ERROR-only volume). Runs as a
+    // best-effort background task — failures log at WARN, never halt.
+    tokio::spawn(async {
+        use std::path::Path;
+        use std::time::Duration;
+        const SWEEP_INTERVAL_SECS: u64 = 3600;
+        const RETENTION_HOURS: u64 = 48;
+        let dir = Path::new(observability::ERRORS_JSONL_DIR);
+        loop {
+            tokio::time::sleep(Duration::from_secs(SWEEP_INTERVAL_SECS)).await;
+            match observability::sweep_errors_jsonl_retention(dir, RETENTION_HOURS) {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(
+                    deleted = n,
+                    dir = %dir.display(),
+                    retention_hours = RETENTION_HOURS,
+                    "errors.jsonl retention sweep"
+                ),
+                Err(err) => tracing::warn!(
+                    ?err,
+                    dir = %dir.display(),
+                    "errors.jsonl retention sweep failed"
+                ),
+            }
+        }
+    });
 
     // Install panic hook: log at ERROR level (triggers Telegram via Loki → Grafana alerting).
     let default_panic_hook = std::panic::take_hook();
@@ -632,7 +716,15 @@ async fn main() -> Result<()> {
                 }
             }
             Err(err) => {
-                error!(error = %err, "FAST BOOT: IP verification failed — BLOCKING BOOT");
+                // GAP-NET-01: static-IP verification rejected boot.
+                error!(
+                    code = tickvault_common::error_code::ErrorCode::GapNetIpMonitor.code_str(),
+                    severity = tickvault_common::error_code::ErrorCode::GapNetIpMonitor
+                        .severity()
+                        .as_str(),
+                    error = %err,
+                    "GAP-NET-01: FAST BOOT — IP verification failed, BLOCKING BOOT"
+                );
                 fast_notifier.notify(NotificationEvent::IpVerificationFailed {
                     reason: err.to_string(),
                 });
@@ -928,7 +1020,16 @@ async fn main() -> Result<()> {
                 Some(manager)
             }
             Ok(Err(err)) => {
-                error!(error = %err, "deferred auth failed — token renewal unavailable");
+                // AUTH-GAP-01: deferred auth failed; token renewal unavailable.
+                error!(
+                    code = tickvault_common::error_code::ErrorCode::AuthGapTokenExpiry
+                        .code_str(),
+                    severity = tickvault_common::error_code::ErrorCode::AuthGapTokenExpiry
+                        .severity()
+                        .as_str(),
+                    error = %err,
+                    "AUTH-GAP-01: deferred auth failed — token renewal unavailable"
+                );
                 notifier.notify(
                     tickvault_core::notification::events::NotificationEvent::AuthenticationFailed {
                         reason: format!(
@@ -939,7 +1040,14 @@ async fn main() -> Result<()> {
                 None
             }
             Err(_elapsed) => {
-                error!("deferred auth timed out — token renewal unavailable");
+                // AUTH-GAP-01: deferred auth hit its timeout.
+                error!(
+                    code = tickvault_common::error_code::ErrorCode::AuthGapTokenExpiry.code_str(),
+                    severity = tickvault_common::error_code::ErrorCode::AuthGapTokenExpiry
+                        .severity()
+                        .as_str(),
+                    "AUTH-GAP-01: deferred auth timed out — token renewal unavailable"
+                );
                 None
             }
         };
@@ -1305,7 +1413,15 @@ async fn main() -> Result<()> {
                 });
             }
             Err(err) => {
-                error!(error = %err, "IP verification failed — BLOCKING BOOT");
+                // GAP-NET-01: static-IP verification rejected boot.
+                error!(
+                    code = tickvault_common::error_code::ErrorCode::GapNetIpMonitor.code_str(),
+                    severity = tickvault_common::error_code::ErrorCode::GapNetIpMonitor
+                        .severity()
+                        .as_str(),
+                    error = %err,
+                    "GAP-NET-01: IP verification failed, BLOCKING BOOT"
+                );
                 notifier.notify(NotificationEvent::IpVerificationFailed {
                     reason: err.to_string(),
                 });
@@ -1336,7 +1452,15 @@ async fn main() -> Result<()> {
         Ok(Ok(manager)) => manager,
         Ok(Err(err)) => {
             // Permanent auth error or Ctrl+C.
-            error!(error = %err, "authentication failed permanently — exiting");
+            // DH-901: auth attempt exhausted; app is halting.
+            error!(
+                code = tickvault_common::error_code::ErrorCode::Dh901InvalidAuth.code_str(),
+                severity = tickvault_common::error_code::ErrorCode::Dh901InvalidAuth
+                    .severity()
+                    .as_str(),
+                error = %err,
+                "DH-901: authentication failed permanently — exiting"
+            );
             notifier.notify(
                 tickvault_core::notification::events::NotificationEvent::AuthenticationFailed {
                     reason: format!("PERMANENT: {err}"),
@@ -2316,7 +2440,8 @@ async fn main() -> Result<()> {
                                             message_sequence,
                                         )
                                     {
-                                        tracing::warn!(?err, "failed to persist 20-level depth");
+                                        // Phase 0 / Rule 5: persist failures are ERROR (route to Telegram).
+                                        tracing::error!(?err, "failed to persist 20-level depth");
                                     }
 
                                     // OBI accumulation: store bid, compute on ask arrival.
@@ -2410,12 +2535,14 @@ async fn main() -> Result<()> {
                     if let Some(ref mut w) = writer
                         && let Err(err) = w.flush()
                     {
-                        tracing::warn!(?err, "depth writer flush on shutdown failed");
+                        // Phase 0 / Rule 5: flush failures are ERROR (route to Telegram).
+                        tracing::error!(?err, "depth writer flush on shutdown failed");
                     }
                     if let Some(ref mut ow) = obi_writer
                         && let Err(err) = ow.flush()
                     {
-                        tracing::warn!(?err, "OBI writer flush on shutdown failed");
+                        // Phase 0 / Rule 5: flush failures are ERROR (route to Telegram).
+                        tracing::error!(?err, "OBI writer flush on shutdown failed");
                     }
                     tracing::info!(
                         underlying = depth_label_recv,
@@ -4055,7 +4182,8 @@ async fn run_tick_persistence_consumer(
                 let _ = tick_gap_tracker.record_tick(tick.security_id, tick.exchange_timestamp);
 
                 if let Err(err) = tick_writer.append_tick(&tick) {
-                    warn!(?err, "cold-path tick persistence write failed");
+                    // Phase 0 / Rule 5: persistence failures are ERROR (route to Telegram).
+                    error!(?err, "cold-path tick persistence write failed");
                 }
 
                 ticks_persisted = ticks_persisted.saturating_add(1);
@@ -4349,7 +4477,8 @@ async fn run_candle_persistence_consumer(
             aggregator.clear_completed();
 
             if let Err(err) = candle_writer.flush_if_needed() {
-                warn!(?err, "cold-path candle flush failed");
+                // Phase 0 / Rule 5: flush failures are ERROR (route to Telegram).
+                error!(?err, "cold-path candle flush failed");
             }
             last_sweep = std::time::Instant::now();
         }

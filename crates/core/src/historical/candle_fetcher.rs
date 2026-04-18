@@ -853,7 +853,8 @@ pub async fn fetch_historical_candles(
 
     // Final flush
     if let Err(err) = candle_writer.force_flush() {
-        warn!(?err, "failed to flush remaining candles to QuestDB");
+        // Phase 0 / Rule 5: flush failures are ERROR (route to Telegram).
+        error!(?err, "failed to flush remaining candles to QuestDB");
     }
 
     info!(

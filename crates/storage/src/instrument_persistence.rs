@@ -313,6 +313,66 @@ pub async fn ensure_instrument_tables(questdb_config: &QuestDbConfig) {
         }
     }
 
+    // I-P1-08 (2026-04-17): Self-healing schema migration for lifecycle
+    // columns. When tables were created by an older build, CREATE TABLE
+    // IF NOT EXISTS is a no-op and the new columns would be missing —
+    // `mark_missing_as_expired` would then fail with "Invalid column".
+    // QuestDB supports `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` which
+    // is idempotent, so running it every boot is safe.
+    let lifecycle_migrations: &[(&str, &[(&str, &str)])] = &[
+        (
+            QUESTDB_TABLE_FNO_UNDERLYINGS,
+            &[
+                ("status", "SYMBOL"),
+                ("last_seen_date", "TIMESTAMP"),
+                ("expired_date", "TIMESTAMP"),
+            ],
+        ),
+        (
+            QUESTDB_TABLE_DERIVATIVE_CONTRACTS,
+            &[
+                ("status", "SYMBOL"),
+                ("last_seen_date", "TIMESTAMP"),
+                ("expired_date", "TIMESTAMP"),
+            ],
+        ),
+        (
+            QUESTDB_TABLE_SUBSCRIBED_INDICES,
+            &[
+                ("status", "SYMBOL"),
+                ("last_seen_date", "TIMESTAMP"),
+                ("expired_date", "TIMESTAMP"),
+            ],
+        ),
+    ];
+
+    for (table, columns) in lifecycle_migrations {
+        for (col, ty) in *columns {
+            let sql = format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} {ty}");
+            match client.get(&base_url).query(&[("query", &sql)]).send().await {
+                Ok(response) => {
+                    if response.status().is_success() {
+                        debug!(table, col, ty, "lifecycle column ensured");
+                    } else {
+                        let status = response.status();
+                        let body = response.text().await.unwrap_or_default();
+                        warn!(
+                            table,
+                            col,
+                            ty,
+                            %status,
+                            body = body.chars().take(200).collect::<String>(),
+                            "ADD COLUMN DDL returned non-success"
+                        );
+                    }
+                }
+                Err(err) => {
+                    warn!(table, col, ty, ?err, "ADD COLUMN DDL request failed");
+                }
+            }
+        }
+    }
+
     // Step 2: Enable DEDUP UPSERT KEYS on all 4 tables.
     let dedup_statements: &[(&str, &str)] = &[
         (QUESTDB_TABLE_BUILD_METADATA, DEDUP_KEY_BUILD_METADATA),
