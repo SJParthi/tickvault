@@ -143,12 +143,15 @@ impl OrderCircuitBreaker {
             {
                 self.half_open_probe_sent.store(false, Ordering::Relaxed);
                 metrics::gauge!("tv_circuit_breaker_state").set(1.0_f64);
-                // Gap 1 fix: ERROR level triggers Telegram via Loki → Grafana.
-                // Previously WARN — operator was unaware orders were being rejected.
+                // OMS-GAP-03: circuit breaker opened; critical severity.
                 error!(
+                    code = tickvault_common::error_code::ErrorCode::OmsGapCircuitBreaker.code_str(),
+                    severity = tickvault_common::error_code::ErrorCode::OmsGapCircuitBreaker
+                        .severity()
+                        .as_str(),
                     failures = new_count,
                     threshold = self.failure_threshold,
-                    "CRITICAL: circuit breaker OPEN — Dhan API failures exceeded threshold. \
+                    "OMS-GAP-03: circuit breaker OPEN — Dhan API failures exceeded threshold. \
                      ALL order submissions blocked until recovery."
                 );
             }
