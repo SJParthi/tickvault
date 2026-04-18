@@ -25,7 +25,13 @@
       "command": "python3",
       "args": [
         "scripts/mcp-servers/tickvault-logs/server.py"
-      ]
+      ],
+      "env": {
+        "TICKVAULT_LOGS_DIR": "${TICKVAULT_LOGS_DIR}",
+        "TICKVAULT_PROMETHEUS_URL": "${TICKVAULT_PROMETHEUS_URL}",
+        "TICKVAULT_ALERTMANAGER_URL": "${TICKVAULT_ALERTMANAGER_URL}",
+        "TICKVAULT_QUESTDB_URL": "${TICKVAULT_QUESTDB_URL}"
+      }
     }
   }
 }
