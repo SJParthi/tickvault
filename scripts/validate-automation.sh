@@ -96,6 +96,8 @@ run_check "claude_triage_lambda_guard" \
     cargo test -p tickvault-common --test claude_triage_lambda_guard
 run_check "loki_alloy_profile_guard" \
     cargo test -p tickvault-common --test loki_alloy_profile_guard
+run_check "runbook_cross_link_guard" \
+    cargo test -p tickvault-common --test runbook_cross_link_guard
 
 echo ""
 echo "--- file-level invariants ---"

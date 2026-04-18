@@ -6,9 +6,17 @@ or the authoritative `.claude/rules/*.md` rule file that defines
 the remediation steps.
 
 **Runbook discipline:**
-- Always dry-run before executing an auto-fix (`scripts/foo.sh --dry-run`)
+- Always dry-run before executing an auto-fix (example: `scripts/auto-fix-refresh-instruments.sh --dry-run`)
 - Always check `data/logs/errors.summary.md` before escalating
 - Never bypass the circuit breaker manually
+
+## Deep-dive runbooks
+
+| Topic | Runbook | When to open |
+|---|---|---|
+| Auth / token failures | [auth.md](./auth.md) | DH-901, DATA-807/808/809/810, AUTH-GAP-* |
+| Zero-tick-loss chain | [zero-tick-loss.md](./zero-tick-loss.md) | TicksDropped, TickBuffer/DiskSpill active, BroadcastLagTickLoss |
+| Dashboards map | [dashboards.md](./dashboards.md) | Morning-ops glance + drill-down navigation |
 
 ## Table — all 54 ErrorCode variants mapped to actions
 
