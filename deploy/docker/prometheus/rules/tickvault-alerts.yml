@@ -568,3 +568,47 @@ groups:
         annotations:
           summary: "SEBI rate limiter blocking orders"
           description: "{{ $value }} orders/sec denied by rate limiter. Regulatory compliance at risk."
+
+      # =========================================================================
+      # Phase 8-expansion alerts — defense-in-depth when Loki profile is OFF
+      # =========================================================================
+
+      # Token renewal repeatedly failing — DH-901 loop
+      - alert: TokenRenewalFailureBurst
+        expr: increase(tv_token_renewal_failures_total[1h]) >= 3
+        for: 0s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Token renewal failed 3+ times in 1h"
+          description: "{{ $value }} token renewal failures in the last hour. DH-901 path hit — token rotation loop. Runbook: .claude/rules/dhan/authentication.md"
+
+      # Auth circuit breaker opened — trading halt imminent or active
+      - alert: AuthCircuitBreakerOpen
+        expr: tv_auth_circuit_breaker_state == 1
+        for: 0s
+        labels:
+          severity: critical
+        annotations:
+          summary: "Auth circuit breaker OPEN"
+          description: "The auth circuit breaker flipped to OPEN — trading is halted until manual recovery. Runbook: .claude/rules/dhan/authentication.md"
+
+      # Public IP drift detected — static IP policy violation risk
+      - alert: IpMismatchDetected
+        expr: tv_ip_mismatch_total > 0
+        for: 0s
+        labels:
+          severity: warning
+        annotations:
+          summary: "Static IP mismatch ({{ $value }} events)"
+          description: "Host public IP differs from the registered Dhan static IP. Orders will be rejected from unregistered IPs after 2026-04-01 enforcement date. Runbook: .claude/rules/dhan/authentication.md (see rule 7)"
+
+      # Cross-segment security_id collision count drift
+      - alert: InstrumentRegistryCollisionDrift
+        expr: tv_instrument_registry_cross_segment_collisions > 5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Cross-segment security_id collisions > 5"
+          description: "Dhan reuses security_id across segments. Two collisions (NIFTY id=13 vs ABB, BANKNIFTY id=25 vs ADANIENT) are expected. {{ $value }} indicates new collisions — investigate whether a new underlying was added. Runbook: .claude/rules/project/security-id-uniqueness.md"
