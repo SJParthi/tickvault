@@ -4045,8 +4045,9 @@ fn spawn_historical_candle_fetch(
                     candles_compared = cross_match.candles_compared,
                     "cross-match SKIPPED — no live data in materialized views (first run, fresh DB, or post-market boot)"
                 );
-                bg_notifier.notify(NotificationEvent::Custom {
-                    message: "Historical vs Live cross-match SKIPPED\nNo live data in materialized views (first run, fresh DB, or post-market boot). Will compare on next run after live ticks are collected during market hours.".to_string(),
+                bg_notifier.notify(NotificationEvent::CandleCrossMatchSkipped {
+                    reason: "no live data in materialized views".to_string(),
+                    candles_compared: cross_match.candles_compared,
                 });
             } else if cross_match.passed {
                 bg_notifier.notify(NotificationEvent::CandleCrossMatchPassed {
@@ -4084,6 +4085,9 @@ fn spawn_historical_candle_fetch(
             );
         } else {
             // Non-trading day: skip cross-match (no live data to compare).
+            // Emit the typed SKIPPED notification so the operator gets
+            // explicit closure on Telegram instead of silently missing
+            // the post-fetch cross-match step on weekends / holidays.
             info!(
                 instruments_fetched = summary.instruments_fetched,
                 instruments_failed = summary.instruments_failed,
@@ -4091,6 +4095,10 @@ fn spawn_historical_candle_fetch(
                 verification_passed = verify_report.passed,
                 "non-trading day historical fetch complete (cross-match skipped — no live data)"
             );
+            bg_notifier.notify(NotificationEvent::CandleCrossMatchSkipped {
+                reason: "weekend or holiday — not a trading day".to_string(),
+                candles_compared: 0,
+            });
         }
     });
 
