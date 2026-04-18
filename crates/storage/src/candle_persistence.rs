@@ -2915,6 +2915,9 @@ mod tests {
 
     #[test]
     fn test_recover_candle_skips_current_active_spill() {
+        let _guard = crate::spill_dir_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Set spill_path to today's file, create that file plus an older one.
         // Verify the active file is NOT drained but the older one IS.
         let real_spill_dir = std::path::Path::new(CANDLE_SPILL_DIR);
@@ -3697,6 +3700,11 @@ mod tests {
 
     #[test]
     fn test_live_candle_recover_stale_spill_files() {
+        // Serialize with other tests that touch the global spill dir so
+        // parallel cargo test runs don't race on filesystem state.
+        let _guard = crate::spill_dir_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let port = spawn_tcp_drain_server();
         let config = QuestDbConfig {
             host: "127.0.0.1".to_string(),
@@ -5484,6 +5492,9 @@ mod tests {
 
     #[test]
     fn test_recover_candle_active_spill_skipped_in_stale_recovery() {
+        let _guard = crate::spill_dir_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Exercise line 721-722: active spill file is skipped during recovery.
         let port = spawn_tcp_drain_server();
         let config = QuestDbConfig {

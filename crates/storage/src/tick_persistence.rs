@@ -7651,6 +7651,11 @@ mod tests {
 
     #[test]
     fn test_recover_skips_current_active_spill() {
+        // Serialize with other tests that touch the global spill dir so
+        // parallel cargo test runs don't race on filesystem state.
+        let _guard = crate::spill_dir_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Set spill_path to today's file, create that file plus an older one.
         // Verify the active file is NOT drained but the older one IS.
         let real_spill_dir = std::path::Path::new(TICK_SPILL_DIR);
