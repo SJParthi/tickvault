@@ -209,7 +209,7 @@ CloudWatch ──(5 alarms) ── SNS topic ───────────�
   - `scripts/auto-fix-refresh-instruments.sh` — triggers `POST /api/instruments/rebuild`
   - Each script: idempotent, logs to `data/logs/auto-fix.log`, includes dry-run flag
 
-- [ ] 8.2 CloudWatch webhook → Claude Code session (AWS only)
+- [x] 8.2 CloudWatch webhook → Claude Code session (AWS only)
   - Lambda function: receives SNS → invokes `tmux send-keys 'claude --resume <session_id> "triage $ALARM"'` on the EC2 via SSM RunCommand
   - File: `deploy/aws/terraform/claude-triage-lambda.tf` + `deploy/aws/lambda/claude-triage.py`
 

@@ -92,6 +92,8 @@ run_check "resilience_sla_alert_guard" \
     cargo test -p tickvault-storage --test resilience_sla_alert_guard
 run_check "tickvault_logs_mcp_guard" \
     cargo test -p tickvault-common --test tickvault_logs_mcp_guard
+run_check "claude_triage_lambda_guard" \
+    cargo test -p tickvault-common --test claude_triage_lambda_guard
 
 echo ""
 echo "--- file-level invariants ---"
