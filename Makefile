@@ -371,3 +371,33 @@ aws-cost: ## Show the current month AWS bill estimate (via Cost Explorer)
 		--time-period Start=$$(date -u +%Y-%m-01),End=$$(date -u +%Y-%m-%d) \
 		--granularity MONTHLY --metrics UnblendedCost --output text 2>/dev/null || \
 	echo "  (Cost Explorer requires explicit enablement + 24h delay)"
+
+# -----------------------------------------------------------------------------
+# Phase 2.2 / 5.2 — Zero-touch observability operator commands
+# -----------------------------------------------------------------------------
+
+tail-errors: ## Live tail of data/logs/errors.jsonl.* with jq pretty-print
+	@echo "Tailing ERROR-only JSONL stream (data/logs/errors.jsonl.*). Ctrl-C to stop."
+	@if ls data/logs/errors.jsonl* >/dev/null 2>&1; then \
+		tail -n 50 -F data/logs/errors.jsonl* 2>/dev/null | \
+			(command -v jq >/dev/null && jq -c '{ts: .timestamp, code, severity, target, message}' || cat); \
+	else \
+		echo "  (no errors.jsonl* files yet — app may not have run since Phase 2 shipped)"; \
+		exit 0; \
+	fi
+
+errors-summary: ## Print data/logs/errors.summary.md (refreshed every 60s by app)
+	@if [ -f data/logs/errors.summary.md ]; then \
+		cat data/logs/errors.summary.md; \
+	else \
+		echo "  (no errors.summary.md yet — app may not have run since Phase 5 shipped)"; \
+	fi
+
+triage-dry-run: ## Run the error-triage hook without executing auto-fixes
+	@bash .claude/hooks/error-triage.sh
+
+triage-execute: ## Run the error-triage hook WITH auto-fix execution
+	@bash .claude/hooks/error-triage.sh --execute-autofix
+
+validate-automation: ## End-to-end validation of the zero-touch chain (20 checks)
+	@bash scripts/validate-automation.sh

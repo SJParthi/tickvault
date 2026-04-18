@@ -118,6 +118,26 @@ rules:
       upgrade path when the confidence rises.
 
   # -----------------------------------------------------------------------
+  # Disk spill stuck — try an explicit drain via the clear-spill helper
+  # -----------------------------------------------------------------------
+
+  - name: tick-spill-stuck-clear
+    match:
+      code: STORAGE-GAP-01
+      message_contains: "spill file preserved for next recovery"
+    action: auto_restart
+    auto_fix_script: scripts/auto-fix-clear-spill.sh
+    runbook_path: .claude/rules/project/observability-architecture.md
+    confidence: 0.85
+    cooldown_secs: 3600
+    justification: >-
+      When QuestDB was down and spilled ticks did not drain on the
+      next attempt, the files sit on disk until a new tick arrives.
+      This triggers an explicit drain via the clear-spill helper.
+      0.85 confidence so it currently escalates instead of auto-
+      executing until the /api/spill/drain endpoint lands.
+
+  # -----------------------------------------------------------------------
   # Critical auth failures — NEVER auto-action
   # -----------------------------------------------------------------------
 

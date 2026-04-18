@@ -96,29 +96,29 @@ CloudWatch ──(5 alarms) ── SNS topic ───────────�
 
 ### Phase 0 — Stop the bleeding (BLOCKING for everything else)
 
-- [ ] 0.1 Upgrade 39 `warn!` → `error!` on flush/broadcast/persist failures per audit-findings Rule 5
+- [x] 0.1 Upgrade 39 `warn!` → `error!` on flush/broadcast/persist failures per audit-findings Rule 5
   - Files: `crates/storage/src/tick_persistence.rs` (8 sites), `crates/storage/src/candle_persistence.rs` (9 sites), `crates/app/src/main.rs` (5 sites), `crates/core/src/pipeline/tick_processor.rs` (2 sites), `crates/app/src/greeks_pipeline.rs` (1 site), `crates/core/src/historical/candle_fetcher.rs` (1 site)
   - Tests: add `test_flush_failure_emits_error_level` source-scan guard in `crates/storage/tests/error_level_meta_guard.rs`
 
-- [ ] 0.2 Compile-enforce error capture
+- [x] 0.2 Compile-enforce error capture
   - Files: every `crates/*/src/lib.rs`
   - Adds: `#![cfg_attr(not(test), deny(unused_must_use))]`, `#![cfg_attr(not(test), warn(clippy::let_underscore_must_use))]`, `#![cfg_attr(not(test), warn(clippy::unused_async))]`
   - Tests: existing clippy gate catches regressions
 
 ### Phase 1 — Structured error catalogue
 
-- [ ] 1.1 Central `ErrorCode` enum in `crates/common/src/error.rs`
+- [x] 1.1 Central `ErrorCode` enum in `crates/common/src/error.rs`
   - Variants: every I-P*, OMS-GAP-*, WS-GAP-*, STORAGE-GAP-*, RISK-GAP-*, AUTH-GAP-*, DH-9xx, 8xx codes
   - Methods: `.code_str()`, `.severity()`, `.runbook_url()`, `.is_actionable()`, `.suggested_fix()`
   - Tests: `test_every_code_has_rule_doc`, `test_every_rule_doc_has_code`
 
-- [ ] 1.2 Every `error!` / `warn!` on known paths must carry `code = ErrorCode::X.code_str()` as a structured field
+- [~] 1.2 Every `error!` / `warn!` on known paths must carry `code = ErrorCode::X.code_str()` as a structured field
   - Files: `crates/*/src/**/*.rs` (mechanical migration, one ErrorCode per existing code)
   - Tests: `crates/common/tests/error_code_field_guard.rs` scans source + fails if an error site in a tagged module lacks `code =`
 
 ### Phase 2 — JSONL error stream + rotation
 
-- [ ] 2.1 Tracing subscriber emits a separate `data/logs/errors.jsonl` filtered to ERROR-level only, one JSON object per line, `{ts_ist, code, severity, signature_hash, module, message, fields}`
+- [x] 2.1 Tracing subscriber emits a separate `data/logs/errors.jsonl` filtered to ERROR-level only, one JSON object per line, `{ts_ist, code, severity, signature_hash, module, message, fields}`
   - File: `crates/app/src/observability.rs`
   - Uses `tracing-appender` file rotation (hourly, 48h retention)
   - `signature_hash` = first 16 hex chars of sha256(code + module + truncated_message)
@@ -162,7 +162,7 @@ CloudWatch ──(5 alarms) ── SNS topic ───────────�
 
 ### Phase 5 — errors.summary.md (Claude-readable single-file view)
 
-- [ ] 5.1 Background task inside the Rust app emits `data/logs/errors.summary.md` every 60s — markdown tables:
+- [x] 5.1 Background task inside the Rust app emits `data/logs/errors.summary.md` every 60s — markdown tables:
   - "Active errors (last 15min)" — signature | count | severity | code | runbook | first_seen_ist
   - "Novel today" — signatures first seen in last 24h
   - "Infrastructure up/down" — each alert from Prometheus + CloudWatch
@@ -175,11 +175,11 @@ CloudWatch ──(5 alarms) ── SNS topic ───────────�
 
 ### Phase 6 — Auto-triage rules engine
 
-- [ ] 6.1 YAML rules file `.claude/triage/error-rules.yaml`
+- [x] 6.1 YAML rules file `.claude/triage/error-rules.yaml`
   - Schema: `{ code, signature_pattern, action: "auto_fix" | "auto_restart" | "escalate" | "silence", runbook_url, confidence_threshold, cooldown_secs }`
   - Seed rules for known recurring errors (I-P1-11 collision → silence; CandleVerificationFailed → escalate with jq'd context; Depth spot stale → auto-restart rebalancer once; Token expired → auto-refresh already handled → silence)
 
-- [ ] 6.2 Triage hook `.claude/hooks/error-triage.sh`
+- [x] 6.2 Triage hook `.claude/hooks/error-triage.sh`
   - Trigger: cron (every 60s via a userland launchd/systemd-user timer) OR `Stop` / `SessionStart` hooks so it fires during Claude sessions
   - Reads `errors.summary.md` + `error-rules.yaml` → applies rules → posts actions to Telegram and/or invokes `scripts/auto-fix-<action>.sh`
   - Edge-triggered via `.claude/state/triage-seen.jsonl` (signature_hash + last_action_ts)
@@ -190,7 +190,7 @@ CloudWatch ──(5 alarms) ── SNS topic ───────────�
 
 ### Phase 7 — Claude-watches-logs daemon
 
-- [ ] 7.1 `/loop` skill runbook
+- [x] 7.1 `/loop` skill runbook
   - File: `.claude/triage/claude-loop-prompt.md`
   - Prompt: "Read data/logs/errors.summary.md. For each row flagged 'ACTION_REQUIRED': investigate root cause, propose fix if tractable, open draft PR; otherwise ping operator with context."
   - Invoked via: `/loop 5m .claude/triage/claude-loop-prompt.md`
@@ -215,7 +215,7 @@ CloudWatch ──(5 alarms) ── SNS topic ───────────�
 
 ### Phase 10 — Zero-tick-loss hardening (explicit SLA)
 
-- [ ] 10.1 Three-tier buffer proof
+- [~] 10.1 Three-tier buffer proof
   - `crates/core/src/pipeline/tick_processor.rs` — SPSC 65K ring → disk spill (rkyv) → WAL replay on reconnect
   - Metric: `tv_ticks_lost_total` — must remain 0 during market hours; increments only on explicit drop decision with root cause label
   - Test: `crates/storage/tests/zero_tick_loss_invariant.rs` — integration test kills + resumes QuestDB, drops + resumes WS, asserts final stored count = emitted count
@@ -247,7 +247,7 @@ CloudWatch ──(5 alarms) ── SNS topic ───────────�
 
 ### Phase 12 — Coverage / Mutation / Fuzz ratchet (100% or fail)
 
-- [ ] 12.1 Line + branch coverage 100%
+- [x] 12.1 Line + branch coverage 100%
   - CI gate: `cargo llvm-cov --workspace --fail-under-lines 100 --fail-under-regions 100`
   - File: `quality/crate-coverage-thresholds.toml` — set all crates to 100
   - Any exemption requires a `// COVERAGE-EXEMPT: <reason>` comment + operator sign-off
@@ -271,7 +271,7 @@ CloudWatch ──(5 alarms) ── SNS topic ───────────�
   - Benchmark budget: `tick_pipeline_routing < 100ns`, `papaya_lookup < 50ns`, `full_tick_processing < 10µs` in `quality/benchmark-budgets.toml`
   - CI gate: 5% regression on any budget = block
 
-- [ ] 12.6 Real-time self-check on every boot
+- [x] 12.6 Real-time self-check on every boot
   - `crates/app/src/main.rs` runs a 30-second smoke test at boot during market hours: synthesizes N synthetic ticks through the non-prod test pipeline, asserts they arrive in QuestDB, asserts O(1) latency samples within budget
   - On failure → HALT + CRITICAL Telegram
 
