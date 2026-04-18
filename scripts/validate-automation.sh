@@ -86,6 +86,8 @@ run_check "observability library tests" \
     cargo test -p tickvault-app --lib observability
 run_check "observability_chain_e2e" \
     cargo test -p tickvault-app --test observability_chain_e2e
+run_check "operator_health_dashboard_guard" \
+    cargo test -p tickvault-storage --test operator_health_dashboard_guard
 
 echo ""
 echo "--- file-level invariants ---"
@@ -103,6 +105,8 @@ run_check "auto-fix clear-spill executable" \
     test -x scripts/auto-fix-clear-spill.sh
 run_check "error-triage hook executable" \
     test -x .claude/hooks/error-triage.sh
+run_check "operator-health dashboard present" \
+    test -f deploy/docker/grafana/dashboards/operator-health.json
 
 echo ""
 echo "--- source-code invariants ---"

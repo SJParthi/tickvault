@@ -277,7 +277,7 @@ CloudWatch ──(5 alarms) ── SNS topic ───────────�
 
 ### Phase 9 — Dashboards + validation
 
-- [ ] 9.1 Single-page "Operator Health" Grafana dashboard
+- [x] 9.1 Single-page "Operator Health" Grafana dashboard
   - File: `deploy/docker/grafana/dashboards/operator-health.json`
   - One panel for every "Is it working?" question: trading live? WS UP? depth streaming? errors rising? P&L within limits? auto-triage running? CloudWatch alarms green?
 
