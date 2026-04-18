@@ -730,12 +730,14 @@ impl TickPersistenceWriter {
             self.pending_count = self.pending_count.saturating_add(1);
             drained += 1;
             if self.pending_count >= TICK_FLUSH_BATCH_SIZE && let Err(err) = self.force_flush() {
-                warn!(?err, drained, remaining = self.tick_buffer.len(), "flush during ring buffer drain failed — in-flight ticks rescued");
+                // Phase 0 / Rule 5: flush failures are ERROR (route to Telegram).
+                error!(?err, drained, remaining = self.tick_buffer.len(), "flush during ring buffer drain failed — in-flight ticks rescued");
                 return;
             }
         }
         if self.pending_count > 0 && let Err(err) = self.force_flush() {
-            warn!(?err, drained, "ring buffer final flush failed"); return;
+            // Phase 0 / Rule 5: flush failures are ERROR (route to Telegram).
+            error!(?err, drained, "ring buffer final flush failed"); return;
         }
         if drained > 0 { info!(drained, ring_count, "ring buffer drained to QuestDB"); }
         if self.ticks_spilled_total > 0 {
@@ -754,7 +756,8 @@ impl TickPersistenceWriter {
     #[rustfmt::skip]
     fn drain_disk_spill(&mut self) -> usize {
         if let Some(ref mut writer) = self.spill_writer && let Err(err) = writer.flush() {
-            warn!(?err, "BufWriter flush failed before drain — last ~73 ticks may be lost (8KB buf / 112B per tick)");
+            // Phase 0 / Rule 5: explicit potential data loss — ERROR (routes to Telegram).
+            error!(?err, "BufWriter flush failed before drain — last ~73 ticks may be lost (8KB buf / 112B per tick)");
         }
         self.spill_writer = None;
         let spill_path = match self.spill_path.take() { Some(p) => p, None => return 0 };
@@ -784,12 +787,14 @@ impl TickPersistenceWriter {
             self.pending_count = self.pending_count.saturating_add(1);
             drained = drained.saturating_add(1);
             if self.pending_count >= TICK_FLUSH_BATCH_SIZE && let Err(err) = self.force_flush() {
-                warn!(?err, drained, "flush during spill drain failed — in-flight rescued");
+                // Phase 0 / Rule 5: flush failures are ERROR (route to Telegram).
+                error!(?err, drained, "flush during spill drain failed — in-flight rescued");
                 flush_failed = true; break;
             }
         }
         if !flush_failed && self.pending_count > 0 && let Err(err) = self.force_flush() {
-            warn!(?err, drained, "spill drain final flush failed"); flush_failed = true;
+            // Phase 0 / Rule 5: flush failures are ERROR (route to Telegram).
+            error!(?err, drained, "spill drain final flush failed"); flush_failed = true;
         }
         if !flush_failed {
             if let Err(err) = std::fs::remove_file(&spill_path) { warn!(?err, path = %spill_path.display(), "failed to delete spill file"); }
