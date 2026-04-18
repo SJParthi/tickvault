@@ -580,6 +580,174 @@ def tool_list_active_alerts(base_url: str | None = None) -> dict[str, Any]:
     return {"ok": True, "active_count": len(summary), "alerts": summary}
 
 
+def tool_tickvault_api(
+    path: str,
+    base_url: str | None = None,
+) -> dict[str, Any]:
+    """HTTP GET against the tickvault app's own REST API
+    (`/health`, `/api/stats`, `/api/quote/{id}`, `/api/top-movers`,
+    `/api/instruments/diagnostic`, `/api/option-chain`, `/api/pcr`,
+    `/api/index-constituency`).
+
+    Lets Claude inspect the running app's own state without the
+    operator copy-pasting curl output.
+    """
+    import urllib.request
+
+    api_url = base_url or os.environ.get(
+        "TICKVAULT_API_URL", "http://127.0.0.1:3001"
+    )
+    if not path.startswith("/"):
+        path = f"/{path}"
+    full = f"{api_url}{path}"
+    try:
+        with urllib.request.urlopen(full, timeout=10) as resp:  # noqa: S310
+            body = resp.read().decode("utf-8")
+            status = resp.status
+    except Exception as err:  # noqa: BLE001
+        return {"ok": False, "error": str(err), "url": full}
+    # Try JSON — fall back to raw text if not JSON.
+    try:
+        parsed = json.loads(body)
+        return {"ok": True, "status": status, "url": full, "json": parsed}
+    except json.JSONDecodeError:
+        return {"ok": True, "status": status, "url": full, "text": body[:4000]}
+
+
+def tool_grafana_query(
+    endpoint: str,
+    base_url: str | None = None,
+) -> dict[str, Any]:
+    """HTTP GET against the Grafana HTTP API.
+
+    `endpoint` is the path component, e.g.
+      - `/api/health` — Grafana liveness
+      - `/api/search?query=tickvault` — list dashboards matching a term
+      - `/api/dashboards/uid/<UID>` — dashboard JSON by UID
+      - `/api/alertmanager/grafana/api/v2/alerts` — Grafana-managed alerts
+      - `/api/datasources/proxy/uid/<ds_uid>/api/v1/query?query=...` —
+        proxy a Prometheus/other datasource query
+
+    For anonymous Grafana (the tickvault default), unauthenticated
+    reads work. For authenticated, set
+    `TICKVAULT_GRAFANA_API_TOKEN` env var.
+    """
+    import urllib.request
+
+    gf_url = base_url or os.environ.get(
+        "TICKVAULT_GRAFANA_URL", "http://127.0.0.1:3000"
+    )
+    if not endpoint.startswith("/"):
+        endpoint = f"/{endpoint}"
+    full = f"{gf_url}{endpoint}"
+    req = urllib.request.Request(full)
+    token = os.environ.get("TICKVAULT_GRAFANA_API_TOKEN")
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:  # noqa: S310
+            body = resp.read().decode("utf-8")
+            status = resp.status
+    except Exception as err:  # noqa: BLE001
+        return {"ok": False, "error": str(err), "url": full}
+    try:
+        parsed = json.loads(body)
+        return {"ok": True, "status": status, "url": full, "json": parsed}
+    except json.JSONDecodeError:
+        return {"ok": True, "status": status, "url": full, "text": body[:4000]}
+
+
+def tool_docker_status() -> dict[str, Any]:
+    """Return `docker compose ps --format json` for the tickvault
+    Docker stack. Shows every container's name / service / state /
+    health / image without shelling into the host.
+    """
+    import subprocess
+
+    repo = Path(__file__).resolve().parents[3]
+    compose_file = repo / "deploy" / "docker" / "docker-compose.yml"
+    if not compose_file.exists():
+        return {"ok": False, "error": f"compose file not found: {compose_file}"}
+    try:
+        proc = subprocess.run(
+            [
+                "docker",
+                "compose",
+                "-f",
+                str(compose_file),
+                "ps",
+                "--format",
+                "json",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except FileNotFoundError:
+        return {"ok": False, "error": "docker CLI not available"}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": "docker compose ps timed out after 15s"}
+    if proc.returncode != 0:
+        return {
+            "ok": False,
+            "exit_code": proc.returncode,
+            "stderr": proc.stderr.strip()[:1000],
+        }
+    # docker compose ps --format json prints one JSON object per line.
+    containers: list[dict[str, Any]] = []
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            containers.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return {
+        "ok": True,
+        "count": len(containers),
+        "containers": containers,
+    }
+
+
+def tool_app_log_tail(
+    limit: int = 100,
+    date: str | None = None,
+) -> dict[str, Any]:
+    """Return the last `limit` lines of the app.YYYY-MM-DD.log file.
+
+    If `date` (YYYY-MM-DD) is omitted, uses today's UTC date. Useful
+    for INFO/DEBUG-level boot-sequence debugging that the ERROR-only
+    errors.jsonl doesn't capture.
+    """
+    import datetime as dt
+
+    log_dir = _logs_dir()
+    if date is None:
+        date = dt.datetime.utcnow().strftime("%Y-%m-%d")
+    log_file = log_dir / f"app.{date}.log"
+    if not log_file.exists():
+        return {
+            "ok": False,
+            "error": f"log file not found: {log_file}",
+            "log_dir": str(log_dir),
+        }
+    try:
+        with open(log_file, "r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+    except OSError as err:
+        return {"ok": False, "error": str(err), "path": str(log_file)}
+    tail = lines[-int(limit):] if limit > 0 else lines
+    return {
+        "ok": True,
+        "path": str(log_file),
+        "total_lines": len(lines),
+        "returned": len(tail),
+        "lines": [ln.rstrip("\n") for ln in tail],
+    }
+
+
 @dataclass
 class ToolSpec:
     name: str
@@ -823,6 +991,98 @@ TOOLS: list[ToolSpec] = [
             },
         },
         handler=lambda args: tool_git_recent_log(limit=int(args.get("limit", 20))),
+    ),
+    ToolSpec(
+        name="tickvault_api",
+        description=(
+            "HTTP GET against the tickvault app's own REST API (port "
+            "3001 by default). Paths: /health, /api/stats, "
+            "/api/quote/{security_id}, /api/top-movers, "
+            "/api/instruments/diagnostic, /api/option-chain, /api/pcr, "
+            "/api/index-constituency. Returns status + json (or text)."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "API path starting with /",
+                },
+                "base_url": {
+                    "type": "string",
+                    "description": "Override TICKVAULT_API_URL for a single call.",
+                },
+            },
+            "required": ["path"],
+        },
+        handler=lambda args: tool_tickvault_api(
+            path=args["path"],
+            base_url=args.get("base_url"),
+        ),
+    ),
+    ToolSpec(
+        name="grafana_query",
+        description=(
+            "HTTP GET against the Grafana HTTP API. Endpoints: "
+            "/api/health, /api/search?query=X, /api/dashboards/uid/UID, "
+            "/api/datasources/proxy/uid/DS_UID/api/v1/query?query=Q. "
+            "Unauthenticated reads supported; set "
+            "TICKVAULT_GRAFANA_API_TOKEN for authenticated endpoints."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "endpoint": {
+                    "type": "string",
+                    "description": "Grafana API path starting with /",
+                },
+                "base_url": {
+                    "type": "string",
+                    "description": "Override TICKVAULT_GRAFANA_URL.",
+                },
+            },
+            "required": ["endpoint"],
+        },
+        handler=lambda args: tool_grafana_query(
+            endpoint=args["endpoint"],
+            base_url=args.get("base_url"),
+        ),
+    ),
+    ToolSpec(
+        name="docker_status",
+        description=(
+            "Return `docker compose ps --format json` for the tickvault "
+            "stack. Gives Claude container name/service/state/health "
+            "without shelling into the host."
+        ),
+        input_schema={"type": "object", "properties": {}},
+        handler=lambda _args: tool_docker_status(),
+    ),
+    ToolSpec(
+        name="app_log_tail",
+        description=(
+            "Last N lines of data/logs/app.YYYY-MM-DD.log (full "
+            "INFO/DEBUG output, not just ERRORs). Optional `date` "
+            "(YYYY-MM-DD) picks a different day; defaults to today UTC."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "limit": {
+                    "type": "integer",
+                    "description": "Max lines (default 100)",
+                    "default": 100,
+                },
+                "date": {
+                    "type": "string",
+                    "description": "YYYY-MM-DD (default: today UTC)",
+                },
+            },
+        },
+        handler=lambda args: tool_app_log_tail(
+            limit=int(args.get("limit", 100)),
+            date=args.get("date"),
+        ),
     ),
 ]
 
