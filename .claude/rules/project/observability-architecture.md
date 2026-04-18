@@ -183,10 +183,15 @@ summary file and drives the above flow.
       confirmation)
 - [ ] **Phase 4** — AWS CloudWatch parity (deferred until instance
       provisioned; Terraform stays ready)
-- [ ] **Phase 5** — `errors.summary.md` writer (next)
-- [ ] **Phase 6** — `.claude/triage/error-rules.yaml` + triage hook
-- [ ] **Phase 7** — `/loop` prompt + log-query MCP server
-- [ ] **Phase 8** — Auto-fix scripts + AWS Lambda bridge
+- [x] **Phase 5** — `errors.summary.md` writer (60s refresh,
+      signature-hash grouping, lookback filter, 18 unit tests, wired
+      as a background tokio task from main.rs)
+- [x] **Phase 6** — `.claude/triage/error-rules.yaml` (6 seed rules),
+      `.claude/triage/claude-loop-prompt.md`, `error-triage.sh` shell
+      hook, auto-fix-{restart-depth,refresh-instruments}.sh scripts,
+      7-test triage_rules_guard meta-test
+- [ ] **Phase 7** — `/loop` prompt wired to cron / scheduler + log-query MCP server
+- [ ] **Phase 8** — Remaining auto-fix scripts + AWS Lambda bridge
 - [ ] **Phase 9** — Operator Health dashboard + e2e validation script
 - [ ] **Phase 10** — Zero-tick-loss hardening (three-tier buffer proof,
       chaos test, sequence-hole detector)
@@ -208,6 +213,8 @@ Branch: `claude/debug-expired-update-error-p5jSL` (PR #276)
 | `8d34421` | Tag-field migration + tag-guard meta-test |
 | `cce7188` | `tracing-appender` dep + errors.jsonl foundation |
 | `d942695` | Wire JSONL layer + retention sweeper into main.rs |
+| `7b87ab2` | Phase 5 summary_writer + this architecture doc |
+| `a3145e9` | Phase 6 triage YAML + auto-fix scripts + shell hook |
 
 ## Trigger (auto-loaded paths)
 
