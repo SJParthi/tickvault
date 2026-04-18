@@ -1,26 +1,28 @@
 // =============================================================================
-// dhan-live-trader — Grafana Alloy Configuration
+// tickvault — Grafana Alloy Configuration (Phase 3 of active-plan.md)
 // =============================================================================
-// Replaces Promtail (which is BANNED). Collects Docker container logs and
-// forwards them to Loki. Also watches the host app log file for dev mode
-// (cargo run) where the Rust app is not in a Docker container.
-// =============================================================================
+// Collects logs from:
+//   1. Docker containers prefixed `tv-*`
+//   2. The host's data/logs/errors.jsonl.* files (the ERROR-only
+//      structured JSONL stream emitted by the Rust observability layer)
+//   3. The host's data/logs/app.YYYY-MM-DD.log file (full app log)
+//
+// Forwards everything to Loki at tv-loki:3100. Only runs when the
+// operator starts the `logs` compose profile; default stack is untouched.
 
-// ---- Docker container log collection (production + infra services) ----
+// ---- Docker container log collection ----
 
-// Discover Docker containers
 discovery.docker "containers" {
-  host = "unix:///var/run/docker.sock"
+  host             = "unix:///var/run/docker.sock"
   refresh_interval = "10s"
 }
 
-// Filter to only dlt- prefixed containers
-discovery.relabel "dlt_containers" {
+discovery.relabel "tv_containers" {
   targets = discovery.docker.containers.targets
 
   rule {
     source_labels = ["__meta_docker_container_name"]
-    regex         = "/dlt-.*"
+    regex         = "/tv-.*"
     action        = "keep"
   }
 
@@ -36,33 +38,85 @@ discovery.relabel "dlt_containers" {
   }
 }
 
-// Collect logs from discovered containers
-loki.source.docker "dlt_logs" {
+loki.source.docker "tv_containers" {
   host       = "unix:///var/run/docker.sock"
-  targets    = discovery.relabel.dlt_containers.output
-  labels     = { "job" = "dlt-docker" }
+  targets    = discovery.relabel.tv_containers.output
+  labels     = { "job" = "tv-docker" }
   forward_to = [loki.write.default.receiver]
 }
 
-// ---- Host app log file (dev mode: cargo run writes JSON to data/logs/app.log) ----
+// ---- ERROR-only structured JSONL stream ----
+// Phase 2 of active-plan.md writes data/logs/errors.jsonl.YYYY-MM-DD-HH
+// via tracing-appender. Alloy tails every hourly-rotated file so Loki
+// alert rules can pattern-match on code/severity/signature fields.
 
-// The Rust app writes structured JSON logs to data/logs/app.log.
-// This file is mounted into the Alloy container at /var/log/dlt-app/app.log.
-// Labels match the Docker container convention so Grafana dashboards work
-// identically in both dev (cargo run) and production (Docker) modes.
+local.file_match "errors_jsonl" {
+  path_targets = [
+    {"__path__" = "/var/log/tv-app/errors.jsonl*"},
+  ]
+}
+
+loki.source.file "errors_jsonl" {
+  targets    = local.file_match.errors_jsonl.targets
+  labels     = {
+    "job"       = "tv-app",
+    "service"   = "tv-app",
+    "container" = "tv-app",
+    "stream"    = "errors_jsonl",
+  }
+  forward_to = [loki.process.errors_jsonl.receiver]
+}
+
+// Parse the JSONL structure so code/severity/message become label-able fields.
+loki.process "errors_jsonl" {
+  forward_to = [loki.write.default.receiver]
+
+  stage.json {
+    expressions = {
+      timestamp = "timestamp",
+      level     = "level",
+      code      = "code",
+      severity  = "severity",
+      message   = "message",
+      target    = "target",
+    }
+  }
+
+  stage.timestamp {
+    source = "timestamp"
+    format = "RFC3339"
+  }
+
+  stage.labels {
+    values = {
+      level    = "",
+      code     = "",
+      severity = "",
+    }
+  }
+}
+
+// ---- Full app log (dev mode, cargo run) ----
+
 local.file_match "app_logs" {
-  path_targets = [{"__path__" = "/var/log/dlt-app/app.log"}]
+  path_targets = [{"__path__" = "/var/log/tv-app/app.*.log"}]
 }
 
 loki.source.file "app_logs" {
   targets    = local.file_match.app_logs.targets
-  labels     = { "job" = "dlt-docker", "container" = "dlt-app", "service" = "dlt-app" }
+  labels     = {
+    "job"       = "tv-app",
+    "container" = "tv-app",
+    "service"   = "tv-app",
+    "stream"    = "app_log",
+  }
   forward_to = [loki.write.default.receiver]
 }
 
-// ---- Write all logs to Loki ----
+// ---- Write to Loki ----
+
 loki.write "default" {
   endpoint {
-    url = "http://dlt-loki:3100/loki/api/v1/push"
+    url = "http://tv-loki:3100/loki/api/v1/push"
   }
 }

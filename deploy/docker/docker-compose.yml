@@ -25,6 +25,9 @@ volumes:
     name: tv-grafana-data
   tv-prometheus-data:
     name: tv-prometheus-data
+  # Phase 3 of active-plan.md — only used when `--profile logs` starts.
+  tv-loki-data:
+    name: tv-loki-data
 
 services:
   # ---------------------------------------------------------------------------
@@ -344,3 +347,74 @@ services:
     networks:
       - tv-network
 
+
+  # ---------------------------------------------------------------------------
+  # Loki — log aggregation (Phase 3 of active-plan.md)
+  # OPT-IN only: starts with `docker-compose --profile logs up -d`.
+  # Default stack is unaffected. On c7i.xlarge budget: 384MB memory.
+  # Retains errors.jsonl.* structured stream for 30 days; ruler fires
+  # LogQL-based alerts (ErrorBurst, FlushErrorStorm, AuthFailureBurst,
+  # NovelErrorSignature) via Alertmanager → Telegram.
+  # ---------------------------------------------------------------------------
+  tv-loki:
+    image: grafana/loki:3.6.6
+    container_name: tv-loki
+    hostname: tv-loki
+    profiles:
+      - logs
+    restart: unless-stopped
+    mem_limit: 384m
+    cpus: 0.5
+    command: -config.file=/etc/loki/loki-config.yml
+    ports:
+      - "127.0.0.1:3100:3100"
+    volumes:
+      - ./loki/loki-config.yml:/etc/loki/loki-config.yml:ro
+      - ./loki/rules.yml:/loki/rules/fake/rules.yml:ro
+      - tv-loki-data:/loki
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:3100/ready || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - tv-network
+
+  # ---------------------------------------------------------------------------
+  # Alloy — log collector (Phase 3 of active-plan.md)
+  # Tails tv-* container logs AND data/logs/errors.jsonl.* on the host,
+  # forwards everything to tv-loki. 256MB memory.
+  # ---------------------------------------------------------------------------
+  tv-alloy:
+    image: grafana/alloy:v1.8.0
+    container_name: tv-alloy
+    hostname: tv-alloy
+    profiles:
+      - logs
+    restart: unless-stopped
+    mem_limit: 256m
+    cpus: 0.3
+    command:
+      - run
+      - --server.http.listen-addr=0.0.0.0:12345
+      - /etc/alloy/alloy-config.alloy
+    ports:
+      - "127.0.0.1:12345:12345"
+    volumes:
+      - ./alloy/alloy-config.alloy:/etc/alloy/alloy-config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Bind-mount the host's data/logs/ so Alloy can tail errors.jsonl.*
+      # and the daily app.*.log files that the Rust observability layer writes.
+      - ../../data/logs:/var/log/tv-app:ro
+    depends_on:
+      tv-loki:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:12345/-/ready || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - tv-network

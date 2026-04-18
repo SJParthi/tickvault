@@ -128,12 +128,12 @@ CloudWatch ──(5 alarms) ── SNS topic ───────────�
 
 ### Phase 3 — Loki/Alloy re-add under memory budget
 
-- [ ] 3.1 Re-add slim Loki + Alloy to `docker-compose.yml` with tight memory limits that fit the 8GB c7i.xlarge budget after QuestDB trim from 4GB to 3.5GB
+- [x] 3.1 Re-add slim Loki + Alloy to `docker-compose.yml` with tight memory limits that fit the 8GB c7i.xlarge budget after QuestDB trim from 4GB to 3.5GB
   - Files: `deploy/docker/docker-compose.yml`, `deploy/docker/loki/loki-config.yml`, `deploy/docker/alloy/alloy-config.alloy`
   - Mem: Loki 384MB, Alloy 256MB (total new: 640MB; offset by QuestDB 512MB trim → net -128MB, still within budget)
   - Alloy scrapes: `data/logs/errors.jsonl` + `docker logs` for `tv-*` containers
 
-- [ ] 3.2 Loki-ruler log-pattern alerts
+- [x] 3.2 Loki-ruler log-pattern alerts
   - File: `deploy/docker/loki/rules.yml`
   - Rules: `ErrorBurst` (>5 errors in 5min with same signature_hash), `NovelErrorSignature` (signature_hash never seen before in rolling 24h), `FlushErrorStorm`, `AuthFailureBurst`
   - Route: Alertmanager → existing `NotificationService` webhook

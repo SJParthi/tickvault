@@ -1,0 +1,104 @@
+# =============================================================================
+# tickvault — Loki Ruler Rules (Phase 3.2 of active-plan.md)
+# =============================================================================
+# LogQL alert rules that pattern-match the structured errors.jsonl stream
+# (emitted by the Rust app's observability layer, hourly rotated under
+# data/logs/errors.jsonl.YYYY-MM-DD-HH). These alerts complement the
+# Prometheus-metric alerts by catching log patterns that don't have a
+# matching tv_* counter.
+#
+# Loki must be running (`docker-compose --profile logs up -d`) for any of
+# these to fire. When Loki is absent, the alerts are inert — no error.
+#
+# Routes via Loki Ruler → Alertmanager (tv-alertmanager:9093) →
+# webhook → Rust NotificationService → Telegram. Same edge-trigger and
+# dedup behaviour as every other alert in the stack.
+
+groups:
+  - name: tickvault-error-signatures
+    interval: 60s
+    rules:
+      # ---------------------------------------------------------------
+      # ErrorBurst — same signature_hash fires > 5 times in 5 minutes.
+      # Means the system is looping on the same failure mode; operator
+      # should investigate immediately.
+      # ---------------------------------------------------------------
+      - alert: ErrorBurst
+        expr: |
+          sum by (code) (count_over_time(
+            {service="tv-app"} | json | level="ERROR" [5m]
+          )) > 5
+        for: 1m
+        labels:
+          severity: warning
+          source: loki
+        annotations:
+          summary: "Error burst: {{ $labels.code }} fired {{ $value }}x in 5m"
+          runbook: .claude/rules/project/observability-architecture.md
+
+      # ---------------------------------------------------------------
+      # FlushErrorStorm — persist/drain failures stacking. This maps
+      # directly to the Rule-5 WARN→ERROR escalations in Phase 0.
+      # Different from generic ErrorBurst because we hard-route this
+      # to critical severity (Telegram + SMS).
+      # ---------------------------------------------------------------
+      - alert: FlushErrorStorm
+        expr: |
+          sum(count_over_time(
+            {service="tv-app"}
+            |~ "(flush|drain|persist).*(failed|error)"
+            | level="ERROR" [5m]
+          )) > 10
+        for: 2m
+        labels:
+          severity: critical
+          source: loki
+        annotations:
+          summary: "Flush/drain/persist errors > 10/5min — QuestDB pipeline degraded"
+          runbook: .claude/rules/project/observability-architecture.md
+
+      # ---------------------------------------------------------------
+      # AuthFailureBurst — DH-901 / DH-902 / 807 / 808 / 809 / 810
+      # repeating. Auth issues compound quickly if not resolved.
+      # ---------------------------------------------------------------
+      - alert: AuthFailureBurst
+        expr: |
+          sum(count_over_time(
+            {service="tv-app"}
+            | json
+            | level="ERROR"
+            | code=~"DH-901|DH-902|DATA-807|DATA-808|DATA-809|DATA-810|AUTH-GAP-01|AUTH-GAP-02"
+            [10m]
+          )) > 3
+        for: 1m
+        labels:
+          severity: critical
+          source: loki
+        annotations:
+          summary: "Auth failures > 3 in 10m — token rotation or credential problem"
+          runbook: .claude/rules/dhan/authentication.md
+
+      # ---------------------------------------------------------------
+      # NovelErrorSignature — a new signature appeared in the last 15m
+      # that hasn't been seen in the preceding 24h. These are the events
+      # that should trigger a draft GitHub Issue via Claude triage.
+      # ---------------------------------------------------------------
+      - alert: NovelErrorSignature
+        expr: |
+          (
+            sum by (code) (count_over_time(
+              {service="tv-app"} | json | level="ERROR" [15m]
+            )) > 0
+          )
+          unless ignoring (instance) (
+            sum by (code) (count_over_time(
+              {service="tv-app"} | json | level="ERROR" [24h] offset 15m
+            )) > 0
+          )
+        for: 1m
+        labels:
+          severity: warning
+          source: loki
+        annotations:
+          summary: "Novel error code {{ $labels.code }} — first seen in last 15m"
+          runbook: .claude/triage/claude-loop-prompt.md
