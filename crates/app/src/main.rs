@@ -454,6 +454,12 @@ async fn main() -> Result<()> {
                 Box::leak(Box::new(guard));
                 let layer = tracing_subscriber::fmt::layer()
                     .json()
+                    // CRITICAL: flatten_event(true) hoists `code`, `severity`,
+                    // `message` from under "fields" to the top level so
+                    // summary_writer + Claude can pattern-match them without
+                    // walking a nested object. The e2e test
+                    // `observability_chain_e2e` regresses on this flag.
+                    .flatten_event(true)
                     .with_current_span(true)
                     .with_span_list(false)
                     .with_target(true)
