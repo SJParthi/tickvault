@@ -166,6 +166,10 @@ pub fn spawn_ip_monitor(
                 IpCheckResult::Mismatch { expected, actual } => {
                     // GAP-NET-01: CRITICAL alert — IP has changed
                     error!(
+                        code = tickvault_common::error_code::ErrorCode::GapNetIpMonitor.code_str(),
+                        severity = tickvault_common::error_code::ErrorCode::GapNetIpMonitor
+                            .severity()
+                            .as_str(),
                         expected = %mask_ip(expected),
                         actual = %mask_ip(actual),
                         "GAP-NET-01: CRITICAL — IP MISMATCH DETECTED. \
