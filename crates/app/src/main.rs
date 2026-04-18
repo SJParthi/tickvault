@@ -2316,7 +2316,8 @@ async fn main() -> Result<()> {
                                             message_sequence,
                                         )
                                     {
-                                        tracing::warn!(?err, "failed to persist 20-level depth");
+                                        // Phase 0 / Rule 5: persist failures are ERROR (route to Telegram).
+                                        tracing::error!(?err, "failed to persist 20-level depth");
                                     }
 
                                     // OBI accumulation: store bid, compute on ask arrival.
@@ -2410,12 +2411,14 @@ async fn main() -> Result<()> {
                     if let Some(ref mut w) = writer
                         && let Err(err) = w.flush()
                     {
-                        tracing::warn!(?err, "depth writer flush on shutdown failed");
+                        // Phase 0 / Rule 5: flush failures are ERROR (route to Telegram).
+                        tracing::error!(?err, "depth writer flush on shutdown failed");
                     }
                     if let Some(ref mut ow) = obi_writer
                         && let Err(err) = ow.flush()
                     {
-                        tracing::warn!(?err, "OBI writer flush on shutdown failed");
+                        // Phase 0 / Rule 5: flush failures are ERROR (route to Telegram).
+                        tracing::error!(?err, "OBI writer flush on shutdown failed");
                     }
                     tracing::info!(
                         underlying = depth_label_recv,
@@ -4055,7 +4058,8 @@ async fn run_tick_persistence_consumer(
                 let _ = tick_gap_tracker.record_tick(tick.security_id, tick.exchange_timestamp);
 
                 if let Err(err) = tick_writer.append_tick(&tick) {
-                    warn!(?err, "cold-path tick persistence write failed");
+                    // Phase 0 / Rule 5: persistence failures are ERROR (route to Telegram).
+                    error!(?err, "cold-path tick persistence write failed");
                 }
 
                 ticks_persisted = ticks_persisted.saturating_add(1);
@@ -4349,7 +4353,8 @@ async fn run_candle_persistence_consumer(
             aggregator.clear_completed();
 
             if let Err(err) = candle_writer.flush_if_needed() {
-                warn!(?err, "cold-path candle flush failed");
+                // Phase 0 / Rule 5: flush failures are ERROR (route to Telegram).
+                error!(?err, "cold-path candle flush failed");
             }
             last_sweep = std::time::Instant::now();
         }
