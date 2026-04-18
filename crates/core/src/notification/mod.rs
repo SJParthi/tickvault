@@ -16,6 +16,7 @@
 
 pub mod events;
 pub mod service;
+pub mod summary_writer;
 
 pub use events::{NotificationEvent, Severity};
 pub use service::NotificationService;

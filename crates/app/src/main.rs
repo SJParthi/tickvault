@@ -483,6 +483,18 @@ async fn main() -> Result<()> {
         .with(otel_layer)
         .init();
 
+    // Phase 5: background summary_writer task. Emits a human + Claude
+    // readable `data/logs/errors.summary.md` every 60s so `/loop` polling
+    // reads ONE file instead of parsing JSONL, and so `make status` can
+    // cat it for an instant health view.
+    {
+        use tickvault_core::notification::summary_writer::{
+            SummaryWriterConfig, spawn as spawn_summary,
+        };
+        let cfg = SummaryWriterConfig::new(observability::ERRORS_JSONL_DIR);
+        let _summary_task = spawn_summary(cfg);
+    }
+
     // Phase 2: hourly retention sweeper for errors.jsonl. Keeps ~48h of
     // rotated files on disk (~= 500KB at ERROR-only volume). Runs as a
     // best-effort background task — failures log at WARN, never halt.
