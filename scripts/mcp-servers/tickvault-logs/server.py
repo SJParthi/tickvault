@@ -293,6 +293,107 @@ def tool_signature_history(signature: str, limit: int = 500) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+def tool_prometheus_query(query: str, base_url: str | None = None) -> dict[str, Any]:
+    """Run an instant PromQL query against the local Prometheus.
+
+    Returns the raw API response as a dict. Lets Claude ask live
+    questions like "what's tv_ticks_dropped_total right now?" without
+    needing shell access or curl + jq chains.
+    """
+    import urllib.parse
+    import urllib.request
+
+    prom_url = base_url or os.environ.get(
+        "TICKVAULT_PROMETHEUS_URL", "http://127.0.0.1:9090"
+    )
+    full = f"{prom_url}/api/v1/query?query={urllib.parse.quote(query)}"
+    try:
+        with urllib.request.urlopen(full, timeout=5) as resp:  # noqa: S310
+            body = resp.read().decode("utf-8")
+        return {"ok": True, "query": query, "response": json.loads(body)}
+    except Exception as err:  # noqa: BLE001
+        return {"ok": False, "query": query, "error": str(err)}
+
+
+def tool_find_runbook_for_code(code: str) -> dict[str, Any]:
+    """Given an ErrorCode string (e.g. "DH-904"), find the runbook(s)
+    that reference it and return the full markdown path + a preview
+    of the relevant section.
+
+    Lets Claude jump from a Telegram alert to the operator runbook in
+    one tool call, without path-guessing.
+    """
+    here = Path(__file__).resolve()
+    root = here.parent.parent.parent.parent
+    runbooks_dir = root / "docs" / "runbooks"
+    rules_dir = root / ".claude" / "rules"
+
+    matches: list[dict[str, Any]] = []
+    for search_dir in [runbooks_dir, rules_dir]:
+        if not search_dir.exists():
+            continue
+        for md in search_dir.rglob("*.md"):
+            try:
+                text = md.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            if code in text:
+                # Grab up to 3 lines before and after the first mention.
+                lines = text.splitlines()
+                for idx, line in enumerate(lines):
+                    if code in line:
+                        start = max(0, idx - 2)
+                        end = min(len(lines), idx + 4)
+                        preview = "\n".join(lines[start:end])
+                        matches.append(
+                            {
+                                "file": str(md.relative_to(root)),
+                                "first_line": idx + 1,
+                                "preview": preview,
+                            }
+                        )
+                        break
+
+    return {
+        "code": code,
+        "match_count": len(matches),
+        "matches": matches,
+    }
+
+
+def tool_list_active_alerts(base_url: str | None = None) -> dict[str, Any]:
+    """List every active (firing) Alertmanager alert. Gives Claude a
+    live view of WHAT is currently broken without parsing
+    errors.summary.md (the summary_writer lags up to 60s).
+    """
+    import urllib.request
+
+    am_url = base_url or os.environ.get(
+        "TICKVAULT_ALERTMANAGER_URL", "http://127.0.0.1:9093"
+    )
+    full = f"{am_url}/api/v2/alerts?active=true&silenced=false&inhibited=false"
+    try:
+        with urllib.request.urlopen(full, timeout=5) as resp:  # noqa: S310
+            body = resp.read().decode("utf-8")
+        parsed = json.loads(body)
+    except Exception as err:  # noqa: BLE001
+        return {"ok": False, "error": str(err)}
+    summary: list[dict[str, Any]] = []
+    for alert in parsed:
+        labels = alert.get("labels") or {}
+        annotations = alert.get("annotations") or {}
+        summary.append(
+            {
+                "alertname": labels.get("alertname"),
+                "severity": labels.get("severity"),
+                "starts_at": alert.get("startsAt"),
+                "summary": annotations.get("summary"),
+                "runbook": annotations.get("runbook"),
+            }
+        )
+    return {"ok": True, "active_count": len(summary), "alerts": summary}
+
+
 @dataclass
 class ToolSpec:
     name: str
@@ -402,6 +503,58 @@ TOOLS: list[ToolSpec] = [
             signature=args["signature"],
             limit=int(args.get("limit", 500)),
         ),
+    ),
+    ToolSpec(
+        name="prometheus_query",
+        description=(
+            "Run an instant PromQL query against the local Prometheus "
+            "and return the raw API response. Lets Claude answer "
+            "\"what's the value of tv_ticks_dropped_total right now?\" "
+            "in one tool call, no shell required."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "PromQL query (e.g. 'tv_ticks_dropped_total' or 'rate(tv_ticks_processed_total[1m])')",
+                },
+            },
+            "required": ["query"],
+        },
+        handler=lambda args: tool_prometheus_query(query=args["query"]),
+    ),
+    ToolSpec(
+        name="find_runbook_for_code",
+        description=(
+            "Given an ErrorCode string (e.g. 'DH-904', 'I-P1-11'), "
+            "search every file under docs/runbooks/ AND .claude/rules/ "
+            "for the code and return matching file paths + a preview "
+            "of the relevant section. Lets Claude jump from a Telegram "
+            "alert to the operator runbook in one tool call."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "description": "ErrorCode.code_str() e.g. 'DH-904', 'OMS-GAP-03'",
+                },
+            },
+            "required": ["code"],
+        },
+        handler=lambda args: tool_find_runbook_for_code(code=args["code"]),
+    ),
+    ToolSpec(
+        name="list_active_alerts",
+        description=(
+            "List every currently-firing Alertmanager alert (active, "
+            "not silenced, not inhibited). Live view of what's broken "
+            "— more up-to-date than errors.summary.md (which has a 60s "
+            "refresh lag)."
+        ),
+        input_schema={"type": "object", "properties": {}},
+        handler=lambda _args: tool_list_active_alerts(),
     ),
 ]
 

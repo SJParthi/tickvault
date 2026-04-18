@@ -29,6 +29,10 @@ const REQUIRED_TOOL_NAMES: &[&str] = &[
     "summary_snapshot",
     "triage_log_tail",
     "signature_history",
+    // Phase 7.2 expansion — live-query tools for Claude co-work
+    "prometheus_query",
+    "find_runbook_for_code",
+    "list_active_alerts",
 ];
 
 fn workspace_root() -> PathBuf {
@@ -130,6 +134,9 @@ fn tickvault_logs_mcp_server_is_stdlib_only() {
         "from datetime",
         "from pathlib",
         "from typing",
+        // Added for Phase 7.2 expansion (prometheus_query, list_active_alerts)
+        "import urllib.parse",
+        "import urllib.request",
     ];
     for line in src.lines() {
         let trimmed = line.trim_start();
