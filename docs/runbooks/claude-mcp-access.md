@@ -12,7 +12,7 @@
 | B | Your Mac | AWS EC2 | Set 4 env vars pointing at AWS |
 | C | Sandbox / other host | Your Mac (or AWS) | Expose endpoints via tunnel, set 4 env vars |
 
-The MCP server `tickvault-logs` reads these four inputs:
+The MCP server `tickvault-logs` reads these seven inputs:
 
 | Input | Default | Env var to override |
 |---|---|---|
@@ -20,10 +20,37 @@ The MCP server `tickvault-logs` reads these four inputs:
 | Prometheus | `http://127.0.0.1:9090` | `TICKVAULT_PROMETHEUS_URL` |
 | Alertmanager | `http://127.0.0.1:9093` | `TICKVAULT_ALERTMANAGER_URL` |
 | QuestDB | `http://127.0.0.1:9000` | `TICKVAULT_QUESTDB_URL` |
+| tickvault API | `http://127.0.0.1:3001` | `TICKVAULT_API_URL` |
+| Grafana | `http://127.0.0.1:3000` | `TICKVAULT_GRAFANA_URL` |
+| Grafana API token | _none_ | `TICKVAULT_GRAFANA_API_TOKEN` |
 
-`.mcp.json` already passes these four env vars through to the server,
-so setting them in your shell (or in your `.envrc` / `.zshenv`) is
+`.mcp.json` passes all seven env vars through to the server, so
+setting them in your shell (or in your `.envrc` / `.zshenv`) is
 enough — no need to edit `.mcp.json` per environment.
+
+## Full MCP tool surface (16 tools)
+
+Every surface of the tickvault stack is reachable through one MCP
+server — no screenshots, no copy-paste.
+
+| Tool | What it reads |
+|---|---|
+| `summary_snapshot` | `errors.summary.md` |
+| `tail_errors` | `errors.jsonl.*` |
+| `list_novel_signatures` | first-seen signatures over a time window |
+| `signature_history` | all events matching a signature hash |
+| `triage_log_tail` | `data/logs/auto-fix.log` |
+| `find_runbook_for_code` | `.claude/rules/**` runbook lookup |
+| `prometheus_query` | any PromQL |
+| `questdb_sql` | any SQL against all 20 QuestDB tables |
+| `list_active_alerts` | firing Alertmanager alerts |
+| `run_doctor` | `make doctor` parsed output |
+| `grep_codebase` | ripgrep over workspace |
+| `git_recent_log` | last N commits |
+| `tickvault_api` | **any tickvault REST API endpoint** |
+| `grafana_query` | **any Grafana HTTP API endpoint** |
+| `docker_status` | **`docker compose ps --format json`** |
+| `app_log_tail` | **full INFO/DEBUG app log** |
 
 ## Mode A — Mac-local (simplest, recommended)
 
@@ -123,7 +150,7 @@ will NOT fabricate status for unreachable services.
 
 ## Tests that guard this
 
-- `crates/storage/tests/tickvault_logs_mcp_guard.rs` — enforces the MCP
+- `crates/common/tests/tickvault_logs_mcp_guard.rs` — enforces the MCP
   server tool set + self-test.
 - `scripts/validate-automation.sh` check `tickvault-logs MCP self-test
   passes` — runs every time you `make validate-automation`.
