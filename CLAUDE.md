@@ -27,6 +27,28 @@ Every file, function, config decision must pass all three. No exceptions.
 
 Do NOT read reference docs (Dhan refs, standards/) at startup. Read them ONLY when implementing that specific topic.
 
+## AUTOMATION-FIRST RULE (MANDATORY, every session)
+
+Before grepping logs, tailing files, or asking "is X broken?" — use the
+zero-touch automation. It answers faster, cites the exact proof file, and
+never hallucinates.
+
+1. **Health question** ("is anything broken?", "why is depth empty?", "is auth OK?")
+   → run `make doctor` (7-section explicit pass/fail) BEFORE reading files.
+2. **"Are the guards intact?"** → run `make validate-automation` (30 checks).
+3. **Error triage** → `make triage-dry-run` (inspect) → `make triage-execute` (act).
+4. **"What's happening right now?"** → the **tickvault-logs MCP** tools are auto-loaded
+   from `.mcp.json`. Prefer `mcp__tickvault-logs__summary_snapshot`,
+   `tail_errors`, `list_novel_signatures`, `prometheus_query`, `questdb_sql`,
+   `run_doctor` over hand-rolled Bash.
+5. **"How do I fix error code X?"** → `mcp__tickvault-logs__find_runbook_for_code`
+   returns the runbook path in `docs/runbooks/`. Never guess.
+6. **Any 100% claim** ("guaranteed", "always", "never") → cite `docs/architecture/guarantees.md`
+   and name the proof test. No test cited = claim is not allowed.
+
+If Claude Code / Claude co-work does NOT invoke these tools on a health question
+it is breaking this rule — the operator should escalate by pointing at this section.
+
 ## WORKFLOW
 
 Parthiban = architect. Claude Code = builder. Present plan → wait for approval → execute → show proof.
