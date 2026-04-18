@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><style>
+html,body{margin:0;padding:16px;background:#0d1117;font-family:'Inter',sans-serif;color:#e6edf3;box-sizing:border-box}
+.r{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+.b{font-size:10px;font-weight:700;padding:2px 8px;border-radius:3px;text-transform:uppercase;letter-spacing:.5px}
+.up{background:rgba(38,166,154,.15);color:#26a69a}
+.down{background:rgba(239,83,80,.15);color:#ef5350}
+.warn{background:rgba(255,171,0,.15);color:#ffab00}
+.info{background:rgba(41,98,255,.15);color:#2962ff}
+.db{background:rgba(124,77,255,.15);color:#7c4dff}
+.pill{font-size:10px;padding:2px 8px;border-radius:4px;letter-spacing:.5px;font-weight:600}
+.live{background:rgba(38,166,154,.15);color:#26a69a}
+.dot{display:inline-flex;align-items:center;gap:6px;color:#8b949e;font-size:12px}
+.d{width:8px;height:8px;border-radius:50%}
+.dg{background:#05b878;box-shadow:0 0 6px #05b878}
+.dr{background:#ef5350;box-shadow:0 0 6px #ef5350}
+.dy{background:#ffab00;box-shadow:0 0 6px #ffab00}
+h4{font-size:10px;color:#484f58;text-transform:uppercase;letter-spacing:1.5px;margin:0 0 8px;font-weight:600;width:100%}
+</style></head><body>
+<h4>Badges</h4>
+<div class="r" style="margin-bottom:12px">
+  <span class="b up">UP</span><span class="b down">DOWN</span><span class="b warn">BUFFERING</span><span class="b info">API</span><span class="b db">DATABASE</span>
+  <span class="pill live">LIVE</span>
+</div>
+<h4>Status dots</h4>
+<div class="r">
+  <span class="dot"><span class="d dg"></span>Connected</span>
+  <span class="dot"><span class="d dr"></span>Down</span>
+  <span class="dot"><span class="d dy"></span>Buffering</span>
+</div>
+</body></html>
