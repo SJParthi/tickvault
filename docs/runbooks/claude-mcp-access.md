@@ -1,42 +1,101 @@
-# Claude MCP Access Runbook
+# Claude MCP Access Runbook — Universal, Branch-Independent
 
-> **Purpose:** make Claude Code able to read tickvault logs, Prometheus,
-> Alertmanager, and QuestDB WITHOUT the operator pasting screenshots or
-> query output. The user should NEVER have to forward data manually.
+> **Purpose:** every Claude Code session, every claude.ai web sandbox,
+> every claude cowork session — on any branch, any machine — can read
+> tickvault's full runtime state (metrics, logs, alerts, DB) WITHOUT
+> the operator pasting screenshots or query output.
+>
+> **Design principle:** the config lives IN THE REPO, not in
+> per-session env vars. One-time tunnel setup per environment, forever
+> after every clone has working endpoints.
 
-## The three deployment modes
+This is **Milestone 1** of the Autonomous Operations Plan
+(`.claude/plans/autonomous-operations-100pct.md`). It is the prerequisite
+for Layers 2-5 (Diagnose / Decide / Act / Verify+Rollback) — without
+observability access from any Claude session, nothing else works.
 
-| Mode | Where Claude Code runs | Where tickvault runs | What to configure |
+## TL;DR — what you run, once per environment
+
+| You are | Tickvault is | One-time command | Forever after |
 |---|---|---|---|
-| A | Your Mac | Your Mac | Nothing — defaults work |
-| B | Your Mac | AWS EC2 | Set 4 env vars pointing at AWS |
-| C | Sandbox / other host | Your Mac (or AWS) | Expose endpoints via tunnel, set 4 env vars |
+| On your Mac (Claude Code CLI) | Running locally on the same Mac | Nothing | MCP works against `127.0.0.1` |
+| On your Mac, but need remote Claude access | Running locally on the Mac | `bash scripts/tv-tunnel/install-mac.sh` | Remote Claude reads live via Tailscale Funnel |
+| On your Mac | Running on AWS EC2 | `bash scripts/tv-tunnel/install-aws.sh` (on EC2) | Mac Claude + remote Claude both read live via Funnel |
+| In a claude.ai sandbox / claude cowork | Running on Mac or AWS | Same as above (installed on host) | Sandbox Claude reads live via committed repo URLs |
 
-The MCP server `tickvault-logs` reads these seven inputs:
+After install-mac.sh / install-aws.sh runs:
+- Tailscale Funnel auto-starts on reboot (launchd on Mac, systemd on AWS)
+- Ports 9090/9093/9000/3000/3001 are exposed via stable `.ts.net` URLs
+- The URLs never change
+- Write them into `config/claude-mcp-endpoints.toml`, commit, push
+- Every future clone of the repo has working MCP — zero per-session setup
 
-| Input | Default | Env var to override |
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ Claude session (anywhere: Mac, web, sandbox, cowork)        │
+│ ┌───────────────────────────────────────────────────────┐   │
+│ │ tickvault-logs MCP server (Python, local to session)  │   │
+│ │  ↓ reads config/claude-mcp-endpoints.toml             │   │
+│ │  ↓ selects active profile (mac-dev | aws-prod | local)│   │
+│ └────────┬──────────────────────────────────────────────┘   │
+└──────────│──────────────────────────────────────────────────┘
+           │ HTTPS
+           ↓
+┌──────────────────────────────────────────────────────────────┐
+│ Tailscale Funnel (stable public URL on .ts.net)              │
+│ mac-hostname.your-tailnet.ts.net:9090  → Prometheus         │
+│ mac-hostname.your-tailnet.ts.net:9093  → Alertmanager       │
+│ mac-hostname.your-tailnet.ts.net:9000  → QuestDB HTTP       │
+│ mac-hostname.your-tailnet.ts.net:3000  → Grafana            │
+│ mac-hostname.your-tailnet.ts.net:3001  → tickvault API      │
+│                                         ├── /api/debug/logs/summary         │
+│                                         └── /api/debug/logs/jsonl/latest    │
+└──────────────────────────────────────────────────────────────┘
+           ↓ (Mac launchd | AWS systemd restarts on crash/reboot)
+┌──────────────────────────────────────────────────────────────┐
+│ Your tickvault Docker stack (localhost)                      │
+└──────────────────────────────────────────────────────────────┘
+```
+
+Key properties:
+- **Stable URLs**: `.ts.net` hostnames never change across Tailscale restarts.
+- **Branch-independent**: endpoints in repo, so every branch checkout works.
+- **Universal**: works identically on Mac dev, AWS prod, claude.ai sandbox.
+- **Logs over HTTP, not filesystem**: `/api/debug/logs/*` eliminates rsync.
+- **Auto-heal**: launchd/systemd restart the funnel on crash or reboot.
+
+## Seven inputs the MCP server reads
+
+Read from `config/claude-mcp-endpoints.toml` under the active profile.
+Env vars (when set) override the file. The file overrides hardcoded
+localhost defaults.
+
+| Input | Env override | Profile key |
 |---|---|---|
-| errors.jsonl directory | `<repo>/data/logs` | `TICKVAULT_LOGS_DIR` |
-| Prometheus | `http://127.0.0.1:9090` | `TICKVAULT_PROMETHEUS_URL` |
-| Alertmanager | `http://127.0.0.1:9093` | `TICKVAULT_ALERTMANAGER_URL` |
-| QuestDB | `http://127.0.0.1:9000` | `TICKVAULT_QUESTDB_URL` |
-| tickvault API | `http://127.0.0.1:3001` | `TICKVAULT_API_URL` |
-| Grafana | `http://127.0.0.1:3000` | `TICKVAULT_GRAFANA_URL` |
-| Grafana API token | _none_ | `TICKVAULT_GRAFANA_API_TOKEN` |
+| Prometheus URL | `TICKVAULT_PROMETHEUS_URL` | `prometheus_url` |
+| Alertmanager URL | `TICKVAULT_ALERTMANAGER_URL` | `alertmanager_url` |
+| QuestDB HTTP URL | `TICKVAULT_QUESTDB_URL` | `questdb_url` |
+| Grafana URL | `TICKVAULT_GRAFANA_URL` | `grafana_url` |
+| tickvault API URL | `TICKVAULT_API_URL` | `tickvault_api_url` |
+| Logs source | `TICKVAULT_LOGS_SOURCE` (`http` or `local`) | `logs_source` |
+| Logs directory (when `local`) | `TICKVAULT_LOGS_DIR` | `logs_dir_local` |
 
-`.mcp.json` passes all seven env vars through to the server, so
-setting them in your shell (or in your `.envrc` / `.zshenv`) is
-enough — no need to edit `.mcp.json` per environment.
+Profile selection order:
+1. `TICKVAULT_MCP_PROFILE` env var (single-session override)
+2. `active = "<name>"` at the top of `claude-mcp-endpoints.toml`
+3. Fallback to `"local"` (everything on `127.0.0.1`)
 
 ## Full MCP tool surface (16 tools)
 
-Every surface of the tickvault stack is reachable through one MCP
-server — no screenshots, no copy-paste.
+Every surface of the tickvault stack is reachable through one MCP server
+— no screenshots, no copy-paste, no manual tailing.
 
 | Tool | What it reads |
 |---|---|
-| `summary_snapshot` | `errors.summary.md` |
-| `tail_errors` | `errors.jsonl.*` |
+| `summary_snapshot` | `errors.summary.md` (local OR via `/api/debug/logs/summary`) |
+| `tail_errors` | `errors.jsonl.*` (local OR via `/api/debug/logs/jsonl/latest`) |
 | `list_novel_signatures` | first-seen signatures over a time window |
 | `signature_history` | all events matching a signature hash |
 | `triage_log_tail` | `data/logs/auto-fix.log` |
@@ -47,110 +106,136 @@ server — no screenshots, no copy-paste.
 | `run_doctor` | `make doctor` parsed output |
 | `grep_codebase` | ripgrep over workspace |
 | `git_recent_log` | last N commits |
-| `tickvault_api` | **any tickvault REST API endpoint** |
-| `grafana_query` | **any Grafana HTTP API endpoint** |
-| `docker_status` | **`docker compose ps --format json`** |
-| `app_log_tail` | **full INFO/DEBUG app log** |
+| `tickvault_api` | any tickvault REST API endpoint |
+| `grafana_query` | any Grafana HTTP API endpoint |
+| `docker_status` | `docker compose ps --format json` |
+| `app_log_tail` | full INFO/DEBUG app log |
 
-## Mode A — Mac-local (simplest, recommended)
+## Mode A — Claude on Mac, tickvault on Mac (simplest)
 
 ```bash
-# On the Mac, in the tickvault repo root:
+# On the Mac, in the tickvault repo root
 make run                 # starts Docker + tickvault
-claude                   # launches Claude Code on the Mac
+claude                   # launches Claude Code
 ```
 
-Nothing to configure. The MCP server reads `./data/logs/` and
-`localhost:9000/9090/9093` directly.
+Active profile: `local` (or whichever is set in the committed config).
+No tunnel, no env vars. Logs read from `./data/logs/` directly.
 
 Verify:
-
 ```bash
 bash scripts/mcp-doctor.sh
-# Expect: all 4 checks PASS.
 ```
 
 ## Mode B — Claude on Mac, tickvault on AWS EC2
 
-Add to `~/.zshenv` (or your shell rc):
+1. On AWS: `bash scripts/tv-tunnel/install-aws.sh` (see "One-time AWS setup" below).
+2. On Mac: edit `config/claude-mcp-endpoints.toml`, set `active = "aws-prod"`, commit, push.
+3. On Mac: `claude` — it now queries the AWS stack live.
+
+## Mode C — Claude in a sandbox / claude.ai / cowork (universal)
+
+This replaces the old (broken) Mode C that assumed SSH reverse tunnels —
+sandboxes can't accept inbound connections.
+
+### C.1 — One-time Mac setup
 
 ```bash
-export TICKVAULT_PROMETHEUS_URL="https://<your-ec2-public-dns>:9090"
-export TICKVAULT_ALERTMANAGER_URL="https://<your-ec2-public-dns>:9093"
-export TICKVAULT_QUESTDB_URL="https://<your-ec2-public-dns>:9000"
-# Keep logs local via SSH rsync cron OR point at a shared EFS mount:
-export TICKVAULT_LOGS_DIR="$HOME/tickvault-logs-sync"
+bash scripts/tv-tunnel/install-mac.sh
 ```
 
-Set up a rsync cron on the Mac (every 30s is enough because the summary
-is refreshed every 60s):
+The script:
+- Verifies macOS, installs Tailscale via brew if missing
+- Launches `tailscale up` (login flow in browser) if not already logged in
+- Verifies Funnel feature is enabled on your tailnet (if not, points you to the admin ACL URL)
+- Installs `~/Library/LaunchAgents/com.tickvault.tunnel.plist`
+- Loads the launchd service, which calls `tailscale funnel --bg 9090 9093 9000 3000 3001`
+- Probes for the funnel to come up within 30s
+- Prints your stable URLs — paste them into `config/claude-mcp-endpoints.toml`
 
-```cron
-* * * * * rsync -az --delete ec2-user@<ec2>:/home/ec2-user/tickvault/data/logs/ ~/tickvault-logs-sync/
-```
-
-Restart Claude Code so it picks up the new env. Verify with
-`scripts/mcp-doctor.sh`.
-
-## Mode C — Claude in a sandbox (gVisor / container / web)
-
-This is the case where `127.0.0.1:9000` inside the sandbox is NOT your
-Mac. There are two supported sub-modes.
-
-### C.1 — Tailscale
-
-1. Install Tailscale on the Mac AND on the sandbox host.
-2. Join both to the same tailnet.
-3. On the Mac, find your Tailscale IP (`tailscale ip -4`).
-4. In the sandbox shell:
-   ```bash
-   export TICKVAULT_PROMETHEUS_URL="http://<tailscale-ip>:9090"
-   export TICKVAULT_ALERTMANAGER_URL="http://<tailscale-ip>:9093"
-   export TICKVAULT_QUESTDB_URL="http://<tailscale-ip>:9000"
-   ```
-5. Mount the Mac's `data/logs/` into the sandbox (e.g. `tailscale serve
-   --bg 8080` + filesystem sync, or Syncthing, or a scp cron).
-6. Point `TICKVAULT_LOGS_DIR` at the mount point.
-
-### C.2 — SSH reverse tunnel
-
-Single command from the Mac:
+### C.2 — One-time AWS setup (when EC2 is provisioned)
 
 ```bash
-ssh -N -R 9090:localhost:9090 \
-       -R 9093:localhost:9093 \
-       -R 9000:localhost:9000 \
-       <sandbox-user>@<sandbox-host>
+# On the EC2 instance
+bash scripts/tv-tunnel/install-aws.sh
 ```
 
-Then inside the sandbox, the defaults `http://127.0.0.1:9090` etc. work
-unchanged. Still need to sync `data/logs/` separately (see C.1 step 5).
+Same flow, but installs `/etc/systemd/system/tickvault-tunnel.service`
+and uses `systemctl enable --now`.
 
-## Mode C limitations (honest)
+### C.3 — One-time repo update
 
-- The log files must physically exist on the host Claude runs on, or
-  appear there via a file-sync mechanism. The MCP server reads files
-  with Python `open()` — there is no "fetch over HTTP" mode.
-- If you don't want to run a sync job, Mode A is the right answer.
+After one or both installs finish, run the doctor in emit-config mode:
+
+```bash
+bash scripts/tv-tunnel/doctor.sh --emit-config
+```
+
+This prints a TOML block like:
+```toml
+[profiles.mac-dev]
+prometheus_url    = "https://your-mac.tailnet-name.ts.net:9090"
+alertmanager_url  = "https://your-mac.tailnet-name.ts.net:9093"
+questdb_url       = "https://your-mac.tailnet-name.ts.net:9000"
+grafana_url       = "https://your-mac.tailnet-name.ts.net:3000"
+tickvault_api_url = "https://your-mac.tailnet-name.ts.net:3001"
+logs_source       = "http"
+logs_dir_local    = "./data/logs"
+```
+
+Paste it into `config/claude-mcp-endpoints.toml` (replacing the
+placeholder Mac or AWS profile), set `active = "mac-dev"` or
+`"aws-prod"`, commit, push.
+
+Any Claude session on any branch from that point on reads live data.
 
 ## Verification — after ANY mode change
 
 ```bash
-bash scripts/mcp-doctor.sh
+bash scripts/mcp-doctor.sh            # MCP-level probes (4 checks)
+bash scripts/tv-tunnel/doctor.sh       # Tunnel-level probes (7 checks)
 ```
 
-All 4 checks must pass. If any fails, the specific check name tells
-you exactly which endpoint is unreachable.
+Both should exit 0.
 
 ## When Claude cannot reach a specific service
 
-Claude will tell you honestly which service is unreachable (via
-`mcp-doctor.sh` output or via the MCP tool's error response). Claude
-will NOT fabricate status for unreachable services.
+Claude reports honestly which endpoint is unreachable (via the
+`mcp-doctor.sh` or `tv-tunnel/doctor.sh` output, or directly via the
+MCP tool's error response). Claude never fabricates status for
+unreachable services.
 
 ## Tests that guard this
 
-- `crates/common/tests/tickvault_logs_mcp_guard.rs` — enforces the MCP
+- `crates/common/tests/tickvault_logs_mcp_guard.rs` — enforces MCP
   server tool set + self-test.
 - `scripts/validate-automation.sh` check `tickvault-logs MCP self-test
-  passes` — runs every time you `make validate-automation`.
+  passes` — runs every `make validate-automation`.
+- `crates/api/src/handlers/debug.rs` unit tests — 11 tests covering
+  route handlers, env-var resolution, missing-file handling.
+- `crates/common/tests/claude_mcp_endpoints_config_guard.rs` — enforces
+  the committed config file contains all required profile keys and is
+  parseable by the MCP server.
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `tailscale funnel status` says "inactive" | `sudo launchctl load -w ~/Library/LaunchAgents/com.tickvault.tunnel.plist` (Mac) / `sudo systemctl start tickvault-tunnel` (AWS) |
+| Funnel status OK but curl returns 000 | Check tickvault Docker is up: `make docker-status` |
+| MCP always hits localhost | Check `active = "mac-dev"` or `aws-prod"` in `config/claude-mcp-endpoints.toml` — default is `local` |
+| Need to point session at different env | `TICKVAULT_MCP_PROFILE=aws-prod claude` — overrides committed config for that session only |
+| `/api/debug/logs/summary` returns 404 | App hasn't written `errors.summary.md` yet (60s refresh cadence). Check `ls data/logs/errors.summary.md` on the host. |
+
+## Security notes
+
+- Tailscale Funnel exposes to the public internet via HTTPS. Access is
+  gated by the Funnel feature's per-node ACL.
+- The debug log endpoints return ERROR signatures and metric values
+  only — never auth tokens, order payloads, or user PII.
+- tickvault's protected endpoints (order place/cancel) remain behind
+  `TV_API_TOKEN` bearer auth. The debug endpoints are read-only and
+  intentionally outside that wall so observability is always available.
+- The Dhan access token, AWS credentials, and private keys are never
+  logged to `errors.jsonl` (enforced by
+  `.claude/hooks/banned-pattern-scanner.sh`).

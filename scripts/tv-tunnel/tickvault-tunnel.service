@@ -1,0 +1,28 @@
+[Unit]
+Description=tickvault Tailscale Funnel — exposes observability ports for Claude MCP access
+Documentation=file:///home/ec2-user/tickvault/docs/runbooks/claude-mcp-access.md
+After=network-online.target tailscaled.service
+Wants=network-online.target tailscaled.service
+
+[Service]
+Type=simple
+# Funnel foreground mode so systemd owns the lifecycle.
+ExecStart=/usr/bin/tailscale funnel 9090 9093 9000 3000 3001
+ExecStopPost=/usr/bin/tailscale funnel reset
+Restart=always
+RestartSec=10
+# Funnel requires root on Linux to bind low ports on the TS socket.
+User=root
+Group=root
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target

@@ -144,6 +144,18 @@ pub fn build_router(state: SharedAppState, allowed_origins: &[String], dry_run: 
         .nest_service(
             "/portal/design",
             tower_http::services::ServeDir::new("ui_kits"),
+        )
+        // Autonomous-ops Layer 1 (observability): read-only log access
+        // for Claude MCP / remote sessions. See
+        // `.claude/plans/autonomous-operations-100pct.md` + the
+        // claude-mcp-access runbook.
+        .route(
+            "/api/debug/logs/summary",
+            axum::routing::get(handlers::debug::logs_summary),
+        )
+        .route(
+            "/api/debug/logs/jsonl/latest",
+            axum::routing::get(handlers::debug::logs_jsonl_latest),
         );
 
     public_routes
