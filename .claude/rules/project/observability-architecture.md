@@ -202,7 +202,13 @@ summary file and drives the above flow.
 - [~] **Phase 10.1** — Zero-tick-loss alert guard (4 Prometheus alerts
       pinned, 7 source-invariant tests); Phase 10.2 sequence-hole
       detector and 10.3 chaos test still pending
-- [ ] **Phase 11** — WS + QuestDB resilience SLAs (chaos tests nightly)
+- [~] **Phase 11** — WS + QuestDB + Valkey resilience SLA ALERT GUARD
+      shipped (`crates/storage/tests/resilience_sla_alert_guard.rs`,
+      6 tests, 6 alert rules + 6 metric emissions pinned). Chaos
+      integration tests (11.1 nightly chaos, 11.2 backpressure sim,
+      11.3 Valkey kill-test) still pending — require a test harness
+      that can kill + restore Docker services from within the CI
+      runner. Next session.
 - [x] **Phase 12.1** — 100% line coverage threshold set in
       `quality/crate-coverage-thresholds.toml`, enforced by
       `scripts/coverage-gate.sh` in CI
@@ -213,8 +219,15 @@ summary file and drives the above flow.
 - [x] **Phase 12.6** — Boot-time/process-time self-check via the e2e
       chain test (`crates/app/tests/observability_chain_e2e.rs`)
       asserting error! → JSONL → summary.md in-process
-- [ ] **Phase 12.2/12.3** — Tighten mutation (zero-survivor gate) +
-      fuzz 24h duration bump (extensions of existing CI workflows)
+- [x] **Phase 12.2** — Mutation zero-survivor gate already active in
+      `.github/workflows/mutation.yml:103-113` — any `SURVIVED` line
+      in results fails the PR.
+- [~] **Phase 12.3** — Fuzz duration. Current config:
+      5 min/target/week (tick_parser, config_parser). "24h clean"
+      aspiration would exceed GitHub Actions free-tier budget —
+      deferred until either (a) operator confirms paid-tier OK
+      or (b) we self-host the fuzz runner. Mid-point bump to
+      1h/target/week is a reasonable next step if cost allows.
 - [x] ~~**Phase 12.4** `#![deny(warnings)]` workspace-wide~~ SKIPPED —
       future toolchain deprecation warnings would silently break
       prod builds; the targeted lints already in place
@@ -241,6 +254,8 @@ Branch: `claude/debug-expired-update-error-p5jSL` (PR #276)
 | `9e807ca` | Phase 12.6 observability_chain_e2e (+ flatten_event fix) |
 | `275157a` | Phase 10.1 zero-tick-loss alert guard (7 pins) |
 | `a81206f` | Phase 2.2 / 5.2 / 8.1 / 9.2 operator commands + 20-check validation |
+| `1cdd78a` | Phase 9.1 operator-health single-page Grafana dashboard |
+| `897f7b6` | Phase 11 resilience SLA alert guard (WS/QuestDB/Valkey pins) |
 
 ## Trigger (auto-loaded paths)
 

@@ -252,12 +252,12 @@ CloudWatch ──(5 alarms) ── SNS topic ───────────�
   - File: `quality/crate-coverage-thresholds.toml` — set all crates to 100
   - Any exemption requires a `// COVERAGE-EXEMPT: <reason>` comment + operator sign-off
 
-- [ ] 12.2 Mutation score 100% (zero survivors)
+- [x] 12.2 Mutation score 100% (zero survivors)
   - CI gate: `cargo mutants --workspace --error-exit-code 1 -- --release`
   - Schedule: nightly, PR blocks if new survivor introduced
   - File: `.github/workflows/mutation.yml` (extend)
 
-- [ ] 12.3 Fuzz 24h clean
+- [~] 12.3 Fuzz 24h clean
   - CI gate: nightly runs `cargo fuzz run tick_parser` + `cargo fuzz run config_parser` for 8h each
   - Zero crash + zero hang = pass
   - File: `.github/workflows/fuzz.yml` (extend duration)
