@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><style>
+html,body{margin:0;padding:16px;background:#0d1117;font-family:'Inter',sans-serif;color:#e6edf3;box-sizing:border-box}
+.row{display:flex;gap:14px;flex-wrap:wrap;align-items:center}
+.stat{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:12px 14px;text-align:center;min-width:120px}
+.v{font-size:22px;font-weight:700;color:#26a69a;font-family:'JetBrains Mono',monospace}
+.l{font-size:10px;color:#8b949e;text-transform:uppercase;letter-spacing:1px;margin-top:4px}
+.v.d{color:#ef5350}.v.b{color:#2962ff}
+.meter{display:flex;align-items:center;gap:8px}
+.bar{width:80px;height:4px;background:#30363d;border-radius:2px;overflow:hidden}
+.fill{height:100%;background:#26a69a;border-radius:2px}
+.fill.y{background:#ffab00}.fill.r{background:#ef5350}
+.pct{font-family:'JetBrains Mono',monospace;font-size:11px;color:#8b949e;min-width:32px}
+</style></head><body>
+<div class="row" style="margin-bottom:14px">
+  <div class="stat"><div class="v">2,439</div><div class="l">Tests</div></div>
+  <div class="stat"><div class="v b">14</div><div class="l">QuestDB Tables</div></div>
+  <div class="stat"><div class="v d">DOWN</div><div class="l">Order WS</div></div>
+</div>
+<div class="row">
+  <div class="meter"><span class="pct">40%</span><div class="bar"><div class="fill" style="width:40%"></div></div></div>
+  <div class="meter"><span class="pct">85%</span><div class="bar"><div class="fill y" style="width:85%"></div></div></div>
+  <div class="meter"><span class="pct">0%</span><div class="bar"><div class="fill r" style="width:100%"></div></div></div>
+</div>
+</body></html>

@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><style>
+html,body{margin:0;padding:16px;background:#0d1117;font-family:'Inter',sans-serif;color:#e6edf3;box-sizing:border-box}
+.card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px;width:260px;transition:all .15s ease;cursor:pointer}
+.card:hover{background:#1c2228;border-color:#2962ff;transform:translateY(-2px);box-shadow:0 4px 12px rgba(41,98,255,.15)}
+.t{font-size:15px;font-weight:600;margin-bottom:4px}
+.d{font-size:12px;color:#8b949e;line-height:1.5;margin-bottom:8px}
+.u{font-size:11px;color:#2962ff;font-family:'JetBrains Mono',monospace}
+.b{display:inline-block;font-size:10px;font-weight:700;padding:2px 8px;border-radius:3px;background:rgba(38,166,154,.15);color:#26a69a;margin-top:8px;letter-spacing:.5px}
+.row{display:flex;gap:12px}
+</style></head><body>
+<div class="row">
+<a class="card"><div class="t">Market Dashboard</div><div class="d">Live index tickers, stock movers (gainers/losers), option movers (OI/Volume).</div><div class="u">/portal/market-dashboard</div><div class="b">LIVE</div></a>
+<a class="card" style="border-color:#2962ff;background:#1c2228;transform:translateY(-2px);box-shadow:0 4px 12px rgba(41,98,255,.15)"><div class="t">WebSocket Dashboard</div><div class="d">Pool utilization, subsystem health, rate-limit reference.</div><div class="u">/portal/ws-dashboard</div><div class="b" style="background:rgba(41,98,255,.15);color:#2962ff">API</div></a>
+</div>
+</body></html>

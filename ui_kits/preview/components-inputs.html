@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><style>
+html,body{margin:0;padding:16px;background:#0d1117;font-family:'Inter',sans-serif;color:#e6edf3;box-sizing:border-box}
+.row{display:flex;gap:16px;margin-bottom:14px;align-items:center}
+input{background:#0d1117;color:#e6edf3;border:1px solid #30363d;padding:6px 10px;border-radius:4px;font-family:inherit;font-size:12px;width:200px}
+input:focus{outline:none;border-color:#2962ff}
+select{background:#0d1117;color:#e6edf3;border:1px solid #30363d;padding:6px 10px;border-radius:4px;font-size:12px}
+.seg{display:flex;border:1px solid #30363d;border-radius:4px;overflow:hidden}
+.seg button{background:#181818;color:#8b949e;border:none;padding:5px 14px;font-size:12px;cursor:pointer;border-right:1px solid #30363d}
+.seg button:last-child{border-right:none}
+.seg button.on{background:#242424;color:#e6edf3}
+.btn{background:#161b22;color:#e6edf3;border:1px solid #30363d;padding:6px 14px;border-radius:4px;font-size:12px;cursor:pointer}
+.btn:hover{border-color:#2962ff}
+.btn.p{background:#2962ff;border-color:#2962ff;color:#fff}
+</style></head><body>
+<div class="row"><input placeholder="Search eg: Infy, Nifty Fut, Nifty 24000 CE"><select><option>NIFTY 50</option></select></div>
+<div class="row"><div class="seg"><button class="on">NSE</button><button>BSE</button></div>
+<div class="seg"><button class="on">Rise &amp; Fall</button><button>Recovery</button></div></div>
+<div class="row"><button class="btn">Cancel</button><button class="btn p">Subscribe</button></div>
+</body></html>

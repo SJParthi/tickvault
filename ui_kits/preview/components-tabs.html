@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><style>
+html,body{margin:0;padding:16px;background:#0d1117;font-family:'Inter',sans-serif;color:#e6edf3;box-sizing:border-box}
+.tabs{display:flex;gap:0;background:#161b22;border-bottom:1px solid #30363d;margin-bottom:14px}
+.tab{padding:10px 24px;cursor:pointer;font-size:13px;font-weight:500;color:#8b949e;border-bottom:2px solid transparent}
+.tab.on{color:#2962ff;border-bottom-color:#2962ff}
+.pill-tabs{display:flex;gap:4px;padding:6px 0}
+.p-tab{padding:5px 20px;color:#8b949e;font-size:13px;background:#181818;border:none;cursor:pointer;height:32px;display:flex;align-items:center}
+.p-tab.on{color:#05b878;background:#1c2c27;border:1px solid #138c61;border-radius:8px}
+.sub{display:flex;gap:4px;margin-top:8px}
+.s-tab{padding:5px 14px;font-size:12px;color:#8b949e;background:#161b22;border:1px solid #30363d;border-radius:4px;cursor:pointer}
+.s-tab.on{color:#2962ff;border-color:#2962ff;background:rgba(41,98,255,.1)}
+</style></head><body>
+<div class="tabs"><div class="tab on">Connections</div><div class="tab">Subsystems</div><div class="tab">Limits</div></div>
+<div class="pill-tabs">
+  <button class="p-tab">Live</button><button class="p-tab on">Stocks</button><button class="p-tab">Options</button><button class="p-tab">Futures</button>
+</div>
+<div class="sub"><div class="s-tab on">Pool Status</div><div class="s-tab">Connection Detail</div></div>
+</body></html>

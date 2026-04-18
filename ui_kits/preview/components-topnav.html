@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><style>
+html,body{margin:0;padding:0;background:#0d1117;font-family:'Inter',sans-serif;color:#e6edf3;box-sizing:border-box}
+.nav{display:flex;align-items:center;background:rgba(18,18,18,.62);border-bottom:1px solid #242424;padding:0 20px;gap:20px;height:60px}
+.logo{width:30px;height:30px;border-radius:50%;background:linear-gradient(135deg,#1e90ff,#4169e1);display:flex;align-items:center;justify-content:center;color:#fff;font-weight:700;font-size:14px}
+.search{background:#242424;border:1px solid #242424;border-radius:4px;padding:8px 12px;color:#8e8e8e;width:220px;font-size:13px}
+.links{display:flex;gap:28px}
+.links a{color:#8e8e8e;text-decoration:none;font-size:13px}
+.links a.on{color:#05b878}
+.right{margin-left:auto;display:flex;align-items:center;gap:16px}
+.live{display:flex;align-items:center;gap:6px;font-size:12px;color:#8e8e8e}
+.dot{width:8px;height:8px;background:#05b878;border-radius:50%;animation:p 2s infinite}
+.av{width:32px;height:32px;border-radius:50%;background:linear-gradient(135deg,#9370db,#6a4c93);display:flex;align-items:center;justify-content:center;color:#fff;font-weight:700;font-size:14px}
+@keyframes p{0%,100%{opacity:1}50%{opacity:.5}}
+.ticker{display:flex;background:#181818;border-bottom:1px solid #242424;padding:8px 20px;gap:30px;font-size:12px}
+.t-item{display:flex;gap:10px;align-items:center}
+.t-n{color:#8e8e8e}.t-v{color:#dadada}.t-u{color:#05b878}.t-d{color:#dd6565}
+</style></head><body>
+<div class="nav">
+  <div class="logo">D</div>
+  <input class="search" placeholder="Search eg: Infy, Nifty Fut">
+  <div class="links"><a>Home</a><a>Portfolio</a><a>Positions</a><a>Orders</a><a class="on">Markets</a></div>
+  <div class="right"><div class="live"><div class="dot"></div><span>LIVE</span></div><div class="av">P</div></div>
+</div>
+<div class="ticker">
+  <div class="t-item"><span class="t-n">Nifty 50</span><span class="t-v">24,862.05</span><span class="t-u">+0.42%</span></div>
+  <div class="t-item"><span class="t-n">Nifty Bank</span><span class="t-v">52,104.30</span><span class="t-d">-0.18%</span></div>
+  <div class="t-item"><span class="t-n">India VIX</span><span class="t-v">14.22</span><span class="t-u">+1.24%</span></div>
+  <div class="t-item"><span class="t-n">Sensex</span><span class="t-v">81,402.11</span><span class="t-u">+0.38%</span></div>
+</div>
+</body></html>
