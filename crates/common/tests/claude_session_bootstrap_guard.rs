@@ -491,6 +491,33 @@ fn dhat_depth_sequence_tracker_test_exists() {
 }
 
 #[test]
+fn health_slash_command_exists_and_wires_all_layers() {
+    // Every new or existing Claude Code session must be able to type
+    // `/health` and get the full automation + observability snapshot
+    // with zero manual setup. The command file is version-controlled
+    // so it works identically on every clone.
+    let cmd = read(".claude/commands/health.md");
+    for required in [
+        "validate-automation.sh",
+        "doctor.sh",
+        "100pct-audit.sh",
+        "tail_errors",
+        "summary_snapshot",
+        "list_novel_signatures",
+        "prometheus_query",
+        "questdb_sql",
+        "list_active_alerts",
+        "session-env",
+    ] {
+        assert!(
+            cmd.contains(required),
+            "/health command must invoke {required} to be a complete \
+             automation snapshot"
+        );
+    }
+}
+
+#[test]
 fn active_profile_is_one_of_the_known_profiles() {
     let cfg = read("config/claude-mcp-endpoints.toml");
     let active_line = cfg
