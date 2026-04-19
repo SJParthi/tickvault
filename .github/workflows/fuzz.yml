@@ -14,6 +14,12 @@ on:
   schedule:
     - cron: '0 2 * * 1'  # Weekly Monday 2 AM UTC — saves ~85% scheduled minutes vs daily
   workflow_dispatch:       # Allow manual trigger for on-demand testing
+    inputs:
+      fuzz_duration_secs:
+        description: 'Seconds per target (default 3600 = 1h scheduled; manual can go higher)'
+        required: false
+        default: '3600'
+        type: string
 
 permissions:
   contents: read
@@ -78,12 +84,18 @@ jobs:
       - name: Run fuzz target (${{ matrix.target }})
         id: fuzz
         if: steps.check.outputs.exists == 'true' && steps.build.outcome == 'success'
+        env:
+          # PR #288 (#8 + Phase 12.3): scheduled runs use 3600s (1h), 12x the
+          # prior 300s. 2 targets x 1h = 2h/week = 8h/month — ~0.4% of the
+          # 2000-min/mo GH Actions free-tier budget. Still well within cost
+          # per aws-budget.md. Manual dispatch can go higher for deep runs.
+          FUZZ_SECS: ${{ github.event.inputs.fuzz_duration_secs || '3600' }}
         run: |
-          # Run for 5 minutes per target.
           # -rss_limit_mb=4096: increase RSS limit for ASan-instrumented builds.
-          # -max_total_time=300: stop after 5 minutes if no crash found.
-          timeout 300 cargo +${{ env.NIGHTLY_VERSION }} fuzz run ${{ matrix.target }} \
-            -- -max_total_time=300 -rss_limit_mb=4096 2>&1 | tee /tmp/fuzz-run.log || {
+          # -max_total_time=$FUZZ_SECS: stop after N seconds if no crash found.
+          # outer `timeout` matches to prevent runaway.
+          timeout "${FUZZ_SECS}" cargo +${{ env.NIGHTLY_VERSION }} fuzz run ${{ matrix.target }} \
+            -- -max_total_time="${FUZZ_SECS}" -rss_limit_mb=4096 2>&1 | tee /tmp/fuzz-run.log || {
             EXIT_CODE=${PIPESTATUS[0]}
             if [ "$EXIT_CODE" -eq 124 ]; then
               echo "Fuzz run completed (timeout reached — no crashes found)"

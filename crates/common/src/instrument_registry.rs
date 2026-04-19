@@ -147,6 +147,16 @@ pub struct InstrumentRegistry {
     /// startup means Dhan's CSV reused an id across segments and the
     /// operator should verify both segments are streaming ticks.
     cross_segment_collisions: u64,
+
+    /// I-P1-11 (2026-04-19, PR #288): specific colliding pairs detected at
+    /// construction. Each entry = `(security_id, losing_segment, winning_segment)`
+    /// where `losing_segment` is the one dropped from the legacy single-segment
+    /// `instruments` map and `winning_segment` is the one kept. Both entries
+    /// ARE still addressable via `by_composite`/`get_with_segment`; this field
+    /// exists so operators can see WHICH ids collided without grepping logs.
+    /// Cold-path (used by operator diagnostics + session-start snapshot).
+    // APPROVED: Vec is cold-path operator-facing diagnostic, not hot-path lookup.
+    collision_pairs: Vec<(SecurityId, ExchangeSegment, ExchangeSegment)>,
 }
 
 impl InstrumentRegistry {
@@ -159,6 +169,7 @@ impl InstrumentRegistry {
             total_count: 0,
             underlying_symbol_to_security_id: HashMap::new(),
             cross_segment_collisions: 0,
+            collision_pairs: Vec::new(),
         }
     }
 
@@ -186,6 +197,11 @@ impl InstrumentRegistry {
         // can emit a Prometheus counter without this common crate
         // taking a metrics dependency.
         let mut cross_segment_collisions: u64 = 0;
+        // PR #288: keep a short list of (id, losing, winning) tuples so
+        // session-start + `make doctor` can show operators exactly which
+        // ids collided. Bounded by Dhan's CSV size in practice; typical
+        // production count is 0-3.
+        let mut collision_pairs: Vec<(SecurityId, ExchangeSegment, ExchangeSegment)> = Vec::new();
 
         for instrument in instruments {
             // Composite index: stores every unique (id, segment) pair,
@@ -206,6 +222,11 @@ impl InstrumentRegistry {
                 && prev.exchange_segment != instrument.exchange_segment
             {
                 cross_segment_collisions = cross_segment_collisions.saturating_add(1);
+                collision_pairs.push((
+                    instrument.security_id,
+                    prev.exchange_segment,
+                    instrument.exchange_segment,
+                ));
                 tracing::error!(
                     code = crate::error_code::ErrorCode::InstrumentP1CrossSegmentCollision.code_str(),
                     severity = crate::error_code::ErrorCode::InstrumentP1CrossSegmentCollision.severity().as_str(),
@@ -262,7 +283,24 @@ impl InstrumentRegistry {
             total_count,
             underlying_symbol_to_security_id,
             cross_segment_collisions,
+            collision_pairs,
         }
+    }
+
+    /// I-P1-11 (PR #288, 2026-04-19): returns the specific colliding
+    /// `(security_id, losing_segment, winning_segment)` tuples detected
+    /// at construction time. Each tuple means: Dhan's instrument master
+    /// contained `security_id` under BOTH `losing_segment` and
+    /// `winning_segment`; the legacy `instruments` map kept `winning`
+    /// (second-seen wins the insert race). BOTH are stored in
+    /// `by_composite` — use `get_with_segment()` for disambiguated lookup.
+    ///
+    /// Returns an empty slice when no collisions (healthy baseline).
+    /// This is a cold-path operator diagnostic — not for use in any
+    /// hot-path tick / order routing.
+    #[inline]
+    pub fn collision_pairs(&self) -> &[(SecurityId, ExchangeSegment, ExchangeSegment)] {
+        &self.collision_pairs
     }
 
     /// I-P1-11 gap G: returns the number of cross-segment `security_id`
@@ -1347,6 +1385,67 @@ mod tests {
             0,
             "same-segment duplicate is NOT a cross-segment collision"
         );
+    }
+
+    // PR #288 (2026-04-19): collision_pairs() getter tests.
+    #[test]
+    fn test_collision_pairs_empty_when_no_collisions() {
+        let registry = InstrumentRegistry::from_instruments(vec![
+            sample_instrument(13, SubscriptionCategory::MajorIndexValue),
+            sample_instrument(25, SubscriptionCategory::MajorIndexValue),
+        ]);
+        assert!(
+            registry.collision_pairs().is_empty(),
+            "no collisions -> collision_pairs is empty"
+        );
+    }
+
+    #[test]
+    fn test_collision_pairs_records_each_id_with_both_segments() {
+        let mut nifty = sample_instrument(13, SubscriptionCategory::MajorIndexValue);
+        nifty.exchange_segment = ExchangeSegment::IdxI;
+        let mut stock13 = sample_instrument(13, SubscriptionCategory::StockEquity);
+        stock13.exchange_segment = ExchangeSegment::NseEquity;
+        let registry = InstrumentRegistry::from_instruments(vec![nifty, stock13]);
+        let pairs = registry.collision_pairs();
+        assert_eq!(pairs.len(), 1, "exactly one id collided");
+        assert_eq!(pairs[0].0, 13, "collision was on id=13");
+        assert_ne!(
+            pairs[0].1, pairs[0].2,
+            "losing and winning segments must differ"
+        );
+        let segments = [pairs[0].1, pairs[0].2];
+        assert!(
+            segments.contains(&ExchangeSegment::IdxI),
+            "IDX_I must appear in the collision pair"
+        );
+        assert!(
+            segments.contains(&ExchangeSegment::NseEquity),
+            "NSE_EQ must appear in the collision pair"
+        );
+    }
+
+    #[test]
+    fn test_collision_pairs_length_matches_count() {
+        let mut a = sample_instrument(13, SubscriptionCategory::MajorIndexValue);
+        a.exchange_segment = ExchangeSegment::IdxI;
+        let mut b = sample_instrument(13, SubscriptionCategory::StockEquity);
+        b.exchange_segment = ExchangeSegment::NseEquity;
+        let mut c = sample_instrument(27, SubscriptionCategory::MajorIndexValue);
+        c.exchange_segment = ExchangeSegment::IdxI;
+        let mut d = sample_instrument(27, SubscriptionCategory::StockEquity);
+        d.exchange_segment = ExchangeSegment::NseEquity;
+        let registry = InstrumentRegistry::from_instruments(vec![a, b, c, d]);
+        assert_eq!(
+            registry.collision_pairs().len() as u64,
+            registry.cross_segment_collisions(),
+            "collision_pairs().len() must equal cross_segment_collisions()"
+        );
+    }
+
+    #[test]
+    fn test_empty_registry_collision_pairs_is_empty() {
+        assert!(InstrumentRegistry::empty().collision_pairs().is_empty());
     }
 
     #[test]

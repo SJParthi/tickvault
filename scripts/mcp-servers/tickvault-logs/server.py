@@ -52,7 +52,9 @@ def _repo_root() -> Path:
 
 def _endpoints_config_path() -> Path:
     override = os.environ.get("TICKVAULT_MCP_ENDPOINTS_CONFIG")
-    if override:
+    if override and not (
+        override.strip().startswith("${") and override.strip().endswith("}")
+    ):
         return Path(override)
     return _repo_root() / "config" / _ENDPOINTS_CONFIG_FILENAME
 
@@ -96,10 +98,24 @@ def _load_endpoints_config() -> dict[str, Any]:
     return result
 
 
+def _is_resolved(value: str | None) -> bool:
+    """An env var is "resolved" iff it is set AND not a literal shell
+    placeholder like `${TICKVAULT_LOGS_DIR}`. Claude Code's MCP launcher
+    passes `env:` values from `.mcp.json` through literally when the
+    shell env var is missing, so the MCP server receives the raw token.
+    We treat that as unset and fall through to the TOML config."""
+    if value is None or value == "":
+        return False
+    stripped = value.strip()
+    if stripped.startswith("${") and stripped.endswith("}"):
+        return False
+    return True
+
+
 def _active_profile() -> str:
     override = os.environ.get("TICKVAULT_MCP_PROFILE")
-    if override:
-        return override
+    if _is_resolved(override):
+        return override  # type: ignore[return-value]
     return _load_endpoints_config().get("active", "local")
 
 
@@ -119,8 +135,8 @@ def _endpoint_url(
     if explicit:
         return explicit
     from_env = os.environ.get(env_var)
-    if from_env:
-        return from_env
+    if _is_resolved(from_env):
+        return from_env  # type: ignore[return-value]
     profile = _active_profile()
     profile_cfg = _load_endpoints_config().get("profiles", {}).get(profile, {})
     from_config = profile_cfg.get(kind)
@@ -131,8 +147,8 @@ def _endpoint_url(
 
 def _logs_dir() -> Path:
     override = os.environ.get("TICKVAULT_LOGS_DIR")
-    if override:
-        return Path(override)
+    if _is_resolved(override):
+        return Path(override)  # type: ignore[arg-type]
     profile = _active_profile()
     profile_cfg = _load_endpoints_config().get("profiles", {}).get(profile, {})
     from_config = profile_cfg.get("logs_dir_local")
@@ -147,8 +163,8 @@ def _logs_dir() -> Path:
 def _logs_source() -> str:
     """Return "http" or "local" — how the MCP should fetch log files."""
     override = os.environ.get("TICKVAULT_LOGS_SOURCE")
-    if override in {"http", "local"}:
-        return override
+    if _is_resolved(override) and override in {"http", "local"}:
+        return override  # type: ignore[return-value]
     profile = _active_profile()
     profile_cfg = _load_endpoints_config().get("profiles", {}).get(profile, {})
     source = profile_cfg.get("logs_source")
@@ -770,7 +786,7 @@ def tool_grafana_query(
     full = f"{gf_url}{endpoint}"
     req = urllib.request.Request(full)
     token = os.environ.get("TICKVAULT_GRAFANA_API_TOKEN")
-    if token:
+    if _is_resolved(token):
         req.add_header("Authorization", f"Bearer {token}")
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:  # noqa: S310

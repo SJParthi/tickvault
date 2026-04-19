@@ -1,0 +1,177 @@
+# =============================================================================
+# tickvault — Chaos Test Suite (Weekly)
+# =============================================================================
+# Runs the 16 `#[ignore]`d chaos tests that exercise:
+#
+# 1. QuestDB outage / pause / sigkill / disk-full
+# 2. WS frame WAL replay / spill saturation / disk IO failure
+# 3. Zero-tick-loss defense chain (with real Docker stack)
+# 4. Mock WS server end-to-end
+#
+# Why weekly (not every push):
+# - Each test spins up Docker compose, runs Rust tests, tears down.
+# - Total wall-clock ~30 min. Running on every PR would consume the free-
+#   tier budget (2000 min/mo) in a week.
+# - Weekly cadence catches regressions within 7 days — good enough for
+#   chaos / infrastructure invariants that rarely change per commit.
+#
+# Operator decision path (see .claude/plans/pr-288-completion.md):
+# - Free-tier GH runner (this workflow) — OK for weekly, ~30 min/week.
+# - Self-hosted runner — required if we want hourly or PR-triggered.
+# - Cost-budget per .claude/rules/project/aws-budget.md.
+#
+# Failure handling:
+# - Opens a GitHub issue tagged `chaos-regression` with the failing log.
+# - Manual dispatch available via workflow_dispatch for on-demand runs.
+# =============================================================================
+
+name: chaos-nightly
+
+on:
+  schedule:
+    # Sat 18:30 UTC = Sun 00:00 IST — runs once a week, Saturday night IST.
+    # Offset from full-test-nightly (01:00 IST daily) to avoid runner contention.
+    - cron: '30 18 * * 6'
+  workflow_dispatch:
+    inputs:
+      include_slow:
+        description: 'Include prolonged-outage tests (TV_SLOW_CHAOS=1). +10 min runtime.'
+        required: false
+        default: 'false'
+        type: boolean
+
+concurrency:
+  group: chaos-nightly
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  chaos:
+    runs-on: ubuntu-latest
+    # 60 min ceiling: 30 min typical + 10 min slow + 20 min safety margin.
+    timeout-minutes: 60
+    env:
+      CARGO_TERM_COLOR: always
+      # Point the test env vars at the Docker compose stack's published ports.
+      TV_QUESTDB_HTTP_URL: http://127.0.0.1:9000
+      TV_VALKEY_URL: redis://127.0.0.1:6379
+      TV_PROMETHEUS_URL: http://127.0.0.1:9090
+      TV_METRICS_PORT: '9091'
+      # Some chaos tests gate on this — off by default, on via workflow_dispatch.
+      TV_SLOW_CHAOS: ${{ github.event.inputs.include_slow == 'true' && '1' || '' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: '1.93.1'
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: chaos-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: chaos-${{ runner.os }}-
+
+      - name: Bring up Docker compose stack
+        # The chaos tests shell out to `docker compose pause/unpause/stop/start`
+        # so the stack must be running at the start of each test. Individual
+        # tests restore state in their teardown.
+        run: |
+          docker compose -f deploy/docker/docker-compose.yml up -d
+          echo "Waiting for QuestDB to be ready..."
+          for i in {1..30}; do
+            if curl -fsS http://127.0.0.1:9000/status >/dev/null 2>&1; then
+              echo "QuestDB ready on attempt $i"
+              break
+            fi
+            sleep 2
+          done
+          curl -fsS http://127.0.0.1:9000/status || {
+            echo "QuestDB failed to come up after 60s"
+            docker compose -f deploy/docker/docker-compose.yml logs --tail=50
+            exit 1
+          }
+
+      - name: Build chaos tests (no-run)
+        # Pre-build so the compile errors surface before any stack state is
+        # mutated by a test.
+        run: cargo test --workspace --no-run --tests
+
+      - name: Run chaos tests (--ignored)
+        id: chaos
+        run: |
+          set -euo pipefail
+          # `--ignored` flips the #[ignore] bit so the chaos tests actually
+          # execute. We scope to the `chaos_*` test binaries via --test so
+          # unrelated #[ignore]'d tests (e.g. flaky GUI tests) don't join in.
+          # --no-fail-fast is intentional — we want the full failure matrix.
+          cargo test \
+            --workspace \
+            --test 'chaos_*' \
+            --no-fail-fast \
+            -- --ignored --nocapture 2>&1 | tee /tmp/chaos.log
+
+      - name: Tear down Docker compose stack
+        if: always()
+        run: |
+          docker compose -f deploy/docker/docker-compose.yml logs --tail=100 \
+            > /tmp/docker-logs.txt || true
+          docker compose -f deploy/docker/docker-compose.yml down -v
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chaos-logs
+          path: |
+            /tmp/chaos.log
+            /tmp/docker-logs.txt
+          retention-days: 14
+
+      - name: Open regression issue on failure
+        if: failure() && github.event_name == 'schedule'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let log = '';
+            try {
+              log = fs.readFileSync('/tmp/chaos.log', 'utf8');
+              // Keep the issue body small — last 100 lines is plenty.
+              log = log.split('\n').slice(-100).join('\n');
+            } catch (e) {
+              log = '(chaos log not captured)';
+            }
+            const title = `chaos-regression: nightly ${new Date().toISOString().slice(0,10)}`;
+            const body = [
+              '## Chaos test suite failed',
+              '',
+              `Workflow: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              '',
+              '### Last 100 lines',
+              '```',
+              log,
+              '```',
+              '',
+              '### Artifacts',
+              `- chaos-logs: full stdout + docker compose logs`,
+              '',
+              `Labels: chaos-regression`,
+            ].join('\n');
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              body,
+              labels: ['chaos-regression'],
+            });

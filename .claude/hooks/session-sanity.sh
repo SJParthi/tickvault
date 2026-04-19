@@ -9,6 +9,18 @@ cd "$CWD" || exit 0
 echo "SESSION START SANITY CHECK" >&2
 echo "=========================" >&2
 
+# Check 0: Runtime endpoint bootstrap — resolves local-Docker vs AWS-tunnel
+# and exports TICKVAULT_*_URL + *_STATUS env vars for every tool in the session.
+BOOTSTRAP="$CWD/scripts/claude-session-bootstrap.sh"
+if [ -x "$BOOTSTRAP" ]; then
+  bash "$BOOTSTRAP" 2>&1 >&2 || true
+fi
+SESSION_ENV="$CWD/.claude/.session-env"
+if [ -f "$SESSION_ENV" ]; then
+  # shellcheck disable=SC1090
+  . "$SESSION_ENV"
+fi
+
 # Check 1: Current branch
 BRANCH=$(git branch --show-current 2>/dev/null || echo "detached")
 echo "Branch: $BRANCH" >&2
@@ -111,6 +123,61 @@ echo "  signature_history, prometheus_query, find_runbook_for_code, list_active_
 echo "  questdb_sql, grep_codebase, run_doctor, git_recent_log" >&2
 echo "Runbooks (for operator + any AI session): docs/runbooks/README.md (54-code index)" >&2
 echo "Architecture + guarantees: docs/architecture/{zero-touch-stack,guarantees,claude-cowork}.md" >&2
+
+# RUNTIME PROBE SNAPSHOT — what the session can actually reach right now
+if [ -f "$SESSION_ENV" ]; then
+  echo "" >&2
+  echo "Runtime endpoints (profile=${TICKVAULT_MCP_PROFILE:-?}):" >&2
+  printf "  prom=%s  alert=%s  questdb=%s  grafana=%s  api=%s\n" \
+    "${TICKVAULT_PROM_STATUS:-?}" "${TICKVAULT_ALERT_STATUS:-?}" \
+    "${TICKVAULT_QDB_STATUS:-?}" "${TICKVAULT_GRAF_STATUS:-?}" \
+    "${TICKVAULT_API_STATUS:-?}" >&2
+fi
+
+# PR #288 (#9b): LIVE METRIC PULL — when Prometheus is REACHABLE, pull the
+# zero-tick-loss-adjacent counters so every session opens knowing whether
+# the app is actually dropping ticks / losing frames. 2s timeout per query,
+# 5 queries total — bounded at 10s worst case. If Prometheus is OFFLINE,
+# this block is skipped entirely (SessionStart stays fast).
+if [ "${TICKVAULT_PROM_STATUS:-}" = "REACHABLE" ] && [ -n "${TICKVAULT_PROMETHEUS_URL:-}" ]; then
+  prom_q() {
+    local q="$1"
+    curl -fsS -m 2 --data-urlencode "query=$q" \
+      "${TICKVAULT_PROMETHEUS_URL}/api/v1/query" 2>/dev/null \
+      | awk 'match($0, /"value":\[[^,]+,"([^"]+)"/, a) { print a[1]; exit }'
+  }
+  TICKS_DROPPED=$(prom_q 'sum(tv_ticks_dropped_total)' 2>/dev/null)
+  SEQ_HOLES=$(prom_q 'sum(tv_depth_sequence_holes_total)' 2>/dev/null)
+  COLLISIONS=$(prom_q 'tv_instrument_registry_cross_segment_collisions' 2>/dev/null)
+  WS_UP=$(prom_q 'tv_websocket_connections_active' 2>/dev/null)
+  QDB_SPILL=$(prom_q 'sum(tv_questdb_spill_bytes)' 2>/dev/null)
+  echo "Live signal (from Prometheus):" >&2
+  printf "  ticks_dropped=%s  depth_seq_holes=%s  id_collisions=%s  ws_active=%s  qdb_spill_bytes=%s\n" \
+    "${TICKS_DROPPED:-n/a}" "${SEQ_HOLES:-n/a}" "${COLLISIONS:-n/a}" \
+    "${WS_UP:-n/a}" "${QDB_SPILL:-n/a}" >&2
+fi
+
+# LIVE ERROR TAIL — inline the last 10 structured ERROR events, if any.
+# Every Claude session / cowork task starts with this in context so nobody
+# has to call tail_errors manually.
+LATEST_JSONL=$(ls -t "$CWD"/data/logs/errors.jsonl.* 2>/dev/null | head -1)
+if [ -n "$LATEST_JSONL" ] && [ -f "$LATEST_JSONL" ]; then
+  TAIL_COUNT=$(wc -l < "$LATEST_JSONL" 2>/dev/null | tr -d ' ')
+  if [ -n "$TAIL_COUNT" ] && [ "$TAIL_COUNT" -gt 0 ]; then
+    echo "" >&2
+    echo "Last 10 ERROR events (from $(basename "$LATEST_JSONL") — total=$TAIL_COUNT):" >&2
+    tail -10 "$LATEST_JSONL" 2>/dev/null | \
+      awk -F'"' '{
+        code=""; msg=""
+        for (i=1; i<=NF; i++) {
+          if ($i ~ /"code"/) { code=$(i+2) }
+          if ($i ~ /"message"/) { msg=$(i+2); break }
+        }
+        if (length(msg) > 120) msg=substr(msg,1,120)"..."
+        printf "  [%s] %s\n", code, msg
+      }' >&2
+  fi
+fi
 
 # ERROR SUMMARY GLANCE — one-line answer to "anything broken?"
 SUMMARY_FILE="$CWD/data/logs/errors.summary.md"

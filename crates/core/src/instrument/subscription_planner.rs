@@ -445,6 +445,21 @@ pub fn build_subscription_plan(
         .set(registry.cross_segment_collisions() as f64);
     metrics::gauge!("tv_instrument_registry_total_entries").set(registry.len() as f64);
 
+    // PR #288 (#5b): emit one gauge per collision pair so operators can
+    // see WHICH ids collided in Grafana without parsing logs. Label values
+    // are stable (numeric id + enum segment) so cardinality is bounded by
+    // the number of actual collisions (typical = 0-3, worst case ~10 per
+    // Dhan's CSV).
+    for (security_id, losing, winning) in registry.collision_pairs() {
+        metrics::gauge!(
+            "tv_instrument_registry_collision_pair",
+            "security_id" => security_id.to_string(),
+            "losing_segment" => losing.as_str(),
+            "winning_segment" => winning.as_str(),
+        )
+        .set(1.0);
+    }
+
     let exceeds_capacity = registry.len() > MAX_TOTAL_SUBSCRIPTIONS;
     if exceeds_capacity {
         warn!(
@@ -788,6 +803,21 @@ pub fn build_subscription_plan_from_archived(
     metrics::gauge!("tv_instrument_registry_cross_segment_collisions")
         .set(registry.cross_segment_collisions() as f64);
     metrics::gauge!("tv_instrument_registry_total_entries").set(registry.len() as f64);
+
+    // PR #288 (#5b): emit one gauge per collision pair so operators can
+    // see WHICH ids collided in Grafana without parsing logs. Label values
+    // are stable (numeric id + enum segment) so cardinality is bounded by
+    // the number of actual collisions (typical = 0-3, worst case ~10 per
+    // Dhan's CSV).
+    for (security_id, losing, winning) in registry.collision_pairs() {
+        metrics::gauge!(
+            "tv_instrument_registry_collision_pair",
+            "security_id" => security_id.to_string(),
+            "losing_segment" => losing.as_str(),
+            "winning_segment" => winning.as_str(),
+        )
+        .set(1.0);
+    }
 
     let exceeds_capacity = registry.len() > MAX_TOTAL_SUBSCRIPTIONS;
     if exceeds_capacity {

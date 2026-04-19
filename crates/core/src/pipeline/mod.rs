@@ -8,11 +8,13 @@
 //! → `TopMoversTracker` → ranked gainers/losers/most-active snapshots
 
 pub mod candle_aggregator;
+pub mod depth_sequence_tracker;
 pub mod option_movers;
 pub mod tick_processor;
 pub mod top_movers;
 
 pub use candle_aggregator::CandleAggregator;
+pub use depth_sequence_tracker::{DepthSequenceTracker, SequenceOutcome};
 pub use option_movers::{OptionMoversTracker, SharedOptionMoversSnapshot};
 pub use tick_processor::run_tick_processor;
 pub use top_movers::{SharedTopMoversSnapshot, TopMoversTracker};

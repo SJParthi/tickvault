@@ -50,7 +50,7 @@ pub struct DeepDepthHeader {
 }
 
 /// Which side of the order book this packet represents.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DepthSide {
     /// Bid (buy) side — feed code 41.
     Bid,

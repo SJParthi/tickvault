@@ -18,6 +18,16 @@
 # scripts, and humans alike. Format: `[STATUS] <category>: <detail>`.
 set -uo pipefail
 
+# --gate: treat SKIP/WARN on runtime endpoints as FAIL. Intended for live
+# sessions where the app is supposed to be running — the audit should not
+# silently pass when Prometheus/QuestDB/Grafana are unreachable.
+GATE_MODE=0
+for arg in "$@"; do
+    case "$arg" in
+        --gate) GATE_MODE=1 ;;
+    esac
+done
+
 PASS=0
 FAIL=0
 FAILED_CHECKS=()
@@ -173,6 +183,32 @@ if [ "${FAIL}" -gt 0 ]; then
     echo "Runbook directory: docs/runbooks/"
     echo "Morning-ops guide: docs/runbooks/README.md"
     exit 1
+fi
+
+if [ "${GATE_MODE}" -eq 1 ]; then
+    # --gate: app is expected to be live. Any unreachable endpoint should
+    # surface as a real failure, not a silent SKIP. Re-probe the five
+    # runtime endpoints and exit 1 if any fail.
+    GATE_FAIL=0
+    for probe in \
+        "prometheus http://127.0.0.1:9090/-/healthy" \
+        "questdb    http://127.0.0.1:9000/status" \
+        "grafana    http://127.0.0.1:3000/api/health" \
+        "alertmgr   http://127.0.0.1:9093/-/healthy" \
+        "api        http://127.0.0.1:3001/health"; do
+        name="${probe%% *}"
+        url="${probe#* }"
+        url="${url## }"
+        if ! curl -fsS -m 3 "$url" >/dev/null 2>&1; then
+            echo "[GATE-FAIL] $name unreachable ($url)"
+            GATE_FAIL=1
+        fi
+    done
+    if [ "${GATE_FAIL}" -eq 1 ]; then
+        echo ""
+        echo "--gate mode: one or more runtime endpoints are DOWN."
+        exit 1
+    fi
 fi
 
 echo ""
