@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  tv-tunnel launchd agent — starts Tailscale Funnel for tickvault's 5
+  observability ports on Mac boot. Installed by install-mac.sh into
+  ~/Library/LaunchAgents/ so it runs under the logged-in user, not root.
+
+  The @TAILSCALE_BIN@ placeholder is substituted at install time because
+  the Tailscale app path may vary between standard Mac App Store
+  installs and brew cask installs.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.tickvault.tunnel</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>@TAILSCALE_BIN@</string>
+    <string>funnel</string>
+    <string>--bg</string>
+    <string>9090</string>
+    <string>9093</string>
+    <string>9000</string>
+    <string>3000</string>
+    <string>3001</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>/tmp/tickvault-tunnel.out.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/tmp/tickvault-tunnel.err.log</string>
+
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+</dict>
+</plist>

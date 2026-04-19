@@ -1,0 +1,58 @@
+# Claude MCP Endpoints Config — universal, branch-independent
+#
+# Read by scripts/mcp-servers/tickvault-logs/server.py at startup.
+# Env vars (TICKVAULT_PROMETHEUS_URL etc.) override any value here.
+#
+# Purpose: every Claude session, on every branch, on every host
+# (Mac dev / AWS prod / claude.ai sandbox / claude cowork) reads the
+# same endpoints — zero per-session setup after one-time tunnel install.
+#
+# To regenerate this file with your actual Tailscale hostnames:
+#   bash scripts/tv-tunnel/doctor.sh --emit-config
+#
+# The `active` profile at the top decides which set is used by default.
+# Override at runtime:   TICKVAULT_MCP_PROFILE=mac-dev claude ...
+
+active = "aws-prod"
+
+# -----------------------------------------------------------------------------
+# mac-dev profile
+# -----------------------------------------------------------------------------
+# Your Mac exposing tickvault's local Docker services via Tailscale Funnel.
+# Replace <mac-host> with your Mac's Tailscale hostname (run `tailscale status`
+# on the Mac to find it). The .ts.net domain is stable across reboots.
+[profiles.mac-dev]
+prometheus_url    = "https://MAC-HOSTNAME.YOUR-TAILNET.ts.net:9090"
+alertmanager_url  = "https://MAC-HOSTNAME.YOUR-TAILNET.ts.net:9093"
+questdb_url       = "https://MAC-HOSTNAME.YOUR-TAILNET.ts.net:9000"
+grafana_url       = "https://MAC-HOSTNAME.YOUR-TAILNET.ts.net:3000"
+tickvault_api_url = "https://MAC-HOSTNAME.YOUR-TAILNET.ts.net:3001"
+logs_source       = "http"  # "http" = fetch via /api/debug/logs/* | "local" = filesystem
+logs_dir_local    = "./data/logs"  # only used when logs_source = "local"
+
+# -----------------------------------------------------------------------------
+# aws-prod profile
+# -----------------------------------------------------------------------------
+# Your AWS EC2 instance exposing tickvault's services via Tailscale Funnel.
+# Activated once the instance is provisioned (scripts/tv-tunnel/install-aws.sh).
+[profiles.aws-prod]
+prometheus_url    = "https://AWS-HOSTNAME.YOUR-TAILNET.ts.net:9090"
+alertmanager_url  = "https://AWS-HOSTNAME.YOUR-TAILNET.ts.net:9093"
+questdb_url       = "https://AWS-HOSTNAME.YOUR-TAILNET.ts.net:9000"
+grafana_url       = "https://AWS-HOSTNAME.YOUR-TAILNET.ts.net:3000"
+tickvault_api_url = "https://AWS-HOSTNAME.YOUR-TAILNET.ts.net:3001"
+logs_source       = "http"
+logs_dir_local    = "./data/logs"
+
+# -----------------------------------------------------------------------------
+# local profile (Mode A — Claude Code running on the Mac with tickvault local)
+# -----------------------------------------------------------------------------
+# No tunnel needed — everything on 127.0.0.1. This is the pre-tunnel default.
+[profiles.local]
+prometheus_url    = "http://127.0.0.1:9090"
+alertmanager_url  = "http://127.0.0.1:9093"
+questdb_url       = "http://127.0.0.1:9000"
+grafana_url       = "http://127.0.0.1:3000"
+tickvault_api_url = "http://127.0.0.1:3001"
+logs_source       = "local"
+logs_dir_local    = "./data/logs"

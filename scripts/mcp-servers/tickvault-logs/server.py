@@ -29,23 +29,136 @@ from typing import Any, Iterable
 
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Configuration — universal, branch-independent endpoints
 # ---------------------------------------------------------------------------
+#
+# Resolution order for every endpoint URL (prom/questdb/alertmanager/...):
+#   1. Explicit `base_url` argument passed to the tool (single-call override)
+#   2. Env var TICKVAULT_<KIND>_URL (session-level override)
+#   3. Active profile in config/claude-mcp-endpoints.toml (universal default)
+#   4. Hardcoded localhost default (Mode A — everything on 127.0.0.1)
+#
+# The config file is committed to the repo so every clone on every branch
+# inherits working endpoints without per-session setup.
+
+_ENDPOINTS_CONFIG_FILENAME = "claude-mcp-endpoints.toml"
+
+
+def _repo_root() -> Path:
+    here = Path(__file__).resolve()
+    # scripts/mcp-servers/tickvault-logs/server.py -> repo root
+    return here.parent.parent.parent.parent
+
+
+def _endpoints_config_path() -> Path:
+    override = os.environ.get("TICKVAULT_MCP_ENDPOINTS_CONFIG")
+    if override:
+        return Path(override)
+    return _repo_root() / "config" / _ENDPOINTS_CONFIG_FILENAME
+
+
+_ENDPOINTS_CACHE: dict[str, Any] | None = None
+
+
+def _load_endpoints_config() -> dict[str, Any]:
+    """Parse config/claude-mcp-endpoints.toml once per process.
+
+    Returns {"active": <profile>, "profiles": {<name>: {<kind>: <url>}}}.
+    Falls back to {"active": "local", "profiles": {}} if the file is
+    missing or unparseable — we never want the MCP server to crash just
+    because the config file is absent.
+    """
+    global _ENDPOINTS_CACHE
+    if _ENDPOINTS_CACHE is not None:
+        return _ENDPOINTS_CACHE
+    path = _endpoints_config_path()
+    result: dict[str, Any] = {"active": "local", "profiles": {}}
+    if not path.is_file():
+        _ENDPOINTS_CACHE = result
+        return result
+    try:
+        import tomllib  # Python 3.11+
+        with path.open("rb") as fh:
+            parsed = tomllib.load(fh)
+    except Exception:  # noqa: BLE001
+        # Best-effort: if the file is malformed, fall back to defaults
+        # instead of crashing the MCP server.
+        _ENDPOINTS_CACHE = result
+        return result
+    if isinstance(parsed.get("active"), str):
+        result["active"] = parsed["active"]
+    profiles = parsed.get("profiles", {})
+    if isinstance(profiles, dict):
+        for name, cfg in profiles.items():
+            if isinstance(cfg, dict):
+                result["profiles"][name] = cfg
+    _ENDPOINTS_CACHE = result
+    return result
+
+
+def _active_profile() -> str:
+    override = os.environ.get("TICKVAULT_MCP_PROFILE")
+    if override:
+        return override
+    return _load_endpoints_config().get("active", "local")
+
+
+def _endpoint_url(
+    kind: str,
+    env_var: str,
+    default: str,
+    explicit: str | None = None,
+) -> str:
+    """Resolve an endpoint URL via the 4-tier precedence order.
+
+    `kind` is the key in the profile config (e.g. "prometheus_url").
+    `env_var` is the legacy env-var override (e.g. "TICKVAULT_PROMETHEUS_URL").
+    `default` is the Mode A localhost fallback.
+    `explicit` is a single-call override from the tool invocation.
+    """
+    if explicit:
+        return explicit
+    from_env = os.environ.get(env_var)
+    if from_env:
+        return from_env
+    profile = _active_profile()
+    profile_cfg = _load_endpoints_config().get("profiles", {}).get(profile, {})
+    from_config = profile_cfg.get(kind)
+    if isinstance(from_config, str) and from_config:
+        return from_config
+    return default
 
 
 def _logs_dir() -> Path:
     override = os.environ.get("TICKVAULT_LOGS_DIR")
     if override:
         return Path(override)
-    # Default: repo_root/data/logs relative to this file.
-    here = Path(__file__).resolve()
-    # scripts/mcp-servers/tickvault-logs/server.py -> repo root
-    return here.parent.parent.parent.parent / "data" / "logs"
+    profile = _active_profile()
+    profile_cfg = _load_endpoints_config().get("profiles", {}).get(profile, {})
+    from_config = profile_cfg.get("logs_dir_local")
+    if isinstance(from_config, str) and from_config:
+        cfg_path = Path(from_config)
+        if not cfg_path.is_absolute():
+            cfg_path = _repo_root() / cfg_path
+        return cfg_path
+    return _repo_root() / "data" / "logs"
+
+
+def _logs_source() -> str:
+    """Return "http" or "local" — how the MCP should fetch log files."""
+    override = os.environ.get("TICKVAULT_LOGS_SOURCE")
+    if override in {"http", "local"}:
+        return override
+    profile = _active_profile()
+    profile_cfg = _load_endpoints_config().get("profiles", {}).get(profile, {})
+    source = profile_cfg.get("logs_source")
+    if source in {"http", "local"}:
+        return source
+    return "local"
 
 
 def _state_dir() -> Path:
-    here = Path(__file__).resolve()
-    return here.parent.parent.parent.parent / ".claude" / "state"
+    return _repo_root() / ".claude" / "state"
 
 
 ERRORS_JSONL_PREFIX = "errors.jsonl"
@@ -303,8 +416,11 @@ def tool_prometheus_query(query: str, base_url: str | None = None) -> dict[str, 
     import urllib.parse
     import urllib.request
 
-    prom_url = base_url or os.environ.get(
-        "TICKVAULT_PROMETHEUS_URL", "http://127.0.0.1:9090"
+    prom_url = _endpoint_url(
+        "prometheus_url",
+        "TICKVAULT_PROMETHEUS_URL",
+        "http://127.0.0.1:9090",
+        explicit=base_url,
     )
     full = f"{prom_url}/api/v1/query?query={urllib.parse.quote(query)}"
     try:
@@ -376,8 +492,11 @@ def tool_questdb_sql(query: str, base_url: str | None = None) -> dict[str, Any]:
     import urllib.parse
     import urllib.request
 
-    qdb = base_url or os.environ.get(
-        "TICKVAULT_QUESTDB_URL", "http://127.0.0.1:9000"
+    qdb = _endpoint_url(
+        "questdb_url",
+        "TICKVAULT_QUESTDB_URL",
+        "http://127.0.0.1:9000",
+        explicit=base_url,
     )
     full = f"{qdb}/exec?query={urllib.parse.quote(query)}"
     try:
@@ -554,8 +673,11 @@ def tool_list_active_alerts(base_url: str | None = None) -> dict[str, Any]:
     """
     import urllib.request
 
-    am_url = base_url or os.environ.get(
-        "TICKVAULT_ALERTMANAGER_URL", "http://127.0.0.1:9093"
+    am_url = _endpoint_url(
+        "alertmanager_url",
+        "TICKVAULT_ALERTMANAGER_URL",
+        "http://127.0.0.1:9093",
+        explicit=base_url,
     )
     full = f"{am_url}/api/v2/alerts?active=true&silenced=false&inhibited=false"
     try:
@@ -594,8 +716,11 @@ def tool_tickvault_api(
     """
     import urllib.request
 
-    api_url = base_url or os.environ.get(
-        "TICKVAULT_API_URL", "http://127.0.0.1:3001"
+    api_url = _endpoint_url(
+        "tickvault_api_url",
+        "TICKVAULT_API_URL",
+        "http://127.0.0.1:3001",
+        explicit=base_url,
     )
     if not path.startswith("/"):
         path = f"/{path}"
@@ -634,8 +759,11 @@ def tool_grafana_query(
     """
     import urllib.request
 
-    gf_url = base_url or os.environ.get(
-        "TICKVAULT_GRAFANA_URL", "http://127.0.0.1:3000"
+    gf_url = _endpoint_url(
+        "grafana_url",
+        "TICKVAULT_GRAFANA_URL",
+        "http://127.0.0.1:3000",
+        explicit=base_url,
     )
     if not endpoint.startswith("/"):
         endpoint = f"/{endpoint}"
