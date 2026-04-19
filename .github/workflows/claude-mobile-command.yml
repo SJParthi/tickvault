@@ -1,0 +1,136 @@
+# =============================================================================
+# tickvault — Claude Co-work Mobile Command
+# =============================================================================
+# One-tap mobile trigger: GitHub mobile app → Actions → "Claude Mobile Command"
+# → Run workflow → type a free-text instruction → Claude Co-work executes it
+# in a GitHub-hosted runner. No laptop required.
+#
+# Examples you can type from the mobile UI:
+#   - "check prometheus for tv_ticks_dropped_total; open a draft issue if > 0"
+#   - "restart depth connections if any stale-spot alert is firing"
+#   - "run make doctor and summarise the 7-section output"
+#   - "review the latest open PR and post findings as a PR comment"
+#   - "sweep data/logs/errors.jsonl for novel signatures in the last hour"
+#
+# Hard rules (enforced by the prompt):
+#   - NEVER push to main, NEVER bypass hooks, NEVER log secrets.
+#   - Every write operation lands on a claude/mobile-<run-id> branch + draft PR.
+#   - If the instruction is destructive or ambiguous, ask via a draft
+#     GitHub issue @SJParthi instead of acting.
+#
+# Requires: ANTHROPIC_API_KEY secret.
+# =============================================================================
+
+name: Claude Mobile Command
+
+on:
+  workflow_dispatch:
+    inputs:
+      instruction:
+        description: 'What should Claude Co-work do? (free text)'
+        required: true
+        type: string
+      allow_write:
+        description: 'Allow Claude to create branches, commits, PRs, issues'
+        required: false
+        default: true
+        type: boolean
+
+concurrency:
+  group: claude-mobile-${{ github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  actions: read
+
+jobs:
+  execute:
+    name: Execute mobile instruction
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # Auto-attach: same env var contract as .mcp.json expects.
+      # Populate these as GitHub secrets (Settings → Secrets and variables
+      # → Actions) so every Co-work run inherits live access to
+      # Prometheus, QuestDB, Grafana, Alertmanager, API, Postgres.
+      # Empty secrets degrade gracefully to OFFLINE (no crash).
+      TICKVAULT_MCP_PROFILE: cloud-tunnel
+      TICKVAULT_PROMETHEUS_URL: ${{ secrets.TICKVAULT_TUNNEL_PROMETHEUS_URL }}
+      TICKVAULT_QUESTDB_URL: ${{ secrets.TICKVAULT_TUNNEL_QUESTDB_URL }}
+      TICKVAULT_GRAFANA_URL: ${{ secrets.TICKVAULT_TUNNEL_GRAFANA_URL }}
+      TICKVAULT_ALERTMANAGER_URL: ${{ secrets.TICKVAULT_TUNNEL_ALERTMANAGER_URL }}
+      TICKVAULT_API_URL: ${{ secrets.TICKVAULT_TUNNEL_API_URL }}
+      TICKVAULT_GRAFANA_API_TOKEN: ${{ secrets.TICKVAULT_GRAFANA_API_TOKEN }}
+      TICKVAULT_LOGS_DIR: ./data/logs
+      QUESTDB_PG_URL: ${{ secrets.TICKVAULT_TUNNEL_QUESTDB_PG_URL }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "claude-cowork[bot]"
+          git config user.email "claude-cowork[bot]@users.noreply.github.com"
+
+      - name: Run Claude Co-work
+        uses: anthropics/claude-code-action@beta
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          timeout_minutes: 25
+          # Inherit the universal .mcp.json at repo root — attaches
+          # github, postgres, and tickvault-logs MCP servers so the
+          # mobile command can query logs, metrics, QuestDB, Grafana
+          # without extra setup.
+          mcp_config: .mcp.json
+          direct_prompt: |
+            # Mobile Command — Run ${{ github.run_id }}
+
+            ## Operator instruction (verbatim)
+
+            > ${{ inputs.instruction }}
+
+            ## Execution rules
+
+            1. If the instruction is a QUESTION or READ-ONLY check → answer in
+               a GitHub Actions step summary (use `$GITHUB_STEP_SUMMARY`) and
+               also post as a comment on the latest PR if one is open.
+            2. If the instruction asks for a CODE CHANGE and
+               `allow_write == ${{ inputs.allow_write }}` is true → create
+               branch `claude/mobile-${{ github.run_id }}`, commit, push,
+               open a DRAFT PR titled
+               `mobile: <concise summary of instruction>`.
+            3. If the instruction is AMBIGUOUS or DESTRUCTIVE (deletes data,
+               drops tables, force-pushes, touches secrets) → STOP. Open a
+               draft GitHub issue titled
+               `Mobile command needs clarification: <summary>` and @mention
+               SJParthi. Do NOT act.
+            4. If the instruction requires live data from tickvault-logs MCP
+               and the Mac tunnel is down → report `mcp_unreachable` in the
+               step summary. Do not pretend otherwise.
+
+            ## Absolute rules (non-negotiable)
+
+            - NEVER push to main.
+            - NEVER skip hooks (`--no-verify`, `--no-gpg-sign`).
+            - NEVER log Dhan JWT, access-token, or SSM parameter values.
+            - NEVER run `git reset --hard`, `rm -rf`, `DROP TABLE`, or
+              anything that loses data without an explicit confirmation
+              issue and human reply.
+            - ALWAYS use the existing runbooks at `.claude/rules/**` and
+              `docs/runbooks/**` instead of improvising.
+
+            ## Output
+
+            At the end, write a short markdown section to
+            `$GITHUB_STEP_SUMMARY` that includes:
+            - Interpretation of the instruction (one sentence).
+            - Actions taken (branch, commits, PR, issue links).
+            - Anything you decided NOT to do and why.
+            - Next step the operator should verify on mobile.

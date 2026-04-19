@@ -11,6 +11,7 @@
         obs obs-verify obs-restart obs-open \
         logs app-pid \
         audit coverage bench geiger typos quality doc bootstrap scoped-check full-qa \
+        dispatch dispatch-readonly dispatch-status dispatch-logs dispatch-check dispatch-audit \
 
 # ---- Configuration ----
 APP_NAME       := tickvault
@@ -416,3 +417,61 @@ mcp-doctor: ## Probe every endpoint the tickvault-logs MCP server reads (4 check
 
 100pct-audit-json: ## Machine-readable JSON output for dashboards
 	@bash scripts/100pct-audit.sh --json
+
+# =============================================================================
+# Claude Co-work Dispatch — uniform entry point from every terminal
+# =============================================================================
+# Fires a fresh Claude Co-work session in the GitHub cloud runner to execute
+# an arbitrary ops instruction. Works identically from:
+#   - Claude Code CLI sessions on your Mac
+#   - Claude Co-work web sessions on laptop
+#   - Any terminal with `gh` CLI installed
+#   - Mobile: use the GitHub mobile app's "Run workflow" UI directly
+#
+# Requires: gh CLI authenticated against SJParthi/tickvault.
+# =============================================================================
+
+dispatch: ## Dispatch a mobile-style command to Claude Co-work. Usage: make dispatch MSG="check prom"
+	@if [ -z "$(MSG)" ]; then \
+		echo "  Usage: make dispatch MSG=\"your instruction\""; \
+		echo ""; \
+		echo "  Examples:"; \
+		echo "    make dispatch MSG=\"check prometheus for ticks_dropped\""; \
+		echo "    make dispatch MSG=\"run make doctor and summarise\""; \
+		echo "    make dispatch MSG=\"review the latest open PR\""; \
+		echo "    make dispatch MSG=\"restart depth if any stale-spot alert is firing\""; \
+		exit 1; \
+	fi
+	@command -v gh >/dev/null 2>&1 || { echo "  gh CLI not installed. brew install gh"; exit 1; }
+	@echo "  Dispatching to Claude Co-work: $(MSG)"
+	@gh workflow run claude-mobile-command.yml \
+		-f instruction="$(MSG)" \
+		-f allow_write=true
+	@echo "  Queued. Follow progress with: make dispatch-status"
+
+dispatch-readonly: ## Dispatch in read-only mode (no branches/PRs/commits). Usage: make dispatch-readonly MSG="..."
+	@if [ -z "$(MSG)" ]; then \
+		echo "  Usage: make dispatch-readonly MSG=\"your instruction\""; \
+		exit 1; \
+	fi
+	@command -v gh >/dev/null 2>&1 || { echo "  gh CLI not installed"; exit 1; }
+	@echo "  Dispatching (read-only) to Claude Co-work: $(MSG)"
+	@gh workflow run claude-mobile-command.yml \
+		-f instruction="$(MSG)" \
+		-f allow_write=false
+
+dispatch-status: ## Show the last 5 Claude Co-work dispatch runs
+	@command -v gh >/dev/null 2>&1 || { echo "  gh CLI not installed"; exit 1; }
+	@gh run list --workflow=claude-mobile-command.yml --limit 5
+
+dispatch-logs: ## Tail the logs of the most recent Claude Co-work dispatch run
+	@command -v gh >/dev/null 2>&1 || { echo "  gh CLI not installed"; exit 1; }
+	@RUN_ID=$$(gh run list --workflow=claude-mobile-command.yml --limit 1 --json databaseId --jq '.[0].databaseId'); \
+	if [ -z "$$RUN_ID" ]; then echo "  No dispatch runs yet"; exit 0; fi; \
+	gh run view "$$RUN_ID" --log
+
+dispatch-check: ## Common preset — ask Claude to run the full health check
+	@$(MAKE) dispatch MSG="run /health in repo context and post the 14-row table as the step summary"
+
+dispatch-audit: ## Common preset — ask Claude to run the 100% audit
+	@$(MAKE) dispatch MSG="run scripts/100pct-audit.sh and post PASS/GAP counts + any GAPs as the step summary"

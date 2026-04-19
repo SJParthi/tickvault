@@ -1,0 +1,103 @@
+# =============================================================================
+# tickvault — Claude Co-work Zero-Touch Triage Loop
+# =============================================================================
+# Runs every 10 minutes on GitHub's free-tier runners, 24/7. Invokes Claude
+# Co-work with the canonical triage runbook (.claude/triage/claude-loop-prompt.md)
+# so novel errors escalate to DRAFT GitHub issues even while Parthiban's
+# Mac is asleep.
+#
+# Behaviour when the Mac is unreachable:
+#   The tickvault-logs MCP server is served from Parthiban's Mac via tv-tunnel.
+#   When the Mac is off, MCP tools return unreachable. The runbook
+#   (.claude/triage/claude-loop-prompt.md) instructs Claude to output
+#   `mcp_unreachable` and STOP — no GitHub noise, no false alerts.
+#
+# Manual override: `workflow_dispatch` lets you trigger the loop on demand
+# (mobile-friendly — GitHub mobile app supports this).
+#
+# Requires: ANTHROPIC_API_KEY secret.
+# =============================================================================
+
+name: Claude Triage Loop
+
+on:
+  schedule:
+    # Every 10 minutes. GitHub's free tier allows up to 1 concurrent job.
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+    inputs:
+      force_full_pass:
+        description: 'Force a full triage pass (ignore dedup state)'
+        required: false
+        default: 'false'
+        type: boolean
+
+concurrency:
+  group: claude-triage-loop
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  triage:
+    name: Zero-touch triage pass
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      # MCP endpoint resolution — secrets set in repo Settings:
+      # - TICKVAULT_TUNNEL_PROMETHEUS_URL (e.g. https://prom.tickvault.tunnel)
+      # - TICKVAULT_TUNNEL_QUESTDB_URL
+      # - TICKVAULT_TUNNEL_GRAFANA_URL
+      # - TICKVAULT_TUNNEL_ALERTMANAGER_URL
+      # - TICKVAULT_TUNNEL_API_URL
+      # - TICKVAULT_GRAFANA_API_TOKEN (for authenticated Grafana queries)
+      # If a secret is empty, the MCP falls back to OFFLINE and the
+      # triage prompt outputs `mcp_unreachable` cleanly.
+      TICKVAULT_MCP_PROFILE: cloud-tunnel
+      TICKVAULT_PROMETHEUS_URL: ${{ secrets.TICKVAULT_TUNNEL_PROMETHEUS_URL }}
+      TICKVAULT_QUESTDB_URL: ${{ secrets.TICKVAULT_TUNNEL_QUESTDB_URL }}
+      TICKVAULT_GRAFANA_URL: ${{ secrets.TICKVAULT_TUNNEL_GRAFANA_URL }}
+      TICKVAULT_ALERTMANAGER_URL: ${{ secrets.TICKVAULT_TUNNEL_ALERTMANAGER_URL }}
+      TICKVAULT_API_URL: ${{ secrets.TICKVAULT_TUNNEL_API_URL }}
+      TICKVAULT_GRAFANA_API_TOKEN: ${{ secrets.TICKVAULT_GRAFANA_API_TOKEN }}
+      TICKVAULT_LOGS_DIR: ./data/logs
+      QUESTDB_PG_URL: ${{ secrets.TICKVAULT_TUNNEL_QUESTDB_PG_URL }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          fetch-depth: 1
+
+      - name: Run Claude Co-work triage pass
+        uses: anthropics/claude-code-action@beta
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          timeout_minutes: 9
+          # Inherit the repo's universal .mcp.json — attaches github,
+          # postgres, and tickvault-logs MCP servers automatically.
+          mcp_config: .mcp.json
+          direct_prompt: |
+            You are the tickvault 24/7 zero-touch operator. Follow the
+            runbook at `.claude/triage/claude-loop-prompt.md` EXACTLY —
+            do not re-implement its logic.
+
+            This is scheduled pass ${{ github.run_id }} at
+            ${{ github.event.head_commit.timestamp }}.
+
+            ${{ inputs.force_full_pass == 'true' && 'OVERRIDE: ignore dedup state for this pass.' || '' }}
+
+            Absolute rules (enforced by runbook but stated here for clarity):
+            - NEVER push to main. Fixes land in a branch + draft PR.
+            - NEVER auto-resolve Critical-severity events.
+            - NEVER log Dhan JWT, access-token, or SSM params in issue bodies.
+            - If tickvault-logs MCP is unreachable (Mac off or tunnel down),
+              output `mcp_unreachable` and stop. Do NOT open noise issues.
+
+            Output format (single markdown block at the end):
+            - `all_green` | `<N> actioned, <M> escalated, <K> silenced` | `mcp_unreachable`
+            - One line per actioned event: `<action> <code> <signature[:8]>`
+            - Link every issue or PR opened by this pass.
