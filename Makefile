@@ -407,3 +407,12 @@ doctor: ## Total-system health check (one command — every section explicit pas
 
 mcp-doctor: ## Probe every endpoint the tickvault-logs MCP server reads (4 checks)
 	@bash scripts/mcp-doctor.sh
+
+100pct-audit: ## Real-time 100% Audit Tracker — every dimension w/ proof (M5)
+	@bash scripts/100pct-audit.sh
+
+100pct-audit-ci: ## Same as 100pct-audit but exits non-zero on any GAP (CI mode)
+	@bash scripts/100pct-audit.sh --ci
+
+100pct-audit-json: ## Machine-readable JSON output for dashboards
+	@bash scripts/100pct-audit.sh --json
