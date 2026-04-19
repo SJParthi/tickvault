@@ -156,6 +156,10 @@ pub fn build_router(state: SharedAppState, allowed_origins: &[String], dry_run: 
         .route(
             "/api/debug/logs/jsonl/latest",
             axum::routing::get(handlers::debug::logs_jsonl_latest),
+        )
+        .route(
+            "/api/debug/spill/status",
+            axum::routing::get(handlers::debug::spill_status),
         );
 
     public_routes
