@@ -215,6 +215,11 @@
           {
             "type": "command",
             "command": "echo 'PRESERVE: (1) modified files list (2) test/build results (3) phase progress (4) unresolved errors (5) three principles'"
+          },
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/scripts/claude-session-bootstrap.sh",
+            "timeout": 10
           }
         ]
       }
