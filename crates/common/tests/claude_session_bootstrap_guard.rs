@@ -222,6 +222,48 @@ fn validate_automation_runs_placeholder_fallback_test() {
 }
 
 #[test]
+fn bootstrap_supports_profile_auto_switch() {
+    // PR #288 (#10): bootstrap auto-switches from a dead profile to a
+    // reachable one. The logic must be in the script, must respect the
+    // operator's explicit override, and must expose the switched-from
+    // state via TICKVAULT_AUTO_SWITCHED_FROM so session-sanity can surface it.
+    let src = read("scripts/claude-session-bootstrap.sh");
+    assert!(
+        src.contains("AUTO_SWITCH_MIN_REACHABLE"),
+        "bootstrap must define AUTO_SWITCH_MIN_REACHABLE threshold"
+    );
+    assert!(
+        src.contains("AUTO_SWITCH_ENABLED"),
+        "bootstrap must track whether auto-switch is enabled (disabled under operator override)"
+    );
+    assert!(
+        src.contains("AUTO_SWITCHED_FROM"),
+        "bootstrap must expose which profile it switched from for operator visibility"
+    );
+    assert!(
+        src.contains("TICKVAULT_AUTO_SWITCHED_FROM"),
+        "bootstrap must export TICKVAULT_AUTO_SWITCHED_FROM env var so session-sanity can announce the switch"
+    );
+    assert!(
+        src.contains("OVERRIDE_PROFILE"),
+        "bootstrap must respect TICKVAULT_MCP_PROFILE operator override and disable auto-switch when set"
+    );
+}
+
+#[test]
+fn bootstrap_override_rejects_placeholder_string() {
+    // PR #288 (#10): belt-and-suspenders — when TICKVAULT_MCP_PROFILE is
+    // set but contains the literal `${...}` placeholder from .mcp.json,
+    // treat it as unset. Otherwise auto-switch silently breaks on any
+    // session where the placeholder leaks through.
+    let src = read("scripts/claude-session-bootstrap.sh");
+    assert!(
+        src.contains("'${'*'}'"),
+        "bootstrap must reject the literal ${{...}} placeholder string as an override"
+    );
+}
+
+#[test]
 fn active_profile_is_one_of_the_known_profiles() {
     let cfg = read("config/claude-mcp-endpoints.toml");
     let active_line = cfg
