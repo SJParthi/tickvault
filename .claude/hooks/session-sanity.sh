@@ -134,6 +134,29 @@ if [ -f "$SESSION_ENV" ]; then
     "${TICKVAULT_API_STATUS:-?}" >&2
 fi
 
+# PR #288 (#9b): LIVE METRIC PULL — when Prometheus is REACHABLE, pull the
+# zero-tick-loss-adjacent counters so every session opens knowing whether
+# the app is actually dropping ticks / losing frames. 2s timeout per query,
+# 5 queries total — bounded at 10s worst case. If Prometheus is OFFLINE,
+# this block is skipped entirely (SessionStart stays fast).
+if [ "${TICKVAULT_PROM_STATUS:-}" = "REACHABLE" ] && [ -n "${TICKVAULT_PROMETHEUS_URL:-}" ]; then
+  prom_q() {
+    local q="$1"
+    curl -fsS -m 2 --data-urlencode "query=$q" \
+      "${TICKVAULT_PROMETHEUS_URL}/api/v1/query" 2>/dev/null \
+      | awk 'match($0, /"value":\[[^,]+,"([^"]+)"/, a) { print a[1]; exit }'
+  }
+  TICKS_DROPPED=$(prom_q 'sum(tv_ticks_dropped_total)' 2>/dev/null)
+  SEQ_HOLES=$(prom_q 'sum(tv_depth_sequence_holes_total)' 2>/dev/null)
+  COLLISIONS=$(prom_q 'tv_instrument_registry_cross_segment_collisions' 2>/dev/null)
+  WS_UP=$(prom_q 'tv_websocket_connections_active' 2>/dev/null)
+  QDB_SPILL=$(prom_q 'sum(tv_questdb_spill_bytes)' 2>/dev/null)
+  echo "Live signal (from Prometheus):" >&2
+  printf "  ticks_dropped=%s  depth_seq_holes=%s  id_collisions=%s  ws_active=%s  qdb_spill_bytes=%s\n" \
+    "${TICKS_DROPPED:-n/a}" "${SEQ_HOLES:-n/a}" "${COLLISIONS:-n/a}" \
+    "${WS_UP:-n/a}" "${QDB_SPILL:-n/a}" >&2
+fi
+
 # LIVE ERROR TAIL — inline the last 10 structured ERROR events, if any.
 # Every Claude session / cowork task starts with this in context so nobody
 # has to call tail_errors manually.

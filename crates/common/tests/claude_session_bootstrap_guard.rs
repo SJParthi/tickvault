@@ -116,6 +116,31 @@ fn session_sanity_hook_tails_live_errors_jsonl() {
 }
 
 #[test]
+fn session_sanity_hook_pulls_prometheus_when_reachable() {
+    // PR #288 (#9b): when Prometheus is REACHABLE, SessionStart must pull
+    // the zero-tick-loss-adjacent counters so operators and Claude both see
+    // the real numbers at session start. The pull must be conditional
+    // (REACHABLE only) to keep SessionStart fast when the stack is down.
+    let hook = read(".claude/hooks/session-sanity.sh");
+    assert!(
+        hook.contains("TICKVAULT_PROM_STATUS") && hook.contains("REACHABLE"),
+        "session-sanity must gate the Prometheus pull on PROM_STATUS=REACHABLE"
+    );
+    assert!(
+        hook.contains("tv_ticks_dropped_total"),
+        "session-sanity must pull tv_ticks_dropped_total"
+    );
+    assert!(
+        hook.contains("tv_depth_sequence_holes_total"),
+        "session-sanity must pull tv_depth_sequence_holes_total (PR #288 #5)"
+    );
+    assert!(
+        hook.contains("tv_instrument_registry_cross_segment_collisions"),
+        "session-sanity must pull the registry collision gauge (I-P1-11)"
+    );
+}
+
+#[test]
 fn precompact_hook_reinvokes_bootstrap() {
     let settings = read(".claude/settings.json");
     let precompact_start = settings
@@ -260,6 +285,96 @@ fn bootstrap_override_rejects_placeholder_string() {
     assert!(
         src.contains("'${'*'}'"),
         "bootstrap must reject the literal ${{...}} placeholder string as an override"
+    );
+}
+
+#[test]
+fn bootstrap_has_auto_switch_logic() {
+    // PR #288 (#10): bootstrap must auto-switch to a reachable profile when
+    // the configured profile has <3 of 5 endpoints reachable. Operator
+    // override (TICKVAULT_MCP_PROFILE) disables auto-switch.
+    let src = read("scripts/claude-session-bootstrap.sh");
+    assert!(
+        src.contains("AUTO_SWITCH_MIN_REACHABLE"),
+        "bootstrap must define the auto-switch threshold"
+    );
+    assert!(
+        src.contains("AUTO_SWITCHED_FROM") || src.contains("auto-switched"),
+        "bootstrap must record when auto-switch fired"
+    );
+    assert!(
+        src.contains("OVERRIDE_PROFILE"),
+        "bootstrap must honor TICKVAULT_MCP_PROFILE override (disables auto-switch)"
+    );
+}
+
+#[test]
+fn bootstrap_rejects_placeholder_profile_override() {
+    // Same bug class as the MCP server: if the shell didn't expand
+    // ${TICKVAULT_MCP_PROFILE}, the literal string leaks through and
+    // auto-switch is incorrectly suppressed.
+    let src = read("scripts/claude-session-bootstrap.sh");
+    assert!(
+        src.contains("'${'*'}'")
+            || src.contains("${*}")
+            || src.contains("case \"$OVERRIDE_PROFILE\""),
+        "bootstrap must treat literal ${{...}} placeholder override as empty"
+    );
+}
+
+#[test]
+fn fuzz_workflow_supports_tunable_duration() {
+    // PR #288 (#8): scheduled runs use 900s (15 min, 3x prior), manual
+    // dispatch can override up to 3600s. Respects cost-budget per
+    // aws-budget.md (~30 min/week stays well under free-tier 2000 min/mo).
+    let wf = read(".github/workflows/fuzz.yml");
+    assert!(
+        wf.contains("fuzz_duration_secs"),
+        "fuzz workflow must expose fuzz_duration_secs dispatch input"
+    );
+    assert!(
+        wf.contains("'900'") || wf.contains("\"900\""),
+        "fuzz workflow default must be 900s (15 min)"
+    );
+    assert!(
+        !wf.contains("-max_total_time=300 "),
+        "fuzz workflow should no longer hardcode 300s (5 min)"
+    );
+}
+
+#[test]
+fn subscription_planner_emits_per_id_collision_gauge() {
+    // PR #288 (#5b): subscription_planner.rs must emit one gauge per
+    // collision pair (labelled security_id + losing + winning) so the
+    // operator can see WHICH ids collided in Grafana.
+    let src = read("crates/core/src/instrument/subscription_planner.rs");
+    assert!(
+        src.contains("tv_instrument_registry_collision_pair"),
+        "subscription_planner must emit tv_instrument_registry_collision_pair gauge"
+    );
+    assert!(
+        src.contains("collision_pairs()"),
+        "subscription_planner must call registry.collision_pairs()"
+    );
+}
+
+#[test]
+fn tick_processor_uses_segment_aware_sequence_tracker() {
+    // PR #288 (#1 wiring): tick_processor must use DepthSequenceTracker
+    // (segment-aware) instead of the old HashMap<(u32, u8), u32>
+    // (not segment-aware, violates I-P1-11).
+    let src = read("crates/core/src/pipeline/tick_processor.rs");
+    assert!(
+        src.contains("DepthSequenceTracker"),
+        "tick_processor must use DepthSequenceTracker"
+    );
+    assert!(
+        !src.contains("let mut deep_depth_seq_tracker: std::collections::HashMap<(u32, u8), u32>"),
+        "old non-segment-aware HashMap must be removed"
+    );
+    assert!(
+        !src.contains("tv_depth_20lvl_sequence_gaps_total"),
+        "old single-metric name must be removed (replaced by 3 labelled metrics)"
     );
 }
 
