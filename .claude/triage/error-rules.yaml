@@ -407,19 +407,21 @@ rules:
       Universe is stale — operator forces instrument rebuild before
       resuming trading.
 
-  - name: data-807-token-expired-escalate
+  - name: data-807-token-expired-auto-fix
     match:
       code: DATA-807
-    action: escalate
+    action: auto_fix
+    auto_fix_script: scripts/auto-fix-rotate-token.sh
     runbook_path: .claude/rules/dhan/authentication.md
-    confidence: 0.90
-    cooldown_secs: 0
+    confidence: 0.85
+    cooldown_secs: 60
     justification: >-
       DATA-807 triggers the token-refresh pipeline automatically via
       AUTH-GAP-02. If we still see a 807 event surfaced to the triage
-      log, the refresh failed — escalate. M3 will add a rotate-token
-      auto-fix script; until then confidence stays below 0.95 and this
-      rule escalates.
+      log, the refresh failed. auto-fix-rotate-token.sh (M3) is
+      scaffolded; backing /api/auth/rotate endpoint pending (M3.5).
+      Confidence 0.85 keeps below the 0.95 auto-action threshold so the
+      rule currently escalates, but documents the upgrade path.
 
   # -----------------------------------------------------------------------
   # Medium — data pipeline correctness
