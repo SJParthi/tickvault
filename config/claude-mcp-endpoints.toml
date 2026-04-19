@@ -13,7 +13,7 @@
 # The `active` profile at the top decides which set is used by default.
 # Override at runtime:   TICKVAULT_MCP_PROFILE=mac-dev claude ...
 
-active = "aws-prod"
+active = "local"
 
 # -----------------------------------------------------------------------------
 # mac-dev profile
