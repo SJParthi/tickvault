@@ -119,6 +119,11 @@ async fn download_single_csv(client: &Client, name: &str, url: &str) -> Result<S
             let response = client
                 .get(&url)
                 .header("Accept", "text/csv, application/csv, text/plain, */*")
+                // niftyindices.com gates CSV downloads behind a same-origin
+                // Referer; without it, Cloudflare returns an HTML challenge
+                // page (HTTP 200 + HTML body), which the `<`/`<!DOCTYPE`
+                // check below rejects as "received HTML instead of CSV".
+                .header("Referer", INDEX_CONSTITUENCY_BASE_URL)
                 .send()
                 .await?;
 
@@ -173,6 +178,22 @@ mod tests {
         assert_eq!(
             url,
             "https://www.niftyindices.com/IndexConstituent/ind_nifty50list.csv"
+        );
+    }
+
+    /// Ratchet: niftyindices.com serves CSVs only when the request carries
+    /// a same-origin Referer. Without it Cloudflare returns an HTML WAF
+    /// challenge page and every constituency download fails with
+    /// "received HTML instead of CSV". This source-scan test blocks
+    /// regressions by asserting the `.header("Referer", ...)` call is
+    /// still present in the single request builder.
+    #[test]
+    fn test_single_csv_request_includes_referer_header() {
+        let source = include_str!("csv_downloader.rs");
+        assert!(
+            source.contains(".header(\"Referer\", INDEX_CONSTITUENCY_BASE_URL)"),
+            "Referer header must be set on the single CSV request — \
+             niftyindices.com returns HTML without it"
         );
     }
 
