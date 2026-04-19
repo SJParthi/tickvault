@@ -1,0 +1,1098 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Dhan — Markets (high-fidelity replica)</title>
+<link rel="stylesheet" href="../../colors_and_type.css">
+<style>
+  :root{
+    --dh-bg:#0a0a0a;--dh-bg-2:#0e0e0e;--dh-bg-3:#151515;--dh-bg-card:#141414;
+    --dh-bg-hover:rgba(255,255,255,0.03);--dh-border:#1f1f1f;--dh-border-2:#262626;
+    --dh-text:#e5e5e5;--dh-text-dim:#9a9a9a;--dh-text-muted:#6a6a6a;
+    --dh-green:#1dbf73;--dh-green-soft:#23c77a;--dh-red:#e04f5f;--dh-red-soft:#d9575e;
+    --dh-accent:#1dbf73;
+  }
+  html,body{margin:0;padding:0;background:var(--dh-bg);color:var(--dh-text);
+    font-family:var(--tv-font-sans);font-size:13px;-webkit-font-smoothing:antialiased;
+    height:100%;overflow:hidden;}
+  a{color:inherit;text-decoration:none}button{font-family:inherit;cursor:pointer}
+
+  .app{display:flex;flex-direction:column;height:100vh;min-height:0;}
+  /* ---- topnav ---- */
+  .topnav{display:flex;align-items:center;height:48px;
+    background:linear-gradient(90deg,#1f241a 0%,#262a20 40%,#2a2e22 100%);
+    border-bottom:1px solid #000;padding:0 24px;gap:24px;color:#dcdcdc;font-size:13px;}
+  .topnav .brand{display:flex;align-items:center;gap:10px;padding-right:14px;
+    border-right:1px solid rgba(255,255,255,0.08);height:48px;}
+  .topnav .brand-logo{width:22px;height:22px;border-radius:3px;
+    background:linear-gradient(135deg,#c9a961,#8a7536);color:#1a1a1a;
+    display:flex;align-items:center;justify-content:center;font-weight:800;font-size:12px;}
+  .topnav .nifty{font-size:12px;display:flex;align-items:center;gap:6px;}
+  .topnav .nifty .v{color:#fff}.topnav .nifty .chg{color:var(--dh-green-soft)}
+  .topnav .nav-main{display:flex;gap:26px;margin-left:200px;}
+  .topnav .nav-main a{color:#cfcfcf;padding:14px 0;}
+  .topnav .right-nav{margin-left:auto;display:flex;gap:24px;align-items:center;}
+  .topnav .right-nav a{color:#cfcfcf}.topnav .right-nav a.on{color:var(--dh-green)}
+  .topnav .status{display:flex;align-items:center;gap:6px;color:#cfcfcf;font-size:12px;
+    padding-left:14px;border-left:1px solid rgba(255,255,255,0.08);height:24px;}
+  .topnav .status .dot{width:7px;height:7px;border-radius:50%;background:#9a9a9a;}
+  .topnav .icon-btn{width:28px;height:28px;display:flex;align-items:center;justify-content:center;}
+  .topnav .avatar-p{width:28px;height:28px;border-radius:50%;
+    background:linear-gradient(135deg,#9370db,#6a4c93);color:#fff;
+    display:flex;align-items:center;justify-content:center;font-weight:700;font-size:13px;}
+
+  /* ---- index strip ---- */
+  .index-strip{display:flex;align-items:center;gap:38px;padding:0 24px;height:36px;
+    background:var(--dh-bg);border-bottom:1px solid var(--dh-border);font-size:12px;
+    overflow-x:auto;position:relative;}
+  .idx{display:flex;align-items:center;gap:8px;white-space:nowrap;}
+  .idx .n{color:#b8b8b8}.idx .v{color:#dcdcdc}
+  .idx .chg.u{color:var(--dh-green-soft)}.idx .chg.d{color:var(--dh-red-soft)}
+  .gift-n{margin-left:auto;display:flex;align-items:center;gap:8px;color:#b8b8b8;font-size:12px;}
+  .gift-n .prev,.gift-n .next{width:22px;height:22px;border-radius:50%;background:#1a1a1a;
+    display:flex;align-items:center;justify-content:center;color:#dcdcdc;font-size:10px;}
+  .gift-n .next{background:var(--dh-green);color:#0a0a0a;}
+
+  .body-grid{display:grid;grid-template-columns:280px 1fr;flex:1;min-height:0;}
+
+  /* ---- watchlist ---- */
+  .wl{border-right:1px solid var(--dh-border);display:flex;flex-direction:column;min-width:0;}
+  .wl-search{padding:12px 14px;border-bottom:1px solid var(--dh-border);}
+  .wl-search .wrap{position:relative;}
+  .wl-search input{width:100%;box-sizing:border-box;background:#111;
+    border:1px solid var(--dh-border-2);color:var(--dh-text);
+    padding:8px 10px 8px 30px;border-radius:4px;font-family:inherit;font-size:12px;}
+  .wl-search .icon{position:absolute;left:9px;top:50%;transform:translateY(-50%);
+    color:var(--dh-text-muted);font-size:13px;}
+  .wl-title{display:flex;align-items:center;justify-content:space-between;
+    padding:12px 14px 8px;font-size:13px;font-weight:600;color:var(--dh-text);}
+  .wl-title .l{display:flex;align-items:center;gap:8px;}
+  .wl-title .l .folder{color:var(--dh-accent);font-size:14px;}
+  .wl-title .caret{color:var(--dh-text-dim);font-size:10px;}
+  .wl-tabs{display:flex;gap:4px;padding:0 14px 10px;border-bottom:1px solid var(--dh-border);}
+  .wl-tab{width:24px;height:24px;border-radius:4px;display:flex;align-items:center;
+    justify-content:center;background:transparent;color:var(--dh-text-dim);
+    font-size:12px;border:none;}
+  .wl-tab.on{color:var(--dh-accent);font-weight:600;border-bottom:2px solid var(--dh-accent);border-radius:0;}
+  .wl-list{flex:1;overflow-y:auto;}
+  .wl-list::-webkit-scrollbar{width:4px;}.wl-list::-webkit-scrollbar-thumb{background:#2a2a2a;border-radius:2px;}
+  .wl-row{display:flex;align-items:center;padding:10px 14px;border-left:3px solid transparent;
+    border-bottom:1px solid rgba(255,255,255,0.02);gap:10px;}
+  .wl-row:hover{background:var(--dh-bg-hover);}
+  .wl-row.u{border-left-color:var(--dh-green);}.wl-row.d{border-left-color:var(--dh-red);}
+  .wl-row .info{flex:1;min-width:0;}.wl-row .name{font-size:12px;color:var(--dh-text);}
+  .wl-row .ex{font-size:10px;color:var(--dh-text-muted);margin-top:2px;display:flex;align-items:center;gap:4px;}
+  .wl-row .ex .fo{color:var(--dh-red-soft);font-weight:600;font-size:9px;letter-spacing:.5px;}
+  .wl-row .price-col{text-align:right;font-variant-numeric:tabular-nums;}
+  .wl-row .ltp{font-size:12px;display:flex;align-items:center;gap:4px;justify-content:flex-end;}
+  .wl-row.u .ltp{color:var(--dh-green-soft);}.wl-row.d .ltp{color:var(--dh-red-soft);}
+  .wl-row .chg{font-size:10px;color:var(--dh-text-muted);margin-top:2px;}
+  .wl-footer{padding:8px 14px;border-top:1px solid var(--dh-border);display:flex;
+    align-items:center;gap:18px;font-size:11px;color:var(--dh-text-muted);}
+  .wl-footer .right{margin-left:auto;display:flex;gap:8px;}
+
+  /* ---- main ---- */
+  .main{display:flex;flex-direction:column;min-width:0;flex:1;min-height:0;}
+  .main-tabs{display:flex;align-items:center;padding:0 24px;
+    border-bottom:1px solid var(--dh-border);height:44px;}
+  .m-tab{padding:12px 16px;color:var(--dh-text-dim);font-size:13px;
+    background:transparent;border:none;position:relative;
+    display:flex;align-items:center;gap:6px;}
+  .m-tab:hover{color:var(--dh-text);}
+  .m-tab.on{color:var(--dh-accent);}
+  .m-tab.on::after{content:'';position:absolute;left:12px;right:12px;bottom:-1px;
+    height:2px;background:var(--dh-accent);}
+  .m-tab .live-dot{width:6px;height:6px;border-radius:50%;background:var(--dh-accent);display:none;}
+  .m-tab[data-live] .live-dot{display:inline-block;}
+
+  .sub-bar{display:flex;align-items:center;padding:10px 24px;
+    border-bottom:1px solid var(--dh-border);gap:22px;flex-wrap:nowrap;}
+  .s-tab{background:transparent;border:none;color:var(--dh-text-dim);
+    font-size:12.5px;padding:6px 0;position:relative;white-space:nowrap;}
+  .s-tab:hover{color:var(--dh-text);}
+  .s-tab.on{color:var(--dh-accent);}
+  .s-tab.on::after{content:'';position:absolute;left:0;right:0;bottom:-11px;
+    height:2px;background:var(--dh-accent);}
+  .sub-nav-arrows{display:inline-flex;gap:4px;margin-left:2px;}
+  .sub-nav-arrows button{width:22px;height:22px;border:1px solid var(--dh-border-2);background:#111;border-radius:3px;color:var(--dh-text-dim);font-size:10px;display:flex;align-items:center;justify-content:center;}
+  .oi-marker{display:inline-block;padding:1px 7px;border-radius:3px;font-size:9px;font-weight:700;margin-left:6px;background:#ff8c2a;color:#0a0a0a;}
+  .oi-marker.minus{background:#9b6bff;color:#fff;}
+  /* Scrip search dropdown in watchlist */
+  .scrip-dd{position:absolute;top:calc(100% + 4px);left:14px;right:14px;background:#0e0e0e;
+    border:1px solid #2a2a2a;border-radius:6px;padding:6px 0;z-index:50;display:none;
+    box-shadow:0 8px 24px rgba(0,0,0,.6);}
+  .scrip-dd.open{display:block}
+  .scrip-dd .it{padding:8px 14px;font-size:11px;color:#ddd;display:flex;justify-content:space-between;align-items:center;}
+  .scrip-dd .it:hover{background:#1a1a1a}
+  .scrip-dd .it .ex{color:#666;font-size:9px;}
+  .sub-bar .right-ctrl{margin-left:auto;display:flex;gap:10px;align-items:center;}
+  .toggle-seg{display:inline-flex;align-items:center;gap:8px;font-size:12px;color:var(--dh-text-dim);cursor:pointer;user-select:none;}
+  .toggle-seg .lbl.on{color:var(--dh-accent);font-weight:500;}
+  .toggle-seg .sw{width:26px;height:14px;background:#1f1f1f;border-radius:8px;position:relative;transition:background .15s;}
+  .toggle-seg .sw::after{content:'';position:absolute;top:1px;left:1px;width:12px;height:12px;
+    border-radius:50%;background:var(--dh-accent);transition:left .15s, background .15s;}
+  .toggle-seg.losers .sw::after{left:13px;background:var(--dh-red);}
+  /* select-pill — slim rounded like real Dhan (top-right of sub-bar) */
+  .select-pill{background:transparent;border:1px solid #2d2d2d;color:#c4c4c4;
+    font-size:11px;padding:4px 20px 4px 10px;border-radius:3px;position:relative;min-width:48px;cursor:pointer;
+    text-align:left;}
+  .select-pill::after{content:'▾';position:absolute;right:7px;top:4px;font-size:9px;color:#888;}
+  .select-pill:hover{border-color:#3a3a3a;color:#fff}
+  .select-pill.open{border-color:var(--dh-accent);color:var(--dh-accent);}
+  .select-pill.open::after{color:var(--dh-accent);}
+  .sp-wrap{position:relative;display:inline-block;}
+  .sp-menu{position:absolute;top:calc(100% + 3px);right:0;background:#151515;border:1px solid #2a2a2a;
+    border-radius:3px;padding:3px 0;z-index:70;display:none;min-width:90px;box-shadow:0 4px 14px rgba(0,0,0,.75);}
+  .sp-menu.open{display:block}
+  .sp-menu button{display:block;width:100%;text-align:left;background:transparent;border:0;color:#d4d4d4;
+    font-size:11px;padding:6px 14px;cursor:pointer;}
+  .sp-menu button:hover{background:#1f1f1f;color:#fff}
+  .sp-menu button.on{color:var(--dh-accent);}
+
+  .table-wrap{flex:1;overflow:auto;position:relative;}
+  .table-wrap::-webkit-scrollbar{width:6px;height:6px;}
+  .table-wrap::-webkit-scrollbar-thumb{background:#2a2a2a;border-radius:3px;}
+  table.dtable{width:100%;border-collapse:separate;border-spacing:0;font-size:12px;min-width:920px;}
+  .dtable thead th{position:sticky;top:0;z-index:2;background:var(--dh-bg);
+    text-align:right;padding:10px 14px;color:var(--dh-text-dim);font-weight:500;
+    font-size:11px;border-bottom:1px solid var(--dh-border);white-space:nowrap;cursor:pointer;user-select:none;}
+  .dtable thead th:hover{color:var(--dh-text);}
+  .dtable thead th:first-child{text-align:left;padding-left:24px;}
+  .dtable thead th .sort-arr{color:var(--dh-accent);margin-right:3px;font-size:9px;visibility:hidden;}
+  .dtable thead th.sorted .sort-arr{visibility:visible;}
+  .dtable tbody td{padding:12px 14px;text-align:right;color:var(--dh-text);
+    font-variant-numeric:tabular-nums;border-bottom:1px solid var(--dh-border);white-space:nowrap;}
+  .dtable tbody tr:hover td{background:var(--dh-bg-hover);}
+  .dtable tbody td:first-child{text-align:left;padding-left:24px;}
+  .dtable .up{color:var(--dh-green-soft);}.dtable .down{color:var(--dh-red-soft);}
+  .dtable .nm{display:flex;align-items:center;gap:10px;}
+  .dtable .nm .cb{width:14px;height:14px;border:1px solid var(--dh-border-2);border-radius:2px;background:#111;}
+  .dtable .nm .flag{font-size:14px;}
+  .dtable .nm .country{font-size:10px;color:var(--dh-text-muted);margin-left:6px;}
+  .dtable .ex-pill{font-size:10px;color:var(--dh-text-muted);margin-left:8px;}
+
+  /* option chain specific */
+  .oc-head{display:flex;align-items:center;padding:14px 24px;gap:16px;border-bottom:1px solid var(--dh-border);flex-wrap:wrap;}
+  .oc-head .scrip{font-size:16px;font-weight:600;color:var(--dh-text);}
+  .oc-head .spot{font-size:12px;color:var(--dh-text-dim);}
+  .oc-head .spot b{color:var(--dh-text);}
+  .oc-head .right{margin-left:auto;display:flex;gap:10px;}
+  table.oc{width:100%;border-collapse:separate;border-spacing:0;font-size:11.5px;
+    font-family:var(--tv-font-mono);min-width:1100px;}
+  .oc thead th{position:sticky;top:0;z-index:2;background:var(--dh-bg);
+    padding:8px 10px;color:var(--dh-text-dim);font-size:10px;font-weight:500;
+    border-bottom:1px solid var(--dh-border);text-align:right;cursor:pointer;user-select:none;text-transform:uppercase;letter-spacing:.5px;}
+  .oc thead th.center{text-align:center;}
+  .oc thead th.strike-h{background:#141414;color:var(--dh-text);}
+  .oc thead th.ce-h{background:rgba(29,191,115,0.08);color:var(--dh-green-soft);text-align:center;}
+  .oc thead th.pe-h{background:rgba(224,79,95,0.08);color:var(--dh-red-soft);text-align:center;}
+  .oc tbody td{padding:7px 10px;text-align:right;color:var(--dh-text);
+    border-bottom:1px solid var(--dh-border);font-variant-numeric:tabular-nums;}
+  .oc tbody tr.ce-row td.ce{background:rgba(29,191,115,0.04);}
+  .oc tbody tr.pe-row td.pe{background:rgba(224,79,95,0.04);}
+  .oc tbody tr.atm td{background:rgba(41,98,255,0.10) !important;}
+  .oc td.strike{text-align:center;color:var(--dh-text);font-weight:600;background:#141414;}
+  .oc td.up{color:var(--dh-green-soft);}.oc td.down{color:var(--dh-red-soft);}
+  .oc tbody tr:hover td:not(.strike){background:rgba(255,255,255,0.03);}
+
+  /* bottom bar — borderless icon buttons like real Dhan */
+  .bottom-bar{display:flex;align-items:center;padding:8px 20px;
+    border-top:1px solid var(--dh-border);background:var(--dh-bg);gap:18px;}
+  .bottom-bar .btn{background:transparent;border:0;color:#c4c4c4;
+    padding:4px 2px;font-size:12px;display:inline-flex;align-items:center;gap:6px;cursor:pointer;
+    white-space:nowrap;}
+  .bottom-bar .btn:hover{color:#fff}
+  .bottom-bar .btn .ico{font-size:13px;color:#8a8a8a}
+  .bottom-bar .btn .caret{font-size:8px;color:#666;margin-left:2px;}
+  .bottom-bar .right{margin-left:auto;}
+  .bottom-bar .cta{background:transparent;border:1px solid var(--dh-accent);color:var(--dh-accent);
+    padding:6px 14px;border-radius:4px;font-size:12px;font-weight:500;display:inline-flex;align-items:center;gap:6px;cursor:pointer;}
+  .bottom-bar .cta:hover{background:rgba(29,191,115,.08)}
+  /* Option Chain scrip popover (matches Dhan exactly) */
+  .oc-pop-wrap{position:relative;}
+  .oc-pop{position:absolute;bottom:calc(100% + 4px);left:0;background:#141414;
+    border:1px solid #2a2a2a;border-radius:4px;padding:4px 0;z-index:60;display:none;
+    box-shadow:0 -4px 16px rgba(0,0,0,.7);min-width:120px;}
+  .oc-pop.open{display:block}
+  .oc-pop .scrip-item{display:block;width:100%;text-align:left;background:transparent;border:0;
+    color:#d4d4d4;font-size:10.5px;padding:7px 14px;cursor:pointer;letter-spacing:.3px;
+    font-weight:500;text-transform:uppercase;}
+  .oc-pop .scrip-item:hover{background:#1d1d1d;color:#fff}
+  .oc-pop .scrip-item.on{color:var(--dh-accent);}
+
+  .view{display:none;flex-direction:column;flex:1;min-height:0;}
+  .view.on{display:flex;}
+  #view-container{display:flex;flex-direction:column;flex:1;min-height:0;}
+
+  /* live cards */
+  .live-cards{display:grid;grid-template-columns:repeat(6,1fr);gap:10px;padding:14px 24px;border-bottom:1px solid var(--dh-border);}
+  .lc{background:#141414;border:1px solid var(--dh-border);border-radius:6px;padding:10px 12px;font-size:12px;color:var(--dh-text);cursor:pointer;}
+  .lc:hover,.lc.on{background:#1a1310;border-color:#3a2a1a;color:#f0a658;font-weight:600;position:relative;}
+  .lc.on::after{content:'▸';position:absolute;top:10px;right:10px;color:#f0a658;}
+</style>
+</head>
+<body>
+<div class="app">
+
+  <!-- TOP NAV -->
+  <div class="topnav">
+    <div class="brand">
+      <div class="brand-logo">d</div>
+      <div class="nifty"><span>Nifty 50</span><span class="v">24,353.55</span>
+        <span class="chg">+156.80</span><span class="chg">(+0.65%)</span><span class="chg">↗</span></div>
+    </div>
+    <div class="nav-main"><a>Home</a><a>Portfolio</a><a>Positions</a><a>Orders</a><a>Money</a></div>
+    <div class="right-nav">
+      <a class="on">Markets</a><a>Rent Stocks</a><a>News</a><a>IPOs</a>
+      <span class="status"><span class="dot"></span>Markets Closed</span>
+      <span class="icon-btn">📶</span><span class="icon-btn">🔔</span>
+      <span class="avatar-p">P</span>
+    </div>
+  </div>
+
+  <!-- INDEX STRIP -->
+  <div class="index-strip">
+    <div class="idx"><span class="n">Nifty 50</span><span class="v">24,353.55</span><span class="chg u">+156.80 (+0.65%) ↗</span></div>
+    <div class="idx"><span class="n">Nifty Next 50</span><span class="v">70,273.80</span><span class="chg u">+973.20 (+1.40%) ↗</span></div>
+    <div class="idx"><span class="n">Nifty Bank</span><span class="v">56,565.70</span><span class="chg d">-479.30 (-0.85%) ↘</span></div>
+    <div class="idx"><span class="n">India VIX</span><span class="v">17.21</span><span class="chg d">-0.88 (-4.86%) ↘</span></div>
+    <div class="idx"><span class="n">Fin Nifty</span><span class="v">26,521.25</span><span class="chg u">+177.70 (+0.67%) ↗</span></div>
+    <div class="gift-n"><span>GIFT N</span><span class="prev">◀</span><span class="next">▶</span></div>
+  </div>
+
+  <div class="body-grid">
+    <!-- WATCHLIST -->
+    <aside class="wl">
+      <div class="wl-search"><div class="wrap"><span class="icon">🔍</span>
+        <input id="wlSearch" placeholder="Search for companies to invest or trade" autocomplete="off">
+        <div class="scrip-dd" id="scripDD"></div>
+      </div></div>
+      <div class="wl-title"><div class="l"><span class="folder">📁</span> First Watchlist</div><span class="caret">▾</span></div>
+      <div class="wl-tabs">
+        <button class="wl-tab on">1</button><button class="wl-tab">2</button><button class="wl-tab">3</button>
+        <button class="wl-tab">4</button><button class="wl-tab">5</button><button class="wl-tab">6</button>
+        <button class="wl-tab" style="color:var(--dh-text-muted)">f</button>
+        <button class="wl-tab" style="color:var(--dh-text-muted)">ƒ</button>
+      </div>
+      <div class="wl-list" id="wl-list"></div>
+      <div class="wl-footer"><span>Name</span><span>LTP</span><span>LTP %</span><span>Color</span>
+        <span class="right"><span>↕</span><span>⋮</span></span></div>
+    </aside>
+
+    <!-- MAIN -->
+    <div class="main">
+      <div class="main-tabs" id="main-tabs"></div>
+      <div id="view-container"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+/* ============ DATA ============ */
+const WATCHLIST = [
+  ['Adani Ports & SEZ','NSE',null,'1,573.40','23.60 (1.52%)','u'],
+  ['Adani Green Energy','NSE',null,'1,127.30','8.40 (0.75%)','u'],
+  ['Adani Enterprises','NSE',null,'2,218.20','14.60 (0.66%)','u'],
+  ['ICICI Bank','NSE','F&O','1,346.80','1.30 (0.10%)','u'],
+  ['HDFC Bank','NSE','F&O','799.90','4.45 (0.56%)','u'],
+  ['Reliance Industries','NSE','F&O','1,365.00','21.70 (1.62%)','u'],
+  ['Sensex','BSE',null,'78,493.64','504.86 (0.65%)','u'],
+  ['Gift Nifty','NSE',null,'24,700.00','280.00 (1.15%)','u'],
+  ['Nifty Midcap Select','NSE',null,'13,838.85','155.15 (1.13%)','u'],
+  ['FinNifty','NSE',null,'26,521.25','177.70 (0.67%)','u'],
+  ['Nifty Bank','NSE',null,'56,565.70','479.30 (0.85%)','u'],
+];
+
+/* number helpers */
+const N = s => typeof s==='number'?s:parseFloat(String(s).replace(/[^\d.\-]/g,''))||0;
+
+/* ---- INDEX data sets ---- */
+const INDEX_NSE = [
+  ['NIFTY FMCG',49557.75,1279.85,2.65,48371.60,49743.05,48371.60,48377.90],
+  ['NIFTY MNC',31348.10,659.85,2.15,30739.30,31380.95,30599.10,30688.25],
+  ['NIFTY Energy',38881.75,697.00,1.83,38354.50,38951.00,38244.50,38184.75],
+  ['Nifty Small Cap 50',8552.95,138.05,1.64,8443.65,8562.05,8424.85,8414.90],
+  ['NIFTY Smallcap 100',17565.70,256.85,1.48,17364.45,17590.65,17341.35,17308.85],
+  ['NIFTY Smallcap 250',16439.25,240.00,1.48,16246.60,16453.40,16228.85,16199.25],
+  ['Nifty Next 50',70273.80,973.20,1.40,69397.75,70410.00,69117.05,69300.60],
+  ['NIFTY Media',1416.60,18.70,1.34,1404.10,1426.25,1401.10,1397.90],
+  ['NIFTY Midcap 100',59898.20,751.45,1.27,59275.25,59961.65,59057.50,59146.75],
+  ['Nifty Mid Cap 50',17014.60,209.80,1.25,16840.15,17035.30,16769.35,16804.80],
+  ['NIFTY Midcap 150',22045.20,264.70,1.22,21829.30,22067.15,21753.75,21780.50],
+  ['NIFTY Microcap 250',22508.20,263.15,1.18,22335.20,22566.70,22312.10,22245.05],
+  ['NIFTY Consumption',11414.05,131.50,1.17,11281.95,11427.15,11262.00,11282.55],
+  ['GIFT Nifty',24700.00,280.00,1.15,24223.50,24849.00,24084.00,24420.00],
+  ['Nifty Midcap',13838.85,155.15,1.13,13706.25,13859.15,13646.95,13683.70],
+  ['NIFTY Metal',12880.05,139.80,1.10,12756.00,12902.70,12618.00,12740.20],
+  ['NIFTY 500',22869.40,213.10,0.94,22660.55,22882.15,22605.15,22656.30],
+  ['NIFTY 200',13862.85,120.60,0.88,13739.20,13871.00,13702.50,13742.25],
+  ['NIFTY 100',25238.90,196.60,0.79,25022.55,25253.15,24955.20,25042.30],
+  ['Nifty 50',24353.55,156.80,0.65,24165.90,24371.90,24096.05,24196.75],
+  ['Nifty Bank',56565.70,479.30,0.85,56072.40,56628.70,55841.65,56086.40],
+  ['Fin Nifty',26521.25,177.70,0.67,26309.05,26552.20,26200.40,26343.55],
+  ['India VIX',17.21,-0.88,-4.86,18.09,18.47,16.59,18.09],
+];
+const INDEX_BSE = [
+  ['SENSEX',78493.64,504.86,0.65,77902.10,78620.45,77800.00,77988.78],
+  ['BSE 500',34122.80,310.45,0.92,33802.00,34190.10,33770.25,33812.35],
+  ['BSE Midcap',45122.10,518.30,1.16,44604.00,45180.60,44550.00,44603.80],
+  ['BSE Smallcap',52338.45,702.20,1.36,51620.00,52410.00,51580.00,51636.25],
+  ['BSE Bankex',61722.30,-185.20,-0.30,61850.00,61920.00,61580.00,61907.50],
+  ['BSE IT',38010.25,-110.30,-0.29,38150.00,38210.00,37860.00,38120.55],
+  ['BSE Auto',52240.80,640.20,1.24,51600.00,52310.00,51580.00,51600.60],
+  ['BSE FMCG',21870.45,445.15,2.08,21420.00,21910.00,21400.00,21425.30],
+];
+const INDEX_GLOBAL = [
+  ['FTSE','🇬🇧','UK',10667.63,77.64,0.73,'Apr 18','04:30'],
+  ['Hang Seng','🇭🇰','Hong Kong',26160.33,-233.94,-0.89,'Apr 17','23:30'],
+  ['DAX','🇩🇪','Germany',24702.24,547.77,2.27,'Apr 18','03:30'],
+  ['CAC','🇫🇷','France',8418.70,144.40,1.75,'Apr 18','02:29'],
+  ['US Tech 100','🇺🇸','USA',24487.56,363.85,1.51,'Apr 18','01:34'],
+  ['SSE Composite Index','🇨🇳','China',4051.43,-4.12,-0.10,'Apr 18','09:30'],
+  ['NIKKEI 225','🇯🇵','Japan',58475.90,-1042.44,-1.75,'Apr 17','12:15'],
+  ['TAIEX','🇹🇼','Taiwan',36804.34,-327.68,-0.88,'Apr 17','21:30'],
+  ['US 30','🇺🇸','USA',49468.44,868.71,1.79,'Apr 18','01:34'],
+  ['KOSPI','🇰🇷','South Korea',6191.92,-34.13,-0.55,'Apr 18','08:30'],
+  ['S&P','🇺🇸','USA',7173.50,84.50,1.19,'Apr 18','16:43'],
+];
+
+/* STOCKS — gainers & losers sets */
+const STOCKS_GAINERS = [
+  ['Angel One',322.47,29.86,10.20,2525.22,'8,08,69,298'],
+  ['Colgate Palmolive',2106.00,128.60,6.50,438.80,'21,00,901'],
+  ['Suzlon Energy',52.93,2.68,5.33,1767.73,'33,71,59,969'],
+  ['Nippon Life India AMC',1015.05,50.20,5.20,232.57,'23,27,117'],
+  ['HDFC AMC',2792.40,130.20,4.89,626.10,'22,59,343'],
+  ['Hindustan Unilever',2240.80,101.70,4.75,1087.29,'48,82,697'],
+  ['Pidilite Industries',1393.40,62.40,4.69,240.13,'17,40,546'],
+  ['Avenue Supermarts DMart',4628.50,200.20,4.52,626.65,'13,66,449'],
+  ['Cochin Shipyard',1561.10,63.00,4.21,552.39,'35,62,913'],
+  ['Motilal Oswal Financial Services',815.45,32.65,4.17,164.48,'20,52,561'],
+  ['KEI Industries',4839.30,191.90,4.13,234.70,'4,89,014'],
+  ['Siemens',3707.90,144.10,4.04,379.24,'10,34,058'],
+  ['Godfrey Phillips',2207.70,82.80,3.90,782.30,'35,21,584'],
+  ['United Spirits',1302.90,48.40,3.86,365.37,'28,25,738'],
+  ['Dabur India',442.85,15.30,3.59,219.57,'49,83,325'],
+  ['Polycab',8192.50,279.00,3.53,556.47,'6,83,294'],
+  ['360 One WAM',1113.30,36.85,3.42,292.21,'26,41,982'],
+  ['ICICI Lombard',1895.60,62.40,3.40,428.15,'22,58,430'],
+  ['Tata Power',398.75,12.90,3.35,685.20,'1,72,45,820'],
+  ['Page Industries',37975.00,1205.00,3.28,189.45,'49,890'],
+  ['Adani Green',1128.45,35.60,3.26,892.74,'79,15,240'],
+  ['Nykaa',269.66,8.40,3.22,145.38,'53,87,120'],
+  ['Bajaj Finserv',1685.20,52.30,3.20,1245.87,'73,92,450'],
+  ['Havells India',1875.40,56.80,3.12,345.92,'18,45,320'],
+  ['HDFC AMC',4285.75,125.40,3.01,425.18,'9,87,650'],
+  ['Muthoot Finance',2125.60,61.45,2.98,318.72,'15,02,480'],
+  ['Tata Consumer',1058.30,30.25,2.94,612.45,'57,82,915'],
+  ['Berger Paints',512.80,14.50,2.91,198.42,'38,67,215'],
+  ['Britannia Industries',5285.40,148.70,2.89,428.35,'8,12,490'],
+  ['Marico',628.50,17.60,2.88,352.18,'56,09,820'],
+  ['Hindustan Zinc',492.75,13.70,2.86,278.94,'56,59,180'],
+];
+const STOCKS_LOSERS = [
+  ['Kalyan Jewellers',426.85,-13.45,-3.05,722.49,'1,69,26,134'],
+  ['Wipro',204.32,-5.94,-2.83,1645.85,'8,05,42,603'],
+  ['HDFC Life Insurance',616.45,-15.05,-2.38,503.08,'81,61,002'],
+  ['Ashok Leyland',174.78,-1.95,-1.10,380.67,'2,17,80,071'],
+  ['Swiggy',277.45,-2.95,-1.05,210.50,'75,86,920'],
+  ['UNO Minda',1097.80,-11.60,-1.05,108.21,'9,85,741'],
+  ['Sun Pharmaceutical',1675.50,-17.60,-1.04,527.19,'31,46,482'],
+  ['Divis Laboratories',6229.00,-64.50,-1.02,105.45,'1,69,295'],
+  ['Persistent Systems',5446.50,-54.00,-0.98,468.52,'8,41,856'],
+  ['Force Motors',22378.00,-160.00,-0.71,206.84,'92,429'],
+  ['Max Financial Services',1683.20,-12.00,-0.71,145.27,'8,63,071'],
+  ['GAIL',157.82,-1.10,-0.69,205.41,'1,30,15,627'],
+  ['Mahindra & Mahindra',3200.20,-22.10,-0.69,697.77,'21,80,404'],
+  ['Larsen & Toubro',4096.10,-23.70,-0.58,1145.55,'27,96,673'],
+  ['TVS Motors',3735.80,-21.40,-0.57,214.50,'5,74,208'],
+  ['HCL Technologies',1442.30,-7.90,-0.54,476.74,'33,19,268'],
+  ['Bajaj Auto',9773.50,-51.50,-0.62,258.58,'2,64,575'],
+];
+
+/* OI Gainers — from screenshot 5.30.41 PM */
+const OPT_OI_GAINERS = [
+  ['NMDC 28 APR 100 CALL',89.78,0.20,0.11,122.22,'29,63,250','29,56,500',43800.00,'59,53,500'],
+  ['GODFRYPHLP 28 APR 2220 CALL',2207.70,68.80,28.80,72.00,'57,200','55,925',20700.00,'3,83,350'],
+  ['POLYCAB 28 APR 8100 CALL',8182.50,166.50,-833.50,-83.35,'38,375','38,125',15260.00,'2,80,750'],
+  ['PAGEIND 28 APR 41000 CALL',37975.00,63.00,20.10,46.85,'2,055','2,040',13600.00,'6,255'],
+  ['OFSS 28 APR 8300 CALL',7992.50,106.35,60.85,133.74,'17,325','17,175',11450.00,'86,775'],
+  ['CUMMINSIND 28 APR 5450 CALL',5140.90,25.66,0.60,2.40,'22,800','22,600',11300.00,'36,600'],
+  ['ANGELONE 28 APR 330 PUT',322.47,13.87,-24.38,-63.74,'2,77,500','2,75,000',11000.00,'8,10,000'],
+  ['COCHINSHIP 28 APR 1540 PUT',1561.10,43.00,-65.80,-60.48,'41,200','40,800',10200.00,'2,35,600'],
+  ['GODFRYPHLP 28 APR 2200 PUT',2207.70,98.00,-80.55,-45.11,'83,050','82,225',9966.67,'5,23,050'],
+  ['GODFRYPHLP 28 APR 2260 CALL',2207.70,55.15,19.25,63.62,'46,475','45,925',8350.00,'4,17,175'],
+  ['IRFC 28 APR 116 CALL',104.84,0.31,0.06,24.00,'3,35,750','3,31,500',7800.00,'4,71,750'],
+  ['DLF 28 APR 635 CALL',601.75,3.20,0.30,10.34,'64,350','63,525',7700.00,'1,03,125'],
+  ['FORTIS 28 APR 890 PUT',890.20,16.40,-12.20,-42.66,'58,900','58,125',7500.00,'1,38,725'],
+  ['ABB 28 APR 7100 PUT',7029.50,190.45,-149.55,-43.99,'9,125','9,000',7200.00,'30,875'],
+  ['TORNTPOWER 28 APR 1540 PUT',1565.00,22.10,-30.40,-57.90,'30,175','29,750',7000.00,'71,825'],
+  ['ABB 28 APR 7450 CALL',7029.50,31.00,-6.25,-16.78,'8,750','8,625',6900.00,'13,500'],
+];
+/* OI Losers — inferred (negative OI change) */
+const OPT_OI_LOSERS = [
+  ['NIFTY 28 APR 24000 PUT',24353.55,143.00,-82.00,-36.44,'45,42,265','-28,88,500',-38.86,'82,51,490'],
+  ['NIFTY 28 APR 23500 PUT',24353.55,59.00,-39.30,-39.98,'40,91,620','-18,30,275',-30.91,'70,24,680'],
+  ['NIFTY 28 APR 22000 PUT',24353.55,5.90,-4.20,-41.58,'44,46,570','-14,62,405',-24.74,'57,92,215'],
+  ['NIFTY 28 APR 23000 CALL',24353.55,1415.00,171.05,13.75,'20,97,095','-12,28,340',-36.94,'1,86,030'],
+  ['BANKNIFTY 28 APR 60000 CALL',56565.70,35.60,0.25,0.71,'14,80,560','-10,04,590',-40.41,'22,18,890'],
+  ['NIFTY 28 APR 25000 PUT',24353.55,663.30,-176.20,-20.99,'19,73,595','-8,48,585',-30.07,'4,38,555'],
+  ['NIFTY 28 APR 24000 CALL',24353.55,535.00,111.05,26.19,'34,97,325','-7,29,060',-17.24,'28,50,380'],
+  ['NIFTY 28 APR 25500 CALL',24353.55,11.25,0.70,6.64,'28,10,535','-5,85,410',-17.23,'47,45,390'],
+  ['NIFTY 28 APR 22550 PUT',24353.55,10.80,-7.85,-42.09,'46,23,370','-4,16,210',-8.26,'56,30,625'],
+  ['NIFTY 28 APR 26000 CALL',24353.55,3.00,-0.90,-23.08,'58,98,490','-3,85,515',-6.13,'56,65,725'],
+];
+/* Top Value — from screenshot 5.30.34 PM */
+const OPT_TOP_VALUE = [
+  ['BANKNIFTY 28 APR 56000 CALL',56565.70,1200.00,233.40,24.15,'5,00,310','-21,990',-4.21,'22,29,870'],
+  ['BANKNIFTY 28 APR 56500 CALL',56565.70,894.55,185.25,26.12,'6,72,900','74,010',12.36,'29,78,070'],
+  ['NIFTY 28 APR 24200 CALL',24353.55,396.10,90.05,29.42,'14,05,560','-3,42,615',-19.60,'60,14,710'],
+  ['NIFTY 28 APR 24300 CALL',24353.55,334.25,78.95,30.92,'13,86,385','43,555',3.24,'61,67,980'],
+  ['NIFTY 28 APR 24500 CALL',24353.55,222.90,57.35,34.64,'39,76,180','1,36,665',3.56,'87,04,605'],
+  ['BANKNIFTY 28 APR 56200 CALL',56565.70,1063.00,198.30,22.90,'87,510','-29,580',-25.26,'17,89,320'],
+  ['BANKNIFTY 28 APR 57000 CALL',56565.70,624.75,139.30,28.70,'6,73,770','-26,040',-3.72,'27,70,680'],
+  ['BANKNIFTY 28 APR 56300 CALL',56565.70,1002.55,191.25,23.57,'1,20,180','7,200',6.37,'17,01,900'],
+  ['NIFTY 28 APR 24000 CALL',24353.55,535.00,111.05,26.19,'34,97,325','-2,29,060',-6.15,'28,50,380'],
+  ['BANKNIFTY 28 APR 56000 PUT',56565.70,536.65,-244.00,-31.26,'6,34,260','1,27,200',25.09,'20,32,300'],
+  ['ANGELONE 28 APR 300 CALL',322.47,25.32,17.76,234.92,'36,10,000','-22,05,000',-37.92,'5,69,15,000'],
+  ['BANKNIFTY 28 APR 56100 CALL',56565.70,1127.10,215.65,23.66,'66,690','-28,890',-30.23,'12,37,860'],
+  ['NIFTY 28 APR 24200 PUT',24353.55,202.95,-103.70,-33.82,'21,42,335','-1,02,505',-4.57,'68,19,435'],
+  ['BANKNIFTY 28 APR 56500 PUT',56565.70,716.90,-286.00,-28.55,'5,45,590','1,73,460',46.62,'18,65,790'],
+  ['BANKNIFTY 28 APR 56400 CALL',56565.70,943.25,184.35,24.29,'1,17,270','23,100',24.53,'12,53,220'],
+  ['NIFTY 28 APR 24000 PUT',24353.55,143.00,-82.00,-36.44,'45,42,265','1,61,915',3.70,'82,51,490'],
+];
+/* Highest OI — original dataset */
+const OPT_HIGHEST_OI = [
+  ['NIFTY 28 APR 26000 CALL',24353.55,3.00,-0.90,-23.08,'58,98,490','7,49,515',14.56,'56,65,725'],
+  ['NIFTY 28 APR 21000 PUT',24353.55,3.10,-1.50,-32.61,'55,89,740','20,12,725',56.27,'58,10,090'],
+  ['NIFTY 28 APR 25000 CALL',24353.55,59.00,14.65,33.03,'50,12,475','1,17,845',2.41,'1,09,23,640'],
+  ['NIFTY 28 APR 23000 PUT',24353.55,24.80,-17.30,-41.09,'49,02,820','5,48,925',12.61,'64,75,950'],
+  ['NIFTY 28 APR 22550 PUT',24353.55,10.80,-7.85,-42.09,'46,23,370','10,16,210',28.17,'56,30,625'],
+  ['NIFTY 28 APR 24000 PUT',24353.55,143.00,-82.00,-36.44,'45,42,265','1,61,915',3.70,'82,51,490'],
+  ['NIFTY 28 APR 22000 PUT',24353.55,5.90,-4.20,-41.58,'44,46,570','-93,405',-2.06,'57,92,215'],
+  ['NIFTY 28 APR 23500 PUT',24353.55,59.00,-39.30,-39.98,'40,91,620','8,08,275',24.62,'70,24,680'],
+  ['NIFTY 28 APR 24500 CALL',24353.55,222.90,57.35,34.64,'39,76,180','1,36,565',3.56,'87,04,605'],
+  ['NIFTY 28 APR 24000 CALL',24353.55,535.00,111.05,26.19,'34,97,325','-2,29,060',-6.15,'28,50,380'],
+  ['BANKNIFTY 28 APR 60000 CALL',56565.70,35.60,0.25,0.71,'14,80,560','-4,590',-0.31,'22,18,890'],
+  ['NIFTY 28 APR 25500 CALL',24353.55,11.25,0.70,6.64,'28,10,535','2,15,410',8.30,'47,45,390'],
+  ['NIFTY 28 APR 24450 PUT',24353.55,332.00,-132.15,-28.47,'22,41,915','4,59,485',25.78,'25,72,440'],
+  ['NIFTY 28 APR 24200 PUT',24353.55,202.95,-103.70,-33.82,'21,42,335','-1,02,505',-4.57,'68,19,435'],
+  ['NIFTY 28 APR 23000 CALL',24353.55,1415.00,171.05,13.75,'20,97,095','-28,340',-1.33,'1,86,030'],
+  ['NIFTY 28 APR 25000 PUT',24353.55,663.30,-176.20,-20.99,'19,73,595','51,415',2.67,'4,38,555'],
+  ['NIFTY 28 APR 24600 CALL',24353.55,68.25,12.45,22.31,'18,42,130','3,21,540',21.13,'42,18,760'],
+  ['NIFTY 28 APR 24700 CALL',24353.55,42.15,8.90,26.75,'17,85,420','2,98,265',20.06,'38,94,225'],
+  ['NIFTY 28 APR 23500 CALL',24353.55,895.00,145.50,19.41,'16,74,890','-52,330',-3.03,'2,14,680'],
+  ['NIFTY 28 APR 24300 PUT',24353.55,165.40,-72.80,-30.57,'15,92,735','4,87,620',44.11,'35,42,910'],
+  ['NIFTY 28 APR 25500 PUT',24353.55,1145.60,-298.30,-20.66,'14,26,890','-86,520',-5.72,'3,65,240'],
+  ['BANKNIFTY 28 APR 58000 PUT',56565.70,125.40,-45.80,-26.77,'13,48,720','2,14,830',18.93,'28,76,450'],
+  ['NIFTY 28 APR 23800 PUT',24353.55,38.50,-22.15,-36.53,'12,95,640','3,52,170',37.32,'48,12,390'],
+  ['NIFTY 28 APR 24400 CALL',24353.55,298.75,74.25,33.08,'12,24,580','-1,25,430',-9.29,'52,87,930'],
+  ['NIFTY 28 APR 22800 PUT',24353.55,15.75,-8.90,-36.10,'11,58,920','1,95,640',20.34,'39,45,120'],
+  ['NIFTY 28 APR 24800 CALL',24353.55,28.40,6.15,27.64,'10,87,240','1,78,920',19.68,'34,21,580'],
+  ['NIFTY 28 APR 22500 PUT',24353.55,8.25,-5.40,-39.55,'10,23,450','2,48,150',31.95,'29,67,890'],
+  ['BANKNIFTY 28 APR 59000 CALL',56565.70,289.60,82.40,39.77,'9,87,320','-45,280',-4.38,'31,58,420'],
+  ['NIFTY 28 APR 22200 PUT',24353.55,4.80,-3.15,-39.62,'9,54,680','1,65,890',21.06,'24,35,710'],
+  ['NIFTY 28 APR 23200 PUT',24353.55,68.90,-38.20,-35.66,'8,96,420','2,78,520',45.04,'41,52,870'],
+];
+const OPT_PRICE_LOSERS = [
+  ['SENSEX 30 APR 86500 CALL',79493.54,0.05,-0.35,-87.50,'160','40',33.33,'40'],
+  ['NYKAA 28 APR 217.50 PUT',269.66,0.05,-3.63,-99.45,'6,250','0',0.00,'6,250'],
+  ['ALKEM 28 APR 6400 CALL',5582.00,1.00,-106.15,-99.07,'0','0',0.00,'4,500'],
+  ['ALKEM 28 APR 6300 CALL',5582.00,1.25,-128.85,-99.04,'0','0',0.00,'250'],
+  ['BANKEX 30 APR 68800 CALL',63718.35,22.90,0.65,2.92,'30','0',0.00,'30'],
+  ['ICICIPRULI 28 APR 665 CALL',562.00,0.05,-3.10,-98.41,'7,400','0',0.00,'3,700'],
+  ['GODREJCP 28 APR 1190 CALL',1109.40,1.45,-88.15,-98.38,'0','0',0.00,'500'],
+  ['BANKEX 30 APR 64500 PUT',63718.35,20.05,20.00,40000.00,'60','0',0.00,'30'],
+  ['IOC 28 APR 174 CALL',145.88,0.05,-2.95,-98.33,'14,625','0',0.00,'19,500'],
+  ['HAL 28 APR 5000 CALL',4388.10,2.50,-121.00,-97.98,'7,050','0',0.00,'8,100'],
+  ['FINNIFTY 28 APR 24160 PUT',26521.25,17.25,-796.65,-97.89,'180','0',0.00,'360'],
+  ['ICICIGI 28 APR 2120 CALL',1891.60,0.45,-19.60,-97.76,'325','0',0.00,'650'],
+  ['TATACONSUM 28 APR 1230 CALL',1113.20,0.60,-23.70,-97.53,'6,050','2,750',83.33,'7,150'],
+  ['GAIL 28 APR 184 CALL',157.82,0.04,-1.56,-97.50,'34,650','28,350',450.00,'1,79,550'],
+  ['FINNIFTY 28 APR 24250 PUT',26521.25,22.20,-860.10,-97.48,'0','0',0.00,'120'],
+  ['PAYTM 28 APR 1280 CALL',1161.65,1.95,-73.30,-97.41,'18,850','0',0.00,'54,375'],
+];
+const OPT_PRICE_GAINERS = [
+  ['VEDL 28 APR 635 CALL',787.50,149.85,107.45,253.42,'4,600','1,150',33.33,'2,300'],
+  ['PIDILITIND 28 APR 1370 CALL',1393.40,46.00,32.40,257.14,'32,000','-27,500',-46.22,'2,70,000'],
+  ['ANGELONE 28 APR 310 CALL',322.47,17.32,12.54,262.34,'21,30,000','-40,000',-1.84,'4,71,90,000'],
+  ['POLYCAB 28 APR 9300 CALL',8192.50,5.80,4.20,262.50,'7,750','3,375',77.14,'16,750'],
+  ['JINDALSTEL 28 APR 1360 CALL',1270.00,2.55,1.85,264.29,'81,875','30,625',59.76,'1,65,625'],
+  ['YESBANK 28 APR 23 CALL',20.19,0.11,0.08,266.67,'8,07,04,500','6,83,57,800',553.65,'27,88,11,500'],
+  ['VEDL 28 APR 610 CALL',787.50,180.00,131.00,267.35,'4,600','0',0.00,'2,300'],
+  ['PREMIERENE 28 APR 1120 CALL',1034.60,4.10,3.00,272.73,'14,375','13,800',2400.00,'29,325'],
+  ['DMART 28 APR 4600 CALL',4628.50,9.45,6.90,270.59,'1,46,400','21,300',17.03,'7,25,300'],
+  ['ANGELONE 28 APR 315 CALL',322.47,13.96,10.23,274.26,'9,10,000','-45,000',-4.71,'3,11,60,000'],
+  ['DMART 28 APR 4650 CALL',4628.50,96.50,70.50,271.15,'82,200','38,400',87.67,'7,22,100'],
+  ['HINDUNILVR 28 APR 2360 CALL',2240.80,5.00,3.70,284.62,'1,22,100','39,900',48.54,'6,66,000'],
+  ['POLYCAB 28 APR 8900 CALL',8192.50,18.85,13.95,284.69,'16,500','15,625',1785.71,'91,000'],
+  ['PIDILITIND 28 APR 1380 CALL',1393.40,38.15,28.30,287.31,'58,500','-35,500',-37.77,'10,18,000'],
+  ['ANGELONE 28 APR 320 CALL',322.47,11.14,8.27,288.15,'8,19,25,000','-10,000',-0.29,'8,19,25,000'],
+  ['HINDUNILVR 28 APR 2340 CALL',2240.80,6.65,4.95,291.18,'1,26,900','57,000',81.55,'6,59,400'],
+];
+const OPT_TOP_VOLUME = [
+  ['COLPAL 28 APR 2200 CALL',2106.00,13.55,12.05,803.33,'2,79,900','80,325',40.25,'45,81,675'],
+  ['COLPAL 28 APR 2100 CALL',2106.00,49.00,42.75,684.00,'2,73,375','76,275',38.70,'65,60,325'],
+  ['ANGELONE 28 APR 320 CALL',322.47,11.14,8.27,288.15,'33,80,000','-10,000',-0.29,'8,19,25,000'],
+  ['ANGELONE 28 APR 300 CALL',322.47,25.32,17.76,234.92,'36,10,000','-22,05,000',-37.92,'5,69,15,000'],
+  ['ITC 28 APR 310 CALL',306.80,2.90,1.05,56.77,'1,75,53,600','63,64,800',56.89,'8,49,77,600'],
+  ['ITC 28 APR 305 CALL',306.80,5.20,1.85,55.22,'1,21,06,000','14,19,800',13.28,'4,95,80,800'],
+  ['BSE 28 APR 3500 CALL',3531.50,116.65,41.30,54.81,'7,60,125','72,750',10.58,'83,62,125'],
+  ['RELIANCE 28 APR 1400 CALL',1365.00,8.65,2.75,46.61,'88,63,000','-8,48,500',-8.74,'1,68,63,500'],
+  ['RELIANCE 28 APR 1360 CALL',1365.00,23.10,7.30,46.20,'39,93,500','-2,08,500',-4.96,'1,17,34,500'],
+  ['RELIANCE 28 APR 1350 CALL',1365.00,28.70,8.50,42.08,'46,51,000','-14,51,000',-24.14,'1,15,40,000'],
+  ['NIFTY 28 APR 24700 CALL',24353.55,140.55,38.15,37.26,'10,30,770','1,36,630',15.28,'29,44,760'],
+  ['NIFTY 28 APR 24800 CALL',24353.55,106.75,28.20,35.90,'13,38,285','1,49,370',12.56,'43,80,610'],
+  ['NIFTY 28 APR 24500 CALL',24353.55,222.90,57.35,34.64,'39,76,180','1,36,565',3.56,'87,04,605'],
+  ['NIFTY 28 APR 24900 CALL',24353.55,79.60,20.15,33.89,'10,34,386','79,950',8.37,'21,17,960'],
+  ['NIFTY 28 APR 24600 CALL',24353.55,176.40,43.90,33.13,'9,28,835','1,79,465',23.95,'22,12,990'],
+  ['NIFTY 25000 CALL',24353.55,59.00,14.65,33.03,'50,12,475','1,17,845',2.41,'1,09,23,640'],
+];
+
+/* LIVE trending */
+const LIVE_TRENDING = [
+  ['HDFC Bank','NSE',799.90,4.45,0.56,'3,72,82,544',2962.23],
+  ['Yes Bank','NSE',20.19,0.24,1.20,'13,02,28,329',262.93],
+  ['ICICI Bank','NSE',1346.80,1.30,0.10,'1,81,51,993',2444.71],
+  ['CRISIL','NSE',4335.40,209.10,5.07,'4,44,535',192.72],
+  ['Lupin','NSE',2326.10,-0.90,-0.04,'9,99,957',232.60],
+  ['Vodafone Idea','NSE',9.61,0.08,0.84,'38,34,84,709',368.53],
+  ['Jindal Stainless','NSE',788.20,-1.25,-0.16,'4,95,365',39.04],
+  ['Ola Electric Mobility','NSE',40.82,2.14,5.53,'35,13,14,724',1434.07],
+  ['Tega Industries','NSE',1738.00,-16.10,-0.92,'31,463',5.47],
+  ['Coforge','NSE',1316.80,3.60,0.27,'28,22,554',371.67],
+  ['Piramal Finance','NSE',1675.30,-24.90,-1.46,'3,45,216',57.83],
+  ['Crompton Greaves','NSE',261.46,0.48,0.18,'43,40,724',113.49],
+];
+
+/* OPTION CHAIN (NIFTY 28 APR, 24350 ATM) — 13 strikes */
+const OC_STRIKES = [
+  /* [CE_OI, CE_OICh, CE_Vol, CE_IV, CE_LTP, CE_Chg, strike, PE_Chg, PE_LTP, PE_IV, PE_Vol, PE_OICh, PE_OI] */
+  [2480000,120000,842100,12.14,372.15,22.40,23750,-12.20,28.40,11.92,1240580,-60000,1840000],
+  [2210000,240000,921880,12.02,284.25,18.60,23800,-10.40,41.85,12.11, 1587120, 80000,2120000],
+  [1870000,410000,1420140,11.88,208.60,15.10,23850,-8.80,62.40,12.24, 1924080, 140000,2450000],
+  [1420000,680000,2084120,11.62,144.70,12.20,23900,-6.80,96.80,12.41, 2140080, 210000,2680000],
+  [1180000,-90000,1782080,11.48, 99.40, 8.90,23950,-4.40,148.25,12.62, 1820040, 180000,2210000],
+  [ 840000,-210000,1128840,11.32, 68.10, 6.10,24000,-3.10,212.50,12.84, 1422180,  90000,1820000],
+  [ 590000,-340000, 821140,11.18, 44.25, 4.20,24050,-2.00,284.40,13.08, 1028840, -40000,1480000],
+  [ 420000,-420000, 612140,11.04, 27.15, 2.90,24100,-1.30,368.80,13.28, 801240,  -80000,1180000],
+  [ 290000,-510000, 402240,10.92, 16.00, 1.80,24150,-0.80,462.40,13.44, 620880, -120000, 920000],
+  [ 180000,-580000, 254810,10.81,  8.85, 1.00,24200,-0.50,567.20,13.58, 482120, -160000, 720000],
+  [ 110000,-610000, 148280,10.72,  4.65, 0.50,24250,-0.30,678.90,13.70, 372040, -180000, 560000],
+  [  62000,-620000,  74520,10.65,  2.20, 0.20,24300,-0.20,797.40,13.80, 284880, -200000, 440000],
+  [  32000,-610000,  42880,10.60,  0.90, 0.05,24350,-0.10,922.80,13.88, 218240, -210000, 340000],
+];
+
+/* ======= STATE / RENDER ======= */
+const state = {
+  main: 'index',
+  subs: { live: 'trending', options: 'highest_oi', stocks: 'price_movers', index: 'nse', oc: 'chain' },
+  sort: {},
+  gainers: true, // gainers = true, losers = false
+  expiry: 'April',
+  scope: 'All',
+};
+
+/* ===== WATCHLIST render ===== */
+(function renderWL(){
+  const list = document.getElementById('wl-list');
+  list.innerHTML = WATCHLIST.map(r=>`
+    <div class="wl-row ${r[5]}">
+      <div class="info">
+        <div class="name">${r[0]}</div>
+        <div class="ex">${r[1]}${r[2]?` <span class="fo">${r[2]}</span>`:''}</div>
+      </div>
+      <div class="price-col">
+        <div class="ltp">${r[3]} <span>↗</span></div>
+        <div class="chg">${r[4]}</div>
+      </div>
+    </div>`).join('');
+})();
+
+/* ===== main tabs ===== */
+const MAIN_TABS = [
+  {id:'live',    label:'Live', live:true},
+  {id:'options', label:'Options'},
+  {id:'oc',      label:'Option Chain'},
+  {id:'stocks',  label:'Stocks'},
+  {id:'commodity',label:'Commodity'},
+  {id:'futures', label:'Futures'},
+  {id:'etfs',    label:'ETFs'},
+  {id:'bonds',   label:'Bonds'},
+  {id:'index',   label:'Index'},
+];
+
+function renderMainTabs(){
+  const el = document.getElementById('main-tabs');
+  el.innerHTML = MAIN_TABS.map(t=>`
+    <button class="m-tab ${state.main===t.id?'on':''}" data-tab="${t.id}" ${t.live?'data-live':''}>
+      <span class="live-dot"></span>${t.label}
+    </button>`).join('');
+  el.querySelectorAll('.m-tab').forEach(b=>b.onclick=()=>{
+    if(b.dataset.tab==='oc'){ window.location.href='Dhan Advanced Option Chain.html'; return; }
+    state.main=b.dataset.tab; state.sort={}; renderMainTabs(); renderView();
+  });
+}
+
+/* ===== view render ===== */
+function renderView(){
+  const view = document.getElementById('view-container');
+  if(state.main==='index') return renderIndex(view);
+  if(state.main==='stocks') return renderStocks(view);
+  if(state.main==='options') return renderOptions(view);
+  if(state.main==='live') return renderLive(view);
+  if(state.main==='oc') return renderOptionChain(view);
+  // fallback placeholder
+  view.innerHTML = `<div style="padding:60px 24px;color:var(--dh-text-muted);text-align:center">
+    <div style="font-size:14px;margin-bottom:6px">${MAIN_TABS.find(t=>t.id===state.main).label}</div>
+    <div style="font-size:12px">Surface from the Dhan web app — placeholder in this UI kit.</div></div>`;
+}
+
+/* ---- sort helper ---- */
+function applySort(rows, keyIdx){
+  const s = state.sort;
+  if(s.key==null) return rows;
+  const k = s.key, d = s.dir;
+  return [...rows].sort((a,b)=>{
+    const va = a[k], vb = b[k];
+    const na = typeof va==='number'?va:N(va);
+    const nb = typeof vb==='number'?vb:N(vb);
+    if(!isNaN(na)&&!isNaN(nb)&&(typeof va==='number'||typeof vb==='number'||(typeof va==='string'&&va.match(/^[\d,.\-]+$/)))){
+      return d==='asc'?na-nb:nb-na;
+    }
+    return d==='asc'?String(va).localeCompare(String(vb)):String(vb).localeCompare(String(va));
+  });
+}
+function bindSort(container, keys){
+  container.querySelectorAll('thead th').forEach((th,i)=>{
+    if(keys[i]==null) return;
+    th.onclick=()=>{
+      const k = keys[i];
+      if(state.sort.key===k) state.sort.dir = state.sort.dir==='asc'?'desc':'asc';
+      else { state.sort.key=k; state.sort.dir='desc'; }
+      renderView();
+    };
+    if(state.sort.key===keys[i]){
+      th.classList.add('sorted');
+      th.querySelector('.sort-arr').textContent = state.sort.dir==='asc'?'▲':'▼';
+    }
+  });
+}
+function fmt(n,dec=2){ if(typeof n!=='number') return n; return n.toLocaleString('en-IN',{minimumFractionDigits:dec,maximumFractionDigits:dec}); }
+function fmtPct(n){ return (n>=0?'':'') + fmt(n,2) + ' %'; }
+
+/* ============================================================ INDEX ===== */
+function renderIndex(view){
+  const subs = [['global','Global'],['nse','NSE'],['bse','BSE']];
+  let rows, headers, keys, body;
+
+  if(state.subs.index==='global'){
+    headers = ['Name','Points','Change','Change %','Date','Time'];
+    keys = [0,3,4,5,6,7];
+    rows = applySort(INDEX_GLOBAL, keys);
+    body = rows.map(r=>`
+      <tr>
+        <td><div class="nm"><div class="cb"></div><span class="flag">${r[1]}</span><span>${r[0]}</span><span class="country">${r[2]}</span></div></td>
+        <td>${fmt(r[3])}</td>
+        <td class="${r[4]>=0?'up':'down'}">${fmt(r[4])}</td>
+        <td class="${r[5]>=0?'up':'down'}">${fmtPct(r[5])}</td>
+        <td>${r[6]}</td>
+        <td>${r[7]}</td>
+      </tr>`).join('');
+  } else {
+    const src = state.subs.index==='nse'?INDEX_NSE:INDEX_BSE;
+    headers = ['Name','LTP','Change','Change %','Open','High','Low','Prev. Close'];
+    keys = [0,1,2,3,4,5,6,7];
+    rows = applySort(src, keys);
+    body = rows.map(r=>`
+      <tr>
+        <td><div class="nm"><div class="cb"></div><span>${r[0]}</span></div></td>
+        <td>${fmt(r[1])}</td>
+        <td class="${r[2]>=0?'up':'down'}">${fmt(r[2])}</td>
+        <td class="${r[3]>=0?'up':'down'}">${fmtPct(r[3])}</td>
+        <td>${fmt(r[4])}</td><td>${fmt(r[5])}</td><td>${fmt(r[6])}</td><td>${fmt(r[7])}</td>
+      </tr>`).join('');
+  }
+
+  view.innerHTML = `
+    <div class="view on">
+      <div class="sub-bar">
+        ${subs.map(s=>`<button class="s-tab ${state.subs.index===s[0]?'on':''}" data-sub="${s[0]}">${s[1]}</button>`).join('')}
+      </div>
+      <div class="table-wrap">
+        <table class="dtable"><thead><tr>
+          ${headers.map((h,i)=>`<th class="${state.sort.key===keys[i]?'sorted':''}"><span class="sort-arr">▼</span>${h}</th>`).join('')}
+        </tr></thead><tbody>${body}</tbody></table>
+      </div>
+    </div>`;
+  view.querySelectorAll('[data-sub]').forEach(b=>b.onclick=()=>{state.subs.index=b.dataset.sub;state.sort={};renderView();});
+  bindSort(view, keys);
+}
+
+/* ============================================================ STOCKS ===== */
+function renderStocks(view){
+  const subs = [
+    ['intraday','Intraday Movers'],['outperformers','Outperformers'],['mtf','MTF'],
+    ['extreme','Extreme Openings'],['price_movers','Price Movers'],['breakouts','Breakouts'],['by_vi','By Vi..']
+  ];
+  const src = state.gainers ? STOCKS_GAINERS : STOCKS_LOSERS;
+  const headers = ['Name','LTP','Change','Change %','Value (Cr.)','Volume'];
+  const keys = [0,1,2,3,4,5];
+  const rows = applySort(src, keys);
+  const body = rows.map(r=>`
+    <tr>
+      <td><div class="nm"><div class="cb"></div><span>${r[0]}</span></div></td>
+      <td>${fmt(r[1])}</td>
+      <td class="${r[2]>=0?'up':'down'}">${fmt(r[2])}</td>
+      <td class="${r[3]>=0?'up':'down'}">${fmtPct(r[3])}</td>
+      <td>${fmt(r[4])}</td>
+      <td>${r[5]}</td>
+    </tr>`).join('');
+
+  view.innerHTML = `
+    <div class="view on">
+      <div class="sub-bar">
+        ${subs.map(s=>`<button class="s-tab ${state.subs.stocks===s[0]?'on':''}" data-sub="${s[0]}">${s[1]}</button>`).join('')}
+        <div class="right-ctrl">
+          <div class="toggle-seg ${state.gainers?'':'losers'}" id="glToggle">
+            <span class="lbl ${state.gainers?'on':''}">Gainers</span>
+            <span class="sw"></span>
+            <span class="lbl ${state.gainers?'':'on'}" style="${state.gainers?'':'color:var(--dh-red)'}">Losers</span>
+          </div>
+          <div class="sp-wrap"><button class="select-pill" data-sp="stockExch">NSE</button>
+            <div class="sp-menu">
+              ${['NSE','BSE','All'].map(m=>`<button data-val="${m}">${m}</button>`).join('')}
+            </div></div>
+          <div class="sp-wrap"><button class="select-pill" data-sp="stockType">F&amp;O Stocks</button>
+            <div class="sp-menu">
+              ${['F&O Stocks','All Stocks','Cash Only','Large Cap','Mid Cap','Small Cap'].map(m=>`<button data-val="${m}">${m}</button>`).join('')}
+            </div></div>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table class="dtable"><thead><tr>
+          ${headers.map((h,i)=>`<th class="${state.sort.key===keys[i]?'sorted':''}"><span class="sort-arr">▼</span>${h}</th>`).join('')}
+        </tr></thead><tbody>${body}</tbody></table>
+      </div>
+    </div>`;
+  view.querySelectorAll('[data-sub]').forEach(b=>b.onclick=()=>{state.subs.stocks=b.dataset.sub;state.sort={};renderView();});
+  view.querySelector('#glToggle').onclick = () => { state.gainers=!state.gainers; state.sort={}; renderView(); };
+  bindSort(view, keys);
+  // wire up select-pill dropdowns
+  view.querySelectorAll('.sp-wrap').forEach(w=>{
+    const btn = w.querySelector('.select-pill');
+    const menu = w.querySelector('.sp-menu');
+    btn.onclick = (e)=>{
+      e.stopPropagation();
+      view.querySelectorAll('.sp-menu.open').forEach(m=>{if(m!==menu)m.classList.remove('open')});
+      view.querySelectorAll('.select-pill.open').forEach(p=>{if(p!==btn)p.classList.remove('open')});
+      menu.classList.toggle('open');
+      btn.classList.toggle('open');
+    };
+    menu.querySelectorAll('button').forEach(b=>b.onclick=(e)=>{
+      e.stopPropagation();
+      btn.textContent = b.dataset.val;
+      menu.classList.remove('open');
+      btn.classList.remove('open');
+    });
+  });
+  document.addEventListener('click',(e)=>{
+    if(!e.target.closest('.sp-wrap')){
+      view.querySelectorAll('.sp-menu.open').forEach(m=>m.classList.remove('open'));
+      view.querySelectorAll('.select-pill.open').forEach(p=>p.classList.remove('open'));
+    }
+  },{once:true});
+}
+
+/* ============================================================ OPTIONS ===== */
+function renderOptions(view){
+  const subs = [
+    ['highest_oi','Highest OI'],['oi_gainers','OI Gainers'],['oi_losers','OI Losers'],
+    ['top_volume','Top Volume'],['top_value','Top Value'],['price_gainers','Price Gainers'],['price_losers','Price Losers']
+  ];
+  const OI_PLUS = new Set(['NIFTY 28 APR 25000 CALL','NIFTY 28 APR 24500 CALL']);
+  const OI_MINUS = new Set(['NIFTY 28 APR 24000 PUT','NIFTY 28 APR 23500 PUT']);
+  const map = {
+    highest_oi: OPT_HIGHEST_OI,
+    oi_gainers: OPT_OI_GAINERS,
+    oi_losers:  OPT_OI_LOSERS,
+    top_volume: OPT_TOP_VOLUME,
+    top_value:  OPT_TOP_VALUE,
+    price_gainers: OPT_PRICE_GAINERS,
+    price_losers:  OPT_PRICE_LOSERS,
+  };
+  const src = map[state.subs.options] || OPT_HIGHEST_OI;
+  const headers = ['Name','Spot Price','LTP','Change','Change %','Open Interest','OI Change','OI Change %','Volume'];
+  const keys = [0,1,2,3,4,5,6,7,8];
+  const rows = applySort(src, keys);
+  const body = rows.map(r=>{
+    let marker = '';
+    if(OI_PLUS.has(r[0])) marker = '<span class="oi-marker">OI+</span>';
+    else if(OI_MINUS.has(r[0])) marker = '<span class="oi-marker minus">OI-</span>';
+    return `
+    <tr>
+      <td><div class="nm"><div class="cb"></div><span>${r[0]}</span>${marker}</div></td>
+      <td>${fmt(r[1])}</td>
+      <td>${fmt(r[2])}</td>
+      <td class="${r[3]>=0?'up':'down'}">${fmt(r[3])}</td>
+      <td class="${r[4]>=0?'up':'down'}">${fmtPct(r[4])}</td>
+      <td>${r[5]}</td>
+      <td class="${typeof r[6]==='string'&&r[6].startsWith('-')?'down':'up'}">${r[6]}</td>
+      <td class="${r[7]>=0?'up':'down'}">${fmtPct(r[7])}</td>
+      <td>${r[8]}</td>
+    </tr>`;}).join('');
+
+  view.innerHTML = `
+    <div class="view on">
+      <div class="sub-bar">
+        ${subs.map(s=>`<button class="s-tab ${state.subs.options===s[0]?'on':''}" data-sub="${s[0]}">${s[1]}</button>`).join('')}
+        <div class="right-ctrl">
+          <div class="sp-wrap"><button class="select-pill" data-sp="expiry">${state.expiry}</button>
+            <div class="sp-menu" data-for="expiry">
+              ${['April','May','June'].map(m=>`<button data-val="${m}" class="${state.expiry===m?'on':''}">${m}</button>`).join('')}
+            </div></div>
+          <div class="sp-wrap"><button class="select-pill" data-sp="scope">${state.scope}</button>
+            <div class="sp-menu" data-for="scope">
+              ${['All','Index','Stock','NSE','BSE'].map(m=>`<button data-val="${m}" class="${state.scope===m?'on':''}">${m}</button>`).join('')}
+            </div></div>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table class="dtable"><thead><tr>
+          ${headers.map((h,i)=>`<th class="${state.sort.key===keys[i]?'sorted':''}"><span class="sort-arr">▼</span>${h}</th>`).join('')}
+        </tr></thead><tbody>${body}</tbody></table>
+      </div>
+      <div class=\"bottom-bar\">
+        <div class=\"oc-pop-wrap\">
+          <button class=\"btn\" id=\"ocPopBtn\"><svg class=\"ico\" width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\"><rect x=\"3\" y=\"3\" width=\"18\" height=\"18\" rx=\"2\"/><path d=\"M3 9h18M9 3v18\"/></svg> Option Chain <span class=\"caret\">▴</span></button>
+          <div class=\"oc-pop\" id=\"ocPop\">
+            <button class=\"scrip-item on\" data-scrip=\"NIFTY\">NIFTY 50</button>
+            <button class=\"scrip-item\" data-scrip=\"BANKNIFTY\">BANK NIFTY</button>
+            <button class=\"scrip-item\" data-scrip=\"FINNIFTY\">FIN NIFTY</button>
+            <button class=\"scrip-item\" data-scrip=\"BANKEX\">BANKEX</button>
+            <button class=\"scrip-item\" data-scrip=\"SENSEX\">SENSEX</button>
+          </div>
+        </div>
+        <button class=\"btn\"><svg class=\"ico\" width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\"><path d=\"M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z\"/><circle cx=\"12\" cy=\"13\" r=\"4\"/></svg> Snapshot <span class=\"caret\">▴</span></button>
+        <button class=\"btn\"><svg class=\"ico\" width=\"14\" height=\"14\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2\"><polyline points=\"3 17 9 11 13 15 21 7\"/><polyline points=\"14 7 21 7 21 14\"/></svg> Chart <span class=\"caret\">▴</span></button>
+        <span class=\"right\"><button class=\"cta\"><svg width=\"12\" height=\"12\" viewBox=\"0 0 24 24\" fill=\"currentColor\"><path d=\"M13 2L3 14h9l-1 8 10-12h-9z\"/></svg> Create Your Strategy</button></span>
+      </div>
+    </div>`;
+  view.querySelectorAll('[data-sub]').forEach(b=>b.onclick=()=>{state.subs.options=b.dataset.sub;state.sort={};renderView();});
+  bindSort(view, keys);
+  // wire up select-pill dropdowns
+  view.querySelectorAll('.sp-wrap').forEach(w=>{
+    const btn = w.querySelector('.select-pill');
+    const menu = w.querySelector('.sp-menu');
+    const key = btn.dataset.sp;
+    btn.onclick = (e)=>{
+      e.stopPropagation();
+      // close others
+      view.querySelectorAll('.sp-menu.open').forEach(m=>{if(m!==menu)m.classList.remove('open')});
+      view.querySelectorAll('.select-pill.open').forEach(p=>{if(p!==btn)p.classList.remove('open')});
+      menu.classList.toggle('open');
+      btn.classList.toggle('open');
+    };
+    menu.querySelectorAll('button').forEach(b=>b.onclick=(e)=>{
+      e.stopPropagation();
+      state[key] = b.dataset.val;
+      renderView();
+    });
+  });
+  document.addEventListener('click',(e)=>{
+    if(!e.target.closest('.sp-wrap')){
+      view.querySelectorAll('.sp-menu.open').forEach(m=>m.classList.remove('open'));
+      view.querySelectorAll('.select-pill.open').forEach(p=>p.classList.remove('open'));
+    }
+  },{once:true});
+  // Option Chain scrip popover
+  const popBtn = view.querySelector('#ocPopBtn');
+  const pop = view.querySelector('#ocPop');
+  if(popBtn && pop){
+    popBtn.onclick = (e)=>{ e.stopPropagation(); pop.classList.toggle('open'); };
+    pop.querySelectorAll('.scrip-item').forEach(b=>b.onclick=(e)=>{
+      e.stopPropagation();
+      const scrip = b.dataset.scrip;
+      window.location.href = 'Dhan Advanced Option Chain.html?scrip='+encodeURIComponent(scrip);
+    });
+    document.addEventListener('click',(e)=>{
+      if(!pop.contains(e.target) && e.target!==popBtn) pop.classList.remove('open');
+    });
+  }
+}
+
+/* ============================================================ LIVE ===== */
+function renderLive(view){
+  const subs = [['trending','Trending on Dhan'],['scanner','Market Scanner'],['action','Market Action']];
+  const cats = ['Stocks In News','Most Traded','Most Bought MTF','Most Delivered in Portfolio','Most Searched','Most Pledged Stocks'];
+  const headers = ['Name','LTP','Change','Change %','Exchange Volume','Value (in Cr)'];
+  const keys = [0,2,3,4,5,6];
+  const rows = applySort(LIVE_TRENDING, keys);
+  const body = rows.map(r=>`
+    <tr>
+      <td><span>${r[0]}</span><span class="ex-pill">${r[1]}</span></td>
+      <td>${fmt(r[2])}</td>
+      <td class="${r[3]>=0?'up':'down'}">${fmt(r[3])}</td>
+      <td class="${r[4]>=0?'up':'down'}">${fmtPct(r[4])}</td>
+      <td>${r[5]}</td>
+      <td>${fmt(r[6])}</td>
+    </tr>`).join('');
+
+  view.innerHTML = `
+    <div class="view on">
+      <div class="sub-bar">
+        ${subs.map(s=>`<button class="s-tab ${state.subs.live===s[0]?'on':''}" data-sub="${s[0]}">${s[1]}</button>`).join('')}
+      </div>
+      <div class="live-cards">
+        ${cats.map((c,i)=>`<div class="lc ${i===0?'on':''}">${c.replace(' ','<br>')}</div>`).join('')}
+      </div>
+      <div style="padding:10px 24px;color:var(--dh-text-dim);font-size:12px">Trending as of 18 April</div>
+      <div class="table-wrap">
+        <table class="dtable"><thead><tr>
+          ${headers.map((h,i)=>`<th class="${state.sort.key===keys[i]?'sorted':''}"><span class="sort-arr">▼</span>${h}</th>`).join('')}
+        </tr></thead><tbody>${body}</tbody></table>
+      </div>
+    </div>`;
+  view.querySelectorAll('[data-sub]').forEach(b=>b.onclick=()=>{state.subs.live=b.dataset.sub;state.sort={};renderView();});
+  view.querySelectorAll('.lc').forEach(el=>el.onclick=()=>{
+    view.querySelectorAll('.lc').forEach(x=>x.classList.remove('on'));
+    el.classList.add('on');
+  });
+  bindSort(view, keys);
+}
+
+/* ============================================================ OPTION CHAIN ===== */
+function renderOptionChain(view){
+  const atmStrike = 23900; // nearest-to-spot
+  const spot = 23862.05;
+  // sortable — key idx into OC_STRIKES row
+  const keys = [0,1,2,3,4,5,6,7,8,9,10,11,12];
+  const rows = applySort(OC_STRIKES, keys);
+  const body = rows.map(r=>{
+    const isATM = r[6]===atmStrike;
+    const side = r[6] < atmStrike ? 'ce-row' : (r[6] > atmStrike ? 'pe-row' : 'ce-row');
+    return `
+    <tr class="${side} ${isATM?'atm':''}">
+      <td class="ce">${(r[0]/100000).toFixed(2)}L</td>
+      <td class="ce ${r[1]>=0?'up':'down'}">${(r[1]>=0?'+':'')+(r[1]/100000).toFixed(2)}L</td>
+      <td class="ce">${fmt(r[2],0)}</td>
+      <td class="ce">${fmt(r[3])}</td>
+      <td class="ce">${fmt(r[4])}</td>
+      <td class="ce ${r[5]>=0?'up':'down'}">${fmt(r[5])}</td>
+      <td class="strike">${r[6]}</td>
+      <td class="pe ${r[7]>=0?'up':'down'}">${fmt(r[7])}</td>
+      <td class="pe">${fmt(r[8])}</td>
+      <td class="pe">${fmt(r[9])}</td>
+      <td class="pe">${fmt(r[10],0)}</td>
+      <td class="pe ${r[11]>=0?'up':'down'}">${(r[11]>=0?'+':'')+(r[11]/100000).toFixed(2)}L</td>
+      <td class="pe">${(r[12]/100000).toFixed(2)}L</td>
+    </tr>`;
+  }).join('');
+
+  view.innerHTML = `
+    <div class="view on">
+      <div class="oc-head">
+        <span class="scrip">NIFTY</span>
+        <span class="spot">Spot <b>${fmt(spot)}</b></span>
+        <button class="select-pill">30 Apr 2026</button>
+        <button class="select-pill">All Strikes</button>
+        <div class="right">
+          <button class="select-pill">ATM ± 5</button>
+          <button class="select-pill">Auto-refresh 3s</button>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table class="oc">
+          <thead>
+            <tr>
+              <th colspan="6" class="ce-h">CALLS (CE)</th>
+              <th class="strike-h center">Strike</th>
+              <th colspan="6" class="pe-h">PUTS (PE)</th>
+            </tr>
+            <tr>
+              <th data-k="0">OI</th>
+              <th data-k="1">OI Chg</th>
+              <th data-k="2">Vol</th>
+              <th data-k="3">IV</th>
+              <th data-k="4">LTP</th>
+              <th data-k="5">Chg</th>
+              <th data-k="6" class="strike-h center">—</th>
+              <th data-k="7">Chg</th>
+              <th data-k="8">LTP</th>
+              <th data-k="9">IV</th>
+              <th data-k="10">Vol</th>
+              <th data-k="11">OI Chg</th>
+              <th data-k="12">OI</th>
+            </tr>
+          </thead>
+          <tbody>${body}</tbody>
+        </table>
+      </div>
+      <div class="bottom-bar">
+        <span style="color:var(--dh-text-dim);font-size:12px">PCR <b style="color:var(--dh-text)">1.14</b></span>
+        <span style="color:var(--dh-text-dim);font-size:12px">· Max Pain <b style="color:var(--dh-text)">24,850</b></span>
+        <span style="color:var(--dh-text-dim);font-size:12px">· Total CE OI <b style="color:var(--dh-text)">105.9L</b></span>
+        <span style="color:var(--dh-text-dim);font-size:12px">· Total PE OI <b style="color:var(--dh-text)">146.0L</b></span>
+        <span class="right"><button class="cta">⚡ Create Your Strategy</button></span>
+      </div>
+    </div>`;
+
+  // bind sort on second header row
+  view.querySelectorAll('.oc thead tr:last-child th').forEach(th=>{
+    const k = +th.dataset.k;
+    if(isNaN(k)) return;
+    th.onclick=()=>{
+      if(state.sort.key===k) state.sort.dir = state.sort.dir==='asc'?'desc':'asc';
+      else { state.sort.key=k; state.sort.dir='desc'; }
+      renderView();
+    };
+  });
+}
+
+/* ===== INIT ===== */
+/* Watchlist scrip search dropdown */
+(function initScripDD(){
+  const inp = document.getElementById('wlSearch');
+  const dd  = document.getElementById('scripDD');
+  if(!inp||!dd) return;
+  const ITEMS = [
+    ['NIFTY 50','NSE'],
+    ['BANK NIFTY','NSE'],
+    ['FIN NIFTY','NSE'],
+    ['BANKEX','BSE'],
+    ['SENSEX','BSE'],
+  ];
+  // Extra F&O universe for partial matches
+  const EXTRA = [
+    ['NIFTY NEXT 50','NSE'],['MIDCPNIFTY','NSE'],['RELIANCE','NSE'],['TCS','NSE'],
+    ['HDFCBANK','NSE'],['ICICIBANK','NSE'],['INFY','NSE'],['SBIN','NSE'],
+    ['BHARTIARTL','NSE'],['ITC','NSE'],['LT','NSE'],['AXISBANK','NSE'],
+    ['MARUTI','NSE'],['TATAMOTORS','NSE'],['ADANIENT','NSE'],['ADANIPORTS','NSE'],
+    ['BAJFINANCE','NSE'],['BAJAJFINSV','NSE'],['SUNPHARMA','NSE'],['ASIANPAINT','NSE'],
+  ];
+  function show(items){
+    dd.innerHTML = items.map(i=>`<div class="it" data-sym="${i[0]}"><span>${i[0]}</span><span class="ex">${i[1]}</span></div>`).join('');
+    dd.querySelectorAll('.it').forEach(el=>{
+      el.onclick=()=>{ inp.value=''; dd.classList.remove('open'); };
+    });
+    dd.classList.add('open');
+  }
+  inp.addEventListener('focus', ()=>{ if(!inp.value.trim()) show(ITEMS); });
+  inp.addEventListener('input', ()=>{
+    const q = inp.value.trim().toLowerCase();
+    if(!q){ show(ITEMS); return; }
+    const pool = [...ITEMS, ...EXTRA];
+    const hits = pool.filter(i=>i[0].toLowerCase().includes(q)).slice(0,12);
+    if(!hits.length) hits.push(['No results','']);
+    show(hits);
+  });
+  document.addEventListener('click', e=>{
+    if(!e.target.closest('.wl-search')) dd.classList.remove('open');
+  });
+})();
+
+renderMainTabs();
+renderView();
+</script>
+</body>
+</html>
