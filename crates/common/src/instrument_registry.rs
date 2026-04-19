@@ -211,13 +211,17 @@ impl InstrumentRegistry {
                 instrument.clone(),
             );
 
-            // Legacy index: keyed on security_id alone; collisions fire
-            // an ERROR log (routed to Telegram by Loki) and only one
-            // entry wins (second-seen overwrites). The count is
-            // exposed via the `cross_segment_collisions()` getter so
-            // callers in crates that depend on `metrics` can emit a
-            // Prometheus counter without this common crate taking a
-            // new dependency.
+            // Legacy index: keyed on security_id alone. When two Dhan
+            // instruments share the same numeric id across segments
+            // (e.g. NIFTY id=13 IDX_I + ABB id=13 NSE_EQ), the second
+            // insert overwrites the first in THIS map. The authoritative
+            // `by_composite` map above has already stored BOTH entries
+            // safely — no data is lost. We log at INFO (not ERROR, not
+            // WARN) because every production caller looks up via
+            // `get_with_segment(id, segment)`; the legacy `get(id)`
+            // API is only used by test assertions. The count is exposed
+            // via `cross_segment_collisions()` for operator visibility
+            // (make doctor / /health surface it as a gauge).
             if let Some(prev) = map.insert(instrument.security_id, instrument.clone())
                 && prev.exchange_segment != instrument.exchange_segment
             {
@@ -227,7 +231,7 @@ impl InstrumentRegistry {
                     prev.exchange_segment,
                     instrument.exchange_segment,
                 ));
-                tracing::error!(
+                tracing::info!(
                     code = crate::error_code::ErrorCode::InstrumentP1CrossSegmentCollision.code_str(),
                     severity = crate::error_code::ErrorCode::InstrumentP1CrossSegmentCollision.severity().as_str(),
                     security_id = instrument.security_id,
@@ -235,13 +239,10 @@ impl InstrumentRegistry {
                     new_segment = ?instrument.exchange_segment,
                     prev_symbol = %prev.underlying_symbol,
                     new_symbol = %instrument.underlying_symbol,
-                    "I-P1-11: InstrumentRegistry cross-segment security_id \
-                     collision — BOTH entries stored in composite index; \
-                     legacy get(id) callers will receive whichever entry \
-                     won the HashMap insert race. Operator action: run \
-                     `SELECT segment, security_id FROM ticks GROUP BY segment, \
-                     security_id HAVING count() > 0` to confirm both segments \
-                     are receiving live ticks."
+                    "I-P1-11: Dhan id reused across segments — BOTH entries \
+                     stored safely in composite (id, segment) index. No data \
+                     loss. Production callers use get_with_segment(); legacy \
+                     get(id) is test-only."
                 );
             }
         }
@@ -597,6 +598,39 @@ mod tests {
         assert_eq!(registry.len(), 0);
         assert!(registry.get(13).is_none());
         assert!(!registry.contains(13));
+    }
+
+    /// Ratchet: the I-P1-11 cross-segment event is NOT a data loss —
+    /// `by_composite` stores both entries safely and every production
+    /// caller uses `get_with_segment`. This test blocks any future
+    /// regression that bumps the log back up to `error!` (which would
+    /// route to Telegram via Loki and spam operators every boot for a
+    /// benign Dhan CSV id reuse like NIFTY id=13 + ABB id=13).
+    #[test]
+    fn test_cross_segment_log_level_is_info_not_error() {
+        let source = include_str!("instrument_registry.rs");
+        // Anchor on a substring unique to the production log call site
+        // (the test's own string literals intentionally differ).
+        let prod_msg = "Dhan id reused across segments";
+        let idx = source
+            .find(prod_msg)
+            .expect("I-P1-11 production log message must exist verbatim");
+        let window_start = idx.saturating_sub(1500);
+        let window = &source[window_start..idx];
+        assert!(
+            window.contains("tracing::info!"),
+            "I-P1-11 cross-segment log must be info!, not error! or warn! \
+             — composite index stores both entries, no data loss. Window: {window}"
+        );
+        let lines_before: Vec<&str> = window.lines().rev().take(30).collect();
+        for line in &lines_before {
+            assert!(
+                !line.trim_start().starts_with("tracing::error!"),
+                "Do not restore tracing::error! for I-P1-11 — it is not a \
+                 data-loss event; downgrade kept the Telegram alert channel \
+                 clear for real errors. Offending line: {line}"
+            );
+        }
     }
 
     #[test]

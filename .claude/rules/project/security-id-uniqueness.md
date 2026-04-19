@@ -85,8 +85,14 @@ one of them, leading to:
 7. **Prometheus visibility** — `InstrumentRegistry::cross_segment_collisions()`
    getter exposes the count. `subscription_planner` emits gauges
    `tv_instrument_registry_cross_segment_collisions` and
-   `tv_instrument_registry_total_entries`. Construction WARN upgraded
-   to `error!` so Loki routes it to Telegram.
+   `tv_instrument_registry_total_entries`. Construction log is at
+   `info!` level (downgraded 2026-04-19): both entries are stored
+   safely in `by_composite` and every production caller uses
+   `get_with_segment(id, segment)`, so this is not a data-loss event
+   and does not warrant a Telegram page. Operators see the count via
+   `/health` and `make doctor` (which read the gauge), not via a
+   per-boot alert. Ratchet: `test_cross_segment_log_level_is_info_not_error`
+   in `instrument_registry.rs` blocks regressions back to `error!`.
 
 ## Dashboard enforcement
 
