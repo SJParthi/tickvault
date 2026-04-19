@@ -6,6 +6,10 @@
 /target/
 **/*.rs.bk
 
+# ---- Python (MCP server bytecode cache) ----
+__pycache__/
+*.pyc
+
 # ---- IDE ----
 .idea/
 .vscode/
