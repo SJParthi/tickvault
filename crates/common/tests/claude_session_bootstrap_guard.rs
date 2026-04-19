@@ -333,8 +333,8 @@ fn fuzz_workflow_supports_tunable_duration() {
         "fuzz workflow must expose fuzz_duration_secs dispatch input"
     );
     assert!(
-        wf.contains("'900'") || wf.contains("\"900\""),
-        "fuzz workflow default must be 900s (15 min)"
+        wf.contains("'3600'") || wf.contains("\"3600\""),
+        "fuzz workflow default must be 3600s (1 hour — Phase 12.3)"
     );
     assert!(
         !wf.contains("-max_total_time=300 "),
@@ -406,6 +406,87 @@ fn chaos_nightly_workflow_wires_ignored_tests() {
     assert!(
         wf.contains("* * 6") || wf.contains("* * * *"),
         "chaos-nightly must run on a schedule"
+    );
+}
+
+#[test]
+fn prometheus_alerts_include_depth_sequence_rules() {
+    // PR #288 (#2): sustained + burst alerts for depth sequence holes.
+    let rules = read("deploy/docker/prometheus/rules/tickvault-alerts.yml");
+    assert!(
+        rules.contains("DepthSequenceHolesSustained"),
+        "tickvault-alerts.yml must include DepthSequenceHolesSustained"
+    );
+    assert!(
+        rules.contains("DepthSequenceHolesBurst"),
+        "tickvault-alerts.yml must include DepthSequenceHolesBurst"
+    );
+    assert!(
+        rules.contains("tv_depth_sequence_holes_total"),
+        "alerts must reference tv_depth_sequence_holes_total"
+    );
+}
+
+#[test]
+fn operator_dashboard_has_depth_sequence_and_collision_panels() {
+    // PR #288 (#1): operator-health dashboard must have panels for the
+    // new depth sequence metrics + the collision-pair table so they are
+    // visible without grepping Prometheus.
+    let dash = read("deploy/docker/grafana/dashboards/operator-health.json");
+    assert!(
+        dash.contains("tv_depth_sequence_holes_total"),
+        "operator-health dashboard must visualize tv_depth_sequence_holes_total"
+    );
+    assert!(
+        dash.contains("tv_instrument_registry_collision_pair"),
+        "operator-health dashboard must visualize collision pairs"
+    );
+}
+
+#[test]
+fn chaos_valkey_kill_test_exists() {
+    // PR #288 (#3): dedicated Valkey chaos test closes the one gap in the
+    // existing 16-file chaos suite.
+    let p = repo_root().join("crates/storage/tests/chaos_valkey_kill.rs");
+    assert!(p.exists(), "chaos_valkey_kill.rs missing");
+    let src = fs::read_to_string(&p).unwrap();
+    assert!(
+        src.contains("docker compose") && src.contains("pause"),
+        "chaos_valkey_kill must shell out to docker compose pause"
+    );
+    assert!(
+        src.contains("#[ignore"),
+        "chaos_valkey_kill tests must be #[ignore]'d (weekly workflow)"
+    );
+}
+
+#[test]
+fn loom_depth_sequence_tracker_test_exists() {
+    let p = repo_root().join("crates/core/tests/loom_depth_sequence_tracker.rs");
+    assert!(p.exists(), "loom_depth_sequence_tracker.rs missing");
+    let src = fs::read_to_string(&p).unwrap();
+    assert!(
+        src.contains("loom::model"),
+        "loom test must use loom::model"
+    );
+    assert!(
+        src.contains("concurrent") || src.contains("thread"),
+        "loom test must exercise concurrent access"
+    );
+}
+
+#[test]
+fn dhat_depth_sequence_tracker_test_exists() {
+    let p = repo_root().join("crates/core/tests/dhat_depth_sequence_tracker.rs");
+    assert!(p.exists(), "dhat_depth_sequence_tracker.rs missing");
+    let src = fs::read_to_string(&p).unwrap();
+    assert!(
+        src.contains("dhat::Profiler") || src.contains("dhat::Alloc"),
+        "DHAT test must use dhat profiler"
+    );
+    assert!(
+        src.contains("zero-alloc") || src.contains("zero alloc") || src.contains("bytes_delta, 0"),
+        "DHAT test must assert zero allocation"
     );
 }
 

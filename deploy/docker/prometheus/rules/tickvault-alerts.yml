@@ -656,3 +656,24 @@ groups:
         annotations:
           summary: "Cross-segment security_id collisions > 5"
           description: "Dhan reuses security_id across segments. Two collisions (NIFTY id=13 vs ABB, BANKNIFTY id=25 vs ADANIENT) are expected. {{ $value }} indicates new collisions — investigate whether a new underlying was added. Runbook: .claude/rules/project/security-id-uniqueness.md"
+
+      # PR #288 (§10.2): sustained depth sequence holes indicate either
+      # genuine upstream packet loss or a local buffer overflow. Rollbacks
+      # are benign (reconnect replays), duplicates are informational.
+      - alert: DepthSequenceHolesSustained
+        expr: sum(rate(tv_depth_sequence_holes_total[5m])) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "20-level depth sequence holes sustained > 0.1/s for 10m"
+          description: "tv_depth_sequence_holes_total rate = {{ $value }}/s. Each hole = at least one missing frame on the 20-level depth feed. Holes sustained across reconnect cycles indicate real packet loss, not reconnect replay. Check WS connection pool health + downstream Dhan status. Runbook: .claude/rules/project/depth-subscription.md"
+
+      - alert: DepthSequenceHolesBurst
+        expr: sum(rate(tv_depth_sequence_holes_total[1m])) > 5
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "20-level depth sequence holes burst > 5/s for 2m"
+          description: "Hole rate spiking — likely lost a connection or the upstream feed is degraded. Check tv_websocket_connections_active and depth pool state."

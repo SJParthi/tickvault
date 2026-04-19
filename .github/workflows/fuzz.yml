@@ -16,9 +16,9 @@ on:
   workflow_dispatch:       # Allow manual trigger for on-demand testing
     inputs:
       fuzz_duration_secs:
-        description: 'Seconds per target (default 900 = 15min scheduled; up to 3600 = 1h)'
+        description: 'Seconds per target (default 3600 = 1h scheduled; manual can go higher)'
         required: false
-        default: '900'
+        default: '3600'
         type: string
 
 permissions:
@@ -85,11 +85,11 @@ jobs:
         id: fuzz
         if: steps.check.outputs.exists == 'true' && steps.build.outcome == 'success'
         env:
-          # PR #288 (#8): scheduled runs use 900s (15min), 3x the prior 300s.
-          # 2 targets x 15min = 30min/week — well under the 2000-min GH Actions
-          # free-tier monthly budget. Manual dispatch can override up to 3600s
-          # for deep on-demand fuzzing when the operator accepts the cost.
-          FUZZ_SECS: ${{ github.event.inputs.fuzz_duration_secs || '900' }}
+          # PR #288 (#8 + Phase 12.3): scheduled runs use 3600s (1h), 12x the
+          # prior 300s. 2 targets x 1h = 2h/week = 8h/month — ~0.4% of the
+          # 2000-min/mo GH Actions free-tier budget. Still well within cost
+          # per aws-budget.md. Manual dispatch can go higher for deep runs.
+          FUZZ_SECS: ${{ github.event.inputs.fuzz_duration_secs || '3600' }}
         run: |
           # -rss_limit_mb=4096: increase RSS limit for ASan-instrumented builds.
           # -max_total_time=$FUZZ_SECS: stop after N seconds if no crash found.
