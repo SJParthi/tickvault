@@ -379,6 +379,37 @@ fn tick_processor_uses_segment_aware_sequence_tracker() {
 }
 
 #[test]
+fn chaos_nightly_workflow_wires_ignored_tests() {
+    // PR #288 (#6/#7): the `#[ignore]`d chaos tests already exist
+    // (4,723 lines across 16 files) but had no CI wiring. This workflow
+    // spins up docker compose, runs `cargo test -- --ignored chaos_*`,
+    // and opens a GitHub issue on failure. Weekly cadence respects the
+    // GH Actions free-tier budget per .claude/rules/project/aws-budget.md.
+    let wf = read(".github/workflows/chaos-nightly.yml");
+    assert!(
+        wf.contains("docker compose"),
+        "chaos-nightly must bring up the docker compose stack"
+    );
+    assert!(
+        wf.contains("--ignored"),
+        "chaos-nightly must pass --ignored so the chaos tests actually run"
+    );
+    assert!(
+        wf.contains("chaos_*") || wf.contains("chaos_"),
+        "chaos-nightly must scope to the chaos_* test binaries"
+    );
+    assert!(
+        wf.contains("chaos-regression"),
+        "chaos-nightly must label regression issues as chaos-regression"
+    );
+    // Weekly cadence (cron '30 18 * * 6') — daily would blow the free-tier budget.
+    assert!(
+        wf.contains("* * 6") || wf.contains("* * * *"),
+        "chaos-nightly must run on a schedule"
+    );
+}
+
+#[test]
 fn active_profile_is_one_of_the_known_profiles() {
     let cfg = read("config/claude-mcp-endpoints.toml");
     let active_line = cfg
