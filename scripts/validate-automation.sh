@@ -123,6 +123,8 @@ run_check "tickvault-logs MCP server present + executable" \
     test -x scripts/mcp-servers/tickvault-logs/server.py
 run_check "tickvault-logs MCP self-test passes" \
     python3 scripts/mcp-servers/tickvault-logs/server.py --self-test
+run_check "tickvault-logs MCP placeholder-env fallback" \
+    python3 scripts/mcp-servers/tickvault-logs/test_placeholder_fallback.py
 
 echo ""
 echo "--- source-code invariants ---"

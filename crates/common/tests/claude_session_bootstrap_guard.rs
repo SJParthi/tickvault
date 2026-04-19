@@ -157,6 +157,71 @@ fn session_env_is_gitignored() {
 }
 
 #[test]
+fn mcp_server_has_placeholder_aware_env_resolution() {
+    // PR #288 review finding: Claude Code's MCP launcher passes literal
+    // `${TICKVAULT_LOGS_DIR}` strings when the shell env var is missing.
+    // The server must treat those as unset and fall through to the TOML.
+    let src = read("scripts/mcp-servers/tickvault-logs/server.py");
+    assert!(
+        src.contains("_is_resolved"),
+        "server.py must define _is_resolved() helper that rejects ${{...}} \
+         placeholder strings — otherwise MCP log tools return ${{...}}/file \
+         not found on every fresh Claude session"
+    );
+    assert!(
+        src.contains("startswith(\"${\")"),
+        "_is_resolved() must explicitly check for the `${{` placeholder prefix"
+    );
+    // Every TICKVAULT_ env accessor must go through _is_resolved, not a
+    // bare truthy check.
+    for accessor in [
+        "_active_profile",
+        "_endpoint_url",
+        "_logs_dir",
+        "_logs_source",
+    ] {
+        let pos = src
+            .find(&format!("def {accessor}"))
+            .unwrap_or_else(|| panic!("server.py missing {accessor}"));
+        let body_end = src[pos..]
+            .find("\n\n\n")
+            .map(|n| pos + n)
+            .unwrap_or(src.len());
+        let body = &src[pos..body_end];
+        assert!(
+            body.contains("_is_resolved"),
+            "{accessor} must use _is_resolved() gatekeeper — raw env truthy \
+             check lets ${{...}} placeholders through"
+        );
+    }
+}
+
+#[test]
+fn mcp_server_placeholder_fallback_test_exists() {
+    let p = repo_root().join("scripts/mcp-servers/tickvault-logs/test_placeholder_fallback.py");
+    assert!(p.exists(), "placeholder fallback test missing");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&p).unwrap().permissions().mode();
+        assert!(
+            mode & 0o111 != 0,
+            "placeholder fallback test must be executable (mode={mode:o})"
+        );
+    }
+}
+
+#[test]
+fn validate_automation_runs_placeholder_fallback_test() {
+    let s = read("scripts/validate-automation.sh");
+    assert!(
+        s.contains("test_placeholder_fallback.py"),
+        "validate-automation.sh must run the placeholder fallback test so \
+         every audit catches regressions"
+    );
+}
+
+#[test]
 fn active_profile_is_one_of_the_known_profiles() {
     let cfg = read("config/claude-mcp-endpoints.toml");
     let active_line = cfg
