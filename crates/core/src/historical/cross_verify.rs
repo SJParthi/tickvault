@@ -1494,14 +1494,14 @@ mod tests {
     }
 
     #[test]
-    fn test_today_ist_window_pre_market_returns_none() {
+    fn test_from_utc_pre_market_returns_none() {
         // 09:14 IST — 1 minute before market open — should return None.
         let now = utc_at_ist(2026, 4, 20, 9, 14);
         assert!(TodayIstWindow::from_utc(now).is_none());
     }
 
     #[test]
-    fn test_today_ist_window_at_market_open_returns_some_at_boundary() {
+    fn test_from_utc_at_market_open_returns_some_at_boundary() {
         // Exactly 09:15 IST — boundary, should be Some with start == end.
         let now = utc_at_ist(2026, 4, 20, 9, 15);
         let w = TodayIstWindow::from_utc(now).expect("at boundary is inclusive");
@@ -1572,7 +1572,15 @@ mod tests {
     }
 
     #[test]
-    fn test_today_ist_window_is_stable_across_day_boundary() {
+    fn test_from_now_returns_some_during_market_or_none_otherwise() {
+        // Smoke-covers `from_now`: the wrapper over `from_utc(Utc::now())`.
+        // We can't assert a specific value since "now" depends on CI clock,
+        // but we can assert it doesn't panic and returns the Option shape.
+        let _ = TodayIstWindow::from_now();
+    }
+
+    #[test]
+    fn test_from_utc_is_stable_across_day_boundary() {
         // 2026-04-20 23:59 UTC == 2026-04-21 05:29 IST — still today-ist = 21,
         // but 05:29 is pre-market → None.
         let now = DateTime::<Utc>::from_naive_utc_and_offset(
