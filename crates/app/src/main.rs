@@ -2954,41 +2954,133 @@ async fn main() -> Result<()> {
                 });
             }
 
-            // O1 (2026-04-17) Phase A: Phase 2 subscription scheduler.
-            // Sleeps until 09:12 IST (or runs immediately if already past 9:12
-            // and within market hours), then waits for NIFTY/BANKNIFTY LTPs,
-            // then computes the stock-F&O delta from the snapshotter's
-            // buffer and dispatches the SubscribeCommand to the pool.
+            // PROMPT C (2026-04-20) — Phase 2 crash-recovery.
             //
-            // PROMPT C (Phase 2 crash-recovery) consumes the chosen
-            // reference prices via the optional `pick_completed_tx`
-            // channel — wired with `None` here until that PR lands.
-            {
-                let phase2_spot_prices = std::sync::Arc::clone(&shared_spot_prices);
-                let phase2_calendar_for_dyn = std::sync::Arc::clone(&trading_calendar);
-                let phase2_calendar_for_decision = std::sync::Arc::clone(&trading_calendar);
-                let phase2_notifier = notifier.clone();
-                let phase2_pool = ws_pool_arc.clone();
-                let phase2_buffer = std::sync::Arc::clone(&preopen_buffer);
-                tokio::spawn(async move {
-                    tickvault_core::instrument::phase2_scheduler::run_phase2_scheduler(
-                        phase2_spot_prices,
-                        phase2_calendar_for_decision,
-                        phase2_notifier,
-                        phase2_pool,
-                        Some(
-                            tickvault_core::instrument::phase2_scheduler::Phase2InstrumentsSource::Dynamic {
-                                buffer: phase2_buffer,
-                                universe: phase2_universe,
-                                calendar: phase2_calendar_for_dyn,
-                                strikes_each_side: 25,
-                            },
-                        ),
-                        tickvault_common::types::FeedMode::Quote,
-                        None, // PROMPT C wires the pick_completed channel.
-                    )
-                    .await;
-                });
+            // BEFORE spawning the Phase 2 scheduler, consult the on-disk
+            // snapshot written by PROMPT A at 09:12:30 IST. If today's
+            // snapshot is present we re-dispatch the SAME ATM chain the
+            // scheduler picked this morning and SKIP spawning the
+            // scheduler — a mid-market restart at 11:00 IST must resume
+            // the same contracts, not re-pick ATM from drifted live
+            // price. Absent/stale snapshot falls through to the existing
+            // scheduler unchanged.
+            let phase2_action = {
+                let snapshot_path =
+                    std::path::PathBuf::from(tickvault_app::phase2_recovery::PHASE2_SNAPSHOT_PATH);
+                let snapshot = match tickvault_storage::phase2_subscription_marker::read_snapshot(
+                    &snapshot_path,
+                ) {
+                    Ok(snap) => snap,
+                    Err(err) => {
+                        warn!(
+                            ?err,
+                            path = %snapshot_path.display(),
+                            "Phase 2 recovery: snapshot read failed — proceeding without it"
+                        );
+                        None
+                    }
+                };
+                let (today_ist, now_sec) =
+                    tickvault_app::phase2_recovery::current_ist_seconds_of_day();
+                let is_trading_day = trading_calendar.is_trading_day(today_ist);
+                let action = tickvault_app::phase2_recovery::plan_recovery(
+                    today_ist,
+                    now_sec,
+                    is_trading_day,
+                    snapshot.as_ref(),
+                );
+                metrics::counter!(
+                    tickvault_app::phase2_recovery::RECOVERY_METRIC_NAME,
+                    "outcome" => action.outcome_label(),
+                )
+                .increment(1);
+                match &action {
+                    tickvault_app::phase2_recovery::RecoveryAction::DispatchSnapshot {
+                        snapshot_date,
+                        instrument_count,
+                        ..
+                    } => info!(
+                        outcome = action.outcome_label(),
+                        snapshot_date = %snapshot_date,
+                        instrument_count,
+                        "Phase 2 recovery: recovering from snapshot — scheduler will be skipped"
+                    ),
+                    other => info!(
+                        outcome = other.outcome_label(),
+                        today_ist = %today_ist,
+                        now_sec,
+                        is_trading_day,
+                        "Phase 2 recovery: no reusable snapshot — delegating to scheduler path"
+                    ),
+                }
+                action
+            };
+
+            match phase2_action {
+                tickvault_app::phase2_recovery::RecoveryAction::DispatchSnapshot {
+                    snapshot_date: _,
+                    instrument_count,
+                    instruments,
+                } => match ws_pool_arc.as_ref() {
+                    Some(pool) => {
+                        let cmd = tickvault_core::websocket::SubscribeCommand::AddInstruments {
+                            instruments,
+                            feed_mode: tickvault_common::types::FeedMode::Quote,
+                        };
+                        match pool.dispatch_subscribe(cmd) {
+                            Some(conn_id) => info!(
+                                target_connection = conn_id,
+                                instrument_count,
+                                "Phase 2 recovery: snapshot chain dispatched to pool"
+                            ),
+                            None => error!(
+                                instrument_count,
+                                "Phase 2 recovery: dispatch_subscribe returned None — \
+                                 snapshot chain will NOT be subscribed this boot"
+                            ),
+                        }
+                    }
+                    None => warn!(
+                        instrument_count,
+                        "Phase 2 recovery: no WebSocket pool — snapshot chain not dispatched"
+                    ),
+                },
+                tickvault_app::phase2_recovery::RecoveryAction::SkipOffHours => {
+                    info!("Phase 2 recovery: skip-off-hours — scheduler NOT spawned this boot");
+                }
+                tickvault_app::phase2_recovery::RecoveryAction::RunFreshPhase2
+                | tickvault_app::phase2_recovery::RecoveryAction::WaitForScheduler => {
+                    // O1 (2026-04-17) Phase A: Phase 2 subscription scheduler.
+                    // Sleeps until 09:12 IST (or runs immediately if already past 9:12
+                    // and within market hours), then waits for NIFTY/BANKNIFTY LTPs,
+                    // then computes the stock-F&O delta from the snapshotter's
+                    // buffer and dispatches the SubscribeCommand to the pool.
+                    let phase2_spot_prices = std::sync::Arc::clone(&shared_spot_prices);
+                    let phase2_calendar_for_dyn = std::sync::Arc::clone(&trading_calendar);
+                    let phase2_calendar_for_decision = std::sync::Arc::clone(&trading_calendar);
+                    let phase2_notifier = notifier.clone();
+                    let phase2_pool = ws_pool_arc.clone();
+                    let phase2_buffer = std::sync::Arc::clone(&preopen_buffer);
+                    tokio::spawn(async move {
+                        tickvault_core::instrument::phase2_scheduler::run_phase2_scheduler(
+                            phase2_spot_prices,
+                            phase2_calendar_for_decision,
+                            phase2_notifier,
+                            phase2_pool,
+                            Some(
+                                tickvault_core::instrument::phase2_scheduler::Phase2InstrumentsSource::Dynamic {
+                                    buffer: phase2_buffer,
+                                    universe: phase2_universe,
+                                    calendar: phase2_calendar_for_dyn,
+                                    strikes_each_side: 25,
+                                },
+                            ),
+                            tickvault_common::types::FeedMode::Quote,
+                            None, // PROMPT A wires the pick_completed channel.
+                        )
+                        .await;
+                    });
+                }
             }
 
             // L1: Listen for rebalance events → Telegram alert + send swap commands (zero disconnect).
