@@ -22,12 +22,13 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, Utc};
 use reqwest::Client;
 use tracing::{debug, error, info, warn};
 
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::constants::{
-    CANDLES_PER_TRADING_DAY, QUESTDB_TABLE_HISTORICAL_CANDLES, TIMEFRAME_1M,
+    CANDLES_PER_TRADING_DAY, IST_UTC_OFFSET_SECONDS, QUESTDB_TABLE_HISTORICAL_CANDLES, TIMEFRAME_1M,
 };
 use tickvault_common::instrument_registry::InstrumentRegistry;
 
@@ -215,6 +216,101 @@ const CROSS_MATCH_TIMEFRAMES: &[(&str, &str)] = &[
     ("60m", "candles_1h"),
     ("1d", "candles_1d"),
 ];
+
+// ---------------------------------------------------------------------------
+// Today-only SQL window (fixes "12 days accumulated data falsely passing" bug)
+// ---------------------------------------------------------------------------
+
+/// Today's IST trading-session SQL window, ready to drop into WHERE clauses.
+///
+/// **Why this exists:** before 2026-04-20 the cross-verify queries used a
+/// rolling `ts > dateadd('d', -3, now())` 3-day window. Because QuestDB data
+/// is persistent across app restarts (Docker volume), that window captured
+/// ticks from MANY prior trading sessions. Cross-match compared 12+ days of
+/// accumulated live ticks against the REST historical fetch — which trivially
+/// "passed" because both data sources come from Dhan. The OK was legitimate
+/// but meaningless for verifying TODAY's session.
+///
+/// `ts` in QuestDB was stored as IST-epoch (WebSocket LTT is IST epoch seconds
+/// per `data-integrity.md`). A literal like `'2026-04-20T09:15:00.000000Z'`
+/// is parsed by QuestDB as UTC-epoch for 09:15 on that date — which exactly
+/// matches the IST-epoch representation we stored for the IST 09:15 tick,
+/// because both share the same numeric value (IST wall clock treated as UTC).
+///
+/// The window is `[today_0915_ist, min(now_ist, today_1530_ist)]` so that:
+/// - During market hours → compare only what live has produced so far
+/// - Post-market → compare the full 09:15-15:30 session
+/// - Pre-market (before 09:15) → `from_utc` returns `None`
+///
+/// Production caller builds this via [`TodayIstWindow::from_now`]. Tests
+/// drive determinism via [`TodayIstWindow::from_utc`].
+#[derive(Debug, Clone)]
+pub struct TodayIstWindow {
+    /// IST date of "today" (used for Telegram labels like "TODAY ONLY: 2026-04-20").
+    pub today_ist: NaiveDate,
+    /// SQL-ready timestamp literal for window start (including quotes).
+    /// Example: `'2026-04-20T09:15:00.000000Z'`.
+    pub start_sql: String,
+    /// SQL-ready timestamp literal for window end (including quotes).
+    /// Example: `'2026-04-20T15:30:00.000000Z'` or earlier during the session.
+    pub end_sql: String,
+}
+
+impl TodayIstWindow {
+    /// Computes today's IST trading-session window from the current UTC time.
+    /// Returns `None` before 09:15 IST (no window exists yet).
+    pub fn from_now() -> Option<Self> {
+        Self::from_utc(Utc::now())
+    }
+
+    /// Computes today's IST trading-session window from a given UTC instant.
+    /// Pure function — suitable for deterministic tests.
+    pub fn from_utc(now_utc: DateTime<Utc>) -> Option<Self> {
+        // APPROVED: IST_UTC_OFFSET_SECONDS (19800) is a compile-time provable
+        // valid FixedOffset — same pattern as trading_calendar::ist_fixed_offset.
+        let ist = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS)?;
+        let now_ist = now_utc.with_timezone(&ist);
+        let today_ist = now_ist.date_naive();
+        let start_naive: NaiveDateTime = today_ist.and_hms_opt(9, 15, 0)?;
+        let market_end_naive: NaiveDateTime = today_ist.and_hms_opt(15, 30, 0)?;
+        let now_naive = now_ist.naive_local();
+        // Pre-market: nothing to compare yet.
+        if now_naive < start_naive {
+            return None;
+        }
+        let effective_end = if now_naive < market_end_naive {
+            now_naive
+        } else {
+            market_end_naive
+        };
+        Some(Self {
+            today_ist,
+            start_sql: format!("'{}'", start_naive.format("%Y-%m-%dT%H:%M:%S.000000Z")),
+            end_sql: format!("'{}'", effective_end.format("%Y-%m-%dT%H:%M:%S.000000Z")),
+        })
+    }
+
+    /// Returns the SQL fragment `ts >= '...' AND ts <= '...'` suitable for
+    /// dropping into any WHERE clause. Replaces the old
+    /// `ts > dateadd('d', -3, now())` 3-day window.
+    pub fn where_clause(&self) -> String {
+        format!(
+            "ts >= {start} AND ts <= {end}",
+            start = self.start_sql,
+            end = self.end_sql,
+        )
+    }
+
+    /// Same as [`where_clause`] but prefixed with a table alias
+    /// (e.g. `"h"` → `h.ts >= '...' AND h.ts <= '...'`).
+    pub fn where_clause_aliased(&self, alias: &str) -> String {
+        format!(
+            "{alias}.ts >= {start} AND {alias}.ts <= {end}",
+            start = self.start_sql,
+            end = self.end_sql,
+        )
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Pure Helper Functions (extracted for testability)
@@ -714,6 +810,7 @@ fn failed_report() -> CrossVerificationReport {
 pub async fn verify_candle_integrity(
     questdb_config: &QuestDbConfig,
     registry: &InstrumentRegistry,
+    today_window: &TodayIstWindow,
 ) -> CrossVerificationReport {
     let base_url = format!(
         "http://{}:{}/exec",
@@ -731,15 +828,22 @@ pub async fn verify_candle_integrity(
         }
     };
 
+    // Today's IST trading-session window — replaces the old rolling 3-day
+    // `dateadd('d', -3, now())` bound, which (because QuestDB persists across
+    // app restarts via Docker volume) captured up to 12 prior sessions'
+    // accumulated ticks. See `TodayIstWindow` docstring for the full rationale.
+    let ts_filter = today_window.where_clause();
+
     // --- Step 1: Per-timeframe coverage query ---
     // Groups by (timeframe, security_id) to get counts per instrument per timeframe.
-    // Use 3-day window to ensure daily candles (stamped at IST midnight = hour 0)
-    // are always captured regardless of when verification runs.
-    // Intraday candles from today are also within this window.
+    // Narrowed to TODAY ONLY (09:15-15:30 IST). Daily candles (stamped at IST
+    // midnight = hour 0 of the NEXT calendar day in the old semantics) are
+    // intentionally NOT captured by this intraday window — the daily cross-check
+    // happens on a separate path post-close.
     let coverage_query = format!(
         "SELECT timeframe, security_id, count() as candle_count \
          FROM {} \
-         WHERE ts > dateadd('d', -3, now()) \
+         WHERE {ts_filter} \
          GROUP BY timeframe, security_id \
          ORDER BY timeframe, candle_count DESC",
         QUESTDB_TABLE_HISTORICAL_CANDLES
@@ -791,7 +895,7 @@ pub async fn verify_candle_integrity(
     // --- Step 3: OHLC consistency check (high < low) with details ---
     let ohlc_count_query = format!(
         "SELECT count() FROM {} \
-         WHERE ts > dateadd('d', -3, now()) AND high < low",
+         WHERE {ts_filter} AND high < low",
         QUESTDB_TABLE_HISTORICAL_CANDLES
     );
 
@@ -801,7 +905,7 @@ pub async fn verify_candle_integrity(
         let ohlc_detail_query = format!(
             "SELECT security_id, segment, timeframe, ts, open, high, low, close, volume \
              FROM {} \
-             WHERE ts > dateadd('d', -3, now()) AND high < low \
+             WHERE {ts_filter} AND high < low \
              LIMIT {}",
             QUESTDB_TABLE_HISTORICAL_CANDLES, MAX_VIOLATION_DETAILS
         );
@@ -827,7 +931,7 @@ pub async fn verify_candle_integrity(
     // --- Step 4: Data integrity check (non-positive prices) with details ---
     let data_count_query = format!(
         "SELECT count() FROM {} \
-         WHERE ts > dateadd('d', -3, now()) \
+         WHERE {ts_filter} \
          AND (open <= 0 OR high <= 0 OR low <= 0 OR close <= 0)",
         QUESTDB_TABLE_HISTORICAL_CANDLES
     );
@@ -838,7 +942,7 @@ pub async fn verify_candle_integrity(
         let data_detail_query = format!(
             "SELECT security_id, segment, timeframe, ts, open, high, low, close, volume \
              FROM {} \
-             WHERE ts > dateadd('d', -3, now()) \
+             WHERE {ts_filter} \
              AND (open <= 0 OR high <= 0 OR low <= 0 OR close <= 0) \
              LIMIT {}",
             QUESTDB_TABLE_HISTORICAL_CANDLES, MAX_VIOLATION_DETAILS
@@ -870,7 +974,7 @@ pub async fn verify_candle_integrity(
     // Any candle at 15:30+ is a violation regardless of timeframe.
     let ts_count_query = format!(
         "SELECT count() FROM {} \
-         WHERE ts > dateadd('d', -3, now()) \
+         WHERE {ts_filter} \
          AND timeframe != '1d' \
          AND (hour(ts) < 9 OR hour(ts) > 15 \
               OR (hour(ts) = 9 AND minute(ts) < 15) \
@@ -884,7 +988,7 @@ pub async fn verify_candle_integrity(
         let ts_detail_query = format!(
             "SELECT security_id, segment, timeframe, ts, open, high, low, close, volume \
              FROM {} \
-             WHERE ts > dateadd('d', -3, now()) \
+             WHERE {ts_filter} \
              AND timeframe != '1d' \
              AND (hour(ts) < 9 OR hour(ts) > 15 \
                   OR (hour(ts) = 9 AND minute(ts) < 15) \
@@ -916,7 +1020,7 @@ pub async fn verify_candle_integrity(
     // NSE is closed on weekends — no trading, no settlement, no data.
     let weekend_count_query = format!(
         "SELECT count() FROM {} \
-         WHERE ts > dateadd('d', -3, now()) \
+         WHERE {ts_filter} \
          AND (day_of_week(ts) = 6 OR day_of_week(ts) = 7)",
         QUESTDB_TABLE_HISTORICAL_CANDLES
     );
@@ -927,7 +1031,7 @@ pub async fn verify_candle_integrity(
         let weekend_detail_query = format!(
             "SELECT security_id, segment, timeframe, ts, open, high, low, close, volume \
              FROM {} \
-             WHERE ts > dateadd('d', -3, now()) \
+             WHERE {ts_filter} \
              AND (day_of_week(ts) = 6 OR day_of_week(ts) = 7) \
              LIMIT {}",
             QUESTDB_TABLE_HISTORICAL_CANDLES, MAX_VIOLATION_DETAILS
@@ -1023,6 +1127,7 @@ pub async fn verify_candle_integrity(
 pub async fn cross_match_historical_vs_live(
     questdb_config: &QuestDbConfig,
     registry: &InstrumentRegistry,
+    today_window: &TodayIstWindow,
 ) -> CrossMatchReport {
     let base_url = format!(
         "http://{}:{}/exec",
@@ -1039,6 +1144,12 @@ pub async fn cross_match_historical_vs_live(
             return failed_cross_match_report();
         }
     };
+
+    // Today's IST trading-session window (see `TodayIstWindow`). `ts_filter`
+    // for unaliased queries (bare `candles_*` live tables); `ts_filter_h` for
+    // LEFT-JOIN queries that alias `historical_candles` as `h`.
+    let ts_filter = today_window.where_clause();
+    let ts_filter_h = today_window.where_clause_aliased("h");
 
     let mut total_compared = 0_usize;
     let mut total_mismatches = 0_usize;
@@ -1087,10 +1198,7 @@ pub async fn cross_match_historical_vs_live(
         // we still run the per-timeframe LEFT JOIN below for completeness
         // but the caller will refuse to emit "OK" without at least one
         // timeframe reporting live rows.
-        let live_count_query = format!(
-            "SELECT count() FROM {} WHERE ts > dateadd('d', -3, now())",
-            live_table
-        );
+        let live_count_query = format!("SELECT count() FROM {} WHERE {ts_filter}", live_table);
         let live_tf_rows = extract_count(&client, &base_url, &live_count_query).await;
         if live_tf_rows > 0 {
             live_candles_present = true;
@@ -1100,7 +1208,7 @@ pub async fn cross_match_historical_vs_live(
         let count_query = format!(
             "SELECT count() FROM {} h \
              LEFT JOIN {} m ON h.security_id = m.security_id AND h.ts = m.ts AND h.segment = m.segment \
-             WHERE h.timeframe = '{}' AND h.ts > dateadd('d', -3, now())",
+             WHERE h.timeframe = '{}' AND {ts_filter_h}",
             QUESTDB_TABLE_HISTORICAL_CANDLES, live_table, hist_tf
         );
 
@@ -1121,7 +1229,7 @@ pub async fn cross_match_historical_vs_live(
                     h.open_interest, m.open_interest \
              FROM {} h \
              LEFT JOIN {} m ON h.security_id = m.security_id AND h.ts = m.ts AND h.segment = m.segment \
-             WHERE h.timeframe = '{}' AND h.ts > dateadd('d', -3, now()) \
+             WHERE h.timeframe = '{}' AND {ts_filter_h} \
              AND (m.open IS NULL \
                   OR abs(h.open - m.open) > {eps} \
                   OR abs(h.high - m.high) > {eps} \
@@ -1369,6 +1477,149 @@ async fn parse_cross_match_rows_with_oi(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // TodayIstWindow — today-only SQL window (fixes "12 days accumulated" bug)
+    // -----------------------------------------------------------------------
+
+    /// Build a UTC instant equivalent to an IST wall-clock time on the given date.
+    fn utc_at_ist(year: i32, month: u32, day: u32, ist_h: u32, ist_m: u32) -> DateTime<Utc> {
+        // IST is UTC+5:30 → subtract 5:30 from IST wall-clock to get UTC.
+        let naive_ist = NaiveDate::from_ymd_opt(year, month, day)
+            .expect("valid date")
+            .and_hms_opt(ist_h, ist_m, 0)
+            .expect("valid time");
+        let naive_utc = naive_ist - chrono::Duration::seconds(i64::from(IST_UTC_OFFSET_SECONDS));
+        DateTime::<Utc>::from_naive_utc_and_offset(naive_utc, Utc)
+    }
+
+    #[test]
+    fn test_today_ist_window_pre_market_returns_none() {
+        // 09:14 IST — 1 minute before market open — should return None.
+        let now = utc_at_ist(2026, 4, 20, 9, 14);
+        assert!(TodayIstWindow::from_utc(now).is_none());
+    }
+
+    #[test]
+    fn test_today_ist_window_at_market_open_returns_some_at_boundary() {
+        // Exactly 09:15 IST — boundary, should be Some with start == end.
+        let now = utc_at_ist(2026, 4, 20, 9, 15);
+        let w = TodayIstWindow::from_utc(now).expect("at boundary is inclusive");
+        assert_eq!(w.today_ist, NaiveDate::from_ymd_opt(2026, 4, 20).unwrap());
+        assert!(w.start_sql.contains("T09:15:00"));
+        // now == start → effective_end == start
+        assert_eq!(w.start_sql, w.end_sql);
+    }
+
+    #[test]
+    fn test_today_ist_window_mid_session_clamps_end_to_now() {
+        // 12:00 IST — mid-session — window end should be 12:00, not 15:30.
+        let now = utc_at_ist(2026, 4, 20, 12, 0);
+        let w = TodayIstWindow::from_utc(now).expect("mid-session window exists");
+        assert!(w.start_sql.contains("T09:15:00"));
+        assert!(w.end_sql.contains("T12:00:00"));
+    }
+
+    #[test]
+    fn test_today_ist_window_post_market_clamps_end_to_1530() {
+        // 18:00 IST — post-market — end should be 15:30, not 18:00.
+        let now = utc_at_ist(2026, 4, 20, 18, 0);
+        let w = TodayIstWindow::from_utc(now).expect("post-market window exists");
+        assert!(w.start_sql.contains("T09:15:00"));
+        assert!(
+            w.end_sql.contains("T15:30:00"),
+            "post-market end must clamp to 15:30: {}",
+            w.end_sql
+        );
+    }
+
+    #[test]
+    fn test_today_ist_window_at_market_close_returns_full_session() {
+        // Exactly 15:30 IST — close boundary — should clamp to 15:30.
+        let now = utc_at_ist(2026, 4, 20, 15, 30);
+        let w = TodayIstWindow::from_utc(now).expect("close boundary window exists");
+        assert!(w.end_sql.contains("T15:30:00"));
+    }
+
+    #[test]
+    fn test_today_ist_window_where_clause_format() {
+        let now = utc_at_ist(2026, 4, 20, 12, 0);
+        let w = TodayIstWindow::from_utc(now).unwrap();
+        let clause = w.where_clause();
+        assert!(clause.starts_with("ts >= '"), "got: {clause}");
+        assert!(
+            clause.contains(" AND ts <= '"),
+            "clause must be bounded both sides: {clause}"
+        );
+        assert!(clause.contains("2026-04-20T09:15:00"));
+        assert!(clause.contains("2026-04-20T12:00:00"));
+    }
+
+    #[test]
+    fn test_today_ist_window_where_clause_aliased_format() {
+        let now = utc_at_ist(2026, 4, 20, 12, 0);
+        let w = TodayIstWindow::from_utc(now).unwrap();
+        let clause = w.where_clause_aliased("h");
+        assert!(clause.starts_with("h.ts >= '"), "got: {clause}");
+        assert!(clause.contains(" AND h.ts <= '"));
+        // Every `ts` reference must carry the `h.` alias — there should be
+        // exactly two (one for `>=`, one for `<=`) and no bare ones.
+        assert_eq!(
+            clause.matches("h.ts").count(),
+            2,
+            "expected exactly 2 h.ts references: {clause}"
+        );
+    }
+
+    #[test]
+    fn test_today_ist_window_is_stable_across_day_boundary() {
+        // 2026-04-20 23:59 UTC == 2026-04-21 05:29 IST — still today-ist = 21,
+        // but 05:29 is pre-market → None.
+        let now = DateTime::<Utc>::from_naive_utc_and_offset(
+            NaiveDate::from_ymd_opt(2026, 4, 20)
+                .unwrap()
+                .and_hms_opt(23, 59, 0)
+                .unwrap(),
+            Utc,
+        );
+        assert!(
+            TodayIstWindow::from_utc(now).is_none(),
+            "pre-market on the NEXT IST day must return None"
+        );
+    }
+
+    #[test]
+    fn test_today_ist_window_rolls_over_at_ist_midnight() {
+        // 18:45 UTC on 2026-04-20 == 00:15 IST on 2026-04-21.
+        // That's pre-market on 2026-04-21 IST → None, and `today_ist` would
+        // be 21 if a window existed.
+        let now = DateTime::<Utc>::from_naive_utc_and_offset(
+            NaiveDate::from_ymd_opt(2026, 4, 20)
+                .unwrap()
+                .and_hms_opt(18, 45, 0)
+                .unwrap(),
+            Utc,
+        );
+        assert!(TodayIstWindow::from_utc(now).is_none());
+    }
+
+    #[test]
+    fn test_today_ist_window_sql_literal_microsecond_padding() {
+        let now = utc_at_ist(2026, 4, 20, 12, 0);
+        let w = TodayIstWindow::from_utc(now).unwrap();
+        // QuestDB timestamp literal requires the `.000000Z` suffix
+        // (microsecond precision) — don't drop it, QuestDB is strict.
+        assert!(
+            w.start_sql.contains(".000000Z"),
+            "start must carry microsecond suffix: {}",
+            w.start_sql
+        );
+        assert!(
+            w.end_sql.contains(".000000Z"),
+            "end must carry microsecond suffix: {}",
+            w.end_sql
+        );
+    }
 
     #[test]
     fn test_cross_verification_report_default_values() {
@@ -1770,7 +2021,9 @@ mod tests {
             ilp_port: 1,
         };
         let registry = InstrumentRegistry::empty();
-        let report = verify_candle_integrity(&config, &registry).await;
+        let window = TodayIstWindow::from_utc(utc_at_ist(2026, 4, 20, 12, 0))
+            .expect("mid-session test window");
+        let report = verify_candle_integrity(&config, &registry, &window).await;
         assert!(!report.passed);
         assert_eq!(report.instruments_checked, 0);
     }
@@ -1784,7 +2037,9 @@ mod tests {
             ilp_port: 1,
         };
         let registry = InstrumentRegistry::empty();
-        let report = cross_match_historical_vs_live(&config, &registry).await;
+        let window = TodayIstWindow::from_utc(utc_at_ist(2026, 4, 20, 12, 0))
+            .expect("mid-session test window");
+        let report = cross_match_historical_vs_live(&config, &registry, &window).await;
         assert!(!report.passed);
         assert_eq!(report.candles_compared, 0);
     }

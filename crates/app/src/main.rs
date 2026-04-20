@@ -4230,9 +4230,51 @@ fn spawn_historical_candle_fetch(
         }
 
         // -----------------------------------------------------------------
+        // Cross-verify + cross-match: TODAY-ONLY window gating
+        //
+        // Gate both operations on:
+        //  1. `is_trading_day` — weekend / NSE holiday → skip both with a
+        //     typed SKIPPED notification so operator gets closure on Telegram.
+        //  2. `TodayIstWindow::from_now()` — pre-market (before 09:15 IST)
+        //     returns None → skip both (nothing to verify yet).
+        //
+        // Otherwise pass the window to both functions so their SQL WHERE
+        // clauses are narrowed to today's 09:15-15:30 IST session. Fixes the
+        // "12 days of accumulated data falsely passing" bug where the old
+        // `dateadd('d', -3, now())` window compared multi-day Dhan-sourced
+        // aggregates against the same-day Dhan REST fetch (vacuous OK).
+        // -----------------------------------------------------------------
+        let today_window = if is_trading_day {
+            tickvault_core::historical::cross_verify::TodayIstWindow::from_now()
+        } else {
+            None
+        };
+
+        let Some(today_window) = today_window else {
+            let reason = if !is_trading_day {
+                "weekend or holiday — not a trading day".to_string()
+            } else {
+                "pre-market (before 09:15 IST) — no live data yet".to_string()
+            };
+            info!(
+                instruments_fetched = summary.instruments_fetched,
+                instruments_failed = summary.instruments_failed,
+                total_candles = summary.total_candles,
+                %reason,
+                "cross-verify + cross-match SKIPPED"
+            );
+            bg_notifier.notify(NotificationEvent::CandleCrossMatchSkipped {
+                reason,
+                candles_compared: 0,
+            });
+            return;
+        };
+
+        // -----------------------------------------------------------------
         // Cross-verify candle integrity in QuestDB
         // -----------------------------------------------------------------
-        let verify_report = verify_candle_integrity(&bg_questdb_config, &bg_registry).await;
+        let verify_report =
+            verify_candle_integrity(&bg_questdb_config, &bg_registry, &today_window).await;
         let timeframe_details = format_timeframe_details(&verify_report);
         if verify_report.passed {
             bg_notifier.notify(NotificationEvent::CandleVerificationPassed {
@@ -4261,12 +4303,12 @@ fn spawn_historical_candle_fetch(
         }
 
         // -----------------------------------------------------------------
-        // Cross-match historical vs live candle data (trading day only —
-        // on non-trading days there's no live data to compare against)
+        // Cross-match historical vs live candle data
         // -----------------------------------------------------------------
-        if is_trading_day {
+        {
             let cross_match =
-                cross_match_historical_vs_live(&bg_questdb_config, &bg_registry).await;
+                cross_match_historical_vs_live(&bg_questdb_config, &bg_registry, &today_window)
+                    .await;
 
             if !cross_match.live_candles_present || cross_match.candles_compared == 0 {
                 // First run / fresh DB / post-market boot with no live ticks yet.
@@ -4318,24 +4360,11 @@ fn spawn_historical_candle_fetch(
                 total_candles = summary.total_candles,
                 verification_passed = verify_report.passed,
                 cross_match_passed = cross_match.passed,
-                "post-market historical fetch + cross-verification complete"
+                today_ist = %today_window.today_ist,
+                window_start = %today_window.start_sql,
+                window_end = %today_window.end_sql,
+                "post-market historical fetch + cross-verification complete (TODAY ONLY)"
             );
-        } else {
-            // Non-trading day: skip cross-match (no live data to compare).
-            // Emit the typed SKIPPED notification so the operator gets
-            // explicit closure on Telegram instead of silently missing
-            // the post-fetch cross-match step on weekends / holidays.
-            info!(
-                instruments_fetched = summary.instruments_fetched,
-                instruments_failed = summary.instruments_failed,
-                total_candles = summary.total_candles,
-                verification_passed = verify_report.passed,
-                "non-trading day historical fetch complete (cross-match skipped — no live data)"
-            );
-            bg_notifier.notify(NotificationEvent::CandleCrossMatchSkipped {
-                reason: "weekend or holiday — not a trading day".to_string(),
-                candles_compared: 0,
-            });
         }
     });
 
