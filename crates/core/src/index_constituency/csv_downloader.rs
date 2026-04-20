@@ -138,10 +138,20 @@ async fn download_single_csv(client: &Client, name: &str, url: &str) -> Result<S
             }
 
             // Reject HTML responses — niftyindices.com returns 200 + HTML
-            // for non-existent slugs instead of 404.
+            // for non-existent slugs AND for Cloudflare-throttled requests.
+            // Diagnostic enhancement (2026-04-20): embed a short signature
+            // of the response body so the operator can tell WHICH kind of
+            // HTML came back — a Cloudflare "checking your browser" page
+            // needs a retry with longer backoff; a generic 404-style HTML
+            // page needs a slug correction. Without the snippet we spend
+            // 15+ minutes re-running in prod to figure out which it is.
             let trimmed = text.trim_start();
             if trimmed.starts_with('<') || trimmed.starts_with("<!DOCTYPE") {
-                anyhow::bail!("received HTML instead of CSV for {url}");
+                let signature = classify_html_body(trimmed);
+                let snippet: String = trimmed.chars().take(160).collect();
+                anyhow::bail!(
+                    "received HTML instead of CSV for {url} — kind={signature} — snippet={snippet:?}"
+                );
             }
 
             Ok(text)
@@ -162,6 +172,41 @@ async fn download_single_csv(client: &Client, name: &str, url: &str) -> Result<S
         );
     })
     .await
+}
+
+/// Classifies an HTML response body into a short operator-friendly signature
+/// so the retry log can distinguish:
+/// - `cloudflare` — WAF / bot-challenge page → symptom of rate-limit or IP ban
+/// - `missing` — 200 + "404-not-found" looking HTML → symptom of wrong slug
+/// - `server_error` — 200 + server error page (rare but seen for NSE)
+/// - `unknown` — HTML we haven't classified
+///
+/// This is a pure heuristic — we're optimising for fast triage, not strict
+/// accuracy. Each signature maps to a known remediation action in the runbook
+/// at `docs/runbooks/constituency-csv-html-rejection.md` (to be added).
+#[must_use]
+pub fn classify_html_body(body: &str) -> &'static str {
+    let lower = body.to_ascii_lowercase();
+    if lower.contains("cloudflare")
+        || lower.contains("checking your browser")
+        || lower.contains("attention required")
+        || lower.contains("ray id")
+        || lower.contains("cf-ray")
+    {
+        "cloudflare"
+    } else if lower.contains("not found")
+        || lower.contains("404")
+        || lower.contains("page not found")
+    {
+        "missing"
+    } else if lower.contains("internal server error")
+        || lower.contains("503")
+        || lower.contains("service unavailable")
+    {
+        "server_error"
+    } else {
+        "unknown"
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -195,6 +240,80 @@ mod tests {
             "Referer header must be set on the single CSV request — \
              niftyindices.com returns HTML without it"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // classify_html_body — operator triage tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_classify_html_body_cloudflare_challenge_is_detected() {
+        let body = r#"<!DOCTYPE html><html><head><title>Just a moment...</title></head><body>Checking your browser before accessing niftyindices.com. This process is automatic. Cloudflare Ray ID: 8a1b2c3d4e5f6a7b</body></html>"#;
+        assert_eq!(classify_html_body(body), "cloudflare");
+    }
+
+    #[test]
+    fn test_classify_html_body_attention_required_is_cloudflare() {
+        let body = r#"<html><title>Attention Required!</title><body>Please solve the captcha.</body></html>"#;
+        assert_eq!(classify_html_body(body), "cloudflare");
+    }
+
+    #[test]
+    fn test_classify_html_body_cf_ray_alone_is_cloudflare() {
+        let body = r#"<html><head><meta name="cf-ray" content="xxx"></head></html>"#;
+        assert_eq!(classify_html_body(body), "cloudflare");
+    }
+
+    #[test]
+    fn test_classify_html_body_404_is_missing() {
+        let body = r#"<!DOCTYPE html><html><head><title>404 Not Found</title></head><body>Page not found</body></html>"#;
+        assert_eq!(classify_html_body(body), "missing");
+    }
+
+    #[test]
+    fn test_classify_html_body_page_not_found_is_missing() {
+        let body = r#"<html><body>Sorry, this page not found</body></html>"#;
+        assert_eq!(classify_html_body(body), "missing");
+    }
+
+    #[test]
+    fn test_classify_html_body_503_is_server_error() {
+        let body = r#"<html><title>503 Service Unavailable</title></html>"#;
+        assert_eq!(classify_html_body(body), "server_error");
+    }
+
+    #[test]
+    fn test_classify_html_body_internal_error_is_server_error() {
+        let body = r#"<html><body>Internal Server Error</body></html>"#;
+        assert_eq!(classify_html_body(body), "server_error");
+    }
+
+    #[test]
+    fn test_classify_html_body_generic_html_is_unknown() {
+        let body = r#"<html><body>Some random HTML page content</body></html>"#;
+        assert_eq!(classify_html_body(body), "unknown");
+    }
+
+    #[test]
+    fn test_classify_html_body_mixed_case_detected() {
+        // Real-world Cloudflare pages mix case freely; the classifier uses
+        // `to_ascii_lowercase` so nothing slips through.
+        let body = r#"<!DOCTYPE HTML><HTML><TITLE>CLOUDFLARE challenge</TITLE></HTML>"#;
+        assert_eq!(classify_html_body(body), "cloudflare");
+    }
+
+    #[test]
+    fn test_classify_html_body_empty_is_unknown() {
+        assert_eq!(classify_html_body(""), "unknown");
+    }
+
+    #[test]
+    fn test_classify_html_body_cloudflare_wins_over_404_when_both_present() {
+        // A Cloudflare challenge page that happens to render a 404-looking
+        // title should still classify as cloudflare — the operator needs
+        // to act on the rate-limit remediation, not change the slug.
+        let body = r#"<html><title>404</title><body>Cloudflare Ray ID: xxx</body></html>"#;
+        assert_eq!(classify_html_body(body), "cloudflare");
     }
 
     #[tokio::test]
