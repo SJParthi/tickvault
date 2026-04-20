@@ -608,6 +608,17 @@ impl TickPersistenceWriter {
         }
         self.dlq_ticks_total = self.dlq_ticks_total.saturating_add(1);
         metrics::counter!("tv_dlq_ticks_total").absolute(self.dlq_ticks_total);
+        // SLA counter: DLQ write means ring buffer AND disk spill both failed —
+        // the tick survived on disk as NDJSON but is NOT in QuestDB. From the
+        // operator's zero-tick-loss perspective this IS a loss (no time-series
+        // query will find it). Pairs with the spill-drop counter in
+        // `ws_frame_spill.rs`. Parthiban 2026-04-20.
+        metrics::counter!(
+            "tv_ticks_lost_total",
+            "source" => "dlq_fallback",
+            "ws_type" => "live_feed",
+        )
+        .increment(1);
         error!(
             security_id = tick.security_id,
             reason,

@@ -165,6 +165,18 @@ impl WsFrameSpill {
                     "ws_type" => ws_type.as_str()
                 )
                 .increment(1);
+                // SLA counter: every dropped frame is one tick-equivalent lost.
+                // Parthiban 2026-04-20: explicit metric so the zero-tick-loss
+                // invariant can be asserted in CI instead of inferred from a
+                // gap between `tv_ticks_processed_total` and
+                // `tv_ticks_persisted_total`. Labelled with the same `ws_type`
+                // so a Grafana heatmap can attribute losses per WebSocket.
+                metrics::counter!(
+                    "tv_ticks_lost_total",
+                    "source" => "spill_drop_critical",
+                    "ws_type" => ws_type.as_str(),
+                )
+                .increment(1);
                 AppendOutcome::Dropped
             }
             Err(TrySendError::Disconnected(_)) => AppendOutcome::Dropped,
@@ -336,6 +348,17 @@ pub fn replay_all<P: AsRef<Path>>(wal_dir: P) -> anyhow::Result<Vec<ReplayedFram
         corrupted_segments = corrupted,
         "WAL replay complete"
     );
+
+    // SLA counter: frames recovered from WAL on startup. Pair with
+    // `tv_ticks_lost_total` (from append) to show the complete
+    // zero-tick-loss picture on Grafana. If spill dropped 0 and
+    // replay recovered N, the guarantee held for the last N frames.
+    // Parthiban 2026-04-20.
+    metrics::counter!("tv_wal_replay_recovered_total").increment(frames.len() as u64);
+    if corrupted > 0 {
+        // APPROVED: cast — corrupted usize is O(segments) ≤ u64 always.
+        metrics::counter!("tv_wal_replay_corrupted_segments_total").increment(corrupted as u64);
+    }
 
     // Archive processed segments so we don't replay them twice.
     let archive_dir = wal_dir.join("archive");

@@ -58,6 +58,32 @@ fn walk_and_concat(dir: &Path, out: &mut String) {
 /// workspace source tree. The description column is the operator-facing
 /// meaning of the metric — it's what you'd put on the Grafana tooltip.
 const REQUIRED_METRICS: &[(&str, &str)] = &[
+    // --- Zero-Tick-Loss SLA (Parthiban 2026-04-20) ---
+    (
+        "tv_ticks_lost_total",
+        "Explicit zero-tick-loss SLA counter. Incremented from TWO sites: \
+         (1) `ws_frame_spill::append` when the WAL spill channel is full \
+         (source=\"spill_drop_critical\"); (2) `tick_persistence::write_to_dlq` \
+         when both ring buffer and disk spill failed (source=\"dlq_fallback\"). \
+         MUST be 0 in production. Labelled by `source` and `ws_type` so \
+         Grafana heatmaps can attribute losses per WebSocket. \
+         CI assertion: asserted == 0 in `zero_tick_loss_sla_guard` tests.",
+    ),
+    (
+        "tv_wal_replay_recovered_total",
+        "Count of frames recovered from the WAL on process startup \
+         (via `ws_frame_spill::replay_all`). Pair with `tv_ticks_lost_total` \
+         to show the complete zero-tick-loss picture: if spill dropped 0 and \
+         replay recovered N, the guarantee held for the last N frames. \
+         Incremented once per startup with the total replay count.",
+    ),
+    (
+        "tv_wal_replay_corrupted_segments_total",
+        "Count of WAL segments found corrupt during startup replay \
+         (CRC32 mismatch or truncated tail). MUST be 0 in production. \
+         Non-zero indicates disk corruption, abrupt kills mid-write, or \
+         tampering.",
+    ),
     // --- Session 1 (A2 dead-letter queue) ---
     (
         "tv_dlq_ticks_total",
