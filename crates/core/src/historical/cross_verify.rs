@@ -60,6 +60,30 @@ pub struct ViolationDetail {
 // Cross-Match Types — Historical vs Live comparison
 // ---------------------------------------------------------------------------
 
+/// Per-field delta for expanded Telegram display. One entry per differing
+/// OHLCV (+OI) field, carrying both sides' raw values and `live - hist`.
+/// Produced by `classify_cross_match_row` alongside `diff_summary` so the
+/// Telegram formatter can render one explicit line per field:
+///     `open      : hist=2847.50 live=2847.00  Δ=+0.50`
+/// (Pre-2026-04-20 formats conflated all deltas onto one `H(-1.5) V(+200)`
+/// line — concise but hard to scan at a glance when multiple fields move.)
+#[derive(Debug, Clone)]
+pub struct FieldDelta {
+    /// Full human-readable field name: "open", "high", "low", "close",
+    /// "volume", "open_interest". Kept long-form so Telegram rendering
+    /// is unambiguous — no "O vs OI" confusion.
+    pub field: String,
+    /// Value from Dhan REST historical fetch.
+    pub hist: f64,
+    /// Value from live WebSocket-sourced materialized view.
+    pub live: f64,
+    /// `live - hist`. Positive = live exceeds historical.
+    pub delta: f64,
+    /// Hint for renderer: `true` for volume/OI (format as integer),
+    /// `false` for OHLC prices (format with 2 decimals).
+    pub is_integer: bool,
+}
+
 /// A single candle mismatch between historical API data and live materialized view.
 #[derive(Debug, Clone)]
 pub struct CrossMatchMismatch {
@@ -80,6 +104,15 @@ pub struct CrossMatchMismatch {
     pub live_values: String,
     /// Field-level diff summary (e.g., "H(-1.5) V(-6500)").
     pub diff_summary: String,
+    /// Structured per-field deltas — one entry per differing field.
+    /// Empty for `missing_live` rows (no live values to compare).
+    /// Populated alongside `diff_summary` in `classify_cross_match_row`
+    /// so the Telegram formatter can render one line per field:
+    ///   `open      : hist=2847.50 live=2847.00  Δ=+0.50`
+    /// Complements the compact `diff_summary` (`"O(+0.50)"`) without
+    /// replacing it — both are surfaced in logs; Telegram renders the
+    /// expanded form for operator readability.
+    pub field_deltas: Vec<FieldDelta>,
 }
 
 /// Summary of historical vs live candle cross-match.
@@ -628,6 +661,20 @@ fn classify_cross_match_row(
         oi_mismatch,
     });
 
+    let field_deltas = build_field_deltas(
+        hist,
+        live,
+        &FieldDeltaFlags {
+            d_open,
+            d_high,
+            d_low,
+            d_close,
+            epsilon: CROSS_MATCH_PRICE_EPSILON,
+            volume_mismatch,
+            oi_mismatch,
+        },
+    );
+
     Some(CrossMatchMismatch {
         symbol: ctx.symbol,
         segment: ctx.segment,
@@ -637,7 +684,94 @@ fn classify_cross_match_row(
         hist_values: hist.format_with_oi(),
         live_values: live.format_with_oi(),
         diff_summary,
+        field_deltas,
     })
+}
+
+/// Flags driving `build_field_deltas` — mirrors `DiffSummaryParams` so both
+/// the compact summary and the expanded per-field delta list are computed
+/// from the same price/volume/OI deltas.
+struct FieldDeltaFlags {
+    d_open: f64,
+    d_high: f64,
+    d_low: f64,
+    d_close: f64,
+    epsilon: f64,
+    volume_mismatch: bool,
+    oi_mismatch: bool,
+}
+
+/// Produces one `FieldDelta` per differing OHLCV (+OI) field. Kept pure +
+/// mirrors `build_diff_summary` field ordering so Telegram output reads
+/// top-to-bottom in the same order as compact logs (open → high → low →
+/// close → volume → open_interest).
+fn build_field_deltas(
+    hist: CandleValues,
+    live: CandleValues,
+    flags: &FieldDeltaFlags,
+) -> Vec<FieldDelta> {
+    let mut out: Vec<FieldDelta> = Vec::new();
+    if flags.d_open.abs() > flags.epsilon {
+        out.push(FieldDelta {
+            field: "open".to_string(),
+            hist: hist.open,
+            live: live.open,
+            delta: flags.d_open,
+            is_integer: false,
+        });
+    }
+    if flags.d_high.abs() > flags.epsilon {
+        out.push(FieldDelta {
+            field: "high".to_string(),
+            hist: hist.high,
+            live: live.high,
+            delta: flags.d_high,
+            is_integer: false,
+        });
+    }
+    if flags.d_low.abs() > flags.epsilon {
+        out.push(FieldDelta {
+            field: "low".to_string(),
+            hist: hist.low,
+            live: live.low,
+            delta: flags.d_low,
+            is_integer: false,
+        });
+    }
+    if flags.d_close.abs() > flags.epsilon {
+        out.push(FieldDelta {
+            field: "close".to_string(),
+            hist: hist.close,
+            live: live.close,
+            delta: flags.d_close,
+            is_integer: false,
+        });
+    }
+    if flags.volume_mismatch {
+        // APPROVED: cast — volumes stored as i64, hist<=9e18 by volume-range invariant.
+        let h_vol_f = hist.volume as f64;
+        let m_vol_f = live.volume as f64;
+        out.push(FieldDelta {
+            field: "volume".to_string(),
+            hist: h_vol_f,
+            live: m_vol_f,
+            delta: m_vol_f - h_vol_f,
+            is_integer: true,
+        });
+    }
+    if flags.oi_mismatch {
+        // APPROVED: cast — OI stored as i64.
+        let h_oi_f = hist.oi as f64;
+        let m_oi_f = live.oi as f64;
+        out.push(FieldDelta {
+            field: "open_interest".to_string(),
+            hist: h_oi_f,
+            live: m_oi_f,
+            delta: m_oi_f - h_oi_f,
+            is_integer: true,
+        });
+    }
+    out
 }
 
 /// Builds a `CrossMatchMismatch` for when live data is missing.
@@ -651,6 +785,9 @@ fn build_missing_live_mismatch(ctx: CandleContext, hist: CandleValues) -> CrossM
         hist_values: hist.format_with_oi(),
         live_values: "[MISSING — no live data for this candle]".to_string(),
         diff_summary: String::new(),
+        // No live side to compare against → no per-field deltas.
+        // Renderer falls back to the compact Hist+Live format.
+        field_deltas: Vec::new(),
     }
 }
 
@@ -1943,9 +2080,26 @@ mod tests {
             hist_values: "O=3520.0 H=3535.0 L=3518.0 C=3530.0 V=45000".to_string(),
             live_values: "O=3520.0 H=3535.0 L=3518.0 C=3528.5 V=42100".to_string(),
             diff_summary: "C(-1.5) V(-2900)".to_string(),
+            field_deltas: vec![
+                FieldDelta {
+                    field: "close".to_string(),
+                    hist: 3530.0,
+                    live: 3528.5,
+                    delta: -1.5,
+                    is_integer: false,
+                },
+                FieldDelta {
+                    field: "volume".to_string(),
+                    hist: 45000.0,
+                    live: 42100.0,
+                    delta: -2900.0,
+                    is_integer: true,
+                },
+            ],
         };
         assert_eq!(mismatch.mismatch_type, "price_diff");
         assert!(mismatch.diff_summary.contains("C(-1.5)"));
+        assert_eq!(mismatch.field_deltas.len(), 2);
     }
 
     #[test]
@@ -1959,9 +2113,13 @@ mod tests {
             hist_values: "O=23480.0 H=23510.0 L=23475.0 C=23505.0 V=0".to_string(),
             live_values: "[MISSING — no live data for this candle]".to_string(),
             diff_summary: String::new(),
+            // missing_live rows carry no per-field deltas — renderer
+            // falls back to the compact Hist+Live format.
+            field_deltas: Vec::new(),
         };
         assert_eq!(mismatch.mismatch_type, "missing_live");
         assert!(mismatch.live_values.contains("MISSING"));
+        assert!(mismatch.field_deltas.is_empty());
     }
 
     #[test]
