@@ -32,6 +32,7 @@ pub mod materialized_views;
 pub mod movers_persistence;
 pub mod obi_persistence;
 pub mod partition_manager;
+pub mod phase2_subscription_marker;
 pub mod questdb_health;
 pub mod tick_persistence;
 pub mod valkey_cache;
