@@ -720,7 +720,7 @@ mod tests {
     }
 
     #[test]
-    fn atmids_fill_display_names_from_universe_populates_both_sides() {
+    fn test_fill_display_names_from_universe_atmids_populates_both_sides() {
         use std::collections::HashMap;
         use tickvault_common::instrument_types::{
             DerivativeContract, DhanInstrumentKind, FnoUniverse, UniverseBuildMetadata,
@@ -815,7 +815,7 @@ mod tests {
     }
 
     #[test]
-    fn fill_display_names_uses_registry_display_name() {
+    fn test_fill_display_names_from_universe_uses_registry_display_name() {
         use std::collections::HashMap;
         use tickvault_common::instrument_types::{
             DerivativeContract, DhanInstrumentKind, FnoUniverse, UniverseBuildMetadata,
