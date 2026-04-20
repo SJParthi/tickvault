@@ -38,6 +38,9 @@ use std::sync::Arc;
 
 use chrono::{FixedOffset, TimeZone, Timelike, Utc};
 use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
+use tickvault_common::instrument_types::{FnoUniverse, UnderlyingKind};
+use tickvault_common::tick_types::ParsedTick;
+use tickvault_common::types::ExchangeSegment;
 use tokio::sync::RwLock;
 
 /// Number of one-minute slots captured in the pre-open window (09:08..=09:12).
@@ -162,7 +165,6 @@ pub async fn snapshot(buffer: &SharedPreOpenBuffer) -> HashMap<String, PreOpenCl
 /// snapshot window (09:08..09:13 IST). The snapshotter task uses this to
 /// gate work outside the window per audit-findings Rule 3.
 #[must_use]
-// WIRING-EXEMPT: slice-1 helper — snapshotter task in slice-2 of this branch.
 pub fn is_within_preopen_window() -> bool {
     // `IST_UTC_OFFSET_SECONDS` (19800) is well within `FixedOffset::east_opt`'s
     // accepted range (±86_400), so `None` is structurally unreachable — but we
@@ -176,6 +178,117 @@ pub fn is_within_preopen_window() -> bool {
         + now_ist.time().minute() * 60
         + now_ist.time().second()) as u32;
     minute_index_for_ist_seconds(sec_of_day).is_some()
+}
+
+// ---------------------------------------------------------------------------
+// Snapshotter — tick-broadcast filter for F&O stock pre-open prices
+// ---------------------------------------------------------------------------
+
+/// Reason a tick was rejected by the snapshotter — kept as a typed
+/// enum so we can label the Prometheus filtered counter without
+/// allocating a `String` on the hot path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotterFilterReason {
+    /// Tick was on a segment other than NSE_EQ — depth, derivatives,
+    /// indices, etc. all live on different segments.
+    WrongSegment,
+    /// Tick was on NSE_EQ but the security_id doesn't belong to any
+    /// F&O stock underlying in the universe (e.g. cash-only equity).
+    NotFnoStock,
+    /// Tick was on the right segment + an F&O stock, but its IST
+    /// wall-clock minute was outside the 09:08..09:12 capture window.
+    WrongMinute,
+}
+
+impl SnapshotterFilterReason {
+    /// Static label for Prometheus — must NOT allocate.
+    #[must_use]
+    pub fn as_label(&self) -> &'static str {
+        match self {
+            Self::WrongSegment => "wrong_segment",
+            Self::NotFnoStock => "not_fno_stock",
+            Self::WrongMinute => "wrong_minute",
+        }
+    }
+}
+
+/// Outcome of feeding one tick into the snapshotter.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SnapshotterOutcome {
+    /// Tick was buffered into the matching minute slot.
+    Buffered { symbol: String, minute_index: usize },
+    /// Tick was rejected — caller increments the corresponding counter.
+    Filtered(SnapshotterFilterReason),
+}
+
+/// Builds a `(security_id, exchange_segment)` → underlying-symbol lookup
+/// table for every F&O **stock** in the universe. Indices are excluded
+/// because Phase 2 only subscribes stock F&O — index option chains are
+/// already handled in Phase 1.
+///
+/// Per `.claude/rules/project/security-id-uniqueness.md` (Rule I-P1-11),
+/// the key MUST be `(security_id, segment)`, not `security_id` alone.
+///
+/// O(1) EXEMPT: boot-time lookup table, ~200 entries.
+#[must_use]
+pub fn build_fno_stock_lookup(universe: &FnoUniverse) -> HashMap<(u32, ExchangeSegment), String> {
+    let mut out: HashMap<(u32, ExchangeSegment), String> =
+        HashMap::with_capacity(universe.underlyings.len());
+    for (symbol, ul) in &universe.underlyings {
+        if ul.kind != UnderlyingKind::Stock {
+            continue;
+        }
+        out.insert(
+            (ul.price_feed_security_id, ul.price_feed_segment),
+            symbol.clone(),
+        );
+    }
+    out
+}
+
+/// Pure synchronous classifier — given a parsed tick + the lookup
+/// table built by `build_fno_stock_lookup`, decide whether the tick
+/// should be buffered (and into which minute slot) or filtered.
+///
+/// Pure function = no I/O, no async, no allocation on the buffer
+/// path. Caller is responsible for actually writing to the
+/// `SharedPreOpenBuffer` and incrementing the metrics.
+#[must_use]
+pub fn classify_tick(
+    tick: &ParsedTick,
+    fno_stock_lookup: &HashMap<(u32, ExchangeSegment), String>,
+) -> SnapshotterOutcome {
+    // Step 1: segment filter — F&O stocks live on NSE_EQ for the
+    // price feed (per `FnoUnderlying.price_feed_segment`).
+    let Some(seg) = ExchangeSegment::from_byte(tick.exchange_segment_code) else {
+        return SnapshotterOutcome::Filtered(SnapshotterFilterReason::WrongSegment);
+    };
+    if seg != ExchangeSegment::NseEquity {
+        return SnapshotterOutcome::Filtered(SnapshotterFilterReason::WrongSegment);
+    }
+
+    // Step 2: F&O-stock membership check. Composite key per I-P1-11.
+    let Some(symbol) = fno_stock_lookup.get(&(tick.security_id, seg)) else {
+        return SnapshotterOutcome::Filtered(SnapshotterFilterReason::NotFnoStock);
+    };
+
+    // Step 3: minute-window check. ParsedTick.exchange_timestamp is
+    // an IST epoch second (Dhan convention — see `live-market-feed.md`
+    // rule 14, LTT fields are IST). Treat 0 as "no timestamp".
+    if tick.exchange_timestamp == 0 {
+        return SnapshotterOutcome::Filtered(SnapshotterFilterReason::WrongMinute);
+    }
+    // Convert IST epoch → UTC epoch for our existing helper, which
+    // adds the IST offset back internally.
+    let utc_epoch =
+        i64::from(tick.exchange_timestamp).saturating_sub(i64::from(IST_UTC_OFFSET_SECONDS));
+    let Some(minute_index) = minute_index_for_utc_epoch(utc_epoch) else {
+        return SnapshotterOutcome::Filtered(SnapshotterFilterReason::WrongMinute);
+    };
+    SnapshotterOutcome::Buffered {
+        symbol: symbol.clone(),
+        minute_index,
+    }
 }
 
 // ---------------------------------------------------------------------------
