@@ -1089,11 +1089,14 @@ impl WebSocketConnection {
             return false;
         }
 
-        // Post-market guard: if current IST time is outside [09:00, 15:30) AND
-        // we've had 3+ consecutive failures, stop reconnecting. During market
-        // hours, Dhan streams data + pings every 10s, so consecutive failures
-        // mean a real problem worth retrying. After market close, silence is
-        // EXPECTED — retrying just spams Telegram with disconnect/reconnect.
+        // Post-market guard: if current IST time is AT OR AFTER 15:30 IST AND
+        // we've had 3+ consecutive failures, stop reconnecting. Pre-market
+        // (< 09:00 IST) keeps retrying indefinitely because Dhan idle-resets
+        // TCP connections between 00:00 and 09:00 IST but opens up at the
+        // pre-open session start (09:00) — giving up pre-market then forces
+        // a process restart after the pool watchdog's 300s halt, which blocks
+        // boot at 09:15 IST when the subscription planner is not yet trimmed
+        // (see Bug A/B/C fix note in claude/fix-market-hours-guards).
         //
         // Only applies to infinite-retry mode (reconnect_max_attempts == 0,
         // the production default). When an explicit finite budget is set
@@ -1105,22 +1108,21 @@ impl WebSocketConnection {
                 tickvault_common::constants::IST_UTC_OFFSET_SECONDS,
             )))
             .rem_euclid(86400) as u32;
-            let raw_outside_market = now_ist_secs_of_day
-                < tickvault_common::constants::TICK_PERSIST_START_SECS_OF_DAY_IST
-                || now_ist_secs_of_day
-                    >= tickvault_common::constants::TICK_PERSIST_END_SECS_OF_DAY_IST;
+            // POST-close only — pre-open keeps retrying.
+            let raw_post_close = now_ist_secs_of_day
+                >= tickvault_common::constants::TICK_PERSIST_END_SECS_OF_DAY_IST;
             // Test-only escape hatch so the "infinite retries math" path
             // can be exercised by `cargo test` regardless of wall-clock.
             #[cfg(test)]
-            let outside_market = raw_outside_market
+            let post_close = raw_post_close
                 && !TEST_FORCE_IN_MARKET_HOURS.load(std::sync::atomic::Ordering::Relaxed);
             #[cfg(not(test))]
-            let outside_market = raw_outside_market;
-            if outside_market {
+            let post_close = raw_post_close;
+            if post_close {
                 info!(
                     connection_id = self.connection_id,
                     attempt,
-                    "Post-market: stopping reconnect after {attempt} failures — market is closed, reconnect is pointless"
+                    "Post-close (>=15:30 IST): stopping reconnect after {attempt} failures — market is closed"
                 );
                 return false;
             }

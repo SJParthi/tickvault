@@ -15,10 +15,32 @@ use tracing::{error, info};
 
 use tickvault_common::config::{DhanConfig, WebSocketConfig};
 use tickvault_common::constants::{
-    MAX_INSTRUMENTS_PER_WEBSOCKET_CONNECTION, MAX_WEBSOCKET_CONNECTIONS,
+    IST_UTC_OFFSET_SECONDS, MAX_INSTRUMENTS_PER_WEBSOCKET_CONNECTION, MAX_WEBSOCKET_CONNECTIONS,
+    SECONDS_PER_DAY, TICK_PERSIST_END_SECS_OF_DAY_IST, TICK_PERSIST_START_SECS_OF_DAY_IST,
 };
 use tickvault_common::types::FeedMode;
 use tickvault_storage::ws_frame_spill::WsFrameSpill;
+
+/// Bug B fix (2026-04-20): market-hours gate for pool watchdog verdicts.
+///
+/// Returns `true` iff the current wall-clock IST time is inside the
+/// trading window `[09:00, 15:30) IST`. Outside this window the pool
+/// watchdog MUST NOT escalate Degraded/Halt to ERROR or exit the
+/// process — Dhan routinely resets idle TCP connections in the 00:00
+/// to 09:00 window, which is normal and should not trigger supervisor
+/// restart loops.
+///
+/// Follows the same pattern as
+/// `depth_rebalancer::is_within_market_hours_ist` (audit-findings
+/// Rule 3 — "all background workers must be market-hours aware").
+#[must_use]
+fn pool_watchdog_is_within_market_hours() -> bool {
+    let now_utc = chrono::Utc::now().timestamp();
+    let now_ist = now_utc.saturating_add(i64::from(IST_UTC_OFFSET_SECONDS));
+    let sec_of_day = now_ist.rem_euclid(i64::from(SECONDS_PER_DAY)) as u32;
+    // O(1) EXEMPT: Range::contains is two integer comparisons, NOT Vec::contains.
+    (TICK_PERSIST_START_SECS_OF_DAY_IST..TICK_PERSIST_END_SECS_OF_DAY_IST).contains(&sec_of_day)
+}
 
 use crate::auth::TokenHandle;
 use crate::websocket::connection::WebSocketConnection;
@@ -459,22 +481,49 @@ impl WebSocketConnectionPool {
                 metrics::gauge!("tv_pool_degraded_seconds").set(down_for.as_secs_f64());
             }
             WatchdogVerdict::Degraded { down_for } => {
-                tracing::error!(
-                    down_for_secs = down_for.as_secs(),
-                    "A4 CRITICAL: WebSocket pool has been FULLY DEGRADED for >60s — ALL connections \
-                     are Reconnecting/Disconnected, no market data flowing. Investigate Dhan \
-                     server status, token validity, network reachability."
-                );
+                // Bug B fix (2026-04-20): gate Degraded ERROR by market hours.
+                // Pre-market (< 09:00 IST) Dhan idle-resets all TCP connections;
+                // firing ERROR → Telegram fires a false alarm during the normal
+                // 07:00-09:00 reset window and the operator's inbox is spammed.
+                // Outside market hours we log at INFO level only (dashboard +
+                // metric still updated so operators can see the signal).
+                if pool_watchdog_is_within_market_hours() {
+                    tracing::error!(
+                        down_for_secs = down_for.as_secs(),
+                        "A4 CRITICAL: WebSocket pool has been FULLY DEGRADED for >60s — ALL connections \
+                         are Reconnecting/Disconnected, no market data flowing. Investigate Dhan \
+                         server status, token validity, network reachability."
+                    );
+                } else {
+                    tracing::info!(
+                        down_for_secs = down_for.as_secs(),
+                        "A4: pool degraded outside market hours (09:00-15:30 IST) — downgraded to INFO \
+                         (Dhan routinely resets idle connections pre-market)"
+                    );
+                }
                 metrics::counter!("tv_pool_degraded_alerts_total").increment(1);
                 metrics::gauge!("tv_pool_degraded_seconds").set(down_for.as_secs_f64());
             }
             WatchdogVerdict::Halt { down_for } => {
-                tracing::error!(
-                    down_for_secs = down_for.as_secs(),
-                    "A4 FATAL: WebSocket pool has been FULLY DEGRADED for >300s — initiating process \
-                     halt so supervisor can restart us. If this fires repeatedly, Dhan is likely \
-                     unreachable or the account/token is locked."
-                );
+                // Bug B fix (2026-04-20): gate Halt ERROR by market hours.
+                // The 08:38 AM IST halt that blocked the 09:15 IST restart was
+                // caused by this ERROR firing pre-market. Outside market hours
+                // we demote Halt to INFO — the downstream supervisor no longer
+                // force-exits the process (see main.rs:3789 for the matching
+                // verdict handler which also checks market-hours post-fix).
+                if pool_watchdog_is_within_market_hours() {
+                    tracing::error!(
+                        down_for_secs = down_for.as_secs(),
+                        "A4 FATAL: WebSocket pool has been FULLY DEGRADED for >300s — initiating process \
+                         halt so supervisor can restart us. If this fires repeatedly, Dhan is likely \
+                         unreachable or the account/token is locked."
+                    );
+                } else {
+                    tracing::info!(
+                        down_for_secs = down_for.as_secs(),
+                        "A4: pool halt verdict outside market hours — downgraded to INFO (no process exit)"
+                    );
+                }
                 metrics::counter!("tv_pool_halts_total").increment(1);
                 metrics::gauge!("tv_pool_degraded_seconds").set(down_for.as_secs_f64());
             }
