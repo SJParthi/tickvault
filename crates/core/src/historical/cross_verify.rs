@@ -1151,6 +1151,44 @@ pub async fn cross_match_historical_vs_live(
     let ts_filter = today_window.where_clause();
     let ts_filter_h = today_window.where_clause_aliased("h");
 
+    // First-fetch gate (Parthiban directive, 2026-04-20): if today's live
+    // `candles_1m` view has ZERO rows, there is nothing meaningful to
+    // compare against — it's a first fetch, a fresh DB, or a post-market
+    // boot before the next session. Skip the entire cross-match with a
+    // clear `live_candles_present = false` signal so the caller emits the
+    // typed SKIPPED Telegram notification instead of running the full
+    // LEFT-JOIN pipeline against an empty live side (which would "succeed"
+    // vacuously with zero rows compared).
+    //
+    // The cheaper `candles_1m` probe is authoritative — if 1m is empty, no
+    // higher timeframe can possibly have data.
+    let live_probe_query = format!("SELECT count() FROM candles_1m WHERE {ts_filter}");
+    let live_probe_rows = extract_count(&client, &base_url, &live_probe_query).await;
+    if live_probe_rows == 0 {
+        info!(
+            today_ist = %today_window.today_ist,
+            window_start = %today_window.start_sql,
+            window_end = %today_window.end_sql,
+            "cross-match SKIPPED — zero live 1m candles for today's window \
+             (first fetch / fresh DB / pre-live-data boot)"
+        );
+        return CrossMatchReport {
+            timeframes_checked: 0,
+            candles_compared: 0,
+            mismatches: 0,
+            missing_live: 0,
+            missing_historical: 0,
+            oi_mismatches: 0,
+            mismatch_details: Vec::new(),
+            missing_views: Vec::new(),
+            per_timeframe_mismatches: Vec::new(),
+            passed: false,
+            // `false` → caller's main.rs:4285 branch fires the typed
+            // `CandleCrossMatchSkipped` Telegram notification.
+            live_candles_present: false,
+        };
+    }
+
     let mut total_compared = 0_usize;
     let mut total_mismatches = 0_usize;
     let mut total_missing_live = 0_usize;
