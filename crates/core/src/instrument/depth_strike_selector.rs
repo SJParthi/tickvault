@@ -720,6 +720,101 @@ mod tests {
     }
 
     #[test]
+    fn atmids_fill_display_names_from_universe_populates_both_sides() {
+        use std::collections::HashMap;
+        use tickvault_common::instrument_types::{
+            DerivativeContract, DhanInstrumentKind, FnoUniverse, UniverseBuildMetadata,
+        };
+        use tickvault_common::types::{ExchangeSegment, OptionType};
+
+        let expiry = NaiveDate::from_ymd_opt(2026, 4, 28).unwrap();
+        let mut derivative_contracts = HashMap::new();
+        let mk = |sid: u32, strike: f64, ot: OptionType, dn: &str, sn: &str| DerivativeContract {
+            security_id: sid,
+            underlying_symbol: "BANKNIFTY".to_string(),
+            instrument_kind: DhanInstrumentKind::OptionIndex,
+            exchange_segment: ExchangeSegment::NseFno,
+            expiry_date: expiry,
+            strike_price: strike,
+            option_type: Some(ot),
+            lot_size: 15,
+            tick_size: 0.05,
+            symbol_name: sn.to_string(),
+            display_name: dn.to_string(),
+        };
+        derivative_contracts.insert(
+            67480_u32,
+            mk(
+                67480,
+                54300.0,
+                OptionType::Call,
+                "BANKNIFTY 28 APR 54300 CALL",
+                "BANKNIFTY-Apr2026-54300-CE",
+            ),
+        );
+        derivative_contracts.insert(
+            67481_u32,
+            mk(
+                67481,
+                54300.0,
+                OptionType::Put,
+                "BANKNIFTY 28 APR 54300 PUT",
+                "BANKNIFTY-Apr2026-54300-PE",
+            ),
+        );
+        let universe = FnoUniverse {
+            underlyings: HashMap::new(),
+            derivative_contracts,
+            instrument_info: HashMap::new(),
+            option_chains: HashMap::new(),
+            expiry_calendars: HashMap::new(),
+            subscribed_indices: Vec::new(),
+            build_metadata: UniverseBuildMetadata {
+                csv_source: "test".to_string(),
+                csv_row_count: 0,
+                parsed_row_count: 0,
+                index_count: 0,
+                equity_count: 0,
+                underlying_count: 0,
+                derivative_count: 0,
+                option_chain_count: 0,
+                build_duration: std::time::Duration::ZERO,
+                build_timestamp: chrono::Utc::now()
+                    .with_timezone(&chrono::FixedOffset::east_opt(19_800).unwrap()),
+            },
+        };
+
+        let mut atm = AtmIds {
+            ce_id: 67480,
+            pe_id: Some(67481),
+            strike: 54300.0,
+            ce_display_name: None,
+            pe_display_name: None,
+        };
+        atm.fill_display_names_from_universe(&universe);
+        assert_eq!(
+            atm.ce_display_name.as_deref(),
+            Some("BANKNIFTY 28 APR 54300 CALL")
+        );
+        assert_eq!(
+            atm.pe_display_name.as_deref(),
+            Some("BANKNIFTY 28 APR 54300 PUT")
+        );
+
+        // No registry entry → display_name stays None (no panic).
+        let mut missing = AtmIds {
+            ce_id: 99999,
+            pe_id: Some(99998),
+            strike: 99999.0,
+            ce_display_name: None,
+            pe_display_name: None,
+        };
+        missing.fill_display_names_from_universe(&universe);
+        assert_eq!(missing.ce_display_name, None);
+        assert_eq!(missing.pe_display_name, None);
+    }
+
+    #[test]
     fn fill_display_names_uses_registry_display_name() {
         use std::collections::HashMap;
         use tickvault_common::instrument_types::{
