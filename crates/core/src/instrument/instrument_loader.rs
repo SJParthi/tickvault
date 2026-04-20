@@ -317,7 +317,10 @@ async fn load_from_cache_or_emergency_download(
 
             write_freshness_marker(cache_dir);
 
-            error!(
+            // I-P0-06: the FAILURE to find cache is CRITICAL (logged above at line 290).
+            // The successful recovery is WARN — visible for investigation but does NOT
+            // re-trigger Telegram (that already fired on the cache-missing ERROR).
+            warn!(
                 derivatives = universe.derivative_contracts.len(),
                 "emergency download succeeded — instruments loaded (investigate why cache was missing)"
             );

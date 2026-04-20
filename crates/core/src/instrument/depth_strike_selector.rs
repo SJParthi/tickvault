@@ -27,12 +27,44 @@ pub const DEPTH_REBALANCE_STRIKE_THRESHOLD: usize = 3;
 pub struct DepthStrikeSelection {
     /// The ATM strike price selected.
     pub atm_strike: f64,
-    /// Security IDs of selected call options (ATM ± N).
+    /// Security IDs of selected call options (ATM ± N), sorted by strike
+    /// ascending. `call_security_ids.first()` is the LOWEST strike in the
+    /// range (ATM − N), NOT the ATM strike. For the exact ATM pair use
+    /// `atm_ce_security_id` / `atm_pe_security_id` below.
     pub call_security_ids: Vec<SecurityId>,
-    /// Security IDs of selected put options (ATM ± N).
+    /// Security IDs of selected put options (ATM ± N), sorted by strike
+    /// ascending. See caveat above on `call_security_ids.first()`.
     pub put_security_ids: Vec<SecurityId>,
     /// All security IDs combined (calls + puts), ready for subscription.
     pub all_security_ids: Vec<SecurityId>,
+    /// Security ID of the CE contract AT the ATM strike (not the range-start).
+    /// `None` only if the chain is empty at the ATM index (should never happen
+    /// for a non-empty chain returned by `select_atm_strikes`).
+    ///
+    /// **Use this — NOT `call_security_ids.first()` — when building the
+    /// Telegram / log label for the ATM contract.** Getting these mixed up
+    /// produces a label/security_id mismatch (e.g. label says
+    /// `BANKNIFTY-Apr2026-56700-PE` while the security_id actually points
+    /// at `BANKNIFTY-Apr2026-54300-PE`), which poisons operator triage.
+    pub atm_ce_security_id: Option<SecurityId>,
+    /// Security ID of the PE contract AT the ATM strike (not the range-start).
+    /// `None` if no put exists at the exact ATM strike.
+    pub atm_pe_security_id: Option<SecurityId>,
+    /// Dhan CSV `display_name` for the ATM CE contract (e.g.
+    /// `"BANKNIFTY 28 APR 54300 CALL"`). Populated by
+    /// [`select_depth_instruments`] from
+    /// `FnoUniverse::derivative_contracts`. `None` if the registry lookup
+    /// fails (degrade gracefully — caller should fall back to the
+    /// synthesized `UNDERLYING-MmmYYYY-STRIKE-SIDE` label).
+    ///
+    /// Prefer this over the synthesized label in operator-facing surfaces
+    /// (Telegram, logs) because it matches exactly what Dhan's web UI and
+    /// order book show.
+    pub atm_ce_display_name: Option<String>,
+    /// Dhan CSV `display_name` for the ATM PE contract (e.g.
+    /// `"BANKNIFTY 28 APR 54300 PUT"`). Same semantics as
+    /// `atm_ce_display_name` above.
+    pub atm_pe_display_name: Option<String>,
     /// The underlying symbol these belong to.
     pub underlying_symbol: String,
     /// The expiry date of the selected chain.
@@ -67,6 +99,16 @@ pub fn select_atm_strikes(
     let atm_idx = find_atm_index(&chain.calls, spot_price);
     let atm_strike = chain.calls[atm_idx].strike_price;
 
+    // Capture the EXACT ATM CE + PE security IDs BEFORE the range expansion.
+    // Using `call_security_ids.first()` downstream would return the lowest
+    // strike in the range (ATM − N), not the ATM itself — a real bug that
+    // previously produced Telegram alerts like
+    // `BANKNIFTY-Apr2026-56700-PE (SID 67481)` where the SID actually
+    // pointed at strike 54300. The two identities are kept here so every
+    // caller can reliably grab the ATM pair without re-deriving it.
+    let atm_ce_security_id = Some(chain.calls[atm_idx].security_id);
+    let atm_pe_security_id = find_put_at_strike(&chain.puts, atm_strike).map(|p| p.security_id);
+
     // Select range: [atm_idx - N, atm_idx + N] clamped to chain bounds.
     let start = atm_idx.saturating_sub(strikes_each_side);
     let end = (atm_idx + strikes_each_side + 1).min(chain.calls.len());
@@ -92,9 +134,40 @@ pub fn select_atm_strikes(
         call_security_ids: call_ids,
         put_security_ids: put_ids,
         all_security_ids: all_ids,
+        atm_ce_security_id,
+        atm_pe_security_id,
+        // Filled in by `select_depth_instruments` (which has registry access)
+        // or by `fill_display_names_from_universe` for direct callers. Left
+        // as None here because `OptionChain` does not carry display_name.
+        atm_ce_display_name: None,
+        atm_pe_display_name: None,
         underlying_symbol: chain.underlying_symbol.clone(),
         expiry_date: chain.expiry_date,
     })
+}
+
+impl DepthStrikeSelection {
+    /// Populates `atm_ce_display_name` / `atm_pe_display_name` by looking
+    /// up the ATM security IDs in the universe's `derivative_contracts`
+    /// map. Idempotent — calling twice is safe.
+    ///
+    /// Used so that Telegram alerts and operator logs show the exact
+    /// Dhan-UI label (`"BANKNIFTY 28 APR 54300 PUT"`) instead of the
+    /// synthesized `symbol_name` (`"BANKNIFTY-Apr2026-54300-PE"`). The
+    /// two can be misleading to an operator scanning the web terminal in
+    /// parallel with Telegram.
+    pub fn fill_display_names_from_universe(&mut self, universe: &FnoUniverse) {
+        if let Some(sid) = self.atm_ce_security_id
+            && let Some(contract) = universe.derivative_contracts.get(&sid)
+        {
+            self.atm_ce_display_name = Some(contract.display_name.clone());
+        }
+        if let Some(sid) = self.atm_pe_security_id
+            && let Some(contract) = universe.derivative_contracts.get(&sid)
+        {
+            self.atm_pe_display_name = Some(contract.display_name.clone());
+        }
+    }
 }
 
 /// Selects depth strikes for multiple underlyings from the FnoUniverse.
@@ -161,10 +234,18 @@ pub fn select_depth_instruments(
         };
 
         // Select ATM ± N strikes
-        if let Some(selection) = select_atm_strikes(chain, spot, strikes_each_side) {
+        if let Some(mut selection) = select_atm_strikes(chain, spot, strikes_each_side) {
+            // Enrich with Dhan CSV `display_name` so every downstream
+            // operator surface (Telegram alert, info log, web panel) can
+            // show the exact string Dhan's UI shows for the same contract.
+            selection.fill_display_names_from_universe(universe);
             tracing::info!(
                 symbol,
                 atm_strike = selection.atm_strike,
+                atm_ce_sid = ?selection.atm_ce_security_id,
+                atm_pe_sid = ?selection.atm_pe_security_id,
+                atm_ce_display = ?selection.atm_ce_display_name,
+                atm_pe_display = ?selection.atm_pe_display_name,
                 calls = selection.call_security_ids.len(),
                 puts = selection.put_security_ids.len(),
                 total = selection.all_security_ids.len(),
@@ -200,7 +281,7 @@ pub fn should_rebalance(
 
 /// ATM contract identifiers at a given spot price — CE + PE security IDs
 /// and the actual ATM strike price from the chain (not the raw spot price).
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AtmIds {
     /// CE security ID at ATM strike.
     pub ce_id: u32,
@@ -208,6 +289,30 @@ pub struct AtmIds {
     pub pe_id: Option<u32>,
     /// The actual strike price in the chain closest to spot.
     pub strike: f64,
+    /// Dhan CSV `display_name` for the CE contract, if the caller enriches
+    /// via [`AtmIds::fill_display_names_from_universe`]. `None` from bare
+    /// [`find_atm_security_ids`] which has no registry access.
+    pub ce_display_name: Option<String>,
+    /// Dhan CSV `display_name` for the PE contract. Same semantics as above.
+    pub pe_display_name: Option<String>,
+}
+
+impl AtmIds {
+    /// Populates `ce_display_name` / `pe_display_name` from the universe's
+    /// `derivative_contracts` map. Idempotent. Used so that rebalancer
+    /// Telegram messages can show the exact Dhan web-UI label
+    /// (e.g. `"BANKNIFTY 28 APR 54300 PUT"`) instead of the synthesized
+    /// `UNDERLYING-MmmYYYY-STRIKE-SIDE` format.
+    pub fn fill_display_names_from_universe(&mut self, universe: &FnoUniverse) {
+        if let Some(contract) = universe.derivative_contracts.get(&self.ce_id) {
+            self.ce_display_name = Some(contract.display_name.clone());
+        }
+        if let Some(pe_id) = self.pe_id
+            && let Some(contract) = universe.derivative_contracts.get(&pe_id)
+        {
+            self.pe_display_name = Some(contract.display_name.clone());
+        }
+    }
 }
 
 /// Returns the CE and PE security IDs + actual strike at the ATM nearest to `spot_price`.
@@ -226,6 +331,8 @@ pub fn find_atm_security_ids(chain: &OptionChain, spot_price: f64) -> Option<Atm
         ce_id,
         pe_id,
         strike,
+        ce_display_name: None,
+        pe_display_name: None,
     })
 }
 
@@ -543,6 +650,186 @@ mod tests {
             future_security_id: None,
         };
         assert!(find_atm_security_ids(&chain, 23200.0).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: ATM CE/PE security_id fields must point at the ACTUAL ATM
+    // strike, not the lowest strike in the ATM ± N range. This is the bug
+    // that produced Telegram alerts like "BANKNIFTY-Apr2026-56700-PE (SID
+    // 67481)" where the SID actually pointed at strike 54300 (range-first,
+    // not ATM). The fix moved off `.first()` onto dedicated fields.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn atm_ce_security_id_is_exact_atm_not_range_first() {
+        // 49 strikes (ATM ± 24) — mirrors production DEPTH_ATM_STRIKES_EACH_SIDE.
+        // ATM is at index 24 of the 49-element range.
+        let strikes: Vec<f64> = (0..49).map(|i| 54000.0 + (i as f64) * 100.0).collect();
+        let chain = make_chain(
+            &strikes,
+            "BANKNIFTY",
+            NaiveDate::from_ymd_opt(2026, 4, 28).unwrap(),
+        );
+
+        // Spot near strike 56400 → ATM should be 56400 (index 24).
+        let selection = select_atm_strikes(&chain, 56400.0, 24).unwrap();
+
+        // ATM strike is 56400, and the CE security_id from make_chain is 10000 + 24 = 10024.
+        assert!((selection.atm_strike - 56400.0).abs() < 0.01);
+        assert_eq!(
+            selection.atm_ce_security_id,
+            Some(10024),
+            "atm_ce_security_id must point at the ATM strike (10024), \
+             NOT the range-first strike (10000)"
+        );
+        assert_eq!(
+            selection.atm_pe_security_id,
+            Some(20024),
+            "atm_pe_security_id must point at the ATM strike (20024), \
+             NOT the range-first strike (20000)"
+        );
+
+        // And prove the historical bug pattern — `.first()` returns the
+        // LOWEST strike in the range, which is NOT the ATM.
+        assert_eq!(
+            selection.call_security_ids.first().copied(),
+            Some(10000),
+            "call_security_ids.first() returns range-start (10000 = strike 54000), \
+             which is why it was wrong to use for the ATM label"
+        );
+        assert_ne!(
+            selection.call_security_ids.first().copied(),
+            selection.atm_ce_security_id,
+            "this assertion documents the exact bug: .first() != atm_ce_security_id"
+        );
+    }
+
+    #[test]
+    fn atm_ce_matches_find_atm_security_ids() {
+        // Cross-check: the new field and the standalone helper must agree.
+        let strikes: Vec<f64> = (0..49).map(|i| 54000.0 + (i as f64) * 100.0).collect();
+        let chain = make_chain(
+            &strikes,
+            "BANKNIFTY",
+            NaiveDate::from_ymd_opt(2026, 4, 28).unwrap(),
+        );
+        let sel = select_atm_strikes(&chain, 56400.0, 24).unwrap();
+        let via_helper = find_atm_security_ids(&chain, 56400.0).unwrap();
+        assert_eq!(sel.atm_ce_security_id, Some(via_helper.ce_id));
+        assert_eq!(sel.atm_pe_security_id, via_helper.pe_id);
+    }
+
+    #[test]
+    fn fill_display_names_uses_registry_display_name() {
+        use std::collections::HashMap;
+        use tickvault_common::instrument_types::{
+            DerivativeContract, DhanInstrumentKind, FnoUniverse, UniverseBuildMetadata,
+        };
+        use tickvault_common::types::{ExchangeSegment, OptionType};
+
+        let strikes: Vec<f64> = (0..5).map(|i| 23000.0 + (i as f64) * 100.0).collect();
+        let chain = make_chain(
+            &strikes,
+            "NIFTY",
+            NaiveDate::from_ymd_opt(2026, 4, 28).unwrap(),
+        );
+        // ATM @ 23200 → CE sid 10002, PE sid 20002 (from make_chain).
+        let mut sel = select_atm_strikes(&chain, 23200.0, 2).unwrap();
+
+        // Build a minimal universe with display_names for the ATM pair.
+        let mut derivative_contracts = HashMap::new();
+        let expiry = NaiveDate::from_ymd_opt(2026, 4, 28).unwrap();
+        derivative_contracts.insert(
+            10002_u32,
+            DerivativeContract {
+                security_id: 10002,
+                underlying_symbol: "NIFTY".to_string(),
+                instrument_kind: DhanInstrumentKind::OptionIndex,
+                exchange_segment: ExchangeSegment::NseFno,
+                expiry_date: expiry,
+                strike_price: 23200.0,
+                option_type: Some(OptionType::Call),
+                lot_size: 50,
+                tick_size: 0.05,
+                symbol_name: "NIFTY-Apr2026-23200-CE".to_string(),
+                display_name: "NIFTY 28 APR 23200 CALL".to_string(),
+            },
+        );
+        derivative_contracts.insert(
+            20002_u32,
+            DerivativeContract {
+                security_id: 20002,
+                underlying_symbol: "NIFTY".to_string(),
+                instrument_kind: DhanInstrumentKind::OptionIndex,
+                exchange_segment: ExchangeSegment::NseFno,
+                expiry_date: expiry,
+                strike_price: 23200.0,
+                option_type: Some(OptionType::Put),
+                lot_size: 50,
+                tick_size: 0.05,
+                symbol_name: "NIFTY-Apr2026-23200-PE".to_string(),
+                display_name: "NIFTY 28 APR 23200 PUT".to_string(),
+            },
+        );
+        let universe = FnoUniverse {
+            underlyings: HashMap::new(),
+            derivative_contracts,
+            instrument_info: HashMap::new(),
+            option_chains: HashMap::new(),
+            expiry_calendars: HashMap::new(),
+            subscribed_indices: Vec::new(),
+            build_metadata: UniverseBuildMetadata {
+                csv_source: "test".to_string(),
+                csv_row_count: 0,
+                parsed_row_count: 0,
+                index_count: 0,
+                equity_count: 0,
+                underlying_count: 0,
+                derivative_count: 0,
+                option_chain_count: 0,
+                build_duration: std::time::Duration::ZERO,
+                build_timestamp: chrono::Utc::now()
+                    .with_timezone(&chrono::FixedOffset::east_opt(19_800).unwrap()),
+            },
+        };
+
+        sel.fill_display_names_from_universe(&universe);
+        assert_eq!(
+            sel.atm_ce_display_name.as_deref(),
+            Some("NIFTY 28 APR 23200 CALL"),
+            "CE display_name must come from the registry, not be synthesized"
+        );
+        assert_eq!(
+            sel.atm_pe_display_name.as_deref(),
+            Some("NIFTY 28 APR 23200 PUT")
+        );
+    }
+
+    #[test]
+    fn atm_security_id_correct_near_chain_edge() {
+        // If ATM is near the start of the chain, the range gets clamped.
+        // `.first()` = lowest strike in clamped range.
+        // Dedicated field must still point at the true ATM strike.
+        let strikes: Vec<f64> = (0..20).map(|i| 23000.0 + (i as f64) * 100.0).collect();
+        let chain = make_chain(
+            &strikes,
+            "NIFTY",
+            NaiveDate::from_ymd_opt(2026, 4, 28).unwrap(),
+        );
+
+        // Spot near strike 23200 → ATM index = 2. Range-start clamps at 0.
+        let sel = select_atm_strikes(&chain, 23200.0, 10).unwrap();
+        assert!((sel.atm_strike - 23200.0).abs() < 0.01);
+        assert_eq!(
+            sel.atm_ce_security_id,
+            Some(10002),
+            "ATM CE at index 2 → security_id 10002 (make_chain baseline)"
+        );
+        assert_eq!(
+            sel.call_security_ids.first().copied(),
+            Some(10000),
+            "range-first when ATM is near edge is still 10000 (clamped)"
+        );
     }
 
     #[test]

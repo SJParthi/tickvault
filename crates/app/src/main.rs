@@ -2293,28 +2293,45 @@ async fn main() -> Result<()> {
 
                 let (atm_ce, atm_pe): (Option<(u32, String)>, Option<(u32, String)>) =
                     if let Some(sel) = selection {
-                        // ATM CE = first call in selection (ATM index), PE = first put
-                        let ce = sel.call_security_ids.first().map(|&sid| {
-                            (
-                                sid,
+                        // CRITICAL: use the dedicated `atm_ce_security_id` /
+                        // `atm_pe_security_id` fields — NOT `.first()` on the
+                        // range vectors. `.first()` returns the LOWEST strike
+                        // in the ATM ± N band, not the ATM itself, so pairing
+                        // it with the center-strike label produced
+                        // Telegram messages like
+                        // `BANKNIFTY-Apr2026-56700-PE (SID 67481)` where the
+                        // SID actually pointed at strike 54300. See
+                        // `depth_strike_selector::DepthStrikeSelection` docs.
+                        //
+                        // LABEL POLICY: prefer the Dhan CSV `display_name`
+                        // (e.g. "BANKNIFTY 28 APR 54300 PUT") over the
+                        // synthesized `UNDERLYING-MmmYYYY-STRIKE-SIDE`
+                        // format, because it matches Dhan's own web UI
+                        // character-for-character. Fall back to the
+                        // synthesized label only if the registry lookup
+                        // didn't populate `display_name` (should not
+                        // happen for contracts present in the CSV).
+                        let ce = sel.atm_ce_security_id.map(|sid| {
+                            let label = sel.atm_ce_display_name.clone().unwrap_or_else(|| {
                                 build_precise_label(
                                     underlying,
                                     sel.expiry_date,
                                     sel.atm_strike,
                                     "CE",
-                                ),
-                            )
+                                )
+                            });
+                            (sid, label)
                         });
-                        let pe = sel.put_security_ids.first().map(|&sid| {
-                            (
-                                sid,
+                        let pe = sel.atm_pe_security_id.map(|sid| {
+                            let label = sel.atm_pe_display_name.clone().unwrap_or_else(|| {
                                 build_precise_label(
                                     underlying,
                                     sel.expiry_date,
                                     sel.atm_strike,
                                     "PE",
-                                ),
-                            )
+                                )
+                            });
+                            (sid, label)
                         });
                         (ce, pe)
                     } else {
@@ -3099,6 +3116,13 @@ async fn main() -> Result<()> {
                             .expiry
                             .map_or_else(|| "?".to_string(), |e| e.format("%b%Y").to_string());
 
+                        // Format a rebalance contract line for Telegram. Prefer
+                        // the Dhan CSV `display_name` (e.g.
+                        // "BANKNIFTY 28 APR 54300 PUT (SID 67481)") — it
+                        // matches Dhan's web UI verbatim and is the string the
+                        // operator is most likely to search for. Fall back to
+                        // the synthesized `UNDERLYING-MmmYYYY-STRIKE-SIDE`
+                        // only if the registry lookup didn't populate it.
                         let fmt_contract = |atm: &Option<
                             tickvault_core::instrument::depth_strike_selector::AtmIds,
                         >,
@@ -3106,15 +3130,19 @@ async fn main() -> Result<()> {
                          -> String {
                             match atm {
                                 Some(ids) => {
-                                    let sid = if opt == "CE" {
-                                        ids.ce_id
+                                    let (sid, display) = if opt == "CE" {
+                                        (ids.ce_id, ids.ce_display_name.as_deref())
                                     } else {
-                                        ids.pe_id.unwrap_or(0)
+                                        (ids.pe_id.unwrap_or(0), ids.pe_display_name.as_deref())
                                     };
-                                    format!(
-                                        "{}-{}-{:.0}-{} ({})",
-                                        ul, expiry_str, ids.strike, opt, sid
-                                    )
+                                    if let Some(name) = display {
+                                        format!("{name} (SID {sid})")
+                                    } else {
+                                        format!(
+                                            "{}-{}-{:.0}-{} ({})",
+                                            ul, expiry_str, ids.strike, opt, sid
+                                        )
+                                    }
                                 }
                                 None => "—".to_string(),
                             }
