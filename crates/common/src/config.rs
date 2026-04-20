@@ -606,6 +606,15 @@ pub struct HistoricalDataConfig {
     pub max_retries: u32,
     /// Delay in milliseconds between consecutive API requests (rate limiting).
     pub request_delay_ms: u64,
+    /// Idempotency marker file path. Tracks the IST date of the last
+    /// successful historical fetch so reboots within the same day skip
+    /// re-fetching the 90-day window.
+    #[serde(default = "default_historical_marker_path")]
+    pub marker_path: String,
+}
+
+fn default_historical_marker_path() -> String {
+    "data/state/historical_fetch_done.json".to_string()
 }
 
 impl Default for HistoricalDataConfig {
@@ -616,6 +625,7 @@ impl Default for HistoricalDataConfig {
             request_timeout_secs: 30,
             max_retries: 3,
             request_delay_ms: 500,
+            marker_path: default_historical_marker_path(),
         }
     }
 }
@@ -1831,6 +1841,16 @@ mod tests {
         assert_eq!(config.request_timeout_secs, 30);
         assert_eq!(config.max_retries, 3);
         assert_eq!(config.request_delay_ms, 500);
+        assert_eq!(config.marker_path, "data/state/historical_fetch_done.json");
+    }
+
+    #[test]
+    fn test_historical_data_config_default_marker_path_is_exact() {
+        // Stable contract — operators / runbooks reference this exact path.
+        assert_eq!(
+            super::default_historical_marker_path(),
+            "data/state/historical_fetch_done.json"
+        );
     }
 
     #[test]

@@ -4087,6 +4087,7 @@ fn spawn_historical_candle_fetch(
             &bg_token_handle,
             &fetch_client_id,
             &mut fetch_writer,
+            is_trading_day,
         )
         .await;
 

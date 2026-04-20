@@ -17,11 +17,12 @@
 //! Runs without human intervention in the boot sequence after authentication.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use chrono::Utc;
-use metrics::counter;
+use chrono::{NaiveDate, Utc};
+use metrics::{counter, gauge};
 use secrecy::{ExposeSecret, SecretString};
 use tracing::{debug, error, info, warn};
 use zeroize::Zeroizing;
@@ -38,6 +39,10 @@ use tickvault_common::tick_types::{DhanDailyResponse, DhanIntradayResponse, Hist
 use tickvault_common::trading_calendar::ist_offset;
 
 use tickvault_storage::candle_persistence::CandlePersistenceWriter;
+use tickvault_storage::historical_fetch_marker::{
+    FetchDecision, FetchMode, HistoricalFetchMarker, POST_MARKET_CLOSE_SECS_IST, decide_fetch,
+    read_marker, write_marker,
+};
 
 use crate::auth::types::TokenState;
 
@@ -579,25 +584,196 @@ const MAX_CONSECUTIVE_PERSIST_FAILURES: usize = 10;
 // Main Fetch Logic
 // ---------------------------------------------------------------------------
 
-/// Fetches historical candles across all timeframes for all subscribed instruments.
+/// Stable Prometheus label for a fetch decision.
+fn decision_label(d: &FetchDecision) -> &'static str {
+    match d {
+        FetchDecision::Skip => "skip",
+        FetchDecision::FetchFullNinetyDays => "full",
+        FetchDecision::FetchTodayOnly => "today",
+        FetchDecision::WaitUntilPostClose => "wait",
+    }
+}
+
+/// UTC epoch seconds for today's 15:30 IST close. Used to compute the
+/// `WaitUntilPostClose` sleep duration.
+fn target_close_utc_secs(today_ist: NaiveDate) -> i64 {
+    // 15:30 IST in UTC seconds = today 00:00 IST as UTC + 15.5h.
+    // 00:00 IST = previous-day 18:30 UTC. So today 15:30 IST = today 10:00 UTC.
+    let midnight_ist_as_utc = today_ist
+        .and_hms_opt(0, 0, 0)
+        .map(|dt| dt.and_utc().timestamp())
+        .unwrap_or(0);
+    midnight_ist_as_utc.saturating_add(i64::from(POST_MARKET_CLOSE_SECS_IST))
+        - IST_UTC_OFFSET_SECONDS_I64
+}
+
+/// Returns today's IST date computed from the system clock.
+fn today_ist_date() -> NaiveDate {
+    Utc::now().with_timezone(&ist_offset()).date_naive()
+}
+
+/// Returns the current second-of-day in IST (0..86_400).
+// APPROVED: rem_euclid(86_400) is bounded to [0, 86_399] which always fits u32
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn now_sec_of_day_ist() -> u32 {
+    let now_utc = Utc::now().timestamp();
+    now_utc
+        .saturating_add(IST_UTC_OFFSET_SECONDS_I64)
+        .rem_euclid(86_400) as u32
+}
+
+/// Public top-level entry point — applies the idempotency decision and
+/// dispatches to either the 90-day or today-only fetch path.
 ///
-/// Fetches 4 intraday timeframes (1m, 5m, 15m, 60m) and daily candles for each
-/// instrument, persisting all to the unified `historical_candles` table.
-///
-/// This runs automatically in the boot sequence — zero human intervention.
+/// This is the function call sites should use. It enforces Parthiban's
+/// "successful fetch only once per day" spec by consulting the marker
+/// file at `historical_config.marker_path`.
 ///
 /// # Arguments
-/// * `registry` — subscribed instrument registry (built from universe)
-/// * `dhan_config` — Dhan API config (base URL)
-/// * `historical_config` — fetch parameters (lookback days, timeouts)
-/// * `token_handle` — arc-swap token for API auth
-/// * `client_id` — Dhan client ID for API header
-/// * `candle_writer` — QuestDB ILP writer for candles
-///
-/// # Returns
-/// Summary of fetch results (successes, failures, candle count).
+/// * `is_trading_day` — caller-supplied (typically `TradingCalendar::is_trading_day_today()`).
+///   Drives the post-close vs. anytime decision.
 #[allow(clippy::too_many_arguments)] // APPROVED: API fetch requires all config + writer params
 pub async fn fetch_historical_candles(
+    registry: &InstrumentRegistry,
+    dhan_config: &DhanConfig,
+    historical_config: &HistoricalDataConfig,
+    token_handle: &TokenHandle,
+    client_id: &SecretString,
+    candle_writer: &mut CandlePersistenceWriter,
+    is_trading_day: bool,
+) -> CandleFetchSummary {
+    let marker_path = PathBuf::from(&historical_config.marker_path);
+    let marker = match read_marker(&marker_path) {
+        Ok(m) => m,
+        Err(err) => {
+            counter!("tv_historical_fetch_marker_read_errors_total").increment(1);
+            // Surface as ERROR so operators see the corrupt-marker case;
+            // do NOT silently re-fetch — that would defeat the point.
+            error!(
+                ?err,
+                marker_path = %historical_config.marker_path,
+                "failed to read historical-fetch marker — refusing to fetch"
+            );
+            return CandleFetchSummary {
+                instruments_fetched: 0,
+                instruments_failed: 0,
+                total_candles: 0,
+                instruments_skipped: 0,
+                persist_failures: 0,
+                failed_instruments: vec![],
+                failure_reasons: HashMap::new(),
+            };
+        }
+    };
+
+    let today = today_ist_date();
+    let now_utc = Utc::now().timestamp();
+    let now_ist_sec = now_sec_of_day_ist();
+    let decision = decide_fetch(today, marker.as_ref(), now_ist_sec, is_trading_day);
+
+    counter!("tv_historical_fetch_decisions_total",
+        "decision" => decision_label(&decision))
+    .increment(1);
+
+    if let Some(ref m) = marker {
+        let age_secs = (today - m.last_success_date).num_seconds().max(0);
+        #[allow(clippy::cast_precision_loss)] // APPROVED: gauge accuracy not financial
+        gauge!("tv_historical_fetch_last_success_age_seconds").set(age_secs as f64);
+    }
+
+    info!(
+        ?decision,
+        %today,
+        is_trading_day,
+        marker_present = marker.is_some(),
+        "historical-fetch idempotency decision"
+    );
+
+    let mode = match decision {
+        FetchDecision::Skip => {
+            info!(
+                last_success_date = %marker.as_ref().map(|m| m.last_success_date.to_string()).unwrap_or_default(),
+                "historical fetch already completed today — skipping"
+            );
+            return CandleFetchSummary {
+                instruments_fetched: 0,
+                instruments_failed: 0,
+                total_candles: 0,
+                instruments_skipped: 0,
+                persist_failures: 0,
+                failed_instruments: vec![],
+                failure_reasons: HashMap::new(),
+            };
+        }
+        FetchDecision::FetchFullNinetyDays => FetchMode::FullNinetyDays,
+        FetchDecision::FetchTodayOnly => FetchMode::TodayOnly,
+        FetchDecision::WaitUntilPostClose => {
+            let target_utc = target_close_utc_secs(today);
+            let sleep_secs = (target_utc - now_utc).max(0);
+            #[allow(clippy::cast_sign_loss)] // APPROVED: clamped above with .max(0)
+            let sleep_dur = Duration::from_secs(sleep_secs as u64);
+            info!(
+                sleep_secs,
+                target_utc, "waiting until 15:30 IST before today-only fetch"
+            );
+            tokio::time::sleep(sleep_dur).await;
+            FetchMode::TodayOnly
+        }
+    };
+
+    let summary = fetch_historical_candles_inner(
+        mode,
+        today,
+        registry,
+        dhan_config,
+        historical_config,
+        token_handle,
+        client_id,
+        candle_writer,
+    )
+    .await;
+
+    // Write marker only if fetch actually produced data. Zero-instrument
+    // runs (e.g. registry empty) should NOT mark today as "done" — the
+    // operator would otherwise miss the next chance to retry.
+    if summary.instruments_fetched > 0 {
+        #[allow(clippy::cast_possible_truncation)]
+        // APPROVED: counts fit u32 (max ~25k instruments)
+        let new_marker = HistoricalFetchMarker {
+            last_success_date: today,
+            instruments_fetched: summary.instruments_fetched as u32,
+            candles_written: summary.total_candles as u64,
+            mode,
+        };
+        if let Err(err) = write_marker(&marker_path, &new_marker) {
+            counter!("tv_historical_fetch_marker_write_errors_total").increment(1);
+            error!(?err, "failed to write historical-fetch marker");
+        } else {
+            info!(
+                marker_path = %historical_config.marker_path,
+                ?mode,
+                instruments_fetched = summary.instruments_fetched,
+                candles_written = summary.total_candles,
+                "historical-fetch marker written"
+            );
+            #[allow(clippy::cast_precision_loss)] // APPROVED: gauge accuracy not financial
+            gauge!("tv_historical_fetch_last_success_age_seconds").set(0.0);
+        }
+    }
+
+    summary
+}
+
+/// Internal fetch implementation. Pulls candles from Dhan's REST API
+/// for either the full 90-day window (`FetchMode::FullNinetyDays`) or
+/// only today's intraday data (`FetchMode::TodayOnly`).
+///
+/// Today-only mode skips daily candles entirely (per Parthiban spec —
+/// only intraday 1m/5m/15m/60m needed for incremental top-up).
+#[allow(clippy::too_many_arguments)] // APPROVED: API fetch requires all config + writer params
+async fn fetch_historical_candles_inner(
+    mode: FetchMode,
+    today: NaiveDate,
     registry: &InstrumentRegistry,
     dhan_config: &DhanConfig,
     historical_config: &HistoricalDataConfig,
@@ -608,11 +784,14 @@ pub async fn fetch_historical_candles(
     let m_fetched = counter!("tv_historical_candles_fetched_total");
     let m_api_errors = counter!("tv_historical_api_errors_total");
 
-    let now_ist = Utc::now().with_timezone(&ist_offset());
-    let today = now_ist.date_naive();
-
-    // Compute date range: today - lookback_days to today
-    let (from_date, to_date) = compute_fetch_date_range(today, historical_config.lookback_days);
+    // Compute date range based on mode.
+    let (from_date, to_date) = match mode {
+        FetchMode::FullNinetyDays => {
+            compute_fetch_date_range(today, historical_config.lookback_days)
+        }
+        FetchMode::TodayOnly => (today, today),
+    };
+    let skip_daily = matches!(mode, FetchMode::TodayOnly);
 
     // Intraday requests use datetime format with market hours
     let from_date_str = from_date.format("%Y-%m-%d").to_string();
@@ -628,8 +807,9 @@ pub async fn fetch_historical_candles(
     info!(
         from_date = %from_date_str,
         to_date = %to_date_str,
-        lookback_days = historical_config.lookback_days,
-        timeframes = "1m,5m,15m,60m,1d",
+        ?mode,
+        skip_daily,
+        timeframes = if skip_daily { "1m,5m,15m,60m" } else { "1m,5m,15m,60m,1d" },
         "starting multi-timeframe historical candle fetch"
     );
 
@@ -765,6 +945,7 @@ pub async fn fetch_historical_candles(
                 historical_config,
                 candle_writer,
                 &m_api_errors,
+                skip_daily,
             )
             .await;
 
@@ -881,8 +1062,11 @@ pub async fn fetch_historical_candles(
 // Per-Instrument Fetch Helper
 // ---------------------------------------------------------------------------
 
-/// Fetches all timeframes (4 intraday + daily) for a single instrument.
+/// Fetches all timeframes (4 intraday + optional daily) for a single instrument.
 /// Returns whether the fetch succeeded, failed transiently, or permanently.
+///
+/// `skip_daily=true` is used by the today-only incremental path — daily
+/// candles only update once per trading day and reuse the 90-day fetch.
 #[allow(clippy::too_many_arguments)] // APPROVED: single-instrument fetch needs full context
 async fn fetch_single_instrument(
     http_client: &reqwest::Client,
@@ -902,6 +1086,7 @@ async fn fetch_single_instrument(
     historical_config: &HistoricalDataConfig,
     candle_writer: &mut CandlePersistenceWriter,
     m_api_errors: &metrics::Counter,
+    skip_daily: bool,
 ) -> InstrumentFetchResult {
     let mut instrument_candles = 0_usize;
     let mut instrument_persist_failures = 0_usize;
@@ -961,7 +1146,11 @@ async fn fetch_single_instrument(
         }
     }
 
-    // --- Fetch daily candles ---
+    // --- Fetch daily candles (skipped in today-only mode) ---
+    if skip_daily {
+        return InstrumentFetchResult::Success(instrument_candles, instrument_persist_failures);
+    }
+
     if historical_config.request_delay_ms > 0 {
         tokio::time::sleep(Duration::from_millis(historical_config.request_delay_ms)).await;
     }
