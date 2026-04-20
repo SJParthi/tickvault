@@ -313,6 +313,44 @@ impl TodayIstWindow {
 }
 
 // ---------------------------------------------------------------------------
+// Once-per-day success cache (Parthiban directive, 2026-04-20):
+// "post verification only once per day until it achieves success"
+// ---------------------------------------------------------------------------
+
+/// Returns the on-disk marker path used to record that today's cross-
+/// verification + cross-match BOTH succeeded. Filename embeds the IST
+/// trading date so a single file is naturally per-day. Lives under
+/// `data/cache/` alongside other one-shot daily markers.
+pub fn cross_verify_success_marker_path(today_ist: NaiveDate) -> std::path::PathBuf {
+    std::path::PathBuf::from("data/cache").join(format!(
+        "cross-verify-success-{}.marker",
+        today_ist.format("%Y-%m-%d")
+    ))
+}
+
+/// `true` when today's cross-verification has already succeeded earlier
+/// in the same trading day (marker file present). The caller skips the
+/// whole post-market verification block when this returns true — fixes
+/// the "every restart re-runs the verification even though it already
+/// passed" failure mode that blew up the operator's Telegram on
+/// crash-recovery boots.
+pub fn cross_verify_already_succeeded_today(today_ist: NaiveDate) -> bool {
+    cross_verify_success_marker_path(today_ist).exists()
+}
+
+/// Records that today's cross-verification + cross-match both passed.
+/// Best-effort: returns the std::io error so the caller can decide
+/// whether to surface it; not panicking lets the verification still
+/// "succeed" in the operator's eyes even if disk write fails.
+pub fn mark_cross_verify_success(today_ist: NaiveDate) -> std::io::Result<()> {
+    let path = cross_verify_success_marker_path(today_ist);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, today_ist.to_string())
+}
+
+// ---------------------------------------------------------------------------
 // Pure Helper Functions (extracted for testability)
 // ---------------------------------------------------------------------------
 
@@ -1665,6 +1703,69 @@ mod tests {
             "end must carry microsecond suffix: {}",
             w.end_sql
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Once-per-day success marker (Parthiban directive 2026-04-20:
+    //   "only once in a day until it achieves success")
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_cross_verify_success_marker_path_includes_date() {
+        let date = NaiveDate::from_ymd_opt(2026, 4, 20).unwrap();
+        let path = cross_verify_success_marker_path(date);
+        let s = path.to_string_lossy();
+        assert!(
+            s.contains("cross-verify-success-2026-04-20"),
+            "marker filename must embed the IST date so it's per-day; got: {s}"
+        );
+        assert!(
+            s.ends_with(".marker"),
+            "marker file extension expected; got: {s}"
+        );
+    }
+
+    #[test]
+    fn test_cross_verify_success_marker_path_changes_per_day() {
+        let d1 = NaiveDate::from_ymd_opt(2026, 4, 20).unwrap();
+        let d2 = NaiveDate::from_ymd_opt(2026, 4, 21).unwrap();
+        assert_ne!(
+            cross_verify_success_marker_path(d1),
+            cross_verify_success_marker_path(d2),
+            "marker path must be per-day so yesterday's success doesn't shadow today"
+        );
+    }
+
+    #[test]
+    fn test_cross_verify_already_succeeded_today_false_when_marker_absent() {
+        // A date so far in the future no marker can ever exist on-disk.
+        let date = NaiveDate::from_ymd_opt(2099, 12, 31).unwrap();
+        assert!(
+            !cross_verify_already_succeeded_today(date),
+            "no marker file → should return false"
+        );
+    }
+
+    #[test]
+    fn test_mark_cross_verify_success_then_already_succeeded_returns_true() {
+        // Use today's date for a real round-trip — write then check then
+        // delete to leave the working tree clean for subsequent runs.
+        // Best-effort cleanup; if the test crashes mid-way the marker is
+        // for "today" anyway and is harmless next time.
+        let date = NaiveDate::from_ymd_opt(2026, 4, 20).unwrap();
+        let marker = cross_verify_success_marker_path(date);
+        // Pre-clean in case a stale marker from a previous test exists.
+        let _ = std::fs::remove_file(&marker);
+        assert!(!cross_verify_already_succeeded_today(date));
+
+        mark_cross_verify_success(date).expect("write marker");
+        assert!(
+            cross_verify_already_succeeded_today(date),
+            "after writing marker, idempotency check must return true"
+        );
+
+        // Cleanup — leave repo clean for re-runs.
+        let _ = std::fs::remove_file(&marker);
     }
 
     #[test]

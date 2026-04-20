@@ -4233,16 +4233,26 @@ fn spawn_historical_candle_fetch(
         // Cross-verify + cross-match: TODAY-ONLY window gating
         //
         // Gate both operations on:
-        //  1. `is_trading_day` — weekend / NSE holiday → skip both with a
-        //     typed SKIPPED notification so operator gets closure on Telegram.
+        //  1. `is_trading_day` — weekend / NSE holiday → skip with a typed
+        //     SKIPPED notification so operator gets closure on Telegram.
         //  2. `TodayIstWindow::from_now()` — pre-market (before 09:15 IST)
-        //     returns None → skip both (nothing to verify yet).
+        //     on a trading day → SILENT skip (INFO log only, NO Telegram).
+        //     Per Parthiban directive 2026-04-20:
+        //       "pre market cross verification should never ever be done
+        //        especially on trading days"
+        //     Verification needs live data; running it pre-market is
+        //     guaranteed-empty noise. The post-market timer will fire it
+        //     correctly once live ticks land.
+        //  3. Once-per-day success cache —
+        //     `cross_verify_already_succeeded_today` checks for a marker
+        //     file written after BOTH verify + match passed earlier today.
+        //     Per Parthiban directive 2026-04-20:
+        //       "even for post verification also only once in a day until
+        //        it achieves success verification should be done"
+        //     If today already succeeded, skip silently.
         //
         // Otherwise pass the window to both functions so their SQL WHERE
-        // clauses are narrowed to today's 09:15-15:30 IST session. Fixes the
-        // "12 days of accumulated data falsely passing" bug where the old
-        // `dateadd('d', -3, now())` window compared multi-day Dhan-sourced
-        // aggregates against the same-day Dhan REST fetch (vacuous OK).
+        // clauses are narrowed to today's 09:15-15:30 IST session.
         // -----------------------------------------------------------------
         let today_window = if is_trading_day {
             tickvault_core::historical::cross_verify::TodayIstWindow::from_now()
@@ -4251,24 +4261,46 @@ fn spawn_historical_candle_fetch(
         };
 
         let Some(today_window) = today_window else {
-            let reason = if !is_trading_day {
-                "weekend or holiday — not a trading day".to_string()
+            if !is_trading_day {
+                // Weekend / holiday — operator-visible SKIPPED notification.
+                let reason = "weekend or holiday — not a trading day".to_string();
+                info!(
+                    instruments_fetched = summary.instruments_fetched,
+                    instruments_failed = summary.instruments_failed,
+                    total_candles = summary.total_candles,
+                    %reason,
+                    "cross-verify + cross-match SKIPPED"
+                );
+                bg_notifier.notify(NotificationEvent::CandleCrossMatchSkipped {
+                    reason,
+                    candles_compared: 0,
+                });
             } else {
-                "pre-market (before 09:15 IST) — no live data yet".to_string()
-            };
-            info!(
-                instruments_fetched = summary.instruments_fetched,
-                instruments_failed = summary.instruments_failed,
-                total_candles = summary.total_candles,
-                %reason,
-                "cross-verify + cross-match SKIPPED"
-            );
-            bg_notifier.notify(NotificationEvent::CandleCrossMatchSkipped {
-                reason,
-                candles_compared: 0,
-            });
+                // Pre-market on a trading day — silent skip per Parthiban
+                // directive. INFO log only; NO Telegram notification.
+                info!(
+                    instruments_fetched = summary.instruments_fetched,
+                    instruments_failed = summary.instruments_failed,
+                    total_candles = summary.total_candles,
+                    "cross-verify + cross-match SILENTLY skipped — pre-market on trading day (will run post-market)"
+                );
+            }
             return;
         };
+
+        // Once-per-day success idempotency. The marker is written below
+        // after BOTH verify + match succeed. Crash-recovery boots and
+        // mid-day restarts therefore won't re-fire the verification.
+        if tickvault_core::historical::cross_verify::cross_verify_already_succeeded_today(
+            today_window.today_ist,
+        ) {
+            info!(
+                today_ist = %today_window.today_ist,
+                marker = ?tickvault_core::historical::cross_verify::cross_verify_success_marker_path(today_window.today_ist),
+                "cross-verify SILENTLY skipped — today's verification already succeeded earlier (marker present)"
+            );
+            return;
+        }
 
         // -----------------------------------------------------------------
         // Cross-verify candle integrity in QuestDB
@@ -4387,12 +4419,40 @@ fn spawn_historical_candle_fetch(
                 }
             }
 
+            // Once-per-day success marker. Both verify AND cross-match must
+            // pass; on success, write a file marker so subsequent restarts
+            // today skip the verification entirely. If either is not-passed
+            // (or skipped due to no live data), do NOT mark — next run will
+            // retry from scratch. Per Parthiban directive 2026-04-20:
+            // "only once in a day until it achieves success".
+            let full_success = verify_report.passed && cross_match.passed;
+            if full_success {
+                match tickvault_core::historical::cross_verify::mark_cross_verify_success(
+                    today_window.today_ist,
+                ) {
+                    Ok(()) => {
+                        info!(
+                            today_ist = %today_window.today_ist,
+                            "cross-verify success marker written — today's verification will not run again"
+                        );
+                    }
+                    Err(err) => {
+                        warn!(
+                            ?err,
+                            today_ist = %today_window.today_ist,
+                            "failed to write cross-verify success marker (verification still passed; next restart will re-run)"
+                        );
+                    }
+                }
+            }
+
             info!(
                 instruments_fetched = summary.instruments_fetched,
                 instruments_failed = summary.instruments_failed,
                 total_candles = summary.total_candles,
                 verification_passed = verify_report.passed,
                 cross_match_passed = cross_match.passed,
+                full_success_marker_written = full_success,
                 today_ist = %today_window.today_ist,
                 window_start = %today_window.start_sql,
                 window_end = %today_window.end_sql,

@@ -821,8 +821,21 @@ impl NotificationEvent {
                 reason,
                 candles_compared,
             } => {
+                // Subtext varies by reason category — the previous hardcoded
+                // "first run / fresh DB / post-market boot" line was misleading
+                // for weekend, holiday, and pre-market skips. Match the lead-in
+                // sentence to the reason so the operator understands WHY the
+                // verification was skipped at a glance.
+                let lower = reason.to_ascii_lowercase();
+                let next_action = if lower.contains("weekend") || lower.contains("holiday") {
+                    "Will compare on the next trading day's post-market run."
+                } else if lower.contains("pre-market") {
+                    "Will compare after market open + post-market historical re-fetch."
+                } else {
+                    "Will compare on next run after live ticks during market hours."
+                };
                 format!(
-                    "<b>Historical vs Live cross-match SKIPPED</b>\nReason: {reason}\n(first run, fresh DB, or post-market boot — no live ticks yet)\nLEFT JOIN rows: {candles_compared} (diagnostic only)\nWill compare on next run after live ticks during market hours."
+                    "<b>Historical vs Live cross-match SKIPPED</b>\nReason: {reason}\nLEFT JOIN rows: {candles_compared} (diagnostic only)\n{next_action}"
                 )
             }
             Self::IpVerificationFailed { reason } => {
@@ -1499,8 +1512,37 @@ mod tests {
         let msg = event.to_message();
         assert!(msg.contains("cross-match SKIPPED"));
         assert!(msg.contains("no live data"));
-        assert!(msg.contains("first run"));
         assert!(msg.contains("Will compare on next run"));
+    }
+
+    #[test]
+    fn test_cross_match_skipped_weekend_subtext() {
+        let event = NotificationEvent::CandleCrossMatchSkipped {
+            reason: "weekend or holiday — not a trading day".to_string(),
+            candles_compared: 0,
+        };
+        let msg = event.to_message();
+        assert!(
+            msg.contains("next trading day"),
+            "weekend reason must use trading-day subtext, got: {msg}"
+        );
+        assert!(
+            !msg.contains("first run"),
+            "weekend reason must NOT show the first-run subtext"
+        );
+    }
+
+    #[test]
+    fn test_cross_match_skipped_premarket_subtext() {
+        let event = NotificationEvent::CandleCrossMatchSkipped {
+            reason: "pre-market (before 09:15 IST) — no live data yet".to_string(),
+            candles_compared: 0,
+        };
+        let msg = event.to_message();
+        assert!(
+            msg.contains("after market open"),
+            "pre-market reason must use post-open subtext, got: {msg}"
+        );
     }
 
     #[test]
