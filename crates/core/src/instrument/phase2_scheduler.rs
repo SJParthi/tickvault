@@ -31,6 +31,7 @@
 //! All decisions are driven by the injected `TradingCalendar` so weekend
 //! / holiday behaviour is correct everywhere.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -38,8 +39,12 @@ use chrono::{NaiveDate, NaiveTime, TimeZone, Utc};
 use tokio::time::Instant;
 use tracing::{error, info, warn};
 
+use crate::instrument::phase2_delta::compute_phase2_stock_subscriptions;
+use crate::instrument::preopen_price_buffer::{PreOpenCloses, SharedPreOpenBuffer, snapshot};
 use crate::notification::{NotificationEvent, NotificationService};
+use tickvault_common::instrument_types::FnoUniverse;
 use tickvault_common::trading_calendar::TradingCalendar;
+use tickvault_common::types::FeedMode;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -69,6 +74,74 @@ pub const MAX_LTP_ATTEMPTS: u32 = 3;
 
 /// Underlyings whose LTPs gate Phase 2 readiness.
 pub const GATING_INDEX_SYMBOLS: &[&str] = &["NIFTY", "BANKNIFTY"];
+
+// ---------------------------------------------------------------------------
+// Phase 2 instrument source — Static (legacy, alert-only) or Dynamic (delta).
+// ---------------------------------------------------------------------------
+
+/// Source of the Phase 2 instrument list. The scheduler chooses how to
+/// produce the subscribe list based on this enum. `Static` carries a
+/// precomputed list (legacy / alert-only path used by tests). `Dynamic`
+/// computes the list at trigger time from the live pre-open price buffer
+/// + universe — that is the real production path.
+pub enum Phase2InstrumentsSource {
+    /// Precomputed instrument list. Backward-compatible with the v1
+    /// alert-only call site. Treated as authoritative — no recomputation
+    /// happens at trigger time.
+    Static(Vec<crate::websocket::types::InstrumentSubscription>),
+    /// Dynamic delta — at trigger time the scheduler snapshots
+    /// `buffer`, runs `compute_phase2_stock_subscriptions`, and
+    /// dispatches the resulting list.
+    Dynamic {
+        /// Pre-open per-minute price buckets, populated by the
+        /// snapshotter task in `crates/app/src/main.rs`.
+        buffer: SharedPreOpenBuffer,
+        /// FnoUniverse built at boot — owns the option chains used to
+        /// pick ATM ± N strikes.
+        universe: Arc<FnoUniverse>,
+        /// Trading calendar — used by `select_stock_expiry` to enforce
+        /// the > 2 trading-days-to-expiry guard for stock F&O.
+        calendar: Arc<TradingCalendar>,
+        /// ATM ± `strikes_each_side` per stock. Spec value is 25
+        /// (matches `live-market-feed-subscription.md`).
+        strikes_each_side: usize,
+    },
+}
+
+impl std::fmt::Debug for Phase2InstrumentsSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Static(list) => f
+                .debug_struct("Static")
+                .field("instruments", &list.len())
+                .finish(),
+            Self::Dynamic {
+                strikes_each_side, ..
+            } => f
+                .debug_struct("Dynamic")
+                .field("strikes_each_side", strikes_each_side)
+                .finish(),
+        }
+    }
+}
+
+/// Outcome of a successful Phase 2 dispatch — sent on the optional
+/// `mpsc::Sender<Phase2PickCompleted>` so downstream consumers (PROMPT C
+/// crash recovery) can persist the chosen reference prices and instrument
+/// IDs without coupling to the scheduler internals.
+///
+/// Consumed by Phase 2 crash-recovery wiring — PROMPT C.
+#[derive(Debug, Clone)]
+pub struct Phase2PickCompleted {
+    /// Instruments dispatched to the WebSocket pool.
+    pub instruments: Vec<crate::websocket::types::InstrumentSubscription>,
+    /// Reference price per stock symbol that drove the ATM pick. Sorted
+    /// (BTreeMap) so the persisted snapshot is byte-stable across reruns.
+    pub reference_prices: BTreeMap<String, f64>,
+    /// Trigger date (IST) — needed by PROMPT C to key the on-disk
+    /// snapshot file.
+    pub trigger_date_ist: NaiveDate,
+}
 
 // ---------------------------------------------------------------------------
 // Decision types
@@ -228,18 +301,18 @@ fn current_ist() -> (NaiveDate, NaiveTime) {
 /// `Phase2Complete` with the planned count for visibility). The
 /// alert-only path is used by tests + the legacy code path that hasn't
 /// yet computed the delta.
-// TEST-EXEMPT: async driver with time-dependent sleep loop — decision logic covered by test_next_trigger_*, readiness by test_has_required_ltps_*
+// TEST-EXEMPT: async driver with time-dependent sleep loop — decision logic covered by test_next_trigger_*, readiness by test_has_required_ltps_*, source resolution covered by phase2_wiring_integration tests
 pub async fn run_phase2_scheduler(
     spot_prices: crate::instrument::depth_rebalancer::SharedSpotPrices,
     calendar: Arc<TradingCalendar>,
     notifier: Arc<NotificationService>,
     pool: Option<Arc<crate::websocket::WebSocketConnectionPool>>,
-    phase2_instruments: Option<Vec<crate::websocket::types::InstrumentSubscription>>,
-    feed_mode: tickvault_common::types::FeedMode,
+    source: Option<Phase2InstrumentsSource>,
+    feed_mode: FeedMode,
+    pick_completed_tx: Option<tokio::sync::mpsc::Sender<Phase2PickCompleted>>,
 ) {
-    let planned_phase2_count = phase2_instruments.as_ref().map(|v| v.len()).unwrap_or(0);
     info!(
-        planned_phase2_count,
+        has_source = source.is_some(),
         has_pool = pool.is_some(),
         "Phase 2 scheduler starting"
     );
@@ -278,12 +351,47 @@ pub async fn run_phase2_scheduler(
         if wait_for_ltps_once(&spot_prices).await {
             let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
-            // O1-B (2026-04-17): real dispatch path. If we have both a
-            // pool reference AND a precomputed instrument list, send a
-            // SubscribeCommand to the pool. Otherwise fall through to
-            // alert-only.
-            let dispatched_count = match (pool.as_ref(), phase2_instruments.as_ref()) {
-                (Some(pool_ref), Some(instruments)) if !instruments.is_empty() => {
+            // Resolve the instrument list at trigger time. For Static
+            // sources we use the precomputed list as-is. For Dynamic
+            // sources we snapshot the pre-open buffer and run the delta
+            // computation now so the chosen prices reflect the actual
+            // 09:12 close (or backtracked 09:11/09:10/...).
+            let (instruments, reference_prices) = match source.as_ref() {
+                Some(Phase2InstrumentsSource::Static(list)) => (list.clone(), BTreeMap::new()),
+                Some(Phase2InstrumentsSource::Dynamic {
+                    buffer,
+                    universe,
+                    calendar: dyn_cal,
+                    strikes_each_side,
+                }) => {
+                    let snap = snapshot(buffer).await;
+                    let compute_start = Instant::now();
+                    let plan = compute_phase2_stock_subscriptions(
+                        universe,
+                        &snap,
+                        dyn_cal,
+                        today_ist,
+                        *strikes_each_side,
+                    );
+                    let compute_ms =
+                        u64::try_from(compute_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    metrics::histogram!("tv_phase2_compute_duration_ms").record(compute_ms as f64);
+                    metrics::counter!("tv_phase2_stocks_subscribed_total")
+                        .increment(plan.stocks_subscribed.len() as u64);
+                    metrics::counter!("tv_phase2_stocks_skipped_no_price_total")
+                        .increment(plan.stocks_skipped_no_price.len() as u64);
+                    metrics::counter!("tv_phase2_stocks_skipped_no_eligible_expiry_total")
+                        .increment(plan.stocks_skipped_no_eligible_expiry.len() as u64);
+                    let prices = derive_reference_prices(&plan.stocks_subscribed, &snap);
+                    record_reference_price_source(&prices, &snap);
+                    (plan.instruments, prices)
+                }
+                None => (Vec::new(), BTreeMap::new()),
+            };
+
+            let planned_count = instruments.len();
+            let dispatched_count = match (pool.as_ref(), instruments.is_empty()) {
+                (Some(pool_ref), false) => {
                     let cmd = crate::websocket::SubscribeCommand::AddInstruments {
                         instruments: instruments.clone(),
                         feed_mode,
@@ -325,13 +433,32 @@ pub async fn run_phase2_scheduler(
                     info!(
                         attempt,
                         duration_ms,
-                        planned_phase2_count,
+                        planned_count,
                         "Phase 2: LTPs present — alert-only mode (no pool or \
                              empty instrument list)"
                     );
-                    planned_phase2_count
+                    planned_count
                 }
             };
+
+            // Hand off to PROMPT C crash-recovery consumer. Best-effort
+            // — a missing or backed-up channel must not delay dispatch.
+            if !instruments.is_empty()
+                && let Some(tx) = pick_completed_tx.as_ref()
+            {
+                let payload = Phase2PickCompleted {
+                    instruments: instruments.clone(),
+                    reference_prices: reference_prices.clone(),
+                    trigger_date_ist: today_ist,
+                };
+                if let Err(err) = tx.try_send(payload) {
+                    warn!(
+                        ?err,
+                        "Phase 2: pick_completed channel send failed — \
+                             crash-recovery snapshot will be missing this run"
+                    );
+                }
+            }
             metrics::counter!("tv_phase2_runs_total", "outcome" => "complete").increment(1);
             metrics::histogram!("tv_phase2_run_ms").record(duration_ms as f64);
             notifier.notify(NotificationEvent::Phase2Complete {
@@ -359,6 +486,53 @@ pub async fn run_phase2_scheduler(
         ),
         attempts: MAX_LTP_ATTEMPTS,
     });
+}
+
+/// For each subscribed stock, walk its pre-open closes from 09:12 down
+/// to 09:08 and pick the latest non-empty bucket as the reference price.
+/// This must mirror `PreOpenCloses::backtrack_latest` so PROMPT C sees
+/// the SAME price the ATM pick used.
+fn derive_reference_prices(
+    subscribed: &[String],
+    snap: &std::collections::HashMap<String, PreOpenCloses>,
+) -> BTreeMap<String, f64> {
+    let mut out = BTreeMap::new();
+    for symbol in subscribed {
+        if let Some(closes) = snap.get(symbol)
+            && let Some(price) = closes.backtrack_latest()
+        {
+            out.insert(symbol.clone(), price);
+        }
+    }
+    out
+}
+
+/// Emit per-source-minute counters for the prices we actually picked,
+/// so operators can see whether 09:12 succeeded or how often we fell
+/// back to 09:11/09:10/09:09/09:08.
+fn record_reference_price_source(
+    reference_prices: &BTreeMap<String, f64>,
+    snap: &std::collections::HashMap<String, PreOpenCloses>,
+) {
+    for symbol in reference_prices.keys() {
+        let Some(closes) = snap.get(symbol) else {
+            continue;
+        };
+        // closes.closes[0..5] = 09:08, 09:09, 09:10, 09:11, 09:12.
+        // backtrack_latest scans from index 4 down to 0; record the
+        // first non-empty slot's source-minute label.
+        let labels: [&str; 5] = ["09:08", "09:09", "09:10", "09:11", "09:12"];
+        for idx in (0..closes.closes.len()).rev() {
+            if closes.closes[idx].is_some() {
+                metrics::counter!(
+                    "tv_phase2_reference_price_source_total",
+                    "source" => labels[idx]
+                )
+                .increment(1);
+                break;
+            }
+        }
+    }
 }
 
 async fn wait_for_ltps_once(

@@ -2839,6 +2839,11 @@ async fn main() -> Result<()> {
             // updater is already running and updating it with live index LTPs.
             let spot_prices = std::sync::Arc::clone(&shared_spot_prices);
 
+            // Pre-clone universe handles for the snapshotter + Phase 2
+            // delta computation BEFORE the rebalancer takes ownership.
+            let snapshotter_universe = std::sync::Arc::clone(&universe_arc);
+            let phase2_universe = std::sync::Arc::clone(&universe_arc);
+
             // Rebalance event channel (watch — latest-value semantics)
             let (rebalance_tx, mut rebalance_rx) = tokio::sync::watch::channel::<
                 Option<tickvault_core::instrument::depth_rebalancer::RebalanceEvent>,
@@ -2884,31 +2889,103 @@ async fn main() -> Result<()> {
                 });
             }
 
+            // PROMPT B precursor (2026-04-20): pre-open price snapshotter.
+            // Subscribes to the tick broadcast and buckets every NSE_EQ
+            // tick that belongs to an F&O stock into the matching minute
+            // slot (09:08..09:12 IST). The Phase 2 scheduler reads from
+            // this buffer at 09:12:30 to pick ATM strikes per stock.
+            // Outside the 09:08..09:12 window the snapshotter is idle
+            // (no work, no metrics) — see audit-findings Rule 3.
+            let preopen_buffer =
+                tickvault_core::instrument::preopen_price_buffer::new_shared_preopen_buffer();
+            {
+                let snap_buffer = std::sync::Arc::clone(&preopen_buffer);
+                let snap_universe = snapshotter_universe;
+                let mut snap_rx = tick_broadcast_sender.subscribe();
+                tokio::spawn(async move {
+                    let lookup =
+                        tickvault_core::instrument::preopen_price_buffer::build_fno_stock_lookup(
+                            &snap_universe,
+                        );
+                    info!(
+                        fno_stock_count = lookup.len(),
+                        "Phase 2 pre-open snapshotter started — F&O stocks tracked"
+                    );
+                    loop {
+                        match snap_rx.recv().await {
+                            Ok(tick) => {
+                                // Window-gate first: outside 09:08..09:12 IST we do
+                                // nothing — no classification, no metrics.
+                                if !tickvault_core::instrument::preopen_price_buffer::is_within_preopen_window() {
+                                    continue;
+                                }
+                                use tickvault_core::instrument::preopen_price_buffer::{
+                                    SnapshotterOutcome, classify_tick,
+                                };
+                                match classify_tick(&tick, &lookup) {
+                                    SnapshotterOutcome::Buffered {
+                                        symbol,
+                                        minute_index,
+                                    } => {
+                                        let mut guard = snap_buffer.write().await;
+                                        guard.entry(symbol).or_default().record(
+                                            minute_index,
+                                            f64::from(tick.last_traded_price),
+                                        );
+                                        drop(guard);
+                                        metrics::counter!(
+                                            "tv_phase2_snapshotter_ticks_buffered_total"
+                                        )
+                                        .increment(1);
+                                    }
+                                    SnapshotterOutcome::Filtered(reason) => {
+                                        metrics::counter!(
+                                            "tv_phase2_snapshotter_ticks_filtered_total",
+                                            "reason" => reason.as_label()
+                                        )
+                                        .increment(1);
+                                    }
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                });
+            }
+
             // O1 (2026-04-17) Phase A: Phase 2 subscription scheduler.
             // Sleeps until 09:12 IST (or runs immediately if already past 9:12
             // and within market hours), then waits for NIFTY/BANKNIFTY LTPs,
-            // then emits Phase2Complete/Failed. Actual SubscribeCommand dispatch
-            // O1-B (2026-04-17): the scheduler now dispatches a real
-            // `SubscribeCommand` to the pool when the LTPs arrive. The
-            // `phase2_instruments` argument here is `None` for v1 — the
-            // delta computation (which derivative_contracts to subscribe
-            // given the live spot price + boot universe) is the next step
-            // and ships in a follow-up commit. With `phase2_instruments=None`
-            // the scheduler falls back to alert-only mode (logs + Telegram
-            // with `added_count=0`) so operators still get the 9:12 signal.
+            // then computes the stock-F&O delta from the snapshotter's
+            // buffer and dispatches the SubscribeCommand to the pool.
+            //
+            // PROMPT C (Phase 2 crash-recovery) consumes the chosen
+            // reference prices via the optional `pick_completed_tx`
+            // channel — wired with `None` here until that PR lands.
             {
                 let phase2_spot_prices = std::sync::Arc::clone(&shared_spot_prices);
-                let phase2_calendar = std::sync::Arc::clone(&trading_calendar);
+                let phase2_calendar_for_dyn = std::sync::Arc::clone(&trading_calendar);
+                let phase2_calendar_for_decision = std::sync::Arc::clone(&trading_calendar);
                 let phase2_notifier = notifier.clone();
                 let phase2_pool = ws_pool_arc.clone();
+                let phase2_buffer = std::sync::Arc::clone(&preopen_buffer);
                 tokio::spawn(async move {
                     tickvault_core::instrument::phase2_scheduler::run_phase2_scheduler(
                         phase2_spot_prices,
-                        phase2_calendar,
+                        phase2_calendar_for_decision,
                         phase2_notifier,
                         phase2_pool,
-                        None, // O1-B v2: real instrument list lands with delta computation
+                        Some(
+                            tickvault_core::instrument::phase2_scheduler::Phase2InstrumentsSource::Dynamic {
+                                buffer: phase2_buffer,
+                                universe: phase2_universe,
+                                calendar: phase2_calendar_for_dyn,
+                                strikes_each_side: 25,
+                            },
+                        ),
                         tickvault_common::types::FeedMode::Quote,
+                        None, // PROMPT C wires the pick_completed channel.
                     )
                     .await;
                 });
