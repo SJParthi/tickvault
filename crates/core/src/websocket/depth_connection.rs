@@ -687,7 +687,13 @@ pub async fn run_two_hundred_depth_connection(
                     });
                 }
 
-                // Escalate to ERROR after 10+ consecutive failures
+                // Log policy — reduces noise during transient Dhan-side
+                // resets (e.g. 200-level `/twohundreddepth` TCP resets per
+                // Ticket #5519522/#5543510) while preserving escalation.
+                //
+                // * attempt == 0          → WARN  (first failure is visible)
+                // * attempt == 1..=9      → DEBUG (silent during brief backoff)
+                // * attempt % 10 == 0 (≥10) → ERROR (Telegram escalation)
                 if attempt > 0 && attempt.is_multiple_of(10) {
                     error!(
                         security_id,
@@ -696,13 +702,21 @@ pub async fn run_two_hundred_depth_connection(
                         ?err,
                         "{prefix}: reconnection threshold — still retrying"
                     );
-                } else {
+                } else if attempt == 0 {
                     warn!(
                         security_id,
                         label = %label,
                         attempt,
                         ?err,
                         "{prefix}: connection failed — will reconnect"
+                    );
+                } else {
+                    debug!(
+                        security_id,
+                        label = %label,
+                        attempt,
+                        ?err,
+                        "{prefix}: connection still failing — retrying"
                     );
                 }
 

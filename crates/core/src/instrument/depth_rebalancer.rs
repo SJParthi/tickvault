@@ -344,9 +344,29 @@ pub async fn run_depth_rebalancer(
                 current_spot,
                 DEPTH_REBALANCE_STRIKE_THRESHOLD,
             ) {
-                // Look up old/new ATM CE/PE security IDs + strike for the notification.
-                let new_atm_ids = find_atm_security_ids(chain, current_spot);
-                let prev_atm_ids = find_atm_security_ids(chain, prev_atm);
+                // Look up old/new ATM CE/PE security IDs + strike for the
+                // notification. Enrich with Dhan CSV `display_name` so the
+                // Telegram rebalance alert shows the exact contract label
+                // Dhan's web UI shows (e.g. "BANKNIFTY 28 APR 54300 PUT")
+                // instead of the synthesized symbol_name.
+                let mut new_atm_ids = find_atm_security_ids(chain, current_spot);
+                let mut prev_atm_ids = find_atm_security_ids(chain, prev_atm);
+                if let Some(ref mut ids) = new_atm_ids {
+                    ids.fill_display_names_from_universe(universe.as_ref());
+                }
+                if let Some(ref mut ids) = prev_atm_ids {
+                    ids.fill_display_names_from_universe(universe.as_ref());
+                }
+
+                info!(
+                    symbol,
+                    previous_spot = prev_atm,
+                    current_spot,
+                    new_atm = ?new_atm_ids,
+                    prev_atm_ids = ?prev_atm_ids,
+                    %expiry,
+                    "depth rebalance triggered — ATM drifted beyond threshold"
+                );
 
                 let event = RebalanceEvent {
                     underlying: symbol.clone(), // O(1) EXEMPT: rebalance event
@@ -357,16 +377,6 @@ pub async fn run_depth_rebalancer(
                     drift_strikes: DEPTH_REBALANCE_STRIKE_THRESHOLD,
                     expiry: Some(expiry),
                 };
-
-                info!(
-                    symbol,
-                    previous_spot = prev_atm,
-                    current_spot,
-                    ?new_atm_ids,
-                    ?prev_atm_ids,
-                    %expiry,
-                    "depth rebalance triggered — ATM drifted beyond threshold"
-                );
 
                 // Update tracked ATM
                 previous_atm.insert(symbol.clone(), current_spot); // O(1) EXEMPT: rebalance
@@ -460,11 +470,15 @@ mod tests {
                 ce_id: 35246,
                 pe_id: Some(35247),
                 strike: 23600.0,
+                ce_display_name: None,
+                pe_display_name: None,
             }),
             prev_atm: Some(AtmIds {
                 ce_id: 35100,
                 pe_id: Some(35101),
                 strike: 23450.0,
+                ce_display_name: None,
+                pe_display_name: None,
             }),
             current_spot: 23620.0,
             previous_spot: 23430.0,

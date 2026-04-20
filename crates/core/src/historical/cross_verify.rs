@@ -22,12 +22,13 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, Utc};
 use reqwest::Client;
 use tracing::{debug, error, info, warn};
 
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::constants::{
-    CANDLES_PER_TRADING_DAY, QUESTDB_TABLE_HISTORICAL_CANDLES, TIMEFRAME_1M,
+    CANDLES_PER_TRADING_DAY, IST_UTC_OFFSET_SECONDS, QUESTDB_TABLE_HISTORICAL_CANDLES, TIMEFRAME_1M,
 };
 use tickvault_common::instrument_registry::InstrumentRegistry;
 
@@ -59,6 +60,30 @@ pub struct ViolationDetail {
 // Cross-Match Types — Historical vs Live comparison
 // ---------------------------------------------------------------------------
 
+/// Per-field delta for expanded Telegram display. One entry per differing
+/// OHLCV (+OI) field, carrying both sides' raw values and `live - hist`.
+/// Produced by `classify_cross_match_row` alongside `diff_summary` so the
+/// Telegram formatter can render one explicit line per field:
+///     `open      : hist=2847.50 live=2847.00  Δ=+0.50`
+/// (Pre-2026-04-20 formats conflated all deltas onto one `H(-1.5) V(+200)`
+/// line — concise but hard to scan at a glance when multiple fields move.)
+#[derive(Debug, Clone)]
+pub struct FieldDelta {
+    /// Full human-readable field name: "open", "high", "low", "close",
+    /// "volume", "open_interest". Kept long-form so Telegram rendering
+    /// is unambiguous — no "O vs OI" confusion.
+    pub field: String,
+    /// Value from Dhan REST historical fetch.
+    pub hist: f64,
+    /// Value from live WebSocket-sourced materialized view.
+    pub live: f64,
+    /// `live - hist`. Positive = live exceeds historical.
+    pub delta: f64,
+    /// Hint for renderer: `true` for volume/OI (format as integer),
+    /// `false` for OHLC prices (format with 2 decimals).
+    pub is_integer: bool,
+}
+
 /// A single candle mismatch between historical API data and live materialized view.
 #[derive(Debug, Clone)]
 pub struct CrossMatchMismatch {
@@ -79,6 +104,15 @@ pub struct CrossMatchMismatch {
     pub live_values: String,
     /// Field-level diff summary (e.g., "H(-1.5) V(-6500)").
     pub diff_summary: String,
+    /// Structured per-field deltas — one entry per differing field.
+    /// Empty for `missing_live` rows (no live values to compare).
+    /// Populated alongside `diff_summary` in `classify_cross_match_row`
+    /// so the Telegram formatter can render one line per field:
+    ///   `open      : hist=2847.50 live=2847.00  Δ=+0.50`
+    /// Complements the compact `diff_summary` (`"O(+0.50)"`) without
+    /// replacing it — both are surfaced in logs; Telegram renders the
+    /// expanded form for operator readability.
+    pub field_deltas: Vec<FieldDelta>,
 }
 
 /// Summary of historical vs live candle cross-match.
@@ -215,6 +249,139 @@ const CROSS_MATCH_TIMEFRAMES: &[(&str, &str)] = &[
     ("60m", "candles_1h"),
     ("1d", "candles_1d"),
 ];
+
+// ---------------------------------------------------------------------------
+// Today-only SQL window (fixes "12 days accumulated data falsely passing" bug)
+// ---------------------------------------------------------------------------
+
+/// Today's IST trading-session SQL window, ready to drop into WHERE clauses.
+///
+/// **Why this exists:** before 2026-04-20 the cross-verify queries used a
+/// rolling `ts > dateadd('d', -3, now())` 3-day window. Because QuestDB data
+/// is persistent across app restarts (Docker volume), that window captured
+/// ticks from MANY prior trading sessions. Cross-match compared 12+ days of
+/// accumulated live ticks against the REST historical fetch — which trivially
+/// "passed" because both data sources come from Dhan. The OK was legitimate
+/// but meaningless for verifying TODAY's session.
+///
+/// `ts` in QuestDB was stored as IST-epoch (WebSocket LTT is IST epoch seconds
+/// per `data-integrity.md`). A literal like `'2026-04-20T09:15:00.000000Z'`
+/// is parsed by QuestDB as UTC-epoch for 09:15 on that date — which exactly
+/// matches the IST-epoch representation we stored for the IST 09:15 tick,
+/// because both share the same numeric value (IST wall clock treated as UTC).
+///
+/// The window is `[today_0915_ist, min(now_ist, today_1530_ist)]` so that:
+/// - During market hours → compare only what live has produced so far
+/// - Post-market → compare the full 09:15-15:30 session
+/// - Pre-market (before 09:15) → `from_utc` returns `None`
+///
+/// Production caller builds this via [`TodayIstWindow::from_now`]. Tests
+/// drive determinism via [`TodayIstWindow::from_utc`].
+#[derive(Debug, Clone)]
+pub struct TodayIstWindow {
+    /// IST date of "today" (used for Telegram labels like "TODAY ONLY: 2026-04-20").
+    pub today_ist: NaiveDate,
+    /// SQL-ready timestamp literal for window start (including quotes).
+    /// Example: `'2026-04-20T09:15:00.000000Z'`.
+    pub start_sql: String,
+    /// SQL-ready timestamp literal for window end (including quotes).
+    /// Example: `'2026-04-20T15:30:00.000000Z'` or earlier during the session.
+    pub end_sql: String,
+}
+
+impl TodayIstWindow {
+    /// Computes today's IST trading-session window from the current UTC time.
+    /// Returns `None` before 09:15 IST (no window exists yet).
+    pub fn from_now() -> Option<Self> {
+        Self::from_utc(Utc::now())
+    }
+
+    /// Computes today's IST trading-session window from a given UTC instant.
+    /// Pure function — suitable for deterministic tests.
+    pub fn from_utc(now_utc: DateTime<Utc>) -> Option<Self> {
+        // APPROVED: IST_UTC_OFFSET_SECONDS (19800) is a compile-time provable
+        // valid FixedOffset — same pattern as trading_calendar::ist_fixed_offset.
+        let ist = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS)?;
+        let now_ist = now_utc.with_timezone(&ist);
+        let today_ist = now_ist.date_naive();
+        let start_naive: NaiveDateTime = today_ist.and_hms_opt(9, 15, 0)?;
+        let market_end_naive: NaiveDateTime = today_ist.and_hms_opt(15, 30, 0)?;
+        let now_naive = now_ist.naive_local();
+        // Pre-market: nothing to compare yet.
+        if now_naive < start_naive {
+            return None;
+        }
+        let effective_end = if now_naive < market_end_naive {
+            now_naive
+        } else {
+            market_end_naive
+        };
+        Some(Self {
+            today_ist,
+            start_sql: format!("'{}'", start_naive.format("%Y-%m-%dT%H:%M:%S.000000Z")),
+            end_sql: format!("'{}'", effective_end.format("%Y-%m-%dT%H:%M:%S.000000Z")),
+        })
+    }
+
+    /// Returns the SQL fragment `ts >= '...' AND ts <= '...'` suitable for
+    /// dropping into any WHERE clause. Replaces the old
+    /// `ts > dateadd('d', -3, now())` 3-day window.
+    pub fn where_clause(&self) -> String {
+        format!(
+            "ts >= {start} AND ts <= {end}",
+            start = self.start_sql,
+            end = self.end_sql,
+        )
+    }
+
+    /// Same as [`where_clause`] but prefixed with a table alias
+    /// (e.g. `"h"` → `h.ts >= '...' AND h.ts <= '...'`).
+    pub fn where_clause_aliased(&self, alias: &str) -> String {
+        format!(
+            "{alias}.ts >= {start} AND {alias}.ts <= {end}",
+            start = self.start_sql,
+            end = self.end_sql,
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Once-per-day success cache (Parthiban directive, 2026-04-20):
+// "post verification only once per day until it achieves success"
+// ---------------------------------------------------------------------------
+
+/// Returns the on-disk marker path used to record that today's cross-
+/// verification + cross-match BOTH succeeded. Filename embeds the IST
+/// trading date so a single file is naturally per-day. Lives under
+/// `data/cache/` alongside other one-shot daily markers.
+pub fn cross_verify_success_marker_path(today_ist: NaiveDate) -> std::path::PathBuf {
+    std::path::PathBuf::from("data/cache").join(format!(
+        "cross-verify-success-{}.marker",
+        today_ist.format("%Y-%m-%d")
+    ))
+}
+
+/// `true` when today's cross-verification has already succeeded earlier
+/// in the same trading day (marker file present). The caller skips the
+/// whole post-market verification block when this returns true — fixes
+/// the "every restart re-runs the verification even though it already
+/// passed" failure mode that blew up the operator's Telegram on
+/// crash-recovery boots.
+pub fn cross_verify_already_succeeded_today(today_ist: NaiveDate) -> bool {
+    cross_verify_success_marker_path(today_ist).exists()
+}
+
+/// Records that today's cross-verification + cross-match both passed.
+/// Best-effort: returns the std::io error so the caller can decide
+/// whether to surface it; not panicking lets the verification still
+/// "succeed" in the operator's eyes even if disk write fails.
+pub fn mark_cross_verify_success(today_ist: NaiveDate) -> std::io::Result<()> {
+    let path = cross_verify_success_marker_path(today_ist);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, today_ist.to_string())
+}
 
 // ---------------------------------------------------------------------------
 // Pure Helper Functions (extracted for testability)
@@ -494,6 +661,20 @@ fn classify_cross_match_row(
         oi_mismatch,
     });
 
+    let field_deltas = build_field_deltas(
+        hist,
+        live,
+        &FieldDeltaFlags {
+            d_open,
+            d_high,
+            d_low,
+            d_close,
+            epsilon: CROSS_MATCH_PRICE_EPSILON,
+            volume_mismatch,
+            oi_mismatch,
+        },
+    );
+
     Some(CrossMatchMismatch {
         symbol: ctx.symbol,
         segment: ctx.segment,
@@ -503,7 +684,94 @@ fn classify_cross_match_row(
         hist_values: hist.format_with_oi(),
         live_values: live.format_with_oi(),
         diff_summary,
+        field_deltas,
     })
+}
+
+/// Flags driving `build_field_deltas` — mirrors `DiffSummaryParams` so both
+/// the compact summary and the expanded per-field delta list are computed
+/// from the same price/volume/OI deltas.
+struct FieldDeltaFlags {
+    d_open: f64,
+    d_high: f64,
+    d_low: f64,
+    d_close: f64,
+    epsilon: f64,
+    volume_mismatch: bool,
+    oi_mismatch: bool,
+}
+
+/// Produces one `FieldDelta` per differing OHLCV (+OI) field. Kept pure +
+/// mirrors `build_diff_summary` field ordering so Telegram output reads
+/// top-to-bottom in the same order as compact logs (open → high → low →
+/// close → volume → open_interest).
+fn build_field_deltas(
+    hist: CandleValues,
+    live: CandleValues,
+    flags: &FieldDeltaFlags,
+) -> Vec<FieldDelta> {
+    let mut out: Vec<FieldDelta> = Vec::new();
+    if flags.d_open.abs() > flags.epsilon {
+        out.push(FieldDelta {
+            field: "open".to_string(),
+            hist: hist.open,
+            live: live.open,
+            delta: flags.d_open,
+            is_integer: false,
+        });
+    }
+    if flags.d_high.abs() > flags.epsilon {
+        out.push(FieldDelta {
+            field: "high".to_string(),
+            hist: hist.high,
+            live: live.high,
+            delta: flags.d_high,
+            is_integer: false,
+        });
+    }
+    if flags.d_low.abs() > flags.epsilon {
+        out.push(FieldDelta {
+            field: "low".to_string(),
+            hist: hist.low,
+            live: live.low,
+            delta: flags.d_low,
+            is_integer: false,
+        });
+    }
+    if flags.d_close.abs() > flags.epsilon {
+        out.push(FieldDelta {
+            field: "close".to_string(),
+            hist: hist.close,
+            live: live.close,
+            delta: flags.d_close,
+            is_integer: false,
+        });
+    }
+    if flags.volume_mismatch {
+        // APPROVED: cast — volumes stored as i64, hist<=9e18 by volume-range invariant.
+        let h_vol_f = hist.volume as f64;
+        let m_vol_f = live.volume as f64;
+        out.push(FieldDelta {
+            field: "volume".to_string(),
+            hist: h_vol_f,
+            live: m_vol_f,
+            delta: m_vol_f - h_vol_f,
+            is_integer: true,
+        });
+    }
+    if flags.oi_mismatch {
+        // APPROVED: cast — OI stored as i64.
+        let h_oi_f = hist.oi as f64;
+        let m_oi_f = live.oi as f64;
+        out.push(FieldDelta {
+            field: "open_interest".to_string(),
+            hist: h_oi_f,
+            live: m_oi_f,
+            delta: m_oi_f - h_oi_f,
+            is_integer: true,
+        });
+    }
+    out
 }
 
 /// Builds a `CrossMatchMismatch` for when live data is missing.
@@ -517,6 +785,9 @@ fn build_missing_live_mismatch(ctx: CandleContext, hist: CandleValues) -> CrossM
         hist_values: hist.format_with_oi(),
         live_values: "[MISSING — no live data for this candle]".to_string(),
         diff_summary: String::new(),
+        // No live side to compare against → no per-field deltas.
+        // Renderer falls back to the compact Hist+Live format.
+        field_deltas: Vec::new(),
     }
 }
 
@@ -714,6 +985,7 @@ fn failed_report() -> CrossVerificationReport {
 pub async fn verify_candle_integrity(
     questdb_config: &QuestDbConfig,
     registry: &InstrumentRegistry,
+    today_window: &TodayIstWindow,
 ) -> CrossVerificationReport {
     let base_url = format!(
         "http://{}:{}/exec",
@@ -731,15 +1003,22 @@ pub async fn verify_candle_integrity(
         }
     };
 
+    // Today's IST trading-session window — replaces the old rolling 3-day
+    // `dateadd('d', -3, now())` bound, which (because QuestDB persists across
+    // app restarts via Docker volume) captured up to 12 prior sessions'
+    // accumulated ticks. See `TodayIstWindow` docstring for the full rationale.
+    let ts_filter = today_window.where_clause();
+
     // --- Step 1: Per-timeframe coverage query ---
     // Groups by (timeframe, security_id) to get counts per instrument per timeframe.
-    // Use 3-day window to ensure daily candles (stamped at IST midnight = hour 0)
-    // are always captured regardless of when verification runs.
-    // Intraday candles from today are also within this window.
+    // Narrowed to TODAY ONLY (09:15-15:30 IST). Daily candles (stamped at IST
+    // midnight = hour 0 of the NEXT calendar day in the old semantics) are
+    // intentionally NOT captured by this intraday window — the daily cross-check
+    // happens on a separate path post-close.
     let coverage_query = format!(
         "SELECT timeframe, security_id, count() as candle_count \
          FROM {} \
-         WHERE ts > dateadd('d', -3, now()) \
+         WHERE {ts_filter} \
          GROUP BY timeframe, security_id \
          ORDER BY timeframe, candle_count DESC",
         QUESTDB_TABLE_HISTORICAL_CANDLES
@@ -791,7 +1070,7 @@ pub async fn verify_candle_integrity(
     // --- Step 3: OHLC consistency check (high < low) with details ---
     let ohlc_count_query = format!(
         "SELECT count() FROM {} \
-         WHERE ts > dateadd('d', -3, now()) AND high < low",
+         WHERE {ts_filter} AND high < low",
         QUESTDB_TABLE_HISTORICAL_CANDLES
     );
 
@@ -801,7 +1080,7 @@ pub async fn verify_candle_integrity(
         let ohlc_detail_query = format!(
             "SELECT security_id, segment, timeframe, ts, open, high, low, close, volume \
              FROM {} \
-             WHERE ts > dateadd('d', -3, now()) AND high < low \
+             WHERE {ts_filter} AND high < low \
              LIMIT {}",
             QUESTDB_TABLE_HISTORICAL_CANDLES, MAX_VIOLATION_DETAILS
         );
@@ -827,7 +1106,7 @@ pub async fn verify_candle_integrity(
     // --- Step 4: Data integrity check (non-positive prices) with details ---
     let data_count_query = format!(
         "SELECT count() FROM {} \
-         WHERE ts > dateadd('d', -3, now()) \
+         WHERE {ts_filter} \
          AND (open <= 0 OR high <= 0 OR low <= 0 OR close <= 0)",
         QUESTDB_TABLE_HISTORICAL_CANDLES
     );
@@ -838,7 +1117,7 @@ pub async fn verify_candle_integrity(
         let data_detail_query = format!(
             "SELECT security_id, segment, timeframe, ts, open, high, low, close, volume \
              FROM {} \
-             WHERE ts > dateadd('d', -3, now()) \
+             WHERE {ts_filter} \
              AND (open <= 0 OR high <= 0 OR low <= 0 OR close <= 0) \
              LIMIT {}",
             QUESTDB_TABLE_HISTORICAL_CANDLES, MAX_VIOLATION_DETAILS
@@ -870,7 +1149,7 @@ pub async fn verify_candle_integrity(
     // Any candle at 15:30+ is a violation regardless of timeframe.
     let ts_count_query = format!(
         "SELECT count() FROM {} \
-         WHERE ts > dateadd('d', -3, now()) \
+         WHERE {ts_filter} \
          AND timeframe != '1d' \
          AND (hour(ts) < 9 OR hour(ts) > 15 \
               OR (hour(ts) = 9 AND minute(ts) < 15) \
@@ -884,7 +1163,7 @@ pub async fn verify_candle_integrity(
         let ts_detail_query = format!(
             "SELECT security_id, segment, timeframe, ts, open, high, low, close, volume \
              FROM {} \
-             WHERE ts > dateadd('d', -3, now()) \
+             WHERE {ts_filter} \
              AND timeframe != '1d' \
              AND (hour(ts) < 9 OR hour(ts) > 15 \
                   OR (hour(ts) = 9 AND minute(ts) < 15) \
@@ -916,7 +1195,7 @@ pub async fn verify_candle_integrity(
     // NSE is closed on weekends — no trading, no settlement, no data.
     let weekend_count_query = format!(
         "SELECT count() FROM {} \
-         WHERE ts > dateadd('d', -3, now()) \
+         WHERE {ts_filter} \
          AND (day_of_week(ts) = 6 OR day_of_week(ts) = 7)",
         QUESTDB_TABLE_HISTORICAL_CANDLES
     );
@@ -927,7 +1206,7 @@ pub async fn verify_candle_integrity(
         let weekend_detail_query = format!(
             "SELECT security_id, segment, timeframe, ts, open, high, low, close, volume \
              FROM {} \
-             WHERE ts > dateadd('d', -3, now()) \
+             WHERE {ts_filter} \
              AND (day_of_week(ts) = 6 OR day_of_week(ts) = 7) \
              LIMIT {}",
             QUESTDB_TABLE_HISTORICAL_CANDLES, MAX_VIOLATION_DETAILS
@@ -1023,6 +1302,7 @@ pub async fn verify_candle_integrity(
 pub async fn cross_match_historical_vs_live(
     questdb_config: &QuestDbConfig,
     registry: &InstrumentRegistry,
+    today_window: &TodayIstWindow,
 ) -> CrossMatchReport {
     let base_url = format!(
         "http://{}:{}/exec",
@@ -1039,6 +1319,50 @@ pub async fn cross_match_historical_vs_live(
             return failed_cross_match_report();
         }
     };
+
+    // Today's IST trading-session window (see `TodayIstWindow`). `ts_filter`
+    // for unaliased queries (bare `candles_*` live tables); `ts_filter_h` for
+    // LEFT-JOIN queries that alias `historical_candles` as `h`.
+    let ts_filter = today_window.where_clause();
+    let ts_filter_h = today_window.where_clause_aliased("h");
+
+    // First-fetch gate (Parthiban directive, 2026-04-20): if today's live
+    // `candles_1m` view has ZERO rows, there is nothing meaningful to
+    // compare against — it's a first fetch, a fresh DB, or a post-market
+    // boot before the next session. Skip the entire cross-match with a
+    // clear `live_candles_present = false` signal so the caller emits the
+    // typed SKIPPED Telegram notification instead of running the full
+    // LEFT-JOIN pipeline against an empty live side (which would "succeed"
+    // vacuously with zero rows compared).
+    //
+    // The cheaper `candles_1m` probe is authoritative — if 1m is empty, no
+    // higher timeframe can possibly have data.
+    let live_probe_query = format!("SELECT count() FROM candles_1m WHERE {ts_filter}");
+    let live_probe_rows = extract_count(&client, &base_url, &live_probe_query).await;
+    if live_probe_rows == 0 {
+        info!(
+            today_ist = %today_window.today_ist,
+            window_start = %today_window.start_sql,
+            window_end = %today_window.end_sql,
+            "cross-match SKIPPED — zero live 1m candles for today's window \
+             (first fetch / fresh DB / pre-live-data boot)"
+        );
+        return CrossMatchReport {
+            timeframes_checked: 0,
+            candles_compared: 0,
+            mismatches: 0,
+            missing_live: 0,
+            missing_historical: 0,
+            oi_mismatches: 0,
+            mismatch_details: Vec::new(),
+            missing_views: Vec::new(),
+            per_timeframe_mismatches: Vec::new(),
+            passed: false,
+            // `false` → caller's main.rs:4285 branch fires the typed
+            // `CandleCrossMatchSkipped` Telegram notification.
+            live_candles_present: false,
+        };
+    }
 
     let mut total_compared = 0_usize;
     let mut total_mismatches = 0_usize;
@@ -1087,10 +1411,7 @@ pub async fn cross_match_historical_vs_live(
         // we still run the per-timeframe LEFT JOIN below for completeness
         // but the caller will refuse to emit "OK" without at least one
         // timeframe reporting live rows.
-        let live_count_query = format!(
-            "SELECT count() FROM {} WHERE ts > dateadd('d', -3, now())",
-            live_table
-        );
+        let live_count_query = format!("SELECT count() FROM {} WHERE {ts_filter}", live_table);
         let live_tf_rows = extract_count(&client, &base_url, &live_count_query).await;
         if live_tf_rows > 0 {
             live_candles_present = true;
@@ -1100,7 +1421,7 @@ pub async fn cross_match_historical_vs_live(
         let count_query = format!(
             "SELECT count() FROM {} h \
              LEFT JOIN {} m ON h.security_id = m.security_id AND h.ts = m.ts AND h.segment = m.segment \
-             WHERE h.timeframe = '{}' AND h.ts > dateadd('d', -3, now())",
+             WHERE h.timeframe = '{}' AND {ts_filter_h}",
             QUESTDB_TABLE_HISTORICAL_CANDLES, live_table, hist_tf
         );
 
@@ -1121,7 +1442,7 @@ pub async fn cross_match_historical_vs_live(
                     h.open_interest, m.open_interest \
              FROM {} h \
              LEFT JOIN {} m ON h.security_id = m.security_id AND h.ts = m.ts AND h.segment = m.segment \
-             WHERE h.timeframe = '{}' AND h.ts > dateadd('d', -3, now()) \
+             WHERE h.timeframe = '{}' AND {ts_filter_h} \
              AND (m.open IS NULL \
                   OR abs(h.open - m.open) > {eps} \
                   OR abs(h.high - m.high) > {eps} \
@@ -1370,6 +1691,220 @@ async fn parse_cross_match_rows_with_oi(
 mod tests {
     use super::*;
 
+    // -----------------------------------------------------------------------
+    // TodayIstWindow — today-only SQL window (fixes "12 days accumulated" bug)
+    // -----------------------------------------------------------------------
+
+    /// Build a UTC instant equivalent to an IST wall-clock time on the given date.
+    fn utc_at_ist(year: i32, month: u32, day: u32, ist_h: u32, ist_m: u32) -> DateTime<Utc> {
+        // IST is UTC+5:30 → subtract 5:30 from IST wall-clock to get UTC.
+        let naive_ist = NaiveDate::from_ymd_opt(year, month, day)
+            .expect("valid date")
+            .and_hms_opt(ist_h, ist_m, 0)
+            .expect("valid time");
+        let naive_utc = naive_ist - chrono::Duration::seconds(i64::from(IST_UTC_OFFSET_SECONDS));
+        DateTime::<Utc>::from_naive_utc_and_offset(naive_utc, Utc)
+    }
+
+    #[test]
+    fn test_from_utc_pre_market_returns_none() {
+        // 09:14 IST — 1 minute before market open — should return None.
+        let now = utc_at_ist(2026, 4, 20, 9, 14);
+        assert!(TodayIstWindow::from_utc(now).is_none());
+    }
+
+    #[test]
+    fn test_from_utc_at_market_open_returns_some_at_boundary() {
+        // Exactly 09:15 IST — boundary, should be Some with start == end.
+        let now = utc_at_ist(2026, 4, 20, 9, 15);
+        let w = TodayIstWindow::from_utc(now).expect("at boundary is inclusive");
+        assert_eq!(w.today_ist, NaiveDate::from_ymd_opt(2026, 4, 20).unwrap());
+        assert!(w.start_sql.contains("T09:15:00"));
+        // now == start → effective_end == start
+        assert_eq!(w.start_sql, w.end_sql);
+    }
+
+    #[test]
+    fn test_today_ist_window_mid_session_clamps_end_to_now() {
+        // 12:00 IST — mid-session — window end should be 12:00, not 15:30.
+        let now = utc_at_ist(2026, 4, 20, 12, 0);
+        let w = TodayIstWindow::from_utc(now).expect("mid-session window exists");
+        assert!(w.start_sql.contains("T09:15:00"));
+        assert!(w.end_sql.contains("T12:00:00"));
+    }
+
+    #[test]
+    fn test_today_ist_window_post_market_clamps_end_to_1530() {
+        // 18:00 IST — post-market — end should be 15:30, not 18:00.
+        let now = utc_at_ist(2026, 4, 20, 18, 0);
+        let w = TodayIstWindow::from_utc(now).expect("post-market window exists");
+        assert!(w.start_sql.contains("T09:15:00"));
+        assert!(
+            w.end_sql.contains("T15:30:00"),
+            "post-market end must clamp to 15:30: {}",
+            w.end_sql
+        );
+    }
+
+    #[test]
+    fn test_today_ist_window_at_market_close_returns_full_session() {
+        // Exactly 15:30 IST — close boundary — should clamp to 15:30.
+        let now = utc_at_ist(2026, 4, 20, 15, 30);
+        let w = TodayIstWindow::from_utc(now).expect("close boundary window exists");
+        assert!(w.end_sql.contains("T15:30:00"));
+    }
+
+    #[test]
+    fn test_today_ist_window_where_clause_format() {
+        let now = utc_at_ist(2026, 4, 20, 12, 0);
+        let w = TodayIstWindow::from_utc(now).unwrap();
+        let clause = w.where_clause();
+        assert!(clause.starts_with("ts >= '"), "got: {clause}");
+        assert!(
+            clause.contains(" AND ts <= '"),
+            "clause must be bounded both sides: {clause}"
+        );
+        assert!(clause.contains("2026-04-20T09:15:00"));
+        assert!(clause.contains("2026-04-20T12:00:00"));
+    }
+
+    #[test]
+    fn test_today_ist_window_where_clause_aliased_format() {
+        let now = utc_at_ist(2026, 4, 20, 12, 0);
+        let w = TodayIstWindow::from_utc(now).unwrap();
+        let clause = w.where_clause_aliased("h");
+        assert!(clause.starts_with("h.ts >= '"), "got: {clause}");
+        assert!(clause.contains(" AND h.ts <= '"));
+        // Every `ts` reference must carry the `h.` alias — there should be
+        // exactly two (one for `>=`, one for `<=`) and no bare ones.
+        assert_eq!(
+            clause.matches("h.ts").count(),
+            2,
+            "expected exactly 2 h.ts references: {clause}"
+        );
+    }
+
+    #[test]
+    fn test_from_now_returns_some_during_market_or_none_otherwise() {
+        // Smoke-covers `from_now`: the wrapper over `from_utc(Utc::now())`.
+        // We can't assert a specific value since "now" depends on CI clock,
+        // but we can assert it doesn't panic and returns the Option shape.
+        let _ = TodayIstWindow::from_now();
+    }
+
+    #[test]
+    fn test_from_utc_is_stable_across_day_boundary() {
+        // 2026-04-20 23:59 UTC == 2026-04-21 05:29 IST — still today-ist = 21,
+        // but 05:29 is pre-market → None.
+        let now = DateTime::<Utc>::from_naive_utc_and_offset(
+            NaiveDate::from_ymd_opt(2026, 4, 20)
+                .unwrap()
+                .and_hms_opt(23, 59, 0)
+                .unwrap(),
+            Utc,
+        );
+        assert!(
+            TodayIstWindow::from_utc(now).is_none(),
+            "pre-market on the NEXT IST day must return None"
+        );
+    }
+
+    #[test]
+    fn test_today_ist_window_rolls_over_at_ist_midnight() {
+        // 18:45 UTC on 2026-04-20 == 00:15 IST on 2026-04-21.
+        // That's pre-market on 2026-04-21 IST → None, and `today_ist` would
+        // be 21 if a window existed.
+        let now = DateTime::<Utc>::from_naive_utc_and_offset(
+            NaiveDate::from_ymd_opt(2026, 4, 20)
+                .unwrap()
+                .and_hms_opt(18, 45, 0)
+                .unwrap(),
+            Utc,
+        );
+        assert!(TodayIstWindow::from_utc(now).is_none());
+    }
+
+    #[test]
+    fn test_today_ist_window_sql_literal_microsecond_padding() {
+        let now = utc_at_ist(2026, 4, 20, 12, 0);
+        let w = TodayIstWindow::from_utc(now).unwrap();
+        // QuestDB timestamp literal requires the `.000000Z` suffix
+        // (microsecond precision) — don't drop it, QuestDB is strict.
+        assert!(
+            w.start_sql.contains(".000000Z"),
+            "start must carry microsecond suffix: {}",
+            w.start_sql
+        );
+        assert!(
+            w.end_sql.contains(".000000Z"),
+            "end must carry microsecond suffix: {}",
+            w.end_sql
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Once-per-day success marker (Parthiban directive 2026-04-20:
+    //   "only once in a day until it achieves success")
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_cross_verify_success_marker_path_includes_date() {
+        let date = NaiveDate::from_ymd_opt(2026, 4, 20).unwrap();
+        let path = cross_verify_success_marker_path(date);
+        let s = path.to_string_lossy();
+        assert!(
+            s.contains("cross-verify-success-2026-04-20"),
+            "marker filename must embed the IST date so it's per-day; got: {s}"
+        );
+        assert!(
+            s.ends_with(".marker"),
+            "marker file extension expected; got: {s}"
+        );
+    }
+
+    #[test]
+    fn test_cross_verify_success_marker_path_changes_per_day() {
+        let d1 = NaiveDate::from_ymd_opt(2026, 4, 20).unwrap();
+        let d2 = NaiveDate::from_ymd_opt(2026, 4, 21).unwrap();
+        assert_ne!(
+            cross_verify_success_marker_path(d1),
+            cross_verify_success_marker_path(d2),
+            "marker path must be per-day so yesterday's success doesn't shadow today"
+        );
+    }
+
+    #[test]
+    fn test_cross_verify_already_succeeded_today_false_when_marker_absent() {
+        // A date so far in the future no marker can ever exist on-disk.
+        let date = NaiveDate::from_ymd_opt(2099, 12, 31).unwrap();
+        assert!(
+            !cross_verify_already_succeeded_today(date),
+            "no marker file → should return false"
+        );
+    }
+
+    #[test]
+    fn test_mark_cross_verify_success_then_already_succeeded_returns_true() {
+        // Use today's date for a real round-trip — write then check then
+        // delete to leave the working tree clean for subsequent runs.
+        // Best-effort cleanup; if the test crashes mid-way the marker is
+        // for "today" anyway and is harmless next time.
+        let date = NaiveDate::from_ymd_opt(2026, 4, 20).unwrap();
+        let marker = cross_verify_success_marker_path(date);
+        // Pre-clean in case a stale marker from a previous test exists.
+        let _ = std::fs::remove_file(&marker);
+        assert!(!cross_verify_already_succeeded_today(date));
+
+        mark_cross_verify_success(date).expect("write marker");
+        assert!(
+            cross_verify_already_succeeded_today(date),
+            "after writing marker, idempotency check must return true"
+        );
+
+        // Cleanup — leave repo clean for re-runs.
+        let _ = std::fs::remove_file(&marker);
+    }
+
     #[test]
     fn test_cross_verification_report_default_values() {
         let report = CrossVerificationReport {
@@ -1545,9 +2080,26 @@ mod tests {
             hist_values: "O=3520.0 H=3535.0 L=3518.0 C=3530.0 V=45000".to_string(),
             live_values: "O=3520.0 H=3535.0 L=3518.0 C=3528.5 V=42100".to_string(),
             diff_summary: "C(-1.5) V(-2900)".to_string(),
+            field_deltas: vec![
+                FieldDelta {
+                    field: "close".to_string(),
+                    hist: 3530.0,
+                    live: 3528.5,
+                    delta: -1.5,
+                    is_integer: false,
+                },
+                FieldDelta {
+                    field: "volume".to_string(),
+                    hist: 45000.0,
+                    live: 42100.0,
+                    delta: -2900.0,
+                    is_integer: true,
+                },
+            ],
         };
         assert_eq!(mismatch.mismatch_type, "price_diff");
         assert!(mismatch.diff_summary.contains("C(-1.5)"));
+        assert_eq!(mismatch.field_deltas.len(), 2);
     }
 
     #[test]
@@ -1561,9 +2113,13 @@ mod tests {
             hist_values: "O=23480.0 H=23510.0 L=23475.0 C=23505.0 V=0".to_string(),
             live_values: "[MISSING — no live data for this candle]".to_string(),
             diff_summary: String::new(),
+            // missing_live rows carry no per-field deltas — renderer
+            // falls back to the compact Hist+Live format.
+            field_deltas: Vec::new(),
         };
         assert_eq!(mismatch.mismatch_type, "missing_live");
         assert!(mismatch.live_values.contains("MISSING"));
+        assert!(mismatch.field_deltas.is_empty());
     }
 
     #[test]
@@ -1770,7 +2326,9 @@ mod tests {
             ilp_port: 1,
         };
         let registry = InstrumentRegistry::empty();
-        let report = verify_candle_integrity(&config, &registry).await;
+        let window = TodayIstWindow::from_utc(utc_at_ist(2026, 4, 20, 12, 0))
+            .expect("mid-session test window");
+        let report = verify_candle_integrity(&config, &registry, &window).await;
         assert!(!report.passed);
         assert_eq!(report.instruments_checked, 0);
     }
@@ -1784,7 +2342,9 @@ mod tests {
             ilp_port: 1,
         };
         let registry = InstrumentRegistry::empty();
-        let report = cross_match_historical_vs_live(&config, &registry).await;
+        let window = TodayIstWindow::from_utc(utc_at_ist(2026, 4, 20, 12, 0))
+            .expect("mid-session test window");
+        let report = cross_match_historical_vs_live(&config, &registry, &window).await;
         assert!(!report.passed);
         assert_eq!(report.candles_compared, 0);
     }

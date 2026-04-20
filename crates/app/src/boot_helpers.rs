@@ -139,21 +139,83 @@ pub fn format_violation_details(details: &[ViolationDetail]) -> Vec<String> {
 }
 
 /// Formats `CrossMatchMismatch` records into pre-formatted Telegram lines.
+///
+/// Prefers the **expanded per-field Δ format** when `field_deltas` is
+/// non-empty:
+///
+/// ```text
+/// • RELIANCE (NSE_EQ) 1m @ 2026-04-20 10:15 IST
+///     open      : hist=2847.50 live=2847.00  Δ=+0.50
+///     volume    : hist=5000000 live=4999800  Δ=+200
+/// ```
+///
+/// Falls back to the compact legacy Hist+Live+Diff format when
+/// `field_deltas` is empty — which happens for `missing_live` rows (no
+/// live side to delta against) and for test fixtures pre-dating Pass E.
 pub fn format_cross_match_details(details: &[CrossMatchMismatch]) -> Vec<String> {
     details
         .iter()
         .map(|d| {
-            let mut line = format!(
-                "\u{2022} {} ({}) {} @ {}\n  Hist: {}",
-                d.symbol, d.segment, d.timeframe, d.timestamp_ist, d.hist_values
+            let header = format!(
+                "\u{2022} {} ({}) {} @ {}",
+                d.symbol, d.segment, d.timeframe, d.timestamp_ist
             );
-            line.push_str(&format!("\n  Live: {}", d.live_values));
-            if !d.diff_summary.is_empty() {
-                line.push_str(&format!("\n  Diff: {}", d.diff_summary));
+            if d.field_deltas.is_empty() {
+                // Legacy / missing_live path — compact display.
+                let mut line = header;
+                line.push_str(&format!("\n  Hist: {}", d.hist_values));
+                line.push_str(&format!("\n  Live: {}", d.live_values));
+                if !d.diff_summary.is_empty() {
+                    line.push_str(&format!("\n  Diff: {}", d.diff_summary));
+                }
+                return line;
+            }
+            // Expanded per-field Δ format (Pass E — Parthiban directive
+            // 2026-04-20: one line per OHLCV field with hist/live/Δ).
+            let mut line = header;
+            for f in &d.field_deltas {
+                line.push_str("\n  ");
+                line.push_str(&format_field_delta_line(f));
             }
             line
         })
         .collect()
+}
+
+/// Formats a single `FieldDelta` as one Telegram line:
+///   `open      : hist=2847.50 live=2847.00  Δ=+0.50`
+///
+/// Number rendering adapts to the field type:
+/// - `is_integer = true`  (volume / OI) → locale-free integer display
+/// - `is_integer = false` (OHLC prices) → two-decimal fixed-point
+///
+/// The Δ is always signed (`+` or `-`) so the direction is at-a-glance.
+fn format_field_delta_line(f: &tickvault_core::historical::cross_verify::FieldDelta) -> String {
+    // Field name padded to 13 chars so the colon aligns down the list
+    // (longest name is "open_interest" = 13). Monospace Telegram font
+    // honours this alignment.
+    let render = |v: f64| -> String {
+        if f.is_integer {
+            // APPROVED: f64→i64 cast — volumes/OI were built from i64
+            // before widening to f64 for the delta. Round-trip-safe for
+            // all representable i64 values up to 2^53.
+            format!("{}", v as i64)
+        } else {
+            format!("{v:.2}")
+        }
+    };
+    let delta_str = if f.is_integer {
+        format!("{:+}", f.delta as i64)
+    } else {
+        format!("{:+.2}", f.delta)
+    };
+    format!(
+        "{name:<13}: hist={hist} live={live}  \u{0394}={delta}",
+        name = f.field,
+        hist = render(f.hist),
+        live = render(f.live),
+        delta = delta_str,
+    )
 }
 
 /// Computes the sleep duration until the given market close time (IST).
@@ -710,6 +772,10 @@ mod tests {
             hist_values: hist_values.to_string(),
             live_values: live_values.to_string(),
             diff_summary: diff_summary.to_string(),
+            // These fixture tests predate Pass E's `field_deltas` and only
+            // exercise the compact-legacy rendering path (empty vec forces
+            // the formatter into that branch).
+            field_deltas: Vec::new(),
         }
     }
 
@@ -1237,6 +1303,120 @@ mod tests {
         let lines: Vec<&str> = result[0].lines().collect();
         assert!(lines.len() >= 3);
         assert!(lines[0].contains("SYM"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Pass E: expanded per-field Δ format (Parthiban directive 2026-04-20)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_format_cross_match_details_expanded_per_field_format() {
+        use tickvault_core::historical::cross_verify::FieldDelta;
+        let mismatch = CrossMatchMismatch {
+            symbol: "RELIANCE".to_string(),
+            segment: "NSE_EQ".to_string(),
+            timeframe: "1m".to_string(),
+            timestamp_ist: "2026-04-20 10:15 IST".to_string(),
+            mismatch_type: "price_diff".to_string(),
+            hist_values: "O=2847.50 H=2850.00 L=2845.00 C=2847.00 V=125000".to_string(),
+            live_values: "O=2847.00 H=2850.00 L=2845.00 C=2847.00 V=125200".to_string(),
+            diff_summary: "O(+0.50) V(+200)".to_string(),
+            field_deltas: vec![
+                FieldDelta {
+                    field: "open".to_string(),
+                    hist: 2847.50,
+                    live: 2847.00,
+                    delta: -0.50,
+                    is_integer: false,
+                },
+                FieldDelta {
+                    field: "volume".to_string(),
+                    hist: 125_000.0,
+                    live: 125_200.0,
+                    delta: 200.0,
+                    is_integer: true,
+                },
+            ],
+        };
+        let result = format_cross_match_details(std::slice::from_ref(&mismatch));
+        assert_eq!(result.len(), 1);
+        let rendered = &result[0];
+
+        // Header line preserved.
+        assert!(rendered.contains("RELIANCE"), "header present: {rendered}");
+        assert!(rendered.contains("1m @ 2026-04-20 10:15 IST"));
+
+        // One line per field with hist/live/Δ — NOT the compact Hist:/Live: form.
+        assert!(
+            rendered.contains("open"),
+            "field name 'open' must appear: {rendered}"
+        );
+        assert!(
+            rendered.contains("hist=2847.50"),
+            "price rendered to 2 decimals: {rendered}"
+        );
+        assert!(
+            rendered.contains("live=2847.00"),
+            "price live value: {rendered}"
+        );
+        assert!(
+            rendered.contains("\u{0394}=-0.50"),
+            "signed delta with Δ symbol: {rendered}"
+        );
+
+        // Volume uses integer format (no trailing .00, no scientific notation).
+        assert!(
+            rendered.contains("hist=125000"),
+            "volume as integer: {rendered}"
+        );
+        assert!(
+            rendered.contains("\u{0394}=+200"),
+            "integer delta is positive with +: {rendered}"
+        );
+
+        // Compact legacy `Hist:` / `Live:` / `Diff:` labels are SUPPRESSED
+        // when field_deltas is populated — we render the expanded form only.
+        assert!(
+            !rendered.contains("Hist:"),
+            "expanded format must not also show compact Hist: line: {rendered}"
+        );
+        assert!(
+            !rendered.contains("Diff:"),
+            "expanded format must not also show compact Diff: line: {rendered}"
+        );
+    }
+
+    #[test]
+    fn test_format_cross_match_details_missing_live_keeps_legacy_compact_format() {
+        // missing_live rows have empty field_deltas by construction — the
+        // formatter must fall back to the compact Hist: + Live: form so the
+        // operator still sees "[MISSING — no live data for this candle]".
+        let mismatch = CrossMatchMismatch {
+            symbol: "NIFTY".to_string(),
+            segment: "IDX_I".to_string(),
+            timeframe: "5m".to_string(),
+            timestamp_ist: "2026-04-20 11:30 IST".to_string(),
+            mismatch_type: "missing_live".to_string(),
+            hist_values: "O=24500.0 H=24510.0 L=24495.0 C=24505.0 V=0".to_string(),
+            live_values: "[MISSING — no live data for this candle]".to_string(),
+            diff_summary: String::new(),
+            field_deltas: Vec::new(),
+        };
+        let result = format_cross_match_details(std::slice::from_ref(&mismatch));
+        let rendered = &result[0];
+        assert!(
+            rendered.contains("Hist:"),
+            "compact Hist: expected: {rendered}"
+        );
+        assert!(
+            rendered.contains("[MISSING"),
+            "missing-live marker preserved: {rendered}"
+        );
+        // No Δ lines — nothing to delta against.
+        assert!(
+            !rendered.contains("\u{0394}="),
+            "no Δ lines without live side: {rendered}"
+        );
     }
 
     #[test]

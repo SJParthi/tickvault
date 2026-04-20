@@ -2293,28 +2293,45 @@ async fn main() -> Result<()> {
 
                 let (atm_ce, atm_pe): (Option<(u32, String)>, Option<(u32, String)>) =
                     if let Some(sel) = selection {
-                        // ATM CE = first call in selection (ATM index), PE = first put
-                        let ce = sel.call_security_ids.first().map(|&sid| {
-                            (
-                                sid,
+                        // CRITICAL: use the dedicated `atm_ce_security_id` /
+                        // `atm_pe_security_id` fields — NOT `.first()` on the
+                        // range vectors. `.first()` returns the LOWEST strike
+                        // in the ATM ± N band, not the ATM itself, so pairing
+                        // it with the center-strike label produced
+                        // Telegram messages like
+                        // `BANKNIFTY-Apr2026-56700-PE (SID 67481)` where the
+                        // SID actually pointed at strike 54300. See
+                        // `depth_strike_selector::DepthStrikeSelection` docs.
+                        //
+                        // LABEL POLICY: prefer the Dhan CSV `display_name`
+                        // (e.g. "BANKNIFTY 28 APR 54300 PUT") over the
+                        // synthesized `UNDERLYING-MmmYYYY-STRIKE-SIDE`
+                        // format, because it matches Dhan's own web UI
+                        // character-for-character. Fall back to the
+                        // synthesized label only if the registry lookup
+                        // didn't populate `display_name` (should not
+                        // happen for contracts present in the CSV).
+                        let ce = sel.atm_ce_security_id.map(|sid| {
+                            let label = sel.atm_ce_display_name.clone().unwrap_or_else(|| {
                                 build_precise_label(
                                     underlying,
                                     sel.expiry_date,
                                     sel.atm_strike,
                                     "CE",
-                                ),
-                            )
+                                )
+                            });
+                            (sid, label)
                         });
-                        let pe = sel.put_security_ids.first().map(|&sid| {
-                            (
-                                sid,
+                        let pe = sel.atm_pe_security_id.map(|sid| {
+                            let label = sel.atm_pe_display_name.clone().unwrap_or_else(|| {
                                 build_precise_label(
                                     underlying,
                                     sel.expiry_date,
                                     sel.atm_strike,
                                     "PE",
-                                ),
-                            )
+                                )
+                            });
+                            (sid, label)
                         });
                         (ce, pe)
                     } else {
@@ -3099,6 +3116,13 @@ async fn main() -> Result<()> {
                             .expiry
                             .map_or_else(|| "?".to_string(), |e| e.format("%b%Y").to_string());
 
+                        // Format a rebalance contract line for Telegram. Prefer
+                        // the Dhan CSV `display_name` (e.g.
+                        // "BANKNIFTY 28 APR 54300 PUT (SID 67481)") — it
+                        // matches Dhan's web UI verbatim and is the string the
+                        // operator is most likely to search for. Fall back to
+                        // the synthesized `UNDERLYING-MmmYYYY-STRIKE-SIDE`
+                        // only if the registry lookup didn't populate it.
                         let fmt_contract = |atm: &Option<
                             tickvault_core::instrument::depth_strike_selector::AtmIds,
                         >,
@@ -3106,15 +3130,19 @@ async fn main() -> Result<()> {
                          -> String {
                             match atm {
                                 Some(ids) => {
-                                    let sid = if opt == "CE" {
-                                        ids.ce_id
+                                    let (sid, display) = if opt == "CE" {
+                                        (ids.ce_id, ids.ce_display_name.as_deref())
                                     } else {
-                                        ids.pe_id.unwrap_or(0)
+                                        (ids.pe_id.unwrap_or(0), ids.pe_display_name.as_deref())
                                     };
-                                    format!(
-                                        "{}-{}-{:.0}-{} ({})",
-                                        ul, expiry_str, ids.strike, opt, sid
-                                    )
+                                    if let Some(name) = display {
+                                        format!("{name} (SID {sid})")
+                                    } else {
+                                        format!(
+                                            "{}-{}-{:.0}-{} ({})",
+                                            ul, expiry_str, ids.strike, opt, sid
+                                        )
+                                    }
                                 }
                                 None => "—".to_string(),
                             }
@@ -4202,9 +4230,83 @@ fn spawn_historical_candle_fetch(
         }
 
         // -----------------------------------------------------------------
+        // Cross-verify + cross-match: TODAY-ONLY window gating
+        //
+        // Gate both operations on:
+        //  1. `is_trading_day` — weekend / NSE holiday → skip with a typed
+        //     SKIPPED notification so operator gets closure on Telegram.
+        //  2. `TodayIstWindow::from_now()` — pre-market (before 09:15 IST)
+        //     on a trading day → SILENT skip (INFO log only, NO Telegram).
+        //     Per Parthiban directive 2026-04-20:
+        //       "pre market cross verification should never ever be done
+        //        especially on trading days"
+        //     Verification needs live data; running it pre-market is
+        //     guaranteed-empty noise. The post-market timer will fire it
+        //     correctly once live ticks land.
+        //  3. Once-per-day success cache —
+        //     `cross_verify_already_succeeded_today` checks for a marker
+        //     file written after BOTH verify + match passed earlier today.
+        //     Per Parthiban directive 2026-04-20:
+        //       "even for post verification also only once in a day until
+        //        it achieves success verification should be done"
+        //     If today already succeeded, skip silently.
+        //
+        // Otherwise pass the window to both functions so their SQL WHERE
+        // clauses are narrowed to today's 09:15-15:30 IST session.
+        // -----------------------------------------------------------------
+        let today_window = if is_trading_day {
+            tickvault_core::historical::cross_verify::TodayIstWindow::from_now()
+        } else {
+            None
+        };
+
+        let Some(today_window) = today_window else {
+            if !is_trading_day {
+                // Weekend / holiday — operator-visible SKIPPED notification.
+                let reason = "weekend or holiday — not a trading day".to_string();
+                info!(
+                    instruments_fetched = summary.instruments_fetched,
+                    instruments_failed = summary.instruments_failed,
+                    total_candles = summary.total_candles,
+                    %reason,
+                    "cross-verify + cross-match SKIPPED"
+                );
+                bg_notifier.notify(NotificationEvent::CandleCrossMatchSkipped {
+                    reason,
+                    candles_compared: 0,
+                });
+            } else {
+                // Pre-market on a trading day — silent skip per Parthiban
+                // directive. INFO log only; NO Telegram notification.
+                info!(
+                    instruments_fetched = summary.instruments_fetched,
+                    instruments_failed = summary.instruments_failed,
+                    total_candles = summary.total_candles,
+                    "cross-verify + cross-match SILENTLY skipped — pre-market on trading day (will run post-market)"
+                );
+            }
+            return;
+        };
+
+        // Once-per-day success idempotency. The marker is written below
+        // after BOTH verify + match succeed. Crash-recovery boots and
+        // mid-day restarts therefore won't re-fire the verification.
+        if tickvault_core::historical::cross_verify::cross_verify_already_succeeded_today(
+            today_window.today_ist,
+        ) {
+            info!(
+                today_ist = %today_window.today_ist,
+                marker = ?tickvault_core::historical::cross_verify::cross_verify_success_marker_path(today_window.today_ist),
+                "cross-verify SILENTLY skipped — today's verification already succeeded earlier (marker present)"
+            );
+            return;
+        }
+
+        // -----------------------------------------------------------------
         // Cross-verify candle integrity in QuestDB
         // -----------------------------------------------------------------
-        let verify_report = verify_candle_integrity(&bg_questdb_config, &bg_registry).await;
+        let verify_report =
+            verify_candle_integrity(&bg_questdb_config, &bg_registry, &today_window).await;
         let timeframe_details = format_timeframe_details(&verify_report);
         if verify_report.passed {
             bg_notifier.notify(NotificationEvent::CandleVerificationPassed {
@@ -4233,12 +4335,12 @@ fn spawn_historical_candle_fetch(
         }
 
         // -----------------------------------------------------------------
-        // Cross-match historical vs live candle data (trading day only —
-        // on non-trading days there's no live data to compare against)
+        // Cross-match historical vs live candle data
         // -----------------------------------------------------------------
-        if is_trading_day {
+        {
             let cross_match =
-                cross_match_historical_vs_live(&bg_questdb_config, &bg_registry).await;
+                cross_match_historical_vs_live(&bg_questdb_config, &bg_registry, &today_window)
+                    .await;
 
             if !cross_match.live_candles_present || cross_match.candles_compared == 0 {
                 // First run / fresh DB / post-market boot with no live ticks yet.
@@ -4258,30 +4360,90 @@ fn spawn_historical_candle_fetch(
                     reason: "no live data in materialized views".to_string(),
                     candles_compared: cross_match.candles_compared,
                 });
-            } else if cross_match.passed {
-                bg_notifier.notify(NotificationEvent::CandleCrossMatchPassed {
-                    timeframes_checked: cross_match.timeframes_checked,
-                    candles_compared: cross_match.candles_compared,
-                });
             } else {
-                // Build per-timeframe summary for Telegram (e.g., "1m: 3 | 5m: 0 | 15m: 1")
-                let tf_summary: String = cross_match
-                    .per_timeframe_mismatches
-                    .iter()
-                    .map(|(tf, count)| format!("{tf}: {count}"))
-                    .collect::<Vec<_>>()
-                    .join(" | ");
-                let mut details = format_cross_match_details(&cross_match.mismatch_details);
-                // Prepend per-timeframe summary as first line
-                if !tf_summary.is_empty() {
-                    details.insert(0, format!("Per-timeframe: {tf_summary}"));
+                // Compute the "TODAY ONLY: YYYY-MM-DD HH:MM–HH:MM IST" label
+                // once and pass to both pass/fail notifications so the operator
+                // immediately sees which trading session the OK/FAIL covers.
+                // The start/end SQL literals on `today_window` look like
+                // `'2026-04-20T09:15:00.000000Z'` — we strip the quotes + the
+                // date + `.000000Z` suffix to render a human-readable
+                // `HH:MM` slice of the IST wall clock.
+                let today_ist_label = {
+                    let date_str = today_window.today_ist.format("%Y-%m-%d").to_string();
+                    let hm = |sql: &str| -> String {
+                        sql.trim_matches('\'')
+                            .split('T')
+                            .nth(1)
+                            .and_then(|t| {
+                                t.split(':')
+                                    .collect::<Vec<_>>()
+                                    .get(..2)
+                                    .map(|s| s.join(":"))
+                            })
+                            .unwrap_or_else(|| "??:??".to_string())
+                    };
+                    format!(
+                        "{date} {start}–{end} IST",
+                        date = date_str,
+                        start = hm(&today_window.start_sql),
+                        end = hm(&today_window.end_sql),
+                    )
+                };
+
+                if cross_match.passed {
+                    bg_notifier.notify(NotificationEvent::CandleCrossMatchPassed {
+                        timeframes_checked: cross_match.timeframes_checked,
+                        candles_compared: cross_match.candles_compared,
+                        today_ist_label,
+                    });
+                } else {
+                    // Build per-timeframe summary for Telegram (e.g., "1m: 3 | 5m: 0 | 15m: 1")
+                    let tf_summary: String = cross_match
+                        .per_timeframe_mismatches
+                        .iter()
+                        .map(|(tf, count)| format!("{tf}: {count}"))
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    let mut details = format_cross_match_details(&cross_match.mismatch_details);
+                    // Prepend per-timeframe summary as first line
+                    if !tf_summary.is_empty() {
+                        details.insert(0, format!("Per-timeframe: {tf_summary}"));
+                    }
+                    bg_notifier.notify(NotificationEvent::CandleCrossMatchFailed {
+                        candles_compared: cross_match.candles_compared,
+                        mismatches: cross_match.mismatches,
+                        missing_live: cross_match.missing_live,
+                        mismatch_details: details,
+                        today_ist_label,
+                    });
                 }
-                bg_notifier.notify(NotificationEvent::CandleCrossMatchFailed {
-                    candles_compared: cross_match.candles_compared,
-                    mismatches: cross_match.mismatches,
-                    missing_live: cross_match.missing_live,
-                    mismatch_details: details,
-                });
+            }
+
+            // Once-per-day success marker. Both verify AND cross-match must
+            // pass; on success, write a file marker so subsequent restarts
+            // today skip the verification entirely. If either is not-passed
+            // (or skipped due to no live data), do NOT mark — next run will
+            // retry from scratch. Per Parthiban directive 2026-04-20:
+            // "only once in a day until it achieves success".
+            let full_success = verify_report.passed && cross_match.passed;
+            if full_success {
+                match tickvault_core::historical::cross_verify::mark_cross_verify_success(
+                    today_window.today_ist,
+                ) {
+                    Ok(()) => {
+                        info!(
+                            today_ist = %today_window.today_ist,
+                            "cross-verify success marker written — today's verification will not run again"
+                        );
+                    }
+                    Err(err) => {
+                        warn!(
+                            ?err,
+                            today_ist = %today_window.today_ist,
+                            "failed to write cross-verify success marker (verification still passed; next restart will re-run)"
+                        );
+                    }
+                }
             }
 
             info!(
@@ -4290,24 +4452,12 @@ fn spawn_historical_candle_fetch(
                 total_candles = summary.total_candles,
                 verification_passed = verify_report.passed,
                 cross_match_passed = cross_match.passed,
-                "post-market historical fetch + cross-verification complete"
+                full_success_marker_written = full_success,
+                today_ist = %today_window.today_ist,
+                window_start = %today_window.start_sql,
+                window_end = %today_window.end_sql,
+                "post-market historical fetch + cross-verification complete (TODAY ONLY)"
             );
-        } else {
-            // Non-trading day: skip cross-match (no live data to compare).
-            // Emit the typed SKIPPED notification so the operator gets
-            // explicit closure on Telegram instead of silently missing
-            // the post-fetch cross-match step on weekends / holidays.
-            info!(
-                instruments_fetched = summary.instruments_fetched,
-                instruments_failed = summary.instruments_failed,
-                total_candles = summary.total_candles,
-                verification_passed = verify_report.passed,
-                "non-trading day historical fetch complete (cross-match skipped — no live data)"
-            );
-            bg_notifier.notify(NotificationEvent::CandleCrossMatchSkipped {
-                reason: "weekend or holiday — not a trading day".to_string(),
-                candles_compared: 0,
-            });
         }
     });
 

@@ -31,6 +31,13 @@ struct SecurityFeedState {
     /// Whether a stale alert has already been emitted for the current gap.
     /// Prevents duplicate alerts until the instrument resumes ticking.
     stale_alerted: bool,
+    /// Whether an ERROR-level gap alert has already been emitted for the
+    /// current gap episode. Edge-triggered: fires once when a gap first
+    /// crosses `TICK_GAP_ERROR_THRESHOLD_SECS`, resets when the instrument
+    /// resumes ticking within the normal band (< WARN threshold). Prevents
+    /// Telegram spam for illiquid F&O contracts that simply don't trade
+    /// for minutes at a time during live hours.
+    error_gap_alerted: bool,
 }
 
 /// Tracks tick gaps per security for feed health monitoring.
@@ -93,6 +100,7 @@ impl TickGapTracker {
             tick_count: 0,
             last_wall_clock: now,
             stale_alerted: false,
+            error_gap_alerted: false,
         });
 
         state.tick_count = state.tick_count.saturating_add(1);
@@ -109,15 +117,23 @@ impl TickGapTracker {
         let gap_secs = exchange_timestamp.saturating_sub(state.last_exchange_timestamp);
 
         let result = if gap_secs >= TICK_GAP_ERROR_THRESHOLD_SECS {
-            // ERROR: possible disconnection — log immediately per-instrument.
-            error!(
-                security_id = security_id,
-                gap_secs = gap_secs,
-                last_ts = state.last_exchange_timestamp,
-                current_ts = exchange_timestamp,
-                "tick feed gap — possible disconnection"
-            );
+            // ERROR: possible disconnection — edge-triggered per instrument.
+            // Log + Telegram fires ONCE when the gap first crosses threshold.
+            // Subsequent ticks still in gap are counted but suppressed to
+            // avoid Telegram spam for illiquid options that legitimately
+            // don't trade for minutes. The flag clears in the recovery
+            // branch below (gap_secs < WARN) once ticks resume normally.
             self.total_errors = self.total_errors.saturating_add(1);
+            if !state.error_gap_alerted {
+                error!(
+                    security_id = security_id,
+                    gap_secs = gap_secs,
+                    last_ts = state.last_exchange_timestamp,
+                    current_ts = exchange_timestamp,
+                    "tick feed gap — possible disconnection"
+                );
+                state.error_gap_alerted = true;
+            }
             TickGapResult::Error { gap_secs }
         } else if gap_secs >= TICK_GAP_ALERT_THRESHOLD_SECS {
             // WARN: normal illiquidity gap — aggregate into periodic summary
@@ -126,6 +142,9 @@ impl TickGapTracker {
             self.total_warnings = self.total_warnings.saturating_add(1);
             TickGapResult::Warning { gap_secs }
         } else {
+            // Recovered — tick arrived within normal band. Clear error
+            // edge-trigger so the next ERROR-level gap fires afresh.
+            state.error_gap_alerted = false;
             TickGapResult::Ok
         };
 
@@ -401,6 +420,7 @@ impl TickGapTracker {
                     tick_count: 0,
                     last_wall_clock: Instant::now(),
                     stale_alerted: false,
+                    error_gap_alerted: false,
                 });
                 BackwardsJumpResult::FirstSeen
             }
@@ -902,6 +922,117 @@ mod tests {
             matches!(result, TickGapResult::Warning { .. }),
             "first tick after warmup must detect gap"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Edge-triggered ERROR gap dedup (Telegram spam suppression for illiquid
+    // F&O contracts that don't tick for minutes during live hours).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn error_gap_alerted_fires_once_then_suppresses_until_recovery() {
+        let mut tracker = TickGapTracker::new(10);
+        let base_ts = 1_700_000_000;
+
+        // Warmup
+        for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
+            tracker.record_tick(1001, base_ts + i);
+        }
+
+        // First ERROR-level gap — flag was false, must fire.
+        let t1 = base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE + TICK_GAP_ERROR_THRESHOLD_SECS;
+        let r1 = tracker.record_tick(1001, t1);
+        assert!(matches!(r1, TickGapResult::Error { .. }));
+        assert!(
+            tracker.states.get(&1001).unwrap().error_gap_alerted,
+            "first ERROR tick must set the edge-trigger flag"
+        );
+        assert_eq!(tracker.total_errors(), 1);
+
+        // Second ERROR-level gap on same instrument while still in gap —
+        // counter still increments but NO new Telegram-routed error! call.
+        // (We can't observe the log macro directly, but the flag gate proves
+        // the error! path was skipped.)
+        let t2 = t1 + TICK_GAP_ERROR_THRESHOLD_SECS;
+        let r2 = tracker.record_tick(1001, t2);
+        assert!(matches!(r2, TickGapResult::Error { .. }));
+        assert!(
+            tracker.states.get(&1001).unwrap().error_gap_alerted,
+            "flag must stay set while instrument is still in the gap episode"
+        );
+        assert_eq!(
+            tracker.total_errors(),
+            2,
+            "counter increments regardless of dedup (metric accuracy)"
+        );
+    }
+
+    #[test]
+    fn error_gap_flag_clears_on_recovery_tick() {
+        let mut tracker = TickGapTracker::new(10);
+        let base_ts = 1_700_000_000;
+
+        // Warmup + first ERROR gap
+        for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
+            tracker.record_tick(1001, base_ts + i);
+        }
+        let t1 = base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE + TICK_GAP_ERROR_THRESHOLD_SECS;
+        tracker.record_tick(1001, t1);
+        assert!(tracker.states.get(&1001).unwrap().error_gap_alerted);
+
+        // Recovery: a normal 1-second tick must CLEAR the flag so the
+        // next ERROR episode fires fresh.
+        let recovery = t1 + 1;
+        let rr = tracker.record_tick(1001, recovery);
+        assert_eq!(rr, TickGapResult::Ok);
+        assert!(
+            !tracker.states.get(&1001).unwrap().error_gap_alerted,
+            "normal tick must clear the error-gap edge-trigger flag"
+        );
+    }
+
+    #[test]
+    fn error_gap_alerted_fires_again_after_recovery() {
+        let mut tracker = TickGapTracker::new(10);
+        let base_ts = 1_700_000_000;
+
+        // Warmup + first ERROR episode
+        for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
+            tracker.record_tick(1001, base_ts + i);
+        }
+        let t1 = base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE + TICK_GAP_ERROR_THRESHOLD_SECS;
+        tracker.record_tick(1001, t1);
+        // Recovery
+        tracker.record_tick(1001, t1 + 1);
+        assert!(!tracker.states.get(&1001).unwrap().error_gap_alerted);
+
+        // Second ERROR episode (after recovery) — flag should re-arm.
+        let t2 = t1 + 1 + TICK_GAP_ERROR_THRESHOLD_SECS;
+        tracker.record_tick(1001, t2);
+        assert!(
+            tracker.states.get(&1001).unwrap().error_gap_alerted,
+            "second gap episode must re-set the edge-trigger flag"
+        );
+    }
+
+    #[test]
+    fn error_gap_dedup_is_per_security() {
+        let mut tracker = TickGapTracker::new(10);
+        let base_ts = 1_700_000_000;
+
+        // Warmup two securities
+        for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
+            tracker.record_tick(1001, base_ts + i);
+            tracker.record_tick(1002, base_ts + i);
+        }
+
+        // Both hit an ERROR-level gap independently — both must fire once.
+        let t_err = base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE + TICK_GAP_ERROR_THRESHOLD_SECS;
+        tracker.record_tick(1001, t_err);
+        tracker.record_tick(1002, t_err);
+        assert!(tracker.states.get(&1001).unwrap().error_gap_alerted);
+        assert!(tracker.states.get(&1002).unwrap().error_gap_alerted);
+        assert_eq!(tracker.total_errors(), 2);
     }
 
     #[test]
