@@ -4328,30 +4328,63 @@ fn spawn_historical_candle_fetch(
                     reason: "no live data in materialized views".to_string(),
                     candles_compared: cross_match.candles_compared,
                 });
-            } else if cross_match.passed {
-                bg_notifier.notify(NotificationEvent::CandleCrossMatchPassed {
-                    timeframes_checked: cross_match.timeframes_checked,
-                    candles_compared: cross_match.candles_compared,
-                });
             } else {
-                // Build per-timeframe summary for Telegram (e.g., "1m: 3 | 5m: 0 | 15m: 1")
-                let tf_summary: String = cross_match
-                    .per_timeframe_mismatches
-                    .iter()
-                    .map(|(tf, count)| format!("{tf}: {count}"))
-                    .collect::<Vec<_>>()
-                    .join(" | ");
-                let mut details = format_cross_match_details(&cross_match.mismatch_details);
-                // Prepend per-timeframe summary as first line
-                if !tf_summary.is_empty() {
-                    details.insert(0, format!("Per-timeframe: {tf_summary}"));
+                // Compute the "TODAY ONLY: YYYY-MM-DD HH:MM–HH:MM IST" label
+                // once and pass to both pass/fail notifications so the operator
+                // immediately sees which trading session the OK/FAIL covers.
+                // The start/end SQL literals on `today_window` look like
+                // `'2026-04-20T09:15:00.000000Z'` — we strip the quotes + the
+                // date + `.000000Z` suffix to render a human-readable
+                // `HH:MM` slice of the IST wall clock.
+                let today_ist_label = {
+                    let date_str = today_window.today_ist.format("%Y-%m-%d").to_string();
+                    let hm = |sql: &str| -> String {
+                        sql.trim_matches('\'')
+                            .split('T')
+                            .nth(1)
+                            .and_then(|t| {
+                                t.split(':')
+                                    .collect::<Vec<_>>()
+                                    .get(..2)
+                                    .map(|s| s.join(":"))
+                            })
+                            .unwrap_or_else(|| "??:??".to_string())
+                    };
+                    format!(
+                        "{date} {start}–{end} IST",
+                        date = date_str,
+                        start = hm(&today_window.start_sql),
+                        end = hm(&today_window.end_sql),
+                    )
+                };
+
+                if cross_match.passed {
+                    bg_notifier.notify(NotificationEvent::CandleCrossMatchPassed {
+                        timeframes_checked: cross_match.timeframes_checked,
+                        candles_compared: cross_match.candles_compared,
+                        today_ist_label,
+                    });
+                } else {
+                    // Build per-timeframe summary for Telegram (e.g., "1m: 3 | 5m: 0 | 15m: 1")
+                    let tf_summary: String = cross_match
+                        .per_timeframe_mismatches
+                        .iter()
+                        .map(|(tf, count)| format!("{tf}: {count}"))
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    let mut details = format_cross_match_details(&cross_match.mismatch_details);
+                    // Prepend per-timeframe summary as first line
+                    if !tf_summary.is_empty() {
+                        details.insert(0, format!("Per-timeframe: {tf_summary}"));
+                    }
+                    bg_notifier.notify(NotificationEvent::CandleCrossMatchFailed {
+                        candles_compared: cross_match.candles_compared,
+                        mismatches: cross_match.mismatches,
+                        missing_live: cross_match.missing_live,
+                        mismatch_details: details,
+                        today_ist_label,
+                    });
                 }
-                bg_notifier.notify(NotificationEvent::CandleCrossMatchFailed {
-                    candles_compared: cross_match.candles_compared,
-                    mismatches: cross_match.mismatches,
-                    missing_live: cross_match.missing_live,
-                    mismatch_details: details,
-                });
             }
 
             info!(

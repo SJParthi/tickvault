@@ -307,6 +307,13 @@ pub enum NotificationEvent {
         timeframes_checked: usize,
         /// Total candles compared.
         candles_compared: usize,
+        /// Human-readable IST session label, e.g. `"2026-04-20 09:15–15:30 IST"`.
+        /// Empty string when the caller doesn't have a window (legacy paths).
+        /// Surfaced on the first Telegram line so the operator immediately
+        /// sees which trading session this "OK" actually verifies — fixes
+        /// the 2026-04-20 ambiguity where an OK on 12 days of accumulated
+        /// data looked like today's session was clean.
+        today_ist_label: String,
     },
 
     /// Historical vs Live candle cross-match found mismatches.
@@ -319,6 +326,9 @@ pub enum NotificationEvent {
         missing_live: usize,
         /// Pre-formatted mismatch detail lines for Telegram.
         mismatch_details: Vec<String>,
+        /// Human-readable IST session label, e.g. `"2026-04-20 09:15–15:30 IST"`.
+        /// See `CandleCrossMatchPassed.today_ist_label`.
+        today_ist_label: String,
     },
 
     /// Historical vs Live candle cross-match skipped — no live data in
@@ -763,9 +773,15 @@ impl NotificationEvent {
             Self::CandleCrossMatchPassed {
                 timeframes_checked,
                 candles_compared,
+                today_ist_label,
             } => {
+                let header = if today_ist_label.is_empty() {
+                    String::new()
+                } else {
+                    format!("\n<b>TODAY ONLY:</b> {today_ist_label}")
+                };
                 format!(
-                    "<b>Historical vs Live cross-match OK</b>\nTimeframes: {timeframes_checked} | Candles compared: {candles_compared}\nAll OHLCV values match exactly (zero tolerance, precision-verified)"
+                    "<b>Historical vs Live cross-match OK</b>{header}\nTimeframes: {timeframes_checked} | Candles compared: {candles_compared}\nAll OHLCV values match exactly (zero tolerance, precision-verified)"
                 )
             }
             Self::CandleCrossMatchFailed {
@@ -773,9 +789,15 @@ impl NotificationEvent {
                 mismatches,
                 missing_live,
                 mismatch_details,
+                today_ist_label,
             } => {
+                let header = if today_ist_label.is_empty() {
+                    String::new()
+                } else {
+                    format!("\n<b>TODAY ONLY:</b> {today_ist_label}")
+                };
                 let mut msg = format!(
-                    "<b>Historical vs Live cross-match FAILED</b>\nCompared: {candles_compared} | Mismatches: {mismatches}"
+                    "<b>Historical vs Live cross-match FAILED</b>{header}\nCompared: {candles_compared} | Mismatches: {mismatches}"
                 );
                 if *missing_live > 0 {
                     msg.push_str(&format!("\nMissing live: {missing_live}"));
@@ -1419,6 +1441,7 @@ mod tests {
         let event = NotificationEvent::CandleCrossMatchPassed {
             timeframes_checked: 5,
             candles_compared: 187500,
+            today_ist_label: String::new(),
         };
         let msg = event.to_message();
         assert!(msg.contains("cross-match OK"));
@@ -1435,6 +1458,7 @@ mod tests {
             mismatch_details: vec![
                 "\u{2022} RELIANCE (NSE_EQ) 1m @ 2026-03-18 10:15 IST\n  Hist: O=2450.0 H=2465.0\n  Live: O=2450.0 H=2463.5\n  Diff: H(-1.5)".to_string(),
             ],
+            today_ist_label: String::new(),
         };
         let msg = event.to_message();
         assert!(msg.contains("cross-match FAILED"));
@@ -1451,6 +1475,7 @@ mod tests {
             mismatches: 12,
             missing_live: 8,
             mismatch_details: vec![],
+            today_ist_label: String::new(),
         };
         assert_eq!(event.severity(), Severity::High);
     }
@@ -1460,6 +1485,7 @@ mod tests {
         let event = NotificationEvent::CandleCrossMatchPassed {
             timeframes_checked: 5,
             candles_compared: 187500,
+            today_ist_label: String::new(),
         };
         assert_eq!(event.severity(), Severity::Low);
     }
@@ -1919,6 +1945,7 @@ mod tests {
             mismatches: 5,
             missing_live: 0,
             mismatch_details: vec![],
+            today_ist_label: String::new(),
         };
         let msg = event.to_message();
         assert!(!msg.contains("Missing live"));
@@ -1931,6 +1958,7 @@ mod tests {
             mismatches: 0,
             missing_live: 0,
             mismatch_details: vec![],
+            today_ist_label: String::new(),
         };
         let msg = event.to_message();
         // The header always contains "Mismatches: N", but the details section should be absent
@@ -2028,6 +2056,7 @@ mod tests {
             mismatches: 60,
             missing_live: 0,
             mismatch_details: details,
+            today_ist_label: String::new(),
         };
         let msg = event.to_message();
         assert!(msg.contains("mismatch 0"));
