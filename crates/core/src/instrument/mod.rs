@@ -16,6 +16,7 @@ pub mod depth_rebalancer;
 pub mod depth_strike_selector;
 pub mod diagnostic;
 pub mod instrument_loader;
+pub mod phase2_delta;
 pub mod phase2_scheduler;
 pub mod preopen_price_buffer;
 pub mod s3_backup;
