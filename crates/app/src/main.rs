@@ -3641,13 +3641,52 @@ fn create_websocket_pool(
 
     info!("building WebSocket connection pool");
 
-    let instruments: Vec<InstrumentSubscription> = plan
+    let mut instruments: Vec<InstrumentSubscription> = plan
         .registry
         .iter()
         .map(|inst| InstrumentSubscription::new(inst.exchange_segment, inst.security_id))
         .collect();
 
     let feed_mode = plan.summary.feed_mode;
+
+    // Bug C fix (2026-04-20): enforce WebSocket pool capacity HERE instead
+    // of propagating `CapacityExceeded` out of pool creation. On 09:15 IST
+    // restart-during-market-hours, the subscription plan was 36,241
+    // instruments vs a capacity of 25,000 — the pool refused to build and
+    // the app bailed out of boot entirely. That is the wrong failure mode:
+    // starting with the first 25,000 highest-priority instruments is
+    // strictly better than starting with zero.
+    //
+    // `InstrumentRegistry::iter()` already yields in priority order:
+    // Major indices → major-index derivatives → display indices →
+    // stock equities → stock derivatives. So truncating the tail drops
+    // the lowest-priority items first (typically stock options far from
+    // ATM that Phase 2 would otherwise add post-09:12 IST).
+    let effective_capacity = config
+        .dhan
+        .max_instruments_per_connection
+        .min(tickvault_common::constants::MAX_INSTRUMENTS_PER_WEBSOCKET_CONNECTION)
+        .saturating_mul(
+            config
+                .dhan
+                .max_websocket_connections
+                .min(tickvault_common::constants::MAX_WEBSOCKET_CONNECTIONS),
+        );
+    if instruments.len() > effective_capacity {
+        let dropped = instruments.len() - effective_capacity;
+        error!(
+            requested = instruments.len(),
+            capacity = effective_capacity,
+            dropped,
+            "Bug C: subscription plan exceeds WebSocket capacity — truncating to \
+             effective_capacity and continuing. Dropped instruments are the \
+             lowest-priority tail of InstrumentRegistry::iter() — stock options \
+             far from ATM are the usual tail."
+        );
+        instruments.truncate(effective_capacity);
+        metrics::counter!("tv_subscription_plan_truncations_total").increment(1);
+        metrics::gauge!("tv_subscription_plan_dropped_instruments").set(dropped as f64);
+    }
 
     let mut pool = match WebSocketConnectionPool::new_with_optional_wal(
         token_handle.clone(),
