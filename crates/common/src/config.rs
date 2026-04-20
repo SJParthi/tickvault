@@ -2077,4 +2077,61 @@ mod tests {
         let conf = config.build_ilp_conf_string();
         assert!(conf.contains("tcp::addr=10.0.1.5:19009;"));
     }
+
+    #[test]
+    fn test_default_twenty_depth_max_instruments_is_49() {
+        // Covers the top-level `default_twenty_depth_max_instruments`
+        // fn referenced via `#[serde(default = ...)]` — never called
+        // directly in production, so we exercise it here. Per Dhan
+        // 20-level limit (max 50/conn) our policy is ATM ± 24 = 49.
+        assert_eq!(super::default_twenty_depth_max_instruments(), 49);
+    }
+
+    #[test]
+    fn test_default_auto_start_is_true() {
+        // Covers `default_auto_start` — referenced via `#[serde(default = ...)]`.
+        // Boot sequence relies on Docker auto-start being on by default.
+        assert!(super::default_auto_start());
+    }
+
+    #[test]
+    fn test_default_valkey_password_is_empty_string() {
+        // Covers `default_valkey_password` (config.rs:356-358).
+        // Production loads the real password from AWS SSM at boot;
+        // the `#[serde(default = ...)]` fallback must stay empty so
+        // a missing TOML field does not leak a hardcoded credential.
+        assert_eq!(super::default_valkey_password(), "");
+    }
+
+    #[test]
+    fn test_validate_url_empty_rest_api_base_url_rejected() {
+        // Covers the `bail!("{name} must not be empty")` branch inside
+        // the validate_url closure (config.rs:~998).
+        let mut config = make_valid_config();
+        config.dhan.rest_api_base_url.clear();
+        let err = config.validate().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("must not be empty"),
+            "expected empty-url rejection, got: {msg}"
+        );
+        assert!(
+            msg.contains("dhan.rest_api_base_url"),
+            "error must name the offending field: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_validate_url_wrong_scheme_rejected() {
+        // Covers the `bail!("{name} must start with ...")` branch
+        // inside the validate_url closure (config.rs:~1001).
+        let mut config = make_valid_config();
+        config.dhan.rest_api_base_url = "http://api.dhan.co/v2/".to_string();
+        let err = config.validate().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("must start with 'https://'"),
+            "expected scheme rejection, got: {msg}"
+        );
+    }
 }

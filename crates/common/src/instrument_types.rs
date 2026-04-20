@@ -3478,4 +3478,67 @@ mod tests {
         assert_eq!(ExpiryCode::Next.to_string(), "Next");
         assert_eq!(ExpiryCode::Far.to_string(), "Far");
     }
+
+    #[test]
+    fn test_dhan_instrument_kind_as_dhan_api_string_all_variants() {
+        // Covers DhanInstrumentKind::as_dhan_api_string (instrument_types.rs:108-115).
+        // The strings MUST match docs/dhan-ref/05-historical-data.md exactly —
+        // any change here breaks the Dhan REST request body format.
+        assert_eq!(
+            DhanInstrumentKind::FutureIndex.as_dhan_api_string(),
+            "FUTIDX"
+        );
+        assert_eq!(
+            DhanInstrumentKind::FutureStock.as_dhan_api_string(),
+            "FUTSTK"
+        );
+        assert_eq!(
+            DhanInstrumentKind::OptionIndex.as_dhan_api_string(),
+            "OPTIDX"
+        );
+        assert_eq!(
+            DhanInstrumentKind::OptionStock.as_dhan_api_string(),
+            "OPTSTK"
+        );
+    }
+
+    #[test]
+    fn test_expiry_code_serialize_as_u8() {
+        // Covers `impl Serialize for ExpiryCode` (instrument_types.rs:145-149).
+        // Dhan JSON expects a bare integer (0, 1, 2), NOT a string enum.
+        assert_eq!(serde_json::to_string(&ExpiryCode::Current).unwrap(), "0");
+        assert_eq!(serde_json::to_string(&ExpiryCode::Next).unwrap(), "1");
+        assert_eq!(serde_json::to_string(&ExpiryCode::Far).unwrap(), "2");
+    }
+
+    #[test]
+    fn test_expiry_code_deserialize_valid() {
+        // Covers `impl Deserialize for ExpiryCode` valid path
+        // (instrument_types.rs:151-157).
+        assert_eq!(
+            serde_json::from_str::<ExpiryCode>("0").unwrap(),
+            ExpiryCode::Current
+        );
+        assert_eq!(
+            serde_json::from_str::<ExpiryCode>("1").unwrap(),
+            ExpiryCode::Next
+        );
+        assert_eq!(
+            serde_json::from_str::<ExpiryCode>("2").unwrap(),
+            ExpiryCode::Far
+        );
+    }
+
+    #[test]
+    fn test_expiry_code_deserialize_invalid_value_returns_err() {
+        // Covers the `.ok_or_else(...)` error arm in Deserialize
+        // (instrument_types.rs:154-156). Values outside 0..=2 must fail.
+        let err = serde_json::from_str::<ExpiryCode>("3").unwrap_err();
+        assert!(
+            err.to_string().contains("invalid expiry code"),
+            "expected invalid-expiry-code error: {err}"
+        );
+        let err = serde_json::from_str::<ExpiryCode>("99").unwrap_err();
+        assert!(err.to_string().contains("invalid expiry code"));
+    }
 }
