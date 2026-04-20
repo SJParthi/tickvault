@@ -1504,4 +1504,61 @@ mod tests {
         assert_eq!(registry.get_underlying_security_id("NIFTY"), Some(13));
         assert_eq!(registry.get_underlying_security_id("ZZSTOCK"), Some(13));
     }
+
+    #[test]
+    fn test_get_with_segment_disambiguates_cross_segment_collision() {
+        // I-P1-11: direct test for get_with_segment (instrument_registry.rs:340-346).
+        // When id=13 exists in both IDX_I and NSE_EQ, get_with_segment must return
+        // the correct entry for each segment independently.
+        let mut nifty = sample_instrument(13, SubscriptionCategory::MajorIndexValue);
+        nifty.exchange_segment = ExchangeSegment::IdxI;
+        nifty.underlying_symbol = "NIFTY".to_string();
+        let mut stock = sample_instrument(13, SubscriptionCategory::StockEquity);
+        stock.exchange_segment = ExchangeSegment::NseEquity;
+        stock.underlying_symbol = "ZZSTOCK".to_string();
+
+        let registry = InstrumentRegistry::from_instruments(vec![nifty, stock]);
+
+        let idx = registry
+            .get_with_segment(13, ExchangeSegment::IdxI)
+            .expect("IDX_I entry must be retrievable by composite key");
+        assert_eq!(idx.underlying_symbol, "NIFTY");
+        assert_eq!(idx.exchange_segment, ExchangeSegment::IdxI);
+
+        let eq = registry
+            .get_with_segment(13, ExchangeSegment::NseEquity)
+            .expect("NSE_EQ entry must be retrievable by composite key");
+        assert_eq!(eq.underlying_symbol, "ZZSTOCK");
+        assert_eq!(eq.exchange_segment, ExchangeSegment::NseEquity);
+
+        // A non-registered (id, segment) pair returns None.
+        assert!(
+            registry
+                .get_with_segment(13, ExchangeSegment::NseFno)
+                .is_none()
+        );
+        assert!(
+            registry
+                .get_with_segment(9_999, ExchangeSegment::IdxI)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_contains_with_segment_matches_get_with_segment() {
+        // I-P1-11: direct test for contains_with_segment
+        // (instrument_registry.rs:354-356). Must agree with get_with_segment
+        // on every queried pair.
+        let mut nifty = sample_instrument(13, SubscriptionCategory::MajorIndexValue);
+        nifty.exchange_segment = ExchangeSegment::IdxI;
+        let mut stock = sample_instrument(13, SubscriptionCategory::StockEquity);
+        stock.exchange_segment = ExchangeSegment::NseEquity;
+
+        let registry = InstrumentRegistry::from_instruments(vec![nifty, stock]);
+
+        assert!(registry.contains_with_segment(13, ExchangeSegment::IdxI));
+        assert!(registry.contains_with_segment(13, ExchangeSegment::NseEquity));
+        assert!(!registry.contains_with_segment(13, ExchangeSegment::NseFno));
+        assert!(!registry.contains_with_segment(9_999, ExchangeSegment::IdxI));
+    }
 }

@@ -61,14 +61,13 @@ fn every_error_code_variant_has_a_triage_rule() {
 fn yaml_contains_code(yaml: &str, needle: &str) -> bool {
     for line in yaml.lines() {
         let trimmed = line.trim_start();
-        if let Some(rest) = trimmed.strip_prefix(needle) {
-            if rest.is_empty()
+        if let Some(rest) = trimmed.strip_prefix(needle)
+            && (rest.is_empty()
                 || rest.starts_with(' ')
                 || rest.starts_with('\t')
-                || rest.starts_with('#')
-            {
-                return true;
-            }
+                || rest.starts_with('#'))
+        {
+            return true;
         }
     }
     false

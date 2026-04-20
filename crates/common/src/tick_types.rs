@@ -1072,4 +1072,27 @@ mod tests {
         // Vega always positive
         assert!(g.vega > 0.0);
     }
+
+    #[test]
+    fn test_noop_greeks_enricher_is_zero_side_effect() {
+        // Covers `impl GreeksEnricher for NoopGreeksEnricher::enrich`
+        // (tick_types.rs:217-220). The no-op enricher must not mutate
+        // any stable field of the ParsedTick it is given.
+        let mut enricher = NoopGreeksEnricher;
+        let mut tick = ParsedTick {
+            security_id: 1333,
+            last_traded_price: 100.5,
+            exchange_timestamp: 1_700_000_000,
+            volume: 42,
+            ..ParsedTick::default()
+        };
+        enricher.enrich(&mut tick);
+        assert_eq!(tick.security_id, 1333);
+        assert!((tick.last_traded_price - 100.5).abs() < f32::EPSILON);
+        assert_eq!(tick.exchange_timestamp, 1_700_000_000);
+        assert_eq!(tick.volume, 42);
+        // IV/delta/etc. stay NaN — no enrichment happened.
+        assert!(tick.iv.is_nan());
+        assert!(tick.delta.is_nan());
+    }
 }

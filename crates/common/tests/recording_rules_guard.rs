@@ -146,7 +146,7 @@ fn depth_pool_health_records_use_bool_comparison() {
 fn recording_rules_use_tv_prefix_not_dlt() {
     // `dlt:` is legacy; all zero-touch-era rules use `tv:`. Enforce it
     // so copy-paste mistakes don't revive the legacy prefix.
-    let src = load_text();
+    let _src = load_text();
     for rule in REQUIRED_RECORDING_RULES {
         assert!(
             rule.starts_with("tv:"),

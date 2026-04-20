@@ -663,4 +663,38 @@ mod tests {
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }
+
+    #[test]
+    fn test_severity_display_impl_matches_as_str() {
+        // Covers `impl fmt::Display for Severity` (error_code.rs:56-60).
+        for sev in [
+            Severity::Info,
+            Severity::Low,
+            Severity::Medium,
+            Severity::High,
+            Severity::Critical,
+        ] {
+            assert_eq!(format!("{sev}"), sev.as_str());
+        }
+    }
+
+    #[test]
+    fn test_unknown_error_code_display_and_error_trait() {
+        // Covers `impl fmt::Display for UnknownErrorCode`
+        // (error_code.rs:516-520) and the std::error::Error impl blanket use.
+        let err = UnknownErrorCode("BOGUS-999".to_string());
+        let rendered = format!("{err}");
+        assert_eq!(rendered, "unknown error code: BOGUS-999");
+        // Exercises std::error::Error path via the trait object.
+        let as_err: &dyn std::error::Error = &err;
+        assert_eq!(as_err.to_string(), "unknown error code: BOGUS-999");
+    }
+
+    #[test]
+    fn test_unknown_error_code_equality_and_clone() {
+        // Covers PartialEq + Clone auto-derives so they are exercised.
+        let a = UnknownErrorCode("X".to_string());
+        let b = a.clone();
+        assert_eq!(a, b);
+    }
 }
