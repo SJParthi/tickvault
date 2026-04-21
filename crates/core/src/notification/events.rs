@@ -175,6 +175,12 @@ pub enum NotificationEvent {
     /// 20-level depth WebSocket disconnected.
     DepthTwentyDisconnected { underlying: String, reason: String },
 
+    /// 20-level depth WebSocket reconnected after a transient disconnect.
+    /// Fires on every successful reconnect, inside or outside market
+    /// hours (Parthiban directive 2026-04-21 — full audit trail on all
+    /// WS events).
+    DepthTwentyReconnected { underlying: String },
+
     /// 200-level depth WebSocket connected.
     ///
     /// `contract` is the precise contract label (e.g. `NIFTY-Apr2026-22500-CE`)
@@ -191,6 +197,12 @@ pub enum NotificationEvent {
         reason: String,
     },
 
+    /// 200-level depth WebSocket reconnected after a transient disconnect.
+    /// Fires on every successful reconnect, inside or outside market
+    /// hours (Parthiban directive 2026-04-21 — full audit trail on all
+    /// WS events).
+    DepthTwoHundredReconnected { contract: String, security_id: u32 },
+
     /// Order update WebSocket connected.
     OrderUpdateConnected,
 
@@ -204,6 +216,25 @@ pub enum NotificationEvent {
 
     /// Order update WebSocket disconnected.
     OrderUpdateDisconnected { reason: String },
+
+    /// Order update WebSocket reconnected after a transient disconnect.
+    /// Fires on every successful reconnect, inside or outside market
+    /// hours (Parthiban directive 2026-04-21 — full audit trail on all
+    /// WS events).
+    OrderUpdateReconnected { consecutive_failures: u32 },
+
+    /// CRITICAL: zero live ticks received during market hours past the
+    /// configured silence threshold. Fires edge-triggered (once on rising
+    /// edge — when ticks resume, an INFO recovery log fires but no
+    /// Telegram). This event would have caught the 2026-04-21 morning
+    /// failure where the WS was connected but Dhan stopped streaming
+    /// (likely data-plan issue).
+    NoLiveTicksDuringMarketHours {
+        /// How long the heartbeat has been stale, in seconds.
+        silent_for_secs: u64,
+        /// Threshold that triggered the alert, in seconds.
+        threshold_secs: u64,
+    },
 
     /// Graceful shutdown initiated.
     ShutdownInitiated,
@@ -580,6 +611,9 @@ impl NotificationEvent {
             Self::DepthTwentyDisconnected { underlying, reason } => {
                 format!("<b>Depth 20-level DISCONNECTED</b>\nUnderlying: {underlying}\n{reason}")
             }
+            Self::DepthTwentyReconnected { underlying } => {
+                format!("<b>Depth 20-level reconnected</b>\nUnderlying: {underlying}")
+            }
             Self::DepthTwoHundredConnected {
                 contract,
                 security_id,
@@ -597,10 +631,36 @@ impl NotificationEvent {
                     "<b>Depth 200-level DISCONNECTED</b>\nContract: {contract}\nSecurityId: {security_id}\n{reason}"
                 )
             }
+            Self::DepthTwoHundredReconnected {
+                contract,
+                security_id,
+            } => {
+                format!(
+                    "<b>Depth 200-level reconnected</b>\nContract: {contract}\nSecurityId: {security_id}"
+                )
+            }
             Self::OrderUpdateConnected => "<b>Order Update WS connected</b>".to_string(),
             Self::OrderUpdateAuthenticated => {
                 "<b>Order Update WS authenticated</b>\nDhan accepted token — streaming live."
                     .to_string()
+            }
+            Self::OrderUpdateReconnected {
+                consecutive_failures,
+            } => {
+                format!(
+                    "<b>Order Update WS reconnected</b>\nRecovered after {consecutive_failures} consecutive failures"
+                )
+            }
+            Self::NoLiveTicksDuringMarketHours {
+                silent_for_secs,
+                threshold_secs,
+            } => {
+                format!(
+                    "<b>CRITICAL: zero live ticks during market hours</b>\n\
+                     Silent for {silent_for_secs}s (threshold {threshold_secs}s).\n\
+                     WebSockets may be connected but NO data streaming. \
+                     Check Dhan dataPlan + IP allowlist + token validity."
+                )
             }
             Self::OrderUpdateDisconnected { reason } => {
                 format!("<b>Order Update WS DISCONNECTED</b>\n{reason}")
@@ -963,8 +1023,12 @@ impl NotificationEvent {
             Self::QuestDbReconnected { .. } => Severity::Medium,
             Self::WebSocketReconnected { .. } => Severity::Medium,
             Self::DepthTwentyDisconnected { .. } => Severity::High,
+            Self::DepthTwentyReconnected { .. } => Severity::Medium,
             Self::DepthTwoHundredDisconnected { .. } => Severity::High,
+            Self::DepthTwoHundredReconnected { .. } => Severity::Medium,
             Self::OrderUpdateDisconnected { .. } => Severity::High,
+            Self::OrderUpdateReconnected { .. } => Severity::Medium,
+            Self::NoLiveTicksDuringMarketHours { .. } => Severity::Critical,
             Self::ShutdownInitiated => Severity::Medium,
             Self::CircuitBreakerClosed => Severity::Medium,
             Self::WebSocketConnected { .. } => Severity::Low,

@@ -865,6 +865,18 @@ async fn main() -> Result<()> {
             let snapshot_handle = Some(shared_movers.clone());
             let tick_broadcast_for_processor = Some(fast_tick_broadcast_sender.clone());
 
+            // Parthiban directive (2026-04-21): no-tick-during-market-hours
+            // watchdog. The tick processor updates this atomic on every
+            // parsed tick; the watchdog fires CRITICAL + Telegram if it
+            // stays stale > NO_TICK_THRESHOLD_SECS during market hours.
+            let fast_tick_heartbeat =
+                tickvault_core::pipeline::no_tick_watchdog::new_tick_heartbeat();
+            let _no_tick_watchdog_handle =
+                tickvault_core::pipeline::no_tick_watchdog::spawn_no_tick_watchdog(
+                    std::sync::Arc::clone(&fast_tick_heartbeat),
+                    Some(std::sync::Arc::clone(&fast_notifier)),
+                );
+
             // O(1) EXEMPT: cold path — build inline Greeks computer once at startup.
             let greeks_enricher = build_inline_greeks_enricher(&config, &subscription_plan);
 
@@ -904,6 +916,7 @@ async fn main() -> Result<()> {
                     None, // option_movers — created in slow boot only
                     None, // option_movers_writer — created in slow boot only
                     fast_registry,
+                    Some(fast_tick_heartbeat),
                 )
                 .await;
             });
@@ -1170,6 +1183,7 @@ async fn main() -> Result<()> {
             }
             let run_signal = Some(std::sync::Arc::clone(&auth_signal));
             let run_latch = Some(std::sync::Arc::clone(&auth_latch));
+            let reconnect_notifier = Some(std::sync::Arc::clone(&fast_notifier));
             tokio::spawn(async move {
                 run_order_update_connection(
                     url,
@@ -1180,6 +1194,7 @@ async fn main() -> Result<()> {
                     spill,
                     run_signal,
                     run_latch,
+                    reconnect_notifier,
                 )
                 .await;
             })
@@ -1872,6 +1887,15 @@ async fn main() -> Result<()> {
             .as_ref()
             .map(|p| std::sync::Arc::new(p.registry.clone()));
 
+        // Parthiban directive (2026-04-21): no-tick-during-market-hours
+        // watchdog (slow boot path). Same pattern as fast boot above.
+        let slow_tick_heartbeat = tickvault_core::pipeline::no_tick_watchdog::new_tick_heartbeat();
+        let _slow_no_tick_watchdog_handle =
+            tickvault_core::pipeline::no_tick_watchdog::spawn_no_tick_watchdog(
+                std::sync::Arc::clone(&slow_tick_heartbeat),
+                Some(std::sync::Arc::clone(&notifier)),
+            );
+
         let handle = tokio::spawn(async move {
             run_tick_processor(
                 receiver,
@@ -1887,6 +1911,7 @@ async fn main() -> Result<()> {
                 option_movers_tracker,
                 option_movers_writer,
                 slow_registry,
+                Some(slow_tick_heartbeat),
             )
             .await;
         });
@@ -2574,6 +2599,11 @@ async fn main() -> Result<()> {
                 let d20_label_for_signal = label.clone();
                 let d20_underlying_label = label.clone();
                 let d20_wal_spill = ws_frame_spill.clone();
+                // Parthiban directive (2026-04-21): wire notifier INSIDE the
+                // depth connection so DepthTwentyReconnected fires on every
+                // successful reconnect. The `d20_notifier` above is used
+                // only on task-exit for DepthTwentyDisconnected.
+                let d20_reconnect_notifier = Some(notifier.clone());
                 let (signal_tx, signal_rx) = tokio::sync::oneshot::channel::<()>();
                 // Command channel for live rebalance (unsubscribe+resubscribe, zero disconnect).
                 let (d20_cmd_tx, d20_cmd_rx) =
@@ -2599,6 +2629,7 @@ async fn main() -> Result<()> {
                         Some(signal_tx),
                         d20_wal_spill,
                         d20_cmd_rx,
+                        d20_reconnect_notifier,
                     )
                     .await
                     {
@@ -2748,6 +2779,11 @@ async fn main() -> Result<()> {
 
                         let d200_health = health_status.clone();
                         let d200_notifier = notifier.clone();
+                        // Parthiban directive (2026-04-21): wire notifier
+                        // INSIDE the depth-200 connection so
+                        // DepthTwoHundredReconnected fires on every
+                        // successful reconnect.
+                        let d200_reconnect_notifier = Some(notifier.clone());
                         let d200_label_for_disconnect = depth200_label.clone();
                         let d200_label_for_signal = depth200_label.clone();
                         let d200_sid_for_disconnect = depth200_sid;
@@ -2783,6 +2819,7 @@ async fn main() -> Result<()> {
                                     Some(d200_signal_tx),
                                     d200_wal_spill,
                                     d200_cmd_rx,
+                                    d200_reconnect_notifier,
                                 )
                                 .await
                             {
@@ -3341,6 +3378,7 @@ async fn main() -> Result<()> {
         }
         let run_signal = Some(std::sync::Arc::clone(&auth_signal));
         let run_latch = Some(std::sync::Arc::clone(&auth_latch));
+        let ou_reconnect_notifier = Some(std::sync::Arc::clone(&notifier));
         tokio::spawn(async move {
             ou_health.set_order_update_connected(true);
             // Telegram: Order Update WS connected (fires before read loop starts).
@@ -3354,6 +3392,7 @@ async fn main() -> Result<()> {
                 ou_wal_spill,
                 run_signal,
                 run_latch,
+                ou_reconnect_notifier,
             )
             .await;
             // If run_order_update_connection returns, connection terminated

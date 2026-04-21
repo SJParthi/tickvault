@@ -59,7 +59,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// * `order_sender` — Broadcast channel for order updates.
 ///
 /// Runs until the task is aborted or reconnection attempts are exhausted.
-#[allow(clippy::too_many_arguments)] // APPROVED: STAGE-C + O2 authenticated signal
+#[allow(clippy::too_many_arguments)] // APPROVED: STAGE-C + O2 authenticated signal + 2026-04-21 reconnect notifier
 pub async fn run_order_update_connection(
     order_update_url: String,
     client_id: String,
@@ -69,6 +69,7 @@ pub async fn run_order_update_connection(
     wal_spill: Option<Arc<WsFrameSpill>>,
     authenticated_signal: Option<Arc<tokio::sync::Notify>>,
     authenticated_latch: Option<Arc<std::sync::atomic::AtomicBool>>,
+    notifier: Option<Arc<crate::notification::NotificationService>>,
 ) {
     let mut consecutive_failures: u32 = 0;
     let m_reconnections = metrics::counter!("tv_order_update_reconnections_total");
@@ -76,6 +77,13 @@ pub async fn run_order_update_connection(
     info!("order update WebSocket starting");
 
     loop {
+        // Snapshot the failure count BEFORE the connect attempt. If the
+        // attempt succeeds AND this counter is > 0, we have just
+        // recovered from a streak of failures. `connect_and_listen`
+        // fires the `OrderUpdateReconnected` Telegram event from inside
+        // itself (right after successful connect), using this count.
+        let failures_before_attempt = consecutive_failures;
+
         match connect_and_listen(
             &order_update_url,
             &client_id,
@@ -85,6 +93,8 @@ pub async fn run_order_update_connection(
             wal_spill.as_ref(),
             authenticated_signal.as_ref(),
             authenticated_latch.as_ref(),
+            notifier.as_ref(),
+            failures_before_attempt,
         )
         .await
         {
@@ -115,7 +125,10 @@ pub async fn run_order_update_connection(
                     }
                     ReconnectAction::IncrementAndRetry => {
                         consecutive_failures = tentative_failures;
-                        // CRITICAL alert every 10 consecutive failures (triggers Telegram).
+                        // Parthiban directive (2026-04-21): always ERROR on
+                        // 10-failure streak and WARN on every error,
+                        // regardless of market hours. Full audit +
+                        // Telegram visibility on every WS event.
                         if consecutive_failures.is_multiple_of(10) {
                             error!(
                                 consecutive_failures,
@@ -157,6 +170,8 @@ async fn connect_and_listen(
     wal_spill: Option<&Arc<WsFrameSpill>>,
     authenticated_signal: Option<&Arc<tokio::sync::Notify>>,
     authenticated_latch: Option<&Arc<std::sync::atomic::AtomicBool>>,
+    notifier: Option<&Arc<crate::notification::NotificationService>>,
+    failures_before_attempt: u32,
 ) -> Result<(), OrderUpdateConnectionError> {
     // Read current token.
     let token_guard = token_handle.load();
@@ -190,6 +205,20 @@ async fn connect_and_listen(
     // O(1) EXEMPT: end
 
     info!("order update WebSocket connected");
+
+    // Parthiban directive (2026-04-21): fire Telegram on every successful
+    // reconnect. A reconnect is defined as "connect() succeeded AND we
+    // had >=1 prior consecutive failure". First boot (failures=0) does
+    // not qualify — `OrderUpdateConnected` covers that already.
+    if failures_before_attempt > 0 {
+        if let Some(n) = notifier {
+            n.notify(
+                crate::notification::events::NotificationEvent::OrderUpdateReconnected {
+                    consecutive_failures: failures_before_attempt,
+                },
+            );
+        }
+    }
 
     let m_active = metrics::gauge!("tv_order_update_ws_active");
     let m_messages = metrics::counter!("tv_order_update_messages_total");
