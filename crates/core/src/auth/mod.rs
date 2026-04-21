@@ -31,6 +31,7 @@
 //! let auth_header = token.access_token().expose_secret();
 //! ```
 
+pub mod mid_session_watchdog;
 pub mod secret_manager;
 pub mod token_cache;
 pub mod token_manager;
