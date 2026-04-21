@@ -3613,6 +3613,22 @@ async fn main() -> Result<()> {
     info!("token renewal task started");
 
     // -----------------------------------------------------------------------
+    // Step 12a: Spawn mid-session profile watchdog (queue item I7)
+    // -----------------------------------------------------------------------
+    // Every 15 minutes during market hours, re-runs `pre_market_check`
+    // (dataPlan == "Active", activeSegment contains "Derivative", token
+    // expires > 4h). On rising-edge failure fires CRITICAL Telegram via
+    // NotificationEvent::MidSessionProfileInvalidated. Does NOT HALT —
+    // dropping the live WS feed mid-session costs more than the
+    // silent-failure risk we're monitoring.
+    let _mid_session_watchdog_handle =
+        tickvault_core::auth::mid_session_watchdog::spawn_mid_session_profile_watchdog(
+            std::sync::Arc::clone(&token_manager),
+            Some(std::sync::Arc::clone(&notifier)),
+        );
+    info!("mid-session profile watchdog spawned (15-min cadence, market-hours only)");
+
+    // -----------------------------------------------------------------------
     // Boot duration check — alert if boot exceeded BOOT_TIMEOUT_SECS
     // -----------------------------------------------------------------------
     let boot_elapsed = boot_start.elapsed();

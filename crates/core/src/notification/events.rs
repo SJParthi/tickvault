@@ -99,6 +99,14 @@ pub enum NotificationEvent {
         within_market_hours: bool,
     },
 
+    /// Mid-session profile check failed during market hours (queue item
+    /// I7, 2026-04-21). Fires CRITICAL on the rising edge only — if
+    /// the profile recovers on a subsequent check, an INFO log is
+    /// emitted (no Telegram). The app does NOT HALT mid-session — a
+    /// mid-session HALT would drop the live WS feed, which costs more
+    /// than the silent-failure risk. Operator remediation is manual.
+    MidSessionProfileInvalidated { reason: String },
+
     /// JWT token renewed successfully by background task.
     TokenRenewed,
 
@@ -524,6 +532,16 @@ impl NotificationEvent {
                     "{header}\n{reason}\n\
                      Run:\n  curl -H \"access-token: $TOKEN\" https://api.dhan.co/v2/profile\n\
                      Check: dataPlan == \"Active\", activeSegment contains \"Derivative\", tokenValidity > 4h."
+                )
+            }
+            Self::MidSessionProfileInvalidated { reason } => {
+                format!(
+                    "<b>CRITICAL: Mid-session profile INVALIDATED</b>\n{reason}\n\
+                     Live WS still running — operator action required.\n\
+                     Run:\n  curl -H \"access-token: $TOKEN\" https://api.dhan.co/v2/profile\n\
+                     Check: dataPlan == \"Active\", activeSegment contains \"Derivative\", tokenValidity > 4h.\n\
+                     If the profile is confirmed bad, restart the app so the boot-time HALT gate triggers \
+                     (the no-tick watchdog will then page again if ticks stop)."
                 )
             }
             Self::TokenRenewed => "<b>Token renewed</b>".to_string(),
@@ -1035,6 +1053,7 @@ impl NotificationEvent {
             Self::BootDeadlineMissed { .. } => Severity::Critical,
             Self::AuthenticationFailed { .. } => Severity::Critical,
             Self::PreMarketProfileCheckFailed { .. } => Severity::Critical,
+            Self::MidSessionProfileInvalidated { .. } => Severity::Critical,
             Self::TokenRenewalFailed { .. } => Severity::Critical,
             Self::InstrumentBuildFailed { .. } => Severity::High,
             Self::WebSocketDisconnected { .. } => Severity::High,
