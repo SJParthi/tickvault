@@ -31,10 +31,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use tickvault_common::constants::{
-    IST_UTC_OFFSET_SECONDS, SECONDS_PER_DAY, TICK_PERSIST_END_SECS_OF_DAY_IST,
-    TICK_PERSIST_START_SECS_OF_DAY_IST,
-};
+use tickvault_common::market_hours::is_within_market_hours_ist;
 use tokio::sync::Notify;
 // NOTE: Use `tokio::time::Instant` instead of `std::time::Instant` so the
 // watchdog honours the paused clock in `#[tokio::test(start_paused = true)]`.
@@ -58,35 +55,15 @@ pub const WATCHDOG_POLL_INTERVAL_SECS: u64 = 5;
 pub const WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS: u64 = 50;
 
 /// Watchdog threshold for live order update. The order update WebSocket
-/// is expected to be silent for long stretches during no-order windows.
-/// 600s tolerance + 60s safety margin.
-pub const WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS: u64 = 660;
-
-/// Test-only override: force `is_within_market_hours_ist()` to return
-/// `true` regardless of wall-clock. Production never reads this
-/// (`#[cfg(test)]` only).
-#[cfg(test)]
-static TEST_FORCE_IN_MARKET_HOURS: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// Returns `true` when the current IST wall-clock falls within the
-/// tick-persist window `[TICK_PERSIST_START, TICK_PERSIST_END)` — the
-/// same window Dhan uses to stream market data. Used by the activity
-/// watchdog to suppress post-market false alarms.
-///
-/// O(1): one `Utc::now()`, one `rem_euclid`, one range check.
-#[allow(clippy::cast_possible_truncation)] // APPROVED: secs-of-day fits u32
-fn is_within_market_hours_ist() -> bool {
-    #[cfg(test)]
-    if TEST_FORCE_IN_MARKET_HOURS.load(std::sync::atomic::Ordering::Relaxed) {
-        return true;
-    }
-    let now_utc_secs = chrono::Utc::now().timestamp();
-    let sec_of_day = now_utc_secs
-        .saturating_add(i64::from(IST_UTC_OFFSET_SECONDS))
-        .rem_euclid(i64::from(SECONDS_PER_DAY)) as u32;
-    (TICK_PERSIST_START_SECS_OF_DAY_IST..TICK_PERSIST_END_SECS_OF_DAY_IST).contains(&sec_of_day) // O(1) EXEMPT: Range::contains on scalar u32 is two compares, not a collection scan
-}
+/// is expected to be silent for long stretches during no-order windows —
+/// production evidence (2026-04-21) shows Dhan's order-update server
+/// does NOT reliably ping every 10s like the market feed does. The old
+/// 660s bound fired every 11 minutes on idle dry-run accounts, producing
+/// Telegram spam without signalling a real dead socket (TCP RST is
+/// caught via the `Some(Err(..))` branch of the read loop, not the
+/// watchdog). 1800s (30 min) keeps the liveness backstop for a truly
+/// wedged socket while staying silent through long idle windows.
+pub const WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS: u64 = 1800;
 
 /// Per-connection activity watchdog.
 ///
@@ -365,12 +342,11 @@ mod tests {
         // SCENARIO: counter never advances after start — watchdog fires after threshold.
         // Force market-hours gate on so the test does not depend on the
         // real wall-clock at which `cargo test` is invoked.
-        super::TEST_FORCE_IN_MARKET_HOURS.store(true, std::sync::atomic::Ordering::Relaxed);
+        tickvault_common::market_hours::set_test_force_in_market_hours(true);
         struct Reset;
         impl Drop for Reset {
             fn drop(&mut self) {
-                super::TEST_FORCE_IN_MARKET_HOURS
-                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                tickvault_common::market_hours::set_test_force_in_market_hours(false);
             }
         }
         let _reset = Reset;
@@ -407,12 +383,12 @@ mod tests {
         handle.abort();
     }
 
-    /// Direct unit test for `is_within_market_hours_ist` — verifies the
-    /// helper exists and returns a bool without reaching out to IO.
-    /// The behavioural property ("post-market silence does not fire")
-    /// is a caller concern; we test the helper in isolation here to
-    /// avoid races with the other paused-clock tests that set
-    /// `TEST_FORCE_IN_MARKET_HOURS`.
+    /// Direct unit test for the shared `is_within_market_hours_ist` —
+    /// verifies delegation to `tickvault_common::market_hours` compiles
+    /// and returns a bool without IO. The behavioural property
+    /// ("post-market silence does not fire") is a caller concern; we
+    /// test the helper in isolation here to avoid races with the other
+    /// paused-clock tests that set the test-force override.
     #[test]
     fn test_is_within_market_hours_ist_returns_bool() {
         let _ = super::is_within_market_hours_ist();
@@ -420,9 +396,14 @@ mod tests {
 
     #[test]
     fn thresholds_match_plan_spec() {
-        // P2.1: 50s for live-feed/depth, 660s for order-update.
+        // P2.1 (rev. 2026-04-21): 50s for live-feed/depth. Order-update
+        // raised from 660s to 1800s after production evidence showed
+        // Dhan's order-update server does not ping on the same cadence
+        // as the market feed; 660s produced every-11-minute false
+        // positives on idle dry-run accounts. 1800s keeps the liveness
+        // backstop while remaining silent through legitimate idle.
         assert_eq!(WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS, 50);
-        assert_eq!(WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS, 660);
+        assert_eq!(WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS, 1800);
     }
 
     // -----------------------------------------------------------------------

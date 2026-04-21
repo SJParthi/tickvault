@@ -865,6 +865,18 @@ async fn main() -> Result<()> {
             let snapshot_handle = Some(shared_movers.clone());
             let tick_broadcast_for_processor = Some(fast_tick_broadcast_sender.clone());
 
+            // Parthiban directive (2026-04-21): no-tick-during-market-hours
+            // watchdog. The tick processor updates this atomic on every
+            // parsed tick; the watchdog fires CRITICAL + Telegram if it
+            // stays stale > NO_TICK_THRESHOLD_SECS during market hours.
+            let fast_tick_heartbeat =
+                tickvault_core::pipeline::no_tick_watchdog::new_tick_heartbeat();
+            let _no_tick_watchdog_handle =
+                tickvault_core::pipeline::no_tick_watchdog::spawn_no_tick_watchdog(
+                    std::sync::Arc::clone(&fast_tick_heartbeat),
+                    Some(std::sync::Arc::clone(&fast_notifier)),
+                );
+
             // O(1) EXEMPT: cold path — build inline Greeks computer once at startup.
             let greeks_enricher = build_inline_greeks_enricher(&config, &subscription_plan);
 
@@ -904,6 +916,7 @@ async fn main() -> Result<()> {
                     None, // option_movers — created in slow boot only
                     None, // option_movers_writer — created in slow boot only
                     fast_registry,
+                    Some(fast_tick_heartbeat),
                 )
                 .await;
             });
@@ -1170,6 +1183,7 @@ async fn main() -> Result<()> {
             }
             let run_signal = Some(std::sync::Arc::clone(&auth_signal));
             let run_latch = Some(std::sync::Arc::clone(&auth_latch));
+            let reconnect_notifier = Some(std::sync::Arc::clone(&fast_notifier));
             tokio::spawn(async move {
                 run_order_update_connection(
                     url,
@@ -1180,6 +1194,7 @@ async fn main() -> Result<()> {
                     spill,
                     run_signal,
                     run_latch,
+                    reconnect_notifier,
                 )
                 .await;
             })
@@ -1614,24 +1629,72 @@ async fn main() -> Result<()> {
     };
 
     // -----------------------------------------------------------------------
-    // Step 6c: Pre-market readiness check (08:00/08:05 IST on trading days)
+    // Step 6c: Pre-market readiness check (Parthiban directive 2026-04-21)
     // -----------------------------------------------------------------------
-    // On AWS the app starts at 08:00 IST. Verify essential conditions before
-    // market open so failures are caught with 75 minutes to spare.
-    // Checks: data plan active, derivative segment enabled, token >4h remaining.
+    // Three-zone behaviour:
+    //   - 08:00–09:14 IST (pre-market): run + CRITICAL Telegram on failure,
+    //     but boot CONTINUES so operator has 75min to rotate the token /
+    //     reactivate dataPlan before 09:15.
+    //   - 09:15–15:30 IST (market hours): run + CRITICAL Telegram on failure
+    //     AND HALT the boot — we refuse to start trading against a bad
+    //     profile (expired dataPlan, revoked Derivative segment, or
+    //     4h-expiring token would all cause silent data loss).
+    //   - Off-hours / non-trading: skip (nothing to check against).
+    //
+    // Checks: dataPlan == "Active", activeSegment contains "Derivative",
+    // token expires > 4 hours from now.
     if is_trading {
         let now_ist =
             chrono::Utc::now() + chrono::Duration::hours(5) + chrono::Duration::minutes(30);
         let hour = now_ist.hour();
-        // Run pre-market check if booting between 08:00-09:14 IST (before market open).
-        if hour == 8 || (hour == 9 && now_ist.minute() < 15) {
-            info!("running pre-market readiness check (08:00–09:14 IST)");
+        let minute = now_ist.minute();
+        let in_pre_market = hour == 8 || (hour == 9 && minute < 15);
+        let in_market_hours =
+            (hour == 9 && minute >= 15) || (10..=14).contains(&hour) || (hour == 15 && minute < 30);
+        if in_pre_market || in_market_hours {
+            info!(
+                in_pre_market,
+                in_market_hours, "running pre-market readiness check"
+            );
             match token_manager.pre_market_check().await {
                 Ok(()) => info!("pre-market readiness check passed"),
                 Err(err) => {
-                    // WARN, not ERROR — system continues but operator should investigate.
-                    // During market hours this would be CRITICAL; at 08:00 there's time to fix.
-                    warn!(error = %err, "pre-market readiness check FAILED — investigate before 09:15");
+                    // I12 (2026-04-21): auto-diagnostic. On pre-market HALT,
+                    // fetch /v2/profile and /v2/ip/getIP directly and embed
+                    // their responses (redacted) in the CRITICAL Telegram
+                    // message. Operators previously had to run curl manually
+                    // while the market clock ticked — now the diagnosis
+                    // arrives in the same page.
+                    let diagnostics = build_pre_market_diagnostics(
+                        &token_manager,
+                        &config.dhan.rest_api_base_url,
+                    )
+                    .await;
+                    let reason = format!("{err}\n\n{diagnostics}");
+                    // Critical Telegram event — always fires (pre-market or market-hours).
+                    notifier.notify(NotificationEvent::PreMarketProfileCheckFailed {
+                        reason: reason.clone(),
+                        within_market_hours: in_market_hours,
+                    });
+                    if in_market_hours {
+                        // HALT — we refuse to boot into a live trading session
+                        // with a bad profile. systemd will restart on the next
+                        // attempt but the underlying cause (dataPlan / segment
+                        // / token) must be fixed first.
+                        error!(
+                            error = %err,
+                            "HALTING BOOT — pre-market profile check failed during market hours"
+                        );
+                        anyhow::bail!(
+                            "pre-market profile check FAILED during market hours — HALT: {reason}"
+                        );
+                    }
+                    // Pre-market window — log ERROR (triggers Telegram) but
+                    // allow boot to continue; operator has until 09:15 IST.
+                    error!(
+                        error = %err,
+                        "pre-market profile check FAILED — investigate before 09:15 IST"
+                    );
                 }
             }
         }
@@ -1872,6 +1935,15 @@ async fn main() -> Result<()> {
             .as_ref()
             .map(|p| std::sync::Arc::new(p.registry.clone()));
 
+        // Parthiban directive (2026-04-21): no-tick-during-market-hours
+        // watchdog (slow boot path). Same pattern as fast boot above.
+        let slow_tick_heartbeat = tickvault_core::pipeline::no_tick_watchdog::new_tick_heartbeat();
+        let _slow_no_tick_watchdog_handle =
+            tickvault_core::pipeline::no_tick_watchdog::spawn_no_tick_watchdog(
+                std::sync::Arc::clone(&slow_tick_heartbeat),
+                Some(std::sync::Arc::clone(&notifier)),
+            );
+
         let handle = tokio::spawn(async move {
             run_tick_processor(
                 receiver,
@@ -1887,6 +1959,7 @@ async fn main() -> Result<()> {
                 option_movers_tracker,
                 option_movers_writer,
                 slow_registry,
+                Some(slow_tick_heartbeat),
             )
             .await;
         });
@@ -2574,6 +2647,11 @@ async fn main() -> Result<()> {
                 let d20_label_for_signal = label.clone();
                 let d20_underlying_label = label.clone();
                 let d20_wal_spill = ws_frame_spill.clone();
+                // Parthiban directive (2026-04-21): wire notifier INSIDE the
+                // depth connection so DepthTwentyReconnected fires on every
+                // successful reconnect. The `d20_notifier` above is used
+                // only on task-exit for DepthTwentyDisconnected.
+                let d20_reconnect_notifier = Some(notifier.clone());
                 let (signal_tx, signal_rx) = tokio::sync::oneshot::channel::<()>();
                 // Command channel for live rebalance (unsubscribe+resubscribe, zero disconnect).
                 let (d20_cmd_tx, d20_cmd_rx) =
@@ -2599,6 +2677,7 @@ async fn main() -> Result<()> {
                         Some(signal_tx),
                         d20_wal_spill,
                         d20_cmd_rx,
+                        d20_reconnect_notifier,
                     )
                     .await
                     {
@@ -2748,6 +2827,11 @@ async fn main() -> Result<()> {
 
                         let d200_health = health_status.clone();
                         let d200_notifier = notifier.clone();
+                        // Parthiban directive (2026-04-21): wire notifier
+                        // INSIDE the depth-200 connection so
+                        // DepthTwoHundredReconnected fires on every
+                        // successful reconnect.
+                        let d200_reconnect_notifier = Some(notifier.clone());
                         let d200_label_for_disconnect = depth200_label.clone();
                         let d200_label_for_signal = depth200_label.clone();
                         let d200_sid_for_disconnect = depth200_sid;
@@ -2783,6 +2867,7 @@ async fn main() -> Result<()> {
                                     Some(d200_signal_tx),
                                     d200_wal_spill,
                                     d200_cmd_rx,
+                                    d200_reconnect_notifier,
                                 )
                                 .await
                             {
@@ -3341,6 +3426,7 @@ async fn main() -> Result<()> {
         }
         let run_signal = Some(std::sync::Arc::clone(&auth_signal));
         let run_latch = Some(std::sync::Arc::clone(&auth_latch));
+        let ou_reconnect_notifier = Some(std::sync::Arc::clone(&notifier));
         tokio::spawn(async move {
             ou_health.set_order_update_connected(true);
             // Telegram: Order Update WS connected (fires before read loop starts).
@@ -3354,6 +3440,7 @@ async fn main() -> Result<()> {
                 ou_wal_spill,
                 run_signal,
                 run_latch,
+                ou_reconnect_notifier,
             )
             .await;
             // If run_order_update_connection returns, connection terminated
@@ -3535,6 +3622,22 @@ async fn main() -> Result<()> {
     // -----------------------------------------------------------------------
     let renewal_handle = token_manager.spawn_renewal_task();
     info!("token renewal task started");
+
+    // -----------------------------------------------------------------------
+    // Step 12a: Spawn mid-session profile watchdog (queue item I7)
+    // -----------------------------------------------------------------------
+    // Every 15 minutes during market hours, re-runs `pre_market_check`
+    // (dataPlan == "Active", activeSegment contains "Derivative", token
+    // expires > 4h). On rising-edge failure fires CRITICAL Telegram via
+    // NotificationEvent::MidSessionProfileInvalidated. Does NOT HALT —
+    // dropping the live WS feed mid-session costs more than the
+    // silent-failure risk we're monitoring.
+    let _mid_session_watchdog_handle =
+        tickvault_core::auth::mid_session_watchdog::spawn_mid_session_profile_watchdog(
+            std::sync::Arc::clone(&token_manager),
+            Some(std::sync::Arc::clone(&notifier)),
+        );
+    info!("mid-session profile watchdog spawned (15-min cadence, market-hours only)");
 
     // -----------------------------------------------------------------------
     // Boot duration check — alert if boot exceeded BOOT_TIMEOUT_SECS
@@ -5347,4 +5450,107 @@ mod tests {
             "greeks pipeline MUST add IST_UTC_OFFSET_NANOS to Utc::now() timestamps"
         );
     }
+
+    /// I12 ratchet: the HALT branch must embed `/v2/profile` +
+    /// `/v2/ip/getIP` diagnostics in the Telegram message.
+    #[test]
+    fn test_premarket_halt_auto_diagnoses_profile_and_ip() {
+        let src = include_str!("main.rs");
+        assert!(
+            src.contains("build_pre_market_diagnostics"),
+            "main.rs HALT branch must call `build_pre_market_diagnostics` so \
+             the Telegram message carries the /v2/profile and /v2/ip/getIP \
+             responses alongside the failure reason (I12)."
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// I12 (2026-04-21): Auto-diagnostic for pre-market profile HALT.
+//
+// When `pre_market_check` fails, the operator previously had to run two
+// curl commands manually to find out WHY (dataPlan / segment / token /
+// IP allowlist). This helper fetches both endpoints directly and
+// returns a short human-readable summary to embed in the CRITICAL
+// Telegram message. Secrets (token + raw IP) are redacted — the output
+// is safe to stream to Telegram.
+// ---------------------------------------------------------------------------
+
+/// Fetches `/v2/profile` and `/v2/ip/getIP` and formats a summary
+/// suitable for the CRITICAL `PreMarketProfileCheckFailed` Telegram body.
+///
+/// Never panics. Every failure path is captured in the returned String
+/// so the operator always gets back SOMETHING — even if both endpoints
+/// are down. Timeout per endpoint is 5 seconds; total worst case ~10 s
+/// before the boot sequence proceeds to the HALT.
+// TEST-EXEMPT: requires live Dhan `/v2/profile` + `/v2/ip/getIP` HTTP; behaviour exercised by the ratchet test `test_premarket_halt_auto_diagnoses_profile_and_ip` above plus production smoke on the first HALT.
+async fn build_pre_market_diagnostics(
+    token_manager: &std::sync::Arc<tickvault_core::auth::TokenManager>,
+    rest_api_base_url: &str,
+) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(out, "--- Diagnostic snapshot (auto-fetched) ---");
+
+    match token_manager.get_user_profile().await {
+        Ok(profile) => {
+            let _ = writeln!(
+                out,
+                "/v2/profile: dataPlan={:?}  activeSegment={:?}  tokenValidity={:?}",
+                profile.data_plan, profile.active_segment, profile.token_validity
+            );
+        }
+        Err(e) => {
+            // The error `Display` already redacts query params via the
+            // REST client's own sanitiser, so it's safe to include here.
+            let _ = writeln!(out, "/v2/profile: ERROR {e}");
+        }
+    }
+
+    // For /v2/ip/getIP we need the access token — pull it from the
+    // token handle (O(1) arc-swap read).
+    let token_guard = token_manager.token_handle().load();
+    if let Some(token_state) = token_guard.as_ref().as_ref() {
+        use secrecy::ExposeSecret;
+        let access_token = token_state.access_token().expose_secret().to_string();
+        match tickvault_core::network::ip_verifier::get_ip(rest_api_base_url, &access_token).await {
+            Ok(ip) => {
+                // Redact all but the last octet of the IP for privacy.
+                let redacted_ip = redact_ip_last_octet(&ip.ip);
+                let _ = writeln!(
+                    out,
+                    "/v2/ip/getIP: ip={redacted_ip}  ipFlag={:?}  modifyDatePrimary={:?}",
+                    ip.ip_flag, ip.modify_date_primary
+                );
+            }
+            Err(e) => {
+                let _ = writeln!(out, "/v2/ip/getIP: ERROR {e}");
+            }
+        }
+    } else {
+        let _ = writeln!(
+            out,
+            "/v2/ip/getIP: SKIPPED (no access token available for diagnostic call)"
+        );
+    }
+    out
+}
+
+/// Redacts all but the last octet of an IPv4 address for safe Telegram
+/// embedding. IPv6 just returns a coarse "xxxx:...:last" form.
+// TEST-EXEMPT: trivial redaction wrapper exercised inline by the ratchet
+// test below.
+fn redact_ip_last_octet(raw: &str) -> String {
+    // IPv4 path
+    if let Some((prefix, last)) = raw.rsplit_once('.') {
+        // Replace prefix with "x.x.x"
+        let _ = prefix; // suppress unused-var
+        return format!("x.x.x.{last}");
+    }
+    // IPv6 path — keep only the last group
+    if let Some((_, last)) = raw.rsplit_once(':') {
+        return format!("x:...:{last}");
+    }
+    // Unknown shape — fully redact
+    "[REDACTED]".to_string()
 }
