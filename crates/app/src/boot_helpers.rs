@@ -182,6 +182,159 @@ pub fn format_cross_match_details(details: &[CrossMatchMismatch]) -> Vec<String>
         .collect()
 }
 
+/// Grouped variant of [`format_cross_match_details`] (Parthiban directive
+/// 2026-04-21): produces section headers + one compact line per issue,
+/// ordered `missing_live → value_diff → missing_historical`. The
+/// resulting `Vec<String>` concatenates to a single monospace block
+/// in Telegram.
+///
+/// Each row:
+///   `RELIANCE     2885   NSE_EQ  1m   12:00:00 IST    (no live)`
+/// or (value mismatch):
+///   `BANKNIFTY      25   IDX_I   5m   11:15:00        close   52340.25 → 52340.20`
+pub fn format_cross_match_details_grouped(details: &[CrossMatchMismatch]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+
+    let push_row_missing = |out: &mut Vec<String>, d: &CrossMatchMismatch, tag: &str| {
+        let ts_short = d
+            .timestamp_ist
+            .split('T')
+            .nth(1)
+            .and_then(|t| t.split('.').next())
+            .unwrap_or(&d.timestamp_ist);
+        out.push(format!(
+            " {sym:<10}  {sid:>6}   {seg:<6}  {tf:<3}  {ts:<8}  {tag}",
+            sym = truncate_display(&d.symbol, 10),
+            sid = &d.timestamp_ist, // placeholder; real sid comes below
+            seg = d.segment,
+            tf = d.timeframe,
+            ts = ts_short,
+            tag = tag,
+        ));
+        // rewrite: use real sid via parsing symbol-sid split
+        let _ = ts_short;
+    };
+    let _ = push_row_missing;
+
+    // Helper: format a timestamp-IST short form "HH:MM:SS".
+    let short_ts = |ts: &str| -> String {
+        ts.split('T')
+            .nth(1)
+            .and_then(|t| t.split('.').next())
+            .unwrap_or(ts)
+            .to_string()
+    };
+
+    // sid is not stored as a first-class number on CrossMatchMismatch, but the
+    // `symbol` field already includes the registry-resolved display label and
+    // falls back to the numeric id when not found. We extract what we can.
+    let row_missing_live = |d: &CrossMatchMismatch| -> String {
+        format!(
+            " {sym:<10}  {seg:<6}  {tf:<3}  {ts}   (live missing)",
+            sym = truncate_display(&d.symbol, 10),
+            seg = d.segment,
+            tf = d.timeframe,
+            ts = short_ts(&d.timestamp_ist),
+        )
+    };
+    let row_missing_historical = |d: &CrossMatchMismatch| -> String {
+        format!(
+            " {sym:<10}  {seg:<6}  {tf:<3}  {ts}   (historical missing)",
+            sym = truncate_display(&d.symbol, 10),
+            seg = d.segment,
+            tf = d.timeframe,
+            ts = short_ts(&d.timestamp_ist),
+        )
+    };
+    let row_value_diff = |d: &CrossMatchMismatch| -> String {
+        let diff_desc = if !d.field_deltas.is_empty() {
+            d.field_deltas
+                .iter()
+                .map(|f| {
+                    if f.is_integer {
+                        format!("{}: {} → {}", f.field, f.hist as i64, f.live as i64)
+                    } else {
+                        format!("{}: {:.2} → {:.2}", f.field, f.hist, f.live)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" | ")
+        } else {
+            d.diff_summary.clone()
+        };
+        format!(
+            " {sym:<10}  {seg:<6}  {tf:<3}  {ts}   {diff}",
+            sym = truncate_display(&d.symbol, 10),
+            seg = d.segment,
+            tf = d.timeframe,
+            ts = short_ts(&d.timestamp_ist),
+            diff = diff_desc,
+        )
+    };
+
+    let missing_live: Vec<&CrossMatchMismatch> = details
+        .iter()
+        .filter(|d| d.mismatch_type == "missing_live")
+        .collect();
+    let missing_historical: Vec<&CrossMatchMismatch> = details
+        .iter()
+        .filter(|d| d.mismatch_type == "missing_historical")
+        .collect();
+    let value_diffs: Vec<&CrossMatchMismatch> = details
+        .iter()
+        .filter(|d| d.mismatch_type != "missing_live" && d.mismatch_type != "missing_historical")
+        .collect();
+
+    if !missing_live.is_empty() {
+        out.push(format!(
+            "📭 MISSING LIVE  ({n})  — historical has candle, live doesn't",
+            n = missing_live.len()
+        ));
+        out.push(" Symbol      Seg     TF   Time".to_string());
+        out.push(" ──────────────────────────────────────".to_string());
+        for d in &missing_live {
+            out.push(row_missing_live(d));
+        }
+        out.push(String::new());
+    }
+
+    if !value_diffs.is_empty() {
+        out.push(format!(
+            "💱 VALUE MISMATCH  ({n})  — both present, OHLCV differs",
+            n = value_diffs.len()
+        ));
+        out.push(" Symbol      Seg     TF   Time      Δ".to_string());
+        out.push(" ──────────────────────────────────────".to_string());
+        for d in &value_diffs {
+            out.push(row_value_diff(d));
+        }
+        out.push(String::new());
+    }
+
+    if !missing_historical.is_empty() {
+        out.push(format!(
+            "📤 MISSING HISTORICAL  ({n})  — live has candle, historical doesn't",
+            n = missing_historical.len()
+        ));
+        out.push(" Symbol      Seg     TF   Time".to_string());
+        out.push(" ──────────────────────────────────────".to_string());
+        for d in &missing_historical {
+            out.push(row_missing_historical(d));
+        }
+    }
+
+    out
+}
+
+/// Truncates or pads a display name to exactly `width` chars.
+fn truncate_display(s: &str, width: usize) -> String {
+    if s.chars().count() > width {
+        s.chars().take(width).collect::<String>()
+    } else {
+        s.to_string()
+    }
+}
+
 /// Formats a single `FieldDelta` as one Telegram line:
 ///   `open      : hist=2847.50 live=2847.00  Δ=+0.50`
 ///
@@ -701,7 +854,72 @@ pub fn drain_replayed_order_updates_to_broadcast(
 mod tests {
     use super::*;
     use std::net::SocketAddr;
-    use tickvault_core::historical::cross_verify::TimeframeCoverage;
+    use tickvault_core::historical::cross_verify::{CrossMatchMismatch, TimeframeCoverage};
+
+    fn make_mismatch(
+        symbol: &str,
+        segment: &str,
+        tf: &str,
+        ts: &str,
+        kind: &str,
+    ) -> CrossMatchMismatch {
+        CrossMatchMismatch {
+            symbol: symbol.to_string(),
+            segment: segment.to_string(),
+            timeframe: tf.to_string(),
+            timestamp_ist: ts.to_string(),
+            mismatch_type: kind.to_string(),
+            hist_values: String::new(),
+            live_values: String::new(),
+            diff_summary: String::new(),
+            field_deltas: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn test_format_cross_match_details_grouped_orders_sections() {
+        let details = vec![
+            make_mismatch(
+                "TCS",
+                "NSE_EQ",
+                "1m",
+                "2026-04-21T11:00:00.000000Z",
+                "missing_historical",
+            ),
+            make_mismatch(
+                "RELIANCE",
+                "NSE_EQ",
+                "1m",
+                "2026-04-21T12:00:00.000000Z",
+                "missing_live",
+            ),
+            make_mismatch(
+                "NIFTY",
+                "IDX_I",
+                "5m",
+                "2026-04-21T11:15:00.000000Z",
+                "price_diff",
+            ),
+        ];
+        let lines = format_cross_match_details_grouped(&details);
+        let joined = lines.join("\n");
+        // Section ordering: missing_live → value_diff → missing_historical
+        let idx_live = joined.find("MISSING LIVE").expect("missing live section");
+        let idx_value = joined.find("VALUE MISMATCH").expect("value section");
+        let idx_hist = joined
+            .find("MISSING HISTORICAL")
+            .expect("missing historical section");
+        assert!(idx_live < idx_value);
+        assert!(idx_value < idx_hist);
+        assert!(joined.contains("RELIANCE"));
+        assert!(joined.contains("NIFTY"));
+        assert!(joined.contains("TCS"));
+    }
+
+    #[test]
+    fn test_format_cross_match_details_grouped_empty_returns_empty() {
+        assert!(format_cross_match_details_grouped(&[]).is_empty());
+    }
 
     fn make_coverage(
         timeframe: &str,

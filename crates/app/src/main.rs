@@ -28,8 +28,9 @@
 use tickvault_app::boot_helpers::{
     CONFIG_BASE_PATH, CONFIG_LOCAL_PATH, FAST_BOOT_WINDOW_END, FAST_BOOT_WINDOW_START, IstTimer,
     check_clock_drift, compute_market_close_sleep, create_error_log_writer,
-    create_rolling_log_writer, effective_ws_stagger, format_bind_addr, format_cross_match_details,
-    format_timeframe_details, format_violation_details, spawn_heartbeat_watchdog,
+    create_rolling_log_writer, effective_ws_stagger, format_bind_addr,
+    format_cross_match_details_grouped, format_timeframe_details, format_violation_details,
+    spawn_heartbeat_watchdog,
 };
 use tickvault_app::{infra, observability, trading_pipeline};
 
@@ -4493,31 +4494,55 @@ fn spawn_historical_candle_fetch(
                     )
                 };
 
+                // Scope counts from the registry (IDX_I + NSE_EQ only — the
+                // cross-match applies only to indices and stock equities per
+                // Parthiban directive 2026-04-21). F&O isn't served by Dhan
+                // historical REST so it's excluded from the expected grid.
+                let (scope_indices, scope_equities) = {
+                    use tickvault_common::types::ExchangeSegment;
+                    let grouped = bg_registry.by_exchange_segment();
+                    let idx = grouped.get(&ExchangeSegment::IdxI).map_or(0, Vec::len);
+                    let eq = grouped.get(&ExchangeSegment::NseEquity).map_or(0, Vec::len);
+                    (idx, eq)
+                };
+
+                // Value-mismatch count = Pass-A mismatches excluding missing_live
+                // (Pass-A produces value_diff + missing_live rows). Pass-B produces
+                // missing_historical. Total = value_mismatches + missing_live + missing_historical.
+                let missing_historical = cross_match
+                    .mismatch_details
+                    .iter()
+                    .filter(|m| m.mismatch_type == "missing_historical")
+                    .count();
+                let value_mismatches_count = cross_match
+                    .mismatches
+                    .saturating_sub(cross_match.missing_live)
+                    .saturating_sub(missing_historical);
+
                 if cross_match.passed {
                     bg_notifier.notify(NotificationEvent::CandleCrossMatchPassed {
                         timeframes_checked: cross_match.timeframes_checked,
                         candles_compared: cross_match.candles_compared,
                         today_ist_label,
+                        scope_indices,
+                        scope_equities,
+                        per_tf_cells: cross_match.per_timeframe_mismatches.clone(),
                     });
                 } else {
-                    // Build per-timeframe summary for Telegram (e.g., "1m: 3 | 5m: 0 | 15m: 1")
-                    let tf_summary: String = cross_match
-                        .per_timeframe_mismatches
-                        .iter()
-                        .map(|(tf, count)| format!("{tf}: {count}"))
-                        .collect::<Vec<_>>()
-                        .join(" | ");
-                    let mut details = format_cross_match_details(&cross_match.mismatch_details);
-                    // Prepend per-timeframe summary as first line
-                    if !tf_summary.is_empty() {
-                        details.insert(0, format!("Per-timeframe: {tf_summary}"));
-                    }
+                    // Group mismatch details by category for Telegram.
+                    // Order: missing_live → value_diff → missing_historical.
+                    let details = format_cross_match_details_grouped(&cross_match.mismatch_details);
                     bg_notifier.notify(NotificationEvent::CandleCrossMatchFailed {
                         candles_compared: cross_match.candles_compared,
                         mismatches: cross_match.mismatches,
                         missing_live: cross_match.missing_live,
                         mismatch_details: details,
                         today_ist_label,
+                        scope_indices,
+                        scope_equities,
+                        missing_historical,
+                        value_mismatches: value_mismatches_count,
+                        per_tf_gaps: cross_match.per_timeframe_mismatches.clone(),
                     });
                 }
             }
@@ -5280,7 +5305,7 @@ mod tests {
     fn test_boot_helper_functions_callable() {
         let _ = compute_market_close_sleep("15:30:00");
         let _ = format_violation_details(&[]);
-        let _ = format_cross_match_details(&[]);
+        let _ = format_cross_match_details_grouped(&[]);
         let _ = create_log_file_writer();
     }
 
