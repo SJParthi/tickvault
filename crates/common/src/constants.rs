@@ -437,7 +437,11 @@ pub const ORDER_UPDATE_OFF_HOURS_READ_TIMEOUT_SECS: u64 = 600;
 pub const ORDER_UPDATE_MAX_RECONNECT_ATTEMPTS: u32 = 10;
 
 /// Initial reconnect delay for order update WebSocket (milliseconds).
-pub const ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS: u64 = 1000;
+/// 500ms matches the main feed + depth connection first-retry latency —
+/// all 4 WebSocket types share a single aggressive first-retry bar so
+/// a transient Dhan reset recovers within a few hundred ms. Doubles on
+/// each failure up to `ORDER_UPDATE_RECONNECT_MAX_DELAY_MS`.
+pub const ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS: u64 = 500;
 
 /// Maximum reconnect delay for order update WebSocket (milliseconds).
 pub const ORDER_UPDATE_RECONNECT_MAX_DELAY_MS: u64 = 60000;
