@@ -341,13 +341,19 @@ impl WebSocketConnection {
                     // Post-reconnect notification. In-market backfill is explicitly
                     // disabled (user policy); only post-market historical candle
                     // fetch runs, and that path is independent of the live WS.
+                    //
+                    // Telegram fires ALWAYS on every successful reconnect,
+                    // inside OR outside market hours — Parthiban directive
+                    // (2026-04-21): all WS disconnect/reconnect/connect events
+                    // MUST be notified + audited, no gating. The operator is
+                    // the ground truth for distinguishing "expected Dhan
+                    // maintenance at 07:40 IST" from "unexpected disconnect".
                     if reconnection_count > 0 {
                         info!(
                             connection_id = self.connection_id,
                             reconnection_count,
                             "WebSocket reconnected (in-market backfill disabled — post-market historical fetch handles any gap)"
                         );
-                        // H1: Fire Telegram alert on reconnection success.
                         if let Some(ref n) = self.notifier {
                             n.notify(crate::notification::events::NotificationEvent::WebSocketReconnected {
                                 connection_index: usize::from(self.connection_id),
@@ -449,12 +455,16 @@ impl WebSocketConnection {
                         }
                         Err(err) => {
                             m_conn_active.set(0.0);
+                            // Telegram + WARN log on EVERY disconnect, inside
+                            // or outside market hours. Parthiban directive
+                            // (2026-04-21): full visibility + audit trail on
+                            // all WS events — the auto-reconnect loop below
+                            // handles recovery automatically and fast.
                             warn!(
                                 connection_id = self.connection_id,
                                 error = %err,
                                 "WebSocket disconnected — will reconnect"
                             );
-                            // H1: Fire Telegram alert on unexpected disconnect.
                             if let Some(ref n) = self.notifier {
                                 n.notify(crate::notification::events::NotificationEvent::WebSocketDisconnected {
                                     connection_index: usize::from(self.connection_id),
@@ -466,11 +476,23 @@ impl WebSocketConnection {
                     }
                 }
                 Err(err) => {
+                    // Telegram + WARN log on EVERY connect-failed event,
+                    // regardless of market hours. Mirrors the disconnect
+                    // branch above for full audit parity.
                     warn!(
                         connection_id = self.connection_id,
                         error = %err,
                         "WebSocket connection failed — will retry"
                     );
+                    if let Some(ref n) = self.notifier {
+                        n.notify(
+                            crate::notification::events::NotificationEvent::WebSocketDisconnected {
+                                connection_index: usize::from(self.connection_id),
+                                // O(1) EXEMPT: cold path — connect-failed is not per tick
+                                reason: format!("connect failed: {err}"),
+                            },
+                        );
+                    }
                 }
             }
 
@@ -1129,6 +1151,11 @@ impl WebSocketConnection {
         }
 
         // CRITICAL alert every 10 consecutive failures (triggers Telegram).
+        // Parthiban directive (2026-04-21): always ERROR + Telegram
+        // regardless of market hours. A 10-failure streak is always a
+        // real signal that warrants operator attention — even if Dhan
+        // is mid-maintenance at 07:40 IST, the operator needs to know
+        // that our recovery loop is still churning.
         if attempt.is_multiple_of(10) {
             error!(
                 connection_id = self.connection_id,

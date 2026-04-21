@@ -604,6 +604,12 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
     instrument_registry: Option<
         std::sync::Arc<tickvault_common::instrument_registry::InstrumentRegistry>,
     >,
+    // Shared heartbeat for the no-tick watchdog (Parthiban directive
+    // 2026-04-21). Updated to `Utc::now().timestamp()` on every parsed
+    // tick — single relaxed atomic store on the hot path. `None`
+    // disables the heartbeat (used by unit tests that do not spawn
+    // the watchdog). See `crate::pipeline::no_tick_watchdog`.
+    tick_heartbeat: Option<std::sync::Arc<std::sync::atomic::AtomicI64>>,
 ) {
     // Grab metric handles once before the hot loop — O(1) per tick after this.
     // These are no-ops if no metrics recorder is installed (e.g., in tests).
@@ -792,6 +798,17 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
             ParsedFrame::Tick(mut tick) => {
                 ticks_processed = ticks_processed.saturating_add(1);
                 m_ticks.increment(1);
+
+                // No-tick watchdog heartbeat (Parthiban directive 2026-04-21).
+                // Single relaxed atomic store. Utc::now() goes through the
+                // vDSO clock_gettime — tens of nanoseconds. The spawned
+                // watchdog reads this atomic every 30s.
+                if let Some(ref hb) = tick_heartbeat {
+                    hb.store(
+                        chrono::Utc::now().timestamp(),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
 
                 // Log PrevClose summary once, on the first real tick.
                 // By this point the PrevClose burst from subscription is complete.
@@ -987,6 +1004,15 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
             ParsedFrame::TickWithDepth(mut tick, depth) => {
                 ticks_processed = ticks_processed.saturating_add(1);
                 m_ticks.increment(1);
+
+                // No-tick watchdog heartbeat — same pattern as the Tick
+                // branch above. See `no_tick_watchdog` module.
+                if let Some(ref hb) = tick_heartbeat {
+                    hb.store(
+                        chrono::Utc::now().timestamp(),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                }
 
                 // Depth data is ALWAYS persisted — Market Depth standalone packets
                 // (code 3) have exchange_timestamp=0 by design, but their 5-level
@@ -1681,6 +1707,7 @@ mod tests {
             option_movers,
             option_movers_writer,
             None, // instrument_registry — not needed in tests
+            None, // tick_heartbeat — watchdog not exercised in tests
         )
         .await;
     }

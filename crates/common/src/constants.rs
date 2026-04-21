@@ -437,7 +437,11 @@ pub const ORDER_UPDATE_OFF_HOURS_READ_TIMEOUT_SECS: u64 = 600;
 pub const ORDER_UPDATE_MAX_RECONNECT_ATTEMPTS: u32 = 10;
 
 /// Initial reconnect delay for order update WebSocket (milliseconds).
-pub const ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS: u64 = 1000;
+/// 500ms matches the main feed + depth connection first-retry latency —
+/// all 4 WebSocket types share a single aggressive first-retry bar so
+/// a transient Dhan reset recovers within a few hundred ms. Doubles on
+/// each failure up to `ORDER_UPDATE_RECONNECT_MAX_DELAY_MS`.
+pub const ORDER_UPDATE_RECONNECT_INITIAL_DELAY_MS: u64 = 500;
 
 /// Maximum reconnect delay for order update WebSocket (milliseconds).
 pub const ORDER_UPDATE_RECONNECT_MAX_DELAY_MS: u64 = 60000;
@@ -491,6 +495,38 @@ pub const TICK_GAP_ERROR_THRESHOLD_SECS: u32 = 120;
 /// this window (wall-clock time), it is considered stale/frozen. 600s = 10 min.
 /// Checked periodically by `TickGapTracker::detect_stale_instruments()`.
 pub const STALE_LTP_THRESHOLD_SECS: u64 = 600;
+
+/// Backlog-tick age threshold (seconds). A tick whose `exchange_timestamp`
+/// is older than `now_ist - BACKLOG_TICK_AGE_THRESHOLD_SECS` is treated as
+/// a historical / replay tick by [`tickvault_trading::risk::tick_gap_tracker`],
+/// which SKIPS the gap-detection branch for it.
+///
+/// **2026-04-21 production evidence** (item I4 in the production-fixes
+/// queue): after a 234-minute process downtime, Dhan replayed the backlog
+/// of missed ticks on reconnect. For illiquid F&O instruments this
+/// replay contains 15-minute+ spacing between consecutive exchange
+/// timestamps — which the tick gap tracker (correctly, in live-stream
+/// semantics) interprets as a disconnection. 365 instruments had WARN
+/// gaps and 4,778 ERROR lines fired within 15 minutes, spamming
+/// Telegram with non-actionable alerts.
+///
+/// 60 seconds is conservative: real-time Dhan ticks arrive with < 2 s
+/// wall-clock-to-exchange-timestamp delta, so anything older than 60 s
+/// is provably not a live-stream gap. The `TICK_GAP_ALERT_THRESHOLD_SECS`
+/// (30 s) is only about gaps between CONSECUTIVE exchange timestamps,
+/// which is independent of this wall-clock age filter.
+pub const BACKLOG_TICK_AGE_THRESHOLD_SECS: u32 = 60;
+
+/// Upper bound for the backlog filter in seconds. A tick whose age exceeds
+/// this bound is considered `absurdly old` — outside any realistic Dhan
+/// backlog replay window — and falls through to the normal gap-detection
+/// logic. The bound exists to keep unit tests with stubbed timestamps
+/// (commonly `1_700_000_000` from 2023) exercising the gap path
+/// unchanged after the 2026-04-21 backlog-filter addition. 24 hours
+/// covers every realistic production backlog (Dhan keeps ~1 trading
+/// session of replay) while still filtering out 2-year-old test
+/// timestamps.
+pub const BACKLOG_TICK_AGE_MAX_SECS: u32 = 86_400;
 
 // ---------------------------------------------------------------------------
 // SSM Parameter Store — Secret Path Prefixes
