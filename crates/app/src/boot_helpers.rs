@@ -2389,6 +2389,73 @@ mod tests {
         assert_eq!(super::WATCHDOG_INTERVAL_SECS, 30);
     }
 
+    /// Ratchet: the Rust watchdog ping cadence MUST be fast enough that
+    /// systemd's `WatchdogSec=` never trips during a healthy run.
+    ///
+    /// The systemd watchdog rule of thumb is `interval >= 2 * ping_cadence`
+    /// so that a single missed ping (e.g. the task was briefly scheduled
+    /// out) does not kill the process. If either side drifts — someone
+    /// halves `WatchdogSec` in the .service file, or someone doubles
+    /// `WATCHDOG_INTERVAL_SECS` in Rust — this test fails at build time.
+    ///
+    /// Without this test, the failure mode is a silent overnight
+    /// kill-loop: systemd kills the app every `WatchdogSec` seconds,
+    /// the supervisor restarts it, and operators see only the restart
+    /// noise without understanding why.
+    #[test]
+    fn test_systemd_watchdog_sec_covers_rust_ping_interval() {
+        let service_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("deploy/systemd/tickvault.service"))
+            .unwrap_or_else(|| panic!("CARGO_MANIFEST_DIR has no grandparent — unexpected layout"));
+
+        let contents = match std::fs::read_to_string(&service_path) {
+            Ok(c) => c,
+            Err(err) => {
+                // If the service file is absent in a stripped checkout
+                // we cannot run this ratchet — fail explicitly rather
+                // than silently skip (silent skips caused production
+                // kill-loops in other projects).
+                panic!(
+                    "cannot read {}: {err} — this ratchet requires the systemd unit file",
+                    service_path.display()
+                );
+            }
+        };
+
+        let watchdog_sec_line = contents
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.starts_with('#') && line.starts_with("WatchdogSec="))
+            .unwrap_or_else(|| {
+                panic!(
+                    "no uncommented WatchdogSec= line found in {}",
+                    service_path.display()
+                )
+            });
+
+        let value_str = watchdog_sec_line
+            .strip_prefix("WatchdogSec=")
+            .unwrap_or_else(|| panic!("unexpected line shape: {watchdog_sec_line}"))
+            .trim();
+
+        let watchdog_sec: u64 = value_str.parse().unwrap_or_else(|_| {
+            panic!("WatchdogSec must be an integer seconds value, got: {value_str}")
+        });
+
+        let ping_secs = super::WATCHDOG_INTERVAL_SECS;
+        let minimum_expected = ping_secs.saturating_mul(2);
+        assert!(
+            watchdog_sec >= minimum_expected,
+            "systemd WatchdogSec={watchdog_sec} is too tight for Rust ping cadence \
+             WATCHDOG_INTERVAL_SECS={ping_secs}. Requires WatchdogSec >= {minimum_expected} \
+             (2x ping cadence) to tolerate a single missed ping without being killed. \
+             Either increase WatchdogSec in deploy/systemd/tickvault.service or decrease \
+             WATCHDOG_INTERVAL_SECS in boot_helpers.rs."
+        );
+    }
+
     #[test]
     fn test_clock_drift_check() {
         assert_eq!(super::CLOCK_DRIFT_THRESHOLD_SECS, 2);
