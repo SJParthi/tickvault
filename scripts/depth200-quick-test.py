@@ -398,57 +398,6 @@ async def test_one_url(url_base, url_label, security_id, sid_label):
 
 
 # ---------------------------------------------------------------------------
-# Step 4: Also test 20-level depth (to prove it works)
-# ---------------------------------------------------------------------------
-async def test_20_depth_quick(security_id, sid_label):
-    """Quick test of 20-level depth to prove THAT works."""
-    url = f"wss://depth-api-feed.dhan.co/twentydepth?token={ACCESS_TOKEN}&clientId={CLIENT_ID}&authType=2"
-
-    print(f"\n--- Control test: 20-level depth (should WORK) ---")
-    print(f"SecurityId: {security_id} ({sid_label})")
-
-    sub_msg = json.dumps({
-        "RequestCode": 23,
-        "InstrumentCount": 1,
-        "InstrumentList": [{
-            "ExchangeSegment": "NSE_FNO",
-            "SecurityId": security_id,
-        }],
-    })
-
-    try:
-        ws = await asyncio.wait_for(websockets.connect(url), timeout=10.0)
-        await ws.send(sub_msg)
-
-        frames = 0
-        start = time.time()
-        while time.time() - start < 15:
-            try:
-                data = await asyncio.wait_for(ws.recv(), timeout=5.0)
-                if isinstance(data, bytes) and len(data) >= 12:
-                    frames += 1
-                    header = struct.unpack('<hBBiI', data[:12])
-                    side = {41: "BID", 51: "ASK", 50: "DISC"}.get(header[1], "?")
-                    print(f"  [20-lvl FRAME {frames}] {side} | sid={header[3]} | {len(data)}B")
-                    if frames >= 4:
-                        break
-            except asyncio.TimeoutError:
-                pass
-
-        await ws.close()
-        if frames > 0:
-            print(f"  [OK] 20-level depth WORKS ({frames} frames)")
-            return True
-        else:
-            print(f"  [FAIL] 20-level depth also got zero frames")
-            return False
-
-    except Exception as e:
-        print(f"  [FAIL] 20-level depth error: {e}")
-        return False
-
-
-# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 async def main():
@@ -479,12 +428,6 @@ async def main():
     print(f"  Contract:          {label}")
     print(f"  Token valid:       YES (REST APIs responded)")
 
-    # Test 20-level first (control — should work)
-    banner("Control Test: 20-Level Depth")
-    twenty_ok = await test_20_depth_quick(sid, label)
-
-    await asyncio.sleep(1)
-
     # Test 200-level on both URLs
     banner("200-Level Depth Tests")
     results = {}
@@ -501,25 +444,20 @@ async def main():
     print(f"SecurityId:      {sid} ({label})")
     print(f"Token valid:     YES")
     print()
-    print(f"  20-level depth:           {'WORKS' if twenty_ok else 'FAILED'}")
     for url_label, (ok, count) in results.items():
         status = f"WORKS ({count} frames)" if ok else "FAILED (0 frames)"
         print(f"  200-level {url_label:20s}: {status}")
 
     all_200_failed = all(not ok for ok, _ in results.values())
-    if all_200_failed and twenty_ok:
+    if all_200_failed:
         print()
-        print("DIAGNOSIS: 20-level works, 200-level does NOT.")
-        print("           Same token, same SecurityId, same account.")
-        print("           200-level depth is NOT ENABLED on this account.")
+        print("DIAGNOSIS: 200-level depth returned ZERO frames on all URLs.")
+        print("           Token + REST APIs proven working above.")
+        print("           200-level depth is NOT working on this account.")
         print()
         print(f"REQUEST: Please enable 200-level Full Market Depth")
         print(f"         for Client ID {CLIENT_ID}.")
-    elif all_200_failed and not twenty_ok:
-        print()
-        print("DIAGNOSIS: BOTH 20-level and 200-level depth failed.")
-        print("           May be outside market hours or general depth issue.")
-    elif not all_200_failed:
+    else:
         print()
         print("200-LEVEL DEPTH IS WORKING!")
         for url_label, (ok, count) in results.items():
