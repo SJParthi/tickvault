@@ -1629,24 +1629,61 @@ async fn main() -> Result<()> {
     };
 
     // -----------------------------------------------------------------------
-    // Step 6c: Pre-market readiness check (08:00/08:05 IST on trading days)
+    // Step 6c: Pre-market readiness check (Parthiban directive 2026-04-21)
     // -----------------------------------------------------------------------
-    // On AWS the app starts at 08:00 IST. Verify essential conditions before
-    // market open so failures are caught with 75 minutes to spare.
-    // Checks: data plan active, derivative segment enabled, token >4h remaining.
+    // Three-zone behaviour:
+    //   - 08:00–09:14 IST (pre-market): run + CRITICAL Telegram on failure,
+    //     but boot CONTINUES so operator has 75min to rotate the token /
+    //     reactivate dataPlan before 09:15.
+    //   - 09:15–15:30 IST (market hours): run + CRITICAL Telegram on failure
+    //     AND HALT the boot — we refuse to start trading against a bad
+    //     profile (expired dataPlan, revoked Derivative segment, or
+    //     4h-expiring token would all cause silent data loss).
+    //   - Off-hours / non-trading: skip (nothing to check against).
+    //
+    // Checks: dataPlan == "Active", activeSegment contains "Derivative",
+    // token expires > 4 hours from now.
     if is_trading {
         let now_ist =
             chrono::Utc::now() + chrono::Duration::hours(5) + chrono::Duration::minutes(30);
         let hour = now_ist.hour();
-        // Run pre-market check if booting between 08:00-09:14 IST (before market open).
-        if hour == 8 || (hour == 9 && now_ist.minute() < 15) {
-            info!("running pre-market readiness check (08:00–09:14 IST)");
+        let minute = now_ist.minute();
+        let in_pre_market = hour == 8 || (hour == 9 && minute < 15);
+        let in_market_hours =
+            (hour == 9 && minute >= 15) || (10..=14).contains(&hour) || (hour == 15 && minute < 30);
+        if in_pre_market || in_market_hours {
+            info!(
+                in_pre_market,
+                in_market_hours, "running pre-market readiness check"
+            );
             match token_manager.pre_market_check().await {
                 Ok(()) => info!("pre-market readiness check passed"),
                 Err(err) => {
-                    // WARN, not ERROR — system continues but operator should investigate.
-                    // During market hours this would be CRITICAL; at 08:00 there's time to fix.
-                    warn!(error = %err, "pre-market readiness check FAILED — investigate before 09:15");
+                    let reason = format!("{err}");
+                    // Critical Telegram event — always fires (pre-market or market-hours).
+                    notifier.notify(NotificationEvent::PreMarketProfileCheckFailed {
+                        reason: reason.clone(),
+                        within_market_hours: in_market_hours,
+                    });
+                    if in_market_hours {
+                        // HALT — we refuse to boot into a live trading session
+                        // with a bad profile. systemd will restart on the next
+                        // attempt but the underlying cause (dataPlan / segment
+                        // / token) must be fixed first.
+                        error!(
+                            error = %err,
+                            "HALTING BOOT — pre-market profile check failed during market hours"
+                        );
+                        anyhow::bail!(
+                            "pre-market profile check FAILED during market hours — HALT: {reason}"
+                        );
+                    }
+                    // Pre-market window — log ERROR (triggers Telegram) but
+                    // allow boot to continue; operator has until 09:15 IST.
+                    error!(
+                        error = %err,
+                        "pre-market profile check FAILED — investigate before 09:15 IST"
+                    );
                 }
             }
         }
