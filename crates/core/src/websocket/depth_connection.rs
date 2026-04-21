@@ -79,10 +79,25 @@ const DEPTH_RECONNECT_INITIAL_MS: u64 = 1000;
 const DEPTH_RECONNECT_MAX_MS: u64 = 30000;
 
 /// Maximum consecutive reconnection attempts before giving up.
-/// At 30s max backoff, 20 attempts ≈ 10 minutes of retrying.
-/// Prevents infinite retry loops after market close or on permanently
-/// unreachable instruments.
-const DEPTH_RECONNECT_MAX_ATTEMPTS: u64 = 20;
+///
+/// **2026-04-21 production evidence**: all 4 depth-200 connections
+/// exhausted the previous 20-attempt budget within 10 minutes during
+/// market hours, then terminated permanently. Dhan's server repeatedly
+/// TCP-reset the socket with `Protocol(ResetWithoutClosingHandshake)`
+/// *despite the subscribed security_id being ATM* (Parthiban verified
+/// against the Python SDK — same account, same strikes, Python works).
+/// Root cause is therefore NOT off-ATM filtering. Investigation is
+/// queued as a separate item in `.claude/queues/production-fixes-2026-04-21.md`
+/// (I14 — Python-vs-Rust depth-200 protocol diff).
+///
+/// This 60-attempt cap is a conservative tolerance raise from 20 →
+/// ≈30 min of retrying during market hours. It does NOT solve the
+/// underlying Rust-side protocol bug; it only gives the process more
+/// time to ride through a transient server reset. The
+/// `ReconnectionExhausted` terminal error still fires CRITICAL
+/// Telegram so the operator is paged if even 30 minutes cannot
+/// recover.
+const DEPTH_RECONNECT_MAX_ATTEMPTS: u64 = 60;
 
 /// Pong send timeout (seconds). Matches main feed connection behavior.
 /// If pong send takes longer, the TCP connection is likely dead.
