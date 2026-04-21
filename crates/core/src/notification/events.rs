@@ -364,12 +364,16 @@ pub enum NotificationEvent {
         /// Total candles compared.
         candles_compared: usize,
         /// Human-readable IST session label, e.g. `"2026-04-20 09:15–15:30 IST"`.
-        /// Empty string when the caller doesn't have a window (legacy paths).
-        /// Surfaced on the first Telegram line so the operator immediately
-        /// sees which trading session this "OK" actually verifies — fixes
-        /// the 2026-04-20 ambiguity where an OK on 12 days of accumulated
-        /// data looked like today's session was clean.
         today_ist_label: String,
+        /// Number of IDX_I (index) instruments in the verified scope.
+        /// Defaults to 0 for legacy callers — renders a blank scope breakdown.
+        scope_indices: usize,
+        /// Number of NSE_EQ (stock equity) instruments in the verified scope.
+        scope_equities: usize,
+        /// Per-timeframe cell counts: `(timeframe, cells)` e.g.
+        /// `[("1m", 79125), ("5m", 15825)]`. Rendered as a monospace
+        /// coverage table in Telegram. Empty for legacy callers.
+        per_tf_cells: Vec<(String, usize)>,
     },
 
     /// Historical vs Live candle cross-match found mismatches.
@@ -381,10 +385,21 @@ pub enum NotificationEvent {
         /// Historical candle exists but no live data (WebSocket missed ticks).
         missing_live: usize,
         /// Pre-formatted mismatch detail lines for Telegram.
+        /// Full list — no truncation (Parthiban directive 2026-04-21).
+        /// Chunked by the notification layer when >4000 chars.
         mismatch_details: Vec<String>,
         /// Human-readable IST session label, e.g. `"2026-04-20 09:15–15:30 IST"`.
-        /// See `CandleCrossMatchPassed.today_ist_label`.
         today_ist_label: String,
+        /// Number of IDX_I (index) instruments in the verified scope.
+        scope_indices: usize,
+        /// Number of NSE_EQ (stock equity) instruments in the verified scope.
+        scope_equities: usize,
+        /// Live candle exists but historical doesn't (rare — Dhan REST gap).
+        missing_historical: usize,
+        /// Both present but OHLCV differs.
+        value_mismatches: usize,
+        /// Per-timeframe gap counts: `(timeframe, gaps)`.
+        per_tf_gaps: Vec<(String, usize)>,
     },
 
     /// Historical vs Live candle cross-match skipped — no live data in
@@ -496,6 +511,112 @@ pub enum NotificationEvent {
 
     /// Custom alert from any component.
     Custom { message: String },
+}
+
+// ---------------------------------------------------------------------------
+// Cross-match Telegram rendering (extracted — Parthiban 2026-04-21)
+// ---------------------------------------------------------------------------
+
+fn render_scope_line(scope_indices: usize, scope_equities: usize) -> String {
+    let total = scope_indices.saturating_add(scope_equities);
+    if total == 0 {
+        return "🎯 Scope    Indices + Stock Equities only\n            (F&O not in Dhan historical API)".to_string();
+    }
+    format!(
+        "🎯 Scope    Indices + Stock Equities only\n            (F&O not in Dhan historical API)\n📊 Universe {total} instruments\n            • {scope_indices} indices  • {scope_equities} equities"
+    )
+}
+
+fn render_window_line(today_ist_label: &str) -> String {
+    if today_ist_label.is_empty() {
+        "📅 Window   (not supplied)".to_string()
+    } else {
+        format!("📅 Window   {today_ist_label}")
+    }
+}
+
+fn render_cross_match_ok(
+    timeframes_checked: usize,
+    candles_compared: usize,
+    today_ist_label: &str,
+    scope_indices: usize,
+    scope_equities: usize,
+    per_tf_cells: &[(String, usize)],
+) -> String {
+    let mut out = String::new();
+    out.push_str("✅ <b>CROSS-MATCH OK</b>\n\n");
+    out.push_str(&render_window_line(today_ist_label));
+    out.push_str("\n\n");
+    out.push_str(&render_scope_line(scope_indices, scope_equities));
+    out.push_str("\n\n ─── COVERAGE ──────────────────────\n<pre>");
+    if per_tf_cells.is_empty() {
+        out.push_str(&format!(
+            "Timeframes: {timeframes_checked}  Candles: {candles_compared}"
+        ));
+    } else {
+        out.push_str("   TF  │  Cells    │ Gaps │ Diffs\n");
+        out.push_str("  ─────┼───────────┼──────┼───────\n");
+        for (tf, cells) in per_tf_cells {
+            out.push_str(&format!(
+                "  {tf:>3}  │ {cells:>9}  │   0  │   0\n",
+                tf = tf,
+                cells = cells
+            ));
+        }
+    }
+    out.push_str("</pre>\n ────────────────────────────────────\n\n");
+    out.push_str("✓ All OHLCV values match bit-for-bit\n");
+    out.push_str("  zero tolerance · precision-verified");
+    out
+}
+
+#[allow(clippy::too_many_arguments)] // APPROVED: struct-equivalent unpacking of event fields; grouping adds a named struct for a private helper.
+fn render_cross_match_failed(
+    candles_compared: usize,
+    mismatches: usize,
+    missing_live: usize,
+    missing_historical: usize,
+    value_mismatches: usize,
+    mismatch_details: &[String],
+    today_ist_label: &str,
+    scope_indices: usize,
+    scope_equities: usize,
+    per_tf_gaps: &[(String, usize)],
+) -> String {
+    let mut out = String::new();
+    out.push_str("❌ <b>CROSS-MATCH FAILED</b>\n\n");
+    out.push_str(&render_window_line(today_ist_label));
+    out.push_str("\n\n");
+    out.push_str(&render_scope_line(scope_indices, scope_equities));
+    out.push_str("\n\n ─── SUMMARY ───────────────────────\n<pre>");
+    out.push_str(&format!("   🔴 Missing live       {missing_live:>6}\n"));
+    out.push_str(&format!(
+        "   🔴 Missing historical {missing_historical:>6}\n"
+    ));
+    out.push_str(&format!("   🟡 Value mismatches   {value_mismatches:>6}\n"));
+    out.push_str("  ─────────────────────────────────\n");
+    out.push_str(&format!("      Total issues       {mismatches:>6}\n"));
+    out.push_str(&format!("      Cells compared     {candles_compared:>6}"));
+    out.push_str("</pre>\n");
+
+    if !per_tf_gaps.is_empty() {
+        out.push_str("\n ─── GAPS BY TIMEFRAME ─────────────\n<pre>");
+        for (tf, gaps) in per_tf_gaps {
+            out.push_str(&format!("   {tf:>3}   {gaps:>5}\n", tf = tf, gaps = gaps));
+        }
+        out.push_str("</pre>\n");
+    }
+
+    if !mismatch_details.is_empty() {
+        out.push_str("\n📋 <b>Full list below</b>");
+        out.push_str("\n   Order: MISSING LIVE → VALUE DIFF → MISSING HIST\n\n<pre>");
+        for line in mismatch_details {
+            out.push_str(line);
+            out.push('\n');
+        }
+        out.push_str("</pre>\n🏁 End of report");
+    }
+    out
 }
 
 impl NotificationEvent {
@@ -884,49 +1005,40 @@ impl NotificationEvent {
                 timeframes_checked,
                 candles_compared,
                 today_ist_label,
-            } => {
-                let header = if today_ist_label.is_empty() {
-                    String::new()
-                } else {
-                    format!("\n<b>TODAY ONLY:</b> {today_ist_label}")
-                };
-                format!(
-                    "<b>Historical vs Live cross-match OK</b>{header}\nTimeframes: {timeframes_checked} | Candles compared: {candles_compared}\nAll OHLCV values match exactly (zero tolerance, precision-verified)"
-                )
-            }
+                scope_indices,
+                scope_equities,
+                per_tf_cells,
+            } => render_cross_match_ok(
+                *timeframes_checked,
+                *candles_compared,
+                today_ist_label,
+                *scope_indices,
+                *scope_equities,
+                per_tf_cells,
+            ),
             Self::CandleCrossMatchFailed {
                 candles_compared,
                 mismatches,
                 missing_live,
                 mismatch_details,
                 today_ist_label,
-            } => {
-                let header = if today_ist_label.is_empty() {
-                    String::new()
-                } else {
-                    format!("\n<b>TODAY ONLY:</b> {today_ist_label}")
-                };
-                let mut msg = format!(
-                    "<b>Historical vs Live cross-match FAILED</b>{header}\nCompared: {candles_compared} | Mismatches: {mismatches}"
-                );
-                if *missing_live > 0 {
-                    msg.push_str(&format!("\nMissing live: {missing_live}"));
-                }
-                if !mismatch_details.is_empty() {
-                    msg.push_str("\n\n<b>Mismatches (every timestamp with OHLCV diff):</b>");
-                    let show_count = mismatch_details.len().min(50);
-                    for line in &mismatch_details[..show_count] {
-                        msg.push_str(&format!("\n{line}"));
-                    }
-                    if mismatch_details.len() > 50 {
-                        let remaining = mismatch_details.len().saturating_sub(50);
-                        msg.push_str(&format!(
-                            "\n... +{remaining} more (full list in structured logs — query Loki/Grafana)"
-                        ));
-                    }
-                }
-                msg
-            }
+                scope_indices,
+                scope_equities,
+                missing_historical,
+                value_mismatches,
+                per_tf_gaps,
+            } => render_cross_match_failed(
+                *candles_compared,
+                *mismatches,
+                *missing_live,
+                *missing_historical,
+                *value_mismatches,
+                mismatch_details,
+                today_ist_label,
+                *scope_indices,
+                *scope_equities,
+                per_tf_gaps,
+            ),
             Self::CandleCrossMatchSkipped {
                 reason,
                 candles_compared,
@@ -1570,12 +1682,16 @@ mod tests {
         let event = NotificationEvent::CandleCrossMatchPassed {
             timeframes_checked: 5,
             candles_compared: 187500,
-            today_ist_label: String::new(),
+            today_ist_label: "2026-04-21 09:15→15:30 IST".to_string(),
+            scope_indices: 5,
+            scope_equities: 206,
+            per_tf_cells: vec![("1m".to_string(), 79125), ("5m".to_string(), 15825)],
         };
         let msg = event.to_message();
-        assert!(msg.contains("cross-match OK"));
-        assert!(msg.contains("187500"));
-        assert!(msg.contains("tolerance"));
+        assert!(msg.contains("CROSS-MATCH OK"));
+        assert!(msg.contains("79125"));
+        assert!(msg.contains("bit-for-bit"));
+        assert!(msg.contains("<pre>"));
     }
 
     #[test]
@@ -1585,16 +1701,23 @@ mod tests {
             mismatches: 12,
             missing_live: 8,
             mismatch_details: vec![
-                "\u{2022} RELIANCE (NSE_EQ) 1m @ 2026-03-18 10:15 IST\n  Hist: O=2450.0 H=2465.0\n  Live: O=2450.0 H=2463.5\n  Diff: H(-1.5)".to_string(),
+                " RELIANCE    NSE_EQ  1m   10:15:00   (live missing)".to_string(),
             ],
-            today_ist_label: String::new(),
+            today_ist_label: "2026-04-21 09:15→15:30 IST".to_string(),
+            scope_indices: 5,
+            scope_equities: 206,
+            missing_historical: 1,
+            value_mismatches: 3,
+            per_tf_gaps: vec![("1m".to_string(), 9), ("5m".to_string(), 3)],
         };
         let msg = event.to_message();
-        assert!(msg.contains("cross-match FAILED"));
-        assert!(msg.contains("Mismatches: 12"));
-        assert!(msg.contains("Missing live: 8"));
+        assert!(msg.contains("CROSS-MATCH FAILED"));
+        assert!(msg.contains("Missing live"));
+        assert!(msg.contains("Missing historical"));
+        assert!(msg.contains("Value mismatches"));
+        assert!(msg.contains("Total issues"));
         assert!(msg.contains("RELIANCE"));
-        assert!(msg.contains("H(-1.5)"));
+        assert!(msg.contains("(live missing)"));
     }
 
     #[test]
@@ -1605,6 +1728,11 @@ mod tests {
             missing_live: 8,
             mismatch_details: vec![],
             today_ist_label: String::new(),
+            scope_indices: 0,
+            scope_equities: 0,
+            missing_historical: 0,
+            value_mismatches: 4,
+            per_tf_gaps: vec![],
         };
         assert_eq!(event.severity(), Severity::High);
     }
@@ -1615,6 +1743,9 @@ mod tests {
             timeframes_checked: 5,
             candles_compared: 187500,
             today_ist_label: String::new(),
+            scope_indices: 0,
+            scope_equities: 0,
+            per_tf_cells: vec![],
         };
         assert_eq!(event.severity(), Severity::Low);
     }
@@ -2098,15 +2229,23 @@ mod tests {
 
     #[test]
     fn test_cross_match_failed_no_missing_live() {
+        // Missing-live is always rendered in the new format — but as `0` in the
+        // SUMMARY block. The top-level FAILED message still appears.
         let event = NotificationEvent::CandleCrossMatchFailed {
             candles_compared: 1000,
             mismatches: 5,
             missing_live: 0,
             mismatch_details: vec![],
             today_ist_label: String::new(),
+            scope_indices: 0,
+            scope_equities: 0,
+            missing_historical: 0,
+            value_mismatches: 5,
+            per_tf_gaps: vec![],
         };
         let msg = event.to_message();
-        assert!(!msg.contains("Missing live"));
+        assert!(msg.contains("FAILED"));
+        assert!(msg.contains("Missing live       "));
     }
 
     #[test]
@@ -2117,10 +2256,15 @@ mod tests {
             missing_live: 0,
             mismatch_details: vec![],
             today_ist_label: String::new(),
+            scope_indices: 0,
+            scope_equities: 0,
+            missing_historical: 0,
+            value_mismatches: 0,
+            per_tf_gaps: vec![],
         };
         let msg = event.to_message();
-        // The header always contains "Mismatches: N", but the details section should be absent
-        assert!(!msg.contains("<b>Mismatches:</b>"));
+        // No per-row list when mismatch_details empty.
+        assert!(!msg.contains("📋"));
     }
 
     #[test]
@@ -2204,10 +2348,9 @@ mod tests {
     }
 
     #[test]
-    fn test_cross_match_failed_truncates_long_mismatch_details() {
-        // Truncation limit raised to 50 in a previous refactor; update the
-        // test to match. Test now uses 60 entries so the +10 more overflow
-        // is still exercised.
+    fn test_cross_match_failed_shows_every_mismatch_no_truncation() {
+        // Parthiban directive 2026-04-21: FULL LIST, no "+N more". 60 rows
+        // must all appear in the Telegram body.
         let details: Vec<String> = (0..60).map(|i| format!("mismatch {i}")).collect();
         let event = NotificationEvent::CandleCrossMatchFailed {
             candles_compared: 100,
@@ -2215,12 +2358,21 @@ mod tests {
             missing_live: 0,
             mismatch_details: details,
             today_ist_label: String::new(),
+            scope_indices: 0,
+            scope_equities: 0,
+            missing_historical: 0,
+            value_mismatches: 60,
+            per_tf_gaps: vec![],
         };
         let msg = event.to_message();
         assert!(msg.contains("mismatch 0"));
         assert!(msg.contains("mismatch 49"));
-        assert!(!msg.contains("mismatch 50"));
-        assert!(msg.contains("+10 more"));
+        assert!(msg.contains("mismatch 50"));
+        assert!(msg.contains("mismatch 59"));
+        assert!(
+            !msg.contains("more (full list"),
+            "no truncation suffix allowed"
+        );
     }
 
     // =====================================================================

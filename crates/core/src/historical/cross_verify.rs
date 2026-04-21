@@ -323,26 +323,55 @@ impl TodayIstWindow {
         })
     }
 
-    /// Returns the SQL fragment `ts >= '...' AND ts <= '...'` suitable for
-    /// dropping into any WHERE clause. Replaces the old
-    /// `ts > dateadd('d', -3, now())` 3-day window.
+    /// Returns the SQL fragment `ts >= '...' AND ts < '...'` suitable for
+    /// dropping into any WHERE clause. Window is **09:15 inclusive → 15:30
+    /// exclusive** per product spec (1m candle at 15:29:00 covers
+    /// 15:29:00–15:29:59, there is no 15:30:00 candle).
     pub fn where_clause(&self) -> String {
         format!(
-            "ts >= {start} AND ts <= {end}",
+            "ts >= {start} AND ts < {end}",
             start = self.start_sql,
             end = self.end_sql,
         )
     }
 
     /// Same as [`where_clause`] but prefixed with a table alias
-    /// (e.g. `"h"` → `h.ts >= '...' AND h.ts <= '...'`).
+    /// (e.g. `"h"` → `h.ts >= '...' AND h.ts < '...'`).
     pub fn where_clause_aliased(&self, alias: &str) -> String {
         format!(
-            "{alias}.ts >= {start} AND {alias}.ts <= {end}",
+            "{alias}.ts >= {start} AND {alias}.ts < {end}",
             start = self.start_sql,
             end = self.end_sql,
         )
     }
+
+    /// Human-readable IST session label for Telegram headers.
+    /// Example: `"2026-04-21 09:15 → 15:30 IST  (inclusive → exclusive)"`.
+    pub fn human_label(&self) -> String {
+        format!(
+            "{} 09:15 → 15:30 IST  (inclusive → exclusive)",
+            self.today_ist
+        )
+    }
+}
+
+/// Cross-match scope: only indices (IDX_I) and stock equities (NSE_EQ)
+/// are verifiable against Dhan's historical REST API. F&O (NSE_FNO,
+/// BSE_FNO) are NOT served by `/v2/charts/historical` or
+/// `/v2/charts/intraday`, so they are excluded from the cross-match
+/// expected grid.
+///
+/// Parthiban directive 2026-04-21: "this is applicable only for indices
+/// and stock equities alone".
+///
+/// Returns a SQL fragment like `segment IN ('NSE_EQ', 'IDX_I')` without a
+/// leading `AND` — caller composes with other WHERE clauses.
+pub const CROSS_MATCH_SCOPE_SQL: &str = "segment IN ('NSE_EQ', 'IDX_I')";
+
+/// Same as [`CROSS_MATCH_SCOPE_SQL`] but prefixed with a table alias
+/// (e.g. `"h"` → `h.segment IN ('NSE_EQ', 'IDX_I')`).
+pub fn cross_match_scope_aliased(alias: &str) -> String {
+    format!("{alias}.segment IN ('NSE_EQ', 'IDX_I')")
 }
 
 // ---------------------------------------------------------------------------
@@ -794,10 +823,26 @@ fn build_missing_live_mismatch(ctx: CandleContext, hist: CandleValues) -> CrossM
 /// Determines if the cross-match report should pass.
 fn determine_cross_match_passed(
     total_mismatches: usize,
+    total_missing_live: usize,
+    total_missing_historical: usize,
     total_compared: usize,
     missing_views_count: usize,
 ) -> bool {
-    total_mismatches == 0 && total_compared > 0 && missing_views_count == 0
+    // Fixed 2026-04-21 (Parthiban directive): cross-match may ONLY report OK
+    // when EVERY applicable 09:15→15:30 IST slot is present on BOTH historical
+    // and live sides AND every OHLCV value matches bit-for-bit. Any hole of
+    // any kind = FAILED.
+    //
+    // Previously this function ignored `missing_live` and `missing_historical`
+    // completely — so a day where the app was down from 12:00–13:00 would
+    // produce zero live rows for that hour, the LEFT JOIN would drop those
+    // historical rows from the detail query, `total_mismatches` stayed 0, and
+    // the operator got a misleading OK at 15:47.
+    total_mismatches == 0
+        && total_missing_live == 0
+        && total_missing_historical == 0
+        && total_compared > 0
+        && missing_views_count == 0
 }
 
 /// Parsed fields from a single QuestDB violation row.
@@ -1367,7 +1412,7 @@ pub async fn cross_match_historical_vs_live(
     let mut total_compared = 0_usize;
     let mut total_mismatches = 0_usize;
     let mut total_missing_live = 0_usize;
-    let total_missing_historical = 0_usize;
+    let mut total_missing_historical = 0_usize;
     let mut total_oi_mismatches = 0_usize;
     let mut all_details: Vec<CrossMatchMismatch> = Vec::new();
     let mut timeframes_checked = 0_usize;
@@ -1378,8 +1423,16 @@ pub async fn cross_match_historical_vs_live(
     // MV is empty, so `candles_compared` alone cannot distinguish
     // "N candles joined against live data" from "N historical rows and
     // zero matching live rows". Track whether any live MV has rows in
-    // the last 3 days separately.
+    // today's window separately.
     let mut live_candles_present = false;
+
+    // Scope filter: cross-match applies ONLY to indices (IDX_I) and stock
+    // equities (NSE_EQ) — F&O is not served by Dhan's historical REST API
+    // so those rows are excluded from both the expected grid and the
+    // detail queries below. Parthiban directive 2026-04-21.
+    let scope_h = cross_match_scope_aliased("h");
+    let scope_m = cross_match_scope_aliased("m");
+    let scope_plain = CROSS_MATCH_SCOPE_SQL;
 
     for &(hist_tf, live_table) in CROSS_MATCH_TIMEFRAMES {
         // M2: Check if the materialized view exists before JOINing.
@@ -1406,23 +1459,29 @@ pub async fn cross_match_historical_vs_live(
             continue;
         }
 
-        // Direct live-MV row count (NOT a LEFT JOIN). Determines whether
-        // there is any live data at all to compare against. If zero,
-        // we still run the per-timeframe LEFT JOIN below for completeness
-        // but the caller will refuse to emit "OK" without at least one
-        // timeframe reporting live rows.
-        let live_count_query = format!("SELECT count() FROM {} WHERE {ts_filter}", live_table);
+        // Direct live-MV row count (scope-filtered, NOT a LEFT JOIN).
+        // Determines whether there is any live data at all to compare
+        // against for IDX_I/NSE_EQ instruments.
+        let live_count_query = format!(
+            "SELECT count() FROM {} WHERE {ts_filter} AND {scope_plain}",
+            live_table
+        );
         let live_tf_rows = extract_count(&client, &base_url, &live_count_query).await;
         if live_tf_rows > 0 {
             live_candles_present = true;
         }
 
-        // Count total comparable candles for this timeframe
+        // Count total comparable historical candles for this timeframe
+        // (scope-filtered to IDX_I + NSE_EQ only). LEFT JOIN preserves
+        // every historical row even if the live twin is absent, so this
+        // count represents the expected grid size for the scope.
         let count_query = format!(
-            "SELECT count() FROM {} h \
-             LEFT JOIN {} m ON h.security_id = m.security_id AND h.ts = m.ts AND h.segment = m.segment \
-             WHERE h.timeframe = '{}' AND {ts_filter_h}",
-            QUESTDB_TABLE_HISTORICAL_CANDLES, live_table, hist_tf
+            "SELECT count() FROM {hist} h \
+             LEFT JOIN {live} m ON h.security_id = m.security_id AND h.ts = m.ts AND h.segment = m.segment \
+             WHERE h.timeframe = '{tf}' AND {ts_filter_h} AND {scope_h}",
+            hist = QUESTDB_TABLE_HISTORICAL_CANDLES,
+            live = live_table,
+            tf = hist_tf,
         );
 
         let tf_total = extract_count(&client, &base_url, &count_query).await;
@@ -1433,28 +1492,30 @@ pub async fn cross_match_historical_vs_live(
         }
         timeframes_checked = timeframes_checked.saturating_add(1);
 
-        // Fetch ALL joined rows for this timeframe — Rust applies epsilon + volume + OI checks.
-        // SQL pre-filters with generous tolerance to avoid fetching perfectly matching rows.
+        // ------------------------------------------------------------------
+        // Pass-A: historical LEFT JOIN live
+        //   Produces: value_diff rows + missing_live rows.
+        //   Scope: IDX_I + NSE_EQ only. No LIMIT — we need every row for
+        //   the exhaustive Telegram report (Parthiban directive 2026-04-21).
+        // ------------------------------------------------------------------
         let detail_query = format!(
             "SELECT h.security_id, h.segment, h.ts, \
                     h.open, h.high, h.low, h.close, h.volume, \
                     m.open, m.high, m.low, m.close, m.volume, \
                     h.open_interest, m.open_interest \
-             FROM {} h \
-             LEFT JOIN {} m ON h.security_id = m.security_id AND h.ts = m.ts AND h.segment = m.segment \
-             WHERE h.timeframe = '{}' AND {ts_filter_h} \
+             FROM {hist} h \
+             LEFT JOIN {live} m ON h.security_id = m.security_id AND h.ts = m.ts AND h.segment = m.segment \
+             WHERE h.timeframe = '{tf}' AND {ts_filter_h} AND {scope_h} \
              AND (m.open IS NULL \
                   OR abs(h.open - m.open) > {eps} \
                   OR abs(h.high - m.high) > {eps} \
                   OR abs(h.low - m.low) > {eps} \
                   OR abs(h.close - m.close) > {eps} \
                   OR abs(h.volume - m.volume) > 0 \
-                  OR abs(h.open_interest - m.open_interest) > 0) \
-             LIMIT {}",
-            QUESTDB_TABLE_HISTORICAL_CANDLES,
-            live_table,
-            hist_tf,
-            MAX_VIOLATION_DETAILS,
+                  OR abs(h.open_interest - m.open_interest) > 0)",
+            hist = QUESTDB_TABLE_HISTORICAL_CANDLES,
+            live = live_table,
+            tf = hist_tf,
             eps = CROSS_MATCH_PRICE_EPSILON,
         );
 
@@ -1472,15 +1533,53 @@ pub async fn cross_match_historical_vs_live(
             }
         }
 
-        // Track per-timeframe mismatch count for Telegram display.
-        let tf_mismatch_count = details.len();
+        // ------------------------------------------------------------------
+        // Pass-B: live LEFT JOIN historical (finds missing_historical)
+        //   Produces: missing_historical rows (live has candle, historical
+        //   doesn't). Previously declared but never populated — live runs
+        //   that out-ran Dhan's REST fetch would silently hide.
+        // ------------------------------------------------------------------
+        let missing_hist_query = format!(
+            "SELECT m.security_id, m.segment, m.ts, \
+                    m.open, m.high, m.low, m.close, m.volume \
+             FROM {live} m \
+             LEFT JOIN {hist} h ON h.security_id = m.security_id AND h.ts = m.ts AND h.segment = m.segment AND h.timeframe = '{tf}' \
+             WHERE {ts_filter_m} AND {scope_m} AND h.security_id IS NULL",
+            hist = QUESTDB_TABLE_HISTORICAL_CANDLES,
+            live = live_table,
+            tf = hist_tf,
+            ts_filter_m = today_window.where_clause_aliased("m"),
+        );
+
+        let missing_hist_details = parse_missing_historical_rows(
+            &client,
+            &base_url,
+            &missing_hist_query,
+            registry,
+            hist_tf,
+        )
+        .await;
+
+        let tf_missing_historical = missing_hist_details.len();
+        total_missing_historical = total_missing_historical.saturating_add(tf_missing_historical);
+        total_mismatches = total_mismatches.saturating_add(tf_missing_historical);
+
+        // Track per-timeframe mismatch count (Pass-A + Pass-B combined) for
+        // Telegram display.
+        let tf_mismatch_count = details.len().saturating_add(tf_missing_historical);
         per_timeframe_mismatches.push((hist_tf.to_string(), tf_mismatch_count));
 
         all_details.extend(details);
+        all_details.extend(missing_hist_details);
     }
 
-    let passed =
-        determine_cross_match_passed(total_mismatches, total_compared, missing_views.len());
+    let passed = determine_cross_match_passed(
+        total_mismatches,
+        total_missing_live,
+        total_missing_historical,
+        total_compared,
+        missing_views.len(),
+    );
 
     info!(
         timeframes_checked,
@@ -1649,6 +1748,13 @@ async fn parse_violation_rows(
 ///   h_open, h_high, h_low, h_close, h_volume,
 ///   m_open, m_high, m_low, m_close, m_volume,
 ///   h_open_interest, m_open_interest
+///
+/// NOTE: `MAX_VIOLATION_DETAILS` acts as a memory-safety ceiling, NOT a
+/// report-level truncation. The exhaustive cross-match plan (Parthiban
+/// directive 2026-04-21) requires every violation in the Telegram output;
+/// the ceiling here catches pathological query responses without silently
+/// dropping rows under normal load. If `details.len()` approaches the
+/// ceiling the operator sees WARN logs and should raise the constant.
 async fn parse_cross_match_rows_with_oi(
     client: &Client,
     base_url: &str,
@@ -1661,7 +1767,7 @@ async fn parse_cross_match_rows_with_oi(
         None => return Vec::new(),
     };
 
-    let mut details = Vec::with_capacity(data.dataset.len().min(MAX_VIOLATION_DETAILS));
+    let mut details = Vec::with_capacity(data.dataset.len());
 
     for row in &data.dataset {
         let Some(parsed) = parse_single_cross_match_row(row) else {
@@ -1671,16 +1777,83 @@ async fn parse_cross_match_rows_with_oi(
         if let Some(mismatch) = classify_parsed_cross_match_row(&parsed, registry, timeframe) {
             details.push(mismatch);
         } else {
-            // SQL pre-filter caught it but Rust-side says it's fine (e.g., volume diff < 10%)
+            // SQL pre-filter caught it but Rust-side says it's fine
             continue;
-        }
-
-        if details.len() >= MAX_VIOLATION_DETAILS {
-            break;
         }
     }
 
+    if details.len() > MAX_VIOLATION_DETAILS {
+        warn!(
+            returned = details.len(),
+            ceiling = MAX_VIOLATION_DETAILS,
+            timeframe,
+            "cross-match Pass-A returned more rows than memory ceiling — operator should raise MAX_VIOLATION_DETAILS"
+        );
+    }
+
     details
+}
+
+/// Parses Pass-B rows (live candle with no historical twin) into
+/// `CrossMatchMismatch` records tagged as `"missing_historical"`.
+///
+/// Expected columns: `security_id, segment, ts, open, high, low, close, volume`
+/// from the live materialized view. No historical columns — this row
+/// class exists precisely because the historical row is absent.
+async fn parse_missing_historical_rows(
+    client: &Client,
+    base_url: &str,
+    query: &str,
+    registry: &InstrumentRegistry,
+    timeframe: &str,
+) -> Vec<CrossMatchMismatch> {
+    let data = match execute_query(client, base_url, query).await {
+        Some(d) => d,
+        None => return Vec::new(),
+    };
+
+    let mut out = Vec::with_capacity(data.dataset.len());
+
+    for row in &data.dataset {
+        if row.len() < 8 {
+            continue;
+        }
+        let sid = row[0].as_i64().unwrap_or(0);
+        let segment = row[1].as_str().unwrap_or("").to_string();
+        let ts_value = row[2].clone();
+        let timestamp_ist = format_timestamp_ist(&ts_value);
+
+        let open = row[3].as_f64().unwrap_or(0.0);
+        let high = row[4].as_f64().unwrap_or(0.0);
+        let low = row[5].as_f64().unwrap_or(0.0);
+        let close = row[6].as_f64().unwrap_or(0.0);
+        let volume = row[7].as_i64().unwrap_or(0);
+
+        let symbol = lookup_symbol(registry, sid);
+
+        out.push(CrossMatchMismatch {
+            symbol,
+            segment,
+            timeframe: timeframe.to_string(),
+            timestamp_ist,
+            mismatch_type: "missing_historical".to_string(),
+            hist_values: "[MISSING]".to_string(),
+            live_values: format!("O={} H={} L={} C={} V={}", open, high, low, close, volume),
+            diff_summary: String::new(),
+            field_deltas: Vec::new(),
+        });
+    }
+
+    if out.len() > MAX_VIOLATION_DETAILS {
+        warn!(
+            returned = out.len(),
+            ceiling = MAX_VIOLATION_DETAILS,
+            timeframe,
+            "cross-match Pass-B returned more rows than memory ceiling — operator should raise MAX_VIOLATION_DETAILS"
+        );
+    }
+
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1761,8 +1934,15 @@ mod tests {
         let clause = w.where_clause();
         assert!(clause.starts_with("ts >= '"), "got: {clause}");
         assert!(
-            clause.contains(" AND ts <= '"),
-            "clause must be bounded both sides: {clause}"
+            clause.contains(" AND ts < '"),
+            "clause must be bounded both sides with exclusive end: {clause}"
+        );
+        // Ratchet: window end MUST be exclusive (`<`, not `<=`).
+        // Parthiban directive 2026-04-21 — 15:30:00 is not a valid candle
+        // timestamp (last intraday candle is 15:29).
+        assert!(
+            !clause.contains(" AND ts <= '"),
+            "clause must use exclusive end `<`, not inclusive `<=`: {clause}"
         );
         assert!(clause.contains("2026-04-20T09:15:00"));
         assert!(clause.contains("2026-04-20T12:00:00"));
@@ -1774,14 +1954,48 @@ mod tests {
         let w = TodayIstWindow::from_utc(now).unwrap();
         let clause = w.where_clause_aliased("h");
         assert!(clause.starts_with("h.ts >= '"), "got: {clause}");
-        assert!(clause.contains(" AND h.ts <= '"));
+        assert!(clause.contains(" AND h.ts < '"));
+        assert!(
+            !clause.contains(" AND h.ts <= '"),
+            "aliased clause must use exclusive end: {clause}"
+        );
         // Every `ts` reference must carry the `h.` alias — there should be
-        // exactly two (one for `>=`, one for `<=`) and no bare ones.
+        // exactly two (one for `>=`, one for `<`) and no bare ones.
         assert_eq!(
             clause.matches("h.ts").count(),
             2,
             "expected exactly 2 h.ts references: {clause}"
         );
+    }
+
+    #[test]
+    fn test_cross_match_scope_sql_contains_idx_i_and_nse_eq() {
+        // Parthiban directive 2026-04-21: scope = indices + stock equities only.
+        assert!(CROSS_MATCH_SCOPE_SQL.contains("NSE_EQ"));
+        assert!(CROSS_MATCH_SCOPE_SQL.contains("IDX_I"));
+        assert!(
+            !CROSS_MATCH_SCOPE_SQL.contains("NSE_FNO"),
+            "F&O must not appear in scope: {CROSS_MATCH_SCOPE_SQL}"
+        );
+    }
+
+    #[test]
+    fn test_cross_match_scope_aliased_prefixes_alias() {
+        let s = cross_match_scope_aliased("h");
+        assert!(s.starts_with("h.segment IN"), "got: {s}");
+        assert!(s.contains("NSE_EQ"));
+        assert!(s.contains("IDX_I"));
+    }
+
+    #[test]
+    fn test_today_ist_window_human_label_has_window() {
+        let now = utc_at_ist(2026, 4, 21, 15, 30);
+        let w = TodayIstWindow::from_utc(now).unwrap();
+        let label = w.human_label();
+        assert!(label.contains("2026-04-21"));
+        assert!(label.contains("09:15"));
+        assert!(label.contains("15:30"));
+        assert!(label.contains("IST"));
     }
 
     #[test]
@@ -2982,27 +3196,45 @@ mod tests {
 
     #[test]
     fn test_determine_cross_match_passed_all_good() {
-        assert!(determine_cross_match_passed(0, 100, 0));
+        // (mismatches, missing_live, missing_historical, total_compared, missing_views)
+        assert!(determine_cross_match_passed(0, 0, 0, 100, 0));
     }
 
     #[test]
     fn test_determine_cross_match_passed_with_mismatches() {
-        assert!(!determine_cross_match_passed(5, 100, 0));
+        assert!(!determine_cross_match_passed(5, 0, 0, 100, 0));
     }
 
     #[test]
     fn test_determine_cross_match_passed_zero_compared() {
-        assert!(!determine_cross_match_passed(0, 0, 0));
+        assert!(!determine_cross_match_passed(0, 0, 0, 0, 0));
     }
 
     #[test]
     fn test_determine_cross_match_passed_with_missing_views() {
-        assert!(!determine_cross_match_passed(0, 100, 2));
+        assert!(!determine_cross_match_passed(0, 0, 0, 100, 2));
     }
 
     #[test]
     fn test_determine_cross_match_passed_mismatches_and_missing_views() {
-        assert!(!determine_cross_match_passed(3, 100, 1));
+        assert!(!determine_cross_match_passed(3, 0, 0, 100, 1));
+    }
+
+    #[test]
+    fn test_determine_cross_match_passed_false_when_missing_live_nonzero() {
+        // 2026-04-21 bug class: gaps in live candles must fail OK, not silent-skip.
+        assert!(!determine_cross_match_passed(1, 1, 0, 100, 0));
+    }
+
+    #[test]
+    fn test_determine_cross_match_passed_false_when_missing_historical_nonzero() {
+        // 2026-04-21 bug class: missing historical must also fail OK.
+        assert!(!determine_cross_match_passed(1, 0, 1, 100, 0));
+    }
+
+    #[test]
+    fn test_determine_cross_match_passed_false_when_both_missing_counters_nonzero() {
+        assert!(!determine_cross_match_passed(4, 2, 2, 100, 0));
     }
 
     // -----------------------------------------------------------------------
@@ -3282,12 +3514,12 @@ mod tests {
     #[test]
     fn test_determine_cross_match_passed_zero_mismatches_zero_compared() {
         // Zero compared = fails even with zero mismatches
-        assert!(!determine_cross_match_passed(0, 0, 0));
+        assert!(!determine_cross_match_passed(0, 0, 0, 0, 0));
     }
 
     #[test]
     fn test_determine_cross_match_passed_large_values() {
-        assert!(determine_cross_match_passed(0, 1_000_000, 0));
+        assert!(determine_cross_match_passed(0, 0, 0, 1_000_000, 0));
     }
 
     // -----------------------------------------------------------------------

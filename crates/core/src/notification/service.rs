@@ -308,16 +308,29 @@ impl NotificationService {
                 // straight to Claude Code for debugging.
                 let message = format!("{} {}", severity.tag(), event.to_message());
 
-                // Always: Telegram
+                // Always: Telegram. Messages > 4000 chars get split into
+                // ordered chunks per Telegram's 4096-char hard limit so
+                // the cross-match FAILED report (potentially thousands of
+                // rows) can be delivered in full — Parthiban directive
+                // 2026-04-21: no truncation, full list always visible.
                 {
                     let token = bot_token.clone();
                     let chat_id = chat_id.clone();
                     let client = http_client.clone();
                     let base_url = telegram_api_base_url.clone();
-                    let msg = message.clone();
+                    let chunks = split_message_for_telegram(&message);
 
                     tokio::spawn(async move {
-                        send_telegram_message(&client, &base_url, &token, &chat_id, &msg).await;
+                        let total = chunks.len();
+                        for (idx, chunk) in chunks.iter().enumerate() {
+                            let body = if total > 1 {
+                                format!("(Part {}/{})\n{chunk}", idx.saturating_add(1), total)
+                            } else {
+                                chunk.clone()
+                            };
+                            send_telegram_message(&client, &base_url, &token, &chat_id, &body)
+                                .await;
+                        }
                     });
                 }
 
@@ -346,6 +359,65 @@ impl NotificationService {
 // ---------------------------------------------------------------------------
 // Internal HTTP Send
 // ---------------------------------------------------------------------------
+
+/// Telegram's hard message cap is 4096 characters. We target a safe ceiling
+/// below that so the `(Part i/N)` prefix + any HTML tag pair doesn't push
+/// the chunk over.
+pub(crate) const TELEGRAM_CHUNK_LIMIT_CHARS: usize = 3800;
+
+/// Splits a potentially huge Telegram message into ordered chunks, each
+/// ≤ `TELEGRAM_CHUNK_LIMIT_CHARS` characters. Splits on newline boundaries
+/// (never mid-row). Preserves open/close `<pre>` HTML tags across chunks
+/// so the monospace formatting stays intact when Telegram re-parses each
+/// chunk independently.
+///
+/// Parthiban directive 2026-04-21: cross-match FAILED report must show
+/// every violation — no truncation. On a heavy-gap day this can produce
+/// thousands of rows; chunking delivers them all as sequential Telegram
+/// messages.
+pub(crate) fn split_message_for_telegram(full: &str) -> Vec<String> {
+    if full.chars().count() <= TELEGRAM_CHUNK_LIMIT_CHARS {
+        return vec![full.to_string()];
+    }
+
+    let mut chunks: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut inside_pre = false;
+
+    for line in full.split_inclusive('\n') {
+        let would_overflow = current.chars().count().saturating_add(line.chars().count())
+            > TELEGRAM_CHUNK_LIMIT_CHARS;
+
+        if would_overflow && !current.is_empty() {
+            // Close any open <pre> before emitting the chunk so Telegram
+            // doesn't render the rest of the message as plain text.
+            if inside_pre {
+                current.push_str("</pre>");
+            }
+            chunks.push(std::mem::take(&mut current));
+            // Re-open <pre> at the top of the next chunk for continuity.
+            if inside_pre {
+                current.push_str("<pre>");
+            }
+        }
+
+        current.push_str(line);
+
+        // Track <pre> state so split/resume keeps monospace contiguous.
+        if line.contains("<pre>") {
+            inside_pre = true;
+        }
+        if line.contains("</pre>") {
+            inside_pre = false;
+        }
+    }
+
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+
+    chunks
+}
 
 /// Posts a message to the Telegram Bot API.
 ///
@@ -496,6 +568,89 @@ mod tests {
     fn test_disabled_service_is_not_active() {
         let service = NotificationService::disabled();
         assert!(!service.is_active());
+    }
+
+    // -----------------------------------------------------------------------
+    // split_message_for_telegram — chunking for cross-match full lists
+    // Parthiban directive 2026-04-21: full report, chunked on newline
+    // boundaries, never mid-row, preserves <pre> monospace wrappers.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_split_message_for_telegram_below_threshold_returns_single() {
+        let msg = "tiny";
+        assert_eq!(split_message_for_telegram(msg).len(), 1);
+    }
+
+    #[test]
+    fn test_chunk_below_threshold_returns_single() {
+        let msg = "short message under the limit";
+        let out = split_message_for_telegram(msg);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0], msg);
+    }
+
+    #[test]
+    fn test_chunk_splits_on_newline_boundary() {
+        // Build a message with many short lines that forces multiple chunks.
+        let line = "A".repeat(100);
+        let mut body = String::new();
+        for _ in 0..80 {
+            body.push_str(&line);
+            body.push('\n');
+        }
+        let out = split_message_for_telegram(&body);
+        assert!(
+            out.len() > 1,
+            "message of ~8000 chars must split into multiple chunks"
+        );
+        // Every chunk stays below the configured ceiling.
+        for c in &out {
+            assert!(
+                c.chars().count() <= TELEGRAM_CHUNK_LIMIT_CHARS,
+                "chunk size {} > limit {TELEGRAM_CHUNK_LIMIT_CHARS}",
+                c.chars().count()
+            );
+        }
+    }
+
+    #[test]
+    fn test_chunk_preserves_line_order() {
+        // Numbered lines so we can verify the concatenation preserves order
+        // even across chunk boundaries.
+        let mut body = String::new();
+        for i in 0..500 {
+            body.push_str(&format!("row-{i:03} {}\n", "x".repeat(60)));
+        }
+        let out = split_message_for_telegram(&body);
+        let joined = out.join("");
+        // Expected order: row-000, row-001, ..., row-499 (as substrings).
+        let idx_000 = joined.find("row-000").expect("row-000 missing");
+        let idx_499 = joined.find("row-499").expect("row-499 missing");
+        assert!(idx_000 < idx_499, "order broken across chunks");
+    }
+
+    #[test]
+    fn test_chunk_preserves_pre_tag_pairs_across_boundary() {
+        // A message that opens <pre>, has many lines, and closes </pre> must
+        // re-open <pre> at every chunk boundary so Telegram's HTML parser
+        // treats every chunk as monospace.
+        let mut body = String::from("<pre>");
+        for _ in 0..60 {
+            body.push_str(&"B".repeat(100));
+            body.push('\n');
+        }
+        body.push_str("</pre>");
+        let out = split_message_for_telegram(&body);
+        assert!(out.len() >= 2);
+        // Every chunk must contain a <pre> opener. Every chunk except the
+        // last must contain a </pre> closer emitted by the splitter.
+        for (idx, c) in out.iter().enumerate() {
+            assert!(c.contains("<pre>"), "chunk {idx} missing <pre>");
+            if idx < out.len() - 1 {
+                assert!(c.contains("</pre>"), "chunk {idx} must self-close <pre>");
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
