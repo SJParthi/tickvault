@@ -212,7 +212,7 @@ fn writer_loop(
         let first = match rx.recv() {
             Ok(r) => r,
             Err(_) => {
-                let _ = current.flush();
+                drop(current.flush());
                 info!("ws-frame-spill-writer channel closed; exiting");
                 return Ok(());
             }
@@ -236,7 +236,7 @@ fn writer_loop(
         current.flush()?;
 
         if bytes_written >= WAL_SEGMENT_MAX_BYTES {
-            let _ = current.flush();
+            drop(current.flush());
             drop(current);
             current = open_new_segment(wal_dir)?;
             bytes_written = 0;
@@ -362,11 +362,11 @@ pub fn replay_all<P: AsRef<Path>>(wal_dir: P) -> anyhow::Result<Vec<ReplayedFram
 
     // Archive processed segments so we don't replay them twice.
     let archive_dir = wal_dir.join("archive");
-    let _ = std::fs::create_dir_all(&archive_dir);
+    drop(std::fs::create_dir_all(&archive_dir));
     for seg in &segments {
         if let Some(name) = seg.file_name() {
             let dst = archive_dir.join(name);
-            let _ = std::fs::rename(seg, dst);
+            drop(std::fs::rename(seg, dst));
         }
     }
 

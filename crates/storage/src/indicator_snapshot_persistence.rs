@@ -635,21 +635,27 @@ pub async fn ensure_indicator_snapshot_table(questdb_config: &QuestDbConfig) {
                     warn!("indicator_snapshots has stale schema — dropping and recreating");
                     let drop_sql =
                         format!("DROP TABLE IF EXISTS {QUESTDB_TABLE_INDICATOR_SNAPSHOTS}");
-                    let _ = client
-                        .get(&base_url)
-                        .query(&[("query", &drop_sql)])
-                        .send()
-                        .await;
-                    let _ = client
-                        .get(&base_url)
-                        .query(&[("query", INDICATOR_SNAPSHOTS_DDL)])
-                        .send()
-                        .await;
-                    let _ = client
-                        .get(&base_url)
-                        .query(&[("query", &dedup_sql)])
-                        .send()
-                        .await;
+                    drop(
+                        client
+                            .get(&base_url)
+                            .query(&[("query", &drop_sql)])
+                            .send()
+                            .await,
+                    );
+                    drop(
+                        client
+                            .get(&base_url)
+                            .query(&[("query", INDICATOR_SNAPSHOTS_DDL)])
+                            .send()
+                            .await,
+                    );
+                    drop(
+                        client
+                            .get(&base_url)
+                            .query(&[("query", &dedup_sql)])
+                            .send()
+                            .await,
+                    );
                     info!("indicator_snapshots recreated with correct schema");
                 } else {
                     warn!(
