@@ -153,17 +153,24 @@ fn test_depth_200_disconnected_includes_security_id_and_reason() {
 /// Every WebSocket type's connected/disconnected notification must carry
 /// enough context for the operator to identify the exact connection from
 /// the Telegram alert alone.
+///
+/// `WebSocketDisconnected::to_message()` displays the connection as
+/// 1-indexed (`{index + 1}/{MAX}`) to match how operators + Dhan talk
+/// about connection slots. So for `connection_index = 3` we expect
+/// `"4"` (3+1) in the formatted message, NOT `"3"`.
 #[test]
 fn test_all_4_ws_notification_events_include_identifiers() {
-    // Live Market Feed — connection_index.
+    // Live Market Feed — connection_index. Display is 1-indexed:
+    // `connection_index = 3` renders as `WebSocket 4/5 disconnected`.
     let live_disc = NotificationEvent::WebSocketDisconnected {
         connection_index: 3,
         reason: "transport error".to_string(),
     };
     let msg = live_disc.to_message();
     assert!(
-        msg.contains("3") || msg.contains("#3"),
-        "Live feed disconnect must include connection_index, got: {msg}"
+        msg.contains("4/") && msg.contains("disconnected"),
+        "Live feed disconnect must include 1-indexed connection (expected \
+         'WebSocket 4/N'), got: {msg}"
     );
 
     // Depth 20 — underlying.
@@ -220,6 +227,9 @@ fn test_questdb_reconnected_event_includes_drained_count() {
 
 // ─── WebSocket reconnection exhausted includes attempts ───
 
+/// Connection display is 1-indexed in the Telegram message (slot N+1 / MAX)
+/// because operators / Dhan refer to connection slots as `1..=5`, not
+/// `0..=4`. `connection_index = 2` → rendered as `WebSocket 3/5`.
 #[test]
 fn test_ws_reconnection_exhausted_includes_connection_and_attempts() {
     let event = NotificationEvent::WebSocketReconnectionExhausted {
@@ -229,8 +239,8 @@ fn test_ws_reconnection_exhausted_includes_connection_and_attempts() {
     let msg = event.to_message();
 
     assert!(
-        msg.contains("2") || msg.contains("#2"),
-        "Must include connection index, got: {msg}"
+        msg.contains("3/") && msg.contains("RECONNECTION EXHAUSTED"),
+        "Must include 1-indexed connection slot (expected 'WebSocket 3/N'), got: {msg}"
     );
     assert!(msg.contains("10"), "Must include attempt count, got: {msg}");
 }
