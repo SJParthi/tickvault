@@ -82,6 +82,23 @@ pub enum NotificationEvent {
     /// Dhan authentication failed at boot — system started in offline mode.
     AuthenticationFailed { reason: String },
 
+    /// Pre-market profile check FAILED — dataPlan, activeSegment, or token
+    /// expiry is not acceptable for today's trading session. Fires CRITICAL
+    /// Telegram on every failure. If the check runs during market hours
+    /// AND fails, the boot sequence HALTS (Parthiban directive 2026-04-21).
+    ///
+    /// Common causes:
+    /// - `dataPlan != "Active"` — subscription expired over weekend
+    /// - `activeSegment` lacks `"Derivative"` — F&O access revoked
+    /// - Token has < 4h until expiry — rotate before market open
+    ///
+    /// `within_market_hours = true` means HALT fired; `false` means operator
+    /// has until market open to investigate.
+    PreMarketProfileCheckFailed {
+        reason: String,
+        within_market_hours: bool,
+    },
+
     /// JWT token renewed successfully by background task.
     TokenRenewed,
 
@@ -461,6 +478,21 @@ impl NotificationEvent {
                 format!(
                     "<b>Auth FAILED</b> — offline mode\n{}",
                     redact_url_params(reason)
+                )
+            }
+            Self::PreMarketProfileCheckFailed {
+                reason,
+                within_market_hours,
+            } => {
+                let header = if *within_market_hours {
+                    "<b>CRITICAL: Pre-market profile check FAILED — BOOT HALTED</b>"
+                } else {
+                    "<b>CRITICAL: Pre-market profile check FAILED — investigate before 09:15 IST</b>"
+                };
+                format!(
+                    "{header}\n{reason}\n\
+                     Run:\n  curl -H \"access-token: $TOKEN\" https://api.dhan.co/v2/profile\n\
+                     Check: dataPlan == \"Active\", activeSegment contains \"Derivative\", tokenValidity > 4h."
                 )
             }
             Self::TokenRenewed => "<b>Token renewed</b>".to_string(),
@@ -942,6 +974,7 @@ impl NotificationEvent {
             Self::IpVerificationFailed { .. } => Severity::Critical,
             Self::BootDeadlineMissed { .. } => Severity::Critical,
             Self::AuthenticationFailed { .. } => Severity::Critical,
+            Self::PreMarketProfileCheckFailed { .. } => Severity::Critical,
             Self::TokenRenewalFailed { .. } => Severity::Critical,
             Self::InstrumentBuildFailed { .. } => Severity::High,
             Self::WebSocketDisconnected { .. } => Severity::High,
