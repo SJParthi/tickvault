@@ -164,7 +164,12 @@ async fn download_single_csv(client: &Client, name: &str, url: &str) -> Result<S
             .with_max_times(INDEX_CONSTITUENCY_RETRY_MAX_TIMES),
     )
     .notify(move |err, dur| {
-        warn!(
+        // Per-retry events are noisy (see observability-architecture.md —
+        // the caller emits a single aggregated WARN after all downloads
+        // complete, so the retry-in-progress detail belongs at DEBUG).
+        // Use `RUST_LOG=tickvault_core::index_constituency=debug` to
+        // re-enable in a triage session.
+        tracing::debug!(
             index = %name_owned,
             error = %err,
             retry_in = ?dur,

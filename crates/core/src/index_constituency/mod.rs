@@ -51,6 +51,23 @@ pub async fn download_and_build_constituency_map(
         return try_load_cache(cache_dir).await;
     }
 
+    // Aggregate partial-failure summary. Previously the retry loop in
+    // csv_downloader.rs emitted one WARN per index per retry attempt —
+    // often 14+ lines per boot when niftyindices.com was soft-blocking
+    // us (Cloudflare "attention required" pages returned as 200 + HTML).
+    // Those per-retry events are now DEBUG; this single aggregated line
+    // keeps the visible signal while collapsing the noise.
+    let missing = compute_missing_indices(INDEX_CONSTITUENCY_SLUGS, &downloaded);
+    if !missing.is_empty() {
+        warn!(
+            expected = INDEX_CONSTITUENCY_SLUGS.len(),
+            got = downloaded.len(),
+            missed = missing.len(),
+            missing = ?missing,
+            "some constituency CSV downloads failed after all retries — continuing with partial data"
+        );
+    }
+
     // Parse each CSV
     let today = chrono::Local::now().date_naive();
     let mut parsed = Vec::with_capacity(downloaded.len());
@@ -125,6 +142,34 @@ pub async fn try_load_cache(cache_dir: &str) -> Option<IndexConstituencyMap> {
             None
         }
     }
+}
+
+/// Computes the list of index names that were requested but not returned by
+/// the downloader. Extracted as a pure function so the aggregation logic in
+/// `download_and_build_constituency_map` can be unit-tested without a real
+/// HTTP client or filesystem.
+///
+/// # Arguments
+/// * `requested` — the canonical slug list (`(display_name, url_slug)` pairs).
+/// * `downloaded` — what the downloader actually returned
+///   (`(display_name, csv_body)` pairs).
+///
+/// # Returns
+/// The display names that are in `requested` but not in `downloaded`, in the
+/// original order of `requested` (stable order matters for operator triage —
+/// if two runs fail on the same indices the log lines should be identical).
+#[must_use]
+pub fn compute_missing_indices<'a>(
+    requested: &'a [(&'a str, &'a str)],
+    downloaded: &[(String, String)],
+) -> Vec<&'a str> {
+    let got: std::collections::HashSet<&str> =
+        downloaded.iter().map(|(name, _)| name.as_str()).collect();
+    requested
+        .iter()
+        .map(|(name, _slug)| *name)
+        .filter(|name| !got.contains(*name))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -566,5 +611,89 @@ mod tests {
         let result = try_load_cache(&cache_dir).await;
         assert!(result.is_none(), "binary garbage should return None");
         let _ = std::fs::remove_dir_all(&cache_dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_missing_indices — regression tests for the log-noise reduction
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_compute_missing_indices_empty_when_all_downloaded() {
+        let requested = &[("Nifty 50", "slug1"), ("Bank Nifty", "slug2")];
+        let downloaded = vec![
+            ("Nifty 50".to_string(), "csv1".to_string()),
+            ("Bank Nifty".to_string(), "csv2".to_string()),
+        ];
+        let missing = compute_missing_indices(requested, &downloaded);
+        assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn test_compute_missing_indices_lists_all_when_none_downloaded() {
+        let requested = &[("Nifty 50", "slug1"), ("Bank Nifty", "slug2")];
+        let downloaded: Vec<(String, String)> = Vec::new();
+        let missing = compute_missing_indices(requested, &downloaded);
+        assert_eq!(missing, vec!["Nifty 50", "Bank Nifty"]);
+    }
+
+    #[test]
+    fn test_compute_missing_indices_partial_failure() {
+        let requested = &[("Nifty 50", "s1"), ("Bank Nifty", "s2"), ("Nifty IT", "s3")];
+        // Only Nifty 50 succeeded.
+        let downloaded = vec![("Nifty 50".to_string(), "csv1".to_string())];
+        let missing = compute_missing_indices(requested, &downloaded);
+        assert_eq!(missing, vec!["Bank Nifty", "Nifty IT"]);
+    }
+
+    #[test]
+    fn test_compute_missing_indices_preserves_requested_order() {
+        // If two runs fail on the same indices, the log lines should be
+        // byte-for-byte identical so operator grep-for-repeats works.
+        let requested = &[
+            ("A", "s1"),
+            ("B", "s2"),
+            ("C", "s3"),
+            ("D", "s4"),
+            ("E", "s5"),
+        ];
+        let downloaded = vec![
+            ("C".to_string(), "c".to_string()),
+            ("E".to_string(), "e".to_string()),
+        ];
+        let missing = compute_missing_indices(requested, &downloaded);
+        assert_eq!(missing, vec!["A", "B", "D"], "order must match requested");
+    }
+
+    #[test]
+    fn test_compute_missing_indices_ignores_unexpected_downloads() {
+        // If the downloader somehow returns an index that was never
+        // requested (shouldn't happen, but be defensive), the summary
+        // should not panic and should not treat the extra as "missing".
+        let requested = &[("A", "s1"), ("B", "s2")];
+        let downloaded = vec![
+            ("A".to_string(), "a".to_string()),
+            ("Z".to_string(), "z".to_string()),
+        ];
+        let missing = compute_missing_indices(requested, &downloaded);
+        assert_eq!(missing, vec!["B"]);
+    }
+
+    #[test]
+    fn test_compute_missing_indices_stable_under_shuffled_downloaded() {
+        // Downloader uses concurrent requests; result order may vary.
+        // The summary must not depend on the order of `downloaded`.
+        let requested = &[("A", "s1"), ("B", "s2"), ("C", "s3")];
+        let downloaded_a = vec![
+            ("A".to_string(), "a".to_string()),
+            ("C".to_string(), "c".to_string()),
+        ];
+        let downloaded_b = vec![
+            ("C".to_string(), "c".to_string()),
+            ("A".to_string(), "a".to_string()),
+        ];
+        assert_eq!(
+            compute_missing_indices(requested, &downloaded_a),
+            compute_missing_indices(requested, &downloaded_b),
+        );
     }
 }
