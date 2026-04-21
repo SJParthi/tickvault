@@ -865,6 +865,18 @@ async fn main() -> Result<()> {
             let snapshot_handle = Some(shared_movers.clone());
             let tick_broadcast_for_processor = Some(fast_tick_broadcast_sender.clone());
 
+            // Parthiban directive (2026-04-21): no-tick-during-market-hours
+            // watchdog. The tick processor updates this atomic on every
+            // parsed tick; the watchdog fires CRITICAL + Telegram if it
+            // stays stale > NO_TICK_THRESHOLD_SECS during market hours.
+            let fast_tick_heartbeat =
+                tickvault_core::pipeline::no_tick_watchdog::new_tick_heartbeat();
+            let _no_tick_watchdog_handle =
+                tickvault_core::pipeline::no_tick_watchdog::spawn_no_tick_watchdog(
+                    std::sync::Arc::clone(&fast_tick_heartbeat),
+                    Some(std::sync::Arc::clone(&fast_notifier)),
+                );
+
             // O(1) EXEMPT: cold path — build inline Greeks computer once at startup.
             let greeks_enricher = build_inline_greeks_enricher(&config, &subscription_plan);
 
@@ -904,6 +916,7 @@ async fn main() -> Result<()> {
                     None, // option_movers — created in slow boot only
                     None, // option_movers_writer — created in slow boot only
                     fast_registry,
+                    Some(fast_tick_heartbeat),
                 )
                 .await;
             });
@@ -1874,6 +1887,15 @@ async fn main() -> Result<()> {
             .as_ref()
             .map(|p| std::sync::Arc::new(p.registry.clone()));
 
+        // Parthiban directive (2026-04-21): no-tick-during-market-hours
+        // watchdog (slow boot path). Same pattern as fast boot above.
+        let slow_tick_heartbeat = tickvault_core::pipeline::no_tick_watchdog::new_tick_heartbeat();
+        let _slow_no_tick_watchdog_handle =
+            tickvault_core::pipeline::no_tick_watchdog::spawn_no_tick_watchdog(
+                std::sync::Arc::clone(&slow_tick_heartbeat),
+                Some(std::sync::Arc::clone(&notifier)),
+            );
+
         let handle = tokio::spawn(async move {
             run_tick_processor(
                 receiver,
@@ -1889,6 +1911,7 @@ async fn main() -> Result<()> {
                 option_movers_tracker,
                 option_movers_writer,
                 slow_registry,
+                Some(slow_tick_heartbeat),
             )
             .await;
         });

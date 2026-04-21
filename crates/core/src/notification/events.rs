@@ -223,6 +223,19 @@ pub enum NotificationEvent {
     /// WS events).
     OrderUpdateReconnected { consecutive_failures: u32 },
 
+    /// CRITICAL: zero live ticks received during market hours past the
+    /// configured silence threshold. Fires edge-triggered (once on rising
+    /// edge — when ticks resume, an INFO recovery log fires but no
+    /// Telegram). This event would have caught the 2026-04-21 morning
+    /// failure where the WS was connected but Dhan stopped streaming
+    /// (likely data-plan issue).
+    NoLiveTicksDuringMarketHours {
+        /// How long the heartbeat has been stale, in seconds.
+        silent_for_secs: u64,
+        /// Threshold that triggered the alert, in seconds.
+        threshold_secs: u64,
+    },
+
     /// Graceful shutdown initiated.
     ShutdownInitiated,
 
@@ -638,6 +651,17 @@ impl NotificationEvent {
                     "<b>Order Update WS reconnected</b>\nRecovered after {consecutive_failures} consecutive failures"
                 )
             }
+            Self::NoLiveTicksDuringMarketHours {
+                silent_for_secs,
+                threshold_secs,
+            } => {
+                format!(
+                    "<b>CRITICAL: zero live ticks during market hours</b>\n\
+                     Silent for {silent_for_secs}s (threshold {threshold_secs}s).\n\
+                     WebSockets may be connected but NO data streaming. \
+                     Check Dhan dataPlan + IP allowlist + token validity."
+                )
+            }
             Self::OrderUpdateDisconnected { reason } => {
                 format!("<b>Order Update WS DISCONNECTED</b>\n{reason}")
             }
@@ -1004,6 +1028,7 @@ impl NotificationEvent {
             Self::DepthTwoHundredReconnected { .. } => Severity::Medium,
             Self::OrderUpdateDisconnected { .. } => Severity::High,
             Self::OrderUpdateReconnected { .. } => Severity::Medium,
+            Self::NoLiveTicksDuringMarketHours { .. } => Severity::Critical,
             Self::ShutdownInitiated => Severity::Medium,
             Self::CircuitBreakerClosed => Severity::Medium,
             Self::WebSocketConnected { .. } => Severity::Low,
