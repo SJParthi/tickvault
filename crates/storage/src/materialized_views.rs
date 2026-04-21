@@ -455,11 +455,13 @@ async fn ensure_greeks_columns_on_table(
 ) {
     for col in GREEKS_COLUMN_NAMES {
         let alter_sql = format!("ALTER TABLE {table_name} ADD COLUMN {col} DOUBLE");
-        let _ = client
-            .get(base_url)
-            .query(&[("query", &alter_sql)])
-            .send()
-            .await;
+        drop(
+            client
+                .get(base_url)
+                .query(&[("query", &alter_sql)])
+                .send()
+                .await,
+        );
     }
     info!(
         table = table_name,
@@ -507,11 +509,13 @@ async fn views_missing_greeks(client: &reqwest::Client, base_url: &str) -> bool 
 async fn drop_all_views(client: &reqwest::Client, base_url: &str) {
     for def in VIEW_DEFS.iter().rev() {
         let drop_sql = format!("DROP MATERIALIZED VIEW IF EXISTS {}", def.name);
-        let _ = client
-            .get(base_url)
-            .query(&[("query", &drop_sql)])
-            .send()
-            .await;
+        drop(
+            client
+                .get(base_url)
+                .query(&[("query", &drop_sql)])
+                .send()
+                .await,
+        );
         debug!(
             view = def.name,
             "dropped materialized view for Greeks migration"
@@ -549,21 +553,27 @@ async fn execute_ddl_check_stale(
                         "stale schema detected — dropping and recreating"
                     );
                     let drop_sql = format!("DROP TABLE IF EXISTS {table_name}");
-                    let _ = client
-                        .get(base_url)
-                        .query(&[("query", &drop_sql)])
-                        .send()
-                        .await;
-                    let _ = client
-                        .get(base_url)
-                        .query(&[("query", create_ddl)])
-                        .send()
-                        .await;
-                    let _ = client
-                        .get(base_url)
-                        .query(&[("query", dedup_sql)])
-                        .send()
-                        .await;
+                    drop(
+                        client
+                            .get(base_url)
+                            .query(&[("query", &drop_sql)])
+                            .send()
+                            .await,
+                    );
+                    drop(
+                        client
+                            .get(base_url)
+                            .query(&[("query", create_ddl)])
+                            .send()
+                            .await,
+                    );
+                    drop(
+                        client
+                            .get(base_url)
+                            .query(&[("query", dedup_sql)])
+                            .send()
+                            .await,
+                    );
                     info!(table_name, "table recreated with correct schema");
                     true
                 } else {

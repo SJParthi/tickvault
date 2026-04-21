@@ -402,21 +402,27 @@ async fn execute_ddl_with_recovery(
                         "stale schema detected — dropping and recreating"
                     );
                     let drop_sql = format!("DROP TABLE IF EXISTS {table_name}");
-                    let _ = client
-                        .get(base_url)
-                        .query(&[("query", &drop_sql)])
-                        .send()
-                        .await;
-                    let _ = client
-                        .get(base_url)
-                        .query(&[("query", create_ddl)])
-                        .send()
-                        .await;
-                    let _ = client
-                        .get(base_url)
-                        .query(&[("query", dedup_sql)])
-                        .send()
-                        .await;
+                    drop(
+                        client
+                            .get(base_url)
+                            .query(&[("query", &drop_sql)])
+                            .send()
+                            .await,
+                    );
+                    drop(
+                        client
+                            .get(base_url)
+                            .query(&[("query", create_ddl)])
+                            .send()
+                            .await,
+                    );
+                    drop(
+                        client
+                            .get(base_url)
+                            .query(&[("query", dedup_sql)])
+                            .send()
+                            .await,
+                    );
                     info!(table_name, "table recreated with correct schema");
                 } else {
                     warn!(

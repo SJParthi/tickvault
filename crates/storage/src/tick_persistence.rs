@@ -1034,7 +1034,7 @@ impl TickPersistenceWriter {
     /// `None` if the check fails (directory doesn't exist or df unavailable).
     fn available_disk_space_bytes_for(dir: &std::path::Path) -> Option<u64> {
         // Create spill dir if needed so df can query it.
-        let _ = std::fs::create_dir_all(dir);
+        drop(std::fs::create_dir_all(dir));
         #[cfg(target_family = "unix")]
         {
             let dir_str = dir.to_str()?;
@@ -1093,7 +1093,7 @@ pub fn f32_to_f64_clean(v: f32) -> f64 {
     let mut cursor = std::io::Cursor::new(&mut buf[..]);
     // f32 Display uses ryu internally — produces the shortest decimal
     // representation that round-trips through f32. Zero allocation.
-    let _ = write!(cursor, "{v}");
+    drop(write!(cursor, "{v}"));
     #[allow(clippy::arithmetic_side_effects)]
     // APPROVED: cursor position of a 24-byte buf always fits usize
     let n = cursor.position() as usize;
@@ -1286,21 +1286,27 @@ pub async fn ensure_tick_table_dedup_keys(questdb_config: &QuestDbConfig) {
                 if body.contains("deduplicate key column not found") {
                     warn!("ticks table has stale schema — dropping and recreating");
                     let drop_sql = format!("DROP TABLE IF EXISTS {QUESTDB_TABLE_TICKS}");
-                    let _ = client
-                        .get(&base_url)
-                        .query(&[("query", &drop_sql)])
-                        .send()
-                        .await;
-                    let _ = client
-                        .get(&base_url)
-                        .query(&[("query", TICKS_CREATE_DDL)])
-                        .send()
-                        .await;
-                    let _ = client
-                        .get(&base_url)
-                        .query(&[("query", &dedup_sql)])
-                        .send()
-                        .await;
+                    drop(
+                        client
+                            .get(&base_url)
+                            .query(&[("query", &drop_sql)])
+                            .send()
+                            .await,
+                    );
+                    drop(
+                        client
+                            .get(&base_url)
+                            .query(&[("query", TICKS_CREATE_DDL)])
+                            .send()
+                            .await,
+                    );
+                    drop(
+                        client
+                            .get(&base_url)
+                            .query(&[("query", &dedup_sql)])
+                            .send()
+                            .await,
+                    );
                     info!("ticks table recreated with correct schema");
                 } else {
                     warn!(
@@ -1324,11 +1330,13 @@ pub async fn ensure_tick_table_dedup_keys(questdb_config: &QuestDbConfig) {
             "ALTER TABLE {} ADD COLUMN {} DOUBLE",
             QUESTDB_TABLE_TICKS, col
         );
-        let _ = client
-            .get(&base_url)
-            .query(&[("query", &alter_sql)])
-            .send()
-            .await;
+        drop(
+            client
+                .get(&base_url)
+                .query(&[("query", &alter_sql)])
+                .send()
+                .await,
+        );
     }
     info!("ticks table Greeks columns ensured (idempotent ADD COLUMN)");
 
@@ -1781,7 +1789,7 @@ impl DepthPersistenceWriter {
     /// Drains the depth disk spill file to QuestDB.
     #[rustfmt::skip]
     fn drain_depth_disk_spill(&mut self) {
-        if let Some(ref mut writer) = self.spill_writer { let _ = writer.flush(); }
+        if let Some(ref mut writer) = self.spill_writer { drop(writer.flush()); }
         self.spill_writer = None;
         let spill_path = match self.spill_path.take() { Some(p) => p, None => return };
         let file = match std::fs::File::open(&spill_path) {

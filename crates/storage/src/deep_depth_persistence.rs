@@ -696,7 +696,7 @@ impl DeepDepthWriter {
                 Ok(data) => {
                     let record_count = data.len() / DEEP_DEPTH_SPILL_RECORD_SIZE;
                     if record_count == 0 {
-                        let _ = std::fs::remove_file(&path);
+                        drop(std::fs::remove_file(&path));
                         continue;
                     }
                     info!(
