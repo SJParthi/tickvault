@@ -199,19 +199,51 @@ async fn write_cache(cache_dir: &str, cache_filename: &str, csv_text: &str) {
     }
 
     let cache_path = dir.join(cache_filename);
-    if let Err(error) = fs::write(&cache_path, csv_text).await {
-        warn!(
-            path = %cache_path.display(),
-            %error,
-            "failed to write CSV cache file"
-        );
-    } else {
-        info!(
+    // Durable write (queue item I2, 2026-04-21): write → fsync file →
+    // atomic rename → fsync parent dir. Without this, a crash between
+    // `fs::write` and kernel page-cache flush leaves a zero-length CSV
+    // on disk; next boot hits I-P0-06 emergency download.
+    match write_csv_durable(&cache_path, dir, csv_text).await {
+        Ok(()) => info!(
             path = %cache_path.display(),
             bytes = csv_text.len(),
-            "instrument CSV cached successfully"
-        );
+            "instrument CSV cached successfully (durable: data + dir fsynced)"
+        ),
+        Err(error) => warn!(
+            path = %cache_path.display(),
+            %error,
+            "failed to write CSV cache file durably"
+        ),
     }
+}
+
+/// Durable-write helper (queue item I2). Writes `csv_text` to a temp file,
+/// fsyncs the file, renames over the final path (atomic within the same
+/// filesystem), then fsyncs the parent directory so the rename is durable
+/// across a crash. Matches the "write → rename → fsync(dir)" pattern used
+/// by SQLite and every other durability-sensitive writer.
+async fn write_csv_durable(
+    cache_path: &Path,
+    parent_dir: &Path,
+    csv_text: &str,
+) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let tmp_path = cache_path.with_extension("csv.tmp");
+    {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_path)
+            .await?;
+        file.write_all(csv_text.as_bytes()).await?;
+        file.sync_all().await?;
+    }
+    fs::rename(&tmp_path, cache_path).await?;
+    // Fsync the parent directory so the rename entry is persisted.
+    let dir = fs::File::open(parent_dir).await?;
+    dir.sync_all().await?;
+    Ok(())
 }
 
 /// Load instrument CSV from local cache only (no HTTP download).
