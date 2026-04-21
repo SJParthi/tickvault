@@ -54,8 +54,18 @@ paths:
     - Sends RequestCode 25 (unsub old) then 23 (sub new) on same WebSocket
     - Zero disconnect, zero reconnect, zero tick gap, O(1) latency
 
-14. **Depth connections cap at 20 retry attempts.** No infinite retry loops.
-    - After 20 consecutive failures (~10 min), gives up via `ReconnectionExhausted`
+14. **Depth connections cap at 60 retry attempts.** No infinite retry loops.
+    - After 60 consecutive failures (~30 min at 30 s max backoff), gives up
+      via `ReconnectionExhausted` and fires CRITICAL Telegram.
+    - Raised from 20 on 2026-04-21 after all 4 depth-200 connections
+      exhausted the 20-attempt budget during market hours.
+      Dhan TCP-reset the socket (`Protocol(ResetWithoutClosingHandshake)`)
+      despite the strikes being ATM — Parthiban verified against the
+      Python SDK which works on the same account with the same strikes.
+      The underlying Rust-side protocol bug is queued for investigation
+      in `.claude/queues/production-fixes-2026-04-21.md` (item I14).
+      The 20 → 60 raise is a tolerance bump only — it does NOT solve
+      the root cause.
 
 15. **Depth ATM selection uses real index LTP, not median or arbitrary.** See `depth-subscription.md`.
     - Boot: waits up to 30s for first index LTP from main WebSocket
