@@ -29,26 +29,17 @@ const REBALANCE_CHECK_INTERVAL_SECS: u64 = 60;
 
 /// O3-HF2 (2026-04-17): returns true iff the current IST wall-clock time
 /// is within the market-hours persistence window (09:00-15:30 IST).
+/// Delegates to `tickvault_common::market_hours::is_within_market_hours_ist`
+/// — canonical home of the helper since 2026-04-21.
 ///
 /// The depth rebalancer is idle-noise outside this window because the
 /// main-feed index LTPs never update post-market — every symbol would
-/// appear "stale" and spam alerts. The constants come from
-/// `tickvault_common::constants::{TICK_PERSIST_START_SECS_OF_DAY_IST,
-/// TICK_PERSIST_END_SECS_OF_DAY_IST}` so market-hours logic is
-/// DRY across the codebase.
+/// appear "stale" and spam alerts.
 ///
 /// O(1) — one `Utc::now()` + arithmetic + range check.
 #[inline]
 fn is_within_market_hours_ist() -> bool {
-    use tickvault_common::constants::{
-        IST_UTC_OFFSET_SECONDS, SECONDS_PER_DAY, TICK_PERSIST_END_SECS_OF_DAY_IST,
-        TICK_PERSIST_START_SECS_OF_DAY_IST,
-    };
-    let now_utc_secs = chrono::Utc::now().timestamp();
-    let now_ist_secs = now_utc_secs.saturating_add(i64::from(IST_UTC_OFFSET_SECONDS));
-    // Defensive cast: seconds-of-day fits in u32 for any reasonable epoch.
-    let sec_of_day = now_ist_secs.rem_euclid(i64::from(SECONDS_PER_DAY)) as u32;
-    (TICK_PERSIST_START_SECS_OF_DAY_IST..TICK_PERSIST_END_SECS_OF_DAY_IST).contains(&sec_of_day)
+    tickvault_common::market_hours::is_within_market_hours_ist()
 }
 
 /// O3 (2026-04-17): A spot price older than this is considered stale. The

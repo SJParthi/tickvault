@@ -73,7 +73,13 @@ pub enum DepthCommand {
 // Stage C's watchdog task (independent of the read loop).
 
 /// Reconnection backoff initial delay (ms).
-const DEPTH_RECONNECT_INITIAL_MS: u64 = 1000;
+///
+/// 500ms matches the main feed's `ws_config.reconnect_initial_delay_ms`
+/// default so all 4 WebSocket types (main + depth-20 + depth-200 +
+/// order-update) share a single first-retry latency. Doubles on each
+/// failure up to `DEPTH_RECONNECT_MAX_MS`. Keeps total 8-attempt
+/// retry window ≈ 60s, matching Dhan's DH-805 rate-limit guidance.
+const DEPTH_RECONNECT_INITIAL_MS: u64 = 500;
 
 /// Reconnection backoff max delay (ms).
 const DEPTH_RECONNECT_MAX_MS: u64 = 30000;
@@ -107,7 +113,7 @@ const DEPTH_CONNECT_TIMEOUT_SECS: u64 = 15;
 /// * `frame_sender` — Shared channel to tick processor.
 /// * `underlying_label` — Underlying name (e.g. "NIFTY") for metric labels.
 /// * `connected_signal` — Fires after first data frame received (not just subscription).
-#[allow(clippy::too_many_arguments)] // APPROVED: STAGE-C added wal_spill param
+#[allow(clippy::too_many_arguments)] // APPROVED: STAGE-C added wal_spill param + 2026-04-21 notifier
 // TEST-EXEMPT: Integration-level — requires live Dhan WebSocket endpoint
 pub async fn run_twenty_depth_connection(
     token_handle: TokenHandle,
@@ -118,6 +124,7 @@ pub async fn run_twenty_depth_connection(
     connected_signal: Option<tokio::sync::oneshot::Sender<()>>,
     wal_spill: Option<Arc<WsFrameSpill>>,
     mut cmd_rx: mpsc::Receiver<DepthCommand>,
+    notifier: Option<Arc<crate::notification::NotificationService>>,
 ) -> Result<(), WebSocketError> {
     if instruments.is_empty() {
         info!("20-level depth: no instruments to subscribe — skipping");
@@ -147,6 +154,10 @@ pub async fn run_twenty_depth_connection(
     let mut pending_signal = connected_signal;
 
     loop {
+        // Parthiban directive (2026-04-21): snapshot the failure count
+        // so we can detect "this attempt is a RECOVERY from prior
+        // failures" and fire the DepthTwentyReconnected Telegram event.
+        let failures_before_attempt = reconnect_counter.load(Ordering::Relaxed);
         match connect_and_run_depth(
             &token_handle,
             &client_id,
@@ -163,6 +174,18 @@ pub async fn run_twenty_depth_connection(
         {
             Ok(()) => {
                 info!("{prefix}: connection closed normally");
+                // If we reached a clean close AFTER at least one prior
+                // failure, we successfully recovered (connect + run +
+                // clean server-side close). Fire the reconnect event.
+                if failures_before_attempt > 0 {
+                    if let Some(ref n) = notifier {
+                        n.notify(
+                            crate::notification::events::NotificationEvent::DepthTwentyReconnected {
+                                underlying: underlying_label.clone(), // O(1) EXEMPT: cold path, once per reconnect
+                            },
+                        );
+                    }
+                }
                 // Reset counter only on successful connection (failures accumulate for backoff)
                 reconnect_counter.store(0, Ordering::Relaxed);
             }
@@ -588,7 +611,7 @@ async fn connect_and_run_depth(
 /// Connects to `wss://full-depth-api.dhan.co/twohundreddepth` (Dhan Ticket #5519522).
 /// Only 1 instrument per connection (Dhan limitation).
 /// Infinite reconnection with exponential backoff.
-#[allow(clippy::too_many_arguments)] // APPROVED: STAGE-C added wal_spill param
+#[allow(clippy::too_many_arguments)] // APPROVED: STAGE-C added wal_spill param + 2026-04-21 notifier
 // TEST-EXEMPT: Integration-level — requires live Dhan WebSocket endpoint
 pub async fn run_two_hundred_depth_connection(
     token_handle: TokenHandle,
@@ -600,6 +623,7 @@ pub async fn run_two_hundred_depth_connection(
     connected_signal: Option<tokio::sync::oneshot::Sender<()>>,
     wal_spill: Option<Arc<WsFrameSpill>>,
     mut cmd_rx: mpsc::Receiver<DepthCommand>,
+    notifier: Option<Arc<crate::notification::NotificationService>>,
 ) -> Result<(), WebSocketError> {
     let segment_str = exchange_segment.as_str();
     let sid_str = security_id.to_string(); // O(1) EXEMPT: boot-time
@@ -633,6 +657,9 @@ pub async fn run_two_hundred_depth_connection(
     let mut pending_signal = connected_signal;
 
     loop {
+        // Parthiban directive (2026-04-21): snapshot failures before
+        // attempt so we can fire DepthTwoHundredReconnected on recovery.
+        let failures_before_attempt = reconnect_counter.load(Ordering::Relaxed);
         match connect_and_run_200_depth(
             &token_handle,
             &client_id,
@@ -649,6 +676,17 @@ pub async fn run_two_hundred_depth_connection(
         {
             Ok(()) => {
                 info!(security_id, label = %label, "{prefix}: connection closed normally");
+                // Recovery from prior failure streak — fire Telegram.
+                if failures_before_attempt > 0 {
+                    if let Some(ref n) = notifier {
+                        n.notify(
+                            crate::notification::events::NotificationEvent::DepthTwoHundredReconnected {
+                                contract: label.clone(), // O(1) EXEMPT: cold path, once per reconnect
+                                security_id,
+                            },
+                        );
+                    }
+                }
                 // Reset counter only on successful connection (failures accumulate for backoff)
                 reconnect_counter.store(0, Ordering::Relaxed);
                 m_consecutive_resets.set(0.0);
@@ -1035,16 +1073,17 @@ mod tests {
 
     #[test]
     fn test_backoff_calculation() {
-        // Verify backoff caps at max
+        // Verify backoff caps at max. Initial = 500ms (2026-04-21 uniform
+        // fast-retry parity with main feed).
         let delay_0 = DEPTH_RECONNECT_INITIAL_MS
             .saturating_mul(1)
             .min(DEPTH_RECONNECT_MAX_MS);
-        assert_eq!(delay_0, 1000);
+        assert_eq!(delay_0, 500);
 
-        let delay_5 = DEPTH_RECONNECT_INITIAL_MS
-            .saturating_mul(1u64.checked_shl(5).unwrap_or(u64::MAX))
+        let delay_6 = DEPTH_RECONNECT_INITIAL_MS
+            .saturating_mul(1u64.checked_shl(6).unwrap_or(u64::MAX))
             .min(DEPTH_RECONNECT_MAX_MS);
-        assert_eq!(delay_5, 30000); // 1000 * 32 = 32000, capped at 30000
+        assert_eq!(delay_6, 30000); // 500 * 64 = 32000, capped at 30000
     }
 
     #[tokio::test]
@@ -1062,6 +1101,7 @@ mod tests {
             None,
             None,
             cmd_rx,
+            None, // no notifier in unit test
         )
         .await;
         assert!(result.is_ok());
@@ -1080,7 +1120,9 @@ mod tests {
 
     #[test]
     fn test_depth_reconnect_initial_delay() {
-        assert_eq!(DEPTH_RECONNECT_INITIAL_MS, 1000);
+        // 500ms — uniform fast first-retry parity with the main feed.
+        // 2026-04-21: lowered from 1000ms; see ws_telegram_visibility_guard.
+        assert_eq!(DEPTH_RECONNECT_INITIAL_MS, 500);
     }
 
     #[test]
@@ -1100,6 +1142,8 @@ mod tests {
 
     #[test]
     fn test_backoff_grows_exponentially_before_cap() {
+        // 2026-04-21: initial lowered from 1000ms -> 500ms for parity
+        // with main feed. Exponential curve: 500, 1000, 2000, 4000, ...
         let delay_0 = DEPTH_RECONNECT_INITIAL_MS.min(DEPTH_RECONNECT_MAX_MS);
         let delay_1 = DEPTH_RECONNECT_INITIAL_MS
             .saturating_mul(2)
@@ -1107,9 +1151,9 @@ mod tests {
         let delay_2 = DEPTH_RECONNECT_INITIAL_MS
             .saturating_mul(4)
             .min(DEPTH_RECONNECT_MAX_MS);
-        assert_eq!(delay_0, 1000);
-        assert_eq!(delay_1, 2000);
-        assert_eq!(delay_2, 4000);
+        assert_eq!(delay_0, 500);
+        assert_eq!(delay_1, 1000);
+        assert_eq!(delay_2, 2000);
     }
 
     #[test]
@@ -1248,15 +1292,16 @@ mod tests {
         // After 5 failures, counter should be 5
         assert_eq!(counter.load(Ordering::Relaxed), 5);
 
-        // Verify backoff grows: attempt 0 = 1s, attempt 4 = 16s
+        // Verify backoff grows: attempt 0 = 500ms, attempt 4 = 8s
+        // (initial = 500ms post-2026-04-21 fast-retry parity)
         let delay_0 = DEPTH_RECONNECT_INITIAL_MS
             .saturating_mul(1u64.checked_shl(0).unwrap_or(u64::MAX))
             .min(DEPTH_RECONNECT_MAX_MS);
         let delay_4 = DEPTH_RECONNECT_INITIAL_MS
             .saturating_mul(1u64.checked_shl(4).unwrap_or(u64::MAX))
             .min(DEPTH_RECONNECT_MAX_MS);
-        assert_eq!(delay_0, 1000, "first attempt: 1s");
-        assert_eq!(delay_4, 16000, "fifth attempt: 16s");
+        assert_eq!(delay_0, 500, "first attempt: 500ms");
+        assert_eq!(delay_4, 8000, "fifth attempt: 8s");
 
         // Only reset on success (simulated Ok path)
         counter.store(0, Ordering::Relaxed);
