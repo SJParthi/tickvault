@@ -52,17 +52,51 @@ pub fn write_binary_cache(universe: &FnoUniverse, cache_dir: &str) -> Result<()>
     payload.extend_from_slice(&[0u8; HEADER_LEN - CACHE_MAGIC.len() - 1]); // padding
     payload.extend_from_slice(&rkyv_bytes);
 
-    // Atomic write: temp file → rename (prevents readers from seeing partial data)
+    // Atomic + DURABLE write (queue item I2, 2026-04-21):
+    //
+    //   1. Write payload to temp file + `sync_all()` — forces kernel to
+    //      persist file contents to disk BEFORE the rename is visible.
+    //      Without this, the rename can land in the directory entry
+    //      while the file data is still in page cache — a crash then
+    //      leaves a zero-length (or partial) `api-scrip-master.bin` on
+    //      disk and the next boot hits I-P0-06 emergency download.
+    //   2. Rename temp → final (atomic within same filesystem).
+    //   3. Open the parent directory and `sync_all()` — forces the
+    //      directory entry update (rename) to persist. On ext4/xfs
+    //      the rename itself is atomic but not durable until the
+    //      parent-dir inode is fsynced.
+    //
+    // Matches the "write → rename → fsync(dir)" pattern used by SQLite,
+    // PostgreSQL, and every serious durability-sensitive writer.
     let temp_path = path.with_extension("tmp");
-    std::fs::write(&temp_path, &payload)
-        .with_context(|| format!("failed to write temp rkyv cache: {}", temp_path.display()))?;
+    {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&temp_path)
+            .with_context(|| format!("failed to open temp rkyv cache: {}", temp_path.display()))?;
+        file.write_all(&payload)
+            .with_context(|| format!("failed to write temp rkyv cache: {}", temp_path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("failed to fsync temp rkyv cache: {}", temp_path.display()))?;
+    }
     std::fs::rename(&temp_path, &path)
         .with_context(|| format!("failed to rename rkyv cache: {}", path.display()))?;
+    // fsync the parent directory so the rename is durable.
+    if let Some(parent) = path.parent() {
+        let dir = std::fs::File::open(parent).with_context(|| {
+            format!("failed to open parent dir for fsync: {}", parent.display())
+        })?;
+        dir.sync_all()
+            .with_context(|| format!("failed to fsync parent dir: {}", parent.display()))?;
+    }
 
     info!(
         bytes = payload.len(),
         path = %path.display(),
-        "rkyv binary cache written (atomic)"
+        "rkyv binary cache written (atomic + durable: data fsynced, rename fsynced)"
     );
     Ok(())
 }
