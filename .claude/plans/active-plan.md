@@ -1,8 +1,8 @@
 # Implementation Plan: Unified 09:12 Close Subscription for Main Feed + Depth-20 + Depth-200
 
-**Status:** DRAFT
+**Status:** APPROVED
 **Date:** 2026-04-22
-**Approved by:** pending (Parthiban)
+**Approved by:** Parthiban (2026-04-22)
 **Branch:** `claude/market-feed-depth-explanation-RynUx`
 
 ## Background
