@@ -49,6 +49,17 @@ pub const DEFAULT_TOP_SIGNATURES: usize = 10;
 /// on this — do NOT rename without updating them.
 pub const SUMMARY_FILENAME: &str = "errors.summary.md";
 
+/// Prometheus counter: total successful summary regenerations.
+/// Downstream alerts watch for rate drops as a liveness signal on the
+/// observability chain itself. Renaming breaks the Grafana panel + alert
+/// rule — guarded by `test_metric_names_are_canonical`.
+pub const METRIC_REFRESH_TOTAL: &str = "tv_errors_summary_refresh_total";
+
+/// Prometheus counter: total summary regenerations that returned `Err`.
+/// Non-zero means the writer could not read the JSONL dir or could not
+/// rename the tmp file into place. Operator action: check disk + permissions.
+pub const METRIC_REFRESH_FAILED_TOTAL: &str = "tv_errors_summary_refresh_failed_total";
+
 /// Minimal shape of a JSONL event we care about. Extra fields are ignored
 /// via `serde(default)` / the flatten escape hatch.
 #[derive(Debug, Deserialize)]
@@ -125,12 +136,18 @@ pub fn spawn(config: SummaryWriterConfig) -> JoinHandle<()> {
         loop {
             tokio::time::sleep(config.refresh_interval).await;
             match regenerate_summary(&config) {
-                Ok(groups) => debug!(signatures = groups, "errors.summary.md refreshed"),
-                Err(err) => warn!(
-                    ?err,
-                    errors_dir = %config.errors_dir.display(),
-                    "errors.summary.md refresh failed — will retry next tick"
-                ),
+                Ok(groups) => {
+                    metrics::counter!(METRIC_REFRESH_TOTAL).increment(1);
+                    debug!(signatures = groups, "errors.summary.md refreshed");
+                }
+                Err(err) => {
+                    metrics::counter!(METRIC_REFRESH_FAILED_TOTAL).increment(1);
+                    warn!(
+                        ?err,
+                        errors_dir = %config.errors_dir.display(),
+                        "errors.summary.md refresh failed — will retry next tick"
+                    );
+                }
             }
         }
     })
@@ -609,6 +626,71 @@ mod tests {
     #[test]
     fn escape_md_collapses_newlines() {
         assert_eq!(escape_md("line1\nline2"), "line1 line2");
+    }
+
+    #[test]
+    fn test_metric_names_are_canonical() {
+        // Grafana panels + Prometheus alert rules reference these exact
+        // strings. Renaming would silently break downstream monitoring.
+        assert_eq!(METRIC_REFRESH_TOTAL, "tv_errors_summary_refresh_total");
+        assert_eq!(
+            METRIC_REFRESH_FAILED_TOTAL,
+            "tv_errors_summary_refresh_failed_total"
+        );
+    }
+
+    /// Regression: production logs emit timestamps like
+    /// `2026-04-21T20:55:26.375979+05:30` (microsecond precision, IST
+    /// offset). The parser must accept this exact shape, or every event
+    /// ends up in the "no-timestamp" fallback bucket and the lookback
+    /// filter becomes a no-op.
+    #[test]
+    fn parse_rfc3339_handles_microsecond_ist_offset_from_prod_logs() {
+        let sample = "2026-04-21T20:55:26.375979+05:30";
+        let epoch = parse_rfc3339_to_epoch(sample);
+        assert!(epoch.is_some(), "prod-format timestamp {sample} must parse");
+        // Independently compute expected epoch via chrono — if both
+        // paths agree, the parser is honoring the +05:30 offset (not
+        // silently treating the value as UTC, which would shift it by
+        // 19800 seconds).
+        let expected = chrono::DateTime::parse_from_rfc3339(sample)
+            .unwrap_or_else(|e| panic!("reference parse failed: {e}"))
+            .timestamp();
+        assert_eq!(epoch.unwrap_or(0), expected);
+    }
+
+    #[test]
+    fn regenerate_summary_accepts_production_timestamp_format() {
+        // End-to-end regression: a JSONL line with the exact timestamp
+        // format the running system emits must be grouped (not filtered
+        // out for unparseable timestamp).
+        let tmp = std::env::temp_dir().join(format!("tv-summary-prodts-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap_or_else(|e| panic!("mkdir: {e}"));
+
+        // Timestamp = now, in microsecond+IST format, inside lookback.
+        let now = chrono::Utc::now().with_timezone(&chrono::FixedOffset::east_opt(19800).unwrap());
+        let ts = now.format("%Y-%m-%dT%H:%M:%S%.6f%:z").to_string();
+        let jsonl = format!(
+            r#"{{"timestamp":"{ts}","level":"ERROR","target":"tickvault_core::notification::summary_writer","code":"I-P1-11","severity":"medium","message":"prod-format regression"}}
+"#
+        );
+        fs::write(tmp.join("errors.jsonl.2099-01-01-00"), &jsonl)
+            .unwrap_or_else(|e| panic!("write jsonl: {e}"));
+
+        let cfg = SummaryWriterConfig::new(&tmp);
+        let count = regenerate_summary(&cfg).unwrap_or_else(|e| panic!("regen: {e}"));
+        assert_eq!(count, 1, "prod-format event must be grouped, not dropped");
+
+        let out = fs::read_to_string(tmp.join(SUMMARY_FILENAME))
+            .unwrap_or_else(|e| panic!("read summary: {e}"));
+        assert!(out.contains("I-P1-11"), "signature code must appear");
+        assert!(
+            out.contains("prod-format regression"),
+            "message sample must appear"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
     }
 
     #[test]
