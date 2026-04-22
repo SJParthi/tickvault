@@ -3006,13 +3006,17 @@ async fn main() -> Result<()> {
                 let snap_universe = snapshotter_universe;
                 let mut snap_rx = tick_broadcast_sender.subscribe();
                 tokio::spawn(async move {
+                    // Plan item A (2026-04-22): combined lookup merges F&O
+                    // stocks (NSE_EQ) + whitelisted indices (NIFTY + BANKNIFTY
+                    // on IDX_I). Indices feed the depth-20 + depth-200 ATM
+                    // selection at 09:12:30 per the unified dispatch plan.
                     let lookup =
-                        tickvault_core::instrument::preopen_price_buffer::build_fno_stock_lookup(
+                        tickvault_core::instrument::preopen_price_buffer::build_preopen_combined_lookup(
                             &snap_universe,
                         );
                     info!(
-                        fno_stock_count = lookup.len(),
-                        "Phase 2 pre-open snapshotter started — F&O stocks tracked"
+                        combined_lookup_count = lookup.len(),
+                        "Phase 2 pre-open snapshotter started — F&O stocks + indices tracked"
                     );
                     loop {
                         match snap_rx.recv().await {

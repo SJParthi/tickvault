@@ -551,6 +551,51 @@ mod tests {
     }
 
     #[test]
+    fn test_build_preopen_combined_lookup_includes_indices() {
+        // Use an empty universe — the combined lookup must still contain
+        // the whitelisted index entries sourced from
+        // `PREOPEN_INDEX_UNDERLYINGS`. Stock-side merge is covered by
+        // `build_fno_stock_lookup`'s own tests and integration tests.
+        use std::time::Duration;
+        use tickvault_common::instrument_types::UniverseBuildMetadata;
+        let universe = FnoUniverse {
+            underlyings: HashMap::new(),
+            derivative_contracts: HashMap::new(),
+            instrument_info: HashMap::new(),
+            option_chains: HashMap::new(),
+            expiry_calendars: HashMap::new(),
+            subscribed_indices: Vec::new(),
+            build_metadata: UniverseBuildMetadata {
+                csv_source: String::new(),
+                csv_row_count: 0,
+                parsed_row_count: 0,
+                index_count: 0,
+                equity_count: 0,
+                underlying_count: 0,
+                derivative_count: 0,
+                option_chain_count: 0,
+                build_duration: Duration::from_millis(0),
+                build_timestamp: chrono::FixedOffset::east_opt(0)
+                    .expect("zero offset")
+                    .from_utc_datetime(&Utc::now().naive_utc()),
+            },
+        };
+        let combined = build_preopen_combined_lookup(&universe);
+
+        // With an empty universe the combined lookup is exactly the
+        // index lookup (NIFTY + BANKNIFTY on IDX_I).
+        assert_eq!(combined.len(), PREOPEN_INDEX_UNDERLYINGS.len());
+        assert_eq!(
+            combined.get(&(13, ExchangeSegment::IdxI)),
+            Some(&"NIFTY".to_string())
+        );
+        assert_eq!(
+            combined.get(&(25, ExchangeSegment::IdxI)),
+            Some(&"BANKNIFTY".to_string())
+        );
+    }
+
+    #[test]
     fn test_preopen_first_and_last_minute_constants_match_spec() {
         // 09:08 IST == hour*3600 + min*60
         assert_eq!(PREOPEN_FIRST_MINUTE_SECS_IST, 9 * 3600 + 8 * 60);
