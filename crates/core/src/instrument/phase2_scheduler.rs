@@ -178,6 +178,80 @@ pub enum SkipReason {
     PostMarket,
 }
 
+/// Plan item J (2026-04-22): where a Phase 2 dispatch originated.
+///
+/// Written to `subscription_audit_log.dispatch_source` (plan item L)
+/// so the operator can answer "which code path subscribed this
+/// contract at 09:13:30 IST today". The variants are deliberately
+/// coarse — we want low-cardinality strings for QuestDB SYMBOL
+/// columns, not one variant per call site.
+///
+/// # Variants
+///
+/// - `Scheduler` — the normal 09:13 IST wake-up path. The `SleepUntil`
+///   branch of `NextTrigger` fires this. Expected source of > 99% of
+///   Phase 2 dispatches in steady state.
+///
+/// - `CrashRecovery` — app was restarted AFTER 09:13 IST but before
+///   15:30 IST. The `RunImmediate { minutes_late: N }` branch fires
+///   this. On-disk snapshot (if present) provides the 09:12 close;
+///   otherwise current LTP is used as a best-effort fallback.
+///
+/// - `ManualRestart` — operator-initiated redeploy during market
+///   hours. Distinct from `CrashRecovery` in that the app was shut
+///   down cleanly and the snapshot IS expected to exist. Reserved
+///   for future use when the shutdown handler persists a "clean"
+///   flag.
+///
+/// - `ApiTrigger` — manual re-dispatch via a future `/api/phase2/run`
+///   endpoint (not yet implemented). Reserved.
+///
+/// # Stability
+///
+/// The string form emitted by `as_str()` is written to QuestDB and
+/// used in Grafana filter expressions. Once a value is shipped, it
+/// must NEVER be renamed — only new variants may be added.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Phase2DispatchSource {
+    Scheduler,
+    CrashRecovery,
+    ManualRestart,
+    ApiTrigger,
+}
+
+impl Phase2DispatchSource {
+    /// Stable wire-format string written to QuestDB `subscription_audit_log`
+    /// and emitted as a Prometheus label. DO NOT rename — these strings
+    /// are persisted and queried by operators.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Scheduler => "scheduler",
+            Self::CrashRecovery => "crash_recovery",
+            Self::ManualRestart => "manual_restart",
+            Self::ApiTrigger => "api_trigger",
+        }
+    }
+
+    /// Derive the dispatch source from a `NextTrigger` decision. Returns
+    /// `Some(source)` for `SleepUntil` / `RunImmediate`, and `None` for
+    /// `SkipToday` since no dispatch happens in that branch.
+    #[must_use]
+    pub const fn from_next_trigger(trigger: &NextTrigger) -> Option<Self> {
+        match trigger {
+            NextTrigger::SleepUntil { .. } => Some(Self::Scheduler),
+            NextTrigger::RunImmediate { .. } => Some(Self::CrashRecovery),
+            NextTrigger::SkipToday { .. } => None,
+        }
+    }
+}
+
+impl std::fmt::Display for Phase2DispatchSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 impl SkipReason {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -886,5 +960,94 @@ mod tests {
         update_spot_price(&prices, "NIFTY", 23500.0).await;
         update_spot_price(&prices, "BANKNIFTY", 51000.0).await;
         assert!(has_required_ltps(&prices).await);
+    }
+
+    // ========================================================================
+    // Plan item J (2026-04-22) — Phase2DispatchSource enum tests
+    // ========================================================================
+
+    #[test]
+    fn test_phase2_dispatch_source_as_str_is_stable() {
+        // These strings are written to QuestDB subscription_audit_log and
+        // used in Grafana filters. DO NOT rename — persisted and queried.
+        assert_eq!(Phase2DispatchSource::Scheduler.as_str(), "scheduler");
+        assert_eq!(
+            Phase2DispatchSource::CrashRecovery.as_str(),
+            "crash_recovery"
+        );
+        assert_eq!(
+            Phase2DispatchSource::ManualRestart.as_str(),
+            "manual_restart"
+        );
+        assert_eq!(Phase2DispatchSource::ApiTrigger.as_str(), "api_trigger");
+    }
+
+    #[test]
+    fn test_phase2_dispatch_source_display_matches_as_str() {
+        assert_eq!(
+            format!("{}", Phase2DispatchSource::Scheduler),
+            Phase2DispatchSource::Scheduler.as_str()
+        );
+        assert_eq!(
+            format!("{}", Phase2DispatchSource::CrashRecovery),
+            Phase2DispatchSource::CrashRecovery.as_str()
+        );
+    }
+
+    #[test]
+    fn test_phase2_dispatch_source_as_str_are_all_unique() {
+        let variants = [
+            Phase2DispatchSource::Scheduler,
+            Phase2DispatchSource::CrashRecovery,
+            Phase2DispatchSource::ManualRestart,
+            Phase2DispatchSource::ApiTrigger,
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for v in variants {
+            assert!(
+                seen.insert(v.as_str()),
+                "duplicate as_str() mapping for {v:?}"
+            );
+        }
+        assert_eq!(seen.len(), 4, "expected 4 distinct wire strings");
+    }
+
+    #[test]
+    fn test_phase2_dispatch_source_from_sleep_until_is_scheduler() {
+        let trigger = NextTrigger::SleepUntil {
+            duration: Duration::from_secs(60),
+        };
+        assert_eq!(
+            Phase2DispatchSource::from_next_trigger(&trigger),
+            Some(Phase2DispatchSource::Scheduler)
+        );
+    }
+
+    #[test]
+    fn test_phase2_dispatch_source_from_run_immediate_is_crash_recovery() {
+        let trigger = NextTrigger::RunImmediate { minutes_late: 5 };
+        assert_eq!(
+            Phase2DispatchSource::from_next_trigger(&trigger),
+            Some(Phase2DispatchSource::CrashRecovery)
+        );
+    }
+
+    #[test]
+    fn test_phase2_dispatch_source_from_skip_today_is_none() {
+        let trigger = NextTrigger::SkipToday {
+            reason: SkipReason::NonTradingDay,
+        };
+        assert_eq!(Phase2DispatchSource::from_next_trigger(&trigger), None);
+    }
+
+    #[test]
+    fn test_phase2_dispatch_source_equality_and_clone() {
+        let a = Phase2DispatchSource::Scheduler;
+        let b = Phase2DispatchSource::Scheduler;
+        let c = Phase2DispatchSource::CrashRecovery;
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        let cloned = a;
+        assert_eq!(a, cloned);
     }
 }
