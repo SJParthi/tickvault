@@ -455,22 +455,37 @@ impl WebSocketConnection {
                         }
                         Err(err) => {
                             m_conn_active.set(0.0);
-                            // Telegram + WARN log on EVERY disconnect, inside
-                            // or outside market hours. Parthiban directive
-                            // (2026-04-21): full visibility + audit trail on
-                            // all WS events — the auto-reconnect loop below
-                            // handles recovery automatically and fast.
+                            // Parthiban override (2026-04-22): the 2026-04-21
+                            // "HIGH-on-every-disconnect" directive caused
+                            // Telegram spam at 08:32 IST (pre-market TCP
+                            // resets by Dhan's idle-cleanup). Off-hours,
+                            // auto-recoverable disconnects now route to
+                            // the LOW-severity `WebSocketDisconnectedOffHours`
+                            // variant — audit trail preserved, no alert
+                            // escalation. In-market disconnects still fire
+                            // HIGH via the original variant.
                             warn!(
                                 connection_id = self.connection_id,
                                 error = %err,
                                 "WebSocket disconnected — will reconnect"
                             );
                             if let Some(ref n) = self.notifier {
-                                n.notify(crate::notification::events::NotificationEvent::WebSocketDisconnected {
-                                    connection_index: usize::from(self.connection_id),
-                                    // O(1) EXEMPT: cold path — reconnection error, not per tick
-                                    reason: format!("{err}"),
-                                });
+                                let event =
+                                    if tickvault_common::market_hours::is_within_market_hours_ist()
+                                    {
+                                        crate::notification::events::NotificationEvent::WebSocketDisconnected {
+                                        connection_index: usize::from(self.connection_id),
+                                        // O(1) EXEMPT: cold path — reconnection error, not per tick
+                                        reason: format!("{err}"),
+                                    }
+                                    } else {
+                                        crate::notification::events::NotificationEvent::WebSocketDisconnectedOffHours {
+                                        connection_index: usize::from(self.connection_id),
+                                        // O(1) EXEMPT: cold path — off-hours reset, not per tick
+                                        reason: format!("{err}"),
+                                    }
+                                    };
+                                n.notify(event);
                             }
                         }
                     }
@@ -485,13 +500,23 @@ impl WebSocketConnection {
                         "WebSocket connection failed — will retry"
                     );
                     if let Some(ref n) = self.notifier {
-                        n.notify(
+                        // Parthiban override (2026-04-22): same off-hours
+                        // severity split as the disconnect branch above.
+                        let event = if tickvault_common::market_hours::is_within_market_hours_ist()
+                        {
                             crate::notification::events::NotificationEvent::WebSocketDisconnected {
                                 connection_index: usize::from(self.connection_id),
                                 // O(1) EXEMPT: cold path — connect-failed is not per tick
                                 reason: format!("connect failed: {err}"),
-                            },
-                        );
+                            }
+                        } else {
+                            crate::notification::events::NotificationEvent::WebSocketDisconnectedOffHours {
+                                connection_index: usize::from(self.connection_id),
+                                // O(1) EXEMPT: cold path — off-hours connect-failed
+                                reason: format!("connect failed: {err}"),
+                            }
+                        };
+                        n.notify(event);
                     }
                 }
             }

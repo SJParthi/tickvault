@@ -191,6 +191,20 @@ pub enum NotificationEvent {
         reason: String,
     },
 
+    /// WebSocket disconnected OUTSIDE market hours — Dhan-side idle reset
+    /// (e.g. TCP `ResetWithoutClosingHandshake` during pre-market before
+    /// 09:00 IST). Auto-reconnected by the retry loop; not actionable for
+    /// the operator. Kept as an INFO-level audit trail (severity Low) per
+    /// Parthiban override (2026-04-22): "as long as it's not our
+    /// implementation causing the disconnect, don't alert HIGH off-hours".
+    ///
+    /// Supersedes the 2026-04-21 directive that fired HIGH on every
+    /// disconnect regardless of market hours.
+    WebSocketDisconnectedOffHours {
+        connection_index: usize,
+        reason: String,
+    },
+
     /// WebSocket reconnected after disconnection.
     WebSocketReconnected { connection_index: usize },
 
@@ -769,6 +783,16 @@ impl NotificationEvent {
                     tickvault_common::constants::MAX_WEBSOCKET_CONNECTIONS
                 )
             }
+            Self::WebSocketDisconnectedOffHours {
+                connection_index,
+                reason,
+            } => {
+                format!(
+                    "<b>WebSocket {}/{} disconnected [off-hours, auto-reconnecting]</b>\n{reason}",
+                    connection_index.saturating_add(1),
+                    tickvault_common::constants::MAX_WEBSOCKET_CONNECTIONS
+                )
+            }
             Self::WebSocketReconnected { connection_index } => {
                 format!(
                     "<b>WebSocket {}/{} reconnected</b>",
@@ -1169,6 +1193,7 @@ impl NotificationEvent {
             Self::TokenRenewalFailed { .. } => Severity::Critical,
             Self::InstrumentBuildFailed { .. } => Severity::High,
             Self::WebSocketDisconnected { .. } => Severity::High,
+            Self::WebSocketDisconnectedOffHours { .. } => Severity::Low,
             Self::HistoricalFetchFailed { .. } => Severity::High,
             Self::CandleVerificationFailed { .. } => Severity::High,
             Self::CandleCrossMatchFailed { .. } => Severity::High,
@@ -2620,5 +2645,44 @@ mod tests {
             reason: "x".to_string(),
         };
         assert_eq!(critical_event.severity(), Severity::Critical);
+    }
+
+    #[test]
+    fn test_websocket_disconnected_offhours_is_low_severity() {
+        // Regression: 2026-04-22 pre-market Telegram spam from Dhan-side
+        // TCP resets at 08:32 IST. Off-hours disconnects MUST be Low, not
+        // High — HIGH path is reserved for in-market disconnects where
+        // missed ticks are operator-actionable.
+        let ev = NotificationEvent::WebSocketDisconnectedOffHours {
+            connection_index: 0,
+            reason: "Connection reset without closing handshake".to_string(),
+        };
+        assert_eq!(ev.severity(), Severity::Low);
+    }
+
+    #[test]
+    fn test_websocket_disconnected_in_market_still_high_severity() {
+        // In-market disconnects remain HIGH — the off-hours variant is a
+        // split, not a replacement.
+        let ev = NotificationEvent::WebSocketDisconnected {
+            connection_index: 0,
+            reason: "x".to_string(),
+        };
+        assert_eq!(ev.severity(), Severity::High);
+    }
+
+    #[test]
+    fn test_websocket_disconnected_offhours_message_mentions_auto_reconnect() {
+        // Message must tell the operator "auto-reconnecting" so they
+        // immediately know no action is needed.
+        let ev = NotificationEvent::WebSocketDisconnectedOffHours {
+            connection_index: 0,
+            reason: "Connection reset without closing handshake".to_string(),
+        };
+        let msg = ev.to_message();
+        assert!(
+            msg.contains("off-hours") && msg.contains("auto-reconnecting"),
+            "off-hours disconnect message must label itself clearly; got: {msg}"
+        );
     }
 }
