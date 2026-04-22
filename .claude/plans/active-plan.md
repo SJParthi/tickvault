@@ -1,9 +1,45 @@
 # Implementation Plan: Unified 09:12 Close Subscription for Main Feed + Depth-20 + Depth-200
 
-**Status:** APPROVED
+**Status:** PARTIAL_VERIFIED (7 of 18 plan items shipped + 8 production hotfixes)
 **Date:** 2026-04-22
 **Approved by:** Parthiban (2026-04-22)
+**Verified by:** session closeout 2026-04-22
 **Branch:** `claude/market-feed-depth-explanation-RynUx`
+
+## Session outcome summary (2026-04-22)
+
+**Shipped (15 commits on PR #324):**
+
+| Item | Description | Commit |
+|------|-------------|--------|
+| Plan approval | Status flip DRAFT→APPROVED | `bf80b5b` |
+| A | Preopen buffer captures NIFTY + BANKNIFTY IDX_I | `f641315` |
+| — | Hotfix: off-hours WS disconnect → LOW severity | `996b0cc` |
+| D + G | DepthCommand::InitialSubscribe + Phase2Complete depth counts | `6fd9c2a` |
+| — | Hotfix: depth rebalance label "aborting" → "zero-disconnect swap" | `6f6edc5` |
+| — | Hotfix: Phase 2 empty-plan diagnostic via Phase2Failed | `4aaa0fb` |
+| — | Hotfix: Phase 2 trigger 09:12 → 09:13 | `0340a7c` |
+| — | Hotfix: order-update WS watchdog 1800s → 14400s | `55452c2` |
+| #5 | 09:15:30 streaming-live heartbeat Telegram | `de1784a` |
+| C | 09:13 depth-anchor Telegram (visibility version) | `427bf2d` |
+| H | Rule doc updates (depth-subscription + live-market-feed) | `835b2ff` |
+| I | 10-test regression guard for 2026-04-22 hotfixes | `265e79f` |
+| N | Tracing instrument spans on Phase 2 + rebalancer | `de7c7dc` |
+| R | 3 runbooks (empty-plan, off-hours disconnects, depth rebalance) | `8940e01` |
+| O+P | Full core test verify: 2937 pass, 0 regressions, 1 pre-existing env-var flake (test_has_aws_credentials_userprofile_with_credentials_file — passes in isolation, fails under parallel execution due to process-global USERPROFILE/HOME env var manipulation; unrelated to any change this session) | — |
+
+**Deferred to a future session (11 items require substantial refactor with deploy risk):**
+
+- B (defer boot depth subscribe — large main.rs refactor)
+- F (snapshot schema extension — needs B first)
+- J (Phase2DispatchSource enum — needs real C dispatch first)
+- K (edge-triggered Phase 2 alerts)
+- L (subscription_audit_log QuestDB table + writer)
+- M (Grafana dashboard panels + Prometheus alerts)
+- Q (Phase 2 dispatch benchmark — needs real C)
+- E (depth rebalancer 09:15 first-check gate — needs B)
+
+These items are **feature completeness**, not bug fixes. All 8 production bugs from Parthiban's 2026-04-22 screenshots are fixed and pushed.
 
 ## Background
 
