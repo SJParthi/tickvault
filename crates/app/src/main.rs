@@ -1867,6 +1867,13 @@ async fn main() -> Result<()> {
         info!("slow-boot observability consumer started");
     }
 
+    // Plan item G1 (2026-04-22): V2 snapshot handle declared OUTSIDE the
+    // processor scope so the api server (Step 11, far below) can read it.
+    // Populated inside the processor branch when the registry is available.
+    let mut movers_v2_snapshot_handle: Option<
+        tickvault_core::pipeline::top_movers::SharedMoversSnapshotV2,
+    > = None;
+
     let processor_handle = if let Some(receiver) = pool_receiver {
         let candle_agg = Some(tickvault_core::pipeline::CandleAggregator::new());
         let live_candle_writer =
@@ -1935,6 +1942,32 @@ async fn main() -> Result<()> {
         let slow_registry = subscription_plan
             .as_ref()
             .map(|p| std::sync::Arc::new(p.registry.clone()));
+
+        // Plan item G1+G2 (2026-04-22): spawn MoversTrackerV2 pipeline alongside
+        // the legacy TopMoversTracker + OptionMoversTracker. The V2 tracker
+        // produces a single 6-bucket snapshot consumed by /api/movers and
+        // persisted to the unified top_movers QuestDB table.
+        //
+        // Safe parallel operation: both trackers read the same tick broadcast
+        // — they are independent consumers. Legacy trackers continue writing
+        // stock_movers + option_movers tables for back-compat (plan D2).
+        // Dedicated shutdown notifier for the V2 movers pipeline. Awakened
+        // by the graceful-shutdown path (below) via a cloned Arc.
+        let movers_v2_shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+        let movers_v2_handles = if let Some(registry) = slow_registry.as_ref() {
+            Some(tickvault_app::movers_v2_pipeline::spawn_movers_v2_pipeline(
+                std::sync::Arc::clone(registry),
+                tick_broadcast_sender.clone(),
+                config.questdb.clone(),
+                config.movers.clone(),
+                std::sync::Arc::clone(&movers_v2_shutdown),
+            ))
+        } else {
+            None
+        };
+        movers_v2_snapshot_handle = movers_v2_handles
+            .as_ref()
+            .map(|h| std::sync::Arc::clone(&h.snapshot_handle));
 
         // Parthiban directive (2026-04-21): no-tick-during-market-hours
         // watchdog (slow boot path). Same pattern as fast boot above.
@@ -3782,6 +3815,14 @@ async fn main() -> Result<()> {
         shared_constituency.clone(),
         health_status,
     );
+
+    // Plan item G1 (2026-04-22): swap in the V2 movers snapshot handle if the
+    // pipeline was spawned. Pre-G1 or when no registry is available the
+    // handler returns `available=false` so the endpoint is safe to call.
+    let api_state = match movers_v2_snapshot_handle.clone() {
+        Some(h) => api_state.with_movers_snapshot_v2(h),
+        None => api_state,
+    };
 
     let router = build_router(
         api_state,
