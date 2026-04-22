@@ -3190,6 +3190,68 @@ async fn main() -> Result<()> {
                 }
             }
 
+            // Plan item #5 (2026-04-22): Market-open streaming confirmation
+            // Telegram. Fires once per trading day at 09:15:30 IST with the
+            // count of active feeds. Answers Parthiban's "how do I know if
+            // connected" question without needing Grafana or curl.
+            //
+            // Audit-findings Rule 3: market-hours-aware. Trading day check +
+            // post-market skip + late-start past 09:15:30 → skip silently.
+            {
+                let heartbeat_notifier = notifier.clone();
+                let heartbeat_health = health_status.clone();
+                let heartbeat_calendar = std::sync::Arc::clone(&trading_calendar);
+                tokio::spawn(async move {
+                    use chrono::{FixedOffset, NaiveTime, TimeZone, Utc};
+                    use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
+                    let Some(ist_offset) = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS) else {
+                        return;
+                    };
+                    let now_ist = ist_offset.from_utc_datetime(&Utc::now().naive_utc());
+                    let today_ist = now_ist.date_naive();
+                    if !heartbeat_calendar.is_trading_day(today_ist) {
+                        info!("market-open heartbeat: skipping (non-trading day)");
+                        return;
+                    }
+                    let Some(target) = NaiveTime::from_hms_opt(9, 15, 30) else {
+                        return;
+                    };
+                    let now_time = now_ist.time();
+                    if now_time >= target {
+                        info!(
+                            now = %now_time,
+                            "market-open heartbeat: skipping (past 09:15:30 — late start)"
+                        );
+                        return;
+                    }
+                    let secs_until = (target - now_time).num_seconds().max(0) as u64;
+                    info!(
+                        secs_until,
+                        "market-open heartbeat: sleeping until 09:15:30 IST"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(secs_until)).await;
+
+                    let main_active = heartbeat_health.websocket_connections() as usize;
+                    let d20 = heartbeat_health.depth_20_connections() as usize;
+                    let d200 = heartbeat_health.depth_200_connections() as usize;
+                    let oms = heartbeat_health.order_update_connected();
+                    info!(
+                        main_feed = main_active,
+                        depth_20 = d20,
+                        depth_200 = d200,
+                        order_update = oms,
+                        "PROOF: market-open streaming confirmation fired @ 09:15:30 IST"
+                    );
+                    heartbeat_notifier.notify(NotificationEvent::MarketOpenStreamingConfirmation {
+                        main_feed_active: main_active,
+                        main_feed_total: tickvault_common::constants::MAX_WEBSOCKET_CONNECTIONS,
+                        depth_20_active: d20,
+                        depth_200_active: d200,
+                        order_update_active: oms,
+                    });
+                });
+            }
+
             // L1: Listen for rebalance events → Telegram alert + send swap commands (zero disconnect).
             {
                 let rebalance_notifier = notifier.clone();

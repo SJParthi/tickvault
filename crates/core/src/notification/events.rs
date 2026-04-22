@@ -142,6 +142,20 @@ pub enum NotificationEvent {
     /// giving up.
     DepthIndexLtpTimeout { waited_secs: u64 },
 
+    /// Plan item #5 (2026-04-22): once-per-day positive confirmation that
+    /// every feed is actually streaming live data at market open. Fires
+    /// at 09:15:30 IST on each trading day. Answers Parthiban's "how do I
+    /// know if connected" question directly — without this, operators only
+    /// see disconnect/reconnect EDGES, never a positive "we are healthy"
+    /// signal. Severity = Info so it never wakes anyone up.
+    MarketOpenStreamingConfirmation {
+        main_feed_active: usize,
+        main_feed_total: usize,
+        depth_20_active: usize,
+        depth_200_active: usize,
+        order_update_active: bool,
+    },
+
     /// Option C (2026-04-17): Depth setup dropped a specific underlying —
     /// the grace window expired without a valid spot price OR the option
     /// chain was missing. Complements `DepthIndexLtpTimeout` which fires
@@ -721,6 +735,22 @@ impl NotificationEvent {
                      Exiting process so the supervisor restarts us."
                 )
             }
+            Self::MarketOpenStreamingConfirmation {
+                main_feed_active,
+                main_feed_total,
+                depth_20_active,
+                depth_200_active,
+                order_update_active,
+            } => {
+                let oms = if *order_update_active { "1/1" } else { "0/1" };
+                format!(
+                    "<b>Streaming live @ 09:15:30 IST</b>\n\
+                     Main feed: {main_feed_active}/{main_feed_total}\n\
+                     Depth-20: {depth_20_active}/4\n\
+                     Depth-200: {depth_200_active}/4\n\
+                     Order updates: {oms}"
+                )
+            }
             Self::DepthIndexLtpTimeout { waited_secs } => {
                 format!(
                     "<b>Depth ATM timeout</b>\nWaited {waited_secs}s for index LTPs \
@@ -1237,6 +1267,7 @@ impl NotificationEvent {
             Self::WebSocketPoolDegraded { .. } => Severity::High,
             Self::WebSocketPoolRecovered { .. } => Severity::Medium,
             Self::WebSocketPoolHalt { .. } => Severity::High,
+            Self::MarketOpenStreamingConfirmation { .. } => Severity::Info,
             Self::DepthIndexLtpTimeout { .. } => Severity::High,
             Self::DepthUnderlyingMissing { .. } => Severity::High,
             Self::DepthSpotPriceStale { .. } => Severity::High,
@@ -2710,6 +2741,57 @@ mod tests {
         assert!(
             msg.contains("09:12:30"),
             "must reference the unified trigger time; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_market_open_streaming_confirmation_severity_is_info() {
+        // Plan #5 (2026-04-22): once-per-day positive heartbeat — must be
+        // INFO so it never wakes anyone up but still appears in Telegram.
+        let ev = NotificationEvent::MarketOpenStreamingConfirmation {
+            main_feed_active: 5,
+            main_feed_total: 5,
+            depth_20_active: 4,
+            depth_200_active: 4,
+            order_update_active: true,
+        };
+        assert_eq!(ev.severity(), Severity::Info);
+    }
+
+    #[test]
+    fn test_market_open_streaming_confirmation_message_lists_every_feed() {
+        let ev = NotificationEvent::MarketOpenStreamingConfirmation {
+            main_feed_active: 5,
+            main_feed_total: 5,
+            depth_20_active: 4,
+            depth_200_active: 4,
+            order_update_active: true,
+        };
+        let msg = ev.to_message();
+        assert!(msg.contains("Streaming live"), "got: {msg}");
+        assert!(msg.contains("Main feed: 5/5"), "got: {msg}");
+        assert!(msg.contains("Depth-20: 4/4"), "got: {msg}");
+        assert!(msg.contains("Depth-200: 4/4"), "got: {msg}");
+        assert!(msg.contains("Order updates: 1/1"), "got: {msg}");
+        assert!(
+            msg.contains("09:15:30"),
+            "must show trigger time; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_market_open_streaming_confirmation_shows_oms_disconnected() {
+        let ev = NotificationEvent::MarketOpenStreamingConfirmation {
+            main_feed_active: 5,
+            main_feed_total: 5,
+            depth_20_active: 4,
+            depth_200_active: 4,
+            order_update_active: false,
+        };
+        let msg = ev.to_message();
+        assert!(
+            msg.contains("Order updates: 0/1"),
+            "must show OMS disconnected when active=false; got: {msg}"
         );
     }
 
