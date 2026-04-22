@@ -50,9 +50,22 @@ use tickvault_common::types::FeedMode;
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Scheduled trigger: 09:12 IST (Phase 2 per live-market-feed-subscription.md).
+/// Scheduled trigger: 09:13:00 IST.
+///
+/// **Why 09:13, not 09:12** (2026-04-22 bugfix): the pre-open buffer slot 4
+/// covers 09:12:00..09:12:59. The LAST tick in that minute = the "09:12
+/// close" per Parthiban's spec. If we wake up at 09:12:00 sharp we read the
+/// buffer BEFORE any 09:12-minute tick has landed — slot 4 is always empty,
+/// backtrack walks 09:11→09:10→... and typically finds nothing (stocks
+/// don't trade during 09:08-09:12 pre-open buffer), so every stock ends up
+/// in `stocks_skipped_no_price`. This produced the live "Added 0 stock F&O"
+/// bug observed 2026-04-22 at 09:11 IST.
+///
+/// Firing at 09:13:00 guarantees the 09:12 minute bucket is fully closed
+/// before we snapshot the buffer, so `backtrack_latest()` returns the real
+/// 09:12 close for every stock that ticked during the pre-open window.
 pub const PHASE2_TRIGGER_HOUR: u32 = 9;
-pub const PHASE2_TRIGGER_MIN: u32 = 12;
+pub const PHASE2_TRIGGER_MIN: u32 = 13;
 
 /// Market-hours window in IST — Phase 2 is only meaningful between 09:12 and
 /// 15:30 on a trading day. After 15:30 there is nothing to subscribe to.
@@ -665,12 +678,13 @@ mod tests {
     }
 
     #[test]
-    fn test_next_trigger_before_912_sleeps() {
+    fn test_next_trigger_before_913_sleeps() {
+        // 2026-04-22: trigger moved 09:12 → 09:13.
         let cal = weekday_calendar();
-        let now = NaiveTime::from_hms_opt(8, 57, 0).unwrap();
+        let now = NaiveTime::from_hms_opt(8, 58, 0).unwrap();
         match next_phase2_trigger(weekday_date(), now, &cal) {
             NextTrigger::SleepUntil { duration } => {
-                // 8:57 -> 9:12 = 15 min = 900 s.
+                // 8:58 -> 9:13 = 15 min = 900 s.
                 assert_eq!(duration.as_secs(), 900);
             }
             other => panic!("expected SleepUntil, got {other:?}"),
@@ -678,12 +692,27 @@ mod tests {
     }
 
     #[test]
-    fn test_next_trigger_at_exactly_912_runs_immediate() {
+    fn test_next_trigger_at_exactly_913_runs_immediate() {
+        // 2026-04-22: trigger moved from 09:12 → 09:13 so the 09:12 close
+        // bucket is complete before we read the pre-open buffer.
         let cal = weekday_calendar();
-        let now = NaiveTime::from_hms_opt(9, 12, 0).unwrap();
+        let now = NaiveTime::from_hms_opt(9, 13, 0).unwrap();
         match next_phase2_trigger(weekday_date(), now, &cal) {
             NextTrigger::RunImmediate { minutes_late } => assert_eq!(minutes_late, 0),
             other => panic!("expected RunImmediate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_next_trigger_at_912_is_still_sleep_until_913() {
+        // 09:12:00 is BEFORE the trigger now — must sleep to 09:13:00.
+        let cal = weekday_calendar();
+        let now = NaiveTime::from_hms_opt(9, 12, 0).unwrap();
+        match next_phase2_trigger(weekday_date(), now, &cal) {
+            NextTrigger::SleepUntil { duration } => {
+                assert_eq!(duration, Duration::from_secs(60));
+            }
+            other => panic!("expected SleepUntil, got {other:?}"),
         }
     }
 
@@ -692,7 +721,7 @@ mod tests {
         let cal = weekday_calendar();
         let now = NaiveTime::from_hms_opt(10, 0, 0).unwrap();
         match next_phase2_trigger(weekday_date(), now, &cal) {
-            NextTrigger::RunImmediate { minutes_late } => assert_eq!(minutes_late, 48),
+            NextTrigger::RunImmediate { minutes_late } => assert_eq!(minutes_late, 47),
             other => panic!("expected RunImmediate, got {other:?}"),
         }
     }
@@ -702,7 +731,7 @@ mod tests {
         let cal = weekday_calendar();
         let now = NaiveTime::from_hms_opt(11, 30, 0).unwrap();
         match next_phase2_trigger(weekday_date(), now, &cal) {
-            NextTrigger::RunImmediate { minutes_late } => assert_eq!(minutes_late, 138),
+            NextTrigger::RunImmediate { minutes_late } => assert_eq!(minutes_late, 137),
             other => panic!("expected RunImmediate, got {other:?}"),
         }
     }
@@ -761,25 +790,27 @@ mod tests {
 
     #[test]
     fn test_next_trigger_at_901_sleeps_correctly() {
+        // 2026-04-22: trigger moved 09:12 → 09:13.
         let cal = weekday_calendar();
         let now = NaiveTime::from_hms_opt(9, 1, 0).unwrap();
         match next_phase2_trigger(weekday_date(), now, &cal) {
             NextTrigger::SleepUntil { duration } => {
-                // 9:01 -> 9:12 = 11 min = 660 s.
-                assert_eq!(duration.as_secs(), 660);
+                // 9:01 -> 9:13 = 12 min = 720 s.
+                assert_eq!(duration.as_secs(), 720);
             }
             other => panic!("expected SleepUntil, got {other:?}"),
         }
     }
 
     #[test]
-    fn test_next_trigger_midnight_sleeps_9h12m() {
+    fn test_next_trigger_midnight_sleeps_9h13m() {
+        // 2026-04-22: trigger moved 09:12 → 09:13.
         let cal = weekday_calendar();
         let now = NaiveTime::from_hms_opt(0, 0, 0).unwrap();
         match next_phase2_trigger(weekday_date(), now, &cal) {
             NextTrigger::SleepUntil { duration } => {
-                // 00:00 -> 09:12 = 9h 12m = 33120 s.
-                assert_eq!(duration.as_secs(), 33120);
+                // 00:00 -> 09:13 = 9h 13m = 33180 s.
+                assert_eq!(duration.as_secs(), 33180);
             }
             other => panic!("expected SleepUntil, got {other:?}"),
         }
@@ -794,10 +825,11 @@ mod tests {
     #[test]
     fn test_constants_are_sane() {
         assert_eq!(PHASE2_TRIGGER_HOUR, 9);
-        assert_eq!(PHASE2_TRIGGER_MIN, 12);
-        // Trigger must be between market open (09:15) ... wait, 09:12 is BEFORE
-        // market open. That's correct per Dhan spec — it's during pre-market
-        // when finalized LTPs become available.
+        // 2026-04-22: trigger moved from 09:12 → 09:13 so the 09:12 close
+        // minute bucket is fully captured before we read the pre-open buffer.
+        assert_eq!(PHASE2_TRIGGER_MIN, 13);
+        // Trigger must still be BEFORE market open (09:15) so we're
+        // subscribed in time for the opening auction.
         assert!(PHASE2_TRIGGER_MIN < MARKET_OPEN_MIN);
         assert!(MAX_LTP_ATTEMPTS >= 2, "need at least one retry");
         assert!(
