@@ -215,6 +215,39 @@ const SUBSCRIBED_INDICES_CREATE_DDL: &str = "\
     ) TIMESTAMP(timestamp) PARTITION BY DAY WAL\
 ";
 
+/// Plan item L (2026-04-22): durable audit log of every subscription
+/// lifecycle event (Phase 2 dispatch, depth-20 swap, depth-200 swap,
+/// boot subscribe, crash-recovery re-dispatch). This table is an
+/// append-only event log — NOT deduplicated, partitioned by day for
+/// SEBI 5-year retention.
+///
+/// Each row answers: "at time X, what changed about our WebSocket
+/// subscription set?". Used for post-mortem triage of "why did
+/// contract Y stop ticking at 09:45 IST".
+///
+/// The writer (shipped separately) emits rows from:
+/// - Phase 2 scheduler on Phase2Complete / Phase2Failed
+/// - Depth rebalancer on Swap20 / Swap200 commands
+/// - Boot sequence on initial main-feed subscribe
+const SUBSCRIPTION_AUDIT_LOG_CREATE_DDL: &str = "\
+    CREATE TABLE IF NOT EXISTS subscription_audit_log (\
+        event_kind SYMBOL,\
+        dispatch_source SYMBOL,\
+        underlying SYMBOL,\
+        exchange_segment SYMBOL,\
+        reason STRING,\
+        security_id LONG,\
+        instrument_count LONG,\
+        spot_price DOUBLE,\
+        atm_strike DOUBLE,\
+        ts TIMESTAMP\
+    ) TIMESTAMP(ts) PARTITION BY DAY WAL\
+";
+
+/// Name of the audit log table. Private to this crate until a public
+/// writer lands — the DDL is ensured at boot via `ensure_instrument_tables`.
+pub(crate) const QUESTDB_TABLE_SUBSCRIPTION_AUDIT_LOG: &str = "subscription_audit_log";
+
 /// SYMBOL value for an instrument currently present in today's universe.
 pub const INSTRUMENT_STATUS_ACTIVE: &str = "active";
 
@@ -285,6 +318,11 @@ pub async fn ensure_instrument_tables(questdb_config: &QuestDbConfig) {
         (
             QUESTDB_TABLE_SUBSCRIBED_INDICES,
             SUBSCRIBED_INDICES_CREATE_DDL,
+        ),
+        // Plan item L (2026-04-22): subscription audit log.
+        (
+            QUESTDB_TABLE_SUBSCRIPTION_AUDIT_LOG,
+            SUBSCRIPTION_AUDIT_LOG_CREATE_DDL,
         ),
     ];
 
@@ -4862,6 +4900,79 @@ mod tests {
     #[test]
     fn test_subscribed_indices_ddl_has_subcategory() {
         assert!(SUBSCRIBED_INDICES_CREATE_DDL.contains("subcategory SYMBOL"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Plan item L (2026-04-22): subscription_audit_log schema ratchet.
+    // The DDL is the contract between the writer (to ship separately) and
+    // downstream consumers (Grafana post-mortem queries). Once shipped,
+    // column renames are breaking changes — these tests lock them.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_subscription_audit_log_ddl_exists() {
+        assert!(
+            SUBSCRIPTION_AUDIT_LOG_CREATE_DDL.contains("subscription_audit_log"),
+            "subscription_audit_log DDL must reference table name (plan L)"
+        );
+    }
+
+    #[test]
+    fn test_subscription_audit_log_ddl_has_required_columns() {
+        // These columns are referenced by the Plan L runbook
+        // (docs/runbooks/phase2-empty-plan.md) and the dashboard guard.
+        // Do not rename without a migration story.
+        let required_columns = [
+            "event_kind SYMBOL",
+            "dispatch_source SYMBOL",
+            "underlying SYMBOL",
+            "exchange_segment SYMBOL",
+            "reason STRING",
+            "security_id LONG",
+            "instrument_count LONG",
+            "spot_price DOUBLE",
+            "atm_strike DOUBLE",
+            "ts TIMESTAMP",
+        ];
+        for col in required_columns {
+            assert!(
+                SUBSCRIPTION_AUDIT_LOG_CREATE_DDL.contains(col),
+                "subscription_audit_log DDL missing required column `{col}`"
+            );
+        }
+    }
+
+    #[test]
+    fn test_subscription_audit_log_is_partitioned_by_day() {
+        // SEBI 5-year retention — daily partitions are the unit of archival.
+        assert!(
+            SUBSCRIPTION_AUDIT_LOG_CREATE_DDL.contains("PARTITION BY DAY"),
+            "subscription_audit_log must partition by day"
+        );
+    }
+
+    #[test]
+    fn test_subscription_audit_log_is_wal_enabled() {
+        assert!(
+            SUBSCRIPTION_AUDIT_LOG_CREATE_DDL.contains("WAL"),
+            "subscription_audit_log must be WAL for append-only durability"
+        );
+    }
+
+    #[test]
+    fn test_subscription_audit_log_designated_ts_is_ts() {
+        assert!(
+            SUBSCRIPTION_AUDIT_LOG_CREATE_DDL.contains("TIMESTAMP(ts)"),
+            "subscription_audit_log designated timestamp must be `ts`"
+        );
+    }
+
+    #[test]
+    fn test_subscription_audit_log_table_name_constant() {
+        assert_eq!(
+            QUESTDB_TABLE_SUBSCRIPTION_AUDIT_LOG, "subscription_audit_log",
+            "table name constant must match DDL"
+        );
     }
 
     // -----------------------------------------------------------------------
