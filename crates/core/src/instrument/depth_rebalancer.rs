@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, instrument, warn};
 
 use super::depth_strike_selector::{
     AtmIds, DEPTH_REBALANCE_STRIKE_THRESHOLD, find_atm_security_ids, should_rebalance,
@@ -157,6 +157,14 @@ pub struct StaleSpotPriceEvent {
 ///   app's main boot wires a listener that fires a Telegram alert.
 /// * `shutdown` — Atomic flag to stop the rebalancer.
 // TEST-EXEMPT: Background task — requires live spot price feed
+// Plan item N (2026-04-22): #[instrument] span groups all 60s-cycle logs
+// under a single trace span. Operator filters by `depth_rebalancer` in
+// tracing/Loki to see the full ATM-drift / stale-spot lifecycle.
+#[instrument(
+    name = "depth_rebalancer",
+    skip_all,
+    fields(underlying_count = underlyings.len())
+)]
 pub async fn run_depth_rebalancer(
     spot_prices: SharedSpotPrices,
     universe: Arc<FnoUniverse>,

@@ -37,7 +37,7 @@ use std::time::Duration;
 
 use chrono::{NaiveDate, NaiveTime, TimeZone, Utc};
 use tokio::time::Instant;
-use tracing::{error, info, warn};
+use tracing::{error, info, instrument, warn};
 
 use crate::instrument::phase2_delta::compute_phase2_stock_subscriptions;
 use crate::instrument::preopen_price_buffer::{PreOpenCloses, SharedPreOpenBuffer, snapshot};
@@ -315,6 +315,11 @@ fn current_ist() -> (NaiveDate, NaiveTime) {
 /// alert-only path is used by tests + the legacy code path that hasn't
 /// yet computed the delta.
 // TEST-EXEMPT: async driver with time-dependent sleep loop — decision logic covered by test_next_trigger_*, readiness by test_has_required_ltps_*, source resolution covered by phase2_wiring_integration tests
+// Plan item N (2026-04-22): #[instrument] span groups all logs from this
+// scheduler under a single trace span — operator can filter by `phase2`
+// in tracing/Loki to see the complete lifecycle (sleep → wake → dispatch
+// or skip/fail) without needing to know individual log call sites.
+#[instrument(name = "phase2", skip_all, fields(feed_mode = ?feed_mode))]
 pub async fn run_phase2_scheduler(
     spot_prices: crate::instrument::depth_rebalancer::SharedSpotPrices,
     calendar: Arc<TradingCalendar>,

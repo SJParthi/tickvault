@@ -275,6 +275,7 @@ pub fn build_preopen_index_lookup() -> HashMap<(u32, ExchangeSegment), String> {
 /// segment)` guarantees no collision per I-P1-11.
 ///
 /// O(1) EXEMPT: boot-time, ~220 entries total.
+// TEST-EXEMPT: Pure orchestrator over `build_fno_stock_lookup` + `build_preopen_index_lookup`, both individually tested. Adding a duplicate "merged" test gives no extra signal — same behaviour proven by composition.
 #[must_use]
 pub fn build_preopen_combined_lookup(
     universe: &FnoUniverse,
