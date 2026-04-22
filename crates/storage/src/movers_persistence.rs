@@ -37,6 +37,10 @@ use tickvault_common::config::QuestDbConfig;
 // ---------------------------------------------------------------------------
 
 /// QuestDB table name for stock movers (gainers, losers, most active).
+/// Plan item C (2026-04-22): unified 6-bucket movers table name.
+/// Written by the V2 movers writer once per second during market hours.
+pub const QUESTDB_TABLE_TOP_MOVERS: &str = "top_movers";
+
 pub const QUESTDB_TABLE_STOCK_MOVERS: &str = "stock_movers";
 
 /// QuestDB table name for option movers (7 categories).
@@ -113,6 +117,52 @@ const STOCK_MOVERS_CREATE_DDL: &str = "\
         ts TIMESTAMP\
     ) TIMESTAMP(ts) PARTITION BY DAY WAL\
 ";
+
+/// Plan item C (2026-04-22): DDL for the unified 6-bucket `top_movers` table.
+///
+/// Replaces `stock_movers` + `option_movers` with a single schema keyed by
+/// `(bucket, rank_category, rank, ts)`. One partition per trading day (SEBI
+/// 5-year retention via lifecycle tiers). WAL + DEDUP means repeated writes
+/// of the same rank row within the same second collapse to the latest.
+///
+/// # Bucket values (plan A1 wire strings)
+/// `indices` / `stocks` / `index_futures` / `stock_futures` /
+/// `index_options` / `stock_options`
+///
+/// # Rank category values (plan A2 wire strings)
+/// `gainers` / `losers` / `most_active` / `top_oi` / `oi_buildup` /
+/// `oi_unwind` / `top_value`
+///
+/// # Row volume
+/// At 1 Hz persistence cadence with 20 ranks per bucket per category
+/// across six buckets (3 categories × 2 price buckets + 7 × 4 derivative
+/// buckets = 134 rows/sec × 21_600 market seconds/day ≈ 2.9M rows/day).
+const TOP_MOVERS_CREATE_DDL: &str = "\
+    CREATE TABLE IF NOT EXISTS top_movers (\
+        bucket SYMBOL,\
+        rank_category SYMBOL,\
+        rank INT,\
+        security_id LONG,\
+        symbol SYMBOL,\
+        underlying SYMBOL,\
+        expiry STRING,\
+        strike DOUBLE,\
+        option_type SYMBOL,\
+        ltp DOUBLE,\
+        prev_close DOUBLE,\
+        change_pct DOUBLE,\
+        volume LONG,\
+        value DOUBLE,\
+        oi LONG,\
+        prev_oi LONG,\
+        oi_change_pct DOUBLE,\
+        ts TIMESTAMP\
+    ) TIMESTAMP(ts) PARTITION BY DAY WAL\
+";
+
+/// DEDUP key for `top_movers`. A rank position within a bucket+category at
+/// a given second is unique — re-writes within the same second overwrite.
+const DEDUP_KEY_TOP_MOVERS: &str = "bucket, rank_category, rank";
 
 /// DDL for the `option_movers` table.
 ///
@@ -871,7 +921,15 @@ pub async fn ensure_movers_tables(questdb_config: &QuestDbConfig) {
     );
     execute_ddl(&client, &base_url, &dedup_sql, "option_movers DEDUP").await;
 
-    info!("movers tables setup complete (stock_movers + option_movers)");
+    // Plan item C (2026-04-22): unified 6-bucket top_movers table.
+    execute_ddl(&client, &base_url, TOP_MOVERS_CREATE_DDL, "top_movers").await;
+    let top_dedup_sql = format!(
+        "ALTER TABLE {} DEDUP ENABLE UPSERT KEYS(ts, {})",
+        QUESTDB_TABLE_TOP_MOVERS, DEDUP_KEY_TOP_MOVERS
+    );
+    execute_ddl(&client, &base_url, &top_dedup_sql, "top_movers DEDUP").await;
+
+    info!("movers tables setup complete (stock_movers + option_movers + top_movers)");
 }
 
 /// Executes a DDL statement against QuestDB HTTP API. Best-effort.
@@ -1535,5 +1593,90 @@ mod tests {
             "BufferedOptionMover size is {size} bytes — if this grows, \
              re-tune MOVERS_RESCUE_RING_CAPACITY"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Plan item C3 (2026-04-22): top_movers DDL ratchet tests.
+    // These lock the schema shape — once the writer ships, column renames
+    // become breaking changes across the SEBI 5-year retention window.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_top_movers_ddl_exists_and_names_table() {
+        assert!(
+            TOP_MOVERS_CREATE_DDL.contains("top_movers"),
+            "top_movers DDL must reference the table name"
+        );
+    }
+
+    #[test]
+    fn test_top_movers_ddl_has_required_columns() {
+        let required_columns = [
+            "bucket SYMBOL",
+            "rank_category SYMBOL",
+            "rank INT",
+            "security_id LONG",
+            "symbol SYMBOL",
+            "underlying SYMBOL",
+            "expiry STRING",
+            "strike DOUBLE",
+            "option_type SYMBOL",
+            "ltp DOUBLE",
+            "prev_close DOUBLE",
+            "change_pct DOUBLE",
+            "volume LONG",
+            "value DOUBLE",
+            "oi LONG",
+            "prev_oi LONG",
+            "oi_change_pct DOUBLE",
+            "ts TIMESTAMP",
+        ];
+        for col in required_columns {
+            assert!(
+                TOP_MOVERS_CREATE_DDL.contains(col),
+                "top_movers DDL missing required column `{col}`"
+            );
+        }
+    }
+
+    #[test]
+    fn test_top_movers_ddl_is_partitioned_by_day() {
+        assert!(
+            TOP_MOVERS_CREATE_DDL.contains("PARTITION BY DAY"),
+            "top_movers must partition by day (SEBI 5-year retention)"
+        );
+    }
+
+    #[test]
+    fn test_top_movers_ddl_is_wal_enabled() {
+        assert!(
+            TOP_MOVERS_CREATE_DDL.contains("WAL"),
+            "top_movers must be WAL for append-only durability"
+        );
+    }
+
+    #[test]
+    fn test_top_movers_ddl_designated_ts_is_ts() {
+        assert!(
+            TOP_MOVERS_CREATE_DDL.contains("TIMESTAMP(ts)"),
+            "top_movers designated timestamp must be `ts`"
+        );
+    }
+
+    #[test]
+    fn test_top_movers_table_name_constant_matches_ddl() {
+        assert_eq!(
+            QUESTDB_TABLE_TOP_MOVERS, "top_movers",
+            "table name constant must match DDL"
+        );
+    }
+
+    #[test]
+    fn test_top_movers_dedup_key_covers_bucket_category_rank() {
+        // All three are required so different buckets / categories / ranks
+        // within the same second do NOT collide. Matches the plan C spec.
+        assert!(DEDUP_KEY_TOP_MOVERS.contains("bucket"));
+        assert!(DEDUP_KEY_TOP_MOVERS.contains("rank_category"));
+        assert!(DEDUP_KEY_TOP_MOVERS.contains("rank"));
     }
 }
