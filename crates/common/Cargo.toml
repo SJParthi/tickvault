@@ -37,9 +37,16 @@ uuid = { workspace = true }
 #   rustls-webpki 0.103.9 → 0.103.13: CRLs-not-authoritative (Moderate)
 #                                   + Name-constraints-wildcard (Low)
 #                                   + URI-name-constraints (Low)
+#   rand 0.9.2 → 0.9.4: rand::rng() unsound with custom logger (Low)
+# Note: rand 0.8.5 also remains in the lockfile (transitive via getrandom
+# v0.2 path) but the CVE applies to the 0.9.x rand::rng() API only.
+# rustls-webpki 0.101.7 also remains, pulled in by tokio-rustls 0.24.1
+# which is a deep AWS SDK transitive (aws-smithy-http-client 1.1.12).
+# Bumping the AWS SDK suite is a major change deferred to its own PR.
 aws-lc-sys = "0.40.0"
 aws-lc-rs = "1.16.3"
 rustls-webpki = "0.103.13"
+rand = "0.9.4"
 
 [dev-dependencies]
 criterion = { workspace = true }
@@ -54,4 +61,4 @@ name = "config"
 harness = false
 
 [package.metadata.cargo-machete]
-ignored = ["chrono-tz", "figment", "secrecy", "toml", "tracing", "uuid", "aws-lc-sys", "aws-lc-rs", "rustls-webpki"]
+ignored = ["chrono-tz", "figment", "secrecy", "toml", "tracing", "uuid", "aws-lc-sys", "aws-lc-rs", "rustls-webpki", "rand"]
