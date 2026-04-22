@@ -144,9 +144,22 @@ impl std::fmt::Debug for Phase2InstrumentsSource {
 /// IDs without coupling to the scheduler internals.
 ///
 /// Consumed by Phase 2 crash-recovery wiring — PROMPT C.
+///
+/// # Schema history
+///
+/// - v1 (2026-04-16): `instruments`, `reference_prices`, `trigger_date_ist`.
+/// - v2 (plan item F, 2026-04-22): added `depth_20_selections` and
+///   `depth_200_selections`. Both default to empty Vec until plan item B +
+///   real C depth dispatch are wired; when they are, a restart mid-day
+///   will replay the exact depth contracts subscribed at 09:13:30 IST
+///   rather than recomputing ATM from possibly-drifted current spot.
+///
+/// On-disk snapshots written before v2 will have these fields missing.
+/// The serde deserializer defaults them to empty (via `#[serde(default)]`
+/// on the impl-side once persisted) so old snapshots remain loadable.
 #[derive(Debug, Clone)]
 pub struct Phase2PickCompleted {
-    /// Instruments dispatched to the WebSocket pool.
+    /// Main-feed stock F&O instruments dispatched to the WebSocket pool.
     pub instruments: Vec<crate::websocket::types::InstrumentSubscription>,
     /// Reference price per stock symbol that drove the ATM pick. Sorted
     /// (BTreeMap) so the persisted snapshot is byte-stable across reruns.
@@ -154,6 +167,15 @@ pub struct Phase2PickCompleted {
     /// Trigger date (IST) — needed by PROMPT C to key the on-disk
     /// snapshot file.
     pub trigger_date_ist: NaiveDate,
+    /// Plan item F (2026-04-22) v2 schema: 20-level depth contracts
+    /// selected at 09:13:30 IST from the 09:12 index close. One batch
+    /// per major underlying (NIFTY/BANKNIFTY/FINNIFTY/MIDCPNIFTY).
+    /// Empty until plan B wires depth dispatch through this snapshot.
+    pub depth_20_selections: Vec<crate::websocket::types::InstrumentSubscription>,
+    /// Plan item F (2026-04-22) v2 schema: 200-level depth contracts
+    /// (ATM CE + ATM PE for NIFTY and BANKNIFTY only = 4 entries).
+    /// Empty until plan B wires depth dispatch through this snapshot.
+    pub depth_200_selections: Vec<crate::websocket::types::InstrumentSubscription>,
 }
 
 // ---------------------------------------------------------------------------
@@ -617,6 +639,12 @@ pub async fn run_phase2_scheduler(
                     instruments: instruments.clone(),
                     reference_prices: reference_prices.clone(),
                     trigger_date_ist: today_ist,
+                    // Plan item F (2026-04-22) v2 schema — populated by
+                    // plan item B once boot-time depth subscribe is
+                    // deferred to 09:13:30. Empty today is correct —
+                    // there is no depth dispatch in this code path yet.
+                    depth_20_selections: Vec::new(),
+                    depth_200_selections: Vec::new(),
                 };
                 if let Err(err) = tx.try_send(payload) {
                     warn!(
@@ -1049,5 +1077,56 @@ mod tests {
         assert_ne!(a, c);
         let cloned = a;
         assert_eq!(a, cloned);
+    }
+
+    // ========================================================================
+    // Plan item F (2026-04-22) — Phase2PickCompleted v2 schema ratchet
+    // ========================================================================
+
+    #[test]
+    fn test_phase2_pick_completed_v2_has_depth_20_selections_field() {
+        // Compile-time guard: removing or renaming the field breaks this
+        // assert. Plan F = durable crash-recovery needs depth contracts
+        // to be replayable on restart mid-day.
+        let payload = Phase2PickCompleted {
+            instruments: Vec::new(),
+            reference_prices: BTreeMap::new(),
+            trigger_date_ist: NaiveDate::from_ymd_opt(2026, 4, 22).expect("valid date"),
+            depth_20_selections: Vec::new(),
+            depth_200_selections: Vec::new(),
+        };
+        assert!(payload.depth_20_selections.is_empty());
+    }
+
+    #[test]
+    fn test_phase2_pick_completed_v2_has_depth_200_selections_field() {
+        let payload = Phase2PickCompleted {
+            instruments: Vec::new(),
+            reference_prices: BTreeMap::new(),
+            trigger_date_ist: NaiveDate::from_ymd_opt(2026, 4, 22).expect("valid date"),
+            depth_20_selections: Vec::new(),
+            depth_200_selections: Vec::new(),
+        };
+        assert!(payload.depth_200_selections.is_empty());
+    }
+
+    #[test]
+    fn test_phase2_pick_completed_v2_clone_preserves_depth_fields() {
+        let original = Phase2PickCompleted {
+            instruments: Vec::new(),
+            reference_prices: BTreeMap::new(),
+            trigger_date_ist: NaiveDate::from_ymd_opt(2026, 4, 22).expect("valid date"),
+            depth_20_selections: Vec::new(),
+            depth_200_selections: Vec::new(),
+        };
+        let cloned = original.clone();
+        assert_eq!(
+            cloned.depth_20_selections.len(),
+            original.depth_20_selections.len()
+        );
+        assert_eq!(
+            cloned.depth_200_selections.len(),
+            original.depth_200_selections.len()
+        );
     }
 }
