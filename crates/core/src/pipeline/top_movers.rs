@@ -700,6 +700,211 @@ impl MoversTrackerV2 {
     pub fn v2_ticks_processed(&self) -> u64 {
         self.ticks_processed
     }
+
+    /// Shared pointer to the injected registry — for callers that need to
+    /// enrich snapshot entries (e.g. the ILP writer) without re-injecting
+    /// a second handle.
+    #[must_use]
+    // TEST-EXEMPT: trivial accessor returning &Arc<InstrumentRegistry>
+    pub fn registry(&self) -> &Arc<InstrumentRegistry> {
+        &self.registry
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Plan item C2 (2026-04-22) — MoversSnapshotV2 → TopMoverRow serializer.
+// ---------------------------------------------------------------------------
+//
+// Converts a V2 snapshot into a flat `Vec<TopMoverRow>` enriched with
+// symbol / underlying / expiry / strike / option_type from the
+// `InstrumentRegistry`. The vec is ready for the `TopMoversV2Writer::append_row`
+// path.
+//
+// Called on the cold path (once per persistence cadence, typically 1 Hz).
+// Allocation is therefore EXEMPT from the hot-path rule.
+// ---------------------------------------------------------------------------
+
+/// Converts one `MoverEntryV2` into a `TopMoverRow`, looking up display
+/// metadata from the registry via segment-aware key (I-P1-11).
+///
+/// The caller provides the `bucket` and `rank_category` wire strings since
+/// those are owned by the enum layer, not the entry itself.
+fn entry_to_row(
+    entry: &MoverEntryV2,
+    bucket: &MoverBucket,
+    rank_category: &str,
+    rank: i32,
+    ts_nanos: i64,
+    registry: &InstrumentRegistry,
+) -> tickvault_storage::movers_persistence::TopMoverRow {
+    // Registry lookup: segment-aware per I-P1-11.
+    let segment = segment_from_code(entry.exchange_segment_code);
+    let subscribed = segment.and_then(|s| registry.get_with_segment(entry.security_id, s));
+
+    let symbol = subscribed
+        .map(|s| s.display_label.clone())
+        .unwrap_or_else(|| format!("id-{}", entry.security_id));
+    let underlying = subscribed
+        .filter(|_| bucket.has_open_interest())
+        .map(|s| s.underlying_symbol.clone());
+    let expiry = subscribed.and_then(|s| s.expiry_date.map(|d| d.format("%Y-%m-%d").to_string()));
+    let strike = subscribed.and_then(|s| s.strike_price);
+    let option_type = subscribed.and_then(|s| s.option_type).map(|ot| match ot {
+        tickvault_common::types::OptionType::Call => "CE".to_string(),
+        tickvault_common::types::OptionType::Put => "PE".to_string(),
+    });
+
+    tickvault_storage::movers_persistence::TopMoverRow {
+        ts_nanos,
+        bucket: bucket.as_str().to_string(),
+        rank_category: rank_category.to_string(),
+        rank,
+        security_id: entry.security_id,
+        symbol,
+        underlying,
+        expiry,
+        strike,
+        option_type,
+        ltp: tickvault_storage::tick_persistence::f32_to_f64_clean(entry.last_traded_price),
+        prev_close: tickvault_storage::tick_persistence::f32_to_f64_clean(entry.prev_close),
+        change_pct: tickvault_storage::tick_persistence::f32_to_f64_clean(entry.change_pct),
+        volume: i64::from(entry.volume),
+        value: entry.value,
+        oi: i64::from(entry.open_interest),
+        prev_oi: i64::from(entry.prev_open_interest),
+        oi_change_pct: tickvault_storage::tick_persistence::f32_to_f64_clean(entry.oi_change_pct),
+    }
+}
+
+/// Flattens a price bucket into its three category lists of rows.
+fn flatten_price_bucket(
+    bucket: &MoverBucket,
+    price: &PriceBucket,
+    ts_nanos: i64,
+    registry: &InstrumentRegistry,
+    out: &mut Vec<tickvault_storage::movers_persistence::TopMoverRow>,
+) {
+    for (idx, entry) in price.gainers.iter().enumerate() {
+        out.push(entry_to_row(
+            entry,
+            bucket,
+            "gainers",
+            (idx + 1) as i32,
+            ts_nanos,
+            registry,
+        ));
+    }
+    for (idx, entry) in price.losers.iter().enumerate() {
+        out.push(entry_to_row(
+            entry,
+            bucket,
+            "losers",
+            (idx + 1) as i32,
+            ts_nanos,
+            registry,
+        ));
+    }
+    for (idx, entry) in price.most_active.iter().enumerate() {
+        out.push(entry_to_row(
+            entry,
+            bucket,
+            "most_active",
+            (idx + 1) as i32,
+            ts_nanos,
+            registry,
+        ));
+    }
+}
+
+/// Flattens a derivative bucket into its up-to-seven category lists of rows.
+fn flatten_derivative_bucket(
+    bucket: &MoverBucket,
+    deriv: &DerivativeBucket,
+    ts_nanos: i64,
+    registry: &InstrumentRegistry,
+    out: &mut Vec<tickvault_storage::movers_persistence::TopMoverRow>,
+) {
+    let categories: [(&str, &Vec<MoverEntryV2>); 7] = [
+        ("gainers", &deriv.gainers),
+        ("losers", &deriv.losers),
+        ("most_active", &deriv.most_active),
+        ("top_oi", &deriv.top_oi),
+        ("oi_buildup", &deriv.oi_buildup),
+        ("oi_unwind", &deriv.oi_unwind),
+        ("top_value", &deriv.top_value),
+    ];
+    for (cat_name, list) in categories {
+        for (idx, entry) in list.iter().enumerate() {
+            out.push(entry_to_row(
+                entry,
+                bucket,
+                cat_name,
+                (idx + 1) as i32,
+                ts_nanos,
+                registry,
+            ));
+        }
+    }
+}
+
+/// Serializes a `MoversSnapshotV2` into the flat row shape consumed by
+/// the `top_movers` ILP writer. Cold-path. Allocates once per snapshot.
+#[must_use]
+pub fn snapshot_to_rows(
+    snapshot: &MoversSnapshotV2,
+    registry: &InstrumentRegistry,
+) -> Vec<tickvault_storage::movers_persistence::TopMoverRow> {
+    // O(1) EXEMPT: cold path — runs once per persistence cadence (default 1Hz),
+    // never inside the tick hot loop.
+    //
+    // Nanosecond timestamp from the snapshot's IST epoch-seconds field.
+    // `i64::saturating_mul` protects against overflow on pathological inputs.
+    let ts_nanos = snapshot.snapshot_at_ist_secs.saturating_mul(1_000_000_000);
+    // Upper bound on row count: (2 × 3 × 20) + (4 × 7 × 20) = 680.
+    let mut out = Vec::with_capacity(680);
+    flatten_price_bucket(
+        &MoverBucket::Indices,
+        &snapshot.indices,
+        ts_nanos,
+        registry,
+        &mut out,
+    );
+    flatten_price_bucket(
+        &MoverBucket::Stocks,
+        &snapshot.stocks,
+        ts_nanos,
+        registry,
+        &mut out,
+    );
+    flatten_derivative_bucket(
+        &MoverBucket::IndexFutures,
+        &snapshot.index_futures,
+        ts_nanos,
+        registry,
+        &mut out,
+    );
+    flatten_derivative_bucket(
+        &MoverBucket::StockFutures,
+        &snapshot.stock_futures,
+        ts_nanos,
+        registry,
+        &mut out,
+    );
+    flatten_derivative_bucket(
+        &MoverBucket::IndexOptions,
+        &snapshot.index_options,
+        ts_nanos,
+        registry,
+        &mut out,
+    );
+    flatten_derivative_bucket(
+        &MoverBucket::StockOptions,
+        &snapshot.stock_options,
+        ts_nanos,
+        registry,
+        &mut out,
+    );
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -2063,5 +2268,204 @@ mod tests {
         assert_eq!(snap.indices.tracked, 1);
         assert_eq!(snap.stocks.tracked, 1);
         assert_eq!(snap.index_options.tracked, 1);
+    }
+
+    // ========================================================================
+    // Plan item C2 (2026-04-22) — snapshot_to_rows enrichment tests
+    // ========================================================================
+
+    #[test]
+    fn test_snapshot_to_rows_empty_snapshot_emits_no_rows() {
+        use tickvault_common::instrument_registry::InstrumentRegistry;
+        let reg = InstrumentRegistry::empty();
+        let snapshot = MoversSnapshotV2::default();
+        let rows = snapshot_to_rows(&snapshot, &reg);
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn test_snapshot_to_rows_indices_populated_with_display_label_and_no_underlying() {
+        use tickvault_common::instrument_registry::{
+            InstrumentRegistry, SubscribedInstrument, SubscriptionCategory,
+        };
+        use tickvault_common::types::{ExchangeSegment, FeedMode};
+
+        let instrument = SubscribedInstrument {
+            security_id: 13,
+            exchange_segment: ExchangeSegment::IdxI,
+            category: SubscriptionCategory::MajorIndexValue,
+            display_label: "NIFTY".to_string(),
+            underlying_symbol: "NIFTY".to_string(),
+            instrument_kind: None,
+            expiry_date: None,
+            strike_price: None,
+            option_type: None,
+            feed_mode: FeedMode::Ticker,
+        };
+        let reg = InstrumentRegistry::from_instruments(vec![instrument]);
+
+        let mut snapshot = MoversSnapshotV2 {
+            snapshot_at_ist_secs: 1_800_000_000,
+            ..Default::default()
+        };
+        snapshot.indices.gainers.push(MoverEntryV2 {
+            security_id: 13,
+            exchange_segment_code: 0,
+            last_traded_price: 22_100.0,
+            prev_close: 22_000.0,
+            change_pct: 0.4545,
+            volume: 1_000_000,
+            open_interest: 0,
+            prev_open_interest: 0,
+            oi_change_pct: 0.0,
+            value: 0.0,
+        });
+        snapshot.indices.tracked = 1;
+
+        let rows = snapshot_to_rows(&snapshot, &reg);
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.bucket, "indices");
+        assert_eq!(row.rank_category, "gainers");
+        assert_eq!(row.rank, 1);
+        assert_eq!(row.security_id, 13);
+        assert_eq!(row.symbol, "NIFTY");
+        // Indices do NOT emit `underlying` / `expiry` / `strike` / `option_type`.
+        assert!(row.underlying.is_none());
+        assert!(row.expiry.is_none());
+        assert!(row.strike.is_none());
+        assert!(row.option_type.is_none());
+        assert_eq!(row.ts_nanos, 1_800_000_000 * 1_000_000_000);
+    }
+
+    #[test]
+    fn test_snapshot_to_rows_index_option_enriched_with_underlying_expiry_strike_cetype() {
+        use chrono::NaiveDate;
+        use tickvault_common::instrument_registry::{
+            InstrumentRegistry, SubscribedInstrument, SubscriptionCategory,
+        };
+        use tickvault_common::instrument_types::DhanInstrumentKind;
+        use tickvault_common::types::{ExchangeSegment, FeedMode, OptionType};
+
+        let instrument = SubscribedInstrument {
+            security_id: 49_081,
+            exchange_segment: ExchangeSegment::NseFno,
+            category: SubscriptionCategory::IndexDerivative,
+            display_label: "NIFTY 25000 CE 28-APR".to_string(),
+            underlying_symbol: "NIFTY".to_string(),
+            instrument_kind: Some(DhanInstrumentKind::OptionIndex),
+            expiry_date: NaiveDate::from_ymd_opt(2026, 4, 28),
+            strike_price: Some(25_000.0),
+            option_type: Some(OptionType::Call),
+            feed_mode: FeedMode::Full,
+        };
+        let reg = InstrumentRegistry::from_instruments(vec![instrument]);
+
+        let mut snapshot = MoversSnapshotV2 {
+            snapshot_at_ist_secs: 1_800_000_000,
+            ..Default::default()
+        };
+        snapshot.index_options.top_oi.push(MoverEntryV2 {
+            security_id: 49_081,
+            exchange_segment_code: 2,
+            last_traded_price: 162.15,
+            prev_close: 290.30,
+            change_pct: -44.14,
+            volume: 12_202_3_330,
+            open_interest: 8_017_880,
+            prev_open_interest: 4_673_565,
+            oi_change_pct: 71.56,
+            value: 19_786_775_434.5,
+        });
+        snapshot.index_options.tracked = 1;
+
+        let rows = snapshot_to_rows(&snapshot, &reg);
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.bucket, "index_options");
+        assert_eq!(row.rank_category, "top_oi");
+        assert_eq!(row.symbol, "NIFTY 25000 CE 28-APR");
+        assert_eq!(row.underlying.as_deref(), Some("NIFTY"));
+        assert_eq!(row.expiry.as_deref(), Some("2026-04-28"));
+        assert_eq!(row.strike, Some(25_000.0));
+        assert_eq!(row.option_type.as_deref(), Some("CE"));
+        assert_eq!(row.oi, 8_017_880);
+        assert_eq!(row.prev_oi, 4_673_565);
+    }
+
+    #[test]
+    fn test_snapshot_to_rows_missing_registry_entry_falls_back_to_id_label() {
+        use tickvault_common::instrument_registry::InstrumentRegistry;
+        let reg = InstrumentRegistry::empty();
+        let mut snapshot = MoversSnapshotV2 {
+            snapshot_at_ist_secs: 1_800_000_000,
+            ..Default::default()
+        };
+        snapshot.stocks.gainers.push(MoverEntryV2 {
+            security_id: 99_999,
+            exchange_segment_code: 1,
+            last_traded_price: 100.0,
+            prev_close: 95.0,
+            change_pct: 5.26,
+            volume: 10_000,
+            open_interest: 0,
+            prev_open_interest: 0,
+            oi_change_pct: 0.0,
+            value: 1_000_000.0,
+        });
+        snapshot.stocks.tracked = 1;
+        let rows = snapshot_to_rows(&snapshot, &reg);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].symbol, "id-99999");
+    }
+
+    #[test]
+    fn test_snapshot_to_rows_six_buckets_capacity_within_upper_bound() {
+        // Plan C spec: the bound is `(2 × 3 × 20) + (4 × 7 × 20) = 680`.
+        // We verify the preallocation matches by inspecting a heavily populated
+        // synthetic snapshot. The test asserts NO row is silently dropped when
+        // the caller fills every slot.
+        use tickvault_common::instrument_registry::InstrumentRegistry;
+        let reg = InstrumentRegistry::empty();
+        let base_entry = MoverEntryV2 {
+            security_id: 1,
+            exchange_segment_code: 2,
+            last_traded_price: 1.0,
+            prev_close: 1.0,
+            change_pct: 0.0,
+            volume: 1,
+            open_interest: 1,
+            prev_open_interest: 1,
+            oi_change_pct: 0.0,
+            value: 1.0,
+        };
+        let mut snapshot = MoversSnapshotV2::default();
+        for _ in 0..20 {
+            snapshot.indices.gainers.push(base_entry);
+            snapshot.indices.losers.push(base_entry);
+            snapshot.indices.most_active.push(base_entry);
+            snapshot.stocks.gainers.push(base_entry);
+            snapshot.stocks.losers.push(base_entry);
+            snapshot.stocks.most_active.push(base_entry);
+        }
+        for bucket in [
+            &mut snapshot.index_futures,
+            &mut snapshot.stock_futures,
+            &mut snapshot.index_options,
+            &mut snapshot.stock_options,
+        ] {
+            for _ in 0..20 {
+                bucket.gainers.push(base_entry);
+                bucket.losers.push(base_entry);
+                bucket.most_active.push(base_entry);
+                bucket.top_oi.push(base_entry);
+                bucket.oi_buildup.push(base_entry);
+                bucket.oi_unwind.push(base_entry);
+                bucket.top_value.push(base_entry);
+            }
+        }
+        let rows = snapshot_to_rows(&snapshot, &reg);
+        // 2 × 3 × 20 + 4 × 7 × 20 = 680
+        assert_eq!(rows.len(), 680);
     }
 }
