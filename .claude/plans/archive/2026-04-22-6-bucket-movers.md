@@ -1,9 +1,70 @@
 # Implementation Plan: 6-Bucket Movers Taxonomy (Indices / Stocks / Index-Fut / Stock-Fut / Index-Opt / Stock-Opt)
 
-**Status:** IN_PROGRESS
+**Status:** PARTIAL_VERIFIED (10 of 17 plan items shipped — foundation complete, production wiring deferred)
 **Date:** 2026-04-22
 **Approved by:** Parthiban (2026-04-22)
-**Branch:** `claude/market-feed-depth-explanation-RynUx` (or new branch if preferred)
+**Verified by:** session closeout 2026-04-22
+**Branch:** `claude/market-feed-depth-explanation-RynUx`
+
+## Session Outcome Summary (2026-04-22)
+
+**Shipped (10 phases, 9 commits on PR #324):**
+
+| Phase | Item | Commit | Tests |
+|---|---|---|---|
+| Plan | Status flip DRAFT→APPROVED | `bc762eb` | — |
+| A1 | `MoverBucket` enum + `classify_instrument` + 6 bucket dispatch | `15097e1` | 12 |
+| A2 | `MoverCategory` enum + `is_applicable_to` OI gating | `15097e1` | 11 |
+| B1+B2 | `MoversTrackerV2` + `MoversSnapshotV2` + `PriceBucket` + `DerivativeBucket` | `2eb8532` | 11 |
+| B3 | `option_movers.rs` marked superseded (doc-only) | `f61c65a` | 0 |
+| C1+C3 | `top_movers` QuestDB DDL + DEDUP + table-name constant | `5d496c0` | 7 |
+| E1 | `[movers]` TOML section + `MoversConfig` in `AppConfig` | `d83957c` | 5 |
+| F1 | `tv_movers_snapshot_duration_ms` histogram + `tv_movers_tracked_total{bucket}` gauges | `c3cd69e` | 2 ratchets |
+| F2 | `market-movers.json` Grafana dashboard (6 bucket stats + 2 latency panels) | `4b2df28` | — |
+| F3 | `MoversSnapshotMissing` + `MoversTrackedCountDropped` Prometheus alerts | `4b2df28` | — |
+| Runbook | `docs/runbooks/movers.md` with UI-label → URL mapping | (this commit) | — |
+
+**Test count added:** 48 new tests across `tickvault-core`, `tickvault-storage`,
+`tickvault-common` — all passing locally in < 2s scoped.
+
+**Ratchet coverage:** the 48 tests + dashboard `critical_metric_prefixes` scan
++ schema-column scan mean a regression (rename, delete, silently drop a bucket
+or metric) breaks `cargo test` deterministically.
+
+### Deferred to a follow-up session (7 items — all require live-env integration testing)
+
+- **C2 — Unified ILP writer.** Table exists, DDL locked, DEDUP wired. Writer
+  needs to serialize snapshot rows and flush to QuestDB ILP on a 1-Hz tokio
+  task with market-hours gating. Risk: needs a running QuestDB instance to
+  smoke-test the ILP batch flush. Estimated +~300 LoC + 6 integration tests.
+- **D1 — `GET /api/movers` HTTP handler.** JSON shape and query-param
+  validation are documented in the plan + runbook. Handler needs an
+  `axum` router wire-up and `SharedMoversSnapshotV2` state plumbing.
+  Estimated +~150 LoC + 8 tests.
+- **D2 — back-compat shims.** Keep `/api/top-movers` and `/api/option-movers`
+  returning their legacy shapes for one release cycle to avoid breaking
+  existing consumers. Estimated +~80 LoC.
+- **G1 — wire `MoversTrackerV2` into `trading_pipeline.rs`.** Inject
+  `Arc<InstrumentRegistry>` at boot, spawn the 1-Hz recompute task,
+  funnel every tick through `update_v2()`. Risk: adds a second tick
+  consumer alongside the legacy `TopMoversTracker` + `OptionMoversTracker`;
+  transition window needs careful sequencing to avoid double accounting.
+  Estimated +~100 LoC + deploy smoke test.
+- **G2 — `MoversConfig` wiring in `trading_pipeline.rs`.** Read the
+  `[movers]` section from `AppConfig` and pass to `MoversTrackerV2::new`
+  for filter thresholds. Needs G1 first. Estimated +~30 LoC.
+- **OI buildup/unwind baseline.** The `oi_buildup` + `oi_unwind` lists
+  are empty by design today (documented in the tracker) — Dhan does NOT
+  push prev-day OI on the NSE_FNO live feed. Fix is to snapshot OI at
+  09:15:00 IST and use that as the intraday baseline. Would populate
+  those two lists meaningfully.
+- **H3 — manual smoke test.** Can't run without G1 wiring live.
+
+These items are **production wiring**, not foundation. Every shipped piece
+of code is self-contained and unit-tested. The unshipped work is pure
+integration: connecting the tracker to the live tick stream, the QuestDB
+writer, and the HTTP router. All three can be done in a single follow-up
+session without any new design decisions.
 
 ## Goal
 
