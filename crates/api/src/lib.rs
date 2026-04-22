@@ -75,6 +75,10 @@ pub fn build_router(state: SharedAppState, allowed_origins: &[String], dry_run: 
             axum::routing::get(handlers::top_movers::get_top_movers),
         )
         .route(
+            "/api/movers",
+            axum::routing::get(handlers::movers_v2::get_movers_v2),
+        )
+        .route(
             "/api/instruments/diagnostic",
             axum::routing::get(handlers::instruments::instrument_diagnostic),
         )
