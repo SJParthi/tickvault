@@ -356,6 +356,17 @@ pub async fn run_phase2_scheduler(
             // sources we snapshot the pre-open buffer and run the delta
             // computation now so the chosen prices reflect the actual
             // 09:12 close (or backtracked 09:11/09:10/...).
+            //
+            // 2026-04-22 diagnostic enhancement: when the plan ends up
+            // empty we capture the skip-reason breakdown (stocks_skipped_*)
+            // + preopen buffer population so the Telegram alert tells the
+            // operator WHY "Added 0" happened instead of silently claiming
+            // success. Before this change Phase2Complete always fired with
+            // added_count=0 and the operator had no visibility.
+            let mut diag_skipped_no_price: usize = 0;
+            let mut diag_skipped_no_expiry: usize = 0;
+            let mut diag_buffer_entries: usize = 0;
+            let mut diag_sample_skipped: Vec<String> = Vec::new();
             let (instruments, reference_prices) = match source.as_ref() {
                 Some(Phase2InstrumentsSource::Static(list)) => (list.clone(), BTreeMap::new()),
                 Some(Phase2InstrumentsSource::Dynamic {
@@ -365,6 +376,7 @@ pub async fn run_phase2_scheduler(
                     strikes_each_side,
                 }) => {
                     let snap = snapshot(buffer).await;
+                    diag_buffer_entries = snap.len();
                     let compute_start = Instant::now();
                     let plan = compute_phase2_stock_subscriptions(
                         universe,
@@ -382,12 +394,59 @@ pub async fn run_phase2_scheduler(
                         .increment(plan.stocks_skipped_no_price.len() as u64);
                     metrics::counter!("tv_phase2_stocks_skipped_no_eligible_expiry_total")
                         .increment(plan.stocks_skipped_no_eligible_expiry.len() as u64);
+                    diag_skipped_no_price = plan.stocks_skipped_no_price.len();
+                    diag_skipped_no_expiry = plan.stocks_skipped_no_eligible_expiry.len();
+                    // Sample the first 5 skip victims for the diagnostic
+                    // Telegram message — enough to see "is it all stocks?"
+                    // without exploding the message size.
+                    for s in plan.stocks_skipped_no_price.iter().take(5) {
+                        diag_sample_skipped.push(format!("{s} (no-price)"));
+                    }
+                    if diag_sample_skipped.len() < 5 {
+                        for s in plan
+                            .stocks_skipped_no_eligible_expiry
+                            .iter()
+                            .take(5 - diag_sample_skipped.len())
+                        {
+                            diag_sample_skipped.push(format!("{s} (no-expiry)"));
+                        }
+                    }
                     let prices = derive_reference_prices(&plan.stocks_subscribed, &snap);
                     record_reference_price_source(&prices, &snap);
                     (plan.instruments, prices)
                 }
                 None => (Vec::new(), BTreeMap::new()),
             };
+
+            // 2026-04-22: if the plan is empty, surface the diagnostics
+            // via Phase2Failed (HIGH severity) instead of lying with
+            // Phase2Complete { added_count: 0 }. This is what the operator
+            // saw at 09:11 IST 2026-04-22 — "Added 0" with no root cause.
+            if instruments.is_empty() {
+                let reason = format!(
+                    "Empty plan at trigger. Preopen buffer entries: {diag_buffer_entries}. \
+                     Skipped no-price: {diag_skipped_no_price}. \
+                     Skipped no-expiry: {diag_skipped_no_expiry}. \
+                     Sample: [{}]. \
+                     Likely cause: pre-open snapshotter received no stock ticks during \
+                     09:08-09:12 IST window (check tv_phase2_snapshotter_ticks_buffered_total \
+                     + tv_phase2_snapshotter_ticks_filtered_total).",
+                    diag_sample_skipped.join(", ")
+                );
+                error!(
+                    attempt,
+                    buffer_entries = diag_buffer_entries,
+                    skipped_no_price = diag_skipped_no_price,
+                    skipped_no_expiry = diag_skipped_no_expiry,
+                    "Phase 2: plan is EMPTY — no instruments to subscribe"
+                );
+                metrics::counter!("tv_phase2_runs_total", "outcome" => "empty_plan").increment(1);
+                notifier.notify(NotificationEvent::Phase2Failed {
+                    reason,
+                    attempts: attempt,
+                });
+                return;
+            }
 
             let planned_count = instruments.len();
             let dispatched_count = match (pool.as_ref(), instruments.is_empty()) {
