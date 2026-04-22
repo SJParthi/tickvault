@@ -1,5 +1,18 @@
 //! Option movers tracker — 7-category ranking for F&O contracts.
 //!
+//! # DEPRECATED (plan item B3, 2026-04-22)
+//!
+//! This tracker is superseded by `MoversTrackerV2` in `top_movers.rs` which
+//! splits NSE_FNO into four independently-ranked buckets
+//! (`index_futures` / `stock_futures` / `index_options` / `stock_options`)
+//! instead of mixing all derivatives together. Phase G of the
+//! 6-bucket movers plan (`.claude/plans/active-plan.md`) migrates the
+//! production pipeline to V2; this file stays compiled for one release
+//! so downstream back-compat handlers (`/api/option-movers`) keep
+//! working until they are replaced with `/api/movers` calls.
+//!
+//! Do NOT add new features here — extend `MoversTrackerV2` instead.
+//!
 //! Tracks OI change, price change, volume, and value for option contracts.
 //! Computes periodic snapshots ranked by 7 categories matching Dhan's
 //! Options > Price Movers view.
