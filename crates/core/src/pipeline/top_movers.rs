@@ -491,6 +491,12 @@ pub struct MoversTrackerV2 {
     /// For NSE_EQ / NSE_FNO we read `tick.day_close` on every tick (per Dhan
     /// Ticket #5525125 — Quote/Full `close` field IS previous-day close).
     prev_close_prices: HashMap<(u32, u8), f32>,
+    /// OI baseline captured at 09:15 IST. Used to compute `oi_change_pct`
+    /// for the `oi_buildup` + `oi_unwind` rankings. Dhan does NOT push
+    /// prev-day OI on the NSE_FNO live feed (confirmed via Ticket
+    /// #5525125) so we use the intraday open as a best-available baseline.
+    /// Keyed `(security_id, segment_code)`.
+    baseline_oi: HashMap<(u32, u8), u32>,
     ticks_processed: u64,
 }
 
@@ -509,8 +515,37 @@ impl MoversTrackerV2 {
             securities: HashMap::with_capacity(Self::INITIAL_CAPACITY),
             registry,
             prev_close_prices: HashMap::with_capacity(Self::INITIAL_CAPACITY),
+            baseline_oi: HashMap::with_capacity(Self::INITIAL_CAPACITY),
             ticks_processed: 0,
         }
+    }
+
+    /// Captures the current OI for every tracked derivative as the intraday
+    /// baseline. Intended to be called once at 09:15 IST by the pipeline
+    /// scheduler; re-calling overwrites the previous baseline (idempotent).
+    ///
+    /// Price buckets (`Indices` / `Stocks`) are intentionally skipped — they
+    /// carry no OI and do not participate in `oi_buildup` / `oi_unwind`.
+    ///
+    /// Returns the number of baseline entries captured (cold-path diagnostic).
+    pub fn capture_baseline_oi(&mut self) -> usize {
+        // O(1) EXEMPT: cold path — called once per trading day at 09:15 IST.
+        self.baseline_oi.clear();
+        let mut captured = 0_usize;
+        for (key, state) in self.securities.iter() {
+            if state.bucket.has_open_interest() && state.open_interest > 0 {
+                self.baseline_oi.insert(*key, state.open_interest);
+                captured += 1;
+            }
+        }
+        captured
+    }
+
+    /// Current baseline OI population. Cold-path diagnostic.
+    #[must_use]
+    // TEST-EXEMPT: trivial getter covered by capture_baseline_oi tests
+    pub fn baseline_oi_len(&self) -> usize {
+        self.baseline_oi.len()
     }
 
     /// Stores prev_close from a PrevClose (code-6) packet. O(1).
@@ -600,10 +635,30 @@ impl MoversTrackerV2 {
         // (gainers/losers) and one by-volume list; derivatives also get
         // top-oi and top-value. Use Vec + sort for simplicity — N is
         // bounded per bucket and we only run every 5s.
+        //
+        // If a baseline OI was captured at 09:15 IST (plan OI-baseline item),
+        // enrich each derivative entry with prev_oi + oi_change_pct so the
+        // oi_buildup / oi_unwind rankings are meaningful instead of empty.
         let entries: Vec<(u32, MoverEntryV2, MoverBucket)> = self
             .securities
             .iter()
-            .map(|(&(sid, _seg), state)| (sid, state.to_entry(sid), state.bucket))
+            .map(|(&key, state)| {
+                let mut entry = state.to_entry(key.0);
+                if state.bucket.has_open_interest()
+                    && let Some(&baseline) = self.baseline_oi.get(&key)
+                    && baseline > 0
+                {
+                    entry.prev_open_interest = baseline;
+                    // DATA-INTEGRITY-EXEMPT: integer OI counts, not Dhan f32 prices — lossless widening.
+                    let current = f64::from(state.open_interest);
+                    // DATA-INTEGRITY-EXEMPT: integer OI baseline count, not f32 price data.
+                    let prev = f64::from(baseline);
+                    // (current - prev) / prev * 100. Clamp to f32 wire type.
+                    let pct = ((current - prev) / prev) * 100.0;
+                    entry.oi_change_pct = if pct.is_finite() { pct as f32 } else { 0.0 };
+                }
+                (key.0, entry, state.bucket)
+            })
             .collect();
 
         for (_sid, entry, bucket) in entries {
@@ -946,7 +1001,14 @@ fn push_derivative(bucket: &mut DerivativeBucket, entry: MoverEntryV2) {
     bucket.most_active.push(entry);
     bucket.top_oi.push(entry);
     bucket.top_value.push(entry);
-    // oi_buildup/oi_unwind stay empty until prev-OI baseline exists.
+    // oi_buildup/oi_unwind populated only for entries with an OI baseline.
+    // `prev_open_interest > 0` indicates a baseline was captured at 09:15 IST.
+    // Without a baseline the entry carries `prev_open_interest = 0` and we
+    // skip the OI-change rankings for it (gate prevents div-by-zero noise).
+    if entry.prev_open_interest > 0 {
+        bucket.oi_buildup.push(entry);
+        bucket.oi_unwind.push(entry);
+    }
 }
 
 fn trim_price_bucket(bucket: &mut PriceBucket) {
@@ -1004,6 +1066,24 @@ fn trim_derivative_bucket(bucket: &mut DerivativeBucket) {
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     bucket.top_value.truncate(MOVERS_V2_TOP_N);
+
+    // OI buildup: positive oi_change_pct, descending.
+    bucket.oi_buildup.sort_by(|a, b| {
+        b.oi_change_pct
+            .partial_cmp(&a.oi_change_pct)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    bucket.oi_buildup.retain(|e| e.oi_change_pct > 0.0);
+    bucket.oi_buildup.truncate(MOVERS_V2_TOP_N);
+
+    // OI unwind: negative oi_change_pct, ascending.
+    bucket.oi_unwind.sort_by(|a, b| {
+        a.oi_change_pct
+            .partial_cmp(&b.oi_change_pct)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    bucket.oi_unwind.retain(|e| e.oi_change_pct < 0.0);
+    bucket.oi_unwind.truncate(MOVERS_V2_TOP_N);
 }
 
 // ---------------------------------------------------------------------------
@@ -2467,5 +2547,155 @@ mod tests {
         let rows = snapshot_to_rows(&snapshot, &reg);
         // 2 × 3 × 20 + 4 × 7 × 20 = 680
         assert_eq!(rows.len(), 680);
+    }
+
+    // ========================================================================
+    // Plan OI-baseline (2026-04-22) — capture_baseline_oi + oi_buildup/oi_unwind
+    // ========================================================================
+
+    fn tracker_with_index_option(
+        security_id: u32,
+        prev_oi_state_starts_at: u32,
+    ) -> MoversTrackerV2 {
+        use chrono::NaiveDate;
+        use tickvault_common::instrument_registry::{
+            InstrumentRegistry, SubscribedInstrument, SubscriptionCategory,
+        };
+        use tickvault_common::instrument_types::DhanInstrumentKind;
+        use tickvault_common::types::{ExchangeSegment, FeedMode, OptionType};
+
+        let instrument = SubscribedInstrument {
+            security_id,
+            exchange_segment: ExchangeSegment::NseFno,
+            category: SubscriptionCategory::IndexDerivative,
+            display_label: format!("NIFTY-OPT-{security_id}"),
+            underlying_symbol: "NIFTY".to_string(),
+            instrument_kind: Some(DhanInstrumentKind::OptionIndex),
+            expiry_date: NaiveDate::from_ymd_opt(2026, 4, 28),
+            strike_price: Some(25_000.0),
+            option_type: Some(OptionType::Call),
+            feed_mode: FeedMode::Full,
+        };
+        let reg = std::sync::Arc::new(InstrumentRegistry::from_instruments(vec![instrument]));
+        let mut tracker = MoversTrackerV2::new(reg);
+        // Seed a tick so the instrument enters `securities`.
+        let mut tick = ParsedTick::default();
+        tick.security_id = security_id;
+        tick.exchange_segment_code = 2;
+        tick.last_traded_price = 100.0;
+        tick.day_close = 95.0;
+        tick.open_interest = prev_oi_state_starts_at;
+        tick.volume = 1_000;
+        tick.exchange_timestamp = 1_000;
+        tracker.update_v2(&tick);
+        tracker
+    }
+
+    #[test]
+    fn test_capture_baseline_oi_on_empty_tracker_captures_zero() {
+        use tickvault_common::instrument_registry::InstrumentRegistry;
+        let reg = std::sync::Arc::new(InstrumentRegistry::empty());
+        let mut tracker = MoversTrackerV2::new(reg);
+        let captured = tracker.capture_baseline_oi();
+        assert_eq!(captured, 0);
+        assert_eq!(tracker.baseline_oi_len(), 0);
+    }
+
+    #[test]
+    fn test_capture_baseline_oi_captures_derivative_oi_snapshot() {
+        let mut tracker = tracker_with_index_option(49_081, 500_000);
+        let captured = tracker.capture_baseline_oi();
+        assert_eq!(captured, 1);
+        assert_eq!(tracker.baseline_oi_len(), 1);
+    }
+
+    #[test]
+    fn test_capture_baseline_oi_skips_zero_oi_entries() {
+        let mut tracker = tracker_with_index_option(49_081, 0);
+        let captured = tracker.capture_baseline_oi();
+        // OI=0 is NOT captured — prevents div-by-zero noise in oi_change_pct.
+        assert_eq!(captured, 0);
+    }
+
+    #[test]
+    fn test_capture_baseline_oi_idempotent_recapture_overwrites() {
+        let mut tracker = tracker_with_index_option(49_081, 100_000);
+        tracker.capture_baseline_oi();
+        // Second capture after OI has grown must overwrite (idempotent).
+        let mut tick = ParsedTick::default();
+        tick.security_id = 49_081;
+        tick.exchange_segment_code = 2;
+        tick.last_traded_price = 110.0;
+        tick.day_close = 95.0;
+        tick.open_interest = 600_000;
+        tick.volume = 2_000;
+        tick.exchange_timestamp = 2_000;
+        tracker.update_v2(&tick);
+        let recaptured = tracker.capture_baseline_oi();
+        assert_eq!(recaptured, 1);
+        assert_eq!(tracker.baseline_oi_len(), 1);
+    }
+
+    #[test]
+    fn test_oi_buildup_populated_when_baseline_below_current() {
+        let mut tracker = tracker_with_index_option(49_081, 100_000);
+        tracker.capture_baseline_oi();
+        // OI grows 50% after baseline — must land in oi_buildup.
+        let mut tick = ParsedTick::default();
+        tick.security_id = 49_081;
+        tick.exchange_segment_code = 2;
+        tick.last_traded_price = 110.0;
+        tick.day_close = 95.0;
+        tick.open_interest = 150_000;
+        tick.volume = 2_000;
+        tick.exchange_timestamp = 2_000;
+        tracker.update_v2(&tick);
+        let snapshot = tracker.compute_snapshot_v2();
+        assert_eq!(snapshot.index_options.oi_buildup.len(), 1);
+        assert_eq!(snapshot.index_options.oi_unwind.len(), 0);
+        let entry = snapshot.index_options.oi_buildup[0];
+        assert!(entry.oi_change_pct > 49.0 && entry.oi_change_pct < 51.0);
+        assert_eq!(entry.prev_open_interest, 100_000);
+    }
+
+    #[test]
+    fn test_oi_unwind_populated_when_baseline_above_current() {
+        let mut tracker = tracker_with_index_option(49_081, 200_000);
+        tracker.capture_baseline_oi();
+        // OI drops 25% after baseline — must land in oi_unwind.
+        let mut tick = ParsedTick::default();
+        tick.security_id = 49_081;
+        tick.exchange_segment_code = 2;
+        tick.last_traded_price = 90.0;
+        tick.day_close = 95.0;
+        tick.open_interest = 150_000;
+        tick.volume = 2_000;
+        tick.exchange_timestamp = 2_000;
+        tracker.update_v2(&tick);
+        let snapshot = tracker.compute_snapshot_v2();
+        assert_eq!(snapshot.index_options.oi_buildup.len(), 0);
+        assert_eq!(snapshot.index_options.oi_unwind.len(), 1);
+        let entry = snapshot.index_options.oi_unwind[0];
+        assert!(entry.oi_change_pct < -24.0 && entry.oi_change_pct > -26.0);
+        assert_eq!(entry.prev_open_interest, 200_000);
+    }
+
+    #[test]
+    fn test_oi_buildup_unwind_empty_without_baseline_capture() {
+        let mut tracker = tracker_with_index_option(49_081, 100_000);
+        // NO baseline capture — both lists must stay empty even though OI
+        // changes. This preserves the pre-baseline contract.
+        let mut tick = ParsedTick::default();
+        tick.security_id = 49_081;
+        tick.exchange_segment_code = 2;
+        tick.last_traded_price = 110.0;
+        tick.day_close = 95.0;
+        tick.open_interest = 200_000;
+        tick.volume = 2_000;
+        tick.exchange_timestamp = 2_000;
+        tracker.update_v2(&tick);
+        let snapshot = tracker.compute_snapshot_v2();
+        assert!(snapshot.index_options.oi_buildup.is_empty());
+        assert!(snapshot.index_options.oi_unwind.is_empty());
     }
 }

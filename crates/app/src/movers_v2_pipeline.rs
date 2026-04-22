@@ -83,6 +83,12 @@ pub fn spawn_movers_v2_pipeline(
     let updater_cadence_secs = u64::from(movers_config.snapshot_cadence_secs.max(1));
     let mut tick_rx = tick_broadcast.subscribe();
 
+    // OI baseline signal — fired once per trading day at 09:15 IST by the
+    // scheduler task (spawned below). The updater owns the tracker and
+    // consumes this notification to call `tracker.capture_baseline_oi()`.
+    let baseline_signal = Arc::new(Notify::new());
+
+    let updater_baseline_signal = Arc::clone(&baseline_signal);
     let updater = tokio::spawn(async move {
         let mut tracker = MoversTrackerV2::new(updater_registry);
         let mut recompute = tokio::time::interval(Duration::from_secs(updater_cadence_secs));
@@ -94,6 +100,14 @@ pub fn spawn_movers_v2_pipeline(
                 _ = updater_shutdown.notified() => {
                     info!("movers_v2 updater task shutting down");
                     break;
+                }
+                _ = updater_baseline_signal.notified() => {
+                    let captured = tracker.capture_baseline_oi();
+                    info!(
+                        captured,
+                        "movers_v2 OI baseline captured at 09:15 IST — \
+                         oi_buildup / oi_unwind rankings now populate"
+                    );
                 }
                 recv = tick_rx.recv() => {
                     match recv {
@@ -116,6 +130,15 @@ pub fn spawn_movers_v2_pipeline(
                 }
             }
         }
+    });
+
+    // OI baseline scheduler — fires `baseline_signal` once per trading day
+    // at 09:15 IST. Restart-safe: if the boot happens after 09:15 on a
+    // trading day, fires immediately so intraday catch-up works.
+    let scheduler_shutdown = Arc::clone(&shutdown);
+    let scheduler_signal = Arc::clone(&baseline_signal);
+    tokio::spawn(async move {
+        run_baseline_scheduler(scheduler_shutdown, scheduler_signal).await;
     });
 
     // Persister task — reads the latest snapshot off the watch channel,
@@ -201,6 +224,66 @@ pub fn spawn_movers_v2_pipeline(
         updater,
         persister,
         snapshot_handle,
+    }
+}
+
+/// OI baseline scheduler — awakes the updater once per trading day at
+/// 09:15 IST so it can capture the intraday OI snapshot used as baseline
+/// for `oi_buildup` + `oi_unwind` rankings.
+///
+/// # Restart behaviour
+/// If the app boots after 09:15 IST on a trading day, fires immediately so
+/// intraday restarts still produce a meaningful baseline. If it boots
+/// before 09:15 IST, sleeps until then.
+async fn run_baseline_scheduler(shutdown: Arc<Notify>, signal: Arc<Notify>) {
+    // Baseline target = 09:15:00 IST = 33_300 seconds since IST midnight.
+    // Matches `TICK_PERSIST_START_SECS_OF_DAY_IST + 900` (market-open + 15min).
+    const OI_BASELINE_SEC_OF_DAY_IST: i64 = 33_300;
+
+    loop {
+        // Compute seconds until next 09:15 IST.
+        let now_utc = chrono::Utc::now().timestamp();
+        let now_ist = now_utc.saturating_add(i64::from(IST_UTC_OFFSET_SECONDS));
+        let sec_of_day = now_ist.rem_euclid(i64::from(SECONDS_PER_DAY));
+        let sleep_secs = if sec_of_day < OI_BASELINE_SEC_OF_DAY_IST {
+            (OI_BASELINE_SEC_OF_DAY_IST - sec_of_day) as u64
+        } else {
+            // Already past today's 09:15 IST — fire immediately on first
+            // boot, then sleep until tomorrow's 09:15.
+            0
+        };
+
+        if sleep_secs == 0 {
+            // Intraday boot — fire immediately so the current session still
+            // gets a meaningful baseline from whatever OI is already tracked.
+            info!("movers_v2 OI baseline scheduler — firing immediate (intraday boot)");
+            signal.notify_waiters();
+            // Sleep until tomorrow's 09:15.
+            let tomorrow = i64::from(SECONDS_PER_DAY) - sec_of_day + OI_BASELINE_SEC_OF_DAY_IST;
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(tomorrow as u64)) => {}
+                _ = shutdown.notified() => {
+                    info!("movers_v2 OI baseline scheduler shutting down");
+                    return;
+                }
+            }
+            continue;
+        }
+
+        debug!(
+            sleep_secs,
+            "movers_v2 OI baseline scheduler sleeping until 09:15 IST"
+        );
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(sleep_secs)) => {
+                info!("movers_v2 OI baseline scheduler — 09:15 IST fired");
+                signal.notify_waiters();
+            }
+            _ = shutdown.notified() => {
+                info!("movers_v2 OI baseline scheduler shutting down");
+                return;
+            }
+        }
     }
 }
 
