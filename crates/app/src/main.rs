@@ -3243,6 +3243,22 @@ async fn main() -> Result<()> {
                         let new_ce = fmt_contract(&event.new_atm, "CE");
                         let new_pe = fmt_contract(&event.new_atm, "PE");
 
+                        // Depth-20 ALWAYS rebalances (all 4 underlyings).
+                        // Depth-200 ONLY rebalances for NIFTY + BANKNIFTY
+                        // (gate at line ~3261 below). Message text MUST
+                        // reflect the actual mechanism (zero-disconnect
+                        // Swap via mpsc command channel) — the previous
+                        // "aborting... spawning new ATM" wording was a
+                        // mislabel that scared Parthiban at 09:42 IST on
+                        // 2026-04-22 into thinking the depth socket was
+                        // being torn down. It was not.
+                        let has_200_level = ul == "NIFTY" || ul == "BANKNIFTY";
+                        let action_line = if has_200_level {
+                            "Action: zero-disconnect swap — 20-level + 200-level unsub old / sub new on same socket"
+                        } else {
+                            "Action: zero-disconnect swap — 20-level unsub old / sub new on same socket (no 200-level for this underlying)"
+                        };
+
                         rebalance_notifier.notify(NotificationEvent::Custom {
                             message: format!(
                                 "<b>Depth rebalance: {ul}</b>\n\
@@ -3251,7 +3267,7 @@ async fn main() -> Result<()> {
                                  Old PE: {old_pe}\n\
                                  New CE: {new_ce}\n\
                                  New PE: {new_pe}\n\
-                                 Action: aborting old 200-level → spawning new ATM",
+                                 {action_line}",
                                 event.previous_spot, event.current_spot,
                             ),
                         });
