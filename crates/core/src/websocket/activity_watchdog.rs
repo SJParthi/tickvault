@@ -56,14 +56,23 @@ pub const WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS: u64 = 50;
 
 /// Watchdog threshold for live order update. The order update WebSocket
 /// is expected to be silent for long stretches during no-order windows —
-/// production evidence (2026-04-21) shows Dhan's order-update server
-/// does NOT reliably ping every 10s like the market feed does. The old
-/// 660s bound fired every 11 minutes on idle dry-run accounts, producing
-/// Telegram spam without signalling a real dead socket (TCP RST is
-/// caught via the `Some(Err(..))` branch of the read loop, not the
-/// watchdog). 1800s (30 min) keeps the liveness backstop for a truly
-/// wedged socket while staying silent through long idle windows.
-pub const WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS: u64 = 1800;
+/// production evidence shows Dhan's order-update server does NOT reliably
+/// ping every 10s like the market feed does, AND on idle dry-run accounts
+/// sends literally zero frames for hours. TCP RST on truly dead sockets
+/// is already caught via the `Some(Err(..))` branch of the read loop, so
+/// the watchdog is ONLY a liveness backstop for the rare "TCP half-open"
+/// case (socket alive, no data flowing).
+///
+/// History:
+/// - `660s` (original) fired every 11 min on idle accounts → spam.
+/// - `1800s` (2026-04-21) still fired every 30 min on idle accounts →
+///   Telegram shows 4+ reconnects every trading morning with zero orders
+///   (observed 2026-04-23 09:10 / 09:40 / 10:10 / 10:40).
+/// - `14400s` (2026-04-22) = 4 hours. Longer than any realistic in-market
+///   idle window (market hours are 6.5h total 09:15-15:30, but order
+///   update only goes silent when NO orders flow — still capped by
+///   truly-dead-socket detection via the read loop's `Err(..)` branch).
+pub const WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS: u64 = 14400;
 
 /// Per-connection activity watchdog.
 ///
@@ -396,14 +405,14 @@ mod tests {
 
     #[test]
     fn thresholds_match_plan_spec() {
-        // P2.1 (rev. 2026-04-21): 50s for live-feed/depth. Order-update
-        // raised from 660s to 1800s after production evidence showed
-        // Dhan's order-update server does not ping on the same cadence
-        // as the market feed; 660s produced every-11-minute false
-        // positives on idle dry-run accounts. 1800s keeps the liveness
-        // backstop while remaining silent through legitimate idle.
+        // P2.1 (rev. 2026-04-22): 50s for live-feed/depth. Order-update
+        // raised 660s → 1800s → 14400s (4h) after the 1800s bound kept
+        // firing every 30 min on idle accounts (observed 09:10 / 09:40 /
+        // 10:10 / 10:40 on 2026-04-23 with zero orders flowing). TCP RST
+        // on truly dead sockets is caught by the read loop's Err branch,
+        // so the watchdog is purely a half-open-socket backstop.
         assert_eq!(WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS, 50);
-        assert_eq!(WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS, 1800);
+        assert_eq!(WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS, 14400);
     }
 
     // -----------------------------------------------------------------------
