@@ -464,6 +464,11 @@ pub async fn run_phase2_scheduler(
             notifier.notify(NotificationEvent::Phase2Complete {
                 added_count: dispatched_count,
                 duration_ms,
+                // Plan item G (2026-04-22): depth dispatch will land in
+                // item C — until then these are zero and the Telegram
+                // message will show "Depth-20: 0 underlyings".
+                depth_20_underlyings: 0,
+                depth_200_contracts: 0,
             });
             return;
         }

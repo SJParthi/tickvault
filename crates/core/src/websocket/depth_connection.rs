@@ -44,8 +44,23 @@ const DEPTH_CONNECTION_PREFIX: &str = "depth-20lvl";
 /// Command sent to a live depth connection to swap instruments without disconnecting.
 /// Unsubscribes old instruments (RequestCode 25) then subscribes new ones (RequestCode 23).
 /// Zero disconnect, zero reconnect, zero tick gap.
+///
+/// Plan item D (2026-04-22): adds `InitialSubscribe20` / `InitialSubscribe200`
+/// variants dispatched by the Phase 2 scheduler at 09:12:30 IST. Under the
+/// unified 09:12 close flow, depth connections are spawned idle (socket open,
+/// authenticated, but no subscribe sent) and only start streaming after
+/// Phase 2 dispatches the initial subscription using the 09:12 index close.
 #[derive(Debug)]
 pub enum DepthCommand {
+    /// 09:12:30 IST first subscribe for a 20-level depth connection. No
+    /// prior state to unsubscribe — just send the pre-built subscribe
+    /// messages. Fires at most once per connection per day.
+    InitialSubscribe20 { subscribe_messages: Vec<String> },
+
+    /// 09:12:30 IST first subscribe for a 200-level depth connection.
+    /// Single JSON message (200-level = 1 instrument per connection).
+    InitialSubscribe200 { subscribe_message: String },
+
     /// Swap 20-level instruments: unsubscribe old list, subscribe new list.
     /// Both lists are pre-built JSON messages ready to send.
     Swap20 {
@@ -412,6 +427,21 @@ async fn connect_and_run_depth(
             // O(1) EXEMPT: cold path — command arrives at most once per 60s rebalance
             Some(cmd) = cmd_rx.recv() => {
                 match cmd {
+                    DepthCommand::InitialSubscribe20 { subscribe_messages } => {
+                        // Plan item D (2026-04-22): 09:12:30 IST first subscribe
+                        // for this 20-level connection. No unsubscribe — connection
+                        // was spawned idle per item B.
+                        info!(
+                            "{prefix}: INITIAL SUBSCRIBE @ 09:12:30 — sending {} subscribe message(s) from 09:12 close",
+                            subscribe_messages.len()
+                        );
+                        for msg in &subscribe_messages {
+                            if let Err(err) = write.send(Message::Text(msg.clone().into())).await {
+                                warn!(?err, "{prefix}: initial subscribe send failed");
+                            }
+                        }
+                        info!("{prefix}: INITIAL SUBSCRIBE complete");
+                    }
                     DepthCommand::Swap20 { unsubscribe_messages, subscribe_messages } => {
                         info!("{prefix}: REBALANCE — sending {} unsubscribe + {} subscribe messages (zero disconnect)",
                             unsubscribe_messages.len(), subscribe_messages.len());
@@ -427,15 +457,11 @@ async fn connect_and_run_depth(
                         }
                         info!("{prefix}: REBALANCE complete — instrument swap done");
                     }
-                    DepthCommand::Swap200 { unsubscribe_message, subscribe_message } => {
-                        info!("{prefix}: REBALANCE — unsubscribing old + subscribing new ATM (zero disconnect)");
-                        if let Err(err) = write.send(Message::Text(unsubscribe_message.into())).await {
-                            warn!(?err, "{prefix}: rebalance 200-level unsubscribe failed");
-                        }
-                        if let Err(err) = write.send(Message::Text(subscribe_message.into())).await {
-                            warn!(?err, "{prefix}: rebalance 200-level subscribe failed");
-                        }
-                        info!("{prefix}: REBALANCE complete — 200-level ATM swap done");
+                    // Wrong-type commands on a 20-level connection are no-ops
+                    // — the Phase 2 dispatcher routes by feed type, so these
+                    // should never fire; logging a warn! catches regressions.
+                    other => {
+                        warn!(?other, "{prefix}: ignored mis-routed DepthCommand on 20-level connection");
                     }
                 }
                 continue;
@@ -912,15 +938,31 @@ async fn connect_and_run_200_depth(
             }
             // O(1) EXEMPT: cold path — rebalance command at most once per 60s
             Some(cmd) = cmd_rx.recv() => {
-                if let DepthCommand::Swap200 { unsubscribe_message, subscribe_message } = cmd {
-                    info!("{prefix}: REBALANCE — swapping 200-level ATM instrument (zero disconnect)");
-                    if let Err(err) = write.send(Message::Text(unsubscribe_message.into())).await {
-                        warn!(?err, "{prefix}: rebalance 200-level unsubscribe failed");
+                match cmd {
+                    DepthCommand::InitialSubscribe200 { subscribe_message } => {
+                        // Plan item D (2026-04-22): 09:12:30 IST first subscribe.
+                        info!("{prefix}: INITIAL SUBSCRIBE @ 09:12:30 — 200-level from 09:12 close");
+                        if let Err(err) = write.send(Message::Text(subscribe_message.into())).await {
+                            warn!(?err, "{prefix}: initial 200-level subscribe send failed");
+                        }
+                        info!("{prefix}: INITIAL SUBSCRIBE complete");
                     }
-                    if let Err(err) = write.send(Message::Text(subscribe_message.into())).await {
-                        warn!(?err, "{prefix}: rebalance 200-level subscribe failed");
+                    DepthCommand::Swap200 { unsubscribe_message, subscribe_message } => {
+                        info!("{prefix}: REBALANCE — swapping 200-level ATM instrument (zero disconnect)");
+                        if let Err(err) = write.send(Message::Text(unsubscribe_message.into())).await {
+                            warn!(?err, "{prefix}: rebalance 200-level unsubscribe failed");
+                        }
+                        if let Err(err) = write.send(Message::Text(subscribe_message.into())).await {
+                            warn!(?err, "{prefix}: rebalance 200-level subscribe failed");
+                        }
+                        info!("{prefix}: REBALANCE complete — 200-level ATM swap done, zero disconnect");
                     }
-                    info!("{prefix}: REBALANCE complete — 200-level ATM swap done, zero disconnect");
+                    // Wrong-type commands on a 200-level connection are no-ops
+                    // — the Phase 2 dispatcher routes by feed type, so this
+                    // should never fire; logging a warn! catches regressions.
+                    other => {
+                        warn!(?other, "{prefix}: ignored mis-routed DepthCommand on 200-level connection");
+                    }
                 }
                 continue;
             }
@@ -1077,6 +1119,49 @@ async fn connect_and_run_200_depth(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_depth_command_has_initial_subscribe_variants() {
+        // Plan item D (2026-04-22): Phase 2 scheduler dispatches the 09:12:30
+        // IST initial subscribe via these variants. Using string-only fields
+        // means the scheduler can construct them without any WebSocket state.
+        let _ = DepthCommand::InitialSubscribe20 {
+            subscribe_messages: vec!["{\"RequestCode\":23}".to_string()],
+        };
+        let _ = DepthCommand::InitialSubscribe200 {
+            subscribe_message: "{\"RequestCode\":23}".to_string(),
+        };
+    }
+
+    #[test]
+    fn test_depth_command_initial_subscribe_20_holds_batch() {
+        let msgs = vec![
+            "{\"RequestCode\":23,\"InstrumentCount\":1}".to_string(),
+            "{\"RequestCode\":23,\"InstrumentCount\":2}".to_string(),
+        ];
+        let cmd = DepthCommand::InitialSubscribe20 {
+            subscribe_messages: msgs.clone(),
+        };
+        if let DepthCommand::InitialSubscribe20 { subscribe_messages } = cmd {
+            assert_eq!(subscribe_messages, msgs);
+        } else {
+            panic!("expected InitialSubscribe20 variant");
+        }
+    }
+
+    #[test]
+    fn test_depth_command_initial_subscribe_200_holds_single_message() {
+        let msg = "{\"RequestCode\":23,\"ExchangeSegment\":\"NSE_FNO\",\"SecurityId\":\"1333\"}"
+            .to_string();
+        let cmd = DepthCommand::InitialSubscribe200 {
+            subscribe_message: msg.clone(),
+        };
+        if let DepthCommand::InitialSubscribe200 { subscribe_message } = cmd {
+            assert_eq!(subscribe_message, msg);
+        } else {
+            panic!("expected InitialSubscribe200 variant");
+        }
+    }
 
     #[test]
     fn test_depth_constants() {

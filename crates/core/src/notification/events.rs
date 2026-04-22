@@ -167,13 +167,20 @@ pub enum NotificationEvent {
     /// know the system crashed or started late and is catching up.
     Phase2RunImmediate { minutes_late: u64 },
 
-    /// O1: Phase 2 completed — stock F&O delta was issued. `added_count`
-    /// is the number of instruments that would have been subscribed
-    /// (until the SubscribeCommand plumbing lands the count is best-effort
-    /// based on the precomputed plan).
+    /// O1: Phase 2 completed — unified 09:12:30 IST dispatch for stock
+    /// F&O + depth-20 + depth-200 (plan item G, 2026-04-22). Counts are
+    /// zero when the respective feed wasn't dispatched this run (e.g.
+    /// depth underlyings that had no 09:12 tick).
     Phase2Complete {
         added_count: usize,
         duration_ms: u64,
+        /// Plan item G: number of depth-20 underlyings subscribed at
+        /// 09:12:30. Zero on recovery from snapshot that predates
+        /// depth-in-Phase-2 wiring.
+        depth_20_underlyings: usize,
+        /// Plan item G: number of depth-200 contracts subscribed at
+        /// 09:12:30. Max 4 today (NIFTY CE/PE + BANKNIFTY CE/PE).
+        depth_200_contracts: usize,
     },
 
     /// O1: Phase 2 failed — LTPs never arrived within `MAX_LTP_ATTEMPTS`
@@ -758,10 +765,15 @@ impl NotificationEvent {
             Self::Phase2Complete {
                 added_count,
                 duration_ms,
+                depth_20_underlyings,
+                depth_200_contracts,
             } => {
                 format!(
-                    "<b>Phase 2 complete</b>\nAdded {added_count} stock F&O instruments \
-                     in {duration_ms} ms."
+                    "<b>Phase 2 complete @ 09:12:30</b>\n\
+                     Stock F&O: +{added_count}\n\
+                     Depth-20: {depth_20_underlyings} underlyings\n\
+                     Depth-200: {depth_200_contracts} contracts\n\
+                     Duration: {duration_ms} ms"
                 )
             }
             Self::Phase2Failed { reason, attempts } => {
@@ -2669,6 +2681,36 @@ mod tests {
             reason: "x".to_string(),
         };
         assert_eq!(ev.severity(), Severity::High);
+    }
+
+    #[test]
+    fn test_phase2_complete_message_includes_depth_counts() {
+        // Plan item G (2026-04-22): unified 09:12 dispatch message must show
+        // all three feed counts so the operator knows the full scope of
+        // what subscribed at market open.
+        let ev = NotificationEvent::Phase2Complete {
+            added_count: 6123,
+            duration_ms: 450,
+            depth_20_underlyings: 4,
+            depth_200_contracts: 4,
+        };
+        let msg = ev.to_message();
+        assert!(
+            msg.contains("Stock F&O: +6123"),
+            "must show stock F&O count; got: {msg}"
+        );
+        assert!(
+            msg.contains("Depth-20: 4 underlyings"),
+            "must show depth-20 count; got: {msg}"
+        );
+        assert!(
+            msg.contains("Depth-200: 4 contracts"),
+            "must show depth-200 count; got: {msg}"
+        );
+        assert!(
+            msg.contains("09:12:30"),
+            "must reference the unified trigger time; got: {msg}"
+        );
     }
 
     #[test]
