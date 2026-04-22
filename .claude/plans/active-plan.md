@@ -1,8 +1,8 @@
 # Implementation Plan: 6-Bucket Movers Taxonomy (Indices / Stocks / Index-Fut / Stock-Fut / Index-Opt / Stock-Opt)
 
-**Status:** DRAFT
+**Status:** IN_PROGRESS
 **Date:** 2026-04-22
-**Approved by:** pending
+**Approved by:** Parthiban (2026-04-22)
 **Branch:** `claude/market-feed-depth-explanation-RynUx` (or new branch if preferred)
 
 ## Goal
