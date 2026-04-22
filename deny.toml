@@ -45,6 +45,14 @@ ignore = [
     # released. Ignore until aws-lc-rs ships the bump.
     { id = "RUSTSEC-2026-0044", reason = "aws-lc-rs 1.17 not released yet; fix is transitive via aws-lc-sys 0.39" },
     { id = "RUSTSEC-2026-0048", reason = "aws-lc-rs 1.17 not released yet; fix is transitive via aws-lc-sys 0.39" },
+    # rustls-webpki 0.101.7 + 0.103.9 CRL parsing panic on empty BIT
+    # STRING in onlySomeReasons (published 2026-04-22). Fix is 0.103.13
+    # which is NOT yet shipped via rustls 0.23.x — we pin 0.23.37
+    # transitively via aws-config 1.8.15. "Applications that do not
+    # use CRLs are not affected" per the advisory text. tickvault
+    # never configures CRL verification on any rustls client.
+    # Non-exploitable for our deployment.
+    { id = "RUSTSEC-2026-0104", reason = "rustls-webpki CRL panic; tickvault never parses CRLs; fix needs rustls 0.23 patch bump" },
 ]
 
 # --- Licenses: Block incompatible licenses ---
