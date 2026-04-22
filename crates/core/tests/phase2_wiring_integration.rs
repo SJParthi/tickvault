@@ -244,11 +244,12 @@ fn test_snapshotter_filters_non_nse_eq_ticks() {
         SnapshotterOutcome::Filtered(SnapshotterFilterReason::WrongSegment)
     );
 
-    // IDX_I (segment 0) — also filtered.
-    let idx = tick_at(13, 0, ist_to_exchange_ts(today, 9, 12, 15), 23500.0);
+    // Non-whitelisted IDX_I (unknown security_id 999) — filtered as
+    // NotFnoStock because the combined lookup doesn't contain it.
+    let idx = tick_at(999, 0, ist_to_exchange_ts(today, 9, 12, 15), 23500.0);
     assert_eq!(
         classify_tick(&idx, &lookup),
-        SnapshotterOutcome::Filtered(SnapshotterFilterReason::WrongSegment)
+        SnapshotterOutcome::Filtered(SnapshotterFilterReason::NotFnoStock)
     );
 
     // Unknown segment byte — also filtered (with WrongSegment).
