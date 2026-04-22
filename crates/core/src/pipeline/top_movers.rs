@@ -586,6 +586,9 @@ impl MoversTrackerV2 {
     /// pending the prev-OI baseline source).
     // O(1) EXEMPT: cold path — runs every 5s not per tick.
     pub fn compute_snapshot_v2(&self) -> MoversSnapshotV2 {
+        // Plan item F1 (2026-04-22): histogram — latency of each recompute.
+        let start = std::time::Instant::now();
+
         let mut indices = PriceBucket::default();
         let mut stocks = PriceBucket::default();
         let mut index_futures = DerivativeBucket::default();
@@ -638,7 +641,7 @@ impl MoversTrackerV2 {
             + index_options.tracked
             + stock_options.tracked;
 
-        MoversSnapshotV2 {
+        let snapshot = MoversSnapshotV2 {
             indices,
             stocks,
             index_futures,
@@ -647,7 +650,49 @@ impl MoversTrackerV2 {
             stock_options,
             total_tracked,
             snapshot_at_ist_secs: ist_now_secs(),
-        }
+        };
+
+        // Plan item F1 (2026-04-22): emit three Prometheus series per snapshot:
+        //   - tv_movers_snapshot_duration_ms (histogram, unlabelled)
+        //   - tv_movers_tracked_total{bucket} (gauge, one per bucket)
+        // `tv_movers_rows_written_total` is emitted by the ILP writer (Phase C2)
+        // not the tracker.
+        let elapsed_ms: u32 = u32::try_from(start.elapsed().as_millis()).unwrap_or(u32::MAX);
+        // O(1) EXEMPT: handle creation on cold path (every 5s, not per tick).
+        let elapsed_f64: f64 = elapsed_ms.into();
+        metrics::histogram!("tv_movers_snapshot_duration_ms").record(elapsed_f64);
+        metrics::gauge!(
+            "tv_movers_tracked_total",
+            "bucket" => MoverBucket::Indices.as_str()
+        )
+        .set(snapshot.indices.tracked as f64);
+        metrics::gauge!(
+            "tv_movers_tracked_total",
+            "bucket" => MoverBucket::Stocks.as_str()
+        )
+        .set(snapshot.stocks.tracked as f64);
+        metrics::gauge!(
+            "tv_movers_tracked_total",
+            "bucket" => MoverBucket::IndexFutures.as_str()
+        )
+        .set(snapshot.index_futures.tracked as f64);
+        metrics::gauge!(
+            "tv_movers_tracked_total",
+            "bucket" => MoverBucket::StockFutures.as_str()
+        )
+        .set(snapshot.stock_futures.tracked as f64);
+        metrics::gauge!(
+            "tv_movers_tracked_total",
+            "bucket" => MoverBucket::IndexOptions.as_str()
+        )
+        .set(snapshot.index_options.tracked as f64);
+        metrics::gauge!(
+            "tv_movers_tracked_total",
+            "bucket" => MoverBucket::StockOptions.as_str()
+        )
+        .set(snapshot.stock_options.tracked as f64);
+
+        snapshot
     }
 
     /// Total ticks processed. Diagnostic only.

@@ -192,3 +192,26 @@ fn guard_phase2_emits_preopen_buffer_entries_gauge() {
         "Phase 2 must emit tv_phase2_preopen_buffer_entries gauge (plan item K)."
     );
 }
+
+#[test]
+fn guard_movers_v2_emits_snapshot_duration_histogram() {
+    // Plan item F1 (2026-04-22) — MoversTrackerV2::compute_snapshot_v2 emits
+    // tv_movers_snapshot_duration_ms histogram each cycle so Grafana can
+    // ratchet p95 snapshot latency (plan item M ships the panel).
+    let src = read_file("crates/core/src/pipeline/top_movers.rs");
+    assert!(
+        src.contains("tv_movers_snapshot_duration_ms"),
+        "MoversTrackerV2 must emit tv_movers_snapshot_duration_ms (plan F1)."
+    );
+}
+
+#[test]
+fn guard_movers_v2_emits_tracked_total_gauge_per_bucket() {
+    // Plan item F1 (2026-04-22) — one gauge per bucket, so Grafana can
+    // plot per-bucket instrument counts side-by-side.
+    let src = read_file("crates/core/src/pipeline/top_movers.rs");
+    assert!(
+        src.contains("tv_movers_tracked_total"),
+        "MoversTrackerV2 must emit tv_movers_tracked_total gauge (plan F1)."
+    );
+}
