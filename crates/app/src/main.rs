@@ -2946,6 +2946,10 @@ async fn main() -> Result<()> {
             // delta computation BEFORE the rebalancer takes ownership.
             let snapshotter_universe = std::sync::Arc::clone(&universe_arc);
             let phase2_universe = std::sync::Arc::clone(&universe_arc);
+            // Plan item C (2026-04-22, visibility version): the 09:13 IST
+            // depth-anchor task needs its own universe handle to look up
+            // option chains for ATM strike derivation.
+            let depth_anchor_universe = std::sync::Arc::clone(&universe_arc);
 
             // Rebalance event channel (watch — latest-value semantics)
             let (rebalance_tx, mut rebalance_rx) = tokio::sync::watch::channel::<
@@ -3249,6 +3253,113 @@ async fn main() -> Result<()> {
                         depth_200_active: d200,
                         order_update_active: oms,
                     });
+                });
+            }
+
+            // Plan item C (2026-04-22, visibility version): once-per-day
+            // depth-anchor Telegram fired at 09:13:00 IST. Reads the
+            // 09:12 closes for NIFTY + BANKNIFTY from the preopen buffer
+            // (Item A) and reports the derived ATM strike. Operator
+            // visibility into "what 09:12 close anchored today's depth".
+            //
+            // The 60s depth_rebalancer continues to handle drift via
+            // SharedSpotPrices (live LTPs). At 09:13:00 the live LTP and
+            // 09:12 close are typically within 0.1% of each other so any
+            // strike difference is small — when this is non-trivial,
+            // operator can correlate against the rebalance Telegrams.
+            //
+            // Audit-findings Rule 3: market-hours-aware. Trading-day check
+            // + skip if past 09:13.
+            {
+                let anchor_notifier = notifier.clone();
+                let anchor_buffer = std::sync::Arc::clone(&preopen_buffer);
+                let anchor_universe = depth_anchor_universe;
+                let anchor_calendar = std::sync::Arc::clone(&trading_calendar);
+                tokio::spawn(async move {
+                    use chrono::{FixedOffset, NaiveTime, TimeZone, Utc};
+                    use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
+                    let Some(ist_offset) = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS) else {
+                        return;
+                    };
+                    let now_ist = ist_offset.from_utc_datetime(&Utc::now().naive_utc());
+                    let today_ist = now_ist.date_naive();
+                    if !anchor_calendar.is_trading_day(today_ist) {
+                        info!("depth-anchor: skipping (non-trading day)");
+                        return;
+                    }
+                    let Some(target) = NaiveTime::from_hms_opt(9, 13, 0) else {
+                        return;
+                    };
+                    let now_time = now_ist.time();
+                    if now_time >= target {
+                        info!(
+                            now = %now_time,
+                            "depth-anchor: skipping (past 09:13:00 — late start)"
+                        );
+                        return;
+                    }
+                    let secs_until = (target - now_time).num_seconds().max(0) as u64;
+                    info!(secs_until, "depth-anchor: sleeping until 09:13:00 IST");
+                    tokio::time::sleep(std::time::Duration::from_secs(secs_until)).await;
+
+                    // Read preopen buffer snapshot.
+                    let snap =
+                        tickvault_core::instrument::preopen_price_buffer::snapshot(&anchor_buffer)
+                            .await;
+
+                    // For each whitelisted index, derive close + ATM strike + emit Telegram.
+                    for (sym, _id) in
+                        tickvault_core::instrument::preopen_price_buffer::PREOPEN_INDEX_UNDERLYINGS
+                    {
+                        let symbol = (*sym).to_string();
+                        let (close_0912, source_minute_slot) = match snap.get(*sym) {
+                            Some(closes) => {
+                                // Find latest non-empty slot.
+                                let slot_idx =
+                                    closes.closes.iter().enumerate().rev().find_map(|(i, p)| {
+                                        if p.is_some() { Some(i) } else { None }
+                                    });
+                                (closes.backtrack_latest(), slot_idx)
+                            }
+                            None => (None, None),
+                        };
+
+                        // Compute ATM strike from option chain at the next eligible expiry.
+                        let atm_strike = close_0912.and_then(|spot| {
+                            let chain_opt = anchor_universe
+                                .expiry_calendars
+                                .get(&symbol)
+                                .and_then(|cal| cal.expiry_dates.first())
+                                .and_then(|expiry| {
+                                    anchor_universe
+                                        .option_chains
+                                        .get(&tickvault_common::instrument_types::OptionChainKey {
+                                            underlying_symbol: symbol.clone(),
+                                            expiry_date: *expiry,
+                                        })
+                                });
+                            chain_opt.and_then(|chain| {
+                                tickvault_core::instrument::depth_strike_selector::find_atm_security_ids(
+                                    chain, spot,
+                                )
+                                .map(|ids| ids.strike)
+                            })
+                        });
+
+                        info!(
+                            underlying = %symbol,
+                            close_0912 = ?close_0912,
+                            atm_strike = ?atm_strike,
+                            source_slot = ?source_minute_slot,
+                            "PROOF: depth anchor @ 09:13 IST"
+                        );
+                        anchor_notifier.notify(NotificationEvent::MarketOpenDepthAnchor {
+                            underlying: symbol,
+                            close_0912,
+                            atm_strike,
+                            source_minute_slot,
+                        });
+                    }
                 });
             }
 
