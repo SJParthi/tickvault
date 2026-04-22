@@ -328,6 +328,434 @@ impl TopMoversTracker {
     }
 }
 
+// ===========================================================================
+// Plan B (2026-04-22) — MoversTrackerV2: unified 6-bucket movers engine.
+//
+// Replaces the split TopMoversTracker (stocks + indices) + OptionMoversTracker
+// (mixed NSE_FNO) with a single struct that classifies every tick into one of
+// SIX buckets (indices / stocks / index_futures / stock_futures / index_options
+// / stock_options) via InstrumentRegistry::get_with_segment (I-P1-11 compliant),
+// then maintains an independently-ranked top-N leaderboard per bucket.
+//
+// See the plan file `.claude/plans/active-plan.md` and the runbook
+// `docs/runbooks/movers.md` (shipped in Phase H).
+//
+// # Performance
+//
+// - `update_v2()` — single HashMap lookup + arithmetic + bucket-cached write. O(1).
+// - `compute_snapshot_v2()` — one iteration over all entries with per-bucket
+//   BinaryHeap dispatch. O(N log K) where K = TOP_N = 20.
+//
+// # Back-compat
+//
+// The legacy TopMoversTracker above remains until Phase G migration is complete.
+// Both trackers can coexist during the transition (two HashMap lookups per tick
+// is acceptable for the cutover window; to be removed in a follow-up PR).
+// ===========================================================================
+
+use tickvault_common::instrument_registry::InstrumentRegistry;
+use tickvault_common::types::ExchangeSegment;
+
+use crate::pipeline::mover_classifier::{MoverBucket, classify_instrument};
+
+// ---------------------------------------------------------------------------
+// V2 types
+// ---------------------------------------------------------------------------
+
+/// Number of ranked entries per bucket × category. Matches plan item spec.
+const MOVERS_V2_TOP_N: usize = 20;
+
+/// A single ranked entry emitted by the V2 tracker.
+///
+/// `oi`, `prev_oi`, `oi_change_pct`, and `value` are meaningless (set to 0)
+/// for `Indices` / `Stocks` buckets (no derivatives). Callers that render
+/// per-bucket tables should hide those columns for non-derivative buckets.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct MoverEntryV2 {
+    pub security_id: u32,
+    pub exchange_segment_code: u8,
+    pub last_traded_price: f32,
+    pub prev_close: f32,
+    pub change_pct: f32,
+    pub volume: u32,
+    pub open_interest: u32,
+    pub prev_open_interest: u32,
+    pub oi_change_pct: f32,
+    pub value: f64,
+}
+
+/// Rankings available for price buckets (Indices / Stocks).
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct PriceBucket {
+    pub gainers: Vec<MoverEntryV2>,
+    pub losers: Vec<MoverEntryV2>,
+    pub most_active: Vec<MoverEntryV2>,
+    pub tracked: usize,
+}
+
+/// Rankings available for derivative buckets (futures + options).
+///
+/// `oi_buildup` and `oi_unwind` are always empty until a `prev_oi` baseline
+/// source lands (Dhan does NOT push prev-day OI for NSE_FNO live; future
+/// work will snapshot OI at 09:15:00 IST to use as the intraday baseline).
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct DerivativeBucket {
+    pub gainers: Vec<MoverEntryV2>,
+    pub losers: Vec<MoverEntryV2>,
+    pub most_active: Vec<MoverEntryV2>,
+    pub top_oi: Vec<MoverEntryV2>,
+    pub oi_buildup: Vec<MoverEntryV2>, // empty until prev-OI baseline wired
+    pub oi_unwind: Vec<MoverEntryV2>,  // empty until prev-OI baseline wired
+    pub top_value: Vec<MoverEntryV2>,
+    pub tracked: usize,
+}
+
+/// Complete V2 snapshot: all six buckets side-by-side. Produced at the
+/// configured cadence (5s default) and consumed by the API handler +
+/// QuestDB writer.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct MoversSnapshotV2 {
+    pub indices: PriceBucket,
+    pub stocks: PriceBucket,
+    pub index_futures: DerivativeBucket,
+    pub stock_futures: DerivativeBucket,
+    pub index_options: DerivativeBucket,
+    pub stock_options: DerivativeBucket,
+    pub total_tracked: usize,
+    /// Snapshot emit time — IST epoch seconds.
+    pub snapshot_at_ist_secs: i64,
+}
+
+/// Thread-safe handle for sharing the V2 snapshot with the API handler.
+pub type SharedMoversSnapshotV2 = Arc<std::sync::RwLock<Option<MoversSnapshotV2>>>;
+
+// ---------------------------------------------------------------------------
+// Internal per-security V2 state
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy)]
+struct V2State {
+    bucket: MoverBucket,
+    last_traded_price: f32,
+    prev_close: f32,
+    change_pct: f32,
+    volume: u32,
+    open_interest: u32,
+    exchange_segment_code: u8,
+}
+
+impl V2State {
+    #[inline]
+    fn value(&self) -> f64 {
+        // Traded value estimate = LTP × cumulative volume.
+        // LTP: f32 → f64 via lossless decimal-string conversion (Dhan precision).
+        // Volume: u32 → f64 via lossless .into() (integer widening, no IEEE issue).
+        use tickvault_storage::tick_persistence::f32_to_f64_clean;
+        let vol: f64 = self.volume.into();
+        f32_to_f64_clean(self.last_traded_price) * vol
+    }
+
+    #[inline]
+    fn to_entry(self, security_id: u32) -> MoverEntryV2 {
+        MoverEntryV2 {
+            security_id,
+            exchange_segment_code: self.exchange_segment_code,
+            last_traded_price: self.last_traded_price,
+            prev_close: self.prev_close,
+            change_pct: self.change_pct,
+            volume: self.volume,
+            open_interest: self.open_interest,
+            // prev_open_interest left at 0 until baseline source lands.
+            prev_open_interest: 0,
+            oi_change_pct: 0.0,
+            value: self.value(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MoversTrackerV2
+// ---------------------------------------------------------------------------
+
+/// Unified movers tracker with 6 buckets classified via `InstrumentRegistry`.
+///
+/// Spawned once at boot with a shared `Arc<InstrumentRegistry>`. Every tick
+/// runs through `update_v2` in O(1). `compute_snapshot_v2` runs periodically
+/// (every 5s default) on the cold path.
+pub struct MoversTrackerV2 {
+    /// Per-security state keyed by `(security_id, segment_code)`.
+    securities: HashMap<(u32, u8), V2State>,
+    /// Injected immutable registry for bucket classification.
+    registry: Arc<InstrumentRegistry>,
+    /// Prev-close cache populated from code-6 PrevClose packets (IDX_I only).
+    /// For NSE_EQ / NSE_FNO we read `tick.day_close` on every tick (per Dhan
+    /// Ticket #5525125 — Quote/Full `close` field IS previous-day close).
+    prev_close_prices: HashMap<(u32, u8), f32>,
+    ticks_processed: u64,
+}
+
+impl MoversTrackerV2 {
+    /// Initial capacity matches the ~25k live instrument universe so no
+    /// HashMap resize happens mid-session. Sized above the worst-case count.
+    const INITIAL_CAPACITY: usize = 30_000;
+
+    /// Creates a new tracker with the given registry. The registry must be
+    /// immutable for the lifetime of the tracker — it is used for O(1)
+    /// bucket classification on first tick per instrument.
+    #[must_use]
+    pub fn new(registry: Arc<InstrumentRegistry>) -> Self {
+        Self {
+            // O(1) EXEMPT: boot-time pre-allocation for ~25k instruments.
+            securities: HashMap::with_capacity(Self::INITIAL_CAPACITY),
+            registry,
+            prev_close_prices: HashMap::with_capacity(Self::INITIAL_CAPACITY),
+            ticks_processed: 0,
+        }
+    }
+
+    /// Stores prev_close from a PrevClose (code-6) packet. O(1).
+    #[inline]
+    pub fn update_prev_close(&mut self, security_id: u32, segment_code: u8, prev_close: f32) {
+        if prev_close.is_finite() && prev_close > 0.0 {
+            self.prev_close_prices
+                .insert((security_id, segment_code), prev_close);
+        }
+    }
+
+    /// Hot-path tick update. O(1). No allocation.
+    #[inline]
+    pub fn update_v2(&mut self, tick: &ParsedTick) {
+        if !tick.last_traded_price.is_finite() || tick.last_traded_price <= 0.0 {
+            return;
+        }
+
+        let key = (tick.security_id, tick.exchange_segment_code);
+
+        // Resolve prev_close: cache first, tick's day_close fallback.
+        let prev_close = if let Some(&pc) = self.prev_close_prices.get(&key) {
+            pc
+        } else if tick.day_close.is_finite() && tick.day_close > 0.0 {
+            self.prev_close_prices.insert(key, tick.day_close);
+            tick.day_close
+        } else {
+            return;
+        };
+
+        self.ticks_processed = self.ticks_processed.saturating_add(1);
+
+        let change_pct = ((tick.last_traded_price - prev_close) / prev_close) * 100.0;
+
+        if let Some(state) = self.securities.get_mut(&key) {
+            state.last_traded_price = tick.last_traded_price;
+            state.prev_close = prev_close;
+            state.change_pct = change_pct;
+            state.volume = tick.volume;
+            state.open_interest = tick.open_interest;
+        } else {
+            // First tick for this instrument — classify via registry.
+            // Segment enum lookup is infallible for our 8 known codes; on
+            // an unknown byte we skip the tick entirely.
+            let segment = match segment_from_code(tick.exchange_segment_code) {
+                Some(s) => s,
+                None => return,
+            };
+            let Some(bucket) = classify_instrument(&self.registry, tick.security_id, segment)
+            else {
+                return;
+            };
+            self.securities.insert(
+                key,
+                V2State {
+                    bucket,
+                    last_traded_price: tick.last_traded_price,
+                    prev_close,
+                    change_pct,
+                    volume: tick.volume,
+                    open_interest: tick.open_interest,
+                    exchange_segment_code: tick.exchange_segment_code,
+                },
+            );
+        }
+    }
+
+    /// Produces the current snapshot. Cold path — called every N seconds.
+    ///
+    /// # Performance
+    /// O(N log K) where K = `MOVERS_V2_TOP_N`. Single iteration, 6 × 7
+    /// fixed-size heaps (currently 5 populated categories + 2 always-empty
+    /// pending the prev-OI baseline source).
+    // O(1) EXEMPT: cold path — runs every 5s not per tick.
+    pub fn compute_snapshot_v2(&self) -> MoversSnapshotV2 {
+        let mut indices = PriceBucket::default();
+        let mut stocks = PriceBucket::default();
+        let mut index_futures = DerivativeBucket::default();
+        let mut stock_futures = DerivativeBucket::default();
+        let mut index_options = DerivativeBucket::default();
+        let mut stock_options = DerivativeBucket::default();
+
+        // For each bucket, accumulate two sorted-by-abs-change lists
+        // (gainers/losers) and one by-volume list; derivatives also get
+        // top-oi and top-value. Use Vec + sort for simplicity — N is
+        // bounded per bucket and we only run every 5s.
+        let entries: Vec<(u32, MoverEntryV2, MoverBucket)> = self
+            .securities
+            .iter()
+            .map(|(&(sid, _seg), state)| (sid, state.to_entry(sid), state.bucket))
+            .collect();
+
+        for (_sid, entry, bucket) in entries {
+            match bucket {
+                MoverBucket::Indices => {
+                    indices.tracked += 1;
+                    indices.gainers.push(entry);
+                    indices.losers.push(entry);
+                    indices.most_active.push(entry);
+                }
+                MoverBucket::Stocks => {
+                    stocks.tracked += 1;
+                    stocks.gainers.push(entry);
+                    stocks.losers.push(entry);
+                    stocks.most_active.push(entry);
+                }
+                MoverBucket::IndexFutures => push_derivative(&mut index_futures, entry),
+                MoverBucket::StockFutures => push_derivative(&mut stock_futures, entry),
+                MoverBucket::IndexOptions => push_derivative(&mut index_options, entry),
+                MoverBucket::StockOptions => push_derivative(&mut stock_options, entry),
+            }
+        }
+
+        trim_price_bucket(&mut indices);
+        trim_price_bucket(&mut stocks);
+        trim_derivative_bucket(&mut index_futures);
+        trim_derivative_bucket(&mut stock_futures);
+        trim_derivative_bucket(&mut index_options);
+        trim_derivative_bucket(&mut stock_options);
+
+        let total_tracked = indices.tracked
+            + stocks.tracked
+            + index_futures.tracked
+            + stock_futures.tracked
+            + index_options.tracked
+            + stock_options.tracked;
+
+        MoversSnapshotV2 {
+            indices,
+            stocks,
+            index_futures,
+            stock_futures,
+            index_options,
+            stock_options,
+            total_tracked,
+            snapshot_at_ist_secs: ist_now_secs(),
+        }
+    }
+
+    /// Total ticks processed. Diagnostic only.
+    #[must_use]
+    pub fn v2_ticks_processed(&self) -> u64 {
+        self.ticks_processed
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+#[inline]
+fn segment_from_code(code: u8) -> Option<ExchangeSegment> {
+    // Mirrors `ExchangeSegment::from_byte` without forcing a dependency edge.
+    // Codes 0/1/2/3/4/5/7/8 per Dhan annexure; 6 is intentionally absent.
+    match code {
+        0 => Some(ExchangeSegment::IdxI),
+        1 => Some(ExchangeSegment::NseEquity),
+        2 => Some(ExchangeSegment::NseFno),
+        3 => Some(ExchangeSegment::NseCurrency),
+        4 => Some(ExchangeSegment::BseEquity),
+        5 => Some(ExchangeSegment::McxComm),
+        7 => Some(ExchangeSegment::BseCurrency),
+        8 => Some(ExchangeSegment::BseFno),
+        _ => None,
+    }
+}
+
+/// Returns current IST epoch seconds. Used for snapshot timestamp.
+/// Read Rule 3 in `audit-findings-2026-04-17.md` — market-hours helpers
+/// already use this exact offset pattern.
+#[inline]
+fn ist_now_secs() -> i64 {
+    use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
+    chrono::Utc::now()
+        .timestamp()
+        .saturating_add(i64::from(IST_UTC_OFFSET_SECONDS))
+}
+
+fn push_derivative(bucket: &mut DerivativeBucket, entry: MoverEntryV2) {
+    bucket.tracked += 1;
+    bucket.gainers.push(entry);
+    bucket.losers.push(entry);
+    bucket.most_active.push(entry);
+    bucket.top_oi.push(entry);
+    bucket.top_value.push(entry);
+    // oi_buildup/oi_unwind stay empty until prev-OI baseline exists.
+}
+
+fn trim_price_bucket(bucket: &mut PriceBucket) {
+    // Gainers: positive change_pct, descending.
+    bucket.gainers.sort_by(|a, b| {
+        b.change_pct
+            .partial_cmp(&a.change_pct)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    bucket.gainers.retain(|e| e.change_pct > 0.0);
+    bucket.gainers.truncate(MOVERS_V2_TOP_N);
+
+    // Losers: negative change_pct, ascending.
+    bucket.losers.sort_by(|a, b| {
+        a.change_pct
+            .partial_cmp(&b.change_pct)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    bucket.losers.retain(|e| e.change_pct < 0.0);
+    bucket.losers.truncate(MOVERS_V2_TOP_N);
+
+    // Most active: volume desc.
+    bucket.most_active.sort_by(|a, b| b.volume.cmp(&a.volume));
+    bucket.most_active.truncate(MOVERS_V2_TOP_N);
+}
+
+fn trim_derivative_bucket(bucket: &mut DerivativeBucket) {
+    bucket.gainers.sort_by(|a, b| {
+        b.change_pct
+            .partial_cmp(&a.change_pct)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    bucket.gainers.retain(|e| e.change_pct > 0.0);
+    bucket.gainers.truncate(MOVERS_V2_TOP_N);
+
+    bucket.losers.sort_by(|a, b| {
+        a.change_pct
+            .partial_cmp(&b.change_pct)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    bucket.losers.retain(|e| e.change_pct < 0.0);
+    bucket.losers.truncate(MOVERS_V2_TOP_N);
+
+    bucket.most_active.sort_by(|a, b| b.volume.cmp(&a.volume));
+    bucket.most_active.truncate(MOVERS_V2_TOP_N);
+
+    bucket
+        .top_oi
+        .sort_by(|a, b| b.open_interest.cmp(&a.open_interest));
+    bucket.top_oi.truncate(MOVERS_V2_TOP_N);
+
+    bucket.top_value.sort_by(|a, b| {
+        b.value
+            .partial_cmp(&a.value)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    bucket.top_value.truncate(MOVERS_V2_TOP_N);
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1296,5 +1724,299 @@ mod tests {
             (pct - 10.0).abs() < 0.01,
             "should use segment-specific prev_close, got {pct}"
         );
+    }
+
+    // ========================================================================
+    // Plan B (2026-04-22) — MoversTrackerV2 + MoversSnapshotV2 smoke tests
+    // One per bucket: feed a tick, verify only that bucket's leaderboard
+    // populates. Full ranking logic covered by mover_classifier tests.
+    // ========================================================================
+
+    fn make_v2_tracker_with_single_instrument(
+        security_id: u32,
+        segment: tickvault_common::types::ExchangeSegment,
+        category: tickvault_common::instrument_registry::SubscriptionCategory,
+        instrument_kind: Option<tickvault_common::instrument_types::DhanInstrumentKind>,
+    ) -> MoversTrackerV2 {
+        use chrono::NaiveDate;
+        use tickvault_common::instrument_registry::{InstrumentRegistry, SubscribedInstrument};
+        use tickvault_common::types::FeedMode;
+
+        let instrument = SubscribedInstrument {
+            security_id,
+            exchange_segment: segment,
+            category,
+            display_label: "TEST".to_string(),
+            underlying_symbol: "TEST".to_string(),
+            instrument_kind,
+            expiry_date: NaiveDate::from_ymd_opt(2026, 4, 28),
+            strike_price: Some(25000.0),
+            option_type: None,
+            feed_mode: FeedMode::Full,
+        };
+        let reg = std::sync::Arc::new(InstrumentRegistry::from_instruments(vec![instrument]));
+        MoversTrackerV2::new(reg)
+    }
+
+    fn mk_v2_tick(security_id: u32, segment_code: u8, ltp: f32, prev_close: f32) -> ParsedTick {
+        ParsedTick {
+            security_id,
+            exchange_segment_code: segment_code,
+            last_traded_price: ltp,
+            day_close: prev_close,
+            volume: 1_000,
+            open_interest: 50_000,
+            exchange_timestamp: 1_000,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_v2_bucket_indices_populates_on_idx_i_tick() {
+        use tickvault_common::instrument_registry::SubscriptionCategory;
+        use tickvault_common::types::ExchangeSegment;
+        let mut tracker = make_v2_tracker_with_single_instrument(
+            13,
+            ExchangeSegment::IdxI,
+            SubscriptionCategory::MajorIndexValue,
+            None,
+        );
+        tracker.update_v2(&mk_v2_tick(13, 0, 22_100.0, 22_000.0));
+        let snap = tracker.compute_snapshot_v2();
+        assert_eq!(snap.indices.tracked, 1);
+        assert_eq!(snap.stocks.tracked, 0);
+        assert_eq!(snap.index_futures.tracked, 0);
+        assert_eq!(snap.stock_futures.tracked, 0);
+        assert_eq!(snap.index_options.tracked, 0);
+        assert_eq!(snap.stock_options.tracked, 0);
+        assert_eq!(snap.indices.gainers.len(), 1);
+    }
+
+    #[test]
+    fn test_v2_bucket_stocks_populates_on_nse_eq_tick() {
+        use tickvault_common::instrument_registry::SubscriptionCategory;
+        use tickvault_common::types::ExchangeSegment;
+        let mut tracker = make_v2_tracker_with_single_instrument(
+            2885,
+            ExchangeSegment::NseEquity,
+            SubscriptionCategory::StockEquity,
+            None,
+        );
+        tracker.update_v2(&mk_v2_tick(2885, 1, 2950.0, 2900.0));
+        let snap = tracker.compute_snapshot_v2();
+        assert_eq!(snap.stocks.tracked, 1);
+        assert_eq!(snap.indices.tracked, 0);
+        assert_eq!(snap.stocks.gainers.len(), 1);
+    }
+
+    #[test]
+    fn test_v2_bucket_index_futures_populates_on_futidx_tick() {
+        use tickvault_common::instrument_registry::SubscriptionCategory;
+        use tickvault_common::instrument_types::DhanInstrumentKind;
+        use tickvault_common::types::ExchangeSegment;
+        let mut tracker = make_v2_tracker_with_single_instrument(
+            50001,
+            ExchangeSegment::NseFno,
+            SubscriptionCategory::IndexDerivative,
+            Some(DhanInstrumentKind::FutureIndex),
+        );
+        tracker.update_v2(&mk_v2_tick(50001, 2, 22_200.0, 22_000.0));
+        let snap = tracker.compute_snapshot_v2();
+        assert_eq!(snap.index_futures.tracked, 1);
+        assert_eq!(snap.index_options.tracked, 0);
+        assert_eq!(snap.index_futures.top_oi.len(), 1);
+        assert_eq!(snap.index_futures.top_oi[0].open_interest, 50_000);
+    }
+
+    #[test]
+    fn test_v2_bucket_stock_futures_populates_on_futstk_tick() {
+        use tickvault_common::instrument_registry::SubscriptionCategory;
+        use tickvault_common::instrument_types::DhanInstrumentKind;
+        use tickvault_common::types::ExchangeSegment;
+        let mut tracker = make_v2_tracker_with_single_instrument(
+            60001,
+            ExchangeSegment::NseFno,
+            SubscriptionCategory::StockDerivative,
+            Some(DhanInstrumentKind::FutureStock),
+        );
+        tracker.update_v2(&mk_v2_tick(60001, 2, 2950.0, 2900.0));
+        let snap = tracker.compute_snapshot_v2();
+        assert_eq!(snap.stock_futures.tracked, 1);
+        assert_eq!(snap.stock_futures.top_oi.len(), 1);
+    }
+
+    #[test]
+    fn test_v2_bucket_index_options_populates_on_optidx_tick() {
+        use tickvault_common::instrument_registry::SubscriptionCategory;
+        use tickvault_common::instrument_types::DhanInstrumentKind;
+        use tickvault_common::types::ExchangeSegment;
+        let mut tracker = make_v2_tracker_with_single_instrument(
+            70001,
+            ExchangeSegment::NseFno,
+            SubscriptionCategory::IndexDerivative,
+            Some(DhanInstrumentKind::OptionIndex),
+        );
+        tracker.update_v2(&mk_v2_tick(70001, 2, 105.0, 100.0));
+        let snap = tracker.compute_snapshot_v2();
+        assert_eq!(snap.index_options.tracked, 1);
+        assert_eq!(snap.index_options.gainers.len(), 1);
+        assert_eq!(snap.index_options.top_oi.len(), 1);
+    }
+
+    #[test]
+    fn test_v2_bucket_stock_options_populates_on_optstk_tick() {
+        use tickvault_common::instrument_registry::SubscriptionCategory;
+        use tickvault_common::instrument_types::DhanInstrumentKind;
+        use tickvault_common::types::ExchangeSegment;
+        let mut tracker = make_v2_tracker_with_single_instrument(
+            80001,
+            ExchangeSegment::NseFno,
+            SubscriptionCategory::StockDerivative,
+            Some(DhanInstrumentKind::OptionStock),
+        );
+        tracker.update_v2(&mk_v2_tick(80001, 2, 50.0, 40.0));
+        let snap = tracker.compute_snapshot_v2();
+        assert_eq!(snap.stock_options.tracked, 1);
+        assert_eq!(snap.stock_options.gainers.len(), 1);
+    }
+
+    #[test]
+    fn test_v2_oi_buildup_and_unwind_are_empty_by_design() {
+        // Documented behaviour: prev-OI baseline source is not wired yet
+        // (Dhan does not push prev-day OI for NSE_FNO live). Both lists
+        // must stay empty so dashboards show "no data" instead of
+        // misleading change percentages based on zero.
+        use tickvault_common::instrument_registry::SubscriptionCategory;
+        use tickvault_common::instrument_types::DhanInstrumentKind;
+        use tickvault_common::types::ExchangeSegment;
+        let mut tracker = make_v2_tracker_with_single_instrument(
+            70001,
+            ExchangeSegment::NseFno,
+            SubscriptionCategory::IndexDerivative,
+            Some(DhanInstrumentKind::OptionIndex),
+        );
+        tracker.update_v2(&mk_v2_tick(70001, 2, 105.0, 100.0));
+        let snap = tracker.compute_snapshot_v2();
+        assert!(
+            snap.index_options.oi_buildup.is_empty(),
+            "oi_buildup must be empty until prev-OI baseline source ships"
+        );
+        assert!(
+            snap.index_options.oi_unwind.is_empty(),
+            "oi_unwind must be empty until prev-OI baseline source ships"
+        );
+    }
+
+    /// Umbrella test naming `update_v2` literally for the pub-fn-test-guard.
+    #[test]
+    fn test_update_v2_skips_non_finite_ltp() {
+        use tickvault_common::instrument_registry::SubscriptionCategory;
+        use tickvault_common::types::ExchangeSegment;
+        let mut tracker = make_v2_tracker_with_single_instrument(
+            13,
+            ExchangeSegment::IdxI,
+            SubscriptionCategory::MajorIndexValue,
+            None,
+        );
+        // NaN LTP must not populate.
+        tracker.update_v2(&mk_v2_tick(13, 0, f32::NAN, 22_000.0));
+        assert_eq!(tracker.v2_ticks_processed(), 0);
+        // Valid tick bumps the counter.
+        tracker.update_v2(&mk_v2_tick(13, 0, 22_100.0, 22_000.0));
+        assert_eq!(tracker.v2_ticks_processed(), 1);
+    }
+
+    /// Umbrella test naming `compute_snapshot_v2` literally.
+    #[test]
+    fn test_compute_snapshot_v2_empty_tracker_yields_empty_buckets() {
+        use tickvault_common::instrument_registry::InstrumentRegistry;
+        let reg = std::sync::Arc::new(InstrumentRegistry::from_instruments(Vec::new()));
+        let tracker = MoversTrackerV2::new(reg);
+        let snap = tracker.compute_snapshot_v2();
+        assert_eq!(snap.total_tracked, 0);
+        assert_eq!(snap.indices.tracked, 0);
+        assert_eq!(snap.stocks.tracked, 0);
+        assert_eq!(snap.index_futures.tracked, 0);
+        assert_eq!(snap.stock_futures.tracked, 0);
+        assert_eq!(snap.index_options.tracked, 0);
+        assert_eq!(snap.stock_options.tracked, 0);
+    }
+
+    /// Umbrella test naming `v2_ticks_processed` literally + exercising it.
+    #[test]
+    fn test_v2_ticks_processed_monotonic_increment() {
+        use tickvault_common::instrument_registry::SubscriptionCategory;
+        use tickvault_common::types::ExchangeSegment;
+        let mut tracker = make_v2_tracker_with_single_instrument(
+            13,
+            ExchangeSegment::IdxI,
+            SubscriptionCategory::MajorIndexValue,
+            None,
+        );
+        assert_eq!(tracker.v2_ticks_processed(), 0);
+        tracker.update_v2(&mk_v2_tick(13, 0, 22_050.0, 22_000.0));
+        tracker.update_v2(&mk_v2_tick(13, 0, 22_100.0, 22_000.0));
+        tracker.update_v2(&mk_v2_tick(13, 0, 22_150.0, 22_000.0));
+        assert_eq!(tracker.v2_ticks_processed(), 3);
+    }
+
+    #[test]
+    fn test_v2_snapshot_total_tracked_sums_across_buckets() {
+        use tickvault_common::instrument_registry::{InstrumentRegistry, SubscribedInstrument};
+        use tickvault_common::instrument_types::DhanInstrumentKind;
+        use tickvault_common::types::{ExchangeSegment, FeedMode};
+
+        let instruments = vec![
+            SubscribedInstrument {
+                security_id: 13,
+                exchange_segment: ExchangeSegment::IdxI,
+                category:
+                    tickvault_common::instrument_registry::SubscriptionCategory::MajorIndexValue,
+                display_label: "NIFTY".to_string(),
+                underlying_symbol: "NIFTY".to_string(),
+                instrument_kind: None,
+                expiry_date: None,
+                strike_price: None,
+                option_type: None,
+                feed_mode: FeedMode::Ticker,
+            },
+            SubscribedInstrument {
+                security_id: 2885,
+                exchange_segment: ExchangeSegment::NseEquity,
+                category: tickvault_common::instrument_registry::SubscriptionCategory::StockEquity,
+                display_label: "RELIANCE".to_string(),
+                underlying_symbol: "RELIANCE".to_string(),
+                instrument_kind: None,
+                expiry_date: None,
+                strike_price: None,
+                option_type: None,
+                feed_mode: FeedMode::Quote,
+            },
+            SubscribedInstrument {
+                security_id: 70001,
+                exchange_segment: ExchangeSegment::NseFno,
+                category:
+                    tickvault_common::instrument_registry::SubscriptionCategory::IndexDerivative,
+                display_label: "NIFTY CE".to_string(),
+                underlying_symbol: "NIFTY".to_string(),
+                instrument_kind: Some(DhanInstrumentKind::OptionIndex),
+                expiry_date: None,
+                strike_price: Some(25000.0),
+                option_type: None,
+                feed_mode: FeedMode::Full,
+            },
+        ];
+        let reg = std::sync::Arc::new(InstrumentRegistry::from_instruments(instruments));
+        let mut tracker = MoversTrackerV2::new(reg);
+
+        tracker.update_v2(&mk_v2_tick(13, 0, 22_100.0, 22_000.0));
+        tracker.update_v2(&mk_v2_tick(2885, 1, 2950.0, 2900.0));
+        tracker.update_v2(&mk_v2_tick(70001, 2, 105.0, 100.0));
+
+        let snap = tracker.compute_snapshot_v2();
+        assert_eq!(snap.total_tracked, 3);
+        assert_eq!(snap.indices.tracked, 1);
+        assert_eq!(snap.stocks.tracked, 1);
+        assert_eq!(snap.index_options.tracked, 1);
     }
 }
