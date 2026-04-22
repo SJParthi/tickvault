@@ -364,6 +364,16 @@ pub async fn run_phase2_scheduler(
         }
     }
 
+    // Plan item K (2026-04-22): emit Phase 2 trigger latency (how late vs
+    // the 09:13 IST target). Zero for the SleepUntil path, >0 for the
+    // RunImmediate crash-recovery path.
+    let trigger_latency_ms: u64 = match &decision {
+        NextTrigger::SleepUntil { .. } => 0,
+        NextTrigger::RunImmediate { minutes_late } => minutes_late.saturating_mul(60_000),
+        NextTrigger::SkipToday { .. } => 0, // unreachable — returned earlier
+    };
+    metrics::histogram!("tv_phase2_trigger_latency_ms").record(trigger_latency_ms as f64);
+
     let start = Instant::now();
     for attempt in 1..=MAX_LTP_ATTEMPTS {
         if wait_for_ltps_once(&spot_prices).await {
@@ -395,6 +405,12 @@ pub async fn run_phase2_scheduler(
                 }) => {
                     let snap = snapshot(buffer).await;
                     diag_buffer_entries = snap.len();
+                    // Plan item K (2026-04-22): gauge on the preopen buffer
+                    // population at trigger time. Low value here = upstream
+                    // tick capture problem; the empty-plan runbook links
+                    // this metric to the triage path.
+                    metrics::gauge!("tv_phase2_preopen_buffer_entries")
+                        .set(diag_buffer_entries as f64);
                     let compute_start = Instant::now();
                     let plan = compute_phase2_stock_subscriptions(
                         universe,

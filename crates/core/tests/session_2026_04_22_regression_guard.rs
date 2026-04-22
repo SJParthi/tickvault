@@ -167,3 +167,28 @@ fn guard_phase2_complete_includes_depth_counts() {
         "Phase2Complete must include depth_200_contracts field (commit 6fd9c2a)."
     );
 }
+
+#[test]
+fn guard_phase2_emits_trigger_latency_histogram() {
+    // Plan item K (2026-04-22) — Phase 2 emits tv_phase2_trigger_latency_ms
+    // so the operator can see how late the RunImmediate crash-recovery path
+    // woke up vs the 09:13 target. Zero for SleepUntil, minutes_late * 60_000
+    // for RunImmediate.
+    let src = read_file("crates/core/src/instrument/phase2_scheduler.rs");
+    assert!(
+        src.contains("tv_phase2_trigger_latency_ms"),
+        "Phase 2 must emit tv_phase2_trigger_latency_ms (plan item K)."
+    );
+}
+
+#[test]
+fn guard_phase2_emits_preopen_buffer_entries_gauge() {
+    // Plan item K (2026-04-22) — Phase 2 emits tv_phase2_preopen_buffer_entries
+    // as a gauge at trigger time. Low value = upstream tick capture problem;
+    // the phase2-empty-plan runbook references this metric.
+    let src = read_file("crates/core/src/instrument/phase2_scheduler.rs");
+    assert!(
+        src.contains("tv_phase2_preopen_buffer_entries"),
+        "Phase 2 must emit tv_phase2_preopen_buffer_entries gauge (plan item K)."
+    );
+}
