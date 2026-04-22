@@ -6,14 +6,22 @@
 # reason + upstream-release condition for removal lives in deny.toml.
 #
 # When removing an ignore here, also remove it from deny.toml.
+#
+# 2026-04-22 cleanup: 4 entries removed after PR #323 landed the
+# aws-lc-sys / aws-lc-rs / rustls-webpki / rand bumps on main:
+#   - RUSTSEC-2026-0044 / 0048 → fixed by aws-lc-sys 0.40.0
+#   - RUSTSEC-2026-0049 → fixed by rustls-webpki 0.103.13
+#   - RUSTSEC-2026-0097 → fixed by rand 0.9.4
+# All three remaining entries apply to rustls-webpki 0.101.7, which
+# is pulled in by the deep AWS SDK stack
+# (aws-smithy-http-client 1.1.12 → hyper-rustls 0.24.2 → rustls 0.21.12).
+# Fix = AWS SDK suite bump, deferred to its own PR.
 # =============================================================================
 
 [advisories]
 ignore = [
-    "RUSTSEC-2026-0098", # rustls-webpki URI name-constraint; 0.103.12 not released yet
-    "RUSTSEC-2026-0099", # rustls-webpki wildcard name-constraint; 0.103.12 not released yet
-    "RUSTSEC-2026-0049", # rustls-webpki CRL matching; requires rustls 0.23 patch bump
-    "RUSTSEC-2026-0044", # AWS-LC X.509 bypass; requires aws-lc-rs 1.17 (not yet released)
-    "RUSTSEC-2026-0048", # AWS-LC CRL scope; requires aws-lc-rs 1.17 (not yet released)
-    "RUSTSEC-2026-0097", # rand unsoundness; only with custom logger reading RNG — N/A here
+    "RUSTSEC-2026-0098", # rustls-webpki 0.101.7 URI name-constraint — AWS SDK transitive only
+    "RUSTSEC-2026-0099", # rustls-webpki 0.101.7 wildcard name-constraint — AWS SDK transitive only
+    "RUSTSEC-2026-0104", # rustls-webpki 0.101.7 CRL-parse panic — AWS SDK transitive only (CRL parsing not on live-feed path which uses rustls 0.23.37 → webpki 0.103.13)
 ]
+
