@@ -275,12 +275,17 @@ impl TokenManager {
                         delay
                     };
 
-                    // Notify on each transient failure.
-                    notifier.notify(NotificationEvent::AuthenticationFailed {
-                        reason: format!(
-                            "attempt {attempt}: {reason} — retrying in {}s",
-                            wait_duration.as_secs()
-                        ),
+                    // Notify on each transient failure. Low severity — the
+                    // retry loop is still active, so firing `Critical` would
+                    // cry wolf on a network blip that the next attempt
+                    // resolves (Q2, 2026-04-23). If the loop ultimately
+                    // exhausts on a TOTP / permanent-auth failure, the
+                    // terminal branch above fires `AuthenticationFailed`
+                    // at `Severity::Critical` instead.
+                    notifier.notify(NotificationEvent::AuthenticationTransientFailure {
+                        attempt,
+                        reason: reason.clone(),
+                        next_retry_ms: u64::try_from(wait_duration.as_millis()).unwrap_or(u64::MAX),
                     });
 
                     // Sleep with Ctrl+C awareness.

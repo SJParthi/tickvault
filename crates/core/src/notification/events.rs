@@ -82,6 +82,21 @@ pub enum NotificationEvent {
     /// Dhan authentication failed at boot — system started in offline mode.
     AuthenticationFailed { reason: String },
 
+    /// Dhan authentication attempt failed transiently (network blip, DNS
+    /// hiccup, TLS handshake timeout) but the retry loop is still active and
+    /// will attempt again in `next_retry_ms` milliseconds. Fires at
+    /// `Severity::Low` — visible in Telegram but no SMS escalation. If all
+    /// retries exhaust (e.g., TOTP secret genuinely wrong, permanent auth
+    /// rejection), the final failure fires `AuthenticationFailed` at
+    /// `Severity::Critical` instead. This split prevents a single 100-ms
+    /// blip on `auth.dhan.co` from triggering a `CRITICAL` alert that the
+    /// very next retry resolves. Queue item Q2 (2026-04-23 session).
+    AuthenticationTransientFailure {
+        attempt: u32,
+        reason: String,
+        next_retry_ms: u64,
+    },
+
     /// Pre-market profile check FAILED — dataPlan, activeSegment, or token
     /// expiry is not acceptable for today's trading session. Fires CRITICAL
     /// Telegram on every failure. If the check runs during market hours
@@ -694,6 +709,24 @@ impl NotificationEvent {
                     redact_url_params(reason)
                 )
             }
+            Self::AuthenticationTransientFailure {
+                attempt,
+                reason,
+                next_retry_ms,
+            } => {
+                // Render sub-second waits with ms precision so the operator
+                // does not see the misleading "retrying in 0s" message that
+                // `.as_secs()` produced on the 100ms→200ms→... early retries.
+                let wait_str = if *next_retry_ms < 1_000 {
+                    format!("{next_retry_ms}ms")
+                } else {
+                    format!("{:.1}s", (*next_retry_ms as f64) / 1_000.0)
+                };
+                format!(
+                    "<b>Auth retry {attempt}</b> — transient\n{reason} — retrying in {wait_str}",
+                    reason = redact_url_params(reason),
+                )
+            }
             Self::PreMarketProfileCheckFailed {
                 reason,
                 within_market_hours,
@@ -1276,6 +1309,10 @@ impl NotificationEvent {
             Self::IpVerificationFailed { .. } => Severity::Critical,
             Self::BootDeadlineMissed { .. } => Severity::Critical,
             Self::AuthenticationFailed { .. } => Severity::Critical,
+            // Transient auth blip — Low so no SMS escalation. If all retries
+            // exhaust, the terminal path fires `AuthenticationFailed` at
+            // Critical instead.
+            Self::AuthenticationTransientFailure { .. } => Severity::Low,
             Self::PreMarketProfileCheckFailed { .. } => Severity::Critical,
             Self::MidSessionProfileInvalidated { .. } => Severity::Critical,
             Self::TokenRenewalFailed { .. } => Severity::Critical,
@@ -1393,6 +1430,80 @@ mod tests {
         let event = NotificationEvent::AuthenticationSuccess;
         let msg = event.to_message();
         assert!(msg.contains("Auth OK"));
+    }
+
+    // Q2 regression pins (2026-04-23): transient auth blips must be Low,
+    // not Critical — a 100ms network hiccup on `auth.dhan.co` that the
+    // very next retry resolves should NOT fire a `CRITICAL` Telegram.
+
+    #[test]
+    fn test_auth_transient_failure_is_low_severity() {
+        let event = NotificationEvent::AuthenticationTransientFailure {
+            attempt: 1,
+            reason: "error sending request".to_string(),
+            next_retry_ms: 100,
+        };
+        assert_eq!(
+            event.severity(),
+            Severity::Low,
+            "transient auth blips must be Low so they do not SMS-escalate — \
+             only the terminal AuthenticationFailed is Critical"
+        );
+    }
+
+    #[test]
+    fn test_auth_transient_failure_shows_ms_not_zero_seconds() {
+        // Before Q2: `format!("retrying in {}s", wait.as_secs())` rendered
+        // 100ms as "retrying in 0s" which was misleading. Now sub-second
+        // waits render with ms precision.
+        let event = NotificationEvent::AuthenticationTransientFailure {
+            attempt: 1,
+            reason: "error sending request".to_string(),
+            next_retry_ms: 100,
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("100ms"), "expected 100ms in: {msg}");
+        assert!(
+            !msg.contains(" 0s"),
+            "must NOT render sub-second waits as '0s': {msg}"
+        );
+    }
+
+    #[test]
+    fn test_auth_transient_failure_shows_seconds_when_ge_1s() {
+        let event = NotificationEvent::AuthenticationTransientFailure {
+            attempt: 5,
+            reason: "dns hiccup".to_string(),
+            next_retry_ms: 3_500,
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("3.5s"), "expected 3.5s in: {msg}");
+    }
+
+    #[test]
+    fn test_auth_transient_failure_redacts_url_params() {
+        let event = NotificationEvent::AuthenticationTransientFailure {
+            attempt: 1,
+            reason: "request failed for https://auth.dhan.co/app/generateAccessToken?token=secret"
+                .to_string(),
+            next_retry_ms: 100,
+        };
+        let msg = event.to_message();
+        assert!(
+            !msg.contains("token=secret"),
+            "URL query params must be redacted: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_auth_failed_still_critical() {
+        // Final / permanent failure still fires Critical — that's the whole
+        // point of splitting the variants. If this flips to Low by accident,
+        // permanent auth death becomes silent.
+        let event = NotificationEvent::AuthenticationFailed {
+            reason: "PERMANENT: invalid pin".to_string(),
+        };
+        assert_eq!(event.severity(), Severity::Critical);
     }
 
     #[test]

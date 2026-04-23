@@ -1,3 +1,8 @@
 venv/
 __pycache__/
 *.pyc
+
+# Local-only variant with hardcoded credentials — NEVER commit.
+# Use this for one-shot manual runs when you don't want to fuss with env vars.
+# The tracked repro.py keeps env-var-only behaviour for CI/shared use.
+repro_local.py
