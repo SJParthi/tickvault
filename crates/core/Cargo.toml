@@ -50,6 +50,13 @@ proptest = { workspace = true }
 criterion = { workspace = true }
 dhat = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
+tracing-subscriber = { workspace = true }
+
+# Diagnostic example — isolates 200-depth disconnect root cause.
+# See .claude/plans/active-plan.md and scripts/dhan-200-depth-repro/.
+[[example]]
+name = "depth_200_variants"
+path = "examples/depth_200_variants.rs"
 
 [[bench]]
 name = "tick_parser"
