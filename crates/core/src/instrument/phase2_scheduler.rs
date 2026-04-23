@@ -88,6 +88,23 @@ pub const LTP_POLL_MS: u64 = 500;
 /// slowness tolerance before giving up for the day.
 pub const MAX_LTP_ATTEMPTS: u32 = 3;
 
+/// How long to sleep between attempts when the live-LTP fallback path
+/// produced an empty plan (2026-04-23 plan item): a fresh-clone boot
+/// at 12:23 PM IST typically runs Phase 2 ~12 seconds after boot, which
+/// is often NOT enough time for:
+///   1. Main WS to connect (~3-5s)
+///   2. Subscribe roundtrip for stock equities (~2-3s)
+///   3. First NSE_EQ ticks to arrive for the ~200 F&O underlyings
+///   4. `SharedStockLtps` map to populate
+///
+/// So when attempt 1 of the fallback produces an empty plan, we wait
+/// 20s for more ticks to stream in and retry. 3 attempts × 20s = up
+/// to 60s of tick-stream-up tolerance. If live LTPs never populate
+/// after 60s, something deeper is broken (main feed not streaming
+/// NSE_EQ, registry mapping bug, etc.) — give up and fire
+/// Phase2Failed so the operator sees it.
+pub const FALLBACK_EMPTY_PLAN_RETRY_DELAY_SECS: u64 = 20;
+
 /// Underlyings whose LTPs gate Phase 2 readiness.
 pub const GATING_INDEX_SYMBOLS: &[&str] = &["NIFTY", "BANKNIFTY"];
 
@@ -515,6 +532,12 @@ pub async fn run_phase2_scheduler(
             // Late-start live-LTP fallback diagnostics (2026-04-23).
             let mut diag_used_live_ltp_fallback = false;
             let mut diag_live_ltp_entries: usize = 0;
+            // 2026-04-23 retry follow-up: tracks whether the caller
+            // wired a SharedStockLtps Arc at all. When true and the
+            // preopen buffer is empty, we retry even if the map was
+            // empty on this attempt — ticks may have arrived between
+            // attempts.
+            let mut diag_live_ltps_wired = false;
             let (instruments, reference_prices) = match source.as_ref() {
                 Some(Phase2InstrumentsSource::Static(list)) => (list.clone(), BTreeMap::new()),
                 Some(Phase2InstrumentsSource::Dynamic {
@@ -543,6 +566,10 @@ pub async fn run_phase2_scheduler(
                     if diag_buffer_entries == 0
                         && let Some(ltps_arc) = live_stock_ltps.as_ref()
                     {
+                        // Wiring is present — eligible for retry even if the
+                        // map is empty on THIS attempt. Ticks may arrive
+                        // between attempts.
+                        diag_live_ltps_wired = true;
                         let live = ltps_arc.read().await;
                         diag_live_ltp_entries = live.len();
                         if diag_live_ltp_entries > 0 {
@@ -605,9 +632,43 @@ pub async fn run_phase2_scheduler(
             // Phase2Complete { added_count: 0 }. This is what the operator
             // saw at 09:11 IST 2026-04-22 — "Added 0" with no root cause.
             if instruments.is_empty() {
+                // 2026-04-23 late-start retry (follow-up to PR #329):
+                // retry when the preopen buffer was empty AND the
+                // caller wired a SharedStockLtps Arc — regardless of
+                // whether the map was ALSO empty on this attempt.
+                //
+                // Critical scenario from the 12:33 PM boot: app
+                // started 20s before Phase 2 ran, so live_stock_ltps
+                // had 0 entries at attempt 1 (no NSE_EQ ticks arrived
+                // yet). The previous gate (`diag_used_live_ltp_fallback`)
+                // was only true when the map was NON-empty, so we
+                // never retried in the one scenario retry was for.
+                //
+                // Do NOT retry when the preopen buffer was populated
+                // but still produced an empty plan — that's a real
+                // planner / universe bug, retrying won't help.
+                let should_retry =
+                    diag_live_ltps_wired && diag_buffer_entries == 0 && attempt < MAX_LTP_ATTEMPTS;
+                if should_retry {
+                    metrics::counter!("tv_phase2_live_ltp_fallback_empty_retry_total").increment(1);
+                    warn!(
+                        attempt,
+                        max_attempts = MAX_LTP_ATTEMPTS,
+                        live_ltp_entries = diag_live_ltp_entries,
+                        used_live_ltp_fallback = diag_used_live_ltp_fallback,
+                        delay_secs = FALLBACK_EMPTY_PLAN_RETRY_DELAY_SECS,
+                        "Phase 2: late-start empty plan — sleeping {FALLBACK_EMPTY_PLAN_RETRY_DELAY_SECS}s for more NSE_EQ ticks to arrive, then retrying"
+                    );
+                    tokio::time::sleep(Duration::from_secs(FALLBACK_EMPTY_PLAN_RETRY_DELAY_SECS))
+                        .await;
+                    continue;
+                }
+
                 let fallback_tag = if diag_used_live_ltp_fallback {
                     format!(
-                        " Live-LTP fallback was attempted ({diag_live_ltp_entries} entries) but still produced an empty plan — \
+                        " Live-LTP fallback was attempted ({diag_live_ltp_entries} entries) over \
+                         {attempt} attempts with {FALLBACK_EMPTY_PLAN_RETRY_DELAY_SECS}s between \
+                         each, but still produced an empty plan — \
                          check whether F&O underlyings streamed any NSE_EQ ticks this session."
                     )
                 } else if diag_buffer_entries == 0 {
@@ -1028,6 +1089,101 @@ mod tests {
         assert!(
             !GATING_INDEX_SYMBOLS.is_empty(),
             "must gate on at least one index"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Fallback empty-plan retry (2026-04-23 follow-up to PR #329)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn fallback_retry_delay_is_sensible() {
+        // Delay must be long enough for a full tick-stream-up cycle
+        // (WS connect + subscribe + first NSE_EQ ticks = ~10-15s
+        // typical), but short enough that the 3-attempt budget
+        // completes within ~1 min so we don't lose the session.
+        assert!(
+            FALLBACK_EMPTY_PLAN_RETRY_DELAY_SECS >= 10,
+            "delay must be ≥10s — any less and live_stock_ltps won't \
+             have time to populate between attempts"
+        );
+        assert!(
+            FALLBACK_EMPTY_PLAN_RETRY_DELAY_SECS <= 60,
+            "delay must be ≤60s — any more and the whole 3-attempt \
+             retry budget exceeds 3 min, which starts cutting into \
+             the 09:15 market-open window"
+        );
+        // Total retry budget (delays between attempts, not including
+        // the actual attempt time itself).
+        let total_delay = FALLBACK_EMPTY_PLAN_RETRY_DELAY_SECS
+            .saturating_mul(u64::from(MAX_LTP_ATTEMPTS.saturating_sub(1)));
+        assert!(
+            total_delay <= 120,
+            "3-attempt fallback retry budget must stay ≤ 2 min so \
+             Phase 2 still finishes in time for market open"
+        );
+    }
+
+    #[test]
+    fn fallback_retry_logic_is_wired_into_empty_plan_branch() {
+        // Source-scan ratchet: fails if the empty-plan branch ever
+        // loses the retry short-circuit. Without this guard, the
+        // scheduler regresses to the PR #329 behaviour where a late-
+        // start boot that hits Phase 2 before live_stock_ltps
+        // populates gives up after one attempt and loses stock F&O
+        // for the whole session.
+        let src = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/instrument/phase2_scheduler.rs"
+        ))
+        .expect("must read own source");
+
+        assert!(
+            src.contains("let should_retry = diag_live_ltps_wired"),
+            "late-start retry short-circuit was removed — empty-plan + \
+             wired-SharedStockLtps path must `continue` (sleep + retry) \
+             instead of `return Phase2Failed` when attempts remain"
+        );
+
+        assert!(
+            src.contains("tv_phase2_live_ltp_fallback_empty_retry_total"),
+            "fallback-retry counter was removed — ops loses visibility \
+             into how often the late-start retry actually kicks in"
+        );
+    }
+
+    #[test]
+    fn fallback_retry_does_not_fire_when_preopen_buffer_populated() {
+        // Guard: retry logic must be gated on `diag_buffer_entries == 0`
+        // AND the SharedStockLtps being wired. If the preopen buffer
+        // was populated but produced an empty plan (e.g. option chain
+        // mismatch), retrying won't help — that's a planner / universe
+        // bug and we should fail fast.
+        let src = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/instrument/phase2_scheduler.rs"
+        ))
+        .expect("must read own source");
+
+        // The `should_retry` predicate MUST be gated on
+        // `diag_live_ltps_wired` (not "used") and `diag_buffer_entries == 0`
+        // so it fires only on the late-start path — never when the
+        // preopen buffer WAS populated.
+        let marker = "let should_retry = diag_live_ltps_wired";
+        assert!(
+            src.contains(marker),
+            "retry gate regressed — `should_retry` must start with \
+             `diag_live_ltps_wired` so retry fires whenever the \
+             SharedStockLtps Arc is wired, NOT just when the map was \
+             non-empty on attempt 1 (which was the bug that prevented \
+             retry on first late-start boot)"
+        );
+        assert!(
+            src.contains("diag_buffer_entries == 0"),
+            "retry gate lost the `diag_buffer_entries == 0` conjunct — \
+             retry must NOT fire when the preopen buffer was populated \
+             but still produced an empty plan (that's a planner bug, \
+             not a timing issue)"
         );
     }
 
