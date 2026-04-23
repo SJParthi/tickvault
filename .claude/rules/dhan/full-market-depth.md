@@ -10,21 +10,29 @@
 
 2. **Two SEPARATE endpoints. Never mix them.**
    - 20-level: `wss://depth-api-feed.dhan.co/twentydepth?token=<TOKEN>&clientId=<CLIENT_ID>&authType=2`
-   - 200-level: `wss://full-depth-api.dhan.co/twohundreddepth?token=<TOKEN>&clientId=<CLIENT_ID>&authType=2`
+   - 200-level: `wss://full-depth-api.dhan.co/?token=<TOKEN>&clientId=<CLIENT_ID>&authType=2`
 
-   **MANDATORY per Dhan support (2026-04-10, Ticket #5519522):**
-   - **Path MUST be `/twohundreddepth`** on host `full-depth-api.dhan.co`.
-     Root path `/` (used by Python SDK) causes `Protocol(ResetWithoutClosingHandshake)`
-     within 3-5 seconds of subscription — the server actively resets the TCP
-     connection. **Do NOT fall back to the root path ever.**
+   **200-level is the ROOT path `/` — verified 2026-04-23 via Dhan Python SDK.**
+
+   On 2026-04-23 Parthiban ran Dhan's official Python SDK `dhanhq==2.2.0rc1`
+   on our account at SecurityId 72271 at depth 200. The SDK streamed 200-level
+   depth for 30+ minutes with zero disconnects using URL
+   `wss://full-depth-api.dhan.co/?token=...&clientId=...&authType=2` (ROOT
+   path `/`, NOT `/twohundreddepth`). Our Rust client at `/twohundreddepth`
+   (the path Dhan Ticket #5519522 had originally told us to use) kept
+   getting `Protocol(ResetWithoutClosingHandshake)` for 2+ weeks on the
+   same account. This reversal supersedes Ticket #5519522. If `/twohundreddepth`
+   ever needs to come back, re-open that ticket first and cite the response.
+
    - **Security ID MUST be close to current market price (ATM).** Far OTM
      contracts return zero consistent depth data even when the subscription
      succeeds — the server accepts but never streams. This is NOT a bug, it
      is by-design server-side filtering.
    - **Mechanical enforcement for 200-level subscriptions**:
-     1. URL builder MUST emit `/twohundreddepth` as the path — verified by
-        `test_twohundreddepth_uses_explicit_path` and banned-pattern scan
-        for `full-depth-api.dhan.co/?` (root path with no segment).
+     1. URL builder MUST emit ROOT path `/?token=...` — verified by
+        `test_two_hundred_depth_url_uses_root_path` in `depth_connection.rs`
+        and banned-pattern scanner category 4 which rejects any
+        `wss://full-depth-api.dhan.co/twohundreddepth` literal.
      2. Strike selector for 200-level subscriptions MUST use the ATM strike
         (index ±0, or max ±2 strikes for coverage). `DEEP_DEPTH_MAX_STRIKE_OFFSET`
         constant enforces this bound.

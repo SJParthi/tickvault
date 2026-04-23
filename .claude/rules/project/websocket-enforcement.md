@@ -59,13 +59,15 @@ paths:
       via `ReconnectionExhausted` and fires CRITICAL Telegram.
     - Raised from 20 on 2026-04-21 after all 4 depth-200 connections
       exhausted the 20-attempt budget during market hours.
-      Dhan TCP-reset the socket (`Protocol(ResetWithoutClosingHandshake)`)
-      despite the strikes being ATM — Parthiban verified against the
-      Python SDK which works on the same account with the same strikes.
-      The underlying Rust-side protocol bug is queued for investigation
-      in `.claude/queues/production-fixes-2026-04-21.md` (item I14).
-      The 20 → 60 raise is a tolerance bump only — it does NOT solve
-      the root cause.
+    - **Root cause FIXED 2026-04-23**: the `Protocol(ResetWithoutClosingHandshake)`
+      storm was caused by our Rust client using `/twohundreddepth` as the
+      200-depth URL path (per Dhan ticket #5519522 advice). Python SDK
+      verification on the same account showed root path `/` is the
+      actually-working URL. URL constant flipped to
+      `wss://full-depth-api.dhan.co` (no path — URL builder emits
+      `/?token=...`). Queue item I14 closed. See
+      `.claude/rules/dhan/full-market-depth.md` rule 2 for the full
+      reversal notes and test references.
 
 15. **Depth ATM selection uses real index LTP, not median or arbitrary.** See `depth-subscription.md`.
     - Boot: waits up to 30s for first index LTP from main WebSocket

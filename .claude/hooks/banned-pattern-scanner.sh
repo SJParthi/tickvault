@@ -246,16 +246,16 @@ scan_prod_code '"https://[a-zA-Z]' 'Hardcoded HTTPS URL — use config' "$STAGED
 # known-broken configuration that Dhan support explicitly told us NOT to
 # use. If you need to reintroduce one, open a new Dhan ticket first.
 
-# Ticket #5519522: 200-level depth root path (Python SDK style) causes
-# Protocol(ResetWithoutClosingHandshake) — tested and confirmed broken.
-# The ONLY working path is /twohundreddepth. Any literal of the root path
-# (closing `/` right before the query string or the closing quote) is a
-# regression.
-scan_prod_code '"wss://full-depth-api\.dhan\.co/"' \
-  'Dhan LOCKED FACT #5519522 — 200-depth MUST use /twohundreddepth, not root path' \
+# 2026-04-23 REVERSAL of Ticket #5519522: Python SDK `dhanhq==2.2.0rc1`
+# verified on our account that the ROOT path `/` is the working URL for
+# 200-depth at SecurityId 72271. The `/twohundreddepth` path (what the
+# ticket originally told us to use) caused Protocol(ResetWithoutClosingHandshake)
+# in our Rust client for 2+ weeks. Ban the old path so no one regresses.
+scan_prod_code '"wss://full-depth-api\.dhan\.co/twohundreddepth' \
+  'Dhan LOCKED FACT (Python SDK 2026-04-23) — 200-depth MUST use ROOT path /, not /twohundreddepth' \
   "$STAGED_FILES"
-scan_prod_code '"wss://full-depth-api\.dhan\.co/?' \
-  'Dhan LOCKED FACT #5519522 — 200-depth MUST use /twohundreddepth, not root path' \
+scan_prod_code 'DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL.*twohundreddepth' \
+  'Dhan LOCKED FACT (2026-04-23) — DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL must be ROOT path, not /twohundreddepth' \
   "$STAGED_FILES"
 
 # ─────────────────────────────────────────────
