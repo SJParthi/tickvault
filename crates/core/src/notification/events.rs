@@ -269,6 +269,19 @@ pub enum NotificationEvent {
     /// 20-level depth WebSocket disconnected.
     DepthTwentyDisconnected { underlying: String, reason: String },
 
+    /// 20-level depth WebSocket disconnected OUTSIDE market hours, OR with a
+    /// placeholder (SecurityId=0) subscription. Fires at `Severity::Low` so
+    /// the operator sees the event in Telegram but gets no SMS escalation.
+    ///
+    /// Rationale (Q5, 2026-04-23): a post-market boot cannot populate
+    /// `SharedSpotPrices` (main feed streams zero ticks after 15:30 IST),
+    /// so the ATM selector falls through to the "deferred" placeholder
+    /// (SecurityId=0). The depth connection then hits Dhan's TCP-reset
+    /// after 60 reconnect attempts and fires a `[HIGH]` disconnect alert
+    /// — which is exactly the anti-pattern we killed for the 15:45 IST
+    /// depth-stale-spot storm. Same rule as `WebSocketDisconnectedOffHours`.
+    DepthTwentyDisconnectedOffHours { underlying: String, reason: String },
+
     /// 20-level depth WebSocket reconnected after a transient disconnect.
     /// Fires on every successful reconnect, inside or outside market
     /// hours (Parthiban directive 2026-04-21 — full audit trail on all
@@ -286,6 +299,17 @@ pub enum NotificationEvent {
 
     /// 200-level depth WebSocket disconnected.
     DepthTwoHundredDisconnected {
+        contract: String,
+        security_id: u32,
+        reason: String,
+    },
+
+    /// 200-level depth disconnected OUTSIDE market hours, OR with a
+    /// placeholder (SecurityId=0) subscription. Fires at `Severity::Low` so
+    /// a post-market boot storm (4× contracts × 60 reconnect attempts)
+    /// doesn't escalate to SMS. See [`Self::DepthTwentyDisconnectedOffHours`]
+    /// for the full rationale — same rule, 200-level variant.
+    DepthTwoHundredDisconnectedOffHours {
         contract: String,
         security_id: u32,
         reason: String,
@@ -927,6 +951,11 @@ impl NotificationEvent {
             Self::DepthTwentyDisconnected { underlying, reason } => {
                 format!("<b>Depth 20-level DISCONNECTED</b>\nUnderlying: {underlying}\n{reason}")
             }
+            Self::DepthTwentyDisconnectedOffHours { underlying, reason } => {
+                format!(
+                    "<b>Depth 20-level disconnected (off-hours / no-data)</b>\nUnderlying: {underlying}\n{reason}"
+                )
+            }
             Self::DepthTwentyReconnected { underlying } => {
                 format!("<b>Depth 20-level reconnected</b>\nUnderlying: {underlying}")
             }
@@ -945,6 +974,15 @@ impl NotificationEvent {
             } => {
                 format!(
                     "<b>Depth 200-level DISCONNECTED</b>\nContract: {contract}\nSecurityId: {security_id}\n{reason}"
+                )
+            }
+            Self::DepthTwoHundredDisconnectedOffHours {
+                contract,
+                security_id,
+                reason,
+            } => {
+                format!(
+                    "<b>Depth 200-level disconnected (off-hours / no-data)</b>\nContract: {contract}\nSecurityId: {security_id}\n{reason}"
                 )
             }
             Self::DepthTwoHundredReconnected {
@@ -1337,8 +1375,10 @@ impl NotificationEvent {
             Self::QuestDbReconnected { .. } => Severity::Medium,
             Self::WebSocketReconnected { .. } => Severity::Medium,
             Self::DepthTwentyDisconnected { .. } => Severity::High,
+            Self::DepthTwentyDisconnectedOffHours { .. } => Severity::Low,
             Self::DepthTwentyReconnected { .. } => Severity::Medium,
             Self::DepthTwoHundredDisconnected { .. } => Severity::High,
+            Self::DepthTwoHundredDisconnectedOffHours { .. } => Severity::Low,
             Self::DepthTwoHundredReconnected { .. } => Severity::Medium,
             Self::OrderUpdateDisconnected { .. } => Severity::High,
             Self::OrderUpdateReconnected { .. } => Severity::Medium,
@@ -1493,6 +1533,76 @@ mod tests {
             !msg.contains("token=secret"),
             "URL query params must be redacted: {msg}"
         );
+    }
+
+    // Q5 regression pins (2026-04-23): post-market depth disconnects fire
+    // Low, not High. A boot at 18:05 IST with 4× [HIGH] depth-200 alerts
+    // (all SecurityId=0, contracts labeled "*-deferred") was pure Telegram
+    // noise because no live spot LTP arrived after 15:30 IST to populate
+    // the ATM selector. These pins enforce the Low routing.
+
+    #[test]
+    fn test_depth_20_disconnected_off_hours_is_low() {
+        let event = NotificationEvent::DepthTwentyDisconnectedOffHours {
+            underlying: "NIFTY".to_string(),
+            reason: "Reconnection failed after 20 attempts".to_string(),
+        };
+        assert_eq!(
+            event.severity(),
+            Severity::Low,
+            "post-market depth-20 disconnect must be Low to avoid SMS escalation"
+        );
+    }
+
+    #[test]
+    fn test_depth_200_disconnected_off_hours_is_low() {
+        let event = NotificationEvent::DepthTwoHundredDisconnectedOffHours {
+            contract: "NIFTY-PE-deferred".to_string(),
+            security_id: 0,
+            reason: "Reconnection failed after 60 attempts".to_string(),
+        };
+        assert_eq!(
+            event.severity(),
+            Severity::Low,
+            "post-market / SID=0 depth-200 disconnect must be Low"
+        );
+    }
+
+    #[test]
+    fn test_depth_20_disconnected_in_hours_still_high() {
+        // Severity-flip guard: a real in-market-hours disconnect must
+        // stay High so the operator gets SMS. If this ever flips to Low
+        // by accident, we'd go silent on real outages.
+        let event = NotificationEvent::DepthTwentyDisconnected {
+            underlying: "NIFTY".to_string(),
+            reason: "Dhan TCP reset".to_string(),
+        };
+        assert_eq!(event.severity(), Severity::High);
+    }
+
+    #[test]
+    fn test_depth_200_disconnected_in_hours_still_high() {
+        let event = NotificationEvent::DepthTwoHundredDisconnected {
+            contract: "NIFTY-Jun2026-25650-CE".to_string(),
+            security_id: 72271,
+            reason: "Dhan TCP reset".to_string(),
+        };
+        assert_eq!(event.severity(), Severity::High);
+    }
+
+    #[test]
+    fn test_depth_200_disconnected_off_hours_message_mentions_off_hours() {
+        let event = NotificationEvent::DepthTwoHundredDisconnectedOffHours {
+            contract: "BANKNIFTY-CE-deferred".to_string(),
+            security_id: 0,
+            reason: "no reason".to_string(),
+        };
+        let msg = event.to_message();
+        assert!(
+            msg.contains("off-hours") || msg.contains("no-data"),
+            "message must distinguish off-hours variant: {msg}"
+        );
+        assert!(msg.contains("BANKNIFTY-CE-deferred"));
     }
 
     #[test]
