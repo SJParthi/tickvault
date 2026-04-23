@@ -246,17 +246,17 @@ pub fn format_cross_match_details_grouped(details: &[CrossMatchMismatch]) -> Vec
             ts = short_ts(&d.timestamp_ist),
         )
     };
+    // Label every field delta with explicit `hist=`/`live=` prefixes so the
+    // operator never has to guess which side of the arrow is which. Q4
+    // (2026-04-23): the previous `X.XX → Y.YY` arrow format hid whether
+    // the left or right value was historical, and there was no legend in
+    // the message header. `format_field_delta_line` already emits the
+    // labelled form — wire it into the grouped renderer.
     let row_value_diff = |d: &CrossMatchMismatch| -> String {
         let diff_desc = if !d.field_deltas.is_empty() {
             d.field_deltas
                 .iter()
-                .map(|f| {
-                    if f.is_integer {
-                        format!("{}: {} → {}", f.field, f.hist as i64, f.live as i64)
-                    } else {
-                        format!("{}: {:.2} → {:.2}", f.field, f.hist, f.live)
-                    }
-                })
+                .map(format_field_delta_line)
                 .collect::<Vec<_>>()
                 .join(" | ")
         } else {
@@ -874,6 +874,65 @@ mod tests {
             diff_summary: String::new(),
             field_deltas: Vec::new(),
         }
+    }
+
+    /// Q4 regression (2026-04-23): the grouped formatter must render each
+    /// differing field with explicit `hist=X live=Y` labels plus a signed
+    /// delta, not the ambiguous `X → Y` arrow that hid which side was
+    /// historical vs live. Operator complaint: "how will i know which one
+    /// is historical vs which one is live dude?" — this test pins the fix.
+    #[test]
+    fn test_format_cross_match_details_value_diff_has_hist_live_labels() {
+        use tickvault_core::historical::cross_verify::FieldDelta;
+
+        let details = vec![CrossMatchMismatch {
+            symbol: "RELIANCE".to_string(),
+            segment: "NSE_EQ".to_string(),
+            timeframe: "1m".to_string(),
+            timestamp_ist: "2026-04-23T10:15:00.000000Z".to_string(),
+            mismatch_type: "value_diff".to_string(),
+            hist_values: String::new(),
+            live_values: String::new(),
+            diff_summary: String::new(),
+            field_deltas: vec![
+                FieldDelta {
+                    field: "open".to_string(),
+                    hist: 2847.50,
+                    live: 2847.00,
+                    delta: -0.50,
+                    is_integer: false,
+                },
+                FieldDelta {
+                    field: "volume".to_string(),
+                    hist: 5_000_000.0,
+                    live: 4_999_800.0,
+                    delta: -200.0,
+                    is_integer: true,
+                },
+            ],
+        }];
+
+        let joined = format_cross_match_details_grouped(&details).join("\n");
+
+        // Every field delta must carry explicit `hist=` and `live=` labels.
+        assert!(
+            joined.contains("hist=2847.50") && joined.contains("live=2847.00"),
+            "open must render with labels, got: {joined}"
+        );
+        assert!(
+            joined.contains("hist=5000000") && joined.contains("live=4999800"),
+            "volume must render with labels, got: {joined}"
+        );
+        // Δ delta must appear so operator sees direction + magnitude at a glance.
+        assert!(
+            joined.contains("\u{0394}="),
+            "must include \u{0394}= prefix"
+        );
+        // The old ambiguous `X → Y` arrow MUST NOT appear for value_diff rows.
+        assert!(
+            !joined.contains("2847.50 \u{2192} 2847.00"),
+            "ambiguous arrow format must be gone, got: {joined}"
+        );
     }
 
     #[test]
