@@ -21,6 +21,39 @@ paths:
 > so that in the future again and again i cant come up with same
 > issues scenarios bugs".
 
+## 2026-04-23 Addendum — 200-depth disconnect root cause FIXED
+
+For 2+ weeks our Rust client had been TCP-reset by Dhan on every
+200-depth subscribe (`Protocol(ResetWithoutClosingHandshake)`).
+On 2026-04-23 Parthiban ran Dhan's official Python SDK
+`dhanhq==2.2.0rc1` on the same account + same token + same
+SecurityId 72271 — the SDK streamed 200-depth successfully for
+30+ minutes using URL `wss://full-depth-api.dhan.co/?token=...`
+(ROOT path `/`, NOT `/twohundreddepth` as ticket #5519522 had
+told us).
+
+Fix (this branch `claude/hardcode-dhan-api-7rgQC`):
+- `DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL` → `wss://full-depth-api.dhan.co`
+- URL builder in `depth_connection.rs` now emits `/?token=...`
+- Tests in `depth_connection.rs`, `dhan_api_coverage.rs`,
+  `dhan_locked_facts.rs` all updated to assert the root path.
+- Banned-pattern hook category 4 inverted: now rejects
+  `wss://full-depth-api.dhan.co/twohundreddepth` literal.
+- Rule 2 of `full-market-depth.md` rewritten with the 2026-04-23
+  Python SDK verification as the new source of truth.
+- `websocket-enforcement.md` rule 14 marks the Rust-side bug FIXED.
+
+**Lesson:** a Dhan support ticket response is NOT infallible ground
+truth. When the Python SDK (also from Dhan) contradicts the ticket's
+advice, the SDK wins — it's what Dhan's own engineers ship and use.
+Live-test both whenever a ticket prescribes a non-obvious config.
+
+Diagnostic tooling kept in the branch for future regressions:
+- `crates/core/examples/depth_200_variants.rs` — 8-variant matrix
+- `scripts/dhan-200-depth-repro/` — Python SDK baseline + analyze script
+- `docs/dhan-support/2026-04-24-depth-200-variant-test-results.md`
+  — template for the next escalation email if this regresses.
+
 ## Timeline of 2026-04-17 session
 
 1. **Morning** — QuestDB showed NIFTY IDX_I ticks never arrived.

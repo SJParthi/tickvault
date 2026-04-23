@@ -31,26 +31,25 @@ use tickvault_common::constants::{
 // Reference: .claude/rules/dhan/full-market-depth.md rule 2
 // ===========================================================================
 
-/// Ticket #5519522: the 200-level depth WebSocket MUST use the explicit
-/// `/twohundreddepth` path on host `full-depth-api.dhan.co`. Root path `/`
-/// (as the Python SDK uses) causes `Protocol(ResetWithoutClosingHandshake)`
-/// within 3-5 seconds of subscription. This fact cost us multiple production
-/// trading sessions before the ticket resolution. Do not revert.
+/// 2026-04-23 REVERSAL of ticket #5519522: the 200-level depth WebSocket
+/// uses the ROOT path `/` on host `full-depth-api.dhan.co`. Verified by
+/// running Dhan's official Python SDK `dhanhq==2.2.0rc1` on our account at
+/// SecurityId 72271 — SDK streamed 30+ minutes on root path, while our Rust
+/// client at `/twohundreddepth` had been getting
+/// `Protocol(ResetWithoutClosingHandshake)` for 2+ weeks. This test now
+/// guards the REVERSED invariant — if you ever need to switch back to
+/// `/twohundreddepth`, re-open ticket #5519522 and cite the response.
 #[test]
-fn locked_ticket_5519522_twohundreddepth_path() {
+fn locked_200_depth_uses_root_path_verified_2026_04_23() {
     assert_eq!(
-        DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL, "wss://full-depth-api.dhan.co/twohundreddepth",
-        "LOCKED FACT (Ticket #5519522): 200-depth URL MUST be /twohundreddepth. \
-         Root path causes TCP reset. If you need to change this, open a new \
-         Dhan support ticket first and cite the response here."
+        DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL, "wss://full-depth-api.dhan.co",
+        "LOCKED FACT (Python SDK 2026-04-23): 200-depth URL uses ROOT path. \
+         The /twohundreddepth path that ticket #5519522 had advised caused \
+         TCP resets in our Rust client. To revert, open a new Dhan ticket."
     );
     assert!(
-        !DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL.ends_with(".dhan.co/"),
-        "LOCKED FACT (Ticket #5519522): 200-depth URL must NOT use root path"
-    );
-    assert!(
-        DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL.contains("/twohundreddepth"),
-        "LOCKED FACT (Ticket #5519522): /twohundreddepth is the ONLY working path"
+        !DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL.contains("/twohundreddepth"),
+        "LOCKED FACT: 200-depth URL must NOT use /twohundreddepth (reversed 2026-04-23)"
     );
 }
 
@@ -192,19 +191,26 @@ fn locked_rule_file_cites_ticket_5525125() {
     );
 }
 
-/// Ensures the `full-market-depth.md` rule file still contains the Ticket
-/// #5519522 citation with the correct `/twohundreddepth` path.
+/// Ensures `full-market-depth.md` documents the 2026-04-23 reversal of
+/// ticket #5519522 — root path is the working URL, NOT `/twohundreddepth`.
+/// The file must cite the Python SDK verification so anyone reading it in
+/// the future understands why the original ticket advice was dropped.
 #[test]
-fn locked_rule_file_cites_ticket_5519522() {
+fn locked_rule_file_documents_2026_04_23_reversal() {
     let rule_file = include_str!("../../../.claude/rules/dhan/full-market-depth.md");
     assert!(
         rule_file.contains("Ticket #5519522"),
         "LOCKED FACT: full-market-depth.md must cite Dhan Ticket #5519522"
     );
     assert!(
-        rule_file.contains("/twohundreddepth"),
-        "LOCKED FACT: full-market-depth.md must document /twohundreddepth \
-         as the ONLY working 200-level depth path"
+        rule_file.contains("2026-04-23"),
+        "LOCKED FACT: full-market-depth.md must document the 2026-04-23 \
+         Python SDK verification of root path"
+    );
+    assert!(
+        rule_file.contains("Python SDK") || rule_file.contains("dhanhq"),
+        "LOCKED FACT: full-market-depth.md must cite the Python SDK \
+         as the source of truth for 200-depth root path"
     );
     assert!(
         rule_file.contains("ATM") || rule_file.contains("at-the-money"),
@@ -219,29 +225,32 @@ fn locked_rule_file_cites_ticket_5519522() {
 // they represent reverted or known-broken configurations.
 // ===========================================================================
 
-/// The Python-SDK root path for 200-level depth (`full-depth-api.dhan.co/`
-/// immediately followed by `?` or `"`) must NOT appear anywhere in
-/// `crates/common/src/constants.rs` or `crates/core/src/websocket/`. If it
-/// does, someone reverted the ticket fix.
+/// Reversed 2026-04-23: the `/twohundreddepth` path for 200-level depth
+/// (what Dhan ticket #5519522 originally told us to use) must NOT appear
+/// on any non-comment line of `crates/common/src/constants.rs`. Python SDK
+/// verified 2026-04-23 that root path `/` is the actually-working URL.
 ///
-/// This scan is deliberately crude — it trips on any suspicious literal, not
-/// just the exact byte pattern. False positives are recoverable (you rename
-/// the variable or add a `// LOCKED FACT` comment); false negatives would
-/// lose the Dhan fix.
+/// This scan is deliberately crude — it trips on any suspicious literal,
+/// not just the exact byte pattern. False positives are recoverable (you
+/// rename the variable or add a `// LOCKED FACT` comment); false negatives
+/// would drop us back into the 2-week TCP-reset loop.
 #[test]
-fn locked_no_root_path_for_200_depth_in_source() {
+fn locked_no_twohundreddepth_path_in_200_depth_url_source() {
     let constants = include_str!("../src/constants.rs");
-    // The sanctioned constant line contains `/twohundreddepth`. Anything else
-    // on `full-depth-api.dhan.co/` is suspicious.
     for (idx, line) in constants.lines().enumerate() {
-        if line.contains("full-depth-api.dhan.co/") && !line.contains("/twohundreddepth") {
-            // Allowed: comments citing the old path for context. Require an
-            // explicit // LOCKED FACT citation if someone needs to mention it.
+        // Only scan lines that mention full-depth-api.dhan.co — i.e. the
+        // 200-depth URL assignment line. 20-depth uses a different host
+        // (depth-api-feed.dhan.co), so we do NOT trip on its /twentydepth.
+        if line.contains("full-depth-api.dhan.co") && line.contains("/twohundreddepth") {
+            // Allowed: comments citing the old path for historical context.
+            // Require an explicit // LOCKED FACT citation if someone needs
+            // to mention it.
             if !line.contains("LOCKED FACT") && !line.trim_start().starts_with("//") {
                 panic!(
-                    "LOCKED FACT VIOLATION at constants.rs:{}: line contains \
-                     'full-depth-api.dhan.co/' without '/twohundreddepth' — \
-                     did you revert Ticket #5519522?\nLine: {line}",
+                    "LOCKED FACT VIOLATION at constants.rs:{}: 200-depth URL \
+                     contains '/twohundreddepth' — did you revert the 2026-04-23 \
+                     Python-SDK-verified root-path fix? Re-open Dhan ticket \
+                     #5519522 if this path really needs to come back.\nLine: {line}",
                     idx + 1
                 );
             }

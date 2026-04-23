@@ -2,7 +2,8 @@
 //!
 //! Separate connections from the Live Market Feed. Connect to:
 //! - 20-level: `wss://depth-api-feed.dhan.co/twentydepth`
-//! - 200-level: `wss://full-depth-api.dhan.co/twohundreddepth` (confirmed by Dhan Ticket #5519522)
+//! - 200-level: `wss://full-depth-api.dhan.co/` (root path; Python SDK verified 2026-04-23 —
+//!   reverses Dhan ticket #5519522's earlier `/twohundreddepth` advice)
 //!
 //! Frames are sent to the same `mpsc::Sender<Bytes>` channel as the main feed,
 //! so the tick processor handles dispatch via `dispatch_deep_depth_frame()`.
@@ -681,7 +682,8 @@ async fn connect_and_run_depth(
 
 /// Runs a 200-level depth WebSocket connection for a SINGLE instrument.
 ///
-/// Connects to `wss://full-depth-api.dhan.co/twohundreddepth` (Dhan Ticket #5519522).
+/// Connects to `wss://full-depth-api.dhan.co/` (root path — Python SDK verified
+/// 2026-04-23, reverses Dhan ticket #5519522's earlier `/twohundreddepth` advice).
 /// Only 1 instrument per connection (Dhan limitation).
 /// Infinite reconnection with exponential backoff.
 #[allow(clippy::too_many_arguments)] // APPROVED: STAGE-C added wal_spill param + 2026-04-21 notifier
@@ -823,8 +825,9 @@ pub async fn run_two_hundred_depth_connection(
                 }
 
                 // Log policy — reduces noise during transient Dhan-side
-                // resets (e.g. 200-level `/twohundreddepth` TCP resets per
-                // Ticket #5519522/#5543510) while preserving escalation.
+                // resets (e.g. 200-level TCP resets per Ticket #5519522/#5543510,
+                // fixed 2026-04-23 by switching from `/twohundreddepth` to root path)
+                // while preserving escalation.
                 //
                 // * attempt == 0          → WARN  (first failure is visible)
                 // * attempt == 1..=9      → DEBUG (silent during brief backoff)
@@ -890,10 +893,12 @@ async fn connect_and_run_200_depth(
     }
 
     let access_token = token_state.access_token().expose_secret().to_string();
-    // 200-level URL: /twohundreddepth path confirmed by Dhan support (Ticket #5519522).
+    // 200-level URL: ROOT path / — verified 2026-04-23 via Dhan Python SDK
+    // `dhanhq==2.2.0rc1` on our account at SecurityId 72271. Replaces the
+    // `/twohundreddepth` path Dhan ticket #5519522 had advised.
     let base = DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL.trim_end_matches('/');
     let authenticated_url = zeroize::Zeroizing::new(format!(
-        "{base}?token={access_token}&clientId={client_id}&authType={WEBSOCKET_AUTH_TYPE}",
+        "{base}/?token={access_token}&clientId={client_id}&authType={WEBSOCKET_AUTH_TYPE}",
     ));
 
     let request = authenticated_url
@@ -1359,10 +1364,12 @@ mod tests {
 
     #[test]
     fn test_two_hundred_depth_ws_url_correct() {
-        // Dhan support confirmed /twohundreddepth path (Ticket #5519522, 2026-04-10)
+        // 2026-04-23: Python SDK `dhanhq==2.2.0rc1` verified root path `/` is the
+        // working URL for 200-depth. Reverses Dhan ticket #5519522 which had
+        // told us to use `/twohundreddepth` (caused ResetWithoutClosingHandshake).
         assert_eq!(
             DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL,
-            "wss://full-depth-api.dhan.co/twohundreddepth"
+            "wss://full-depth-api.dhan.co"
         );
     }
 
@@ -1553,18 +1560,20 @@ mod tests {
     }
 
     #[test]
-    fn test_two_hundred_depth_url_uses_twohundreddepth_path() {
-        // Dhan support confirmed /twohundreddepth (Ticket #5519522, 2026-04-10).
-        // Root path / caused ResetWithoutClosingHandshake.
+    fn test_two_hundred_depth_url_uses_root_path() {
+        // 2026-04-23: Python SDK `dhanhq==2.2.0rc1` verified root path `/` is the
+        // working URL. `/twohundreddepth` kept TCP-resetting our Rust client
+        // for 2+ weeks. The URL builder now explicitly emits `/?token=...` so
+        // the resulting URL matches the Python SDK output exactly.
         let base = DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL.trim_end_matches('/');
-        let url = format!("{base}?token=TEST&clientId=TEST&authType=2",);
+        let url = format!("{base}/?token=TEST&clientId=TEST&authType=2",);
         assert!(
-            url.contains("twohundreddepth?token="),
-            "200-level must use /twohundreddepth path: {url}"
+            url.starts_with("wss://full-depth-api.dhan.co/?token="),
+            "200-level must use root path: {url}"
         );
         assert!(
-            !url.contains("twohundreddepth/?"),
-            "must NOT have spurious / before query string: {url}"
+            !url.contains("/twohundreddepth"),
+            "must NOT contain the old /twohundreddepth path: {url}"
         );
     }
 

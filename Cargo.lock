@@ -3931,6 +3931,7 @@ dependencies = [
  "tokio-tungstenite 0.29.0",
  "totp-rs",
  "tracing",
+ "tracing-subscriber",
  "zerocopy",
  "zeroize",
 ]
