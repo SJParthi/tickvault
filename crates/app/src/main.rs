@@ -2895,7 +2895,7 @@ async fn main() -> Result<()> {
                                     depth200_token,
                                     depth200_client_id,
                                     depth200_segment,
-                                    depth200_sid,
+                                    Some(depth200_sid),
                                     depth200_label,
                                     tx200,
                                     Some(d200_signal_tx),

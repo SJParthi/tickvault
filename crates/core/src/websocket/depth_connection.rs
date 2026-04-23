@@ -156,25 +156,44 @@ pub async fn run_twenty_depth_connection(
     mut cmd_rx: mpsc::Receiver<DepthCommand>,
     notifier: Option<Arc<crate::notification::NotificationService>>,
 ) -> Result<(), WebSocketError> {
-    if instruments.is_empty() {
-        info!("20-level depth: no instruments to subscribe — skipping");
-        return Ok(());
-    }
-
+    // Plan item B (2026-04-23): empty `instruments` is NO LONGER an early-
+    // exit path. Under the unified 09:12 close flow, boot callers pass an
+    // empty list intentionally; the connection opens idle (socket up,
+    // authenticated, no subscribe sent) and waits for a
+    // `DepthCommand::InitialSubscribe20` from the 09:13 dispatcher before
+    // it starts streaming. `subscription_messages` being empty is the
+    // sentinel — see `connect_and_run_depth` which sends only when the
+    // slice is non-empty.
     let instrument_count = instruments.len().min(DEPTH_SUBSCRIPTION_BATCH_SIZE);
     let prefix = format!("{DEPTH_CONNECTION_PREFIX}-{underlying_label}"); // O(1) EXEMPT: boot-time
 
-    info!(
-        instrument_count,
-        underlying = %underlying_label,
-        "starting 20-level depth WebSocket connection"
-    );
+    if instrument_count == 0 {
+        info!(
+            underlying = %underlying_label,
+            "{prefix}: starting 20-level depth in DEFERRED mode — awaiting InitialSubscribe20 from 09:13 dispatcher"
+        );
+    } else {
+        info!(
+            instrument_count,
+            underlying = %underlying_label,
+            "starting 20-level depth WebSocket connection"
+        );
+    }
 
-    // Pre-build subscription messages (reused across reconnects).
-    let subscription_messages = build_twenty_depth_subscription_messages(
-        &instruments[..instrument_count],
-        DEPTH_SUBSCRIPTION_BATCH_SIZE,
-    );
+    // Pre-build subscription messages (reused across reconnects). Empty
+    // slice when deferred — the connect loop treats empty as "skip the
+    // initial subscribe step" and relies on InitialSubscribe20 to kick
+    // in via the command channel.
+    // Deferred-mode empty Vec is allocated once per depth connection at
+    // boot (4 connections total across NIFTY/BANKNIFTY/FINNIFTY/MIDCPNIFTY).
+    let subscription_messages: Vec<String> = if instrument_count == 0 {
+        Vec::new() // O(1) EXEMPT: boot-time deferred-mode empty sentinel
+    } else {
+        build_twenty_depth_subscription_messages(
+            &instruments[..instrument_count],
+            DEPTH_SUBSCRIPTION_BATCH_SIZE,
+        )
+    };
 
     let reconnect_counter = AtomicU64::new(0);
     // O(1) EXEMPT: metric handle created once at boot, not per tick
@@ -352,14 +371,25 @@ async fn connect_and_run_depth(
             source: err,
         })?;
 
-    info!(
-        instrument_count,
-        "{prefix}: connected — sending subscriptions"
-    );
+    if subscription_messages.is_empty() {
+        // Plan item B (2026-04-23): deferred mode — connection is up but no
+        // subscribe has been sent. The 09:13 dispatcher will send an
+        // `InitialSubscribe20` via the command channel once the 09:12 close
+        // is available. Until then, Dhan's 10s server pings keep the
+        // socket alive and the watchdog quiet.
+        info!(
+            "{prefix}: connected in DEFERRED mode — no subscribe sent, awaiting InitialSubscribe20"
+        );
+    } else {
+        info!(
+            instrument_count,
+            "{prefix}: connected — sending subscriptions"
+        );
+    }
 
     let (mut write, mut read) = ws_stream.split();
 
-    // Send subscription messages
+    // Send subscription messages (empty slice in deferred mode = no-op).
     for msg in subscription_messages {
         write
             .send(Message::Text(msg.clone().into()))
@@ -371,11 +401,13 @@ async fn connect_and_run_depth(
         debug!("{prefix}: subscription sent");
     }
 
-    info!(
-        instrument_count,
-        subscription_count = subscription_messages.len(),
-        "{prefix}: all subscriptions sent — reading depth frames"
-    );
+    if !subscription_messages.is_empty() {
+        info!(
+            instrument_count,
+            subscription_count = subscription_messages.len(),
+            "{prefix}: all subscriptions sent — reading depth frames"
+        );
+    }
 
     // Metrics — labeled per underlying so Grafana can distinguish connections.
     let m_frames = metrics::counter!("tv_depth_20lvl_frames_total", "underlying" => underlying_label.to_string());
@@ -658,7 +690,7 @@ pub async fn run_two_hundred_depth_connection(
     token_handle: TokenHandle,
     client_id: String,
     exchange_segment: ExchangeSegment,
-    security_id: u32,
+    security_id: Option<u32>,
     label: String,
     frame_sender: mpsc::Sender<Bytes>,
     connected_signal: Option<tokio::sync::oneshot::Sender<()>>,
@@ -667,22 +699,46 @@ pub async fn run_two_hundred_depth_connection(
     notifier: Option<Arc<crate::notification::NotificationService>>,
 ) -> Result<(), WebSocketError> {
     let segment_str = exchange_segment.as_str();
-    let sid_str = security_id.to_string(); // O(1) EXEMPT: boot-time
 
-    // 200-level uses flat JSON (no InstrumentList array)
-    let subscribe_msg = serde_json::json!({
-        "RequestCode": 23,
-        "ExchangeSegment": segment_str,
-        "SecurityId": sid_str,
-    })
-    .to_string(); // O(1) EXEMPT: boot-time
+    // Plan item B (2026-04-23): `security_id == None` = deferred mode.
+    // Connect idle, skip sending initial subscribe; wait for
+    // `DepthCommand::InitialSubscribe200` from the 09:13 dispatcher.
+    // Internal code below carries `u32` with 0 as the "unassigned"
+    // sentinel — callers must never pass `Some(0)` because the
+    // SubscribeRequest JSON `"SecurityId":"0"` would be rejected by
+    // Dhan. The inner `connect_and_run_200_depth` treats an empty
+    // `subscribe_msg` as a no-op for the initial subscribe step.
+    let deferred = security_id.is_none();
+    let security_id: u32 = security_id.unwrap_or(0);
+    // Deferred-mode empty String is allocated once per 200-level depth
+    // connection at boot (max 4 — NIFTY CE/PE + BANKNIFTY CE/PE).
+    let subscribe_msg: String = if deferred {
+        String::new() // O(1) EXEMPT: boot-time deferred-mode empty sentinel
+    } else {
+        let sid_str = security_id.to_string(); // O(1) EXEMPT: boot-time
+        // 200-level uses flat JSON (no InstrumentList array)
+        serde_json::json!({
+            "RequestCode": 23,
+            "ExchangeSegment": segment_str,
+            "SecurityId": sid_str,
+        })
+        .to_string() // O(1) EXEMPT: boot-time
+    };
 
-    info!(
-        label,
-        security_id,
-        segment = segment_str,
-        "starting 200-level depth WebSocket connection"
-    );
+    if deferred {
+        info!(
+            label,
+            segment = segment_str,
+            "starting 200-level depth WebSocket connection in DEFERRED mode — awaiting InitialSubscribe200"
+        );
+    } else {
+        info!(
+            label,
+            security_id,
+            segment = segment_str,
+            "starting 200-level depth WebSocket connection"
+        );
+    }
 
     let reconnect_counter = AtomicU64::new(0);
     let prefix = format!("depth-200lvl-{label}"); // O(1) EXEMPT: boot-time
@@ -870,27 +926,42 @@ async fn connect_and_run_200_depth(
             source: err,
         })?;
 
-    info!(
-        security_id,
-        label = %label,
-        "{prefix}: connected — sending subscription"
-    );
+    if subscribe_msg.is_empty() {
+        // Plan item B (2026-04-23): deferred mode — socket authenticated
+        // but no subscribe sent. `InitialSubscribe200` via `cmd_rx` will
+        // kick in at 09:12:30 IST. Dhan's 10s server pings keep the
+        // watchdog quiet in the meantime. `security_id` is the 0 sentinel
+        // passed by the outer `run_two_hundred_depth_connection` when the
+        // caller supplies `None`.
+        info!(
+            label = %label,
+            "{prefix}: connected in DEFERRED mode — no subscribe sent, awaiting InitialSubscribe200"
+        );
+    } else {
+        info!(
+            security_id,
+            label = %label,
+            "{prefix}: connected — sending subscription"
+        );
+    }
 
     let (mut write, mut read) = ws_stream.split();
 
-    write
-        .send(Message::Text(subscribe_msg.to_string().into()))
-        .await
-        .map_err(|err| WebSocketError::ConnectionFailed {
-            url: DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL.to_string(),
-            source: err,
-        })?;
+    if !subscribe_msg.is_empty() {
+        write
+            .send(Message::Text(subscribe_msg.to_string().into()))
+            .await
+            .map_err(|err| WebSocketError::ConnectionFailed {
+                url: DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL.to_string(),
+                source: err,
+            })?;
 
-    info!(
-        security_id,
-        label = %label,
-        "{prefix}: subscription sent — reading 200-level depth frames"
-    );
+        info!(
+            security_id,
+            label = %label,
+            "{prefix}: subscription sent — reading 200-level depth frames"
+        );
+    }
 
     // Metrics — labeled per underlying for Grafana differentiation.
     let m_frames =
@@ -908,7 +979,14 @@ async fn connect_and_run_200_depth(
     // points directly at the dead contract.
     let activity_counter = Arc::new(AtomicU64::new(0));
     let watchdog_notify = Arc::new(tokio::sync::Notify::new());
-    let watchdog_label = format!("depth-200-{label}-sid{security_id}"); // O(1) EXEMPT: one alloc per connect cycle
+    // Plan item B (2026-04-23): `security_id == 0` = DEFERRED sentinel
+    // (outer caller passed `None`). Label differentiates so a fired
+    // watchdog alert is unambiguous about what hasn't been subscribed.
+    let watchdog_label = if security_id == 0 {
+        format!("depth-200-{label}-deferred") // O(1) EXEMPT: one alloc per connect cycle
+    } else {
+        format!("depth-200-{label}-sid{security_id}") // O(1) EXEMPT: one alloc per connect cycle
+    };
     let watchdog = ActivityWatchdog::new(
         watchdog_label.clone(),
         Arc::clone(&activity_counter),
@@ -1186,13 +1264,21 @@ mod tests {
         assert_eq!(delay_6, 30000); // 500 * 64 = 32000, capped at 30000
     }
 
+    /// Plan item B (2026-04-23): verifies that empty `instruments` is NO
+    /// LONGER an early-exit `Ok(())` path — the connection function
+    /// attempts to enter the connect loop so it can wait for
+    /// `InitialSubscribe20` from the 09:13 dispatcher. We prove the old
+    /// early-exit is gone by asserting the future does NOT complete
+    /// within a short timeout (the real code will either connect to
+    /// Dhan or retry-backoff on NoTokenAvailable — either way it is
+    /// NOT an immediate `Ok(())`).
     #[tokio::test]
-    async fn test_run_twenty_depth_empty_instruments_returns_ok() {
+    async fn test_run_twenty_depth_empty_instruments_enters_deferred_mode_not_early_ok() {
         let (tx, _rx) = mpsc::channel(16);
         let token_handle: TokenHandle =
             std::sync::Arc::new(arc_swap::ArcSwap::new(std::sync::Arc::new(None)));
         let (_cmd_tx, cmd_rx) = mpsc::channel(4);
-        let result = run_twenty_depth_connection(
+        let fut = run_twenty_depth_connection(
             token_handle,
             "test".to_string(),
             vec![],
@@ -1202,9 +1288,16 @@ mod tests {
             None,
             cmd_rx,
             None, // no notifier in unit test
-        )
-        .await;
-        assert!(result.is_ok());
+        );
+        // Old behaviour: empty instruments returned `Ok(())` synchronously
+        // before any async yield. If the future completes inside 200ms,
+        // the old early-exit is back — fail loudly.
+        let outcome = tokio::time::timeout(Duration::from_millis(200), fut).await;
+        assert!(
+            outcome.is_err(),
+            "empty instruments must enter the connect/reconnect loop (deferred mode); \
+             early-exit Ok(()) regression detected. Result = {outcome:?}"
+        );
     }
 
     #[test]
