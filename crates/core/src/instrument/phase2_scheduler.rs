@@ -37,7 +37,7 @@ use std::time::Duration;
 
 use chrono::{NaiveDate, NaiveTime, TimeZone, Utc};
 use tokio::time::Instant;
-use tracing::{error, info, warn};
+use tracing::{error, info, instrument, warn};
 
 use crate::instrument::phase2_delta::compute_phase2_stock_subscriptions;
 use crate::instrument::preopen_price_buffer::{PreOpenCloses, SharedPreOpenBuffer, snapshot};
@@ -50,9 +50,22 @@ use tickvault_common::types::FeedMode;
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Scheduled trigger: 09:12 IST (Phase 2 per live-market-feed-subscription.md).
+/// Scheduled trigger: 09:13:00 IST.
+///
+/// **Why 09:13, not 09:12** (2026-04-22 bugfix): the pre-open buffer slot 4
+/// covers 09:12:00..09:12:59. The LAST tick in that minute = the "09:12
+/// close" per Parthiban's spec. If we wake up at 09:12:00 sharp we read the
+/// buffer BEFORE any 09:12-minute tick has landed — slot 4 is always empty,
+/// backtrack walks 09:11→09:10→... and typically finds nothing (stocks
+/// don't trade during 09:08-09:12 pre-open buffer), so every stock ends up
+/// in `stocks_skipped_no_price`. This produced the live "Added 0 stock F&O"
+/// bug observed 2026-04-22 at 09:11 IST.
+///
+/// Firing at 09:13:00 guarantees the 09:12 minute bucket is fully closed
+/// before we snapshot the buffer, so `backtrack_latest()` returns the real
+/// 09:12 close for every stock that ticked during the pre-open window.
 pub const PHASE2_TRIGGER_HOUR: u32 = 9;
-pub const PHASE2_TRIGGER_MIN: u32 = 12;
+pub const PHASE2_TRIGGER_MIN: u32 = 13;
 
 /// Market-hours window in IST — Phase 2 is only meaningful between 09:12 and
 /// 15:30 on a trading day. After 15:30 there is nothing to subscribe to.
@@ -131,9 +144,22 @@ impl std::fmt::Debug for Phase2InstrumentsSource {
 /// IDs without coupling to the scheduler internals.
 ///
 /// Consumed by Phase 2 crash-recovery wiring — PROMPT C.
+///
+/// # Schema history
+///
+/// - v1 (2026-04-16): `instruments`, `reference_prices`, `trigger_date_ist`.
+/// - v2 (plan item F, 2026-04-22): added `depth_20_selections` and
+///   `depth_200_selections`. Both default to empty Vec until plan item B +
+///   real C depth dispatch are wired; when they are, a restart mid-day
+///   will replay the exact depth contracts subscribed at 09:13:30 IST
+///   rather than recomputing ATM from possibly-drifted current spot.
+///
+/// On-disk snapshots written before v2 will have these fields missing.
+/// The serde deserializer defaults them to empty (via `#[serde(default)]`
+/// on the impl-side once persisted) so old snapshots remain loadable.
 #[derive(Debug, Clone)]
 pub struct Phase2PickCompleted {
-    /// Instruments dispatched to the WebSocket pool.
+    /// Main-feed stock F&O instruments dispatched to the WebSocket pool.
     pub instruments: Vec<crate::websocket::types::InstrumentSubscription>,
     /// Reference price per stock symbol that drove the ATM pick. Sorted
     /// (BTreeMap) so the persisted snapshot is byte-stable across reruns.
@@ -141,6 +167,15 @@ pub struct Phase2PickCompleted {
     /// Trigger date (IST) — needed by PROMPT C to key the on-disk
     /// snapshot file.
     pub trigger_date_ist: NaiveDate,
+    /// Plan item F (2026-04-22) v2 schema: 20-level depth contracts
+    /// selected at 09:13:30 IST from the 09:12 index close. One batch
+    /// per major underlying (NIFTY/BANKNIFTY/FINNIFTY/MIDCPNIFTY).
+    /// Empty until plan B wires depth dispatch through this snapshot.
+    pub depth_20_selections: Vec<crate::websocket::types::InstrumentSubscription>,
+    /// Plan item F (2026-04-22) v2 schema: 200-level depth contracts
+    /// (ATM CE + ATM PE for NIFTY and BANKNIFTY only = 4 entries).
+    /// Empty until plan B wires depth dispatch through this snapshot.
+    pub depth_200_selections: Vec<crate::websocket::types::InstrumentSubscription>,
 }
 
 // ---------------------------------------------------------------------------
@@ -163,6 +198,80 @@ pub enum NextTrigger {
 pub enum SkipReason {
     NonTradingDay,
     PostMarket,
+}
+
+/// Plan item J (2026-04-22): where a Phase 2 dispatch originated.
+///
+/// Written to `subscription_audit_log.dispatch_source` (plan item L)
+/// so the operator can answer "which code path subscribed this
+/// contract at 09:13:30 IST today". The variants are deliberately
+/// coarse — we want low-cardinality strings for QuestDB SYMBOL
+/// columns, not one variant per call site.
+///
+/// # Variants
+///
+/// - `Scheduler` — the normal 09:13 IST wake-up path. The `SleepUntil`
+///   branch of `NextTrigger` fires this. Expected source of > 99% of
+///   Phase 2 dispatches in steady state.
+///
+/// - `CrashRecovery` — app was restarted AFTER 09:13 IST but before
+///   15:30 IST. The `RunImmediate { minutes_late: N }` branch fires
+///   this. On-disk snapshot (if present) provides the 09:12 close;
+///   otherwise current LTP is used as a best-effort fallback.
+///
+/// - `ManualRestart` — operator-initiated redeploy during market
+///   hours. Distinct from `CrashRecovery` in that the app was shut
+///   down cleanly and the snapshot IS expected to exist. Reserved
+///   for future use when the shutdown handler persists a "clean"
+///   flag.
+///
+/// - `ApiTrigger` — manual re-dispatch via a future `/api/phase2/run`
+///   endpoint (not yet implemented). Reserved.
+///
+/// # Stability
+///
+/// The string form emitted by `as_str()` is written to QuestDB and
+/// used in Grafana filter expressions. Once a value is shipped, it
+/// must NEVER be renamed — only new variants may be added.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Phase2DispatchSource {
+    Scheduler,
+    CrashRecovery,
+    ManualRestart,
+    ApiTrigger,
+}
+
+impl Phase2DispatchSource {
+    /// Stable wire-format string written to QuestDB `subscription_audit_log`
+    /// and emitted as a Prometheus label. DO NOT rename — these strings
+    /// are persisted and queried by operators.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Scheduler => "scheduler",
+            Self::CrashRecovery => "crash_recovery",
+            Self::ManualRestart => "manual_restart",
+            Self::ApiTrigger => "api_trigger",
+        }
+    }
+
+    /// Derive the dispatch source from a `NextTrigger` decision. Returns
+    /// `Some(source)` for `SleepUntil` / `RunImmediate`, and `None` for
+    /// `SkipToday` since no dispatch happens in that branch.
+    #[must_use]
+    pub const fn from_next_trigger(trigger: &NextTrigger) -> Option<Self> {
+        match trigger {
+            NextTrigger::SleepUntil { .. } => Some(Self::Scheduler),
+            NextTrigger::RunImmediate { .. } => Some(Self::CrashRecovery),
+            NextTrigger::SkipToday { .. } => None,
+        }
+    }
+}
+
+impl std::fmt::Display for Phase2DispatchSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 impl SkipReason {
@@ -302,6 +411,11 @@ fn current_ist() -> (NaiveDate, NaiveTime) {
 /// alert-only path is used by tests + the legacy code path that hasn't
 /// yet computed the delta.
 // TEST-EXEMPT: async driver with time-dependent sleep loop — decision logic covered by test_next_trigger_*, readiness by test_has_required_ltps_*, source resolution covered by phase2_wiring_integration tests
+// Plan item N (2026-04-22): #[instrument] span groups all logs from this
+// scheduler under a single trace span — operator can filter by `phase2`
+// in tracing/Loki to see the complete lifecycle (sleep → wake → dispatch
+// or skip/fail) without needing to know individual log call sites.
+#[instrument(name = "phase2", skip_all, fields(feed_mode = ?feed_mode))]
 pub async fn run_phase2_scheduler(
     spot_prices: crate::instrument::depth_rebalancer::SharedSpotPrices,
     calendar: Arc<TradingCalendar>,
@@ -346,6 +460,16 @@ pub async fn run_phase2_scheduler(
         }
     }
 
+    // Plan item K (2026-04-22): emit Phase 2 trigger latency (how late vs
+    // the 09:13 IST target). Zero for the SleepUntil path, >0 for the
+    // RunImmediate crash-recovery path.
+    let trigger_latency_ms: u64 = match &decision {
+        NextTrigger::SleepUntil { .. } => 0,
+        NextTrigger::RunImmediate { minutes_late } => minutes_late.saturating_mul(60_000),
+        NextTrigger::SkipToday { .. } => 0, // unreachable — returned earlier
+    };
+    metrics::histogram!("tv_phase2_trigger_latency_ms").record(trigger_latency_ms as f64);
+
     let start = Instant::now();
     for attempt in 1..=MAX_LTP_ATTEMPTS {
         if wait_for_ltps_once(&spot_prices).await {
@@ -356,6 +480,17 @@ pub async fn run_phase2_scheduler(
             // sources we snapshot the pre-open buffer and run the delta
             // computation now so the chosen prices reflect the actual
             // 09:12 close (or backtracked 09:11/09:10/...).
+            //
+            // 2026-04-22 diagnostic enhancement: when the plan ends up
+            // empty we capture the skip-reason breakdown (stocks_skipped_*)
+            // + preopen buffer population so the Telegram alert tells the
+            // operator WHY "Added 0" happened instead of silently claiming
+            // success. Before this change Phase2Complete always fired with
+            // added_count=0 and the operator had no visibility.
+            let mut diag_skipped_no_price: usize = 0;
+            let mut diag_skipped_no_expiry: usize = 0;
+            let mut diag_buffer_entries: usize = 0;
+            let mut diag_sample_skipped: Vec<String> = Vec::new();
             let (instruments, reference_prices) = match source.as_ref() {
                 Some(Phase2InstrumentsSource::Static(list)) => (list.clone(), BTreeMap::new()),
                 Some(Phase2InstrumentsSource::Dynamic {
@@ -365,6 +500,13 @@ pub async fn run_phase2_scheduler(
                     strikes_each_side,
                 }) => {
                     let snap = snapshot(buffer).await;
+                    diag_buffer_entries = snap.len();
+                    // Plan item K (2026-04-22): gauge on the preopen buffer
+                    // population at trigger time. Low value here = upstream
+                    // tick capture problem; the empty-plan runbook links
+                    // this metric to the triage path.
+                    metrics::gauge!("tv_phase2_preopen_buffer_entries")
+                        .set(diag_buffer_entries as f64);
                     let compute_start = Instant::now();
                     let plan = compute_phase2_stock_subscriptions(
                         universe,
@@ -382,12 +524,59 @@ pub async fn run_phase2_scheduler(
                         .increment(plan.stocks_skipped_no_price.len() as u64);
                     metrics::counter!("tv_phase2_stocks_skipped_no_eligible_expiry_total")
                         .increment(plan.stocks_skipped_no_eligible_expiry.len() as u64);
+                    diag_skipped_no_price = plan.stocks_skipped_no_price.len();
+                    diag_skipped_no_expiry = plan.stocks_skipped_no_eligible_expiry.len();
+                    // Sample the first 5 skip victims for the diagnostic
+                    // Telegram message — enough to see "is it all stocks?"
+                    // without exploding the message size.
+                    for s in plan.stocks_skipped_no_price.iter().take(5) {
+                        diag_sample_skipped.push(format!("{s} (no-price)"));
+                    }
+                    if diag_sample_skipped.len() < 5 {
+                        for s in plan
+                            .stocks_skipped_no_eligible_expiry
+                            .iter()
+                            .take(5 - diag_sample_skipped.len())
+                        {
+                            diag_sample_skipped.push(format!("{s} (no-expiry)"));
+                        }
+                    }
                     let prices = derive_reference_prices(&plan.stocks_subscribed, &snap);
                     record_reference_price_source(&prices, &snap);
                     (plan.instruments, prices)
                 }
                 None => (Vec::new(), BTreeMap::new()),
             };
+
+            // 2026-04-22: if the plan is empty, surface the diagnostics
+            // via Phase2Failed (HIGH severity) instead of lying with
+            // Phase2Complete { added_count: 0 }. This is what the operator
+            // saw at 09:11 IST 2026-04-22 — "Added 0" with no root cause.
+            if instruments.is_empty() {
+                let reason = format!(
+                    "Empty plan at trigger. Preopen buffer entries: {diag_buffer_entries}. \
+                     Skipped no-price: {diag_skipped_no_price}. \
+                     Skipped no-expiry: {diag_skipped_no_expiry}. \
+                     Sample: [{}]. \
+                     Likely cause: pre-open snapshotter received no stock ticks during \
+                     09:08-09:12 IST window (check tv_phase2_snapshotter_ticks_buffered_total \
+                     + tv_phase2_snapshotter_ticks_filtered_total).",
+                    diag_sample_skipped.join(", ")
+                );
+                error!(
+                    attempt,
+                    buffer_entries = diag_buffer_entries,
+                    skipped_no_price = diag_skipped_no_price,
+                    skipped_no_expiry = diag_skipped_no_expiry,
+                    "Phase 2: plan is EMPTY — no instruments to subscribe"
+                );
+                metrics::counter!("tv_phase2_runs_total", "outcome" => "empty_plan").increment(1);
+                notifier.notify(NotificationEvent::Phase2Failed {
+                    reason,
+                    attempts: attempt,
+                });
+                return;
+            }
 
             let planned_count = instruments.len();
             let dispatched_count = match (pool.as_ref(), instruments.is_empty()) {
@@ -450,6 +639,12 @@ pub async fn run_phase2_scheduler(
                     instruments: instruments.clone(),
                     reference_prices: reference_prices.clone(),
                     trigger_date_ist: today_ist,
+                    // Plan item F (2026-04-22) v2 schema — populated by
+                    // plan item B once boot-time depth subscribe is
+                    // deferred to 09:13:30. Empty today is correct —
+                    // there is no depth dispatch in this code path yet.
+                    depth_20_selections: Vec::new(),
+                    depth_200_selections: Vec::new(),
                 };
                 if let Err(err) = tx.try_send(payload) {
                     warn!(
@@ -464,6 +659,11 @@ pub async fn run_phase2_scheduler(
             notifier.notify(NotificationEvent::Phase2Complete {
                 added_count: dispatched_count,
                 duration_ms,
+                // Plan item G (2026-04-22): depth dispatch will land in
+                // item C — until then these are zero and the Telegram
+                // message will show "Depth-20: 0 underlyings".
+                depth_20_underlyings: 0,
+                depth_200_contracts: 0,
             });
             return;
         }
@@ -601,12 +801,13 @@ mod tests {
     }
 
     #[test]
-    fn test_next_trigger_before_912_sleeps() {
+    fn test_next_trigger_before_913_sleeps() {
+        // 2026-04-22: trigger moved 09:12 → 09:13.
         let cal = weekday_calendar();
-        let now = NaiveTime::from_hms_opt(8, 57, 0).unwrap();
+        let now = NaiveTime::from_hms_opt(8, 58, 0).unwrap();
         match next_phase2_trigger(weekday_date(), now, &cal) {
             NextTrigger::SleepUntil { duration } => {
-                // 8:57 -> 9:12 = 15 min = 900 s.
+                // 8:58 -> 9:13 = 15 min = 900 s.
                 assert_eq!(duration.as_secs(), 900);
             }
             other => panic!("expected SleepUntil, got {other:?}"),
@@ -614,12 +815,27 @@ mod tests {
     }
 
     #[test]
-    fn test_next_trigger_at_exactly_912_runs_immediate() {
+    fn test_next_trigger_at_exactly_913_runs_immediate() {
+        // 2026-04-22: trigger moved from 09:12 → 09:13 so the 09:12 close
+        // bucket is complete before we read the pre-open buffer.
         let cal = weekday_calendar();
-        let now = NaiveTime::from_hms_opt(9, 12, 0).unwrap();
+        let now = NaiveTime::from_hms_opt(9, 13, 0).unwrap();
         match next_phase2_trigger(weekday_date(), now, &cal) {
             NextTrigger::RunImmediate { minutes_late } => assert_eq!(minutes_late, 0),
             other => panic!("expected RunImmediate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_next_trigger_at_912_is_still_sleep_until_913() {
+        // 09:12:00 is BEFORE the trigger now — must sleep to 09:13:00.
+        let cal = weekday_calendar();
+        let now = NaiveTime::from_hms_opt(9, 12, 0).unwrap();
+        match next_phase2_trigger(weekday_date(), now, &cal) {
+            NextTrigger::SleepUntil { duration } => {
+                assert_eq!(duration, Duration::from_secs(60));
+            }
+            other => panic!("expected SleepUntil, got {other:?}"),
         }
     }
 
@@ -628,7 +844,7 @@ mod tests {
         let cal = weekday_calendar();
         let now = NaiveTime::from_hms_opt(10, 0, 0).unwrap();
         match next_phase2_trigger(weekday_date(), now, &cal) {
-            NextTrigger::RunImmediate { minutes_late } => assert_eq!(minutes_late, 48),
+            NextTrigger::RunImmediate { minutes_late } => assert_eq!(minutes_late, 47),
             other => panic!("expected RunImmediate, got {other:?}"),
         }
     }
@@ -638,7 +854,7 @@ mod tests {
         let cal = weekday_calendar();
         let now = NaiveTime::from_hms_opt(11, 30, 0).unwrap();
         match next_phase2_trigger(weekday_date(), now, &cal) {
-            NextTrigger::RunImmediate { minutes_late } => assert_eq!(minutes_late, 138),
+            NextTrigger::RunImmediate { minutes_late } => assert_eq!(minutes_late, 137),
             other => panic!("expected RunImmediate, got {other:?}"),
         }
     }
@@ -697,25 +913,27 @@ mod tests {
 
     #[test]
     fn test_next_trigger_at_901_sleeps_correctly() {
+        // 2026-04-22: trigger moved 09:12 → 09:13.
         let cal = weekday_calendar();
         let now = NaiveTime::from_hms_opt(9, 1, 0).unwrap();
         match next_phase2_trigger(weekday_date(), now, &cal) {
             NextTrigger::SleepUntil { duration } => {
-                // 9:01 -> 9:12 = 11 min = 660 s.
-                assert_eq!(duration.as_secs(), 660);
+                // 9:01 -> 9:13 = 12 min = 720 s.
+                assert_eq!(duration.as_secs(), 720);
             }
             other => panic!("expected SleepUntil, got {other:?}"),
         }
     }
 
     #[test]
-    fn test_next_trigger_midnight_sleeps_9h12m() {
+    fn test_next_trigger_midnight_sleeps_9h13m() {
+        // 2026-04-22: trigger moved 09:12 → 09:13.
         let cal = weekday_calendar();
         let now = NaiveTime::from_hms_opt(0, 0, 0).unwrap();
         match next_phase2_trigger(weekday_date(), now, &cal) {
             NextTrigger::SleepUntil { duration } => {
-                // 00:00 -> 09:12 = 9h 12m = 33120 s.
-                assert_eq!(duration.as_secs(), 33120);
+                // 00:00 -> 09:13 = 9h 13m = 33180 s.
+                assert_eq!(duration.as_secs(), 33180);
             }
             other => panic!("expected SleepUntil, got {other:?}"),
         }
@@ -730,10 +948,11 @@ mod tests {
     #[test]
     fn test_constants_are_sane() {
         assert_eq!(PHASE2_TRIGGER_HOUR, 9);
-        assert_eq!(PHASE2_TRIGGER_MIN, 12);
-        // Trigger must be between market open (09:15) ... wait, 09:12 is BEFORE
-        // market open. That's correct per Dhan spec — it's during pre-market
-        // when finalized LTPs become available.
+        // 2026-04-22: trigger moved from 09:12 → 09:13 so the 09:12 close
+        // minute bucket is fully captured before we read the pre-open buffer.
+        assert_eq!(PHASE2_TRIGGER_MIN, 13);
+        // Trigger must still be BEFORE market open (09:15) so we're
+        // subscribed in time for the opening auction.
         assert!(PHASE2_TRIGGER_MIN < MARKET_OPEN_MIN);
         assert!(MAX_LTP_ATTEMPTS >= 2, "need at least one retry");
         assert!(
@@ -769,5 +988,145 @@ mod tests {
         update_spot_price(&prices, "NIFTY", 23500.0).await;
         update_spot_price(&prices, "BANKNIFTY", 51000.0).await;
         assert!(has_required_ltps(&prices).await);
+    }
+
+    // ========================================================================
+    // Plan item J (2026-04-22) — Phase2DispatchSource enum tests
+    // ========================================================================
+
+    #[test]
+    fn test_phase2_dispatch_source_as_str_is_stable() {
+        // These strings are written to QuestDB subscription_audit_log and
+        // used in Grafana filters. DO NOT rename — persisted and queried.
+        assert_eq!(Phase2DispatchSource::Scheduler.as_str(), "scheduler");
+        assert_eq!(
+            Phase2DispatchSource::CrashRecovery.as_str(),
+            "crash_recovery"
+        );
+        assert_eq!(
+            Phase2DispatchSource::ManualRestart.as_str(),
+            "manual_restart"
+        );
+        assert_eq!(Phase2DispatchSource::ApiTrigger.as_str(), "api_trigger");
+    }
+
+    #[test]
+    fn test_phase2_dispatch_source_display_matches_as_str() {
+        assert_eq!(
+            format!("{}", Phase2DispatchSource::Scheduler),
+            Phase2DispatchSource::Scheduler.as_str()
+        );
+        assert_eq!(
+            format!("{}", Phase2DispatchSource::CrashRecovery),
+            Phase2DispatchSource::CrashRecovery.as_str()
+        );
+    }
+
+    #[test]
+    fn test_phase2_dispatch_source_as_str_are_all_unique() {
+        let variants = [
+            Phase2DispatchSource::Scheduler,
+            Phase2DispatchSource::CrashRecovery,
+            Phase2DispatchSource::ManualRestart,
+            Phase2DispatchSource::ApiTrigger,
+        ];
+        let mut seen = std::collections::HashSet::new();
+        for v in variants {
+            assert!(
+                seen.insert(v.as_str()),
+                "duplicate as_str() mapping for {v:?}"
+            );
+        }
+        assert_eq!(seen.len(), 4, "expected 4 distinct wire strings");
+    }
+
+    #[test]
+    fn test_phase2_dispatch_source_from_sleep_until_is_scheduler() {
+        let trigger = NextTrigger::SleepUntil {
+            duration: Duration::from_secs(60),
+        };
+        assert_eq!(
+            Phase2DispatchSource::from_next_trigger(&trigger),
+            Some(Phase2DispatchSource::Scheduler)
+        );
+    }
+
+    #[test]
+    fn test_phase2_dispatch_source_from_run_immediate_is_crash_recovery() {
+        let trigger = NextTrigger::RunImmediate { minutes_late: 5 };
+        assert_eq!(
+            Phase2DispatchSource::from_next_trigger(&trigger),
+            Some(Phase2DispatchSource::CrashRecovery)
+        );
+    }
+
+    #[test]
+    fn test_phase2_dispatch_source_from_skip_today_is_none() {
+        let trigger = NextTrigger::SkipToday {
+            reason: SkipReason::NonTradingDay,
+        };
+        assert_eq!(Phase2DispatchSource::from_next_trigger(&trigger), None);
+    }
+
+    #[test]
+    fn test_phase2_dispatch_source_equality_and_clone() {
+        let a = Phase2DispatchSource::Scheduler;
+        let b = Phase2DispatchSource::Scheduler;
+        let c = Phase2DispatchSource::CrashRecovery;
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        let cloned = a;
+        assert_eq!(a, cloned);
+    }
+
+    // ========================================================================
+    // Plan item F (2026-04-22) — Phase2PickCompleted v2 schema ratchet
+    // ========================================================================
+
+    #[test]
+    fn test_phase2_pick_completed_v2_has_depth_20_selections_field() {
+        // Compile-time guard: removing or renaming the field breaks this
+        // assert. Plan F = durable crash-recovery needs depth contracts
+        // to be replayable on restart mid-day.
+        let payload = Phase2PickCompleted {
+            instruments: Vec::new(),
+            reference_prices: BTreeMap::new(),
+            trigger_date_ist: NaiveDate::from_ymd_opt(2026, 4, 22).expect("valid date"),
+            depth_20_selections: Vec::new(),
+            depth_200_selections: Vec::new(),
+        };
+        assert!(payload.depth_20_selections.is_empty());
+    }
+
+    #[test]
+    fn test_phase2_pick_completed_v2_has_depth_200_selections_field() {
+        let payload = Phase2PickCompleted {
+            instruments: Vec::new(),
+            reference_prices: BTreeMap::new(),
+            trigger_date_ist: NaiveDate::from_ymd_opt(2026, 4, 22).expect("valid date"),
+            depth_20_selections: Vec::new(),
+            depth_200_selections: Vec::new(),
+        };
+        assert!(payload.depth_200_selections.is_empty());
+    }
+
+    #[test]
+    fn test_phase2_pick_completed_v2_clone_preserves_depth_fields() {
+        let original = Phase2PickCompleted {
+            instruments: Vec::new(),
+            reference_prices: BTreeMap::new(),
+            trigger_date_ist: NaiveDate::from_ymd_opt(2026, 4, 22).expect("valid date"),
+            depth_20_selections: Vec::new(),
+            depth_200_selections: Vec::new(),
+        };
+        let cloned = original.clone();
+        assert_eq!(
+            cloned.depth_20_selections.len(),
+            original.depth_20_selections.len()
+        );
+        assert_eq!(
+            cloned.depth_200_selections.len(),
+            original.depth_200_selections.len()
+        );
     }
 }

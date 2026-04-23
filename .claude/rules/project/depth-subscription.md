@@ -4,6 +4,30 @@
 > **Scope:** Any file touching depth WebSocket connections, strike selection, rebalancing, or depth persistence.
 > **Ground truth:** `docs/dhan-ref/04-full-market-depth-websocket.md`, `docs/dhan-ref/08-annexure-enums.md`
 
+## 2026-04-22 Updates (this session)
+
+The following changes shipped on branch `claude/market-feed-depth-explanation-RynUx` (PR #324) and are mandatory for any new depth/Phase-2 work:
+
+1. **`DepthCommand::InitialSubscribe20` / `InitialSubscribe200` variants exist** — added for the unified 09:13 dispatch flow. Boot-time depth subscribe is unchanged today (Item B not shipped yet); these variants will be used once Item B defers boot subscribe. Do not delete them.
+
+2. **Depth rebalance Telegram MUST NOT use the words "aborting" or "spawning new"** — they describe a disconnect-and-respawn flow which is NOT what happens. The correct mechanism is `Swap20`/`Swap200` zero-disconnect. Use "zero-disconnect swap" wording in any new depth-rebalance message.
+
+3. **Depth rebalance Telegram MUST be feed-aware** — only NIFTY and BANKNIFTY have 200-level. FINNIFTY/MIDCPNIFTY messages must NOT mention "200-level" — see the per-feed message branch in `main.rs` (Plan item C label fix, commit 6f6edc5).
+
+4. **Phase 2 trigger time is 09:13:00 IST, not 09:12:00** (commit 0340a7c). Reading the buffer at 09:12:00 means slot 4 (09:12:00–09:12:59) is empty — backtrack walks down to 09:11/...09:08 which are typically also empty during pre-open. 09:13:00 guarantees the 09:12 close minute bucket is fully captured.
+
+5. **Phase 2 empty plan MUST fire `Phase2Failed`, NOT `Phase2Complete { added_count: 0 }`** (commit 4aaa0fb). The diagnostic must include `buffer_entries`, `skipped_no_price`, `skipped_no_expiry`, and a sample of skipped stocks. Silent "Added 0" is banned.
+
+6. **Off-hours WebSocket disconnects route to `WebSocketDisconnectedOffHours` (Severity::Low)**, not `WebSocketDisconnected` (Severity::High) (commit 996b0cc). In-market disconnects still use the High variant. Use `tickvault_common::market_hours::is_within_market_hours_ist()` to branch.
+
+7. **Order-update WS activity watchdog is 14400s (4h), NOT 1800s** (commit 55452c2). Dhan's order-update server goes silent on idle accounts; 1800s caused every-30-min false reconnects. TCP-RST detection in the read loop's `Err` branch is the actual liveness backstop.
+
+8. **`MarketOpenStreamingConfirmation` Telegram fires once per trading day at 09:15:30 IST** with active counts for main feed / depth-20 / depth-200 / order update (commit de1784a). Severity::Info. Operator's "am I streaming" question is answered by this single message.
+
+9. **`MarketOpenDepthAnchor` Telegram fires once per index at 09:13:00 IST** showing the 09:12 close used + derived ATM strike (commit 427bf2d). Severity::Info. Audit trail for "what 09:12 close anchored today's depth".
+
+10. **Pre-open price buffer captures NIFTY (id=13) + BANKNIFTY (id=25) on IDX_I segment** (commit f641315), in addition to F&O stocks. `PREOPEN_INDEX_UNDERLYINGS` constant is the source of truth for which indices feed depth ATM selection.
+
 ## Architecture
 
 ### Two Depth Types (independent WebSocket pools)

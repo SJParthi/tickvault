@@ -73,6 +73,15 @@ const REQUIRED_DASHBOARD_METRIC_PREFIXES: &[&str] = &[
     "tv_tick_flush_errors_total",
     // I-P1-11 cross-segment collision detector (commit d049bd6).
     "tv_instrument_registry_cross_segment_collisions",
+    // Plan item M (2026-04-22): Phase 2 daily scheduler health panels
+    // on operator-health dashboard. Prefix matches both
+    // tv_phase2_runs_total and tv_phase2_preopen_buffer_entries and
+    // tv_phase2_trigger_latency_ms.
+    "tv_phase2_",
+    // Plan item F2 (2026-04-22): 6-bucket movers dashboard panels on
+    // market-movers.json. Prefix matches tv_movers_snapshot_duration_ms
+    // and tv_movers_tracked_total.
+    "tv_movers_",
 ];
 
 const CROSS_SEGMENT_TABLES: &[&str] = &[

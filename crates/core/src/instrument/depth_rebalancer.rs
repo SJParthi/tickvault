@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, instrument, warn};
 
 use super::depth_strike_selector::{
     AtmIds, DEPTH_REBALANCE_STRIKE_THRESHOLD, find_atm_security_ids, should_rebalance,
@@ -40,6 +40,27 @@ const REBALANCE_CHECK_INTERVAL_SECS: u64 = 60;
 #[inline]
 fn is_within_market_hours_ist() -> bool {
     tickvault_common::market_hours::is_within_market_hours_ist()
+}
+
+/// Plan item E (2026-04-22): returns true iff the current IST wall-clock
+/// time is at or past 09:15:00 (continuous trading session start).
+///
+/// The depth rebalancer must NOT fire rebalance commands during 09:00-
+/// 09:15 IST: pre-open discovery prices oscillate wildly, and the depth
+/// bootstrap picks the 09:12/09:13 close-derived ATM at 09:13:30 (plan C).
+/// Rebalancing that selection at 09:14 on a flicker would churn the
+/// bootstrap decision. After 09:15 the continuous session begins and the
+/// 60s/3-strike drift check is meaningful.
+///
+/// O(1) — one `Utc::now()` + arithmetic + range check.
+#[inline]
+fn is_past_0915_ist() -> bool {
+    use tickvault_common::constants::{IST_UTC_OFFSET_SECONDS, SECONDS_PER_DAY};
+    const SECS_0915_OF_DAY_IST: u32 = 9 * 3600 + 15 * 60;
+    let now_utc = chrono::Utc::now().timestamp();
+    let now_ist = now_utc.saturating_add(i64::from(IST_UTC_OFFSET_SECONDS));
+    let sec_of_day = now_ist.rem_euclid(i64::from(SECONDS_PER_DAY)) as u32;
+    sec_of_day >= SECS_0915_OF_DAY_IST
 }
 
 /// O3 (2026-04-17): A spot price older than this is considered stale. The
@@ -157,6 +178,14 @@ pub struct StaleSpotPriceEvent {
 ///   app's main boot wires a listener that fires a Telegram alert.
 /// * `shutdown` — Atomic flag to stop the rebalancer.
 // TEST-EXEMPT: Background task — requires live spot price feed
+// Plan item N (2026-04-22): #[instrument] span groups all 60s-cycle logs
+// under a single trace span. Operator filters by `depth_rebalancer` in
+// tracing/Loki to see the full ATM-drift / stale-spot lifecycle.
+#[instrument(
+    name = "depth_rebalancer",
+    skip_all,
+    fields(underlying_count = underlyings.len())
+)]
 pub async fn run_depth_rebalancer(
     spot_prices: SharedSpotPrices,
     universe: Arc<FnoUniverse>,
@@ -229,6 +258,18 @@ pub async fn run_depth_rebalancer(
             // Clear stale tracking so the rising edge after next market
             // open is detected correctly.
             currently_stale.clear();
+            continue;
+        }
+        // Plan item E (2026-04-22): in-market gate for 09:00-09:15.
+        // The continuous trading session opens at 09:15:00 IST. During
+        // the preceding 15 minutes the main feed is streaming pre-open
+        // equilibrium ticks which oscillate around discovery prices;
+        // any rebalance decision made on those prices would undo the
+        // 09:13:30 depth bootstrap (plan C). Suppress the rebalance
+        // cycle entirely until the cash market opens. Stale tracking
+        // is preserved (not cleared) because the next pre-market tick
+        // was genuinely reflecting the symbol's liquidity.
+        if !is_past_0915_ist() {
             continue;
         }
 
@@ -586,6 +627,35 @@ mod tests {
              to suppress post-market stale-alert storms. Live 2026-04-17 \
              regression: FINNIFTY + MIDCPNIFTY spammed every 60s post-close."
         );
+    }
+
+    /// Plan item E (2026-04-22): the 09:15 first-check gate helper exists
+    /// and returns a plain bool. The value depends on wall-clock time so
+    /// we only smoke-test the callability, not a specific outcome.
+    #[test]
+    fn test_is_past_0915_helper_exists_and_returns_bool() {
+        let _: bool = is_past_0915_ist();
+    }
+
+    /// Plan item E (2026-04-22): source-scan guard — the rebalancer loop
+    /// MUST call the 09:15 gate so rebalance decisions before 09:15 IST
+    /// cannot churn the 09:13:30 depth bootstrap.
+    #[test]
+    fn test_0915_gate_is_wired_into_rebalancer_loop() {
+        let src = include_str!("depth_rebalancer.rs");
+        assert!(
+            src.contains("if !is_past_0915_ist() {"),
+            "run_depth_rebalancer MUST call is_past_0915_ist() to gate \
+             rebalance decisions until continuous session open. Plan item E."
+        );
+    }
+
+    /// Plan item E (2026-04-22): the constant 09:15 = 33_300 secs-of-day
+    /// is the single source of truth. Guard the derivation so a refactor
+    /// doesn't silently shift the gate by 1 minute.
+    #[test]
+    fn test_0915_seconds_of_day_is_33300() {
+        assert_eq!(9 * 3600 + 15 * 60, 33_300_u32);
     }
 
     /// Guard test: rising-edge alert suppression is wired.

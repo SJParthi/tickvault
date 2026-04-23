@@ -46,6 +46,13 @@ use tokio::sync::RwLock;
 /// Number of one-minute slots captured in the pre-open window (09:08..=09:12).
 pub const PREOPEN_MINUTE_SLOTS: usize = 5;
 
+/// Pre-open index underlyings whose 09:12 close is used to pick depth-20 +
+/// depth-200 ATM strikes at 09:12:30 IST (mirror of the stock F&O dispatch
+/// path — see `phase2_scheduler.rs` and `.claude/plans/active-plan.md`
+/// items A + C). The security IDs come from Dhan's instrument master and are
+/// fixed per `.claude/rules/project/depth-subscription.md`.
+pub const PREOPEN_INDEX_UNDERLYINGS: &[(&str, u32)] = &[("NIFTY", 13), ("BANKNIFTY", 25)];
+
 /// First captured minute, as seconds since IST midnight (09:08:00 IST).
 pub const PREOPEN_FIRST_MINUTE_SECS_IST: u32 = 9 * 3600 + 8 * 60;
 
@@ -246,9 +253,46 @@ pub fn build_fno_stock_lookup(universe: &FnoUniverse) -> HashMap<(u32, ExchangeS
     out
 }
 
-/// Pure synchronous classifier — given a parsed tick + the lookup
-/// table built by `build_fno_stock_lookup`, decide whether the tick
+/// Builds the unified pre-open lookup for the index underlyings in
+/// `PREOPEN_INDEX_UNDERLYINGS`. Keyed by `(security_id, IdxI)` so it
+/// merges cleanly with the F&O stock lookup (different segment half of the
+/// composite key per I-P1-11).
+///
+/// O(1) EXEMPT: boot-time lookup table with ≤ `PREOPEN_INDEX_UNDERLYINGS.len()`
+/// entries (today: 2 — NIFTY + BANKNIFTY).
+#[must_use]
+pub fn build_preopen_index_lookup() -> HashMap<(u32, ExchangeSegment), String> {
+    let mut out: HashMap<(u32, ExchangeSegment), String> =
+        HashMap::with_capacity(PREOPEN_INDEX_UNDERLYINGS.len());
+    for (symbol, security_id) in PREOPEN_INDEX_UNDERLYINGS {
+        out.insert((*security_id, ExchangeSegment::IdxI), (*symbol).to_string());
+    }
+    out
+}
+
+/// Builds the combined pre-open lookup used by `classify_tick` — F&O stocks
+/// (NSE_EQ) + whitelisted indices (IDX_I). Composite key `(security_id,
+/// segment)` guarantees no collision per I-P1-11.
+///
+/// O(1) EXEMPT: boot-time, ~220 entries total.
+// TEST-EXEMPT: Pure orchestrator over `build_fno_stock_lookup` + `build_preopen_index_lookup`, both individually tested. Adding a duplicate "merged" test gives no extra signal — same behaviour proven by composition.
+#[must_use]
+pub fn build_preopen_combined_lookup(
+    universe: &FnoUniverse,
+) -> HashMap<(u32, ExchangeSegment), String> {
+    let mut combined = build_fno_stock_lookup(universe);
+    for ((security_id, seg), symbol) in build_preopen_index_lookup() {
+        combined.insert((security_id, seg), symbol);
+    }
+    combined
+}
+
+/// Pure synchronous classifier — given a parsed tick + the combined lookup
+/// table built by `build_preopen_combined_lookup`, decide whether the tick
 /// should be buffered (and into which minute slot) or filtered.
+///
+/// Accepts both `NseEquity` (F&O stocks) and `IdxI` (whitelisted indices —
+/// NIFTY + BANKNIFTY, used for depth ATM selection at 09:12:30).
 ///
 /// Pure function = no I/O, no async, no allocation on the buffer
 /// path. Caller is responsible for actually writing to the
@@ -258,16 +302,18 @@ pub fn classify_tick(
     tick: &ParsedTick,
     fno_stock_lookup: &HashMap<(u32, ExchangeSegment), String>,
 ) -> SnapshotterOutcome {
-    // Step 1: segment filter — F&O stocks live on NSE_EQ for the
-    // price feed (per `FnoUnderlying.price_feed_segment`).
+    // Step 1: segment filter — accept both F&O-stock feed segment (NSE_EQ)
+    // AND IDX_I (major indices NIFTY + BANKNIFTY for depth ATM at 09:12:30).
+    // All other segments (BSE, MCX, Currency, derivatives) are filtered.
     let Some(seg) = ExchangeSegment::from_byte(tick.exchange_segment_code) else {
         return SnapshotterOutcome::Filtered(SnapshotterFilterReason::WrongSegment);
     };
-    if seg != ExchangeSegment::NseEquity {
+    if seg != ExchangeSegment::NseEquity && seg != ExchangeSegment::IdxI {
         return SnapshotterOutcome::Filtered(SnapshotterFilterReason::WrongSegment);
     }
 
-    // Step 2: F&O-stock membership check. Composite key per I-P1-11.
+    // Step 2: composite-key membership check. Key is `(security_id, segment)`
+    // per I-P1-11 so the same numeric id across segments never collides.
     let Some(symbol) = fno_stock_lookup.get(&(tick.security_id, seg)) else {
         return SnapshotterOutcome::Filtered(SnapshotterFilterReason::NotFnoStock);
     };
@@ -469,6 +515,85 @@ mod tests {
         assert_eq!(snap1.get("TCS").unwrap().closes[4], None);
         let snap2 = snapshot(&buffer).await;
         assert_eq!(snap2.get("TCS").unwrap().closes[4], Some(3510.0));
+    }
+
+    #[test]
+    fn test_preopen_index_underlyings_contains_nifty_and_banknifty() {
+        // Per .claude/rules/project/depth-subscription.md: NIFTY=13, BANKNIFTY=25.
+        // These feed the depth-20 + depth-200 ATM selection at 09:12:30.
+        let map: HashMap<&str, u32> = PREOPEN_INDEX_UNDERLYINGS.iter().copied().collect();
+        assert_eq!(map.get("NIFTY"), Some(&13));
+        assert_eq!(map.get("BANKNIFTY"), Some(&25));
+    }
+
+    #[test]
+    fn test_build_preopen_index_lookup_keyed_by_composite() {
+        // I-P1-11: key MUST be (security_id, segment). IdxI segment for
+        // indices so we never collide with any NSE_EQ id reuse.
+        let lookup = build_preopen_index_lookup();
+        assert_eq!(
+            lookup.get(&(13, ExchangeSegment::IdxI)),
+            Some(&"NIFTY".to_string())
+        );
+        assert_eq!(
+            lookup.get(&(25, ExchangeSegment::IdxI)),
+            Some(&"BANKNIFTY".to_string())
+        );
+        // Wrong segment must not match even with same id.
+        assert!(lookup.get(&(13, ExchangeSegment::NseEquity)).is_none());
+        assert!(lookup.get(&(25, ExchangeSegment::NseEquity)).is_none());
+    }
+
+    #[test]
+    fn test_build_preopen_index_lookup_contains_exactly_two_entries() {
+        let lookup = build_preopen_index_lookup();
+        assert_eq!(lookup.len(), PREOPEN_INDEX_UNDERLYINGS.len());
+        assert_eq!(lookup.len(), 2, "today we subscribe NIFTY + BANKNIFTY only");
+    }
+
+    #[test]
+    fn test_build_preopen_combined_lookup_includes_indices() {
+        // Use an empty universe — the combined lookup must still contain
+        // the whitelisted index entries sourced from
+        // `PREOPEN_INDEX_UNDERLYINGS`. Stock-side merge is covered by
+        // `build_fno_stock_lookup`'s own tests and integration tests.
+        use std::time::Duration;
+        use tickvault_common::instrument_types::UniverseBuildMetadata;
+        let universe = FnoUniverse {
+            underlyings: HashMap::new(),
+            derivative_contracts: HashMap::new(),
+            instrument_info: HashMap::new(),
+            option_chains: HashMap::new(),
+            expiry_calendars: HashMap::new(),
+            subscribed_indices: Vec::new(),
+            build_metadata: UniverseBuildMetadata {
+                csv_source: String::new(),
+                csv_row_count: 0,
+                parsed_row_count: 0,
+                index_count: 0,
+                equity_count: 0,
+                underlying_count: 0,
+                derivative_count: 0,
+                option_chain_count: 0,
+                build_duration: Duration::from_millis(0),
+                build_timestamp: chrono::FixedOffset::east_opt(0)
+                    .expect("zero offset")
+                    .from_utc_datetime(&Utc::now().naive_utc()),
+            },
+        };
+        let combined = build_preopen_combined_lookup(&universe);
+
+        // With an empty universe the combined lookup is exactly the
+        // index lookup (NIFTY + BANKNIFTY on IDX_I).
+        assert_eq!(combined.len(), PREOPEN_INDEX_UNDERLYINGS.len());
+        assert_eq!(
+            combined.get(&(13, ExchangeSegment::IdxI)),
+            Some(&"NIFTY".to_string())
+        );
+        assert_eq!(
+            combined.get(&(25, ExchangeSegment::IdxI)),
+            Some(&"BANKNIFTY".to_string())
+        );
     }
 
     #[test]

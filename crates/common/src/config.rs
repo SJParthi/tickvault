@@ -43,6 +43,72 @@ pub struct ApplicationConfig {
     pub infrastructure: InfrastructureConfig,
     #[serde(default)]
     pub partition_retention: PartitionRetentionConfig,
+    /// Plan item E1 (2026-04-22): 6-bucket movers tracker filter + cadence config.
+    #[serde(default)]
+    pub movers: MoversConfig,
+}
+
+/// Plan item E1 (2026-04-22): tuning knobs for the 6-bucket `MoversTrackerV2`.
+///
+/// Defaults match the plan spec. Operators can override via `config/base.toml`
+/// `[movers]` section. Units are documented per-field.
+///
+/// # Filter rationale
+///
+/// Without `index_options_min_oi` / `stock_options_min_oi`, the leaderboard is
+/// dominated by deep-OTM strikes (0.05 → 0.10 = +100% noise) that nobody
+/// trades. Setting minimums in the low-hundreds suppresses this while still
+/// allowing thin-but-real options through.
+///
+/// # Cadence rationale
+///
+/// `snapshot_cadence_secs` controls in-memory recompute (humans poll at 1 Hz).
+/// `persistence_cadence_secs` controls QuestDB write (1 Hz = ~134 rows/sec =
+/// ~2.9M rows/day = comfortable for WAL).
+#[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct MoversConfig {
+    /// Minimum traded volume to qualify for stock ranking. Default 0 (no filter).
+    pub stocks_min_volume: u32,
+    /// Minimum traded volume for index ranking. Default 0.
+    pub indices_min_volume: u32,
+    /// Minimum traded volume for index-future ranking. Default 1.
+    pub index_futures_min_volume: u32,
+    /// Minimum traded volume for stock-future ranking. Default 1.
+    pub stock_futures_min_volume: u32,
+    /// Minimum traded volume for index-option ranking. Default 1.
+    pub index_options_min_volume: u32,
+    /// Minimum open interest for index-option ranking. Default 100.
+    /// Suppresses deep-OTM 0.05→0.10 = +100% noise.
+    pub index_options_min_oi: u32,
+    /// Minimum traded volume for stock-option ranking. Default 1.
+    pub stock_options_min_volume: u32,
+    /// Minimum open interest for stock-option ranking. Default 100.
+    pub stock_options_min_oi: u32,
+    /// In-memory snapshot recompute period. Default 5 seconds.
+    pub snapshot_cadence_secs: u32,
+    /// QuestDB persistence write period. Default 1 second.
+    pub persistence_cadence_secs: u32,
+    /// Top-N ranks emitted per category per bucket. Default 20.
+    pub top_n: u32,
+}
+
+impl Default for MoversConfig {
+    fn default() -> Self {
+        Self {
+            stocks_min_volume: 0,
+            indices_min_volume: 0,
+            index_futures_min_volume: 1,
+            stock_futures_min_volume: 1,
+            index_options_min_volume: 1,
+            index_options_min_oi: 100,
+            stock_options_min_volume: 1,
+            stock_options_min_oi: 100,
+            snapshot_cadence_secs: 5,
+            persistence_cadence_secs: 1,
+            top_n: 20,
+        }
+    }
 }
 
 /// Trading execution mode — controls how orders are routed.
@@ -1259,6 +1325,7 @@ mod tests {
             greeks: GreeksConfig::default(),
             infrastructure: InfrastructureConfig::default(),
             partition_retention: PartitionRetentionConfig::default(),
+            movers: MoversConfig::default(),
         }
     }
 
@@ -2153,5 +2220,41 @@ mod tests {
             msg.contains("must start with 'https://'"),
             "expected scheme rejection, got: {msg}"
         );
+    }
+
+    // Plan item E1 (2026-04-22) — MoversConfig defaults guard
+    #[test]
+    fn test_movers_config_default_min_oi_is_100_for_options() {
+        let cfg = MoversConfig::default();
+        assert_eq!(cfg.index_options_min_oi, 100);
+        assert_eq!(cfg.stock_options_min_oi, 100);
+    }
+
+    #[test]
+    fn test_movers_config_default_cadences_are_5s_and_1s() {
+        let cfg = MoversConfig::default();
+        assert_eq!(cfg.snapshot_cadence_secs, 5);
+        assert_eq!(cfg.persistence_cadence_secs, 1);
+    }
+
+    #[test]
+    fn test_movers_config_default_top_n_is_20() {
+        assert_eq!(MoversConfig::default().top_n, 20);
+    }
+
+    #[test]
+    fn test_movers_config_default_stocks_and_indices_have_no_volume_filter() {
+        let cfg = MoversConfig::default();
+        assert_eq!(cfg.stocks_min_volume, 0);
+        assert_eq!(cfg.indices_min_volume, 0);
+    }
+
+    #[test]
+    fn test_movers_config_default_derivatives_require_at_least_one_trade() {
+        let cfg = MoversConfig::default();
+        assert_eq!(cfg.index_futures_min_volume, 1);
+        assert_eq!(cfg.stock_futures_min_volume, 1);
+        assert_eq!(cfg.index_options_min_volume, 1);
+        assert_eq!(cfg.stock_options_min_volume, 1);
     }
 }

@@ -677,3 +677,64 @@ groups:
         annotations:
           summary: "20-level depth sequence holes burst > 5/s for 2m"
           description: "Hole rate spiking — likely lost a connection or the upstream feed is degraded. Check tv_websocket_connections_active and depth pool state."
+
+      # Plan item M (2026-04-22): Phase 2 daily health.
+      # Phase 2 runs once per trading day at 09:13 IST. Any non-complete
+      # outcome in the last 6h = stock F&O subscribe either skipped or
+      # failed for today. Operator must triage per runbook.
+      - alert: Phase2FailureToday
+        expr: sum(increase(tv_phase2_runs_total{outcome!="complete"}[6h])) > 0
+        for: 1m
+        labels:
+          severity: high
+        annotations:
+          summary: "Phase 2 stock F&O subscribe did not complete successfully today"
+          description: "tv_phase2_runs_total emitted {{ $value }} non-complete outcome(s) in the last 6h. Stock derivatives may be unsubscribed for the rest of the trading day. Runbook: docs/runbooks/phase2-empty-plan.md"
+
+      # Phase 2 trigger latency: any delay > 60s vs the 09:13 target
+      # indicates either (a) crash-recovery RunImmediate path fired,
+      # or (b) scheduler wake was delayed. Investigate if sustained.
+      - alert: Phase2TriggerLate
+        expr: max_over_time(tv_phase2_trigger_latency_ms[6h]) > 60000
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Phase 2 fired > 60s after its 09:13 IST target"
+          description: "Max trigger latency in last 6h = {{ $value }}ms. Either a crash-recovery RunImmediate path fired (app was restarted mid-day) or the scheduler task was blocked. Normal during operator-initiated redeploy."
+
+      # Plan item F3 (2026-04-22): 6-bucket movers snapshot health.
+      # Tracker emits tv_movers_snapshot_duration_ms + tv_movers_tracked_total
+      # every recompute (5s cadence). No emission for 5 min during market
+      # hours = tracker crashed or lost its tick feed.
+      - alert: MoversSnapshotMissing
+        expr: |
+          absent(tv_movers_snapshot_duration_ms_count)
+          or
+          (rate(tv_movers_snapshot_duration_ms_count[5m]) == 0
+            and hour() >= 3 and hour() < 10
+            and (day_of_week() > 0 and day_of_week() < 6))
+        for: 5m
+        labels:
+          severity: high
+        annotations:
+          summary: "Movers snapshot not computed in last 5 min during market hours"
+          description: "MoversTrackerV2::compute_snapshot_v2 has stopped emitting. Either the tracker task panicked or the tick SPSC drained. Investigate `crates/core/src/pipeline/top_movers.rs` + Phase G wiring in trading_pipeline.rs."
+
+      # Tracked-instrument count dropping ≥ 50% between two successive scrapes
+      # usually means the InstrumentRegistry got rebuilt mid-session or the
+      # tick feed lost half its subscriptions. Benign only if a planned
+      # redeploy is in progress.
+      - alert: MoversTrackedCountDropped
+        expr: |
+          (
+            (max by (bucket) (tv_movers_tracked_total offset 5m)
+              - max by (bucket) (tv_movers_tracked_total))
+            / max by (bucket) (tv_movers_tracked_total offset 5m)
+          ) > 0.5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Movers tracked_total for bucket {{ $labels.bucket }} dropped > 50%"
+          description: "tv_movers_tracked_total{{ '{' }}bucket={{ $labels.bucket }}{{ '}' }} fell > 50% in the last 5m. Likely a WebSocket subscription loss or registry rebuild. Cross-check tv_websocket_connections_active + tv_instrument_registry_total_entries."

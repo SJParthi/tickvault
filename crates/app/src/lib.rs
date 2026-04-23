@@ -14,6 +14,7 @@
 pub mod boot_helpers;
 pub mod greeks_pipeline;
 pub mod infra;
+pub mod movers_v2_pipeline;
 pub mod observability;
 pub mod phase2_recovery;
 pub mod trading_pipeline;

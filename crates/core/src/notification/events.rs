@@ -142,6 +142,39 @@ pub enum NotificationEvent {
     /// giving up.
     DepthIndexLtpTimeout { waited_secs: u64 },
 
+    /// Plan item #5 (2026-04-22): once-per-day positive confirmation that
+    /// every feed is actually streaming live data at market open. Fires
+    /// at 09:15:30 IST on each trading day. Answers Parthiban's "how do I
+    /// know if connected" question directly — without this, operators only
+    /// see disconnect/reconnect EDGES, never a positive "we are healthy"
+    /// signal. Severity = Info so it never wakes anyone up.
+    MarketOpenStreamingConfirmation {
+        main_feed_active: usize,
+        main_feed_total: usize,
+        depth_20_active: usize,
+        depth_200_active: usize,
+        order_update_active: bool,
+    },
+
+    /// Plan item C (2026-04-22, visibility version): once-per-day audit
+    /// trail of what NIFTY + BANKNIFTY 09:12 closes were used as the
+    /// authoritative anchor for the day's depth ATM. The 60s depth
+    /// rebalancer is what actually keeps depth subscribed to the right
+    /// strikes during the session — this Telegram is for operator
+    /// visibility into "what 09:12 close grounded today's depth" so
+    /// drift complaints can be cross-checked against a known anchor.
+    /// Severity = Info (no wake-ups).
+    MarketOpenDepthAnchor {
+        /// "NIFTY" or "BANKNIFTY"
+        underlying: String,
+        /// 09:12 close from the preopen buffer (or backtracked 09:11/10/09/08).
+        close_0912: Option<f64>,
+        /// Strike price of the ATM contract derived from `close_0912`.
+        atm_strike: Option<f64>,
+        /// Source minute: 4 = 09:12, 3 = 09:11, ..., 0 = 09:08, None = no data.
+        source_minute_slot: Option<usize>,
+    },
+
     /// Option C (2026-04-17): Depth setup dropped a specific underlying —
     /// the grace window expired without a valid spot price OR the option
     /// chain was missing. Complements `DepthIndexLtpTimeout` which fires
@@ -167,13 +200,20 @@ pub enum NotificationEvent {
     /// know the system crashed or started late and is catching up.
     Phase2RunImmediate { minutes_late: u64 },
 
-    /// O1: Phase 2 completed — stock F&O delta was issued. `added_count`
-    /// is the number of instruments that would have been subscribed
-    /// (until the SubscribeCommand plumbing lands the count is best-effort
-    /// based on the precomputed plan).
+    /// O1: Phase 2 completed — unified 09:12:30 IST dispatch for stock
+    /// F&O + depth-20 + depth-200 (plan item G, 2026-04-22). Counts are
+    /// zero when the respective feed wasn't dispatched this run (e.g.
+    /// depth underlyings that had no 09:12 tick).
     Phase2Complete {
         added_count: usize,
         duration_ms: u64,
+        /// Plan item G: number of depth-20 underlyings subscribed at
+        /// 09:12:30. Zero on recovery from snapshot that predates
+        /// depth-in-Phase-2 wiring.
+        depth_20_underlyings: usize,
+        /// Plan item G: number of depth-200 contracts subscribed at
+        /// 09:12:30. Max 4 today (NIFTY CE/PE + BANKNIFTY CE/PE).
+        depth_200_contracts: usize,
     },
 
     /// O1: Phase 2 failed — LTPs never arrived within `MAX_LTP_ATTEMPTS`
@@ -187,6 +227,20 @@ pub enum NotificationEvent {
 
     /// WebSocket disconnected (unexpected, will reconnect).
     WebSocketDisconnected {
+        connection_index: usize,
+        reason: String,
+    },
+
+    /// WebSocket disconnected OUTSIDE market hours — Dhan-side idle reset
+    /// (e.g. TCP `ResetWithoutClosingHandshake` during pre-market before
+    /// 09:00 IST). Auto-reconnected by the retry loop; not actionable for
+    /// the operator. Kept as an INFO-level audit trail (severity Low) per
+    /// Parthiban override (2026-04-22): "as long as it's not our
+    /// implementation causing the disconnect, don't alert HIGH off-hours".
+    ///
+    /// Supersedes the 2026-04-21 directive that fired HIGH on every
+    /// disconnect regardless of market hours.
+    WebSocketDisconnectedOffHours {
         connection_index: usize,
         reason: String,
     },
@@ -700,6 +754,49 @@ impl NotificationEvent {
                      Exiting process so the supervisor restarts us."
                 )
             }
+            Self::MarketOpenStreamingConfirmation {
+                main_feed_active,
+                main_feed_total,
+                depth_20_active,
+                depth_200_active,
+                order_update_active,
+            } => {
+                let oms = if *order_update_active { "1/1" } else { "0/1" };
+                format!(
+                    "<b>Streaming live @ 09:15:30 IST</b>\n\
+                     Main feed: {main_feed_active}/{main_feed_total}\n\
+                     Depth-20: {depth_20_active}/4\n\
+                     Depth-200: {depth_200_active}/4\n\
+                     Order updates: {oms}"
+                )
+            }
+            Self::MarketOpenDepthAnchor {
+                underlying,
+                close_0912,
+                atm_strike,
+                source_minute_slot,
+            } => {
+                let close_str = close_0912
+                    .map(|p| format!("{p:.2}"))
+                    .unwrap_or_else(|| "N/A".to_string());
+                let atm_str = atm_strike
+                    .map(|s| format!("{s:.2}"))
+                    .unwrap_or_else(|| "N/A".to_string());
+                let source_str = match source_minute_slot {
+                    Some(4) => "09:12 close",
+                    Some(3) => "09:11 close (backtrack)",
+                    Some(2) => "09:10 close (backtrack)",
+                    Some(1) => "09:09 close (backtrack)",
+                    Some(0) => "09:08 close (backtrack)",
+                    _ => "no preopen tick",
+                };
+                format!(
+                    "<b>Depth anchor: {underlying} @ 09:13 IST</b>\n\
+                     Close: {close_str}\n\
+                     ATM strike: {atm_str}\n\
+                     Source: {source_str}"
+                )
+            }
             Self::DepthIndexLtpTimeout { waited_secs } => {
                 format!(
                     "<b>Depth ATM timeout</b>\nWaited {waited_secs}s for index LTPs \
@@ -744,10 +841,15 @@ impl NotificationEvent {
             Self::Phase2Complete {
                 added_count,
                 duration_ms,
+                depth_20_underlyings,
+                depth_200_contracts,
             } => {
                 format!(
-                    "<b>Phase 2 complete</b>\nAdded {added_count} stock F&O instruments \
-                     in {duration_ms} ms."
+                    "<b>Phase 2 complete @ 09:12:30</b>\n\
+                     Stock F&O: +{added_count}\n\
+                     Depth-20: {depth_20_underlyings} underlyings\n\
+                     Depth-200: {depth_200_contracts} contracts\n\
+                     Duration: {duration_ms} ms"
                 )
             }
             Self::Phase2Failed { reason, attempts } => {
@@ -765,6 +867,16 @@ impl NotificationEvent {
             } => {
                 format!(
                     "<b>WebSocket {}/{} disconnected</b>\n{reason}",
+                    connection_index.saturating_add(1),
+                    tickvault_common::constants::MAX_WEBSOCKET_CONNECTIONS
+                )
+            }
+            Self::WebSocketDisconnectedOffHours {
+                connection_index,
+                reason,
+            } => {
+                format!(
+                    "<b>WebSocket {}/{} disconnected [off-hours, auto-reconnecting]</b>\n{reason}",
                     connection_index.saturating_add(1),
                     tickvault_common::constants::MAX_WEBSOCKET_CONNECTIONS
                 )
@@ -1169,6 +1281,7 @@ impl NotificationEvent {
             Self::TokenRenewalFailed { .. } => Severity::Critical,
             Self::InstrumentBuildFailed { .. } => Severity::High,
             Self::WebSocketDisconnected { .. } => Severity::High,
+            Self::WebSocketDisconnectedOffHours { .. } => Severity::Low,
             Self::HistoricalFetchFailed { .. } => Severity::High,
             Self::CandleVerificationFailed { .. } => Severity::High,
             Self::CandleCrossMatchFailed { .. } => Severity::High,
@@ -1200,6 +1313,8 @@ impl NotificationEvent {
             Self::WebSocketPoolDegraded { .. } => Severity::High,
             Self::WebSocketPoolRecovered { .. } => Severity::Medium,
             Self::WebSocketPoolHalt { .. } => Severity::High,
+            Self::MarketOpenStreamingConfirmation { .. } => Severity::Info,
+            Self::MarketOpenDepthAnchor { .. } => Severity::Info,
             Self::DepthIndexLtpTimeout { .. } => Severity::High,
             Self::DepthUnderlyingMissing { .. } => Severity::High,
             Self::DepthSpotPriceStale { .. } => Severity::High,
@@ -2620,5 +2735,125 @@ mod tests {
             reason: "x".to_string(),
         };
         assert_eq!(critical_event.severity(), Severity::Critical);
+    }
+
+    #[test]
+    fn test_websocket_disconnected_offhours_is_low_severity() {
+        // Regression: 2026-04-22 pre-market Telegram spam from Dhan-side
+        // TCP resets at 08:32 IST. Off-hours disconnects MUST be Low, not
+        // High — HIGH path is reserved for in-market disconnects where
+        // missed ticks are operator-actionable.
+        let ev = NotificationEvent::WebSocketDisconnectedOffHours {
+            connection_index: 0,
+            reason: "Connection reset without closing handshake".to_string(),
+        };
+        assert_eq!(ev.severity(), Severity::Low);
+    }
+
+    #[test]
+    fn test_websocket_disconnected_in_market_still_high_severity() {
+        // In-market disconnects remain HIGH — the off-hours variant is a
+        // split, not a replacement.
+        let ev = NotificationEvent::WebSocketDisconnected {
+            connection_index: 0,
+            reason: "x".to_string(),
+        };
+        assert_eq!(ev.severity(), Severity::High);
+    }
+
+    #[test]
+    fn test_phase2_complete_message_includes_depth_counts() {
+        // Plan item G (2026-04-22): unified 09:12 dispatch message must show
+        // all three feed counts so the operator knows the full scope of
+        // what subscribed at market open.
+        let ev = NotificationEvent::Phase2Complete {
+            added_count: 6123,
+            duration_ms: 450,
+            depth_20_underlyings: 4,
+            depth_200_contracts: 4,
+        };
+        let msg = ev.to_message();
+        assert!(
+            msg.contains("Stock F&O: +6123"),
+            "must show stock F&O count; got: {msg}"
+        );
+        assert!(
+            msg.contains("Depth-20: 4 underlyings"),
+            "must show depth-20 count; got: {msg}"
+        );
+        assert!(
+            msg.contains("Depth-200: 4 contracts"),
+            "must show depth-200 count; got: {msg}"
+        );
+        assert!(
+            msg.contains("09:12:30"),
+            "must reference the unified trigger time; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_market_open_streaming_confirmation_severity_is_info() {
+        // Plan #5 (2026-04-22): once-per-day positive heartbeat — must be
+        // INFO so it never wakes anyone up but still appears in Telegram.
+        let ev = NotificationEvent::MarketOpenStreamingConfirmation {
+            main_feed_active: 5,
+            main_feed_total: 5,
+            depth_20_active: 4,
+            depth_200_active: 4,
+            order_update_active: true,
+        };
+        assert_eq!(ev.severity(), Severity::Info);
+    }
+
+    #[test]
+    fn test_market_open_streaming_confirmation_message_lists_every_feed() {
+        let ev = NotificationEvent::MarketOpenStreamingConfirmation {
+            main_feed_active: 5,
+            main_feed_total: 5,
+            depth_20_active: 4,
+            depth_200_active: 4,
+            order_update_active: true,
+        };
+        let msg = ev.to_message();
+        assert!(msg.contains("Streaming live"), "got: {msg}");
+        assert!(msg.contains("Main feed: 5/5"), "got: {msg}");
+        assert!(msg.contains("Depth-20: 4/4"), "got: {msg}");
+        assert!(msg.contains("Depth-200: 4/4"), "got: {msg}");
+        assert!(msg.contains("Order updates: 1/1"), "got: {msg}");
+        assert!(
+            msg.contains("09:15:30"),
+            "must show trigger time; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_market_open_streaming_confirmation_shows_oms_disconnected() {
+        let ev = NotificationEvent::MarketOpenStreamingConfirmation {
+            main_feed_active: 5,
+            main_feed_total: 5,
+            depth_20_active: 4,
+            depth_200_active: 4,
+            order_update_active: false,
+        };
+        let msg = ev.to_message();
+        assert!(
+            msg.contains("Order updates: 0/1"),
+            "must show OMS disconnected when active=false; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_websocket_disconnected_offhours_message_mentions_auto_reconnect() {
+        // Message must tell the operator "auto-reconnecting" so they
+        // immediately know no action is needed.
+        let ev = NotificationEvent::WebSocketDisconnectedOffHours {
+            connection_index: 0,
+            reason: "Connection reset without closing handshake".to_string(),
+        };
+        let msg = ev.to_message();
+        assert!(
+            msg.contains("off-hours") && msg.contains("auto-reconnecting"),
+            "off-hours disconnect message must label itself clearly; got: {msg}"
+        );
     }
 }

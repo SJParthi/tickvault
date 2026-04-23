@@ -4,6 +4,24 @@
 > **Scope:** Any file touching main WebSocket connection pool, subscription planning, or instrument distribution.
 > **Ground truth:** `docs/dhan-ref/03-live-market-feed-websocket.md`, `docs/dhan-ref/08-annexure-enums.md`
 
+## 2026-04-22 Updates (this session, branch `claude/market-feed-depth-explanation-RynUx` / PR #324)
+
+1. **Phase 2 trigger time = 09:13:00 IST** (was 09:12:00, commit 0340a7c). Reading the preopen buffer at 09:12:00 reads slot 4 (09:12:00–09:12:59) before the close has been written. 09:13:00 guarantees the 09:12 minute is fully closed.
+
+2. **Phase 2 fires `Phase2Failed` with diagnostic when plan is empty** (commit 4aaa0fb). Includes `buffer_entries`, `skipped_no_price`, `skipped_no_expiry`, sample stocks. Silent "Added 0" is forbidden.
+
+3. **`Phase2Complete` event includes depth counts** (commit 6fd9c2a): `depth_20_underlyings`, `depth_200_contracts`. Today these are 0 (depth dispatch from 09:12 close not yet wired); they'll populate once Items B+C are merged together.
+
+4. **Off-hours WS disconnect spam fixed** (commit 996b0cc). Pre-market Dhan TCP-RSTs route to `WebSocketDisconnectedOffHours` (Severity::Low). In-market disconnects unchanged.
+
+5. **Pre-open price buffer also captures NIFTY + BANKNIFTY IDX_I closes** (commit f641315). Use `build_preopen_combined_lookup` instead of the legacy stock-only lookup. `PREOPEN_INDEX_UNDERLYINGS` constant is the source of truth.
+
+6. **Streaming-live heartbeat at 09:15:30 IST** (commit de1784a). Once-per-trading-day Telegram with feed counts. Operator's "am I connected" question now has a positive signal, not just disconnect EDGES.
+
+7. **Depth anchor at 09:13:00 IST** (commit 427bf2d). Once-per-trading-day Telegram per index showing the 09:12 close + derived ATM strike. Audit trail for "what anchored today's depth".
+
+8. **Items still pending** (do NOT pretend these are done): B (defer boot depth subscribe), real C (re-dispatch using InitialSubscribe variants), E (rebalancer 09:15 first-check gate), F (snapshot schema for depth), I (no-boot-depth-subscribe guard test), J (Phase2DispatchSource enum), K (edge-triggered Phase 2 alerts), L (audit log table), M (Grafana panels), N (tracing spans), Q (benchmark), R (runbooks).
+
 ## Architecture
 
 ### Connection Pool

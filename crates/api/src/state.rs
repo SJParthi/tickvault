@@ -8,7 +8,7 @@ const QUESTDB_HTTP_CLIENT_TIMEOUT_SECS: u64 = 10;
 
 use tickvault_common::config::{DhanConfig, InstrumentConfig, QuestDbConfig};
 use tickvault_common::instrument_types::IndexConstituencyMap;
-use tickvault_core::pipeline::top_movers::SharedTopMoversSnapshot;
+use tickvault_core::pipeline::top_movers::{SharedMoversSnapshotV2, SharedTopMoversSnapshot};
 
 /// Shared handle to the index constituency map (Arc<RwLock<Option<...>>>).
 pub type SharedConstituencyMap = Arc<RwLock<Option<IndexConstituencyMap>>>;
@@ -254,6 +254,9 @@ struct AppStateInner {
     rebuild_in_progress: AtomicBool,
     /// Shared top movers snapshot from the tick pipeline.
     top_movers_snapshot: SharedTopMoversSnapshot,
+    /// Plan item D1 (2026-04-22): unified 6-bucket V2 snapshot handle.
+    /// `None` when the V2 tracker isn't wired yet (transition period — G1).
+    movers_snapshot_v2: SharedMoversSnapshotV2,
     /// Shared index constituency map.
     constituency_map: SharedConstituencyMap,
     /// Subsystem health status for the `/health` endpoint.
@@ -289,9 +292,41 @@ impl SharedAppState {
                 instrument_config,
                 rebuild_in_progress: AtomicBool::new(false),
                 top_movers_snapshot,
+                movers_snapshot_v2: Arc::new(RwLock::new(None)),
                 constituency_map,
                 health_status,
                 questdb_http_client,
+            }),
+        }
+    }
+
+    /// Plan item D1 (2026-04-22): replaces the V2 snapshot handle. Used by
+    /// boot wiring (G1) to connect the `MoversTrackerV2` output to the
+    /// `/api/movers` handler. Returns a new `SharedAppState` that shares
+    /// all OTHER fields with the original — the v2 snapshot slot is
+    /// atomically swapped.
+    ///
+    /// Transition-period contract: when the V2 tracker has not yet been
+    /// wired (pre-G1 deploy), `movers_snapshot_v2` stays at its default
+    /// `RwLock<None>` value and the `/api/movers` handler returns an
+    /// empty snapshot so the endpoint is safe to call.
+    #[must_use]
+    // TEST-EXEMPT: covered by test_handler_populated_snapshot_returns_200_with_buckets
+    pub fn with_movers_snapshot_v2(self, handle: SharedMoversSnapshotV2) -> Self {
+        // O(1) EXEMPT: cold path — called once at boot.
+        Self {
+            inner: Arc::new(AppStateInner {
+                questdb_config: self.inner.questdb_config.clone(),
+                dhan_config: self.inner.dhan_config.clone(),
+                instrument_config: self.inner.instrument_config.clone(),
+                rebuild_in_progress: AtomicBool::new(
+                    self.inner.rebuild_in_progress.load(Ordering::Relaxed),
+                ),
+                top_movers_snapshot: Arc::clone(&self.inner.top_movers_snapshot),
+                movers_snapshot_v2: handle,
+                constituency_map: Arc::clone(&self.inner.constituency_map),
+                health_status: Arc::clone(&self.inner.health_status),
+                questdb_http_client: self.inner.questdb_http_client.clone(),
             }),
         }
     }
@@ -325,6 +360,14 @@ impl SharedAppState {
     /// Returns the shared top movers snapshot handle.
     pub fn top_movers_snapshot(&self) -> &SharedTopMoversSnapshot {
         &self.inner.top_movers_snapshot
+    }
+
+    /// Plan item D1 (2026-04-22): returns the shared V2 movers snapshot handle.
+    /// Backed by `RwLock<Option<MoversSnapshotV2>>` — handler reads under a
+    /// cheap shared lock and returns `{ "buckets": null }` when None.
+    // TEST-EXEMPT: trivial accessor covered by test_handler_empty_snapshot_returns_200_with_available_false
+    pub fn movers_snapshot_v2(&self) -> &SharedMoversSnapshotV2 {
+        &self.inner.movers_snapshot_v2
     }
 
     /// Returns the shared index constituency map handle.

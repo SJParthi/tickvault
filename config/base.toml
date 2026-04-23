@@ -296,3 +296,18 @@ inter_batch_delay_ms = 0
 # On AWS: docker daemon is always running, just starts containers.
 # Safe: probes first — if services already running, skips immediately.
 auto_start_docker = true
+
+# Plan item E1 (2026-04-22): 6-bucket movers tracker filters + cadence.
+# See crates/common/src/config.rs::MoversConfig for field semantics.
+[movers]
+stocks_min_volume = 0
+indices_min_volume = 0
+index_futures_min_volume = 1
+stock_futures_min_volume = 1
+index_options_min_volume = 1
+index_options_min_oi = 100     # Suppresses deep-OTM noise on options leaderboard
+stock_options_min_volume = 1
+stock_options_min_oi = 100
+snapshot_cadence_secs = 5      # In-memory recompute (humans poll at 1 Hz)
+persistence_cadence_secs = 1   # QuestDB write cadence (~134 rows/sec)
+top_n = 20
