@@ -71,5 +71,9 @@ harness = false
 name = "ws_reader_frame_handle"
 harness = false
 
+[[bench]]
+name = "phase2_dispatch"
+harness = false
+
 [package.metadata.cargo-machete]
 ignored = ["ahash", "arrayvec", "bytes", "chrono-tz", "failsafe", "loom", "papaya", "rtrb", "zerocopy"]

@@ -2369,12 +2369,21 @@ async fn main() -> Result<()> {
                     Vec::new()
                 };
 
+                // Plan item B.2 (2026-04-23): previously we skipped spawning
+                // depth connections when no instruments could be built at
+                // boot (pre-market LTPs unavailable). This produced zero
+                // depth subscriptions until next restart. Now we ALWAYS
+                // spawn — an empty instrument list puts the connection in
+                // DEFERRED mode (socket up, no subscribe sent) and the
+                // 09:13 dispatcher (real-C) sends InitialSubscribe20 once
+                // the 09:12 close is available in the preopen buffer.
+                // 200-level gets the same treatment via `Option<u32>` for
+                // the ATM CE/PE security_id below.
                 if instruments_for_underlying.is_empty() {
                     info!(
                         underlying,
-                        "20-level depth: no instruments selected — skipping"
+                        "20-level depth: no instruments selected at boot — spawning DEFERRED connection, 09:13 dispatcher will InitialSubscribe20"
                     );
-                    continue;
                 }
 
                 // Extract ATM CE + ATM PE for 200-level depth.
@@ -2748,18 +2757,25 @@ async fn main() -> Result<()> {
                 // O(1) EXEMPT: begin — boot-time 200-level depth setup (max 2 spawns per underlying)
                 // Only NIFTY + BANKNIFTY get 200-level (4 connections within Dhan's 5 limit).
                 if *underlying == "NIFTY" || *underlying == "BANKNIFTY" {
-                    // Pair the precise CE/PE labels with their security_ids so every
-                    // downstream log line + Telegram alert identifies the exact
-                    // contract (e.g. `NIFTY-Apr2026-22500-CE`).
-                    let atm_ce_entry = atm_ce.as_ref().map(|(sid, lbl)| ("CE", *sid, lbl.clone()));
-                    let atm_pe_entry = atm_pe.as_ref().map(|(sid, lbl)| ("PE", *sid, lbl.clone()));
-                    for opt_entry in [atm_ce_entry, atm_pe_entry] {
+                    // Plan item B.2 (2026-04-23): when boot-time ATM is
+                    // unavailable (pre-market deploy before 09:00 LTPs
+                    // arrive), spawn the 200-level connection in DEFERRED
+                    // mode with `depth200_sid = None`. The 09:13 dispatcher
+                    // (real-C) will send InitialSubscribe200 once the
+                    // 09:12 close is in the preopen buffer. Label carries
+                    // "-deferred" so Telegrams + logs reflect the state.
+                    // No ERROR-level alert here — pre-market missing ATM
+                    // is EXPECTED, not a planner bug.
+                    let atm_ce_entry: (&str, Option<u32>, String) = match atm_ce.as_ref() {
+                        Some((sid, lbl)) => ("CE", Some(*sid), lbl.clone()), // O(1) EXEMPT: boot-time
+                        None => ("CE", None, format!("{underlying}-CE-deferred")), // O(1) EXEMPT: boot-time
+                    };
+                    let atm_pe_entry: (&str, Option<u32>, String) = match atm_pe.as_ref() {
+                        Some((sid, lbl)) => ("PE", Some(*sid), lbl.clone()), // O(1) EXEMPT: boot-time
+                        None => ("PE", None, format!("{underlying}-PE-deferred")), // O(1) EXEMPT: boot-time
+                    };
+                    for opt_entry in [Some(atm_ce_entry), Some(atm_pe_entry)] {
                         let Some((opt_label, depth200_sid, depth200_label)) = opt_entry else {
-                            // ERROR triggers Telegram — ATM None for major index is actionable
-                            error!(
-                                underlying,
-                                "200-level depth: no ATM CE/PE found — skipping (check subscription planner)"
-                            );
                             continue;
                         };
 
@@ -2767,12 +2783,15 @@ async fn main() -> Result<()> {
                         let depth200_client_id = ws_client_id.clone();
                         let depth200_segment = tickvault_common::types::ExchangeSegment::NseFno;
 
+                        // depth200_sid is Option<u32> (Item B.2): Some = ATM
+                        // available at boot, None = deferred until 09:13.
+                        let sid_log: i64 = depth200_sid.map_or(-1, i64::from);
                         info!(
                             underlying,
                             option = opt_label,
-                            security_id = depth200_sid,
+                            security_id = sid_log,
                             contract = %depth200_label,
-                            "spawning 200-level depth connection (contract={depth200_label}, sid={depth200_sid})"
+                            "spawning 200-level depth connection (contract={depth200_label}, sid={sid_log})"
                         );
 
                         let (tx200, mut rx200) = tokio::sync::mpsc::channel::<bytes::Bytes>(1024);
@@ -2868,8 +2887,13 @@ async fn main() -> Result<()> {
                         let d200_reconnect_notifier = Some(notifier.clone());
                         let d200_label_for_disconnect = depth200_label.clone();
                         let d200_label_for_signal = depth200_label.clone();
-                        let d200_sid_for_disconnect = depth200_sid;
-                        let d200_sid_for_signal = depth200_sid;
+                        // Use 0 sentinel for the Telegram/disconnect event
+                        // when deferred (pre-09:13 boot) — the event types
+                        // take u32 and the 09:13 dispatcher will log the
+                        // real sid via InitialSubscribe200 before any
+                        // disconnect notification is meaningful.
+                        let d200_sid_for_disconnect: u32 = depth200_sid.unwrap_or(0);
+                        let d200_sid_for_signal: u32 = depth200_sid.unwrap_or(0);
                         let d200_wal_spill = ws_frame_spill.clone();
                         let (d200_signal_tx, d200_signal_rx) =
                             tokio::sync::oneshot::channel::<()>();
@@ -2895,6 +2919,9 @@ async fn main() -> Result<()> {
                                     depth200_token,
                                     depth200_client_id,
                                     depth200_segment,
+                                    // depth200_sid is already Option<u32>
+                                    // (Item B.2): None = deferred, Some =
+                                    // boot-time ATM available.
                                     depth200_sid,
                                     depth200_label,
                                     tx200,
@@ -3308,6 +3335,18 @@ async fn main() -> Result<()> {
                 let anchor_buffer = std::sync::Arc::clone(&preopen_buffer);
                 let anchor_universe = depth_anchor_universe;
                 let anchor_calendar = std::sync::Arc::clone(&trading_calendar);
+                // Plan item real-C (2026-04-23): the 09:13 task now also
+                // dispatches InitialSubscribe20/InitialSubscribe200 commands
+                // to the depth connections spawned in DEFERRED mode (item
+                // B.2). `anchor_cmd_senders` is the per-underlying map of
+                // mpsc::Sender<DepthCommand> built when depth connections
+                // were spawned earlier in boot.
+                let anchor_cmd_senders = std::sync::Arc::clone(&depth_cmd_senders);
+                let anchor_twenty_max = config.subscription.twenty_depth_max_instruments;
+                // Live LTPs for FINNIFTY + MIDCPNIFTY (the preopen buffer
+                // only captures NIFTY + BANKNIFTY IDX_I). At 09:13 the main
+                // feed has been streaming for ~13 min so these are present.
+                let anchor_shared_spot_prices = std::sync::Arc::clone(&shared_spot_prices);
                 tokio::spawn(async move {
                     use chrono::{FixedOffset, NaiveTime, TimeZone, Utc};
                     use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
@@ -3393,6 +3432,153 @@ async fn main() -> Result<()> {
                             source_minute_slot,
                         });
                     }
+
+                    // Plan item real-C (2026-04-23): dispatch
+                    // InitialSubscribe20 + InitialSubscribe200 to depth
+                    // connections spawned in DEFERRED mode (item B.2).
+                    //
+                    // Spot prices sourced from two places, in priority order:
+                    //   1. NIFTY + BANKNIFTY: 09:12 close from the preopen
+                    //      buffer (authoritative — matches Dhan's reference).
+                    //   2. FINNIFTY + MIDCPNIFTY: live LTP from
+                    //      SharedSpotPrices (main feed has been streaming
+                    //      since 09:00 pre-open).
+                    //
+                    // Underlyings missing a spot at 09:13 are skipped with a
+                    // WARN; the depth rebalancer's 09:15 first-check gate
+                    // will pick them up once the main feed has a fresh LTP.
+                    let mut spot_map: std::collections::HashMap<String, f64> =
+                        // O(1) EXEMPT: 4-entry map built once per day
+                        std::collections::HashMap::new();
+                    {
+                        let live = anchor_shared_spot_prices.read().await;
+                        for (k, entry) in live.iter() {
+                            spot_map.insert(k.clone(), entry.price); // O(1) EXEMPT: 4 entries
+                        }
+                    }
+                    for (sym, _id) in
+                        tickvault_core::instrument::preopen_price_buffer::PREOPEN_INDEX_UNDERLYINGS
+                    {
+                        if let Some(c) = snap.get(*sym).and_then(|cl| cl.backtrack_latest()) {
+                            spot_map.insert((*sym).to_string(), c); // O(1) EXEMPT: 2 overrides
+                        }
+                    }
+
+                    let depth_ul: [&str; 4] = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"];
+                    let today = now_ist.date_naive();
+                    let selections =
+                        tickvault_core::instrument::depth_strike_selector::select_depth_instruments(
+                            &anchor_universe,
+                            &depth_ul,
+                            &spot_map,
+                            today,
+                            tickvault_core::instrument::depth_strike_selector::DEPTH_ATM_STRIKES_EACH_SIDE,
+                        );
+                    let m_dispatch_total =
+                        metrics::counter!("tv_depth_initial_subscribe_dispatched_total");
+                    let m_dispatch_failed =
+                        metrics::counter!("tv_depth_initial_subscribe_dispatch_failed_total");
+
+                    let senders = anchor_cmd_senders.lock().await;
+                    for sel in &selections {
+                        // 20-level InitialSubscribe.
+                        let instruments: Vec<
+                            tickvault_core::websocket::types::InstrumentSubscription,
+                        > = sel
+                            .all_security_ids
+                            .iter()
+                            .take(anchor_twenty_max)
+                            .map(|&sid| {
+                                tickvault_core::websocket::types::InstrumentSubscription::new(
+                                    tickvault_common::types::ExchangeSegment::NseFno,
+                                    sid,
+                                )
+                            })
+                            .collect::<Vec<_>>(); // O(1) EXEMPT: 4 underlyings × ~49 contracts, once per day
+                        let subscribe_messages = tickvault_core::websocket::subscription_builder::build_twenty_depth_subscription_messages(
+                            &instruments,
+                            50, // Dhan max batch size for 20-level subscribe
+                        );
+
+                        if let Some(sender) = senders.get(&sel.underlying_symbol) {
+                            let cmd = tickvault_core::websocket::DepthCommand::InitialSubscribe20 {
+                                subscribe_messages: subscribe_messages.clone(), // O(1) EXEMPT: once-per-day
+                            };
+                            if sender.send(cmd).await.is_err() {
+                                error!(
+                                    underlying = %sel.underlying_symbol,
+                                    "09:13 dispatch: InitialSubscribe20 send failed — depth receiver dropped"
+                                );
+                                m_dispatch_failed.increment(1);
+                            } else {
+                                m_dispatch_total.increment(1);
+                            }
+                        } else {
+                            warn!(
+                                underlying = %sel.underlying_symbol,
+                                "09:13 dispatch: no depth_cmd_sender registered for 20-level underlying"
+                            );
+                        }
+
+                        // 200-level: only NIFTY + BANKNIFTY (Dhan 5-conn cap).
+                        if sel.underlying_symbol != "NIFTY" && sel.underlying_symbol != "BANKNIFTY"
+                        {
+                            continue;
+                        }
+                        for (opt_label, opt_sid) in [
+                            ("CE", sel.atm_ce_security_id),
+                            ("PE", sel.atm_pe_security_id),
+                        ] {
+                            let Some(sid) = opt_sid else {
+                                warn!(
+                                    underlying = %sel.underlying_symbol,
+                                    option = opt_label,
+                                    "09:13 dispatch: missing ATM CE/PE sid for 200-level"
+                                );
+                                continue;
+                            };
+                            let segment_str =
+                                tickvault_common::types::ExchangeSegment::NseFno.as_str();
+                            let sid_str = sid.to_string(); // O(1) EXEMPT: 4 per day
+                            let subscribe_message = serde_json::json!({
+                                "RequestCode": 23,
+                                "ExchangeSegment": segment_str,
+                                "SecurityId": sid_str,
+                            })
+                            .to_string(); // O(1) EXEMPT: 4 per day
+                            let key = format!("{}-{}", sel.underlying_symbol, opt_label); // O(1) EXEMPT: 4 per day
+                            if let Some(sender) = senders.get(&key) {
+                                let cmd =
+                                    tickvault_core::websocket::DepthCommand::InitialSubscribe200 {
+                                        subscribe_message,
+                                    };
+                                if sender.send(cmd).await.is_err() {
+                                    error!(
+                                        key,
+                                        "09:13 dispatch: InitialSubscribe200 send failed — depth receiver dropped"
+                                    );
+                                    m_dispatch_failed.increment(1);
+                                } else {
+                                    m_dispatch_total.increment(1);
+                                }
+                            } else {
+                                warn!(
+                                    key,
+                                    "09:13 dispatch: no depth_cmd_sender registered for 200-level key"
+                                );
+                            }
+                        }
+
+                        info!(
+                            underlying = %sel.underlying_symbol,
+                            atm_strike = sel.atm_strike,
+                            twenty_count = sel.all_security_ids.len(),
+                            atm_ce_sid = ?sel.atm_ce_security_id,
+                            atm_pe_sid = ?sel.atm_pe_security_id,
+                            "PROOF: 09:13 dispatcher sent InitialSubscribe20 + InitialSubscribe200"
+                        );
+                    }
+                    drop(senders);
                 });
             }
 
