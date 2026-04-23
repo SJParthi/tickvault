@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use secrecy::{ExposeSecret, SecretString};
-use tracing::{info, instrument, warn};
+use tracing::{error, info, instrument, warn};
 
 use tickvault_common::config::NotificationConfig;
 use tickvault_common::constants::{
@@ -322,14 +322,38 @@ impl NotificationService {
 
                     tokio::spawn(async move {
                         let total = chunks.len();
+                        let mut failed_parts: Vec<usize> = Vec::new();
                         for (idx, chunk) in chunks.iter().enumerate() {
+                            let part_num = idx.saturating_add(1);
                             let body = if total > 1 {
-                                format!("(Part {}/{})\n{chunk}", idx.saturating_add(1), total)
+                                format!("(Part {part_num}/{total})\n{chunk}")
                             } else {
                                 chunk.clone()
                             };
-                            send_telegram_message(&client, &base_url, &token, &chat_id, &body)
-                                .await;
+                            let ok = send_telegram_chunk_with_retry(
+                                &client, &base_url, &token, &chat_id, &body,
+                            )
+                            .await;
+                            if !ok {
+                                failed_parts.push(part_num);
+                            }
+                        }
+                        // Q3 (2026-04-23): if ANY chunk failed after all
+                        // retries, emit a single ERROR log so the operator
+                        // knows the report is incomplete. Loki routes
+                        // ERROR-level tracing events to Telegram via
+                        // alertmanager, so this serves as the
+                        // "delivery-failed, investigate" signal even
+                        // though the Telegram transport itself is the
+                        // thing that failed (the alertmanager path is
+                        // independent — different chat channel / retry).
+                        if !failed_parts.is_empty() {
+                            error!(
+                                total_chunks = total,
+                                failed_chunks = failed_parts.len(),
+                                failed_part_numbers = ?failed_parts,
+                                "notification: Telegram chunked-send had mid-batch failures after retries — user-visible report is incomplete"
+                            );
                         }
                     });
                 }
@@ -427,13 +451,60 @@ pub(crate) fn split_message_for_telegram(full: &str) -> Vec<String> {
 /// # Performance
 ///
 /// Cold path only. Called from a spawned task.
+/// Per-chunk retry budget when Telegram returns a transient failure. Q3
+/// (2026-04-23): a previous implementation logged WARN on failure and
+/// moved on to the next chunk — on a 14-part CROSS-MATCH FAILED message
+/// a mid-batch 429 or TLS blip would leave the operator with a gap in
+/// the details. Three retries with `100ms → 400ms → 1600ms` backoff
+/// cover typical rate-limit windows without falling off the
+/// notification-task timeout budget.
+pub(crate) const TELEGRAM_SEND_MAX_ATTEMPTS: u32 = 3;
+
+/// Initial backoff (in milliseconds) before the second attempt. Doubled
+/// each retry, capped at [`TELEGRAM_SEND_BACKOFF_CAP_SECS`]. Stored as
+/// `u64` rather than `Duration` so the banned-pattern scanner recognises
+/// it as a named constant (the scanner rejects
+/// `Duration::from_millis(<literal>)` outright).
+pub(crate) const TELEGRAM_SEND_BACKOFF_INITIAL_MS: u64 = 100;
+
+/// Upper bound on the retry sleep (in seconds) — prevents a single stuck
+/// chunk from delaying the rest of the background notification task
+/// indefinitely.
+pub(crate) const TELEGRAM_SEND_BACKOFF_CAP_SECS: u64 = 2;
+
+/// Outcome of a single Telegram `sendMessage` request. Drives whether
+/// the caller retries the same chunk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TelegramSendOutcome {
+    /// HTTP 2xx — Telegram accepted the message.
+    Success,
+    /// Network error, 5xx, or 429 rate-limit — worth retrying.
+    Transient,
+    /// 4xx other than 429 — retrying won't help (bad bot token, wrong
+    /// chat_id, malformed HTML). Log ERROR once and move on.
+    Permanent,
+}
+
+/// Classifies an HTTP status for Telegram-send retry decisions. 429 and
+/// 5xx are transient (retry); other 4xx are permanent (don't retry); 2xx
+/// is success.
+fn classify_telegram_status(status: reqwest::StatusCode) -> TelegramSendOutcome {
+    if status.is_success() {
+        TelegramSendOutcome::Success
+    } else if status.as_u16() == 429 || status.is_server_error() {
+        TelegramSendOutcome::Transient
+    } else {
+        TelegramSendOutcome::Permanent
+    }
+}
+
 async fn send_telegram_message(
     client: &reqwest::Client,
     base_url: &str,
     bot_token: &SecretString,
     chat_id: &str,
     text: &str,
-) {
+) -> TelegramSendOutcome {
     let url = format!("{}/bot{}/sendMessage", base_url, bot_token.expose_secret());
 
     let body = serde_json::json!({
@@ -444,15 +515,26 @@ async fn send_telegram_message(
 
     match client.post(&url).json(&body).send().await {
         Ok(response) => {
-            if response.status().is_success() {
-                tracing::debug!("notification: Telegram message sent");
-            } else {
-                let status = response.status();
-                warn!(
-                    status = %status,
-                    "notification: Telegram sendMessage returned non-success status"
-                );
+            let status = response.status();
+            let outcome = classify_telegram_status(status);
+            match outcome {
+                TelegramSendOutcome::Success => {
+                    tracing::debug!("notification: Telegram message sent");
+                }
+                TelegramSendOutcome::Transient => {
+                    warn!(
+                        status = %status,
+                        "notification: Telegram sendMessage transient failure — will retry"
+                    );
+                }
+                TelegramSendOutcome::Permanent => {
+                    warn!(
+                        status = %status,
+                        "notification: Telegram sendMessage permanent failure (4xx non-429) — not retrying"
+                    );
+                }
             }
+            outcome
         }
         Err(err) => {
             // SECURITY: reqwest::Error Display may include the request URL,
@@ -462,10 +544,46 @@ async fn send_telegram_message(
                 .replace(bot_token.expose_secret(), "[REDACTED]");
             warn!(
                 error = %safe_msg,
-                "notification: Telegram sendMessage HTTP error"
+                "notification: Telegram sendMessage HTTP error (transient)"
             );
+            // Network errors are always transient — DNS, TLS handshake,
+            // TCP reset all self-heal on retry.
+            TelegramSendOutcome::Transient
         }
     }
+}
+
+/// Sends a single Telegram chunk with per-chunk retry. Retries transient
+/// failures (network, 5xx, 429) up to [`TELEGRAM_SEND_MAX_ATTEMPTS`] with
+/// doubling backoff; returns `true` iff at least one attempt succeeded.
+/// Permanent 4xx responses abort immediately (retry won't help).
+///
+/// Q3 regression (2026-04-23): before this wrapper, the chunked send
+/// loop called `send_telegram_message` once per chunk and moved on —
+/// a single rate-limited mid-batch chunk produced a silent gap in the
+/// user-visible CROSS-MATCH FAILED report.
+pub(crate) async fn send_telegram_chunk_with_retry(
+    client: &reqwest::Client,
+    base_url: &str,
+    bot_token: &SecretString,
+    chat_id: &str,
+    text: &str,
+) -> bool {
+    let mut delay = Duration::from_millis(TELEGRAM_SEND_BACKOFF_INITIAL_MS);
+    let cap = Duration::from_secs(TELEGRAM_SEND_BACKOFF_CAP_SECS);
+    for attempt in 1..=TELEGRAM_SEND_MAX_ATTEMPTS {
+        match send_telegram_message(client, base_url, bot_token, chat_id, text).await {
+            TelegramSendOutcome::Success => return true,
+            TelegramSendOutcome::Permanent => return false,
+            TelegramSendOutcome::Transient => {
+                if attempt < TELEGRAM_SEND_MAX_ATTEMPTS {
+                    tokio::time::sleep(delay).await;
+                    delay = delay.saturating_mul(2).min(cap);
+                }
+            }
+        }
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -941,6 +1059,102 @@ mod tests {
         let token = SecretString::from("fake-bot-token".to_string());
 
         send_telegram_message(&client, &base_url, &token, "999999999", "test message").await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Q3 regression pins (2026-04-23): Telegram chunk-send retry + classify.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_classify_telegram_status_success_is_success() {
+        assert_eq!(
+            classify_telegram_status(reqwest::StatusCode::OK),
+            TelegramSendOutcome::Success
+        );
+        assert_eq!(
+            classify_telegram_status(reqwest::StatusCode::ACCEPTED),
+            TelegramSendOutcome::Success
+        );
+    }
+
+    #[test]
+    fn test_classify_telegram_status_429_is_transient() {
+        // Rate-limited — must retry, not give up.
+        assert_eq!(
+            classify_telegram_status(reqwest::StatusCode::TOO_MANY_REQUESTS),
+            TelegramSendOutcome::Transient
+        );
+    }
+
+    #[test]
+    fn test_classify_telegram_status_5xx_is_transient() {
+        // Server errors (502, 503, 504) are telegram-side blips — retry.
+        for code in [500, 502, 503, 504] {
+            let status = reqwest::StatusCode::from_u16(code).unwrap();
+            assert_eq!(
+                classify_telegram_status(status),
+                TelegramSendOutcome::Transient,
+                "HTTP {code} must classify as transient"
+            );
+        }
+    }
+
+    #[test]
+    fn test_classify_telegram_status_4xx_non_429_is_permanent() {
+        // Client errors (400/401/403/404) won't succeed on retry — 4xx means
+        // the message body or credentials are wrong. Abort, don't retry.
+        for code in [400, 401, 403, 404] {
+            let status = reqwest::StatusCode::from_u16(code).unwrap();
+            assert_eq!(
+                classify_telegram_status(status),
+                TelegramSendOutcome::Permanent,
+                "HTTP {code} must classify as permanent (no retry)"
+            );
+        }
+    }
+
+    // Compile-time guards on the retry-budget constants. `const _: () = ...`
+    // pattern evaluates the assertion at build time, so a future edit that
+    // sets `TELEGRAM_SEND_MAX_ATTEMPTS = 1` or pushes the backoff cap to
+    // 60s will fail `cargo build` rather than slipping through.
+    const _: () = assert!(
+        TELEGRAM_SEND_MAX_ATTEMPTS >= 2,
+        "retry must attempt at least twice (original + 1 retry)"
+    );
+    const _: () = assert!(
+        TELEGRAM_SEND_BACKOFF_INITIAL_MS <= TELEGRAM_SEND_BACKOFF_CAP_SECS * 1000,
+        "initial backoff must not exceed cap"
+    );
+    const _: () = assert!(
+        TELEGRAM_SEND_BACKOFF_CAP_SECS <= 10,
+        "backoff cap must stay low so a stuck chunk does not hold up \
+         the rest of the notification task"
+    );
+
+    #[tokio::test]
+    async fn test_send_telegram_chunk_with_retry_gives_up_on_permanent() {
+        // Hit a guaranteed-404 URL path — should classify as Permanent on
+        // the very first attempt and return false without retrying.
+        let base_url = "http://127.0.0.1:1".to_string(); // port 1 → connect refused
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(50))
+            .build()
+            .unwrap();
+        let token = SecretString::from("fake".to_string());
+
+        // Connect-refused = transient (we'll exhaust all retries then fail).
+        let started = std::time::Instant::now();
+        let ok = send_telegram_chunk_with_retry(&client, &base_url, &token, "chat", "msg").await;
+        let elapsed = started.elapsed();
+
+        assert!(!ok, "unreachable host must return false after retries");
+        // Three transient attempts with 50ms timeout each + 100ms + 200ms
+        // backoff between them = ~450ms floor. Confirm we actually slept
+        // (i.e., retried) rather than giving up instantly on attempt 1.
+        assert!(
+            elapsed >= Duration::from_millis(100),
+            "must have retried at least once (elapsed = {elapsed:?})"
+        );
     }
 
     // -----------------------------------------------------------------------

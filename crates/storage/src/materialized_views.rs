@@ -4,13 +4,25 @@
 //! timeframes from 5 seconds to 1 month. Live WebSocket data arrives as IST
 //! epoch seconds (stored directly). Historical REST data arrives as UTC epoch
 //! seconds (+19800s offset applied at persistence). Both result in IST-based
-//! timestamps. Views use `OFFSET '00:00'` since stored data is already IST.
+//! timestamps.
+//!
+//! # Bucket alignment
+//!
+//! Most views use `OFFSET '00:00'` (IST midnight). The hourly view
+//! `candles_1h` is the exception — it uses `OFFSET '00:15'` so its buckets
+//! start at the NSE market open (09:15 IST) and match Dhan's `/charts/intraday`
+//! `interval="60"` response timestamps exactly. Without that offset, live 60m
+//! candles land at 09:00/10:00/... while historical 60m candles land at
+//! 09:15/10:15/..., and every cross-verification `(ts, security_id)` join
+//! misses on 60m. (1m/5m/15m naturally align because 15 divides into 1/5/15.)
 //!
 //! Timeframes 20-21 (3 months, 1 year) are computed in Rust from monthly data.
 //!
 //! # Idempotency
 //! All DDL uses `CREATE TABLE IF NOT EXISTS` / `CREATE MATERIALIZED VIEW IF NOT EXISTS`.
-//! Safe to call every startup.
+//! Safe to call every startup. A one-time migration
+//! (`drop_misaligned_hourly_chain_if_needed`) drops the hourly view chain
+//! when it detects old `:00` alignment, so Step 5 recreates it at `:15`.
 
 use std::time::Duration;
 
@@ -18,6 +30,13 @@ use tracing::{debug, error, info, warn};
 
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::constants::{QUESTDB_IST_ALIGN_OFFSET, QUESTDB_TABLE_CANDLES_1S};
+
+/// Bucket alignment for the hourly view chain.
+///
+/// NSE market opens at 09:15 IST. Dhan's `/charts/intraday` API with
+/// `interval="60"` returns candles bucketed at `09:15, 10:15, ..., 15:15`.
+/// Live 60m candles must bucket at the same offset for cross-match to join.
+const QUESTDB_HOURLY_ALIGN_OFFSET: &str = "00:15";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -73,6 +92,12 @@ struct ViewDef {
     interval: &'static str,
     /// Whether source has tick_count (sub-minute views aggregate tick_count).
     has_tick_count: bool,
+    /// `ALIGN TO CALENDAR WITH OFFSET` value (e.g., "00:00", "00:15").
+    ///
+    /// Defaults to `QUESTDB_IST_ALIGN_OFFSET` ("00:00"). Only the hourly view
+    /// `candles_1h` overrides to `QUESTDB_HOURLY_ALIGN_OFFSET` ("00:15") so its
+    /// buckets match Dhan's market-open-aligned 60m historical candles.
+    align_offset: &'static str,
 }
 
 /// All 18 materialized views ordered by dependency chain.
@@ -92,30 +117,35 @@ const VIEW_DEFS: &[ViewDef] = &[
         source: "candles_1s",
         interval: "5s",
         has_tick_count: true,
+        align_offset: QUESTDB_IST_ALIGN_OFFSET,
     },
     ViewDef {
         name: "candles_10s",
         source: "candles_1s",
         interval: "10s",
         has_tick_count: true,
+        align_offset: QUESTDB_IST_ALIGN_OFFSET,
     },
     ViewDef {
         name: "candles_15s",
         source: "candles_1s",
         interval: "15s",
         has_tick_count: true,
+        align_offset: QUESTDB_IST_ALIGN_OFFSET,
     },
     ViewDef {
         name: "candles_30s",
         source: "candles_1s",
         interval: "30s",
         has_tick_count: true,
+        align_offset: QUESTDB_IST_ALIGN_OFFSET,
     },
     ViewDef {
         name: "candles_1m",
         source: "candles_1s",
         interval: "1m",
         has_tick_count: true,
+        align_offset: QUESTDB_IST_ALIGN_OFFSET,
     },
     // Minute-level from 1m
     ViewDef {
@@ -123,18 +153,21 @@ const VIEW_DEFS: &[ViewDef] = &[
         source: "candles_1m",
         interval: "2m",
         has_tick_count: false,
+        align_offset: QUESTDB_IST_ALIGN_OFFSET,
     },
     ViewDef {
         name: "candles_3m",
         source: "candles_1m",
         interval: "3m",
         has_tick_count: false,
+        align_offset: QUESTDB_IST_ALIGN_OFFSET,
     },
     ViewDef {
         name: "candles_5m",
         source: "candles_1m",
         interval: "5m",
         has_tick_count: false,
+        align_offset: QUESTDB_IST_ALIGN_OFFSET,
     },
     // Multi-minute from 5m
     ViewDef {
@@ -142,12 +175,14 @@ const VIEW_DEFS: &[ViewDef] = &[
         source: "candles_5m",
         interval: "10m",
         has_tick_count: false,
+        align_offset: QUESTDB_IST_ALIGN_OFFSET,
     },
     ViewDef {
         name: "candles_15m",
         source: "candles_5m",
         interval: "15m",
         has_tick_count: false,
+        align_offset: QUESTDB_IST_ALIGN_OFFSET,
     },
     // Half-hour from 15m
     ViewDef {
@@ -155,13 +190,16 @@ const VIEW_DEFS: &[ViewDef] = &[
         source: "candles_15m",
         interval: "30m",
         has_tick_count: false,
+        align_offset: QUESTDB_IST_ALIGN_OFFSET,
     },
-    // Hourly from 30m
+    // Hourly from 30m — offset '00:15' so buckets start at NSE market open
+    // (09:15 IST) and match Dhan's /charts/intraday interval=60 timestamps.
     ViewDef {
         name: "candles_1h",
         source: "candles_30m",
         interval: "1h",
         has_tick_count: false,
+        align_offset: QUESTDB_HOURLY_ALIGN_OFFSET,
     },
     // Multi-hour from 1h
     ViewDef {
@@ -169,18 +207,21 @@ const VIEW_DEFS: &[ViewDef] = &[
         source: "candles_1h",
         interval: "2h",
         has_tick_count: false,
+        align_offset: QUESTDB_IST_ALIGN_OFFSET,
     },
     ViewDef {
         name: "candles_3h",
         source: "candles_1h",
         interval: "3h",
         has_tick_count: false,
+        align_offset: QUESTDB_IST_ALIGN_OFFSET,
     },
     ViewDef {
         name: "candles_4h",
         source: "candles_1h",
         interval: "4h",
         has_tick_count: false,
+        align_offset: QUESTDB_IST_ALIGN_OFFSET,
     },
     // Daily from 1h
     ViewDef {
@@ -188,6 +229,7 @@ const VIEW_DEFS: &[ViewDef] = &[
         source: "candles_1h",
         interval: "1d",
         has_tick_count: false,
+        align_offset: QUESTDB_IST_ALIGN_OFFSET,
     },
     // Weekly from 1d
     ViewDef {
@@ -195,6 +237,7 @@ const VIEW_DEFS: &[ViewDef] = &[
         source: "candles_1d",
         interval: "7d",
         has_tick_count: false,
+        align_offset: QUESTDB_IST_ALIGN_OFFSET,
     },
     // Monthly from 1d
     ViewDef {
@@ -202,6 +245,7 @@ const VIEW_DEFS: &[ViewDef] = &[
         source: "candles_1d",
         interval: "1M",
         has_tick_count: false,
+        align_offset: QUESTDB_IST_ALIGN_OFFSET,
     },
 ];
 
@@ -251,7 +295,11 @@ fn validate_dependency_order(base_table: &str) -> bool {
 
 /// Builds the CREATE MATERIALIZED VIEW SQL for a given view definition.
 ///
-/// Data is stored as IST-as-UTC — offset '00:00' since midnight "UTC" IS midnight IST.
+/// Data is stored as IST-as-UTC. Most views use `offset '00:00'` since midnight
+/// "UTC" IS midnight IST. The `candles_1h` view overrides to `'00:15'` so its
+/// buckets start at the NSE market open (09:15 IST), matching Dhan's
+/// `/charts/intraday` `interval="60"` response exactly — required for
+/// cross-verification `(security_id, ts, segment)` joins to succeed on 60m.
 fn build_view_sql(def: &ViewDef) -> String {
     let tick_count_select = if def.has_tick_count {
         ", sum(tick_count) AS tick_count"
@@ -274,7 +322,7 @@ fn build_view_sql(def: &ViewDef) -> String {
         source = def.source,
         interval = def.interval,
         tick_count = tick_count_select,
-        offset = QUESTDB_IST_ALIGN_OFFSET,
+        offset = def.align_offset,
     )
 }
 
@@ -338,6 +386,18 @@ pub async fn ensure_candle_views(questdb_config: &QuestDbConfig) {
     if views_missing_greeks(&client, &base_url).await {
         info!("materialized views lack Greeks columns — dropping for recreation");
         drop_all_views(&client, &base_url).await;
+    }
+
+    // Step 4b: Drop the hourly-chain views if candles_1h has stale 00:00
+    // alignment (old schema). Step 5 will recreate candles_1h at 00:15 so its
+    // buckets match Dhan's market-open-aligned 60m historical candles and the
+    // cross-match (security_id, ts, segment) join succeeds on 60m.
+    if hourly_view_misaligned(&client, &base_url).await {
+        info!(
+            "candles_1h has stale 00:00 alignment — dropping hourly chain for \
+             00:15 realignment (matches Dhan /charts/intraday interval=60)"
+        );
+        drop_hourly_chain_views(&client, &base_url).await;
     }
 
     // Step 5: Create materialized views in dependency order.
@@ -524,6 +584,80 @@ async fn drop_all_views(client: &reqwest::Client, base_url: &str) {
     info!("all 18 materialized views dropped for Greeks migration");
 }
 
+/// Names of the hourly-chain views that must be rebuilt together when
+/// `candles_1h`'s alignment offset changes. Listed in reverse dependency order
+/// so children are dropped before parents.
+const HOURLY_CHAIN_VIEWS: &[&str] = &[
+    "candles_1M",
+    "candles_7d",
+    "candles_1d",
+    "candles_4h",
+    "candles_3h",
+    "candles_2h",
+    "candles_1h",
+];
+
+/// Checks whether `candles_1h` still uses the old `00:00` bucket alignment.
+///
+/// Probes the view for a single row's timestamp and computes
+/// `(epoch_seconds) % 3600`. With new `00:15` alignment every bucket timestamp
+/// has seconds-of-hour = 900. With old `00:00` alignment it is 0.
+///
+/// Returns `true` when the probe succeeds and the sampled row is `:00`-aligned
+/// (migration required). Returns `false` when the view is absent, empty, or
+/// already `:15`-aligned.
+async fn hourly_view_misaligned(client: &reqwest::Client, base_url: &str) -> bool {
+    // Use QuestDB's datediff-friendly SQL: cast ts to long nanos, divide to
+    // seconds, modulo 3600. `LIMIT 1` keeps the probe cheap.
+    let probe_sql =
+        "SELECT (to_long(ts) / 1000000000) % 3600 AS sec_in_hour FROM candles_1h LIMIT 1";
+    let response = match client
+        .get(base_url)
+        .query(&[("query", probe_sql)])
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => r,
+        // View absent or query failed → Step 5 will create with new alignment.
+        _ => return false,
+    };
+
+    let body = match response.text().await {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+
+    // Cheap JSON scan: look for `"dataset":[[0]]` vs `"dataset":[[900]]`.
+    // Any value other than 900 on a freshly-produced bucket means old schema.
+    // Presence of `[[0]]` specifically locks the old-schema detection.
+    if body.contains("\"dataset\":[[0]]") {
+        return true;
+    }
+    // Also treat "count=0" / empty dataset as non-misaligned (nothing to fix).
+    false
+}
+
+/// Drops the hourly-chain materialized views so Step 5 recreates them with the
+/// updated alignment offset. Safe to call even if some views don't exist —
+/// `DROP MATERIALIZED VIEW IF EXISTS` is idempotent.
+async fn drop_hourly_chain_views(client: &reqwest::Client, base_url: &str) {
+    for name in HOURLY_CHAIN_VIEWS {
+        let drop_sql = format!("DROP MATERIALIZED VIEW IF EXISTS {name}");
+        drop(
+            client
+                .get(base_url)
+                .query(&[("query", &drop_sql)])
+                .send()
+                .await,
+        );
+        debug!(view = name, "dropped hourly-chain view for realignment");
+    }
+    info!(
+        view_count = HOURLY_CHAIN_VIEWS.len(),
+        "hourly-chain views dropped for 00:15 realignment"
+    );
+}
+
 /// Executes a DEDUP DDL with auto-recovery on stale schema. Returns true on success.
 ///
 /// If DEDUP fails with "deduplicate key column not found", drops and recreates the table.
@@ -688,6 +822,101 @@ mod tests {
         assert!(sql.contains("SAMPLE BY 5s"));
         assert!(sql.contains("FROM candles_1s"));
         assert!(sql.contains("candles_5s"));
+    }
+
+    /// Cross-verification regression (2026-04-23).
+    ///
+    /// The hourly view `candles_1h` MUST bucket at NSE market open (09:15 IST),
+    /// not IST midnight. Dhan's `/charts/intraday` `interval="60"` response
+    /// stamps candles at `09:15, 10:15, ...` — the live view must match so the
+    /// cross-match `(security_id, ts, segment)` join succeeds. With the old
+    /// `'00:00'` offset every single live 60m candle was flagged as
+    /// "MISSING HISTORICAL" because `09:00 != 09:15`.
+    #[test]
+    fn candles_1h_uses_market_open_aligned_offset() {
+        let def = VIEW_DEFS
+            .iter()
+            .find(|d| d.name == "candles_1h")
+            .expect("candles_1h view must exist");
+        assert_eq!(
+            def.align_offset, "00:15",
+            "candles_1h must use 00:15 offset to match Dhan's market-open \
+             aligned 60m historical candles (09:15, 10:15, ...). Regressing \
+             this breaks the cross-match JOIN on every 60m candle."
+        );
+    }
+
+    #[test]
+    fn build_view_sql_candles_1h_emits_00_15_offset() {
+        let def = VIEW_DEFS
+            .iter()
+            .find(|d| d.name == "candles_1h")
+            .expect("candles_1h view must exist");
+        let sql = build_view_sql(def);
+        assert!(
+            sql.contains("ALIGN TO CALENDAR WITH OFFSET '00:15'"),
+            "candles_1h SQL must carry 00:15 offset, got: {sql}"
+        );
+        assert!(sql.contains("SAMPLE BY 1h"));
+    }
+
+    #[test]
+    fn only_candles_1h_overrides_default_offset() {
+        // Every non-hourly view must stay on the default IST-midnight offset.
+        // If a future session adds another market-open-aligned view, this test
+        // forces them to update this guard deliberately.
+        for def in VIEW_DEFS {
+            if def.name == "candles_1h" {
+                assert_eq!(
+                    def.align_offset, QUESTDB_HOURLY_ALIGN_OFFSET,
+                    "candles_1h must use hourly offset"
+                );
+            } else {
+                assert_eq!(
+                    def.align_offset, QUESTDB_IST_ALIGN_OFFSET,
+                    "view {} must use default IST-midnight offset (only \
+                     candles_1h is market-open aligned)",
+                    def.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hourly_chain_views_matches_candles_1h_dependents() {
+        // HOURLY_CHAIN_VIEWS must cover candles_1h and every view that samples
+        // from it (directly or transitively). If a new descendant is added to
+        // VIEW_DEFS, this test forces updating HOURLY_CHAIN_VIEWS so the
+        // migration keeps dropping the whole sub-tree together.
+        let mut expected: Vec<&str> = vec!["candles_1h"];
+        // BFS from candles_1h over the VIEW_DEFS dependency graph.
+        let mut frontier = vec!["candles_1h"];
+        while let Some(parent) = frontier.pop() {
+            for def in VIEW_DEFS {
+                if def.source == parent && !expected.contains(&def.name) {
+                    expected.push(def.name);
+                    frontier.push(def.name);
+                }
+            }
+        }
+        expected.sort_unstable();
+        let mut actual: Vec<&str> = HOURLY_CHAIN_VIEWS.to_vec();
+        actual.sort_unstable();
+        assert_eq!(
+            expected, actual,
+            "HOURLY_CHAIN_VIEWS must equal candles_1h + all its transitive \
+             dependents. If you added a view sampling from the hourly chain, \
+             include it here so the 00:15 migration drops it too."
+        );
+    }
+
+    #[test]
+    fn hourly_align_offset_constant_is_market_open() {
+        assert_eq!(
+            QUESTDB_HOURLY_ALIGN_OFFSET, "00:15",
+            "NSE market opens at 09:15 IST. Changing this constant will \
+             break the cross-match alignment contract."
+        );
     }
 
     #[test]
