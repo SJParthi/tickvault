@@ -37,10 +37,18 @@ echo "Source: $JSON"
 echo "Variants tested: $n_variants"
 echo ""
 
-# Per-variant table
-jq -r '.results[] |
-  "\(.label)\tframes=\(.frames)\tdisc=\(.disconnects)\tbytes=\(.bytes)\tlast=\(.last_disconnect_reason // "n/a")"' \
-  "$JSON" | column -t -s $'\t'
+# Per-variant table — prefer `column` for nice alignment, fall back to raw tab-separated
+_table_body() {
+  jq -r '.results[] |
+    "\(.label)\tframes=\(.frames)\tdisc=\(.disconnects)\tbytes=\(.bytes)\tlast=\(.last_disconnect_reason // "n/a")"' \
+    "$JSON"
+}
+
+if command -v column >/dev/null 2>&1; then
+  _table_body | column -t -s $'\t'
+else
+  _table_body
+fi
 
 echo ""
 
