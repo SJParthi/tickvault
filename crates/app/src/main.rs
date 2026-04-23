@@ -4457,49 +4457,47 @@ fn spawn_historical_candle_fetch(
 
         // -----------------------------------------------------------------
         // Historical fetch timing on trading days:
-        //   Before 08:00 IST → fetch immediately (pre-market, yesterday's data)
-        //   08:00–15:30 IST  → WAIT for post-market signal (market active or about to open)
-        //   After 15:30 IST  → fetch immediately (market closed, today's data ready)
-        // Non-trading day: fetch immediately at boot (no live data to wait for)
+        //   Before 15:30 IST → WAIT for post-market signal (live feed is
+        //                      sensitive pre-market + during market hours;
+        //                      historical REST hammering the same account
+        //                      risks DH-904 rate limits on the live path)
+        //   After 15:30 IST  → fetch immediately (market closed)
+        // Non-trading day    → fetch immediately at boot (no live data to protect)
+        //
+        // Parthiban directive (2026-04-22, enforced): historical fetch must
+        // NEVER run pre-market on a trading day. Only post-market (>= 15:30 IST)
+        // OR on non-trading days (weekends/holidays). See live-feed-purity.md
+        // and audit-findings-2026-04-17.md Rule 3.
+        //
+        // Previously the code had a third "before 08:00 — fetch immediately"
+        // branch which violated the directive: a fresh clone booting at 07:39
+        // IST on a trading day would hammer Dhan REST with 25,000-instrument ×
+        // 5-timeframe fetches right before market open. Removed.
         // -----------------------------------------------------------------
 
-        let is_within_collection_window =
-            tickvault_core::instrument::instrument_loader::is_within_build_window(
-                &bg_data_collection_start,
-                &bg_data_collection_end,
-            );
-
-        // Wait logic for trading days:
-        //   Before 08:00 IST → fetch immediately (pre-market, yesterday's data)
-        //   08:00–15:30 IST  → WAIT for post-market signal (market active)
-        //   After 15:30 IST  → fetch immediately (market closed, today's data ready)
-        //
-        // is_within_collection_window covers 09:00-15:30 (from config).
-        // Pre-market extension: 08:00-08:59 only (hour == 8, before market open).
-        // This ensures starting the app at 5 PM or 7 AM fetches immediately.
-        let is_pre_market_wait_zone = if is_trading_day {
-            let now_ist =
-                chrono::Utc::now() + chrono::Duration::hours(5) + chrono::Duration::minutes(30);
-            let hour = now_ist.format("%H").to_string().parse::<u32>().unwrap_or(0);
-            // Only 08:00-08:59 IST — the gap before data_collection_start (09:00)
-            hour == 8
+        let should_wait_for_post_market = if is_trading_day {
+            use tickvault_common::constants::{
+                IST_UTC_OFFSET_SECONDS, SECONDS_PER_DAY, TICK_PERSIST_END_SECS_OF_DAY_IST,
+            };
+            let now_utc = chrono::Utc::now().timestamp();
+            let now_ist = now_utc.saturating_add(i64::from(IST_UTC_OFFSET_SECONDS));
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            // APPROVED: rem_euclid on SECONDS_PER_DAY (86400) fits u32
+            let sec_of_day = now_ist.rem_euclid(i64::from(SECONDS_PER_DAY)) as u32;
+            sec_of_day < TICK_PERSIST_END_SECS_OF_DAY_IST
         } else {
             false
         };
 
-        if is_trading_day && (is_within_collection_window || is_pre_market_wait_zone) {
-            // During market hours (08:00-15:30): live ticks handle everything.
-            // Wait for post-market signal at 15:30 IST, then fetch historical.
+        if should_wait_for_post_market {
             info!(
-                "trading day (08:00-15:30 IST) — waiting for post-market signal before historical fetch"
+                "trading day before 15:30 IST — waiting for post-market signal before historical fetch"
             );
             post_market_signal.notified().await;
             info!("post-market signal received — starting historical candle fetch");
         } else if is_trading_day {
-            // Before 8 AM or after 3:30 PM — fetch immediately.
-            info!(
-                "trading day before 08:00 or after 15:30 — fetching historical candles immediately"
-            );
+            // After 15:30 IST on a trading day — market closed, safe to fetch.
+            info!("trading day after 15:30 IST — fetching historical candles immediately");
         } else {
             info!("non-trading day — starting historical candle fetch immediately");
         }
@@ -5533,6 +5531,83 @@ mod tests {
         assert!(OFF_HOURS_CONNECTION_STAGGER_MS > 0);
         assert!(!FAST_BOOT_WINDOW_START.is_empty());
         assert!(!FAST_BOOT_WINDOW_END.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Historical-fetch post-market-only gate (Parthiban directive 2026-04-22)
+    // -----------------------------------------------------------------------
+    //
+    // Ratchet: on a trading day, the boot sequence MUST wait for the
+    // post-market signal (15:30 IST) before firing the historical candle
+    // fetch. A prior code branch "trading day before 08:00 IST → fetch
+    // immediately" was removed on 2026-04-22 after it caused a fresh-clone
+    // boot at 07:39 IST to hammer Dhan REST right before market open.
+    //
+    // These source-scan tests fail the build if the removed branch (or any
+    // equivalent) is reintroduced. We source-scan instead of unit-testing
+    // the gate directly because the gate lives inside a multi-megabyte
+    // tokio::spawn closure — extracting a pure function would be a large
+    // refactor. The source-scan is cheap and sufficient.
+
+    fn read_main_source() -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/main.rs");
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    }
+
+    #[test]
+    fn test_historical_fetch_has_no_pre_market_immediate_branch() {
+        let src = read_main_source();
+        // Reassemble the forbidden log message at runtime so THIS test's
+        // own source doesn't trivially match itself via src.contains().
+        // The old buggy branch logged this exact phrase.
+        let forbidden = ["before 08:00 or after ", "15:30", " — fetching historical"].concat();
+        let forbidden_count = src.matches(forbidden.as_str()).count();
+        assert_eq!(
+            forbidden_count, 0,
+            "historical fetch MUST NOT fire pre-market on trading days \
+             (directive 2026-04-22). The early-hour immediate-fetch branch \
+             was removed; do not reintroduce it. Found {forbidden_count} \
+             match(es) of the old log string."
+        );
+        // Guard against a common rewrite that still fires pre-market:
+        // `hour == 8 → fetch immediately`. The old code stored this check
+        // in a bool variable; that name must stay removed.
+        let sentinel_var = ["is_pre_market", "_wait_zone"].concat();
+        let sentinel_count = src.matches(sentinel_var.as_str()).count();
+        assert_eq!(
+            sentinel_count, 0,
+            "the pre-market-wait-zone variable was removed — trading days \
+             now always wait for post-market signal regardless of hour. \
+             Reintroducing this likely means the pre-market branch came back."
+        );
+    }
+
+    #[test]
+    fn test_historical_fetch_gate_uses_tick_persist_end_constant() {
+        let src = read_main_source();
+        assert!(
+            src.contains("should_wait_for_post_market"),
+            "post-market gate variable `should_wait_for_post_market` must exist"
+        );
+        assert!(
+            src.contains("TICK_PERSIST_END_SECS_OF_DAY_IST"),
+            "post-market gate MUST compare against the shared market-close \
+             constant (not a hardcoded 15:30)"
+        );
+    }
+
+    #[test]
+    fn test_historical_fetch_gate_honours_post_market_signal() {
+        let src = read_main_source();
+        assert!(
+            src.contains("post_market_signal.notified().await"),
+            "the gate MUST await the post-market notification rather than \
+             fetching immediately on trading days before 15:30"
+        );
+        assert!(
+            src.contains("trading day before 15:30 IST — waiting for post-market signal"),
+            "the gate's INFO log message must accurately describe the wait"
+        );
     }
 
     #[test]

@@ -733,10 +733,25 @@ pub async fn fetch_historical_candles(
     )
     .await;
 
-    // Write marker only if fetch actually produced data. Zero-instrument
-    // runs (e.g. registry empty) should NOT mark today as "done" — the
-    // operator would otherwise miss the next chance to retry.
-    if summary.instruments_fetched > 0 {
+    // Parthiban directive (2026-04-22): the idempotency marker MUST only be
+    // written on a FULLY successful fetch run — zero failures, not just
+    // "some data arrived". Previously the guard was `instruments_fetched > 0`
+    // which would set the marker even when 200 of 220 instruments failed.
+    // That caused the next day's boot to skip the retry of the missing 200.
+    //
+    // Definition of "fully successful":
+    //   - at least 1 instrument fetched (so an empty registry doesn't mark)
+    //   - zero fetch failures (instruments_failed == 0)
+    //   - zero persist failures (persist_failures == 0)
+    //
+    // `instruments_skipped` is NOT a failure — it counts derivatives that
+    // Dhan's REST API intentionally does not serve, plus any other
+    // documented skips. Those should not block marker write.
+    let is_fully_successful = summary.instruments_fetched > 0
+        && summary.instruments_failed == 0
+        && summary.persist_failures == 0;
+
+    if is_fully_successful {
         #[allow(clippy::cast_possible_truncation)]
         // APPROVED: counts fit u32 (max ~25k instruments)
         let new_marker = HistoricalFetchMarker {
@@ -754,11 +769,18 @@ pub async fn fetch_historical_candles(
                 ?mode,
                 instruments_fetched = summary.instruments_fetched,
                 candles_written = summary.total_candles,
-                "historical-fetch marker written"
+                "historical-fetch marker written (fully successful run)"
             );
             #[allow(clippy::cast_precision_loss)] // APPROVED: gauge accuracy not financial
             gauge!("tv_historical_fetch_last_success_age_seconds").set(0.0);
         }
+    } else {
+        warn!(
+            instruments_fetched = summary.instruments_fetched,
+            instruments_failed = summary.instruments_failed,
+            persist_failures = summary.persist_failures,
+            "historical-fetch marker NOT written — run was not fully successful; tomorrow's boot will retry"
+        );
     }
 
     summary
@@ -4360,6 +4382,73 @@ mod tests {
         assert!(
             !is_weekend_timestamp(fri_ist_1529),
             "Friday must NOT be detected as weekend"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Marker-write guard regression (Parthiban directive 2026-04-22)
+    // -----------------------------------------------------------------------
+    //
+    // The idempotency marker MUST only be written on a fully successful run.
+    // Any partial failure (non-zero instruments_failed OR persist_failures)
+    // must leave the marker unchanged so tomorrow's boot re-attempts the
+    // full 90-day fetch.
+    //
+    // We can't easily unit-test the closure in `fetch_historical_candles`
+    // without a full Dhan mock + QuestDB, but we CAN source-scan to ensure
+    // the guard condition stays strict. A regression to the old
+    // `instruments_fetched > 0` check would allow partial-success runs to
+    // mark the day done, which is exactly the bug this rule prevents.
+
+    fn read_fetcher_source() -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/historical/candle_fetcher.rs");
+        std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!("read {}: {e}", path.display());
+        })
+    }
+
+    #[test]
+    fn test_marker_write_guard_requires_zero_instrument_failures() {
+        let src = read_fetcher_source();
+        assert!(
+            src.contains("summary.instruments_failed == 0"),
+            "marker-write guard MUST assert instruments_failed == 0 \
+             (Parthiban directive 2026-04-22 — full-success only). \
+             Do NOT weaken to e.g. `instruments_fetched > 0` alone."
+        );
+    }
+
+    #[test]
+    fn test_marker_write_guard_requires_zero_persist_failures() {
+        let src = read_fetcher_source();
+        assert!(
+            src.contains("summary.persist_failures == 0"),
+            "marker-write guard MUST assert persist_failures == 0 \
+             (Parthiban directive 2026-04-22 — full-success only)"
+        );
+    }
+
+    #[test]
+    fn test_marker_write_guard_still_requires_nonzero_instruments_fetched() {
+        let src = read_fetcher_source();
+        assert!(
+            src.contains("summary.instruments_fetched > 0"),
+            "marker-write guard MUST still reject empty-registry runs \
+             (instruments_fetched > 0 sentinel)"
+        );
+    }
+
+    #[test]
+    fn test_marker_not_written_on_partial_failure_emits_warn() {
+        // Guard that the else-branch of the marker-write gate emits an
+        // explicit WARN log explaining why the marker was skipped.
+        // Silent skipping would make "why didn't marker update?" debugging
+        // impossible.
+        let src = read_fetcher_source();
+        assert!(
+            src.contains("historical-fetch marker NOT written — run was not fully successful",),
+            "partial-failure path MUST emit a WARN log explaining the skip"
         );
     }
 }

@@ -25,34 +25,21 @@ unmaintained = "workspace"
 # Temporary advisory ignores — waiting on stable upstream fixes.
 # Review at every dependency-bump pass; remove once the fix ships in a
 # non-alpha release and we bump the relevant workspace dep.
+#
+# 2026-04-22 partial cleanup: 4 of 6 stale ignores removed after the
+# CVE bump landed (`claude/dependabot-cve-fixes-2026-04-22` branch):
+#   - RUSTSEC-2026-0044, 0048 → fixed by aws-lc-sys 0.40.0
+#   - RUSTSEC-2026-0049 → fixed by rustls-webpki 0.103.13
+#   - RUSTSEC-2026-0097 → fixed by rand 0.9.4
+# The two remaining ignores below apply to rustls-webpki 0.101.7, which
+# is pulled in by tokio-rustls 0.24.1 → rustls 0.21.12 in the deep AWS
+# SDK stack (aws-smithy-http-client 1.1.12). Bumping the AWS SDK suite
+# is its own change requiring a separate PR + verification window — see
+# the deferred-work table in PR #323 for context.
 ignore = [
-    # rustls-webpki name-constraints advisories. Fix is 0.103.12 OR
-    # 0.104.0-alpha.6. 0.103.12 is NOT yet released on crates.io (latest
-    # stable is 0.103.9 as of 2026-04-17); 0.104 is alpha which we do
-    # NOT ship in a regulated trading system.
-    { id = "RUSTSEC-2026-0098", reason = "rustls-webpki URI name-constraint bug; 0.103.12 not released yet, 0.104 is alpha" },
-    { id = "RUSTSEC-2026-0099", reason = "rustls-webpki wildcard name-constraint bug; 0.103.12 not released yet, 0.104 is alpha" },
-    # rustls-webpki 0.103.9 CRL authority matching — fix is 0.103.10,
-    # but our rustls 0.23.37 pins 0.103.9. Needs a rustls patch bump.
-    { id = "RUSTSEC-2026-0049", reason = "rustls-webpki 0.103.10 fix requires rustls 0.23 patch bump — pending" },
-    # rand unsoundness. Triggers only when a *custom global logger*
-    # reads RNG state. tickvault's custom tracing layer never reads
-    # rand — we use rand transitively only for tungstenite reconnect
-    # jitter and failsafe circuit-breaker probability. Non-exploitable.
-    { id = "RUSTSEC-2026-0097", reason = "unsound only with custom logger reading RNG; tickvault never does this" },
-    # AWS-LC advisories (X.509 bypass + CRL scope). Fix is aws-lc-sys
-    # 0.39.0+, but aws-lc-rs 1.16.1 pins <0.39. aws-lc-rs 1.17 not yet
-    # released. Ignore until aws-lc-rs ships the bump.
-    { id = "RUSTSEC-2026-0044", reason = "aws-lc-rs 1.17 not released yet; fix is transitive via aws-lc-sys 0.39" },
-    { id = "RUSTSEC-2026-0048", reason = "aws-lc-rs 1.17 not released yet; fix is transitive via aws-lc-sys 0.39" },
-    # rustls-webpki 0.101.7 + 0.103.9 CRL parsing panic on empty BIT
-    # STRING in onlySomeReasons (published 2026-04-22). Fix is 0.103.13
-    # which is NOT yet shipped via rustls 0.23.x — we pin 0.23.37
-    # transitively via aws-config 1.8.15. "Applications that do not
-    # use CRLs are not affected" per the advisory text. tickvault
-    # never configures CRL verification on any rustls client.
-    # Non-exploitable for our deployment.
-    { id = "RUSTSEC-2026-0104", reason = "rustls-webpki CRL panic; tickvault never parses CRLs; fix needs rustls 0.23 patch bump" },
+    { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.101.7 (AWS SDK transitive only — not on tickvault's primary TLS path which is now 0.103.13)" },
+    { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.101.7 (AWS SDK transitive only — not on tickvault's primary TLS path which is now 0.103.13)" },
+    { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.101.7 CRL-parse panic — AWS SDK transitive only; CRL parsing is not on tickvault's live-feed path (which uses rustls 0.23.37 → webpki 0.103.13, patched). Exploit surface: attacker-controlled CRL from an AWS SDK endpoint — not a realistic attack vector for us. Full fix = AWS SDK suite bump, deferred to its own branch." },
 ]
 
 # --- Licenses: Block incompatible licenses ---
@@ -113,6 +100,7 @@ skip = [
     { crate = "rand_chacha", reason = "follows rand version split" },
     { crate = "rand_core", reason = "follows rand version split" },
     { crate = "redis", reason = "deadpool-redis may pull different redis version" },
+    { crate = "untrusted", reason = "aws-lc-rs 1.16.3 pins untrusted 0.7.x while ring/aws-credential-types use 0.9.x" },
     { crate = "serde_spanned", reason = "figment + toml crate version split" },
     { crate = "toml", reason = "figment uses older toml, we pin newer" },
     { crate = "toml_datetime", reason = "follows toml version split" },

@@ -19,6 +19,35 @@ tracing = { workspace = true }
 secrecy = { workspace = true }
 uuid = { workspace = true }
 
+# CVE pins (2026-04-22, Parthiban-authorised). Unused direct deps that
+# exist solely to force `cargo`'s lockfile resolver to pick patched
+# versions of TLS/crypto transitives flagged by dependabot. We use this
+# mechanism because:
+#   - `cargo update` is project-banned (.claude pre-tool hook).
+#   - `[patch.crates-io]` cannot redirect a crate to a different version
+#     within the same source.
+# The cargo-machete ignored list below silences the unused-dep warning.
+# Reviewer note: deletion of these lines reverts the lockfile to vulnerable
+# versions on the next `cargo build`, so DO NOT remove without re-issuing
+# the upgrade through whatever new mechanism replaces this.
+#
+# Patched CVEs:
+#   aws-lc-sys 0.38.0 → 0.40.0: AWS-LC X.509 Name Constraints Bypass (HIGH)
+#                              + CRL Distribution Point Scope Check (HIGH)
+#   rustls-webpki 0.103.9 → 0.103.13: CRLs-not-authoritative (Moderate)
+#                                   + Name-constraints-wildcard (Low)
+#                                   + URI-name-constraints (Low)
+#   rand 0.9.2 → 0.9.4: rand::rng() unsound with custom logger (Low)
+# Note: rand 0.8.5 also remains in the lockfile (transitive via getrandom
+# v0.2 path) but the CVE applies to the 0.9.x rand::rng() API only.
+# rustls-webpki 0.101.7 also remains, pulled in by tokio-rustls 0.24.1
+# which is a deep AWS SDK transitive (aws-smithy-http-client 1.1.12).
+# Bumping the AWS SDK suite is a major change deferred to its own PR.
+aws-lc-sys = "0.40.0"
+aws-lc-rs = "1.16.3"
+rustls-webpki = "0.103.13"
+rand = "0.9.4"
+
 [dev-dependencies]
 criterion = { workspace = true }
 proptest = { workspace = true }
@@ -32,4 +61,4 @@ name = "config"
 harness = false
 
 [package.metadata.cargo-machete]
-ignored = ["chrono-tz", "figment", "secrecy", "toml", "tracing", "uuid"]
+ignored = ["chrono-tz", "figment", "secrecy", "toml", "tracing", "uuid", "aws-lc-sys", "aws-lc-rs", "rustls-webpki", "rand"]
