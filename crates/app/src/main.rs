@@ -2725,10 +2725,25 @@ async fn main() -> Result<()> {
                     .await
                     {
                         tracing::error!(?err, "20-level depth connection terminated");
-                        d20_notifier.notify(NotificationEvent::DepthTwentyDisconnected {
-                            underlying: d20_label_for_disconnect,
-                            reason: format!("{err}"),
-                        });
+                        // Q5 (2026-04-23): route to Low-severity off-hours
+                        // variant when outside 09:00-15:30 IST. Same
+                        // anti-spam pattern as `WebSocketDisconnectedOffHours`
+                        // and `depth_rebalancer` stale-spot edge trigger —
+                        // a post-market boot shouldn't fire [HIGH] SMS for
+                        // an expected no-data disconnect.
+                        if tickvault_common::market_hours::is_within_market_hours_ist() {
+                            d20_notifier.notify(NotificationEvent::DepthTwentyDisconnected {
+                                underlying: d20_label_for_disconnect,
+                                reason: format!("{err}"),
+                            });
+                        } else {
+                            d20_notifier.notify(
+                                NotificationEvent::DepthTwentyDisconnectedOffHours {
+                                    underlying: d20_label_for_disconnect,
+                                    reason: format!("{err}"),
+                                },
+                            );
+                        }
                         d20_health.set_depth_20_connections(
                             d20_health.depth_20_connections().saturating_sub(1),
                         );
@@ -2938,13 +2953,34 @@ async fn main() -> Result<()> {
                                     security_id = d200_sid_for_disconnect,
                                     "200-level depth connection terminated"
                                 );
-                                d200_notifier.notify(
-                                    NotificationEvent::DepthTwoHundredDisconnected {
-                                        contract: d200_label_for_disconnect,
-                                        security_id: d200_sid_for_disconnect,
-                                        reason: format!("{err}"),
-                                    },
-                                );
+                                // Q5 (2026-04-23): route to Low-severity
+                                // off-hours variant when outside market
+                                // hours OR when the subscription fell
+                                // through to the deferred placeholder
+                                // (SecurityId=0). The 2026-04-23 post-
+                                // market boot fired 4× [HIGH] alerts with
+                                // SID=0 because no spot LTP arrived to
+                                // pick the ATM — pure Telegram noise.
+                                let use_off_hours_variant = d200_sid_for_disconnect == 0
+                                    || !tickvault_common::market_hours::is_within_market_hours_ist(
+                                    );
+                                if use_off_hours_variant {
+                                    d200_notifier.notify(
+                                        NotificationEvent::DepthTwoHundredDisconnectedOffHours {
+                                            contract: d200_label_for_disconnect,
+                                            security_id: d200_sid_for_disconnect,
+                                            reason: format!("{err}"),
+                                        },
+                                    );
+                                } else {
+                                    d200_notifier.notify(
+                                        NotificationEvent::DepthTwoHundredDisconnected {
+                                            contract: d200_label_for_disconnect,
+                                            security_id: d200_sid_for_disconnect,
+                                            reason: format!("{err}"),
+                                        },
+                                    );
+                                }
                                 d200_health.set_depth_200_connections(
                                     d200_health.depth_200_connections().saturating_sub(1),
                                 );
