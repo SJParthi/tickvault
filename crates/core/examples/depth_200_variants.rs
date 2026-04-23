@@ -432,8 +432,8 @@ async fn main() -> Result<(), String> {
 
     progress_handle.abort();
 
-    // Final summary.
-    info!("===== SUMMARY =====");
+    // Collect results for both on-screen summary and JSON/markdown output files.
+    let mut results: Vec<VariantResult> = Vec::with_capacity(VARIANTS.len());
     for (idx, variant) in VARIANTS.iter().enumerate() {
         let s = &stats_vec[idx];
         let frames = s.frames_received.load(Ordering::Relaxed);
@@ -444,19 +444,176 @@ async fn main() -> Result<(), String> {
             .lock()
             .await
             .clone()
-            .unwrap_or_else(|| "n/a".into());
-        info!(
-            variant = variant.label,
+            .unwrap_or_default();
+        results.push(VariantResult {
+            label: variant.label,
+            url_path: variant.url_path,
+            ua: format!("{:?}", variant.ua),
+            alpn: format!("{:?}", variant.alpn),
             frames,
             bytes,
-            disconnects = disc,
-            last_disconnect = %last_reason,
+            disconnects: disc,
+            last_disconnect_reason: last_reason,
+        });
+    }
+
+    // Final summary.
+    info!("===== SUMMARY =====");
+    for r in &results {
+        info!(
+            variant = r.label,
+            frames = r.frames,
+            bytes = r.bytes,
+            disconnects = r.disconnects,
+            last_disconnect = %r.last_disconnect_reason,
             "summary"
         );
     }
     info!("===================");
-    info!("The variant with frames>0 AND disconnects=0 is the working config.");
-    info!("Apply its (url_path, ua, alpn) combo to production depth_connection.rs.");
+    let winner = results
+        .iter()
+        .find(|r| r.frames > 0 && r.disconnects == 0)
+        .map(|r| r.label);
+    if let Some(label) = winner {
+        info!(winner = label, "FIX IDENTIFIED");
+    } else {
+        info!(
+            "NO CLEAR WINNER — all variants disconnected or received no frames. \
+             Consider Phase 2 (native-tls, fastwebsockets) or escalate to Dhan support."
+        );
+    }
 
+    // Write machine-readable results so the analysis / Dhan email scripts can
+    // consume them without re-parsing tracing logs.
+    if let Err(err) = write_results_json(&results).await {
+        error!(?err, "failed to write JSON results file");
+    }
+    if let Err(err) = write_results_markdown(&results).await {
+        error!(?err, "failed to write markdown results file");
+    }
+
+    Ok(())
+}
+
+#[derive(Debug)]
+struct VariantResult {
+    label: &'static str,
+    url_path: &'static str,
+    ua: String,
+    alpn: String,
+    frames: u64,
+    bytes: u64,
+    disconnects: u64,
+    last_disconnect_reason: String,
+}
+
+/// Escape a string for embedding in a JSON literal. Handles the minimum
+/// required by RFC 8259 section 7: quote, backslash, control chars <0x20.
+fn json_escape(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+async fn write_results_json(results: &[VariantResult]) -> std::io::Result<()> {
+    let path = env::var("RESULTS_JSON_PATH")
+        .unwrap_or_else(|_| "/tmp/depth_200_variants_results.json".to_string());
+
+    let mut body = String::from("{\n  \"results\": [\n");
+    for (i, r) in results.iter().enumerate() {
+        body.push_str("    {\n");
+        body.push_str(&format!("      \"label\": \"{}\",\n", json_escape(r.label)));
+        body.push_str(&format!(
+            "      \"url_path\": \"{}\",\n",
+            json_escape(r.url_path)
+        ));
+        body.push_str(&format!("      \"ua\": \"{}\",\n", json_escape(&r.ua)));
+        body.push_str(&format!("      \"alpn\": \"{}\",\n", json_escape(&r.alpn)));
+        body.push_str(&format!("      \"frames\": {},\n", r.frames));
+        body.push_str(&format!("      \"bytes\": {},\n", r.bytes));
+        body.push_str(&format!("      \"disconnects\": {},\n", r.disconnects));
+        body.push_str(&format!(
+            "      \"last_disconnect_reason\": \"{}\"\n",
+            json_escape(&r.last_disconnect_reason)
+        ));
+        body.push_str(if i + 1 == results.len() {
+            "    }\n"
+        } else {
+            "    },\n"
+        });
+    }
+    let winner = results
+        .iter()
+        .find(|r| r.frames > 0 && r.disconnects == 0)
+        .map(|r| r.label);
+    body.push_str("  ],\n  \"winner\": ");
+    match winner {
+        Some(label) => body.push_str(&format!("\"{}\"", json_escape(label))),
+        None => body.push_str("null"),
+    }
+    body.push_str("\n}\n");
+
+    tokio::fs::write(&path, body).await?;
+    info!(path = %path, "wrote JSON results");
+    Ok(())
+}
+
+async fn write_results_markdown(results: &[VariantResult]) -> std::io::Result<()> {
+    let path = env::var("RESULTS_MD_PATH")
+        .unwrap_or_else(|_| "/tmp/depth_200_variants_results.md".to_string());
+
+    let mut body = String::from("# Depth 200 Variant Test Results\n\n");
+    body.push_str(&format!(
+        "Run: {} UTC, SecurityId {}, segment {}\n\n",
+        chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S"),
+        TEST_SECURITY_ID,
+        TEST_EXCHANGE_SEGMENT
+    ));
+    body.push_str("| Variant | URL Path | UA | ALPN | Frames | Bytes | Disconnects | Last Disconnect Reason |\n");
+    body.push_str("|---|---|---|---|---|---|---|---|\n");
+    for r in results {
+        body.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
+            r.label,
+            r.url_path,
+            r.ua,
+            r.alpn,
+            r.frames,
+            r.bytes,
+            r.disconnects,
+            if r.last_disconnect_reason.is_empty() {
+                "n/a".to_string()
+            } else {
+                r.last_disconnect_reason.replace('|', "\\|")
+            }
+        ));
+    }
+    let winner = results.iter().find(|r| r.frames > 0 && r.disconnects == 0);
+    body.push_str("\n## Verdict\n\n");
+    match winner {
+        Some(w) => body.push_str(&format!(
+            "**FIX IDENTIFIED**: variant `{}` stayed connected and received {} frames.\n\
+             Apply its `(url_path={}, ua={}, alpn={})` combo to production.\n",
+            w.label, w.frames, w.url_path, w.ua, w.alpn
+        )),
+        None => body.push_str(
+            "**NO CLEAR WINNER**: all variants disconnected or received no frames.\n\
+             Proceed to Phase 2 (TLS/WS library variants) or escalate to Dhan support \
+             with `docs/dhan-support/2026-04-24-depth-200-variant-test-results.md`.\n",
+        ),
+    }
+
+    tokio::fs::write(&path, body).await?;
+    info!(path = %path, "wrote markdown results");
     Ok(())
 }

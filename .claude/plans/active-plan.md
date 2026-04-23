@@ -110,3 +110,99 @@ All changes in Phase 1 are additive (new files only):
 
 No rollback needed. If Phase 1 finds the fix, production depth_connection.rs
 gets the minimal change (1-2 lines) in a follow-up PR.
+
+---
+
+## 2026-04-23 Update — Expanded to 8-variant sequential matrix
+
+The original 3-variant parallel version only covered URL path and Python-UA.
+Expanded to 8 variants covering URL path × User-Agent × ALPN combinations,
+running sequentially (avoids Dhan 5-connection 200-depth cap).
+
+### Variant matrix (commit `ccfbbed`)
+
+| # | URL path             | User-Agent               | ALPN     |
+|---|----------------------|--------------------------|----------|
+| A | `/`                  | tungstenite default      | http/1.1 |
+| B | `/twohundreddepth`   | tungstenite default      | http/1.1 |
+| C | `/`                  | Python websockets        | http/1.1 |
+| D | `/twohundreddepth`   | Python websockets        | http/1.1 |
+| E | `/`                  | tungstenite default      | none     |
+| F | `/`                  | Chrome + Origin + Pragma | http/1.1 |
+| G | `/twohundreddepth`   | tungstenite default      | none     |
+| H | `/`                  | Python websockets        | none     |
+
+### What we do NOT test in Phase 1 (reserved for Phase 2)
+
+- TLS backend: `native-tls` (openssl) instead of `aws-lc-rs` (rustls)
+- WebSocket library: `fastwebsockets` instead of `tokio-tungstenite`
+- TLS 1.2-only (force no TLS 1.3)
+- `permessage-deflate` compression extension disabled
+- `Sec-WebSocket-Protocol` explicit sub-protocol
+
+Rationale: Python SDK works from the **same machine with the same OS
+trust store** — so cert verification and trust chain are not the
+issue. TLS cipher / ALPN / UA fingerprint are the remaining suspects
+at Phase 1. If all 8 variants fail, Phase 2 swaps the TLS/WS library
+to isolate library-level causes.
+
+### Result capture (automatic)
+
+The diagnostic writes two machine-readable files at exit:
+
+- `/tmp/depth_200_variants_results.json` — per-variant stats + winner field
+- `/tmp/depth_200_variants_results.md` — human-readable markdown table
+
+Override paths via `RESULTS_JSON_PATH` / `RESULTS_MD_PATH` env vars.
+
+### Decision flow (automated by `analyze_results.sh`)
+
+```
+cargo run --release --example depth_200_variants
+  → writes /tmp/depth_200_variants_results.json
+
+bash scripts/dhan-200-depth-repro/analyze_results.sh
+  → reads JSON, prints table, decides:
+
+      exit 0 (winner found)
+        → Apply (url_path, ua, alpn) combo to production:
+          - crates/common/src/constants.rs
+          - crates/core/src/websocket/depth_connection.rs
+          - Update 2 URL tests in depth_connection.rs
+          - Update dhan_api_coverage.rs, dhan_locked_facts.rs
+          - Update banned-pattern-scanner.sh category 4
+          - Update full-market-depth.md rule 2
+          - Update websocket-enforcement.md rule 14 (mark fixed)
+          - Delete diagnostic example (or keep as regression test)
+
+      exit 1 (no winner)
+        → Proceed to Phase 2 (TLS/WS library variants) in parallel with
+        → Send Dhan escalation email (Phase 3):
+          docs/dhan-support/2026-04-24-depth-200-variant-test-results.md
+          Fill <PLACEHOLDER>s from the JSON results, share GitHub URL.
+
+      exit 2 (error — missing results file or jq)
+        → Re-run diagnostic or install jq.
+```
+
+### Commit chain so far
+
+```
+db7f692  chore(depth-diag): phase 1 3-variant diagnostic (initial, 3 variants)
+ccfbbed  chore(depth-diag): expand to 8-variant sequential matrix
+<this>   chore(depth-diag): result capture + Dhan email template + analyze script
+```
+
+Remote branch is still stuck at `b70a5df` (pre-rebase old diag) —
+force-push blocked by Claude permission hooks. User must force-push
+from their terminal:
+
+```
+cd ~/tickvault
+git fetch origin
+git push --force-with-lease origin claude/hardcode-dhan-api-7rgQC
+```
+
+After force-push, PR #328 CI Commit-Lint will pass (correct prefix)
+and the 8-variant + result-capture + analysis + email template all
+land on the branch for the morning test.
