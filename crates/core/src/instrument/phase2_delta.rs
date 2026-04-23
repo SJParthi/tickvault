@@ -718,6 +718,122 @@ mod tests {
         assert_eq!(plan.stocks_skipped_no_price, vec!["WIPRO".to_string()]);
     }
 
+    // ---------------------------------------------------------------
+    // Phase 2 late-start live-LTP fallback tests (2026-04-23)
+    // ---------------------------------------------------------------
+    //
+    // These pin the "same process, different spot source" contract:
+    // `compute_phase2_stock_subscriptions` MUST accept a synthetic
+    // snapshot built from live NSE_EQ LTPs (via
+    // `build_synthetic_snap_from_live_ltps`) and produce the same
+    // plan shape as it would from the pre-open buffer. This is the
+    // fallback path used by the scheduler when the 09:08–09:12 IST
+    // window was missed (fresh-clone boot at 11:26 AM, crash recovery
+    // mid-session, etc.).
+
+    #[test]
+    fn fallback_synthetic_snap_from_live_ltp_produces_normal_phase2_plan() {
+        use crate::instrument::preopen_price_buffer::build_synthetic_snap_from_live_ltps;
+
+        let cal = make_calendar_empty_holidays();
+        let uni =
+            make_universe_with_stock("RELIANCE", vec![d(2026, 4, 23), d(2026, 4, 30)], 2850.0);
+
+        // The scheduler's fallback path: live_stock_ltps map built
+        // continuously from the NSE_EQ tick broadcast.
+        let mut live_ltps = HashMap::new();
+        live_ltps.insert("RELIANCE".to_string(), 2_847.5);
+        let synthetic_snap = build_synthetic_snap_from_live_ltps(&live_ltps);
+
+        let plan = compute_phase2_stock_subscriptions(&uni, &synthetic_snap, &cal, today(), 25);
+
+        // Exact same shape as the happy-path test that uses a real
+        // pre-open buffer: stock subscribes, 51 × 2 + 1 instruments.
+        assert_eq!(plan.stocks_subscribed, vec!["RELIANCE".to_string()]);
+        assert!(plan.stocks_skipped_no_price.is_empty());
+        assert_eq!(plan.total_instruments(), 51 * 2 + 1);
+    }
+
+    #[test]
+    fn fallback_empty_live_ltps_skips_every_stock_just_like_empty_preopen() {
+        use crate::instrument::preopen_price_buffer::build_synthetic_snap_from_live_ltps;
+
+        let cal = make_calendar_empty_holidays();
+        let uni = make_universe_with_stock("INFY", vec![d(2026, 4, 23)], 1_500.0);
+        let live_ltps: HashMap<String, f64> = HashMap::new();
+        let synthetic_snap = build_synthetic_snap_from_live_ltps(&live_ltps);
+
+        let plan = compute_phase2_stock_subscriptions(&uni, &synthetic_snap, &cal, today(), 25);
+
+        // No live LTPs and no pre-open = no plan. This is correct:
+        // we'd rather skip than forge prices.
+        assert!(plan.instruments.is_empty());
+        assert_eq!(plan.stocks_skipped_no_price, vec!["INFY".to_string()]);
+    }
+
+    #[test]
+    fn fallback_partial_live_ltp_coverage_subscribes_only_covered_stocks() {
+        use crate::instrument::preopen_price_buffer::build_synthetic_snap_from_live_ltps;
+
+        let cal = make_calendar_empty_holidays();
+        // Two stocks in the universe, only one has a live LTP.
+        let mut uni =
+            make_universe_with_stock("RELIANCE", vec![d(2026, 4, 23), d(2026, 4, 30)], 2850.0);
+        // Add INFY directly to the universe.
+        let infy = make_universe_with_stock("INFY", vec![d(2026, 4, 23), d(2026, 4, 30)], 1500.0);
+        for (sym, u) in infy.underlyings {
+            uni.underlyings.insert(sym, u);
+        }
+        for (k, v) in infy.expiry_calendars {
+            uni.expiry_calendars.insert(k, v);
+        }
+        for (k, v) in infy.option_chains {
+            uni.option_chains.insert(k, v);
+        }
+
+        let mut live_ltps = HashMap::new();
+        live_ltps.insert("RELIANCE".to_string(), 2_847.5);
+        // INFY missing.
+        let synthetic_snap = build_synthetic_snap_from_live_ltps(&live_ltps);
+
+        let plan = compute_phase2_stock_subscriptions(&uni, &synthetic_snap, &cal, today(), 25);
+
+        assert!(plan.stocks_subscribed.contains(&"RELIANCE".to_string()));
+        assert!(plan.stocks_skipped_no_price.contains(&"INFY".to_string()));
+    }
+
+    #[test]
+    fn fallback_synthetic_snap_and_preopen_snap_produce_identical_plans() {
+        // Two paths to the same answer: both the real 09:12 close and
+        // the live-LTP fallback at 2_847.5 must produce the exact same
+        // instrument count. Proves the fallback is not a lossy path.
+        use crate::instrument::preopen_price_buffer::build_synthetic_snap_from_live_ltps;
+
+        let cal = make_calendar_empty_holidays();
+        let uni =
+            make_universe_with_stock("RELIANCE", vec![d(2026, 4, 23), d(2026, 4, 30)], 2850.0);
+
+        let preopen_snap = stock_buffer("RELIANCE", 2_847.5);
+        let mut live_ltps = HashMap::new();
+        live_ltps.insert("RELIANCE".to_string(), 2_847.5);
+        let synthetic_snap = build_synthetic_snap_from_live_ltps(&live_ltps);
+
+        let plan_preopen =
+            compute_phase2_stock_subscriptions(&uni, &preopen_snap, &cal, today(), 25);
+        let plan_fallback =
+            compute_phase2_stock_subscriptions(&uni, &synthetic_snap, &cal, today(), 25);
+
+        assert_eq!(
+            plan_preopen.total_instruments(),
+            plan_fallback.total_instruments(),
+            "fallback path must produce identical instrument count to preopen path at same spot"
+        );
+        assert_eq!(
+            plan_preopen.stocks_subscribed,
+            plan_fallback.stocks_subscribed
+        );
+    }
+
     #[test]
     fn test_min_trading_days_to_expiry_constant_is_three() {
         // Guards the spec: "greater than two working days" means >=3.

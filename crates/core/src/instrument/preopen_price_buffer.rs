@@ -112,6 +112,60 @@ pub fn new_shared_preopen_buffer() -> SharedPreOpenBuffer {
     Arc::new(RwLock::new(HashMap::with_capacity(320)))
 }
 
+/// Live LTP map for F&O underlying stocks — Phase 2 late-start fallback.
+///
+/// Populated continuously from NSE_EQ ticks on the main WebSocket feed
+/// (segment code 1). Keyed by underlying symbol (e.g. "RELIANCE",
+/// "INFY"). Value is the most recent LTP seen for that stock.
+///
+/// Used by `Phase2InstrumentsSource::Dynamic` when the pre-open buffer
+/// is empty at trigger time (e.g. app booted at 11:26 AM after missing
+/// the 09:08–09:12 IST window). Phase 2 then wraps each live LTP as a
+/// synthetic `PreOpenCloses` so `compute_phase2_stock_subscriptions`
+/// can pick ATM strikes using whatever data IS available right now.
+///
+/// This is the "same process, different spot source" path Parthiban
+/// described: fresh-clone boot after market open must still subscribe
+/// stock F&O using live data, not wait until tomorrow's pre-open.
+pub type SharedStockLtps = Arc<RwLock<HashMap<String, f64>>>;
+
+/// Creates an empty shared stock-LTP map. Capacity pre-sized for ~300
+/// F&O underlying stocks.
+#[must_use]
+pub fn new_shared_stock_ltps() -> SharedStockLtps {
+    // O(1) EXEMPT: boot-time allocation, 300 entries, never resized on hot path.
+    Arc::new(RwLock::new(HashMap::with_capacity(320)))
+}
+
+/// Builds a synthetic `HashMap<String, PreOpenCloses>` from live stock
+/// LTPs — used by Phase 2's live-LTP fallback path when the pre-open
+/// buffer is empty. Each live LTP is stuffed into the latest slot
+/// (09:12) so `PreOpenCloses::backtrack_latest()` returns it.
+///
+/// Filters out non-finite and non-positive prices.
+///
+/// # Performance
+///
+/// Cold path — called at most once per Phase 2 dispatch (≤4 retries).
+/// O(n) in the number of stock LTPs (~300).
+#[must_use]
+pub fn build_synthetic_snap_from_live_ltps(
+    live_ltps: &HashMap<String, f64>,
+) -> HashMap<String, PreOpenCloses> {
+    // O(1) EXEMPT: cold path, sized ~300 entries.
+    let mut out: HashMap<String, PreOpenCloses> = HashMap::with_capacity(live_ltps.len());
+    for (symbol, &ltp) in live_ltps {
+        if !ltp.is_finite() || ltp <= 0.0 {
+            continue;
+        }
+        let mut closes = PreOpenCloses::default();
+        // Stuff into slot 4 (09:12) so backtrack_latest returns it.
+        closes.record(PREOPEN_MINUTE_SLOTS - 1, ltp);
+        out.insert(symbol.clone(), closes);
+    }
+    out
+}
+
 /// Maps an IST wall-clock seconds-of-day to a pre-open minute slot index.
 /// Returns `None` if the time is outside the 09:08..09:13 window.
 #[inline]
@@ -345,6 +399,73 @@ pub fn classify_tick(
 mod tests {
     use super::*;
     use chrono::Timelike;
+
+    // ---------------------------------------------------------------
+    // Live-LTP fallback tests (plan item: Phase 2 late-start recovery)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn new_shared_stock_ltps_is_empty_on_construction() {
+        let map = new_shared_stock_ltps();
+        assert!(map.blocking_read().is_empty());
+    }
+
+    #[test]
+    fn build_synthetic_snap_from_live_ltps_stuffs_into_latest_slot() {
+        let mut live = HashMap::new();
+        live.insert("RELIANCE".to_string(), 2_500.75);
+        live.insert("INFY".to_string(), 1_480.10);
+        let snap = build_synthetic_snap_from_live_ltps(&live);
+        assert_eq!(snap.len(), 2);
+        // Slot 4 (09:12) is where backtrack_latest starts scanning.
+        assert_eq!(
+            snap.get("RELIANCE").unwrap().closes[PREOPEN_MINUTE_SLOTS - 1],
+            Some(2_500.75)
+        );
+        assert_eq!(
+            snap.get("INFY").unwrap().closes[PREOPEN_MINUTE_SLOTS - 1],
+            Some(1_480.10)
+        );
+        // Earlier slots remain None.
+        for s in 0..PREOPEN_MINUTE_SLOTS - 1 {
+            assert_eq!(snap.get("RELIANCE").unwrap().closes[s], None);
+        }
+    }
+
+    #[test]
+    fn build_synthetic_snap_skips_nonfinite_and_nonpositive() {
+        let mut live = HashMap::new();
+        live.insert("GOOD".to_string(), 100.0);
+        live.insert("ZERO".to_string(), 0.0);
+        live.insert("NEG".to_string(), -5.0);
+        live.insert("NAN".to_string(), f64::NAN);
+        live.insert("INF".to_string(), f64::INFINITY);
+        let snap = build_synthetic_snap_from_live_ltps(&live);
+        assert_eq!(snap.len(), 1);
+        assert!(snap.contains_key("GOOD"));
+        assert!(!snap.contains_key("ZERO"));
+        assert!(!snap.contains_key("NEG"));
+        assert!(!snap.contains_key("NAN"));
+        assert!(!snap.contains_key("INF"));
+    }
+
+    #[test]
+    fn build_synthetic_snap_round_trips_through_backtrack_latest() {
+        // Proof that `compute_phase2_stock_subscriptions` will pick the
+        // live LTP via the normal `backtrack_latest` call — no API
+        // changes in the consumer.
+        let mut live = HashMap::new();
+        live.insert("TCS".to_string(), 3_750.25);
+        let snap = build_synthetic_snap_from_live_ltps(&live);
+        assert_eq!(snap.get("TCS").unwrap().backtrack_latest(), Some(3_750.25));
+    }
+
+    #[test]
+    fn build_synthetic_snap_from_empty_live_map_returns_empty() {
+        let live: HashMap<String, f64> = HashMap::new();
+        let snap = build_synthetic_snap_from_live_ltps(&live);
+        assert!(snap.is_empty());
+    }
 
     // 09:08:00 IST = 03:38:00 UTC = UTC epoch offset from midnight = 3*3600+38*60
     fn ist_utc_epoch(hour: u32, minute: u32, second: u32) -> i64 {

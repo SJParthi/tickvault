@@ -40,7 +40,10 @@ use tokio::time::Instant;
 use tracing::{error, info, instrument, warn};
 
 use crate::instrument::phase2_delta::compute_phase2_stock_subscriptions;
-use crate::instrument::preopen_price_buffer::{PreOpenCloses, SharedPreOpenBuffer, snapshot};
+use crate::instrument::preopen_price_buffer::{
+    PreOpenCloses, SharedPreOpenBuffer, SharedStockLtps, build_synthetic_snap_from_live_ltps,
+    snapshot,
+};
 use crate::notification::{NotificationEvent, NotificationService};
 use tickvault_common::instrument_types::FnoUniverse;
 use tickvault_common::trading_calendar::TradingCalendar;
@@ -118,6 +121,13 @@ pub enum Phase2InstrumentsSource {
         /// ATM ± `strikes_each_side` per stock. Spec value is 25
         /// (matches `live-market-feed-subscription.md`).
         strikes_each_side: usize,
+        /// Live-LTP fallback — populated continuously from NSE_EQ
+        /// ticks on the main feed. When the pre-open buffer is empty
+        /// at trigger time (fresh-clone deploy at 11:26 AM, crash
+        /// recovery, etc.), Phase 2 falls back to this map so stock
+        /// F&O still gets subscribed the same session using live data.
+        /// `None` disables the fallback (test / legacy call sites).
+        live_stock_ltps: Option<SharedStockLtps>,
     },
 }
 
@@ -129,10 +139,13 @@ impl std::fmt::Debug for Phase2InstrumentsSource {
                 .field("instruments", &list.len())
                 .finish(),
             Self::Dynamic {
-                strikes_each_side, ..
+                strikes_each_side,
+                live_stock_ltps,
+                ..
             } => f
                 .debug_struct("Dynamic")
                 .field("strikes_each_side", strikes_each_side)
+                .field("live_ltp_fallback", &live_stock_ltps.is_some())
                 .finish(),
         }
     }
@@ -239,6 +252,13 @@ pub enum Phase2DispatchSource {
     CrashRecovery,
     ManualRestart,
     ApiTrigger,
+    /// Late-start path (2026-04-23): pre-open buffer was empty at
+    /// trigger time so the scheduler fell back to live NSE_EQ LTPs
+    /// from `SharedStockLtps`. ATM picking used whatever prices were
+    /// streaming at the moment of dispatch — less authoritative than
+    /// the 09:12 close but restores stock F&O coverage in the same
+    /// session instead of losing it until tomorrow's pre-open.
+    LiveLtpFallback,
 }
 
 impl Phase2DispatchSource {
@@ -252,6 +272,7 @@ impl Phase2DispatchSource {
             Self::CrashRecovery => "crash_recovery",
             Self::ManualRestart => "manual_restart",
             Self::ApiTrigger => "api_trigger",
+            Self::LiveLtpFallback => "live_ltp_fallback",
         }
     }
 
@@ -491,6 +512,9 @@ pub async fn run_phase2_scheduler(
             let mut diag_skipped_no_expiry: usize = 0;
             let mut diag_buffer_entries: usize = 0;
             let mut diag_sample_skipped: Vec<String> = Vec::new();
+            // Late-start live-LTP fallback diagnostics (2026-04-23).
+            let mut diag_used_live_ltp_fallback = false;
+            let mut diag_live_ltp_entries: usize = 0;
             let (instruments, reference_prices) = match source.as_ref() {
                 Some(Phase2InstrumentsSource::Static(list)) => (list.clone(), BTreeMap::new()),
                 Some(Phase2InstrumentsSource::Dynamic {
@@ -498,8 +522,9 @@ pub async fn run_phase2_scheduler(
                     universe,
                     calendar: dyn_cal,
                     strikes_each_side,
+                    live_stock_ltps,
                 }) => {
-                    let snap = snapshot(buffer).await;
+                    let mut snap = snapshot(buffer).await;
                     diag_buffer_entries = snap.len();
                     // Plan item K (2026-04-22): gauge on the preopen buffer
                     // population at trigger time. Low value here = upstream
@@ -507,6 +532,33 @@ pub async fn run_phase2_scheduler(
                     // this metric to the triage path.
                     metrics::gauge!("tv_phase2_preopen_buffer_entries")
                         .set(diag_buffer_entries as f64);
+                    // Late-start live-LTP fallback (2026-04-23): if the
+                    // pre-open buffer is empty AND the caller provided a
+                    // `live_stock_ltps` map (populated continuously from
+                    // NSE_EQ ticks on the main feed), build a synthetic
+                    // snapshot using live LTPs so stock F&O still gets
+                    // subscribed the same session. This is the "same
+                    // process, different spot source" path — ATM picking
+                    // logic is unchanged; only the spot input differs.
+                    if diag_buffer_entries == 0
+                        && let Some(ltps_arc) = live_stock_ltps.as_ref()
+                    {
+                        let live = ltps_arc.read().await;
+                        diag_live_ltp_entries = live.len();
+                        if diag_live_ltp_entries > 0 {
+                            snap = build_synthetic_snap_from_live_ltps(&live);
+                            diag_used_live_ltp_fallback = true;
+                            metrics::counter!("tv_phase2_live_ltp_fallback_used_total")
+                                .increment(1);
+                            metrics::gauge!("tv_phase2_live_ltp_fallback_entries")
+                                .set(diag_live_ltp_entries as f64);
+                            warn!(
+                                live_ltp_entries = diag_live_ltp_entries,
+                                "Phase 2: preopen buffer empty — falling back to live NSE_EQ LTPs \
+                                 (late-start / crash-recovery path)"
+                            );
+                        }
+                    }
                     let compute_start = Instant::now();
                     let plan = compute_phase2_stock_subscriptions(
                         universe,
@@ -553,6 +605,18 @@ pub async fn run_phase2_scheduler(
             // Phase2Complete { added_count: 0 }. This is what the operator
             // saw at 09:11 IST 2026-04-22 — "Added 0" with no root cause.
             if instruments.is_empty() {
+                let fallback_tag = if diag_used_live_ltp_fallback {
+                    format!(
+                        " Live-LTP fallback was attempted ({diag_live_ltp_entries} entries) but still produced an empty plan — \
+                         check whether F&O underlyings streamed any NSE_EQ ticks this session."
+                    )
+                } else if diag_buffer_entries == 0 {
+                    " Live-LTP fallback was NOT attempted (SharedStockLtps not wired or empty at trigger time) — \
+                     Phase2InstrumentsSource::Dynamic::live_stock_ltps should be populated from the main-feed tick broadcast."
+                        .to_string()
+                } else {
+                    String::new()
+                };
                 let reason = format!(
                     "Empty plan at trigger. Preopen buffer entries: {diag_buffer_entries}. \
                      Skipped no-price: {diag_skipped_no_price}. \
@@ -560,7 +624,7 @@ pub async fn run_phase2_scheduler(
                      Sample: [{}]. \
                      Likely cause: pre-open snapshotter received no stock ticks during \
                      09:08-09:12 IST window (check tv_phase2_snapshotter_ticks_buffered_total \
-                     + tv_phase2_snapshotter_ticks_filtered_total).",
+                     + tv_phase2_snapshotter_ticks_filtered_total).{fallback_tag}",
                     diag_sample_skipped.join(", ")
                 );
                 error!(
@@ -568,6 +632,8 @@ pub async fn run_phase2_scheduler(
                     buffer_entries = diag_buffer_entries,
                     skipped_no_price = diag_skipped_no_price,
                     skipped_no_expiry = diag_skipped_no_expiry,
+                    used_live_ltp_fallback = diag_used_live_ltp_fallback,
+                    live_ltp_entries = diag_live_ltp_entries,
                     "Phase 2: plan is EMPTY — no instruments to subscribe"
                 );
                 metrics::counter!("tv_phase2_runs_total", "outcome" => "empty_plan").increment(1);
@@ -1008,6 +1074,31 @@ mod tests {
             "manual_restart"
         );
         assert_eq!(Phase2DispatchSource::ApiTrigger.as_str(), "api_trigger");
+        // 2026-04-23: late-start live-LTP fallback.
+        assert_eq!(
+            Phase2DispatchSource::LiveLtpFallback.as_str(),
+            "live_ltp_fallback"
+        );
+    }
+
+    #[test]
+    fn test_phase2_dispatch_source_live_ltp_fallback_is_distinct() {
+        // The fallback variant must not collide with any existing
+        // dispatch source — Grafana panels filter by the wire string
+        // and a collision would silently mis-attribute dispatches.
+        let all = [
+            Phase2DispatchSource::Scheduler,
+            Phase2DispatchSource::CrashRecovery,
+            Phase2DispatchSource::ManualRestart,
+            Phase2DispatchSource::ApiTrigger,
+            Phase2DispatchSource::LiveLtpFallback,
+        ];
+        let uniq: std::collections::HashSet<&str> = all.iter().map(|s| s.as_str()).collect();
+        assert_eq!(
+            uniq.len(),
+            all.len(),
+            "dispatch source strings must be unique"
+        );
     }
 
     #[test]
