@@ -212,6 +212,22 @@ pub enum NotificationEvent {
         order_update_active: bool,
     },
 
+    /// Audit finding #8 (2026-04-24): when the 09:15:30 heartbeat fires
+    /// but the main-feed connection count is 0, the situation is the
+    /// OPPOSITE of "streaming OK" — it's a catastrophic missed market
+    /// open. The heartbeat codepath previously fired `MarketOpenStreaming
+    /// Confirmation` (Severity::Info) even in that case, reading as
+    /// "Streaming live @ 09:15:30 IST / Main feed: 0/5" which is confusing
+    /// and under-alerted. This variant fires at Severity::High so the
+    /// operator pages immediately instead of mistaking it for a heartbeat.
+    MarketOpenStreamingFailed {
+        main_feed_active: usize,
+        main_feed_total: usize,
+        depth_20_active: usize,
+        depth_200_active: usize,
+        order_update_active: bool,
+    },
+
     /// Plan item C (2026-04-22, visibility version): once-per-day audit
     /// trail of what NIFTY + BANKNIFTY 09:12 closes were used as the
     /// authoritative anchor for the day's depth ATM. The 60s depth
@@ -469,6 +485,23 @@ pub enum NotificationEvent {
         total_candles: usize,
         /// Number of QuestDB write failures (candles lost during persist).
         persist_failures: usize,
+    },
+
+    /// 2026-04-24 — idempotent re-run detected. The fetch call returned
+    /// `instruments_fetched == 0 && total_candles == 0`, but QuestDB
+    /// already has today's historical candles from a prior run, so the
+    /// zero result is "nothing to do" not "fetch broke". Fired at
+    /// [`Severity::Low`] instead of the HIGH `HistoricalFetchFailed`.
+    ///
+    /// See `count_historical_candles_for_ist_day` in `cross_verify.rs`
+    /// for the presence check.
+    HistoricalFetchAlreadyAvailable {
+        /// IST date of the trading day (e.g. `2026-04-24`).
+        today_ist: String,
+        /// Count of rows in `historical_candles` with `ts >= today
+        /// IST midnight`. Bounded above by ~60M (universe × timeframes
+        /// × candles-per-day) — `u64` is ample headroom.
+        today_candles: u64,
     },
 
     /// Historical candle fetch completed with failures.
@@ -908,6 +941,23 @@ impl NotificationEvent {
                      Order updates: {oms}"
                 )
             }
+            Self::MarketOpenStreamingFailed {
+                main_feed_active,
+                main_feed_total,
+                depth_20_active,
+                depth_200_active,
+                order_update_active,
+            } => {
+                let oms = if *order_update_active { "1/1" } else { "0/1" };
+                format!(
+                    "<b>MARKET OPEN STREAMING FAILED @ 09:15:30 IST</b>\n\
+                     Main feed: {main_feed_active}/{main_feed_total} — NO CONNECTIONS\n\
+                     Depth-20: {depth_20_active}/4\n\
+                     Depth-200: {depth_200_active}/4\n\
+                     Order updates: {oms}\n\
+                     Action: check pool watchdog, token validity, Dhan status."
+                )
+            }
             Self::MarketOpenDepthAnchor {
                 underlying,
                 close_0912,
@@ -1161,6 +1211,17 @@ impl NotificationEvent {
                     msg.push_str(&format!("\nPersist errors: {persist_failures}"));
                 }
                 msg
+            }
+            Self::HistoricalFetchAlreadyAvailable {
+                today_ist,
+                today_candles,
+            } => {
+                format!(
+                    "<b>Historical candles already fetched</b>\n\
+                     Date: {today_ist} IST\n\
+                     Today's candles in DB: {today_candles}\n\
+                     No new fetch needed (idempotent re-run)"
+                )
             }
             Self::HistoricalFetchFailed {
                 instruments_fetched,
@@ -1471,6 +1532,7 @@ impl NotificationEvent {
             Self::CandleVerificationFailed { .. } => Severity::High,
             Self::CandleCrossMatchFailed { .. } => Severity::High,
             Self::HistoricalFetchComplete { .. } => Severity::Low,
+            Self::HistoricalFetchAlreadyAvailable { .. } => Severity::Low,
             Self::CandleVerificationPassed { .. } => Severity::Low,
             Self::CandleCrossMatchPassed { .. } => Severity::Low,
             Self::CandleCrossMatchSkipped { .. } => Severity::Low,
@@ -1508,6 +1570,7 @@ impl NotificationEvent {
             Self::WebSocketPoolRecovered { .. } => Severity::Medium,
             Self::WebSocketPoolHalt { .. } => Severity::High,
             Self::MarketOpenStreamingConfirmation { .. } => Severity::Info,
+            Self::MarketOpenStreamingFailed { .. } => Severity::High,
             Self::MarketOpenDepthAnchor { .. } => Severity::Info,
             Self::DepthIndexLtpTimeout { .. } => Severity::High,
             Self::DepthUnderlyingMissing { .. } => Severity::High,
