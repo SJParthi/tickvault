@@ -286,9 +286,13 @@ async fn load_from_cache_or_emergency_download(
         }
     }
 
-    // I-P0-06: Emergency Download Override — all caches missing during market hours
+    // I-P0-06: Emergency Download Override — all caches missing during market hours.
+    // Must be ERROR level (routes to Telegram) per I-P0-06: the operator needs to
+    // know a cache-miss happened even on fresh clone, so they can investigate why
+    // the cache was absent (expected on fresh clone / Docker wipe / rkyv corruption).
+    // Self-healing: the code immediately downloads from Dhan CSV feed and continues.
     error!(
-        "CRITICAL: no instrument cache available during market hours — triggering emergency download"
+        "CRITICAL: instrument cache missing (fresh clone / wipe / corruption) — auto-recovering via Dhan CSV emergency download (self-healing, no operator action required unless download fails)"
     );
 
     match download_instrument_csv(

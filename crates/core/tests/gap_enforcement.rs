@@ -1222,9 +1222,12 @@ mod i_p0_06_emergency_download {
     fn test_i_p0_06_emergency_download_uses_critical_log() {
         let source = include_str!("../src/instrument/instrument_loader.rs");
 
-        // Must have CRITICAL log when all caches miss during market hours
+        // Must have CRITICAL log when all caches miss during market hours.
+        // Wording updated 2026-04-24 to make operator intent clearer on fresh
+        // clone boots — still ERROR level + "CRITICAL" prefix preserves I-P0-06
+        // Telegram routing and audit trail.
         assert!(
-            source.contains("CRITICAL: no instrument cache available during market hours"),
+            source.contains("CRITICAL: instrument cache missing"),
             "I-P0-06: instrument_loader.rs must log CRITICAL when caches miss during market hours"
         );
 
