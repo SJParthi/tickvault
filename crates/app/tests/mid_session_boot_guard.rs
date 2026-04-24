@@ -211,6 +211,32 @@ fn test_per_instrument_stall_poller_is_wired() {
 }
 
 #[test]
+fn test_market_open_streaming_routes_to_failed_when_main_feed_is_zero() {
+    // 2026-04-24 audit finding #8: when main_feed_active == 0 at the
+    // 09:15:30 heartbeat, the event MUST route to MarketOpenStreamingFailed
+    // (Severity::High), NOT to MarketOpenStreamingConfirmation
+    // (Severity::Info). Without this branch, a catastrophic "no connections
+    // at market open" scenario shows up as "Streaming live / Main feed: 0/5"
+    // in Telegram — Info severity, wakes nobody up.
+    let src = read_file("crates/app/src/main.rs");
+    assert!(
+        src.contains("NotificationEvent::MarketOpenStreamingFailed"),
+        "2026-04-24 regression: MarketOpenStreamingFailed routing missing. \
+         When main_feed_active == 0 at 09:15:30 IST, operator must page via \
+         the High-severity Failed variant, not the Info-severity Confirmation."
+    );
+    // Branch predicate must be `main_active == 0` — if someone relaxes it
+    // to `main_active < 5` or similar, the normal degraded-but-still-streaming
+    // case flips to High-severity noise.
+    assert!(
+        src.contains("if main_active == 0 {"),
+        "2026-04-24 regression: MarketOpenStreamingFailed gate must be \
+         `main_active == 0` exactly — relaxing to `< 5` etc. produces \
+         false pages for degraded-but-streaming pool states."
+    );
+}
+
+#[test]
 fn test_historical_fetch_guards_zero_fetched_zero_candles() {
     // 2026-04-24 audit finding #1: HistoricalFetchComplete must NOT fire
     // when `instruments_fetched == 0 && total_candles == 0`. Without this
