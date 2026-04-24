@@ -125,6 +125,39 @@ fn test_depth_200_has_initial_stagger_constant() {
 }
 
 #[test]
+fn test_instrument_build_success_event_is_emitted_on_both_boot_paths() {
+    // 2026-04-24 audit finding #6: InstrumentBuildSuccess was defined and
+    // unit-tested but NEVER emitted in production. Only the FAILURE path
+    // (InstrumentBuildFailed) fired, so operators had no positive Telegram
+    // signal that the daily instrument rebuild succeeded.
+    //
+    // This guard ensures InstrumentBuildSuccess is fired from BOTH the
+    // fast-boot and slow-boot load_instruments call sites.
+    let src = read_file("crates/app/src/main.rs");
+    let emissions = src
+        .matches("NotificationEvent::InstrumentBuildSuccess")
+        .count();
+    assert!(
+        emissions >= 2,
+        "2026-04-24 regression: InstrumentBuildSuccess must be emitted from \
+         BOTH boot paths (fast-boot + slow-boot). Found only {emissions} emission(s). \
+         Without both, one boot path regresses to silent-success behaviour."
+    );
+    // The source tag must be one of the two expected values — not a blank
+    // or generic string.
+    assert!(
+        src.contains("\"fresh_csv_build\""),
+        "2026-04-24 regression: source tag for FreshBuild must be \
+         'fresh_csv_build' (distinguishes from cache-hit path)."
+    );
+    assert!(
+        src.contains("\"rkyv_cache\""),
+        "2026-04-24 regression: source tag for CachedPlan must be \
+         'rkyv_cache' (distinguishes from fresh-csv path)."
+    );
+}
+
+#[test]
 fn test_depth_200_main_rs_increments_spawn_counter() {
     let src = read_file("crates/app/src/main.rs");
     assert!(
