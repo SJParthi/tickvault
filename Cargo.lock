@@ -3910,6 +3910,7 @@ dependencies = [
  "csv",
  "dhat",
  "failsafe",
+ "figment",
  "futures-util",
  "loom",
  "memmap2",
