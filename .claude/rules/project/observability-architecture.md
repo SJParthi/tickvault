@@ -170,6 +170,30 @@ summary file and drives the above flow.
 6. **Do not log at ERROR without a `code =` field** if the message
    mentions a known code prefix (I-P*, OMS-*, WS-*, STORAGE-*, etc.).
    The tag-guard fails the build.
+7. **Do not upgrade `DepthRebalanced` back to `Severity::High`.**
+   2026-04-24 PR #337 downgraded routine zero-disconnect drift swaps
+   from `[HIGH]` (via `NotificationEvent::Custom`) to `Severity::Low`
+   via the new typed `DepthRebalanced` variant. Amber alerts every 60s
+   on drift are pager fatigue. The `[HIGH]` tier is reserved for the
+   separate `DepthRebalanceFailed` variant (swap command channel
+   broken, new ATM unresolved). Ratchet:
+   `test_depth_rebalance_success_is_low_severity` +
+   `test_depth_rebalance_failure_is_high_severity`.
+8. **Do not drop the swap-level from the depth-rebalance Telegram title.**
+   Titles MUST read `Depth-20 rebalance: <UL>` or
+   `Depth-20+200 rebalance: <UL>`. Operators tell swap scope at a glance;
+   the 2026-04-22 operator incident (BANKNIFTY rebalance scared the
+   operator because the title didn't say "swap, not reconnect") proved
+   this is a safety-critical wording concern. Enforced by
+   `DepthRebalanceLevels::title_fragment()` + ratchets
+   `test_depth_rebalance_title_20_only` / `test_depth_rebalance_title_20_plus_200`.
+9. **Do not regress the `websocket_connections` counter write.**
+   `spawn_pool_watchdog_task` MUST call
+   `health.set_websocket_connections(active_count)` every 5s.
+   Removing this silently restores the "0/5 forever" bug the 09:15:30
+   heartbeat revealed on 2026-04-24. Ratchet:
+   `test_pool_watchdog_task_accepts_health_status` (source-scan guard
+   in `crates/api/tests/health_counter_fix7_guard.rs`).
 
 ## Completion status of the Zero-Touch plan
 

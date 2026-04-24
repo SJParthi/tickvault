@@ -486,3 +486,16 @@ When compacting, always preserve: (1) list of all modified files (2) test/build 
 **Boot sequence:** CryptoProvider → Config → Observability → Logging → Notification → Auth → QuestDB → Universe → HistoricalCandles → WebSocket → TickProcessor → OrderUpdateWS → API → TokenRenewal → Shutdown
 **Codebase size:** ~74K LoC Rust (~61K production, ~14K tests), 158 files, 6 crates
 **Test count:** ~7,250 passing tests (unit + integration + proptest + adversarial), 43 integration test files, 8 benchmarks, 2 fuzz targets
+
+**2026-04-24 PR #337 — recent-session pointer:** reconnect hardening
+(Fix #3), 09:13 triple-dispatch ratchets (#4), pre-open buffer widened
+to 09:00–09:12 (#1/#2), REST `/marketfeed/ltp` fallback module (#5),
+stock F&O expiry rollover ≤ 1 trading day (#6), main-feed 0/5 counter
+wiring (#7), stale 09:12 comment cleanup (#8), depth-rebalance severity
+LOW + title includes swap level(s) (#9/#10). Rule updates live in
+`.claude/rules/project/depth-subscription.md` (2026-04-24 Updates +
+"Stock F&O Expiry Rollover" section),
+`.claude/rules/project/live-market-feed-subscription.md` (2026-04-24
+Updates), and `.claude/rules/project/observability-architecture.md`
+(clauses 7–9 in "What future sessions MUST NOT do"). Runbook update:
+`docs/runbooks/expiry-day.md` → "Stock F&O Expiry Rollover".

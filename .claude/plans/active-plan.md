@@ -1,6 +1,6 @@
 # Implementation Plan: Reconnect Hardening + 09:13 Dispatch Chain + REST Fallback + Expiry Rollover + Telegram Severity
 
-**Status:** APPROVED
+**Status:** VERIFIED
 **Date:** 2026-04-24
 **Approved by:** Parthiban
 **Branch:** `claude/rest-fallback-implementation-nkVMl`
@@ -23,8 +23,8 @@ Plus:
 
 ### P0 — Ship today
 
-- [ ] **Fix #3: Reconnect subscription persistence**
-  - Files: `crates/core/src/websocket/connection.rs:683`, `crates/core/src/websocket/connection_pool.rs`
+- [x] **Fix #3: Reconnect subscription persistence**
+  - Files: `crates/core/src/websocket/connection.rs`, `crates/core/src/websocket/connection_pool.rs`
   - Change: `subscribe_cmd_rx.take()` permanently removes the receiver on first connect. On reconnect we lose the channel. Refactor so the reconnect loop **re-installs** the receiver (or the pool re-creates a fresh `mpsc` pair and the connection loop picks it up).
   - Post-reconnect tick-flow verification: after a resubscribe replay, assert at least one tick flows on the expected segments within 10s; on failure emit `[HIGH] PostReconnectTickStarvation` event and trigger another reconnect.
   - Tests added:
@@ -33,7 +33,7 @@ Plus:
     * `test_reconnect_replay_covers_nse_eq_nse_fno_idx_i` (integration)
   - Ratchet: banned-pattern scanner rejects `.take()` on `subscribe_cmd_rx` unless the preceding line has `// APPROVED: reinstall on reconnect`.
 
-- [ ] **Fix #4: Chain 3 dispatches at 09:13 from one snapshot**
+- [x] **Fix #4: Chain 3 dispatches at 09:13 from one snapshot**
   - Files: `crates/app/src/main.rs` (Phase 2 dispatch), `crates/core/src/websocket/depth_connection.rs` (ensure `DepthCommand::InitialSubscribe20` / `InitialSubscribe200` handled), `crates/core/src/instrument/depth_strike_selector.rs`
   - Change: at 09:13:00 IST, read the pre-open buffer once → atomic snapshot → three dispatches fired from same snapshot: (a) main-feed Phase 2, (b) depth-20 `InitialSubscribe20`, (c) depth-200 `InitialSubscribe200` for NIFTY CE/PE + BANKNIFTY CE/PE.
   - Tests added:
@@ -42,14 +42,14 @@ Plus:
     * `test_three_dispatches_use_single_snapshot`
   - Ratchet: new integration test `crates/app/tests/initial_depth_dispatch_guard.rs` fails if any of the 3 dispatches is missing at 09:13.
 
-- [ ] **Fix #9: Depth-rebalance severity HIGH → LOW on success**
-  - Files: `crates/core/src/notification/events.rs`, `crates/app/src/main.rs:3774`
+- [x] **Fix #9: Depth-rebalance severity HIGH → LOW on success**
+  - Files: `crates/core/src/notification/events.rs`, `crates/app/src/main.rs`
   - Change: add `NotificationEvent::DepthRebalanced { … }` with `Severity::Low`. Add `NotificationEvent::DepthRebalanceFailed { … }` with `Severity::High`. Replace the inline `NotificationEvent::Custom { message: … }` call in `main.rs:3774`.
   - Tests added:
     * `test_depth_rebalance_success_is_low_severity`
     * `test_depth_rebalance_failure_is_high_severity`
 
-- [ ] **Fix #10: Depth-rebalance title includes level(s)**
+- [x] **Fix #10: Depth-rebalance title includes level(s)**
   - Files: `crates/core/src/notification/events.rs`
   - Change: `Depth rebalance: BANKNIFTY` → `Depth-20+200 rebalance: BANKNIFTY` or `Depth-20 rebalance: FINNIFTY`.
   - Tests added:
@@ -58,30 +58,31 @@ Plus:
 
 ### P1 — Ship this batch
 
-- [ ] **Fix #1: Widen pre-open buffer to 09:00-09:12 IST**
+- [x] **Fix #1: Widen pre-open buffer to 09:00-09:12 IST**
   - Files: `crates/core/src/instrument/preopen_price_buffer.rs`
   - Change: window constant from 09:08-09:12 → 09:00-09:12. Buffer slots grow from 5 to 13.
   - Tests added:
     * `test_preopen_buffer_window_is_0900_to_0912`
     * `test_preopen_buffer_accepts_0905_tick`
 
-- [ ] **Fix #2: Backtrack 09:12 → … → 09:00 first non-empty minute wins**
+- [x] **Fix #2: Backtrack 09:12 → … → 09:00 first non-empty minute wins**
   - Files: `crates/core/src/instrument/phase2_scheduler.rs`, `crates/core/src/instrument/phase2_delta.rs`
   - Change: backtrack loop lower bound from 09:08 → 09:00.
   - Tests added:
     * `test_phase2_backtrack_walks_down_to_0900`
     * `test_phase2_first_non_empty_minute_wins`
 
-- [ ] **Fix #5: REST belt-and-suspenders `/v2/marketfeed/ltp` at 09:12:55**
-  - Files: NEW `crates/core/src/instrument/preopen_rest_fallback.rs`, `crates/core/src/instrument/phase2_scheduler.rs`
+- [x] **Fix #5: REST belt-and-suspenders `/v2/marketfeed/ltp` at 09:12:55**
+  - Files: `crates/core/src/instrument/preopen_rest_fallback.rs` (NEW), `crates/core/src/instrument/phase2_scheduler.rs`
   - Change: if the pre-open buffer is empty for any stock at 09:12:55 IST, POST `/v2/marketfeed/ltp` with up to 1000 SIDs. Merge returned LTPs into the buffer before Phase 2 reads at 09:13:00. If REST also returns empty for a SID, fall back to `historical_candles` previous-day close + emit `[HIGH]` Telegram "degraded mode".
   - Tests added:
     * `test_rest_fallback_invoked_when_buffer_empty`
     * `test_rest_fallback_merges_ltps_into_buffer`
     * `test_historical_fallback_fires_when_rest_also_empty`
 
-- [ ] **Fix #6: Expiry rollover (strict ≤1 trading day, stocks only)**
-  - Files: `crates/core/src/instrument/subscription_planner.rs:217`, `crates/core/src/instrument/depth_strike_selector.rs`, `crates/common/src/trading_calendar.rs` (new `count_trading_days(from, to) -> u32`)
+- [x] **Fix #6: Expiry rollover (strict ≤1 trading day, stocks only)**
+  - Files: `crates/core/src/instrument/subscription_planner.rs`, `crates/core/src/instrument/depth_strike_selector.rs`, `crates/common/src/trading_calendar.rs`
+  - New API: `TradingCalendar::count_trading_days(from, to) -> u32` helper
   - Change: for `UnderlyingKind::Stock`, if `count_trading_days(today, nearest_expiry) <= 1` → pick next expiry. Indices unchanged.
   - Tests added:
     * `test_stock_expiry_rolls_on_t_minus_1`
@@ -92,26 +93,26 @@ Plus:
 
 ### P2 — Ship this batch
 
-- [ ] **Fix #7: Fix main-feed 0/5 counter wiring**
+- [x] **Fix #7: Fix main-feed 0/5 counter wiring**
   - Files: `crates/core/src/websocket/connection_pool.rs`, `crates/api/src/state.rs`, `crates/app/src/main.rs` (around line 3416)
   - Change: increment `tv_websocket_connections_active` on successful connect, decrement on disconnect. Expose accurate count in `/health`.
   - Tests added:
     * `test_active_counter_increments_on_connect`
     * `test_active_counter_decrements_on_disconnect`
 
-- [ ] **Fix #8: Stale 09:12 → 09:13 comment**
-  - Files: `crates/app/src/main.rs:3336` and any sibling comments found by grep
+- [x] **Fix #8: Stale 09:12 → 09:13 comment**
+  - Files: `crates/app/src/main.rs` (around line 3336 and sibling comments found by grep)
   - Change: text-only, update `09:12` → `09:13` where comments reference the Phase 2 trigger time.
   - No test (doc-only); caught by grep hook.
 
 ### Doc updates (D1–D6)
 
-- [ ] **D1: `docs/runbooks/expiry-day.md`** — add "Stock F&O expiry rollover rule" section with strict ≤1 trading day, scope (stocks only), code pointer, Dhan ticket cite.
-- [ ] **D2: `.claude/rules/project/depth-subscription.md`** — new section "Expiry rollover — stock F&O only, 1 trading day" + 2026-04-24 section update (window widening, REST fallback, severity, title format).
-- [ ] **D3: `.claude/rules/project/live-market-feed-subscription.md`** — Phase 2 section update (09:00-09:12 window, backtrack, REST fallback, rollover).
-- [ ] **D4: `.claude/rules/project/observability-architecture.md`** — severity downgrade doc + title format ratchet.
-- [ ] **D5: `CLAUDE.md`** — one-line pointer in enforcement-rules table.
-- [ ] **D6: `docs/dhan-support/2026-04-24-expiry-day-non-tradeable-clarification.md`** — NEW draft support ticket.
+- [x] **D1: `docs/runbooks/expiry-day.md`** — add "Stock F&O expiry rollover rule" section with strict ≤1 trading day, scope (stocks only), code pointer, Dhan ticket cite.
+- [x] **D2: `.claude/rules/project/depth-subscription.md`** — new section "Expiry rollover — stock F&O only, 1 trading day" + 2026-04-24 section update (window widening, REST fallback, severity, title format).
+- [x] **D3: `.claude/rules/project/live-market-feed-subscription.md`** — Phase 2 section update (09:00-09:12 window, backtrack, REST fallback, rollover).
+- [x] **D4: `.claude/rules/project/observability-architecture.md`** — severity downgrade doc + title format ratchet.
+- [x] **D5: `CLAUDE.md`** — one-line pointer in enforcement-rules table.
+- [x] **D6: `docs/dhan-support/2026-04-24-expiry-day-non-tradeable-clarification.md`** — NEW draft support ticket.
 
 ## Scenarios
 

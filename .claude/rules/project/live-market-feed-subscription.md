@@ -4,6 +4,53 @@
 > **Scope:** Any file touching main WebSocket connection pool, subscription planning, or instrument distribution.
 > **Ground truth:** `docs/dhan-ref/03-live-market-feed-websocket.md`, `docs/dhan-ref/08-annexure-enums.md`
 
+## 2026-04-24 Updates (PR #337)
+
+Applies to Phase 2 scheduler + main-feed reconnect path:
+
+1. **Pre-open buffer window WIDENED to 09:00..=09:12 IST** (Fix #1). See
+   `preopen_price_buffer.rs` — `PREOPEN_MINUTE_SLOTS = 13`,
+   `PREOPEN_FIRST_MINUTE_SECS_IST = 9 * 3600`. Any 09:00..09:08 tick
+   that would previously have been dropped now lands in the buffer.
+   Ratchet: `test_preopen_buffer_window_is_0900_to_0912`.
+
+2. **Backtrack walks 09:12 → 09:11 → … → 09:00** (Fix #2). First
+   non-empty minute wins. Automatically follows from the widened
+   buffer because `PreOpenCloses::backtrack_latest` iterates the full
+   `closes` array. Ratchet:
+   `test_compute_phase2_backtracking_uses_0900_when_later_minutes_missing`.
+
+3. **REST /v2/marketfeed/ltp fallback** (Fix #5). At 09:12:55 IST, for
+   any F&O stock still absent from the buffer, the scheduler calls the
+   LTP endpoint and merges the result into the buffer's last slot.
+   Module: `crates/core/src/instrument/preopen_rest_fallback.rs`. See
+   `depth-subscription.md` 2026-04-24 Updates §2 for the policy
+   (historical-close fallback if REST is also empty). Pure-logic
+   primitives shipped in PR #337; scheduler integration is follow-up.
+
+4. **Stock F&O expiry rollover** (Fix #6) — STRICT ≤ 1 trading day.
+   `select_stock_expiry_with_rollover` (subscription_planner.rs) picks
+   the NEXT expiry when today is T or T-1 relative to the nearest
+   stock expiry. Indices unchanged — NIFTY / BANKNIFTY / FINNIFTY /
+   MIDCPNIFTY keep the nearest expiry. See `depth-subscription.md`
+   2026-04-24 Updates for the full rule + ratchets. Runbook:
+   `docs/runbooks/expiry-day.md`.
+
+5. **Reconnect subscription persistence** (Fix #3). `SubscribeRxGuard`
+   in `crates/core/src/websocket/connection.rs` ensures the
+   subscribe-command receiver is reinstalled on every read-loop exit,
+   so post-reconnect subscribe commands reach the new socket. Prior
+   behaviour left the channel `None` after first connect → cascading
+   silent-socket → watchdog-trip → reconnect loop. Ratchets:
+   `test_subscribe_rx_guard_reinstalls_on_drop`,
+   `test_subscribe_rx_guard_survives_many_cycles`.
+
+6. **Main-feed `tv_websocket_connections_active` counter wired** (Fix #7).
+   `spawn_pool_watchdog_task` now writes
+   `health.set_websocket_connections(active_count)` on every 5s tick.
+   `/health` and the 09:15:30 heartbeat now report the live count,
+   not `0/5`.
+
 ## 2026-04-22 Updates (this session, branch `claude/market-feed-depth-explanation-RynUx` / PR #324)
 
 1. **Phase 2 trigger time = 09:13:00 IST** (was 09:12:00, commit 0340a7c). Reading the preopen buffer at 09:12:00 reads slot 4 (09:12:00–09:12:59) before the close has been written. 09:13:00 guarantees the 09:12 minute is fully closed.

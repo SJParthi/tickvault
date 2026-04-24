@@ -4,6 +4,86 @@
 > **Scope:** Any file touching depth WebSocket connections, strike selection, rebalancing, or depth persistence.
 > **Ground truth:** `docs/dhan-ref/04-full-market-depth-websocket.md`, `docs/dhan-ref/08-annexure-enums.md`
 
+## 2026-04-24 Updates (PR #337)
+
+Mandatory for any new depth/Phase-2 work. These shipped on branch
+`claude/rest-fallback-implementation-nkVMl`:
+
+1. **Pre-open buffer window widened: 09:00..=09:12 IST** (was 09:08..=09:12).
+   `PREOPEN_MINUTE_SLOTS = 13`, `PREOPEN_FIRST_MINUTE_SECS_IST = 09:00`.
+   Backtrack walks 09:12 → 09:11 → … → 09:00, first non-empty minute wins.
+   Ratchet: `test_preopen_buffer_window_is_0900_to_0912`.
+
+2. **REST /marketfeed/ltp belt-and-suspenders fallback** —
+   `crates/core/src/instrument/preopen_rest_fallback.rs`. If a stock's
+   symbol is absent from the preopen buffer at 09:12:55 IST, call
+   `POST /v2/marketfeed/ltp` with integer SIDs (Dhan max 1000/request),
+   merge returned LTPs into the buffer's last slot. If REST also returns
+   nothing for a SID → historical-close fallback + `[HIGH]` Telegram.
+   Pure-logic primitives are shipped + unit-tested; scheduler integration
+   is follow-up. Ratchets: `test_rest_fallback_invoked_when_buffer_empty`,
+   `test_rest_fallback_merges_ltps_into_buffer`.
+
+3. **Depth rebalance severity DOWNGRADED to `Low` for routine zero-disconnect
+   swaps.** `NotificationEvent::DepthRebalanced` (Low) replaces the inline
+   `Custom { message }` call in `main.rs:3774`. `Severity::High` is reserved
+   for the new `DepthRebalanceFailed` variant. Ratchet:
+   `test_depth_rebalance_success_is_low_severity`.
+
+4. **Depth rebalance title includes swap level(s).** Format:
+   `Depth-20 rebalance: FINNIFTY` (indices without 200-level) or
+   `Depth-20+200 rebalance: BANKNIFTY` (NIFTY + BANKNIFTY). The operator
+   sees the swap scope at a glance — no need to read the Action line.
+   `DepthRebalanceLevels` enum in `notification/events.rs` owns the
+   `title_fragment()` and `action_line()` helpers. Ratchets:
+   `test_depth_rebalance_title_20_only`, `test_depth_rebalance_title_20_plus_200`.
+
+5. **Reconnect subscription persistence — `SubscribeRxGuard`.** The main-feed
+   `run_read_loop` now holds the subscribe-command receiver via a
+   reinstall-on-drop guard so every reconnect cycle can resume
+   subscribe-command delivery. Before this fix, a Dhan-side TCP RST storm
+   (10:08 IST on 2026-04-24) left sockets under-subscribed after the
+   reconnect → silent-socket → activity watchdog trip → cascade of
+   10:11 / 10:15 reconnects. Ratchets:
+   `test_subscribe_rx_guard_reinstalls_on_drop` +
+   `test_subscribe_rx_guard_survives_many_cycles`.
+
+6. **Main-feed `websocket_connections` counter is now written by the pool
+   watchdog.** Every 5s the watchdog snapshots `pool.health()`, counts
+   entries in state `Connected`, and calls `health.set_websocket_connections(count)`.
+   `/health` and the 09:15:30 IST streaming heartbeat now report the live
+   count instead of `0/5` forever. Ratchet:
+   `test_pool_watchdog_task_accepts_health_status`.
+
+## Stock F&O Expiry Rollover — STRICT ≤ 1 trading day (Fix #6, 2026-04-24)
+
+**Applies to stock F&O only. Indices (NIFTY / BANKNIFTY / FINNIFTY / MIDCPNIFTY)
+keep nearest expiry unconditionally.**
+
+The subscription planner rolls the subscribed expiry forward to the NEXT
+available expiry when `TradingCalendar::count_trading_days(today, nearest_expiry)
+<= STOCK_EXPIRY_ROLLOVER_TRADING_DAYS (= 1)`. Wednesday with a Thursday
+expiry → roll. Thursday-is-expiry → roll. Tuesday → keep nearest.
+
+**Enforced sites:**
+- `subscription_planner::build_subscription_plan` stock branch at line
+  ~297 — calls `select_stock_expiry_with_rollover` instead of the raw
+  nearest-expiry `find(|d| **d >= today)`.
+- `depth_strike_selector::select_depth_instruments` is **unchanged** —
+  called only for indices (which never roll).
+
+**Ratchets:**
+- `test_stock_expiry_rolls_on_t_minus_1`
+- `test_stock_expiry_rolls_on_t`
+- `test_stock_expiry_stays_on_t_minus_2`
+- `test_index_expiry_never_rolls_via_planner`
+- `test_count_trading_days_expiry_day_from_t_minus_1`
+
+**Full runbook:** `docs/runbooks/expiry-day.md` → "Stock F&O Expiry Rollover".
+
+**Dhan support citation:** `docs/dhan-support/2026-04-24-expiry-day-non-tradeable-clarification.md`
+(pending Dhan reply — link the response here when it arrives).
+
 ## 2026-04-22 Updates (this session)
 
 The following changes shipped on branch `claude/market-feed-depth-explanation-RynUx` (PR #324) and are mandatory for any new depth/Phase-2 work:
