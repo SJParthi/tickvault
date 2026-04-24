@@ -15,9 +15,10 @@ use tracing::{info, warn};
 
 use tickvault_common::config::IndexConstituencyConfig;
 use tickvault_common::constants::{
-    INDEX_CONSTITUENCY_BASE_URL, INDEX_CONSTITUENCY_MIN_INDICES,
-    INDEX_CONSTITUENCY_RETRY_MAX_DELAY_SECS, INDEX_CONSTITUENCY_RETRY_MAX_TIMES,
-    INDEX_CONSTITUENCY_RETRY_MIN_DELAY_SECS, INDEX_CONSTITUENCY_USER_AGENT,
+    INDEX_CONSTITUENCY_BASE_URL, INDEX_CONSTITUENCY_KNOWN_STALE_SLUGS,
+    INDEX_CONSTITUENCY_MIN_INDICES, INDEX_CONSTITUENCY_RETRY_MAX_DELAY_SECS,
+    INDEX_CONSTITUENCY_RETRY_MAX_TIMES, INDEX_CONSTITUENCY_RETRY_MIN_DELAY_SECS,
+    INDEX_CONSTITUENCY_USER_AGENT,
 };
 
 /// Download index constituency CSVs concurrently.
@@ -32,6 +33,30 @@ pub async fn download_constituency_csvs(
         return Vec::new();
     }
 
+    // Q8 (2026-04-24): filter out known-stale slugs before dispatching
+    // downloads. Skipping at the source means no HTTP request, no 404
+    // retry, no "received HTML instead of CSV" log line, no aggregated
+    // "14 failed" WARN. See `INDEX_CONSTITUENCY_KNOWN_STALE_SLUGS` for
+    // the operator runbook to remove a slug from the stale set after
+    // verifying the correct URL at niftyindices.com in a browser.
+    let stale_skipped_count = slugs
+        .iter()
+        .filter(|(_, s)| INDEX_CONSTITUENCY_KNOWN_STALE_SLUGS.contains(s))
+        .count();
+    if stale_skipped_count > 0 {
+        info!(
+            skipped = stale_skipped_count,
+            "constituency downloader: skipping known-stale slugs \
+             (niftyindices.com returns 404 — see \
+             INDEX_CONSTITUENCY_KNOWN_STALE_SLUGS for re-enable steps)"
+        );
+    }
+    let active_slugs: Vec<(&str, &str)> = slugs
+        .iter()
+        .copied()
+        .filter(|(_, s)| !INDEX_CONSTITUENCY_KNOWN_STALE_SLUGS.contains(s))
+        .collect();
+
     let client = match Client::builder()
         .timeout(Duration::from_secs(config.download_timeout_secs))
         .user_agent(INDEX_CONSTITUENCY_USER_AGENT)
@@ -45,9 +70,9 @@ pub async fn download_constituency_csvs(
     };
 
     let semaphore = Arc::new(Semaphore::new(config.max_concurrent_downloads));
-    let mut handles = Vec::with_capacity(slugs.len());
+    let mut handles = Vec::with_capacity(active_slugs.len());
 
-    for (name, slug) in slugs {
+    for (name, slug) in &active_slugs {
         let client = client.clone();
         let semaphore = Arc::clone(&semaphore);
         let name = name.to_string();
@@ -64,7 +89,7 @@ pub async fn download_constituency_csvs(
         }));
     }
 
-    let mut results = Vec::with_capacity(slugs.len());
+    let mut results = Vec::with_capacity(active_slugs.len());
     let mut failed_count = 0usize;
 
     for handle in handles {
@@ -228,6 +253,58 @@ mod tests {
         assert_eq!(
             url,
             "https://www.niftyindices.com/IndexConstituent/ind_nifty50list.csv"
+        );
+    }
+
+    /// Q8 regression (2026-04-24): every slug in
+    /// `INDEX_CONSTITUENCY_KNOWN_STALE_SLUGS` MUST also appear in
+    /// `INDEX_CONSTITUENCY_SLUGS`. Otherwise the filter becomes a no-op
+    /// guard that masks a typo, and the operator's "remove from stale
+    /// after verifying" workflow silently breaks.
+    #[test]
+    fn test_known_stale_slugs_all_exist_in_main_list() {
+        use tickvault_common::constants::{
+            INDEX_CONSTITUENCY_KNOWN_STALE_SLUGS, INDEX_CONSTITUENCY_SLUGS,
+        };
+        let active_slugs: std::collections::HashSet<&str> =
+            INDEX_CONSTITUENCY_SLUGS.iter().map(|(_, s)| *s).collect();
+        for stale in INDEX_CONSTITUENCY_KNOWN_STALE_SLUGS {
+            assert!(
+                active_slugs.contains(stale),
+                "stale slug `{stale}` not found in INDEX_CONSTITUENCY_SLUGS \
+                 — this means the skip-filter is silently doing nothing \
+                 for that entry. Either add it to the main list or \
+                 remove it from the stale list."
+            );
+        }
+    }
+
+    /// Q8 regression: the stale list is a set (no duplicates). Duplicate
+    /// entries hide bookkeeping errors during manual slug re-audits.
+    #[test]
+    fn test_known_stale_slugs_are_unique() {
+        use tickvault_common::constants::INDEX_CONSTITUENCY_KNOWN_STALE_SLUGS;
+        let mut seen = std::collections::HashSet::new();
+        for s in INDEX_CONSTITUENCY_KNOWN_STALE_SLUGS {
+            assert!(
+                seen.insert(*s),
+                "duplicate stale slug `{s}` — remove the dup"
+            );
+        }
+    }
+
+    /// Q8 regression: downloader source must reference
+    /// `INDEX_CONSTITUENCY_KNOWN_STALE_SLUGS.contains(...)` so the
+    /// skip-filter stays wired. Catches accidental removal during
+    /// refactors.
+    #[test]
+    fn test_downloader_filters_known_stale_slugs() {
+        let src = include_str!("csv_downloader.rs");
+        assert!(
+            src.contains("INDEX_CONSTITUENCY_KNOWN_STALE_SLUGS.contains"),
+            "downloader MUST filter against INDEX_CONSTITUENCY_KNOWN_STALE_SLUGS. \
+             If this regresses, every boot fires 14 redundant WARNs for URLs \
+             already known to 404."
         );
     }
 
