@@ -488,8 +488,17 @@ pub const TICK_GAP_MIN_TICKS_BEFORE_ACTIVE: u32 = 5;
 pub const TICK_GAP_ALERT_THRESHOLD_SECS: u32 = 30;
 
 /// Error-level gap threshold in seconds. Gaps >= this trigger an ERROR log
-/// (which routes to Telegram alert). 120 seconds suggests feed disconnection.
-pub const TICK_GAP_ERROR_THRESHOLD_SECS: u32 = 120;
+/// (which routes to Telegram alert).
+///
+/// **Raised from 120s → 300s on 2026-04-24** after live production log
+/// showed 988 ERROR entries in 15 minutes for illiquid F&O options that
+/// legitimately don't trade for 2-5 minutes at a time. A real feed
+/// disconnect is detected by WS ping/pong within 40s (Dhan server
+/// timeout) plus the `no_tick_watchdog` in `crates/core/src/pipeline/`;
+/// a 5-minute silence on ONE instrument while others keep ticking is
+/// illiquidity, not disconnect. The WARN band (30s threshold) still
+/// surfaces illiquidity to the aggregated 30s summary log.
+pub const TICK_GAP_ERROR_THRESHOLD_SECS: u32 = 300;
 
 /// Stale LTP threshold in seconds. If no tick arrives for a security within
 /// this window (wall-clock time), it is considered stale/frozen. 600s = 10 min.
