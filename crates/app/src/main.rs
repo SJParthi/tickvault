@@ -928,6 +928,13 @@ async fn main() -> Result<()> {
             None
         };
 
+        // Fix #7 (2026-04-24): create the shared health status early so
+        // the pool watchdog task can push live main-feed connection counts
+        // into it on every 5s tick. Before Fix #7 the watchdog was spawned
+        // before `health_status` existed and the fast-boot path's /health
+        // endpoint reported `websocket_connections: 0` forever.
+        let health_status: SharedHealthStatus = std::sync::Arc::new(SystemHealthStatus::new());
+
         // --- NOW spawn WebSocket connections (tick processor consuming) ---
         // S4-T1a/T1b: Wrap the pool in Arc so we can retain clones for the
         // pool watchdog task and the graceful-shutdown handler. All three
@@ -945,6 +952,7 @@ async fn main() -> Result<()> {
                 std::sync::Arc::clone(&pool_arc),
                 std::sync::Arc::clone(&shutdown_notify),
                 std::sync::Arc::clone(&fast_notifier),
+                std::sync::Arc::clone(&health_status),
             );
             // FAST BOOT parity with slow boot (main.rs ~1760):
             // emit per-connection + aggregate Telegram alerts so an operator
@@ -1066,8 +1074,8 @@ async fn main() -> Result<()> {
             }
         };
 
-        // Health status — created early so tick persistence consumer can update it.
-        let health_status: SharedHealthStatus = std::sync::Arc::new(SystemHealthStatus::new());
+        // Health status was created above (Fix #7 — moved up so the pool
+        // watchdog can push connection counts into it from its 5s poll).
 
         // --- Background: Tick persistence (cold path — subscribes to broadcast) ---
         // The tick processor was started with None writers (fast boot, QuestDB wasn't
@@ -2019,6 +2027,7 @@ async fn main() -> Result<()> {
             std::sync::Arc::clone(&pool_arc),
             std::sync::Arc::clone(&shutdown_notify),
             std::sync::Arc::clone(&notifier),
+            std::sync::Arc::clone(&health_status),
         );
         // FAST BOOT parity: helper emits per-connection + aggregate Telegram
         // alerts on BOTH boot paths (main.rs ~830 for FAST BOOT, here for slow).
@@ -4640,6 +4649,7 @@ fn spawn_pool_watchdog_task(
     pool: std::sync::Arc<WebSocketConnectionPool>,
     shutdown_notify: std::sync::Arc<tokio::sync::Notify>,
     notifier: std::sync::Arc<NotificationService>,
+    health: tickvault_api::state::SharedHealthStatus,
 ) {
     tokio::spawn(async move {
         // 5-second poll interval — cold path, not per tick. Matches the
@@ -4656,6 +4666,24 @@ fn spawn_pool_watchdog_task(
                     return;
                 }
                 _ = interval.tick() => {
+                    // Fix #7 (2026-04-24): update the main-feed active-
+                    // connection counter BEFORE polling the watchdog so
+                    // `/health` and the 09:15:30 streaming-confirmation
+                    // heartbeat see a fresh count. Without this write the
+                    // `websocket_connections` gauge stayed at 0/5 forever
+                    // even when all 5 sockets were live.
+                    let healths = pool.health();
+                    let active: u64 = healths
+                        .iter()
+                        .filter(|h| {
+                            matches!(
+                                h.state,
+                                tickvault_core::websocket::types::ConnectionState::Connected
+                            )
+                        })
+                        .count() as u64;
+                    health.set_websocket_connections(active);
+
                     let verdict = pool.poll_watchdog();
                     use tickvault_core::websocket::pool_watchdog::WatchdogVerdict;
                     match verdict {
