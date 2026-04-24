@@ -50,7 +50,7 @@ const BROWSER_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleW
 const BROWSER_ORIGIN: &str = "https://web.dhan.co";
 
 /// User-Agent flavour to send on the WebSocket upgrade request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum UaFlavor {
     /// tungstenite's compiled-in default (e.g. `tungstenite-rs/0.24.0`).
     Default,
@@ -61,7 +61,7 @@ pub enum UaFlavor {
 }
 
 /// ALPN advertisement mode on the TLS ClientHello.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AlpnMode {
     /// Force `http/1.1` ALPN — matches existing `build_websocket_tls_connector`.
     Http11,
@@ -82,13 +82,22 @@ pub struct DepthVariant {
     pub alpn: AlpnMode,
 }
 
-/// The full catalog of 8 variants, in the order the rotator tries them.
+/// The full catalog of 12 variants (2 paths × 3 UAs × 2 ALPN modes = 12),
+/// in the order the rotator tries them.
 ///
 /// Variant A is the default current production config (root path, default
 /// UA, `http/1.1` ALPN) — matches what `depth_connection.rs` used before
 /// this module existed. Any successful state therefore starts at variant
 /// A, as long as Dhan accepts it.
-pub const VARIANTS: [DepthVariant; 8] = [
+///
+/// Order rationale:
+/// - A, C, E, H first — root path with escalating mimicry depth (Python SDK
+///   verified to work with root path on 2026-04-23).
+/// - F, FN next — browser UA variants on root path.
+/// - B, D, G, H' last — `/twohundreddepth` path fallback (per Dhan ticket
+///   #5519522 advice), with full UA × ALPN coverage.
+pub const VARIANTS: [DepthVariant; 12] = [
+    // Root path variants (6) — most likely to work based on Python SDK verification.
     DepthVariant {
         label: "A_root_default_alpn11",
         url_path: "/",
@@ -120,6 +129,13 @@ pub const VARIANTS: [DepthVariant; 8] = [
         alpn: AlpnMode::Http11,
     },
     DepthVariant {
+        label: "FN_root_browser_noalpn",
+        url_path: "/",
+        ua: UaFlavor::Browser,
+        alpn: AlpnMode::None,
+    },
+    // /twohundreddepth path variants (6) — fallback per Dhan ticket #5519522.
+    DepthVariant {
         label: "B_twohundred_default_alpn11",
         url_path: "/twohundreddepth",
         ua: UaFlavor::Default,
@@ -135,6 +151,24 @@ pub const VARIANTS: [DepthVariant; 8] = [
         label: "G_twohundred_default_noalpn",
         url_path: "/twohundreddepth",
         ua: UaFlavor::Default,
+        alpn: AlpnMode::None,
+    },
+    DepthVariant {
+        label: "HT_twohundred_python_noalpn",
+        url_path: "/twohundreddepth",
+        ua: UaFlavor::Python,
+        alpn: AlpnMode::None,
+    },
+    DepthVariant {
+        label: "BR_twohundred_browser_alpn11",
+        url_path: "/twohundreddepth",
+        ua: UaFlavor::Browser,
+        alpn: AlpnMode::Http11,
+    },
+    DepthVariant {
+        label: "BRN_twohundred_browser_noalpn",
+        url_path: "/twohundreddepth",
+        ua: UaFlavor::Browser,
         alpn: AlpnMode::None,
     },
 ];
@@ -317,8 +351,43 @@ mod tests {
     }
 
     #[test]
-    fn test_variants_catalog_has_exactly_eight() {
-        assert_eq!(VARIANTS.len(), 8, "catalog must have exactly 8 variants");
+    fn test_variants_catalog_has_all_twelve_combinations() {
+        // Full matrix: 2 paths × 3 UAs × 2 ALPN modes = 12 variants.
+        assert_eq!(
+            VARIANTS.len(),
+            12,
+            "catalog must have exactly 12 variants (full 2×3×2 matrix)"
+        );
+        // Verify every (path, ua, alpn) combination is present exactly once.
+        let mut seen = std::collections::HashSet::with_capacity(12);
+        for v in VARIANTS.iter() {
+            let key = (v.url_path, v.ua, v.alpn);
+            assert!(
+                seen.insert(key),
+                "duplicate (path={}, ua={:?}, alpn={:?})",
+                v.url_path,
+                v.ua,
+                v.alpn
+            );
+        }
+        // Verify both paths are represented.
+        let root_count = VARIANTS.iter().filter(|v| v.url_path == "/").count();
+        let twohundred_count = VARIANTS
+            .iter()
+            .filter(|v| v.url_path == "/twohundreddepth")
+            .count();
+        assert_eq!(root_count, 6, "6 variants on root path");
+        assert_eq!(twohundred_count, 6, "6 variants on /twohundreddepth path");
+        // Verify every UA flavor is represented.
+        for ua in [UaFlavor::Default, UaFlavor::Python, UaFlavor::Browser] {
+            let count = VARIANTS.iter().filter(|v| v.ua == ua).count();
+            assert_eq!(count, 4, "4 variants per UA flavor ({:?})", ua);
+        }
+        // Verify both ALPN modes are represented.
+        for alpn in [AlpnMode::Http11, AlpnMode::None] {
+            let count = VARIANTS.iter().filter(|v| v.alpn == alpn).count();
+            assert_eq!(count, 6, "6 variants per ALPN mode ({:?})", alpn);
+        }
     }
 
     #[test]
