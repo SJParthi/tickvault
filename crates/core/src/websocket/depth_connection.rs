@@ -856,29 +856,27 @@ pub async fn run_two_hundred_depth_connection(
                     return Err(WebSocketError::NonReconnectableDisconnect { code: *code });
                 }
 
-                // 2026-04-24 Path B: if the failure is the
-                // `Protocol(ResetWithoutClosingHandshake)` error that has
-                // plagued us for 2 weeks, feed it to the rotator. After
-                // RESET_ROTATE_THRESHOLD consecutive resets on the current
-                // variant, the next attempt automatically uses the next
-                // variant from the catalog.
-                let is_reset_handshake = matches!(
-                    &err,
-                    WebSocketError::ConnectionFailed {
-                        source: tokio_tungstenite::tungstenite::Error::Protocol(
-                            tokio_tungstenite::tungstenite::error::ProtocolError::ResetWithoutClosingHandshake
-                        ),
-                        ..
-                    }
-                );
-                if is_reset_handshake && variant_rotator.record_reset() {
+                // 2026-04-24 Path B: any consecutive handshake failure counts
+                // toward rotation. The rotator's `locked_in` flag (set by
+                // `record_success()` inside connect_and_run_200_depth once
+                // the WS handshake completes) suppresses rotation after a
+                // variant has successfully connected at least once.
+                // Mid-stream RSTs from Dhan server rotation therefore do NOT
+                // rotate away from a known-working variant. Only pre-handshake
+                // failures (which short-circuit before record_success) count.
+                //
+                // Removed the previous `is_reset_handshake` gate because the
+                // exact tungstenite error shape can vary (IO vs Protocol vs
+                // Url, etc.) and letting ANY pre-handshake failure count is
+                // both safer and simpler.
+                if !variant_rotator.is_locked_in() && variant_rotator.record_reset() {
                     let new_variant = variant_rotator.current();
                     error!(
                         security_id,
                         label = %label,
                         from_variant = current_variant.label,
                         to_variant = new_variant.label,
-                        "{prefix}: rotating to next 200-depth variant after {} consecutive resets",
+                        "{prefix}: rotating to next 200-depth variant after {} consecutive pre-handshake failures",
                         crate::websocket::depth_200_variants::RESET_ROTATE_THRESHOLD
                     );
                 }
