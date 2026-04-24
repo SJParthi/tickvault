@@ -70,6 +70,111 @@ pub enum SubscribeCommand {
 }
 
 // ---------------------------------------------------------------------------
+// Fix #3 (2026-04-24): reconnect subscription persistence
+// ---------------------------------------------------------------------------
+
+/// Scope guard that takes the subscribe-command receiver out of a connection's
+/// `Mutex<Option<Receiver<SubscribeCommand>>>` slot for the duration of the
+/// `run_read_loop` call, and ALWAYS reinstalls it on drop — regardless of
+/// whether the loop exited via `return Err(...)`, `return Ok(())`, panic
+/// unwind, or normal fallthrough.
+///
+/// # Why this exists
+///
+/// On 2026-04-24 10:08 IST Dhan TCP-RST'd all 5 main-feed sockets. Our
+/// `run()` loop reconnected in ~4s, but the prior implementation did
+/// `self.subscribe_cmd_rx.lock().await.take()` INSIDE `run_read_loop`
+/// without ever putting the receiver back. Consequence: a late Phase 2
+/// subscribe command arriving after the reconnect had nowhere to go, so
+/// the new socket ended up under-subscribed. That socket then went silent
+/// for 50+ seconds, our activity watchdog tripped, and we got another
+/// reconnect — a cascade that fires at 10:11, 10:15, etc. This guard fixes
+/// the cause.
+///
+/// # Correctness
+///
+/// - On construction, moves the `Option<Receiver>` out of the slot.
+/// - `take_rx()` returns the receiver ONCE to the owner of the guard.
+/// - On `Drop`, moves the receiver back into the slot using `try_lock()`.
+///   `try_lock` cannot contend in practice: `install_subscribe_channel`
+///   runs exactly once per connection at boot (before `run()` starts).
+///   If `try_lock` ever does fail, we emit an `error!` with the stable
+///   code `"I-P1-RECONNECT"` so the operator is alerted and the receiver
+///   is dropped — the next Phase 2 dispatch will then fail fast with
+///   `SendError::Disconnected`, which is recoverable (pool can re-install).
+///
+/// # Usage
+///
+/// ```ignore
+/// let mut guard = SubscribeRxGuard::acquire(&self.subscribe_cmd_rx).await;
+/// // Borrow the Option<Receiver> via `guard.rx_mut()` inside select!
+/// // On any return path, `guard` is dropped and whatever is currently in
+/// // `guard.rx` is reinstalled into the slot for the NEXT reconnect.
+/// ```
+struct SubscribeRxGuard<'a> {
+    slot: &'a tokio::sync::Mutex<Option<mpsc::Receiver<SubscribeCommand>>>,
+    /// `Some(rx)` while the channel is alive, `None` after the pool
+    /// dropped the sender (channel closed). The read loop may set this
+    /// to `None` at any time via `rx_mut()`; on guard drop we reinstall
+    /// whatever state it currently holds.
+    rx: Option<mpsc::Receiver<SubscribeCommand>>,
+}
+
+impl<'a> SubscribeRxGuard<'a> {
+    /// Locks the slot, moves the `Option<Receiver>` out of it, and
+    /// returns the guard. The caller borrows the option via `rx_mut()`
+    /// inside the read loop. On drop the guard reinstalls whatever the
+    /// read loop left in `self.rx` — so the NEXT `run_read_loop`
+    /// invocation (after reconnect) can take it again.
+    async fn acquire(
+        slot: &'a tokio::sync::Mutex<Option<mpsc::Receiver<SubscribeCommand>>>,
+    ) -> Self {
+        let rx = slot.lock().await.take();
+        Self { slot, rx }
+    }
+
+    /// Returns a mutable borrow of the receiver slot so the read loop
+    /// can poll it (`rx_mut().as_mut()` gives `Option<&mut Receiver>`).
+    /// Setting it to `None` (e.g. when the channel closed) is expected
+    /// and does NOT leak the receiver — the guard's drop handler will
+    /// then reinstall `None` into the connection, which is the correct
+    /// state.
+    fn rx_mut(&mut self) -> &mut Option<mpsc::Receiver<SubscribeCommand>> {
+        &mut self.rx
+    }
+}
+
+impl Drop for SubscribeRxGuard<'_> {
+    fn drop(&mut self) {
+        // APPROVED: reinstall on reconnect — this is the entire point of
+        // the guard; see the struct-level doc-comment for rationale.
+        let rx = self.rx.take();
+        match self.slot.try_lock() {
+            Ok(mut guard) => {
+                // Reinstall whatever state the read loop left us in —
+                // `Some(rx)` to let the next reconnect cycle resume
+                // delivery, or `None` if the channel was closed during
+                // this cycle.
+                *guard = rx;
+            }
+            Err(_) => {
+                // This should be unreachable in production: the only
+                // other lock holder is `install_subscribe_channel`, which
+                // runs once at boot before `run()` starts. If we ever
+                // hit this branch, drop the receiver and alert — Phase 2
+                // will then fail fast and the pool can re-install.
+                tracing::error!(
+                    code = "I-P1-RECONNECT",
+                    "subscribe_cmd_rx reinstall on read-loop exit failed: mutex contended. \
+                     Dropping receiver; next Phase 2 dispatch will fail fast and the pool \
+                     can re-install via install_subscribe_channel()."
+                );
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // WebSocket Connection
 // ---------------------------------------------------------------------------
 
@@ -673,14 +778,22 @@ impl WebSocketConnection {
         let (write, mut read) = ws_stream.split();
         let write = Arc::new(tokio::sync::Mutex::new(write));
 
-        // O1-B (2026-04-17): take the subscribe-command receiver once at
-        // read-loop start. If the pool installed a channel, this is `Some`
-        // for the duration of this connect cycle; if the connection
-        // reconnects, `subscribe_cmd_rx` is `None` (we already took it).
-        // Pool can re-install via `with_subscribe_channel` between
-        // connect cycles — but the typical case is one channel per
-        // process lifetime.
-        let mut subscribe_rx = self.subscribe_cmd_rx.lock().await.take();
+        // Fix #3 (2026-04-24): hold the subscribe-command receiver via a
+        // reinstall-on-drop guard so the NEXT reconnect cycle can take it
+        // again. Before this fix the receiver was `.take()`d without ever
+        // being put back, which caused the 10:11 / 10:15 IST 2026-04-24
+        // silent-socket → watchdog trip → reconnect cascade. See
+        // SubscribeRxGuard doc-comment above for the root-cause writeup.
+        //
+        // The guard is dropped when this function returns via ANY path
+        // (Err, Ok, panic unwind) and reinstalls whatever state the read
+        // loop left in `guard.rx_mut()` back into `self.subscribe_cmd_rx`.
+        // A post-drop call to `run_read_loop` on the same connection
+        // (the reconnect case) will then take the receiver again from
+        // the same slot.
+        let mut subscribe_rx_guard = SubscribeRxGuard::acquire(&self.subscribe_cmd_rx).await;
+        let subscribe_rx: &mut Option<mpsc::Receiver<SubscribeCommand>> =
+            subscribe_rx_guard.rx_mut();
         let m_subscribe_dispatched = metrics::counter!("tv_ws_subscribe_command_dispatched_total");
         let m_subscribe_failed = metrics::counter!("tv_ws_subscribe_command_failed_total");
 
@@ -856,8 +969,12 @@ impl WebSocketConnection {
                         continue;
                     }
                     // Channel closed → leave the arm dormant for the rest
-                    // of this connect cycle.
-                    subscribe_rx = None;
+                    // of this connect cycle. Assign through the &mut
+                    // reference so the SubscribeRxGuard reinstalls `None`
+                    // on drop (Fix #3 correctness — the pool must then
+                    // re-install via `install_subscribe_channel` if it
+                    // wants further subscribe commands delivered).
+                    *subscribe_rx = None;
                     continue;
                 }
                 // STAGE-B (P1.1): plain read.next().await — no deadline.
@@ -3892,5 +4009,114 @@ mod tests {
             "backpressure and frame-drop metrics must be distinct counters \
              (WS-2 invariant)"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Fix #3 (2026-04-24): SubscribeRxGuard reinstall-on-drop tests.
+    //
+    // Without these ratchets, a regression where `run_read_loop` takes
+    // the receiver without reinstalling would silently resurface the
+    // 10:11 / 10:15 IST silent-socket → watchdog → reconnect cascade.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_subscribe_rx_guard_reinstalls_on_drop() {
+        // Arrange: a slot with a live receiver.
+        let (tx, rx) = mpsc::channel::<SubscribeCommand>(4);
+        let slot = tokio::sync::Mutex::new(Some(rx));
+
+        // Act: acquire and drop the guard (simulating a run_read_loop
+        // exit path with no state changes).
+        {
+            let _guard = SubscribeRxGuard::acquire(&slot).await;
+            // No reads, no writes — simulate a quick reconnect
+            // triggered by a Dhan TCP RST (the 10:08 scenario).
+        }
+
+        // Assert: the slot still holds the receiver, so the NEXT
+        // read-loop invocation can take it again.
+        let reinstalled = slot.lock().await;
+        assert!(
+            reinstalled.is_some(),
+            "SubscribeRxGuard::drop must reinstall the receiver so \
+             the next reconnect cycle can resume subscribe-command \
+             delivery (Fix #3 — see .claude/plans/active-plan.md)"
+        );
+        // Sanity: the reinstalled receiver is still usable.
+        drop(reinstalled);
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_rx_guard_survives_many_cycles() {
+        // Simulate N reconnect cycles. The receiver must be re-usable
+        // after every cycle — this is the property the 10:11 cascade
+        // violated before the guard existed.
+        let (tx, rx) = mpsc::channel::<SubscribeCommand>(4);
+        let slot = tokio::sync::Mutex::new(Some(rx));
+
+        for cycle in 0..10 {
+            let mut guard = SubscribeRxGuard::acquire(&slot).await;
+            // Each cycle briefly borrows the receiver. On early cycles
+            // the slot was empty between acquire→drop moments.
+            let rx_ref = guard.rx_mut();
+            assert!(
+                rx_ref.is_some(),
+                "cycle {cycle}: receiver must still be present after prior cycle"
+            );
+            // Drop the guard at scope exit — slot is reinstalled.
+        }
+
+        // After 10 cycles, one more acquire still gets the receiver.
+        let final_guard = SubscribeRxGuard::acquire(&slot).await;
+        assert!(
+            final_guard.rx.is_some(),
+            "receiver must survive N reconnect cycles — the pre-Fix-3 \
+             behaviour dropped it on cycle 1, causing silent sockets."
+        );
+        drop(final_guard);
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_rx_guard_preserves_none_on_closed_channel() {
+        // If the pool dropped the sender during the read loop, the
+        // loop sets *subscribe_rx = None. On guard drop we reinstall
+        // None — the pool MUST call install_subscribe_channel to
+        // resume. This ratchet pins the "closed stays closed" semantic
+        // so a refactor doesn't accidentally resurrect the old
+        // receiver state.
+        let (tx, rx) = mpsc::channel::<SubscribeCommand>(4);
+        let slot = tokio::sync::Mutex::new(Some(rx));
+
+        {
+            let mut guard = SubscribeRxGuard::acquire(&slot).await;
+            // Read loop sees closed channel → sets None.
+            *guard.rx_mut() = None;
+            drop(tx); // sender gone
+        }
+
+        let after = slot.lock().await;
+        assert!(
+            after.is_none(),
+            "guard must reinstall whatever state the loop left, \
+             including None — the pool re-installs a fresh receiver"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_rx_guard_empty_slot_is_noop() {
+        // Some connections never get a subscribe channel installed
+        // (depth-only pool, tests, etc.). The guard must handle the
+        // slot=None case without panicking and leave the slot=None.
+        let slot: tokio::sync::Mutex<Option<mpsc::Receiver<SubscribeCommand>>> =
+            tokio::sync::Mutex::new(None);
+
+        {
+            let _guard = SubscribeRxGuard::acquire(&slot).await;
+        }
+
+        let after = slot.lock().await;
+        assert!(after.is_none());
     }
 }
