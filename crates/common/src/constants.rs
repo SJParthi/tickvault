@@ -505,6 +505,22 @@ pub const TICK_GAP_ERROR_THRESHOLD_SECS: u32 = 300;
 /// Checked periodically by `TickGapTracker::detect_stale_instruments()`.
 pub const STALE_LTP_THRESHOLD_SECS: u64 = 600;
 
+/// Cadence for the per-instrument stall-detection poller wired in
+/// `run_slow_boot_observability`.
+///
+/// The poller calls `TickGapTracker::detect_stale_instruments()` which is
+/// O(n) over tracked securities (n up to 25k in prod). Running it per-tick
+/// would be O(n^2) over a session; running it hourly would delay detection
+/// past an operator's natural notice window. 30s is the sweet spot:
+/// matches the broader "is something wrong?" cadence used elsewhere
+/// (depth rebalancer = 60s, QuestDB health = 2s), so operators develop
+/// a consistent mental model of reaction latency.
+///
+/// Audit finding #2 (2026-04-24) wired the poller. See
+/// `.claude/rules/project/audit-findings-2026-04-17.md` Rule 3
+/// (background-worker market-hours awareness).
+pub const STALE_LTP_SCAN_INTERVAL_SECS: u64 = 30;
+
 /// Backlog-tick age threshold (seconds). A tick whose `exchange_timestamp`
 /// is older than `now_ist - BACKLOG_TICK_AGE_THRESHOLD_SECS` is treated as
 /// a historical / replay tick by [`tickvault_trading::risk::tick_gap_tracker`],

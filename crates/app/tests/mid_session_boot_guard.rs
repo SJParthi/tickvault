@@ -142,6 +142,42 @@ fn test_depth_200_main_rs_increments_spawn_counter() {
 }
 
 #[test]
+fn test_per_instrument_stall_poller_is_wired() {
+    // 2026-04-24 audit finding #2: TickGapTracker::detect_stale_instruments()
+    // existed in the tracker but was NEVER called in production. Per-instrument
+    // stall (Dhan silently drops a subscription OR an ATM strike stops trading
+    // mid-session) stayed invisible until the global no_tick_watchdog fired
+    // on TOTAL silence. This guard ensures the 30s periodic poller stays
+    // wired in run_slow_boot_observability.
+    let src = read_file("crates/app/src/main.rs");
+    assert!(
+        src.contains("tick_gap_tracker.detect_stale_instruments()"),
+        "2026-04-24 regression: detect_stale_instruments() call missing from \
+         main.rs. Per-instrument stall detection reverts to the 120s global \
+         watchdog — catastrophic for mid-session individual-underlying stalls."
+    );
+    let constants = read_file("crates/common/src/constants.rs");
+    assert!(
+        constants.contains("pub const STALE_LTP_SCAN_INTERVAL_SECS: u64 = 30;"),
+        "2026-04-24 regression: STALE_LTP_SCAN_INTERVAL_SECS must stay at 30 \
+         in common/constants.rs. Longer cadence delays stall detection; \
+         shorter wastes CPU on the O(n) scan."
+    );
+    assert!(
+        src.contains("STALE_LTP_SCAN_INTERVAL_SECS"),
+        "2026-04-24 regression: main.rs must reference the named constant \
+         STALE_LTP_SCAN_INTERVAL_SECS, not a hardcoded Duration literal \
+         (banned-pattern category 3)."
+    );
+    assert!(
+        src.contains("last_stale_check.elapsed() >= stale_check_interval"),
+        "2026-04-24 regression: stale-check cadence gate missing. Without it, \
+         detect_stale_instruments() would run on every tick (O(n) per tick = \
+         O(n^2) per session) or not at all."
+    );
+}
+
+#[test]
 fn test_historical_fetch_guards_zero_fetched_zero_candles() {
     // 2026-04-24 audit finding #1: HistoricalFetchComplete must NOT fire
     // when `instruments_fetched == 0 && total_candles == 0`. Without this
