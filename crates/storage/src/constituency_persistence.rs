@@ -43,14 +43,24 @@ const INDEX_CONSTITUENTS_CREATE_DDL: &str = "\
 /// Maximum retry attempts for constituency ILP persistence.
 const CONSTITUENCY_PERSIST_MAX_RETRIES: u32 = 3;
 
-/// Delay between constituency persistence retries (seconds).
+/// Initial delay between constituency persistence retries (seconds).
+/// Q7 (2026-04-24): was fixed 2s; now 2s → 5s → 12s exponential so
+/// QuestDB has real time to drain WAL pressure between attempts.
 const CONSTITUENCY_PERSIST_RETRY_DELAY_SECS: u64 = 2;
 
+/// Backoff multiplier for retry delays — `delay = delay * MULTIPLIER`.
+const CONSTITUENCY_PERSIST_BACKOFF_MULTIPLIER: u64 = 2;
+
 /// Flush batch size for constituency ILP persistence.
-/// Flushing 4000+ rows in one TCP ILP buffer causes `Broken pipe` on
-/// fresh QuestDB boots. Batching at 500 rows matches the pattern used
-/// by OBI persistence (100 rows) while keeping the number of flushes low.
-const CONSTITUENCY_FLUSH_BATCH_SIZE: usize = 500;
+///
+/// History:
+/// - Initial value: 4000+ (flushed entire dataset in one buffer).
+/// - First reduction: 500 (still failing on 2026-04-23 post-market boot with
+///   `Broken pipe (os error 32)` on all 3 retries).
+/// - Q7 (2026-04-24): reduced to 100 to match the `MOVERS_FLUSH_BATCH_SIZE`
+///   pattern which has NEVER shown broken-pipe failures. Smaller batches
+///   survive QuestDB WAL backpressure on fresh Docker boots.
+const CONSTITUENCY_FLUSH_BATCH_SIZE: usize = 100;
 
 // ---------------------------------------------------------------------------
 // Pure helper functions (testable without DB)
@@ -182,6 +192,12 @@ pub fn persist_constituency(
     fno_universe: Option<&FnoUniverse>,
 ) -> Result<()> {
     let mut last_err = None;
+    // Q7 (2026-04-24): exponential backoff between retries. Was fixed 2s
+    // × 3 = all attempts fired within 6 seconds — not enough time for
+    // QuestDB's WAL to drain under boot-time pressure. Now 2s → 4s → 8s
+    // so the third attempt happens 14s after the first, giving the WAL
+    // writer a real chance to finish whatever it was blocked on.
+    let mut delay_secs = CONSTITUENCY_PERSIST_RETRY_DELAY_SECS;
     for attempt in 1..=CONSTITUENCY_PERSIST_MAX_RETRIES {
         match persist_constituency_inner(constituency_map, questdb_config, fno_universe) {
             Ok(count) => {
@@ -198,19 +214,25 @@ pub fn persist_constituency(
                     ?err,
                     attempt,
                     max_retries = CONSTITUENCY_PERSIST_MAX_RETRIES,
+                    next_retry_secs = if attempt < CONSTITUENCY_PERSIST_MAX_RETRIES {
+                        delay_secs
+                    } else {
+                        0
+                    },
                     "constituency persistence attempt failed — retrying"
                 );
                 last_err = Some(err);
                 if attempt < CONSTITUENCY_PERSIST_MAX_RETRIES {
-                    std::thread::sleep(std::time::Duration::from_secs(
-                        CONSTITUENCY_PERSIST_RETRY_DELAY_SECS,
-                    ));
+                    std::thread::sleep(std::time::Duration::from_secs(delay_secs));
+                    delay_secs = delay_secs.saturating_mul(CONSTITUENCY_PERSIST_BACKOFF_MULTIPLIER);
                 }
             }
         }
     }
     tracing::error!(
         err = ?last_err,
+        total_indices = constituency_map.index_to_constituents.len(),
+        batch_size = CONSTITUENCY_FLUSH_BATCH_SIZE,
         "constituency persistence failed after {CONSTITUENCY_PERSIST_MAX_RETRIES} attempts — index_constituents table will be empty in Grafana"
     );
     Ok(())
@@ -519,6 +541,46 @@ mod tests {
         let delay = CONSTITUENCY_PERSIST_RETRY_DELAY_SECS;
         assert!((1..=10).contains(&retries));
         assert!((1..=30).contains(&delay));
+    }
+
+    /// Q7 regression (2026-04-24): the 2026-04-23 post-market boot had
+    /// `Broken pipe (os error 32)` on all 3 retries because
+    /// `CONSTITUENCY_FLUSH_BATCH_SIZE = 500` was overwhelming QuestDB's
+    /// WAL writer on fresh Docker boots. 100 matches `MOVERS_FLUSH_BATCH_SIZE`
+    /// which has never broken. If this ever creeps back up to 500+, the
+    /// post-market `index_constituents table will be empty in Grafana`
+    /// regression returns.
+    #[test]
+    fn test_flush_batch_size_small_enough_for_fresh_questdb() {
+        assert!(
+            CONSTITUENCY_FLUSH_BATCH_SIZE <= 250,
+            "CONSTITUENCY_FLUSH_BATCH_SIZE must stay <= 250 to survive \
+             QuestDB WAL pressure on fresh boots. Current: {CONSTITUENCY_FLUSH_BATCH_SIZE}. \
+             See 2026-04-23 broken-pipe incident — larger batches corrupt \
+             the TCP pipe mid-flush and all 3 retries fail identically."
+        );
+    }
+
+    /// Q7 regression (2026-04-24): the retry backoff must be exponential
+    /// (not fixed) so the 3rd attempt happens far enough after the 1st
+    /// to let QuestDB's WAL drain. Fixed 2s × 3 meant all 3 retries
+    /// fired within 6s total, which didn't give QuestDB enough time to
+    /// recover from whatever caused the first failure.
+    #[test]
+    fn test_retry_uses_exponential_backoff() {
+        assert!(
+            CONSTITUENCY_PERSIST_BACKOFF_MULTIPLIER >= 2,
+            "retry backoff multiplier must be >= 2 for exponential growth. \
+             Fixed delay means the third attempt fires too soon after the \
+             first and hits the same broken pipe the first one did."
+        );
+        let src = include_str!("constituency_persistence.rs");
+        assert!(
+            src.contains("saturating_mul(CONSTITUENCY_PERSIST_BACKOFF_MULTIPLIER)"),
+            "persist_constituency retry loop MUST apply the backoff \
+             multiplier between attempts — otherwise it degrades to \
+             fixed 2s × 3 and the regression returns."
+        );
     }
 
     // --- DEDUP key structure (from 5p1RT) ---

@@ -1859,6 +1859,49 @@ pub const INDEX_CONSTITUENCY_SLUGS: &[(&str, &str)] = &[
 /// Number of slugs in `INDEX_CONSTITUENCY_SLUGS`.
 pub const INDEX_CONSTITUENCY_SLUG_COUNT: usize = INDEX_CONSTITUENCY_SLUGS.len();
 
+/// Slugs known to return 404/HTML from niftyindices.com — skipped by the
+/// CSV downloader so we don't log 14 WARNs + fire an aggregated ERROR every
+/// boot for URLs we already know are wrong. The underlying CSVs almost
+/// certainly still exist at niftyindices.com, but under a different
+/// filename; the slugs here are the ones we shipped that the server now
+/// rejects with a 404 HTML page (classified as `kind=missing`).
+///
+/// **Last audited: 2026-04-24** (Q8 — 14 slugs confirmed stale by live
+/// post-market log review; HTTP headers, User-Agent, and Referer are all
+/// correct, so this is a pure URL-path problem, not a bot-wall problem).
+///
+/// ## Operator action to re-enable one of these
+///
+/// 1. Open <https://www.niftyindices.com> in a normal browser
+/// 2. Navigate to the index (e.g. Indices → Strategy → Nifty Alpha 50)
+/// 3. Click the "Download CSV" button on the index page
+/// 4. Inspect the download URL — copy the `ind_*.csv` filename
+/// 5. Update the corresponding entry in [`INDEX_CONSTITUENCY_SLUGS`]
+/// 6. Remove that slug from this list
+///
+/// ## Why we can't auto-fix from code
+///
+/// niftyindices.com is behind Cloudflare bot protection that blocks
+/// sandbox/datacenter IPs (verified 2026-04-24: every WebFetch from
+/// this environment returned 403). The correct slugs can only be
+/// discovered from a real browser session.
+pub const INDEX_CONSTITUENCY_KNOWN_STALE_SLUGS: &[&str] = &[
+    "ind_niftymidcap_selectlist",
+    "ind_niftyfinancialservices25_50list",
+    "ind_niftypvtbanklist",
+    "ind_niftyconsumerdurablelist",
+    "ind_niftyoilandgaslist",
+    "ind_niftyindiaconsumptionlist",
+    "ind_niftyinfrastructurelist",
+    "ind_niftyGrowthSectors15list",
+    "ind_nifty100_Quality30list",
+    "ind_nifty50_value20list",
+    "ind_niftyAlpha50list",
+    "ind_niftyHighBeta50list",
+    "ind_niftyLowVolatility50list",
+    "ind_niftyIndiaMfg_list",
+];
+
 // ---------------------------------------------------------------------------
 // Tests — Market Hours Constants
 // ---------------------------------------------------------------------------
