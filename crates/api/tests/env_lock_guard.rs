@@ -158,3 +158,47 @@ fn env_lock_module_exists_and_is_test_gated() {
          `mod test_support;` and used by middleware + debug test modules)."
     );
 }
+
+#[test]
+fn env_lock_uses_poison_error_recovery() {
+    // Ratchet: env_lock() MUST call `PoisonError::into_inner` so one
+    // panicking test doesn't cascade-block every downstream env test
+    // in the same binary. Replaces an earlier inline runtime test that
+    // deliberately panicked a thread — that approach tripped CI's
+    // `cargo nextest run --profile ci` (stderr capture / signal
+    // handling sensitivity we could not reproduce locally).
+    let src = fs::read_to_string(api_src_root().join("test_support.rs"))
+        .expect("test_support.rs must be readable");
+    assert!(
+        src.contains("PoisonError::into_inner"),
+        "env_lock() in crates/api/src/test_support.rs must use \
+         `PoisonError::into_inner` for poison recovery. See module docs \
+         for the full rationale."
+    );
+    assert!(
+        src.contains(".lock()") && src.contains("unwrap_or_else(PoisonError::into_inner)"),
+        "env_lock() must chain `.lock().unwrap_or_else(PoisonError::into_inner)` \
+         so the recovery fires on the specific lock() call path."
+    );
+}
+
+#[test]
+fn env_lock_exposes_mutex_guard_type_not_noop() {
+    // Ratchet: env_lock() returns a real MutexGuard<()>, not a no-op.
+    // If someone simplifies the impl to return `()` or a dummy type,
+    // the mutex-backed serialization property goes away and env-mutating
+    // tests could race again.
+    let src = fs::read_to_string(api_src_root().join("test_support.rs"))
+        .expect("test_support.rs must be readable");
+    assert!(
+        src.contains("MutexGuard<'static, ()>"),
+        "env_lock() return type must be MutexGuard<'static, ()>. \
+         Returning `()` would break the serialization property."
+    );
+    assert!(
+        src.contains("static ENV_MUTATION_LOCK") && src.contains("OnceLock<Mutex<()>>"),
+        "env_lock must be backed by a single `OnceLock<Mutex<()>>` static \
+         — otherwise each call would get a fresh mutex and callers \
+         would not serialize."
+    );
+}
