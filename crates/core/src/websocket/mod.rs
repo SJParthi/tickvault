@@ -16,6 +16,7 @@ pub mod activity_watchdog;
 pub mod connection;
 pub mod connection_pool;
 pub mod depth_connection;
+pub mod market_hours_gate;
 pub mod order_update_connection;
 pub mod pool_watchdog;
 pub mod subscription_builder;

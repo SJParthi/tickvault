@@ -267,12 +267,25 @@ impl WebSocketConnectionPool {
             }
 
             let conn = Arc::clone(conn);
-            handles.push(tokio::spawn(async move { conn.run().await }));
+            let defer_label = format!("conn={idx}");
+            handles.push(tokio::spawn(async move {
+                // Off-hours boot gate: if the app starts outside
+                // [09:00, 15:30) IST, sleep until the next 09:00 IST
+                // BEFORE opening any TCP socket. Eliminates the pre-market
+                // disconnect/reconnect flap Parthiban reported on
+                // 2026-04-24 at 07:40 IST.
+                crate::websocket::market_hours_gate::defer_until_market_open_ist(
+                    "main_feed",
+                    &defer_label,
+                )
+                .await;
+                conn.run().await
+            }));
 
             info!(
                 connection_id = idx,
                 total = self.connections.len(),
-                "Spawned WebSocket connection"
+                "Spawned WebSocket connection (task started; may defer connect if off-hours)"
             );
         }
 
