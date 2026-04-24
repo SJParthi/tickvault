@@ -1011,28 +1011,22 @@ async fn connect_and_run_200_depth(
             source: err,
         })?;
 
-    // 2026-04-24 Path B: TLS + WebSocket handshake succeeded — Dhan accepted
-    // this variant's URL/UA/ALPN combination. Lock it in immediately, BEFORE
-    // we subscribe or read any frames. This is the critical semantic:
-    // `ResetWithoutClosingHandshake` that later occurs mid-stream (e.g. Dhan
-    // rotating servers after 30 min) must NOT rotate us away from a variant
-    // we know works. Only handshake-time resets (which short-circuit this
-    // code path via the `?` above) count toward rotation.
-    if let Some(rotator) = variant_rotator {
-        if !rotator.is_locked_in() {
-            rotator.record_success();
-            info!(
-                label = %label,
-                variant = variant.label,
-                "{prefix}: handshake succeeded — locking in variant for this process"
-            );
-            metrics::counter!(
-                "tv_depth_200_variant_success_total",
-                "variant" => variant.label
-            )
-            .increment(1);
-        }
-    }
+    // 2026-04-24 Path B (REVISED 2026-04-24 evening): TLS + WebSocket
+    // handshake succeeded — but Dhan sometimes accepts the handshake and
+    // then RSTs the stream within ~6s before sending any data. Locking in
+    // at handshake time is therefore PREMATURE: the variant has proven
+    // nothing about its ability to stream depth. We now defer the
+    // `record_success()` call until the FIRST binary data frame arrives
+    // in the read loop below — at that point the variant has proven it
+    // can actually stream, and we can safely lock it in for the rest of
+    // the process lifetime. Handshake-only "success" no longer suppresses
+    // rotation; a handshake-then-RST cycle will still count toward
+    // rotation on the next pre-frame failure.
+    info!(
+        label = %label,
+        variant = variant.label,
+        "{prefix}: handshake succeeded — awaiting first data frame before locking in variant"
+    );
 
     if subscribe_msg.is_empty() {
         // Plan item B (2026-04-23): deferred mode — socket authenticated
@@ -1180,6 +1174,26 @@ async fn connect_and_run_200_depth(
                     m_active.set(1.0);
                     if let Some(signal) = connected_signal.take() {
                         let _ = signal.send(());
+                    }
+                    // 2026-04-24 (revised): lock in the variant ONLY on
+                    // first real data frame, not on handshake. A variant
+                    // that handshake-succeeds then RSTs before any frame
+                    // has not proven it can stream; locking it in would
+                    // suppress rotation away from a dead-stream variant.
+                    if let Some(rotator) = variant_rotator {
+                        if !rotator.is_locked_in() {
+                            rotator.record_success();
+                            info!(
+                                label = %label,
+                                variant = variant.label,
+                                "{prefix}: first data frame received — locking in variant for this process"
+                            );
+                            metrics::counter!(
+                                "tv_depth_200_variant_success_total",
+                                "variant" => variant.label
+                            )
+                            .increment(1);
+                        }
                     }
                 }
                 m_frames.increment(1);
