@@ -1741,6 +1741,75 @@ async fn execute_query(
     }
 }
 
+/// 2026-04-24 — counts the rows in `historical_candles` for the given IST
+/// trading day. Used by the boot-time historical-fetch alert so we can
+/// distinguish:
+///
+/// - **DB already has today's data** → next boot returns "Fetched: 0 /
+///   Candles: 0" not because of a Dhan outage but because every candle
+///   was deduplicated by QuestDB's UPSERT keys. This is the
+///   **idempotent re-run** case and should fire LOW
+///   `HistoricalFetchAlreadyAvailable`, not HIGH `HistoricalFetchFailed`.
+/// - **DB is empty for today** → "Fetched: 0 / Candles: 0" really IS a
+///   problem (Dhan outage, mid-boot race, empty universe). HIGH
+///   `HistoricalFetchFailed` with `zero_fetched_zero_candles` reason.
+///
+/// Bound is IST midnight (00:00 of `today_ist`) expressed in our
+/// storage convention (IST-as-UTC ISO string). This captures BOTH:
+/// - today's daily candle (stamped at IST midnight)
+/// - all of today's intraday candles (09:15 IST onwards)
+///
+/// Returns `None` if QuestDB is unreachable / returns garbage. Callers
+/// MUST treat `None` conservatively (do NOT downgrade severity on a
+/// failed query — a missing answer is not "DB has data").
+///
+/// # Performance
+/// Cold path — runs once per boot. The `count()` is bounded by
+/// today's candle volume (~25k instruments × ~6 timeframes × ~375
+/// candles ≈ 60M rows max), QuestDB returns < 100ms with the standard
+/// timestamp index.
+// Exemption rationale: pure HTTP wrapper over `execute_query` (which is
+// tested via cross-verify integration tests and `verify_candle_integrity`).
+// The SQL shaping is a single format! with a literal date — no branching,
+// no arithmetic, no hot path. The IST-midnight bound is covered indirectly
+// by the `mid_session_boot_guard` source-scan ratchet + the live boot flow.
+// TEST-EXEMPT: HTTP wrapper, covered by cross-verify integration path
+pub async fn count_historical_candles_for_ist_day(
+    questdb_config: &QuestDbConfig,
+    today_ist: NaiveDate,
+) -> Option<u64> {
+    let base_url = format!(
+        "http://{}:{}/exec",
+        questdb_config.host, questdb_config.http_port
+    );
+    let client = Client::builder()
+        .timeout(Duration::from_secs(VERIFY_QUERY_TIMEOUT_SECS))
+        .build()
+        .ok()?;
+
+    // IST midnight expressed in our IST-as-UTC storage convention.
+    // historical_candles.ts is stored as IST-epoch nanos serialised as
+    // a UTC ISO string by QuestDB's HTTP layer, so the bound formats
+    // identically to other where-clauses in this module.
+    let bound = format!("'{}T00:00:00.000000Z'", today_ist.format("%Y-%m-%d"));
+    let query = format!(
+        "SELECT count() FROM {table} WHERE ts >= {bound}",
+        table = QUESTDB_TABLE_HISTORICAL_CANDLES,
+    );
+
+    let data = execute_query(&client, &base_url, &query).await?;
+    let row = data.dataset.first()?;
+    let count = row.first()?.as_i64()?;
+    if count < 0 {
+        // Defensive: QuestDB count() is unsigned, but as_i64() returns
+        // i64. Treat negative as "unknown" — same conservative choice
+        // as a failed query.
+        return None;
+    }
+    #[allow(clippy::cast_sign_loss)] // APPROVED: bounded above by `< 0` check
+    Some(count as u64)
+}
+
 /// Executes a `SELECT count()` query and returns the count as usize.
 async fn extract_count(client: &Client, base_url: &str, query: &str) -> usize {
     match execute_query(client, base_url, query).await {
