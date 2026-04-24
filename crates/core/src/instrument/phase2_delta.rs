@@ -5,7 +5,7 @@
 //! At 09:12:30 IST the Phase 2 scheduler wakes up. For every F&O stock,
 //! it must:
 //! 1. Pick a reference price (the 09:12 close, or backtrack through
-//!    09:11/09:10/09:09/09:08 if 09:12 has no tick).
+//!    09:11/09:10/…/09:00 if 09:12 has no tick — widened 2026-04-24 Fix #1/#2).
 //! 2. Pick an eligible expiry — **strictly more than 2 trading days
 //!    remaining** (Dhan does not allow trading stock F&O on expiry
 //!    day, and a single-day-remaining contract is dangerous).
@@ -167,7 +167,7 @@ impl Phase2StockPlan {
 ///
 /// - `universe` — built at boot from the Dhan CSV.
 /// - `snapshots` — per-stock pre-open minute-close buckets
-///   (09:08..09:12 IST) from `preopen_price_buffer::snapshot()`.
+///   (09:00..09:12 IST, widened 2026-04-24) from `preopen_price_buffer::snapshot()`.
 /// - `calendar` — from `ApplicationConfig::trading`.
 /// - `today` — IST calendar date.
 /// - `strikes_each_side` — ATM ± N. Parthiban's spec is `25`
@@ -199,7 +199,8 @@ pub fn compute_phase2_stock_subscriptions(
             continue;
         }
 
-        // 1. Price — 09:12 close, backtrack through 09:11/09:10/09:09/09:08.
+        // 1. Price — 09:12 close, backtrack through 09:11/09:10/…/09:00
+        //    (widened 2026-04-24 Fix #1/#2). First non-empty minute wins.
         let Some(closes) = snapshots.get(symbol) else {
             stocks_skipped_no_price.push(symbol.clone());
             continue;
@@ -601,10 +602,13 @@ mod tests {
     }
 
     fn stock_buffer(symbol: &str, price_0912: f64) -> HashMap<String, PreOpenCloses> {
+        use crate::instrument::preopen_price_buffer::PREOPEN_MINUTE_SLOTS;
         let mut buf = HashMap::new();
-        let closes = PreOpenCloses {
-            closes: [None, None, None, None, Some(price_0912)],
-        };
+        // Fix #1 (2026-04-24): PREOPEN_MINUTE_SLOTS is 13 (09:00..=09:12).
+        // Record the price into the last slot (09:12) — the test name says
+        // "0912", so the last slot is correct regardless of window width.
+        let mut closes = PreOpenCloses::default();
+        closes.record(PREOPEN_MINUTE_SLOTS - 1, price_0912);
         buf.insert(symbol.to_string(), closes);
         buf
     }
@@ -691,14 +695,15 @@ mod tests {
 
     #[test]
     fn test_compute_phase2_backtracking_uses_0911_when_0912_missing() {
-        // If only 09:11 slot is populated, ATM picking still works.
+        // Fix #2 (2026-04-24): with the widened 09:00-09:12 window,
+        // backtrack walks 09:12 → 09:11 → … → 09:00 — first non-empty
+        // minute wins. Populate slot 11 (09:11) and leave slot 12 empty.
+        use crate::instrument::preopen_price_buffer::PREOPEN_MINUTE_SLOTS;
         let cal = make_calendar_empty_holidays();
         let uni = make_universe_with_stock("RELIANCE", vec![d(2026, 4, 23)], 2850.0);
         let mut snapshots = HashMap::new();
-        let closes = PreOpenCloses {
-            // slots 0..4 = 09:08/09/10/11/12. Only 09:11 has data.
-            closes: [None, None, None, Some(2861.0), None],
-        };
+        let mut closes = PreOpenCloses::default();
+        closes.record(PREOPEN_MINUTE_SLOTS - 2, 2861.0); // slot = 09:11
         snapshots.insert("RELIANCE".to_string(), closes);
 
         let plan = compute_phase2_stock_subscriptions(&uni, &snapshots, &cal, today(), 25);
@@ -707,12 +712,36 @@ mod tests {
     }
 
     #[test]
+    fn test_compute_phase2_backtracking_uses_0900_when_later_minutes_missing() {
+        // Fix #2 (2026-04-24): backtrack walks all the way to slot 0
+        // (09:00) when every later minute is empty. Before the widening
+        // this stock would have been skipped at the 09:08 boundary.
+        use crate::instrument::preopen_price_buffer::PREOPEN_MINUTE_SLOTS;
+        assert!(PREOPEN_MINUTE_SLOTS >= 2, "window must include 09:00");
+        let cal = make_calendar_empty_holidays();
+        let uni = make_universe_with_stock("RELIANCE", vec![d(2026, 4, 23)], 2850.0);
+        let mut snapshots = HashMap::new();
+        let mut closes = PreOpenCloses::default();
+        closes.record(0, 2846.0); // slot 0 = 09:00
+        snapshots.insert("RELIANCE".to_string(), closes);
+
+        let plan = compute_phase2_stock_subscriptions(&uni, &snapshots, &cal, today(), 25);
+        assert_eq!(
+            plan.stocks_subscribed,
+            vec!["RELIANCE".to_string()],
+            "Fix #2: stock with only an 09:00 tick MUST backtrack and subscribe"
+        );
+        assert!(plan.stocks_skipped_no_price.is_empty());
+    }
+
+    #[test]
     fn test_compute_phase2_stock_with_no_buckets_in_any_minute_is_skipped() {
-        // All 5 slots None — stock must be skipped.
+        // All slots None — stock must be skipped (only when it did not
+        // trade at ALL during the widened 09:00..=09:12 window).
         let cal = make_calendar_empty_holidays();
         let uni = make_universe_with_stock("WIPRO", vec![d(2026, 4, 23)], 400.0);
         let mut snapshots = HashMap::new();
-        snapshots.insert("WIPRO".to_string(), PreOpenCloses { closes: [None; 5] });
+        snapshots.insert("WIPRO".to_string(), PreOpenCloses::default());
         let plan = compute_phase2_stock_subscriptions(&uni, &snapshots, &cal, today(), 25);
         assert!(plan.instruments.is_empty());
         assert_eq!(plan.stocks_skipped_no_price, vec!["WIPRO".to_string()]);

@@ -166,6 +166,55 @@ impl TradingCalendar {
         self.mock_trading_names.get(&date).map(|s| s.as_str())
     }
 
+    /// Counts regular trading days in the half-open interval `(from, to]`.
+    ///
+    /// Used by Fix #6 (2026-04-24) — stock F&O expiry rollover. The
+    /// planner rolls a stock's nearest expiry to the next one when
+    /// `count_trading_days(today, nearest_expiry) <= 1`, i.e. when only
+    /// today (T-0) and/or tomorrow (T-1) trading days remain. Stocks
+    /// are illiquid/non-tradeable on those days; subscribing to them
+    /// wastes depth slots.
+    ///
+    /// The interval is **half-open**: `from` itself is NOT counted, but
+    /// `to` IS if it is a trading day. So for a Thursday expiry:
+    /// - Monday (from)   -> Tue + Wed + Thu = 3 trading days
+    /// - Tuesday (from)  -> Wed + Thu       = 2 trading days
+    /// - Wednesday (from)-> Thu             = 1 trading day   (rolls per strict rule)
+    /// - Thursday (from) -> (empty)         = 0 trading days  (rolls)
+    /// - Friday (from)   -> (negative int)  = 0 (to is in the past)
+    ///
+    /// Bounded to 30 iterations — longer than any realistic expiry gap
+    /// (typical rolls are 7–14 calendar days). Returns 0 if `to <= from`.
+    ///
+    /// # Panics
+    ///
+    /// Never panics. Date-arithmetic failures (which require year-9999
+    /// class overflow) saturate at 0.
+    pub fn count_trading_days(&self, from: NaiveDate, to: NaiveDate) -> u32 {
+        if to <= from {
+            return 0;
+        }
+        const MAX_ITERATIONS: u32 = 30;
+        let mut count: u32 = 0;
+        let mut candidate = match from.succ_opt() {
+            Some(d) => d,
+            None => return 0,
+        };
+        for _ in 0..MAX_ITERATIONS {
+            if candidate > to {
+                break;
+            }
+            if self.is_trading_day(candidate) {
+                count = count.saturating_add(1);
+            }
+            candidate = match candidate.succ_opt() {
+                Some(d) => d,
+                None => break,
+            };
+        }
+        count
+    }
+
     /// Returns the next regular trading day on or after the given date.
     ///
     /// Useful for scheduling: "when is the next day we should start up?"
@@ -342,6 +391,95 @@ mod tests {
         let cal = TradingCalendar::from_config(&config).unwrap();
         let date = NaiveDate::from_ymd_opt(2026, 3, 7).unwrap(); // Saturday
         assert!(!cal.is_trading_day(date));
+    }
+
+    // -----------------------------------------------------------------
+    // Fix #6 (2026-04-24): count_trading_days for stock F&O expiry rollover.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_count_trading_days_basic() {
+        // Monday -> Thursday (both inclusive on `to`; `from` exclusive)
+        // No holidays in the week: Tue, Wed, Thu = 3.
+        let config = make_test_config();
+        let cal = TradingCalendar::from_config(&config).unwrap();
+        let monday = NaiveDate::from_ymd_opt(2026, 4, 27).unwrap();
+        let thursday = NaiveDate::from_ymd_opt(2026, 4, 30).unwrap();
+        assert_eq!(cal.count_trading_days(monday, thursday), 3);
+    }
+
+    #[test]
+    fn test_count_trading_days_same_day_is_zero() {
+        let config = make_test_config();
+        let cal = TradingCalendar::from_config(&config).unwrap();
+        let d = NaiveDate::from_ymd_opt(2026, 4, 27).unwrap();
+        assert_eq!(cal.count_trading_days(d, d), 0);
+    }
+
+    #[test]
+    fn test_count_trading_days_to_before_from_is_zero() {
+        let config = make_test_config();
+        let cal = TradingCalendar::from_config(&config).unwrap();
+        let later = NaiveDate::from_ymd_opt(2026, 4, 30).unwrap();
+        let earlier = NaiveDate::from_ymd_opt(2026, 4, 27).unwrap();
+        assert_eq!(cal.count_trading_days(later, earlier), 0);
+    }
+
+    #[test]
+    fn test_count_trading_days_excludes_weekend() {
+        // Friday -> Monday: Sat + Sun + Mon, with Sat+Sun not trading.
+        // Result = 1 (Monday only).
+        let config = make_test_config();
+        let cal = TradingCalendar::from_config(&config).unwrap();
+        let friday = NaiveDate::from_ymd_opt(2026, 4, 24).unwrap();
+        let monday = NaiveDate::from_ymd_opt(2026, 4, 27).unwrap();
+        assert_eq!(cal.count_trading_days(friday, monday), 1);
+    }
+
+    #[test]
+    fn test_count_trading_days_excludes_holiday() {
+        // 2026-01-26 (Mon) is Republic Day. From Fri 2026-01-23 to Tue 2026-01-27:
+        // Sat (no), Sun (no), Mon = holiday (no), Tue (yes) = 1 trading day.
+        let config = make_test_config();
+        let cal = TradingCalendar::from_config(&config).unwrap();
+        let fri = NaiveDate::from_ymd_opt(2026, 1, 23).unwrap();
+        let tue = NaiveDate::from_ymd_opt(2026, 1, 27).unwrap();
+        assert_eq!(cal.count_trading_days(fri, tue), 1);
+    }
+
+    #[test]
+    fn test_count_trading_days_expiry_day_from_t_minus_1() {
+        // Fix #6 strict rollover boundary: today = Wed, Thu = expiry.
+        // count_trading_days(Wed, Thu) = 1 (Thu is a trading day, Wed exclusive).
+        // Rule: roll when count <= 1 → Wed rolls. ✓
+        let config = make_test_config();
+        let cal = TradingCalendar::from_config(&config).unwrap();
+        let wed = NaiveDate::from_ymd_opt(2026, 4, 29).unwrap();
+        let thu = NaiveDate::from_ymd_opt(2026, 4, 30).unwrap();
+        assert_eq!(cal.count_trading_days(wed, thu), 1);
+    }
+
+    #[test]
+    fn test_count_trading_days_expiry_day_from_t_minus_2() {
+        // Today = Tue, Thu = expiry.
+        // count_trading_days(Tue, Thu) = 2 (Wed + Thu).
+        // Rule: roll when count <= 1 → Tue does NOT roll. ✓
+        let config = make_test_config();
+        let cal = TradingCalendar::from_config(&config).unwrap();
+        let tue = NaiveDate::from_ymd_opt(2026, 4, 28).unwrap();
+        let thu = NaiveDate::from_ymd_opt(2026, 4, 30).unwrap();
+        assert_eq!(cal.count_trading_days(tue, thu), 2);
+    }
+
+    #[test]
+    fn test_count_trading_days_on_expiry_day_itself_is_zero() {
+        // Today = Thu (expiry), expiry = Thu.
+        // count_trading_days(Thu, Thu) = 0 (to <= from).
+        // Rule: roll when count <= 1 → Thu rolls. ✓
+        let config = make_test_config();
+        let cal = TradingCalendar::from_config(&config).unwrap();
+        let thu = NaiveDate::from_ymd_opt(2026, 4, 30).unwrap();
+        assert_eq!(cal.count_trading_days(thu, thu), 0);
     }
 
     #[test]

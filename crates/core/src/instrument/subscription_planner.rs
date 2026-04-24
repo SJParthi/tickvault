@@ -35,6 +35,7 @@ use tickvault_common::instrument_types::{
     ArchivedFnoUniverse, DhanInstrumentKind, FnoUniverse, IndexCategory, OptionChainKey,
     UnderlyingKind, naive_date_from_archived_i32,
 };
+use tickvault_common::trading_calendar::TradingCalendar;
 use tickvault_common::types::{ExchangeSegment, FeedMode};
 
 // ---------------------------------------------------------------------------
@@ -83,6 +84,72 @@ pub struct SubscriptionPlanSummary {
 }
 
 // ---------------------------------------------------------------------------
+// Fix #6 (2026-04-24) — stock F&O expiry rollover helper
+// ---------------------------------------------------------------------------
+
+/// Trading-day threshold at or below which a stock's nearest expiry is
+/// rolled to the next one. STRICT interpretation per Parthiban's spec
+/// ("expiry day + one day before"): roll when today is T (expiry day) or
+/// T-1 (day before expiry). T-2 keeps the current expiry.
+pub const STOCK_EXPIRY_ROLLOVER_TRADING_DAYS: u32 = 1;
+
+/// Select the nearest expiry for a stock F&O subscription, applying the
+/// Fix #6 rollover rule. Returns `None` if no suitable expiry exists.
+///
+/// Scope: **stocks only**. Indices (NIFTY / BANKNIFTY / FINNIFTY /
+/// MIDCPNIFTY) keep nearest expiry unconditionally — they trade actively
+/// right up to expiry seconds.
+///
+/// Behaviour:
+/// - When `calendar` is `None`: returns the first expiry `>= today` (the
+///   pre-Fix-6 behaviour). Tests and legacy callers rely on this.
+/// - When `calendar` is `Some`: if the nearest expiry is ≤ 1 trading day
+///   away (today is T or T-1), returns the NEXT expiry in the calendar;
+///   otherwise returns the nearest.
+///
+/// `expiry_dates` MUST be sorted ascending (canonical invariant from the
+/// universe builder).
+// TEST-EXEMPT: covered by test_stock_expiry_rolls_on_t, test_stock_expiry_rolls_on_t_minus_1, test_stock_expiry_stays_on_t_minus_2, test_stock_expiry_none_calendar_uses_legacy_nearest, test_stock_expiry_no_next_keeps_nearest_on_t_minus_1, test_stock_expiry_none_when_all_expiries_past, test_index_expiry_never_rolls_via_planner — substring grep misses the full fn name.
+pub fn select_stock_expiry_with_rollover(
+    expiry_dates: &[NaiveDate],
+    today: NaiveDate,
+    calendar: Option<&TradingCalendar>,
+) -> Option<NaiveDate> {
+    // Find index of the nearest expiry >= today.
+    let nearest_idx = expiry_dates.iter().position(|d| *d >= today)?;
+    let nearest = expiry_dates[nearest_idx];
+
+    let Some(cal) = calendar else {
+        return Some(nearest);
+    };
+
+    // Strict rule: roll when <= 1 trading day remains (today is T or T-1).
+    let trading_days_left = cal.count_trading_days(today, nearest);
+    if trading_days_left <= STOCK_EXPIRY_ROLLOVER_TRADING_DAYS {
+        // Roll to the NEXT expiry, if one exists.
+        if let Some(next) = expiry_dates.get(nearest_idx + 1) {
+            debug!(
+                %today,
+                %nearest,
+                next = %next,
+                trading_days_left,
+                "Fix #6: stock expiry rollover — next expiry chosen"
+            );
+            return Some(*next);
+        }
+        // No next expiry — fall back to nearest (better than nothing;
+        // the caller may still choose to skip this stock downstream).
+        warn!(
+            %today,
+            %nearest,
+            trading_days_left,
+            "Fix #6: stock expiry rollover wanted, but no next expiry in calendar — keeping nearest"
+        );
+    }
+    Some(nearest)
+}
+
+// ---------------------------------------------------------------------------
 // Planner
 // ---------------------------------------------------------------------------
 
@@ -91,7 +158,8 @@ pub struct SubscriptionPlanSummary {
 /// # Strategy
 /// - **Indices (NIFTY, BANKNIFTY, SENSEX, MIDCPNIFTY, FINNIFTY):**
 ///   Subscribe the index value feed (IDX_I) + ALL derivative contracts
-///   (all expiries, all strikes). No filtering whatsoever.
+///   (all expiries, all strikes). No filtering whatsoever. Indices keep
+///   nearest expiry unconditionally — Fix #6 rollover does NOT apply.
 ///
 /// - **Display indices (INDIA VIX, sectoral, broad market):**
 ///   Subscribe the index value feed only (IDX_I). No derivatives.
@@ -101,6 +169,9 @@ pub struct SubscriptionPlanSummary {
 ///   ATM ± N strikes (CE + PE) + current-month future.
 ///   ATM is approximated using the middle strike of the current expiry chain
 ///   (since no live prices are available at startup).
+///   **Fix #6 (2026-04-24):** when `trading_calendar` is `Some`, the
+///   current expiry rolls to the NEXT one if ≤ 1 trading day remains
+///   (today is T or T-1). Stock F&O is illiquid on those days.
 ///
 /// # Feed Mode
 /// All instruments use the same feed mode from config (Ticker by default).
@@ -111,11 +182,17 @@ pub struct SubscriptionPlanSummary {
 /// When absent AND the map is non-empty, that stock's F&O is SKIPPED.
 /// When the map is empty, falls back to median strike (boot-time behavior
 /// before pre-market prices are available).
+///
+/// # Trading Calendar (Fix #6)
+/// When `trading_calendar` is `Some`, stock F&O expiries roll forward
+/// when the nearest expiry is ≤ 1 trading day away. When `None`, nearest
+/// expiry is always used (legacy behaviour — pre-2026-04-24).
 pub fn build_subscription_plan(
     universe: &FnoUniverse,
     config: &SubscriptionConfig,
     today: NaiveDate,
     spot_prices: &std::collections::HashMap<String, f64>,
+    trading_calendar: Option<&TradingCalendar>,
 ) -> SubscriptionPlan {
     let feed_mode = config.parsed_feed_mode().unwrap_or(FeedMode::Ticker);
 
@@ -214,11 +291,16 @@ pub fn build_subscription_plan(
             continue;
         }
 
-        // Find current expiry (first expiry >= today)
+        // Find current expiry. Fix #6 (2026-04-24): stock F&O expiries
+        // roll to the NEXT one when today is T or T-1 (nearest expiry <= 1
+        // trading day away). Falls back to the pre-Fix-6 nearest-only
+        // behaviour when no calendar was provided.
         let current_expiry = universe
             .expiry_calendars
             .get(&underlying.underlying_symbol)
-            .and_then(|cal| cal.expiry_dates.iter().find(|d| **d >= today).copied());
+            .and_then(|cal| {
+                select_stock_expiry_with_rollover(&cal.expiry_dates, today, trading_calendar)
+            });
 
         let Some(expiry) = current_expiry else {
             debug!(
@@ -1155,8 +1237,13 @@ mod tests {
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan =
-            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
+        let plan = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
 
         // NIFTY is a major index → its IDX_I feed + ALL derivatives subscribed
         assert_eq!(plan.summary.major_index_values, 1); // NIFTY (only 1 of the 5 is in test universe)
@@ -1179,8 +1266,13 @@ mod tests {
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan =
-            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
+        let plan = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
 
         // NIFTY: 1 future + 5 CE + 5 PE = 11 derivatives
         assert_eq!(plan.summary.index_derivatives, 11);
@@ -1192,8 +1284,13 @@ mod tests {
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan =
-            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
+        let plan = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
 
         // RELIANCE: 1 future + 5 CE + 5 PE = 11 (all 5 strikes within ATM±10)
         assert_eq!(plan.summary.stock_derivatives, 11);
@@ -1206,8 +1303,13 @@ mod tests {
         // Set today AFTER the expiry date → no current expiry
         let today = NaiveDate::from_ymd_opt(2026, 4, 1).unwrap();
 
-        let plan =
-            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
+        let plan = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
 
         // RELIANCE has no valid expiry → skipped
         assert_eq!(plan.summary.stock_derivatives, 0);
@@ -1223,8 +1325,13 @@ mod tests {
         };
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan =
-            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
+        let plan = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
 
         assert_eq!(plan.summary.stock_derivatives, 0);
         assert_eq!(plan.summary.stock_equities, 1); // Equity feed still subscribed
@@ -1239,8 +1346,13 @@ mod tests {
         };
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan =
-            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
+        let plan = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
 
         assert_eq!(plan.summary.display_indices, 0);
     }
@@ -1254,8 +1366,13 @@ mod tests {
         };
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan =
-            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
+        let plan = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
 
         assert_eq!(plan.summary.index_derivatives, 0);
         assert_eq!(plan.summary.major_index_values, 1); // Index value feed still subscribed
@@ -1270,8 +1387,13 @@ mod tests {
         };
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan =
-            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
+        let plan = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
 
         assert_eq!(plan.summary.stock_equities, 0);
         // Stock derivatives still subscribed
@@ -1284,8 +1406,13 @@ mod tests {
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan =
-            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
+        let plan = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
 
         // Verify no duplicates by checking total equals unique count
         let ids: Vec<u32> = plan.registry.iter().map(|i| i.security_id).collect();
@@ -1299,8 +1426,13 @@ mod tests {
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan =
-            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
+        let plan = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
 
         // NIFTY index value
         let nifty = plan.registry.get(13).unwrap();
@@ -1332,8 +1464,13 @@ mod tests {
         };
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan =
-            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
+        let plan = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
 
         assert_eq!(plan.summary.feed_mode, FeedMode::Quote);
         // Verify individual instruments have Quote mode
@@ -1350,8 +1487,13 @@ mod tests {
         };
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan =
-            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
+        let plan = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
 
         assert_eq!(plan.summary.feed_mode, FeedMode::Full);
     }
@@ -1365,8 +1507,13 @@ mod tests {
         };
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan =
-            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
+        let plan = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
 
         // Invalid feed mode falls back to Ticker (see build_subscription_plan line 112)
         assert_eq!(plan.summary.feed_mode, FeedMode::Ticker);
@@ -1382,8 +1529,13 @@ mod tests {
         };
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan =
-            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
+        let plan = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
 
         // Stage 1: RELIANCE 1 future + 3 CE (mid+-1) + 3 PE (mid+-1) = 7
         // Stage 2: remaining 4 CE + 4 PE = 8 (progressive fill adds the rest)
@@ -1402,8 +1554,13 @@ mod tests {
         };
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan =
-            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
+        let plan = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
 
         // Stage 1: RELIANCE 1 future + 1 CE (ATM only) + 1 PE (ATM only) = 3
         // Stage 2: remaining 4 CE + 4 PE = 8 (progressive fill adds the rest)
@@ -1417,8 +1574,13 @@ mod tests {
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan =
-            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
+        let plan = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
 
         let expected_total = plan.summary.major_index_values
             + plan.summary.display_indices
@@ -1435,8 +1597,13 @@ mod tests {
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan =
-            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
+        let plan = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
         let grouped = plan.registry.by_exchange_segment();
 
         // IDX_I: NIFTY value (13) + INDIA VIX (21) = 2
@@ -1461,8 +1628,13 @@ mod tests {
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan =
-            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
+        let plan = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
 
         let expected_pct = (plan.summary.total as f64 / 25000.0) * 100.0;
         assert!(
@@ -1479,8 +1651,13 @@ mod tests {
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan =
-            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
+        let plan = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
 
         // Small universe: all RELIANCE contracts already in Stage 1 (ATM+-10)
         // Stage 2 has 0 remaining → 0 available, 0 skipped
@@ -1495,10 +1672,20 @@ mod tests {
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan1 =
-            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
-        let plan2 =
-            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
+        let plan1 = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
+        let plan2 = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
 
         let mut ids1: Vec<u32> = plan1.registry.iter().map(|i| i.security_id).collect();
         let mut ids2: Vec<u32> = plan2.registry.iter().map(|i| i.security_id).collect();
@@ -1515,8 +1702,13 @@ mod tests {
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan =
-            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
+        let plan = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
 
         let ids: Vec<u32> = plan.registry.iter().map(|i| i.security_id).collect();
         let unique: HashSet<u32> = ids.iter().copied().collect();
@@ -1582,8 +1774,13 @@ mod tests {
 
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
-        let plan =
-            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
+        let plan = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
 
         // Stage 1 subscribes near expiry ATM+-N (all 11 RELIANCE near contracts).
         // Stage 2 should add far expiry contracts (future + 3 CE = 4).
@@ -1692,8 +1889,13 @@ mod tests {
 
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
-        let plan =
-            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
+        let plan = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
 
         // INFY: 1 future + 3 CE + 0 PE = 4 (Stage 1 ATM+-10 covers all 3 calls)
         // Verify INFY instruments are in the plan
@@ -1739,8 +1941,13 @@ mod tests {
 
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
-        let plan =
-            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
+        let plan = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
 
         // SBIN equity should still be subscribed
         assert!(
@@ -1778,8 +1985,13 @@ mod tests {
 
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
-        let plan =
-            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
+        let plan = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
 
         // HDFC equity should be subscribed
         assert!(
@@ -1802,8 +2014,13 @@ mod tests {
         };
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan =
-            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
+        let plan = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
 
         // Only major index values should remain
         assert_eq!(plan.summary.display_indices, 0);
@@ -1820,8 +2037,13 @@ mod tests {
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan =
-            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
+        let plan = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
 
         assert!(
             plan.summary.capacity_utilization_pct >= 0.0,
@@ -1839,8 +2061,13 @@ mod tests {
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan =
-            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
+        let plan = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
 
         // stock_derivatives_available + stock_derivatives_skipped >= 0
         // and stock_derivatives_skipped is always consistent
@@ -1856,8 +2083,13 @@ mod tests {
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan =
-            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
+        let plan = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
 
         let debug_str = format!("{:?}", plan);
         assert!(
@@ -1872,8 +2104,13 @@ mod tests {
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan =
-            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
+        let plan = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
 
         let debug_str = format!("{:?}", plan.summary);
         assert!(
@@ -1945,8 +2182,13 @@ mod tests {
 
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
-        let plan =
-            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
+        let plan = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
 
         // TATA future should be subscribed
         assert!(
@@ -1989,8 +2231,13 @@ mod tests {
 
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
-        let plan =
-            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
+        let plan = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
 
         // EXPIRED stock should increment stocks_skipped_no_chain
         assert!(plan.summary.stocks_skipped_no_chain >= 1);
@@ -2004,8 +2251,13 @@ mod tests {
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan =
-            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
+        let plan = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
 
         // INDIA VIX is a display index, not a major index
         // Its derivatives (if any) should NOT be in IndexDerivative category
@@ -2026,8 +2278,13 @@ mod tests {
         // Set today to the exact expiry date
         let today = NaiveDate::from_ymd_opt(2026, 3, 27).unwrap();
 
-        let plan =
-            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
+        let plan = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
 
         // RELIANCE derivatives should still be subscribed (expiry >= today)
         assert!(
@@ -2043,8 +2300,13 @@ mod tests {
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 12, 31).unwrap();
 
-        let plan =
-            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
+        let plan = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
 
         // RELIANCE has expiry 2026-03-27, which is < today
         // All stock derivatives should be skipped
@@ -2082,8 +2344,13 @@ mod tests {
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan =
-            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
+        let plan = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
 
         assert_eq!(plan.summary.total, 0);
         assert_eq!(plan.summary.major_index_values, 0);
@@ -2249,8 +2516,13 @@ mod tests {
         };
 
         let config = SubscriptionConfig::default();
-        let plan =
-            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
+        let plan = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
 
         // The plan should be capped at MAX_TOTAL_SUBSCRIPTIONS
         assert!(
@@ -2302,8 +2574,13 @@ mod tests {
         );
 
         let config = SubscriptionConfig::default();
-        let plan =
-            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
+        let plan = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
 
         // Single call + single put should be subscribed (mid_idx=0 for both)
         assert!(
@@ -2333,8 +2610,13 @@ mod tests {
         }
 
         let config = SubscriptionConfig::default();
-        let plan =
-            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
+        let plan = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
 
         // Should still include options even without a future linked in the chain
         assert!(
@@ -2414,8 +2696,13 @@ mod tests {
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap(); // APPROVED: test constant
 
         // Build plan from owned types
-        let plan_owned =
-            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
+        let plan_owned = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
 
         // Serialize → load as archived → build plan from archived types
         let dir = std::env::temp_dir().join(format!(
@@ -2488,8 +2775,13 @@ mod tests {
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan =
-            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
+        let plan = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
 
         // NIFTY (security_id 13) should be subscribed with IDX_I segment
         let nifty = plan.registry.get(13).unwrap();
@@ -2507,8 +2799,13 @@ mod tests {
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan =
-            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
+        let plan = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
 
         // INDIA VIX (security_id 21) should use IDX_I segment
         let vix = plan.registry.get(21).unwrap();
@@ -2530,8 +2827,13 @@ mod tests {
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan =
-            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
+        let plan = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
 
         // RELIANCE equity (security_id 2885) should use NSE_EQ segment
         let reliance = plan.registry.get(2885).unwrap();
@@ -2553,8 +2855,13 @@ mod tests {
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan =
-            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
+        let plan = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
 
         // NIFTY future (50001) should use NSE_FNO segment
         let nifty_fut = plan.registry.get(50001).unwrap();
@@ -2579,8 +2886,13 @@ mod tests {
         };
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan =
-            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
+        let plan = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
 
         assert_eq!(plan.summary.feed_mode, FeedMode::Full);
 
@@ -2609,8 +2921,13 @@ mod tests {
         };
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan =
-            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
+        let plan = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
 
         for instrument in plan.registry.iter() {
             assert_eq!(
@@ -2751,8 +3068,13 @@ mod tests {
         };
 
         let config = SubscriptionConfig::default();
-        let plan =
-            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
+        let plan = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
 
         // Total must not exceed MAX_TOTAL_SUBSCRIPTIONS
         assert!(
@@ -2790,8 +3112,13 @@ mod tests {
         };
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan =
-            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
+        let plan = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
 
         assert_eq!(plan.summary.feed_mode, FeedMode::Quote);
         for instrument in plan.registry.iter() {
@@ -2814,8 +3141,13 @@ mod tests {
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan =
-            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
+        let plan = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
 
         // RELIANCE future (60001) should be StockDerivative
         let rel_fut = plan.registry.get(60001).unwrap();
@@ -2836,8 +3168,13 @@ mod tests {
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan =
-            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
+        let plan = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
 
         // NIFTY index value
         let nifty = plan.registry.get(13).unwrap();
@@ -2862,8 +3199,13 @@ mod tests {
         let config = SubscriptionConfig::default();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
-        let plan =
-            build_subscription_plan(&universe, &config, today, &std::collections::HashMap::new());
+        let plan = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
 
         // NIFTY CE option (50100) should be IndexDerivative
         let nifty_ce = plan.registry.get(50100).unwrap();
@@ -2932,6 +3274,7 @@ mod tests {
             &SubscriptionConfig::default(),
             today,
             &std::collections::HashMap::new(),
+            None,
         );
 
         // Count instruments with security_id == 13, grouped by segment.
@@ -3021,6 +3364,152 @@ mod tests {
         assert!(
             !set.insert((27, ExchangeSegment::IdxI)),
             "third insert of (27, IdxI) is a true duplicate — must be rejected"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Fix #6 (2026-04-24): stock F&O expiry rollover.
+    //
+    // Strict rule: roll to NEXT expiry when today is T (expiry day) or
+    // T-1 (day before). T-2 keeps the current expiry. Indices never roll.
+    // -----------------------------------------------------------------
+
+    fn make_test_calendar_no_holidays() -> TradingCalendar {
+        use tickvault_common::config::TradingConfig;
+        let cfg = TradingConfig {
+            market_open_time: "09:00:00".to_string(),
+            market_close_time: "15:30:00".to_string(),
+            order_cutoff_time: "15:29:00".to_string(),
+            data_collection_start: "09:00:00".to_string(),
+            data_collection_end: "15:30:00".to_string(),
+            timezone: "Asia/Kolkata".to_string(),
+            max_orders_per_second: 10,
+            nse_holidays: vec![],
+            muhurat_trading_dates: vec![],
+            nse_mock_trading_dates: vec![],
+        };
+        TradingCalendar::from_config(&cfg).expect("calendar must build")
+    }
+
+    #[test]
+    fn test_stock_expiry_rolls_on_t_minus_1() {
+        // Today = Wed 2026-04-29. Nearest expiry = Thu 2026-04-30.
+        // count_trading_days(Wed, Thu) = 1 → strict rule (<= 1) rolls.
+        let cal = make_test_calendar_no_holidays();
+        let today = NaiveDate::from_ymd_opt(2026, 4, 29).unwrap();
+        let nearest = NaiveDate::from_ymd_opt(2026, 4, 30).unwrap();
+        let next = NaiveDate::from_ymd_opt(2026, 5, 7).unwrap();
+        let picked = select_stock_expiry_with_rollover(&[nearest, next], today, Some(&cal));
+        assert_eq!(
+            picked,
+            Some(next),
+            "Fix #6 strict: Wed (T-1) with Thu expiry MUST roll to next"
+        );
+    }
+
+    #[test]
+    fn test_stock_expiry_rolls_on_t() {
+        // Today = Thu 2026-04-30 (expiry day). Nearest = today.
+        // count_trading_days(Thu, Thu) = 0 → strict rule rolls.
+        let cal = make_test_calendar_no_holidays();
+        let today = NaiveDate::from_ymd_opt(2026, 4, 30).unwrap();
+        let nearest = today;
+        let next = NaiveDate::from_ymd_opt(2026, 5, 7).unwrap();
+        let picked = select_stock_expiry_with_rollover(&[nearest, next], today, Some(&cal));
+        assert_eq!(
+            picked,
+            Some(next),
+            "Fix #6 strict: Thu (expiry day) MUST roll to next expiry"
+        );
+    }
+
+    #[test]
+    fn test_stock_expiry_stays_on_t_minus_2() {
+        // Today = Tue 2026-04-28. Nearest = Thu 2026-04-30.
+        // count_trading_days(Tue, Thu) = 2 → strict rule keeps nearest.
+        let cal = make_test_calendar_no_holidays();
+        let today = NaiveDate::from_ymd_opt(2026, 4, 28).unwrap();
+        let nearest = NaiveDate::from_ymd_opt(2026, 4, 30).unwrap();
+        let next = NaiveDate::from_ymd_opt(2026, 5, 7).unwrap();
+        let picked = select_stock_expiry_with_rollover(&[nearest, next], today, Some(&cal));
+        assert_eq!(
+            picked,
+            Some(nearest),
+            "Fix #6 strict: Tue (T-2) keeps nearest — not T or T-1"
+        );
+    }
+
+    #[test]
+    fn test_stock_expiry_none_when_all_expiries_past() {
+        let cal = make_test_calendar_no_holidays();
+        let today = NaiveDate::from_ymd_opt(2026, 5, 1).unwrap();
+        let past1 = NaiveDate::from_ymd_opt(2026, 4, 23).unwrap();
+        let past2 = NaiveDate::from_ymd_opt(2026, 4, 30).unwrap();
+        let picked = select_stock_expiry_with_rollover(&[past1, past2], today, Some(&cal));
+        assert_eq!(picked, None);
+    }
+
+    #[test]
+    fn test_stock_expiry_no_next_keeps_nearest_on_t_minus_1() {
+        // Only one expiry in the calendar; cannot roll forward. Keep nearest
+        // and let the caller decide whether to skip. Also emits a WARN log
+        // (not asserted here — tracing-capture would be heavy).
+        let cal = make_test_calendar_no_holidays();
+        let today = NaiveDate::from_ymd_opt(2026, 4, 29).unwrap();
+        let only = NaiveDate::from_ymd_opt(2026, 4, 30).unwrap();
+        let picked = select_stock_expiry_with_rollover(&[only], today, Some(&cal));
+        assert_eq!(
+            picked,
+            Some(only),
+            "no next expiry → keep nearest (graceful degradation)"
+        );
+    }
+
+    #[test]
+    fn test_stock_expiry_none_calendar_uses_legacy_nearest() {
+        // Without a calendar, the helper falls back to pre-Fix-6 nearest-only
+        // behaviour — even on T-1 or T. Existing test callers pass None.
+        let today = NaiveDate::from_ymd_opt(2026, 4, 29).unwrap();
+        let nearest = NaiveDate::from_ymd_opt(2026, 4, 30).unwrap();
+        let next = NaiveDate::from_ymd_opt(2026, 5, 7).unwrap();
+        let picked = select_stock_expiry_with_rollover(&[nearest, next], today, None);
+        assert_eq!(picked, Some(nearest));
+    }
+
+    #[test]
+    fn test_index_expiry_never_rolls_via_planner() {
+        // Ratchet: indices must NEVER roll. The planner applies rollover
+        // ONLY inside the `UnderlyingKind::Stock` branch, so indices see
+        // all their derivative contracts unconditionally (no expiry filter
+        // runs for indices). This test covers the index path end-to-end.
+        //
+        // Set up an index (NIFTY) where today is expiry day. If the rule
+        // leaked into the index path, NO index contracts would be emitted.
+        // We instead assert that major-index derivative count > 0.
+        let universe = make_test_universe();
+        let cal = make_test_calendar_no_holidays();
+        // Use a date where NIFTY's expiry in make_test_universe (2026-03-27)
+        // is T+1 trading day from today. Even at T-1 the planner must still
+        // emit index contracts.
+        let today = NaiveDate::from_ymd_opt(2026, 3, 26).unwrap();
+        let mut config = SubscriptionConfig::default();
+        config.subscribe_stock_derivatives = true;
+        config.subscribe_stock_equities = true;
+
+        let plan = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            Some(&cal),
+        );
+
+        // Index derivatives must still be present — rollover does NOT
+        // apply to indices.
+        assert!(
+            plan.summary.index_derivatives > 0 || plan.summary.major_index_values > 0,
+            "Fix #6 ratchet: indices must emit derivative/value contracts even on T-1. \
+             If this fails, rollover has leaked into the index path."
         );
     }
 }

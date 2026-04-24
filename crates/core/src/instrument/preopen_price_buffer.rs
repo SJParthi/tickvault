@@ -1,37 +1,42 @@
-//! Per-minute price buffer for pre-open (09:08-09:12 IST) price capture.
+//! Per-minute price buffer for pre-open (09:00-09:12 IST) price capture.
 //!
-//! # Why this exists (Parthiban, 2026-04-20)
+//! # Why this exists (Parthiban, 2026-04-20; widened 2026-04-24 per Fix #1)
 //!
-//! At 09:12:30 IST the Phase 2 scheduler wakes up to subscribe stock F&O
+//! At 09:13:00 IST the Phase 2 scheduler wakes up to subscribe stock F&O
 //! contracts (ATM ± N CE/PE). To pick the right ATM strike for each stock,
 //! we need the *finalised pre-open price* — Dhan's pre-open matching ends
 //! at 09:08 and the same equilibrium LTP is streamed on each stock's
 //! NSE_EQ subscription during the 09:08-09:15 buffer window.
 //!
 //! Per Parthiban's spec: use the **09:12 close** for each stock. If no tick
-//! landed in the 09:12:00-09:12:59 bucket (stock had no pre-open activity
-//! that minute), **backtrack** to 09:11 → 09:10 → 09:09 → 09:08. If all
-//! five buckets are empty, skip that stock with a WARN + metric.
+//! landed in the 09:12:00-09:12:59 bucket, **backtrack** through
+//! 09:11 → 09:10 → … → **09:00** — the first non-empty minute wins.
+//! The window was widened from 09:08-09:12 to **09:00-09:12** on
+//! 2026-04-24 (Fix #1) because Dhan occasionally sends the first pre-open
+//! tick earlier than 09:08 and a stock with no 09:08..09:12 activity
+//! would otherwise be silently skipped. With the wider window we only
+//! skip if ALL 13 buckets are empty — which means "did not trade at
+//! all during pre-open", a genuine signal.
 //!
 //! # How
 //!
-//! 1. `PreOpenCloses` holds 5 `Option<f64>` slots indexed 0..=4 for
-//!    minutes 09:08/09/10/11/12.
+//! 1. `PreOpenCloses` holds `PREOPEN_MINUTE_SLOTS = 13` `Option<f64>` slots
+//!    indexed 0..=12 for minutes 09:00/09:01/…/09:12.
 //! 2. `SharedPreOpenBuffer` is an `Arc<RwLock<HashMap<String, PreOpenCloses>>>`
 //!    keyed by underlying stock symbol.
 //! 3. `run_preopen_snapshot_task` subscribes to the tick broadcast and, for
 //!    every NSE_EQ tick belonging to an F&O stock whose IST wall-clock
-//!    minute is in 09:08..=09:12, overwrites the matching slot with the
+//!    minute is in 09:00..=09:12, overwrites the matching slot with the
 //!    latest LTP (last-write-wins within a minute = the minute's close).
-//! 4. Outside 09:08-09:12 IST the task is idle — matches the
+//! 4. Outside 09:00-09:12 IST the task is idle — matches the
 //!    market-hours-aware background-worker rule from
 //!    `.claude/rules/project/audit-findings-2026-04-17.md` Rule 3.
 //!
 //! # Hot-path guarantees
 //!
-//! - Bucketing is an O(1) index into a 5-slot array — no allocation.
+//! - Bucketing is an O(1) index into a fixed-size array — no allocation.
 //! - Lock is a `tokio::sync::RwLock`; writes held for microseconds only.
-//! - The phase2 scheduler reads a snapshot ONCE per day at 09:12:30.
+//! - The phase2 scheduler reads a snapshot ONCE per day at 09:13:00.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -43,27 +48,35 @@ use tickvault_common::tick_types::ParsedTick;
 use tickvault_common::types::ExchangeSegment;
 use tokio::sync::RwLock;
 
-/// Number of one-minute slots captured in the pre-open window (09:08..=09:12).
-pub const PREOPEN_MINUTE_SLOTS: usize = 5;
+/// Number of one-minute slots captured in the pre-open window (09:00..=09:12).
+///
+/// Widened from 5 (09:08..=09:12) to 13 on 2026-04-24 per Fix #1 in
+/// `.claude/plans/active-plan.md`. Dhan occasionally sends the first
+/// pre-open tick earlier than 09:08 — the wider window means any stock
+/// that traded at all during pre-open gets captured.
+pub const PREOPEN_MINUTE_SLOTS: usize = 13;
 
 /// Pre-open index underlyings whose 09:12 close is used to pick depth-20 +
-/// depth-200 ATM strikes at 09:12:30 IST (mirror of the stock F&O dispatch
+/// depth-200 ATM strikes at 09:13:00 IST (mirror of the stock F&O dispatch
 /// path — see `phase2_scheduler.rs` and `.claude/plans/active-plan.md`
 /// items A + C). The security IDs come from Dhan's instrument master and are
 /// fixed per `.claude/rules/project/depth-subscription.md`.
 pub const PREOPEN_INDEX_UNDERLYINGS: &[(&str, u32)] = &[("NIFTY", 13), ("BANKNIFTY", 25)];
 
-/// First captured minute, as seconds since IST midnight (09:08:00 IST).
-pub const PREOPEN_FIRST_MINUTE_SECS_IST: u32 = 9 * 3600 + 8 * 60;
+/// First captured minute, as seconds since IST midnight (09:00:00 IST).
+///
+/// Widened from 09:08 → 09:00 on 2026-04-24 per Fix #1 in
+/// `.claude/plans/active-plan.md`.
+pub const PREOPEN_FIRST_MINUTE_SECS_IST: u32 = 9 * 3600;
 
 /// Last captured minute (exclusive upper bound), as seconds since IST midnight
-/// (09:13:00 IST — slot 4 = 09:12:00..09:12:59).
+/// (09:13:00 IST — slot 12 = 09:12:00..09:12:59).
 pub const PREOPEN_LAST_MINUTE_SECS_IST: u32 = 9 * 3600 + 13 * 60;
 
 /// Per-stock pre-open minute-close buffer.
 ///
-/// Slots are indexed 0..5 = minutes 09:08/09/10/11/12. `None` = no tick
-/// landed in that minute for this stock.
+/// Slots are indexed 0..13 = minutes 09:00/09:01/…/09:12.
+/// `None` = no tick landed in that minute for this stock.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PreOpenCloses {
     /// Last LTP seen inside each minute bucket (or `None` if no tick arrived).
@@ -72,13 +85,16 @@ pub struct PreOpenCloses {
 
 impl PreOpenCloses {
     /// Returns the first non-`None` price when scanning from the latest minute
-    /// (09:12) backwards to 09:08.
+    /// (09:12) backwards to 09:00.
     ///
-    /// Matches Parthiban's spec: "9:12 close alone only right only then we
-    /// will clearly know ... when 9.12 am close is not found then backtrack
-    /// till 9.11 or 9.10 or 9.09 or 9.08".
+    /// Matches Parthiban's widened spec (Fix #2 — 2026-04-24):
+    /// "9:12 close alone only right only then we will clearly know ...
+    /// when 9.12 am close is not found then backtrack till 9.11 or 9.10
+    /// ... down to 9:00". The buffer window was widened to 09:00-09:12 in
+    /// Fix #1 — `backtrack_latest` automatically follows because it
+    /// iterates the full `closes` array.
     ///
-    /// Returns `None` only when ALL 5 slots are empty.
+    /// Returns `None` only when ALL 13 slots are empty.
     #[inline]
     pub fn backtrack_latest(&self) -> Option<f64> {
         for slot in self.closes.iter().rev() {
@@ -93,7 +109,7 @@ impl PreOpenCloses {
     }
 
     /// Records the LTP for the minute indicated by `minute_index`
-    /// (0 = 09:08, ..., 4 = 09:12). Last-write-wins inside the minute.
+    /// (0 = 09:00, ..., 12 = 09:12). Last-write-wins inside the minute.
     #[inline]
     pub fn record(&mut self, minute_index: usize, price: f64) {
         if minute_index < PREOPEN_MINUTE_SLOTS && price.is_finite() && price > 0.0 {
@@ -140,7 +156,8 @@ pub fn new_shared_stock_ltps() -> SharedStockLtps {
 /// Builds a synthetic `HashMap<String, PreOpenCloses>` from live stock
 /// LTPs — used by Phase 2's live-LTP fallback path when the pre-open
 /// buffer is empty. Each live LTP is stuffed into the latest slot
-/// (09:12) so `PreOpenCloses::backtrack_latest()` returns it.
+/// (slot index 12 = 09:12) so `PreOpenCloses::backtrack_latest()`
+/// returns it first.
 ///
 /// Filters out non-finite and non-positive prices.
 ///
@@ -167,21 +184,21 @@ pub fn build_synthetic_snap_from_live_ltps(
 }
 
 /// Maps an IST wall-clock seconds-of-day to a pre-open minute slot index.
-/// Returns `None` if the time is outside the 09:08..09:13 window.
+/// Returns `None` if the time is outside the 09:00..09:13 window.
 #[inline]
 #[must_use]
 pub fn minute_index_for_ist_seconds(sec_of_day_ist: u32) -> Option<usize> {
     if !(PREOPEN_FIRST_MINUTE_SECS_IST..PREOPEN_LAST_MINUTE_SECS_IST).contains(&sec_of_day_ist) {
         return None;
     }
-    // 60 seconds per minute; 0-indexed from 09:08.
+    // 60 seconds per minute; 0-indexed from 09:00.
     let minute_offset = (sec_of_day_ist - PREOPEN_FIRST_MINUTE_SECS_IST) / 60;
     Some(minute_offset as usize)
 }
 
 /// Maps a UTC epoch second to a pre-open minute slot index in IST terms.
 ///
-/// Returns `None` outside 09:08..09:13 IST.
+/// Returns `None` outside 09:00..09:13 IST.
 #[inline]
 #[must_use]
 pub fn minute_index_for_utc_epoch(utc_epoch_secs: i64) -> Option<usize> {
@@ -193,7 +210,7 @@ pub fn minute_index_for_utc_epoch(utc_epoch_secs: i64) -> Option<usize> {
 
 /// Records a price snapshot for a stock at a given UTC epoch timestamp.
 ///
-/// No-op when the timestamp is outside the 09:08-09:12 IST window.
+/// No-op when the timestamp is outside the 09:00-09:12 IST window.
 /// Intended to be called from the tick broadcast subscriber in production
 /// and directly from tests to populate buckets.
 pub async fn record_preopen_tick(
@@ -216,14 +233,14 @@ pub async fn record_preopen_tick(
 }
 
 /// Reads a consistent snapshot of every stock's pre-open closes.
-/// Used by the Phase 2 scheduler at 09:12:30 IST to pick ATM strikes.
+/// Used by the Phase 2 scheduler at 09:13:00 IST to pick ATM strikes.
 pub async fn snapshot(buffer: &SharedPreOpenBuffer) -> HashMap<String, PreOpenCloses> {
     let guard = buffer.read().await;
     guard.clone()
 }
 
 /// Returns `true` if the current wall-clock time is inside the pre-open
-/// snapshot window (09:08..09:13 IST). The snapshotter task uses this to
+/// snapshot window (09:00..09:13 IST). The snapshotter task uses this to
 /// gate work outside the window per audit-findings Rule 3.
 #[must_use]
 pub fn is_within_preopen_window() -> bool {
@@ -257,7 +274,7 @@ pub enum SnapshotterFilterReason {
     /// F&O stock underlying in the universe (e.g. cash-only equity).
     NotFnoStock,
     /// Tick was on the right segment + an F&O stock, but its IST
-    /// wall-clock minute was outside the 09:08..09:12 capture window.
+    /// wall-clock minute was outside the 09:00..09:12 capture window.
     WrongMinute,
 }
 
@@ -346,7 +363,7 @@ pub fn build_preopen_combined_lookup(
 /// should be buffered (and into which minute slot) or filtered.
 ///
 /// Accepts both `NseEquity` (F&O stocks) and `IdxI` (whitelisted indices —
-/// NIFTY + BANKNIFTY, used for depth ATM selection at 09:12:30).
+/// NIFTY + BANKNIFTY, used for depth ATM selection at 09:13:00).
 ///
 /// Pure function = no I/O, no async, no allocation on the buffer
 /// path. Caller is responsible for actually writing to the
@@ -417,7 +434,9 @@ mod tests {
         live.insert("INFY".to_string(), 1_480.10);
         let snap = build_synthetic_snap_from_live_ltps(&live);
         assert_eq!(snap.len(), 2);
-        // Slot 4 (09:12) is where backtrack_latest starts scanning.
+        // Slot PREOPEN_MINUTE_SLOTS - 1 (09:12) is where
+        // backtrack_latest starts scanning. Value depends on the
+        // window constant.
         assert_eq!(
             snap.get("RELIANCE").unwrap().closes[PREOPEN_MINUTE_SLOTS - 1],
             Some(2_500.75)
@@ -481,24 +500,29 @@ mod tests {
 
     #[test]
     fn test_minute_index_for_ist_seconds_each_bucket() {
-        assert_eq!(minute_index_for_ist_seconds(9 * 3600 + 8 * 60), Some(0));
+        // Window is 09:00..09:13 — 13 one-minute slots (Fix #1).
+        // Slot 0 = 09:00, slot 8 = 09:08, slot 12 = 09:12.
+        assert_eq!(minute_index_for_ist_seconds(9 * 3600), Some(0));
+        assert_eq!(minute_index_for_ist_seconds(9 * 3600 + 59), Some(0));
+        assert_eq!(minute_index_for_ist_seconds(9 * 3600 + 60), Some(1));
+        assert_eq!(minute_index_for_ist_seconds(9 * 3600 + 8 * 60), Some(8));
         assert_eq!(
             minute_index_for_ist_seconds(9 * 3600 + 8 * 60 + 59),
-            Some(0)
+            Some(8)
         );
-        assert_eq!(minute_index_for_ist_seconds(9 * 3600 + 9 * 60), Some(1));
-        assert_eq!(minute_index_for_ist_seconds(9 * 3600 + 10 * 60), Some(2));
-        assert_eq!(minute_index_for_ist_seconds(9 * 3600 + 11 * 60), Some(3));
-        assert_eq!(minute_index_for_ist_seconds(9 * 3600 + 12 * 60), Some(4));
+        assert_eq!(minute_index_for_ist_seconds(9 * 3600 + 9 * 60), Some(9));
+        assert_eq!(minute_index_for_ist_seconds(9 * 3600 + 10 * 60), Some(10));
+        assert_eq!(minute_index_for_ist_seconds(9 * 3600 + 11 * 60), Some(11));
+        assert_eq!(minute_index_for_ist_seconds(9 * 3600 + 12 * 60), Some(12));
     }
 
     #[test]
     fn test_minute_index_for_ist_seconds_outside_window() {
-        // 09:07:59 — one second before window
+        // 08:59:59 — one second before the widened 09:00 window.
         assert_eq!(
-            minute_index_for_ist_seconds(9 * 3600 + 7 * 60 + 59),
+            minute_index_for_ist_seconds(9 * 3600 - 1),
             None,
-            "09:07:59 must not map to a bucket"
+            "08:59:59 must not map to a bucket"
         );
         // 09:13:00 — exclusive upper bound
         assert_eq!(
@@ -512,78 +536,104 @@ mod tests {
         assert_eq!(minute_index_for_ist_seconds(0), None);
     }
 
+    /// Helper: build a `PreOpenCloses` from a Vec of slot values,
+    /// padding any remaining slots with `None`. Keeps the test intent
+    /// readable regardless of the `PREOPEN_MINUTE_SLOTS` constant.
+    fn closes_from(values: Vec<Option<f64>>) -> PreOpenCloses {
+        let mut c = PreOpenCloses::default();
+        for (i, v) in values.into_iter().enumerate() {
+            if i >= PREOPEN_MINUTE_SLOTS {
+                break;
+            }
+            if let Some(p) = v {
+                c.closes[i] = Some(p);
+            }
+        }
+        c
+    }
+
+    /// Helper: fill exactly slot `idx` and leave every other slot None.
+    fn closes_with_single_slot(idx: usize, price: f64) -> PreOpenCloses {
+        let mut c = PreOpenCloses::default();
+        if idx < PREOPEN_MINUTE_SLOTS {
+            c.closes[idx] = Some(price);
+        }
+        c
+    }
+
     #[test]
     fn test_backtrack_latest_prefers_09_12_over_earlier() {
-        // All 5 buckets populated — must return the 09:12 value (slot 4).
-        let closes = PreOpenCloses {
-            closes: [
-                Some(100.0),
-                Some(101.0),
-                Some(102.0),
-                Some(103.0),
-                Some(104.0),
-            ],
-        };
-        assert_eq!(closes.backtrack_latest(), Some(104.0));
+        // Every slot populated — must return the 09:12 value (slot
+        // PREOPEN_MINUTE_SLOTS - 1).
+        let mut c = PreOpenCloses::default();
+        for (i, slot) in c.closes.iter_mut().enumerate() {
+            *slot = Some(100.0 + i as f64);
+        }
+        let expected = 100.0 + (PREOPEN_MINUTE_SLOTS - 1) as f64;
+        assert_eq!(c.backtrack_latest(), Some(expected));
     }
 
     #[test]
     fn test_backtrack_latest_falls_back_to_09_11_when_09_12_missing() {
-        let closes = PreOpenCloses {
-            closes: [Some(100.0), Some(101.0), Some(102.0), Some(103.0), None],
-        };
-        assert_eq!(closes.backtrack_latest(), Some(103.0));
+        // Populate every slot except the last (09:12). Backtrack must
+        // return the 09:11 value (slot PREOPEN_MINUTE_SLOTS - 2).
+        let mut c = PreOpenCloses::default();
+        for (i, slot) in c.closes.iter_mut().enumerate() {
+            if i == PREOPEN_MINUTE_SLOTS - 1 {
+                continue;
+            }
+            *slot = Some(100.0 + i as f64);
+        }
+        let expected = 100.0 + (PREOPEN_MINUTE_SLOTS - 2) as f64;
+        assert_eq!(c.backtrack_latest(), Some(expected));
     }
 
     #[test]
-    fn test_backtrack_latest_walks_all_way_to_09_08_when_only_that_minute_has_data() {
-        let closes = PreOpenCloses {
-            closes: [Some(95.5), None, None, None, None],
-        };
+    fn test_backtrack_latest_walks_all_way_to_09_00_when_only_that_minute_has_data() {
+        // Fix #2 (2026-04-24): backtrack must walk ALL the way to slot 0
+        // = 09:00 IST, not stop at 09:08. Only slot 0 populated.
+        let c = closes_with_single_slot(0, 95.5);
         assert_eq!(
-            closes.backtrack_latest(),
+            c.backtrack_latest(),
             Some(95.5),
-            "only 09:08 slot populated — must return that value"
+            "only 09:00 slot populated — backtrack must walk down to slot 0"
         );
     }
 
     #[test]
     fn test_backtrack_latest_returns_none_when_no_minute_has_data() {
-        let closes = PreOpenCloses {
-            closes: [None; PREOPEN_MINUTE_SLOTS],
-        };
-        assert!(closes.backtrack_latest().is_none());
+        let c = PreOpenCloses::default();
+        assert!(c.backtrack_latest().is_none());
     }
 
     #[test]
     fn test_backtrack_latest_ignores_non_finite_and_zero_prices() {
-        let closes = PreOpenCloses {
-            closes: [
-                Some(100.0),
-                Some(0.0),
-                Some(f64::NAN),
-                Some(f64::INFINITY),
-                Some(-1.0),
-            ],
-        };
-        // All later slots are rejected by the is_finite && >0 guard, so we
-        // fall back to slot 0 (100.0).
-        assert_eq!(closes.backtrack_latest(), Some(100.0));
+        // slot 0 = 100.0 (valid), slots 1..=4 = garbage, rest = None.
+        // Backtrack must skip the garbage slots and return slot 0.
+        let c = closes_from(vec![
+            Some(100.0),
+            Some(0.0),
+            Some(f64::NAN),
+            Some(f64::INFINITY),
+            Some(-1.0),
+        ]);
+        assert_eq!(c.backtrack_latest(), Some(100.0));
     }
 
     #[test]
     fn test_record_last_write_wins_within_minute() {
         let mut closes = PreOpenCloses::default();
-        closes.record(4, 101.0); // first 09:12 tick
-        closes.record(4, 102.0); // later 09:12 tick
-        closes.record(4, 103.5); // last 09:12 tick — this is the "close"
-        assert_eq!(closes.closes[4], Some(103.5));
+        let last = PREOPEN_MINUTE_SLOTS - 1;
+        closes.record(last, 101.0); // first 09:12 tick
+        closes.record(last, 102.0); // later 09:12 tick
+        closes.record(last, 103.5); // last 09:12 tick — this is the "close"
+        assert_eq!(closes.closes[last], Some(103.5));
     }
 
     #[test]
     fn test_record_rejects_out_of_range_index() {
         let mut closes = PreOpenCloses::default();
-        closes.record(PREOPEN_MINUTE_SLOTS, 100.0); // 5 is out of 0..5
+        closes.record(PREOPEN_MINUTE_SLOTS, 100.0);
         closes.record(99, 100.0);
         assert!(closes.closes.iter().all(|s| s.is_none()));
     }
@@ -602,19 +652,20 @@ mod tests {
     #[tokio::test]
     async fn test_record_preopen_tick_buckets_into_correct_minute() {
         let buffer = new_shared_preopen_buffer();
-        // 09:12:15 IST tick for RELIANCE
+        // 09:12:15 IST tick for RELIANCE — lands in slot 12 (last slot).
         let ts = ist_utc_epoch(9, 12, 15);
         record_preopen_tick(&buffer, "RELIANCE", ts, 2847.5).await;
         let snap = snapshot(&buffer).await;
         let reliance = snap.get("RELIANCE").expect("RELIANCE bucket must exist");
-        assert_eq!(reliance.closes[4], Some(2847.5));
-        assert!(reliance.closes[0..4].iter().all(Option::is_none));
+        let last = PREOPEN_MINUTE_SLOTS - 1;
+        assert_eq!(reliance.closes[last], Some(2847.5));
+        assert!(reliance.closes[..last].iter().all(Option::is_none));
     }
 
     #[tokio::test]
     async fn test_record_preopen_tick_ignores_outside_window() {
         let buffer = new_shared_preopen_buffer();
-        // 09:15:00 — main session open, outside the 09:08..09:13 window.
+        // 09:15:00 — main session open, outside the 09:00..09:13 window.
         let ts = ist_utc_epoch(9, 15, 0);
         record_preopen_tick(&buffer, "RELIANCE", ts, 2847.5).await;
         let snap = snapshot(&buffer).await;
@@ -625,23 +676,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_record_preopen_tick_accepts_0905_tick() {
+        // Fix #1 (2026-04-24): with the 09:00-09:12 widened window,
+        // an 09:05 tick is INSIDE the window and lands in slot 5.
+        // Before the widening this tick would be silently dropped.
+        let buffer = new_shared_preopen_buffer();
+        let ts = ist_utc_epoch(9, 5, 0);
+        record_preopen_tick(&buffer, "RELIANCE", ts, 2847.5).await;
+        let snap = snapshot(&buffer).await;
+        let reliance = snap
+            .get("RELIANCE")
+            .expect("09:05 tick must land in widened window");
+        assert_eq!(
+            reliance.closes[5],
+            Some(2847.5),
+            "09:05 IST → slot 5 (09:00+5min)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_record_preopen_tick_accepts_0900_tick() {
+        // Edge: 09:00:00 IST — lower bound inclusive, slot 0.
+        let buffer = new_shared_preopen_buffer();
+        let ts = ist_utc_epoch(9, 0, 0);
+        record_preopen_tick(&buffer, "RELIANCE", ts, 2847.5).await;
+        let snap = snapshot(&buffer).await;
+        let r = snap.get("RELIANCE").expect("09:00:00 IST is in window");
+        assert_eq!(r.closes[0], Some(2847.5));
+    }
+
+    #[tokio::test]
+    async fn test_record_preopen_tick_rejects_0859_tick() {
+        // Edge: 08:59:59 IST — one second before the widened window.
+        let buffer = new_shared_preopen_buffer();
+        let ts = ist_utc_epoch(8, 59, 59);
+        record_preopen_tick(&buffer, "RELIANCE", ts, 2847.5).await;
+        let snap = snapshot(&buffer).await;
+        assert!(
+            snap.get("RELIANCE").is_none(),
+            "08:59:59 IST is outside the widened 09:00-09:12 window"
+        );
+    }
+
+    #[tokio::test]
     async fn test_snapshot_returns_independent_clone() {
         let buffer = new_shared_preopen_buffer();
+        // First tick at 09:10:00 lands in slot 10.
         let ts = ist_utc_epoch(9, 10, 0);
         record_preopen_tick(&buffer, "TCS", ts, 3500.0).await;
         let snap1 = snapshot(&buffer).await;
         // Mutate the original buffer — snap1 must not see the change.
+        // Second tick at 09:12:00 lands in the last slot (09:12).
         let ts2 = ist_utc_epoch(9, 12, 0);
         record_preopen_tick(&buffer, "TCS", ts2, 3510.0).await;
-        assert_eq!(snap1.get("TCS").unwrap().closes[4], None);
+        let last = PREOPEN_MINUTE_SLOTS - 1;
+        assert_eq!(snap1.get("TCS").unwrap().closes[last], None);
         let snap2 = snapshot(&buffer).await;
-        assert_eq!(snap2.get("TCS").unwrap().closes[4], Some(3510.0));
+        assert_eq!(snap2.get("TCS").unwrap().closes[last], Some(3510.0));
     }
 
     #[test]
     fn test_preopen_index_underlyings_contains_nifty_and_banknifty() {
         // Per .claude/rules/project/depth-subscription.md: NIFTY=13, BANKNIFTY=25.
-        // These feed the depth-20 + depth-200 ATM selection at 09:12:30.
+        // These feed the depth-20 + depth-200 ATM selection at 09:13:00.
         let map: HashMap<&str, u32> = PREOPEN_INDEX_UNDERLYINGS.iter().copied().collect();
         assert_eq!(map.get("NIFTY"), Some(&13));
         assert_eq!(map.get("BANKNIFTY"), Some(&25));
@@ -719,16 +816,54 @@ mod tests {
 
     #[test]
     fn test_preopen_first_and_last_minute_constants_match_spec() {
-        // 09:08 IST == hour*3600 + min*60
-        assert_eq!(PREOPEN_FIRST_MINUTE_SECS_IST, 9 * 3600 + 8 * 60);
-        // 09:13 IST (exclusive upper bound — bucket 4 = 09:12:00..09:12:59)
+        // Fix #1 (2026-04-24): window is 09:00..09:13 IST, 13 one-minute slots.
+        assert_eq!(PREOPEN_FIRST_MINUTE_SECS_IST, 9 * 3600);
+        // 09:13 IST (exclusive upper bound — bucket 12 = 09:12:00..09:12:59)
         assert_eq!(PREOPEN_LAST_MINUTE_SECS_IST, 9 * 3600 + 13 * 60);
-        // Exactly 5 minutes.
+        // Exactly 13 minutes.
         assert_eq!(
             PREOPEN_LAST_MINUTE_SECS_IST - PREOPEN_FIRST_MINUTE_SECS_IST,
-            5 * 60
+            13 * 60
         );
-        assert_eq!(PREOPEN_MINUTE_SLOTS, 5);
+        assert_eq!(PREOPEN_MINUTE_SLOTS, 13);
+    }
+
+    /// Fix #1 ratchet (2026-04-24): the pre-open buffer window is
+    /// **09:00..=09:12 IST**, not 09:08..=09:12 as originally shipped.
+    /// If this test ever flips back to 09:08 the widening in Fix #1 has
+    /// regressed and any stock that traded only in 09:00..09:07 will
+    /// be silently skipped by Phase 2.
+    #[test]
+    fn test_preopen_buffer_window_is_0900_to_0912() {
+        // Lower bound: exactly 09:00:00 IST in seconds since IST midnight.
+        assert_eq!(
+            PREOPEN_FIRST_MINUTE_SECS_IST,
+            9 * 3600,
+            "Fix #1 regression: window no longer starts at 09:00"
+        );
+        // Upper bound: 09:13:00 IST exclusive = 09:12:00..09:12:59 inclusive.
+        assert_eq!(
+            PREOPEN_LAST_MINUTE_SECS_IST,
+            9 * 3600 + 13 * 60,
+            "Fix #1 regression: upper bound changed"
+        );
+        // Slot count: 13 (one per minute 09:00/01/02/.../12).
+        assert_eq!(
+            PREOPEN_MINUTE_SLOTS, 13,
+            "Fix #1 regression: slot count must be 13 (09:00..=09:12). \
+             Reverting to 5 drops any stock whose pre-open activity started \
+             before 09:08 — the exact class of bug Fix #1 was created to close."
+        );
+        // Boundary behaviour: 09:00:00 maps to slot 0; 08:59:59 does NOT.
+        assert_eq!(
+            minute_index_for_ist_seconds(9 * 3600),
+            Some(0),
+            "09:00:00 IST must map to slot 0"
+        );
+        assert!(
+            minute_index_for_ist_seconds(9 * 3600 - 1).is_none(),
+            "08:59:59 IST must be OUTSIDE the window"
+        );
     }
 
     #[test]

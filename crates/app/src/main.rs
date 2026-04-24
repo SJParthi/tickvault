@@ -735,7 +735,7 @@ async fn main() -> Result<()> {
 
         // --- Load instruments (sub-1ms from rkyv cache during market hours) ---
         let (subscription_plan, fresh_universe, _needs_persist) =
-            load_instruments(&config, is_trading).await;
+            load_instruments(&config, is_trading, trading_calendar.as_ref()).await;
 
         // --- WebSocket pool create (channel only, NOT spawned yet) ---
         let (pool_receiver, ws_pool_ready) = match create_websocket_pool(
@@ -928,6 +928,13 @@ async fn main() -> Result<()> {
             None
         };
 
+        // Fix #7 (2026-04-24): create the shared health status early so
+        // the pool watchdog task can push live main-feed connection counts
+        // into it on every 5s tick. Before Fix #7 the watchdog was spawned
+        // before `health_status` existed and the fast-boot path's /health
+        // endpoint reported `websocket_connections: 0` forever.
+        let health_status: SharedHealthStatus = std::sync::Arc::new(SystemHealthStatus::new());
+
         // --- NOW spawn WebSocket connections (tick processor consuming) ---
         // S4-T1a/T1b: Wrap the pool in Arc so we can retain clones for the
         // pool watchdog task and the graceful-shutdown handler. All three
@@ -945,6 +952,7 @@ async fn main() -> Result<()> {
                 std::sync::Arc::clone(&pool_arc),
                 std::sync::Arc::clone(&shutdown_notify),
                 std::sync::Arc::clone(&fast_notifier),
+                std::sync::Arc::clone(&health_status),
             );
             // FAST BOOT parity with slow boot (main.rs ~1760):
             // emit per-connection + aggregate Telegram alerts so an operator
@@ -1066,8 +1074,8 @@ async fn main() -> Result<()> {
             }
         };
 
-        // Health status — created early so tick persistence consumer can update it.
-        let health_status: SharedHealthStatus = std::sync::Arc::new(SystemHealthStatus::new());
+        // Health status was created above (Fix #7 — moved up so the pool
+        // watchdog can push connection counts into it from its 5s poll).
 
         // --- Background: Tick persistence (cold path — subscribes to broadcast) ---
         // The tick processor was started with None writers (fast boot, QuestDB wasn't
@@ -1708,7 +1716,7 @@ async fn main() -> Result<()> {
     // CachedPlan loads from rkyv cache and returns universe for persistence here.
     // To avoid DOUBLE persistence on FreshBuild, only persist if CachedPlan.
     let (subscription_plan, slow_boot_universe, needs_instrument_persist) =
-        load_instruments(&config, is_trading).await;
+        load_instruments(&config, is_trading, trading_calendar.as_ref()).await;
     // Only persist for CachedPlan (not yet persisted). FreshBuild already
     // persisted inside load_or_build_instruments — double-write creates
     // duplicate rows in the same timestamp second.
@@ -2019,6 +2027,7 @@ async fn main() -> Result<()> {
             std::sync::Arc::clone(&pool_arc),
             std::sync::Arc::clone(&shutdown_notify),
             std::sync::Arc::clone(&notifier),
+            std::sync::Arc::clone(&health_status),
         );
         // FAST BOOT parity: helper emits per-connection + aggregate Telegram
         // alerts on BOTH boot paths (main.rs ~830 for FAST BOOT, here for slow).
@@ -3121,10 +3130,13 @@ async fn main() -> Result<()> {
             // PROMPT B precursor (2026-04-20): pre-open price snapshotter.
             // Subscribes to the tick broadcast and buckets every NSE_EQ
             // tick that belongs to an F&O stock into the matching minute
-            // slot (09:08..09:12 IST). The Phase 2 scheduler reads from
-            // this buffer at 09:12:30 to pick ATM strikes per stock.
-            // Outside the 09:08..09:12 window the snapshotter is idle
-            // (no work, no metrics) — see audit-findings Rule 3.
+            // slot (09:08..09:12 IST today; widening to 09:00..09:12 in
+            // Fix #1 — see .claude/plans/active-plan.md). The Phase 2
+            // scheduler reads this buffer at **09:13:00 IST** (commit
+            // 0340a7c moved it from 09:12:30 so the 09:12-minute bucket
+            // is fully closed before we read). Outside the window the
+            // snapshotter is idle (no work, no metrics) — see
+            // audit-findings Rule 3.
             let preopen_buffer =
                 tickvault_core::instrument::preopen_price_buffer::new_shared_preopen_buffer();
             // Plan: Phase 2 live-LTP fallback (2026-04-23). Holds the
@@ -3184,7 +3196,8 @@ async fn main() -> Result<()> {
                     // Plan item A (2026-04-22): combined lookup merges F&O
                     // stocks (NSE_EQ) + whitelisted indices (NIFTY + BANKNIFTY
                     // on IDX_I). Indices feed the depth-20 + depth-200 ATM
-                    // selection at 09:12:30 per the unified dispatch plan.
+                    // selection at **09:13:00 IST** per the unified dispatch
+                    // plan (was 09:12:30 — Fix #8 comment cleanup 2026-04-24).
                     let lookup =
                         tickvault_core::instrument::preopen_price_buffer::build_preopen_combined_lookup(
                             &snap_universe,
@@ -3239,7 +3252,7 @@ async fn main() -> Result<()> {
             // PROMPT C (2026-04-20) — Phase 2 crash-recovery.
             //
             // BEFORE spawning the Phase 2 scheduler, consult the on-disk
-            // snapshot written by PROMPT A at 09:12:30 IST. If today's
+            // snapshot written by PROMPT A at 09:13:00 IST. If today's
             // snapshot is present we re-dispatch the SAME ATM chain the
             // scheduler picked this morning and SKIP spawning the
             // scheduler — a mid-market restart at 11:00 IST must resume
@@ -3333,10 +3346,15 @@ async fn main() -> Result<()> {
                 tickvault_app::phase2_recovery::RecoveryAction::RunFreshPhase2
                 | tickvault_app::phase2_recovery::RecoveryAction::WaitForScheduler => {
                     // O1 (2026-04-17) Phase A: Phase 2 subscription scheduler.
-                    // Sleeps until 09:12 IST (or runs immediately if already past 9:12
+                    // Sleeps until 09:13 IST (or runs immediately if already past 9:13
                     // and within market hours), then waits for NIFTY/BANKNIFTY LTPs,
                     // then computes the stock-F&O delta from the snapshotter's
                     // buffer and dispatches the SubscribeCommand to the pool.
+                    //
+                    // Fix #8 (2026-04-24): trigger time moved 09:12 → 09:13 per
+                    // commit 0340a7c so the 09:12-minute bucket is fully closed
+                    // before Phase 2 reads the preopen buffer. Old "09:12" text
+                    // below was stale.
                     let phase2_spot_prices = std::sync::Arc::clone(&shared_spot_prices);
                     let phase2_calendar_for_dyn = std::sync::Arc::clone(&trading_calendar);
                     let phase2_calendar_for_decision = std::sync::Arc::clone(&trading_calendar);
@@ -3755,31 +3773,29 @@ async fn main() -> Result<()> {
 
                         // Depth-20 ALWAYS rebalances (all 4 underlyings).
                         // Depth-200 ONLY rebalances for NIFTY + BANKNIFTY
-                        // (gate at line ~3261 below). Message text MUST
-                        // reflect the actual mechanism (zero-disconnect
-                        // Swap via mpsc command channel) — the previous
-                        // "aborting... spawning new ATM" wording was a
-                        // mislabel that scared Parthiban at 09:42 IST on
-                        // 2026-04-22 into thinking the depth socket was
-                        // being torn down. It was not.
+                        // (gate at line ~3261 below). The typed
+                        // `DepthRebalanced` event fires at `Severity::Low`
+                        // per Fix #9 (2026-04-24): routine zero-disconnect
+                        // drift swap is working-as-designed, not an amber
+                        // alert. The title fragment includes the level(s)
+                        // per Fix #10 so operators can tell the swap scope
+                        // at a glance.
                         let has_200_level = ul == "NIFTY" || ul == "BANKNIFTY";
-                        let action_line = if has_200_level {
-                            "Action: zero-disconnect swap — 20-level + 200-level unsub old / sub new on same socket"
+                        let levels = if has_200_level {
+                            tickvault_core::notification::DepthRebalanceLevels::TwentyAndTwoHundred
                         } else {
-                            "Action: zero-disconnect swap — 20-level unsub old / sub new on same socket (no 200-level for this underlying)"
+                            tickvault_core::notification::DepthRebalanceLevels::TwentyOnly
                         };
 
-                        rebalance_notifier.notify(NotificationEvent::Custom {
-                            message: format!(
-                                "<b>Depth rebalance: {ul}</b>\n\
-                                 Spot: {:.2} → {:.2}\n\
-                                 Old CE: {old_ce}\n\
-                                 Old PE: {old_pe}\n\
-                                 New CE: {new_ce}\n\
-                                 New PE: {new_pe}\n\
-                                 {action_line}",
-                                event.previous_spot, event.current_spot,
-                            ),
+                        rebalance_notifier.notify(NotificationEvent::DepthRebalanced {
+                            underlying: ul.to_string(),
+                            previous_spot: event.previous_spot,
+                            current_spot: event.current_spot,
+                            old_ce: old_ce.clone(),
+                            old_pe: old_pe.clone(),
+                            new_ce: new_ce.clone(),
+                            new_pe: new_pe.clone(),
+                            levels,
                         });
 
                         // --- 200-level rebalance via command channel (zero disconnect) ---
@@ -4357,6 +4373,7 @@ async fn main() -> Result<()> {
 async fn load_instruments(
     config: &ApplicationConfig,
     is_trading_day: bool,
+    trading_calendar: &TradingCalendar,
 ) -> (Option<SubscriptionPlan>, Option<FnoUniverse>, bool) {
     info!("checking instrument build eligibility");
 
@@ -4373,11 +4390,20 @@ async fn load_instruments(
         Ok(InstrumentLoadResult::FreshBuild(universe)) => {
             let today = Utc::now().with_timezone(&ist_offset()).date_naive();
             // Boot-time: pass empty spot prices — stock F&O will be subscribed
-            // at 9:12 AM once pre-market finalized prices are available.
+            // at 9:13 AM once pre-market finalized prices are available.
             // Indices get ALL contracts regardless. Stock equities subscribe immediately.
+            //
+            // Fix #6 (2026-04-24): pass the trading calendar so stock F&O
+            // expiries roll forward when nearest is T or T-1. Indices are
+            // unaffected — the planner ignores rollover for index kinds.
             let empty_spot_prices = std::collections::HashMap::new();
-            let plan =
-                build_subscription_plan(&universe, &config.subscription, today, &empty_spot_prices);
+            let plan = build_subscription_plan(
+                &universe,
+                &config.subscription,
+                today,
+                &empty_spot_prices,
+                Some(trading_calendar),
+            );
 
             info!(
                 total = plan.summary.total,
@@ -4623,6 +4649,7 @@ fn spawn_pool_watchdog_task(
     pool: std::sync::Arc<WebSocketConnectionPool>,
     shutdown_notify: std::sync::Arc<tokio::sync::Notify>,
     notifier: std::sync::Arc<NotificationService>,
+    health: tickvault_api::state::SharedHealthStatus,
 ) {
     tokio::spawn(async move {
         // 5-second poll interval — cold path, not per tick. Matches the
@@ -4639,6 +4666,24 @@ fn spawn_pool_watchdog_task(
                     return;
                 }
                 _ = interval.tick() => {
+                    // Fix #7 (2026-04-24): update the main-feed active-
+                    // connection counter BEFORE polling the watchdog so
+                    // `/health` and the 09:15:30 streaming-confirmation
+                    // heartbeat see a fresh count. Without this write the
+                    // `websocket_connections` gauge stayed at 0/5 forever
+                    // even when all 5 sockets were live.
+                    let healths = pool.health();
+                    let active: u64 = healths
+                        .iter()
+                        .filter(|h| {
+                            matches!(
+                                h.state,
+                                tickvault_core::websocket::types::ConnectionState::Connected
+                            )
+                        })
+                        .count() as u64;
+                    health.set_websocket_connections(active);
+
                     let verdict = pool.poll_watchdog();
                     use tickvault_core::websocket::pool_watchdog::WatchdogVerdict;
                     match verdict {
