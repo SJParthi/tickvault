@@ -5479,6 +5479,19 @@ async fn run_slow_boot_observability(
     let qdb_health_interval = std::time::Duration::from_secs(2); // APPROVED: pre-existing literal, session-7 tech debt tracked for cleanup
     let mut last_qdb_health_check = std::time::Instant::now();
 
+    // Audit finding #2 (2026-04-24): wire TickGapTracker::detect_stale_instruments()
+    // to a 30s periodic poller. The method existed in the tracker but was never
+    // called in production, so per-instrument stall detection (Dhan silently drops
+    // a subscription OR an ATM strike stops trading mid-session) stayed invisible
+    // until the global `no_tick_watchdog` fired on total silence — up to 120s
+    // of missed signals on a single underlying. The 30s cadence is the sweet
+    // spot: fast enough to catch stalls before operators manually notice them,
+    // slow enough to stay off the hot path (O(n) scan of tracked securities,
+    // n = up to 25k in prod).
+    let stale_check_interval =
+        std::time::Duration::from_secs(tickvault_common::constants::STALE_LTP_SCAN_INTERVAL_SECS);
+    let mut last_stale_check = std::time::Instant::now();
+
     // HTTP client for QuestDB /exec health ping. Uses a short timeout so
     // an unresponsive QDB is treated as disconnected within 1s.
     let http_client = match reqwest::Client::builder()
@@ -5507,6 +5520,21 @@ async fn run_slow_boot_observability(
                 // no backfill request is published (in-market backfill
                 // disabled by user policy).
                 let _ = tick_gap_tracker.record_tick(tick.security_id, tick.exchange_timestamp);
+
+                // Audit finding #2 (2026-04-24): periodic per-instrument stall
+                // scan every 30 s. Returns the count of newly-stale instruments;
+                // the tracker itself emits an ERROR per-instrument (→ Telegram)
+                // and increments `tv_stale_ltp_instruments`. Here we just
+                // track cadence so the scan runs even when no ticks are
+                // flowing (otherwise the loop would wait on tick_rx.recv()
+                // forever during a total-silence incident).
+                if last_stale_check.elapsed() >= stale_check_interval {
+                    let newly_stale = tick_gap_tracker.detect_stale_instruments();
+                    if newly_stale > 0 {
+                        debug!(newly_stale, "per-instrument stall scan: newly-stale count");
+                    }
+                    last_stale_check = std::time::Instant::now();
+                }
 
                 // QuestDB HTTP health ping every 2 seconds.
                 if last_qdb_health_check.elapsed() >= qdb_health_interval {
