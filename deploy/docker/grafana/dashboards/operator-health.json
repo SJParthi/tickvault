@@ -578,7 +578,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "tv_ticks_dropped_total",
+          "expr": "increase(tv_ticks_dropped_total[5m])",
           "refId": "A"
         }
       ],
@@ -694,7 +694,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "tv_ticks_spilled_total",
+          "expr": "increase(tv_ticks_spilled_total[5m])",
           "refId": "A"
         }
       ],
