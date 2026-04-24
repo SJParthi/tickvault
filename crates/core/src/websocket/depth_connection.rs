@@ -22,6 +22,7 @@ use tokio::time;
 use tokio_tungstenite::connect_async_tls_with_config;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tracing::{debug, error, info, warn};
 
@@ -30,7 +31,7 @@ use tickvault_common::constants::{
 };
 use tickvault_common::types::ExchangeSegment;
 
-use super::tls::build_websocket_tls_connector;
+use super::tls::{build_websocket_tls_connector, build_websocket_tls_connector_no_alpn};
 use super::types::{InstrumentSubscription, WebSocketError};
 use crate::auth::TokenHandle;
 use crate::websocket::activity_watchdog::{
@@ -151,6 +152,21 @@ const DEPTH_SUBSCRIPTION_BATCH_SIZE: usize = 50;
 
 /// Connection timeout for depth WebSocket (seconds).
 const DEPTH_CONNECT_TIMEOUT_SECS: u64 = 15;
+
+/// 200-depth User-Agent — matches Dhan's Python SDK `dhanhq==2.2.0rc1`
+/// which transitively uses the `websockets` library version `16.0`.
+///
+/// The `websockets` library sends `User-Agent: Python/<py_ver> websockets/<ws_ver>`.
+/// Parthiban verified on 2026-04-23 that the Python SDK streams 200-depth
+/// successfully for 30+ minutes on SecurityId 72271 — our Rust client using
+/// the tungstenite default UA kept getting `Protocol(ResetWithoutClosingHandshake)`
+/// for 2+ weeks on the same account. Pinning this UA + the no-ALPN TLS
+/// connector (see [`super::tls::build_websocket_tls_connector_no_alpn`])
+/// makes our wire behavior byte-identical to the verified-working Python SDK.
+///
+/// Must stay in lockstep with the Python version embedded in
+/// `scripts/dhan-200-depth-repro/` when that repro is regenerated.
+pub const DEPTH_200_USER_AGENT: &str = "Python/3.12 websockets/16.0";
 
 /// Runs a 20-level depth WebSocket connection with infinite reconnection.
 ///
@@ -932,7 +948,7 @@ async fn connect_and_run_200_depth(
         "{base}/?token={access_token}&clientId={client_id}&authType={WEBSOCKET_AUTH_TYPE}",
     ));
 
-    let request = authenticated_url
+    let mut request = authenticated_url
         .as_str()
         .into_client_request()
         .map_err(|err| WebSocketError::ConnectionFailed {
@@ -940,7 +956,22 @@ async fn connect_and_run_200_depth(
             source: err,
         })?;
 
-    let tls_connector = build_websocket_tls_connector()?;
+    // Match Dhan Python SDK `dhanhq==2.2.0rc1` wire behavior exactly: Python
+    // UA + no-ALPN TLS. Verified 2026-04-23 on SecurityId 72271 — without
+    // this combo the server responds with Protocol(ResetWithoutClosingHandshake).
+    // `HeaderValue::from_static` over a `const &'static str` cannot fail, so
+    // this is an infallible insert — no allocation beyond the insert itself.
+    request
+        .headers_mut()
+        .insert("User-Agent", HeaderValue::from_static(DEPTH_200_USER_AGENT));
+
+    // 200-depth TLS connector MUST skip ALPN — Python `websockets/16.0`
+    // defaults to an SSLContext with no `alpn_protocols` set. Using the
+    // shared `build_websocket_tls_connector()` (which forces http/1.1 ALPN)
+    // is what caused 2+ weeks of ResetWithoutClosingHandshake on
+    // full-depth-api.dhan.co. Do NOT switch back without first re-running
+    // the operator variant matrix against a live account during market hours.
+    let tls_connector = build_websocket_tls_connector_no_alpn()?;
     let connect_timeout = Duration::from_secs(DEPTH_CONNECT_TIMEOUT_SECS);
 
     let connect_result = time::timeout(
@@ -1631,6 +1662,99 @@ mod tests {
         assert!(
             DEPTH_RECONNECT_MAX_MS <= 60_000,
             "max reconnect delay must be <= 60s (no multi-hour sleep)"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Variant H pin: Python SDK wire behavior (2026-04-24)
+    // -------------------------------------------------------------------
+    //
+    // These ratchets lock in the combination Parthiban verified working
+    // with the Dhan Python SDK on 2026-04-23. Anything else has historically
+    // caused Protocol(ResetWithoutClosingHandshake) on full-depth-api.dhan.co.
+
+    #[test]
+    fn test_depth_200_user_agent_matches_python_sdk() {
+        // Must stay equal to what Python `websockets==16.0` sends. If the
+        // Python SDK ever upgrades and this drifts, the repro script under
+        // scripts/dhan-200-depth-repro/ is the single source of truth; update
+        // this constant to match.
+        assert_eq!(
+            DEPTH_200_USER_AGENT, "Python/3.12 websockets/16.0",
+            "depth-200 UA must match Dhan Python SDK (dhanhq==2.2.0rc1 -> websockets/16.0)"
+        );
+    }
+
+    #[test]
+    fn test_depth_200_user_agent_is_parseable_as_header_value() {
+        // `HeaderValue::from_static` panics on invalid header chars; this
+        // ratchet ensures a typo can never ship a static that would only
+        // fail at runtime inside the connect path.
+        let hv = HeaderValue::from_static(DEPTH_200_USER_AGENT);
+        assert_eq!(hv.to_str().unwrap(), DEPTH_200_USER_AGENT);
+    }
+
+    #[test]
+    fn test_depth_200_connect_path_sources_python_ua_constant() {
+        // Source-scan guard: asserts the 200-depth connect function actually
+        // uses DEPTH_200_USER_AGENT and does NOT have a raw "User-Agent"
+        // HeaderValue::from_static call with a different literal. Cheap way
+        // to block a copy-paste regression without touching the hot path.
+        let src = include_str!("depth_connection.rs");
+        assert!(
+            src.contains("HeaderValue::from_static(DEPTH_200_USER_AGENT)"),
+            "connect_and_run_200_depth must inject DEPTH_200_USER_AGENT (Python SDK UA); \
+             any direct HeaderValue::from_static(\"...\") literal reintroduces the pre-2026-04-24 bug"
+        );
+    }
+
+    /// Returns only the non-test source (everything before `#[cfg(test)]`)
+    /// so source-scan ratchets don't match their own assertions.
+    fn production_source() -> &'static str {
+        let src = include_str!("depth_connection.rs");
+        let cut = src
+            .find("#[cfg(test)]")
+            .expect("depth_connection.rs must have a #[cfg(test)] module");
+        &src[..cut]
+    }
+
+    #[test]
+    fn test_depth_200_connect_path_uses_no_alpn_tls_connector() {
+        // Production code (excluding tests) must contain EXACTLY ONE call to
+        // the no-ALPN builder, assigned to tls_connector. 200-depth is the
+        // only caller — regressions back to the ALPN-forcing builder caused
+        // 2+ weeks of ResetWithoutClosingHandshake on full-depth-api.dhan.co.
+        let prod = production_source();
+        let no_alpn_uses = prod
+            .matches("build_websocket_tls_connector_no_alpn()")
+            .count();
+        assert_eq!(
+            no_alpn_uses, 1,
+            "production code must call build_websocket_tls_connector_no_alpn() exactly once \
+             (in connect_and_run_200_depth), got {no_alpn_uses}"
+        );
+        assert!(
+            prod.contains("let tls_connector = build_websocket_tls_connector_no_alpn()"),
+            "connect_and_run_200_depth MUST assign tls_connector from the no-ALPN builder"
+        );
+    }
+
+    #[test]
+    fn test_depth_20_still_uses_alpn_tls_connector() {
+        // 20-depth goes to depth-api-feed.dhan.co (different endpoint) which
+        // still needs http/1.1 ALPN through reverse proxies. Must NOT be
+        // swapped to the no-ALPN variant.
+        let prod = production_source();
+        // Count the ALPN builder, excluding the no-ALPN substring overlap.
+        let alpn_uses = prod
+            .match_indices("build_websocket_tls_connector()")
+            .count();
+        // Main feed, 20-depth, order-update — 3 call sites on the http/1.1
+        // ALPN builder. 200-depth is the ONLY one that uses no-ALPN.
+        assert!(
+            alpn_uses >= 1,
+            "production code must still use build_websocket_tls_connector() for \
+             main feed / 20-depth / order-update, got {alpn_uses}"
         );
     }
 }
