@@ -197,6 +197,7 @@ pub fn parse_ltp_response(body: &str) -> Result<LtpResponseMap, LtpParseError> {
 /// # Performance
 ///
 /// O(n) in `ltp_map.len()`. Cold path — once per Phase 2 dispatch.
+// TEST-EXEMPT: covered by test_merge_ltps_fills_missing_stocks_only, test_merge_ltps_ignores_unknown_sids, test_merge_ltps_with_empty_ltp_map_is_noop, test_rest_fallback_merges_ltps_into_buffer — substring grep misses the full fn name.
 pub fn merge_ltps_into_snapshot(
     snapshot: &mut HashMap<String, PreOpenCloses>,
     ltp_map: &LtpResponseMap,
@@ -231,6 +232,7 @@ pub fn merge_ltps_into_snapshot(
 /// O(n log n) due to the final sort. Cold path — once per Phase 2
 /// dispatch at most every 24 hours.
 #[must_use]
+// TEST-EXEMPT: covered by test_missing_sids_returns_all_when_snapshot_empty, test_missing_sids_excludes_already_present_symbols, test_missing_sids_output_is_sorted, test_missing_sids_empty_when_all_present, test_rest_fallback_invoked_when_buffer_empty — substring grep misses the full fn name.
 pub fn missing_sids_for_rest_fallback(
     snapshot: &HashMap<String, PreOpenCloses>,
     stock_sids: &HashMap<u32, String>,

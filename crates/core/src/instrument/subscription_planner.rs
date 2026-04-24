@@ -109,6 +109,7 @@ pub const STOCK_EXPIRY_ROLLOVER_TRADING_DAYS: u32 = 1;
 ///
 /// `expiry_dates` MUST be sorted ascending (canonical invariant from the
 /// universe builder).
+// TEST-EXEMPT: covered by test_stock_expiry_rolls_on_t, test_stock_expiry_rolls_on_t_minus_1, test_stock_expiry_stays_on_t_minus_2, test_stock_expiry_none_calendar_uses_legacy_nearest, test_stock_expiry_no_next_keeps_nearest_on_t_minus_1, test_stock_expiry_none_when_all_expiries_past, test_index_expiry_never_rolls_via_planner — substring grep misses the full fn name.
 pub fn select_stock_expiry_with_rollover(
     expiry_dates: &[NaiveDate],
     today: NaiveDate,
