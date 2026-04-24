@@ -6,12 +6,16 @@
 //! avoids hitting Dhan's 5-connection-per-account 200-depth cap.
 //!
 //! This is an isolated Cargo example — it does NOT touch the production
-//! depth connection path. Run:
+//! depth connection path. **2026-04-24 refactor (Parthiban directive):**
+//! no more hardcoded env-var exports — the example now loads the same
+//! `AppConfig` + `TokenManager` stack as the main app. Client ID + JWT
+//! come from AWS SSM via the exact boot-time authentication path used
+//! by `make run`. Any token refresh, TOTP handling, and SSM fetch that
+//! production uses is automatically reused here.
 //!
 //! ```bash
-//! export DHAN_CLIENT_ID='1106656882'
-//! export DHAN_ACCESS_TOKEN='<fresh JWT from web.dhan.co>'
-//! cd crates/core
+//! # Requires AWS_PROFILE / TICKVAULT_ENV set as for `make run`.
+//! cd /path/to/tickvault
 //! cargo run --release --example depth_200_variants
 //! ```
 //!
@@ -44,7 +48,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use figment::Figment;
+use figment::providers::{Format, Toml};
 use futures_util::{SinkExt, StreamExt};
+use secrecy::ExposeSecret;
+use tickvault_common::config::ApplicationConfig;
+use tickvault_core::auth::TokenManager;
+use tickvault_core::notification::NotificationService;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -357,10 +367,48 @@ async fn main() -> Result<(), String> {
         .with_target(false)
         .init();
 
-    let client_id =
-        env::var("DHAN_CLIENT_ID").map_err(|_| "DHAN_CLIENT_ID env var not set".to_string())?;
-    let token_value = env::var("DHAN_ACCESS_TOKEN")
-        .map_err(|_| "DHAN_ACCESS_TOKEN env var not set".to_string())?;
+    // 2026-04-24 refactor (Parthiban directive): stop requiring operator to
+    // paste DHAN_CLIENT_ID + DHAN_ACCESS_TOKEN into env vars. The diagnostic
+    // loads AppConfig + TokenManager using the SAME boot path as the main
+    // app so SSM-stored credentials, TOTP flow, and token-cache fast-path
+    // are all reused. This also ensures the diagnostic tests the SAME JWT
+    // that production would have carried into the failing depth-200 handshake.
+    info!("loading ApplicationConfig from config/base.toml + config/local.toml");
+    let config: ApplicationConfig = Figment::new()
+        .merge(Toml::file("config/base.toml"))
+        .merge(Toml::file("config/local.toml"))
+        .extract()
+        .map_err(|err| format!("ApplicationConfig load failed: {err}"))?;
+
+    // Disabled notifier — the diagnostic must not spam Telegram.
+    let notifier = NotificationService::disabled();
+
+    info!("initializing TokenManager (SSM fetch + TOTP if needed)");
+    let token_manager =
+        TokenManager::initialize(&config.dhan, &config.token, &config.network, &notifier)
+            .await
+            .map_err(|err| format!("TokenManager::initialize failed: {err}"))?;
+    let token_handle = token_manager.token_handle();
+
+    let token_value: String = {
+        let guard = token_handle.load();
+        let state = guard
+            .as_ref()
+            .as_ref()
+            .ok_or_else(|| "TokenManager returned no TokenState after initialize".to_string())?;
+        state.access_token().expose_secret().to_string()
+    };
+    let client_id: String = {
+        let creds = tickvault_core::auth::secret_manager::fetch_dhan_credentials()
+            .await
+            .map_err(|err| format!("fetch_dhan_credentials failed: {err}"))?;
+        creds.client_id.expose_secret().to_string()
+    };
+    info!(
+        client_id_len = client_id.len(),
+        jwt_len = token_value.len(),
+        "credentials loaded via project auth stack — no env-var export needed"
+    );
 
     let per_variant_secs: u64 = env::var("PER_VARIANT_DURATION_SECS")
         .ok()
