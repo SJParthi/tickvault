@@ -26,7 +26,8 @@ pub mod types;
 pub use connection::{SubscribeCommand, WebSocketConnection};
 pub use connection_pool::WebSocketConnectionPool;
 pub use depth_connection::{
-    DepthCommand, run_twenty_depth_connection, run_two_hundred_depth_connection,
+    DEPTH_200_INITIAL_STAGGER_MS, DepthCommand, run_twenty_depth_connection,
+    run_two_hundred_depth_connection,
 };
 pub use order_update_connection::run_order_update_connection;
 pub use subscription_builder::build_subscription_messages;

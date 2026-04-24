@@ -121,6 +121,27 @@ const DEPTH_RECONNECT_MAX_MS: u64 = 30000;
 /// recover.
 const DEPTH_RECONNECT_MAX_ATTEMPTS: u64 = 60;
 
+/// Per-connection initial-connect stagger for 200-level depth (ms).
+///
+/// **2026-04-24 production evidence** (12:07:54 IST boot): all 4
+/// 200-level depth connections (NIFTY CE/PE, BANKNIFTY CE/PE) fired
+/// concurrent TLS handshakes against `wss://full-depth-api.dhan.co`
+/// within <100ms and all 4 were immediately TCP-reset with
+/// `Protocol(ResetWithoutClosingHandshake)`. They stayed in retry loop
+/// for 9+ minutes (observed attempt 20 at 12:16:53 IST).
+///
+/// Staggering each subsequent spawn by 2s gives Dhan's auth endpoint
+/// exclusive processing time per handshake — serialising 4 connects
+/// across ~8s. This is a speculative mitigation for what MAY be a
+/// Dhan-side concurrent-auth rate limit; the variants-matrix test
+/// (`cargo run --release --example depth_200_variants`) is the
+/// primary investigation for the underlying Rust-vs-Python protocol
+/// mismatch and will suggest the real fix (URL/UA/ALPN combo that
+/// works without reset).
+///
+/// Zero cost on the happy path (spawn index 0 gets 0ms stagger).
+pub const DEPTH_200_INITIAL_STAGGER_MS: u64 = 2000;
+
 /// Pong send timeout (seconds). Matches main feed connection behavior.
 /// If pong send takes longer, the TCP connection is likely dead.
 const DEPTH_PONG_TIMEOUT_SECS: u64 = 10;
@@ -699,7 +720,17 @@ pub async fn run_two_hundred_depth_connection(
     wal_spill: Option<Arc<WsFrameSpill>>,
     mut cmd_rx: mpsc::Receiver<DepthCommand>,
     notifier: Option<Arc<crate::notification::NotificationService>>,
+    initial_stagger_ms: u64,
 ) -> Result<(), WebSocketError> {
+    if initial_stagger_ms > 0 {
+        info!(
+            label = %label,
+            stagger_ms = initial_stagger_ms,
+            "200-level depth: staggering initial connect to avoid concurrent-auth reset"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(initial_stagger_ms)).await;
+    }
+
     let segment_str = exchange_segment.as_str();
 
     // Plan item B (2026-04-23): `security_id == None` = deferred mode.

@@ -116,6 +116,45 @@ impl TickGapTracker {
         exchange_timestamp: u32,
         now_ist_secs: u64,
     ) -> TickGapResult {
+        // Backlog-tick filter — MUST run BEFORE any state mutation.
+        //
+        // On new Phase 2 subscription (or process restart), Dhan replays
+        // the instrument's last trade as a "backlog" tick whose
+        // `exchange_timestamp` is minutes to hours old. Production
+        // evidence (2026-04-24 12:07 IST, 988 gap ERRORs in 15 min):
+        // SID 76918 replayed a tick at ts=1777031498 (12:02:38 IST) at
+        // wall clock 1777032558 (12:09:18 IST), age 1060s. Before this
+        // fix, the filter correctly skipped the gap check but still
+        // wrote `last_exchange_timestamp = exchange_timestamp` — so the
+        // next real-time tick at ts=12:09:18 computed
+        // `12:09:18 - 12:02:38 = 1060s` and fired ERROR.
+        //
+        // The fix: on backlog detection, make NO state mutation at all.
+        // - If no state exists yet for this SID, do NOT `or_insert` (a
+        //   backlog-only first tick should leave the tracker empty; the
+        //   real-time tick that follows seeds state correctly).
+        // - If state exists, do NOT touch `last_exchange_timestamp`,
+        //   `tick_count`, `last_wall_clock`, or any flag. Warmup is
+        //   defined over real-time ticks only.
+        //
+        // `IST_UTC_OFFSET_SECONDS` is added at the `record_tick` entry
+        // point because Dhan's WS `exchange_timestamp` is IST epoch
+        // seconds (per data-integrity rule — LTT is IST, not UTC). We
+        // already receive `now_ist_secs` in that frame.
+        #[allow(clippy::cast_possible_truncation)] // APPROVED: u32 suffices for ~136 years
+        let tick_age_secs: u32 = {
+            let delta = now_ist_secs.saturating_sub(u64::from(exchange_timestamp));
+            delta.min(u64::from(u32::MAX)) as u32
+        };
+        // Bounded filter — only skip for ticks inside a realistic backlog
+        // window. Absurdly old timestamps (e.g. unit-test stubs from
+        // 2023) fall through to the gap-detection path unchanged.
+        let is_backlog_tick = tick_age_secs > BACKLOG_TICK_AGE_THRESHOLD_SECS
+            && tick_age_secs <= BACKLOG_TICK_AGE_MAX_SECS;
+        if is_backlog_tick {
+            return TickGapResult::Ok;
+        }
+
         let now = Instant::now();
         let state = self.states.entry(security_id).or_insert(SecurityFeedState {
             last_exchange_timestamp: exchange_timestamp,
@@ -128,43 +167,6 @@ impl TickGapTracker {
         state.tick_count = state.tick_count.saturating_add(1);
         state.last_wall_clock = now;
         state.stale_alerted = false; // Reset stale flag on any new tick.
-
-        // I4 (2026-04-21 production-fixes queue): backlog-tick filter.
-        //
-        // On process restart, Dhan replays the backlog of missed ticks for
-        // each instrument. Those replays have real, historical
-        // exchange_timestamps with legitimate multi-minute gaps between
-        // them (common for illiquid F&O options). Running them through
-        // the gap detector would fire ERROR after ERROR with gap_secs in
-        // the hundreds — exactly the spam pattern observed on
-        // 2026-04-21 (4,778 ERROR lines / 365 instruments in 15 min).
-        //
-        // A tick whose exchange_timestamp is older than the current IST
-        // wall-clock by more than `BACKLOG_TICK_AGE_THRESHOLD_SECS` (60 s
-        // by default) is demonstrably not a real-time-stream gap; it is
-        // a backlog replay. We still update `last_exchange_timestamp` so
-        // the next real-time tick has a sane baseline, but we skip the
-        // gap-alert branch entirely.
-        //
-        // `IST_UTC_OFFSET_SECONDS` is added because Dhan's WS
-        // `exchange_timestamp` is already IST epoch seconds (per the data
-        // integrity rule — WebSocket LTT is IST, NOT UTC). We bring
-        // `chrono::Utc::now()` into the same reference frame for the
-        // age comparison.
-        #[allow(clippy::cast_possible_truncation)] // APPROVED: u32 suffices for ~136 years
-        let tick_age_secs: u32 = {
-            let delta = now_ist_secs.saturating_sub(u64::from(exchange_timestamp));
-            delta.min(u64::from(u32::MAX)) as u32
-        };
-        // Bounded filter — only skip gap check for ticks within a realistic
-        // backlog window. Absurdly old timestamps (e.g. unit-test stubs
-        // from 2023) fall through to the gap-detection path unchanged.
-        let is_backlog_tick = tick_age_secs > BACKLOG_TICK_AGE_THRESHOLD_SECS
-            && tick_age_secs <= BACKLOG_TICK_AGE_MAX_SECS;
-        if is_backlog_tick {
-            state.last_exchange_timestamp = exchange_timestamp;
-            return TickGapResult::Ok;
-        }
 
         // Don't check gaps during warmup phase.
         if state.tick_count <= TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
@@ -340,6 +342,24 @@ impl TickGapTracker {
         self.total_errors = 0;
         self.total_stale_alerts = 0;
         self.pending_warn_gaps.clear();
+    }
+
+    /// Drops per-SID state for a set of securities. Intended caller:
+    /// any code that just mid-session-subscribed a new set of
+    /// instruments (e.g. Phase 2 scheduler). The next tick for each
+    /// reset SID will re-seed state cleanly, preventing the
+    /// "old-backlog-ts vs new-real-time-ts" false-positive ERROR the
+    /// backlog filter fix (2026-04-24, item B) also addresses.
+    ///
+    /// Defensive companion to the backlog-filter fix — either one alone
+    /// prevents the issue; both together are belt-and-suspenders.
+    ///
+    /// Cold path — runs once per Phase 2 dispatch, not per tick. O(n)
+    /// in `ids.len()`.
+    pub fn reset_for_securities(&mut self, ids: &[u32]) {
+        for sid in ids {
+            self.states.remove(sid);
+        }
     }
 
     /// **P8.1 primitive** — snapshots the set of securities that have
@@ -642,6 +662,151 @@ mod tests {
         assert_eq!(tracker.tracked_securities(), 0);
         assert_eq!(tracker.total_warnings(), 0);
         assert_eq!(tracker.total_errors(), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // 2026-04-24 backlog-tick state-corruption bug (Item B)
+    //
+    // Direct reproduction of the production scenario: on Phase 2 dispatch
+    // at 12:08:08 IST, Dhan replayed SID 76918 at ts=1777031498 (12:02:38
+    // IST), age ~6 min. Pre-fix, the backlog filter correctly skipped the
+    // gap-check branch BUT updated `last_exchange_timestamp` to the old
+    // value. The next real-time tick at ts=1777032558 (12:09:18 IST)
+    // computed gap = 1060s and fired ERROR. Post-fix, no state mutation
+    // occurs on backlog ticks, so the next real-time tick simply seeds
+    // fresh state (or computes tiny gap against the prior real-time tick).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_backlog_tick_then_realtime_tick_does_not_fire_gap_error() {
+        let mut tracker = TickGapTracker::new(10);
+        // Exact production timestamps from the 2026-04-24 12:09:21 IST log.
+        let backlog_ts: u32 = 1_777_031_498; // 12:02:38 IST (trade 6+ min ago)
+        let realtime_ts: u32 = 1_777_032_558; // 12:09:18 IST (new live tick)
+        let now_ist_1: u64 = 1_777_032_558; // wall clock at backlog arrival
+        let now_ist_2: u64 = 1_777_032_560; // wall clock ~2s later
+
+        // Scenario: first-ever tick for this SID is a Dhan-replay backlog.
+        let r1 = tracker.record_tick_with_now_ist(76918, backlog_ts, now_ist_1);
+        assert_eq!(r1, TickGapResult::Ok);
+        // POST-FIX: no state created for backlog-only first tick.
+        assert_eq!(
+            tracker.tracked_securities(),
+            0,
+            "backlog-only first tick must NOT create tracking state"
+        );
+
+        // Now a real-time tick arrives for the same SID.
+        let r2 = tracker.record_tick_with_now_ist(76918, realtime_ts, now_ist_2);
+        assert_eq!(
+            r2,
+            TickGapResult::Ok,
+            "real-time tick following a backlog must NOT fire gap ERROR; \
+             pre-fix this computed 1060s gap and fired ERROR"
+        );
+        assert_eq!(tracker.total_errors(), 0);
+        assert_eq!(tracker.total_warnings(), 0);
+        assert_eq!(tracker.tracked_securities(), 1);
+    }
+
+    #[test]
+    fn test_backlog_only_first_tick_does_not_create_state() {
+        let mut tracker = TickGapTracker::new(10);
+        let backlog_ts: u32 = 1_777_031_000;
+        let now_ist: u64 = 1_777_032_558; // 1558s age — well inside [60, 86400]
+        let result = tracker.record_tick_with_now_ist(12345, backlog_ts, now_ist);
+        assert_eq!(result, TickGapResult::Ok);
+        assert_eq!(
+            tracker.tracked_securities(),
+            0,
+            "a backlog-only tick must leave the tracker empty"
+        );
+        assert_eq!(tracker.total_warnings(), 0);
+        assert_eq!(tracker.total_errors(), 0);
+    }
+
+    #[test]
+    fn test_backlog_tick_preserves_existing_state() {
+        // Verify: if state exists from a prior real-time tick, a backlog
+        // tick must NOT mutate last_exchange_timestamp or tick_count.
+        let mut tracker = TickGapTracker::new(10);
+        // Warm up with real-time ticks.
+        let base_ts: u32 = 1_777_032_550;
+        let now_ist: u64 = u64::from(base_ts + 5);
+        for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
+            tracker.record_tick_with_now_ist(7777, base_ts + i, now_ist);
+        }
+        let before_count = tracker.tracked_securities();
+        // Now inject a backlog tick from 10 minutes ago.
+        let backlog_ts: u32 = base_ts - 600;
+        let now_after_backlog: u64 = u64::from(base_ts + 10);
+        let result = tracker.record_tick_with_now_ist(7777, backlog_ts, now_after_backlog);
+        assert_eq!(result, TickGapResult::Ok);
+        assert_eq!(tracker.tracked_securities(), before_count);
+
+        // A subsequent real-time tick computes gap against the PRE-backlog
+        // last_ts (not the backlog ts), so the gap is small.
+        let realtime_ts: u32 = base_ts + 10;
+        let r = tracker.record_tick_with_now_ist(7777, realtime_ts, u64::from(realtime_ts));
+        assert_eq!(
+            r,
+            TickGapResult::Ok,
+            "real-time tick after backlog must see small gap, not huge"
+        );
+        assert_eq!(tracker.total_errors(), 0);
+    }
+
+    #[test]
+    fn test_reset_for_securities_drops_per_sid_state() {
+        let mut tracker = TickGapTracker::new(10);
+        let base_ts: u32 = 1_700_000_000;
+        for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
+            tracker.record_tick(1001, base_ts + i);
+            tracker.record_tick(1002, base_ts + i);
+            tracker.record_tick(1003, base_ts + i);
+        }
+        assert_eq!(tracker.tracked_securities(), 3);
+
+        tracker.reset_for_securities(&[1001, 1002]);
+        assert_eq!(tracker.tracked_securities(), 1);
+    }
+
+    #[test]
+    fn test_reset_for_securities_empty_list_noop() {
+        let mut tracker = TickGapTracker::new(10);
+        let base_ts: u32 = 1_700_000_000;
+        for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
+            tracker.record_tick(1001, base_ts + i);
+        }
+        assert_eq!(tracker.tracked_securities(), 1);
+        tracker.reset_for_securities(&[]);
+        assert_eq!(tracker.tracked_securities(), 1);
+    }
+
+    #[test]
+    fn test_reset_for_securities_unknown_id_noop() {
+        let mut tracker = TickGapTracker::new(10);
+        let base_ts: u32 = 1_700_000_000;
+        for i in 0..=TICK_GAP_MIN_TICKS_BEFORE_ACTIVE {
+            tracker.record_tick(1001, base_ts + i);
+        }
+        assert_eq!(tracker.tracked_securities(), 1);
+        // Removing an unknown SID is a no-op, not a panic.
+        tracker.reset_for_securities(&[9999, 8888]);
+        assert_eq!(tracker.tracked_securities(), 1);
+    }
+
+    #[test]
+    fn test_error_threshold_is_300_seconds_per_2026_04_24_raise() {
+        // Ratchet: 2026-04-24 raised threshold from 120s to 300s to
+        // eliminate false-positive spam from illiquid F&O. A tick gap
+        // of 250s must be WARN (not ERROR) post-raise.
+        assert_eq!(TICK_GAP_ERROR_THRESHOLD_SECS, 300);
+        assert!(
+            TICK_GAP_ERROR_THRESHOLD_SECS > TICK_GAP_ALERT_THRESHOLD_SECS * 5,
+            "ERROR threshold must be well above WARN threshold to avoid \
+             collapsing into a single severity tier"
+        );
     }
 
     // -----------------------------------------------------------------------

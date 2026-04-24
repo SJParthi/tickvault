@@ -41,7 +41,7 @@ use chrono::{Timelike, Utc};
 use figment::Figment;
 use figment::providers::{Format, Toml};
 use secrecy::ExposeSecret;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
@@ -2350,6 +2350,13 @@ async fn main() -> Result<()> {
                 );
             }
 
+            // 2026-04-24 Fix C: counter for 200-depth initial-connect stagger.
+            // Each successful spawn (only NIFTY + BANKNIFTY × CE + PE = 4 total)
+            // increments the counter, so spawn 0 gets 0ms delay, spawn 1 gets
+            // 2000ms, spawn 2 gets 4000ms, spawn 3 gets 6000ms. Dhan auth
+            // handshakes land ~2s apart instead of all within 100ms.
+            let mut depth_200_spawn_index: u64 = 0;
+
             for underlying in &depth_underlyings {
                 // Look up the ATM selection for this underlying.
                 let selection = depth_selections
@@ -2780,6 +2787,10 @@ async fn main() -> Result<()> {
                 // Dhan confirmed (Ticket #5519522): must use ATM security_id.
                 // O(1) EXEMPT: begin — boot-time 200-level depth setup (max 2 spawns per underlying)
                 // Only NIFTY + BANKNIFTY get 200-level (4 connections within Dhan's 5 limit).
+                //
+                // 2026-04-24: stagger initial connects by DEPTH_200_INITIAL_STAGGER_MS (2s)
+                // per spawn to avoid the concurrent-auth TCP-reset storm observed at
+                // 12:07:54 IST boot (all 4 connections reset within <100ms of each other).
                 if *underlying == "NIFTY" || *underlying == "BANKNIFTY" {
                     // Plan item B.2 (2026-04-23): when boot-time ATM is
                     // unavailable (pre-market deploy before 09:00 LTPs
@@ -2944,6 +2955,12 @@ async fn main() -> Result<()> {
                         let d200_sid_for_disconnect: u32 = depth200_sid.unwrap_or(0);
                         let d200_sid_for_signal: u32 = depth200_sid.unwrap_or(0);
                         let d200_wal_spill = ws_frame_spill.clone();
+                        // 2026-04-24 Fix C: stagger this spawn's first connect
+                        // by N × 2s where N is the 0-based spawn index.
+                        let d200_initial_stagger_ms: u64 = depth_200_spawn_index.saturating_mul(
+                            tickvault_core::websocket::DEPTH_200_INITIAL_STAGGER_MS,
+                        );
+                        depth_200_spawn_index = depth_200_spawn_index.saturating_add(1);
                         let (d200_signal_tx, d200_signal_rx) =
                             tokio::sync::oneshot::channel::<()>();
                         // Command channel for live 200-level rebalance (zero disconnect).
@@ -2978,6 +2995,7 @@ async fn main() -> Result<()> {
                                     d200_wal_spill,
                                     d200_cmd_rx,
                                     d200_reconnect_notifier,
+                                    d200_initial_stagger_ms,
                                 )
                                 .await
                             {
@@ -3418,9 +3436,14 @@ async fn main() -> Result<()> {
                     };
                     let now_time = now_ist.time();
                     if now_time >= target {
-                        info!(
+                        // 2026-04-24 Fix D: demoted INFO → DEBUG. A mid-session
+                        // fresh boot (e.g. 12:07 IST) legitimately runs past
+                        // 09:15:30, and this INFO log reads like "something is
+                        // broken". Real streaming confirmation happens via
+                        // boot-time spot-wait + depth ATM selection.
+                        debug!(
                             now = %now_time,
-                            "market-open heartbeat: skipping (past 09:15:30 — late start)"
+                            "market-open heartbeat: skipping (past 09:15:30 — expected on mid-session boot)"
                         );
                         return;
                     }
@@ -3500,9 +3523,13 @@ async fn main() -> Result<()> {
                     };
                     let now_time = now_ist.time();
                     if now_time >= target {
-                        info!(
+                        // 2026-04-24 Fix D: demoted INFO → DEBUG. A mid-session
+                        // fresh boot legitimately runs past 09:13:00; the real
+                        // ATM/depth dispatch happens via the boot-time
+                        // spot-wait path (see run_depth_init_sync).
+                        debug!(
                             now = %now_time,
-                            "depth-anchor: skipping (past 09:13:00 — late start)"
+                            "depth-anchor: skipping (past 09:13:00 — expected on mid-session boot)"
                         );
                         return;
                     }
