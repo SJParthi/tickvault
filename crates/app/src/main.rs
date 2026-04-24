@@ -3121,10 +3121,13 @@ async fn main() -> Result<()> {
             // PROMPT B precursor (2026-04-20): pre-open price snapshotter.
             // Subscribes to the tick broadcast and buckets every NSE_EQ
             // tick that belongs to an F&O stock into the matching minute
-            // slot (09:08..09:12 IST). The Phase 2 scheduler reads from
-            // this buffer at 09:12:30 to pick ATM strikes per stock.
-            // Outside the 09:08..09:12 window the snapshotter is idle
-            // (no work, no metrics) — see audit-findings Rule 3.
+            // slot (09:08..09:12 IST today; widening to 09:00..09:12 in
+            // Fix #1 — see .claude/plans/active-plan.md). The Phase 2
+            // scheduler reads this buffer at **09:13:00 IST** (commit
+            // 0340a7c moved it from 09:12:30 so the 09:12-minute bucket
+            // is fully closed before we read). Outside the window the
+            // snapshotter is idle (no work, no metrics) — see
+            // audit-findings Rule 3.
             let preopen_buffer =
                 tickvault_core::instrument::preopen_price_buffer::new_shared_preopen_buffer();
             // Plan: Phase 2 live-LTP fallback (2026-04-23). Holds the
@@ -3184,7 +3187,8 @@ async fn main() -> Result<()> {
                     // Plan item A (2026-04-22): combined lookup merges F&O
                     // stocks (NSE_EQ) + whitelisted indices (NIFTY + BANKNIFTY
                     // on IDX_I). Indices feed the depth-20 + depth-200 ATM
-                    // selection at 09:12:30 per the unified dispatch plan.
+                    // selection at **09:13:00 IST** per the unified dispatch
+                    // plan (was 09:12:30 — Fix #8 comment cleanup 2026-04-24).
                     let lookup =
                         tickvault_core::instrument::preopen_price_buffer::build_preopen_combined_lookup(
                             &snap_universe,
@@ -3239,7 +3243,7 @@ async fn main() -> Result<()> {
             // PROMPT C (2026-04-20) — Phase 2 crash-recovery.
             //
             // BEFORE spawning the Phase 2 scheduler, consult the on-disk
-            // snapshot written by PROMPT A at 09:12:30 IST. If today's
+            // snapshot written by PROMPT A at 09:13:00 IST. If today's
             // snapshot is present we re-dispatch the SAME ATM chain the
             // scheduler picked this morning and SKIP spawning the
             // scheduler — a mid-market restart at 11:00 IST must resume
@@ -3333,10 +3337,15 @@ async fn main() -> Result<()> {
                 tickvault_app::phase2_recovery::RecoveryAction::RunFreshPhase2
                 | tickvault_app::phase2_recovery::RecoveryAction::WaitForScheduler => {
                     // O1 (2026-04-17) Phase A: Phase 2 subscription scheduler.
-                    // Sleeps until 09:12 IST (or runs immediately if already past 9:12
+                    // Sleeps until 09:13 IST (or runs immediately if already past 9:13
                     // and within market hours), then waits for NIFTY/BANKNIFTY LTPs,
                     // then computes the stock-F&O delta from the snapshotter's
                     // buffer and dispatches the SubscribeCommand to the pool.
+                    //
+                    // Fix #8 (2026-04-24): trigger time moved 09:12 → 09:13 per
+                    // commit 0340a7c so the 09:12-minute bucket is fully closed
+                    // before Phase 2 reads the preopen buffer. Old "09:12" text
+                    // below was stale.
                     let phase2_spot_prices = std::sync::Arc::clone(&shared_spot_prices);
                     let phase2_calendar_for_dyn = std::sync::Arc::clone(&trading_calendar);
                     let phase2_calendar_for_decision = std::sync::Arc::clone(&trading_calendar);
@@ -3755,31 +3764,29 @@ async fn main() -> Result<()> {
 
                         // Depth-20 ALWAYS rebalances (all 4 underlyings).
                         // Depth-200 ONLY rebalances for NIFTY + BANKNIFTY
-                        // (gate at line ~3261 below). Message text MUST
-                        // reflect the actual mechanism (zero-disconnect
-                        // Swap via mpsc command channel) — the previous
-                        // "aborting... spawning new ATM" wording was a
-                        // mislabel that scared Parthiban at 09:42 IST on
-                        // 2026-04-22 into thinking the depth socket was
-                        // being torn down. It was not.
+                        // (gate at line ~3261 below). The typed
+                        // `DepthRebalanced` event fires at `Severity::Low`
+                        // per Fix #9 (2026-04-24): routine zero-disconnect
+                        // drift swap is working-as-designed, not an amber
+                        // alert. The title fragment includes the level(s)
+                        // per Fix #10 so operators can tell the swap scope
+                        // at a glance.
                         let has_200_level = ul == "NIFTY" || ul == "BANKNIFTY";
-                        let action_line = if has_200_level {
-                            "Action: zero-disconnect swap — 20-level + 200-level unsub old / sub new on same socket"
+                        let levels = if has_200_level {
+                            tickvault_core::notification::DepthRebalanceLevels::TwentyAndTwoHundred
                         } else {
-                            "Action: zero-disconnect swap — 20-level unsub old / sub new on same socket (no 200-level for this underlying)"
+                            tickvault_core::notification::DepthRebalanceLevels::TwentyOnly
                         };
 
-                        rebalance_notifier.notify(NotificationEvent::Custom {
-                            message: format!(
-                                "<b>Depth rebalance: {ul}</b>\n\
-                                 Spot: {:.2} → {:.2}\n\
-                                 Old CE: {old_ce}\n\
-                                 Old PE: {old_pe}\n\
-                                 New CE: {new_ce}\n\
-                                 New PE: {new_pe}\n\
-                                 {action_line}",
-                                event.previous_spot, event.current_spot,
-                            ),
+                        rebalance_notifier.notify(NotificationEvent::DepthRebalanced {
+                            underlying: ul.to_string(),
+                            previous_spot: event.previous_spot,
+                            current_spot: event.current_spot,
+                            old_ce: old_ce.clone(),
+                            old_pe: old_pe.clone(),
+                            new_ce: new_ce.clone(),
+                            new_pe: new_pe.clone(),
+                            levels,
                         });
 
                         // --- 200-level rebalance via command channel (zero disconnect) ---
