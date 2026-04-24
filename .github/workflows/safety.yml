@@ -31,7 +31,11 @@ env:
   RUST_BACKTRACE: 1
   # Pin nightly to a specific date for reproducible builds.
   # Update periodically after verifying the new nightly compiles cleanly.
-  NIGHTLY_VERSION: nightly-2026-04-15
+  # 2026-04-24: bumped from 2026-04-15 → 2026-04-20 to keep the pin under
+  # the 14-day safety window. 2026-04-20 is proven working (weekly safety
+  # run on that date surfaced issues #302 + #304 — i.e. the build +
+  # sanitizer jobs ran end-to-end).
+  NIGHTLY_VERSION: nightly-2026-04-20
 
 jobs:
   # ---- cargo-careful: Extra debug checks ----

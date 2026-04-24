@@ -228,6 +228,44 @@ pub async fn request_tracing(request: Request, next: Next) -> Response {
 mod tests {
     use super::*;
 
+    /// Serializes all `TV_API_TOKEN` env-var mutations across tests in
+    /// this file.
+    ///
+    /// Rust 2024 promoted `std::env::set_var` / `remove_var` to `unsafe`
+    /// because they can race with any other thread reading the env. A
+    /// ThreadSanitizer run on 2026-04-20 (GitHub issue #304) detected
+    /// exactly this: parallel test execution mutated `TV_API_TOKEN`
+    /// from multiple threads without synchronization.
+    ///
+    /// Every test that calls `unsafe { std::env::set_var }` or
+    /// `unsafe { std::env::remove_var }` MUST acquire this lock first:
+    ///
+    /// ```rust,ignore
+    /// #[test]
+    /// fn my_test() {
+    ///     let _env_guard = lock_env();
+    ///     unsafe { std::env::set_var("TV_API_TOKEN", "...") };
+    ///     // ... test body ...
+    ///     unsafe { std::env::remove_var("TV_API_TOKEN") };
+    ///     // `_env_guard` drops at end-of-scope, releasing the mutex.
+    /// }
+    /// ```
+    ///
+    /// On poisoned lock (another test panicked while holding it) we
+    /// recover the inner guard rather than propagating the poison —
+    /// the env var state may be wrong, but the failing test already
+    /// reported its own error, and blocking every downstream env test
+    /// on one earlier failure is strictly worse for CI signal.
+    static ENV_MUTATION_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+        std::sync::OnceLock::new();
+
+    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        ENV_MUTATION_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Named handler function shared by all middleware tests.
     /// Using a single named function instead of separate `|| async { "ok" }`
     /// closures ensures coverage when at least one test reaches the handler.
@@ -746,6 +784,7 @@ mod tests {
 
     #[test]
     fn test_from_env_dry_run_no_token_disables_auth() {
+        let _env_guard = lock_env();
         // Remove TV_API_TOKEN to simulate unset
         unsafe { std::env::remove_var("TV_API_TOKEN") };
         let config = ApiAuthConfig::from_env(true);
@@ -755,6 +794,7 @@ mod tests {
 
     #[test]
     fn test_from_env_live_mode_no_token_generates_token() {
+        let _env_guard = lock_env();
         // Remove TV_API_TOKEN to simulate unset
         unsafe { std::env::remove_var("TV_API_TOKEN") };
         let config = ApiAuthConfig::from_env(false);
@@ -772,6 +812,7 @@ mod tests {
 
     #[test]
     fn test_from_env_live_mode_no_token_generates_unique_tokens() {
+        let _env_guard = lock_env();
         unsafe { std::env::remove_var("TV_API_TOKEN") };
         let config1 = ApiAuthConfig::from_env(false);
         let config2 = ApiAuthConfig::from_env(false);
@@ -913,6 +954,7 @@ mod tests {
 
     #[test]
     fn test_from_env_with_explicit_token_set() {
+        let _env_guard = lock_env();
         // Set TV_API_TOKEN so from_env() takes the Ok(token) path
         unsafe { std::env::set_var("TV_API_TOKEN", "test-explicit-token-12345") };
         let config = ApiAuthConfig::from_env(true);
@@ -934,6 +976,7 @@ mod tests {
 
     #[test]
     fn test_from_env_empty_token_string_dry_run_disables_auth() {
+        let _env_guard = lock_env();
         unsafe { std::env::set_var("TV_API_TOKEN", "") };
         let config = ApiAuthConfig::from_env(true);
         assert!(!config.enabled, "empty token + dry_run = disabled");
@@ -943,6 +986,7 @@ mod tests {
 
     #[test]
     fn test_from_env_empty_token_string_live_generates_token() {
+        let _env_guard = lock_env();
         unsafe { std::env::set_var("TV_API_TOKEN", "") };
         let config = ApiAuthConfig::from_env(false);
         assert!(
