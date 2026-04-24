@@ -5042,11 +5042,85 @@ fn spawn_historical_candle_fetch(
         // class as the cross-match false-OK fix in PR #341. The downstream
         // cross-verify then trusts that signal and silently passes too.
         //
+        // 2026-04-24 refinement (operator feedback post PR #342 merge):
+        // when the fetch returns zero AND QuestDB already has today's
+        // candles from a prior run, this is an **idempotent re-run**,
+        // not an outage. The fetch call returned zero because DEDUP
+        // upserted every candle Dhan sent. Fire LOW
+        // `HistoricalFetchAlreadyAvailable` instead of HIGH
+        // `HistoricalFetchFailed`. The presence check runs BEFORE the
+        // failure decision so the alarm severity matches reality.
+        //
         // Routes to HistoricalFetchFailed with a synthesized failure_reasons
         // entry so the operator gets a clear diagnostic in Telegram.
         let zero_fetched_degenerate =
             summary.instruments_fetched == 0 && summary.total_candles == 0;
-        if summary.instruments_failed > 0 || zero_fetched_degenerate {
+        let zero_fetched_no_actual_failures =
+            zero_fetched_degenerate && summary.instruments_failed == 0;
+        // Query the presence check ONLY in the zero-fetched-no-failures
+        // case to avoid an unnecessary QuestDB round-trip on the happy
+        // path. `None` means the query failed — treat as "unknown",
+        // fall through to the HIGH HistoricalFetchFailed path so we do
+        // not mask a real outage behind a failed presence check.
+        let today_candle_presence: Option<u64> = if zero_fetched_no_actual_failures {
+            // today_ist best-effort: use `TodayIstWindow::from_now` when
+            // available (09:15 IST onwards); pre-market (before 09:15)
+            // falls back to system-clock IST date. Both produce the
+            // same IST calendar date for today — only the window start
+            // differs, which this count helper doesn't need.
+            let today_ist_naive =
+                tickvault_core::historical::cross_verify::TodayIstWindow::from_now()
+                    .map(|w| w.today_ist)
+                    .unwrap_or_else(|| {
+                        // Pre-market IST date — computed from UTC clock.
+                        // Pure chrono, no I/O.
+                        use chrono::{FixedOffset, Utc};
+                        let ist_offset = FixedOffset::east_opt(
+                            tickvault_common::constants::IST_UTC_OFFSET_SECONDS,
+                        )
+                        .expect("IST offset is compile-time valid"); // APPROVED: 19800 is a valid FixedOffset
+                        Utc::now().with_timezone(&ist_offset).date_naive()
+                    });
+            tickvault_core::historical::cross_verify::count_historical_candles_for_ist_day(
+                &bg_questdb_config,
+                today_ist_naive,
+            )
+            .await
+            .map(|n| {
+                info!(
+                    today_ist = %today_ist_naive,
+                    today_candles = n,
+                    "historical fetch returned zero — checking DB presence to \
+                     classify as idempotent re-run vs outage"
+                );
+                n
+            })
+        } else {
+            None
+        };
+        if zero_fetched_no_actual_failures && today_candle_presence.unwrap_or(0) > 0 {
+            // DB already has today's data. This is an idempotent re-run,
+            // not an outage. Fire LOW.
+            let today_candles = today_candle_presence.unwrap_or(0);
+            let today_ist_label =
+                tickvault_core::historical::cross_verify::TodayIstWindow::from_now()
+                    .map(|w| w.today_ist.to_string())
+                    .unwrap_or_else(|| {
+                        use chrono::{FixedOffset, Utc};
+                        let ist_offset = FixedOffset::east_opt(
+                            tickvault_common::constants::IST_UTC_OFFSET_SECONDS,
+                        )
+                        .expect("IST offset is compile-time valid"); // APPROVED: 19800 is a valid FixedOffset
+                        Utc::now()
+                            .with_timezone(&ist_offset)
+                            .date_naive()
+                            .to_string()
+                    });
+            bg_notifier.notify(NotificationEvent::HistoricalFetchAlreadyAvailable {
+                today_ist: today_ist_label,
+                today_candles,
+            });
+        } else if summary.instruments_failed > 0 || zero_fetched_degenerate {
             let mut failure_reasons = summary.failure_reasons.clone();
             if zero_fetched_degenerate && summary.instruments_failed == 0 {
                 failure_reasons.insert(

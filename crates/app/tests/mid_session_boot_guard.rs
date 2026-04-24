@@ -274,3 +274,81 @@ fn test_historical_fetch_guards_zero_fetched_zero_candles() {
          HistoricalFetchFailed, not HistoricalFetchComplete."
     );
 }
+
+#[test]
+fn test_historical_fetch_idempotent_rerun_routes_to_already_available() {
+    // 2026-04-24 operator-feedback follow-up (PR #353):
+    //
+    //   "already we downloaded all the data including today so using
+    //    another branch when we run this again since the data is
+    //    available even for today then in telegram it should display
+    //    the low message as data is already fetched or available for
+    //    today"
+    //
+    // When the fetch returns `instruments_fetched == 0 && total_candles
+    // == 0` BUT QuestDB already has today's candles, fire LOW
+    // `HistoricalFetchAlreadyAvailable` instead of HIGH
+    // `HistoricalFetchFailed`. The operator should not be paged for an
+    // idempotent re-run; they should be paged for a real outage.
+    let src = read_file("crates/app/src/main.rs");
+    assert!(
+        src.contains("zero_fetched_no_actual_failures"),
+        "historical-fetch decision tree must define the \
+         `zero_fetched_no_actual_failures` binding — it's the pre-condition \
+         for the DB presence check. Dropping it would re-merge the \
+         idempotent-rerun path back into HistoricalFetchFailed (HIGH)."
+    );
+    assert!(
+        src.contains("count_historical_candles_for_ist_day"),
+        "historical-fetch decision tree must call \
+         count_historical_candles_for_ist_day — it's the QuestDB presence \
+         check that distinguishes idempotent re-runs from Dhan outages. \
+         Without the call, every zero-fetched boot fires HIGH."
+    );
+    assert!(
+        src.contains("NotificationEvent::HistoricalFetchAlreadyAvailable"),
+        "historical-fetch decision tree must emit \
+         HistoricalFetchAlreadyAvailable on the idempotent-rerun path. \
+         Routing it back through HistoricalFetchComplete would be wrong \
+         — Complete claims a successful fetch; we did not fetch anything."
+    );
+    // The idempotent-rerun branch must be tested for `> 0` against the
+    // presence count, not `>= 0` (which would fire on every zero-fetched
+    // boot regardless of DB state — defeating the whole point).
+    assert!(
+        src.contains("today_candle_presence.unwrap_or(0) > 0"),
+        "idempotent-rerun branch must test `today_candle_presence > 0`. \
+         Dropping the `> 0` makes the branch fire on every failed QuestDB \
+         query, silently masking real outages."
+    );
+}
+
+#[test]
+fn test_historical_fetch_already_available_variant_exists_at_low_severity() {
+    // Ratchet the event-catalogue side of the PR #353 fix: the new
+    // variant must exist in `events.rs` AND be tagged Severity::Low.
+    // If a future maintainer removes the variant or bumps its severity
+    // to High, Telegram would start paging on idempotent re-runs again.
+    let events_src = read_file("crates/core/src/notification/events.rs");
+    assert!(
+        events_src.contains("HistoricalFetchAlreadyAvailable {"),
+        "events.rs must declare HistoricalFetchAlreadyAvailable variant"
+    );
+    assert!(
+        events_src.contains("Self::HistoricalFetchAlreadyAvailable { .. } => Severity::Low"),
+        "HistoricalFetchAlreadyAvailable MUST be Severity::Low. \
+         An idempotent re-run is not an operator-page event."
+    );
+    assert!(
+        events_src.contains("Historical candles already fetched"),
+        "HistoricalFetchAlreadyAvailable to_message must start with \
+         `<b>Historical candles already fetched</b>` so the operator can \
+         visually distinguish it from the HIGH HistoricalFetchFailed."
+    );
+    assert!(
+        events_src.contains("today_ist: String") && events_src.contains("today_candles: u64"),
+        "HistoricalFetchAlreadyAvailable must carry today_ist (for the \
+         Telegram label) and today_candles (so the operator sees exactly \
+         how much data the DB has — reassurance that the skip is safe)."
+    );
+}

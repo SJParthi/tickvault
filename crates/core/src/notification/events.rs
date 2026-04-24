@@ -487,6 +487,23 @@ pub enum NotificationEvent {
         persist_failures: usize,
     },
 
+    /// 2026-04-24 — idempotent re-run detected. The fetch call returned
+    /// `instruments_fetched == 0 && total_candles == 0`, but QuestDB
+    /// already has today's historical candles from a prior run, so the
+    /// zero result is "nothing to do" not "fetch broke". Fired at
+    /// [`Severity::Low`] instead of the HIGH `HistoricalFetchFailed`.
+    ///
+    /// See `count_historical_candles_for_ist_day` in `cross_verify.rs`
+    /// for the presence check.
+    HistoricalFetchAlreadyAvailable {
+        /// IST date of the trading day (e.g. `2026-04-24`).
+        today_ist: String,
+        /// Count of rows in `historical_candles` with `ts >= today
+        /// IST midnight`. Bounded above by ~60M (universe × timeframes
+        /// × candles-per-day) — `u64` is ample headroom.
+        today_candles: u64,
+    },
+
     /// Historical candle fetch completed with failures.
     HistoricalFetchFailed {
         /// Number of instruments that succeeded.
@@ -1195,6 +1212,17 @@ impl NotificationEvent {
                 }
                 msg
             }
+            Self::HistoricalFetchAlreadyAvailable {
+                today_ist,
+                today_candles,
+            } => {
+                format!(
+                    "<b>Historical candles already fetched</b>\n\
+                     Date: {today_ist} IST\n\
+                     Today's candles in DB: {today_candles}\n\
+                     No new fetch needed (idempotent re-run)"
+                )
+            }
             Self::HistoricalFetchFailed {
                 instruments_fetched,
                 instruments_failed,
@@ -1504,6 +1532,7 @@ impl NotificationEvent {
             Self::CandleVerificationFailed { .. } => Severity::High,
             Self::CandleCrossMatchFailed { .. } => Severity::High,
             Self::HistoricalFetchComplete { .. } => Severity::Low,
+            Self::HistoricalFetchAlreadyAvailable { .. } => Severity::Low,
             Self::CandleVerificationPassed { .. } => Severity::Low,
             Self::CandleCrossMatchPassed { .. } => Severity::Low,
             Self::CandleCrossMatchSkipped { .. } => Severity::Low,
