@@ -735,7 +735,7 @@ async fn main() -> Result<()> {
 
         // --- Load instruments (sub-1ms from rkyv cache during market hours) ---
         let (subscription_plan, fresh_universe, _needs_persist) =
-            load_instruments(&config, is_trading).await;
+            load_instruments(&config, is_trading, trading_calendar.as_ref()).await;
 
         // --- WebSocket pool create (channel only, NOT spawned yet) ---
         let (pool_receiver, ws_pool_ready) = match create_websocket_pool(
@@ -1708,7 +1708,7 @@ async fn main() -> Result<()> {
     // CachedPlan loads from rkyv cache and returns universe for persistence here.
     // To avoid DOUBLE persistence on FreshBuild, only persist if CachedPlan.
     let (subscription_plan, slow_boot_universe, needs_instrument_persist) =
-        load_instruments(&config, is_trading).await;
+        load_instruments(&config, is_trading, trading_calendar.as_ref()).await;
     // Only persist for CachedPlan (not yet persisted). FreshBuild already
     // persisted inside load_or_build_instruments — double-write creates
     // duplicate rows in the same timestamp second.
@@ -4364,6 +4364,7 @@ async fn main() -> Result<()> {
 async fn load_instruments(
     config: &ApplicationConfig,
     is_trading_day: bool,
+    trading_calendar: &TradingCalendar,
 ) -> (Option<SubscriptionPlan>, Option<FnoUniverse>, bool) {
     info!("checking instrument build eligibility");
 
@@ -4380,11 +4381,20 @@ async fn load_instruments(
         Ok(InstrumentLoadResult::FreshBuild(universe)) => {
             let today = Utc::now().with_timezone(&ist_offset()).date_naive();
             // Boot-time: pass empty spot prices — stock F&O will be subscribed
-            // at 9:12 AM once pre-market finalized prices are available.
+            // at 9:13 AM once pre-market finalized prices are available.
             // Indices get ALL contracts regardless. Stock equities subscribe immediately.
+            //
+            // Fix #6 (2026-04-24): pass the trading calendar so stock F&O
+            // expiries roll forward when nearest is T or T-1. Indices are
+            // unaffected — the planner ignores rollover for index kinds.
             let empty_spot_prices = std::collections::HashMap::new();
-            let plan =
-                build_subscription_plan(&universe, &config.subscription, today, &empty_spot_prices);
+            let plan = build_subscription_plan(
+                &universe,
+                &config.subscription,
+                today,
+                &empty_spot_prices,
+                Some(trading_calendar),
+            );
 
             info!(
                 total = plan.summary.total,
