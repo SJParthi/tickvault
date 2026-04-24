@@ -1,7 +1,16 @@
 //! TLS connector configuration for WebSocket connections.
 //!
-//! Builds a rustls `ClientConfig` with HTTP/1.1 ALPN to ensure WebSocket
-//! upgrade requests succeed through reverse proxies that otherwise negotiate HTTP/2.
+//! Two builders:
+//! - [`build_websocket_tls_connector`]: forces `http/1.1` ALPN. Used by main
+//!   feed, 20-level depth, and order-update sockets, which all transit
+//!   reverse proxies that would otherwise negotiate HTTP/2 and reject the
+//!   WebSocket upgrade.
+//! - [`build_websocket_tls_connector_no_alpn`]: advertises NO ALPN protocol.
+//!   Used by 200-level depth ONLY, matching Dhan's Python SDK
+//!   `dhanhq==2.2.0rc1` exactly (Parthiban verified 2026-04-23 on
+//!   SecurityId 72271). Any other combination (tungstenite default UA +
+//!   http/1.1 ALPN) produced `Protocol(ResetWithoutClosingHandshake)`
+//!   disconnects for 2+ weeks on `full-depth-api.dhan.co`.
 
 use std::sync::Arc;
 
@@ -18,6 +27,27 @@ use crate::websocket::types::WebSocketError;
 /// Uses the already-installed `aws_lc_rs` CryptoProvider and native root
 /// certificates for TLS verification.
 pub fn build_websocket_tls_connector() -> Result<Connector, WebSocketError> {
+    build_tls_connector_inner(true)
+}
+
+/// Builds a TLS connector WITHOUT any ALPN protocol for the 200-level depth
+/// socket.
+///
+/// Matches the wire behavior of Dhan's Python SDK `dhanhq==2.2.0rc1` which
+/// uses the stock `websockets/16.0` library — that library does not set
+/// `alpn_protocols` on its `ssl.SSLContext`, so the TLS ClientHello advertises
+/// no ALPN. Parthiban ran the Python SDK against our account at SecurityId
+/// 72271 on 2026-04-23 and the connection streamed for 30+ minutes with zero
+/// disconnects, while our Rust client with `http/1.1` ALPN kept getting
+/// `Protocol(ResetWithoutClosingHandshake)`.
+///
+/// **DO NOT reuse this builder for main feed, 20-level depth, or order-update
+/// sockets.** Those go through reverse proxies that require `http/1.1` ALPN.
+pub fn build_websocket_tls_connector_no_alpn() -> Result<Connector, WebSocketError> {
+    build_tls_connector_inner(false)
+}
+
+fn build_tls_connector_inner(force_http11_alpn: bool) -> Result<Connector, WebSocketError> {
     let mut root_store = rustls::RootCertStore::empty();
 
     let native_certs = rustls_native_certs::load_native_certs();
@@ -35,8 +65,10 @@ pub fn build_websocket_tls_connector() -> Result<Connector, WebSocketError> {
         .with_root_certificates(root_store)
         .with_no_client_auth();
 
-    // Force HTTP/1.1 ALPN — required for WebSocket upgrade through proxies.
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    if force_http11_alpn {
+        // Force HTTP/1.1 ALPN — required for WebSocket upgrade through proxies.
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    }
     // O(1) EXEMPT: end
 
     Ok(Connector::Rustls(Arc::new(config)))
@@ -301,5 +333,62 @@ mod tests {
             assert_eq!(config.alpn_protocols.len(), 1);
             assert_eq!(config.alpn_protocols[0], b"http/1.1");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // No-ALPN connector (200-level depth only — matches Python SDK wire behavior)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_websocket_tls_connector_no_alpn_succeeds() {
+        install_crypto_provider();
+        let result = build_websocket_tls_connector_no_alpn();
+        assert!(result.is_ok(), "no-ALPN TLS connector must build");
+    }
+
+    #[test]
+    fn test_build_websocket_tls_connector_no_alpn_has_empty_alpn_list() {
+        // Matches Python SDK `dhanhq==2.2.0rc1` which uses `websockets/16.0`
+        // with default SSLContext — no ALPN advertised. Verified 2026-04-23.
+        install_crypto_provider();
+        let connector = build_websocket_tls_connector_no_alpn().unwrap();
+        let config = unwrap_rustls_config(connector);
+        assert!(
+            config.alpn_protocols.is_empty(),
+            "200-depth TLS connector MUST NOT advertise any ALPN protocol; \
+             anything else regresses to ResetWithoutClosingHandshake on full-depth-api.dhan.co"
+        );
+    }
+
+    #[test]
+    fn test_build_websocket_tls_connector_no_alpn_does_not_contain_http11() {
+        install_crypto_provider();
+        let connector = build_websocket_tls_connector_no_alpn().unwrap();
+        let config = unwrap_rustls_config(connector);
+        assert!(
+            !config.alpn_protocols.contains(&b"http/1.1".to_vec()),
+            "no-ALPN connector must not contain http/1.1 — that combo caused \
+             2+ weeks of 200-depth disconnects; use build_websocket_tls_connector() for \
+             main feed/20-depth/order-update instead"
+        );
+    }
+
+    #[test]
+    fn test_build_websocket_tls_connector_no_alpn_does_not_contain_h2() {
+        install_crypto_provider();
+        let connector = build_websocket_tls_connector_no_alpn().unwrap();
+        let config = unwrap_rustls_config(connector);
+        assert!(!config.alpn_protocols.contains(&b"h2".to_vec()));
+    }
+
+    #[test]
+    fn test_http11_and_no_alpn_connectors_produce_distinct_alpn_lists() {
+        install_crypto_provider();
+        let with_alpn = build_websocket_tls_connector().unwrap();
+        let no_alpn = build_websocket_tls_connector_no_alpn().unwrap();
+        let cfg_with = unwrap_rustls_config(with_alpn);
+        let cfg_no = unwrap_rustls_config(no_alpn);
+        assert_eq!(cfg_with.alpn_protocols.len(), 1);
+        assert!(cfg_no.alpn_protocols.is_empty());
     }
 }
