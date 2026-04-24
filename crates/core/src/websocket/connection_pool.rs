@@ -267,12 +267,25 @@ impl WebSocketConnectionPool {
             }
 
             let conn = Arc::clone(conn);
-            handles.push(tokio::spawn(async move { conn.run().await }));
+            let defer_label = format!("conn={idx}");
+            handles.push(tokio::spawn(async move {
+                // Off-hours boot gate: if the app starts outside
+                // [09:00, 15:30) IST, sleep until the next 09:00 IST
+                // BEFORE opening any TCP socket. Eliminates the pre-market
+                // disconnect/reconnect flap Parthiban reported on
+                // 2026-04-24 at 07:40 IST.
+                crate::websocket::market_hours_gate::defer_until_market_open_ist(
+                    "main_feed",
+                    &defer_label,
+                )
+                .await;
+                conn.run().await
+            }));
 
             info!(
                 connection_id = idx,
                 total = self.connections.len(),
-                "Spawned WebSocket connection"
+                "Spawned WebSocket connection (task started; may defer connect if off-hours)"
             );
         }
 
@@ -1040,6 +1053,43 @@ mod tests {
 
     // --- spawn_all() Tests ---
 
+    /// RAII guard: pin `is_within_market_hours_ist()` to `true` for the
+    /// lifetime of the guard.
+    ///
+    /// The off-hours boot gate added in `market_hours_gate.rs` (2026-04-24,
+    /// fix-offhours-ws-connect-flap) otherwise sleeps each `spawn_all` task
+    /// until the next 09:00 IST, which would hang every `test_spawn_all_*`
+    /// when CI runs outside market hours (most of the 24-hour day).
+    /// Wrapping each test with this guard forces the gate to short-circuit
+    /// and preserves the pre-fix test semantics (tasks run immediately).
+    ///
+    /// **Race-safe:** a process-global refcount ensures the override stays
+    /// `true` until the LAST concurrent guard drops. Without this,
+    /// `cargo test` running tests in parallel would see test A's drop
+    /// flip the atomic to `false` while test B's tasks are still parked
+    /// at the gate, re-introducing the exact hang this guard exists to
+    /// prevent.
+    static MARKET_HOURS_GUARD_REFCOUNT: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    struct MarketHoursTestGuard;
+    impl MarketHoursTestGuard {
+        fn new() -> Self {
+            MARKET_HOURS_GUARD_REFCOUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tickvault_common::market_hours::set_test_force_in_market_hours(true);
+            Self
+        }
+    }
+    impl Drop for MarketHoursTestGuard {
+        fn drop(&mut self) {
+            let prev =
+                MARKET_HOURS_GUARD_REFCOUNT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            // Only clear the override when we were the LAST guard holding it.
+            if prev == 1 {
+                tickvault_common::market_hours::set_test_force_in_market_hours(false);
+            }
+        }
+    }
+
     /// Session 8 final-sweep helper — drain all spawned WebSocket tasks for
     /// test cleanup without hanging. Signals graceful shutdown first, then
     /// aborts each handle so the task exits even if the deeper connection
@@ -1059,6 +1109,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_spawn_all_returns_correct_number_of_handles() {
+        let _guard = MarketHoursTestGuard::new();
         let pool = WebSocketConnectionPool::new(
             make_test_token_handle(), // No token → connections will fail
             "test-client".to_string(),
@@ -1088,6 +1139,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_spawn_all_empty_pool_returns_handles() {
+        let _guard = MarketHoursTestGuard::new();
         let pool = WebSocketConnectionPool::new(
             make_test_token_handle(),
             "test-client".to_string(),
@@ -1112,6 +1164,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_spawn_all_tasks_return_reconnection_exhausted() {
+        let _guard = MarketHoursTestGuard::new();
         let pool = WebSocketConnectionPool::new(
             make_test_token_handle(),
             "test-client".to_string(),
@@ -1382,6 +1435,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_spawn_all_with_single_connection() {
+        let _guard = MarketHoursTestGuard::new();
         let config = DhanConfig {
             max_websocket_connections: 1,
             ..make_test_dhan_config()
@@ -1410,6 +1464,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_spawn_all_with_stagger_returns_correct_handles() {
+        let _guard = MarketHoursTestGuard::new();
         let pool = WebSocketConnectionPool::new(
             make_test_token_handle(),
             "test-client".to_string(),
@@ -1557,6 +1612,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_spawn_all_zero_stagger_is_instant() {
+        let _guard = MarketHoursTestGuard::new();
         let pool = WebSocketConnectionPool::new(
             make_test_token_handle(),
             "test-client".to_string(),

@@ -81,6 +81,44 @@ pub fn is_within_market_hours_ist() -> bool {
     (TICK_PERSIST_START_SECS_OF_DAY_IST..TICK_PERSIST_END_SECS_OF_DAY_IST).contains(&sec_of_day)
 }
 
+/// Returns the number of seconds until the next `TICK_PERSIST_START_SECS_OF_DAY_IST`
+/// (09:00 IST). Returns `0` when currently within market hours.
+///
+/// Used by WebSocket boot gates that want to defer TCP connect until market
+/// open rather than flap against Dhan's pre-market idle-socket resets.
+///
+/// # Complexity
+/// O(1): same path as `is_within_market_hours_ist` plus arithmetic.
+///
+/// # Upper bound
+/// At most 24 hours minus the `[09:00, 15:30)` window, i.e. 17h30m = 63,000 s.
+///
+/// # Test override
+/// When `TEST_FORCE_IN_MARKET_HOURS` is set, returns `0` — same semantics as
+/// "currently in market hours".
+#[allow(clippy::cast_possible_truncation)] // APPROVED: secs-of-day and diff fit u32 by construction
+#[inline]
+// TEST-EXEMPT: covered by secs_until_next_open_returns_zero_during_market_hours, secs_until_next_open_bounded_below_one_day, secs_until_next_open_positive_when_off_hours below
+pub fn secs_until_next_market_open_ist() -> u64 {
+    if is_within_market_hours_ist() {
+        return 0;
+    }
+    let now_utc_secs = chrono::Utc::now().timestamp();
+    let sec_of_day = now_utc_secs
+        .saturating_add(i64::from(IST_UTC_OFFSET_SECONDS))
+        .rem_euclid(i64::from(SECONDS_PER_DAY)) as u32;
+    let open = TICK_PERSIST_START_SECS_OF_DAY_IST;
+    let day = SECONDS_PER_DAY;
+    // If sec_of_day < open → today, later. If sec_of_day >= open (we're past
+    // 09:00 but not within hours, i.e. >= 15:30) → next day's open.
+    let until = if sec_of_day < open {
+        open - sec_of_day
+    } else {
+        day - sec_of_day + open
+    };
+    u64::from(until)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,5 +154,46 @@ mod tests {
     fn window_bounds_come_from_tick_persist_constants() {
         assert_eq!(TICK_PERSIST_START_SECS_OF_DAY_IST, 9 * 3600);
         assert_eq!(TICK_PERSIST_END_SECS_OF_DAY_IST, 15 * 3600 + 30 * 60);
+    }
+
+    // ----- secs_until_next_market_open_ist ----------------------------------
+
+    #[test]
+    fn secs_until_next_open_returns_zero_during_market_hours() {
+        set_test_force_in_market_hours(true);
+        assert_eq!(secs_until_next_market_open_ist(), 0);
+        set_test_force_in_market_hours(false);
+    }
+
+    /// Upper-bound sanity: 24h == 86,400s. The answer must be less than
+    /// 24h because there is at most one full day between two 09:00 IST
+    /// market opens.
+    #[test]
+    fn secs_until_next_open_bounded_below_one_day() {
+        let secs = secs_until_next_market_open_ist();
+        assert!(
+            secs < u64::from(SECONDS_PER_DAY),
+            "secs_until_next_market_open_ist() = {secs} must be < 24h ({})",
+            SECONDS_PER_DAY
+        );
+    }
+
+    /// If NOT in market hours, the helper MUST return a positive number of
+    /// seconds; returning 0 off-hours would make the boot-time defer loop
+    /// a no-op and re-introduce the flap.
+    #[test]
+    fn secs_until_next_open_positive_when_off_hours() {
+        // Force off-hours by clearing the override (default state).
+        set_test_force_in_market_hours(false);
+        if !is_within_market_hours_ist() {
+            assert!(
+                secs_until_next_market_open_ist() > 0,
+                "off-hours must return > 0 secs"
+            );
+        }
+        // If the real wall-clock happens to be inside [09:00, 15:30) IST
+        // while CI runs this test, we can't deterministically assert > 0
+        // — but `secs_until_next_open_returns_zero_during_market_hours`
+        // covers that direction.
     }
 }

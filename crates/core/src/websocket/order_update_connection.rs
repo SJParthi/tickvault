@@ -76,6 +76,17 @@ pub async fn run_order_update_connection(
 
     info!("order update WebSocket starting");
 
+    // Off-hours boot gate: Dhan's `api-order-update.dhan.co` TCP-RSTs idle
+    // sockets outside market hours. If we open a socket at 06:00 IST the
+    // server resets it within seconds, and the reconnect loop flaps until
+    // 09:00 IST. Defer the first connect until market open to eliminate
+    // the flap (Parthiban directive, 2026-04-24).
+    crate::websocket::market_hours_gate::defer_until_market_open_ist(
+        "order_update",
+        "run_order_update_connection",
+    )
+    .await;
+
     loop {
         // Snapshot the failure count BEFORE the connect attempt. If the
         // attempt succeeds AND this counter is > 0, we have just
