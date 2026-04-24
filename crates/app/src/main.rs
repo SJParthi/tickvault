@@ -737,6 +737,23 @@ async fn main() -> Result<()> {
         let (subscription_plan, fresh_universe, _needs_persist) =
             load_instruments(&config, is_trading, trading_calendar.as_ref()).await;
 
+        // Audit finding #6 (2026-04-24): emit InstrumentBuildSuccess when
+        // instruments load successfully. Previously only the FAILURE path
+        // (`InstrumentBuildFailed`) fired a Telegram, leaving operators
+        // without a positive signal that the daily rebuild succeeded.
+        if let Some(ref u) = fresh_universe {
+            let source = if _needs_persist {
+                "rkyv_cache"
+            } else {
+                "fresh_csv_build"
+            };
+            fast_notifier.notify(NotificationEvent::InstrumentBuildSuccess {
+                source: source.to_string(),
+                derivative_count: u.derivative_contracts.len(),
+                underlying_count: u.underlyings.len(),
+            });
+        }
+
         // --- WebSocket pool create (channel only, NOT spawned yet) ---
         let (pool_receiver, ws_pool_ready) = match create_websocket_pool(
             &token_handle,
@@ -1717,6 +1734,25 @@ async fn main() -> Result<()> {
     // To avoid DOUBLE persistence on FreshBuild, only persist if CachedPlan.
     let (subscription_plan, slow_boot_universe, needs_instrument_persist) =
         load_instruments(&config, is_trading, trading_calendar.as_ref()).await;
+
+    // Audit finding #6 (2026-04-24): emit InstrumentBuildSuccess when
+    // instruments load successfully on the standard-boot path. Mirrors
+    // the fast-boot emission above. Before this, only failure produced
+    // a Telegram — operators had no positive "instruments rebuilt OK"
+    // signal.
+    if let Some(ref u) = slow_boot_universe {
+        let source = if needs_instrument_persist {
+            "rkyv_cache"
+        } else {
+            "fresh_csv_build"
+        };
+        notifier.notify(NotificationEvent::InstrumentBuildSuccess {
+            source: source.to_string(),
+            derivative_count: u.derivative_contracts.len(),
+            underlying_count: u.underlyings.len(),
+        });
+    }
+
     // Only persist for CachedPlan (not yet persisted). FreshBuild already
     // persisted inside load_or_build_instruments — double-write creates
     // duplicate rows in the same timestamp second.
