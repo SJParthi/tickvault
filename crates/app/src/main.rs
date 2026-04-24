@@ -3501,13 +3501,32 @@ async fn main() -> Result<()> {
                         order_update = oms,
                         "PROOF: market-open streaming confirmation fired @ 09:15:30 IST"
                     );
-                    heartbeat_notifier.notify(NotificationEvent::MarketOpenStreamingConfirmation {
-                        main_feed_active: main_active,
-                        main_feed_total: tickvault_common::constants::MAX_WEBSOCKET_CONNECTIONS,
-                        depth_20_active: d20,
-                        depth_200_active: d200,
-                        order_update_active: oms,
-                    });
+                    // Audit finding #8 (2026-04-24): when main feed is 0 at the
+                    // 09:15:30 heartbeat, this is NOT a positive "streaming live"
+                    // signal — it's a catastrophic missed market open. Route to
+                    // the High-severity Failed variant so the operator pages,
+                    // not to the Info-severity Confirmation that reads confusingly
+                    // as "Streaming live / Main feed: 0/5".
+                    if main_active == 0 {
+                        heartbeat_notifier.notify(NotificationEvent::MarketOpenStreamingFailed {
+                            main_feed_active: main_active,
+                            main_feed_total: tickvault_common::constants::MAX_WEBSOCKET_CONNECTIONS,
+                            depth_20_active: d20,
+                            depth_200_active: d200,
+                            order_update_active: oms,
+                        });
+                    } else {
+                        heartbeat_notifier.notify(
+                            NotificationEvent::MarketOpenStreamingConfirmation {
+                                main_feed_active: main_active,
+                                main_feed_total:
+                                    tickvault_common::constants::MAX_WEBSOCKET_CONNECTIONS,
+                                depth_20_active: d20,
+                                depth_200_active: d200,
+                                order_update_active: oms,
+                            },
+                        );
+                    }
                 });
             }
 
