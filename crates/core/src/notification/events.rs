@@ -1822,6 +1822,20 @@ mod tests {
     }
 
     #[test]
+    fn test_depth_rebalance_levels_action_line() {
+        // The action line explicitly distinguishes "20-level only" from
+        // "20-level + 200-level" so the operator knows the swap scope
+        // without reading the full message body.
+        let twenty = DepthRebalanceLevels::TwentyOnly.action_line();
+        assert!(twenty.contains("20-level unsub old"));
+        assert!(twenty.contains("no 200-level for this underlying"));
+
+        let both = DepthRebalanceLevels::TwentyAndTwoHundred.action_line();
+        assert!(both.contains("20-level + 200-level unsub old"));
+        assert!(!both.contains("no 200-level"));
+    }
+
+    #[test]
     fn test_auth_failed_still_critical() {
         // Final / permanent failure still fires Critical — that's the whole
         // point of splitting the variants. If this flips to Low by accident,
