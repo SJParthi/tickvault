@@ -2794,6 +2794,31 @@ async fn main() -> Result<()> {
                             continue;
                         };
 
+                        // Q6 (2026-04-24): skip deferred spawn outside market
+                        // hours. Deferred mode (sid=None, "-deferred" label)
+                        // waits for the 09:13 IST dispatcher to provide the
+                        // real ATM SID via InitialSubscribe200. Post-market
+                        // that dispatcher won't fire again today — spawning
+                        // the loop with SID=0 just burns 60 TCP connects
+                        // against Dhan before giving up (seen in 2026-04-23
+                        // 21:20-23:13 IST boot: 4 contracts × 60 attempts =
+                        // 240 useless connects). Rule 3 from
+                        // audit-findings-2026-04-17.md: background workers
+                        // must be market-hours aware.
+                        if depth200_sid.is_none()
+                            && !tickvault_common::market_hours::is_within_market_hours_ist()
+                        {
+                            warn!(
+                                underlying,
+                                option = opt_label,
+                                contract = %depth200_label,
+                                "200-level depth: skipping deferred spawn — off-market-hours boot, \
+                                 09:13 IST dispatcher won't run today. Boot during 09:00-15:30 IST to \
+                                 pick up depth-200 for this contract."
+                            );
+                            continue;
+                        }
+
                         let depth200_token = token_handle.clone();
                         let depth200_client_id = ws_client_id.clone();
                         let depth200_segment = tickvault_common::types::ExchangeSegment::NseFno;
@@ -6074,6 +6099,38 @@ mod tests {
             "main.rs HALT branch must call `build_pre_market_diagnostics` so \
              the Telegram message carries the /v2/profile and /v2/ip/getIP \
              responses alongside the failure reason (I12)."
+        );
+    }
+
+    /// Q6 regression (2026-04-24): the depth-200 spawn loop MUST skip
+    /// deferred-mode connections (sid=None, "-deferred" label) when off
+    /// market hours. Live 2026-04-23 boot at 21:20 IST spawned 4 depth-200
+    /// connections with SID=0 that each burned 60 TCP connects to Dhan
+    /// over ~2 hours before giving up — 240 useless handshakes in a
+    /// single post-market boot. The guard wires
+    /// `is_within_market_hours_ist()` at the per-contract spawn site
+    /// inside the `for opt_entry in [Some(atm_ce_entry), ...]` loop.
+    #[test]
+    fn test_depth_200_deferred_spawn_skipped_off_market_hours() {
+        let src = include_str!("main.rs");
+        assert!(
+            src.contains("tickvault_common::market_hours::is_within_market_hours_ist()"),
+            "main.rs MUST call is_within_market_hours_ist() somewhere — \
+             depth-200 deferred spawn relies on it"
+        );
+        // The specific guard literal — if this ever regresses, the
+        // post-market boot storm returns (Q6 / audit-findings Rule 3).
+        assert!(
+            src.contains("skipping deferred spawn"),
+            "main.rs MUST contain the 'skipping deferred spawn' warn-log \
+             inside the depth-200 spawn loop so off-market-hours boots \
+             don't burn 240 TCP connects against Dhan with SID=0."
+        );
+        assert!(
+            src.contains("if depth200_sid.is_none()")
+                && src.contains("!tickvault_common::market_hours::is_within_market_hours_ist()"),
+            "Fix A guard at the depth-200 spawn site must check \
+             `depth200_sid.is_none() && !is_within_market_hours_ist()`."
         );
     }
 }
