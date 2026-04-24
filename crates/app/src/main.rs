@@ -4280,20 +4280,41 @@ async fn main() -> Result<()> {
     // Boot duration check — alert if boot exceeded BOOT_TIMEOUT_SECS
     // -----------------------------------------------------------------------
     let boot_elapsed = boot_start.elapsed();
+    // 2026-04-24 fix: gate the boot deadline CRITICAL alert on market
+    // hours. Post-market boots are legitimately slower because index
+    // LTPs never arrive (Dhan stops streaming at 15:30 IST), so the
+    // 09:00 IST 120s budget is the wrong yardstick for a 19:00 IST
+    // operator-test boot. The 2026-04-17 audit already documented this
+    // (Option C v3 was supposed to fix it but only addressed the LTP
+    // wait, not the deadline alert itself). Outside market hours we
+    // log INFO + emit a metric but do NOT page the operator. Ratchet:
+    // crates/app/tests/post_market_pool_halt_guard.rs.
     if boot_elapsed.as_secs() > tickvault_common::constants::BOOT_TIMEOUT_SECS {
-        error!(
-            elapsed_secs = boot_elapsed.as_secs(),
-            timeout_secs = tickvault_common::constants::BOOT_TIMEOUT_SECS,
-            "BOOT TIMEOUT EXCEEDED"
-        );
-        notifier.notify(NotificationEvent::BootDeadlineMissed {
-            deadline_secs: tickvault_common::constants::BOOT_TIMEOUT_SECS,
-            step: format!(
-                "boot completed in {}s (over {}s limit)",
-                boot_elapsed.as_secs(),
+        let in_market_hours = tickvault_common::market_hours::is_within_market_hours_ist();
+        if in_market_hours {
+            error!(
+                elapsed_secs = boot_elapsed.as_secs(),
+                timeout_secs = tickvault_common::constants::BOOT_TIMEOUT_SECS,
+                "BOOT TIMEOUT EXCEEDED"
+            );
+            notifier.notify(NotificationEvent::BootDeadlineMissed {
+                deadline_secs: tickvault_common::constants::BOOT_TIMEOUT_SECS,
+                step: format!(
+                    "boot completed in {}s (over {}s limit)",
+                    boot_elapsed.as_secs(),
+                    tickvault_common::constants::BOOT_TIMEOUT_SECS,
+                ),
+            });
+        } else {
+            info!(
+                elapsed_secs = boot_elapsed.as_secs(),
+                timeout_secs = tickvault_common::constants::BOOT_TIMEOUT_SECS,
+                "boot exceeded {}s budget but outside market hours \
+                 (09:00-15:30 IST) — suppressed CRITICAL alert (Dhan idle, \
+                 LTP-dependent boot steps legitimately slower post-market)",
                 tickvault_common::constants::BOOT_TIMEOUT_SECS,
-            ),
-        });
+            );
+        }
     } else {
         info!(
             elapsed_ms = boot_elapsed.as_millis() as u64,
@@ -4768,17 +4789,37 @@ fn spawn_pool_watchdog_task(
 
                     let verdict = pool.poll_watchdog();
                     use tickvault_core::websocket::pool_watchdog::WatchdogVerdict;
+                    // 2026-04-24 fix: gate Degraded/Halt side-effects on
+                    // market hours. Outside [09:00, 15:30) IST Dhan stops
+                    // streaming and every connection legitimately goes
+                    // silent — firing Telegram + std::process::exit(2)
+                    // post-market causes false-alarm pages and a
+                    // supervisor-restart loop. The inner gate in
+                    // connection_pool.rs::poll_watchdog only suppresses
+                    // the inner log; the outer notifier + process exit
+                    // need their own gate. Ratchet:
+                    // crates/app/tests/post_market_pool_halt_guard.rs.
+                    let in_market_hours =
+                        tickvault_common::market_hours::is_within_market_hours_ist();
                     match verdict {
                         WatchdogVerdict::Degraded { down_for } => {
-                            error!(
-                                down_for_secs = down_for.as_secs(),
-                                "S4-T1a CRITICAL: pool watchdog Degraded verdict — \
-                                 all main-feed WebSocket connections down >= 60s."
-                            );
                             metrics::counter!("tv_pool_degraded_alerts_total").increment(1);
-                            notifier.notify(NotificationEvent::WebSocketPoolDegraded {
-                                down_secs: down_for.as_secs(),
-                            });
+                            if in_market_hours {
+                                error!(
+                                    down_for_secs = down_for.as_secs(),
+                                    "S4-T1a CRITICAL: pool watchdog Degraded verdict — \
+                                     all main-feed WebSocket connections down >= 60s."
+                                );
+                                notifier.notify(NotificationEvent::WebSocketPoolDegraded {
+                                    down_secs: down_for.as_secs(),
+                                });
+                            } else {
+                                info!(
+                                    down_for_secs = down_for.as_secs(),
+                                    "S4-T1a: pool Degraded verdict outside market hours \
+                                     (09:00-15:30 IST) — Dhan idle, no Telegram, no exit"
+                                );
+                            }
                         }
                         WatchdogVerdict::Recovered { was_down_for } => {
                             info!(
@@ -4786,24 +4827,38 @@ fn spawn_pool_watchdog_task(
                                 "S4-T1a: pool watchdog Recovered verdict — pool back online"
                             );
                             metrics::counter!("tv_pool_recoveries_total").increment(1);
-                            notifier.notify(NotificationEvent::WebSocketPoolRecovered {
-                                was_down_secs: was_down_for.as_secs(),
-                            });
+                            // Recovery is informational; only Telegram-page the
+                            // operator if the original Degraded fired (i.e. we
+                            // were inside market hours when the down-cycle hit).
+                            if in_market_hours {
+                                notifier.notify(NotificationEvent::WebSocketPoolRecovered {
+                                    was_down_secs: was_down_for.as_secs(),
+                                });
+                            }
                         }
                         WatchdogVerdict::Halt { down_for } => {
-                            error!(
-                                down_for_secs = down_for.as_secs(),
-                                "S4-T1a FATAL: pool watchdog fired Halt verdict. \
-                                 Exiting process with status 2 so the supervisor restarts us. \
-                                 All main-feed WebSocket connections have been down for >300s."
-                            );
                             metrics::counter!("tv_pool_self_halts_total").increment(1);
-                            notifier.notify(NotificationEvent::WebSocketPoolHalt {
-                                down_secs: down_for.as_secs(),
-                            });
-                            // Give notifications + metrics flush a moment.
-                            tokio::time::sleep(std::time::Duration::from_secs(2)).await; // APPROVED: pre-existing literal, session-7 tech debt tracked for cleanup
-                            std::process::exit(2);
+                            if in_market_hours {
+                                error!(
+                                    down_for_secs = down_for.as_secs(),
+                                    "S4-T1a FATAL: pool watchdog fired Halt verdict. \
+                                     Exiting process with status 2 so the supervisor restarts us. \
+                                     All main-feed WebSocket connections have been down for >300s."
+                                );
+                                notifier.notify(NotificationEvent::WebSocketPoolHalt {
+                                    down_secs: down_for.as_secs(),
+                                });
+                                // Give notifications + metrics flush a moment.
+                                tokio::time::sleep(std::time::Duration::from_secs(2)).await; // APPROVED: pre-existing literal, session-7 tech debt tracked for cleanup
+                                std::process::exit(2);
+                            } else {
+                                info!(
+                                    down_for_secs = down_for.as_secs(),
+                                    "S4-T1a: pool Halt verdict outside market hours \
+                                     (09:00-15:30 IST) — Dhan idle, suppressing Telegram \
+                                     and process exit. Watchdog will reset on next market open."
+                                );
+                            }
                         }
                         WatchdogVerdict::Degrading { .. } | WatchdogVerdict::Healthy => {
                             // No alert; watchdog's internal state machine
