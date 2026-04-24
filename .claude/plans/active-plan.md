@@ -150,6 +150,46 @@ manual every-six-months verification.
 4. `crates/app/src/main.rs` — demote skip logs, wire spawn-index stagger
 5. `crates/app/tests/mid_session_boot_guard.rs` — new integration test
 
+## Always-on invariant (Parthiban 2026-04-24, latest directive)
+
+> "Hereafter we will always subscribe 25k instruments across 5 connections of
+> live market feed AND depth 20 AND depth 200 AND order update websocket.
+> Everything will be always connected irrespective of every extreme worst case
+> because I need to know the real discussion and functionality of all these.
+> Only then will we know whether these are working precisely or not."
+
+**Invariant:** Every boot path (W1–W6) ends with this steady state within the
+operator's tolerance window (target: 3 min after boot during market hours):
+
+| Feed | Target | Observability |
+|---|---|---|
+| Main feed | 25,000 instruments across 5 WS connections | `tv_websocket_connections_active == 5` AND `tv_instruments_subscribed_total == 25000` |
+| Depth-20 | 4 underlyings (NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY), ATM ± 24 each = up to 49 × 4 = 196 | `tv_depth_20_connections_active == 4` |
+| Depth-200 | 4 contracts (NIFTY CE/PE, BANKNIFTY CE/PE), ATM strike | `tv_depth_200_connections_active == 4` |
+| Order-update | 1 WS connection (JSON, MsgCode 42) | `tv_order_update_connected == 1` |
+
+**Gap today:** mid-session fresh-clone boot at 12:07 IST ended with 4/4 depth-200
+DISCONNECTED at 12:39 IST (60-attempt cap exhausted). Invariant violated.
+
+**Follow-up work to enforce this invariant (next plan):**
+
+1. **Variants matrix auto-run on boot** when depth-200 exhausts its attempt
+   budget. Today the handler emits Telegram `[HIGH] Depth 200-level DISCONNECTED`
+   and stops. Follow-up: on `ReconnectionExhausted`, launch the 8-variant matrix
+   in-process (reusing the live TokenManager), pick the first variant that
+   produces frames, and flip `depth_connection.rs` to that variant's config
+   live via a feature-flag / config-reload mechanism.
+2. **Connection-count health alert**: Alertmanager rule that fires if
+   `(main_feed_active != 5 OR depth_20_active != 4 OR depth_200_active != 4 OR
+   order_update_active != 1)` persists for > 5 minutes during market hours.
+3. **`test_always_25k_invariant_mid_session_boot`** integration test that
+   spins up mock Dhan server, boots the app mid-session, waits 3 min, asserts
+   the 4 counters at their targets. Runs in CI with GitHub Actions market-hours
+   simulation.
+4. **Operator dashboard** (Grafana): a single "Is everything connected?"
+   top-of-page panel with green/red per feed. Red = open the runbook at
+   `docs/runbooks/boot-scenarios.md` for that feed's recovery procedure.
+
 ## Queued follow-up: extreme-worst-case boot scenarios (Parthiban 2026-04-24)
 
 **Directive:** "as per the design before market hour fresh or new also it
