@@ -74,6 +74,61 @@ pub struct FastCacheResult {
 }
 
 // ---------------------------------------------------------------------------
+// Async wrappers (2026-04-24)
+// ---------------------------------------------------------------------------
+//
+// Defense-in-depth: the sync `load_token_cache` / `save_token_cache` below
+// call `std::fs::read_to_string` and `std::fs::write`. When invoked from an
+// async task, these can pin a tokio worker thread for the duration of the
+// disk I/O. Under sustained disk pressure (e.g. Docker volume thrashing at
+// boot + QuestDB ILP flush spike), a blocked worker can delay the 5s
+// activity-watchdog poll on a WebSocket connection enough to fire a false
+// "50s silence" reconnect.
+//
+// The async wrappers use `tokio::task::spawn_blocking`, which runs the
+// sync call on the dedicated blocking-thread pool (up to 512 threads by
+// default) instead of a tokio worker. New async call sites SHOULD prefer
+// these wrappers. Existing sync call sites (tests, one-shot boot paths)
+// are safe to leave as-is.
+
+/// Async wrapper for [`save_token_cache`]. Runs the blocking file write on
+/// the spawn_blocking pool so it never starves a tokio worker.
+///
+/// Pre-serializes the `TokenCacheEntry` on the calling task (cheap, no I/O)
+/// and passes the raw JSON bytes to the blocking thread. Avoids any need
+/// for `TokenState: Clone` — it intentionally isn't, to discourage casual
+/// duplication of the inner `SecretString`.
+// TEST-EXEMPT: spawn_blocking wrapper around save_token_cache — inner sync fn covered by test_save_and_load_roundtrip
+pub async fn save_token_cache_async(token: &TokenState, client_id: &SecretString) {
+    let entry = TokenCacheEntry {
+        access_token: token.access_token().expose_secret().to_string(),
+        expires_at_epoch_secs: token.expires_at().timestamp(),
+        issued_at_epoch_secs: token.issued_at().timestamp(),
+        client_id_hash: hash_client_id(client_id),
+        client_id: Some(client_id.expose_secret().to_string()),
+    };
+    let json = match serde_json::to_string(&entry) {
+        Ok(j) => Zeroizing::new(j),
+        Err(err) => {
+            warn!(?err, "failed to serialize token cache");
+            return;
+        }
+    };
+    let _ = tokio::task::spawn_blocking(move || write_cache_json_to_disk(&json)).await;
+}
+
+/// Async wrapper for [`load_token_cache`]. Runs the blocking file read on
+/// the spawn_blocking pool.
+// TEST-EXEMPT: spawn_blocking wrapper around load_token_cache — inner sync fn covered by test_save_and_load_roundtrip + test_load_token_cache_*
+pub async fn load_token_cache_async(client_id: &SecretString) -> Option<TokenState> {
+    let client_id_cloned: SecretString = SecretString::from(client_id.expose_secret().to_string());
+    tokio::task::spawn_blocking(move || load_token_cache(&client_id_cloned))
+        .await
+        .ok()
+        .flatten()
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -81,6 +136,10 @@ pub struct FastCacheResult {
 ///
 /// Called after every successful `acquire_token()` and `try_renew_token()`.
 /// Writes atomically (temp file + rename) with 0600 permissions.
+///
+/// SYNC — blocks the current thread during disk I/O. When invoking from an
+/// async context, prefer [`save_token_cache_async`] which runs this on the
+/// spawn_blocking pool.
 pub fn save_token_cache(token: &TokenState, client_id: &SecretString) {
     let entry = TokenCacheEntry {
         access_token: token.access_token().expose_secret().to_string(),
@@ -98,6 +157,17 @@ pub fn save_token_cache(token: &TokenState, client_id: &SecretString) {
         }
     };
 
+    write_cache_json_to_disk(&json);
+}
+
+/// Writes a pre-serialized JSON cache payload atomically (temp file +
+/// rename) with 0600 permissions. Extracted so the async wrapper can
+/// serialize on the calling task and hand only the final bytes to
+/// `spawn_blocking`, keeping the blocking-thread window to pure I/O.
+// TEST-EXEMPT: private helper exercised end-to-end by test_save_and_load_roundtrip
+// via save_token_cache. Extracting a separate unit test would duplicate that
+// coverage without exercising a distinct code path.
+fn write_cache_json_to_disk(json: &str) {
     let tmp_path = format!("{TOKEN_CACHE_FILE_PATH}.tmp");
 
     // Ensure parent directory exists (data/cache/ may not exist on first run).

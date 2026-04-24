@@ -163,7 +163,9 @@ impl TokenManager {
         // This skips the Dhan HTTP auth call (~500ms-2s), saving significant
         // boot time on crash recovery. SSM credentials are still fetched above
         // (needed for the renewal loop).
-        if let Some(cached_token) = token_cache::load_token_cache(&manager.credentials.client_id) {
+        if let Some(cached_token) =
+            token_cache::load_token_cache_async(&manager.credentials.client_id).await
+        {
             manager.token.store(Arc::new(Some(cached_token)));
             info!(
                 expires_at = %manager.current_expiry_display(),
@@ -656,7 +658,7 @@ impl TokenManager {
         self.token.store(Arc::new(Some(token_state)));
 
         // Cache for fast restart on crash recovery
-        self.save_current_token_to_cache();
+        self.save_current_token_to_cache().await;
 
         Ok(())
     }
@@ -729,7 +731,7 @@ impl TokenManager {
         self.token.store(Arc::new(Some(new_token_state)));
 
         // Update cache for fast restart
-        self.save_current_token_to_cache();
+        self.save_current_token_to_cache().await;
 
         Ok(())
     }
@@ -889,10 +891,16 @@ impl TokenManager {
     }
 
     /// Saves the current token to the disk cache for fast crash recovery.
-    fn save_current_token_to_cache(&self) {
+    ///
+    /// Uses [`token_cache::save_token_cache_async`] so the disk write runs
+    /// on the spawn_blocking pool and never pins a tokio worker thread —
+    /// important because this is called from `generate_token` and
+    /// `try_renew_token`, both of which run concurrently with live
+    /// WebSocket read loops on the same runtime.
+    async fn save_current_token_to_cache(&self) {
         let guard = self.token.load();
         if let Some(token_state) = guard.as_ref().as_ref() {
-            token_cache::save_token_cache(token_state, &self.credentials.client_id);
+            token_cache::save_token_cache_async(token_state, &self.credentials.client_id).await;
         }
     }
 
