@@ -4959,14 +4959,34 @@ fn spawn_historical_candle_fetch(
         )
         .await;
 
-        if summary.instruments_failed > 0 {
+        // 2026-04-24 audit finding #1: do NOT fire "Historical candles OK"
+        // when the degenerate case `instruments_fetched == 0 &&
+        // total_candles == 0` occurs. Without this guard, a Dhan outage
+        // that returns 200-with-empty-payload, an empty universe on a
+        // mid-boot race, or a disabled-scope misconfiguration all produce
+        // a green Telegram ("Fetched: 0 / Candles: 0") — exact same bug
+        // class as the cross-match false-OK fix in PR #341. The downstream
+        // cross-verify then trusts that signal and silently passes too.
+        //
+        // Routes to HistoricalFetchFailed with a synthesized failure_reasons
+        // entry so the operator gets a clear diagnostic in Telegram.
+        let zero_fetched_degenerate =
+            summary.instruments_fetched == 0 && summary.total_candles == 0;
+        if summary.instruments_failed > 0 || zero_fetched_degenerate {
+            let mut failure_reasons = summary.failure_reasons.clone();
+            if zero_fetched_degenerate && summary.instruments_failed == 0 {
+                failure_reasons.insert(
+                    "zero_fetched_zero_candles".to_string(),
+                    summary.instruments_skipped.max(1),
+                );
+            }
             bg_notifier.notify(NotificationEvent::HistoricalFetchFailed {
                 instruments_fetched: summary.instruments_fetched,
                 instruments_failed: summary.instruments_failed,
                 total_candles: summary.total_candles,
                 persist_failures: summary.persist_failures,
                 failed_instruments: summary.failed_instruments.clone(),
-                failure_reasons: summary.failure_reasons.clone(),
+                failure_reasons,
             });
         } else {
             bg_notifier.notify(NotificationEvent::HistoricalFetchComplete {
