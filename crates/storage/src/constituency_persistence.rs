@@ -53,13 +53,23 @@ const CONSTITUENCY_PERSIST_BACKOFF_MULTIPLIER: u64 = 2;
 
 /// Flush batch size for constituency ILP persistence.
 ///
+/// With HTTP ILP (`build_http_ilp_conf_string`) each flush is a single
+/// stateless transactional POST — the root-cause fix for the
+/// `Broken pipe (os error 32)` failure mode observed in prod on
+/// 2026-04-23T15:50:19Z. The batch size is a defensive secondary control
+/// bounding POST body size and protecting against QuestDB WAL backpressure
+/// on fresh Docker boots.
+///
 /// History:
 /// - Initial value: 4000+ (flushed entire dataset in one buffer).
 /// - First reduction: 500 (still failing on 2026-04-23 post-market boot with
-///   `Broken pipe (os error 32)` on all 3 retries).
+///   `Broken pipe (os error 32)` on all 3 retries — TCP ILP socket rotation).
+/// - Transport fix: TCP ILP → HTTP ILP via `build_http_ilp_conf_string` —
+///   eliminates the broken-pipe failure mode at the transport layer.
 /// - Q7 (2026-04-24): reduced to 100 to match the `MOVERS_FLUSH_BATCH_SIZE`
 ///   pattern which has NEVER shown broken-pipe failures. Smaller batches
-///   survive QuestDB WAL backpressure on fresh Docker boots.
+///   survive QuestDB WAL backpressure on fresh Docker boots even with
+///   HTTP ILP.
 const CONSTITUENCY_FLUSH_BATCH_SIZE: usize = 100;
 
 // ---------------------------------------------------------------------------
@@ -79,9 +89,29 @@ fn build_dedup_sql(table_name: &str, dedup_key: &str) -> String {
     )
 }
 
-/// Builds the ILP TCP connection string from host and port.
-fn build_ilp_conf_string(host: &str, ilp_port: u16) -> String {
-    format!("tcp::addr={}:{};", host, ilp_port)
+/// Builds the ILP **HTTP** connection string from host and HTTP port.
+///
+/// Constituency persistence is a one-shot bursty cold-path writer: it runs
+/// once at boot with ~1,750 rows and then stays idle. TCP ILP (`tcp::addr=`)
+/// holds a persistent socket that QuestDB's `line.tcp` writer rotates when
+/// idle, which caused `Broken pipe (os error 32)` on the first flush and
+/// every retry (prod logs, 2026-04-23T15:50:19Z). HTTP ILP is stateless —
+/// each flush is a single transactional POST to `/write` — so there is no
+/// persistent socket that can break between batches.
+///
+/// This is the same architectural fix applied to the historical candle
+/// writer (see `build_historical_ilp_conf_string` in `candle_persistence.rs`).
+///
+/// Parameters:
+/// - `auto_flush=off` — we control batching explicitly via
+///   `CONSTITUENCY_FLUSH_BATCH_SIZE`.
+/// - `retry_timeout=30000` — HTTP sender retries transient 5xx / network
+///   errors for up to 30s internally, so callers rarely see transient failures.
+fn build_http_ilp_conf_string(host: &str, http_port: u16) -> String {
+    format!(
+        "http::addr={}:{};auto_flush=off;retry_timeout=30000;",
+        host, http_port
+    )
 }
 
 /// Resolves the security_id for a constituent from the FnoUniverse.
@@ -243,7 +273,9 @@ fn persist_constituency_inner(
     questdb_config: &QuestDbConfig,
     fno_universe: Option<&FnoUniverse>,
 ) -> Result<usize> {
-    let conf_string = build_ilp_conf_string(&questdb_config.host, questdb_config.ilp_port);
+    // HTTP ILP — stateless transactional POSTs, no persistent socket to break.
+    // See `build_http_ilp_conf_string` for the rationale.
+    let conf_string = build_http_ilp_conf_string(&questdb_config.host, questdb_config.http_port);
     let mut sender = Sender::from_conf(&conf_string)
         .context("failed to connect to QuestDB ILP for constituency")?;
     let mut buffer = sender.new_buffer();
@@ -405,18 +437,65 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // build_ilp_conf_string
+    // build_http_ilp_conf_string — HTTP ILP (broken-pipe fix)
+    //
+    // Constituency persistence MUST use HTTP ILP, not TCP ILP. TCP ILP caused
+    // "Broken pipe after every flush" on the one-shot boot-time writer
+    // because QuestDB rotates idle line.tcp sockets. HTTP ILP is stateless.
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_build_ilp_conf_string_docker() {
-        let conf = build_ilp_conf_string("tv-questdb", 9009);
-        assert_eq!(conf, "tcp::addr=tv-questdb:9009;");
+    fn test_build_http_ilp_conf_string_uses_http_not_tcp() {
+        let conf = build_http_ilp_conf_string("tv-questdb", 9000);
+        assert!(
+            conf.starts_with("http::addr="),
+            "constituency writer MUST use http:: transport, got: {conf}"
+        );
+        assert!(
+            !conf.contains("tcp::addr="),
+            "constituency writer MUST NOT use tcp:: transport, got: {conf}"
+        );
     }
 
     #[test]
-    fn test_build_ilp_conf_string_ends_with_semicolon() {
-        let conf = build_ilp_conf_string("host", 1234);
+    fn test_build_http_ilp_conf_string_docker_defaults() {
+        let conf = build_http_ilp_conf_string("tv-questdb", 9000);
+        assert_eq!(
+            conf, "http::addr=tv-questdb:9000;auto_flush=off;retry_timeout=30000;",
+            "constituency ILP conf string format regression"
+        );
+    }
+
+    #[test]
+    fn test_build_http_ilp_conf_string_disables_auto_flush() {
+        let conf = build_http_ilp_conf_string("host", 9000);
+        assert!(
+            conf.contains("auto_flush=off"),
+            "constituency writer must disable auto_flush, got: {conf}"
+        );
+    }
+
+    #[test]
+    fn test_build_http_ilp_conf_string_sets_retry_timeout() {
+        let conf = build_http_ilp_conf_string("host", 9000);
+        assert!(
+            conf.contains("retry_timeout=30000"),
+            "constituency writer must set retry_timeout=30000ms, got: {conf}"
+        );
+    }
+
+    #[test]
+    fn test_build_http_ilp_conf_string_custom_port() {
+        let conf = build_http_ilp_conf_string("10.0.0.5", 19000);
+        assert!(
+            conf.starts_with("http::addr=10.0.0.5:19000;"),
+            "host:port must reflect config, got: {conf}"
+        );
+    }
+
+    #[test]
+    fn test_build_http_ilp_conf_string_ends_with_semicolon() {
+        let conf = build_http_ilp_conf_string("host", 1234);
         assert!(conf.ends_with(';'));
     }
 
@@ -845,64 +924,13 @@ mod tests {
         ensure_constituency_table(&config).await;
     }
 
-    // -----------------------------------------------------------------------
-    // persist_constituency_inner — with TCP drain (ILP write paths)
-    // -----------------------------------------------------------------------
-
-    fn spawn_tcp_drain_server() -> u16 {
-        use std::io::Read as _;
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        std::thread::spawn(move || {
-            if let Ok((mut stream, _)) = listener.accept() {
-                let mut buf = [0u8; 65536];
-                loop {
-                    match stream.read(&mut buf) {
-                        Ok(0) | Err(_) => break,
-                        Ok(_) => {}
-                    }
-                }
-            }
-        });
-        port
-    }
-
-    #[test]
-    fn test_persist_constituency_inner_with_data() {
-        use std::collections::HashMap;
-        use tickvault_common::instrument_types::{ConstituencyBuildMetadata, IndexConstituent};
-
-        let port = spawn_tcp_drain_server();
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            ilp_port: port,
-            http_port: port,
-            pg_port: port,
-        };
-
-        let today = chrono::Utc::now().date_naive();
-        let mut index_to_constituents = HashMap::new();
-        index_to_constituents.insert(
-            "NIFTY 50".to_string(),
-            vec![IndexConstituent {
-                index_name: "NIFTY 50".to_string(),
-                symbol: "RELIANCE".to_string(),
-                isin: "INE002A01018".to_string(),
-                weight: 10.5,
-                sector: "Energy".to_string(),
-                last_updated: today,
-            }],
-        );
-
-        let map = IndexConstituencyMap {
-            index_to_constituents,
-            stock_to_indices: HashMap::new(),
-            build_metadata: ConstituencyBuildMetadata::default(),
-        };
-
-        let result = persist_constituency(&map, &config, None);
-        assert!(result.is_ok());
-    }
+    // Note: a `persist_constituency_inner` write-path smoke test against an
+    // in-process drain server is not feasible here — questdb-rs HTTP
+    // `from_conf` validates the endpoint with a real `/ping` handshake
+    // that a simple TCP drain cannot satisfy (same constraint documented
+    // in `candle_persistence.rs::new_http`). The best-effort outer
+    // `persist_constituency` is covered by the unreachable-host tests
+    // below, which assert Ok is always returned on failure.
 
     // -----------------------------------------------------------------------
     // Coverage gap-fill: warn! field evaluation with tracing subscriber
@@ -984,11 +1012,13 @@ mod tests {
     }
 
     #[test]
-    fn test_build_ilp_conf_string_format() {
-        let conf = build_ilp_conf_string("myhost", 9009);
-        assert!(conf.starts_with("tcp::addr="));
+    fn test_build_http_ilp_conf_string_format() {
+        let conf = build_http_ilp_conf_string("myhost", 9000);
+        assert!(conf.starts_with("http::addr="));
         assert!(conf.ends_with(';'));
-        assert!(conf.contains("myhost:9009"));
+        assert!(conf.contains("myhost:9000"));
+        assert!(conf.contains("auto_flush=off"));
+        assert!(conf.contains("retry_timeout=30000"));
     }
 
     #[test]
@@ -1108,5 +1138,106 @@ mod tests {
             build_metadata: ConstituencyBuildMetadata::default(),
         };
         assert_eq!(count_total_constituents(&map), 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression guards for the TCP-ILP → HTTP-ILP broken-pipe fix.
+    //
+    // Prod log evidence: 2026-04-23T15:50:19Z — "constituency persistence
+    // failed after 3 attempts: Could not flush buffer: Broken pipe (os error 32)".
+    // Root cause: `persist_constituency_inner` used `tcp::addr=` which holds a
+    // persistent socket that QuestDB's `line.tcp` writer rotates on idle.
+    // Fix: switch to `http::addr=` (stateless POST per flush).
+    //
+    // These tests source-scan the current file so that regressing back to TCP
+    // ILP (or dropping `auto_flush=off` / `retry_timeout=30000`) fails the
+    // build at `cargo test` time — before the bug ever reaches prod again.
+    // -----------------------------------------------------------------------
+
+    /// Production source MUST NOT build a `tcp::addr=` conf string for the
+    /// constituency writer. `build_http_ilp_conf_string` is the only allowed
+    /// transport builder.
+    #[test]
+    fn test_regression_source_does_not_build_tcp_ilp_for_constituency() {
+        let src = include_str!("constituency_persistence.rs");
+        // Filter out comments and test-only string literals so we only inspect
+        // production code. We do this by deleting the test module's region.
+        // Delimit at the tests module header, not the first `#[cfg(test)]`
+        // (which may appear earlier on a test-only helper like
+        // `count_total_constituents`).
+        let prod_region_end = src.find("mod tests {").expect("tests module must exist");
+        let prod_src = &src[..prod_region_end];
+        // Match the STRING-LITERAL form produced by `format!("tcp::addr=...")`
+        // so that informative doc comments (`TCP ILP (\`tcp::addr=\`)`) don't
+        // trip the guard. Any real TCP-ILP conf string in production code
+        // MUST originate from a `"tcp::addr=` string literal.
+        assert!(
+            !prod_src.contains("\"tcp::addr="),
+            "production constituency code MUST NOT build a \"tcp::addr=\" \
+             ILP conf string — see prod log 2026-04-23T15:50:19Z broken-pipe \
+             regression. Use build_http_ilp_conf_string() instead."
+        );
+    }
+
+    /// Production source MUST call `build_http_ilp_conf_string` in
+    /// `persist_constituency_inner`. Locks in the architectural fix.
+    #[test]
+    fn test_regression_persist_inner_uses_http_ilp_builder() {
+        let src = include_str!("constituency_persistence.rs");
+        // Delimit at the tests module header, not the first `#[cfg(test)]`
+        // (which may appear earlier on a test-only helper like
+        // `count_total_constituents`).
+        let prod_region_end = src.find("mod tests {").expect("tests module must exist");
+        let prod_src = &src[..prod_region_end];
+        assert!(
+            prod_src.contains(
+                "build_http_ilp_conf_string(&questdb_config.host, questdb_config.http_port)"
+            ),
+            "persist_constituency_inner MUST call build_http_ilp_conf_string \
+             with questdb_config.http_port (not ilp_port). Broken-pipe fix guard."
+        );
+    }
+
+    /// HTTP ILP must retain `auto_flush=off` so batching stays deterministic.
+    #[test]
+    fn test_regression_http_ilp_keeps_auto_flush_off() {
+        let conf = build_http_ilp_conf_string("host", 9000);
+        assert!(
+            conf.contains("auto_flush=off"),
+            "auto_flush=off is load-bearing — we batch via \
+             CONSTITUENCY_FLUSH_BATCH_SIZE; half-built batches must not auto-POST"
+        );
+    }
+
+    /// HTTP ILP must retain a bounded `retry_timeout` so transient 5xx doesn't
+    /// waste all 3 outer-retry attempts on the same request.
+    #[test]
+    fn test_regression_http_ilp_keeps_retry_timeout_30s() {
+        let conf = build_http_ilp_conf_string("host", 9000);
+        assert!(
+            conf.contains("retry_timeout=30000"),
+            "retry_timeout=30000 is load-bearing — questdb-rs HTTP sender \
+             absorbs transient 5xx internally so the outer 3-retry loop is \
+             reserved for hard failures"
+        );
+    }
+
+    /// The TCP-ILP helper from the old implementation MUST stay deleted. If a
+    /// future change adds it back, this guard fails the build — forcing a
+    /// conscious re-think instead of a silent regression.
+    #[test]
+    fn test_regression_tcp_ilp_builder_is_not_resurrected() {
+        let src = include_str!("constituency_persistence.rs");
+        // Delimit at the tests module header, not the first `#[cfg(test)]`
+        // (which may appear earlier on a test-only helper like
+        // `count_total_constituents`).
+        let prod_region_end = src.find("mod tests {").expect("tests module must exist");
+        let prod_src = &src[..prod_region_end];
+        assert!(
+            !prod_src.contains("fn build_ilp_conf_string"),
+            "fn build_ilp_conf_string (TCP ILP) was removed to prevent a \
+             broken-pipe regression. Re-adding it requires operator approval \
+             AND an updated architectural rationale comment."
+        );
     }
 }
