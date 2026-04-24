@@ -353,8 +353,33 @@ async fn connect_and_listen(
                             "order update received"
                         );
                         // Broadcast to subscribers (OMS, notification, etc.).
-                        // If no receivers, send returns Err — that's fine, just discard.
-                        let _ = order_sender.send(update);
+                        // 2026-04-24 audit finding #4: previously discarded the
+                        // SendError with "no receivers — that's fine". BUT if
+                        // the OMS subscriber task panics or drops its receiver
+                        // mid-session, filled-order updates are silently lost
+                        // (status stays Pending → reconciliation alert fires
+                        // ≥60s later — too slow + too indirect). Now we emit
+                        // an ERROR + increment a Prometheus counter so the
+                        // drop is observable in real time.
+                        //
+                        // `broadcast::Sender::send` returns Err only when there
+                        // are zero active receivers. During normal operation
+                        // at least one OMS task IS subscribed; zero receivers
+                        // means the subscriber task crashed or the channel
+                        // was torn down — both are real bugs worth paging.
+                        //
+                        // Zero-alloc hot path: the `broadcast::error::SendError(T)`
+                        // gives back the original `update` on failure, so we can
+                        // read order_no from `err.0` without cloning. The happy
+                        // path (success) does not touch err at all.
+                        if let Err(err) = order_sender.send(update) {
+                            metrics::counter!("tv_order_update_broadcast_drops_total").increment(1);
+                            error!(
+                                order_no = %err.0.order_no,
+                                "order update broadcast dropped — no active receivers \
+                                 (OMS subscriber likely crashed or channel torn down)"
+                            );
+                        }
                     }
                     Err(err) => {
                         // Not a valid order update — check if it's an auth error.
