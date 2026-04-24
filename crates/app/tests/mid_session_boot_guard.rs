@@ -140,3 +140,42 @@ fn test_depth_200_main_rs_increments_spawn_counter() {
          run_two_hundred_depth_connection."
     );
 }
+
+#[test]
+fn test_historical_fetch_guards_zero_fetched_zero_candles() {
+    // 2026-04-24 audit finding #1: HistoricalFetchComplete must NOT fire
+    // when `instruments_fetched == 0 && total_candles == 0`. Without this
+    // guard, a Dhan outage that returns 200-with-empty-payload, an empty
+    // universe on a mid-boot race, or a disabled-scope misconfiguration
+    // all produced a green Telegram "Historical candles OK / Fetched: 0 /
+    // Candles: 0" — same false-OK class as the 2026-04-24 15:47 IST
+    // cross-match bug fixed in PR #341.
+    let src = read_file("crates/app/src/main.rs");
+    assert!(
+        src.contains("zero_fetched_degenerate"),
+        "2026-04-24 regression: zero_fetched_degenerate guard missing from \
+         historical-fetch success/failure routing. Without it, fresh-boot \
+         against a Dhan outage produces a false-OK Telegram."
+    );
+    assert!(
+        src.contains("\"zero_fetched_zero_candles\".to_string()"),
+        "2026-04-24 regression: failure_reasons entry for the degenerate \
+         case must include a named reason so Telegram surfaces the actual \
+         diagnostic instead of an empty breakdown."
+    );
+    // Enforce the boolean composition — both conjuncts required. If the
+    // future maintainer removes the `total_candles == 0` conjunct, the
+    // guard regresses silently (any non-zero candle count would bypass).
+    assert!(
+        src.contains("summary.instruments_fetched == 0 && summary.total_candles == 0"),
+        "2026-04-24 regression: zero_fetched_degenerate must require BOTH \
+         instruments_fetched == 0 AND total_candles == 0. Dropping either \
+         conjunct reintroduces the false-OK class."
+    );
+    // Enforce the routing — degenerate case goes to Failed variant.
+    assert!(
+        src.contains("summary.instruments_failed > 0 || zero_fetched_degenerate"),
+        "2026-04-24 regression: degenerate case must route to \
+         HistoricalFetchFailed, not HistoricalFetchComplete."
+    );
+}
