@@ -386,13 +386,22 @@ fn escape_md(s: &str) -> String {
 }
 
 /// Atomic write: `{path}.tmp` → rename → `{path}`.
+///
+/// 2026-04-24 audit finding #7: previously `f.sync_all().ok()` silently
+/// discarded the flush-to-disk error. After a hard poweroff the rename
+/// could promote a partially-flushed file, and `errors.summary.md` is
+/// part of the zero-touch triage chain (see observability-architecture.md)
+/// so silent staleness matters. The sync error now propagates via `?` so
+/// the caller can retry on the next 60s tick instead of shipping a
+/// potentially-unflushed file to the rename step.
 fn atomic_write(path: &Path, contents: &str) -> Result<()> {
     let tmp = path.with_extension("md.tmp");
     {
         let mut f = fs::File::create(&tmp).with_context(|| format!("create {}", tmp.display()))?;
         f.write_all(contents.as_bytes())
             .with_context(|| format!("write {}", tmp.display()))?;
-        f.sync_all().ok();
+        f.sync_all()
+            .with_context(|| format!("sync_all {}", tmp.display()))?;
     }
     fs::rename(&tmp, path)
         .with_context(|| format!("rename {} -> {}", tmp.display(), path.display()))?;
