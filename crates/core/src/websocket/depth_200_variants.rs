@@ -32,11 +32,12 @@ use tokio_tungstenite::tungstenite::http::HeaderValue;
 use crate::websocket::types::WebSocketError;
 
 /// Consecutive `ResetWithoutClosingHandshake` count on a single variant
-/// before we rotate to the next. Chosen to be large enough that a transient
-/// network blip on the current variant does not cause spurious rotation,
-/// but small enough that all 8 variants can be exhausted inside the overall
-/// 60-attempt reconnect cap (8 × 5 = 40 attempts).
-pub const RESET_ROTATE_THRESHOLD: u64 = 5;
+/// before we rotate to the next. Chosen to be small enough that all 8
+/// variants can be exhausted well inside the overall 60-attempt reconnect
+/// cap (8 × 3 = 24 attempts, leaves 36 attempts of margin on the winning
+/// variant) AND fast enough that the operator sees convergence within
+/// ~3 minutes of boot rather than ~9 minutes.
+pub const RESET_ROTATE_THRESHOLD: u64 = 3;
 
 /// User-Agent string emitted by Dhan's Python SDK's underlying
 /// `websockets` library at the time of the 2026-04-23 verification.
@@ -496,12 +497,13 @@ mod tests {
     }
 
     #[test]
-    fn test_reset_rotate_threshold_is_five() {
-        // Ratchet — 2026-04-24 chose 5 so 8 variants × 5 resets = 40
-        // fits inside the 60-attempt overall reconnect cap with room to
-        // spare. If someone raises this without also raising
-        // DEPTH_RECONNECT_MAX_ATTEMPTS, we will exhaust the cap before
-        // trying all variants, defeating the rotation.
-        assert_eq!(RESET_ROTATE_THRESHOLD, 5);
+    fn test_reset_rotate_threshold_is_three() {
+        // Ratchet — 2026-04-24 chose 3 so 8 variants × 3 resets = 24
+        // fits well inside the 60-attempt overall reconnect cap AND the
+        // operator sees convergence within ~3 minutes of boot. If someone
+        // raises this without also raising DEPTH_RECONNECT_MAX_ATTEMPTS,
+        // we will exhaust the cap before trying all variants, defeating
+        // the rotation.
+        assert_eq!(RESET_ROTATE_THRESHOLD, 3);
     }
 }
