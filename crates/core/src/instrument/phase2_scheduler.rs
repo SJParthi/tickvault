@@ -60,7 +60,7 @@ use tickvault_common::types::FeedMode;
 /// close" per Parthiban's spec. If we wake up at 09:12:00 sharp we read the
 /// buffer BEFORE any 09:12-minute tick has landed — slot 4 is always empty,
 /// backtrack walks 09:11→09:10→... and typically finds nothing (stocks
-/// don't trade during 09:08-09:12 pre-open buffer), so every stock ends up
+/// don't trade during 09:00-09:12 pre-open buffer — widened 2026-04-24 Fix #1), so every stock ends up
 /// in `stocks_skipped_no_price`. This produced the live "Added 0 stock F&O"
 /// bug observed 2026-04-22 at 09:11 IST.
 ///
@@ -684,7 +684,7 @@ pub async fn run_phase2_scheduler(
                      Skipped no-expiry: {diag_skipped_no_expiry}. \
                      Sample: [{}]. \
                      Likely cause: pre-open snapshotter received no stock ticks during \
-                     09:08-09:12 IST window (check tv_phase2_snapshotter_ticks_buffered_total \
+                     09:00-09:12 IST window (check tv_phase2_snapshotter_ticks_buffered_total \
                      + tv_phase2_snapshotter_ticks_filtered_total).{fallback_tag}",
                     diag_sample_skipped.join(", ")
                 );
@@ -816,9 +816,10 @@ pub async fn run_phase2_scheduler(
 }
 
 /// For each subscribed stock, walk its pre-open closes from 09:12 down
-/// to 09:08 and pick the latest non-empty bucket as the reference price.
-/// This must mirror `PreOpenCloses::backtrack_latest` so PROMPT C sees
-/// the SAME price the ATM pick used.
+/// to 09:00 (widened 2026-04-24 Fix #1/#2 — was 09:08) and pick the
+/// latest non-empty bucket as the reference price. This must mirror
+/// `PreOpenCloses::backtrack_latest` so PROMPT C sees the SAME price
+/// the ATM pick used.
 fn derive_reference_prices(
     subscribed: &[String],
     snap: &std::collections::HashMap<String, PreOpenCloses>,
@@ -836,7 +837,8 @@ fn derive_reference_prices(
 
 /// Emit per-source-minute counters for the prices we actually picked,
 /// so operators can see whether 09:12 succeeded or how often we fell
-/// back to 09:11/09:10/09:09/09:08.
+/// back to earlier minutes. Labels cover the full 09:00..=09:12 widened
+/// window (Fix #1/#2 — 2026-04-24).
 fn record_reference_price_source(
     reference_prices: &BTreeMap<String, f64>,
     snap: &std::collections::HashMap<String, PreOpenCloses>,
@@ -845,15 +847,28 @@ fn record_reference_price_source(
         let Some(closes) = snap.get(symbol) else {
             continue;
         };
-        // closes.closes[0..5] = 09:08, 09:09, 09:10, 09:11, 09:12.
-        // backtrack_latest scans from index 4 down to 0; record the
+        // closes.closes[0..13] = 09:00, 09:01, ..., 09:12 (Fix #1 — 2026-04-24).
+        // backtrack_latest scans from the last index down to 0; record the
         // first non-empty slot's source-minute label.
-        let labels: [&str; 5] = ["09:08", "09:09", "09:10", "09:11", "09:12"];
+        const SOURCE_LABELS: [&str; 13] = [
+            "09:00", "09:01", "09:02", "09:03", "09:04", "09:05", "09:06", "09:07", "09:08",
+            "09:09", "09:10", "09:11", "09:12",
+        ];
+        debug_assert_eq!(
+            SOURCE_LABELS.len(),
+            closes.closes.len(),
+            "source-minute labels must match PREOPEN_MINUTE_SLOTS"
+        );
         for idx in (0..closes.closes.len()).rev() {
             if closes.closes[idx].is_some() {
+                let label = if idx < SOURCE_LABELS.len() {
+                    SOURCE_LABELS[idx]
+                } else {
+                    "unknown"
+                };
                 metrics::counter!(
                     "tv_phase2_reference_price_source_total",
-                    "source" => labels[idx]
+                    "source" => label
                 )
                 .increment(1);
                 break;
