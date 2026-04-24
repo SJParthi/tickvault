@@ -5072,6 +5072,30 @@ fn spawn_historical_candle_fetch(
                     reason: "no live data in materialized views".to_string(),
                     candles_compared: cross_match.candles_compared,
                 });
+            } else if cross_match.coverage_pct
+                < tickvault_core::historical::cross_verify::CROSS_MATCH_MIN_COVERAGE_PCT
+            {
+                // 2026-04-24 regression fix: partial coverage (operator booted
+                // mid-session, or live feed had a major gap). Before this guard,
+                // mid-session-boot produced a false "CROSS-MATCH OK" because the
+                // LEFT JOIN NULL-live detail-query branch under-counted missing
+                // rows. Now we route to Skipped with a reason that names the
+                // actual coverage shortfall so the operator knows the cross-match
+                // was NOT certified.
+                info!(
+                    coverage_pct = cross_match.coverage_pct,
+                    live_candles_present = cross_match.live_candles_present,
+                    candles_compared = cross_match.candles_compared,
+                    "cross-match SKIPPED — partial coverage (likely mid-session boot)"
+                );
+                bg_notifier.notify(NotificationEvent::CandleCrossMatchSkipped {
+                    reason: format!(
+                        "partial live coverage: {pct}% of historical grid (booted mid-session or live feed degraded; threshold {min}%)",
+                        pct = cross_match.coverage_pct,
+                        min = tickvault_core::historical::cross_verify::CROSS_MATCH_MIN_COVERAGE_PCT,
+                    ),
+                    candles_compared: cross_match.candles_compared,
+                });
             } else {
                 // Compute the "TODAY ONLY: YYYY-MM-DD HH:MM–HH:MM IST" label
                 // once and pass to both pass/fail notifications so the operator

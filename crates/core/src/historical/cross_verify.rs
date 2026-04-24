@@ -145,6 +145,29 @@ pub struct CrossMatchReport {
     /// the caller MUST treat "candles_compared > 0 but
     /// live_candles_present = false" as SKIP, not as a pass.
     pub live_candles_present: bool,
+    /// Percentage coverage of live candles vs historical grid (0..=100).
+    ///
+    /// Computed as `(total_live_candles * 100) / max(total_compared, 1)`
+    /// where `total_compared` comes from the LEFT JOIN (= historical grid
+    /// size) and `total_live_candles` is the direct live-MV row count.
+    ///
+    /// When the operator boots the app mid-session, live can cover only
+    /// a fraction of the expected historical window even though
+    /// `live_candles_present == true` and `candles_compared > 0`. Before
+    /// 2026-04-24 this case was reported as "CROSS-MATCH OK" because the
+    /// LEFT JOIN didn't generate detail rows for the missing live side
+    /// (the `m.open IS NULL` detail-query branch is authoritative but
+    /// did not get exercised for every missing row in practice).
+    ///
+    /// Callers MUST route `coverage_pct < 90` to
+    /// `CandleCrossMatchSkipped` with a reason that mentions the
+    /// coverage gap. Anything else reintroduces the 2026-04-24 false
+    /// positive where the operator booted at 14:54 IST and got a
+    /// green "CROSS-MATCH OK" covering a 09:15-15:30 window.
+    ///
+    /// 100 = full coverage (or no comparison performed);
+    /// values computed with integer division, so 99 means "≥99% and <100%".
+    pub coverage_pct: u8,
 }
 
 // ---------------------------------------------------------------------------
@@ -820,6 +843,31 @@ fn build_missing_live_mismatch(ctx: CandleContext, hist: CandleValues) -> CrossM
     }
 }
 
+/// Cross-match coverage threshold (percent).
+///
+/// Live candles must cover at least this % of the historical grid for
+/// `determine_cross_match_passed` to return true. Set to 90 to allow the
+/// natural slop at session edges (pre-open minute closes, 15:29:59 last-second
+/// slot, rare MV refresh lag) while still catching the 2026-04-24
+/// "booted at 14:54 IST but got CROSS-MATCH OK at 15:47" class of false
+/// positive (actual coverage ~10%).
+pub const CROSS_MATCH_MIN_COVERAGE_PCT: u8 = 90;
+
+/// Computes the live-vs-historical coverage percentage as integer 0..=100.
+///
+/// `total_compared` is the LEFT-JOIN row count (= historical grid size);
+/// `total_live_candles` is the direct live-MV count across all checked
+/// timeframes. When `total_compared == 0` the function returns 100 (there
+/// is nothing to cover, and the `total_compared > 0` check in
+/// `determine_cross_match_passed` will independently force a skip).
+pub fn compute_coverage_pct(total_compared: usize, total_live_candles: usize) -> u8 {
+    if total_compared == 0 {
+        return 100;
+    }
+    let pct_u = total_live_candles.saturating_mul(100) / total_compared;
+    u8::try_from(pct_u.min(100)).unwrap_or(100)
+}
+
 /// Determines if the cross-match report should pass.
 fn determine_cross_match_passed(
     total_mismatches: usize,
@@ -827,22 +875,27 @@ fn determine_cross_match_passed(
     total_missing_historical: usize,
     total_compared: usize,
     missing_views_count: usize,
+    coverage_pct: u8,
 ) -> bool {
     // Fixed 2026-04-21 (Parthiban directive): cross-match may ONLY report OK
     // when EVERY applicable 09:15→15:30 IST slot is present on BOTH historical
     // and live sides AND every OHLCV value matches bit-for-bit. Any hole of
     // any kind = FAILED.
     //
-    // Previously this function ignored `missing_live` and `missing_historical`
-    // completely — so a day where the app was down from 12:00–13:00 would
-    // produce zero live rows for that hour, the LEFT JOIN would drop those
-    // historical rows from the detail query, `total_mismatches` stayed 0, and
-    // the operator got a misleading OK at 15:47.
+    // 2026-04-24 defense-in-depth: also require `coverage_pct >=
+    // CROSS_MATCH_MIN_COVERAGE_PCT`. Without this, mid-session-boot
+    // scenarios where live covers ~10% of historical were producing
+    // `total_mismatches=0 && total_missing_live=0 && total_compared>0`
+    // → passed=true, because the NULL-live detail-query branch didn't
+    // actually flag every missing row in practice. The coverage check
+    // gives an independent signal that doesn't depend on the classifier
+    // being correct.
     total_mismatches == 0
         && total_missing_live == 0
         && total_missing_historical == 0
         && total_compared > 0
         && missing_views_count == 0
+        && coverage_pct >= CROSS_MATCH_MIN_COVERAGE_PCT
 }
 
 /// Parsed fields from a single QuestDB violation row.
@@ -1406,6 +1459,9 @@ pub async fn cross_match_historical_vs_live(
             // `false` → caller's main.rs:4285 branch fires the typed
             // `CandleCrossMatchSkipped` Telegram notification.
             live_candles_present: false,
+            // No comparison performed; 100 signals "nothing to cover" so
+            // downstream callers don't flag coverage as the skip reason.
+            coverage_pct: 100,
         };
     }
 
@@ -1414,6 +1470,7 @@ pub async fn cross_match_historical_vs_live(
     let mut total_missing_live = 0_usize;
     let mut total_missing_historical = 0_usize;
     let mut total_oi_mismatches = 0_usize;
+    let mut total_live_candles = 0_usize;
     let mut all_details: Vec<CrossMatchMismatch> = Vec::new();
     let mut timeframes_checked = 0_usize;
     let mut missing_views: Vec<String> = Vec::new();
@@ -1470,6 +1527,21 @@ pub async fn cross_match_historical_vs_live(
         if live_tf_rows > 0 {
             live_candles_present = true;
         }
+        // Accumulate live counts across timeframes for the coverage-ratio
+        // check below. This is the defense-in-depth guard against the
+        // 2026-04-24 mid-session-boot false-positive: when the operator
+        // booted at 14:54 IST, historical had full 09:15-15:30 coverage
+        // but live had only 36 min of data. The LEFT JOIN's detail-query
+        // branch for `m.open IS NULL` failed to flag every missing row,
+        // and `determine_cross_match_passed` received `total_mismatches=0
+        // && total_missing_live=0 && total_compared>0` → returned true →
+        // "CROSS-MATCH OK" Telegram despite a ~90% coverage gap.
+        //
+        // By comparing the direct live-MV count against the LEFT-JOIN
+        // count (= historical grid size) we get an INDEPENDENT coverage
+        // signal that does not depend on the classifier correctly
+        // detecting NULL live rows.
+        total_live_candles = total_live_candles.saturating_add(live_tf_rows);
 
         // Count total comparable historical candles for this timeframe
         // (scope-filtered to IDX_I + NSE_EQ only). LEFT JOIN preserves
@@ -1573,17 +1645,21 @@ pub async fn cross_match_historical_vs_live(
         all_details.extend(missing_hist_details);
     }
 
+    let coverage_pct = compute_coverage_pct(total_compared, total_live_candles);
     let passed = determine_cross_match_passed(
         total_mismatches,
         total_missing_live,
         total_missing_historical,
         total_compared,
         missing_views.len(),
+        coverage_pct,
     );
 
     info!(
         timeframes_checked,
         candles_compared = total_compared,
+        live_candles = total_live_candles,
+        coverage_pct,
         mismatches = total_mismatches,
         missing_live = total_missing_live,
         oi_mismatches = total_oi_mismatches,
@@ -1604,6 +1680,7 @@ pub async fn cross_match_historical_vs_live(
         per_timeframe_mismatches,
         passed,
         live_candles_present,
+        coverage_pct,
     }
 }
 
@@ -1621,6 +1698,9 @@ fn failed_cross_match_report() -> CrossMatchReport {
         per_timeframe_mismatches: Vec::new(),
         passed: false,
         live_candles_present: false,
+        // Failure path — coverage is meaningless; keep at 100 so routing
+        // does not double-count the skip reason.
+        coverage_pct: 100,
     }
 }
 
@@ -2350,6 +2430,7 @@ mod tests {
             per_timeframe_mismatches: vec![],
             passed: false,
             live_candles_present: true,
+            coverage_pct: 100,
         };
         assert_eq!(report.timeframes_checked, 5);
         assert_eq!(report.mismatches, 12);
@@ -2462,6 +2543,7 @@ mod tests {
             per_timeframe_mismatches: vec![],
             passed: false,
             live_candles_present: true,
+            coverage_pct: 100,
         };
         assert_eq!(report.oi_mismatches, 3);
         assert_eq!(report.missing_views.len(), 1);
@@ -2482,6 +2564,7 @@ mod tests {
             per_timeframe_mismatches: vec![],
             passed: false,
             live_candles_present: false,
+            coverage_pct: 100,
         };
         assert!(!report.passed, "missing views must fail cross-match");
         assert_eq!(report.missing_views.len(), 2);
@@ -2513,6 +2596,7 @@ mod tests {
             per_timeframe_mismatches: vec![],
             passed: false, // determine_cross_match_passed sees 0 compared+mismatches correctly
             live_candles_present: false, // <-- the new explicit signal
+            coverage_pct: 100, // nothing to cover
         };
         assert!(
             !report.live_candles_present,
@@ -3196,45 +3280,109 @@ mod tests {
 
     #[test]
     fn test_determine_cross_match_passed_all_good() {
-        // (mismatches, missing_live, missing_historical, total_compared, missing_views)
-        assert!(determine_cross_match_passed(0, 0, 0, 100, 0));
+        // (mismatches, missing_live, missing_historical, total_compared, missing_views, coverage_pct)
+        assert!(determine_cross_match_passed(0, 0, 0, 100, 0, 100));
     }
 
     #[test]
     fn test_determine_cross_match_passed_with_mismatches() {
-        assert!(!determine_cross_match_passed(5, 0, 0, 100, 0));
+        assert!(!determine_cross_match_passed(5, 0, 0, 100, 0, 100));
     }
 
     #[test]
     fn test_determine_cross_match_passed_zero_compared() {
-        assert!(!determine_cross_match_passed(0, 0, 0, 0, 0));
+        assert!(!determine_cross_match_passed(0, 0, 0, 0, 0, 100));
     }
 
     #[test]
     fn test_determine_cross_match_passed_with_missing_views() {
-        assert!(!determine_cross_match_passed(0, 0, 0, 100, 2));
+        assert!(!determine_cross_match_passed(0, 0, 0, 100, 2, 100));
     }
 
     #[test]
     fn test_determine_cross_match_passed_mismatches_and_missing_views() {
-        assert!(!determine_cross_match_passed(3, 0, 0, 100, 1));
+        assert!(!determine_cross_match_passed(3, 0, 0, 100, 1, 100));
     }
 
     #[test]
     fn test_determine_cross_match_passed_false_when_missing_live_nonzero() {
         // 2026-04-21 bug class: gaps in live candles must fail OK, not silent-skip.
-        assert!(!determine_cross_match_passed(1, 1, 0, 100, 0));
+        assert!(!determine_cross_match_passed(1, 1, 0, 100, 0, 100));
     }
 
     #[test]
     fn test_determine_cross_match_passed_false_when_missing_historical_nonzero() {
         // 2026-04-21 bug class: missing historical must also fail OK.
-        assert!(!determine_cross_match_passed(1, 0, 1, 100, 0));
+        assert!(!determine_cross_match_passed(1, 0, 1, 100, 0, 100));
     }
 
     #[test]
     fn test_determine_cross_match_passed_false_when_both_missing_counters_nonzero() {
-        assert!(!determine_cross_match_passed(4, 2, 2, 100, 0));
+        assert!(!determine_cross_match_passed(4, 2, 2, 100, 0, 100));
+    }
+
+    // -----------------------------------------------------------------------
+    // 2026-04-24 regression: coverage guard (partial mid-session boot)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_determine_cross_match_passed_false_when_coverage_below_90() {
+        // User boots at 14:54 IST → ~10% live coverage of 09:15-15:30 grid.
+        // Before 2026-04-24 this returned true (because total_mismatches=0
+        // and total_missing_live=0 due to a classifier quirk) and produced a
+        // false "CROSS-MATCH OK" Telegram.
+        assert!(!determine_cross_match_passed(0, 0, 0, 100, 0, 10));
+        assert!(!determine_cross_match_passed(0, 0, 0, 100, 0, 89));
+    }
+
+    #[test]
+    fn test_determine_cross_match_passed_true_at_exact_threshold() {
+        // 90% coverage is the minimum acceptable.
+        assert!(determine_cross_match_passed(0, 0, 0, 100, 0, 90));
+    }
+
+    #[test]
+    fn test_determine_cross_match_passed_true_at_full_coverage() {
+        assert!(determine_cross_match_passed(0, 0, 0, 100, 0, 100));
+    }
+
+    #[test]
+    fn test_compute_coverage_pct_zero_compared_returns_100() {
+        // No historical grid = nothing to cover; 100 signals "not the skip reason".
+        assert_eq!(compute_coverage_pct(0, 0), 100);
+        assert_eq!(compute_coverage_pct(0, 50), 100);
+    }
+
+    #[test]
+    fn test_compute_coverage_pct_full_coverage() {
+        assert_eq!(compute_coverage_pct(1000, 1000), 100);
+    }
+
+    #[test]
+    fn test_compute_coverage_pct_partial_mid_session_boot() {
+        // Operator booted at 14:54 IST. Historical grid = 90375 cells
+        // (241 instruments × 375 min 1m). Live has 36 min × 241 = 8676.
+        // 8676 * 100 / 90375 = 9 (integer division).
+        let pct = compute_coverage_pct(90375, 8676);
+        assert_eq!(pct, 9, "mid-session boot should report ~10% coverage");
+    }
+
+    #[test]
+    fn test_compute_coverage_pct_above_100_is_clamped() {
+        // Can't exceed 100 even with arithmetic accident.
+        assert_eq!(compute_coverage_pct(100, 200), 100);
+    }
+
+    #[test]
+    fn test_compute_coverage_pct_exact_90_percent() {
+        assert_eq!(compute_coverage_pct(100, 90), 90);
+    }
+
+    #[test]
+    fn test_cross_match_min_coverage_pct_constant_is_90() {
+        // Document the policy value. If Parthiban ever tightens the
+        // threshold, this ratchet highlights the change in a diff review.
+        assert_eq!(CROSS_MATCH_MIN_COVERAGE_PCT, 90);
     }
 
     // -----------------------------------------------------------------------
@@ -3514,12 +3662,12 @@ mod tests {
     #[test]
     fn test_determine_cross_match_passed_zero_mismatches_zero_compared() {
         // Zero compared = fails even with zero mismatches
-        assert!(!determine_cross_match_passed(0, 0, 0, 0, 0));
+        assert!(!determine_cross_match_passed(0, 0, 0, 0, 0, 100));
     }
 
     #[test]
     fn test_determine_cross_match_passed_large_values() {
-        assert!(determine_cross_match_passed(0, 0, 0, 1_000_000, 0));
+        assert!(determine_cross_match_passed(0, 0, 0, 1_000_000, 0, 100));
     }
 
     // -----------------------------------------------------------------------
