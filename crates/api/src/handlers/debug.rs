@@ -242,6 +242,12 @@ mod tests {
     use super::*;
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
+    // 2026-04-24: shared crate-level env lock serialises `unsafe
+    // set_var/remove_var` calls across middleware.rs + debug.rs so
+    // they don't race under `cargo test` parallelism. See
+    // `crates/api/src/test_support.rs` for the full rationale + the
+    // TSan finding (GitHub #304) that motivated it.
+    use crate::test_support::env_lock;
 
     /// Minimal tempdir helper — avoids pulling in the `tempfile` crate
     /// (which isn't in the workspace deps). Returns a unique
@@ -271,9 +277,9 @@ mod tests {
 
     #[test]
     fn resolve_logs_dir_respects_env_override() {
-        // Safety: tests run serially per #[test] and read env vars.
-        // SAFETY: set_var/remove_var require a mutable environment which
-        // is safe within a single-threaded test execution.
+        // SAFETY: `env_lock` serialises all env mutations in this
+        // crate's test binary (see crates/api/src/test_support.rs).
+        let _env_guard = env_lock();
         unsafe {
             std::env::set_var(LOGS_DIR_ENV, "/tmp/tickvault-debug-test");
         }
@@ -286,6 +292,7 @@ mod tests {
 
     #[test]
     fn resolve_logs_dir_default_when_env_unset() {
+        let _env_guard = env_lock();
         unsafe {
             std::env::remove_var(LOGS_DIR_ENV);
         }
@@ -295,6 +302,7 @@ mod tests {
 
     #[test]
     fn resolve_logs_dir_ignores_whitespace_env() {
+        let _env_guard = env_lock();
         unsafe {
             std::env::set_var(LOGS_DIR_ENV, "   ");
         }
@@ -365,6 +373,7 @@ mod tests {
 
     #[tokio::test]
     async fn logs_summary_returns_404_when_file_missing() {
+        let _env_guard = env_lock();
         unsafe {
             std::env::set_var(LOGS_DIR_ENV, "/nonexistent-tickvault-logs-test");
         }
@@ -378,6 +387,7 @@ mod tests {
     #[tokio::test]
     async fn logs_jsonl_latest_returns_404_when_dir_empty() {
         let tmp = mktemp("test");
+        let _env_guard = env_lock();
         unsafe {
             std::env::set_var(LOGS_DIR_ENV, tmp.path().to_str().unwrap());
         }
@@ -390,6 +400,7 @@ mod tests {
 
     #[test]
     fn resolve_spill_dir_default_when_env_unset() {
+        let _env_guard = env_lock();
         unsafe {
             std::env::remove_var(SPILL_DIR_ENV);
         }
@@ -398,6 +409,7 @@ mod tests {
 
     #[test]
     fn resolve_spill_dir_respects_env_override() {
+        let _env_guard = env_lock();
         unsafe {
             std::env::set_var(SPILL_DIR_ENV, "/tmp/tv-spill-test");
         }
@@ -438,6 +450,7 @@ mod tests {
 
     #[tokio::test]
     async fn spill_status_returns_200_with_categories_even_when_dir_missing() {
+        let _env_guard = env_lock();
         unsafe {
             std::env::set_var(SPILL_DIR_ENV, "/nonexistent/spill-test-dir-xyz");
         }
@@ -466,6 +479,7 @@ mod tests {
             fs::create_dir_all(&cat_dir).unwrap();
             fs::write(cat_dir.join(format!("{kind}-2026-04-19.bin")), b"hello").unwrap();
         }
+        let _env_guard = env_lock();
         unsafe {
             std::env::set_var(SPILL_DIR_ENV, tmp.path().to_str().unwrap());
         }

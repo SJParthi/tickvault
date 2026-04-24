@@ -24,6 +24,9 @@ pub mod handlers;
 pub mod middleware;
 pub mod state;
 
+#[cfg(test)]
+mod test_support;
+
 use axum::Router;
 use tower_http::cors::CorsLayer;
 

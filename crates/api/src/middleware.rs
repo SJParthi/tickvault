@@ -227,44 +227,12 @@ pub async fn request_tracing(request: Request, next: Next) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Serializes all `TV_API_TOKEN` env-var mutations across tests in
-    /// this file.
-    ///
-    /// Rust 2024 promoted `std::env::set_var` / `remove_var` to `unsafe`
-    /// because they can race with any other thread reading the env. A
-    /// ThreadSanitizer run on 2026-04-20 (GitHub issue #304) detected
-    /// exactly this: parallel test execution mutated `TV_API_TOKEN`
-    /// from multiple threads without synchronization.
-    ///
-    /// Every test that calls `unsafe { std::env::set_var }` or
-    /// `unsafe { std::env::remove_var }` MUST acquire this lock first:
-    ///
-    /// ```rust,ignore
-    /// #[test]
-    /// fn my_test() {
-    ///     let _env_guard = lock_env();
-    ///     unsafe { std::env::set_var("TV_API_TOKEN", "...") };
-    ///     // ... test body ...
-    ///     unsafe { std::env::remove_var("TV_API_TOKEN") };
-    ///     // `_env_guard` drops at end-of-scope, releasing the mutex.
-    /// }
-    /// ```
-    ///
-    /// On poisoned lock (another test panicked while holding it) we
-    /// recover the inner guard rather than propagating the poison —
-    /// the env var state may be wrong, but the failing test already
-    /// reported its own error, and blocking every downstream env test
-    /// on one earlier failure is strictly worse for CI signal.
-    static ENV_MUTATION_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
-        std::sync::OnceLock::new();
-
-    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
-        ENV_MUTATION_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
+    // 2026-04-24: shared crate-level env lock. Middleware + debug
+    // handler tests compile into the same test binary, so a local
+    // lock per file would not prevent cross-file races on the
+    // global libc env table. See `crates/api/src/test_support.rs`
+    // for the full rationale + poison-recovery policy.
+    use crate::test_support::env_lock as lock_env;
 
     /// Named handler function shared by all middleware tests.
     /// Using a single named function instead of separate `|| async { "ok" }`
