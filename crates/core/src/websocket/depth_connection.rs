@@ -784,12 +784,29 @@ pub async fn run_two_hundred_depth_connection(
     let m_consecutive_resets =
         // O(1) EXEMPT: metric handle created once at boot
         metrics::gauge!("tv_depth_200lvl_consecutive_resets", "label" => label.to_string());
+    // 2026-04-24 Path B: runtime variant rotator. Starts at variant A (root
+    // path + default UA + http/1.1 ALPN) and rotates through the 8-variant
+    // catalog after `RESET_ROTATE_THRESHOLD` consecutive
+    // `ResetWithoutClosingHandshake` errors. On first successful frame the
+    // variant is locked in for the life of the process.
+    let variant_rotator = crate::websocket::depth_200_variants::VariantRotator::new();
     let mut pending_signal = connected_signal;
 
     loop {
         // Parthiban directive (2026-04-21): snapshot failures before
         // attempt so we can fire DepthTwoHundredReconnected on recovery.
         let failures_before_attempt = reconnect_counter.load(Ordering::Relaxed);
+        let current_variant = variant_rotator.current();
+        info!(
+            security_id,
+            label = %label,
+            variant = current_variant.label,
+            url_path = current_variant.url_path,
+            ua = ?current_variant.ua,
+            alpn = ?current_variant.alpn,
+            locked_in = variant_rotator.is_locked_in(),
+            "{prefix}: attempting connect with variant"
+        );
         match connect_and_run_200_depth(
             &token_handle,
             &client_id,
@@ -801,11 +818,15 @@ pub async fn run_two_hundred_depth_connection(
             &label,
             wal_spill.as_ref(),
             &mut cmd_rx,
+            current_variant,
+            Some(&variant_rotator),
         )
         .await
         {
             Ok(()) => {
-                info!(security_id, label = %label, "{prefix}: connection closed normally");
+                info!(security_id, label = %label, variant = current_variant.label, "{prefix}: connection closed normally");
+                // record_success already called inside the inner fn when the
+                // handshake completed — no need to call it again here.
                 // Recovery from prior failure streak — fire Telegram.
                 if failures_before_attempt > 0 {
                     if let Some(ref n) = notifier {
@@ -833,6 +854,33 @@ pub async fn run_two_hundred_depth_connection(
                         "{prefix}: non-reconnectable Dhan disconnect — halting reconnect loop"
                     );
                     return Err(WebSocketError::NonReconnectableDisconnect { code: *code });
+                }
+
+                // 2026-04-24 Path B: if the failure is the
+                // `Protocol(ResetWithoutClosingHandshake)` error that has
+                // plagued us for 2 weeks, feed it to the rotator. After
+                // RESET_ROTATE_THRESHOLD consecutive resets on the current
+                // variant, the next attempt automatically uses the next
+                // variant from the catalog.
+                let is_reset_handshake = matches!(
+                    &err,
+                    WebSocketError::ConnectionFailed {
+                        source: tokio_tungstenite::tungstenite::Error::Protocol(
+                            tokio_tungstenite::tungstenite::error::ProtocolError::ResetWithoutClosingHandshake
+                        ),
+                        ..
+                    }
+                );
+                if is_reset_handshake && variant_rotator.record_reset() {
+                    let new_variant = variant_rotator.current();
+                    error!(
+                        security_id,
+                        label = %label,
+                        from_variant = current_variant.label,
+                        to_variant = new_variant.label,
+                        "{prefix}: rotating to next 200-depth variant after {} consecutive resets",
+                        crate::websocket::depth_200_variants::RESET_ROTATE_THRESHOLD
+                    );
                 }
 
                 let attempt = reconnect_counter.fetch_add(1, Ordering::Relaxed);
@@ -900,7 +948,7 @@ pub async fn run_two_hundred_depth_connection(
 
 /// Connects to the 200-level depth WebSocket and runs the read loop.
 // O(1) EXEMPT: begin — connection lifecycle
-#[allow(clippy::too_many_arguments)] // APPROVED: STAGE-C added security_id/label/wal_spill params
+#[allow(clippy::too_many_arguments)] // APPROVED: STAGE-C added security_id/label/wal_spill params; 2026-04-24 added variant
 async fn connect_and_run_200_depth(
     token_handle: &TokenHandle,
     client_id: &str,
@@ -912,6 +960,8 @@ async fn connect_and_run_200_depth(
     label: &str,
     wal_spill: Option<&Arc<WsFrameSpill>>,
     cmd_rx: &mut mpsc::Receiver<DepthCommand>,
+    variant: crate::websocket::depth_200_variants::DepthVariant,
+    variant_rotator: Option<&crate::websocket::depth_200_variants::VariantRotator>,
 ) -> Result<(), WebSocketError> {
     let token_guard = token_handle.load();
     let token_state = token_guard
@@ -924,23 +974,24 @@ async fn connect_and_run_200_depth(
     }
 
     let access_token = token_state.access_token().expose_secret().to_string();
-    // 200-level URL: ROOT path / — verified 2026-04-23 via Dhan Python SDK
-    // `dhanhq==2.2.0rc1` on our account at SecurityId 72271. Replaces the
-    // `/twohundreddepth` path Dhan ticket #5519522 had advised.
-    let base = DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL.trim_end_matches('/');
-    let authenticated_url = zeroize::Zeroizing::new(format!(
-        "{base}/?token={access_token}&clientId={client_id}&authType={WEBSOCKET_AUTH_TYPE}",
-    ));
+    // 200-level URL path + UA + ALPN come from the variant. Variant A
+    // (root + default UA + http/1.1) is the production baseline verified
+    // via Dhan Python SDK on 2026-04-23. If it fails with repeated
+    // `ResetWithoutClosingHandshake`, the outer run loop rotates to the
+    // next variant automatically.
+    let base_host = DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL
+        .trim_start_matches("wss://")
+        .trim_end_matches('/');
 
-    let request = authenticated_url
-        .as_str()
-        .into_client_request()
-        .map_err(|err| WebSocketError::ConnectionFailed {
-            url: DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL.to_string(),
-            source: err,
-        })?;
+    let request = crate::websocket::depth_200_variants::build_request_for_variant(
+        variant,
+        base_host,
+        &access_token,
+        client_id,
+    )?;
 
-    let tls_connector = build_websocket_tls_connector()?;
+    let tls_connector =
+        crate::websocket::depth_200_variants::build_tls_connector_for_variant(variant)?;
     let connect_timeout = Duration::from_secs(DEPTH_CONNECT_TIMEOUT_SECS);
 
     let connect_result = time::timeout(
@@ -961,6 +1012,29 @@ async fn connect_and_run_200_depth(
             url: DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL.to_string(),
             source: err,
         })?;
+
+    // 2026-04-24 Path B: TLS + WebSocket handshake succeeded — Dhan accepted
+    // this variant's URL/UA/ALPN combination. Lock it in immediately, BEFORE
+    // we subscribe or read any frames. This is the critical semantic:
+    // `ResetWithoutClosingHandshake` that later occurs mid-stream (e.g. Dhan
+    // rotating servers after 30 min) must NOT rotate us away from a variant
+    // we know works. Only handshake-time resets (which short-circuit this
+    // code path via the `?` above) count toward rotation.
+    if let Some(rotator) = variant_rotator {
+        if !rotator.is_locked_in() {
+            rotator.record_success();
+            info!(
+                label = %label,
+                variant = variant.label,
+                "{prefix}: handshake succeeded — locking in variant for this process"
+            );
+            metrics::counter!(
+                "tv_depth_200_variant_success_total",
+                "variant" => variant.label
+            )
+            .increment(1);
+        }
+    }
 
     if subscribe_msg.is_empty() {
         // Plan item B (2026-04-23): deferred mode — socket authenticated
@@ -1458,6 +1532,8 @@ mod tests {
             "TEST-LABEL",
             None,
             &mut cmd_rx,
+            crate::websocket::depth_200_variants::VARIANTS[0],
+            None,
         )
         .await;
         assert!(result.is_err());

@@ -15,6 +15,7 @@
 pub mod activity_watchdog;
 pub mod connection;
 pub mod connection_pool;
+pub mod depth_200_variants;
 pub mod depth_connection;
 pub mod market_hours_gate;
 pub mod order_update_connection;
@@ -25,6 +26,9 @@ pub mod types;
 
 pub use connection::{SubscribeCommand, WebSocketConnection};
 pub use connection_pool::WebSocketConnectionPool;
+pub use depth_200_variants::{
+    AlpnMode, DepthVariant, RESET_ROTATE_THRESHOLD, UaFlavor, VARIANTS, VariantRotator,
+};
 pub use depth_connection::{
     DEPTH_200_INITIAL_STAGGER_MS, DepthCommand, run_twenty_depth_connection,
     run_two_hundred_depth_connection,
