@@ -1392,7 +1392,7 @@ Response: Array of OHLCV candles with timestamps.
 
 | Property | Value |
 |----------|-------|
-| Language | Rust 2024 Edition (1.93.1) |
+| Language | Rust 2024 Edition (1.95.0) |
 | Runtime | Docker containers (Mac dev → AWS prod) |
 | Tick parse latency | <10ns (zerocopy) |
 | End-to-end latency | <92μs (tick → QuestDB) |

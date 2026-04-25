@@ -35,7 +35,7 @@ tickvault/
 
 ## Quick Start
 
-**Prerequisites:** Rust 1.93.1, Docker, Docker Compose
+**Prerequisites:** Rust 1.95.0, Docker, Docker Compose
 
 ```bash
 git clone https://github.com/SJParthi/tickvault.git
