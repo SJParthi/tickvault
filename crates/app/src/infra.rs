@@ -115,46 +115,24 @@ const GRAFANA_DASHBOARD_URL: &str = "http://localhost:3000";
 
 /// Ensures Docker infrastructure services are running.
 ///
-/// 1. Probes ALL critical services (QuestDB, Grafana, Prometheus, Valkey).
-///    If every probe succeeds, opens dashboards and returns.
-/// 2. If ANY service is unreachable, fetches infra credentials from SSM.
-/// 3. Runs `docker compose up -d` (idempotent — only starts missing/stopped
-///    containers, leaves running ones alone).
-/// 4. Waits for QuestDB and Grafana to become healthy.
+/// **ALWAYS runs `docker compose up -d`** at boot. This is by design.
+/// `docker compose up -d` is idempotent — it is a no-op (~1s) when every
+/// service is already running, and it brings up any container that is
+/// missing, stopped, crashed, or has a stale port binding from a previous
+/// run. TCP probes are NOT used as a short-circuit because they produce
+/// false positives (port bound but process dead, stale Docker IPVS rule,
+/// container `up` but app process inside it crashed).
+///
+/// 1. Ensures Docker daemon is running (launches Docker Desktop on macOS).
+/// 2. Fetches infra credentials from SSM.
+/// 3. Runs `docker compose up -d` (idempotent).
+/// 4. Waits for QuestDB, Grafana, Prometheus, Valkey to become healthy.
+/// 5. Opens dashboards in the default browser.
 ///
 /// Best-effort: if Docker or SSM is unavailable, logs a warning
 /// and returns — the app already handles missing services gracefully.
 pub async fn ensure_infra_running(questdb_config: &QuestDbConfig) {
-    let questdb_ok = is_service_reachable(&questdb_config.host, questdb_config.http_port);
-    let grafana_ok = is_service_reachable(GRAFANA_HOST, GRAFANA_PORT);
-    let prometheus_ok = is_service_reachable(LOCAL_HOST, PROMETHEUS_PORT);
-    let valkey_ok = is_service_reachable(LOCAL_HOST, VALKEY_PORT);
-
-    if questdb_ok && grafana_ok && prometheus_ok && valkey_ok {
-        debug!("all critical infrastructure services reachable — skipping docker compose up");
-        // Infrastructure already running — auto-open all monitoring dashboards.
-        open_all_dashboards().await;
-        return;
-    }
-
-    let mut missing: Vec<&'static str> = Vec::new();
-    if !questdb_ok {
-        missing.push("QuestDB");
-    }
-    if !grafana_ok {
-        missing.push("Grafana");
-    }
-    if !prometheus_ok {
-        missing.push("Prometheus");
-    }
-    if !valkey_ok {
-        missing.push("Valkey");
-    }
-
-    info!(
-        ?missing,
-        "infrastructure services missing — auto-starting Docker services (idempotent)"
-    );
+    info!("ensuring Docker infrastructure is running (idempotent — safe to call when up)");
 
     // Ensure Docker daemon is running (launches Docker Desktop on macOS if needed).
     if !ensure_docker_daemon_running().await {
