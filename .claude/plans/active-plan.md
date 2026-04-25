@@ -107,44 +107,36 @@ timeframe.
     `test_baselines_segment_isolation` (same security_id, different segment
     → independent buffers per I-P1-11)
 
-- [ ] **F. Per-timeframe ranking pass** in `MoversTrackerV2::snapshot()`:
-  - For each `Timeframe` in `Timeframe::iter_all()`:
-    - For each tracked security: compute `change_pct = (ltp − baseline(tf.secs())) / baseline × 100`
-    - For derivatives, compute `premium = ltp − spot_of_underlying(security)` and
-      route to Premium (>0 ranked desc) or Discount (<0 ranked asc) leaderboard
-    - For options, populate `Highest OI` (sort by current `oi` desc) and
-      `Top Value` (sort by `ltp × volume` desc)
-    - For OI Gainers / OI Losers: leave empty (matches existing comment) —
-      requires 09:15 IST OI baseline, separate follow-up PR
-  - Output type: `Vec<(Timeframe, MoversSnapshotV2)>` returned from `snapshot_all()`
-  - Tests: `test_snapshot_all_returns_15_entries`,
-    `test_premium_only_for_futures_buckets`,
-    `test_premium_zero_when_ltp_equals_spot`,
-    `test_premium_negative_routed_to_discount`,
-    `test_highest_oi_only_for_options_buckets`,
-    `test_top_value_only_for_options_buckets`
+- [x] **F. Per-timeframe ranking pass** in `MoversTrackerV2::compute_snapshot_v2_at_timeframe`:
+  - Per-security `change_pct = self.change_pct_at_timeframe(...)`; warmup → skip
+  - Premium/Discount routing for futures buckets (item H below)
+  - OI Gainers/Losers populate when 09:15 IST baseline is captured
+  - Tests: `test_compute_snapshot_v2_at_timeframe_empty_tracker_yields_empty`,
+    `test_compute_snapshot_v2_at_timeframe_skips_warmup_securities`,
+    `test_compute_snapshot_v2_at_timeframe_uses_rolling_change_pct`,
+    `test_compute_snapshot_at_timeframe_longer_tf_warmup_independent`
 
-- [ ] **G. Snapshot loop + writer wiring** in tracker entry point:
-  - Cadence: every 60 seconds, run `snapshot_all()` then write each
-    timeframe to `top_movers` with the matching `timeframe` symbol
-  - Market-hours gate: skip outside 09:00–15:30 IST (matches
-    `is_within_market_hours_ist()` from depth_rebalancer.rs)
-  - Each snapshot row gets `ts = ist_now_secs() × 1_000_000_000`
-    (no IST offset — already IST per data-integrity.md WebSocket rule)
-  - Tests (source-scan ratchets, since the loop is async):
-    `test_movers_snapshot_loop_calls_snapshot_all`,
-    `test_movers_snapshot_loop_market_hours_gated`,
-    `test_movers_snapshot_loop_writes_to_top_movers_table`
+- [x] **G. Snapshot loop + writer wiring** in `crates/app/src/movers_v2_pipeline.rs`:
+  - Updater task takes `SharedSpotPrices`, snapshots it sync per cycle,
+    iterates `Timeframe::ALL` and emits `MultiTimeframeSnapshots` on the watch channel
+  - Persister task iterates every timeframe and writes rows to `top_movers`
+  - Market-hours gate (Rule 3) skips outside 09:00–15:30 IST
+  - Tests: `test_spawn_movers_v2_pipeline_returns_handles_and_snapshot_arc`,
+    `test_is_within_market_hours_ist_returns_bool_in_current_wall_clock`
 
-- [ ] **H. Spot-price lookup for premium/discount**:
-  - Reuse `SharedSpotPrices: Arc<RwLock<HashMap<u32, f32>>>` from
-    `depth_rebalancer.rs` (already populated by tick broadcast subscriber)
-  - For each derivative, `underlying_security_id` from `InstrumentRegistry`
-    → spot_price lookup → premium computation
-  - O(1) hot path read (RwLock read + HashMap lookup)
-  - Tests: `test_premium_lookup_with_known_spot_price`,
-    `test_premium_lookup_returns_none_when_spot_missing` (warmup grace),
-    `test_premium_uses_underlying_not_derivative_security_id`
+- [x] **H. Spot-price lookup for premium/discount**:
+  - Reuse `SharedSpotPrices` from `depth_rebalancer.rs` — created once in
+    main.rs and shared between movers + depth ATM selection
+  - `push_premium_discount` looks up underlying symbol via
+    `registry.get_with_segment(id, segment)` → spread = LTP − spot
+  - Options buckets explicitly skipped — futures-only feature
+  - Tests: `test_compute_snapshot_at_timeframe_futures_premium_when_ltp_gt_spot`,
+    `test_compute_snapshot_at_timeframe_futures_discount_when_ltp_lt_spot`,
+    `test_compute_snapshot_at_timeframe_premium_discount_empty_without_spot`,
+    `test_compute_snapshot_at_timeframe_options_never_populate_premium_discount`,
+    `test_compute_snapshot_at_timeframe_stock_futures_route_by_underlying`,
+    `test_compute_snapshot_at_timeframe_zero_spread_neither_premium_nor_discount`,
+    `test_compute_snapshot_at_timeframe_invalid_spot_skips_premium_discount`
 
 - [ ] **I. DDL self-heal at boot** in `ensure_movers_tables`:
   - `ALTER TABLE top_movers ADD COLUMN IF NOT EXISTS timeframe SYMBOL`

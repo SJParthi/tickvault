@@ -1918,6 +1918,12 @@ async fn main() -> Result<()> {
         tickvault_core::pipeline::top_movers::SharedMoversSnapshotV2,
     > = None;
 
+    // Plan item H (2026-04-25): SharedSpotPrices map shared between movers
+    // (Premium/Discount routing) + depth ATM selection. Created OUTSIDE the
+    // processor scope so Step 8c.0 (below) can clone the same Arc.
+    let shared_spot_prices_for_movers =
+        tickvault_core::instrument::depth_rebalancer::new_shared_spot_prices();
+
     let processor_handle = if let Some(receiver) = pool_receiver {
         let candle_agg = Some(tickvault_core::pipeline::CandleAggregator::new());
         let live_candle_writer =
@@ -1997,6 +2003,10 @@ async fn main() -> Result<()> {
         // stock_movers + option_movers tables for back-compat (plan D2).
         // Dedicated shutdown notifier for the V2 movers pipeline. Awakened
         // by the graceful-shutdown path (below) via a cloned Arc.
+        //
+        // Plan item H (2026-04-25): SharedSpotPrices was created above (outside
+        // the processor scope). Movers Premium/Discount routing reads from the
+        // same map populated by the spot updater task in Step 8c.0 below.
         let movers_v2_shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
         let movers_v2_handles = if let Some(registry) = slow_registry.as_ref() {
             Some(tickvault_app::movers_v2_pipeline::spawn_movers_v2_pipeline(
@@ -2004,6 +2014,7 @@ async fn main() -> Result<()> {
                 tick_broadcast_sender.clone(),
                 config.questdb.clone(),
                 config.movers.clone(),
+                std::sync::Arc::clone(&shared_spot_prices_for_movers),
                 std::sync::Arc::clone(&movers_v2_shutdown),
             ))
         } else {
@@ -2079,7 +2090,12 @@ async fn main() -> Result<()> {
     // Must be created BEFORE depth connections so we can wait for the first
     // index LTP before selecting ATM strikes. The spot price updater subscribes
     // to the tick broadcast and extracts index LTPs.
-    let shared_spot_prices = tickvault_core::instrument::depth_rebalancer::new_shared_spot_prices();
+    //
+    // 2026-04-25: reuse the SharedSpotPrices map created earlier (above the
+    // movers v2 pipeline spawn, plan item H). Both subsystems share one map
+    // so the spot updater task at the bottom of this block populates LTPs
+    // visible to depth ATM selection AND movers Premium/Discount routing.
+    let shared_spot_prices = std::sync::Arc::clone(&shared_spot_prices_for_movers);
     let spot_prices_for_depth = std::sync::Arc::clone(&shared_spot_prices);
     if should_connect_ws {
         let spot_prices_updater = std::sync::Arc::clone(&shared_spot_prices);
