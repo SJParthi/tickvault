@@ -347,25 +347,10 @@ impl StockMoversWriter {
             Instant::now() + Duration::from_secs(MOVERS_RECONNECT_THROTTLE_SECS);
     }
 
-    /// Appends a single stock mover entry to the ILP buffer.
-    ///
-    /// # Arguments
-    /// * `ts_nanos` — snapshot timestamp (IST epoch nanoseconds)
-    /// * `category` — "GAINER", "LOSER", or "MOST_ACTIVE"
-    /// * `rank` — 1-based rank within category
-    /// * `security_id` — Dhan security ID
-    /// * `segment` — exchange segment string ("NSE_EQ", "NSE_FNO", etc.)
-    /// * `symbol` — human-readable symbol name
-    /// * `ltp` — last traded price
-    /// * `prev_close` — previous day close price
-    /// * `change_pct` — percentage change
-    /// * `volume` — day volume
-    // TEST-EXEMPT: ILP buffer append — requires live QuestDB, tested via ensure_movers_tables integration
-    #[allow(clippy::too_many_arguments)]
-    // APPROVED: 10 params — each maps to a QuestDB column, no abstraction reduces this
     /// Writes a `BufferedStockMover` into an ILP `Buffer`. Single source
     /// of truth for column order + rounding policy — both live append
     /// and rescue drain call this helper. DB-2.
+    // TEST-EXEMPT: ILP buffer append — requires live QuestDB, tested via ensure_movers_tables integration
     fn append_stock_row_to_buffer(buffer: &mut Buffer, row: &BufferedStockMover) -> Result<()> {
         let change_abs = ((row.ltp - row.prev_close) * 100.0).round() / 100.0;
         let ts = TimestampNanos::new(row.ts_nanos);
@@ -397,6 +382,21 @@ impl StockMoversWriter {
         Ok(())
     }
 
+    /// Appends a single stock mover entry to the ILP buffer.
+    ///
+    /// # Arguments
+    /// * `ts_nanos` — snapshot timestamp (IST epoch nanoseconds)
+    /// * `category` — "GAINER", "LOSER", or "MOST_ACTIVE"
+    /// * `rank` — 1-based rank within category
+    /// * `security_id` — Dhan security ID
+    /// * `segment` — exchange segment string ("NSE_EQ", "NSE_FNO", etc.)
+    /// * `symbol` — human-readable symbol name
+    /// * `ltp` — last traded price
+    /// * `prev_close` — previous day close price
+    /// * `change_pct` — percentage change
+    /// * `volume` — day volume
+    #[allow(clippy::too_many_arguments)]
+    // APPROVED: 10 params — each maps to a QuestDB column, no abstraction reduces this
     pub fn append_stock_mover(
         &mut self,
         ts_nanos: i64,
@@ -657,17 +657,9 @@ impl OptionMoversWriter {
             Instant::now() + Duration::from_secs(MOVERS_RECONNECT_THROTTLE_SECS);
     }
 
-    /// Appends a single option mover entry to the ILP buffer.
-    ///
-    /// # Arguments
-    /// * `ts_nanos` — snapshot timestamp (IST epoch nanoseconds)
-    /// * `category` — "HIGHEST_OI", "OI_GAINER", "OI_LOSER", "TOP_VOLUME", "TOP_VALUE", "PRICE_GAINER", "PRICE_LOSER"
-    /// * `rank` — 1-based rank within category
-    // TEST-EXEMPT: ILP buffer append — requires live QuestDB, tested via ensure_movers_tables integration
-    #[allow(clippy::too_many_arguments)]
-    // APPROVED: 17 params — each maps to a QuestDB column, no abstraction reduces this
     /// Writes a `BufferedOptionMover` into an ILP `Buffer`. Single source
     /// of truth for column order + rounding. DB-2.
+    // TEST-EXEMPT: ILP buffer append — requires live QuestDB, tested via ensure_movers_tables integration
     fn append_option_row_to_buffer(buffer: &mut Buffer, row: &BufferedOptionMover) -> Result<()> {
         let ts = TimestampNanos::new(row.ts_nanos);
         buffer
@@ -714,6 +706,14 @@ impl OptionMoversWriter {
         Ok(())
     }
 
+    /// Appends a single option mover entry to the ILP buffer.
+    ///
+    /// # Arguments
+    /// * `ts_nanos` — snapshot timestamp (IST epoch nanoseconds)
+    /// * `category` — "HIGHEST_OI", "OI_GAINER", "OI_LOSER", "TOP_VOLUME", "TOP_VALUE", "PRICE_GAINER", "PRICE_LOSER"
+    /// * `rank` — 1-based rank within category
+    #[allow(clippy::too_many_arguments)]
+    // APPROVED: 17 params — each maps to a QuestDB column, no abstraction reduces this
     pub fn append_option_mover(
         &mut self,
         ts_nanos: i64,
@@ -807,7 +807,7 @@ impl OptionMoversWriter {
     ///
     /// DB-2/DB-6/DB-7: rescue-ring drain-on-reconnect + pop-on-success
     /// + retain-on-failure. See `StockMoversWriter::flush` for the
-    /// identical contract.
+    ///   identical contract.
     pub fn flush(&mut self) -> Result<()> {
         if self.pending_count == 0 && self.rescue_ring.is_empty() {
             return Ok(());

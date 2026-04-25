@@ -493,23 +493,22 @@ fn build_derivatives_and_chains(
         // silently overwrite the other. Warn loudly so the operator can
         // investigate before the collision causes a downstream bug
         // (wrong subscription, wrong Greeks, wrong delta-detector pass).
-        if let Some(prev) = derivative_contracts.insert(row.security_id, contract.clone()) {
-            if prev.exchange_segment != contract.exchange_segment
-                || prev.underlying_symbol != contract.underlying_symbol
-            {
-                tracing::warn!(
-                    security_id = row.security_id,
-                    prev_segment = ?prev.exchange_segment,
-                    new_segment = ?contract.exchange_segment,
-                    prev_underlying = %prev.underlying_symbol,
-                    new_underlying = %contract.underlying_symbol,
-                    "I-P1-11: FnoUniverse.derivative_contracts cross-key collision — \
-                     two distinct contracts share the same security_id. One will be \
-                     dropped; delta_detector lookups on this id are ambiguous until \
-                     the FnoUniverse map is refactored to (id, segment) key."
-                );
-                metrics::counter!("tv_fno_universe_derivative_collisions_total").increment(1);
-            }
+        if let Some(prev) = derivative_contracts.insert(row.security_id, contract.clone())
+            && (prev.exchange_segment != contract.exchange_segment
+                || prev.underlying_symbol != contract.underlying_symbol)
+        {
+            tracing::warn!(
+                security_id = row.security_id,
+                prev_segment = ?prev.exchange_segment,
+                new_segment = ?contract.exchange_segment,
+                prev_underlying = %prev.underlying_symbol,
+                new_underlying = %contract.underlying_symbol,
+                "I-P1-11: FnoUniverse.derivative_contracts cross-key collision — \
+                 two distinct contracts share the same security_id. One will be \
+                 dropped; delta_detector lookups on this id are ambiguous until \
+                 the FnoUniverse map is refactored to (id, segment) key."
+            );
+            metrics::counter!("tv_fno_universe_derivative_collisions_total").increment(1);
         }
 
         // Add to instrument_info

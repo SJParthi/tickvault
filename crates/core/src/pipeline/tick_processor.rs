@@ -69,6 +69,7 @@ const INDEX_PREV_CLOSE_CACHE_TMP: &str = "data/instrument-cache/index-prev-close
 /// - NIFTY 50: Dhan SID 13, segment IDX_I
 /// - BANK NIFTY: Dhan SID 25, segment IDX_I
 /// - SENSEX: Dhan SID 51, segment IDX_I
+///
 /// Verified via existing test `tests::test_header_parse` which uses
 /// SID 13 for NIFTY, and by the live universe seeded from the
 /// instrument master at boot.
@@ -222,7 +223,7 @@ fn current_received_at_nanos() -> i64 {
 /// wall-clock goes BACKWARD by more than `CLOCK_SKEW_BACKWARD_THRESHOLD_NANOS`
 /// versus the largest value seen so far, it logs ERROR + increments
 /// `tv_clock_skew_detections_total` so the operator sees it in Grafana
-/// + Telegram. The tick is still evaluated against the window (we do
+/// and Telegram. The tick is still evaluated against the window (we do
 /// NOT reject it on the basis of skew alone — that would drop
 /// legitimate ticks during a one-off correction).
 ///
@@ -236,7 +237,7 @@ fn is_wall_clock_within_persist_window(received_at_nanos: i64) -> bool {
     if received_at_nanos > prev_max {
         // Rising edge: update max (relaxed CAS — lost races only mean
         // we miss an update, which is fine for a monitoring counter).
-        let _ = MAX_WALL_CLOCK_SEEN_NANOS.compare_exchange(
+        _ = MAX_WALL_CLOCK_SEEN_NANOS.compare_exchange(
             prev_max,
             received_at_nanos,
             Ordering::Relaxed,
@@ -344,7 +345,7 @@ fn persist_stock_movers_snapshot(
                 let prev_close = f32_clean(entry.prev_close);
                 let ltp = f32_clean(entry.last_traded_price);
                 let change_pct = f32_clean(entry.change_pct);
-                let _ = writer.append_stock_mover(
+                drop(writer.append_stock_mover(
                     ts_nanos,
                     category,
                     (i as i32).saturating_add(1),
@@ -355,7 +356,7 @@ fn persist_stock_movers_snapshot(
                     prev_close,
                     change_pct,
                     i64::from(entry.volume),
-                );
+                ));
             }
         };
 
@@ -367,7 +368,7 @@ fn persist_stock_movers_snapshot(
     persist_entries(writer, &snapshot.index_most_active, "INDEX_MOST_ACTIVE");
 
     // Best-effort flush
-    let _ = writer.flush();
+    drop(writer.flush());
 }
 
 /// Persists an option movers snapshot to QuestDB (cold path, best-effort).
@@ -431,7 +432,7 @@ fn persist_option_movers_snapshot(
                 const SPOT_PRICE_NOT_AVAILABLE: f64 = 0.0;
                 let spot_price = SPOT_PRICE_NOT_AVAILABLE;
 
-                let _ = writer.append_option_mover(
+                drop(writer.append_option_mover(
                     ts_nanos,
                     category,
                     (i as i32).saturating_add(1),
@@ -451,7 +452,7 @@ fn persist_option_movers_snapshot(
                     f32_clean(entry.oi_change_pct),
                     i64::from(entry.volume),
                     entry.value,
-                );
+                ));
             }
         };
 
@@ -488,7 +489,7 @@ fn persist_option_movers_snapshot(
     split_persist(writer, &snapshot.price_gainers, "PRICE_GAINER");
     split_persist(writer, &snapshot.price_losers, "PRICE_LOSER");
 
-    let _ = writer.flush();
+    drop(writer.flush());
 }
 
 // ---------------------------------------------------------------------------
@@ -1297,7 +1298,7 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     let cache_path = INDEX_PREV_CLOSE_CACHE_PATH;
                     let tmp_path = INDEX_PREV_CLOSE_CACHE_TMP;
                     if let Ok(json) = serde_json::to_string(&index_prev_close_cache) {
-                        let _ = std::fs::create_dir_all(cache_dir);
+                        drop(std::fs::create_dir_all(cache_dir));
                         match std::fs::write(tmp_path, &json)
                             .and_then(|()| std::fs::rename(tmp_path, cache_path))
                         {
@@ -1594,7 +1595,7 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                 if !is_within_persist_window(c.timestamp_secs) {
                     continue;
                 }
-                let _ = cw.append_candle(
+                drop(cw.append_candle(
                     c.security_id,
                     c.exchange_segment_code,
                     c.timestamp_secs,
@@ -1609,7 +1610,7 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     c.gamma,
                     c.theta,
                     c.vega,
-                );
+                ));
             }
             cw.flush_on_shutdown();
         }

@@ -278,7 +278,7 @@ impl TopMoversTracker {
                 .collect();
 
             // Most active: sort by volume descending
-            entries.sort_unstable_by(|a, b| b.volume.cmp(&a.volume));
+            entries.sort_unstable_by_key(|e| std::cmp::Reverse(e.volume));
             let most_active: Vec<MoverEntry> = entries.iter().take(top_n).copied().collect();
 
             (gainers, losers, most_active)
@@ -1445,7 +1445,9 @@ fn trim_price_bucket(bucket: &mut PriceBucket) {
     bucket.losers.truncate(MOVERS_V2_TOP_N);
 
     // Most active: volume desc.
-    bucket.most_active.sort_by(|a, b| b.volume.cmp(&a.volume));
+    bucket
+        .most_active
+        .sort_by_key(|e| std::cmp::Reverse(e.volume));
     bucket.most_active.truncate(MOVERS_V2_TOP_N);
 }
 
@@ -1466,12 +1468,14 @@ fn trim_derivative_bucket(bucket: &mut DerivativeBucket) {
     bucket.losers.retain(|e| e.change_pct < 0.0);
     bucket.losers.truncate(MOVERS_V2_TOP_N);
 
-    bucket.most_active.sort_by(|a, b| b.volume.cmp(&a.volume));
+    bucket
+        .most_active
+        .sort_by_key(|e| std::cmp::Reverse(e.volume));
     bucket.most_active.truncate(MOVERS_V2_TOP_N);
 
     bucket
         .top_oi
-        .sort_by(|a, b| b.open_interest.cmp(&a.open_interest));
+        .sort_by_key(|e| std::cmp::Reverse(e.open_interest));
     bucket.top_oi.truncate(MOVERS_V2_TOP_N);
 
     bucket.top_value.sort_by(|a, b| {

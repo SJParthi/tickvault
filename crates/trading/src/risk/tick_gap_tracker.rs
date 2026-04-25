@@ -251,7 +251,7 @@ impl TickGapTracker {
         // Include up to 3 worst security_ids for debugging.
         // O(1) EXEMPT: begin — cold path, called once every 30s (not per tick)
         self.pending_warn_gaps
-            .sort_unstable_by(|a, b| b.1.cmp(&a.1));
+            .sort_unstable_by_key(|&(_, gap)| std::cmp::Reverse(gap));
         let worst_3: Vec<_> = self.pending_warn_gaps.iter().take(3).collect();
         let sample_str: String = worst_3
             .iter()

@@ -242,10 +242,11 @@ async fn build_snapshot_for_stocks(
     let map = spot_prices.read().await;
     let mut out: HashMap<String, f64> = HashMap::with_capacity(stocks.len());
     for stock in stocks {
-        if let Some(entry) = map.get(stock) {
-            if entry.price > 0.0 && entry.price.is_finite() {
-                out.insert(stock.clone(), entry.price);
-            }
+        if let Some(entry) = map.get(stock)
+            && entry.price > 0.0
+            && entry.price.is_finite()
+        {
+            out.insert(stock.clone(), entry.price);
         }
     }
     out

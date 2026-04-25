@@ -35,10 +35,10 @@ const DEFAULT_SPILL_DIR: &str = "data/spill";
 const SPILL_DIR_ENV: &str = "TV_SPILL_DIR";
 
 fn resolve_logs_dir() -> PathBuf {
-    if let Ok(custom) = std::env::var(LOGS_DIR_ENV) {
-        if !custom.trim().is_empty() {
-            return PathBuf::from(custom);
-        }
+    if let Ok(custom) = std::env::var(LOGS_DIR_ENV)
+        && !custom.trim().is_empty()
+    {
+        return PathBuf::from(custom);
     }
     PathBuf::from(DEFAULT_LOGS_DIR)
 }
@@ -68,10 +68,10 @@ pub async fn logs_jsonl_latest() -> impl IntoResponse {
 }
 
 fn resolve_spill_dir() -> PathBuf {
-    if let Ok(custom) = std::env::var(SPILL_DIR_ENV) {
-        if !custom.trim().is_empty() {
-            return PathBuf::from(custom);
-        }
+    if let Ok(custom) = std::env::var(SPILL_DIR_ENV)
+        && !custom.trim().is_empty()
+    {
+        return PathBuf::from(custom);
     }
     PathBuf::from(DEFAULT_SPILL_DIR)
 }

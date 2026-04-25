@@ -512,22 +512,22 @@ impl IndicatorSnapshotWriter {
         // Connected. FIRST drain the rescue ring (oldest rows first), so
         // on a bursty restart the oldest missed snapshots reach QuestDB
         // before the in-flight batch.
-        if !self.rescue_ring.is_empty() {
-            if let Err(err) = self.drain_rescue_ring_to_sender() {
-                // Ring drain failed (flush error during drain). Keep the
-                // sender set to None so the next flush retries reconnect
-                // + drain. Rows are still in the ring.
-                self.sender = None;
-                self.buffer.clear();
-                self.pending_count = 0;
-                warn!(
-                    ?err,
-                    ring_depth = self.rescue_ring.len(),
-                    "indicator snapshot rescue ring drain failed — will retry \
-                     on next flush attempt"
-                );
-                return Ok(());
-            }
+        if !self.rescue_ring.is_empty()
+            && let Err(err) = self.drain_rescue_ring_to_sender()
+        {
+            // Ring drain failed (flush error during drain). Keep the
+            // sender set to None so the next flush retries reconnect
+            // + drain. Rows are still in the ring.
+            self.sender = None;
+            self.buffer.clear();
+            self.pending_count = 0;
+            warn!(
+                ?err,
+                ring_depth = self.rescue_ring.len(),
+                "indicator snapshot rescue ring drain failed — will retry \
+                 on next flush attempt"
+            );
+            return Ok(());
         }
 
         // Now flush the in-flight ILP batch.

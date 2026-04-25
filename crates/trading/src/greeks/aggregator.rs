@@ -194,11 +194,11 @@ impl GreeksAggregator {
 
         match segment {
             // Index or equity tick → update underlying LTP cache
-            Some(ExchangeSegment::IdxI | ExchangeSegment::NseEquity) => {
-                if tick.last_traded_price > 0.0 && tick.last_traded_price.is_finite() {
-                    self.underlying_ltp
-                        .insert(tick.security_id, tick.last_traded_price);
-                }
+            Some(ExchangeSegment::IdxI | ExchangeSegment::NseEquity)
+                if tick.last_traded_price > 0.0 && tick.last_traded_price.is_finite() =>
+            {
+                self.underlying_ltp
+                    .insert(tick.security_id, tick.last_traded_price);
             }
             // F&O tick → update option state
             Some(ExchangeSegment::NseFno) => {

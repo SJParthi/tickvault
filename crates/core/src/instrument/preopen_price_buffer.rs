@@ -252,9 +252,8 @@ pub fn is_within_preopen_window() -> bool {
         return false;
     };
     let now_ist = offset.from_utc_datetime(&Utc::now().naive_utc());
-    let sec_of_day = (now_ist.time().hour() * 3600
-        + now_ist.time().minute() * 60
-        + now_ist.time().second()) as u32;
+    let sec_of_day =
+        now_ist.time().hour() * 3600 + now_ist.time().minute() * 60 + now_ist.time().second();
     minute_index_for_ist_seconds(sec_of_day).is_some()
 }
 

@@ -144,7 +144,7 @@ pub fn spawn_daily_refresh_task(
         if !config.enabled {
             // GAP-CFG-01: scheduler disabled — park until shutdown
             info!("daily instrument refresh scheduler disabled");
-            let _ = shutdown_rx.changed().await;
+            drop(shutdown_rx.changed().await);
             return;
         }
 

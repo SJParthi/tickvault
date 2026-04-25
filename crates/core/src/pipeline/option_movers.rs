@@ -310,7 +310,7 @@ impl OptionMoversTracker {
                 .filter(|e| e.oi >= MIN_OI_THRESHOLD)
                 .cloned()
                 .collect();
-            v.sort_unstable_by(|a, b| b.oi.cmp(&a.oi));
+            v.sort_unstable_by_key(|e| std::cmp::Reverse(e.oi));
             v.truncate(TOP_N);
             v
         };
@@ -350,7 +350,7 @@ impl OptionMoversTracker {
         // 4. Top Volume — sort by volume descending
         let top_volume = {
             let mut v = entries.clone();
-            v.sort_unstable_by(|a, b| b.volume.cmp(&a.volume));
+            v.sort_unstable_by_key(|e| std::cmp::Reverse(e.volume));
             v.truncate(TOP_N);
             v
         };

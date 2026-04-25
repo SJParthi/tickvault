@@ -130,8 +130,7 @@ pub fn decide_recovery(
     is_trading_day: bool,
 ) -> RecoveryDecision {
     let in_market_hours = is_trading_day
-        && now_sec_of_day_ist >= PHASE2_TRIGGER_SECS_IST
-        && now_sec_of_day_ist < MARKET_CLOSE_SECS_IST;
+        && (PHASE2_TRIGGER_SECS_IST..MARKET_CLOSE_SECS_IST).contains(&now_sec_of_day_ist);
     let pre_trigger_trading_day = is_trading_day && now_sec_of_day_ist < PHASE2_TRIGGER_SECS_IST;
 
     // Case A — valid today-dated snapshot wins every time. The

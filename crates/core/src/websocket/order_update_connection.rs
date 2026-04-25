@@ -170,8 +170,7 @@ pub async fn run_order_update_connection(
 // ---------------------------------------------------------------------------
 
 /// Single connection lifecycle: connect → login → read loop.
-#[allow(clippy::too_many_arguments)] // APPROVED: STAGE-C added wal_spill param
-#[allow(clippy::too_many_arguments)] // APPROVED: STAGE-C + O2 authenticated signal
+#[allow(clippy::too_many_arguments)] // APPROVED: STAGE-C wal_spill + O2 authenticated signal
 async fn connect_and_listen(
     url: &str,
     client_id: &str,
@@ -221,14 +220,14 @@ async fn connect_and_listen(
     // reconnect. A reconnect is defined as "connect() succeeded AND we
     // had >=1 prior consecutive failure". First boot (failures=0) does
     // not qualify — `OrderUpdateConnected` covers that already.
-    if failures_before_attempt > 0 {
-        if let Some(n) = notifier {
-            n.notify(
-                crate::notification::events::NotificationEvent::OrderUpdateReconnected {
-                    consecutive_failures: failures_before_attempt,
-                },
-            );
-        }
+    if failures_before_attempt > 0
+        && let Some(n) = notifier
+    {
+        n.notify(
+            crate::notification::events::NotificationEvent::OrderUpdateReconnected {
+                consecutive_failures: failures_before_attempt,
+            },
+        );
     }
 
     let m_active = metrics::gauge!("tv_order_update_ws_active");

@@ -251,11 +251,9 @@ impl GreeksEnricher for InlineGreeksComputer {
             // Index / equity: update underlying LTP cache, no Greeks.
             Some(
                 ExchangeSegment::IdxI | ExchangeSegment::NseEquity | ExchangeSegment::BseEquity,
-            ) => {
-                if tick.last_traded_price > 0.0 && tick.last_traded_price.is_finite() {
-                    self.underlying_ltp
-                        .insert(tick.security_id, tick.last_traded_price);
-                }
+            ) if tick.last_traded_price > 0.0 && tick.last_traded_price.is_finite() => {
+                self.underlying_ltp
+                    .insert(tick.security_id, tick.last_traded_price);
             }
             // F&O: compute Greeks for options.
             Some(ExchangeSegment::NseFno | ExchangeSegment::BseFno) => {

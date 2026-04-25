@@ -385,10 +385,10 @@ pub fn next_phase2_trigger(
 
     if now_ist_time < trigger {
         // Before 09:12 — sleep until the trigger.
-        let secs_until = match (trigger - now_ist_time).num_seconds().try_into() {
-            Ok(s) => s,
-            Err(_) => 0,
-        };
+        let secs_until = (trigger - now_ist_time)
+            .num_seconds()
+            .try_into()
+            .unwrap_or_default();
         return NextTrigger::SleepUntil {
             duration: Duration::from_secs(secs_until),
         };
