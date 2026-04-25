@@ -220,19 +220,27 @@ summary file and drives the above flow.
       instruments, clear-spill — all three scaffolded, refresh-instruments
       fully functional today); Phase 8.2 Lambda bridge deferred until
       AWS instance provisioned
+- [x] **Phase 9.1** — Grafana Operator Health single-page dashboard
+      shipped: `deploy/docker/grafana/dashboards/operator-health.json`
+      pinned by `crates/storage/tests/operator_health_dashboard_guard.rs`.
 - [x] **Phase 9.2** — `scripts/validate-automation.sh` + `make
-      validate-automation` runs 20 end-to-end checks;
-      Phase 9.1 Grafana Operator Health dashboard still pending
-- [~] **Phase 10.1** — Zero-tick-loss alert guard (4 Prometheus alerts
-      pinned, 7 source-invariant tests); Phase 10.2 sequence-hole
-      detector and 10.3 chaos test still pending
-- [~] **Phase 11** — WS + QuestDB + Valkey resilience SLA ALERT GUARD
+      validate-automation` runs 20 end-to-end checks.
+- [x] **Phase 10.1** — Zero-tick-loss alert guard (4 Prometheus alerts
+      pinned, 7 source-invariant tests).
+- [x] **Phase 10.2** — Sequence-hole detector shipped:
+      `crates/core/src/pipeline/depth_sequence_tracker.rs` with
+      `dhat_depth_sequence_tracker.rs` (zero-alloc) and
+      `loom_depth_sequence_tracker.rs` (concurrency) ratchets.
+- [x] **Phase 10.3** — Tick-loss chaos test shipped:
+      `crates/storage/tests/chaos_zero_tick_loss.rs`.
+- [x] **Phase 11** — WS + QuestDB + Valkey resilience SLA ALERT GUARD
       shipped (`crates/storage/tests/resilience_sla_alert_guard.rs`,
       6 tests, 6 alert rules + 6 metric emissions pinned). Chaos
-      integration tests (11.1 nightly chaos, 11.2 backpressure sim,
-      11.3 Valkey kill-test) still pending — require a test harness
-      that can kill + restore Docker services from within the CI
-      runner. Next session.
+      integration tests now also shipped: `chaos_questdb_docker_pause.rs`
+      (Phase 11.1 nightly chaos), `chaos_rescue_ring_overflow.rs` +
+      `chaos_ws_frame_spill_saturation.rs` (Phase 11.2 backpressure sim),
+      `chaos_valkey_kill.rs` (Phase 11.3 Valkey kill-test). Total chaos
+      tests in workspace: 16.
 - [x] **Phase 12.1** — 100% line coverage threshold set in
       `quality/crate-coverage-thresholds.toml`, enforced by
       `scripts/coverage-gate.sh` in CI
@@ -246,12 +254,12 @@ summary file and drives the above flow.
 - [x] **Phase 12.2** — Mutation zero-survivor gate already active in
       `.github/workflows/mutation.yml:103-113` — any `SURVIVED` line
       in results fails the PR.
-- [~] **Phase 12.3** — Fuzz duration. Current config:
-      5 min/target/week (tick_parser, config_parser). "24h clean"
-      aspiration would exceed GitHub Actions free-tier budget —
+- [~] **Phase 12.3** — Fuzz duration. Current default config in
+      `.github/workflows/fuzz.yml` is 1 hour per target per run
+      (`FUZZ_SECS: 3600`, overridable via workflow_dispatch). "24h
+      clean" aspiration would exceed GitHub Actions free-tier budget —
       deferred until either (a) operator confirms paid-tier OK
-      or (b) we self-host the fuzz runner. Mid-point bump to
-      1h/target/week is a reasonable next step if cost allows.
+      or (b) we self-host the fuzz runner.
 - [x] ~~**Phase 12.4** `#![deny(warnings)]` workspace-wide~~ SKIPPED —
       future toolchain deprecation warnings would silently break
       prod builds; the targeted lints already in place
