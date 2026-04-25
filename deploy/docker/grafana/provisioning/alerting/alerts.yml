@@ -2,7 +2,11 @@
 # tickvault — Grafana Alerting Provisioning
 # =============================================================================
 # Auto-configures alert rules and notification policies.
-# Uses Grafana's built-in default contact point so provisioning never fails.
+# Defines the `grafana-default-email` contact point explicitly because
+# Grafana 13+ requires every receiver referenced in `policies` to be
+# defined here (v12 accepted the implicit built-in default; v13 errors out
+# with "receiver 'grafana-default-email' does not exist" and refuses to
+# start the provisioning module → container crash-restart loop).
 #
 # Telegram contact point: configured via Grafana API by setup-observability.sh
 # ONLY when credentials exist in AWS SSM. This prevents Grafana from crash-looping
@@ -10,6 +14,23 @@
 # =============================================================================
 
 apiVersion: 1
+
+# -- Contact Points -----------------------------------------------------------
+# Provides the `grafana-default-email` receiver referenced by `policies`
+# below. The address is a deliberately invalid placeholder — alerts are
+# routed to Telegram via setup-observability.sh, not email. SMTP is not
+# configured, so this receiver never actually sends mail. Its sole purpose
+# is to satisfy Grafana 13's strict provisioning validation.
+contactPoints:
+  - orgId: 1
+    name: grafana-default-email
+    receivers:
+      - uid: grafana-default-email-receiver
+        type: email
+        settings:
+          addresses: alerts@tickvault.local
+          singleEmail: false
+        disableResolveMessage: false
 
 # -- Notification Policies ----------------------------------------------------
 # Uses Grafana's built-in default receiver. setup-observability.sh upgrades
