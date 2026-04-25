@@ -357,7 +357,9 @@ services:
   # NovelErrorSignature) via Alertmanager → Telegram.
   # ---------------------------------------------------------------------------
   tv-loki:
-    image: grafana/loki:3.6.6
+    # 2026-04-25: SHA256 digest pinned per CLAUDE.md "All images pinned with
+    # SHA256 digest". Linux/amd64 digest from Docker Hub registry.
+    image: grafana/loki:3.6.6@sha256:ea32fad24c19145c73c606409d20db34a5b1d1d22c3fd7075bac3a40487c7a42
     container_name: tv-loki
     hostname: tv-loki
     profiles:
@@ -387,7 +389,9 @@ services:
   # forwards everything to tv-loki. 256MB memory.
   # ---------------------------------------------------------------------------
   tv-alloy:
-    image: grafana/alloy:v1.8.0
+    # 2026-04-25: SHA256 digest pinned per CLAUDE.md "All images pinned with
+    # SHA256 digest". Linux/amd64 digest from Docker Hub registry.
+    image: grafana/alloy:v1.8.0@sha256:769a27e1b26fcd37f7f7c611fff66d0f550d4888c7698c2396bf50b68fdc952f
     container_name: tv-alloy
     hostname: tv-alloy
     profiles:
