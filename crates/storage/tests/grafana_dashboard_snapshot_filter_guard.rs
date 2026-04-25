@@ -34,6 +34,7 @@
 
 #![cfg(test)]
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 /// Lifecycle tables — queries on these must filter on `status`.
@@ -571,4 +572,492 @@ fn self_test_extract_raw_sql_queries_handles_escaped_newlines() {
     assert_eq!(queries.len(), 1);
     assert!(queries[0].contains("FROM fno_underlyings"));
     assert!(queries[0].contains('\n'));
+}
+
+// ============================================================================
+// Rule 12 (audit-findings-2026-04-17.md) — Dashboard counter wrapper guard
+// ============================================================================
+//
+// Any Prometheus *counter* shown as a raw value (not `rate()`/`increase()`/
+// `delta()`/`irate()`) lies to the operator after the process restarts:
+// the counter resets to 0 and the panel reads "0" while drops are actively
+// happening. The 2026-04-24 audit finding #5 (PR #346) wrapped two counters
+// (`tv_ticks_dropped_total`, `tv_ticks_spilled_total`) in `increase(...[5m])`.
+// This guard prevents the regression class.
+//
+// Strategy:
+//   1. Auto-discover counter names from the source tree by scanning
+//      `metrics::counter!("tv_xxx")` and `counter!("tv_xxx")` invocations
+//      across `crates/**/src/**/*.rs`.  Source is single source of truth —
+//      gauges (which legitimately appear bare) are never picked up.
+//   2. For each Grafana dashboard JSON, extract every `"expr": "..."`
+//      string (Prometheus expressions, distinct from `rawSql` SQL strings).
+//   3. For each occurrence of a discovered counter name in an expr,
+//      check whether its IMMEDIATELY enclosing function call is one of
+//      `rate` / `increase` / `delta` / `irate`. Aggregations like
+//      `sum(...)` or `topk(...)` are NOT enough on their own — they
+//      aggregate raw counter values which still go to 0 after restart.
+//   4. Bare counter usage = violation. KNOWN_BARE_COUNTERS is a ratchet
+//      allowlist that can only shrink (each removal = one panel fixed).
+//
+// Why a ratchet: dashboards have ~30 historical bare-counter panels. We
+// fix them in waves and tighten the allowlist each PR. The companion
+// `known_bare_counter_entries_must_actually_be_bare` test ensures stale
+// entries cannot accumulate — the moment a dashboard is fixed, the
+// matching allowlist entry MUST be removed in the same PR.
+
+/// Allowed wrapper functions whose immediate body sanitises a counter
+/// against process restarts.  `rate()`/`irate()`/`increase()`/`delta()`
+/// all treat counter resets as zero and emit a per-second / per-window
+/// value that survives restart.
+const COUNTER_RESET_SAFE_WRAPPERS: &[&str] = &["rate", "irate", "increase", "delta"];
+
+/// Ratchet allowlist of `(dashboard_file, counter_metric)` pairs that are
+/// currently rendered as bare counters. Each entry is a known papercut.
+/// **The list can only shrink.** Adding a new bare counter is blocked.
+/// Removing an entry must be paired with an actual dashboard fix in the
+/// same commit (enforced by `known_bare_counter_entries_must_actually_be_bare`).
+///
+/// Format: `(dashboard_filename, counter_metric_name)`. A single entry
+/// covers ALL panels in that file using that counter — operator may have
+/// multiple panels in one dashboard for the same counter, all need wrapping
+/// at once.
+const KNOWN_BARE_COUNTERS: &[(&str, &str)] = &[
+    // depth-flow.json — FIXED in this commit, all entries removed.
+    // (orphan `tv_depth_stale_spot_total` is a dashboard-only reference
+    // with no source emission, so the discoverer never sees it.)
+    // tv-health.json — FIXED in this commit, all 9 counter panels wrapped
+    // in `increase(...[5m])`.
+    // trading-pipeline.json — FIXED in this commit. All 14 raw counters
+    // wrapped in `increase(...[5m])`. The 3 `sum(metric)` panels rewritten
+    // to `sum(increase(metric[5m]))` (sum() alone is still bare because it
+    // does not handle counter resets, only rate/increase/delta/irate do).
+    // trading-flow.json — orphan: dashboard panel with no source emission.
+    // ("trading-flow.json", "tv_oms_reconciliation_mismatches_total"),
+    // auth-health.json — orphan: dashboard panel with no source emission.
+    // ("auth-health.json", "tv_ip_mismatch_total"),
+];
+
+/// Discovered counter names from source code. Cached at first call.
+/// Pure function — caller passes the workspace root.
+fn discover_counter_metric_names(workspace_root: &Path) -> BTreeSet<String> {
+    let mut out: BTreeSet<String> = BTreeSet::new();
+    for crate_dir in &["common", "core", "trading", "storage", "api", "app"] {
+        let src = workspace_root.join("crates").join(crate_dir).join("src");
+        if !src.is_dir() {
+            continue;
+        }
+        scan_dir_for_counter_names(&src, &mut out);
+    }
+    out
+}
+
+fn scan_dir_for_counter_names(dir: &Path, out: &mut BTreeSet<String>) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            scan_dir_for_counter_names(&path, out);
+        } else if path.extension().and_then(|s| s.to_str()) == Some("rs") {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                extract_counter_names_from_source(&content, out);
+            }
+        }
+    }
+}
+
+/// Pure: pull metric names from `metrics::counter!("tv_xxx")` and
+/// `counter!("tv_xxx")` invocations. The `metrics` crate also exposes
+/// `register_counter!` (deprecated) and `describe_counter!`; both handled.
+///
+/// Tolerates whitespace and newlines between `(` and the opening quote
+/// (the codebase uses multi-line macro invocations for labelled counters).
+fn extract_counter_names_from_source(content: &str, out: &mut BTreeSet<String>) {
+    for needle in &["counter!(", "register_counter!(", "describe_counter!("] {
+        let mut rest = content;
+        while let Some(idx) = rest.find(needle) {
+            let after = &rest[idx + needle.len()..];
+            // Skip whitespace (incl. newlines + indentation) until the
+            // opening quote of the metric name. Bail if we hit a non-
+            // whitespace, non-quote byte first — that's a non-literal
+            // call (e.g. variable name passed as identifier).
+            let bytes = after.as_bytes();
+            let mut i = 0;
+            while i < bytes.len() && (bytes[i] as char).is_whitespace() {
+                i += 1;
+            }
+            if i >= bytes.len() || bytes[i] != b'"' {
+                rest = &after[i..];
+                continue;
+            }
+            i += 1;
+            let name_start = i;
+            while i < bytes.len() && bytes[i] != b'"' {
+                i += 1;
+            }
+            if i >= bytes.len() {
+                break;
+            }
+            let name = &after[name_start..i];
+            if name.starts_with("tv_") {
+                out.insert(name.to_owned());
+            }
+            rest = &after[i..];
+        }
+    }
+}
+
+/// Pure: extract every `"expr": "..."` Prometheus expression from a
+/// dashboard JSON. Excludes `"rawSql": "..."` SQL queries (handled by
+/// the lifecycle guard above). Returns the unescaped expression strings.
+fn extract_promql_exprs(json: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let needle = "\"expr\":";
+    let mut rest = json;
+    while let Some(idx) = rest.find(needle) {
+        let after = &rest[idx + needle.len()..];
+        let start_quote = match after.find('"') {
+            Some(p) => p + 1,
+            None => break,
+        };
+        let body = &after[start_quote..];
+        let mut end = 0;
+        let bytes = body.as_bytes();
+        while end < bytes.len() {
+            if bytes[end] == b'\\' && end + 1 < bytes.len() {
+                end += 2;
+                continue;
+            }
+            if bytes[end] == b'"' {
+                break;
+            }
+            end += 1;
+        }
+        if end >= bytes.len() {
+            break;
+        }
+        let raw = &body[..end];
+        let expr = raw
+            .replace("\\n", "\n")
+            .replace("\\\"", "\"")
+            .replace("\\\\", "\\");
+        out.push(expr);
+        rest = &body[end..];
+    }
+    out
+}
+
+/// Pure: returns true if `expr` contains a bare (unwrapped) reference to
+/// `counter`. A reference is "bare" iff at least one occurrence of the
+/// counter name is NOT immediately enclosed by one of the
+/// COUNTER_RESET_SAFE_WRAPPERS.
+///
+/// Reference enclosure detection: walk left from the metric position and
+/// count parens. The first `(` we encounter at `depth = -1` (i.e. the
+/// opening paren of the immediate enclosing call) is preceded by an
+/// identifier — if that identifier is one of the safe wrappers, the
+/// occurrence is wrapped.
+///
+/// Multiple occurrences of the same counter in one expr: ANY bare
+/// occurrence flags the expr.
+fn expr_uses_counter_bare(expr: &str, counter: &str) -> bool {
+    let bytes = expr.as_bytes();
+    let counter_bytes = counter.as_bytes();
+    let mut search_from = 0;
+    while let Some(idx) = expr[search_from..].find(counter) {
+        let pos = search_from + idx;
+        // Word boundary check: the byte before pos must not be an identifier
+        // char, and the byte at pos+counter.len() must not be one either.
+        // Otherwise `tv_foo_total` would match inside `tv_foo_total_extended`.
+        let left_ok = pos == 0 || !is_ident_byte(bytes[pos - 1]);
+        let right_idx = pos + counter_bytes.len();
+        let right_ok = right_idx >= bytes.len() || !is_ident_byte(bytes[right_idx]);
+        if !left_ok || !right_ok {
+            search_from = pos + 1;
+            continue;
+        }
+
+        // Walk left from pos. Track paren depth. depth starts at 0; each
+        // ')' before pos increases depth (we are inside it), each '('
+        // before pos decreases depth. When depth becomes -1 we have
+        // found the immediate enclosing '(' — read the identifier
+        // immediately to its left.
+        let mut depth: i32 = 0;
+        let mut wrapper: Option<String> = None;
+        let mut i = pos;
+        while i > 0 {
+            i -= 1;
+            let c = bytes[i];
+            if c == b')' {
+                depth += 1;
+            } else if c == b'(' {
+                depth -= 1;
+                if depth < 0 {
+                    // Read identifier immediately before this '('.
+                    let mut j = i;
+                    while j > 0 && (bytes[j - 1] == b' ' || bytes[j - 1] == b'\t') {
+                        j -= 1;
+                    }
+                    let id_end = j;
+                    while j > 0 && is_ident_byte(bytes[j - 1]) {
+                        j -= 1;
+                    }
+                    if j < id_end {
+                        wrapper = Some(expr[j..id_end].to_owned());
+                    }
+                    break;
+                }
+            }
+        }
+
+        let is_wrapped = wrapper
+            .as_deref()
+            .is_some_and(|w| COUNTER_RESET_SAFE_WRAPPERS.contains(&w));
+        if !is_wrapped {
+            return true;
+        }
+        search_from = pos + counter_bytes.len();
+    }
+    false
+}
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Resolve workspace root from this crate's manifest dir.
+fn workspace_root() -> PathBuf {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    manifest_dir
+        .parent()
+        .and_then(Path::parent)
+        .expect("workspace root must exist")
+        .to_path_buf()
+}
+
+#[test]
+fn dashboard_counters_must_be_wrapped_in_increase_or_rate() {
+    let dashboards = read_all_dashboards();
+    let counters = discover_counter_metric_names(&workspace_root());
+    assert!(
+        !counters.is_empty(),
+        "auto-discovery returned zero counter names — scanner regressed"
+    );
+
+    let allow: BTreeSet<(&str, &str)> = KNOWN_BARE_COUNTERS.iter().copied().collect();
+    let mut violations: Vec<String> = Vec::new();
+
+    for (file, json) in &dashboards {
+        let exprs = extract_promql_exprs(json);
+        for expr in &exprs {
+            for counter in &counters {
+                if !expr_uses_counter_bare(expr, counter) {
+                    continue;
+                }
+                if allow.contains(&(file.as_str(), counter.as_str())) {
+                    continue;
+                }
+                violations.push(format!(
+                    "[{file}] counter `{counter}` rendered bare in PromQL \
+                     expression — wrap it in `increase({counter}[5m])` or \
+                     `rate({counter}[5m])`. Bare counters reset to 0 after \
+                     restart and silently lie to the operator about ongoing \
+                     activity. (See audit-findings-2026-04-17.md Rule 12 + \
+                     PR #346 for the reference fix.)\n  expr: {}",
+                    expr.replace('\n', " ")
+                        .chars()
+                        .take(200)
+                        .collect::<String>()
+                ));
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "Rule 12 violation — Grafana dashboard panels render bare \
+         Prometheus counters. After process restart these panels read 0 \
+         even when drops are happening. Wrap each in `increase(...[5m])` \
+         or `rate(...[5m])`.\n\n{}\n\n\
+         If the metric is intentionally a gauge (despite the `_total` \
+         suffix), confirm it is registered with `metrics::gauge!` (NOT \
+         `metrics::counter!`); only counter-registered metrics are flagged.",
+        violations.join("\n\n")
+    );
+}
+
+/// Ratchet integrity: if a dashboard is FIXED to wrap a previously-bare
+/// counter, the corresponding `KNOWN_BARE_COUNTERS` entry MUST be removed
+/// in the same commit. Otherwise the allowlist accumulates stale entries
+/// and the guard silently weakens.
+#[test]
+fn known_bare_counter_entries_must_actually_be_bare() {
+    let dashboards = read_all_dashboards();
+    let counters = discover_counter_metric_names(&workspace_root());
+
+    // Build a quick lookup: (file, counter) -> bare?
+    let mut still_bare: BTreeSet<(String, String)> = BTreeSet::new();
+    for (file, json) in &dashboards {
+        let exprs = extract_promql_exprs(json);
+        for expr in &exprs {
+            for counter in &counters {
+                if expr_uses_counter_bare(expr, counter) {
+                    still_bare.insert((file.clone(), counter.clone()));
+                }
+            }
+        }
+    }
+
+    let mut stale: Vec<(&str, &str)> = Vec::new();
+    for &(file, counter) in KNOWN_BARE_COUNTERS {
+        if !still_bare.contains(&(file.to_owned(), counter.to_owned())) {
+            stale.push((file, counter));
+        }
+    }
+
+    assert!(
+        stale.is_empty(),
+        "Rule 12 ratchet violation — KNOWN_BARE_COUNTERS contains \
+         entries that are no longer bare on the dashboard. The dashboard \
+         was fixed but the allowlist entry was not removed. Remove these \
+         entries from KNOWN_BARE_COUNTERS in the SAME commit that fixed \
+         the dashboard:\n\n{}",
+        stale
+            .iter()
+            .map(|(f, c)| format!("  ({f:?}, {c:?}),"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+#[test]
+fn rule12_self_test_extract_promql_exprs_finds_simple_expr() {
+    let json = r#"{ "expr": "tv_foo_total" }"#;
+    let exprs = extract_promql_exprs(json);
+    assert_eq!(exprs, vec!["tv_foo_total".to_string()]);
+}
+
+#[test]
+fn rule12_self_test_extract_promql_exprs_skips_rawsql() {
+    // `rawSql` strings must not be extracted by the PromQL extractor —
+    // they are SQL queries handled by the lifecycle guard above.
+    let json = r#"{ "rawSql": "SELECT 1 FROM ticks" }"#;
+    let exprs = extract_promql_exprs(json);
+    assert!(exprs.is_empty());
+}
+
+#[test]
+fn rule12_self_test_bare_counter_detected() {
+    assert!(expr_uses_counter_bare("tv_foo_total", "tv_foo_total"));
+}
+
+#[test]
+fn rule12_self_test_increase_wrap_accepted() {
+    assert!(!expr_uses_counter_bare(
+        "increase(tv_foo_total[5m])",
+        "tv_foo_total"
+    ));
+}
+
+#[test]
+fn rule12_self_test_rate_wrap_accepted() {
+    assert!(!expr_uses_counter_bare(
+        "rate(tv_foo_total[1m])",
+        "tv_foo_total"
+    ));
+}
+
+#[test]
+fn rule12_self_test_delta_wrap_accepted() {
+    assert!(!expr_uses_counter_bare(
+        "delta(tv_foo_total[10m])",
+        "tv_foo_total"
+    ));
+}
+
+#[test]
+fn rule12_self_test_irate_wrap_accepted() {
+    assert!(!expr_uses_counter_bare(
+        "irate(tv_foo_total[30s])",
+        "tv_foo_total"
+    ));
+}
+
+#[test]
+fn rule12_self_test_sum_alone_rejected() {
+    // sum() is not enough — it aggregates raw counter values that still
+    // reset to 0 on restart.
+    assert!(expr_uses_counter_bare("sum(tv_foo_total)", "tv_foo_total"));
+}
+
+#[test]
+fn rule12_self_test_sum_of_increase_accepted() {
+    assert!(!expr_uses_counter_bare(
+        "sum(increase(tv_foo_total[5m]))",
+        "tv_foo_total"
+    ));
+}
+
+#[test]
+fn rule12_self_test_word_boundary_avoids_false_positive() {
+    // `tv_foo_total` should NOT match inside `tv_foo_total_extended`.
+    assert!(!expr_uses_counter_bare(
+        "tv_foo_total_extended",
+        "tv_foo_total"
+    ));
+}
+
+#[test]
+fn rule12_self_test_label_filter_treated_as_bare() {
+    // `tv_foo_total{instance="x"}` is bare — label selectors are not a
+    // wrapper; they restrict series, not handle counter resets.
+    assert!(expr_uses_counter_bare(
+        "tv_foo_total{instance=\"x\"}",
+        "tv_foo_total"
+    ));
+}
+
+#[test]
+fn rule12_self_test_multiple_occurrences_any_bare_flags() {
+    // First occurrence is wrapped, second is bare → must flag.
+    let expr = "increase(tv_foo_total[5m]) - tv_foo_total";
+    assert!(expr_uses_counter_bare(expr, "tv_foo_total"));
+}
+
+#[test]
+fn rule12_self_test_discover_picks_up_counter_macro() {
+    let mut out = BTreeSet::new();
+    extract_counter_names_from_source("let _ = metrics::counter!(\"tv_xyz_total\");", &mut out);
+    assert!(out.contains("tv_xyz_total"));
+}
+
+#[test]
+fn rule12_self_test_discover_ignores_gauge_macro() {
+    let mut out = BTreeSet::new();
+    // Gauges legitimately appear bare on dashboards; the discoverer
+    // must not pick them up.
+    extract_counter_names_from_source("let _ = metrics::gauge!(\"tv_some_gauge\");", &mut out);
+    assert!(out.is_empty());
+}
+
+#[test]
+fn rule12_self_test_discover_ignores_non_tv_prefix() {
+    let mut out = BTreeSet::new();
+    extract_counter_names_from_source("let _ = metrics::counter!(\"some_other_total\");", &mut out);
+    assert!(out.is_empty());
+}
+
+#[test]
+fn rule12_self_test_known_bare_counter_pairs_unique() {
+    // Catch accidental duplicate entries in the ratchet.
+    let mut seen: BTreeSet<(&str, &str)> = BTreeSet::new();
+    for &pair in KNOWN_BARE_COUNTERS {
+        assert!(
+            seen.insert(pair),
+            "duplicate KNOWN_BARE_COUNTERS entry: {pair:?}"
+        );
+    }
 }

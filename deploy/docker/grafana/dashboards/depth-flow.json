@@ -107,7 +107,7 @@
       "gridPos": { "h": 5, "w": 6, "x": 18, "y": 4 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
-        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "tv_deep_depth_dropped_total", "refId": "A" }
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "increase(tv_deep_depth_dropped_total[5m])", "refId": "A" }
       ],
       "fieldConfig": {
         "defaults": {
@@ -194,7 +194,7 @@
       "gridPos": { "h": 5, "w": 6, "x": 18, "y": 10 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
-        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "tv_depth_spilled_total", "refId": "A" }
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "increase(tv_depth_spilled_total[5m])", "refId": "A" }
       ],
       "fieldConfig": {
         "defaults": {
