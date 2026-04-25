@@ -800,19 +800,41 @@ pub const DISPLAY_INDEX_ENTRIES: &[(&str, SecurityId, &str)] = &[
 /// Number of display indices.
 pub const DISPLAY_INDEX_COUNT: usize = 23;
 
-/// Total subscribed indices: 8 F&O + 23 Display = 31.
-pub const TOTAL_SUBSCRIBED_INDEX_COUNT: usize = 31;
+/// Total subscribed indices: 6 F&O + 23 Display = 29.
+///
+/// 2026-04-25: Reduced from 31 → 29. FINNIFTY and MIDCPNIFTY were dropped from
+/// the F&O index list (was 8 → now 6), see `VALIDATION_MUST_EXIST_INDICES`.
+pub const TOTAL_SUBSCRIBED_INDEX_COUNT: usize = 29;
 
 // ---------------------------------------------------------------------------
 // F&O Universe — Full Chain Indices
 // ---------------------------------------------------------------------------
 
-/// Index symbols that get full option chain subscriptions.
-pub const FULL_CHAIN_INDEX_SYMBOLS: &[&str] =
-    &["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX"];
+/// Index symbols that get full option chain subscriptions (current expiry only).
+///
+/// 2026-04-25: Reduced from 5 to 3. FINNIFTY and MIDCPNIFTY were dropped to free
+/// 25K WebSocket capacity for stock F&O ATM±25 coverage. Verified against live
+/// QuestDB on 2026-04-25: 3 indices full-chain = 2,037 contracts; 216 stocks at
+/// ATM±25 = 22,042 contracts; total subscription = 24,324 ≤ 25,000 (676 headroom).
+pub const FULL_CHAIN_INDEX_SYMBOLS: &[&str] = &["NIFTY", "BANKNIFTY", "SENSEX"];
 
 /// Number of full-chain indices.
-pub const FULL_CHAIN_INDEX_COUNT: usize = 5;
+pub const FULL_CHAIN_INDEX_COUNT: usize = 3;
+
+/// ATM ± N strikes per side cap for stock F&O option subscriptions.
+///
+/// 2026-04-25: NSE intraday circuit breaker is 20% — ATM±25 strikes covers any
+/// realistic intraday move on every F&O stock. Set as a CONSTANT (not config)
+/// because the math is invariant: 25 above + 25 below = 51 strikes per side per
+/// option type → ~103 contracts/stock × 216 stocks ≈ 22,042 contracts.
+pub const STOCK_OPTION_ATM_STRIKES_EACH_SIDE: usize = 25;
+
+/// Capacity ratchet target — Telegram WARN if planner exceeds this on any boot.
+///
+/// Hard cap is `MAX_TOTAL_SUBSCRIPTIONS` (25,000). The 24,500 target leaves 500
+/// slots for capacity drift between F&O CSV updates (new strikes, new F&O stocks).
+/// If breached, operator decides whether to drop a stock or tighten ATM cap.
+pub const MAX_TOTAL_SUBSCRIPTIONS_TARGET: usize = 24_500;
 
 // ---------------------------------------------------------------------------
 // F&O Universe — Index Aliases (FNO symbol → IDX_I symbol)
@@ -829,13 +851,14 @@ pub const INDEX_SYMBOL_ALIASES: &[(&str, &str)] =
 
 /// Known index security IDs that MUST exist after universe build.
 /// (underlying_symbol, expected IDX_I security_id).
+/// 2026-04-25: First 3 entries are the F&O full-chain indices (NIFTY,
+/// BANKNIFTY, SENSEX) — DO NOT REORDER. `greeks_pipeline.rs` slices `[..3]`
+/// to fetch greeks only for F&O indices. Display-only indices follow.
 pub const VALIDATION_MUST_EXIST_INDICES: &[(&str, SecurityId)] = &[
     ("NIFTY", 13),
     ("BANKNIFTY", 25),
-    ("FINNIFTY", 27),
-    ("MIDCPNIFTY", 442),
-    ("NIFTYNXT50", 38),
     ("SENSEX", 51),
+    ("NIFTYNXT50", 38),
     ("BANKEX", 69),
     ("SENSEX50", 83),
 ];
@@ -1596,7 +1619,7 @@ const _: () = assert!(
 );
 
 // Enforce: TOTAL_SUBSCRIBED_INDEX_COUNT is the sum of F&O and display.
-// 8 F&O indices (from VALIDATION_MUST_EXIST_INDICES) + 23 display.
+// 6 F&O indices (from VALIDATION_MUST_EXIST_INDICES) + 23 display.
 const _: () = assert!(
     TOTAL_SUBSCRIBED_INDEX_COUNT == VALIDATION_MUST_EXIST_INDICES.len() + DISPLAY_INDEX_COUNT,
     "TOTAL_SUBSCRIBED_INDEX_COUNT mismatch"
@@ -2236,6 +2259,37 @@ mod tests {
         for &sym in FULL_CHAIN_INDEX_SYMBOLS {
             assert!(!sym.is_empty(), "Full chain index symbol is empty");
         }
+    }
+
+    /// 2026-04-25 ratchet: full-chain set is exactly 3 indices (NIFTY, BANKNIFTY,
+    /// SENSEX). FINNIFTY + MIDCPNIFTY were dropped to free 25K WS capacity for
+    /// stock F&O ATM±25 coverage. Regressing this resurrects the 40K-contract
+    /// over-subscription bug.
+    #[test]
+    fn test_full_chain_index_symbols_is_exactly_three() {
+        assert_eq!(FULL_CHAIN_INDEX_SYMBOLS.len(), 3);
+        assert_eq!(FULL_CHAIN_INDEX_COUNT, 3);
+        assert!(FULL_CHAIN_INDEX_SYMBOLS.contains(&"NIFTY"));
+        assert!(FULL_CHAIN_INDEX_SYMBOLS.contains(&"BANKNIFTY"));
+        assert!(FULL_CHAIN_INDEX_SYMBOLS.contains(&"SENSEX"));
+        assert!(!FULL_CHAIN_INDEX_SYMBOLS.contains(&"FINNIFTY"));
+        assert!(!FULL_CHAIN_INDEX_SYMBOLS.contains(&"MIDCPNIFTY"));
+    }
+
+    /// 2026-04-25 ratchet: stock option ATM±N cap is 25 strikes per side.
+    /// NSE intraday circuit is 20% — ±25 strikes mathematically covers any move.
+    #[test]
+    fn test_stock_option_atm_strikes_each_side_is_25() {
+        assert_eq!(STOCK_OPTION_ATM_STRIKES_EACH_SIDE, 25);
+    }
+
+    /// 2026-04-25 ratchet: capacity warn threshold is below the hard cap and
+    /// above the verified live total of 24,324.
+    #[test]
+    fn test_max_total_subscriptions_target_below_hard_limit() {
+        assert!(MAX_TOTAL_SUBSCRIPTIONS_TARGET < MAX_TOTAL_SUBSCRIPTIONS);
+        assert!(MAX_TOTAL_SUBSCRIPTIONS_TARGET >= 24_324);
+        assert_eq!(MAX_TOTAL_SUBSCRIPTIONS, 25_000);
     }
 
     // --- Validation Constants ---

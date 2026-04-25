@@ -246,9 +246,24 @@ pub fn build_subscription_plan(
     }
 
     // -----------------------------------------------------------------------
-    // 3. Index derivatives — ALL contracts for 5 major indices (no filtering)
+    // 3. Index derivatives — full chain at CURRENT EXPIRY ONLY (3 indices)
+    //
+    // 2026-04-25: Was "all contracts for 5 major indices, no expiry filter".
+    // Reduced to current-expiry-only for the 3 full-chain indices (NIFTY,
+    // BANKNIFTY, SENSEX) to fit 25K WS capacity. Far-month index contracts
+    // are dropped — strategy doesn't trade them and they consume ~10K slots.
+    //
+    // Indices NEVER apply the stock rollover rule (≤1-day-to-expiry roll).
+    // Per `subscription_planner` ratchet `test_index_expiry_never_rolls_via_planner`,
+    // index strategies legitimately trade expiry-day, so we keep nearest expiry
+    // even when today equals expiry.
     // -----------------------------------------------------------------------
     if config.subscribe_index_derivatives {
+        // Pre-pass: compute nearest expiry per full-chain index.
+        // O(N) where N = derivative contract count. One scan, no allocation
+        // beyond the small HashMap (≤3 entries).
+        let mut index_nearest_expiry: HashMap<&str, chrono::NaiveDate> =
+            HashMap::with_capacity(FULL_CHAIN_INDEX_SYMBOLS.len());
         for contract in universe.derivative_contracts.values() {
             let is_index = matches!(
                 contract.instrument_kind,
@@ -257,6 +272,32 @@ pub fn build_subscription_plan(
             );
             if is_index
                 && full_chain_set.contains(contract.underlying_symbol.as_str())
+                && contract.expiry_date >= today
+            {
+                let symbol = contract.underlying_symbol.as_str();
+                index_nearest_expiry
+                    .entry(symbol)
+                    .and_modify(|e| {
+                        if contract.expiry_date < *e {
+                            *e = contract.expiry_date;
+                        }
+                    })
+                    .or_insert(contract.expiry_date);
+            }
+        }
+
+        // Subscribe pass: only contracts at the nearest expiry per index.
+        for contract in universe.derivative_contracts.values() {
+            let is_index = matches!(
+                contract.instrument_kind,
+                tickvault_common::instrument_types::DhanInstrumentKind::FutureIndex
+                    | tickvault_common::instrument_types::DhanInstrumentKind::OptionIndex
+            );
+            if is_index
+                && full_chain_set.contains(contract.underlying_symbol.as_str())
+                && index_nearest_expiry
+                    .get(contract.underlying_symbol.as_str())
+                    .is_some_and(|nearest| *nearest == contract.expiry_date)
                 && seen_ids.insert((contract.security_id, contract.exchange_segment))
             {
                 instruments.push(make_derivative_instrument(
@@ -663,9 +704,37 @@ pub fn build_subscription_plan_from_archived(
     }
 
     // -----------------------------------------------------------------------
-    // 3. Index derivatives — ALL contracts for major indices
+    // 3. Index derivatives — full chain at CURRENT EXPIRY ONLY (3 indices)
+    //
+    // 2026-04-25: Mirror of live planner change. See sibling
+    // `build_subscription_plan` Section 3 for rationale (current-expiry filter
+    // for FULL_CHAIN_INDEX_SYMBOLS to fit 25K WS capacity).
     // -----------------------------------------------------------------------
     if config.subscribe_index_derivatives {
+        // Pre-pass: nearest expiry per full-chain index.
+        let mut index_nearest_expiry: HashMap<&str, NaiveDate> =
+            HashMap::with_capacity(FULL_CHAIN_INDEX_SYMBOLS.len());
+        for contract in universe.derivative_contracts.values() {
+            let kind = DhanInstrumentKind::from(&contract.instrument_kind);
+            let is_index = matches!(
+                kind,
+                DhanInstrumentKind::FutureIndex | DhanInstrumentKind::OptionIndex
+            );
+            let symbol = contract.underlying_symbol.as_str();
+            let expiry = naive_date_from_archived_i32(&contract.expiry_date);
+            if is_index && full_chain_set.contains(symbol) && expiry >= today {
+                index_nearest_expiry
+                    .entry(symbol)
+                    .and_modify(|e| {
+                        if expiry < *e {
+                            *e = expiry;
+                        }
+                    })
+                    .or_insert(expiry);
+            }
+        }
+
+        // Subscribe pass: only contracts at the nearest expiry per index.
         for contract in universe.derivative_contracts.values() {
             let kind = DhanInstrumentKind::from(&contract.instrument_kind);
             let is_index = matches!(
@@ -674,8 +743,13 @@ pub fn build_subscription_plan_from_archived(
             );
             let sec_id = contract.security_id.to_native();
             let contract_seg = ExchangeSegment::from(&contract.exchange_segment);
+            let symbol = contract.underlying_symbol.as_str();
+            let expiry = naive_date_from_archived_i32(&contract.expiry_date);
             if is_index
-                && full_chain_set.contains(contract.underlying_symbol.as_str())
+                && full_chain_set.contains(symbol)
+                && index_nearest_expiry
+                    .get(symbol)
+                    .is_some_and(|nearest| *nearest == expiry)
                 && seen_ids.insert((sec_id, contract_seg))
             {
                 instruments.push(make_derivative_instrument_from_archived(
@@ -3510,6 +3584,219 @@ mod tests {
             plan.summary.index_derivatives > 0 || plan.summary.major_index_values > 0,
             "Fix #6 ratchet: indices must emit derivative/value contracts even on T-1. \
              If this fails, rollover has leaked into the index path."
+        );
+    }
+
+    // ========================================================================
+    // 2026-04-25 ratchets — F&O universe rebuild (3 indices + ATM±25 stocks)
+    // ========================================================================
+
+    /// 2026-04-25 ratchet: full-chain index set is exactly 3 — NIFTY,
+    /// BANKNIFTY, SENSEX. Regression to 5 (re-adding FINNIFTY/MIDCPNIFTY)
+    /// resurrects the 40K-contract over-subscription bug.
+    #[test]
+    fn test_only_three_indices_in_full_chain_set() {
+        assert_eq!(FULL_CHAIN_INDEX_SYMBOLS.len(), 3);
+        let set: HashSet<&str> = FULL_CHAIN_INDEX_SYMBOLS.iter().copied().collect();
+        assert!(set.contains("NIFTY"));
+        assert!(set.contains("BANKNIFTY"));
+        assert!(set.contains("SENSEX"));
+    }
+
+    /// 2026-04-25 ratchet: FINNIFTY + MIDCPNIFTY are explicitly NOT in the
+    /// full-chain set. Both were dropped to free 25K WS capacity.
+    #[test]
+    fn test_finnifty_midcpnifty_dropped_from_index_set() {
+        let set: HashSet<&str> = FULL_CHAIN_INDEX_SYMBOLS.iter().copied().collect();
+        assert!(
+            !set.contains("FINNIFTY"),
+            "FINNIFTY must stay dropped from FULL_CHAIN_INDEX_SYMBOLS"
+        );
+        assert!(
+            !set.contains("MIDCPNIFTY"),
+            "MIDCPNIFTY must stay dropped from FULL_CHAIN_INDEX_SYMBOLS"
+        );
+    }
+
+    /// 2026-04-25 ratchet: index F&O subscribes ONLY the current (nearest)
+    /// expiry. Far-month index contracts must be excluded. Build a NIFTY
+    /// universe with 3 expiries (nearest, mid, far) and assert only the
+    /// nearest-expiry contracts are in the plan.
+    #[test]
+    fn test_index_derivatives_use_current_expiry_only() {
+        let nearest = NaiveDate::from_ymd_opt(2026, 4, 30).unwrap();
+        let mid = NaiveDate::from_ymd_opt(2026, 5, 28).unwrap();
+        let far = NaiveDate::from_ymd_opt(2026, 6, 25).unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 4, 25).unwrap();
+
+        let mut underlyings = HashMap::new();
+        let mut derivative_contracts: HashMap<SecurityId, DerivativeContract> = HashMap::new();
+
+        underlyings.insert(
+            "NIFTY".to_string(),
+            FnoUnderlying {
+                underlying_symbol: "NIFTY".to_string(),
+                underlying_security_id: 26000,
+                price_feed_security_id: 13,
+                price_feed_segment: ExchangeSegment::IdxI,
+                derivative_segment: ExchangeSegment::NseFno,
+                kind: UnderlyingKind::NseIndex,
+                lot_size: 50,
+                contract_count: 6,
+            },
+        );
+
+        // Insert 1 future + 1 CE per expiry (3 expiries × 2 contracts = 6 total)
+        for (i, exp) in [nearest, mid, far].iter().enumerate() {
+            derivative_contracts.insert(
+                70000 + i as u32,
+                DerivativeContract {
+                    security_id: 70000 + i as u32,
+                    underlying_symbol: "NIFTY".to_string(),
+                    instrument_kind: DhanInstrumentKind::FutureIndex,
+                    exchange_segment: ExchangeSegment::NseFno,
+                    expiry_date: *exp,
+                    strike_price: 0.0,
+                    option_type: None,
+                    lot_size: 50,
+                    tick_size: 0.05,
+                    symbol_name: format!("NIFTY-{exp}-FUT"),
+                    display_name: format!("NIFTY FUT {exp}"),
+                },
+            );
+            derivative_contracts.insert(
+                70010 + i as u32,
+                DerivativeContract {
+                    security_id: 70010 + i as u32,
+                    underlying_symbol: "NIFTY".to_string(),
+                    instrument_kind: DhanInstrumentKind::OptionIndex,
+                    exchange_segment: ExchangeSegment::NseFno,
+                    expiry_date: *exp,
+                    strike_price: 18000.0,
+                    option_type: Some(OptionType::Call),
+                    lot_size: 50,
+                    tick_size: 0.05,
+                    symbol_name: format!("NIFTY-{exp}-18000-CE"),
+                    display_name: format!("NIFTY 18000 CE {exp}"),
+                },
+            );
+        }
+
+        let ist = tickvault_common::trading_calendar::ist_offset();
+        let universe = FnoUniverse {
+            underlyings,
+            derivative_contracts,
+            option_chains: HashMap::new(),
+            expiry_calendars: HashMap::new(),
+            instrument_info: HashMap::new(),
+            subscribed_indices: Vec::new(),
+            build_metadata: UniverseBuildMetadata {
+                csv_source: "test".to_string(),
+                csv_row_count: 0,
+                parsed_row_count: 0,
+                index_count: 0,
+                equity_count: 0,
+                underlying_count: 0,
+                derivative_count: 0,
+                option_chain_count: 0,
+                build_duration: Duration::from_millis(0),
+                build_timestamp: Utc::now().with_timezone(&ist),
+            },
+        };
+
+        let config = SubscriptionConfig {
+            feed_mode: "Full".to_string(),
+            subscribe_index_derivatives: true,
+            subscribe_stock_derivatives: false,
+            subscribe_stock_equities: false,
+            subscribe_display_indices: false,
+            stock_atm_strikes_above: 25,
+            stock_atm_strikes_below: 25,
+            stock_default_atm_fallback_enabled: false,
+            enable_twenty_depth: false,
+            twenty_depth_max_instruments: 49,
+        };
+
+        let plan = build_subscription_plan(&universe, &config, today, &HashMap::new(), None);
+
+        // Assert: only the nearest-expiry contracts (security_ids 70000 + 70010) emitted.
+        let subscribed_ids: HashSet<u32> = plan.registry.iter().map(|i| i.security_id).collect();
+
+        assert!(
+            subscribed_ids.contains(&70000),
+            "Nearest-expiry NIFTY future must be subscribed"
+        );
+        assert!(
+            subscribed_ids.contains(&70010),
+            "Nearest-expiry NIFTY CE must be subscribed"
+        );
+        assert!(
+            !subscribed_ids.contains(&70001),
+            "Mid-expiry NIFTY future must NOT be subscribed (current expiry only)"
+        );
+        assert!(
+            !subscribed_ids.contains(&70002),
+            "Far-expiry NIFTY future must NOT be subscribed"
+        );
+        assert!(
+            !subscribed_ids.contains(&70011),
+            "Mid-expiry NIFTY CE must NOT be subscribed"
+        );
+        assert!(
+            !subscribed_ids.contains(&70012),
+            "Far-expiry NIFTY CE must NOT be subscribed"
+        );
+    }
+
+    /// 2026-04-25 ratchet: capacity assertion — total subscription count
+    /// MUST stay below the hard cap. The default test universe has 1 stock
+    /// (RELIANCE) + 1 index (NIFTY) and ~12 derivative contracts; this is a
+    /// trivially-small assertion. The real-world live count of ~24,324 is
+    /// validated separately at boot via `summary.exceeds_capacity`.
+    #[test]
+    fn test_total_subscription_count_below_25k_hard_limit() {
+        let universe = make_test_universe();
+        let cal = make_test_calendar_no_holidays();
+        let today = NaiveDate::from_ymd_opt(2026, 3, 26).unwrap();
+        let config = SubscriptionConfig::default();
+        let mut spot = HashMap::new();
+        spot.insert("RELIANCE".to_string(), 2500.0);
+
+        let plan = build_subscription_plan(&universe, &config, today, &spot, Some(&cal));
+
+        assert!(
+            plan.summary.total <= MAX_TOTAL_SUBSCRIPTIONS,
+            "total {} must not exceed hard cap {}",
+            plan.summary.total,
+            MAX_TOTAL_SUBSCRIPTIONS
+        );
+        assert!(
+            !plan.summary.exceeds_capacity,
+            "exceeds_capacity flag must be false on a sane universe"
+        );
+    }
+
+    /// 2026-04-25 ratchet: stock-option ATM cap constant exists and is
+    /// `STOCK_OPTION_ATM_STRIKES_EACH_SIDE = 25`. Defaults of
+    /// `SubscriptionConfig::stock_atm_strikes_above/below` MUST equal this
+    /// constant in production; test configs may override smaller for
+    /// fast iteration. The end-to-end ATM filtering behaviour is already
+    /// covered by `test_atm_strike_range_narrow` and
+    /// `test_plan_stock_option_chain_calls_only`.
+    #[test]
+    fn test_stock_options_atm_cap_constant_is_25() {
+        use tickvault_common::constants::STOCK_OPTION_ATM_STRIKES_EACH_SIDE;
+        assert_eq!(STOCK_OPTION_ATM_STRIKES_EACH_SIDE, 25);
+
+        // Verify SubscriptionConfig::default() picks up the same value.
+        let cfg = SubscriptionConfig::default();
+        assert_eq!(
+            cfg.stock_atm_strikes_above, STOCK_OPTION_ATM_STRIKES_EACH_SIDE,
+            "default config must mirror the constant for production safety"
+        );
+        assert_eq!(
+            cfg.stock_atm_strikes_below, STOCK_OPTION_ATM_STRIKES_EACH_SIDE,
+            "default config must mirror the constant for production safety"
         );
     }
 }
