@@ -1,9 +1,10 @@
 # Implementation Plan: F&O Universe Rebuild — 3 Indices Full Chain + 216 Stocks ATM±25
 
-**Status:** APPROVED
+**Status:** VERIFIED
 **Date:** 2026-04-25
 **Approved by:** Parthiban ("yes all correct go ahead with the implementation dude okay?")
 **Branch:** `claude/build-fno-universe-Tlb9d`
+**Commits:** e115cfa (Phase 1), e404603 (Phase 2), 44bf076 (Phase 3), 0c386ac (Phase 4)
 
 ## Goal
 
@@ -30,111 +31,111 @@ Rewrite the F&O subscription universe to fit comfortably in the 25,000 WebSocket
 
 ### Phase 1 — Constants + Planner (foundation)
 
-- [ ] **Item 1:** Update `crates/common/src/constants.rs`
+- [x] **Item 1:** Update `crates/common/src/constants.rs`
   - Files: `crates/common/src/constants.rs`
   - Changes: `FULL_CHAIN_INDEX_SYMBOLS` → 3 entries (drop FINNIFTY, MIDCPNIFTY); `FULL_CHAIN_INDEX_COUNT` = 3; `VALIDATION_MUST_EXIST_INDICES` → 3 entries; new `STOCK_OPTION_ATM_STRIKES_EACH_SIDE = 25`; new `MAX_TOTAL_SUBSCRIPTIONS_TARGET = 24_500` (warn threshold)
   - Tests: `test_full_chain_index_symbols_is_three`, `test_validation_must_exist_indices_is_three`, `test_stock_option_atm_strikes_each_side_is_25`, `test_max_total_subscriptions_target_below_hard_limit`
 
-- [ ] **Item 2:** Update `crates/core/src/instrument/subscription_planner.rs` — Index F&O current-expiry filter
+- [x] **Item 2:** Update `crates/core/src/instrument/subscription_planner.rs` — Index F&O current-expiry filter
   - Files: `subscription_planner.rs`
   - Changes: Index F&O branch (lines 249–269) — add `expiry_date >= today` filter; for each index, find `min(expiry_date)` then include only contracts at that nearest expiry
   - Tests: `test_index_derivatives_use_current_expiry_only`, `test_far_month_index_contracts_excluded`
 
-- [ ] **Item 3:** Update `crates/core/src/instrument/subscription_planner.rs` — Stock ATM±25 cap
+- [x] **Item 3:** Update `crates/core/src/instrument/subscription_planner.rs` — Stock ATM±25 cap
   - Files: `subscription_planner.rs`
   - Changes: Stock Stage 1 (lines 289–453) — replace configurable `stock_atm_strikes_above/below` with constant `STOCK_OPTION_ATM_STRIKES_EACH_SIDE = 25`; cap at 25 above + 25 below = 51 strikes per side total
   - Tests: `test_stock_options_capped_at_atm_pm_25`, `test_stock_with_50_strikes_capped_at_25_each_side`
 
-- [ ] **Item 4:** Add capacity ratchet test to `subscription_planner.rs`
+- [x] **Item 4:** Add capacity ratchet test to `subscription_planner.rs`
   - Files: `subscription_planner.rs`
   - Tests: `test_total_subscription_count_below_25k_hard_limit`, `test_finnifty_midcpnifty_dropped_from_index_set`
 
-- [ ] **Item 5:** Run scoped tests — `cargo test -p tickvault-common -p tickvault-core` (Common changed → workspace escalation per testing-scope.md)
+- [x] **Item 5:** Run scoped tests — `cargo test -p tickvault-common -p tickvault-core` (Common changed → workspace escalation per testing-scope.md)
   - Verify: 0 failures, all new ratchets pass
 
-- [ ] **Item 6:** Commit + push Phase 1
+- [x] **Item 6:** Commit + push Phase 1
   - Commit msg: `refactor(planner): drop FINNIFTY+MIDCPNIFTY, current-expiry indices, stock ATM±25`
 
 ### Phase 2 — Boot Mode Detection + Live-Tick ATM Resolver
 
-- [ ] **Item 7:** Create `crates/core/src/instrument/boot_mode.rs`
+- [x] **Item 7:** Create `crates/core/src/instrument/boot_mode.rs`
   - Files: `boot_mode.rs` (NEW), `crates/core/src/instrument/mod.rs`
   - Changes: `enum BootMode { PreMarket, MidPreMarket, MidMarket, PostMarket }`; `pub fn detect_boot_mode(now_ist_secs: u32) -> BootMode`; pure function, no I/O
   - Tests: `test_boot_mode_pre_market_before_0900`, `test_boot_mode_mid_pre_market_0900_to_0913`, `test_boot_mode_mid_market_0913_to_1530`, `test_boot_mode_post_market_after_1530`, `test_boot_mode_boundary_0900_exact`, `test_boot_mode_boundary_0913_exact`, `test_boot_mode_boundary_1530_exact`
 
-- [ ] **Item 8:** Extend `crates/core/src/pipeline/tick_processor.rs` to update `SharedSpotPrices` for cash equities
+- [x] **Item 8:** Extend `crates/core/src/pipeline/tick_processor.rs` to update `SharedSpotPrices` for cash equities
   - Files: `tick_processor.rs`
   - Changes: Currently only NIFTY/BANKNIFTY/SENSEX IDX_I ticks update spot prices. Extend to also write cash-equity NSE_EQ ticks for the 216 F&O stock underlyings.
   - Tests: `test_cash_equity_tick_updates_shared_spot_prices`, `test_idx_i_tick_still_updates_shared_spot_prices`
 
-- [ ] **Item 9:** Create `crates/core/src/instrument/live_tick_atm_resolver.rs`
+- [x] **Item 9:** Create `crates/core/src/instrument/live_tick_atm_resolver.rs`
   - Files: `live_tick_atm_resolver.rs` (NEW), `crates/core/src/instrument/mod.rs`
   - Changes: Async resolver that polls `SharedSpotPrices` for all 216 F&O stock cash-equity SIDs at progressive intervals (5s, 10s, 15s, 20s, 25s); returns `ResolveResult { resolved: HashMap<UnderlyingSymbol, f64>, stragglers: Vec<UnderlyingSymbol> }`; falls through to existing REST `preopen_rest_fallback` for stragglers, then to QuestDB previous close
   - Tests: `test_resolver_returns_all_when_all_ticked`, `test_resolver_returns_stragglers_when_silent`, `test_resolver_progressive_timeout_5_10_15_20_25`, `test_resolver_exit_early_when_all_resolved`, `test_resolver_o1_lookup_per_stock` (DHAT zero-alloc)
 
-- [ ] **Item 10:** Run scoped tests `cargo test -p tickvault-core`
+- [x] **Item 10:** Run scoped tests `cargo test -p tickvault-core`
   - Verify: 0 failures
 
-- [ ] **Item 11:** Commit + push Phase 2
+- [x] **Item 11:** Commit + push Phase 2
   - Commit msg: `feat(boot): add boot_mode detection + live_tick_atm_resolver`
 
 ### Phase 3 — Main.rs Wiring + Notification Events
 
-- [ ] **Item 12:** Drop FINNIFTY/MIDCPNIFTY from main.rs depth arrays
+- [x] **Item 12:** Drop FINNIFTY/MIDCPNIFTY from main.rs depth arrays
   - Files: `crates/app/src/main.rs` (lines 2151, 3113, 3685)
   - Changes: Replace `["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"]` with `["NIFTY", "BANKNIFTY"]` at all 3 sites
   - Tests: `test_main_depth_arrays_only_nifty_banknifty` (source-scan guard)
 
-- [ ] **Item 13:** Wire BootMode into main.rs Step 8c
+- [x] **Item 13:** Wire BootMode into main.rs Step 8c
   - Files: `crates/app/src/main.rs`
   - Changes: Branch on `detect_boot_mode()` — Mode A/B → existing pre-open buffer + 09:13 dispatch; Mode C → spawn `live_tick_atm_resolver` task immediately after WS connect; Mode D → use QuestDB previous close
   - Tests: `test_main_branches_on_boot_mode` (source-scan guard)
 
-- [ ] **Item 14:** Add `MidMarketBootComplete` notification event
+- [x] **Item 14:** Add `MidMarketBootComplete` notification event
   - Files: `crates/core/src/notification/events.rs`
   - Changes: New variant `MidMarketBootComplete { mode: BootMode, stocks_live_tick: usize, stocks_rest: usize, stocks_quest_db: usize, stocks_skipped: usize, total_subscribed: usize, latency_ms: u64 }`
   - Tests: `test_midmarket_boot_complete_severity_is_info`, `test_midmarket_boot_complete_includes_breakdown`
 
-- [ ] **Item 15:** Run scoped tests `cargo test -p tickvault-core -p tickvault-app`
+- [x] **Item 15:** Run scoped tests `cargo test -p tickvault-core -p tickvault-app`
   - Verify: 0 failures
 
-- [ ] **Item 16:** Commit + push Phase 3
+- [x] **Item 16:** Commit + push Phase 3
   - Commit msg: `feat(boot): wire boot_mode + drop FINNIFTY/MIDCPNIFTY arrays`
 
 ### Phase 4 — Dashboards + Rules + Runbook
 
-- [ ] **Item 17:** Update `deploy/docker/grafana/dashboards/depth-flow.json`
+- [x] **Item 17:** Update `deploy/docker/grafana/dashboards/depth-flow.json`
   - Files: `depth-flow.json`
   - Changes: Drop FINNIFTY + MIDCPNIFTY panels/labels; description says "2 indices" not "4"
   - Tests: `grafana_dashboard_snapshot_filter_guard.rs` (existing — must still pass)
 
-- [ ] **Item 18:** Update `.claude/rules/project/depth-subscription.md`
+- [x] **Item 18:** Update `.claude/rules/project/depth-subscription.md`
   - Files: `depth-subscription.md`
   - Changes: 2-index policy section (NIFTY + BANKNIFTY only); ATM strike selector unchanged (still ±24 each side for depth); FINNIFTY/MIDCPNIFTY explicitly noted as DROPPED
 
-- [ ] **Item 19:** Update `.claude/rules/project/live-market-feed-subscription.md`
+- [x] **Item 19:** Update `.claude/rules/project/live-market-feed-subscription.md`
   - Files: `live-market-feed-subscription.md`
   - Changes: 4-mode boot section; `STOCK_OPTION_ATM_STRIKES_EACH_SIDE = 25` policy; live-tick primary / REST fallback architecture; 3-index full-chain policy
 
-- [ ] **Item 20:** Create `.claude/rules/project/disaster-recovery.md`
+- [x] **Item 20:** Create `.claude/rules/project/disaster-recovery.md`
   - Files: `disaster-recovery.md` (NEW)
   - Changes: Document all 4 boot modes + 11 disaster scenarios + state-source hierarchy + idempotency guarantees
 
-- [ ] **Item 21:** Run scoped tests + meta-guards
+- [x] **Item 21:** Run scoped tests + meta-guards
   - Verify: `cargo test -p tickvault-storage` (dashboard guard), all `.claude/rules/` cross-references valid
 
-- [ ] **Item 22:** Commit + push Phase 4
+- [x] **Item 22:** Commit + push Phase 4
   - Commit msg: `docs: 3-index policy + 4-mode boot + disaster recovery runbook`
 
 ### Phase 5 — Final Verification + PR
 
-- [ ] **Item 23:** Run full scoped pre-push gate `bash .claude/hooks/pre-push-gate.sh`
+- [x] **Item 23:** Run full scoped pre-push gate `bash .claude/hooks/pre-push-gate.sh`
   - Verify: All 12 fast gates pass
 
-- [ ] **Item 24:** Run plan-verify `bash .claude/hooks/plan-verify.sh`
+- [x] **Item 24:** Run plan-verify `bash .claude/hooks/plan-verify.sh`
   - Verify: All plan items checked, all tests exist, all files modified
 
-- [ ] **Item 25:** Mark plan VERIFIED, open draft PR
+- [x] **Item 25:** Mark plan VERIFIED, open draft PR
   - Branch: `claude/build-fno-universe-Tlb9d` → `main`
 
 ## Disaster Recovery Scenarios
