@@ -3,6 +3,9 @@
 //! Routes raw WebSocket binary frames to the appropriate packet parser
 //! based on the response code in the 8-byte header.
 
+use std::sync::OnceLock;
+
+use metrics::Counter;
 use tickvault_common::constants::{
     RESPONSE_CODE_DISCONNECT, RESPONSE_CODE_FULL, RESPONSE_CODE_INDEX_TICKER,
     RESPONSE_CODE_MARKET_DEPTH, RESPONSE_CODE_MARKET_STATUS, RESPONSE_CODE_OI,
@@ -22,6 +25,83 @@ use super::previous_close::parse_previous_close_packet;
 use super::quote::parse_quote_packet;
 use super::ticker::parse_ticker_packet;
 use super::types::{ParseError, ParsedFrame};
+
+// O(1) hot-path Counter handles. The `metrics::counter!()` macro with
+// labels allocates a Vec<Label> per invocation; caching the resolved
+// Counter handle in a OnceLock keeps the hot path zero-allocation
+// (Principle #1) after the first call. See `dhat_all_parsers_zero_alloc`.
+static C_INDEX_TICKER: OnceLock<Counter> = OnceLock::new();
+static C_TICKER: OnceLock<Counter> = OnceLock::new();
+static C_MARKET_DEPTH_V1: OnceLock<Counter> = OnceLock::new();
+static C_QUOTE: OnceLock<Counter> = OnceLock::new();
+static C_OI: OnceLock<Counter> = OnceLock::new();
+static C_PREV_CLOSE: OnceLock<Counter> = OnceLock::new();
+static C_MARKET_STATUS: OnceLock<Counter> = OnceLock::new();
+static C_FULL: OnceLock<Counter> = OnceLock::new();
+static C_DISCONNECT: OnceLock<Counter> = OnceLock::new();
+static C_UNKNOWN: OnceLock<Counter> = OnceLock::new();
+static C_UNKNOWN_RESPONSE_CODES_TOTAL: OnceLock<Counter> = OnceLock::new();
+
+#[inline]
+fn dispatcher_counter(code: u8) -> &'static Counter {
+    match code {
+        RESPONSE_CODE_INDEX_TICKER => C_INDEX_TICKER.get_or_init(
+            || metrics::counter!("tv_packets_by_response_code", "code" => "index_ticker"),
+        ),
+        RESPONSE_CODE_TICKER => C_TICKER
+            .get_or_init(|| metrics::counter!("tv_packets_by_response_code", "code" => "ticker")),
+        RESPONSE_CODE_MARKET_DEPTH => C_MARKET_DEPTH_V1.get_or_init(
+            || metrics::counter!("tv_packets_by_response_code", "code" => "market_depth_v1"),
+        ),
+        RESPONSE_CODE_QUOTE => C_QUOTE
+            .get_or_init(|| metrics::counter!("tv_packets_by_response_code", "code" => "quote")),
+        RESPONSE_CODE_OI => {
+            C_OI.get_or_init(|| metrics::counter!("tv_packets_by_response_code", "code" => "oi"))
+        }
+        RESPONSE_CODE_PREVIOUS_CLOSE => C_PREV_CLOSE.get_or_init(
+            || metrics::counter!("tv_packets_by_response_code", "code" => "prev_close"),
+        ),
+        RESPONSE_CODE_MARKET_STATUS => C_MARKET_STATUS.get_or_init(
+            || metrics::counter!("tv_packets_by_response_code", "code" => "market_status"),
+        ),
+        RESPONSE_CODE_FULL => C_FULL
+            .get_or_init(|| metrics::counter!("tv_packets_by_response_code", "code" => "full")),
+        RESPONSE_CODE_DISCONNECT => C_DISCONNECT.get_or_init(
+            || metrics::counter!("tv_packets_by_response_code", "code" => "disconnect"),
+        ),
+        _ => C_UNKNOWN
+            .get_or_init(|| metrics::counter!("tv_packets_by_response_code", "code" => "unknown")),
+    }
+}
+
+#[inline]
+fn unknown_response_codes_counter() -> &'static Counter {
+    C_UNKNOWN_RESPONSE_CODES_TOTAL
+        .get_or_init(|| metrics::counter!("tv_unknown_response_codes_total"))
+}
+
+/// Pre-register every dispatcher Counter handle so the hot path never
+/// allocates. Must be called once at boot AFTER the global metrics
+/// recorder is installed (otherwise the cached handles will be `noop`
+/// counters that ignore increments forever).
+///
+/// Safe to call multiple times — `OnceLock::get_or_init` is idempotent.
+pub fn prewarm_dispatcher_counters() {
+    // Touch every label arm so each cell holds a real Counter handle.
+    // Using a sentinel byte for the "unknown" arm; any value not in the
+    // known set drops into `_ =>` and initializes `C_UNKNOWN`.
+    dispatcher_counter(RESPONSE_CODE_INDEX_TICKER);
+    dispatcher_counter(RESPONSE_CODE_TICKER);
+    dispatcher_counter(RESPONSE_CODE_MARKET_DEPTH);
+    dispatcher_counter(RESPONSE_CODE_QUOTE);
+    dispatcher_counter(RESPONSE_CODE_OI);
+    dispatcher_counter(RESPONSE_CODE_PREVIOUS_CLOSE);
+    dispatcher_counter(RESPONSE_CODE_MARKET_STATUS);
+    dispatcher_counter(RESPONSE_CODE_FULL);
+    dispatcher_counter(RESPONSE_CODE_DISCONNECT);
+    dispatcher_counter(0xFF);
+    unknown_response_codes_counter();
+}
 
 /// Dispatches a raw WebSocket binary frame to the correct parser.
 ///
@@ -46,11 +126,9 @@ pub fn dispatch_frame(raw: &[u8], received_at_nanos: i64) -> Result<ParsedFrame,
     // Observability (§10.3): per-response-code packet counter so operators
     // can trend traffic mix in Grafana without scraping logs. Labelled by
     // the numeric code; the `unknown` bucket catches protocol drift.
-    metrics::counter!(
-        "tv_packets_by_response_code",
-        "code" => response_code_label(header.response_code)
-    )
-    .increment(1);
+    // Counter handle is cached in a per-label OnceLock to keep the hot
+    // path zero-allocation (Principle #1) — see `dispatcher_counter`.
+    dispatcher_counter(header.response_code).increment(1);
 
     match header.response_code {
         RESPONSE_CODE_INDEX_TICKER | RESPONSE_CODE_TICKER => {
@@ -100,29 +178,9 @@ pub fn dispatch_frame(raw: &[u8], received_at_nanos: i64) -> Result<ParsedFrame,
         code => {
             // Observability (§10.3): protocol drift / Dhan sending a code
             // we don't handle. ERROR-level log triggers Telegram via Loki.
-            metrics::counter!("tv_unknown_response_codes_total").increment(1);
+            unknown_response_codes_counter().increment(1);
             Err(ParseError::UnknownResponseCode(code))
         }
-    }
-}
-
-/// Returns a static label for `tv_packets_by_response_code`. Returns
-/// `&'static str` so Prometheus doesn't see a high-cardinality explosion
-/// from unknown codes — everything unrecognized maps to the `unknown`
-/// bucket (the actual numeric code is captured separately by
-/// `tv_unknown_response_codes_total`).
-fn response_code_label(code: u8) -> &'static str {
-    match code {
-        RESPONSE_CODE_INDEX_TICKER => "index_ticker",
-        RESPONSE_CODE_TICKER => "ticker",
-        RESPONSE_CODE_MARKET_DEPTH => "market_depth_v1",
-        RESPONSE_CODE_QUOTE => "quote",
-        RESPONSE_CODE_OI => "oi",
-        RESPONSE_CODE_PREVIOUS_CLOSE => "prev_close",
-        RESPONSE_CODE_MARKET_STATUS => "market_status",
-        RESPONSE_CODE_FULL => "full",
-        RESPONSE_CODE_DISCONNECT => "disconnect",
-        _ => "unknown",
     }
 }
 
@@ -281,6 +339,20 @@ mod tests {
         buf[3] = 2; // NSE_FNO
         buf[4..8].copy_from_slice(&42u32.to_le_bytes());
         buf
+    }
+
+    #[test]
+    fn test_prewarm_dispatcher_counters_is_idempotent() {
+        // Calling prewarm twice must not panic — OnceLock::get_or_init
+        // is idempotent and the second call is a cheap pointer load.
+        // This also verifies dispatch_frame can run after prewarm without
+        // corrupting the cached Counter handles.
+        prewarm_dispatcher_counters();
+        prewarm_dispatcher_counters();
+
+        let buf = make_minimal_packet(RESPONSE_CODE_TICKER, TICKER_PACKET_SIZE);
+        let tick = unwrap_tick(dispatch_frame(&buf, 0).unwrap());
+        assert_eq!(tick.security_id, 42);
     }
 
     #[test]

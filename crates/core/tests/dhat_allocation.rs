@@ -119,6 +119,13 @@ fn dhat_all_parsers_zero_alloc() {
         .collect();
     let empty: &[u8] = &[];
 
+    // Pre-register every Counter handle. The `metrics::counter!()` macro
+    // with labels allocates a Vec<Label> on first call per label set; the
+    // dispatcher caches the resolved handle in a OnceLock so subsequent
+    // calls are zero-allocation. Without this prewarm, the first call to
+    // each label arm (ticker/quote/depth/full/unknown) would allocate.
+    tickvault_core::parser::prewarm_dispatcher_counters();
+
     // ---- Measure: all allocations from here must be zero ----
     let stats_before = dhat::HeapStats::get();
 

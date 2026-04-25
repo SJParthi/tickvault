@@ -362,6 +362,12 @@ async fn main() -> Result<()> {
     observability::init_metrics(&config.observability)
         .context("failed to initialize Prometheus metrics")?;
 
+    // Cache parser dispatcher Counter handles AFTER the recorder is
+    // installed. Without this, the first hot-path packet of each kind
+    // would allocate (Principle #1 violation). Must run post-install
+    // because handles created pre-install resolve to a no-op counter.
+    tickvault_core::parser::prewarm_dispatcher_counters();
+
     // -----------------------------------------------------------------------
     // Step 3: Initialize structured logging + OpenTelemetry tracing layer
     // -----------------------------------------------------------------------

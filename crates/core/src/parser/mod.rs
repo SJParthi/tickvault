@@ -33,6 +33,6 @@ pub use deep_depth::{
     DeepDepthHeader, DepthSide, ParsedDeepDepth, parse_twenty_depth_packet,
     parse_two_hundred_depth_packet,
 };
-pub use dispatcher::{dispatch_deep_depth_frame, dispatch_frame};
+pub use dispatcher::{dispatch_deep_depth_frame, dispatch_frame, prewarm_dispatcher_counters};
 pub use order_update::{OrderUpdateParseError, build_order_update_login, parse_order_update};
 pub use types::{PacketHeader, ParseError, ParsedFrame};
