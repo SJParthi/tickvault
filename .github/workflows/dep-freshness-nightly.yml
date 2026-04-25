@@ -135,7 +135,7 @@ jobs:
           cargo test -p tickvault-storage --lib
 
       - name: Create Pull Request
-        uses: peter-evans/create-pull-request@v7
+        uses: peter-evans/create-pull-request@v8
         with:
           commit-message: |
             chore(deps): auto-bump ${{ needs.scan.outputs.patch_count }} patch versions
