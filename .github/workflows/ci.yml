@@ -76,10 +76,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Install Rust toolchain 1.93.1
+      - name: Install Rust toolchain 1.95.0
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # SHA-pinned (was @stable, supply-chain hardening 2026-04-25)
         with:
-          toolchain: '1.93.1'
+          toolchain: '1.95.0'
           components: rustfmt, clippy
 
       - name: Cache cargo registry + build
@@ -117,10 +117,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Install Rust toolchain 1.93.1
+      - name: Install Rust toolchain 1.95.0
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # SHA-pinned (was @stable, supply-chain hardening 2026-04-25)
         with:
-          toolchain: '1.93.1'
+          toolchain: '1.95.0'
 
       - name: Cache cargo registry + build
         uses: Swatinem/rust-cache@v2
@@ -152,10 +152,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Install Rust toolchain 1.93.1
+      - name: Install Rust toolchain 1.95.0
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # SHA-pinned (was @stable, supply-chain hardening 2026-04-25)
         with:
-          toolchain: '1.93.1'
+          toolchain: '1.95.0'
 
       - name: Install cargo-audit + cargo-deny
         run: |
@@ -182,10 +182,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
-      - name: Install Rust toolchain 1.93.1 + llvm-tools
+      - name: Install Rust toolchain 1.95.0 + llvm-tools
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # SHA-pinned (was @stable, supply-chain hardening 2026-04-25)
         with:
-          toolchain: '1.93.1'
+          toolchain: '1.95.0'
           components: llvm-tools-preview
 
       - name: Cache cargo + llvm-cov build

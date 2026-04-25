@@ -52,7 +52,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # SHA-pinned (was @master, supply-chain hardening 2026-04-25)
         with:
-          toolchain: 1.93.1
+          toolchain: 1.95.0
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -94,7 +94,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # SHA-pinned (was @master, supply-chain hardening 2026-04-25)
         with:
-          toolchain: 1.93.1
+          toolchain: 1.95.0
 
       - name: Run scanner to identify patch drifts
         id: identify
