@@ -2149,7 +2149,7 @@ async fn main() -> Result<()> {
     // -----------------------------------------------------------------------
     // Step 8c: Spawn 20-level + 200-level depth WebSocket connections
     // -----------------------------------------------------------------------
-    // 20-level: 4 connections (NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY), 49 instruments each
+    // 20-level: 2 connections (NIFTY, BANKNIFTY), 49 instruments each (2026-04-25: FINNIFTY + MIDCPNIFTY dropped)
     //   = ATM + 24 CE above + 24 PE below (nearest expiry only)
     // 200-level: 2 underlyings (NIFTY, BANKNIFTY), 1 ATM CE + 1 ATM PE each
     //   (nearest expiry only)
@@ -2202,7 +2202,14 @@ async fn main() -> Result<()> {
             // original 5-minute hard cap still applies (correct behaviour —
             // a genuinely degraded main feed mid-market is a real problem).
             const MANDATORY_UNDERLYINGS: &[&str] = &["NIFTY", "BANKNIFTY"];
-            const OPTIONAL_UNDERLYINGS: &[&str] = &["FINNIFTY", "MIDCPNIFTY"];
+            // 2026-04-25: FINNIFTY + MIDCPNIFTY were dropped from the F&O
+            // universe — neither IDX_I value nor F&O nor depth-20 is
+            // subscribed for them anymore. Phase B's 30s top-up window
+            // therefore has no symbols to wait for and exits immediately.
+            // Kept as `&[]` (rather than removing Phase B entirely) for
+            // minimal-disruption review; Phase B can be deleted in a
+            // follow-up cleanup PR if no other OPTIONAL indices return.
+            const OPTIONAL_UNDERLYINGS: &[&str] = &[];
             const MANDATORY_WAIT_MARKET_HOURS_SECS: u64 = 300; // 5 min — during session
             const MANDATORY_WAIT_POST_MARKET_SECS: u64 = 10; // 10 s — off-hours boot
             const OPTIONAL_WAIT_SECS: u64 = 30;
@@ -2310,7 +2317,8 @@ async fn main() -> Result<()> {
                     if have_all {
                         info!(
                             underlyings = ?depth_underlyings,
-                            "depth ATM: all 4 index LTPs present — proceeding"
+                            count = depth_underlyings.len(),
+                            "depth ATM: all index LTPs present — proceeding"
                         );
                         break;
                     }
