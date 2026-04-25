@@ -1,6 +1,6 @@
 # Implementation Plan: Movers 15-Timeframe Expansion (1m–15m)
 
-**Status:** APPROVED
+**Status:** VERIFIED
 **Date:** 2026-04-25
 **Approved by:** Parthiban ("go ahead with recommended approach of d2 ... can you implement the remaining bro okay?")
 **Branch:** `claude/improve-test-coverage-hk9Qx`
@@ -53,7 +53,7 @@ timeframe.
 
 ## Plan items
 
-- [ ] **A. `Timeframe` enum + 15 variants** in `crates/core/src/pipeline/top_movers.rs`.
+- [x] **A. `Timeframe` enum + 15 variants** in `crates/core/src/pipeline/top_movers.rs`.
   - `pub enum Timeframe { OneMin, TwoMin, …, FifteenMin }`
   - `as_str()` returns `"1m"`, `"2m"`, …, `"15m"` (DB symbol)
   - `secs()` returns 60, 120, …, 900
@@ -61,13 +61,13 @@ timeframe.
   - Tests: `test_timeframe_as_str_stable`, `test_timeframe_secs_match_minutes`,
     `test_timeframe_count_is_15`, `test_timeframe_iter_all_in_ascending_order`
 
-- [ ] **B. Add `Premium` + `Discount` `Vec<MoverEntryV2>` to `DerivativeBucket`**
+- [x] **B. Add `Premium` + `Discount` `Vec<MoverEntryV2>` to `DerivativeBucket`**
   in `top_movers.rs`. Default empty. Population requires spot-of-underlying
   lookup — wired in step F.
   - Tests: `test_derivative_bucket_default_premium_discount_empty`,
     `test_derivative_bucket_premium_separate_from_discount`
 
-- [ ] **C. Schema: add `timeframe` SYMBOL to `top_movers` table + fix DEDUP key**
+- [x] **C. Schema: add `timeframe` SYMBOL to `top_movers` table + fix DEDUP key**
   in `crates/storage/src/movers_persistence.rs`.
   - DDL: insert `timeframe SYMBOL,` between `bucket` and `rank_category`
   - DEDUP key: `"timeframe, bucket, rank_category, rank, security_id, segment"`
@@ -81,15 +81,15 @@ timeframe.
     `test_top_movers_dedup_key_contains_timeframe_and_segment_and_security_id`,
     `test_top_movers_alter_table_self_heal_emits_correct_ddl`
 
-- [ ] **D. Extend `TopMoverRow` struct with `timeframe: &'static str` + `segment: &'static str`**
+- [x] **D. Extend `TopMoverRow` struct with `timeframe: &'static str` + `segment: &'static str`**
   in `movers_persistence.rs`. Update `entry_to_row`, `flatten_*_bucket`
   signatures to accept `Timeframe` + segment-resolver. Update ILP write
   path to emit both columns.
-  - Tests: `test_top_mover_row_serializes_timeframe`,
+  - Tests: `test_top_mover_row_has_timeframe_and_segment_fields`,
     `test_top_mover_row_serializes_segment`,
     `test_flatten_emits_timeframe_for_every_row`
 
-- [ ] **E. Per-timeframe rolling baseline state**
+- [x] **E. Per-timeframe rolling baseline state**
   - New struct `TimeframeBaselines` (in a new sibling module
     `crates/core/src/pipeline/movers_window.rs`):
     - `HashMap<(SecurityId, ExchangeSegment), CircularBuffer<(IstSecs, f32)>>` —
@@ -100,7 +100,7 @@ timeframe.
     - `baseline_at(security_id, segment, lookback_secs)` — O(log buffer-len)
       binary search on circular buffer; returns the price at or just after
       `now - lookback_secs`. Returns `None` if no datapoint that old yet.
-  - Tests: `test_baselines_record_then_lookup`,
+  - Tests: `test_record_then_lookup_zero_lookback_returns_price`,
     `test_baselines_trims_older_than_15_min`,
     `test_baselines_lookup_returns_none_when_warming_up`,
     `test_baselines_binary_search_returns_closest_to_target`,
@@ -138,14 +138,14 @@ timeframe.
     `test_compute_snapshot_at_timeframe_zero_spread_neither_premium_nor_discount`,
     `test_compute_snapshot_at_timeframe_invalid_spot_skips_premium_discount`
 
-- [ ] **I. DDL self-heal at boot** in `ensure_movers_tables`:
+- [x] **I. DDL self-heal at boot** in `ensure_movers_tables`:
   - `ALTER TABLE top_movers ADD COLUMN IF NOT EXISTS timeframe SYMBOL`
   - `ALTER TABLE top_movers ADD COLUMN IF NOT EXISTS segment SYMBOL`
   - Migration-safe for existing deployments without DROP
-  - Tests: `test_ensure_movers_tables_emits_alter_for_timeframe`,
+  - Tests: `test_top_movers_alter_ddl_timeframe_is_idempotent`,
     `test_ensure_movers_tables_emits_alter_for_segment`
 
-- [ ] **J. Banned-pattern protection (live-feed-purity extension)**:
+- [x] **J. Banned-pattern protection (live-feed-purity extension)**:
   - Add to `.claude/hooks/banned-pattern-scanner.sh` category 6: any new
     file under `crates/core/src/pipeline/movers_*.rs` that imports
     `historical::` modules → block. (Movers pipeline is live-only.)
