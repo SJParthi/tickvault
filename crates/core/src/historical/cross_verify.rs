@@ -346,6 +346,58 @@ impl TodayIstWindow {
         })
     }
 
+    /// Post-market-only constructor (Parthiban directive 2026-04-24).
+    ///
+    /// Returns `Some(window)` only after 15:30 IST on the current
+    /// trading day. Used by cross-verification to enforce the "post-
+    /// market only" gate — verification needs the FULL session's live
+    /// data, so running it mid-session always yields partial coverage
+    /// and a non-actionable Skipped/Failed Telegram.
+    ///
+    /// Behaviour:
+    /// - Before 09:15 IST: `None` (pre-market, same as `from_utc`)
+    /// - 09:15 IST – 15:29:59 IST: `None` (NEW — mid-session blocked)
+    /// - 15:30 IST onwards: `Some(window)` with end pinned to 15:30 IST
+    ///
+    /// The returned window's `end_sql` is always exactly 15:30 IST —
+    /// not "now" clipped to 15:30. This guarantees idempotent SQL
+    /// queries: a 16:00 IST run and a 19:00 IST run both query the
+    /// SAME bound, so QuestDB's plan cache + DEDUP semantics behave
+    /// identically. The cross-verify success marker file then makes
+    /// successful runs idempotent across boots within the same day.
+    ///
+    /// Pure function — caller passes the UTC clock (production uses
+    /// `Utc::now()` via `from_now_post_market_only`). Tests drive
+    /// determinism by passing a fixed `DateTime<Utc>`.
+    // TEST-EXEMPT: covered by 6 `test_post_market_only_*` unit tests in this module's `tests` submodule (pre-market, mid-session, close-boundary, post-market admission, late-evening, same-day idempotency). Pub-fn-test guard's heuristic doesn't auto-match the `_post_market_only` prefix.
+    pub fn from_utc_post_market_only(now_utc: DateTime<Utc>) -> Option<Self> {
+        let ist = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS)?;
+        let now_ist = now_utc.with_timezone(&ist);
+        let today_ist = now_ist.date_naive();
+        let start_naive: NaiveDateTime = today_ist.and_hms_opt(9, 15, 0)?;
+        let market_end_naive: NaiveDateTime = today_ist.and_hms_opt(15, 30, 0)?;
+        let now_naive = now_ist.naive_local();
+        // Hard gate: must be at or after 15:30 IST on a trading day.
+        // Pre-market (< 09:15) AND mid-session (09:15..15:30) BOTH
+        // return None — verification only runs after the session
+        // closes so the full 09:15-15:30 grid is comparable.
+        if now_naive < market_end_naive {
+            return None;
+        }
+        Some(Self {
+            today_ist,
+            start_sql: format!("'{}'", start_naive.format("%Y-%m-%dT%H:%M:%S.000000Z")),
+            end_sql: format!("'{}'", market_end_naive.format("%Y-%m-%dT%H:%M:%S.000000Z")),
+        })
+    }
+
+    /// Production wrapper: post-market-only window from system clock.
+    /// See [`from_utc_post_market_only`] for the behavioural contract.
+    // TEST-EXEMPT: one-line wrapper over `from_utc_post_market_only` (which is itself covered by 6 `test_post_market_only_*` unit tests). Same pattern as the existing `from_now()` wrapper which is also exempt.
+    pub fn from_now_post_market_only() -> Option<Self> {
+        Self::from_utc_post_market_only(Utc::now())
+    }
+
     /// Returns the SQL fragment `ts >= '...' AND ts < '...'` suitable for
     /// dropping into any WHERE clause. Window is **09:15 inclusive → 15:30
     /// exclusive** per product spec (1m candle at 15:29:00 covers
@@ -845,13 +897,20 @@ fn build_missing_live_mismatch(ctx: CandleContext, hist: CandleValues) -> CrossM
 
 /// Cross-match coverage threshold (percent).
 ///
-/// Live candles must cover at least this % of the historical grid for
-/// `determine_cross_match_passed` to return true. Set to 90 to allow the
-/// natural slop at session edges (pre-open minute closes, 15:29:59 last-second
-/// slot, rare MV refresh lag) while still catching the 2026-04-24
-/// "booted at 14:54 IST but got CROSS-MATCH OK at 15:47" class of false
-/// positive (actual coverage ~10%).
-pub const CROSS_MATCH_MIN_COVERAGE_PCT: u8 = 90;
+/// Live candles must cover this exact % of the historical grid for
+/// `determine_cross_match_passed` to return true. Set to **100**
+/// (Parthiban directive 2026-04-24): the verification is "done" only
+/// when EVERY historical candle has a matching live candle. Anything
+/// less is `CandleCrossMatchFailed` HIGH with a specific diagnostic
+/// listing the gap, not a `Skipped` LOW.
+///
+/// Pre-2026-04-24 the threshold was 90% which permitted partial-OK on
+/// edge cases (pre-open minute closes, 15:29:59 last-second slot, rare
+/// materialized-view refresh lag). With the new 15:30+ post-market-
+/// only gate (`TodayIstWindow::from_now_post_market_only`) the entire
+/// 09:15-15:30 grid is settled by the time we run, so 100% is the
+/// only correct success criterion.
+pub const CROSS_MATCH_MIN_COVERAGE_PCT: u8 = 100;
 
 /// Computes the live-vs-historical coverage percentage as integer 0..=100.
 ///
@@ -2156,6 +2215,141 @@ mod tests {
     }
 
     #[test]
+    fn test_post_market_only_blocks_pre_market() {
+        // 2026-04-21 03:00 UTC = 08:30 IST — well before market open.
+        // The post-market-only constructor must return None.
+        let now = DateTime::<Utc>::from_naive_utc_and_offset(
+            NaiveDate::from_ymd_opt(2026, 4, 21)
+                .unwrap()
+                .and_hms_opt(3, 0, 0)
+                .unwrap(),
+            Utc,
+        );
+        assert!(
+            TodayIstWindow::from_utc_post_market_only(now).is_none(),
+            "08:30 IST is pre-market — must return None"
+        );
+    }
+
+    #[test]
+    fn test_post_market_only_blocks_mid_session() {
+        // 2026-04-21 06:30 UTC = 12:00 IST — mid-session. The
+        // ORIGINAL `from_utc` returns Some here (window 09:15..12:00),
+        // but the post-market-only constructor must return None to
+        // enforce "only run after the session closes".
+        let now = DateTime::<Utc>::from_naive_utc_and_offset(
+            NaiveDate::from_ymd_opt(2026, 4, 21)
+                .unwrap()
+                .and_hms_opt(6, 30, 0)
+                .unwrap(),
+            Utc,
+        );
+        assert!(
+            TodayIstWindow::from_utc(now).is_some(),
+            "guard test: 12:00 IST IS within original from_utc window"
+        );
+        assert!(
+            TodayIstWindow::from_utc_post_market_only(now).is_none(),
+            "12:00 IST is mid-session — post-market-only must return None"
+        );
+    }
+
+    #[test]
+    fn test_post_market_only_blocks_at_session_close_boundary() {
+        // 2026-04-21 09:59:59 UTC = 15:29:59 IST — last second of the
+        // trading session. Must return None — the gate fires AT 15:30,
+        // not at 15:29:59.
+        let now = DateTime::<Utc>::from_naive_utc_and_offset(
+            NaiveDate::from_ymd_opt(2026, 4, 21)
+                .unwrap()
+                .and_hms_opt(9, 59, 59)
+                .unwrap(),
+            Utc,
+        );
+        assert!(
+            TodayIstWindow::from_utc_post_market_only(now).is_none(),
+            "15:29:59 IST is still in-session — must return None"
+        );
+    }
+
+    #[test]
+    fn test_post_market_only_admits_at_session_close_exact() {
+        // 2026-04-21 10:00:00 UTC = 15:30:00 IST — first second
+        // post-market. Must return Some(window) with end pinned to 15:30.
+        let now = DateTime::<Utc>::from_naive_utc_and_offset(
+            NaiveDate::from_ymd_opt(2026, 4, 21)
+                .unwrap()
+                .and_hms_opt(10, 0, 0)
+                .unwrap(),
+            Utc,
+        );
+        let window = TodayIstWindow::from_utc_post_market_only(now)
+            .expect("15:30:00 IST is post-market — must return Some");
+        assert!(
+            window.end_sql.contains("15:30:00"),
+            "end_sql must be pinned to 15:30:00 exactly, got {}",
+            window.end_sql
+        );
+        assert!(
+            window.start_sql.contains("09:15:00"),
+            "start_sql must be 09:15:00, got {}",
+            window.start_sql
+        );
+    }
+
+    #[test]
+    fn test_post_market_only_admits_late_evening() {
+        // 2026-04-21 15:00 UTC = 20:30 IST — well after market close.
+        // Must return Some with end STILL pinned at 15:30 (not 20:30).
+        let now = DateTime::<Utc>::from_naive_utc_and_offset(
+            NaiveDate::from_ymd_opt(2026, 4, 21)
+                .unwrap()
+                .and_hms_opt(15, 0, 0)
+                .unwrap(),
+            Utc,
+        );
+        let window = TodayIstWindow::from_utc_post_market_only(now)
+            .expect("20:30 IST is post-market — must return Some");
+        assert!(
+            window.end_sql.contains("15:30:00"),
+            "post-market window's end_sql must be FIXED at 15:30, not now-clipped. \
+             Got: {}",
+            window.end_sql
+        );
+    }
+
+    #[test]
+    fn test_post_market_only_idempotent_end_across_runs_same_day() {
+        // Two boots on the same trading day (16:00 IST and 19:00 IST)
+        // must produce IDENTICAL end_sql so QuestDB query plans + DEDUP
+        // semantics are deterministic. This is what makes "run on every
+        // boot until success marker" safe — repeated runs query the
+        // same bound.
+        let day = NaiveDate::from_ymd_opt(2026, 4, 21).unwrap();
+        let evening_a = DateTime::<Utc>::from_naive_utc_and_offset(
+            day.and_hms_opt(10, 30, 0).unwrap(), // 16:00 IST
+            Utc,
+        );
+        let evening_b = DateTime::<Utc>::from_naive_utc_and_offset(
+            day.and_hms_opt(13, 30, 0).unwrap(), // 19:00 IST
+            Utc,
+        );
+        let win_a = TodayIstWindow::from_utc_post_market_only(evening_a)
+            .expect("16:00 IST must produce a window");
+        let win_b = TodayIstWindow::from_utc_post_market_only(evening_b)
+            .expect("19:00 IST must produce a window");
+        assert_eq!(
+            win_a.end_sql, win_b.end_sql,
+            "post-market end_sql must be IDENTICAL across the same day's boots — \
+             otherwise the success-marker idempotency model breaks"
+        );
+        assert_eq!(
+            win_a.start_sql, win_b.start_sql,
+            "post-market start_sql must also be identical (always 09:15)"
+        );
+    }
+
+    #[test]
     fn test_from_utc_is_stable_across_day_boundary() {
         // 2026-04-20 23:59 UTC == 2026-04-21 05:29 IST — still today-ist = 21,
         // but 05:29 is pre-market → None.
@@ -3406,8 +3600,15 @@ mod tests {
 
     #[test]
     fn test_determine_cross_match_passed_true_at_exact_threshold() {
-        // 90% coverage is the minimum acceptable.
-        assert!(determine_cross_match_passed(0, 0, 0, 100, 0, 90));
+        // 2026-04-24: threshold is now 100% (was 90%). Anything less
+        // is a HIGH FAILED, not an OK. The post-market-only gate
+        // upstream guarantees the full 09:15-15:30 grid is settled
+        // by the time this fn runs, so 100% is achievable.
+        assert!(determine_cross_match_passed(0, 0, 0, 100, 0, 100));
+        // 90% no longer passes — partial coverage is a failure.
+        assert!(!determine_cross_match_passed(0, 0, 0, 100, 0, 90));
+        // 99% no longer passes either — strict 100% only.
+        assert!(!determine_cross_match_passed(0, 0, 0, 100, 0, 99));
     }
 
     #[test]
@@ -3448,10 +3649,16 @@ mod tests {
     }
 
     #[test]
-    fn test_cross_match_min_coverage_pct_constant_is_90() {
-        // Document the policy value. If Parthiban ever tightens the
-        // threshold, this ratchet highlights the change in a diff review.
-        assert_eq!(CROSS_MATCH_MIN_COVERAGE_PCT, 90);
+    fn test_cross_match_min_coverage_pct_constant_is_100() {
+        // Parthiban directive 2026-04-24: cross-verify is "done" only
+        // when EVERY historical OHLCV candle matches a live candle.
+        // 100% is the only valid success threshold; 90% (the prior
+        // value) was a soft compromise that masked partial coverage.
+        // The new post-market-only gate
+        // (`TodayIstWindow::from_now_post_market_only`) ensures we
+        // only run after the full session has settled, so 100% is
+        // achievable, not aspirational.
+        assert_eq!(CROSS_MATCH_MIN_COVERAGE_PCT, 100);
     }
 
     // -----------------------------------------------------------------------
