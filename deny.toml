@@ -109,6 +109,19 @@ skip = [
     # call sites, intentional.
     { crate = "tokio-tungstenite", reason = "axum 0.8 uses 0.28, core uses 0.29 for Dhan WS" },
     { crate = "tungstenite", reason = "follows tokio-tungstenite version split" },
+    # --- Crypto stack version split (introduced 2026-04-25 by aws-sigv4 1.4.3 + rand 0.10) ---
+    # aws-sigv4 1.4.3 bumped to sha2 0.11 / digest 0.11 family while many
+    # other transitive deps (sha1, criterion, etc.) still use the 0.10
+    # family. rand 0.10's chacha20 brings cpufeatures 0.3 alongside
+    # the existing 0.2 used by sha2 0.10.x. All transitive — not on our
+    # direct dep tree. Cannot be unified until upstream consolidates.
+    { crate = "cpufeatures", reason = "rand 0.10 chacha20 uses 0.3, sha2 0.10 uses 0.2" },
+    { crate = "digest", reason = "aws-sigv4 1.4.3 uses 0.11, sha1/criterion use 0.10" },
+    { crate = "block-buffer", reason = "follows digest version split (0.10/0.12)" },
+    { crate = "crypto-common", reason = "follows digest version split (0.1/0.2)" },
+    { crate = "hmac", reason = "aws-sigv4 1.4.3 uses 0.13, totp-rs uses 0.12" },
+    { crate = "sha2", reason = "aws-sigv4 1.4.3 uses 0.11, totp-rs/digest use 0.10" },
+    { crate = "typenum", reason = "transitive splits 1.19/1.20 across digest 0.10/0.11" },
     # toml_edit 0.22 (direct) + toml_edit 0.23 (via cargo-deny internal) etc.
     # causes winnow 0.6 + 0.7 duplicate through toml_edit's parser stack.
     { crate = "winnow", reason = "toml_edit + figment parser version split" },
