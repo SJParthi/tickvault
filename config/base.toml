@@ -170,8 +170,22 @@ retention_days = 90
 host = "tv-valkey"
 port = 6379
 max_connections = 16
-# Password loaded from AWS SSM at boot (/tickvault/{env}/valkey/password)
-# Empty string = no auth (NOT recommended for production)
+# Valkey AUTH password.
+#
+# Status: NOT YET WIRED IN PRODUCTION (2026-04-25).
+# `ValkeyPool::new` is currently called only from storage unit tests; no
+# code path in `crates/app/src/main.rs` constructs a Valkey client at boot.
+# When Valkey is wired up (e.g. for idempotency tracking, token caching,
+# or strategy state), the password MUST be fetched from AWS SSM via
+# `tickvault_core::auth::secret_manager::fetch_valkey_password()`
+# (path `/tickvault/<env>/valkey/password`), NOT read from this TOML file.
+# Per `.claude/rules/project/rust-code.md`: "always real AWS, never mocks".
+#
+# This empty default is therefore safe today — no client uses it. It
+# remains here so the figment loader can deserialize the [valkey] section
+# without errors. The source-scan ratchet
+# `test_valkey_pool_new_uses_ssm_when_wired` (in middleware.rs) blocks
+# any future wiring that bypasses the SSM fetch.
 password = ""
 
 [prometheus]

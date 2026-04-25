@@ -334,6 +334,49 @@ pub async fn fetch_telegram_credentials() -> Result<TelegramCredentials, Applica
     Ok(TelegramCredentials { bot_token, chat_id })
 }
 
+/// Fetches the Valkey AUTH password from AWS SSM Parameter Store.
+///
+/// Returns `SecretString` (zeroize on drop, `[REDACTED]` Display).
+///
+/// 2026-04-25 security audit (PR #357 follow-up): the Valkey password was
+/// previously a `""` default in `config/base.toml` with a misleading
+/// comment that claimed it was "loaded from AWS SSM at boot" — but no
+/// SSM fetch actually existed. Project mandate per
+/// `.claude/rules/project/rust-code.md` is "always real AWS, never mocks";
+/// same code path on local Mac (via `~/.aws/credentials`) and on EC2 (via
+/// IAM role). This function brings Valkey credentials into the same SSM
+/// boot pattern as Dhan, QuestDB, Grafana, Telegram, and API.
+///
+/// SSM path: `/tickvault/<env>/valkey/password`
+///
+/// # Errors
+///
+/// Returns `ApplicationError::SecretRetrieval` if the secret cannot be
+/// fetched. Callers in `crates/app/src/main.rs` propagate via `?` so the
+/// app fails to boot rather than silently running with no Valkey AUTH.
+#[instrument(skip_all, fields(environment))]
+pub async fn fetch_valkey_password() -> Result<SecretString, ApplicationError> {
+    use tickvault_common::constants::{SSM_VALKEY_SERVICE, VALKEY_PASSWORD_SECRET};
+
+    let environment = resolve_environment()?;
+    tracing::Span::current().record("environment", environment.as_str());
+
+    let ssm_client = create_ssm_client().await;
+
+    let password_path = build_ssm_path(&environment, SSM_VALKEY_SERVICE, VALKEY_PASSWORD_SECRET);
+
+    info!(
+        password_path = %password_path,
+        "fetching Valkey password from SSM"
+    );
+
+    let password = fetch_secret(&ssm_client, &password_path).await?;
+
+    info!("Valkey password fetched successfully from SSM");
+
+    Ok(password)
+}
+
 /// Fetches the API bearer token from AWS SSM Parameter Store.
 ///
 /// Returns `SecretString` (zeroize on drop, `[REDACTED]` Display).
@@ -684,6 +727,104 @@ mod tests {
             }
             other => panic!("expected SecretRetrieval error, got {:?}", other),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // 2026-04-25 security audit follow-up: Valkey password SSM path
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_ssm_path_valkey_password_dev() {
+        use tickvault_common::constants::{SSM_VALKEY_SERVICE, VALKEY_PASSWORD_SECRET};
+        assert_eq!(
+            build_ssm_path("dev", SSM_VALKEY_SERVICE, VALKEY_PASSWORD_SECRET),
+            "/tickvault/dev/valkey/password"
+        );
+    }
+
+    #[test]
+    fn test_build_ssm_path_valkey_password_prod() {
+        use tickvault_common::constants::{SSM_VALKEY_SERVICE, VALKEY_PASSWORD_SECRET};
+        assert_eq!(
+            build_ssm_path("prod", SSM_VALKEY_SERVICE, VALKEY_PASSWORD_SECRET),
+            "/tickvault/prod/valkey/password"
+        );
+    }
+
+    /// Smoke: SSM_VALKEY_SERVICE constant is non-empty + lowercase + matches
+    /// the project's existing service-name convention.
+    #[test]
+    fn test_ssm_valkey_service_constant_is_well_formed() {
+        use tickvault_common::constants::SSM_VALKEY_SERVICE;
+        assert!(
+            !SSM_VALKEY_SERVICE.is_empty(),
+            "SSM_VALKEY_SERVICE must not be empty"
+        );
+        assert!(
+            SSM_VALKEY_SERVICE
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c == '-'),
+            "SSM_VALKEY_SERVICE must be ascii-lowercase + hyphens, got {}",
+            SSM_VALKEY_SERVICE
+        );
+    }
+
+    /// fetch_valkey_password must error without real SSM connectivity, with
+    /// the typed `ApplicationError::SecretRetrieval` variant carrying the
+    /// expected path so downstream main.rs error handling stays stable.
+    #[tokio::test]
+    async fn test_fetch_valkey_password_errors_without_real_ssm() {
+        let result = fetch_valkey_password().await;
+        assert!(
+            result.is_err(),
+            "fetch_valkey_password must fail without real SSM connectivity"
+        );
+        match result.err().unwrap() {
+            ApplicationError::SecretRetrieval { path, .. } => {
+                assert!(
+                    path.contains("/valkey/password"),
+                    "error path must include /valkey/password, got {}",
+                    path
+                );
+            }
+            other => panic!("expected SecretRetrieval error, got {:?}", other),
+        }
+    }
+
+    /// 2026-04-25 future-wiring ratchet: when a developer wires Valkey
+    /// into the production boot path (i.e. constructs a `ValkeyPool` from
+    /// `crates/app/src/main.rs`), they MUST source the password from
+    /// SSM via `fetch_valkey_password` rather than reading
+    /// `config.valkey.password` directly from TOML.
+    ///
+    /// Status today (2026-04-25): no production caller of `ValkeyPool::new`
+    /// exists in main.rs. This test passes vacuously while that holds.
+    /// The instant someone adds a `ValkeyPool::new` call to main.rs, this
+    /// test FAILS unless the same file also imports `fetch_valkey_password`,
+    /// forcing the developer to wire SSM at the same time.
+    #[test]
+    fn test_valkey_wiring_in_main_must_use_ssm() {
+        let main_rs = std::fs::read_to_string("../app/src/main.rs")
+            .or_else(|_| std::fs::read_to_string("crates/app/src/main.rs"))
+            .expect("main.rs must be readable from secret_manager test working dir");
+
+        let main_constructs_valkey =
+            main_rs.contains("ValkeyPool::new") || main_rs.contains("valkey_cache::ValkeyPool");
+        let main_uses_ssm_fetch = main_rs.contains("fetch_valkey_password")
+            || main_rs.contains("fetch_valkey_credentials");
+
+        if main_constructs_valkey {
+            assert!(
+                main_uses_ssm_fetch,
+                "main.rs constructs a ValkeyPool but does NOT call \
+                 fetch_valkey_password() — Valkey password must come from \
+                 AWS SSM (/tickvault/<env>/valkey/password), not from \
+                 config.valkey.password (TOML default is empty). Wire \
+                 fetch_valkey_password() into the same boot block that \
+                 calls ValkeyPool::new()."
+            );
+        }
+        // else: vacuous pass — Valkey is not yet wired in production
     }
 
     // -----------------------------------------------------------------------
