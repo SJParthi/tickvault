@@ -82,7 +82,7 @@
       "type": "stat",
       "options": { "colorMode": "background_solid", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "targets": [
-        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "tv_questdb_reconnects_total", "refId": "A" }
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "increase(tv_questdb_reconnects_total[5m])", "refId": "A" }
       ]
     },
     {
@@ -100,7 +100,7 @@
       "type": "stat",
       "options": { "colorMode": "background_solid", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "targets": [
-        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "tv_questdb_disconnect_events_total", "refId": "A" }
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "increase(tv_questdb_disconnect_events_total[5m])", "refId": "A" }
       ]
     },
     {
@@ -144,7 +144,7 @@
       "type": "stat",
       "options": { "colorMode": "background_solid", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "targets": [
-        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "tv_pool_degraded_alerts_total", "refId": "A" }
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "increase(tv_pool_degraded_alerts_total[5m])", "refId": "A" }
       ]
     },
     {
@@ -162,7 +162,7 @@
       "type": "stat",
       "options": { "colorMode": "background_solid", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "targets": [
-        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "tv_pool_halts_total", "refId": "A" }
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "increase(tv_pool_halts_total[5m])", "refId": "A" }
       ]
     },
     {
@@ -180,7 +180,7 @@
       "type": "stat",
       "options": { "colorMode": "background_solid", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "targets": [
-        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "tv_pool_recoveries_total", "refId": "A" }
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "increase(tv_pool_recoveries_total[5m])", "refId": "A" }
       ]
     },
     {
@@ -198,7 +198,7 @@
       "type": "stat",
       "options": { "colorMode": "background_solid", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "targets": [
-        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "tv_pool_self_halts_total", "refId": "A" }
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "increase(tv_pool_self_halts_total[5m])", "refId": "A" }
       ]
     },
     {
@@ -223,7 +223,7 @@
       "type": "stat",
       "options": { "colorMode": "background_solid", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "targets": [
-        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "tv_tick_flush_errors_total", "refId": "A" }
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "increase(tv_tick_flush_errors_total[5m])", "refId": "A" }
       ]
     },
     {
@@ -241,7 +241,7 @@
       "type": "stat",
       "options": { "colorMode": "background_solid", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "targets": [
-        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "tv_depth_flush_errors_total", "refId": "A" }
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "increase(tv_depth_flush_errors_total[5m])", "refId": "A" }
       ]
     },
     {
@@ -259,7 +259,7 @@
       "type": "stat",
       "options": { "colorMode": "background_solid", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "targets": [
-        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "tv_live_candle_flush_errors_total", "refId": "A" }
+        { "datasource": { "type": "prometheus", "uid": "prometheus" }, "expr": "increase(tv_live_candle_flush_errors_total[5m])", "refId": "A" }
       ]
     },
     {

@@ -79,7 +79,7 @@
       "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "title": "Total Ticks Processed",
       "type": "stat",
-      "targets": [{ "expr": "tv_ticks_processed_total", "legendFormat": "", "refId": "A" }]
+      "targets": [{ "expr": "increase(tv_ticks_processed_total[5m])", "legendFormat": "", "refId": "A" }]
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
@@ -95,7 +95,7 @@
       "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "title": "Total Frames Processed",
       "type": "stat",
-      "targets": [{ "expr": "tv_frames_processed_total", "legendFormat": "", "refId": "A" }]
+      "targets": [{ "expr": "increase(tv_frames_processed_total[5m])", "legendFormat": "", "refId": "A" }]
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
@@ -169,7 +169,7 @@
       "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "title": "Junk Ticks Filtered",
       "type": "stat",
-      "targets": [{ "expr": "tv_junk_ticks_filtered_total", "legendFormat": "", "refId": "A" }]
+      "targets": [{ "expr": "increase(tv_junk_ticks_filtered_total[5m])", "legendFormat": "", "refId": "A" }]
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
@@ -186,7 +186,7 @@
       "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "title": "Parse Errors",
       "type": "stat",
-      "targets": [{ "expr": "tv_parse_errors_total", "legendFormat": "", "refId": "A" }]
+      "targets": [{ "expr": "increase(tv_parse_errors_total[5m])", "legendFormat": "", "refId": "A" }]
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
@@ -203,7 +203,7 @@
       "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "title": "Storage Errors",
       "type": "stat",
-      "targets": [{ "expr": "tv_storage_errors_total", "legendFormat": "", "refId": "A" }]
+      "targets": [{ "expr": "increase(tv_storage_errors_total[5m])", "legendFormat": "", "refId": "A" }]
     },
     {
       "collapsed": false,
@@ -244,10 +244,10 @@
       "title": "WebSocket Reconnections",
       "type": "stat",
       "targets": [
-        { "expr": "sum(tv_websocket_reconnections_total)", "legendFormat": "main-feed", "refId": "A" },
-        { "expr": "sum(tv_depth_20lvl_reconnections_total)", "legendFormat": "depth-20", "refId": "B" },
-        { "expr": "sum(tv_depth_200lvl_reconnections_total)", "legendFormat": "depth-200", "refId": "C" },
-        { "expr": "tv_order_update_reconnections_total", "legendFormat": "order-update", "refId": "D" }
+        { "expr": "sum(increase(tv_websocket_reconnections_total[5m]))", "legendFormat": "main-feed", "refId": "A" },
+        { "expr": "sum(increase(tv_depth_20lvl_reconnections_total[5m]))", "legendFormat": "depth-20", "refId": "B" },
+        { "expr": "sum(increase(tv_depth_200lvl_reconnections_total[5m]))", "legendFormat": "depth-200", "refId": "C" },
+        { "expr": "increase(tv_order_update_reconnections_total[5m])", "legendFormat": "order-update", "refId": "D" }
       ]
     },
     {
@@ -338,7 +338,7 @@
       "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "title": "Depth Frames Dropped",
       "type": "stat",
-      "targets": [{ "expr": "tv_depth_frames_dropped_total", "legendFormat": "{{depth}} {{type}}", "refId": "A" }]
+      "targets": [{ "expr": "increase(tv_depth_frames_dropped_total[5m])", "legendFormat": "{{depth}} {{type}}", "refId": "A" }]
     },
     {
       "collapsed": false,
@@ -362,7 +362,7 @@
       "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "title": "Historical Candles Fetched",
       "type": "stat",
-      "targets": [{ "expr": "tv_historical_candles_fetched_total", "legendFormat": "", "refId": "A" }]
+      "targets": [{ "expr": "increase(tv_historical_candles_fetched_total[5m])", "legendFormat": "", "refId": "A" }]
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
@@ -380,7 +380,7 @@
       "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "title": "Historical API Errors",
       "type": "stat",
-      "targets": [{ "expr": "tv_historical_api_errors_total", "legendFormat": "", "refId": "A" }]
+      "targets": [{ "expr": "increase(tv_historical_api_errors_total[5m])", "legendFormat": "", "refId": "A" }]
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
@@ -397,7 +397,7 @@
       "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "title": "Dedup Filtered Total",
       "type": "stat",
-      "targets": [{ "expr": "tv_dedup_filtered_total", "legendFormat": "", "refId": "A" }]
+      "targets": [{ "expr": "increase(tv_dedup_filtered_total[5m])", "legendFormat": "", "refId": "A" }]
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
@@ -414,7 +414,7 @@
       "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "title": "Crossed Market Events",
       "type": "stat",
-      "targets": [{ "expr": "tv_crossed_market_total", "legendFormat": "", "refId": "A" }]
+      "targets": [{ "expr": "increase(tv_crossed_market_total[5m])", "legendFormat": "", "refId": "A" }]
     },
     {
       "collapsed": false,
@@ -462,7 +462,7 @@
       "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "title": "Orders Placed",
       "type": "stat",
-      "targets": [{ "expr": "tv_orders_placed_total", "legendFormat": "", "refId": "A" }]
+      "targets": [{ "expr": "increase(tv_orders_placed_total[5m])", "legendFormat": "", "refId": "A" }]
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
@@ -478,7 +478,7 @@
       "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "title": "Orders Filled",
       "type": "stat",
-      "targets": [{ "expr": "tv_orders_filled_total", "legendFormat": "", "refId": "A" }]
+      "targets": [{ "expr": "increase(tv_orders_filled_total[5m])", "legendFormat": "", "refId": "A" }]
     },
     {
       "datasource": { "type": "prometheus", "uid": "prometheus" },
@@ -495,7 +495,7 @@
       "options": { "colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "title": "Orders Rejected",
       "type": "stat",
-      "targets": [{ "expr": "tv_orders_rejected_total", "legendFormat": "", "refId": "A" }]
+      "targets": [{ "expr": "increase(tv_orders_rejected_total[5m])", "legendFormat": "", "refId": "A" }]
     },
     {
       "collapsed": false,

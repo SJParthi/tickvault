@@ -83,7 +83,11 @@ use tickvault_storage::tick_persistence::{
 
 use tickvault_trading::greeks::inline_computer::InlineGreeksComputer;
 
-use tickvault_api::build_router;
+// `build_router` was the legacy entry point; both boot paths now use
+// `build_router_with_auth` directly with an SSM-resolved `ApiAuthConfig`
+// per the 2026-04-25 security audit (PR #357). Import remains commented
+// for one release cycle so the legacy wrapper is easy to revive if needed.
+// use tickvault_api::build_router;
 use tickvault_api::state::{SharedAppState, SharedHealthStatus, SystemHealthStatus};
 
 // Constants are in boot_helpers module (lib.rs) for coverage instrumentation.
@@ -1332,10 +1336,24 @@ async fn main() -> Result<()> {
             health_status,
         );
 
-        let router = build_router(
+        // 2026-04-25 security audit (PR #357): SSM-only bearer token resolution
+        // (mirrors the slow-boot path below). Fast-boot uses the same SSM path
+        // so both boot paths have identical secret-handling semantics. Hard-fail
+        // on SSM error — matches `fetch_dhan_credentials` / `fetch_telegram_*`
+        // boot-time semantics. NO env var fallback.
+        let api_bearer_token_fast = tickvault_core::auth::secret_manager::fetch_api_bearer_token()
+            .await
+            .context("GAP-SEC-01 (fast boot): SSM fetch for API bearer token failed at /tickvault/<env>/api/bearer-token — store the token via `aws ssm put-parameter --name /tickvault/<env>/api/bearer-token --type SecureString`")?;
+        info!(
+            "GAP-SEC-01 (fast boot): API bearer token loaded from SSM \
+             (/tickvault/<env>/api/bearer-token)"
+        );
+        let api_auth_config_fast =
+            tickvault_api::middleware::ApiAuthConfig::from_token(api_bearer_token_fast);
+        let router = tickvault_api::build_router_with_auth(
             api_state,
             &config.api.allowed_origins,
-            config.strategy.dry_run,
+            api_auth_config_fast,
         );
         let bind_addr: SocketAddr = format_bind_addr(&config.api.host, config.api.port)
             .parse()
@@ -1918,6 +1936,12 @@ async fn main() -> Result<()> {
         tickvault_core::pipeline::top_movers::SharedMoversSnapshotV2,
     > = None;
 
+    // Plan item H (2026-04-25): SharedSpotPrices map shared between movers
+    // (Premium/Discount routing) + depth ATM selection. Created OUTSIDE the
+    // processor scope so Step 8c.0 (below) can clone the same Arc.
+    let shared_spot_prices_for_movers =
+        tickvault_core::instrument::depth_rebalancer::new_shared_spot_prices();
+
     let processor_handle = if let Some(receiver) = pool_receiver {
         let candle_agg = Some(tickvault_core::pipeline::CandleAggregator::new());
         let live_candle_writer =
@@ -1997,6 +2021,10 @@ async fn main() -> Result<()> {
         // stock_movers + option_movers tables for back-compat (plan D2).
         // Dedicated shutdown notifier for the V2 movers pipeline. Awakened
         // by the graceful-shutdown path (below) via a cloned Arc.
+        //
+        // Plan item H (2026-04-25): SharedSpotPrices was created above (outside
+        // the processor scope). Movers Premium/Discount routing reads from the
+        // same map populated by the spot updater task in Step 8c.0 below.
         let movers_v2_shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
         let movers_v2_handles = if let Some(registry) = slow_registry.as_ref() {
             Some(tickvault_app::movers_v2_pipeline::spawn_movers_v2_pipeline(
@@ -2004,6 +2032,7 @@ async fn main() -> Result<()> {
                 tick_broadcast_sender.clone(),
                 config.questdb.clone(),
                 config.movers.clone(),
+                std::sync::Arc::clone(&shared_spot_prices_for_movers),
                 std::sync::Arc::clone(&movers_v2_shutdown),
             ))
         } else {
@@ -2079,7 +2108,12 @@ async fn main() -> Result<()> {
     // Must be created BEFORE depth connections so we can wait for the first
     // index LTP before selecting ATM strikes. The spot price updater subscribes
     // to the tick broadcast and extracts index LTPs.
-    let shared_spot_prices = tickvault_core::instrument::depth_rebalancer::new_shared_spot_prices();
+    //
+    // 2026-04-25: reuse the SharedSpotPrices map created earlier (above the
+    // movers v2 pipeline spawn, plan item H). Both subsystems share one map
+    // so the spot updater task at the bottom of this block populates LTPs
+    // visible to depth ATM selection AND movers Premium/Discount routing.
+    let shared_spot_prices = std::sync::Arc::clone(&shared_spot_prices_for_movers);
     let spot_prices_for_depth = std::sync::Arc::clone(&shared_spot_prices);
     if should_connect_ws {
         let spot_prices_updater = std::sync::Arc::clone(&shared_spot_prices);
@@ -4269,10 +4303,25 @@ async fn main() -> Result<()> {
         None => api_state,
     };
 
-    let router = build_router(
+    // 2026-04-25 security audit (PR #357): API bearer token sourced from AWS
+    // SSM Parameter Store ONLY — `/tickvault/<env>/api/bearer-token`. Same
+    // rule as Dhan, Telegram, Grafana, QuestDB credentials per
+    // `.claude/rules/project/rust-code.md` ("always real AWS, never mocks";
+    // local Mac uses `~/.aws/credentials` to reach the same SSM endpoint).
+    //
+    // Hard-fail on SSM error — matches the existing `fetch_dhan_credentials`
+    // / `fetch_telegram_credentials` boot-time semantics. There is NO env
+    // var fallback. If SSM is unreachable the app cannot boot, period.
+    let api_bearer_token = tickvault_core::auth::secret_manager::fetch_api_bearer_token()
+        .await
+        .context("GAP-SEC-01: SSM fetch for API bearer token failed at /tickvault/<env>/api/bearer-token — store the token via `aws ssm put-parameter --name /tickvault/<env>/api/bearer-token --type SecureString`")?;
+    info!("GAP-SEC-01: API bearer token loaded from SSM (/tickvault/<env>/api/bearer-token)");
+    let api_auth_config = tickvault_api::middleware::ApiAuthConfig::from_token(api_bearer_token);
+
+    let router = tickvault_api::build_router_with_auth(
         api_state,
         &config.api.allowed_origins,
-        config.strategy.dry_run,
+        api_auth_config,
     );
 
     let bind_addr: SocketAddr = format_bind_addr(&config.api.host, config.api.port)

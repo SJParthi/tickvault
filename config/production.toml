@@ -29,7 +29,18 @@ ip_verification_enabled = true
 ip_check_interval_secs = 300
 
 [valkey]
-# Password loaded from SSM at boot: /tickvault/prod/valkey/password
+# Valkey AUTH password.
+#
+# Status: NOT YET WIRED IN PRODUCTION (2026-04-25).
+# `ValkeyPool::new` is currently called only from storage unit tests; no
+# code path in `crates/app/src/main.rs` constructs a Valkey client at boot.
+# When Valkey is wired up, the password MUST be fetched from AWS SSM via
+# `tickvault_core::auth::secret_manager::fetch_valkey_password()` (path
+# `/tickvault/prod/valkey/password`), NOT read from this TOML file.
+# The empty default below is safe today because no client uses it.
+# See `crates/common/src/constants.rs::SSM_VALKEY_SERVICE` and the
+# future-wiring ratchet `test_valkey_wiring_in_main_must_use_ssm`
+# in `crates/core/src/auth/secret_manager.rs`.
 password = ""
 
 [logging]

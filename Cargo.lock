@@ -3817,6 +3817,7 @@ dependencies = [
  "chrono",
  "metrics",
  "reqwest",
+ "secrecy",
  "serde",
  "serde_json",
  "thiserror",
@@ -3829,7 +3830,6 @@ dependencies = [
  "tower-http",
  "tracing",
  "uuid",
- "zeroize",
 ]
 
 [[package]]

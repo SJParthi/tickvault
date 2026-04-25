@@ -14,7 +14,7 @@
 fn test_gap_sec_01_auth_config_exists_with_required_fields() {
     let config = tickvault_api::middleware::ApiAuthConfig::new("test-token".to_string());
     assert!(config.enabled, "auth config with token must be enabled");
-    assert_eq!(config.bearer_token, "test-token");
+    assert_eq!(config.token_value_for_test(), "test-token");
 }
 
 /// Verify disabled auth mode exists (dev passthrough).

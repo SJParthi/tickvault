@@ -618,6 +618,46 @@ pub const TELEGRAM_BOT_TOKEN_SECRET: &str = "bot-token";
 pub const TELEGRAM_CHAT_ID_SECRET: &str = "chat-id";
 
 // ---------------------------------------------------------------------------
+// SSM Parameter Store — API Service (added 2026-04-25)
+// ---------------------------------------------------------------------------
+
+/// SSM service path segment for API server credentials.
+///
+/// 2026-04-25 security audit (PR #357): TV_API_TOKEN was previously read
+/// from a process env var (Docker `environment:` block or systemd
+/// `EnvironmentFile`), which is plaintext on disk and visible via
+/// `docker inspect` / `/proc/<pid>/environ`. Project mandate per
+/// `.claude/rules/project/rust-code.md` is "All secrets from AWS SSM
+/// Parameter Store". This service path moves the bearer token into SSM
+/// alongside Dhan, QuestDB, Grafana, and Telegram credentials.
+pub const SSM_API_SERVICE: &str = "api";
+
+/// SSM key for API bearer token (mutating-endpoint authentication).
+///
+/// Full path: `/tickvault/<env>/api/bearer-token`
+pub const API_BEARER_TOKEN_SECRET: &str = "bearer-token";
+
+// ---------------------------------------------------------------------------
+// SSM Parameter Store — Valkey Service (added 2026-04-25)
+// ---------------------------------------------------------------------------
+
+/// SSM service path segment for Valkey (Redis-replacement) credentials.
+///
+/// 2026-04-25 security audit (PR #357 follow-up): the Valkey password was
+/// previously a checked-in default of `""` in `config/base.toml` with a
+/// comment that promised "loaded from AWS SSM at boot" — but no SSM fetch
+/// existed. The comment lied to the reader. This service path closes the
+/// gap so Valkey credentials match the rest of the project (Dhan, QuestDB,
+/// Grafana, Telegram, API). Per `.claude/rules/project/rust-code.md` rule
+/// "always real AWS, never mocks" — same code path on local Mac and EC2.
+pub const SSM_VALKEY_SERVICE: &str = "valkey";
+
+/// SSM key for Valkey AUTH password.
+///
+/// Full path: `/tickvault/<env>/valkey/password`
+pub const VALKEY_PASSWORD_SECRET: &str = "password";
+
+// ---------------------------------------------------------------------------
 // SSM Parameter Store — SNS Service
 // ---------------------------------------------------------------------------
 
@@ -1849,7 +1889,7 @@ pub const INDEX_CONSTITUENCY_SLUGS: &[(&str, &str)] = &[
     ("Nifty Midcap 50", "ind_niftymidcap50list"),
     ("Nifty Midcap 100", "ind_niftymidcap100list"),
     ("Nifty Midcap 150", "ind_niftymidcap150list"),
-    ("Nifty Midcap Select", "ind_niftymidcap_selectlist"),
+    ("Nifty Midcap Select", "ind_niftymidcapselect_list"),
     ("Nifty Smallcap 50", "ind_niftysmallcap50list"),
     ("Nifty Smallcap 100", "ind_niftysmallcap100list"),
     ("Nifty Smallcap 250", "ind_niftysmallcap250list"),
@@ -1865,7 +1905,7 @@ pub const INDEX_CONSTITUENCY_SLUGS: &[(&str, &str)] = &[
     ("Nifty Financial Services", "ind_niftyfinancelist"),
     (
         "Nifty Financial Services 25/50",
-        "ind_niftyfinancialservices25_50list",
+        "ind_niftyfinancialservices25-50list",
     ),
     ("Nifty FMCG", "ind_niftyfmcglist"),
     ("Nifty Healthcare", "ind_niftyhealthcarelist"),
@@ -1874,29 +1914,32 @@ pub const INDEX_CONSTITUENCY_SLUGS: &[(&str, &str)] = &[
     ("Nifty Metal", "ind_niftymetallist"),
     ("Nifty Pharma", "ind_niftypharmalist"),
     ("Nifty PSU Bank", "ind_niftypsubanklist"),
-    ("Nifty Private Bank", "ind_niftypvtbanklist"),
+    ("Nifty Private Bank", "ind_nifty_privatebanklist"),
     ("Nifty Realty", "ind_niftyrealtylist"),
-    ("Nifty Consumer Durables", "ind_niftyconsumerdurablelist"),
-    ("Nifty Oil & Gas", "ind_niftyoilandgaslist"),
+    ("Nifty Consumer Durables", "ind_niftyconsumerdurableslist"),
+    ("Nifty Oil & Gas", "ind_niftyoilgaslist"),
     // -----------------------------------------------------------------------
     // Thematic / Strategy Indices (18)
     // -----------------------------------------------------------------------
     ("Nifty Commodities", "ind_niftycommoditieslist"),
-    ("Nifty India Consumption", "ind_niftyindiaconsumptionlist"),
+    ("Nifty India Consumption", "ind_niftyconsumptionlist"),
     ("Nifty CPSE", "ind_niftycpselist"),
     ("Nifty Energy", "ind_niftyenergylist"),
-    ("Nifty Infrastructure", "ind_niftyinfrastructurelist"),
+    ("Nifty Infrastructure", "ind_niftyinfralist"),
     ("Nifty MNC", "ind_niftymnclist"),
     ("Nifty PSE", "ind_niftypselist"),
-    ("Nifty Growth Sectors 15", "ind_niftyGrowthSectors15list"),
-    ("Nifty100 Quality 30", "ind_nifty100_Quality30list"),
-    ("Nifty50 Value 20", "ind_nifty50_value20list"),
-    ("Nifty Alpha 50", "ind_niftyAlpha50list"),
-    ("Nifty High Beta 50", "ind_niftyHighBeta50list"),
-    ("Nifty Low Volatility 50", "ind_niftyLowVolatility50list"),
+    ("Nifty Growth Sectors 15", "ind_NiftyGrowth_Sectors15_Index"),
+    ("Nifty100 Quality 30", "ind_nifty100Quality30list"),
+    ("Nifty50 Value 20", "ind_Nifty50_Value20"),
+    ("Nifty Alpha 50", "ind_nifty_Alpha_Index"),
+    ("Nifty High Beta 50", "nifty_High_Beta50_Index"),
+    ("Nifty Low Volatility 50", "nifty_low_Volatility50_Index"),
     ("Nifty India Digital", "ind_niftyIndiaDigital_list"),
     ("Nifty India Defence", "ind_niftyIndiaDefence_list"),
-    ("Nifty India Manufacturing", "ind_niftyIndiaMfg_list"),
+    (
+        "Nifty India Manufacturing",
+        "ind_niftyindiamanufacturing_list",
+    ),
     ("Nifty Mobility", "ind_niftymobility_list"),
     (
         "Nifty500 Multicap 50:25:25",
@@ -1933,22 +1976,7 @@ pub const INDEX_CONSTITUENCY_SLUG_COUNT: usize = INDEX_CONSTITUENCY_SLUGS.len();
 /// sandbox/datacenter IPs (verified 2026-04-24: every WebFetch from
 /// this environment returned 403). The correct slugs can only be
 /// discovered from a real browser session.
-pub const INDEX_CONSTITUENCY_KNOWN_STALE_SLUGS: &[&str] = &[
-    "ind_niftymidcap_selectlist",
-    "ind_niftyfinancialservices25_50list",
-    "ind_niftypvtbanklist",
-    "ind_niftyconsumerdurablelist",
-    "ind_niftyoilandgaslist",
-    "ind_niftyindiaconsumptionlist",
-    "ind_niftyinfrastructurelist",
-    "ind_niftyGrowthSectors15list",
-    "ind_nifty100_Quality30list",
-    "ind_nifty50_value20list",
-    "ind_niftyAlpha50list",
-    "ind_niftyHighBeta50list",
-    "ind_niftyLowVolatility50list",
-    "ind_niftyIndiaMfg_list",
-];
+pub const INDEX_CONSTITUENCY_KNOWN_STALE_SLUGS: &[&str] = &[];
 
 // ---------------------------------------------------------------------------
 // Tests — Market Hours Constants

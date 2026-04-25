@@ -22,6 +22,7 @@
 //! spawn logic here keeps the two boot paths symmetric (prevents the
 //! kind of boot-path divergence the G3+G4 pre-push guard complains about).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -35,10 +36,21 @@ use tickvault_common::constants::{
 };
 use tickvault_common::instrument_registry::InstrumentRegistry;
 use tickvault_common::tick_types::ParsedTick;
+use tickvault_core::instrument::depth_rebalancer::SharedSpotPrices;
 use tickvault_core::pipeline::top_movers::{
-    MoversSnapshotV2, MoversTrackerV2, SharedMoversSnapshotV2, snapshot_to_rows,
+    MoversSnapshotV2, MoversTrackerV2, SharedMoversSnapshotV2, Timeframe, snapshot_to_rows,
 };
 use tickvault_storage::movers_persistence::TopMoversV2Writer;
+
+/// Plan item G (2026-04-25): bundle of one snapshot per timeframe.
+///
+/// `MoversTrackerV2::compute_snapshot_v2_at_timeframe` is invoked once per
+/// `Timeframe` per cycle. Results land in this map keyed by timeframe so
+/// downstream code (API handle publishing, QuestDB persistence) can iterate.
+///
+/// Always exactly `Timeframe::ALL.len()` entries when emitted from the
+/// updater task. `Default` is empty for the watch channel's initial value.
+pub type MultiTimeframeSnapshots = HashMap<Timeframe, MoversSnapshotV2>;
 
 /// Handles returned to the boot path so it can join on shutdown.
 pub struct MoversV2PipelineHandles {
@@ -55,6 +67,10 @@ pub struct MoversV2PipelineHandles {
 ///   receiver is created via `.subscribe()`.
 /// * `questdb_config` — for constructing the `TopMoversV2Writer` (ILP).
 /// * `movers_config` — [`MoversConfig`] filters + cadences (plan item G2).
+/// * `spot_prices` — shared underlying-spot LTPs (e.g. NIFTY, RELIANCE) used
+///   by `MoversTrackerV2::compute_snapshot_v2_at_timeframe` to compute
+///   futures Premium/Discount spreads. May be empty (warm-up grace —
+///   buckets simply leave Premium/Discount empty).
 /// * `shutdown` — notifier that both tasks await alongside their work.
 #[must_use]
 pub fn spawn_movers_v2_pipeline(
@@ -62,6 +78,7 @@ pub fn spawn_movers_v2_pipeline(
     tick_broadcast: broadcast::Sender<ParsedTick>,
     questdb_config: tickvault_common::config::QuestDbConfig,
     movers_config: MoversConfig,
+    spot_prices: SharedSpotPrices,
     shutdown: Arc<Notify>,
 ) -> MoversV2PipelineHandles {
     // Shared state — constructed eagerly so both the api state and the
@@ -73,13 +90,15 @@ pub fn spawn_movers_v2_pipeline(
     // reads snapshots via a clone of the tracker — BUT the tracker is
     // not Send between tasks by itself (HashMap is, but we want a single
     // writer). Pattern: the updater owns the tracker and emits a fresh
-    // snapshot into a watch channel; the persister consumes the watch.
+    // bundle of per-timeframe snapshots into a watch channel; the
+    // persister consumes the watch.
     let (snapshot_tx, snapshot_rx) =
-        tokio::sync::watch::channel::<MoversSnapshotV2>(MoversSnapshotV2::default());
+        tokio::sync::watch::channel::<MultiTimeframeSnapshots>(MultiTimeframeSnapshots::new());
 
     let updater_registry = Arc::clone(&registry);
     let updater_shutdown = Arc::clone(&shutdown);
     let updater_snapshot_tx = snapshot_tx.clone();
+    let updater_spot_prices = Arc::clone(&spot_prices);
     let updater_cadence_secs = u64::from(movers_config.snapshot_cadence_secs.max(1));
     let mut tick_rx = tick_broadcast.subscribe();
 
@@ -122,8 +141,37 @@ pub fn spawn_movers_v2_pipeline(
                     }
                 }
                 _ = recompute.tick() => {
-                    let snapshot = tracker.compute_snapshot_v2();
-                    if updater_snapshot_tx.send(snapshot).is_err() {
+                    // Plan item H (2026-04-25): take a synchronous snapshot
+                    // of the SharedSpotPrices map for futures Premium/Discount
+                    // routing. Allocation is on the cold path (every N
+                    // seconds, not per tick) so the clone is acceptable.
+                    let spot_snapshot: HashMap<String, f32> = {
+                        let map = updater_spot_prices.read().await;
+                        // O(1) EXEMPT: cold path, ~4-200 underlyings (NIFTY, BANKNIFTY,
+                        // FINNIFTY, MIDCPNIFTY + stock underlyings).
+                        let mut out = HashMap::with_capacity(map.len());
+                        for (sym, entry) in map.iter() {
+                            // Lossy f64 → f32 — fine for spread routing where the
+                            // tracker stores LTPs as f32. The narrowing is bounded
+                            // by Indian equity prices (max ~100k INR), well within
+                            // f32 precision.
+                            #[allow(clippy::cast_possible_truncation)] // APPROVED: bounded by NSE max price ≪ f32::MAX
+                            out.insert(sym.clone(), entry.price as f32);
+                        }
+                        out
+                    };
+
+                    // Plan item G (2026-04-25): compute one snapshot per
+                    // timeframe. Total = 15 cold-path computations per cycle.
+                    // O(1) EXEMPT: cold path; allocation budgeted under cadence.
+                    let mut multi: MultiTimeframeSnapshots =
+                        MultiTimeframeSnapshots::with_capacity(Timeframe::ALL.len());
+                    for tf in Timeframe::ALL {
+                        let snap =
+                            tracker.compute_snapshot_v2_at_timeframe(tf, &spot_snapshot);
+                        multi.insert(tf, snap);
+                    }
+                    if updater_snapshot_tx.send(multi).is_err() {
                         info!("movers_v2 snapshot channel closed — updater exiting");
                         break;
                     }
@@ -182,10 +230,16 @@ pub fn spawn_movers_v2_pipeline(
                         info!("movers_v2 snapshot channel closed — persister exiting");
                         break;
                     }
-                    // Publish to the API-facing shared handle regardless of market hours.
-                    let snapshot: MoversSnapshotV2 = rx.borrow_and_update().clone();
-                    if let Ok(mut guard) = persister_snapshot_handle.write() {
-                        *guard = Some(snapshot);
+                    // Publish the OneMin (1m) snapshot to the API-facing handle
+                    // regardless of market hours. The /api/movers handler is
+                    // currently single-timeframe; multi-timeframe API surface
+                    // is a separate workstream. Persistence below writes ALL
+                    // 15 timeframes when market is open.
+                    let multi: MultiTimeframeSnapshots = rx.borrow_and_update().clone();
+                    if let Some(one_min) = multi.get(&Timeframe::OneMin)
+                        && let Ok(mut guard) = persister_snapshot_handle.write()
+                    {
+                        *guard = Some(one_min.clone());
                     }
                 }
                 _ = flush_interval.tick() => {
@@ -194,26 +248,44 @@ pub fn spawn_movers_v2_pipeline(
                         debug!("movers_v2 persister idle — outside market hours");
                         continue;
                     }
-                    if let Some(w) = writer.as_mut() {
-                        // Snapshot the latest published state (RwLock read) and enrich to rows.
-                        let snapshot_opt = match persister_snapshot_handle.read() {
-                            Ok(g) => g.as_ref().cloned(),
-                            Err(_) => None,
-                        };
-                        let Some(snapshot) = snapshot_opt else { continue };
-                        let rows = snapshot_to_rows(&snapshot, &persister_registry);
+                    let Some(w) = writer.as_mut() else { continue };
+                    // Plan item G (2026-04-25): iterate every timeframe and
+                    // emit rows for each. The DEDUP key
+                    //   (timeframe, bucket, rank_category, rank, security_id, segment)
+                    // ensures the 15 series coexist without collisions.
+                    let multi: MultiTimeframeSnapshots = rx.borrow().clone();
+                    if multi.is_empty() {
+                        continue;
+                    }
+                    let mut total_rows = 0_usize;
+                    for tf in Timeframe::ALL {
+                        let Some(snapshot) = multi.get(&tf) else { continue };
+                        let rows =
+                            snapshot_to_rows(snapshot, tf, &persister_registry);
                         if rows.is_empty() {
                             continue;
                         }
+                        total_rows = total_rows.saturating_add(rows.len());
                         for row in rows {
                             if let Err(err) = w.append_row(row) {
-                                error!(?err, "movers_v2 append_row failed — dropping snapshot batch");
+                                error!(
+                                    ?err,
+                                    timeframe = tf.as_str(),
+                                    "movers_v2 append_row failed — dropping snapshot batch"
+                                );
                                 break;
                             }
                         }
-                        if let Err(err) = w.flush() {
-                            error!(?err, "movers_v2 flush failed — rows retained in rescue ring");
-                        }
+                    }
+                    if total_rows == 0 {
+                        continue;
+                    }
+                    if let Err(err) = w.flush() {
+                        error!(
+                            ?err,
+                            total_rows,
+                            "movers_v2 flush failed — rows retained in rescue ring"
+                        );
                     }
                 }
             }
@@ -337,11 +409,14 @@ mod tests {
                 ilp_port: 65_535,
             };
             let shutdown = Arc::new(Notify::new());
+            let spot_prices =
+                tickvault_core::instrument::depth_rebalancer::new_shared_spot_prices();
             let handles = spawn_movers_v2_pipeline(
                 Arc::clone(&registry),
                 tx.clone(),
                 questdb_cfg,
                 MoversConfig::default(),
+                spot_prices,
                 Arc::clone(&shutdown),
             );
 

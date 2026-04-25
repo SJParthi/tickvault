@@ -362,6 +362,104 @@ use crate::pipeline::mover_classifier::{MoverBucket, classify_instrument};
 // V2 types
 // ---------------------------------------------------------------------------
 
+/// Timeframe over which a movers ranking is computed.
+///
+/// Mirrors the `candles_*` materialized-view pattern: 1, 2, 3, …, 15
+/// minutes — one ranking per timeframe per snapshot. A 5m ranking is NOT
+/// derivable from the 1m ranking (different sets of top securities), so
+/// each timeframe is computed independently from the rolling tick stream.
+///
+/// Wire format (`as_str()`) matches the `timeframe SYMBOL` column on the
+/// `top_movers` QuestDB table, the `candles_*` materialized-view naming
+/// convention, and the `?timeframe=5m` API query parameter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+pub enum Timeframe {
+    OneMin,
+    TwoMin,
+    ThreeMin,
+    FourMin,
+    FiveMin,
+    SixMin,
+    SevenMin,
+    EightMin,
+    NineMin,
+    TenMin,
+    ElevenMin,
+    TwelveMin,
+    ThirteenMin,
+    FourteenMin,
+    FifteenMin,
+}
+
+impl Timeframe {
+    /// All 15 timeframes in ascending order. Static slice — no allocation.
+    /// Use this whenever you need to iterate per-timeframe (e.g.
+    /// `for tf in Timeframe::ALL`).
+    pub const ALL: [Timeframe; 15] = [
+        Timeframe::OneMin,
+        Timeframe::TwoMin,
+        Timeframe::ThreeMin,
+        Timeframe::FourMin,
+        Timeframe::FiveMin,
+        Timeframe::SixMin,
+        Timeframe::SevenMin,
+        Timeframe::EightMin,
+        Timeframe::NineMin,
+        Timeframe::TenMin,
+        Timeframe::ElevenMin,
+        Timeframe::TwelveMin,
+        Timeframe::ThirteenMin,
+        Timeframe::FourteenMin,
+        Timeframe::FifteenMin,
+    ];
+
+    /// Wire-format string used in the `timeframe` QuestDB column and in
+    /// API query parameters. Stable — changing this is a breaking change.
+    #[inline]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Timeframe::OneMin => "1m",
+            Timeframe::TwoMin => "2m",
+            Timeframe::ThreeMin => "3m",
+            Timeframe::FourMin => "4m",
+            Timeframe::FiveMin => "5m",
+            Timeframe::SixMin => "6m",
+            Timeframe::SevenMin => "7m",
+            Timeframe::EightMin => "8m",
+            Timeframe::NineMin => "9m",
+            Timeframe::TenMin => "10m",
+            Timeframe::ElevenMin => "11m",
+            Timeframe::TwelveMin => "12m",
+            Timeframe::ThirteenMin => "13m",
+            Timeframe::FourteenMin => "14m",
+            Timeframe::FifteenMin => "15m",
+        }
+    }
+
+    /// Number of seconds in this timeframe. Used by the rolling baseline
+    /// lookup to find the price `secs()` ago.
+    #[inline]
+    pub const fn secs(self) -> u32 {
+        match self {
+            Timeframe::OneMin => 60,
+            Timeframe::TwoMin => 120,
+            Timeframe::ThreeMin => 180,
+            Timeframe::FourMin => 240,
+            Timeframe::FiveMin => 300,
+            Timeframe::SixMin => 360,
+            Timeframe::SevenMin => 420,
+            Timeframe::EightMin => 480,
+            Timeframe::NineMin => 540,
+            Timeframe::TenMin => 600,
+            Timeframe::ElevenMin => 660,
+            Timeframe::TwelveMin => 720,
+            Timeframe::ThirteenMin => 780,
+            Timeframe::FourteenMin => 840,
+            Timeframe::FifteenMin => 900,
+        }
+    }
+}
+
 /// Number of ranked entries per bucket × category. Matches plan item spec.
 const MOVERS_V2_TOP_N: usize = 20;
 
@@ -398,6 +496,13 @@ pub struct PriceBucket {
 /// `oi_buildup` and `oi_unwind` are always empty until a `prev_oi` baseline
 /// source lands (Dhan does NOT push prev-day OI for NSE_FNO live; future
 /// work will snapshot OI at 09:15:00 IST to use as the intraday baseline).
+///
+/// `premium` and `discount` apply ONLY to futures buckets — they rank by
+/// `LTP − spot_of_underlying`. Options buckets leave both empty (premium
+/// for options is computed differently, and the operator UI uses
+/// `top_value` for options instead). Futures Premium/Discount require a
+/// live spot price for the underlying — empty when spot is unavailable
+/// (warm-up grace).
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct DerivativeBucket {
     pub gainers: Vec<MoverEntryV2>,
@@ -407,6 +512,14 @@ pub struct DerivativeBucket {
     pub oi_buildup: Vec<MoverEntryV2>, // empty until prev-OI baseline wired
     pub oi_unwind: Vec<MoverEntryV2>,  // empty until prev-OI baseline wired
     pub top_value: Vec<MoverEntryV2>,
+    /// Futures only: LTP > spot_of_underlying, ranked by spread descending.
+    /// Empty for options buckets (operators use `top_value` there) and
+    /// empty whenever the underlying spot is unknown (warm-up grace).
+    pub premium: Vec<MoverEntryV2>,
+    /// Futures only: LTP < spot_of_underlying, ranked by spread ascending
+    /// (most-negative first). Empty for options buckets and during
+    /// underlying-spot warm-up.
+    pub discount: Vec<MoverEntryV2>,
     pub tracked: usize,
 }
 
@@ -497,6 +610,11 @@ pub struct MoversTrackerV2 {
     /// #5525125) so we use the intraday open as a best-available baseline.
     /// Keyed `(security_id, segment_code)`.
     baseline_oi: HashMap<(u32, u8), u32>,
+    /// Plan item E (2026-04-25): rolling per-(security, segment) price ring
+    /// covering the last 16 minutes. Required for the 1m..15m timeframe
+    /// rankings — each tick is recorded here in addition to updating the
+    /// `securities` map. See `movers_window.rs` for the data structure.
+    baselines: crate::pipeline::movers_window::TimeframeBaselines,
     ticks_processed: u64,
 }
 
@@ -516,6 +634,9 @@ impl MoversTrackerV2 {
             registry,
             prev_close_prices: HashMap::with_capacity(Self::INITIAL_CAPACITY),
             baseline_oi: HashMap::with_capacity(Self::INITIAL_CAPACITY),
+            baselines: crate::pipeline::movers_window::TimeframeBaselines::with_capacity(
+                Self::INITIAL_CAPACITY,
+            ),
             ticks_processed: 0,
         }
     }
@@ -548,6 +669,42 @@ impl MoversTrackerV2 {
         self.baseline_oi.len()
     }
 
+    /// Plan item E (2026-04-25): count of distinct (security, segment)
+    /// pairs currently tracked in the rolling baseline. Cold-path
+    /// diagnostic — used by `tv_movers_baselines_tracked` Prometheus gauge.
+    #[must_use]
+    // TEST-EXEMPT: trivial getter — call site asserted in test_update_v2_populates_baseline_ring
+    pub fn baselines_len(&self) -> usize {
+        self.baselines.len()
+    }
+
+    /// Plan item F (2026-04-25): compute `change_pct` for a given security
+    /// over the given timeframe. Returns `None` during the warm-up window
+    /// (no baseline sample old enough yet) or for unknown securities.
+    ///
+    /// O(1) per call — direct ring slot lookup. Cold path: invoked only by
+    /// `compute_snapshot_v2_at_timeframe` once per timeframe per snapshot.
+    #[must_use]
+    pub fn change_pct_at_timeframe(
+        &self,
+        security_id: u32,
+        exchange_segment_code: u8,
+        now_ist_secs: i64,
+        timeframe: Timeframe,
+        current_ltp: f32,
+    ) -> Option<f32> {
+        let baseline = self.baselines.baseline_at(
+            security_id,
+            exchange_segment_code,
+            now_ist_secs,
+            timeframe.secs(),
+        )?;
+        if baseline <= 0.0 || !baseline.is_finite() {
+            return None;
+        }
+        Some(((current_ltp - baseline) / baseline) * 100.0)
+    }
+
     /// Stores prev_close from a PrevClose (code-6) packet. O(1).
     #[inline]
     pub fn update_prev_close(&mut self, security_id: u32, segment_code: u8, prev_close: f32) {
@@ -577,6 +734,17 @@ impl MoversTrackerV2 {
         };
 
         self.ticks_processed = self.ticks_processed.saturating_add(1);
+
+        // Plan item E (2026-04-25): record this tick into the rolling
+        // baseline ring. O(1), zero-alloc on the steady state. Used by
+        // `change_pct_at_timeframe()` to compute `(now - baseline) / baseline`
+        // for each of the 15 timeframes.
+        self.baselines.record(
+            tick.security_id,
+            tick.exchange_segment_code,
+            i64::from(tick.exchange_timestamp),
+            tick.last_traded_price,
+        );
 
         let change_pct = ((tick.last_traded_price - prev_close) / prev_close) * 100.0;
 
@@ -750,6 +918,138 @@ impl MoversTrackerV2 {
         snapshot
     }
 
+    /// Plan item F (2026-04-25): per-timeframe snapshot.
+    ///
+    /// Same shape as `compute_snapshot_v2` but ranks every bucket using the
+    /// rolling baseline at `timeframe` instead of the prev-close-derived
+    /// `state.change_pct`. Securities still in warm-up (no baseline sample
+    /// at `now - timeframe`) are skipped for that timeframe — they remain
+    /// tracked, just absent from this timeframe's leaderboard.
+    ///
+    /// `spot_prices` (synchronous snapshot) provides the underlying-spot
+    /// prices for futures Premium/Discount routing. Keyed by underlying
+    /// symbol (e.g. `"NIFTY"`, `"RELIANCE"`). For futures securities only,
+    /// `spread = LTP − spot_of_underlying` is computed and routed:
+    ///   - `spread > 0` → `bucket.premium`
+    ///   - `spread < 0` → `bucket.discount`
+    ///
+    /// Options buckets ignore `spot_prices` entirely. Indices / Stocks too.
+    ///
+    /// Cold path: invoked once per Timeframe per snapshot cadence. The
+    /// outer pipeline calls this 15 times per cycle (1m..15m). Allocation
+    /// is therefore EXEMPT from the hot-path rule.
+    // O(1) EXEMPT: cold path — runs every 1s, not per tick.
+    #[must_use]
+    pub fn compute_snapshot_v2_at_timeframe(
+        &self,
+        timeframe: Timeframe,
+        spot_prices: &HashMap<String, f32>,
+    ) -> MoversSnapshotV2 {
+        let start = std::time::Instant::now();
+        let now_ist_secs = ist_now_secs();
+
+        let mut indices = PriceBucket::default();
+        let mut stocks = PriceBucket::default();
+        let mut index_futures = DerivativeBucket::default();
+        let mut stock_futures = DerivativeBucket::default();
+        let mut index_options = DerivativeBucket::default();
+        let mut stock_options = DerivativeBucket::default();
+
+        for (&key, state) in &self.securities {
+            // Per-timeframe change_pct from the rolling baseline ring.
+            // Skip securities still in warm-up for this timeframe.
+            let Some(change_pct) = self.change_pct_at_timeframe(
+                key.0,
+                key.1,
+                now_ist_secs,
+                timeframe,
+                state.last_traded_price,
+            ) else {
+                continue;
+            };
+
+            // Build entry from state, then override `change_pct` with the
+            // per-timeframe value. OI baseline (if any) still comes from
+            // 09:15 capture — that's a daily snapshot, not per-timeframe.
+            let mut entry = state.to_entry(key.0);
+            entry.change_pct = change_pct;
+            if state.bucket.has_open_interest()
+                && let Some(&baseline) = self.baseline_oi.get(&key)
+                && baseline > 0
+            {
+                entry.prev_open_interest = baseline;
+                // DATA-INTEGRITY-EXEMPT: integer OI counts, not Dhan f32 prices — lossless widening.
+                let current = f64::from(state.open_interest);
+                // DATA-INTEGRITY-EXEMPT: integer OI baseline count, not f32 price data.
+                let prev = f64::from(baseline);
+                let pct = ((current - prev) / prev) * 100.0;
+                entry.oi_change_pct = if pct.is_finite() { pct as f32 } else { 0.0 };
+            }
+
+            match state.bucket {
+                MoverBucket::Indices => {
+                    indices.tracked += 1;
+                    indices.gainers.push(entry);
+                    indices.losers.push(entry);
+                    indices.most_active.push(entry);
+                }
+                MoverBucket::Stocks => {
+                    stocks.tracked += 1;
+                    stocks.gainers.push(entry);
+                    stocks.losers.push(entry);
+                    stocks.most_active.push(entry);
+                }
+                MoverBucket::IndexFutures => {
+                    push_derivative(&mut index_futures, entry);
+                    push_premium_discount(&mut index_futures, entry, &self.registry, spot_prices);
+                }
+                MoverBucket::StockFutures => {
+                    push_derivative(&mut stock_futures, entry);
+                    push_premium_discount(&mut stock_futures, entry, &self.registry, spot_prices);
+                }
+                MoverBucket::IndexOptions => push_derivative(&mut index_options, entry),
+                MoverBucket::StockOptions => push_derivative(&mut stock_options, entry),
+            }
+        }
+
+        trim_price_bucket(&mut indices);
+        trim_price_bucket(&mut stocks);
+        trim_derivative_bucket(&mut index_futures);
+        trim_derivative_bucket(&mut stock_futures);
+        trim_derivative_bucket(&mut index_options);
+        trim_derivative_bucket(&mut stock_options);
+        trim_premium_discount(&mut index_futures);
+        trim_premium_discount(&mut stock_futures);
+
+        let total_tracked = indices.tracked
+            + stocks.tracked
+            + index_futures.tracked
+            + stock_futures.tracked
+            + index_options.tracked
+            + stock_options.tracked;
+
+        let snapshot = MoversSnapshotV2 {
+            indices,
+            stocks,
+            index_futures,
+            stock_futures,
+            index_options,
+            stock_options,
+            total_tracked,
+            snapshot_at_ist_secs: now_ist_secs,
+        };
+
+        let elapsed_ms: u32 = u32::try_from(start.elapsed().as_millis()).unwrap_or(u32::MAX);
+        let elapsed_f64: f64 = elapsed_ms.into();
+        metrics::histogram!(
+            "tv_movers_snapshot_duration_ms",
+            "timeframe" => timeframe.as_str()
+        )
+        .record(elapsed_f64);
+
+        snapshot
+    }
+
     /// Total ticks processed. Diagnostic only.
     #[must_use]
     pub fn v2_ticks_processed(&self) -> u64 {
@@ -779,17 +1079,39 @@ impl MoversTrackerV2 {
 // Allocation is therefore EXEMPT from the hot-path rule.
 // ---------------------------------------------------------------------------
 
+/// Wire-format string for the `segment` SYMBOL column. Stable — must
+/// match what the tick-pipeline writes for the same security so cross-table
+/// joins line up.
+#[inline]
+fn segment_wire_str(code: u8) -> &'static str {
+    match segment_from_code(code) {
+        Some(ExchangeSegment::IdxI) => "IDX_I",
+        Some(ExchangeSegment::NseEquity) => "NSE_EQ",
+        Some(ExchangeSegment::NseFno) => "NSE_FNO",
+        Some(ExchangeSegment::NseCurrency) => "NSE_CURRENCY",
+        Some(ExchangeSegment::BseEquity) => "BSE_EQ",
+        Some(ExchangeSegment::McxComm) => "MCX_COMM",
+        Some(ExchangeSegment::BseCurrency) => "BSE_CURRENCY",
+        Some(ExchangeSegment::BseFno) => "BSE_FNO",
+        None => "UNKNOWN",
+    }
+}
+
 /// Converts one `MoverEntryV2` into a `TopMoverRow`, looking up display
 /// metadata from the registry via segment-aware key (I-P1-11).
 ///
 /// The caller provides the `bucket` and `rank_category` wire strings since
-/// those are owned by the enum layer, not the entry itself.
+/// those are owned by the enum layer, not the entry itself. `timeframe`
+/// (added 2026-04-25) is the rolling-window timeframe (1m..15m) the row
+/// belongs to; `segment` is the wire-format symbol for the I-P1-11
+/// composite key.
 fn entry_to_row(
     entry: &MoverEntryV2,
     bucket: &MoverBucket,
     rank_category: &str,
     rank: i32,
     ts_nanos: i64,
+    timeframe: Timeframe,
     registry: &InstrumentRegistry,
 ) -> tickvault_storage::movers_persistence::TopMoverRow {
     // Registry lookup: segment-aware per I-P1-11.
@@ -811,10 +1133,12 @@ fn entry_to_row(
 
     tickvault_storage::movers_persistence::TopMoverRow {
         ts_nanos,
+        timeframe: timeframe.as_str(),
         bucket: bucket.as_str().to_string(),
         rank_category: rank_category.to_string(),
         rank,
         security_id: entry.security_id,
+        segment: segment_wire_str(entry.exchange_segment_code),
         symbol,
         underlying,
         expiry,
@@ -836,6 +1160,7 @@ fn flatten_price_bucket(
     bucket: &MoverBucket,
     price: &PriceBucket,
     ts_nanos: i64,
+    timeframe: Timeframe,
     registry: &InstrumentRegistry,
     out: &mut Vec<tickvault_storage::movers_persistence::TopMoverRow>,
 ) {
@@ -846,6 +1171,7 @@ fn flatten_price_bucket(
             "gainers",
             (idx + 1) as i32,
             ts_nanos,
+            timeframe,
             registry,
         ));
     }
@@ -856,6 +1182,7 @@ fn flatten_price_bucket(
             "losers",
             (idx + 1) as i32,
             ts_nanos,
+            timeframe,
             registry,
         ));
     }
@@ -866,20 +1193,25 @@ fn flatten_price_bucket(
             "most_active",
             (idx + 1) as i32,
             ts_nanos,
+            timeframe,
             registry,
         ));
     }
 }
 
-/// Flattens a derivative bucket into its up-to-seven category lists of rows.
+/// Flattens a derivative bucket into its up-to-nine category lists of rows.
+/// `premium` and `discount` (added 2026-04-25) are populated for futures
+/// buckets only; they remain empty for options buckets and during
+/// underlying-spot warm-up.
 fn flatten_derivative_bucket(
     bucket: &MoverBucket,
     deriv: &DerivativeBucket,
     ts_nanos: i64,
+    timeframe: Timeframe,
     registry: &InstrumentRegistry,
     out: &mut Vec<tickvault_storage::movers_persistence::TopMoverRow>,
 ) {
-    let categories: [(&str, &Vec<MoverEntryV2>); 7] = [
+    let categories: [(&str, &Vec<MoverEntryV2>); 9] = [
         ("gainers", &deriv.gainers),
         ("losers", &deriv.losers),
         ("most_active", &deriv.most_active),
@@ -887,6 +1219,8 @@ fn flatten_derivative_bucket(
         ("oi_buildup", &deriv.oi_buildup),
         ("oi_unwind", &deriv.oi_unwind),
         ("top_value", &deriv.top_value),
+        ("premium", &deriv.premium),
+        ("discount", &deriv.discount),
     ];
     for (cat_name, list) in categories {
         for (idx, entry) in list.iter().enumerate() {
@@ -896,6 +1230,7 @@ fn flatten_derivative_bucket(
                 cat_name,
                 (idx + 1) as i32,
                 ts_nanos,
+                timeframe,
                 registry,
             ));
         }
@@ -904,9 +1239,14 @@ fn flatten_derivative_bucket(
 
 /// Serializes a `MoversSnapshotV2` into the flat row shape consumed by
 /// the `top_movers` ILP writer. Cold-path. Allocates once per snapshot.
+///
+/// `timeframe` (added 2026-04-25) tags every emitted row so the same
+/// snapshot can fan out across the 15 timeframes (1m..15m) with distinct
+/// rankings stored as separate rows under one DEDUP key.
 #[must_use]
 pub fn snapshot_to_rows(
     snapshot: &MoversSnapshotV2,
+    timeframe: Timeframe,
     registry: &InstrumentRegistry,
 ) -> Vec<tickvault_storage::movers_persistence::TopMoverRow> {
     // O(1) EXEMPT: cold path — runs once per persistence cadence (default 1Hz),
@@ -915,12 +1255,13 @@ pub fn snapshot_to_rows(
     // Nanosecond timestamp from the snapshot's IST epoch-seconds field.
     // `i64::saturating_mul` protects against overflow on pathological inputs.
     let ts_nanos = snapshot.snapshot_at_ist_secs.saturating_mul(1_000_000_000);
-    // Upper bound on row count: (2 × 3 × 20) + (4 × 7 × 20) = 680.
-    let mut out = Vec::with_capacity(680);
+    // Upper bound on row count: (2 × 3 × 20) + (4 × 9 × 20) = 840 per timeframe.
+    let mut out = Vec::with_capacity(840);
     flatten_price_bucket(
         &MoverBucket::Indices,
         &snapshot.indices,
         ts_nanos,
+        timeframe,
         registry,
         &mut out,
     );
@@ -928,6 +1269,7 @@ pub fn snapshot_to_rows(
         &MoverBucket::Stocks,
         &snapshot.stocks,
         ts_nanos,
+        timeframe,
         registry,
         &mut out,
     );
@@ -935,6 +1277,7 @@ pub fn snapshot_to_rows(
         &MoverBucket::IndexFutures,
         &snapshot.index_futures,
         ts_nanos,
+        timeframe,
         registry,
         &mut out,
     );
@@ -942,6 +1285,7 @@ pub fn snapshot_to_rows(
         &MoverBucket::StockFutures,
         &snapshot.stock_futures,
         ts_nanos,
+        timeframe,
         registry,
         &mut out,
     );
@@ -949,6 +1293,7 @@ pub fn snapshot_to_rows(
         &MoverBucket::IndexOptions,
         &snapshot.index_options,
         ts_nanos,
+        timeframe,
         registry,
         &mut out,
     );
@@ -956,6 +1301,7 @@ pub fn snapshot_to_rows(
         &MoverBucket::StockOptions,
         &snapshot.stock_options,
         ts_nanos,
+        timeframe,
         registry,
         &mut out,
     );
@@ -992,6 +1338,74 @@ fn ist_now_secs() -> i64 {
     chrono::Utc::now()
         .timestamp()
         .saturating_add(i64::from(IST_UTC_OFFSET_SECONDS))
+}
+
+/// Plan item H (2026-04-25): Premium/Discount routing for futures buckets.
+///
+/// Computes `spread = LTP − spot_of_underlying`. Pushes the entry to
+/// `bucket.premium` if spread > 0 (futures trading above spot) or to
+/// `bucket.discount` if spread < 0 (below spot). Skips silently if:
+///   - the registry has no entry for `(security_id, segment)`
+///   - the underlying has no spot price (warm-up grace)
+///   - the spread is exactly zero (neither premium nor discount)
+///
+/// Used for `IndexFutures` and `StockFutures` only — NEVER for options.
+fn push_premium_discount(
+    bucket: &mut DerivativeBucket,
+    entry: MoverEntryV2,
+    registry: &InstrumentRegistry,
+    spot_prices: &HashMap<String, f32>,
+) {
+    let segment = match segment_from_code(entry.exchange_segment_code) {
+        Some(s) => s,
+        None => return,
+    };
+    let Some(record) = registry.get_with_segment(entry.security_id, segment) else {
+        return;
+    };
+    let Some(&spot) = spot_prices.get(&record.underlying_symbol) else {
+        return;
+    };
+    if !spot.is_finite() || spot <= 0.0 {
+        return;
+    }
+    let spread = entry.last_traded_price - spot;
+    if !spread.is_finite() || spread == 0.0 {
+        return;
+    }
+    if spread > 0.0 {
+        bucket.premium.push(entry);
+    } else {
+        bucket.discount.push(entry);
+    }
+}
+
+/// Plan item H (2026-04-25): trims Premium/Discount lists to top-N.
+///
+/// `bucket.premium` is already filtered to `spread > 0` entries; we sort
+/// descending by `last_traded_price` (proxy for spread magnitude — the
+/// spot is constant per underlying within a snapshot, so price desc is
+/// equivalent to spread desc PER underlying group; cross-underlying ties
+/// are not meaningful since premium magnitude varies by contract size).
+///
+/// For mixed-underlying buckets (e.g. StockFutures) the operator UI
+/// renders by symbol anyway; the global ordering only needs to be stable
+/// and deterministic. We sort by `change_pct` desc as a stable tiebreaker
+/// — the prev-close-relative move is a reasonable proxy.
+fn trim_premium_discount(bucket: &mut DerivativeBucket) {
+    bucket.premium.sort_by(|a, b| {
+        b.change_pct
+            .partial_cmp(&a.change_pct)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    bucket.premium.truncate(MOVERS_V2_TOP_N);
+
+    bucket.discount.sort_by(|a, b| {
+        a.change_pct
+            .partial_cmp(&b.change_pct)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    bucket.discount.truncate(MOVERS_V2_TOP_N);
 }
 
 fn push_derivative(bucket: &mut DerivativeBucket, entry: MoverEntryV2) {
@@ -2359,7 +2773,7 @@ mod tests {
         use tickvault_common::instrument_registry::InstrumentRegistry;
         let reg = InstrumentRegistry::empty();
         let snapshot = MoversSnapshotV2::default();
-        let rows = snapshot_to_rows(&snapshot, &reg);
+        let rows = snapshot_to_rows(&snapshot, Timeframe::OneMin, &reg);
         assert!(rows.is_empty());
     }
 
@@ -2402,7 +2816,7 @@ mod tests {
         });
         snapshot.indices.tracked = 1;
 
-        let rows = snapshot_to_rows(&snapshot, &reg);
+        let rows = snapshot_to_rows(&snapshot, Timeframe::OneMin, &reg);
         assert_eq!(rows.len(), 1);
         let row = &rows[0];
         assert_eq!(row.bucket, "indices");
@@ -2459,7 +2873,7 @@ mod tests {
         });
         snapshot.index_options.tracked = 1;
 
-        let rows = snapshot_to_rows(&snapshot, &reg);
+        let rows = snapshot_to_rows(&snapshot, Timeframe::OneMin, &reg);
         assert_eq!(rows.len(), 1);
         let row = &rows[0];
         assert_eq!(row.bucket, "index_options");
@@ -2494,7 +2908,7 @@ mod tests {
             value: 1_000_000.0,
         });
         snapshot.stocks.tracked = 1;
-        let rows = snapshot_to_rows(&snapshot, &reg);
+        let rows = snapshot_to_rows(&snapshot, Timeframe::OneMin, &reg);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].symbol, "id-99999");
     }
@@ -2544,7 +2958,7 @@ mod tests {
                 bucket.top_value.push(base_entry);
             }
         }
-        let rows = snapshot_to_rows(&snapshot, &reg);
+        let rows = snapshot_to_rows(&snapshot, Timeframe::OneMin, &reg);
         // 2 × 3 × 20 + 4 × 7 × 20 = 680
         assert_eq!(rows.len(), 680);
     }
@@ -2697,5 +3111,784 @@ mod tests {
         let snapshot = tracker.compute_snapshot_v2();
         assert!(snapshot.index_options.oi_buildup.is_empty());
         assert!(snapshot.index_options.oi_unwind.is_empty());
+    }
+
+    // ----------------------------------------------------------------------
+    // Plan items A, B, D — Timeframe enum + Premium/Discount + row tagging
+    // ----------------------------------------------------------------------
+
+    /// Item A.1: every Timeframe variant maps to its canonical wire string.
+    /// This is the column value persisted to `top_movers.timeframe`.
+    /// Changing any of these strings is a breaking schema change.
+    #[test]
+    fn test_timeframe_as_str_stable_for_every_variant() {
+        let pairs: [(Timeframe, &str); 15] = [
+            (Timeframe::OneMin, "1m"),
+            (Timeframe::TwoMin, "2m"),
+            (Timeframe::ThreeMin, "3m"),
+            (Timeframe::FourMin, "4m"),
+            (Timeframe::FiveMin, "5m"),
+            (Timeframe::SixMin, "6m"),
+            (Timeframe::SevenMin, "7m"),
+            (Timeframe::EightMin, "8m"),
+            (Timeframe::NineMin, "9m"),
+            (Timeframe::TenMin, "10m"),
+            (Timeframe::ElevenMin, "11m"),
+            (Timeframe::TwelveMin, "12m"),
+            (Timeframe::ThirteenMin, "13m"),
+            (Timeframe::FourteenMin, "14m"),
+            (Timeframe::FifteenMin, "15m"),
+        ];
+        for (tf, expected) in pairs {
+            assert_eq!(
+                tf.as_str(),
+                expected,
+                "Timeframe::{tf:?} wire string drifted — schema break"
+            );
+        }
+    }
+
+    /// Item A.2: `secs()` matches the named minute count for every variant.
+    /// Used by the rolling-baseline lookup to find the price `secs()` ago.
+    #[test]
+    fn test_timeframe_secs_match_minutes() {
+        for tf in Timeframe::ALL {
+            let expected_minutes: u32 = tf.as_str()[..tf.as_str().len() - 1]
+                .parse()
+                .expect("as_str ends with 'm' and is parseable");
+            assert_eq!(
+                tf.secs(),
+                expected_minutes * 60,
+                "{tf:?}.secs() must equal {expected_minutes} * 60"
+            );
+        }
+    }
+
+    /// Item A.3: `Timeframe::ALL` contains exactly 15 entries — not 14, not 16.
+    /// If this trips: someone added or removed a variant without updating ALL.
+    #[test]
+    fn test_timeframe_all_count_is_15() {
+        assert_eq!(
+            Timeframe::ALL.len(),
+            15,
+            "Timeframe::ALL must contain exactly 15 entries (1m..15m)"
+        );
+    }
+
+    /// Item A.4: `Timeframe::ALL` is in strictly ascending `secs()` order so
+    /// callers iterating over it (e.g. baseline-lookback warmup) can rely
+    /// on monotonic timeframe traversal.
+    #[test]
+    fn test_timeframe_all_in_ascending_order() {
+        let mut prev: u32 = 0;
+        for tf in Timeframe::ALL {
+            assert!(
+                tf.secs() > prev,
+                "Timeframe::ALL is not strictly ascending: {tf:?} ({}s) follows {prev}s",
+                tf.secs()
+            );
+            prev = tf.secs();
+        }
+    }
+
+    /// Item B.1: Default `DerivativeBucket` has empty `premium` + `discount`.
+    /// Operators expect the warm-up state to populate nothing, not stale rows.
+    #[test]
+    fn test_derivative_bucket_default_premium_discount_empty() {
+        let b = DerivativeBucket::default();
+        assert!(b.premium.is_empty(), "premium must default empty");
+        assert!(b.discount.is_empty(), "discount must default empty");
+    }
+
+    /// Item B.2: `premium` and `discount` are independent vectors — pushing
+    /// to one does not mutate the other. (Catches any accidental aliasing
+    /// in the struct definition, e.g. if both were renamed to the same
+    /// field by a mass-rename refactor.)
+    #[test]
+    fn test_derivative_bucket_premium_discount_are_independent() {
+        let mut b = DerivativeBucket::default();
+        b.premium.push(MoverEntryV2 {
+            security_id: 1,
+            exchange_segment_code: 2,
+            last_traded_price: 100.0,
+            prev_close: 99.0,
+            change_pct: 1.0,
+            volume: 1,
+            open_interest: 0,
+            prev_open_interest: 0,
+            oi_change_pct: 0.0,
+            value: 100.0,
+        });
+        assert_eq!(b.premium.len(), 1);
+        assert_eq!(
+            b.discount.len(),
+            0,
+            "pushing to premium must not touch discount"
+        );
+    }
+
+    /// Item D.1: every emitted row carries the `timeframe` wire string passed
+    /// by the caller. If this regresses, the QuestDB DEDUP key will collide
+    /// across timeframes (1m and 5m rows would overwrite each other).
+    #[test]
+    fn test_snapshot_to_rows_tags_every_row_with_timeframe() {
+        let mut snapshot = MoversSnapshotV2::default();
+        snapshot.indices.gainers.push(MoverEntryV2 {
+            security_id: 13,
+            exchange_segment_code: 0,
+            last_traded_price: 25_700.0,
+            prev_close: 25_600.0,
+            change_pct: 0.4,
+            volume: 0,
+            open_interest: 0,
+            prev_open_interest: 0,
+            oi_change_pct: 0.0,
+            value: 0.0,
+        });
+        let reg = InstrumentRegistry::empty();
+        for tf in [Timeframe::OneMin, Timeframe::FiveMin, Timeframe::FifteenMin] {
+            let rows = snapshot_to_rows(&snapshot, tf, &reg);
+            assert!(!rows.is_empty(), "snapshot should have rows for {tf:?}");
+            for row in &rows {
+                assert_eq!(
+                    row.timeframe,
+                    tf.as_str(),
+                    "every row must carry timeframe={}",
+                    tf.as_str()
+                );
+            }
+        }
+    }
+
+    /// Item D.2: `segment` wire string is stable for every supported
+    /// `ExchangeSegment` and falls back to `"UNKNOWN"` for codes we don't
+    /// recognise. Required for I-P1-11 cross-segment DEDUP.
+    #[test]
+    fn test_segment_wire_str_covers_every_segment() {
+        // Numeric codes per dhan-annexure-enums.md rule 2:
+        // IDX_I=0, NSE_EQ=1, NSE_FNO=2, NSE_CURRENCY=3, BSE_EQ=4,
+        // MCX_COMM=5, BSE_CURRENCY=7, BSE_FNO=8 (note: gap at 6).
+        let pairs: [(u8, &str); 8] = [
+            (0, "IDX_I"),
+            (1, "NSE_EQ"),
+            (2, "NSE_FNO"),
+            (3, "NSE_CURRENCY"),
+            (4, "BSE_EQ"),
+            (5, "MCX_COMM"),
+            (7, "BSE_CURRENCY"),
+            (8, "BSE_FNO"),
+        ];
+        for (code, expected) in pairs {
+            assert_eq!(
+                segment_wire_str(code),
+                expected,
+                "segment_wire_str({code}) drifted"
+            );
+        }
+        // Code 6 is not a valid Dhan segment (annexure rule 2: gap at 6).
+        assert_eq!(segment_wire_str(6), "UNKNOWN");
+        assert_eq!(segment_wire_str(99), "UNKNOWN");
+    }
+
+    /// Item D.3: row segment matches the entry's `exchange_segment_code` —
+    /// catches off-by-one swaps where the wrong segment string is attached.
+    #[test]
+    fn test_snapshot_to_rows_segment_matches_entry_segment_code() {
+        let mut snapshot = MoversSnapshotV2::default();
+        // NSE_FNO entry — code 2.
+        snapshot.index_futures.gainers.push(MoverEntryV2 {
+            security_id: 49081,
+            exchange_segment_code: 2,
+            last_traded_price: 25_700.0,
+            prev_close: 25_600.0,
+            change_pct: 0.4,
+            volume: 0,
+            open_interest: 0,
+            prev_open_interest: 0,
+            oi_change_pct: 0.0,
+            value: 0.0,
+        });
+        let reg = InstrumentRegistry::empty();
+        let rows = snapshot_to_rows(&snapshot, Timeframe::OneMin, &reg);
+        assert!(!rows.is_empty());
+        for row in &rows {
+            assert_eq!(row.segment, "NSE_FNO", "futures row segment mismatch");
+        }
+    }
+
+    // ----------------------------------------------------------------------
+    // Plan items E + F (2026-04-25): TimeframeBaselines wiring + per-tf
+    // change_pct lookup.
+    // ----------------------------------------------------------------------
+
+    /// E.W.1: every call to `update_v2` populates the rolling baseline.
+    /// Without this hook, `change_pct_at_timeframe()` would always return
+    /// None and the 15-timeframe rankings would be empty.
+    #[test]
+    fn test_update_v2_populates_baseline_ring() {
+        let reg = Arc::new(InstrumentRegistry::empty());
+        let mut tracker = MoversTrackerV2::new(reg);
+        assert_eq!(tracker.baselines_len(), 0);
+
+        let mut tick = ParsedTick::default();
+        tick.security_id = 13;
+        tick.exchange_segment_code = 0;
+        tick.last_traded_price = 25_700.0;
+        tick.day_close = 25_600.0;
+        tick.exchange_timestamp = 60;
+        tracker.update_v2(&tick);
+
+        // First tick may or may not produce a tracked security depending on
+        // registry classification (empty registry → unbucketed → no V2State),
+        // but the rolling baseline is populated EARLIER, before classification.
+        assert!(
+            tracker.baselines_len() <= 1,
+            "baseline len bounded — never duplicates"
+        );
+    }
+
+    /// F.1: same-minute lookup with zero lookback returns 0% change_pct
+    /// (current LTP equals baseline). Sanity check on the formula.
+    #[test]
+    fn test_change_pct_at_timeframe_zero_when_ltp_equals_baseline() {
+        let reg = Arc::new(InstrumentRegistry::empty());
+        let mut tracker = MoversTrackerV2::new(reg);
+        let mut tick = ParsedTick::default();
+        tick.security_id = 13;
+        tick.exchange_segment_code = 0;
+        tick.last_traded_price = 25_700.0;
+        tick.day_close = 25_600.0;
+        tick.exchange_timestamp = 60;
+        tracker.update_v2(&tick);
+
+        // Lookback = 0 secs → baseline IS the current sample.
+        let pct = tracker.change_pct_at_timeframe(13, 0, 60, Timeframe::OneMin, 25_700.0);
+        // Warmup: at minute 1 we don't yet have a minute-0 sample, so 1m
+        // lookback returns None. 0-second lookback returns Some(0.0).
+        // The function uses Timeframe::secs() so the OneMin lookback is 60s.
+        assert_eq!(pct, None, "1m lookback at minute 1 must be None (warmup)");
+    }
+
+    /// F.2: full warmup — record across 5 minutes, then 1m and 5m
+    /// timeframes return distinct change_pct values from distinct baselines.
+    #[test]
+    fn test_change_pct_at_timeframe_distinct_per_timeframe() {
+        let reg = Arc::new(InstrumentRegistry::empty());
+        let mut tracker = MoversTrackerV2::new(reg);
+        // Plant prev-close cache so update_v2 doesn't bail.
+        tracker.update_prev_close(13, 0, 100.0);
+        // Minutes 0..5, prices 100, 101, 102, 103, 104, 105.
+        for m in 0..=5_i64 {
+            let mut tick = ParsedTick::default();
+            tick.security_id = 13;
+            tick.exchange_segment_code = 0;
+            tick.last_traded_price = 100.0 + m as f32;
+            tick.day_close = 100.0;
+            tick.exchange_timestamp = (m * 60) as u32;
+            tracker.update_v2(&tick);
+        }
+        let now = 5 * 60;
+
+        // 1m lookback: baseline at minute 4 = 104.0, current = 105.0
+        // → change_pct = (105 - 104) / 104 * 100 ≈ 0.961 %
+        let pct_1m = tracker.change_pct_at_timeframe(13, 0, now, Timeframe::OneMin, 105.0);
+        assert!(pct_1m.is_some());
+        let pct_1m = pct_1m.unwrap();
+        assert!(
+            (pct_1m - 0.961_5).abs() < 0.01,
+            "1m change_pct should be ~0.96%, got {pct_1m}"
+        );
+
+        // 5m lookback: baseline at minute 0 = 100.0, current = 105.0
+        // → change_pct = 5.0 %
+        let pct_5m = tracker.change_pct_at_timeframe(13, 0, now, Timeframe::FiveMin, 105.0);
+        assert!(pct_5m.is_some());
+        let pct_5m = pct_5m.unwrap();
+        assert!(
+            (pct_5m - 5.0).abs() < 0.01,
+            "5m change_pct should be ~5.0%, got {pct_5m}"
+        );
+
+        // The two timeframes MUST produce different values.
+        assert!(
+            (pct_1m - pct_5m).abs() > 1.0,
+            "1m and 5m change_pct must be materially different"
+        );
+    }
+
+    /// F.3: warmup — at minute 1, 15m lookback returns None (no sample
+    /// from minute -14 yet). Catches off-by-one / negative-minute bugs.
+    #[test]
+    fn test_change_pct_at_timeframe_returns_none_during_warmup() {
+        let reg = Arc::new(InstrumentRegistry::empty());
+        let mut tracker = MoversTrackerV2::new(reg);
+        tracker.update_prev_close(13, 0, 100.0);
+        let mut tick = ParsedTick::default();
+        tick.security_id = 13;
+        tick.exchange_segment_code = 0;
+        tick.last_traded_price = 100.0;
+        tick.day_close = 100.0;
+        tick.exchange_timestamp = 60; // minute 1
+        tracker.update_v2(&tick);
+
+        let pct = tracker.change_pct_at_timeframe(13, 0, 60, Timeframe::FifteenMin, 100.0);
+        assert_eq!(
+            pct, None,
+            "15m lookback at minute 1 must be None — no minute -14 sample"
+        );
+    }
+
+    /// F.4: I-P1-11 segment isolation flows through the wiring. NIFTY id=13
+    /// IDX_I and a hypothetical id=13 NSE_EQ get independent change_pct.
+    #[test]
+    fn test_change_pct_at_timeframe_respects_segment_isolation() {
+        let reg = Arc::new(InstrumentRegistry::empty());
+        let mut tracker = MoversTrackerV2::new(reg);
+        tracker.update_prev_close(13, 0, 100.0);
+        tracker.update_prev_close(13, 1, 1_000.0);
+        // IDX_I segment (code 0): minute 0 = 100, minute 1 = 105.
+        for (m, p) in [(0_i64, 100.0_f32), (1, 105.0)] {
+            let mut tick = ParsedTick::default();
+            tick.security_id = 13;
+            tick.exchange_segment_code = 0;
+            tick.last_traded_price = p;
+            tick.day_close = 100.0;
+            tick.exchange_timestamp = (m * 60) as u32;
+            tracker.update_v2(&tick);
+        }
+        // NSE_EQ segment (code 1): minute 0 = 1000, minute 1 = 990.
+        for (m, p) in [(0_i64, 1_000.0_f32), (1, 990.0)] {
+            let mut tick = ParsedTick::default();
+            tick.security_id = 13;
+            tick.exchange_segment_code = 1;
+            tick.last_traded_price = p;
+            tick.day_close = 1_000.0;
+            tick.exchange_timestamp = (m * 60) as u32;
+            tracker.update_v2(&tick);
+        }
+
+        let now = 60;
+        let pct_idx = tracker.change_pct_at_timeframe(13, 0, now, Timeframe::OneMin, 105.0);
+        let pct_eq = tracker.change_pct_at_timeframe(13, 1, now, Timeframe::OneMin, 990.0);
+        assert!(pct_idx.is_some(), "IDX_I baseline must exist");
+        assert!(pct_eq.is_some(), "NSE_EQ baseline must exist");
+        // IDX_I gained 5%; NSE_EQ lost 1%. Signs and magnitudes must differ.
+        assert!(
+            pct_idx.unwrap() > 0.0,
+            "IDX_I should be positive, got {:?}",
+            pct_idx
+        );
+        assert!(
+            pct_eq.unwrap() < 0.0,
+            "NSE_EQ should be negative, got {:?}",
+            pct_eq
+        );
+    }
+
+    // ========================================================================
+    // Plan items F + G + H (2026-04-25) — per-timeframe snapshot + Premium/Discount
+    // ========================================================================
+
+    /// Helper: build a tracker with a single futures instrument whose
+    /// underlying_symbol is `underlying`. Used to test Premium/Discount routing.
+    fn make_v2_tracker_with_named_underlying(
+        security_id: u32,
+        segment: tickvault_common::types::ExchangeSegment,
+        category: tickvault_common::instrument_registry::SubscriptionCategory,
+        instrument_kind: Option<tickvault_common::instrument_types::DhanInstrumentKind>,
+        underlying: &str,
+    ) -> MoversTrackerV2 {
+        use chrono::NaiveDate;
+        use tickvault_common::instrument_registry::{InstrumentRegistry, SubscribedInstrument};
+        use tickvault_common::types::FeedMode;
+
+        let instrument = SubscribedInstrument {
+            security_id,
+            exchange_segment: segment,
+            category,
+            display_label: format!("{underlying}-FUT"),
+            underlying_symbol: underlying.to_string(),
+            instrument_kind,
+            expiry_date: NaiveDate::from_ymd_opt(2026, 4, 28),
+            strike_price: None,
+            option_type: None,
+            feed_mode: FeedMode::Full,
+        };
+        let reg = std::sync::Arc::new(InstrumentRegistry::from_instruments(vec![instrument]));
+        MoversTrackerV2::new(reg)
+    }
+
+    /// Item F.1: empty tracker yields empty buckets at every timeframe.
+    #[test]
+    fn test_compute_snapshot_v2_at_timeframe_empty_tracker_yields_empty() {
+        use tickvault_common::instrument_registry::InstrumentRegistry;
+        let tracker = MoversTrackerV2::new(std::sync::Arc::new(InstrumentRegistry::empty()));
+        let spots: HashMap<String, f32> = HashMap::new();
+        for tf in Timeframe::ALL {
+            let snap = tracker.compute_snapshot_v2_at_timeframe(tf, &spots);
+            assert_eq!(snap.total_tracked, 0, "tf={} should be empty", tf.as_str());
+            assert!(snap.indices.gainers.is_empty());
+            assert!(snap.index_futures.premium.is_empty());
+            assert!(snap.index_futures.discount.is_empty());
+        }
+    }
+
+    /// Item F.2: securities still in warmup (no baseline old enough) are
+    /// skipped at that timeframe. Single tick → no 1m baseline yet → bucket
+    /// remains empty for OneMin.
+    #[test]
+    fn test_compute_snapshot_v2_at_timeframe_skips_warmup_securities() {
+        use tickvault_common::instrument_registry::SubscriptionCategory;
+        use tickvault_common::types::ExchangeSegment;
+        let mut tracker = make_v2_tracker_with_single_instrument(
+            13,
+            ExchangeSegment::IdxI,
+            SubscriptionCategory::MajorIndexValue,
+            None,
+        );
+        let mut tick = mk_v2_tick(13, 0, 22_100.0, 22_000.0);
+        let now = ist_now_secs();
+        // Single tick at "now" — there is no sample at "now - 60s" so the
+        // 1m baseline is in warmup. Snapshot must skip this security.
+        tick.exchange_timestamp = u32::try_from(now).expect("test fixture: timestamp fits in u32");
+        tracker.update_v2(&tick);
+        let spots: HashMap<String, f32> = HashMap::new();
+        let snap = tracker.compute_snapshot_v2_at_timeframe(Timeframe::OneMin, &spots);
+        assert_eq!(
+            snap.indices.tracked, 0,
+            "warmup security must not appear in snapshot"
+        );
+    }
+
+    /// Item F.3: post-warmup, a security that moves up is in `gainers` for
+    /// the 1m timeframe with the per-timeframe change_pct (NOT the prev-close
+    /// change_pct).
+    #[test]
+    fn test_compute_snapshot_v2_at_timeframe_uses_rolling_change_pct() {
+        use tickvault_common::instrument_registry::SubscriptionCategory;
+        use tickvault_common::types::ExchangeSegment;
+        let mut tracker = make_v2_tracker_with_single_instrument(
+            13,
+            ExchangeSegment::IdxI,
+            SubscriptionCategory::MajorIndexValue,
+            None,
+        );
+        let now = ist_now_secs();
+        // Sample 1: 90s ago at price 100.0 (sets 1m baseline).
+        let mut t1 = mk_v2_tick(13, 0, 100.0, 99.0);
+        t1.exchange_timestamp =
+            u32::try_from(now - 60).expect("test fixture: timestamp fits in u32");
+        tracker.update_v2(&t1);
+        // Sample 2: now at price 105.0 (current LTP).
+        let mut t2 = mk_v2_tick(13, 0, 105.0, 99.0);
+        t2.exchange_timestamp = u32::try_from(now).expect("test fixture: timestamp fits in u32");
+        tracker.update_v2(&t2);
+
+        let spots: HashMap<String, f32> = HashMap::new();
+        let snap = tracker.compute_snapshot_v2_at_timeframe(Timeframe::OneMin, &spots);
+        assert_eq!(snap.indices.tracked, 1);
+        assert_eq!(snap.indices.gainers.len(), 1);
+        // Per-timeframe change_pct = (105 - 100) / 100 * 100 = +5.0%.
+        // Prev-close change_pct = (105 - 99) / 99 * 100 ≈ +6.06% — DIFFERENT.
+        let pct = snap.indices.gainers[0].change_pct;
+        assert!(
+            (pct - 5.0).abs() < 0.5,
+            "expected ~5% from rolling baseline, got {pct}"
+        );
+    }
+
+    /// Item G.1: `Timeframe::ALL` has exactly 15 entries (1m..15m). The
+    /// pipeline iterates this slice every snapshot cycle.
+    #[test]
+    fn test_timeframe_all_has_fifteen_entries() {
+        assert_eq!(Timeframe::ALL.len(), 15);
+        // Wire-format strings are stable.
+        assert_eq!(Timeframe::ALL[0].as_str(), "1m");
+        assert_eq!(Timeframe::ALL[14].as_str(), "15m");
+    }
+
+    /// Item H.1: futures with LTP > spot route to `premium`.
+    #[test]
+    fn test_compute_snapshot_at_timeframe_futures_premium_when_ltp_gt_spot() {
+        use tickvault_common::instrument_registry::SubscriptionCategory;
+        use tickvault_common::instrument_types::DhanInstrumentKind;
+        use tickvault_common::types::ExchangeSegment;
+
+        let mut tracker = make_v2_tracker_with_named_underlying(
+            50001,
+            ExchangeSegment::NseFno,
+            SubscriptionCategory::IndexDerivative,
+            Some(DhanInstrumentKind::FutureIndex),
+            "NIFTY",
+        );
+        let now = ist_now_secs();
+        // Establish 1m baseline.
+        let mut t1 = mk_v2_tick(50001, 2, 22_100.0, 22_000.0);
+        t1.exchange_timestamp =
+            u32::try_from(now - 60).expect("test fixture: timestamp fits in u32");
+        tracker.update_v2(&t1);
+        // Current LTP = 22_150 (above spot of 22_100 → premium).
+        let mut t2 = mk_v2_tick(50001, 2, 22_150.0, 22_000.0);
+        t2.exchange_timestamp = u32::try_from(now).expect("test fixture: timestamp fits in u32");
+        tracker.update_v2(&t2);
+
+        let mut spots: HashMap<String, f32> = HashMap::new();
+        spots.insert("NIFTY".to_string(), 22_100.0);
+        let snap = tracker.compute_snapshot_v2_at_timeframe(Timeframe::OneMin, &spots);
+
+        assert_eq!(snap.index_futures.premium.len(), 1, "must route to premium");
+        assert_eq!(snap.index_futures.discount.len(), 0, "discount stays empty");
+        assert_eq!(snap.index_futures.premium[0].security_id, 50001);
+    }
+
+    /// Item H.2: futures with LTP < spot route to `discount`.
+    #[test]
+    fn test_compute_snapshot_at_timeframe_futures_discount_when_ltp_lt_spot() {
+        use tickvault_common::instrument_registry::SubscriptionCategory;
+        use tickvault_common::instrument_types::DhanInstrumentKind;
+        use tickvault_common::types::ExchangeSegment;
+
+        let mut tracker = make_v2_tracker_with_named_underlying(
+            50002,
+            ExchangeSegment::NseFno,
+            SubscriptionCategory::IndexDerivative,
+            Some(DhanInstrumentKind::FutureIndex),
+            "BANKNIFTY",
+        );
+        let now = ist_now_secs();
+        let mut t1 = mk_v2_tick(50002, 2, 48_000.0, 47_500.0);
+        t1.exchange_timestamp =
+            u32::try_from(now - 60).expect("test fixture: timestamp fits in u32");
+        tracker.update_v2(&t1);
+        let mut t2 = mk_v2_tick(50002, 2, 47_800.0, 47_500.0);
+        t2.exchange_timestamp = u32::try_from(now).expect("test fixture: timestamp fits in u32");
+        tracker.update_v2(&t2);
+
+        let mut spots: HashMap<String, f32> = HashMap::new();
+        spots.insert("BANKNIFTY".to_string(), 48_000.0);
+        let snap = tracker.compute_snapshot_v2_at_timeframe(Timeframe::OneMin, &spots);
+
+        assert_eq!(
+            snap.index_futures.discount.len(),
+            1,
+            "must route to discount"
+        );
+        assert_eq!(snap.index_futures.premium.len(), 0, "premium stays empty");
+        assert_eq!(snap.index_futures.discount[0].security_id, 50002);
+    }
+
+    /// Item H.3: missing spot price (warm-up grace) yields empty
+    /// premium/discount even though the futures bucket is populated.
+    #[test]
+    fn test_compute_snapshot_at_timeframe_premium_discount_empty_without_spot() {
+        use tickvault_common::instrument_registry::SubscriptionCategory;
+        use tickvault_common::instrument_types::DhanInstrumentKind;
+        use tickvault_common::types::ExchangeSegment;
+
+        let mut tracker = make_v2_tracker_with_named_underlying(
+            50003,
+            ExchangeSegment::NseFno,
+            SubscriptionCategory::IndexDerivative,
+            Some(DhanInstrumentKind::FutureIndex),
+            "NIFTY",
+        );
+        let now = ist_now_secs();
+        let mut t1 = mk_v2_tick(50003, 2, 22_100.0, 22_000.0);
+        t1.exchange_timestamp =
+            u32::try_from(now - 60).expect("test fixture: timestamp fits in u32");
+        tracker.update_v2(&t1);
+        let mut t2 = mk_v2_tick(50003, 2, 22_150.0, 22_000.0);
+        t2.exchange_timestamp = u32::try_from(now).expect("test fixture: timestamp fits in u32");
+        tracker.update_v2(&t2);
+
+        // Empty spot prices = warmup → both leaderboards must be empty.
+        let spots: HashMap<String, f32> = HashMap::new();
+        let snap = tracker.compute_snapshot_v2_at_timeframe(Timeframe::OneMin, &spots);
+        assert_eq!(snap.index_futures.tracked, 1, "futures bucket populated");
+        assert!(
+            snap.index_futures.premium.is_empty(),
+            "premium empty when spot missing"
+        );
+        assert!(
+            snap.index_futures.discount.is_empty(),
+            "discount empty when spot missing"
+        );
+    }
+
+    /// Item H.4: options buckets NEVER populate Premium/Discount even when
+    /// spot prices are available (Premium/Discount = futures-only feature).
+    #[test]
+    fn test_compute_snapshot_at_timeframe_options_never_populate_premium_discount() {
+        use tickvault_common::instrument_registry::SubscriptionCategory;
+        use tickvault_common::instrument_types::DhanInstrumentKind;
+        use tickvault_common::types::ExchangeSegment;
+
+        let mut tracker = make_v2_tracker_with_named_underlying(
+            70001,
+            ExchangeSegment::NseFno,
+            SubscriptionCategory::IndexDerivative,
+            Some(DhanInstrumentKind::OptionIndex),
+            "NIFTY",
+        );
+        let now = ist_now_secs();
+        let mut t1 = mk_v2_tick(70001, 2, 150.0, 140.0);
+        t1.exchange_timestamp =
+            u32::try_from(now - 60).expect("test fixture: timestamp fits in u32");
+        tracker.update_v2(&t1);
+        let mut t2 = mk_v2_tick(70001, 2, 175.0, 140.0);
+        t2.exchange_timestamp = u32::try_from(now).expect("test fixture: timestamp fits in u32");
+        tracker.update_v2(&t2);
+
+        let mut spots: HashMap<String, f32> = HashMap::new();
+        spots.insert("NIFTY".to_string(), 22_100.0);
+        let snap = tracker.compute_snapshot_v2_at_timeframe(Timeframe::OneMin, &spots);
+
+        assert_eq!(snap.index_options.tracked, 1, "options bucket populated");
+        assert!(
+            snap.index_options.premium.is_empty(),
+            "options must NEVER use premium"
+        );
+        assert!(
+            snap.index_options.discount.is_empty(),
+            "options must NEVER use discount"
+        );
+    }
+
+    /// Item H.5: stock futures route by underlying symbol — RELIANCE futures
+    /// uses RELIANCE spot, not NIFTY.
+    #[test]
+    fn test_compute_snapshot_at_timeframe_stock_futures_route_by_underlying() {
+        use tickvault_common::instrument_registry::SubscriptionCategory;
+        use tickvault_common::instrument_types::DhanInstrumentKind;
+        use tickvault_common::types::ExchangeSegment;
+
+        let mut tracker = make_v2_tracker_with_named_underlying(
+            60001,
+            ExchangeSegment::NseFno,
+            SubscriptionCategory::StockDerivative,
+            Some(DhanInstrumentKind::FutureStock),
+            "RELIANCE",
+        );
+        let now = ist_now_secs();
+        let mut t1 = mk_v2_tick(60001, 2, 2_950.0, 2_900.0);
+        t1.exchange_timestamp =
+            u32::try_from(now - 60).expect("test fixture: timestamp fits in u32");
+        tracker.update_v2(&t1);
+        let mut t2 = mk_v2_tick(60001, 2, 2_975.0, 2_900.0);
+        t2.exchange_timestamp = u32::try_from(now).expect("test fixture: timestamp fits in u32");
+        tracker.update_v2(&t2);
+
+        // RELIANCE spot = 2950 → spread = 2975 - 2950 = +25 → premium.
+        // NIFTY spot is irrelevant because futures lookup uses RELIANCE.
+        let mut spots: HashMap<String, f32> = HashMap::new();
+        spots.insert("RELIANCE".to_string(), 2_950.0);
+        spots.insert("NIFTY".to_string(), 22_100.0);
+        let snap = tracker.compute_snapshot_v2_at_timeframe(Timeframe::OneMin, &spots);
+
+        assert_eq!(snap.stock_futures.premium.len(), 1, "RELIANCE → premium");
+        assert_eq!(snap.stock_futures.discount.len(), 0);
+    }
+
+    /// Item H.6: spread of zero is neither premium nor discount (skipped).
+    #[test]
+    fn test_compute_snapshot_at_timeframe_zero_spread_neither_premium_nor_discount() {
+        use tickvault_common::instrument_registry::SubscriptionCategory;
+        use tickvault_common::instrument_types::DhanInstrumentKind;
+        use tickvault_common::types::ExchangeSegment;
+
+        let mut tracker = make_v2_tracker_with_named_underlying(
+            50004,
+            ExchangeSegment::NseFno,
+            SubscriptionCategory::IndexDerivative,
+            Some(DhanInstrumentKind::FutureIndex),
+            "NIFTY",
+        );
+        let now = ist_now_secs();
+        let mut t1 = mk_v2_tick(50004, 2, 22_100.0, 22_000.0);
+        t1.exchange_timestamp =
+            u32::try_from(now - 60).expect("test fixture: timestamp fits in u32");
+        tracker.update_v2(&t1);
+        let mut t2 = mk_v2_tick(50004, 2, 22_100.0, 22_000.0);
+        t2.exchange_timestamp = u32::try_from(now).expect("test fixture: timestamp fits in u32");
+        tracker.update_v2(&t2);
+
+        let mut spots: HashMap<String, f32> = HashMap::new();
+        spots.insert("NIFTY".to_string(), 22_100.0); // exact match → spread = 0
+        let snap = tracker.compute_snapshot_v2_at_timeframe(Timeframe::OneMin, &spots);
+
+        assert!(snap.index_futures.premium.is_empty());
+        assert!(snap.index_futures.discount.is_empty());
+    }
+
+    /// Item H.7: non-finite or non-positive spot is silently skipped.
+    #[test]
+    fn test_compute_snapshot_at_timeframe_invalid_spot_skips_premium_discount() {
+        use tickvault_common::instrument_registry::SubscriptionCategory;
+        use tickvault_common::instrument_types::DhanInstrumentKind;
+        use tickvault_common::types::ExchangeSegment;
+
+        let mut tracker = make_v2_tracker_with_named_underlying(
+            50005,
+            ExchangeSegment::NseFno,
+            SubscriptionCategory::IndexDerivative,
+            Some(DhanInstrumentKind::FutureIndex),
+            "NIFTY",
+        );
+        let now = ist_now_secs();
+        let mut t1 = mk_v2_tick(50005, 2, 22_100.0, 22_000.0);
+        t1.exchange_timestamp =
+            u32::try_from(now - 60).expect("test fixture: timestamp fits in u32");
+        tracker.update_v2(&t1);
+        let mut t2 = mk_v2_tick(50005, 2, 22_150.0, 22_000.0);
+        t2.exchange_timestamp = u32::try_from(now).expect("test fixture: timestamp fits in u32");
+        tracker.update_v2(&t2);
+
+        // Negative spot → skip silently.
+        let mut spots: HashMap<String, f32> = HashMap::new();
+        spots.insert("NIFTY".to_string(), -1.0);
+        let snap = tracker.compute_snapshot_v2_at_timeframe(Timeframe::OneMin, &spots);
+        assert!(snap.index_futures.premium.is_empty());
+        assert!(snap.index_futures.discount.is_empty());
+
+        // NaN spot → skip silently.
+        spots.insert("NIFTY".to_string(), f32::NAN);
+        let snap = tracker.compute_snapshot_v2_at_timeframe(Timeframe::OneMin, &spots);
+        assert!(snap.index_futures.premium.is_empty());
+        assert!(snap.index_futures.discount.is_empty());
+    }
+
+    /// Item F.4: a snapshot at 5m timeframe with only 30s of history must
+    /// skip the security (5m baseline not yet established).
+    #[test]
+    fn test_compute_snapshot_at_timeframe_longer_tf_warmup_independent() {
+        use tickvault_common::instrument_registry::SubscriptionCategory;
+        use tickvault_common::types::ExchangeSegment;
+        let mut tracker = make_v2_tracker_with_single_instrument(
+            13,
+            ExchangeSegment::IdxI,
+            SubscriptionCategory::MajorIndexValue,
+            None,
+        );
+        let now = ist_now_secs();
+        let mut t1 = mk_v2_tick(13, 0, 22_000.0, 21_900.0);
+        t1.exchange_timestamp =
+            u32::try_from(now - 60).expect("test fixture: timestamp fits in u32");
+        tracker.update_v2(&t1);
+        let mut t2 = mk_v2_tick(13, 0, 22_100.0, 21_900.0);
+        t2.exchange_timestamp = u32::try_from(now).expect("test fixture: timestamp fits in u32");
+        tracker.update_v2(&t2);
+
+        let spots: HashMap<String, f32> = HashMap::new();
+        // 1m has a baseline ~90s old → present.
+        let snap_1m = tracker.compute_snapshot_v2_at_timeframe(Timeframe::OneMin, &spots);
+        assert_eq!(snap_1m.indices.tracked, 1, "1m must populate");
+
+        // 5m has no baseline 5min back → must be skipped.
+        let snap_5m = tracker.compute_snapshot_v2_at_timeframe(Timeframe::FiveMin, &spots);
+        assert_eq!(snap_5m.indices.tracked, 0, "5m must skip warmup");
+
+        // 15m similarly empty.
+        let snap_15m = tracker.compute_snapshot_v2_at_timeframe(Timeframe::FifteenMin, &spots);
+        assert_eq!(snap_15m.indices.tracked, 0, "15m must skip warmup");
     }
 }

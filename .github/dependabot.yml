@@ -1,0 +1,86 @@
+# Dependabot configuration — added 2026-04-25 (PR #357 follow-up)
+#
+# Purpose: surface security alerts as auto-PRs the operator can review +
+# merge, instead of an opaque "GitHub found 6 vulnerabilities" message
+# on every git push. Each PR carries the exact CVE / advisory + the
+# recommended fix version, with the patch already applied.
+#
+# Coverage:
+#   - cargo            (workspace Cargo.toml)
+#   - github-actions   (.github/workflows/*.yml)
+#   - docker           (deploy/docker/docker-compose.yml + Dockerfiles)
+#
+# Schedule: weekly Monday morning IST. Avoids weekend operator fatigue
+# and gives a fresh batch at the start of every trading week.
+#
+# Allowlists / ignore lists are intentionally empty — the project's
+# version-pinning rule (`.claude/rules/project/cargo-and-docker.md`)
+# requires every bump to be reviewed manually before merge, so we want
+# every alert to surface, not silently filter any out.
+
+version: 2
+
+updates:
+  # ────────────────────────────────────────────────────────────────────
+  # Cargo workspace deps
+  # ────────────────────────────────────────────────────────────────────
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "02:00"
+      timezone: "Asia/Kolkata"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "rust"
+    commit-message:
+      prefix: "deps(cargo)"
+      include: "scope"
+    # Group all patch + minor bumps for the same crate into one PR per week.
+    # Major bumps stay as separate PRs because they may be breaking.
+    groups:
+      cargo-patch-and-minor:
+        update-types:
+          - "patch"
+          - "minor"
+
+  # ────────────────────────────────────────────────────────────────────
+  # GitHub Actions in workflows
+  # ────────────────────────────────────────────────────────────────────
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "02:00"
+      timezone: "Asia/Kolkata"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "github-actions"
+    commit-message:
+      prefix: "deps(actions)"
+      include: "scope"
+    # Pin SHA digests for action references rather than tag refs to mitigate
+    # tag-squatting attacks. Dependabot honours this via the comment-after
+    # convention (`uses: actions/checkout@<sha> # v4.2.2`).
+
+  # ────────────────────────────────────────────────────────────────────
+  # Docker images in deploy/docker/
+  # ────────────────────────────────────────────────────────────────────
+  - package-ecosystem: "docker"
+    directory: "/deploy/docker"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "02:00"
+      timezone: "Asia/Kolkata"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "docker"
+    commit-message:
+      prefix: "deps(docker)"
+      include: "scope"

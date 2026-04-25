@@ -39,16 +39,35 @@ pub async fn download_constituency_csvs(
     // "14 failed" WARN. See `INDEX_CONSTITUENCY_KNOWN_STALE_SLUGS` for
     // the operator runbook to remove a slug from the stale set after
     // verifying the correct URL at niftyindices.com in a browser.
-    let stale_skipped_count = slugs
+    //
+    // 2026-04-25 (PR #357 audit follow-up): the original log was at INFO
+    // level which never reached `data/logs/errors.log`. Operator asked
+    // "why these 14 of them are missing dude why didnt you fix that bro
+    // why why why we need all the indices right dude" — the answer is the
+    // queue is still pending operator action. Surfacing this at WARN with
+    // the full slug list + index names makes the queue grep-able from
+    // `errors.log` and visible on the `make doctor` summary so it's not
+    // forgotten. Stays WARN (NOT ERROR) — no Telegram page; this is a
+    // queue reminder, not an incident.
+    let stale_skipped: Vec<&str> = slugs
         .iter()
-        .filter(|(_, s)| INDEX_CONSTITUENCY_KNOWN_STALE_SLUGS.contains(s))
-        .count();
+        .filter_map(|(name, s)| {
+            INDEX_CONSTITUENCY_KNOWN_STALE_SLUGS
+                .contains(s)
+                .then_some(*name)
+        })
+        .collect();
+    let stale_skipped_count = stale_skipped.len();
     if stale_skipped_count > 0 {
-        info!(
+        // O(1) EXEMPT: cold path — runs once per daily boot, not per tick.
+        let pending_index_names = stale_skipped.join(", ");
+        warn!(
             skipped = stale_skipped_count,
-            "constituency downloader: skipping known-stale slugs \
-             (niftyindices.com returns 404 — see \
-             INDEX_CONSTITUENCY_KNOWN_STALE_SLUGS for re-enable steps)"
+            pending_indices = %pending_index_names,
+            "constituency downloader: {stale_skipped_count} indices still queued for \
+             operator URL re-discovery (niftyindices.com renamed these slugs; see \
+             INDEX_CONSTITUENCY_KNOWN_STALE_SLUGS in crates/common/src/constants.rs \
+             for the re-enable runbook). Pending: {pending_index_names}"
         );
     }
     let active_slugs: Vec<(&str, &str)> = slugs
@@ -305,6 +324,41 @@ mod tests {
             "downloader MUST filter against INDEX_CONSTITUENCY_KNOWN_STALE_SLUGS. \
              If this regresses, every boot fires 14 redundant WARNs for URLs \
              already known to 404."
+        );
+    }
+
+    /// 2026-04-25 (PR #357 audit follow-up): the stale-slug skip log was
+    /// upgraded from `info!` to `warn!` so the operator's "why are 14
+    /// missing" question is grep-able from `data/logs/errors.log` and
+    /// visible to `make doctor`. This source-scan ratchet blocks any
+    /// regression back to INFO level, which would silently bury the
+    /// queue under INFO-level boot noise.
+    #[test]
+    fn test_stale_slug_skip_log_is_warn_not_info() {
+        let src = include_str!("csv_downloader.rs");
+        // The skip block must use warn! and include both the skipped count
+        // and the pending_indices field so the operator sees the queue
+        // names directly in the log line.
+        assert!(
+            src.contains("warn!(\n            skipped = stale_skipped_count,\n            pending_indices = %pending_index_names,"),
+            "stale-slug skip log MUST be warn! with skipped + pending_indices \
+             fields so the operator queue is grep-able from errors.log. \
+             Reverting to info!() hides the queue."
+        );
+    }
+
+    /// Companion ratchet: the WARN message must include the literal
+    /// "queued for operator URL re-discovery" so monitoring + doctor
+    /// scripts can grep for the queue without false positives from
+    /// other index_constituency log lines.
+    #[test]
+    fn test_stale_slug_skip_log_contains_queue_marker_phrase() {
+        let src = include_str!("csv_downloader.rs");
+        assert!(
+            src.contains("queued for \\\n             operator URL re-discovery"),
+            "stale-slug skip log MUST contain 'queued for operator URL \
+             re-discovery' as a stable grep marker for `make doctor` and \
+             the operator runbook."
         );
     }
 
