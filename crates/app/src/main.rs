@@ -1336,27 +1336,20 @@ async fn main() -> Result<()> {
             health_status,
         );
 
-        // 2026-04-25 security audit (PR #357): SSM-first bearer token resolution
-        // (mirrors the slow-boot path below, line ~4250). Fast-boot uses the
-        // same SSM path so both paths have identical secret-handling semantics.
+        // 2026-04-25 security audit (PR #357): SSM-only bearer token resolution
+        // (mirrors the slow-boot path below). Fast-boot uses the same SSM path
+        // so both boot paths have identical secret-handling semantics. Hard-fail
+        // on SSM error — matches `fetch_dhan_credentials` / `fetch_telegram_*`
+        // boot-time semantics. NO env var fallback.
+        let api_bearer_token_fast = tickvault_core::auth::secret_manager::fetch_api_bearer_token()
+            .await
+            .context("GAP-SEC-01 (fast boot): SSM fetch for API bearer token failed at /tickvault/<env>/api/bearer-token — store the token via `aws ssm put-parameter --name /tickvault/<env>/api/bearer-token --type SecureString`")?;
+        info!(
+            "GAP-SEC-01 (fast boot): API bearer token loaded from SSM \
+             (/tickvault/<env>/api/bearer-token)"
+        );
         let api_auth_config_fast =
-            match tickvault_core::auth::secret_manager::fetch_api_bearer_token().await {
-                Ok(token) => {
-                    info!(
-                        "GAP-SEC-01 (fast boot): API bearer token loaded from SSM \
-                         (/tickvault/<env>/api/bearer-token)"
-                    );
-                    tickvault_api::middleware::ApiAuthConfig::from_token(token)
-                }
-                Err(err) => {
-                    warn!(
-                        ?err,
-                        "GAP-SEC-01 (fast boot): SSM fetch failed; falling back to \
-                         TV_API_TOKEN env var"
-                    );
-                    tickvault_api::middleware::ApiAuthConfig::from_env(config.strategy.dry_run)
-                }
-            };
+            tickvault_api::middleware::ApiAuthConfig::from_token(api_bearer_token_fast);
         let router = tickvault_api::build_router_with_auth(
             api_state,
             &config.api.allowed_origins,
@@ -4267,29 +4260,20 @@ async fn main() -> Result<()> {
         None => api_state,
     };
 
-    // 2026-04-25 security audit (PR #357): API bearer token is now sourced
-    // from AWS SSM Parameter Store (`/tickvault/<env>/api/bearer-token`) per
-    // `.claude/rules/project/rust-code.md` ("All secrets from AWS SSM").
-    // Resolution order: SSM → TV_API_TOKEN env var (with WARN) → dry_run/live
-    // fallback in `ApiAuthConfig::from_env`.
-    let api_auth_config = match tickvault_core::auth::secret_manager::fetch_api_bearer_token().await
-    {
-        Ok(token) => {
-            info!(
-                "GAP-SEC-01: API bearer token loaded from SSM \
-                 (/tickvault/<env>/api/bearer-token)"
-            );
-            tickvault_api::middleware::ApiAuthConfig::from_token(token)
-        }
-        Err(err) => {
-            warn!(
-                ?err,
-                "GAP-SEC-01: SSM fetch for API bearer token failed; falling back to \
-                 TV_API_TOKEN env var (acceptable for local dev, NOT for prod)"
-            );
-            tickvault_api::middleware::ApiAuthConfig::from_env(config.strategy.dry_run)
-        }
-    };
+    // 2026-04-25 security audit (PR #357): API bearer token sourced from AWS
+    // SSM Parameter Store ONLY — `/tickvault/<env>/api/bearer-token`. Same
+    // rule as Dhan, Telegram, Grafana, QuestDB credentials per
+    // `.claude/rules/project/rust-code.md` ("always real AWS, never mocks";
+    // local Mac uses `~/.aws/credentials` to reach the same SSM endpoint).
+    //
+    // Hard-fail on SSM error — matches the existing `fetch_dhan_credentials`
+    // / `fetch_telegram_credentials` boot-time semantics. There is NO env
+    // var fallback. If SSM is unreachable the app cannot boot, period.
+    let api_bearer_token = tickvault_core::auth::secret_manager::fetch_api_bearer_token()
+        .await
+        .context("GAP-SEC-01: SSM fetch for API bearer token failed at /tickvault/<env>/api/bearer-token — store the token via `aws ssm put-parameter --name /tickvault/<env>/api/bearer-token --type SecureString`")?;
+    info!("GAP-SEC-01: API bearer token loaded from SSM (/tickvault/<env>/api/bearer-token)");
+    let api_auth_config = tickvault_api::middleware::ApiAuthConfig::from_token(api_bearer_token);
 
     let router = tickvault_api::build_router_with_auth(
         api_state,

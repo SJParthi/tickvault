@@ -3,22 +3,27 @@
 //! Provides bearer token authentication for mutating API endpoints.
 //! Read-only endpoints (health, stats, quote) remain unauthenticated.
 //!
-//! # Token Source (preferred → fallback)
+//! # Token Source — AWS SSM ONLY
 //!
-//! 1. **AWS SSM Parameter Store** — `/tickvault/<env>/api/bearer-token`
-//!    fetched by `tickvault_core::auth::secret_manager::fetch_api_bearer_token`
-//!    in `crates/app/src/main.rs` and injected via [`ApiAuthConfig::from_token`].
-//!    THIS IS THE MANDATED PROD SOURCE per `.claude/rules/project/rust-code.md`.
-//! 2. **`TV_API_TOKEN` env var** — legacy / local dev fallback used by
-//!    [`ApiAuthConfig::from_env`] when SSM is unavailable. Logs a WARN
-//!    so the operator notices the deviation in prod logs.
+//! The bearer token is fetched from AWS SSM Parameter Store at
+//! `/tickvault/<env>/api/bearer-token` by
+//! `tickvault_core::auth::secret_manager::fetch_api_bearer_token` in
+//! `crates/app/src/main.rs` and injected via [`ApiAuthConfig::from_token`].
+//!
+//! Per `.claude/rules/project/rust-code.md` the rule is "always real AWS,
+//! never mocks". On a developer Mac, `~/.aws/credentials` points at the
+//! same `ap-south-1` SSM endpoint that the prod EC2 instance reaches via
+//! its IAM role — same code path everywhere, NO env-var fallback.
+//!
+//! [`ApiAuthConfig::from_env`] is a TEST-ONLY constructor retained for
+//! the existing unit + integration tests so they can inject ad-hoc tokens
+//! without spinning up SSM. Production code in main.rs MUST go through
+//! [`ApiAuthConfig::from_token`].
 //!
 //! # Auth Behavior
-//! - Token resolved (SSM or env): auth enabled with that token.
-//! - No token + `dry_run = true`: auth disabled (development passthrough).
-//! - No token + `dry_run = false`: fail-closed — generates a random UUID v4
-//!   token, logs CRITICAL via `error!`, and still requires auth for
-//!   mutating endpoints. Operator gets paged via Telegram.
+//! - SSM resolved → auth enabled with that token.
+//! - SSM unreachable → boot fails with CRITICAL (matches the existing
+//!   `fetch_dhan_credentials` / `fetch_telegram_credentials` semantics).
 //!
 //! # In-memory hygiene
 //! `bearer_token` is `secrecy::SecretString` — zeroize on drop, `[REDACTED]`
@@ -132,10 +137,14 @@ impl ApiAuthConfig {
         self.bearer_token.expose_secret()
     }
 
-    /// Loads the API token from the `TV_API_TOKEN` environment variable
-    /// (legacy / local-dev fallback path). Production uses
-    /// [`Self::from_token`] with an SSM-fetched `SecretString` instead —
-    /// see `crates/app/src/main.rs`.
+    /// **TEST-ONLY constructor.** Loads the API token from the
+    /// `TV_API_TOKEN` environment variable. Retained for the existing unit
+    /// + integration test suite so tests can inject ad-hoc tokens without
+    /// spinning up real AWS SSM. **Production callers in
+    /// `crates/app/src/main.rs` MUST NOT use this** — they go through
+    /// [`Self::from_token`] with an SSM-fetched `SecretString` per
+    /// `.claude/rules/project/rust-code.md` ("always real AWS, never
+    /// mocks").
     ///
     /// # Behavior
     /// - Token set and non-empty: auth enabled with that token.
@@ -1341,5 +1350,59 @@ mod tests {
             config.bearer_token.expose_secret()
         );
         assert_eq!(config.token_value_for_test(), "private-field-test");
+    }
+
+    /// SEC-7 (HIGH→FIXED, hardened): `crates/app/src/main.rs` must source
+    /// the API bearer token from SSM ONLY — no env-var fallback. This
+    /// source-scan ratchet reads the literal main.rs file and verifies:
+    ///
+    /// 1. Both boot paths call `fetch_api_bearer_token().await.context(...)`
+    ///    with a `?` propagator (hard-fail on SSM error).
+    /// 2. NEITHER boot path calls `ApiAuthConfig::from_env(...)` —
+    ///    that constructor is reserved for the test suite.
+    ///
+    /// The 2026-04-25 audit (PR #357) initially shipped with an env-var
+    /// fallback for local dev; Parthiban then asked whether everything
+    /// already reads from real AWS SSM (yes — `~/.aws/credentials` on Mac
+    /// points to the same endpoint as the EC2 IAM role). The fallback was
+    /// removed to match `fetch_dhan_credentials` / `fetch_telegram_*`
+    /// boot semantics. This test blocks any silent regression that
+    /// re-introduces the fallback.
+    #[test]
+    fn test_main_rs_uses_ssm_only_no_env_fallback() {
+        let main_rs = std::fs::read_to_string("../app/src/main.rs")
+            .or_else(|_| std::fs::read_to_string("crates/app/src/main.rs"))
+            .expect("main.rs must be readable from middleware test working dir");
+
+        // Both boot paths must hard-fail on SSM error via `.await.context(...)?`.
+        // Count occurrences — must be at least 2 (slow + fast boot).
+        let ssm_calls = main_rs
+            .matches("fetch_api_bearer_token()\n            .await\n            .context")
+            .count()
+            + main_rs
+                .matches("fetch_api_bearer_token()\n        .await\n        .context")
+                .count();
+        assert!(
+            ssm_calls >= 2,
+            "main.rs MUST call fetch_api_bearer_token().await.context(...) in both \
+             boot paths (slow + fast); found {ssm_calls} occurrence(s). Regressing \
+             this re-introduces an env-var fallback that violates project rule \
+             'always real AWS, never mocks'."
+        );
+
+        // Negative ratchet: from_env(config.strategy.dry_run) must NOT appear.
+        // That call signature is the SSM-fallback pattern that the audit removed.
+        assert!(
+            !main_rs.contains("ApiAuthConfig::from_env(config.strategy.dry_run)"),
+            "main.rs MUST NOT call ApiAuthConfig::from_env(config.strategy.dry_run). \
+             That construction was the env-var fallback removed in PR #357. \
+             Production paths must use ApiAuthConfig::from_token(SecretString) only."
+        );
+
+        // Sanity: from_token call exists in main.rs.
+        assert!(
+            main_rs.contains("ApiAuthConfig::from_token("),
+            "main.rs MUST construct the config via ApiAuthConfig::from_token(SecretString)."
+        );
     }
 }
