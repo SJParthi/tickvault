@@ -91,7 +91,7 @@ jobs:
 
       - name: Create issue on test failure (deduplicated)
         if: failure() && steps.test.outputs.test_failed == 'true'
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v7
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v7
         with:
           script: |
             const title = '🔴 Safety Net: cargo-careful found issues';
@@ -122,7 +122,7 @@ jobs:
 
       - name: Create issue on build failure (deduplicated)
         if: failure() && steps.build.outputs.build_failed == 'true'
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v7
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v7
         with:
           script: |
             const title = '⚠️ Safety Net: cargo-careful build failure (nightly compatibility)';
@@ -202,7 +202,7 @@ jobs:
 
       - name: Create issue on test failure (deduplicated)
         if: failure() && steps.test.outputs.test_failed == 'true'
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v7
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v7
         with:
           script: |
             const title = '🔴 Safety Net: AddressSanitizer found memory issues';
@@ -233,7 +233,7 @@ jobs:
 
       - name: Create issue on build failure (deduplicated)
         if: failure() && steps.build.outputs.build_failed == 'true'
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v7
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v7
         with:
           script: |
             const title = '⚠️ Safety Net: ASan build failure (nightly compatibility)';
@@ -313,7 +313,7 @@ jobs:
 
       - name: Create issue on test failure (deduplicated)
         if: failure() && steps.test.outputs.test_failed == 'true'
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v7
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v7
         with:
           script: |
             const title = '🔴 Safety Net: ThreadSanitizer found data races';
@@ -344,7 +344,7 @@ jobs:
 
       - name: Create issue on build failure (deduplicated)
         if: failure() && steps.build.outputs.build_failed == 'true'
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v7
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v7
         with:
           script: |
             const title = '⚠️ Safety Net: TSan build failure (nightly compatibility)';

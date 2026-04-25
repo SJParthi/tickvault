@@ -125,7 +125,7 @@ jobs:
 
       - name: Create issue on crash (deduplicated)
         if: failure() && steps.fuzz.outputs.fuzz_crashed == 'true'
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v7
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v7
         with:
           script: |
             const title = `🔴 Fuzz: Crash in ${{ matrix.target }}`;
@@ -158,7 +158,7 @@ jobs:
 
       - name: Create issue on build failure (deduplicated)
         if: failure() && steps.build.outputs.build_failed == 'true'
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v7
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v7
         with:
           script: |
             const title = `⚠️ Fuzz: Build failure for ${{ matrix.target }}`;
