@@ -362,6 +362,104 @@ use crate::pipeline::mover_classifier::{MoverBucket, classify_instrument};
 // V2 types
 // ---------------------------------------------------------------------------
 
+/// Timeframe over which a movers ranking is computed.
+///
+/// Mirrors the `candles_*` materialized-view pattern: 1, 2, 3, …, 15
+/// minutes — one ranking per timeframe per snapshot. A 5m ranking is NOT
+/// derivable from the 1m ranking (different sets of top securities), so
+/// each timeframe is computed independently from the rolling tick stream.
+///
+/// Wire format (`as_str()`) matches the `timeframe SYMBOL` column on the
+/// `top_movers` QuestDB table, the `candles_*` materialized-view naming
+/// convention, and the `?timeframe=5m` API query parameter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize)]
+pub enum Timeframe {
+    OneMin,
+    TwoMin,
+    ThreeMin,
+    FourMin,
+    FiveMin,
+    SixMin,
+    SevenMin,
+    EightMin,
+    NineMin,
+    TenMin,
+    ElevenMin,
+    TwelveMin,
+    ThirteenMin,
+    FourteenMin,
+    FifteenMin,
+}
+
+impl Timeframe {
+    /// All 15 timeframes in ascending order. Static slice — no allocation.
+    /// Use this whenever you need to iterate per-timeframe (e.g.
+    /// `for tf in Timeframe::ALL`).
+    pub const ALL: [Timeframe; 15] = [
+        Timeframe::OneMin,
+        Timeframe::TwoMin,
+        Timeframe::ThreeMin,
+        Timeframe::FourMin,
+        Timeframe::FiveMin,
+        Timeframe::SixMin,
+        Timeframe::SevenMin,
+        Timeframe::EightMin,
+        Timeframe::NineMin,
+        Timeframe::TenMin,
+        Timeframe::ElevenMin,
+        Timeframe::TwelveMin,
+        Timeframe::ThirteenMin,
+        Timeframe::FourteenMin,
+        Timeframe::FifteenMin,
+    ];
+
+    /// Wire-format string used in the `timeframe` QuestDB column and in
+    /// API query parameters. Stable — changing this is a breaking change.
+    #[inline]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Timeframe::OneMin => "1m",
+            Timeframe::TwoMin => "2m",
+            Timeframe::ThreeMin => "3m",
+            Timeframe::FourMin => "4m",
+            Timeframe::FiveMin => "5m",
+            Timeframe::SixMin => "6m",
+            Timeframe::SevenMin => "7m",
+            Timeframe::EightMin => "8m",
+            Timeframe::NineMin => "9m",
+            Timeframe::TenMin => "10m",
+            Timeframe::ElevenMin => "11m",
+            Timeframe::TwelveMin => "12m",
+            Timeframe::ThirteenMin => "13m",
+            Timeframe::FourteenMin => "14m",
+            Timeframe::FifteenMin => "15m",
+        }
+    }
+
+    /// Number of seconds in this timeframe. Used by the rolling baseline
+    /// lookup to find the price `secs()` ago.
+    #[inline]
+    pub const fn secs(self) -> u32 {
+        match self {
+            Timeframe::OneMin => 60,
+            Timeframe::TwoMin => 120,
+            Timeframe::ThreeMin => 180,
+            Timeframe::FourMin => 240,
+            Timeframe::FiveMin => 300,
+            Timeframe::SixMin => 360,
+            Timeframe::SevenMin => 420,
+            Timeframe::EightMin => 480,
+            Timeframe::NineMin => 540,
+            Timeframe::TenMin => 600,
+            Timeframe::ElevenMin => 660,
+            Timeframe::TwelveMin => 720,
+            Timeframe::ThirteenMin => 780,
+            Timeframe::FourteenMin => 840,
+            Timeframe::FifteenMin => 900,
+        }
+    }
+}
+
 /// Number of ranked entries per bucket × category. Matches plan item spec.
 const MOVERS_V2_TOP_N: usize = 20;
 
@@ -398,6 +496,13 @@ pub struct PriceBucket {
 /// `oi_buildup` and `oi_unwind` are always empty until a `prev_oi` baseline
 /// source lands (Dhan does NOT push prev-day OI for NSE_FNO live; future
 /// work will snapshot OI at 09:15:00 IST to use as the intraday baseline).
+///
+/// `premium` and `discount` apply ONLY to futures buckets — they rank by
+/// `LTP − spot_of_underlying`. Options buckets leave both empty (premium
+/// for options is computed differently, and the operator UI uses
+/// `top_value` for options instead). Futures Premium/Discount require a
+/// live spot price for the underlying — empty when spot is unavailable
+/// (warm-up grace).
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct DerivativeBucket {
     pub gainers: Vec<MoverEntryV2>,
@@ -407,6 +512,14 @@ pub struct DerivativeBucket {
     pub oi_buildup: Vec<MoverEntryV2>, // empty until prev-OI baseline wired
     pub oi_unwind: Vec<MoverEntryV2>,  // empty until prev-OI baseline wired
     pub top_value: Vec<MoverEntryV2>,
+    /// Futures only: LTP > spot_of_underlying, ranked by spread descending.
+    /// Empty for options buckets (operators use `top_value` there) and
+    /// empty whenever the underlying spot is unknown (warm-up grace).
+    pub premium: Vec<MoverEntryV2>,
+    /// Futures only: LTP < spot_of_underlying, ranked by spread ascending
+    /// (most-negative first). Empty for options buckets and during
+    /// underlying-spot warm-up.
+    pub discount: Vec<MoverEntryV2>,
     pub tracked: usize,
 }
 
@@ -779,17 +892,39 @@ impl MoversTrackerV2 {
 // Allocation is therefore EXEMPT from the hot-path rule.
 // ---------------------------------------------------------------------------
 
+/// Wire-format string for the `segment` SYMBOL column. Stable — must
+/// match what the tick-pipeline writes for the same security so cross-table
+/// joins line up.
+#[inline]
+fn segment_wire_str(code: u8) -> &'static str {
+    match segment_from_code(code) {
+        Some(ExchangeSegment::IdxI) => "IDX_I",
+        Some(ExchangeSegment::NseEquity) => "NSE_EQ",
+        Some(ExchangeSegment::NseFno) => "NSE_FNO",
+        Some(ExchangeSegment::NseCurrency) => "NSE_CURRENCY",
+        Some(ExchangeSegment::BseEquity) => "BSE_EQ",
+        Some(ExchangeSegment::McxComm) => "MCX_COMM",
+        Some(ExchangeSegment::BseCurrency) => "BSE_CURRENCY",
+        Some(ExchangeSegment::BseFno) => "BSE_FNO",
+        None => "UNKNOWN",
+    }
+}
+
 /// Converts one `MoverEntryV2` into a `TopMoverRow`, looking up display
 /// metadata from the registry via segment-aware key (I-P1-11).
 ///
 /// The caller provides the `bucket` and `rank_category` wire strings since
-/// those are owned by the enum layer, not the entry itself.
+/// those are owned by the enum layer, not the entry itself. `timeframe`
+/// (added 2026-04-25) is the rolling-window timeframe (1m..15m) the row
+/// belongs to; `segment` is the wire-format symbol for the I-P1-11
+/// composite key.
 fn entry_to_row(
     entry: &MoverEntryV2,
     bucket: &MoverBucket,
     rank_category: &str,
     rank: i32,
     ts_nanos: i64,
+    timeframe: Timeframe,
     registry: &InstrumentRegistry,
 ) -> tickvault_storage::movers_persistence::TopMoverRow {
     // Registry lookup: segment-aware per I-P1-11.
@@ -811,10 +946,12 @@ fn entry_to_row(
 
     tickvault_storage::movers_persistence::TopMoverRow {
         ts_nanos,
+        timeframe: timeframe.as_str(),
         bucket: bucket.as_str().to_string(),
         rank_category: rank_category.to_string(),
         rank,
         security_id: entry.security_id,
+        segment: segment_wire_str(entry.exchange_segment_code),
         symbol,
         underlying,
         expiry,
@@ -836,6 +973,7 @@ fn flatten_price_bucket(
     bucket: &MoverBucket,
     price: &PriceBucket,
     ts_nanos: i64,
+    timeframe: Timeframe,
     registry: &InstrumentRegistry,
     out: &mut Vec<tickvault_storage::movers_persistence::TopMoverRow>,
 ) {
@@ -846,6 +984,7 @@ fn flatten_price_bucket(
             "gainers",
             (idx + 1) as i32,
             ts_nanos,
+            timeframe,
             registry,
         ));
     }
@@ -856,6 +995,7 @@ fn flatten_price_bucket(
             "losers",
             (idx + 1) as i32,
             ts_nanos,
+            timeframe,
             registry,
         ));
     }
@@ -866,20 +1006,25 @@ fn flatten_price_bucket(
             "most_active",
             (idx + 1) as i32,
             ts_nanos,
+            timeframe,
             registry,
         ));
     }
 }
 
-/// Flattens a derivative bucket into its up-to-seven category lists of rows.
+/// Flattens a derivative bucket into its up-to-nine category lists of rows.
+/// `premium` and `discount` (added 2026-04-25) are populated for futures
+/// buckets only; they remain empty for options buckets and during
+/// underlying-spot warm-up.
 fn flatten_derivative_bucket(
     bucket: &MoverBucket,
     deriv: &DerivativeBucket,
     ts_nanos: i64,
+    timeframe: Timeframe,
     registry: &InstrumentRegistry,
     out: &mut Vec<tickvault_storage::movers_persistence::TopMoverRow>,
 ) {
-    let categories: [(&str, &Vec<MoverEntryV2>); 7] = [
+    let categories: [(&str, &Vec<MoverEntryV2>); 9] = [
         ("gainers", &deriv.gainers),
         ("losers", &deriv.losers),
         ("most_active", &deriv.most_active),
@@ -887,6 +1032,8 @@ fn flatten_derivative_bucket(
         ("oi_buildup", &deriv.oi_buildup),
         ("oi_unwind", &deriv.oi_unwind),
         ("top_value", &deriv.top_value),
+        ("premium", &deriv.premium),
+        ("discount", &deriv.discount),
     ];
     for (cat_name, list) in categories {
         for (idx, entry) in list.iter().enumerate() {
@@ -896,6 +1043,7 @@ fn flatten_derivative_bucket(
                 cat_name,
                 (idx + 1) as i32,
                 ts_nanos,
+                timeframe,
                 registry,
             ));
         }
@@ -904,9 +1052,14 @@ fn flatten_derivative_bucket(
 
 /// Serializes a `MoversSnapshotV2` into the flat row shape consumed by
 /// the `top_movers` ILP writer. Cold-path. Allocates once per snapshot.
+///
+/// `timeframe` (added 2026-04-25) tags every emitted row so the same
+/// snapshot can fan out across the 15 timeframes (1m..15m) with distinct
+/// rankings stored as separate rows under one DEDUP key.
 #[must_use]
 pub fn snapshot_to_rows(
     snapshot: &MoversSnapshotV2,
+    timeframe: Timeframe,
     registry: &InstrumentRegistry,
 ) -> Vec<tickvault_storage::movers_persistence::TopMoverRow> {
     // O(1) EXEMPT: cold path — runs once per persistence cadence (default 1Hz),
@@ -915,12 +1068,13 @@ pub fn snapshot_to_rows(
     // Nanosecond timestamp from the snapshot's IST epoch-seconds field.
     // `i64::saturating_mul` protects against overflow on pathological inputs.
     let ts_nanos = snapshot.snapshot_at_ist_secs.saturating_mul(1_000_000_000);
-    // Upper bound on row count: (2 × 3 × 20) + (4 × 7 × 20) = 680.
-    let mut out = Vec::with_capacity(680);
+    // Upper bound on row count: (2 × 3 × 20) + (4 × 9 × 20) = 840 per timeframe.
+    let mut out = Vec::with_capacity(840);
     flatten_price_bucket(
         &MoverBucket::Indices,
         &snapshot.indices,
         ts_nanos,
+        timeframe,
         registry,
         &mut out,
     );
@@ -928,6 +1082,7 @@ pub fn snapshot_to_rows(
         &MoverBucket::Stocks,
         &snapshot.stocks,
         ts_nanos,
+        timeframe,
         registry,
         &mut out,
     );
@@ -935,6 +1090,7 @@ pub fn snapshot_to_rows(
         &MoverBucket::IndexFutures,
         &snapshot.index_futures,
         ts_nanos,
+        timeframe,
         registry,
         &mut out,
     );
@@ -942,6 +1098,7 @@ pub fn snapshot_to_rows(
         &MoverBucket::StockFutures,
         &snapshot.stock_futures,
         ts_nanos,
+        timeframe,
         registry,
         &mut out,
     );
@@ -949,6 +1106,7 @@ pub fn snapshot_to_rows(
         &MoverBucket::IndexOptions,
         &snapshot.index_options,
         ts_nanos,
+        timeframe,
         registry,
         &mut out,
     );
@@ -956,6 +1114,7 @@ pub fn snapshot_to_rows(
         &MoverBucket::StockOptions,
         &snapshot.stock_options,
         ts_nanos,
+        timeframe,
         registry,
         &mut out,
     );
@@ -2359,7 +2518,7 @@ mod tests {
         use tickvault_common::instrument_registry::InstrumentRegistry;
         let reg = InstrumentRegistry::empty();
         let snapshot = MoversSnapshotV2::default();
-        let rows = snapshot_to_rows(&snapshot, &reg);
+        let rows = snapshot_to_rows(&snapshot, Timeframe::OneMin, &reg);
         assert!(rows.is_empty());
     }
 
@@ -2402,7 +2561,7 @@ mod tests {
         });
         snapshot.indices.tracked = 1;
 
-        let rows = snapshot_to_rows(&snapshot, &reg);
+        let rows = snapshot_to_rows(&snapshot, Timeframe::OneMin, &reg);
         assert_eq!(rows.len(), 1);
         let row = &rows[0];
         assert_eq!(row.bucket, "indices");
@@ -2459,7 +2618,7 @@ mod tests {
         });
         snapshot.index_options.tracked = 1;
 
-        let rows = snapshot_to_rows(&snapshot, &reg);
+        let rows = snapshot_to_rows(&snapshot, Timeframe::OneMin, &reg);
         assert_eq!(rows.len(), 1);
         let row = &rows[0];
         assert_eq!(row.bucket, "index_options");
@@ -2494,7 +2653,7 @@ mod tests {
             value: 1_000_000.0,
         });
         snapshot.stocks.tracked = 1;
-        let rows = snapshot_to_rows(&snapshot, &reg);
+        let rows = snapshot_to_rows(&snapshot, Timeframe::OneMin, &reg);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].symbol, "id-99999");
     }
@@ -2544,7 +2703,7 @@ mod tests {
                 bucket.top_value.push(base_entry);
             }
         }
-        let rows = snapshot_to_rows(&snapshot, &reg);
+        let rows = snapshot_to_rows(&snapshot, Timeframe::OneMin, &reg);
         // 2 × 3 × 20 + 4 × 7 × 20 = 680
         assert_eq!(rows.len(), 680);
     }
@@ -2697,5 +2856,208 @@ mod tests {
         let snapshot = tracker.compute_snapshot_v2();
         assert!(snapshot.index_options.oi_buildup.is_empty());
         assert!(snapshot.index_options.oi_unwind.is_empty());
+    }
+
+    // ----------------------------------------------------------------------
+    // Plan items A, B, D — Timeframe enum + Premium/Discount + row tagging
+    // ----------------------------------------------------------------------
+
+    /// Item A.1: every Timeframe variant maps to its canonical wire string.
+    /// This is the column value persisted to `top_movers.timeframe`.
+    /// Changing any of these strings is a breaking schema change.
+    #[test]
+    fn test_timeframe_as_str_stable_for_every_variant() {
+        let pairs: [(Timeframe, &str); 15] = [
+            (Timeframe::OneMin, "1m"),
+            (Timeframe::TwoMin, "2m"),
+            (Timeframe::ThreeMin, "3m"),
+            (Timeframe::FourMin, "4m"),
+            (Timeframe::FiveMin, "5m"),
+            (Timeframe::SixMin, "6m"),
+            (Timeframe::SevenMin, "7m"),
+            (Timeframe::EightMin, "8m"),
+            (Timeframe::NineMin, "9m"),
+            (Timeframe::TenMin, "10m"),
+            (Timeframe::ElevenMin, "11m"),
+            (Timeframe::TwelveMin, "12m"),
+            (Timeframe::ThirteenMin, "13m"),
+            (Timeframe::FourteenMin, "14m"),
+            (Timeframe::FifteenMin, "15m"),
+        ];
+        for (tf, expected) in pairs {
+            assert_eq!(
+                tf.as_str(),
+                expected,
+                "Timeframe::{tf:?} wire string drifted — schema break"
+            );
+        }
+    }
+
+    /// Item A.2: `secs()` matches the named minute count for every variant.
+    /// Used by the rolling-baseline lookup to find the price `secs()` ago.
+    #[test]
+    fn test_timeframe_secs_match_minutes() {
+        for tf in Timeframe::ALL {
+            let expected_minutes: u32 = tf.as_str()[..tf.as_str().len() - 1]
+                .parse()
+                .expect("as_str ends with 'm' and is parseable");
+            assert_eq!(
+                tf.secs(),
+                expected_minutes * 60,
+                "{tf:?}.secs() must equal {expected_minutes} * 60"
+            );
+        }
+    }
+
+    /// Item A.3: `Timeframe::ALL` contains exactly 15 entries — not 14, not 16.
+    /// If this trips: someone added or removed a variant without updating ALL.
+    #[test]
+    fn test_timeframe_all_count_is_15() {
+        assert_eq!(
+            Timeframe::ALL.len(),
+            15,
+            "Timeframe::ALL must contain exactly 15 entries (1m..15m)"
+        );
+    }
+
+    /// Item A.4: `Timeframe::ALL` is in strictly ascending `secs()` order so
+    /// callers iterating over it (e.g. baseline-lookback warmup) can rely
+    /// on monotonic timeframe traversal.
+    #[test]
+    fn test_timeframe_all_in_ascending_order() {
+        let mut prev: u32 = 0;
+        for tf in Timeframe::ALL {
+            assert!(
+                tf.secs() > prev,
+                "Timeframe::ALL is not strictly ascending: {tf:?} ({}s) follows {prev}s",
+                tf.secs()
+            );
+            prev = tf.secs();
+        }
+    }
+
+    /// Item B.1: Default `DerivativeBucket` has empty `premium` + `discount`.
+    /// Operators expect the warm-up state to populate nothing, not stale rows.
+    #[test]
+    fn test_derivative_bucket_default_premium_discount_empty() {
+        let b = DerivativeBucket::default();
+        assert!(b.premium.is_empty(), "premium must default empty");
+        assert!(b.discount.is_empty(), "discount must default empty");
+    }
+
+    /// Item B.2: `premium` and `discount` are independent vectors — pushing
+    /// to one does not mutate the other. (Catches any accidental aliasing
+    /// in the struct definition, e.g. if both were renamed to the same
+    /// field by a mass-rename refactor.)
+    #[test]
+    fn test_derivative_bucket_premium_discount_are_independent() {
+        let mut b = DerivativeBucket::default();
+        b.premium.push(MoverEntryV2 {
+            security_id: 1,
+            exchange_segment_code: 2,
+            last_traded_price: 100.0,
+            prev_close: 99.0,
+            change_pct: 1.0,
+            volume: 1,
+            open_interest: 0,
+            prev_open_interest: 0,
+            oi_change_pct: 0.0,
+            value: 100.0,
+        });
+        assert_eq!(b.premium.len(), 1);
+        assert_eq!(
+            b.discount.len(),
+            0,
+            "pushing to premium must not touch discount"
+        );
+    }
+
+    /// Item D.1: every emitted row carries the `timeframe` wire string passed
+    /// by the caller. If this regresses, the QuestDB DEDUP key will collide
+    /// across timeframes (1m and 5m rows would overwrite each other).
+    #[test]
+    fn test_snapshot_to_rows_tags_every_row_with_timeframe() {
+        let mut snapshot = MoversSnapshotV2::default();
+        snapshot.indices.gainers.push(MoverEntryV2 {
+            security_id: 13,
+            exchange_segment_code: 0,
+            last_traded_price: 25_700.0,
+            prev_close: 25_600.0,
+            change_pct: 0.4,
+            volume: 0,
+            open_interest: 0,
+            prev_open_interest: 0,
+            oi_change_pct: 0.0,
+            value: 0.0,
+        });
+        let reg = InstrumentRegistry::empty();
+        for tf in [Timeframe::OneMin, Timeframe::FiveMin, Timeframe::FifteenMin] {
+            let rows = snapshot_to_rows(&snapshot, tf, &reg);
+            assert!(!rows.is_empty(), "snapshot should have rows for {tf:?}");
+            for row in &rows {
+                assert_eq!(
+                    row.timeframe,
+                    tf.as_str(),
+                    "every row must carry timeframe={}",
+                    tf.as_str()
+                );
+            }
+        }
+    }
+
+    /// Item D.2: `segment` wire string is stable for every supported
+    /// `ExchangeSegment` and falls back to `"UNKNOWN"` for codes we don't
+    /// recognise. Required for I-P1-11 cross-segment DEDUP.
+    #[test]
+    fn test_segment_wire_str_covers_every_segment() {
+        // Numeric codes per dhan-annexure-enums.md rule 2:
+        // IDX_I=0, NSE_EQ=1, NSE_FNO=2, NSE_CURRENCY=3, BSE_EQ=4,
+        // MCX_COMM=5, BSE_CURRENCY=7, BSE_FNO=8 (note: gap at 6).
+        let pairs: [(u8, &str); 8] = [
+            (0, "IDX_I"),
+            (1, "NSE_EQ"),
+            (2, "NSE_FNO"),
+            (3, "NSE_CURRENCY"),
+            (4, "BSE_EQ"),
+            (5, "MCX_COMM"),
+            (7, "BSE_CURRENCY"),
+            (8, "BSE_FNO"),
+        ];
+        for (code, expected) in pairs {
+            assert_eq!(
+                segment_wire_str(code),
+                expected,
+                "segment_wire_str({code}) drifted"
+            );
+        }
+        // Code 6 is not a valid Dhan segment (annexure rule 2: gap at 6).
+        assert_eq!(segment_wire_str(6), "UNKNOWN");
+        assert_eq!(segment_wire_str(99), "UNKNOWN");
+    }
+
+    /// Item D.3: row segment matches the entry's `exchange_segment_code` —
+    /// catches off-by-one swaps where the wrong segment string is attached.
+    #[test]
+    fn test_snapshot_to_rows_segment_matches_entry_segment_code() {
+        let mut snapshot = MoversSnapshotV2::default();
+        // NSE_FNO entry — code 2.
+        snapshot.index_futures.gainers.push(MoverEntryV2 {
+            security_id: 49081,
+            exchange_segment_code: 2,
+            last_traded_price: 25_700.0,
+            prev_close: 25_600.0,
+            change_pct: 0.4,
+            volume: 0,
+            open_interest: 0,
+            prev_open_interest: 0,
+            oi_change_pct: 0.0,
+            value: 0.0,
+        });
+        let reg = InstrumentRegistry::empty();
+        let rows = snapshot_to_rows(&snapshot, Timeframe::OneMin, &reg);
+        assert!(!rows.is_empty());
+        for row in &rows {
+            assert_eq!(row.segment, "NSE_FNO", "futures row segment mismatch");
+        }
     }
 }

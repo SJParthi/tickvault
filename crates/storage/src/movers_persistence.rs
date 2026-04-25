@@ -139,10 +139,12 @@ const STOCK_MOVERS_CREATE_DDL: &str = "\
 /// buckets = 134 rows/sec × 21_600 market seconds/day ≈ 2.9M rows/day).
 const TOP_MOVERS_CREATE_DDL: &str = "\
     CREATE TABLE IF NOT EXISTS top_movers (\
+        timeframe SYMBOL,\
         bucket SYMBOL,\
         rank_category SYMBOL,\
         rank INT,\
         security_id LONG,\
+        segment SYMBOL,\
         symbol SYMBOL,\
         underlying SYMBOL,\
         expiry STRING,\
@@ -160,9 +162,22 @@ const TOP_MOVERS_CREATE_DDL: &str = "\
     ) TIMESTAMP(ts) PARTITION BY DAY WAL\
 ";
 
-/// DEDUP key for `top_movers`. A rank position within a bucket+category at
-/// a given second is unique — re-writes within the same second overwrite.
-const DEDUP_KEY_TOP_MOVERS: &str = "bucket, rank_category, rank";
+/// Idempotent self-heal DDL: ALTER TABLE ADD COLUMN IF NOT EXISTS for the
+/// two columns added 2026-04-25 (`timeframe`, `segment`). Pre-existing
+/// QuestDB deployments built on the previous schema get auto-migrated at
+/// boot without DROP. QuestDB ignores ADDs that already exist, so running
+/// every boot is free.
+const TOP_MOVERS_ALTER_DDL_TIMEFRAME: &str =
+    "ALTER TABLE top_movers ADD COLUMN IF NOT EXISTS timeframe SYMBOL";
+const TOP_MOVERS_ALTER_DDL_SEGMENT: &str =
+    "ALTER TABLE top_movers ADD COLUMN IF NOT EXISTS segment SYMBOL";
+
+/// DEDUP key for `top_movers`. Includes `timeframe` so the same rank
+/// position at the same second across DIFFERENT timeframes (1m vs 5m
+/// rankings) does not collide. Includes `security_id` + `segment` so
+/// I-P1-11 cross-segment id collisions (e.g. NIFTY id=13 IDX_I vs an
+/// NSE_EQ id=13) are kept as distinct rows.
+const DEDUP_KEY_TOP_MOVERS: &str = "timeframe, bucket, rank_category, rank, security_id, segment";
 
 /// DDL for the `option_movers` table.
 ///
@@ -883,19 +898,26 @@ impl OptionMoversWriter {
 
 /// A single row destined for the unified `top_movers` table.
 ///
-/// One snapshot fans out into up to ~680 rows (`(2 × 3 × 20) + (4 × 7 × 20)`).
-/// Each row is fully self-describing — the writer performs NO registry
-/// lookups (the caller assembles `symbol`, `underlying`, `expiry`, `strike`,
-/// and `option_type` from the `InstrumentRegistry` before calling `append`).
-/// This keeps the writer side-effect-free for unit testing without a
-/// QuestDB instance.
+/// One snapshot fans out into up to ~680 rows per timeframe; with 15
+/// timeframes that is ~10,200 rows per minute peak. Each row is fully
+/// self-describing — the writer performs NO registry lookups (the caller
+/// assembles `symbol`, `underlying`, `expiry`, `strike`, and `option_type`
+/// from the `InstrumentRegistry` before calling `append`). This keeps the
+/// writer side-effect-free for unit testing without a QuestDB instance.
+///
+/// `timeframe` (added 2026-04-25) selects which of the 15 rolling-window
+/// rankings (1m..15m) this row belongs to. `segment` (added 2026-04-25)
+/// disambiguates cross-segment `security_id` collisions per I-P1-11 (e.g.
+/// FINNIFTY id=27 IDX_I vs an NSE_EQ id=27).
 #[derive(Debug, Clone)]
 pub struct TopMoverRow {
     pub ts_nanos: i64,
+    pub timeframe: &'static str,
     pub bucket: String,
     pub rank_category: String,
     pub rank: i32,
     pub security_id: u32,
+    pub segment: &'static str,
     pub symbol: String,
     pub underlying: Option<String>,
     pub expiry: Option<String>,
@@ -1016,10 +1038,14 @@ impl TopMoversV2Writer {
         let mut b = buffer
             .table(QUESTDB_TABLE_TOP_MOVERS)
             .context("table")?
+            .symbol("timeframe", row.timeframe)
+            .context("timeframe")?
             .symbol("bucket", &row.bucket)
             .context("bucket")?
             .symbol("rank_category", &row.rank_category)
             .context("rank_category")?
+            .symbol("segment", row.segment)
+            .context("segment")?
             .symbol("symbol", &row.symbol)
             .context("symbol")?;
         if let Some(ref u) = row.underlying {
@@ -1242,6 +1268,25 @@ pub async fn ensure_movers_tables(questdb_config: &QuestDbConfig) {
 
     // Plan item C (2026-04-22): unified 6-bucket top_movers table.
     execute_ddl(&client, &base_url, TOP_MOVERS_CREATE_DDL, "top_movers").await;
+    // Plan item I (2026-04-25): self-heal ADD COLUMN IF NOT EXISTS for the
+    // two columns added 2026-04-25. Pre-existing deployments built on the
+    // 2026-04-22 schema get auto-migrated at boot; QuestDB ignores ADDs
+    // that already exist, so running every boot is free. Pattern lifted
+    // from observability-architecture.md schema self-heal.
+    execute_ddl(
+        &client,
+        &base_url,
+        TOP_MOVERS_ALTER_DDL_TIMEFRAME,
+        "top_movers ADD COLUMN timeframe",
+    )
+    .await;
+    execute_ddl(
+        &client,
+        &base_url,
+        TOP_MOVERS_ALTER_DDL_SEGMENT,
+        "top_movers ADD COLUMN segment",
+    )
+    .await;
     let top_dedup_sql = format!(
         "ALTER TABLE {} DEDUP ENABLE UPSERT KEYS(ts, {})",
         QUESTDB_TABLE_TOP_MOVERS, DEDUP_KEY_TOP_MOVERS
@@ -2000,16 +2045,110 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Plan items C, D, I (2026-04-25): timeframe + segment columns + DEDUP
+    // + ALTER self-heal. Catches accidental schema reverts.
+    // -----------------------------------------------------------------------
+
+    /// Item C.1: the DDL declares a `timeframe SYMBOL` column. Without
+    /// this, every snapshot row would have a NULL timeframe and the 15
+    /// timeframes (1m..15m) cannot be distinguished at query time.
+    #[test]
+    fn test_top_movers_ddl_contains_timeframe_column() {
+        assert!(
+            TOP_MOVERS_CREATE_DDL.contains("timeframe SYMBOL"),
+            "top_movers DDL must declare a `timeframe SYMBOL` column"
+        );
+    }
+
+    /// Item C.2: the DDL declares a `segment SYMBOL` column. Required for
+    /// I-P1-11 cross-segment composite key (e.g. id=27 IDX_I vs NSE_EQ).
+    #[test]
+    fn test_top_movers_ddl_contains_segment_column() {
+        assert!(
+            TOP_MOVERS_CREATE_DDL.contains("segment SYMBOL"),
+            "top_movers DDL must declare a `segment SYMBOL` column for I-P1-11"
+        );
+    }
+
+    /// Item C.3: DEDUP key includes `timeframe` so 1m and 5m rows at the
+    /// same second do not collide.
+    #[test]
+    fn test_top_movers_dedup_key_includes_timeframe() {
+        assert!(
+            DEDUP_KEY_TOP_MOVERS.contains("timeframe"),
+            "DEDUP_KEY_TOP_MOVERS must include `timeframe` — without it, \
+             snapshots from different timeframes at the same second collide"
+        );
+    }
+
+    /// Item C.4: DEDUP key includes `security_id` AND `segment`. Per
+    /// I-P1-11, `security_id` alone is not unique — Dhan reuses ids
+    /// across segments (e.g. FINNIFTY id=27 IDX_I + a stock id=27 NSE_EQ).
+    #[test]
+    fn test_top_movers_dedup_key_includes_security_id_and_segment() {
+        assert!(
+            DEDUP_KEY_TOP_MOVERS.contains("security_id"),
+            "DEDUP_KEY_TOP_MOVERS must include `security_id` for I-P1-11"
+        );
+        assert!(
+            DEDUP_KEY_TOP_MOVERS.contains("segment"),
+            "DEDUP_KEY_TOP_MOVERS must include `segment` for I-P1-11"
+        );
+    }
+
+    /// Item I.1: ALTER DDL for the new `timeframe` column uses
+    /// `IF NOT EXISTS` so it is safe to run on every boot. Without this
+    /// idempotency, pre-2026-04-25 deployments would crash at boot.
+    #[test]
+    fn test_top_movers_alter_ddl_timeframe_is_idempotent() {
+        assert!(
+            TOP_MOVERS_ALTER_DDL_TIMEFRAME.contains("ADD COLUMN IF NOT EXISTS"),
+            "ALTER for `timeframe` must use ADD COLUMN IF NOT EXISTS"
+        );
+        assert!(
+            TOP_MOVERS_ALTER_DDL_TIMEFRAME.contains("timeframe SYMBOL"),
+            "ALTER must declare the new column type as SYMBOL"
+        );
+    }
+
+    /// Item I.2: ALTER DDL for the new `segment` column is also
+    /// idempotent for the same reason as I.1.
+    #[test]
+    fn test_top_movers_alter_ddl_segment_is_idempotent() {
+        assert!(
+            TOP_MOVERS_ALTER_DDL_SEGMENT.contains("ADD COLUMN IF NOT EXISTS"),
+            "ALTER for `segment` must use ADD COLUMN IF NOT EXISTS"
+        );
+        assert!(
+            TOP_MOVERS_ALTER_DDL_SEGMENT.contains("segment SYMBOL"),
+            "ALTER must declare the new column type as SYMBOL"
+        );
+    }
+
+    /// Item D.4: TopMoverRow has dedicated `timeframe` and `segment`
+    /// fields. Catches accidental field removal in a refactor.
+    #[test]
+    fn test_top_mover_row_has_timeframe_and_segment_fields() {
+        let row = sample_price_row();
+        // If either field name is removed by a future refactor, this
+        // ceases to compile — the test is a compile-time ratchet too.
+        assert_eq!(row.timeframe, "1m");
+        assert_eq!(row.segment, "NSE_EQ");
+    }
+
+    // -----------------------------------------------------------------------
     // Plan item C2 (2026-04-22): TopMoverRow wire shape ratchets
     // -----------------------------------------------------------------------
 
     fn sample_derivative_row() -> TopMoverRow {
         TopMoverRow {
             ts_nanos: 1_700_000_000_000_000_000,
+            timeframe: "1m",
             bucket: "index_options".to_string(),
             rank_category: "top_oi".to_string(),
             rank: 1,
             security_id: 49_081,
+            segment: "NSE_FNO",
             symbol: "NIFTY 25000 CE 28-APR".to_string(),
             underlying: Some("NIFTY".to_string()),
             expiry: Some("2026-04-28".to_string()),
@@ -2029,10 +2168,12 @@ mod tests {
     fn sample_price_row() -> TopMoverRow {
         TopMoverRow {
             ts_nanos: 1_700_000_000_000_000_000,
+            timeframe: "1m",
             bucket: "stocks".to_string(),
             rank_category: "gainers".to_string(),
             rank: 1,
             security_id: 1_333,
+            segment: "NSE_EQ",
             symbol: "RELIANCE".to_string(),
             underlying: None,
             expiry: None,

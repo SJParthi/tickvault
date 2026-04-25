@@ -36,7 +36,7 @@ use tickvault_common::constants::{
 use tickvault_common::instrument_registry::InstrumentRegistry;
 use tickvault_common::tick_types::ParsedTick;
 use tickvault_core::pipeline::top_movers::{
-    MoversSnapshotV2, MoversTrackerV2, SharedMoversSnapshotV2, snapshot_to_rows,
+    MoversSnapshotV2, MoversTrackerV2, SharedMoversSnapshotV2, Timeframe, snapshot_to_rows,
 };
 use tickvault_storage::movers_persistence::TopMoversV2Writer;
 
@@ -201,7 +201,14 @@ pub fn spawn_movers_v2_pipeline(
                             Err(_) => None,
                         };
                         let Some(snapshot) = snapshot_opt else { continue };
-                        let rows = snapshot_to_rows(&snapshot, &persister_registry);
+                        // 2026-04-25 transitional: the existing snapshot path
+                        // computes change_pct against prev_close (a "today vs
+                        // yesterday" view). Tagging as OneMin until the
+                        // 15-timeframe rolling baseline lands (plan items E+F)
+                        // and emits one snapshot per timeframe. The DEDUP key
+                        // includes `timeframe` so multi-timeframe rows will
+                        // coexist without rewriting the existing 1m series.
+                        let rows = snapshot_to_rows(&snapshot, Timeframe::OneMin, &persister_registry);
                         if rows.is_empty() {
                             continue;
                         }
