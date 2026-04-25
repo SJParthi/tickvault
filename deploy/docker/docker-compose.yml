@@ -266,7 +266,7 @@ services:
   # Bible #27: grafana/grafana-oss:12.3.3
   # ---------------------------------------------------------------------------
   tv-grafana:
-    image: grafana/grafana-oss:12.3.3@sha256:9e1e77ade304069aee3196e9a4f210830e96e80ce9a2640891eccc324b152faf
+    image: grafana/grafana-oss:13.0.1@sha256:3625fdfa3cab904abdf9faaff8f40de0639b456ac5c5d322964fe705051d5455
     container_name: tv-grafana
     hostname: tv-grafana
     restart: unless-stopped
