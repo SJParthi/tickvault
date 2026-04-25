@@ -47,7 +47,7 @@ jobs:
       report: ${{ steps.scan.outputs.report }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # SHA-pinned (was @master, supply-chain hardening 2026-04-25)
@@ -89,7 +89,7 @@ jobs:
     if: needs.scan.outputs.patch_count != '0' && needs.scan.outputs.patch_count != ''
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # SHA-pinned (was @master, supply-chain hardening 2026-04-25)
