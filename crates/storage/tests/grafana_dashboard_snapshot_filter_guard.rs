@@ -661,10 +661,10 @@ fn scan_dir_for_counter_names(dir: &Path, out: &mut BTreeSet<String>) {
         let path = entry.path();
         if path.is_dir() {
             scan_dir_for_counter_names(&path, out);
-        } else if path.extension().and_then(|s| s.to_str()) == Some("rs") {
-            if let Ok(content) = std::fs::read_to_string(&path) {
-                extract_counter_names_from_source(&content, out);
-            }
+        } else if path.extension().and_then(|s| s.to_str()) == Some("rs")
+            && let Ok(content) = std::fs::read_to_string(&path)
+        {
+            extract_counter_names_from_source(&content, out);
         }
     }
 }

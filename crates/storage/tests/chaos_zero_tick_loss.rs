@@ -135,10 +135,10 @@ fn read_metric(metric: &str) -> f64 {
             continue;
         };
         // Match either bare metric name or name with label set.
-        if name == metric || name.starts_with(&format!("{metric}{{")) {
-            if let Ok(v) = value.trim().parse::<f64>() {
-                return v;
-            }
+        if (name == metric || name.starts_with(&format!("{metric}{{")))
+            && let Ok(v) = value.trim().parse::<f64>()
+        {
+            return v;
         }
     }
     0.0

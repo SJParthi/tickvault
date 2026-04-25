@@ -224,7 +224,7 @@ pub async fn get_stock_movers(State(state): State<SharedAppState>) -> impl IntoR
             .partial_cmp(&b.change_pct)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    most_active.sort_by(|a, b| b.volume.cmp(&a.volume));
+    most_active.sort_by_key(|e| std::cmp::Reverse(e.volume));
 
     Json(StockMoversResponse {
         available: !gainers.is_empty() || !losers.is_empty() || !most_active.is_empty(),

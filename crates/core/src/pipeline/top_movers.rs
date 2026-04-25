@@ -278,7 +278,7 @@ impl TopMoversTracker {
                 .collect();
 
             // Most active: sort by volume descending
-            entries.sort_unstable_by(|a, b| b.volume.cmp(&a.volume));
+            entries.sort_unstable_by_key(|e| std::cmp::Reverse(e.volume));
             let most_active: Vec<MoverEntry> = entries.iter().take(top_n).copied().collect();
 
             (gainers, losers, most_active)
@@ -1445,7 +1445,9 @@ fn trim_price_bucket(bucket: &mut PriceBucket) {
     bucket.losers.truncate(MOVERS_V2_TOP_N);
 
     // Most active: volume desc.
-    bucket.most_active.sort_by(|a, b| b.volume.cmp(&a.volume));
+    bucket
+        .most_active
+        .sort_by_key(|e| std::cmp::Reverse(e.volume));
     bucket.most_active.truncate(MOVERS_V2_TOP_N);
 }
 
@@ -1466,12 +1468,14 @@ fn trim_derivative_bucket(bucket: &mut DerivativeBucket) {
     bucket.losers.retain(|e| e.change_pct < 0.0);
     bucket.losers.truncate(MOVERS_V2_TOP_N);
 
-    bucket.most_active.sort_by(|a, b| b.volume.cmp(&a.volume));
+    bucket
+        .most_active
+        .sort_by_key(|e| std::cmp::Reverse(e.volume));
     bucket.most_active.truncate(MOVERS_V2_TOP_N);
 
     bucket
         .top_oi
-        .sort_by(|a, b| b.open_interest.cmp(&a.open_interest));
+        .sort_by_key(|e| std::cmp::Reverse(e.open_interest));
     bucket.top_oi.truncate(MOVERS_V2_TOP_N);
 
     bucket.top_value.sort_by(|a, b| {
@@ -2213,7 +2217,7 @@ mod tests {
             change_pct: -3.75,
             volume: 99999,
         };
-        let json = serde_json::to_value(&entry).unwrap();
+        let json = serde_json::to_value(entry).unwrap();
         assert_eq!(json["security_id"], 12345);
         assert_eq!(json["exchange_segment_code"], 1);
         assert_eq!(json["volume"], 99999);
@@ -2865,7 +2869,7 @@ mod tests {
             last_traded_price: 162.15,
             prev_close: 290.30,
             change_pct: -44.14,
-            volume: 12_202_3_330,
+            volume: 122_023_330,
             open_interest: 8_017_880,
             prev_open_interest: 4_673_565,
             oi_change_pct: 71.56,

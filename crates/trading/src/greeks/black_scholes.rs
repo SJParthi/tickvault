@@ -1463,7 +1463,7 @@ mod tests {
         let g = compute_greeks(OptionSide::Call, S, K, T, R, Q, price);
         assert!(g.is_some());
         assert!(
-            g.as_ref().map_or(false, |g| g.rho > 0.0),
+            g.as_ref().is_some_and(|g| g.rho > 0.0),
             "Call rho should be positive"
         );
     }
@@ -1474,7 +1474,7 @@ mod tests {
         let g = compute_greeks(OptionSide::Put, S, K, T, R, Q, price);
         assert!(g.is_some());
         assert!(
-            g.as_ref().map_or(false, |g| g.rho < 0.0),
+            g.as_ref().is_some_and(|g| g.rho < 0.0),
             "Put rho should be negative"
         );
     }
@@ -1486,7 +1486,7 @@ mod tests {
         let g = compute_greeks(OptionSide::Call, S, K, T, R, Q, price);
         assert!(g.is_some());
         // Vanna can be positive or negative — just check it's computed and finite.
-        assert!(g.as_ref().map_or(false, |g| g.vanna.is_finite()));
+        assert!(g.as_ref().is_some_and(|g| g.vanna.is_finite()));
     }
 
     #[test]
@@ -1495,7 +1495,7 @@ mod tests {
         let price = bs_call_price(S, K, T, R, Q, SIGMA);
         let g = compute_greeks(OptionSide::Call, S, K, T, R, Q, price);
         assert!(g.is_some());
-        assert!(g.as_ref().map_or(false, |g| g.volga.is_finite()));
+        assert!(g.as_ref().is_some_and(|g| g.volga.is_finite()));
     }
 
     #[test]
@@ -1504,7 +1504,7 @@ mod tests {
         let price = bs_call_price(S, K, T, R, Q, SIGMA);
         let g = compute_greeks(OptionSide::Call, S, K, T, R, Q, price);
         assert!(g.is_some());
-        assert!(g.as_ref().map_or(false, |g| g.speed.is_finite()));
+        assert!(g.as_ref().is_some_and(|g| g.speed.is_finite()));
     }
 
     #[test]
@@ -1930,6 +1930,8 @@ mod tests {
     /// Fine-tune: scan spot/T to find exact params matching Dhan with Cody CDF.
     /// Prints optimal parameters and asserts all 4 Greeks match within 1%.
     #[test]
+    #[allow(clippy::print_stderr)]
+    // APPROVED: calibration test prints diagnostic numerics for human review
     fn test_dhan_screenshot_fine_tune_params_24mar2026() {
         let strike = 22950.0;
         let iv = 0.1829;

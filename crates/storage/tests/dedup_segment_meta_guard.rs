@@ -159,7 +159,7 @@ fn self_test_collect_finds_ticks_dedup_key() {
     let decls = collect_dedup_key_declarations();
     let names: Vec<&str> = decls.iter().map(|(_, _, n, _)| n.as_str()).collect();
     assert!(
-        names.iter().any(|n| *n == "DEDUP_KEY_TICKS"),
+        names.contains(&"DEDUP_KEY_TICKS"),
         "DEDUP_KEY_TICKS must be discovered by the scanner. Names: {:?}",
         names
     );

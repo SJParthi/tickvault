@@ -924,35 +924,35 @@ mod tests {
         let mut engine = make_engine();
         engine.update_market_price(1001, f64::NAN);
         // NaN should NOT be stored
-        assert!(engine.market_prices.get(&1001).is_none());
+        assert!(!engine.market_prices.contains_key(&1001));
     }
 
     #[test]
     fn test_infinity_price_rejected() {
         let mut engine = make_engine();
         engine.update_market_price(1001, f64::INFINITY);
-        assert!(engine.market_prices.get(&1001).is_none());
+        assert!(!engine.market_prices.contains_key(&1001));
     }
 
     #[test]
     fn test_negative_infinity_price_rejected() {
         let mut engine = make_engine();
         engine.update_market_price(1001, f64::NEG_INFINITY);
-        assert!(engine.market_prices.get(&1001).is_none());
+        assert!(!engine.market_prices.contains_key(&1001));
     }
 
     #[test]
     fn test_zero_price_rejected() {
         let mut engine = make_engine();
         engine.update_market_price(1001, 0.0);
-        assert!(engine.market_prices.get(&1001).is_none());
+        assert!(!engine.market_prices.contains_key(&1001));
     }
 
     #[test]
     fn test_negative_price_rejected() {
         let mut engine = make_engine();
         engine.update_market_price(1001, -1.0);
-        assert!(engine.market_prices.get(&1001).is_none());
+        assert!(!engine.market_prices.contains_key(&1001));
     }
 
     #[test]

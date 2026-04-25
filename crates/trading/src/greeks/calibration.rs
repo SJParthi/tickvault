@@ -466,6 +466,8 @@ mod tests {
 
     /// Helper: runs calibration for a specific `days_to_expiry` value and returns
     /// the best result along with a per-combo error table.
+    #[allow(clippy::type_complexity)]
+    // APPROVED: tuple maps 1-to-1 to Dhan calibration sample columns; refactor would obscure intent
     fn calibrate_with_day_count(
         base_samples: &[(OptionSide, f64, f64, f64, f64, f64, f64, f64, f64)],
         days_to_expiry: i64,
@@ -991,6 +993,8 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::print_stderr)]
+    // APPROVED: calibration proof test prints grid-search diagnostics for human review
     fn test_proof_find_dhan_exact_parameters() {
         // Grid search: r × q × dc × fractional_time
         let rates = [0.0, 0.05, 0.06, 0.065, 0.068, 0.07, 0.075, 0.08, 0.10, 0.12];

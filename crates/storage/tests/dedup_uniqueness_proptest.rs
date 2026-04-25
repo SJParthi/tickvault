@@ -76,7 +76,7 @@ proptest! {
         new_vol in any::<u32>(),
         new_oi in any::<u32>(),
     ) {
-        let mut changed = base.clone();
+        let mut changed = base;
         changed.last_traded_price = new_price;
         changed.volume = new_vol;
         changed.open_interest = new_oi;
@@ -92,7 +92,7 @@ proptest! {
         new_sid in any::<u32>(),
     ) {
         prop_assume!(new_sid != base.security_id);
-        let mut changed = base.clone();
+        let mut changed = base;
         changed.security_id = new_sid;
         prop_assert_ne!(dedup_tuple(&base), dedup_tuple(&changed));
     }
@@ -107,7 +107,7 @@ proptest! {
         new_seg in any::<u8>(),
     ) {
         prop_assume!(new_seg != base.exchange_segment_code);
-        let mut changed = base.clone();
+        let mut changed = base;
         changed.exchange_segment_code = new_seg;
         prop_assert_ne!(dedup_tuple(&base), dedup_tuple(&changed));
     }
@@ -119,7 +119,7 @@ proptest! {
         new_ts in any::<u32>(),
     ) {
         prop_assume!(new_ts != base.exchange_timestamp);
-        let mut changed = base.clone();
+        let mut changed = base;
         changed.exchange_timestamp = new_ts;
         prop_assert_ne!(dedup_tuple(&base), dedup_tuple(&changed));
     }

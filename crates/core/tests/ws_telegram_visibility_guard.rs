@@ -24,6 +24,8 @@
 //! 5. Subscription replay on reconnect is preserved (main feed
 //!    `cached_subscription_messages.iter()` in `connect_and_subscribe`).
 
+#![allow(clippy::assertions_on_constants)]
+
 use std::fs;
 use std::path::PathBuf;
 

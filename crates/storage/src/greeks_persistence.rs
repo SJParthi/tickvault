@@ -1518,7 +1518,7 @@ mod tests {
             ts_nanos: sample_ts_nanos(),
         };
         assert!(build_option_greeks_live_row(&mut buffer, &row).is_ok());
-        assert!(buffer.len() > 0);
+        assert!(!buffer.is_empty());
     }
 
     #[test]
@@ -1538,7 +1538,7 @@ mod tests {
             ts_nanos: sample_ts_nanos(),
         };
         assert!(build_pcr_snapshot_live_row(&mut buffer, &row).is_ok());
-        assert!(buffer.len() > 0);
+        assert!(!buffer.is_empty());
     }
 
     // --- Async HTTP tests for ensure_greeks_tables + execute_ddl ---
@@ -1711,7 +1711,7 @@ mod tests {
             ts_nanos: sample_ts_nanos(),
         };
         assert!(build_dhan_raw_row(&mut buffer, &row).is_ok());
-        assert!(buffer.len() > 0);
+        assert!(!buffer.is_empty());
     }
 
     #[test]
@@ -1751,7 +1751,7 @@ mod tests {
             ts_nanos: sample_ts_nanos(),
         };
         assert!(build_option_greeks_row(&mut buffer, &row).is_ok());
-        assert!(buffer.len() > 0);
+        assert!(!buffer.is_empty());
     }
 
     #[test]
@@ -1770,7 +1770,7 @@ mod tests {
             ts_nanos: sample_ts_nanos(),
         };
         assert!(build_pcr_snapshot_row(&mut buffer, &row).is_ok());
-        assert!(buffer.len() > 0);
+        assert!(!buffer.is_empty());
     }
 
     #[test]
@@ -1802,7 +1802,7 @@ mod tests {
             ts_nanos: sample_ts_nanos(),
         };
         assert!(build_verification_row(&mut buffer, &row).is_ok());
-        assert!(buffer.len() > 0);
+        assert!(!buffer.is_empty());
     }
 
     #[test]

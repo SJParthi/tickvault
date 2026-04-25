@@ -26,6 +26,8 @@
 //! GAP-SEC-01 tests live in crates/api/tests/auth_middleware.rs.
 //! AUTH-GAP-01/02 tests live in the auth module's unit tests (require secrecy crate).
 
+#![allow(clippy::assertions_on_constants)]
+
 // ===========================================================================
 // I-P0-05: S3 Backup — exhaustive
 // ===========================================================================

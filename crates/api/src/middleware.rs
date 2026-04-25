@@ -139,7 +139,7 @@ impl ApiAuthConfig {
 
     /// **TEST-ONLY constructor.** Loads the API token from the
     /// `TV_API_TOKEN` environment variable. Retained for the existing unit
-    /// + integration test suite so tests can inject ad-hoc tokens without
+    /// and integration test suite so tests can inject ad-hoc tokens without
     /// spinning up real AWS SSM. **Production callers in
     /// `crates/app/src/main.rs` MUST NOT use this** — they go through
     /// [`Self::from_token`] with an SSM-fetched `SecretString` per

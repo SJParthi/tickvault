@@ -362,6 +362,12 @@ async fn main() -> Result<()> {
     observability::init_metrics(&config.observability)
         .context("failed to initialize Prometheus metrics")?;
 
+    // Cache parser dispatcher Counter handles AFTER the recorder is
+    // installed. Without this, the first hot-path packet of each kind
+    // would allocate (Principle #1 violation). Must run post-install
+    // because handles created pre-install resolve to a no-op counter.
+    tickvault_core::parser::prewarm_dispatcher_counters();
+
     // -----------------------------------------------------------------------
     // Step 3: Initialize structured logging + OpenTelemetry tracing layer
     // -----------------------------------------------------------------------
@@ -2432,7 +2438,7 @@ async fn main() -> Result<()> {
             let depth_selections: Vec<
                 tickvault_core::instrument::depth_strike_selector::DepthStrikeSelection,
             > = if let Some(universe) = depth_universe {
-                let ul_refs: Vec<&str> = depth_underlyings.iter().copied().collect();
+                let ul_refs: Vec<&str> = depth_underlyings.to_vec();
                 tickvault_core::instrument::depth_strike_selector::select_depth_instruments(
                     universe,
                     &ul_refs,
@@ -3279,7 +3285,6 @@ async fn main() -> Result<()> {
                 tickvault_core::instrument::preopen_price_buffer::new_shared_stock_ltps();
             {
                 let stock_ltps_updater = std::sync::Arc::clone(&live_stock_ltps);
-                let stock_ltps_universe = stock_ltps_universe;
                 let mut stock_rx = tick_broadcast_sender.subscribe();
                 tokio::spawn(async move {
                     loop {
@@ -4987,8 +4992,6 @@ fn spawn_historical_candle_fetch(
     let bg_dhan_config = config.dhan.clone();
     let bg_historical_config = config.historical.clone();
     let bg_questdb_config = config.questdb.clone();
-    let bg_data_collection_start = config.trading.data_collection_start.clone();
-    let bg_data_collection_end = config.trading.data_collection_end.clone();
     let bg_token_handle = token_manager.token_handle();
     let bg_notifier = std::sync::Arc::clone(notifier);
 
@@ -5178,14 +5181,13 @@ fn spawn_historical_candle_fetch(
                 today_ist_naive,
             )
             .await
-            .map(|n| {
+            .inspect(|&n| {
                 info!(
                     today_ist = %today_ist_naive,
                     today_candles = n,
                     "historical fetch returned zero — checking DB presence to \
                      classify as idempotent re-run vs outage"
                 );
-                n
             })
         } else {
             None
@@ -6249,6 +6251,9 @@ fn build_inline_greeks_enricher(
 // All pure helper function tests are in boot_helpers.rs (lib.rs target).
 // Only integration-level tests that require main.rs-specific code remain here.
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+// APPROVED: helper fns below the tests block are part of the boot path; reordering would add churn
+#[allow(clippy::assertions_on_constants)]
 mod tests {
     use super::*;
     use tickvault_app::boot_helpers::{

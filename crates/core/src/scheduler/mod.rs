@@ -488,6 +488,8 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
+    #[allow(clippy::clone_on_copy)]
+    // APPROVED: this test exists to verify Clone trait is wired alongside Copy
     fn test_schedule_phase_copy_clone_eq() {
         let phase = SchedulePhase::MarketOpen;
         let copied = phase; // Copy

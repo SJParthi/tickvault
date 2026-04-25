@@ -264,14 +264,14 @@ pub async fn run_twenty_depth_connection(
                 // If we reached a clean close AFTER at least one prior
                 // failure, we successfully recovered (connect + run +
                 // clean server-side close). Fire the reconnect event.
-                if failures_before_attempt > 0 {
-                    if let Some(ref n) = notifier {
-                        n.notify(
-                            crate::notification::events::NotificationEvent::DepthTwentyReconnected {
-                                underlying: underlying_label.clone(), // O(1) EXEMPT: cold path, once per reconnect
-                            },
-                        );
-                    }
+                if failures_before_attempt > 0
+                    && let Some(ref n) = notifier
+                {
+                    n.notify(
+                        crate::notification::events::NotificationEvent::DepthTwentyReconnected {
+                            underlying: underlying_label.clone(), // O(1) EXEMPT: cold path, once per reconnect
+                        },
+                    );
                 }
                 // Reset counter only on successful connection (failures accumulate for backoff)
                 reconnect_counter.store(0, Ordering::Relaxed);
@@ -581,7 +581,7 @@ async fn connect_and_run_depth(
                     first_frame_received = true;
                     m_active.set(1.0);
                     if let Some(signal) = connected_signal.take() {
-                        let _ = signal.send(());
+                        _ = signal.send(());
                     }
                 }
                 m_frames.increment(1);
@@ -823,15 +823,15 @@ pub async fn run_two_hundred_depth_connection(
             Ok(()) => {
                 info!(security_id, label = %label, "{prefix}: connection closed normally");
                 // Recovery from prior failure streak — fire Telegram.
-                if failures_before_attempt > 0 {
-                    if let Some(ref n) = notifier {
-                        n.notify(
-                            crate::notification::events::NotificationEvent::DepthTwoHundredReconnected {
-                                contract: label.clone(), // O(1) EXEMPT: cold path, once per reconnect
-                                security_id,
-                            },
-                        );
-                    }
+                if failures_before_attempt > 0
+                    && let Some(ref n) = notifier
+                {
+                    n.notify(
+                        crate::notification::events::NotificationEvent::DepthTwoHundredReconnected {
+                            contract: label.clone(), // O(1) EXEMPT: cold path, once per reconnect
+                            security_id,
+                        },
+                    );
                 }
                 // Reset counter only on successful connection (failures accumulate for backoff)
                 reconnect_counter.store(0, Ordering::Relaxed);
@@ -1138,7 +1138,7 @@ async fn connect_and_run_200_depth(
                     first_frame_received = true;
                     m_active.set(1.0);
                     if let Some(signal) = connected_signal.take() {
-                        let _ = signal.send(());
+                        _ = signal.send(());
                     }
                 }
                 m_frames.increment(1);

@@ -155,7 +155,7 @@ fn project_price(
     top: usize,
     only_category: Option<MoverCategory>,
 ) -> BucketResponse {
-    let include = |cat: MoverCategory| only_category.map_or(true, |filter| filter == cat);
+    let include = |cat: MoverCategory| only_category.is_none_or(|filter| filter == cat);
     BucketResponse {
         tracked: bucket.tracked,
         gainers: include(MoverCategory::Gainers).then(|| trim(&bucket.gainers, top)),
@@ -173,7 +173,7 @@ fn project_derivative(
     top: usize,
     only_category: Option<MoverCategory>,
 ) -> BucketResponse {
-    let include = |cat: MoverCategory| only_category.map_or(true, |filter| filter == cat);
+    let include = |cat: MoverCategory| only_category.is_none_or(|filter| filter == cat);
     BucketResponse {
         tracked: bucket.tracked,
         gainers: include(MoverCategory::Gainers).then(|| trim(&bucket.gainers, top)),
@@ -227,18 +227,18 @@ pub async fn get_movers_v2(
     };
 
     // ---- Bucket/category compatibility (405) ----
-    if let (Some(b), Some(c)) = (bucket_filter, category_filter) {
-        if !c.is_applicable_to(b) {
-            let body = ErrorBody {
-                error: format!(
-                    "category `{}` is not applicable to bucket `{}`",
-                    c.as_str(),
-                    b.as_str()
-                ),
-                valid: None,
-            };
-            return (StatusCode::METHOD_NOT_ALLOWED, Json(body)).into_response();
-        }
+    if let (Some(b), Some(c)) = (bucket_filter, category_filter)
+        && !c.is_applicable_to(b)
+    {
+        let body = ErrorBody {
+            error: format!(
+                "category `{}` is not applicable to bucket `{}`",
+                c.as_str(),
+                b.as_str()
+            ),
+            valid: None,
+        };
+        return (StatusCode::METHOD_NOT_ALLOWED, Json(body)).into_response();
     }
 
     // ---- Validate `top` ----
@@ -278,7 +278,7 @@ pub async fn get_movers_v2(
 
     // ---- Project per bucket filter ----
     let mut buckets = std::collections::BTreeMap::new();
-    let include_bucket = |b: MoverBucket| bucket_filter.map_or(true, |filter| filter == b);
+    let include_bucket = |b: MoverBucket| bucket_filter.is_none_or(|filter| filter == b);
 
     if include_bucket(MoverBucket::Indices) {
         buckets.insert(
@@ -502,7 +502,7 @@ mod tests {
 
     fn mk_state() -> SharedAppState {
         use std::sync::{Arc, RwLock};
-        let state = SharedAppState::new(
+        SharedAppState::new(
             tickvault_common::config::QuestDbConfig {
                 host: "127.0.0.1".to_string(),
                 http_port: 1,
@@ -531,8 +531,7 @@ mod tests {
             Arc::new(RwLock::new(None)),
             Arc::new(RwLock::new(None)),
             Arc::new(crate::state::SystemHealthStatus::new()),
-        );
-        state
+        )
     }
 
     async fn call(uri: &str, state: SharedAppState) -> (axum::http::StatusCode, String) {

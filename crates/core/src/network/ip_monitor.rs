@@ -175,7 +175,7 @@ pub fn spawn_ip_monitor(
                         "GAP-NET-01: CRITICAL — IP MISMATCH DETECTED. \
                          Dhan API calls will be rejected from wrong IP. Trading should halt."
                     );
-                    let _ = tx.send(true);
+                    _ = tx.send(true);
                 }
                 IpCheckResult::CheckFailed { reason } => {
                     warn!(

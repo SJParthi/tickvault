@@ -902,7 +902,7 @@ impl WebSocketConnection {
                     // Close the socket regardless of send outcome.
                     {
                         let mut sink = write.lock().await;
-                        let _ = time::timeout(Duration::from_secs(1), sink.close()).await; // APPROVED: graceful-shutdown inner close timeout — 1s is the session 7 A5 spec.
+                        drop(time::timeout(Duration::from_secs(1), sink.close()).await); // APPROVED: graceful-shutdown inner close timeout — 1s is the session 7 A5 spec.
                     }
                     return Ok(());
                 }

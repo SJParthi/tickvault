@@ -126,14 +126,14 @@ pub fn save_token_cache(token: &TokenState, client_id: &SecretString) {
 
     if let Err(err) = write_result {
         warn!(?err, "failed to write token cache temp file");
-        let _ = std::fs::remove_file(&tmp_path);
+        drop(std::fs::remove_file(&tmp_path));
         return;
     }
 
     // Atomic rename
     if let Err(err) = std::fs::rename(&tmp_path, TOKEN_CACHE_FILE_PATH) {
         warn!(?err, "failed to rename token cache file");
-        let _ = std::fs::remove_file(&tmp_path);
+        drop(std::fs::remove_file(&tmp_path));
         return;
     }
 
@@ -326,7 +326,7 @@ pub fn load_token_cache_fast() -> Option<FastCacheResult> {
 
 /// Deletes the token cache file (best-effort, no error on failure).
 pub fn delete_cache_file() {
-    let _ = std::fs::remove_file(TOKEN_CACHE_FILE_PATH);
+    drop(std::fs::remove_file(TOKEN_CACHE_FILE_PATH));
 }
 
 // ---------------------------------------------------------------------------
@@ -393,6 +393,8 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::print_stderr)]
+    // APPROVED: test logs SKIP reason to stderr for cross-platform diagnostics
     fn test_save_and_load_roundtrip() {
         use chrono::{Duration, Utc};
 

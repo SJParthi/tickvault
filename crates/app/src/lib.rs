@@ -10,6 +10,8 @@
 // Phase 0.2: no dropped Result/JoinHandle/must-use values (silent error swallowing).
 #![cfg_attr(not(test), deny(unused_must_use))]
 #![cfg_attr(not(test), warn(clippy::let_underscore_must_use))]
+#![cfg_attr(test, allow(clippy::assertions_on_constants))]
+#![cfg_attr(test, allow(clippy::field_reassign_with_default))]
 
 pub mod boot_helpers;
 pub mod greeks_pipeline;

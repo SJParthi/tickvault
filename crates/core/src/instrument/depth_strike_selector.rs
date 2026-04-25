@@ -606,7 +606,7 @@ mod tests {
         let has_ce = selection
             .all_security_ids
             .iter()
-            .any(|&id| id >= 10000 && id < 20000);
+            .any(|&id| (10000..20000).contains(&id));
         let has_pe = selection.all_security_ids.iter().any(|&id| id >= 20000);
         assert!(has_ce, "must have CE security IDs");
         assert!(has_pe, "must have PE security IDs");

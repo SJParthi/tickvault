@@ -2437,9 +2437,9 @@ mod tests {
             exchange_segment_code: 2, // NSE_FNO
             timestamp_secs: 1_740_556_500,
             open: 24567.25,
-            high: 24600.50,
+            high: 24600.5,
             low: 24510.75,
-            close: 24580.00,
+            close: 24580.0,
             volume: 1_234_567,
             tick_count: 4_200,
             iv: f64::NAN,
@@ -4421,6 +4421,7 @@ mod tests {
         // Write records using BufWriter.
         let file = std::fs::OpenOptions::new()
             .create(true)
+            .truncate(true)
             .write(true)
             .open(&spill_path)
             .unwrap();
@@ -5884,8 +5885,7 @@ mod tests {
 
         // Connect then immediately break the sender
         let port = spawn_tcp_drain_server();
-        if let Ok(s) = questdb::ingress::Sender::from_conf(&format!("tcp::addr=127.0.0.1:{port};"))
-        {
+        if let Ok(s) = questdb::ingress::Sender::from_conf(format!("tcp::addr=127.0.0.1:{port};")) {
             writer.buffer = s.new_buffer();
             writer.sender = Some(s);
         }
@@ -5995,7 +5995,7 @@ mod tests {
         let spill_path = tmp_dir.join("candles-corrupt.bin");
 
         // Write a partial record (less than CANDLE_SPILL_RECORD_SIZE bytes)
-        std::fs::write(&spill_path, &[0u8; 10]).unwrap();
+        std::fs::write(&spill_path, [0u8; 10]).unwrap();
         writer.spill_path = Some(spill_path.clone());
         writer.candles_spilled_total = 1;
 
@@ -6042,7 +6042,7 @@ mod tests {
                 vega: f64::NAN,
             };
             let record = serialize_candle(&c);
-            std::fs::write(&spill_path, &record).unwrap();
+            std::fs::write(&spill_path, record).unwrap();
         }
 
         writer.spill_path = Some(spill_path.clone());
@@ -6088,7 +6088,7 @@ mod tests {
                 vega: f64::NAN,
             };
             let record = serialize_candle(&c);
-            std::fs::write(&spill_path, &record).unwrap();
+            std::fs::write(&spill_path, record).unwrap();
         }
 
         writer.spill_path = Some(spill_path.clone());
@@ -6096,8 +6096,7 @@ mod tests {
 
         // Connect a sender that we'll disconnect after building rows
         let port = spawn_tcp_drain_server();
-        if let Ok(s) = questdb::ingress::Sender::from_conf(&format!("tcp::addr=127.0.0.1:{port};"))
-        {
+        if let Ok(s) = questdb::ingress::Sender::from_conf(format!("tcp::addr=127.0.0.1:{port};")) {
             writer.buffer = s.new_buffer();
             writer.sender = Some(s);
         }
@@ -6190,7 +6189,7 @@ mod tests {
                 vega: f64::NAN,
             };
             let record = serialize_candle(&c);
-            std::fs::write(&stale_path, &record).unwrap();
+            std::fs::write(&stale_path, record).unwrap();
         }
 
         // Make sure the active spill path is different
@@ -6230,7 +6229,7 @@ mod tests {
         let stale_path = real_spill_dir.join("candles-19700102.bin");
 
         // Write partial/corrupt data
-        std::fs::write(&stale_path, &[0xFFu8; 10]).unwrap();
+        std::fs::write(&stale_path, [0xFFu8; 10]).unwrap();
         writer.spill_path = None;
 
         let recovered = writer.recover_stale_spill_files();
@@ -6311,9 +6310,7 @@ mod tests {
             pg_port: port,
         };
         let mut writer = LiveCandleWriter::new(&config).ok()?;
-        if writer.sender.is_none() {
-            return None;
-        }
+        writer.sender.as_ref()?;
         writer.next_reconnect_allowed =
             std::time::Instant::now() + std::time::Duration::from_secs(3600);
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -6495,7 +6492,7 @@ mod tests {
         let path = std::path::PathBuf::from(format!("{}/candles-bufwriter-test.bin", spill_dir));
         let candle = make_cov_buffered_candle(33000);
         let record = serialize_candle(&candle);
-        std::fs::write(&path, &record).unwrap();
+        std::fs::write(&path, record).unwrap();
 
         writer.spill_path = Some(path.clone());
         writer.candles_spilled_total = 1;
@@ -6532,7 +6529,7 @@ mod tests {
         let _ = std::fs::create_dir_all(spill_dir);
         let path = std::path::PathBuf::from(format!("{}/candles-read-err-test.bin", spill_dir));
         // Write corrupt (short) data — should trigger read error
-        std::fs::write(&path, &[0xAB; 30]).unwrap();
+        std::fs::write(&path, [0xAB; 30]).unwrap();
 
         writer.spill_path = Some(path.clone());
         writer.candles_spilled_total = 1;
@@ -6565,7 +6562,7 @@ mod tests {
         let path = std::path::PathBuf::from(format!("{}/candles-build-err-test.bin", spill_dir));
         let candle = make_cov_buffered_candle(34000);
         let record = serialize_candle(&candle);
-        std::fs::write(&path, &record).unwrap();
+        std::fs::write(&path, record).unwrap();
 
         writer.spill_path = Some(path.clone());
         writer.candles_spilled_total = 1;
@@ -6656,7 +6653,7 @@ mod tests {
         // Use a unique filename with test-specific prefix to avoid conflicts
         let stale = std::path::PathBuf::from(format!("{}/candles-19800101.bin", spill_dir));
         // Write corrupt short data — triggers stale spill read error (line 787)
-        std::fs::write(&stale, &[0xAB; 30]).unwrap();
+        std::fs::write(&stale, [0xAB; 30]).unwrap();
 
         let recovered = writer.recover_stale_spill_files();
         let _ = recovered;

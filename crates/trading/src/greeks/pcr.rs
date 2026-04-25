@@ -56,7 +56,7 @@ mod tests {
 
     #[test]
     fn test_pcr_basic() {
-        let pcr = compute_pcr(72_90_595, 28_12_485).unwrap();
+        let pcr = compute_pcr(7_290_595, 2_812_485).unwrap();
         assert!(pcr > 2.0, "High put OI → high PCR: {pcr}");
     }
 
@@ -86,7 +86,7 @@ mod tests {
     fn test_pcr_nifty_example() {
         // From screenshot: PCR = 0.78 (approximate)
         // Typical NIFTY weekly: ~40L puts, ~50L calls
-        let pcr = compute_pcr(40_00_000, 51_28_205).unwrap();
+        let pcr = compute_pcr(4_000_000, 5_128_205).unwrap();
         assert!(pcr > 0.7 && pcr < 0.9, "NIFTY-like PCR: {pcr}");
     }
 

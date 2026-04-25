@@ -46,7 +46,6 @@ use tickvault_core::notification::summary_writer::{
 };
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
 
 fn fresh_tmp_dir(label: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(

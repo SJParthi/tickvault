@@ -32,7 +32,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
-          toolchain: "1.93.1"
+          toolchain: "1.95.0"
 
       - name: Install cargo-audit
         uses: taiki-e/install-action@2096c74c99c2f065b14e98d9738b44dd2018c2b7 # cargo-audit

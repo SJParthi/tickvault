@@ -435,12 +435,11 @@ pub fn build_subscription_plan(
                         // Binary search: find strike closest to spot price.
                         let idx = chain.calls.partition_point(|e| e.strike_price < price);
                         let candidates = [idx.saturating_sub(1), idx.min(call_count - 1)];
-                        let best = candidates.iter().copied().min_by(|&a, &b| {
+                        candidates.iter().copied().min_by(|&a, &b| {
                             let da = (chain.calls[a].strike_price - price).abs();
                             let db = (chain.calls[b].strike_price - price).abs();
                             da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
-                        });
-                        best
+                        })
                     }
                     _ => {
                         // No pre-market price available — skip this stock's options.
@@ -497,12 +496,11 @@ pub fn build_subscription_plan(
                     Some(price) if price > 0.0 && price.is_finite() => {
                         let idx = chain.puts.partition_point(|e| e.strike_price < price);
                         let candidates = [idx.saturating_sub(1), idx.min(put_count - 1)];
-                        let best = candidates.iter().copied().min_by(|&a, &b| {
+                        candidates.iter().copied().min_by(|&a, &b| {
                             let da = (chain.puts[a].strike_price - price).abs();
                             let db = (chain.puts[b].strike_price - price).abs();
                             da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
-                        });
-                        best
+                        })
                     }
                     _ => None, // No pre-market price — skipped (same as calls)
                 }
