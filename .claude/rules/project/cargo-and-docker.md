@@ -13,7 +13,7 @@ paths:
 - `cargo update` is BANNED — Bible updates only.
 - Workspace deps in root Cargo.toml, crates use `{ workspace = true }`
 - Adding deps: check Bible first. Not found? Propose to Parthiban with justification.
-- `edition = "2024"`, `rust-version = "1.93.1"` in every crate
+- `edition = "2024"`, `rust-version = "1.95.0"` in every crate
 
 ## Docker
 - Same docker-compose.yml and Dockerfile on Mac and AWS

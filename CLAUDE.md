@@ -15,7 +15,7 @@ Every file, function, config decision must pass all three. No exceptions.
 ## PROJECT
 
 - **Purpose:** O(1) latency live F&O trading system for Indian markets (NSE)
-- **Language:** Rust 2024 Edition (stable 1.93.1)
+- **Language:** Rust 2024 Edition (stable 1.95.0)
 - **Repo:** `https://github.com/SJParthi/tickvault` (single source of truth)
 - **Runtime:** Docker everywhere. Mac (dev) → AWS c7i.2xlarge Mumbai (prod). Same containers, same code, always real AWS SSM.
 - **Owner:** Parthiban (architect). Claude Code (builder).
@@ -186,7 +186,7 @@ Branch protection ON: Build & Verify, Security & Audit, Commit Lint, Secret Scan
 
 - Workspace deps in root Cargo.toml, crates use `{ workspace = true }`
 - Exact versions ONLY in workspace `Cargo.toml`. `^`, `~`, `*`, `>=` are BANNED. `cargo update` is BANNED. New dep additions need Parthiban approval.
-- `edition = "2024"`, `rust-version = "1.93.1"` in every crate
+- `edition = "2024"`, `rust-version = "1.95.0"` in every crate
 - Release profile: `overflow-checks = true`, `lto = "thin"`, `codegen-units = 1`, `panic = "abort"`, `strip = "symbols"`
 
 ## KEY DEPENDENCIES (pinned versions)

@@ -281,7 +281,7 @@ api:
 - Bible last reconciled 2026-02-26 but dependencies have drifted since
 
 ### LOW: Fuzz Crate Edition Duplication
-- `fuzz/Cargo.toml` duplicates `edition = "2024"` and `rust-version = "1.93.1"` instead of workspace inheritance (acceptable since excluded from workspace)
+- `fuzz/Cargo.toml` duplicates `edition = "2024"` and `rust-version = "1.95.0"` instead of workspace inheritance (acceptable since excluded from workspace)
 
 ### LOW: DashMap in Dependencies
 - `dashmap` appears in root Cargo.toml but is imported nowhere — dead dependency
