@@ -22,7 +22,12 @@ serde_json = { workspace = true }
 chrono = { workspace = true }
 reqwest = { workspace = true }
 uuid = { workspace = true }
-zeroize = { workspace = true }
+# 2026-04-25 security audit (PR #357): bearer_token migrated from
+# `String` (with manual zeroize::Zeroize Drop impl) to `secrecy::SecretString`
+# per .claude/rules/project/rust-code.md (mandated secret type).
+# `secrecy` provides Drop+Zeroize transitively; the direct `zeroize` dep is
+# no longer needed in this crate.
+secrecy = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

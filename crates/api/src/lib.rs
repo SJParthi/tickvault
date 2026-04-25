@@ -35,18 +35,46 @@ use state::SharedAppState;
 /// GAP-SEC-01: Mutating endpoints (POST /api/instruments/rebuild) are protected
 /// by bearer token auth. Read-only GET endpoints remain unauthenticated.
 ///
+/// Auth source: legacy env-var path via [`ApiAuthConfig::from_env`].
+/// Production callers in `crates/app/src/main.rs` should use
+/// [`build_router_with_auth`] with a `SecretString` resolved from AWS SSM
+/// (path `/tickvault/<env>/api/bearer-token`) so the bearer token never
+/// transits a process env var.
+///
 /// # Arguments
 /// * `state` — shared application state for handlers
 /// * `allowed_origins` — list of allowed CORS origin URLs (from config)
 /// * `dry_run` — whether the system is in dry-run mode (relaxed auth when token unset)
 // O(1) EXEMPT: begin — cold path, called once at boot
 pub fn build_router(state: SharedAppState, allowed_origins: &[String], dry_run: bool) -> Router {
-    let cors = build_cors_layer(allowed_origins);
-
-    // GAP-SEC-01: Load auth config from TV_API_TOKEN env var.
+    // GAP-SEC-01: Load auth config from TV_API_TOKEN env var (legacy fallback).
     // In dry_run mode: missing token = passthrough (dev mode).
     // In live mode: missing token = auto-generated token, auth still enforced.
     let auth_config = ApiAuthConfig::from_env(dry_run);
+    build_router_with_auth(state, allowed_origins, auth_config)
+}
+
+/// Builds the router with a pre-resolved [`ApiAuthConfig`].
+///
+/// 2026-04-25 security audit (PR #357): production code path. The caller
+/// (typically `crates/app/src/main.rs`) is responsible for resolving the
+/// bearer token from AWS SSM Parameter Store
+/// (`/tickvault/<env>/api/bearer-token` via
+/// `tickvault_core::auth::secret_manager::fetch_api_bearer_token`) and
+/// constructing `ApiAuthConfig::from_token(SecretString)`. This keeps the
+/// bearer token out of process env vars / Docker `environment:` blocks.
+///
+/// # Arguments
+/// * `state` — shared application state for handlers
+/// * `allowed_origins` — list of allowed CORS origin URLs (from config)
+/// * `auth_config` — pre-resolved auth config (SSM-fetched in prod, env-fallback in dev)
+// O(1) EXEMPT: begin — cold path, called once at boot
+pub fn build_router_with_auth(
+    state: SharedAppState,
+    allowed_origins: &[String],
+    auth_config: ApiAuthConfig,
+) -> Router {
+    let cors = build_cors_layer(allowed_origins);
 
     // Protected routes — mutating endpoints behind bearer token auth
     let protected_routes = Router::new()
@@ -260,6 +288,55 @@ mod tests {
     // -------------------------------------------------------------------
     // build_router: smoke test — router builds without panic
     // -------------------------------------------------------------------
+
+    #[test]
+    /// 2026-04-25 (PR #357): direct smoke test for `build_router_with_auth`,
+    /// the production code path that takes a pre-resolved `ApiAuthConfig`
+    /// (typically constructed from an SSM-fetched `SecretString` in
+    /// `crates/app/src/main.rs`). Verifies the router builds without panic
+    /// when given a `from_token`-constructed config — this exercises the
+    /// SSM-backed code path that the legacy `build_router` wrapper does not.
+    #[test]
+    fn test_build_router_with_auth_from_token_smoke() {
+        use middleware::ApiAuthConfig;
+        use secrecy::SecretString;
+
+        let state = state::SharedAppState::new(
+            tickvault_common::config::QuestDbConfig {
+                host: "127.0.0.1".to_string(),
+                http_port: 1,
+                pg_port: 1,
+                ilp_port: 1,
+            },
+            tickvault_common::config::DhanConfig {
+                websocket_url: "wss://test".to_string(),
+                order_update_websocket_url: "wss://test".to_string(),
+                rest_api_base_url: "https://test".to_string(),
+                auth_base_url: "https://test".to_string(),
+                instrument_csv_url: "https://test".to_string(),
+                instrument_csv_fallback_url: "https://test".to_string(),
+                max_instruments_per_connection: 5000,
+                max_websocket_connections: 5,
+                sandbox_base_url: String::new(),
+            },
+            tickvault_common::config::InstrumentConfig {
+                daily_download_time: "08:55:00".to_string(),
+                csv_cache_directory: "/tmp/tv-cache".to_string(),
+                csv_cache_filename: "instruments.csv".to_string(),
+                csv_download_timeout_secs: 120,
+                build_window_start: "08:25:00".to_string(),
+                build_window_end: "08:55:00".to_string(),
+            },
+            std::sync::Arc::new(std::sync::RwLock::new(None)),
+            std::sync::Arc::new(std::sync::RwLock::new(None)),
+            std::sync::Arc::new(state::SystemHealthStatus::new()),
+        );
+        // Production-style call: SecretString → from_token → build_router_with_auth.
+        let token = SecretString::from("ssm-fetched-token-test".to_string());
+        let auth_config = ApiAuthConfig::from_token(token);
+        assert!(auth_config.enabled, "from_token must enable auth");
+        let _router = build_router_with_auth(state, &[], auth_config);
+    }
 
     #[test]
     fn test_build_router_smoke_test_dry_run() {

@@ -30,7 +30,7 @@ fn auth_app(config: ApiAuthConfig) -> Router {
 fn config_new_enabled() {
     let c = ApiAuthConfig::new("secret".to_owned());
     assert!(c.enabled);
-    assert_eq!(c.bearer_token, "secret");
+    assert_eq!(c.token_value_for_test(), "secret");
 }
 
 #[test]
@@ -43,14 +43,14 @@ fn config_new_empty_disabled() {
 fn config_disabled() {
     let c = ApiAuthConfig::disabled();
     assert!(!c.enabled);
-    assert!(c.bearer_token.is_empty());
+    assert!(c.token_value_for_test().is_empty());
 }
 
 #[test]
 fn config_clone_preserves_all() {
     let c = ApiAuthConfig::new("tok".to_owned());
     let cl = c.clone();
-    assert_eq!(cl.bearer_token, "tok");
+    assert_eq!(cl.token_value_for_test(), "tok");
     assert!(cl.enabled);
 }
 

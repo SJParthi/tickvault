@@ -618,6 +618,26 @@ pub const TELEGRAM_BOT_TOKEN_SECRET: &str = "bot-token";
 pub const TELEGRAM_CHAT_ID_SECRET: &str = "chat-id";
 
 // ---------------------------------------------------------------------------
+// SSM Parameter Store — API Service (added 2026-04-25)
+// ---------------------------------------------------------------------------
+
+/// SSM service path segment for API server credentials.
+///
+/// 2026-04-25 security audit (PR #357): TV_API_TOKEN was previously read
+/// from a process env var (Docker `environment:` block or systemd
+/// `EnvironmentFile`), which is plaintext on disk and visible via
+/// `docker inspect` / `/proc/<pid>/environ`. Project mandate per
+/// `.claude/rules/project/rust-code.md` is "All secrets from AWS SSM
+/// Parameter Store". This service path moves the bearer token into SSM
+/// alongside Dhan, QuestDB, Grafana, and Telegram credentials.
+pub const SSM_API_SERVICE: &str = "api";
+
+/// SSM key for API bearer token (mutating-endpoint authentication).
+///
+/// Full path: `/tickvault/<env>/api/bearer-token`
+pub const API_BEARER_TOKEN_SECRET: &str = "bearer-token";
+
+// ---------------------------------------------------------------------------
 // SSM Parameter Store — SNS Service
 // ---------------------------------------------------------------------------
 

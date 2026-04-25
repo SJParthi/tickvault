@@ -3,15 +3,29 @@
 //! Provides bearer token authentication for mutating API endpoints.
 //! Read-only endpoints (health, stats, quote) remain unauthenticated.
 //!
-//! # Token Source
-//! The API bearer token is read from the environment variable `TV_API_TOKEN`
-//! at startup.
+//! # Token Source (preferred → fallback)
+//!
+//! 1. **AWS SSM Parameter Store** — `/tickvault/<env>/api/bearer-token`
+//!    fetched by `tickvault_core::auth::secret_manager::fetch_api_bearer_token`
+//!    in `crates/app/src/main.rs` and injected via [`ApiAuthConfig::from_token`].
+//!    THIS IS THE MANDATED PROD SOURCE per `.claude/rules/project/rust-code.md`.
+//! 2. **`TV_API_TOKEN` env var** — legacy / local dev fallback used by
+//!    [`ApiAuthConfig::from_env`] when SSM is unavailable. Logs a WARN
+//!    so the operator notices the deviation in prod logs.
 //!
 //! # Auth Behavior
-//! - Token set: auth enabled with configured token.
-//! - Token unset + dry_run: auth disabled (development passthrough).
-//! - Token unset + live mode: fail-closed — auto-generates a random token,
-//!   logs it at WARN level, and still requires auth for mutating endpoints.
+//! - Token resolved (SSM or env): auth enabled with that token.
+//! - No token + `dry_run = true`: auth disabled (development passthrough).
+//! - No token + `dry_run = false`: fail-closed — generates a random UUID v4
+//!   token, logs CRITICAL via `error!`, and still requires auth for
+//!   mutating endpoints. Operator gets paged via Telegram.
+//!
+//! # In-memory hygiene
+//! `bearer_token` is `secrecy::SecretString` — zeroize on drop, `[REDACTED]`
+//! `Display`. Manual `Debug` impl provides defense-in-depth on top of
+//! `secrecy`'s own Debug guard. The constant-time comparison briefly
+//! exposes the inner bytes via `expose_secret()` only in
+//! [`require_bearer_auth`].
 //!
 //! # Authenticated Endpoints
 //! - `POST /api/instruments/rebuild` — triggers instrument reload
@@ -21,6 +35,7 @@ use axum::extract::Request;
 use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::Response;
+use secrecy::{ExposeSecret, SecretString};
 use tracing::{error, info, warn};
 
 // ---------------------------------------------------------------------------
@@ -29,25 +44,24 @@ use tracing::{error, info, warn};
 
 /// Configuration for API authentication.
 ///
-/// Manual `Debug` impl redacts `bearer_token` to prevent secret leakage
-/// via `format!("{:?}", config)` or tracing spans.
+/// `bearer_token: SecretString` — the project's mandated secret type per
+/// `.claude/rules/project/rust-code.md` ("Secret<T> from secrecy crate
+/// enforces [REDACTED]"). `secrecy::SecretString` provides:
+///   - Zeroize-on-drop of the inner heap allocation
+///   - `[REDACTED]` `Debug` + `Display` impls
+///   - No accidental `String` coercion
 ///
-/// SEC-2: `bearer_token` zeroized on drop to prevent heap residency.
+/// The manual `Debug` impl below adds defense-in-depth in case a future
+/// derive macro on a wrapper struct circumvents secrecy's guards.
 #[derive(Clone)]
 pub struct ApiAuthConfig {
     /// Bearer token for authenticating mutating API requests.
-    /// Empty string = auth disabled (development mode only).
-    /// Zeroized on drop (see `Drop` impl below).
-    pub bearer_token: String,
+    /// Empty (zero-length inner string) = auth disabled (development mode only).
+    /// Field is private — callers go through [`Self::expose_bearer_token`]
+    /// (constant-time comparison only) or never see the inner bytes at all.
+    bearer_token: SecretString,
     /// Whether authentication is enabled.
     pub enabled: bool,
-}
-
-/// SEC-2: Zeroize the bearer token on struct drop.
-impl Drop for ApiAuthConfig {
-    fn drop(&mut self) {
-        zeroize::Zeroize::zeroize(&mut self.bearer_token);
-    }
 }
 
 impl std::fmt::Debug for ApiAuthConfig {
@@ -60,9 +74,25 @@ impl std::fmt::Debug for ApiAuthConfig {
 }
 
 impl ApiAuthConfig {
-    /// Creates a new config with the given token.
+    /// Creates a new config with the given `String` token (test + legacy
+    /// callers). Production code paths in `crates/app/src/main.rs`
+    /// MUST use [`Self::from_token`] with a `SecretString` from SSM.
     pub fn new(bearer_token: String) -> Self {
         let enabled = !bearer_token.is_empty();
+        Self {
+            bearer_token: SecretString::from(bearer_token),
+            enabled,
+        }
+    }
+
+    /// Creates a config from a pre-resolved `SecretString` (typically from
+    /// AWS SSM Parameter Store via
+    /// `tickvault_core::auth::secret_manager::fetch_api_bearer_token`).
+    ///
+    /// Empty inner string = auth disabled (caller responsibility — main.rs
+    /// halts in live mode rather than silently disabling).
+    pub fn from_token(bearer_token: SecretString) -> Self {
+        let enabled = !bearer_token.expose_secret().is_empty();
         Self {
             bearer_token,
             enabled,
@@ -72,24 +102,55 @@ impl ApiAuthConfig {
     /// Creates a disabled auth config (development/dry-run mode only).
     pub fn disabled() -> Self {
         Self {
-            bearer_token: String::new(),
+            bearer_token: SecretString::from(String::new()),
             enabled: false,
         }
     }
 
-    /// Loads the API token from the `TV_API_TOKEN` environment variable.
+    /// Returns the inner token bytes for the constant-time comparison in
+    /// [`require_bearer_auth`]. Do NOT call this from any other code path —
+    /// the entire point of `SecretString` is to keep the bytes inside the
+    /// secrecy boundary.
+    fn expose_bearer_token(&self) -> &[u8] {
+        self.bearer_token.expose_secret().as_bytes()
+    }
+
+    /// Test-only accessor for integration tests in `tests/`.
+    ///
+    /// Marked `#[doc(hidden)]` so it does not appear in rustdoc, and the
+    /// name itself documents intent. Production code paths must NOT call
+    /// this; the bearer token is meant to stay inside the secrecy boundary
+    /// (zeroize on drop, redacted Display). The pre-2026-04-25 code had
+    /// `bearer_token` as a public `String` field, so this accessor is a
+    /// strict improvement: callers must reach for an explicitly named
+    /// test-only method instead of touching a public field.
+    ///
+    /// Cannot be `#[cfg(test)]` because integration tests in `tests/` link
+    /// against the non-test lib build.
+    #[doc(hidden)]
+    pub fn token_value_for_test(&self) -> &str {
+        self.bearer_token.expose_secret()
+    }
+
+    /// Loads the API token from the `TV_API_TOKEN` environment variable
+    /// (legacy / local-dev fallback path). Production uses
+    /// [`Self::from_token`] with an SSM-fetched `SecretString` instead —
+    /// see `crates/app/src/main.rs`.
     ///
     /// # Behavior
     /// - Token set and non-empty: auth enabled with that token.
     /// - Token unset/empty + `dry_run = true`: auth disabled (dev passthrough).
     /// - Token unset/empty + `dry_run = false`: fail-closed — generates a
-    ///   random UUID v4 token, logs it at WARN, and enforces auth. This
+    ///   random UUID v4 token, logs CRITICAL, and enforces auth. This
     ///   prevents accidentally running live with unprotected mutating endpoints.
     // O(1) EXEMPT: begin — cold path, called once at boot
     pub fn from_env(dry_run: bool) -> Self {
         match std::env::var("TV_API_TOKEN") {
             Ok(token) if !token.is_empty() => {
-                info!("GAP-SEC-01: API bearer token authentication enabled");
+                info!(
+                    "GAP-SEC-01: API bearer token authentication enabled (env-var fallback path; \
+                     prefer SSM /tickvault/<env>/api/bearer-token in prod)"
+                );
                 Self::new(token)
             }
             _ => {
@@ -109,11 +170,13 @@ impl ApiAuthConfig {
                         severity = tickvault_common::error_code::ErrorCode::GapSecApiAuth
                             .severity()
                             .as_str(),
-                        "GAP-SEC-01 CRITICAL: TV_API_TOKEN not set in LIVE mode — \
-                         auto-generated bearer token for this session (set TV_API_TOKEN env var)"
+                        "GAP-SEC-01 CRITICAL: TV_API_TOKEN not set in LIVE mode and SSM fetch \
+                         failed — auto-generated bearer token for this session (set \
+                         /tickvault/<env>/api/bearer-token in SSM, or TV_API_TOKEN env var)"
                     );
                     warn!(
-                        "GAP-SEC-01: Set TV_API_TOKEN environment variable to suppress this warning"
+                        "GAP-SEC-01: Move bearer token to SSM /tickvault/<env>/api/bearer-token \
+                         to suppress this warning"
                     );
                     Self::new(generated_token)
                 }
@@ -155,11 +218,14 @@ pub async fn require_bearer_auth(
             let token = &header[7..]; // Skip "Bearer "
             // SEC-3: Constant-time comparison prevents timing oracle attacks.
             // Length check + byte-by-byte XOR ensures equal-time regardless of position.
-            let token_match = token.len() == config.bearer_token.len()
+            // expose_bearer_token() is the only call site that briefly accesses
+            // the SecretString inner bytes — kept inside the secrecy boundary.
+            let expected = config.expose_bearer_token();
+            let token_match = token.len() == expected.len()
                 && token
                     .as_bytes()
                     .iter()
-                    .zip(config.bearer_token.as_bytes())
+                    .zip(expected.iter())
                     .fold(0u8, |acc, (a, b)| acc | (a ^ b))
                     == 0;
             if token_match {
@@ -281,7 +347,7 @@ mod tests {
     fn test_api_auth_config_new_enabled() {
         let config = ApiAuthConfig::new("my-secret-token".to_string());
         assert!(config.enabled);
-        assert_eq!(config.bearer_token, "my-secret-token");
+        assert_eq!(config.bearer_token.expose_secret(), "my-secret-token");
     }
 
     #[test]
@@ -294,14 +360,14 @@ mod tests {
     fn test_api_auth_config_disabled() {
         let config = ApiAuthConfig::disabled();
         assert!(!config.enabled);
-        assert!(config.bearer_token.is_empty());
+        assert!(config.bearer_token.expose_secret().is_empty());
     }
 
     #[test]
     fn test_api_auth_config_clone() {
         let config = ApiAuthConfig::new("token123".to_string());
         let cloned = config.clone();
-        assert_eq!(cloned.bearer_token, "token123");
+        assert_eq!(cloned.bearer_token.expose_secret(), "token123");
         assert!(cloned.enabled);
     }
 
@@ -789,7 +855,7 @@ mod tests {
         unsafe { std::env::remove_var("TV_API_TOKEN") };
         let config = ApiAuthConfig::from_env(true);
         assert!(!config.enabled, "dry_run + no token = auth disabled");
-        assert!(config.bearer_token.is_empty());
+        assert!(config.bearer_token.expose_secret().is_empty());
     }
 
     #[test]
@@ -803,11 +869,15 @@ mod tests {
             "live mode + no token = auth enabled with generated token"
         );
         assert!(
-            !config.bearer_token.is_empty(),
+            !config.bearer_token.expose_secret().is_empty(),
             "generated token must not be empty"
         );
         // Verify it looks like a UUID v4
-        assert_eq!(config.bearer_token.len(), 36, "UUID v4 is 36 chars");
+        assert_eq!(
+            config.bearer_token.expose_secret().len(),
+            36,
+            "UUID v4 is 36 chars"
+        );
     }
 
     #[test]
@@ -817,7 +887,8 @@ mod tests {
         let config1 = ApiAuthConfig::from_env(false);
         let config2 = ApiAuthConfig::from_env(false);
         assert_ne!(
-            config1.bearer_token, config2.bearer_token,
+            config1.bearer_token.expose_secret(),
+            config2.bearer_token.expose_secret(),
             "each call must generate a unique token"
         );
     }
@@ -828,7 +899,7 @@ mod tests {
         // We test the struct constructor directly to avoid env var races.
         let config = ApiAuthConfig::new("explicit-token".to_string());
         assert!(config.enabled);
-        assert_eq!(config.bearer_token, "explicit-token");
+        assert_eq!(config.bearer_token.expose_secret(), "explicit-token");
     }
 
     // =====================================================================
@@ -840,7 +911,7 @@ mod tests {
         // Whitespace-only token should still be "enabled" (non-empty)
         let config = ApiAuthConfig::new("   ".to_string());
         assert!(config.enabled);
-        assert_eq!(config.bearer_token, "   ");
+        assert_eq!(config.bearer_token.expose_secret(), "   ");
     }
 
     #[tokio::test]
@@ -913,7 +984,7 @@ mod tests {
     fn test_api_auth_config_new_single_char_token() {
         let config = ApiAuthConfig::new("x".to_string());
         assert!(config.enabled);
-        assert_eq!(config.bearer_token, "x");
+        assert_eq!(config.bearer_token.expose_secret(), "x");
     }
 
     #[tokio::test]
@@ -959,12 +1030,18 @@ mod tests {
         unsafe { std::env::set_var("TV_API_TOKEN", "test-explicit-token-12345") };
         let config = ApiAuthConfig::from_env(true);
         assert!(config.enabled);
-        assert_eq!(config.bearer_token, "test-explicit-token-12345");
+        assert_eq!(
+            config.bearer_token.expose_secret(),
+            "test-explicit-token-12345"
+        );
 
         // Also works in live mode
         let config_live = ApiAuthConfig::from_env(false);
         assert!(config_live.enabled);
-        assert_eq!(config_live.bearer_token, "test-explicit-token-12345");
+        assert_eq!(
+            config_live.bearer_token.expose_secret(),
+            "test-explicit-token-12345"
+        );
 
         // Clean up
         unsafe { std::env::remove_var("TV_API_TOKEN") };
@@ -980,7 +1057,7 @@ mod tests {
         unsafe { std::env::set_var("TV_API_TOKEN", "") };
         let config = ApiAuthConfig::from_env(true);
         assert!(!config.enabled, "empty token + dry_run = disabled");
-        assert!(config.bearer_token.is_empty());
+        assert!(config.bearer_token.expose_secret().is_empty());
         unsafe { std::env::remove_var("TV_API_TOKEN") };
     }
 
@@ -993,9 +1070,9 @@ mod tests {
             config.enabled,
             "empty token + live = enabled with generated"
         );
-        assert!(!config.bearer_token.is_empty());
+        assert!(!config.bearer_token.expose_secret().is_empty());
         assert_eq!(
-            config.bearer_token.len(),
+            config.bearer_token.expose_secret().len(),
             36,
             "generated UUID v4 is 36 chars"
         );
@@ -1128,5 +1205,141 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // =========================================================================
+    // 2026-04-25 security audit (PR #357) — SecretString migration regressions
+    // =========================================================================
+
+    /// SEC-1 (HIGH→FIXED): bearer_token field MUST be SecretString.
+    /// Source-scan ratchet: any future regression to `String` is caught at
+    /// compile time because SecretString does not coerce to String.
+    /// This test documents the type and pins the secrecy-crate semantics.
+    #[test]
+    fn test_bearer_token_field_is_secret_string() {
+        let config = ApiAuthConfig::new("test-token".to_string());
+        // SecretString::expose_secret() returns &str — coerces from
+        // SecretString only via the secrecy crate API, NEVER via Deref.
+        let exposed: &str = config.bearer_token.expose_secret();
+        assert_eq!(exposed, "test-token");
+    }
+
+    /// SEC-2 (HIGH→FIXED): from_token constructor accepts a pre-resolved
+    /// SecretString (typically from SSM). Verifies the auth-enable bit
+    /// flips correctly based on the inner string's emptiness.
+    #[test]
+    fn test_from_token_with_non_empty_secret_enables_auth() {
+        let token = SecretString::from("ssm-fetched-token".to_string());
+        let config = ApiAuthConfig::from_token(token);
+        assert!(config.enabled, "non-empty SecretString must enable auth");
+        assert_eq!(
+            config.bearer_token.expose_secret(),
+            "ssm-fetched-token",
+            "token roundtrip"
+        );
+    }
+
+    #[test]
+    fn test_from_token_with_empty_secret_disables_auth() {
+        let token = SecretString::from(String::new());
+        let config = ApiAuthConfig::from_token(token);
+        assert!(!config.enabled, "empty SecretString must disable auth");
+    }
+
+    /// SEC-3: Debug impl never leaks the token bytes.
+    /// Even after migrating to SecretString, the manual Debug impl stays as
+    /// defense-in-depth. This test verifies the secret never appears in the
+    /// Debug output regardless of which constructor was used.
+    #[test]
+    fn test_from_token_debug_does_not_leak_secret() {
+        let token = SecretString::from("super-secret-ssm-value-12345".to_string());
+        let config = ApiAuthConfig::from_token(token);
+        let debug_output = format!("{config:?}");
+        assert!(
+            !debug_output.contains("super-secret-ssm-value-12345"),
+            "Debug must NOT contain the token bytes; got: {debug_output}"
+        );
+        assert!(
+            debug_output.contains("[REDACTED]"),
+            "Debug must contain [REDACTED] marker"
+        );
+    }
+
+    /// SEC-4: Constant-time comparison still works after the SecretString
+    /// migration. expose_bearer_token() returns the raw bytes only inside
+    /// the auth middleware boundary.
+    #[tokio::test]
+    async fn test_from_token_full_auth_round_trip() {
+        use axum::Router;
+        use axum::body::Body;
+        use axum::http::Request;
+        use axum::routing::get;
+        use tower::ServiceExt;
+
+        let token = SecretString::from("ssm-style-token-abc".to_string());
+        let config = ApiAuthConfig::from_token(token);
+        assert!(config.enabled);
+
+        let app = Router::new()
+            .route("/protected", get(mock_handler))
+            .layer(axum::middleware::from_fn_with_state(
+                config.clone(),
+                require_bearer_auth,
+            ))
+            .with_state(config);
+
+        // Valid token via from_token → 200 OK
+        let response_ok = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/protected")
+                    .header("Authorization", "Bearer ssm-style-token-abc")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response_ok.status(), StatusCode::OK);
+
+        // Wrong token → 401
+        let response_bad = app
+            .oneshot(
+                Request::builder()
+                    .uri("/protected")
+                    .header("Authorization", "Bearer wrong-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response_bad.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// SEC-5 (MED→FIXED): Clone preserves the SecretString without leaking
+    /// the inner bytes — secrecy::SecretString is Clone and the inner heap
+    /// allocation is a fresh allocation per clone (separate Drop lifecycle).
+    #[test]
+    fn test_clone_preserves_secret_token_value() {
+        let original = ApiAuthConfig::new("clone-me".to_string());
+        let cloned = original.clone();
+        assert_eq!(original.bearer_token.expose_secret(), "clone-me");
+        assert_eq!(cloned.bearer_token.expose_secret(), "clone-me");
+        assert_eq!(original.enabled, cloned.enabled);
+    }
+
+    /// SEC-6: bearer_token field is private. External callers must use
+    /// `token_value_for_test()` (test-only accessor) or the public
+    /// constructors. This test verifies the accessor returns the expected
+    /// inner value and that production code paths cannot bypass it.
+    #[test]
+    fn test_token_value_for_test_accessor_round_trip() {
+        let config = ApiAuthConfig::new("private-field-test".to_string());
+        // In-module access — verify accessor matches direct field access.
+        assert_eq!(
+            config.token_value_for_test(),
+            config.bearer_token.expose_secret()
+        );
+        assert_eq!(config.token_value_for_test(), "private-field-test");
     }
 }

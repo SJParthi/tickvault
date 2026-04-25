@@ -334,6 +334,49 @@ pub async fn fetch_telegram_credentials() -> Result<TelegramCredentials, Applica
     Ok(TelegramCredentials { bot_token, chat_id })
 }
 
+/// Fetches the API bearer token from AWS SSM Parameter Store.
+///
+/// Returns `SecretString` (zeroize on drop, `[REDACTED]` Display).
+///
+/// 2026-04-25 security audit (PR #357 follow-up): the API bearer token
+/// was previously read from a process env var (`TV_API_TOKEN`) which is
+/// plaintext on disk in Docker `environment:` blocks and visible via
+/// `docker inspect` / `/proc/<pid>/environ`. Project mandate per
+/// `.claude/rules/project/rust-code.md` is "All secrets from AWS SSM
+/// Parameter Store". This function moves the bearer token to the same
+/// SSM source as Dhan, QuestDB, Grafana, and Telegram credentials.
+///
+/// SSM path: `/tickvault/<env>/api/bearer-token`
+///
+/// # Errors
+///
+/// Returns `ApplicationError::SecretRetrieval` if the secret cannot be
+/// fetched. Callers in `crates/app/src/main.rs` are expected to fall
+/// back to the legacy env-var path (with a WARN) for local dev where
+/// AWS credentials may be absent, and to halt with CRITICAL in live mode.
+#[instrument(skip_all, fields(environment))]
+pub async fn fetch_api_bearer_token() -> Result<SecretString, ApplicationError> {
+    use tickvault_common::constants::{API_BEARER_TOKEN_SECRET, SSM_API_SERVICE};
+
+    let environment = resolve_environment()?;
+    tracing::Span::current().record("environment", environment.as_str());
+
+    let ssm_client = create_ssm_client().await;
+
+    let bearer_token_path = build_ssm_path(&environment, SSM_API_SERVICE, API_BEARER_TOKEN_SECRET);
+
+    info!(
+        bearer_token_path = %bearer_token_path,
+        "fetching API bearer token from SSM"
+    );
+
+    let bearer_token = fetch_secret(&ssm_client, &bearer_token_path).await?;
+
+    info!("API bearer token fetched successfully from SSM");
+
+    Ok(bearer_token)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -578,6 +621,69 @@ mod tests {
             build_ssm_path("prod", SSM_GRAFANA_SERVICE, GRAFANA_ADMIN_PASSWORD_SECRET),
             "/tickvault/prod/grafana/admin-password"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // 2026-04-25 security audit: API bearer token SSM path
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_ssm_path_api_bearer_token_dev() {
+        use tickvault_common::constants::{API_BEARER_TOKEN_SECRET, SSM_API_SERVICE};
+        assert_eq!(
+            build_ssm_path("dev", SSM_API_SERVICE, API_BEARER_TOKEN_SECRET),
+            "/tickvault/dev/api/bearer-token"
+        );
+    }
+
+    #[test]
+    fn test_build_ssm_path_api_bearer_token_prod() {
+        use tickvault_common::constants::{API_BEARER_TOKEN_SECRET, SSM_API_SERVICE};
+        assert_eq!(
+            build_ssm_path("prod", SSM_API_SERVICE, API_BEARER_TOKEN_SECRET),
+            "/tickvault/prod/api/bearer-token"
+        );
+    }
+
+    /// Smoke: SSM_API_SERVICE constant is non-empty + lowercase + matches
+    /// the project's existing service-name convention (alpha + hyphen).
+    #[test]
+    fn test_ssm_api_service_constant_is_well_formed() {
+        use tickvault_common::constants::SSM_API_SERVICE;
+        assert!(
+            !SSM_API_SERVICE.is_empty(),
+            "SSM_API_SERVICE must not be empty"
+        );
+        assert!(
+            SSM_API_SERVICE
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c == '-'),
+            "SSM_API_SERVICE must be ascii-lowercase + hyphens, got {}",
+            SSM_API_SERVICE
+        );
+    }
+
+    /// fetch_api_bearer_token must error without real SSM connectivity in
+    /// the same way the other fetch helpers do (matches fetch_secret error
+    /// surface). Asserts the typed error variant for downstream pattern
+    /// matching in main.rs.
+    #[tokio::test]
+    async fn test_fetch_api_bearer_token_errors_without_real_ssm() {
+        let result = fetch_api_bearer_token().await;
+        assert!(
+            result.is_err(),
+            "fetch_api_bearer_token must fail without real SSM connectivity"
+        );
+        match result.err().unwrap() {
+            ApplicationError::SecretRetrieval { path, .. } => {
+                assert!(
+                    path.contains("/api/bearer-token"),
+                    "error path must include /api/bearer-token, got {}",
+                    path
+                );
+            }
+            other => panic!("expected SecretRetrieval error, got {:?}", other),
+        }
     }
 
     // -----------------------------------------------------------------------

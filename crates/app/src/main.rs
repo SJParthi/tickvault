@@ -83,7 +83,11 @@ use tickvault_storage::tick_persistence::{
 
 use tickvault_trading::greeks::inline_computer::InlineGreeksComputer;
 
-use tickvault_api::build_router;
+// `build_router` was the legacy entry point; both boot paths now use
+// `build_router_with_auth` directly with an SSM-resolved `ApiAuthConfig`
+// per the 2026-04-25 security audit (PR #357). Import remains commented
+// for one release cycle so the legacy wrapper is easy to revive if needed.
+// use tickvault_api::build_router;
 use tickvault_api::state::{SharedAppState, SharedHealthStatus, SystemHealthStatus};
 
 // Constants are in boot_helpers module (lib.rs) for coverage instrumentation.
@@ -1332,10 +1336,31 @@ async fn main() -> Result<()> {
             health_status,
         );
 
-        let router = build_router(
+        // 2026-04-25 security audit (PR #357): SSM-first bearer token resolution
+        // (mirrors the slow-boot path below, line ~4250). Fast-boot uses the
+        // same SSM path so both paths have identical secret-handling semantics.
+        let api_auth_config_fast =
+            match tickvault_core::auth::secret_manager::fetch_api_bearer_token().await {
+                Ok(token) => {
+                    info!(
+                        "GAP-SEC-01 (fast boot): API bearer token loaded from SSM \
+                         (/tickvault/<env>/api/bearer-token)"
+                    );
+                    tickvault_api::middleware::ApiAuthConfig::from_token(token)
+                }
+                Err(err) => {
+                    warn!(
+                        ?err,
+                        "GAP-SEC-01 (fast boot): SSM fetch failed; falling back to \
+                         TV_API_TOKEN env var"
+                    );
+                    tickvault_api::middleware::ApiAuthConfig::from_env(config.strategy.dry_run)
+                }
+            };
+        let router = tickvault_api::build_router_with_auth(
             api_state,
             &config.api.allowed_origins,
-            config.strategy.dry_run,
+            api_auth_config_fast,
         );
         let bind_addr: SocketAddr = format_bind_addr(&config.api.host, config.api.port)
             .parse()
@@ -4242,10 +4267,34 @@ async fn main() -> Result<()> {
         None => api_state,
     };
 
-    let router = build_router(
+    // 2026-04-25 security audit (PR #357): API bearer token is now sourced
+    // from AWS SSM Parameter Store (`/tickvault/<env>/api/bearer-token`) per
+    // `.claude/rules/project/rust-code.md` ("All secrets from AWS SSM").
+    // Resolution order: SSM → TV_API_TOKEN env var (with WARN) → dry_run/live
+    // fallback in `ApiAuthConfig::from_env`.
+    let api_auth_config = match tickvault_core::auth::secret_manager::fetch_api_bearer_token().await
+    {
+        Ok(token) => {
+            info!(
+                "GAP-SEC-01: API bearer token loaded from SSM \
+                 (/tickvault/<env>/api/bearer-token)"
+            );
+            tickvault_api::middleware::ApiAuthConfig::from_token(token)
+        }
+        Err(err) => {
+            warn!(
+                ?err,
+                "GAP-SEC-01: SSM fetch for API bearer token failed; falling back to \
+                 TV_API_TOKEN env var (acceptable for local dev, NOT for prod)"
+            );
+            tickvault_api::middleware::ApiAuthConfig::from_env(config.strategy.dry_run)
+        }
+    };
+
+    let router = tickvault_api::build_router_with_auth(
         api_state,
         &config.api.allowed_origins,
-        config.strategy.dry_run,
+        api_auth_config,
     );
 
     let bind_addr: SocketAddr = format_bind_addr(&config.api.host, config.api.port)
