@@ -4,6 +4,81 @@
 > **Scope:** Any file touching main WebSocket connection pool, subscription planning, or instrument distribution.
 > **Ground truth:** `docs/dhan-ref/03-live-market-feed-websocket.md`, `docs/dhan-ref/08-annexure-enums.md`
 
+## 2026-04-25 Updates — F&O Universe Rebuild (3-index policy + 4-mode boot)
+
+Mandatory for any new subscription/boot work. Shipped on branch
+`claude/build-fno-universe-Tlb9d`:
+
+### Subscription scope (the new universe)
+
+| Slot | Subscription | Mode | Count |
+|---|---|---|---|
+| Index values IDX_I | NIFTY=13, BANKNIFTY=25, SENSEX=51 | Ticker | 3 |
+| Display indices | sectoral + INDIA VIX | Ticker | 26 |
+| Cash equities NSE_EQ | one per F&O stock | Quote/Full | ~216 |
+| Index F&O — full current expiry | NIFTY + BANKNIFTY + SENSEX | Quote/Full | ~2,037 |
+| Stock F&O — ATM±25 of current expiry | 216 stocks × 51 CE + 51 PE + 1 FUT | Quote/Full | ~22,042 |
+| **TOTAL** | verified live 2026-04-25 | | **~24,324** ≤ 25,000 |
+
+### What changed vs pre-2026-04-25
+
+| Old (≤ 5 indices) | New (3 indices) |
+|---|---|
+| FINNIFTY + MIDCPNIFTY full chain | DROPPED entirely |
+| Index F&O all expiries | Current expiry only (per index) |
+| Stock F&O Stage 1 ATM±N + Stage 2 progressive fill | Stage 1 ATM±25 only (Stage 2 still wired but rarely fires) |
+| Greeks pipeline `MAX_UNDERLYINGS = 4` | `MAX_UNDERLYINGS = 3` (NIFTY/BANKNIFTY/SENSEX) |
+| Spot updater handled 4 indices via inline match | Uses `classify_tick_for_spot_update` helper + adds NSE_EQ cash equities for 216 F&O stocks |
+
+### 4-mode bootstrap (`crates/core/src/instrument/boot_mode.rs`)
+
+| Mode | IST window | Stock-ATM source | Latency to full subscribe |
+|---|---|---|---|
+| **PreMarket** | < 09:00 | Pre-open buffer (09:00–09:12) | At 09:13:00 |
+| **MidPreMarket** | 09:00–09:13 | Partial buffer + REST at 09:12:55 | At 09:13:00 |
+| **MidMarket** | 09:13–15:30 | **Live cash-equity ticks** (primary) → REST stragglers → QuestDB last resort | ~30s after boot |
+| **PostMarket** | 15:30–next 09:00 | QuestDB previous close | At boot |
+
+Mode is detected by `detect_boot_mode(now_ist_secs_of_day)` — a pure
+function with 21 unit tests covering every minute boundary.
+
+### Live-tick ATM resolver (`live_tick_atm_resolver.rs`)
+
+- **Primary source for Mode C** — polls `SharedSpotPrices` at 5/10/15/20/25s
+  intervals; exits early when all 216 F&O stocks have ticked.
+- **Stragglers fall through** to existing `preopen_rest_fallback`
+  (`/v2/marketfeed/ltp`) and finally to QuestDB previous close.
+- **`SharedSpotPrices` is now populated for cash equities too** — the
+  spot updater spawn at `main.rs:2087` now uses
+  `classify_tick_for_spot_update` and writes both IDX_I and NSE_EQ ticks.
+
+### New constants (in `crates/common/src/constants.rs`)
+
+- `STOCK_OPTION_ATM_STRIKES_EACH_SIDE = 25` — NSE 20% circuit covers ATM±25
+- `MAX_TOTAL_SUBSCRIPTIONS_TARGET = 24_500` — warn threshold (hard cap stays 25K)
+
+### New notification event
+
+- `MidMarketBootComplete { stocks_live_tick, stocks_rest, stocks_quest_db,
+  stocks_skipped, total_subscribed, latency_ms }` — Severity::Info, fires
+  once after Mode C resolution completes.
+
+### Ratchet tests added
+
+| Test | File | Pins |
+|---|---|---|
+| `test_full_chain_index_symbols_is_exactly_three` | `constants.rs` | 3-index policy |
+| `test_stock_option_atm_strikes_each_side_is_25` | `constants.rs` | Stock cap |
+| `test_max_total_subscriptions_target_below_hard_limit` | `constants.rs` | Capacity targets |
+| `test_only_three_indices_in_full_chain_set` | `subscription_planner.rs` | Same as above (planner-side) |
+| `test_finnifty_midcpnifty_dropped_from_index_set` | `subscription_planner.rs` | Hard regression block |
+| `test_index_derivatives_use_current_expiry_only` | `subscription_planner.rs` | Far-month exclusion |
+| `test_total_subscription_count_below_25k_hard_limit` | `subscription_planner.rs` | Capacity assertion |
+| `test_boot_mode_*_at_*` (15 tests) | `boot_mode.rs` | Time partition |
+| `test_partition_*` + `test_resolver_*` (29 tests) | `live_tick_atm_resolver.rs` | Mode C resolver |
+| `test_classify_*` (8 tests) | `live_tick_atm_resolver.rs` | Tick→symbol classification |
+| `test_midmarket_boot_complete_*` (2 tests) | `events.rs` | Telegram event |
+
 ## 2026-04-24 Updates (PR #337)
 
 Applies to Phase 2 scheduler + main-feed reconnect path:

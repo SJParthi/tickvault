@@ -8,6 +8,7 @@
 //! Config -> **Instrument Download -> Universe Build** -> Auth -> WebSocket
 
 pub mod binary_cache;
+pub mod boot_mode;
 pub mod csv_downloader;
 pub mod csv_parser;
 pub mod daily_scheduler;
@@ -16,6 +17,7 @@ pub mod depth_rebalancer;
 pub mod depth_strike_selector;
 pub mod diagnostic;
 pub mod instrument_loader;
+pub mod live_tick_atm_resolver;
 pub mod phase2_delta;
 pub mod phase2_scheduler;
 pub mod preopen_price_buffer;

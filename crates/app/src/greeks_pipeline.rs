@@ -46,8 +46,11 @@ use tickvault_trading::greeks::pcr::{classify_pcr, compute_pcr};
 const MATCH_EPSILON: f64 = EXACT_MATCH_EPSILON;
 
 /// Underlyings to fetch option chain for.
-/// Uses first 4 from VALIDATION_MUST_EXIST_INDICES (NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY).
-const MAX_UNDERLYINGS: usize = 4;
+///
+/// 2026-04-25: Uses first 3 from VALIDATION_MUST_EXIST_INDICES — NIFTY,
+/// BANKNIFTY, SENSEX. FINNIFTY and MIDCPNIFTY were dropped from the F&O
+/// universe to free 25K WebSocket capacity for stock F&O ATM±25 coverage.
+const MAX_UNDERLYINGS: usize = 3;
 
 /// Exchange segment for index underlyings (option chain API).
 const INDEX_SEGMENT: &str = "IDX_I";

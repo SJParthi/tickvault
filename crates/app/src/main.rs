@@ -2084,30 +2084,55 @@ async fn main() -> Result<()> {
     if should_connect_ws {
         let spot_prices_updater = std::sync::Arc::clone(&shared_spot_prices);
         let mut spot_rx = tick_broadcast_sender.subscribe();
+
+        // 2026-04-25: Spot updater now also captures NSE_EQ cash-equity LTPs
+        // for the 216 F&O stocks. This is the LIVE-tick source consumed by
+        // the Mode C live-tick ATM resolver (mid-market boots). Index lookup
+        // includes only the 3 full-chain indices (NIFTY/BANKNIFTY/SENSEX);
+        // FINNIFTY/MIDCPNIFTY were dropped 2026-04-25.
+        let index_lookup =
+            tickvault_core::instrument::live_tick_atm_resolver::build_full_chain_index_lookup();
+        // Build NSE_EQ stock lookup from the F&O universe: price_feed_security_id → underlying_symbol.
+        // APPROVED: I-P1-11 — `stock_lookup_map` is single-segment NSE_EQ by construction (only F&O stock underlyings inserted).
+        let stock_lookup_map: std::collections::HashMap<u32, String> = slow_boot_universe
+            .as_ref()
+            .map(|u| {
+                u.underlyings
+                    .values()
+                    .filter(|ul| {
+                        matches!(
+                            ul.kind,
+                            tickvault_common::instrument_types::UnderlyingKind::Stock
+                        ) && matches!(
+                            ul.price_feed_segment,
+                            tickvault_common::types::ExchangeSegment::NseEquity
+                        )
+                    })
+                    .map(|ul| (ul.price_feed_security_id, ul.underlying_symbol.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let cash_equity_count = stock_lookup_map.len();
         tokio::spawn(async move {
             loop {
                 match spot_rx.recv().await {
                     Ok(tick) => {
-                        // IDX_I segment code = 0 — index ticks carry the spot price
-                        if tick.exchange_segment_code == 0
-                            && tick.last_traded_price > 0.0
-                            && tick.last_traded_price.is_finite()
+                        if let Some(sym) =
+                            tickvault_core::instrument::live_tick_atm_resolver::classify_tick_for_spot_update(
+                                tick.security_id,
+                                tick.exchange_segment_code,
+                                tick.last_traded_price,
+                                &index_lookup,
+                                &stock_lookup_map,
+                            )
                         {
-                            let symbol = match tick.security_id {
-                                13 => Some("NIFTY"),
-                                25 => Some("BANKNIFTY"),
-                                27 => Some("FINNIFTY"),
-                                442 => Some("MIDCPNIFTY"),
-                                _ => None,
-                            };
-                            if let Some(sym) = symbol {
-                                tickvault_core::instrument::depth_rebalancer::update_spot_price(
-                                    &spot_prices_updater,
-                                    sym,
-                                    f64::from(tick.last_traded_price),
-                                )
-                                .await;
-                            }
+                            tickvault_core::instrument::depth_rebalancer::update_spot_price(
+                                &spot_prices_updater,
+                                sym,
+                                f64::from(tick.last_traded_price),
+                            )
+                            .await;
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
@@ -2115,13 +2140,16 @@ async fn main() -> Result<()> {
                 }
             }
         });
-        info!("spot price updater started — capturing index LTPs for depth ATM selection");
+        info!(
+            cash_equities = cash_equity_count,
+            "spot price updater started — capturing index + cash-equity LTPs (Mode C live-tick ATM source)"
+        );
     }
 
     // -----------------------------------------------------------------------
     // Step 8c: Spawn 20-level + 200-level depth WebSocket connections
     // -----------------------------------------------------------------------
-    // 20-level: 4 connections (NIFTY, BANKNIFTY, FINNIFTY, MIDCPNIFTY), 49 instruments each
+    // 20-level: 2 connections (NIFTY, BANKNIFTY), 49 instruments each (2026-04-25: FINNIFTY + MIDCPNIFTY dropped)
     //   = ATM + 24 CE above + 24 PE below (nearest expiry only)
     // 200-level: 2 underlyings (NIFTY, BANKNIFTY), 1 ATM CE + 1 ATM PE each
     //   (nearest expiry only)
@@ -2148,7 +2176,11 @@ async fn main() -> Result<()> {
     // O(1) EXEMPT: begin — boot-time depth connection setup
     if should_connect_ws && config.subscription.enable_twenty_depth {
         if let Some(ref _plan) = subscription_plan {
-            let depth_underlyings = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"];
+            // 2026-04-25: Reduced from 4 to 2. FINNIFTY + MIDCPNIFTY were
+            // dropped to free 25K main-feed WS capacity for stock F&O ATM±25.
+            // 20-level depth only on NIFTY + BANKNIFTY now; SENSEX is BSE
+            // (no Dhan depth endpoint).
+            let depth_underlyings = ["NIFTY", "BANKNIFTY"];
 
             // Option C v2 (2026-04-17, Parthiban feedback): do NOT treat all
             // 4 underlyings equally. NIFTY + BANKNIFTY are MANDATORY (they
@@ -2170,7 +2202,14 @@ async fn main() -> Result<()> {
             // original 5-minute hard cap still applies (correct behaviour —
             // a genuinely degraded main feed mid-market is a real problem).
             const MANDATORY_UNDERLYINGS: &[&str] = &["NIFTY", "BANKNIFTY"];
-            const OPTIONAL_UNDERLYINGS: &[&str] = &["FINNIFTY", "MIDCPNIFTY"];
+            // 2026-04-25: FINNIFTY + MIDCPNIFTY were dropped from the F&O
+            // universe — neither IDX_I value nor F&O nor depth-20 is
+            // subscribed for them anymore. Phase B's 30s top-up window
+            // therefore has no symbols to wait for and exits immediately.
+            // Kept as `&[]` (rather than removing Phase B entirely) for
+            // minimal-disruption review; Phase B can be deleted in a
+            // follow-up cleanup PR if no other OPTIONAL indices return.
+            const OPTIONAL_UNDERLYINGS: &[&str] = &[];
             const MANDATORY_WAIT_MARKET_HOURS_SECS: u64 = 300; // 5 min — during session
             const MANDATORY_WAIT_POST_MARKET_SECS: u64 = 10; // 10 s — off-hours boot
             const OPTIONAL_WAIT_SECS: u64 = 30;
@@ -2278,7 +2317,8 @@ async fn main() -> Result<()> {
                     if have_all {
                         info!(
                             underlyings = ?depth_underlyings,
-                            "depth ATM: all 4 index LTPs present — proceeding"
+                            count = depth_underlyings.len(),
+                            "depth ATM: all index LTPs present — proceeding"
                         );
                         break;
                     }
@@ -3110,7 +3150,9 @@ async fn main() -> Result<()> {
     // Step 8d: Spawn depth rebalancer (monitors spot drift, signals ATM changes)
     // -----------------------------------------------------------------------
     if should_connect_ws && config.subscription.enable_twenty_depth && subscription_plan.is_some() {
-        let depth_underlyings: Vec<String> = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"]
+        // 2026-04-25: Reduced from 4 to 2 — see comment at depth_underlyings
+        // declaration above (Step 8c). FINNIFTY/MIDCPNIFTY dropped.
+        let depth_underlyings: Vec<String> = ["NIFTY", "BANKNIFTY"]
             .iter()
             .map(|s| (*s).to_string())
             .collect(); // O(1) EXEMPT: boot-time vec of 4 strings
@@ -3682,7 +3724,8 @@ async fn main() -> Result<()> {
                         }
                     }
 
-                    let depth_ul: [&str; 4] = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY"];
+                    // 2026-04-25: Reduced 4 → 2. FINNIFTY/MIDCPNIFTY dropped from depth.
+                    let depth_ul: [&str; 2] = ["NIFTY", "BANKNIFTY"];
                     let today = now_ist.date_naive();
                     let selections =
                         tickvault_core::instrument::depth_strike_selector::select_depth_instruments(
