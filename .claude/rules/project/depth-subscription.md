@@ -4,6 +4,49 @@
 > **Scope:** Any file touching depth WebSocket connections, strike selection, rebalancing, or depth persistence.
 > **Ground truth:** `docs/dhan-ref/04-full-market-depth-websocket.md`, `docs/dhan-ref/08-annexure-enums.md`
 
+## 2026-04-25 Updates — F&O Universe Rebuild (3-index policy)
+
+Mandatory for any new depth work. Shipped on branch
+`claude/build-fno-universe-Tlb9d`:
+
+1. **FINNIFTY + MIDCPNIFTY DROPPED ENTIRELY** — neither IDX_I value nor F&O
+   nor depth-20 is subscribed for them anymore. Live count verified
+   2026-04-25 against QuestDB: total subscription with 3 indices full
+   chain + 216 stocks ATM±25 = 24,324 (676 headroom under 25K cap).
+2. **Depth-20 underlyings reduced from 4 → 2.** `crates/app/src/main.rs`
+   lines 2151, 3113, 3685 — all three array literals now `["NIFTY",
+   "BANKNIFTY"]`. SENSEX is BSE (Dhan depth endpoint unsupported), so
+   it gets 5-level depth from main Live Market Feed only.
+3. **Depth-200 underlyings unchanged at 2** (NIFTY + BANKNIFTY).
+4. **Constants:**
+   - `FULL_CHAIN_INDEX_SYMBOLS = ["NIFTY", "BANKNIFTY", "SENSEX"]` (was 5)
+   - `FULL_CHAIN_INDEX_COUNT = 3` (was 5)
+   - `STOCK_OPTION_ATM_STRIKES_EACH_SIDE = 25` (NEW — main-feed stock
+     option cap, NOT depth)
+   - `MAX_TOTAL_SUBSCRIPTIONS_TARGET = 24_500` (NEW — warn threshold)
+   - `VALIDATION_MUST_EXIST_INDICES` reordered: NIFTY, BANKNIFTY, SENSEX
+     are first 3 entries (greeks pipeline slices `[..3]`).
+5. **Pre-open index lookup unchanged** — `PREOPEN_INDEX_UNDERLYINGS`
+   still tracks NIFTY=13 + BANKNIFTY=25 only (no SENSEX yet because
+   SENSEX F&O is full-chain — no ATM math needed for subscription).
+6. **Live-tick ATM resolver added** (`live_tick_atm_resolver.rs`) — Mode
+   C (mid-market boot) primary stock spot source; REST `/marketfeed/ltp`
+   becomes a straggler fallback only.
+7. **`build_full_chain_index_lookup()`** in `live_tick_atm_resolver.rs`
+   contains exactly 3 entries (13/25/51); test
+   `test_build_full_chain_index_lookup_excludes_finnifty_midcpnifty`
+   pins the regression block.
+8. **Greeks pipeline `MAX_UNDERLYINGS = 3`** (was 4) — fetches greeks
+   for NIFTY/BANKNIFTY/SENSEX, no longer FINNIFTY/MIDCPNIFTY.
+9. **Grafana `depth-flow.json` updated** — header text + panel target
+   reflect 2-underlying depth coverage.
+10. **Ratchet tests added (planner):**
+    - `test_only_three_indices_in_full_chain_set`
+    - `test_finnifty_midcpnifty_dropped_from_index_set`
+    - `test_index_derivatives_use_current_expiry_only`
+    - `test_total_subscription_count_below_25k_hard_limit`
+    - `test_stock_options_atm_cap_constant_is_25`
+
 ## 2026-04-24 Updates (PR #337)
 
 Mandatory for any new depth/Phase-2 work. These shipped on branch
