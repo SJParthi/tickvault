@@ -96,10 +96,9 @@ pub async fn ensure_deep_depth_table(questdb_config: &QuestDbConfig) {
     );
     execute_ddl(&client, &base_url, &dedup_sql, "deep_market_depth DEDUP").await;
 
-    // Migration: add exchange_sequence column (idempotent — ADD COLUMN IF NOT EXISTS equivalent).
-    // QuestDB's ALTER TABLE ADD COLUMN is no-op if the column already exists.
+    // Migration: add exchange_sequence column (idempotent via IF NOT EXISTS).
     let seq_col_sql = format!(
-        "ALTER TABLE {} ADD COLUMN exchange_sequence LONG",
+        "ALTER TABLE {} ADD COLUMN IF NOT EXISTS exchange_sequence LONG",
         QUESTDB_TABLE_DEEP_MARKET_DEPTH
     );
     execute_ddl(

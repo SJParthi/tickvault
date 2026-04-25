@@ -99,6 +99,12 @@ const GRAFANA_HOST: &str = LOCAL_HOST;
 /// Grafana HTTP port for TCP reachability probe.
 const GRAFANA_PORT: u16 = 3000;
 
+/// Prometheus HTTP port for TCP reachability probe.
+const PROMETHEUS_PORT: u16 = 9090;
+
+/// Valkey (Redis) port for TCP reachability probe.
+const VALKEY_PORT: u16 = 6379;
+
 /// Grafana dashboard URL (used in tests to validate DASHBOARD_SERVICES consistency).
 #[cfg(test)]
 const GRAFANA_DASHBOARD_URL: &str = "http://localhost:3000";
@@ -109,26 +115,46 @@ const GRAFANA_DASHBOARD_URL: &str = "http://localhost:3000";
 
 /// Ensures Docker infrastructure services are running.
 ///
-/// 1. Probes QuestDB HTTP port — if reachable, returns immediately.
-/// 2. If unreachable, fetches infra credentials from SSM.
-/// 3. Runs `docker compose up -d` with SSM-sourced env vars.
-/// 4. Waits for QuestDB to become healthy (up to 60s).
+/// 1. Probes ALL critical services (QuestDB, Grafana, Prometheus, Valkey).
+///    If every probe succeeds, opens dashboards and returns.
+/// 2. If ANY service is unreachable, fetches infra credentials from SSM.
+/// 3. Runs `docker compose up -d` (idempotent — only starts missing/stopped
+///    containers, leaves running ones alone).
+/// 4. Waits for QuestDB and Grafana to become healthy.
 ///
 /// Best-effort: if Docker or SSM is unavailable, logs a warning
 /// and returns — the app already handles missing services gracefully.
 pub async fn ensure_infra_running(questdb_config: &QuestDbConfig) {
-    if is_service_reachable(&questdb_config.host, questdb_config.http_port) {
-        debug!(
-            host = %questdb_config.host,
-            port = questdb_config.http_port,
-            "infrastructure already running (QuestDB reachable)"
-        );
+    let questdb_ok = is_service_reachable(&questdb_config.host, questdb_config.http_port);
+    let grafana_ok = is_service_reachable(GRAFANA_HOST, GRAFANA_PORT);
+    let prometheus_ok = is_service_reachable(LOCAL_HOST, PROMETHEUS_PORT);
+    let valkey_ok = is_service_reachable(LOCAL_HOST, VALKEY_PORT);
+
+    if questdb_ok && grafana_ok && prometheus_ok && valkey_ok {
+        debug!("all critical infrastructure services reachable — skipping docker compose up");
         // Infrastructure already running — auto-open all monitoring dashboards.
         open_all_dashboards().await;
         return;
     }
 
-    info!("infrastructure not running — auto-starting Docker services");
+    let mut missing: Vec<&'static str> = Vec::new();
+    if !questdb_ok {
+        missing.push("QuestDB");
+    }
+    if !grafana_ok {
+        missing.push("Grafana");
+    }
+    if !prometheus_ok {
+        missing.push("Prometheus");
+    }
+    if !valkey_ok {
+        missing.push("Valkey");
+    }
+
+    info!(
+        ?missing,
+        "infrastructure services missing — auto-starting Docker services (idempotent)"
+    );
 
     // Ensure Docker daemon is running (launches Docker Desktop on macOS if needed).
     if !ensure_docker_daemon_running().await {
@@ -250,9 +276,11 @@ pub async fn ensure_infra_running(questdb_config: &QuestDbConfig) {
         return;
     }
 
-    // Wait for QuestDB and Grafana to become healthy.
+    // Wait for all critical services to become healthy.
     wait_for_service_healthy("QuestDB", &questdb_config.host, questdb_config.http_port).await;
     wait_for_service_healthy("Grafana", GRAFANA_HOST, GRAFANA_PORT).await;
+    wait_for_service_healthy("Prometheus", LOCAL_HOST, PROMETHEUS_PORT).await;
+    wait_for_service_healthy("Valkey", LOCAL_HOST, VALKEY_PORT).await;
 
     // Auto-open all monitoring dashboards in the default browser.
     open_all_dashboards().await;
