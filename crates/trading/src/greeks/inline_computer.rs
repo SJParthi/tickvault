@@ -385,9 +385,9 @@ mod tests {
         let mut computer = InlineGreeksComputer::new(registry, 0.065, 0.012, 365.0, today);
 
         // IDX_I tick updates underlying LTP cache.
-        let mut tick = make_tick(13, 0, 23114.50); // IDX_I = 0
+        let mut tick = make_tick(13, 0, 23114.5); // IDX_I = 0
         computer.enrich(&mut tick);
-        assert_eq!(computer.underlying_ltp.get(&13), Some(&23114.50_f32));
+        assert_eq!(computer.underlying_ltp.get(&13), Some(&23114.5_f32));
     }
 
     #[test]
@@ -396,7 +396,7 @@ mod tests {
         let today = NaiveDate::from_ymd_opt(2026, 3, 26).unwrap();
         let mut computer = InlineGreeksComputer::new(registry, 0.065, 0.012, 365.0, today);
 
-        let mut tick = make_tick(13, 0, 23114.50);
+        let mut tick = make_tick(13, 0, 23114.5);
         computer.enrich(&mut tick);
         // Greeks should remain NAN for non-F&O ticks.
         assert!(tick.iv.is_nan());
@@ -422,7 +422,7 @@ mod tests {
         let mut computer = InlineGreeksComputer::new(registry, 0.065, 0.012, 365.0, today);
 
         // First: send underlying tick to populate LTP cache.
-        let mut idx_tick = make_tick(13, 0, 23114.50);
+        let mut idx_tick = make_tick(13, 0, 23114.5);
         computer.enrich(&mut idx_tick);
 
         // Then: send option tick → should compute Greeks.
@@ -464,7 +464,7 @@ mod tests {
         let today = NaiveDate::from_ymd_opt(2026, 3, 26).unwrap();
         let mut computer = InlineGreeksComputer::new(registry, 0.065, 0.012, 365.0, today);
 
-        let mut idx_tick = make_tick(13, 0, 23114.50);
+        let mut idx_tick = make_tick(13, 0, 23114.5);
         computer.enrich(&mut idx_tick);
 
         let mut put_tick = make_tick(50002, 2, 200.0);
@@ -489,7 +489,7 @@ mod tests {
         let today = NaiveDate::from_ymd_opt(2026, 3, 26).unwrap();
         let mut computer = InlineGreeksComputer::new(registry, 0.065, 0.012, 365.0, today);
 
-        let mut idx_tick = make_tick(13, 0, 23114.50);
+        let mut idx_tick = make_tick(13, 0, 23114.5);
         computer.enrich(&mut idx_tick);
 
         // Future tick → no option_type → no Greeks.
@@ -505,7 +505,7 @@ mod tests {
         let today = NaiveDate::from_ymd_opt(2026, 5, 1).unwrap();
         let mut computer = InlineGreeksComputer::new(registry, 0.065, 0.012, 365.0, today);
 
-        let mut idx_tick = make_tick(13, 0, 23114.50);
+        let mut idx_tick = make_tick(13, 0, 23114.5);
         computer.enrich(&mut idx_tick);
 
         let mut opt_tick = make_tick(50001, 2, 250.0);
@@ -522,7 +522,7 @@ mod tests {
         let today = NaiveDate::from_ymd_opt(2026, 3, 26).unwrap();
         let mut computer = InlineGreeksComputer::new(registry, 0.065, 0.012, 365.0, today);
 
-        let mut idx_tick = make_tick(13, 0, 23114.50);
+        let mut idx_tick = make_tick(13, 0, 23114.5);
         computer.enrich(&mut idx_tick);
 
         // Zero LTP option → skip.
@@ -548,7 +548,7 @@ mod tests {
         let today = NaiveDate::from_ymd_opt(2026, 3, 26).unwrap();
         let mut computer = InlineGreeksComputer::new(registry, 0.065, 0.012, 365.0, today);
 
-        let mut idx_tick = make_tick(13, 0, 23114.50);
+        let mut idx_tick = make_tick(13, 0, 23114.5);
         computer.enrich(&mut idx_tick);
 
         // First option tick: resolves metadata.

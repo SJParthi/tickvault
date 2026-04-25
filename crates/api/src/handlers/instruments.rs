@@ -548,8 +548,7 @@ mod tests {
         // The unwrap_or_else fallback on the diagnostic endpoint handles
         // serialization errors. We verify the fallback format directly since
         // serde_json::to_value on a well-formed DiagnosticReport never fails.
-        let err =
-            serde_json::Error::io(std::io::Error::new(std::io::ErrorKind::Other, "simulated"));
+        let err = serde_json::Error::io(std::io::Error::other("simulated"));
         let fallback = serde_json::json!({"error": format!("serialization failed: {err}")});
         assert!(fallback.is_object());
         assert!(
@@ -564,8 +563,7 @@ mod tests {
 
     #[test]
     fn test_diagnostic_serialization_fallback_produces_error_json() {
-        let err =
-            serde_json::Error::io(std::io::Error::new(std::io::ErrorKind::Other, "test error"));
+        let err = serde_json::Error::io(std::io::Error::other("test error"));
         let result = diagnostic_serialization_fallback(err);
         assert!(result.is_object());
         let error_msg = result.get("error").unwrap().as_str().unwrap();

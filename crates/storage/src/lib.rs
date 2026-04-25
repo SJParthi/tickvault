@@ -7,6 +7,7 @@
 // Phase 0.2: no dropped Result/JoinHandle/must-use values (silent error swallowing).
 #![cfg_attr(not(test), deny(unused_must_use))]
 #![cfg_attr(not(test), warn(clippy::let_underscore_must_use))]
+#![cfg_attr(test, allow(clippy::assertions_on_constants))]
 #![allow(missing_docs)] // TODO: enforce after adding docs to all public items
 
 //! Data persistence layer — QuestDB for time-series, Valkey for caching.
@@ -52,6 +53,7 @@ pub mod tick_persistence_testing {
 /// The two recovery tests
 ///   - `tick_persistence::tests::test_recover_skips_current_active_spill`
 ///   - `candle_persistence::tests::test_live_candle_recover_stale_spill_files`
+///
 /// both call `recover_stale_spill_files()`, which drains EVERY matching
 /// `{ticks,candles}-*.bin` file under the global spill directory. When
 /// cargo runs these tests in parallel inside the same binary, they race

@@ -4900,7 +4900,7 @@ mod tests {
         let (url, h) = start_mock_server(429, "{}").await;
         let client = make_test_client(&url);
         let result = client.activate_kill_switch("jwt").await;
-        assert!(matches!(result, Err(OmsError::DhanRateLimited { .. })));
+        assert!(matches!(result, Err(OmsError::DhanRateLimited)));
         h.abort();
     }
 
@@ -4923,7 +4923,7 @@ mod tests {
             trailing_jump: 0.0,
         };
         let result = client.place_super_order("jwt", &req).await;
-        assert!(matches!(result, Err(OmsError::DhanRateLimited { .. })));
+        assert!(matches!(result, Err(OmsError::DhanRateLimited)));
         h.abort();
     }
 
@@ -4950,7 +4950,7 @@ mod tests {
             quantity1: None,
         };
         let result = client.create_forever_order("jwt", &req).await;
-        assert!(matches!(result, Err(OmsError::DhanRateLimited { .. })));
+        assert!(matches!(result, Err(OmsError::DhanRateLimited)));
         h.abort();
     }
 
@@ -4959,7 +4959,7 @@ mod tests {
         let (url, h) = start_mock_server(429, "{}").await;
         let client = make_test_client(&url);
         let result = client.get_all_conditional_triggers("jwt").await;
-        assert!(matches!(result, Err(OmsError::DhanRateLimited { .. })));
+        assert!(matches!(result, Err(OmsError::DhanRateLimited)));
         h.abort();
     }
 }

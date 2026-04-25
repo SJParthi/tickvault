@@ -1629,7 +1629,7 @@ mod tests {
         for hour in 0..24_u8 {
             let ttl = compute_instrument_ttl_secs(epoch, hour);
             assert!(
-                ttl >= 60 && ttl <= 86_400,
+                (60..=86_400).contains(&ttl),
                 "TTL for target hour {hour} must be in [60, 86400], got {ttl}"
             );
         }

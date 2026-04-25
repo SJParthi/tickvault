@@ -18,6 +18,8 @@
 // Phase 0.2: no dropped Result/JoinHandle/must-use values (silent error swallowing).
 #![cfg_attr(not(test), deny(unused_must_use))]
 #![cfg_attr(not(test), warn(clippy::let_underscore_must_use))]
+#![cfg_attr(test, allow(clippy::assertions_on_constants))]
+#![cfg_attr(test, allow(clippy::field_reassign_with_default))]
 #![allow(missing_docs)]
 
 pub mod handlers;
@@ -289,7 +291,6 @@ mod tests {
     // build_router: smoke test — router builds without panic
     // -------------------------------------------------------------------
 
-    #[test]
     /// 2026-04-25 (PR #357): direct smoke test for `build_router_with_auth`,
     /// the production code path that takes a pre-resolved `ApiAuthConfig`
     /// (typically constructed from an SSM-fetched `SecretString` in

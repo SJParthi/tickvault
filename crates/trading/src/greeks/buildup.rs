@@ -152,14 +152,14 @@ mod tests {
     fn test_nifty_23000_ce_short_covering() {
         // From screenshot: CE 23000 → LTP 296.50 (was higher prev), OI down
         // OI: 72,90,595 → current OI lower → Short Covering if price up
-        let result = classify_buildup(72_90_595, 80_00_000, 296.50, 280.0);
+        let result = classify_buildup(7_290_595, 8_000_000, 296.50, 280.0);
         assert_eq!(result, Some(BuildupType::ShortCovering));
     }
 
     #[test]
     fn test_nifty_23000_pe_short_buildup() {
         // PE 23000 → OI increasing, price decreasing → Short Buildup
-        let result = classify_buildup(9_62_065, 8_00_000, 173.75, 250.0);
+        let result = classify_buildup(962_065, 800_000, 173.75, 250.0);
         assert_eq!(result, Some(BuildupType::ShortBuildup));
     }
 

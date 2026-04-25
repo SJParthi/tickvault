@@ -502,7 +502,7 @@ mod tests {
 
     fn mk_state() -> SharedAppState {
         use std::sync::{Arc, RwLock};
-        let state = SharedAppState::new(
+        SharedAppState::new(
             tickvault_common::config::QuestDbConfig {
                 host: "127.0.0.1".to_string(),
                 http_port: 1,
@@ -531,8 +531,7 @@ mod tests {
             Arc::new(RwLock::new(None)),
             Arc::new(RwLock::new(None)),
             Arc::new(crate::state::SystemHealthStatus::new()),
-        );
-        state
+        )
     }
 
     async fn call(uri: &str, state: SharedAppState) -> (axum::http::StatusCode, String) {

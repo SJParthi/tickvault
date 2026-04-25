@@ -1043,7 +1043,7 @@ mod tests {
         }
         // Gap exactly at (alert + error) / 2 — should be Warning not Error
         let mid_gap = (TICK_GAP_ALERT_THRESHOLD_SECS + TICK_GAP_ERROR_THRESHOLD_SECS) / 2;
-        if mid_gap >= TICK_GAP_ALERT_THRESHOLD_SECS && mid_gap < TICK_GAP_ERROR_THRESHOLD_SECS {
+        if (TICK_GAP_ALERT_THRESHOLD_SECS..TICK_GAP_ERROR_THRESHOLD_SECS).contains(&mid_gap) {
             let gap_ts = base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE + mid_gap;
             let result = tracker.record_tick(1001, gap_ts);
             assert!(
@@ -1063,7 +1063,7 @@ mod tests {
         let gap_ts = base_ts + TICK_GAP_MIN_TICKS_BEFORE_ACTIVE + TICK_GAP_ERROR_THRESHOLD_SECS - 1;
         let result = tracker.record_tick(1001, gap_ts);
         // If error - 1 >= alert, it should be Warning
-        if TICK_GAP_ERROR_THRESHOLD_SECS - 1 >= TICK_GAP_ALERT_THRESHOLD_SECS {
+        if TICK_GAP_ERROR_THRESHOLD_SECS > TICK_GAP_ALERT_THRESHOLD_SECS {
             assert!(matches!(result, TickGapResult::Warning { .. }));
         }
     }

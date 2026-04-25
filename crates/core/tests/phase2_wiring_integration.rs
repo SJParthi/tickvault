@@ -15,6 +15,8 @@
 //! the public API of `tickvault-core` — same surface a real consumer
 //! sees.
 
+#![allow(clippy::field_reassign_with_default)]
+
 use std::collections::HashMap;
 use std::time::Duration;
 

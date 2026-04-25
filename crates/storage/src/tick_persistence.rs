@@ -6630,7 +6630,7 @@ mod tests {
             last_trade_quantity: 75,
             exchange_timestamp: 1_740_556_500,
             received_at_nanos: 1_740_556_500_123_456_789,
-            average_traded_price: 24495.50,
+            average_traded_price: 24495.5,
             volume: 50000,
             total_sell_quantity: 12000,
             total_buy_quantity: 13000,
@@ -7170,6 +7170,8 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
+    #[allow(clippy::print_stderr)]
+    // APPROVED: verbose proof test prints human-readable narrative to stderr
     fn test_verbose_proof_zero_tick_loss_guarantee() {
         use std::sync::atomic::Ordering;
 
@@ -7322,7 +7324,7 @@ mod tests {
             last_trade_quantity: 75,
             exchange_timestamp: 1_740_556_500,
             received_at_nanos: 1_740_556_500_123_456_789,
-            average_traded_price: 24495.50,
+            average_traded_price: 24495.5,
             volume: 50000,
             total_sell_quantity: 12000,
             total_buy_quantity: 13000,
@@ -7754,9 +7756,9 @@ mod tests {
         // If it exists with no matching files, should also return 0.
         let recovered = writer.recover_stale_spill_files();
 
-        // Can only guarantee >= 0 without controlling filesystem state,
-        // but the method must not panic.
-        assert!(recovered == 0 || recovered > 0, "must not panic");
+        // Can only guarantee that the method returns without panicking;
+        // recovered is usize so the value itself is always >= 0.
+        let _ = recovered;
     }
 
     // -----------------------------------------------------------------------
@@ -10403,7 +10405,7 @@ mod tests {
     #[test]
     fn test_f32_to_f64_clean_pi_constant() {
         let result = f32_to_f64_clean(std::f32::consts::PI);
-        assert!((result - 3.1415927_f64).abs() < 0.0001);
+        assert!((result - f64::from(std::f32::consts::PI)).abs() < 0.0001);
     }
 
     #[test]
@@ -11873,7 +11875,7 @@ mod tests {
         let spill_path = tmp_dir.join("ticks-corrupt.bin");
 
         // Write partial data (less than TICK_SPILL_RECORD_SIZE)
-        std::fs::write(&spill_path, &[0xAAu8; 20]).unwrap();
+        std::fs::write(&spill_path, [0xAAu8; 20]).unwrap();
         writer.spill_path = Some(spill_path.clone());
         writer.ticks_spilled_total = 1;
 
@@ -11948,7 +11950,7 @@ mod tests {
         {
             let tick = make_test_tick(5000, 28000.0);
             let record = serialize_tick(&tick);
-            std::fs::write(&stale_path, &record).unwrap();
+            std::fs::write(&stale_path, record).unwrap();
         }
 
         writer.spill_path = None; // no active spill
@@ -12009,7 +12011,7 @@ mod tests {
         let stale_path = real_spill_dir.join("ticks-19700102.bin");
 
         // Write partial/corrupt data
-        std::fs::write(&stale_path, &[0xBBu8; 10]).unwrap();
+        std::fs::write(&stale_path, [0xBBu8; 10]).unwrap();
         writer.spill_path = None;
 
         let recovered = writer.recover_stale_spill_files();
@@ -12528,9 +12530,7 @@ mod tests {
             pg_port: port,
         };
         let mut writer = TickPersistenceWriter::new(&config).ok()?;
-        if writer.sender.is_none() {
-            return None;
-        }
+        writer.sender.as_ref()?;
         // Prevent reconnect during test
         writer.next_reconnect_allowed =
             std::time::Instant::now() + std::time::Duration::from_secs(3600);
@@ -12558,9 +12558,7 @@ mod tests {
             pg_port: port,
         };
         let mut writer = DepthPersistenceWriter::new(&config).ok()?;
-        if writer.sender.is_none() {
-            return None;
-        }
+        writer.sender.as_ref()?;
         writer.next_reconnect_allowed =
             std::time::Instant::now() + std::time::Duration::from_secs(3600);
         std::thread::sleep(std::time::Duration::from_millis(100));
@@ -12750,7 +12748,7 @@ mod tests {
         let corrupt_path =
             std::path::PathBuf::from(format!("{}/ticks-corrupt-test.bin", spill_dir));
         // Write only 50 bytes — less than TICK_SPILL_RECORD_SIZE (112)
-        std::fs::write(&corrupt_path, &[0xAB; 50]).unwrap();
+        std::fs::write(&corrupt_path, [0xAB; 50]).unwrap();
 
         writer.spill_path = Some(corrupt_path.clone());
         writer.ticks_spilled_total = 1;
@@ -12780,7 +12778,7 @@ mod tests {
         let path = std::path::PathBuf::from(format!("{}/ticks-build-err-test.bin", spill_dir));
         let tick = make_test_tick(6000, 24800.0);
         let record = serialize_tick(&tick);
-        std::fs::write(&path, &record).unwrap();
+        std::fs::write(&path, record).unwrap();
 
         writer.spill_path = Some(path.clone());
         writer.ticks_spilled_total = 1;
@@ -12888,7 +12886,7 @@ mod tests {
         let stale_path = format!("{}/ticks-19800501.bin", spill_dir);
         let tick = make_test_tick(8000, 25000.0);
         let record = serialize_tick(&tick);
-        std::fs::write(&stale_path, &record).unwrap();
+        std::fs::write(&stale_path, record).unwrap();
 
         // Poison the buffer to trigger build_tick_row error (line 572)
         let _ = writer.buffer.table("ticks");
@@ -13108,7 +13106,7 @@ mod tests {
         let corrupt_path =
             std::path::PathBuf::from(format!("{}/depth-corrupt-test.bin", spill_dir));
         // Write short data to trigger UnexpectedEof read error (line 1314)
-        std::fs::write(&corrupt_path, &[0xCD; 50]).unwrap();
+        std::fs::write(&corrupt_path, [0xCD; 50]).unwrap();
 
         writer.spill_path = Some(corrupt_path.clone());
         writer.depth_spilled_total = 1;
@@ -13141,7 +13139,7 @@ mod tests {
             depth,
         };
         let record = serialize_depth(&snapshot);
-        std::fs::write(&path, &record).unwrap();
+        std::fs::write(&path, record).unwrap();
 
         writer.spill_path = Some(path.clone());
         writer.depth_spilled_total = 1;

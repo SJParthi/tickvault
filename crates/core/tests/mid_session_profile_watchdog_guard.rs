@@ -9,6 +9,8 @@
 //!
 //! These tests scan the source so the wiring cannot regress silently.
 
+#![allow(clippy::assertions_on_constants)]
+
 use std::fs;
 use std::path::PathBuf;
 

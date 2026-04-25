@@ -3288,6 +3288,8 @@ mod tests {
     // -----------------------------------------------------------------------
 
     // Helper to build DiffSummaryParams concisely in tests
+    #[allow(clippy::too_many_arguments)]
+    // APPROVED: test helper mirrors DiffSummaryParams 1-to-1 for readable assertions
     fn diff_params(
         d_open: f64,
         d_high: f64,

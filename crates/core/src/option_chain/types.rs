@@ -440,7 +440,7 @@ mod tests {
             gamma: 0.001,
             vega: 8.0,
         };
-        let g2 = g.clone();
+        let g2 = g;
         assert_eq!(g.delta, g2.delta);
         assert_eq!(g.theta, g2.theta);
         assert_eq!(g.gamma, g2.gamma);

@@ -61,7 +61,6 @@ fn pool_watchdog_match_block(src: &str) -> &str {
     let start = src
         .find(needle)
         .expect("spawn_pool_watchdog_task must contain `let verdict = pool.poll_watchdog();`");
-    let after = &src[start..];
     // The `match verdict {` block ends at the next top-level closing
     // brace pair followed by `Healthy => { ... }` — but the cleanest
     // bound is just to take the next ~6,000 bytes which comfortably

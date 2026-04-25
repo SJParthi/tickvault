@@ -1234,9 +1234,8 @@ mod tests {
     fn test_is_within_build_window_exact_second_boundary() {
         // Window from 12:00:00 to 12:00:01 — 1 second window
         // Very unlikely current time is in this exact second
-        let result = is_within_build_window("12:00:00", "12:00:01");
+        let _ = is_within_build_window("12:00:00", "12:00:01");
         // Just verify it returns a bool without panicking
-        assert!(result || !result);
     }
 
     #[test]
@@ -1315,7 +1314,7 @@ mod tests {
         let date_str = now_ist_date_string();
         let year: u32 = date_str[0..4].parse().unwrap();
         assert!(
-            year >= 2025 && year <= 2030,
+            (2025..=2030).contains(&year),
             "year should be reasonable, got {year}"
         );
     }

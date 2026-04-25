@@ -3571,7 +3571,7 @@ mod tests {
         // wrapping_shl with attempt >= 64 wraps — confirm no panic
         let result = compute_dh904_backoff_secs(100);
         // With wrapping_shl, 1u64.wrapping_shl(100) wraps to 1u64.wrapping_shl(100 % 64)
-        assert!(result > 0 || result == 0); // Just confirm no panic
+        let _ = result; // Just confirm no panic; result is u64 so always >= 0
     }
 
     // =======================================================================

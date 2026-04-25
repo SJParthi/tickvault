@@ -44,6 +44,7 @@ loom = { workspace = true, optional = true }
 
 [features]
 loom = ["dep:loom"]
+dhat = []
 
 [dev-dependencies]
 proptest = { workspace = true }

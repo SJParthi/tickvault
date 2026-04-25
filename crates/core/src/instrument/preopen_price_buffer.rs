@@ -493,8 +493,7 @@ mod tests {
             .unwrap()
             .and_hms_opt(hour, minute, second)
             .unwrap();
-        let ist_utc = ist_naive.and_utc().timestamp() - i64::from(IST_UTC_OFFSET_SECONDS);
-        ist_utc
+        ist_naive.and_utc().timestamp() - i64::from(IST_UTC_OFFSET_SECONDS)
     }
 
     #[test]
@@ -669,7 +668,7 @@ mod tests {
         record_preopen_tick(&buffer, "RELIANCE", ts, 2847.5).await;
         let snap = snapshot(&buffer).await;
         assert!(
-            snap.get("RELIANCE").is_none(),
+            !snap.contains_key("RELIANCE"),
             "no bucket should have been created for a 09:15 tick"
         );
     }
@@ -712,7 +711,7 @@ mod tests {
         record_preopen_tick(&buffer, "RELIANCE", ts, 2847.5).await;
         let snap = snapshot(&buffer).await;
         assert!(
-            snap.get("RELIANCE").is_none(),
+            !snap.contains_key("RELIANCE"),
             "08:59:59 IST is outside the widened 09:00-09:12 window"
         );
     }
@@ -757,8 +756,8 @@ mod tests {
             Some(&"BANKNIFTY".to_string())
         );
         // Wrong segment must not match even with same id.
-        assert!(lookup.get(&(13, ExchangeSegment::NseEquity)).is_none());
-        assert!(lookup.get(&(25, ExchangeSegment::NseEquity)).is_none());
+        assert!(!lookup.contains_key(&(13, ExchangeSegment::NseEquity)));
+        assert!(!lookup.contains_key(&(25, ExchangeSegment::NseEquity)));
     }
 
     #[test]

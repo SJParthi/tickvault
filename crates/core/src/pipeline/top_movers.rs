@@ -2217,7 +2217,7 @@ mod tests {
             change_pct: -3.75,
             volume: 99999,
         };
-        let json = serde_json::to_value(&entry).unwrap();
+        let json = serde_json::to_value(entry).unwrap();
         assert_eq!(json["security_id"], 12345);
         assert_eq!(json["exchange_segment_code"], 1);
         assert_eq!(json["volume"], 99999);
@@ -2869,7 +2869,7 @@ mod tests {
             last_traded_price: 162.15,
             prev_close: 290.30,
             change_pct: -44.14,
-            volume: 12_202_3_330,
+            volume: 122_023_330,
             open_interest: 8_017_880,
             prev_open_interest: 4_673_565,
             oi_change_pct: 71.56,

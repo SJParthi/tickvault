@@ -6245,6 +6245,9 @@ fn build_inline_greeks_enricher(
 // All pure helper function tests are in boot_helpers.rs (lib.rs target).
 // Only integration-level tests that require main.rs-specific code remain here.
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+// APPROVED: helper fns below the tests block are part of the boot path; reordering would add churn
+#[allow(clippy::assertions_on_constants)]
 mod tests {
     use super::*;
     use tickvault_app::boot_helpers::{

@@ -19,7 +19,7 @@ fn make_realistic_book(base_price: f64, step: f64, base_qty: u32) -> Vec<DeepDep
         .map(|i| DeepDepthLevel {
             price: base_price + step * i as f64,
             quantity: base_qty.saturating_sub(i * (base_qty / 25)),
-            orders: (20 - i) as u32,
+            orders: 20 - i,
         })
         .collect()
 }

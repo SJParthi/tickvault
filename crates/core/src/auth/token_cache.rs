@@ -393,6 +393,8 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::print_stderr)]
+    // APPROVED: test logs SKIP reason to stderr for cross-platform diagnostics
     fn test_save_and_load_roundtrip() {
         use chrono::{Duration, Utc};
 

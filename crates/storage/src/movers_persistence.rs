@@ -2157,7 +2157,7 @@ mod tests {
             ltp: 162.15,
             prev_close: 290.30,
             change_pct: -44.14,
-            volume: 12_202_3_330,
+            volume: 122_023_330,
             value: 19_786_775_434.5,
             oi: 8_017_880,
             prev_oi: 4_673_565,
@@ -2182,7 +2182,7 @@ mod tests {
             ltp: 1_368.10,
             prev_close: 1_265.30,
             change_pct: 8.12,
-            volume: 65_515_73,
+            volume: 6_551_573,
             value: 8_963_200_000.0,
             oi: 0,
             prev_oi: 0,
@@ -2255,7 +2255,7 @@ mod tests {
             .expect("price row should append cleanly");
         // Buffer should now contain two line-protocol rows. len_bytes > 0.
         assert!(
-            buffer.len() > 0,
+            !buffer.is_empty(),
             "buffer must have content after two appends"
         );
     }

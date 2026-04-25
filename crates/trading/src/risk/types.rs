@@ -139,6 +139,8 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::clone_on_copy)]
+    // APPROVED: this test exists to verify Clone trait is wired alongside Copy
     fn risk_breach_clone_and_copy() {
         let breach = RiskBreach::ManualHalt;
         let cloned = breach.clone();
@@ -263,6 +265,8 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::clone_on_copy)]
+    // APPROVED: this test exists to verify Clone trait is wired alongside Copy
     fn position_info_clone_and_copy() {
         let pos = PositionInfo {
             net_lots: 10,
