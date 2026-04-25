@@ -214,8 +214,16 @@ summary file and drives the above flow.
       incl. clear-spill), `.claude/triage/claude-loop-prompt.md`,
       `error-triage.sh` shell hook, 3 auto-fix scripts, triage_rules_guard
       meta-test, `make triage-dry-run/triage-execute`
-- [x] **Phase 7.1** — `/loop` runbook prompt (claude-loop-prompt.md);
-      Phase 7.2 MCP server still pending
+- [x] **Phase 7.1** — `/loop` runbook prompt
+      (`.claude/triage/claude-loop-prompt.md`).
+- [x] **Phase 7.2** — Triage MCP server shipped:
+      `scripts/mcp-servers/tickvault-logs/server.py` exposes the full
+      triage flow over stdio MCP — `_signature_hash` (FNV-1a of
+      code+target+first-160), `tool_triage_log_tail`,
+      `tool_find_runbook_for_code`, `tool_list_novel_signatures`,
+      `tool_tail_errors`, `tool_summary_snapshot`, `tool_signature_history`.
+      Auto-loaded via `.mcp.json` `tickvault-logs` entry; tools surface
+      as `mcp__tickvault-logs__*` in any Claude Code session.
 - [~] **Phase 8.1** — Common auto-fix scripts (restart-depth, refresh-
       instruments, clear-spill — all three scaffolded, refresh-instruments
       fully functional today); Phase 8.2 Lambda bridge deferred until
