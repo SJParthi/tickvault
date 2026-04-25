@@ -1866,7 +1866,7 @@ pub const INDEX_CONSTITUENCY_SLUGS: &[(&str, &str)] = &[
     ("Nifty Midcap 50", "ind_niftymidcap50list"),
     ("Nifty Midcap 100", "ind_niftymidcap100list"),
     ("Nifty Midcap 150", "ind_niftymidcap150list"),
-    ("Nifty Midcap Select", "ind_niftymidcap_selectlist"),
+    ("Nifty Midcap Select", "ind_niftymidcapselect_list"),
     ("Nifty Smallcap 50", "ind_niftysmallcap50list"),
     ("Nifty Smallcap 100", "ind_niftysmallcap100list"),
     ("Nifty Smallcap 250", "ind_niftysmallcap250list"),
@@ -1882,7 +1882,7 @@ pub const INDEX_CONSTITUENCY_SLUGS: &[(&str, &str)] = &[
     ("Nifty Financial Services", "ind_niftyfinancelist"),
     (
         "Nifty Financial Services 25/50",
-        "ind_niftyfinancialservices25_50list",
+        "ind_niftyfinancialservices25-50list",
     ),
     ("Nifty FMCG", "ind_niftyfmcglist"),
     ("Nifty Healthcare", "ind_niftyhealthcarelist"),
@@ -1891,29 +1891,32 @@ pub const INDEX_CONSTITUENCY_SLUGS: &[(&str, &str)] = &[
     ("Nifty Metal", "ind_niftymetallist"),
     ("Nifty Pharma", "ind_niftypharmalist"),
     ("Nifty PSU Bank", "ind_niftypsubanklist"),
-    ("Nifty Private Bank", "ind_niftypvtbanklist"),
+    ("Nifty Private Bank", "ind_nifty_privatebanklist"),
     ("Nifty Realty", "ind_niftyrealtylist"),
-    ("Nifty Consumer Durables", "ind_niftyconsumerdurablelist"),
-    ("Nifty Oil & Gas", "ind_niftyoilandgaslist"),
+    ("Nifty Consumer Durables", "ind_niftyconsumerdurableslist"),
+    ("Nifty Oil & Gas", "ind_niftyoilgaslist"),
     // -----------------------------------------------------------------------
     // Thematic / Strategy Indices (18)
     // -----------------------------------------------------------------------
     ("Nifty Commodities", "ind_niftycommoditieslist"),
-    ("Nifty India Consumption", "ind_niftyindiaconsumptionlist"),
+    ("Nifty India Consumption", "ind_niftyconsumptionlist"),
     ("Nifty CPSE", "ind_niftycpselist"),
     ("Nifty Energy", "ind_niftyenergylist"),
-    ("Nifty Infrastructure", "ind_niftyinfrastructurelist"),
+    ("Nifty Infrastructure", "ind_niftyinfralist"),
     ("Nifty MNC", "ind_niftymnclist"),
     ("Nifty PSE", "ind_niftypselist"),
-    ("Nifty Growth Sectors 15", "ind_niftyGrowthSectors15list"),
-    ("Nifty100 Quality 30", "ind_nifty100_Quality30list"),
-    ("Nifty50 Value 20", "ind_nifty50_value20list"),
-    ("Nifty Alpha 50", "ind_niftyAlpha50list"),
-    ("Nifty High Beta 50", "ind_niftyHighBeta50list"),
-    ("Nifty Low Volatility 50", "ind_niftyLowVolatility50list"),
+    ("Nifty Growth Sectors 15", "ind_NiftyGrowth_Sectors15_Index"),
+    ("Nifty100 Quality 30", "ind_nifty100Quality30list"),
+    ("Nifty50 Value 20", "ind_Nifty50_Value20"),
+    ("Nifty Alpha 50", "ind_nifty_Alpha_Index"),
+    ("Nifty High Beta 50", "nifty_High_Beta50_Index"),
+    ("Nifty Low Volatility 50", "nifty_low_Volatility50_Index"),
     ("Nifty India Digital", "ind_niftyIndiaDigital_list"),
     ("Nifty India Defence", "ind_niftyIndiaDefence_list"),
-    ("Nifty India Manufacturing", "ind_niftyIndiaMfg_list"),
+    (
+        "Nifty India Manufacturing",
+        "ind_niftyindiamanufacturing_list",
+    ),
     ("Nifty Mobility", "ind_niftymobility_list"),
     (
         "Nifty500 Multicap 50:25:25",
@@ -1950,22 +1953,7 @@ pub const INDEX_CONSTITUENCY_SLUG_COUNT: usize = INDEX_CONSTITUENCY_SLUGS.len();
 /// sandbox/datacenter IPs (verified 2026-04-24: every WebFetch from
 /// this environment returned 403). The correct slugs can only be
 /// discovered from a real browser session.
-pub const INDEX_CONSTITUENCY_KNOWN_STALE_SLUGS: &[&str] = &[
-    "ind_niftymidcap_selectlist",
-    "ind_niftyfinancialservices25_50list",
-    "ind_niftypvtbanklist",
-    "ind_niftyconsumerdurablelist",
-    "ind_niftyoilandgaslist",
-    "ind_niftyindiaconsumptionlist",
-    "ind_niftyinfrastructurelist",
-    "ind_niftyGrowthSectors15list",
-    "ind_nifty100_Quality30list",
-    "ind_nifty50_value20list",
-    "ind_niftyAlpha50list",
-    "ind_niftyHighBeta50list",
-    "ind_niftyLowVolatility50list",
-    "ind_niftyIndiaMfg_list",
-];
+pub const INDEX_CONSTITUENCY_KNOWN_STALE_SLUGS: &[&str] = &[];
 
 // ---------------------------------------------------------------------------
 // Tests — Market Hours Constants
