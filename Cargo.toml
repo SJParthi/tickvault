@@ -14,7 +14,7 @@ license = "MIT"
 # Run `bash .claude/hooks/dep-freshness-scanner.sh` to check for drift.
 
 # ---- Section 2: Backend Core — Async Runtime ----
-tokio = { version = "1.51.1", features = ["full"] }
+tokio = { version = "1.52.1", features = ["full"] }
 
 # ---- Section 2: Backend Core — WebSocket ----
 tokio-tungstenite = { version = "0.29.0", features = ["rustls-tls-native-roots"] }
@@ -35,7 +35,7 @@ ringbuf = "0.4.8"
 
 # ---- Section 4: Database & Cache ----
 questdb-rs = { version = "6.1.0", features = ["chrono_timestamp"] }
-redis = { version = "1.1.0", features = ["tokio-comp", "connection-manager"] }
+redis = { version = "1.2.0", features = ["tokio-comp", "connection-manager"] }
 deadpool-redis = "0.23.0"
 
 # ---- Section 5: Observability — Metrics ----
@@ -76,7 +76,7 @@ yata = "0.7.0"
 reqwest = { version = "0.12.15", features = ["json", "rustls-tls"], default-features = false }
 
 # ---- Section 8: HTTP Server ----
-axum = { version = "0.8.8", features = ["macros", "ws"] }
+axum = { version = "0.8.9", features = ["macros", "ws"] }
 tower = { version = "0.5.3", features = ["full"] }
 tower-http = { version = "0.6.8", features = ["cors", "trace", "compression-gzip", "fs"] }
 
@@ -92,7 +92,7 @@ chrono-tz = "0.10.4"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 bitcode = "0.6.9"
-rkyv = { version = "0.8.15", features = ["std", "bytecheck"] }
+rkyv = { version = "0.8.16", features = ["std", "bytecheck"] }
 csv = "1.4.0"
 thiserror = "2.0.18"
 anyhow = "1.0.102"
@@ -119,19 +119,19 @@ zeroize = { version = "1.8.2", features = ["derive"] }
 # ---- Section 14: TLS — Crypto Provider for rustls ----
 # Both tokio-tungstenite and reqwest depend on rustls 0.23+, which requires
 # an explicit CryptoProvider. We use aws-lc-rs (already in the dep tree).
-rustls = { version = "0.23.37", default-features = false, features = ["aws_lc_rs"] }
+rustls = { version = "0.23.39", default-features = false, features = ["aws_lc_rs"] }
 rustls-native-certs = "0.8.3"
 
 # ---- Section 11: AWS SDK ----
-aws-config = "1.8.15"
-aws-sdk-sns = "1.98.0"
-aws-sdk-ssm = "1.108.0"
+aws-config = "1.8.16"
+aws-sdk-sns = "1.99.0"
+aws-sdk-ssm = "1.109.0"
 
 # ---- Section 16: CLI ----
-clap = { version = "4.6.0", features = ["derive"] }
+clap = { version = "4.6.1", features = ["derive"] }
 
 # ---- Section 17: Unique IDs ----
-uuid = { version = "1.23.0", features = ["v4", "serde"] }
+uuid = { version = "1.23.1", features = ["v4", "serde"] }
 
 # ---- Section 18: Telegram Alerts ----
 teloxide = { version = "0.13.0", features = ["macros"] }
