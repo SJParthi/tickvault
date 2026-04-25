@@ -12,7 +12,7 @@
       }
     ]
   },
-  "description": "Depth subscription flow — 20-level (49 instruments per NIFTY/BANKNIFTY/FINNIFTY/MIDCPNIFTY) and 200-level (ATM CE + PE for NIFTY/BANKNIFTY only). Red panels indicate depth connection failures, rebalancer stalls, or dropped frames. Runbook: .claude/rules/project/depth-subscription.md.",
+  "description": "Depth subscription flow — 20-level (49 instruments per NIFTY/BANKNIFTY) and 200-level (ATM CE + PE for NIFTY/BANKNIFTY only). FINNIFTY + MIDCPNIFTY were dropped 2026-04-25 to free 25K WS capacity for stock F&O ATM±25. Red panels indicate depth connection failures, rebalancer stalls, or dropped frames. Runbook: .claude/rules/project/depth-subscription.md.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -31,7 +31,7 @@
       "gridPos": { "h": 3, "w": 24, "x": 0, "y": 0 },
       "options": {
         "mode": "markdown",
-        "content": "## Depth Flow — 20-level + 200-level\n\nDepth connections are pool-independent from main feed (separate 5-connection cap per Dhan). 20-level = 49 instruments per underlying (ATM ± 24 strikes). 200-level = ATM CE + ATM PE for NIFTY and BANKNIFTY only. Rebalancer runs every 60s on spot drift. **All panels must be green during market hours (09:15-15:30 IST).**"
+        "content": "## Depth Flow — 20-level + 200-level\n\nDepth connections are pool-independent from main feed (separate 5-connection cap per Dhan). 20-level = 49 instruments per underlying (ATM ± 24 strikes) for **NIFTY + BANKNIFTY only** (FINNIFTY + MIDCPNIFTY dropped 2026-04-25). 200-level = ATM CE + ATM PE for NIFTY and BANKNIFTY only. Rebalancer runs every 60s on spot drift. **All panels must be green during market hours (09:15-15:30 IST).**"
       }
     },
     {
@@ -45,7 +45,7 @@
       "type": "stat",
       "id": 1,
       "title": "Depth-20 connections active",
-      "description": "Target: 4/4 (NIFTY / BANKNIFTY / FINNIFTY / MIDCPNIFTY).",
+      "description": "Target: 2/2 (NIFTY / BANKNIFTY). 2026-04-25: FINNIFTY + MIDCPNIFTY dropped.",
       "gridPos": { "h": 5, "w": 6, "x": 0, "y": 4 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
