@@ -87,25 +87,53 @@ pub struct SubscriptionPlanSummary {
 // Fix #6 (2026-04-24) — stock F&O expiry rollover helper
 // ---------------------------------------------------------------------------
 
-/// Trading-day threshold at or below which a stock's nearest expiry is
-/// rolled to the next one. STRICT interpretation per Parthiban's spec
-/// ("expiry day + one day before"): roll when today is T (expiry day) or
-/// T-1 (day before expiry). T-2 keeps the current expiry.
+/// Trading-day threshold at or below which a stock F&O nearest expiry is
+/// rolled to the next one.
+///
+/// **STRICT RULE (Parthiban 2026-04-25 confirmation):** roll when STRICTLY
+/// LESS THAN 2 trading days remain until expiry. For integer day counts,
+/// `trading_days_left < 2` is equivalent to `trading_days_left <= 1`, hence
+/// the constant value of 1.
+///
+/// **Concrete decision table** (e.g., Thursday April 30 = expiry):
+///
+/// | Today | Trading days remaining | Roll? |
+/// |---|---:|---|
+/// | Thursday Apr 30 (expiry day, T) | 0 | YES — Dhan disallows expiry-day trading on stock options |
+/// | Wednesday Apr 29 (T-1) | 1 | YES — 1-day safety margin |
+/// | Tuesday Apr 28 (T-2) | 2 | NO — keep current expiry |
+/// | Monday Apr 27 (T-3) | 3 | NO — keep current expiry |
+///
+/// **SCOPE — STOCKS ONLY (OPTSTK + FUTSTK):**
+/// - Stock options (OPTSTK) and stock futures (FUTSTK) on F&O stocks → ROLL applies
+/// - Index options (OPTIDX) and index futures (FUTIDX) for NIFTY/BANKNIFTY/SENSEX → NEVER roll
+/// - Index strategies legitimately trade right up to expiry; weekly expiries are routine
+/// - Cash equities and IDX_I value feeds have no expiry concept
+///
+/// Pinned by ratchet test `test_index_expiry_never_rolls_via_planner` —
+/// rollover MUST NOT leak into the index path.
 pub const STOCK_EXPIRY_ROLLOVER_TRADING_DAYS: u32 = 1;
 
 /// Select the nearest expiry for a stock F&O subscription, applying the
-/// Fix #6 rollover rule. Returns `None` if no suitable expiry exists.
+/// stock-only rollover rule. Returns `None` if no suitable expiry exists.
 ///
-/// Scope: **stocks only**. Indices (NIFTY / BANKNIFTY / FINNIFTY /
-/// MIDCPNIFTY) keep nearest expiry unconditionally — they trade actively
-/// right up to expiry seconds.
+/// **SCOPE — STOCKS ONLY (OPTSTK + FUTSTK).** Indices (NIFTY / BANKNIFTY /
+/// SENSEX — the 3 full-chain indices as of 2026-04-25) keep nearest expiry
+/// unconditionally; they trade actively right up to expiry seconds and
+/// weekly index expiries are routine. FINNIFTY + MIDCPNIFTY are not in
+/// the F&O universe anymore (dropped 2026-04-25).
+///
+/// **Rule:** roll when STRICTLY LESS THAN 2 trading days remain until
+/// expiry — see `STOCK_EXPIRY_ROLLOVER_TRADING_DAYS` docstring for the
+/// full decision table. Mathematically `trading_days_left < 2` is the
+/// same as `trading_days_left <= 1` for integer day counts; the code
+/// uses `<= 1` because that's what Rust comparison naturally expresses.
 ///
 /// Behaviour:
 /// - When `calendar` is `None`: returns the first expiry `>= today` (the
-///   pre-Fix-6 behaviour). Tests and legacy callers rely on this.
-/// - When `calendar` is `Some`: if the nearest expiry is ≤ 1 trading day
-///   away (today is T or T-1), returns the NEXT expiry in the calendar;
-///   otherwise returns the nearest.
+///   pre-rollover behaviour). Tests and legacy callers rely on this.
+/// - When `calendar` is `Some`: if `< 2` trading days to expiry (today is
+///   T or T-1), returns the NEXT expiry; otherwise returns the nearest.
 ///
 /// `expiry_dates` MUST be sorted ascending (canonical invariant from the
 /// universe builder).
@@ -123,7 +151,10 @@ pub fn select_stock_expiry_with_rollover(
         return Some(nearest);
     };
 
-    // Strict rule: roll when <= 1 trading day remains (today is T or T-1).
+    // STRICT rule: roll when < 2 trading days remain (today is T or T-1).
+    // `<= 1` is mathematically equivalent to `< 2` for integer day counts.
+    // This is the documented stock-only safety margin: avoid expiry day
+    // (Dhan disallows stock-option expiry-day trading) AND avoid T-1 too.
     let trading_days_left = cal.count_trading_days(today, nearest);
     if trading_days_left <= STOCK_EXPIRY_ROLLOVER_TRADING_DAYS {
         // Roll to the NEXT expiry, if one exists.
@@ -312,6 +343,14 @@ pub fn build_subscription_plan(
     // -----------------------------------------------------------------------
     // 4. Stock equities (NSE_EQ price feed) + Stock derivatives (current expiry)
     // -----------------------------------------------------------------------
+    // 2026-04-25: Track each stock's selected expiry so Stage 2 progressive
+    // fill (Section 5 below) ALSO respects the rollover. Without this map,
+    // Stage 2 would silently re-subscribe contracts at the rolled-away
+    // nearest expiry — defeating the safety margin (T-1 rollover for stock
+    // options because Dhan disallows expiry-day trading).
+    let mut selected_expiry_per_stock: HashMap<String, NaiveDate> =
+        HashMap::with_capacity(universe.underlyings.len());
+
     for underlying in universe.underlyings.values() {
         if underlying.kind != UnderlyingKind::Stock {
             continue;
@@ -332,10 +371,11 @@ pub fn build_subscription_plan(
             continue;
         }
 
-        // Find current expiry. Fix #6 (2026-04-24): stock F&O expiries
-        // roll to the NEXT one when today is T or T-1 (nearest expiry <= 1
-        // trading day away). Falls back to the pre-Fix-6 nearest-only
-        // behaviour when no calendar was provided.
+        // Find current expiry. STOCK-ONLY rollover (OPTSTK + FUTSTK):
+        // roll to the NEXT expiry when STRICTLY LESS THAN 2 trading days
+        // remain (i.e. today is T or T-1). Indices NEVER apply this rule.
+        // See `select_stock_expiry_with_rollover` and
+        // `STOCK_EXPIRY_ROLLOVER_TRADING_DAYS` for the full decision table.
         let current_expiry = universe
             .expiry_calendars
             .get(&underlying.underlying_symbol)
@@ -351,6 +391,12 @@ pub fn build_subscription_plan(
             stocks_skipped_no_chain = stocks_skipped_no_chain.saturating_add(1);
             continue;
         };
+
+        // 2026-04-25: Record the selected expiry so Stage 2 (Section 5)
+        // ONLY fills at this same expiry — preserving the rollover safety
+        // margin. Without this, Stage 2 would silently subscribe nearest-
+        // expiry contracts on T-1 stocks.
+        selected_expiry_per_stock.insert(underlying.underlying_symbol.clone(), expiry);
 
         // Subscribe the current-month future for this expiry
         let chain_key = OptionChainKey {
@@ -495,9 +541,15 @@ pub fn build_subscription_plan(
 
     // -----------------------------------------------------------------------
     // 5. Progressive fill — remaining stock derivatives to 25K capacity
-    //    Stage 2: ALL stock derivatives with expiry >= today, nearest first.
-    //    Stage 1 (ATM+-N above) already added priority instruments.
+    //    Stage 2: stock derivatives at THE PER-STOCK SELECTED EXPIRY only,
+    //    nearest first. Stage 1 (ATM ± 25 above) added priority instruments.
     //    seen_ids ensures no duplicates.
+    //
+    //    2026-04-25 SAFETY: Stage 2 MUST respect the rollover via
+    //    `selected_expiry_per_stock`. Stocks on T-1 (rolled to next expiry)
+    //    must NOT have nearest-expiry contracts subscribed by Stage 2. Stocks
+    //    that were skipped in Stage 1 (no spot price) are excluded entirely
+    //    so we never subscribe a stock without ATM resolution.
     // -----------------------------------------------------------------------
     let mut stock_derivatives_available: usize = 0;
     let mut stock_derivatives_skipped: usize = 0;
@@ -512,12 +564,21 @@ pub fn build_subscription_plan(
             .derivative_contracts
             .values()
             .filter(|c| {
-                matches!(
+                let kind_ok = matches!(
                     c.instrument_kind,
                     tickvault_common::instrument_types::DhanInstrumentKind::FutureStock
                         | tickvault_common::instrument_types::DhanInstrumentKind::OptionStock
-                ) && c.expiry_date >= today
-                    && !seen_ids.contains(&(c.security_id, c.exchange_segment))
+                );
+                if !kind_ok {
+                    return false;
+                }
+                // SAFETY (2026-04-25): only include if Stage 1 selected an
+                // expiry for this stock AND this contract's expiry matches.
+                // This makes Stage 2 honour the stock-only rollover.
+                let expiry_ok = selected_expiry_per_stock
+                    .get(c.underlying_symbol.as_str())
+                    .is_some_and(|sel| *sel == c.expiry_date);
+                expiry_ok && !seen_ids.contains(&(c.security_id, c.exchange_segment))
             })
             .collect();
 
@@ -764,6 +825,11 @@ pub fn build_subscription_plan_from_archived(
     // -----------------------------------------------------------------------
     // 4. Stock equities + Stock derivatives (current expiry)
     // -----------------------------------------------------------------------
+    // 2026-04-25: Mirror of live planner Section 4 — track each stock's
+    // selected expiry so Stage 2 progressive fill respects the same.
+    let mut selected_expiry_per_stock: HashMap<String, NaiveDate> =
+        HashMap::with_capacity(universe.underlyings.len());
+
     for underlying in universe.underlyings.values() {
         let kind = UnderlyingKind::from(&underlying.kind);
         if kind != UnderlyingKind::Stock {
@@ -802,6 +868,9 @@ pub fn build_subscription_plan_from_archived(
             stocks_skipped_no_chain = stocks_skipped_no_chain.saturating_add(1);
             continue;
         };
+
+        // 2026-04-25: Same safety as live planner — track selected expiry.
+        selected_expiry_per_stock.insert(symbol.to_string(), expiry);
 
         // Look up option chain via our pre-built index
         if let Some(&chain_idx) = option_chain_lookup.get(&(symbol, expiry)) {
@@ -905,10 +974,19 @@ pub fn build_subscription_plan_from_archived(
                     kind,
                     DhanInstrumentKind::FutureStock | DhanInstrumentKind::OptionStock
                 );
+                if !is_stock_deriv {
+                    return None;
+                }
                 let expiry = naive_date_from_archived_i32(&c.expiry_date);
                 let sec_id = c.security_id.to_native();
                 let seg = ExchangeSegment::from(&c.exchange_segment);
-                if is_stock_deriv && expiry >= today && !seen_ids.contains(&(sec_id, seg)) {
+                // SAFETY (2026-04-25): only include if Stage 1 selected an
+                // expiry for this stock AND this contract's expiry matches.
+                // Mirrors the live planner Stage 2 fix.
+                let expiry_ok = selected_expiry_per_stock
+                    .get(c.underlying_symbol.as_str())
+                    .is_some_and(|sel| *sel == expiry);
+                if expiry_ok && !seen_ids.contains(&(sec_id, seg)) {
                     Some((sec_id, expiry, c.underlying_symbol.as_str(), c))
                 } else {
                     None
@@ -1794,8 +1872,12 @@ mod tests {
     }
 
     #[test]
-    fn test_plan_stage2_nearest_expiry_prioritized() {
-        // Universe with 2 expiry dates — Stage 2 should fill nearest first
+    fn test_plan_stage2_does_not_add_far_month_stock_derivatives() {
+        // 2026-04-25: Updated semantics. Previously Stage 2 progressively
+        // filled far-month stock derivatives until 25K capacity. Under the
+        // new "ATM±25 current expiry only" design, Stage 2 MUST stay within
+        // the per-stock selected expiry. Far-month stock contracts are
+        // explicitly DROPPED.
         let mut universe = make_test_universe();
         // near_expiry = 2026-03-27 is already in make_test_universe()
         let far_expiry = NaiveDate::from_ymd_opt(2026, 4, 24).unwrap();
@@ -1856,20 +1938,24 @@ mod tests {
             None,
         );
 
-        // Stage 1 subscribes near expiry ATM+-N (all 11 RELIANCE near contracts).
-        // Stage 2 should add far expiry contracts (future + 3 CE = 4).
-        // Verify far expiry contracts are present in plan.
+        // Stage 1 subscribes near expiry ATM±N (all 11 RELIANCE near contracts).
+        // Stage 2 must NOT add far-month contracts under the new design.
         assert!(
-            plan.registry.get(far_future_id).is_some(),
-            "Far expiry future should be in plan via Stage 2"
+            plan.registry.get(far_future_id).is_none(),
+            "Far expiry future MUST NOT be in plan — current expiry only"
         );
         assert!(
-            plan.registry.get(70100).is_some(),
-            "Far expiry CE should be in plan via Stage 2"
+            plan.registry.get(70100).is_none(),
+            "Far expiry CE MUST NOT be in plan — current expiry only"
         );
 
-        // Total stock derivatives should include both near (11) + far (4) = 15
-        assert_eq!(plan.summary.stock_derivatives, 15);
+        // Total stock derivatives should only include near expiry contracts.
+        // make_test_universe puts 11 RELIANCE contracts at near expiry
+        // (1 future + 5 CE + 5 PE).
+        assert_eq!(
+            plan.summary.stock_derivatives, 11,
+            "Stage 2 must not bypass current-expiry filter; only 11 near-expiry contracts allowed"
+        );
     }
 
     #[test]
@@ -3797,6 +3883,198 @@ mod tests {
         assert_eq!(
             cfg.stock_atm_strikes_below, STOCK_OPTION_ATM_STRIKES_EACH_SIDE,
             "default config must mirror the constant for production safety"
+        );
+    }
+
+    /// 2026-04-25 ratchet: rollover rule constant value is exactly 1
+    /// (mathematically equivalent to "< 2 trading days"). Regressing this
+    /// to 0 would let stock options trade on expiry day (Dhan disallows);
+    /// regressing to 2 would prematurely roll on T-2 (loses 1 trading day
+    /// of liquidity). Lock at 1.
+    #[test]
+    fn test_stock_expiry_rollover_constant_is_one() {
+        assert_eq!(
+            STOCK_EXPIRY_ROLLOVER_TRADING_DAYS, 1,
+            "rollover threshold must stay at 1 (= '< 2 trading days')"
+        );
+    }
+
+    /// 2026-04-25 ratchet: cross-instrument rollover scope check —
+    /// confirms the rollover applies to BOTH OPTSTK (stock options) AND
+    /// FUTSTK (stock futures). Both are F&O on the same stock underlying
+    /// and share the same expiry calendar; if one rolls, the other must
+    /// too. Set up RELIANCE on T-1, assert that BOTH the future and the
+    /// options rolled to the next expiry.
+    #[test]
+    fn test_stock_rollover_applies_to_both_optstk_and_futstk() {
+        // Build a 2-expiry RELIANCE universe: nearest is T-1, next is +30d.
+        let nearest = NaiveDate::from_ymd_opt(2026, 4, 30).unwrap();
+        let next = NaiveDate::from_ymd_opt(2026, 5, 28).unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 4, 29).unwrap(); // T-1
+
+        let mut underlyings = HashMap::new();
+        underlyings.insert(
+            "RELIANCE".to_string(),
+            FnoUnderlying {
+                underlying_symbol: "RELIANCE".to_string(),
+                underlying_security_id: 2885,
+                price_feed_security_id: 2885,
+                price_feed_segment: ExchangeSegment::NseEquity,
+                derivative_segment: ExchangeSegment::NseFno,
+                kind: UnderlyingKind::Stock,
+                lot_size: 250,
+                contract_count: 4,
+            },
+        );
+
+        let mut derivative_contracts: HashMap<SecurityId, DerivativeContract> = HashMap::new();
+        // Future + 1 CE strike at NEAREST expiry (should be SKIPPED due to rollover)
+        derivative_contracts.insert(
+            80001,
+            DerivativeContract {
+                security_id: 80001,
+                underlying_symbol: "RELIANCE".to_string(),
+                instrument_kind: DhanInstrumentKind::FutureStock,
+                exchange_segment: ExchangeSegment::NseFno,
+                expiry_date: nearest,
+                strike_price: 0.0,
+                option_type: None,
+                lot_size: 250,
+                tick_size: 0.05,
+                symbol_name: "RELIANCE-30APR26-FUT".to_string(),
+                display_name: "RELIANCE FUT 30Apr26 (NEAREST)".to_string(),
+            },
+        );
+        derivative_contracts.insert(
+            80002,
+            DerivativeContract {
+                security_id: 80002,
+                underlying_symbol: "RELIANCE".to_string(),
+                instrument_kind: DhanInstrumentKind::OptionStock,
+                exchange_segment: ExchangeSegment::NseFno,
+                expiry_date: nearest,
+                strike_price: 2700.0,
+                option_type: Some(OptionType::Call),
+                lot_size: 250,
+                tick_size: 0.05,
+                symbol_name: "RELIANCE-30APR26-2700-CE".to_string(),
+                display_name: "RELIANCE 2700 CE 30Apr26 (NEAREST)".to_string(),
+            },
+        );
+        // Future + 1 CE strike at NEXT expiry (should be subscribed after rollover)
+        derivative_contracts.insert(
+            80101,
+            DerivativeContract {
+                security_id: 80101,
+                underlying_symbol: "RELIANCE".to_string(),
+                instrument_kind: DhanInstrumentKind::FutureStock,
+                exchange_segment: ExchangeSegment::NseFno,
+                expiry_date: next,
+                strike_price: 0.0,
+                option_type: None,
+                lot_size: 250,
+                tick_size: 0.05,
+                symbol_name: "RELIANCE-28MAY26-FUT".to_string(),
+                display_name: "RELIANCE FUT 28May26 (NEXT)".to_string(),
+            },
+        );
+        derivative_contracts.insert(
+            80102,
+            DerivativeContract {
+                security_id: 80102,
+                underlying_symbol: "RELIANCE".to_string(),
+                instrument_kind: DhanInstrumentKind::OptionStock,
+                exchange_segment: ExchangeSegment::NseFno,
+                expiry_date: next,
+                strike_price: 2700.0,
+                option_type: Some(OptionType::Call),
+                lot_size: 250,
+                tick_size: 0.05,
+                symbol_name: "RELIANCE-28MAY26-2700-CE".to_string(),
+                display_name: "RELIANCE 2700 CE 28May26 (NEXT)".to_string(),
+            },
+        );
+
+        let mut option_chains = HashMap::new();
+        option_chains.insert(
+            OptionChainKey {
+                underlying_symbol: "RELIANCE".to_string(),
+                expiry_date: next,
+            },
+            OptionChain {
+                underlying_symbol: "RELIANCE".to_string(),
+                expiry_date: next,
+                calls: vec![OptionChainEntry {
+                    security_id: 80102,
+                    strike_price: 2700.0,
+                    lot_size: 250,
+                }],
+                puts: Vec::new(),
+                future_security_id: Some(80101),
+            },
+        );
+
+        let mut expiry_calendars = HashMap::new();
+        expiry_calendars.insert(
+            "RELIANCE".to_string(),
+            ExpiryCalendar {
+                underlying_symbol: "RELIANCE".to_string(),
+                expiry_dates: vec![nearest, next],
+            },
+        );
+
+        let ist = tickvault_common::trading_calendar::ist_offset();
+        let universe = FnoUniverse {
+            underlyings,
+            derivative_contracts,
+            option_chains,
+            expiry_calendars,
+            instrument_info: HashMap::new(),
+            subscribed_indices: Vec::new(),
+            build_metadata: UniverseBuildMetadata {
+                csv_source: "test".to_string(),
+                csv_row_count: 0,
+                parsed_row_count: 0,
+                index_count: 0,
+                equity_count: 0,
+                underlying_count: 0,
+                derivative_count: 0,
+                option_chain_count: 0,
+                build_duration: Duration::from_millis(0),
+                build_timestamp: Utc::now().with_timezone(&ist),
+            },
+        };
+
+        let cal = make_test_calendar_no_holidays();
+        let mut spot = HashMap::new();
+        spot.insert("RELIANCE".to_string(), 2700.0);
+        let plan = build_subscription_plan(
+            &universe,
+            &SubscriptionConfig::default(),
+            today,
+            &spot,
+            Some(&cal),
+        );
+
+        let subscribed_ids: HashSet<u32> = plan.registry.iter().map(|i| i.security_id).collect();
+
+        // BOTH NEAREST FUT and NEAREST CE must be DROPPED (rolled away).
+        assert!(
+            !subscribed_ids.contains(&80001),
+            "Stock FUTSTK at T-1 nearest expiry must be rolled — found in subscription"
+        );
+        assert!(
+            !subscribed_ids.contains(&80002),
+            "Stock OPTSTK at T-1 nearest expiry must be rolled — found in subscription"
+        );
+        // BOTH NEXT FUT and NEXT CE must be SUBSCRIBED (rolled to).
+        assert!(
+            subscribed_ids.contains(&80101),
+            "Stock FUTSTK at NEXT expiry must be subscribed after rollover"
+        );
+        assert!(
+            subscribed_ids.contains(&80102),
+            "Stock OPTSTK at NEXT expiry must be subscribed after rollover"
         );
     }
 }
