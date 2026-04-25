@@ -57,7 +57,7 @@ tracing-opentelemetry = "0.32.1"
 # Phase 2 of plans/active-plan.md: hourly-rotated ERROR-only JSONL stream
 # at data/logs/errors.jsonl so Claude Code / Loki / summary_writer can tail
 # a structured, append-only file instead of parsing journald prose.
-tracing-appender = "0.2.3"
+tracing-appender = "0.2.5"
 
 # ---- Section 6: Trading Domain — Auth ----
 arc-swap = "1.9.1"
@@ -134,7 +134,7 @@ clap = { version = "4.6.0", features = ["derive"] }
 uuid = { version = "1.23.0", features = ["v4", "serde"] }
 
 # ---- Section 18: Telegram Alerts ----
-teloxide = { version = "0.13.0", features = ["macros"] }
+teloxide = { version = "0.17.0", features = ["macros"] }
 
 # ---- Section 13: Dev/Test Dependencies ----
 criterion = { version = "0.8.2", features = ["html_reports"] }

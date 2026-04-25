@@ -35,7 +35,7 @@ services:
   # Bible #16: questdb/questdb:9.3.2
   # ---------------------------------------------------------------------------
   tv-questdb:
-    image: questdb/questdb:9.3.2@sha256:f8802d6ffa8c855fc3f9f69e86aaabcc4ee4d921e6755af4690b0b0290036517
+    image: questdb/questdb:9.3.5@sha256:5b6f1518296b45aa9ba049382b11b15cfb71e39d8b9dd5634683184bbd97bf0b
     container_name: tv-questdb
     hostname: tv-questdb
     restart: unless-stopped
@@ -114,7 +114,7 @@ services:
   # Bible #18: valkey/valkey:9.0.2-alpine
   # ---------------------------------------------------------------------------
   tv-valkey:
-    image: valkey/valkey:9.0.2-alpine@sha256:68677f85c863830af7836ff07c4a13b7f085ebeff62f4dedb71499ca27d229f2
+    image: valkey/valkey:9.0.3-alpine@sha256:f741f6f4080be5f2bc213f31206a608bee5369ab617a03d6970b800ee60a00c5
     container_name: tv-valkey
     hostname: tv-valkey
     restart: unless-stopped
@@ -152,7 +152,7 @@ services:
   # Bible: oliver006/redis_exporter:v1.67.0
   # ---------------------------------------------------------------------------
   tv-valkey-exporter:
-    image: oliver006/redis_exporter:v1.67.0@sha256:120f7ec77293459ccfdad66bb1db75ab72e8bfeab99f58b1cc2564cadcd7a9e7
+    image: oliver006/redis_exporter:v1.82.0@sha256:4b467f718ea9f62fe47b87ce39039ebeedff7764c40fde2a129913484fff716f
     container_name: tv-valkey-exporter
     hostname: tv-valkey-exporter
     restart: unless-stopped
@@ -183,7 +183,7 @@ services:
   # Bible #28: prom/prometheus:v3.9.1
   # ---------------------------------------------------------------------------
   tv-prometheus:
-    image: prom/prometheus:v3.9.1@sha256:1f0f50f06acaceb0f5670d2c8a658a599affe7b0d8e78b898c1035653849a702
+    image: prom/prometheus:v3.11.2@sha256:3674db04d3640d2157de57f8679dbe8dbc10a673e6d63ec58d9430e34abbfe68
     container_name: tv-prometheus
     hostname: tv-prometheus
     restart: unless-stopped
@@ -225,7 +225,7 @@ services:
   # Pinned: prom/alertmanager:v0.28.1
   # ---------------------------------------------------------------------------
   tv-alertmanager:
-    image: prom/alertmanager:v0.28.1@sha256:27c475db5fb156cab31d5c18a4251ac7ed567746a2483ff264516437a39b15ba
+    image: prom/alertmanager:v0.32.0@sha256:fe1f57b89ec7b94928746e61d9924cafd3674c688e3c7c3ad9600d8ef5da6cf9
     container_name: tv-alertmanager
     hostname: tv-alertmanager
     restart: unless-stopped
@@ -316,7 +316,7 @@ services:
   # Bible #79: traefik:v3.6.8
   # ---------------------------------------------------------------------------
   tv-traefik:
-    image: traefik:v3.6.8@sha256:90099f8948c828ecf0ababd711a4359a2443eba12261c1df2f548a3b1d815938
+    image: traefik:v3.6.14@sha256:e08f2a770aee6b838b4c1be5fe25569a653b1592e4673a240414bc8bc4ad0aaa
     container_name: tv-traefik
     hostname: tv-traefik
     restart: unless-stopped
@@ -359,7 +359,7 @@ services:
   tv-loki:
     # 2026-04-25: SHA256 digest pinned per CLAUDE.md "All images pinned with
     # SHA256 digest". Linux/amd64 digest from Docker Hub registry.
-    image: grafana/loki:3.6.6@sha256:ea32fad24c19145c73c606409d20db34a5b1d1d22c3fd7075bac3a40487c7a42
+    image: grafana/loki:3.7.1@sha256:1694e9237e2b3d7cd4ad959bae1f21e12b6184d886d7412bd1b939fb0dd4e75c
     container_name: tv-loki
     hostname: tv-loki
     profiles:
@@ -391,7 +391,7 @@ services:
   tv-alloy:
     # 2026-04-25: SHA256 digest pinned per CLAUDE.md "All images pinned with
     # SHA256 digest". Linux/amd64 digest from Docker Hub registry.
-    image: grafana/alloy:v1.8.0@sha256:769a27e1b26fcd37f7f7c611fff66d0f550d4888c7698c2396bf50b68fdc952f
+    image: grafana/alloy:v1.16.0@sha256:c12b05c77378537384f4082011855338de4558d258a1f3351862b73a920ea55c
     container_name: tv-alloy
     hostname: tv-alloy
     profiles:
