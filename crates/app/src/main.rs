@@ -5170,8 +5170,15 @@ fn spawn_historical_candle_fetch(
         // Otherwise pass the window to both functions so their SQL WHERE
         // clauses are narrowed to today's 09:15-15:30 IST session.
         // -----------------------------------------------------------------
+        // 2026-04-24 Parthiban directive: cross-verify is a POST-MARKET
+        // ONLY operation. The session must be fully closed before the
+        // grid is comparable — running mid-session always yields partial
+        // coverage and a non-actionable Skipped/Failed Telegram. The
+        // new gate in `from_now_post_market_only()` returns None for
+        // both pre-market AND mid-session boots; only 15:30+ IST on a
+        // trading day produces a window.
         let today_window = if is_trading_day {
-            tickvault_core::historical::cross_verify::TodayIstWindow::from_now()
+            tickvault_core::historical::cross_verify::TodayIstWindow::from_now_post_market_only()
         } else {
             None
         };
@@ -5192,13 +5199,19 @@ fn spawn_historical_candle_fetch(
                     candles_compared: 0,
                 });
             } else {
-                // Pre-market on a trading day — silent skip per Parthiban
-                // directive. INFO log only; NO Telegram notification.
+                // Trading day, but EITHER pre-market (< 09:15 IST) OR
+                // mid-session (09:15..15:30 IST). Silent skip per
+                // Parthiban directive — INFO log only, no Telegram.
+                // Cross-verify retries on every subsequent boot until
+                // the post-market gate opens, at which point the
+                // success-marker idempotency takes over.
                 info!(
                     instruments_fetched = summary.instruments_fetched,
                     instruments_failed = summary.instruments_failed,
                     total_candles = summary.total_candles,
-                    "cross-verify + cross-match SILENTLY skipped — pre-market on trading day (will run post-market)"
+                    "cross-verify + cross-match SILENTLY skipped — \
+                     trading day but not yet post-market (15:30 IST). \
+                     Will run on the next boot scheduled at or after 15:30 IST."
                 );
             }
             return;
