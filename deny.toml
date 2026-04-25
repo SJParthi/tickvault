@@ -125,6 +125,10 @@ skip = [
     # toml_edit 0.22 (direct) + toml_edit 0.23 (via cargo-deny internal) etc.
     # causes winnow 0.6 + 0.7 duplicate through toml_edit's parser stack.
     { crate = "winnow", reason = "toml_edit + figment parser version split" },
+    # 2026-04-25 reqwest 0.12 → 0.13 bump: opentelemetry-http 0.31.0 still
+    # pins reqwest 0.12.28 transitively; we direct-pin 0.13.2. Will resolve
+    # when opentelemetry-otlp upgrades. Not on our hot path.
+    { crate = "reqwest", reason = "opentelemetry-http 0.31 uses reqwest 0.12, we pin 0.13 directly" },
 ]
 skip-tree = []
 
