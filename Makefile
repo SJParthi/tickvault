@@ -50,9 +50,14 @@ run: ## Run app in dev mode (pretty logs, localhost config)
 	@./scripts/ensure-ready.sh
 	@cargo run
 
-stop: ## Stop running app
+stop: ## Stop running app (also wipes the on-disk JWT cache)
 	@echo "🛑 Stopping $(APP_NAME)..."
 	@-pkill -f "target/debug/$(APP_NAME)" 2>/dev/null && echo "  Stopped." || echo "  Not running."
+	@# Defence-in-depth: remove the cached Dhan JWT so a stolen-laptop
+	@# scenario cannot reuse it. The app re-fetches via SSM on next boot.
+	@if [ -f data/cache/tv-token-cache ]; then \
+		rm -f data/cache/tv-token-cache && echo "  Token cache wiped."; \
+	fi
 
 restart: stop ## Restart app (stop + run)
 	@sleep 1
