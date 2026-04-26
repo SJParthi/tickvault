@@ -274,14 +274,14 @@
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "thresholds" },
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }] }
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "orange", "value": 5 }, { "color": "red", "value": 10 }] }
         },
         "overrides": []
       },
       "gridPos": { "h": 4, "w": 12, "x": 0, "y": 20 },
       "id": 13,
       "title": "Cross-Segment Security-ID Collisions",
-      "description": "Number of (security_id, segment) collisions detected at InstrumentRegistry build time. Healthy baseline = 0. Any non-zero value = Dhan's CSV reused an id across segments; verify both segments are streaming ticks (see audit-findings-2026-04-17.md).",
+      "description": "Number of (security_id, segment) collisions detected at InstrumentRegistry build time. Baseline = 2 (NIFTY id=13 and BANKNIFTY id=25 collide with NSE_EQ stocks now that cash equities for F&O underlyings are subscribed; the composite (security_id, segment) index handles them safely — see security-id-uniqueness.md). Threshold: orange ≥ 5, red ≥ 10. Aligned with operator-health.json so both dashboards agree.",
       "type": "stat",
       "options": { "colorMode": "background_solid", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
       "targets": [

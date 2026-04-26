@@ -962,6 +962,16 @@ async fn main() -> Result<()> {
         // endpoint reported `websocket_connections: 0` forever.
         let health_status: SharedHealthStatus = std::sync::Arc::new(SystemHealthStatus::new());
 
+        // Pipeline-active wiring: when the tick processor spawned successfully
+        // above, flip the flag so /health reports "active" and the
+        // `tv_pipeline_active` Prometheus gauge (System Overview "Pipeline
+        // Status" tile) reads 1=RUNNING. Before this wiring the gauge was
+        // never emitted, leaving the tile RED on every boot even though
+        // ticks were flowing.
+        if processor_handle.is_some() {
+            health_status.set_pipeline_active(true);
+        }
+
         // --- NOW spawn WebSocket connections (tick processor consuming) ---
         // S4-T1a/T1b: Wrap the pool in Arc so we can retain clones for the
         // pool watchdog task and the graceful-shutdown handler. All three
@@ -2079,6 +2089,12 @@ async fn main() -> Result<()> {
         info!(
             "tick processor started (with candle aggregation + top movers + option movers + trading broadcast)"
         );
+        // Pipeline-active wiring (slow boot): mirror the fast-boot flip
+        // above so the System Overview "Pipeline Status" tile reads
+        // RUNNING and /health reports `pipeline.active` instead of
+        // `pipeline.inactive`. `health_status` is created earlier in the
+        // slow-boot sequence and is in scope here.
+        health_status.set_pipeline_active(true);
         Some(handle)
     } else {
         info!("tick processor skipped — no frame source available");
@@ -5192,9 +5208,29 @@ fn spawn_historical_candle_fetch(
         } else {
             None
         };
-        if zero_fetched_no_actual_failures && today_candle_presence.unwrap_or(0) > 0 {
-            // DB already has today's data. This is an idempotent re-run,
-            // not an outage. Fire LOW.
+        // 2026-04-26: gate the zero-fetched HIGH alert on `is_trading_day`.
+        // On a non-trading day (weekend / NSE holiday) the market never
+        // opened, so "fetched 0 instruments / 0 candles" is BY DESIGN —
+        // not an outage. Routing it to HIGH `HistoricalFetchFailed` paged
+        // the operator on every weekend boot. Per the
+        // `audit-findings-2026-04-17` Rule 11 ("False-OK classification
+        // is a CLASS bug"), the symmetric inverse applies here: a
+        // FAILURE-class event whose denominator is structurally zero on
+        // the current calendar day is a false-positive and must route to
+        // a Low/typed-Skipped variant instead.
+        //
+        // We reuse `HistoricalFetchAlreadyAvailable` for this case (with
+        // `today_candles=0`, since the market never opened so there is
+        // nothing to count). The variant's semantic — "DB already
+        // reflects current state, nothing was fetched, this is normal" —
+        // matches the non-trading-day case. The Severity stays Low.
+        let zero_fetched_non_trading_day = zero_fetched_no_actual_failures && !is_trading_day;
+        if zero_fetched_no_actual_failures
+            && (today_candle_presence.unwrap_or(0) > 0 || zero_fetched_non_trading_day)
+        {
+            // Either DB already has today's data (idempotent re-run on a
+            // trading day) OR it's a non-trading day so zero-fetched is
+            // expected. Fire LOW in both cases.
             let today_candles = today_candle_presence.unwrap_or(0);
             let today_ist_label =
                 tickvault_core::historical::cross_verify::TodayIstWindow::from_now()
@@ -5210,6 +5246,14 @@ fn spawn_historical_candle_fetch(
                             .date_naive()
                             .to_string()
                     });
+            if zero_fetched_non_trading_day {
+                info!(
+                    today_ist = %today_ist_label,
+                    "historical fetch returned zero on a non-trading day — \
+                     market never opened, classifying as expected (LOW), \
+                     not an outage (HIGH)"
+                );
+            }
             bg_notifier.notify(NotificationEvent::HistoricalFetchAlreadyAvailable {
                 today_ist: today_ist_label,
                 today_candles,
