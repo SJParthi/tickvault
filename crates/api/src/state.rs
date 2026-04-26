@@ -116,8 +116,16 @@ impl SystemHealthStatus {
     }
 
     /// Marks the tick pipeline as active/inactive.
+    ///
+    /// Also emits the `tv_pipeline_active` Prometheus gauge (0 = stopped,
+    /// 1 = running) so the System Overview dashboard's "Pipeline Status"
+    /// tile reflects the live flag instead of "No data". Without this
+    /// emission the Grafana panel queries a metric that never gets
+    /// scraped → tile reads RED "STOPPED" forever even when the tick
+    /// processor is consuming ticks.
     pub fn set_pipeline_active(&self, active: bool) {
         self.pipeline_active.store(active, Ordering::Relaxed);
+        metrics::gauge!("tv_pipeline_active").set(if active { 1.0 } else { 0.0 });
     }
 
     /// Returns whether the tick pipeline is active.
