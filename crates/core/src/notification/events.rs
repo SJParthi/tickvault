@@ -1447,7 +1447,7 @@ impl NotificationEvent {
                     "Will compare on next run after live ticks during market hours."
                 };
                 format!(
-                    "<b>Historical vs Live cross-match SKIPPED</b>\nReason: {reason}\nLEFT JOIN rows: {candles_compared} (diagnostic only)\n{next_action}"
+                    "<b>Historical vs Live cross-match SKIPPED</b>\nReason: {reason}\nCandles compared: {candles_compared}\n{next_action}"
                 )
             }
             Self::IpVerificationFailed { reason } => {
