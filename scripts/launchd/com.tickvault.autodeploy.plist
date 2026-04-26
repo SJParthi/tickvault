@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.tickvault.autodeploy</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <!-- EDIT THIS PATH if your repo is not at ~/IdeaProjects/tickvault -->
+        <string>/Users/YOUR_USERNAME/IdeaProjects/tickvault/scripts/launchd/auto-deploy.sh</string>
+    </array>
+
+    <!-- Restart automatically if the script crashes -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Start at login -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Throttle restarts to once per 60s if the script keeps dying -->
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
+
+    <!-- Inherit the user's PATH so `git`, `gh`, `cargo`, `make`, `docker` are found -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+
+    <!-- Stdout / stderr go straight to the same log file the script writes to -->
+    <key>StandardOutPath</key>
+    <string>/Users/YOUR_USERNAME/IdeaProjects/tickvault/data/logs/auto-deploy.launchd.out</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/YOUR_USERNAME/IdeaProjects/tickvault/data/logs/auto-deploy.launchd.err</string>
+</dict>
+</plist>

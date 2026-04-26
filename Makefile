@@ -50,9 +50,14 @@ run: ## Run app in dev mode (pretty logs, localhost config)
 	@./scripts/ensure-ready.sh
 	@cargo run
 
-stop: ## Stop running app
+stop: ## Stop running app (also wipes the on-disk JWT cache)
 	@echo "🛑 Stopping $(APP_NAME)..."
 	@-pkill -f "target/debug/$(APP_NAME)" 2>/dev/null && echo "  Stopped." || echo "  Not running."
+	@# Defence-in-depth: remove the cached Dhan JWT so a stolen-laptop
+	@# scenario cannot reuse it. The app re-fetches via SSM on next boot.
+	@if [ -f data/cache/tv-token-cache ]; then \
+		rm -f data/cache/tv-token-cache && echo "  Token cache wiped."; \
+	fi
 
 restart: stop ## Restart app (stop + run)
 	@sleep 1
@@ -208,6 +213,15 @@ open: ## Open DLT Control Panel in browser
 
 grafana: ## Open Grafana dashboard (localhost:3000)
 	@open http://localhost:3000
+
+grafana-reload: ## Reload Grafana provisioning (run after editing alerts.yml or dashboards/*.json)
+	@echo "Reloading Grafana provisioning..."
+	@docker compose -f deploy/docker/docker-compose.yml restart tv-grafana >/dev/null 2>&1 \
+		&& echo "  Grafana reloaded — alert rule + dashboard changes are live." \
+		|| { echo "  Reload failed — is Docker running? Try: make docker-up"; exit 1; }
+
+grafana-watch: ## Watch grafana provisioning dir + auto-reload on change (Ctrl+C to stop)
+	@bash scripts/grafana-watch.sh
 
 questdb: ## Open QuestDB console (localhost:9000)
 	@open http://localhost:9000
