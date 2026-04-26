@@ -220,6 +220,9 @@ grafana-reload: ## Reload Grafana provisioning (run after editing alerts.yml or 
 		&& echo "  Grafana reloaded — alert rule + dashboard changes are live." \
 		|| { echo "  Reload failed — is Docker running? Try: make docker-up"; exit 1; }
 
+grafana-watch: ## Watch grafana provisioning dir + auto-reload on change (Ctrl+C to stop)
+	@bash scripts/grafana-watch.sh
+
 questdb: ## Open QuestDB console (localhost:9000)
 	@open http://localhost:9000
 
