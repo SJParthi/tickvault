@@ -214,6 +214,12 @@ open: ## Open DLT Control Panel in browser
 grafana: ## Open Grafana dashboard (localhost:3000)
 	@open http://localhost:3000
 
+grafana-reload: ## Reload Grafana provisioning (run after editing alerts.yml or dashboards/*.json)
+	@echo "Reloading Grafana provisioning..."
+	@docker compose -f deploy/docker/docker-compose.yml restart tv-grafana >/dev/null 2>&1 \
+		&& echo "  Grafana reloaded — alert rule + dashboard changes are live." \
+		|| { echo "  Reload failed — is Docker running? Try: make docker-up"; exit 1; }
+
 questdb: ## Open QuestDB console (localhost:9000)
 	@open http://localhost:9000
 
