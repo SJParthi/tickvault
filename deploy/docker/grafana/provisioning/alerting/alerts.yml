@@ -127,6 +127,12 @@ groups:
     rules:
       - uid: tickvault-down
         title: "Application Down"
+        # Boot sequence is ~37s (CryptoProvider → Config → SSM → JWT → DDL →
+        # universe build → WebSocket pool). Scrape interval is 15s. Old
+        # `for: 1m` + `noDataState: Alerting` fired during every cold start
+        # before the first successful scrape landed. 5 minutes is the smallest
+        # window that covers a clean boot + 1-2 missed scrapes without paging
+        # the operator on every restart.
         condition: C
         data:
           - refId: A
@@ -151,24 +157,32 @@ groups:
               expression: B
               conditions:
                 - evaluator: { type: lt, params: [1] }
-        noDataState: Alerting
+        noDataState: OK
         execErrState: Alerting
-        for: 1m
+        for: 5m
         annotations:
           summary: "tickvault application is DOWN"
-          description: "The main trading application has been unreachable for more than 1 minute. Immediate action required."
+          description: "The main trading application has been unreachable for more than 5 minutes. Immediate action required."
         labels:
           severity: critical
 
       - uid: tv-pipeline-stopped
         title: "Pipeline Stopped"
+        # Pipeline-active==0 by itself is NOT a fault: on weekends, holidays,
+        # and outside 09:15-15:30 IST the WebSocket pool is intentionally not
+        # started ("WebSocket pool skipped — non-trading day" / off-hours boot
+        # path), so tv_pipeline_active stays 0 by design. The alert should
+        # only fire when WS connections ARE up (so we expect ticks to flow)
+        # but the pipeline isn't moving them. Mirrors the gating used by
+        # tv-no-ticks / tv-depth-* in tickvault-alerts.yml
+        # (`... and tv_pipeline_active == 1`).
         condition: C
         data:
           - refId: A
             relativeTimeRange: { from: 300, to: 0 }
             datasourceUid: prometheus
             model:
-              expr: "tv_pipeline_active == 0"
+              expr: "tv_pipeline_active == 0 and tv_websocket_connections_active > 0"
               intervalMs: 15000
               maxDataPoints: 43200
           - refId: B
@@ -185,13 +199,13 @@ groups:
               type: threshold
               expression: B
               conditions:
-                - evaluator: { type: lt, params: [1] }
-        noDataState: Alerting
+                - evaluator: { type: gt, params: [0] }
+        noDataState: OK
         execErrState: Alerting
-        for: 1m
+        for: 2m
         annotations:
           summary: "Tick processing pipeline is STOPPED"
-          description: "The pipeline has been inactive for 1+ minute. No ticks are being processed."
+          description: "WebSocket connections are active but the tick pipeline is inactive for 2+ minutes. Investigate the pipeline task."
         labels:
           severity: critical
 
@@ -378,17 +392,24 @@ groups:
     rules:
       - uid: tv-error-logs
         title: "Application ERROR Logs Detected"
+        # Two changes vs the previous version:
+        #   1. Use Loki's parsed `level` label (`| json | level=~"ERROR|FATAL"`)
+        #      instead of a raw substring match on the JSON line. The old
+        #      `|~ "\"level\":\"(ERROR|FATAL)\""` regex was correct in spirit
+        #      but fragile against any future field whose value contains the
+        #      literal token `"level":"ERROR"` (e.g. a serialized error
+        #      object). Parsing the JSON makes the match unambiguous.
+        #   2. `for: 1m` (was 0m). Single transient ERRORs (e.g. a one-off
+        #      flush that retries successfully) don't deserve a page; a
+        #      sustained 1-minute presence does. WARN-level retries (auth
+        #      transient backoff, etc.) are NOT matched — only true ERROR/FATAL.
         condition: C
         data:
           - refId: A
             relativeTimeRange: { from: 120, to: 0 }
             datasourceUid: loki
             model:
-              # Match the JSON `"level":"ERROR"` field exactly (not arbitrary substrings).
-              # Old regex `(?i)(ERROR|PANIC|FATAL)` matched filenames like
-              # "errors.summary.md", metric names like "tv_historical_api_errors_total",
-              # and Dhan field names like "errorCode" — causing constant false positives.
-              expr: "count_over_time({job=\"tv-docker\", container=\"tickvault\"} |~ \"\\\"level\\\":\\\"(ERROR|FATAL)\\\"\" [2m])"
+              expr: "count_over_time({job=\"tv-docker\", container=\"tickvault\"} | json | level=~\"ERROR|FATAL\" [2m])"
               intervalMs: 15000
               maxDataPoints: 43200
           - refId: B
@@ -408,10 +429,10 @@ groups:
                 - evaluator: { type: gt, params: [0] }
         noDataState: OK
         execErrState: Alerting
-        for: 0m
+        for: 1m
         annotations:
-          summary: "ERROR/PANIC/FATAL logs detected in tickvault"
-          description: "Application produced ERROR-level logs in the last 2 minutes. Check Grafana Logs dashboard for details."
+          summary: "ERROR/FATAL logs detected in tickvault"
+          description: "Application produced ERROR or FATAL logs sustained for 1+ minute (window: last 2 minutes). WARN-level transient retries are excluded. Check Grafana Logs dashboard for details."
         labels:
           severity: critical
 
