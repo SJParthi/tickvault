@@ -384,7 +384,11 @@ groups:
             relativeTimeRange: { from: 120, to: 0 }
             datasourceUid: loki
             model:
-              expr: "count_over_time({job=\"tv-docker\", container=\"tickvault\"} |~ \"(?i)(ERROR|PANIC|FATAL)\" [2m])"
+              # Match the JSON `"level":"ERROR"` field exactly (not arbitrary substrings).
+              # Old regex `(?i)(ERROR|PANIC|FATAL)` matched filenames like
+              # "errors.summary.md", metric names like "tv_historical_api_errors_total",
+              # and Dhan field names like "errorCode" — causing constant false positives.
+              expr: "count_over_time({job=\"tv-docker\", container=\"tickvault\"} |~ \"\\\"level\\\":\\\"(ERROR|FATAL)\\\"\" [2m])"
               intervalMs: 15000
               maxDataPoints: 43200
           - refId: B
