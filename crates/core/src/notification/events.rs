@@ -456,6 +456,16 @@ pub enum NotificationEvent {
     /// Fires on every successful reconnect, inside or outside market
     /// hours (Parthiban directive 2026-04-21 — full audit trail on all
     /// WS events).
+    ///
+    /// Severity intentionally downgraded to `Severity::Low` (was Medium
+    /// before 2026-04-26). Dhan's order-update server idle-disconnects
+    /// accounts that haven't placed an order in 30-60 minutes, so on a
+    /// dry-run / paper-trading day this event fires 5-10 times. A
+    /// successful recovery is operator-informational, not pager-worthy
+    /// — MEDIUM at that volume is pure pager fatigue. The companion
+    /// `OrderUpdateDisconnected` (Severity::High) still pages on the
+    /// disconnect leg, and `OrderUpdateReconnectionExhausted` (if/when
+    /// added) would page CRITICAL on actual loss-of-feed.
     OrderUpdateReconnected { consecutive_failures: u32 },
 
     /// CRITICAL: zero live ticks received during market hours past the
@@ -1596,7 +1606,7 @@ impl NotificationEvent {
             // Swap itself failed — depth quality degraded until next rebalance.
             Self::DepthRebalanceFailed { .. } => Severity::High,
             Self::OrderUpdateDisconnected { .. } => Severity::High,
-            Self::OrderUpdateReconnected { .. } => Severity::Medium,
+            Self::OrderUpdateReconnected { .. } => Severity::Low,
             Self::NoLiveTicksDuringMarketHours { .. } => Severity::Critical,
             Self::ShutdownInitiated => Severity::Medium,
             Self::CircuitBreakerClosed => Severity::Medium,
@@ -2834,6 +2844,22 @@ mod tests {
             connection_index: 0,
         };
         assert_eq!(event.severity(), Severity::Medium);
+    }
+
+    /// Ratchet (added 2026-04-26): order update WS reconnects MUST be
+    /// Severity::Low, not Medium. Dhan idle-disconnects accounts every
+    /// 30-60 minutes on dry-run / paper-trading days, so this event
+    /// fires 5-10x/day and Medium = pure pager fatigue. The disconnect
+    /// leg (`OrderUpdateDisconnected`, Severity::High) is what pages
+    /// the operator. If this test fails because someone bumped this
+    /// back to Medium/High, talk to whoever did it before "fixing"
+    /// the test.
+    #[test]
+    fn test_order_update_reconnected_severity_is_low() {
+        let event = NotificationEvent::OrderUpdateReconnected {
+            consecutive_failures: 5,
+        };
+        assert_eq!(event.severity(), Severity::Low);
     }
 
     #[test]

@@ -53,7 +53,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tickvault_common::market_hours::is_within_market_hours_ist;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::auth::token_manager::TokenManager;
 use crate::notification::events::NotificationEvent;
@@ -105,14 +105,105 @@ async fn run_watchdog_loop(
             continue;
         }
         let check_result = token_manager.pre_market_check().await;
-        let is_failing = check_result.is_err();
-        let reason = match &check_result {
-            Ok(()) => None,
-            Err(err) => Some(format!("{err}")),
-        };
-        let transition = evaluate_transition(&state, is_failing);
+        let (is_real_auth_failing, reason) = classify_check_result(&check_result);
+        let transition = evaluate_transition(&state, is_real_auth_failing);
         apply_transition(transition, &mut state, reason, notifier.as_ref());
     }
+}
+
+/// Classify a `pre_market_check` result into "real auth failure" vs
+/// "transient network failure".
+///
+/// **Why this exists** (2026-04-26 incident): the original watchdog
+/// fired CRITICAL Telegram on ANY `pre_market_check` error. On a Sunday
+/// at 13:09 IST the operator's laptop hit a 30-second DNS hiccup
+/// (`failed to lookup address information`) and the watchdog paged
+/// CRITICAL — but nothing was actually wrong with the Dhan token or
+/// data plan. False CRITICAL pages erode the operator's trust in real
+/// CRITICAL pages, so we now distinguish:
+///
+/// * **Transient network failure** (DNS lookup failed, connect refused,
+///   connection reset, request timeout, no route to host) → log WARN,
+///   increment `tv_mid_session_profile_transient_failure_total`, do NOT
+///   page Telegram. The next 15-minute cycle will re-check.
+/// * **Real auth failure** (HTTP 401/403, profile parse error, dataPlan
+///   inactive, activeSegment missing Derivative, token expiry < 4h) →
+///   page CRITICAL Telegram via the existing rising-edge logic.
+///
+/// Returns `(is_real_auth_failing, reason)`. The boolean drives the
+/// state machine; transient failures return `false` so they never
+/// touch `state.currently_failing`. This means a transient blip
+/// followed by a real auth failure on the NEXT cycle still fires
+/// CRITICAL on the rising edge — which is the property we want.
+fn classify_check_result(
+    result: &Result<(), tickvault_common::error::ApplicationError>,
+) -> (bool, Option<String>) {
+    match result {
+        Ok(()) => (false, None),
+        Err(err) => {
+            let reason = format!("{err}");
+            if is_transient_network_failure(&reason) {
+                warn!(
+                    reason = %reason,
+                    "mid-session profile check encountered transient network error — not paging (will retry next cycle)"
+                );
+                metrics::counter!("tv_mid_session_profile_transient_failure_total").increment(1);
+                (false, Some(reason))
+            } else {
+                (true, Some(reason))
+            }
+        }
+    }
+}
+
+/// Returns true if the failure reason is a transient network error
+/// (laptop offline / DNS flap / Dhan socket reset) rather than a
+/// real Dhan-side auth or data-plan invalidation.
+///
+/// The reason strings come from [`crate::auth::token_manager::TokenManager::get_user_profile`]
+/// and reach this classifier via `format!("{err}")` on the
+/// `ApplicationError::AuthenticationFailed` Display, which prepends
+/// `"Dhan authentication failed: "` to the inner reason. So the
+/// strings we see here look like one of:
+///
+/// * `"Dhan authentication failed: profile request failed: <reqwest::Error>"`
+///   — the HTTP send leg failed before any response was received.
+///   ALL such cases are network-side. We require BOTH the
+///   `"profile request failed:"` wrapper (proves we're on the send
+///   leg, not a real HTTP 4xx response which uses the
+///   `"profile request HTTP {status}"` wrapper) AND one of the
+///   transient substrings below.
+/// * `"Dhan authentication failed: profile request HTTP 401 ..."` —
+///   real auth failure; NOT transient.
+/// * `"Dhan authentication failed: data plan is 'Inactive' ..."` —
+///   real data-plan failure; NOT transient.
+///
+/// New substrings should be added here only after observing them in
+/// `tv_mid_session_profile_transient_failure_total` not incrementing
+/// during a known transient incident — i.e. the ratchet tests in this
+/// module prove which cases are covered.
+fn is_transient_network_failure(reason: &str) -> bool {
+    // Must be the HTTP-send-leg wrapper, NOT the HTTP-response wrapper.
+    // `contains` (not `starts_with`) so this works whether or not
+    // ApplicationError::AuthenticationFailed's Display prefix is present.
+    if !reason.contains("profile request failed:") {
+        return false;
+    }
+    let lower = reason.to_lowercase();
+    [
+        "dns error",
+        "failed to lookup address",
+        "connection refused",
+        "connection reset",
+        "operation timed out",
+        "timedout",
+        "request timeout",
+        "connecterror",
+        "no route to host",
+        "network is unreachable",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
 }
 
 /// Internal state for the edge-triggered watchdog.
@@ -237,5 +328,193 @@ mod tests {
         const _: () = assert!(MID_SESSION_CHECK_INTERVAL_SECS >= 300);
         // At most 30 min (so mid-session invalidation is caught fast).
         const _: () = assert!(MID_SESSION_CHECK_INTERVAL_SECS <= 1800);
+    }
+
+    // ---------------------------------------------------------------
+    // 2026-04-26 transient-vs-real classifier ratchet tests.
+    //
+    // Every substring matched by `is_transient_network_failure` MUST
+    // have a covering test below. Adding a new substring without a
+    // test will let a real auth failure slip through the classifier
+    // unnoticed.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn transient_dns_lookup_failure_is_transient() {
+        // Verbatim from the 2026-04-26 13:09 IST production incident.
+        let reason = "profile request failed: error sending request for url \
+                      (https://api.dhan.co/v2/profile): client error (Connect): \
+                      dns error: failed to lookup address information: nodename \
+                      nor servname provided, or not known";
+        assert!(is_transient_network_failure(reason));
+    }
+
+    #[test]
+    fn transient_connection_refused_is_transient() {
+        let reason = "profile request failed: error sending request for url \
+                      (https://api.dhan.co/v2/profile): \
+                      Connection refused (os error 111)";
+        assert!(is_transient_network_failure(reason));
+    }
+
+    #[test]
+    fn transient_connection_reset_is_transient() {
+        // Mirrors the order-update WS reset error pattern.
+        let reason = "profile request failed: error sending request for url \
+                      (https://api.dhan.co/v2/profile): \
+                      Connection reset by peer (os error 54)";
+        assert!(is_transient_network_failure(reason));
+    }
+
+    #[test]
+    fn transient_request_timeout_is_transient() {
+        let reason = "profile request failed: \
+                      reqwest::Error { kind: Request, source: TimedOut }";
+        assert!(is_transient_network_failure(reason));
+    }
+
+    #[test]
+    fn transient_no_route_to_host_is_transient() {
+        let reason = "profile request failed: error sending request \
+                      for url (https://api.dhan.co/v2/profile): \
+                      No route to host (os error 65)";
+        assert!(is_transient_network_failure(reason));
+    }
+
+    #[test]
+    fn real_auth_http_401_is_not_transient() {
+        // Genuine auth failure — must page CRITICAL.
+        let reason = "profile request HTTP 401 Unauthorized — see server logs for details";
+        assert!(!is_transient_network_failure(reason));
+    }
+
+    #[test]
+    fn real_auth_http_403_is_not_transient() {
+        let reason = "profile request HTTP 403 Forbidden — see server logs for details";
+        assert!(!is_transient_network_failure(reason));
+    }
+
+    #[test]
+    fn real_data_plan_inactive_is_not_transient() {
+        let reason = "data plan is 'Inactive', must be 'Active' for market data access";
+        assert!(!is_transient_network_failure(reason));
+    }
+
+    #[test]
+    fn real_active_segment_missing_is_not_transient() {
+        let reason = "activeSegment does not contain 'Derivative' — F&O trading not enabled";
+        assert!(!is_transient_network_failure(reason));
+    }
+
+    #[test]
+    fn real_token_expiring_is_not_transient() {
+        let reason = "token validity 2h12m — must have > 4h before market open";
+        assert!(!is_transient_network_failure(reason));
+    }
+
+    #[test]
+    fn empty_reason_is_not_transient() {
+        // Defensive — never page on an empty string but never falsely
+        // classify it as transient either. Returning false here means
+        // the state machine still treats it as a real failure (and
+        // pages on the rising edge), which is the safe-by-default
+        // behaviour for an unknown error shape.
+        assert!(!is_transient_network_failure(""));
+    }
+
+    #[test]
+    fn reason_without_profile_request_failed_prefix_is_not_transient() {
+        // A reason like "dns error" with no prefix MUST NOT be
+        // classified as transient — it could equally come from a
+        // future error path we haven't audited.
+        let reason = "dns error: failed to lookup address information";
+        assert!(!is_transient_network_failure(reason));
+    }
+
+    /// Classifier returns (is_real_auth_failing, reason). Transient
+    /// inputs MUST set `is_real_auth_failing = false` so the state
+    /// machine never enters the failing state — that's the property
+    /// that prevents false CRITICAL pages.
+    #[test]
+    fn classify_check_result_transient_does_not_count_as_failing() {
+        use tickvault_common::error::ApplicationError;
+        let err = ApplicationError::AuthenticationFailed {
+            reason: "profile request failed: dns error: failed to lookup address \
+                     information"
+                .to_string(),
+        };
+        let result: Result<(), ApplicationError> = Err(err);
+        let (is_failing, reason) = classify_check_result(&result);
+        assert!(
+            !is_failing,
+            "transient DNS failure must NOT count as failing"
+        );
+        assert!(reason.is_some());
+    }
+
+    #[test]
+    fn classify_check_result_real_auth_counts_as_failing() {
+        use tickvault_common::error::ApplicationError;
+        let err = ApplicationError::AuthenticationFailed {
+            reason: "data plan is 'Inactive', must be 'Active' for market data \
+                     access"
+                .to_string(),
+        };
+        let result: Result<(), ApplicationError> = Err(err);
+        let (is_failing, reason) = classify_check_result(&result);
+        assert!(is_failing, "real auth failure must count as failing");
+        assert!(reason.is_some());
+    }
+
+    #[test]
+    fn classify_check_result_ok_is_not_failing() {
+        let result: Result<(), tickvault_common::error::ApplicationError> = Ok(());
+        let (is_failing, reason) = classify_check_result(&result);
+        assert!(!is_failing);
+        assert!(reason.is_none());
+    }
+
+    /// Round-trip property: a transient blip followed by a real auth
+    /// failure on the very next cycle MUST still page CRITICAL.
+    /// This is the headline property the 2026-04-26 hotfix preserves.
+    #[test]
+    fn transient_blip_then_real_failure_still_pages_critical() {
+        use tickvault_common::error::ApplicationError;
+
+        let mut state = WatchdogState::default();
+
+        // Cycle 1: transient (DNS hiccup) — must NOT flip state.
+        let r1: Result<(), ApplicationError> = Err(ApplicationError::AuthenticationFailed {
+            reason: "profile request failed: dns error: failed to lookup address \
+                     information"
+                .to_string(),
+        });
+        let (failing_1, _) = classify_check_result(&r1);
+        let t1 = evaluate_transition(&state, failing_1);
+        assert_eq!(
+            t1,
+            Transition::NoOp,
+            "transient must NOT trigger CRITICAL transition"
+        );
+        apply_transition(t1, &mut state, None, None);
+        assert!(
+            !state.currently_failing,
+            "state must stay clean after a transient"
+        );
+
+        // Cycle 2: real auth failure — MUST trigger FirstFailure
+        // (rising edge → CRITICAL Telegram).
+        let r2: Result<(), ApplicationError> = Err(ApplicationError::AuthenticationFailed {
+            reason: "data plan is 'Inactive', must be 'Active' for market data \
+                     access"
+                .to_string(),
+        });
+        let (failing_2, _) = classify_check_result(&r2);
+        let t2 = evaluate_transition(&state, failing_2);
+        assert_eq!(
+            t2,
+            Transition::FirstFailure,
+            "real auth failure after transient must page CRITICAL"
+        );
     }
 }
