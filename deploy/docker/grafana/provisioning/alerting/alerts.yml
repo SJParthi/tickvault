@@ -392,17 +392,28 @@ groups:
     rules:
       - uid: tv-error-logs
         title: "Application ERROR Logs Detected"
-        # Two changes vs the previous version:
+        # Three changes vs the previous version:
         #   1. Use Loki's parsed `level` label (`| json | level=~"ERROR|FATAL"`)
         #      instead of a raw substring match on the JSON line. The old
         #      `|~ "\"level\":\"(ERROR|FATAL)\""` regex was correct in spirit
         #      but fragile against any future field whose value contains the
         #      literal token `"level":"ERROR"` (e.g. a serialized error
         #      object). Parsing the JSON makes the match unambiguous.
-        #   2. `for: 1m` (was 0m). Single transient ERRORs (e.g. a one-off
-        #      flush that retries successfully) don't deserve a page; a
-        #      sustained 1-minute presence does. WARN-level retries (auth
-        #      transient backoff, etc.) are NOT matched — only true ERROR/FATAL.
+        #   2. WARN-level retries (auth transient backoff, etc.) are NOT
+        #      matched — only true ERROR/FATAL.
+        #   3. `for: 3m` (was 1m, originally 0m). Rationale: the count window
+        #      is `[2m]`, so ERROR lines from a PRIOR (now-exited) tickvault
+        #      process age out of the count within 2 minutes. Requiring the
+        #      condition to hold for 3 consecutive minutes makes it
+        #      mechanically impossible for stale-from-prior-run logs to page
+        #      after a fresh boot. Genuine sustained errors still alert —
+        #      they just need to be present for 3 minutes (already implied
+        #      by "sustained" semantics). Operator-observed false positive
+        #      on 2026-04-26 20:28 IST: clean boot at 20:27:44, alert fired
+        #      at 20:28 from a prior run's residual ERROR lines still in the
+        #      2m Loki window. JSONL sink + summary_writer were both empty
+        #      for the live process — confirming this was a stale-window
+        #      artifact, not a real error.
         condition: C
         data:
           - refId: A
@@ -429,10 +440,10 @@ groups:
                 - evaluator: { type: gt, params: [0] }
         noDataState: OK
         execErrState: Alerting
-        for: 1m
+        for: 3m
         annotations:
           summary: "ERROR/FATAL logs detected in tickvault"
-          description: "Application produced ERROR or FATAL logs sustained for 1+ minute (window: last 2 minutes). WARN-level transient retries are excluded. Check Grafana Logs dashboard for details."
+          description: "Application produced ERROR or FATAL logs sustained for 3+ minutes (window: last 2 minutes). WARN-level transient retries are excluded. Stale logs from a prior process cannot trigger this alert — the count window is shorter than the for-duration. Check Grafana Logs dashboard for details."
         labels:
           severity: critical
 
