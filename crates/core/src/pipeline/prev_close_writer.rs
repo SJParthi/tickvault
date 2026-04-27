@@ -192,7 +192,7 @@ mod tests {
     /// reasonable wall-clock window. This proves the async pipeline is
     /// wired end-to-end (channel → blocking task → fs::write → fs::rename).
     #[tokio::test]
-    async fn test_prev_close_writer_drains_to_disk() {
+    async fn test_spawn_drains_to_disk_via_blocking_pool() {
         let dir = fresh_test_dir("drain");
         let cache_path = dir.join("cache.json");
         let tmp_path = dir.join("cache.json.tmp");
@@ -222,7 +222,7 @@ mod tests {
     /// `tv_prev_close_writer_dropped_total{reason="full"}` counter, but
     /// must NEVER block the caller.
     #[tokio::test]
-    async fn test_prev_close_writer_drops_on_full_without_blocking() {
+    async fn test_try_enqueue_drops_oldest_on_full_without_blocking() {
         let dir = fresh_test_dir("saturation");
         let cache_path = dir.join("cache.json");
         let tmp_path = dir.join("cache.json.tmp");
@@ -259,7 +259,7 @@ mod tests {
     /// `init()` is safe to call multiple times — the second call is a
     /// no-op. Mirrors `init_prev_close_cache_dir()`'s idempotent contract.
     #[tokio::test]
-    async fn test_init_prev_close_writer_global_is_idempotent() {
+    async fn test_init_and_try_enqueue_global_are_safe_idempotent() {
         // Calling init() repeatedly must not panic and must leave the
         // global writer in a usable state. We don't assert that the
         // GLOBAL is re-spawned (it isn't) — only that no double-init
