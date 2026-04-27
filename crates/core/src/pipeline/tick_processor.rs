@@ -43,9 +43,12 @@ fn depth_prices_are_finite(depth: &[MarketDepthLevel; 5]) -> bool {
 // ---------------------------------------------------------------------------
 
 /// File path for index prev_close cache (survives mid-day restarts).
+///
+/// Wave 1 Item 0.a — the `*_TMP` constant is no longer used here; the
+/// async writer in `super::prev_close_writer` owns the tmp+rename
+/// atomic pattern internally.
 const INDEX_PREV_CLOSE_CACHE_DIR: &str = "data/instrument-cache";
 const INDEX_PREV_CLOSE_CACHE_PATH: &str = "data/instrument-cache/index-prev-close.json";
-const INDEX_PREV_CLOSE_CACHE_TMP: &str = "data/instrument-cache/index-prev-close.json.tmp";
 
 /// Wave 1 Item 0.d — boot-time idempotent init for the index prev_close
 /// cache directory. Hoisted out of the tick hot path (was previously a
@@ -1305,33 +1308,25 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                 if exchange_segment_code == 0 {
                     // IDX_I segment
                     index_prev_close_cache.insert(security_id, previous_close);
-                    // Atomic file write: serialize → write to .tmp → rename.
-                    // Prevents partial/corrupt cache on crash or disk full.
                     //
-                    // Wave 1 Item 0.d — `create_dir_all` was hoisted to boot via
-                    // `init_prev_close_cache_dir()`. The hot path assumes the
-                    // dir exists. If it has been deleted at runtime, the write
-                    // will surface the underlying io::Error in the warn arm.
-                    let cache_path = INDEX_PREV_CLOSE_CACHE_PATH;
-                    let tmp_path = INDEX_PREV_CLOSE_CACHE_TMP;
+                    // Wave 1 Item 0.a — sync `std::fs::write` + rename moved to
+                    // a dedicated writer task fed by a bounded
+                    // `tokio::sync::mpsc::channel(64)`; the hot path enqueues
+                    // a `bytes::Bytes` payload via `try_enqueue_global`. Drop
+                    // policy on overflow: drop newest, increment
+                    // `tv_prev_close_writer_dropped_total`, the next packet
+                    // re-snapshots the full HashMap so the cache becomes
+                    // fresh on the following successful enqueue.
                     if let Ok(json) = serde_json::to_string(&index_prev_close_cache) {
-                        // HOT-PATH-EXEMPT: PrevClose (code 6) is index-only and
-                        // arrives ~28x at subscription time + once per index
-                        // post-market. Wave 1 Item 0.a will move this to an
-                        // async writer task; this commit only hoists the dir
-                        // creation. Hot path frequency: cold-path-equivalent.
-                        match std::fs::write(tmp_path, &json)
-                            .and_then(|()| std::fs::rename(tmp_path, cache_path))
-                        {
-                            Ok(()) => {}
-                            Err(err) => {
-                                warn!(
-                                    ?err,
-                                    security_id,
-                                    "failed to write index prev_close cache — mid-day restart may lose index baselines"
-                                );
-                            }
-                        }
+                        let outcome =
+                            super::prev_close_writer::try_enqueue_global(bytes::Bytes::from(json));
+                        // The writer logs its own ERROR on disk failure +
+                        // increments `tv_prev_close_writer_errors_total`. Hot
+                        // path stays ALLOC-CHEAP: the only allocation is the
+                        // `serde_json::to_string` above, which already
+                        // existed before Wave 1 Item 0.a. The Bytes::from
+                        // wrap is an Arc handoff (no copy).
+                        let _ = outcome;
                     }
                 }
 
@@ -1732,7 +1727,7 @@ mod tests {
     /// construction (and comment lines inside the arm body are
     /// filtered before the substring match).
     #[test]
-    fn test_prev_close_arm_has_no_create_dir_all() {
+    fn test_prev_close_arm_has_no_sync_fs_calls() {
         let src = include_str!("tick_processor.rs");
         let arm_start_marker =
             "// IDX_I segment\n                    index_prev_close_cache.insert";
@@ -1745,21 +1740,32 @@ mod tests {
             .expect("PrevClose arm must be followed by the trace!(...) summary");
         let arm_body = &src[start..start.saturating_add(end_rel)];
         // Strip comment lines so the human-readable explanation that
-        // mentions "create_dir_all" does NOT trip the regression scan.
-        // We only flag actual call sites in code lines.
+        // mentions the banned call names does NOT trip the regression
+        // scan. We only flag actual call sites in code lines.
         let code_only: String = arm_body
             .lines()
             .filter(|line| !line.trim_start().starts_with("//"))
             .collect::<Vec<&str>>()
             .join("\n");
+        // Wave 1 Item 0.d — directory creation must stay at boot.
         assert!(
             !code_only.contains("create_dir_all"),
-            "Wave 1 Item 0.d regression: `create_dir_all` reappeared inside \
+            "Wave 1 Item 0.d regression: create-dir-all reappeared inside \
              the PrevClose IDX_I arm. Hoist it back to \
-             `init_prev_close_cache_dir()` at boot, or add an explicit \
-             `// HOT-PATH-EXEMPT: <reason>` comment if a per-packet syscall \
-             is genuinely required."
+             init_prev_close_cache_dir() at boot, or add an explicit \
+             HOT-PATH-EXEMPT comment if a per-packet syscall is genuinely \
+             required."
         );
+        // Wave 1 Item 0.a — sync write/rename must stay off the hot path.
+        // The async writer task on the blocking pool owns these calls now.
+        for banned in ["std::fs::write", "std::fs::rename"] {
+            assert!(
+                !code_only.contains(banned),
+                "Wave 1 Item 0.a regression: sync `{banned}` reappeared in \
+                 the PrevClose IDX_I arm. Use \
+                 prev_close_writer::try_enqueue_global(...) instead."
+            );
+        }
     }
 
     /// A5: Test helper — calls `run_tick_processor` with `NoopGreeksEnricher`
