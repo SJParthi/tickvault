@@ -128,11 +128,30 @@ pub async fn run_order_update_connection(
                     }
                     ReconnectAction::Exhausted => {
                         consecutive_failures = tentative_failures;
+                        // Wave 2 Item 6 (G1, WS-GAP-04) — instead of giving
+                        // up (legacy `return`) outside market hours, sleep
+                        // until the next NSE market open and resume the
+                        // reconnect loop. Mirrors the main-feed +
+                        // depth-20/200 sleep path. Order-Update has its own
+                        // independent sleep clock per feed.
                         error!(
                             attempts = consecutive_failures,
-                            "order update WebSocket exhausted reconnection attempts"
+                            code = tickvault_common::error_code::ErrorCode::WsGap04PostCloseSleep
+                                .code_str(),
+                            "WS-GAP-04 order update WebSocket exhausted reconnection attempts — \
+                             sleeping until next market open"
                         );
-                        return;
+                        order_update_post_close_sleep(
+                            &calendar,
+                            consecutive_failures,
+                            notifier.as_ref(),
+                        )
+                        .await;
+                        // Reset attempt counter so the post-sleep attempt
+                        // starts fresh.
+                        consecutive_failures = 0;
+                        // Continue the reconnect loop after sleep.
+                        continue;
                     }
                     ReconnectAction::IncrementAndRetry => {
                         consecutive_failures = tentative_failures;
@@ -168,6 +187,96 @@ pub async fn run_order_update_connection(
 // ---------------------------------------------------------------------------
 // Internal
 // ---------------------------------------------------------------------------
+
+/// Wave 2 Item 6 (G1, WS-GAP-04) — order update post-close sleep.
+///
+/// Mirrors the main-feed + depth sleep paths. Sleeps until the next
+/// NSE market open via `TradingCalendar::secs_until_next_market_open`,
+/// emits `WebSocketSleepEntered`/`WebSocketSleepResumed` Telegram
+/// events, and force-renews the JWT (AUTH-GAP-03) before the post-sleep
+/// reconnect when < 4h validity remains.
+///
+/// Always returns — caller resets the attempt counter and continues
+/// the reconnect loop. If the calendar cannot resolve the next open
+/// (e.g., test fixture exhausted), falls back to a 1h sleep.
+async fn order_update_post_close_sleep(
+    calendar: &TradingCalendar,
+    attempt: u32,
+    notifier: Option<&Arc<crate::notification::NotificationService>>,
+) {
+    let now_utc = chrono::Utc::now().timestamp();
+    let sleep_secs = calendar
+        .secs_until_next_market_open(now_utc)
+        .unwrap_or(60 * 60);
+    info!(
+        attempt,
+        sleep_secs,
+        feed = "order_update",
+        code = tickvault_common::error_code::ErrorCode::WsGap04PostCloseSleep.code_str(),
+        "WS-GAP-04 order update WebSocket entered post-close sleep until next market open"
+    );
+    metrics::counter!("tv_ws_post_close_sleep_total", "feed" => "order_update").increment(1);
+    if let Some(n) = notifier {
+        n.notify(
+            crate::notification::events::NotificationEvent::WebSocketSleepEntered {
+                feed: "order_update".to_string(), // O(1) EXEMPT: cold path, once per post-close
+                connection_index: 0,
+                sleep_secs,
+            },
+        );
+    }
+    time::sleep(Duration::from_secs(sleep_secs)).await;
+    info!(
+        attempt,
+        slept_for_secs = sleep_secs,
+        feed = "order_update",
+        "Order update WebSocket sleep resumed — attempting reconnect"
+    );
+    // AUTH-GAP-03 — proactively renew the token if < 4h validity remains
+    // before reattempting connect, preventing the "wake → connect → 901 →
+    // renew → reconnect" cascade.
+    if let Some(tm) = crate::auth::token_manager::global_token_manager() {
+        let remaining_secs_before = tm
+            .next_renewal_at()
+            .map(|exp| (exp - chrono::Utc::now().with_timezone(&ist_offset())).num_seconds())
+            .unwrap_or(i64::MIN);
+        match tm.force_renewal_if_stale(14_400).await {
+            Ok(true) => {
+                if let Some(n) = notifier {
+                    n.notify(
+                        crate::notification::events::NotificationEvent::WebSocketTokenForceRenewedOnWake {
+                            feed: "order_update".to_string(), // O(1) EXEMPT: cold path
+                            connection_index: 0,
+                            remaining_secs_before,
+                            threshold_secs: 14_400,
+                        },
+                    );
+                }
+            }
+            Ok(false) => {
+                // Fresh token — no Telegram noise.
+            }
+            Err(e) => {
+                error!(
+                    feed = "order_update",
+                    error = ?e,
+                    code = tickvault_common::error_code::ErrorCode::AuthGap03TokenForceRenewedOnWake
+                        .code_str(),
+                    "AUTH-GAP-03 order update wake-time token renewal failed — will rely on reconnect retry"
+                );
+            }
+        }
+    }
+    if let Some(n) = notifier {
+        n.notify(
+            crate::notification::events::NotificationEvent::WebSocketSleepResumed {
+                feed: "order_update".to_string(), // O(1) EXEMPT: cold path
+                connection_index: 0,
+                slept_for_secs: sleep_secs,
+            },
+        );
+    }
+}
 
 /// Single connection lifecycle: connect → login → read loop.
 #[allow(clippy::too_many_arguments)] // APPROVED: STAGE-C wal_spill + O2 authenticated signal

@@ -18,11 +18,22 @@ use std::time::Duration;
 /// installed, sleeps until the next NSE market open instead of giving
 /// up — closes G1 for the depth-20 / depth-200 pools.
 ///
+/// Mirrors the main-feed sleep path in
+/// `connection.rs::wait_with_backoff` (Wave 2 Item 5):
+/// 1. Emits `WebSocketSleepEntered` Telegram event before sleep.
+/// 2. After waking, calls `TokenManager::force_renewal_if_stale(14_400)`
+///    so the post-sleep reconnect uses a fresh JWT (closes the legacy
+///    "wake → reconnect → DH-901 → renew → reconnect" cascade).
+///    Emits `WebSocketTokenForceRenewedOnWake` when a renewal fired.
+/// 3. Emits `WebSocketSleepResumed` Telegram event after wake.
+///
 /// Returns `Ok(())` to signal the caller should reset the attempt
 /// counter and continue the reconnect loop.
 async fn depth_post_close_sleep_or_exhaust(
     feed_label: &'static str,
     attempt: u64,
+    notifier: Option<&Arc<crate::notification::NotificationService>>,
+    connection_index: usize,
 ) -> Result<(), super::WebSocketError> {
     let now_utc = chrono::Utc::now().timestamp();
     let now_ist = now_utc.saturating_add(i64::from(
@@ -40,7 +51,70 @@ async fn depth_post_close_sleep_or_exhaust(
             "WS-GAP-04 depth feed entered post-close sleep until next market open"
         );
         metrics::counter!("tv_ws_post_close_sleep_total", "feed" => feed_label).increment(1);
+        if let Some(n) = notifier {
+            n.notify(
+                crate::notification::events::NotificationEvent::WebSocketSleepEntered {
+                    feed: feed_label.to_string(), // O(1) EXEMPT: cold path, once per post-close
+                    connection_index,
+                    sleep_secs,
+                },
+            );
+        }
         tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
+        tracing::info!(
+            attempt,
+            slept_for_secs = sleep_secs,
+            feed = feed_label,
+            "Depth feed sleep resumed — attempting reconnect"
+        );
+        // Wave 2 Item 6 / 5.4 (AUTH-GAP-03) — proactively renew the token
+        // if it has < 4h validity left BEFORE attempting the post-sleep
+        // reconnect. Mirrors the main-feed wake path. Falls back silently
+        // if no global TokenManager is installed (test binaries).
+        if let Some(tm) = crate::auth::token_manager::global_token_manager() {
+            let remaining_secs_before = tm
+                .next_renewal_at()
+                .map(|exp| {
+                    (exp - chrono::Utc::now()
+                        .with_timezone(&tickvault_common::trading_calendar::ist_offset()))
+                    .num_seconds()
+                })
+                .unwrap_or(i64::MIN);
+            match tm.force_renewal_if_stale(14_400).await {
+                Ok(true) => {
+                    if let Some(n) = notifier {
+                        n.notify(
+                            crate::notification::events::NotificationEvent::WebSocketTokenForceRenewedOnWake {
+                                feed: feed_label.to_string(), // O(1) EXEMPT: cold path
+                                connection_index,
+                                remaining_secs_before,
+                                threshold_secs: 14_400,
+                            },
+                        );
+                    }
+                }
+                Ok(false) => {
+                    // Token still fresh — no Telegram noise.
+                }
+                Err(e) => {
+                    tracing::error!(
+                        feed = feed_label,
+                        error = ?e,
+                        code = tickvault_common::error_code::ErrorCode::AuthGap03TokenForceRenewedOnWake.code_str(),
+                        "AUTH-GAP-03 wake-time token renewal failed — will rely on reconnect retry"
+                    );
+                }
+            }
+        }
+        if let Some(n) = notifier {
+            n.notify(
+                crate::notification::events::NotificationEvent::WebSocketSleepResumed {
+                    feed: feed_label.to_string(), // O(1) EXEMPT: cold path
+                    connection_index,
+                    slept_for_secs: sleep_secs,
+                },
+            );
+        }
         return Ok(());
     }
     Err(super::WebSocketError::ReconnectionExhausted {
@@ -346,7 +420,8 @@ pub async fn run_twenty_depth_connection(
                         ?err,
                         "{prefix}: exhausted {DEPTH_RECONNECT_MAX_ATTEMPTS} attempts — checking post-close gate"
                     );
-                    depth_post_close_sleep_or_exhaust("depth20", attempt).await?;
+                    depth_post_close_sleep_or_exhaust("depth_20", attempt, notifier.as_ref(), 0)
+                        .await?;
                     // Slept successfully — reset attempt counter and continue.
                     reconnect_counter.store(0, Ordering::Relaxed);
                     continue;
@@ -906,7 +981,8 @@ pub async fn run_two_hundred_depth_connection(
                         ?err,
                         "{prefix}: exhausted {DEPTH_RECONNECT_MAX_ATTEMPTS} attempts — checking post-close gate"
                     );
-                    depth_post_close_sleep_or_exhaust("depth200", attempt).await?;
+                    depth_post_close_sleep_or_exhaust("depth_200", attempt, notifier.as_ref(), 0)
+                        .await?;
                     // Slept successfully — reset attempt counter and continue.
                     reconnect_counter.store(0, Ordering::Relaxed);
                     continue;
