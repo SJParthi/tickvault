@@ -358,6 +358,19 @@ pub enum NotificationEvent {
         slept_for_secs: u64,
     },
 
+    /// Wave 2 Item 5.4 (AUTH-GAP-03) — TokenManager force-renewed the
+    /// JWT immediately after a WebSocket woke from post-close sleep
+    /// because the cached token had less than the configured headroom
+    /// remaining. Severity::Low — informational; the renewal succeeded.
+    /// Use `WebSocketTokenForceRenewalFailed`-style routing via the
+    /// adjacent error log for failure cases.
+    WebSocketTokenForceRenewedOnWake {
+        feed: String,
+        connection_index: usize,
+        remaining_secs_before: i64,
+        threshold_secs: i64,
+    },
+
     /// 20-level depth WebSocket connected for an underlying.
     DepthTwentyConnected { underlying: String },
 
@@ -1160,6 +1173,17 @@ impl NotificationEvent {
                     connection_index.saturating_add(1)
                 )
             }
+            Self::WebSocketTokenForceRenewedOnWake {
+                feed,
+                connection_index,
+                remaining_secs_before,
+                threshold_secs,
+            } => {
+                format!(
+                    "<b>AUTH-GAP-03 {feed} feed (slot {}) wake-time token renewed</b>\nRemaining before renewal: {remaining_secs_before}s (threshold {threshold_secs}s)",
+                    connection_index.saturating_add(1)
+                )
+            }
             Self::DepthTwentyConnected { underlying } => {
                 format!("<b>Depth 20-level connected</b>\nUnderlying: {underlying}")
             }
@@ -1633,6 +1657,7 @@ impl NotificationEvent {
             Self::WebSocketSleepEntered { .. } | Self::WebSocketSleepResumed { .. } => {
                 Severity::Low
             }
+            Self::WebSocketTokenForceRenewedOnWake { .. } => Severity::Low,
             Self::DepthTwentyDisconnected { .. } => Severity::High,
             Self::DepthTwentyDisconnectedOffHours { .. } => Severity::Low,
             Self::DepthTwentyReconnected { .. } => Severity::Medium,
