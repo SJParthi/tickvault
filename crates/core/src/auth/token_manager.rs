@@ -999,6 +999,40 @@ impl TokenManager {
             }
         }
     }
+
+    /// Wave 2 Item 5.4 (G1) — unconditional token renewal.
+    ///
+    /// Forces a renewal regardless of remaining validity. Use when the
+    /// caller has evidence the existing token is invalid (e.g., 807
+    /// disconnect from Dhan, DH-901 from REST). Prefer
+    /// [`force_renewal_if_stale`](Self::force_renewal_if_stale) on the
+    /// post-sleep wake path so a fresh token is not wasted.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the underlying renew/generate error. Caller is
+    /// responsible for retry policy.
+    pub async fn force_renewal(&self) -> Result<(), ApplicationError> {
+        metrics::counter!(
+            "tv_token_force_renewal_total",
+            "trigger" => "explicit"
+        )
+        .increment(1);
+        self.renew_with_fallback().await
+    }
+
+    /// Wave 2 Item 5.4 (G1) — current token expiry timestamp.
+    ///
+    /// Returns the IST `DateTime` at which the cached token expires,
+    /// or `None` if no token is loaded. Caller subtracts the
+    /// configured refresh-before-expiry headroom to derive the next
+    /// scheduled renewal moment. Cheap O(1) `arc-swap` read; safe to
+    /// poll from any task.
+    #[must_use]
+    pub fn next_renewal_at(&self) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+        let guard = self.token.load();
+        guard.as_ref().as_ref().map(|state| state.expires_at())
+    }
 }
 
 // ---------------------------------------------------------------------------
