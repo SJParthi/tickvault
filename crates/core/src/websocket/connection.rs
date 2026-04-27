@@ -1397,13 +1397,40 @@ impl WebSocketConnection {
                     // 30-second cascade. Uses the global TokenManager
                     // handle installed at boot.
                     if let Some(tm) = crate::auth::token_manager::global_token_manager() {
-                        if let Err(e) = tm.force_renewal_if_stale(14_400).await {
-                            tracing::error!(
-                                connection_id = self.connection_id,
-                                error = ?e,
-                                code = tickvault_common::error_code::ErrorCode::AuthGap03TokenForceRenewedOnWake.code_str(),
-                                "AUTH-GAP-03 wake-time token renewal failed — will rely on reconnect retry"
-                            );
+                        // Snapshot remaining seconds for the typed Telegram event.
+                        let remaining_secs_before = tm
+                            .next_renewal_at()
+                            .map(|exp| {
+                                (exp - chrono::Utc::now().with_timezone(
+                                    &tickvault_common::trading_calendar::ist_offset(),
+                                ))
+                                .num_seconds()
+                            })
+                            .unwrap_or(i64::MIN);
+                        match tm.force_renewal_if_stale(14_400).await {
+                            Ok(true) => {
+                                if let Some(ref n) = self.notifier {
+                                    n.notify(
+                                        crate::notification::events::NotificationEvent::WebSocketTokenForceRenewedOnWake {
+                                            feed: "main".to_string(),
+                                            connection_index: self.connection_id as usize,
+                                            remaining_secs_before,
+                                            threshold_secs: 14_400,
+                                        },
+                                    );
+                                }
+                            }
+                            Ok(false) => {
+                                // Token still fresh — no Telegram noise.
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    connection_id = self.connection_id,
+                                    error = ?e,
+                                    code = tickvault_common::error_code::ErrorCode::AuthGap03TokenForceRenewedOnWake.code_str(),
+                                    "AUTH-GAP-03 wake-time token renewal failed — will rely on reconnect retry"
+                                );
+                            }
                         }
                     }
                     // Wave 2 — emit Telegram WebSocketSleepResumed.
