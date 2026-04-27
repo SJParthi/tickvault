@@ -1628,6 +1628,24 @@ async fn main() -> Result<()> {
         tickvault_core::pipeline::first_seen_set::spawn_ist_midnight_reset_task(first_seen);
     tickvault_core::pipeline::prev_close_persist::init(&config.questdb);
 
+    // Wave 1 Item 0.b part 2 — async tick spill drain. Adds an mpsc(8192)
+    // layer in front of the existing sync BufWriter spill so the hot path
+    // gets non-blocking enqueue semantics under slow-disk conditions
+    // (chaos-mode tests, full-disk recovery, host I/O glitches). The
+    // sync BufWriter + DLQ safety net stays intact — this is additional
+    // capacity, not a replacement.
+    let async_spill_path = std::path::PathBuf::from("data/spill").join(format!(
+        "ticks-async-{}.bin",
+        chrono::Utc::now().format("%Y%m%d")
+    ));
+    if let Err(err) = tickvault_storage::tick_spill_drain::init(async_spill_path).await {
+        warn!(
+            ?err,
+            "tick_spill_drain init failed (non-critical, sync spill path \
+             remains active)"
+        );
+    }
+
     // Health status — created early so tick persistence status can be set.
     let health_status: SharedHealthStatus = std::sync::Arc::new(SystemHealthStatus::new());
 
