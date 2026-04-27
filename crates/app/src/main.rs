@@ -1583,6 +1583,11 @@ async fn main() -> Result<()> {
         ),
         tickvault_storage::deep_depth_persistence::ensure_deep_depth_table(&config.questdb),
         tickvault_storage::obi_persistence::ensure_obi_table(&config.questdb),
+        // Wave 1 Item 4.2 — un-deprecated previous_close table. Schema
+        // includes the new `source` column (CODE6 / QUOTE_CLOSE /
+        // FULL_CLOSE) and idempotent ALTER ADD COLUMN IF NOT EXISTS so
+        // existing deployments auto-migrate.
+        tickvault_storage::previous_close_persistence::ensure_previous_close_table(&config.questdb,),
     );
 
     // Persist trading calendar to QuestDB (best-effort, non-blocking).
