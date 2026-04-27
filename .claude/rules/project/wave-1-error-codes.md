@@ -51,12 +51,23 @@ Updates §5 — full diagnostic fields are in the Telegram message.
 **Trigger:** the `Phase2EmitGuard` (Wave 1 Item 1) was dropped without
 calling any of `emit_complete` / `emit_failed` / `emit_skipped`. In
 debug builds this panics; in release builds it logs ERROR
-`PHASE2-02`. Indicates a regression where the Phase 2 dispatcher
-returned without firing an outcome notification.
+`PHASE2-02` AND increments the Prometheus counter
+`tv_phase2_emit_guard_dropped_total` (so the
+`tv-phase2-02-emit-guard-dropped` alert fires). Indicates a regression
+where the Phase 2 dispatcher returned without firing an outcome
+notification.
 
 **Triage:** find the recent edit to `phase2_scheduler.rs` that added a
 new return path and ensure it consumes `guard.emit_*(...)` before
 returning.
+
+**Alert acknowledgement caveat:** the alert query is
+`increase(tv_phase2_emit_guard_dropped_total[1d]) > 0` with a 24h
+sliding window. A single regression keeps the alert firing for 24
+hours; "acknowledge" in Alertmanager only suppresses pages for the
+acknowledged window, not the underlying value. The alert returns to
+OK on its own once the sample ages out, or immediately after a
+Prometheus restart.
 
 **Source:** `crates/core/src/instrument/phase2_emit_guard.rs::Drop`
 

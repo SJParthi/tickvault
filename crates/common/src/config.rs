@@ -53,21 +53,33 @@ pub struct ApplicationConfig {
 }
 
 /// Wave 1 C9 feature-flag toggles. Default = `true` for every flag (the
-/// new code path is the safe default). Operators flip a flag to `false`
-/// in `config/base.toml` (or an env-override file) when a Wave 1/2/3
-/// item misbehaves and a redeploy isn't acceptable. The presence of
-/// the toggle is the rollback contract — Wave 2/3 items add their
-/// runtime branching as they ship; Wave 1 items 0-4 already on
-/// `claude/wave-1-hardening-implementation-Eok0R` use these flags
-/// where the rollback path exists.
+/// new code path is the safe default).
 ///
-/// `feature_flag_rollback_guard.rs` ratchets:
-/// 1. Every flag has a `<flag>_off`/`<flag>_on`/`<flag>_default_is_safe`
-///    test trio.
-/// 2. Default is always `true` so a missing `[features]` section does
-///    not silently disable the new behaviour.
-/// 3. Flags can be flipped to `false` and the config still parses
-///    (proves the rollback path is reachable from `config/base.toml`).
+/// # Status — flag plumbing only (Phase 1)
+///
+/// This struct ships the **config plumbing** for the 14 toggles. It does
+/// NOT yet guarantee that flipping a flag to `false` reverts to a
+/// pre-Wave code path: Wave 1 items 0–4 do their work unconditionally
+/// today, and the corresponding flag is read at runtime only by future
+/// Wave 2 / Wave 3 PRs that ship the actual runtime branching. Setting
+/// `hotpath_async_writers = false` in `config/base.toml` will parse
+/// cleanly but does NOT today bring back the deleted `std::fs::write`
+/// path — that revert needs a code change.
+///
+/// The honest C9 rollback contract is:
+///
+/// 1. The flag exists in the config struct + `[features]` section so an
+///    operator override file can carry a `false` value end-to-end.
+/// 2. Every Wave 2 / Wave 3 item PR is required to wire its runtime
+///    branch on the corresponding flag before merge (enforced by the
+///    9-box plan checklist + `feature_flag_rollback_guard.rs`).
+/// 3. Default is always `true` so a missing `[features]` section in any
+///    override file cannot silently disable a Wave item.
+///
+/// `feature_flag_rollback_guard.rs` ratchets the three guarantees above.
+/// The runtime-branch wiring is OUT of scope for this struct — see each
+/// Wave 2 / Wave 3 PR for the per-item `if cfg.features.<flag> { ... }`
+/// call sites.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(default)]
 pub struct FeaturesConfig {

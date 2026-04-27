@@ -1,27 +1,34 @@
-//! Wave 1 C9 feature-flag rollback guard.
+//! Wave 1 C9 feature-flag rollback guard — Phase 1 (flag plumbing only).
 //!
 //! Source: `.claude/plans/active-plan-cross-cutting.md` (C9) — every
 //! Wave 1/2/3 item has a paired feature flag in `[features]` of
-//! `config/base.toml` so the operator can flip a misbehaving item OFF
-//! without a redeploy. The flag is the rollback contract.
+//! `config/base.toml`.
+//!
+//! # What this guard asserts (and what it does NOT)
+//!
+//! These are **config-plumbing** assertions, not runtime-branch
+//! assertions. They prove the toggle exists end-to-end (TOML → figment
+//! → `FeaturesConfig` → `ApplicationConfig`) so an operator override
+//! file can carry a `false` value to the boot sequence. They do NOT
+//! prove that `false` actually disables the new code path at runtime —
+//! that wiring is shipped per Wave 2 / Wave 3 PR alongside the
+//! corresponding `if cfg.features.<flag> { new_path } else { old_path }`
+//! branch.
 //!
 //! For each of the 14 flags this test suite asserts:
 //!
 //! 1. `<flag>_off_disables_path` — `flag = false` parses cleanly. The
-//!    "old" (pre-Wave) behaviour is reachable from config; no silent
-//!    panic when the flag is off.
-//! 2. `<flag>_on_enables_path` — `flag = true` parses cleanly. The
-//!    "new" (Wave-shipped) behaviour is reachable from config; the
-//!    happy path works.
+//!    config struct round-trips the false value; the boot sequence can
+//!    therefore see it.
+//! 2. `<flag>_on_enables_path` — `flag = true` parses cleanly. Symmetric
+//!    half of (1).
 //! 3. `<flag>_default_is_safe` — the `Default` impl returns `true`, so
-//!    a missing `[features]` section in an environment override does
-//!    NOT silently disable a Wave 1 item.
+//!    a missing `[features]` section in any environment override file
+//!    cannot silently disable a Wave item.
 //!
-//! These are config-plumbing assertions: they prove the toggle exists
-//! end-to-end (TOML → `FeaturesConfig` → `ApplicationConfig`) so the
-//! operator's rollback contract is mechanically guaranteed. The
-//! per-item runtime branching is wired by the items themselves — see
-//! Wave 1 Items 0–4 commits in PR #393.
+//! Wave 2 / Wave 3 PRs are required (per the 9-box plan checklist) to
+//! extend this file with `<flag>_off_actually_disables_runtime_branch`
+//! tests once their runtime wiring lands.
 //!
 //! Run: `cargo test -p tickvault-app --test feature_flag_rollback_guard`
 
