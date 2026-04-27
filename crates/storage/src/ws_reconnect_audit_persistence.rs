@@ -67,9 +67,63 @@ pub async fn ensure_ws_reconnect_audit_table(questdb_config: &QuestDbConfig) {
     }
 }
 
+/// Append one WS-reconnect audit row.
+///
+/// `feed` ∈ {"main", "depth20", "depth200", "order_update"};
+/// `outcome` ∈ {"success", "failed", "exhausted"}.
+#[allow(clippy::too_many_arguments)] // APPROVED: audit row schema requires every column
+pub async fn append_ws_reconnect_audit_row(
+    questdb_config: &QuestDbConfig,
+    ts_nanos_ist: i64,
+    feed: &str,
+    connection_id: i32,
+    attempt: i64,
+    outcome: &str,
+    disconnect_code: Option<i16>,
+    reason: &str,
+) -> anyhow::Result<()> {
+    let base_url = format!(
+        "http://{}:{}/exec",
+        questdb_config.host, questdb_config.http_port
+    );
+    let client = Client::builder()
+        .timeout(Duration::from_secs(QUESTDB_DDL_TIMEOUT_SECS))
+        .build()?;
+    let feed_esc = feed.replace('\'', "''");
+    let outcome_esc = outcome.replace('\'', "''");
+    let reason_esc = reason.replace('\'', "''");
+    let dc = disconnect_code
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "NULL".to_string());
+    let sql = format!(
+        "INSERT INTO {QUESTDB_TABLE_WS_RECONNECT_AUDIT} (ts, feed, connection_id, attempt, outcome, disconnect_code, reason) VALUES \
+         ({ts_nanos_ist}, '{feed_esc}', {connection_id}, {attempt}, '{outcome_esc}', {dc}, '{reason_esc}');"
+    );
+    let resp = client
+        .get(&base_url)
+        .query(&[("query", sql.as_str())])
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("ws_reconnect audit insert non-2xx ({status}): {body}");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_cfg(http_port: u16) -> QuestDbConfig {
+        QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port,
+            pg_port: 8812,
+            ilp_port: 9009,
+        }
+    }
 
     #[test]
     fn test_dedup_key_no_security_id() {
@@ -80,5 +134,38 @@ mod tests {
     #[test]
     fn test_table_name_constant() {
         assert_eq!(QUESTDB_TABLE_WS_RECONNECT_AUDIT, "ws_reconnect_audit");
+    }
+
+    #[tokio::test]
+    async fn test_append_ws_reconnect_returns_err_when_questdb_unreachable() {
+        let cfg = test_cfg(1);
+        let result = append_ws_reconnect_audit_row(
+            &cfg,
+            1_710_000_000_000_000_000,
+            "main",
+            0,
+            5,
+            "success",
+            None,
+            "TCP RST recovered",
+        )
+        .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_append_ws_reconnect_handles_optional_disconnect_code() {
+        let cfg = test_cfg(1);
+        let _ = append_ws_reconnect_audit_row(
+            &cfg,
+            0,
+            "main",
+            0,
+            1,
+            "failed",
+            Some(807),
+            "DataAPI-807 token expired",
+        )
+        .await;
     }
 }
