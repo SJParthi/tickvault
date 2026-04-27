@@ -1,8 +1,8 @@
 # Implementation Plan: Comprehensive Hardening — 14 Items / 3 Waves
 
-**Status:** DRAFT
+**Status:** APPROVED
 **Date:** 2026-04-27
-**Approved by:** pending (await operator green-light to flip to APPROVED)
+**Approved by:** Parthiban (operator) on 2026-04-27
 **Branch:** `claude/debug-session-error-6yqZV`
 **Supersedes:** PR #391 (`claude/fix-websocket-startup-p0x1O`) — close after this PR opens
 **Triggering incident:** Overnight 2026-04-26 → 2026-04-27 — app started 22:21 IST Sun, all 5 main-feed connections were dead at 09:00 IST Mon market open. Operator manually restarted at 09:03:51. Depth, stock_movers, option_movers, previous_close all broken simultaneously.
