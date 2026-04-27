@@ -1618,6 +1618,16 @@ async fn main() -> Result<()> {
     // on overflow with `tv_prev_close_writer_dropped_total`).
     tickvault_core::pipeline::prev_close_writer::init();
 
+    // Wave 1 Item 4.3/4.4 — boot-time idempotent init for the
+    // FirstSeenSet (gates first-Quote/Full per (security_id, segment)
+    // per IST trading day) + the PrevClose persist drain task (forwards
+    // hot-path enqueues to QuestDB via ILP). Plus the IST-midnight
+    // reset task that flips first_seen back to empty at IST 00:00.
+    let first_seen = tickvault_core::pipeline::first_seen_set::init_global();
+    let _first_seen_reset_handle =
+        tickvault_core::pipeline::first_seen_set::spawn_ist_midnight_reset_task(first_seen);
+    tickvault_core::pipeline::prev_close_persist::init(&config.questdb);
+
     // Health status — created early so tick persistence status can be set.
     let health_status: SharedHealthStatus = std::sync::Arc::new(SystemHealthStatus::new());
 
