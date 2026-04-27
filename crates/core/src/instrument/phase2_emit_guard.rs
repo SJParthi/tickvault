@@ -155,7 +155,7 @@ mod tests {
     /// Calling `emit_complete` flips `has_emitted` and the subsequent
     /// drop is a no-op (no panic, no error log).
     #[test]
-    fn test_phase2_emit_guard_emit_complete_satisfies_invariant() {
+    fn test_phase2_emit_guard_emit_complete_then_has_emitted_returns_true() {
         let mut guard = Phase2EmitGuard::new(test_notifier());
         assert!(
             !guard.has_emitted(),
