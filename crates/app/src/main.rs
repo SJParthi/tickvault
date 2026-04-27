@@ -1593,6 +1593,19 @@ async fn main() -> Result<()> {
         );
     }
 
+    // Wave 1 Item 0.d — boot-time idempotent init for the index prev_close
+    // cache directory. Hoisted out of the tick hot path (was a per-packet
+    // `std::fs::create_dir_all` call on every PrevClose code-6 frame).
+    // Failure here is non-fatal: the hot-path write will surface the
+    // io::Error in the warn arm and movers will simply not have an index
+    // baseline cached for mid-day restart recovery.
+    if let Err(err) = tickvault_core::pipeline::init_prev_close_cache_dir() {
+        warn!(
+            ?err,
+            "init_prev_close_cache_dir failed (non-critical, mid-day index baseline cache will be unavailable)"
+        );
+    }
+
     // Health status — created early so tick persistence status can be set.
     let health_status: SharedHealthStatus = std::sync::Arc::new(SystemHealthStatus::new());
 

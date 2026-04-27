@@ -47,6 +47,19 @@ const INDEX_PREV_CLOSE_CACHE_DIR: &str = "data/instrument-cache";
 const INDEX_PREV_CLOSE_CACHE_PATH: &str = "data/instrument-cache/index-prev-close.json";
 const INDEX_PREV_CLOSE_CACHE_TMP: &str = "data/instrument-cache/index-prev-close.json.tmp";
 
+/// Wave 1 Item 0.d — boot-time idempotent init for the index prev_close
+/// cache directory. Hoisted out of the tick hot path (was previously a
+/// per-packet `std::fs::create_dir_all` call on every PrevClose code-6
+/// frame). Safe to call multiple times.
+///
+/// Called from `crates/app/src/main.rs` Step 6b alongside the QuestDB
+/// table-DDL fan-out, before the tick processor starts. The hot path now
+/// assumes the directory exists and only writes the file atomically.
+// HOT-PATH-EXEMPT: boot-only init, runs once before tick processor starts.
+pub fn init_prev_close_cache_dir() -> std::io::Result<()> {
+    std::fs::create_dir_all(INDEX_PREV_CLOSE_CACHE_DIR)
+}
+
 /// **ZL-P0-2** — canary underlyings whose ticks are used as an
 /// end-to-end "alive but flowing?" health probe.
 ///
@@ -1294,11 +1307,19 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     index_prev_close_cache.insert(security_id, previous_close);
                     // Atomic file write: serialize → write to .tmp → rename.
                     // Prevents partial/corrupt cache on crash or disk full.
-                    let cache_dir = INDEX_PREV_CLOSE_CACHE_DIR;
+                    //
+                    // Wave 1 Item 0.d — `create_dir_all` was hoisted to boot via
+                    // `init_prev_close_cache_dir()`. The hot path assumes the
+                    // dir exists. If it has been deleted at runtime, the write
+                    // will surface the underlying io::Error in the warn arm.
                     let cache_path = INDEX_PREV_CLOSE_CACHE_PATH;
                     let tmp_path = INDEX_PREV_CLOSE_CACHE_TMP;
                     if let Ok(json) = serde_json::to_string(&index_prev_close_cache) {
-                        drop(std::fs::create_dir_all(cache_dir));
+                        // HOT-PATH-EXEMPT: PrevClose (code 6) is index-only and
+                        // arrives ~28x at subscription time + once per index
+                        // post-market. Wave 1 Item 0.a will move this to an
+                        // async writer task; this commit only hoists the dir
+                        // creation. Hot path frequency: cold-path-equivalent.
                         match std::fs::write(tmp_path, &json)
                             .and_then(|()| std::fs::rename(tmp_path, cache_path))
                         {
@@ -1676,6 +1697,70 @@ mod tests {
         RESPONSE_CODE_MARKET_DEPTH, RESPONSE_CODE_MARKET_STATUS, RESPONSE_CODE_OI,
         RESPONSE_CODE_PREVIOUS_CLOSE, TICKER_OFFSET_LTP, TICKER_OFFSET_LTT, TICKER_PACKET_SIZE,
     };
+
+    // -----------------------------------------------------------------------
+    // Wave 1 Item 0.d — boot-time prev_close cache dir init
+    // -----------------------------------------------------------------------
+
+    /// Wave 1 Item 0.d ratchet: `init_prev_close_cache_dir()` must be safe to
+    /// call repeatedly. It runs at boot before the tick processor, so the
+    /// hot-path PrevClose code-6 frame can assume the directory exists
+    /// without paying for a `create_dir_all` syscall on every packet.
+    #[test]
+    fn test_init_prev_close_cache_dir_idempotent() {
+        // Calling the boot init three times in a row must succeed every time.
+        // The function is `pub` and idempotent by design (`create_dir_all` is
+        // a no-op when the directory already exists).
+        for _ in 0..3 {
+            init_prev_close_cache_dir().expect("init_prev_close_cache_dir must be idempotent");
+        }
+        assert!(
+            std::path::Path::new(INDEX_PREV_CLOSE_CACHE_DIR).exists(),
+            "init_prev_close_cache_dir must leave INDEX_PREV_CLOSE_CACHE_DIR on disk"
+        );
+    }
+
+    /// Wave 1 Item 0.d source-scan ratchet: prove the per-packet
+    /// create-dir-all call was hoisted out of the PrevClose hot-path arm.
+    /// If a future edit re-introduces the call inside the
+    /// ParsedFrame PrevClose arm without a HOT-PATH-EXEMPT comment,
+    /// this test MUST fail.
+    ///
+    /// The scan stops at the closing of the IDX_I if-arm by string
+    /// match on the trailing trace! marker, so test source — which
+    /// legitimately mentions the banned call name — is excluded by
+    /// construction (and comment lines inside the arm body are
+    /// filtered before the substring match).
+    #[test]
+    fn test_prev_close_arm_has_no_create_dir_all() {
+        let src = include_str!("tick_processor.rs");
+        let arm_start_marker =
+            "// IDX_I segment\n                    index_prev_close_cache.insert";
+        let arm_end_marker = "trace!(\n                    security_id,\n                    exchange_segment_code, previous_close, previous_oi, \"previous close persisted\"";
+        let start = src
+            .find(arm_start_marker)
+            .expect("PrevClose IDX_I cache-write arm must exist");
+        let end_rel = src[start..]
+            .find(arm_end_marker)
+            .expect("PrevClose arm must be followed by the trace!(...) summary");
+        let arm_body = &src[start..start.saturating_add(end_rel)];
+        // Strip comment lines so the human-readable explanation that
+        // mentions "create_dir_all" does NOT trip the regression scan.
+        // We only flag actual call sites in code lines.
+        let code_only: String = arm_body
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<&str>>()
+            .join("\n");
+        assert!(
+            !code_only.contains("create_dir_all"),
+            "Wave 1 Item 0.d regression: `create_dir_all` reappeared inside \
+             the PrevClose IDX_I arm. Hoist it back to \
+             `init_prev_close_cache_dir()` at boot, or add an explicit \
+             `// HOT-PATH-EXEMPT: <reason>` comment if a per-packet syscall \
+             is genuinely required."
+        );
+    }
 
     /// A5: Test helper — calls `run_tick_processor` with `NoopGreeksEnricher`
     /// as the concrete type parameter (no Greeks in tests). Avoids turbofish
