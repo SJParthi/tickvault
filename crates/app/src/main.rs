@@ -177,6 +177,49 @@ async fn main() -> Result<()> {
         tracing::warn!("global TradingCalendar already installed — skipping");
     }
 
+    // Wave 2 Item 8 (G4) — install the global tick-gap detector and
+    // spawn the 60s coalescing task. Recorded ticks live in a papaya
+    // map keyed by (security_id, segment) — composite per I-P1-11.
+    let tick_gap_detector = std::sync::Arc::new(tickvault_core::pipeline::TickGapDetector::new(
+        tickvault_core::pipeline::TICK_GAP_THRESHOLD_SECS_DEFAULT,
+    ));
+    if !tickvault_core::pipeline::tick_gap_detector::set_global_tick_gap_detector(
+        tick_gap_detector.clone(),
+    ) {
+        tracing::warn!("global TickGapDetector already installed — skipping");
+    }
+    {
+        let detector_for_task = tick_gap_detector.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
+                tickvault_core::pipeline::TICK_GAP_COALESCE_WINDOW_SECS_DEFAULT,
+            ));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                let now = std::time::Instant::now();
+                let gaps = detector_for_task.scan_gaps(now);
+                if gaps.is_empty() {
+                    continue;
+                }
+                metrics::counter!("tv_tick_gap_summary_total").increment(1);
+                metrics::gauge!("tv_tick_gap_instruments_silent").set(gaps.len() as f64);
+                let top: Vec<(u32, &'static str, u64)> = gaps
+                    .iter()
+                    .take(10)
+                    .map(|(id, seg, gap)| (*id, seg.as_str(), *gap))
+                    .collect();
+                tracing::error!(
+                    silent_count = gaps.len(),
+                    top_10_samples = ?top,
+                    code = tickvault_common::error_code::ErrorCode::WsGap06TickGapSummary
+                        .code_str(),
+                    "WS-GAP-06 tick-gap detector coalesced summary — instruments silent ≥30s"
+                );
+            }
+        });
+    }
+
     // -----------------------------------------------------------------------
     // STAGE-C: WebSocket frame WAL (write-ahead log) — durable spill
     //
@@ -1574,6 +1617,24 @@ async fn main() -> Result<()> {
         "setting up QuestDB tables (ticks + instruments + depth + previous_close + historical_candles + materialized views + greeks)"
     );
 
+    // Wave 2 Item 7 (G14) — block until QuestDB is reachable. Escalating
+    // logs at +5/+10/+20s; BOOT-01 ERROR @+30s; BOOT-02 HALT @+60s.
+    // Prevents the legacy "tick processor starts before QuestDB is up"
+    // race that dropped early-boot ticks before this gate existed.
+    if let Err(e) = tickvault_storage::boot_probe::wait_for_questdb_ready(
+        &config.questdb,
+        tickvault_storage::boot_probe::BOOT_DEADLINE_SECS,
+    )
+    .await
+    {
+        tracing::error!(
+            error = ?e,
+            code = tickvault_common::error_code::ErrorCode::Boot02DeadlineExceeded.code_str(),
+            "BOOT-02 QuestDB never reached ready state — halting"
+        );
+        anyhow::bail!("BOOT-02 QuestDB readiness deadline exceeded: {e}");
+    }
+
     // All table creation queries are independent — run in parallel for faster boot.
     tokio::join!(
         ensure_tick_table_dedup_keys(&config.questdb),
@@ -1595,6 +1656,18 @@ async fn main() -> Result<()> {
         // FULL_CLOSE) and idempotent ALTER ADD COLUMN IF NOT EXISTS so
         // existing deployments auto-migrate.
         tickvault_storage::previous_close_persistence::ensure_previous_close_table(&config.questdb,),
+        // Wave 2 Item 9 (G18) — 6 audit-trail tables. SEBI-relevant.
+        // 90d hot → S3 IT → Glacier per `aws-budget.md`.
+        tickvault_storage::phase2_audit_persistence::ensure_phase2_audit_table(&config.questdb),
+        tickvault_storage::depth_rebalance_audit_persistence::ensure_depth_rebalance_audit_table(
+            &config.questdb
+        ),
+        tickvault_storage::ws_reconnect_audit_persistence::ensure_ws_reconnect_audit_table(
+            &config.questdb
+        ),
+        tickvault_storage::boot_audit_persistence::ensure_boot_audit_table(&config.questdb),
+        tickvault_storage::selftest_audit_persistence::ensure_selftest_audit_table(&config.questdb),
+        tickvault_storage::order_audit_persistence::ensure_order_audit_table(&config.questdb),
     );
 
     // Persist trading calendar to QuestDB (best-effort, non-blocking).
