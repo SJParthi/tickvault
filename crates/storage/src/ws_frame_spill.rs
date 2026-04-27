@@ -95,8 +95,20 @@ pub struct ReplayedFrame {
 // ---------------------------------------------------------------------------
 
 /// Bounded crossbeam channel between WS readers and the disk writer thread.
-/// 65k frames ≈ 6.5 seconds of peak 10k frames/sec headroom.
-const SPILL_CHANNEL_CAPACITY: usize = 65_536;
+///
+/// 131,072 frames ≈ 13 seconds of peak 10k frames/sec headroom.
+///
+/// 2026-04-27: Bumped from 65,536 to 131,072 after `chaos_healthy_ops_burst_100k_frames_zero_drops`
+/// flaked on slow 2-vCPU GitHub Actions runners. The producer's tight loop
+/// could enqueue 100,000 frames before the kernel scheduler ran the writer
+/// thread, exceeding the 65k cap and tripping the safety-floor invariant
+/// (`tv_ws_frame_spill_drop_critical == 0` in healthy ops). The new ceiling
+/// stays above the 100k chaos test threshold AND doubles burst headroom for
+/// production: a transient writer stall of up to 13s (e.g. brief disk fsync
+/// latency on a contended host) now absorbs without dropping. Memory cost
+/// at idle is ~3 MiB extra (131k × ~24 B/`WalRecord` header), trivial on
+/// the 8 GiB c7i.xlarge target.
+const SPILL_CHANNEL_CAPACITY: usize = 131_072;
 
 /// WAL file magic bytes — segment-local sanity check.
 const WAL_MAGIC: [u8; 4] = *b"TVW1";
@@ -548,6 +560,27 @@ mod tests {
         assert!(frames.len() <= 2);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Ratchet — the chaos test `chaos_healthy_ops_burst_100k_frames_zero_drops`
+    /// asserts ZERO drops while bursting 100,000 frames in a tight loop.
+    /// That requires the channel capacity to stay strictly above 100,000 so
+    /// even a fully-pinned writer thread on a 2-vCPU CI runner cannot fill
+    /// the channel before draining starts. A future regression that lowers
+    /// `SPILL_CHANNEL_CAPACITY` below 100,000 fails this test BEFORE the
+    /// chaos suite flakes in CI.
+    #[test]
+    fn test_spill_channel_capacity_exceeds_chaos_burst_size() {
+        const CHAOS_BURST_N: usize = 100_000;
+        assert!(
+            SPILL_CHANNEL_CAPACITY > CHAOS_BURST_N,
+            "SPILL_CHANNEL_CAPACITY ({}) must stay strictly above the chaos \
+             test's burst size ({}) so writer-thread scheduling delays on \
+             slow CI runners cannot trip the drop_critical safety-floor \
+             invariant",
+            SPILL_CHANNEL_CAPACITY,
+            CHAOS_BURST_N
+        );
     }
 
     #[test]
