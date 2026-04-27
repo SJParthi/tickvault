@@ -2931,4 +2931,59 @@ mod tests {
         let result = mgr.force_renewal_if_stale(14_400).await;
         assert!(!matches!(result, Ok(false)));
     }
+
+    // -----------------------------------------------------------------
+    // Wave 2 Item 5.4 (G1) — force_renewal + next_renewal_at tests.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_next_renewal_at_returns_none_when_no_token() {
+        let mgr = make_test_manager(None);
+        assert!(
+            mgr.next_renewal_at().is_none(),
+            "next_renewal_at must return None when no token is loaded"
+        );
+    }
+
+    #[test]
+    fn test_next_renewal_at_returns_expiry_when_token_present() {
+        let response = DhanAuthResponseData {
+            access_token: "eyJfresh".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 86_400,
+        };
+        let state = TokenState::from_response(&response);
+        let expected = state.expires_at();
+        let mgr = make_test_manager(Some(state));
+        let actual = mgr
+            .next_renewal_at()
+            .expect("token loaded so accessor returns Some");
+        assert_eq!(
+            actual, expected,
+            "next_renewal_at must return the cached expiry timestamp"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_force_renewal_attempts_renewal_unconditionally() {
+        // No HTTP server in test → renewal will fail with a network
+        // error. The contract under test is that the call ATTEMPTS the
+        // renewal regardless of remaining validity (i.e., it does not
+        // short-circuit on a fresh token like force_renewal_if_stale).
+        let response = DhanAuthResponseData {
+            access_token: "eyJfresh".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 86_400,
+        };
+        let state = TokenState::from_response(&response);
+        let mgr = make_test_manager(Some(state));
+        let result = mgr.force_renewal().await;
+        // Forbidden: Ok(()) — would mean a real renewal succeeded
+        // against the test base URL, which is impossible.
+        assert!(
+            result.is_err(),
+            "force_renewal must propagate the underlying network error \
+             when no Dhan endpoint is reachable, proving it always tries"
+        );
+    }
 }
