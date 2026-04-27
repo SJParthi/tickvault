@@ -46,6 +46,80 @@ pub struct ApplicationConfig {
     /// Plan item E1 (2026-04-22): 6-bucket movers tracker filter + cadence config.
     #[serde(default)]
     pub movers: MoversConfig,
+    /// Wave 1 C9 feature flags — operator-flippable rollback toggles.
+    /// 14 flags spanning Wave 1, Wave 2 and Wave 3 items.
+    #[serde(default)]
+    pub features: FeaturesConfig,
+}
+
+/// Wave 1 C9 feature-flag toggles. Default = `true` for every flag (the
+/// new code path is the safe default). Operators flip a flag to `false`
+/// in `config/base.toml` (or an env-override file) when a Wave 1/2/3
+/// item misbehaves and a redeploy isn't acceptable. The presence of
+/// the toggle is the rollback contract — Wave 2/3 items add their
+/// runtime branching as they ship; Wave 1 items 0-4 already on
+/// `claude/wave-1-hardening-implementation-Eok0R` use these flags
+/// where the rollback path exists.
+///
+/// `feature_flag_rollback_guard.rs` ratchets:
+/// 1. Every flag has a `<flag>_off`/`<flag>_on`/`<flag>_default_is_safe`
+///    test trio.
+/// 2. Default is always `true` so a missing `[features]` section does
+///    not silently disable the new behaviour.
+/// 3. Flags can be flipped to `false` and the config still parses
+///    (proves the rollback path is reachable from `config/base.toml`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct FeaturesConfig {
+    /// Wave 1 Item 0 — sync std::fs writers moved to dedicated drain tasks.
+    pub hotpath_async_writers: bool,
+    /// Wave 1 Item 1 — Phase2EmitGuard panic-on-drop in debug, ERROR in release.
+    pub phase2_emit_guard: bool,
+    /// Wave 1 Item 2 — stock movers persist ALL ranks (no top-N truncation).
+    pub stock_movers_full_universe: bool,
+    /// Wave 1 Item 3 — option movers snapshot every 5s for ~22K contracts.
+    pub option_movers_5s: bool,
+    /// Wave 1 Item 4 — `previous_close` un-deprecate + segment-routed persist.
+    pub previous_close_persist: bool,
+    /// Wave 2 Item 5 — main-feed WS idle-sleep until 09:00 IST.
+    pub ws_main_sleep_until_open: bool,
+    /// Wave 2 Item 6 — depth + order-update WS idle-sleep until 09:00 IST.
+    pub ws_depth_ou_sleep_until_open: bool,
+    /// Wave 2 Item 7 — fast-boot 60-second deadline with mid-market degraded mode.
+    pub fast_boot_60s_deadline: bool,
+    /// Wave 2 Item 8 — tick-gap detector 60-second alert coalescing.
+    pub tick_gap_detector_60s_coalesce: bool,
+    /// Wave 2 Item 9 — 6 audit tables (subscribe/disconnect/depth/etc).
+    pub audit_tables_enabled: bool,
+    /// Wave 3 Item 10 — pre-open movers snapshot during 09:00-09:13 IST.
+    pub preopen_movers: bool,
+    /// Wave 3 Item 11 — Telegram bucket-coalescer + dispatcher hardening.
+    pub telegram_bucket_coalescer: bool,
+    /// Wave 3 Item 12 — market-open self-test at 09:15 IST.
+    pub market_open_self_test: bool,
+    /// Wave 3 Item 13 — composite real-time guarantee score gauge.
+    pub realtime_guarantee_score: bool,
+}
+
+impl Default for FeaturesConfig {
+    fn default() -> Self {
+        Self {
+            hotpath_async_writers: true,
+            phase2_emit_guard: true,
+            stock_movers_full_universe: true,
+            option_movers_5s: true,
+            previous_close_persist: true,
+            ws_main_sleep_until_open: true,
+            ws_depth_ou_sleep_until_open: true,
+            fast_boot_60s_deadline: true,
+            tick_gap_detector_60s_coalesce: true,
+            audit_tables_enabled: true,
+            preopen_movers: true,
+            telegram_bucket_coalescer: true,
+            market_open_self_test: true,
+            realtime_guarantee_score: true,
+        }
+    }
 }
 
 /// Plan item E1 (2026-04-22): tuning knobs for the 6-bucket `MoversTrackerV2`.
@@ -1326,6 +1400,7 @@ mod tests {
             infrastructure: InfrastructureConfig::default(),
             partition_retention: PartitionRetentionConfig::default(),
             movers: MoversConfig::default(),
+            features: FeaturesConfig::default(),
         }
     }
 
