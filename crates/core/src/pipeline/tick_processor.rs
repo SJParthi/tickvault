@@ -43,9 +43,25 @@ fn depth_prices_are_finite(depth: &[MarketDepthLevel; 5]) -> bool {
 // ---------------------------------------------------------------------------
 
 /// File path for index prev_close cache (survives mid-day restarts).
+///
+/// Wave 1 Item 0.a — the `*_TMP` constant is no longer used here; the
+/// async writer in `super::prev_close_writer` owns the tmp+rename
+/// atomic pattern internally.
 const INDEX_PREV_CLOSE_CACHE_DIR: &str = "data/instrument-cache";
 const INDEX_PREV_CLOSE_CACHE_PATH: &str = "data/instrument-cache/index-prev-close.json";
-const INDEX_PREV_CLOSE_CACHE_TMP: &str = "data/instrument-cache/index-prev-close.json.tmp";
+
+/// Wave 1 Item 0.d — boot-time idempotent init for the index prev_close
+/// cache directory. Hoisted out of the tick hot path (was previously a
+/// per-packet `std::fs::create_dir_all` call on every PrevClose code-6
+/// frame). Safe to call multiple times.
+///
+/// Called from `crates/app/src/main.rs` Step 6b alongside the QuestDB
+/// table-DDL fan-out, before the tick processor starts. The hot path now
+/// assumes the directory exists and only writes the file atomically.
+// HOT-PATH-EXEMPT: boot-only init, runs once before tick processor starts.
+pub fn init_prev_close_cache_dir() -> std::io::Result<()> {
+    std::fs::create_dir_all(INDEX_PREV_CLOSE_CACHE_DIR)
+}
 
 /// **ZL-P0-2** — canary underlyings whose ticks are used as an
 /// end-to-end "alive but flowing?" health probe.
@@ -371,6 +387,77 @@ fn persist_stock_movers_snapshot(
     drop(writer.flush());
 }
 
+/// Wave 1 Item 2 — persists EVERY tracked equity and index entry as a
+/// single `EQUITY_ALL` / `INDEX_ALL` category. Operators can then
+/// query `select count(*) from stock_movers where ts > now()-1h` and
+/// see the full universe rolling forward (~239 × 720 ≈ 172 K rows/h)
+/// instead of just the top-N gainers/losers.
+///
+/// Cold path — runs alongside the existing `persist_stock_movers_snapshot`
+/// every 5 s during market hours. Composite key
+/// `(security_id, exchange_segment, ts)` is honored by the QuestDB
+/// DEDUP UPSERT KEY so reconnect / restart bursts within the same
+/// 5-second tick collapse to one row.
+fn persist_stock_movers_full_snapshot(
+    writer: &mut tickvault_storage::movers_persistence::StockMoversWriter,
+    equity_all: &[super::top_movers::MoverEntry],
+    index_all: &[super::top_movers::MoverEntry],
+    ts_nanos: i64,
+    registry: &Option<std::sync::Arc<tickvault_common::instrument_registry::InstrumentRegistry>>,
+) {
+    if equity_all.is_empty() && index_all.is_empty() {
+        return;
+    }
+
+    // Same registry-lookup pattern as `persist_stock_movers_snapshot`:
+    // I-P1-11 segment-aware lookup so cross-segment id collisions
+    // don't write the wrong symbol.
+    // O(1) EXEMPT: cold path — registry lookup per entry; bounded by
+    // the universe size (~270 entries per snapshot).
+    let lookup_symbol = |security_id: u32, segment_code: u8| -> &str {
+        let segment = match tickvault_common::types::ExchangeSegment::from_byte(segment_code) {
+            Some(s) => s,
+            None => return "",
+        };
+        registry
+            .as_ref()
+            .and_then(|r| r.get_with_segment(security_id, segment))
+            .map(|inst| inst.display_label.as_str())
+            .unwrap_or("")
+    };
+
+    let f32_clean = tickvault_storage::tick_persistence_testing::f32_to_f64_clean_pub;
+
+    let persist_all = |writer: &mut tickvault_storage::movers_persistence::StockMoversWriter,
+                       entries: &[super::top_movers::MoverEntry],
+                       category: &str| {
+        for (i, entry) in entries.iter().enumerate() {
+            let symbol = lookup_symbol(entry.security_id, entry.exchange_segment_code);
+            let prev_close = f32_clean(entry.prev_close);
+            let ltp = f32_clean(entry.last_traded_price);
+            let change_pct = f32_clean(entry.change_pct);
+            drop(writer.append_stock_mover(
+                ts_nanos,
+                category,
+                (i as i32).saturating_add(1),
+                entry.security_id,
+                tickvault_common::segment::segment_code_to_str(entry.exchange_segment_code),
+                symbol,
+                ltp,
+                prev_close,
+                change_pct,
+                i64::from(entry.volume),
+            ));
+        }
+    };
+
+    persist_all(writer, equity_all, "EQUITY_ALL");
+    persist_all(writer, index_all, "INDEX_ALL");
+
+    // Best-effort flush.
+    drop(writer.flush());
+}
+
 /// Persists an option movers snapshot to QuestDB (cold path, best-effort).
 ///
 /// Writes top 20 entries per category (7 categories × 20 = 140 rows max).
@@ -488,6 +575,104 @@ fn persist_option_movers_snapshot(
     split_persist(writer, &snapshot.top_value, "TOP_VALUE");
     split_persist(writer, &snapshot.price_gainers, "PRICE_GAINER");
     split_persist(writer, &snapshot.price_losers, "PRICE_LOSER");
+
+    drop(writer.flush());
+}
+
+/// Wave 1 Item 3 — persists EVERY tracked option contract entry as a
+/// single `OPTION_ALL` / `FUTURE_ALL` category. Operators can then
+/// answer "what was BANKNIFTY-Jun26-50000-CE doing at 11:23 IST?"
+/// without depending on whether the contract was in the top-N at that
+/// snapshot.
+///
+/// Cold path — runs alongside the existing `persist_option_movers_snapshot`
+/// every 5 s during market hours starting at 09:15:00 IST.
+fn persist_option_movers_full_snapshot(
+    writer: &mut tickvault_storage::movers_persistence::OptionMoversWriter,
+    entries: &[super::option_movers::OptionMoverEntry],
+    ts_nanos: i64,
+    registry: &Option<std::sync::Arc<tickvault_common::instrument_registry::InstrumentRegistry>>,
+) {
+    if entries.is_empty() {
+        return;
+    }
+    let f32_clean = tickvault_storage::tick_persistence_testing::f32_to_f64_clean_pub;
+
+    // Same registry-enrichment + OPTION/FUTURE split pattern as
+    // `persist_option_movers_snapshot`, applied to the full entry list.
+    // O(1) EXEMPT: cold path — bounded by ~22 K entries per snapshot.
+    let (opts, futs): (Vec<_>, Vec<_>) = entries.iter().cloned().partition(|e| {
+        let seg = tickvault_common::types::ExchangeSegment::from_byte(e.exchange_segment_code);
+        seg.and_then(|s| {
+            registry
+                .as_ref()
+                .and_then(|r| r.get_with_segment(e.security_id, s))
+        })
+        .and_then(|inst| inst.option_type)
+        .is_some()
+    });
+
+    let persist_full = |writer: &mut tickvault_storage::movers_persistence::OptionMoversWriter,
+                        items: &[super::option_movers::OptionMoverEntry],
+                        category: &str| {
+        for (i, entry) in items.iter().enumerate() {
+            let seg_for_lookup =
+                tickvault_common::types::ExchangeSegment::from_byte(entry.exchange_segment_code);
+            let enriched = seg_for_lookup
+                .and_then(|seg| {
+                    registry
+                        .as_ref()
+                        .and_then(|reg| reg.get_with_segment(entry.security_id, seg))
+                })
+                .map(|inst| {
+                    let ot = inst
+                        .option_type
+                        .map(|ot| match ot {
+                            tickvault_common::types::OptionType::Call => "CE",
+                            tickvault_common::types::OptionType::Put => "PE",
+                        })
+                        .unwrap_or("");
+                    (
+                        inst.display_label.as_str(),
+                        inst.underlying_symbol.as_str(),
+                        ot,
+                        inst.strike_price.unwrap_or(0.0),
+                        inst.expiry_date
+                            .map(|d| d.format("%Y-%m-%d").to_string())
+                            .unwrap_or_default(),
+                    )
+                });
+            let (contract_name, underlying, option_type_str, strike, expiry_str) = match enriched {
+                Some((cn, ul, ot, st, ex)) => (cn, ul, ot, st, ex),
+                None => ("", "", "", 0.0, String::new()),
+            };
+            const SPOT_PRICE_NOT_AVAILABLE: f64 = 0.0;
+            drop(writer.append_option_mover(
+                ts_nanos,
+                category,
+                (i as i32).saturating_add(1),
+                entry.security_id,
+                tickvault_common::segment::segment_code_to_str(entry.exchange_segment_code),
+                contract_name,
+                underlying,
+                option_type_str,
+                strike,
+                &expiry_str,
+                SPOT_PRICE_NOT_AVAILABLE,
+                f32_clean(entry.ltp),
+                f32_clean(entry.change),
+                f32_clean(entry.change_pct),
+                i64::from(entry.oi),
+                entry.oi_change,
+                f32_clean(entry.oi_change_pct),
+                i64::from(entry.volume),
+                entry.value,
+            ));
+        }
+    };
+
+    persist_full(writer, &opts, "OPTION_ALL");
+    persist_full(writer, &futs, "FUTURE_ALL");
 
     drop(writer.flush());
 }
@@ -874,8 +1059,25 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                             tick.day_close,
                         );
                     }
-                    // No separate previous_close table — day_close is already in every
-                    // tick persisted to the ticks table. Movers use in-memory baselines.
+                    // Wave 1 Item 4.4 — NSE_EQ prev-close persistence
+                    // per Dhan Ticket #5525125 (Quote packet code 4,
+                    // bytes 38-41). The first-seen gate fires once per
+                    // (security_id, segment) per IST trading day so
+                    // we don't amplify ILP throughput by ~24K-x.
+                    if let Some(seg) = tickvault_common::types::ExchangeSegment::from_byte(
+                        tick.exchange_segment_code,
+                    ) && super::first_seen_set::try_insert_global(tick.security_id, seg)
+                    {
+                        let _ = super::prev_close_persist::try_record_global(
+                            super::prev_close_persist::PrevCloseRecord {
+                                security_id: tick.security_id,
+                                exchange_segment_code: tick.exchange_segment_code,
+                                source: tickvault_storage::previous_close_persistence::PrevCloseSource::QuoteClose,
+                                prev_close: tick.day_close,
+                                received_at_nanos,
+                            },
+                        );
+                    }
                 }
 
                 // Ingestion gate: drop ALL ticks outside [9:00 AM, 3:30 PM) IST.
@@ -1041,6 +1243,25 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                             tick.security_id,
                             tick.exchange_segment_code,
                             tick.day_close,
+                        );
+                    }
+                    // Wave 1 Item 4.4 — NSE_FNO prev-close persistence
+                    // per Dhan Ticket #5525125 (Full packet code 8,
+                    // bytes 50-53). Same first-seen gate semantics as
+                    // the Quote path so we record exactly one row per
+                    // (security_id, segment) per IST trading day.
+                    if let Some(seg) = tickvault_common::types::ExchangeSegment::from_byte(
+                        tick.exchange_segment_code,
+                    ) && super::first_seen_set::try_insert_global(tick.security_id, seg)
+                    {
+                        let _ = super::prev_close_persist::try_record_global(
+                            super::prev_close_persist::PrevCloseRecord {
+                                security_id: tick.security_id,
+                                exchange_segment_code: tick.exchange_segment_code,
+                                source: tickvault_storage::previous_close_persistence::PrevCloseSource::FullClose,
+                                prev_close: tick.day_close,
+                                received_at_nanos,
+                            },
                         );
                     }
                 }
@@ -1292,26 +1513,46 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                 if exchange_segment_code == 0 {
                     // IDX_I segment
                     index_prev_close_cache.insert(security_id, previous_close);
-                    // Atomic file write: serialize → write to .tmp → rename.
-                    // Prevents partial/corrupt cache on crash or disk full.
-                    let cache_dir = INDEX_PREV_CLOSE_CACHE_DIR;
-                    let cache_path = INDEX_PREV_CLOSE_CACHE_PATH;
-                    let tmp_path = INDEX_PREV_CLOSE_CACHE_TMP;
+                    //
+                    // Wave 1 Item 0.a — sync `std::fs::write` + rename moved to
+                    // a dedicated writer task fed by a bounded
+                    // `tokio::sync::mpsc::channel(64)`; the hot path enqueues
+                    // a `bytes::Bytes` payload via `try_enqueue_global`. Drop
+                    // policy on overflow: drop newest, increment
+                    // `tv_prev_close_writer_dropped_total`, the next packet
+                    // re-snapshots the full HashMap so the cache becomes
+                    // fresh on the following successful enqueue.
                     if let Ok(json) = serde_json::to_string(&index_prev_close_cache) {
-                        drop(std::fs::create_dir_all(cache_dir));
-                        match std::fs::write(tmp_path, &json)
-                            .and_then(|()| std::fs::rename(tmp_path, cache_path))
-                        {
-                            Ok(()) => {}
-                            Err(err) => {
-                                warn!(
-                                    ?err,
-                                    security_id,
-                                    "failed to write index prev_close cache — mid-day restart may lose index baselines"
-                                );
-                            }
-                        }
+                        let outcome =
+                            super::prev_close_writer::try_enqueue_global(bytes::Bytes::from(json));
+                        // The writer logs its own ERROR on disk failure +
+                        // increments `tv_prev_close_writer_errors_total`. Hot
+                        // path stays ALLOC-CHEAP: the only allocation is the
+                        // `serde_json::to_string` above, which already
+                        // existed before Wave 1 Item 0.a. The Bytes::from
+                        // wrap is an Arc handoff (no copy).
+                        let _ = outcome;
                     }
+                }
+
+                // Wave 1 Item 4.4 — IDX_I prev-close persistence per
+                // Dhan Ticket #5525125 (PrevClose packet, code 6, bytes
+                // 8-11). The IDX_I path is "always emit" — DEDUP UPSERT
+                // KEYS(ts, security_id, segment) on `previous_close`
+                // collapses repeat packets within the same IST trading
+                // day to one row. We do NOT gate on FirstSeenSet for
+                // IDX_I because the packet is rare (~28 indices once
+                // per session) and the dedup is at-most-once already.
+                if exchange_segment_code == 0 {
+                    let _ = super::prev_close_persist::try_record_global(
+                        super::prev_close_persist::PrevCloseRecord {
+                            security_id,
+                            exchange_segment_code,
+                            source: tickvault_storage::previous_close_persistence::PrevCloseSource::Code6,
+                            prev_close: previous_close,
+                            received_at_nanos,
+                        },
+                    );
                 }
 
                 trace!(
@@ -1545,6 +1786,19 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                         ts_nanos,
                         &instrument_registry,
                     );
+                    // Wave 1 Item 2 — also persist EVERY tracked entry
+                    // as EQUITY_ALL / INDEX_ALL so the operator query
+                    // `select count(*) from stock_movers where ts > now()-1h`
+                    // returns the full universe (~239 stocks + ~30
+                    // indices) rather than just the top-N.
+                    let (equity_all, index_all) = movers.compute_full_entries();
+                    persist_stock_movers_full_snapshot(
+                        writer,
+                        &equity_all,
+                        &index_all,
+                        ts_nanos,
+                        &instrument_registry,
+                    );
                     movers_persist_count = movers_persist_count.saturating_add(1);
                     m_movers_persisted.increment(1);
                 }
@@ -1559,6 +1813,17 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     persist_option_movers_snapshot(
                         opt_writer,
                         &opt_snapshot,
+                        ts_nanos,
+                        &instrument_registry,
+                    );
+                    // Wave 1 Item 3 — also persist EVERY tracked option
+                    // contract as OPTION_ALL / FUTURE_ALL so the operator
+                    // can query the full ~22 K NSE_FNO universe per
+                    // snapshot rather than just the top-N per category.
+                    let full_entries = opt_movers.compute_full_entries();
+                    persist_option_movers_full_snapshot(
+                        opt_writer,
+                        &full_entries,
                         ts_nanos,
                         &instrument_registry,
                     );
@@ -1676,6 +1941,81 @@ mod tests {
         RESPONSE_CODE_MARKET_DEPTH, RESPONSE_CODE_MARKET_STATUS, RESPONSE_CODE_OI,
         RESPONSE_CODE_PREVIOUS_CLOSE, TICKER_OFFSET_LTP, TICKER_OFFSET_LTT, TICKER_PACKET_SIZE,
     };
+
+    // -----------------------------------------------------------------------
+    // Wave 1 Item 0.d — boot-time prev_close cache dir init
+    // -----------------------------------------------------------------------
+
+    /// Wave 1 Item 0.d ratchet: `init_prev_close_cache_dir()` must be safe to
+    /// call repeatedly. It runs at boot before the tick processor, so the
+    /// hot-path PrevClose code-6 frame can assume the directory exists
+    /// without paying for a `create_dir_all` syscall on every packet.
+    #[test]
+    fn test_init_prev_close_cache_dir_idempotent() {
+        // Calling the boot init three times in a row must succeed every time.
+        // The function is `pub` and idempotent by design (`create_dir_all` is
+        // a no-op when the directory already exists).
+        for _ in 0..3 {
+            init_prev_close_cache_dir().expect("init_prev_close_cache_dir must be idempotent");
+        }
+        assert!(
+            std::path::Path::new(INDEX_PREV_CLOSE_CACHE_DIR).exists(),
+            "init_prev_close_cache_dir must leave INDEX_PREV_CLOSE_CACHE_DIR on disk"
+        );
+    }
+
+    /// Wave 1 Item 0.d source-scan ratchet: prove the per-packet
+    /// create-dir-all call was hoisted out of the PrevClose hot-path arm.
+    /// If a future edit re-introduces the call inside the
+    /// ParsedFrame PrevClose arm without a HOT-PATH-EXEMPT comment,
+    /// this test MUST fail.
+    ///
+    /// The scan stops at the closing of the IDX_I if-arm by string
+    /// match on the trailing trace! marker, so test source — which
+    /// legitimately mentions the banned call name — is excluded by
+    /// construction (and comment lines inside the arm body are
+    /// filtered before the substring match).
+    #[test]
+    fn test_prev_close_arm_has_no_sync_fs_calls() {
+        let src = include_str!("tick_processor.rs");
+        let arm_start_marker =
+            "// IDX_I segment\n                    index_prev_close_cache.insert";
+        let arm_end_marker = "trace!(\n                    security_id,\n                    exchange_segment_code, previous_close, previous_oi, \"previous close persisted\"";
+        let start = src
+            .find(arm_start_marker)
+            .expect("PrevClose IDX_I cache-write arm must exist");
+        let end_rel = src[start..]
+            .find(arm_end_marker)
+            .expect("PrevClose arm must be followed by the trace!(...) summary");
+        let arm_body = &src[start..start.saturating_add(end_rel)];
+        // Strip comment lines so the human-readable explanation that
+        // mentions the banned call names does NOT trip the regression
+        // scan. We only flag actual call sites in code lines.
+        let code_only: String = arm_body
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<&str>>()
+            .join("\n");
+        // Wave 1 Item 0.d — directory creation must stay at boot.
+        assert!(
+            !code_only.contains("create_dir_all"),
+            "Wave 1 Item 0.d regression: create-dir-all reappeared inside \
+             the PrevClose IDX_I arm. Hoist it back to \
+             init_prev_close_cache_dir() at boot, or add an explicit \
+             HOT-PATH-EXEMPT comment if a per-packet syscall is genuinely \
+             required."
+        );
+        // Wave 1 Item 0.a — sync write/rename must stay off the hot path.
+        // The async writer task on the blocking pool owns these calls now.
+        for banned in ["std::fs::write", "std::fs::rename"] {
+            assert!(
+                !code_only.contains(banned),
+                "Wave 1 Item 0.a regression: sync `{banned}` reappeared in \
+                 the PrevClose IDX_I arm. Use \
+                 prev_close_writer::try_enqueue_global(...) instead."
+            );
+        }
+    }
 
     /// A5: Test helper — calls `run_tick_processor` with `NoopGreeksEnricher`
     /// as the concrete type parameter (no Greeks in tests). Avoids turbofish

@@ -83,5 +83,9 @@ harness = false
 name = "phase2_dispatch"
 harness = false
 
+[[bench]]
+name = "prev_close_writer"
+harness = false
+
 [package.metadata.cargo-machete]
 ignored = ["ahash", "arrayvec", "bytes", "chrono-tz", "failsafe", "loom", "papaya", "rtrb", "zerocopy"]

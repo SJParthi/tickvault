@@ -172,7 +172,7 @@ if [ -n "$COMMIT_MSG" ]; then
   # Allow: conventional commits, merge commits, revert commits
   if echo "$FIRST_LINE" | grep -qE '^(Merge|Revert) '; then
     echo "  PASS: Merge/Revert commit" >&2
-  elif echo "$FIRST_LINE" | grep -qE '^(feat|fix|refactor|test|docs|chore|perf|security)(\([a-z0-9_/-]+\))?: .+'; then
+  elif echo "$FIRST_LINE" | grep -qE '^(feat|fix|refactor|test|docs|chore|perf|security|ci|build|style|bench|revert)(\([a-z0-9_/-]+\))?: .+'; then
     echo "  PASS: Conventional commit format" >&2
   else
     echo "  FAIL: Commit message does not follow conventional format." >&2

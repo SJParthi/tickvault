@@ -214,7 +214,7 @@ while IFS= read -r msg; do
   [ -z "$msg" ] && continue
   # Allow: conventional commits, merge commits, revert commits
   if ! echo "$msg" | grep -qE '^(Merge|Revert)' && \
-     ! echo "$msg" | grep -qE '^(feat|fix|refactor|test|docs|chore|perf|security)(\([a-z0-9_/-]+\))?: .+'; then
+     ! echo "$msg" | grep -qE '^(feat|fix|refactor|test|docs|chore|perf|security|ci|build|style|bench|revert)(\([a-z0-9_/-]+\))?: .+'; then
     BAD_MSGS="${BAD_MSGS}  - ${msg}\n"
   fi
 done <<< "$COMMITS"

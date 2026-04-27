@@ -752,3 +752,104 @@ rules:
     justification: >-
       DH-910 is the catch-all for unknown Dhan error codes. ALWAYS
       escalate — an unknown code must be documented and mapped.
+
+  # -----------------------------------------------------------------------
+  # Wave 1 (PR #393) — hot-path / phase2 / prev-close / movers
+  # -----------------------------------------------------------------------
+
+  - name: hot-path-01-sync-fs-failed-escalate
+    match:
+      code: HOT-PATH-01
+    action: escalate
+    runbook_path: .claude/rules/project/wave-1-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 3600
+    justification: >-
+      HOT-PATH-01 means the writer task hit a sync fs error
+      (write/rename failed). Likely disk full, mount gone, or
+      permission issue. Operator must inspect; not auto-fixable.
+
+  - name: hot-path-02-writer-queue-drop-silence
+    match:
+      code: HOT-PATH-02
+    action: silence
+    runbook_path: .claude/rules/project/wave-1-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 86400
+    justification: >-
+      HOT-PATH-02 is a single-payload drop on a bounded mpsc(64)
+      queue. The next packet re-snapshots the full HashMap so the
+      cache becomes fresh. Sustained HOT-PATH-02 above 1/min
+      indicates a slow disk and should escalate via Prometheus
+      alert, not per-event Telegram.
+
+  - name: phase2-01-dispatch-failed-escalate
+    match:
+      code: PHASE2-01
+    action: escalate
+    runbook_path: .claude/rules/project/wave-1-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      PHASE2-01 means the Phase 2 09:13 IST dispatch could not
+      subscribe stock F&O. Operator MUST investigate immediately
+      — F&O ingestion is missing for the day until resolved.
+
+  - name: phase2-02-emit-guard-dropped-escalate
+    match:
+      code: PHASE2-02
+    action: escalate
+    runbook_path: .claude/rules/project/wave-1-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      PHASE2-02 means the Phase2EmitGuard was dropped without firing
+      an outcome — a regression added a return path that doesn't
+      consume guard.emit_*. Always escalate so the regression is
+      caught and reverted before more damage.
+
+  - name: prev-close-01-ilp-failed-escalate
+    match:
+      code: PREVCLOSE-01
+    action: escalate
+    runbook_path: .claude/rules/project/wave-1-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 3600
+    justification: >-
+      PREVCLOSE-01 means the previous_close ILP write failed.
+      Likely QuestDB ILP port unreachable or schema drift. Run
+      make doctor and check Loki for accompanying QuestDB errors.
+
+  - name: prev-close-02-first-seen-inconsistency-escalate
+    match:
+      code: PREVCLOSE-02
+    action: escalate
+    runbook_path: .claude/rules/project/wave-1-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      PREVCLOSE-02 is reserved for first_seen_set inconsistency.
+      Not currently emitted; if it ever fires, escalate so the
+      operator can investigate the IST-midnight reset task.
+
+  - name: movers-01-stock-persist-failed-escalate
+    match:
+      code: MOVERS-01
+    action: escalate
+    runbook_path: .claude/rules/project/wave-1-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 3600
+    justification: >-
+      MOVERS-01 means stock_movers ILP flush failed. Cosmetic for
+      the dashboard but indicative of QuestDB unreachable.
+
+  - name: movers-02-option-persist-failed-escalate
+    match:
+      code: MOVERS-02
+    action: escalate
+    runbook_path: .claude/rules/project/wave-1-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 3600
+    justification: >-
+      MOVERS-02 means option_movers ILP flush failed. Same
+      diagnosis path as MOVERS-01 but the table is option_movers.
