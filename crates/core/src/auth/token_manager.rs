@@ -904,6 +904,82 @@ impl TokenManager {
             None => "no token".to_string(),
         }
     }
+
+    /// Wave 2 Item 5.4 (AUTH-GAP-03) — proactive token renewal on
+    /// wake-from-sleep.
+    ///
+    /// Checks the current token's remaining validity. If the token has
+    /// **less than `threshold_secs` of validity left** (or no token
+    /// exists at all), triggers a renewal BEFORE the caller's next
+    /// reconnect attempt. Prevents the legacy "wake → reconnect →
+    /// DH-901 / DataAPI-807 → token refresh → reconnect → success"
+    /// 30-second cascade after a long post-close sleep.
+    ///
+    /// Returns:
+    /// - `Ok(true)` if a renewal was performed.
+    /// - `Ok(false)` if the existing token is still fresh enough.
+    /// - `Err(_)` if the renewal attempt failed (caller should still
+    ///   try to reconnect — Dhan may accept the existing token if it
+    ///   has any validity left).
+    ///
+    /// Threshold guidance: pass `14400` (4h) for the post-sleep wake
+    /// path. Set higher if the next sleep window is expected to be
+    /// long (e.g., Friday-evening → Monday-morning).
+    pub async fn force_renewal_if_stale(
+        &self,
+        threshold_secs: i64,
+    ) -> Result<bool, ApplicationError> {
+        // Use the canonical IST offset helper (same one TokenState uses).
+        let now =
+            chrono::Utc::now().with_timezone(&tickvault_common::trading_calendar::ist_offset());
+
+        // Snapshot the current token state without holding the lock
+        // across an await.
+        let remaining_secs: i64 = {
+            let guard = self.token.load();
+            match guard.as_ref().as_ref() {
+                Some(state) => (state.expires_at() - now).num_seconds(),
+                // No token at all → treat as "infinitely stale".
+                None => i64::MIN,
+            }
+        };
+
+        if remaining_secs > threshold_secs {
+            tracing::debug!(
+                remaining_secs,
+                threshold_secs,
+                "AUTH-GAP-03 token is fresh enough — skipping force renewal"
+            );
+            return Ok(false);
+        }
+
+        tracing::info!(
+            remaining_secs,
+            threshold_secs,
+            code = tickvault_common::error_code::ErrorCode::AuthGap03TokenForceRenewedOnWake
+                .code_str(),
+            "AUTH-GAP-03 token below threshold — forcing renewal before next reconnect"
+        );
+        metrics::counter!(
+            "tv_token_force_renewal_total",
+            "trigger" => "ws_wake"
+        )
+        .increment(1);
+
+        match self.renew_with_fallback().await {
+            Ok(()) => Ok(true),
+            Err(e) => {
+                tracing::error!(
+                    ?e,
+                    code =
+                        tickvault_common::error_code::ErrorCode::AuthGap03TokenForceRenewedOnWake
+                            .code_str(),
+                    "AUTH-GAP-03 force renewal failed — caller should still try reconnect"
+                );
+                Err(e)
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2739,5 +2815,48 @@ mod tests {
         assert!(!is_permanent_auth_error(rate_error));
         assert!(!is_totp_error(rate_error));
         assert!(is_dhan_rate_limited(rate_error));
+    }
+
+    // -----------------------------------------------------------------
+    // Wave 2 Item 5.4 (AUTH-GAP-03) — force_renewal_if_stale tests.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_force_renewal_if_stale_returns_false_when_token_is_fresh() {
+        // Token expires +24h. Threshold = 4h. Fresh → no renewal.
+        let response = DhanAuthResponseData {
+            access_token: "eyJfresh".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 86_400,
+        };
+        let state = TokenState::from_response(&response);
+        let mgr = make_test_manager(Some(state));
+        let result = mgr.force_renewal_if_stale(14_400).await;
+        assert!(matches!(result, Ok(false)));
+    }
+
+    #[tokio::test]
+    async fn test_force_renewal_if_stale_attempts_renewal_when_no_token() {
+        // No token → infinitely stale → renewal attempted.
+        // Renewal will fail in test (no live HTTP server) but the
+        // attempt-decision is the contract under test.
+        let mgr = make_test_manager(None);
+        let result = mgr.force_renewal_if_stale(14_400).await;
+        // Forbidden outcome: Ok(false) — would mean "fresh" with no token.
+        assert!(!matches!(result, Ok(false)));
+    }
+
+    #[tokio::test]
+    async fn test_force_renewal_if_stale_attempts_renewal_when_token_expires_soon() {
+        // Token expires in 1h. Threshold = 4h. Stale → renewal attempted.
+        let response = DhanAuthResponseData {
+            access_token: "eyJstale".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 3_600,
+        };
+        let state = TokenState::from_response(&response);
+        let mgr = make_test_manager(Some(state));
+        let result = mgr.force_renewal_if_stale(14_400).await;
+        assert!(!matches!(result, Ok(false)));
     }
 }
