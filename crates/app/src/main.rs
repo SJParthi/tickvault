@@ -231,6 +231,8 @@ async fn main() -> Result<()> {
                             .code_str(),
                         "AUDIT-05 selftest audit row write failed"
                     );
+                    metrics::counter!("tv_audit_write_failures_total", "table" => "selftest_audit")
+                        .increment(1);
                 }
             }
         });
@@ -1726,6 +1728,8 @@ async fn main() -> Result<()> {
                 code = tickvault_common::error_code::ErrorCode::Audit04BootWriteFailed.code_str(),
                 "AUDIT-04 boot audit row write failed — continuing"
             );
+            metrics::counter!("tv_audit_write_failures_total", "table" => "boot_audit")
+                .increment(1);
         }
     }
 
@@ -4245,6 +4249,7 @@ async fn main() -> Result<()> {
                                     code = tickvault_common::error_code::ErrorCode::Audit02DepthRebalanceWriteFailed.code_str(),
                                     "AUDIT-02 depth-rebalance audit row write failed"
                                 );
+                                metrics::counter!("tv_audit_write_failures_total", "table" => "depth_rebalance_audit").increment(1);
                             }
                         });
 

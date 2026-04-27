@@ -148,6 +148,8 @@ impl Phase2EmitGuard {
                         .code_str(),
                     "AUDIT-01 phase2 audit row write failed"
                 );
+                metrics::counter!("tv_audit_write_failures_total", "table" => "phase2_audit")
+                    .increment(1);
             }
         });
     }

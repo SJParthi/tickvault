@@ -401,6 +401,7 @@ async fn connect_and_listen(
                                         code = tickvault_common::error_code::ErrorCode::Audit06OrderWriteFailed.code_str(),
                                         "AUDIT-06 order audit row write failed"
                                     );
+                                    metrics::counter!("tv_audit_write_failures_total", "table" => "order_audit").increment(1);
                                 }
                             });
                         }
