@@ -21,11 +21,13 @@
 //! # Boot Sequence Position
 //! OMS -> **QuestDB -> Valkey** -> HTTP API
 
+pub mod boot_audit_persistence;
 pub mod boot_probe;
 pub mod calendar_persistence;
 pub mod candle_persistence;
 pub mod constituency_persistence;
 pub mod deep_depth_persistence;
+pub mod depth_rebalance_audit_persistence;
 pub mod greeks_persistence;
 pub mod historical_fetch_marker;
 pub mod indicator_snapshot_persistence;
@@ -33,14 +35,18 @@ pub mod instrument_persistence;
 pub mod materialized_views;
 pub mod movers_persistence;
 pub mod obi_persistence;
+pub mod order_audit_persistence;
 pub mod partition_manager;
+pub mod phase2_audit_persistence;
 pub mod phase2_subscription_marker;
 pub mod previous_close_persistence;
 pub mod questdb_health;
+pub mod selftest_audit_persistence;
 pub mod tick_persistence;
 pub mod tick_spill_drain;
 pub mod valkey_cache;
 pub mod ws_frame_spill;
+pub mod ws_reconnect_audit_persistence;
 
 /// Test support: re-exports internal functions for DHAT and benchmark tests.
 pub mod tick_persistence_testing {
