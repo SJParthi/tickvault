@@ -9,6 +9,7 @@
 
 pub mod candle_aggregator;
 pub mod depth_sequence_tracker;
+pub mod first_seen_set;
 pub mod mover_classifier;
 pub mod movers_window;
 pub mod no_tick_watchdog;

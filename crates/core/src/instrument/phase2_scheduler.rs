@@ -469,15 +469,21 @@ pub async fn run_phase2_scheduler(
         "Phase 2 scheduler starting"
     );
 
+    // Wave 1 Item 1 / G7 — the emit guard enforces that EVERY return
+    // path below ends with exactly one of `emit_complete` / `emit_failed`
+    // / `emit_skipped`. Drop without an emit:
+    //   * cfg(debug_assertions)  → panic immediately (test catches it),
+    //   * release build          → ERROR `PHASE2-02` to Loki + Telegram.
+    let mut guard =
+        crate::instrument::phase2_emit_guard::Phase2EmitGuard::new(Arc::clone(&notifier));
+
     let (today_ist, time_ist) = current_ist();
     let decision = next_phase2_trigger(today_ist, time_ist, &calendar);
     info!(?decision, "Phase 2 decision");
 
     match decision {
         NextTrigger::SkipToday { reason } => {
-            notifier.notify(NotificationEvent::Phase2Skipped {
-                reason: reason.as_str().to_string(),
-            });
+            guard.emit_skipped(reason.as_str().to_string());
             return;
         }
         NextTrigger::SleepUntil { duration } => {
@@ -486,6 +492,9 @@ pub async fn run_phase2_scheduler(
                 "Phase 2 sleeping until 09:12 IST"
             );
             tokio::time::sleep(duration).await;
+            // Phase2Started is informational; it does NOT satisfy the
+            // outcome contract — leaves the guard's `emitted` flag
+            // unchanged so a missing terminal emit still trips Drop.
             notifier.notify(NotificationEvent::Phase2Started { minutes_late: 0 });
         }
         NextTrigger::RunImmediate { minutes_late } => {
@@ -493,6 +502,8 @@ pub async fn run_phase2_scheduler(
                 minutes_late,
                 "Phase 2 running immediately — late-start or crash-recovery path"
             );
+            // Both informational; outcome must still come from a
+            // `guard.emit_*` call below.
             notifier.notify(NotificationEvent::Phase2RunImmediate { minutes_late });
             notifier.notify(NotificationEvent::Phase2Started { minutes_late });
         }
@@ -698,10 +709,7 @@ pub async fn run_phase2_scheduler(
                     "Phase 2: plan is EMPTY — no instruments to subscribe"
                 );
                 metrics::counter!("tv_phase2_runs_total", "outcome" => "empty_plan").increment(1);
-                notifier.notify(NotificationEvent::Phase2Failed {
-                    reason,
-                    attempts: attempt,
-                });
+                guard.emit_failed(reason, attempt);
                 return;
             }
 
@@ -735,12 +743,12 @@ pub async fn run_phase2_scheduler(
                                 "outcome" => "dispatch_failed"
                             )
                             .increment(1);
-                            notifier.notify(NotificationEvent::Phase2Failed {
-                                reason: "pool dispatch returned None — no capacity or \
-                                             no channels installed"
+                            guard.emit_failed(
+                                "pool dispatch returned None — no capacity or \
+                                 no channels installed"
                                     .to_string(),
-                                attempts: attempt,
-                            });
+                                attempt,
+                            );
                             return;
                         }
                     }
@@ -783,15 +791,10 @@ pub async fn run_phase2_scheduler(
             }
             metrics::counter!("tv_phase2_runs_total", "outcome" => "complete").increment(1);
             metrics::histogram!("tv_phase2_run_ms").record(duration_ms as f64);
-            notifier.notify(NotificationEvent::Phase2Complete {
-                added_count: dispatched_count,
-                duration_ms,
-                // Plan item G (2026-04-22): depth dispatch will land in
-                // item C — until then these are zero and the Telegram
-                // message will show "Depth-20: 0 underlyings".
-                depth_20_underlyings: 0,
-                depth_200_contracts: 0,
-            });
+            // Plan item G (2026-04-22): depth dispatch will land in
+            // item C — until then these are zero and the Telegram
+            // message will show "Depth-20: 0 underlyings".
+            guard.emit_complete(dispatched_count, duration_ms, 0, 0);
             return;
         }
         warn!(
@@ -806,13 +809,13 @@ pub async fn run_phase2_scheduler(
         "Phase 2: FAILED — LTPs never arrived within retry budget"
     );
     metrics::counter!("tv_phase2_runs_total", "outcome" => "failed").increment(1);
-    notifier.notify(NotificationEvent::Phase2Failed {
-        reason: format!(
+    guard.emit_failed(
+        format!(
             "index LTPs (NIFTY/BANKNIFTY) not present after {} attempts of {}s each",
             MAX_LTP_ATTEMPTS, LTP_WAIT_SECS_PER_ATTEMPT
         ),
-        attempts: MAX_LTP_ATTEMPTS,
-    });
+        MAX_LTP_ATTEMPTS,
+    );
 }
 
 /// For each subscribed stock, walk its pre-open closes from 09:12 down
