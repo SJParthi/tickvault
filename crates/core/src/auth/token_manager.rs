@@ -45,6 +45,25 @@ use crate::notification::service::NotificationService;
 /// swapped atomically on renewal — zero lock contention.
 pub type TokenHandle = Arc<ArcSwap<Option<TokenState>>>;
 
+/// Wave 2 Item 5.4 (AUTH-GAP-03) — global TokenManager handle so the
+/// WebSocket sleep-wake path can call `force_renewal_if_stale()`
+/// without the connection holding a back-reference. Set once at boot
+/// from `main.rs` via `set_global_token_manager()`.
+static GLOBAL_TOKEN_MANAGER: std::sync::OnceLock<Arc<TokenManager>> = std::sync::OnceLock::new();
+
+/// Install the global TokenManager. Idempotent — second call is a
+/// no-op. Returns `true` on first install, `false` if already set.
+pub fn set_global_token_manager(tm: Arc<TokenManager>) -> bool {
+    GLOBAL_TOKEN_MANAGER.set(tm).is_ok()
+}
+
+/// Read-only accessor for the global TokenManager. Returns `None`
+/// before `set_global_token_manager` is called (test binaries).
+#[must_use]
+pub fn global_token_manager() -> Option<&'static Arc<TokenManager>> {
+    GLOBAL_TOKEN_MANAGER.get()
+}
+
 // ---------------------------------------------------------------------------
 // Token Manager
 // ---------------------------------------------------------------------------

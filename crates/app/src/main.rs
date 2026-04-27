@@ -1973,6 +1973,13 @@ async fn main() -> Result<()> {
     // -----------------------------------------------------------------------
     let token_handle = token_manager.token_handle();
 
+    // Wave 2 Item 5.4 (AUTH-GAP-03) — install global TokenManager so the
+    // WebSocket sleep-wake path can call `force_renewal_if_stale()`
+    // without holding a back-reference per connection.
+    if !tickvault_core::auth::token_manager::set_global_token_manager(token_manager.clone()) {
+        tracing::warn!("global TokenManager already installed — skipping");
+    }
+
     // Fetch credentials ONCE for all downstream consumers (WS pool, order update WS, trading pipeline).
     // Previously fetched 3 separate times — each SSM call is a network roundtrip to AWS.
     let ws_client_id = {
