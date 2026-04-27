@@ -46,6 +46,92 @@ pub struct ApplicationConfig {
     /// Plan item E1 (2026-04-22): 6-bucket movers tracker filter + cadence config.
     #[serde(default)]
     pub movers: MoversConfig,
+    /// Wave 1 C9 feature flags — operator-flippable rollback toggles.
+    /// 14 flags spanning Wave 1, Wave 2 and Wave 3 items.
+    #[serde(default)]
+    pub features: FeaturesConfig,
+}
+
+/// Wave 1 C9 feature-flag toggles. Default = `true` for every flag (the
+/// new code path is the safe default).
+///
+/// # Status — flag plumbing only (Phase 1)
+///
+/// This struct ships the **config plumbing** for the 14 toggles. It does
+/// NOT yet guarantee that flipping a flag to `false` reverts to a
+/// pre-Wave code path: Wave 1 items 0–4 do their work unconditionally
+/// today, and the corresponding flag is read at runtime only by future
+/// Wave 2 / Wave 3 PRs that ship the actual runtime branching. Setting
+/// `hotpath_async_writers = false` in `config/base.toml` will parse
+/// cleanly but does NOT today bring back the deleted `std::fs::write`
+/// path — that revert needs a code change.
+///
+/// The honest C9 rollback contract is:
+///
+/// 1. The flag exists in the config struct + `[features]` section so an
+///    operator override file can carry a `false` value end-to-end.
+/// 2. Every Wave 2 / Wave 3 item PR is required to wire its runtime
+///    branch on the corresponding flag before merge (enforced by the
+///    9-box plan checklist + `feature_flag_rollback_guard.rs`).
+/// 3. Default is always `true` so a missing `[features]` section in any
+///    override file cannot silently disable a Wave item.
+///
+/// `feature_flag_rollback_guard.rs` ratchets the three guarantees above.
+/// The runtime-branch wiring is OUT of scope for this struct — see each
+/// Wave 2 / Wave 3 PR for the per-item `if cfg.features.<flag> { ... }`
+/// call sites.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct FeaturesConfig {
+    /// Wave 1 Item 0 — sync std::fs writers moved to dedicated drain tasks.
+    pub hotpath_async_writers: bool,
+    /// Wave 1 Item 1 — Phase2EmitGuard panic-on-drop in debug, ERROR in release.
+    pub phase2_emit_guard: bool,
+    /// Wave 1 Item 2 — stock movers persist ALL ranks (no top-N truncation).
+    pub stock_movers_full_universe: bool,
+    /// Wave 1 Item 3 — option movers snapshot every 5s for ~22K contracts.
+    pub option_movers_5s: bool,
+    /// Wave 1 Item 4 — `previous_close` un-deprecate + segment-routed persist.
+    pub previous_close_persist: bool,
+    /// Wave 2 Item 5 — main-feed WS idle-sleep until 09:00 IST.
+    pub ws_main_sleep_until_open: bool,
+    /// Wave 2 Item 6 — depth + order-update WS idle-sleep until 09:00 IST.
+    pub ws_depth_ou_sleep_until_open: bool,
+    /// Wave 2 Item 7 — fast-boot 60-second deadline with mid-market degraded mode.
+    pub fast_boot_60s_deadline: bool,
+    /// Wave 2 Item 8 — tick-gap detector 60-second alert coalescing.
+    pub tick_gap_detector_60s_coalesce: bool,
+    /// Wave 2 Item 9 — 6 audit tables (subscribe/disconnect/depth/etc).
+    pub audit_tables_enabled: bool,
+    /// Wave 3 Item 10 — pre-open movers snapshot during 09:00-09:13 IST.
+    pub preopen_movers: bool,
+    /// Wave 3 Item 11 — Telegram bucket-coalescer + dispatcher hardening.
+    pub telegram_bucket_coalescer: bool,
+    /// Wave 3 Item 12 — market-open self-test at 09:15 IST.
+    pub market_open_self_test: bool,
+    /// Wave 3 Item 13 — composite real-time guarantee score gauge.
+    pub realtime_guarantee_score: bool,
+}
+
+impl Default for FeaturesConfig {
+    fn default() -> Self {
+        Self {
+            hotpath_async_writers: true,
+            phase2_emit_guard: true,
+            stock_movers_full_universe: true,
+            option_movers_5s: true,
+            previous_close_persist: true,
+            ws_main_sleep_until_open: true,
+            ws_depth_ou_sleep_until_open: true,
+            fast_boot_60s_deadline: true,
+            tick_gap_detector_60s_coalesce: true,
+            audit_tables_enabled: true,
+            preopen_movers: true,
+            telegram_bucket_coalescer: true,
+            market_open_self_test: true,
+            realtime_guarantee_score: true,
+        }
+    }
 }
 
 /// Plan item E1 (2026-04-22): tuning knobs for the 6-bucket `MoversTrackerV2`.
@@ -1326,6 +1412,7 @@ mod tests {
             infrastructure: InfrastructureConfig::default(),
             partition_retention: PartitionRetentionConfig::default(),
             movers: MoversConfig::default(),
+            features: FeaturesConfig::default(),
         }
     }
 

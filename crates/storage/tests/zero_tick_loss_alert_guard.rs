@@ -95,6 +95,31 @@ fn tick_persistence_emits_dropped_counter_field() {
     );
 }
 
+/// Wave 1 Item 0.b — `tv_spill_dropped_total` counter MUST be emitted
+/// at the spill-path drop sites (open-failure + write-failure). Without
+/// it, operators cannot distinguish "spill is fine" from "spill is
+/// dropping ticks because of a slow disk".
+#[test]
+fn tick_persistence_emits_spill_dropped_total_with_reason_label() {
+    let text = load_text(TICK_PERSISTENCE_SOURCE);
+    assert!(
+        text.contains("tv_spill_dropped_total"),
+        "Wave 1 Item 0.b regression: tick_persistence.rs no longer emits \
+         `tv_spill_dropped_total` — operator visibility into spill-path \
+         drop reasons is broken."
+    );
+    assert!(
+        text.contains("\"reason\" => \"open_failed\""),
+        "Wave 1 Item 0.b regression: spill-path open-failure drop site \
+         must label the metric with `reason=\"open_failed\"`"
+    );
+    assert!(
+        text.contains("\"reason\" => \"write_failed\""),
+        "Wave 1 Item 0.b regression: spill-path write-failure drop site \
+         must label the metric with `reason=\"write_failed\"`"
+    );
+}
+
 #[test]
 fn tick_persistence_buffer_capacity_is_at_least_one_lakh() {
     // TICK_BUFFER_CAPACITY must stay above 100K to absorb normal market

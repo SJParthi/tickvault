@@ -1583,6 +1583,11 @@ async fn main() -> Result<()> {
         ),
         tickvault_storage::deep_depth_persistence::ensure_deep_depth_table(&config.questdb),
         tickvault_storage::obi_persistence::ensure_obi_table(&config.questdb),
+        // Wave 1 Item 4.2 — un-deprecated previous_close table. Schema
+        // includes the new `source` column (CODE6 / QUOTE_CLOSE /
+        // FULL_CLOSE) and idempotent ALTER ADD COLUMN IF NOT EXISTS so
+        // existing deployments auto-migrate.
+        tickvault_storage::previous_close_persistence::ensure_previous_close_table(&config.questdb,),
     );
 
     // Persist trading calendar to QuestDB (best-effort, non-blocking).
@@ -1590,6 +1595,54 @@ async fn main() -> Result<()> {
         warn!(
             ?err,
             "calendar persistence failed (non-critical, best-effort)"
+        );
+    }
+
+    // Wave 1 Item 0.d — boot-time idempotent init for the index prev_close
+    // cache directory. Hoisted out of the tick hot path (was a per-packet
+    // `std::fs::create_dir_all` call on every PrevClose code-6 frame).
+    // Failure here is non-fatal: the hot-path enqueue will surface the
+    // io::Error in the writer task's ERROR arm and movers will simply not
+    // have an index baseline cached for mid-day restart recovery.
+    if let Err(err) = tickvault_core::pipeline::init_prev_close_cache_dir() {
+        warn!(
+            ?err,
+            "init_prev_close_cache_dir failed (non-critical, mid-day index baseline cache will be unavailable)"
+        );
+    }
+
+    // Wave 1 Item 0.a — boot-time idempotent init for the async PrevClose
+    // cache writer. Spawns a `tokio::task::spawn_blocking` consumer task
+    // owning a bounded `tokio::sync::mpsc::channel(64)`. Hot path uses
+    // `prev_close_writer::try_enqueue_global` (non-blocking, drops oldest
+    // on overflow with `tv_prev_close_writer_dropped_total`).
+    tickvault_core::pipeline::prev_close_writer::init();
+
+    // Wave 1 Item 4.3/4.4 — boot-time idempotent init for the
+    // FirstSeenSet (gates first-Quote/Full per (security_id, segment)
+    // per IST trading day) + the PrevClose persist drain task (forwards
+    // hot-path enqueues to QuestDB via ILP). Plus the IST-midnight
+    // reset task that flips first_seen back to empty at IST 00:00.
+    let first_seen = tickvault_core::pipeline::first_seen_set::init_global();
+    let _first_seen_reset_handle =
+        tickvault_core::pipeline::first_seen_set::spawn_ist_midnight_reset_task(first_seen);
+    tickvault_core::pipeline::prev_close_persist::init(&config.questdb);
+
+    // Wave 1 Item 0.b part 2 — async tick spill drain. Adds an mpsc(8192)
+    // layer in front of the existing sync BufWriter spill so the hot path
+    // gets non-blocking enqueue semantics under slow-disk conditions
+    // (chaos-mode tests, full-disk recovery, host I/O glitches). The
+    // sync BufWriter + DLQ safety net stays intact — this is additional
+    // capacity, not a replacement.
+    let async_spill_path = std::path::PathBuf::from("data/spill").join(format!(
+        "ticks-async-{}.bin",
+        chrono::Utc::now().format("%Y%m%d")
+    ));
+    if let Err(err) = tickvault_storage::tick_spill_drain::init(async_spill_path).await {
+        warn!(
+            ?err,
+            "tick_spill_drain init failed (non-critical, sync spill path \
+             remains active)"
         );
     }
 

@@ -415,6 +415,68 @@ impl OptionMoversTracker {
         }
     }
 
+    /// Wave 1 Item 3 — returns EVERY tracked option contract entry
+    /// with NO top-N truncation. Persistence layer writes one row per
+    /// entry per snapshot so the `option_movers` QuestDB table covers
+    /// the full ~22 K NSE_FNO option universe (NIFTY + BANKNIFTY +
+    /// SENSEX full chains + 216 stocks ATM±25). Display paths
+    /// (`compute_snapshot`) keep their TOP_N truncation per category.
+    ///
+    /// Cold path — runs every 5 s during market hours starting at
+    /// 09:15:00 IST. O(N) where N ≈ 22 K; sorted by `change_pct`
+    /// descending so rank=1 is the biggest gainer.
+    pub fn compute_full_entries(&self) -> Vec<OptionMoverEntry> {
+        // O(1) EXEMPT: cold path — bounded by the F&O option universe
+        // (~22 K contracts). One pass + one sort.
+        let mut entries: Vec<OptionMoverEntry> = self
+            .options
+            .iter()
+            .filter_map(|(&(sid, _seg), state)| {
+                if !state.ltp.is_finite()
+                    || state.ltp <= 0.0
+                    || !state.prev_close.is_finite()
+                    || state.prev_close <= 0.0
+                {
+                    return None;
+                }
+                let change = state.ltp - state.prev_close;
+                let change_pct = (change / state.prev_close) * 100.0;
+                let oi_change = i64::from(state.oi).saturating_sub(i64::from(state.prev_oi));
+                let oi_change_pct = if state.prev_oi > 0 {
+                    (oi_change as f32 / state.prev_oi as f32) * 100.0
+                } else {
+                    0.0
+                };
+                // DATA-INTEGRITY-EXEMPT: derived metric (LTP × volume), not raw price storage
+                let value = f64::from(state.ltp) * f64::from(state.volume);
+                if !change_pct.is_finite() || !oi_change_pct.is_finite() {
+                    return None;
+                }
+                Some(OptionMoverEntry {
+                    security_id: sid,
+                    exchange_segment_code: state.exchange_segment_code,
+                    ltp: state.ltp,
+                    prev_close: state.prev_close,
+                    change,
+                    change_pct,
+                    oi: state.oi,
+                    prev_oi: state.prev_oi,
+                    oi_change,
+                    oi_change_pct,
+                    volume: state.volume,
+                    value,
+                })
+            })
+            .collect();
+
+        entries.sort_unstable_by(|a, b| {
+            b.change_pct
+                .partial_cmp(&a.change_pct)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        entries
+    }
+
     /// Returns the total number of ticks processed.
     pub fn ticks_processed(&self) -> u64 {
         self.ticks_processed
@@ -593,6 +655,35 @@ mod tests {
         let snapshot = tracker.compute_snapshot();
         assert!(snapshot.price_gainers.len() <= TOP_N);
         assert!(snapshot.top_volume.len() <= TOP_N);
+    }
+
+    /// Wave 1 Item 3 — `compute_full_entries` returns EVERY tracked
+    /// option contract entry with NO top-N truncation, sorted by
+    /// change_pct descending. Persistence path uses this so the
+    /// `option_movers` QuestDB table reflects the full ~22 K NSE_FNO
+    /// universe instead of just the top-N per category.
+    #[test]
+    fn test_compute_full_entries_returns_all_tracked_no_truncation() {
+        let mut tracker = OptionMoversTracker::new();
+        // 100 contracts — exceeds TOP_N (= 20).
+        for i in 0..100_u32 {
+            let tick = make_option_tick(49_000 + i, 100.0 + i as f32, 90.0, 1_000 + i * 100, 100);
+            tracker.update(&tick);
+        }
+        let entries = tracker.compute_full_entries();
+        assert_eq!(
+            entries.len(),
+            100,
+            "Wave 1 Item 3 invariant: compute_full_entries must return \
+             EVERY tracked option contract, not just TOP_N (= {TOP_N})"
+        );
+        // Sorted by change_pct descending — rank=1 is the biggest gainer.
+        for window in entries.windows(2) {
+            assert!(
+                window[0].change_pct >= window[1].change_pct,
+                "compute_full_entries MUST be sorted by change_pct desc"
+            );
+        }
     }
 
     #[test]

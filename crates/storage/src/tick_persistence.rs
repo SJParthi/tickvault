@@ -560,13 +560,39 @@ impl TickPersistenceWriter {
         // Lazy-open the spill file.
         if self.spill_writer.is_none() && let Err(err) = self.open_spill_file() {
             error!(?err, "CRITICAL: cannot open tick spill file — falling back to DLQ");
+            // Wave 1 Item 0.b — drop counter for spill-path failures.
+            // Per-reason label lets operators distinguish open-failure
+            // (likely permission / fsbroken) from write-failure
+            // (likely disk full) on the Grafana panel.
+            metrics::counter!("tv_spill_dropped_total", "reason" => "open_failed").increment(1);
             self.write_to_dlq(tick, "spill_open_failed");
             return;
         }
         let record = serialize_tick(tick);
+        // Wave 1 Item 0.b part 2 — try the async drain path FIRST.
+        // The drain task uses tokio::fs::File::write_all and dispatches
+        // the actual syscall to tokio's blocking pool, decoupling the
+        // hot-path enqueue latency from disk-write latency. Best-effort:
+        // on `Uninitialized` (drain never spawned) or `DroppedFull`
+        // (overflow), we fall through to the existing sync BufWriter
+        // path which preserves the chaos_zero_tick_loss safety net.
+        // O(1) EXEMPT: degraded path — only reached when the ring
+        // buffer is full (QuestDB down). 112-byte array -> Vec<u8> is
+        // one allocation per spill; under normal operation this code
+        // path never runs.
+        let drain_outcome = crate::tick_spill_drain::try_record_global(record.to_vec());
+        if matches!(
+            drain_outcome,
+            crate::tick_spill_drain::RecordOutcome::Sent
+        ) {
+            self.ticks_spilled_total = self.ticks_spilled_total.saturating_add(1);
+            return;
+        }
         if let Some(ref mut writer) = self.spill_writer && let Err(err) = writer.write_all(&record) {
             error!(?err, ticks_spilled = self.ticks_spilled_total, "CRITICAL: disk spill write failed — falling back to DLQ");
             self.spill_writer = None;
+            // Wave 1 Item 0.b — drop counter for the write-failure path.
+            metrics::counter!("tv_spill_dropped_total", "reason" => "write_failed").increment(1);
             self.write_to_dlq(tick, "spill_write_failed");
             return;
         }

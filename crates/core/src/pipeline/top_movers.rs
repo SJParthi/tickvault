@@ -317,6 +317,55 @@ impl TopMoversTracker {
         self.latest_snapshot.as_ref()
     }
 
+    /// Wave 1 Item 2 — returns EVERY tracked equity and index entry as
+    /// a `(equity_all, index_all)` tuple, with NO top-N truncation. The
+    /// persistence layer writes one row per entry per snapshot so the
+    /// `stock_movers` QuestDB table reflects the full universe (~239
+    /// stocks + ~30 indices). Display paths (`compute_snapshot`) keep
+    /// the top-N truncation for the API/UI surface.
+    ///
+    /// O(N) where N = number of tracked instruments. Cold path — runs
+    /// every 5 s during market hours.
+    pub fn compute_full_entries(&self) -> (Vec<MoverEntry>, Vec<MoverEntry>) {
+        let total_tracked = self.securities.len();
+        // O(1) EXEMPT: cold path — bounded by the F&O universe size.
+        let mut equity_all: Vec<MoverEntry> = Vec::with_capacity(total_tracked);
+        let mut index_all: Vec<MoverEntry> = Vec::with_capacity(64);
+
+        for (&(security_id, segment_code), state) in &self.securities {
+            if !state.change_pct.is_finite() {
+                continue;
+            }
+            let prev_close = self
+                .prev_close_prices
+                .get(&(security_id, segment_code))
+                .copied()
+                .unwrap_or(0.0);
+            let entry = MoverEntry {
+                security_id,
+                exchange_segment_code: state.exchange_segment_code,
+                last_traded_price: state.last_traded_price,
+                prev_close,
+                change_pct: state.change_pct,
+                volume: state.volume,
+            };
+            match state.exchange_segment_code {
+                0 => index_all.push(entry),
+                1 | 4 => equity_all.push(entry),
+                _ => {}
+            }
+        }
+        // Sort by change_pct descending so rank=1 is the biggest gainer.
+        let cmp_change = |a: &MoverEntry, b: &MoverEntry| {
+            b.change_pct
+                .partial_cmp(&a.change_pct)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        };
+        equity_all.sort_unstable_by(cmp_change);
+        index_all.sort_unstable_by(cmp_change);
+        (equity_all, index_all)
+    }
+
     /// Returns the number of securities being tracked.
     pub fn tracked_count(&self) -> usize {
         self.securities.len()
@@ -2282,6 +2331,47 @@ mod tests {
         assert!(snapshot.equity_losers.len() <= TOP_N);
         assert!(snapshot.equity_most_active.len() <= TOP_N);
         assert_eq!(snapshot.total_tracked, 100);
+    }
+
+    /// Wave 1 Item 2 — `compute_full_entries` returns EVERY tracked
+    /// equity and index entry with NO top-N truncation. Persistence
+    /// path uses this so the QuestDB `stock_movers` table reflects the
+    /// full universe instead of just the top-N gainers/losers.
+    #[test]
+    fn test_compute_full_entries_returns_all_tracked_no_truncation() {
+        let mut tracker = TopMoversTracker::new();
+        // 100 equities — exceeds TOP_N (= 20) so the truncation in
+        // compute_snapshot would drop most of them. compute_full_entries
+        // MUST return all 100 in equity_all.
+        for i in 1..=100u32 {
+            let ltp = 100.0 + (i as f32) * 0.5;
+            tracker.update(&make_tick(i, 1, ltp, 100.0, i * 1000));
+        }
+        // 30 indices (segment_code = 0 = IDX_I).
+        for i in 1001..=1030u32 {
+            let ltp = 19_500.0 + (i as f32);
+            tracker.update(&make_tick(i, 0, ltp, 19_500.0, 0));
+        }
+        let (equity_all, index_all) = tracker.compute_full_entries();
+        assert_eq!(
+            equity_all.len(),
+            100,
+            "Wave 1 Item 2 invariant: compute_full_entries must return \
+             EVERY tracked equity, not just TOP_N (= {TOP_N})"
+        );
+        assert_eq!(
+            index_all.len(),
+            30,
+            "Wave 1 Item 2 invariant: compute_full_entries must return \
+             EVERY tracked index, not just TOP_N"
+        );
+        // Sorted by change_pct descending — rank=1 is the biggest gainer.
+        for window in equity_all.windows(2) {
+            assert!(
+                window[0].change_pct >= window[1].change_pct,
+                "compute_full_entries equity_all MUST be sorted by change_pct desc"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

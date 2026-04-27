@@ -325,3 +325,25 @@ stock_options_min_oi = 100
 snapshot_cadence_secs = 5      # In-memory recompute (humans poll at 1 Hz)
 persistence_cadence_secs = 1   # QuestDB write cadence (~134 rows/sec)
 top_n = 20
+
+# ---------------------------------------------------------------------------
+# Wave 1 C9 feature flags — operator-flippable rollback toggles.
+# Default = true (safe, new code path active). Flip to false to revert
+# to the pre-Wave-1 path without redeploying. See
+# .claude/plans/active-plan-cross-cutting.md (C9) for the full spec.
+# ---------------------------------------------------------------------------
+[features]
+hotpath_async_writers = true        # Item 0  — async std::fs writers
+phase2_emit_guard = true            # Item 1  — Phase2EmitGuard panic-on-drop
+stock_movers_full_universe = true   # Item 2  — persist ALL movers (no top-N)
+option_movers_5s = true             # Item 3  — 22K option contracts every 5s
+previous_close_persist = true       # Item 4  — segment-routed prev_close write
+ws_main_sleep_until_open = true     # Item 5  — main feed idle-sleep until 09:00
+ws_depth_ou_sleep_until_open = true # Item 6  — depth + OU idle-sleep
+fast_boot_60s_deadline = true       # Item 7  — 60s deadline + degraded mode
+tick_gap_detector_60s_coalesce = true # Item 8 — 60s alert coalescing
+audit_tables_enabled = true         # Item 9  — 6 audit tables
+preopen_movers = true               # Item 10 — pre-open movers 09:00-09:13
+telegram_bucket_coalescer = true    # Item 11 — Telegram bucket coalescing
+market_open_self_test = true        # Item 12 — 09:15 IST self-test
+realtime_guarantee_score = true     # Item 13 — composite SLO score gauge

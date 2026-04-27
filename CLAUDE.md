@@ -320,7 +320,7 @@ make prometheus                      # localhost:9090
 **Pre-commit (8 gates):** fmt → banned patterns → data integrity → O(1)/dedup scan → secrets → version pinning → commit msg → typos
 **Pre-push (7 fast gates):** fmt → banned patterns → secrets → test count → data integrity → pub fn test guard → financial test guard
 **Git hook pre-push (11 gates):** fmt → clippy → test → banned patterns → test count → audit → deny → loom → data integrity → pub fn test guard → financial test guard
-**Commit message:** `^(feat|fix|refactor|test|docs|chore|perf|security)(\([a-z0-9_/-]+\))?: .+`
+**Commit message:** `^(feat|fix|refactor|test|docs|chore|perf|security|ci|build|style|bench|revert)(\([a-z0-9_/-]+\))?: .+`
 **Other hooks:** pre-tool-dispatch, auto-save, session-sanity, plan-verify, block-env-files
 
 ## DOCKER SERVICES (8 containers)
