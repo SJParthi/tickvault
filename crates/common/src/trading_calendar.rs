@@ -254,6 +254,59 @@ impl TradingCalendar {
         self.mock_trading_dates.len()
     }
 
+    /// Computes seconds from `now_utc_secs` until the next NSE market open
+    /// (09:00 IST on the next trading day, skipping weekends + holidays).
+    ///
+    /// Used by `WS-GAP-04` post-close sleep path — the WebSocket dormant
+    /// task awakens at the returned offset and reconnects.
+    ///
+    /// Pure function — `from_unix_secs` is a `i64`, callers pass in
+    /// `chrono::Utc::now().timestamp()` (or any deterministic value for
+    /// tests). Returns 0 if `from_unix_secs` is already past 09:00 IST on
+    /// a trading day (caller should immediately attempt reconnect).
+    ///
+    /// # Errors
+    /// Returns `None` if the lookahead exhausts without finding a trading
+    /// day within 14 calendar days — should never happen with a valid
+    /// NSE calendar.
+    #[must_use]
+    pub fn secs_until_next_market_open(&self, from_unix_secs: i64) -> Option<u64> {
+        const MARKET_OPEN_SEC_OF_DAY_IST: i64 = 9 * 3600;
+        const SECONDS_PER_DAY: i64 = 86_400;
+
+        let ist_secs = from_unix_secs.saturating_add(i64::from(IST_UTC_OFFSET_SECONDS));
+        let ist_day_index = ist_secs.div_euclid(SECONDS_PER_DAY);
+        let ist_secs_of_day = ist_secs.rem_euclid(SECONDS_PER_DAY);
+
+        // Convert IST day index back to NaiveDate (epoch 1970-01-01).
+        let today_ist = NaiveDate::from_num_days_from_ce_opt(
+            (ist_day_index + 719_163) // days from CE epoch to UNIX epoch = 719_162; +1 for inclusive
+                .try_into()
+                .ok()?,
+        )?;
+
+        // If still BEFORE 09:00 IST today AND today is a trading day,
+        // sleep until 09:00 IST today.
+        if ist_secs_of_day < MARKET_OPEN_SEC_OF_DAY_IST && self.is_trading_day(today_ist) {
+            let secs = MARKET_OPEN_SEC_OF_DAY_IST - ist_secs_of_day;
+            return u64::try_from(secs).ok();
+        }
+
+        // Otherwise, find the next trading day strictly after today.
+        let tomorrow = today_ist.succ_opt()?;
+        let next_day = self.next_trading_day(tomorrow);
+
+        // Compute UNIX seconds at 00:00 IST on next_day, then add 9h.
+        let days_from_epoch = i64::from(next_day.num_days_from_ce()).checked_sub(719_163)?;
+        let next_open_ist_unix = days_from_epoch
+            .checked_mul(SECONDS_PER_DAY)?
+            .checked_add(MARKET_OPEN_SEC_OF_DAY_IST)?;
+        // Subtract IST offset to get UNIX UTC seconds.
+        let next_open_utc = next_open_ist_unix.checked_sub(i64::from(IST_UTC_OFFSET_SECONDS))?;
+        let secs = next_open_utc.checked_sub(from_unix_secs)?;
+        u64::try_from(secs).ok()
+    }
+
     /// Returns all holiday, Muhurat, and mock trading entries for persistence/display.
     /// Sorted by date ascending.
     pub fn all_entries(&self) -> Vec<HolidayInfo> {
@@ -357,6 +410,86 @@ mod tests {
                 },
             ],
         }
+    }
+
+    // ---------------------------------------------------------------
+    // Wave 2 Item 5 — secs_until_next_market_open ratchets
+    // ---------------------------------------------------------------
+
+    /// Returns UNIX UTC timestamp for `YYYY-MM-DD HH:MM:SS IST`.
+    fn ist_unix(date: NaiveDate, h: u32, m: u32, s: u32) -> i64 {
+        let day_secs = i64::from(h) * 3600 + i64::from(m) * 60 + i64::from(s);
+        let days_from_epoch = i64::from(date.num_days_from_ce()) - 719_163;
+        days_from_epoch * 86_400 + day_secs - i64::from(IST_UTC_OFFSET_SECONDS)
+    }
+
+    #[test]
+    fn test_sleep_post_close_friday_sleeps_to_monday_0900() {
+        // 2026-01-23 is a Friday (NaiveDate weekday: Fri).
+        // Nearest holidays in test config: 2026-01-26 (Republic Day, Mon).
+        // So Friday post-close → sleep should land on Tuesday 2026-01-27 09:00 IST.
+        let config = make_test_config();
+        let cal = TradingCalendar::from_config(&config).unwrap();
+        let friday = NaiveDate::from_ymd_opt(2026, 1, 23).unwrap();
+        assert_eq!(friday.weekday(), Weekday::Fri);
+        let now = ist_unix(friday, 16, 0, 0); // 16:00 IST Friday (post-close)
+        let secs = cal.secs_until_next_market_open(now).unwrap();
+        let target = ist_unix(NaiveDate::from_ymd_opt(2026, 1, 27).unwrap(), 9, 0, 0);
+        assert_eq!(i64::try_from(secs).unwrap(), target - now);
+    }
+
+    #[test]
+    fn test_sleep_skips_weekend_to_monday_0900() {
+        // 2026-04-04 is Saturday. Skip Sat + Sun → wake Mon 2026-04-06 09:00 IST.
+        let config = make_test_config();
+        let cal = TradingCalendar::from_config(&config).unwrap();
+        let saturday = NaiveDate::from_ymd_opt(2026, 4, 4).unwrap();
+        assert_eq!(saturday.weekday(), Weekday::Sat);
+        let now = ist_unix(saturday, 12, 0, 0);
+        let secs = cal.secs_until_next_market_open(now).unwrap();
+        let target = ist_unix(NaiveDate::from_ymd_opt(2026, 4, 6).unwrap(), 9, 0, 0);
+        assert_eq!(i64::try_from(secs).unwrap(), target - now);
+    }
+
+    #[test]
+    fn test_sleep_skips_holiday_via_trading_calendar() {
+        // 2026-03-02 is Monday; 2026-03-03 is Holi (holiday in test config).
+        // Sleep at Mon 16:00 IST → wake Wed 2026-03-04 09:00 IST.
+        let config = make_test_config();
+        let cal = TradingCalendar::from_config(&config).unwrap();
+        let monday = NaiveDate::from_ymd_opt(2026, 3, 2).unwrap();
+        assert_eq!(monday.weekday(), Weekday::Mon);
+        let now = ist_unix(monday, 16, 0, 0);
+        let secs = cal.secs_until_next_market_open(now).unwrap();
+        let target = ist_unix(NaiveDate::from_ymd_opt(2026, 3, 4).unwrap(), 9, 0, 0);
+        assert_eq!(i64::try_from(secs).unwrap(), target - now);
+    }
+
+    #[test]
+    fn test_sleep_pre_open_today_sleeps_to_today_0900() {
+        // Trading day, before 09:00 IST → sleep until 09:00 IST today.
+        let config = make_test_config();
+        let cal = TradingCalendar::from_config(&config).unwrap();
+        // 2026-04-06 is Monday (trading day in test config).
+        let now = ist_unix(NaiveDate::from_ymd_opt(2026, 4, 6).unwrap(), 7, 30, 0);
+        let secs = cal.secs_until_next_market_open(now).unwrap();
+        // From 07:30 to 09:00 = 1h30m = 5400s.
+        assert_eq!(secs, 5400);
+    }
+
+    #[test]
+    fn test_sleep_70h_friday_to_monday_then_connect_succeeds() {
+        // Worst-case overnight: Fri 16:00 IST → Mon 09:00 IST = ~65h.
+        // No holiday in test config in this window so it lands on Monday.
+        let config = make_test_config();
+        let cal = TradingCalendar::from_config(&config).unwrap();
+        let friday = NaiveDate::from_ymd_opt(2026, 4, 3).unwrap();
+        assert_eq!(friday.weekday(), Weekday::Fri);
+        let now = ist_unix(friday, 16, 0, 0);
+        let secs = cal.secs_until_next_market_open(now).unwrap();
+        // Fri 16:00 → Mon 09:00 = 65 hours = 234_000 seconds.
+        assert_eq!(secs, 65 * 3600);
+        assert!(secs < 100 * 3600, "sleep window must be bounded under 100h");
     }
 
     #[test]
