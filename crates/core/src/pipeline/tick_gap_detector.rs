@@ -227,6 +227,33 @@ mod tests {
     }
 
     #[test]
+    fn test_set_global_tick_gap_detector_is_idempotent() {
+        // First call may or may not succeed (other tests in the same
+        // binary may have already installed). Either way the second
+        // call must not also succeed.
+        let d = Arc::new(TickGapDetector::new(30));
+        let first = set_global_tick_gap_detector(d.clone());
+        let second = set_global_tick_gap_detector(d);
+        assert!(
+            !(first && second),
+            "set_global_tick_gap_detector must be idempotent"
+        );
+    }
+
+    #[test]
+    fn test_record_tick_global_is_safe_when_no_detector_installed() {
+        // The hot-path call site must NOT panic when no detector is
+        // installed (test binaries that don't call set_*).
+        record_tick_global(13, ExchangeSegment::IdxI, Instant::now());
+    }
+
+    #[test]
+    fn test_global_tick_gap_detector_accessor_returns_option() {
+        // Type-check the accessor signature.
+        let _: Option<&'static SharedTickGapDetector> = global_tick_gap_detector();
+    }
+
+    #[test]
     fn test_record_tick_updates_existing_entry_in_place() {
         // Re-recording the same key replaces the previous Instant —
         // the map size stays at 1.
