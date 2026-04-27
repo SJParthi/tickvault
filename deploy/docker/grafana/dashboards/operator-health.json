@@ -1469,7 +1469,7 @@
       "type": "stat",
       "id": 44,
       "title": "Phase2EmitGuard dropped / 24h",
-      "description": "Wave 1 PHASE2-02. Should always be 0 — if it increments, the Phase 2 dispatcher returned without firing the daily outcome notification (regression in main.rs phase2_scheduler). Runbook: .claude/rules/project/wave-1-error-codes.md (PHASE2-02). Wrapped in increase() per Rule 12 — raw counters lie after process restart.",
+      "description": "Wave 1 PHASE2-02. Should always be 0 across a 24h sliding window. Any non-zero value means the Phase 2 dispatcher returned without firing the daily outcome notification (regression in main.rs phase2_scheduler). The companion alert tv-phase2-02-emit-guard-dropped stays firing for 24h after a single drop because the increase()[1d] window slides — operator must wait for the sample to age out or restart Prometheus to silence. Runbook: .claude/rules/project/wave-1-error-codes.md (PHASE2-02). Wrapped in increase() per Rule 12 — raw counters lie after process restart.",
       "gridPos": {
         "h": 6,
         "w": 6,

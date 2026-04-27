@@ -34,6 +34,7 @@
 
 use std::sync::Arc;
 
+use metrics::counter;
 // `tracing::error!` is used inside `Drop` only on release builds — gate
 // the import so the unused-import warning doesn't fire under
 // `cfg(debug_assertions)` / `cargo test`.
@@ -108,6 +109,14 @@ impl Drop for Phase2EmitGuard {
         if self.emitted {
             return;
         }
+        // Increment the Prometheus counter on BOTH debug and release
+        // paths — the alert tv-phase2-02-emit-guard-dropped + the
+        // operator-health Grafana panel both query
+        // `tv_phase2_emit_guard_dropped_total`. Without this increment
+        // the alert would silently never fire even though the guard
+        // caught the regression. Lives at the top of the drop branch
+        // so it fires before the debug panic unwinds.
+        counter!("tv_phase2_emit_guard_dropped_total").increment(1);
         // Debug builds (tests) — panic so missing-emit regressions show
         // up on the first execution that exercises the dropped path.
         #[cfg(debug_assertions)]
