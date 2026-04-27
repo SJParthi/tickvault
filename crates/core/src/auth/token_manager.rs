@@ -2840,6 +2840,25 @@ mod tests {
     // Wave 2 Item 5.4 (AUTH-GAP-03) — force_renewal_if_stale tests.
     // -----------------------------------------------------------------
 
+    #[test]
+    fn test_set_global_token_manager_is_idempotent() {
+        // Construct a TokenManager-shaped Arc via the test helper so we
+        // get a real instance.
+        let mgr = make_test_manager(None);
+        let first = super::set_global_token_manager(mgr.clone());
+        let second = super::set_global_token_manager(mgr);
+        assert!(
+            !(first && second),
+            "set_global_token_manager must be idempotent"
+        );
+    }
+
+    #[test]
+    fn test_global_token_manager_accessor_returns_option() {
+        // Type-check the accessor signature; value depends on test ordering.
+        let _: Option<&'static Arc<TokenManager>> = super::global_token_manager();
+    }
+
     #[tokio::test]
     async fn test_force_renewal_if_stale_returns_false_when_token_is_fresh() {
         // Token expires +24h. Threshold = 4h. Fresh → no renewal.
