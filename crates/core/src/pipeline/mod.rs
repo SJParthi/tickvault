@@ -19,5 +19,5 @@ pub mod top_movers;
 pub use candle_aggregator::CandleAggregator;
 pub use depth_sequence_tracker::{DepthSequenceTracker, SequenceOutcome};
 pub use option_movers::{OptionMoversTracker, SharedOptionMoversSnapshot};
-pub use tick_processor::run_tick_processor;
+pub use tick_processor::{init_prev_close_cache_dir, run_tick_processor};
 pub use top_movers::{SharedTopMoversSnapshot, TopMoversTracker};
