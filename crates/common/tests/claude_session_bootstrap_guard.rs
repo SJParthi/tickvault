@@ -517,6 +517,79 @@ fn health_slash_command_exists_and_wires_all_layers() {
     }
 }
 
+// -----------------------------------------------------------------------
+// PR #384 — auto-up Docker on local profile when all 4 services OFFLINE.
+// Closes "Honest gap #1": operator should not have to manually run
+// `make docker-up` after every laptop reboot. Strict guards keep this
+// safe (local-only, all-OFFLINE-only, CI-skipped, opt-out via env var,
+// fire-and-forget). The 5 ratchets below pin every safety guard so a
+// future regression cannot silently fire `docker compose up -d` from a
+// CI runner or an AWS profile.
+// -----------------------------------------------------------------------
+
+#[test]
+fn bootstrap_auto_up_only_fires_on_local_profile() {
+    let src = read("scripts/claude-session-bootstrap.sh");
+    assert!(
+        src.contains(r#"PROFILE" = "local""#),
+        "auto-up must guard on PROFILE=local — never touch AWS or mac-dev"
+    );
+}
+
+#[test]
+fn bootstrap_auto_up_skipped_in_ci() {
+    let src = read("scripts/claude-session-bootstrap.sh");
+    for env_var in ["${CI:-}", "${GITHUB_ACTIONS:-}", "${GITLAB_CI:-}"] {
+        assert!(
+            src.contains(env_var),
+            "auto-up must skip when {env_var} is set — CI runners must \
+             never spin up Docker via the SessionStart hook"
+        );
+    }
+}
+
+#[test]
+fn bootstrap_auto_up_supports_operator_opt_out() {
+    let src = read("scripts/claude-session-bootstrap.sh");
+    assert!(
+        src.contains("TICKVAULT_NO_AUTO_UP"),
+        "auto-up must honor TICKVAULT_NO_AUTO_UP=1 escape hatch — operator \
+         debugging a partially-up stack must be able to disable auto-start"
+    );
+}
+
+#[test]
+fn bootstrap_auto_up_requires_every_service_offline() {
+    let src = read("scripts/claude-session-bootstrap.sh");
+    // A partially-up stack means the operator is mid-debug — never
+    // disturb. Auto-up only fires when EVERY probed local service is
+    // OFFLINE (a fresh laptop boot scenario).
+    for status_var in ["PROM_S", "QDB_S", "GRAF_S", "API_S"] {
+        assert!(
+            src.contains(&format!(r#""${status_var}" = "OFFLINE""#)),
+            "auto-up must require {status_var}=OFFLINE — partial-up state \
+             must NOT trigger docker compose up"
+        );
+    }
+}
+
+#[test]
+fn bootstrap_auto_up_is_fire_and_forget() {
+    let src = read("scripts/claude-session-bootstrap.sh");
+    assert!(
+        src.contains("nohup docker compose"),
+        "auto-up must use nohup so SessionStart never blocks on Docker"
+    );
+    assert!(
+        src.contains("disown"),
+        "auto-up must disown the background docker compose process"
+    );
+    assert!(
+        src.contains("deploy/docker/docker-compose.yml"),
+        "auto-up must reference the canonical compose file path"
+    );
+}
+
 #[test]
 fn active_profile_is_one_of_the_known_profiles() {
     let cfg = read("config/claude-mcp-endpoints.toml");

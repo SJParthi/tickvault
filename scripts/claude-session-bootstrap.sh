@@ -173,4 +173,31 @@ if [ -n "$AUTO_SWITCHED_FROM" ]; then
 else
     echo "bootstrap: profile=$PROFILE  prom=$PROM_S  qdb=$QDB_S  graf=$GRAF_S  api=$API_S" >&2
 fi
+
+# PR #384: auto-up Docker on local profile when every probed service is OFFLINE.
+# Closes "Honest gap #1" — operator should not have to run `make docker-up`
+# after every laptop reboot. Strict guards keep this safe:
+#   1. Only fires on profile=local (never touches AWS).
+#   2. Only fires when prom + qdb + graf + api are ALL OFFLINE
+#      (any service up → assume operator is mid-debug and don't disturb).
+#   3. Only fires if `docker` is on PATH and the compose file exists.
+#   4. Skipped in CI (CI=true / GITHUB_ACTIONS=true / GITLAB_CI=true).
+#   5. Operator opt-out via TICKVAULT_NO_AUTO_UP=1.
+#   6. Fire-and-forget: never blocks SessionStart — `nohup ... &` + `disown`.
+#   7. Idempotent: `docker compose up -d` is a no-op if already running.
+COMPOSE_FILE="$CWD/deploy/docker/docker-compose.yml"
+if [ "$PROFILE" = "local" ] \
+    && [ "${TICKVAULT_NO_AUTO_UP:-0}" != "1" ] \
+    && [ -z "${CI:-}" ] && [ -z "${GITHUB_ACTIONS:-}" ] && [ -z "${GITLAB_CI:-}" ] \
+    && [ "$PROM_S" = "OFFLINE" ] && [ "$QDB_S" = "OFFLINE" ] \
+    && [ "$GRAF_S" = "OFFLINE" ] && [ "$API_S" = "OFFLINE" ] \
+    && command -v docker >/dev/null 2>&1 \
+    && [ -f "$COMPOSE_FILE" ]; then
+    AUTO_UP_LOG="$CWD/data/logs/auto-up.$(date +%Y-%m-%d-%H%M).log"
+    mkdir -p "$(dirname "$AUTO_UP_LOG")" 2>/dev/null || true
+    echo "bootstrap: all 4 local services OFFLINE — firing 'docker compose up -d' in background (log: $AUTO_UP_LOG; opt out via TICKVAULT_NO_AUTO_UP=1)" >&2
+    nohup docker compose -f "$COMPOSE_FILE" up -d </dev/null > "$AUTO_UP_LOG" 2>&1 &
+    disown || true
+fi
+
 exit 0
