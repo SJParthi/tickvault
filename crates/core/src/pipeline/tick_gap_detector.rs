@@ -113,6 +113,40 @@ impl TickGapDetector {
 /// Shared handle for the tick-gap detector (zero-copy clone via `Arc`).
 pub type SharedTickGapDetector = Arc<TickGapDetector>;
 
+/// Wave 2 Item 8 — global tick-gap detector handle. Set once at boot
+/// via `set_global_tick_gap_detector()`. The hot-path call site
+/// `record_tick_global()` is a no-op when no detector is installed
+/// (preserves test behaviour and avoids paying for the lookup if the
+/// feature is disabled).
+static GLOBAL_TICK_GAP_DETECTOR: std::sync::OnceLock<SharedTickGapDetector> =
+    std::sync::OnceLock::new();
+
+/// Install the global tick-gap detector. Idempotent — second call is a
+/// no-op. Returns `true` on first install, `false` otherwise. Call once
+/// at boot from `main.rs` BEFORE the tick processor starts.
+pub fn set_global_tick_gap_detector(detector: SharedTickGapDetector) -> bool {
+    GLOBAL_TICK_GAP_DETECTOR.set(detector).is_ok()
+}
+
+/// Hot-path entry point. Records a tick observation against the global
+/// detector if one is installed; otherwise, no-op.
+///
+/// O(1) — single OnceLock read + one papaya insert. Safe to call from
+/// the tick processor's hot loop.
+#[inline]
+pub fn record_tick_global(security_id: u32, segment: ExchangeSegment, now: Instant) {
+    if let Some(d) = GLOBAL_TICK_GAP_DETECTOR.get() {
+        d.record_tick(security_id, segment, now);
+    }
+}
+
+/// Read-only accessor for the global detector. Returns `None` if no
+/// detector has been installed yet. Used by the 60s coalescing task.
+#[must_use]
+pub fn global_tick_gap_detector() -> Option<&'static SharedTickGapDetector> {
+    GLOBAL_TICK_GAP_DETECTOR.get()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

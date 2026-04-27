@@ -1020,6 +1020,20 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     }
                 }
 
+                // Wave 2 Item 8 (G4) — record this tick observation in
+                // the global gap detector. O(1) hot-path: single
+                // OnceLock read + one papaya insert. No-op when the
+                // detector is not installed.
+                if let Some(seg) =
+                    tickvault_common::types::ExchangeSegment::from_byte(tick.exchange_segment_code)
+                {
+                    super::tick_gap_detector::record_tick_global(
+                        tick.security_id,
+                        seg,
+                        std::time::Instant::now(),
+                    );
+                }
+
                 // Filter junk ticks: NaN/Infinity, zero/negative LTP,
                 // or epoch timestamps (heartbeat/init frames from Dhan).
                 if !is_valid_tick(tick.last_traded_price, tick.exchange_timestamp) {
