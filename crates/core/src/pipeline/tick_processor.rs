@@ -579,6 +579,104 @@ fn persist_option_movers_snapshot(
     drop(writer.flush());
 }
 
+/// Wave 1 Item 3 — persists EVERY tracked option contract entry as a
+/// single `OPTION_ALL` / `FUTURE_ALL` category. Operators can then
+/// answer "what was BANKNIFTY-Jun26-50000-CE doing at 11:23 IST?"
+/// without depending on whether the contract was in the top-N at that
+/// snapshot.
+///
+/// Cold path — runs alongside the existing `persist_option_movers_snapshot`
+/// every 5 s during market hours starting at 09:15:00 IST.
+fn persist_option_movers_full_snapshot(
+    writer: &mut tickvault_storage::movers_persistence::OptionMoversWriter,
+    entries: &[super::option_movers::OptionMoverEntry],
+    ts_nanos: i64,
+    registry: &Option<std::sync::Arc<tickvault_common::instrument_registry::InstrumentRegistry>>,
+) {
+    if entries.is_empty() {
+        return;
+    }
+    let f32_clean = tickvault_storage::tick_persistence_testing::f32_to_f64_clean_pub;
+
+    // Same registry-enrichment + OPTION/FUTURE split pattern as
+    // `persist_option_movers_snapshot`, applied to the full entry list.
+    // O(1) EXEMPT: cold path — bounded by ~22 K entries per snapshot.
+    let (opts, futs): (Vec<_>, Vec<_>) = entries.iter().cloned().partition(|e| {
+        let seg = tickvault_common::types::ExchangeSegment::from_byte(e.exchange_segment_code);
+        seg.and_then(|s| {
+            registry
+                .as_ref()
+                .and_then(|r| r.get_with_segment(e.security_id, s))
+        })
+        .and_then(|inst| inst.option_type)
+        .is_some()
+    });
+
+    let persist_full = |writer: &mut tickvault_storage::movers_persistence::OptionMoversWriter,
+                        items: &[super::option_movers::OptionMoverEntry],
+                        category: &str| {
+        for (i, entry) in items.iter().enumerate() {
+            let seg_for_lookup =
+                tickvault_common::types::ExchangeSegment::from_byte(entry.exchange_segment_code);
+            let enriched = seg_for_lookup
+                .and_then(|seg| {
+                    registry
+                        .as_ref()
+                        .and_then(|reg| reg.get_with_segment(entry.security_id, seg))
+                })
+                .map(|inst| {
+                    let ot = inst
+                        .option_type
+                        .map(|ot| match ot {
+                            tickvault_common::types::OptionType::Call => "CE",
+                            tickvault_common::types::OptionType::Put => "PE",
+                        })
+                        .unwrap_or("");
+                    (
+                        inst.display_label.as_str(),
+                        inst.underlying_symbol.as_str(),
+                        ot,
+                        inst.strike_price.unwrap_or(0.0),
+                        inst.expiry_date
+                            .map(|d| d.format("%Y-%m-%d").to_string())
+                            .unwrap_or_default(),
+                    )
+                });
+            let (contract_name, underlying, option_type_str, strike, expiry_str) = match enriched {
+                Some((cn, ul, ot, st, ex)) => (cn, ul, ot, st, ex),
+                None => ("", "", "", 0.0, String::new()),
+            };
+            const SPOT_PRICE_NOT_AVAILABLE: f64 = 0.0;
+            drop(writer.append_option_mover(
+                ts_nanos,
+                category,
+                (i as i32).saturating_add(1),
+                entry.security_id,
+                tickvault_common::segment::segment_code_to_str(entry.exchange_segment_code),
+                contract_name,
+                underlying,
+                option_type_str,
+                strike,
+                &expiry_str,
+                SPOT_PRICE_NOT_AVAILABLE,
+                f32_clean(entry.ltp),
+                f32_clean(entry.change),
+                f32_clean(entry.change_pct),
+                i64::from(entry.oi),
+                entry.oi_change,
+                f32_clean(entry.oi_change_pct),
+                i64::from(entry.volume),
+                entry.value,
+            ));
+        }
+    };
+
+    persist_full(writer, &opts, "OPTION_ALL");
+    persist_full(writer, &futs, "FUTURE_ALL");
+
+    drop(writer.flush());
+}
+
 // ---------------------------------------------------------------------------
 // O(1) Tick Deduplication Ring Buffer
 // ---------------------------------------------------------------------------
@@ -1715,6 +1813,17 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     persist_option_movers_snapshot(
                         opt_writer,
                         &opt_snapshot,
+                        ts_nanos,
+                        &instrument_registry,
+                    );
+                    // Wave 1 Item 3 — also persist EVERY tracked option
+                    // contract as OPTION_ALL / FUTURE_ALL so the operator
+                    // can query the full ~22 K NSE_FNO universe per
+                    // snapshot rather than just the top-N per category.
+                    let full_entries = opt_movers.compute_full_entries();
+                    persist_option_movers_full_snapshot(
+                        opt_writer,
+                        &full_entries,
                         ts_nanos,
                         &instrument_registry,
                     );
