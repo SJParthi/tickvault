@@ -81,20 +81,77 @@ impl Phase2EmitGuard {
             depth_200_contracts,
         });
         self.emitted = true;
+        Self::audit_async(
+            "complete",
+            i64::try_from(added_count).unwrap_or(i64::MAX),
+            0,
+            0,
+            "Phase 2 dispatch succeeded",
+        );
     }
 
     /// Emits the failure outcome and marks the guard as fired.
     pub fn emit_failed(&mut self, reason: String, attempts: u32) {
+        let diag = format!("attempts={attempts}; {reason}");
         self.notifier
             .notify(NotificationEvent::Phase2Failed { reason, attempts });
         self.emitted = true;
+        Self::audit_async("failed", 0, 0, 0, &diag);
     }
 
     /// Emits the skipped outcome and marks the guard as fired.
     pub fn emit_skipped(&mut self, reason: String) {
+        let diag = reason.clone();
         self.notifier
             .notify(NotificationEvent::Phase2Skipped { reason });
         self.emitted = true;
+        Self::audit_async("skipped", 0, 0, 0, &diag);
+    }
+
+    /// Wave 2 Item 9 (AUDIT-01) — best-effort audit row. If the global
+    /// QuestDB config is not installed (e.g., unit tests), this is a
+    /// no-op. Always spawns onto the runtime so the caller's hot path
+    /// is unaffected.
+    fn audit_async(
+        outcome: &'static str,
+        stocks_added: i64,
+        stocks_skipped: i64,
+        buffer_entries: i64,
+        diagnostic: &str,
+    ) {
+        let Some(qcfg) = tickvault_storage::global_questdb_config() else {
+            return;
+        };
+        let qcfg = qcfg.clone();
+        let diag = diagnostic.to_string();
+        tokio::spawn(async move {
+            let now_ist_nanos = chrono::Utc::now()
+                .timestamp_nanos_opt()
+                .unwrap_or(0)
+                .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS);
+            let trading_date = now_ist_nanos - now_ist_nanos.rem_euclid(86_400_000_000_000);
+            if let Err(e) = tickvault_storage::phase2_audit_persistence::append_phase2_audit_row(
+                &qcfg,
+                now_ist_nanos,
+                trading_date,
+                outcome,
+                stocks_added,
+                stocks_skipped,
+                buffer_entries,
+                &diag,
+            )
+            .await
+            {
+                tracing::error!(
+                    ?e,
+                    code = tickvault_common::error_code::ErrorCode::Audit01Phase2WriteFailed
+                        .code_str(),
+                    "AUDIT-01 phase2 audit row write failed"
+                );
+                metrics::counter!("tv_audit_write_failures_total", "table" => "phase2_audit")
+                    .increment(1);
+            }
+        });
     }
 
     /// Returns `true` if any of the three `emit_*` methods has been

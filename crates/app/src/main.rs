@@ -170,6 +170,117 @@ async fn main() -> Result<()> {
             .context("failed to build trading calendar")?,
     );
 
+    // Wave 2 Item 5 (G1) — install global TradingCalendar handle so the
+    // main-feed `wait_with_backoff` post-close path can sleep until the
+    // next NSE market open instead of giving up.
+    if !tickvault_core::websocket::connection::set_market_calendar(trading_calendar.clone()) {
+        tracing::warn!("global TradingCalendar already installed — skipping");
+    }
+
+    // Wave 2 — install global QuestDB config so any module can emit
+    // audit rows without holding a config reference.
+    if !tickvault_storage::set_global_questdb_config(config.questdb.clone()) {
+        tracing::warn!("global QuestDbConfig already installed — skipping");
+    }
+
+    // Wave 2 Item 9 (AUDIT-05) — periodic selftest audit task. Every
+    // 15 minutes during the trading session, persist a row recording
+    // whether the QuestDB readiness probe succeeded. The body of the
+    // check is the same `wait_for_questdb_ready` call (1s deadline) —
+    // a fast liveness probe, not a full validate-automation run.
+    {
+        const SELFTEST_AUDIT_INTERVAL_SECS: u64 = 900;
+        let qcfg = config.questdb.clone();
+        tokio::spawn(async move {
+            let mut ticker =
+                tokio::time::interval(std::time::Duration::from_secs(SELFTEST_AUDIT_INTERVAL_SECS));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // Skip the first immediate fire — we already probed at boot.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let started = std::time::Instant::now();
+                let outcome =
+                    match tickvault_storage::boot_probe::wait_for_questdb_ready(&qcfg, 5).await {
+                        Ok(_) => "green",
+                        Err(_) => "red",
+                    };
+                let duration_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
+                let now_ist_nanos = chrono::Utc::now()
+                    .timestamp_nanos_opt()
+                    .unwrap_or(0)
+                    .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS);
+                // Truncate today's IST nanos to start of day for trading_date_ist.
+                let trading_date_ist =
+                    now_ist_nanos - (now_ist_nanos.rem_euclid(86_400_000_000_000));
+                if let Err(e) =
+                    tickvault_storage::selftest_audit_persistence::append_selftest_audit_row(
+                        &qcfg,
+                        now_ist_nanos,
+                        trading_date_ist,
+                        "questdb-liveness",
+                        outcome,
+                        duration_ms,
+                        "periodic 15-min liveness probe",
+                    )
+                    .await
+                {
+                    tracing::error!(
+                        error = ?e,
+                        code = tickvault_common::error_code::ErrorCode::Audit05SelftestWriteFailed
+                            .code_str(),
+                        "AUDIT-05 selftest audit row write failed"
+                    );
+                    metrics::counter!("tv_audit_write_failures_total", "table" => "selftest_audit")
+                        .increment(1);
+                }
+            }
+        });
+    }
+
+    // Wave 2 Item 8 (G4) — install the global tick-gap detector and
+    // spawn the 60s coalescing task. Recorded ticks live in a papaya
+    // map keyed by (security_id, segment) — composite per I-P1-11.
+    let tick_gap_detector = std::sync::Arc::new(tickvault_core::pipeline::TickGapDetector::new(
+        tickvault_core::pipeline::TICK_GAP_THRESHOLD_SECS_DEFAULT,
+    ));
+    if !tickvault_core::pipeline::tick_gap_detector::set_global_tick_gap_detector(
+        tick_gap_detector.clone(),
+    ) {
+        tracing::warn!("global TickGapDetector already installed — skipping");
+    }
+    {
+        let detector_for_task = tick_gap_detector.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
+                tickvault_core::pipeline::TICK_GAP_COALESCE_WINDOW_SECS_DEFAULT,
+            ));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                let now = std::time::Instant::now();
+                let gaps = detector_for_task.scan_gaps(now);
+                if gaps.is_empty() {
+                    continue;
+                }
+                metrics::counter!("tv_tick_gap_summary_total").increment(1);
+                metrics::gauge!("tv_tick_gap_instruments_silent").set(gaps.len() as f64);
+                let top: Vec<(u32, &'static str, u64)> = gaps
+                    .iter()
+                    .take(10)
+                    .map(|(id, seg, gap)| (*id, seg.as_str(), *gap))
+                    .collect();
+                tracing::error!(
+                    silent_count = gaps.len(),
+                    top_10_samples = ?top,
+                    code = tickvault_common::error_code::ErrorCode::WsGap06TickGapSummary
+                        .code_str(),
+                    "WS-GAP-06 tick-gap detector coalesced summary — instruments silent ≥30s"
+                );
+            }
+        });
+    }
+
     // -----------------------------------------------------------------------
     // STAGE-C: WebSocket frame WAL (write-ahead log) — durable spill
     //
@@ -1567,6 +1678,61 @@ async fn main() -> Result<()> {
         "setting up QuestDB tables (ticks + instruments + depth + previous_close + historical_candles + materialized views + greeks)"
     );
 
+    // Wave 2 Item 7 (G14) — block until QuestDB is reachable. Escalating
+    // logs at +5/+10/+20s; BOOT-01 ERROR @+30s; BOOT-02 HALT @+60s.
+    // Prevents the legacy "tick processor starts before QuestDB is up"
+    // race that dropped early-boot ticks before this gate existed.
+    let probe_started = std::time::Instant::now();
+    let boot_id = format!(
+        "boot-{}",
+        chrono::Utc::now()
+            .with_timezone(&tickvault_common::trading_calendar::ist_offset())
+            .format("%Y-%m-%d-%H%M%S")
+    );
+    if let Err(e) = tickvault_storage::boot_probe::wait_for_questdb_ready(
+        &config.questdb,
+        tickvault_storage::boot_probe::BOOT_DEADLINE_SECS,
+    )
+    .await
+    {
+        tracing::error!(
+            error = ?e,
+            code = tickvault_common::error_code::ErrorCode::Boot02DeadlineExceeded.code_str(),
+            "BOOT-02 QuestDB never reached ready state — halting"
+        );
+        anyhow::bail!("BOOT-02 QuestDB readiness deadline exceeded: {e}");
+    }
+
+    // Wave 2 Item 9 — boot audit row for the QuestDB readiness step.
+    // Best-effort: if QuestDB just barely came up but the DDL phase is
+    // about to write to it, we still want this row. Failures don't halt
+    // boot — the AUDIT-04 ErrorCode + tracing::error! covers regression.
+    {
+        let now_nanos = chrono::Utc::now()
+            .timestamp_nanos_opt()
+            .unwrap_or(0)
+            .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS);
+        if let Err(e) = tickvault_storage::boot_audit_persistence::append_boot_audit_row(
+            &config.questdb,
+            now_nanos,
+            &boot_id,
+            "questdb_ready",
+            "ok",
+            i64::try_from(probe_started.elapsed().as_millis()).unwrap_or(i64::MAX),
+            "QuestDB readiness probe succeeded",
+        )
+        .await
+        {
+            tracing::error!(
+                error = ?e,
+                code = tickvault_common::error_code::ErrorCode::Audit04BootWriteFailed.code_str(),
+                "AUDIT-04 boot audit row write failed — continuing"
+            );
+            metrics::counter!("tv_audit_write_failures_total", "table" => "boot_audit")
+                .increment(1);
+        }
+    }
+
     // All table creation queries are independent — run in parallel for faster boot.
     tokio::join!(
         ensure_tick_table_dedup_keys(&config.questdb),
@@ -1588,6 +1754,18 @@ async fn main() -> Result<()> {
         // FULL_CLOSE) and idempotent ALTER ADD COLUMN IF NOT EXISTS so
         // existing deployments auto-migrate.
         tickvault_storage::previous_close_persistence::ensure_previous_close_table(&config.questdb,),
+        // Wave 2 Item 9 (G18) — 6 audit-trail tables. SEBI-relevant.
+        // 90d hot → S3 IT → Glacier per `aws-budget.md`.
+        tickvault_storage::phase2_audit_persistence::ensure_phase2_audit_table(&config.questdb),
+        tickvault_storage::depth_rebalance_audit_persistence::ensure_depth_rebalance_audit_table(
+            &config.questdb
+        ),
+        tickvault_storage::ws_reconnect_audit_persistence::ensure_ws_reconnect_audit_table(
+            &config.questdb
+        ),
+        tickvault_storage::boot_audit_persistence::ensure_boot_audit_table(&config.questdb),
+        tickvault_storage::selftest_audit_persistence::ensure_selftest_audit_table(&config.questdb),
+        tickvault_storage::order_audit_persistence::ensure_order_audit_table(&config.questdb),
     );
 
     // Persist trading calendar to QuestDB (best-effort, non-blocking).
@@ -1857,6 +2035,13 @@ async fn main() -> Result<()> {
     // Step 8: Build WebSocket connection pool (only if authenticated + plan ready)
     // -----------------------------------------------------------------------
     let token_handle = token_manager.token_handle();
+
+    // Wave 2 Item 5.4 (AUTH-GAP-03) — install global TokenManager so the
+    // WebSocket sleep-wake path can call `force_renewal_if_stale()`
+    // without holding a back-reference per connection.
+    if !tickvault_core::auth::token_manager::set_global_token_manager(token_manager.clone()) {
+        tracing::warn!("global TokenManager already installed — skipping");
+    }
 
     // Fetch credentials ONCE for all downstream consumers (WS pool, order update WS, trading pipeline).
     // Previously fetched 3 separate times — each SSM call is a network roundtrip to AWS.
@@ -3955,6 +4140,9 @@ async fn main() -> Result<()> {
             {
                 let rebalance_notifier = notifier.clone();
                 let rebal_cmd_senders = std::sync::Arc::clone(&depth_cmd_senders);
+                // Wave 2 Item 9 (AUDIT-02) — clone QuestDB config into the
+                // rebalancer task scope so audit rows can be persisted.
+                let qcfg_for_rebalance = config.questdb.clone();
                 tokio::spawn(async move {
                     while rebalance_rx.changed().await.is_ok() {
                         let event = match rebalance_rx.borrow().clone() {
@@ -4029,6 +4217,40 @@ async fn main() -> Result<()> {
                             new_ce: new_ce.clone(),
                             new_pe: new_pe.clone(),
                             levels,
+                        });
+
+                        // Wave 2 Item 9 (AUDIT-02) — persist a depth-rebalance
+                        // audit row for SEBI-grade reconstruction.
+                        let now_nanos = chrono::Utc::now()
+                            .timestamp_nanos_opt()
+                            .unwrap_or(0)
+                            .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS);
+                        let levels_label = if has_200_level { "20+200" } else { "20" };
+                        let qcfg_for_audit = qcfg_for_rebalance.clone();
+                        let ul_for_audit = ul.to_string();
+                        let old_strike = event.prev_atm.as_ref().map(|a| a.strike).unwrap_or(0.0);
+                        let new_strike = event.new_atm.as_ref().map(|a| a.strike).unwrap_or(0.0);
+                        let spot_at_swap = event.current_spot;
+                        tokio::spawn(async move {
+                            if let Err(e) = tickvault_storage::depth_rebalance_audit_persistence::append_depth_rebalance_audit_row(
+                                &qcfg_for_audit,
+                                now_nanos,
+                                &ul_for_audit,
+                                old_strike,
+                                new_strike,
+                                spot_at_swap,
+                                levels_label,
+                                "success",
+                            )
+                            .await
+                            {
+                                tracing::error!(
+                                    error = ?e,
+                                    code = tickvault_common::error_code::ErrorCode::Audit02DepthRebalanceWriteFailed.code_str(),
+                                    "AUDIT-02 depth-rebalance audit row write failed"
+                                );
+                                metrics::counter!("tv_audit_write_failures_total", "table" => "depth_rebalance_audit").increment(1);
+                            }
                         });
 
                         // --- 200-level rebalance via command channel (zero disconnect) ---
@@ -6214,9 +6436,27 @@ async fn run_shutdown_fast(
     }
 
     // 3b. Abort WebSocket connections (drops senders → processor exits).
-    for handle in ws_handles {
-        handle.abort();
+    // Wave 2 Item 5.2 (WS-GAP-05) — first abort, then run the pool
+    // supervisor to drain any final exits with structured ERROR logs +
+    // metric increments for tasks that panicked / errored vs exited
+    // cleanly. Bounded by 5s so a hung handle does not stall shutdown.
+    let abort_handles: Vec<_> = ws_handles
+        .iter()
+        .map(tokio::task::JoinHandle::abort_handle)
+        .collect();
+    for h in &abort_handles {
+        h.abort();
     }
+    let supervise_fut =
+        tickvault_core::websocket::connection_pool::WebSocketConnectionPool::supervise_pool(
+            ws_handles,
+        );
+    const POOL_SUPERVISOR_DRAIN_TIMEOUT_SECS: u64 = 5;
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(POOL_SUPERVISOR_DRAIN_TIMEOUT_SECS),
+        supervise_fut,
+    )
+    .await;
 
     // 4. Wait for tick processor final flush.
     if let Some(handle) = processor_handle {

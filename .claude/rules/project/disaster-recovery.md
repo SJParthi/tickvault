@@ -79,38 +79,55 @@ is intact; if not, fall through to CSV download (~60s adds 30s to RTO).
 | Recovery | Falls through to AWS SSM (already-fresh token) |
 | **Impact** | Zero — trading continues, cache repopulates on next renewal |
 
-### 5. Single WS connection drops mid-day
+### 5. Single WS connection drops mid-day (REWRITTEN — Wave 2 Item 5/6)
 
 | Step | Action |
 |---|---|
 | Detection | Pool watchdog (5s tick) sees state ≠ Connected |
-| Recovery | Reconnect with `SubscribeRxGuard` (PR #337) — re-issues subscribe commands on the new socket |
-| **RTO** | ~5–10s |
+| Recovery | Reconnect with `SubscribeRxGuard` (PR #337). **Wave 2:** if 3 consecutive failures occur post-15:30 IST, the per-connection task does NOT exit — it sleeps until the next NSE market open via `TradingCalendar::secs_until_next_market_open` (WS-GAP-04). Was a `return false` → process-restart-required in the legacy code. |
+| **RTO** | ~5–10s in-market; up to ~65h overnight (Fri 16:00 → Mon 09:00 sleep). |
 
-### 6. All 5 WS connections drop (network blip / RST flood)
+### 6. All 5 WS connections drop (network blip / RST flood) (REWRITTEN — Wave 2 Item 5/6)
 
 | Step | Action |
 |---|---|
 | Detection | Watchdog sees `active_count = 0` → Telegram CRITICAL |
-| Recovery | All 5 reconnect in parallel; SubscribeRxGuard restores subscriptions |
+| Recovery | All 5 reconnect in parallel; `SubscribeRxGuard` restores subscriptions. **Wave 2:** if all reconnects exhaust the post-close gate, pool stays alive in dormant sleep instead of giving up. Pool supervisor (`respawn_dead_connections_loop`) re-spawns any panicked task within 5s (WS-GAP-05). |
 | Spot freshness | If buffer stale (Mode C), live-tick resolver re-runs to confirm ATM |
-| **RTO** | ~30s |
+| **RTO** | ~30s in-market; pool re-converges at next market open if event happens after 15:30 IST. |
 
-### 7. Auth token expired mid-market (DH-901 / DataAPI-807)
+### 7. Auth token expired mid-market (DH-901 / DataAPI-807) (REWRITTEN — Wave 2 Item 5.4)
 
 | Step | Action |
 |---|---|
 | Detection | `DisconnectCode::AccessTokenExpired` (807) routed by Dhan |
-| Recovery | Token refresh (Valkey → SSM → TOTP) → reconnect with fresh JWT (AUTH-GAP-02) |
-| **RTO** | ~15s |
+| Recovery | Token refresh (Valkey → SSM → TOTP) → reconnect with fresh JWT (AUTH-GAP-02). **Wave 2:** on wake-from-sleep, `TokenManager::force_renewal_if_stale(threshold_secs = 14400)` proactively renews if token has < 4h validity, BEFORE the post-sleep reconnect attempt (AUTH-GAP-03). Prevents the legacy "wake → reconnect → 807 → token refresh → reconnect → success" 30-second cascade. |
+| **RTO** | ~15s in-market; ~5s on wake (token already fresh). |
 
-### 8. Network blip (RST flood like 2026-04-24 incident)
+### 8. Network blip (RST flood like 2026-04-24 incident) (REWRITTEN — Wave 2 Item 5)
 
 | Step | Action |
 |---|---|
 | Detection | Connection read-loop `Err` + watchdog 5s tick |
-| Recovery | Existing exponential backoff + SubscribeRxGuard preserves the subscription channel across reconnects |
-| **RTO** | ~10–30s |
+| Recovery | Existing exponential backoff + `SubscribeRxGuard` preserves the subscription channel across reconnects. **Wave 2:** post-close streak no longer terminates the task — it transitions to sleep mode with `tv_ws_post_close_sleep_total{feed="main"}` increment + `WebSocketSleepEntered` notification (Severity::Low). |
+| **RTO** | ~10–30s in-market. |
+
+### 12. Boot-time QuestDB readiness race (NEW — Wave 2 Item 7)
+
+| Step | Action |
+|---|---|
+| Detection | Boot probe `wait_for_questdb_ready(BOOT_DEADLINE_SECS=60)` polls QuestDB `/exec` endpoint with `SELECT 1`. Escalating logs: DEBUG @5s, INFO @10s, WARN @20s, ERROR `BOOT-01` @30s (with Telegram alert), CRITICAL `BOOT-02` @60s (HALT). |
+| Recovery | If QuestDB green within 60s → boot continues. If not → app halts. Operator runs `make doctor` + `docker ps` to fix the underlying issue, then restarts. The rescue ring buffers ticks in the meantime. |
+| **RTO** | ~10s warm path (QuestDB already up); ~60s on cold start; HALT after 60s. |
+
+### 13. Synthetic / regulatory audit reconstruction (NEW — Wave 2 Item 9)
+
+| Step | Action |
+|---|---|
+| Trigger | "Why was BANKNIFTY 47000 swapped to 47200 at 11:23:45 IST on 2026-05-15?" |
+| Recovery | Query `depth_rebalance_audit` for ts range. Query `phase2_audit` for that day's 09:13 outcome. Query `ws_reconnect_audit` for any churn around the swap. Query `boot_audit` for that day's boot timeline. Query `selftest_audit` for `make doctor` history. |
+| SEBI retention | All 6 audit tables retained 90d hot (QuestDB) → S3 IT (90–365d) → Glacier Deep Archive (≥1y up to 5y). `order_audit` is the strict 5y SEBI-mandate table. |
+| **Cost** | ~₹333/mo for up to 500GB cold archive (covered by `aws-budget.md`). |
 
 ### 9. Dhan REST `/marketfeed/ltp` returns 805 (too many connections)
 

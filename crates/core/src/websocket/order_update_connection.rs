@@ -351,6 +351,60 @@ async fn connect_and_listen(
                             symbol = %update.symbol,
                             "order update received"
                         );
+                        // Wave 2 Item 9 (AUDIT-06) — persist an order audit row
+                        // for SEBI 5y retention. Best-effort; failures don't
+                        // block the broadcast path. Spawned to keep hot loop O(1).
+                        if let Some(qcfg) = tickvault_storage::global_questdb_config() {
+                            // O(1) EXEMPT: begin
+                            // Cold path — fires once per order event
+                            // (~20–100/day in dry-run, hundreds/day live).
+                            // Audit row build is deliberately cold; the
+                            // persistence happens off-hot-loop via tokio::spawn.
+                            let qcfg = qcfg.clone();
+                            let order_id = update.order_no.clone();
+                            let corr_id = update.correlation_id.clone();
+                            let leg = format!("LEG_{}", update.leg_no);
+                            let event_label = update.status.clone();
+                            let sid = update.security_id.parse::<i32>().unwrap_or(0);
+                            let segment = update.segment.clone();
+                            let txn = update.txn_type.clone();
+                            let qty = update.quantity;
+                            let price = update.price;
+                            let status = update.status.clone();
+                            let symbol = update.symbol.clone();
+                            // O(1) EXEMPT: end
+                            tokio::spawn(async move {
+                                let now_nanos = chrono::Utc::now()
+                                    .timestamp_nanos_opt()
+                                    .unwrap_or(0)
+                                    .saturating_add(
+                                        tickvault_common::constants::IST_UTC_OFFSET_NANOS,
+                                    );
+                                if let Err(e) = tickvault_storage::order_audit_persistence::append_order_audit_row(
+                                    &qcfg,
+                                    now_nanos,
+                                    &order_id,
+                                    &corr_id,
+                                    &leg,
+                                    &event_label,
+                                    sid,
+                                    &segment,
+                                    &txn,
+                                    qty,
+                                    price,
+                                    &status,
+                                    "ok",
+                                    &symbol,
+                                ).await {
+                                    tracing::error!(
+                                        ?e,
+                                        code = tickvault_common::error_code::ErrorCode::Audit06OrderWriteFailed.code_str(),
+                                        "AUDIT-06 order audit row write failed"
+                                    );
+                                    metrics::counter!("tv_audit_write_failures_total", "table" => "order_audit").increment(1);
+                                }
+                            });
+                        }
                         // Broadcast to subscribers (OMS, notification, etc.).
                         // 2026-04-24 audit finding #4: previously discarded the
                         // SendError with "no receivers — that's fine". BUT if

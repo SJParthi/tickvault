@@ -21,10 +21,59 @@
 //! # Boot Sequence Position
 //! OMS -> **QuestDB -> Valkey** -> HTTP API
 
+/// Wave 2 — global QuestDB config handle so any module (e.g.,
+/// `connection.rs` reconnect-success) can emit audit rows without
+/// holding a reference. Set once at boot via
+/// `set_global_questdb_config()`.
+static GLOBAL_QUESTDB_CONFIG: std::sync::OnceLock<tickvault_common::config::QuestDbConfig> =
+    std::sync::OnceLock::new();
+
+/// Install the global QuestDB config. Idempotent. Returns `true` on
+/// first install.
+pub fn set_global_questdb_config(cfg: tickvault_common::config::QuestDbConfig) -> bool {
+    GLOBAL_QUESTDB_CONFIG.set(cfg).is_ok()
+}
+
+/// Read-only accessor for the global QuestDB config.
+#[must_use]
+pub fn global_questdb_config() -> Option<&'static tickvault_common::config::QuestDbConfig> {
+    GLOBAL_QUESTDB_CONFIG.get()
+}
+
+#[cfg(test)]
+mod global_qcfg_tests {
+    use super::*;
+    use tickvault_common::config::QuestDbConfig;
+
+    #[test]
+    fn test_set_global_questdb_config_is_idempotent() {
+        let cfg = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: 9000,
+            pg_port: 8812,
+            ilp_port: 9009,
+        };
+        let first = set_global_questdb_config(cfg.clone());
+        let second = set_global_questdb_config(cfg);
+        assert!(
+            !(first && second),
+            "set_global_questdb_config must be idempotent"
+        );
+    }
+
+    #[test]
+    fn test_global_questdb_config_accessor_returns_option() {
+        let _: Option<&'static QuestDbConfig> = global_questdb_config();
+    }
+}
+
+pub mod boot_audit_persistence;
+pub mod boot_probe;
 pub mod calendar_persistence;
 pub mod candle_persistence;
 pub mod constituency_persistence;
 pub mod deep_depth_persistence;
+pub mod depth_rebalance_audit_persistence;
 pub mod greeks_persistence;
 pub mod historical_fetch_marker;
 pub mod indicator_snapshot_persistence;
@@ -32,14 +81,18 @@ pub mod instrument_persistence;
 pub mod materialized_views;
 pub mod movers_persistence;
 pub mod obi_persistence;
+pub mod order_audit_persistence;
 pub mod partition_manager;
+pub mod phase2_audit_persistence;
 pub mod phase2_subscription_marker;
 pub mod previous_close_persistence;
 pub mod questdb_health;
+pub mod selftest_audit_persistence;
 pub mod tick_persistence;
 pub mod tick_spill_drain;
 pub mod valkey_cache;
 pub mod ws_frame_spill;
+pub mod ws_reconnect_audit_persistence;
 
 /// Test support: re-exports internal functions for DHAT and benchmark tests.
 pub mod tick_persistence_testing {

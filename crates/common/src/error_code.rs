@@ -188,6 +188,38 @@ pub enum ErrorCode {
     Movers02OptionPersistFailed,
 
     // -----------------------------------------------------------------------
+    // Wave 2 — resilience (Items 5–9)
+    // -----------------------------------------------------------------------
+    /// WS-GAP-04: a WebSocket entered post-close sleep-until-next-open mode.
+    WsGap04PostCloseSleep,
+    /// WS-GAP-05: pool supervisor respawned a dead connection task.
+    WsGap05PoolRespawn,
+    /// WS-GAP-06: tick-gap detector fired a coalesced summary.
+    WsGap06TickGapSummary,
+    /// AUTH-GAP-03: token force-renewed on WebSocket wake.
+    AuthGap03TokenForceRenewedOnWake,
+    /// BOOT-01: slow-boot QuestDB readiness deadline approaching (>30s).
+    Boot01QuestDbSlow,
+    /// BOOT-02: boot deadline exceeded (>60s) — HALTING.
+    Boot02DeadlineExceeded,
+    /// AUDIT-01: Phase 2 audit row write failed.
+    Audit01Phase2WriteFailed,
+    /// AUDIT-02: depth-rebalance audit row write failed.
+    Audit02DepthRebalanceWriteFailed,
+    /// AUDIT-03: WS reconnect audit row write failed.
+    Audit03WsReconnectWriteFailed,
+    /// AUDIT-04: boot audit row write failed.
+    Audit04BootWriteFailed,
+    /// AUDIT-05: selftest audit row write failed.
+    Audit05SelftestWriteFailed,
+    /// AUDIT-06: order audit row write failed.
+    Audit06OrderWriteFailed,
+    /// STORAGE-GAP-03: audit-table write failure (any table).
+    StorageGap03AuditWriteFailed,
+    /// STORAGE-GAP-04: S3 archive failure (partition upload).
+    StorageGap04S3ArchiveFailed,
+
+    // -----------------------------------------------------------------------
     // Dhan Trading API (DH-9xx)
     // -----------------------------------------------------------------------
     /// DH-901: Invalid auth — rotate token, retry once.
@@ -298,6 +330,21 @@ impl ErrorCode {
             Self::PrevClose02FirstSeenInconsistency => "PREVCLOSE-02",
             Self::Movers01StockPersistFailed => "MOVERS-01",
             Self::Movers02OptionPersistFailed => "MOVERS-02",
+            // Wave 2
+            Self::WsGap04PostCloseSleep => "WS-GAP-04",
+            Self::WsGap05PoolRespawn => "WS-GAP-05",
+            Self::WsGap06TickGapSummary => "WS-GAP-06",
+            Self::AuthGap03TokenForceRenewedOnWake => "AUTH-GAP-03",
+            Self::Boot01QuestDbSlow => "BOOT-01",
+            Self::Boot02DeadlineExceeded => "BOOT-02",
+            Self::Audit01Phase2WriteFailed => "AUDIT-01",
+            Self::Audit02DepthRebalanceWriteFailed => "AUDIT-02",
+            Self::Audit03WsReconnectWriteFailed => "AUDIT-03",
+            Self::Audit04BootWriteFailed => "AUDIT-04",
+            Self::Audit05SelftestWriteFailed => "AUDIT-05",
+            Self::Audit06OrderWriteFailed => "AUDIT-06",
+            Self::StorageGap03AuditWriteFailed => "STORAGE-GAP-03",
+            Self::StorageGap04S3ArchiveFailed => "STORAGE-GAP-04",
             // Dhan Trading API
             Self::Dh901InvalidAuth => "DH-901",
             Self::Dh902NoApiAccess => "DH-902",
@@ -341,7 +388,8 @@ impl ErrorCode {
             | Self::AuthGapDisconnectTokenMap
             | Self::OmsGapCircuitBreaker
             | Self::OmsGapDryRunSafety
-            | Self::InstrumentP0EmergencyDownload => Severity::Critical,
+            | Self::InstrumentP0EmergencyDownload
+            | Self::Boot02DeadlineExceeded => Severity::Critical,
             // High: regulatory / order / risk / rate-limit
             Self::Dh904RateLimit
             | Self::Dh905InputException
@@ -354,7 +402,8 @@ impl ErrorCode {
             | Self::RiskGapPositionPnl
             | Self::InstrumentP0ExpiryAtGate4
             | Self::Data807TokenExpired
-            | Self::Phase202EmitGuardDropped => Severity::High,
+            | Self::Phase202EmitGuardDropped
+            | Self::Boot01QuestDbSlow => Severity::High,
             // Medium: data pipeline correctness
             Self::InstrumentP0DuplicateSecurityId
             | Self::InstrumentP0CountConsistency
@@ -388,13 +437,25 @@ impl ErrorCode {
             | Self::PrevClose01IlpFailed
             | Self::PrevClose02FirstSeenInconsistency
             | Self::Movers01StockPersistFailed
-            | Self::Movers02OptionPersistFailed => Severity::Medium,
+            | Self::Movers02OptionPersistFailed
+            | Self::WsGap06TickGapSummary
+            | Self::Audit01Phase2WriteFailed
+            | Self::Audit02DepthRebalanceWriteFailed
+            | Self::Audit03WsReconnectWriteFailed
+            | Self::Audit04BootWriteFailed
+            | Self::Audit05SelftestWriteFailed
+            | Self::Audit06OrderWriteFailed
+            | Self::StorageGap03AuditWriteFailed
+            | Self::StorageGap04S3ArchiveFailed => Severity::Medium,
             // Low: scheduler / field coverage / trading-day / Dhan other
             Self::InstrumentP1DailyScheduler
             | Self::InstrumentP1DeltaFieldCoverage
             | Self::InstrumentP2TradingDayGuard
             | Self::Dh910Other
-            | Self::HotPath02WriterQueueDrop => Severity::Low,
+            | Self::HotPath02WriterQueueDrop
+            | Self::WsGap04PostCloseSleep
+            | Self::WsGap05PoolRespawn
+            | Self::AuthGap03TokenForceRenewedOnWake => Severity::Low,
         }
     }
 
@@ -446,6 +507,20 @@ impl ErrorCode {
             | Self::PrevClose02FirstSeenInconsistency
             | Self::Movers01StockPersistFailed
             | Self::Movers02OptionPersistFailed => ".claude/rules/project/wave-1-error-codes.md",
+            Self::WsGap04PostCloseSleep
+            | Self::WsGap05PoolRespawn
+            | Self::WsGap06TickGapSummary
+            | Self::AuthGap03TokenForceRenewedOnWake
+            | Self::Boot01QuestDbSlow
+            | Self::Boot02DeadlineExceeded
+            | Self::Audit01Phase2WriteFailed
+            | Self::Audit02DepthRebalanceWriteFailed
+            | Self::Audit03WsReconnectWriteFailed
+            | Self::Audit04BootWriteFailed
+            | Self::Audit05SelftestWriteFailed
+            | Self::Audit06OrderWriteFailed
+            | Self::StorageGap03AuditWriteFailed
+            | Self::StorageGap04S3ArchiveFailed => ".claude/rules/project/wave-2-error-codes.md",
             Self::Dh901InvalidAuth
             | Self::Dh902NoApiAccess
             | Self::Dh903AccountIssue
@@ -552,6 +627,20 @@ impl ErrorCode {
             Self::PrevClose02FirstSeenInconsistency,
             Self::Movers01StockPersistFailed,
             Self::Movers02OptionPersistFailed,
+            Self::WsGap04PostCloseSleep,
+            Self::WsGap05PoolRespawn,
+            Self::WsGap06TickGapSummary,
+            Self::AuthGap03TokenForceRenewedOnWake,
+            Self::Boot01QuestDbSlow,
+            Self::Boot02DeadlineExceeded,
+            Self::Audit01Phase2WriteFailed,
+            Self::Audit02DepthRebalanceWriteFailed,
+            Self::Audit03WsReconnectWriteFailed,
+            Self::Audit04BootWriteFailed,
+            Self::Audit05SelftestWriteFailed,
+            Self::Audit06OrderWriteFailed,
+            Self::StorageGap03AuditWriteFailed,
+            Self::StorageGap04S3ArchiveFailed,
         ]
     }
 }
@@ -699,7 +788,10 @@ mod tests {
         // was added. Keep this count in sync with the enum.
         // 2026-04-27 (Wave 1): bumped 54 -> 62 for 8 new variants
         // (HOT-PATH-01/02, PHASE2-01/02, PREVCLOSE-01/02, MOVERS-01/02).
-        assert_eq!(ErrorCode::all().len(), 62);
+        // 2026-04-27 (Wave 2): bumped 62 -> 76 for 14 new variants
+        // (WS-GAP-04/05/06, AUTH-GAP-03, BOOT-01/02, AUDIT-01..06,
+        // STORAGE-GAP-03/04).
+        assert_eq!(ErrorCode::all().len(), 76);
     }
 
     #[test]
@@ -719,7 +811,10 @@ mod tests {
                 || s.starts_with("HOT-PATH-")
                 || s.starts_with("PHASE2-")
                 || s.starts_with("PREVCLOSE-")
-                || s.starts_with("MOVERS-");
+                || s.starts_with("MOVERS-")
+                // Wave 2: boot / audit prefixes
+                || s.starts_with("BOOT-")
+                || s.starts_with("AUDIT-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }
