@@ -16,11 +16,16 @@ pub mod no_tick_watchdog;
 pub mod option_movers;
 pub mod prev_close_persist;
 pub mod prev_close_writer;
+pub mod tick_gap_detector;
 pub mod tick_processor;
 pub mod top_movers;
 
 pub use candle_aggregator::CandleAggregator;
 pub use depth_sequence_tracker::{DepthSequenceTracker, SequenceOutcome};
 pub use option_movers::{OptionMoversTracker, SharedOptionMoversSnapshot};
+pub use tick_gap_detector::{
+    SharedTickGapDetector, TICK_GAP_COALESCE_WINDOW_SECS_DEFAULT, TICK_GAP_THRESHOLD_SECS_DEFAULT,
+    TickGapDetector, TickGapKey,
+};
 pub use tick_processor::{init_prev_close_cache_dir, run_tick_processor};
 pub use top_movers::{SharedTopMoversSnapshot, TopMoversTracker};
