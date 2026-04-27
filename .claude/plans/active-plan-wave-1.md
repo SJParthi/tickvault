@@ -7,26 +7,28 @@
 
 ## Item 0 — Hot-path I/O + lock remediation (NEW, precondition)
 
-**Source:** Background agent 2 (2026-04-27) verified 3/3 P0 stalls.
+**Source:** Background agent 2 (2026-04-27) verified 3 P0 stalls + bonus.
 
-| Stall | File:line | Current code | Fix |
-|---|---|---|---|
-| (a) Sync `std::fs::write` + rename in PrevClose arm | `tick_processor.rs:1300-1314` | `std::fs::write(tmp, json).and_then(\|()\| std::fs::rename(tmp, path))` blocking on every code-6 packet | Move to dedicated writer task via `tokio::sync::mpsc::channel(64)` + `tokio::task::spawn_blocking`. Hot path enqueues `(path, bytes)`; writer drains. |
-| (b) Sync `BufWriter<File>` on spill+DLQ | `tick_persistence.rs:567, 785, 594-630` | `writer.write_all(...)`, `writer.flush()` blocking when QuestDB down | Wrap spill writer with `tokio::sync::mpsc::channel(8192)` + dedicated `tokio::task::spawn_blocking` consumer. Bound queue, drop oldest with `tv_spill_dropped_total` counter on overflow. |
-| (c) `RwLock::write()` every 5s on movers snapshot | `tick_processor.rs:1515` | `Arc<RwLock<Option<TopMoversSnapshot>>>` | Replace with `Arc<ArcSwap<TopMoversSnapshot>>` (arc-swap is a workspace dep). Reads = lock-free. |
-| BONUS sync `fs::create_dir_all` per packet | `tick_processor.rs:1301` | redundant per-packet syscall | Hoist to one-shot at boot (`init_prev_close_cache_dir()`). |
+**REVISION 2026-04-27 (during Item 0.a kickoff):** Re-read of `tick_processor.rs:1515` showed the `RwLock::write()` is inside an explicit 5-second-gated cold-path block (`if last_snapshot_check.elapsed().as_secs() >= 5`) with comment "cold path, O(N log N)". The lock is held for the duration of a single `*guard = Some(snapshot)` assignment (nanoseconds). API readers almost never block. **Sub-item (c) downgraded — NOT a P0 stall, NOT in Wave 1 scope.** ArcSwap migration deferred to a future hardening pass if a real-world reader-blocking incident materializes.
 
-### Tests
+| Stall | File:line | Current code | Fix | Wave 1? |
+|---|---|---|---|---|
+| (a) Sync `std::fs::write` + rename in PrevClose arm | `tick_processor.rs:1300-1314` | `std::fs::write(tmp, json).and_then(\|()\| std::fs::rename(tmp, path))` blocking on every code-6 packet | Move to dedicated writer task via `tokio::sync::mpsc::channel(64)` + `tokio::task::spawn_blocking`. Hot path enqueues `(path, bytes)`; writer drains. | ✅ Yes |
+| (b) Sync `BufWriter<File>` on spill+DLQ | `tick_persistence.rs:567, 785, 594-630` | `writer.write_all(...)`, `writer.flush()` blocking when QuestDB down | Wrap spill writer with `tokio::sync::mpsc::channel(8192)` + dedicated `tokio::task::spawn_blocking` consumer. Bound queue, drop oldest with `tv_spill_dropped_total` counter on overflow. | ✅ Yes |
+| ~~(c) `RwLock::write()` every 5s~~ | `tick_processor.rs:1515` | gated by 5s timer; lock held for ns | DEFERRED — not a P0 | ❌ Deferred |
+| BONUS sync `fs::create_dir_all` per packet | `tick_processor.rs:1301` | redundant per-packet syscall | Hoist to one-shot at boot (`init_prev_close_cache_dir()`). | ✅ Yes |
+
+### Tests (revised after sub-(c) deferral)
 
 | Test | File | Asserts |
 |---|---|---|
 | `dhat_tick_path_zero_alloc_under_prev_close_burst` | `crates/core/tests/dhat_tick_path_zero_alloc.rs` | `total_blocks == 0` over 10K simulated PrevClose packets |
-| `bench_prev_close_handler_le_100ns` | `crates/core/benches/prev_close_handler.rs` | Criterion p99 ≤ 100ns |
-| `bench_movers_snapshot_swap_le_50ns` | `crates/core/benches/movers_swap.rs` | Criterion p99 ≤ 50ns |
+| `bench_prev_close_handler_le_100ns` | `crates/core/benches/prev_close_handler.rs` | Criterion p99 ≤ 100ns (enqueue only; actual fs::write happens in spawn_blocking task) |
 | `bench_spill_write_enqueue_le_200ns` | `crates/storage/benches/spill_enqueue.rs` | Criterion p99 ≤ 200ns |
-| `loom_movers_arc_swap_concurrent` | `crates/core/tests/loom_movers_arc_swap.rs` | No data races under loom model |
 | `no_sync_fs_in_hot_path_guard` (source-scan) | `crates/core/tests/no_sync_fs_guard.rs` | Walk `crates/core/src/pipeline/` + hot files; fail on any `std::fs::*` without `// HOT-PATH-EXEMPT:` line |
 | `chaos_questdb_down_spill_no_block` | `crates/storage/tests/chaos_spill_async.rs` | With QuestDB Docker paused, hot-tick latency stays ≤ 10μs (existing tick budget) |
+| `test_prev_close_writer_task_drains_under_burst` | `crates/core/tests/prev_close_writer.rs` | 1000 enqueues → all written within 1s; no drops |
+| `test_prev_close_cache_dir_init_idempotent` | same | `init_prev_close_cache_dir()` callable multiple times safely |
 
 ### Banned-pattern hook addition (category 7)
 
