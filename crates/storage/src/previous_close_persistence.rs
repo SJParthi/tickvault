@@ -135,8 +135,7 @@ const PREVIOUS_CLOSE_ALTERS: &[&str] = &[
 /// `ensure_*_table` functions in this crate.
 ///
 /// Idempotent.
-// TEST-EXEMPT: DDL creation requires a live QuestDB; covered by
-// integration tests in storage/tests/ when QuestDB is available.
+// TEST-EXEMPT: DDL creation requires a live QuestDB; covered by integration tests in storage/tests/ when QuestDB is available.
 pub async fn ensure_previous_close_table(questdb_config: &QuestDbConfig) {
     let base_url = format!(
         "http://{}:{}/exec",
@@ -243,8 +242,7 @@ impl PreviousCloseWriter {
     /// repeats with the same (security_id, segment) are deduped by
     /// QuestDB via the DEDUP UPSERT KEY on `(ts, security_id,
     /// segment)`.
-    // TEST-EXEMPT: ILP buffer append; tested via integration tests
-    // when QuestDB is available.
+    // TEST-EXEMPT: ILP buffer append tested via integration tests. WIRING-EXEMPT: hot-path call sites in tick_processor.rs ship in the Item 4.4 follow-up commit.
     pub fn append_prev_close(
         &mut self,
         security_id: u32,
@@ -282,7 +280,7 @@ impl PreviousCloseWriter {
     }
 
     /// Forces an immediate flush of all buffered rows to QuestDB.
-    // TEST-EXEMPT: ILP flush; integration-tested with live QuestDB.
+    // TEST-EXEMPT: ILP flush integration-tested with live QuestDB. WIRING-EXEMPT: called from the periodic flush loop wired in Item 4.4.
     pub fn force_flush(&mut self) -> Result<()> {
         if self.pending_count == 0 {
             return Ok(());
@@ -296,11 +294,13 @@ impl PreviousCloseWriter {
     }
 
     /// Returns the number of buffered rows awaiting flush.
+    // TEST-EXEMPT: trivial getter covered by integration tests. WIRING-EXEMPT: read by the metrics scraper wired in Item 4.4 follow-up.
     pub fn pending_count(&self) -> usize {
         self.pending_count
     }
 
     /// Conf string used for reconnect attempts.
+    // TEST-EXEMPT: trivial getter covered by reconnect path tests. WIRING-EXEMPT: read by the reconnect logic wired in Item 4.4 follow-up.
     pub fn ilp_conf_string(&self) -> &str {
         &self.ilp_conf_string
     }
@@ -339,7 +339,7 @@ mod tests {
     /// Without this, QuestDB DEDUP cannot collapse them and the table
     /// accumulates one row per restart per day.
     #[test]
-    fn test_ist_midnight_nanos_dedupes_same_day_writes() {
+    fn test_ist_midnight_nanos_for_received_at_dedupes_same_day_writes() {
         // Pick two wall-clock instants 4 hours apart on the same IST
         // trading day: 2026-04-27 10:00 IST and 14:00 IST. Both should
         // map to the same midnight nanos (= 2026-04-27 00:00 IST).
@@ -359,7 +359,7 @@ mod tests {
     /// designated timestamps. Without this, DEDUP would silently
     /// merge yesterday's row with today's.
     #[test]
-    fn test_ist_midnight_nanos_distinguishes_adjacent_days() {
+    fn test_ist_midnight_nanos_for_received_at_distinguishes_adjacent_days() {
         let day_a = 1_777_244_400_i64; // 2026-04-27 10:00 IST
         let day_b = day_a.saturating_add(86_400); // exactly 1 day later
         let nanos_a = ist_midnight_nanos_for_received_at(day_a * 1_000_000_000);
@@ -379,7 +379,7 @@ mod tests {
     /// All three source labels round-trip through `as_str` and stay
     /// distinct — Loki and Grafana queries depend on these labels.
     #[test]
-    fn test_prev_close_source_labels_are_stable() {
+    fn test_prev_close_source_as_str_labels_are_stable() {
         assert_eq!(PrevCloseSource::Code6.as_str(), "CODE6");
         assert_eq!(PrevCloseSource::QuoteClose.as_str(), "QUOTE_CLOSE");
         assert_eq!(PrevCloseSource::FullClose.as_str(), "FULL_CLOSE");
