@@ -560,6 +560,11 @@ impl TickPersistenceWriter {
         // Lazy-open the spill file.
         if self.spill_writer.is_none() && let Err(err) = self.open_spill_file() {
             error!(?err, "CRITICAL: cannot open tick spill file — falling back to DLQ");
+            // Wave 1 Item 0.b — drop counter for spill-path failures.
+            // Per-reason label lets operators distinguish open-failure
+            // (likely permission / fsbroken) from write-failure
+            // (likely disk full) on the Grafana panel.
+            metrics::counter!("tv_spill_dropped_total", "reason" => "open_failed").increment(1);
             self.write_to_dlq(tick, "spill_open_failed");
             return;
         }
@@ -567,6 +572,8 @@ impl TickPersistenceWriter {
         if let Some(ref mut writer) = self.spill_writer && let Err(err) = writer.write_all(&record) {
             error!(?err, ticks_spilled = self.ticks_spilled_total, "CRITICAL: disk spill write failed — falling back to DLQ");
             self.spill_writer = None;
+            // Wave 1 Item 0.b — drop counter for the write-failure path.
+            metrics::counter!("tv_spill_dropped_total", "reason" => "write_failed").increment(1);
             self.write_to_dlq(tick, "spill_write_failed");
             return;
         }
