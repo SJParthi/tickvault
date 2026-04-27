@@ -21,6 +21,52 @@
 //! # Boot Sequence Position
 //! OMS -> **QuestDB -> Valkey** -> HTTP API
 
+/// Wave 2 — global QuestDB config handle so any module (e.g.,
+/// `connection.rs` reconnect-success) can emit audit rows without
+/// holding a reference. Set once at boot via
+/// `set_global_questdb_config()`.
+static GLOBAL_QUESTDB_CONFIG: std::sync::OnceLock<tickvault_common::config::QuestDbConfig> =
+    std::sync::OnceLock::new();
+
+/// Install the global QuestDB config. Idempotent. Returns `true` on
+/// first install.
+pub fn set_global_questdb_config(cfg: tickvault_common::config::QuestDbConfig) -> bool {
+    GLOBAL_QUESTDB_CONFIG.set(cfg).is_ok()
+}
+
+/// Read-only accessor for the global QuestDB config.
+#[must_use]
+pub fn global_questdb_config() -> Option<&'static tickvault_common::config::QuestDbConfig> {
+    GLOBAL_QUESTDB_CONFIG.get()
+}
+
+#[cfg(test)]
+mod global_qcfg_tests {
+    use super::*;
+    use tickvault_common::config::QuestDbConfig;
+
+    #[test]
+    fn test_set_global_questdb_config_is_idempotent() {
+        let cfg = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: 9000,
+            pg_port: 8812,
+            ilp_port: 9009,
+        };
+        let first = set_global_questdb_config(cfg.clone());
+        let second = set_global_questdb_config(cfg);
+        assert!(
+            !(first && second),
+            "set_global_questdb_config must be idempotent"
+        );
+    }
+
+    #[test]
+    fn test_global_questdb_config_accessor_returns_option() {
+        let _: Option<&'static QuestDbConfig> = global_questdb_config();
+    }
+}
+
 pub mod boot_audit_persistence;
 pub mod boot_probe;
 pub mod calendar_persistence;
