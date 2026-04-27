@@ -527,6 +527,7 @@ impl WebSocketConnection {
                                         code = tickvault_common::error_code::ErrorCode::Audit03WsReconnectWriteFailed.code_str(),
                                         "AUDIT-03 ws_reconnect audit row write failed"
                                     );
+                                    metrics::counter!("tv_audit_write_failures_total", "table" => "ws_reconnect_audit").increment(1);
                                 }
                             });
                         }
