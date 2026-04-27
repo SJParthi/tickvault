@@ -74,9 +74,69 @@ pub async fn ensure_order_audit_table(questdb_config: &QuestDbConfig) {
     }
 }
 
+/// Append one order-lifecycle audit row. SEBI 5y retention applies.
+#[allow(clippy::too_many_arguments)] // APPROVED: order audit row schema requires every column
+pub async fn append_order_audit_row(
+    questdb_config: &QuestDbConfig,
+    ts_nanos_ist: i64,
+    order_id: &str,
+    correlation_id: &str,
+    leg: &str,
+    event: &str,
+    security_id: i32,
+    segment: &str,
+    transaction_type: &str,
+    quantity: i64,
+    price: f64,
+    order_status: &str,
+    outcome: &str,
+    detail: &str,
+) -> anyhow::Result<()> {
+    let base_url = format!(
+        "http://{}:{}/exec",
+        questdb_config.host, questdb_config.http_port
+    );
+    let client = Client::builder()
+        .timeout(Duration::from_secs(QUESTDB_DDL_TIMEOUT_SECS))
+        .build()?;
+    let order_id_esc = order_id.replace('\'', "''");
+    let corr_esc = correlation_id.replace('\'', "''");
+    let leg_esc = leg.replace('\'', "''");
+    let event_esc = event.replace('\'', "''");
+    let seg_esc = segment.replace('\'', "''");
+    let txn_esc = transaction_type.replace('\'', "''");
+    let status_esc = order_status.replace('\'', "''");
+    let outcome_esc = outcome.replace('\'', "''");
+    let detail_esc = detail.replace('\'', "''");
+    let sql = format!(
+        "INSERT INTO {QUESTDB_TABLE_ORDER_AUDIT} (ts, order_id, correlation_id, leg, event, security_id, segment, transaction_type, quantity, price, order_status, outcome, detail) VALUES \
+         ({ts_nanos_ist}, '{order_id_esc}', '{corr_esc}', '{leg_esc}', '{event_esc}', {security_id}, '{seg_esc}', '{txn_esc}', {quantity}, {price}, '{status_esc}', '{outcome_esc}', '{detail_esc}');"
+    );
+    let resp = client
+        .get(&base_url)
+        .query(&[("query", sql.as_str())])
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("order audit insert non-2xx ({status}): {body}");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_cfg(http_port: u16) -> QuestDbConfig {
+        QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port,
+            pg_port: 8812,
+            ilp_port: 9009,
+        }
+    }
 
     #[test]
     fn test_dedup_key_uses_order_id_not_security_id() {
@@ -93,5 +153,28 @@ mod tests {
     #[test]
     fn test_table_name_constant() {
         assert_eq!(QUESTDB_TABLE_ORDER_AUDIT, "order_audit");
+    }
+
+    #[tokio::test]
+    async fn test_append_order_audit_row_returns_err_when_questdb_unreachable() {
+        let cfg = test_cfg(1);
+        let result = append_order_audit_row(
+            &cfg,
+            1_710_000_000_000_000_000,
+            "ORD-2026-001",
+            "corr-001",
+            "ENTRY_LEG",
+            "place",
+            123_456,
+            "NSE_FNO",
+            "BUY",
+            75,
+            247.5,
+            "PENDING",
+            "ok",
+            "limit order placed",
+        )
+        .await;
+        assert!(result.is_err());
     }
 }
