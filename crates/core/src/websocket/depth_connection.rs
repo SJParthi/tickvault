@@ -12,6 +12,43 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+/// Wave 2 Item 6 (G1) — handles the depth WS exhaustion guard. If the
+/// app is in-market, returns `Err(ReconnectionExhausted)` (legacy
+/// behaviour). If the app is post-close and a global TradingCalendar is
+/// installed, sleeps until the next NSE market open instead of giving
+/// up — closes G1 for the depth-20 / depth-200 pools.
+///
+/// Returns `Ok(())` to signal the caller should reset the attempt
+/// counter and continue the reconnect loop.
+async fn depth_post_close_sleep_or_exhaust(
+    feed_label: &'static str,
+    attempt: u64,
+) -> Result<(), super::WebSocketError> {
+    let now_utc = chrono::Utc::now().timestamp();
+    let now_ist = now_utc.saturating_add(i64::from(
+        tickvault_common::constants::IST_UTC_OFFSET_SECONDS,
+    ));
+    let secs_of_day = now_ist.rem_euclid(86_400) as u32;
+    let post_close = secs_of_day >= tickvault_common::constants::TICK_PERSIST_END_SECS_OF_DAY_IST;
+    if post_close && let Some(cal) = super::connection::market_calendar() {
+        let sleep_secs = cal.secs_until_next_market_open(now_utc).unwrap_or(60 * 60);
+        tracing::info!(
+            attempt,
+            sleep_secs,
+            feed = feed_label,
+            code = tickvault_common::error_code::ErrorCode::WsGap04PostCloseSleep.code_str(),
+            "WS-GAP-04 depth feed entered post-close sleep until next market open"
+        );
+        metrics::counter!("tv_ws_post_close_sleep_total", "feed" => feed_label).increment(1);
+        tokio::time::sleep(Duration::from_secs(sleep_secs)).await;
+        return Ok(());
+    }
+    Err(super::WebSocketError::ReconnectionExhausted {
+        connection_id: 0,
+        attempts: attempt.min(u64::from(u32::MAX)) as u32,
+    })
+}
+
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
 use secrecy::ExposeSecret;
@@ -301,16 +338,18 @@ pub async fn run_twenty_depth_connection(
                 // Give up after max attempts — prevents infinite retry loops
                 // after market close or on permanently unreachable instruments.
                 if attempt >= DEPTH_RECONNECT_MAX_ATTEMPTS {
+                    // Wave 2 Item 6 (G1): give up only if in-market.
+                    // Post-close, sleep until next market open instead.
                     error!(
                         attempt,
                         instrument_count,
                         ?err,
-                        "{prefix}: exhausted {DEPTH_RECONNECT_MAX_ATTEMPTS} reconnection attempts — giving up"
+                        "{prefix}: exhausted {DEPTH_RECONNECT_MAX_ATTEMPTS} attempts — checking post-close gate"
                     );
-                    return Err(WebSocketError::ReconnectionExhausted {
-                        connection_id: 0, // depth connections don't use pool IDs
-                        attempts: attempt.min(u64::from(u32::MAX)) as u32,
-                    });
+                    depth_post_close_sleep_or_exhaust("depth20", attempt).await?;
+                    // Slept successfully — reset attempt counter and continue.
+                    reconnect_counter.store(0, Ordering::Relaxed);
+                    continue;
                 }
 
                 // Escalate to ERROR after 10+ consecutive failures
@@ -858,17 +897,19 @@ pub async fn run_two_hundred_depth_connection(
                 // Give up after max attempts — prevents infinite retry loops
                 // after market close or on permanently unreachable instruments.
                 if attempt >= DEPTH_RECONNECT_MAX_ATTEMPTS {
+                    // Wave 2 Item 6 (G1): give up only if in-market.
+                    // Post-close, sleep until next market open instead.
                     error!(
                         security_id,
                         label = %label,
                         attempt,
                         ?err,
-                        "{prefix}: exhausted {DEPTH_RECONNECT_MAX_ATTEMPTS} reconnection attempts — giving up"
+                        "{prefix}: exhausted {DEPTH_RECONNECT_MAX_ATTEMPTS} attempts — checking post-close gate"
                     );
-                    return Err(WebSocketError::ReconnectionExhausted {
-                        connection_id: 0, // depth connections don't use pool IDs
-                        attempts: attempt.min(u64::from(u32::MAX)) as u32,
-                    });
+                    depth_post_close_sleep_or_exhaust("depth200", attempt).await?;
+                    // Slept successfully — reset attempt counter and continue.
+                    reconnect_counter.store(0, Ordering::Relaxed);
+                    continue;
                 }
 
                 // Log policy — reduces noise during transient Dhan-side
