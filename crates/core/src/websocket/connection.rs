@@ -497,6 +497,39 @@ impl WebSocketConnection {
                                 connection_index: usize::from(self.connection_id),
                             });
                         }
+                        // Wave 2 Item 9 (AUDIT-03) — persist a ws_reconnect
+                        // audit row for SEBI-grade reconstruction. Best-effort
+                        // — failures don't block the read loop.
+                        if let Some(qcfg) = tickvault_storage::global_questdb_config() {
+                            // O(1) EXEMPT: cold path — runs only on reconnect, not per tick.
+                            let qcfg = qcfg.clone();
+                            let conn_id = i32::from(self.connection_id);
+                            let attempt = i64::try_from(reconnection_count).unwrap_or(i64::MAX);
+                            tokio::spawn(async move {
+                                let now_nanos = chrono::Utc::now()
+                                    .timestamp_nanos_opt()
+                                    .unwrap_or(0)
+                                    .saturating_add(
+                                        tickvault_common::constants::IST_UTC_OFFSET_NANOS,
+                                    );
+                                if let Err(e) = tickvault_storage::ws_reconnect_audit_persistence::append_ws_reconnect_audit_row(
+                                    &qcfg,
+                                    now_nanos,
+                                    "main",
+                                    conn_id,
+                                    attempt,
+                                    "success",
+                                    None,
+                                    "post-failure reconnect succeeded",
+                                ).await {
+                                    tracing::error!(
+                                        ?e,
+                                        code = tickvault_common::error_code::ErrorCode::Audit03WsReconnectWriteFailed.code_str(),
+                                        "AUDIT-03 ws_reconnect audit row write failed"
+                                    );
+                                }
+                            });
+                        }
                     }
 
                     // STAGE-C.3: Spawn the per-connection activity watchdog

@@ -177,6 +177,65 @@ async fn main() -> Result<()> {
         tracing::warn!("global TradingCalendar already installed — skipping");
     }
 
+    // Wave 2 — install global QuestDB config so any module can emit
+    // audit rows without holding a config reference.
+    if !tickvault_storage::set_global_questdb_config(config.questdb.clone()) {
+        tracing::warn!("global QuestDbConfig already installed — skipping");
+    }
+
+    // Wave 2 Item 9 (AUDIT-05) — periodic selftest audit task. Every
+    // 15 minutes during the trading session, persist a row recording
+    // whether the QuestDB readiness probe succeeded. The body of the
+    // check is the same `wait_for_questdb_ready` call (1s deadline) —
+    // a fast liveness probe, not a full validate-automation run.
+    {
+        const SELFTEST_AUDIT_INTERVAL_SECS: u64 = 900;
+        let qcfg = config.questdb.clone();
+        tokio::spawn(async move {
+            let mut ticker =
+                tokio::time::interval(std::time::Duration::from_secs(SELFTEST_AUDIT_INTERVAL_SECS));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // Skip the first immediate fire — we already probed at boot.
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let started = std::time::Instant::now();
+                let outcome =
+                    match tickvault_storage::boot_probe::wait_for_questdb_ready(&qcfg, 5).await {
+                        Ok(_) => "green",
+                        Err(_) => "red",
+                    };
+                let duration_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
+                let now_ist_nanos = chrono::Utc::now()
+                    .timestamp_nanos_opt()
+                    .unwrap_or(0)
+                    .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS);
+                // Truncate today's IST nanos to start of day for trading_date_ist.
+                let trading_date_ist =
+                    now_ist_nanos - (now_ist_nanos.rem_euclid(86_400_000_000_000));
+                if let Err(e) =
+                    tickvault_storage::selftest_audit_persistence::append_selftest_audit_row(
+                        &qcfg,
+                        now_ist_nanos,
+                        trading_date_ist,
+                        "questdb-liveness",
+                        outcome,
+                        duration_ms,
+                        "periodic 15-min liveness probe",
+                    )
+                    .await
+                {
+                    tracing::error!(
+                        error = ?e,
+                        code = tickvault_common::error_code::ErrorCode::Audit05SelftestWriteFailed
+                            .code_str(),
+                        "AUDIT-05 selftest audit row write failed"
+                    );
+                }
+            }
+        });
+    }
+
     // Wave 2 Item 8 (G4) — install the global tick-gap detector and
     // spawn the 60s coalescing task. Recorded ticks live in a papaya
     // map keyed by (security_id, segment) — composite per I-P1-11.
@@ -6372,9 +6431,27 @@ async fn run_shutdown_fast(
     }
 
     // 3b. Abort WebSocket connections (drops senders → processor exits).
-    for handle in ws_handles {
-        handle.abort();
+    // Wave 2 Item 5.2 (WS-GAP-05) — first abort, then run the pool
+    // supervisor to drain any final exits with structured ERROR logs +
+    // metric increments for tasks that panicked / errored vs exited
+    // cleanly. Bounded by 5s so a hung handle does not stall shutdown.
+    let abort_handles: Vec<_> = ws_handles
+        .iter()
+        .map(tokio::task::JoinHandle::abort_handle)
+        .collect();
+    for h in &abort_handles {
+        h.abort();
     }
+    let supervise_fut =
+        tickvault_core::websocket::connection_pool::WebSocketConnectionPool::supervise_pool(
+            ws_handles,
+        );
+    const POOL_SUPERVISOR_DRAIN_TIMEOUT_SECS: u64 = 5;
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(POOL_SUPERVISOR_DRAIN_TIMEOUT_SECS),
+        supervise_fut,
+    )
+    .await;
 
     // 4. Wait for tick processor final flush.
     if let Some(handle) = processor_handle {
