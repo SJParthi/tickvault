@@ -890,8 +890,25 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                             tick.day_close,
                         );
                     }
-                    // No separate previous_close table — day_close is already in every
-                    // tick persisted to the ticks table. Movers use in-memory baselines.
+                    // Wave 1 Item 4.4 — NSE_EQ prev-close persistence
+                    // per Dhan Ticket #5525125 (Quote packet code 4,
+                    // bytes 38-41). The first-seen gate fires once per
+                    // (security_id, segment) per IST trading day so
+                    // we don't amplify ILP throughput by ~24K-x.
+                    if let Some(seg) = tickvault_common::types::ExchangeSegment::from_byte(
+                        tick.exchange_segment_code,
+                    ) && super::first_seen_set::try_insert_global(tick.security_id, seg)
+                    {
+                        let _ = super::prev_close_persist::try_record_global(
+                            super::prev_close_persist::PrevCloseRecord {
+                                security_id: tick.security_id,
+                                exchange_segment_code: tick.exchange_segment_code,
+                                source: tickvault_storage::previous_close_persistence::PrevCloseSource::QuoteClose,
+                                prev_close: tick.day_close,
+                                received_at_nanos,
+                            },
+                        );
+                    }
                 }
 
                 // Ingestion gate: drop ALL ticks outside [9:00 AM, 3:30 PM) IST.
@@ -1057,6 +1074,25 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                             tick.security_id,
                             tick.exchange_segment_code,
                             tick.day_close,
+                        );
+                    }
+                    // Wave 1 Item 4.4 — NSE_FNO prev-close persistence
+                    // per Dhan Ticket #5525125 (Full packet code 8,
+                    // bytes 50-53). Same first-seen gate semantics as
+                    // the Quote path so we record exactly one row per
+                    // (security_id, segment) per IST trading day.
+                    if let Some(seg) = tickvault_common::types::ExchangeSegment::from_byte(
+                        tick.exchange_segment_code,
+                    ) && super::first_seen_set::try_insert_global(tick.security_id, seg)
+                    {
+                        let _ = super::prev_close_persist::try_record_global(
+                            super::prev_close_persist::PrevCloseRecord {
+                                security_id: tick.security_id,
+                                exchange_segment_code: tick.exchange_segment_code,
+                                source: tickvault_storage::previous_close_persistence::PrevCloseSource::FullClose,
+                                prev_close: tick.day_close,
+                                received_at_nanos,
+                            },
                         );
                     }
                 }
@@ -1328,6 +1364,26 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                         // wrap is an Arc handoff (no copy).
                         let _ = outcome;
                     }
+                }
+
+                // Wave 1 Item 4.4 — IDX_I prev-close persistence per
+                // Dhan Ticket #5525125 (PrevClose packet, code 6, bytes
+                // 8-11). The IDX_I path is "always emit" — DEDUP UPSERT
+                // KEYS(ts, security_id, segment) on `previous_close`
+                // collapses repeat packets within the same IST trading
+                // day to one row. We do NOT gate on FirstSeenSet for
+                // IDX_I because the packet is rare (~28 indices once
+                // per session) and the dedup is at-most-once already.
+                if exchange_segment_code == 0 {
+                    let _ = super::prev_close_persist::try_record_global(
+                        super::prev_close_persist::PrevCloseRecord {
+                            security_id,
+                            exchange_segment_code,
+                            source: tickvault_storage::previous_close_persistence::PrevCloseSource::Code6,
+                            prev_close: previous_close,
+                            received_at_nanos,
+                        },
+                    );
                 }
 
                 trace!(
