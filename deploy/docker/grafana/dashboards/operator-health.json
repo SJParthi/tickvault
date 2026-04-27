@@ -1520,6 +1520,68 @@
           ]
         }
       }
+    },
+    {
+      "type": "stat",
+      "id": 45,
+      "title": "Spill drain write errors / 5m",
+      "description": "Wave 1 HOT-PATH-01. Async tokio::fs write_all errors inside the spill drain task — distinct from tv_spill_dropped_total (queue overflow). Each increment = one tick payload lost from the spill file. Green = 0. Red = disk full / mount gone / permission issue. Runbook: .claude/rules/project/wave-1-error-codes.md (HOT-PATH-01). Wrapped in increase() per Rule 12 — raw counters lie after process restart.",
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 0,
+        "y": 42
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (stage) (increase(tv_spill_drain_errors_total[5m]))",
+          "legendFormat": "{{stage}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "unit": "none",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green"
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 10
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "background_solid",
+        "graphMode": "area",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        }
+      }
     }
   ]
 }

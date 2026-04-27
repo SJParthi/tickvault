@@ -76,6 +76,19 @@ static GLOBAL: OnceLock<GlobalHandle> = OnceLock::new();
 /// second call is a no-op. Must be called from inside a tokio runtime
 /// (boot wiring in `main.rs`).
 ///
+/// **Concurrency contract:** This function is intended to be called
+/// EXACTLY ONCE at boot from `main.rs::run`, single-threaded with
+/// respect to itself. The early `GLOBAL.get().is_some()` short-circuit
+/// is an idempotency net for accidental double-invocation (e.g., a
+/// future test harness that re-runs the boot wiring). Concurrent
+/// callers can race past the check — both spawn `PreviousCloseWriter`,
+/// the second `GLOBAL.set(...)` returns `Err` and is silently ignored,
+/// and the loser's mpsc Sender drops, terminating the orphan drain
+/// task on the next channel close. This leaks one ILP TCP connection
+/// briefly (~1 round-trip). Acceptable for the boot-once design;
+/// tightening to `OnceLock::get_or_init` would require restructuring
+/// the async spawn pattern (init returns synchronously today).
+///
 /// Best-effort: if the underlying ILP writer cannot connect to QuestDB
 /// (Docker not yet up, wrong port, etc.), the function logs a warning
 /// and leaves the global uninitialised. Subsequent

@@ -79,6 +79,18 @@ static GLOBAL: OnceLock<GlobalHandle> = OnceLock::new();
 /// Spawns the async drain task and stores the global Sender.
 /// Idempotent — a second call is a no-op.
 ///
+/// **Concurrency contract:** Intended to be called EXACTLY ONCE at boot
+/// from `main.rs::run`, single-threaded w.r.t. itself. The early
+/// `GLOBAL.get().is_some()` short-circuit catches accidental double-
+/// invocation. Concurrent callers can race past the check — both spawn
+/// drain tasks, both open the spill file, the second `GLOBAL.set(...)`
+/// returns `Err` and is silently ignored, and the loser's mpsc Sender
+/// drops which terminates its orphan drain task. This leaks one open
+/// file handle until the orphan task exits (~immediate). Acceptable
+/// for the boot-once design; restructuring to `OnceLock::get_or_init`
+/// would require a sync init-then-async-spawn pattern that conflicts
+/// with the async file-open here.
+///
 /// The drain task opens `spill_path` in append mode (creating it if
 /// missing) and writes each enqueued payload via `tokio::fs::File::write_all`.
 /// The file handle stays open for the lifetime of the runtime; on a

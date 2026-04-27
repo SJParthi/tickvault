@@ -45,7 +45,7 @@ use reqwest::Client;
 use tracing::{info, warn};
 
 use tickvault_common::config::QuestDbConfig;
-use tickvault_common::constants::{IST_UTC_OFFSET_SECONDS, SECONDS_PER_DAY};
+use tickvault_common::constants::{IST_UTC_OFFSET_NANOS, IST_UTC_OFFSET_SECONDS, SECONDS_PER_DAY};
 use tickvault_common::segment::segment_code_to_str;
 
 // ---------------------------------------------------------------------------
@@ -252,7 +252,16 @@ impl PreviousCloseWriter {
         received_at_nanos: i64,
     ) -> Result<()> {
         let ts_nanos = ist_midnight_nanos_for_received_at(received_at_nanos);
-        let received_ist_nanos = TimestampNanos::new(received_at_nanos);
+        // Per data-integrity rule: `received_at` columns store IST wall-
+        // clock = `Utc::now() + IST_UTC_OFFSET_NANOS`. The caller passes
+        // raw UTC nanos from `current_received_at_nanos()` /
+        // `Utc::now().timestamp_nanos_opt()`, so we add the offset here
+        // to match the convention used by `tick_persistence.rs`
+        // (build_tick_row, append_market_depth_row, append_prev_close_row).
+        // Without this offset every cross-table join on `received_at`
+        // would skew by 5h30m. Fixed 2026-04-27 after PR #393 grill audit.
+        let received_ist_nanos =
+            TimestampNanos::new(received_at_nanos.saturating_add(IST_UTC_OFFSET_NANOS));
         let ts = TimestampNanos::new(ts_nanos);
         let segment = segment_code_to_str(exchange_segment_code);
 
@@ -432,6 +441,27 @@ mod tests {
             PREVIOUS_CLOSE_CREATE_DDL.contains("source SYMBOL"),
             "CREATE TABLE DDL MUST include `source SYMBOL` so fresh \
              deployments have the column without relying on the ALTER"
+        );
+    }
+
+    /// Source-scan ratchet for the IST-offset rule on `received_at`
+    /// (data-integrity rule "received_at = Utc::now() + IST_UTC_OFFSET_NANOS").
+    /// `append_prev_close` MUST add `IST_UTC_OFFSET_NANOS` so cross-table
+    /// joins on `received_at` against `ticks` / `market_depth` /
+    /// `previous_close` do not skew by 5h30m. Discovered 2026-04-27 by
+    /// the PR #393 grill audit. Without this fix, every operator who
+    /// joined `previous_close` against `ticks` would see prev_close
+    /// rows appear 5.5 hours earlier than they actually arrived.
+    #[test]
+    fn test_critical_received_at_includes_ist_offset() {
+        let src = include_str!("previous_close_persistence.rs");
+        assert!(
+            src.contains("received_at_nanos.saturating_add(IST_UTC_OFFSET_NANOS)"),
+            "previous_close_persistence.rs MUST add IST_UTC_OFFSET_NANOS \
+             to received_at_nanos before writing the `received_at` column \
+             — see data-integrity rule, sibling write paths in \
+             tick_persistence.rs (build_tick_row, append_market_depth_row, \
+             append_prev_close_row)."
         );
     }
 }
