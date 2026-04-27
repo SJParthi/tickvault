@@ -168,6 +168,26 @@ pub enum ErrorCode {
     StorageGapF32F64Precision,
 
     // -----------------------------------------------------------------------
+    // Wave 1 hot-path / Phase 2 / prev-close / movers (PR #393)
+    // -----------------------------------------------------------------------
+    /// HOT-PATH-01: sync filesystem I/O failed inside an async writer task.
+    HotPath01SyncFsFailed,
+    /// HOT-PATH-02: hot-path writer queue full / closed / uninitialized.
+    HotPath02WriterQueueDrop,
+    /// PHASE2-01: Phase 2 dispatch failed (Failed event emitted).
+    Phase201DispatchFailed,
+    /// PHASE2-02: Phase2EmitGuard dropped without firing an outcome.
+    Phase202EmitGuardDropped,
+    /// PREVCLOSE-01: previous_close ILP append or flush failed.
+    PrevClose01IlpFailed,
+    /// PREVCLOSE-02: first_seen_set inconsistency (reserved for future use).
+    PrevClose02FirstSeenInconsistency,
+    /// MOVERS-01: stock movers persistence failed.
+    Movers01StockPersistFailed,
+    /// MOVERS-02: option movers persistence failed.
+    Movers02OptionPersistFailed,
+
+    // -----------------------------------------------------------------------
     // Dhan Trading API (DH-9xx)
     // -----------------------------------------------------------------------
     /// DH-901: Invalid auth — rotate token, retry once.
@@ -269,6 +289,15 @@ impl ErrorCode {
             // Storage
             Self::StorageGapTickDedupSegment => "STORAGE-GAP-01",
             Self::StorageGapF32F64Precision => "STORAGE-GAP-02",
+            // Wave 1 (PR #393)
+            Self::HotPath01SyncFsFailed => "HOT-PATH-01",
+            Self::HotPath02WriterQueueDrop => "HOT-PATH-02",
+            Self::Phase201DispatchFailed => "PHASE2-01",
+            Self::Phase202EmitGuardDropped => "PHASE2-02",
+            Self::PrevClose01IlpFailed => "PREVCLOSE-01",
+            Self::PrevClose02FirstSeenInconsistency => "PREVCLOSE-02",
+            Self::Movers01StockPersistFailed => "MOVERS-01",
+            Self::Movers02OptionPersistFailed => "MOVERS-02",
             // Dhan Trading API
             Self::Dh901InvalidAuth => "DH-901",
             Self::Dh902NoApiAccess => "DH-902",
@@ -324,7 +353,8 @@ impl ErrorCode {
             | Self::RiskGapPreTrade
             | Self::RiskGapPositionPnl
             | Self::InstrumentP0ExpiryAtGate4
-            | Self::Data807TokenExpired => Severity::High,
+            | Self::Data807TokenExpired
+            | Self::Phase202EmitGuardDropped => Severity::High,
             // Medium: data pipeline correctness
             Self::InstrumentP0DuplicateSecurityId
             | Self::InstrumentP0CountConsistency
@@ -352,12 +382,19 @@ impl ErrorCode {
             | Self::Data811InvalidExpiry
             | Self::Data812InvalidDateFormat
             | Self::Data813InvalidSecurityId
-            | Self::Data814InvalidRequest => Severity::Medium,
+            | Self::Data814InvalidRequest
+            | Self::HotPath01SyncFsFailed
+            | Self::Phase201DispatchFailed
+            | Self::PrevClose01IlpFailed
+            | Self::PrevClose02FirstSeenInconsistency
+            | Self::Movers01StockPersistFailed
+            | Self::Movers02OptionPersistFailed => Severity::Medium,
             // Low: scheduler / field coverage / trading-day / Dhan other
             Self::InstrumentP1DailyScheduler
             | Self::InstrumentP1DeltaFieldCoverage
             | Self::InstrumentP2TradingDayGuard
-            | Self::Dh910Other => Severity::Low,
+            | Self::Dh910Other
+            | Self::HotPath02WriterQueueDrop => Severity::Low,
         }
     }
 
@@ -401,6 +438,14 @@ impl ErrorCode {
             | Self::AuthGapDisconnectTokenMap
             | Self::StorageGapTickDedupSegment
             | Self::StorageGapF32F64Precision => ".claude/rules/project/gap-enforcement.md",
+            Self::HotPath01SyncFsFailed
+            | Self::HotPath02WriterQueueDrop
+            | Self::Phase201DispatchFailed
+            | Self::Phase202EmitGuardDropped
+            | Self::PrevClose01IlpFailed
+            | Self::PrevClose02FirstSeenInconsistency
+            | Self::Movers01StockPersistFailed
+            | Self::Movers02OptionPersistFailed => ".claude/rules/project/wave-1-error-codes.md",
             Self::Dh901InvalidAuth
             | Self::Dh902NoApiAccess
             | Self::Dh903AccountIssue
@@ -499,6 +544,14 @@ impl ErrorCode {
             Self::Data812InvalidDateFormat,
             Self::Data813InvalidSecurityId,
             Self::Data814InvalidRequest,
+            Self::HotPath01SyncFsFailed,
+            Self::HotPath02WriterQueueDrop,
+            Self::Phase201DispatchFailed,
+            Self::Phase202EmitGuardDropped,
+            Self::PrevClose01IlpFailed,
+            Self::PrevClose02FirstSeenInconsistency,
+            Self::Movers01StockPersistFailed,
+            Self::Movers02OptionPersistFailed,
         ]
     }
 }
@@ -644,7 +697,9 @@ mod tests {
     fn test_all_list_length_matches_catalogue_size() {
         // If this fails, the `all()` list was not updated when a new variant
         // was added. Keep this count in sync with the enum.
-        assert_eq!(ErrorCode::all().len(), 54);
+        // 2026-04-27 (Wave 1): bumped 54 -> 62 for 8 new variants
+        // (HOT-PATH-01/02, PHASE2-01/02, PREVCLOSE-01/02, MOVERS-01/02).
+        assert_eq!(ErrorCode::all().len(), 62);
     }
 
     #[test]
@@ -659,7 +714,12 @@ mod tests {
                 || s.starts_with("AUTH-GAP-")
                 || s.starts_with("STORAGE-GAP-")
                 || s.starts_with("DH-")
-                || s.starts_with("DATA-");
+                || s.starts_with("DATA-")
+                // Wave 1 (PR #393): hot-path / phase2 / prev-close / movers prefixes
+                || s.starts_with("HOT-PATH-")
+                || s.starts_with("PHASE2-")
+                || s.starts_with("PREVCLOSE-")
+                || s.starts_with("MOVERS-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }
