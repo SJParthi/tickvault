@@ -387,6 +387,77 @@ fn persist_stock_movers_snapshot(
     drop(writer.flush());
 }
 
+/// Wave 1 Item 2 — persists EVERY tracked equity and index entry as a
+/// single `EQUITY_ALL` / `INDEX_ALL` category. Operators can then
+/// query `select count(*) from stock_movers where ts > now()-1h` and
+/// see the full universe rolling forward (~239 × 720 ≈ 172 K rows/h)
+/// instead of just the top-N gainers/losers.
+///
+/// Cold path — runs alongside the existing `persist_stock_movers_snapshot`
+/// every 5 s during market hours. Composite key
+/// `(security_id, exchange_segment, ts)` is honored by the QuestDB
+/// DEDUP UPSERT KEY so reconnect / restart bursts within the same
+/// 5-second tick collapse to one row.
+fn persist_stock_movers_full_snapshot(
+    writer: &mut tickvault_storage::movers_persistence::StockMoversWriter,
+    equity_all: &[super::top_movers::MoverEntry],
+    index_all: &[super::top_movers::MoverEntry],
+    ts_nanos: i64,
+    registry: &Option<std::sync::Arc<tickvault_common::instrument_registry::InstrumentRegistry>>,
+) {
+    if equity_all.is_empty() && index_all.is_empty() {
+        return;
+    }
+
+    // Same registry-lookup pattern as `persist_stock_movers_snapshot`:
+    // I-P1-11 segment-aware lookup so cross-segment id collisions
+    // don't write the wrong symbol.
+    // O(1) EXEMPT: cold path — registry lookup per entry; bounded by
+    // the universe size (~270 entries per snapshot).
+    let lookup_symbol = |security_id: u32, segment_code: u8| -> &str {
+        let segment = match tickvault_common::types::ExchangeSegment::from_byte(segment_code) {
+            Some(s) => s,
+            None => return "",
+        };
+        registry
+            .as_ref()
+            .and_then(|r| r.get_with_segment(security_id, segment))
+            .map(|inst| inst.display_label.as_str())
+            .unwrap_or("")
+    };
+
+    let f32_clean = tickvault_storage::tick_persistence_testing::f32_to_f64_clean_pub;
+
+    let persist_all = |writer: &mut tickvault_storage::movers_persistence::StockMoversWriter,
+                       entries: &[super::top_movers::MoverEntry],
+                       category: &str| {
+        for (i, entry) in entries.iter().enumerate() {
+            let symbol = lookup_symbol(entry.security_id, entry.exchange_segment_code);
+            let prev_close = f32_clean(entry.prev_close);
+            let ltp = f32_clean(entry.last_traded_price);
+            let change_pct = f32_clean(entry.change_pct);
+            drop(writer.append_stock_mover(
+                ts_nanos,
+                category,
+                (i as i32).saturating_add(1),
+                entry.security_id,
+                tickvault_common::segment::segment_code_to_str(entry.exchange_segment_code),
+                symbol,
+                ltp,
+                prev_close,
+                change_pct,
+                i64::from(entry.volume),
+            ));
+        }
+    };
+
+    persist_all(writer, equity_all, "EQUITY_ALL");
+    persist_all(writer, index_all, "INDEX_ALL");
+
+    // Best-effort flush.
+    drop(writer.flush());
+}
+
 /// Persists an option movers snapshot to QuestDB (cold path, best-effort).
 ///
 /// Writes top 20 entries per category (7 categories × 20 = 140 rows max).
@@ -1614,6 +1685,19 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     persist_stock_movers_snapshot(
                         writer,
                         &snapshot,
+                        ts_nanos,
+                        &instrument_registry,
+                    );
+                    // Wave 1 Item 2 — also persist EVERY tracked entry
+                    // as EQUITY_ALL / INDEX_ALL so the operator query
+                    // `select count(*) from stock_movers where ts > now()-1h`
+                    // returns the full universe (~239 stocks + ~30
+                    // indices) rather than just the top-N.
+                    let (equity_all, index_all) = movers.compute_full_entries();
+                    persist_stock_movers_full_snapshot(
+                        writer,
+                        &equity_all,
+                        &index_all,
                         ts_nanos,
                         &instrument_registry,
                     );
