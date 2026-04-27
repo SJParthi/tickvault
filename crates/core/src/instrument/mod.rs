@@ -19,6 +19,7 @@ pub mod diagnostic;
 pub mod instrument_loader;
 pub mod live_tick_atm_resolver;
 pub mod phase2_delta;
+pub mod phase2_emit_guard;
 pub mod phase2_scheduler;
 pub mod preopen_price_buffer;
 pub mod preopen_rest_fallback;
