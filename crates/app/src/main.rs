@@ -1621,6 +1621,13 @@ async fn main() -> Result<()> {
     // logs at +5/+10/+20s; BOOT-01 ERROR @+30s; BOOT-02 HALT @+60s.
     // Prevents the legacy "tick processor starts before QuestDB is up"
     // race that dropped early-boot ticks before this gate existed.
+    let probe_started = std::time::Instant::now();
+    let boot_id = format!(
+        "boot-{}",
+        chrono::Utc::now()
+            .with_timezone(&tickvault_common::trading_calendar::ist_offset())
+            .format("%Y-%m-%d-%H%M%S")
+    );
     if let Err(e) = tickvault_storage::boot_probe::wait_for_questdb_ready(
         &config.questdb,
         tickvault_storage::boot_probe::BOOT_DEADLINE_SECS,
@@ -1633,6 +1640,34 @@ async fn main() -> Result<()> {
             "BOOT-02 QuestDB never reached ready state — halting"
         );
         anyhow::bail!("BOOT-02 QuestDB readiness deadline exceeded: {e}");
+    }
+
+    // Wave 2 Item 9 — boot audit row for the QuestDB readiness step.
+    // Best-effort: if QuestDB just barely came up but the DDL phase is
+    // about to write to it, we still want this row. Failures don't halt
+    // boot — the AUDIT-04 ErrorCode + tracing::error! covers regression.
+    {
+        let now_nanos = chrono::Utc::now()
+            .timestamp_nanos_opt()
+            .unwrap_or(0)
+            .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS);
+        if let Err(e) = tickvault_storage::boot_audit_persistence::append_boot_audit_row(
+            &config.questdb,
+            now_nanos,
+            &boot_id,
+            "questdb_ready",
+            "ok",
+            i64::try_from(probe_started.elapsed().as_millis()).unwrap_or(i64::MAX),
+            "QuestDB readiness probe succeeded",
+        )
+        .await
+        {
+            tracing::error!(
+                error = ?e,
+                code = tickvault_common::error_code::ErrorCode::Audit04BootWriteFailed.code_str(),
+                "AUDIT-04 boot audit row write failed — continuing"
+            );
+        }
     }
 
     // All table creation queries are independent — run in parallel for faster boot.
@@ -1937,6 +1972,13 @@ async fn main() -> Result<()> {
     // Step 8: Build WebSocket connection pool (only if authenticated + plan ready)
     // -----------------------------------------------------------------------
     let token_handle = token_manager.token_handle();
+
+    // Wave 2 Item 5.4 (AUTH-GAP-03) — install global TokenManager so the
+    // WebSocket sleep-wake path can call `force_renewal_if_stale()`
+    // without holding a back-reference per connection.
+    if !tickvault_core::auth::token_manager::set_global_token_manager(token_manager.clone()) {
+        tracing::warn!("global TokenManager already installed — skipping");
+    }
 
     // Fetch credentials ONCE for all downstream consumers (WS pool, order update WS, trading pipeline).
     // Previously fetched 3 separate times — each SSM call is a network roundtrip to AWS.
@@ -4035,6 +4077,9 @@ async fn main() -> Result<()> {
             {
                 let rebalance_notifier = notifier.clone();
                 let rebal_cmd_senders = std::sync::Arc::clone(&depth_cmd_senders);
+                // Wave 2 Item 9 (AUDIT-02) — clone QuestDB config into the
+                // rebalancer task scope so audit rows can be persisted.
+                let qcfg_for_rebalance = config.questdb.clone();
                 tokio::spawn(async move {
                     while rebalance_rx.changed().await.is_ok() {
                         let event = match rebalance_rx.borrow().clone() {
@@ -4109,6 +4154,39 @@ async fn main() -> Result<()> {
                             new_ce: new_ce.clone(),
                             new_pe: new_pe.clone(),
                             levels,
+                        });
+
+                        // Wave 2 Item 9 (AUDIT-02) — persist a depth-rebalance
+                        // audit row for SEBI-grade reconstruction.
+                        let now_nanos = chrono::Utc::now()
+                            .timestamp_nanos_opt()
+                            .unwrap_or(0)
+                            .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS);
+                        let levels_label = if has_200_level { "20+200" } else { "20" };
+                        let qcfg_for_audit = qcfg_for_rebalance.clone();
+                        let ul_for_audit = ul.to_string();
+                        let old_strike = event.prev_atm.as_ref().map(|a| a.strike).unwrap_or(0.0);
+                        let new_strike = event.new_atm.as_ref().map(|a| a.strike).unwrap_or(0.0);
+                        let spot_at_swap = event.current_spot;
+                        tokio::spawn(async move {
+                            if let Err(e) = tickvault_storage::depth_rebalance_audit_persistence::append_depth_rebalance_audit_row(
+                                &qcfg_for_audit,
+                                now_nanos,
+                                &ul_for_audit,
+                                old_strike,
+                                new_strike,
+                                spot_at_swap,
+                                levels_label,
+                                "success",
+                            )
+                            .await
+                            {
+                                tracing::error!(
+                                    error = ?e,
+                                    code = tickvault_common::error_code::ErrorCode::Audit02DepthRebalanceWriteFailed.code_str(),
+                                    "AUDIT-02 depth-rebalance audit row write failed"
+                                );
+                            }
                         });
 
                         // --- 200-level rebalance via command channel (zero disconnect) ---

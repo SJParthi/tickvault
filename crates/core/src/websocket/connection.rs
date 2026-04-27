@@ -1340,12 +1340,48 @@ impl WebSocketConnection {
                         "feed" => "main"
                     )
                     .increment(1);
+                    // Wave 2 — emit Telegram WebSocketSleepEntered (Severity::Low).
+                    if let Some(ref n) = self.notifier {
+                        n.notify(
+                            crate::notification::events::NotificationEvent::WebSocketSleepEntered {
+                                feed: "main".to_string(),
+                                connection_index: self.connection_id as usize,
+                                sleep_secs,
+                            },
+                        );
+                    }
                     time::sleep(Duration::from_secs(sleep_secs)).await;
                     info!(
                         connection_id = self.connection_id,
                         slept_for_secs = sleep_secs,
                         "Main-feed sleep resumed — attempting reconnect"
                     );
+                    // Wave 2 Item 5.4 (AUTH-GAP-03) — proactively renew the
+                    // token if it has < 4h validity left BEFORE attempting
+                    // the post-sleep reconnect. Prevents the legacy
+                    // "wake → reconnect → DH-901 → renew → reconnect"
+                    // 30-second cascade. Uses the global TokenManager
+                    // handle installed at boot.
+                    if let Some(tm) = crate::auth::token_manager::global_token_manager() {
+                        if let Err(e) = tm.force_renewal_if_stale(14_400).await {
+                            tracing::error!(
+                                connection_id = self.connection_id,
+                                error = ?e,
+                                code = tickvault_common::error_code::ErrorCode::AuthGap03TokenForceRenewedOnWake.code_str(),
+                                "AUTH-GAP-03 wake-time token renewal failed — will rely on reconnect retry"
+                            );
+                        }
+                    }
+                    // Wave 2 — emit Telegram WebSocketSleepResumed.
+                    if let Some(ref n) = self.notifier {
+                        n.notify(
+                            crate::notification::events::NotificationEvent::WebSocketSleepResumed {
+                                feed: "main".to_string(),
+                                connection_index: self.connection_id as usize,
+                                slept_for_secs: sleep_secs,
+                            },
+                        );
+                    }
                     // Reset reconnection counter so the post-sleep attempt
                     // starts fresh (3-failure post-close gate is per-cycle).
                     self.total_reconnections.store(0, Ordering::Release);
