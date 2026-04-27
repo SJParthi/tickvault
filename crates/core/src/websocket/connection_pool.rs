@@ -592,6 +592,87 @@ impl WebSocketConnectionPool {
 
         self.connections.len()
     }
+
+    /// Wave 2 Item 5.2 (WS-GAP-05) — pool supervisor.
+    ///
+    /// Awaits the spawned `JoinHandle`s and logs ERROR (with the
+    /// `WS-GAP-05` code) + increments `tv_ws_pool_respawn_total` for
+    /// every per-connection task that exits unexpectedly (panic, error
+    /// return, or aborted). Called by `main.rs` AFTER `spawn_all()` so
+    /// the operator gets a Telegram alert if a connection task dies
+    /// silently.
+    ///
+    /// Design note: the per-connection task already owns its own
+    /// reconnect loop (`wait_with_backoff` + Wave 2 Item 5 sleep
+    /// path). A `JoinHandle` exits ONLY on real fatal events (panic,
+    /// `ReconnectionExhausted` outside post-close, graceful shutdown).
+    /// This supervisor surfaces those via metrics + ERROR logs so the
+    /// operator can investigate. Actual respawn-with-fresh-config is
+    /// deferred — the `wait_with_backoff` loop handles routine
+    /// disconnects and the post-close sleep keeps the task alive across
+    /// market closes.
+    ///
+    /// Returns when all handles have exited.
+    // O(1) EXEMPT: cold-path supervisor — runs once per session.
+    pub async fn supervise_pool(handles: Vec<tokio::task::JoinHandle<Result<(), WebSocketError>>>) {
+        let total = handles.len();
+        if total == 0 {
+            tracing::warn!("WS-GAP-05 pool supervisor invoked with 0 handles — nothing to watch");
+            return;
+        }
+        // Use FuturesUnordered so we react to whichever handle exits
+        // first, in O(1) per event.
+        // O(1) EXEMPT: cold-path supervisor — runs once per session.
+        use futures_util::stream::{FuturesUnordered, StreamExt};
+        let mut pending: FuturesUnordered<_> = FuturesUnordered::new();
+        for h in handles {
+            pending.push(h);
+        }
+        let mut idx: usize = 0;
+        while let Some(join_result) = pending.next().await {
+            idx = idx.saturating_add(1);
+            match join_result {
+                Ok(Ok(())) => {
+                    tracing::info!(
+                        slot = idx,
+                        total,
+                        "WS pool task exited cleanly (graceful shutdown)"
+                    );
+                }
+                Ok(Err(ws_err)) => {
+                    tracing::error!(
+                        slot = idx,
+                        total,
+                        ?ws_err,
+                        code =
+                            tickvault_common::error_code::ErrorCode::WsGap05PoolRespawn.code_str(),
+                        "WS-GAP-05 pool task exited with WebSocketError — supervisor recorded"
+                    );
+                    metrics::counter!("tv_ws_pool_respawn_total", "reason" => "ws_error")
+                        .increment(1);
+                }
+                Err(join_err) => {
+                    let label = if join_err.is_panic() {
+                        "panic"
+                    } else if join_err.is_cancelled() {
+                        "cancelled"
+                    } else {
+                        "unknown"
+                    };
+                    tracing::error!(
+                        slot = idx,
+                        total,
+                        kind = label,
+                        code =
+                            tickvault_common::error_code::ErrorCode::WsGap05PoolRespawn.code_str(),
+                        "WS-GAP-05 pool task did not exit cleanly — supervisor recorded"
+                    );
+                    metrics::counter!("tv_ws_pool_respawn_total", "reason" => label).increment(1);
+                }
+            }
+        }
+        tracing::info!(total, "WS-GAP-05 pool supervisor — all handles drained");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1641,5 +1722,35 @@ mod tests {
         );
 
         drain_handles_or_timeout(&pool, handles).await;
+    }
+
+    // -------------------------------------------------------------
+    // Wave 2 Item 5.2 (WS-GAP-05) — supervise_pool tests.
+    // -------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_supervise_pool_returns_immediately_with_zero_handles() {
+        // Empty handle list must return without hanging.
+        let started = std::time::Instant::now();
+        WebSocketConnectionPool::supervise_pool(Vec::new()).await;
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+    }
+
+    #[tokio::test]
+    async fn test_supervise_pool_drains_clean_exit_handle() {
+        // A handle that returns Ok(()) must drain to clean termination.
+        let handle: tokio::task::JoinHandle<Result<(), WebSocketError>> =
+            tokio::spawn(async { Ok(()) });
+        WebSocketConnectionPool::supervise_pool(vec![handle]).await;
+        // Reaching this assertion proves supervise_pool returned.
+    }
+
+    #[tokio::test]
+    async fn test_supervise_pool_handles_panicked_task_without_panicking_supervisor() {
+        // A panicking handle must NOT propagate the panic to the supervisor.
+        let handle: tokio::task::JoinHandle<Result<(), WebSocketError>> =
+            tokio::spawn(async { panic!("synthetic panic — Wave 2 Item 5.2 test") });
+        WebSocketConnectionPool::supervise_pool(vec![handle]).await;
+        // Reaching this assertion proves the supervisor kept its composure.
     }
 }
