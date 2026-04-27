@@ -340,6 +340,24 @@ pub enum NotificationEvent {
     /// WebSocket reconnected after disconnection.
     WebSocketReconnected { connection_index: usize },
 
+    /// Wave 2 Item 5 (G1, WS-GAP-04) — main-feed connection entered
+    /// post-close sleep mode (instead of legacy give-up `return false`).
+    /// Severity::Low — informational, the connection is dormant not
+    /// failed and will auto-reconnect at next NSE market open.
+    WebSocketSleepEntered {
+        feed: String,
+        connection_index: usize,
+        sleep_secs: u64,
+    },
+
+    /// Wave 2 Item 5 (G1) — connection woke from post-close sleep and
+    /// is about to attempt reconnect. Severity::Info.
+    WebSocketSleepResumed {
+        feed: String,
+        connection_index: usize,
+        slept_for_secs: u64,
+    },
+
     /// 20-level depth WebSocket connected for an underlying.
     DepthTwentyConnected { underlying: String },
 
@@ -1122,6 +1140,26 @@ impl NotificationEvent {
                     tickvault_common::constants::MAX_WEBSOCKET_CONNECTIONS
                 )
             }
+            Self::WebSocketSleepEntered {
+                feed,
+                connection_index,
+                sleep_secs,
+            } => {
+                format!(
+                    "<b>WS-GAP-04 {feed} feed sleeping (slot {})</b>\nSleep for {sleep_secs}s until next NSE market open",
+                    connection_index.saturating_add(1)
+                )
+            }
+            Self::WebSocketSleepResumed {
+                feed,
+                connection_index,
+                slept_for_secs,
+            } => {
+                format!(
+                    "<b>WS-GAP-04 {feed} feed waking (slot {})</b>\nSlept {slept_for_secs}s — attempting reconnect",
+                    connection_index.saturating_add(1)
+                )
+            }
             Self::DepthTwentyConnected { underlying } => {
                 format!("<b>Depth 20-level connected</b>\nUnderlying: {underlying}")
             }
@@ -1592,6 +1630,9 @@ impl NotificationEvent {
             Self::QuestDbDisconnected { .. } => Severity::Critical,
             Self::QuestDbReconnected { .. } => Severity::Medium,
             Self::WebSocketReconnected { .. } => Severity::Medium,
+            Self::WebSocketSleepEntered { .. } | Self::WebSocketSleepResumed { .. } => {
+                Severity::Low
+            }
             Self::DepthTwentyDisconnected { .. } => Severity::High,
             Self::DepthTwentyDisconnectedOffHours { .. } => Severity::Low,
             Self::DepthTwentyReconnected { .. } => Severity::Medium,
