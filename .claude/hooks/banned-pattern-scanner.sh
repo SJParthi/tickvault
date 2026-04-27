@@ -368,6 +368,106 @@ scan_prod_code 'pub mod backfill' \
   "$STAGED_FILES"
 
 # ─────────────────────────────────────────────
+# CATEGORY 7: HOT-PATH SYNC FILESYSTEM (Wave 1 Item 0.d/0.a/0.e)
+# ─────────────────────────────────────────────
+#
+# Synchronous `std::fs::*` calls (write / rename / create_dir_all etc.)
+# inside the hot-path tick processor or persistence layer block the
+# tokio runtime and stall tick ingestion when disk is slow or paused
+# (chaos-mode tests, host I/O glitches, full disk).
+#
+# Wave 1 Item 0.d hoisted `create_dir_all` to a one-shot boot init.
+# Item 0.a moved the PrevClose JSON cache write to a dedicated tokio
+# task fed by `tokio::sync::mpsc::channel(64)`. This category locks
+# both fixes in: any future re-introduction of `std::fs::*` (or
+# `BufWriter::<File>::new(...)`) into the hot-path files MUST carry
+# a `// HOT-PATH-EXEMPT: <reason>` comment on the directly preceding
+# line OR be inside a `tokio::task::spawn_blocking` or `tokio::fs::*`
+# closure (those are async-safe).
+#
+# Hot-path files (start narrow — extend as the spill async wrapper
+# Item 0.b lands in a follow-up):
+#   - crates/core/src/pipeline/tick_processor.rs
+# Test files / boot init / drain task internals are exempt
+# because they run on the blocking pool or once-only at boot.
+
+scan_hot_path_sync_fs() {
+  local pattern="$1"
+  local description="$2"
+  local files="$3"
+  local target_files
+
+  target_files=$(echo "$files" | grep -E \
+    '^crates/core/src/pipeline/tick_processor\.rs$' \
+    || true)
+  if [ -z "$target_files" ]; then
+    return
+  fi
+
+  while IFS= read -r file; do
+    [ -z "$file" ] && continue
+    local full_path="$PROJECT_DIR/$file"
+    [ ! -f "$full_path" ] && continue
+    if echo "$file" | grep -qE '(_test\.rs|/tests/|/test_|_tests\.rs|/benches/)'; then
+      continue
+    fi
+    # Production-only: strip #[cfg(test)] blocks via the same awk used
+    # in the universal scanner.
+    local prod_code
+    prod_code=$(extract_prod_code "$full_path")
+    [ -z "$prod_code" ] && continue
+    # Strip Rust comment lines so prose mentions of the banned literal
+    # (e.g. doc-comments explaining the rule) don't trip the scanner.
+    # Format produced by `extract_prod_code` is `<line_num>: <code>` —
+    # we want to drop entries whose code starts with `///`, `//!`, or `//`.
+    local code_only
+    code_only=$(echo "$prod_code" | grep -vE '^[0-9]+:\s*(///|//!|//)' || true)
+    local hits
+    hits=$(echo "$code_only" | grep -E "$pattern" || true)
+    [ -z "$hits" ] && continue
+    while IFS= read -r hit; do
+      [ -z "$hit" ] && continue
+      local hit_line_num
+      hit_line_num=$(echo "$hit" | cut -d: -f1)
+      [ -z "$hit_line_num" ] && continue
+      # Look back up to 5 lines for HOT-PATH-EXEMPT — the marker may
+      # be on the line above the offending call OR on a doc-comment
+      # block above the enclosing fn declaration.
+      local exempt=0
+      local i
+      for i in 1 2 3 4 5; do
+        local back_line_num=$((hit_line_num - i))
+        [ "$back_line_num" -lt 1 ] && break
+        local back_text
+        back_text=$(sed -n "${back_line_num}p" "$full_path" 2>/dev/null)
+        if echo "$back_text" | grep -q 'HOT-PATH-EXEMPT:'; then
+          exempt=1
+          break
+        fi
+      done
+      if [ "$exempt" = "1" ]; then
+        continue
+      fi
+      VIOLATIONS=$((VIOLATIONS + 1))
+      REPORT="${REPORT}\n  [BANNED] ${description} in ${file}:\n    ${hit}"
+    done <<< "$hits"
+  done <<< "$target_files"
+}
+
+scan_hot_path_sync_fs 'std::fs::write\b' \
+  'Wave 1 Item 0.a: std::fs::write on hot path — use prev_close_writer::try_enqueue_global or add // HOT-PATH-EXEMPT: above the call' \
+  "$STAGED_FILES"
+scan_hot_path_sync_fs 'std::fs::rename\b' \
+  'Wave 1 Item 0.a: std::fs::rename on hot path — owned by the async writer task or add // HOT-PATH-EXEMPT:' \
+  "$STAGED_FILES"
+scan_hot_path_sync_fs 'std::fs::create_dir_all\b' \
+  'Wave 1 Item 0.d: std::fs::create_dir_all on hot path — hoist to init_prev_close_cache_dir() at boot or add // HOT-PATH-EXEMPT:' \
+  "$STAGED_FILES"
+scan_hot_path_sync_fs 'std::fs::create_dir\b' \
+  'Wave 1 Item 0.d: std::fs::create_dir on hot path — hoist to boot init or add // HOT-PATH-EXEMPT:' \
+  "$STAGED_FILES"
+
+# ─────────────────────────────────────────────
 # RESULT
 # ─────────────────────────────────────────────
 
