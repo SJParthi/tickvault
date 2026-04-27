@@ -16,6 +16,7 @@ pub const DEDUP_KEY_BOOT_AUDIT: &str = "boot_id, step";
 
 const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 
+// TEST-EXEMPT: requires running QuestDB; tested via boot integration in CI.
 pub async fn ensure_boot_audit_table(questdb_config: &QuestDbConfig) {
     let base_url = format!(
         "http://{}:{}/exec",

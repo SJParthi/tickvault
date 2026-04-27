@@ -16,6 +16,7 @@ pub const DEDUP_KEY_SELFTEST_AUDIT: &str = "trading_date_ist, check_name";
 
 const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 
+// TEST-EXEMPT: requires running QuestDB; tested via boot integration in CI.
 pub async fn ensure_selftest_audit_table(questdb_config: &QuestDbConfig) {
     let base_url = format!(
         "http://{}:{}/exec",

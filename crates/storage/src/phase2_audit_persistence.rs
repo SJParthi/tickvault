@@ -26,6 +26,7 @@ const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 /// Idempotent CREATE + ALTER ADD COLUMN IF NOT EXISTS for the audit
 /// table. Called once at boot from `main.rs` — per the schema-self-heal
 /// pattern in `observability-architecture.md`.
+// TEST-EXEMPT: requires running QuestDB; tested via boot integration in CI.
 pub async fn ensure_phase2_audit_table(questdb_config: &QuestDbConfig) {
     let base_url = format!(
         "http://{}:{}/exec",

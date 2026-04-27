@@ -15,6 +15,7 @@ pub const DEDUP_KEY_WS_RECONNECT_AUDIT: &str = "connection_id, ts";
 
 const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 
+// TEST-EXEMPT: requires running QuestDB; tested via boot integration in CI.
 pub async fn ensure_ws_reconnect_audit_table(questdb_config: &QuestDbConfig) {
     let base_url = format!(
         "http://{}:{}/exec",

@@ -16,6 +16,7 @@ pub const DEDUP_KEY_ORDER_AUDIT: &str = "order_id, ts, leg";
 
 const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 
+// TEST-EXEMPT: requires running QuestDB; tested via boot integration in CI.
 pub async fn ensure_order_audit_table(questdb_config: &QuestDbConfig) {
     let base_url = format!(
         "http://{}:{}/exec",
