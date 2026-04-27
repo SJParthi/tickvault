@@ -6,6 +6,9 @@
 /target/
 **/*.rs.bk
 
+# ---- DHAT profiler output (per-test artifact) ----
+**/dhat-heap.json
+
 # ---- Python (MCP server bytecode cache) ----
 __pycache__/
 *.pyc
