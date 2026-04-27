@@ -942,6 +942,44 @@ groups:
         labels:
           severity: high
 
+      # Wave 1 / HOT-PATH-01: spill drain write_all failed. Same
+      # ErrorCode as the prev_close writer error above — both fire
+      # when a sync filesystem write inside an async drain task fails.
+      - uid: tv-hot-path-01-spill-drain-error
+        title: "Wave 1 HOT-PATH-01: spill drain write_all failed"
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: prometheus
+            model:
+              expr: "increase(tv_spill_drain_errors_total[10m])"
+              intervalMs: 15000
+              maxDataPoints: 43200
+          - refId: B
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: gt, params: [0] }
+        noDataState: OK
+        execErrState: Alerting
+        for: 5m
+        annotations:
+          summary: "HOT-PATH-01: spill drain async write_all failed"
+          description: "tv_spill_drain_errors_total incremented. The async tick-spill drain task hit a tokio::fs write_all error — disk full, mount disappeared, or permission issue. Hot path is NOT blocked (drain is decoupled), but each error means one tick payload was lost from the spill file. Runbook: .claude/rules/project/wave-1-error-codes.md (HOT-PATH-01)."
+        labels:
+          severity: high
+
       # Wave 1 / HOT-PATH-02: prev_close writer queue sustained drops.
       - uid: tv-hot-path-02-prev-close-writer-sustained-drops
         title: "Wave 1 HOT-PATH-02: prev_close writer sustained drops"
