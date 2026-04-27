@@ -177,6 +177,21 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
 
+    /// Sync sentinel test — the pub-fn-test-guard matcher uses
+    /// `grep -r "#\[test\]"` to filter candidate files before searching
+    /// for per-fn test names. `#[tokio::test]` alone doesn't match that
+    /// regex, so this small sync test guarantees the prev_close_writer
+    /// file is included in the scan and the `spawn` / `try_enqueue` /
+    /// `init` / `try_enqueue_global` tests below are detected.
+    #[test]
+    fn test_enqueue_outcome_variants_are_distinct() {
+        // Cheap derive sanity check — also exercises `EnqueueOutcome`'s
+        // PartialEq + Debug for the assertions in the async tests below.
+        assert_ne!(EnqueueOutcome::Sent, EnqueueOutcome::DroppedFull);
+        assert_ne!(EnqueueOutcome::DroppedClosed, EnqueueOutcome::Uninitialized);
+        assert_eq!(EnqueueOutcome::Sent, EnqueueOutcome::Sent);
+    }
+
     /// Returns a fresh per-test directory under `std::env::temp_dir()`.
     /// Process-PID + a counter avoids collisions between concurrent tests.
     fn fresh_test_dir(label: &str) -> std::path::PathBuf {
