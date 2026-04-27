@@ -1707,7 +1707,7 @@ mod tests {
     /// hot-path PrevClose code-6 frame can assume the directory exists
     /// without paying for a `create_dir_all` syscall on every packet.
     #[test]
-    fn test_prev_close_cache_dir_init_idempotent() {
+    fn test_init_prev_close_cache_dir_idempotent() {
         // Calling the boot init three times in a row must succeed every time.
         // The function is `pub` and idempotent by design (`create_dir_all` is
         // a no-op when the directory already exists).
