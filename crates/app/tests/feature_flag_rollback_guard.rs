@@ -34,7 +34,29 @@
 
 use figment::Figment;
 use figment::providers::{Format, Toml};
-use tickvault_common::config::FeaturesConfig;
+use tickvault_common::config::{ApplicationConfig, FeaturesConfig};
+
+/// Canonical list of all 14 C9 feature-flag names. Source of truth used
+/// by the drift-prevention meta-tests below — if any flag is renamed
+/// in `FeaturesConfig` or `config/base.toml`, this list MUST be updated
+/// too. The cross-check tests guarantee no silent drift between the
+/// three definitions (struct fields ↔ TOML keys ↔ this list).
+const EXPECTED_FLAGS: [&str; 14] = [
+    "hotpath_async_writers",
+    "phase2_emit_guard",
+    "stock_movers_full_universe",
+    "option_movers_5s",
+    "previous_close_persist",
+    "ws_main_sleep_until_open",
+    "ws_depth_ou_sleep_until_open",
+    "fast_boot_60s_deadline",
+    "tick_gap_detector_60s_coalesce",
+    "audit_tables_enabled",
+    "preopen_movers",
+    "telegram_bucket_coalescer",
+    "market_open_self_test",
+    "realtime_guarantee_score",
+];
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -401,8 +423,82 @@ fn test_features_empty_body_falls_back_to_default_all_true() {
     assert_eq!(cfg, FeaturesConfig::default());
 }
 
+/// Production-path test: load the real `config/base.toml` exactly the
+/// way the boot sequence does (`Figment::new().merge(Toml::file(...))
+/// .extract::<ApplicationConfig>()`) and assert the `features` sub-table
+/// resolves to `FeaturesConfig::default()`. This exercises the
+/// `[features]` heading routing that the per-flag tests above bypass.
+#[test]
+fn test_features_loads_via_application_config_from_base_toml() {
+    let toml_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("config")
+        .join("base.toml");
+    let app: ApplicationConfig = Figment::new()
+        .merge(Toml::file(&toml_path))
+        .extract()
+        .expect("config/base.toml must parse via the boot-sequence loader");
+    assert_eq!(
+        app.features,
+        FeaturesConfig::default(),
+        "config/base.toml [features] must round-trip to FeaturesConfig::default() \
+         — every flag stays at the safe-by-default true value"
+    );
+}
+
+/// Drift-prevention meta-guard: serialize `FeaturesConfig::default()`
+/// via serde and assert the JSON object's keys match `EXPECTED_FLAGS`
+/// exactly. Catches struct-field renames + accidental field removals
+/// + accidental field additions without a paired test trio.
+#[test]
+fn test_features_struct_fields_match_expected_canonical_list() {
+    let value = serde_json::to_value(FeaturesConfig::default())
+        .expect("FeaturesConfig must serialize as JSON object");
+    let object = value
+        .as_object()
+        .expect("FeaturesConfig::default() must serialize as JSON object");
+    let mut struct_keys: Vec<&str> = object.keys().map(String::as_str).collect();
+    struct_keys.sort_unstable();
+    let mut expected: Vec<&str> = EXPECTED_FLAGS.to_vec();
+    expected.sort_unstable();
+    assert_eq!(
+        struct_keys, expected,
+        "FeaturesConfig field names must match EXPECTED_FLAGS exactly. \
+         If you added/renamed/removed a flag, update both sides + the \
+         per-flag test trio."
+    );
+}
+
+/// Drift-prevention meta-guard: every name in `EXPECTED_FLAGS` MUST
+/// appear in `config/base.toml`'s `[features]` section. Catches the
+/// case where the struct + canonical list stay in sync but base.toml
+/// drifts.
+#[test]
+fn test_every_expected_flag_appears_in_config_base_toml() {
+    let toml_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("config")
+        .join("base.toml");
+    let body = std::fs::read_to_string(&toml_path).expect("config/base.toml must exist");
+    assert!(
+        body.contains("[features]"),
+        "config/base.toml must contain a [features] section (C9 contract)"
+    );
+    for flag in EXPECTED_FLAGS {
+        assert!(
+            body.contains(flag),
+            "config/base.toml [features] must list `{flag}` — every name in \
+             EXPECTED_FLAGS must be present in the TOML."
+        );
+    }
+}
+
 /// The `[features]` section in `config/base.toml` must list every one
 /// of the 14 flags. Missing a flag = silent regression of a Wave item.
+/// Retained alongside the meta-guards above as a string-presence
+/// double-check; the meta-guards do the structural check.
 #[test]
 fn test_config_base_toml_lists_every_feature_flag() {
     let toml_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
