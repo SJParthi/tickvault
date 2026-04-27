@@ -65,23 +65,25 @@ pub struct PrevCloseWriter {
 }
 
 impl PrevCloseWriter {
-    /// Spawns a blocking writer task on the current tokio runtime and
+    /// Spawns an async writer task on the current tokio runtime and
     /// returns a handle. Each enqueued `Bytes` payload is written to
     /// `tmp_path` then atomically renamed to `cache_path`.
     ///
-    /// Sync `std::fs::*` is allowed inside the spawned closure because
-    /// the task itself runs in tokio's blocking thread pool — it never
-    /// blocks the async runtime.
-    // HOT-PATH-EXEMPT: the spawned closure runs on the blocking pool.
-    // This is the canonical pattern for async-safe sync I/O in tokio.
+    /// Implementation note: the original Wave 1 Item 0.a sketch called
+    /// for `tokio::task::spawn_blocking` + `Receiver::blocking_recv`
+    /// (sync receiver, sync `std::fs::*`). That works in production but
+    /// hangs `#[tokio::test]` shutdown — the blocking recv waits forever
+    /// on a Sender held in the `OnceLock` global, so the runtime drop
+    /// never returns. We use async `tokio::spawn` + `tokio::fs::write` /
+    /// `tokio::fs::rename`, which dispatch the actual syscall to tokio's
+    /// blocking pool internally but present a cancellation-safe async
+    /// surface so runtime drops cleanly. Hot-path latency is unchanged
+    /// — the caller still pays only a non-blocking `try_send`.
     pub fn spawn(cache_path: PathBuf, tmp_path: PathBuf) -> Self {
         let (tx, mut rx) = mpsc::channel::<Bytes>(CHANNEL_CAPACITY);
-        tokio::task::spawn_blocking(move || {
-            // Drain the channel until all senders are dropped.
-            while let Some(bytes) = rx.blocking_recv() {
-                // HOT-PATH-EXEMPT: blocking pool task — sync fs is fine.
-                let write_res = std::fs::write(&tmp_path, &bytes);
-                if let Err(err) = write_res {
+        tokio::spawn(async move {
+            while let Some(bytes) = rx.recv().await {
+                if let Err(err) = tokio::fs::write(&tmp_path, &bytes).await {
                     error!(
                         ?err,
                         code = "HOT-PATH-01",
@@ -91,8 +93,7 @@ impl PrevCloseWriter {
                     counter!("tv_prev_close_writer_errors_total", "stage" => "write").increment(1);
                     continue;
                 }
-                // HOT-PATH-EXEMPT: blocking pool task — sync fs is fine.
-                if let Err(err) = std::fs::rename(&tmp_path, &cache_path) {
+                if let Err(err) = tokio::fs::rename(&tmp_path, &cache_path).await {
                     error!(
                         ?err,
                         code = "HOT-PATH-01",
