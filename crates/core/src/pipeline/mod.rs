@@ -13,6 +13,7 @@ pub mod mover_classifier;
 pub mod movers_window;
 pub mod no_tick_watchdog;
 pub mod option_movers;
+pub mod prev_close_writer;
 pub mod tick_processor;
 pub mod top_movers;
 
