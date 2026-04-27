@@ -126,7 +126,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_append_selftest_audit_returns_err_when_questdb_unreachable() {
+    async fn test_append_selftest_audit_row_returns_err_when_questdb_unreachable() {
         let cfg = test_cfg(1);
         let result = append_selftest_audit_row(
             &cfg,

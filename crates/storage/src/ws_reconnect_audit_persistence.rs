@@ -137,7 +137,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_append_ws_reconnect_returns_err_when_questdb_unreachable() {
+    async fn test_append_ws_reconnect_audit_row_returns_err_when_questdb_unreachable() {
         let cfg = test_cfg(1);
         let result = append_ws_reconnect_audit_row(
             &cfg,
@@ -154,7 +154,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_append_ws_reconnect_handles_optional_disconnect_code() {
+    async fn test_append_ws_reconnect_audit_row_handles_optional_disconnect_code() {
         let cfg = test_cfg(1);
         let _ = append_ws_reconnect_audit_row(
             &cfg,

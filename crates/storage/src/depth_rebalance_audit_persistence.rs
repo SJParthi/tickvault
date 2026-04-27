@@ -138,7 +138,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_append_depth_rebalance_returns_err_when_questdb_unreachable() {
+    async fn test_append_depth_rebalance_audit_row_returns_err_when_questdb_unreachable() {
         let cfg = test_cfg(1);
         let result = append_depth_rebalance_audit_row(
             &cfg,
@@ -155,7 +155,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_append_depth_rebalance_escapes_quotes_in_underlying() {
+    async fn test_append_depth_rebalance_audit_row_escapes_quotes_in_underlying() {
         let cfg = test_cfg(1);
         let _ =
             append_depth_rebalance_audit_row(&cfg, 0, "BANK'NIFTY", 0.0, 0.0, 0.0, "20", "success")
