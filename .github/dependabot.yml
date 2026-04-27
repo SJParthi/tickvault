@@ -36,7 +36,7 @@ updates:
       - "dependencies"
       - "rust"
     commit-message:
-      prefix: "deps(cargo)"
+      prefix: "chore(deps)"
       include: "scope"
     # Group all patch + minor bumps for the same crate into one PR per week.
     # Major bumps stay as separate PRs because they may be breaking.
@@ -61,7 +61,7 @@ updates:
       - "dependencies"
       - "github-actions"
     commit-message:
-      prefix: "deps(actions)"
+      prefix: "chore(deps)"
       include: "scope"
     # Pin SHA digests for action references rather than tag refs to mitigate
     # tag-squatting attacks. Dependabot honours this via the comment-after
@@ -82,5 +82,5 @@ updates:
       - "dependencies"
       - "docker"
     commit-message:
-      prefix: "deps(docker)"
+      prefix: "chore(deps)"
       include: "scope"
