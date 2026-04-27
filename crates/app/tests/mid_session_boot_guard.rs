@@ -352,3 +352,44 @@ fn test_historical_fetch_already_available_variant_exists_at_low_severity() {
          how much data the DB has — reassurance that the skip is safe)."
     );
 }
+
+#[test]
+fn test_historical_fetch_zero_fetched_on_non_trading_day_routes_to_low() {
+    // 2026-04-26 follow-up: on a non-trading day (weekend / NSE holiday)
+    // the market never opened, so `instruments_fetched == 0 && total_candles
+    // == 0` is the EXPECTED state — not an outage. Before this fix the
+    // operator was paged HIGH `Historical candle fetch — partial failure /
+    // zero_fetched_zero_candles: 1` on every weekend boot. The fix routes
+    // the non-trading-day case to LOW `HistoricalFetchAlreadyAvailable`
+    // (the same Low variant used for trading-day idempotent re-runs).
+    //
+    // Per audit-findings-2026-04-17 Rule 11, a FAILURE-class event whose
+    // denominator is structurally zero on the current calendar day is a
+    // false-positive. This guard pins the gate so a future revert fails
+    // the build.
+    let src = read_file("crates/app/src/main.rs");
+    assert!(
+        src.contains("zero_fetched_non_trading_day"),
+        "main.rs must define `zero_fetched_non_trading_day` binding so the \
+         non-trading-day fork of the zero-fetched routing is mechanically \
+         visible. Dropping it re-merges the weekend boot path back into \
+         HIGH HistoricalFetchFailed."
+    );
+    assert!(
+        src.contains("zero_fetched_no_actual_failures && !is_trading_day"),
+        "the non-trading-day gate MUST require BOTH \
+         `zero_fetched_no_actual_failures` AND `!is_trading_day`. Removing \
+         either conjunct either (a) suppresses real outages on weekends \
+         or (b) re-introduces the false-positive HIGH page."
+    );
+    // The Low routing branch MUST cover both the trading-day idempotent
+    // rerun (today_candle_presence > 0) AND the non-trading-day case.
+    assert!(
+        src.contains("today_candle_presence.unwrap_or(0) > 0 || zero_fetched_non_trading_day"),
+        "Low-severity HistoricalFetchAlreadyAvailable branch must cover \
+         BOTH the idempotent-rerun case (DB has today's candles) AND the \
+         non-trading-day case (market never opened, nothing to fetch). \
+         Dropping the `|| zero_fetched_non_trading_day` regresses to the \
+         pre-fix behaviour where every weekend boot pages HIGH."
+    );
+}

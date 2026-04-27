@@ -247,6 +247,15 @@ impl TickPersistenceWriter {
             Sender::from_conf(&conf_string).context("failed to connect to QuestDB via ILP")?;
         let buffer = sender.new_buffer();
 
+        // Eagerly publish `tv_questdb_connected=1.0` so the operator-health +
+        // tv-health "QuestDB" tiles flip GREEN immediately on first connect
+        // — instead of showing "No data" RED for ~30s while the
+        // `QuestDbHealthPoller` (which lives inside `run_tick_persistence_consumer`,
+        // started much later in main.rs) waits for its first tick. The poller
+        // continues to own the canonical source-of-truth for outage detection;
+        // this emission just sets a healthy initial value.
+        metrics::gauge!("tv_questdb_connected").set(1.0);
+
         Ok(Self {
             sender: Some(sender),
             buffer,
@@ -279,6 +288,13 @@ impl TickPersistenceWriter {
     pub fn new_disconnected(config: &QuestDbConfig) -> Self {
         let conf_string = config.build_ilp_conf_string();
         let buffer = Buffer::new(questdb::ingress::ProtocolVersion::V1);
+
+        // Mirror the connected path: publish `tv_questdb_connected=0.0` so the
+        // dashboard tile correctly reads RED "DOWN" from boot instead of
+        // "No data". Without this initial emission a fast-boot path that
+        // starts disconnected leaves the gauge unscraped → tile is "No data"
+        // RED, indistinguishable from a metrics-pipeline outage.
+        metrics::gauge!("tv_questdb_connected").set(0.0);
 
         Self {
             sender: None,
