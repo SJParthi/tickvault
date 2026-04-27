@@ -45,7 +45,12 @@ pub fn set_market_calendar(
 /// Read-only accessor for the global TradingCalendar. Returns `None`
 /// before `set_market_calendar` is called (e.g., in unit tests that
 /// construct a `WebSocketConnection` directly).
-fn market_calendar() -> Option<&'static Arc<tickvault_common::trading_calendar::TradingCalendar>> {
+///
+/// Visibility: `pub(crate)` so sibling modules under `websocket/`
+/// (depth_connection, order_update_connection) can share the same
+/// global handle for their post-close sleep paths.
+pub(crate) fn market_calendar()
+-> Option<&'static Arc<tickvault_common::trading_calendar::TradingCalendar>> {
     MARKET_CALENDAR.get()
 }
 
