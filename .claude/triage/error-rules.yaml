@@ -853,3 +853,164 @@ rules:
     justification: >-
       MOVERS-02 means option_movers ILP flush failed. Same
       diagnosis path as MOVERS-01 but the table is option_movers.
+
+  # -----------------------------------------------------------------------
+  # Wave 2 — resilience (Items 5–9)
+  # -----------------------------------------------------------------------
+
+  - name: ws-gap-04-post-close-sleep-silence
+    match:
+      code: WS-GAP-04
+    action: silence
+    runbook_path: .claude/rules/project/wave-2-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 86400
+    justification: >-
+      WS-GAP-04 is informational — a feed entered post-close sleep
+      until the next market open. Replaces the legacy give-up path.
+      Silence daily; only the Resumed event needs operator visibility.
+
+  - name: ws-gap-05-pool-respawn-escalate
+    match:
+      code: WS-GAP-05
+    action: escalate
+    runbook_path: .claude/rules/project/wave-2-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 60
+    justification: >-
+      WS-GAP-05 means the pool supervisor respawned a dead task.
+      Single respawn is recoverable; sustained rate >1/min for 5min
+      = cascading failure. Escalate so operator can correlate.
+
+  - name: ws-gap-06-tick-gap-summary-silence
+    match:
+      code: WS-GAP-06
+    action: silence
+    runbook_path: .claude/rules/project/wave-2-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 60
+    justification: >-
+      WS-GAP-06 is the 60s coalesced tick-gap summary. Telegram
+      already routes the summary event; the JSONL entry is for
+      audit only. Silence (cooldown matches the 60s coalesce window).
+
+  - name: auth-gap-03-token-force-renewal-on-wake-silence
+    match:
+      code: AUTH-GAP-03
+    action: silence
+    runbook_path: .claude/rules/project/wave-2-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 86400
+    justification: >-
+      AUTH-GAP-03 fires once per overnight sleep cycle when the
+      wake path force-renews a stale token before reconnecting.
+      Daily noise floor; silence.
+
+  - name: boot-01-questdb-slow-escalate
+    match:
+      code: BOOT-01
+    action: escalate
+    runbook_path: .claude/rules/project/wave-2-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      BOOT-01 means QuestDB took >30s to come ready. Cold starts
+      can be slow but consistent BOOT-01 indicates Docker / disk
+      issue. Escalate so operator can run make doctor.
+
+  - name: boot-02-deadline-exceeded-escalate
+    match:
+      code: BOOT-02
+    action: escalate
+    runbook_path: .claude/rules/project/wave-2-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      BOOT-02 = >60s with no QuestDB readiness. App halts. ALWAYS
+      escalate — never auto-restart Docker without operator review
+      because it may indicate a corrupted volume or partition.
+
+  - name: audit-01-phase2-write-failed-escalate
+    match:
+      code: AUDIT-01
+    action: escalate
+    runbook_path: .claude/rules/project/wave-2-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      Phase 2 audit write failure. SEBI-relevant — escalate.
+
+  - name: audit-02-depth-rebalance-write-failed-escalate
+    match:
+      code: AUDIT-02
+    action: escalate
+    runbook_path: .claude/rules/project/wave-2-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      Depth-rebalance audit write failure. Escalate so operator
+      can correlate with QuestDB health.
+
+  - name: audit-03-ws-reconnect-write-failed-escalate
+    match:
+      code: AUDIT-03
+    action: escalate
+    runbook_path: .claude/rules/project/wave-2-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      WS reconnect audit write failure. Escalate.
+
+  - name: audit-04-boot-write-failed-escalate
+    match:
+      code: AUDIT-04
+    action: escalate
+    runbook_path: .claude/rules/project/wave-2-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      Boot audit write failure. Escalate.
+
+  - name: audit-05-selftest-write-failed-escalate
+    match:
+      code: AUDIT-05
+    action: escalate
+    runbook_path: .claude/rules/project/wave-2-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      Selftest audit write failure. Escalate.
+
+  - name: audit-06-order-write-failed-escalate
+    match:
+      code: AUDIT-06
+    action: escalate
+    runbook_path: .claude/rules/project/wave-2-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      Order audit write failure. SEBI 5-year retention — ALWAYS
+      escalate immediately.
+
+  - name: storage-gap-03-audit-write-coalesce-escalate
+    match:
+      code: STORAGE-GAP-03
+    action: escalate
+    runbook_path: .claude/rules/project/wave-2-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      Coalesces AUDIT-01..06 — operator should see one of those
+      alongside this. Escalate.
+
+  - name: storage-gap-04-s3-archive-failed-escalate
+    match:
+      code: STORAGE-GAP-04
+    action: escalate
+    runbook_path: .claude/rules/project/wave-2-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 3600
+    justification: >-
+      S3 archive failure. Idempotency-key prevents re-archive;
+      next cycle will retry. Escalate so operator can verify
+      AWS credentials + bucket reachability.
