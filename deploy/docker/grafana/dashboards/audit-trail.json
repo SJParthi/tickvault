@@ -1,0 +1,132 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "Wave 2 Item 9 — audit trail dashboards for SEBI-grade reconstruction. 6 tables: phase2_audit, depth_rebalance_audit, ws_reconnect_audit, boot_audit, selftest_audit, order_audit. Retention: 90d hot in QuestDB, then S3 Intelligent-Tiering then Glacier per deploy/aws/s3-lifecycle-audit-tables.json. Runbook: .claude/rules/project/wave-2-error-codes.md.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "uid": "tv-audit-trail",
+  "title": "tickvault — Audit Trail (Wave 2)",
+  "tags": ["tickvault", "audit", "wave-2", "sebi"],
+  "timezone": "Asia/Kolkata",
+  "refresh": "1m",
+  "schemaVersion": 39,
+  "version": 1,
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Phase 2 outcomes today",
+      "id": 1,
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 0 },
+      "datasource": { "type": "questdb-questdb-datasource", "uid": "questdb" },
+      "targets": [
+        {
+          "rawSql": "SELECT outcome AS metric, count(*) AS value FROM phase2_audit WHERE ts >= dateadd('h', -24, now()) GROUP BY outcome",
+          "format": "table"
+        }
+      ],
+      "options": { "reduceOptions": { "values": true, "fields": "" } }
+    },
+    {
+      "type": "table",
+      "title": "Recent depth-rebalance swaps",
+      "id": 2,
+      "gridPos": { "h": 8, "w": 12, "x": 6, "y": 0 },
+      "datasource": { "type": "questdb-questdb-datasource", "uid": "questdb" },
+      "targets": [
+        {
+          "rawSql": "SELECT ts, underlying_symbol, old_atm_strike, new_atm_strike, swap_levels, outcome FROM depth_rebalance_audit WHERE ts >= dateadd('h', -6, now()) ORDER BY ts DESC LIMIT 25",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "WS reconnects today (per feed)",
+      "id": 3,
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 0 },
+      "datasource": { "type": "questdb-questdb-datasource", "uid": "questdb" },
+      "targets": [
+        {
+          "rawSql": "SELECT feed AS metric, count(*) AS value FROM ws_reconnect_audit WHERE ts >= dateadd('h', -24, now()) GROUP BY feed",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "type": "table",
+      "title": "Latest boot timeline",
+      "id": 4,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 5 },
+      "datasource": { "type": "questdb-questdb-datasource", "uid": "questdb" },
+      "targets": [
+        {
+          "rawSql": "SELECT ts, boot_id, step, outcome, elapsed_ms, detail FROM boot_audit WHERE boot_id = (SELECT boot_id FROM boot_audit ORDER BY ts DESC LIMIT 1) ORDER BY ts ASC",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Selftest outcomes (15m periodic)",
+      "id": 5,
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "datasource": { "type": "questdb-questdb-datasource", "uid": "questdb" },
+      "targets": [
+        {
+          "rawSql": "SELECT ts AS time, check_name AS metric, duration_ms AS value FROM selftest_audit WHERE ts >= dateadd('h', -24, now()) ORDER BY ts ASC",
+          "format": "time_series"
+        }
+      ]
+    },
+    {
+      "type": "table",
+      "title": "Recent order events (SEBI 5y retention)",
+      "id": 6,
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 16 },
+      "datasource": { "type": "questdb-questdb-datasource", "uid": "questdb" },
+      "targets": [
+        {
+          "rawSql": "SELECT ts, order_id, correlation_id, leg, event, security_id, segment, transaction_type, quantity, price, order_status, outcome FROM order_audit WHERE ts >= dateadd('h', -24, now()) ORDER BY ts DESC LIMIT 100",
+          "format": "table"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Audit write failures today (sum across 6 tables)",
+      "id": 7,
+      "gridPos": { "h": 5, "w": 12, "x": 0, "y": 13 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum(increase(tv_audit_write_failures_total[24h]))"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "red", "value": 5 }
+            ]
+          }
+        }
+      }
+    }
+  ]
+}
