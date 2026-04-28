@@ -25,6 +25,8 @@ ws_reader_frame_handle   = 5000         # <5μs  — STAGE-D P7.6: counter bump 
 phase2_compute_subscriptions = 1000000  # <1ms  — Plan item Q (2026-04-23): cold-path 09:13 dispatcher computes ATM±24 for 4 depth underlyings × 200-strike option chains. Measured ~4.3μs; 1ms budget gives ~230× headroom so accidental O(n²) regressions fail CI without being tight enough to flake on noisy runners.
 tick_gap_record_tick_steady_state = 500 # <500ns — Wave 2 Item 8.5: hot-path papaya pin().insert() with composite (security_id, segment) key. Budget covers papaya's epoch-list overhead; a regression to allocating .clone() on string fields would push median past this ceiling.
 tick_gap_scan_gaps_full_universe = 5000000 # <5ms — Wave 2 Item 8.5: cold-path scan over ~24K-entry map, runs once per 60s coalesce window. Budget is operator-visible latency, not hot-path.
+slo_score_evaluate_all_green = 1000      # <1µs — Wave 3-D Item 13: composite SLO score evaluator hot path (six clamps + five multiplies + 6-way min-scan). 1µs ceiling gives ~20× headroom over the measured median; regression past this size means a heap allocation or a powf entered the path.
+slo_score_evaluate_degraded = 1000       # <1µs — Wave 3-D Item 13: degraded path (find-weakest scan + threshold branches). Same budget as all-green.
 
 # Trading crate — OMS
 oms_state_transition     = 100          # <100ns — matches oms/state_transition

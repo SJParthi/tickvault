@@ -43,6 +43,12 @@ const REQUIRED_PANELS: &[(&str, &str)] = &[
         "Telegram dispatch rate (5m)",
         "tv_telegram_dispatched_total",
     ),
+    // Wave 3-D Item 13 — composite real-time guarantee score gauge.
+    // Single-glance answer to the operator's "is everything working?"
+    // question. Gauge (0..1), thresholds: green ≥ 0.95, orange [0.80,
+    // 0.95), red < 0.80. Runbook:
+    // .claude/rules/project/wave-3-d-error-codes.md
+    ("Real-time guarantee score", "tv_realtime_guarantee_score"),
 ];
 
 fn workspace_root() -> PathBuf {

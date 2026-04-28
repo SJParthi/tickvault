@@ -83,6 +83,11 @@ const REQUIRED_DASHBOARD_METRIC_PREFIXES: &[&str] = &[
     // market-movers.json. Prefix matches tv_movers_snapshot_duration_ms
     // and tv_movers_tracked_total.
     "tv_movers_",
+    // Wave 3-D Item 13: composite real-time guarantee score gauge.
+    // Matches `tv_realtime_guarantee_score`,
+    // `tv_realtime_guarantee_dimension`, and
+    // `tv_realtime_guarantee_evaluations_total`.
+    "tv_realtime_guarantee_",
 ];
 
 const CROSS_SEGMENT_TABLES: &[&str] = &[

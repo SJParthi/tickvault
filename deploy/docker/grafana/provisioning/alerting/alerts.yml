@@ -1280,3 +1280,44 @@ groups:
           description: "tv_self_test_total{result='degraded' or 'critical'} incremented in the last 24h. The 09:16:00 IST self-test detected a failure across one or more of the 8 sub-checks (main feed / depth-20 / depth-200 / order-update WS / pipeline / recent-tick / QuestDB / token-headroom). The Telegram payload lists the exact failed sub-checks. Runbook: .claude/rules/project/wave-3-c-error-codes.md (SELFTEST-02)."
         labels:
           severity: high
+
+      # Wave 3-D / SLO-02: composite real-time guarantee score < 0.95
+      # for 5 minutes. Sustained-condition channel (the per-tick rising
+      # edge fires Telegram via the in-process scheduler — this Prom
+      # alert covers the case where the SLO is stuck below 0.95 for an
+      # extended period without further tier transitions, e.g. a slow
+      # recurring spill drop every 12s that keeps spill_health = 0).
+      - uid: tv-realtime-score-degraded
+        title: "Wave 3-D SLO-02: real-time guarantee score < 0.95 for 5m"
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: prometheus
+            model:
+              expr: 'tv_realtime_guarantee_score'
+              intervalMs: 15000
+              maxDataPoints: 43200
+          - refId: B
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: lt, params: [0.95] }
+        noDataState: OK
+        execErrState: Alerting
+        for: 5m
+        annotations:
+          summary: "SLO-02: real-time guarantee score below 0.95 for 5m"
+          description: "tv_realtime_guarantee_score has been < 0.95 (Degraded or Critical band) for 5 minutes. Inspect tv_realtime_guarantee_dimension{name=*} gauges to identify the weakest dimension; each dimension has its own runbook. Composite-score runbook: .claude/rules/project/wave-3-d-error-codes.md (SLO-02)."
+        labels:
+          severity: high

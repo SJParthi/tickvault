@@ -227,16 +227,13 @@ pub enum ErrorCode {
     /// SELFTEST-02: market-open self-test detected a Critical or Degraded
     /// failure — operator action required.
     Selftest02Failed,
-
-    // -----------------------------------------------------------------------
-    // Wave 3 — Telegram dispatcher (Item 11)
-    // -----------------------------------------------------------------------
-    /// TELEGRAM-01: a Telegram event was dropped (queue full, send-after-retry
-    /// failure, or coalescer overflow). Operator alerts MAY be missed.
-    Telegram01Dropped,
-    /// TELEGRAM-02: coalescer state inconsistency (drain failed mid-window;
-    /// next drain self-recovers). Informational.
-    Telegram02CoalescerStateInconsistency,
+    /// SLO-01: composite real-time guarantee score recovered to healthy
+    /// (≥ 0.95) on the falling edge from a degraded period. Informational.
+    Slo01Healthy,
+    /// SLO-02: composite real-time guarantee score crossed below 0.95
+    /// (Degraded) or 0.80 (Critical). Edge-triggered on the rising edge
+    /// into a worse tier. Operator action required for `Critical`.
+    Slo02Degraded,
 
     // -----------------------------------------------------------------------
     // Wave 3 — Telegram dispatcher (Item 11)
@@ -382,6 +379,9 @@ impl ErrorCode {
             // Wave 3-C — market-open self-test (Item 12)
             Self::Selftest01Passed => "SELFTEST-01",
             Self::Selftest02Failed => "SELFTEST-02",
+            // Wave 3-D — composite real-time guarantee score (Item 13)
+            Self::Slo01Healthy => "SLO-01",
+            Self::Slo02Degraded => "SLO-02",
             // Dhan Trading API
             Self::Dh901InvalidAuth => "DH-901",
             Self::Dh902NoApiAccess => "DH-902",
@@ -430,7 +430,9 @@ impl ErrorCode {
             | Self::Boot03ClockSkewExceeded
             | Self::Selftest02Failed => Severity::Critical,
             // Info: positive-ping / lifecycle confirmations
-            Self::Selftest01Passed => Severity::Info,
+            Self::Selftest01Passed | Self::Slo01Healthy => Severity::Info,
+            // High: composite SLO degradation summary signal
+            Self::Slo02Degraded => Severity::High,
             // High: regulatory / order / risk / rate-limit
             Self::Dh904RateLimit
             | Self::Dh905InputException
@@ -573,6 +575,9 @@ impl ErrorCode {
             Self::Selftest01Passed | Self::Selftest02Failed => {
                 ".claude/rules/project/wave-3-c-error-codes.md"
             }
+            Self::Slo01Healthy | Self::Slo02Degraded => {
+                ".claude/rules/project/wave-3-d-error-codes.md"
+            }
             Self::Dh901InvalidAuth
             | Self::Dh902NoApiAccess
             | Self::Dh903AccountIssue
@@ -699,6 +704,8 @@ impl ErrorCode {
             Self::Telegram02CoalescerStateInconsistency,
             Self::Selftest01Passed,
             Self::Selftest02Failed,
+            Self::Slo01Healthy,
+            Self::Slo02Degraded,
         ]
     }
 }
@@ -857,7 +864,10 @@ mod tests {
         // (Telegram bucket-coalescer hardening).
         // 2026-04-28 (Wave 3-C Item 12): bumped 80 -> 82 for SELFTEST-01
         // (passed) + SELFTEST-02 (failed) — market-open self-test.
-        assert_eq!(ErrorCode::all().len(), 82);
+        // 2026-04-28 (Wave 3-D Item 13): bumped 82 -> 84 for SLO-01
+        // (healthy recovery) + SLO-02 (degraded/critical) — composite
+        // real-time guarantee score.
+        assert_eq!(ErrorCode::all().len(), 84);
     }
 
     #[test]
@@ -884,7 +894,9 @@ mod tests {
                 // Wave 3-B: Telegram dispatcher
                 || s.starts_with("TELEGRAM-")
                 // Wave 3-C: market-open self-test prefix
-                || s.starts_with("SELFTEST-");
+                || s.starts_with("SELFTEST-")
+                // Wave 3-D: composite real-time guarantee score
+                || s.starts_with("SLO-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }
