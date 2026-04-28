@@ -854,6 +854,20 @@ rules:
       MOVERS-02 means option_movers ILP flush failed. Same
       diagnosis path as MOVERS-01 but the table is option_movers.
 
+  - name: movers-03-preopen-persist-failed-escalate
+    match:
+      code: MOVERS-03
+    action: escalate
+    runbook_path: .claude/rules/project/wave-1-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 3600
+    justification: >-
+      MOVERS-03 means the pre-open (09:00-09:13 IST) movers snapshot
+      failed to persist to stock_movers with phase='PREOPEN'. The
+      audit trail for that morning's pre-open spread is lost — escalate
+      so operator can confirm QuestDB ILP TCP port is reachable before
+      the next trading day.
+
   # -----------------------------------------------------------------------
   # Wave 2 — resilience (Items 5–9)
   # -----------------------------------------------------------------------

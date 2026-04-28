@@ -114,6 +114,7 @@ const STOCK_MOVERS_CREATE_DDL: &str = "\
         change_pct DOUBLE,\
         volume LONG,\
         rank INT,\
+        phase SYMBOL,\
         ts TIMESTAMP\
     ) TIMESTAMP(ts) PARTITION BY DAY WAL\
 ";
@@ -172,6 +173,35 @@ const TOP_MOVERS_ALTER_DDL_TIMEFRAME: &str =
 const TOP_MOVERS_ALTER_DDL_SEGMENT: &str =
     "ALTER TABLE top_movers ADD COLUMN IF NOT EXISTS segment SYMBOL";
 
+/// Wave 3-A Item 10: idempotent ALTER for `stock_movers.phase` SYMBOL.
+///
+/// Differentiates pre-open (09:00-09:13 IST) snapshot rows from in-market
+/// rows. Values: `"PREOPEN"` (live pre-open data), `"PREOPEN_UNAVAILABLE"`
+/// (SENSEX/BSE which is not in the pre-open feed), `"MARKET"` (default for
+/// existing in-market writes via `append_stock_mover`).
+///
+/// `phase` is intentionally NOT in `DEDUP_KEY_MOVERS`: a single
+/// (security_id, segment, ts) row should not have two phases coexisting —
+/// the same row should replace itself if accidentally written twice with
+/// different phases (the latest write wins).
+const STOCK_MOVERS_ALTER_DDL_PHASE: &str =
+    "ALTER TABLE stock_movers ADD COLUMN IF NOT EXISTS phase SYMBOL";
+
+/// Wire constant for the default in-market phase. Existing
+/// `append_stock_mover` callers route through this value so historic
+/// rows remain query-compatible after the ALTER.
+pub const STOCK_MOVERS_PHASE_MARKET: &str = "MARKET";
+
+/// Wave 3-A Item 10: pre-open phase value for live pre-open snapshot rows.
+pub const STOCK_MOVERS_PHASE_PREOPEN: &str = "PREOPEN";
+
+/// Wave 3-A Item 10: pre-open phase value for instruments that are NOT in
+/// the pre-open feed (SENSEX / BSE). These rows are emitted with zeroed
+/// price columns + this phase so the dashboard can prove "we KNEW it was
+/// not available, we did not silently skip" — distinguishes "no data" from
+/// "feed broken".
+pub const STOCK_MOVERS_PHASE_PREOPEN_UNAVAILABLE: &str = "PREOPEN_UNAVAILABLE";
+
 /// DEDUP key for `top_movers`. Includes `timeframe` so the same rank
 /// position at the same second across DIFFERENT timeframes (1m vs 5m
 /// rankings) does not collide. Includes `security_id` + `segment` so
@@ -229,6 +259,10 @@ struct BufferedStockMover {
     prev_close: f64,
     change_pct: f64,
     volume: i64,
+    /// Wave 3-A Item 10: snapshot phase. Defaults to `STOCK_MOVERS_PHASE_MARKET`
+    /// for in-market writes; pre-open writes set `STOCK_MOVERS_PHASE_PREOPEN`
+    /// or `STOCK_MOVERS_PHASE_PREOPEN_UNAVAILABLE` (SENSEX).
+    phase: String,
 }
 
 /// A buffered option mover entry — same rationale as `BufferedStockMover`.
@@ -363,6 +397,8 @@ impl StockMoversWriter {
             .context("segment")?
             .symbol("symbol", &row.symbol)
             .context("symbol")?
+            .symbol("phase", &row.phase)
+            .context("phase")?
             .column_i64("security_id", i64::from(row.security_id))
             .context("security_id")?
             .column_f64("ltp", row.ltp)
@@ -410,6 +446,51 @@ impl StockMoversWriter {
         change_pct: f64,
         volume: i64,
     ) -> Result<()> {
+        // In-market default: phase = "MARKET". Pre-open callers must use
+        // `append_stock_mover_with_phase` directly.
+        self.append_stock_mover_with_phase(
+            ts_nanos,
+            category,
+            rank,
+            security_id,
+            segment,
+            symbol,
+            ltp,
+            prev_close,
+            change_pct,
+            volume,
+            STOCK_MOVERS_PHASE_MARKET,
+        )
+    }
+
+    /// Wave 3-A Item 10: append a stock mover row with an explicit `phase`
+    /// label. Used by the pre-open movers tracker to differentiate
+    /// 09:00-09:13 IST snapshot rows from in-market rows.
+    ///
+    /// `phase` values are pinned by `STOCK_MOVERS_PHASE_*` constants:
+    /// - `MARKET` — default in-market writes (delegated from
+    ///   `append_stock_mover`).
+    /// - `PREOPEN` — pre-open snapshot row with live data.
+    /// - `PREOPEN_UNAVAILABLE` — pre-open row for an instrument NOT in the
+    ///   pre-open feed (SENSEX/BSE). Price columns are zeroed; the row
+    ///   exists so the dashboard can prove the absence is intentional.
+    #[allow(clippy::too_many_arguments)]
+    // APPROVED: 11 params — each maps to a QuestDB column or schema label,
+    // no abstraction reduces this without obscuring the call site.
+    pub fn append_stock_mover_with_phase(
+        &mut self,
+        ts_nanos: i64,
+        category: &str,
+        rank: i32,
+        security_id: u32,
+        segment: &str,
+        symbol: &str,
+        ltp: f64,
+        prev_close: f64,
+        change_pct: f64,
+        volume: i64,
+        phase: &str,
+    ) -> Result<()> {
         // Round all f64 values to 2dp to prevent IEEE 754 artifacts in QuestDB.
         let row = BufferedStockMover {
             ts_nanos,
@@ -422,6 +503,7 @@ impl StockMoversWriter {
             prev_close: (prev_close * 100.0).round() / 100.0,
             change_pct: (change_pct * 100.0).round() / 100.0,
             volume,
+            phase: phase.to_string(),
         };
 
         // DB-2: push to rescue ring BEFORE the ILP buffer. If the ring
@@ -1243,6 +1325,17 @@ pub async fn ensure_movers_tables(questdb_config: &QuestDbConfig) {
     // Create stock_movers table
     execute_ddl(&client, &base_url, STOCK_MOVERS_CREATE_DDL, "stock_movers").await;
 
+    // Wave 3-A Item 10: idempotent ALTER ADD COLUMN IF NOT EXISTS for `phase`.
+    // QuestDB ignores ADDs that already exist, so this is safe to run every boot.
+    // Existing pre-`phase` deployments self-heal at the next boot.
+    execute_ddl(
+        &client,
+        &base_url,
+        STOCK_MOVERS_ALTER_DDL_PHASE,
+        "stock_movers ADD COLUMN phase",
+    )
+    .await;
+
     // Enable DEDUP on stock_movers
     let dedup_sql = format!(
         "ALTER TABLE {} DEDUP ENABLE UPSERT KEYS(ts, {})",
@@ -1827,6 +1920,7 @@ mod tests {
             prev_close: 99.0,
             change_pct: 1.0,
             volume: 100_000,
+            phase: STOCK_MOVERS_PHASE_MARKET.to_string(),
         }
     }
 
