@@ -118,7 +118,14 @@ impl MarketOpenSelfTestOutcome {
 /// Total number of sub-checks the evaluator runs. Wire-stable: the
 /// audit `detail` column references this count, and the SCOPE §12.5
 /// test asserts it.
-pub const TOTAL_SUB_CHECKS: usize = 7;
+///
+/// SCOPE §12.1 lists 7 ordinal sub-checks but the evaluator runs 8
+/// `if` arms (it splits "depth" into `depth_20_active` and
+/// `depth_200_active` because those WS pools are independent). This
+/// constant matches the implementation, not the SCOPE wording.
+/// Adversarial review (hot-path-reviewer, 2026-04-28) caught the
+/// off-by-one between `7` and the actual `8` `if` checks.
+pub const TOTAL_SUB_CHECKS: usize = 8;
 
 /// Token-expiry headroom threshold below which the self-test fires
 /// `Critical`. 4 hours = 14_400 seconds. Matches the existing
@@ -223,7 +230,7 @@ mod tests {
         let outcome = evaluate_self_test(&green_inputs());
         assert_eq!(
             outcome,
-            MarketOpenSelfTestOutcome::Passed { checks_passed: 7 }
+            MarketOpenSelfTestOutcome::Passed { checks_passed: 8 }
         );
         assert_eq!(outcome.error_code(), ErrorCode::Selftest01Passed);
         assert_eq!(outcome.outcome_str(), "passed");
@@ -278,7 +285,7 @@ mod tests {
             } => {
                 assert!(failed.contains(&"pipeline_active"));
                 assert_eq!(checks_failed, 1);
-                assert_eq!(checks_passed, 6);
+                assert_eq!(checks_passed, 7);
             }
             other => panic!("expected Degraded, got {other:?}"),
         }
@@ -325,7 +332,7 @@ mod tests {
     /// without flipping a test red.
     #[test]
     fn test_self_test_constants_pinned() {
-        assert_eq!(TOTAL_SUB_CHECKS, 7);
+        assert_eq!(TOTAL_SUB_CHECKS, 8);
         assert_eq!(TOKEN_EXPIRY_HEADROOM_CRITICAL_SECS, 14_400);
         assert_eq!(RECENT_TICK_DEGRADED_THRESHOLD_SECS, 60);
         assert_eq!(CRITICAL_CHECK_NAMES.len(), 3);

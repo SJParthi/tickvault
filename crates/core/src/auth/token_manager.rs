@@ -927,8 +927,16 @@ impl TokenManager {
     /// Wave 3-C Item 12 — seconds until token expiry, for the
     /// market-open self-test sub-check `token_expiry_headroom`.
     ///
-    /// Returns 0 when no token is loaded (treated as "expired" by the
-    /// self-test, which then escalates to Critical).
+    /// Returns 0 in two distinct fail-closed cases:
+    /// 1. No token is loaded (boot-time or pre-auth state).
+    /// 2. The loaded token has already passed its expiry timestamp —
+    ///    `time_until_refresh(0)` saturates to `Duration::ZERO`.
+    ///
+    /// Both cases route the self-test to `Critical` because the
+    /// `token_expiry_headroom_secs < TOKEN_EXPIRY_HEADROOM_CRITICAL_SECS`
+    /// (= 14_400) check trips on 0. Adversarial review
+    /// (security-reviewer, 2026-04-28) flagged the original doc-comment
+    /// for not naming the second case explicitly.
     #[must_use]
     pub fn seconds_until_expiry(&self) -> u64 {
         let guard = self.token.load();
