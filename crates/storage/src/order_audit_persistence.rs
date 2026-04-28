@@ -125,9 +125,13 @@ pub async fn append_order_audit_row(
         );
         0.0
     };
+    // QuestDB TIMESTAMP columns store microseconds since epoch. The
+    // caller passes IST wall-clock nanoseconds; divide by 1_000 before
+    // embedding so the value stays in the QuestDB year-9999 range.
+    let ts_micros_ist = ts_nanos_ist / 1_000;
     let sql = format!(
         "INSERT INTO {QUESTDB_TABLE_ORDER_AUDIT} (ts, order_id, correlation_id, leg, event, security_id, segment, transaction_type, quantity, price, order_status, outcome, detail) VALUES \
-         ({ts_nanos_ist}, '{order_id_esc}', '{corr_esc}', '{leg_esc}', '{event_esc}', {security_id}, '{seg_esc}', '{txn_esc}', {quantity}, {safe_price}, '{status_esc}', '{outcome_esc}', '{detail_esc}');"
+         ({ts_micros_ist}, '{order_id_esc}', '{corr_esc}', '{leg_esc}', '{event_esc}', {security_id}, '{seg_esc}', '{txn_esc}', {quantity}, {safe_price}, '{status_esc}', '{outcome_esc}', '{detail_esc}');"
     );
     let resp = client
         .get(&base_url)
@@ -193,5 +197,18 @@ mod tests {
         )
         .await;
         assert!(result.is_err());
+    }
+
+    /// Regression: 2026-04-28 — see phase2_audit_persistence.rs for the
+    /// nanos-to-micros bug class. Source-scan ratchet locks the fix.
+    /// SEBI 5-year retention applies to this table; a silent insert
+    /// failure is a regulatory risk.
+    #[test]
+    fn test_insert_sql_uses_microseconds_not_nanoseconds() {
+        let src = include_str!("order_audit_persistence.rs");
+        assert!(
+            src.contains("ts_micros_ist = ts_nanos_ist / 1_000"),
+            "INSERT must convert nanos to micros before embedding"
+        );
     }
 }

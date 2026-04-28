@@ -13,7 +13,10 @@ use tickvault_common::config::QuestDbConfig;
 use tickvault_common::sanitize::sanitize_audit_string;
 
 pub const QUESTDB_TABLE_SELFTEST_AUDIT: &str = "selftest_audit";
-pub const DEDUP_KEY_SELFTEST_AUDIT: &str = "trading_date_ist, check_name";
+// QuestDB requires the designated timestamp column to be present in
+// DEDUP UPSERT KEYS — without `ts` the CREATE TABLE returned 400 Bad Request
+// on 2026-04-28 boot, leaving the table missing for the entire session.
+pub const DEDUP_KEY_SELFTEST_AUDIT: &str = "trading_date_ist, check_name, ts";
 
 const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 
@@ -85,9 +88,14 @@ pub async fn append_selftest_audit_row(
     let check_esc = sanitize_audit_string(check_name);
     let outcome_esc = sanitize_audit_string(outcome);
     let detail_esc = sanitize_audit_string(detail);
+    // QuestDB TIMESTAMP columns store microseconds since epoch. The
+    // caller passes IST wall-clock nanoseconds; divide by 1_000 before
+    // embedding so the value stays in the QuestDB year-9999 range.
+    let ts_micros_ist = ts_nanos_ist / 1_000;
+    let trading_date_ist_micros = trading_date_ist_nanos / 1_000;
     let sql = format!(
         "INSERT INTO {QUESTDB_TABLE_SELFTEST_AUDIT} (ts, trading_date_ist, check_name, outcome, duration_ms, detail) VALUES \
-         ({ts_nanos_ist}, {trading_date_ist_nanos}, '{check_esc}', '{outcome_esc}', {duration_ms}, '{detail_esc}');"
+         ({ts_micros_ist}, {trading_date_ist_micros}, '{check_esc}', '{outcome_esc}', {duration_ms}, '{detail_esc}');"
     );
     let resp = client
         .get(&base_url)
@@ -119,6 +127,34 @@ mod tests {
     fn test_dedup_key_no_security_id() {
         assert!(!DEDUP_KEY_SELFTEST_AUDIT.contains("security_id"));
         assert!(DEDUP_KEY_SELFTEST_AUDIT.contains("check_name"));
+    }
+
+    /// Regression: 2026-04-28 — QuestDB requires the designated timestamp
+    /// column to be present in DEDUP UPSERT KEYS. Without `ts` the CREATE
+    /// TABLE returned 400 Bad Request and the table was missing for the
+    /// entire session, silently breaking every selftest audit write.
+    #[test]
+    fn test_dedup_key_includes_designated_timestamp() {
+        assert!(
+            DEDUP_KEY_SELFTEST_AUDIT.contains("ts"),
+            "selftest_audit DEDUP key must include `ts` (designated timestamp); \
+             QuestDB rejects DDL otherwise. Got: {DEDUP_KEY_SELFTEST_AUDIT}"
+        );
+    }
+
+    /// Regression: 2026-04-28 — see boot_audit_persistence.rs for the
+    /// nanos-to-micros bug class. Source-scan ratchet locks the fix.
+    #[test]
+    fn test_insert_sql_uses_microseconds_not_nanoseconds() {
+        let src = include_str!("selftest_audit_persistence.rs");
+        assert!(
+            src.contains("ts_micros_ist = ts_nanos_ist / 1_000"),
+            "INSERT must convert nanos to micros before embedding"
+        );
+        assert!(
+            src.contains("trading_date_ist_micros = trading_date_ist_nanos / 1_000"),
+            "INSERT must convert trading_date_ist nanos to micros"
+        );
     }
 
     #[test]
