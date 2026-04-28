@@ -327,6 +327,57 @@ class DiffSubscriptionsTests(unittest.TestCase):
         self.assertEqual(to_add, {self._sub(3), self._sub(4)})
 
 
+class BridgeMetricsTests(unittest.TestCase):
+    def test_counter_increments_per_frame(self) -> None:
+        m = bridge.BridgeMetrics()
+        m.inc_frames(72265, "BID", "NSE_FNO")
+        m.inc_frames(72265, "BID", "NSE_FNO")
+        m.inc_frames(72265, "ASK", "NSE_FNO")
+        out = m.render_prometheus().decode("utf-8")
+        self.assertIn(
+            'tv_depth_200_bridge_frames_total{security_id="72265",side="BID",segment="NSE_FNO"} 2',
+            out,
+        )
+        self.assertIn(
+            'tv_depth_200_bridge_frames_total{security_id="72265",side="ASK",segment="NSE_FNO"} 1',
+            out,
+        )
+
+    def test_reconnect_counter_tracked_per_sid(self) -> None:
+        m = bridge.BridgeMetrics()
+        m.inc_reconnects(72265)
+        m.inc_reconnects(72265)
+        m.inc_reconnects(67522)
+        out = m.render_prometheus().decode("utf-8")
+        self.assertIn('tv_depth_200_bridge_reconnects_total{security_id="72265"} 2', out)
+        self.assertIn('tv_depth_200_bridge_reconnects_total{security_id="67522"} 1', out)
+
+    def test_gauges_render_without_label(self) -> None:
+        m = bridge.BridgeMetrics()
+        m.set_active_subscriptions(4)
+        m.set_state_version(7)
+        out = m.render_prometheus().decode("utf-8")
+        self.assertIn("tv_depth_200_bridge_active_subscriptions 4", out)
+        self.assertIn("tv_depth_200_bridge_state_version 7", out)
+
+    def test_ilp_failure_counter_separate_from_writes(self) -> None:
+        m = bridge.BridgeMetrics()
+        m.inc_ilp_writes()
+        m.inc_ilp_writes()
+        m.inc_ilp_failures()
+        out = m.render_prometheus().decode("utf-8")
+        self.assertIn("tv_depth_200_bridge_ilp_writes_total 2", out)
+        self.assertIn("tv_depth_200_bridge_ilp_failures_total 1", out)
+
+    def test_prometheus_format_includes_help_and_type(self) -> None:
+        m = bridge.BridgeMetrics()
+        out = m.render_prometheus().decode("utf-8")
+        # Per Prometheus spec, every metric must have HELP + TYPE comments.
+        self.assertIn("# HELP tv_depth_200_bridge_frames_total", out)
+        self.assertIn("# TYPE tv_depth_200_bridge_frames_total counter", out)
+        self.assertIn("# TYPE tv_depth_200_bridge_active_subscriptions gauge", out)
+
+
 class CredentialLoadingTests(unittest.TestCase):
     def test_env_takes_precedence_over_cache(self) -> None:
         import os

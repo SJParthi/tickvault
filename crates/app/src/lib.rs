@@ -14,6 +14,7 @@
 #![cfg_attr(test, allow(clippy::field_reassign_with_default))]
 
 pub mod boot_helpers;
+pub mod depth_bridge_state_writer;
 pub mod greeks_pipeline;
 pub mod infra;
 pub mod movers_v2_pipeline;

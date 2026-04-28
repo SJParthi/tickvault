@@ -2043,6 +2043,15 @@ async fn main() -> Result<()> {
         );
     }
 
+    // 2026-04-28 audit gap closure: spawn the disk-health watcher.
+    // Closes the highest-risk hole in the zero-loss chain ("disk full +
+    // QuestDB down simultaneously"). Operator now gets ~hours of warning
+    // via `tv_spill_dir_free_bytes` gauge before the spill disk fills.
+    let _disk_health_watcher_handle =
+        tickvault_storage::disk_health_watcher::spawn_spill_disk_health_watcher(
+            std::path::PathBuf::from("data/spill"),
+        );
+
     // Health status — created early so tick persistence status can be set.
     let health_status: SharedHealthStatus = std::sync::Arc::new(SystemHealthStatus::new());
 
@@ -2946,6 +2955,19 @@ async fn main() -> Result<()> {
             // handshakes land ~2s apart instead of all within 100ms.
             let mut depth_200_spawn_index: u64 = 0;
 
+            // Python depth-200 sidecar bridge: accumulate the 4 ATM SIDs as
+            // each underlying's selection is computed, then write the state
+            // file after the loop. The Python sidecar polls mtime every 1s
+            // and reconciles its own subscription set when version changes.
+            let depth_bridge_state_writer = std::sync::Arc::new(
+                tickvault_app::depth_bridge_state_writer::DepthBridgeStateWriter::new(
+                    tickvault_app::depth_bridge_state_writer::DEFAULT_DEPTH_BRIDGE_STATE_PATH,
+                ),
+            );
+            let mut depth_bridge_subs: Vec<
+                tickvault_app::depth_bridge_state_writer::DepthBridgeSubscription,
+            > = Vec::with_capacity(4);
+
             for underlying in &depth_underlyings {
                 // Look up the ATM selection for this underlying.
                 let selection = depth_selections
@@ -3651,8 +3673,37 @@ async fn main() -> Result<()> {
                         }
                     }
                     // O(1) EXEMPT: end
+                    // Push the 4 ATM SIDs we just spawned native depth-200
+                    // connections for, so the Python sidecar bridge can pick
+                    // them up via the state file and run as a guaranteed
+                    // fallback path while the native client flaps.
+                    if let Some(sid) = atm_ce_sid {
+                        depth_bridge_subs.push(
+                            tickvault_app::depth_bridge_state_writer::DepthBridgeSubscription {
+                                security_id: sid,
+                                segment: "NSE_FNO",
+                                label: Some(atm_ce_label.to_string()),
+                            },
+                        );
+                    }
+                    if let Some(sid) = atm_pe_sid {
+                        depth_bridge_subs.push(
+                            tickvault_app::depth_bridge_state_writer::DepthBridgeSubscription {
+                                security_id: sid,
+                                segment: "NSE_FNO",
+                                label: Some(atm_pe_label.to_string()),
+                            },
+                        );
+                    }
                 } // end if NIFTY || BANKNIFTY (200-level guard)
             }
+
+            // After the depth-200 spawn loop completes, write the initial
+            // state file so the Python sidecar can begin streaming. Token
+            // is intentionally NOT in this file — Python falls back to
+            // data/cache/tv-token-cache (already kept fresh by the Rust
+            // TokenManager). Rebalance updates are a follow-up commit.
+            depth_bridge_state_writer.write_or_log(&ws_client_id, &depth_bridge_subs);
         }
     } else if config.subscription.enable_twenty_depth {
         info!("depth connections skipped — WebSocket connections not active");

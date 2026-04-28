@@ -106,6 +106,11 @@ DHAN_FULL_DEPTH_BASE = "wss://full-depth-api.dhan.co"
 TOKEN_CACHE_PATH = "data/cache/tv-token-cache"
 DEPTH_TABLE = "deep_market_depth"
 
+# Prometheus exposition endpoint defaults. Operator can override via
+# --metrics-port; setting --metrics-port 0 disables the endpoint.
+DEFAULT_METRICS_PORT = 9092
+METRICS_NAMESPACE = "tv_depth_200_bridge"
+
 # Default path that the Rust app's state writer (follow-up commit)
 # atomically writes whenever the access token rotates or the depth
 # rebalancer swaps an ATM contract. Operator can override with
@@ -205,6 +210,143 @@ def diff_subscriptions(
     old_set = set(old)
     new_set = set(new)
     return old_set - new_set, new_set - old_set
+
+
+# ---------------------------------------------------------------------------
+# Prometheus metrics — stdlib-only exposition (no client_python dep)
+# ---------------------------------------------------------------------------
+class BridgeMetrics:
+    """Thread-safe in-memory metric registry served via /metrics endpoint.
+
+    All counters are monotonic, all gauges are snapshotted at scrape time.
+    Output matches the Prometheus text exposition format 0.0.4 so any
+    scraper (Prometheus, VictoriaMetrics, OpenTelemetry collector) can
+    ingest it without adapter code.
+    """
+
+    def __init__(self) -> None:
+        self._lock = __import__("threading").Lock()
+        # Counters: monotonic, exposed as Prometheus `counter` type.
+        self.frames_total: dict[tuple[int, str, str], int] = {}  # (sid, side, segment) -> count
+        self.reconnects_total: dict[int, int] = {}  # sid -> count
+        self.ilp_writes_total: int = 0
+        self.ilp_failures_total: int = 0
+        self.state_reloads_total: int = 0
+        # Gauges: instantaneous, exposed as Prometheus `gauge` type.
+        self.active_subscriptions: int = 0
+        self.state_version: int = 0
+        self.last_frame_unix_secs: float = 0.0
+
+    def inc_frames(self, sid: int, side: str, segment: str, delta: int = 1) -> None:
+        key = (sid, side, segment)
+        with self._lock:
+            self.frames_total[key] = self.frames_total.get(key, 0) + delta
+            self.last_frame_unix_secs = time.time()
+
+    def inc_reconnects(self, sid: int) -> None:
+        with self._lock:
+            self.reconnects_total[sid] = self.reconnects_total.get(sid, 0) + 1
+
+    def inc_ilp_writes(self) -> None:
+        with self._lock:
+            self.ilp_writes_total += 1
+
+    def inc_ilp_failures(self) -> None:
+        with self._lock:
+            self.ilp_failures_total += 1
+
+    def inc_state_reloads(self) -> None:
+        with self._lock:
+            self.state_reloads_total += 1
+
+    def set_active_subscriptions(self, n: int) -> None:
+        with self._lock:
+            self.active_subscriptions = n
+
+    def set_state_version(self, v: int) -> None:
+        with self._lock:
+            self.state_version = v
+
+    def render_prometheus(self) -> bytes:
+        """Render the full metric snapshot as Prometheus text format."""
+        with self._lock:
+            lines: list[str] = []
+            lines.append(f"# HELP {METRICS_NAMESPACE}_frames_total Depth frames parsed")
+            lines.append(f"# TYPE {METRICS_NAMESPACE}_frames_total counter")
+            for (sid, side, segment), count in sorted(self.frames_total.items()):
+                lines.append(
+                    f'{METRICS_NAMESPACE}_frames_total{{security_id="{sid}",'
+                    f'side="{side}",segment="{segment}"}} {count}'
+                )
+            lines.append(f"# HELP {METRICS_NAMESPACE}_reconnects_total WebSocket reconnects")
+            lines.append(f"# TYPE {METRICS_NAMESPACE}_reconnects_total counter")
+            for sid, count in sorted(self.reconnects_total.items()):
+                lines.append(
+                    f'{METRICS_NAMESPACE}_reconnects_total{{security_id="{sid}"}} {count}'
+                )
+            lines.append(f"# HELP {METRICS_NAMESPACE}_ilp_writes_total ILP TCP writes to QuestDB")
+            lines.append(f"# TYPE {METRICS_NAMESPACE}_ilp_writes_total counter")
+            lines.append(f"{METRICS_NAMESPACE}_ilp_writes_total {self.ilp_writes_total}")
+            lines.append(f"# HELP {METRICS_NAMESPACE}_ilp_failures_total ILP TCP write failures")
+            lines.append(f"# TYPE {METRICS_NAMESPACE}_ilp_failures_total counter")
+            lines.append(f"{METRICS_NAMESPACE}_ilp_failures_total {self.ilp_failures_total}")
+            lines.append(f"# HELP {METRICS_NAMESPACE}_state_reloads_total State-file reloads")
+            lines.append(f"# TYPE {METRICS_NAMESPACE}_state_reloads_total counter")
+            lines.append(f"{METRICS_NAMESPACE}_state_reloads_total {self.state_reloads_total}")
+            lines.append(f"# HELP {METRICS_NAMESPACE}_active_subscriptions Active depth-200 subs")
+            lines.append(f"# TYPE {METRICS_NAMESPACE}_active_subscriptions gauge")
+            lines.append(
+                f"{METRICS_NAMESPACE}_active_subscriptions {self.active_subscriptions}"
+            )
+            lines.append(f"# HELP {METRICS_NAMESPACE}_state_version Last loaded state version")
+            lines.append(f"# TYPE {METRICS_NAMESPACE}_state_version gauge")
+            lines.append(f"{METRICS_NAMESPACE}_state_version {self.state_version}")
+            lines.append(
+                f"# HELP {METRICS_NAMESPACE}_last_frame_unix_secs Wall-clock of last frame"
+            )
+            lines.append(f"# TYPE {METRICS_NAMESPACE}_last_frame_unix_secs gauge")
+            lines.append(
+                f"{METRICS_NAMESPACE}_last_frame_unix_secs {self.last_frame_unix_secs}"
+            )
+            return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+# Module-level singleton so any task can record metrics without plumbing it through.
+METRICS = BridgeMetrics()
+
+
+def start_metrics_server(port: int) -> Optional["object"]:
+    """Bind a background HTTP server on `port` exposing /metrics. Returns None
+    if `port == 0` (operator-disabled). The server runs in a daemon thread
+    so it cannot block process shutdown."""
+    if port <= 0:
+        logging.info("metrics endpoint disabled (--metrics-port=0)")
+        return None
+    import http.server
+    import threading
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802 - stdlib API
+            if self.path != "/metrics":
+                self.send_response(404)
+                self.end_headers()
+                return
+            payload = METRICS.render_prometheus()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; version=0.0.4")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        # Suppress noisy default access logs — bridge logs go via tracing.
+        def log_message(self, fmt: str, *args: object) -> None:  # noqa: ARG002
+            return
+
+    server = http.server.HTTPServer(("0.0.0.0", port), _Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True, name="bridge-metrics")
+    thread.start()
+    logging.info("metrics endpoint listening on :%d/metrics", port)
+    return server
 
 
 def load_credentials() -> tuple[str, str]:
@@ -415,7 +557,13 @@ async def run_subscription(
                         levels,
                         received_nanos,
                     )
-                    sender.send(payload)
+                    try:
+                        sender.send(payload)
+                        METRICS.inc_ilp_writes()
+                    except Exception:  # noqa: BLE001 - record + re-raise
+                        METRICS.inc_ilp_failures()
+                        raise
+                    METRICS.inc_frames(parsed_sid, side, seg_str, delta=1)
                     frames += 1
                     if frames % 200 == 0:
                         logging.info(
@@ -431,6 +579,7 @@ async def run_subscription(
             logging.warning(
                 "[%s] connection error: %s — backoff %.1fs", label, err, backoff
             )
+            METRICS.inc_reconnects(sub.security_id)
         if stop.is_set():
             break
         await asyncio.sleep(backoff)
@@ -542,6 +691,8 @@ async def main_async_with_state_file(
 
     for sub in current_state.subscriptions:
         tasks[sub] = _spawn(sub)
+    METRICS.set_active_subscriptions(len(tasks))
+    METRICS.set_state_version(current_state.version)
     logging.info(
         "state-file mode: spawned %d subscription(s) at version=%d",
         len(tasks),
@@ -619,6 +770,9 @@ async def main_async_with_state_file(
                         tasks[sub] = _spawn(sub)
 
             current_state = new_state
+            METRICS.inc_state_reloads()
+            METRICS.set_active_subscriptions(len(tasks))
+            METRICS.set_state_version(current_state.version)
     finally:
         for task in tasks.values():
             task.cancel()
@@ -659,6 +813,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--questdb-host", default="127.0.0.1")
     parser.add_argument("--questdb-ilp-port", type=int, default=9009)
     parser.add_argument(
+        "--metrics-port",
+        type=int,
+        default=DEFAULT_METRICS_PORT,
+        help=(
+            "Port for the Prometheus /metrics endpoint (default: %(default)d). "
+            "Set to 0 to disable. Scrape with: curl http://127.0.0.1:<port>/metrics"
+        ),
+    )
+    parser.add_argument(
         "--log-level",
         default="INFO",
         choices=("DEBUG", "INFO", "WARNING", "ERROR"),
@@ -677,6 +840,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         stream=sys.stderr,
     )
     sender = IlpSender(args.questdb_host, args.questdb_ilp_port)
+    start_metrics_server(args.metrics_port)
 
     if args.state_file:
         logging.info(
