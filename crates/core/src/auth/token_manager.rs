@@ -924,6 +924,20 @@ impl TokenManager {
         }
     }
 
+    /// Wave 3-C Item 12 — seconds until token expiry, for the
+    /// market-open self-test sub-check `token_expiry_headroom`.
+    ///
+    /// Returns 0 when no token is loaded (treated as "expired" by the
+    /// self-test, which then escalates to Critical).
+    #[must_use]
+    pub fn seconds_until_expiry(&self) -> u64 {
+        let guard = self.token.load();
+        match guard.as_ref().as_ref() {
+            Some(state) => state.time_until_refresh(0).as_secs(),
+            None => 0,
+        }
+    }
+
     /// Wave 2 Item 5.4 (AUTH-GAP-03) — proactive token renewal on
     /// wake-from-sleep.
     ///
@@ -2942,6 +2956,36 @@ mod tests {
         assert!(
             mgr.next_renewal_at().is_none(),
             "next_renewal_at must return None when no token is loaded"
+        );
+    }
+
+    #[test]
+    fn test_seconds_until_expiry_is_zero_when_no_token() {
+        let mgr = make_test_manager(None);
+        assert_eq!(
+            mgr.seconds_until_expiry(),
+            0,
+            "no token loaded => zero headroom (escalates self-test to Critical)"
+        );
+    }
+
+    #[test]
+    fn test_seconds_until_expiry_returns_positive_when_token_fresh() {
+        let response = DhanAuthResponseData {
+            access_token: "eyJfresh".to_string(),
+            token_type: "Bearer".to_string(),
+            expires_in: 86_400,
+        };
+        let state = TokenState::from_response(&response);
+        let mgr = make_test_manager(Some(state));
+        let secs = mgr.seconds_until_expiry();
+        assert!(
+            secs > 0,
+            "fresh token (24h validity) must report positive headroom; got {secs}"
+        );
+        assert!(
+            secs <= 86_400,
+            "headroom cannot exceed token's full validity; got {secs}"
         );
     }
 
