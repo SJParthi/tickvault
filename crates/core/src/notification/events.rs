@@ -868,6 +868,73 @@ pub enum NotificationEvent {
 
     /// Custom alert from any component.
     Custom { message: String },
+
+    // -----------------------------------------------------------------------
+    // Depth-200 SELF token alternate auth path
+    // (2026-04-28 — see `docs/architecture/depth-200-self-token-design.md`)
+    // -----------------------------------------------------------------------
+    /// Boot fetched and validated a SELF JWT from AWS SSM.
+    Depth200SelfTokenLoaded {
+        /// SSM parameter path the token was read from.
+        ssm_parameter: String,
+        /// Hours of validity remaining at boot.
+        hours_remaining: f64,
+    },
+
+    /// 23h renewal cycle succeeded — RenewToken extended the SELF JWT
+    /// and PutParameter wrote the new value back to SSM.
+    Depth200SelfTokenRenewed {
+        /// SSM parameter path that was overwritten.
+        ssm_parameter: String,
+        /// Hours of validity on the renewed token.
+        new_hours_remaining: f64,
+    },
+
+    /// Boot found a token in SSM but it failed `validate_self_claims` —
+    /// APP type, wrong client_id, expired, or corrupt JWT.
+    /// `code = ErrorCode::Depth200Auth01InvalidAtBoot`.
+    Depth200SelfTokenInvalidAtBoot {
+        /// SSM parameter path checked.
+        ssm_parameter: String,
+        /// Description of the validation failure.
+        reason: String,
+    },
+
+    /// Renewal cycle failed — RenewToken HTTP error, response was not
+    /// SELF-type, or SSM PutParameter failed. The arc-swap is NOT
+    /// updated; the existing SELF JWT continues to be used until it
+    /// expires.
+    /// `code = ErrorCode::Depth200Auth02RenewalFailed`.
+    Depth200SelfTokenRenewalFailed {
+        /// SSM parameter path the renewal targeted.
+        ssm_parameter: String,
+        /// Description of the renewal failure.
+        reason: String,
+        /// Hours of validity left on the existing (un-renewed) token.
+        hours_remaining: f64,
+    },
+
+    /// AWS SSM unreachable — IAM, network, or KMS access issue.
+    /// Fires at boot and on PutParameter write-back.
+    /// `code = ErrorCode::Depth200Auth03SsmUnreachable`.
+    Depth200SelfTokenSsmUnreachable {
+        /// SSM parameter path that could not be reached.
+        ssm_parameter: String,
+        /// Underlying error from `aws-sdk-ssm`.
+        reason: String,
+        /// One of `"boot"` or `"renewal_writeback"`.
+        phase: String,
+    },
+
+    /// One of the 4 depth-200 WS connections came up using the SELF
+    /// token (positive ping — confirms the alternate auth path
+    /// actually streams data end-to-end).
+    Depth200SelfStreamingConfirmed {
+        /// Precise contract label (e.g. `"NIFTY-Jun2026-25000-CE"`).
+        contract: String,
+        /// Numeric SecurityId of the contract.
+        security_id: u32,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -1784,6 +1851,64 @@ impl NotificationEvent {
                 )
             }
             Self::Custom { message } => message.clone(),
+            Self::Depth200SelfTokenLoaded {
+                ssm_parameter,
+                hours_remaining,
+            } => format!(
+                "<b>Depth-200 SELF Token Loaded</b>\n\
+                 ssm_param: <code>{ssm_parameter}</code>\n\
+                 hours_remaining: <code>{hours_remaining:.1}</code>"
+            ),
+            Self::Depth200SelfTokenRenewed {
+                ssm_parameter,
+                new_hours_remaining,
+            } => format!(
+                "<b>Depth-200 SELF Token Renewed</b>\n\
+                 ssm_param: <code>{ssm_parameter}</code>\n\
+                 new_hours_remaining: <code>{new_hours_remaining:.1}</code>"
+            ),
+            Self::Depth200SelfTokenInvalidAtBoot {
+                ssm_parameter,
+                reason,
+            } => format!(
+                "<b>Depth-200 SELF Token INVALID at boot</b>\n\
+                 code: <code>DEPTH200-AUTH-01</code>\n\
+                 ssm_param: <code>{ssm_parameter}</code>\n\
+                 reason: <code>{reason}</code>\n\
+                 ACTION: paste a fresh SELF token from web.dhan.co into SSM and restart"
+            ),
+            Self::Depth200SelfTokenRenewalFailed {
+                ssm_parameter,
+                reason,
+                hours_remaining,
+            } => format!(
+                "<b>Depth-200 SELF Token RENEWAL FAILED</b>\n\
+                 code: <code>DEPTH200-AUTH-02</code>\n\
+                 ssm_param: <code>{ssm_parameter}</code>\n\
+                 reason: <code>{reason}</code>\n\
+                 hours_remaining: <code>{hours_remaining:.1}</code>\n\
+                 ACTION: paste a fresh SELF token into SSM before token expires"
+            ),
+            Self::Depth200SelfTokenSsmUnreachable {
+                ssm_parameter,
+                reason,
+                phase,
+            } => format!(
+                "<b>Depth-200 SELF Token SSM UNREACHABLE</b>\n\
+                 code: <code>DEPTH200-AUTH-03</code>\n\
+                 ssm_param: <code>{ssm_parameter}</code>\n\
+                 phase: <code>{phase}</code>\n\
+                 reason: <code>{reason}</code>\n\
+                 ACTION: check IAM (ssm:GetParameter, ssm:PutParameter, kms:Decrypt, kms:Encrypt) + network egress"
+            ),
+            Self::Depth200SelfStreamingConfirmed {
+                contract,
+                security_id,
+            } => format!(
+                "<b>Depth-200 SELF streaming confirmed</b>\n\
+                 contract: <code>{contract}</code>\n\
+                 security_id: <code>{security_id}</code>"
+            ),
         }
     }
 
@@ -1879,6 +2004,12 @@ impl NotificationEvent {
             Self::RealtimeGuaranteeDegraded { .. } => "RealtimeGuaranteeDegraded",
             Self::RealtimeGuaranteeCritical { .. } => "RealtimeGuaranteeCritical",
             Self::Custom { .. } => "Custom",
+            Self::Depth200SelfTokenLoaded { .. } => "Depth200SelfTokenLoaded",
+            Self::Depth200SelfTokenRenewed { .. } => "Depth200SelfTokenRenewed",
+            Self::Depth200SelfTokenInvalidAtBoot { .. } => "Depth200SelfTokenInvalidAtBoot",
+            Self::Depth200SelfTokenRenewalFailed { .. } => "Depth200SelfTokenRenewalFailed",
+            Self::Depth200SelfTokenSsmUnreachable { .. } => "Depth200SelfTokenSsmUnreachable",
+            Self::Depth200SelfStreamingConfirmed { .. } => "Depth200SelfStreamingConfirmed",
         }
     }
 
@@ -1977,6 +2108,12 @@ impl NotificationEvent {
             Self::BootHealthCheck { .. } => Severity::Low,
             Self::StartupComplete { .. } => Severity::Info,
             Self::ShutdownComplete => Severity::Info,
+            Self::Depth200SelfTokenLoaded { .. } => Severity::Info,
+            Self::Depth200SelfTokenRenewed { .. } => Severity::Info,
+            Self::Depth200SelfStreamingConfirmed { .. } => Severity::Info,
+            Self::Depth200SelfTokenInvalidAtBoot { .. } => Severity::Critical,
+            Self::Depth200SelfTokenRenewalFailed { .. } => Severity::Critical,
+            Self::Depth200SelfTokenSsmUnreachable { .. } => Severity::Critical,
         }
     }
 }
