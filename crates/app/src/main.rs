@@ -1703,6 +1703,60 @@ async fn main() -> Result<()> {
         anyhow::bail!("BOOT-02 QuestDB readiness deadline exceeded: {e}");
     }
 
+    // Wave 2-C Item 7.3 (G8) — boot-time wall-clock skew probe. Runs
+    // AFTER `wait_for_questdb_ready` so the QuestDB `SELECT now()`
+    // fallback is reachable when chrony is unavailable. On
+    // `ThresholdExceeded` the boot HALTS (BOOT-03). On `Unavailable`
+    // the boot proceeds with a WARN — a missing chronyc + unreachable
+    // QuestDB after the readiness probe is a rare ordering issue, not
+    // a correctness defect.
+    {
+        let threshold = tickvault_common::constants::CLOCK_SKEW_HALT_THRESHOLD_SECS;
+        match tickvault_app::infra::enforce_clock_skew_at_boot(&config.questdb, threshold).await {
+            Ok(sample) => {
+                tracing::info!(
+                    skew_secs = sample.skew_secs,
+                    source = sample.source,
+                    threshold_secs = threshold,
+                    "BOOT-03 clock-skew probe within tolerance"
+                );
+            }
+            Err(tickvault_app::infra::ClockSkewError::ThresholdExceeded {
+                skew_secs,
+                threshold_secs,
+                source,
+            }) => {
+                tracing::error!(
+                    skew_secs,
+                    threshold_secs,
+                    source,
+                    code =
+                        tickvault_common::error_code::ErrorCode::Boot03ClockSkewExceeded.code_str(),
+                    "BOOT-03 wall-clock skew exceeds threshold — HALTING"
+                );
+                metrics::counter!("tv_boot_clock_skew_halt_total").increment(1);
+                let event = tickvault_core::notification::events::NotificationEvent::BootClockSkewExceeded {
+                    skew_secs,
+                    threshold_secs,
+                    source: source.to_string(),
+                };
+                notifier.notify(event);
+                anyhow::bail!(
+                    "BOOT-03 clock skew {skew_secs:+.3}s exceeds threshold {threshold_secs:.2}s \
+                     (source: {source}) — fix `chronyc tracking` then restart"
+                );
+            }
+            Err(tickvault_app::infra::ClockSkewError::Unavailable { primary, fallback }) => {
+                tracing::warn!(
+                    primary = %primary,
+                    fallback = %fallback,
+                    "BOOT-03 clock-skew probe unavailable — boot proceeding without skew check"
+                );
+                metrics::counter!("tv_boot_clock_skew_unavailable_total").increment(1);
+            }
+        }
+    }
+
     // Wave 2 Item 9 — boot audit row for the QuestDB readiness step.
     // Best-effort: if QuestDB just barely came up but the DDL phase is
     // about to write to it, we still want this row. Failures don't halt
