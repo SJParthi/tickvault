@@ -2,8 +2,10 @@
 //!
 //! Separate connections from the Live Market Feed. Connect to:
 //! - 20-level: `wss://depth-api-feed.dhan.co/twentydepth`
-//! - 200-level: `wss://full-depth-api.dhan.co/` (root path; Python SDK verified 2026-04-23 —
-//!   reverses Dhan ticket #5519522's earlier `/twohundreddepth` advice)
+//! - 200-level: `wss://full-depth-api.dhan.co/` (LOCKED FACT — root path
+//!   verified 2026-04-23; regression-blocked by ratchet
+//!   `test_two_hundred_depth_url_uses_root_path` + banned-pattern hook
+//!   category 4. SELF token (not APP) required.)
 //!
 //! Frames are sent to the same `mpsc::Sender<Bytes>` channel as the main feed,
 //! so the tick processor handles dispatch via `dispatch_deep_depth_frame()`.
@@ -856,8 +858,7 @@ async fn connect_and_run_depth(
 
 /// Runs a 200-level depth WebSocket connection for a SINGLE instrument.
 ///
-/// Connects to `wss://full-depth-api.dhan.co/` (root path — Python SDK verified
-/// 2026-04-23, reverses Dhan ticket #5519522's earlier `/twohundreddepth` advice).
+/// Connects to `wss://full-depth-api.dhan.co/` (LOCKED FACT — root path).
 /// Only 1 instrument per connection (Dhan limitation).
 /// Infinite reconnection with exponential backoff.
 #[allow(clippy::too_many_arguments)] // APPROVED: STAGE-C added wal_spill param + 2026-04-21 notifier
@@ -1012,9 +1013,7 @@ pub async fn run_two_hundred_depth_connection(
                 }
 
                 // Log policy — reduces noise during transient Dhan-side
-                // resets (e.g. 200-level TCP resets per Ticket #5519522/#5543510,
-                // fixed 2026-04-23 by switching from `/twohundreddepth` to root path)
-                // while preserving escalation.
+                // resets while preserving escalation.
                 //
                 // * attempt == 0          → WARN  (first failure is visible)
                 // * attempt == 1..=9      → DEBUG (silent during brief backoff)
@@ -1080,9 +1079,7 @@ async fn connect_and_run_200_depth(
     }
 
     let access_token = token_state.access_token().expose_secret().to_string();
-    // 200-level URL: ROOT path / — verified 2026-04-23 via Dhan Python SDK
-    // `dhanhq==2.2.0rc1` on our account at SecurityId 72271. Replaces the
-    // `/twohundreddepth` path Dhan ticket #5519522 had advised.
+    // 200-level URL: ROOT path `/` (LOCKED FACT — see module docstring).
     let base = DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL.trim_end_matches('/');
     let authenticated_url = zeroize::Zeroizing::new(format!(
         "{base}/?token={access_token}&clientId={client_id}&authType={WEBSOCKET_AUTH_TYPE}",
@@ -1096,21 +1093,18 @@ async fn connect_and_run_200_depth(
             source: err,
         })?;
 
-    // Match Dhan Python SDK `dhanhq==2.2.0rc1` wire behavior exactly: Python
-    // UA + no-ALPN TLS. Verified 2026-04-23 on SecurityId 72271 — without
-    // this combo the server responds with Protocol(ResetWithoutClosingHandshake).
+    // Match Dhan Python SDK wire behavior exactly: Python UA + no-ALPN TLS
+    // (LOCKED FACTS — pinned by `test_depth_200_user_agent_is_python_sdk` +
+    // `test_build_websocket_tls_connector_no_alpn_skips_alpn`).
     // `HeaderValue::from_static` over a `const &'static str` cannot fail, so
     // this is an infallible insert — no allocation beyond the insert itself.
     request
         .headers_mut()
         .insert("User-Agent", HeaderValue::from_static(DEPTH_200_USER_AGENT));
 
-    // 200-depth TLS connector MUST skip ALPN — Python `websockets/16.0`
-    // defaults to an SSLContext with no `alpn_protocols` set. Using the
-    // shared `build_websocket_tls_connector()` (which forces http/1.1 ALPN)
-    // is what caused 2+ weeks of ResetWithoutClosingHandshake on
-    // full-depth-api.dhan.co. Do NOT switch back without first re-running
-    // the operator variant matrix against a live account during market hours.
+    // 200-depth TLS connector MUST skip ALPN (LOCKED FACT). The shared
+    // `build_websocket_tls_connector()` forces http/1.1 ALPN which the
+    // 200-depth server rejects with ResetWithoutClosingHandshake.
     let tls_connector = build_websocket_tls_connector_no_alpn()?;
     let connect_timeout = Duration::from_secs(DEPTH_CONNECT_TIMEOUT_SECS);
 
@@ -1566,9 +1560,9 @@ mod tests {
 
     #[test]
     fn test_two_hundred_depth_ws_url_correct() {
-        // 2026-04-23: Python SDK `dhanhq==2.2.0rc1` verified root path `/` is the
-        // working URL for 200-depth. Reverses Dhan ticket #5519522 which had
-        // told us to use `/twohundreddepth` (caused ResetWithoutClosingHandshake).
+        // LOCKED FACT (2026-04-23): root path `/` is the working URL.
+        // Banned-pattern hook category 4 + dhan_locked_facts.rs ratchet
+        // block any regression to `/twohundreddepth`.
         assert_eq!(
             DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL,
             "wss://full-depth-api.dhan.co"
@@ -1763,10 +1757,9 @@ mod tests {
 
     #[test]
     fn test_two_hundred_depth_url_uses_root_path() {
-        // 2026-04-23: Python SDK `dhanhq==2.2.0rc1` verified root path `/` is the
-        // working URL. `/twohundreddepth` kept TCP-resetting our Rust client
-        // for 2+ weeks. The URL builder now explicitly emits `/?token=...` so
-        // the resulting URL matches the Python SDK output exactly.
+        // LOCKED FACT: 200-depth URL builder emits `/?token=...` (root path).
+        // Banned-pattern hook + dhan_locked_facts.rs both block regression
+        // to `/twohundreddepth`.
         let base = DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL.trim_end_matches('/');
         let url = format!("{base}/?token=TEST&clientId=TEST&authType=2",);
         assert!(
@@ -1895,6 +1888,49 @@ mod tests {
             alpn_uses >= 1,
             "production code must still use build_websocket_tls_connector() for \
              main feed / 20-depth / order-update, got {alpn_uses}"
+        );
+    }
+
+    /// Phase 6 ratchet 52: Depth-200 diagnostic example was deleted as part
+    /// of the URL wipe-off (2026-04-28). The ROOT path `/` is locked-fact
+    /// since 2026-04-23, so the 8-variant A/B test against `/twohundreddepth`
+    /// is dead diagnostic weight. This ratchet blocks accidental re-creation
+    /// from git history.
+    #[test]
+    fn test_depth_200_variants_example_does_not_exist() {
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
+        let example_path = std::path::Path::new(&manifest_dir)
+            .join("examples")
+            .join("depth_200_variants.rs");
+        assert!(
+            !example_path.exists(),
+            "depth_200_variants.rs example was wiped 2026-04-28 — must NOT \
+             reappear at {} without explicit Parthiban approval (the URL is \
+             locked-fact, no diagnostic A/B needed)",
+            example_path.display()
+        );
+    }
+
+    /// Phase 6 ratchet 53: After the wipe-off, the locked-fact assertion in
+    /// dhan_locked_facts.rs MUST still be present — it's the regression-
+    /// blocker for the URL constant. If anyone deletes that assertion in a
+    /// future "cleanup", this test catches it.
+    #[test]
+    fn test_depth_200_root_path_locked_fact_still_present() {
+        let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
+        let locked_facts_path = std::path::Path::new(&manifest_dir)
+            .join("..")
+            .join("common")
+            .join("tests")
+            .join("dhan_locked_facts.rs");
+        let contents =
+            std::fs::read_to_string(&locked_facts_path).expect("dhan_locked_facts.rs must exist");
+        assert!(
+            contents.contains("DHAN_TWO_HUNDRED_DEPTH_WS_BASE_URL.contains(\"/twohundreddepth\")"),
+            "dhan_locked_facts.rs MUST still contain the regression-blocking \
+             assertion against the legacy /twohundreddepth path. The Phase 6 \
+             wipe-off (2026-04-28) deleted only the diagnostic example; the \
+             locked-fact ratchet stays."
         );
     }
 }
