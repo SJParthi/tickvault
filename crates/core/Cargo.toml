@@ -91,5 +91,9 @@ harness = false
 name = "tick_gap_detector"
 harness = false
 
+[[bench]]
+name = "slo_score"
+harness = false
+
 [package.metadata.cargo-machete]
 ignored = ["ahash", "arrayvec", "bytes", "chrono-tz", "failsafe", "loom", "papaya", "rtrb", "zerocopy"]

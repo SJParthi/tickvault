@@ -4839,6 +4839,358 @@ async fn main() -> Result<()> {
                 });
             }
 
+            // Wave 3-D Item 13 — composite real-time guarantee score.
+            // Every 10s, sample 6 dimensions (WS, QDB, tick freshness,
+            // token, spill, Phase 2), compute composite score
+            // ∈ [0.0, 1.0], emit `tv_realtime_guarantee_score` gauge +
+            // 6 per-dimension gauges, and on rising-tier transitions
+            // (Healthy → Degraded / Healthy → Critical / Degraded →
+            // Critical) fire edge-triggered Telegram with severity
+            // matching the new tier.
+            //
+            // Audit-findings Rule 3 (market-hours-aware): off-hours we
+            // pin WS / tick / Phase2 dimensions to 1.0 because their
+            // by-design state (sleeping connections, no ticks, no
+            // Phase 2 trigger yet) is not a degradation — only QDB,
+            // token, spill remain genuine off-hours signals.
+            //
+            // Audit-findings Rule 4 (edge-trigger): sustained-degraded
+            // ticks do NOT spam Telegram. The Prometheus alert
+            // `tv-realtime-score-degraded` (5m sustained < 0.95) is
+            // the sustained-condition channel.
+            //
+            // Gated on `config.features.realtime_guarantee_score`.
+            if config.features.realtime_guarantee_score {
+                let slo_notifier = notifier.clone();
+                let slo_health = health_status.clone();
+                let slo_qcfg = config.questdb.clone();
+                tokio::spawn(async move {
+                    use std::time::{Duration, Instant};
+                    use tickvault_common::constants::{
+                        IST_UTC_OFFSET_NANOS, IST_UTC_OFFSET_SECONDS, SECONDS_PER_DAY,
+                        TICK_PERSIST_END_SECS_OF_DAY_IST, TICK_PERSIST_START_SECS_OF_DAY_IST,
+                    };
+                    use tickvault_common::error_code::ErrorCode;
+                    use tickvault_core::instrument::phase2_emit_guard::phase2_outcome_today_is_complete;
+                    use tickvault_core::instrument::slo_score::{
+                        SloInputs, SloOutcome, evaluate_slo_score,
+                    };
+
+                    /// Sum of expected connections across the four pools:
+                    /// 5 main feed + 4 depth-20 (NIFTY/BANKNIFTY/FINNIFTY/MIDCPNIFTY,
+                    /// per pre-2026-04-25 universe; the post-2026-04-25 rebuild
+                    /// reduced this to 2 but the pool capacity still permits 4)
+                    /// + 2 depth-200 (NIFTY ATM CE/PE + BANKNIFTY ATM CE/PE
+                    /// — capped at 2 in the live config) + 1 order-update.
+                    /// Total = 12. Used as the `expected` divisor for
+                    /// `WS_health = active / expected`.
+                    const SLO_WS_EXPECTED_TOTAL: f64 = 12.0;
+
+                    /// Tick-freshness threshold during market hours: a tick
+                    /// gap >= this many seconds drives `tick_freshness = 0.0`.
+                    /// Aligned with the operator's "silent socket" boundary
+                    /// used elsewhere (the 60s pool watchdog).
+                    const SLO_TICK_FRESHNESS_DEGRADED_SECS: u64 = 30;
+
+                    /// Token headroom threshold: < this many seconds remaining
+                    /// drives `token_freshness = 0.0`. Aligned with
+                    /// `force_renewal_if_stale(threshold_secs = 14400)` used
+                    /// by the post-sleep WebSocket wake path (AUTH-GAP-03).
+                    const SLO_TOKEN_HEADROOM_THRESHOLD_SECS: u64 = 4 * 3600;
+
+                    /// IST seconds-of-day at which Phase 2 dispatcher fires
+                    /// (09:13:00). Before this, Phase2_health is pinned to
+                    /// `1.0` because no outcome has been recorded yet.
+                    const SLO_PHASE2_TRIGGER_SECS_OF_DAY_IST: u32 = 9 * 3600 + 13 * 60;
+
+                    /// Grace window after the 09:13:00 trigger during which
+                    /// `phase2_outcome_today_is_complete == None` is treated
+                    /// as "still computing" rather than "Phase 2 never
+                    /// fired". Adversarial review (general-purpose, 2026-04-28
+                    /// HIGH #2): without this, the SLO scheduler tick that
+                    /// fires at exactly 09:13:00 — before the dispatcher
+                    /// has finished — would incorrectly produce
+                    /// `phase2_health = 0.0` and page CRITICAL. 60 seconds
+                    /// is comfortably longer than the typical Phase 2
+                    /// dispatch latency (~30s on the slowest day).
+                    const SLO_PHASE2_GRACE_SECS: u32 = 60;
+
+                    /// Sample interval. SCOPE §13.1.
+                    const SLO_TICK_INTERVAL_SECS: u64 = 10;
+
+                    /// Hard upper-bound for the per-tick QDB-readiness probe.
+                    /// Adversarial review (general-purpose, 2026-04-28
+                    /// HIGH #3): caps `wait_for_questdb_ready` so a hung
+                    /// TCP connect cannot stretch the 10s scheduler tick.
+                    const SLO_QDB_PROBE_TIMEOUT_SECS: u64 = 2;
+
+                    /// Helper: returns true iff `now_ist_secs_of_day` falls
+                    /// inside the data-collection window
+                    /// `[09:00, 16:00)` IST. Off-hours we relax 3 of 6
+                    /// dimensions to avoid false-positive pages on
+                    /// by-design idle state.
+                    fn is_within_market_hours_ist(now_ist_secs_of_day: u32) -> bool {
+                        (TICK_PERSIST_START_SECS_OF_DAY_IST..TICK_PERSIST_END_SECS_OF_DAY_IST)
+                            .contains(&now_ist_secs_of_day)
+                    }
+
+                    let mut interval =
+                        tokio::time::interval(Duration::from_secs(SLO_TICK_INTERVAL_SECS));
+                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    // Skip the immediate first tick — let other systems boot.
+                    interval.tick().await;
+
+                    // Edge-trigger state. Initial tier 0 (Healthy) so a
+                    // genuine first-tick Degraded/Critical fires Telegram
+                    // exactly once on the rising edge.
+                    let mut prev_tier: u8 = 0;
+                    // Spill delta tracker — saturate-subtract previous total
+                    // to detect any new drops in the last 10s.
+                    let mut last_spill_total: u64 = slo_health.ticks_spilled();
+
+                    info!("Wave 3-D SLO score scheduler: started (10s tick)");
+
+                    loop {
+                        interval.tick().await;
+
+                        // Compute "now" in IST for market-hours + Phase 2
+                        // gates. `chrono::Utc::now()` is the canonical
+                        // wall-clock source per existing usage in this file.
+                        let now_utc_secs = chrono::Utc::now().timestamp();
+                        let now_ist_secs =
+                            now_utc_secs.saturating_add(i64::from(IST_UTC_OFFSET_SECONDS));
+                        let secs_of_day =
+                            now_ist_secs.rem_euclid(i64::from(SECONDS_PER_DAY)) as u32;
+                        let in_market = is_within_market_hours_ist(secs_of_day);
+
+                        // ---- WS_health -----------------------------------
+                        let active_main = slo_health.websocket_connections() as f64;
+                        let active_d20 = slo_health.depth_20_connections() as f64;
+                        let active_d200 = slo_health.depth_200_connections() as f64;
+                        let active_ou = if slo_health.order_update_connected() {
+                            1.0
+                        } else {
+                            0.0
+                        };
+                        let active_total = active_main + active_d20 + active_d200 + active_ou;
+                        let raw_ws_health = active_total / SLO_WS_EXPECTED_TOTAL;
+                        // Off-hours: by-design sleeping connections must
+                        // NOT degrade the SLO. Pin to 1.0.
+                        let ws_health = if !in_market { 1.0 } else { raw_ws_health };
+
+                        // ---- QDB_health ---------------------------------
+                        // 1s probe wrapped in tokio::time::timeout(2s) as a
+                        // hard upper-bound. Adversarial review (general-
+                        // purpose, 2026-04-28 HIGH #3): the boot probe's
+                        // internal max_wait_secs may not strictly cap on a
+                        // hung TCP connect (OS-default connect timeout can
+                        // be 20-75s). Timeout-bounding here keeps the 10s
+                        // scheduler interval from compounding into a
+                        // slow-loop under prolonged QDB outages.
+                        let qdb_ok = tokio::time::timeout(
+                            Duration::from_secs(SLO_QDB_PROBE_TIMEOUT_SECS),
+                            tickvault_storage::boot_probe::wait_for_questdb_ready(&slo_qcfg, 1),
+                        )
+                        .await
+                        .is_ok_and(|res| res.is_ok());
+                        let qdb_health = if qdb_ok { 1.0 } else { 0.0 };
+
+                        // ---- Tick_freshness ------------------------------
+                        let tick_freshness = if !in_market {
+                            1.0
+                        } else {
+                            let worst_gap = tickvault_core::pipeline::tick_gap_detector::global_tick_gap_detector()
+                                .map(|d| {
+                                    let (top, _total) =
+                                        d.scan_gaps_top_n(Instant::now(), 1);
+                                    top.first().map(|(_, _, gap)| *gap).unwrap_or(0)
+                                })
+                                .unwrap_or(0);
+                            if worst_gap < SLO_TICK_FRESHNESS_DEGRADED_SECS {
+                                1.0
+                            } else {
+                                0.0
+                            }
+                        };
+
+                        // ---- Token_freshness -----------------------------
+                        let token_secs =
+                            tickvault_core::auth::token_manager::global_token_manager()
+                                .map(|tm| tm.seconds_until_expiry())
+                                .unwrap_or(0);
+                        let token_freshness = if token_secs > SLO_TOKEN_HEADROOM_THRESHOLD_SECS {
+                            1.0
+                        } else {
+                            0.0
+                        };
+
+                        // ---- Spill_health --------------------------------
+                        // Delta over the last 10s sample window. Strict
+                        // signal — any new drop drives 0.0 for one tick.
+                        let cur_spill = slo_health.ticks_spilled();
+                        let spill_delta = cur_spill.saturating_sub(last_spill_total);
+                        last_spill_total = cur_spill;
+                        let spill_health = if spill_delta == 0 { 1.0 } else { 0.0 };
+
+                        // ---- Phase2_health -------------------------------
+                        let now_ist_nanos = chrono::Utc::now()
+                            .timestamp_nanos_opt()
+                            .unwrap_or(0)
+                            .saturating_add(IST_UTC_OFFSET_NANOS);
+                        let today_date_ist =
+                            now_ist_nanos - now_ist_nanos.rem_euclid(86_400_000_000_000);
+                        let phase2_health = if !in_market {
+                            1.0
+                        } else if secs_of_day < SLO_PHASE2_TRIGGER_SECS_OF_DAY_IST {
+                            // Pre-trigger: no outcome yet, do not penalize.
+                            1.0
+                        } else {
+                            match phase2_outcome_today_is_complete(today_date_ist) {
+                                Some(true) => 1.0,
+                                Some(false) => 0.0,
+                                None => {
+                                    // Post-trigger but no record — could be
+                                    // "still dispatching" (within grace) or
+                                    // "Phase 2 never fired" (past grace).
+                                    // Grace window pins to 1.0 to avoid
+                                    // racing the dispatcher at 09:13:00 IST.
+                                    if secs_of_day
+                                        < SLO_PHASE2_TRIGGER_SECS_OF_DAY_IST + SLO_PHASE2_GRACE_SECS
+                                    {
+                                        1.0
+                                    } else {
+                                        0.0
+                                    }
+                                }
+                            }
+                        };
+
+                        let inputs = SloInputs {
+                            ws_health,
+                            qdb_health,
+                            tick_freshness,
+                            token_freshness,
+                            spill_health,
+                            phase2_health,
+                        };
+                        let outcome = evaluate_slo_score(&inputs);
+
+                        // Always emit gauges (operator dashboard reads them
+                        // in real-time, off-hours included). Clamp each
+                        // per-dimension gauge value into [0, 1] before
+                        // emit so that a future regression that lets a
+                        // raw f64 (e.g. NaN from div-by-zero or > 1.0
+                        // from a misconfigured `SLO_WS_EXPECTED_TOTAL`)
+                        // cannot pollute the dashboard. `evaluate_slo_score`
+                        // already clamps internally for the composite —
+                        // this is the same defense for the per-dimension
+                        // panels (hot-path-reviewer hardening, 2026-04-28).
+                        let dim_clamp =
+                            |v: f64| -> f64 { if v.is_nan() { 0.0 } else { v.clamp(0.0, 1.0) } };
+                        metrics::gauge!("tv_realtime_guarantee_score").set(outcome.score());
+                        metrics::gauge!(
+                            "tv_realtime_guarantee_dimension",
+                            "name" => "ws_health"
+                        )
+                        .set(dim_clamp(ws_health));
+                        metrics::gauge!(
+                            "tv_realtime_guarantee_dimension",
+                            "name" => "qdb_health"
+                        )
+                        .set(dim_clamp(qdb_health));
+                        metrics::gauge!(
+                            "tv_realtime_guarantee_dimension",
+                            "name" => "tick_freshness"
+                        )
+                        .set(dim_clamp(tick_freshness));
+                        metrics::gauge!(
+                            "tv_realtime_guarantee_dimension",
+                            "name" => "token_freshness"
+                        )
+                        .set(dim_clamp(token_freshness));
+                        metrics::gauge!(
+                            "tv_realtime_guarantee_dimension",
+                            "name" => "spill_health"
+                        )
+                        .set(dim_clamp(spill_health));
+                        metrics::gauge!(
+                            "tv_realtime_guarantee_dimension",
+                            "name" => "phase2_health"
+                        )
+                        .set(dim_clamp(phase2_health));
+
+                        let cur_tier = outcome.tier();
+
+                        // Edge-triggered Telegram — fire ONLY during market
+                        // hours (off-hours pinning makes the score
+                        // operator-meaningful, but transient off-hours
+                        // QDB/token blips should not page).
+                        if in_market {
+                            if cur_tier > prev_tier {
+                                // Worsened — page on the rising edge.
+                                match &outcome {
+                                    SloOutcome::Healthy { .. } => {
+                                        // Cannot reach: tier 0 is Healthy
+                                        // and prev_tier > 0 contradicts
+                                        // cur_tier > prev_tier with
+                                        // cur_tier == 0. Defensive only.
+                                    }
+                                    SloOutcome::Degraded { score, weakest } => {
+                                        slo_notifier.notify(
+                                            tickvault_core::notification::events::NotificationEvent::RealtimeGuaranteeDegraded {
+                                                score: *score,
+                                                weakest,
+                                            },
+                                        );
+                                        error!(
+                                            code = ErrorCode::Slo02Degraded.code_str(),
+                                            score = *score,
+                                            weakest = weakest,
+                                            "SLO score crossed below 0.95 — DEGRADED"
+                                        );
+                                    }
+                                    SloOutcome::Critical { score, weakest } => {
+                                        slo_notifier.notify(
+                                            tickvault_core::notification::events::NotificationEvent::RealtimeGuaranteeCritical {
+                                                score: *score,
+                                                weakest,
+                                            },
+                                        );
+                                        error!(
+                                            code = ErrorCode::Slo02Degraded.code_str(),
+                                            score = *score,
+                                            weakest = weakest,
+                                            "SLO score crossed below 0.80 — CRITICAL"
+                                        );
+                                    }
+                                }
+                            } else if cur_tier < prev_tier && cur_tier == 0 {
+                                // Recovery to Healthy from worse — Info
+                                // ping (audit-findings Rule 4: positive
+                                // signal on falling edge).
+                                slo_notifier.notify(
+                                    tickvault_core::notification::events::NotificationEvent::RealtimeGuaranteeHealthy {
+                                        score: outcome.score(),
+                                    },
+                                );
+                                info!(
+                                    code = ErrorCode::Slo01Healthy.code_str(),
+                                    score = outcome.score(),
+                                    "SLO score recovered to healthy"
+                                );
+                            }
+                        }
+                        prev_tier = cur_tier;
+
+                        metrics::counter!(
+                            "tv_realtime_guarantee_evaluations_total",
+                            "tier" => outcome.outcome_str()
+                        )
+                        .increment(1);
+                    }
+                });
+            }
+
             // Plan item C (2026-04-22, visibility version): once-per-day
             // depth-anchor Telegram fired at 09:13:00 IST. Reads the
             // 09:12 closes for NIFTY + BANKNIFTY from the preopen buffer

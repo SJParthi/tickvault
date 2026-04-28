@@ -565,6 +565,36 @@ pub enum NotificationEvent {
         failed: Vec<&'static str>,
     },
 
+    /// Wave 3-D Item 13 — composite real-time guarantee score recovered
+    /// to `Healthy` (≥ 0.95) on the falling edge from a degraded period.
+    /// Severity::Info; edge-triggered (sustained-healthy ticks do NOT
+    /// spam Telegram). Maps to ErrorCode `SLO-01`.
+    RealtimeGuaranteeHealthy {
+        /// Composite score in `[0.95, 1.0]`.
+        score: f64,
+    },
+
+    /// Wave 3-D Item 13 — composite real-time guarantee score crossed
+    /// below `0.95` (Degraded band `[0.80, 0.95)`). Severity::High.
+    /// Edge-triggered on rising edge into a worse tier. Maps to
+    /// ErrorCode `SLO-02`.
+    RealtimeGuaranteeDegraded {
+        /// Composite score in `[0.80, 0.95)`.
+        score: f64,
+        /// Static label of the lowest-input dimension (e.g. `"ws_health"`).
+        weakest: &'static str,
+    },
+
+    /// Wave 3-D Item 13 — composite real-time guarantee score crossed
+    /// below `0.80` (Critical). Severity::Critical so the operator pages
+    /// immediately. Maps to ErrorCode `SLO-02`.
+    RealtimeGuaranteeCritical {
+        /// Composite score in `[0.0, 0.80)`.
+        score: f64,
+        /// Static label of the lowest-input dimension.
+        weakest: &'static str,
+    },
+
     /// Instrument build succeeded (first build of the day).
     InstrumentBuildSuccess {
         /// CSV source: "primary", "fallback", or "cache".
@@ -1657,6 +1687,31 @@ impl NotificationEvent {
                      Action: see runbook .claude/rules/project/wave-3-c-error-codes.md"
                 )
             }
+            Self::RealtimeGuaranteeHealthy { score } => {
+                format!(
+                    "<b>Real-time guarantee score recovered</b>\n\
+                     Composite score: {score:.3} (≥ 0.95).\n\
+                     Code: SLO-01"
+                )
+            }
+            Self::RealtimeGuaranteeDegraded { score, weakest } => {
+                format!(
+                    "<b>Real-time guarantee score DEGRADED</b>\n\
+                     Composite score: {score:.3} (band [0.80, 0.95)).\n\
+                     Weakest dimension: {weakest}\n\
+                     Code: SLO-02\n\
+                     Action: see runbook .claude/rules/project/wave-3-d-error-codes.md"
+                )
+            }
+            Self::RealtimeGuaranteeCritical { score, weakest } => {
+                format!(
+                    "<b>REAL-TIME GUARANTEE SCORE CRITICAL</b>\n\
+                     Composite score: {score:.3} (< 0.80).\n\
+                     Weakest dimension: {weakest}\n\
+                     Code: SLO-02\n\
+                     Action: see runbook .claude/rules/project/wave-3-d-error-codes.md"
+                )
+            }
             Self::OrderRejected {
                 correlation_id,
                 reason,
@@ -1812,6 +1867,9 @@ impl NotificationEvent {
             Self::SelfTestPassed { .. } => "SelfTestPassed",
             Self::SelfTestDegraded { .. } => "SelfTestDegraded",
             Self::SelfTestCritical { .. } => "SelfTestCritical",
+            Self::RealtimeGuaranteeHealthy { .. } => "RealtimeGuaranteeHealthy",
+            Self::RealtimeGuaranteeDegraded { .. } => "RealtimeGuaranteeDegraded",
+            Self::RealtimeGuaranteeCritical { .. } => "RealtimeGuaranteeCritical",
             Self::Custom { .. } => "Custom",
         }
     }
@@ -1887,6 +1945,9 @@ impl NotificationEvent {
             Self::MarketOpenDepthAnchor { .. } => Severity::Info,
             Self::SelfTestPassed { .. } => Severity::Info,
             Self::SelfTestDegraded { .. } => Severity::High,
+            Self::RealtimeGuaranteeHealthy { .. } => Severity::Info,
+            Self::RealtimeGuaranteeDegraded { .. } => Severity::High,
+            Self::RealtimeGuaranteeCritical { .. } => Severity::Critical,
             Self::SelfTestCritical { .. } => Severity::Critical,
             Self::DepthIndexLtpTimeout { .. } => Severity::High,
             Self::DepthUnderlyingMissing { .. } => Severity::High,
