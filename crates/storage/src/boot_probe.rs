@@ -10,16 +10,29 @@ use reqwest::Client;
 use tracing::{debug, error, info, warn};
 
 use tickvault_common::config::QuestDbConfig;
+use tickvault_common::constants::{
+    BOOT_DEADLINE_SECS as COMMON_BOOT_DEADLINE_SECS, BOOT_ESCALATION_DEBUG_AT_SECS,
+    BOOT_ESCALATION_ERROR_AT_SECS, BOOT_ESCALATION_INFO_AT_SECS, BOOT_ESCALATION_WARN_AT_SECS,
+};
 use tickvault_common::error_code::ErrorCode;
 
 /// Boot deadline before BOOT-02 fires + the app halts.
-pub const BOOT_DEADLINE_SECS: u64 = 60;
+///
+/// Re-exported from `tickvault_common::constants` so the canonical
+/// constant lives in `crates/common/src/constants.rs` (the single
+/// source of truth for the +5/+10/+20/+30/+60 escalation table).
+pub const BOOT_DEADLINE_SECS: u64 = COMMON_BOOT_DEADLINE_SECS;
 
 /// Escalation thresholds in elapsed-seconds order.
-const ESCALATION_DEBUG_AT_SECS: u64 = 5;
-const ESCALATION_INFO_AT_SECS: u64 = 10;
-const ESCALATION_WARN_AT_SECS: u64 = 20;
-const ESCALATION_ERROR_AT_SECS: u64 = 30;
+///
+/// Pinned in `tickvault_common::constants` (re-exported here as
+/// privates so the existing call sites continue to work). The
+/// `boot_constants_tests::test_escalation_thresholds_match_pinned_table`
+/// ratchet asserts the +5/+10/+20/+30/+60 table.
+const ESCALATION_DEBUG_AT_SECS: u64 = BOOT_ESCALATION_DEBUG_AT_SECS;
+const ESCALATION_INFO_AT_SECS: u64 = BOOT_ESCALATION_INFO_AT_SECS;
+const ESCALATION_WARN_AT_SECS: u64 = BOOT_ESCALATION_WARN_AT_SECS;
+const ESCALATION_ERROR_AT_SECS: u64 = BOOT_ESCALATION_ERROR_AT_SECS;
 
 /// HTTP request timeout for a single QuestDB readiness probe.
 const PROBE_REQUEST_TIMEOUT_SECS: u64 = 2;

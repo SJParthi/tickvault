@@ -917,6 +917,58 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
         now_ist.saturating_div(i64::from(SECONDS_PER_DAY)) as u32
     };
 
+    // Wave 2 Item 7.1 (G14) — block on QuestDB readiness BEFORE consuming
+    // the SPSC ring. Until this gate clears, ticks accumulate safely in
+    // the upstream `frame_receiver` channel (65,536 cap) and the WAL
+    // spill — the consume loop simply has not started yet, so nothing
+    // is dropped. Reading the global config is the canonical wiring per
+    // `crates/storage/src/lib.rs::set_global_questdb_config`. Tests that
+    // never installed a global skip the wait and proceed immediately.
+    if let Some(qcfg) = tickvault_storage::global_questdb_config() {
+        // Boot probe owns its own escalating-log table (+5 DEBUG / +10
+        // INFO / +20 WARN / +30 ERROR BOOT-01 / +60 CRITICAL BOOT-02).
+        // We tag the entry log so operators can correlate with the
+        // probe's own logs.
+        info!(
+            "tick processor: gating on wait_for_questdb_ready({}s) before SPSC consume \
+             (Wave 2 Item 7.1 / G14)",
+            tickvault_common::constants::BOOT_DEADLINE_SECS
+        );
+        match tickvault_storage::boot_probe::wait_for_questdb_ready(
+            qcfg,
+            tickvault_common::constants::BOOT_DEADLINE_SECS,
+        )
+        .await
+        {
+            Ok(elapsed) => {
+                info!(
+                    elapsed_secs = elapsed.as_secs(),
+                    "tick processor: QuestDB ready, opening SPSC consume loop"
+                );
+            }
+            Err(err) => {
+                error!(
+                    ?err,
+                    code =
+                        tickvault_common::error_code::ErrorCode::Boot02DeadlineExceeded.code_str(),
+                    "BOOT-02 tick processor refusing to consume — QuestDB never reached \
+                     ready state within deadline"
+                );
+                // Refuse to start the hot loop. The caller's processor
+                // task ends; ticks remain buffered in the SPSC ring + WAL
+                // spill. Process-level HALT is the boot path's call (the
+                // boot orchestrator already runs `wait_for_questdb_ready`
+                // on its own deadline at main.rs:1692 and bails on Err).
+                return;
+            }
+        }
+    } else {
+        debug!(
+            "tick processor: no global QuestDB config installed — skipping boot probe \
+             (test mode)"
+        );
+    }
+
     m_pipeline_active.set(1.0);
     // Record channel capacity once at startup (65536 for SPSC buffer).
     m_channel_capacity.set(frame_receiver.max_capacity() as f64);

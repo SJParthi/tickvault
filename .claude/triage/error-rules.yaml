@@ -930,6 +930,22 @@ rules:
       escalate — never auto-restart Docker without operator review
       because it may indicate a corrupted volume or partition.
 
+  - name: boot-03-clock-skew-exceeded-escalate
+    match:
+      code: BOOT-03
+    action: escalate
+    runbook_path: .claude/rules/project/wave-2-c-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      BOOT-03 = host wall-clock drifted ≥2.0s from trusted source
+      (chrony / QuestDB now()). App halts because IST timestamp math
+      and DEDUP UPSERT keys would silently corrupt trading-day
+      partitions. Operator must run `chronyc tracking` then
+      `chronyc -a makestep` and restart. Never auto-action — clock
+      drift is symptomatic of NTP / hardware / hypervisor issues
+      that need human triage.
+
   - name: audit-01-phase2-write-failed-escalate
     match:
       code: AUDIT-01

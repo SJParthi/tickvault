@@ -280,6 +280,239 @@ async fn open_all_dashboards() {
 }
 
 // ---------------------------------------------------------------------------
+// Wave 2 Item 7.3 (G8) — Boot-time wall-clock skew probe (BOOT-03)
+// ---------------------------------------------------------------------------
+
+/// Outcome of a single clock-skew probe sample.
+///
+/// Returned by [`probe_clock_skew`] so callers can log + alert + halt
+/// without re-implementing the threshold check.
+#[derive(Debug, Clone)]
+pub struct ClockSkewSample {
+    /// Signed seconds; positive = local clock is AHEAD of trusted source.
+    pub skew_secs: f64,
+    /// Source label, one of `"chronyc"` or `"questdb_now"`.
+    pub source: &'static str,
+}
+
+impl ClockSkewSample {
+    /// True when `|skew_secs|` exceeds the halt threshold (default 2.0s
+    /// per `CLOCK_SKEW_HALT_THRESHOLD_SECS`). Pure function so tests
+    /// can drive synthetic skews deterministically.
+    #[must_use]
+    pub fn exceeds(&self, threshold_secs: f64) -> bool {
+        self.skew_secs.abs() >= threshold_secs
+    }
+}
+
+/// Errors from the boot-time clock-skew probe.
+///
+/// Hand-written `Display` / `Error` impls so the `app` crate does not
+/// pull in a new `thiserror` dependency for one enum.
+#[derive(Debug, Clone)]
+pub enum ClockSkewError {
+    /// Both probe paths (`chronyc` PRIMARY, QuestDB `SELECT now()`
+    /// FALLBACK) failed before producing a sample. The boot orchestrator
+    /// should log a WARN and proceed (not HALT) — refusing to boot when
+    /// we cannot even read the clock is brittle on dev hardware.
+    Unavailable {
+        /// Primary probe failure description.
+        primary: String,
+        /// Fallback probe failure description.
+        fallback: String,
+    },
+    /// Sample acquired and skew exceeded `CLOCK_SKEW_HALT_THRESHOLD_SECS`.
+    ThresholdExceeded {
+        /// Observed signed skew seconds.
+        skew_secs: f64,
+        /// Threshold that was exceeded.
+        threshold_secs: f64,
+        /// Probe source.
+        source: &'static str,
+    },
+}
+
+impl std::fmt::Display for ClockSkewError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable { primary, fallback } => write!(
+                f,
+                "clock-skew probe unavailable: {primary} (primary), {fallback} (fallback)"
+            ),
+            Self::ThresholdExceeded {
+                skew_secs,
+                threshold_secs,
+                source,
+            } => write!(
+                f,
+                "BOOT-03 clock skew {skew_secs:+.3}s exceeds threshold {threshold_secs:.2}s (source: {source})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ClockSkewError {}
+
+/// Reads `chronyc tracking` and parses the `Last offset` line.
+///
+/// Security review: `Command::new` + `args(&[...])` with a STATIC slice.
+/// No string interpolation, no shell, no env passthrough — argv cannot
+/// be influenced by external input. The `chronyc` binary itself comes
+/// from the host (Docker bind-mount) and is trusted. On hosts without
+/// chrony installed, this returns `Err` and the caller falls through.
+///
+/// `Last offset` line format:
+/// ```text
+/// Last offset     : -0.000007441 seconds
+/// ```
+fn probe_via_chronyc() -> Result<ClockSkewSample, String> {
+    // STATIC argv — argv is a `&[&str; 1]` literal. Security-reviewed:
+    // never mix in user input, never `format!`, never `env` passthrough.
+    let argv: &[&str; 1] = &["tracking"];
+    let output = std::process::Command::new("chronyc")
+        .args(argv.as_slice())
+        .output()
+        .map_err(|e| format!("chronyc spawn failed: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "chronyc tracking exited non-zero: {}",
+            output.status
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        // Tolerate locale variants — match prefix only.
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("Last offset") {
+            // After the colon, the value is `<sign?>0.NNNNN seconds`.
+            let after_colon = rest.split(':').nth(1).ok_or_else(|| {
+                format!("chronyc tracking 'Last offset' line malformed: {trimmed}")
+            })?;
+            let value = after_colon
+                .split_whitespace()
+                .next()
+                .ok_or_else(|| format!("chronyc tracking value missing: {trimmed}"))?;
+            let skew_secs: f64 = value
+                .parse()
+                .map_err(|e| format!("chronyc tracking value not f64 ('{value}'): {e}"))?;
+            return Ok(ClockSkewSample {
+                skew_secs,
+                source: "chronyc",
+            });
+        }
+    }
+    Err("chronyc tracking did not contain a 'Last offset' line".to_string())
+}
+
+/// Falls back to QuestDB `SELECT now()` over its HTTP `/exec` endpoint.
+///
+/// Returns the signed difference between `Utc::now()` and QuestDB's
+/// `now()`. QuestDB stores all timestamps in UTC, so the comparison is
+/// timezone-safe.
+async fn probe_via_questdb_now(questdb_config: &QuestDbConfig) -> Result<ClockSkewSample, String> {
+    let url = format!(
+        "http://{}:{}/exec?query=SELECT%20now()",
+        questdb_config.host, questdb_config.http_port
+    );
+    let client = reqwest::Client::builder()
+        .timeout(INFRA_PROBE_TIMEOUT)
+        .build()
+        .map_err(|e| format!("reqwest builder: {e}"))?;
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("questdb GET failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("questdb /exec status {}", resp.status()));
+    }
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| format!("questdb body read: {e}"))?;
+    // Body shape: `{"query":"SELECT now()","columns":[...],"dataset":[["2026-04-27T12:34:56.123456Z"]],...}`
+    // Lift the timestamp string out of the dataset without pulling in serde_json.
+    let dataset_marker = "\"dataset\":[[\"";
+    let from = body
+        .find(dataset_marker)
+        .ok_or_else(|| format!("questdb response missing dataset: {body}"))?
+        + dataset_marker.len();
+    let end = body[from..]
+        .find('"')
+        .ok_or_else(|| format!("questdb response malformed: {body}"))?;
+    let ts_str = &body[from..from + end];
+    let questdb_ts = chrono::DateTime::parse_from_rfc3339(ts_str)
+        .map_err(|e| format!("questdb timestamp '{ts_str}' parse: {e}"))?;
+    let local_ts = chrono::Utc::now();
+    let skew_secs = (local_ts.timestamp_micros() - questdb_ts.timestamp_micros()) as f64 / 1.0e6;
+    Ok(ClockSkewSample {
+        skew_secs,
+        source: "questdb_now",
+    })
+}
+
+/// Wave 2 Item 7.3 (G8) — sample wall-clock skew at boot.
+///
+/// PRIMARY: `chronyc tracking` shell-out (host has chrony installed in
+/// every prod + dev container per `deploy/`). FALLBACK: QuestDB
+/// `SELECT now()` over PG-wire — usable post-`wait_for_questdb_ready`.
+/// One probe, no try/catch chain — PRIMARY is attempted first, then
+/// FALLBACK if PRIMARY errored.
+///
+/// Returns `Ok(sample)` regardless of magnitude — the caller is
+/// responsible for comparing `sample.skew_secs.abs()` against
+/// `CLOCK_SKEW_HALT_THRESHOLD_SECS`. This split lets unit tests
+/// deterministically drive the threshold logic without a live clock.
+pub async fn probe_clock_skew(
+    questdb_config: &QuestDbConfig,
+) -> Result<ClockSkewSample, ClockSkewError> {
+    match probe_via_chronyc() {
+        Ok(sample) => {
+            // Emit a Prometheus gauge so dashboards can plot drift over
+            // time. `tv_clock_skew_seconds` is the canonical metric name.
+            metrics::gauge!("tv_clock_skew_seconds", "source" => sample.source)
+                .set(sample.skew_secs);
+            Ok(sample)
+        }
+        Err(primary_err) => {
+            debug!(
+                error = %primary_err,
+                "chronyc clock-skew probe failed, trying QuestDB fallback"
+            );
+            match probe_via_questdb_now(questdb_config).await {
+                Ok(sample) => {
+                    metrics::gauge!("tv_clock_skew_seconds", "source" => sample.source)
+                        .set(sample.skew_secs);
+                    Ok(sample)
+                }
+                Err(fallback_err) => Err(ClockSkewError::Unavailable {
+                    primary: primary_err,
+                    fallback: fallback_err,
+                }),
+            }
+        }
+    }
+}
+
+/// Convenience helper: runs [`probe_clock_skew`] and returns
+/// `Err(ThresholdExceeded)` if the magnitude exceeds the configured
+/// halt threshold. Boot orchestrator calls this; on Err it must HALT.
+pub async fn enforce_clock_skew_at_boot(
+    questdb_config: &QuestDbConfig,
+    threshold_secs: f64,
+) -> Result<ClockSkewSample, ClockSkewError> {
+    let sample = probe_clock_skew(questdb_config).await?;
+    if sample.exceeds(threshold_secs) {
+        return Err(ClockSkewError::ThresholdExceeded {
+            skew_secs: sample.skew_secs,
+            threshold_secs,
+            source: sample.source,
+        });
+    }
+    Ok(sample)
+}
+
+// ---------------------------------------------------------------------------
 // System health checks (cold path — called once at boot or periodically)
 // ---------------------------------------------------------------------------
 

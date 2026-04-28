@@ -202,6 +202,8 @@ pub enum ErrorCode {
     Boot01QuestDbSlow,
     /// BOOT-02: boot deadline exceeded (>60s) — HALTING.
     Boot02DeadlineExceeded,
+    /// BOOT-03: wall-clock skew vs trusted source exceeded threshold — HALTING.
+    Boot03ClockSkewExceeded,
     /// AUDIT-01: Phase 2 audit row write failed.
     Audit01Phase2WriteFailed,
     /// AUDIT-02: depth-rebalance audit row write failed.
@@ -337,6 +339,7 @@ impl ErrorCode {
             Self::AuthGap03TokenForceRenewedOnWake => "AUTH-GAP-03",
             Self::Boot01QuestDbSlow => "BOOT-01",
             Self::Boot02DeadlineExceeded => "BOOT-02",
+            Self::Boot03ClockSkewExceeded => "BOOT-03",
             Self::Audit01Phase2WriteFailed => "AUDIT-01",
             Self::Audit02DepthRebalanceWriteFailed => "AUDIT-02",
             Self::Audit03WsReconnectWriteFailed => "AUDIT-03",
@@ -389,7 +392,8 @@ impl ErrorCode {
             | Self::OmsGapCircuitBreaker
             | Self::OmsGapDryRunSafety
             | Self::InstrumentP0EmergencyDownload
-            | Self::Boot02DeadlineExceeded => Severity::Critical,
+            | Self::Boot02DeadlineExceeded
+            | Self::Boot03ClockSkewExceeded => Severity::Critical,
             // High: regulatory / order / risk / rate-limit
             Self::Dh904RateLimit
             | Self::Dh905InputException
@@ -521,6 +525,7 @@ impl ErrorCode {
             | Self::Audit06OrderWriteFailed
             | Self::StorageGap03AuditWriteFailed
             | Self::StorageGap04S3ArchiveFailed => ".claude/rules/project/wave-2-error-codes.md",
+            Self::Boot03ClockSkewExceeded => ".claude/rules/project/wave-2-c-error-codes.md",
             Self::Dh901InvalidAuth
             | Self::Dh902NoApiAccess
             | Self::Dh903AccountIssue
@@ -633,6 +638,7 @@ impl ErrorCode {
             Self::AuthGap03TokenForceRenewedOnWake,
             Self::Boot01QuestDbSlow,
             Self::Boot02DeadlineExceeded,
+            Self::Boot03ClockSkewExceeded,
             Self::Audit01Phase2WriteFailed,
             Self::Audit02DepthRebalanceWriteFailed,
             Self::Audit03WsReconnectWriteFailed,
@@ -791,7 +797,9 @@ mod tests {
         // 2026-04-27 (Wave 2): bumped 62 -> 76 for 14 new variants
         // (WS-GAP-04/05/06, AUTH-GAP-03, BOOT-01/02, AUDIT-01..06,
         // STORAGE-GAP-03/04).
-        assert_eq!(ErrorCode::all().len(), 76);
+        // 2026-04-27 (Wave 2-C Item 7.3): bumped 76 -> 77 for BOOT-03
+        // (clock-skew exceeded — HALTING).
+        assert_eq!(ErrorCode::all().len(), 77);
     }
 
     #[test]

@@ -710,6 +710,18 @@ pub enum NotificationEvent {
         step: String,
     },
 
+    /// Wave 2-C Item 7.3 (G8) — wall-clock skew vs trusted source exceeded
+    /// `CLOCK_SKEW_HALT_THRESHOLD_SECS`. Boot HALTS. Severity::Critical.
+    BootClockSkewExceeded {
+        /// Observed signed skew (positive = local clock ahead of trusted source).
+        skew_secs: f64,
+        /// Threshold that was exceeded (mirrors
+        /// `CLOCK_SKEW_HALT_THRESHOLD_SECS` from common::constants).
+        threshold_secs: f64,
+        /// Probe source that observed the skew (e.g., "chronyc", "questdb_now").
+        source: String,
+    },
+
     /// Order rejected by Dhan API or OMS validation.
     OrderRejected {
         /// Correlation ID of the rejected order.
@@ -1547,6 +1559,20 @@ impl NotificationEvent {
                     "<b>BOOT DEADLINE MISSED</b>\nDeadline: {deadline_secs}s\nBlocked at: {step}"
                 )
             }
+            Self::BootClockSkewExceeded {
+                skew_secs,
+                threshold_secs,
+                source,
+            } => {
+                format!(
+                    "<b>BOOT-03 CLOCK SKEW EXCEEDED — HALTING</b>\n\
+                     Source: {source}\n\
+                     Skew: {skew_secs:+.3}s (threshold ±{threshold_secs:.2}s)\n\
+                     IST timestamp math + DEDUP keys cannot be trusted.\n\
+                     Run on host: `chronyc tracking` then `chronyc -a makestep`.\n\
+                     Restart the app once `Last offset` < {threshold_secs:.2}s."
+                )
+            }
             Self::ShutdownInitiated => "<b>Shutdown initiated</b>".to_string(),
             Self::ShutdownComplete => "<b>tickvault stopped</b>".to_string(),
             Self::OrderRejected {
@@ -1625,6 +1651,7 @@ impl NotificationEvent {
         match self {
             Self::IpVerificationFailed { .. } => Severity::Critical,
             Self::BootDeadlineMissed { .. } => Severity::Critical,
+            Self::BootClockSkewExceeded { .. } => Severity::Critical,
             Self::AuthenticationFailed { .. } => Severity::Critical,
             // Transient auth blip — Low so no SMS escalation. If all retries
             // exhaust, the terminal path fires `AuthenticationFailed` at
