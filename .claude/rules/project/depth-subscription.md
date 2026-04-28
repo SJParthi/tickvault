@@ -98,29 +98,46 @@ Mandatory for any new depth/Phase-2 work. These shipped on branch
    count instead of `0/5` forever. Ratchet:
    `test_pool_watchdog_task_accepts_health_status`.
 
-## Stock F&O Expiry Rollover — STRICT ≤ 1 trading day (Fix #6, 2026-04-24)
+## Stock F&O Expiry Rollover — STRICT T-only (Fix #6, 2026-04-24; narrowed 2026-04-28)
 
-**Applies to stock F&O only. Indices (NIFTY / BANKNIFTY / FINNIFTY / MIDCPNIFTY)
-keep nearest expiry unconditionally.**
+**Applies to stock F&O only. Indices (NIFTY / BANKNIFTY / SENSEX) keep
+nearest expiry unconditionally.**
 
-The subscription planner rolls the subscribed expiry forward to the NEXT
-available expiry when `TradingCalendar::count_trading_days(today, nearest_expiry)
-<= STOCK_EXPIRY_ROLLOVER_TRADING_DAYS (= 1)`. Wednesday with a Thursday
-expiry → roll. Thursday-is-expiry → roll. Tuesday → keep nearest.
+**T-only rule (Parthiban 2026-04-28 narrowing):** The subscription planner
+rolls the subscribed expiry forward to the NEXT available expiry ONLY when
+today IS the expiry day itself: `TradingCalendar::count_trading_days(today,
+nearest_expiry) <= STOCK_EXPIRY_ROLLOVER_TRADING_DAYS (= 0)`.
+
+| Today | Days to expiry | Behaviour |
+|---|---:|---|
+| Thursday IS Thursday-expiry (T-0) | 0 | **ROLL** to next expiry |
+| Wednesday with Thursday expiry (T-1) | 1 | **KEEP** nearest (was: rolled until 2026-04-28) |
+| Tuesday with Thursday expiry (T-2) | 2 | **KEEP** nearest |
+
+**Why narrowed:** Dhan only blocks stock F&O trading on the expiry day
+itself (T-0). T-1 contracts are illiquid late in the day but still
+tradeable; subscribing to them is correct. The previous T-or-T-1 rule
+prematurely dropped one trading day of liquidity.
+
+**Applied at TWO subscription points (both go through the same helper):**
+1. **Boot-time stock F&O subscribe** (Phase 1 before 09:00 IST)
+2. **09:13 IST Phase 2 dispatch** (with finalized 09:12 close prices)
 
 **Enforced sites:**
-- `subscription_planner::build_subscription_plan` stock branch at line
-  ~297 — calls `select_stock_expiry_with_rollover` instead of the raw
-  nearest-expiry `find(|d| **d >= today)`.
+- `subscription_planner::build_subscription_plan` stock branch — calls
+  `select_stock_expiry_with_rollover` instead of the raw nearest-expiry
+  `find(|d| **d >= today)`.
 - `depth_strike_selector::select_depth_instruments` is **unchanged** —
   called only for indices (which never roll).
 
-**Ratchets:**
-- `test_stock_expiry_rolls_on_t_minus_1`
-- `test_stock_expiry_rolls_on_t`
+**Ratchets (UPDATED 2026-04-28):**
+- `test_stock_expiry_rollover_constant_is_zero` (NEW — locks constant at 0)
+- `test_stock_expiry_keeps_nearest_on_t_minus_1` (REWRITTEN — was: rolls)
+- `test_stock_expiry_rolls_only_on_t_zero` (RENAMED from `_rolls_on_t`)
 - `test_stock_expiry_stays_on_t_minus_2`
+- `test_stock_expiry_no_next_keeps_nearest_on_t_zero` (REWRITTEN — was: T-1)
+- `test_stock_rollover_applies_to_both_optstk_and_futstk` (UPDATED — uses T-0)
 - `test_index_expiry_never_rolls_via_planner`
-- `test_count_trading_days_expiry_day_from_t_minus_1`
 
 **Full runbook:** `docs/runbooks/expiry-day.md` → "Stock F&O Expiry Rollover".
 
