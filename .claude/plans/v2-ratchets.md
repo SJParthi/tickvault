@@ -94,6 +94,22 @@
 | 46 | `test_stock_expiry_keeps_nearest_on_t_minus_1` (REWRITE of existing) | Wed with Thu expiry → KEEP Thursday (was: roll) |
 | 47 | `test_stock_expiry_rolls_only_on_t_zero` | Thursday IS Thursday-expiry → roll to next month |
 
+### NEW — Depth-20 dynamic top-150 (4) — Phase 7
+
+| # | Test | Pins |
+|---|---|---|
+| 48 | `test_depth_20_top_150_selector_returns_at_most_150_rows` | LIMIT 150 enforced at SQL level |
+| 49 | `test_depth_20_top_150_selector_filters_change_pct_positive_only` | `WHERE change_pct > 0` filter applied (Option B) |
+| 50 | `test_depth_20_top_150_recompute_interval_is_60_seconds` | `tokio::time::interval(Duration::from_secs(60))` + `MissedTickBehavior::Skip` |
+| 51 | `test_depth_20_top_150_delta_swap_emits_correct_unsubscribe_subscribe_pair` | Set diff: leavers go to RequestCode 25, entrants go to RequestCode 23, both in same `Swap20` |
+
+### NEW — Depth-200 URL wipe-off verification (2) — Phase 6
+
+| # | Test | Pins |
+|---|---|---|
+| 52 | `test_depth_200_variants_example_does_not_exist` | `crates/core/examples/depth_200_variants.rs` is DELETED (no diagnostic A/B file in the example tree) |
+| 53 | `test_depth_200_root_path_locked_fact_still_present` | The locked-fact assertion in `dhan_locked_facts.rs` survives the wipe-off (regression-blocker preserved) |
+
 ### Existing ratchets to UPDATE (5 in `subscription_planner.rs::tests`)
 
 | Existing test | Old assertion | New assertion |
@@ -134,7 +150,7 @@
 
 ## Test count ratchet impact
 
-47 new + 5 rewritten + 2 DHAT + 3 Criterion + 1 chaos = **+58 net test moves**. Test-count ratchet only-increases.
+53 new + 5 rewritten + 2 DHAT + 3 Criterion + 1 chaos = **+64 net test moves**. Test-count ratchet only-increases.
 
 ## Coverage thresholds (100% per `crate-coverage-thresholds.toml`)
 

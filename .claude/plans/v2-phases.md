@@ -1,19 +1,27 @@
 # Movers 22-TF v3 — Phased commits + verification gates + go/no-go
 
-## 7 phased commits (was 6 in v2)
+## 13 phased commits (Phase 5 done; depth ships before movers Phase 1-7)
 
-| Phase | Commit | Files | LoC |
+| Phase | Commit | Files | LoC | Status |
+|---|---|---|---|---|
+| 5 | `fix(subscription): stock F&O expiry rollover T-only (was T-1)` — constant 1→0; 5 test rewrites; rule file + runbook update | `constants.rs`, `subscription_planner.rs`, `depth-subscription.md`, `expiry-day.md` | ~300 | **DONE (commit d428835)** |
+| 6 | **`chore(depth-200): wipe off /twohundreddepth dead code`** — delete `examples/depth_200_variants.rs` (~400 LoC of diagnostic), strip historical narrative comments referencing `/twohundreddepth` from prod files; KEEP the locked-fact ratchet + banned-pattern hook + one-line LOCKED FACT comment | `examples/depth_200_variants.rs` (DELETE), `depth_connection.rs` (comments only), `dhan_locked_facts.rs` (unchanged), `config.rs` (unchanged) | ~50 net LoC removed | **NEXT** |
+| 7 | **`feat(depth-20): dynamic top-150 selector + 1-minute Swap20 rebalance`** — new module `depth_20_dynamic_subscriber.rs`; queries `option_movers` table per minute, picks top 150 by `volume DESC` filtered by `change_pct > 0`; emits `Swap20 { unsubscribe: leavers, subscribe: entrants }` over existing channels; 4 new ratchets; uses `DEPTH-DYN-01/02` ErrorCodes (already RESERVED in `wave-4-error-codes.md`) | `depth_20_dynamic_subscriber.rs` (new), `main.rs` (boot wiring slot 3/4/5), `error_code.rs` (DEPTH-DYN-01/02 promote from RESERVED to defined), `error-rules.yaml`, `wave-4-error-codes.md` (RESERVED → defined), tests | ~600 | After 6 |
+| 8 | `feat(storage): 22 movers_{T} tables + DDL + DEDUP + partition manager + S3 lifecycle` (was Phase 1) | `materialized_views.rs`, `movers_22tf_persistence.rs`, `partition_manager.rs`, `s3-lifecycle-movers-tables.json`, 4 schema/lifecycle tests | ~500 | After 7 |
+| 9 | `feat(common): MoverRow 26-column Copy struct + 22-tf constants` (was Phase 2) | `mover_types.rs`, `constants.rs`, 3 tests | ~250 | After 8 |
+| 10 | `feat(core): papaya MoversTracker + arena snapshot + scheduler + supervisor + market-hours gate + 3-tier prev_close + F&O expiry filter + depth-cache lookup + spot-price lookup` (was Phase 3) | `top_movers.rs`, `movers_22tf_scheduler.rs`, `movers_22tf_supervisor.rs`, `movers_22tf_writer_state.rs`, 12 unit + supervisor + depth-cache integration tests | ~1,000 | After 9 |
+| 11 | `feat(observability): 10 metrics + 3 ErrorCodes + Triage YAML + 24-panel Grafana + 4 alert rules + drift/drop SLA + runbook` (was Phase 4) | `error_code.rs`, `events.rs`, `error-rules.yaml`, `movers-22tf.json` (24 panels: Stocks 2 + Index 2 + Options 7 + Futures 7 + Depth 6), `alerts.yml`, `wave-4-error-codes.md` (MOVERS-22TF-01..03 entries), runbook | ~600 | After 10 |
+| 12 | `test(movers): 47 ratchets + 2 DHAT + 3 Criterion + 1 chaos test (1M rows/sec)` (was Phase 6) | tests/, benches/, `benchmark-budgets.toml`, `chaos_movers_22tf_throughput.rs` | ~800 | After 11 |
+| 13 | `chore(hooks): banned-pattern cats 8/9/10 + make doctor sections 8/9 + dedup_segment_meta_guard extension` (was Phase 7) | `banned-pattern-scanner.sh`, `Makefile`, `dedup_segment_meta_guard.rs`, `scripts/doctor.sh` | ~200 | After 12 |
+| **Total NEW LoC after Phase 5** | | | **~4,000** | (split across 3 PRs below) |
+
+## PR splits (per stream-resilience.md B12 ≤ 3K LoC cap)
+
+| PR | Phases | LoC | Independence |
 |---|---|---|---|
-| 1 | `feat(storage): 22 movers_{T} tables + DDL + DEDUP + partition manager + S3 lifecycle` | `materialized_views.rs`, `movers_22tf_persistence.rs`, `partition_manager.rs`, `s3-lifecycle-movers-tables.json`, 4 schema/lifecycle tests | ~500 |
-| 2 | `feat(common): MoverRow 26-column Copy struct + 22-tf constants` | `mover_types.rs`, `constants.rs`, 3 tests | ~250 |
-| 3 | `feat(core): papaya MoversTracker + arena snapshot + scheduler + supervisor + market-hours gate + 3-tier prev_close + F&O expiry filter + depth-cache lookup + spot-price lookup` | `top_movers.rs`, `movers_22tf_scheduler.rs`, `movers_22tf_supervisor.rs`, `movers_22tf_writer_state.rs`, 12 unit tests + supervisor + depth-cache integration tests | ~1,000 |
-| 4 | `feat(observability): 10 metrics + 3 ErrorCodes + Triage YAML + 24-panel Grafana + 4 alert rules + drift/drop SLA + runbook` | `error_code.rs`, `events.rs`, `error-rules.yaml`, `movers-22tf.json` (24 panels: Stocks 2 + Index 2 + Options 7 + Futures 7 + Depth 6), `alerts.yml`, `wave-4-error-codes.md` (MOVERS-22TF-01..03 entries), runbook | ~600 |
-| 5 | **`fix(subscription): stock F&O expiry rollover T-only (was T-1)`** — flip constant 1→0; rewrite 5 ratchet tests; update `depth-subscription.md` rule file 2026-04-24 Updates §6; update `docs/runbooks/expiry-day.md`; cite Dhan support thread | `constants.rs`, `subscription_planner.rs`, `subscription_planner::tests` (rewrite 5), `depth-subscription.md`, `expiry-day.md`, plus 3 new ratchets (45/46/47) | ~300 |
-| 6 | `test(movers): 47 ratchets + 2 DHAT + 3 Criterion + 1 chaos test (1M rows/sec)` | tests/, benches/, `benchmark-budgets.toml`, `chaos_movers_22tf_throughput.rs` | ~800 |
-| 7 | `chore(hooks): banned-pattern cats 8/9/10 + make doctor sections 8/9 + dedup_segment_meta_guard extension` | `banned-pattern-scanner.sh`, `Makefile`, `dedup_segment_meta_guard.rs`, `scripts/doctor.sh` | ~200 |
-| **Total** | | | **~3,650 LoC** |
-
-⚠ Slightly over the 3K LoC stream-resilience.md B12 PR cap. **Recommend:** split Phase 5 (expiry rollover) into a SEPARATE PR shipping FIRST — it's independent of movers core and only touches subscription planner + 5 tests + 2 docs (~300 LoC). That puts the movers PR at ~3,350 LoC, marginal but acceptable.
+| PR-A (already merged via commit `d428835`) | Phase 5 | ~300 | Independent of movers + depth |
+| **PR-B (NEXT)** | Phase 6 + Phase 7 | ~650 | Independent of movers; uses existing `option_movers` table |
+| PR-C | Phase 8 + 9 + 10 + 11 + 12 + 13 | ~3,350 | Movers core; depends on PR-B's `option_movers` queries to be in production |
 
 ## Pre-merge verification gates (16 gates, was 14)
 

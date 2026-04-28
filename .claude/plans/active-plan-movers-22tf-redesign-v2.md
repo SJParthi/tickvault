@@ -119,11 +119,25 @@ See `v2-phases.md`. Recommendation: **ship Phase 5 (expiry rollover) as separate
 
 ## Plan status workflow
 
-1. **DRAFT** ← current (v3, pending approval)
-2. **APPROVED** ← after Parthiban GO on 7 open questions in `v2-risks.md`
-3. **IN_PROGRESS** ← Phase 1 commit lands
-4. **VERIFIED** ← `bash .claude/hooks/plan-verify.sh` green after Phase 7
-5. **ARCHIVED** ← `.claude/plans/archive/2026-04-28-movers-22tf-redesign-v3.md` after PR merge
+1. **DRAFT** ← (was) v3 pending approval
+2. **APPROVED** ← Parthiban "yes dude go ahead gooooooooooo" 2026-04-28
+3. **IN_PROGRESS** ← current (Phase 5 done; Phases 6+7 next, then 8-13)
+4. **VERIFIED** ← `bash .claude/hooks/plan-verify.sh` green after Phase 13
+5. **ARCHIVED** ← `.claude/plans/archive/2026-04-28-movers-22tf-redesign-v3.md` after final PR merge
+
+## Phase progress tracker
+
+| Phase | Description | Status | Commit |
+|---|---|---|---|
+| 5 | Stock F&O expiry rollover T-only | DONE | `d428835` |
+| 6 | Depth-200 URL wipe-off | NEXT | — |
+| 7 | Depth-20 dynamic top-150 | After 6 | — |
+| 8 | Movers 22 tables + DDL | After 7 | — |
+| 9 | MoverRow common types | After 8 | — |
+| 10 | papaya tracker + scheduler | After 9 | — |
+| 11 | Observability (24-panel Grafana) | After 10 | — |
+| 12 | Tests + chaos | After 11 | — |
+| 13 | Hooks + doctor | After 12 | — |
 
 ## Next action — STOP
 
