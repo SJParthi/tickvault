@@ -347,3 +347,16 @@ preopen_movers = true               # Item 10 — pre-open movers 09:00-09:13
 telegram_bucket_coalescer = true    # Item 11 — Telegram bucket coalescing
 market_open_self_test = true        # Item 12 — 09:15 IST self-test
 realtime_guarantee_score = true     # Item 13 — composite SLO score gauge
+
+# 2026-04-28 — depth-200 alternate auth path for the Dhan
+# `wss://full-depth-api.dhan.co/` endpoint, which rejects APP-type
+# tokens (our TOTP/automated flow) but accepts SELF-type tokens
+# (operator-pasted from web.dhan.co). Default `mode = "totp_app"`
+# keeps the existing behavior — no change unless the operator flips
+# this to "manual_self_with_renewal" AND populates the cache file.
+# See docs/dhan-support/2026-04-28-depth-200-app-vs-self-token.md.
+[depth_200_auth]
+mode = "totp_app"
+cache_path = "data/cache/depth-200-self-token-cache"
+renewal_interval_secs = 82800        # 23h — fires before 24h JWT expiry
+min_remaining_secs_at_boot = 3600    # accept cached token if >= 1h left

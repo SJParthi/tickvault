@@ -1659,6 +1659,19 @@ pub const IV_MAX_BOUND: f64 = 5.0;
 /// persistent data root, also used by rkyv instrument cache and log files.
 pub const TOKEN_CACHE_FILE_PATH: &str = "data/cache/tv-token-cache";
 
+/// 2026-04-28 — depth-200 SELF-token cache file path.
+///
+/// Distinct from `TOKEN_CACHE_FILE_PATH` because depth-200 uses a
+/// SELF-type token (operator-pasted from web.dhan.co) which is renewed
+/// via `GET /v2/RenewToken`, while the rest of the system uses an
+/// APP-type token minted by `POST /app/generateAccessToken`. Mixing
+/// the two caches would cause depth-200 to reuse the rejected APP
+/// token.
+///
+/// Gitignored. See `.claude/rules/dhan/full-market-depth.md` and
+/// `docs/dhan-support/2026-04-28-depth-200-app-vs-self-token.md`.
+pub const DEPTH_200_SELF_TOKEN_CACHE_PATH: &str = "data/cache/depth-200-self-token-cache";
+
 /// Minimum remaining token validity (hours) to accept a cached token.
 ///
 /// If the cached token expires in less than this, a full re-auth is performed.
