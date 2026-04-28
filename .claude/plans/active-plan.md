@@ -32,6 +32,18 @@
   - Files: crates/app/src/infra.rs
   - Tests: test_grafana_health_probe_polls_api_health_endpoint
 
+- [x] **5. Python depth-200 sidecar bridge v0** (replaces / supplements Rust depth-200 client which Dhan resets on ATM/expiry-day)
+  - Files: scripts/depth_200_bridge.py
+  - Files: scripts/depth_200_bridge_requirements.txt
+  - Files: scripts/depth_200_bridge_README.md
+  - Files: scripts/test_depth_200_bridge.py
+  - Tests: test_parses_bid_frame_into_levels
+  - Tests: test_parses_ask_frame
+  - Tests: test_disconnect_frame_returns_none
+  - Tests: test_zero_priced_levels_are_skipped
+  - Tests: test_ilp_line_format_matches_questdb_schema
+  - Tests: test_levels_are_one_indexed
+
 ## Verification
 
 ```bash
