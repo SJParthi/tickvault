@@ -248,6 +248,7 @@ impl Depth200SelfTokenManager {
     /// is missing, or the JWT fails validation. Operator runbook is
     /// keyed on the error text.
     #[instrument(skip_all, fields(ssm_param = %config.ssm_parameter_name))]
+    // TEST-EXEMPT: requires real AWS SSM credentials + network — covered by manual operator test on Mac and (future) integration test against a localstack mock.
     pub async fn boot_from_ssm(
         config: &Depth200AuthConfig,
         expected_client_id: String,
@@ -304,6 +305,7 @@ impl Depth200SelfTokenManager {
     /// `run_two_hundred_depth_connection` does not need any signature
     /// changes.
     #[must_use]
+    // TEST-EXEMPT: trivial getter for an internal Arc — exercised transitively by every depth-200 connection that calls it.
     pub fn handle(&self) -> &TokenHandle {
         &self.handle
     }
@@ -318,6 +320,7 @@ impl Depth200SelfTokenManager {
     /// caller via the notification service when wired into main.rs),
     /// retries on the next interval. Caller is responsible for any
     /// Telegram alerting.
+    // TEST-EXEMPT: spawns a long-lived tokio task with HTTP + SSM I/O — covered by manual operator test and future integration test against mocked Dhan + localstack.
     pub fn spawn_renewal_task(self: Arc<Self>) -> JoinHandle<()> {
         let manager = Arc::clone(&self);
         tokio::spawn(async move {
@@ -524,7 +527,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_accepts_valid_self_token() {
+    fn test_validate_self_claims_accepts_valid_token() {
         let claims = ParsedSelfClaims {
             token_consumer_type: "SELF".to_string(),
             exp: 2_000_000_000,
