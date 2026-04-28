@@ -1062,7 +1062,9 @@ groups:
           severity: high
 
       # Wave 1 / HOT-PATH-02: prev_close writer queue sustained drops.
-      - uid: tv-hot-path-02-prev-close-writer-sustained-drops
+      # UID kept ≤40 chars — Grafana 13 enforces this limit and refuses to
+      # provision otherwise (causes container crash-loop).
+      - uid: tv-hot-path-02-prev-close-drops
         title: "Wave 1 HOT-PATH-02: prev_close writer sustained drops"
         condition: C
         data:
