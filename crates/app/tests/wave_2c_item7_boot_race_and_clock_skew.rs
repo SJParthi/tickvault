@@ -168,13 +168,13 @@ fn test_boot_03_error_code_round_trips() {
     );
 }
 
-/// Item 7.3 — `enforce_clock_skew_at_boot` returns ThresholdExceeded
-/// (not Unavailable) when both probe paths produce skew >= threshold.
-/// We can't drive a real `chronyc` from a unit test, so we use the
-/// QuestDB-fallback path with an unreachable QuestDB to assert the
-/// `Unavailable` branch surfaces the WARN-not-HALT path.
+/// Item 7.3 — `enforce_clock_skew_at_boot` returns Unavailable
+/// (not ThresholdExceeded) when both probe paths fail before producing
+/// a sample. We can't drive a real `chronyc` from a unit test, so we
+/// use the QuestDB-fallback path with an unreachable QuestDB to assert
+/// the `Unavailable` branch surfaces the WARN-not-HALT path.
 #[tokio::test]
-async fn test_clock_skew_unavailable_does_not_halt() {
+async fn test_enforce_clock_skew_at_boot_unavailable_does_not_halt() {
     let cfg = unreachable_questdb_config();
     // chrony may or may not be installed in the test container — both
     // outcomes are acceptable. What matters: when both probes fail we
@@ -188,4 +188,74 @@ async fn test_clock_skew_unavailable_does_not_halt() {
              unreachable QuestDB must yield Unavailable or Ok (chronyc)"
         );
     }
+}
+
+/// Item 7.3 — `probe_clock_skew` is the public entry point sampled
+/// once at boot. Smoke test: returns either Ok(sample) or
+/// `Unavailable` against an unreachable QuestDB. Never panics.
+/// Named to satisfy the pub-fn-test-guard regex `test.*probe_clock_skew`.
+#[tokio::test]
+async fn test_probe_clock_skew_smoke_against_unreachable_questdb() {
+    let cfg = unreachable_questdb_config();
+    let result = tickvault_app::infra::probe_clock_skew(&cfg).await;
+    match result {
+        Ok(sample) => {
+            // chrony was reachable on the host — the sample is real.
+            assert!(
+                sample.source == "chronyc" || sample.source == "questdb_now",
+                "sample.source must be one of chronyc / questdb_now, got {}",
+                sample.source
+            );
+            assert!(sample.skew_secs.is_finite());
+        }
+        Err(ClockSkewError::Unavailable { .. }) => {
+            // chronyc + unreachable QuestDB → Unavailable. Boot
+            // proceeds with WARN per design.
+        }
+        Err(ClockSkewError::ThresholdExceeded { .. }) => {
+            panic!(
+                "probe_clock_skew alone never returns ThresholdExceeded; that's enforce_clock_skew_at_boot's job"
+            );
+        }
+    }
+}
+
+/// Item 7.3 — pure-function test for `ClockSkewSample::exceeds`. Drives
+/// every boundary case so the threshold-comparison code path is fully
+/// covered. Named to satisfy the pub-fn-test-guard regex `test.*exceeds`.
+#[test]
+fn test_clock_skew_sample_exceeds_threshold_boundaries() {
+    let threshold = CLOCK_SKEW_HALT_THRESHOLD_SECS;
+    // Strictly below threshold (1.99s) — does NOT exceed.
+    assert!(
+        !ClockSkewSample {
+            skew_secs: 1.99,
+            source: "synthetic",
+        }
+        .exceeds(threshold)
+    );
+    // Exactly at threshold — DOES exceed (>= comparison).
+    assert!(
+        ClockSkewSample {
+            skew_secs: threshold,
+            source: "synthetic",
+        }
+        .exceeds(threshold)
+    );
+    // Negative direction — abs() catches symmetric drift.
+    assert!(
+        ClockSkewSample {
+            skew_secs: -threshold,
+            source: "synthetic",
+        }
+        .exceeds(threshold)
+    );
+    // Tiny positive — does NOT exceed.
+    assert!(
+        !ClockSkewSample {
+            skew_secs: 0.001,
+            source: "synthetic",
+        }
+        .exceeds(threshold)
+    );
 }
