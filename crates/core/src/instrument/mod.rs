@@ -25,6 +25,7 @@ pub mod phase2_scheduler;
 pub mod preopen_price_buffer;
 pub mod preopen_rest_fallback;
 pub mod s3_backup;
+pub mod slo_score;
 pub mod subscription_planner;
 pub mod universe_builder;
 pub mod validation;
