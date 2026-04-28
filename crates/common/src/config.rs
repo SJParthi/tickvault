@@ -179,14 +179,18 @@ pub struct Depth200AuthConfig {
     /// - `"totp_app"` (default, no behavior change)
     /// - `"manual_self_with_renewal"`
     pub mode: String,
-    /// Cache file path holding the SELF JWT (operator-pasted, renewed
-    /// in-place by the renewal task). Gitignored.
-    pub cache_path: String,
+    /// AWS SSM Parameter Store path holding the SELF JWT
+    /// (operator-pasted via `web.dhan.co > Generate Access Token`,
+    /// renewed in-place by the manager's task via `PutParameter`).
+    /// SecureString, KMS `alias/aws/ssm` encrypted at rest. Per
+    /// CLAUDE.md "always real AWS SSM" — there is no local-disk
+    /// fallback for this token.
+    pub ssm_parameter_name: String,
     /// Renewal cadence in seconds. Default 82800 (23h) — fires before
-    /// the 24h JWT expiry to keep the cache always valid.
+    /// the 24h JWT expiry so the SSM value is always renewable.
     pub renewal_interval_secs: u64,
-    /// Minimum remaining validity (seconds) at boot to accept a cached
-    /// token without forcing the operator to paste a fresh one.
+    /// Minimum remaining validity (seconds) at boot to accept the cached
+    /// SSM token without forcing the operator to paste a fresh one.
     /// Default 3600 (1h).
     pub min_remaining_secs_at_boot: u64,
 }
@@ -195,7 +199,7 @@ impl Default for Depth200AuthConfig {
     fn default() -> Self {
         Self {
             mode: "totp_app".to_string(),
-            cache_path: "data/cache/depth-200-self-token-cache".to_string(),
+            ssm_parameter_name: crate::constants::DEPTH_200_SELF_TOKEN_SSM_PARAMETER.to_string(),
             renewal_interval_secs: 82_800,
             min_remaining_secs_at_boot: 3_600,
         }
@@ -218,7 +222,9 @@ impl Depth200AuthConfig {
     ///
     /// # Errors
     /// Returns an `anyhow::Error` if `mode` is not one of the two known
-    /// literals — typo-prevention at boot rather than a runtime surprise.
+    /// literals, if `renewal_interval_secs == 0`, or if
+    /// `ssm_parameter_name` is empty / does not begin with `/tickvault/`
+    /// — typo-prevention at boot rather than a runtime surprise.
     pub fn validate(&self) -> Result<()> {
         if self.mode != Self::MODE_TOTP_APP && self.mode != Self::MODE_MANUAL_SELF_WITH_RENEWAL {
             bail!(
@@ -231,8 +237,14 @@ impl Depth200AuthConfig {
         if self.renewal_interval_secs == 0 {
             bail!("depth_200_auth.renewal_interval_secs must be > 0");
         }
-        if self.cache_path.is_empty() {
-            bail!("depth_200_auth.cache_path must not be empty");
+        if self.ssm_parameter_name.is_empty() {
+            bail!("depth_200_auth.ssm_parameter_name must not be empty");
+        }
+        if !self.ssm_parameter_name.starts_with("/tickvault/") {
+            bail!(
+                "depth_200_auth.ssm_parameter_name must follow /tickvault/<env>/<service>/<key> convention, got \"{}\"",
+                self.ssm_parameter_name
+            );
         }
         Ok(())
     }
@@ -2340,12 +2352,26 @@ mod tests {
     }
 
     #[test]
-    fn test_depth_200_auth_default_cache_path_is_separate_from_main_token_cache() {
+    fn test_depth_200_auth_default_ssm_path_matches_constant() {
         let cfg = Depth200AuthConfig::default();
-        assert_ne!(cfg.cache_path, crate::constants::TOKEN_CACHE_FILE_PATH);
         assert_eq!(
-            cfg.cache_path,
-            crate::constants::DEPTH_200_SELF_TOKEN_CACHE_PATH
+            cfg.ssm_parameter_name,
+            crate::constants::DEPTH_200_SELF_TOKEN_SSM_PARAMETER
+        );
+    }
+
+    #[test]
+    fn test_depth_200_auth_default_ssm_path_follows_tickvault_convention() {
+        let cfg = Depth200AuthConfig::default();
+        assert!(
+            cfg.ssm_parameter_name.starts_with("/tickvault/"),
+            "SSM path must follow /tickvault/<env>/<service>/<key> convention, got {}",
+            cfg.ssm_parameter_name
+        );
+        assert!(
+            cfg.ssm_parameter_name.contains("/dhan/"),
+            "SSM path should be under /dhan/ service segment, got {}",
+            cfg.ssm_parameter_name
         );
     }
 
@@ -2394,9 +2420,18 @@ mod tests {
     }
 
     #[test]
-    fn test_depth_200_auth_validate_rejects_empty_cache_path() {
+    fn test_depth_200_auth_validate_rejects_empty_ssm_parameter_name() {
         let cfg = Depth200AuthConfig {
-            cache_path: String::new(),
+            ssm_parameter_name: String::new(),
+            ..Depth200AuthConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_depth_200_auth_validate_rejects_non_tickvault_ssm_path() {
+        let cfg = Depth200AuthConfig {
+            ssm_parameter_name: "/wrong/path/depth_200_self_token".to_string(),
             ..Depth200AuthConfig::default()
         };
         assert!(cfg.validate().is_err());
