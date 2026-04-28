@@ -544,6 +544,30 @@ mod tests {
     }
 
     #[test]
+    fn test_drain_mature_only_returns_aged_buckets() {
+        let c = TelegramCoalescer::new(CoalescerConfig {
+            window: Duration::from_millis(10),
+            flush_interval: Duration::from_millis(5),
+        });
+        c.observe("Foo", Severity::Low, || "x".to_string());
+        // Immediately drain — bucket too young.
+        assert!(c.drain_mature().is_empty());
+        // After window elapses, drain returns the bucket.
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(c.drain_mature().len(), 1);
+    }
+
+    #[test]
+    fn test_drain_all_empties_every_bucket() {
+        let c = make_coalescer(60_000);
+        c.observe("A", Severity::Low, || "1".into());
+        c.observe("B", Severity::Info, || "2".into());
+        let summaries = c.drain_all();
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(c.bucket_count(), 0);
+    }
+
+    #[test]
     fn test_observe_returns_bypass_for_high_and_critical() {
         let c = make_coalescer(60_000);
         assert_eq!(
