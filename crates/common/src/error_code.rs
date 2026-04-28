@@ -296,6 +296,19 @@ pub enum ErrorCode {
     Data813InvalidSecurityId,
     /// 814: Invalid request.
     Data814InvalidRequest,
+
+    // -----------------------------------------------------------------------
+    // Depth-200 SELF token (2026-04-28 — see
+    // `docs/architecture/depth-200-self-token-design.md`)
+    // -----------------------------------------------------------------------
+    /// SSM token failed validation at boot — APP type, wrong client_id,
+    /// expired, or corrupt JWT.
+    Depth200Auth01InvalidAtBoot,
+    /// `RenewToken` HTTP error / response not SELF / SSM PutParameter
+    /// failure during the 23h renewal cycle.
+    Depth200Auth02RenewalFailed,
+    /// AWS SSM unreachable — IAM, network, or KMS access issue.
+    Depth200Auth03SsmUnreachable,
 }
 
 impl ErrorCode {
@@ -406,6 +419,10 @@ impl ErrorCode {
             Self::Data812InvalidDateFormat => "DATA-812",
             Self::Data813InvalidSecurityId => "DATA-813",
             Self::Data814InvalidRequest => "DATA-814",
+            // Depth-200 SELF token (2026-04-28)
+            Self::Depth200Auth01InvalidAtBoot => "DEPTH200-AUTH-01",
+            Self::Depth200Auth02RenewalFailed => "DEPTH200-AUTH-02",
+            Self::Depth200Auth03SsmUnreachable => "DEPTH200-AUTH-03",
         }
     }
 
@@ -428,7 +445,10 @@ impl ErrorCode {
             | Self::InstrumentP0EmergencyDownload
             | Self::Boot02DeadlineExceeded
             | Self::Boot03ClockSkewExceeded
-            | Self::Selftest02Failed => Severity::Critical,
+            | Self::Selftest02Failed
+            | Self::Depth200Auth01InvalidAtBoot
+            | Self::Depth200Auth02RenewalFailed
+            | Self::Depth200Auth03SsmUnreachable => Severity::Critical,
             // Info: positive-ping / lifecycle confirmations
             Self::Selftest01Passed | Self::Slo01Healthy => Severity::Info,
             // High: composite SLO degradation summary signal
@@ -600,6 +620,11 @@ impl ErrorCode {
             | Self::Data812InvalidDateFormat
             | Self::Data813InvalidSecurityId
             | Self::Data814InvalidRequest => ".claude/rules/dhan/annexure-enums.md",
+            Self::Depth200Auth01InvalidAtBoot
+            | Self::Depth200Auth02RenewalFailed
+            | Self::Depth200Auth03SsmUnreachable => {
+                ".claude/rules/project/depth-200-auth-error-codes.md"
+            }
         }
     }
 
@@ -706,6 +731,9 @@ impl ErrorCode {
             Self::Selftest02Failed,
             Self::Slo01Healthy,
             Self::Slo02Degraded,
+            Self::Depth200Auth01InvalidAtBoot,
+            Self::Depth200Auth02RenewalFailed,
+            Self::Depth200Auth03SsmUnreachable,
         ]
     }
 }
@@ -867,7 +895,10 @@ mod tests {
         // 2026-04-28 (Wave 3-D Item 13): bumped 82 -> 84 for SLO-01
         // (healthy recovery) + SLO-02 (degraded/critical) — composite
         // real-time guarantee score.
-        assert_eq!(ErrorCode::all().len(), 84);
+        // 2026-04-28 (depth-200 SELF token): bumped 84 -> 87 for
+        // DEPTH200-AUTH-01/02/03 — alternate auth path for
+        // full-depth-api.dhan.co (rejects APP, accepts SELF).
+        assert_eq!(ErrorCode::all().len(), 87);
     }
 
     #[test]
@@ -896,7 +927,9 @@ mod tests {
                 // Wave 3-C: market-open self-test prefix
                 || s.starts_with("SELFTEST-")
                 // Wave 3-D: composite real-time guarantee score
-                || s.starts_with("SLO-");
+                || s.starts_with("SLO-")
+                // 2026-04-28: depth-200 SELF token alternate auth path
+                || s.starts_with("DEPTH200-AUTH-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }
