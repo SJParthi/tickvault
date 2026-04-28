@@ -186,6 +186,8 @@ pub enum ErrorCode {
     Movers01StockPersistFailed,
     /// MOVERS-02: option movers persistence failed.
     Movers02OptionPersistFailed,
+    /// MOVERS-03: pre-open movers snapshot persistence failed.
+    Movers03PreopenPersistFailed,
 
     // -----------------------------------------------------------------------
     // Wave 2 — resilience (Items 5–9)
@@ -347,6 +349,7 @@ impl ErrorCode {
             Self::PrevClose02FirstSeenInconsistency => "PREVCLOSE-02",
             Self::Movers01StockPersistFailed => "MOVERS-01",
             Self::Movers02OptionPersistFailed => "MOVERS-02",
+            Self::Movers03PreopenPersistFailed => "MOVERS-03",
             // Wave 2
             Self::WsGap04PostCloseSleep => "WS-GAP-04",
             Self::WsGap05PoolRespawn => "WS-GAP-05",
@@ -466,6 +469,7 @@ impl ErrorCode {
             | Self::PrevClose02FirstSeenInconsistency
             | Self::Movers01StockPersistFailed
             | Self::Movers02OptionPersistFailed
+            | Self::Movers03PreopenPersistFailed
             | Self::WsGap06TickGapSummary
             | Self::Audit01Phase2WriteFailed
             | Self::Audit02DepthRebalanceWriteFailed
@@ -536,7 +540,8 @@ impl ErrorCode {
             | Self::PrevClose01IlpFailed
             | Self::PrevClose02FirstSeenInconsistency
             | Self::Movers01StockPersistFailed
-            | Self::Movers02OptionPersistFailed => ".claude/rules/project/wave-1-error-codes.md",
+            | Self::Movers02OptionPersistFailed
+            | Self::Movers03PreopenPersistFailed => ".claude/rules/project/wave-1-error-codes.md",
             Self::WsGap04PostCloseSleep
             | Self::WsGap05PoolRespawn
             | Self::WsGap06TickGapSummary
@@ -664,6 +669,7 @@ impl ErrorCode {
             Self::PrevClose02FirstSeenInconsistency,
             Self::Movers01StockPersistFailed,
             Self::Movers02OptionPersistFailed,
+            Self::Movers03PreopenPersistFailed,
             Self::WsGap04PostCloseSleep,
             Self::WsGap05PoolRespawn,
             Self::WsGap06TickGapSummary,
@@ -835,11 +841,13 @@ mod tests {
         // STORAGE-GAP-03/04).
         // 2026-04-27 (Wave 2-C Item 7.3): bumped 76 -> 77 for BOOT-03
         // (clock-skew exceeded — HALTING).
-        // 2026-04-28 (Wave 3-B Item 11): bumped 77 -> 79 for TELEGRAM-01/02
+        // 2026-04-28 (Wave 3-A Item 10): bumped 77 -> 78 for MOVERS-03
+        // (pre-open movers persistence failed).
+        // 2026-04-28 (Wave 3-B Item 11): bumped 78 -> 80 for TELEGRAM-01/02
         // (Telegram bucket-coalescer hardening).
-        // 2026-04-28 (Wave 3-C Item 12): bumped 79 -> 81 for SELFTEST-01
+        // 2026-04-28 (Wave 3-C Item 12): bumped 80 -> 82 for SELFTEST-01
         // (passed) + SELFTEST-02 (failed) — market-open self-test.
-        assert_eq!(ErrorCode::all().len(), 81);
+        assert_eq!(ErrorCode::all().len(), 82);
     }
 
     #[test]
