@@ -1695,18 +1695,26 @@ impl NotificationEvent {
                 )
             }
             Self::RealtimeGuaranteeDegraded { score, weakest } => {
+                // Telegram HTML parse mode treats `<` and `>` as tag
+                // delimiters; literal `<` / `>` in the body returns 400
+                // Bad Request and the operator never sees the alert.
+                // Phrase the band as plain text instead.
                 format!(
                     "<b>Real-time guarantee score DEGRADED</b>\n\
-                     Composite score: {score:.3} (band [0.80, 0.95)).\n\
+                     Composite score: {score:.3} (band 0.80 to 0.95).\n\
                      Weakest dimension: {weakest}\n\
                      Code: SLO-02\n\
                      Action: see runbook .claude/rules/project/wave-3-d-error-codes.md"
                 )
             }
             Self::RealtimeGuaranteeCritical { score, weakest } => {
+                // Telegram HTML parse mode treats `<` and `>` as tag
+                // delimiters; literal `<` / `>` in the body returns 400
+                // Bad Request and the operator never sees the alert.
+                // Phrase the threshold as plain text instead.
                 format!(
                     "<b>REAL-TIME GUARANTEE SCORE CRITICAL</b>\n\
-                     Composite score: {score:.3} (< 0.80).\n\
+                     Composite score: {score:.3} (below 0.80).\n\
                      Weakest dimension: {weakest}\n\
                      Code: SLO-02\n\
                      Action: see runbook .claude/rules/project/wave-3-d-error-codes.md"
@@ -3875,5 +3883,68 @@ mod tests {
             "message must include total_subscribed; got: {msg}"
         );
         assert!(msg.contains("30500"), "message must include latency_ms");
+    }
+
+    /// Regression: 2026-04-28 — `RealtimeGuaranteeCritical` body contained
+    /// the literal phrase `(< 0.80)` which Telegram HTML parse mode treats
+    /// as the start of an unclosed tag, returning 400 Bad Request. The
+    /// operator never saw the SLO-02 page during a real CRITICAL event.
+    /// Strip valid `<b>`/`</b>` tags, then assert no other `<` / `>` remain.
+    #[test]
+    fn test_realtime_guarantee_critical_body_has_no_unescaped_html_brackets() {
+        let event = NotificationEvent::RealtimeGuaranteeCritical {
+            score: 0.0,
+            weakest: "phase2_health",
+        };
+        let body = event.to_message();
+        let stripped = body.replace("<b>", "").replace("</b>", "");
+        assert!(
+            !stripped.contains('<'),
+            "Telegram HTML mode rejects unescaped '<' — body was: {body}"
+        );
+        assert!(
+            !stripped.contains('>'),
+            "Telegram HTML mode rejects unescaped '>' — body was: {body}"
+        );
+    }
+
+    /// Same regression check for the Degraded variant — its body used to
+    /// contain `[0.80, 0.95)` which is bracket-safe but the parens-with-
+    /// `<` pattern is what crashed the Critical variant; keep this guard
+    /// so a future edit can't reintroduce a literal `<` here either.
+    #[test]
+    fn test_realtime_guarantee_degraded_body_has_no_unescaped_html_brackets() {
+        let event = NotificationEvent::RealtimeGuaranteeDegraded {
+            score: 0.85,
+            weakest: "ws_health",
+        };
+        let body = event.to_message();
+        let stripped = body.replace("<b>", "").replace("</b>", "");
+        assert!(
+            !stripped.contains('<'),
+            "Telegram HTML mode rejects unescaped '<' — body was: {body}"
+        );
+        assert!(
+            !stripped.contains('>'),
+            "Telegram HTML mode rejects unescaped '>' — body was: {body}"
+        );
+    }
+
+    /// Healthy variant uses the unicode `≥` glyph (not ASCII `>`), so it
+    /// has always been safe — pin it as a guard so a future "simplify to
+    /// >= " edit cannot regress it back into a 400-Bad-Request landmine.
+    #[test]
+    fn test_realtime_guarantee_healthy_body_has_no_unescaped_html_brackets() {
+        let event = NotificationEvent::RealtimeGuaranteeHealthy { score: 1.0 };
+        let body = event.to_message();
+        let stripped = body.replace("<b>", "").replace("</b>", "");
+        assert!(
+            !stripped.contains('<'),
+            "Telegram HTML mode rejects unescaped '<' — body was: {body}"
+        );
+        assert!(
+            !stripped.contains('>'),
+            "Telegram HTML mode rejects unescaped '>' — body was: {body}"
+        );
     }
 }

@@ -1,0 +1,7 @@
+# Pinned dependencies for the production depth-200 Python sidecar.
+# Install with: pip install -r scripts/depth_200_bridge_requirements.txt
+#
+# We use the raw `websockets` library (not the dhanhq SDK) because we
+# parse the binary depth frames ourselves and emit ILP straight to
+# QuestDB; the SDK's polling API would add an unneeded layer.
+websockets>=12.0,<16.0

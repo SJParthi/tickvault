@@ -97,9 +97,14 @@ pub async fn append_phase2_audit_row(
     // QuestDB SQL escape: replace single quotes with two single quotes.
     let escaped_diag = sanitize_audit_string(diagnostic);
     let escaped_outcome = sanitize_audit_string(outcome);
+    // QuestDB TIMESTAMP columns store microseconds since epoch. The
+    // caller passes IST wall-clock nanoseconds; divide by 1_000 before
+    // embedding so the value stays in the QuestDB year-9999 range.
+    let ts_micros_ist = ts_nanos_ist / 1_000;
+    let trading_date_ist_micros = trading_date_ist_nanos / 1_000;
     let sql = format!(
         "INSERT INTO {QUESTDB_TABLE_PHASE2_AUDIT} (ts, trading_date_ist, outcome, stocks_added, stocks_skipped, buffer_entries, diagnostic) VALUES \
-         ({ts_nanos_ist}, {trading_date_ist_nanos}, '{escaped_outcome}', {stocks_added}, {stocks_skipped}, {buffer_entries}, '{escaped_diag}');"
+         ({ts_micros_ist}, {trading_date_ist_micros}, '{escaped_outcome}', {stocks_added}, {stocks_skipped}, {buffer_entries}, '{escaped_diag}');"
     );
     let resp = client
         .get(&base_url)
@@ -176,5 +181,24 @@ mod tests {
         )
         .await;
         // Reaching this assertion proves no panic/format error in the SQL builder.
+    }
+
+    /// Regression: 2026-04-28 — INSERT used to embed `ts_nanos_ist`
+    /// directly into the SQL VALUES clause, but QuestDB TIMESTAMP columns
+    /// store microseconds since epoch, so a nanosecond value overflowed
+    /// year 9999 and the insert returned 400 ("designated timestamp
+    /// beyond 9999-12-31 is not allowed"). Source-scan ratchet locks
+    /// the fix in place.
+    #[test]
+    fn test_insert_sql_uses_microseconds_not_nanoseconds() {
+        let src = include_str!("phase2_audit_persistence.rs");
+        assert!(
+            src.contains("ts_micros_ist = ts_nanos_ist / 1_000"),
+            "INSERT must convert ts nanos to micros before embedding"
+        );
+        assert!(
+            src.contains("trading_date_ist_micros = trading_date_ist_nanos / 1_000"),
+            "INSERT must convert trading_date_ist nanos to micros"
+        );
     }
 }

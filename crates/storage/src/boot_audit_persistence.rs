@@ -13,7 +13,10 @@ use tickvault_common::config::QuestDbConfig;
 use tickvault_common::sanitize::sanitize_audit_string;
 
 pub const QUESTDB_TABLE_BOOT_AUDIT: &str = "boot_audit";
-pub const DEDUP_KEY_BOOT_AUDIT: &str = "boot_id, step";
+// QuestDB requires the designated timestamp column to be present in
+// DEDUP UPSERT KEYS — without `ts` the CREATE TABLE returned 400 Bad Request
+// on 2026-04-28 boot, leaving the table missing for the entire session.
+pub const DEDUP_KEY_BOOT_AUDIT: &str = "boot_id, step, ts";
 
 const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 
@@ -82,9 +85,13 @@ pub async fn append_boot_audit_row(
     let step_esc = sanitize_audit_string(step);
     let outcome_esc = sanitize_audit_string(outcome);
     let detail_esc = sanitize_audit_string(detail);
+    // QuestDB TIMESTAMP columns store microseconds since epoch. The
+    // caller passes IST wall-clock nanoseconds; divide by 1_000 before
+    // embedding so the value stays in the QuestDB year-9999 range.
+    let ts_micros_ist = ts_nanos_ist / 1_000;
     let sql = format!(
         "INSERT INTO {QUESTDB_TABLE_BOOT_AUDIT} (ts, boot_id, step, outcome, elapsed_ms, detail) VALUES \
-         ({ts_nanos_ist}, '{boot_id_esc}', '{step_esc}', '{outcome_esc}', {elapsed_ms}, '{detail_esc}');"
+         ({ts_micros_ist}, '{boot_id_esc}', '{step_esc}', '{outcome_esc}', {elapsed_ms}, '{detail_esc}');"
     );
     let resp = client
         .get(&base_url)
@@ -117,6 +124,37 @@ mod tests {
         assert!(!DEDUP_KEY_BOOT_AUDIT.contains("security_id"));
         assert!(DEDUP_KEY_BOOT_AUDIT.contains("boot_id"));
         assert!(DEDUP_KEY_BOOT_AUDIT.contains("step"));
+    }
+
+    /// Regression: 2026-04-28 — QuestDB requires the designated timestamp
+    /// column to be present in DEDUP UPSERT KEYS. Without `ts` the CREATE
+    /// TABLE returned 400 Bad Request and the table was missing for the
+    /// entire session, breaking every subsequent `boot_audit` insert.
+    #[test]
+    fn test_dedup_key_includes_designated_timestamp() {
+        assert!(
+            DEDUP_KEY_BOOT_AUDIT.contains("ts"),
+            "boot_audit DEDUP key must include `ts` (designated timestamp); \
+             QuestDB rejects DDL otherwise. Got: {DEDUP_KEY_BOOT_AUDIT}"
+        );
+    }
+
+    /// Regression: 2026-04-28 — the function used to embed `ts_nanos_ist`
+    /// directly into the SQL VALUES clause, but QuestDB TIMESTAMP columns
+    /// store microseconds since epoch, so a nanosecond value overflowed
+    /// year 9999 and the insert returned 400. The fix divides by 1_000.
+    /// This source-scan ratchet locks the conversion in place.
+    #[test]
+    fn test_insert_sql_uses_microseconds_not_nanoseconds() {
+        let src = include_str!("boot_audit_persistence.rs");
+        assert!(
+            src.contains("ts_micros_ist = ts_nanos_ist / 1_000"),
+            "INSERT must convert nanos to micros before embedding"
+        );
+        assert!(
+            !src.contains("VALUES \\\n         ({ts_nanos_ist}"),
+            "INSERT must NOT embed raw nanoseconds in TIMESTAMP column"
+        );
     }
 
     #[test]

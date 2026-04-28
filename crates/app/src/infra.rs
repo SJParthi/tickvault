@@ -43,6 +43,11 @@ const DOCKER_DAEMON_TIMEOUT: Duration = Duration::from_secs(90);
 /// Polling interval when waiting for services to become healthy.
 const INFRA_HEALTH_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Per-attempt HTTP request timeout for `wait_for_http_endpoint_healthy`.
+/// Short — the endpoint either responds quickly or it isn't ready yet,
+/// in which case we'd rather move on to the next poll.
+const HTTP_HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Timeout for QuestDB liveness HTTP check (SELECT 1).
 ///
 /// 15s is high enough that a QuestDB under heavy ILP ingestion pressure
@@ -257,6 +262,16 @@ pub async fn ensure_infra_running(questdb_config: &QuestDbConfig) {
     // Wait for all critical services to become healthy.
     wait_for_service_healthy("QuestDB", &questdb_config.host, questdb_config.http_port).await;
     wait_for_service_healthy("Grafana", GRAFANA_HOST, GRAFANA_PORT).await;
+    // The TCP probe above only proves the port is open — Grafana opens
+    // the listener several seconds before its HTTP server is ready. On
+    // 2026-04-28 boot the TCP probe completed in 0.4s but Grafana was
+    // still 5-10s away from serving requests, leaving the operator
+    // staring at ERR_CONNECTION_REFUSED. Wait for /api/health = 200.
+    wait_for_http_endpoint_healthy(
+        "Grafana",
+        &format!("http://{GRAFANA_HOST}:{GRAFANA_PORT}/api/health"),
+    )
+    .await;
     wait_for_service_healthy("Prometheus", LOCAL_HOST, PROMETHEUS_PORT).await;
     wait_for_service_healthy("Valkey", LOCAL_HOST, VALKEY_PORT).await;
 
@@ -1191,6 +1206,53 @@ async fn wait_for_service_healthy(name: &str, host: &str, port: u16) {
     );
 }
 
+/// Polls an HTTP endpoint until it returns a 2xx response or the timeout
+/// expires. Stricter than `wait_for_service_healthy` (which only proves
+/// the TCP port is open) — Grafana in particular opens its listener
+/// several seconds before the HTTP server is ready to serve requests.
+async fn wait_for_http_endpoint_healthy(name: &str, url: &str) {
+    let start = std::time::Instant::now();
+    let client = reqwest::Client::builder()
+        .timeout(HTTP_HEALTH_PROBE_TIMEOUT)
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+
+    while start.elapsed() < INFRA_HEALTH_TIMEOUT {
+        match client.get(url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                info!(service = name, url, "HTTP endpoint is healthy");
+                return;
+            }
+            Ok(resp) => {
+                debug!(
+                    service = name,
+                    url,
+                    status = %resp.status(),
+                    elapsed_secs = start.elapsed().as_secs(),
+                    "HTTP endpoint not yet healthy"
+                );
+            }
+            Err(err) => {
+                debug!(
+                    service = name,
+                    url,
+                    %err,
+                    elapsed_secs = start.elapsed().as_secs(),
+                    "HTTP endpoint not reachable yet"
+                );
+            }
+        }
+        tokio::time::sleep(INFRA_HEALTH_POLL_INTERVAL).await;
+    }
+
+    warn!(
+        service = name,
+        url,
+        timeout_secs = INFRA_HEALTH_TIMEOUT.as_secs(),
+        "HTTP endpoint did not become healthy within timeout — continuing anyway"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1263,6 +1325,31 @@ mod tests {
     #[test]
     fn test_health_poll_interval_less_than_timeout() {
         assert!(INFRA_HEALTH_POLL_INTERVAL < INFRA_HEALTH_TIMEOUT);
+    }
+
+    /// Regression: 2026-04-28 — boot logged "Grafana service is healthy"
+    /// 0.4 s after `docker compose up -d` returned, but Grafana's HTTP
+    /// server takes 5–10 s to come up. The TCP probe was passing on a
+    /// listener that wasn't serving yet, leading to operator-visible
+    /// ERR_CONNECTION_REFUSED in the browser. The fix layers an HTTP
+    /// probe of `/api/health` on top of the TCP probe. Source-scan
+    /// ratchet locks both pieces in place.
+    #[test]
+    fn test_grafana_health_probe_polls_api_health_endpoint() {
+        let src = include_str!("infra.rs");
+        assert!(
+            src.contains("async fn wait_for_http_endpoint_healthy"),
+            "infra must define an HTTP-level health probe helper"
+        );
+        assert!(
+            src.contains("wait_for_http_endpoint_healthy(\n        \"Grafana\",")
+                || src.contains("wait_for_http_endpoint_healthy(\"Grafana\","),
+            "infra must call wait_for_http_endpoint_healthy with Grafana as the service name"
+        );
+        assert!(
+            src.contains("/api/health"),
+            "Grafana HTTP probe must hit the /api/health endpoint"
+        );
     }
 
     #[test]

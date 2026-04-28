@@ -97,9 +97,13 @@ pub async fn append_depth_rebalance_audit_row(
     let underlying = sanitize_audit_string(underlying_symbol);
     let levels = sanitize_audit_string(swap_levels);
     let outcome_esc = sanitize_audit_string(outcome);
+    // QuestDB TIMESTAMP columns store microseconds since epoch. The
+    // caller passes IST wall-clock nanoseconds; divide by 1_000 before
+    // embedding so the value stays in the QuestDB year-9999 range.
+    let ts_micros_ist = ts_nanos_ist / 1_000;
     let sql = format!(
         "INSERT INTO {QUESTDB_TABLE_DEPTH_REBALANCE_AUDIT} (ts, underlying_symbol, old_atm_strike, new_atm_strike, spot_at_swap, swap_levels, outcome) VALUES \
-         ({ts_nanos_ist}, '{underlying}', {old_atm_strike}, {new_atm_strike}, {spot_at_swap}, '{levels}', '{outcome_esc}');"
+         ({ts_micros_ist}, '{underlying}', {old_atm_strike}, {new_atm_strike}, {spot_at_swap}, '{levels}', '{outcome_esc}');"
     );
     let resp = client
         .get(&base_url)
@@ -161,5 +165,16 @@ mod tests {
         let _ =
             append_depth_rebalance_audit_row(&cfg, 0, "BANK'NIFTY", 0.0, 0.0, 0.0, "20", "success")
                 .await;
+    }
+
+    /// Regression: 2026-04-28 — see phase2_audit_persistence.rs for the
+    /// nanos-to-micros bug class. Source-scan ratchet locks the fix.
+    #[test]
+    fn test_insert_sql_uses_microseconds_not_nanoseconds() {
+        let src = include_str!("depth_rebalance_audit_persistence.rs");
+        assert!(
+            src.contains("ts_micros_ist = ts_nanos_ist / 1_000"),
+            "INSERT must convert nanos to micros before embedding"
+        );
     }
 }

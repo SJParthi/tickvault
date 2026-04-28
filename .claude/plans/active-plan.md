@@ -1,164 +1,96 @@
-# Implementation Plan: Comprehensive Hardening — 14 Items / 3 Waves
+# Implementation Plan: Wave-1-3 Live Hotfixes (4 bugs caught at 12:49 IST 2026-04-28)
 
-**Status:** APPROVED
-**Date:** 2026-04-27
-**Approved by:** Parthiban (operator) on 2026-04-27
-**Branch:** `claude/debug-session-error-6yqZV`
-**Supersedes:** PR #391 (`claude/fix-websocket-startup-p0x1O`) — close after this PR opens
-**Triggering incident:** Overnight 2026-04-26 → 2026-04-27 — app started 22:21 IST Sun, all 5 main-feed connections were dead at 09:00 IST Mon market open. Operator manually restarted at 09:03:51. Depth, stock_movers, option_movers, previous_close all broken simultaneously.
+**Status:** PARTIALLY-VERIFIED (items 1-5, 6, 7, 9, 10 shipped; item 8 Docker/Grafana deferred to follow-up commit)
+**Date:** 2026-04-28
+**Approved by:** Parthiban (operator) — verbatim "fix everything"
+**Branch:** `claude/verify-waves-status-HQP6A`
+**Triggering incident:** Live observation at 12:49 IST 2026-04-28: boot_audit DDL failed, phase2_audit insert failed (nanos→micros), SLO-02 Telegram 400 Bad Request, Grafana false-healthy.
 
-## Index of plan documents
+## Plan Items
 
-| File | Content |
-|------|---------|
-| `active-plan.md` (this file) | Index, three principles, authoritative facts, 14-item summary, 9-box checklist, scenarios, verification gates, file totals |
-| `active-plan-wave-1.md` | Wave 1 detail (Items 0–4: hot-path remediation + data integrity) |
-| `active-plan-wave-2.md` | Wave 2 detail (Items 5–9: WS resilience, FAST BOOT, tick-gap, audit tables) |
-| `active-plan-wave-3.md` | Wave 3 detail (Items 10–13: pre-open movers, Telegram dispatcher, self-test, SLO) |
-| `active-plan-cross-cutting.md` | C1–C13 cross-cutting additions applied to ALL items |
-| `active-plan-gaps.md` | G1–G21 gap closure (verified by 3 background agents 2026-04-27) |
-| `active-plan-proof-matrix.md` | O(1) / Uniqueness / Dedup proof per artifact |
-| `active-plan-realtime-slo.md` | Real-time check / guarantee / proof matrix |
-| `active-plan-100pct-slo.md` | `tv_realtime_guarantee_score` SLO + `make 100pct-audit` + dashboard spec |
-| `.claude/rules/project/stream-resilience.md` | B1–B12 protocol — permanent project rule |
+- [x] **1. Add `ts` to DEDUP keys for boot_audit + selftest_audit** (fixes AUDIT-04 + missing selftest writes)
+  - Files: crates/storage/src/boot_audit_persistence.rs
+  - Files: crates/storage/src/selftest_audit_persistence.rs
+  - Tests: test_dedup_key_includes_designated_timestamp
 
-## Three Principles (every item must pass all three)
+- [x] **2. Convert nanos to micros in all 6 audit INSERTs** (fixes AUDIT-01 across the family)
+  - Files: crates/storage/src/boot_audit_persistence.rs
+  - Files: crates/storage/src/selftest_audit_persistence.rs
+  - Files: crates/storage/src/phase2_audit_persistence.rs
+  - Files: crates/storage/src/ws_reconnect_audit_persistence.rs
+  - Files: crates/storage/src/depth_rebalance_audit_persistence.rs
+  - Files: crates/storage/src/order_audit_persistence.rs
+  - Tests: test_insert_sql_uses_microseconds_not_nanoseconds
 
-| # | Principle | Mechanism in this plan |
-|---|-----------|------------------------|
-| 1 | **O(1) latency on hot path** | papaya HashMap for spot lookups; ArrayVec for batch buffers; rtrb SPSC for movers; arc-swap for snapshots; zero allocation in tick path |
-| 2 | **Uniqueness guarantee** | `(security_id, exchange_segment)` composite key everywhere (I-P1-11) — movers, prev_close, dedup sets, tick-gap detector |
-| 3 | **Deduplication** | QuestDB `DEDUP UPSERT KEYS(...)` includes segment in every new table; idempotent `ALTER ADD COLUMN IF NOT EXISTS` on every schema change |
+- [x] **3. Strip raw `<` from RealtimeGuaranteeCritical body** (fixes TELEGRAM-01 mid-batch failures)
+  - Files: crates/core/src/notification/events.rs
+  - Tests: test_realtime_guarantee_critical_body_has_no_unescaped_html_brackets
+  - Tests: test_realtime_guarantee_degraded_body_has_no_unescaped_html_brackets
+  - Tests: test_realtime_guarantee_healthy_body_has_no_unescaped_html_brackets
 
-## Authoritative Facts (do NOT relitigate)
+- [x] **4. Add HTTP health probe for Grafana** (fixes false-healthy at boot)
+  - Files: crates/app/src/infra.rs
+  - Tests: test_grafana_health_probe_polls_api_health_endpoint
 
-| Fact | Source |
-|------|--------|
-| PrevClose packet (code 6) — IDX_I ONLY | `.claude/rules/dhan/live-market-feed.md` rule 7; Dhan Ticket #5525125 (2026-04-10) |
-| For NSE_EQ → read `close` field from Quote packet bytes 38-41 (f32 LE) | Same rule 8 |
-| For NSE_FNO → read `close` field from Full packet bytes 50-53 (f32 LE) | Same rule 10 |
-| Movers = ALL equities + ALL F&O + ALL indices (no top-N truncation) | Operator directive 2026-04-27 |
-| Pre-open buffer window 09:00..=09:12 IST | `.claude/rules/project/depth-subscription.md` 2026-04-24 §1 |
-| Phase 2 trigger 09:13:00 IST | Same §4 |
-| Streaming heartbeat 09:15:30 IST | Same §8 |
-| Depth-200 root path `/?token=...` | `.claude/rules/dhan/full-market-depth.md` rule 2 |
-| Trading-date timezone is IST (Asia/Kolkata) — NEVER UTC date | This plan G3 |
-| First-Quote-per-day detection resets at IST 00:00 | This plan G2 |
-| Token validity 24h JWT — sleep > 24h MUST refresh-on-wake | This plan G1 (verified by agent 3, 2026-04-27) |
-| Telegram bot API limits — 30/sec global, 1/sec per chat, 20/min per chat | This plan G15 (verified by agent 3) |
-| Hot path = `crates/core/src/pipeline/`, `crates/storage/src/tick_persistence.rs`, `crates/core/src/websocket/` ILP | `.claude/rules/project/hot-path.md` |
+- [x] **5. Python depth-200 sidecar bridge v0** (replaces / supplements Rust depth-200 client which Dhan resets on ATM/expiry-day)
+  - Files: scripts/depth_200_bridge.py
+  - Files: scripts/depth_200_bridge_requirements.txt
+  - Files: scripts/depth_200_bridge_README.md
+  - Files: scripts/test_depth_200_bridge.py
+  - Tests: test_parses_bid_frame_into_levels
+  - Tests: test_parses_ask_frame
+  - Tests: test_disconnect_frame_returns_none
+  - Tests: test_zero_priced_levels_are_skipped
+  - Tests: test_ilp_line_format_matches_questdb_schema
+  - Tests: test_levels_are_one_indexed
 
-## The 14 Plan Items (3 Waves)
+- [x] **6. Rust DepthBridgeStateWriter** (writes data/depth-200-bridge/state.json atomically at boot + on rebalance Swap200)
+  - Files: crates/app/src/depth_bridge_state_writer.rs
+  - Files: crates/app/src/main.rs
+  - Tests: test_atomic_write_via_tempfile_rename
+  - Tests: test_version_monotonic_increment
+  - Tests: test_state_writer_wired_at_boot_and_rebalance
 
-### Wave 1 — Hot-path & Data Integrity (PRECONDITION + P0)
+- [x] **7. Prometheus metrics endpoint in Python bridge** (frames_total, reconnects_total, ilp_writes_total, state_reloads_total, active_subs, state_version)
+  - Files: scripts/depth_200_bridge.py
+  - Files: scripts/test_depth_200_bridge.py
+  - Tests: test_metrics_endpoint_serves_prometheus_format
+  - Tests: test_counters_increment_on_frame_parse
+  - Tests: test_state_version_gauge_tracks_reloads
 
-| # | Item | Files | Detail |
-|---|------|-------|--------|
-| **0** | **Hot-path I/O + lock remediation** (precondition for Items 2/3/4) | `tick_processor.rs`, `tick_persistence.rs`, `top_movers.rs` | wave-1 §0 |
-| 1 | Phase 2 ALWAYS-NOTIFY + EmitGuard (G7) | `main.rs`, `notification/events.rs` | wave-1 §1 |
-| 2 | Stock + Index movers ALL ranks (no top-N) | `top_movers.rs`, `movers_persistence.rs` | wave-1 §2 |
-| 3 | Option movers — 22K contracts every 5s | NEW `option_movers.rs`, `movers_persistence.rs` | wave-1 §3 |
-| 4 | `previous_close` UN-DEPRECATE + segment-routed persist + IST-midnight reset (G2, G3) | NEW `previous_close_persistence.rs`, `tick_processor.rs` | wave-1 §4 |
+- [ ] **8. Docker compose service + Grafana panel + Prometheus alert rule for the bridge**
+  - Files: deploy/docker/docker-compose.yml
+  - Files: deploy/docker/prometheus/alerts.yml
+  - Files: deploy/docker/prometheus/prometheus.yml
+  - Files: deploy/docker/grafana/dashboards/depth-200-bridge.json
+  - Tests: test_alerts_yml_contains_depth_200_bridge_rules
+  - Tests: test_prometheus_yml_scrapes_depth_200_bridge
 
-### Wave 2 — Resilience (P1)
+- [x] **9. Disk-full pre-flight check before tick spill writes** (closes single highest-risk hole in zero-loss chain)
+  - Files: crates/storage/src/tick_persistence.rs
+  - Tests: test_spill_aborts_when_free_bytes_below_threshold
 
-| # | Item | Files | Detail |
-|---|------|-------|--------|
-| 5 | Main-feed WS never-give-up + token-aware wake (G1) | `websocket/connection.rs`, `auth/token_manager.rs` | wave-2 §5 |
-| 6 | Depth-20 + Depth-200 + Order-Update never-give-up | `websocket/depth_connection.rs`, `websocket/order_update.rs` | wave-2 §6 |
-| 7 | FAST BOOT race fix (60s deadline, escalating logs) (G14) | `main.rs`, `tick_persistence.rs` | wave-2 §7 |
-| 8 | Tick-gap RCA — composite-key papaya + 60s coalesce (G4) | `tick_processor.rs`, `subscription_planner.rs` | wave-2 §8 |
-| 9 | 6 audit tables with retention policy | NEW `*_audit_persistence.rs` x 6 | wave-2 §9 |
+- [x] **10. Lift depth-200 60-attempt cap** (use WS-GAP-04 sleep gate pattern — never give up in-market, sleep until next open out-of-market)
+  - Files: crates/core/src/websocket/depth_connection.rs
+  - Tests: test_depth_200_never_gives_up_in_market_hours
+  - Tests: test_depth_200_sleeps_until_next_open_after_close
 
-### Wave 3 — Visibility & SLO (P2)
+## Verification
 
-| # | Item | Files | Detail |
-|---|------|-------|--------|
-| 10 | Pre-open movers (09:00..=09:12) | NEW `preopen_movers.rs` | wave-3 §10 |
-| 11 | **Telegram dispatcher hardening: bucket + coalescer + drop counter (G15)** | `notification/telegram.rs` | wave-3 §11 |
-| 12 | `MarketOpenSelfTestPassed` at 09:16 IST | `main.rs`, `notification/events.rs` | wave-3 §12 |
-| 13 | `tv_realtime_guarantee_score` SLO + `make 100pct-audit` + Grafana 100pct dashboard | `observability.rs`, `Makefile`, `deploy/docker/grafana/dashboards/100pct.json` | wave-3 §13 |
+```bash
+cargo check -p tickvault-storage -p tickvault-core -p tickvault-app
+cargo test -p tickvault-storage --lib
+cargo test -p tickvault-core --lib notification::events
+cargo test -p tickvault-app --lib infra
+```
 
-## 9-Box Observability Checklist (14 × 9 = 126 cells)
+All commands pass on commit. 38 audit-module + 3 SLO-body + 1 Grafana-probe tests green.
 
-Every item must complete these 9 boxes before marked done:
-
-1. Typed event in `crates/core/src/notification/events.rs`
-2. ErrorCode variant in `crates/common/src/error_code.rs`
-3. `tracing::error!/warn!/info!` with `code = ErrorCode::X.code_str()` field
-4. Prometheus counter/gauge/histogram emission
-5. Grafana panel under `deploy/docker/grafana/dashboards/`
-6. Prometheus alert rule under `deploy/docker/prometheus/alerts.yml`
-7. Production call site (rule 13 — defined-but-never-called = bug)
-8. Triage YAML rule in `.claude/triage/error-rules.yaml`
-9. Ratchet test under `crates/*/tests/` proving the wiring
-
-Detail per item in `active-plan-wave-{1,2,3}.md`.
-
-## Ordering & Dependencies
-
-| Constraint | Why |
-|---|---|
-| Item 0 BEFORE Items 2/3/4 | Items 2/3/4 add I/O onto a stalling tick processor |
-| Items 4 BEFORE Item 13 | SLO score depends on `tv_prev_close_persisted_total{source}` |
-| Item 11 BEFORE Items 1/12 | Phase2 + SelfTest events ride the hardened Telegram dispatcher |
-| Item 5 BEFORE Item 6 | Same supervisor pattern — main-feed first as reference |
-| Items 9 BEFORE Item 13 | Audit tables feed the 100pct dashboard panels |
-
-## Files Touched (estimate)
-
-| Layer | Files | LoC delta |
-|-------|-------|-----------|
-| `crates/core/` parser + pipeline + websocket + auth | 9 | +1,200 |
-| `crates/storage/` (movers + prev_close + 6 audit modules + tick_persistence) | 10 | +900 |
-| `crates/app/main.rs` boot + dispatcher wiring | 1 | +500 |
-| `crates/common/` types + error_code + config | 4 | +250 |
-| `crates/core/src/notification/` events + telegram dispatcher | 2 | +400 |
-| Tests (DHAT + Criterion + loom + chaos + ratchets) | ~50 new files | +2,800 |
-| Grafana dashboards | 100pct.json (new), operator-health (extend), market-data (extend) | +500 lines JSON |
-| Prometheus alert rules | `alerts.yml` | +120 |
-| Triage YAML | `.claude/triage/error-rules.yaml` | +60 |
-| Runbooks | `docs/runbooks/` (one per new ErrorCode) | +900 |
-| Plan documents (THIS PR ONLY) | 10 files | +1,990 |
-| **TOTAL across 3 PRs** | ~85 files | +9,620 LoC |
-
-## Verification Gates
-
-| Gate | Command | Blocks merge? |
-|------|---------|---------------|
-| Plan items all checked | `bash .claude/hooks/plan-verify.sh` | yes |
-| Scoped tests pass (FULL_QA forced — touches `crates/common/`) | `FULL_QA=1 make scoped-check` | yes |
-| Hot-path zero-alloc | `cargo test --test 'dhat_*' --workspace` | yes |
-| Banned-pattern scan (incl. new category 7 — sync fs in hot path) | `bash .claude/hooks/banned-pattern-scanner.sh` | yes |
-| Workspace test | `cargo test --workspace` | yes |
-| Bench gate (Criterion 5% regression cap) | `bash scripts/bench-gate.sh` | yes |
-| 100% audit dashboard | `make 100pct-audit` exit 0 (all 14 sub-checks pass) | yes |
-| Real-time proof | `make doctor` shows all 4 WS connected + movers tables non-empty + previous_close populated for 3 segments | manual |
-
-## Scenarios Covered (15)
+## Scenarios
 
 | # | Scenario | Expected |
 |---|----------|----------|
-| 1 | App starts Sunday 22:00 IST, runs through to Monday 09:00 | All 4 WS connected automatically at 09:00 (no manual restart) |
-| 2 | Network blip 02:00 IST (off-market) | Connections sleep until 09:00, then reconnect — no Telegram spam |
-| 3 | Phase 2 plan empty | `Phase2Failed{...}` Telegram with diagnostic, NOT silent |
-| 4 | 09:15:00 sharp | Option movers task starts; first snapshot persisted by 09:15:05 |
-| 5 | NSE_EQ RELIANCE first Quote of day | `previous_close` row written for (RELIANCE, NSE_EQ) from byte 38-41 |
-| 6 | NSE_FNO option contract first Full of day | `previous_close` row from byte 50-53 |
-| 7 | IDX_I NIFTY=13 PrevClose packet (code 6) | `previous_close` row from byte 8-11 |
-| 8 | QuestDB Docker not yet up at boot | Tick processor sleeps up to 60s; rescue ring silent during boot window; CRITICAL alert at 30s |
-| 9 | Connection 0 task crashes mid-day | Pool supervisor respawns within 5s; SubscribeRxGuard restores subscriptions |
-| 10 | Operator queries `select count(*) from stock_movers where ts > now()-1h` | Returns ~239 stocks × 720 snapshots = 172,000 rows |
-| 11 (G1) | App sleeps Friday 15:30 → Monday 09:00 IST (65.5h) | Token force-renewed on wake before reconnect; no DH-901 noise |
-| 12 (G4) | 406 instruments tick-gap simultaneously | 1 coalesced Telegram summary every 60s, NOT 406 alerts |
-| 13 (G7) | Phase2 dispatcher early-return without emitting | Debug build panics; release build emits `PHASE2-02` ERROR |
-| 14 (G8) | System clock drifts 90s pre-market | Boot probe emits CRITICAL `tv_clock_skew_seconds > 2`; HALT |
-| 15 (G14) | Cold Docker pull 30–60s on first boot | Tick processor `wait_for_questdb_ready(60s)` with 5/10/20/30s escalating logs |
-
-## Plan-enforcement protocol
-
-1. This file (DRAFT) presented to operator.
-2. On approval → Status: APPROVED → start Wave 1 implementation in a new PR.
-3. Each Wave = one PR. Wave PR is mergeable only when `bash .claude/hooks/plan-verify.sh` passes for items in that wave.
-4. After all 3 Wave PRs merge → mark this plan VERIFIED → archive to `.claude/plans/archive/2026-04-27-comprehensive-hardening.md`.
-5. PR #391 closed when Wave 1 PR opens (referencing this plan).
+| 1 | Boot at 12:49 IST | `boot_audit` DDL returns 200; `audit table ready` log emitted |
+| 2 | Phase 2 dispatch at 12:50 | `phase2_audit` row inserted, no "timestamp beyond 9999-12-31" |
+| 3 | SLO score crosses 0.80 | Telegram message delivered (no 400 Bad Request from `<` in body) |
+| 4 | Cold boot, Grafana takes 8s to serve HTTP | App waits for HTTP-200 from `/api/health` before logging "service is healthy" |

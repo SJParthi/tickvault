@@ -74,6 +74,7 @@ pub mod candle_persistence;
 pub mod constituency_persistence;
 pub mod deep_depth_persistence;
 pub mod depth_rebalance_audit_persistence;
+pub mod disk_health_watcher;
 pub mod greeks_persistence;
 pub mod historical_fetch_marker;
 pub mod indicator_snapshot_persistence;
