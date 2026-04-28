@@ -531,6 +531,40 @@ pub enum NotificationEvent {
     /// Application stopped.
     ShutdownComplete,
 
+    /// Wave 3-C Item 12 — market-open self-test all-green positive ping
+    /// at 09:16:00 IST. Severity::Info; never wakes the operator. Maps
+    /// to ErrorCode `SELFTEST-01`.
+    SelfTestPassed {
+        /// Number of sub-checks evaluated and passed (always equal to
+        /// the total today, but carried forward for schema evolution).
+        checks_passed: usize,
+    },
+
+    /// Wave 3-C Item 12 — market-open self-test detected one or more
+    /// non-critical sub-check failures at 09:16:00 IST. Severity::High.
+    /// `failed` is a list of static strings naming the sub-checks that
+    /// tripped (no user-controllable data — safe for log + Telegram).
+    /// Maps to ErrorCode `SELFTEST-02`.
+    SelfTestDegraded {
+        /// Number of green sub-checks (out of `TOTAL_SUB_CHECKS`).
+        checks_passed: usize,
+        /// Number of red sub-checks.
+        checks_failed: usize,
+        /// Names of the red sub-checks (static strings).
+        failed: Vec<&'static str>,
+    },
+
+    /// Wave 3-C Item 12 — market-open self-test detected a critical
+    /// sub-check failure (no main feed / QuestDB down / token expired)
+    /// at 09:16:00 IST. Severity::Critical so the operator pages
+    /// immediately. Maps to ErrorCode `SELFTEST-02`.
+    SelfTestCritical {
+        /// Number of red sub-checks (≥ 1, with at least one critical).
+        checks_failed: usize,
+        /// Names of the red sub-checks (static strings).
+        failed: Vec<&'static str>,
+    },
+
     /// Instrument build succeeded (first build of the day).
     InstrumentBuildSuccess {
         /// CSV source: "primary", "fallback", or "cache".
@@ -1588,6 +1622,41 @@ impl NotificationEvent {
             }
             Self::ShutdownInitiated => "<b>Shutdown initiated</b>".to_string(),
             Self::ShutdownComplete => "<b>tickvault stopped</b>".to_string(),
+            Self::SelfTestPassed { checks_passed } => {
+                format!(
+                    "<b>Market-open self-test PASSED @ 09:16 IST</b>\n\
+                     {checks_passed}/{checks_passed} sub-checks green.\n\
+                     Code: SELFTEST-01"
+                )
+            }
+            Self::SelfTestDegraded {
+                checks_passed,
+                checks_failed,
+                failed,
+            } => {
+                let total = checks_passed + checks_failed;
+                let failed_list = failed.join(", ");
+                format!(
+                    "<b>Market-open self-test DEGRADED @ 09:16 IST</b>\n\
+                     {checks_passed}/{total} sub-checks green; {checks_failed} failed.\n\
+                     Failed: {failed_list}\n\
+                     Code: SELFTEST-02\n\
+                     Action: investigate the listed sub-checks; trading may continue."
+                )
+            }
+            Self::SelfTestCritical {
+                checks_failed,
+                failed,
+            } => {
+                let failed_list = failed.join(", ");
+                format!(
+                    "<b>MARKET-OPEN SELF-TEST CRITICAL @ 09:16 IST</b>\n\
+                     {checks_failed} sub-check(s) failed (≥1 critical).\n\
+                     Failed: {failed_list}\n\
+                     Code: SELFTEST-02\n\
+                     Action: see runbook .claude/rules/project/wave-3-c-error-codes.md"
+                )
+            }
             Self::OrderRejected {
                 correlation_id,
                 reason,
@@ -1813,6 +1882,9 @@ impl NotificationEvent {
             Self::MarketOpenStreamingConfirmation { .. } => Severity::Info,
             Self::MarketOpenStreamingFailed { .. } => Severity::High,
             Self::MarketOpenDepthAnchor { .. } => Severity::Info,
+            Self::SelfTestPassed { .. } => Severity::Info,
+            Self::SelfTestDegraded { .. } => Severity::High,
+            Self::SelfTestCritical { .. } => Severity::Critical,
             Self::DepthIndexLtpTimeout { .. } => Severity::High,
             Self::DepthUnderlyingMissing { .. } => Severity::High,
             Self::DepthSpotPriceStale { .. } => Severity::High,

@@ -220,6 +220,11 @@ pub enum ErrorCode {
     StorageGap03AuditWriteFailed,
     /// STORAGE-GAP-04: S3 archive failure (partition upload).
     StorageGap04S3ArchiveFailed,
+    /// SELFTEST-01: market-open self-test passed (informational positive ping).
+    Selftest01Passed,
+    /// SELFTEST-02: market-open self-test detected a Critical or Degraded
+    /// failure — operator action required.
+    Selftest02Failed,
 
     // -----------------------------------------------------------------------
     // Wave 3 — Telegram dispatcher (Item 11)
@@ -361,6 +366,9 @@ impl ErrorCode {
             // Wave 3 — Telegram dispatcher (Item 11)
             Self::Telegram01Dropped => "TELEGRAM-01",
             Self::Telegram02CoalescerStateInconsistency => "TELEGRAM-02",
+            // Wave 3-C — market-open self-test (Item 12)
+            Self::Selftest01Passed => "SELFTEST-01",
+            Self::Selftest02Failed => "SELFTEST-02",
             // Dhan Trading API
             Self::Dh901InvalidAuth => "DH-901",
             Self::Dh902NoApiAccess => "DH-902",
@@ -406,7 +414,10 @@ impl ErrorCode {
             | Self::OmsGapDryRunSafety
             | Self::InstrumentP0EmergencyDownload
             | Self::Boot02DeadlineExceeded
-            | Self::Boot03ClockSkewExceeded => Severity::Critical,
+            | Self::Boot03ClockSkewExceeded
+            | Self::Selftest02Failed => Severity::Critical,
+            // Info: positive-ping / lifecycle confirmations
+            Self::Selftest01Passed => Severity::Info,
             // High: regulatory / order / risk / rate-limit
             Self::Dh904RateLimit
             | Self::Dh905InputException
@@ -544,6 +555,9 @@ impl ErrorCode {
             Self::Telegram01Dropped | Self::Telegram02CoalescerStateInconsistency => {
                 ".claude/rules/project/wave-3-error-codes.md"
             }
+            Self::Selftest01Passed | Self::Selftest02Failed => {
+                ".claude/rules/project/wave-3-c-error-codes.md"
+            }
             Self::Dh901InvalidAuth
             | Self::Dh902NoApiAccess
             | Self::Dh903AccountIssue
@@ -667,6 +681,8 @@ impl ErrorCode {
             Self::StorageGap04S3ArchiveFailed,
             Self::Telegram01Dropped,
             Self::Telegram02CoalescerStateInconsistency,
+            Self::Selftest01Passed,
+            Self::Selftest02Failed,
         ]
     }
 }
@@ -821,7 +837,9 @@ mod tests {
         // (clock-skew exceeded — HALTING).
         // 2026-04-28 (Wave 3-B Item 11): bumped 77 -> 79 for TELEGRAM-01/02
         // (Telegram bucket-coalescer hardening).
-        assert_eq!(ErrorCode::all().len(), 79);
+        // 2026-04-28 (Wave 3-C Item 12): bumped 79 -> 81 for SELFTEST-01
+        // (passed) + SELFTEST-02 (failed) — market-open self-test.
+        assert_eq!(ErrorCode::all().len(), 81);
     }
 
     #[test]
@@ -846,7 +864,9 @@ mod tests {
                 || s.starts_with("BOOT-")
                 || s.starts_with("AUDIT-")
                 // Wave 3-B: Telegram dispatcher
-                || s.starts_with("TELEGRAM-");
+                || s.starts_with("TELEGRAM-")
+                // Wave 3-C: market-open self-test prefix
+                || s.starts_with("SELFTEST-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }
