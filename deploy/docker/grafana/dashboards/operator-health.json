@@ -1586,13 +1586,13 @@
     {
       "type": "stat",
       "id": 46,
-      "title": "Telegram dispatch rate (5m)",
-      "description": "Wave 3-B Item 11. Total Telegram messages dispatched in the last 5 minutes, broken down by severity and whether the event was coalesced (true) or sent immediately (false). Wrapped in increase() per Rule 12 — raw counters lie after process restart. A coalesced=true row of 1 represents one summary message folding many events; coalesced=false counts are direct sends. Runbook: .claude/rules/project/wave-3-error-codes.md.",
+      "title": "Self-test outcome / 24h (Wave 3-C SELFTEST-01/02)",
+      "description": "Wave 3-C Item 12. Once-per-trading-day market-open self-test fired at 09:16:00 IST. Counts by result label across the last 24h sliding window. Green=0 means no failures detected; any 'degraded' or 'critical' increment means the operator received the SELFTEST-02 Telegram with a list of failed sub-checks (main feed / depth-20 / depth-200 / order-update / pipeline / recent-tick / QuestDB / token-headroom). Companion alert: tv-selftest-02-failed. Runbook: .claude/rules/project/wave-3-c-error-codes.md. Wrapped in increase() per Rule 12 — raw counters lie after process restart.",
       "gridPos": {
         "h": 6,
         "w": 6,
         "x": 6,
-        "y": 42
+        "y": 48
       },
       "datasource": {
         "type": "prometheus",
@@ -1604,18 +1604,9 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum by (severity, coalesced) (increase(tv_telegram_dispatched_total[5m]))",
-          "legendFormat": "{{severity}}/coalesced={{coalesced}}",
+          "expr": "sum by (result) (increase(tv_self_test_total[1d]))",
+          "legendFormat": "{{result}}",
           "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "expr": "sum by (reason) (increase(tv_telegram_dropped_total[5m]))",
-          "legendFormat": "drop:{{reason}}",
-          "refId": "B"
         }
       ],
       "fieldConfig": {
@@ -1632,25 +1623,28 @@
                 "color": "green"
               },
               {
-                "color": "orange",
-                "value": 50
-              },
-              {
                 "color": "red",
-                "value": 500
+                "value": 1
               }
             ]
           }
-        }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "passed" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } }
+            ]
+          }
+        ]
       },
       "options": {
         "colorMode": "background_solid",
-        "graphMode": "area",
+        "graphMode": "none",
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
-          ],
-          "fields": ""
+          ]
         }
       }
     }
