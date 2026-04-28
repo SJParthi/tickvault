@@ -1204,3 +1204,39 @@ groups:
           description: "tv_spill_dropped_total{reason='drain_*'} rate > 1.0/s for 10m. The async spill writer queue is overflowing — disk too slow, drain task crashed, or writer never initialised. DLQ NDJSON still catches every payload as recoverable text, but operator must investigate. Runbook: .claude/rules/project/wave-1-error-codes.md."
         labels:
           severity: medium
+
+      # Wave 3-C / SELFTEST-02: market-open self-test detected a failure.
+      - uid: tv-selftest-02-failed
+        title: "Wave 3-C SELFTEST-02: market-open self-test failed"
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 86400, to: 0 }
+            datasourceUid: prometheus
+            model:
+              expr: 'increase(tv_self_test_total{result=~"degraded|critical"}[1d])'
+              intervalMs: 60000
+              maxDataPoints: 43200
+          - refId: B
+            relativeTimeRange: { from: 86400, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            relativeTimeRange: { from: 86400, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: gt, params: [0] }
+        noDataState: OK
+        execErrState: Alerting
+        for: 1m
+        annotations:
+          summary: "SELFTEST-02: market-open self-test failed at 09:16 IST"
+          description: "tv_self_test_total{result='degraded' or 'critical'} incremented in the last 24h. The 09:16:00 IST self-test detected a failure across one or more of the 8 sub-checks (main feed / depth-20 / depth-200 / order-update WS / pipeline / recent-tick / QuestDB / token-headroom). The Telegram payload lists the exact failed sub-checks. Runbook: .claude/rules/project/wave-3-c-error-codes.md (SELFTEST-02)."
+        labels:
+          severity: high
