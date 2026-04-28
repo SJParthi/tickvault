@@ -114,6 +114,7 @@ const STOCK_MOVERS_CREATE_DDL: &str = "\
         change_pct DOUBLE,\
         volume LONG,\
         rank INT,\
+        phase SYMBOL,\
         ts TIMESTAMP\
     ) TIMESTAMP(ts) PARTITION BY DAY WAL\
 ";
@@ -172,6 +173,67 @@ const TOP_MOVERS_ALTER_DDL_TIMEFRAME: &str =
 const TOP_MOVERS_ALTER_DDL_SEGMENT: &str =
     "ALTER TABLE top_movers ADD COLUMN IF NOT EXISTS segment SYMBOL";
 
+/// Wave-3-A Item 10 + adversarial-review LOW #6: sanitize an ILP SYMBOL
+/// value before it is written to QuestDB.
+///
+/// The InfluxDB Line Protocol uses `\n`, `\r`, `,`, `=`, and space as
+/// structural delimiters. Although the upstream `questdb-rs` crate
+/// validates symbol values, the precise rejected-character set has
+/// drifted across library versions and a future upgrade could re-open
+/// the injection vector. Strip every control character + the four
+/// structural delimiters defensively before they reach the buffer.
+///
+/// This is a borrow-friendly helper: returns `Cow::Borrowed(input)` if
+/// the input is already clean (zero allocation on the common path) and
+/// `Cow::Owned(_)` only when sanitisation actually happened.
+///
+/// O(1) per character; runs at the cold ILP-build cadence (~218
+/// rows/snapshot × 60s = ~3.6 rows/sec peak), so allocation on the
+/// dirty path is acceptable.
+#[must_use]
+pub fn sanitize_ilp_symbol(input: &str) -> std::borrow::Cow<'_, str> {
+    let needs_sanitize = input
+        .chars()
+        .any(|c| c == '\n' || c == '\r' || c == ',' || c == '=' || c.is_control());
+    if !needs_sanitize {
+        return std::borrow::Cow::Borrowed(input);
+    }
+    let cleaned: String = input
+        .chars()
+        .filter(|c| !(*c == '\n' || *c == '\r' || *c == ',' || *c == '=' || c.is_control()))
+        .collect();
+    std::borrow::Cow::Owned(cleaned)
+}
+
+/// Wave 3-A Item 10: idempotent ALTER for `stock_movers.phase` SYMBOL.
+///
+/// Differentiates pre-open (09:00-09:13 IST) snapshot rows from in-market
+/// rows. Values: `"PREOPEN"` (live pre-open data), `"PREOPEN_UNAVAILABLE"`
+/// (SENSEX/BSE which is not in the pre-open feed), `"MARKET"` (default for
+/// existing in-market writes via `append_stock_mover`).
+///
+/// `phase` is intentionally NOT in `DEDUP_KEY_MOVERS`: a single
+/// (security_id, segment, ts) row should not have two phases coexisting —
+/// the same row should replace itself if accidentally written twice with
+/// different phases (the latest write wins).
+const STOCK_MOVERS_ALTER_DDL_PHASE: &str =
+    "ALTER TABLE stock_movers ADD COLUMN IF NOT EXISTS phase SYMBOL";
+
+/// Wire constant for the default in-market phase. Existing
+/// `append_stock_mover` callers route through this value so historic
+/// rows remain query-compatible after the ALTER.
+pub const STOCK_MOVERS_PHASE_MARKET: &str = "MARKET";
+
+/// Wave 3-A Item 10: pre-open phase value for live pre-open snapshot rows.
+pub const STOCK_MOVERS_PHASE_PREOPEN: &str = "PREOPEN";
+
+/// Wave 3-A Item 10: pre-open phase value for instruments that are NOT in
+/// the pre-open feed (SENSEX / BSE). These rows are emitted with zeroed
+/// price columns + this phase so the dashboard can prove "we KNEW it was
+/// not available, we did not silently skip" — distinguishes "no data" from
+/// "feed broken".
+pub const STOCK_MOVERS_PHASE_PREOPEN_UNAVAILABLE: &str = "PREOPEN_UNAVAILABLE";
+
 /// DEDUP key for `top_movers`. Includes `timeframe` so the same rank
 /// position at the same second across DIFFERENT timeframes (1m vs 5m
 /// rankings) does not collide. Includes `security_id` + `segment` so
@@ -229,6 +291,10 @@ struct BufferedStockMover {
     prev_close: f64,
     change_pct: f64,
     volume: i64,
+    /// Wave 3-A Item 10: snapshot phase. Defaults to `STOCK_MOVERS_PHASE_MARKET`
+    /// for in-market writes; pre-open writes set `STOCK_MOVERS_PHASE_PREOPEN`
+    /// or `STOCK_MOVERS_PHASE_PREOPEN_UNAVAILABLE` (SENSEX).
+    phase: String,
 }
 
 /// A buffered option mover entry — same rationale as `BufferedStockMover`.
@@ -354,15 +420,24 @@ impl StockMoversWriter {
     fn append_stock_row_to_buffer(buffer: &mut Buffer, row: &BufferedStockMover) -> Result<()> {
         let change_abs = ((row.ltp - row.prev_close) * 100.0).round() / 100.0;
         let ts = TimestampNanos::new(row.ts_nanos);
+        // Adversarial-review LOW #6: defensively sanitise every SYMBOL
+        // value before passing to ILP. Cow::Borrowed on the common path
+        // (no allocation when input is already clean).
+        let category = sanitize_ilp_symbol(&row.category);
+        let segment = sanitize_ilp_symbol(&row.segment);
+        let symbol = sanitize_ilp_symbol(&row.symbol);
+        let phase = sanitize_ilp_symbol(&row.phase);
         buffer
             .table(QUESTDB_TABLE_STOCK_MOVERS)
             .context("table")?
-            .symbol("category", &row.category)
+            .symbol("category", category.as_ref())
             .context("category")?
-            .symbol("segment", &row.segment)
+            .symbol("segment", segment.as_ref())
             .context("segment")?
-            .symbol("symbol", &row.symbol)
+            .symbol("symbol", symbol.as_ref())
             .context("symbol")?
+            .symbol("phase", phase.as_ref())
+            .context("phase")?
             .column_i64("security_id", i64::from(row.security_id))
             .context("security_id")?
             .column_f64("ltp", row.ltp)
@@ -410,6 +485,51 @@ impl StockMoversWriter {
         change_pct: f64,
         volume: i64,
     ) -> Result<()> {
+        // In-market default: phase = "MARKET". Pre-open callers must use
+        // `append_stock_mover_with_phase` directly.
+        self.append_stock_mover_with_phase(
+            ts_nanos,
+            category,
+            rank,
+            security_id,
+            segment,
+            symbol,
+            ltp,
+            prev_close,
+            change_pct,
+            volume,
+            STOCK_MOVERS_PHASE_MARKET,
+        )
+    }
+
+    /// Wave 3-A Item 10: append a stock mover row with an explicit `phase`
+    /// label. Used by the pre-open movers tracker to differentiate
+    /// 09:00-09:13 IST snapshot rows from in-market rows.
+    ///
+    /// `phase` values are pinned by `STOCK_MOVERS_PHASE_*` constants:
+    /// - `MARKET` — default in-market writes (delegated from
+    ///   `append_stock_mover`).
+    /// - `PREOPEN` — pre-open snapshot row with live data.
+    /// - `PREOPEN_UNAVAILABLE` — pre-open row for an instrument NOT in the
+    ///   pre-open feed (SENSEX/BSE). Price columns are zeroed; the row
+    ///   exists so the dashboard can prove the absence is intentional.
+    #[allow(clippy::too_many_arguments)]
+    // APPROVED: 11 params — each maps to a QuestDB column or schema label, no abstraction reduces this without obscuring the call site.
+    // TEST-EXEMPT: ILP buffer append requires a live QuestDB connection; the existing `append_stock_mover` path (which delegates here with phase=MARKET) is exercised by every in-market integration test.
+    pub fn append_stock_mover_with_phase(
+        &mut self,
+        ts_nanos: i64,
+        category: &str,
+        rank: i32,
+        security_id: u32,
+        segment: &str,
+        symbol: &str,
+        ltp: f64,
+        prev_close: f64,
+        change_pct: f64,
+        volume: i64,
+        phase: &str,
+    ) -> Result<()> {
         // Round all f64 values to 2dp to prevent IEEE 754 artifacts in QuestDB.
         let row = BufferedStockMover {
             ts_nanos,
@@ -422,6 +542,7 @@ impl StockMoversWriter {
             prev_close: (prev_close * 100.0).round() / 100.0,
             change_pct: (change_pct * 100.0).round() / 100.0,
             volume,
+            phase: phase.to_string(),
         };
 
         // DB-2: push to rescue ring BEFORE the ILP buffer. If the ring
@@ -1243,6 +1364,17 @@ pub async fn ensure_movers_tables(questdb_config: &QuestDbConfig) {
     // Create stock_movers table
     execute_ddl(&client, &base_url, STOCK_MOVERS_CREATE_DDL, "stock_movers").await;
 
+    // Wave 3-A Item 10: idempotent ALTER ADD COLUMN IF NOT EXISTS for `phase`.
+    // QuestDB ignores ADDs that already exist, so this is safe to run every boot.
+    // Existing pre-`phase` deployments self-heal at the next boot.
+    execute_ddl(
+        &client,
+        &base_url,
+        STOCK_MOVERS_ALTER_DDL_PHASE,
+        "stock_movers ADD COLUMN phase",
+    )
+    .await;
+
     // Enable DEDUP on stock_movers
     let dedup_sql = format!(
         "ALTER TABLE {} DEDUP ENABLE UPSERT KEYS(ts, {})",
@@ -1325,6 +1457,49 @@ async fn execute_ddl(client: &Client, base_url: &str, sql: &str, label: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // Wave-3-A LOW #6 — sanitize_ilp_symbol
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sanitize_ilp_symbol_clean_input_borrows_zero_alloc() {
+        let clean = "RELIANCE";
+        let out = sanitize_ilp_symbol(clean);
+        // Borrowed variant — pointer equality with input.
+        assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(out, "RELIANCE");
+    }
+
+    #[test]
+    fn test_sanitize_ilp_symbol_strips_newline() {
+        let dirty = "RELIANCE\nmalicious_table";
+        let out = sanitize_ilp_symbol(dirty);
+        assert!(matches!(out, std::borrow::Cow::Owned(_)));
+        assert_eq!(out, "RELIANCEmalicious_table");
+    }
+
+    #[test]
+    fn test_sanitize_ilp_symbol_strips_carriage_return_comma_equals_control() {
+        let dirty = "BAD,SYM\r=1\x07X";
+        let out = sanitize_ilp_symbol(dirty);
+        assert_eq!(out, "BADSYM1X");
+    }
+
+    #[test]
+    fn test_sanitize_ilp_symbol_preserves_unicode_and_normal_chars() {
+        let clean = "NIFTY-Jun2026-25000-CE";
+        let out = sanitize_ilp_symbol(clean);
+        assert_eq!(out, clean);
+        assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn test_sanitize_ilp_symbol_empty_string_is_borrowed() {
+        let out = sanitize_ilp_symbol("");
+        assert_eq!(out, "");
+        assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
+    }
 
     // -----------------------------------------------------------------------
     // DDL content validation
@@ -1827,6 +2002,7 @@ mod tests {
             prev_close: 99.0,
             change_pct: 1.0,
             volume: 100_000,
+            phase: STOCK_MOVERS_PHASE_MARKET.to_string(),
         }
     }
 

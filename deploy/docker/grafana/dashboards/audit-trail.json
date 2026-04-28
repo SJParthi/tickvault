@@ -3,7 +3,10 @@
     "list": [
       {
         "builtIn": 1,
-        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
         "enable": true,
         "hide": true,
         "iconColor": "rgba(0, 211, 255, 1)",
@@ -12,14 +15,19 @@
       }
     ]
   },
-  "description": "Wave 2 Item 9 — audit trail dashboards for SEBI-grade reconstruction. 6 tables: phase2_audit, depth_rebalance_audit, ws_reconnect_audit, boot_audit, selftest_audit, order_audit. Retention: 90d hot in QuestDB, then S3 Intelligent-Tiering then Glacier per deploy/aws/s3-lifecycle-audit-tables.json. Runbook: .claude/rules/project/wave-2-error-codes.md.",
+  "description": "Wave 2 Item 9 \u2014 audit trail dashboards for SEBI-grade reconstruction. 6 tables: phase2_audit, depth_rebalance_audit, ws_reconnect_audit, boot_audit, selftest_audit, order_audit. Retention: 90d hot in QuestDB, then S3 Intelligent-Tiering then Glacier per deploy/aws/s3-lifecycle-audit-tables.json. Runbook: .claude/rules/project/wave-2-error-codes.md.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
   "id": null,
   "uid": "tv-audit-trail",
-  "title": "tickvault — Audit Trail (Wave 2)",
-  "tags": ["tickvault", "audit", "wave-2", "sebi"],
+  "title": "tickvault \u2014 Audit Trail (Wave 2)",
+  "tags": [
+    "tickvault",
+    "audit",
+    "wave-2",
+    "sebi"
+  ],
   "timezone": "Asia/Kolkata",
   "refresh": "1m",
   "schemaVersion": 39,
@@ -29,22 +37,43 @@
       "type": "stat",
       "title": "Phase 2 outcomes today",
       "id": 1,
-      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 0 },
-      "datasource": { "type": "questdb-questdb-datasource", "uid": "questdb" },
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 0,
+        "y": 0
+      },
+      "datasource": {
+        "type": "questdb-questdb-datasource",
+        "uid": "questdb"
+      },
       "targets": [
         {
           "rawSql": "SELECT outcome AS metric, count(*) AS value FROM phase2_audit WHERE ts >= dateadd('h', -24, now()) GROUP BY outcome",
           "format": "table"
         }
       ],
-      "options": { "reduceOptions": { "values": true, "fields": "" } }
+      "options": {
+        "reduceOptions": {
+          "values": true,
+          "fields": ""
+        }
+      }
     },
     {
       "type": "table",
       "title": "Recent depth-rebalance swaps",
       "id": 2,
-      "gridPos": { "h": 8, "w": 12, "x": 6, "y": 0 },
-      "datasource": { "type": "questdb-questdb-datasource", "uid": "questdb" },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 6,
+        "y": 0
+      },
+      "datasource": {
+        "type": "questdb-questdb-datasource",
+        "uid": "questdb"
+      },
       "targets": [
         {
           "rawSql": "SELECT ts, underlying_symbol, old_atm_strike, new_atm_strike, swap_levels, outcome FROM depth_rebalance_audit WHERE ts >= dateadd('h', -6, now()) ORDER BY ts DESC LIMIT 25",
@@ -56,8 +85,16 @@
       "type": "stat",
       "title": "WS reconnects today (per feed)",
       "id": 3,
-      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 0 },
-      "datasource": { "type": "questdb-questdb-datasource", "uid": "questdb" },
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 18,
+        "y": 0
+      },
+      "datasource": {
+        "type": "questdb-questdb-datasource",
+        "uid": "questdb"
+      },
       "targets": [
         {
           "rawSql": "SELECT feed AS metric, count(*) AS value FROM ws_reconnect_audit WHERE ts >= dateadd('h', -24, now()) GROUP BY feed",
@@ -69,8 +106,16 @@
       "type": "table",
       "title": "Latest boot timeline",
       "id": 4,
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 5 },
-      "datasource": { "type": "questdb-questdb-datasource", "uid": "questdb" },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 5
+      },
+      "datasource": {
+        "type": "questdb-questdb-datasource",
+        "uid": "questdb"
+      },
       "targets": [
         {
           "rawSql": "SELECT ts, boot_id, step, outcome, elapsed_ms, detail FROM boot_audit WHERE boot_id = (SELECT boot_id FROM boot_audit ORDER BY ts DESC LIMIT 1) ORDER BY ts ASC",
@@ -82,8 +127,16 @@
       "type": "timeseries",
       "title": "Selftest outcomes (15m periodic)",
       "id": 5,
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
-      "datasource": { "type": "questdb-questdb-datasource", "uid": "questdb" },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "datasource": {
+        "type": "questdb-questdb-datasource",
+        "uid": "questdb"
+      },
       "targets": [
         {
           "rawSql": "SELECT ts AS time, check_name AS metric, duration_ms AS value FROM selftest_audit WHERE ts >= dateadd('h', -24, now()) ORDER BY ts ASC",
@@ -95,8 +148,16 @@
       "type": "table",
       "title": "Recent order events (SEBI 5y retention)",
       "id": 6,
-      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 16 },
-      "datasource": { "type": "questdb-questdb-datasource", "uid": "questdb" },
+      "gridPos": {
+        "h": 10,
+        "w": 24,
+        "x": 0,
+        "y": 16
+      },
+      "datasource": {
+        "type": "questdb-questdb-datasource",
+        "uid": "questdb"
+      },
       "targets": [
         {
           "rawSql": "SELECT ts, order_id, correlation_id, leg, event, security_id, segment, transaction_type, quantity, price, order_status, outcome FROM order_audit WHERE ts >= dateadd('h', -24, now()) ORDER BY ts DESC LIMIT 100",
@@ -108,8 +169,16 @@
       "type": "stat",
       "title": "Audit write failures today (sum across 6 tables)",
       "id": 7,
-      "gridPos": { "h": 5, "w": 12, "x": 0, "y": 13 },
-      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": {
+        "h": 5,
+        "w": 12,
+        "x": 0,
+        "y": 13
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
       "targets": [
         {
           "expr": "sum(increase(tv_audit_write_failures_total[24h]))"
@@ -120,11 +189,142 @@
           "thresholds": {
             "mode": "absolute",
             "steps": [
-              { "color": "green", "value": null },
-              { "color": "yellow", "value": 1 },
-              { "color": "red", "value": 5 }
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 5
+              }
             ]
           }
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Pre-open movers persisted (24h)",
+      "description": "Wave 3-A Item 10. Rows persisted to stock_movers with phase=PREOPEN during the 09:00-09:13 IST window. Expected ~218 rows per snapshot (216 stocks + NIFTY + BANKNIFTY) every 60s for ~13 minutes = ~2,800 rows per trading day. Wrapped in increase() per audit-findings Rule 12 so the panel doesn't lie after a process restart.",
+      "id": 8,
+      "gridPos": {
+        "h": 5,
+        "w": 12,
+        "x": 0,
+        "y": 26
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum(increase(tv_preopen_movers_total[24h]))",
+          "legendFormat": "rows persisted",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "unit": "none",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              },
+              {
+                "color": "green",
+                "value": 2000
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "background_solid",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Pre-open movers persist errors (24h)",
+      "description": "MOVERS-03 \u2014 pre-open movers append/flush failures (broken out by stage label). Any non-zero value during 09:00-09:13 IST means the audit trail for this morning's pre-open spread is partially lost. Runbook: .claude/rules/project/wave-1-error-codes.md#movers-03",
+      "id": 9,
+      "gridPos": {
+        "h": 5,
+        "w": 12,
+        "x": 12,
+        "y": 26
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (stage) (increase(tv_preopen_movers_persist_errors_total[24h]))",
+          "legendFormat": "{{stage}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "unit": "none",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "background_solid",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
         }
       }
     }
