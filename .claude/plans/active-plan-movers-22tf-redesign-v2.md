@@ -1,6 +1,6 @@
 # Movers 22-TF v3 — Index (split-file plan, final scope)
 
-**Status:** DRAFT v3 (pending Parthiban approval)
+**Status:** APPROVED v3 — 2026-04-28 by Parthiban ("yes dude go ahead gooooooooooo")
 **Date:** 2026-04-28
 **Branch:** `claude/new-session-TBQe7`
 **Supersedes:** v1 → v2 → v3
