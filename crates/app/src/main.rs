@@ -93,6 +93,56 @@ use tickvault_api::state::{SharedAppState, SharedHealthStatus, SystemHealthStatu
 // Constants are in boot_helpers module (lib.rs) for coverage instrumentation.
 
 // ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Wave 3-C Item 12 — idempotency probe for the once-per-trading-day
+/// market-open self-test. Queries `selftest_audit` for a row with
+/// today's `trading_date_ist` AND `check_name='market-open-self-test'`.
+/// Returns `Ok(true)` when such a row exists (skip the Telegram
+/// notification path; UPSERT the audit row anyway). Used by the
+/// scheduler block in `main()` to defend against rapid restarts that
+/// would otherwise spawn two schedulers both firing at 09:16:00.
+///
+/// Adversarial review (general-purpose Class B+H, 2026-04-28).
+async fn probe_selftest_already_fired_today(
+    qcfg: &tickvault_common::config::QuestDbConfig,
+) -> anyhow::Result<bool> {
+    use chrono::Utc;
+    use std::time::Duration;
+    /// Timeout for the once-per-day idempotency pre-check against
+    /// `selftest_audit`. Mirrors the 5-second deadline used by the
+    /// boot-time QuestDB liveness probe in this same file. Local
+    /// (not in `constants.rs`) because it's specific to this helper.
+    const SELFTEST_PROBE_TIMEOUT_SECS: u64 = 5;
+    let base_url = format!("http://{}:{}/exec", qcfg.host, qcfg.http_port);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(SELFTEST_PROBE_TIMEOUT_SECS))
+        .build()?;
+    let now_ist_nanos = Utc::now()
+        .timestamp_nanos_opt()
+        .unwrap_or(0)
+        .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS);
+    let trading_date_ist = now_ist_nanos - now_ist_nanos.rem_euclid(86_400_000_000_000);
+    let sql = format!(
+        "SELECT count(*) AS n FROM selftest_audit \
+         WHERE trading_date_ist = {trading_date_ist} \
+           AND check_name = 'market-open-self-test';"
+    );
+    let resp = client
+        .get(&base_url)
+        .query(&[("query", sql.as_str())])
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        anyhow::bail!("selftest pre-check non-2xx: {}", resp.status());
+    }
+    let body = resp.text().await?;
+    // QuestDB JSON: dataset is `[[N]]` where N >= 1 means already fired.
+    Ok(body.contains("[[1]]") || body.contains("[[2]]") || body.contains("[[3]]"))
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -4086,16 +4136,45 @@ async fn main() -> Result<()> {
                     );
                     tokio::time::sleep(std::time::Duration::from_secs(secs_until)).await;
 
-                    // Sample live state. Counters that don't yet have a
-                    // production gauge (pipeline_active, last_tick_age)
-                    // are conservatively reported as green so the
-                    // self-test doesn't false-alarm. Wiring those gauges
-                    // is a separate follow-up — when they land, replace
-                    // the literals here.
+                    // Adversarial review (general-purpose Class B+H,
+                    // 2026-04-28): rapid restart between 09:14 and 09:16
+                    // (e.g. operator `make restart`) can spawn two
+                    // schedulers that both fire at 09:16. The audit row
+                    // DEDUPs (key = trading_date_ist + check_name) but
+                    // the Telegram notify path does not. Pre-check the
+                    // audit table; if a row already exists for today,
+                    // skip notify (audit row will UPSERT regardless).
+                    let already_fired = match probe_selftest_already_fired_today(&st_qcfg).await {
+                        Ok(v) => v,
+                        Err(err) => {
+                            // Pre-check failure must not block the
+                            // primary self-test path. Log and proceed.
+                            tracing::warn!(
+                                ?err,
+                                "market-open self-test: pre-check failed; proceeding to fire"
+                            );
+                            false
+                        }
+                    };
+                    if already_fired {
+                        info!(
+                            "market-open self-test: skipping notify (already fired today; audit-row UPSERT only)"
+                        );
+                    }
+
+                    // Sample live state. Seven of the eight sub-checks have
+                    // production gauges; `last_tick_age_secs` does not
+                    // yet have a per-instrument aggregator and is
+                    // conservatively reported as 0. Adversarial review
+                    // (general-purpose Class C, 2026-04-28) caught the
+                    // earlier false-OK where `pipeline_active` was
+                    // hardcoded — `health_status.pipeline_active()`
+                    // already exists and is now read live.
                     let main_active = st_health.websocket_connections() as usize;
                     let d20 = st_health.depth_20_connections() as usize;
                     let d200 = st_health.depth_200_connections() as usize;
                     let oms = st_health.order_update_connected();
+                    let pipeline = st_health.pipeline_active();
                     let questdb_ok =
                         tickvault_storage::boot_probe::wait_for_questdb_ready(&st_qcfg, 3)
                             .await
@@ -4109,7 +4188,7 @@ async fn main() -> Result<()> {
                         depth_20_active: d20,
                         depth_200_active: d200,
                         order_update_active: oms,
-                        pipeline_active: true,
+                        pipeline_active: pipeline,
                         last_tick_age_secs: 0,
                         questdb_connected: questdb_ok,
                         token_expiry_headroom_secs: token_headroom_secs,
@@ -4121,6 +4200,7 @@ async fn main() -> Result<()> {
 
                     info!(
                         result = outcome.outcome_str(),
+                        code = outcome.error_code().code_str(),
                         main_feed = main_active,
                         depth_20 = d20,
                         depth_200 = d200,
@@ -4136,37 +4216,39 @@ async fn main() -> Result<()> {
                     )
                     .increment(1);
 
-                    match &outcome {
-                        MarketOpenSelfTestOutcome::Passed { checks_passed } => {
-                            st_notifier.notify(
-                                tickvault_core::notification::events::NotificationEvent::SelfTestPassed {
-                                    checks_passed: *checks_passed,
-                                },
-                            );
-                        }
-                        MarketOpenSelfTestOutcome::Degraded {
-                            checks_passed,
-                            checks_failed,
-                            failed,
-                        } => {
-                            st_notifier.notify(
-                                tickvault_core::notification::events::NotificationEvent::SelfTestDegraded {
-                                    checks_passed: *checks_passed,
-                                    checks_failed: *checks_failed,
-                                    failed: failed.clone(),
-                                },
-                            );
-                        }
-                        MarketOpenSelfTestOutcome::Critical {
-                            checks_failed,
-                            failed,
-                        } => {
-                            st_notifier.notify(
-                                tickvault_core::notification::events::NotificationEvent::SelfTestCritical {
-                                    checks_failed: *checks_failed,
-                                    failed: failed.clone(),
-                                },
-                            );
+                    if !already_fired {
+                        match &outcome {
+                            MarketOpenSelfTestOutcome::Passed { checks_passed } => {
+                                st_notifier.notify(
+                                    tickvault_core::notification::events::NotificationEvent::SelfTestPassed {
+                                        checks_passed: *checks_passed,
+                                    },
+                                );
+                            }
+                            MarketOpenSelfTestOutcome::Degraded {
+                                checks_passed,
+                                checks_failed,
+                                failed,
+                            } => {
+                                st_notifier.notify(
+                                    tickvault_core::notification::events::NotificationEvent::SelfTestDegraded {
+                                        checks_passed: *checks_passed,
+                                        checks_failed: *checks_failed,
+                                        failed: failed.clone(),
+                                    },
+                                );
+                            }
+                            MarketOpenSelfTestOutcome::Critical {
+                                checks_failed,
+                                failed,
+                            } => {
+                                st_notifier.notify(
+                                    tickvault_core::notification::events::NotificationEvent::SelfTestCritical {
+                                        checks_failed: *checks_failed,
+                                        failed: failed.clone(),
+                                    },
+                                );
+                            }
                         }
                     }
 
@@ -4182,7 +4264,7 @@ async fn main() -> Result<()> {
                         now_ist_nanos - (now_ist_nanos.rem_euclid(86_400_000_000_000));
                     let detail = match &outcome {
                         MarketOpenSelfTestOutcome::Passed { .. } => {
-                            "all 7 sub-checks green".to_string()
+                            "all 8 sub-checks green".to_string()
                         }
                         MarketOpenSelfTestOutcome::Degraded { failed, .. }
                         | MarketOpenSelfTestOutcome::Critical { failed, .. } => {
