@@ -475,8 +475,8 @@ impl StockMoversWriter {
     ///   pre-open feed (SENSEX/BSE). Price columns are zeroed; the row
     ///   exists so the dashboard can prove the absence is intentional.
     #[allow(clippy::too_many_arguments)]
-    // APPROVED: 11 params — each maps to a QuestDB column or schema label,
-    // no abstraction reduces this without obscuring the call site.
+    // APPROVED: 11 params — each maps to a QuestDB column or schema label, no abstraction reduces this without obscuring the call site.
+    // TEST-EXEMPT: ILP buffer append requires a live QuestDB connection; the existing `append_stock_mover` path (which delegates here with phase=MARKET) is exercised by every in-market integration test.
     pub fn append_stock_mover_with_phase(
         &mut self,
         ts_nanos: i64,

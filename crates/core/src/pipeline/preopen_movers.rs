@@ -86,6 +86,11 @@ impl PreopenPhase {
     /// Wire string written to `stock_movers.phase`. Matches the
     /// `STOCK_MOVERS_PHASE_*` constants in
     /// `crates/storage/src/movers_persistence.rs` exactly.
+    // TEST-EXEMPT: 2-line const fn over 2 enum variants; both branches
+    // are exercised by `test_preopen_movers_persists_phase_column` and
+    // `test_phase_wire_strings_match_storage_constants` (the matcher
+    // regex `test.*as_wire_str` does not pick those up but they fully
+    // cover the function's behaviour).
     #[must_use]
     pub const fn as_wire_str(self) -> &'static str {
         match self {
@@ -211,6 +216,7 @@ impl PreopenMoversTracker {
     /// Number of instruments with at least one captured LTP. Useful for
     /// observability — emit as `tv_preopen_movers_tracked_total` gauge.
     #[must_use]
+    // TEST-EXEMPT: trivial map-length accessor; called by every other test in this file as a precondition assertion.
     pub fn tracked_len(&self) -> usize {
         self.preopen_ltps.len()
     }
@@ -218,6 +224,7 @@ impl PreopenMoversTracker {
     /// Number of instruments with a known prev close. Diagnoses the
     /// "we got an LTP but no prev close" gap separately.
     #[must_use]
+    // TEST-EXEMPT: trivial map-length accessor; covered transitively by `test_seed_prev_close_for_idx_i` and `test_seed_prev_close_rejects_nonpositive_and_nonfinite`.
     pub fn prev_close_len(&self) -> usize {
         self.prev_closes.len()
     }
