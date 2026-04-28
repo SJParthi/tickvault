@@ -3858,21 +3858,59 @@ async fn main() -> Result<()> {
                             );
                         }
 
+                        // Wave-3-A Item 10 + adversarial-review LOW #5:
                         // SENSEX (BSE) is the canonical
                         // PREOPEN_UNAVAILABLE entry — Dhan does NOT
                         // stream BSE indices on the pre-open feed. The
                         // explicit row preserves audit visibility per
                         // Rule 11 (no false-OK signals).
-                        let unavailable = vec![
-                            tickvault_core::pipeline::preopen_movers::UnavailableSymbol {
-                                symbol: "SENSEX".to_string(),
-                                security_id: 51,
-                                segment: tickvault_common::types::ExchangeSegment::IdxI,
-                            },
-                        ];
+                        //
+                        // Look up SENSEX's `price_feed_security_id`
+                        // from the universe instead of hardcoding 51.
+                        // Falls back to 51 (the Dhan-stable id seen
+                        // live for years) only if SENSEX is missing
+                        // from the universe — which would itself be
+                        // logged at warn level since SENSEX is a
+                        // mandatory full-chain index per
+                        // FULL_CHAIN_INDEX_SYMBOLS.
+                        let unavailable = {
+                            let (sid, source) =
+                                match preopen_movers_universe.underlyings.get("SENSEX") {
+                                    Some(meta) => (meta.price_feed_security_id, "registry"),
+                                    None => {
+                                        warn!(
+                                            "preopen_movers — SENSEX missing from FnoUniverse; \
+                                         falling back to hardcoded security_id=51 (Dhan-stable). \
+                                         Investigate: SENSEX is in FULL_CHAIN_INDEX_SYMBOLS and \
+                                         should always be present after universe build."
+                                        );
+                                        (51_u32, "fallback")
+                                    }
+                                };
+                            info!(
+                                sensex_security_id = sid,
+                                source, "preopen_movers SENSEX unavailable entry resolved"
+                            );
+                            vec![
+                                tickvault_core::pipeline::preopen_movers::UnavailableSymbol {
+                                    symbol: "SENSEX".to_string(),
+                                    security_id: sid,
+                                    segment: tickvault_common::types::ExchangeSegment::IdxI,
+                                },
+                            ]
+                        };
 
                         let tracker_size = symbol_lookup.len();
-                        let tracker = std::sync::Arc::new(tokio::sync::RwLock::new(
+                        // Adversarial review follow-up (Wave-3-A MED #1):
+                        // use `std::sync::Mutex` (sync, fast) instead of
+                        // `tokio::sync::RwLock`. The critical section is a
+                        // single HashMap::insert — microseconds, no .await
+                        // held. Tokio's own docs recommend std::sync::Mutex
+                        // when no await crosses the lock; tokio::RwLock has
+                        // higher acquire cost and FIFO queueing under
+                        // contention which would matter at the 09:00:00 IST
+                        // burst (~5K ticks/sec).
+                        let tracker = std::sync::Arc::new(std::sync::Mutex::new(
                             tickvault_core::pipeline::preopen_movers::PreopenMoversTracker::new(
                                 symbol_lookup,
                                 unavailable,
@@ -3902,7 +3940,15 @@ async fn main() -> Result<()> {
                                 >(&json)
                                 {
                                     Ok(cached) => {
-                                        let mut g = tracker.write().await;
+                                        // Wave-3-A MED #1: std::sync::Mutex.
+                                        // Boot path — lock-poisoning recovery
+                                        // is acceptable since the tracker's
+                                        // invariants are unchanged across
+                                        // panics (it's pure HashMap state).
+                                        let mut g = match tracker.lock() {
+                                            Ok(g) => g,
+                                            Err(p) => p.into_inner(),
+                                        };
                                         let mut seeded = 0usize;
                                         for (&sid, &pc) in &cached {
                                             if matches!(sid, 13 | 25) {
@@ -3941,21 +3987,68 @@ async fn main() -> Result<()> {
                              cadence, phase=PREOPEN (Wave 3-A Item 10)"
                         );
 
+                        // Wave-3-A MED #2: cache `is_within_preopen_window()`
+                        // result in an AtomicBool refreshed once per second.
+                        // The tick subscriber checks this with a relaxed
+                        // load (~1ns) instead of re-resolving the wall
+                        // clock (~30-50ns) on every tick. At ~5K ticks/sec
+                        // during the 09:00:00 IST burst this is ~150-250 µs
+                        // of saved CPU per second — small but free.
+                        let window_cache = std::sync::Arc::new(
+                            std::sync::atomic::AtomicBool::new(
+                                tickvault_core::instrument::preopen_price_buffer::is_within_preopen_window(),
+                            ),
+                        );
+                        {
+                            // 1s refresh task — cheap. Lives for the
+                            // lifetime of the app; no shutdown signal
+                            // needed since the tokio runtime tears down
+                            // on app exit.
+                            const PREOPEN_WINDOW_CACHE_REFRESH_SECS: u64 = 1;
+                            let cache_for_refresh = std::sync::Arc::clone(&window_cache);
+                            tokio::spawn(async move {
+                                let mut ticker =
+                                    tokio::time::interval(tokio::time::Duration::from_secs(
+                                        PREOPEN_WINDOW_CACHE_REFRESH_SECS,
+                                    ));
+                                ticker.set_missed_tick_behavior(
+                                    tokio::time::MissedTickBehavior::Skip,
+                                );
+                                loop {
+                                    ticker.tick().await;
+                                    let in_window = tickvault_core::instrument::preopen_price_buffer::is_within_preopen_window();
+                                    cache_for_refresh
+                                        .store(in_window, std::sync::atomic::Ordering::Relaxed);
+                                }
+                            });
+                        }
+
                         // Tick subscriber — updates the tracker from each
                         // tick during the pre-open window. Fast-path
                         // ignored outside the window.
                         {
                             let tracker_for_ticks = std::sync::Arc::clone(&tracker);
+                            let window_cache_for_ticks = std::sync::Arc::clone(&window_cache);
                             let mut tick_rx = tick_broadcast_sender.subscribe();
                             tokio::spawn(async move {
                                 loop {
                                     match tick_rx.recv().await {
                                         Ok(tick) => {
-                                            // Audit Rule 3 — market-hours gate.
-                                            if !tickvault_core::instrument::preopen_price_buffer::is_within_preopen_window() {
+                                            // Audit Rule 3 — market-hours gate
+                                            // (Wave-3-A MED #2: cached
+                                            // AtomicBool, refreshed every 1s
+                                            // by the gate-cache task below).
+                                            if !window_cache_for_ticks
+                                                .load(std::sync::atomic::Ordering::Relaxed)
+                                            {
                                                 continue;
                                             }
-                                            let mut g = tracker_for_ticks.write().await;
+                                            // Wave-3-A MED #1: sync mutex,
+                                            // microsecond critical section.
+                                            let mut g = match tracker_for_ticks.lock() {
+                                                Ok(g) => g,
+                                                Err(p) => p.into_inner(),
+                                            };
                                             g.update_from_tick(&tick);
                                         }
                                         Err(tokio::sync::broadcast::error::RecvError::Lagged(
@@ -3984,6 +4077,72 @@ async fn main() -> Result<()> {
                                             break;
                                         }
                                     }
+                                }
+                            });
+                        }
+
+                        // Wave-3-A MED #4 — continuous code-6 PrevClose
+                        // re-seed task. The boot-time disk-cache read
+                        // (above) only runs once at task spawn, so a
+                        // code-6 packet for NIFTY / BANKNIFTY arriving
+                        // AFTER boot would never reach the tracker. The
+                        // file-poll loop below re-reads the on-disk
+                        // cache every 30s (which `tick_processor`
+                        // updates on every code-6 packet) and re-seeds
+                        // the tracker — closing the continuous wire-up
+                        // gap without touching tick_processor's hot
+                        // path. 30s latency is fine: code-6 is rare
+                        // (once per session per index) and the snapshot
+                        // cadence is 60s anyway. Audit Rule 3 — gated
+                        // on the window cache so it sleeps post-13:00.
+                        {
+                            const PREV_CLOSE_RESEED_INTERVAL_SECS: u64 = 30;
+                            let tracker_for_reseed = std::sync::Arc::clone(&tracker);
+                            let window_cache_for_reseed = std::sync::Arc::clone(&window_cache);
+                            tokio::spawn(async move {
+                                let mut ticker =
+                                    tokio::time::interval(tokio::time::Duration::from_secs(
+                                        PREV_CLOSE_RESEED_INTERVAL_SECS,
+                                    ));
+                                ticker.set_missed_tick_behavior(
+                                    tokio::time::MissedTickBehavior::Skip,
+                                );
+                                let seed_path = std::path::Path::new(
+                                    "data/instrument-cache/index-prev-close.json",
+                                );
+                                loop {
+                                    ticker.tick().await;
+                                    if !window_cache_for_reseed
+                                        .load(std::sync::atomic::Ordering::Relaxed)
+                                    {
+                                        continue;
+                                    }
+                                    let Ok(json) = std::fs::read_to_string(seed_path) else {
+                                        continue;
+                                    };
+                                    let Ok(cached) = serde_json::from_str::<
+                                        std::collections::HashMap<u32, f32>,
+                                    >(&json) else {
+                                        continue;
+                                    };
+                                    // Hold the tracker lock briefly (≤ 220 entries
+                                    // re-seeded; HashMap::insert is O(1) per call).
+                                    let mut g = match tracker_for_reseed.lock() {
+                                        Ok(g) => g,
+                                        Err(p) => p.into_inner(),
+                                    };
+                                    for (&sid, &pc) in &cached {
+                                        if matches!(sid, 13 | 25) {
+                                            g.seed_prev_close(
+                                                sid,
+                                                tickvault_common::types::ExchangeSegment::IdxI,
+                                                f64::from(pc),
+                                            );
+                                        }
+                                    }
+                                    drop(g);
+                                    metrics::counter!("tv_preopen_movers_prev_close_reseed_total")
+                                        .increment(1);
                                 }
                             });
                         }
@@ -4020,7 +4179,10 @@ async fn main() -> Result<()> {
                                     let in_window = tickvault_core::instrument::preopen_price_buffer::is_within_preopen_window();
                                     // Audit Rule 4 — edge-trigger reset.
                                     if in_window && !prev_in_window {
-                                        let mut g = tracker_for_snap.write().await;
+                                        let mut g = match tracker_for_snap.lock() {
+                                            Ok(g) => g,
+                                            Err(p) => p.into_inner(),
+                                        };
                                         g.reset();
                                         metrics::counter!("tv_preopen_movers_window_entered_total")
                                             .increment(1);
@@ -4034,10 +4196,26 @@ async fn main() -> Result<()> {
                                         // Audit Rule 3 — silent outside window.
                                         continue;
                                     }
-                                    let snap = {
-                                        let g = tracker_for_snap.read().await;
-                                        g.compute_snapshot()
+                                    // Wave-3-A MED #3: emit tracker observability
+                                    // gauges every snapshot tick. tracked_len ==
+                                    // count of (security_id, segment) with at
+                                    // least one captured LTP; prev_close_len ==
+                                    // count with a known previous-day close.
+                                    // The gap between the two diagnoses
+                                    // "we got LTPs but no prev_close" cleanly.
+                                    let (snap, tracked_n, prev_close_n) = {
+                                        let g = match tracker_for_snap.lock() {
+                                            Ok(g) => g,
+                                            Err(p) => p.into_inner(),
+                                        };
+                                        let tracked_n = g.tracked_len();
+                                        let prev_close_n = g.prev_close_len();
+                                        (g.compute_snapshot(), tracked_n, prev_close_n)
                                     };
+                                    metrics::gauge!("tv_preopen_movers_tracked_total")
+                                        .set(tracked_n as f64);
+                                    metrics::gauge!("tv_preopen_movers_prev_close_total")
+                                        .set(prev_close_n as f64);
                                     if snap.is_empty() {
                                         continue;
                                     }

@@ -173,6 +173,38 @@ const TOP_MOVERS_ALTER_DDL_TIMEFRAME: &str =
 const TOP_MOVERS_ALTER_DDL_SEGMENT: &str =
     "ALTER TABLE top_movers ADD COLUMN IF NOT EXISTS segment SYMBOL";
 
+/// Wave-3-A Item 10 + adversarial-review LOW #6: sanitize an ILP SYMBOL
+/// value before it is written to QuestDB.
+///
+/// The InfluxDB Line Protocol uses `\n`, `\r`, `,`, `=`, and space as
+/// structural delimiters. Although the upstream `questdb-rs` crate
+/// validates symbol values, the precise rejected-character set has
+/// drifted across library versions and a future upgrade could re-open
+/// the injection vector. Strip every control character + the four
+/// structural delimiters defensively before they reach the buffer.
+///
+/// This is a borrow-friendly helper: returns `Cow::Borrowed(input)` if
+/// the input is already clean (zero allocation on the common path) and
+/// `Cow::Owned(_)` only when sanitisation actually happened.
+///
+/// O(1) per character; runs at the cold ILP-build cadence (~218
+/// rows/snapshot × 60s = ~3.6 rows/sec peak), so allocation on the
+/// dirty path is acceptable.
+#[must_use]
+pub fn sanitize_ilp_symbol(input: &str) -> std::borrow::Cow<'_, str> {
+    let needs_sanitize = input
+        .chars()
+        .any(|c| c == '\n' || c == '\r' || c == ',' || c == '=' || c.is_control());
+    if !needs_sanitize {
+        return std::borrow::Cow::Borrowed(input);
+    }
+    let cleaned: String = input
+        .chars()
+        .filter(|c| !(*c == '\n' || *c == '\r' || *c == ',' || *c == '=' || c.is_control()))
+        .collect();
+    std::borrow::Cow::Owned(cleaned)
+}
+
 /// Wave 3-A Item 10: idempotent ALTER for `stock_movers.phase` SYMBOL.
 ///
 /// Differentiates pre-open (09:00-09:13 IST) snapshot rows from in-market
@@ -388,16 +420,23 @@ impl StockMoversWriter {
     fn append_stock_row_to_buffer(buffer: &mut Buffer, row: &BufferedStockMover) -> Result<()> {
         let change_abs = ((row.ltp - row.prev_close) * 100.0).round() / 100.0;
         let ts = TimestampNanos::new(row.ts_nanos);
+        // Adversarial-review LOW #6: defensively sanitise every SYMBOL
+        // value before passing to ILP. Cow::Borrowed on the common path
+        // (no allocation when input is already clean).
+        let category = sanitize_ilp_symbol(&row.category);
+        let segment = sanitize_ilp_symbol(&row.segment);
+        let symbol = sanitize_ilp_symbol(&row.symbol);
+        let phase = sanitize_ilp_symbol(&row.phase);
         buffer
             .table(QUESTDB_TABLE_STOCK_MOVERS)
             .context("table")?
-            .symbol("category", &row.category)
+            .symbol("category", category.as_ref())
             .context("category")?
-            .symbol("segment", &row.segment)
+            .symbol("segment", segment.as_ref())
             .context("segment")?
-            .symbol("symbol", &row.symbol)
+            .symbol("symbol", symbol.as_ref())
             .context("symbol")?
-            .symbol("phase", &row.phase)
+            .symbol("phase", phase.as_ref())
             .context("phase")?
             .column_i64("security_id", i64::from(row.security_id))
             .context("security_id")?
@@ -1418,6 +1457,49 @@ async fn execute_ddl(client: &Client, base_url: &str, sql: &str, label: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // Wave-3-A LOW #6 — sanitize_ilp_symbol
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_sanitize_ilp_symbol_clean_input_borrows_zero_alloc() {
+        let clean = "RELIANCE";
+        let out = sanitize_ilp_symbol(clean);
+        // Borrowed variant — pointer equality with input.
+        assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(out, "RELIANCE");
+    }
+
+    #[test]
+    fn test_sanitize_ilp_symbol_strips_newline() {
+        let dirty = "RELIANCE\nmalicious_table";
+        let out = sanitize_ilp_symbol(dirty);
+        assert!(matches!(out, std::borrow::Cow::Owned(_)));
+        assert_eq!(out, "RELIANCEmalicious_table");
+    }
+
+    #[test]
+    fn test_sanitize_ilp_symbol_strips_carriage_return_comma_equals_control() {
+        let dirty = "BAD,SYM\r=1\x07X";
+        let out = sanitize_ilp_symbol(dirty);
+        assert_eq!(out, "BADSYM1X");
+    }
+
+    #[test]
+    fn test_sanitize_ilp_symbol_preserves_unicode_and_normal_chars() {
+        let clean = "NIFTY-Jun2026-25000-CE";
+        let out = sanitize_ilp_symbol(clean);
+        assert_eq!(out, clean);
+        assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn test_sanitize_ilp_symbol_empty_string_is_borrowed() {
+        let out = sanitize_ilp_symbol("");
+        assert_eq!(out, "");
+        assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
+    }
 
     // -----------------------------------------------------------------------
     // DDL content validation
