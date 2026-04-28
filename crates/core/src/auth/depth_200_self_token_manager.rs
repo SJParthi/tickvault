@@ -44,11 +44,13 @@ use tokio::task::JoinHandle;
 use tracing::{error, info, instrument};
 
 use tickvault_common::config::Depth200AuthConfig;
+use tickvault_common::error_code::ErrorCode;
 use tickvault_common::trading_calendar::ist_offset;
 
 use crate::auth::secret_manager::create_ssm_client;
 use crate::auth::token_manager::TokenHandle;
 use crate::auth::types::TokenState;
+use crate::notification::{NotificationEvent, NotificationService};
 
 /// HTTP timeout for the `GET /v2/RenewToken` call. Generous because
 /// Dhan's auth tier occasionally takes 5-10s under load.
@@ -232,6 +234,7 @@ pub struct Depth200SelfTokenManager {
     min_remaining_secs_at_boot: i64,
     http_client: reqwest::Client,
     rest_api_base_url: String,
+    notifier: Option<Arc<NotificationService>>,
 }
 
 impl Depth200SelfTokenManager {
@@ -253,6 +256,7 @@ impl Depth200SelfTokenManager {
         config: &Depth200AuthConfig,
         expected_client_id: String,
         rest_api_base_url: String,
+        notifier: Option<Arc<NotificationService>>,
     ) -> Result<Self> {
         if !config.is_manual_self_mode() {
             bail!(
@@ -261,27 +265,66 @@ impl Depth200SelfTokenManager {
             );
         }
         let ssm_client = create_ssm_client().await;
-        let jwt = fetch_ssm_secure_string(&ssm_client, &config.ssm_parameter_name)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to fetch SELF JWT from SSM at {}",
-                    config.ssm_parameter_name
-                )
-            })?;
+        let jwt = match fetch_ssm_secure_string(&ssm_client, &config.ssm_parameter_name).await {
+            Ok(value) => value,
+            Err(err) => {
+                let reason = format!("{err}");
+                error!(
+                    code = ErrorCode::Depth200Auth03SsmUnreachable.code_str(),
+                    ssm_param = %config.ssm_parameter_name,
+                    error = %reason,
+                    "DEPTH200-AUTH-03 — SSM GetParameter failed at boot"
+                );
+                if let Some(n) = notifier.as_ref() {
+                    n.notify(NotificationEvent::Depth200SelfTokenSsmUnreachable {
+                        ssm_parameter: config.ssm_parameter_name.clone(),
+                        reason: reason.clone(),
+                        phase: "boot".to_string(),
+                    });
+                }
+                return Err(anyhow!(reason));
+            }
+        };
         #[allow(clippy::cast_possible_wrap)] // APPROVED: u64 secs fit in i64 for thousands of years
         let min_remaining = config.min_remaining_secs_at_boot as i64;
-        let token_state = build_token_state_from_self_jwt(
+        let token_state = match build_token_state_from_self_jwt(
             jwt.expose_secret(),
             &expected_client_id,
             min_remaining,
-        )?;
+        ) {
+            Ok(state) => state,
+            Err(err) => {
+                let reason = format!("{err}");
+                error!(
+                    code = ErrorCode::Depth200Auth01InvalidAtBoot.code_str(),
+                    ssm_param = %config.ssm_parameter_name,
+                    error = %reason,
+                    "DEPTH200-AUTH-01 — SELF JWT failed validation at boot — operator must paste fresh SELF token"
+                );
+                if let Some(n) = notifier.as_ref() {
+                    n.notify(NotificationEvent::Depth200SelfTokenInvalidAtBoot {
+                        ssm_parameter: config.ssm_parameter_name.clone(),
+                        reason: reason.clone(),
+                    });
+                }
+                return Err(anyhow!(reason));
+            }
+        };
+        let now_unix = Utc::now().timestamp();
+        let hours_remaining = ((token_state.expires_at().timestamp() - now_unix) as f64) / 3600.0;
         info!(
             ssm_param = %config.ssm_parameter_name,
             client_id = %expected_client_id,
             expires_at = %token_state.expires_at(),
+            hours_remaining = hours_remaining,
             "depth-200 SELF token loaded from SSM"
         );
+        if let Some(n) = notifier.as_ref() {
+            n.notify(NotificationEvent::Depth200SelfTokenLoaded {
+                ssm_parameter: config.ssm_parameter_name.clone(),
+                hours_remaining,
+            });
+        }
         let handle: TokenHandle = Arc::new(ArcSwap::new(Arc::new(Some(token_state))));
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(RENEW_TOKEN_HTTP_TIMEOUT_SECS))
@@ -296,6 +339,7 @@ impl Depth200SelfTokenManager {
             min_remaining_secs_at_boot: min_remaining,
             http_client,
             rest_api_base_url,
+            notifier,
         })
     }
 
@@ -328,18 +372,48 @@ impl Depth200SelfTokenManager {
                 tokio::time::sleep(manager.renewal_interval).await;
                 match manager.renew_once().await {
                     Ok(new_state) => {
+                        let now_unix = Utc::now().timestamp();
+                        let new_hours_remaining =
+                            ((new_state.expires_at().timestamp() - now_unix) as f64) / 3600.0;
                         manager.handle.store(Arc::new(Some(new_state)));
                         info!(
                             ssm_param = %manager.ssm_parameter_name,
+                            new_hours_remaining = new_hours_remaining,
                             "depth-200 SELF token renewed and atomic-swapped"
                         );
+                        if let Some(n) = manager.notifier.as_ref() {
+                            n.notify(NotificationEvent::Depth200SelfTokenRenewed {
+                                ssm_parameter: manager.ssm_parameter_name.clone(),
+                                new_hours_remaining,
+                            });
+                        }
                     }
                     Err(err) => {
+                        let reason = format!("{err}");
+                        let hours_remaining =
+                            manager
+                                .handle
+                                .load()
+                                .as_ref()
+                                .as_ref()
+                                .map_or(0.0, |state| {
+                                    let now_unix = Utc::now().timestamp();
+                                    ((state.expires_at().timestamp() - now_unix) as f64) / 3600.0
+                                });
                         error!(
-                            error = %err,
+                            code = ErrorCode::Depth200Auth02RenewalFailed.code_str(),
+                            error = %reason,
                             ssm_param = %manager.ssm_parameter_name,
-                            "depth-200 SELF token renewal failed — operator must paste a fresh SELF token at the SSM path before token expires"
+                            hours_remaining = hours_remaining,
+                            "DEPTH200-AUTH-02 — depth-200 SELF token renewal failed — operator must paste a fresh SELF token at the SSM path before token expires"
                         );
+                        if let Some(n) = manager.notifier.as_ref() {
+                            n.notify(NotificationEvent::Depth200SelfTokenRenewalFailed {
+                                ssm_parameter: manager.ssm_parameter_name.clone(),
+                                reason,
+                                hours_remaining,
+                            });
+                        }
                     }
                 }
             }
