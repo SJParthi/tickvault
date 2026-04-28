@@ -239,6 +239,13 @@ async fn load_from_cache_or_emergency_download(
     let cache_dir = &instrument_config.csv_cache_directory;
     let today = Utc::now().with_timezone(&ist_offset()).date_naive();
 
+    // Track whether a previously-existing rkyv cache failed to load.
+    // Distinguishes "fresh clone / first boot of the day" (file absent —
+    // expected) from "corrupt cache" (file present but unreadable — real
+    // operational concern). Used below to scale the log level on the
+    // emergency-download path.
+    let mut rkyv_was_corrupt = false;
+
     // Try 1: Zero-copy rkyv binary cache (sub-0.5ms)
     match MappedUniverse::load(cache_dir) {
         Ok(Some(mapped)) => {
@@ -260,6 +267,7 @@ async fn load_from_cache_or_emergency_download(
         }
         Err(err) => {
             warn!(%err, "market hours: rkyv binary cache corrupt, trying CSV fallback");
+            rkyv_was_corrupt = true;
         }
     }
 
@@ -286,10 +294,24 @@ async fn load_from_cache_or_emergency_download(
         }
     }
 
-    // I-P0-06: Emergency Download Override — all caches missing during market hours
-    error!(
-        "CRITICAL: no instrument cache available during market hours — triggering emergency download"
-    );
+    // I-P0-06: Emergency Download Override — all caches missing during market hours.
+    //
+    // Log level depends on what was missing:
+    //   - rkyv was corrupt → ERROR (real operational concern; cache file
+    //     was written previously but is now unreadable)
+    //   - rkyv was absent (fresh clone, first boot of the day) → WARN
+    //     (expected state; emergency download is the by-design path)
+    //
+    // Both cases trigger the same recovery (download CSV → build →
+    // persist). Only the alerting tier differs. Telegram fires on
+    // ERROR-level via the Loki routing; WARN does not page.
+    if rkyv_was_corrupt {
+        error!("CRITICAL: rkyv cache corrupt during market hours — triggering emergency download");
+    } else {
+        warn!(
+            "no instrument cache on fresh-clone / first-boot — triggering emergency download (expected path)"
+        );
+    }
 
     match download_instrument_csv(
         dhan_csv_url,

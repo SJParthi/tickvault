@@ -4989,6 +4989,30 @@ async fn main() -> Result<()> {
                     /// of when boot happened.
                     const SLO_PHASE2_BOOT_GRACE_SECS: u64 = 60;
 
+                    /// Uniform boot-relative grace covering ALL six SLO
+                    /// dimensions (ws_health, qdb_health, tick_freshness,
+                    /// token_freshness, spill_health, phase2_health).
+                    /// During the first 60s after the scheduler starts,
+                    /// the composite score is pinned to `1.0` regardless
+                    /// of inputs.
+                    ///
+                    /// Rationale: at boot the scheduler's 10s tick can
+                    /// fire before all 12 expected WS connections are
+                    /// up (DEGRADED with weakest=ws_health) or before the
+                    /// tick-gap coalescer's 30s window has filled
+                    /// (CRITICAL with weakest=tick_freshness). Both are
+                    /// transient partial-state reads, not real
+                    /// degradation. Live incident 2026-04-28 15:06–15:07
+                    /// IST proved this: DEGRADED at boot+10s, CRITICAL
+                    /// at boot+60s, both recovered on their own once
+                    /// the system steady-stated.
+                    ///
+                    /// 60s is the same magnitude as the per-dimension
+                    /// grace and is comfortably longer than the typical
+                    /// boot settle window (~30s for connections + ~30s
+                    /// for tick-gap coalescer).
+                    const SLO_BOOT_UNIFORM_GRACE_SECS: u64 = 60;
+
                     /// Sample interval. SCOPE §13.1.
                     const SLO_TICK_INTERVAL_SECS: u64 = 10;
 
@@ -5164,7 +5188,17 @@ async fn main() -> Result<()> {
                             spill_health,
                             phase2_health,
                         };
-                        let outcome = evaluate_slo_score(&inputs);
+                        // Uniform boot grace: pin Healthy across ALL
+                        // dimensions during the first 60s after the
+                        // scheduler started. See
+                        // SLO_BOOT_UNIFORM_GRACE_SECS docstring.
+                        let outcome = if scheduler_boot_at.elapsed().as_secs()
+                            < SLO_BOOT_UNIFORM_GRACE_SECS
+                        {
+                            SloOutcome::Healthy { score: 1.0 }
+                        } else {
+                            evaluate_slo_score(&inputs)
+                        };
 
                         // Always emit gauges (operator dashboard reads them
                         // in real-time, off-hours included). Clamp each
