@@ -1653,6 +1653,71 @@
           "fields": ""
         }
       }
+    },
+    {
+      "type": "stat",
+      "id": 46,
+      "title": "Self-test outcome / 24h (Wave 3-C SELFTEST-01/02)",
+      "description": "Wave 3-C Item 12. Once-per-trading-day market-open self-test fired at 09:16:00 IST. Counts by result label across the last 24h sliding window. Green=0 means no failures detected; any 'degraded' or 'critical' increment means the operator received the SELFTEST-02 Telegram with a list of failed sub-checks (main feed / depth-20 / depth-200 / order-update / pipeline / recent-tick / QuestDB / token-headroom). Companion alert: tv-selftest-02-failed. Runbook: .claude/rules/project/wave-3-c-error-codes.md. Wrapped in increase() per Rule 12 — raw counters lie after process restart.",
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 6,
+        "y": 48
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (result) (increase(tv_self_test_total[1d]))",
+          "legendFormat": "{{result}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "unit": "none",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green"
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "passed" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "colorMode": "background_solid",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ]
+        }
+      }
     }
   ]
 }

@@ -1809,6 +1809,9 @@ impl NotificationEvent {
             Self::TokenRenewalDeadlineMissed { .. } => "TokenRenewalDeadlineMissed",
             Self::QuestDbDisconnected { .. } => "QuestDbDisconnected",
             Self::QuestDbReconnected { .. } => "QuestDbReconnected",
+            Self::SelfTestPassed { .. } => "SelfTestPassed",
+            Self::SelfTestDegraded { .. } => "SelfTestDegraded",
+            Self::SelfTestCritical { .. } => "SelfTestCritical",
             Self::Custom { .. } => "Custom",
         }
     }

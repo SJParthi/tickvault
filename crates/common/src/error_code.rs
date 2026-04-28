@@ -379,6 +379,9 @@ impl ErrorCode {
             // Wave 3 — Telegram dispatcher (Item 11)
             Self::Telegram01Dropped => "TELEGRAM-01",
             Self::Telegram02CoalescerStateInconsistency => "TELEGRAM-02",
+            // Wave 3-C — market-open self-test (Item 12)
+            Self::Selftest01Passed => "SELFTEST-01",
+            Self::Selftest02Failed => "SELFTEST-02",
             // Dhan Trading API
             Self::Dh901InvalidAuth => "DH-901",
             Self::Dh902NoApiAccess => "DH-902",
@@ -567,6 +570,9 @@ impl ErrorCode {
             Self::Telegram01Dropped | Self::Telegram02CoalescerStateInconsistency => {
                 ".claude/rules/project/wave-3-error-codes.md"
             }
+            Self::Selftest01Passed | Self::Selftest02Failed => {
+                ".claude/rules/project/wave-3-c-error-codes.md"
+            }
             Self::Dh901InvalidAuth
             | Self::Dh902NoApiAccess
             | Self::Dh903AccountIssue
@@ -691,6 +697,8 @@ impl ErrorCode {
             Self::StorageGap04S3ArchiveFailed,
             Self::Telegram01Dropped,
             Self::Telegram02CoalescerStateInconsistency,
+            Self::Selftest01Passed,
+            Self::Selftest02Failed,
         ]
     }
 }
@@ -843,11 +851,11 @@ mod tests {
         // STORAGE-GAP-03/04).
         // 2026-04-27 (Wave 2-C Item 7.3): bumped 76 -> 77 for BOOT-03
         // (clock-skew exceeded — HALTING).
-        // 2026-04-28 (Wave 3-A Item 10): bumped 77 -> 78 for MOVERS-03
-        // (pre-open movers persistence failed).
-        // 2026-04-28 (Wave 3-B Item 11): bumped 78 -> 80 for TELEGRAM-01/02
+        // 2026-04-28 (Wave 3-B Item 11): bumped 77 -> 79 for TELEGRAM-01/02
         // (Telegram bucket-coalescer hardening).
-        assert_eq!(ErrorCode::all().len(), 80);
+        // 2026-04-28 (Wave 3-C Item 12): bumped 79 -> 81 for SELFTEST-01
+        // (passed) + SELFTEST-02 (failed) — market-open self-test.
+        assert_eq!(ErrorCode::all().len(), 81);
     }
 
     #[test]
@@ -872,7 +880,9 @@ mod tests {
                 || s.starts_with("BOOT-")
                 || s.starts_with("AUDIT-")
                 // Wave 3-B: Telegram dispatcher
-                || s.starts_with("TELEGRAM-");
+                || s.starts_with("TELEGRAM-")
+                // Wave 3-C: market-open self-test prefix
+                || s.starts_with("SELFTEST-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }
