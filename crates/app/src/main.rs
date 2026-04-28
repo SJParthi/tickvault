@@ -4162,14 +4162,11 @@ async fn main() -> Result<()> {
                         );
                     }
 
-                    // Sample live state. Seven of the eight sub-checks have
-                    // production gauges; `last_tick_age_secs` does not
-                    // yet have a per-instrument aggregator and is
-                    // conservatively reported as 0. Adversarial review
-                    // (general-purpose Class C, 2026-04-28) caught the
-                    // earlier false-OK where `pipeline_active` was
-                    // hardcoded — `health_status.pipeline_active()`
-                    // already exists and is now read live.
+                    // Sample live state. All eight sub-checks now have
+                    // production sources: seven from `health_status`
+                    // gauges + token manager, and `last_tick_age_secs`
+                    // from the global `TickGapDetector::scan_gaps_top_n`
+                    // (returns the worst-stale instrument's gap).
                     let main_active = st_health.websocket_connections() as usize;
                     let d20 = st_health.depth_20_connections() as usize;
                     let d200 = st_health.depth_200_connections() as usize;
@@ -4183,13 +4180,20 @@ async fn main() -> Result<()> {
                         tickvault_core::auth::token_manager::global_token_manager()
                             .map(|tm| tm.seconds_until_expiry())
                             .unwrap_or(0);
+                    let worst_gap_secs =
+                        tickvault_core::pipeline::tick_gap_detector::global_tick_gap_detector()
+                            .map(|d| {
+                                let (top, _total) = d.scan_gaps_top_n(std::time::Instant::now(), 1);
+                                top.first().map(|(_, _, gap)| *gap).unwrap_or(0)
+                            })
+                            .unwrap_or(0);
                     let inputs = MarketOpenSelfTestInputs {
                         main_feed_active: main_active,
                         depth_20_active: d20,
                         depth_200_active: d200,
                         order_update_active: oms,
                         pipeline_active: pipeline,
-                        last_tick_age_secs: 0,
+                        last_tick_age_secs: worst_gap_secs,
                         questdb_connected: questdb_ok,
                         token_expiry_headroom_secs: token_headroom_secs,
                     };
