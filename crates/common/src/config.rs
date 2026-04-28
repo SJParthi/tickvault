@@ -197,8 +197,16 @@ pub struct Depth200AuthConfig {
 
 impl Default for Depth200AuthConfig {
     fn default() -> Self {
+        // 2026-04-28 — default is `manual_self_with_renewal` because
+        // Dhan rejects APP-type tokens on `full-depth-api.dhan.co`
+        // (verified end-to-end). Defaulting to `totp_app` would mean
+        // every fresh deploy ships broken depth-200 until an operator
+        // remembers to flip the flag — that is the opposite of zero-
+        // touch automation. The operator can still override to
+        // `"totp_app"` for emergency rollback if Dhan ever fixes the
+        // server-side gate.
         Self {
-            mode: "totp_app".to_string(),
+            mode: Self::MODE_MANUAL_SELF_WITH_RENEWAL.to_string(),
             ssm_parameter_name: crate::constants::DEPTH_200_SELF_TOKEN_SSM_PARAMETER.to_string(),
             renewal_interval_secs: 82_800,
             min_remaining_secs_at_boot: 3_600,
@@ -2345,10 +2353,12 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_depth_200_auth_default_mode_is_totp_app() {
+    fn test_depth_200_auth_default_mode_is_manual_self_with_renewal() {
+        // Per the 2026-04-28 zero-touch directive: default is the
+        // working SSM/SELF path, NOT the rejected TOTP/APP path.
         let cfg = Depth200AuthConfig::default();
-        assert_eq!(cfg.mode, Depth200AuthConfig::MODE_TOTP_APP);
-        assert!(!cfg.is_manual_self_mode());
+        assert_eq!(cfg.mode, Depth200AuthConfig::MODE_MANUAL_SELF_WITH_RENEWAL);
+        assert!(cfg.is_manual_self_mode());
     }
 
     #[test]
@@ -2439,10 +2449,11 @@ mod tests {
 
     #[test]
     fn test_depth_200_auth_is_manual_self_mode_helper() {
+        // Default is now manual_self_with_renewal (zero-touch).
         let mut cfg = Depth200AuthConfig::default();
-        assert!(!cfg.is_manual_self_mode());
-        cfg.mode = Depth200AuthConfig::MODE_MANUAL_SELF_WITH_RENEWAL.to_string();
         assert!(cfg.is_manual_self_mode());
+        cfg.mode = Depth200AuthConfig::MODE_TOTP_APP.to_string();
+        assert!(!cfg.is_manual_self_mode());
     }
 
     #[test]
