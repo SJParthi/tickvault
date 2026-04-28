@@ -1922,37 +1922,11 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Wave 2 Item 9 — boot audit row for the QuestDB readiness step.
-    // Best-effort: if QuestDB just barely came up but the DDL phase is
-    // about to write to it, we still want this row. Failures don't halt
-    // boot — the AUDIT-04 ErrorCode + tracing::error! covers regression.
-    {
-        let now_nanos = chrono::Utc::now()
-            .timestamp_nanos_opt()
-            .unwrap_or(0)
-            .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS);
-        if let Err(e) = tickvault_storage::boot_audit_persistence::append_boot_audit_row(
-            &config.questdb,
-            now_nanos,
-            &boot_id,
-            "questdb_ready",
-            "ok",
-            i64::try_from(probe_started.elapsed().as_millis()).unwrap_or(i64::MAX),
-            "QuestDB readiness probe succeeded",
-        )
-        .await
-        {
-            tracing::error!(
-                error = ?e,
-                code = tickvault_common::error_code::ErrorCode::Audit04BootWriteFailed.code_str(),
-                "AUDIT-04 boot audit row write failed — continuing"
-            );
-            metrics::counter!("tv_audit_write_failures_total", "table" => "boot_audit")
-                .increment(1);
-        }
-    }
-
     // All table creation queries are independent — run in parallel for faster boot.
+    // NOTE: the boot audit row for the `questdb_ready` step is appended AFTER this
+    // join — `ensure_boot_audit_table` lives inside the join (line ~1985) and
+    // writing to `boot_audit` before the table exists caused AUDIT-04 to fire on
+    // every clean boot until 2026-04-28.
     tokio::join!(
         ensure_tick_table_dedup_keys(&config.questdb),
         ensure_depth_and_prev_close_tables(&config.questdb),
@@ -1986,6 +1960,38 @@ async fn main() -> Result<()> {
         tickvault_storage::selftest_audit_persistence::ensure_selftest_audit_table(&config.questdb),
         tickvault_storage::order_audit_persistence::ensure_order_audit_table(&config.questdb),
     );
+
+    // Wave 2 Item 9 — boot audit row for the QuestDB readiness step.
+    // Must run AFTER the `tokio::join!` above so `ensure_boot_audit_table`
+    // has created the table. Writing this row before the join was the cause
+    // of AUDIT-04 firing on every clean boot until 2026-04-28.
+    // Best-effort: failures don't halt boot — the AUDIT-04 ErrorCode +
+    // tracing::error! covers regression.
+    {
+        let now_nanos = chrono::Utc::now()
+            .timestamp_nanos_opt()
+            .unwrap_or(0)
+            .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS);
+        if let Err(e) = tickvault_storage::boot_audit_persistence::append_boot_audit_row(
+            &config.questdb,
+            now_nanos,
+            &boot_id,
+            "questdb_ready",
+            "ok",
+            i64::try_from(probe_started.elapsed().as_millis()).unwrap_or(i64::MAX),
+            "QuestDB readiness probe succeeded",
+        )
+        .await
+        {
+            tracing::error!(
+                error = ?e,
+                code = tickvault_common::error_code::ErrorCode::Audit04BootWriteFailed.code_str(),
+                "AUDIT-04 boot audit row write failed — continuing"
+            );
+            metrics::counter!("tv_audit_write_failures_total", "table" => "boot_audit")
+                .increment(1);
+        }
+    }
 
     // Persist trading calendar to QuestDB (best-effort, non-blocking).
     if let Err(err) = calendar_persistence::persist_calendar(&trading_calendar, &config.questdb) {
@@ -2278,6 +2284,51 @@ async fn main() -> Result<()> {
             .await
             .context("failed to fetch Dhan client ID for WebSocket + trading")?;
         credentials.client_id.expose_secret().to_string()
+    };
+
+    // 2026-04-28 — depth-200 SELF token alternate auth path.
+    // When `[depth_200_auth] mode = "manual_self_with_renewal"` is set,
+    // boot a separate `Depth200SelfTokenManager` against AWS SSM at
+    // `/tickvault/<env>/dhan/depth_200_self_token`, validate the JWT is
+    // SELF-type, and use ITS TokenHandle for the depth-200 connections
+    // only. All other WebSockets keep the shared TOTP/APP `token_handle`.
+    // See `docs/architecture/depth-200-self-token-design.md` for the
+    // full design and Telegram event matrix. Default mode `"totp_app"`
+    // is a no-op — the option remains None and depth-200 reuses
+    // `token_handle.clone()` exactly as before.
+    let depth_200_self_token_manager: Option<
+        std::sync::Arc<
+            tickvault_core::auth::depth_200_self_token_manager::Depth200SelfTokenManager,
+        >,
+    > = if config.depth_200_auth.is_manual_self_mode() {
+        match tickvault_core::auth::depth_200_self_token_manager::Depth200SelfTokenManager::boot_from_ssm(
+            &config.depth_200_auth,
+            ws_client_id.clone(),
+            config.dhan.rest_api_base_url.clone(),
+            Some(notifier.clone()),
+        )
+        .await
+        {
+            Ok(manager) => {
+                let manager = std::sync::Arc::new(manager);
+                let _renewal_handle = std::sync::Arc::clone(&manager).spawn_renewal_task();
+                tracing::info!(
+                    ssm_param = %config.depth_200_auth.ssm_parameter_name,
+                    "depth-200 SELF token manager booted; renewal task spawned"
+                );
+                Some(manager)
+            }
+            Err(err) => {
+                tracing::error!(
+                    error = %err,
+                    ssm_param = %config.depth_200_auth.ssm_parameter_name,
+                    "depth-200 SELF token manager FAILED to boot — depth-200 will fall back to shared TOTP/APP handle (which Dhan rejects). Operator must paste a valid SELF JWT into SSM and restart."
+                );
+                None
+            }
+        }
+    } else {
+        None
     };
 
     // Step 8a: Create WebSocket pool (channel + connections, NOT yet spawned).
@@ -3450,7 +3501,19 @@ async fn main() -> Result<()> {
                             continue;
                         }
 
-                        let depth200_token = token_handle.clone();
+                        // 2026-04-28 — pick the right TokenHandle for depth-200.
+                        // When manual_self_with_renewal mode is on AND the SELF
+                        // token manager booted successfully, depth-200 uses the
+                        // SELF-token handle (full-depth-api.dhan.co requires
+                        // tokenConsumerType=SELF). All other WS pools keep the
+                        // shared TOTP/APP token_handle. If the manager is None
+                        // (default mode OR boot failed) we fall back to the
+                        // shared handle — depth-200 will fail with APP-token
+                        // RST as before, surfaced via existing alerts.
+                        let depth200_token = match &depth_200_self_token_manager {
+                            Some(manager) => manager.handle().clone(),
+                            None => token_handle.clone(),
+                        };
                         let depth200_client_id = ws_client_id.clone();
                         let depth200_segment = tickvault_common::types::ExchangeSegment::NseFno;
 
@@ -4966,6 +5029,47 @@ async fn main() -> Result<()> {
                     /// dispatch latency (~30s on the slowest day).
                     const SLO_PHASE2_GRACE_SECS: u32 = 60;
 
+                    /// Boot-relative grace window for mid-market starts.
+                    /// When the app boots after 09:13:00 IST (e.g. crash-
+                    /// recovery or operator restart), Phase 2 dispatches
+                    /// immediately ("late-start path") but still takes
+                    /// ~30s to complete. Without this grace the SLO
+                    /// scheduler's first tick after boot would observe
+                    /// `phase2_outcome == None`, fall past the wall-clock
+                    /// grace (which expired hours ago at 09:14), and
+                    /// page SLO-02 CRITICAL with weakest=phase2_health.
+                    /// Live incident 2026-04-28 14:18 IST proved this:
+                    /// CRITICAL fired at 14:18:24, recovered to SLO-01
+                    /// Healthy at 14:18:34 (10s later) once Phase 2
+                    /// completed. Same magnitude as the wall-clock grace
+                    /// (60s) — Phase 2 dispatch latency is independent
+                    /// of when boot happened.
+                    const SLO_PHASE2_BOOT_GRACE_SECS: u64 = 60;
+
+                    /// Uniform boot-relative grace covering ALL six SLO
+                    /// dimensions (ws_health, qdb_health, tick_freshness,
+                    /// token_freshness, spill_health, phase2_health).
+                    /// During the first 60s after the scheduler starts,
+                    /// the composite score is pinned to `1.0` regardless
+                    /// of inputs.
+                    ///
+                    /// Rationale: at boot the scheduler's 10s tick can
+                    /// fire before all 12 expected WS connections are
+                    /// up (DEGRADED with weakest=ws_health) or before the
+                    /// tick-gap coalescer's 30s window has filled
+                    /// (CRITICAL with weakest=tick_freshness). Both are
+                    /// transient partial-state reads, not real
+                    /// degradation. Live incident 2026-04-28 15:06–15:07
+                    /// IST proved this: DEGRADED at boot+10s, CRITICAL
+                    /// at boot+60s, both recovered on their own once
+                    /// the system steady-stated.
+                    ///
+                    /// 60s is the same magnitude as the per-dimension
+                    /// grace and is comfortably longer than the typical
+                    /// boot settle window (~30s for connections + ~30s
+                    /// for tick-gap coalescer).
+                    const SLO_BOOT_UNIFORM_GRACE_SECS: u64 = 60;
+
                     /// Sample interval. SCOPE §13.1.
                     const SLO_TICK_INTERVAL_SECS: u64 = 10;
 
@@ -4998,6 +5102,10 @@ async fn main() -> Result<()> {
                     // Spill delta tracker — saturate-subtract previous total
                     // to detect any new drops in the last 10s.
                     let mut last_spill_total: u64 = slo_health.ticks_spilled();
+                    // Scheduler boot instant — used by the boot-relative
+                    // Phase 2 grace below to suppress SLO-02 false-positive
+                    // on mid-market boots (live incident 2026-04-28).
+                    let scheduler_boot_at = std::time::Instant::now();
 
                     info!("Wave 3-D SLO score scheduler: started (10s tick)");
 
@@ -5103,11 +5211,24 @@ async fn main() -> Result<()> {
                                     // Post-trigger but no record — could be
                                     // "still dispatching" (within grace) or
                                     // "Phase 2 never fired" (past grace).
-                                    // Grace window pins to 1.0 to avoid
-                                    // racing the dispatcher at 09:13:00 IST.
-                                    if secs_of_day
-                                        < SLO_PHASE2_TRIGGER_SECS_OF_DAY_IST + SLO_PHASE2_GRACE_SECS
-                                    {
+                                    // Two grace windows pin to 1.0:
+                                    //   1. Wall-clock grace at the 09:13:00
+                                    //      trigger (handles normal-boot race).
+                                    //   2. Boot-relative grace (handles
+                                    //      mid-market boot late-start path —
+                                    //      live incident 2026-04-28 14:18 IST
+                                    //      where Phase 2 dispatch took ~10s
+                                    //      after boot but the wall-clock
+                                    //      grace had already expired hours
+                                    //      ago at 09:14). Falsely paged
+                                    //      SLO-02 CRITICAL until the boot
+                                    //      grace was added here.
+                                    let in_wallclock_grace = secs_of_day
+                                        < SLO_PHASE2_TRIGGER_SECS_OF_DAY_IST
+                                            + SLO_PHASE2_GRACE_SECS;
+                                    let in_boot_grace = scheduler_boot_at.elapsed().as_secs()
+                                        < SLO_PHASE2_BOOT_GRACE_SECS;
+                                    if in_wallclock_grace || in_boot_grace {
                                         1.0
                                     } else {
                                         0.0
@@ -5124,7 +5245,17 @@ async fn main() -> Result<()> {
                             spill_health,
                             phase2_health,
                         };
-                        let outcome = evaluate_slo_score(&inputs);
+                        // Uniform boot grace: pin Healthy across ALL
+                        // dimensions during the first 60s after the
+                        // scheduler started. See
+                        // SLO_BOOT_UNIFORM_GRACE_SECS docstring.
+                        let outcome = if scheduler_boot_at.elapsed().as_secs()
+                            < SLO_BOOT_UNIFORM_GRACE_SECS
+                        {
+                            SloOutcome::Healthy { score: 1.0 }
+                        } else {
+                            evaluate_slo_score(&inputs)
+                        };
 
                         // Always emit gauges (operator dashboard reads them
                         // in real-time, off-hours included). Clamp each

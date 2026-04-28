@@ -1659,6 +1659,22 @@ pub const IV_MAX_BOUND: f64 = 5.0;
 /// persistent data root, also used by rkyv instrument cache and log files.
 pub const TOKEN_CACHE_FILE_PATH: &str = "data/cache/tv-token-cache";
 
+/// 2026-04-28 — depth-200 SELF-token AWS SSM Parameter Store path.
+///
+/// Distinct from the TOTP/APP token (which goes through the existing
+/// `secret_manager.rs` SSM flow) because depth-200 uses a SELF-type
+/// JWT — operator-pasted from web.dhan.co, renewed via
+/// `GET /v2/RenewToken`. Per CLAUDE.md "always real AWS SSM" — there
+/// is no local-disk cache for this token. Boot reads `GetParameter`,
+/// every renewal calls `PutParameter` to overwrite with the extended
+/// JWT. SSM at-rest encryption is `SecureString` + KMS
+/// `alias/aws/ssm`.
+///
+/// Naming follows CLAUDE.md convention `/tickvault/<env>/<service>/<key>`.
+/// See `.claude/rules/dhan/full-market-depth.md` and
+/// `docs/dhan-support/2026-04-28-depth-200-app-vs-self-token.md`.
+pub const DEPTH_200_SELF_TOKEN_SSM_PARAMETER: &str = "/tickvault/dev/dhan/depth_200_self_token";
+
 /// Minimum remaining token validity (hours) to accept a cached token.
 ///
 /// If the cached token expires in less than this, a full re-auth is performed.

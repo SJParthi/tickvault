@@ -50,6 +50,11 @@ pub struct ApplicationConfig {
     /// 14 flags spanning Wave 1, Wave 2 and Wave 3 items.
     #[serde(default)]
     pub features: FeaturesConfig,
+    /// 2026-04-28 — depth-200 alternate auth path (manually-pasted SELF
+    /// JWT, renewed via `GET /v2/RenewToken`). Default mode `"totp_app"`
+    /// keeps the existing TOTP/APP token flow untouched.
+    #[serde(default)]
+    pub depth_200_auth: Depth200AuthConfig,
 }
 
 /// Wave 1 C9 feature-flag toggles. Default = `true` for every flag (the
@@ -131,6 +136,125 @@ impl Default for FeaturesConfig {
             market_open_self_test: true,
             realtime_guarantee_score: true,
         }
+    }
+}
+
+/// 2026-04-28 — auth-mode selector for the depth-200 WebSocket only.
+///
+/// # Why this exists
+///
+/// Dhan's `wss://full-depth-api.dhan.co/` rejects access tokens whose
+/// `tokenConsumerType` claim is `"APP"` (the only type our automated
+/// `POST /app/generateAccessToken` flow can mint). Tokens with
+/// `tokenConsumerType: "SELF"` (operator-pasted from `web.dhan.co` >
+/// "Generate Access Token") stream depth-200 frames continuously on the
+/// SAME account, SAME SecurityId, SAME WebSocket URL.
+///
+/// Verified 2026-04-28 with the official Dhan Python SDK
+/// `dhanhq==2.2.0rc1`, SecurityId 74147, both `/` and `/twohundreddepth`
+/// path variants. Email + GitHub link sent to apihelp@dhan.co requesting
+/// they confirm the policy and document a programmatic SELF mint
+/// endpoint. This config struct ships the **plumbing** for the
+/// per-endpoint workaround behind a default-OFF mode flag, so the
+/// existing TOTP/APP path is untouched until Dhan replies.
+///
+/// # Modes
+///
+/// - `"totp_app"` (default) — depth-200 reuses the shared TOTP-driven
+///   `TokenHandle`. No behavior change vs today.
+/// - `"manual_self_with_renewal"` — depth-200 reads a separate cache
+///   file containing an operator-pasted SELF JWT, renews it every
+///   ~23h via `GET /v2/RenewToken`. All other WebSockets keep using
+///   the shared TOTP/APP handle.
+///
+/// # Cross-refs
+///
+/// - `.claude/rules/dhan/full-market-depth.md` — root-path URL invariant
+/// - `.claude/rules/dhan/authentication.md` rule 5 — `RenewToken` semantics
+/// - `docs/dhan-support/2026-04-28-depth-200-app-vs-self-token.md` — repro
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct Depth200AuthConfig {
+    /// Auth mode for depth-200 connections. One of:
+    /// - `"totp_app"` (default, no behavior change)
+    /// - `"manual_self_with_renewal"`
+    pub mode: String,
+    /// AWS SSM Parameter Store path holding the SELF JWT
+    /// (operator-pasted via `web.dhan.co > Generate Access Token`,
+    /// renewed in-place by the manager's task via `PutParameter`).
+    /// SecureString, KMS `alias/aws/ssm` encrypted at rest. Per
+    /// CLAUDE.md "always real AWS SSM" — there is no local-disk
+    /// fallback for this token.
+    pub ssm_parameter_name: String,
+    /// Renewal cadence in seconds. Default 82800 (23h) — fires before
+    /// the 24h JWT expiry so the SSM value is always renewable.
+    pub renewal_interval_secs: u64,
+    /// Minimum remaining validity (seconds) at boot to accept the cached
+    /// SSM token without forcing the operator to paste a fresh one.
+    /// Default 3600 (1h).
+    pub min_remaining_secs_at_boot: u64,
+}
+
+impl Default for Depth200AuthConfig {
+    fn default() -> Self {
+        // 2026-04-28 — default is `manual_self_with_renewal` because
+        // Dhan rejects APP-type tokens on `full-depth-api.dhan.co`
+        // (verified end-to-end). Defaulting to `totp_app` would mean
+        // every fresh deploy ships broken depth-200 until an operator
+        // remembers to flip the flag — that is the opposite of zero-
+        // touch automation. The operator can still override to
+        // `"totp_app"` for emergency rollback if Dhan ever fixes the
+        // server-side gate.
+        Self {
+            mode: Self::MODE_MANUAL_SELF_WITH_RENEWAL.to_string(),
+            ssm_parameter_name: crate::constants::DEPTH_200_SELF_TOKEN_SSM_PARAMETER.to_string(),
+            renewal_interval_secs: 82_800,
+            min_remaining_secs_at_boot: 3_600,
+        }
+    }
+}
+
+impl Depth200AuthConfig {
+    /// Canonical mode literal for the default TOTP/APP path.
+    pub const MODE_TOTP_APP: &'static str = "totp_app";
+    /// Canonical mode literal for the manual SELF + RenewToken path.
+    pub const MODE_MANUAL_SELF_WITH_RENEWAL: &'static str = "manual_self_with_renewal";
+
+    /// Returns true when the mode selects the manual-SELF code path.
+    #[must_use]
+    pub fn is_manual_self_mode(&self) -> bool {
+        self.mode == Self::MODE_MANUAL_SELF_WITH_RENEWAL
+    }
+
+    /// Validates the parsed config. Returns `Err` for an unrecognized mode.
+    ///
+    /// # Errors
+    /// Returns an `anyhow::Error` if `mode` is not one of the two known
+    /// literals, if `renewal_interval_secs == 0`, or if
+    /// `ssm_parameter_name` is empty / does not begin with `/tickvault/`
+    /// — typo-prevention at boot rather than a runtime surprise.
+    pub fn validate(&self) -> Result<()> {
+        if self.mode != Self::MODE_TOTP_APP && self.mode != Self::MODE_MANUAL_SELF_WITH_RENEWAL {
+            bail!(
+                "depth_200_auth.mode must be \"{}\" or \"{}\", got \"{}\"",
+                Self::MODE_TOTP_APP,
+                Self::MODE_MANUAL_SELF_WITH_RENEWAL,
+                self.mode
+            );
+        }
+        if self.renewal_interval_secs == 0 {
+            bail!("depth_200_auth.renewal_interval_secs must be > 0");
+        }
+        if self.ssm_parameter_name.is_empty() {
+            bail!("depth_200_auth.ssm_parameter_name must not be empty");
+        }
+        if !self.ssm_parameter_name.starts_with("/tickvault/") {
+            bail!(
+                "depth_200_auth.ssm_parameter_name must follow /tickvault/<env>/<service>/<key> convention, got \"{}\"",
+                self.ssm_parameter_name
+            );
+        }
+        Ok(())
     }
 }
 
@@ -1413,6 +1537,7 @@ mod tests {
             partition_retention: PartitionRetentionConfig::default(),
             movers: MoversConfig::default(),
             features: FeaturesConfig::default(),
+            depth_200_auth: Depth200AuthConfig::default(),
         }
     }
 
@@ -2221,6 +2346,122 @@ mod tests {
         assert!(!config.strategy.mode.is_live());
         assert!(!config.strategy.mode.is_sandbox());
         assert!(!config.strategy.mode.is_http_active());
+    }
+
+    // -----------------------------------------------------------------------
+    // Depth200AuthConfig — 2026-04-28 (depth-200 SELF token mode)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_depth_200_auth_default_mode_is_manual_self_with_renewal() {
+        // Per the 2026-04-28 zero-touch directive: default is the
+        // working SSM/SELF path, NOT the rejected TOTP/APP path.
+        let cfg = Depth200AuthConfig::default();
+        assert_eq!(cfg.mode, Depth200AuthConfig::MODE_MANUAL_SELF_WITH_RENEWAL);
+        assert!(cfg.is_manual_self_mode());
+    }
+
+    #[test]
+    fn test_depth_200_auth_default_ssm_path_matches_constant() {
+        let cfg = Depth200AuthConfig::default();
+        assert_eq!(
+            cfg.ssm_parameter_name,
+            crate::constants::DEPTH_200_SELF_TOKEN_SSM_PARAMETER
+        );
+    }
+
+    #[test]
+    fn test_depth_200_auth_default_ssm_path_follows_tickvault_convention() {
+        let cfg = Depth200AuthConfig::default();
+        assert!(
+            cfg.ssm_parameter_name.starts_with("/tickvault/"),
+            "SSM path must follow /tickvault/<env>/<service>/<key> convention, got {}",
+            cfg.ssm_parameter_name
+        );
+        assert!(
+            cfg.ssm_parameter_name.contains("/dhan/"),
+            "SSM path should be under /dhan/ service segment, got {}",
+            cfg.ssm_parameter_name
+        );
+    }
+
+    #[test]
+    fn test_depth_200_auth_default_renewal_interval_is_below_24h() {
+        let cfg = Depth200AuthConfig::default();
+        assert!(
+            cfg.renewal_interval_secs < 24 * 3_600,
+            "renewal must fire BEFORE the 24h JWT expiry, got {}",
+            cfg.renewal_interval_secs
+        );
+        assert!(
+            cfg.renewal_interval_secs >= 22 * 3_600,
+            "too aggressive renewal would burn rate limit, got {}",
+            cfg.renewal_interval_secs
+        );
+    }
+
+    #[test]
+    fn test_depth_200_auth_validate_accepts_known_modes() {
+        let mut cfg = Depth200AuthConfig::default();
+        assert!(cfg.validate().is_ok(), "totp_app must validate");
+        cfg.mode = Depth200AuthConfig::MODE_MANUAL_SELF_WITH_RENEWAL.to_string();
+        assert!(
+            cfg.validate().is_ok(),
+            "manual_self_with_renewal must validate"
+        );
+    }
+
+    #[test]
+    fn test_depth_200_auth_validate_rejects_unknown_mode() {
+        let cfg = Depth200AuthConfig {
+            mode: "nope".to_string(),
+            ..Depth200AuthConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_depth_200_auth_validate_rejects_zero_renewal_interval() {
+        let cfg = Depth200AuthConfig {
+            renewal_interval_secs: 0,
+            ..Depth200AuthConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_depth_200_auth_validate_rejects_empty_ssm_parameter_name() {
+        let cfg = Depth200AuthConfig {
+            ssm_parameter_name: String::new(),
+            ..Depth200AuthConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_depth_200_auth_validate_rejects_non_tickvault_ssm_path() {
+        let cfg = Depth200AuthConfig {
+            ssm_parameter_name: "/wrong/path/depth_200_self_token".to_string(),
+            ..Depth200AuthConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_depth_200_auth_is_manual_self_mode_helper() {
+        // Default is now manual_self_with_renewal (zero-touch).
+        let mut cfg = Depth200AuthConfig::default();
+        assert!(cfg.is_manual_self_mode());
+        cfg.mode = Depth200AuthConfig::MODE_TOTP_APP.to_string();
+        assert!(!cfg.is_manual_self_mode());
+    }
+
+    #[test]
+    fn test_depth_200_auth_mode_constants_are_distinct() {
+        assert_ne!(
+            Depth200AuthConfig::MODE_TOTP_APP,
+            Depth200AuthConfig::MODE_MANUAL_SELF_WITH_RENEWAL
+        );
     }
 
     #[test]
