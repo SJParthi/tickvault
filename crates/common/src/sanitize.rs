@@ -30,12 +30,21 @@ pub const MAX_AUDIT_STR_LEN: usize = 1024;
 /// (`*_audit_persistence.rs`) MUST funnel free-text columns through this
 /// helper before SQL interpolation.
 ///
-/// Three guarantees:
+/// Four guarantees:
 /// 1. Output is bounded by `MAX_AUDIT_STR_LEN` (UTF-8 safe truncation).
 /// 2. Control characters (`\0`, `\r`, `\n`, ASCII < 0x20 except space)
 ///    are removed — protects against SQL-string-literal newline
 ///    injection and HTTP framing breakage.
 /// 3. Single quotes are doubled per QuestDB SQL escape rule.
+/// 4. **Wave 3-C adversarial review (security-reviewer, 2026-04-28):**
+///    Belt-and-suspenders strip of `;` and `--` so QuestDB's `/exec`
+///    endpoint (which accepts multiple semicolon-separated statements
+///    in one `query=` parameter) cannot be coerced into multi-statement
+///    execution even if the single-quote doubling were ever bypassed
+///    by a future bug. Defense in depth: single-quote doubling already
+///    contains the practical attack today, but stripping the structural
+///    SQL tokens means the function is safe by construction even if a
+///    caller forgets to pass through it.
 ///
 /// Input is treated as untrusted (may originate from a Dhan error body
 /// or a raw WebSocket disconnect reason). Output is safe for direct
@@ -49,31 +58,80 @@ pub fn sanitize_audit_string(input: &str) -> String {
     // multi-byte sequences.
     let truncated: String = input.chars().take(MAX_AUDIT_STR_LEN).collect();
     let mut out = String::with_capacity(truncated.len());
+    let mut prev_was_dash = false;
     for ch in truncated.chars() {
         let cp = ch as u32;
         match ch {
             // Strip ALL ASCII control chars except plain space —
             // newlines, tabs, NUL, etc. They have no place in a
             // one-line audit diagnostic and break SQL string literals.
-            _ if cp < 0x20 => continue,
+            _ if cp < 0x20 => {
+                prev_was_dash = false;
+                continue;
+            }
             // ASCII DELETE.
-            _ if cp == 0x7f => continue,
+            _ if cp == 0x7f => {
+                prev_was_dash = false;
+                continue;
+            }
             // C1 control characters (U+0080..U+009F).
-            _ if (0x80..=0x9f).contains(&cp) => continue,
+            _ if (0x80..=0x9f).contains(&cp) => {
+                prev_was_dash = false;
+                continue;
+            }
             // Wave-2-D adversarial review (MEDIUM): strip Unicode
             // direction-override and zero-width characters that
             // (a) can reverse-render Telegram text in a way that
             // conceals malicious payload (U+202E RIGHT-TO-LEFT
             // OVERRIDE), and (b) break grep/jq parsing of audit
             // logs (zero-width spaces, BOM).
-            '\u{202a}'..='\u{202e}' => continue, // bidi overrides
-            '\u{2066}'..='\u{2069}' => continue, // bidi isolates
-            '\u{200b}'..='\u{200f}' => continue, // zero-widths + LRM/RLM
-            '\u{feff}' => continue,              // BOM
+            '\u{202a}'..='\u{202e}' => {
+                prev_was_dash = false;
+                continue;
+            } // bidi overrides
+            '\u{2066}'..='\u{2069}' => {
+                prev_was_dash = false;
+                continue;
+            } // bidi isolates
+            '\u{200b}'..='\u{200f}' => {
+                prev_was_dash = false;
+                continue;
+            } // zero-widths + LRM/RLM
+            '\u{feff}' => {
+                prev_was_dash = false;
+                continue;
+            } // BOM
+            // Wave 3-C: defense-in-depth strip of SQL-structural
+            // tokens. `;` ends a statement; `--` opens a line
+            // comment. QuestDB `/exec` accepts multi-statement
+            // `query=`, so stripping `;` removes the multi-statement
+            // attack class entirely. The double-dash check uses
+            // `prev_was_dash` to also strip the second dash.
+            ';' => {
+                prev_was_dash = false;
+                continue;
+            }
+            '-' if prev_was_dash => {
+                // Two dashes in a row: drop both. The first dash was
+                // already pushed; pop it.
+                let _ = out.pop();
+                prev_was_dash = false;
+                continue;
+            }
+            '-' => {
+                out.push('-');
+                prev_was_dash = true;
+            }
             // Single-quote doubling per QuestDB SQL escape.
-            '\'' => out.push_str("''"),
+            '\'' => {
+                out.push_str("''");
+                prev_was_dash = false;
+            }
             // Standard char.
-            c => out.push(c),
+            c => {
+                out.push(c);
+                prev_was_dash = false;
+            }
         }
     }
     out
@@ -541,5 +599,50 @@ mod tests {
         // Pin the constant so a future "let's bump to 64KB" PR is
         // forced to update tests + dashboards together.
         assert_eq!(MAX_AUDIT_STR_LEN, 1024);
+    }
+
+    #[test]
+    fn test_sanitize_audit_string_strips_semicolon_strict() {
+        // Wave 3-C adversarial review (security-reviewer, 2026-04-28):
+        // belt-and-suspenders SQL-structural strip.
+        let out = sanitize_audit_string("a;b;c");
+        assert_eq!(out, "abc");
+    }
+
+    #[test]
+    fn test_sanitize_audit_string_strips_double_dash_strict() {
+        let out = sanitize_audit_string("a--b");
+        assert_eq!(out, "ab", "both dashes of `--` must be removed");
+    }
+
+    #[test]
+    fn test_sanitize_audit_string_preserves_single_dash() {
+        let out = sanitize_audit_string("ATM-strike-25");
+        assert_eq!(
+            out, "ATM-strike-25",
+            "single dash legitimately appears in symbol/strike strings"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_audit_string_strips_triple_dash_first_pair() {
+        // `---` reads as `--` then `-`. The pair is stripped, the
+        // trailing single dash is preserved.
+        let out = sanitize_audit_string("a---b");
+        assert_eq!(
+            out, "a-b",
+            "first two dashes form `--`, stripped; trailing dash retained"
+        );
+    }
+
+    #[test]
+    fn test_sanitize_audit_string_combined_quote_semicolon_dash_attack() {
+        // Wave 3-C: quote-escape AND structural-strip both close the
+        // door on a triple-vector payload.
+        let evil = "ok'); DROP TABLE x; --";
+        let out = sanitize_audit_string(evil);
+        assert!(out.contains("''"), "quote doubled");
+        assert!(!out.contains(';'), "semicolons stripped");
+        assert!(!out.contains("--"), "comment markers stripped");
     }
 }
