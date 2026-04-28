@@ -1030,3 +1030,29 @@ rules:
       S3 archive failure. Idempotency-key prevents re-archive;
       next cycle will retry. Escalate so operator can verify
       AWS credentials + bucket reachability.
+
+  - name: selftest-01-passed-silence
+    match:
+      code: SELFTEST-01
+    action: silence
+    runbook_path: .claude/rules/project/wave-3-c-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      SELFTEST-01 = market-open self-test all-green positive ping.
+      Severity::Info, never wakes anyone. Silence locally; the
+      Telegram message is itself the operator-visible artifact.
+
+  - name: selftest-02-failed-escalate
+    match:
+      code: SELFTEST-02
+    action: escalate
+    runbook_path: .claude/rules/project/wave-3-c-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      SELFTEST-02 = market-open self-test detected a Critical or
+      Degraded sub-check failure. Severity::Critical. Always escalate;
+      the failure list in the Telegram payload tells the operator which
+      sub-check tripped. No auto-fix — sub-checks (main feed / QuestDB /
+      token) are upstream of this module.
