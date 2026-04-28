@@ -9,10 +9,60 @@
 //! patterns from arbitrary strings. It is regex-free — uses only
 //! `str::find` and character scanning.
 //!
+//! `sanitize_audit_string` (Wave-2-D Item 9 hardening) is the single
+//! choke-point used by every audit-table writer. It (a) caps length at
+//! `MAX_AUDIT_STR_LEN`, (b) strips control characters (NUL / CR / LF) so
+//! a hostile diagnostic cannot inject newlines into a SQL string literal
+//! or break HTTP framing, and (c) doubles single quotes per QuestDB SQL
+//! escape rules.
+//!
 //! # Usage
 //!
 //! Apply at error-creation sites (token_manager.rs) and at notification
 //! boundaries (events.rs) for defense-in-depth.
+
+/// Hard cap on any free-text column written to audit tables. 1 KiB is
+/// well above the longest legitimate diagnostic (typically ≤ 256 chars)
+/// and well below QuestDB's 32 KiB STRING limit.
+pub const MAX_AUDIT_STR_LEN: usize = 1024;
+
+/// Centralised audit-string sanitiser. Every audit-table writer
+/// (`*_audit_persistence.rs`) MUST funnel free-text columns through this
+/// helper before SQL interpolation.
+///
+/// Three guarantees:
+/// 1. Output is bounded by `MAX_AUDIT_STR_LEN` (UTF-8 safe truncation).
+/// 2. Control characters (`\0`, `\r`, `\n`, ASCII < 0x20 except space)
+///    are removed — protects against SQL-string-literal newline
+///    injection and HTTP framing breakage.
+/// 3. Single quotes are doubled per QuestDB SQL escape rule.
+///
+/// Input is treated as untrusted (may originate from a Dhan error body
+/// or a raw WebSocket disconnect reason). Output is safe for direct
+/// `'{escaped}'` interpolation in QuestDB SQL.
+#[must_use]
+pub fn sanitize_audit_string(input: &str) -> String {
+    if input.is_empty() {
+        return String::new();
+    }
+    // UTF-8 safe truncation by char (NOT byte) to avoid splitting
+    // multi-byte sequences.
+    let truncated: String = input.chars().take(MAX_AUDIT_STR_LEN).collect();
+    let mut out = String::with_capacity(truncated.len());
+    for ch in truncated.chars() {
+        match ch {
+            // Strip ALL ASCII control chars except plain space — newlines,
+            // tabs, NUL, etc. They have no place in a one-line audit
+            // diagnostic and break SQL string literals.
+            c if (c as u32) < 0x20 => continue,
+            // Single-quote doubling per QuestDB SQL escape.
+            '\'' => out.push_str("''"),
+            // Standard char.
+            c => out.push(c),
+        }
+    }
+    out
+}
 
 /// Redacts URL query parameters and known credential patterns from a string.
 ///
@@ -332,5 +382,93 @@ mod tests {
         let output = redact_url_params(input);
         assert!(!output.contains("s=t"), "https param leaked: {output}");
         assert!(!output.contains("k=v"), "http param leaked: {output}");
+    }
+
+    // -----------------------------------------------------------------
+    // sanitize_audit_string (Wave-2-D Item 9 hardening)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_sanitize_audit_string_empty_returns_empty() {
+        assert_eq!(sanitize_audit_string(""), "");
+    }
+
+    #[test]
+    fn test_sanitize_audit_string_doubles_single_quote() {
+        let out = sanitize_audit_string("RELIANCE's pre-open close was missing");
+        assert!(out.contains("''"));
+        assert!(!out.contains("RELIANCE's"));
+    }
+
+    #[test]
+    fn test_sanitize_audit_string_strips_newlines() {
+        let out = sanitize_audit_string("line1\nline2\rline3\0end");
+        assert!(!out.contains('\n'));
+        assert!(!out.contains('\r'));
+        assert!(!out.contains('\0'));
+        assert_eq!(out, "line1line2line3end");
+    }
+
+    #[test]
+    fn test_sanitize_audit_string_strips_control_chars() {
+        // ASCII bell (0x07) and tab (0x09) — both removed.
+        let out = sanitize_audit_string("a\x07b\tc");
+        assert_eq!(out, "abc");
+    }
+
+    #[test]
+    fn test_sanitize_audit_string_preserves_space() {
+        let out = sanitize_audit_string("hello world");
+        assert_eq!(out, "hello world");
+    }
+
+    #[test]
+    fn test_sanitize_audit_string_preserves_utf8() {
+        let out = sanitize_audit_string("errör — done");
+        assert!(out.contains("errör"));
+        assert!(out.contains("—"));
+    }
+
+    #[test]
+    fn test_sanitize_audit_string_truncates_to_max_len() {
+        let huge = "x".repeat(MAX_AUDIT_STR_LEN * 2);
+        let out = sanitize_audit_string(&huge);
+        assert_eq!(out.chars().count(), MAX_AUDIT_STR_LEN);
+    }
+
+    #[test]
+    fn test_sanitize_audit_string_truncation_is_utf8_char_boundary() {
+        // 4-byte char (😀 = U+1F600). Build input where truncation
+        // cap would fall mid-multi-byte if byte-wise.
+        let mut huge = String::new();
+        for _ in 0..(MAX_AUDIT_STR_LEN * 2) {
+            huge.push('😀');
+        }
+        let out = sanitize_audit_string(&huge);
+        // Truncation done by char count, so result is still valid UTF-8
+        // and all chars are 😀.
+        assert_eq!(out.chars().count(), MAX_AUDIT_STR_LEN);
+        for ch in out.chars() {
+            assert_eq!(ch, '😀');
+        }
+    }
+
+    #[test]
+    fn test_sanitize_audit_string_blocks_sql_newline_injection() {
+        // Adversarial: attacker-controlled diagnostic with embedded SQL.
+        let evil = "innocent\n', 0); DROP TABLE order_audit; --";
+        let out = sanitize_audit_string(evil);
+        assert!(!out.contains('\n'), "newline must be stripped");
+        // Single quotes are doubled, breaking the injected literal.
+        assert!(out.contains("''"));
+        // The attempt to break out of the SQL string literal therefore
+        // yields a still-quoted (and quote-doubled) literal — safe.
+    }
+
+    #[test]
+    fn test_max_audit_str_len_is_1024() {
+        // Pin the constant so a future "let's bump to 64KB" PR is
+        // forced to update tests + dashboards together.
+        assert_eq!(MAX_AUDIT_STR_LEN, 1024);
     }
 }

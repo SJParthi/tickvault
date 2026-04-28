@@ -10,6 +10,7 @@ use reqwest::Client;
 use tracing::{error, info, warn};
 
 use tickvault_common::config::QuestDbConfig;
+use tickvault_common::sanitize::sanitize_audit_string;
 
 /// QuestDB table for depth-rebalance audit.
 pub const QUESTDB_TABLE_DEPTH_REBALANCE_AUDIT: &str = "depth_rebalance_audit";
@@ -93,9 +94,9 @@ pub async fn append_depth_rebalance_audit_row(
     let client = Client::builder()
         .timeout(Duration::from_secs(QUESTDB_DDL_TIMEOUT_SECS))
         .build()?;
-    let underlying = underlying_symbol.replace('\'', "''");
-    let levels = swap_levels.replace('\'', "''");
-    let outcome_esc = outcome.replace('\'', "''");
+    let underlying = sanitize_audit_string(underlying_symbol);
+    let levels = sanitize_audit_string(swap_levels);
+    let outcome_esc = sanitize_audit_string(outcome);
     let sql = format!(
         "INSERT INTO {QUESTDB_TABLE_DEPTH_REBALANCE_AUDIT} (ts, underlying_symbol, old_atm_strike, new_atm_strike, spot_at_swap, swap_levels, outcome) VALUES \
          ({ts_nanos_ist}, '{underlying}', {old_atm_strike}, {new_atm_strike}, {spot_at_swap}, '{levels}', '{outcome_esc}');"
