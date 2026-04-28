@@ -1,66 +1,137 @@
-# Movers 22-TF v2 — Index (split-file plan to dodge inline-stream timeout)
+# Movers 22-TF v3 — Index (split-file plan, final scope)
 
-**Status:** DRAFT v2 (pending Parthiban approval)
+**Status:** DRAFT v3 (pending Parthiban approval)
 **Date:** 2026-04-28
 **Branch:** `claude/new-session-TBQe7`
-**Supersedes:** `.claude/plans/active-plan-movers-22tf-redesign.md` (v1)
+**Supersedes:** v1 → v2 → v3
 **Source audits:** `.claude/plans/research/2026-04-28-movers-22tf-design-verification/01..04.md`
 
-## Why this plan is split into 4 files
+## Why split into 4 files
 
-`stream-resilience.md` rule B1+B2: chat carries pointers, not bulk; each
-streamed/written payload stays small. Inlining the full plan kept timing
-out (Stream idle timeout — partial response received), so the body lives
-in 4 separate files written via individual `Write` calls.
+`stream-resilience.md` rule B1+B2 — chat carries pointers, not bulk; each Write payload stays small. Inlining failed 3 times with stream-idle-timeout. Body now lives in 4 separate files, each Written via individual tool call.
 
-| File | Contents | Size |
+| File | Contents |
+|---|---|
+| `.claude/plans/v2-architecture.md` | 6 architectural fixes; 8 components; final 26-col schema; depth integration; expiry rollover |
+| `.claude/plans/v2-risks.md` | 8 movers risks + 2 expiry-rollover risks; 12 failure modes; chaos test; 7 open questions |
+| `.claude/plans/v2-ratchets.md` | 47 ratchets + 5 rewrites + 3 banned-pattern + 2 make-doctor + 1 chaos |
+| `.claude/plans/v2-phases.md` | 7-commit phasing + 16 verification gates + 9-box per phase + go/no-go |
+
+## Final scope — every item
+
+### A. Movers core (22 tables, unified)
+
+1. 22 `movers_{T}` tables (1s, 5s, 10s, 15s, 30s, 1m..15m, 30m, 1h)
+2. Unified per-timeframe (NOT split per category) — `segment` + `instrument_type` distinguish
+3. DEDUP UPSERT KEYS(ts, security_id, segment) — I-P1-11 composite-key
+4. papaya tracker — lock-free O(1) hot path
+5. 22 isolated ILP writers
+6. Caller-owned arena Vec per writer — zero per-snap alloc
+7. Drop-NEWEST mpsc(8192) + 0.1% SLA alert
+8. Market-hours gate `[09:00, 15:30]` IST
+9. `MoversSupervisor` — respawns within 5s
+10. Rescue ring — buffers ILP writes during QuestDB outage
+11. All 22 tables in partition manager
+12. 90-day SEBI classification (NOT 5y)
+13. 9 new candle materialized views (4m, 6m, 7m, 8m, 9m, 11m, 12m, 13m, 14m)
+
+### B. MoverRow 26-column schema
+
+13 base + 4 derivative-meta + 4 OI/spot + 5 depth = 26 columns; ~296 B; `Copy`; 5 cache lines.
+
+### C. UI tabs (24 panels — final, trimmed)
+
+| Category | Sub-tabs | Count |
 |---|---|---|
-| `.claude/plans/v2-architecture.md` | 6 NEEDS-CHANGE fixes baked in (papaya, 22 writers, ArrayString, market-hours gate, arena Vec, drop-newest mpsc); 7 components; DDL pattern; prev_close routing | small |
-| `.claude/plans/v2-risks.md` | 8 unmitigated → all mitigated (rescue ring, partition manager, F&O expiry, SEBI, panic supervisor, drop-rate SLA, scheduler drift, IDX_I mid-day fallback); chaos test for 1M rows/sec; 10 failure modes; 5 open questions | small |
-| `.claude/plans/v2-ratchets.md` | 37 ratchet tests + 3 banned-pattern cats + 2 make-doctor sections + 1 chaos test + 4 ratchet extensions + 7-layer obs map | small |
-| `.claude/plans/v2-phases.md` | 6 phased commits + 14-gate pre-merge checklist + 9-box per phase + cross-ref to every rule file + honest 100% claim + go/no-go protocol | small |
+| Stocks | Price Movers (Gainers / Losers) | 2 |
+| Index | Price Movers (Gainers / Losers) | 2 |
+| Options | Highest OI, OI Gainers, OI Losers, Top Volume, Top Value, Price Gainers, Price Losers | 7 |
+| Futures | Premium, Discount, Top Volume, OI Gainers, OI Losers, Price Gainers, Price Losers | 7 |
+| **Depth (NEW)** | Widest Spread, Tightest Spread, Top Bid Pressure, Top Ask Pressure, NIFTY ATM ladder, BANKNIFTY ATM ladder | 6 |
+| **Total** | | **24** |
 
-## Audit findings baked in (14 of 14)
+### D. Filters / dropdowns
 
-### 6 architectural NEEDS-CHANGE (audit 01)
+- Global timeframe (22 options)
+- Options + Futures: expiry-month dropdown (April/May/June from `derivative_contracts.expiry_date`)
+- Options + Futures: All / Index / Stock
+- Stocks: Gainers ↔ Losers, F&O Stocks toggle
 
-| # | Finding | Where addressed |
+### E. Depth integration (Option A + C, NOT B)
+
+| Item | Decision |
+|---|---|
+| Option A: 5 depth columns on movers | YES |
+| Option C: 6 depth panels from existing tables | YES |
+| Option B: full ladder snapshots × 22 | NO (too heavy: ~4B rows/day) |
+| Existing depth-20/200 WS system | UNCHANGED |
+| `MarketDepthCache` reused via papaya O(1) lookup | YES |
+
+### F. Stock F&O expiry rollover (NEW)
+
+| Aspect | Old | New |
 |---|---|---|
-| 1 | papaya, not std::HashMap, for shared tracker state | architecture §What changed #1; ratchet 18 |
-| 2 | 22 writers, not 1 | architecture §What changed #2 + §"Why 22 writers"; ratchet 14 |
-| 3 | `ArrayString<16>` so `MoverRow` is `Copy` | architecture §What changed #3; ratchet 12 |
-| 4 | Market-hours gate (`is_within_market_hours_ist`) | architecture §What changed #4; ratchet 24 |
-| 5 | Caller-owned arena `Vec<MoverRow>` | architecture §What changed #5; ratchet 17 |
-| 6 | Drop-NEWEST (native tokio) explicitly documented | architecture §What changed #6; ratchet 15 |
+| Constant | `STOCK_EXPIRY_ROLLOVER_TRADING_DAYS = 1` | `= 0` |
+| Wed with Thu expiry (T-1) | ROLL | KEEP Thursday |
+| Thu IS expiry (T-0) | ROLL | ROLL |
+| Reason | avoid expiry-day risk | **Dhan disallows expiry-day stock F&O trading** |
+| Rule file | `depth-subscription.md` 2026-04-24 §6 | UPDATED |
+| Runbook | `expiry-day.md` | UPDATED |
 
-### 8 unmitigated risks (audit 03)
+### G. Ratchets (47 + 5 rewritten + 3 banned-pattern + 2 make-doctor + 1 chaos)
 
-| # | Risk | Where addressed |
+See `v2-ratchets.md` for the full table.
+
+### H. 7 phased commits
+
+See `v2-phases.md`. Recommendation: **ship Phase 5 (expiry rollover) as separate PR first** to keep movers PR under 3K LoC.
+
+## Audit findings still baked in (14 of 14)
+
+| # | Finding | Where |
 |---|---|---|
-| 1 | Movers-specific rescue ring | risks #1; phases 1+5 |
-| 2 | mpsc saturation drop SLA | risks #2; ratchet 15; alert wired |
-| 3 | Scheduler clock drift | risks #3; alert wired |
-| 4 | All 22 tasks panic supervisor | risks #4; phases 3; ratchet 23 |
-| 5 | IDX_I prev_close mid-day fallback | risks #5; phase 3 |
-| 6 | F&O expiry filter | risks #6; phase 3 |
-| 7 | Partition manager 22-table inclusion | risks #7; phase 1; ratchet 7 |
-| 8 | SEBI classification 90d (not 5y) | risks #8; phase 1; ratchet 8 |
+| 1 | papaya, not std::HashMap | architecture; ratchet 18 |
+| 2 | 22 writers, not 1 | architecture; ratchet 14 |
+| 3 | ArrayString<16> Copy MoverRow | architecture; ratchet 12 |
+| 4 | Market-hours gate | architecture; ratchet 24 |
+| 5 | Caller-owned arena Vec | architecture; ratchet 17 |
+| 6 | Drop-NEWEST mpsc | architecture; ratchet 15 |
+| 7 | Movers-specific rescue ring | risks #1; phases 1+5 |
+| 8 | mpsc saturation drop SLA | risks #2; ratchet 15 |
+| 9 | Scheduler clock drift alert | risks #3 |
+| 10 | All-22-tasks-panic supervisor | risks #4; ratchet 23 |
+| 11 | IDX_I prev_close mid-day fallback | risks #5 |
+| 12 | F&O expiry filter | risks #6 |
+| 13 | Partition manager 22-table inclusion | risks #7; ratchet 7 |
+| 14 | SEBI 90d classification | risks #8; ratchet 8 |
 
-### 37 ratchets + 3 banned-pattern + 2 make-doctor + chaos test
+## NEW additions in v3 (beyond v2)
 
-All in `v2-ratchets.md`. Maps to audit 04 1:1.
+| # | Addition |
+|---|---|
+| 15 | Categorization columns (`instrument_type`, `underlying_security_id`, `expiry_date`, `strike_price`, `option_type`) |
+| 16 | OI columns (`open_interest`, `oi_change`, `oi_change_pct`) |
+| 17 | Spot column (`spot_price` from `SharedSpotPrices`) |
+| 18 | Depth columns (`best_bid`, `best_ask`, `spread_pct`, `bid_pressure_5`, `ask_pressure_5` from `MarketDepthCache`) |
+| 19 | 24-panel Grafana dashboard with expiry-month dropdown |
+| 20 | Stock F&O expiry rollover policy change (T-1 → T-only) + 5 rewritten ratchets + rule + runbook |
+| 21 | 7 new Dhan-UI ratchets (38–47) |
 
-## Plan status workflow (per `plan-enforcement.md`)
+## Plan status workflow
 
-1. **DRAFT** ← current (pending approval)
-2. **APPROVED** ← after Parthiban gives explicit GO on 5 open questions in `v2-risks.md`
+1. **DRAFT** ← current (v3, pending approval)
+2. **APPROVED** ← after Parthiban GO on 7 open questions in `v2-risks.md`
 3. **IN_PROGRESS** ← Phase 1 commit lands
-4. **VERIFIED** ← `bash .claude/hooks/plan-verify.sh` passes after Phase 6
-5. **ARCHIVED** ← move to `.claude/plans/archive/2026-04-28-movers-22tf-redesign-v2.md` after PR merge
+4. **VERIFIED** ← `bash .claude/hooks/plan-verify.sh` green after Phase 7
+5. **ARCHIVED** ← `.claude/plans/archive/2026-04-28-movers-22tf-redesign-v3.md` after PR merge
 
-## Next action
+## Next action — STOP
 
-Parthiban — please review the 4 files above (each <300 lines) and answer the
-5 open questions in `v2-risks.md` so this plan can move from DRAFT → APPROVED.
+Parthiban — please review the 4 files (each <300 lines) and answer the 7 open questions in `v2-risks.md`, especially the new ones:
+
+- Q6: Approve expiry rollover T-1 → T-only?
+- Q7: Approve Option A + C depth integration (NOT B)?
+
+Plus: ship Phase 5 (rollover) as separate PR first, or bundle with movers?
 
 **No production code will be written until that explicit GO.**
