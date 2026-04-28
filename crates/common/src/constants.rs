@@ -1979,6 +1979,37 @@ pub const INDEX_CONSTITUENCY_SLUG_COUNT: usize = INDEX_CONSTITUENCY_SLUGS.len();
 pub const INDEX_CONSTITUENCY_KNOWN_STALE_SLUGS: &[&str] = &[];
 
 // ---------------------------------------------------------------------------
+// Wave 2 Item 7 (G14, G8) — Boot-time readiness + clock-skew probe constants
+//
+// Centralised here as the canonical pin so the escalation table is
+// asserted by both `boot_probe.rs` (consumer) and the rule files
+// (`wave-2-error-codes.md`, `wave-2-c-error-codes.md`). Any drift fails
+// the escalation_table_constants_match_pinned_values ratchet.
+// ---------------------------------------------------------------------------
+
+/// Boot deadline before BOOT-02 fires + the app halts.
+pub const BOOT_DEADLINE_SECS: u64 = 60;
+
+/// Escalation thresholds for `wait_for_questdb_ready`. Pinned as the
+/// single source of truth for the +5 / +10 / +20 / +30 / +60 table.
+pub const BOOT_ESCALATION_DEBUG_AT_SECS: u64 = 5;
+/// Boot escalation: INFO at +10s.
+pub const BOOT_ESCALATION_INFO_AT_SECS: u64 = 10;
+/// Boot escalation: WARN at +20s.
+pub const BOOT_ESCALATION_WARN_AT_SECS: u64 = 20;
+/// Boot escalation: ERROR `BOOT-01` at +30s.
+pub const BOOT_ESCALATION_ERROR_AT_SECS: u64 = 30;
+
+/// Hard threshold (signed seconds) for the boot-time clock-skew probe.
+/// Exceeding this magnitude (`|skew| >= 2.0`) emits `BOOT-03` + HALT.
+///
+/// Justification: IST timestamp math + DEDUP UPSERT keys depend on
+/// accurate wall-clock. ±2s can cross IST midnight, the 09:00:00
+/// market-open gate, or the 15:30:00 close gate — silently splitting or
+/// merging trading days in QuestDB.
+pub const CLOCK_SKEW_HALT_THRESHOLD_SECS: f64 = 2.0;
+
+// ---------------------------------------------------------------------------
 // Tests — Market Hours Constants
 // ---------------------------------------------------------------------------
 
@@ -2014,6 +2045,60 @@ mod market_hours_tests {
     fn test_persist_window_is_subset_of_day() {
         const { assert!(TICK_PERSIST_START_SECS_OF_DAY_IST < TICK_PERSIST_END_SECS_OF_DAY_IST) };
         const { assert!(TICK_PERSIST_END_SECS_OF_DAY_IST < SECONDS_PER_DAY) };
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests — Wave 2 Item 7 (G14, G8) boot-time constants
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod boot_constants_tests {
+    use super::*;
+
+    #[test]
+    fn test_boot_deadline_constant_is_60s() {
+        const { assert!(BOOT_DEADLINE_SECS == 60) };
+    }
+
+    #[test]
+    fn test_escalation_thresholds_match_pinned_table() {
+        // The wave-2-error-codes.md and Item 7.2 spec pin this exact table:
+        // +5s DEBUG, +10s INFO, +20s WARN, +30s ERROR (BOOT-01),
+        // +60s CRITICAL+HALT (BOOT-02). The constants below MUST match;
+        // any drift fails this ratchet and the rule cross-ref test.
+        const { assert!(BOOT_ESCALATION_DEBUG_AT_SECS == 5) };
+        const { assert!(BOOT_ESCALATION_INFO_AT_SECS == 10) };
+        const { assert!(BOOT_ESCALATION_WARN_AT_SECS == 20) };
+        const { assert!(BOOT_ESCALATION_ERROR_AT_SECS == 30) };
+        const { assert!(BOOT_DEADLINE_SECS == 60) };
+    }
+
+    #[test]
+    fn test_escalation_thresholds_strictly_monotonic() {
+        const { assert!(BOOT_ESCALATION_DEBUG_AT_SECS < BOOT_ESCALATION_INFO_AT_SECS) };
+        const { assert!(BOOT_ESCALATION_INFO_AT_SECS < BOOT_ESCALATION_WARN_AT_SECS) };
+        const { assert!(BOOT_ESCALATION_WARN_AT_SECS < BOOT_ESCALATION_ERROR_AT_SECS) };
+        const { assert!(BOOT_ESCALATION_ERROR_AT_SECS < BOOT_DEADLINE_SECS) };
+    }
+
+    #[test]
+    fn test_clock_skew_threshold_constant_is_2s() {
+        // Ratchet for Wave 2 Item 7.3 (G8). 2s is the hard upper bound
+        // that keeps IST midnight + 09:00:00 + 15:30:00 gates from
+        // silently slipping by one trading day or one market session.
+        // Any change to this constant requires re-evaluation of the IST
+        // boundary math and operator approval — see
+        // .claude/rules/project/wave-2-c-error-codes.md (BOOT-03).
+        let lo = CLOCK_SKEW_HALT_THRESHOLD_SECS - 2.0_f64;
+        let hi = CLOCK_SKEW_HALT_THRESHOLD_SECS + 2.0_f64;
+        assert!((-f64::EPSILON..=f64::EPSILON).contains(&lo));
+        assert!((4.0 - f64::EPSILON..=4.0 + f64::EPSILON).contains(&hi));
+    }
+
+    #[test]
+    fn test_clock_skew_threshold_is_strictly_positive() {
+        const { assert!(CLOCK_SKEW_HALT_THRESHOLD_SECS > 0.0) };
     }
 }
 
