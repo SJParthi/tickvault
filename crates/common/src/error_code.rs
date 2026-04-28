@@ -239,6 +239,16 @@ pub enum ErrorCode {
     Telegram02CoalescerStateInconsistency,
 
     // -----------------------------------------------------------------------
+    // Wave 3 — Telegram dispatcher (Item 11)
+    // -----------------------------------------------------------------------
+    /// TELEGRAM-01: a Telegram event was dropped (queue full, send-after-retry
+    /// failure, or coalescer overflow). Operator alerts MAY be missed.
+    Telegram01Dropped,
+    /// TELEGRAM-02: coalescer state inconsistency (drain failed mid-window;
+    /// next drain self-recovers). Informational.
+    Telegram02CoalescerStateInconsistency,
+
+    // -----------------------------------------------------------------------
     // Dhan Trading API (DH-9xx)
     // -----------------------------------------------------------------------
     /// DH-901: Invalid auth — rotate token, retry once.
@@ -833,9 +843,11 @@ mod tests {
         // STORAGE-GAP-03/04).
         // 2026-04-27 (Wave 2-C Item 7.3): bumped 76 -> 77 for BOOT-03
         // (clock-skew exceeded — HALTING).
-        // 2026-04-28 (Wave 3-B Item 11): bumped 77 -> 79 for TELEGRAM-01/02
+        // 2026-04-28 (Wave 3-A Item 10): bumped 77 -> 78 for MOVERS-03
+        // (pre-open movers persistence failed).
+        // 2026-04-28 (Wave 3-B Item 11): bumped 78 -> 80 for TELEGRAM-01/02
         // (Telegram bucket-coalescer hardening).
-        assert_eq!(ErrorCode::all().len(), 79);
+        assert_eq!(ErrorCode::all().len(), 80);
     }
 
     #[test]

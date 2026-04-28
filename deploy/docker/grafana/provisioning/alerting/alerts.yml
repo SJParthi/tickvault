@@ -1205,38 +1205,42 @@ groups:
         labels:
           severity: medium
 
-      # Wave 3-C / SELFTEST-02: market-open self-test detected a failure.
-      - uid: tv-selftest-02-failed
-        title: "Wave 3-C SELFTEST-02: market-open self-test failed"
+      # Wave 3-B Item 11: Telegram dispatcher drops.
+      # Drops mean operator alerts MAY be missed — investigate
+      # immediately. Counter is labelled by `reason` (`noop_mode`,
+      # `coalesced_sample_capped`, `send_failed`); we sum across reasons
+      # so any drop fires the alert.
+      - uid: tv-telegram-drops
+        title: "TELEGRAM-01: Telegram drops detected — operator alerts may be missed"
         condition: C
         data:
           - refId: A
-            relativeTimeRange: { from: 86400, to: 0 }
+            relativeTimeRange: { from: 60, to: 0 }
             datasourceUid: prometheus
             model:
-              expr: 'increase(tv_self_test_total{result=~"degraded|critical"}[1d])'
-              intervalMs: 60000
+              expr: 'sum(rate(tv_telegram_dropped_total[1m]))'
+              intervalMs: 15000
               maxDataPoints: 43200
           - refId: B
-            relativeTimeRange: { from: 86400, to: 0 }
+            relativeTimeRange: { from: 60, to: 0 }
             datasourceUid: __expr__
             model:
               type: reduce
               expression: A
               reducer: last
           - refId: C
-            relativeTimeRange: { from: 86400, to: 0 }
+            relativeTimeRange: { from: 60, to: 0 }
             datasourceUid: __expr__
             model:
               type: threshold
               expression: B
               conditions:
-                - evaluator: { type: gt, params: [0] }
+                - evaluator: { type: gt, params: [0.1] }
         noDataState: OK
         execErrState: Alerting
         for: 1m
         annotations:
-          summary: "SELFTEST-02: market-open self-test failed at 09:16 IST"
-          description: "tv_self_test_total{result='degraded' or 'critical'} incremented in the last 24h. The 09:16:00 IST self-test detected a failure across one or more of the 8 sub-checks (main feed / depth-20 / depth-200 / order-update WS / pipeline / recent-tick / QuestDB / token-headroom). The Telegram payload lists the exact failed sub-checks. Runbook: .claude/rules/project/wave-3-c-error-codes.md (SELFTEST-02)."
+          summary: "TELEGRAM-01: Telegram dispatcher drops > 0.1/s for 60s"
+          description: "tv_telegram_dropped_total rate > 0.1/s for 60s. Operator alerts may be missed. Inspect the `reason` label distribution: `send_failed` = network/auth issue, `coalesced_sample_capped` = noisy subsystem (count is still authoritative), `noop_mode` = SSM unavailable. Runbook: .claude/rules/project/wave-3-error-codes.md (TELEGRAM-01)."
         labels:
           severity: high
