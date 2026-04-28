@@ -130,14 +130,47 @@ See `v2-phases.md`. Recommendation: **ship Phase 5 (expiry rollover) as separate
 | Phase | Description | Status | Commit |
 |---|---|---|---|
 | 5 | Stock F&O expiry rollover T-only | DONE | `d428835` |
-| 6 | Depth-200 URL wipe-off | NEXT | — |
-| 7 | Depth-20 dynamic top-150 | After 6 | — |
+| 6 | Depth-200 URL wipe-off (619 LoC removed + 2 new ratchets) | DONE | `33547aa` |
+| **7** | **Depth-20 dynamic top-150 selector (~600 LoC, 4 new ratchets)** | **NEXT** | — |
 | 8 | Movers 22 tables + DDL | After 7 | — |
 | 9 | MoverRow common types | After 8 | — |
 | 10 | papaya tracker + scheduler | After 9 | — |
 | 11 | Observability (24-panel Grafana) | After 10 | — |
 | 12 | Tests + chaos | After 11 | — |
 | 13 | Hooks + doctor | After 12 | — |
+
+## Resume protocol (for new Claude Code sessions)
+
+If this session ends prematurely, a fresh session can resume by:
+
+1. Checkout the branch: `git checkout claude/new-session-TBQe7`
+2. Read this file (the index) — phase progress tracker above is the source of truth
+3. Read the most recent commit message to see the last completed phase
+4. Read the 4 split files (`v2-architecture.md`, `v2-risks.md`, `v2-ratchets.md`, `v2-phases.md`) for full context
+5. Continue from the **NEXT** phase per the tracker above
+
+Last commit on this branch: `33547aa` (Phase 6 — depth-200 wipe-off complete).
+Next action: **Phase 7** — implement `crates/core/src/instrument/depth_20_dynamic_subscriber.rs` per the design in `v2-architecture.md` Section I.
+
+## Phase 7 implementation guide (for resume)
+
+| Step | Action |
+|---|---|
+| 1 | Create `crates/core/src/instrument/depth_20_dynamic_subscriber.rs` (new module) |
+| 2 | Add module to `crates/core/src/instrument/mod.rs` |
+| 3 | Implement selector function querying `option_movers` (existing table): `SELECT security_id FROM option_movers WHERE ts > now() - 90s AND change_pct > 0 ORDER BY volume DESC LIMIT 150` |
+| 4 | Implement 1-minute `tokio::time::interval` recompute loop with `MissedTickBehavior::Skip` |
+| 5 | Add `is_within_market_hours_ist()` gate (audit-findings Rule 3) |
+| 6 | Implement set-diff: `leavers = previous - current; entrants = current - previous` |
+| 7 | Emit `DepthCommand::Swap20 { unsubscribe_messages: leavers, subscribe_messages: entrants }` over the 3 dynamic-slot mpsc channels |
+| 8 | Promote `DEPTH-DYN-01` and `DEPTH-DYN-02` from RESERVED to defined `ErrorCode` variants in `crates/common/src/error_code.rs` |
+| 9 | Add Triage YAML entries in `.claude/triage/error-rules.yaml` |
+| 10 | Update `wave-4-error-codes.md` (RESERVED → defined) |
+| 11 | Add Telegram event variants `Depth20DynamicTop150Empty`, `Depth20DynamicSwapBroken` (edge-triggered per audit-findings Rule 4) |
+| 12 | Boot wiring in `crates/app/src/main.rs` — spawn supervisor task that owns the 3 dynamic-slot mpsc Senders (slots 3/4/5) |
+| 13 | Add 4 new ratchet tests (48-51): selector returns ≤150, filter > 0, 1-min interval, delta-swap correctness |
+| 14 | Run `cargo test -p tickvault-core` |
+| 15 | Commit + push as `feat(depth-20): dynamic top-150 selector + 1-minute Swap20 rebalance` |
 
 ## Next action — STOP
 
