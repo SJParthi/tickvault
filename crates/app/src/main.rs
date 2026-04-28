@@ -259,24 +259,119 @@ async fn main() -> Result<()> {
             loop {
                 ticker.tick().await;
                 let now = std::time::Instant::now();
-                let gaps = detector_for_task.scan_gaps(now);
-                if gaps.is_empty() {
+                // Wave-2-D Fix 4: bounded variant — even universe-wide
+                // silence (~25 K silent instruments) only allocates for
+                // the top-N. Returns (top_n_entries, total_silent).
+                let (gaps, total_silent) = detector_for_task.scan_gaps_top_n(
+                    now,
+                    tickvault_core::pipeline::tick_gap_detector::TICK_GAP_TOP_N_DEFAULT,
+                );
+                if total_silent == 0 {
                     continue;
                 }
                 metrics::counter!("tv_tick_gap_summary_total").increment(1);
-                metrics::gauge!("tv_tick_gap_instruments_silent").set(gaps.len() as f64);
+                metrics::gauge!("tv_tick_gap_instruments_silent").set(total_silent as f64);
                 let top: Vec<(u32, &'static str, u64)> = gaps
                     .iter()
                     .take(10)
                     .map(|(id, seg, gap)| (*id, seg.as_str(), *gap))
                     .collect();
                 tracing::error!(
-                    silent_count = gaps.len(),
+                    silent_count = total_silent,
                     top_10_samples = ?top,
                     code = tickvault_common::error_code::ErrorCode::WsGap06TickGapSummary
                         .code_str(),
                     "WS-GAP-06 tick-gap detector coalesced summary — instruments silent ≥30s"
                 );
+            }
+        });
+    }
+
+    // Wave-2-D Fix 2 (G19) — daily 15:35 IST reset task. The
+    // coalescing detector accumulates per-(security_id, segment) entries
+    // forever; without this reset, expired/delisted contracts pollute
+    // tomorrow's scan and overnight silence (16:00 → next 09:15) reads
+    // as a tick gap. `reset_daily()` is defined + tested in
+    // `tick_gap_detector.rs` but had no production call site —
+    // satisfies audit-findings-2026-04-17.md Rule 13.
+    //
+    // Loop: sleep until 15:35 IST today (or tomorrow if past), call
+    // `reset_daily()`, then sleep ~24h until next 15:35 IST.
+    {
+        let detector_for_reset = tick_gap_detector.clone();
+        tokio::spawn(async move {
+            loop {
+                // 15:35:00 IST = 5min after market close. Use the same
+                // helper that `compute_market_close_sleep("15:30:00")`
+                // uses elsewhere — just shifted +5min so we don't race
+                // any 15:30-tied tasks.
+                let sleep_dur = compute_market_close_sleep(
+                    tickvault_common::constants::TICK_GAP_RESET_TIME_IST,
+                );
+                if sleep_dur.is_zero() {
+                    // Already past 15:35 IST today → settle 60s and
+                    // recompute. Avoids a hot-spin during the post-15:35
+                    // window.
+                    tokio::time::sleep(std::time::Duration::from_secs(
+                        tickvault_common::constants::TICK_GAP_RESET_SETTLE_SECS,
+                    ))
+                    .await;
+                    let recompute = compute_market_close_sleep(
+                        tickvault_common::constants::TICK_GAP_RESET_TIME_IST,
+                    );
+                    if recompute.is_zero() {
+                        // Still past 15:35 (clock stuck?) — bounded
+                        // busy-loop avoidance.
+                        tokio::time::sleep(std::time::Duration::from_secs(
+                            tickvault_common::constants::TICK_GAP_RESET_BUSYLOOP_GUARD_SECS,
+                        ))
+                        .await;
+                        continue;
+                    }
+                    tokio::time::sleep(recompute).await;
+                } else {
+                    tokio::time::sleep(sleep_dur).await;
+                }
+                // Wave-2-D adversarial review (MEDIUM) — idempotent
+                // per-day reset. NTP backward step or a Duration::ZERO
+                // recompute can otherwise race this loop into a
+                // double-fire. Compute current trading-date IST in
+                // epoch days; the detector's CAS guarantees a single
+                // real clear per day.
+                let now_secs = chrono::Utc::now().timestamp();
+                let now_ist_secs = now_secs.saturating_add(i64::from(
+                    tickvault_common::constants::IST_UTC_OFFSET_SECONDS,
+                ));
+                let trading_date_ist_days = now_ist_secs
+                    .div_euclid(i64::from(tickvault_common::constants::SECONDS_PER_DAY));
+                let actually_fired =
+                    detector_for_reset.reset_daily_idempotent(trading_date_ist_days);
+                if actually_fired {
+                    metrics::counter!("tv_tick_gap_daily_resets_total").increment(1);
+                    metrics::gauge!("tv_tick_gap_last_reset_date_ist_days")
+                        .set(trading_date_ist_days as f64);
+                    tracing::info!(
+                        map_size_after = detector_for_reset.len(),
+                        trading_date_ist_days,
+                        "WS-GAP-06 tick-gap detector daily reset fired @ 15:35 IST"
+                    );
+                } else {
+                    // Idempotent skip — another loop iteration in the
+                    // same trading day already cleared the map. Log
+                    // at debug; do NOT increment the counter or fire
+                    // a Telegram event.
+                    tracing::debug!(
+                        trading_date_ist_days,
+                        "WS-GAP-06 daily reset skipped — already fired today"
+                    );
+                }
+                // After reset, ensure we sleep past the 15:35 boundary
+                // so we don't race the same minute back into a
+                // near-zero sleep on the next loop iteration.
+                tokio::time::sleep(std::time::Duration::from_secs(
+                    tickvault_common::constants::TICK_GAP_RESET_SETTLE_SECS,
+                ))
+                .await;
             }
         });
     }

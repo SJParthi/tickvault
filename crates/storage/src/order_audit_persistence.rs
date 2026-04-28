@@ -10,6 +10,7 @@ use reqwest::Client;
 use tracing::{error, info, warn};
 
 use tickvault_common::config::QuestDbConfig;
+use tickvault_common::sanitize::sanitize_audit_string;
 
 pub const QUESTDB_TABLE_ORDER_AUDIT: &str = "order_audit";
 pub const DEDUP_KEY_ORDER_AUDIT: &str = "order_id, ts, leg";
@@ -99,18 +100,34 @@ pub async fn append_order_audit_row(
     let client = Client::builder()
         .timeout(Duration::from_secs(QUESTDB_DDL_TIMEOUT_SECS))
         .build()?;
-    let order_id_esc = order_id.replace('\'', "''");
-    let corr_esc = correlation_id.replace('\'', "''");
-    let leg_esc = leg.replace('\'', "''");
-    let event_esc = event.replace('\'', "''");
-    let seg_esc = segment.replace('\'', "''");
-    let txn_esc = transaction_type.replace('\'', "''");
-    let status_esc = order_status.replace('\'', "''");
-    let outcome_esc = outcome.replace('\'', "''");
-    let detail_esc = detail.replace('\'', "''");
+    let order_id_esc = sanitize_audit_string(order_id);
+    let corr_esc = sanitize_audit_string(correlation_id);
+    let leg_esc = sanitize_audit_string(leg);
+    let event_esc = sanitize_audit_string(event);
+    let seg_esc = sanitize_audit_string(segment);
+    let txn_esc = sanitize_audit_string(transaction_type);
+    let status_esc = sanitize_audit_string(order_status);
+    let outcome_esc = sanitize_audit_string(outcome);
+    let detail_esc = sanitize_audit_string(detail);
+    // Wave-2-D adversarial review (HIGH) — `price` is `f64`; a malformed
+    // Dhan response could produce NaN/Infinity. QuestDB rejects both,
+    // which would fail every subsequent audit insert for that order.
+    // Clamp to a finite fallback (0.0) and log; the audit row still
+    // captures the order with the lifecycle event, just without a
+    // bogus price.
+    let safe_price: f64 = if price.is_finite() {
+        price
+    } else {
+        tracing::warn!(
+            order_id = %order_id_esc,
+            raw_price = price,
+            "order_audit: non-finite price clamped to 0.0 to avoid QuestDB reject"
+        );
+        0.0
+    };
     let sql = format!(
         "INSERT INTO {QUESTDB_TABLE_ORDER_AUDIT} (ts, order_id, correlation_id, leg, event, security_id, segment, transaction_type, quantity, price, order_status, outcome, detail) VALUES \
-         ({ts_nanos_ist}, '{order_id_esc}', '{corr_esc}', '{leg_esc}', '{event_esc}', {security_id}, '{seg_esc}', '{txn_esc}', {quantity}, {price}, '{status_esc}', '{outcome_esc}', '{detail_esc}');"
+         ({ts_nanos_ist}, '{order_id_esc}', '{corr_esc}', '{leg_esc}', '{event_esc}', {security_id}, '{seg_esc}', '{txn_esc}', {quantity}, {safe_price}, '{status_esc}', '{outcome_esc}', '{detail_esc}');"
     );
     let resp = client
         .get(&base_url)

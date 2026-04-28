@@ -10,6 +10,7 @@ use reqwest::Client;
 use tracing::{error, info, warn};
 
 use tickvault_common::config::QuestDbConfig;
+use tickvault_common::sanitize::sanitize_audit_string;
 
 /// QuestDB table name for the Phase 2 audit trail.
 pub const QUESTDB_TABLE_PHASE2_AUDIT: &str = "phase2_audit";
@@ -94,8 +95,8 @@ pub async fn append_phase2_audit_row(
         .timeout(Duration::from_secs(QUESTDB_DDL_TIMEOUT_SECS))
         .build()?;
     // QuestDB SQL escape: replace single quotes with two single quotes.
-    let escaped_diag = diagnostic.replace('\'', "''");
-    let escaped_outcome = outcome.replace('\'', "''");
+    let escaped_diag = sanitize_audit_string(diagnostic);
+    let escaped_outcome = sanitize_audit_string(outcome);
     let sql = format!(
         "INSERT INTO {QUESTDB_TABLE_PHASE2_AUDIT} (ts, trading_date_ist, outcome, stocks_added, stocks_skipped, buffer_entries, diagnostic) VALUES \
          ({ts_nanos_ist}, {trading_date_ist_nanos}, '{escaped_outcome}', {stocks_added}, {stocks_skipped}, {buffer_entries}, '{escaped_diag}');"

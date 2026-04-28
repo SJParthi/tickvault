@@ -9,10 +9,75 @@
 //! patterns from arbitrary strings. It is regex-free — uses only
 //! `str::find` and character scanning.
 //!
+//! `sanitize_audit_string` (Wave-2-D Item 9 hardening) is the single
+//! choke-point used by every audit-table writer. It (a) caps length at
+//! `MAX_AUDIT_STR_LEN`, (b) strips control characters (NUL / CR / LF) so
+//! a hostile diagnostic cannot inject newlines into a SQL string literal
+//! or break HTTP framing, and (c) doubles single quotes per QuestDB SQL
+//! escape rules.
+//!
 //! # Usage
 //!
 //! Apply at error-creation sites (token_manager.rs) and at notification
 //! boundaries (events.rs) for defense-in-depth.
+
+/// Hard cap on any free-text column written to audit tables. 1 KiB is
+/// well above the longest legitimate diagnostic (typically ≤ 256 chars)
+/// and well below QuestDB's 32 KiB STRING limit.
+pub const MAX_AUDIT_STR_LEN: usize = 1024;
+
+/// Centralised audit-string sanitiser. Every audit-table writer
+/// (`*_audit_persistence.rs`) MUST funnel free-text columns through this
+/// helper before SQL interpolation.
+///
+/// Three guarantees:
+/// 1. Output is bounded by `MAX_AUDIT_STR_LEN` (UTF-8 safe truncation).
+/// 2. Control characters (`\0`, `\r`, `\n`, ASCII < 0x20 except space)
+///    are removed — protects against SQL-string-literal newline
+///    injection and HTTP framing breakage.
+/// 3. Single quotes are doubled per QuestDB SQL escape rule.
+///
+/// Input is treated as untrusted (may originate from a Dhan error body
+/// or a raw WebSocket disconnect reason). Output is safe for direct
+/// `'{escaped}'` interpolation in QuestDB SQL.
+#[must_use]
+pub fn sanitize_audit_string(input: &str) -> String {
+    if input.is_empty() {
+        return String::new();
+    }
+    // UTF-8 safe truncation by char (NOT byte) to avoid splitting
+    // multi-byte sequences.
+    let truncated: String = input.chars().take(MAX_AUDIT_STR_LEN).collect();
+    let mut out = String::with_capacity(truncated.len());
+    for ch in truncated.chars() {
+        let cp = ch as u32;
+        match ch {
+            // Strip ALL ASCII control chars except plain space —
+            // newlines, tabs, NUL, etc. They have no place in a
+            // one-line audit diagnostic and break SQL string literals.
+            _ if cp < 0x20 => continue,
+            // ASCII DELETE.
+            _ if cp == 0x7f => continue,
+            // C1 control characters (U+0080..U+009F).
+            _ if (0x80..=0x9f).contains(&cp) => continue,
+            // Wave-2-D adversarial review (MEDIUM): strip Unicode
+            // direction-override and zero-width characters that
+            // (a) can reverse-render Telegram text in a way that
+            // conceals malicious payload (U+202E RIGHT-TO-LEFT
+            // OVERRIDE), and (b) break grep/jq parsing of audit
+            // logs (zero-width spaces, BOM).
+            '\u{202a}'..='\u{202e}' => continue, // bidi overrides
+            '\u{2066}'..='\u{2069}' => continue, // bidi isolates
+            '\u{200b}'..='\u{200f}' => continue, // zero-widths + LRM/RLM
+            '\u{feff}' => continue,              // BOM
+            // Single-quote doubling per QuestDB SQL escape.
+            '\'' => out.push_str("''"),
+            // Standard char.
+            c => out.push(c),
+        }
+    }
+    out
+}
 
 /// Redacts URL query parameters and known credential patterns from a string.
 ///
@@ -332,5 +397,149 @@ mod tests {
         let output = redact_url_params(input);
         assert!(!output.contains("s=t"), "https param leaked: {output}");
         assert!(!output.contains("k=v"), "http param leaked: {output}");
+    }
+
+    // -----------------------------------------------------------------
+    // sanitize_audit_string (Wave-2-D Item 9 hardening)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_sanitize_audit_string_empty_returns_empty() {
+        assert_eq!(sanitize_audit_string(""), "");
+    }
+
+    #[test]
+    fn test_sanitize_audit_string_doubles_single_quote() {
+        let out = sanitize_audit_string("RELIANCE's pre-open close was missing");
+        assert!(out.contains("''"));
+        assert!(!out.contains("RELIANCE's"));
+    }
+
+    #[test]
+    fn test_sanitize_audit_string_strips_newlines() {
+        let out = sanitize_audit_string("line1\nline2\rline3\0end");
+        assert!(!out.contains('\n'));
+        assert!(!out.contains('\r'));
+        assert!(!out.contains('\0'));
+        assert_eq!(out, "line1line2line3end");
+    }
+
+    #[test]
+    fn test_sanitize_audit_string_strips_control_chars() {
+        // ASCII bell (0x07) and tab (0x09) — both removed.
+        let out = sanitize_audit_string("a\x07b\tc");
+        assert_eq!(out, "abc");
+    }
+
+    #[test]
+    fn test_sanitize_audit_string_preserves_space() {
+        let out = sanitize_audit_string("hello world");
+        assert_eq!(out, "hello world");
+    }
+
+    #[test]
+    fn test_sanitize_audit_string_preserves_utf8() {
+        let out = sanitize_audit_string("errör — done");
+        assert!(out.contains("errör"));
+        assert!(out.contains("—"));
+    }
+
+    #[test]
+    fn test_sanitize_audit_string_truncates_to_max_len() {
+        let huge = "x".repeat(MAX_AUDIT_STR_LEN * 2);
+        let out = sanitize_audit_string(&huge);
+        assert_eq!(out.chars().count(), MAX_AUDIT_STR_LEN);
+    }
+
+    #[test]
+    fn test_sanitize_audit_string_truncation_is_utf8_char_boundary() {
+        // 4-byte char (😀 = U+1F600). Build input where truncation
+        // cap would fall mid-multi-byte if byte-wise.
+        let mut huge = String::new();
+        for _ in 0..(MAX_AUDIT_STR_LEN * 2) {
+            huge.push('😀');
+        }
+        let out = sanitize_audit_string(&huge);
+        // Truncation done by char count, so result is still valid UTF-8
+        // and all chars are 😀.
+        assert_eq!(out.chars().count(), MAX_AUDIT_STR_LEN);
+        for ch in out.chars() {
+            assert_eq!(ch, '😀');
+        }
+    }
+
+    #[test]
+    fn test_sanitize_audit_string_strips_ascii_delete() {
+        let out = sanitize_audit_string("a\x7fb");
+        assert_eq!(out, "ab");
+    }
+
+    #[test]
+    fn test_sanitize_audit_string_strips_c1_controls() {
+        // U+0080..U+009F C1 controls — invisible in many fonts but
+        // breakable in some terminals.
+        let mut input = String::from("hello");
+        input.push('\u{0080}');
+        input.push('\u{0085}'); // NEL — newline-equivalent in some renderers
+        input.push('\u{009F}');
+        input.push('w');
+        input.push('o');
+        input.push('r');
+        input.push('l');
+        input.push('d');
+        let out = sanitize_audit_string(&input);
+        assert_eq!(out, "helloworld");
+    }
+
+    #[test]
+    fn test_sanitize_audit_string_strips_bidi_override() {
+        // Wave-2-D adversarial review (MEDIUM) — U+202E RIGHT-TO-LEFT
+        // OVERRIDE is the classic "Trojan Source" attack vector.
+        let evil = "innocent\u{202e} -- malicious";
+        let out = sanitize_audit_string(evil);
+        assert!(!out.contains('\u{202e}'), "bidi override must be stripped");
+        // Surrounding text preserved.
+        assert!(out.contains("innocent"));
+        assert!(out.contains("malicious"));
+    }
+
+    #[test]
+    fn test_sanitize_audit_string_strips_zero_width_chars() {
+        // ZWSP (U+200B), ZWNJ (U+200C), ZWJ (U+200D), LRM (U+200E), RLM (U+200F)
+        let mut input = String::from("a");
+        input.push('\u{200b}');
+        input.push('\u{200c}');
+        input.push('\u{200d}');
+        input.push('\u{200e}');
+        input.push('\u{200f}');
+        input.push('b');
+        let out = sanitize_audit_string(&input);
+        assert_eq!(out, "ab");
+    }
+
+    #[test]
+    fn test_sanitize_audit_string_strips_bom() {
+        let input = "\u{feff}hello";
+        let out = sanitize_audit_string(input);
+        assert_eq!(out, "hello");
+    }
+
+    #[test]
+    fn test_sanitize_audit_string_blocks_sql_newline_injection() {
+        // Adversarial: attacker-controlled diagnostic with embedded SQL.
+        let evil = "innocent\n', 0); DROP TABLE order_audit; --";
+        let out = sanitize_audit_string(evil);
+        assert!(!out.contains('\n'), "newline must be stripped");
+        // Single quotes are doubled, breaking the injected literal.
+        assert!(out.contains("''"));
+        // The attempt to break out of the SQL string literal therefore
+        // yields a still-quoted (and quote-doubled) literal — safe.
+    }
+
+    #[test]
+    fn test_max_audit_str_len_is_1024() {
+        // Pin the constant so a future "let's bump to 64KB" PR is
+        // forced to update tests + dashboards together.
+        assert_eq!(MAX_AUDIT_STR_LEN, 1024);
     }
 }

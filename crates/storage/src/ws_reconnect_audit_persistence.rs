@@ -9,6 +9,7 @@ use reqwest::Client;
 use tracing::{error, info, warn};
 
 use tickvault_common::config::QuestDbConfig;
+use tickvault_common::sanitize::sanitize_audit_string;
 
 pub const QUESTDB_TABLE_WS_RECONNECT_AUDIT: &str = "ws_reconnect_audit";
 pub const DEDUP_KEY_WS_RECONNECT_AUDIT: &str = "connection_id, ts";
@@ -89,9 +90,19 @@ pub async fn append_ws_reconnect_audit_row(
     let client = Client::builder()
         .timeout(Duration::from_secs(QUESTDB_DDL_TIMEOUT_SECS))
         .build()?;
-    let feed_esc = feed.replace('\'', "''");
-    let outcome_esc = outcome.replace('\'', "''");
-    let reason_esc = reason.replace('\'', "''");
+    let feed_esc = sanitize_audit_string(feed);
+    let outcome_esc = sanitize_audit_string(outcome);
+    let reason_esc = sanitize_audit_string(reason);
+    // SECURITY (Wave-2-D adversarial review MEDIUM): disconnect_code
+    // is written verbatim as an i16. We DELIBERATELY do not reject
+    // codes outside the known Dhan enum (800..814) — SEBI audit
+    // completeness requires recording what actually happened on the
+    // wire, including unknown future codes. The column type is
+    // SHORT (signed i16), which bounds the wire format itself.
+    // The `reason` free-text column carries any human-readable
+    // context; that one IS sanitized via `sanitize_audit_string` to
+    // strip control chars and Unicode bidi-overrides per the same
+    // adversarial-review finding.
     let dc = disconnect_code
         .map(|v| v.to_string())
         .unwrap_or_else(|| "NULL".to_string());

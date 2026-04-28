@@ -10,6 +10,7 @@ use reqwest::Client;
 use tracing::{error, info, warn};
 
 use tickvault_common::config::QuestDbConfig;
+use tickvault_common::sanitize::sanitize_audit_string;
 
 pub const QUESTDB_TABLE_SELFTEST_AUDIT: &str = "selftest_audit";
 pub const DEDUP_KEY_SELFTEST_AUDIT: &str = "trading_date_ist, check_name";
@@ -81,9 +82,9 @@ pub async fn append_selftest_audit_row(
     let client = Client::builder()
         .timeout(Duration::from_secs(QUESTDB_DDL_TIMEOUT_SECS))
         .build()?;
-    let check_esc = check_name.replace('\'', "''");
-    let outcome_esc = outcome.replace('\'', "''");
-    let detail_esc = detail.replace('\'', "''");
+    let check_esc = sanitize_audit_string(check_name);
+    let outcome_esc = sanitize_audit_string(outcome);
+    let detail_esc = sanitize_audit_string(detail);
     let sql = format!(
         "INSERT INTO {QUESTDB_TABLE_SELFTEST_AUDIT} (ts, trading_date_ist, check_name, outcome, duration_ms, detail) VALUES \
          ({ts_nanos_ist}, {trading_date_ist_nanos}, '{check_esc}', '{outcome_esc}', {duration_ms}, '{detail_esc}');"

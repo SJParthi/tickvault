@@ -153,6 +153,56 @@ is intact; if not, fall through to CSV download (~60s adds 30s to RTO).
 | Recovery | Build fails fast, Telegram CRITICAL, operator manual intervention |
 | Warning threshold | `MAX_TOTAL_SUBSCRIPTIONS_TARGET = 24_500` — Telegram WARN before hitting hard cap |
 
+### 14. Overnight wake (Friday 15:30 → Monday 09:00, ~65.5 hours sleep) — NEW (Wave-2-D)
+
+The most common "long sleep" scenario. After 15:30 IST Friday close,
+the per-connection task transitions to dormant sleep (Wave-2-A
+WS-GAP-04). Pool supervisor (`respawn_dead_connections_loop`,
+WS-GAP-05) keeps the slot alive even if the inner task panics. Token
+manager runs in the background; the JWT may approach expiry over
+the weekend.
+
+| Step | Action |
+|---|---|
+| Sat 00:00 IST | `TickGapDetector::reset_daily()` (Wave-2-D Fix 2) does not fire today (last fire was Fri 15:35 IST). Map remains empty per Friday's reset. |
+| Sat–Sun (any time) | App is functionally idle. Pool watchdog continues 5s ticks but they all observe dormant connections. No Telegram pages — `WebSocketDisconnectedOffHours` (Severity::Low) coalesces. |
+| Sun 23:55 IST | Token manager's renewal scheduler may fire if 23h-window crosses now. Token cache + SSM are still reachable; renewal succeeds in the background. |
+| Mon 09:00 IST | Pool watchdog observes scheduled wake. Per-connection tasks resume. **AUTH-GAP-03** — `force_renewal_if_stale(threshold=14400)` runs: if token has < 4h validity, force-renew BEFORE the post-sleep reconnect. Increments `tv_token_force_renewal_total{trigger="ws_wake"}`. |
+| Mon 09:00–09:13 IST | Reconnect with `SubscribeRxGuard` (PR #337) preserves subscriptions. Pre-open buffer captures 09:00–09:12 closes. |
+| Mon 09:13 IST | Phase 2 dispatcher fires per `Phase2EmitGuard`. Mid-market boot path (Mode C) uses live cash-equity ticks; ~30s to full subscription. |
+| Mon 09:15:30 IST | `MarketOpenStreamingConfirmation` Telegram (Severity::Info) — single positive signal that everything is connected. |
+| Mon 15:35 IST | First post-weekend `reset_daily()` fires (Wave-2-D Fix 2). Bounded `tv_tick_gap_daily_resets_total` increment. |
+
+**Total RTO from sleep wake to fully subscribed:** ~30s. **Total dormant-task wall-clock cost:** ~65 hours, zero CPU, zero allocation.
+
+**Operator-visible Telegram during the 65h sleep:** none, by design. The `WebSocketDisconnectedOffHours` Severity::Low events do not page; they're informational only.
+
+**Audit trail:** `boot_audit` table captures the Mon 09:00 wake; `ws_reconnect_audit` captures the per-connection reconnect; `phase2_audit` captures the 09:13 dispatch outcome; `selftest_audit` captures `make doctor` post-boot. All retained 90d hot in QuestDB → S3 cold per Wave-2-D Fix 5 lifecycle.
+
+### 15. Holiday wake (Wed close → Tue 09:00 across Republic Day, ~92 hours sleep) — NEW (Wave-2-D)
+
+Worst case for sleep duration in a normal year: a 4-day weekend with a
+Republic Day-class holiday. Same machinery as Scenario 14 but with a
+longer dormant window and a higher chance the token has already expired
+(JWT 24h validity vs ~92h sleep).
+
+| Step | Action |
+|---|---|
+| Wed 15:30 IST | Connections enter dormant sleep. `TradingCalendar::secs_until_next_market_open()` computes the wake instant accounting for Thursday holiday + weekend. |
+| Thu (holiday) | Pool supervisor + watchdog continue ticking. Token manager fires at the 23h mark; renewal succeeds, cache + SSM repopulated. |
+| Fri–Sat–Sun | Same as Scenario 14's Sat–Sun. |
+| Mon (holiday) | Same as Sun in Scenario 14. (NSE may treat Monday as a holiday on a 4-day weekend.) |
+| Tue 09:00 IST | Per-connection tasks wake. `force_renewal_if_stale(14400)` triggers because the token issued at Wed-23h-mark + 1 renewal at Thu-23h-mark may already be > 4h old. Increments `tv_token_force_renewal_total{trigger="ws_wake"}`. |
+| Tue 09:13 IST | Phase 2 dispatcher fires. Mode C boot. |
+| Tue 09:15:30 IST | `MarketOpenStreamingConfirmation` fires. |
+| Tue 15:35 IST | First post-holiday `reset_daily()` fires. |
+
+**Total RTO:** ~30s (same as Scenario 14). **Total dormant wall-clock cost:** ~92 hours. **Token renewals during sleep:** up to 4 (one per 23h tick) — all silent, all cached.
+
+**Why the holiday case is NOT special-cased in code:** the same `TradingCalendar`-driven wake gate handles arbitrary holiday lengths. The dormant sleep duration is not bounded — `WS-GAP-04` recomputes the wake instant on each pool watchdog tick using the calendar, so a 92-hour or 192-hour gap is no different from a 16-hour overnight gap.
+
+**Telegram during the 92h sleep:** none. **First Telegram after wake:** `MarketOpenStreamingConfirmation` at Tue 09:15:30 IST.
+
 ## Idempotency Guarantees
 
 | Guarantee | Mechanism |
