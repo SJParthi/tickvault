@@ -224,6 +224,16 @@ pub enum ErrorCode {
     StorageGap04S3ArchiveFailed,
 
     // -----------------------------------------------------------------------
+    // Wave 3 — Telegram dispatcher (Item 11)
+    // -----------------------------------------------------------------------
+    /// TELEGRAM-01: a Telegram event was dropped (queue full, send-after-retry
+    /// failure, or coalescer overflow). Operator alerts MAY be missed.
+    Telegram01Dropped,
+    /// TELEGRAM-02: coalescer state inconsistency (drain failed mid-window;
+    /// next drain self-recovers). Informational.
+    Telegram02CoalescerStateInconsistency,
+
+    // -----------------------------------------------------------------------
     // Dhan Trading API (DH-9xx)
     // -----------------------------------------------------------------------
     /// DH-901: Invalid auth — rotate token, retry once.
@@ -351,6 +361,9 @@ impl ErrorCode {
             Self::Audit06OrderWriteFailed => "AUDIT-06",
             Self::StorageGap03AuditWriteFailed => "STORAGE-GAP-03",
             Self::StorageGap04S3ArchiveFailed => "STORAGE-GAP-04",
+            // Wave 3 — Telegram dispatcher (Item 11)
+            Self::Telegram01Dropped => "TELEGRAM-01",
+            Self::Telegram02CoalescerStateInconsistency => "TELEGRAM-02",
             // Dhan Trading API
             Self::Dh901InvalidAuth => "DH-901",
             Self::Dh902NoApiAccess => "DH-902",
@@ -454,7 +467,8 @@ impl ErrorCode {
             | Self::Audit05SelftestWriteFailed
             | Self::Audit06OrderWriteFailed
             | Self::StorageGap03AuditWriteFailed
-            | Self::StorageGap04S3ArchiveFailed => Severity::Medium,
+            | Self::StorageGap04S3ArchiveFailed
+            | Self::Telegram01Dropped => Severity::Medium,
             // Low: scheduler / field coverage / trading-day / Dhan other
             Self::InstrumentP1DailyScheduler
             | Self::InstrumentP1DeltaFieldCoverage
@@ -463,7 +477,8 @@ impl ErrorCode {
             | Self::HotPath02WriterQueueDrop
             | Self::WsGap04PostCloseSleep
             | Self::WsGap05PoolRespawn
-            | Self::AuthGap03TokenForceRenewedOnWake => Severity::Low,
+            | Self::AuthGap03TokenForceRenewedOnWake
+            | Self::Telegram02CoalescerStateInconsistency => Severity::Low,
         }
     }
 
@@ -531,6 +546,9 @@ impl ErrorCode {
             | Self::StorageGap03AuditWriteFailed
             | Self::StorageGap04S3ArchiveFailed => ".claude/rules/project/wave-2-error-codes.md",
             Self::Boot03ClockSkewExceeded => ".claude/rules/project/wave-2-c-error-codes.md",
+            Self::Telegram01Dropped | Self::Telegram02CoalescerStateInconsistency => {
+                ".claude/rules/project/wave-3-error-codes.md"
+            }
             Self::Dh901InvalidAuth
             | Self::Dh902NoApiAccess
             | Self::Dh903AccountIssue
@@ -653,6 +671,8 @@ impl ErrorCode {
             Self::Audit06OrderWriteFailed,
             Self::StorageGap03AuditWriteFailed,
             Self::StorageGap04S3ArchiveFailed,
+            Self::Telegram01Dropped,
+            Self::Telegram02CoalescerStateInconsistency,
         ]
     }
 }
@@ -807,7 +827,9 @@ mod tests {
         // (clock-skew exceeded — HALTING).
         // 2026-04-28 (Wave 3-A Item 10): bumped 77 -> 78 for MOVERS-03
         // (pre-open movers persistence failed).
-        assert_eq!(ErrorCode::all().len(), 78);
+        // 2026-04-28 (Wave 3-B Item 11): bumped 78 -> 80 for TELEGRAM-01/02
+        // (Telegram bucket-coalescer hardening).
+        assert_eq!(ErrorCode::all().len(), 80);
     }
 
     #[test]
@@ -830,7 +852,9 @@ mod tests {
                 || s.starts_with("MOVERS-")
                 // Wave 2: boot / audit prefixes
                 || s.starts_with("BOOT-")
-                || s.starts_with("AUDIT-");
+                || s.starts_with("AUDIT-")
+                // Wave 3-B: Telegram dispatcher
+                || s.starts_with("TELEGRAM-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }

@@ -1044,3 +1044,27 @@ rules:
       S3 archive failure. Idempotency-key prevents re-archive;
       next cycle will retry. Escalate so operator can verify
       AWS credentials + bucket reachability.
+
+  - name: telegram-01-dropped-escalate
+    match:
+      code: TELEGRAM-01
+    action: escalate
+    runbook_path: .claude/rules/project/wave-3-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 1800
+    justification: >-
+      Telegram dispatcher dropped an event. Operator alerts MAY be
+      missed. 30-minute cooldown — repeated drops within that
+      window indicate a sustained Telegram outage and the operator
+      already knows.
+
+  - name: telegram-02-coalescer-state-silence
+    match:
+      code: TELEGRAM-02
+    action: silence
+    runbook_path: .claude/rules/project/wave-3-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      Coalescer state inconsistency self-recovers on next drain.
+      Informational — operator action only required if recurring.

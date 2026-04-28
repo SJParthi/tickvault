@@ -924,6 +924,16 @@ async fn main() -> Result<()> {
                 return Err(anyhow::anyhow!(reason));
             }
         };
+        // Wave 3-B Item 11: opt-in Telegram bucket-coalescer based on the
+        // `features.telegram_bucket_coalescer` flag. Defaults to `true`.
+        let fast_notifier = if config.features.telegram_bucket_coalescer {
+            NotificationService::enable_coalescer(
+                fast_notifier,
+                tickvault_core::notification::CoalescerConfig::default(),
+            )
+        } else {
+            fast_notifier
+        };
         match ip_result {
             Ok(result) => {
                 if fast_trading_mode.is_live() {
@@ -1676,6 +1686,16 @@ async fn main() -> Result<()> {
             );
             return Err(anyhow::anyhow!(reason));
         }
+    };
+    // Wave 3-B Item 11: opt-in Telegram bucket-coalescer based on the
+    // `features.telegram_bucket_coalescer` flag. Defaults to `true`.
+    let notifier = if config.features.telegram_bucket_coalescer {
+        NotificationService::enable_coalescer(
+            notifier,
+            tickvault_core::notification::CoalescerConfig::default(),
+        )
+    } else {
+        notifier
     };
 
     // -----------------------------------------------------------------------
