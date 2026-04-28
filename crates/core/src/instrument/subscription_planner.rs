@@ -90,17 +90,18 @@ pub struct SubscriptionPlanSummary {
 /// Trading-day threshold at or below which a stock F&O nearest expiry is
 /// rolled to the next one.
 ///
-/// **STRICT RULE (Parthiban 2026-04-25 confirmation):** roll when STRICTLY
-/// LESS THAN 2 trading days remain until expiry. For integer day counts,
-/// `trading_days_left < 2` is equivalent to `trading_days_left <= 1`, hence
-/// the constant value of 1.
+/// **STRICT RULE (Parthiban 2026-04-28 update — T-only):** roll ONLY when
+/// today IS the expiry day itself (0 trading days remaining). T-1 and
+/// earlier KEEP the nearest expiry. The previous T-1 rollover (constant
+/// = 1) was over-cautious; Dhan only blocks trading on the expiry day
+/// itself, not the day before.
 ///
 /// **Concrete decision table** (e.g., Thursday April 30 = expiry):
 ///
 /// | Today | Trading days remaining | Roll? |
 /// |---|---:|---|
-/// | Thursday Apr 30 (expiry day, T) | 0 | YES — Dhan disallows expiry-day trading on stock options |
-/// | Wednesday Apr 29 (T-1) | 1 | YES — 1-day safety margin |
+/// | Thursday Apr 30 (expiry day, T) | 0 | YES — Dhan disallows expiry-day trading on stock F&O |
+/// | Wednesday Apr 29 (T-1) | 1 | NO — keep nearest (was YES pre-2026-04-28) |
 /// | Tuesday Apr 28 (T-2) | 2 | NO — keep current expiry |
 /// | Monday Apr 27 (T-3) | 3 | NO — keep current expiry |
 ///
@@ -112,7 +113,7 @@ pub struct SubscriptionPlanSummary {
 ///
 /// Pinned by ratchet test `test_index_expiry_never_rolls_via_planner` —
 /// rollover MUST NOT leak into the index path.
-pub const STOCK_EXPIRY_ROLLOVER_TRADING_DAYS: u32 = 1;
+pub const STOCK_EXPIRY_ROLLOVER_TRADING_DAYS: u32 = 0;
 
 /// Select the nearest expiry for a stock F&O subscription, applying the
 /// stock-only rollover rule. Returns `None` if no suitable expiry exists.
@@ -123,21 +124,21 @@ pub const STOCK_EXPIRY_ROLLOVER_TRADING_DAYS: u32 = 1;
 /// weekly index expiries are routine. FINNIFTY + MIDCPNIFTY are not in
 /// the F&O universe anymore (dropped 2026-04-25).
 ///
-/// **Rule:** roll when STRICTLY LESS THAN 2 trading days remain until
-/// expiry — see `STOCK_EXPIRY_ROLLOVER_TRADING_DAYS` docstring for the
-/// full decision table. Mathematically `trading_days_left < 2` is the
-/// same as `trading_days_left <= 1` for integer day counts; the code
-/// uses `<= 1` because that's what Rust comparison naturally expresses.
+/// **Rule (T-only since 2026-04-28):** roll ONLY when today IS the expiry
+/// day itself (0 trading days remaining). See
+/// `STOCK_EXPIRY_ROLLOVER_TRADING_DAYS` docstring for the full decision
+/// table. Was previously T-1-or-T; Parthiban 2026-04-28 narrowed to T-only
+/// because Dhan only blocks trading on the expiry day itself.
 ///
 /// Behaviour:
 /// - When `calendar` is `None`: returns the first expiry `>= today` (the
 ///   pre-rollover behaviour). Tests and legacy callers rely on this.
-/// - When `calendar` is `Some`: if `< 2` trading days to expiry (today is
-///   T or T-1), returns the NEXT expiry; otherwise returns the nearest.
+/// - When `calendar` is `Some`: if today IS the expiry day (0 trading days
+///   remaining), returns the NEXT expiry; otherwise returns the nearest.
 ///
 /// `expiry_dates` MUST be sorted ascending (canonical invariant from the
 /// universe builder).
-// TEST-EXEMPT: covered by test_stock_expiry_rolls_on_t, test_stock_expiry_rolls_on_t_minus_1, test_stock_expiry_stays_on_t_minus_2, test_stock_expiry_none_calendar_uses_legacy_nearest, test_stock_expiry_no_next_keeps_nearest_on_t_minus_1, test_stock_expiry_none_when_all_expiries_past, test_index_expiry_never_rolls_via_planner — substring grep misses the full fn name.
+// TEST-EXEMPT: covered by test_stock_expiry_rolls_only_on_t_zero, test_stock_expiry_keeps_nearest_on_t_minus_1, test_stock_expiry_stays_on_t_minus_2, test_stock_expiry_none_calendar_uses_legacy_nearest, test_stock_expiry_no_next_keeps_nearest_on_t_zero, test_stock_expiry_none_when_all_expiries_past, test_index_expiry_never_rolls_via_planner — substring grep misses the full fn name.
 pub fn select_stock_expiry_with_rollover(
     expiry_dates: &[NaiveDate],
     today: NaiveDate,
@@ -151,10 +152,12 @@ pub fn select_stock_expiry_with_rollover(
         return Some(nearest);
     };
 
-    // STRICT rule: roll when < 2 trading days remain (today is T or T-1).
-    // `<= 1` is mathematically equivalent to `< 2` for integer day counts.
-    // This is the documented stock-only safety margin: avoid expiry day
-    // (Dhan disallows stock-option expiry-day trading) AND avoid T-1 too.
+    // T-ONLY rule (2026-04-28): roll ONLY when today IS the expiry day
+    // (0 trading days remaining). Was T-or-T-1 (`<= 1`) pre-2026-04-28;
+    // narrowed because Dhan only blocks trading on expiry day itself, not
+    // T-1. The `<= STOCK_EXPIRY_ROLLOVER_TRADING_DAYS` form is preserved
+    // for u32 type-correctness; the constant is now 0 so this compares
+    // `== 0` in practice.
     let trading_days_left = cal.count_trading_days(today, nearest);
     if trading_days_left <= STOCK_EXPIRY_ROLLOVER_TRADING_DAYS {
         // Roll to the NEXT expiry, if one exists.
@@ -200,9 +203,11 @@ pub fn select_stock_expiry_with_rollover(
 ///   ATM ± N strikes (CE + PE) + current-month future.
 ///   ATM is approximated using the middle strike of the current expiry chain
 ///   (since no live prices are available at startup).
-///   **Fix #6 (2026-04-24):** when `trading_calendar` is `Some`, the
-///   current expiry rolls to the NEXT one if ≤ 1 trading day remains
-///   (today is T or T-1). Stock F&O is illiquid on those days.
+///   **Fix #6 (2026-04-24, narrowed 2026-04-28 to T-only):** when
+///   `trading_calendar` is `Some`, the current expiry rolls to the NEXT
+///   one ONLY if today IS the expiry day (0 trading days remaining).
+///   Dhan disallows stock F&O trading on expiry day itself; T-1 and
+///   earlier are tradeable so we keep the nearest expiry.
 ///
 /// # Feed Mode
 /// All instruments use the same feed mode from config (Ticker by default).
@@ -214,10 +219,11 @@ pub fn select_stock_expiry_with_rollover(
 /// When the map is empty, falls back to median strike (boot-time behavior
 /// before pre-market prices are available).
 ///
-/// # Trading Calendar (Fix #6)
+/// # Trading Calendar (Fix #6 — T-only since 2026-04-28)
 /// When `trading_calendar` is `Some`, stock F&O expiries roll forward
-/// when the nearest expiry is ≤ 1 trading day away. When `None`, nearest
-/// expiry is always used (legacy behaviour — pre-2026-04-24).
+/// ONLY when today IS the expiry day (0 trading days remaining). When
+/// `None`, nearest expiry is always used (legacy behaviour —
+/// pre-2026-04-24).
 pub fn build_subscription_plan(
     universe: &FnoUniverse,
     config: &SubscriptionConfig,
@@ -3550,9 +3556,12 @@ mod tests {
     }
 
     #[test]
-    fn test_stock_expiry_rolls_on_t_minus_1() {
+    fn test_stock_expiry_keeps_nearest_on_t_minus_1() {
+        // T-only rule (2026-04-28): T-1 KEEPS the nearest expiry.
+        // Was previously "rolls" under the T-or-T-1 rule; narrowed because
+        // Dhan only blocks trading on expiry day itself, not T-1.
         // Today = Wed 2026-04-29. Nearest expiry = Thu 2026-04-30.
-        // count_trading_days(Wed, Thu) = 1 → strict rule (<= 1) rolls.
+        // count_trading_days(Wed, Thu) = 1 → T-only rule (<= 0) does NOT roll.
         let cal = make_test_calendar_no_holidays();
         let today = NaiveDate::from_ymd_opt(2026, 4, 29).unwrap();
         let nearest = NaiveDate::from_ymd_opt(2026, 4, 30).unwrap();
@@ -3560,15 +3569,18 @@ mod tests {
         let picked = select_stock_expiry_with_rollover(&[nearest, next], today, Some(&cal));
         assert_eq!(
             picked,
-            Some(next),
-            "Fix #6 strict: Wed (T-1) with Thu expiry MUST roll to next"
+            Some(nearest),
+            "T-only rule (2026-04-28): Wed (T-1) with Thu expiry KEEPS nearest \
+             (was: rolls under old T-or-T-1 rule)"
         );
     }
 
     #[test]
-    fn test_stock_expiry_rolls_on_t() {
+    fn test_stock_expiry_rolls_only_on_t_zero() {
+        // T-only rule (2026-04-28): T-0 (expiry day itself) rolls.
+        // This is the ONLY case that triggers rollover under the new rule.
         // Today = Thu 2026-04-30 (expiry day). Nearest = today.
-        // count_trading_days(Thu, Thu) = 0 → strict rule rolls.
+        // count_trading_days(Thu, Thu) = 0 → T-only rule rolls.
         let cal = make_test_calendar_no_holidays();
         let today = NaiveDate::from_ymd_opt(2026, 4, 30).unwrap();
         let nearest = today;
@@ -3577,7 +3589,8 @@ mod tests {
         assert_eq!(
             picked,
             Some(next),
-            "Fix #6 strict: Thu (expiry day) MUST roll to next expiry"
+            "T-only rule (2026-04-28): Thu (expiry day) MUST roll to next expiry — \
+             Dhan disallows stock F&O trading on expiry day itself"
         );
     }
 
@@ -3608,12 +3621,15 @@ mod tests {
     }
 
     #[test]
-    fn test_stock_expiry_no_next_keeps_nearest_on_t_minus_1() {
-        // Only one expiry in the calendar; cannot roll forward. Keep nearest
-        // and let the caller decide whether to skip. Also emits a WARN log
-        // (not asserted here — tracing-capture would be heavy).
+    fn test_stock_expiry_no_next_keeps_nearest_on_t_zero() {
+        // T-only rule: only T-0 triggers rollover. With single expiry on
+        // T-0, cannot roll forward. Keep nearest (= today = expiry day)
+        // and let caller decide to skip. Also emits a WARN log (not
+        // asserted — tracing-capture is heavy).
+        // (Previously this test used T-1 because old rule triggered there;
+        // updated to T-0 to cover the equivalent code path under T-only.)
         let cal = make_test_calendar_no_holidays();
-        let today = NaiveDate::from_ymd_opt(2026, 4, 29).unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 4, 30).unwrap();
         let only = NaiveDate::from_ymd_opt(2026, 4, 30).unwrap();
         let picked = select_stock_expiry_with_rollover(&[only], today, Some(&cal));
         assert_eq!(
@@ -3884,31 +3900,31 @@ mod tests {
         );
     }
 
-    /// 2026-04-25 ratchet: rollover rule constant value is exactly 1
-    /// (mathematically equivalent to "< 2 trading days"). Regressing this
-    /// to 0 would let stock options trade on expiry day (Dhan disallows);
-    /// regressing to 2 would prematurely roll on T-2 (loses 1 trading day
-    /// of liquidity). Lock at 1.
+    /// 2026-04-28 ratchet (NEW #45): rollover constant is exactly 0 (T-only).
+    /// Was 1 (T-or-T-1) until 2026-04-28. Regressing to 1 would prematurely
+    /// drop T-1 contracts that ARE tradeable on Dhan; regressing to 2 would
+    /// lose another trading day of liquidity. Lock at 0.
     #[test]
-    fn test_stock_expiry_rollover_constant_is_one() {
+    fn test_stock_expiry_rollover_constant_is_zero() {
         assert_eq!(
-            STOCK_EXPIRY_ROLLOVER_TRADING_DAYS, 1,
-            "rollover threshold must stay at 1 (= '< 2 trading days')"
+            STOCK_EXPIRY_ROLLOVER_TRADING_DAYS, 0,
+            "rollover threshold must stay at 0 (T-only — Dhan only blocks expiry-day trading)"
         );
     }
 
-    /// 2026-04-25 ratchet: cross-instrument rollover scope check —
-    /// confirms the rollover applies to BOTH OPTSTK (stock options) AND
-    /// FUTSTK (stock futures). Both are F&O on the same stock underlying
-    /// and share the same expiry calendar; if one rolls, the other must
-    /// too. Set up RELIANCE on T-1, assert that BOTH the future and the
-    /// options rolled to the next expiry.
+    /// 2026-04-28 ratchet (UPDATED for T-only): cross-instrument rollover
+    /// scope check — confirms the rollover applies to BOTH OPTSTK (stock
+    /// options) AND FUTSTK (stock futures). Both are F&O on the same stock
+    /// underlying and share the same expiry calendar; if one rolls, the
+    /// other must too. Set up RELIANCE on T-0 (expiry day, the ONLY case
+    /// that triggers rollover under T-only rule), assert that BOTH the
+    /// future and the options rolled to the next expiry.
     #[test]
     fn test_stock_rollover_applies_to_both_optstk_and_futstk() {
-        // Build a 2-expiry RELIANCE universe: nearest is T-1, next is +30d.
+        // Build a 2-expiry RELIANCE universe: nearest is T-0, next is +28d.
         let nearest = NaiveDate::from_ymd_opt(2026, 4, 30).unwrap();
         let next = NaiveDate::from_ymd_opt(2026, 5, 28).unwrap();
-        let today = NaiveDate::from_ymd_opt(2026, 4, 29).unwrap(); // T-1
+        let today = NaiveDate::from_ymd_opt(2026, 4, 30).unwrap(); // T-0 (expiry day)
 
         let mut underlyings = HashMap::new();
         underlyings.insert(
@@ -4059,11 +4075,11 @@ mod tests {
         // BOTH NEAREST FUT and NEAREST CE must be DROPPED (rolled away).
         assert!(
             !subscribed_ids.contains(&80001),
-            "Stock FUTSTK at T-1 nearest expiry must be rolled — found in subscription"
+            "Stock FUTSTK at T-0 (expiry day) nearest expiry must be rolled — found in subscription"
         );
         assert!(
             !subscribed_ids.contains(&80002),
-            "Stock OPTSTK at T-1 nearest expiry must be rolled — found in subscription"
+            "Stock OPTSTK at T-0 (expiry day) nearest expiry must be rolled — found in subscription"
         );
         // BOTH NEXT FUT and NEXT CE must be SUBSCRIBED (rolled to).
         assert!(
