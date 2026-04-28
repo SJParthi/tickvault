@@ -1,5 +1,5 @@
 {
-  "_comment": "Wave 2 Item 9.4 — S3 lifecycle policy for the 6 audit tables. Apply via: aws s3api put-bucket-lifecycle-configuration --bucket tickvault-audit --lifecycle-configuration file://deploy/aws/s3-lifecycle-audit-tables.json. Cost target: under 333 INR per month for up to 500 GB across all 6 tables (per .claude/rules/project/aws-budget.md). Retention: 90d hot in QuestDB, 90 to 365 days S3 Intelligent-Tiering, 365 days plus Glacier Deep Archive. order_audit honors SEBI 5y minimum (1825 days).",
+  "_comment": "Wave 2 Item 9.4 — S3 lifecycle policy for the 6 audit tables. Apply via: aws s3api put-bucket-lifecycle-configuration --bucket tickvault-audit --lifecycle-configuration file://deploy/aws/s3-lifecycle-audit-tables.json. Cost target: under 333 INR per month for up to 500 GB across all 6 tables (per .claude/rules/project/aws-budget.md). Tier transitions: Day 0 INTELLIGENT_TIERING, Day 90 GLACIER_IR (Glacier Instant Retrieval — minimum 90d storage), Day 365 DEEP_ARCHIVE (Glacier Deep Archive — minimum 180d storage). 5 of 6 tables expire at 1825 days (5 years). order_audit has NO expiration: SEBI 5y minimum is a floor not a ceiling, and aws-budget.md states 'all orders forever'. Wave-2-D Fix 5 closes the security audit finding that `Expiration: 1825d` would silently delete order audit data exactly at the SEBI floor leaving zero margin for late SEBI inspection requests.",
   "Rules": [
     {
       "ID": "phase2-audit-lifecycle",
@@ -57,16 +57,15 @@
       "Expiration": { "Days": 1825 }
     },
     {
-      "ID": "order-audit-sebi-5y",
+      "ID": "order-audit-forever",
       "Status": "Enabled",
       "Filter": { "Prefix": "order_audit/" },
-      "_comment_order_audit": "SEBI mandate: 5-year retention is the floor, not a ceiling. Object Lock with COMPLIANCE mode is applied separately via aws s3api put-object-lock-configuration to make these objects immune to early deletion.",
+      "_comment_order_audit": "SEBI mandate: 5-year retention is the FLOOR, not a ceiling. aws-budget.md (.claude/rules/project/) states 'all orders forever'. Wave-2-D Fix 5: NO Expiration rule on this prefix — order audit objects are kept indefinitely. Object Lock with COMPLIANCE mode is applied separately via aws s3api put-object-lock-configuration to make these objects immune to early deletion. If storage cost ever needs review, reach for Glacier Deep Archive lifetime retention (~₹0.17/GB-mo at 2026 prices) — never reach for an Expiration rule.",
       "Transitions": [
         { "Days": 0,   "StorageClass": "INTELLIGENT_TIERING" },
         { "Days": 90,  "StorageClass": "GLACIER_IR" },
         { "Days": 365, "StorageClass": "DEEP_ARCHIVE" }
-      ],
-      "Expiration": { "Days": 1825 }
+      ]
     }
   ]
 }
