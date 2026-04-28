@@ -9,6 +9,7 @@ use reqwest::Client;
 use tracing::{error, info, warn};
 
 use tickvault_common::config::QuestDbConfig;
+use tickvault_common::sanitize::sanitize_audit_string;
 
 pub const QUESTDB_TABLE_WS_RECONNECT_AUDIT: &str = "ws_reconnect_audit";
 pub const DEDUP_KEY_WS_RECONNECT_AUDIT: &str = "connection_id, ts";
@@ -89,9 +90,9 @@ pub async fn append_ws_reconnect_audit_row(
     let client = Client::builder()
         .timeout(Duration::from_secs(QUESTDB_DDL_TIMEOUT_SECS))
         .build()?;
-    let feed_esc = feed.replace('\'', "''");
-    let outcome_esc = outcome.replace('\'', "''");
-    let reason_esc = reason.replace('\'', "''");
+    let feed_esc = sanitize_audit_string(feed);
+    let outcome_esc = sanitize_audit_string(outcome);
+    let reason_esc = sanitize_audit_string(reason);
     let dc = disconnect_code
         .map(|v| v.to_string())
         .unwrap_or_else(|| "NULL".to_string());
