@@ -30,7 +30,7 @@ fn mask_ip_for_notification(ip: &str) -> String {
 /// `Medium`, `Low`, `Info` → Telegram only.
 ///
 /// Ordered for comparison: `Info < Low < Medium < High < Critical`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Severity {
     /// Lifecycle events — startup complete, shutdown complete.
     Info,
@@ -53,6 +53,19 @@ impl Severity {
     /// Mapping: emoji icon + square-bracket tag + exact severity name.
     /// Operator workflow: any `[HIGH]` or `[CRITICAL]` message goes to
     /// Claude Code for debugging; `[INFO]`/`[LOW]`/`[MEDIUM]` is scroll-by.
+    /// Lowercase Prometheus label for this severity. Used by the
+    /// `tv_telegram_dispatched_total` and `tv_telegram_dropped_total`
+    /// counters (Wave 3-B Item 11).
+    pub const fn as_label(&self) -> &'static str {
+        match self {
+            Self::Info => "info",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Critical => "critical",
+        }
+    }
+
     pub fn tag(&self) -> &'static str {
         match self {
             Self::Info => "\u{2139}\u{fe0f} [INFO]",  // ℹ️
@@ -1642,6 +1655,95 @@ impl NotificationEvent {
         }
     }
 
+    /// Returns a stable `&'static str` topic name used by the Telegram
+    /// bucket-coalescer (Wave 3-B Item 11) to group bursts of identical
+    /// events into a single summary message.
+    ///
+    /// The string returned is the variant's PascalCase name. This is
+    /// `&'static str` so the bucket key is allocation-free.
+    ///
+    /// Tested by `test_topic_returns_static_str_for_each_variant_kind`.
+    #[must_use]
+    pub const fn topic(&self) -> &'static str {
+        match self {
+            Self::StartupComplete { .. } => "StartupComplete",
+            Self::AuthenticationSuccess => "AuthenticationSuccess",
+            Self::AuthenticationFailed { .. } => "AuthenticationFailed",
+            Self::AuthenticationTransientFailure { .. } => "AuthenticationTransientFailure",
+            Self::PreMarketProfileCheckFailed { .. } => "PreMarketProfileCheckFailed",
+            Self::MidSessionProfileInvalidated { .. } => "MidSessionProfileInvalidated",
+            Self::TokenRenewed => "TokenRenewed",
+            Self::TokenRenewalFailed { .. } => "TokenRenewalFailed",
+            Self::WebSocketConnected { .. } => "WebSocketConnected",
+            Self::WebSocketPoolOnline { .. } => "WebSocketPoolOnline",
+            Self::WebSocketPoolDegraded { .. } => "WebSocketPoolDegraded",
+            Self::WebSocketPoolRecovered { .. } => "WebSocketPoolRecovered",
+            Self::WebSocketPoolHalt { .. } => "WebSocketPoolHalt",
+            Self::DepthIndexLtpTimeout { .. } => "DepthIndexLtpTimeout",
+            Self::MarketOpenStreamingConfirmation { .. } => "MarketOpenStreamingConfirmation",
+            Self::MarketOpenStreamingFailed { .. } => "MarketOpenStreamingFailed",
+            Self::MarketOpenDepthAnchor { .. } => "MarketOpenDepthAnchor",
+            Self::DepthUnderlyingMissing { .. } => "DepthUnderlyingMissing",
+            Self::DepthSpotPriceStale { .. } => "DepthSpotPriceStale",
+            Self::Phase2Started { .. } => "Phase2Started",
+            Self::Phase2RunImmediate { .. } => "Phase2RunImmediate",
+            Self::Phase2Complete { .. } => "Phase2Complete",
+            Self::Phase2Failed { .. } => "Phase2Failed",
+            Self::Phase2Skipped { .. } => "Phase2Skipped",
+            Self::MidMarketBootComplete { .. } => "MidMarketBootComplete",
+            Self::WebSocketDisconnected { .. } => "WebSocketDisconnected",
+            Self::WebSocketDisconnectedOffHours { .. } => "WebSocketDisconnectedOffHours",
+            Self::WebSocketReconnected { .. } => "WebSocketReconnected",
+            Self::WebSocketSleepEntered { .. } => "WebSocketSleepEntered",
+            Self::WebSocketSleepResumed { .. } => "WebSocketSleepResumed",
+            Self::WebSocketTokenForceRenewedOnWake { .. } => "WebSocketTokenForceRenewedOnWake",
+            Self::DepthTwentyConnected { .. } => "DepthTwentyConnected",
+            Self::DepthTwentyDisconnected { .. } => "DepthTwentyDisconnected",
+            Self::DepthTwentyDisconnectedOffHours { .. } => "DepthTwentyDisconnectedOffHours",
+            Self::DepthTwentyReconnected { .. } => "DepthTwentyReconnected",
+            Self::DepthTwoHundredConnected { .. } => "DepthTwoHundredConnected",
+            Self::DepthTwoHundredDisconnected { .. } => "DepthTwoHundredDisconnected",
+            Self::DepthTwoHundredDisconnectedOffHours { .. } => {
+                "DepthTwoHundredDisconnectedOffHours"
+            }
+            Self::DepthTwoHundredReconnected { .. } => "DepthTwoHundredReconnected",
+            Self::DepthRebalanced { .. } => "DepthRebalanced",
+            Self::DepthRebalanceFailed { .. } => "DepthRebalanceFailed",
+            Self::OrderUpdateConnected => "OrderUpdateConnected",
+            Self::OrderUpdateAuthenticated => "OrderUpdateAuthenticated",
+            Self::OrderUpdateDisconnected { .. } => "OrderUpdateDisconnected",
+            Self::OrderUpdateReconnected { .. } => "OrderUpdateReconnected",
+            Self::NoLiveTicksDuringMarketHours { .. } => "NoLiveTicksDuringMarketHours",
+            Self::ShutdownInitiated => "ShutdownInitiated",
+            Self::ShutdownComplete => "ShutdownComplete",
+            Self::InstrumentBuildSuccess { .. } => "InstrumentBuildSuccess",
+            Self::InstrumentBuildFailed { .. } => "InstrumentBuildFailed",
+            Self::HistoricalFetchComplete { .. } => "HistoricalFetchComplete",
+            Self::HistoricalFetchAlreadyAvailable { .. } => "HistoricalFetchAlreadyAvailable",
+            Self::HistoricalFetchFailed { .. } => "HistoricalFetchFailed",
+            Self::CandleVerificationPassed { .. } => "CandleVerificationPassed",
+            Self::CandleVerificationFailed { .. } => "CandleVerificationFailed",
+            Self::CandleCrossMatchPassed { .. } => "CandleCrossMatchPassed",
+            Self::CandleCrossMatchFailed { .. } => "CandleCrossMatchFailed",
+            Self::CandleCrossMatchSkipped { .. } => "CandleCrossMatchSkipped",
+            Self::IpVerificationFailed { .. } => "IpVerificationFailed",
+            Self::IpVerificationSuccess { .. } => "IpVerificationSuccess",
+            Self::BootHealthCheck { .. } => "BootHealthCheck",
+            Self::BootDeadlineMissed { .. } => "BootDeadlineMissed",
+            Self::BootClockSkewExceeded { .. } => "BootClockSkewExceeded",
+            Self::OrderRejected { .. } => "OrderRejected",
+            Self::CircuitBreakerOpened { .. } => "CircuitBreakerOpened",
+            Self::CircuitBreakerClosed => "CircuitBreakerClosed",
+            Self::RateLimitExhausted { .. } => "RateLimitExhausted",
+            Self::RiskHalt { .. } => "RiskHalt",
+            Self::WebSocketReconnectionExhausted { .. } => "WebSocketReconnectionExhausted",
+            Self::TokenRenewalDeadlineMissed { .. } => "TokenRenewalDeadlineMissed",
+            Self::QuestDbDisconnected { .. } => "QuestDbDisconnected",
+            Self::QuestDbReconnected { .. } => "QuestDbReconnected",
+            Self::Custom { .. } => "Custom",
+        }
+    }
+
     /// Returns the severity level for this event.
     ///
     /// Severity drives channel selection in `NotificationService::notify`:
@@ -1758,6 +1860,74 @@ fn append_detail_lines(msg: &mut String, details: &[String], total_count: usize)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_severity_as_label_returns_lowercase_string() {
+        assert_eq!(Severity::Info.as_label(), "info");
+        assert_eq!(Severity::Low.as_label(), "low");
+        assert_eq!(Severity::Medium.as_label(), "medium");
+        assert_eq!(Severity::High.as_label(), "high");
+        assert_eq!(Severity::Critical.as_label(), "critical");
+    }
+
+    #[test]
+    fn test_topic_returns_static_str_for_each_variant_kind() {
+        // Spot-check across all severities + several event kinds. The
+        // returned string is a `&'static str` literal — Rust will not
+        // compile if any arm allocates. We additionally assert two
+        // variants return distinct topics so a lazy implementation
+        // (e.g. always returning "Event") cannot pass.
+        let cases: Vec<(NotificationEvent, &'static str)> = vec![
+            (
+                NotificationEvent::StartupComplete { mode: "LIVE" },
+                "StartupComplete",
+            ),
+            (
+                NotificationEvent::AuthenticationSuccess,
+                "AuthenticationSuccess",
+            ),
+            (NotificationEvent::TokenRenewed, "TokenRenewed"),
+            (
+                NotificationEvent::WebSocketDisconnectedOffHours {
+                    connection_index: 0,
+                    reason: "x".into(),
+                },
+                "WebSocketDisconnectedOffHours",
+            ),
+            (
+                NotificationEvent::DepthRebalanced {
+                    underlying: "NIFTY".into(),
+                    previous_spot: 25_000.0,
+                    current_spot: 25_050.0,
+                    old_ce: "old_ce".into(),
+                    old_pe: "old_pe".into(),
+                    new_ce: "new_ce".into(),
+                    new_pe: "new_pe".into(),
+                    levels: DepthRebalanceLevels::TwentyOnly,
+                },
+                "DepthRebalanced",
+            ),
+            (
+                NotificationEvent::RiskHalt {
+                    reason: "limit breach".into(),
+                },
+                "RiskHalt",
+            ),
+            (NotificationEvent::ShutdownComplete, "ShutdownComplete"),
+        ];
+        let mut seen: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
+        for (event, expected) in cases {
+            let actual = event.topic();
+            assert_eq!(actual, expected, "topic() mismatch for variant");
+            seen.insert(actual);
+        }
+        // At least 6 distinct topics observed.
+        assert!(
+            seen.len() >= 6,
+            "expected ≥6 distinct topics, got {}",
+            seen.len()
+        );
+    }
 
     #[test]
     fn test_startup_complete_live_message() {

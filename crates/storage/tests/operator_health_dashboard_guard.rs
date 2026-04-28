@@ -37,6 +37,12 @@ const REQUIRED_PANELS: &[(&str, &str)] = &[
         "Instrument registry entries",
         "tv_instrument_registry_total_entries",
     ),
+    // Wave 3-B Item 11 — Telegram bucket-coalescer dispatch panel.
+    // Wrapped in increase() per Rule 12 to avoid post-restart "0 means OK" bug.
+    (
+        "Telegram dispatch rate (5m)",
+        "tv_telegram_dispatched_total",
+    ),
 ];
 
 fn workspace_root() -> PathBuf {
