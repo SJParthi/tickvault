@@ -332,12 +332,39 @@ async fn main() -> Result<()> {
                 } else {
                     tokio::time::sleep(sleep_dur).await;
                 }
-                detector_for_reset.reset_daily();
-                metrics::counter!("tv_tick_gap_daily_resets_total").increment(1);
-                tracing::info!(
-                    map_size_after = detector_for_reset.len(),
-                    "WS-GAP-06 tick-gap detector daily reset fired @ 15:35 IST"
-                );
+                // Wave-2-D adversarial review (MEDIUM) — idempotent
+                // per-day reset. NTP backward step or a Duration::ZERO
+                // recompute can otherwise race this loop into a
+                // double-fire. Compute current trading-date IST in
+                // epoch days; the detector's CAS guarantees a single
+                // real clear per day.
+                let now_secs = chrono::Utc::now().timestamp();
+                let now_ist_secs = now_secs.saturating_add(i64::from(
+                    tickvault_common::constants::IST_UTC_OFFSET_SECONDS,
+                ));
+                let trading_date_ist_days = now_ist_secs
+                    .div_euclid(i64::from(tickvault_common::constants::SECONDS_PER_DAY));
+                let actually_fired =
+                    detector_for_reset.reset_daily_idempotent(trading_date_ist_days);
+                if actually_fired {
+                    metrics::counter!("tv_tick_gap_daily_resets_total").increment(1);
+                    metrics::gauge!("tv_tick_gap_last_reset_date_ist_days")
+                        .set(trading_date_ist_days as f64);
+                    tracing::info!(
+                        map_size_after = detector_for_reset.len(),
+                        trading_date_ist_days,
+                        "WS-GAP-06 tick-gap detector daily reset fired @ 15:35 IST"
+                    );
+                } else {
+                    // Idempotent skip — another loop iteration in the
+                    // same trading day already cleared the map. Log
+                    // at debug; do NOT increment the counter or fire
+                    // a Telegram event.
+                    tracing::debug!(
+                        trading_date_ist_days,
+                        "WS-GAP-06 daily reset skipped — already fired today"
+                    );
+                }
                 // After reset, ensure we sleep past the 15:35 boundary
                 // so we don't race the same minute back into a
                 // near-zero sleep on the next loop iteration.

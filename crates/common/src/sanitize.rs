@@ -50,11 +50,26 @@ pub fn sanitize_audit_string(input: &str) -> String {
     let truncated: String = input.chars().take(MAX_AUDIT_STR_LEN).collect();
     let mut out = String::with_capacity(truncated.len());
     for ch in truncated.chars() {
+        let cp = ch as u32;
         match ch {
-            // Strip ALL ASCII control chars except plain space — newlines,
-            // tabs, NUL, etc. They have no place in a one-line audit
-            // diagnostic and break SQL string literals.
-            c if (c as u32) < 0x20 => continue,
+            // Strip ALL ASCII control chars except plain space —
+            // newlines, tabs, NUL, etc. They have no place in a
+            // one-line audit diagnostic and break SQL string literals.
+            _ if cp < 0x20 => continue,
+            // ASCII DELETE.
+            _ if cp == 0x7f => continue,
+            // C1 control characters (U+0080..U+009F).
+            _ if (0x80..=0x9f).contains(&cp) => continue,
+            // Wave-2-D adversarial review (MEDIUM): strip Unicode
+            // direction-override and zero-width characters that
+            // (a) can reverse-render Telegram text in a way that
+            // conceals malicious payload (U+202E RIGHT-TO-LEFT
+            // OVERRIDE), and (b) break grep/jq parsing of audit
+            // logs (zero-width spaces, BOM).
+            '\u{202a}'..='\u{202e}' => continue, // bidi overrides
+            '\u{2066}'..='\u{2069}' => continue, // bidi isolates
+            '\u{200b}'..='\u{200f}' => continue, // zero-widths + LRM/RLM
+            '\u{feff}' => continue,              // BOM
             // Single-quote doubling per QuestDB SQL escape.
             '\'' => out.push_str("''"),
             // Standard char.
@@ -451,6 +466,62 @@ mod tests {
         for ch in out.chars() {
             assert_eq!(ch, '😀');
         }
+    }
+
+    #[test]
+    fn test_sanitize_audit_string_strips_ascii_delete() {
+        let out = sanitize_audit_string("a\x7fb");
+        assert_eq!(out, "ab");
+    }
+
+    #[test]
+    fn test_sanitize_audit_string_strips_c1_controls() {
+        // U+0080..U+009F C1 controls — invisible in many fonts but
+        // breakable in some terminals.
+        let mut input = String::from("hello");
+        input.push('\u{0080}');
+        input.push('\u{0085}'); // NEL — newline-equivalent in some renderers
+        input.push('\u{009F}');
+        input.push('w');
+        input.push('o');
+        input.push('r');
+        input.push('l');
+        input.push('d');
+        let out = sanitize_audit_string(&input);
+        assert_eq!(out, "helloworld");
+    }
+
+    #[test]
+    fn test_sanitize_audit_string_strips_bidi_override() {
+        // Wave-2-D adversarial review (MEDIUM) — U+202E RIGHT-TO-LEFT
+        // OVERRIDE is the classic "Trojan Source" attack vector.
+        let evil = "innocent\u{202e} -- malicious";
+        let out = sanitize_audit_string(evil);
+        assert!(!out.contains('\u{202e}'), "bidi override must be stripped");
+        // Surrounding text preserved.
+        assert!(out.contains("innocent"));
+        assert!(out.contains("malicious"));
+    }
+
+    #[test]
+    fn test_sanitize_audit_string_strips_zero_width_chars() {
+        // ZWSP (U+200B), ZWNJ (U+200C), ZWJ (U+200D), LRM (U+200E), RLM (U+200F)
+        let mut input = String::from("a");
+        input.push('\u{200b}');
+        input.push('\u{200c}');
+        input.push('\u{200d}');
+        input.push('\u{200e}');
+        input.push('\u{200f}');
+        input.push('b');
+        let out = sanitize_audit_string(&input);
+        assert_eq!(out, "ab");
+    }
+
+    #[test]
+    fn test_sanitize_audit_string_strips_bom() {
+        let input = "\u{feff}hello";
+        let out = sanitize_audit_string(input);
+        assert_eq!(out, "hello");
     }
 
     #[test]

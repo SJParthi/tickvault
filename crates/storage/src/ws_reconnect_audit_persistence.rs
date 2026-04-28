@@ -93,6 +93,16 @@ pub async fn append_ws_reconnect_audit_row(
     let feed_esc = sanitize_audit_string(feed);
     let outcome_esc = sanitize_audit_string(outcome);
     let reason_esc = sanitize_audit_string(reason);
+    // SECURITY (Wave-2-D adversarial review MEDIUM): disconnect_code
+    // is written verbatim as an i16. We DELIBERATELY do not reject
+    // codes outside the known Dhan enum (800..814) — SEBI audit
+    // completeness requires recording what actually happened on the
+    // wire, including unknown future codes. The column type is
+    // SHORT (signed i16), which bounds the wire format itself.
+    // The `reason` free-text column carries any human-readable
+    // context; that one IS sanitized via `sanitize_audit_string` to
+    // strip control chars and Unicode bidi-overrides per the same
+    // adversarial-review finding.
     let dc = disconnect_code
         .map(|v| v.to_string())
         .unwrap_or_else(|| "NULL".to_string());

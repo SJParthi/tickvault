@@ -55,6 +55,15 @@ pub struct TickGapDetector {
     /// Per-instrument silence threshold in seconds. Configurable via
     /// `config/base.toml` `tick_gap_threshold_seconds`.
     threshold_secs: u64,
+    /// Wave-2-D adversarial review (MEDIUM) — last trading-date IST
+    /// (epoch days) on which `reset_daily()` actually fired. The
+    /// 15:35 IST scheduler can race itself if the wall-clock steps
+    /// backward (NTP correction) or if `compute_market_close_sleep`
+    /// returns Duration::ZERO repeatedly within the post-15:35
+    /// window. We use this as an idempotency guard so multiple
+    /// "fire" attempts on the same trading day collapse to a single
+    /// real clear. `0` means "no reset has fired yet".
+    last_reset_trading_date_ist: std::sync::atomic::AtomicI64,
 }
 
 impl TickGapDetector {
@@ -64,6 +73,7 @@ impl TickGapDetector {
         Self {
             last_seen: PapayaHashMap::new(),
             threshold_secs,
+            last_reset_trading_date_ist: std::sync::atomic::AtomicI64::new(0),
         }
     }
 
@@ -196,6 +206,55 @@ impl TickGapDetector {
         pin.clear();
     }
 
+    /// Wave-2-D adversarial review (MEDIUM) — idempotent per-day
+    /// reset. Fires `reset_daily()` only if the supplied
+    /// `trading_date_ist_days` has not already fired today. Returns
+    /// `true` if the reset actually fired, `false` if it was a
+    /// duplicate attempt for the same day.
+    ///
+    /// Use case: the 15:35 IST scheduler in `main.rs` can race itself
+    /// when (a) `compute_market_close_sleep` returns `Duration::ZERO`
+    /// repeatedly during the post-15:35 settle window, or (b) NTP
+    /// steps the wall-clock backward across the 15:35 boundary. The
+    /// idempotency guard collapses these into a single real clear.
+    pub fn reset_daily_idempotent(&self, trading_date_ist_days: i64) -> bool {
+        use std::sync::atomic::Ordering;
+        // CAS — only the first caller for a given trading_date_ist_days
+        // wins. Any later caller for the same or earlier day sees the
+        // stored value matches/exceeds and skips.
+        let prev = self.last_reset_trading_date_ist.load(Ordering::Acquire);
+        if trading_date_ist_days <= prev {
+            return false;
+        }
+        // Try to claim this day. Use compare_exchange so a concurrent
+        // call for the same day cannot also fire the reset.
+        match self.last_reset_trading_date_ist.compare_exchange(
+            prev,
+            trading_date_ist_days,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                self.reset_daily();
+                true
+            }
+            Err(_) => {
+                // Another caller raced us and won. Their reset is
+                // sufficient.
+                false
+            }
+        }
+    }
+
+    /// Read-only accessor for the per-day idempotency guard. For
+    /// tests + the `tv_tick_gap_last_reset_date_ist_days` Prometheus
+    /// gauge.
+    #[must_use]
+    pub fn last_reset_trading_date_ist_days(&self) -> i64 {
+        self.last_reset_trading_date_ist
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Number of entries currently tracked. For the
     /// `tv_tick_gap_map_entries` Prometheus gauge.
     #[must_use]
@@ -316,6 +375,59 @@ mod tests {
     }
 
     #[test]
+    fn test_reset_daily_idempotent_first_call_fires_second_call_skips() {
+        // Wave-2-D adversarial review (MEDIUM) — guard against
+        // double-fire from NTP backward step or compute_market_close_sleep
+        // returning Duration::ZERO repeatedly.
+        let d = TickGapDetector::new(30);
+        let now = Instant::now();
+        d.record_tick(13, ExchangeSegment::IdxI, now);
+        d.record_tick(25, ExchangeSegment::IdxI, now);
+        // First call for trading day 20000 — should fire.
+        let fired_first = d.reset_daily_idempotent(20000);
+        assert!(fired_first);
+        assert!(d.is_empty());
+        // Re-populate and call again for the same day — must skip.
+        d.record_tick(13, ExchangeSegment::IdxI, now);
+        let fired_second = d.reset_daily_idempotent(20000);
+        assert!(!fired_second, "second call same day must skip");
+        // The detector's `last_seen` map for `13` is preserved
+        // because the skip didn't clear.
+        assert_eq!(d.len(), 1);
+    }
+
+    #[test]
+    fn test_reset_daily_idempotent_fires_again_on_next_day() {
+        let d = TickGapDetector::new(30);
+        d.record_tick(13, ExchangeSegment::IdxI, Instant::now());
+        assert!(d.reset_daily_idempotent(20000));
+        assert!(d.is_empty());
+        // Next day → must fire.
+        d.record_tick(13, ExchangeSegment::IdxI, Instant::now());
+        assert!(d.reset_daily_idempotent(20001));
+        assert!(d.is_empty());
+    }
+
+    #[test]
+    fn test_reset_daily_idempotent_rejects_backward_step() {
+        // Simulate NTP backward step: yesterday's day number arrives
+        // AFTER today's day already fired. The guard must reject.
+        let d = TickGapDetector::new(30);
+        assert!(d.reset_daily_idempotent(20001));
+        // Now an "earlier" day number arrives (e.g. NTP stepped back).
+        let fired = d.reset_daily_idempotent(20000);
+        assert!(!fired, "backward step (yesterday's day number) must skip");
+    }
+
+    #[test]
+    fn test_last_reset_trading_date_ist_days_accessor() {
+        let d = TickGapDetector::new(30);
+        assert_eq!(d.last_reset_trading_date_ist_days(), 0);
+        let _ = d.reset_daily_idempotent(20245);
+        assert_eq!(d.last_reset_trading_date_ist_days(), 20245);
+    }
+
+    #[test]
     fn test_reset_daily_clears_all_entries() {
         let d = TickGapDetector::new(30);
         let now = Instant::now();
@@ -403,6 +515,64 @@ mod tests {
         assert!(entries[1].2 >= entries[2].2);
         // Top-3 should be ids 1, 2, 3 (gaps 150, 120, 90).
         assert_eq!(entries[0].0, 1);
+    }
+
+    #[test]
+    fn test_scan_gaps_top_n_round_trips_all_segment_variants() {
+        // Wave-2-D adversarial review (LOW) — `scan_gaps_top_n`
+        // encodes `ExchangeSegment` as `u8` (binary_code) inside the
+        // heap and decodes back via `from_byte` on drain. This test
+        // exercises every known variant to ensure no entry is
+        // silently dropped on the round-trip.
+        let d = TickGapDetector::new(30);
+        let t0 = Instant::now();
+        let segments = [
+            ExchangeSegment::IdxI,
+            ExchangeSegment::NseEquity,
+            ExchangeSegment::NseFno,
+            ExchangeSegment::NseCurrency,
+            ExchangeSegment::BseEquity,
+            ExchangeSegment::McxComm,
+            ExchangeSegment::BseCurrency,
+            ExchangeSegment::BseFno,
+        ];
+        for (i, seg) in segments.iter().enumerate() {
+            d.record_tick(i as u32, *seg, t0);
+        }
+        let now = t0 + Duration::from_secs(60);
+        let (entries, total) = d.scan_gaps_top_n(now, 10);
+        // All 8 variants must round-trip — total includes all,
+        // entries cap=10 also includes all.
+        assert_eq!(total, segments.len());
+        assert_eq!(entries.len(), segments.len());
+        // Verify every input segment is present in the output.
+        for seg in segments {
+            assert!(
+                entries.iter().any(|(_, s, _)| *s == seg),
+                "segment {seg:?} dropped on heap encode/decode round-trip"
+            );
+        }
+    }
+
+    #[test]
+    fn test_scan_gaps_top_n_breaks_ties_deterministically() {
+        // Wave-2-D adversarial review (MEDIUM) — verify tie-breaking
+        // on identical gaps is by `(id, segment)` lexicographic order.
+        let d = TickGapDetector::new(30);
+        let t0 = Instant::now();
+        d.record_tick(100, ExchangeSegment::IdxI, t0);
+        d.record_tick(50, ExchangeSegment::IdxI, t0);
+        d.record_tick(200, ExchangeSegment::IdxI, t0);
+        let now = t0 + Duration::from_secs(60);
+        let (entries, _) = d.scan_gaps_top_n(now, 3);
+        assert_eq!(entries.len(), 3);
+        // All gaps equal (60s) → secondary sort by id descending
+        // because the heap uses Reverse((gap, id, seg)) and
+        // into_sorted_vec yields ascending Reverse = descending T.
+        // Verify the ordering is deterministic (same input → same
+        // output across runs).
+        let (entries2, _) = d.scan_gaps_top_n(now, 3);
+        assert_eq!(entries, entries2, "tie-breaking must be deterministic");
     }
 
     #[test]

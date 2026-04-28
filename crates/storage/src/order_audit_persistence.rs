@@ -109,9 +109,25 @@ pub async fn append_order_audit_row(
     let status_esc = sanitize_audit_string(order_status);
     let outcome_esc = sanitize_audit_string(outcome);
     let detail_esc = sanitize_audit_string(detail);
+    // Wave-2-D adversarial review (HIGH) — `price` is `f64`; a malformed
+    // Dhan response could produce NaN/Infinity. QuestDB rejects both,
+    // which would fail every subsequent audit insert for that order.
+    // Clamp to a finite fallback (0.0) and log; the audit row still
+    // captures the order with the lifecycle event, just without a
+    // bogus price.
+    let safe_price: f64 = if price.is_finite() {
+        price
+    } else {
+        tracing::warn!(
+            order_id = %order_id_esc,
+            raw_price = price,
+            "order_audit: non-finite price clamped to 0.0 to avoid QuestDB reject"
+        );
+        0.0
+    };
     let sql = format!(
         "INSERT INTO {QUESTDB_TABLE_ORDER_AUDIT} (ts, order_id, correlation_id, leg, event, security_id, segment, transaction_type, quantity, price, order_status, outcome, detail) VALUES \
-         ({ts_nanos_ist}, '{order_id_esc}', '{corr_esc}', '{leg_esc}', '{event_esc}', {security_id}, '{seg_esc}', '{txn_esc}', {quantity}, {price}, '{status_esc}', '{outcome_esc}', '{detail_esc}');"
+         ({ts_nanos_ist}, '{order_id_esc}', '{corr_esc}', '{leg_esc}', '{event_esc}', {security_id}, '{seg_esc}', '{txn_esc}', {quantity}, {safe_price}, '{status_esc}', '{outcome_esc}', '{detail_esc}');"
     );
     let resp = client
         .get(&base_url)
