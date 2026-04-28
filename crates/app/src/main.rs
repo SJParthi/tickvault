@@ -4972,6 +4972,23 @@ async fn main() -> Result<()> {
                     /// dispatch latency (~30s on the slowest day).
                     const SLO_PHASE2_GRACE_SECS: u32 = 60;
 
+                    /// Boot-relative grace window for mid-market starts.
+                    /// When the app boots after 09:13:00 IST (e.g. crash-
+                    /// recovery or operator restart), Phase 2 dispatches
+                    /// immediately ("late-start path") but still takes
+                    /// ~30s to complete. Without this grace the SLO
+                    /// scheduler's first tick after boot would observe
+                    /// `phase2_outcome == None`, fall past the wall-clock
+                    /// grace (which expired hours ago at 09:14), and
+                    /// page SLO-02 CRITICAL with weakest=phase2_health.
+                    /// Live incident 2026-04-28 14:18 IST proved this:
+                    /// CRITICAL fired at 14:18:24, recovered to SLO-01
+                    /// Healthy at 14:18:34 (10s later) once Phase 2
+                    /// completed. Same magnitude as the wall-clock grace
+                    /// (60s) — Phase 2 dispatch latency is independent
+                    /// of when boot happened.
+                    const SLO_PHASE2_BOOT_GRACE_SECS: u64 = 60;
+
                     /// Sample interval. SCOPE §13.1.
                     const SLO_TICK_INTERVAL_SECS: u64 = 10;
 
@@ -5004,6 +5021,10 @@ async fn main() -> Result<()> {
                     // Spill delta tracker — saturate-subtract previous total
                     // to detect any new drops in the last 10s.
                     let mut last_spill_total: u64 = slo_health.ticks_spilled();
+                    // Scheduler boot instant — used by the boot-relative
+                    // Phase 2 grace below to suppress SLO-02 false-positive
+                    // on mid-market boots (live incident 2026-04-28).
+                    let scheduler_boot_at = std::time::Instant::now();
 
                     info!("Wave 3-D SLO score scheduler: started (10s tick)");
 
@@ -5109,11 +5130,24 @@ async fn main() -> Result<()> {
                                     // Post-trigger but no record — could be
                                     // "still dispatching" (within grace) or
                                     // "Phase 2 never fired" (past grace).
-                                    // Grace window pins to 1.0 to avoid
-                                    // racing the dispatcher at 09:13:00 IST.
-                                    if secs_of_day
-                                        < SLO_PHASE2_TRIGGER_SECS_OF_DAY_IST + SLO_PHASE2_GRACE_SECS
-                                    {
+                                    // Two grace windows pin to 1.0:
+                                    //   1. Wall-clock grace at the 09:13:00
+                                    //      trigger (handles normal-boot race).
+                                    //   2. Boot-relative grace (handles
+                                    //      mid-market boot late-start path —
+                                    //      live incident 2026-04-28 14:18 IST
+                                    //      where Phase 2 dispatch took ~10s
+                                    //      after boot but the wall-clock
+                                    //      grace had already expired hours
+                                    //      ago at 09:14). Falsely paged
+                                    //      SLO-02 CRITICAL until the boot
+                                    //      grace was added here.
+                                    let in_wallclock_grace = secs_of_day
+                                        < SLO_PHASE2_TRIGGER_SECS_OF_DAY_IST
+                                            + SLO_PHASE2_GRACE_SECS;
+                                    let in_boot_grace = scheduler_boot_at.elapsed().as_secs()
+                                        < SLO_PHASE2_BOOT_GRACE_SECS;
+                                    if in_wallclock_grace || in_boot_grace {
                                         1.0
                                     } else {
                                         0.0
