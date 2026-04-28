@@ -220,6 +220,11 @@ pub enum ErrorCode {
     StorageGap03AuditWriteFailed,
     /// STORAGE-GAP-04: S3 archive failure (partition upload).
     StorageGap04S3ArchiveFailed,
+    /// SELFTEST-01: market-open self-test passed (informational positive ping).
+    Selftest01Passed,
+    /// SELFTEST-02: market-open self-test detected a Critical or Degraded
+    /// failure — operator action required.
+    Selftest02Failed,
 
     // -----------------------------------------------------------------------
     // Dhan Trading API (DH-9xx)
@@ -348,6 +353,8 @@ impl ErrorCode {
             Self::Audit06OrderWriteFailed => "AUDIT-06",
             Self::StorageGap03AuditWriteFailed => "STORAGE-GAP-03",
             Self::StorageGap04S3ArchiveFailed => "STORAGE-GAP-04",
+            Self::Selftest01Passed => "SELFTEST-01",
+            Self::Selftest02Failed => "SELFTEST-02",
             // Dhan Trading API
             Self::Dh901InvalidAuth => "DH-901",
             Self::Dh902NoApiAccess => "DH-902",
@@ -393,7 +400,10 @@ impl ErrorCode {
             | Self::OmsGapDryRunSafety
             | Self::InstrumentP0EmergencyDownload
             | Self::Boot02DeadlineExceeded
-            | Self::Boot03ClockSkewExceeded => Severity::Critical,
+            | Self::Boot03ClockSkewExceeded
+            | Self::Selftest02Failed => Severity::Critical,
+            // Info: positive-ping / lifecycle confirmations
+            Self::Selftest01Passed => Severity::Info,
             // High: regulatory / order / risk / rate-limit
             Self::Dh904RateLimit
             | Self::Dh905InputException
@@ -526,6 +536,9 @@ impl ErrorCode {
             | Self::StorageGap03AuditWriteFailed
             | Self::StorageGap04S3ArchiveFailed => ".claude/rules/project/wave-2-error-codes.md",
             Self::Boot03ClockSkewExceeded => ".claude/rules/project/wave-2-c-error-codes.md",
+            Self::Selftest01Passed | Self::Selftest02Failed => {
+                ".claude/rules/project/wave-3-c-error-codes.md"
+            }
             Self::Dh901InvalidAuth
             | Self::Dh902NoApiAccess
             | Self::Dh903AccountIssue
@@ -647,6 +660,8 @@ impl ErrorCode {
             Self::Audit06OrderWriteFailed,
             Self::StorageGap03AuditWriteFailed,
             Self::StorageGap04S3ArchiveFailed,
+            Self::Selftest01Passed,
+            Self::Selftest02Failed,
         ]
     }
 }
@@ -799,7 +814,9 @@ mod tests {
         // STORAGE-GAP-03/04).
         // 2026-04-27 (Wave 2-C Item 7.3): bumped 76 -> 77 for BOOT-03
         // (clock-skew exceeded — HALTING).
-        assert_eq!(ErrorCode::all().len(), 77);
+        // 2026-04-28 (Wave 3-C Item 12): bumped 77 -> 79 for SELFTEST-01
+        // (passed) + SELFTEST-02 (failed) — market-open self-test.
+        assert_eq!(ErrorCode::all().len(), 79);
     }
 
     #[test]
@@ -822,7 +839,9 @@ mod tests {
                 || s.starts_with("MOVERS-")
                 // Wave 2: boot / audit prefixes
                 || s.starts_with("BOOT-")
-                || s.starts_with("AUDIT-");
+                || s.starts_with("AUDIT-")
+                // Wave 3-C: market-open self-test prefix
+                || s.starts_with("SELFTEST-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }
