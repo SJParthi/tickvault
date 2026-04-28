@@ -357,7 +357,10 @@ realtime_guarantee_score = true     # Item 13 — composite SLO score gauge
 # Per CLAUDE.md "always real AWS SSM" — no local-disk fallback.
 # See docs/dhan-support/2026-04-28-depth-200-app-vs-self-token.md.
 [depth_200_auth]
-mode = "totp_app"
+# Default ON — full-depth-api.dhan.co rejects APP-type tokens, so the
+# SELF-token path from SSM is the ONLY working depth-200 auth flow.
+# Override to "totp_app" only for emergency rollback.
+mode = "manual_self_with_renewal"
 ssm_parameter_name = "/tickvault/dev/dhan/depth_200_self_token"
 renewal_interval_secs = 82800        # 23h — fires before 24h JWT expiry
 min_remaining_secs_at_boot = 3600    # accept SSM token if >= 1h validity left
