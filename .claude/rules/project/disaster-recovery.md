@@ -153,7 +153,7 @@ is intact; if not, fall through to CSV download (~60s adds 30s to RTO).
 | Recovery | Build fails fast, Telegram CRITICAL, operator manual intervention |
 | Warning threshold | `MAX_TOTAL_SUBSCRIPTIONS_TARGET = 24_500` — Telegram WARN before hitting hard cap |
 
-### 14. Overnight wake (Friday 15:30 → Monday 09:00, ~65 hours sleep) — NEW (Wave-2-D)
+### 14. Overnight wake (Friday 15:30 → Monday 09:00, ~65.5 hours sleep) — NEW (Wave-2-D)
 
 The most common "long sleep" scenario. After 15:30 IST Friday close,
 the per-connection task transitions to dormant sleep (Wave-2-A

@@ -46,19 +46,33 @@ fn audit_write_failure_alert_is_pinned() {
     );
 }
 
+// Wave-2-D adversarial review (CRITICAL): the originally-proposed
+// `tv-s3-archive-failure` alert referenced
+// `tv_s3_archive_errors_total` — a metric with NO production
+// emission site (the Wave-3 `crates/storage/src/s3_archive.rs`
+// writer is not yet shipped). An alert that references a phantom
+// metric never fires, which would silently mask SEBI archive
+// failures the day Wave-3 lands.
+//
+// We REMOVED that alert from alerts.yml. The guard test below
+// pins the absence so a future PR cannot re-introduce a phantom
+// reference. The alert + emission BOTH ship together in Wave-3.
 #[test]
-fn s3_archive_failure_alert_is_pinned() {
+fn s3_archive_failure_alert_is_intentionally_absent_until_wave_3() {
     let yaml = read_alerts_yaml();
     assert!(
-        yaml.contains("uid: tv-s3-archive-failure"),
-        "Wave-2-D Fix 3 regression: alert `tv-s3-archive-failure` MUST \
-         exist in alerts.yml. SEBI 5y retention for order_audit \
-         partitions depends on S3 archive succeeding."
+        !yaml.contains("uid: tv-s3-archive-failure"),
+        "Wave-2-D adversarial-review CRITICAL fix: the \
+         `tv-s3-archive-failure` alert MUST NOT be present until the \
+         Wave-3 `s3_archive.rs` writer is shipped and emits \
+         `tv_s3_archive_errors_total`. A phantom-metric alert never \
+         fires and silently masks SEBI archive failures."
     );
     assert!(
-        yaml.contains("increase(tv_s3_archive_errors_total[1h])"),
-        "Wave-2-D Fix 3 regression: tv-s3-archive-failure expression \
-         must be `increase(tv_s3_archive_errors_total[1h])`."
+        !yaml.contains("tv_s3_archive_errors_total"),
+        "Wave-2-D adversarial-review CRITICAL fix: phantom metric \
+         `tv_s3_archive_errors_total` must not appear in alerts.yml \
+         until the emission site ships."
     );
 }
 
@@ -80,16 +94,26 @@ fn tick_gap_coalesce_storm_alert_is_pinned() {
 }
 
 #[test]
-fn all_three_wave_2d_alerts_have_severity_label() {
+fn wave_2d_alerts_have_severity_label() {
+    // Every Wave-2-D alert must carry the `wave: "2-d"` label so
+    // dashboards can group/filter them. The s3-archive alert was
+    // removed (see s3_archive_failure_alert_is_intentionally_absent_until_wave_3),
+    // so the count is 2: tv-audit-write-failure + tv-tick-gap-coalesce-storm.
+    //
+    // Adversarial review (LOW finding) — the original byte-substring
+    // match was fragile under YAML reformatting. We now check both
+    // the label key and the value-fragment separately so a
+    // single-quote vs double-quote reformat keeps the test green.
     let yaml = read_alerts_yaml();
-    // Every Wave-2-D alert must have `wave: "2-d"` label so dashboards
-    // can group/filter them. Counter-test against accidental deletion.
-    let count = yaml.matches("wave: \"2-d\"").count();
+    let count_double = yaml.matches("wave: \"2-d\"").count();
+    let count_single = yaml.matches("wave: '2-d'").count();
+    let total = count_double + count_single;
     assert_eq!(
-        count, 3,
-        "Wave-2-D Fix 3 regression: expected exactly 3 alerts with \
-         label `wave: \"2-d\"` in alerts.yml, found {count}. The 3 are: \
-         tv-audit-write-failure, tv-s3-archive-failure, \
-         tv-tick-gap-coalesce-storm."
+        total, 2,
+        "Wave-2-D Fix 3 regression: expected exactly 2 alerts with \
+         label `wave: \"2-d\"` (or single-quoted equivalent) in \
+         alerts.yml, found {total}. The 2 are: \
+         tv-audit-write-failure, tv-tick-gap-coalesce-storm. \
+         (tv-s3-archive-failure intentionally deferred to Wave-3.)"
     );
 }

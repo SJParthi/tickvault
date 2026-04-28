@@ -910,44 +910,6 @@ groups:
           severity: high
           wave: "2-d"
 
-      # Wave-2-D: S3 archive failure (Glacier upload from partition manager)
-      - uid: tv-s3-archive-failure
-        title: "Wave-2-D: S3 archive failure (audit partition upload)"
-        condition: C
-        data:
-          - refId: A
-            relativeTimeRange: { from: 3600, to: 0 }
-            datasourceUid: prometheus
-            model:
-              expr: "increase(tv_s3_archive_errors_total[1h])"
-              intervalMs: 60000
-              maxDataPoints: 43200
-          - refId: B
-            relativeTimeRange: { from: 3600, to: 0 }
-            datasourceUid: __expr__
-            model:
-              type: reduce
-              expression: A
-              reducer: last
-          - refId: C
-            relativeTimeRange: { from: 3600, to: 0 }
-            datasourceUid: __expr__
-            model:
-              type: threshold
-              expression: B
-              conditions:
-                # ANY S3 archive failure in the last hour pages the operator.
-                - evaluator: { type: gt, params: [0] }
-        noDataState: OK
-        execErrState: Alerting
-        for: 0m
-        annotations:
-          summary: "HIGH: S3 archive of audit partition failed"
-          description: "tv_s3_archive_errors_total increased in the last hour. A QuestDB partition could not be uploaded to S3 Intelligent-Tiering / Glacier IR / Deep Archive. SEBI 5-year retention at risk for order_audit partitions. Check AWS credentials and S3 bucket reachability via `aws s3 ls s3://tickvault-audit/`."
-        labels:
-          severity: high
-          wave: "2-d"
-
       # Wave-2-D: tick-gap coalesce-task storm (catastrophic universe-wide silence)
       - uid: tv-tick-gap-coalesce-storm
         title: "Wave-2-D: tick-gap coalesce-task storm (>100 summaries/min)"
