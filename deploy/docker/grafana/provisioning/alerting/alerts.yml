@@ -1204,3 +1204,43 @@ groups:
           description: "tv_spill_dropped_total{reason='drain_*'} rate > 1.0/s for 10m. The async spill writer queue is overflowing — disk too slow, drain task crashed, or writer never initialised. DLQ NDJSON still catches every payload as recoverable text, but operator must investigate. Runbook: .claude/rules/project/wave-1-error-codes.md."
         labels:
           severity: medium
+
+      # Wave 3-B Item 11: Telegram dispatcher drops.
+      # Drops mean operator alerts MAY be missed — investigate
+      # immediately. Counter is labelled by `reason` (`noop_mode`,
+      # `coalesced_sample_capped`, `send_failed`); we sum across reasons
+      # so any drop fires the alert.
+      - uid: tv-telegram-drops
+        title: "TELEGRAM-01: Telegram drops detected — operator alerts may be missed"
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 60, to: 0 }
+            datasourceUid: prometheus
+            model:
+              expr: 'sum(rate(tv_telegram_dropped_total[1m]))'
+              intervalMs: 15000
+              maxDataPoints: 43200
+          - refId: B
+            relativeTimeRange: { from: 60, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            relativeTimeRange: { from: 60, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: gt, params: [0.1] }
+        noDataState: OK
+        execErrState: Alerting
+        for: 1m
+        annotations:
+          summary: "TELEGRAM-01: Telegram dispatcher drops > 0.1/s for 60s"
+          description: "tv_telegram_dropped_total rate > 0.1/s for 60s. Operator alerts may be missed. Inspect the `reason` label distribution: `send_failed` = network/auth issue, `coalesced_sample_capped` = noisy subsystem (count is still authoritative), `noop_mode` = SSM unavailable. Runbook: .claude/rules/project/wave-3-error-codes.md (TELEGRAM-01)."
+        labels:
+          severity: high

@@ -1582,6 +1582,77 @@
           "fields": ""
         }
       }
+    },
+    {
+      "type": "stat",
+      "id": 46,
+      "title": "Telegram dispatch rate (5m)",
+      "description": "Wave 3-B Item 11. Total Telegram messages dispatched in the last 5 minutes, broken down by severity and whether the event was coalesced (true) or sent immediately (false). Wrapped in increase() per Rule 12 — raw counters lie after process restart. A coalesced=true row of 1 represents one summary message folding many events; coalesced=false counts are direct sends. Runbook: .claude/rules/project/wave-3-error-codes.md.",
+      "gridPos": {
+        "h": 6,
+        "w": 6,
+        "x": 6,
+        "y": 42
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (severity, coalesced) (increase(tv_telegram_dispatched_total[5m]))",
+          "legendFormat": "{{severity}}/coalesced={{coalesced}}",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (reason) (increase(tv_telegram_dropped_total[5m]))",
+          "legendFormat": "drop:{{reason}}",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "unit": "none",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green"
+              },
+              {
+                "color": "orange",
+                "value": 50
+              },
+              {
+                "color": "red",
+                "value": 500
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "background_solid",
+        "graphMode": "area",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        }
+      }
     }
   ]
 }
