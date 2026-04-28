@@ -107,6 +107,37 @@ Snapshot of 24K rows: ~10.5 ms (within 11 ms Criterion budget).
 | Rule file | `depth-subscription.md` 2026-04-24 Updates §6 | UPDATED |
 | Runbook | `docs/runbooks/expiry-day.md` | UPDATED |
 
+## Section I — Depth-20 dynamic top-150 + Depth-200 URL wipe-off (NEW 2026-04-28)
+
+### Depth-20 dynamic top-150 (Phase 7)
+
+| Aspect | Detail |
+|---|---|
+| Connection layout | 5 total depth-20 connections; slots 1+2 stay pinned to NIFTY ATM±24 + BANKNIFTY ATM±24 (~98 instruments); slots 3/4/5 dynamic (3 × 50 = 150 contracts) |
+| Selection criteria (Option B confirmed) | `SELECT security_id FROM option_movers WHERE ts > now() - 90s AND change_pct > 0 ORDER BY volume DESC LIMIT 150` |
+| Recompute interval | 1 minute via `tokio::time::interval` + `MissedTickBehavior::Skip` |
+| Market-hours gate | `is_within_market_hours_ist()` short-circuits outside [09:00, 15:30] IST |
+| Delta computation | `HashSet<(u32, ExchangeSegment)>` diff: `leavers = previous - current`; `entrants = current - previous` |
+| Wire mechanism | Reuses existing `DepthCommand::Swap20 { unsubscribe_messages, subscribe_messages }` channel — zero-disconnect |
+| ErrorCodes | `DEPTH-DYN-01` (top-150 empty: option_movers stale or empty universe) Severity::High; `DEPTH-DYN-02` (Swap20 channel broken) Severity::Critical — promoted from RESERVED to defined in Phase 7 |
+| Module | `crates/core/src/instrument/depth_20_dynamic_subscriber.rs` (new) |
+| Boot wiring | `crates/app/src/main.rs` after existing depth-20 setup; spawns one supervisor task that owns the 3 dynamic-slot mpsc::Sender channels |
+| Source dependency | EXISTING `option_movers` table (already populated 60s by `OptionMoversWriter`) — does NOT depend on new `movers_{T}` tables |
+| Failure mode | If selector returns < 150 (e.g., low-volume morning), still emit Swap20 with whatever was returned + log; do not panic |
+| Backpressure | If `Swap20` channel send fails, log + retry next minute; supervisor respawns connection task on panic (existing WS-GAP-05) |
+
+### Depth-200 URL wipe-off (Phase 6)
+
+| Item | Action |
+|---|---|
+| `crates/core/examples/depth_200_variants.rs` (~400 LoC, 8-variant A/B test) | DELETE — `/` is locked-fact since 2026-04-23 |
+| `crates/core/src/websocket/depth_connection.rs` historical narrative comments | STRIP comments at lines ~860, ~1016, ~1085, ~1571, ~1767 referencing the old `/twohundreddepth` story; keep the assertion test + one-line LOCKED FACT marker |
+| `crates/common/tests/dhan_locked_facts.rs` ratchet | KEEP unchanged — this is the regression-blocker |
+| `crates/common/src/config.rs:154` | KEEP — one-line ratchet pointer |
+| Banned-pattern hook category 4 | KEEP — blocks any literal `wss://full-depth-api.dhan.co/twohundreddepth` regression |
+
+**SELF token confirmation (Parthiban 2026-04-28):** Depth-200 accepts ONLY SELF tokens. RenewToken extends a SELF token by 24h while preserving `tokenConsumerType: "SELF"`. APP tokens are silently rejected by the depth-200 server (TCP disconnects within seconds). This is enforced by `Depth200SelfTokenManager::boot_from_ssm`'s `validate_self_claims` (DEPTH200-AUTH-01..03 fire on misuse).
+
 ## Cross-references
 
 - Risks: `.claude/plans/v2-risks.md`
