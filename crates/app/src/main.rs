@@ -1922,37 +1922,11 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Wave 2 Item 9 — boot audit row for the QuestDB readiness step.
-    // Best-effort: if QuestDB just barely came up but the DDL phase is
-    // about to write to it, we still want this row. Failures don't halt
-    // boot — the AUDIT-04 ErrorCode + tracing::error! covers regression.
-    {
-        let now_nanos = chrono::Utc::now()
-            .timestamp_nanos_opt()
-            .unwrap_or(0)
-            .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS);
-        if let Err(e) = tickvault_storage::boot_audit_persistence::append_boot_audit_row(
-            &config.questdb,
-            now_nanos,
-            &boot_id,
-            "questdb_ready",
-            "ok",
-            i64::try_from(probe_started.elapsed().as_millis()).unwrap_or(i64::MAX),
-            "QuestDB readiness probe succeeded",
-        )
-        .await
-        {
-            tracing::error!(
-                error = ?e,
-                code = tickvault_common::error_code::ErrorCode::Audit04BootWriteFailed.code_str(),
-                "AUDIT-04 boot audit row write failed — continuing"
-            );
-            metrics::counter!("tv_audit_write_failures_total", "table" => "boot_audit")
-                .increment(1);
-        }
-    }
-
     // All table creation queries are independent — run in parallel for faster boot.
+    // NOTE: the boot audit row for the `questdb_ready` step is appended AFTER this
+    // join — `ensure_boot_audit_table` lives inside the join (line ~1985) and
+    // writing to `boot_audit` before the table exists caused AUDIT-04 to fire on
+    // every clean boot until 2026-04-28.
     tokio::join!(
         ensure_tick_table_dedup_keys(&config.questdb),
         ensure_depth_and_prev_close_tables(&config.questdb),
@@ -1986,6 +1960,38 @@ async fn main() -> Result<()> {
         tickvault_storage::selftest_audit_persistence::ensure_selftest_audit_table(&config.questdb),
         tickvault_storage::order_audit_persistence::ensure_order_audit_table(&config.questdb),
     );
+
+    // Wave 2 Item 9 — boot audit row for the QuestDB readiness step.
+    // Must run AFTER the `tokio::join!` above so `ensure_boot_audit_table`
+    // has created the table. Writing this row before the join was the cause
+    // of AUDIT-04 firing on every clean boot until 2026-04-28.
+    // Best-effort: failures don't halt boot — the AUDIT-04 ErrorCode +
+    // tracing::error! covers regression.
+    {
+        let now_nanos = chrono::Utc::now()
+            .timestamp_nanos_opt()
+            .unwrap_or(0)
+            .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS);
+        if let Err(e) = tickvault_storage::boot_audit_persistence::append_boot_audit_row(
+            &config.questdb,
+            now_nanos,
+            &boot_id,
+            "questdb_ready",
+            "ok",
+            i64::try_from(probe_started.elapsed().as_millis()).unwrap_or(i64::MAX),
+            "QuestDB readiness probe succeeded",
+        )
+        .await
+        {
+            tracing::error!(
+                error = ?e,
+                code = tickvault_common::error_code::ErrorCode::Audit04BootWriteFailed.code_str(),
+                "AUDIT-04 boot audit row write failed — continuing"
+            );
+            metrics::counter!("tv_audit_write_failures_total", "table" => "boot_audit")
+                .increment(1);
+        }
+    }
 
     // Persist trading calendar to QuestDB (best-effort, non-blocking).
     if let Err(err) = calendar_persistence::persist_calendar(&trading_calendar, &config.questdb) {
