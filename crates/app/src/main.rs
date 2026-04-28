@@ -259,19 +259,25 @@ async fn main() -> Result<()> {
             loop {
                 ticker.tick().await;
                 let now = std::time::Instant::now();
-                let gaps = detector_for_task.scan_gaps(now);
-                if gaps.is_empty() {
+                // Wave-2-D Fix 4: bounded variant — even universe-wide
+                // silence (~25 K silent instruments) only allocates for
+                // the top-N. Returns (top_n_entries, total_silent).
+                let (gaps, total_silent) = detector_for_task.scan_gaps_top_n(
+                    now,
+                    tickvault_core::pipeline::tick_gap_detector::TICK_GAP_TOP_N_DEFAULT,
+                );
+                if total_silent == 0 {
                     continue;
                 }
                 metrics::counter!("tv_tick_gap_summary_total").increment(1);
-                metrics::gauge!("tv_tick_gap_instruments_silent").set(gaps.len() as f64);
+                metrics::gauge!("tv_tick_gap_instruments_silent").set(total_silent as f64);
                 let top: Vec<(u32, &'static str, u64)> = gaps
                     .iter()
                     .take(10)
                     .map(|(id, seg, gap)| (*id, seg.as_str(), *gap))
                     .collect();
                 tracing::error!(
-                    silent_count = gaps.len(),
+                    silent_count = total_silent,
                     top_10_samples = ?top,
                     code = tickvault_common::error_code::ErrorCode::WsGap06TickGapSummary
                         .code_str(),

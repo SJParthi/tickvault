@@ -19,8 +19,27 @@ pub const TICK_GAP_THRESHOLD_SECS_DEFAULT: u64 = 30;
 /// Default coalescing window for Telegram summary emission.
 pub const TICK_GAP_COALESCE_WINDOW_SECS_DEFAULT: u64 = 60;
 
+/// Wave-2-D — bounded cap for the coalesce-task Telegram digest. Even
+/// when the entire universe is silent, the top-N filter only allocates
+/// for this many entries.
+pub const TICK_GAP_TOP_N_DEFAULT: usize = 64;
+
 /// Composite key per I-P1-11. Wave 2 Item 8.
 pub type TickGapKey = (u32, ExchangeSegment);
+
+// Wave-2-D Fix 4 — hot-path `Copy` compile-time ratchet. The
+// `record_tick` call is on the tick-processor hot path and builds
+// `TickGapKey` by value (no allocation). If `ExchangeSegment` ever
+// loses `Copy` (e.g. someone changes it from an enum to a `String`),
+// every `record_tick` call would silently start allocating. This
+// const block is a compile-time guard: the closure body fails to
+// type-check if either type is not `Copy`. Hand-rolled because
+// `static_assertions` is not in workspace Cargo.toml.
+const _: fn() = || {
+    const fn assert_copy<T: Copy>() {}
+    assert_copy::<ExchangeSegment>();
+    assert_copy::<TickGapKey>();
+};
 
 /// O(1) tick-gap detector.
 ///
@@ -66,6 +85,13 @@ impl TickGapDetector {
     ///
     /// Sorted by `gap_secs` descending (largest gap first) for
     /// operator-friendly Telegram digest.
+    ///
+    /// **Allocation note (Wave-2-D adversarial review finding (e)):**
+    /// when the entire universe (~25 K instruments) is silent
+    /// (Dhan-side outage, network blip), this returns a Vec with up to
+    /// 25 K entries (~600 KB once per 60s). For pure summary purposes
+    /// the coalesce task only needs the top-N — see `scan_gaps_top_n`
+    /// for the bounded variant.
     #[must_use]
     pub fn scan_gaps(&self, now: Instant) -> Vec<(u32, ExchangeSegment, u64)> {
         let pin = self.last_seen.pin();
@@ -84,6 +110,80 @@ impl TickGapDetector {
         // small in practice (< 100). Sort largest-gap-first.
         out.sort_by(|a, b| b.2.cmp(&a.2));
         out
+    }
+
+    /// Wave-2-D Fix 4 — bounded variant of `scan_gaps` that returns at
+    /// most `cap` entries (the top-`cap` largest gaps) plus the total
+    /// silent count.
+    ///
+    /// Bounded allocation: O(`cap`) regardless of how many instruments
+    /// are silent. Used by the 60s coalesce task so a universe-wide
+    /// silence event cannot allocate 600 KB on every tick of the
+    /// coalesce timer.
+    ///
+    /// Returns `(top_cap_entries, total_silent_count)`. The full count
+    /// drives the `tv_tick_gap_instruments_silent` gauge; the top-N
+    /// entries drive the Telegram digest.
+    #[must_use]
+    pub fn scan_gaps_top_n(
+        &self,
+        now: Instant,
+        cap: usize,
+    ) -> (Vec<(u32, ExchangeSegment, u64)>, usize) {
+        if cap == 0 {
+            // Still need the total count for the gauge — walk without
+            // collecting.
+            let pin = self.last_seen.pin();
+            let total = pin
+                .iter()
+                .filter(|(_, last)| {
+                    now.saturating_duration_since(**last).as_secs() >= self.threshold_secs
+                })
+                .count();
+            return (Vec::new(), total);
+        }
+        let pin = self.last_seen.pin();
+        // Single-pass top-K via a min-heap pruned to size `cap`. O(n
+        // log cap) time, O(cap) space. Bounded regardless of universe
+        // size. The segment is stored as a `u8` (binary_code) so the
+        // heap key is fully `Ord` without requiring Ord on
+        // ExchangeSegment itself.
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
+        let mut heap: BinaryHeap<Reverse<(u64, u32, u8)>> =
+            BinaryHeap::with_capacity(cap.saturating_add(1));
+        let mut total: usize = 0;
+        for (key, last) in pin.iter() {
+            let gap = now.saturating_duration_since(*last).as_secs();
+            if gap < self.threshold_secs {
+                continue;
+            }
+            total = total.saturating_add(1);
+            let seg_code = key.1.binary_code();
+            if heap.len() < cap {
+                heap.push(Reverse((gap, key.0, seg_code)));
+            } else if let Some(Reverse((min_gap, _, _))) = heap.peek() {
+                if gap > *min_gap {
+                    heap.pop();
+                    heap.push(Reverse((gap, key.0, seg_code)));
+                }
+            }
+        }
+        // Drain into a sorted (largest-first) Vec. `into_sorted_vec` on
+        // a `BinaryHeap<Reverse<T>>` returns elements in ascending
+        // `Reverse<T>` order — i.e. largest underlying T first. So the
+        // resulting Vec is already largest-gap-first; no reverse
+        // needed. Decode the u8 segment back to ExchangeSegment via
+        // `from_byte`; on the (impossible) None path we skip the entry
+        // rather than panic per `dhan-annexure-enums.md` Rule 15.
+        let out: Vec<(u32, ExchangeSegment, u64)> = heap
+            .into_sorted_vec()
+            .into_iter()
+            .filter_map(|Reverse((gap, id, seg_code))| {
+                ExchangeSegment::from_byte(seg_code).map(|seg| (id, seg, gap))
+            })
+            .collect();
+        (out, total)
     }
 
     /// Daily reset (G19). Called from a 15:35 IST scheduled task so that
@@ -251,6 +351,94 @@ mod tests {
     fn test_global_tick_gap_detector_accessor_returns_option() {
         // Type-check the accessor signature.
         let _: Option<&'static SharedTickGapDetector> = global_tick_gap_detector();
+    }
+
+    #[test]
+    fn test_scan_gaps_top_n_zero_cap_returns_empty_vec_with_total_count() {
+        let d = TickGapDetector::new(30);
+        let t0 = Instant::now();
+        for id in 0u32..5 {
+            d.record_tick(id, ExchangeSegment::IdxI, t0);
+        }
+        // Advance 60s — all 5 entries are silent.
+        let now = t0 + Duration::from_secs(60);
+        let (entries, total) = d.scan_gaps_top_n(now, 0);
+        assert!(entries.is_empty());
+        assert_eq!(total, 5);
+    }
+
+    #[test]
+    fn test_scan_gaps_top_n_caps_returned_entries() {
+        let d = TickGapDetector::new(30);
+        let t0 = Instant::now();
+        // Record 100 instruments silent for varying durations.
+        for id in 0u32..100 {
+            d.record_tick(id, ExchangeSegment::IdxI, t0);
+        }
+        let now = t0 + Duration::from_secs(60);
+        let (entries, total) = d.scan_gaps_top_n(now, 10);
+        // total must reflect the FULL silent count even when capped.
+        assert_eq!(total, 100);
+        // entries must be capped at 10.
+        assert!(entries.len() <= 10);
+    }
+
+    #[test]
+    fn test_scan_gaps_top_n_returns_largest_gaps_first() {
+        let d = TickGapDetector::new(30);
+        let t_base = Instant::now();
+        // 5 entries with different last-seen times → different gaps.
+        d.record_tick(1, ExchangeSegment::IdxI, t_base);
+        d.record_tick(2, ExchangeSegment::IdxI, t_base + Duration::from_secs(30));
+        d.record_tick(3, ExchangeSegment::IdxI, t_base + Duration::from_secs(60));
+        d.record_tick(4, ExchangeSegment::IdxI, t_base + Duration::from_secs(90));
+        d.record_tick(5, ExchangeSegment::IdxI, t_base + Duration::from_secs(120));
+        // Now scan at t_base + 150s. Gaps: 150, 120, 90, 60, 30.
+        let now = t_base + Duration::from_secs(150);
+        let (entries, total) = d.scan_gaps_top_n(now, 3);
+        assert_eq!(total, 5);
+        assert_eq!(entries.len(), 3);
+        // Largest-first order.
+        assert!(entries[0].2 >= entries[1].2);
+        assert!(entries[1].2 >= entries[2].2);
+        // Top-3 should be ids 1, 2, 3 (gaps 150, 120, 90).
+        assert_eq!(entries[0].0, 1);
+    }
+
+    #[test]
+    fn test_scan_gaps_top_n_bounded_when_universe_silent() {
+        // Wave-2-D Fix 4 — the killer test: 5000 silent instruments,
+        // cap=64. Returned Vec must be at most 64. This is the
+        // operator-visible "universe-wide silence" scenario.
+        let d = TickGapDetector::new(30);
+        let t0 = Instant::now();
+        for id in 0u32..5000 {
+            d.record_tick(id, ExchangeSegment::IdxI, t0);
+        }
+        let now = t0 + Duration::from_secs(60);
+        let (entries, total) = d.scan_gaps_top_n(now, TICK_GAP_TOP_N_DEFAULT);
+        assert_eq!(total, 5000);
+        assert!(entries.len() <= TICK_GAP_TOP_N_DEFAULT);
+    }
+
+    #[test]
+    fn test_scan_gaps_top_n_skips_fresh_instruments_below_threshold() {
+        let d = TickGapDetector::new(30);
+        let t0 = Instant::now();
+        d.record_tick(1, ExchangeSegment::IdxI, t0);
+        d.record_tick(2, ExchangeSegment::IdxI, t0);
+        // 10s later — no gaps yet.
+        let now = t0 + Duration::from_secs(10);
+        let (entries, total) = d.scan_gaps_top_n(now, 10);
+        assert!(entries.is_empty());
+        assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn test_tick_gap_top_n_default_is_64() {
+        // Pin the constant — a future "let's bump to 1024" PR is
+        // forced to update tests + dashboards together.
+        assert_eq!(TICK_GAP_TOP_N_DEFAULT, 64);
     }
 
     #[test]
