@@ -106,9 +106,13 @@ pub async fn append_ws_reconnect_audit_row(
     let dc = disconnect_code
         .map(|v| v.to_string())
         .unwrap_or_else(|| "NULL".to_string());
+    // QuestDB TIMESTAMP columns store microseconds since epoch. The
+    // caller passes IST wall-clock nanoseconds; divide by 1_000 before
+    // embedding so the value stays in the QuestDB year-9999 range.
+    let ts_micros_ist = ts_nanos_ist / 1_000;
     let sql = format!(
         "INSERT INTO {QUESTDB_TABLE_WS_RECONNECT_AUDIT} (ts, feed, connection_id, attempt, outcome, disconnect_code, reason) VALUES \
-         ({ts_nanos_ist}, '{feed_esc}', {connection_id}, {attempt}, '{outcome_esc}', {dc}, '{reason_esc}');"
+         ({ts_micros_ist}, '{feed_esc}', {connection_id}, {attempt}, '{outcome_esc}', {dc}, '{reason_esc}');"
     );
     let resp = client
         .get(&base_url)
@@ -178,5 +182,16 @@ mod tests {
             "DataAPI-807 token expired",
         )
         .await;
+    }
+
+    /// Regression: 2026-04-28 — see phase2_audit_persistence.rs for the
+    /// nanos-to-micros bug class. Source-scan ratchet locks the fix.
+    #[test]
+    fn test_insert_sql_uses_microseconds_not_nanoseconds() {
+        let src = include_str!("ws_reconnect_audit_persistence.rs");
+        assert!(
+            src.contains("ts_micros_ist = ts_nanos_ist / 1_000"),
+            "INSERT must convert nanos to micros before embedding"
+        );
     }
 }
