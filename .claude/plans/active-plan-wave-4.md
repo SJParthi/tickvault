@@ -183,33 +183,65 @@ Commit 2 — AWS schedule update
 
 ## Wave-4-E1 SCOPE — Worst-case A + B (process/container/network)
 
+**Canonical scenario list:** `.claude/plans/wave-4-worst-case-A-B.md` (11 scenarios A1–A7 + B1–B4).
+
 | Aspect | Value |
 |---|---|
 | Categories | A. Process/container (7 scenarios) ; B. Network (4 scenarios) |
 | New Prom counters | `tv_oom_kills_total` (cgroup memory.events scrape), `tv_ip_changed_total` (wired to `crates/core/src/network/ip_monitor.rs`), `tv_app_image_sha_changed_total` |
 | New tables | `app_image_audit(boot_ts, image_sha, git_commit, version)` DEDUP UPSERT KEYS(boot_ts, image_sha) |
 | New ErrorCodes | `PROC-01` OOM kill detected, `PROC-02` container restart loop, `NET-01` IP changed mid-session, `NET-02` DNS resolution failure cascade |
-| Chaos tests | `chaos_oom_kill_recovery.rs`, `chaos_container_restart_loop.rs`, `chaos_ip_change_mid_session.rs`, `chaos_dns_resolution_storm.rs`, `chaos_app_image_drift.rs` |
-| Doc | `.claude/rules/project/wave-4-error-codes.md` (NEW) — runbook for each |
+| Chaos tests | `chaos_oom_kill_recovery.rs`, `chaos_container_restart_loop.rs`, `chaos_ip_change_mid_session.rs`, `chaos_dns_resolution_storm.rs`, `chaos_app_image_drift.rs`, `chaos_ws_task_panic.rs`, `chaos_tls_handshake_failure.rs`, `chaos_network_partition.rs`, `chaos_dual_instance.rs` (overlaps E3-I1) |
+| Doc | `.claude/rules/project/wave-4-error-codes.md` runbook fleshed-out for each |
 
 ## Wave-4-E2 SCOPE — Worst-case C + D + E (storage/auth/Dhan-API)
+
+**Canonical scenario list:** `.claude/plans/wave-4-worst-case-C-D-E.md` (16 scenarios C1–C6 + D1–D4 + E1–E6).
 
 | Aspect | Value |
 |---|---|
 | Categories | C. Storage (6) ; D. Auth (4) ; E. Dhan-API (6) |
 | New Prom counters | `tv_disk_full_total`, `tv_subscribed_no_data_total{security_id}` (gauge with TTL), `tv_token_external_rotation_detected_total` |
 | New ErrorCodes | `STORAGE-GAP-05` disk-full pre-flight failed, `AUTH-GAP-04` TOTP secret rotated externally, `DH-911` Dhan API silent black-hole (subscribe accepted, no data) |
-| Chaos tests | `chaos_disk_full_during_spill.rs`, `chaos_questdb_partition_corruption.rs`, `chaos_token_external_rotation.rs`, `chaos_dhan_subscribe_blackhole.rs`, `chaos_dhan_partial_response.rs` |
+| Chaos tests | `chaos_disk_full_during_spill.rs`, `chaos_questdb_partition_corruption.rs`, `chaos_token_external_rotation.rs`, `chaos_dhan_subscribe_blackhole.rs`, `chaos_dhan_partial_response.rs`, `chaos_csv_column_rename.rs`, `chaos_unknown_exchange_segment.rs`, `chaos_spill_file_growth.rs` |
 
 ## Wave-4-E3 SCOPE — Worst-case F + G + H + I + J
+
+**Canonical scenario list:** `.claude/plans/wave-4-worst-case-F-G-H-I-J.md` (27 scenarios F1–F7 + G1–G5 + H1–H6 + I1–I4 + J1–J5).
 
 | Aspect | Value |
 |---|---|
 | Categories | F. Time/calendar (7) ; G. Resource (5) ; H. Operator error (6) ; I. Resilience cascade (4) ; J. Idempotency (5) |
 | New Prom counters | `tv_trades_on_declared_holiday_total`, `tv_fd_count` (gauge), `tv_resident_memory_bytes` (gauge), `tv_spill_file_size_bytes` (gauge), `tv_dhan_client_id_changed_total`, `tv_dual_instance_detected_total` |
-| New ErrorCodes | `TIME-01` trade attempted on declared holiday, `RESOURCE-01..03` (FD / mem / spill thresholds), `OPER-01` client-ID changed in config, `RESILIENCE-01` dual-instance detected, `RESILIENCE-02` mid-rebalance crash recovered, `CASCADE-01` triple-failure recovery, `IDEMP-01..05` idempotency guard breaches |
-| Chaos tests | 8 (one per cascade scenario) |
-| Recovery primitive | `subscription_audit` replay-on-boot for mid-rebalance crash; `dual_instance_detector` via QuestDB UPSERT-on-host-id |
+| New ErrorCodes | `TIME-01` trade attempted on declared holiday, `TIME-02` clock rollback detected (F7), `RESOURCE-01..03` (FD / mem / spill thresholds), `OPER-01` client-ID changed in config, `OPER-02` wrong-env config, `RESILIENCE-01` dual-instance detected, `RESILIENCE-02` mid-rebalance crash recovered, `CASCADE-01` triple-failure recovery, `IDEMP-01..05` idempotency guard breaches |
+| Chaos tests | `chaos_trade_on_holiday.rs`, `chaos_clock_rollback.rs`, `chaos_fd_exhaustion.rs`, `chaos_memory_pressure.rs`, `chaos_client_id_drift.rs`, `chaos_wrong_env_config.rs`, `chaos_concurrent_web_order.rs`, `chaos_dual_instance.rs`, `chaos_mid_rebalance_crash.rs`, `chaos_triple_failure.rs`, `chaos_recovery_storm.rs`, `chaos_order_idempotency_breach.rs`, `chaos_instrument_master_drift.rs`, `chaos_depth_rebalance_double_fire.rs`, `chaos_historical_state_regression.rs` |
+| Recovery primitive | `subscription_audit` replay-on-boot for mid-rebalance crash; `live_instance_lock` UPSERT-on-client-id for dual-instance |
+
+## Cross-Cutting Reconciliation
+
+Wave 4 interacts with these existing artifacts. Sub-PR sessions MUST consult them:
+
+| Existing artifact | Wave 4 interaction |
+|---|---|
+| `.claude/plans/active-plan.md` (Wave-1-3 hotfixes) | Item 8 (depth-200 bridge Docker/Grafana/Prom) STILL OPEN. Touches the depth subsystem Wave-4-D rebuilds. **Wave-4-D session must check active-plan.md item 8 status before opening PR — if item 8 is still open, coordinate Docker compose changes.** |
+| `.claude/plans/active-plan-100pct-slo.md` | Item 7 (boot-decision) and Item 8 (pre-open self-test) feed new sub-gauges into the SLO score. **Wave-4-B + Wave-4-C sessions extend `slo_score.rs::evaluate_slo_score` with the new dimensions.** |
+| `.claude/plans/active-plan-cross-cutting.md` | Cross-cutting performance/observability work. **No direct conflict, but Wave-4-D's Criterion bench must respect the existing budget table.** |
+| `.claude/plans/active-plan-gaps.md` | Tracks open audit-findings gaps. **Wave-4-E3's IDEMP-01..05 close idempotency gaps listed there.** |
+| `.claude/plans/active-plan-proof-matrix.md` | "100% inside the tested envelope" matrix. **Every Wave 4 ratchet test added to the matrix on PR merge.** |
+| `.claude/plans/active-plan-realtime-slo.md` | Realtime SLO score Item 13 already shipped. **Wave-4-B/C extend it; Wave-4-D adds new dimensions.** |
+| `.claude/rules/project/depth-subscription.md` | Section "Stock F&O Expiry Rollover" — **Wave-4-A must update from "≤ 1" to "== 0".** |
+| `.claude/rules/project/aws-budget.md` | EC2 cron table — **Wave-4-C must update + recompute monthly bill (must remain ≤ ₹5,000/mo).** |
+| `.claude/rules/project/historical-candles-cross-verify.md` | Cross-verify section — **Wave-4-B commit 5 must reaffirm 100% threshold + add skip-on-fresh policy.** |
+| `.claude/rules/project/live-market-feed-subscription.md` | Subscription scope — **Wave-4-D must add "Dynamic depth-20 top-150 OPTION" subsection.** |
+| `.claude/rules/project/disaster-recovery.md` | Add Wave-4-E1/E2/E3 worst-case scenarios as new entries 16–69 (catalog grows from current 15). |
+
+## Known Pre-existing Issues (Wave 4 sub-PRs MUST address before merge)
+
+1. **`dedup_uniqueness_proptest` flaky/broken** — observed on this PR's pre-commit gate 2026-04-28T11:25 IST. Did not block this docs-only commit, but every Wave 4 .rs commit will hit it. **Wave-4-A is the smallest .rs change; that session investigates root cause first.**
+
+2. **Item 8 in `active-plan.md` (depth-200 bridge ops)** — Status PARTIALLY-VERIFIED. Wave-4-D depth subsystem changes risk merge conflict. **Wave-4-D session checks-in before opening PR.**
+
+3. **Recent dependabot vulnerabilities** — push of this PR surfaced "6 vulnerabilities (2 high, 4 low)" on default branch. **Out of scope for Wave 4 plan PR; flag for separate security-review session.**
 
 ## How to deliver
 
