@@ -1862,6 +1862,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_severity_as_label_returns_lowercase_string() {
+        assert_eq!(Severity::Info.as_label(), "info");
+        assert_eq!(Severity::Low.as_label(), "low");
+        assert_eq!(Severity::Medium.as_label(), "medium");
+        assert_eq!(Severity::High.as_label(), "high");
+        assert_eq!(Severity::Critical.as_label(), "critical");
+    }
+
+    #[test]
     fn test_topic_returns_static_str_for_each_variant_kind() {
         // Spot-check across all severities + several event kinds. The
         // returned string is a `&'static str` literal — Rust will not

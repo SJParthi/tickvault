@@ -544,6 +544,19 @@ mod tests {
     }
 
     #[test]
+    fn test_observe_returns_bypass_for_high_and_critical() {
+        let c = make_coalescer(60_000);
+        assert_eq!(
+            c.observe("X", Severity::Critical, || "x".to_string()),
+            CoalesceDecision::Bypass
+        );
+        assert_eq!(
+            c.observe("X", Severity::High, || "x".to_string()),
+            CoalesceDecision::Bypass
+        );
+    }
+
+    #[test]
     fn test_default_config_sane() {
         let c = CoalescerConfig::default();
         assert_eq!(c.window, Duration::from_secs(60));

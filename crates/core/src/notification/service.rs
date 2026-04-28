@@ -1646,6 +1646,17 @@ mod tests {
     // Wave 3-B Item 11 — coalescer wiring
     // -----------------------------------------------------------------------
 
+    #[tokio::test]
+    async fn test_coalescer_enabled_returns_true_after_enable_call() {
+        let service = NotificationService::disabled();
+        assert!(!service.coalescer_enabled());
+        let upgraded = NotificationService::enable_coalescer(
+            service,
+            super::super::coalescer::CoalescerConfig::default(),
+        );
+        assert!(upgraded.coalescer_enabled());
+    }
+
     #[test]
     fn test_default_service_has_no_coalescer() {
         let service = NotificationService::build(NotificationMode::NoOp);
