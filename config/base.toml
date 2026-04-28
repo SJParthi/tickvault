@@ -353,10 +353,11 @@ realtime_guarantee_score = true     # Item 13 — composite SLO score gauge
 # tokens (our TOTP/automated flow) but accepts SELF-type tokens
 # (operator-pasted from web.dhan.co). Default `mode = "totp_app"`
 # keeps the existing behavior — no change unless the operator flips
-# this to "manual_self_with_renewal" AND populates the cache file.
+# this to "manual_self_with_renewal" AND populates the SSM parameter.
+# Per CLAUDE.md "always real AWS SSM" — no local-disk fallback.
 # See docs/dhan-support/2026-04-28-depth-200-app-vs-self-token.md.
 [depth_200_auth]
 mode = "totp_app"
-cache_path = "data/cache/depth-200-self-token-cache"
+ssm_parameter_name = "/tickvault/dev/dhan/depth_200_self_token"
 renewal_interval_secs = 82800        # 23h — fires before 24h JWT expiry
-min_remaining_secs_at_boot = 3600    # accept cached token if >= 1h left
+min_remaining_secs_at_boot = 3600    # accept SSM token if >= 1h validity left
