@@ -1,6 +1,6 @@
 # Implementation Plan: Wave-1-3 Live Hotfixes (4 bugs caught at 12:49 IST 2026-04-28)
 
-**Status:** VERIFIED
+**Status:** PARTIALLY-VERIFIED (items 1-5, 6, 7, 9, 10 shipped; item 8 Docker/Grafana deferred to follow-up commit)
 **Date:** 2026-04-28
 **Approved by:** Parthiban (operator) — verbatim "fix everything"
 **Branch:** `claude/verify-waves-status-HQP6A`
@@ -43,6 +43,37 @@
   - Tests: test_zero_priced_levels_are_skipped
   - Tests: test_ilp_line_format_matches_questdb_schema
   - Tests: test_levels_are_one_indexed
+
+- [x] **6. Rust DepthBridgeStateWriter** (writes data/depth-200-bridge/state.json atomically at boot + on rebalance Swap200)
+  - Files: crates/app/src/depth_bridge_state_writer.rs
+  - Files: crates/app/src/main.rs
+  - Tests: test_atomic_write_via_tempfile_rename
+  - Tests: test_version_monotonic_increment
+  - Tests: test_state_writer_wired_at_boot_and_rebalance
+
+- [x] **7. Prometheus metrics endpoint in Python bridge** (frames_total, reconnects_total, ilp_writes_total, state_reloads_total, active_subs, state_version)
+  - Files: scripts/depth_200_bridge.py
+  - Files: scripts/test_depth_200_bridge.py
+  - Tests: test_metrics_endpoint_serves_prometheus_format
+  - Tests: test_counters_increment_on_frame_parse
+  - Tests: test_state_version_gauge_tracks_reloads
+
+- [ ] **8. Docker compose service + Grafana panel + Prometheus alert rule for the bridge**
+  - Files: deploy/docker/docker-compose.yml
+  - Files: deploy/docker/prometheus/alerts.yml
+  - Files: deploy/docker/prometheus/prometheus.yml
+  - Files: deploy/docker/grafana/dashboards/depth-200-bridge.json
+  - Tests: test_alerts_yml_contains_depth_200_bridge_rules
+  - Tests: test_prometheus_yml_scrapes_depth_200_bridge
+
+- [x] **9. Disk-full pre-flight check before tick spill writes** (closes single highest-risk hole in zero-loss chain)
+  - Files: crates/storage/src/tick_persistence.rs
+  - Tests: test_spill_aborts_when_free_bytes_below_threshold
+
+- [x] **10. Lift depth-200 60-attempt cap** (use WS-GAP-04 sleep gate pattern — never give up in-market, sleep until next open out-of-market)
+  - Files: crates/core/src/websocket/depth_connection.rs
+  - Tests: test_depth_200_never_gives_up_in_market_hours
+  - Tests: test_depth_200_sleeps_until_next_open_after_close
 
 ## Verification
 

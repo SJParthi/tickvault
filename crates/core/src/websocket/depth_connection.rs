@@ -117,10 +117,33 @@ async fn depth_post_close_sleep_or_exhaust(
         }
         return Ok(());
     }
-    Err(super::WebSocketError::ReconnectionExhausted {
-        connection_id: 0,
-        attempts: attempt.min(u64::from(u32::MAX)) as u32,
-    })
+    // In-market: NEVER give up. Mirrors the main-feed WS-GAP-04
+    // never-give-up pattern (`connection.rs::wait_with_backoff`). The
+    // caller resets the attempt counter and keeps retrying with
+    // exponential backoff. We fire a CRITICAL Telegram so the operator
+    // knows the bridge has been struggling for ~30 min, but we do NOT
+    // exit the task — that would silently abandon depth-200 for the
+    // rest of the trading day. Replaces the legacy `ReconnectionExhausted`
+    // terminal error which would propagate up and terminate the
+    // connection task in-market.
+    tracing::error!(
+        attempt,
+        feed = feed_label,
+        connection_index,
+        "{feed_label}: in-market reconnection budget exhausted ({attempt} attempts) — \
+         resetting counter and continuing per WS-GAP-04 never-give-up pattern"
+    );
+    metrics::counter!(
+        "tv_ws_depth_in_market_budget_exhausted_total",
+        "feed" => feed_label,
+    )
+    .increment(1);
+    // The `error!` log above already routes to Telegram via Loki ERROR
+    // routing, so an additional Custom notify event would just be a noisy
+    // duplicate. Suppress the second notification — operator has already
+    // been paged by the error log.
+    let _ = notifier; // currently unused on this in-market budget-exhausted branch
+    Ok(())
 }
 
 use bytes::Bytes;
