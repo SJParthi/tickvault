@@ -870,6 +870,125 @@ groups:
         labels:
           severity: critical
 
+      # Wave-2-D: audit-table write failure (any of 6 audit tables)
+      # Coalesces AUDIT-01..06 + STORAGE-GAP-03. Operator gets 1 page
+      # rather than 6.
+      - uid: tv-audit-write-failure
+        title: "Wave-2-D: audit-table write failure (any of 6 tables)"
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model:
+              expr: "rate(tv_audit_write_failures_total[5m])"
+              intervalMs: 15000
+              maxDataPoints: 43200
+          - refId: B
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                # > 1 failure per minute (= 0.0167/sec) sustained 5 min.
+                - evaluator: { type: gt, params: [0.0167] }
+        noDataState: OK
+        execErrState: Alerting
+        for: 5m
+        annotations:
+          summary: "HIGH: audit table write failure rate > 1/min"
+          description: "tv_audit_write_failures_total rate > 1/min for 5 min. One of phase2_audit / depth_rebalance_audit / ws_reconnect_audit / boot_audit / selftest_audit / order_audit cannot persist to QuestDB. SEBI audit trail at risk. Check docker compose ps tv-questdb and disk space on the QuestDB volume."
+        labels:
+          severity: high
+          wave: "2-d"
+
+      # Wave-2-D: S3 archive failure (Glacier upload from partition manager)
+      - uid: tv-s3-archive-failure
+        title: "Wave-2-D: S3 archive failure (audit partition upload)"
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 3600, to: 0 }
+            datasourceUid: prometheus
+            model:
+              expr: "increase(tv_s3_archive_errors_total[1h])"
+              intervalMs: 60000
+              maxDataPoints: 43200
+          - refId: B
+            relativeTimeRange: { from: 3600, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            relativeTimeRange: { from: 3600, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                # ANY S3 archive failure in the last hour pages the operator.
+                - evaluator: { type: gt, params: [0] }
+        noDataState: OK
+        execErrState: Alerting
+        for: 0m
+        annotations:
+          summary: "HIGH: S3 archive of audit partition failed"
+          description: "tv_s3_archive_errors_total increased in the last hour. A QuestDB partition could not be uploaded to S3 Intelligent-Tiering / Glacier IR / Deep Archive. SEBI 5-year retention at risk for order_audit partitions. Check AWS credentials and S3 bucket reachability via `aws s3 ls s3://tickvault-audit/`."
+        labels:
+          severity: high
+          wave: "2-d"
+
+      # Wave-2-D: tick-gap coalesce-task storm (catastrophic universe-wide silence)
+      - uid: tv-tick-gap-coalesce-storm
+        title: "Wave-2-D: tick-gap coalesce-task storm (>100 summaries/min)"
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 60, to: 0 }
+            datasourceUid: prometheus
+            model:
+              expr: "rate(tv_tick_gap_summary_total[1m])"
+              intervalMs: 15000
+              maxDataPoints: 43200
+          - refId: B
+            relativeTimeRange: { from: 60, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            relativeTimeRange: { from: 60, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                # > 100 summaries/min (= 1.67/sec) — the coalesce task
+                # fires once per 60s, so this can only happen if the
+                # coalesce loop itself is mis-configured or if the
+                # universe is ~entirely silent. Either way, page.
+                - evaluator: { type: gt, params: [1.67] }
+        noDataState: OK
+        execErrState: Alerting
+        for: 1m
+        annotations:
+          summary: "MEDIUM: tick-gap coalesce summaries firing > 100/min"
+          description: "tv_tick_gap_summary_total rate > 100/min sustained for 1 min. Either the coalesce task is mis-spawning (multiple instances?) or the entire universe is silent (Dhan outage). Investigate via tail data/logs/errors.jsonl.* | jq 'select(.code == \"WS-GAP-06\")'."
+        labels:
+          severity: medium
+          wave: "2-d"
+
       # Pool watchdog fired a halt (process exit expected).
       - uid: tv-pool-halted
         title: "A4: WebSocket pool halted (process restart expected)"
