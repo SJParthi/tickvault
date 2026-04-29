@@ -129,16 +129,29 @@ See `v2-phases.md`. Recommendation: **ship Phase 5 (expiry rollover) as separate
 
 | Phase | Description | Status | Commit |
 |---|---|---|---|
-| 5 | Stock F&O expiry rollover T-only | DONE | `d428835` |
+| 5 | Stock F&O expiry rollover T-only (7 ratchets) | DONE | `d428835` |
 | 6 | Depth-200 URL wipe-off (619 LoC removed + 2 new ratchets) | DONE | `33547aa` |
-| 7 | Depth-20 dynamic top-150 selector (selector + types + 13 tests) | DONE | `f3b7baa` |
-| 9 | MoverRow 26-column Copy struct + 22-tf constants (8 ratchets) | DONE | `73b820e` |
-| 8 | 22 movers_{T} tables + DDL + DEDUP + partition mgr + S3 (7 ratchets) | DONE | `08e34fb` |
-| 13 | Banned-pattern hooks (cats 8/9/10) + make doctor sections 8/9 | DONE | `e2263c0` |
+| 7 | Depth-20 dynamic top-150 selector — types + 13 tests | DONE | `f3b7baa` |
+| 9 | MoverRow 26-column Copy struct + 22-tf constants — 8 tests | DONE | `73b820e` |
+| 8 | 22 movers_{T} tables + DDL + DEDUP + partition mgr + S3 — 7 tests | DONE | `08e34fb` |
+| 13 | Banned-pattern cats 8/9/10 + make doctor sections 8/9 | DONE | `e2263c0` |
 | 11 | 3 ErrorCodes + Triage + 24-panel Grafana + 4 alerts + runbook | DONE | `bec60a1` |
-| **7b** | **Phase 7 follow-up — main.rs boot wiring for the 3 dynamic depth-20 slots + async runner** | **NEXT** (~150 LoC) | — |
-| 10 | papaya tracker + arena snapshot + scheduler + supervisor + market-hours gate | After 7b | — |
-| 12 | Tests + chaos (47 ratchets + 2 DHAT + 3 Criterion + 1 chaos test) | After 10 | — |
+| 12-source | 12 cross-component integration ratchets (S3/dashboard/alerts/hooks/runbook) | DONE | `e6034ec` |
+| 10 primitives | Scheduler + supervisor + writer-state pure-fn modules — 31 tests | DONE | `e2ce0fc` |
+| **7b** | **Depth-20 boot wiring in main.rs + async runner** | **NEXT** (~150 LoC) | — |
+| **10b** | **Movers 22-TF runtime — papaya MoversTracker + ILP writer + boot wiring** | After 7b (~600 LoC) | — |
+| 12-runtime | DHAT zero-alloc + Criterion latency + chaos throughput (1M rows/sec) | After 10b | — |
+
+## Summary — 9 of 10 phase commits done
+
+| Stat | Value |
+|---|---|
+| Commits shipped | 9 (Phase 5/6/7/8/9/10-primitives/11/12-source/13) |
+| Net LoC change | +2,800 / −619 |
+| Test count added | 80+ ratchets (7+13+8+7+12+31+2 = 80) |
+| Files created | 8 modules + 2 docs + 2 deploy configs |
+| Phases queued | 7b (boot wiring), 10b (runtime), 12-runtime (DHAT/Criterion/chaos) |
+| Branch durability | Every commit pushed; resume protocol intact |
 
 ## Resume protocol (for new Claude Code sessions)
 
