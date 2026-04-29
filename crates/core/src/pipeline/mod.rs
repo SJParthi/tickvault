@@ -13,6 +13,7 @@ pub mod first_seen_set;
 pub mod mover_classifier;
 pub mod movers_22tf_scheduler;
 pub mod movers_22tf_supervisor;
+pub mod movers_22tf_tracker;
 pub mod movers_22tf_writer_state;
 pub mod movers_window;
 pub mod no_tick_watchdog;
