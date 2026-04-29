@@ -164,6 +164,62 @@ pub fn split_into_slots(
     slots
 }
 
+/// Parses a QuestDB `/exec` JSON response body into a HashSet of contract
+/// keys. The expected response shape is QuestDB's standard 2-column dataset:
+///
+/// ```json
+/// { "dataset": [[12345, "D"], [67890, "D"], ...] }
+/// ```
+///
+/// Each row carries `[security_id, segment]`. `segment` is a string but we
+/// stored `'D'` for NSE_FNO at write time (per `OptionMoversWriter`); here
+/// we just take the first character.
+///
+/// Returns an empty set on malformed JSON; the caller's
+/// `check_set_emptiness` will route the empty set to the `Depth20Dyn01`
+/// Telegram alert with reason `"zero_results"` or `"below_slot_capacity"`.
+///
+/// Pure function: no I/O. The HTTP fetch lives in the async runner and
+/// passes the body string to this parser.
+#[must_use]
+pub fn parse_questdb_dataset_json(body: &str) -> HashSet<DynamicContractKey> {
+    let parsed: serde_json::Value = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(_) => return HashSet::new(),
+    };
+    let Some(rows) = parsed.get("dataset").and_then(|v| v.as_array()) else {
+        return HashSet::new();
+    };
+    let mut out: HashSet<DynamicContractKey> = HashSet::with_capacity(DEPTH_20_DYNAMIC_TOP_N);
+    for row in rows {
+        let Some(arr) = row.as_array() else { continue };
+        if arr.len() < 2 {
+            continue;
+        }
+        // QuestDB INT columns serialize as JSON numbers; SYMBOL as strings.
+        let Some(sec_id) = arr[0].as_i64() else {
+            continue;
+        };
+        if sec_id <= 0 || sec_id > i64::from(u32::MAX) {
+            continue;
+        }
+        let Some(seg) = arr[1].as_str() else { continue };
+        let Some(seg_char) = seg.chars().next() else {
+            continue;
+        };
+        out.insert((sec_id as u32, seg_char));
+    }
+    out
+}
+
+/// Builds the QuestDB `/exec` URL for a given host + http port. Public for
+/// tests + main.rs wiring; the async runner uses this once at boot to
+/// avoid re-formatting per query.
+#[must_use]
+pub fn questdb_exec_url(host: &str, http_port: u16) -> String {
+    format!("http://{host}:{http_port}/exec")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -364,6 +420,72 @@ mod tests {
         assert!(
             DEPTH_20_DYNAMIC_SELECTOR_SQL.contains(extracted_limit_str),
             "selector SQL LIMIT must equal DEPTH_20_DYNAMIC_TOP_N ({DEPTH_20_DYNAMIC_TOP_N})"
+        );
+    }
+
+    /// Phase 7b ratchet: parser handles the canonical QuestDB 2-column
+    /// dataset shape.
+    #[test]
+    fn test_parse_questdb_dataset_json_normal_response() {
+        let body = r#"{"query":"...","columns":[{"name":"security_id","type":"INT"},{"name":"segment","type":"SYMBOL"}],"dataset":[[1001,"D"],[1002,"D"],[1003,"D"]],"count":3}"#;
+        let parsed = parse_questdb_dataset_json(body);
+        assert_eq!(parsed.len(), 3);
+        assert!(parsed.contains(&(1001u32, 'D')));
+        assert!(parsed.contains(&(1002u32, 'D')));
+        assert!(parsed.contains(&(1003u32, 'D')));
+    }
+
+    /// Phase 7b ratchet: malformed JSON returns empty set (not panic).
+    #[test]
+    fn test_parse_questdb_dataset_malformed_json_returns_empty() {
+        assert!(parse_questdb_dataset_json("not json").is_empty());
+        assert!(parse_questdb_dataset_json("").is_empty());
+        assert!(parse_questdb_dataset_json("{}").is_empty());
+        assert!(parse_questdb_dataset_json(r#"{"dataset":null}"#).is_empty());
+    }
+
+    /// Phase 7b ratchet: rows with missing / invalid security_id are
+    /// silently dropped (not crash the loop).
+    #[test]
+    fn test_parse_questdb_dataset_drops_invalid_rows() {
+        let body = r#"{"dataset":[[1001,"D"],[null,"D"],[-5,"D"],[0,"D"],[1002,"D"]]}"#;
+        let parsed = parse_questdb_dataset_json(body);
+        // Only 1001 and 1002 are valid (positive non-zero u32).
+        assert_eq!(parsed.len(), 2);
+        assert!(parsed.contains(&(1001u32, 'D')));
+        assert!(parsed.contains(&(1002u32, 'D')));
+    }
+
+    /// Phase 7b ratchet: dedup by (security_id, segment) per I-P1-11 — if
+    /// the same row appears twice the HashSet collapses it.
+    #[test]
+    fn test_parse_questdb_dataset_dedupes_duplicates() {
+        let body = r#"{"dataset":[[1001,"D"],[1001,"D"],[1001,"D"]]}"#;
+        let parsed = parse_questdb_dataset_json(body);
+        assert_eq!(parsed.len(), 1);
+        assert!(parsed.contains(&(1001u32, 'D')));
+    }
+
+    /// Phase 7b ratchet: u32 max boundary handled cleanly (no overflow).
+    #[test]
+    fn test_parse_questdb_dataset_u32_max_boundary() {
+        let max_u32 = u32::MAX as u64;
+        let body = format!(r#"{{"dataset":[[{max_u32},"D"]]}}"#);
+        let parsed = parse_questdb_dataset_json(&body);
+        assert_eq!(parsed.len(), 1);
+        assert!(parsed.contains(&(u32::MAX, 'D')));
+    }
+
+    /// Phase 7b ratchet: questdb_exec_url assembly format.
+    #[test]
+    fn test_questdb_exec_url_format() {
+        assert_eq!(
+            questdb_exec_url("tv-questdb", 9000),
+            "http://tv-questdb:9000/exec"
+        );
+        assert_eq!(
+            questdb_exec_url("127.0.0.1", 9000),
+            "http://127.0.0.1:9000/exec"
         );
     }
 }
