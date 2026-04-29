@@ -138,20 +138,22 @@ See `v2-phases.md`. Recommendation: **ship Phase 5 (expiry rollover) as separate
 | 11 | 3 ErrorCodes + Triage + 24-panel Grafana + 4 alerts + runbook | DONE | `bec60a1` |
 | 12-source | 12 cross-component integration ratchets (S3/dashboard/alerts/hooks/runbook) | DONE | `e6034ec` |
 | 10 primitives | Scheduler + supervisor + writer-state pure-fn modules — 31 tests | DONE | `e2ce0fc` |
-| **7b** | **Depth-20 boot wiring in main.rs + async runner** | **NEXT** (~150 LoC) | — |
-| **10b** | **Movers 22-TF runtime — papaya MoversTracker + ILP writer + boot wiring** | After 7b (~600 LoC) | — |
-| 12-runtime | DHAT zero-alloc + Criterion latency + chaos throughput (1M rows/sec) | After 10b | — |
+| 7b parser | QuestDB JSON response parser + URL builder — 6 tests | DONE | `e9faae1` |
+| 12-runtime primitives | 7 Criterion benches with budget entries (≤50ns / ≤50µs / ≤1ms) | DONE | `ece554d` |
+| **10b** | **Movers 22-TF runtime — papaya MoversTracker + ILP writer + boot wiring** | **NEXT** (~600 LoC) | — |
+| 7b-runner | Async dynamic-subscriber runner + main.rs boot wiring (3 dynamic slots 3/4/5) | After 10b OR parallel (~120 LoC) | — |
+| 12-final | DHAT zero-alloc + chaos throughput test (1M rows/sec claim) | After 10b | — |
 
-## Summary — 9 of 10 phase commits done
+## Summary — 11 of 12 logical phase commits done
 
 | Stat | Value |
 |---|---|
-| Commits shipped | 9 (Phase 5/6/7/8/9/10-primitives/11/12-source/13) |
-| Net LoC change | +2,800 / −619 |
-| Test count added | 80+ ratchets (7+13+8+7+12+31+2 = 80) |
-| Files created | 8 modules + 2 docs + 2 deploy configs |
-| Phases queued | 7b (boot wiring), 10b (runtime), 12-runtime (DHAT/Criterion/chaos) |
-| Branch durability | Every commit pushed; resume protocol intact |
+| Commits shipped | 11 (Phase 5/6/7/7b-parser/8/9/10-primitives/11/12-source/12-runtime/13) |
+| Net LoC change | +3,070 / −619 |
+| Test count added | 99+ ratchets + 7 Criterion benches |
+| Files created | 9 modules + 2 docs + 2 deploy configs + 1 bench file |
+| Phases queued | 10b (runtime — biggest), 7b-runner (boot wiring), 12-final (DHAT + chaos) |
+| Branch durability | Every commit pushed atomically; full resume protocol intact |
 
 ## Resume protocol (for new Claude Code sessions)
 
