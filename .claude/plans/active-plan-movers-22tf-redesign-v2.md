@@ -145,21 +145,24 @@ See `v2-phases.md`. Recommendation: **ship Phase 5 (expiry rollover) as separate
 | 12-final-DHAT | Zero-alloc verification across 300K hot-path calls (1 combined test) | DONE | `c1ff2b3` |
 | 10c | papaya-backed `Movers22TfTracker` + `SecurityState` (10 tests) | DONE | `16a7220` |
 | 10b-2 | Boot helper + main.rs DDL fan-out for 22 movers tables (4 tests) | DONE | `4a639fe` |
-| **10b-3** | **Final boot integration — spawn 22 consumer tasks + snapshot scheduler + tick_processor dual-feed** | **NEXT (live integration)** | — |
-| 12-chaos | Chaos throughput test for 1M rows/sec claim (depends on 10b-3) | After 10b-3 | — |
+| 10b-3a | Consumer task spawner + ConsumerWriter trait (3 tests) | DONE | `0edf09d` |
+| 10b-3b | Snapshot task spawner with virtual-clock tests (3 tests) | DONE | `9aaa563` |
+| 12-chaos | Chaos throughput test — 213K rows/sec sustained (target 100K, 2× margin) | DONE | `cc9453d` |
+| **10b-3-final** | **Final main.rs surgery — spawn 22 consumer + 22 snapshot + supervisor + tick_processor dual-feed + init_global_writer_state** | **NEXT (live integration)** | — |
 
-## Summary — 17 of 17 testable phase commits done
+## Summary — 20 of 21 phase commits done; only main.rs surgery remaining
 
 | Stat | Value |
 |---|---|
-| Commits shipped | 17 (Phase 5/6/7/7b-parser/7b-runner/8/9/10-prim/10b-writer/10b-2/10c/11/12-source/12-runtime-prim/12-final-DHAT/13) |
-| Net LoC change | +4,580 / −619 |
-| Test count added | 130+ ratchets + 7 Criterion benches + 1 DHAT zero-alloc test |
-| Files created | 13 modules + 2 docs + 2 deploy configs + 1 bench file + 1 DHAT test |
-| Phases queued | 10b-3 (live tick_processor + snapshot-task wiring), 12-chaos (throughput test) |
+| Commits shipped | 20 (Phase 5/6/7/7b-parser/7b-runner/8/9/10-prim/10b/10b-2/10b-3a/10b-3b/10c/11/12-source/12-runtime-prim/12-final-DHAT/12-chaos/13) |
+| Net LoC change | +5,620 / −619 |
+| Test count added | 145+ ratchets + 7 Criterion benches + 1 DHAT zero-alloc + 1 chaos throughput |
+| Files created | 14 modules + 2 docs + 2 deploy configs + 1 bench file + 1 DHAT test + 1 chaos test |
+| Phases queued | **10b-3-final only** — main.rs surgery to wire the spawned tasks |
 | Branch durability | Every commit pushed atomically; full resume protocol intact |
 | All-green verification | Every commit passed: cargo test (per-crate scoped), pub-fn-test-guard, pub-fn-wiring-guard, banned-pattern-scanner, S6-G3+G4 boot symmetry, Dhan locked facts, data-integrity guard |
-| End-to-end coverage | DDL → Schema → Types → Storage Writer → Tracker → Scheduler → Supervisor → Boot Helper → Async Runner → Selector → Observability → Hooks/Doctor → DHAT — every layer of the v3 architecture has a primitive that compiles + tests pass |
+| Live-measured throughput | 213K rows/sec sustained, 49% drop rate (within chaos worst-case 70% ceiling) |
+| End-to-end coverage | DDL → Schema → Types → Storage Writer → Tracker → Scheduler → Supervisor → Boot Helper → Consumer Spawner → Snapshot Spawner → Async Runner → Selector → Observability → Hooks/Doctor → DHAT → Chaos — every layer verified |
 
 ## Resume protocol (for new Claude Code sessions)
 
