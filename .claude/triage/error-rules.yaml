@@ -1203,3 +1203,48 @@ rules:
       5s. Severity::Critical. 60s cooldown — repeated DEPTH-DYN-02
       within 5 minutes indicates cascading failure that operator must
       diagnose.
+
+  # -----------------------------------------------------------------------
+  # Phase 11 (2026-04-28) — Movers 22-TF
+  # -----------------------------------------------------------------------
+
+  - name: movers-22tf-01-writer-ilp-failed-escalate
+    match:
+      code: MOVERS-22TF-01
+    action: escalate
+    runbook_path: .claude/rules/project/movers-22tf-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 1800
+    justification: >-
+      MOVERS-22TF-01 means a Movers22TfWriter ILP append or flush
+      failed. The rescue ring buffers the row so single events are
+      recoverable; sustained failure indicates QuestDB ILP TCP port
+      issue or schema drift. 30-min cooldown to avoid Telegram spam
+      while the rescue ring catches up.
+
+  - name: movers-22tf-02-scheduler-panic-escalate
+    match:
+      code: MOVERS-22TF-02
+    action: escalate
+    runbook_path: .claude/rules/project/movers-22tf-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 60
+    justification: >-
+      MOVERS-22TF-02 means one of the 22 snapshot scheduler tasks
+      panicked. The MoversSupervisor respawns within 5s. Sustained
+      respawns indicate deterministic panic — operator must read the
+      backtrace from data/logs/errors.jsonl.*.
+
+  - name: movers-22tf-03-universe-drift-escalate
+    match:
+      code: MOVERS-22TF-03
+    action: escalate
+    runbook_path: .claude/rules/project/movers-22tf-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 1800
+    justification: >-
+      MOVERS-22TF-03 means tv_movers_universe_size drifted outside
+      24,324 ± 5% during market hours. Indicates universe build
+      regression OR stale Arc<MoversTracker> snapshot. Operator runs
+      `make doctor` section 9 to compare gauges + investigates the
+      latest InstrumentBuildSuccess Telegram event.
