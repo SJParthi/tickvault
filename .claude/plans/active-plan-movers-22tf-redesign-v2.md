@@ -148,21 +148,23 @@ See `v2-phases.md`. Recommendation: **ship Phase 5 (expiry rollover) as separate
 | 10b-3a | Consumer task spawner + ConsumerWriter trait (3 tests) | DONE | `0edf09d` |
 | 10b-3b | Snapshot task spawner with virtual-clock tests (3 tests) | DONE | `9aaa563` |
 | 12-chaos | Chaos throughput test — 213K rows/sec sustained (target 100K, 2× margin) | DONE | `cc9453d` |
-| **10b-3-final** | **Final main.rs surgery — spawn 22 consumer + 22 snapshot + supervisor + tick_processor dual-feed + init_global_writer_state** | **NEXT (live integration)** | — |
+| 10b-3-final | Env-gated boot wiring — 22 consumer + 22 snapshot + writer-state install | DONE | `72028c5` |
+| 10c-2 | tick_processor dual-feed + global tracker registry — pipeline FULLY WIRED | DONE | `c9f53a4` |
 
-## Summary — 20 of 21 phase commits done; only main.rs surgery remaining
+## Summary — 22 of 22 phase commits DONE — v3 plan COMPLETE
 
 | Stat | Value |
 |---|---|
-| Commits shipped | 20 (Phase 5/6/7/7b-parser/7b-runner/8/9/10-prim/10b/10b-2/10b-3a/10b-3b/10c/11/12-source/12-runtime-prim/12-final-DHAT/12-chaos/13) |
-| Net LoC change | +5,620 / −619 |
+| Commits shipped | **22 / 22** (Phase 5/6/7/7b-parser/7b-runner/8/9/10-prim/10b/10b-2/10b-3a/10b-3b/10b-3-final/10c/10c-2/11/12-source/12-runtime-prim/12-final-DHAT/12-chaos/13) |
+| Net LoC change | +5,900+ / −619 |
 | Test count added | 145+ ratchets + 7 Criterion benches + 1 DHAT zero-alloc + 1 chaos throughput |
 | Files created | 14 modules + 2 docs + 2 deploy configs + 1 bench file + 1 DHAT test + 1 chaos test |
-| Phases queued | **10b-3-final only** — main.rs surgery to wire the spawned tasks |
+| Phases queued | **none — v3 plan is complete** |
 | Branch durability | Every commit pushed atomically; full resume protocol intact |
 | All-green verification | Every commit passed: cargo test (per-crate scoped), pub-fn-test-guard, pub-fn-wiring-guard, banned-pattern-scanner, S6-G3+G4 boot symmetry, Dhan locked facts, data-integrity guard |
 | Live-measured throughput | 213K rows/sec sustained, 49% drop rate (within chaos worst-case 70% ceiling) |
-| End-to-end coverage | DDL → Schema → Types → Storage Writer → Tracker → Scheduler → Supervisor → Boot Helper → Consumer Spawner → Snapshot Spawner → Async Runner → Selector → Observability → Hooks/Doctor → DHAT → Chaos — every layer verified |
+| Activation | `TICKVAULT_MOVERS_22TF_PIPELINE_ENABLED=1` env var; default OFF for safe rollout |
+| End-to-end pipeline | Tick → tick_processor → tracker (papaya) → snapshot scheduler → arena → mpsc → consumer → ILP writer → QuestDB movers_{T} → Grafana 24-panel dashboard |
 
 ## Resume protocol (for new Claude Code sessions)
 
