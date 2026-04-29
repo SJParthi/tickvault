@@ -205,6 +205,89 @@ impl ConsumerWriter for Movers22TfWriter {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Phase 10b-3b — snapshot task spawner
+// ---------------------------------------------------------------------------
+
+/// Spawns ONE snapshot task for the timeframe at `slot_idx`. The task:
+/// 1. Sleeps until the next cadence-aligned tick.
+/// 2. Checks `is_market_hours()` per audit-findings Rule 3.
+/// 3. Calls `tracker.snapshot_into(&mut arena, ts_nanos)`.
+/// 4. For each row in the arena, calls `enqueue_fn(slot_idx, row)`.
+/// 5. Reports outcome via `on_cycle_complete(rows_written)` callback.
+///
+/// `enqueue_fn` is injected so tests can substitute a mock that
+/// counts rows without needing the global writer-state OnceLock to
+/// be initialised. In production `enqueue_fn` calls
+/// `try_enqueue_global(slot_idx, row)`.
+///
+/// `now_secs_fn` is injected for deterministic time control in tests
+/// (production passes `|| std::time::SystemTime::now()...`).
+///
+/// The task exits when `shutdown.load(Relaxed)` is true.
+pub fn spawn_snapshot_task<F, I, M, N>(
+    slot_idx: usize,
+    cadence_secs: u64,
+    timeframe_label: &'static str,
+    tracker: Arc<Movers22TfTracker>,
+    mut enqueue_fn: F,
+    is_market_hours: I,
+    now_nanos_fn: N,
+    mut on_cycle_complete: M,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+) -> JoinHandle<()>
+where
+    F: FnMut(usize, MoverRow) + Send + 'static,
+    I: Fn() -> bool + Send + 'static,
+    M: FnMut(usize) + Send + 'static,
+    N: Fn() -> i64 + Send + 'static,
+{
+    use std::sync::atomic::Ordering;
+
+    tokio::spawn(async move {
+        info!(
+            slot_idx,
+            timeframe = timeframe_label,
+            cadence_secs,
+            "movers_22tf snapshot task starting"
+        );
+        let mut arena: Vec<MoverRow> =
+            Vec::with_capacity(super::movers_22tf_scheduler::MOVERS_ARENA_CAPACITY);
+        let interval = std::time::Duration::from_secs(cadence_secs);
+
+        loop {
+            if shutdown.load(Ordering::Relaxed) {
+                info!(
+                    slot_idx,
+                    timeframe = timeframe_label,
+                    "movers_22tf snapshot task shutting down"
+                );
+                break;
+            }
+
+            tokio::time::sleep(interval).await;
+
+            if shutdown.load(Ordering::Relaxed) {
+                break;
+            }
+
+            // Market-hours gate per audit-findings Rule 3.
+            if !is_market_hours() {
+                on_cycle_complete(0);
+                continue;
+            }
+
+            let ts_nanos = now_nanos_fn();
+            tracker.snapshot_into(&mut arena, ts_nanos);
+            let rows = arena.len();
+            for row in arena.drain(..) {
+                enqueue_fn(slot_idx, row);
+            }
+            on_cycle_complete(rows);
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,5 +460,188 @@ mod tests {
     #[test]
     fn test_consumer_flush_threshold_is_1024() {
         assert_eq!(CONSUMER_FLUSH_THRESHOLD, 1024);
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 10b-3b — snapshot task spawner tests
+    // -----------------------------------------------------------------
+
+    /// Phase 10b-3b ratchet: snapshot task shut down before any cycle
+    /// runs exits cleanly without invoking enqueue/cycle callbacks.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_spawn_snapshot_task_shutdown_before_first_cycle() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        let tracker = Arc::new(Movers22TfTracker::new());
+        let enqueue_count = Arc::new(AtomicUsize::new(0));
+        let cycle_count = Arc::new(AtomicUsize::new(0));
+        let shutdown = Arc::new(AtomicBool::new(true)); // already requested
+
+        let enqueue = {
+            let counter = Arc::clone(&enqueue_count);
+            move |_slot: usize, _row: MoverRow| {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+        };
+        let on_cycle = {
+            let counter = Arc::clone(&cycle_count);
+            move |_rows: usize| {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+        };
+
+        let handle = spawn_snapshot_task(
+            0,
+            1,
+            "1s",
+            tracker,
+            enqueue,
+            || true,
+            || 1_700_000_000_000_000_000_i64,
+            on_cycle,
+            shutdown,
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("task should exit on pre-set shutdown")
+            .expect("task should complete cleanly");
+
+        assert_eq!(enqueue_count.load(Ordering::Relaxed), 0);
+        assert_eq!(cycle_count.load(Ordering::Relaxed), 0);
+    }
+
+    /// Phase 10b-3b ratchet: market-hours gate calls on_cycle_complete(0)
+    /// without invoking enqueue when off-market.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_spawn_snapshot_task_off_hours_skips_enqueue() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use tickvault_common::types::ExchangeSegment;
+
+        let tracker = Arc::new(Movers22TfTracker::new());
+        // Pre-populate so any snapshot would emit rows.
+        tracker.update_security_state(
+            13,
+            ExchangeSegment::IdxI,
+            crate::pipeline::movers_22tf_tracker::SecurityState::empty(),
+        );
+
+        let enqueue_count = Arc::new(AtomicUsize::new(0));
+        let cycle_count = Arc::new(AtomicUsize::new(0));
+        let zero_cycle_count = Arc::new(AtomicUsize::new(0));
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let enqueue = {
+            let counter = Arc::clone(&enqueue_count);
+            move |_slot, _row| {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+        };
+        let on_cycle = {
+            let total = Arc::clone(&cycle_count);
+            let zeros = Arc::clone(&zero_cycle_count);
+            let shutdown_signal = Arc::clone(&shutdown);
+            move |rows: usize| {
+                total.fetch_add(1, Ordering::Relaxed);
+                if rows == 0 {
+                    zeros.fetch_add(1, Ordering::Relaxed);
+                }
+                if total.load(Ordering::Relaxed) >= 1 {
+                    shutdown_signal.store(true, Ordering::Relaxed);
+                }
+            }
+        };
+
+        let handle = spawn_snapshot_task(
+            0,
+            1,
+            "1s",
+            tracker,
+            enqueue,
+            || false, // always off-market
+            || 1_700_000_000_000_000_000_i64,
+            on_cycle,
+            Arc::clone(&shutdown),
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(60), handle)
+            .await
+            .expect("task should exit on shutdown")
+            .expect("task should complete cleanly");
+
+        assert_eq!(
+            enqueue_count.load(Ordering::Relaxed),
+            0,
+            "off-market path must NOT call enqueue"
+        );
+        assert!(
+            zero_cycle_count.load(Ordering::Relaxed) >= 1,
+            "off-market cycle must report rows=0; got {}",
+            zero_cycle_count.load(Ordering::Relaxed)
+        );
+    }
+
+    /// Phase 10b-3b ratchet: in-market cycle drains tracker into the
+    /// enqueue callback — exactly tracker.len() rows per cycle.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_spawn_snapshot_task_in_market_drains_tracker() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use tickvault_common::types::ExchangeSegment;
+
+        let tracker = Arc::new(Movers22TfTracker::new());
+        // 5 distinct securities.
+        for i in 0..5_u32 {
+            tracker.update_security_state(
+                i,
+                ExchangeSegment::NseEquity,
+                crate::pipeline::movers_22tf_tracker::SecurityState::empty(),
+            );
+        }
+
+        let enqueue_count = Arc::new(AtomicUsize::new(0));
+        let cycle_count = Arc::new(AtomicUsize::new(0));
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let enqueue = {
+            let counter = Arc::clone(&enqueue_count);
+            move |slot: usize, _row: MoverRow| {
+                assert_eq!(slot, 7, "snapshot task must pass its own slot_idx");
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+        };
+        let on_cycle = {
+            let total = Arc::clone(&cycle_count);
+            let shutdown_signal = Arc::clone(&shutdown);
+            move |rows: usize| {
+                assert_eq!(rows, 5, "snapshot must drain all 5 tracker entries");
+                total.fetch_add(1, Ordering::Relaxed);
+                if total.load(Ordering::Relaxed) >= 1 {
+                    shutdown_signal.store(true, Ordering::Relaxed);
+                }
+            }
+        };
+
+        let handle = spawn_snapshot_task(
+            7,
+            1,
+            "1s",
+            tracker,
+            enqueue,
+            || true, // always in-market
+            || 1_700_000_000_000_000_000_i64,
+            on_cycle,
+            Arc::clone(&shutdown),
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(60), handle)
+            .await
+            .expect("task should exit on shutdown")
+            .expect("task should complete cleanly");
+
+        assert_eq!(
+            enqueue_count.load(Ordering::Relaxed),
+            5,
+            "exactly 5 rows must be enqueued (tracker has 5 entries)"
+        );
     }
 }
