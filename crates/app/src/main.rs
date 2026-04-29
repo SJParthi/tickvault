@@ -1937,6 +1937,12 @@ async fn main() -> Result<()> {
         tickvault_storage::materialized_views::ensure_candle_views(&config.questdb),
         ensure_greeks_tables(&config.questdb),
         tickvault_storage::movers_persistence::ensure_movers_tables(&config.questdb),
+        // Phase 10b-2: ensure all 22 movers_{T} tables exist alongside
+        // the existing stock_movers / option_movers tables. Idempotent
+        // CREATE TABLE IF NOT EXISTS — safe to call every boot per
+        // stream-resilience.md B10. The 22 ILP writers (one per
+        // timeframe) come up after this DDL fan-out completes.
+        tickvault_storage::movers_22tf_persistence::ensure_movers_22tf_tables(&config.questdb),
         tickvault_storage::indicator_snapshot_persistence::ensure_indicator_snapshot_table(
             &config.questdb
         ),

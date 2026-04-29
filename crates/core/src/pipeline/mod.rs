@@ -11,6 +11,7 @@ pub mod candle_aggregator;
 pub mod depth_sequence_tracker;
 pub mod first_seen_set;
 pub mod mover_classifier;
+pub mod movers_22tf_boot;
 pub mod movers_22tf_scheduler;
 pub mod movers_22tf_supervisor;
 pub mod movers_22tf_tracker;
