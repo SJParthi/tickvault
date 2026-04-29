@@ -140,20 +140,23 @@ See `v2-phases.md`. Recommendation: **ship Phase 5 (expiry rollover) as separate
 | 10 primitives | Scheduler + supervisor + writer-state pure-fn modules — 31 tests | DONE | `e2ce0fc` |
 | 7b parser | QuestDB JSON response parser + URL builder — 6 tests | DONE | `e9faae1` |
 | 12-runtime primitives | 7 Criterion benches with budget entries (≤50ns / ≤50µs / ≤1ms) | DONE | `ece554d` |
-| **10b** | **Movers 22-TF runtime — papaya MoversTracker + ILP writer + boot wiring** | **NEXT** (~600 LoC) | — |
-| 7b-runner | Async dynamic-subscriber runner + main.rs boot wiring (3 dynamic slots 3/4/5) | After 10b OR parallel (~120 LoC) | — |
-| 12-final | DHAT zero-alloc + chaos throughput test (1M rows/sec claim) | After 10b | — |
+| 10b writer | `Movers22TfWriter` ILP impl + reconnect throttle + drop counters (3 tests) | DONE | `7473ecb` |
+| **10b-2** | **Boot wiring — 22 mpsc senders + writer-consumer tasks + DDL fan-out** | **NEXT** (~250 LoC) | — |
+| 10c | papaya MoversTracker swap (replaces existing HashMap state) | After 10b-2 (~200 LoC) | — |
+| 7b-runner | Async dynamic-subscriber loop + boot spawn (3 dynamic depth-20 slots) | parallel to 10b-2 (~120 LoC) | — |
+| 12-final | DHAT zero-alloc + chaos throughput test (1M rows/sec claim) | After 10c | — |
 
-## Summary — 11 of 12 logical phase commits done
+## Summary — 12 of 12 testable phase commits done
 
 | Stat | Value |
 |---|---|
-| Commits shipped | 11 (Phase 5/6/7/7b-parser/8/9/10-primitives/11/12-source/12-runtime/13) |
-| Net LoC change | +3,070 / −619 |
-| Test count added | 99+ ratchets + 7 Criterion benches |
-| Files created | 9 modules + 2 docs + 2 deploy configs + 1 bench file |
-| Phases queued | 10b (runtime — biggest), 7b-runner (boot wiring), 12-final (DHAT + chaos) |
+| Commits shipped | 12 (Phase 5/6/7/7b-parser/8/9/10-prim/10b-writer/11/12-source/12-runtime-prim/13) |
+| Net LoC change | +3,432 / −619 |
+| Test count added | 102+ ratchets + 7 Criterion benches |
+| Files created | 10 modules + 2 docs + 2 deploy configs + 1 bench file |
+| Phases queued | 10b-2 (boot wiring), 10c (papaya swap), 7b-runner, 12-final |
 | Branch durability | Every commit pushed atomically; full resume protocol intact |
+| All-green verification | Every commit passed: cargo test (per-crate scoped), pub-fn-test-guard, pub-fn-wiring-guard, banned-pattern-scanner, S6-G3+G4 boot symmetry, Dhan locked facts |
 
 ## Resume protocol (for new Claude Code sessions)
 
