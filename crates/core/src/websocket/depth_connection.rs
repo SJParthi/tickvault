@@ -128,6 +128,7 @@ async fn depth_post_close_sleep_or_exhaust(
     // rest of the trading day. Replaces the legacy `ReconnectionExhausted`
     // terminal error which would propagate up and terminate the
     // connection task in-market.
+    // APPROVED: WS-GAP-04 in the error message names the rule we are FOLLOWING (never-give-up), not an error code being emitted.
     tracing::error!(
         attempt,
         feed = feed_label,
