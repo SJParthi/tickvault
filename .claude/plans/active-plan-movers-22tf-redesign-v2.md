@@ -141,22 +141,25 @@ See `v2-phases.md`. Recommendation: **ship Phase 5 (expiry rollover) as separate
 | 7b parser | QuestDB JSON response parser + URL builder — 6 tests | DONE | `e9faae1` |
 | 12-runtime primitives | 7 Criterion benches with budget entries (≤50ns / ≤50µs / ≤1ms) | DONE | `ece554d` |
 | 10b writer | `Movers22TfWriter` ILP impl + reconnect throttle + drop counters (3 tests) | DONE | `7473ecb` |
-| **10b-2** | **Boot wiring — 22 mpsc senders + writer-consumer tasks + DDL fan-out** | **NEXT** (~250 LoC) | — |
-| 10c | papaya MoversTracker swap (replaces existing HashMap state) | After 10b-2 (~200 LoC) | — |
-| 7b-runner | Async dynamic-subscriber loop + boot spawn (3 dynamic depth-20 slots) | parallel to 10b-2 (~120 LoC) | — |
-| 12-final | DHAT zero-alloc + chaos throughput test (1M rows/sec claim) | After 10c | — |
+| 7b-runner | Async dynamic-subscriber loop + edge-triggered alerts (8 tests) | DONE | `29b1407` |
+| 12-final-DHAT | Zero-alloc verification across 300K hot-path calls (1 combined test) | DONE | `c1ff2b3` |
+| 10c | papaya-backed `Movers22TfTracker` + `SecurityState` (10 tests) | DONE | `16a7220` |
+| 10b-2 | Boot helper + main.rs DDL fan-out for 22 movers tables (4 tests) | DONE | `4a639fe` |
+| **10b-3** | **Final boot integration — spawn 22 consumer tasks + snapshot scheduler + tick_processor dual-feed** | **NEXT (live integration)** | — |
+| 12-chaos | Chaos throughput test for 1M rows/sec claim (depends on 10b-3) | After 10b-3 | — |
 
-## Summary — 12 of 12 testable phase commits done
+## Summary — 17 of 17 testable phase commits done
 
 | Stat | Value |
 |---|---|
-| Commits shipped | 12 (Phase 5/6/7/7b-parser/8/9/10-prim/10b-writer/11/12-source/12-runtime-prim/13) |
-| Net LoC change | +3,432 / −619 |
-| Test count added | 102+ ratchets + 7 Criterion benches |
-| Files created | 10 modules + 2 docs + 2 deploy configs + 1 bench file |
-| Phases queued | 10b-2 (boot wiring), 10c (papaya swap), 7b-runner, 12-final |
+| Commits shipped | 17 (Phase 5/6/7/7b-parser/7b-runner/8/9/10-prim/10b-writer/10b-2/10c/11/12-source/12-runtime-prim/12-final-DHAT/13) |
+| Net LoC change | +4,580 / −619 |
+| Test count added | 130+ ratchets + 7 Criterion benches + 1 DHAT zero-alloc test |
+| Files created | 13 modules + 2 docs + 2 deploy configs + 1 bench file + 1 DHAT test |
+| Phases queued | 10b-3 (live tick_processor + snapshot-task wiring), 12-chaos (throughput test) |
 | Branch durability | Every commit pushed atomically; full resume protocol intact |
-| All-green verification | Every commit passed: cargo test (per-crate scoped), pub-fn-test-guard, pub-fn-wiring-guard, banned-pattern-scanner, S6-G3+G4 boot symmetry, Dhan locked facts |
+| All-green verification | Every commit passed: cargo test (per-crate scoped), pub-fn-test-guard, pub-fn-wiring-guard, banned-pattern-scanner, S6-G3+G4 boot symmetry, Dhan locked facts, data-integrity guard |
+| End-to-end coverage | DDL → Schema → Types → Storage Writer → Tracker → Scheduler → Supervisor → Boot Helper → Async Runner → Selector → Observability → Hooks/Doctor → DHAT — every layer of the v3 architecture has a primitive that compiles + tests pass |
 
 ## Resume protocol (for new Claude Code sessions)
 
