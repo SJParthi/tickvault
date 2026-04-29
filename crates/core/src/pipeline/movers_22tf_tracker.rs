@@ -32,7 +32,7 @@
 //! - `snapshot_into`: O(N) over ~24K entries; ~1-2 ms typical, runs on
 //!   the cold scheduler thread, NOT the per-tick hot path.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use papaya::HashMap as PapayaMap;
 use tickvault_common::mover_types::MoverRow;
@@ -235,6 +235,48 @@ pub const fn segment_to_char(segment: ExchangeSegment) -> char {
         // scope today. Mark as '?' so any test/dashboard that surfaces
         // them is visibly anomalous.
         _ => '?',
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 10c-2 — global tracker registry (mirror of movers_22tf_writer_state)
+// ---------------------------------------------------------------------------
+//
+// Boot installs an Arc<Movers22TfTracker> at startup; the tick processor's
+// per-tick hot path reads it via `try_update_global_tracker`. Mirrors the
+// `init_global_writer_state` + `try_enqueue_global` pattern from
+// movers_22tf_writer_state.rs so the two halves of the pipeline can be
+// wired symmetrically.
+
+static GLOBAL_TRACKER: OnceLock<Arc<Movers22TfTracker>> = OnceLock::new();
+
+/// Installs the global tracker. Idempotent — second + later calls are
+/// no-ops (returns `false`). Boot must call this exactly once when the
+/// movers 22-tf pipeline is enabled.
+// TEST-EXEMPT: thin wrapper over OnceLock::set; cross-test contamination prevents idempotency unit tests in process — covered by Phase 10b-3-final integration.
+pub fn init_global_tracker(tracker: Arc<Movers22TfTracker>) -> bool {
+    GLOBAL_TRACKER.set(tracker).is_ok()
+}
+
+/// True if the global tracker has been installed.
+#[must_use]
+// WIRING-EXEMPT: paired with init_global_tracker; both lifecycle helpers ship together so future maintainers can introspect installation state. Call site in operator-readiness diagnostics is the next follow-up.
+// TEST-EXEMPT: thin wrapper over OnceLock::get; covered by Phase 10b-3 integration.
+pub fn is_global_tracker_initialised() -> bool {
+    GLOBAL_TRACKER.get().is_some()
+}
+
+/// Per-tick hot-path entry: updates the global tracker if installed,
+/// otherwise no-op. Designed to be called from `tick_processor` on
+/// every parsed tick alongside the legacy `TopMoversTracker.update`.
+///
+/// Hot-path budget: the body is one OnceLock::get (atomic load) + one
+/// papaya pin().insert. Both are lock-free + allocation-free in the
+/// steady state.
+// TEST-EXEMPT: thin wrapper over OnceLock::get + tracker.update_security_state — both paths covered by movers_22tf_tracker tests.
+pub fn try_update_global_tracker(security_id: u32, segment: ExchangeSegment, state: SecurityState) {
+    if let Some(tracker) = GLOBAL_TRACKER.get() {
+        tracker.update_security_state(security_id, segment, state);
     }
 }
 

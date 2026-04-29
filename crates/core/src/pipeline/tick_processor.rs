@@ -1264,6 +1264,36 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     opt_movers.update(&tick);
                 }
 
+                // Phase 10c-2 — dual-feed: also push the tick into the
+                // global Movers22TfTracker so the 22-tf snapshot tasks
+                // see live data. No-op if the tracker is not installed
+                // (env var TICKVAULT_MOVERS_22TF_PIPELINE_ENABLED off).
+                // Hot-path safe: try_update_global_tracker is one
+                // OnceLock load + one papaya pin().insert (lock-free
+                // + zero-alloc in steady state).
+                if let Some(segment) =
+                    tickvault_common::types::ExchangeSegment::from_byte(tick.exchange_segment_code)
+                {
+                    super::movers_22tf_tracker::try_update_global_tracker(
+                        tick.security_id,
+                        segment,
+                        super::movers_22tf_tracker::SecurityState {
+                            ltp: tickvault_storage::tick_persistence::f32_to_f64_clean(
+                                tick.last_traded_price,
+                            ),
+                            prev_close: tickvault_storage::tick_persistence::f32_to_f64_clean(
+                                tick.day_close,
+                            ),
+                            volume: i64::from(tick.volume),
+                            buy_qty: i64::from(tick.total_buy_quantity),
+                            sell_qty: i64::from(tick.total_sell_quantity),
+                            open_interest: i64::from(tick.open_interest),
+                            first_oi_today: 0, // first_seen_set baseline lands in a follow-up
+                            last_updated_ts_nanos: tick.received_at_nanos,
+                        },
+                    );
+                }
+
                 trace!(
                     security_id = tick.security_id,
                     ltp = tick.last_traded_price,
