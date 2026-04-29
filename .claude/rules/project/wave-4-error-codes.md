@@ -33,30 +33,58 @@ follow the SELFTEST-02 (market-open) triage pattern in
 
 **Source (planned):** `crates/core/src/instrument/preopen_self_test.rs`
 
-## DEPTH-DYN-01 — top-150 selector returned empty set (Wave-4-D)
+## DEPTH-DYN-01 — top-150 selector returned empty set (Wave-4-D, Phase 7 SHIPPED 2026-04-28)
 
-**Reserved.** Severity::High.
+**Status (2026-04-28):** PROMOTED FROM RESERVED — defined as
+`ErrorCode::Depth20Dyn01TopSetEmpty` with `code_str() == "DEPTH-DYN-01"`.
+Severity::High. NOT auto-triage-safe.
 
-Triage stub: dynamic depth-20 top-150 selector found zero option
-contracts meeting the volume + gainer% criteria. Likely root cause
-is empty `option_movers` table or subscription_audit reporting no
-NSE_FNO option packets in the last 5 minutes. Operator runs
-`mcp__tickvault-logs__questdb_sql "select count(*) from option_movers
-where ts > now() - 5m"`.
+**Trigger:** every 60s the dynamic depth-20 selector queries
+`option_movers` for the top 150 contracts (filtered `change_pct > 0`,
+sorted `volume DESC`). If returned set has fewer than 50 contracts
+(per-slot capacity), `check_set_emptiness` flags as either
+`zero_results` or `below_slot_capacity`. Runner emits
+`NotificationEvent::Depth20DynamicTopSetEmpty { returned_count, reason }`
+with edge-triggered semantics (rising-edge fire only).
 
-**Source (planned):** `crates/core/src/instrument/depth_20_dynamic_subscriber.rs`
+**Triage:**
+1. `mcp__tickvault-logs__questdb_sql "select count(*) from option_movers where ts > now() - 5m"`
+   — empty / very low count means upstream `OptionMoversWriter` is
+   unhealthy; follow MOVERS-02 runbook.
+2. Outside market hours this is expected. The boot-wired runner uses
+   `is_within_market_hours_ist()` to suppress emission outside
+   `[09:00, 15:30] IST`.
+3. Inside market hours with healthy rows: universe-wide bear day where
+   < 50 contracts are positive movers. Operator confirms; do NOT relax
+   the `change_pct > 0` filter without Parthiban approval (Option B
+   is locked).
 
-## DEPTH-DYN-02 — Swap20 command channel broken (Wave-4-D)
+**Source:** `crates/core/src/instrument/depth_20_dynamic_subscriber.rs`,
+`crates/common/src/error_code.rs::Depth20Dyn01TopSetEmpty`,
+`.claude/triage/error-rules.yaml::depth-dyn-01-top-set-empty-escalate`.
 
-**Reserved.** Severity::Critical.
+## DEPTH-DYN-02 — Swap20 command channel broken (Wave-4-D, Phase 7 SHIPPED 2026-04-28)
 
-Triage stub: dynamic selector computed a new top-150 set but the
-`mpsc::Sender<DepthCommand>` for one of the 3 dynamic depth-20
-connections returned `SendError`. The connection's task panicked or
-was deallocated. Pool supervisor (WS-GAP-05) respawn should recover
-within 5s; if not, restart the app.
+**Status (2026-04-28):** PROMOTED FROM RESERVED — defined as
+`ErrorCode::Depth20Dyn02SwapChannelBroken` with `code_str() == "DEPTH-DYN-02"`.
+Severity::Critical. NOT auto-triage-safe.
 
-**Source (planned):** `crates/core/src/instrument/depth_20_dynamic_subscriber.rs`
+**Trigger:** selector emits `DepthCommand::Swap20` over one of the 3
+dynamic-slot Senders (slots 3/4/5); send returns `SendError` because
+receiver task exited. Pool supervisor (WS-GAP-05) should respawn
+within 5s.
+
+**Triage:**
+1. Check `tv_ws_pool_respawn_total` — if incremented within last 5s,
+   supervisor is working; next selector cycle should succeed.
+2. If counter NOT incrementing: supervisor itself broken. Check
+   `data/logs/errors.jsonl.*` for panic backtraces immediately
+   preceding the DEPTH-DYN-02 emission.
+3. If supervisor + respawn both fail repeatedly: restart the app.
+
+**Source:** `crates/common/src/error_code.rs::Depth20Dyn02SwapChannelBroken`,
+`crates/core/src/notification/events.rs::Depth20DynamicSwapChannelBroken`,
+`.claude/triage/error-rules.yaml::depth-dyn-02-swap-channel-broken-escalate`.
 
 ## PROC-01 — OOM kill detected (Wave-4-E1)
 

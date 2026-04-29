@@ -58,6 +58,15 @@ const REVERSE_CHECK_ALLOWLIST: &[&str] = &[
     //   `DH-9xx` error-code family introduced in API v2.0, not a specific
     //   code. No individual variant corresponds to it.
     "DH-900",
+    // RESERVED Wave-4 stubs in `wave-4-error-codes.md`. These codes are
+    // documented as planned but not yet promoted to ErrorCode variants.
+    // Each will be removed from this allowlist when its sub-PR ships.
+    // `AUTH-GAP-04` — TOTP secret rotated externally (Wave-4-E2).
+    "AUTH-GAP-04",
+    // `DH-911` — Dhan API silent black-hole (Wave-4-E2).
+    "DH-911",
+    // `STORAGE-GAP-05` — disk-full pre-flight failed (Wave-4-E2).
+    "STORAGE-GAP-05",
 ];
 
 #[test]

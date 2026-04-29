@@ -309,6 +309,20 @@ pub enum ErrorCode {
     Depth200Auth02RenewalFailed,
     /// AWS SSM unreachable — IAM, network, or KMS access issue.
     Depth200Auth03SsmUnreachable,
+
+    // -----------------------------------------------------------------------
+    // Depth-20 dynamic top-150 selector (Phase 7, 2026-04-28 — see
+    // `.claude/plans/v2-architecture.md` Section I)
+    // -----------------------------------------------------------------------
+    /// Top-150 dynamic selector returned an empty (or sub-50) set —
+    /// `option_movers` table stale, market closed, or no contracts had
+    /// `change_pct > 0` in the last 90 seconds. Severity::High.
+    Depth20Dyn01TopSetEmpty,
+    /// `mpsc::Sender<DepthCommand>::send` returned `SendError` for one of
+    /// the three dynamic depth-20 connection slots. Receiver task panicked
+    /// or was deallocated. Pool supervisor (WS-GAP-05) respawn should
+    /// recover within 5s. Severity::Critical.
+    Depth20Dyn02SwapChannelBroken,
 }
 
 impl ErrorCode {
@@ -423,6 +437,9 @@ impl ErrorCode {
             Self::Depth200Auth01InvalidAtBoot => "DEPTH200-AUTH-01",
             Self::Depth200Auth02RenewalFailed => "DEPTH200-AUTH-02",
             Self::Depth200Auth03SsmUnreachable => "DEPTH200-AUTH-03",
+            // Depth-20 dynamic top-150 selector (Phase 7, 2026-04-28)
+            Self::Depth20Dyn01TopSetEmpty => "DEPTH-DYN-01",
+            Self::Depth20Dyn02SwapChannelBroken => "DEPTH-DYN-02",
         }
     }
 
@@ -448,7 +465,8 @@ impl ErrorCode {
             | Self::Selftest02Failed
             | Self::Depth200Auth01InvalidAtBoot
             | Self::Depth200Auth02RenewalFailed
-            | Self::Depth200Auth03SsmUnreachable => Severity::Critical,
+            | Self::Depth200Auth03SsmUnreachable
+            | Self::Depth20Dyn02SwapChannelBroken => Severity::Critical,
             // Info: positive-ping / lifecycle confirmations
             Self::Selftest01Passed | Self::Slo01Healthy => Severity::Info,
             // High: composite SLO degradation summary signal
@@ -466,7 +484,8 @@ impl ErrorCode {
             | Self::InstrumentP0ExpiryAtGate4
             | Self::Data807TokenExpired
             | Self::Phase202EmitGuardDropped
-            | Self::Boot01QuestDbSlow => Severity::High,
+            | Self::Boot01QuestDbSlow
+            | Self::Depth20Dyn01TopSetEmpty => Severity::High,
             // Medium: data pipeline correctness
             Self::InstrumentP0DuplicateSecurityId
             | Self::InstrumentP0CountConsistency
@@ -625,6 +644,9 @@ impl ErrorCode {
             | Self::Depth200Auth03SsmUnreachable => {
                 ".claude/rules/project/depth-200-auth-error-codes.md"
             }
+            Self::Depth20Dyn01TopSetEmpty | Self::Depth20Dyn02SwapChannelBroken => {
+                ".claude/rules/project/wave-4-error-codes.md"
+            }
         }
     }
 
@@ -734,6 +756,8 @@ impl ErrorCode {
             Self::Depth200Auth01InvalidAtBoot,
             Self::Depth200Auth02RenewalFailed,
             Self::Depth200Auth03SsmUnreachable,
+            Self::Depth20Dyn01TopSetEmpty,
+            Self::Depth20Dyn02SwapChannelBroken,
         ]
     }
 }
@@ -898,7 +922,10 @@ mod tests {
         // 2026-04-28 (depth-200 SELF token): bumped 84 -> 87 for
         // DEPTH200-AUTH-01/02/03 — alternate auth path for
         // full-depth-api.dhan.co (rejects APP, accepts SELF).
-        assert_eq!(ErrorCode::all().len(), 87);
+        // 2026-04-28 (Phase 7 of v3 plan): bumped 87 -> 89 for
+        // DEPTH-DYN-01/02 — depth-20 dynamic top-150 selector
+        // promoted from RESERVED to defined.
+        assert_eq!(ErrorCode::all().len(), 89);
     }
 
     #[test]
@@ -929,7 +956,9 @@ mod tests {
                 // Wave 3-D: composite real-time guarantee score
                 || s.starts_with("SLO-")
                 // 2026-04-28: depth-200 SELF token alternate auth path
-                || s.starts_with("DEPTH200-AUTH-");
+                || s.starts_with("DEPTH200-AUTH-")
+                // Phase 7 (2026-04-28): depth-20 dynamic top-150 selector
+                || s.starts_with("DEPTH-DYN-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }

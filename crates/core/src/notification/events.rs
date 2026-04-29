@@ -935,6 +935,49 @@ pub enum NotificationEvent {
         /// Numeric SecurityId of the contract.
         security_id: u32,
     },
+
+    // -----------------------------------------------------------------------
+    // Depth-20 dynamic top-150 selector (Phase 7, 2026-04-28 — see
+    // `.claude/plans/v2-architecture.md` Section I)
+    // -----------------------------------------------------------------------
+    /// Top-150 dynamic selector returned an empty (or sub-50) set —
+    /// `option_movers` table stale, market closed, or no contracts had
+    /// `change_pct > 0` in the last 90 seconds. Edge-triggered: fires once
+    /// on rising edge (selector starts returning < 50). Severity::High.
+    /// `code = ErrorCode::Depth20Dyn01TopSetEmpty`.
+    Depth20DynamicTopSetEmpty {
+        /// Number of contracts the selector returned (< 50 considered empty).
+        returned_count: usize,
+        /// Reason the set is empty (e.g. `"market_closed"`, `"option_movers_stale"`,
+        /// `"no_positive_gainers"`).
+        reason: String,
+    },
+
+    /// `mpsc::Sender<DepthCommand>::send` returned `SendError` for one of
+    /// the three dynamic depth-20 connection slots. Receiver task panicked
+    /// or was deallocated. Pool supervisor (WS-GAP-05) respawn should
+    /// recover within 5s. Severity::Critical.
+    /// `code = ErrorCode::Depth20Dyn02SwapChannelBroken`.
+    Depth20DynamicSwapChannelBroken {
+        /// Slot index (3, 4, or 5 — slots 1+2 are the static NIFTY+BANKNIFTY ATM±24).
+        slot_index: u8,
+        /// Description of the send failure.
+        reason: String,
+    },
+
+    /// Dynamic top-150 selector emitted a successful Swap20 with delta —
+    /// positive ping (informational). Edge-triggered: fires only when the
+    /// set actually changed. Severity::Low.
+    Depth20DynamicSwapApplied {
+        /// Slot index (3, 4, or 5).
+        slot_index: u8,
+        /// Number of contracts unsubscribed (leavers).
+        unsubscribed_count: usize,
+        /// Number of contracts subscribed (entrants).
+        subscribed_count: usize,
+        /// Total active contracts in this slot after the swap.
+        total_active: usize,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -1909,6 +1952,37 @@ impl NotificationEvent {
                  contract: <code>{contract}</code>\n\
                  security_id: <code>{security_id}</code>"
             ),
+            Self::Depth20DynamicTopSetEmpty {
+                returned_count,
+                reason,
+            } => format!(
+                "<b>Depth-20 dynamic top-150: empty set</b>\n\
+                 code: <code>DEPTH-DYN-01</code>\n\
+                 returned_count: <code>{returned_count}</code>\n\
+                 reason: <code>{reason}</code>\n\
+                 ACTION: check option_movers freshness via \
+                 <code>SELECT count(*) FROM option_movers WHERE ts &gt; now() - 5m</code>"
+            ),
+            Self::Depth20DynamicSwapChannelBroken { slot_index, reason } => format!(
+                "<b>Depth-20 dynamic Swap20 channel BROKEN</b>\n\
+                 code: <code>DEPTH-DYN-02</code>\n\
+                 slot: <code>{slot_index}</code>\n\
+                 reason: <code>{reason}</code>\n\
+                 ACTION: pool supervisor (WS-GAP-05) should respawn within 5s; \
+                 if not, restart the app"
+            ),
+            Self::Depth20DynamicSwapApplied {
+                slot_index,
+                unsubscribed_count,
+                subscribed_count,
+                total_active,
+            } => format!(
+                "<b>Depth-20 dynamic top-150: swap applied</b>\n\
+                 slot: <code>{slot_index}</code>\n\
+                 unsubscribed: <code>{unsubscribed_count}</code>\n\
+                 subscribed: <code>{subscribed_count}</code>\n\
+                 active: <code>{total_active}</code>"
+            ),
         }
     }
 
@@ -2010,6 +2084,9 @@ impl NotificationEvent {
             Self::Depth200SelfTokenRenewalFailed { .. } => "Depth200SelfTokenRenewalFailed",
             Self::Depth200SelfTokenSsmUnreachable { .. } => "Depth200SelfTokenSsmUnreachable",
             Self::Depth200SelfStreamingConfirmed { .. } => "Depth200SelfStreamingConfirmed",
+            Self::Depth20DynamicTopSetEmpty { .. } => "Depth20DynamicTopSetEmpty",
+            Self::Depth20DynamicSwapChannelBroken { .. } => "Depth20DynamicSwapChannelBroken",
+            Self::Depth20DynamicSwapApplied { .. } => "Depth20DynamicSwapApplied",
         }
     }
 
@@ -2114,6 +2191,9 @@ impl NotificationEvent {
             Self::Depth200SelfTokenInvalidAtBoot { .. } => Severity::Critical,
             Self::Depth200SelfTokenRenewalFailed { .. } => Severity::Critical,
             Self::Depth200SelfTokenSsmUnreachable { .. } => Severity::Critical,
+            Self::Depth20DynamicTopSetEmpty { .. } => Severity::High,
+            Self::Depth20DynamicSwapChannelBroken { .. } => Severity::Critical,
+            Self::Depth20DynamicSwapApplied { .. } => Severity::Low,
         }
     }
 }
