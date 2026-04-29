@@ -80,6 +80,8 @@ pub mod historical_fetch_marker;
 pub mod indicator_snapshot_persistence;
 pub mod instrument_persistence;
 pub mod materialized_views;
+pub mod movers_22tf_persistence;
+pub mod movers_22tf_writer;
 pub mod movers_persistence;
 pub mod obi_persistence;
 pub mod order_audit_persistence;

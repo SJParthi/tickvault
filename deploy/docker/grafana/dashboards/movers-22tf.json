@@ -1,0 +1,178 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "Movers 22-Timeframe — full-universe mover snapshots across 22 cadences. Phase 11 of v3 plan (2026-04-28). 24 panels: Stocks (2 — Gainers/Losers) + Index (2) + Options (7) + Futures (7) + Depth (6) covering the existing market_depth/deep_market_depth tables.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "type": "row",
+      "title": "Health & Universe Coverage",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "id": 100,
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "stat",
+      "title": "Universe Size (target ~24,324)",
+      "id": 101,
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "tv-prometheus" },
+      "targets": [{ "expr": "tv_movers_universe_size", "refId": "A" }],
+      "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": 0 }, { "color": "yellow", "value": 23107 }, { "color": "green", "value": 24000 }] } } }
+    },
+    {
+      "type": "timeseries",
+      "title": "Per-Segment Coverage",
+      "id": 102,
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "tv-prometheus" },
+      "targets": [{ "expr": "tv_movers_per_segment_count", "refId": "A", "legendFormat": "{{segment}}" }]
+    },
+    {
+      "type": "timeseries",
+      "title": "Snapshot Lag (s) per Timeframe",
+      "id": 103,
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "tv-prometheus" },
+      "targets": [{ "expr": "tv_movers_snapshot_lag_seconds", "refId": "A", "legendFormat": "{{timeframe}}" }]
+    },
+    {
+      "type": "timeseries",
+      "title": "Drop Rate (rate per 5m)",
+      "id": 104,
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "tv-prometheus" },
+      "targets": [{ "expr": "rate(tv_movers_writer_dropped_total[5m])", "refId": "A", "legendFormat": "{{reason}}" }]
+    },
+    {
+      "type": "row",
+      "title": "Stocks (NSE_EQ) — Gainers / Losers",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 5 },
+      "id": 200,
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "table",
+      "title": "Stocks Top Gainers (movers_$timeframe)",
+      "id": 201,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
+      "datasource": { "type": "questdb", "uid": "tv-questdb" },
+      "targets": [{ "queryType": "table", "rawSql": "SELECT underlying_symbol, ltp, change_pct, volume FROM movers_${timeframe} WHERE ts > dateadd('s', -90, now()) AND segment = 'E' ORDER BY change_pct DESC LIMIT 50", "refId": "A" }]
+    },
+    {
+      "type": "table",
+      "title": "Stocks Top Losers (movers_$timeframe)",
+      "id": 202,
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
+      "datasource": { "type": "questdb", "uid": "tv-questdb" },
+      "targets": [{ "queryType": "table", "rawSql": "SELECT underlying_symbol, ltp, change_pct, volume FROM movers_${timeframe} WHERE ts > dateadd('s', -90, now()) AND segment = 'E' ORDER BY change_pct ASC LIMIT 50", "refId": "A" }]
+    },
+    {
+      "type": "row",
+      "title": "Index (IDX_I) — Gainers / Losers",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 14 },
+      "id": 300,
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "table",
+      "title": "Index Top Gainers",
+      "id": 301,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 15 },
+      "datasource": { "type": "questdb", "uid": "tv-questdb" },
+      "targets": [{ "queryType": "table", "rawSql": "SELECT underlying_symbol, ltp, change_pct FROM movers_${timeframe} WHERE ts > dateadd('s', -90, now()) AND segment = 'I' ORDER BY change_pct DESC LIMIT 20", "refId": "A" }]
+    },
+    {
+      "type": "table",
+      "title": "Index Top Losers",
+      "id": 302,
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 15 },
+      "datasource": { "type": "questdb", "uid": "tv-questdb" },
+      "targets": [{ "queryType": "table", "rawSql": "SELECT underlying_symbol, ltp, change_pct FROM movers_${timeframe} WHERE ts > dateadd('s', -90, now()) AND segment = 'I' ORDER BY change_pct ASC LIMIT 20", "refId": "A" }]
+    },
+    {
+      "type": "row",
+      "title": "Options (NSE_FNO OPT*) — 7 tabs",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 23 },
+      "id": 400,
+      "collapsed": false,
+      "panels": []
+    },
+    { "type": "table", "title": "Options Highest OI",   "id": 401, "gridPos": { "h": 6, "w": 8, "x": 0,  "y": 24 }, "datasource": { "type": "questdb", "uid": "tv-questdb" }, "targets": [{ "queryType": "table", "rawSql": "SELECT underlying_symbol, strike_price, option_type, ltp, open_interest FROM movers_${timeframe} WHERE ts > dateadd('s', -90, now()) AND segment = 'D' AND instrument_type IN ('OPTIDX','OPTSTK') AND expiry_date BETWEEN '${expiry_from}' AND '${expiry_to}' ORDER BY open_interest DESC LIMIT 50", "refId": "A" }] },
+    { "type": "table", "title": "Options OI Gainers",   "id": 402, "gridPos": { "h": 6, "w": 8, "x": 8,  "y": 24 }, "datasource": { "type": "questdb", "uid": "tv-questdb" }, "targets": [{ "queryType": "table", "rawSql": "SELECT underlying_symbol, strike_price, option_type, ltp, oi_change_pct FROM movers_${timeframe} WHERE ts > dateadd('s', -90, now()) AND segment = 'D' AND instrument_type IN ('OPTIDX','OPTSTK') AND expiry_date BETWEEN '${expiry_from}' AND '${expiry_to}' ORDER BY oi_change_pct DESC LIMIT 50", "refId": "A" }] },
+    { "type": "table", "title": "Options OI Losers",    "id": 403, "gridPos": { "h": 6, "w": 8, "x": 16, "y": 24 }, "datasource": { "type": "questdb", "uid": "tv-questdb" }, "targets": [{ "queryType": "table", "rawSql": "SELECT underlying_symbol, strike_price, option_type, ltp, oi_change_pct FROM movers_${timeframe} WHERE ts > dateadd('s', -90, now()) AND segment = 'D' AND instrument_type IN ('OPTIDX','OPTSTK') AND expiry_date BETWEEN '${expiry_from}' AND '${expiry_to}' ORDER BY oi_change_pct ASC LIMIT 50", "refId": "A" }] },
+    { "type": "table", "title": "Options Top Volume",   "id": 404, "gridPos": { "h": 6, "w": 6, "x": 0,  "y": 30 }, "datasource": { "type": "questdb", "uid": "tv-questdb" }, "targets": [{ "queryType": "table", "rawSql": "SELECT underlying_symbol, strike_price, option_type, ltp, volume FROM movers_${timeframe} WHERE ts > dateadd('s', -90, now()) AND segment = 'D' AND instrument_type IN ('OPTIDX','OPTSTK') AND expiry_date BETWEEN '${expiry_from}' AND '${expiry_to}' ORDER BY volume DESC LIMIT 50", "refId": "A" }] },
+    { "type": "table", "title": "Options Top Value",    "id": 405, "gridPos": { "h": 6, "w": 6, "x": 6,  "y": 30 }, "datasource": { "type": "questdb", "uid": "tv-questdb" }, "targets": [{ "queryType": "table", "rawSql": "SELECT underlying_symbol, strike_price, option_type, ltp, ltp * volume AS value FROM movers_${timeframe} WHERE ts > dateadd('s', -90, now()) AND segment = 'D' AND instrument_type IN ('OPTIDX','OPTSTK') AND expiry_date BETWEEN '${expiry_from}' AND '${expiry_to}' ORDER BY value DESC LIMIT 50", "refId": "A" }] },
+    { "type": "table", "title": "Options Price Gainers","id": 406, "gridPos": { "h": 6, "w": 6, "x": 12, "y": 30 }, "datasource": { "type": "questdb", "uid": "tv-questdb" }, "targets": [{ "queryType": "table", "rawSql": "SELECT underlying_symbol, strike_price, option_type, ltp, change_pct FROM movers_${timeframe} WHERE ts > dateadd('s', -90, now()) AND segment = 'D' AND instrument_type IN ('OPTIDX','OPTSTK') AND expiry_date BETWEEN '${expiry_from}' AND '${expiry_to}' ORDER BY change_pct DESC LIMIT 50", "refId": "A" }] },
+    { "type": "table", "title": "Options Price Losers", "id": 407, "gridPos": { "h": 6, "w": 6, "x": 18, "y": 30 }, "datasource": { "type": "questdb", "uid": "tv-questdb" }, "targets": [{ "queryType": "table", "rawSql": "SELECT underlying_symbol, strike_price, option_type, ltp, change_pct FROM movers_${timeframe} WHERE ts > dateadd('s', -90, now()) AND segment = 'D' AND instrument_type IN ('OPTIDX','OPTSTK') AND expiry_date BETWEEN '${expiry_from}' AND '${expiry_to}' ORDER BY change_pct ASC LIMIT 50", "refId": "A" }] },
+    {
+      "type": "row",
+      "title": "Futures (NSE_FNO FUT*) — 7 tabs",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 36 },
+      "id": 500,
+      "collapsed": false,
+      "panels": []
+    },
+    { "type": "table", "title": "Futures Premium",       "id": 501, "gridPos": { "h": 6, "w": 8, "x": 0,  "y": 37 }, "datasource": { "type": "questdb", "uid": "tv-questdb" }, "targets": [{ "queryType": "table", "rawSql": "SELECT underlying_symbol, ltp, spot_price, ltp - spot_price AS premium FROM movers_${timeframe} WHERE ts > dateadd('s', -90, now()) AND segment = 'D' AND instrument_type IN ('FUTIDX','FUTSTK') AND expiry_date BETWEEN '${expiry_from}' AND '${expiry_to}' ORDER BY premium DESC LIMIT 50", "refId": "A" }] },
+    { "type": "table", "title": "Futures Discount",      "id": 502, "gridPos": { "h": 6, "w": 8, "x": 8,  "y": 37 }, "datasource": { "type": "questdb", "uid": "tv-questdb" }, "targets": [{ "queryType": "table", "rawSql": "SELECT underlying_symbol, ltp, spot_price, ltp - spot_price AS premium FROM movers_${timeframe} WHERE ts > dateadd('s', -90, now()) AND segment = 'D' AND instrument_type IN ('FUTIDX','FUTSTK') AND expiry_date BETWEEN '${expiry_from}' AND '${expiry_to}' ORDER BY premium ASC LIMIT 50", "refId": "A" }] },
+    { "type": "table", "title": "Futures Top Volume",    "id": 503, "gridPos": { "h": 6, "w": 8, "x": 16, "y": 37 }, "datasource": { "type": "questdb", "uid": "tv-questdb" }, "targets": [{ "queryType": "table", "rawSql": "SELECT underlying_symbol, ltp, volume FROM movers_${timeframe} WHERE ts > dateadd('s', -90, now()) AND segment = 'D' AND instrument_type IN ('FUTIDX','FUTSTK') AND expiry_date BETWEEN '${expiry_from}' AND '${expiry_to}' ORDER BY volume DESC LIMIT 50", "refId": "A" }] },
+    { "type": "table", "title": "Futures OI Gainers",    "id": 504, "gridPos": { "h": 6, "w": 6, "x": 0,  "y": 43 }, "datasource": { "type": "questdb", "uid": "tv-questdb" }, "targets": [{ "queryType": "table", "rawSql": "SELECT underlying_symbol, ltp, oi_change_pct FROM movers_${timeframe} WHERE ts > dateadd('s', -90, now()) AND segment = 'D' AND instrument_type IN ('FUTIDX','FUTSTK') AND expiry_date BETWEEN '${expiry_from}' AND '${expiry_to}' ORDER BY oi_change_pct DESC LIMIT 50", "refId": "A" }] },
+    { "type": "table", "title": "Futures OI Losers",     "id": 505, "gridPos": { "h": 6, "w": 6, "x": 6,  "y": 43 }, "datasource": { "type": "questdb", "uid": "tv-questdb" }, "targets": [{ "queryType": "table", "rawSql": "SELECT underlying_symbol, ltp, oi_change_pct FROM movers_${timeframe} WHERE ts > dateadd('s', -90, now()) AND segment = 'D' AND instrument_type IN ('FUTIDX','FUTSTK') AND expiry_date BETWEEN '${expiry_from}' AND '${expiry_to}' ORDER BY oi_change_pct ASC LIMIT 50", "refId": "A" }] },
+    { "type": "table", "title": "Futures Price Gainers", "id": 506, "gridPos": { "h": 6, "w": 6, "x": 12, "y": 43 }, "datasource": { "type": "questdb", "uid": "tv-questdb" }, "targets": [{ "queryType": "table", "rawSql": "SELECT underlying_symbol, ltp, change_pct FROM movers_${timeframe} WHERE ts > dateadd('s', -90, now()) AND segment = 'D' AND instrument_type IN ('FUTIDX','FUTSTK') AND expiry_date BETWEEN '${expiry_from}' AND '${expiry_to}' ORDER BY change_pct DESC LIMIT 50", "refId": "A" }] },
+    { "type": "table", "title": "Futures Price Losers",  "id": 507, "gridPos": { "h": 6, "w": 6, "x": 18, "y": 43 }, "datasource": { "type": "questdb", "uid": "tv-questdb" }, "targets": [{ "queryType": "table", "rawSql": "SELECT underlying_symbol, ltp, change_pct FROM movers_${timeframe} WHERE ts > dateadd('s', -90, now()) AND segment = 'D' AND instrument_type IN ('FUTIDX','FUTSTK') AND expiry_date BETWEEN '${expiry_from}' AND '${expiry_to}' ORDER BY change_pct ASC LIMIT 50", "refId": "A" }] },
+    {
+      "type": "row",
+      "title": "Depth (existing market_depth + deep_market_depth, Option C)",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 49 },
+      "id": 600,
+      "collapsed": false,
+      "panels": []
+    },
+    { "type": "table", "title": "Widest Spread",         "id": 601, "gridPos": { "h": 6, "w": 8, "x": 0,  "y": 50 }, "datasource": { "type": "questdb", "uid": "tv-questdb" }, "targets": [{ "queryType": "table", "rawSql": "SELECT security_id, ltp, ask_price[0] - bid_price[0] AS spread FROM market_depth WHERE ts > dateadd('s', -90, now()) ORDER BY spread DESC LIMIT 50", "refId": "A" }] },
+    { "type": "table", "title": "Tightest Spread",       "id": 602, "gridPos": { "h": 6, "w": 8, "x": 8,  "y": 50 }, "datasource": { "type": "questdb", "uid": "tv-questdb" }, "targets": [{ "queryType": "table", "rawSql": "SELECT security_id, ltp, ask_price[0] - bid_price[0] AS spread FROM market_depth WHERE ts > dateadd('s', -90, now()) AND ask_price[0] > bid_price[0] ORDER BY spread ASC LIMIT 50", "refId": "A" }] },
+    { "type": "table", "title": "Top Bid Pressure",      "id": 603, "gridPos": { "h": 6, "w": 8, "x": 16, "y": 50 }, "datasource": { "type": "questdb", "uid": "tv-questdb" }, "targets": [{ "queryType": "table", "rawSql": "SELECT security_id, bid_qty[0] + bid_qty[1] + bid_qty[2] + bid_qty[3] + bid_qty[4] AS bid_pressure FROM market_depth WHERE ts > dateadd('s', -90, now()) ORDER BY bid_pressure DESC LIMIT 50", "refId": "A" }] },
+    { "type": "table", "title": "Top Ask Pressure",      "id": 604, "gridPos": { "h": 6, "w": 8, "x": 0,  "y": 56 }, "datasource": { "type": "questdb", "uid": "tv-questdb" }, "targets": [{ "queryType": "table", "rawSql": "SELECT security_id, ask_qty[0] + ask_qty[1] + ask_qty[2] + ask_qty[3] + ask_qty[4] AS ask_pressure FROM market_depth WHERE ts > dateadd('s', -90, now()) ORDER BY ask_pressure DESC LIMIT 50", "refId": "A" }] },
+    { "type": "table", "title": "NIFTY ATM 200-Depth",   "id": 605, "gridPos": { "h": 6, "w": 8, "x": 8,  "y": 56 }, "datasource": { "type": "questdb", "uid": "tv-questdb" }, "targets": [{ "queryType": "table", "rawSql": "SELECT * FROM deep_market_depth WHERE security_id IN (${nifty_atm_ce}, ${nifty_atm_pe}) AND ts > dateadd('s', -90, now()) ORDER BY ts DESC LIMIT 200", "refId": "A" }] },
+    { "type": "table", "title": "BANKNIFTY ATM 200-Depth","id": 606, "gridPos": { "h": 6, "w": 8, "x": 16, "y": 56 }, "datasource": { "type": "questdb", "uid": "tv-questdb" }, "targets": [{ "queryType": "table", "rawSql": "SELECT * FROM deep_market_depth WHERE security_id IN (${banknifty_atm_ce}, ${banknifty_atm_pe}) AND ts > dateadd('s', -90, now()) ORDER BY ts DESC LIMIT 200", "refId": "A" }] }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 39,
+  "tags": ["movers", "22tf", "tickvault"],
+  "templating": {
+    "list": [
+      { "name": "timeframe", "type": "custom", "current": { "value": "1m" }, "options": [{ "value": "1s" }, { "value": "5s" }, { "value": "10s" }, { "value": "15s" }, { "value": "30s" }, { "value": "1m", "selected": true }, { "value": "2m" }, { "value": "3m" }, { "value": "4m" }, { "value": "5m" }, { "value": "6m" }, { "value": "7m" }, { "value": "8m" }, { "value": "9m" }, { "value": "10m" }, { "value": "11m" }, { "value": "12m" }, { "value": "13m" }, { "value": "14m" }, { "value": "15m" }, { "value": "30m" }, { "value": "1h" }] },
+      { "name": "expiry_from", "type": "textbox", "current": { "value": "2026-04-01" } },
+      { "name": "expiry_to", "type": "textbox", "current": { "value": "2026-06-30" } },
+      { "name": "nifty_atm_ce", "type": "textbox", "current": { "value": "0" } },
+      { "name": "nifty_atm_pe", "type": "textbox", "current": { "value": "0" } },
+      { "name": "banknifty_atm_ce", "type": "textbox", "current": { "value": "0" } },
+      { "name": "banknifty_atm_pe", "type": "textbox", "current": { "value": "0" } }
+    ]
+  },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "Asia/Kolkata",
+  "title": "Movers 22-TF (Phase 11 of v3 plan)",
+  "uid": "tv-movers-22tf",
+  "version": 1,
+  "weekStart": ""
+}

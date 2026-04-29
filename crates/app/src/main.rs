@@ -1937,6 +1937,12 @@ async fn main() -> Result<()> {
         tickvault_storage::materialized_views::ensure_candle_views(&config.questdb),
         ensure_greeks_tables(&config.questdb),
         tickvault_storage::movers_persistence::ensure_movers_tables(&config.questdb),
+        // Phase 10b-2: ensure all 22 movers_{T} tables exist alongside
+        // the existing stock_movers / option_movers tables. Idempotent
+        // CREATE TABLE IF NOT EXISTS — safe to call every boot per
+        // stream-resilience.md B10. The 22 ILP writers (one per
+        // timeframe) come up after this DDL fan-out completes.
+        tickvault_storage::movers_22tf_persistence::ensure_movers_22tf_tables(&config.questdb),
         tickvault_storage::indicator_snapshot_persistence::ensure_indicator_snapshot_table(
             &config.questdb
         ),
@@ -1991,6 +1997,40 @@ async fn main() -> Result<()> {
             metrics::counter!("tv_audit_write_failures_total", "table" => "boot_audit")
                 .increment(1);
         }
+    }
+
+    // -------------------------------------------------------------------
+    // Phase 10b-3-final — Movers 22-TF pipeline boot integration
+    //
+    // GATED behind env var TICKVAULT_MOVERS_22TF_PIPELINE_ENABLED=1
+    // (default disabled) so production boots without the new pipeline
+    // until tick_processor is taught to dual-feed Movers22TfTracker.
+    // The wiring helpers + tracker + writer + scheduler primitives are
+    // all unit-tested + chaos-tested; this block just composes them.
+    //
+    // Layout when enabled:
+    //   - 1× Movers22TfTracker (papaya, lock-free) — Arc-shared.
+    //   - 22× mpsc(8192) channels (one per timeframe).
+    //   - 22× consumer tokio tasks: each owns one Movers22TfWriter +
+    //     one Receiver; drains channel into ILP buffer with periodic
+    //     flush (CONSUMER_FLUSH_THRESHOLD = 1024 rows).
+    //   - 22× snapshot tokio tasks: each calls tracker.snapshot_into
+    //     at its cadence (1s..1h), gates on is_within_market_hours_ist,
+    //     forwards every row to the matching slot via try_enqueue_global.
+    //   - Global OnceLock<Movers22TfWriterState> installed via
+    //     init_global_writer_state.
+    if std::env::var("TICKVAULT_MOVERS_22TF_PIPELINE_ENABLED")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        info!(
+            "Phase 10b-3-final: TICKVAULT_MOVERS_22TF_PIPELINE_ENABLED=1 — bringing up movers 22-tf pipeline"
+        );
+        boot_movers_22tf_pipeline(&config.questdb).await;
+    } else {
+        info!(
+            "Phase 10b-3-final: movers 22-tf pipeline DISABLED (set TICKVAULT_MOVERS_22TF_PIPELINE_ENABLED=1 to enable)"
+        );
     }
 
     // Persist trading calendar to QuestDB (best-effort, non-blocking).
@@ -8506,4 +8546,180 @@ fn redact_ip_last_octet(raw: &str) -> String {
     }
     // Unknown shape — fully redact
     "[REDACTED]".to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Phase 10b-3-final — Movers 22-TF pipeline boot helper
+// ---------------------------------------------------------------------------
+//
+// Composes the 4 spawn helpers shipped in Phase 10/10b/10b-3a/10b-3b
+// into one boot-time function. Called from the env-gated block in
+// `main()` above. Side effects:
+//   - Constructs 22 ILP-bound `Movers22TfWriter` instances (one per
+//     timeframe). On QuestDB unreachable: logs the failure + skips
+//     that timeframe (boot continues).
+//   - Spawns 22 consumer tasks + 22 snapshot tasks + 1 global
+//     writer-state installer.
+//   - All tasks observe market-hours via the canonical helper
+//     (audit-findings Rule 3).
+//   - Tasks have NO shutdown signal yet — the existing graceful
+//     shutdown path will be extended in a follow-up to close the
+//     mpsc senders, which in turn drains the consumers.
+//
+// TEST-EXEMPT: end-to-end integration; the per-helper contracts are
+// covered by the unit tests in movers_22tf_boot.rs (10 tests) +
+// movers_22tf_writer.rs (3 tests) + the chaos throughput test.
+async fn boot_movers_22tf_pipeline(questdb_config: &tickvault_common::config::QuestDbConfig) {
+    use tickvault_common::mover_types::MOVERS_TIMEFRAMES;
+    use tickvault_core::pipeline::movers_22tf_boot::{
+        CONSUMER_FLUSH_THRESHOLD, build_movers_22tf_pipeline, spawn_consumer_task,
+        spawn_snapshot_task,
+    };
+    use tickvault_core::pipeline::movers_22tf_writer_state::{
+        EnqueueOutcome, init_global_writer_state, try_enqueue_global,
+    };
+    use tickvault_storage::movers_22tf_writer::Movers22TfWriter;
+
+    let pipeline = build_movers_22tf_pipeline();
+    let tracker = std::sync::Arc::new(pipeline.tracker.clone());
+    let mut receivers = pipeline.receivers;
+
+    // Install the global writer state — snapshot tasks read this via
+    // try_enqueue_global. Idempotent: returns false on second call.
+    if !init_global_writer_state(pipeline.writer_state) {
+        tracing::error!(
+            "Phase 10b-3-final: init_global_writer_state called twice — programmer bug; \
+             continuing with first-installed state"
+        );
+    }
+
+    // Phase 10c-2: install the global Movers22TfTracker so the tick
+    // processor's hot path can call try_update_global_tracker on every
+    // parsed tick. Without this install, the tracker stays empty and
+    // the snapshot tasks emit 0-row snapshots forever.
+    if !tickvault_core::pipeline::movers_22tf_tracker::init_global_tracker(std::sync::Arc::clone(
+        &tracker,
+    )) {
+        tracing::error!(
+            "Phase 10c-2: init_global_tracker called twice — programmer bug; \
+             continuing with first-installed tracker"
+        );
+    }
+
+    let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut consumer_handles: Vec<tokio::task::JoinHandle<()>> = Vec::with_capacity(22);
+    let mut snapshot_handles: Vec<tokio::task::JoinHandle<()>> = Vec::with_capacity(22);
+
+    for (idx, timeframe) in MOVERS_TIMEFRAMES.iter().enumerate() {
+        let label = timeframe.label;
+        let cadence = timeframe.cadence_secs;
+
+        // Construct the per-timeframe ILP writer. On connect failure
+        // (QuestDB unreachable), log + skip — boot continues. The
+        // matching consumer task is therefore NOT spawned, so the
+        // mpsc receiver sits idle; snapshot tasks will hit DroppedFull
+        // for that slot and emit MOVERS-22TF-01 metrics naturally.
+        let writer = match Movers22TfWriter::new(questdb_config, timeframe) {
+            Ok(w) => w,
+            Err(err) => {
+                tracing::error!(
+                    code = tickvault_common::error_code::ErrorCode::Movers22Tf01WriterIlpFailed
+                        .code_str(),
+                    timeframe = label,
+                    ?err,
+                    "Phase 10b-3-final: Movers22TfWriter construction failed — skipping consumer for this timeframe"
+                );
+                continue;
+            }
+        };
+
+        // Pop the matching receiver. We iterate in MOVERS_TIMEFRAMES
+        // order so receiver index always equals timeframe index.
+        if receivers.is_empty() {
+            tracing::error!(
+                timeframe = label,
+                "Phase 10b-3-final: receiver Vec exhausted — boot helper invariant violated"
+            );
+            break;
+        }
+        let receiver = receivers.remove(0);
+        consumer_handles.push(spawn_consumer_task(
+            writer,
+            receiver,
+            CONSUMER_FLUSH_THRESHOLD,
+        ));
+
+        // Snapshot task closures.
+        let enqueue = move |slot: usize, row: tickvault_common::mover_types::MoverRow| {
+            match try_enqueue_global(slot, row) {
+                EnqueueOutcome::Sent => {}
+                EnqueueOutcome::DroppedFull => {
+                    metrics::counter!(
+                        "tv_movers_writer_dropped_total",
+                        "timeframe" => label,
+                        "reason" => "full_drop_newest"
+                    )
+                    .increment(1);
+                }
+                EnqueueOutcome::Closed => {
+                    metrics::counter!(
+                        "tv_movers_writer_dropped_total",
+                        "timeframe" => label,
+                        "reason" => "closed"
+                    )
+                    .increment(1);
+                }
+                EnqueueOutcome::Uninit | EnqueueOutcome::OutOfRange => {
+                    metrics::counter!(
+                        "tv_movers_writer_dropped_total",
+                        "timeframe" => label,
+                        "reason" => "uninit_or_oor"
+                    )
+                    .increment(1);
+                }
+            }
+        };
+        let on_cycle = move |rows: usize| {
+            metrics::counter!(
+                "tv_movers_snapshot_rows_total",
+                "timeframe" => label,
+            )
+            .increment(rows as u64);
+        };
+        let now_nanos_fn = || -> i64 {
+            chrono::Utc::now()
+                .timestamp_nanos_opt()
+                .unwrap_or(0)
+                .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS)
+        };
+        let is_market_hours = || tickvault_common::market_hours::is_within_market_hours_ist();
+
+        snapshot_handles.push(spawn_snapshot_task(
+            idx,
+            cadence,
+            label,
+            std::sync::Arc::clone(&tracker),
+            enqueue,
+            is_market_hours,
+            now_nanos_fn,
+            on_cycle,
+            std::sync::Arc::clone(&shutdown),
+        ));
+    }
+
+    info!(
+        consumer_tasks = consumer_handles.len(),
+        snapshot_tasks = snapshot_handles.len(),
+        "Phase 10b-3-final: movers 22-tf pipeline UP"
+    );
+
+    // The handles are intentionally dropped — the tasks run for the
+    // remainder of the process lifetime. Graceful shutdown extension
+    // is a follow-up: dropping the writer-state OnceLock isn't possible
+    // (OnceLock is set-once), so the cleanest shutdown is via the
+    // already-shared `shutdown` AtomicBool, which a follow-up wires
+    // into the existing `wait_for_shutdown_signal` path.
+    drop(consumer_handles);
+    drop(snapshot_handles);
+    drop(shutdown);
 }

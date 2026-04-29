@@ -28,6 +28,15 @@ tick_gap_scan_gaps_full_universe = 5000000 # <5ms — Wave 2 Item 8.5: cold-path
 slo_score_evaluate_all_green = 1000      # <1µs — Wave 3-D Item 13: composite SLO score evaluator hot path (six clamps + five multiplies + 6-way min-scan). 1µs ceiling gives ~20× headroom over the measured median; regression past this size means a heap allocation or a powf entered the path.
 slo_score_evaluate_degraded = 1000       # <1µs — Wave 3-D Item 13: degraded path (find-weakest scan + threshold branches). Same budget as all-green.
 
+# Phase 12-runtime (2026-04-28) — Movers 22-TF primitives
+compute_swap_delta_150_30_overlap   = 50000   # <50µs — depth-20 dynamic top-150 set diff with 30-entry crossover (typical per-minute case).
+compute_swap_delta_full_overlap     = 50000   # <50µs — full 150 overlap (no-op delta path).
+compute_swap_delta_zero_overlap     = 50000   # <50µs — full 150-vs-150 swap (worst case).
+compute_next_tick_secs              = 50      # <50ns — pure integer arithmetic.
+compute_lag_secs                    = 50      # <50ns — saturating sub.
+should_emit_snapshot                = 50      # <50ns — single integer compare.
+parse_questdb_dataset_json_150_rows = 1000000 # <1ms — JSON parsing for 150-row payload (option_movers worst case).
+
 # Trading crate — OMS
 oms_state_transition     = 100          # <100ns — matches oms/state_transition
 

@@ -166,6 +166,49 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Section 8 — Movers DDL Integrity (Phase 13 of v3 plan)
+# ---------------------------------------------------------------------------
+# Verifies the 22 movers_{T} table DDL files + partition manager + S3
+# lifecycle config are all in sync. Source-only checks (no QuestDB
+# round-trip) so this stays fast and runs on a fresh clone.
+
+print_section "movers DDL integrity (Phase 13 sec 8)"
+
+# 22 movers tables registered in partition manager
+run_check "movers" "22 movers_{T} tables in partition manager" \
+    bash -c 'grep -cE "\"movers_(1s|5s|10s|15s|30s|[0-9]+m|1h)\"," crates/storage/src/partition_manager.rs | awk "{ exit (\$1 == 22 ? 0 : 1) }"'
+
+# S3 lifecycle config exists
+run_check "movers" "S3 lifecycle config exists for movers" \
+    test -f deploy/aws/s3-lifecycle-movers-tables.json
+
+# 22 movers_22tf canonical helper file
+run_check "movers" "movers_22tf_persistence module present" \
+    test -f crates/storage/src/movers_22tf_persistence.rs
+
+# DEDUP key includes segment per I-P1-11
+run_check "movers" "DEDUP_KEY_MOVERS_22TF includes segment" \
+    grep -q 'DEDUP_KEY_MOVERS_22TF.*segment' crates/storage/src/movers_22tf_persistence.rs
+
+# 22 timeframes constant pinned
+run_check "movers" "MOVERS_TIMEFRAMES has 22 entries" \
+    grep -q 'MOVERS_TIMEFRAME_COUNT: usize = 22' crates/common/src/mover_types.rs
+
+# ---------------------------------------------------------------------------
+# Section 9 — Movers Universe Coverage (Phase 13 of v3 plan)
+# ---------------------------------------------------------------------------
+# Live runtime check — only meaningful after the snapshot scheduler ships
+# in Phase 10. Until then it's a SKIP. Once shipped, queries Prometheus
+# for `tv_movers_universe_size` (target ~24,324 ± 5% during market hours).
+
+print_section "movers universe coverage (Phase 13 sec 9)"
+
+# This section's checks are wired in Phase 10 once the metrics emit.
+# Documented here so the section header is in place.
+printf "[SKIP] %-14s Prometheus metric tv_movers_universe_size — wires up in Phase 10\n" "movers"
+printf "[SKIP] %-14s Prometheus metric tv_movers_per_segment_count — wires up in Phase 10\n" "movers"
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 echo ""

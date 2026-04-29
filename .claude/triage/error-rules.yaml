@@ -1094,3 +1094,157 @@ rules:
       the failure list in the Telegram payload tells the operator which
       sub-check tripped. No auto-fix — sub-checks (main feed / QuestDB /
       token) are upstream of this module.
+
+  # -----------------------------------------------------------------------
+  # Wave 3-D — composite real-time guarantee score (drive-by fix 2026-04-28)
+  # -----------------------------------------------------------------------
+
+  - name: slo-01-healthy-recovery-silence
+    match:
+      code: SLO-01
+    action: silence
+    runbook_path: .claude/rules/project/wave-3-d-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      SLO-01 = composite real-time guarantee score recovered to healthy
+      (>= 0.95). Severity::Info positive ping; the Telegram message itself
+      is the operator-visible artifact. Silence locally.
+
+  - name: slo-02-degraded-escalate
+    match:
+      code: SLO-02
+    action: escalate
+    runbook_path: .claude/rules/project/wave-3-d-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      SLO-02 = composite score below 0.95 (Degraded) or below 0.80
+      (Critical). The `weakest` field on the Telegram payload names the
+      contributing dimension. Triage by following the dimension-specific
+      runbook (PHASE2-01, BOOT-01, AUTH-GAP-03, etc.). Never auto-fix
+      the composite — root cause is upstream.
+
+  # -----------------------------------------------------------------------
+  # Wave 2 — Depth-200 SELF token (drive-by fix 2026-04-28)
+  # -----------------------------------------------------------------------
+
+  - name: depth200-auth-01-invalid-at-boot-escalate
+    match:
+      code: DEPTH200-AUTH-01
+    action: escalate
+    runbook_path: .claude/rules/project/depth-200-auth-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      DEPTH200-AUTH-01 = SELF JWT in SSM failed validate_self_claims at
+      boot (APP type, wrong client_id, expired, or corrupt). Operator
+      pastes a fresh SELF token from web.dhan.co. Critical — never
+      auto-action because the wrong token will silently lock out
+      depth-200 for the trading day.
+
+  - name: depth200-auth-02-renewal-failed-escalate
+    match:
+      code: DEPTH200-AUTH-02
+    action: escalate
+    runbook_path: .claude/rules/project/depth-200-auth-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      DEPTH200-AUTH-02 = 23h RenewToken cycle failed (HTTP error / non-SELF
+      response / SSM PutParameter error). The arc-swap is not updated;
+      existing token continues until expiry. Operator investigates root
+      cause (Dhan-side change?, IAM permission?). Never auto-action.
+
+  - name: depth200-auth-03-ssm-unreachable-escalate
+    match:
+      code: DEPTH200-AUTH-03
+    action: escalate
+    runbook_path: .claude/rules/project/depth-200-auth-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      DEPTH200-AUTH-03 = AWS SSM unreachable (IAM / network / KMS).
+      Environmental failure — operator checks ssm:GetParameter +
+      kms:Decrypt permissions and network egress to ssm endpoint.
+
+  # -----------------------------------------------------------------------
+  # Phase 7 (2026-04-28) — Depth-20 dynamic top-150 selector
+  # -----------------------------------------------------------------------
+
+  - name: depth-dyn-01-top-set-empty-escalate
+    match:
+      code: DEPTH-DYN-01
+    action: escalate
+    runbook_path: .claude/rules/project/wave-4-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 1800
+    justification: >-
+      DEPTH-DYN-01 means the top-150 selector returned an empty (or
+      sub-50) set during market hours. Either option_movers stale,
+      universe empty, or no positive gainers in the last 90s. Operator
+      checks `SELECT count(*) FROM option_movers WHERE ts > now() - 5m`.
+      Severity::High; 30-min cooldown to avoid Telegram spam during
+      sustained low-volume periods. NEVER auto-fix — empty top-150 is
+      symptomatic of upstream failure (movers pipeline / market closed
+      mid-day / Dhan outage), not a fixable selector bug.
+
+  - name: depth-dyn-02-swap-channel-broken-escalate
+    match:
+      code: DEPTH-DYN-02
+    action: escalate
+    runbook_path: .claude/rules/project/wave-4-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 60
+    justification: >-
+      DEPTH-DYN-02 means one of the 3 dynamic depth-20 slots' Swap20
+      mpsc channel returned SendError — receiver task panicked or was
+      deallocated. Pool supervisor (WS-GAP-05) should respawn within
+      5s. Severity::Critical. 60s cooldown — repeated DEPTH-DYN-02
+      within 5 minutes indicates cascading failure that operator must
+      diagnose.
+
+  # -----------------------------------------------------------------------
+  # Phase 11 (2026-04-28) — Movers 22-TF
+  # -----------------------------------------------------------------------
+
+  - name: movers-22tf-01-writer-ilp-failed-escalate
+    match:
+      code: MOVERS-22TF-01
+    action: escalate
+    runbook_path: .claude/rules/project/movers-22tf-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 1800
+    justification: >-
+      MOVERS-22TF-01 means a Movers22TfWriter ILP append or flush
+      failed. The rescue ring buffers the row so single events are
+      recoverable; sustained failure indicates QuestDB ILP TCP port
+      issue or schema drift. 30-min cooldown to avoid Telegram spam
+      while the rescue ring catches up.
+
+  - name: movers-22tf-02-scheduler-panic-escalate
+    match:
+      code: MOVERS-22TF-02
+    action: escalate
+    runbook_path: .claude/rules/project/movers-22tf-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 60
+    justification: >-
+      MOVERS-22TF-02 means one of the 22 snapshot scheduler tasks
+      panicked. The MoversSupervisor respawns within 5s. Sustained
+      respawns indicate deterministic panic — operator must read the
+      backtrace from data/logs/errors.jsonl.*.
+
+  - name: movers-22tf-03-universe-drift-escalate
+    match:
+      code: MOVERS-22TF-03
+    action: escalate
+    runbook_path: .claude/rules/project/movers-22tf-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 1800
+    justification: >-
+      MOVERS-22TF-03 means tv_movers_universe_size drifted outside
+      24,324 ± 5% during market hours. Indicates universe build
+      regression OR stale Arc<MoversTracker> snapshot. Operator runs
+      `make doctor` section 9 to compare gauges + investigates the
+      latest InstrumentBuildSuccess Telegram event.
