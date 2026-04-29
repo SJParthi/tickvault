@@ -27,6 +27,12 @@ use tickvault_common::config::QuestDbConfig;
 const PARTITION_DDL_TIMEOUT_SECS: u64 = 30;
 
 /// Tables with HOUR partitioning (high-frequency data).
+///
+/// 2026-04-28 (Phase 8): added 22 `movers_{T}` tables for the movers
+/// 22-timeframe redesign. Each table is `PARTITION BY DAY WAL` but is
+/// listed here because it's high-frequency snapshot data subject to the
+/// same retention rotation. The constant name predates the rotation-vs-
+/// partition-period distinction.
 const HOUR_PARTITIONED_TABLES: &[&str] = &[
     "ticks",
     "market_depth",
@@ -39,6 +45,29 @@ const HOUR_PARTITIONED_TABLES: &[&str] = &[
     "indicator_snapshots",
     "stock_movers",
     "option_movers",
+    // Phase 8 (Movers 22-tf): 22 tables, one per timeframe.
+    "movers_1s",
+    "movers_5s",
+    "movers_10s",
+    "movers_15s",
+    "movers_30s",
+    "movers_1m",
+    "movers_2m",
+    "movers_3m",
+    "movers_4m",
+    "movers_5m",
+    "movers_6m",
+    "movers_7m",
+    "movers_8m",
+    "movers_9m",
+    "movers_10m",
+    "movers_11m",
+    "movers_12m",
+    "movers_13m",
+    "movers_14m",
+    "movers_15m",
+    "movers_30m",
+    "movers_1h",
 ];
 
 /// Tables with DAY partitioning (lower-frequency data).
