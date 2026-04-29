@@ -8593,6 +8593,19 @@ async fn boot_movers_22tf_pipeline(questdb_config: &tickvault_common::config::Qu
         );
     }
 
+    // Phase 10c-2: install the global Movers22TfTracker so the tick
+    // processor's hot path can call try_update_global_tracker on every
+    // parsed tick. Without this install, the tracker stays empty and
+    // the snapshot tasks emit 0-row snapshots forever.
+    if !tickvault_core::pipeline::movers_22tf_tracker::init_global_tracker(std::sync::Arc::clone(
+        &tracker,
+    )) {
+        tracing::error!(
+            "Phase 10c-2: init_global_tracker called twice — programmer bug; \
+             continuing with first-installed tracker"
+        );
+    }
+
     let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut consumer_handles: Vec<tokio::task::JoinHandle<()>> = Vec::with_capacity(22);
     let mut snapshot_handles: Vec<tokio::task::JoinHandle<()>> = Vec::with_capacity(22);
