@@ -32,10 +32,20 @@ use std::sync::Arc;
 
 use tickvault_common::mover_types::MoverRow;
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+use tracing::{info, warn};
 
 use crate::pipeline::movers_22tf_scheduler::MOVERS_22TF_MPSC_CAPACITY;
 use crate::pipeline::movers_22tf_tracker::Movers22TfTracker;
 use crate::pipeline::movers_22tf_writer_state::{MOVERS_22TF_WRITER_COUNT, Movers22TfWriterState};
+
+use tickvault_storage::movers_22tf_writer::Movers22TfWriter;
+
+/// Default flush threshold for consumer tasks — flush after N rows
+/// accumulate in the ILP buffer. Picked to balance ILP TCP throughput
+/// (larger batches = better) vs latency (smaller batches = quicker
+/// dashboard updates). 1024 rows ≈ 256 KB at 256 B/row.
+pub const CONSUMER_FLUSH_THRESHOLD: usize = 1024;
 
 /// Output of `build_movers_22tf_pipeline` — everything the boot wiring
 /// needs to install in main.rs.
@@ -96,6 +106,103 @@ pub fn build_movers_22tf_pipeline() -> Movers22TfPipeline {
 #[must_use]
 pub fn arc_tracker(pipeline: &Movers22TfPipeline) -> Arc<Movers22TfTracker> {
     Arc::new(pipeline.tracker.clone())
+}
+
+// ---------------------------------------------------------------------------
+// Phase 10b-3a — consumer task spawner
+// ---------------------------------------------------------------------------
+
+/// Spawns ONE consumer task that drains the given mpsc receiver into the
+/// given `Movers22TfWriter`. Each row is appended to the writer's ILP
+/// buffer; the buffer is flushed every `CONSUMER_FLUSH_THRESHOLD` rows.
+///
+/// The task exits cleanly when the sender side of the channel is
+/// dropped (returns `None` from `recv`). Final flush attempts to drain
+/// any remaining buffered rows before exit; failures are logged at
+/// WARN (the writer's own append/flush already emit MOVERS-22TF-01
+/// at ERROR if QuestDB is unreachable).
+///
+/// Generic over the writer to keep the spawner testable with
+/// `MockConsumerWriter` impls in the unit tests.
+pub fn spawn_consumer_task<W: ConsumerWriter + Send + 'static>(
+    mut writer: W,
+    mut receiver: mpsc::Receiver<MoverRow>,
+    flush_threshold: usize,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let label = writer.timeframe_label();
+        info!(
+            timeframe = label,
+            flush_threshold, "movers_22tf consumer task starting"
+        );
+        let mut total_appended: u64 = 0;
+        let mut total_dropped: u64 = 0;
+
+        while let Some(row) = receiver.recv().await {
+            match writer.append_row(&row) {
+                Ok(()) => {
+                    total_appended = total_appended.saturating_add(1);
+                }
+                Err(_) => {
+                    // Writer's append_row already emitted MOVERS-22TF-01
+                    // at ERROR with full context — no need to re-log here.
+                    total_dropped = total_dropped.saturating_add(1);
+                }
+            }
+            if writer.pending_count() >= flush_threshold {
+                if let Err(err) = writer.flush() {
+                    warn!(
+                        timeframe = label,
+                        ?err,
+                        "movers_22tf consumer flush failed — writer will reconnect"
+                    );
+                }
+            }
+        }
+
+        // Sender side dropped — drain final buffered rows.
+        if let Err(err) = writer.flush() {
+            warn!(
+                timeframe = label,
+                ?err,
+                "movers_22tf consumer final flush failed on shutdown"
+            );
+        }
+        info!(
+            timeframe = label,
+            total_appended, total_dropped, "movers_22tf consumer task exiting"
+        );
+    })
+}
+
+/// Trait abstraction for the consumer writer — implemented by
+/// `Movers22TfWriter` (the runtime ILP impl) and by `MockConsumerWriter`
+/// in tests. Keeps the spawn function generic + testable without a
+/// live QuestDB.
+pub trait ConsumerWriter {
+    /// Returns the timeframe label for tracing context.
+    fn timeframe_label(&self) -> &'static str;
+    /// Appends a row to the writer's buffer.
+    fn append_row(&mut self, row: &MoverRow) -> anyhow::Result<()>;
+    /// Returns the current pending row count.
+    fn pending_count(&self) -> usize;
+    /// Drains the buffer to QuestDB.
+    fn flush(&mut self) -> anyhow::Result<()>;
+}
+
+impl ConsumerWriter for Movers22TfWriter {
+    fn timeframe_label(&self) -> &'static str {
+        Movers22TfWriter::timeframe_label(self)
+    }
+    fn append_row(&mut self, row: &MoverRow) -> anyhow::Result<()> {
+        Movers22TfWriter::append_row(self, row)
+    }
+    fn pending_count(&self) -> usize {
+        Movers22TfWriter::pending_count(self)
+    }
+    fn flush(&mut self) -> anyhow::Result<()> {
+        Movers22TfWriter::flush(self)
+    }
 }
 
 #[cfg(test)]
@@ -164,5 +271,111 @@ mod tests {
             .try_recv()
             .expect("recv should succeed");
         assert_eq!(received.security_id, row.security_id);
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 10b-3a — consumer task spawner tests
+    // -----------------------------------------------------------------
+
+    /// Mock consumer writer for testing the spawn function without
+    /// needing a live QuestDB. Records every operation in counters.
+    struct MockConsumerWriter {
+        label: &'static str,
+        appended: Arc<std::sync::atomic::AtomicUsize>,
+        flushed: Arc<std::sync::atomic::AtomicUsize>,
+        pending: usize,
+    }
+
+    impl ConsumerWriter for MockConsumerWriter {
+        fn timeframe_label(&self) -> &'static str {
+            self.label
+        }
+        fn append_row(&mut self, _row: &MoverRow) -> anyhow::Result<()> {
+            self.pending += 1;
+            self.appended
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        }
+        fn pending_count(&self) -> usize {
+            self.pending
+        }
+        fn flush(&mut self) -> anyhow::Result<()> {
+            self.pending = 0;
+            self.flushed
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(())
+        }
+    }
+
+    /// Phase 10b-3a ratchet: consumer task drains the receiver into
+    /// the writer and flushes when threshold reached.
+    #[tokio::test]
+    async fn test_spawn_consumer_task_drains_and_flushes() {
+        use std::sync::atomic::Ordering;
+
+        let appended = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let flushed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let writer = MockConsumerWriter {
+            label: "1s",
+            appended: Arc::clone(&appended),
+            flushed: Arc::clone(&flushed),
+            pending: 0,
+        };
+        let (tx, rx) = mpsc::channel::<MoverRow>(64);
+        let handle = spawn_consumer_task(writer, rx, 5);
+
+        // Send 12 rows — flush threshold is 5, so we expect 2 mid-stream
+        // flushes (after 5 + 10) plus 1 final flush on channel close.
+        for _ in 0..12 {
+            tx.send(MoverRow::empty())
+                .await
+                .expect("send should succeed");
+        }
+        drop(tx);
+
+        // Wait for the task to finish.
+        handle.await.expect("task should complete cleanly");
+
+        assert_eq!(appended.load(Ordering::Relaxed), 12, "12 rows appended");
+        assert!(
+            flushed.load(Ordering::Relaxed) >= 2,
+            "at least 2 flushes (mid-stream at 5+10 OR end-of-stream); got {}",
+            flushed.load(Ordering::Relaxed)
+        );
+    }
+
+    /// Phase 10b-3a ratchet: consumer task exits cleanly when sender
+    /// drops with no rows received (final flush on empty buffer is a
+    /// no-op).
+    #[tokio::test]
+    async fn test_spawn_consumer_task_exits_on_empty_drop() {
+        use std::sync::atomic::Ordering;
+
+        let appended = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let flushed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let writer = MockConsumerWriter {
+            label: "1m",
+            appended: Arc::clone(&appended),
+            flushed: Arc::clone(&flushed),
+            pending: 0,
+        };
+        let (tx, rx) = mpsc::channel::<MoverRow>(64);
+        let handle = spawn_consumer_task(writer, rx, 5);
+
+        drop(tx);
+        handle.await.expect("task should complete on drop");
+
+        assert_eq!(appended.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            flushed.load(Ordering::Relaxed),
+            1,
+            "exactly one final flush on shutdown"
+        );
+    }
+
+    /// Phase 10b-3a ratchet: CONSUMER_FLUSH_THRESHOLD constant pinned.
+    #[test]
+    fn test_consumer_flush_threshold_is_1024() {
+        assert_eq!(CONSUMER_FLUSH_THRESHOLD, 1024);
     }
 }
