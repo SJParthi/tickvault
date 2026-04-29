@@ -37,6 +37,11 @@
 //! design.
 
 use std::collections::HashSet;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+use tracing::{error, info, warn};
 
 /// Maximum number of contracts to subscribe across the 3 dynamic depth-20
 /// slots. Each slot holds 50 contracts (Dhan's per-message + per-connection
@@ -218,6 +223,214 @@ pub fn parse_questdb_dataset_json(body: &str) -> HashSet<DynamicContractKey> {
 #[must_use]
 pub fn questdb_exec_url(host: &str, http_port: u16) -> String {
     format!("http://{host}:{http_port}/exec")
+}
+
+// ---------------------------------------------------------------------------
+// Phase 7b-runner — async dynamic-subscriber loop
+// ---------------------------------------------------------------------------
+
+/// HTTP timeout for the per-minute QuestDB selector query. Generous (5 s)
+/// because a single slow query is preferable to a missed snapshot — the
+/// rebalance happens off the hot path.
+pub const SELECTOR_QUERY_TIMEOUT_SECS: u64 = 5;
+
+/// Outcome of one selector cycle. Returned by `run_one_selector_cycle` so
+/// callers (and tests) can verify each step independently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelectorCycleOutcome {
+    /// Outside `[09:00, 15:30] IST` — loop continued without query.
+    /// Emitted to the falling-edge logger but does not page operator.
+    SkippedOffMarketHours,
+    /// QuestDB query failed (timeout / 5xx / parse error). Edge-triggered
+    /// `Depth20DynamicTopSetEmpty` may fire; previous set retained.
+    QueryFailed { reason: String },
+    /// Selector returned `< DEPTH_20_DYNAMIC_EMPTY_THRESHOLD` rows.
+    /// Edge-triggered alert fires once on rising edge.
+    EmptyOrUndersized {
+        returned_count: usize,
+        reason: &'static str,
+    },
+    /// Set is healthy — delta computed, Swap20 emitted to slots.
+    SwapApplied {
+        leavers: usize,
+        entrants: usize,
+        total_active: usize,
+    },
+    /// Same set as previous cycle — no Swap20 emitted (no-op path).
+    NoChange { total_active: usize },
+}
+
+/// Pure-function classifier — given the previous + current set, produces
+/// the cycle outcome WITHOUT emitting any Swap20. The runner uses this
+/// to decide whether to call its callback. Testable in isolation.
+#[must_use]
+pub fn classify_cycle_outcome(
+    previous: &HashSet<DynamicContractKey>,
+    current: &HashSet<DynamicContractKey>,
+) -> SelectorCycleOutcome {
+    if let Some(reason) = check_set_emptiness(current) {
+        return SelectorCycleOutcome::EmptyOrUndersized {
+            returned_count: current.len(),
+            reason,
+        };
+    }
+    let delta = compute_swap_delta(previous, current);
+    if delta.leavers.is_empty() && delta.entrants.is_empty() {
+        return SelectorCycleOutcome::NoChange {
+            total_active: delta.total_active,
+        };
+    }
+    SelectorCycleOutcome::SwapApplied {
+        leavers: delta.leavers.len(),
+        entrants: delta.entrants.len(),
+        total_active: delta.total_active,
+    }
+}
+
+/// Edge-triggered alert state for the runner. Mirrors the
+/// `currently_stale: HashSet<String>` pattern in `depth_rebalancer.rs`
+/// (audit-findings Rule 4) — the runner tracks whether the most-recent
+/// cycle was already in the "empty" state, so falling+rising edges
+/// each fire exactly once.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct EdgeTriggeredEmptyState {
+    is_empty_now: bool,
+}
+
+impl EdgeTriggeredEmptyState {
+    /// Update the state with the latest cycle outcome. Returns
+    /// `true` iff a Telegram alert should fire on the rising edge
+    /// (was healthy, now empty).
+    pub fn observe(&mut self, outcome: &SelectorCycleOutcome) -> bool {
+        let now_empty = matches!(outcome, SelectorCycleOutcome::EmptyOrUndersized { .. });
+        let rising_edge = now_empty && !self.is_empty_now;
+        self.is_empty_now = now_empty;
+        rising_edge
+    }
+}
+
+/// Async runner for the 1-minute dynamic top-150 selector loop. Pure
+/// data-flow; the IO callback (`fetch_top_set`) and the swap-emit
+/// callback (`emit_swap`) are injected so the runner is testable
+/// without QuestDB or mpsc senders.
+///
+/// Design rationale:
+/// - Market-hours gate per audit-findings Rule 3 — outside
+///   `[09:00, 15:30] IST` the loop sleeps + clears edge state.
+/// - Edge-triggered Telegram via `EdgeTriggeredEmptyState` per Rule 4.
+/// - `error!` (not `warn!`) on QueryFailed per Rule 5.
+/// - Bounded loop iteration — sleeps `DEPTH_20_DYNAMIC_RECOMPUTE_INTERVAL_SECS`
+///   between cycles. Shutdown checked at the start of each iteration.
+///
+/// The boot-wiring step (Phase 10b-2 follow-up) supplies:
+/// - `fetch_top_set` — closure that calls QuestDB `/exec` + parses
+///   the response via `parse_questdb_dataset_json`. Real impl uses
+///   `reqwest::Client`; tests use deterministic stubs.
+/// - `emit_swap` — closure that builds Swap20 messages from the
+///   delta (leavers + entrants) and `try_send`s them to the 3 slot
+///   mpsc senders. Real impl uses `DepthCommand::Swap20`; tests use
+///   counters.
+// WIRING-EXEMPT: Phase 10b-2 follow-up wires this into main.rs after the 3 dynamic depth-20 slots are allocated. The runner is fully testable in isolation via the injected callbacks.
+pub async fn run_dynamic_subscriber_loop<F, Fut, G>(
+    mut fetch_top_set: F,
+    mut emit_swap: G,
+    is_market_hours: impl Fn() -> bool,
+    shutdown: Arc<AtomicBool>,
+) where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<HashSet<DynamicContractKey>, String>>,
+    G: FnMut(&SelectorCycleOutcome),
+{
+    let mut previous: HashSet<DynamicContractKey> = HashSet::with_capacity(DEPTH_20_DYNAMIC_TOP_N);
+    let mut edge_state = EdgeTriggeredEmptyState::default();
+    let interval = Duration::from_secs(DEPTH_20_DYNAMIC_RECOMPUTE_INTERVAL_SECS);
+
+    info!(
+        interval_secs = DEPTH_20_DYNAMIC_RECOMPUTE_INTERVAL_SECS,
+        top_n = DEPTH_20_DYNAMIC_TOP_N,
+        "depth-20 dynamic subscriber loop started"
+    );
+
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            info!("depth-20 dynamic subscriber loop shutting down");
+            break;
+        }
+
+        tokio::time::sleep(interval).await;
+
+        if shutdown.load(Ordering::Relaxed) {
+            break;
+        }
+
+        // Market-hours gate (audit-findings Rule 3). Outside the window
+        // we clear the edge state so the next market-open's first empty
+        // detection fires correctly as a rising edge.
+        if !is_market_hours() {
+            edge_state = EdgeTriggeredEmptyState::default();
+            let outcome = SelectorCycleOutcome::SkippedOffMarketHours;
+            emit_swap(&outcome);
+            continue;
+        }
+
+        // Query QuestDB + parse. Failures keep `previous` intact so the
+        // next cycle re-tries against the same baseline.
+        let current = match fetch_top_set().await {
+            Ok(set) => set,
+            Err(reason) => {
+                let outcome = SelectorCycleOutcome::QueryFailed { reason };
+                error!(
+                    code = "DEPTH-DYN-01",
+                    ?outcome,
+                    "depth-20 dynamic top-150 query failed — keeping previous set"
+                );
+                emit_swap(&outcome);
+                continue;
+            }
+        };
+
+        let outcome = classify_cycle_outcome(&previous, &current);
+        let rising_empty_edge = edge_state.observe(&outcome);
+
+        match &outcome {
+            SelectorCycleOutcome::EmptyOrUndersized {
+                returned_count,
+                reason,
+            } => {
+                if rising_empty_edge {
+                    warn!(
+                        code = "DEPTH-DYN-01",
+                        returned_count,
+                        reason,
+                        "depth-20 dynamic top-150 set is empty / undersized — rising edge"
+                    );
+                }
+                // Don't update `previous` — keep the last healthy baseline
+                // so the next recovery cycle computes a clean delta.
+            }
+            SelectorCycleOutcome::SwapApplied {
+                leavers,
+                entrants,
+                total_active,
+            } => {
+                info!(
+                    leavers,
+                    entrants, total_active, "depth-20 dynamic top-150 swap applied"
+                );
+                previous = current;
+            }
+            SelectorCycleOutcome::NoChange { total_active } => {
+                info!(total_active, "depth-20 dynamic top-150 unchanged");
+                // previous == current already.
+            }
+            SelectorCycleOutcome::QueryFailed { .. }
+            | SelectorCycleOutcome::SkippedOffMarketHours => {
+                // Already handled above.
+            }
+        }
+
+        emit_swap(&outcome);
+    }
 }
 
 #[cfg(test)]
@@ -487,5 +700,168 @@ mod tests {
             questdb_exec_url("127.0.0.1", 9000),
             "http://127.0.0.1:9000/exec"
         );
+    }
+
+    /// Phase 7b-runner ratchet: classifier produces SwapApplied when
+    /// previous != current and current is healthy.
+    #[test]
+    fn test_classify_cycle_outcome_swap_applied() {
+        let mut prev: HashSet<DynamicContractKey> = HashSet::new();
+        for i in 0..50 {
+            prev.insert((i, 'D'));
+        }
+        let mut curr: HashSet<DynamicContractKey> = HashSet::new();
+        for i in 25..75 {
+            curr.insert((i, 'D'));
+        }
+        let outcome = classify_cycle_outcome(&prev, &curr);
+        assert_eq!(
+            outcome,
+            SelectorCycleOutcome::SwapApplied {
+                leavers: 25,
+                entrants: 25,
+                total_active: 50,
+            }
+        );
+    }
+
+    /// Phase 7b-runner ratchet: classifier produces NoChange when
+    /// previous == current.
+    #[test]
+    fn test_classify_cycle_outcome_no_change_when_identical() {
+        let mut prev: HashSet<DynamicContractKey> = HashSet::new();
+        for i in 0..50 {
+            prev.insert((i, 'D'));
+        }
+        let curr = prev.clone();
+        let outcome = classify_cycle_outcome(&prev, &curr);
+        assert_eq!(outcome, SelectorCycleOutcome::NoChange { total_active: 50 });
+    }
+
+    /// Phase 7b-runner ratchet: classifier produces EmptyOrUndersized
+    /// when current.len() < threshold (50).
+    #[test]
+    fn test_classify_cycle_outcome_empty_when_below_threshold() {
+        let prev: HashSet<DynamicContractKey> = HashSet::new();
+        let mut curr: HashSet<DynamicContractKey> = HashSet::new();
+        for i in 0..30 {
+            curr.insert((i, 'D'));
+        }
+        let outcome = classify_cycle_outcome(&prev, &curr);
+        assert_eq!(
+            outcome,
+            SelectorCycleOutcome::EmptyOrUndersized {
+                returned_count: 30,
+                reason: "below_slot_capacity",
+            }
+        );
+    }
+
+    /// Phase 7b-runner ratchet: classifier produces EmptyOrUndersized
+    /// with `zero_results` when current is fully empty.
+    #[test]
+    fn test_classify_cycle_outcome_empty_when_zero_results() {
+        let prev: HashSet<DynamicContractKey> = HashSet::new();
+        let curr: HashSet<DynamicContractKey> = HashSet::new();
+        let outcome = classify_cycle_outcome(&prev, &curr);
+        assert_eq!(
+            outcome,
+            SelectorCycleOutcome::EmptyOrUndersized {
+                returned_count: 0,
+                reason: "zero_results",
+            }
+        );
+    }
+
+    /// Phase 7b-runner ratchet: edge-triggered alert fires ONCE on rising
+    /// edge from healthy → empty, NOT on subsequent empty cycles.
+    #[test]
+    fn test_edge_triggered_empty_state_fires_once_on_rising_edge() {
+        let mut state = EdgeTriggeredEmptyState::default();
+
+        // Cycle 1: healthy → no alert
+        let healthy = SelectorCycleOutcome::SwapApplied {
+            leavers: 10,
+            entrants: 10,
+            total_active: 50,
+        };
+        assert!(!state.observe(&healthy));
+
+        // Cycle 2: empty → rising edge → ALERT
+        let empty = SelectorCycleOutcome::EmptyOrUndersized {
+            returned_count: 0,
+            reason: "zero_results",
+        };
+        assert!(state.observe(&empty), "rising edge must fire");
+
+        // Cycle 3: still empty → no alert (already alerted)
+        assert!(!state.observe(&empty), "sustained empty must not re-fire");
+
+        // Cycle 4: empty → still no alert
+        assert!(!state.observe(&empty));
+
+        // Cycle 5: healthy → no alert
+        assert!(!state.observe(&healthy));
+
+        // Cycle 6: empty again → rising edge → ALERT
+        assert!(state.observe(&empty), "second rising edge must fire");
+    }
+
+    /// Phase 7b-runner ratchet: SELECTOR_QUERY_TIMEOUT_SECS pinned at 5s.
+    #[test]
+    fn test_selector_query_timeout_is_5_seconds() {
+        assert_eq!(SELECTOR_QUERY_TIMEOUT_SECS, 5);
+    }
+
+    /// Phase 7b-runner ratchet: SkippedOffMarketHours and QueryFailed
+    /// outcomes do NOT trip the empty-state edge.
+    #[test]
+    fn test_edge_state_does_not_fire_on_skip_or_query_failure() {
+        let mut state = EdgeTriggeredEmptyState::default();
+        assert!(!state.observe(&SelectorCycleOutcome::SkippedOffMarketHours));
+        assert!(!state.observe(&SelectorCycleOutcome::QueryFailed {
+            reason: "test".to_string(),
+        }));
+    }
+
+    /// Phase 7b-runner ratchet: the loop runs at least once with a
+    /// market-hours gate that always returns false (off-market) and
+    /// shuts down on the second iteration. Verifies the off-hours
+    /// path emits SkippedOffMarketHours via the callback.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_run_dynamic_subscriber_loop_off_hours_emits_skipped() {
+        use std::sync::Mutex;
+        let outcomes: Arc<Mutex<Vec<SelectorCycleOutcome>>> = Arc::new(Mutex::new(Vec::new()));
+        let outcomes_clone = Arc::clone(&outcomes);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_clone = Arc::clone(&shutdown);
+
+        let fetch = move || async move {
+            // Should never be called when off-hours.
+            unreachable!("fetch should not run during off-market hours");
+        };
+        let emit = move |outcome: &SelectorCycleOutcome| {
+            outcomes_clone.lock().unwrap().push(outcome.clone());
+            // Trigger shutdown after the first outcome so the loop exits.
+            shutdown_clone.store(true, Ordering::Relaxed);
+        };
+
+        let runner = run_dynamic_subscriber_loop(
+            fetch,
+            emit,
+            || false, // always off-hours
+            Arc::clone(&shutdown),
+        );
+
+        tokio::time::timeout(Duration::from_secs(120), runner)
+            .await
+            .expect("loop should exit on shutdown");
+
+        let captured = outcomes.lock().unwrap();
+        assert!(!captured.is_empty(), "at least one cycle should run");
+        assert!(matches!(
+            captured[0],
+            SelectorCycleOutcome::SkippedOffMarketHours
+        ));
     }
 }
