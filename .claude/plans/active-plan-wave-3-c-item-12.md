@@ -59,3 +59,10 @@
 | 4 | Token <4h | token_h=3h | `Critical` contains `"token_expiry_headroom"` |
 | 5 | Pipeline inactive | pipeline=false | `Degraded` contains `"pipeline_active"` |
 | 6 | Stale tick | tick_age=120s | `Degraded` contains `"recent_tick"` |
+
+## Per-Wave Guarantee Matrix (cross-reference)
+
+See `.claude/rules/project/per-wave-guarantee-matrix.md` — all 15 rows of the
+100% Guarantee Matrix and all 7 rows of the Resilience Demand Matrix apply to
+every item in this plan. Mechanical enforcement via
+`.claude/hooks/per-item-guarantee-check.sh` (CI gate).

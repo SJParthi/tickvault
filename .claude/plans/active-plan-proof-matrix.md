@@ -91,3 +91,10 @@ greeks_lag_with_movers_running_p99_ms = 50
 ```
 
 `scripts/bench-gate.sh` enforces 5% regression cap across all 9.
+
+## Per-Wave Guarantee Matrix (cross-reference)
+
+See `.claude/rules/project/per-wave-guarantee-matrix.md` — all 15 rows of the
+100% Guarantee Matrix and all 7 rows of the Resilience Demand Matrix apply to
+every item in this plan. Mechanical enforcement via
+`.claude/hooks/per-item-guarantee-check.sh` (CI gate).

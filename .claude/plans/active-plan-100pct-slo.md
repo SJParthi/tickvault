@@ -137,3 +137,10 @@ Dashboard pinned by `crates/storage/tests/operator_100pct_dashboard_guard.rs` sn
 ## What this gives the operator (one paragraph)
 
 After Wave 3 merges, the operator answers "is everything OK?" by glancing at one Grafana panel showing one number. If it's 100, every guarantee in the matrix is currently true. If it's not, the dashboard shows which sub-gauge failed; the SLO-01 Telegram alert points at the runbook; the auto-triage either fixes it or escalates with full context. No grep, no `docker logs`, no manual SQL — the whole observability stack converges to a single `bool`.
+
+## Per-Wave Guarantee Matrix (cross-reference)
+
+See `.claude/rules/project/per-wave-guarantee-matrix.md` — all 15 rows of the
+100% Guarantee Matrix and all 7 rows of the Resilience Demand Matrix apply to
+every item in this plan. Mechanical enforcement via
+`.claude/hooks/per-item-guarantee-check.sh` (CI gate).
