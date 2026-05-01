@@ -1294,7 +1294,7 @@ LIMIT 50;                             -- depth-200 takes first 5 of these (share
 - Migrate `HashMap<u32, OhlcvState>` → `HashMap<(u32, ExchangeSegment), OhlcvState>`. Update banned-pattern scanner glob to include `crates/core/src/pipeline/candle_aggregator.rs`.
 - 9-box: ① N/A ② reuse I-P1-11 ③ N/A (lookup, no error) ④ `tv_candle_aggregator_keyspace_size` gauge ⑤ existing I-P1-11 panel ⑥ N/A ⑦ `tick_processor::on_tick` ⑧ N/A ⑨ regression test on collision pair
 
-### - [ ] 8. Fix HIGH: `warn!` → `error!` at tick_persistence.rs:357
+### - [x] 8. Fix HIGH: `warn!` → `error!` at tick_persistence.rs:357
 
 - Files: `crates/storage/src/tick_persistence.rs:357`
 - Tests: `crates/storage/tests/error_level_meta_guard.rs` (existing meta-guard catches new violations going forward; one-time fix is the line itself)

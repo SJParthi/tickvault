@@ -352,7 +352,12 @@ impl TickPersistenceWriter {
         if self.pending_count >= TICK_FLUSH_BATCH_SIZE
             && let Err(err) = self.force_flush()
         {
-            warn!(
+            // Wave 5 Item 8: flush/persist failure must be `error!` (Loki →
+            // Telegram), not `warn!`. See
+            // .claude/rules/project/observability-architecture.md Rule 5.
+            // Item 9 will attach a typed `code` field once the dedicated
+            // TickFlushFailed ErrorCode variant lands.
+            error!(
                 ?err,
                 "tick auto-flush failed — in-flight ticks rescued to ring buffer"
             );
