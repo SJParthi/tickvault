@@ -29,6 +29,8 @@ const REQUIRE_ERROR_LEVEL_PHRASES: &[&str] = &[
     "bufwriter flush failed before drain",
     "flush during spill drain failed",
     "spill drain final flush failed",
+    // Wave 5 Item 8 — auto-flush escalated 2026-05-01.
+    "tick auto-flush failed",
     // Depth persistence
     "flush during depth ring buffer drain failed",
     "depth ring buffer final flush failed",
