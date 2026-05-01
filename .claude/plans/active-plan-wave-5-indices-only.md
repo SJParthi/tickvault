@@ -1241,7 +1241,7 @@ LIMIT 50;                             -- depth-200 takes first 5 of these (share
 - Test additions: `test_depth_200_reuses_depth_20_selector_result_no_separate_query`, `test_depth_200_excludes_sensex_takes_next_eligible`, `test_depth_200_5_conns_x_1_instrument_each`, `test_depth_200_query_uses_ist_offset_for_ts_freshness`
 - 9-box: ① new `Depth200TopGainersSwapped` (Severity::Low, edge-triggered) + reuse `Depth200SwapChannelBroken` (existing DEPTH-DYN-02) ② `DEPTH-200-DYN-01` (top-5 selector returned < 5, severity High) ③ `error!(code = ErrorCode::Depth200Dyn01TopSetEmpty.code_str())` ④ `tv_depth_200_top_gainers_set_size`, `tv_depth_200_top_gainers_swaps_total` ⑤ Operator Health "Depth-200 top-5" panel ⑥ `tv-depth-200-dyn-01-empty-set` ⑦ `main.rs::run_depth_200_top_gainers_loop` ⑧ `.claude/triage/error-rules.yaml::depth-200-dyn-01-top-set-empty-escalate` ⑨ all 5 tests above
 
-### - [ ] 6. Wire `core_affinity` — pin 4 Tokio workers to 4 vCPUs (Mac dev MIRRORS AWS 4-vCPU)
+### - [x] 6. Wire `core_affinity` — pin 4 Tokio workers to 4 vCPUs (Mac dev MIRRORS AWS 4-vCPU)
 
 **Operator decision 2026-05-01:** Dev Mac (M4 Pro 14 cores = 10P + 4E) MUST reproduce the AWS c7i.xlarge 4-vCPU configuration EXACTLY for parity testing. Operator verbatim: "even in our local dev macbook also reproduce the same aws 4vcpu dude okay?"
 
