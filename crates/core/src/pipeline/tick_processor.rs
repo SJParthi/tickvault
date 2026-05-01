@@ -906,6 +906,15 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
     // O(1) dedup ring buffer — pre-allocated once, zero allocation in hot loop.
     let mut dedup_ring = TickDedupRing::new(DEDUP_RING_BUFFER_POWER);
 
+    // Wave 5 Item 26 L1 — volume monotonicity guard. One HashMap entry
+    // per (security_id, segment) tracking last-seen volume. On each
+    // tick: O(1) lookup; if `volume < previous` within trading day,
+    // emit ERROR `VOLUME-MONO-01` + Prom counter. Silent on the happy
+    // path. Cleared at IST midnight via the `FirstSeenSet`-class daily
+    // reset task (separate scheduler).
+    let mut volume_monotonicity_guard =
+        super::volume_monotonicity_guard::VolumeMonotonicityGuard::new();
+
     // Defense-in-depth: reject stale ticks from previous trading days.
     // exchange_timestamp is IST epoch seconds; dividing by 86400 gives the IST day number.
     // Computed once at startup — valid for the entire trading session (09:00–15:30).
@@ -1260,6 +1269,21 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                 if let Some(ref mut opt_movers) = option_movers {
                     opt_movers.update(&tick);
                 }
+
+                // Wave 5 Item 26 L1 — volume monotonicity guard.
+                // O(1) per tick. Silent unless Dhan breaks its
+                // cumulative-since-session-open semantic; on breach
+                // emits ERROR `VOLUME-MONO-01` + Prom counter.
+                // IDX_I (segment 0) ticks have `volume == 0` (Ticker
+                // mode), so the guard sees a single 0-baseline and
+                // never flags. NSE_EQ / NSE_FNO / BSE_FNO ticks
+                // carry the cumulative session volume from Dhan's
+                // Quote / Full packets.
+                let _ = volume_monotonicity_guard.observe(
+                    tick.security_id,
+                    tick.exchange_segment_code,
+                    tick.volume,
+                );
 
                 // Phase 10c-2 — dual-feed: also push the tick into the
                 // global Movers22TfTracker so the 22-tf snapshot tasks
