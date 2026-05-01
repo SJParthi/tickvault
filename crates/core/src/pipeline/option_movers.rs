@@ -50,9 +50,28 @@ const OPTION_MAP_INITIAL_CAPACITY: usize = 30_000;
 const MIN_OI_THRESHOLD: u32 = 100;
 
 /// Exchange segment code for NSE_FNO (derivatives).
-/// INTENTIONAL: BSE_FNO (segment 8) is excluded — Dhan's depth and option chain
-/// APIs only support NSE segments. BSE_FNO instruments have no depth/OI data.
 const NSE_FNO_SEGMENT: u8 = 2;
+
+/// Exchange segment code for BSE_FNO (SENSEX derivatives).
+///
+/// Wave 5 Item 12 (2026-05-01) — added so SENSEX option contracts are
+/// tracked in `option_movers`. The earlier "BSE_FNO is excluded" comment
+/// confused two separate concerns: Dhan's DEPTH and OPTION-CHAIN APIs do
+/// not support BSE_FNO (so depth-20 / depth-200 selectors skip SENSEX —
+/// see Wave 5 Items 4 + 5), but the MAIN-FEED Full/Quote packets DO
+/// carry SENSEX option ticks including OI in bytes 34-37 of the Full
+/// packet. The movers tracker reads exactly those fields, so
+/// SENSEX is fully observable here.
+const BSE_FNO_SEGMENT: u8 = 8;
+
+/// Returns true when the given segment code is a derivative-options
+/// segment that the movers tracker should accept. Wave 5 Item 12
+/// extends this to NSE_FNO + BSE_FNO so the indices-only universe
+/// (NIFTY + BANKNIFTY + SENSEX) is fully covered.
+#[inline]
+const fn is_option_movers_segment(segment_code: u8) -> bool {
+    segment_code == NSE_FNO_SEGMENT || segment_code == BSE_FNO_SEGMENT
+}
 
 // ---------------------------------------------------------------------------
 // OptionMoverEntry — public snapshot entry
@@ -169,8 +188,9 @@ impl OptionMoversTracker {
     /// O(1) — single HashMap lookup + arithmetic.
     #[inline]
     pub fn update(&mut self, tick: &ParsedTick) {
-        // Only track F&O derivatives
-        if tick.exchange_segment_code != NSE_FNO_SEGMENT {
+        // Only track F&O derivatives (NSE_FNO + BSE_FNO under Wave 5
+        // indices-only universe — SENSEX options live on BSE_FNO).
+        if !is_option_movers_segment(tick.exchange_segment_code) {
             return;
         }
 
@@ -207,7 +227,7 @@ impl OptionMoversTracker {
     /// Called when a PrevClose packet arrives for an F&O instrument.
     /// This sets the baseline for OI change calculations.
     pub fn update_prev_oi(&mut self, security_id: u32, segment_code: u8, prev_oi: u32) {
-        if segment_code != NSE_FNO_SEGMENT {
+        if !is_option_movers_segment(segment_code) {
             return;
         }
         let key = (security_id, segment_code);
@@ -223,7 +243,7 @@ impl OptionMoversTracker {
     /// hours, `tick.day_close` is 0 (exchange only sets it post-market), so
     /// PrevClose packets are the only source of previous close price.
     pub fn update_prev_close(&mut self, security_id: u32, segment_code: u8, prev_close: f32) {
-        if segment_code != NSE_FNO_SEGMENT {
+        if !is_option_movers_segment(segment_code) {
             return;
         }
         if !prev_close.is_finite() || prev_close <= 0.0 {
@@ -899,5 +919,113 @@ mod tests {
             0,
             "non-FNO segment should be ignored"
         );
+    }
+
+    // ----------------------------------------------------------------------
+    // Wave 5 Item 12 — universe filter ratchet.
+    //
+    // Under indices-only scope (Items 1 + 2), the F&O universe is
+    // NIFTY + BANKNIFTY (NSE_FNO) + SENSEX (BSE_FNO). Pre-Wave-5 the
+    // tracker filtered ticks to NSE_FNO only and silently dropped every
+    // SENSEX option tick — invisible failure for ~2,283 contracts. This
+    // test pins the fix: BSE_FNO ticks are ALSO accepted, so the
+    // tracker matches the subscription set.
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn test_option_movers_universe_matches_subscription_set_under_indices_only_scope() {
+        let mut tracker = OptionMoversTracker::new();
+
+        // 1. NSE_FNO option (NIFTY 22000 CE) — accepted as before.
+        let nse_fno_tick = ParsedTick {
+            security_id: 49_000,
+            exchange_segment_code: NSE_FNO_SEGMENT,
+            last_traded_price: 150.0,
+            day_close: 140.0,
+            open_interest: 50_000,
+            volume: 1_000,
+            ..ParsedTick::default()
+        };
+        tracker.update(&nse_fno_tick);
+        assert_eq!(tracker.tracked_count(), 1, "NSE_FNO must be tracked");
+
+        // 2. BSE_FNO option (SENSEX 81000 PE) — Wave 5 Item 12 fix.
+        let bse_fno_tick = ParsedTick {
+            security_id: 80_000,
+            exchange_segment_code: BSE_FNO_SEGMENT,
+            last_traded_price: 95.0,
+            day_close: 90.0,
+            open_interest: 12_000,
+            volume: 500,
+            ..ParsedTick::default()
+        };
+        tracker.update(&bse_fno_tick);
+        assert_eq!(
+            tracker.tracked_count(),
+            2,
+            "BSE_FNO (SENSEX) options MUST be tracked under Wave 5 \
+             indices-only scope; the tracker dropped them silently \
+             before Item 12."
+        );
+
+        // 3. NSE_EQ tick — still rejected (cash equities have their
+        //    own movers tracker `StockMoversTracker`).
+        let nse_eq_tick = ParsedTick {
+            security_id: 1234,
+            exchange_segment_code: 1, // NSE_EQ
+            last_traded_price: 2_500.0,
+            day_close: 2_400.0,
+            open_interest: 0,
+            volume: 100,
+            ..ParsedTick::default()
+        };
+        tracker.update(&nse_eq_tick);
+        assert_eq!(
+            tracker.tracked_count(),
+            2,
+            "NSE_EQ ticks must NOT enter option_movers tracker"
+        );
+
+        // 4. IDX_I tick — still rejected (indices have no option movers).
+        let idx_i_tick = ParsedTick {
+            security_id: 13,
+            exchange_segment_code: 0, // IDX_I
+            last_traded_price: 22_500.0,
+            day_close: 22_400.0,
+            open_interest: 0,
+            volume: 0,
+            ..ParsedTick::default()
+        };
+        tracker.update(&idx_i_tick);
+        assert_eq!(
+            tracker.tracked_count(),
+            2,
+            "IDX_I ticks must NOT enter option_movers tracker"
+        );
+
+        // 5. update_prev_close + update_prev_oi must accept BSE_FNO too.
+        tracker.update_prev_close(80_000, BSE_FNO_SEGMENT, 92.0);
+        tracker.update_prev_oi(80_000, BSE_FNO_SEGMENT, 11_500);
+        // No assertion: would need to read internal state — covered by
+        // existing `test_update_prev_close_*` tests + the `is_option_movers_segment`
+        // function being a single source of truth for the gate.
+    }
+
+    /// Compile-time guard: the segment helper recognises both NSE_FNO and
+    /// BSE_FNO. If a future refactor narrows the gate back to NSE_FNO-only
+    /// (regressing Item 12), this test fails.
+    #[test]
+    fn test_is_option_movers_segment_accepts_nse_fno_and_bse_fno_only() {
+        assert!(is_option_movers_segment(NSE_FNO_SEGMENT));
+        assert!(is_option_movers_segment(BSE_FNO_SEGMENT));
+        // Other segment codes (per types.rs):
+        // 0 = IDX_I, 1 = NSE_EQ, 3 = NSE_CURRENCY, 4 = BSE_EQ,
+        // 5 = MCX_COMM, 7 = BSE_CURRENCY. None should pass.
+        for seg in [0u8, 1, 3, 4, 5, 6, 7, 9, 255] {
+            assert!(
+                !is_option_movers_segment(seg),
+                "segment {seg} must NOT be accepted by option_movers"
+            );
+        }
     }
 }
