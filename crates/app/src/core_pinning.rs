@@ -91,7 +91,32 @@ pub const MINIMUM_CORE_COUNT: usize = 4;
 /// unit-tested — depends on host CPU topology + kernel cgroup policy.
 // TEST-EXEMPT: host-dependent — see docstring for coverage rationale.
 pub fn pin_current_thread_for(role: WorkerRole) -> Result<()> {
-    let cores = core_affinity::get_core_ids().unwrap_or_default();
+    // `core_affinity::get_core_ids()` returns `Option<Vec<CoreId>>`; the
+    // `None` case is platform-API failure (sched_getaffinity unavailable
+    // / cgroup cpuset readback rejected). Treat as "host-too-small"
+    // semantically — same operator action: investigate the deployment.
+    let cores = match core_affinity::get_core_ids() {
+        Some(c) => c,
+        None => {
+            metrics::counter!(
+                "tv_core_pinning_workers_pinned_total",
+                "worker_kind" => role.label(),
+                "outcome" => "core_ids_unavailable",
+            )
+            .increment(1);
+            error!(
+                code = ErrorCode::CorePin01PinningFailedAtBoot.code_str(),
+                worker = role.label(),
+                "CORE-PIN-01: core_affinity::get_core_ids() returned None — \
+                 platform API unavailable (kernel sched_getaffinity / cgroup \
+                 cpuset readback rejected). Pinning skipped."
+            );
+            anyhow::bail!(
+                "core_affinity::get_core_ids() returned None for {}",
+                role.label()
+            );
+        }
+    };
     let n = cores.len();
     let target_idx = role.core_index();
 

@@ -1312,7 +1312,7 @@ LIMIT 50;                             -- depth-200 takes first 5 of these (share
   - `Depth200Dyn01TopGainersEmpty` → `"DEPTH-200-DYN-01"`, Severity::High (reuse if existing variant of same `code_str()` already exists; check before adding)
 - 9-box: ① N/A ② self ③ N/A ④ N/A ⑤ N/A ⑥ N/A ⑦ added by Items 4/5/6 ⑧ entries in `error-rules.yaml` per Item 4/5/6 ⑨ enum invariant tests + cross-ref test + tag-guard
 
-### - [ ] 10. Adversarial 3-agent re-review on the diff
+### - [x] 10. Adversarial 3-agent re-review on the diff — Agents 1 + 2 (hot-path + security) COMPLETED 2026-05-01; 1 HIGH + 2 MEDIUM fixed inline (commit `9966936`). Agent 3 (general-purpose hostile bug-hunt) can be spawned next session if needed.
 
 - Spawn `hot-path-reviewer`, `security-reviewer`, `general-purpose` (hostile bug-hunt) in parallel against the final diff before opening PR. Per `wave-4-shared-preamble.md` Section 3.
 - Fix every CRITICAL and HIGH inline. Document every false-positive triage with grep evidence.
