@@ -340,6 +340,59 @@ pub enum ErrorCode {
     /// (24,324 ± 5% during market hours). Indicates universe build
     /// failure or unexpected instrument loss. Severity::Medium.
     Movers22Tf03UniverseDrift,
+
+    // -----------------------------------------------------------------------
+    // Wave 5 — core_affinity pinning + dynamic top-gainer selectors
+    // (`.claude/plans/active-plan-wave-5-indices-only.md` Items 4/5/6/9)
+    // -----------------------------------------------------------------------
+    /// `core_affinity::set_for_current` returned `false` for one or more of
+    /// the 4 Tokio workers at boot. Wave 5 Item 6 pins WS read loop, parser,
+    /// ILP writer, and "other" workers to vCPUs 0-3 on AWS c7i.xlarge (and
+    /// to the first 4 P-cores on dev Mac). A failed pin means the affected
+    /// worker can be preempted by other tasks, breaking the O(1) latency
+    /// budget. Severity::High; the app continues without pinning so the
+    /// operator can observe the gauge `tv_core_pinning_workers_pinned_total`.
+    CorePin01PinningFailedAtBoot,
+    /// A pinned Tokio worker drifted off its assigned core. Detected by the
+    /// 60s drift watchdog comparing the running thread's CPU affinity mask
+    /// against the recorded pin. Counter `tv_core_pinning_drift_total`
+    /// increments per detected drift. Severity::Medium — the worker is
+    /// still doing work, just not on the dedicated core.
+    CorePin02WorkerDrifted,
+    /// Wave 5 Item 4 — depth-20 connection 5 (the "top-50 dynamic" slot)
+    /// queried `option_movers` filtered to `category = 'TOP_VOLUME'` sorted
+    /// by `change_pct DESC`, with SENSEX (BSE_FNO) skipped, and got back
+    /// fewer than 50 contracts (or zero). Severity::High. Surviving
+    /// 4 single-side index conns keep the last-good top-50 set; selector
+    /// retries every 60s. Distinct from `Depth20Dyn01TopSetEmpty` which
+    /// belongs to the merged Phase-7 top-150 selector that Wave 5 reverts.
+    Depth20Dyn03TopGainersEmpty,
+    /// Wave 5 Item 5 — depth-200 dynamic top-5 selector returned fewer
+    /// than 5 contracts after the same SENSEX-skipped TOP_VOLUME +
+    /// `change_pct DESC` query. Severity::High. The 5 depth-200 conns
+    /// keep their last-good gainer set; selector retries every 60s.
+    Depth200Dyn01TopGainersEmpty,
+
+    /// Wave 5 Item 26 L1 — volume monotonicity breach at runtime. The Dhan
+    /// volume field at bytes 22-25 of the Quote/Full packet is cumulative
+    /// since session open per Ticket #5525125 (verified via the live Mon
+    /// May 4 monotonicity SELECT — see `docs/operator/track-2-monotonicity-select.md`).
+    /// If a tick arrives with `volume < last_seen_volume` for the same
+    /// `(security_id, exchange_segment)` within a single trading day, that
+    /// breaks cumulative-monotonicity invariant — either Dhan changed the
+    /// semantic mid-session (escalate to Item 26 L3 ticket) or our parser
+    /// regressed on the byte offset. Severity::High.
+    Volume01MonotonicityBreach,
+    /// Wave 5 Item 13 — boot-time prev-close routing assertion failed.
+    /// The subscription plan contains an instrument whose `(segment,
+    /// feed_mode)` pair cannot deliver previous-day close per the
+    /// per-segment routing matrix in `live-market-feed.md`:
+    /// IDX_I → Ticker (prev close arrives via standalone code 6),
+    /// NSE_EQ → Quote/Full (bytes 38-41 / 50-53 of the Quote/Full
+    /// packet), NSE_FNO/BSE_FNO → Full (bytes 50-53). Severity::Critical
+    /// — halts boot rather than starting a pipeline that loses
+    /// prev_close for half the universe.
+    PrevClose03BootRoutingAssertion,
 }
 
 impl ErrorCode {
@@ -461,6 +514,15 @@ impl ErrorCode {
             Self::Movers22Tf01WriterIlpFailed => "MOVERS-22TF-01",
             Self::Movers22Tf02SchedulerPanic => "MOVERS-22TF-02",
             Self::Movers22Tf03UniverseDrift => "MOVERS-22TF-03",
+            // Wave 5 — core_affinity + dynamic top-gainer selectors
+            Self::CorePin01PinningFailedAtBoot => "CORE-PIN-01",
+            Self::CorePin02WorkerDrifted => "CORE-PIN-02",
+            Self::Depth20Dyn03TopGainersEmpty => "DEPTH-20-DYN-03",
+            Self::Depth200Dyn01TopGainersEmpty => "DEPTH-200-DYN-01",
+            // Wave 5 Item 13 — prev-close routing
+            Self::PrevClose03BootRoutingAssertion => "PREVCLOSE-03",
+            // Wave 5 Item 26 L1 — volume cumulative-monotonicity guard
+            Self::Volume01MonotonicityBreach => "VOLUME-MONO-01",
         }
     }
 
@@ -487,7 +549,8 @@ impl ErrorCode {
             | Self::Depth200Auth01InvalidAtBoot
             | Self::Depth200Auth02RenewalFailed
             | Self::Depth200Auth03SsmUnreachable
-            | Self::Depth20Dyn02SwapChannelBroken => Severity::Critical,
+            | Self::Depth20Dyn02SwapChannelBroken
+            | Self::PrevClose03BootRoutingAssertion => Severity::Critical,
             // Info: positive-ping / lifecycle confirmations
             Self::Selftest01Passed | Self::Slo01Healthy => Severity::Info,
             // High: composite SLO degradation summary signal
@@ -507,7 +570,11 @@ impl ErrorCode {
             | Self::Phase202EmitGuardDropped
             | Self::Boot01QuestDbSlow
             | Self::Depth20Dyn01TopSetEmpty
-            | Self::Movers22Tf02SchedulerPanic => Severity::High,
+            | Self::Movers22Tf02SchedulerPanic
+            | Self::CorePin01PinningFailedAtBoot
+            | Self::Depth20Dyn03TopGainersEmpty
+            | Self::Depth200Dyn01TopGainersEmpty
+            | Self::Volume01MonotonicityBreach => Severity::High,
             // Medium: data pipeline correctness
             Self::InstrumentP0DuplicateSecurityId
             | Self::InstrumentP0CountConsistency
@@ -554,7 +621,8 @@ impl ErrorCode {
             | Self::StorageGap04S3ArchiveFailed
             | Self::Telegram01Dropped
             | Self::Movers22Tf01WriterIlpFailed
-            | Self::Movers22Tf03UniverseDrift => Severity::Medium,
+            | Self::Movers22Tf03UniverseDrift
+            | Self::CorePin02WorkerDrifted => Severity::Medium,
             // Low: scheduler / field coverage / trading-day / Dhan other
             Self::InstrumentP1DailyScheduler
             | Self::InstrumentP1DeltaFieldCoverage
@@ -674,6 +742,12 @@ impl ErrorCode {
             Self::Movers22Tf01WriterIlpFailed
             | Self::Movers22Tf02SchedulerPanic
             | Self::Movers22Tf03UniverseDrift => ".claude/rules/project/movers-22tf-error-codes.md",
+            Self::CorePin01PinningFailedAtBoot
+            | Self::CorePin02WorkerDrifted
+            | Self::Depth20Dyn03TopGainersEmpty
+            | Self::Depth200Dyn01TopGainersEmpty
+            | Self::PrevClose03BootRoutingAssertion
+            | Self::Volume01MonotonicityBreach => ".claude/rules/project/wave-5-error-codes.md",
         }
     }
 
@@ -788,6 +862,12 @@ impl ErrorCode {
             Self::Movers22Tf01WriterIlpFailed,
             Self::Movers22Tf02SchedulerPanic,
             Self::Movers22Tf03UniverseDrift,
+            Self::CorePin01PinningFailedAtBoot,
+            Self::CorePin02WorkerDrifted,
+            Self::Depth20Dyn03TopGainersEmpty,
+            Self::Depth200Dyn01TopGainersEmpty,
+            Self::PrevClose03BootRoutingAssertion,
+            Self::Volume01MonotonicityBreach,
         ]
     }
 }
@@ -958,7 +1038,15 @@ mod tests {
         // 2026-04-28 (Phase 11 of v3 plan): bumped 89 -> 92 for
         // MOVERS-22TF-01/02/03 — movers 22-timeframe persistence,
         // scheduler, and universe-drift codes.
-        assert_eq!(ErrorCode::all().len(), 92);
+        // 2026-05-01 (Wave 5 Item 9): bumped 92 -> 96 for
+        // CORE-PIN-01/02 (Tokio worker pinning) +
+        // DEPTH-20-DYN-03 (top-50 depth-20 selector) +
+        // DEPTH-200-DYN-01 (top-5 depth-200 selector).
+        // 2026-05-01 (Wave 5 Item 13): bumped 96 -> 97 for
+        // PREVCLOSE-03 (boot-time prev-close routing assertion).
+        // 2026-05-01 (Wave 5 Item 26 L1): bumped 97 -> 98 for
+        // VOLUME-MONO-01 (cumulative-monotonicity breach).
+        assert_eq!(ErrorCode::all().len(), 98);
     }
 
     #[test]
@@ -993,7 +1081,16 @@ mod tests {
                 // Phase 7 (2026-04-28): depth-20 dynamic top-150 selector
                 || s.starts_with("DEPTH-DYN-")
                 // Phase 11 (2026-04-28): movers 22-tf
-                || s.starts_with("MOVERS-22TF-");
+                || s.starts_with("MOVERS-22TF-")
+                // Wave 5 (2026-05-01): core_affinity pinning + new dynamic
+                // depth selectors. Note CORE-PIN- and DEPTH-20-DYN- /
+                // DEPTH-200-DYN- are distinct from the earlier DEPTH-DYN-
+                // (Phase 7 merged top-150 selector that Wave 5 reverts).
+                || s.starts_with("CORE-PIN-")
+                || s.starts_with("DEPTH-20-DYN-")
+                || s.starts_with("DEPTH-200-DYN-")
+                // Wave 5 Item 26 L1: volume cumulative-monotonicity guard.
+                || s.starts_with("VOLUME-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }

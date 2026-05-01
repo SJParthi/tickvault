@@ -138,7 +138,11 @@ pub async fn ensure_movers_22tf_tables(questdb_config: &QuestDbConfig) {
         execute_ddl(&client, &base_url, &dedup_sql, &dedup_label).await;
     }
 
-    info!("movers_22tf: all 22 tables ensured");
+    info!(
+        timeframe_count = tickvault_common::mover_types::MOVERS_TIMEFRAME_COUNT,
+        "movers_22tf: all {} tables ensured",
+        tickvault_common::mover_types::MOVERS_TIMEFRAME_COUNT
+    );
 }
 
 /// Executes a DDL statement against QuestDB HTTP API. Best-effort.
@@ -242,14 +246,24 @@ mod tests {
             );
             seen_tables.push(expected_table);
         }
-        assert_eq!(seen_tables.len(), 22);
+        // Wave 5 Item 19 (2026-05-01) extended ladder 22 → 25; pin via
+        // the canonical constant so future ladder edits don't need a
+        // 3-place patch.
+        assert_eq!(
+            seen_tables.len(),
+            tickvault_common::mover_types::MOVERS_TIMEFRAME_COUNT
+        );
     }
 
     /// Phase 8 ratchet: DEDUP statement is well-formed and refers to the
-    /// expected table name.
+    /// expected table name. Wave 5 Item 19 extended the ladder so `1m`
+    /// is no longer at index 5 — look it up by label.
     #[test]
     fn test_movers_22tf_dedup_ddl_format() {
-        let timeframe = &MOVERS_TIMEFRAMES[5]; // "1m"
+        let timeframe = MOVERS_TIMEFRAMES
+            .iter()
+            .find(|tf| tf.label == "1m")
+            .expect("1m timeframe must exist");
         let ddl = movers_22tf_dedup_ddl(timeframe);
         assert_eq!(
             ddl,

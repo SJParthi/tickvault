@@ -57,17 +57,27 @@ impl MoversTimeframe {
     }
 }
 
-/// The 22 movers timeframes — same ladder as the candle materialized views.
+/// The 25 movers timeframes — same ladder as the candle materialized views.
 ///
 /// Order matters: ratchets pin both the count AND the exact ordering.
 /// The labels here MUST match the materialized-view names in the storage
 /// crate (e.g. `candles_1s` ↔ `movers_1s`).
+///
+/// Wave 5 Item 19 (2026-05-01): extended from 22 → 25 timeframes by adding
+/// `2s`, `3s`, and `20s` to the sub-minute set. The `22Tf` naming on
+/// surrounding types/files/tables/ErrorCodes is intentionally kept as a
+/// historical artifact (operator decision Q4: "keep `22Tf` naming + add
+/// timeframes inside").
 pub const MOVERS_TIMEFRAMES: &[MoversTimeframe] = &[
-    // Sub-minute (5)
+    // Sub-minute (8) — Wave 5 Item 19 added 2s, 3s, 20s for finer
+    // intra-minute movers granularity.
     MoversTimeframe::new("1s", 1),
+    MoversTimeframe::new("2s", 2),
+    MoversTimeframe::new("3s", 3),
     MoversTimeframe::new("5s", 5),
     MoversTimeframe::new("10s", 10),
     MoversTimeframe::new("15s", 15),
+    MoversTimeframe::new("20s", 20),
     MoversTimeframe::new("30s", 30),
     // 1-15 minute sequential (15)
     MoversTimeframe::new("1m", 60),
@@ -90,9 +100,10 @@ pub const MOVERS_TIMEFRAMES: &[MoversTimeframe] = &[
     MoversTimeframe::new("1h", 3600),
 ];
 
-/// Number of movers timeframes — pinned at 22 by ratchet test
-/// `test_movers_timeframes_constant_is_22`.
-pub const MOVERS_TIMEFRAME_COUNT: usize = 22;
+/// Number of movers timeframes — pinned at 25 by ratchet tests
+/// `test_movers_timeframes_constant_is_22` (legacy name kept) and
+/// `test_movers_25_timeframe_list_pinned` (Wave 5 Item 19).
+pub const MOVERS_TIMEFRAME_COUNT: usize = 25;
 
 const _: () = assert!(
     MOVERS_TIMEFRAMES.len() == MOVERS_TIMEFRAME_COUNT,
@@ -218,19 +229,44 @@ impl MoverRow {
 mod tests {
     use super::*;
 
-    /// Phase 9 ratchet: exactly 22 timeframes, exact ordering pinned.
+    /// Phase 9 ratchet — kept under legacy name even after Wave 5 Item 19's
+    /// extension to 25 timeframes (operator decision Q4: "keep `22Tf`
+    /// naming"). Asserts the post-extension count.
     #[test]
     fn test_movers_timeframes_constant_is_22() {
         assert_eq!(MOVERS_TIMEFRAMES.len(), MOVERS_TIMEFRAME_COUNT);
-        assert_eq!(MOVERS_TIMEFRAME_COUNT, 22);
+        assert_eq!(MOVERS_TIMEFRAME_COUNT, 25);
+    }
+
+    /// Wave 5 Item 19 ratchet: pins the exact post-extension count + the
+    /// 3 new sub-minute additions.
+    #[test]
+    fn test_movers_25_timeframe_list_pinned() {
+        assert_eq!(MOVERS_TIMEFRAMES.len(), 25, "Wave 5 Item 19: 25-tf list");
+        // The 3 new sub-minute additions:
+        let labels: Vec<&str> = MOVERS_TIMEFRAMES.iter().map(|tf| tf.label).collect();
+        for new_label in ["2s", "3s", "20s"] {
+            assert!(
+                labels.contains(&new_label),
+                "Wave 5 Item 19: sub-minute timeframe {new_label} missing"
+            );
+        }
+        // Sub-minute set is now 8 entries (1s, 2s, 3s, 5s, 10s, 15s, 20s, 30s).
+        let sub_minute_count = MOVERS_TIMEFRAMES
+            .iter()
+            .filter(|tf| tf.cadence_secs < 60)
+            .count();
+        assert_eq!(sub_minute_count, 8, "sub-minute set extended to 8 entries");
     }
 
     #[test]
     fn test_movers_timeframes_first_is_1s_last_is_1h() {
         assert_eq!(MOVERS_TIMEFRAMES[0].label, "1s");
         assert_eq!(MOVERS_TIMEFRAMES[0].cadence_secs, 1);
-        assert_eq!(MOVERS_TIMEFRAMES[21].label, "1h");
-        assert_eq!(MOVERS_TIMEFRAMES[21].cadence_secs, 3600);
+        // Last index changed from 21 → 24 after the Wave 5 Item 19 extension.
+        let last = MOVERS_TIMEFRAMES.len() - 1;
+        assert_eq!(MOVERS_TIMEFRAMES[last].label, "1h");
+        assert_eq!(MOVERS_TIMEFRAMES[last].cadence_secs, 3600);
     }
 
     #[test]
@@ -263,8 +299,15 @@ mod tests {
     #[test]
     fn test_movers_table_name_format() {
         assert_eq!(MOVERS_TIMEFRAMES[0].table_name().as_str(), "movers_1s");
-        assert_eq!(MOVERS_TIMEFRAMES[5].table_name().as_str(), "movers_1m");
-        assert_eq!(MOVERS_TIMEFRAMES[21].table_name().as_str(), "movers_1h");
+        // After Wave 5 Item 19 (8 sub-minute entries), `1m` is at index 8
+        // and the last entry is at index 24.
+        let one_minute = MOVERS_TIMEFRAMES
+            .iter()
+            .find(|tf| tf.label == "1m")
+            .expect("1m must exist in MOVERS_TIMEFRAMES");
+        assert_eq!(one_minute.table_name().as_str(), "movers_1m");
+        let last = MOVERS_TIMEFRAMES.len() - 1;
+        assert_eq!(MOVERS_TIMEFRAMES[last].table_name().as_str(), "movers_1h");
     }
 
     #[test]

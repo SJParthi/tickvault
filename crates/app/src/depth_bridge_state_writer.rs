@@ -72,15 +72,15 @@ impl DepthBridgeStateWriter {
     pub fn new(path: impl Into<PathBuf>) -> Self {
         let path = path.into();
         let tmp_path = path.with_extension("json.tmp");
-        if let Some(parent) = path.parent() {
-            if let Err(err) = std::fs::create_dir_all(parent) {
-                warn!(
-                    target: "tickvault::depth_bridge_state_writer",
-                    ?err,
-                    path = %parent.display(),
-                    "could not create depth-bridge state dir — write attempts will fail",
-                );
-            }
+        if let Some(parent) = path.parent()
+            && let Err(err) = std::fs::create_dir_all(parent)
+        {
+            warn!(
+                target: "tickvault::depth_bridge_state_writer",
+                ?err,
+                path = %parent.display(),
+                "could not create depth-bridge state dir — write attempts will fail",
+            );
         }
         Self {
             path,

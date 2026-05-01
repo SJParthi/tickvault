@@ -7,15 +7,20 @@
 //! # Boot Sequence Position
 //! Config -> **Instrument Download -> Universe Build** -> Auth -> WebSocket
 
+pub mod bhavcopy_cross_check;
+pub mod bhavcopy_fetcher;
+pub mod bhavcopy_scheduler;
 pub mod binary_cache;
 pub mod boot_mode;
 pub mod csv_downloader;
 pub mod csv_parser;
 pub mod daily_scheduler;
 pub mod delta_detector;
+pub mod depth_200_dynamic_subscriber;
 pub mod depth_20_dynamic_subscriber;
 pub mod depth_rebalancer;
 pub mod depth_strike_selector;
+pub mod depth_top_volume_selector;
 pub mod diagnostic;
 pub mod instrument_loader;
 pub mod live_tick_atm_resolver;
@@ -27,6 +32,7 @@ pub mod preopen_price_buffer;
 pub mod preopen_rest_fallback;
 pub mod s3_backup;
 pub mod slo_score;
+pub mod subscription_distribution;
 pub mod subscription_planner;
 pub mod universe_builder;
 pub mod validation;

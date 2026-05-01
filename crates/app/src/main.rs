@@ -32,7 +32,7 @@ use tickvault_app::boot_helpers::{
     format_cross_match_details_grouped, format_timeframe_details, format_violation_details,
     spawn_heartbeat_watchdog,
 };
-use tickvault_app::{infra, observability, trading_pipeline};
+use tickvault_app::{core_pinning, infra, observability, trading_pipeline};
 
 use std::net::SocketAddr;
 
@@ -157,6 +157,12 @@ async fn main() -> Result<()> {
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .expect("failed to install rustls CryptoProvider — cannot proceed without TLS"); // APPROVED: bootstrap — TLS mandatory, failure is fatal
+
+    // Wave 5 Item 6: pin the main thread to Core 3 ("other") so it does not
+    // share Core 0 with the WebSocket read loop (pinned later when its
+    // dedicated worker task spawns). Best-effort — failures emit
+    // CORE-PIN-01 + Telegram and the app continues without pinning.
+    core_pinning::pin_main_thread();
 
     // -----------------------------------------------------------------------
     // Step 1: Load and validate configuration
@@ -1943,6 +1949,12 @@ async fn main() -> Result<()> {
         // stream-resilience.md B10. The 22 ILP writers (one per
         // timeframe) come up after this DDL fan-out completes.
         tickvault_storage::movers_22tf_persistence::ensure_movers_22tf_tables(&config.questdb),
+        // Wave 5 Item 25 + 27 — single base table + 24 materialized views.
+        // Idempotent CREATE-IF-NOT-EXISTS; safe to call alongside the
+        // legacy 22tf table DDL until the writer-task switch lands.
+        tickvault_storage::movers_unified_persistence::ensure_movers_unified_tables_and_views(
+            &config.questdb,
+        ),
         tickvault_storage::indicator_snapshot_persistence::ensure_indicator_snapshot_table(
             &config.questdb
         ),
@@ -2614,6 +2626,137 @@ async fn main() -> Result<()> {
         movers_v2_snapshot_handle = movers_v2_handles
             .as_ref()
             .map(|h| std::sync::Arc::clone(&h.snapshot_handle));
+
+        // Wave 5 Item 25/27 Phase B — base-1s writer for `movers_unified_1s`.
+        // ONE task. Subscribes to tick_broadcast, drains in-memory state at
+        // 1Hz, ILP-appends to the base table; QuestDB auto-refreshes the 24
+        // mat views. Market-hours gated.
+        let movers_unified_shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+        let _movers_unified_handle =
+            tickvault_app::movers_unified_pipeline::spawn_movers_unified_pipeline(
+                config.questdb.clone(),
+                tick_broadcast_sender.clone(),
+                std::sync::Arc::clone(&movers_unified_shutdown),
+            );
+
+        // Wave 5 Item 26 L2 LIVE — 16:30 IST bhavcopy cross-check task.
+        // Post-market only (TradingCalendar gated); reads `movers_unified_1s`
+        // for our captured EOD volumes, downloads NSE bhavcopy ZIP via
+        // `unzip` shell, parses, cross-checks with 0.1% tolerance, writes
+        // audit rows to `volume_nse_audit`, emits Telegram summary.
+        let bhavcopy_shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+        let bhavcopy_registry =
+            std::sync::Arc::clone(slow_registry.as_ref().unwrap_or_else(|| {
+                // Fallback: if slow_registry is None (boot-bypass scenarios),
+                // use a fresh empty Arc — the supplier returns empty contracts
+                // and the cycle reports MISSING_OUR for every NSE row.
+                // Operator triages the empty universe via dashboards.
+                unreachable!("slow_registry is required for slow-boot path")
+            }));
+        let _bhavcopy_handle = tickvault_app::bhavcopy_pipeline::spawn_bhavcopy_scheduler_task(
+            config.questdb.clone(),
+            {
+                let reg = std::sync::Arc::clone(&bhavcopy_registry);
+                move || {
+                    // Snapshot the registry's derivative contracts at
+                    // each 16:30 IST cycle. Builds `DerivativeContract`
+                    // from `SubscribedInstrument` fields. Filters to
+                    // future/option derivatives only (skips IDX_I and
+                    // NSE_EQ since bhavcopy is NSE_FNO-only). Empty
+                    // Vec if registry empty — bhavcopy reports
+                    // MISSING_OUR for every NSE row, which is correct.
+                    use tickvault_common::instrument_types::{
+                        DerivativeContract, DhanInstrumentKind,
+                    };
+                    reg.iter()
+                        .filter_map(|inst| {
+                            let kind = inst.instrument_kind?;
+                            // Bhavcopy is F&O — skip indices + cash equities.
+                            match kind {
+                                DhanInstrumentKind::FutureIndex
+                                | DhanInstrumentKind::FutureStock
+                                | DhanInstrumentKind::OptionIndex
+                                | DhanInstrumentKind::OptionStock => {}
+                            }
+                            let expiry_date = inst.expiry_date?;
+                            Some(DerivativeContract {
+                                security_id: inst.security_id,
+                                underlying_symbol: inst.underlying_symbol.clone(),
+                                instrument_kind: kind,
+                                exchange_segment: inst.exchange_segment,
+                                expiry_date,
+                                strike_price: inst.strike_price.unwrap_or(0.0),
+                                option_type: inst.option_type,
+                                // Bhavcopy lookup only uses underlying_symbol +
+                                // expiry_date + strike_price + option_type.
+                                // Fill the rest with safe defaults.
+                                lot_size: 0,
+                                tick_size: 0.0,
+                                symbol_name: inst.display_label.clone(),
+                                display_name: inst.display_label.clone(),
+                            })
+                        })
+                        .collect()
+                }
+            },
+            std::sync::Arc::clone(&notifier),
+            std::sync::Arc::clone(&bhavcopy_shutdown),
+        );
+
+        // Wave 5 Items 4+5 LIVE — depth-20 conn-5 dynamic top-50 + depth-200
+        // dynamic top-5 orchestrator. Off by default; flip
+        // `[features] depth_dynamic_top_volume = true` to activate.
+        //
+        // Wiring contract: the orchestrator OWNS the Sender side of the
+        // command channels here. The Receiver side must be picked up by
+        // the depth-conn-pool refactor (separate sub-PR) which spawns:
+        //   * 1 dedicated depth-20 conn 5 (subscribes/swaps via the
+        //     `depth_20_conn5_rx` receiver)
+        //   * 5 depth-200 conns indexed 0..4 (each consumes its
+        //     `depth_200_slot_N_rx` receiver)
+        //
+        // Until that refactor lands, the orchestrator's `cmd_tx.send()`
+        // calls will fail (no receiver task) → DEPTH-DYN-02 fires on
+        // every 60s cycle inside market hours. That's the visible
+        // signal the operator uses to schedule the conn-pool refactor.
+        if config.features.depth_dynamic_top_volume {
+            tracing::info!(
+                "Wave 5 Items 4+5: depth_dynamic_top_volume feature ON — \
+                 spawning orchestrator. Receiver-side conn-pool refactor \
+                 must land for the dynamic conns to actually subscribe."
+            );
+            let depth_dyn_shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+
+            // Depth-20 conn 5 dynamic top-50 task.
+            let (d20_conn5_cmd_tx, _d20_conn5_cmd_rx) =
+                tokio::sync::mpsc::channel::<tickvault_core::websocket::DepthCommand>(4);
+            let _d20_dyn_handle =
+                tickvault_app::depth_dynamic_pipeline::spawn_depth_20_dynamic_conn5_task(
+                    config.questdb.clone(),
+                    d20_conn5_cmd_tx,
+                    std::sync::Arc::clone(&depth_dyn_shutdown),
+                );
+
+            // Depth-200 dynamic pool (5 slots). One channel per slot.
+            // The conn-pool refactor will own each slot's receiver.
+            let mut d200_cmd_senders = std::collections::HashMap::new();
+            for slot in 0..5_usize {
+                let (tx, _rx) =
+                    tokio::sync::mpsc::channel::<tickvault_core::websocket::DepthCommand>(4);
+                d200_cmd_senders.insert(slot, tx);
+            }
+            let _d200_dyn_handle =
+                tickvault_app::depth_dynamic_pipeline::spawn_depth_200_dynamic_pool_task(
+                    config.questdb.clone(),
+                    d200_cmd_senders,
+                    std::sync::Arc::clone(&depth_dyn_shutdown),
+                );
+        } else {
+            tracing::info!(
+                "Wave 5 Items 4+5: depth_dynamic_top_volume feature OFF (default) — \
+                 dynamic top-volume orchestrator NOT spawned; legacy depth pool active"
+            );
+        }
 
         // Parthiban directive (2026-04-21): no-tick-during-market-hours
         // watchdog (slow boot path). Same pattern as fast boot above.
@@ -5031,13 +5174,13 @@ async fn main() -> Result<()> {
                     };
 
                     /// Sum of expected connections across the four pools:
-                    /// 5 main feed + 4 depth-20 (NIFTY/BANKNIFTY/FINNIFTY/MIDCPNIFTY,
-                    /// per pre-2026-04-25 universe; the post-2026-04-25 rebuild
-                    /// reduced this to 2 but the pool capacity still permits 4)
-                    /// + 2 depth-200 (NIFTY ATM CE/PE + BANKNIFTY ATM CE/PE
-                    /// — capped at 2 in the live config) + 1 order-update.
-                    /// Total = 12. Used as the `expected` divisor for
-                    /// `WS_health = active / expected`.
+                    /// Total expected websocket count = 12. Breakdown:
+                    /// 5 main feed, 4 depth-20 (NIFTY, BANKNIFTY, FINNIFTY,
+                    /// MIDCPNIFTY per pre-2026-04-25 universe; rebuild reduced
+                    /// to 2 but pool capacity still permits 4), 2 depth-200
+                    /// (NIFTY ATM CE/PE plus BANKNIFTY ATM CE/PE, capped at 2
+                    /// in live config), 1 order-update.
+                    /// Used as `expected` divisor for `WS_health = active / expected`.
                     const SLO_WS_EXPECTED_TOTAL: f64 = 12.0;
 
                     /// Tick-freshness threshold during market hours: a tick

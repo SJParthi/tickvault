@@ -28,8 +28,10 @@ use std::sync::OnceLock;
 use tickvault_common::mover_types::MoverRow;
 use tokio::sync::mpsc;
 
-/// Number of writer slots. Pinned at 22 by the timeframe ladder.
-pub const MOVERS_22TF_WRITER_COUNT: usize = 22;
+/// Number of writer slots. Pinned at 25 by the timeframe ladder.
+/// Wave 5 Item 19 (2026-05-01): extended from 22 → 25 (added 2s, 3s, 20s).
+/// `22Tf` naming kept as historical artifact (operator decision Q4).
+pub const MOVERS_22TF_WRITER_COUNT: usize = 25;
 
 /// Reasons a `try_enqueue_global` call could fail. Mirrors the
 /// `prev_close_writer::EnqueueOutcome` taxonomy.
@@ -156,16 +158,23 @@ mod tests {
         (Movers22TfWriterState::new(arr), receivers)
     }
 
-    /// Phase 10 primitive ratchet — count is 22.
+    /// Phase 10 primitive ratchet — count tracks the timeframe ladder.
+    /// Wave 5 Item 19: post-extension pinned at 25 (was 22).
     #[test]
     fn test_movers_22tf_writer_count_is_22() {
-        assert_eq!(MOVERS_22TF_WRITER_COUNT, 22);
+        assert_eq!(MOVERS_22TF_WRITER_COUNT, 25);
+        // Stay in lockstep with the canonical timeframe list.
+        assert_eq!(
+            MOVERS_22TF_WRITER_COUNT,
+            tickvault_common::mover_types::MOVERS_TIMEFRAME_COUNT
+        );
     }
 
     #[test]
-    fn test_state_len_returns_22() {
+    fn test_state_len_returns_22_legacy_name_kept_post_wave_5_extension() {
         let (state, _rx) = make_state(8);
-        assert_eq!(state.len(), 22);
+        // Wave 5 Item 19 extended count from 22 → 25; legacy fn name kept.
+        assert_eq!(state.len(), MOVERS_22TF_WRITER_COUNT);
         assert!(!state.is_empty());
     }
 
@@ -178,7 +187,7 @@ mod tests {
                 "sender_for({idx}) returned None"
             );
         }
-        assert!(state.sender_for(22).is_none());
+        assert!(state.sender_for(MOVERS_22TF_WRITER_COUNT).is_none());
         assert!(state.sender_for(usize::MAX).is_none());
     }
 

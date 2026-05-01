@@ -149,14 +149,14 @@ pub fn spawn_consumer_task<W: ConsumerWriter + Send + 'static>(
                     total_dropped = total_dropped.saturating_add(1);
                 }
             }
-            if writer.pending_count() >= flush_threshold {
-                if let Err(err) = writer.flush() {
-                    warn!(
-                        timeframe = label,
-                        ?err,
-                        "movers_22tf consumer flush failed — writer will reconnect"
-                    );
-                }
+            if writer.pending_count() >= flush_threshold
+                && let Err(err) = writer.flush()
+            {
+                warn!(
+                    timeframe = label,
+                    ?err,
+                    "movers_22tf consumer flush failed — writer will reconnect"
+                );
             }
         }
 
@@ -225,6 +225,7 @@ impl ConsumerWriter for Movers22TfWriter {
 /// (production passes `|| std::time::SystemTime::now()...`).
 ///
 /// The task exits when `shutdown.load(Relaxed)` is true.
+#[allow(clippy::too_many_arguments)] // APPROVED: 9 generic + state args; refactoring to a builder adds boilerplate without clarifying the per-tf snapshot task's role.
 pub fn spawn_snapshot_task<F, I, M, N>(
     slot_idx: usize,
     cadence_secs: u64,
@@ -300,7 +301,8 @@ mod tests {
         let pipeline = build_movers_22tf_pipeline();
         assert_eq!(pipeline.receivers.len(), MOVERS_22TF_WRITER_COUNT);
         assert_eq!(pipeline.writer_state.len(), MOVERS_22TF_WRITER_COUNT);
-        assert_eq!(MOVERS_22TF_WRITER_COUNT, 22);
+        // Wave 5 Item 19 extended ladder from 22 → 25; legacy test name kept.
+        assert_eq!(MOVERS_22TF_WRITER_COUNT, 25);
     }
 
     /// Phase 10b-2 ratchet: tracker starts empty + writer state has
@@ -314,7 +316,13 @@ mod tests {
                 "writer_state.sender_for({idx}) should be Some"
             );
         }
-        assert!(pipeline.writer_state.sender_for(22).is_none());
+        // Sender at index = WRITER_COUNT must be None (out of range).
+        assert!(
+            pipeline
+                .writer_state
+                .sender_for(MOVERS_22TF_WRITER_COUNT)
+                .is_none()
+        );
     }
 
     /// Phase 10b-2 ratchet: arc_tracker returns a clonable Arc that

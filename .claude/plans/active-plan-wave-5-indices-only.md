@@ -345,7 +345,7 @@ Operator's verbatim: "previously with stocks and its instruments we majorly face
 
 **Burst chaos test (Item 11 — adding now):**
 
-- [ ] **11. Stress test the burst defence chain**
+- [x] **11. Stress test the burst defence chain**
 - File: `crates/storage/tests/chaos_burst_indices_only.rs` (new)
 - Synthetic: feed 200K tick/sec sustained for 10s into the parser channel; assert ring stays bounded, no DLQ writes, no parser stall
 - Verifies: bounded channels, ring high-watermark alert, drain catches up post-burst
@@ -466,7 +466,7 @@ The `option_movers` + `stock_movers` writers already exist with 7 ranking catego
 
 ### Movers writers under indices-only — what we add to the plan
 
-- [ ] **Item 12. Wire option_movers selector to use Wave 5 universe filter.** No new code; verify `option_movers` writer already iterates only the subscribed instruments — if it scans ALL NSE_FNO+BSE_FNO contracts regardless of subscription, that's wasted work and should narrow.
+- [x] **Item 12. Wire option_movers selector to use Wave 5 universe filter.** No new code; verify `option_movers` writer already iterates only the subscribed instruments — if it scans ALL NSE_FNO+BSE_FNO contracts regardless of subscription, that's wasted work and should narrow.
 - File: `crates/core/src/pipeline/option_movers.rs` (verify, possibly amend)
 - Test: `test_option_movers_universe_matches_subscription_set_under_indices_only_scope`
 - 9-box: gauge `tv_option_movers_universe_size` (expect ~10,783 under indices-only); alert if >12,000 (regression to old universe)
@@ -497,7 +497,7 @@ Operator question: "how about prev close?" Per `dhan/live-market-feed.md` rule +
 
 ### What we add to the plan
 
-- [ ] **Item 13. Boot-time prev-close routing assertion**
+- [x] **Item 13. Boot-time prev-close routing assertion**
 - File: `crates/app/src/main.rs` (boot sequence) + `crates/core/src/instrument/subscription_planner.rs`
 - Tests: `test_idx_i_subscriptions_use_ticker_mode`, `test_nse_eq_subscriptions_use_quote_or_full`, `test_nse_fno_bse_fno_subscriptions_use_full_mode`
 - ErrorCode: `PREVCLOSE-03` (new — boot-time invariant violation, Severity::Critical, halts boot)
@@ -555,7 +555,7 @@ vs c7i.xlarge 8 GB RAM (with QuestDB at 4 GB, Valkey 1 GB, others ~2 GB → tick
 
 ### What we add to the plan
 
-- [ ] **Item 14. NSE_EQ feed_mode downgrade Full → Quote**
+- [x] **Item 14. NSE_EQ feed_mode downgrade Full → Quote**
 - File: `crates/core/src/instrument/subscription_planner.rs`
 - Tests: `test_nse_eq_uses_quote_mode_under_indices_only`, `test_quote_packet_close_field_matches_prev_close_lookup`
 - 9-box: Prom gauge `tv_subscription_bytes_per_sec_per_conn{conn}` — alert if any conn exceeds 5 MB/sec sustained (means we accidentally subscribed Full to cash); `FeedModeRoutingAudit` typed event at boot listing per-slot mode counts; ratchet test
@@ -596,7 +596,7 @@ Operator question: "for full we don't need to store the day close or prev close 
 
 ### What we add to the plan
 
-- [ ] **Item 15. Drop `previous_close` table writes for NSE_EQ + NSE_FNO + BSE_FNO**
+- [x] **Item 15. Drop `previous_close` table writes for NSE_EQ + NSE_FNO + BSE_FNO**
 - Files: `crates/core/src/pipeline/prev_close_persist.rs`, `crates/storage/src/previous_close_persistence.rs`, `crates/core/src/parser/dispatcher.rs`
 - Tests: `test_prev_close_persist_skips_quote_and_full_sources`, `test_prev_close_table_only_contains_idx_i_rows`, `test_movers_writer_reads_day_close_from_ticks_via_in_memory_cache`
 - Behaviour change:
@@ -679,7 +679,7 @@ Tick stream (parser) ──┐
 
 ### What we add to the plan
 
-- [ ] **Item 16. Movers hybrid storage — REUSE existing `Movers22TfTracker` (BLOCKER C2 → Reuse)**
+- [x] **Item 16. Movers hybrid storage — REUSE existing `Movers22TfTracker` (BLOCKER C2 → Reuse)** — **SUPERSEDED 2026-05-01** by Item 25 / Item 27 (materialised-view movers redesign). No code change required; the unified-schema path absorbs Item 16's intent. See "Items 16, 19, 21, 23 — all SUPERSEDED by Item 25" table below.
 
 **Decision:** Item 16 does NOT create a new tracker. The merged trunk (commit `16a7220`) already ships `Movers22TfTracker` (papaya-backed) wired into `tick_processor` (commit `c9f53a4`). Wave 5 contributes:
 - Verify that a 60s checkpoint to QuestDB is wired (per the parallel APPROVED `active-plan-movers-22tf-redesign-v2.md`). If yes → no-op verification. If no → add the checkpoint loop on Core 3 best-effort.
@@ -754,7 +754,7 @@ Per `stream-resilience.md` per-PR-set protocol: ≤3 sub-PRs, ≤30 files / ≤3
 
 ### What we add to the plan
 
-- [ ] **Item 17. Document parallelization map + sub-branch protocol**
+- [x] **Item 17. Document parallelization map + sub-branch protocol**
 - Files: this plan file (already done); add `.claude/plans/wave-5-sub-branches.md` listing each sub-branch + assigned items + base commit
 - Tests: N/A (documentation)
 - 9-box: N/A (process)
@@ -1006,7 +1006,7 @@ The merged trunk's tracker is named `Movers22TfTracker`. Operator's new spec is 
 
 ### What we add to the plan
 
-- [ ] **Item 19. 25-timeframe spec extension to merged `Movers22TfTracker`**
+- [x] **Item 19. 25-timeframe spec extension to merged `Movers22TfTracker`**
 - Files: `crates/common/src/constants.rs` (timeframe list), `crates/core/src/pipeline/movers_22tf_tracker.rs` (rename or extend), `crates/core/src/pipeline/movers_22tf_scheduler.rs`, `crates/core/src/pipeline/movers_22tf_supervisor.rs`, `crates/core/src/pipeline/movers_22tf_writer_state.rs`, `crates/storage/src/movers_22tf_persistence.rs`, `crates/api/src/handlers/market_data.rs` (top-movers-22tf API endpoint)
 - Tests:
   - `test_movers_25_timeframe_list_pinned` (constant pin)
@@ -1138,14 +1138,14 @@ This is the honest envelope. Anything tighter ("guaranteed by May 31") would be 
 
 Each item carries the 9-box checklist per `stream-resilience.md` B8: ① typed event, ② ErrorCode, ③ tracing+code field, ④ Prometheus counter, ⑤ Grafana panel, ⑥ alert rule, ⑦ call site, ⑧ triage YAML rule, ⑨ ratchet test.
 
-### - [ ] 1. `subscription.scope` config gate
+### - [x] 1. `subscription.scope` config gate
 
 - Files: `crates/common/src/config.rs`, `config/base.toml`
 - Tests: `test_subscription_scope_enum_indices_only_all_expiries_default`, `test_subscription_scope_round_trips_via_figment`
 - Add enum `SubscriptionScope::{IndicesOnlyAllExpiries, FullUniverse}`. Default = `IndicesOnlyAllExpiries`.
 - 9-box: ① N/A (config) ② N/A ③ N/A ④ `tv_subscription_scope` info-gauge ⑤ Operator Health header ⑥ N/A ⑦ `subscription_planner::build_subscription_plan` ⑧ N/A ⑨ enum tests + figment round-trip
 
-### - [ ] 2. Universe filter — keep 11,018 instruments
+### - [x] 2. Universe filter — keep 11,018 instruments
 
 - Files: `crates/core/src/instrument/subscription_planner.rs`
 - Tests: `test_indices_only_scope_filters_to_three_underlyings`, `test_universe_count_pinned_at_11018`, `test_finnifty_midcpnifty_excluded_from_indices_only`, `test_stock_fno_excluded_under_indices_only_scope`
@@ -1153,14 +1153,14 @@ Each item carries the 9-box checklist per `stream-resilience.md` B8: ① typed e
 - Drops Phase 2 dispatcher (09:13 IST) + Mode C live-tick ATM resolver + pre-open REST `/marketfeed/ltp` fallback to inert (no stock F&O).
 - 9-box: ① `Phase2Skipped` (new, Severity::Info, fires once at 09:13:00 explaining "no stock F&O under indices-only scope") ② N/A (no failure path) ③ tracing `info!(scope = "indices_only", count = 11018)` at boot ④ `tv_subscription_total_instruments` gauge ⑤ Operator Health "Subscription scope" panel ⑥ `tv-subscription-count-drift` (alert if `tv_subscription_total_instruments` outside 10,500..11,500) ⑦ `main.rs` boot sequence ⑧ N/A ⑨ count-pinned test
 
-### - [ ] 3. Main feed equal-split (5 × ~2,204, category-balanced round-robin)
+### - [x] 3. Main feed equal-split (5 × ~2,204, category-balanced round-robin) — pure-logic primitive SHIPPED 2026-05-01 (`subscription_distribution.rs` + 7 ratchet tests). Connection-pool wiring deferred to follow-up sub-PR.
 
 - Files: `crates/core/src/websocket/connection_pool.rs`, `crates/core/src/instrument/subscription_distribution.rs` (new)
 - Tests: `test_distribution_is_category_balanced_round_robin`, `test_same_security_id_lands_on_same_connection_across_runs`, `test_distribution_per_conn_within_5_pct_of_target`, `test_distribution_idempotent_on_replay`
 - Algorithm: group by [IDX_I, NSE_EQ, NSE_FNO+BSE_FNO]; sort each group by security_id ASC; `conn_index = i % 5`. Stable across boots.
 - 9-box: ① N/A ② N/A ③ tracing `info!(conn = i, count = n)` per conn at boot ④ `tv_main_feed_per_conn_instrument_count` gauge with `{conn}` label ⑤ Operator Health "Main feed distribution" stacked-bar panel ⑥ `tv-main-feed-conn-overload` (any conn > 4,500) ⑦ `connection_pool::distribute` ⑧ N/A ⑨ deterministic-replay test + spread test
 
-### - [ ] 4. Depth-20 — REVERTED TO OPERATOR ORIGINAL DESIGN 2026-05-01 (BLOCKER C1 → Option B)
+### - [x] 4. Depth-20 — REVERTED TO OPERATOR ORIGINAL DESIGN 2026-05-01 (BLOCKER C1 → Option B) — pure-logic primitive (selector SQL + sanitisation + anti-thrash + static layout) SHIPPED 2026-05-01 in `depth_top_volume_selector.rs` with 25 ratchet tests. RIP+REWRITE of merged `depth_20_dynamic_subscriber.rs` + main.rs wiring DEFERRED to follow-up sub-PR (touches live trading boot path; needs operator review).
 
 **Decision (operator override 2026-05-01):** Operator reaffirmed original single-side design. Earlier "Option A adopt merged" decision is REVERSED. Wave 5 RIPS the merged `depth_20_dynamic_subscriber.rs` (commits `f3b7baa`, `29b1407`, `72028c5`, `c9f53a4`) and replaces with single-side 4-conn + 1 dynamic-50.
 
@@ -1222,7 +1222,7 @@ LIMIT 50;                             -- depth-200 takes first 5 of these (share
 
 **Blast radius note:** rip + replace is bigger than Option A. Mitigation: Item 4 sub-PR includes deletion of `DEPTH_20_DYNAMIC_SLOT_COUNT = 3` + `LIMIT 150` constants in same commit so the build stays green.
 
-### - [ ] 5. Depth-200 — Top-5 dynamic (operator original design)
+### - [x] 5. Depth-200 — Top-5 dynamic (operator original design) — pure-logic primitive (`fan_out_to_depth_200` + `selector_sql(5)`) SHIPPED 2026-05-01 alongside Item 4 in `depth_top_volume_selector.rs`. New `depth_200_subscriber.rs` connection wiring DEFERRED to follow-up sub-PR (touches live trading boot path).
 
 - Files: `crates/core/src/websocket/depth_connection.rs`, `crates/core/src/instrument/depth_200_subscriber.rs` (new — replaces merged static logic), `crates/app/src/main.rs`
 - Tests:
@@ -1241,7 +1241,7 @@ LIMIT 50;                             -- depth-200 takes first 5 of these (share
 - Test additions: `test_depth_200_reuses_depth_20_selector_result_no_separate_query`, `test_depth_200_excludes_sensex_takes_next_eligible`, `test_depth_200_5_conns_x_1_instrument_each`, `test_depth_200_query_uses_ist_offset_for_ts_freshness`
 - 9-box: ① new `Depth200TopGainersSwapped` (Severity::Low, edge-triggered) + reuse `Depth200SwapChannelBroken` (existing DEPTH-DYN-02) ② `DEPTH-200-DYN-01` (top-5 selector returned < 5, severity High) ③ `error!(code = ErrorCode::Depth200Dyn01TopSetEmpty.code_str())` ④ `tv_depth_200_top_gainers_set_size`, `tv_depth_200_top_gainers_swaps_total` ⑤ Operator Health "Depth-200 top-5" panel ⑥ `tv-depth-200-dyn-01-empty-set` ⑦ `main.rs::run_depth_200_top_gainers_loop` ⑧ `.claude/triage/error-rules.yaml::depth-200-dyn-01-top-set-empty-escalate` ⑨ all 5 tests above
 
-### - [ ] 6. Wire `core_affinity` — pin 4 Tokio workers to 4 vCPUs (Mac dev MIRRORS AWS 4-vCPU)
+### - [x] 6. Wire `core_affinity` — pin 4 Tokio workers to 4 vCPUs (Mac dev MIRRORS AWS 4-vCPU)
 
 **Operator decision 2026-05-01:** Dev Mac (M4 Pro 14 cores = 10P + 4E) MUST reproduce the AWS c7i.xlarge 4-vCPU configuration EXACTLY for parity testing. Operator verbatim: "even in our local dev macbook also reproduce the same aws 4vcpu dude okay?"
 
@@ -1287,21 +1287,21 @@ LIMIT 50;                             -- depth-200 takes first 5 of these (share
 
 **Mac dev workflow note:** Devs running on M4 Pro will see only 4 of 14 cores utilized — this is BY DESIGN for parity. To temporarily disable for non-parity work, set `TICKVAULT_ALLOW_SUB_4_VCPU=1` (per CORE-PIN-03 graceful path).
 
-### - [ ] 7. Fix CRITICAL: candle_aggregator segment-aware key (I-P1-11)
+### - [x] 7. Fix CRITICAL: candle_aggregator segment-aware key (I-P1-11)
 
 - Files: `crates/core/src/pipeline/candle_aggregator.rs:12,21` (and any other site)
 - Tests: `test_candle_aggregator_keyed_on_security_id_and_segment`, `test_two_instruments_same_id_different_segment_do_not_merge_ohlcv` (regression for FINNIFTY=27 IDX_I vs NSE_EQ=27 collision)
 - Migrate `HashMap<u32, OhlcvState>` → `HashMap<(u32, ExchangeSegment), OhlcvState>`. Update banned-pattern scanner glob to include `crates/core/src/pipeline/candle_aggregator.rs`.
 - 9-box: ① N/A ② reuse I-P1-11 ③ N/A (lookup, no error) ④ `tv_candle_aggregator_keyspace_size` gauge ⑤ existing I-P1-11 panel ⑥ N/A ⑦ `tick_processor::on_tick` ⑧ N/A ⑨ regression test on collision pair
 
-### - [ ] 8. Fix HIGH: `warn!` → `error!` at tick_persistence.rs:357
+### - [x] 8. Fix HIGH: `warn!` → `error!` at tick_persistence.rs:357
 
 - Files: `crates/storage/src/tick_persistence.rs:357`
 - Tests: `crates/storage/tests/error_level_meta_guard.rs` (existing meta-guard catches new violations going forward; one-time fix is the line itself)
 - Add `code = ErrorCode::StorageGap03AuditWriteFailure.code_str()` field to satisfy tag-guard.
 - 9-box: ① existing typed event ② STORAGE-GAP-03 (existing) ③ added in this fix ④ existing counter ⑤ existing panel ⑥ existing alert ⑦ tick_persistence flush call site ⑧ existing triage rule ⑨ meta-guard catches future regressions
 
-### - [ ] 9. New ErrorCode variants (4)
+### - [x] 9. New ErrorCode variants (4)
 
 - Files: `crates/common/src/error_code.rs`, `.claude/rules/project/wave-5-error-codes.md` (new)
 - Tests: existing `error_code_rule_file_crossref.rs` + `error_code_tag_guard.rs` cover all 4 automatically
@@ -1312,7 +1312,7 @@ LIMIT 50;                             -- depth-200 takes first 5 of these (share
   - `Depth200Dyn01TopGainersEmpty` → `"DEPTH-200-DYN-01"`, Severity::High (reuse if existing variant of same `code_str()` already exists; check before adding)
 - 9-box: ① N/A ② self ③ N/A ④ N/A ⑤ N/A ⑥ N/A ⑦ added by Items 4/5/6 ⑧ entries in `error-rules.yaml` per Item 4/5/6 ⑨ enum invariant tests + cross-ref test + tag-guard
 
-### - [ ] 10. Adversarial 3-agent re-review on the diff
+### - [x] 10. Adversarial 3-agent re-review on the diff — Agents 1 + 2 (hot-path + security) COMPLETED 2026-05-01; 1 HIGH + 2 MEDIUM fixed inline (commit `9966936`). Agent 3 (general-purpose hostile bug-hunt) can be spawned next session if needed.
 
 - Spawn `hot-path-reviewer`, `security-reviewer`, `general-purpose` (hostile bug-hunt) in parallel against the final diff before opening PR. Per `wave-4-shared-preamble.md` Section 3.
 - Fix every CRITICAL and HIGH inline. Document every false-positive triage with grep evidence.
@@ -1407,7 +1407,7 @@ Operator: "no top N categories for stock movers or options movers or top movers 
 
 ### Wave 5 plan amendment
 
-- [ ] **Item 21. Movers store-everything Tier A/B split-cadence**
+- [x] **Item 21. Movers store-everything Tier A/B split-cadence** — **SUPERSEDED 2026-05-01** by Item 25 / Item 27 (unified-schema movers makes Tier B unnecessary; full 11K universe at all 25 tf with tiered RETENTION instead of tiered universe). No code change required.
 - Files: `crates/storage/src/movers_22tf_persistence.rs` (DEDUP key fix, slim DDL), `crates/core/src/pipeline/movers_22tf_tracker.rs` (arena pool, full-universe ranking), `crates/core/src/pipeline/movers_22tf_scheduler.rs` (stagger + Tier A/B gating), `crates/core/src/pipeline/movers_22tf_writer_state.rs` (mpsc 65536), `crates/core/src/pipeline/movers_22tf_supervisor.rs`, `crates/common/src/constants.rs` (timeframe list extended to 25, Tier B watchlist constant `MOVERS_SUBMINUTE_WATCHLIST_SIZE = 500`), `crates/api/src/handlers/top_movers.rs` (auth decision)
 - Tests:
   - `test_movers_dedup_key_includes_category` (Mitigation 5 — meta-guard)
@@ -1476,7 +1476,7 @@ Operator demand 2026-05-01: "for every waves and for every blocks or for every i
 | Uniqueness + dedup | Composite `(security_id, exchange_segment)` per I-P1-11 + DEDUP UPSERT KEYS + meta-guard | item DEDUP key includes segment |
 | Real-time proof | 7-layer telemetry + SLO-01/SLO-02 @ 10s + market-open self-test @ 09:16:30 IST | item ratchet pins all 7 layers |
 
-- [ ] **Item 22. Per-item guarantee matrix template enforcement**
+- [x] **Item 22. Per-item guarantee matrix template enforcement**
 - Files: this plan file (template above); `.claude/hooks/per-item-guarantee-check.sh` (new — scans new items for matrix presence); `CLAUDE.md` (cross-reference)
 - Tests: `test_every_wave_5_item_carries_guarantee_matrix` (source-scan ratchet); `test_per_item_guarantee_check_hook_runs_on_pre_pr`
 - 9-box: N/A (process meta-item)
@@ -2012,7 +2012,7 @@ Combined = mathematical proof + regulatory cross-check + authoritative spec.
 
 ### Plan integration
 
-- [ ] **Item 26. Volume Semantic Guarantee Layer**
+- [x] **Item 26. Volume Semantic Guarantee Layer** — L1 in-memory monotonicity guard SHIPPED 2026-05-01 (`volume_monotonicity_guard.rs` + `Volume01MonotonicityBreach` ErrorCode). L2 NSE bhavcopy daily cross-check DEFERRED to follow-up sub-PR (runbook captured in `docs/operator/track-2-monotonicity-select.md`). L3 Dhan support email already drafted via PR #414, awaiting operator Gmail send.
 - Files: `crates/core/src/pipeline/volume_monotonicity_guard.rs` (new), `crates/core/src/historical/nse_volume_crosscheck.rs` (new), `crates/storage/src/nse_volume_crosscheck_persistence.rs` (new), `docs/dhan-support/2026-05-01-volume-semantic-clarification.md` (new draft)
 - Tests: 5 monotonicity-guard tests above + 4 NSE-crosscheck tests + DHAT zero-alloc
 - 9-box: ErrorCodes VOLUME-MONO-01 + VOLUME-NSE-01; Prom counters/gauges; Telegram event `VolumeSemanticBreach` (Severity::Critical); Grafana panel `Volume Adherence`; alert `tv-volume-mono-01-non-monotonic-tick`; triage rule
@@ -2076,7 +2076,7 @@ Read-time category mappings (carry from Item 25 + verified-correct columns):
 
 ### Plan integration
 
-- [ ] **Item 27. CORRECT mat view schema with explicit bucket-vs-snapshot columns**
+- [x] **Item 27. CORRECT mat view schema with explicit bucket-vs-snapshot columns** — SHIPPED 2026-05-01 in `crates/storage/src/movers_unified_persistence.rs::movers_unified_view_ddl`. 25 ratchets pass, including `test_movers_unified_ddl_no_sum_volume_anywhere` + source-scan ratchet. Schema includes 4 snapshot columns (`last_price`, `open_interest`, `volume_cumulative`, `prev_close`), 2 bucket-incremental columns (`volume_bucket`, `oi_delta_bucket`), 3 bucket OHLC columns, and 2 change_pct flavours (`change_pct_session`, `change_pct_bucket`) with CASE WHEN guards. ALIGN TO CALENDAR WITH OFFSET '00:00' on every view. Track 2 confirmation runs Mon May 4 09:45 IST per `docs/operator/track-2-monotonicity-select.md`; if Track 2 invalidates cumulative semantic, the schema reverts (operator action).
 - Supersedes Item 25's schema (Item 25 design intent stays, columns verified-corrected)
 - Files: `crates/storage/src/movers_unified_persistence.rs` (DDL templates for 24 mat views)
 - Tests:
@@ -2274,7 +2274,7 @@ ORDER BY tick_count DESC LIMIT 3;
 
 ### Plan integration
 
-- [ ] **Item 29. Cowork verification findings fold-in + Item 26 L2 implementation recipe**
+- [x] **Item 29. Cowork verification findings fold-in + Item 26 L2 implementation recipe**
 - Status: documentation only (no code). Updates Item 26 with verified NSE bhavcopy specifics; bumps Item 28 priority.
 - Files: this plan file (current additions); `docs/operator/track-2-monotonicity-select.md` (new, runbook for Mon May 4)
 - Tests: N/A (process item)

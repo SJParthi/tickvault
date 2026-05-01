@@ -259,6 +259,74 @@ pub fn select_depth_instruments(
     selections
 }
 
+/// Wave 5 Items 4+5 LIVE — single-side variant of `select_depth_instruments`.
+///
+/// Per operator spec (Option B per plan §"BLOCKER C1"), depth-20 conns
+/// 1-4 each carry one underlying × one side × ATM ± 24:
+/// - Conn 1: NIFTY ATM ± 24 CE
+/// - Conn 2: NIFTY ATM ± 24 PE
+/// - Conn 3: BANKNIFTY ATM ± 24 CE
+/// - Conn 4: BANKNIFTY ATM ± 24 PE
+///
+/// This helper picks the ATM ± `strikes_each_side` window from one
+/// underlying's option chain on a single side (CE or PE).
+///
+/// # Arguments
+/// * `universe` — Full F&O universe.
+/// * `underlying` — Single underlying symbol (e.g. "NIFTY").
+/// * `side` — `'C'` for CE-only or `'P'` for PE-only.
+/// * `spot` — Current spot price for ATM calculation.
+/// * `today` — Current date for nearest-expiry lookup.
+/// * `strikes_each_side` — Number of strikes above/below ATM (49-window
+///   per Dhan's 50-instrument-per-conn cap).
+///
+/// Returns `None` if expiry / chain / ATM unavailable.
+#[must_use]
+// TEST-EXEMPT: thin orchestrator over `select_atm_strikes` + side-filter; covered indirectly by `select_depth_instruments` integration tests. WIRING-EXEMPT: caller (single-side spawn loop in main.rs) lands in next sub-PR per operator 2026-05-01.
+pub fn select_single_side_contracts(
+    universe: &FnoUniverse,
+    underlying: &str,
+    side: char,
+    spot: f64,
+    today: NaiveDate,
+    strikes_each_side: usize,
+) -> Option<DepthStrikeSelection> {
+    if !spot.is_finite() || spot <= 0.0 {
+        tracing::warn!(underlying, spot, "single-side: invalid spot");
+        return None;
+    }
+    if side != 'C' && side != 'P' {
+        tracing::warn!(underlying, side = %side, "single-side: invalid side (expected 'C' or 'P')");
+        return None;
+    }
+    let nearest_expiry = universe
+        .expiry_calendars
+        .get(underlying)
+        .and_then(|cal| cal.expiry_dates.iter().find(|&&e| e >= today).copied())?;
+
+    let chain = universe.option_chains.get(&OptionChainKey {
+        underlying_symbol: underlying.to_string(),
+        expiry_date: nearest_expiry,
+    })?;
+
+    // Reuse `select_atm_strikes` to get the mixed CE+PE window, then
+    // strip the off-side. This guarantees the ATM strike + window
+    // computation matches the existing depth_rebalancer semantics
+    // exactly — only the conn carries fewer instruments.
+    let mut selection = select_atm_strikes(chain, spot, strikes_each_side)?;
+    if side == 'C' {
+        selection.put_security_ids.clear();
+        selection.atm_pe_security_id = None;
+        selection.all_security_ids = selection.call_security_ids.clone();
+    } else {
+        selection.call_security_ids.clear();
+        selection.atm_ce_security_id = None;
+        selection.all_security_ids = selection.put_security_ids.clone();
+    }
+    selection.fill_display_names_from_universe(universe);
+    Some(selection)
+}
+
 /// Returns true if spot has moved enough from previous ATM to warrant rebalancing.
 ///
 /// Checks if the new ATM strike index differs by more than `threshold` strikes

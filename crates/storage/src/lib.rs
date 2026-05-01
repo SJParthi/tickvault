@@ -83,6 +83,9 @@ pub mod materialized_views;
 pub mod movers_22tf_persistence;
 pub mod movers_22tf_writer;
 pub mod movers_persistence;
+pub mod movers_unified_persistence;
+pub mod movers_unified_query;
+pub mod movers_unified_writer;
 pub mod obi_persistence;
 pub mod order_audit_persistence;
 pub mod partition_manager;
@@ -94,6 +97,7 @@ pub mod selftest_audit_persistence;
 pub mod tick_persistence;
 pub mod tick_spill_drain;
 pub mod valkey_cache;
+pub mod volume_nse_audit_persistence;
 pub mod ws_frame_spill;
 pub mod ws_reconnect_audit_persistence;
 

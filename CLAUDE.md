@@ -470,6 +470,13 @@ Multi-file tasks (3+ changes) require a plan in `.claude/plans/active-plan.md`:
 
 See `.claude/rules/project/plan-enforcement.md` for full protocol.
 
+**Per-wave / per-item guarantee matrix (mandatory):** every wave plan / item /
+block in `.claude/plans/active-plan*.md` MUST carry the 15-row + 7-row guarantee
+matrix from `.claude/rules/project/per-wave-guarantee-matrix.md` (or
+cross-reference it). Mechanically enforced by
+`bash .claude/hooks/per-item-guarantee-check.sh` (exit 2 = block) and
+`make wave-guarantee-check`. Wave 5 Item 22 wired this gate.
+
 ## TOKEN EFFICIENCY
 
 - Never re-read files already in session. Parallelize reads. Keep responses short.

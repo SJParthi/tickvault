@@ -906,6 +906,15 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
     // O(1) dedup ring buffer — pre-allocated once, zero allocation in hot loop.
     let mut dedup_ring = TickDedupRing::new(DEDUP_RING_BUFFER_POWER);
 
+    // Wave 5 Item 26 L1 — volume monotonicity guard. One HashMap entry
+    // per (security_id, segment) tracking last-seen volume. On each
+    // tick: O(1) lookup; if `volume < previous` within trading day,
+    // emit ERROR `VOLUME-MONO-01` + Prom counter. Silent on the happy
+    // path. Cleared at IST midnight via the `FirstSeenSet`-class daily
+    // reset task (separate scheduler).
+    let mut volume_monotonicity_guard =
+        super::volume_monotonicity_guard::VolumeMonotonicityGuard::new();
+
     // Defense-in-depth: reject stale ticks from previous trading days.
     // exchange_timestamp is IST epoch seconds; dividing by 86400 gives the IST day number.
     // Computed once at startup — valid for the entire trading session (09:00–15:30).
@@ -1125,25 +1134,22 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                             tick.day_close,
                         );
                     }
-                    // Wave 1 Item 4.4 — NSE_EQ prev-close persistence
-                    // per Dhan Ticket #5525125 (Quote packet code 4,
-                    // bytes 38-41). The first-seen gate fires once per
-                    // (security_id, segment) per IST trading day so
-                    // we don't amplify ILP throughput by ~24K-x.
-                    if let Some(seg) = tickvault_common::types::ExchangeSegment::from_byte(
-                        tick.exchange_segment_code,
-                    ) && super::first_seen_set::try_insert_global(tick.security_id, seg)
-                    {
-                        let _ = super::prev_close_persist::try_record_global(
-                            super::prev_close_persist::PrevCloseRecord {
-                                security_id: tick.security_id,
-                                exchange_segment_code: tick.exchange_segment_code,
-                                source: tickvault_storage::previous_close_persistence::PrevCloseSource::QuoteClose,
-                                prev_close: tick.day_close,
-                                received_at_nanos,
-                            },
-                        );
-                    }
+                    // Wave 5 Item 15 (2026-05-01) — `previous_close` table
+                    // write for NSE_EQ Quote-packet close field REMOVED
+                    // (~99.7% ILP write cut). The in-memory
+                    // `movers.update_prev_close` / `opt_movers.update_prev_close`
+                    // calls above still serve runtime change_pct queries.
+                    // HONEST RECOVERY ENVELOPE: on mid-day restart,
+                    // NSE_EQ / NSE_FNO / BSE_FNO movers caches start
+                    // empty and are repopulated by the NEXT Quote / Full
+                    // tick that carries `day_close`. `change_pct` for
+                    // those (security_id, segment) pairs reads `0.0`
+                    // until the next tick arrives — typically <2s during
+                    // market hours, <60s in pre-open. Boot recovery for
+                    // IDX_I still uses `previous_close` table via the
+                    // code-6 path below (separate file-cache + QuestDB
+                    // path in main.rs::boot_index_prev_close_cache).
+                    // Ratchet: `wave_5_prev_close_writes_idx_i_only_guard.rs`.
                 }
 
                 // Ingestion gate: drop ALL ticks outside [9:00 AM, 3:30 PM) IST.
@@ -1264,6 +1270,21 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     opt_movers.update(&tick);
                 }
 
+                // Wave 5 Item 26 L1 — volume monotonicity guard.
+                // O(1) per tick. Silent unless Dhan breaks its
+                // cumulative-since-session-open semantic; on breach
+                // emits ERROR `VOLUME-MONO-01` + Prom counter.
+                // IDX_I (segment 0) ticks have `volume == 0` (Ticker
+                // mode), so the guard sees a single 0-baseline and
+                // never flags. NSE_EQ / NSE_FNO / BSE_FNO ticks
+                // carry the cumulative session volume from Dhan's
+                // Quote / Full packets.
+                let _ = volume_monotonicity_guard.observe(
+                    tick.security_id,
+                    tick.exchange_segment_code,
+                    tick.volume,
+                );
+
                 // Phase 10c-2 — dual-feed: also push the tick into the
                 // global Movers22TfTracker so the 22-tf snapshot tasks
                 // see live data. No-op if the tracker is not installed
@@ -1341,25 +1362,12 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                             tick.day_close,
                         );
                     }
-                    // Wave 1 Item 4.4 — NSE_FNO prev-close persistence
-                    // per Dhan Ticket #5525125 (Full packet code 8,
-                    // bytes 50-53). Same first-seen gate semantics as
-                    // the Quote path so we record exactly one row per
-                    // (security_id, segment) per IST trading day.
-                    if let Some(seg) = tickvault_common::types::ExchangeSegment::from_byte(
-                        tick.exchange_segment_code,
-                    ) && super::first_seen_set::try_insert_global(tick.security_id, seg)
-                    {
-                        let _ = super::prev_close_persist::try_record_global(
-                            super::prev_close_persist::PrevCloseRecord {
-                                security_id: tick.security_id,
-                                exchange_segment_code: tick.exchange_segment_code,
-                                source: tickvault_storage::previous_close_persistence::PrevCloseSource::FullClose,
-                                prev_close: tick.day_close,
-                                received_at_nanos,
-                            },
-                        );
-                    }
+                    // Wave 5 Item 15 (2026-05-01) — `previous_close` table
+                    // write for NSE_FNO + BSE_FNO Full-packet close field
+                    // REMOVED. In-memory cache update above still feeds
+                    // movers writers; restart recovery is via single
+                    // QuestDB SELECT against `ticks`. Ratchet:
+                    // `wave_5_prev_close_writes_idx_i_only_guard.rs`.
                 }
 
                 if tick_is_valid {

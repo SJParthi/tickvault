@@ -183,22 +183,26 @@ mod tests {
 
     #[test]
     fn test_timeframe_count_is_22() {
-        assert_eq!(timeframe_count(), 22);
+        // Wave 5 Item 19 extended count from 22 → 25; legacy fn name kept.
+        assert_eq!(timeframe_count(), 25);
     }
 
     #[test]
     fn test_cadence_for_index_first_and_last() {
         assert_eq!(cadence_for_index(0), Some(1));
-        assert_eq!(cadence_for_index(21), Some(3600));
-        assert_eq!(cadence_for_index(22), None);
+        // Last index is now 24 (was 21); cadence still 3600 (1h).
+        assert_eq!(cadence_for_index(24), Some(3600));
+        assert_eq!(cadence_for_index(25), None);
     }
 
     #[test]
     fn test_timeframe_at_returns_correct_label() {
         assert_eq!(timeframe_at(0).unwrap().label, "1s");
-        assert_eq!(timeframe_at(5).unwrap().label, "1m");
-        assert_eq!(timeframe_at(21).unwrap().label, "1h");
-        assert!(timeframe_at(22).is_none());
+        // After Wave 5 Item 19 (8 sub-minute entries), `1m` is at index 8.
+        assert_eq!(timeframe_at(8).unwrap().label, "1m");
+        // Last entry: index 24, label `1h`.
+        assert_eq!(timeframe_at(24).unwrap().label, "1h");
+        assert!(timeframe_at(25).is_none());
     }
 
     #[test]
