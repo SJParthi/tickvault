@@ -1318,3 +1318,120 @@ cargo test --features dhat             # zero hot-path allocations
 - `MidMarketBootComplete` event becomes inert (no stock F&O Mode C resolution needed). Keep variant; rename trigger condition.
 - Pre-open buffer + REST fallback (`preopen_rest_fallback.rs`) becomes inert for stocks. Indices still use it.
 - DEDUP keys + I-P1-11 composite-key invariants UNCHANGED. New code MUST use `(security_id, exchange_segment)`.
+
+## Item 21 — Movers Store-Everything (Tier A/B Split-Cadence) — operator demand 2026-05-01
+
+Operator: "no top N categories for stock movers or options movers or top movers because i never ever wanted this top n dude it should be always everything dude — only then in dashboard for historical view we can easily see this".
+
+3 specialist agents reviewed full-universe persistence in parallel. **Hot-path agent: 1 CRITICAL + 3 HIGH. Feasibility agent: pure store-everything blows ₹5K/mo budget by 6×. Security agent: 0 CRITICAL, 2 MEDIUM, 2 LOW.**
+
+**Honest verdict: pure "store all 11K × 7 cat × 25 tf" exceeds c7i.xlarge budget AND ingest ceiling. Tier A/B split-cadence is the only viable path within ₹5K/mo cap.**
+
+### Final design — Tier A / Tier B split
+
+| Tier | Timeframes | Universe | Categories | Rationale |
+|---|---|---|---|---|
+| **A — minute+** | 1m, 2m, 3m, 4m, 5m, 6m, 7m, 8m, 9m, 10m, 11m, 12m, 13m, 14m, 15m, 30m, 1h, 2h, 3h, 4h, 1d (22 tf) | **ALL ~11,018 instruments** | All 7 (HIGHEST_OI, OI_GAINER, OI_LOSER, TOP_VOLUME, TOP_VALUE, PRICE_GAINER, PRICE_LOSER) | Operator's historical-dashboard demand satisfied |
+| **B — sub-minute** | 1s, 5s, 15s, 30s (4 tf) | Watchlist only: NIFTY/BANKNIFTY full chain + ATM±25 of focus stocks (~500 contracts) | All 7 | Sub-minute is for fast trading signals; storing 1s × 11K × 7 = 77K rows/sec exceeds QuestDB ceiling and blows EBS in <1 day |
+
+### Math (verified by agents)
+
+| Metric | Pure store-everything | **Tier A/B (chosen)** |
+|---|---|---|
+| Peak burst (09:15 IST coboundary) | ~1M rows/sec | ~30K rows/sec staggered |
+| Sustained writes | ~250K rows/sec | ~8.5K rows/sec |
+| Storage/day | 45–196 GB | ~3.5 GB |
+| 90-day hot | 4 TB (₹31K/mo) | 115 GB (fits ₹333/mo S3 lifecycle) |
+| QuestDB ceiling on c7i.xlarge | EXCEEDED | safe |
+| Fits ₹5K/mo cap | NO (6× over) | YES |
+
+### Mandatory mitigations (all 3 agents agreed)
+
+| # | Fix | Source | Why |
+|---|---|---|---|
+| 1 | Stagger boundary emissions (each tf offset by `idx × 200ms`) | hot-path | Spreads 175 sorts across ~5s instead of synchronous 1.92M-row burst |
+| 2 | Arena pool per category (`[Vec<MoverRow>; 7]` reusable, owned per timeframe task) | hot-path | Zero allocation steady-state |
+| 3 | mpsc 8192 → 65536 OR per-timeframe spill ring (`spill_ring.rs` pattern) | hot-path | Absorb burst without drops |
+| 4 | Criterion bench `bench_rank_all_n11k_22tf_p99_under_200ms` | hot-path | Without ratchet, "O(1) under normal" is aspirational |
+| 5 | **DEDUP key fix:** `DEDUP_KEY_MOVERS_22TF` `"ts, security_id, segment"` → `"ts, security_id, segment, category"` | feasibility + security | Without `category`, 7 categories × same instrument collide → row clobber |
+| 6 | Tie-break deterministic: `change_pct DESC, volume DESC, security_id ASC` | security L2 | Eliminates rank divergence between snapshots |
+| 7 | API `/api/top-movers` — explicit operator decision on auth gating (currently unauthed) | security M1 | Full-universe rank exposes intraday positions |
+| 8 | DDL comment fix: drop "SEBI 5-year retention" wording — movers are observability, NOT order audit | security L1 | Prevents over-retention cost |
+
+### Wave 5 plan amendment
+
+- [ ] **Item 21. Movers store-everything Tier A/B split-cadence**
+- Files: `crates/storage/src/movers_22tf_persistence.rs` (DEDUP key fix, slim DDL), `crates/core/src/pipeline/movers_22tf_tracker.rs` (arena pool, full-universe ranking), `crates/core/src/pipeline/movers_22tf_scheduler.rs` (stagger + Tier A/B gating), `crates/core/src/pipeline/movers_22tf_writer_state.rs` (mpsc 65536), `crates/core/src/pipeline/movers_22tf_supervisor.rs`, `crates/common/src/constants.rs` (timeframe list extended to 25, Tier B watchlist constant `MOVERS_SUBMINUTE_WATCHLIST_SIZE = 500`), `crates/api/src/handlers/top_movers.rs` (auth decision)
+- Tests:
+  - `test_movers_dedup_key_includes_category` (Mitigation 5 — meta-guard)
+  - `test_movers_tier_a_full_universe_minute_plus` (22 tf × 11K × 7 = full)
+  - `test_movers_tier_b_watchlist_only_sub_minute` (500-contract gate)
+  - `test_movers_boundary_stagger_200ms_offset_per_tf` (Mitigation 1)
+  - `test_movers_arena_pool_zero_alloc_steady_state` (DHAT, Mitigation 2)
+  - `test_movers_writer_channel_capacity_65536` (Mitigation 3)
+  - `bench_rank_all_n11k_22tf_p99_under_200ms` (Criterion, Mitigation 4)
+  - `test_movers_tie_break_change_pct_volume_security_id` (Mitigation 6)
+  - `test_movers_api_top_movers_auth_or_explicitly_unauthed` (security M1)
+  - `test_movers_ddl_comment_no_sebi_5y_wording` (security L1 source-scan)
+- 9-box:
+  - ① typed event: existing `Movers22TfWriterIlpFailed` + add `MoversTierBWatchlistDrift` (Severity::Medium, watchlist size != 500 due to ATM rebalance)
+  - ② ErrorCode: existing `MOVERS-22TF-01/02/03`; add `MOVERS-22TF-04` (sub-minute watchlist drift, Medium); add `MOVERS-22TF-05` (DEDUP key validation failed, Critical, halt boot)
+  - ③ tracing: `info!(tier, tf, rows_persisted, …)`
+  - ④ Prom: `tv_movers_persist_rows_total{tier,tf,category}`, `tv_movers_burst_peak_rows_per_sec`, `tv_movers_arena_pool_alloc_count` (expect = 0 steady-state)
+  - ⑤ Grafana: rewrite Operator Health movers panel — split Tier A vs Tier B rows
+  - ⑥ Alert: `tv-movers-22tf-burst-exceeds-100k-rows-per-sec` (>100K/sec sustained 60s = QuestDB ceiling risk)
+  - ⑦ Call site: `tick_processor` → tracker (existing); scheduler stagger (new); supervisor (existing)
+  - ⑧ Triage: existing entries + new `movers-22tf-04-watchlist-drift-investigate`
+  - ⑨ Ratchet: 10 tests above + `dedup_segment_meta_guard.rs` extension to verify `category` membership
+
+### Items 16 + 19 amendments
+
+- Item 16 (was: REUSE Movers22TfTracker) — **superseded by Item 21**. Item 16 closes as "verify-only no-op" since Item 21 is the active rewrite.
+- Item 19 (was: 25-timeframe extension keeping 22Tf naming) — **folded into Item 21**. The 25-tf list extension is now a sub-task of Item 21's Tier A/B implementation.
+
+### Honest non-claim restated
+
+Operator's ideal "store everything for everything" is **physically infeasible** on ₹5K/mo c7i.xlarge — sustained 250K rows/sec writes blow EBS in 4 days, peak 1M rows/sec exceeds QuestDB single-host ingest. Tier A/B is the **only design that satisfies operator intent (full historical view) within budget envelope**. If operator wants pure store-everything, AWS budget must move to ~₹10–12K/mo (c7i.2xlarge + 500GB EBS + larger S3).
+
+## Item 22 — Per-Item Guarantee Matrix (mandatory template)
+
+Operator demand 2026-05-01: "for every waves and for every blocks or for every items we need all these guarantee and assurance right dude because every block is extremely critical right dude?"
+
+**Every Wave/item from this point forward MUST attach the following matrix to its 9-box checklist.** No item ships without all rows green at PR-merge time.
+
+| Demand | Mechanical proof artefact | Real-time check | Per-item gate |
+|---|---|---|---|
+| **100% code coverage** | `quality/crate-coverage-thresholds.toml` 100% min per crate; `scripts/coverage-gate.sh` | post-merge llvm-cov report | item PR includes coverage screenshot |
+| **100% audit coverage** | `<event>_audit` table per typed event with DEDUP UPSERT KEYS | `mcp__tickvault-logs__questdb_sql` | item adds/extends audit table |
+| **100% testing coverage** | 22 test categories per `testing.md` (unit/integration/property/loom/dhat/fuzz/mutation/sanitizer/coverage/etc.) | `cargo test --workspace` green | item declares which 22 it covers |
+| **100% code checks** | banned-pattern + pub-fn-test + pub-fn-wiring + plan-verify + secret-scan + 8 pre-commit gates | pre-push mandatory | all gates green |
+| **100% code performance** | DHAT zero-alloc + Criterion p99 budgets + bench-gate ≤5% regression | `cargo bench` + `scripts/bench-gate.sh` | DHAT test if hot path |
+| **100% monitoring** | 7-layer telemetry (Prom + tracing + Loki + Telegram + Grafana + alert + audit) | `mcp__tickvault-logs__run_doctor` | 9-box completes 7 layers |
+| **100% logging** | tracing macros mandatory (no println!/dbg!); ERROR → Telegram | hourly errors.jsonl rotation | every error path uses `error!` with `code` |
+| **100% alerting** | `alerts.yml` Prom rule + `resilience_sla_alert_guard.rs` ratchet | `mcp__tickvault-logs__list_active_alerts` | item adds alert for new failure |
+| **100% security** | banned-pattern + secret-scan + `Secret<T>` + security-reviewer agent | `cargo audit` post-deploy | item runs security-reviewer |
+| **100% security hardening** | static IP enforcement + pre-commit secret scan + `unused_must_use` lint | post-deploy IP verify | item declares attack-surface delta |
+| **100% bugs fixing** | adversarial 3-agent review (proven 4-bug catch rate) | pre-PR + post-impl agent pass | item runs all 3 agents |
+| **100% scenarios covering** | 9-box + chaos test for new failure mode (Item 11 pattern) | chaos suite | item declares scenarios in ratchet |
+| **100% functionalities covering** | every pub fn has call site + test (`pub-fn-wiring-guard.sh` + `pub-fn-test-guard.sh`) | pre-push gates 6+11 | item adds tests for every new pub fn |
+| **100% code review** | adversarial 3-agent on diff before AND after impl | per-PR | item PR includes both passes |
+| **100% extreme check** | all of above + ratchet tests fail build on regression | every commit | item adds ratchet test |
+
+### Resilience demands per item (mandatory)
+
+| Demand | Honest envelope | Per-item proof |
+|---|---|---|
+| Zero ticks lost | Bounded zero loss inside chaos envelope: ring 600K → spill NDJSON → DLQ | item must not introduce new tick-drop path |
+| WS never disconnects | DETECT ≤5s, reconnect with `SubscribeRxGuard`, sleep-until-open post-close | item must not break SubscribeRxGuard or pool watchdog |
+| Never slow/locked/hanged | DHAT ≤4 alloc blocks/8KB across 10K calls; Criterion p99 ≤100ns; tick-gap >30s Telegram; core_affinity Core 0 | item must not add hot-path allocation |
+| QuestDB never fails | ABSORB via 3-tier rescue→spill→DLQ + schema self-heal | item must not break self-heal |
+| O(1) latency | `from_le_bytes` + `papaya` + `Arc<HashMap>` + SPSC bounded; bench-gate ≤5% regression | item adds Criterion bench if hot path |
+| Uniqueness + dedup | Composite `(security_id, exchange_segment)` per I-P1-11 + DEDUP UPSERT KEYS + meta-guard | item DEDUP key includes segment |
+| Real-time proof | 7-layer telemetry + SLO-01/SLO-02 @ 10s + market-open self-test @ 09:16:30 IST | item ratchet pins all 7 layers |
+
+- [ ] **Item 22. Per-item guarantee matrix template enforcement**
+- Files: this plan file (template above); `.claude/hooks/per-item-guarantee-check.sh` (new — scans new items for matrix presence); `CLAUDE.md` (cross-reference)
+- Tests: `test_every_wave_5_item_carries_guarantee_matrix` (source-scan ratchet); `test_per_item_guarantee_check_hook_runs_on_pre_pr`
+- 9-box: N/A (process meta-item)
+
+## Plan Items (now 22, was 10)
