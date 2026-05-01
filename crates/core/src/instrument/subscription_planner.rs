@@ -155,11 +155,10 @@ pub fn select_stock_expiry_with_rollover(
     // T-ONLY rule (2026-04-28): roll ONLY when today IS the expiry day
     // (0 trading days remaining). Was T-or-T-1 (`<= 1`) pre-2026-04-28;
     // narrowed because Dhan only blocks trading on expiry day itself, not
-    // T-1. The `<= STOCK_EXPIRY_ROLLOVER_TRADING_DAYS` form is preserved
-    // for u32 type-correctness; the constant is now 0 so this compares
-    // `== 0` in practice.
+    // T-1. Uses `==` rather than `<=` because the constant is now 0 (u32
+    // min); `<= 0` is `clippy::absurd_extreme_comparisons` on unsigned.
     let trading_days_left = cal.count_trading_days(today, nearest);
-    if trading_days_left <= STOCK_EXPIRY_ROLLOVER_TRADING_DAYS {
+    if trading_days_left == STOCK_EXPIRY_ROLLOVER_TRADING_DAYS {
         // Roll to the NEXT expiry, if one exists.
         if let Some(next) = expiry_dates.get(nearest_idx + 1) {
             debug!(
