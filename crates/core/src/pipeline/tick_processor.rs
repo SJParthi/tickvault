@@ -1125,25 +1125,16 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                             tick.day_close,
                         );
                     }
-                    // Wave 1 Item 4.4 — NSE_EQ prev-close persistence
-                    // per Dhan Ticket #5525125 (Quote packet code 4,
-                    // bytes 38-41). The first-seen gate fires once per
-                    // (security_id, segment) per IST trading day so
-                    // we don't amplify ILP throughput by ~24K-x.
-                    if let Some(seg) = tickvault_common::types::ExchangeSegment::from_byte(
-                        tick.exchange_segment_code,
-                    ) && super::first_seen_set::try_insert_global(tick.security_id, seg)
-                    {
-                        let _ = super::prev_close_persist::try_record_global(
-                            super::prev_close_persist::PrevCloseRecord {
-                                security_id: tick.security_id,
-                                exchange_segment_code: tick.exchange_segment_code,
-                                source: tickvault_storage::previous_close_persistence::PrevCloseSource::QuoteClose,
-                                prev_close: tick.day_close,
-                                received_at_nanos,
-                            },
-                        );
-                    }
+                    // Wave 5 Item 15 (2026-05-01) — `previous_close` table
+                    // write for NSE_EQ Quote-packet close field REMOVED.
+                    // The in-memory `movers.update_prev_close` /
+                    // `opt_movers.update_prev_close` calls above still
+                    // serve runtime change_pct queries; on restart, the
+                    // cache is rehydrated from the latest tick of the
+                    // current trading day in `ticks` (single QuestDB
+                    // SELECT). Boot recovery for IDX_I still uses
+                    // `previous_close` table — see code-6 path below.
+                    // Ratchet: `wave_5_prev_close_writes_idx_i_only_guard.rs`.
                 }
 
                 // Ingestion gate: drop ALL ticks outside [9:00 AM, 3:30 PM) IST.
@@ -1341,25 +1332,12 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                             tick.day_close,
                         );
                     }
-                    // Wave 1 Item 4.4 — NSE_FNO prev-close persistence
-                    // per Dhan Ticket #5525125 (Full packet code 8,
-                    // bytes 50-53). Same first-seen gate semantics as
-                    // the Quote path so we record exactly one row per
-                    // (security_id, segment) per IST trading day.
-                    if let Some(seg) = tickvault_common::types::ExchangeSegment::from_byte(
-                        tick.exchange_segment_code,
-                    ) && super::first_seen_set::try_insert_global(tick.security_id, seg)
-                    {
-                        let _ = super::prev_close_persist::try_record_global(
-                            super::prev_close_persist::PrevCloseRecord {
-                                security_id: tick.security_id,
-                                exchange_segment_code: tick.exchange_segment_code,
-                                source: tickvault_storage::previous_close_persistence::PrevCloseSource::FullClose,
-                                prev_close: tick.day_close,
-                                received_at_nanos,
-                            },
-                        );
-                    }
+                    // Wave 5 Item 15 (2026-05-01) — `previous_close` table
+                    // write for NSE_FNO + BSE_FNO Full-packet close field
+                    // REMOVED. In-memory cache update above still feeds
+                    // movers writers; restart recovery is via single
+                    // QuestDB SELECT against `ticks`. Ratchet:
+                    // `wave_5_prev_close_writes_idx_i_only_guard.rs`.
                 }
 
                 if tick_is_valid {
