@@ -1145,7 +1145,7 @@ Each item carries the 9-box checklist per `stream-resilience.md` B8: ① typed e
 - Add enum `SubscriptionScope::{IndicesOnlyAllExpiries, FullUniverse}`. Default = `IndicesOnlyAllExpiries`.
 - 9-box: ① N/A (config) ② N/A ③ N/A ④ `tv_subscription_scope` info-gauge ⑤ Operator Health header ⑥ N/A ⑦ `subscription_planner::build_subscription_plan` ⑧ N/A ⑨ enum tests + figment round-trip
 
-### - [ ] 2. Universe filter — keep 11,018 instruments
+### - [x] 2. Universe filter — keep 11,018 instruments
 
 - Files: `crates/core/src/instrument/subscription_planner.rs`
 - Tests: `test_indices_only_scope_filters_to_three_underlyings`, `test_universe_count_pinned_at_11018`, `test_finnifty_midcpnifty_excluded_from_indices_only`, `test_stock_fno_excluded_under_indices_only_scope`

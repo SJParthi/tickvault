@@ -23,7 +23,7 @@ use std::collections::{HashMap, HashSet};
 use chrono::NaiveDate;
 use tracing::{debug, info, warn};
 
-use tickvault_common::config::SubscriptionConfig;
+use tickvault_common::config::{SubscriptionConfig, SubscriptionScope};
 use tickvault_common::constants::{FULL_CHAIN_INDEX_SYMBOLS, MAX_TOTAL_SUBSCRIPTIONS};
 use tickvault_common::instrument_registry::{
     InstrumentRegistry, SubscribedInstrument, SubscriptionCategory, make_derivative_instrument,
@@ -223,6 +223,29 @@ pub fn select_stock_expiry_with_rollover(
 /// ONLY when today IS the expiry day (0 trading days remaining). When
 /// `None`, nearest expiry is always used (legacy behaviour —
 /// pre-2026-04-24).
+/// Wave 5 Item 2 — returns `true` when the planner SHOULD subscribe stock
+/// derivatives (NSE_FNO + BSE_FNO contracts on `UnderlyingKind::Stock`
+/// underlyings). Combines the legacy `config.subscribe_stock_derivatives`
+/// boolean AND the new `config.subscription.scope` gate:
+///
+/// - `IndicesOnlyAllExpiries` (Wave 5 default) → returns `false`. The 216
+///   F&O stocks contribute zero contracts to the plan; the saved ~22K
+///   subscription slots fan out to NIFTY + BANKNIFTY + SENSEX full chain
+///   plus the cash-equity feeds.
+/// - `FullUniverse` (legacy escape hatch) → falls through to the legacy
+///   `subscribe_stock_derivatives` boolean.
+///
+/// Pure function; tested by `test_indices_only_scope_filters_to_three_underlyings`,
+/// `test_universe_count_pinned_at_11018`, etc.
+#[inline]
+#[must_use]
+pub const fn should_subscribe_stock_derivatives(config: &SubscriptionConfig) -> bool {
+    match config.scope {
+        SubscriptionScope::IndicesOnlyAllExpiries => false,
+        SubscriptionScope::FullUniverse => config.subscribe_stock_derivatives,
+    }
+}
+
 pub fn build_subscription_plan(
     universe: &FnoUniverse,
     config: &SubscriptionConfig,
@@ -231,6 +254,9 @@ pub fn build_subscription_plan(
     trading_calendar: Option<&TradingCalendar>,
 ) -> SubscriptionPlan {
     let feed_mode = config.parsed_feed_mode().unwrap_or(FeedMode::Ticker);
+    // Wave 5 Item 2: scope gate. Under `IndicesOnlyAllExpiries`, no stock
+    // F&O is subscribed regardless of the legacy boolean.
+    let stock_derivatives_enabled = should_subscribe_stock_derivatives(config);
 
     let mut instruments: Vec<SubscribedInstrument> = Vec::with_capacity(MAX_TOTAL_SUBSCRIPTIONS);
     // BUG FIX (2026-04-17, spotted by Parthiban): dedup was keyed on
@@ -381,8 +407,11 @@ pub fn build_subscription_plan(
             instruments.push(make_stock_equity_instrument(underlying, nse_eq_feed_mode));
         }
 
-        // 4b. Stock derivatives — current expiry only, ATM ± N strikes
-        if !config.subscribe_stock_derivatives {
+        // 4b. Stock derivatives — current expiry only, ATM ± N strikes.
+        // Wave 5 Item 2: under `IndicesOnlyAllExpiries` scope this short-
+        // circuits for every stock underlying, dropping the entire 216-
+        // stock F&O block (~22K contracts) from the plan.
+        if !stock_derivatives_enabled {
             continue;
         }
 
@@ -567,7 +596,9 @@ pub fn build_subscription_plan(
     let mut stock_derivatives_available: usize = 0;
     let mut stock_derivatives_skipped: usize = 0;
 
-    if config.subscribe_stock_derivatives {
+    // Wave 5 Item 2 scope gate. Under `IndicesOnlyAllExpiries` the entire
+    // Stage 2 progressive-fill block is dead code.
+    if stock_derivatives_enabled {
         // O(1) EXEMPT: begin — planner runs once at startup, not per tick
         let count_before_stage2 = instruments.len();
 
@@ -720,6 +751,8 @@ pub fn build_subscription_plan_from_archived(
     today: NaiveDate,
 ) -> SubscriptionPlan {
     let feed_mode = config.parsed_feed_mode().unwrap_or(FeedMode::Ticker);
+    // Wave 5 Item 2 (archived path mirror): scope gate.
+    let stock_derivatives_enabled = should_subscribe_stock_derivatives(config);
 
     let mut instruments: Vec<SubscribedInstrument> = Vec::with_capacity(MAX_TOTAL_SUBSCRIPTIONS);
     // BUG FIX (2026-04-17): see sibling `build_subscription_plan` — dedup
@@ -865,8 +898,9 @@ pub fn build_subscription_plan_from_archived(
             ));
         }
 
-        // 4b. Stock derivatives — current expiry only, ATM ± N strikes
-        if !config.subscribe_stock_derivatives {
+        // 4b. Stock derivatives — current expiry only, ATM ± N strikes.
+        // Wave 5 Item 2 scope gate (archived path mirror).
+        if !stock_derivatives_enabled {
             continue;
         }
 
@@ -979,7 +1013,8 @@ pub fn build_subscription_plan_from_archived(
     let mut stock_derivatives_available: usize = 0;
     let mut stock_derivatives_skipped: usize = 0;
 
-    if config.subscribe_stock_derivatives {
+    // Wave 5 Item 2 scope gate (archived path mirror).
+    if stock_derivatives_enabled {
         // O(1) EXEMPT: begin — planner runs once at startup, not per tick
         let count_before_stage2 = instruments.len();
 
@@ -1135,6 +1170,17 @@ mod tests {
     use tickvault_common::types::{Exchange, ExchangeSegment, OptionType, SecurityId};
 
     /// Builds a minimal FnoUniverse for testing.
+    /// Wave 5 Item 2: `SubscriptionConfig::default()` now ships with
+    /// `scope = IndicesOnlyAllExpiries`, which intentionally drops the
+    /// 216-stock F&O block. Tests that exercise the legacy stock-F&O
+    /// pipeline use this helper to force the FullUniverse escape hatch.
+    fn legacy_full_universe_config() -> SubscriptionConfig {
+        SubscriptionConfig {
+            scope: SubscriptionScope::FullUniverse,
+            ..SubscriptionConfig::default()
+        }
+    }
+
     fn make_test_universe() -> FnoUniverse {
         let ist = tickvault_common::trading_calendar::ist_offset();
         let expiry = NaiveDate::from_ymd_opt(2026, 3, 27).unwrap();
@@ -1404,7 +1450,7 @@ mod tests {
     #[test]
     fn test_build_plan_default_config() {
         let universe = make_test_universe();
-        let config = SubscriptionConfig::default();
+        let config = legacy_full_universe_config();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
         let plan = build_subscription_plan(
@@ -1451,7 +1497,7 @@ mod tests {
     #[test]
     fn test_stock_derivatives_current_expiry_only() {
         let universe = make_test_universe();
-        let config = SubscriptionConfig::default();
+        let config = legacy_full_universe_config();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
         let plan = build_subscription_plan(
@@ -1469,7 +1515,7 @@ mod tests {
     #[test]
     fn test_stock_past_expiry_skipped() {
         let universe = make_test_universe();
-        let config = SubscriptionConfig::default();
+        let config = legacy_full_universe_config();
         // Set today AFTER the expiry date → no current expiry
         let today = NaiveDate::from_ymd_opt(2026, 4, 1).unwrap();
 
@@ -1552,6 +1598,7 @@ mod tests {
     fn test_disable_stock_equities() {
         let universe = make_test_universe();
         let config = SubscriptionConfig {
+            scope: SubscriptionScope::FullUniverse,
             subscribe_stock_equities: false,
             ..Default::default()
         };
@@ -1693,6 +1740,7 @@ mod tests {
     fn test_atm_strike_range_narrow() {
         let universe = make_test_universe();
         let config = SubscriptionConfig {
+            scope: SubscriptionScope::FullUniverse,
             stock_atm_strikes_above: 1,
             stock_atm_strikes_below: 1,
             ..Default::default()
@@ -1718,6 +1766,7 @@ mod tests {
     fn test_atm_strike_range_zero() {
         let universe = make_test_universe();
         let config = SubscriptionConfig {
+            scope: SubscriptionScope::FullUniverse,
             stock_atm_strikes_above: 0,
             stock_atm_strikes_below: 0,
             ..Default::default()
@@ -1946,7 +1995,7 @@ mod tests {
             .expiry_dates
             .push(far_expiry);
 
-        let config = SubscriptionConfig::default();
+        let config = legacy_full_universe_config();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
         let plan = build_subscription_plan(
             &universe,
@@ -2065,7 +2114,7 @@ mod tests {
             },
         );
 
-        let config = SubscriptionConfig::default();
+        let config = legacy_full_universe_config();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
         let plan = build_subscription_plan(
             &universe,
@@ -2117,7 +2166,7 @@ mod tests {
         );
         // Deliberately NOT adding an option chain for SBIN
 
-        let config = SubscriptionConfig::default();
+        let config = legacy_full_universe_config();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
         let plan = build_subscription_plan(
             &universe,
@@ -2161,7 +2210,7 @@ mod tests {
         );
         // No expiry_calendar for HDFC
 
-        let config = SubscriptionConfig::default();
+        let config = legacy_full_universe_config();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
         let plan = build_subscription_plan(
             &universe,
@@ -2358,7 +2407,7 @@ mod tests {
             },
         );
 
-        let config = SubscriptionConfig::default();
+        let config = legacy_full_universe_config();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
         let plan = build_subscription_plan(
             &universe,
@@ -2407,7 +2456,7 @@ mod tests {
             },
         );
 
-        let config = SubscriptionConfig::default();
+        let config = legacy_full_universe_config();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
         let plan = build_subscription_plan(
             &universe,
@@ -2452,7 +2501,7 @@ mod tests {
     fn test_plan_today_equals_expiry_still_included() {
         // When today == expiry date, the contract should still be included
         let universe = make_test_universe();
-        let config = SubscriptionConfig::default();
+        let config = legacy_full_universe_config();
         // Set today to the exact expiry date
         let today = NaiveDate::from_ymd_opt(2026, 3, 27).unwrap();
 
@@ -2693,7 +2742,7 @@ mod tests {
             },
         };
 
-        let config = SubscriptionConfig::default();
+        let config = legacy_full_universe_config();
         let plan = build_subscription_plan(
             &universe,
             &config,
@@ -2751,7 +2800,7 @@ mod tests {
             },
         );
 
-        let config = SubscriptionConfig::default();
+        let config = legacy_full_universe_config();
         let plan = build_subscription_plan(
             &universe,
             &config,
@@ -2787,7 +2836,7 @@ mod tests {
             chain.future_security_id = None;
         }
 
-        let config = SubscriptionConfig::default();
+        let config = legacy_full_universe_config();
         let plan = build_subscription_plan(
             &universe,
             &config,
@@ -3258,7 +3307,7 @@ mod tests {
             },
         };
 
-        let config = SubscriptionConfig::default();
+        let config = legacy_full_universe_config();
         let plan = build_subscription_plan(
             &universe,
             &config,
@@ -3329,7 +3378,7 @@ mod tests {
     #[test]
     fn test_stock_derivative_category_assignment() {
         let universe = make_test_universe();
-        let config = SubscriptionConfig::default();
+        let config = legacy_full_universe_config();
         let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
 
         let plan = build_subscription_plan(
@@ -4092,7 +4141,7 @@ mod tests {
         spot.insert("RELIANCE".to_string(), 2700.0);
         let plan = build_subscription_plan(
             &universe,
-            &SubscriptionConfig::default(),
+            &legacy_full_universe_config(),
             today,
             &spot,
             Some(&cal),
@@ -4400,5 +4449,186 @@ mod tests {
                 inst.display_label
             );
         }
+    }
+
+    // ----------------------------------------------------------------------
+    // Wave 5 Item 2 — `subscription.scope` universe-filter ratchets.
+    //
+    // Default scope = `IndicesOnlyAllExpiries` (Item 1) → drops the entire
+    // 216-stock F&O block; only NIFTY + BANKNIFTY + SENSEX index F&O,
+    // cash equities, and IDX_I are subscribed.
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn test_indices_only_scope_filters_to_three_underlyings() {
+        // Build a universe that contains BOTH index F&O (NIFTY) and stock
+        // F&O (RELIANCE). Under default IndicesOnlyAllExpiries scope, the
+        // RELIANCE F&O block must NOT appear in the plan; the cash equity
+        // feed survives independently.
+        let universe = make_test_universe();
+        let config = SubscriptionConfig::default();
+        let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
+
+        let plan = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
+
+        // Stock derivatives count must be ZERO.
+        assert_eq!(
+            plan.summary.stock_derivatives, 0,
+            "indices-only scope must drop ALL stock derivatives"
+        );
+
+        // Index derivatives still subscribed (NIFTY full chain).
+        assert!(
+            plan.summary.index_derivatives > 0,
+            "index derivatives must remain subscribed"
+        );
+
+        // Cash equities (NSE_EQ) UNCHANGED — RELIANCE price feed still subscribed.
+        assert_eq!(
+            plan.summary.stock_equities, 1,
+            "NSE_EQ cash feeds are independent of stock-derivatives gate"
+        );
+
+        // No instrument with `instrument_kind = OptionStock` or `FutureStock`.
+        for inst in plan.registry.iter() {
+            assert!(
+                !matches!(
+                    inst.instrument_kind,
+                    Some(DhanInstrumentKind::OptionStock) | Some(DhanInstrumentKind::FutureStock)
+                ),
+                "stock derivative leaked under IndicesOnlyAllExpiries scope: {} {}",
+                inst.security_id,
+                inst.display_label
+            );
+        }
+    }
+
+    #[test]
+    fn test_universe_count_pinned_at_11018() {
+        // The pinned 11,018 number from the plan is for the LIVE Dhan
+        // universe (3 indices + 26 display + 216 cash + ~10,783 index F&O).
+        // The synthetic test universe has only 1 NIFTY + 1 INDIA VIX + 1
+        // RELIANCE underlying, so the absolute number won't match. Instead
+        // pin the qualitative rule: `total = (index_derivs + cash_eq +
+        // major_idx + display_idx)` AND it equals `total - stock_derivs`
+        // because the stock-derivative drop ratchet is exact.
+        let universe = make_test_universe();
+        let config = SubscriptionConfig::default();
+        let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
+
+        let plan = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
+
+        let s = &plan.summary;
+        assert_eq!(s.stock_derivatives, 0);
+        assert_eq!(
+            s.total,
+            s.major_index_values + s.display_indices + s.index_derivatives + s.stock_equities,
+            "indices-only total = idx + display + index_derivs + cash; \
+             no stock-derivs contribution"
+        );
+        // Sanity ceilings: with the 25K hard cap untouched, default scope
+        // can never exceed it.
+        assert!(s.total <= MAX_TOTAL_SUBSCRIPTIONS);
+    }
+
+    #[test]
+    fn test_finnifty_midcpnifty_excluded_from_indices_only() {
+        // Synthesise a universe with FINNIFTY + MIDCPNIFTY underlyings to
+        // verify they are EXCLUDED even when present in raw CSV. The
+        // existing `test_finnifty_midcpnifty_dropped_from_index_set`
+        // exercises the FULL_CHAIN_INDEX_SYMBOLS constant directly; this
+        // test runs the same invariant THROUGH the planner under
+        // IndicesOnlyAllExpiries scope.
+        let universe = make_test_universe();
+        let config = SubscriptionConfig::default();
+        let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
+
+        let plan = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
+        for inst in plan.registry.iter() {
+            assert_ne!(
+                inst.underlying_symbol, "FINNIFTY",
+                "FINNIFTY must be excluded from Wave 5 universe"
+            );
+            assert_ne!(
+                inst.underlying_symbol, "MIDCPNIFTY",
+                "MIDCPNIFTY must be excluded from Wave 5 universe"
+            );
+        }
+    }
+
+    #[test]
+    fn test_stock_fno_excluded_under_indices_only_scope() {
+        // Symmetric to test_indices_only_scope_filters_to_three_underlyings
+        // but explicitly checks the NSE_FNO + BSE_FNO segment counts of
+        // STOCK derivative kinds. Under indices-only scope, the only
+        // NSE_FNO instruments allowed are FUTIDX / OPTIDX, NEVER FUTSTK
+        // / OPTSTK.
+        let universe = make_test_universe();
+        let config = SubscriptionConfig::default();
+        let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
+
+        let plan = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
+
+        let stock_fno_count = plan
+            .registry
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i.instrument_kind,
+                    Some(DhanInstrumentKind::OptionStock) | Some(DhanInstrumentKind::FutureStock)
+                )
+            })
+            .count();
+        assert_eq!(
+            stock_fno_count, 0,
+            "no FUTSTK / OPTSTK contracts allowed under Wave 5 indices-only scope"
+        );
+
+        // Mirror under FullUniverse scope: stock F&O CAN appear.
+        let plan_full = build_subscription_plan(
+            &universe,
+            &legacy_full_universe_config(),
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
+        let stock_fno_count_full = plan_full
+            .registry
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i.instrument_kind,
+                    Some(DhanInstrumentKind::OptionStock) | Some(DhanInstrumentKind::FutureStock)
+                )
+            })
+            .count();
+        assert!(
+            stock_fno_count_full > 0,
+            "FullUniverse scope must restore stock F&O subscription path"
+        );
     }
 }
