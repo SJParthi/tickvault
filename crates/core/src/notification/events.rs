@@ -310,6 +310,40 @@ pub enum NotificationEvent {
     /// restart). Low-noise — informational only.
     Phase2Skipped { reason: String },
 
+    /// Wave 5 Item 26 L2 — NSE bhavcopy daily volume cross-check completed.
+    /// Fires once at 16:30 IST after the post-market scheduler drains the
+    /// bhavcopy diff into `volume_nse_audit`. Counts MUST sum to total
+    /// rows compared. Severity::Info on green run; Severity::High when
+    /// `mismatched > 0` (typed via the dispatcher per audit-findings
+    /// Rule 11 — false-OK class bugs).
+    NseBhavcopyCheckComplete {
+        /// Rows where dhan_eod_volume matched NSE within tolerance.
+        matched: usize,
+        /// Rows where the diff exceeded tolerance.
+        mismatched: usize,
+        /// Rows where NSE listed the contract but our `ticks` table didn't.
+        missing_our: usize,
+        /// Rows where our `ticks` table had data but NSE didn't list it.
+        missing_nse: usize,
+        /// ISO trading date covered by the bhavcopy.
+        trading_date_ist: String,
+        /// Tolerance (% of NSE volume) used for the comparison.
+        tolerance_pct: f64,
+    },
+
+    /// Wave 5 Item 26 L2 — NSE bhavcopy fetch / parse / cross-check
+    /// failed terminally (HTTP 4xx after retries, ZIP corruption, header
+    /// schema mismatch, or QuestDB SELECT failure). The 16:30 IST run
+    /// produced zero audit rows; operator must investigate before next
+    /// trading day. Severity::High.
+    NseBhavcopyCheckFailed {
+        /// Short typed reason: `"http_403"` / `"http_404"` / `"zip_corrupt"`
+        /// / `"header_mismatch"` / `"questdb_query_failed"` / etc.
+        reason: String,
+        /// ISO trading date the run was attempting.
+        trading_date_ist: String,
+    },
+
     /// 2026-04-25: Mid-market cold start completed. Fires once when the app
     /// boots between 09:13 and 15:30 IST and the live-tick ATM resolver +
     /// REST fallback + QuestDB-prev-close chain has resolved (or skipped)
@@ -1309,6 +1343,32 @@ impl NotificationEvent {
             Self::Phase2Skipped { reason } => {
                 format!("<b>Phase 2 skipped</b>\n{reason}")
             }
+            Self::NseBhavcopyCheckComplete {
+                matched,
+                mismatched,
+                missing_our,
+                missing_nse,
+                trading_date_ist,
+                tolerance_pct,
+            } => {
+                format!(
+                    "<b>NSE bhavcopy cross-check</b>\n\
+                     {trading_date_ist} (tolerance: {tolerance_pct:.2}%)\n\
+                     PASS: {matched} | FAIL: {mismatched}\n\
+                     MISSING_OUR: {missing_our} | MISSING_NSE: {missing_nse}"
+                )
+            }
+            Self::NseBhavcopyCheckFailed {
+                reason,
+                trading_date_ist,
+            } => {
+                format!(
+                    "<b>NSE bhavcopy cross-check FAILED</b>\n\
+                     {trading_date_ist}\n\
+                     Reason: {reason}\n\
+                     No audit rows produced — investigate before next trading day."
+                )
+            }
             Self::MidMarketBootComplete {
                 stocks_live_tick,
                 stocks_rest,
@@ -2021,6 +2081,8 @@ impl NotificationEvent {
             Self::Phase2Complete { .. } => "Phase2Complete",
             Self::Phase2Failed { .. } => "Phase2Failed",
             Self::Phase2Skipped { .. } => "Phase2Skipped",
+            Self::NseBhavcopyCheckComplete { .. } => "NseBhavcopyCheckComplete",
+            Self::NseBhavcopyCheckFailed { .. } => "NseBhavcopyCheckFailed",
             Self::MidMarketBootComplete { .. } => "MidMarketBootComplete",
             Self::WebSocketDisconnected { .. } => "WebSocketDisconnected",
             Self::WebSocketDisconnectedOffHours { .. } => "WebSocketDisconnectedOffHours",
@@ -2173,6 +2235,12 @@ impl NotificationEvent {
             Self::Phase2Complete { .. } => Severity::Medium,
             Self::Phase2Failed { .. } => Severity::High,
             Self::Phase2Skipped { .. } => Severity::Low,
+            // Wave 5 Item 26 L2 — operator triages FAIL/MISSING_OUR rows
+            // via the audit table; the summary itself is Info on the
+            // happy path. The dedicated `NseBhavcopyCheckFailed` variant
+            // is High (per audit-findings Rule 11 — no false-OK class).
+            Self::NseBhavcopyCheckComplete { .. } => Severity::Info,
+            Self::NseBhavcopyCheckFailed { .. } => Severity::High,
             Self::MidMarketBootComplete { .. } => Severity::Info,
             Self::DepthTwentyConnected { .. } => Severity::Low,
             Self::DepthTwoHundredConnected { .. } => Severity::Low,
@@ -3893,6 +3961,60 @@ mod tests {
             deadline_hour_ist: 10,
         };
         assert_eq!(event.severity(), Severity::Critical);
+    }
+
+    /// Wave 5 Item 26 L2 — happy-path summary fires Severity::Info
+    /// (operator triages the audit table; the summary itself is not a
+    /// pager event).
+    #[test]
+    fn test_nse_bhavcopy_check_complete_is_info_severity() {
+        let event = NotificationEvent::NseBhavcopyCheckComplete {
+            matched: 200_000,
+            mismatched: 0,
+            missing_our: 0,
+            missing_nse: 0,
+            trading_date_ist: "2026-05-04".to_string(),
+            tolerance_pct: 0.1,
+        };
+        assert_eq!(event.severity(), Severity::Info);
+        assert_eq!(event.topic(), "NseBhavcopyCheckComplete");
+    }
+
+    /// Wave 5 Item 26 L2 — terminal failure (HTTP 4xx after retries,
+    /// ZIP corruption, header schema drift) is High so the operator
+    /// pages immediately. NOT Critical — the dashboard + Prom alerts
+    /// already cover the no-row case; we don't escalate twice.
+    #[test]
+    fn test_nse_bhavcopy_check_failed_is_high_severity() {
+        let event = NotificationEvent::NseBhavcopyCheckFailed {
+            reason: "header_mismatch".to_string(),
+            trading_date_ist: "2026-05-04".to_string(),
+        };
+        assert_eq!(event.severity(), Severity::High);
+        assert_eq!(event.topic(), "NseBhavcopyCheckFailed");
+    }
+
+    /// Wave 5 Item 26 L2 — message body for the operator. Pin the
+    /// trading-date + tolerance + 4 verdict counts so a future format
+    /// drift breaks loud rather than silent.
+    #[test]
+    fn test_nse_bhavcopy_check_complete_message_format() {
+        let event = NotificationEvent::NseBhavcopyCheckComplete {
+            matched: 199_500,
+            mismatched: 42,
+            missing_our: 15,
+            missing_nse: 7,
+            trading_date_ist: "2026-05-04".to_string(),
+            tolerance_pct: 0.1,
+        };
+        let msg = event.to_message();
+        assert!(msg.contains("NSE bhavcopy cross-check"));
+        assert!(msg.contains("2026-05-04"));
+        assert!(msg.contains("0.10%"));
+        assert!(msg.contains("PASS: 199500"));
+        assert!(msg.contains("FAIL: 42"));
+        assert!(msg.contains("MISSING_OUR: 15"));
+        assert!(msg.contains("MISSING_NSE: 7"));
     }
 
     #[test]

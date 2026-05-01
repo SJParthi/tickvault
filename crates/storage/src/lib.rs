@@ -94,6 +94,7 @@ pub mod selftest_audit_persistence;
 pub mod tick_persistence;
 pub mod tick_spill_drain;
 pub mod valkey_cache;
+pub mod volume_nse_audit_persistence;
 pub mod ws_frame_spill;
 pub mod ws_reconnect_audit_persistence;
 
