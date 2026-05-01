@@ -183,14 +183,22 @@ pub fn pin_current_thread_for(role: WorkerRole) -> Result<()> {
 /// Best-effort one-shot pin of the calling (main) thread to
 /// `WorkerRole::Other`. Used at boot so the main thread doesn't share
 /// Core 0 with the WS read loop.
+///
+/// On failure, `pin_current_thread_for` ALREADY emits `error!` with
+/// `code = ErrorCode::CorePin01PinningFailedAtBoot.code_str()` AND
+/// increments `tv_core_pinning_workers_pinned_total{outcome="failed"|"host_too_small"|"core_ids_unavailable"}`.
+/// We deliberately do NOT re-log here — duplicating the message at WARN
+/// level would (a) lack the `code` field (so the tag-guard cannot trace
+/// it) and (b) confuse operators reading `errors.jsonl` who would see
+/// the same incident twice. Loki routes the inner ERROR to Telegram via
+/// the standard severity pipeline; the outer wrapper just consumes the
+/// `Result` without obscuring it.
 // TEST-EXEMPT: thin wrapper around pin_current_thread_for; same rationale.
 pub fn pin_main_thread() {
-    if let Err(err) = pin_current_thread_for(WorkerRole::Other) {
-        warn!(
-            ?err,
-            "main thread pinning failed — operator should investigate \
-             tv_core_pinning_workers_pinned_total"
-        );
+    match pin_current_thread_for(WorkerRole::Other) {
+        Ok(()) => {}
+        // Inner emission is the authoritative diagnostic — see docstring.
+        Err(_) => {}
     }
 }
 
