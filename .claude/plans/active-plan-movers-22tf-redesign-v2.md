@@ -209,3 +209,10 @@ Parthiban — please review the 4 files (each <300 lines) and answer the 7 open 
 Plus: ship Phase 5 (rollover) as separate PR first, or bundle with movers?
 
 **No production code will be written until that explicit GO.**
+
+## Per-Wave Guarantee Matrix (cross-reference)
+
+See `.claude/rules/project/per-wave-guarantee-matrix.md` — all 15 rows of the
+100% Guarantee Matrix and all 7 rows of the Resilience Demand Matrix apply to
+every item in this plan. Mechanical enforcement via
+`.claude/hooks/per-item-guarantee-check.sh` (CI gate).

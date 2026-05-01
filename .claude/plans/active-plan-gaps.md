@@ -55,3 +55,10 @@
 | `crates/core/src/pipeline/tick_gap_detector.rs` (NEW) | G19 |
 | `scripts/100pct-audit.sh` (NEW) | G20 |
 | `active-plan.md` Verification Gates | G21 |
+
+## Per-Wave Guarantee Matrix (cross-reference)
+
+See `.claude/rules/project/per-wave-guarantee-matrix.md` — all 15 rows of the
+100% Guarantee Matrix and all 7 rows of the Resilience Demand Matrix apply to
+every item in this plan. Mechanical enforcement via
+`.claude/hooks/per-item-guarantee-check.sh` (CI gate).

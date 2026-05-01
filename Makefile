@@ -489,3 +489,7 @@ dispatch-check: ## Common preset — ask Claude to run the full health check
 
 dispatch-audit: ## Common preset — ask Claude to run the 100% audit
 	@$(MAKE) dispatch MSG="run scripts/100pct-audit.sh and post PASS/GAP counts + any GAPs as the step summary"
+
+.PHONY: wave-guarantee-check
+wave-guarantee-check: ## Verify every active plan carries the per-wave guarantee matrix
+	@bash .claude/hooks/per-item-guarantee-check.sh

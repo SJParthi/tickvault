@@ -71,3 +71,10 @@ Each flag has a paired test in `crates/app/tests/feature_flag_rollback_guard.rs`
 - **Mandatory:** C1, C3, C5, C7, C8, C9 (build fails without)
 - **Important:** C2, C4, C6, C10, C11, C13 (one of these missing degrades operator experience)
 - **Process:** C12 (3-PR split — reviewer can complete each in one sitting)
+
+## Per-Wave Guarantee Matrix (cross-reference)
+
+See `.claude/rules/project/per-wave-guarantee-matrix.md` — all 15 rows of the
+100% Guarantee Matrix and all 7 rows of the Resilience Demand Matrix apply to
+every item in this plan. Mechanical enforcement via
+`.claude/hooks/per-item-guarantee-check.sh` (CI gate).
