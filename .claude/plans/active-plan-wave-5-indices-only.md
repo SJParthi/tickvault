@@ -1,5 +1,52 @@
 # Implementation Plan: Wave 5 — Indices-Only Subscription + Depth Redesign + Resilience Hardening
 
+---
+
+## 🚀 QUICK START FOR NEW CLAUDE CODE SESSIONS — read this first
+
+**Prompt to copy-paste into a new session:**
+
+```
+Implement Wave 5 plan.
+```
+
+That's it. SessionStart hooks will auto-load CLAUDE.md, this plan, and the per-wave guarantee matrix. Pick up where the last session left off.
+
+**Already shipped on main (do NOT redo):**
+
+| PR | Item | What |
+|---|---|---|
+| #411 | 1-25 plan + matrix infra | Wave 5 plan, per-wave guarantee matrix rule, session-context-brief hook |
+| #412 | Items 26+27+28 docs | Volume guarantee + mat view fixes + candles bug design |
+| #413 | Item 29 | Cowork verification findings + Mon May 4 runbook |
+| #414 | Item 26 L3 | Dhan support ticket draft (operator must email) |
+| #415 | **Item 28 CODE** | candles cascade volume bug fix (per-security cumulative tracker) |
+| #416 | docs | tick Item 28 [x] in plan |
+
+**Recommended next item to implement:** Item 1 (subscription.scope config gate) — smallest, unblocks rest.
+
+**Independent / parallelizable items (pick any):** 1, 6, 7, 8, 9, 11, 26 L1, 26 L2.
+
+**GATED on Mon May 4 09:45 IST Track 2 verdict:** Item 27 (mat view DDL). Do NOT ship until 5-series monotonicity SELECT confirms cumulative semantic.
+
+**Operator pre-conditions before Mon May 4:**
+
+1. Refresh DEPTH200 SELF token in SSM per `.claude/rules/project/depth-200-auth-error-codes.md` (today's app boot failed `DEPTH200-AUTH-01`, token expired ~40h ago)
+2. Send Item 26 L3 Dhan ticket via Gmail using GitHub link to `docs/dhan-support/2026-05-01-volume-semantic-clarification.md`
+
+**Implementation rules (mandatory, all in repo):**
+
+- Branch naming: `claude/wave-5-item-<N>-<slug>` off main
+- ONE item per PR (commit lint requires conventional scope `[a-z0-9_/-]+`)
+- 9-box checklist per item: typed event + ErrorCode + tracing+code + Prom counter + Grafana panel + alert rule + call site + triage rule + ratchet test
+- Per-wave guarantee matrix mandatory — see `.claude/rules/project/per-wave-guarantee-matrix.md`
+- Tick `[x]` in this plan when item ships (small followup PR — see #416 for template)
+- Honest charter: "100% inside the tested envelope, with ratcheted regression coverage" — no claims beyond
+
+**Reference template for sub-PRs:** PR #415 (Item 28 implementation) — branch + commit + test + PR body pattern.
+
+---
+
 **Status:** APPROVED
 **Date:** 2026-05-01
 **Approved by:** Parthiban (operator) — verbatim "yes approved" 2026-05-01 + "whichever is recommended add everything" 2026-05-01 (defaults locked).
