@@ -83,6 +83,7 @@ pub mod materialized_views;
 pub mod movers_22tf_persistence;
 pub mod movers_22tf_writer;
 pub mod movers_persistence;
+pub mod movers_unified_persistence;
 pub mod obi_persistence;
 pub mod order_audit_persistence;
 pub mod partition_manager;
