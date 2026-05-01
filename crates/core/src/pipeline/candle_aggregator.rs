@@ -171,8 +171,20 @@ pub struct CompletedCandle {
 ///
 /// Maintains a HashMap of `(security_id, exchange_segment_code)` → `LiveCandle`.
 /// When a tick arrives for a new second, the previous candle is completed and emitted.
+///
+/// # I-P1-11 segment-aware key invariant
+///
+/// The map key is the COMPOSITE `(u32 security_id, u8 exchange_segment_code)`,
+/// NOT `security_id` alone. Dhan's instrument master can reuse the same numeric
+/// `security_id` across different `ExchangeSegment` values (e.g. FINNIFTY's
+/// IDX_I index value `27` and an NSE_EQ instrument with id `27` both existed
+/// live on 2026-04-17). A `HashMap<u32, _>` would silently merge OHLCV across
+/// the two segments, polluting candles. The composite key prevents this.
+/// Ratchets: `test_candle_aggregator_keyed_on_security_id_and_segment`,
+/// `test_two_instruments_same_id_different_segment_do_not_merge_ohlcv`.
 pub struct CandleAggregator {
     /// Active candles keyed by `(security_id, segment_code)`.
+    /// I-P1-11: composite key — DO NOT regress to `HashMap<u32, _>`.
     candles: HashMap<(u32, u8), LiveCandle>,
     /// Buffer for completed candles (drained by caller after sweep).
     completed: Vec<CompletedCandle>,
@@ -1146,5 +1158,67 @@ mod tests {
         assert_eq!(copied.high, candle.high);
         assert_eq!(copied.low, candle.low);
         assert_eq!(copied.close, candle.close);
+    }
+
+    // ------------------------------------------------------------------
+    // Wave 5 Item 7 — I-P1-11 segment-aware key ratchet tests.
+    // ------------------------------------------------------------------
+
+    /// Pins the composite key shape `(security_id, segment_code)`. Failing this
+    /// test means someone regressed the aggregator to `HashMap<u32, _>`, which
+    /// would silently merge OHLCV across segments per the I-P1-11 collision
+    /// (Dhan reuses security_id 27 for FINNIFTY IDX_I + NSE_EQ id 27).
+    #[test]
+    fn test_candle_aggregator_keyed_on_security_id_and_segment() {
+        let mut agg = CandleAggregator::new();
+        // Same security_id (27), different segments (IDX_I=0, NSE_EQ=1).
+        agg.update(&make_tick(27, 0, 25_650.0, 1000, 0)); // IDX_I — index value
+        agg.update(&make_tick(27, 1, 1_234.5, 1000, 100)); // NSE_EQ — equity
+        // If the key were just `u32`, the second tick would overwrite the first
+        // and active_count would be 1. The composite key keeps both alive.
+        assert_eq!(
+            agg.active_count(),
+            2,
+            "composite key (security_id, segment_code) MUST keep colliding ids separated"
+        );
+        // Each segment's candle is reachable on its own composite key.
+        assert!(agg.candles.contains_key(&(27, 0)));
+        assert!(agg.candles.contains_key(&(27, 1)));
+    }
+
+    /// I-P1-11 OHLCV non-merge guarantee. Two ticks with the same security_id
+    /// in the same second-bucket but on different segments must NOT update each
+    /// other's open/high/low/close. The IDX_I index value at 25,650 must not
+    /// pollute the NSE_EQ candle at 1,234.5 and vice versa.
+    #[test]
+    fn test_two_instruments_same_id_different_segment_do_not_merge_ohlcv() {
+        let mut agg = CandleAggregator::new();
+        // IDX_I tick path: open at 25,650, high to 25,700, low to 25,600.
+        agg.update(&make_tick(27, 0, 25_650.0, 1000, 0));
+        agg.update(&make_tick(27, 0, 25_700.0, 1000, 0)); // index OI is 0
+        agg.update(&make_tick(27, 0, 25_600.0, 1000, 0));
+        // NSE_EQ tick path: open at 1,234.5, distinct OHLCV.
+        agg.update(&make_tick(27, 1, 1_234.5, 1000, 100));
+        agg.update(&make_tick(27, 1, 1_240.0, 1000, 200));
+        agg.update(&make_tick(27, 1, 1_230.0, 1000, 300));
+
+        let idx = agg.candles.get(&(27, 0)).expect("IDX_I candle must exist");
+        let eq = agg.candles.get(&(27, 1)).expect("NSE_EQ candle must exist");
+
+        // IDX_I OHLCV stays in 25,000s — NEVER pulled toward equity range.
+        assert_eq!(idx.open, 25_650.0);
+        assert_eq!(idx.high, 25_700.0);
+        assert_eq!(idx.low, 25_600.0);
+        assert_eq!(idx.close, 25_600.0);
+
+        // NSE_EQ OHLCV stays in 1,200s — NEVER pulled toward index range.
+        assert_eq!(eq.open, 1_234.5);
+        assert_eq!(eq.high, 1_240.0);
+        assert_eq!(eq.low, 1_230.0);
+        assert_eq!(eq.close, 1_230.0);
+
+        // Volume tracking is also segment-isolated.
+        assert_eq!(idx.volume, 0, "IDX_I volume isolated from NSE_EQ");
+        assert_eq!(eq.volume, 300, "NSE_EQ volume isolated from IDX_I");
     }
 }
