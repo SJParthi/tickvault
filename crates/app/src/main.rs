@@ -4052,13 +4052,15 @@ async fn main() -> Result<()> {
 
                     let (cmd_tx, cmd_rx) =
                         tokio::sync::mpsc::channel::<tickvault_core::websocket::DepthCommand>(4);
-                    {
-                        let senders = std::sync::Arc::clone(&depth_cmd_senders);
-                        let key_for_register = key.clone();
-                        tokio::spawn(async move {
-                            senders.lock().await.insert(key_for_register, cmd_tx);
-                        });
-                    }
+                    // Wave 5 commit 6 (C1 fix from hostile-agent review):
+                    // register the cmd_tx SYNCHRONOUSLY (not via detached
+                    // tokio::spawn) so the 09:13 anchor dispatcher at
+                    // line ~5874 cannot race with the registration. The
+                    // legacy detached-spawn pattern at lines 3636/3903 is
+                    // gated off when single-side layout is ON, so those
+                    // race windows don't apply to Wave 5 boots. Capacity
+                    // is 4 single-side keys × 1 await = ~microseconds.
+                    depth_cmd_senders.lock().await.insert(key.clone(), cmd_tx);
 
                     info!(
                         underlying = %row.underlying,
@@ -5972,6 +5974,18 @@ async fn main() -> Result<()> {
                         }
 
                         // 200-level: only NIFTY + BANKNIFTY (Dhan 5-conn cap).
+                        // Wave 5 commit 6: when single-side layout is ON,
+                        // depth-200 is top-volume-driven (NOT ATM-following) —
+                        // the dynamic orchestrator at `main.rs:2722` owns the
+                        // 5 depth-200 slot senders. The 09:13 anchor would
+                        // hit `senders.get(&"NIFTY-CE")` which IS registered
+                        // (depth-20 single-side conn) and accidentally route
+                        // an InitialSubscribe200 to a depth-20 channel.
+                        // Skip the entire 200-level block under the flag so
+                        // the dynamic orchestrator handles it instead.
+                        if anchor_single_side_enabled {
+                            continue;
+                        }
                         if sel.underlying_symbol != "NIFTY" && sel.underlying_symbol != "BANKNIFTY"
                         {
                             continue;

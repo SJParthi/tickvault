@@ -437,7 +437,11 @@ pub fn spawn_depth_200_minimal_conn(inputs: Depth200MinimalConnInputs) {
                             message_sequence,
                         )
                     {
-                        tracing::warn!(
+                        // Audit-findings Rule 5: persist failures use error!
+                        // (not warn!) so Loki routes to Telegram. Hostile-agent
+                        // bug-hunt review caught this asymmetry vs depth-20
+                        // helper at line 195.
+                        error!(
                             ?err,
                             label = %label_for_recv,
                             "failed to persist 200-level depth (minimal conn)"
