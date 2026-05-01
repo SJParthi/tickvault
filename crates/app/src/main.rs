@@ -2722,14 +2722,36 @@ async fn main() -> Result<()> {
         if config.features.depth_dynamic_top_volume {
             tracing::info!(
                 "Wave 5 Items 4+5: depth_dynamic_top_volume feature ON — \
-                 spawning orchestrator. Receiver-side conn-pool refactor \
-                 must land for the dynamic conns to actually subscribe."
+                 spawning orchestrator + receiver-side dynamic depth-20 conn 5"
             );
             let depth_dyn_shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
 
-            // Depth-20 conn 5 dynamic top-50 task.
-            let (d20_conn5_cmd_tx, _d20_conn5_cmd_rx) =
+            // Depth-20 conn 5 dynamic top-50: orchestrator (Sender) +
+            // receiver-side WS connection (Receiver). Wave 5 commit 2.
+            //
+            // The orchestrator owns the Sender side and emits Swap20 /
+            // InitialSubscribe20 every 60s based on `option_movers`
+            // top-50 by `change_pct DESC`, SENSEX excluded. The receiver
+            // side here spawns a real depth-20 WS connection in DEFERRED
+            // mode (empty initial instruments) — the orchestrator's first
+            // cycle InitialSubscribe20 populates the SID list.
+            let (d20_conn5_cmd_tx, d20_conn5_cmd_rx) =
                 tokio::sync::mpsc::channel::<tickvault_core::websocket::DepthCommand>(4);
+
+            tickvault_app::depth_20_conn_spawner::spawn_depth_20_minimal_conn(
+                tickvault_app::depth_20_conn_spawner::Depth20MinimalConnInputs {
+                    token_handle: token_handle.clone(),
+                    ws_client_id: ws_client_id.clone(),
+                    label: "DYN-TOP50".to_string(),
+                    instruments: Vec::new(), // DEFERRED — orchestrator sends InitialSubscribe20
+                    cmd_rx: d20_conn5_cmd_rx,
+                    questdb_config: config.questdb.clone(),
+                    notifier: notifier.clone(),
+                    health_status: health_status.clone(),
+                    ws_frame_spill: ws_frame_spill.clone(),
+                },
+            );
+
             let _d20_dyn_handle =
                 tickvault_app::depth_dynamic_pipeline::spawn_depth_20_dynamic_conn5_task(
                     config.questdb.clone(),
@@ -2738,7 +2760,9 @@ async fn main() -> Result<()> {
                 );
 
             // Depth-200 dynamic pool (5 slots). One channel per slot.
-            // The conn-pool refactor will own each slot's receiver.
+            // Receiver-side wiring lands in Wave 5 commit 3 — until then
+            // the rx is dropped and orchestrator Swap200 calls fail with
+            // DEPTH-DYN-02 (visible via `tv_ws_pool_respawn_total`).
             let mut d200_cmd_senders = std::collections::HashMap::new();
             for slot in 0..5_usize {
                 let (tx, _rx) =
