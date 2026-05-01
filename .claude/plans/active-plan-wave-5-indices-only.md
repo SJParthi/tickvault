@@ -2274,7 +2274,7 @@ ORDER BY tick_count DESC LIMIT 3;
 
 ### Plan integration
 
-- [ ] **Item 29. Cowork verification findings fold-in + Item 26 L2 implementation recipe**
+- [x] **Item 29. Cowork verification findings fold-in + Item 26 L2 implementation recipe**
 - Status: documentation only (no code). Updates Item 26 with verified NSE bhavcopy specifics; bumps Item 28 priority.
 - Files: this plan file (current additions); `docs/operator/track-2-monotonicity-select.md` (new, runbook for Mon May 4)
 - Tests: N/A (process item)
