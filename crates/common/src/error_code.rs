@@ -325,23 +325,6 @@ pub enum ErrorCode {
     Depth20Dyn02SwapChannelBroken,
 
     // -----------------------------------------------------------------------
-    // Movers 22-TF (Phase 11 of v3 plan, 2026-04-28 — see
-    // `.claude/plans/v2-architecture.md` Section A)
-    // -----------------------------------------------------------------------
-    /// `Movers22TfWriter` ILP append/flush failed for one timeframe.
-    /// The rescue ring buffers the row; next snapshot retries.
-    /// Severity::Medium.
-    Movers22Tf01WriterIlpFailed,
-    /// One of the 22 snapshot scheduler tasks panicked. Pool supervisor
-    /// respawns within 5s; meanwhile the affected timeframe is missing
-    /// snapshots. Severity::High.
-    Movers22Tf02SchedulerPanic,
-    /// `tv_movers_universe_size` drifted outside the expected band
-    /// (24,324 ± 5% during market hours). Indicates universe build
-    /// failure or unexpected instrument loss. Severity::Medium.
-    Movers22Tf03UniverseDrift,
-
-    // -----------------------------------------------------------------------
     // Wave 5 — core_affinity pinning + dynamic top-gainer selectors
     // (`.claude/plans/active-plan-wave-5-indices-only.md` Items 4/5/6/9)
     // -----------------------------------------------------------------------
@@ -510,10 +493,6 @@ impl ErrorCode {
             // Depth-20 dynamic top-150 selector (Phase 7, 2026-04-28)
             Self::Depth20Dyn01TopSetEmpty => "DEPTH-DYN-01",
             Self::Depth20Dyn02SwapChannelBroken => "DEPTH-DYN-02",
-            // Movers 22-TF (Phase 11, 2026-04-28)
-            Self::Movers22Tf01WriterIlpFailed => "MOVERS-22TF-01",
-            Self::Movers22Tf02SchedulerPanic => "MOVERS-22TF-02",
-            Self::Movers22Tf03UniverseDrift => "MOVERS-22TF-03",
             // Wave 5 — core_affinity + dynamic top-gainer selectors
             Self::CorePin01PinningFailedAtBoot => "CORE-PIN-01",
             Self::CorePin02WorkerDrifted => "CORE-PIN-02",
@@ -570,7 +549,6 @@ impl ErrorCode {
             | Self::Phase202EmitGuardDropped
             | Self::Boot01QuestDbSlow
             | Self::Depth20Dyn01TopSetEmpty
-            | Self::Movers22Tf02SchedulerPanic
             | Self::CorePin01PinningFailedAtBoot
             | Self::Depth20Dyn03TopGainersEmpty
             | Self::Depth200Dyn01TopGainersEmpty
@@ -620,8 +598,6 @@ impl ErrorCode {
             | Self::StorageGap03AuditWriteFailed
             | Self::StorageGap04S3ArchiveFailed
             | Self::Telegram01Dropped
-            | Self::Movers22Tf01WriterIlpFailed
-            | Self::Movers22Tf03UniverseDrift
             | Self::CorePin02WorkerDrifted => Severity::Medium,
             // Low: scheduler / field coverage / trading-day / Dhan other
             Self::InstrumentP1DailyScheduler
@@ -739,9 +715,6 @@ impl ErrorCode {
             Self::Depth20Dyn01TopSetEmpty | Self::Depth20Dyn02SwapChannelBroken => {
                 ".claude/rules/project/wave-4-error-codes.md"
             }
-            Self::Movers22Tf01WriterIlpFailed
-            | Self::Movers22Tf02SchedulerPanic
-            | Self::Movers22Tf03UniverseDrift => ".claude/rules/project/movers-22tf-error-codes.md",
             Self::CorePin01PinningFailedAtBoot
             | Self::CorePin02WorkerDrifted
             | Self::Depth20Dyn03TopGainersEmpty
@@ -859,9 +832,6 @@ impl ErrorCode {
             Self::Depth200Auth03SsmUnreachable,
             Self::Depth20Dyn01TopSetEmpty,
             Self::Depth20Dyn02SwapChannelBroken,
-            Self::Movers22Tf01WriterIlpFailed,
-            Self::Movers22Tf02SchedulerPanic,
-            Self::Movers22Tf03UniverseDrift,
             Self::CorePin01PinningFailedAtBoot,
             Self::CorePin02WorkerDrifted,
             Self::Depth20Dyn03TopGainersEmpty,
@@ -1046,7 +1016,9 @@ mod tests {
         // PREVCLOSE-03 (boot-time prev-close routing assertion).
         // 2026-05-01 (Wave 5 Item 26 L1): bumped 97 -> 98 for
         // VOLUME-MONO-01 (cumulative-monotonicity breach).
-        assert_eq!(ErrorCode::all().len(), 98);
+        // 2026-05-01 (movers cleanup): bumped 98 -> 95 — removed
+        // MOVERS-22TF-01/02/03 along with the dead 22-tf pipeline.
+        assert_eq!(ErrorCode::all().len(), 95);
     }
 
     #[test]
@@ -1080,8 +1052,6 @@ mod tests {
                 || s.starts_with("DEPTH200-AUTH-")
                 // Phase 7 (2026-04-28): depth-20 dynamic top-150 selector
                 || s.starts_with("DEPTH-DYN-")
-                // Phase 11 (2026-04-28): movers 22-tf
-                || s.starts_with("MOVERS-22TF-")
                 // Wave 5 (2026-05-01): core_affinity pinning + new dynamic
                 // depth selectors. Note CORE-PIN- and DEPTH-20-DYN- /
                 // DEPTH-200-DYN- are distinct from the earlier DEPTH-DYN-

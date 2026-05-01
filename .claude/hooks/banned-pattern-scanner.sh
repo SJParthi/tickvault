@@ -498,13 +498,13 @@ scan_movers_paths 'HashMap<u32,' \
   "$STAGED_FILES"
 
 # ─────────────────────────────────────────────
-# CATEGORY 9: MOVERS DDL REGISTRATION (Phase 13 of v3 plan)
+# CATEGORY 9: MOVERS DDL REGISTRATION
 # ─────────────────────────────────────────────
 #
 # Every `CREATE TABLE IF NOT EXISTS movers_` literal in a Rust source file
-# MUST be emitted by the canonical `movers_22tf_create_ddl(timeframe)`
-# helper, which iterates `MOVERS_TIMEFRAMES`. Hand-rolled DDL strings for
-# orphan movers tables (e.g. `movers_42m`) skip the partition manager
+# MUST be emitted by the canonical helper in `movers_unified_persistence.rs`
+# (the `movers_1s` base table + 24 materialized views). Hand-rolled DDL
+# for orphan movers tables (e.g. `movers_42m`) skips the partition manager
 # registration + S3 lifecycle config, so the partition rotation never
 # happens and EBS fills silently.
 scan_movers_orphan_ddl() {
@@ -517,9 +517,12 @@ scan_movers_orphan_ddl() {
   while IFS= read -r file; do
     [ -z "$file" ] && continue
     [ ! -f "$file" ] && continue
-    # Skip the canonical helper itself + tests
+    # Skip the canonical helper itself + tests. Use exact-path matches so
+    # only the two known canonical storage modules are exempted (a rogue
+    # `crates/api/src/movers_persistence.rs` would NOT bypass the check).
     case "$file" in
-      */movers_22tf_persistence.rs) continue ;;
+      crates/storage/src/movers_unified_persistence.rs) continue ;;
+      crates/storage/src/movers_persistence.rs) continue ;;
       */tests/*) continue ;;
     esac
     # Find any literal CREATE TABLE IF NOT EXISTS movers_ outside the helper
@@ -531,41 +534,10 @@ scan_movers_orphan_ddl() {
 
   if [ -n "$orphans" ]; then
     VIOLATIONS=$((VIOLATIONS + 1))
-    REPORT="${REPORT}\n  [BANNED] Cat 9 (Phase 13): Orphan movers DDL outside movers_22tf_persistence.rs — use the canonical helper iterating MOVERS_TIMEFRAMES, or add // APPROVED: comment.\n${orphans}"
+    REPORT="${REPORT}\n  [BANNED] Cat 9: Orphan movers DDL outside movers_unified_persistence.rs (or movers_persistence.rs for legacy stock/option/top tables) — use the canonical helper or add // APPROVED: comment.\n${orphans}"
   fi
 }
 scan_movers_orphan_ddl "$STAGED_FILES"
-
-# ─────────────────────────────────────────────
-# CATEGORY 10: MOVERS WRITER PANIC (Phase 13 of v3 plan)
-# ─────────────────────────────────────────────
-#
-# Banned: `.unwrap()` / `.expect(` inside the movers persistence + scheduler
-# modules. The 22 writers + scheduler tasks run on the snapshot path —
-# panics there cascade into pool-supervisor respawns and operator-visible
-# Telegram noise. Use `?` with proper error returns or the `// O(1) EXEMPT:`
-# escape hatch for genuinely infallible call sites.
-scan_movers_persist_paths() {
-  local pattern="$1"
-  local description="$2"
-  local files="$3"
-  local persist_files
-
-  persist_files=$(echo "$files" | grep -E \
-    '^(crates/storage/src/movers_22tf_persistence\.rs|crates/core/src/pipeline/movers_22tf_(scheduler|supervisor|writer_state)\.rs)$' \
-    || true)
-  if [ -z "$persist_files" ]; then
-    return
-  fi
-  scan_prod_code "$pattern" "$description" "$persist_files"
-}
-
-scan_movers_persist_paths '\.unwrap()' \
-  'Cat 10 (Phase 13): .unwrap() in movers persistence path — use ? with proper error or add // O(1) EXEMPT: <reason>' \
-  "$STAGED_FILES"
-scan_movers_persist_paths '\.expect(' \
-  'Cat 10 (Phase 13): .expect() in movers persistence path — use ? with proper error or add // O(1) EXEMPT: <reason>' \
-  "$STAGED_FILES"
 
 # ─────────────────────────────────────────────
 # RESULT

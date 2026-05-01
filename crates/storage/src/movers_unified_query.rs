@@ -121,15 +121,11 @@ pub const MOVERS_QUERY_DEFAULT_LIMIT: usize = 50;
 /// Builds the read-side SELECT against `movers_unified_<tf>`.
 ///
 /// `timeframe` MUST be one of the 24 mat-view timeframes (caller validates
-/// via `MOVERS_UNIFIED_VIEW_TIMEFRAMES`). `limit` clamped to `[1, 200]`.
+/// via `MOVERS_VIEW_TIMEFRAMES`). `limit` clamped to `[1, 200]`.
 ///
 /// Excludes `BSE_FNO` per Wave 5 Item 4 SENSEX-options filter.
 #[must_use]
-pub fn build_movers_unified_query(
-    timeframe: &str,
-    category: MoversCategory,
-    limit: usize,
-) -> String {
+pub fn build_movers_query(timeframe: &str, category: MoversCategory, limit: usize) -> String {
     let bounded_limit = limit.clamp(1, 200);
     format!(
         "SELECT \
@@ -138,7 +134,7 @@ pub fn build_movers_unified_query(
             volume_bucket, oi_delta_bucket, \
             open_price_bucket, high_price_bucket, low_price_bucket, \
             change_pct_session, change_pct_bucket \
-         FROM movers_unified_{timeframe} \
+         FROM movers_{timeframe} \
          WHERE ts > dateadd('s', -300, now()) \
            AND segment != 'BSE_FNO' \
          ORDER BY {order} \
@@ -183,38 +179,43 @@ mod tests {
 
     #[test]
     fn test_build_query_includes_target_view_for_5m() {
-        let sql = build_movers_unified_query("5m", MoversCategory::TopVolumeBucket, 50);
-        assert!(sql.contains("FROM movers_unified_5m"));
+        let sql = build_movers_query("5m", MoversCategory::TopVolumeBucket, 50);
+        assert!(sql.contains("FROM movers_5m"));
+        // Regression guard: must NOT reference the legacy table name. The
+        // 2026-05-01 migration drops every `movers_unified_*` mat view, so
+        // any read-path query targeting that name returns "table does not
+        // exist" at runtime.
+        assert!(!sql.contains("movers_unified_"));
     }
 
     #[test]
     fn test_build_query_excludes_bse_fno_per_wave_5_item_4() {
-        let sql = build_movers_unified_query("5m", MoversCategory::PriceGainerSession, 50);
+        let sql = build_movers_query("5m", MoversCategory::PriceGainerSession, 50);
         assert!(sql.contains("segment != 'BSE_FNO'"));
     }
 
     #[test]
     fn test_build_query_uses_5_minute_freshness_window() {
-        let sql = build_movers_unified_query("5m", MoversCategory::TopVolumeBucket, 50);
+        let sql = build_movers_query("5m", MoversCategory::TopVolumeBucket, 50);
         // Read-side recency: only consider the last ~5 min of mat-view rows.
         assert!(sql.contains("dateadd('s', -300, now())"));
     }
 
     #[test]
     fn test_build_query_clamps_limit_to_max_200() {
-        let sql = build_movers_unified_query("1m", MoversCategory::HighestOi, 99_999);
+        let sql = build_movers_query("1m", MoversCategory::HighestOi, 99_999);
         assert!(sql.contains("LIMIT 200"));
     }
 
     #[test]
     fn test_build_query_clamps_limit_to_min_1() {
-        let sql = build_movers_unified_query("1m", MoversCategory::HighestOi, 0);
+        let sql = build_movers_query("1m", MoversCategory::HighestOi, 0);
         assert!(sql.contains("LIMIT 1"));
     }
 
     #[test]
     fn test_build_query_default_limit_is_50_via_constant() {
-        let sql = build_movers_unified_query(
+        let sql = build_movers_query(
             "5m",
             MoversCategory::TopVolumeBucket,
             MOVERS_QUERY_DEFAULT_LIMIT,
@@ -224,13 +225,13 @@ mod tests {
 
     #[test]
     fn test_build_query_top_value_uses_price_volume_product() {
-        let sql = build_movers_unified_query("5m", MoversCategory::TopValueBucket, 50);
+        let sql = build_movers_query("5m", MoversCategory::TopValueBucket, 50);
         assert!(sql.contains("ORDER BY (last_price * volume_bucket) DESC"));
     }
 
     #[test]
     fn test_build_query_includes_all_14_columns() {
-        let sql = build_movers_unified_query("5m", MoversCategory::HighestOi, 50);
+        let sql = build_movers_query("5m", MoversCategory::HighestOi, 50);
         for col in [
             "security_id",
             "segment",
@@ -253,7 +254,7 @@ mod tests {
 
     #[test]
     fn test_build_query_loser_uses_asc_order() {
-        let sql = build_movers_unified_query("5m", MoversCategory::PriceLoserBucket, 50);
+        let sql = build_movers_query("5m", MoversCategory::PriceLoserBucket, 50);
         assert!(sql.contains("change_pct_bucket ASC"));
     }
 
@@ -284,11 +285,12 @@ mod tests {
     }
 
     #[test]
-    fn test_build_movers_unified_query_produces_complete_select_statement() {
-        // Pub-fn substring-match guard pin for `pub fn build_movers_unified_query`.
-        let sql = build_movers_unified_query("1m", MoversCategory::HighestOi, 50);
+    fn test_build_movers_query_produces_complete_select_statement() {
+        // Pub-fn substring-match guard pin for `pub fn build_movers_query`.
+        let sql = build_movers_query("1m", MoversCategory::HighestOi, 50);
         assert!(sql.starts_with("SELECT"));
-        assert!(sql.contains("FROM movers_unified_1m"));
+        assert!(sql.contains("FROM movers_1m"));
+        assert!(!sql.contains("movers_unified_"));
         assert!(sql.contains("WHERE"));
         assert!(sql.contains("ORDER BY"));
         assert!(sql.contains("LIMIT"));
