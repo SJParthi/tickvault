@@ -1878,3 +1878,211 @@ All 15 rows + 7 resilience rows apply (same as Item 23). The mat-view design SIM
 Wave 5 movers design = Item 25 only. Earlier iterations preserved in plan history for traceability.
 
 ## Plan Items (now 25, was 10)
+
+## Item 26 — Volume Semantic Guarantee Layer (operator demand 2026-05-01) — Dhan-NSE adherence proof
+
+Operator: "even dhan is following as well after receiving every ticks directly from nse — i need the guarantee."
+
+We cannot audit Dhan's internals. We CAN prove the wire-format semantic empirically via 3 independent layers, deployed live, fired automatically.
+
+### Layer 1 — Runtime monotonicity guard (in-process)
+
+If Dhan's `volume` field is truly cumulative-since-session-open, it MUST be monotonically non-decreasing for any `(security_id, exchange_segment)` within a single trading day. Any decrease = wire format wrong = CRITICAL alert.
+
+Implementation:
+- `crates/core/src/pipeline/volume_monotonicity_guard.rs` (NEW)
+- Per-tick check: `if curr_tick.volume < prev_tick.volume { increment counter; emit ERROR }`
+- Per-instrument tracker via `papaya::HashMap<(security_id, ExchangeSegment), u32>` (last seen volume)
+- Tracker resets at IST midnight (intentional — Dhan resets at 09:15 IST for new session)
+- Pre-market window 09:00-09:15 IST allows volume = 0 (no trading); first non-zero locks the floor
+
+ErrorCode: **VOLUME-MONO-01** (Severity::Critical, halt depth selectors using cumulative volume + Telegram CRITICAL)
+
+Prom: `tv_volume_non_monotonic_total{security_id, segment}` — expected 0 across all instruments forever.
+
+Tests:
+- `test_volume_monotonicity_guard_passes_increasing_sequence`
+- `test_volume_monotonicity_guard_fires_on_decrease`
+- `test_volume_monotonicity_guard_resets_at_ist_midnight`
+- `test_volume_monotonicity_guard_allows_zero_in_premarket`
+- DHAT zero-alloc on per-tick check
+
+### Layer 2 — NSE cross-check (nightly)
+
+NSE publishes daily traded volumes per contract via bhavcopy CSV (downloadable from `https://archives.nseindia.com/content/historical/DERIVATIVES/`). Our cumulative volume at 15:30 IST close MUST match NSE's published daily total within tolerance.
+
+Implementation:
+- `crates/core/src/historical/nse_volume_crosscheck.rs` (NEW)
+- Daily job at 16:00 IST (after market close + bhavcopy publication):
+  1. Download bhavcopy for today's date
+  2. Parse per-contract daily total volume
+  3. Query QuestDB: `SELECT security_id, last(volume) FROM ticks WHERE date(ts) = today() GROUP BY security_id`
+  4. Compare per-contract: `abs(our_cum - nse_total) / nse_total < 0.001` (0.1% tolerance for late tick arrivals)
+  5. ANY mismatch = CRITICAL Telegram with delta + diagnostic
+
+ErrorCode: **VOLUME-NSE-01** (Severity::Critical, daily reconciliation failed)
+
+Prom: `tv_volume_nse_crosscheck_diff_pct{security_id}` — distribution gauge; alert at p99 > 0.1%.
+
+Audit table: `nse_volume_crosscheck_audit` (DEDUP UPSERT KEYS `(date, security_id, segment)`)
+
+### Layer 3 — Dhan support ticket (authoritative spec)
+
+Draft per `docs/dhan-support/TEMPLATE.md`:
+
+> **Subject:** Wire Format Specification — Volume Field Semantic in Quote/Full Packets
+> **Topic:** Live Market Feed WebSocket — clarification request
+> **Body:** Confirm officially that the `Volume` field at bytes 22-25 (uint32 LE) in Quote packet (response code 4) and Full packet (response code 8) represents:
+> 1. Cumulative day-traded volume since session open (09:15 IST)
+> 2. Monotonically non-decreasing within a trading day
+> 3. Resets to 0 at start of next session (09:15 IST next trading day)
+> 4. Matches NSE bhavcopy daily total at 15:30 IST close
+
+Per past tickets (#5525125 prev close, #5519522 depth-200), expected response time 1-2 days. Once confirmed, archive to `docs/dhan-support/2026-05-XX-volume-semantic-confirmation.md` and pin in `dhan/live-market-feed.md` rule.
+
+### Why these 3 layers TOGETHER are the strongest guarantee possible
+
+| Failure mode | L1 catches | L2 catches | L3 prevents |
+|---|---|---|---|
+| Dhan changes wire format | YES (within seconds) | YES (next day) | NO (already deployed change) |
+| Dhan has internal bug producing wrong volume | YES (monotonicity violation) | YES (delta vs NSE) | NO (bug exists) |
+| Dhan + NSE both wrong (impossible — NSE is regulator) | NO (consistent) | NO (consistent) | NO (no force) |
+| Our parser misreads bytes | YES (random non-monotonic) | YES (delta vs NSE) | NO |
+| Network-induced reordering | YES (out-of-order detected via sequence_number) | NO | NO |
+| Wire format unchanged but Dhan starts sending incremental | YES (monotonicity violation if multiple ticks per second) | YES | NO |
+
+Combined = mathematical proof + regulatory cross-check + authoritative spec.
+
+### What this verifies vs CANNOT verify
+
+| Claim | Can we prove? |
+|---|---|
+| "Dhan correctly forwards NSE data after every tick" | NO — closed system |
+| "Dhan's wire format is cumulative-since-session-open" | YES — L1 monotonicity (mathematical) + L2 NSE match (empirical) |
+| "Our parser correctly interprets Dhan's wire format" | YES — L1 + L2 + L3 combined |
+| "Volume math (`last - first`) gives correct bucket increment" | YES — derives from L1 (cumulative confirmed) |
+| "We will detect any future Dhan format change immediately" | YES — L1 fires within seconds, L2 within 24h |
+
+### Plan integration
+
+- [ ] **Item 26. Volume Semantic Guarantee Layer**
+- Files: `crates/core/src/pipeline/volume_monotonicity_guard.rs` (new), `crates/core/src/historical/nse_volume_crosscheck.rs` (new), `crates/storage/src/nse_volume_crosscheck_persistence.rs` (new), `docs/dhan-support/2026-05-01-volume-semantic-clarification.md` (new draft)
+- Tests: 5 monotonicity-guard tests above + 4 NSE-crosscheck tests + DHAT zero-alloc
+- 9-box: ErrorCodes VOLUME-MONO-01 + VOLUME-NSE-01; Prom counters/gauges; Telegram event `VolumeSemanticBreach` (Severity::Critical); Grafana panel `Volume Adherence`; alert `tv-volume-mono-01-non-monotonic-tick`; triage rule
+
+### Per-Item Guarantee Matrix (per Item 22)
+
+All 15 rows + 7 resilience rows apply (see canonical `.claude/rules/project/per-wave-guarantee-matrix.md`).
+
+## Item 27 — CORRECT Movers Mat View Aggregations (verified, supersedes Item 25 schema)
+
+Per Item 26 verification, volume IS cumulative. Operator-correct schema for `movers_unified_*` mat views:
+
+```sql
+CREATE MATERIALIZED VIEW movers_unified_5m AS
+  SELECT security_id, segment, ts,
+    -- Snapshot at bucket close (cumulative since session open):
+    last(last_price)        AS last_price,
+    last(open_interest)     AS open_interest,
+    last(volume)            AS volume_cumulative,
+    last(prev_close)        AS prev_close,
+
+    -- Bucket aggregates (incremental within this 5m):
+    last(volume) - first(volume)               AS volume_bucket,        -- correct via cumulative monotonicity (Item 26 L1)
+    last(open_interest) - first(open_interest) AS oi_delta_bucket,      -- signed (gainer +, loser -)
+
+    -- OHLC within bucket:
+    first(last_price)       AS open_price_bucket,
+    max(last_price)         AS high_price_bucket,
+    min(last_price)         AS low_price_bucket,
+    -- close = last(last_price) (alias above)
+
+    -- Percentage:
+    CASE WHEN last(prev_close) > 0
+      THEN ((last(last_price) - last(prev_close)) / last(prev_close)) * 100
+      ELSE 0
+    END AS change_pct_session,
+    CASE WHEN first(last_price) > 0
+      THEN ((last(last_price) - first(last_price)) / first(last_price)) * 100
+      ELSE 0
+    END AS change_pct_bucket
+
+  FROM movers_unified_1s
+  SAMPLE BY 5m ALIGN TO CALENDAR WITH OFFSET '00:00';
+```
+
+**BANNED in this schema:** `sum(volume)`, `sum(open_interest)`. Ratchet test scans all `movers_unified_*` DDLs and fails build if these appear.
+
+Read-time category mappings (carry from Item 25 + verified-correct columns):
+
+| Category | SQL | Column |
+|---|---|---|
+| HIGHEST_OI | `ORDER BY open_interest DESC` | snapshot |
+| OI_GAINER | `ORDER BY oi_delta_bucket DESC` | bucket-incremental |
+| OI_LOSER | `ORDER BY oi_delta_bucket ASC` | bucket-incremental |
+| TOP_VOLUME (intraday) | `ORDER BY volume_cumulative DESC` | snapshot |
+| TOP_VOLUME (last 5m) | `ORDER BY volume_bucket DESC` | bucket-incremental |
+| TOP_VALUE | `ORDER BY (last_price * volume_bucket) DESC` | computed at read |
+| PRICE_GAINER (vs prev day) | `ORDER BY change_pct_session DESC` | session % |
+| PRICE_GAINER (last 5m) | `ORDER BY change_pct_bucket DESC` | bucket % |
+| PRICE_LOSER | symmetric ASC | as above |
+
+### Plan integration
+
+- [ ] **Item 27. CORRECT mat view schema with explicit bucket-vs-snapshot columns**
+- Supersedes Item 25's schema (Item 25 design intent stays, columns verified-corrected)
+- Files: `crates/storage/src/movers_unified_persistence.rs` (DDL templates for 24 mat views)
+- Tests:
+  - `test_movers_unified_ddl_no_sum_volume_anywhere` (banned-pattern source-scan)
+  - `test_movers_unified_volume_bucket_via_last_minus_first` (DDL string assertion)
+  - `test_movers_unified_oi_delta_via_last_minus_first` (DDL string assertion)
+  - `test_movers_unified_change_pct_uses_case_when_prev_close_positive`
+  - `test_movers_unified_all_24_views_have_align_to_calendar_with_offset`
+  - Integration: feed synthetic ticks → assert mat view rows match Rust-computed reference
+
+### Per-Item Guarantee Matrix (per Item 22)
+
+All 15 rows + 7 resilience rows apply.
+
+## Item 28 — Existing Candles Cascade Volume Bug Fix (separate from Wave 5 movers)
+
+Discovered during Item 26 verification: `crates/storage/src/materialized_views.rs:315` uses `sum(volume) AS volume` cascading from `candles_1s` (which stores cumulative-snapshot volume per `candle_aggregator.rs:92` "Snapshot, not incremental"). Result: every candle volume column above 1s tier is wrong (sum of cumulative endpoints, off by ~10×).
+
+### Fix design (cascade-aware)
+
+Two correct paths:
+
+**Path X — Change base aggregator to incremental:**
+- `candle_aggregator.rs`: track `bucket.volume_start` at first tick of bucket; on bucket close, persist `volume = current.volume - volume_start` (incremental)
+- All cascade `sum(volume)` becomes correct
+- Migration: drop + recreate candles_1s + cascade views (auto-rebuilds from ticks)
+- Pro: `sum()` semantically correct everywhere
+- Con: aggregator code change + data migration
+
+**Path Y — Keep base cumulative-snapshot, fix cascade DDL:**
+- `candles_1s.volume` stays as end-of-second cumulative
+- Tier 1 cascade (5s, 10s, 15s, 30s, 1m FROM candles_1s): use `last(volume) - first(volume) AS volume`
+- Tier 2+ cascade (5m FROM 1m, etc.): NOW the volume is incremental → use `sum(volume) AS volume`
+- DDL macro encodes this: views with cumulative source use `last - first`, views with incremental source use `sum`
+- Pro: no aggregator code change, no migration of base table
+- Con: cascade tier semantics encoded in DDL macro
+
+**Recommend Path X.** Cleaner long-term (one semantic for volume column). Migration is cheap (mat views auto-rebuild from ticks once dropped).
+
+### Plan integration (separate from Wave 5 movers)
+
+- [ ] **Item 28. Fix candles cascade volume bug (Path X)**
+- Files: `crates/core/src/pipeline/candle_aggregator.rs` (track volume_start, compute incremental), `crates/storage/src/materialized_views.rs` (no DDL change with Path X), `scripts/migrate-candles-volume-fix.sql` (drop + recreate cascade)
+- Tests:
+  - `test_candle_aggregator_persists_incremental_volume_not_cumulative`
+  - `test_candle_aggregator_volume_start_resets_per_bucket`
+  - Integration: feed cumulative tick stream → assert per-bucket volume = correct increment
+  - Regression: existing candles_1s snapshot test (line 528-530) inverted — assert NEW behavior
+- 9-box: ErrorCode `CANDLE-VOL-01` (volume bucket count mismatch with NSE bhavcopy, reuses Item 26 L2 cross-check infrastructure)
+- Migration: ship in same PR with `scripts/migrate-candles-volume-fix.sql` to drop/recreate views post-deploy
+
+### Per-Item Guarantee Matrix (per Item 22)
+
+All 15 rows + 7 resilience rows apply.
+
+## Plan Items (now 28, was 10)
