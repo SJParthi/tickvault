@@ -468,6 +468,106 @@ scan_hot_path_sync_fs 'std::fs::create_dir\b' \
   "$STAGED_FILES"
 
 # ─────────────────────────────────────────────
+# CATEGORY 8: MOVERS 22-TF — I-P1-11 in movers paths (Phase 13 of v3 plan)
+# ─────────────────────────────────────────────
+#
+# Same I-P1-11 invariant as Cat 5 but scoped to the movers paths. The
+# movers writers iterate every tick across every segment so single-segment
+# collections keyed on security_id alone silently drop colliding entries.
+scan_movers_paths() {
+  local pattern="$1"
+  local description="$2"
+  local files="$3"
+  local movers_files
+
+  movers_files=$(echo "$files" | grep -E \
+    '^(crates/(core|storage|common)/src/.*(mover|movers).*\.rs|crates/common/src/mover_types\.rs)$' \
+    || true)
+  if [ -z "$movers_files" ]; then
+    return
+  fi
+
+  scan_prod_code "$pattern" "$description" "$movers_files"
+}
+
+scan_movers_paths 'HashSet<u32>' \
+  'Cat 8 (Phase 13): HashSet<u32> in movers path — use HashSet<(u32, ExchangeSegment)> or add // APPROVED: single-segment context' \
+  "$STAGED_FILES"
+scan_movers_paths 'HashMap<u32,' \
+  'Cat 8 (Phase 13): HashMap<u32, _> in movers path — use HashMap<(u32, ExchangeSegment), _> or add // APPROVED: single-segment context' \
+  "$STAGED_FILES"
+
+# ─────────────────────────────────────────────
+# CATEGORY 9: MOVERS DDL REGISTRATION (Phase 13 of v3 plan)
+# ─────────────────────────────────────────────
+#
+# Every `CREATE TABLE IF NOT EXISTS movers_` literal in a Rust source file
+# MUST be emitted by the canonical `movers_22tf_create_ddl(timeframe)`
+# helper, which iterates `MOVERS_TIMEFRAMES`. Hand-rolled DDL strings for
+# orphan movers tables (e.g. `movers_42m`) skip the partition manager
+# registration + S3 lifecycle config, so the partition rotation never
+# happens and EBS fills silently.
+scan_movers_orphan_ddl() {
+  local files="$1"
+  local rust_files
+  rust_files=$(echo "$files" | grep -E '^crates/.+\.rs$' | grep -v '_test\.rs$' || true)
+  [ -z "$rust_files" ] && return
+
+  local orphans=""
+  while IFS= read -r file; do
+    [ -z "$file" ] && continue
+    [ ! -f "$file" ] && continue
+    # Skip the canonical helper itself + tests
+    case "$file" in
+      */movers_22tf_persistence.rs) continue ;;
+      */tests/*) continue ;;
+    esac
+    # Find any literal CREATE TABLE IF NOT EXISTS movers_ outside the helper
+    if grep -nE 'CREATE TABLE IF NOT EXISTS movers_' "$file" 2>/dev/null \
+       | grep -v -- '// APPROVED:'; then
+      orphans="${orphans}${file}\n"
+    fi
+  done <<< "$rust_files"
+
+  if [ -n "$orphans" ]; then
+    VIOLATIONS=$((VIOLATIONS + 1))
+    REPORT="${REPORT}\n  [BANNED] Cat 9 (Phase 13): Orphan movers DDL outside movers_22tf_persistence.rs — use the canonical helper iterating MOVERS_TIMEFRAMES, or add // APPROVED: comment.\n${orphans}"
+  fi
+}
+scan_movers_orphan_ddl "$STAGED_FILES"
+
+# ─────────────────────────────────────────────
+# CATEGORY 10: MOVERS WRITER PANIC (Phase 13 of v3 plan)
+# ─────────────────────────────────────────────
+#
+# Banned: `.unwrap()` / `.expect(` inside the movers persistence + scheduler
+# modules. The 22 writers + scheduler tasks run on the snapshot path —
+# panics there cascade into pool-supervisor respawns and operator-visible
+# Telegram noise. Use `?` with proper error returns or the `// O(1) EXEMPT:`
+# escape hatch for genuinely infallible call sites.
+scan_movers_persist_paths() {
+  local pattern="$1"
+  local description="$2"
+  local files="$3"
+  local persist_files
+
+  persist_files=$(echo "$files" | grep -E \
+    '^(crates/storage/src/movers_22tf_persistence\.rs|crates/core/src/pipeline/movers_22tf_(scheduler|supervisor|writer_state)\.rs)$' \
+    || true)
+  if [ -z "$persist_files" ]; then
+    return
+  fi
+  scan_prod_code "$pattern" "$description" "$persist_files"
+}
+
+scan_movers_persist_paths '\.unwrap()' \
+  'Cat 10 (Phase 13): .unwrap() in movers persistence path — use ? with proper error or add // O(1) EXEMPT: <reason>' \
+  "$STAGED_FILES"
+scan_movers_persist_paths '\.expect(' \
+  'Cat 10 (Phase 13): .expect() in movers persistence path — use ? with proper error or add // O(1) EXEMPT: <reason>' \
+  "$STAGED_FILES"
+
+# ─────────────────────────────────────────────
 # RESULT
 # ─────────────────────────────────────────────
 
