@@ -1006,7 +1006,7 @@ The merged trunk's tracker is named `Movers22TfTracker`. Operator's new spec is 
 
 ### What we add to the plan
 
-- [ ] **Item 19. 25-timeframe spec extension to merged `Movers22TfTracker`**
+- [x] **Item 19. 25-timeframe spec extension to merged `Movers22TfTracker`**
 - Files: `crates/common/src/constants.rs` (timeframe list), `crates/core/src/pipeline/movers_22tf_tracker.rs` (rename or extend), `crates/core/src/pipeline/movers_22tf_scheduler.rs`, `crates/core/src/pipeline/movers_22tf_supervisor.rs`, `crates/core/src/pipeline/movers_22tf_writer_state.rs`, `crates/storage/src/movers_22tf_persistence.rs`, `crates/api/src/handlers/market_data.rs` (top-movers-22tf API endpoint)
 - Tests:
   - `test_movers_25_timeframe_list_pinned` (constant pin)

@@ -250,6 +250,12 @@ async fn chaos_movers_22tf_sustained_throughput() {
 #[tokio::test(flavor = "current_thread")]
 async fn chaos_movers_22tf_pipeline_construct_destroy_clean() {
     let pipeline = build_movers_22tf_pipeline();
-    assert_eq!(pipeline.receivers.len(), 22);
+    // Wave 5 Item 19: list extended from 22 → 25 timeframes (operator
+    // decision Q4: keep `22Tf` naming as historical artifact). The
+    // receiver count tracks `MOVERS_TIMEFRAME_COUNT`.
+    assert_eq!(
+        pipeline.receivers.len(),
+        tickvault_common::mover_types::MOVERS_TIMEFRAME_COUNT
+    );
     drop(pipeline);
 }
