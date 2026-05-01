@@ -1731,3 +1731,150 @@ For every Wave 5 item:
 **No item escapes this matrix.** The Per-Item Guarantee Matrix from Item 22 amplifies this with 15-row × 7-row coverage on every other dimension (security, monitoring, alerting, audit, etc.).
 
 ## Plan Items (now 24, was 10)
+
+## Item 25 — Materialized-View Movers Redesign (operator demand 2026-05-01) — SUPERSEDES Item 23
+
+Operator: "why didn't you move all the movers similar to materialised view candles dude — even for movers 1s also you can keep it in normal table and remaining you can move it into materialised views right dude?"
+
+**Operator is right.** Item 23's 25-separate-writer-stream design was overcomplicated. Use QuestDB materialized views (same pattern as `candles_1m`, `candles_5m`, etc. already in `crates/storage/src/materialized_views.rs`).
+
+### The simplification
+
+| Aspect | Item 23 (old) | **Item 25 (new)** |
+|---|---|---|
+| App writer tasks | 25 (one per timeframe) | **1** (base 1s only) |
+| ILP streams from app to QuestDB | 25 | **1** |
+| Arena pools | 25 (one per task) | **0** (no per-tf computation in app) |
+| Staggering (200ms offset per tf) | Required | **Eliminated** |
+| Supervisor respawn cardinality | 25 | **1** |
+| `mpsc` channels | 25 × 65536 | **1** |
+| Burst @ 09:15 IST coboundary from app | 275K rows/sec | **11K rows/sec** (QuestDB handles aggregation) |
+| Code complexity | High (tracker + scheduler + supervisor + writer_state per tf) | **Massively simpler** (one writer task, mat views server-side) |
+| Aggregation correctness | Manually computed in Rust (bug-prone) | **QuestDB-native via SAMPLE BY** |
+
+### Design
+
+**Base table (only physical write from app, 1Hz cadence):**
+
+```sql
+CREATE TABLE IF NOT EXISTS movers_unified_1s (
+  ts            TIMESTAMP,
+  security_id   LONG,
+  segment       SYMBOL CAPACITY 16 NOCACHE,
+  open_interest LONG,
+  oi_delta      LONG,
+  volume        LONG,
+  last_price    DOUBLE,
+  prev_close    DOUBLE,
+  change_pct    DOUBLE,
+  received_at   TIMESTAMP
+) TIMESTAMP(ts) PARTITION BY DAY
+  DEDUP UPSERT KEYS(ts, security_id, segment);
+```
+
+**24 materialized views, one per timeframe, incrementally refreshed by QuestDB:**
+
+```sql
+-- Pattern (repeated for 5s, 15s, 30s, 1m, 2m, 3m, 4m, 5m, 6m, 7m, 8m, 9m, 10m,
+-- 11m, 12m, 13m, 14m, 15m, 30m, 1h, 2h, 3h, 4h, 1d):
+CREATE MATERIALIZED VIEW IF NOT EXISTS movers_unified_5s AS
+  SELECT
+    security_id,
+    segment,
+    ts,
+    last(last_price)                                                AS last_price,
+    last(volume)                                                    AS volume,
+    last(open_interest)                                             AS open_interest,
+    last(open_interest) - first(open_interest)                      AS oi_delta,
+    last(prev_close)                                                AS prev_close,
+    ((last(last_price) - last(prev_close)) / last(prev_close)) * 100 AS change_pct
+  FROM movers_unified_1s
+  SAMPLE BY 5s;
+```
+
+QuestDB refreshes mat views **incrementally** as new rows arrive in the base — server-side, no app intervention.
+
+### Read path (unchanged from Item 23 except table names)
+
+```sql
+-- TOP_VOLUME at 5m timeframe over last 5min:
+SELECT * FROM movers_unified_5m
+WHERE ts > now() - 5m AND segment != 'BSE_FNO' AND change_pct > 0
+ORDER BY volume DESC, change_pct DESC, security_id ASC
+LIMIT 50;
+
+-- HIGHEST_OI at 1h:
+SELECT * FROM movers_unified_1h
+WHERE ts > now() - 1h
+ORDER BY open_interest DESC LIMIT 50;
+```
+
+API handler enriches each row via `InstrumentRegistry` lookup at read time (same as Item 23). Sub-millisecond.
+
+### DEDUP key (simplified)
+
+| Table | DEDUP UPSERT KEYS |
+|---|---|
+| `movers_unified_1s` (base) | `(ts, security_id, segment)` — 3-col |
+| All 24 mat views | inherit from base via SAMPLE BY semantics; QuestDB enforces uniqueness per (ts, security_id, segment) within each bucket |
+
+NO `timeframe` column needed because each view IS its own timeframe.
+
+### Tiered hot retention
+
+Same intent as Item 23, applied to base + mat views via QuestDB partition manager:
+
+| Table | Hot retention |
+|---|---|
+| `movers_unified_1s` (base) | 7 days (1s data is high-frequency, rarely queried >1 week back) |
+| `movers_unified_5s` | 14 days |
+| `movers_unified_15s` | 30 days |
+| `movers_unified_30s` through `movers_unified_1d` (22 views) | 90 days |
+
+After hot expiry, partition manager detaches → S3 lifecycle to Glacier Deep Archive (per `aws-budget.md` ₹333/mo).
+
+### Files (massively reduced from Item 23)
+
+- `crates/storage/src/movers_unified_persistence.rs` — base table DDL + ILP writer + 24 mat-view CREATE-IF-NOT-EXISTS at boot
+- `crates/storage/src/materialized_views.rs` — extend existing module to register 24 movers mat views alongside candle views
+- `crates/core/src/pipeline/movers_unified_writer.rs` — ONE writer task; consumes from `tick_processor` enrichment, ILP-appends to `movers_unified_1s` at 1Hz
+- `crates/api/src/handlers/top_movers.rs` — read-time queries against the right mat view + InstrumentRegistry enrichment
+- ~~movers_unified_scheduler.rs~~ DELETED — no scheduler needed
+- ~~movers_unified_supervisor.rs~~ DELETED — only 1 task to supervise
+- ~~movers_unified_writer_state.rs (per-tf)~~ DELETED — merged into single writer
+
+### Tests
+
+- `test_movers_unified_1s_base_table_ddl_creates_with_dedup_keys`
+- `test_movers_unified_24_materialized_views_auto_created_at_boot`
+- `test_materialized_view_5m_aggregates_correctly_via_sample_by` (sample data)
+- `test_materialized_view_oi_delta_uses_last_minus_first` (correctness)
+- `test_materialized_view_change_pct_formula` (correctness)
+- `test_api_top_movers_queries_correct_view_per_timeframe` (5m → movers_unified_5m)
+- `test_api_enriches_via_instrument_registry_o1_lookup` (carry-over from Item 23)
+- `test_movers_writer_writes_only_to_base_1s_not_to_mat_views` (regression guard)
+- `bench_movers_unified_1s_writer_p99_under_1ms` (Criterion bench — base writer hot path)
+- `test_movers_unified_partition_retention_per_tier` (1s=7d, 5s=14d, 15s=30d, 30s+=90d)
+- `test_movers_dedup_key_is_3_col_no_timeframe` (replaces Item 23 4-col guard)
+
+### 9-box (per Item 22 mandatory matrix)
+
+- ① typed event: `MoversUnifiedWriterIlpFailed` (Severity::Medium); `MoversUnifiedMatViewRefreshLag` (Severity::Medium when QuestDB mat view refresh > 60s behind base)
+- ② ErrorCode: `MOVERS-UNIFIED-01` (writer ILP failed, Medium); `MOVERS-UNIFIED-04` (mat view refresh lag, Medium); `MOVERS-UNIFIED-05` (mat view DDL failed at boot, Critical halt boot)
+- ③ tracing: `info!(rows_persisted, …)` per 1s write
+- ④ Prom: `tv_movers_unified_1s_rows_total`, `tv_movers_mat_view_refresh_lag_seconds{view}`, `tv_movers_unified_writer_errors_total`
+- ⑤ Grafana: rewrite Operator Health movers panel — single base table row count + 24 view-lag gauges
+- ⑥ Alert: `tv-movers-unified-mat-view-refresh-lag-exceeds-60s`
+- ⑦ Call site: `tick_processor` enrichment → 1 writer task on Core 3
+- ⑧ Triage: `.claude/triage/error-rules.yaml::movers-unified-04-mat-view-lag-investigate`
+- ⑨ Ratchet: 11 tests above + `dedup_segment_meta_guard.rs` extension
+
+### Per-Item Guarantee Matrix (per Item 22)
+
+All 15 rows + 7 resilience rows apply (same as Item 23). The mat-view design SIMPLIFIES delivery of these guarantees — fewer moving parts to fail.
+
+### Items 16, 19, 21, 23 — all SUPERSEDED by Item 25
+
+Wave 5 movers design = Item 25 only. Earlier iterations preserved in plan history for traceability.
+
+## Plan Items (now 25, was 10)
