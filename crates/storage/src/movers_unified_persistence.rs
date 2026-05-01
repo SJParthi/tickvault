@@ -285,13 +285,78 @@ async fn run_one_shot_cleanup_migration(client: &Client, base_url: &str) {
 /// endpoint returns HTTP 200 with `{"error":"..."}` in the body for queries
 /// against missing tables, so HTTP-status-only checks are insufficient.
 async fn ddl_succeeded(client: &Client, base_url: &str, sql: &str) -> bool {
+    run_ddl(client, base_url, sql).await.success
+}
+
+/// QuestDB DDL response triage. Captures the structured outcome so callers
+/// can log the body verbatim on failure (essential for diagnosing `400 Bad
+/// Request` returns where the error message is in the body, not the status).
+struct DdlOutcome {
+    /// True when HTTP 2xx AND no `"error":` key in body — i.e. QuestDB
+    /// actually executed the DDL.
+    success: bool,
+    /// Best-effort copy of the response body (HTTP error message OR JSON
+    /// `{"error":"..."}` content). Empty on transport errors.
+    body: String,
+    /// HTTP status code as string for log fields. `transport_err` if the
+    /// request never reached QuestDB.
+    status: String,
+}
+
+/// Run a DDL statement against QuestDB's `/exec` endpoint and return a
+/// triaged `DdlOutcome`. Replaces the boolean `ddl_succeeded` for sites
+/// that need to log the actual error body (Fix A from PR #421 follow-up).
+async fn run_ddl(client: &Client, base_url: &str, sql: &str) -> DdlOutcome {
     match client.get(base_url).query(&[("query", sql)]).send().await {
-        Ok(resp) if resp.status().is_success() => match resp.text().await {
-            Ok(body) => !body.contains(r#""error":"#),
-            Err(_) => false,
+        Ok(resp) => {
+            let status = resp.status();
+            let status_str = status.to_string();
+            let body = resp.text().await.unwrap_or_default();
+            let success = status.is_success() && !body.contains(r#""error":"#);
+            DdlOutcome {
+                success,
+                body,
+                status: status_str,
+            }
+        }
+        Err(err) => DdlOutcome {
+            success: false,
+            body: format!("transport_err: {err}"),
+            status: "transport_err".to_string(),
         },
-        _ => false,
     }
+}
+
+/// List every `tables()` row whose `table_name` starts with `prefix`. Used
+/// by the post-migration audit (Fix E) and the post-CREATE verification
+/// (Fix C) to confirm physical state matches what the DDL responses said.
+///
+/// Returns an empty `Vec` on any QuestDB-side error so the caller's audit
+/// safe-fails to "no rows present" — the audit then reports "0 of N
+/// expected" which is itself a useful signal.
+async fn query_table_names_with_prefix(
+    client: &Client,
+    base_url: &str,
+    prefix: &str,
+) -> Vec<String> {
+    let sql = format!("SELECT table_name FROM tables() WHERE table_name LIKE '{prefix}%'");
+    let outcome = run_ddl(client, base_url, &sql).await;
+    if !outcome.success {
+        return Vec::new();
+    }
+    let parsed: serde_json::Value = match serde_json::from_str(&outcome.body) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    parsed
+        .get("dataset")
+        .and_then(|d| d.as_array())
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| row.get(0).and_then(|c| c.as_str()).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Probe the marker table for an existing row. Returns `true` ONLY when the
@@ -380,36 +445,104 @@ pub async fn ensure_movers_tables_and_views(questdb_config: &QuestDbConfig) {
         }
     }
 
-    // Step 2: 24 materialized views.
+    // Step 2: 24 materialized views — robust loop with DROP-before-CREATE
+    // (Fix B: defensive against stale state from a prior failed boot),
+    // retry-once-on-failure (Fix D: 400 Bad Request can be transient on
+    // QuestDB during high-concurrency boot DDL), and structured error-body
+    // logging (Fix A: the original WARN only carried the HTTP status, not
+    // the actual reason QuestDB rejected the DDL).
     let mut created = 0;
     for &tf in MOVERS_VIEW_TIMEFRAMES {
+        // Fix B: drop any stale object with this name first. DROP MAT VIEW
+        // IF EXISTS is idempotent and returns OK on missing names. Then
+        // also DROP TABLE IF EXISTS for the same name — handles the case
+        // where a legacy `movers_22tf` table with this name (e.g.
+        // `movers_5s`, `movers_15s`) survived the cleanup migration.
+        let drop_view_sql = format!("DROP MATERIALIZED VIEW IF EXISTS movers_{tf}");
+        let _ = run_ddl(&client, &base_url, &drop_view_sql).await;
+        let drop_table_sql = format!("DROP TABLE IF EXISTS movers_{tf}");
+        let _ = run_ddl(&client, &base_url, &drop_table_sql).await;
+
+        // Try CREATE, then once-retry on failure.
         let sql = movers_view_ddl(tf);
-        match client
-            .get(&base_url)
-            .query(&[("query", sql.as_str())])
-            .send()
-            .await
-        {
-            Ok(resp) if resp.status().is_success() => {
-                created += 1;
-            }
-            Ok(resp) => {
-                warn!(
-                    timeframe = tf,
-                    status = %resp.status(),
-                    "movers mat-view DDL non-2xx — continuing"
-                );
-            }
-            Err(err) => {
-                error!(timeframe = tf, ?err, "movers mat-view DDL failed");
-            }
+        let mut outcome = run_ddl(&client, &base_url, &sql).await;
+        if !outcome.success {
+            // Fix D: a single retry handles transient QuestDB-side state.
+            outcome = run_ddl(&client, &base_url, &sql).await;
+        }
+
+        if outcome.success {
+            created += 1;
+        } else {
+            // Fix A: log the response body so the operator can see WHY
+            // QuestDB rejected the DDL. Uses `error!` (Loki → Telegram)
+            // because a missing mat view is a real coverage gap that
+            // breaks downstream queries, not a routine warning.
+            error!(
+                timeframe = tf,
+                status = %outcome.status,
+                body = %outcome.body,
+                "movers mat-view CREATE failed after retry — view missing"
+            );
         }
     }
+
     info!(
         created,
         total = MOVERS_VIEW_COUNT,
         "movers materialized views ensured"
     );
+
+    // Fix C: post-CREATE verification. Query the QuestDB metadata table
+    // to confirm physical state matches what the DDL responses claimed.
+    // If any expected mat view is missing, log ERROR with the gap list so
+    // the operator knows EXACTLY which timeframes are absent (instead of
+    // just a count discrepancy buried in INFO).
+    let actual = query_table_names_with_prefix(&client, &base_url, "movers_").await;
+    let mut missing: Vec<&'static str> = Vec::new();
+    for &tf in MOVERS_VIEW_TIMEFRAMES {
+        let expected = format!("movers_{tf}");
+        if !actual.iter().any(|name| name == &expected) {
+            missing.push(tf);
+        }
+    }
+    if !missing.is_empty() {
+        error!(
+            missing_count = missing.len(),
+            missing_timeframes = ?missing,
+            actual_count = actual.len(),
+            "movers post-CREATE verification: views missing — read-path queries WILL fail for these timeframes"
+        );
+    }
+
+    // Fix E: post-migration legacy-table audit. The DROP IF EXISTS path
+    // returns `{"ddl":"OK"}` even when the underlying table object can't
+    // be dropped (rare but observed in PR #421's first deployment), so
+    // we sanity-check that none of the LEGACY_22TF_TIMEFRAMES exist as
+    // standalone TABLES (different from mat views with the same name).
+    // We compare against the new-mat-view set: any `movers_{tf}` left
+    // behind whose `tf` is in 22tf-only-set (NOT in MOVERS_VIEW_TIMEFRAMES)
+    // is definitively a stale 22tf table that the cleanup didn't drop.
+    let legacy_22tf_only: Vec<&'static str> = LEGACY_22TF_TIMEFRAMES
+        .iter()
+        .copied()
+        .filter(|tf| !MOVERS_VIEW_TIMEFRAMES.contains(tf))
+        .collect();
+    let stale: Vec<&'static str> = legacy_22tf_only
+        .iter()
+        .copied()
+        .filter(|tf| {
+            let name = format!("movers_{tf}");
+            actual.iter().any(|n| n == &name)
+        })
+        .collect();
+    if !stale.is_empty() {
+        error!(
+            stale_count = stale.len(),
+            stale_timeframes = ?stale,
+            "movers post-migration audit: legacy 22tf tables still present — manual `DROP TABLE` required"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -666,5 +799,59 @@ mod tests {
     #[test]
     fn test_migration_marker_name_pinned() {
         assert_eq!(MIGRATION_MARKER_TABLE, "movers_migration_2026_05_01");
+    }
+
+    #[test]
+    fn test_legacy_22tf_only_set_excludes_new_view_timeframes() {
+        // Fix E audit logic depends on this set: "names that exist ONLY
+        // in the dead 22tf list, NOT in the new mat-view list". If both
+        // sets share a name, that name is legitimately a new mat view
+        // and shouldn't be flagged as a stale 22tf table by the audit.
+        let legacy_only: Vec<&'static str> = LEGACY_22TF_TIMEFRAMES
+            .iter()
+            .copied()
+            .filter(|tf| !MOVERS_VIEW_TIMEFRAMES.contains(tf))
+            .collect();
+        // From the live boot of PR #421's first deploy, these are the
+        // four 22tf names not represented in the new mat-view set:
+        //   1s (the new BASE table — not a view)
+        //   2s, 3s, 10s, 20s (sub-minute names dropped from new design)
+        // The 1s overlap is intentional: movers_1s is a TABLE in the new
+        // design (the base), not a mat view. The audit checks against
+        // mat-view names so a movers_1s table doesn't trigger a false
+        // positive.
+        for expected in ["1s", "2s", "3s", "10s", "20s"] {
+            assert!(
+                legacy_only.contains(&expected),
+                "legacy-22tf-only set must contain `{expected}` (got: {legacy_only:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ddl_outcome_struct_carries_status_and_body() {
+        // Pub-fn substring-match guard pin for `DdlOutcome`. The Fix A
+        // contract is "log status + body verbatim on failure"; this
+        // ratchets the struct shape so a future cleanup that strips
+        // either field would break the build.
+        let outcome = DdlOutcome {
+            success: false,
+            status: "400 Bad Request".to_string(),
+            body: r#"{"error":"unsupported SAMPLE BY interval"}"#.to_string(),
+        };
+        assert!(!outcome.success);
+        assert_eq!(outcome.status, "400 Bad Request");
+        assert!(outcome.body.contains("error"));
+        assert!(outcome.body.contains("SAMPLE BY"));
+    }
+
+    #[test]
+    fn test_view_count_invariant_holds_against_new_mat_view_set() {
+        // Fix C's post-verify loop iterates MOVERS_VIEW_TIMEFRAMES; the
+        // count drives the operator-visible "missing X of N" log. Pin
+        // the invariant so a future timeframe addition can't silently
+        // skew the audit.
+        assert_eq!(MOVERS_VIEW_TIMEFRAMES.len(), MOVERS_VIEW_COUNT);
+        assert_eq!(MOVERS_VIEW_COUNT, 24);
     }
 }
