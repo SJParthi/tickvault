@@ -43,8 +43,20 @@ pub struct LiveCandle {
     pub low: f32,
     /// Close price (last tick in this second).
     pub close: f32,
-    /// Cumulative volume snapshot from latest tick (NOT incremental).
+    /// **INCREMENTAL volume** within this 1-second bucket.
+    /// Computed as `current_tick_cumulative - bucket_start_cumulative`.
+    /// Item 28 (Wave 5): fixes pre-2026-05-01 bug where this field stored cumulative-snapshot
+    /// (`tick.volume`), making `sum(volume)` cascade in materialized_views.rs:315 produce
+    /// 60× over-count. Mat view `sum(volume)` is now MATHEMATICALLY CORRECT.
     pub volume: u32,
+    /// **Bucket-start cumulative volume** — the cumulative-volume value at the start of THIS
+    /// 1-second bucket. Set ONCE on bucket creation (from per-security tracker), never updated.
+    /// Used to compute incremental volume on each subsequent tick: `volume = tick.volume - bucket_start_cumulative`.
+    /// For the first-ever tick of a session: bucket_start_cumulative = 0 (cumulative starts at 0).
+    /// For subsequent buckets: bucket_start_cumulative = previous bucket's last cumulative
+    /// (carried via the per-security tracker, ensuring no inter-bucket volume is lost when a
+    /// bucket has no ticks).
+    pub bucket_start_cumulative: u32,
     /// Number of ticks aggregated into this candle.
     pub tick_count: u32,
     /// Implied volatility (latest snapshot from Greeks pipeline, f64::NAN if not available).
@@ -61,15 +73,21 @@ pub struct LiveCandle {
 
 impl LiveCandle {
     /// Creates a new candle from the first tick in this second.
+    ///
+    /// `bucket_start_cumulative` is the cumulative volume at the END of the previous bucket
+    /// for this security (or 0 if this is the first-ever tick or after a session reset).
+    /// Initial volume = `tick.volume - bucket_start_cumulative` (incremental from bucket start).
     #[inline(always)]
-    fn from_tick(tick: &ParsedTick) -> Self {
+    fn from_tick(tick: &ParsedTick, bucket_start_cumulative: u32) -> Self {
         Self {
             timestamp_secs: tick.exchange_timestamp,
             open: tick.last_traded_price,
             high: tick.last_traded_price,
             low: tick.last_traded_price,
             close: tick.last_traded_price,
-            volume: tick.volume,
+            // Item 28: incremental volume from bucket start (NOT cumulative snapshot).
+            volume: tick.volume.saturating_sub(bucket_start_cumulative),
+            bucket_start_cumulative,
             tick_count: 1,
             iv: tick.iv,
             delta: tick.delta,
@@ -80,6 +98,10 @@ impl LiveCandle {
     }
 
     /// Updates the candle with a new tick in the same second.
+    ///
+    /// Recomputes `volume` as `tick.volume - self.bucket_start_cumulative` (incremental).
+    /// `self.bucket_start_cumulative` is set once on bucket creation; it stays constant
+    /// across ticks within the same bucket.
     #[inline(always)]
     fn update(&mut self, tick: &ParsedTick) {
         if tick.last_traded_price > self.high {
@@ -89,7 +111,9 @@ impl LiveCandle {
             self.low = tick.last_traded_price;
         }
         self.close = tick.last_traded_price;
-        self.volume = tick.volume; // Snapshot, not incremental
+        // Item 28: recompute incremental volume from bucket start.
+        // saturating_sub guards against rare out-of-order tick where current cumulative < bucket start.
+        self.volume = tick.volume.saturating_sub(self.bucket_start_cumulative);
         self.tick_count = self.tick_count.saturating_add(1);
         // Update Greeks from latest tick snapshot (only if available).
         if !tick.iv.is_nan() {
@@ -154,6 +178,25 @@ pub struct CandleAggregator {
     completed: Vec<CompletedCandle>,
     /// Total candles completed since startup.
     total_completed: u64,
+    /// **Per-security last-cumulative-volume tracker** — Item 28 (Wave 5) Choice A.
+    ///
+    /// Holds the LATEST cumulative volume seen for each `(security_id, segment_code)`,
+    /// updated on EVERY tick regardless of bucket boundary. Used to seed the
+    /// `bucket_start_cumulative` of NEW candles when a bucket boundary is crossed,
+    /// ensuring that volume traded between buckets (when intermediate buckets had no ticks)
+    /// is correctly attributed to the bucket where the next tick arrives.
+    ///
+    /// Why this is necessary: naive `last - first` per bucket misses inter-bucket volume.
+    /// Example: bucket B has tick at cumulative=1500 then bucket C has no ticks then
+    /// bucket D has tick at cumulative=1800. Naive D.volume = 1800 - 1800 = 0 (WRONG).
+    /// With this tracker: D's bucket_start_cumulative = 1500 (from previous tick), so
+    /// D.volume = 1800 - 1500 = 300 (CORRECT).
+    ///
+    /// Session-reset detection: if `tick.volume < tracker.get(key)`, treat as session
+    /// boundary (NSE F&O cumulative resets at 09:15:00 IST next day). bucket_start = 0.
+    /// (Item 26 L1 monotonicity guard fires CRITICAL if this happens within a single
+    /// trading day; that runtime check is in a follow-up sub-PR.)
+    last_cumulative_volume: HashMap<(u32, u8), u32>,
 }
 
 impl Default for CandleAggregator {
@@ -169,6 +212,9 @@ impl CandleAggregator {
             candles: HashMap::with_capacity(CANDLE_MAP_INITIAL_CAPACITY),
             completed: Vec::with_capacity(256),
             total_completed: 0,
+            // Item 28 Choice A: same capacity as candles HashMap; one entry per
+            // active security carried across bucket boundaries.
+            last_cumulative_volume: HashMap::with_capacity(CANDLE_MAP_INITIAL_CAPACITY),
         }
     }
 
@@ -183,12 +229,31 @@ impl CandleAggregator {
     pub fn update(&mut self, tick: &ParsedTick) {
         let key = (tick.security_id, tick.exchange_segment_code);
 
+        // Item 28 Choice A: compute bucket_start_cumulative from per-security tracker.
+        // - First-ever tick for this security: tracker is empty → bucket_start = 0.
+        // - Subsequent buckets: tracker holds cumulative from previous tick (which may
+        //   be in the same bucket OR the previous bucket, but always represents
+        //   "cumulative at end of last seen activity").
+        // - Session reset detection: if current tick's cumulative is LESS than tracker,
+        //   it's a session boundary (cumulative resets at 09:15:00 IST next day);
+        //   reset bucket_start to 0. (Within a single trading day, decreasing volume
+        //   would violate cumulative semantic — Item 26 L1 catches that as CRITICAL
+        //   in a separate sub-PR.)
+        let prev_cum = self.last_cumulative_volume.get(&key).copied().unwrap_or(0);
+        let bucket_start = if tick.volume < prev_cum {
+            0 // Session reset (next trading day)
+        } else {
+            prev_cum
+        };
+
         if let Some(candle) = self.candles.get_mut(&key) {
             if tick.exchange_timestamp == candle.timestamp_secs {
-                // Same second — update OHLCV in place
+                // Same second — update OHLCV in place. Candle's stored
+                // bucket_start_cumulative is unchanged; volume re-computed as incremental.
                 candle.update(tick);
             } else {
-                // New second — complete the old candle and start fresh
+                // New second — complete the old candle (its volume is final incremental)
+                // and start a new bucket with bucket_start = previous-tick cumulative.
                 self.completed.push(CompletedCandle {
                     security_id: tick.security_id,
                     exchange_segment_code: tick.exchange_segment_code,
@@ -206,12 +271,19 @@ impl CandleAggregator {
                     vega: candle.vega,
                 });
                 self.total_completed = self.total_completed.saturating_add(1);
-                *candle = LiveCandle::from_tick(tick);
+                *candle = LiveCandle::from_tick(tick, bucket_start);
             }
         } else {
-            // First tick for this security — start a new candle
-            self.candles.insert(key, LiveCandle::from_tick(tick));
+            // First tick for this security — start a new candle.
+            // bucket_start = 0 here (tracker was empty), so candle.volume = tick.volume
+            // (correctly representing cumulative-since-session-open for the first bucket).
+            self.candles
+                .insert(key, LiveCandle::from_tick(tick, bucket_start));
         }
+
+        // ALWAYS update the tracker AFTER processing the tick, so the NEXT tick
+        // (whether in the same bucket or a new one) sees the current cumulative.
+        self.last_cumulative_volume.insert(key, tick.volume);
     }
 
     /// Sweeps stale candles older than `current_timestamp - STALE_CANDLE_THRESHOLD_SECS`.
@@ -517,16 +589,156 @@ mod tests {
     }
 
     #[test]
-    fn volume_is_snapshot_not_incremental() {
+    fn volume_is_incremental_within_bucket_post_item_28() {
+        // Item 28 (Wave 5) fix: candle volume is INCREMENTAL from bucket_start_cumulative,
+        // NOT the cumulative-snapshot of the latest tick.
+        //
+        // For the first bucket of a security: bucket_start_cumulative = 0, so
+        // candle.volume == latest_tick.volume (== cumulative-since-session-open).
+        //
+        // The "drop from 500 to 300" in this test simulates a session reset OR
+        // an out-of-order tick. With saturating_sub, the candle correctly recomputes
+        // from bucket_start = 0 → candle.volume = 300.
         let mut agg = CandleAggregator::new();
-        agg.update(&make_tick(100, 2, 500.0, 1000, 100));
-        agg.update(&make_tick(100, 2, 510.0, 1000, 500)); // Volume jumps
-        agg.update(&make_tick(100, 2, 505.0, 1000, 300)); // Volume drops (correction)
+        agg.update(&make_tick(100, 2, 500.0, 1000, 100)); // 1st bucket, 1st tick: bucket_start=0, vol=100-0=100
+        agg.update(&make_tick(100, 2, 510.0, 1000, 500)); // same bucket, 2nd tick: vol=500-0=500
+        agg.update(&make_tick(100, 2, 505.0, 1000, 300)); // same bucket, 3rd tick: vol=300-0=300 (saturating_sub safe)
 
         let candle = agg.candles.get(&(100, 2)).expect("candle must exist");
         assert_eq!(
             candle.volume, 300,
-            "volume should be latest snapshot, not cumulative"
+            "Item 28: volume should be incremental from bucket_start_cumulative=0; for first bucket, equals latest tick's cumulative."
+        );
+        assert_eq!(
+            candle.bucket_start_cumulative, 0,
+            "first-ever bucket for this security should have bucket_start_cumulative = 0"
+        );
+    }
+
+    #[test]
+    fn volume_carries_across_bucket_boundary_correctly_item_28() {
+        // Item 28 critical regression: the bug fix's central claim.
+        //
+        // Bucket A (ts=1000): cumulative goes 1000 → 1500. A.volume = 1500 (incremental from 0).
+        // Bucket B (ts=1001): cumulative goes 1500 → 1800. B.volume = 1800-1500 = 300.
+        //
+        // Pre-Item 28 (snapshot bug): B.volume would be 1800. sum across A+B = 1500+1800 = 3300.
+        // Post-Item 28: B.volume = 300. sum across A+B = 1500+300 = 1800 (CORRECT — matches final cumulative).
+        let mut agg = CandleAggregator::new();
+        agg.update(&make_tick(100, 2, 500.0, 1000, 1000));
+        agg.update(&make_tick(100, 2, 502.0, 1000, 1500)); // A closes at cum=1500
+        agg.update(&make_tick(100, 2, 503.0, 1001, 1800)); // B opens with bucket_start=1500
+
+        // Bucket A is now in completed buffer
+        let completed = agg.drain_completed();
+        assert_eq!(completed.len(), 1, "bucket A should be completed");
+        assert_eq!(completed[0].timestamp_secs, 1000);
+        assert_eq!(
+            completed[0].volume, 1500,
+            "Item 28: bucket A volume = incremental from session start (bucket_start=0) to A's close = 1500"
+        );
+
+        // Bucket B is still active in self.candles
+        let candle_b = agg.candles.get(&(100, 2)).expect("bucket B must exist");
+        assert_eq!(candle_b.timestamp_secs, 1001);
+        assert_eq!(
+            candle_b.bucket_start_cumulative, 1500,
+            "Item 28: bucket B's start = previous bucket's last cumulative (1500), NOT 0 and NOT 1800"
+        );
+        assert_eq!(
+            candle_b.volume, 300,
+            "Item 28: bucket B volume = 1800 - 1500 = 300 (incremental WITHIN this bucket, not cumulative)"
+        );
+    }
+
+    #[test]
+    fn volume_attributes_skipped_bucket_volume_to_next_bucket_item_28() {
+        // Item 28 inter-bucket attribution: when an intermediate bucket has no ticks,
+        // its volume is correctly attributed to the bucket where the next tick arrives.
+        //
+        // Bucket A (ts=1000): cum 1000 → 1500.
+        // Bucket B (ts=1001): NO TICKS (security went silent for 1 second).
+        // Bucket C (ts=1002): cum reaches 2300 (1500 → 1800 happened during B silently, then 1800 → 2300 in C).
+        //
+        // Without per-security tracker (naive last-first per bucket): C.volume = 0 (only one tick = no delta).
+        //                                                              Total volume lost = 800.
+        // With per-security tracker (Item 28): C.bucket_start = 1500 (carried from end of A). C.volume = 2300 - 1500 = 800.
+        //                                       Volume conservation: A + C = 1500 + 800 = 2300 (matches final cumulative).
+        let mut agg = CandleAggregator::new();
+        agg.update(&make_tick(100, 2, 500.0, 1000, 1000));
+        agg.update(&make_tick(100, 2, 502.0, 1000, 1500)); // A closes at cum=1500
+        // No ticks in bucket 1001 — security went silent
+        agg.update(&make_tick(100, 2, 506.0, 1002, 2300)); // C opens 2 seconds later
+
+        // Snapshot bucket C's volume BEFORE draining completed (avoids overlapping borrows).
+        let c_volume = {
+            let candle_c = agg.candles.get(&(100, 2)).expect("bucket C must exist");
+            assert_eq!(candle_c.timestamp_secs, 1002);
+            assert_eq!(
+                candle_c.bucket_start_cumulative, 1500,
+                "Item 28: bucket C's start = end of bucket A (1500), even though B had no ticks"
+            );
+            assert_eq!(
+                candle_c.volume, 800,
+                "Item 28: bucket C volume = 2300 - 1500 = 800 (captures inter-bucket trades from silent bucket B)"
+            );
+            candle_c.volume
+        };
+
+        // Verify volume conservation: A.volume + C.volume should equal C's final cumulative
+        let completed = agg.drain_completed();
+        let a_volume = completed[0].volume; // bucket A
+        assert_eq!(
+            a_volume + c_volume,
+            2300,
+            "Item 28 volume conservation: sum of all bucket-incremental volumes = final cumulative"
+        );
+    }
+
+    #[test]
+    fn volume_session_reset_resets_bucket_start_to_zero_item_28() {
+        // Item 28 session-reset detection: when current tick's cumulative is LESS than
+        // the per-security tracker, treat as new trading-day session reset.
+        // bucket_start_cumulative resets to 0 → first tick of new day correctly captures
+        // its cumulative-since-09:15 IST.
+        //
+        // (Item 26 L1 will fire CRITICAL alert if a decrease is observed within a single
+        // trading day — that's a separate sub-PR.)
+        let mut agg = CandleAggregator::new();
+        // Day 1 trading
+        agg.update(&make_tick(100, 2, 500.0, 1000, 50_000)); // bucket A, day 1: cum=50K
+        agg.update(&make_tick(100, 2, 502.0, 1000, 75_000)); // same bucket, cum=75K (incremental=75K)
+        // Day 2 first tick — cumulative reset, smaller value than tracker
+        agg.update(&make_tick(100, 2, 510.0, 86_400 + 1000, 500)); // new bucket (different ts), cum=500 < 75K (reset)
+
+        let candle = agg.candles.get(&(100, 2)).expect("candle must exist");
+        assert_eq!(
+            candle.bucket_start_cumulative, 0,
+            "Item 28: session reset detected (tick.volume=500 < tracker=75000); bucket_start reset to 0"
+        );
+        assert_eq!(
+            candle.volume, 500,
+            "Item 28: first bucket of new day volume = cumulative since 09:15 IST today = 500"
+        );
+    }
+
+    #[test]
+    fn first_ever_tick_volume_equals_cumulative_item_28() {
+        // Item 28 first-ever-tick semantic: when no prior tick exists for a security,
+        // tracker is empty (`unwrap_or(0)`) → bucket_start = 0 → candle.volume = tick.volume.
+        // This is mathematically correct: first cumulative observed = volume traded since
+        // session open (assuming Dhan publishes from 09:15 IST onward).
+        let mut agg = CandleAggregator::new();
+        agg.update(&make_tick(999, 2, 1000.0, 33_300, 12_345)); // first tick ever for security 999
+
+        let candle = agg.candles.get(&(999, 2)).expect("candle must exist");
+        assert_eq!(
+            candle.bucket_start_cumulative, 0,
+            "first-ever tick: bucket_start_cumulative = 0 (no prior cumulative known)"
+        );
+        assert_eq!(
+            candle.volume, 12345,
+            "Item 28: first-ever bucket volume = tick.volume (== cumulative since 09:15 IST)"
         );
     }
 
