@@ -570,7 +570,120 @@ Operator question: "for full we don't need to store the day close or prev close 
 
 **Decision: keep IDX_I-only.** Smaller change, preserves audit queries.
 
-## Plan Items (now 15, was 10)
+## Movers Storage Strategy — In-Memory Tracker vs Persistent Snapshot (operator question 2026-05-01)
+
+Operator: "is it always better to store every movers options separately or just store and calculate and save and from runtime we can pull it up dude what is the best extreme efficient option?"
+
+### Answer: Hybrid — in-memory rolling tracker (runtime) + 60s checkpoint (audit/restart)
+
+| Strategy | Pros | Cons | Use case |
+|---|---|---|---|
+| A. Persist every snapshot at 1Hz | Full history, granular replay | ~75K writes/sec to QuestDB on indices-only universe; ILP load + write amplification | Rejected — too expensive |
+| B. In-memory only | O(1) reads, zero ILP cost | Lost on restart; no audit trail | Rejected — SEBI 5y retention + restart recovery |
+| C. **Hybrid: in-memory rolling tracker + 60s checkpoint** | O(1) runtime reads from memory; bounded ILP load (~1 snapshot/min); audit + restart recovery from QuestDB | 60s of granularity loss on restart | **CHOSEN** |
+
+### Wave 5 movers architecture (all 7 categories × all subscribed instruments)
+
+```
+Tick stream (parser) ──┐
+                       │
+                       ▼
+              ┌─────────────────────────┐
+              │  In-memory MoversTracker│  ← O(1) update per tick
+              │  (papaya / Arc<HashMap>) │
+              │  - HIGHEST_OI            │
+              │  - OI_GAINER / LOSER     │
+              │  - TOP_VOLUME / VALUE    │
+              │  - PRICE_GAINER / LOSER  │
+              └────────────┬─────────────┘
+                           │
+              ┌────────────┴───────────┬──────────────────┐
+              │                        │                  │
+              ▼                        ▼                  ▼
+       Runtime queries       60s snapshot writer   1Hz pre-open writer
+       (API handlers)         (option_movers,        (PreopenMoversTracker
+       O(1) lookup            stock_movers,           09:00–09:13 only)
+                              top_movers_22tf)
+```
+
+### Why O(1) latency is preserved
+
+| Layer | Operation | Cost |
+|---|---|---|
+| Per-tick update | Increment counters in `papaya::HashMap<(security_id, segment), MoversState>` | ~80 ns avg, lock-free |
+| Per-tick category re-rank | NOT done per tick — done at snapshot boundary (60s); per-tick we only update raw stats | ~0 ns extra per tick |
+| Snapshot rank computation | `BTreeSet<(value, security_id)>` per category, sorted insertion is O(log N) where N=10,783; total snapshot = 7 categories × N log N ≈ 1ms | Off hot path |
+| API query "top 50 by volume" | Read pre-computed snapshot from `Arc<MoversSnapshot>` — O(1) | <100 ns |
+| QuestDB checkpoint write | 7 categories × 50 ranks × 1 row = 350 rows/snapshot × 1/min = 5.8 rows/sec ILP | Negligible |
+
+### Storage cost math
+
+| Approach | Rows/day | ILP writes/sec peak | Storage 90 days hot | Storage 5 years cold (S3) |
+|---|---|---|---|---|
+| A. 1Hz persist | 75K rows/sec × 8h = 2.16 B rows/day | 75,000 | ~2 TB | impractical |
+| C. 60s checkpoint | 350 rows/snapshot × 60 snapshots/h × 8h = 168K rows/day | 5.8 | ~150 GB | ~330 GB Glacier — fits ₹333/mo budget |
+
+**Decision: C is 12,857× cheaper on writes, 13,300× cheaper on storage. Same operator-facing query latency (both use in-memory cache).**
+
+### What we add to the plan
+
+- [ ] **Item 16. Movers hybrid storage strategy**
+- Files: `crates/core/src/pipeline/option_movers.rs`, `crates/core/src/pipeline/top_movers.rs`, `crates/core/src/pipeline/stock_movers.rs`, `crates/core/src/pipeline/movers_22tf_scheduler.rs`
+- Tests: `test_movers_tracker_per_tick_update_is_o1`, `test_movers_snapshot_cadence_is_60s_default`, `test_movers_api_query_reads_from_in_memory_arc`, `test_movers_restart_rehydrates_from_questdb_last_snapshot`
+- 9-box: Prom counter `tv_movers_snapshot_writes_total{table}`, gauge `tv_movers_in_memory_state_size_bytes`, alert `tv-movers-snapshot-cadence-drift` (>120s gap = writer task stalled), `MoversSnapshotPersisted` Severity::Info edge-triggered, ratchet test on per-tick allocation count.
+
+## Dhan Documentation Pin — Previous Close in Full / Quote Packets
+
+Operator: "dhan already mentioned right in full we can automatically fetch the prev close day data from close right dude can you check that doc or email dude they clearly mentioned it right?"
+
+**Confirmed.** Source artefacts (live in repo):
+
+| Source | Where | What it confirms |
+|---|---|---|
+| Dhan Ticket #5525125 (2026-04-10) | `docs/dhan-support/README.md` archive entry: `2026-04-20-ticket-5525125-prev-close-routing.md` (archived) | "PrevClose as a standalone packet is emitted only for IDX_I instruments. For NSE_EQ and NSE_FNO subscriptions, the previous-day close is delivered inside the Quote and Full packets via the `close` field" |
+| Rule file | `.claude/rules/dhan/live-market-feed.md` lines 79-101 (`MECHANICAL RULE: Previous-Day Close Routing`) | Codifies the routing — explicit byte offsets per packet |
+| Module docstring | `crates/storage/src/previous_close_persistence.rs:7-13` | 3-row table mapping segment → source packet → bytes → source label |
+| Annexure | `dhan-ref/03-live-market-feed-websocket.md` | Quote bytes 38-41 + Full bytes 50-53 = `close` field; Dhan doc labels this as "close" but per Ticket #5525125 it's **previous trading session's close**, NOT current day's close |
+
+**This is why Wave 5 Item 15 is safe.** The close value rides every Quote/Full tick; the `previous_close` table writes for NSE_EQ + NSE_FNO + BSE_FNO are pure redundancy.
+
+## Parallelization Map — How to Split Wave 5 Across Multiple Sessions Without Conflicts
+
+Operator: "in the future we can split it out or we can provide parallel everything to new new claude code sessions right if it doesn't have any dependency right dude?"
+
+Per `stream-resilience.md` per-PR-set protocol: ≤3 sub-PRs, ≤30 files / ≤3K LoC each. Wave 5 = 16 items. Dependency-grouped:
+
+| Group | Items | Touches | Depends on | Can run in parallel? |
+|---|---|---|---|---|
+| **A — Foundation** (1 PR, 1 commit each) | Item 1 (config gate) | `crates/common/src/config.rs`, `config/base.toml` | nothing | NO — must land first |
+| **B — Independent fixes** (1 PR, parallelizable commits) | Item 6 (core_affinity), Item 7 (candle_aggregator key), Item 8 (warn→error), Item 9 (ErrorCodes), Item 15 (drop redundant prev_close) | core, common, storage, app | nothing — orthogonal | **YES — 5 sessions in parallel possible** |
+| **C — Universe-driven** (1 PR, sequential within) | Item 2 (universe filter) → Items 3, 4, 5, 12, 13, 14 | core, app, api | Item 1 + B | Items 3/4/5/12/13/14 can run parallel **after** Item 2 |
+| **D — Storage strategy** (1 PR) | Item 16 (movers hybrid) | core, storage | Item 12 | Sequential after Item 12 |
+| **E — Test+review** (1 PR, last) | Item 10 (adversarial review), Item 11 (chaos burst) | tests | all of above | Sequential at the end |
+
+### Recommended sub-PR split for parallel session execution
+
+| Sub-PR | Items | Sessions in parallel | Wall-clock estimate |
+|---|---|---|---|
+| Wave 5-A | 1, 6, 7, 8, 9, 15 | 5 sessions in parallel (Item 1 first, then 6/7/8/9/15 fan-out) | ~2-3 hours (parallel) |
+| Wave 5-B | 2, 3, 4, 5, 12, 13, 14 | 1 session for Item 2; then 6 sessions parallel (3/4/5/12/13/14) | ~3-4 hours (parallel) |
+| Wave 5-C | 16, 11, 10 | Sequential | ~2 hours |
+
+**Per-session protocol on parallel work:**
+1. Each session reads `.claude/plans/active-plan-wave-5-indices-only.md` → identifies its assigned item(s)
+2. Each session creates a sub-branch off `claude/fetch-status-info-V56GN` (e.g., `claude/wave-5a-item-6-core-affinity`)
+3. After implementation: PR back to the wave branch (not main)
+4. Wave branch PR (#410) gets all sub-PRs merged, then squash to main
+5. **Conflict avoidance:** items in same Group share NO files (verified by file paths in Plan Items table)
+
+### What we add to the plan
+
+- [ ] **Item 17. Document parallelization map + sub-branch protocol**
+- Files: this plan file (already done); add `.claude/plans/wave-5-sub-branches.md` listing each sub-branch + assigned items + base commit
+- Tests: N/A (documentation)
+- 9-box: N/A (process)
+
+## Plan Items (now 17, was 10)
 
 Each item carries the 9-box checklist per `stream-resilience.md` B8: ① typed event, ② ErrorCode, ③ tracing+code field, ④ Prometheus counter, ⑤ Grafana panel, ⑥ alert rule, ⑦ call site, ⑧ triage YAML rule, ⑨ ratchet test.
 
