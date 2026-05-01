@@ -142,10 +142,17 @@ impl Default for FeaturesConfig {
             telegram_bucket_coalescer: true,
             market_open_self_test: true,
             realtime_guarantee_score: true,
-            // Wave 5 Items 4+5: OFF by default. Operator flips to true after
-            // validating depth-20 dynamic top-50 + depth-200 dynamic top-5
-            // wiring on a non-trading day.
-            depth_dynamic_top_volume: false,
+            // Wave 5 Items 4+5: ON by default per operator 2026-05-01.
+            // The orchestrator runs the 60s top-volume reselection
+            // (`depth_dynamic_pipeline.rs`) and emits Swap20/Swap200
+            // commands. Until the conn-pool refactor lands (replacing
+            // mixed-CE+PE conns with 4 single-side static + 1 dynamic
+            // for depth-20, and 4 ATM with 5 dynamic for depth-200),
+            // those Swap commands have no receiver and fire
+            // `DEPTH-DYN-02` ERROR per cycle. That's the visible
+            // signal the operator uses to schedule the receiver-side
+            // refactor sub-PR.
+            depth_dynamic_top_volume: true,
         }
     }
 }
