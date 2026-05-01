@@ -28,7 +28,7 @@
 //!   AND change_pct > 0                  -- gainers only
 //!   AND volume > 0                      -- defensive
 //!   AND ts > dateadd('s', -300, now())  -- 5m freshness
-//! ORDER BY change_pct DESC, volume DESC -- tie-break by volume
+//! ORDER BY volume DESC, change_pct DESC -- volume is PRIMARY criteria (operator spec 2026-05-01); change_pct is tie-breaker
 //! LIMIT 50;                             -- depth-200 takes first 5 of these
 //! ```
 //!
@@ -93,7 +93,7 @@ fn build_selector_sql(k: usize) -> String {
            AND change_pct > 0 \
            AND volume > 0 \
            AND ts > dateadd('s', -300, now()) \
-         ORDER BY change_pct DESC, volume DESC \
+         ORDER BY volume DESC, change_pct DESC \
          LIMIT {k}"
     )
 }
@@ -314,12 +314,35 @@ mod tests {
     // ----------------------------------------------------------------------
 
     #[test]
-    fn test_selector_sql_uses_top_volume_category_change_pct_desc() {
+    fn test_selector_sql_uses_top_volume_category_volume_desc_primary() {
         let sql = selector_sql(50);
         assert!(sql.contains("category = 'TOP_VOLUME'"));
-        assert!(sql.contains("ORDER BY change_pct DESC"));
-        // Tie-break by volume for determinism.
-        assert!(sql.contains("change_pct DESC, volume DESC"));
+        // Operator spec 2026-05-01: VOLUME is PRIMARY sort criteria;
+        // change_pct DESC is the tie-breaker. Reverse of pre-fix shape.
+        assert!(sql.contains("ORDER BY volume DESC"));
+        assert!(sql.contains("volume DESC, change_pct DESC"));
+    }
+
+    #[test]
+    fn test_selector_sql_volume_is_first_sort_key_not_change_pct() {
+        // Strict ratchet: rejects any regression that puts change_pct
+        // before volume in the ORDER BY. Operator spec 2026-05-01:
+        // "based on top volume alone only our sorted by percentage desc
+        //  should work dude it should always pick the top volume as the
+        //  first criteria bro okay?"
+        let sql = selector_sql(50);
+        let order_by_idx = sql.find("ORDER BY").expect("ORDER BY in selector SQL"); // APPROVED: test-only
+        let after_order_by = &sql[order_by_idx..];
+        let volume_idx = after_order_by
+            .find("volume DESC")
+            .expect("volume DESC present"); // APPROVED: test-only
+        let change_pct_idx = after_order_by
+            .find("change_pct DESC")
+            .expect("change_pct DESC present"); // APPROVED: test-only
+        assert!(
+            volume_idx < change_pct_idx,
+            "volume DESC must precede change_pct DESC in ORDER BY (operator spec)"
+        );
     }
 
     #[test]
@@ -585,7 +608,9 @@ mod tests {
     }
 
     #[test]
-    fn test_depth_200_sorts_by_change_pct_desc() {
-        assert!(selector_sql(DEPTH_200_DYNAMIC_K).contains("ORDER BY change_pct DESC"));
+    fn test_depth_200_sorts_by_volume_desc_primary() {
+        // Operator spec 2026-05-01: VOLUME is PRIMARY criteria; change_pct
+        // DESC is the tie-breaker. Same shape as depth-20 selector.
+        assert!(selector_sql(DEPTH_200_DYNAMIC_K).contains("ORDER BY volume DESC"));
     }
 }
