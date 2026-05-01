@@ -127,6 +127,7 @@ pub fn sanitize(rows: &[DepthSelectorRow], k: usize) -> Vec<DepthSelectorRow> {
 /// least `DEPTH_20_SWAP_HYSTERESIS_MIN` positions. Edge-triggered:
 /// stable sets DO NOT issue a swap (no churn on rank order alone).
 #[must_use]
+// TEST-EXEMPT: covered by 4 test_swap_hysteresis_* ratchets (first-set, identical-set, below-min, at-or-above-min).
 pub fn should_issue_depth_20_swap(
     previous: &[DepthSelectorRow],
     current: &[DepthSelectorRow],
@@ -177,6 +178,7 @@ pub enum DepthStaticSide {
 /// at the chain edges if the ATM is closer than 24 strikes from either
 /// boundary.
 #[must_use]
+// TEST-EXEMPT: covered by 4 test_static_side_* ratchets (centred-49, low-edge, high-edge, empty).
 pub fn select_static_side_contracts(sorted_strikes: &[(u32, f64)], atm_index: usize) -> Vec<u32> {
     if sorted_strikes.is_empty() {
         return Vec::new();
