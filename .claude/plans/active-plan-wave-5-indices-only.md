@@ -1301,7 +1301,7 @@ LIMIT 50;                             -- depth-200 takes first 5 of these (share
 - Add `code = ErrorCode::StorageGap03AuditWriteFailure.code_str()` field to satisfy tag-guard.
 - 9-box: ① existing typed event ② STORAGE-GAP-03 (existing) ③ added in this fix ④ existing counter ⑤ existing panel ⑥ existing alert ⑦ tick_persistence flush call site ⑧ existing triage rule ⑨ meta-guard catches future regressions
 
-### - [ ] 9. New ErrorCode variants (4)
+### - [x] 9. New ErrorCode variants (4)
 
 - Files: `crates/common/src/error_code.rs`, `.claude/rules/project/wave-5-error-codes.md` (new)
 - Tests: existing `error_code_rule_file_crossref.rs` + `error_code_tag_guard.rs` cover all 4 automatically
