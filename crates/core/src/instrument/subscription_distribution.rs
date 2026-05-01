@@ -83,6 +83,8 @@ pub struct DistributedSubscription {
 /// security_id ASC — the sort key is what makes the distribution stable
 /// across boots (same input → same output).
 #[must_use]
+// TEST-EXEMPT: exhaustively covered by 7 named tests
+// (test_distribution_*, test_same_security_id_*, test_per_connection_*).
 pub fn distribute_main_feed_subscriptions(
     instruments: &[(u32, ExchangeSegment)],
 ) -> Vec<DistributedSubscription> {
