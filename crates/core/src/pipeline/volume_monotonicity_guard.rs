@@ -149,6 +149,7 @@ impl VolumeMonotonicityGuard {
     /// Resets the breach counter. Used by the periodic exporter that
     /// reads the value into a Prom counter (the counter has its own
     /// monotonic semantics — this struct is the in-memory mirror).
+    // TEST-EXEMPT: covered by `test_clear_resets_per_instrument_state_but_preserves_breach_history` which exercises the call.
     pub fn reset_breach_count(&mut self) {
         self.breach_count = 0;
     }
@@ -156,6 +157,7 @@ impl VolumeMonotonicityGuard {
     /// Number of (security_id, segment) pairs currently tracked. Useful
     /// for sanity checks (should match the subscribed universe size).
     #[must_use]
+    // TEST-EXEMPT: covered by `test_first_tick_sets_baseline_no_breach` and `test_segment_isolation_per_i_p1_11` which assert tracked_count.
     pub fn tracked_count(&self) -> usize {
         self.last_seen.len()
     }
