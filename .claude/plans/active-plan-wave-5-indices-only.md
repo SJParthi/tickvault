@@ -18,8 +18,8 @@ No literal "never disconnect" / "never fail" claims. TCP, kernel, remote process
 |---|---|---|
 | F&O subscription scope | 216 stocks ATM±25 + 3 indices full chain (~24,324) | NIFTY+BANKNIFTY+SENSEX all expiries/all strikes only (~10,783 F&O + 206 cash + 29 IDX_I = **11,018**) |
 | Main-feed connections | 5 conns @ 97% cap, segment-bucket | 5 conns @ 44% cap, **category-balanced round-robin** (deterministic by security_id) |
-| Depth-20 connections | 4 (NIFTY+BANKNIFTY mixed CE+PE), 98 instruments, ATM±24 | **5 conns: 4 single-side index + 1 top-50 volume-gainers**, 246 instruments |
-| Depth-200 connections | 4 static (NIFTY/BANKNIFTY ATM CE/PE) | **5 dynamic top-5 volume-gainers** (1 per conn), 60s rebalance |
+| Depth-20 connections | 4 (NIFTY+BANKNIFTY mixed CE+PE), 98 instruments, ATM±24 | **5 conns: 4 single-side index + 1 top-50 from top-volume bucket sorted by `change_pct` DESC, SENSEX-skipped**, 246 instruments |
+| Depth-200 connections | 4 static (NIFTY/BANKNIFTY ATM CE/PE) | **5 dynamic top-5 from top-volume bucket sorted by `change_pct` DESC, SENSEX-skipped** (1 per conn), 60s rebalance |
 | Tokio worker affinity | 4 floating workers across 4 vCPUs | **4 workers pinned to dedicated cores** (0=WS, 1=pipeline, 2=ILP, 3=other) |
 | candle_aggregator key | `HashMap<u32, _>` keyed on security_id alone | `HashMap<(u32, ExchangeSegment), _>` (I-P1-11) |
 | tick_persistence flush failure | `warn!` (no Telegram) | `error!` (Loki → Telegram) per audit Rule 5 |
@@ -44,10 +44,10 @@ Equal-split per conn: 11,018 ÷ 5 = **2,204** (44% of Dhan's 5K/conn cap → 2.3
 | 2 | NIFTY current expiry | PE only | ATM ±24 | 49 | depth_strike_selector |
 | 3 | BANKNIFTY current expiry | CE only | ATM ±24 | 49 | depth_strike_selector |
 | 4 | BANKNIFTY current expiry | PE only | ATM ±24 | 49 | depth_strike_selector |
-| 5 | Top 50 volume-gainers | mixed | dynamic 60s | 50 | option_movers (volume DESC, change_pct > 0) |
+| 5 | Top 50 from top-volume bucket, sorted by `change_pct` DESC, SENSEX-skipped | mixed | dynamic 60s | 50 | option_movers (see Selector SQL below) |
 | **Total** | | | | **246** | |
 
-**SENSEX excluded from depth** — Dhan rule 13 (`full-market-depth.md`): "Only NSE segments valid. NSE_EQ and NSE_FNO only. BSE, MCX, Currency are NOT available."
+**SENSEX excluded from depth** — Dhan rule 13 (`full-market-depth.md`): "Only NSE segments valid. NSE_EQ and NSE_FNO only. BSE, MCX, Currency are NOT available." Selector skips any `exchange_segment = 'BSE_FNO'` row and takes next-eligible.
 
 ±24 locked (not ±25): Dhan caps 50 instruments per depth conn; ±25 = 51 → rejected.
 
@@ -55,13 +55,40 @@ Equal-split per conn: 11,018 ÷ 5 = **2,204** (44% of Dhan's 5K/conn cap → 2.3
 
 | Conn | Instrument | Source |
 |---:|---|---|
-| 1 | Top volume-gainer #1 | option_movers (volume DESC, change_pct > 0) |
-| 2 | Top volume-gainer #2 | dynamic 60s rebalance |
-| 3 | Top volume-gainer #3 | dynamic 60s rebalance |
-| 4 | Top volume-gainer #4 | dynamic 60s rebalance |
-| 5 | Top volume-gainer #5 | dynamic 60s rebalance |
+| 1 | Top-volume + top `change_pct` #1 (NSE_FNO only) | option_movers (see Selector SQL below) |
+| 2 | Top-volume + top `change_pct` #2 (NSE_FNO only) | dynamic 60s rebalance |
+| 3 | Top-volume + top `change_pct` #3 (NSE_FNO only) | dynamic 60s rebalance |
+| 4 | Top-volume + top `change_pct` #4 (NSE_FNO only) | dynamic 60s rebalance |
+| 5 | Top-volume + top `change_pct` #5 (NSE_FNO only) | dynamic 60s rebalance |
 
 Replaces static NIFTY ATM CE / NIFTY ATM PE / BANKNIFTY ATM CE / BANKNIFTY ATM PE.
+
+## Selector SQL (depth-20 conn 5 + depth-200 conns 1-5)
+
+The operator's literal: "always pick top volume section dude in that we need to sort by percentage bro i mean top percentage starting bro meanwhile see if it has sensex then we need to skip that and move onto the next one."
+
+Mechanical interpretation:
+
+1. Restrict to the **top-volume bucket** in `option_movers` (rows where `category = 'TOP_VOLUME'` — existing categorization in the movers writer).
+2. Within that bucket, **sort by `change_pct` DESC** (highest gainers first).
+3. **Exclude** any row where `exchange_segment = 'BSE_FNO'` (SENSEX). When a SENSEX row would have placed in the top-N, it is skipped and the next-eligible row takes its slot.
+4. Final cut: `LIMIT 50` for depth-20 conn 5; `LIMIT 5` for depth-200 conns 1-5.
+5. **Idempotent on rank churn:** unchanged set → no swap. Edge-triggered `Swap20` / `Swap200` only on rank-set change (set diff, not order diff).
+
+```sql
+-- depth-20 conn 5 (LIMIT 50); depth-200 conns 1-5 (LIMIT 5)
+SELECT security_id, exchange_segment, underlying_symbol, change_pct, volume
+FROM option_movers
+WHERE category = 'TOP_VOLUME'
+  AND exchange_segment <> 'BSE_FNO'   -- skip SENSEX (Dhan depth NSE-only)
+  AND change_pct > 0                  -- gainers only
+  AND volume > 0                      -- defensive — Open Question 1 default Yes
+  AND ts > now() - 5m                 -- freshness window (movers writer cadence is 5s; 5m gives 60 snapshots tolerance)
+ORDER BY change_pct DESC, volume DESC -- tie-break by volume to stay deterministic
+LIMIT 50;                             -- LIMIT 5 for depth-200
+```
+
+If the result has < 50 (depth-20) or < 5 (depth-200), emit `DEPTH-20-DYN-03` / `DEPTH-200-DYN-01` (`Severity::High`) with `returned_count` and reason. Surviving conns keep last good set; we do NOT subscribe a degraded set.
 
 ## CPU Pinning (c7i.xlarge, 4 vCPU / 8 GB)
 
@@ -71,6 +98,43 @@ Replaces static NIFTY ATM CE / NIFTY ATM PE / BANKNIFTY ATM CE / BANKNIFTY ATM P
 | 1 | Pipeline (tick_processor SPSC + candle aggregator + indicators) | 21-timeframe candle work |
 | 2 | QuestDB ILP writer + rescue ring drain | Must drain ≥10K tps |
 | 3 | API server, observability, auth, OMS, depth feeds, audit writers | Best-effort, degradation here doesn't block ticks |
+
+## Resilience Envelope — How Each Operator Demand is Mechanically Backed
+
+The operator's literal demands (zero ticks lost, never disconnect, never slow/locked/hanged, QuestDB never fails, O(1) latency, dedup uniqueness, real-time proof) are restated below with the **honest engineering guarantee** + **mechanical proof artefact** that fails the build on regression. No literal "never" without an envelope qualifier.
+
+| Operator demand | Honest guarantee (envelope) | Mechanical proof artefact | Real-time check |
+|---|---|---|---|
+| Zero ticks lost | Bounded zero loss inside chaos-test envelope: rescue ring (600K) → spill file → DLQ NDJSON. Absorbs ≤60s QuestDB outage @ 10K tps. Beyond envelope, DLQ catches every payload as recoverable text. | `chaos_questdb_docker_pause.rs`, `chaos_rescue_ring_overflow.rs`, `chaos_zero_tick_loss.rs`, `resilience_sla_alert_guard.rs` | `tv_tick_dropped_total` Prom counter (= 0); `tv_questdb_disconnected_seconds > 30` alert |
+| WebSocket never disconnects | DETECT ≤5s via pool watchdog; RECONNECT with `SubscribeRxGuard` preserving subs; SLEEP-UNTIL-OPEN post-close (Wave-2 WS-GAP-04); pool supervisor respawns dead tasks within 5s (WS-GAP-05). TCP failures cannot be prevented. | `test_subscribe_rx_guard_reinstalls_on_drop`, `test_subscribe_rx_guard_survives_many_cycles`, `test_pool_watchdog_task_accepts_health_status`, `respawn_dead_connections_loop` | `tv_websocket_connections_active` gauge (expect=5); `tv_ws_pool_respawn_total` rate; `WebSocketDisconnected` (in-market) / `WebSocketDisconnectedOffHours` (post-close) Telegram |
+| Never slow/locked/hanged | Hot path DHAT-tested ≤4 alloc blocks / 8 KB across 10K calls; Criterion p99 ≤100ns enqueue; tick-gap >30s fires Telegram (60s coalesced); core_affinity pins 4 Tokio workers to dedicated cores (Item 6). | `quality/benchmark-budgets.toml` (5% regression block), `dhat_tick_parser.rs`, `dhat_tick_processor.rs`, `tick_gap_detector.rs`, `test_core_affinity_actually_pinned_via_proc_status` | `tv_tick_processing_duration_ns` histogram p99; `tv_tick_gaps_summary_count` |
+| QuestDB never fails | ABSORB via 3-tier rescue→spill→DLQ. Remote process failures cannot be prevented; we DETECT + ABSORB + ALERT. Schema self-heal at boot (`ALTER TABLE ADD COLUMN IF NOT EXISTS`). | `wait_for_questdb_ready` (BOOT-01/02), `tick_persistence rescue ring`, `chaos_questdb_docker_pause.rs`, `chaos_valkey_kill.rs` | `tv_questdb_disconnected_seconds`, `tv_rescue_ring_used_capacity`, `tv_spill_file_size_bytes`, BOOT-01/02 alerts |
+| O(1) latency on hot path | Bounded constant-time ops: `from_le_bytes` parsing (no loops), `papaya` concurrent map for shared state, `Arc<HashMap>` immutable registry, SPSC 65K bounded channel. Bench-gate fails build on >5% regression. | `bench tick_binary_parse ≤10ns`, `bench papaya_lookup ≤50ns`, `bench oms_state_transition ≤100ns`, `quality/benchmark-budgets.toml` | `tv_tick_pipeline_routing_duration_ns` histogram |
+| Uniqueness + dedup | Composite `(security_id, exchange_segment)` per I-P1-11 enforced everywhere. DEDUP UPSERT KEYS on every storage table; meta-guard scans every constant. | `dedup_segment_meta_guard.rs`, `subscription_planner regression tests`, `instrument_registry by_composite`, banned-pattern category 5 | `tv_instrument_registry_cross_segment_collisions` gauge |
+| Real-time proof | 7-layer telemetry per new code path: typed event + ErrorCode + tracing+code + Prom counter + Grafana panel + alert rule + audit table. SLO-01/SLO-02 composite score @ 10s cadence. Market-open self-test @ 09:16:30 IST (SELFTEST-01/02). | `error_code_tag_guard.rs`, `error_code_rule_file_crossref.rs`, `operator_health_dashboard_guard.rs`, `resilience_sla_alert_guard.rs`, `slo_score.rs` | `mcp__tickvault-logs__run_doctor`, SLO-01/02 Telegram, MarketOpenStreamingConfirmation @ 09:15:30 |
+
+## Dhan Ping/Pong + O(1) Inside Each WS Read Loop
+
+Operator's emphasis: "respect dhan server ping pong" + "achieve O(1) latency inside every connection of its websockets."
+
+| Concern | Mechanical handling | Why it stays O(1) per packet |
+|---|---|---|
+| Server ping every 10s, timeout 40s | Library-handled by `tokio-tungstenite` 0.29.0 — the `Ping` frame is auto-replied with `Pong` by the underlying `WebSocketStream`. We never write manual ping frames (banned pattern in `live-market-feed.md` rule 16). | Ping/pong is on the I/O thread, no allocation, no parsing |
+| Frame parsing | 8-byte header + fixed-offset `from_le_bytes` per packet type (16 / 50 / 162 bytes). No loops, no allocation. Parsed into `ParsedTick` stack struct. | Constant-time per packet regardless of subscription count |
+| Tick fan-out | SPSC 65,536-buffer `tokio::sync::mpsc` — `try_send` returns `Full` instead of awaiting. Hot path emits `tv_tick_dropped_total` and the rescue ring drains. | `try_send` is O(1); the channel is bounded so it never grows |
+| Subscribe/unsubscribe commands | `SubscribeRxGuard` reinstalls receiver on every read-loop exit; resubscribe replays the static plan from the in-memory `Arc<Vec<SubscriptionMessage>>`. | No DB lookup, no recompute — pre-computed at boot |
+| Activity watchdog | 5s pool watchdog tick; per-conn last-message timestamp updated atomically (`AtomicU64`). | Single atomic load per conn per 5s — O(1) per check |
+| Audit row write | `WsReconnectAuditWriter` ILP append on every reconnect; failure routes to STORAGE-GAP-03/AUDIT-03. | ILP append is non-blocking; rescue ring absorbs flushes |
+| Order-update activity | 14400s (4h) watchdog (NOT 1800s — Dhan order-update goes silent on idle accounts; 1800 caused false reconnects). | Same pool watchdog tick |
+
+**What we never do on the read loop:**
+- No `clone()` (banned by hot-path scanner)
+- No `Vec::new()` / `format!()` / `.collect()` (banned)
+- No DB lookups (registry is `Arc<HashMap>`)
+- No mutex acquisition (`papaya` for shared state)
+- No `dyn` dispatch (banned on hot path)
+
+**Honest non-claim:** TCP RST storms, kernel scheduler preemption, and remote-process failures CAN happen. Our envelope is: detect ≤5s, reconnect with subs preserved, audit every event, sleep dormantly post-close. Items 6 (core_affinity) closes the last preemption gap.
 
 ## Plan Items (10)
 
@@ -102,14 +166,14 @@ Each item carries the 9-box checklist per `stream-resilience.md` B8: ① typed e
 
 - Files: `crates/core/src/websocket/depth_connection.rs`, `crates/core/src/instrument/depth_strike_selector.rs`, `crates/core/src/instrument/depth_20_top_gainers.rs` (new), `crates/app/src/main.rs`
 - Tests: `test_depth_20_conn_1_is_nifty_ce_atm_24`, `test_depth_20_conn_2_is_nifty_pe_atm_24`, `test_depth_20_conn_3_is_banknifty_ce_atm_24`, `test_depth_20_conn_4_is_banknifty_pe_atm_24`, `test_depth_20_conn_5_is_top_50_volume_gainers`, `test_depth_20_total_under_dhan_50_per_conn_cap`, `test_depth_20_excludes_sensex`
-- Top-50 selector queries `option_movers` every 60s: `SELECT security_id FROM option_movers WHERE change_pct > 0 ORDER BY volume DESC LIMIT 50`. Edge-triggered swap via existing `DepthCommand::Swap20`.
+- Top-50 selector queries `option_movers` every 60s. SQL is the canonical "Selector SQL" block above (top-volume bucket → sort by `change_pct` DESC → SENSEX-skipped → LIMIT 50). Edge-triggered swap via existing `DepthCommand::Swap20` only when the set diff is non-empty (rank-set churn, not order churn).
 - 9-box: ① `Depth20TopSetEmpty` (existing DEPTH-DYN-01 reused — fires when result < 50) + new `Depth20TopGainersSwapped` (Severity::Low, edge-triggered on rank change) ② `DEPTH-20-DYN-03` (top-50 selector empty/below capacity, severity High) ③ `error!(code = ErrorCode::Depth20Dyn03TopGainersEmpty.code_str())` ④ `tv_depth_20_top_gainers_set_size` gauge, `tv_depth_20_top_gainers_swaps_total` counter ⑤ Operator Health "Depth-20 top-50 gainers" panel ⑥ `tv-depth-20-dyn-03-empty-set` (gauge < 25 for > 5min during market hours) ⑦ `main.rs::run_depth_20_top_gainers_loop` ⑧ `.claude/triage/error-rules.yaml::depth-20-dyn-03-top-set-empty-escalate` ⑨ all 7 ratchet tests above + `test_top_50_query_filters_change_pct_positive`
 
 ### - [ ] 5. Depth-200 dynamic top-5 (replaces static ATM CE/PE)
 
 - Files: `crates/core/src/websocket/depth_connection.rs`, `crates/core/src/instrument/depth_200_top_gainers.rs` (new), `crates/app/src/main.rs`
 - Tests: `test_depth_200_picks_top_5_by_volume`, `test_depth_200_filters_change_pct_positive`, `test_depth_200_one_instrument_per_conn`, `test_depth_200_swap_on_rank_change`, `test_depth_200_excludes_sensex`
-- Replaces existing static `["NIFTY", "BANKNIFTY"]` ATM CE/PE config in `main.rs:2151,3113,3685`. Uses existing `DepthCommand::Swap200` path. 60s rebalance from `option_movers`.
+- Replaces existing static `["NIFTY", "BANKNIFTY"]` ATM CE/PE config in `main.rs:2151,3113,3685`. Uses existing `DepthCommand::Swap200` path. 60s rebalance from `option_movers` using the canonical "Selector SQL" block above (top-volume bucket → sort by `change_pct` DESC → SENSEX-skipped → LIMIT 5). Edge-triggered swap on rank-set churn only.
 - 9-box: ① new `Depth200TopGainersSwapped` (Severity::Low, edge-triggered) + reuse `Depth200SwapChannelBroken` (existing DEPTH-DYN-02) ② `DEPTH-200-DYN-01` (top-5 selector returned < 5, severity High) ③ `error!(code = ErrorCode::Depth200Dyn01TopSetEmpty.code_str())` ④ `tv_depth_200_top_gainers_set_size`, `tv_depth_200_top_gainers_swaps_total` ⑤ Operator Health "Depth-200 top-5" panel ⑥ `tv-depth-200-dyn-01-empty-set` ⑦ `main.rs::run_depth_200_top_gainers_loop` ⑧ `.claude/triage/error-rules.yaml::depth-200-dyn-01-top-set-empty-escalate` ⑨ all 5 tests above
 
 ### - [ ] 6. Wire `core_affinity` — pin 4 Tokio workers to 4 vCPUs
@@ -171,8 +235,10 @@ cargo test --features dhat             # zero hot-path allocations
 | # | Scenario | Expected |
 |---|----------|----------|
 | 1 | Boot at 09:00 IST with `subscription.scope = "indices_only_all_expiries"` | Universe loads 11,018; 5 main-feed conns at ~2,204 each; depth-20 wires 5 conns (4 NIFTY/BANKNIFTY single-side + 1 top-50); depth-200 wires 5 conns to top-5 gainers; 4 Tokio workers pinned to cores 0-3 |
-| 2 | option_movers returns < 50 for top-50 query during market hours | DEPTH-20-DYN-03 fires `Severity::High` Telegram with `returned_count` + reason; surviving conn 5 keeps last good set |
-| 3 | option_movers returns < 5 for top-5 query during market hours | DEPTH-200-DYN-01 fires `Severity::High`; surviving 5 conns keep last good gainers |
+| 2 | option_movers TOP_VOLUME bucket sorted by change_pct DESC returns < 50 after SENSEX-skip during market hours | DEPTH-20-DYN-03 fires `Severity::High` Telegram with `returned_count` + reason (`empty_after_sensex_skip` / `bucket_below_capacity`); surviving conn 5 keeps last good set |
+| 3 | option_movers TOP_VOLUME bucket sorted by change_pct DESC returns < 5 after SENSEX-skip during market hours | DEPTH-200-DYN-01 fires `Severity::High`; surviving 5 conns keep last good gainers |
+| 11 | SENSEX (BSE_FNO) appears in top-volume + top change_pct rank | Selector skips, takes next-eligible NSE_FNO row; no Telegram (normal behavior) |
+| 12 | TOP_VOLUME bucket has rank churn but final set unchanged after sort + SENSEX-skip | No Swap command issued (idempotent on set, not order); zero unnecessary disconnects |
 | 4 | core_affinity::set_for_current returns false on one worker | CORE-PIN-01 fires `Severity::High`; gauge `tv_core_pinning_workers_pinned_total < 4` |
 | 5 | candle_aggregator receives tick with security_id=27 from IDX_I + tick with security_id=27 from NSE_EQ | OHLCV state stays in two distinct keys; regression test pinned |
 | 6 | tick_persistence flush fails | `error!` (not `warn!`) emitted with `code = "STORAGE-GAP-03"`; Loki routes to Telegram via Alertmanager |
@@ -185,7 +251,7 @@ cargo test --features dhat             # zero hot-path allocations
 
 | # | Question | Default if unanswered |
 |---|---|---|
-| 1 | Top-50 / Top-5 query — current implementation in `option_movers` already filters `change_pct > 0`. Should we ALSO require `volume > 0` to avoid zero-volume contracts entering the set? | Yes (volume DESC implies, but explicit guard is safer) |
+| 1 | ~~Top-50 / Top-5 query — should we ALSO require `volume > 0`?~~ **ANSWERED 2026-05-01:** Selector restricted to `category = 'TOP_VOLUME'` bucket, then sorted by `change_pct` DESC, SENSEX (BSE_FNO) skipped. `volume > 0` defensive guard included. Canonical SQL pinned in "Selector SQL" section above. | (resolved) |
 | 2 | If on-day-1-boot the `option_movers` table is empty (e.g., first 60s after universe build), should depth-20 conn 5 + depth-200 5 conns: (a) skip subscribe and wait, or (b) fall back to NIFTY/BANKNIFTY ATM as today? | (a) skip + retry every 60s; INFO Telegram once |
 | 3 | core_affinity on dev Mac (typically 8-12 cores) vs AWS c7i.xlarge (4 vCPUs) — do we hard-fail boot on Mac if `vcpu_count != 4`? | No, pin to first 4; Mac is dev-only |
 
