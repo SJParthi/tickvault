@@ -102,14 +102,39 @@ pub fn movers_unified_1s_create_ddl() -> String {
     )
 }
 
-/// Materialized-view DDL for one timeframe. Pattern matches the plan's
-/// canonical SAMPLE BY example. Uses `last()` for cumulative metrics
-/// (`last_price`, `volume`, `open_interest`, `prev_close`) and
-/// `last - first` for `oi_delta` per the plan's correctness rationale.
+/// Materialized-view DDL for one timeframe. **Item 27 schema** —
+/// supersedes Item 25's simpler version. Adds explicit bucket-vs-snapshot
+/// columns so the read path can distinguish session-cumulative from
+/// per-bucket-incremental metrics.
 ///
-/// `change_pct` is recomputed at view level from `last_price` /
-/// `last_prev_close` so per-bucket rounding stays consistent with the
-/// base — NOT carried forward from per-second values.
+/// **Snapshot columns** (cumulative since session open, last-tick semantics):
+/// - `last_price` — close-tick price for this bucket
+/// - `open_interest` — OI at bucket close
+/// - `volume_cumulative` — cumulative session volume at bucket close
+/// - `prev_close` — previous-day close (per-instrument constant during session)
+///
+/// **Bucket-incremental columns** (work via cumulative monotonicity per
+/// Item 26 L1 — `volume` is monotonic non-decreasing within a session,
+/// so `last - first` recovers per-bucket increment):
+/// - `volume_bucket` — `last(volume) - first(volume)` (volume traded
+///   within this bucket only)
+/// - `oi_delta_bucket` — `last(oi) - first(oi)` (signed: gainer +, loser −)
+///
+/// **Bucket OHLC** (intra-bucket price action):
+/// - `open_price_bucket = first(last_price)` — first tick price
+/// - `high_price_bucket = max(last_price)` — high within bucket
+/// - `low_price_bucket  = min(last_price)` — low within bucket
+/// - close = `last_price` (snapshot column above; aliased)
+///
+/// **Two change_pct flavours** (CASE-WHEN guards prev_close > 0 to
+/// avoid divide-by-zero on freshly-listed contracts):
+/// - `change_pct_session` — session-vs-prev-day (display dashboard)
+/// - `change_pct_bucket` — bucket-vs-bucket-open (intraday momentum)
+///
+/// **BANNED aggregations** — SUM-of-volume / SUM-of-open-interest. Volume
+/// + OI are cumulative per Item 26 L1; summing across buckets
+/// double/triple-counts. Source-scan ratchet
+/// `test_movers_unified_ddl_no_sum_volume_anywhere` enforces.
 #[must_use]
 pub fn movers_unified_view_ddl(timeframe: &str) -> String {
     format!(
@@ -119,13 +144,24 @@ pub fn movers_unified_view_ddl(timeframe: &str) -> String {
             segment, \
             ts, \
             last(last_price) AS last_price, \
-            last(volume) AS volume, \
             last(open_interest) AS open_interest, \
-            last(open_interest) - first(open_interest) AS oi_delta, \
+            last(volume) AS volume_cumulative, \
             last(prev_close) AS prev_close, \
-            ((last(last_price) - last(prev_close)) / last(prev_close)) * 100 AS change_pct \
+            last(volume) - first(volume) AS volume_bucket, \
+            last(open_interest) - first(open_interest) AS oi_delta_bucket, \
+            first(last_price) AS open_price_bucket, \
+            max(last_price) AS high_price_bucket, \
+            min(last_price) AS low_price_bucket, \
+            CASE WHEN last(prev_close) > 0 \
+                 THEN ((last(last_price) - last(prev_close)) / last(prev_close)) * 100 \
+                 ELSE 0 \
+            END AS change_pct_session, \
+            CASE WHEN first(last_price) > 0 \
+                 THEN ((last(last_price) - first(last_price)) / first(last_price)) * 100 \
+                 ELSE 0 \
+            END AS change_pct_bucket \
          FROM {QUESTDB_TABLE_MOVERS_UNIFIED_1S} \
-         SAMPLE BY {timeframe};"
+         SAMPLE BY {timeframe} ALIGN TO CALENDAR WITH OFFSET '00:00';"
     )
 }
 
@@ -308,41 +344,112 @@ mod tests {
     }
 
     #[test]
-    fn test_view_ddl_oi_delta_uses_last_minus_first() {
-        // Plan correctness rationale: oi_delta = last - first per bucket
-        // (not sum) so cross-bucket math stays meaningful.
+    fn test_movers_unified_oi_delta_via_last_minus_first() {
+        // Plan Item 27: oi_delta_bucket = last - first (signed).
         let sql = movers_unified_view_ddl("5m");
         assert!(
-            sql.contains("last(open_interest) - first(open_interest) AS oi_delta"),
-            "oi_delta must be `last - first`, got: {sql}"
+            sql.contains("last(open_interest) - first(open_interest) AS oi_delta_bucket"),
+            "oi_delta_bucket must be `last - first`, got: {sql}"
         );
     }
 
     #[test]
-    fn test_view_ddl_change_pct_recomputed_per_bucket() {
-        // Plan correctness rationale: change_pct recomputed at view
-        // level from last_price / last_prev_close — NOT carried forward.
+    fn test_movers_unified_volume_bucket_via_last_minus_first() {
+        // Plan Item 27: volume_bucket via cumulative monotonicity recovery
+        // (Item 26 L1 invariant: volume is monotonic non-decreasing).
+        let sql = movers_unified_view_ddl("5m");
+        assert!(
+            sql.contains("last(volume) - first(volume) AS volume_bucket"),
+            "volume_bucket must be `last - first`, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_movers_unified_change_pct_uses_case_when_prev_close_positive() {
+        // Plan Item 27: CASE WHEN guard prevents div-by-zero on
+        // freshly-listed contracts (prev_close = 0).
         let sql = movers_unified_view_ddl("1h");
         assert!(
-            sql.contains(
-                "((last(last_price) - last(prev_close)) / last(prev_close)) * 100 AS change_pct"
-            ),
-            "change_pct formula mismatch, got: {sql}"
+            sql.contains("CASE WHEN last(prev_close) > 0"),
+            "change_pct_session must guard prev_close > 0, got: {sql}"
+        );
+        assert!(
+            sql.contains("CASE WHEN first(last_price) > 0"),
+            "change_pct_bucket must guard first(last_price) > 0, got: {sql}"
+        );
+        assert!(sql.contains("AS change_pct_session"));
+        assert!(sql.contains("AS change_pct_bucket"));
+    }
+
+    #[test]
+    fn test_movers_unified_all_24_views_have_align_to_calendar_with_offset() {
+        // Plan Item 27: every view uses ALIGN TO CALENDAR WITH OFFSET '00:00'
+        // so buckets align to IST midnight (consistent with candle views).
+        for tf in MOVERS_UNIFIED_VIEW_TIMEFRAMES {
+            let sql = movers_unified_view_ddl(tf);
+            assert!(
+                sql.contains("ALIGN TO CALENDAR WITH OFFSET '00:00'"),
+                "tf {tf} missing ALIGN TO CALENDAR offset"
+            );
+        }
+    }
+
+    #[test]
+    fn test_movers_unified_includes_bucket_ohlc_columns() {
+        // Plan Item 27: explicit per-bucket OHLC for intraday momentum displays.
+        let sql = movers_unified_view_ddl("5m");
+        assert!(sql.contains("first(last_price) AS open_price_bucket"));
+        assert!(sql.contains("max(last_price) AS high_price_bucket"));
+        assert!(sql.contains("min(last_price) AS low_price_bucket"));
+    }
+
+    #[test]
+    fn test_movers_unified_volume_cumulative_uses_last() {
+        // Snapshot column: cumulative session volume at bucket close.
+        let sql = movers_unified_view_ddl("5m");
+        assert!(
+            sql.contains("last(volume) AS volume_cumulative"),
+            "volume_cumulative must use last() of the cumulative base"
         );
     }
 
     #[test]
-    fn test_view_ddl_aggregates_volume_via_last_not_sum() {
-        // Volume is cumulative-since-session-open per Item 26 L1; per-bucket
-        // value = LAST tick in that bucket. NOT sum (would 60×-overcount).
-        let sql = movers_unified_view_ddl("5m");
+    fn test_movers_unified_ddl_no_sum_volume_anywhere() {
+        // Plan Item 27: BANNED — sum(volume) cascade-bug regression guard.
+        // Volume is cumulative per Item 26 L1; summing across buckets
+        // double/triple-counts. This is Item 28's exact failure mode.
+        for tf in MOVERS_UNIFIED_VIEW_TIMEFRAMES {
+            let sql = movers_unified_view_ddl(tf);
+            assert!(
+                !sql.contains("sum(volume)"),
+                "tf {tf}: BANNED `sum(volume)` appeared — Item 28 cascade-bug regression: {sql}"
+            );
+            assert!(
+                !sql.contains("sum(open_interest)"),
+                "tf {tf}: BANNED `sum(open_interest)` appeared — same class of bug as sum(volume)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_movers_unified_ddl_no_sum_volume_source_scan() {
+        // Source-scan ratchet: scans THIS file for any `sum(volume)` /
+        // `sum(open_interest)` strings outside the test module. Catches
+        // future edits that might bypass the per-tf DDL test above by
+        // adding `sum()` directly inside `movers_unified_view_ddl`.
+        let src = include_str!("movers_unified_persistence.rs");
+        // Cut at the start of the `mod tests` block — production source only.
+        let prod_src = src
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .map(|(p, _)| p)
+            .unwrap_or(src);
         assert!(
-            sql.contains("last(volume) AS volume"),
-            "volume must use last(), not sum() — Item 28 cascade-bug fix; got: {sql}"
+            !prod_src.contains("sum(volume)"),
+            "BANNED `sum(volume)` found in production source"
         );
         assert!(
-            !sql.contains("sum(volume)"),
-            "volume MUST NOT be sum() — that's Item 28's regression"
+            !prod_src.contains("sum(open_interest)"),
+            "BANNED `sum(open_interest)` found in production source"
         );
     }
 
