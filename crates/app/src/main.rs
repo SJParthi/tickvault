@@ -1949,6 +1949,12 @@ async fn main() -> Result<()> {
         // stream-resilience.md B10. The 22 ILP writers (one per
         // timeframe) come up after this DDL fan-out completes.
         tickvault_storage::movers_22tf_persistence::ensure_movers_22tf_tables(&config.questdb),
+        // Wave 5 Item 25 + 27 — single base table + 24 materialized views.
+        // Idempotent CREATE-IF-NOT-EXISTS; safe to call alongside the
+        // legacy 22tf table DDL until the writer-task switch lands.
+        tickvault_storage::movers_unified_persistence::ensure_movers_unified_tables_and_views(
+            &config.questdb,
+        ),
         tickvault_storage::indicator_snapshot_persistence::ensure_indicator_snapshot_table(
             &config.questdb
         ),
@@ -2620,6 +2626,18 @@ async fn main() -> Result<()> {
         movers_v2_snapshot_handle = movers_v2_handles
             .as_ref()
             .map(|h| std::sync::Arc::clone(&h.snapshot_handle));
+
+        // Wave 5 Item 25/27 Phase B — base-1s writer for `movers_unified_1s`.
+        // ONE task. Subscribes to tick_broadcast, drains in-memory state at
+        // 1Hz, ILP-appends to the base table; QuestDB auto-refreshes the 24
+        // mat views. Market-hours gated.
+        let movers_unified_shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+        let _movers_unified_handle =
+            tickvault_app::movers_unified_pipeline::spawn_movers_unified_pipeline(
+                config.questdb.clone(),
+                tick_broadcast_sender.clone(),
+                std::sync::Arc::clone(&movers_unified_shutdown),
+            );
 
         // Parthiban directive (2026-04-21): no-tick-during-market-hours
         // watchdog (slow boot path). Same pattern as fast boot above.
