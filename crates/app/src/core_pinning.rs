@@ -84,6 +84,9 @@ pub const MINIMUM_CORE_COUNT: usize = 4;
 /// counter and returns `Err(_)`. On success the same counter is bumped
 /// with `outcome="ok"`. Either way the function NEVER panics — the
 /// caller decides whether a failed pin is fatal (today: warn + continue).
+// TEST-EXEMPT: depends on host CPU topology + kernel cgroup policy; covered
+// by the host-too-small + role-mapping ratchets above plus runtime emission
+// of `tv_core_pinning_workers_pinned_total`.
 pub fn pin_current_thread_for(role: WorkerRole) -> Result<()> {
     let cores = core_affinity::get_core_ids().unwrap_or_default();
     let n = cores.len();
@@ -152,6 +155,8 @@ pub fn pin_current_thread_for(role: WorkerRole) -> Result<()> {
 /// Best-effort one-shot pin of the calling (main) thread to
 /// `WorkerRole::Other`. Used at boot so the main thread doesn't share
 /// Core 0 with the WS read loop.
+// TEST-EXEMPT: thin wrapper around `pin_current_thread_for(Other)`; the
+// wrapped function is itself TEST-EXEMPT for the same reasons.
 pub fn pin_main_thread() {
     if let Err(err) = pin_current_thread_for(WorkerRole::Other) {
         warn!(
