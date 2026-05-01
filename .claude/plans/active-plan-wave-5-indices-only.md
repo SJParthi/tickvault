@@ -1287,7 +1287,7 @@ LIMIT 50;                             -- depth-200 takes first 5 of these (share
 
 **Mac dev workflow note:** Devs running on M4 Pro will see only 4 of 14 cores utilized — this is BY DESIGN for parity. To temporarily disable for non-parity work, set `TICKVAULT_ALLOW_SUB_4_VCPU=1` (per CORE-PIN-03 graceful path).
 
-### - [ ] 7. Fix CRITICAL: candle_aggregator segment-aware key (I-P1-11)
+### - [x] 7. Fix CRITICAL: candle_aggregator segment-aware key (I-P1-11)
 
 - Files: `crates/core/src/pipeline/candle_aggregator.rs:12,21` (and any other site)
 - Tests: `test_candle_aggregator_keyed_on_security_id_and_segment`, `test_two_instruments_same_id_different_segment_do_not_merge_ohlcv` (regression for FINNIFTY=27 IDX_I vs NSE_EQ=27 collision)

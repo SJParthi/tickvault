@@ -3814,6 +3814,7 @@ mod tests {
             stock_default_atm_fallback_enabled: false,
             enable_twenty_depth: false,
             twenty_depth_max_instruments: 49,
+            ..SubscriptionConfig::default()
         };
 
         let plan = build_subscription_plan(&universe, &config, today, &HashMap::new(), None);
