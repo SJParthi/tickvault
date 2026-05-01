@@ -1,4 +1,4 @@
-//! Wave 5 Item 25/27 Phase B — base-1s writer pipeline for `movers_unified_1s`.
+//! Wave 5 Item 25/27 Phase B — base-1s writer pipeline for `movers_1s`.
 //!
 //! Single tokio task. Subscribes to the `tick_broadcast` and maintains an
 //! in-memory `HashMap<(security_id, segment_code), MoversUnifiedState>`
@@ -14,10 +14,10 @@
 //! HashMap<(u32, u8), MoversUnifiedState>
 //!   │
 //!   ▼  drain at 1s tick (Tokio interval)
-//! MoversUnifiedWriter::append_row × N + flush
+//! MoversWriter::append_row × N + flush
 //!   │
 //!   ▼
-//! QuestDB ILP → movers_unified_1s
+//! QuestDB ILP → movers_1s
 //!   │
 //!   ▼  (server-side, incremental)
 //! 24 materialized views (5s, 15s, ..., 1d)
@@ -54,12 +54,17 @@ use tickvault_common::constants::{
     TICK_PERSIST_END_SECS_OF_DAY_IST, TICK_PERSIST_START_SECS_OF_DAY_IST,
 };
 use tickvault_common::tick_types::ParsedTick;
-use tickvault_storage::movers_unified_writer::{
-    MoversUnifiedRow, MoversUnifiedWriter, segment_code_to_char,
-};
+use tickvault_storage::movers_unified_writer::{MoversRow, MoversWriter, segment_code_to_char};
 
 /// Drain cadence — 1 second per the plan §"Item 25" base-1s table.
 const DRAIN_INTERVAL_MS: u64 = 1_000;
+
+/// Backoff between ILP-connect attempts when the writer is offline.
+const CONNECT_RETRY_SECS: u64 = 30;
+
+/// Bounded flush deadline used during graceful shutdown to avoid hanging
+/// the boot path on a slow QuestDB ILP send.
+const SHUTDOWN_FLUSH_TIMEOUT_SECS: u64 = 5;
 
 /// In-memory state per (security_id, segment) tracked between ticks.
 /// `prev_oi` is used to compute `oi_delta` at drain time.
@@ -103,24 +108,24 @@ fn now_ist_aligned_to_1s_nanos() -> i64 {
 ///
 /// Behavior:
 /// - Connects to QuestDB ILP at task start; if connect fails, retries
-///   every 30s (the `MoversUnifiedWriter::flush` path also handles
+///   every 30s (the `MoversWriter::flush` path also handles
 ///   reconnect on every failed flush).
 /// - Subscribes to `tick_broadcast` and updates the in-memory state map.
 /// - Every 1s: drains the map → 1 ILP append per entry → flush.
 /// - Outside market hours: skips the drain.
 /// - On `shutdown.notified()`: flushes pending + exits cleanly.
 // TEST-EXEMPT: orchestration spawner; live-tested via `cargo run`. Internal helpers `is_within_market_hours_ist`, `now_ist_aligned_to_1s_nanos`, `MoversUnifiedState::last_traded_price_or_default` are unit-tested below.
-pub fn spawn_movers_unified_pipeline(
+pub fn spawn_movers_pipeline(
     questdb: QuestDbConfig,
     tick_broadcast: broadcast::Sender<ParsedTick>,
     shutdown: Arc<Notify>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        info!("movers_unified_pipeline starting");
+        info!("movers_pipeline starting");
 
         // Connect with retry loop.
-        let mut writer: Option<MoversUnifiedWriter> = None;
-        let mut connect_retry = tokio::time::interval(Duration::from_secs(30));
+        let mut writer: Option<MoversWriter> = None;
+        let mut connect_retry = tokio::time::interval(Duration::from_secs(CONNECT_RETRY_SECS));
         connect_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         let mut tick_rx = tick_broadcast.subscribe();
@@ -136,24 +141,24 @@ pub fn spawn_movers_unified_pipeline(
                 biased;
 
                 _ = shutdown.notified() => {
-                    info!("movers_unified_pipeline shutting down — flushing pending");
+                    info!("movers_pipeline shutting down — flushing pending");
                     if let Some(w) = writer.as_mut() {
-                        w.shutdown_flush(Duration::from_secs(5));
+                        w.shutdown_flush(Duration::from_secs(SHUTDOWN_FLUSH_TIMEOUT_SECS));
                     }
                     break;
                 }
 
                 _ = connect_retry.tick(), if writer.is_none() => {
-                    match MoversUnifiedWriter::connect(&questdb) {
+                    match MoversWriter::connect(&questdb) {
                         Ok(w) => {
-                            info!("movers_unified_pipeline ILP connected");
+                            info!("movers_pipeline ILP connected");
                             writer = Some(w);
                         }
                         Err(err) => {
                             error!(
                                 code = "MOVERS-UNIFIED-01",
                                 ?err,
-                                "movers_unified_pipeline ILP connect failed — retrying in 30s"
+                                "movers_pipeline ILP connect failed — retrying in 30s"
                             );
                         }
                     }
@@ -184,12 +189,12 @@ pub fn spawn_movers_unified_pipeline(
                         }
                         Err(broadcast::error::RecvError::Lagged(skipped)) => {
                             metrics::counter!(
-                                "tv_movers_unified_pipeline_lagged_total"
+                                "tv_movers_pipeline_lagged_total"
                             ).increment(skipped);
-                            warn!(skipped, "movers_unified_pipeline broadcast lagged");
+                            warn!(skipped, "movers_pipeline broadcast lagged");
                         }
                         Err(broadcast::error::RecvError::Closed) => {
-                            info!("movers_unified_pipeline broadcast closed — exiting");
+                            info!("movers_pipeline broadcast closed — exiting");
                             break;
                         }
                     }
@@ -227,7 +232,7 @@ pub fn spawn_movers_unified_pipeline(
                         };
                         let oi_delta = i64::from(st.open_interest)
                             .saturating_sub(i64::from(st.prev_oi_at_last_drain));
-                        let row = MoversUnifiedRow {
+                        let row = MoversRow {
                             ts_nanos,
                             security_id: *security_id,
                             segment_char,
@@ -258,19 +263,19 @@ pub fn spawn_movers_unified_pipeline(
                             code = "MOVERS-UNIFIED-01",
                             written,
                             ?err,
-                            "movers_unified_pipeline flush failed"
+                            "movers_pipeline flush failed"
                         );
                         // Drop the writer; connect_retry will rebuild.
                         writer = None;
                     } else if written > 0 {
-                        metrics::gauge!("tv_movers_unified_universe_size")
+                        metrics::gauge!("tv_movers_universe_size")
                             .set(written as f64);
                     }
                 }
             }
         }
 
-        info!("movers_unified_pipeline exited");
+        info!("movers_pipeline exited");
     })
 }
 

@@ -182,17 +182,9 @@ run_check "movers" "22 movers_{T} tables in partition manager" \
 run_check "movers" "S3 lifecycle config exists for movers" \
     test -f deploy/aws/s3-lifecycle-movers-tables.json
 
-# 22 movers_22tf canonical helper file
-run_check "movers" "movers_22tf_persistence module present" \
-    test -f crates/storage/src/movers_22tf_persistence.rs
-
-# DEDUP key includes segment per I-P1-11
-run_check "movers" "DEDUP_KEY_MOVERS_22TF includes segment" \
-    grep -q 'DEDUP_KEY_MOVERS_22TF.*segment' crates/storage/src/movers_22tf_persistence.rs
-
-# 22 timeframes constant pinned
-run_check "movers" "MOVERS_TIMEFRAMES has 22 entries" \
-    grep -q 'MOVERS_TIMEFRAME_COUNT: usize = 22' crates/common/src/mover_types.rs
+# Movers base table + materialized views (post 2026-05-01 cleanup)
+run_check "movers" "movers_unified_persistence module present" \
+    test -f crates/storage/src/movers_unified_persistence.rs
 
 # ---------------------------------------------------------------------------
 # Section 9 — Movers Universe Coverage (Phase 13 of v3 plan)

@@ -21,7 +21,6 @@ pub mod error_code;
 pub mod instrument_registry;
 pub mod instrument_types;
 pub mod market_hours;
-pub mod mover_types;
 pub mod order_types;
 pub mod sanitize;
 pub mod segment;

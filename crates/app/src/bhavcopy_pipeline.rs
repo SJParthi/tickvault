@@ -53,13 +53,13 @@ use tickvault_core::instrument::bhavcopy_scheduler::{
 };
 use tickvault_core::notification::events::NotificationEvent;
 use tickvault_core::notification::service::NotificationService;
-use tickvault_storage::movers_unified_persistence::QUESTDB_TABLE_MOVERS_UNIFIED_1S;
+use tickvault_storage::movers_unified_persistence::QUESTDB_TABLE_MOVERS_1S;
 use tickvault_storage::volume_nse_audit_persistence::{
     append_volume_nse_audit_row, ensure_volume_nse_audit_table,
 };
 
 /// HTTP timeout for QuestDB EOD volume query — generous since the
-/// SELECT against `movers_unified_1s` filters by 30-min window.
+/// SELECT against `movers_1s` filters by 30-min window.
 const QUESTDB_QUERY_TIMEOUT_SECS: u64 = 30;
 
 /// IST `+05:30` offset for scheduling.
@@ -180,7 +180,7 @@ where
 /// Queries QuestDB for the last(volume) per security_id at 15:30 IST
 /// close on the given trading date.
 ///
-/// Reads from the `movers_unified_1s` base table since that's the
+/// Reads from the `movers_1s` base table since that's the
 /// canonical Wave 5 source carrying `volume_cumulative` at 1s
 /// granularity. Falls back to nothing on table-empty (caller treats
 /// as `MISSING_OUR` for every NSE row).
@@ -196,7 +196,7 @@ async fn query_dhan_eod_volumes(
     // Use `latest on` which QuestDB optimises to one row per (security_id).
     let sql = format!(
         "SELECT security_id, last(volume) AS volume \
-         FROM {QUESTDB_TABLE_MOVERS_UNIFIED_1S} \
+         FROM {QUESTDB_TABLE_MOVERS_1S} \
          WHERE ts BETWEEN '{trading_date_ist}T15:00:00.000000Z' \
                        AND '{trading_date_ist}T15:30:00.000000Z' \
            AND segment = 'D' \
