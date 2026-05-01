@@ -2071,7 +2071,21 @@ Two correct paths:
 
 ### Plan integration (separate from Wave 5 movers)
 
-- [ ] **Item 28. Fix candles cascade volume bug (Path X)**
+- [x] **Item 28. Fix candles cascade volume bug (Path X)** — **SHIPPED via PR #415 (merged 2026-05-01)**
+
+**Implementation summary** (from PR #415 commit `b85b7ee` on main):
+- `LiveCandle.volume` semantic flipped from cumulative-snapshot to incremental-within-bucket
+- New `LiveCandle.bucket_start_cumulative: u32` field (set ONCE at bucket creation, never updated)
+- New `CandleAggregator.last_cumulative_volume: HashMap<(u32, u8), u32>` per-security tracker (Choice A)
+- Session-reset detection: `tick.volume < tracker` → bucket_start = 0 (handles IST midnight day boundary)
+- 5 new ratchet tests + 1 existing test renamed (38 total candle_aggregator tests pass)
+- Workspace compiles clean
+- `materialized_views.rs:315 sum(volume)` cascade is now MATHEMATICALLY CORRECT (no DDL change needed)
+
+**Deferred to follow-up sub-PRs:**
+- Item 26 L1 runtime monotonicity guard (separate sub-PR, builds on Item 28 tracker)
+- Item 26 L2 NSE bhavcopy nightly cross-check (separate sub-PR; recipe verified live in Item 29)
+- Migration script `scripts/migrate-candles-volume-fix.sql` for existing wrong rows (deferred until Mon May 4 Track 2 verdict)
 - Files: `crates/core/src/pipeline/candle_aggregator.rs` (track volume_start, compute incremental), `crates/storage/src/materialized_views.rs` (no DDL change with Path X), `scripts/migrate-candles-volume-fix.sql` (drop + recreate cascade)
 - Tests:
   - `test_candle_aggregator_persists_incremental_volume_not_cumulative`
