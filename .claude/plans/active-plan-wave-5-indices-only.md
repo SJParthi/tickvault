@@ -377,7 +377,138 @@ Quick-reference table — see "Ping/Pong Mechanism" + "Per-Packet O(1) Timing Bu
 
 **Honest non-claim:** TCP RST storms, kernel scheduler preemption, and remote-process failures CAN happen. Our envelope is: detect ≤5s, reconnect with subs preserved, audit every event, sleep dormantly post-close. Item 6 (core_affinity) closes the last preemption gap.
 
-## Plan Items (10)
+## Top Movers Under Wave 5 — Indices-Only Scope
+
+Operator question: "what about movers — top movers and all of it section?"
+
+The `option_movers` + `stock_movers` writers already exist with 7 ranking categories. Wave 5 keeps both writers active; the universe shrinks but the snapshotting cadence + categories stay identical. The 22-timeframe redesign (`active-plan-movers-22tf-redesign-v2.md`, APPROVED parallel plan) is independent — Wave 5 does not block or duplicate it.
+
+### Verified categories (source: `crates/api/src/handlers/market_data.rs:360-368`)
+
+| Category | What it ranks |
+|---|---|
+| `HIGHEST_OI` | Top open interest contracts |
+| `OI_GAINER` | Largest OI delta over snapshot window |
+| `OI_LOSER` | Largest OI drop over snapshot window |
+| `TOP_VOLUME` | Highest volume contracts |
+| `TOP_VALUE` | Highest notional value (price × volume) |
+| `PRICE_GAINER` | Largest % price increase |
+| `PRICE_LOSER` | Largest % price decrease |
+
+### Wave 5 movers behaviour
+
+| Concern | Today | Wave 5 |
+|---|---|---|
+| `option_movers` universe | All NSE_FNO + BSE_FNO (~22K stock F&O + ~10K index F&O = ~32K) | NSE_FNO + BSE_FNO for NIFTY/BANKNIFTY/SENSEX only (~10,783) — drops ~22K stock F&O entries |
+| `stock_movers` universe | All NSE_EQ F&O underlyings (~206) | Same ~206 (cash equities still subscribed) — UNCHANGED |
+| Snapshot cadence | 5s per writer (option) / 60s (stock) | Same |
+| Storage tables | `option_movers`, `stock_movers`, plus `top_movers_22tf` (in-flight) | Same — no schema change |
+| Selector for depth-20 conn 5 + depth-200 | Wave 5 NEW: `category='TOP_VOLUME'` then sort by `change_pct` DESC, SENSEX-skip | Documented in "Selector SQL" section above |
+| Memory cost | High (32K × 7 categories × 5s cadence) | ~3× cheaper (10,783 × 7 × 5s) — fits the burst-defence envelope |
+
+### Pre-open movers (`PreopenMoversTracker`) under Wave 5
+
+- Continues to fire 09:00–09:13 IST per `MOVERS-03` runbook (`wave-1-error-codes.md`).
+- Universe: 218 stocks + 2 indices (existing). Wave 5 keeps cash equities so this is unchanged.
+- SENSEX (BSXOPT) special case: `phase = 'PREOPEN_UNAVAILABLE'` rows continue (BSE has no formal pre-open auction at the same window) — not a Wave 5 regression.
+
+### Movers writers under indices-only — what we add to the plan
+
+- [ ] **Item 12. Wire option_movers selector to use Wave 5 universe filter.** No new code; verify `option_movers` writer already iterates only the subscribed instruments — if it scans ALL NSE_FNO+BSE_FNO contracts regardless of subscription, that's wasted work and should narrow.
+- File: `crates/core/src/pipeline/option_movers.rs` (verify, possibly amend)
+- Test: `test_option_movers_universe_matches_subscription_set_under_indices_only_scope`
+- 9-box: gauge `tv_option_movers_universe_size` (expect ~10,783 under indices-only); alert if >12,000 (regression to old universe)
+
+## Previous Close Routing — Wave 5 Per-Slot Map
+
+Operator question: "how about prev close?" Per `dhan/live-market-feed.md` rule + Dhan Ticket #5525125:
+
+| Slot | Segment | Subscribed feed mode | Where prev close lives | Parser |
+|---|---|---|---|---|
+| Major indices | IDX_I | Ticker (forced) | **Standalone PrevClose packet (code 6, 16 bytes, bytes 8-11 f32 LE)** | `parse_previous_close_packet` (`crates/core/src/parser/previous_close.rs`) |
+| Display indices | IDX_I | Ticker (forced) | Same as major indices | Same |
+| Cash equities | NSE_EQ | **Quote** (Wave 5 change — see "Feed Mode Per Slot" below) | Quote packet bytes 38-41 f32 LE (close field) | `parse_quote_packet` |
+| Index F&O derivatives | NSE_FNO | Full | Full packet bytes 50-53 f32 LE (close field) | `parse_full_packet` |
+| Index F&O derivatives | BSE_FNO (SENSEX) | Full | Same as NSE_FNO | Same |
+
+**Hard rule (per `live-market-feed.md` `MECHANICAL RULE: Previous-Day Close Routing`):**
+
+> "Subscribing to Ticker mode on equities/derivatives and then waiting for code 6 packets is a bug — those packets will never arrive. The symptom is 'prev close missing for 24,972 of 25,000 instruments, only 28 IDX_I indices have it'."
+
+**Wave 5 must verify on every boot:**
+
+| Check | What it ensures |
+|---|---|
+| For every NSE_EQ subscription: feed_mode is Quote or Full | Otherwise prev close = always 0 |
+| For every NSE_FNO/BSE_FNO subscription: feed_mode is Full | Quote-mode derivatives miss OI + close at correct offset |
+| For every IDX_I subscription: feed_mode is Ticker AND we listen for code 6 packets | Standalone PrevClose packet is the ONLY source for indices |
+
+### What we add to the plan
+
+- [ ] **Item 13. Boot-time prev-close routing assertion**
+- File: `crates/app/src/main.rs` (boot sequence) + `crates/core/src/instrument/subscription_planner.rs`
+- Tests: `test_idx_i_subscriptions_use_ticker_mode`, `test_nse_eq_subscriptions_use_quote_or_full`, `test_nse_fno_bse_fno_subscriptions_use_full_mode`
+- ErrorCode: `PREVCLOSE-03` (new — boot-time invariant violation, Severity::Critical, halts boot)
+- 9-box: ratchet test that scans the computed subscription plan and fails build if any slot/feed-mode combo is wrong
+
+## Feed Mode Per Slot — Ticker / Quote / Full Decision Matrix
+
+Operator question: "how about ticker, quote and full packet how bro?"
+
+### Packet sizes + content (verified per `dhan/live-market-feed.md` rules 5-10)
+
+| Mode | Packet size | Content | Has prev close? |
+|---|---|---|---|
+| Ticker (code 2) | 16 bytes (8 header + 8 payload) | LTP + LTT only | NO — but IDX_I gets standalone code 6 separately |
+| Quote (code 4) | 50 bytes (8 header + 42 payload) | LTP + LTQ + LTT + ATP + Volume + buy/sell qty + day OHLC + **close at bytes 38-41** | YES (NSE_EQ) |
+| OI (code 5) | 12 bytes | OI only — auxiliary packet alongside Quote on F&O | N/A |
+| Full (code 8) | 162 bytes (8 header + 154 payload) | Quote fields + OI + 5-level depth + **close at bytes 50-53** | YES (NSE_FNO/BSE_FNO) |
+| PrevClose (code 6) | 16 bytes | Indices ONLY — prev close + prev day OI | YES (IDX_I) |
+
+### Wave 5 feed mode allocation (FINAL)
+
+| Slot | Count | Feed mode | Bytes per packet | Justification |
+|---|---|---|---|---|
+| IDX_I major | 3 | Ticker (forced) | 16 | LTP for ATM math; prev close from code 6; depth not needed |
+| IDX_I display | 26 | Ticker (forced) | 16 | LTP for dashboard; prev close from code 6 |
+| NSE_EQ cash | ~206 | **Quote** (downgrade from Full) | 50 | Need volume + OHLC + prev close (38-41); 5-level depth not needed (cash isn't in any depth subscription) |
+| NSE_FNO derivatives | ~7,500 | Full | 162 | Need OI + 5-level depth (for option chain UI) + prev close (50-53) |
+| BSE_FNO derivatives (SENSEX) | ~2,283 | Full | 162 | Same as NSE_FNO |
+
+### Bandwidth math at peak burst
+
+| Slot | Count | Bytes/pkt | Pkts/sec/instr peak | MB/sec total | MB/sec/conn (÷5) |
+|---|---|---|---|---|---|
+| IDX_I (29) | 29 | 16 | 10 | 0.0046 | 0.0009 |
+| NSE_EQ (~206) | 206 | 50 | 5 | 0.052 | 0.010 |
+| NSE_FNO+BSE_FNO (~10,783) | 10,783 | 162 | 5 | 8.74 | 1.75 |
+| **TOTAL** | 11,018 | | | **8.79 MB/sec** | **1.76 MB/sec/conn** |
+
+c7i.xlarge has 12.5 Gbps network bandwidth → 1.56 GB/sec → we use 0.56% of network at peak. Comfortable.
+
+### Memory math at peak
+
+| Slot | Count | Bytes/instr in registry + state | MB |
+|---|---|---|---|
+| IDX_I | 29 | ~500 (lookup + spot map + OHLCV state × 21 timeframes) | 0.014 |
+| NSE_EQ | 206 | ~10K (registry + spot + OHLCV × 21 + indicator engine state) | 2.06 |
+| NSE_FNO+BSE_FNO | 10,783 | ~12K (above + greeks + OI tracker + 5-level depth state) | 129 |
+| **TOTAL state** | | | **~131 MB** |
+| Rescue ring (TICK_BUFFER_CAPACITY=600K × ~80 bytes) | | | 48 |
+| Subscription plan (Arc<Vec<Message>>) | | | ~5 |
+| Other (audit writers, Telegram queue, etc.) | | | ~50 |
+| **TOTAL tickvault binary RSS estimate** | | | **~234 MB** |
+
+vs c7i.xlarge 8 GB RAM (with QuestDB at 4 GB, Valkey 1 GB, others ~2 GB → tickvault gets ~1 GB). 234 MB / 1 GB = 23% — comfortable headroom for bursts.
+
+### What we add to the plan
+
+- [ ] **Item 14. NSE_EQ feed_mode downgrade Full → Quote**
+- File: `crates/core/src/instrument/subscription_planner.rs`
+- Tests: `test_nse_eq_uses_quote_mode_under_indices_only`, `test_quote_packet_close_field_matches_prev_close_lookup`
+- 9-box: Prom gauge `tv_subscription_bytes_per_sec_per_conn{conn}` — alert if any conn exceeds 5 MB/sec sustained (means we accidentally subscribed Full to cash); `FeedModeRoutingAudit` typed event at boot listing per-slot mode counts; ratchet test
+
+## Plan Items (now 14, was 10)
 
 Each item carries the 9-box checklist per `stream-resilience.md` B8: ① typed event, ② ErrorCode, ③ tracing+code field, ④ Prometheus counter, ⑤ Grafana panel, ⑥ alert rule, ⑦ call site, ⑧ triage YAML rule, ⑨ ratchet test.
 
