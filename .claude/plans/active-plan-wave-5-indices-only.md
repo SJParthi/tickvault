@@ -1,8 +1,8 @@
 # Implementation Plan: Wave 5 — Indices-Only Subscription + Depth Redesign + Resilience Hardening
 
-**Status:** DRAFT
+**Status:** APPROVED
 **Date:** 2026-05-01
-**Approved by:** pending (Parthiban — operator)
+**Approved by:** Parthiban (operator) — verbatim "yes approved" 2026-05-01
 **Branch:** `claude/fetch-status-info-V56GN`
 **Triggering context:** Operator decision 2026-05-01: drop the 216-stock F&O subscription, focus exclusively on NIFTY/BANKNIFTY/SENSEX indices (all expiries, all strikes), redesign depth-20 + depth-200 around major-index single-side connections + dynamic top-volume gainers, wire core_affinity, fix two hot-path bugs caught by adversarial review.
 
