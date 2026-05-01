@@ -2713,12 +2713,46 @@ async fn main() -> Result<()> {
                 },
             );
 
-            let _d20_dyn_handle =
+            // M2 — JoinHandle panic watchdog: capture the orchestrator
+            // handle and spawn a tiny supervisor that awaits panic. The
+            // orchestrator is the SOLE Sender side of conn 5's command
+            // channel; if it panics silently, the receiver-side WS conn
+            // 5 stays connected but never receives Swap20 / InitialSubscribe20
+            // — manifests as "depth-20 conn 5 connected but no data flowing".
+            // Detect-only (no respawn): the orchestrator holds 60s tick
+            // state and a clean restart is safer than a partial respawn.
+            // Operator action: restart the app on this Telegram.
+            let d20_dyn_handle =
                 tickvault_app::depth_dynamic_pipeline::spawn_depth_20_dynamic_conn5_task(
                     config.questdb.clone(),
                     d20_conn5_cmd_tx,
                     std::sync::Arc::clone(&depth_dyn_shutdown),
                 );
+            tokio::spawn(async move {
+                match d20_dyn_handle.await {
+                    Ok(()) => {
+                        tracing::info!(
+                            "depth-20 dynamic conn 5 orchestrator exited cleanly \
+                             (shutdown signalled)"
+                        );
+                    }
+                    Err(err) if err.is_panic() => {
+                        tracing::error!(
+                            ?err,
+                            "depth-20 dynamic conn 5 orchestrator task PANICKED — \
+                             conn 5 will stop receiving Swap20 commands; operator \
+                             MUST restart the app to recover dynamic top-50 swaps"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            ?err,
+                            "depth-20 dynamic conn 5 orchestrator task cancelled \
+                             (likely shutdown race)"
+                        );
+                    }
+                }
+            });
 
             // Depth-200 dynamic pool (5 slots). One channel + receiver
             // depth-200 WS connection per slot. Wave 5 commit 3.
@@ -2731,8 +2765,20 @@ async fn main() -> Result<()> {
             // each slot's contract. Initial-connect stagger spreads the
             // 5 first-connect handshakes over 10s to avoid Dhan TCP-RST
             // storm (per audit-findings 2026-04-24 Fix C).
+            // H1 capacity assertion: depth-200 dynamic pool MUST equal
+            // MAX_TWO_HUNDRED_DEPTH_CONNECTIONS (=5). The Dhan 5-conn cap
+            // per pool is documented in `dhan-ref/04-full-market-depth`;
+            // a future commit accidentally widening this bound would be
+            // silently rejected by Dhan. Compile-time assertion here
+            // catches the regression at boot, NOT at first market-open.
+            const _D200_POOL_SIZE_INVARIANT: () = assert!(
+                tickvault_common::constants::MAX_TWO_HUNDRED_DEPTH_CONNECTIONS == 5,
+                "Wave 5 commit 3 depth-200 pool sized for exactly 5 slots; \
+                 update the spawn loop range AND this assertion together."
+            );
             let mut d200_cmd_senders = std::collections::HashMap::new();
-            for slot in 0..5_usize {
+            let mut d200_dyn_spawn_count: usize = 0;
+            for slot in 0..tickvault_common::constants::MAX_TWO_HUNDRED_DEPTH_CONNECTIONS {
                 let (tx, rx) =
                     tokio::sync::mpsc::channel::<tickvault_core::websocket::DepthCommand>(4);
                 d200_cmd_senders.insert(slot, tx);
@@ -2760,13 +2806,54 @@ async fn main() -> Result<()> {
                         initial_stagger_ms: stagger_ms,
                     },
                 );
+                d200_dyn_spawn_count = d200_dyn_spawn_count.saturating_add(1);
             }
-            let _d200_dyn_handle =
+            // H1 + M3 — runtime invariant: spawn loop emitted exactly 5 conns.
+            // Saturating add means a logic bug (e.g. early break) leaves the
+            // counter < 5; a duplicate spawn could push it > 5. Both fail.
+            assert_eq!(
+                d200_dyn_spawn_count,
+                tickvault_common::constants::MAX_TWO_HUNDRED_DEPTH_CONNECTIONS,
+                "Wave 5: depth-200 dynamic pool spawned {d200_dyn_spawn_count} \
+                 conns; expected exactly {} per Dhan 5-conn cap.",
+                tickvault_common::constants::MAX_TWO_HUNDRED_DEPTH_CONNECTIONS
+            );
+            // M2 — JoinHandle panic watchdog (depth-200 5-slot pool).
+            // Symmetric with the conn 5 watchdog above. The 5 minimal
+            // depth-200 conns block on InitialSubscribe200 from this
+            // orchestrator; if it panics, all 5 stay in DEFERRED mode
+            // forever (no contract subscribed). Operator restart required.
+            let d200_dyn_handle =
                 tickvault_app::depth_dynamic_pipeline::spawn_depth_200_dynamic_pool_task(
                     config.questdb.clone(),
                     d200_cmd_senders,
                     std::sync::Arc::clone(&depth_dyn_shutdown),
                 );
+            tokio::spawn(async move {
+                match d200_dyn_handle.await {
+                    Ok(()) => {
+                        tracing::info!(
+                            "depth-200 dynamic pool orchestrator exited cleanly \
+                             (shutdown signalled)"
+                        );
+                    }
+                    Err(err) if err.is_panic() => {
+                        tracing::error!(
+                            ?err,
+                            "depth-200 dynamic pool orchestrator task PANICKED — \
+                             all 5 depth-200 slots stuck in DEFERRED mode; operator \
+                             MUST restart the app to resume top-5 contract subscription"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            ?err,
+                            "depth-200 dynamic pool orchestrator task cancelled \
+                             (likely shutdown race)"
+                        );
+                    }
+                }
+            });
         } else {
             tracing::info!(
                 "Wave 5 Items 4+5: depth_dynamic_top_volume feature OFF (default) — \
@@ -4023,12 +4110,21 @@ async fn main() -> Result<()> {
                     // is 4 single-side keys × 1 await = ~microseconds.
                     depth_cmd_senders.lock().await.insert(key.clone(), cmd_tx);
 
+                    // H2 — false-OK suppression: this log records SPAWN
+                    // INTENT only. Successful first-frame handshake is
+                    // signalled separately via the typed
+                    // NotificationEvent::DepthTwentyConnected Telegram
+                    // event emitted from the per-conn read loop. A reader
+                    // of THIS line MUST NOT conclude the conn reached
+                    // Dhan — it only confirms the spawn function returned.
                     info!(
                         underlying = %row.underlying,
                         side = %row.side,
                         key = %key,
                         instruments = instruments.len(),
-                        "PROOF: Wave 5 single-side depth-20 conn — {} ({} SIDs, DEFERRED if 0)",
+                        "Wave 5 depth-20 single-side spawn INTENT issued for {} \
+                         ({} SIDs, DEFERRED if 0; first-frame success will appear \
+                         as DepthTwentyConnected Telegram event, NOT here)",
                         key,
                         instruments.len()
                     );
@@ -4048,9 +4144,26 @@ async fn main() -> Result<()> {
                     );
                     spawn_count = spawn_count.saturating_add(1);
                 }
+                // H1 + M3 — runtime invariant: 4 single-side spawn intents.
+                // Combined with the depth-200 5-slot assertion above and
+                // the 1 dynamic depth-20 conn 5 spawn (line 2702-2714),
+                // total depth-20 = 4 + 1 = 5 = MAX_TWENTY_DEPTH_CONNECTIONS.
+                // A planner regression that drops a row (returning 3 or 5
+                // entries instead of 4) fails the build at boot.
+                assert_eq!(
+                    spawn_count,
+                    tickvault_app::depth_20_single_side_planner::DEPTH_20_SINGLE_SIDE_TARGETS.len(),
+                    "Wave 5: single-side spawn loop emitted {spawn_count} \
+                     conns; expected exactly {} (NIFTY-CE/PE + BANKNIFTY-CE/PE).",
+                    tickvault_app::depth_20_single_side_planner::DEPTH_20_SINGLE_SIDE_TARGETS.len()
+                );
                 info!(
-                    spawned = spawn_count,
-                    "Wave 5: single-side static depth-20 conns spawned (legacy mixed + ATM-fixed depth-200 SKIPPED — orchestrator block already spawned 1 dynamic depth-20 + 5 dynamic depth-200)"
+                    spawn_intent_issued = spawn_count,
+                    "Wave 5: single-side static depth-20 spawn INTENT issued for all 4 conns \
+                     (first-frame success appears as DepthTwentyConnected Telegram events; \
+                     legacy mixed + ATM-fixed depth-200 SKIPPED — orchestrator block \
+                     already spawned 1 dynamic depth-20 + 5 dynamic depth-200; \
+                     total depth-20=5, depth-200=5, both at Dhan cap)"
                 );
             }
         }
