@@ -48,7 +48,15 @@ use tickvault_core::instrument::depth_strike_selector::{
 };
 
 /// One row of the depth-20 single-side spawn plan.
-#[derive(Debug, Clone)]
+///
+/// **Security note (hardening fix M-Sec, 2026-05-01):** `Debug` is gated to
+/// `#[cfg(test)]` ONLY. The struct holds no secrets today, but `Debug`
+/// auto-derive is a latent exposure vector — if a `TokenHandle` or other
+/// sensitive field is added in a future commit, `{:?}` formatting would
+/// silently log it via tracing or panic backtraces. Test-only Debug
+/// preserves `assert_eq!` ergonomics without leaking in prod.
+#[cfg_attr(test, derive(Debug))]
+#[derive(Clone)]
 pub struct Depth20SingleSideRow {
     /// Underlying symbol (e.g. `"NIFTY"` / `"BANKNIFTY"`).
     pub underlying: String,
