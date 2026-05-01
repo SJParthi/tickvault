@@ -596,7 +596,7 @@ Operator question: "for full we don't need to store the day close or prev close 
 
 ### What we add to the plan
 
-- [ ] **Item 15. Drop `previous_close` table writes for NSE_EQ + NSE_FNO + BSE_FNO**
+- [x] **Item 15. Drop `previous_close` table writes for NSE_EQ + NSE_FNO + BSE_FNO**
 - Files: `crates/core/src/pipeline/prev_close_persist.rs`, `crates/storage/src/previous_close_persistence.rs`, `crates/core/src/parser/dispatcher.rs`
 - Tests: `test_prev_close_persist_skips_quote_and_full_sources`, `test_prev_close_table_only_contains_idx_i_rows`, `test_movers_writer_reads_day_close_from_ticks_via_in_memory_cache`
 - Behaviour change:
