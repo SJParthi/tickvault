@@ -754,7 +754,7 @@ Per `stream-resilience.md` per-PR-set protocol: ≤3 sub-PRs, ≤30 files / ≤3
 
 ### What we add to the plan
 
-- [ ] **Item 17. Document parallelization map + sub-branch protocol**
+- [x] **Item 17. Document parallelization map + sub-branch protocol**
 - Files: this plan file (already done); add `.claude/plans/wave-5-sub-branches.md` listing each sub-branch + assigned items + base commit
 - Tests: N/A (documentation)
 - 9-box: N/A (process)
