@@ -233,6 +233,78 @@ Verified against `crates/storage/src/tick_persistence.rs` + `crates/common/src/c
 - **QuestDB outage 60s–10min:** ring fills, spill takes over. Disk-full pre-flight gates. Recovery replays.
 - **Beyond envelope (disk full + QuestDB down):** DLQ catches as text. Operator sees CRITICAL Telegram. Recovery manual.
 
+## Extreme Burst + Memory Pressure Defence — Stock-Cascade Lesson Learned
+
+Operator's verbatim: "previously with stocks and its instruments we majorly faced the high memory issues and reconnection and disconnection many times — this affects our websockets live ticks majorly, biggest impact, shouldn't happen again."
+
+**Root cause analysis (why Wave 4 with stocks blew up):**
+
+| Failure mode | Mechanism | Wave 5 mitigation |
+|---|---|---|
+| Cardinality explosion | 24,324 instruments × 10 packets/sec/instr peak = 243K tps theoretical burst | Indices-only cuts to 11,018 — 55% reduction. Peak burst budget: ~110K tps. Ring (600K) still absorbs 5+ seconds. |
+| Per-instrument memory | Each instrument has registry entries + spot-price slot + OHLCV state across 21 timeframes | 55% fewer instruments → 55% lower steady-state memory |
+| OHLCV state map growth | `HashMap<u32, OhlcvState>` grew unbounded as stock options accumulated across expiries | Item 7: composite-key `HashMap<(u32, ExchangeSegment), OhlcvState>` + bounded by registry size |
+| Channel saturation | Single mpsc(65,536) for ALL ticks; stocks at peak filled it faster than pipeline drained | Channel capacity unchanged but inflow halved → drain catches up reliably |
+| QuestDB write amplification | Stock F&O wrote to `ticks` + every materialized view (21 timeframes × 22 movers categories × greeks) | Same per-tick cost, but 55% fewer ticks → ILP load halved |
+| Reconnect storm cascade | Ring fills → backpressure on parser → parser falls behind → activity watchdog trips → reconnect → new subs → ring still full → loop | Item 6 core_affinity isolates parser CPU. Ring drains independent of WS read loop. |
+| TCP RST from Dhan side | Stock F&O subscriptions hit Dhan's per-conn rate-limit on quote-mode aggregate updates → server forced disconnect | Indices-only stays well under per-conn 5K cap (44%); per-instrument update rate is lower for indices than stocks |
+| Watchdog false positives | 1800s order-update watchdog tripped on idle accounts | Wave 2 fix: bumped to 14400s (4h) — already shipped, persists in Wave 5 |
+
+**Wave 5 burst defence layers (cumulative):**
+
+| Layer | What it does | Hard limit | Action on breach |
+|---|---|---|---|
+| 1. Subscription scope cap | Compile-time + boot-time assertion `total ≤ MAX_TOTAL_SUBSCRIPTIONS = 25_000` | 25K | Boot fails fast before subscribing |
+| 2. Bounded SPSC channels | Every `mpsc::channel(N)` is bounded; `try_send` returns `Full` on overflow | 65,536 (parser→pipeline) | Increment `tv_tick_dropped_total`, drop the tick (last-resort) |
+| 3. Rescue ring (Tier 1) | 600,000 ticks held in RAM if QuestDB writes block | 600K = ~48 MB | Spill to disk (Tier 2) |
+| 4. Disk spill (Tier 2) | NDJSON append-only file | Disk-full pre-flight gate (Item 9 from prior wave, already shipped) | DLQ (Tier 3) |
+| 5. DLQ (Tier 3) | Last-resort recoverable text | Disk capacity | CRITICAL Telegram + manual recovery |
+| 6. High-watermark alert | Ring at 80% (480K) fires Prom alert | n/a | Operator paged before catastrophic fill |
+| 7. Container memory limit | Docker `mem_limit` per `aws-budget.md` per-service budget | 7.4 GB total (4 GB QuestDB, 1 GB Valkey, etc.; tickvault binary ~1 GB) | Linux OOM-killer; PROC-01 ErrorCode reserved (`wave-4-error-codes.md`) |
+| 8. cgroup OOM monitor | Phase 4-E1 (reserved): scrape `/sys/fs/cgroup/.../memory.events` | n/a | PROC-01 CRITICAL Telegram |
+| 9. Backpressure on parser | Parser uses `try_send` not `send().await` — never blocks WS read loop | n/a | Drop + count, never stall |
+| 10. Core affinity (Item 6) | WS read loop pinned to Core 0; ILP writer pinned to Core 2 — they cannot starve each other | n/a | If pinning fails: CORE-PIN-01 CRITICAL alert, app continues without pinning |
+
+**Why this prevents the stock-cascade pattern:**
+
+| Past failure step | Wave 5 break point |
+|---|---|
+| Step 1: Stocks F&O subscribed (24K instruments) | NOT REACHED — indices-only scope filters stock F&O out |
+| Step 2: Peak burst @ 200K+ tps overwhelms parser | Inflow halved; parser stays current |
+| Step 3: Ring fills past high-watermark | Earlier alert + `core_affinity` ensures drain task gets CPU |
+| Step 4: Activity watchdog trips on parser stall | Parser doesn't stall (Core 0 dedicated); watchdog only trips on real disconnects |
+| Step 5: Reconnect cascade across 5 conns | Even if 1 conn drops, surviving 4 absorb at 55%/conn (still under cap) |
+| Step 6: OOM kill / Docker restart | PROC-01 monitor fires CRITICAL before kill; container `mem_limit` enforces |
+| Step 7: Token expiry mid-cascade | AUTH-GAP-03 force-renewal-if-stale (Wave 2, shipped) |
+
+**Real-time burst observability (during the next live test):**
+
+| Prom counter / gauge | What it tells the operator |
+|---|---|
+| `tv_websocket_inbound_messages_per_sec{conn}` | Per-conn message rate; alerts on >2× steady-state |
+| `tv_rescue_ring_used_capacity` | Ring fill level; alert at 80% (480K) |
+| `tv_rescue_ring_high_watermark_breaches_total` | Counter — non-zero = burst pressure observed |
+| `tv_tick_dropped_total{reason}` | reasons: `channel_full`, `dlq_persisted`, `dlq_failed` |
+| `tv_spill_file_size_bytes` | Disk spill size in bytes |
+| `tv_dlq_ticks_total` | DLQ count — non-zero = catastrophic fail, page operator |
+| `tv_ws_pool_respawn_total` | Pool supervisor activity; non-zero rate = task panicking |
+| `tv_questdb_disconnected_seconds` | QuestDB write latency; alert at >30s |
+| `tv_resident_memory_bytes` (Phase 4-E3 reserved) | Process RSS; alert at 80% of cgroup limit |
+
+**Burst chaos test (Item 11 — adding now):**
+
+- [ ] **11. Stress test the burst defence chain**
+- File: `crates/storage/tests/chaos_burst_indices_only.rs` (new)
+- Synthetic: feed 200K tick/sec sustained for 10s into the parser channel; assert ring stays bounded, no DLQ writes, no parser stall
+- Verifies: bounded channels, ring high-watermark alert, drain catches up post-burst
+- Adds to existing chaos test suite alongside `chaos_questdb_docker_pause.rs`, `chaos_rescue_ring_overflow.rs`, `chaos_zero_tick_loss.rs`
+
+**Honest non-claim:**
+
+- We CANNOT promise "no OOM ever." The cgroup limit is set by Docker; if the operator deploys a wrong `mem_limit`, OOM-kill happens. PROC-01 detects + alerts, doesn't prevent.
+- We CANNOT promise "no reconnect ever." Dhan can RST. We promise: detect ≤5s, reconnect with subs preserved, audit, sleep dormant post-close.
+- We CAN promise: under the verified 11,018-instrument indices-only scope at observed peak rates (≤110K tps theoretical, typically ~30K tps), the chain absorbs without drop. Item 11 chaos test pins this envelope.
+
 ## Per-Packet O(1) Timing Budget Inside Every WS Read Loop
 
 Operator demand: "achieve O(1) latency inside all the websockets and its connections."
