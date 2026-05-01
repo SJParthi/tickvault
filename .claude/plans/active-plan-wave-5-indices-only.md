@@ -1,8 +1,9 @@
 # Implementation Plan: Wave 5 — Indices-Only Subscription + Depth Redesign + Resilience Hardening
 
-**Status:** APPROVED
+**Status:** APPROVED-PENDING-REVIEW-FIXES
 **Date:** 2026-05-01
 **Approved by:** Parthiban (operator) — verbatim "yes approved" 2026-05-01
+**Re-approval pending:** 2 BLOCKERS (C1 Item 4 collision with merged `depth_20_dynamic_subscriber.rs`, C2 Item 16 collision with merged `Movers22TfTracker`) — see Item 18 for operator decision options.
 **Branch:** `claude/fetch-status-info-V56GN`
 **Triggering context:** Operator decision 2026-05-01: drop the 216-stock F&O subscription, focus exclusively on NIFTY/BANKNIFTY/SENSEX indices (all expiries, all strikes), redesign depth-20 + depth-200 around major-index single-side connections + dynamic top-volume gainers, wire core_affinity, fix two hot-path bugs caught by adversarial review.
 
@@ -683,7 +684,244 @@ Per `stream-resilience.md` per-PR-set protocol: ≤3 sub-PRs, ≤30 files / ≤3
 - Tests: N/A (documentation)
 - 9-box: N/A (process)
 
-## Plan Items (now 17, was 10)
+## Item 18 — Adversarial 3-Agent Review Findings (2026-05-01)
+
+Per `stream-resilience.md` B3 + `wave-4-shared-preamble.md` §3, three specialist agents (`hot-path-reviewer`, `security-reviewer`, `general-purpose` hostile bug-hunt) reviewed the 17-item plan in parallel. **Total findings: 7 CRITICAL + 12 HIGH + 9 MEDIUM + 5 LOW = 33.** Two CRITICALs are MERGE BLOCKERS — they collide with already-merged code and require an operator architectural decision before implementation can begin.
+
+### MERGE BLOCKERS — operator decision required before Item 4 / Item 16 can ship
+
+**BLOCKER C1 — Item 4 collides with already-shipped `depth_20_dynamic_subscriber.rs`.**
+
+The merged trunk (commits `f3b7baa`, `29b1407`, `72028c5`, `c9f53a4`) ALREADY ships a depth-20 dynamic selector covering slots 3/4/5 (3 dynamic slots × 50 = 150 instruments) with:
+- `DEPTH_20_DYNAMIC_SLOT_COUNT = 3`
+- `DEPTH_20_DYNAMIC_SLOT_CAPACITY = 50`
+- SQL: `WHERE change_pct > 0 ORDER BY volume DESC LIMIT 150`
+- Slots 1+2 pinned to NIFTY + BANKNIFTY mixed CE+PE ATM±24
+
+Wave 5 Item 4 specifies:
+- Slots 1+2+3+4 = NIFTY/BANKNIFTY single-side (CE only / PE only) ATM±24
+- Slot 5 = top-50 dynamic from `category='TOP_VOLUME'` sorted by `change_pct` DESC
+
+These are incompatible. Wave 5 cuts dynamic coverage 150 → 50 and changes slots 1+2 from mixed to single-side. **Operator must choose:**
+
+| Option | Means | Trade-off |
+|---|---|---|
+| A. Adopt merged design | Drop the single-side-conn idea; keep mixed CE+PE slots 1+2 + 3 dynamic top-50 slots (150 total) | Smaller diff, no rework. Loses the "single-side packet routing" benefit Wave 5 hypothesised. |
+| B. Refactor to Wave 5 design | Rip merged dynamic-subscriber, change slots 1-4 to single-side, add 1 top-50 dynamic | Larger blast radius, must retest the Phase 7 ratchets in `depth_20_dynamic_subscriber.rs`. Halves dynamic coverage. |
+| C. Hybrid | Keep merged 3-slot dynamic; add single-side ONLY for NIFTY/BANKNIFTY (slots 1+2 split into 4 sub-conns? requires Dhan to allow extra conns — not possible, hard cap = 5 depth-20 conns total) | NOT VIABLE — Dhan caps depth-20 at 5 conns total |
+
+**Recommendation: Option A.** Smaller change, more dynamic coverage, aligns with already-merged code. The "single-side packet routing" benefit was theoretical — actual packet routing in Dhan's depth feed splits Bid/Ask packets regardless of slot composition.
+
+**Action:** Operator confirms Option A → rewrite Item 4 to match merged design + extend the in-flight movers-22tf-redesign-v2 plan.
+
+---
+
+**BLOCKER C2 — Item 16 collides with already-shipped `Movers22TfTracker`.**
+
+The merged trunk (commit `16a7220`) ALREADY ships a papaya-backed `Movers22TfTracker` wired into `tick_processor` (commit `c9f53a4`). The 22-tf v3 plan (`active-plan-movers-22tf-redesign-v2.md`, APPROVED in parallel) owns the snapshot writers + scheduler.
+
+Wave 5 Item 16 specifies "in-memory MoversTracker" — a new struct with the same 7 categories. Two trackers consuming the same tick stream = double-counted volume + OI deltas, OR one silently shadowing the other.
+
+**Resolution:** Wave 5 Item 16 must REUSE `Movers22TfTracker`, not create a parallel struct. Specifically:
+- Remove "new MoversTracker" wording from Item 16
+- Specify: "Wave 5 Item 16 = configuration tweaks to existing `Movers22TfTracker` snapshot cadence + add 60s checkpoint to QuestDB if not already wired"
+- Verify the 22-tf v3 plan already covers the 60s checkpoint; if yes, Item 16 becomes a verify-only no-op. If no, Item 16 adds the checkpoint to the existing tracker.
+
+**Action:** Operator approves: "Item 16 reuses Movers22TfTracker" → rewrite Item 16 as verify-or-extend of the existing tracker.
+
+---
+
+### CRITICAL findings (5 more, all blocking)
+
+| # | Source | Item | Finding | Remediation |
+|---|---|---|---|---|
+| C3 | hot-path | 16 | `papaya::HashMap<MoversState>` per-tick mutation: needs `AtomicU64`/`AtomicI64` only OR `compute_mut` causes per-tick alloc. Current `Movers22TfTracker` uses atomics — **verify Wave 5 doesn't add non-atomic fields**. | Add ratchet `dhat_movers_22tf_per_tick.rs` (DHAT zero-alloc proof, not timing test). |
+| C4 | hot-path | 16 | BTreeSet rank computation at 60s snapshot MUST run on Core 3, not Core 1. | Item 6 9-box: explicitly map "snapshot computation" to Core 3 in `tokio::spawn` task. |
+| C5 | bug-hunt | 16 | Snapshot vs per-tick race: BTreeSet iteration of papaya map can see torn reads if a tick mutates `MoversState.volume` mid-iteration. | Use papaya `pin()` snapshot-of-snapshot pattern OR copy values into local Vec before sorting. Add ratchet `loom_movers_snapshot_vs_per_tick_race.rs`. |
+| C6 | bug-hunt | 13 | PREVCLOSE-03 false-OK inverse: correctly configured slot with empty in-memory cache silently serves `0.0` for prev_close until first tick (potentially 30+ min on low-volume contracts). Operator sees no alert (Rule 11 violation). | Add `tv_prev_close_cache_coverage_ratio` gauge + alert. Add `PREVCLOSE-04` (cache empty for instrument > 5 min during market hours, Severity::High). |
+| C7 | bug-hunt | 1 | `subscription.scope` default = `IndicesOnlyAllExpiries` + Figment merge: missing key in `prod.toml` silently flips prod from FullUniverse → IndicesOnly on next boot, dropping 13K subscriptions. | Add boot-time assertion: scope MUST be present explicitly in env-overlay TOML; missing = halt with `CONFIG-01` Critical. |
+
+### HIGH findings (12, all need plan amendments)
+
+| # | Source | Item | Finding | Remediation |
+|---|---|---|---|---|
+| H1 | hot-path | 11 | Chaos burst generator `try_send(parsed_tick.clone())` → false-positive DHAT allocations. | Pre-build `[ParsedTick; 1024]` array, cycle via `i % 1024`. Add `cargo test --features dhat` ratchet on the chaos test itself. |
+| H2 | hot-path | 4+5 | Depth selector tasks must `tokio::spawn` on Core 3 (best-effort), not Core 1 (pipeline). | Item 6 9-box: explicit Core 3 mapping for `run_depth_20_top_gainers_loop` + `run_depth_200_top_gainers_loop`. |
+| H3 | security | 15 | Cache-miss fail-safe missing: empty rehydration query → NaN/Inf `change_pct` → undefined depth selector ordering. | Add `PREVCLOSE-05`: rehydration empty for any NSE_EQ/F&O instrument during market hours → halt boot OR default `change_pct = 0.0` + suppress depth selector for those instruments. |
+| H4 | security | 6 | `core_affinity::set_for_current` calls `unsafe` `sched_setaffinity`/`thread_policy_set`. No justification documented. | Add `// APPROVED: core_affinity 0.8.3 calls sched_setaffinity via libc; reviewed for soundness` at call site. Run `cargo audit` explicitly for this dep. |
+| H5 | security | 4+5 | ILP injection surface: `underlying_symbol` from `option_movers` flows back to QuestDB ILP writes without guaranteed sanitization. | Add `test_selector_result_sanitized_before_ilp_write` — assert all values from selector pass through `crates/common/src/sanitize.rs`. |
+| H6 | security | 15 | IST timestamp ambiguity in rehydration query: must explicitly use `Utc::now() + IST_UTC_OFFSET_NANOS` (REST/QuestDB path requires the offset, opposite of WebSocket ts rule). | Spell out `IST_UTC_OFFSET_NANOS` usage in plan + add ratchet `test_prev_close_rehydration_query_uses_ist_offset`. |
+| H7 | bug-hunt | 4+5 | Edge-trigger needs hysteresis: top-50 by `change_pct` in chop market = rank-set flips every 60s = subscription thrash on conn 5 = Dhan rate-limit risk. | Add `min rank-change ≥ 3 positions` OR `5-min minimum dwell` guard. Plan needs `tv_depth_20_swap_thrash_ratio` gauge. |
+| H8 | bug-hunt | 6 | `core_affinity` on sub-4-vCPU container: 4 workers fighting over 2 cores with affinity masks pinning to non-existent cores. | Read `core_affinity::get_core_ids().len()` first; pin only `min(N, 4)`; emit CORE-PIN-03 if N < 4 (Severity::Medium, app continues). |
+| H9 | bug-hunt | 16 | Daily reset for in-memory `Movers22TfTracker` undefined: app boot at 09:14 IST → empty tracker → all `change_pct = 0` until 09:14 + 60s → DEPTH-20-DYN-03/DEPTH-200-DYN-01 firing CRITICAL during ~1 min cold boot every day. | Add positive warm-up signal `MoversTrackerReady` Severity::Info @ first snapshot post-boot. Suppress depth selector emptiness alerts during `[boot_ts, boot_ts + 90s]` window. |
+| H10 | bug-hunt | 14 | NSE_EQ Full→Quote downstream consumers: any consumer reading `tick.depth_levels` for NSE_EQ goes from valid 5-level → empty silently. | Add `test_no_consumer_reads_depth_for_nse_eq` — grep across crates for `depth_levels` usage on cash. |
+| H11 | bug-hunt | 16 | Channel boundedness between tracker and snapshot writer unstated. | Match 22-tf v3 plan: `mpsc::channel(8192)` drop-NEWEST. |
+| H12 | bug-hunt | 11 | Chaos burst test market-hours gate: no `#[ignore]` or feature flag — risk of running against live QuestDB during normal `cargo test --workspace`. | Add `#[ignore]` + `make chaos` invocation; document in test docstring. |
+
+### MEDIUM findings (9)
+
+| # | Source | Item | Finding | Remediation |
+|---|---|---|---|---|
+| M1 | hot-path | 7 | `HashMap::with_capacity` not preserved post-migration. | Add ratchet `test_candle_aggregator_uses_with_capacity_not_new`. |
+| M2 | hot-path | 14 | NSE_EQ prev-close lookup must use existing `Arc<HashMap>` cache, not new Mutex. | Item 14 9-box: forbid Mutex-guarded prev_close lookups; reference `prev_close_writer.rs`. |
+| M3 | security | 4+5 | `change_pct > 0` filter + Item 15 cache-miss bug = bear-day page storm. | Items 4+5+15 risk-linked in plan; resolution = H3 + C6 fixes propagate. |
+| M4 | security | 16 | DEDUP keys for `top_movers_22tf` not explicitly stated. | Item 16 9-box: write `(security_id, exchange_segment, ts, category)` explicitly so meta-guard has correct expectation. |
+| M5 | security | 13 | PREVCLOSE-03 runtime semantics ambiguous (halt mid-session bad). | Distinguish: boot=halt; runtime=Severity::High + continue with last valid plan. |
+| M6 | bug-hunt | 7 | `HashMap<u32, _>` → composite-key migration breaks test fixtures workspace-wide. | Add subtask "audit + migrate all call sites" to Item 7. |
+| M7 | bug-hunt | 4+5+6+14+16 | Counter `_total` naming + gauge semantics mismatch (e.g., `tv_core_pinning_workers_pinned_total` is gauge, named `_total`). | Item 6 ratchet renames to `tv_core_pinning_workers_pinned` (gauge convention). All counters wrapped in `increase()`/`rate()` per Rule 12. |
+| M8 | bug-hunt | 4+5 | Two selector queries firing same 60s tick = inconsistent bucket if a row ages out between Item 4 and Item 5 query. | Single SQL query, shared `Arc<Vec<Row>>`, both selectors slice from it. |
+| M9 | bug-hunt | 12 | Universe filter at runtime is likely a verify-only no-op (writer narrows naturally under indices-only). | Test name reflects no-op: `test_option_movers_writer_narrows_naturally_under_indices_only`. |
+
+### LOW findings (5)
+
+| # | Source | Item | Finding | Remediation |
+|---|---|---|---|---|
+| L1 | bug-hunt | 9 | `Depth200Dyn01TopGainersEmpty` may collide with existing `Depth20Dyn01TopSetEmpty` code-string. | Cross-ref test catches; verify before adding the variant. |
+| L2 | bug-hunt | Selector | `ts > now() - 5m`: QuestDB `now()` is UTC, `option_movers.ts` is IST nanos. Selector returns zero rows always unless normalized. | Pin TZ in SQL: `ts > now() - 5m` → `ts > timestamp_floor('s', now()) + INTERVAL '5h30m' - INTERVAL '5m'` OR explicit IST-aware comparison. Add ratchet. |
+| L3 | bug-hunt | 2 | Phase 2 dispatcher inert: PHASE2-02 `Phase2EmitGuard` panics in debug if dropped without firing. | Specify: under indices-only, guard either never instantiated, OR instantiated and `emit_skipped()` called. Plan must say which. |
+| L4 | security | 17 | Future templating risk on `wave-5-sub-branches.md` if file gains dynamic content. | Flag for review if scripts later read this file. |
+| L5 | hot-path | 16 | papaya `pin()` per-tick vs per-batch ambiguity. | Ratchet `test_movers_tracker_pins_papaya_once_per_batch_not_per_tick`. |
+
+### Plan amendment summary
+
+The 33 findings break into:
+- **2 BLOCKERS (C1, C2):** require operator architectural decision (Option A recommended for both — adopt merged design / reuse merged tracker).
+- **5 CRITICALs (C3-C7):** add to plan as Item 18 sub-items, must fix before any sub-PR opens.
+- **12 HIGHs:** fold remediation into existing items 1-17 9-box checklists.
+- **9 MEDIUMs:** same.
+- **5 LOWs:** same; some are verify-only (L1).
+
+### Status update
+
+Wave 5 plan moves from `Status: APPROVED` → `Status: APPROVED-PENDING-REVIEW-FIXES` until:
+1. Operator confirms BLOCKER C1 path (Option A vs B vs C)
+2. Operator confirms BLOCKER C2 (Item 16 reuses `Movers22TfTracker`)
+3. Items 1-17 9-box checklists are amended with the 26 non-blocker findings
+4. Item 18 itself is added as the explicit "review fixes" tracker
+
+Then re-approve and start Item 1 implementation.
+
+## Item 19 — 25-Timeframe Movers Calculation Spec (operator requirement 2026-05-01)
+
+Operator: "for top movers now we need 1s, 5s, 15s, 30s, then starting 1 minute sequentially incrementally as one till 15 minutes meanwhile we need to have 30 min and 1 hour and 2 hour and 3 hour and 4 hour and one day also. These calculations should happen starting 9.15 am — i mean for one minute if it is 9.15 am then for two minute it should 9.15 am and 9.17 am — for every other also it is same."
+
+### Full timeframe set (25 timeframes, replacing "22 timeframes" naming)
+
+| # | Label | Duration (sec) | First bucket boundary (IST) | Second bucket boundary | Notes |
+|---:|---|---:|---|---|---|
+| 1 | 1s | 1 | 09:15:00 | 09:15:01 | Sub-minute high-resolution |
+| 2 | 5s | 5 | 09:15:00 | 09:15:05 | |
+| 3 | 15s | 15 | 09:15:00 | 09:15:15 | |
+| 4 | 30s | 30 | 09:15:00 | 09:15:30 | |
+| 5 | 1m | 60 | 09:15:00 | 09:16:00 | |
+| 6 | 2m | 120 | 09:15:00 | 09:17:00 | Operator example |
+| 7 | 3m | 180 | 09:15:00 | 09:18:00 | |
+| 8 | 4m | 240 | 09:15:00 | 09:19:00 | |
+| 9 | 5m | 300 | 09:15:00 | 09:20:00 | |
+| 10 | 6m | 360 | 09:15:00 | 09:21:00 | |
+| 11 | 7m | 420 | 09:15:00 | 09:22:00 | |
+| 12 | 8m | 480 | 09:15:00 | 09:23:00 | |
+| 13 | 9m | 540 | 09:15:00 | 09:24:00 | |
+| 14 | 10m | 600 | 09:15:00 | 09:25:00 | |
+| 15 | 11m | 660 | 09:15:00 | 09:26:00 | |
+| 16 | 12m | 720 | 09:15:00 | 09:27:00 | |
+| 17 | 13m | 780 | 09:15:00 | 09:28:00 | |
+| 18 | 14m | 840 | 09:15:00 | 09:29:00 | |
+| 19 | 15m | 900 | 09:15:00 | 09:30:00 | |
+| 20 | 30m | 1,800 | 09:15:00 | 09:45:00 | |
+| 21 | 1h | 3,600 | 09:15:00 | 10:15:00 | |
+| 22 | 2h | 7,200 | 09:15:00 | 11:15:00 | |
+| 23 | 3h | 10,800 | 09:15:00 | 12:15:00 | |
+| 24 | 4h | 14,400 | 09:15:00 | 13:15:00 | |
+| 25 | 1d | 86,400 | 09:15:00 (today) | 09:15:00 (tomorrow) | Day timeframe = trading-session bar (15:30 IST close stops growth) |
+
+### Anchor rule (mandatory)
+
+**All bucket boundaries are derived from `09:15:00 IST` of each trading day, NOT from `00:00:00 IST midnight`, NOT from arbitrary `UNIX_EPOCH % timeframe`.**
+
+The mechanical formula: for a tick at `t_ist_secs` (IST epoch seconds), the bucket-start for timeframe `tf_secs` is:
+
+```rust
+const SESSION_OPEN_SECS_IST: u32 = 9 * 3600 + 15 * 60;  // 09:15:00 IST = 33,300 secs into day
+
+fn bucket_start(t_ist_secs: u64, tf_secs: u64) -> u64 {
+    let secs_of_day = t_ist_secs % 86_400;
+    let elapsed_since_open = secs_of_day.saturating_sub(SESSION_OPEN_SECS_IST as u64);
+    let buckets_since_open = elapsed_since_open / tf_secs;
+    let bucket_offset_in_day = SESSION_OPEN_SECS_IST as u64 + buckets_since_open * tf_secs;
+    let day_start_ist = (t_ist_secs / 86_400) * 86_400;
+    day_start_ist + bucket_offset_in_day
+}
+```
+
+Reference test cases (must pass):
+
+| Tick at | tf=2m | tf=5m | tf=1h |
+|---|---|---|---|
+| 09:15:00 IST | 09:15:00 | 09:15:00 | 09:15:00 |
+| 09:16:30 IST | 09:15:00 (still in first 2m bucket) | 09:15:00 | 09:15:00 |
+| 09:17:00 IST | 09:17:00 (boundary) | 09:15:00 | 09:15:00 |
+| 09:20:00 IST | 09:19:00 (last 2m closed at 09:19) | 09:20:00 (boundary) | 09:15:00 |
+| 10:15:00 IST | 10:15:00 | 10:15:00 | 10:15:00 |
+
+### Pre-market behaviour
+
+For ticks before `09:15:00 IST` (pre-open auction window 09:00–09:12, IDX_I + cash equities) — the formula's `saturating_sub` returns 0, so `bucket_start = day_start + 09:15:00`. This means pre-open ticks accumulate into the **first** bucket of each timeframe (the 09:15 bucket). Operator's call: keep this OR drop pre-open ticks from movers entirely. Default: keep (movers are observability, not trading signals; pre-open data is informative).
+
+### Post-close behaviour (15:30 IST onwards)
+
+After 15:30 IST close, no live ticks arrive. The day-bar (tf=1d) is closed at the 15:30 last-tick value. All other timeframes are dormant until 09:15 next trading day.
+
+### Storage cost math under 25 timeframes (vs 22)
+
+| Timeframe count | Categories | Top-N | Universe | Snapshots/day | Rows/day | Rows/year |
+|---|---|---|---|---|---|---|
+| 22 (existing) | 7 | 50 | 10,783 | varies | ~3M | ~750M |
+| 25 (Wave 5) | 7 | 50 | 10,783 | varies | ~3.4M (+13%) | ~850M |
+
+### Implementation impact on already-merged `Movers22TfTracker` (BLOCKER follow-up)
+
+The merged trunk's tracker is named `Movers22TfTracker`. Operator's new spec is 25 timeframes. **Rename + extend, not replace.**
+
+| Component | Current (22-tf) | Wave 5 (25-tf) |
+|---|---|---|
+| Type name | `Movers22TfTracker` | `Movers25TfTracker` (rename — but defer to operator: rename or keep `22Tf` alias?) |
+| Timeframes constant | `MOVERS_22TF_LIST` | Extend to 25; rename or alias |
+| QuestDB table | `top_movers_22tf` | Either: rename to `top_movers_25tf`, OR keep table name + add 3 new timeframes (1s, 5s, 15s, 30s) as new rows |
+| Snapshot scheduler | `movers_22tf_scheduler.rs` | Extend cadence array to 25 entries |
+| Per-timeframe writer task | 22 tokio::spawn tasks | 25 tokio::spawn tasks (Phase 10 supervisor pattern continues) |
+| Memory | 22 × per-instrument state | 25 × per-instrument state (~14% more) |
+
+### What we add to the plan
+
+- [ ] **Item 19. 25-timeframe spec extension to merged `Movers22TfTracker`**
+- Files: `crates/common/src/constants.rs` (timeframe list), `crates/core/src/pipeline/movers_22tf_tracker.rs` (rename or extend), `crates/core/src/pipeline/movers_22tf_scheduler.rs`, `crates/core/src/pipeline/movers_22tf_supervisor.rs`, `crates/core/src/pipeline/movers_22tf_writer_state.rs`, `crates/storage/src/movers_22tf_persistence.rs`, `crates/api/src/handlers/market_data.rs` (top-movers-22tf API endpoint)
+- Tests:
+  - `test_movers_25_timeframe_list_pinned` (constant pin)
+  - `test_bucket_start_anchored_at_0915_ist` (formula correctness — 5+ scenarios from the Reference test cases table)
+  - `test_pre_market_ticks_accumulate_into_0915_bucket`
+  - `test_post_close_ticks_ignored`
+  - `test_2m_bucket_at_0916_30_ist_returns_0915_bucket` (operator's example)
+  - `test_2m_bucket_at_0917_00_ist_returns_0917_bucket`
+  - `test_each_timeframe_has_dedicated_writer_task` (extend supervisor ratchet)
+- 9-box:
+  - ① typed event: `MoversTimeframeWriterRespawned` (existing — extend label cardinality from 22 to 25)
+  - ② ErrorCode: reuse `MOVERS-22TF-01` / `MOVERS-22TF-02` / `MOVERS-22TF-03` (already covers writer / panic / drift). Optionally rename code prefix to `MOVERS-TF-` (drop the `22` from the code).
+  - ③ tracing: `info!(timeframe = label, bucket_start = …)`
+  - ④ Prom: extend `tv_movers_writer_errors_total{stage,timeframe}` label cardinality from 22 to 25
+  - ⑤ Grafana: Operator Health "Movers 25-tf coverage" panel (extend existing 22-tf panel)
+  - ⑥ Alert: extend `tv-movers-22tf-*` alert rules to cover 25 labels
+  - ⑦ Call site: tick_processor → tracker → 25 spawned writer tasks
+  - ⑧ Triage rule: `.claude/triage/error-rules.yaml` — no change (codes unchanged)
+  - ⑨ Ratchet: 7 tests above
+
+### Open question for operator
+
+**Q4 (Item 19):** Rename `Movers22Tf*` types/files/tables to `Movers25Tf*`, OR keep `22Tf` naming + add the 3 sub-minute timeframes alongside?
+- Default: **keep `22Tf` naming + add timeframes inside** (smaller diff, less migration cost; the "22" number is now historical artifact).
+- Alternative: rename for clarity (larger diff, requires `cargo-mutants` re-baseline + dashboard rename + `MOVERS-22TF-*` ErrorCode rename).
+
+## Plan Items (now 19, was 10)
 
 Each item carries the 9-box checklist per `stream-resilience.md` B8: ① typed event, ② ErrorCode, ③ tracing+code field, ④ Prometheus counter, ⑤ Grafana panel, ⑥ alert rule, ⑦ call site, ⑧ triage YAML rule, ⑨ ratchet test.
 
