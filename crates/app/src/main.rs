@@ -2703,6 +2703,61 @@ async fn main() -> Result<()> {
             std::sync::Arc::clone(&bhavcopy_shutdown),
         );
 
+        // Wave 5 Items 4+5 LIVE — depth-20 conn-5 dynamic top-50 + depth-200
+        // dynamic top-5 orchestrator. Off by default; flip
+        // `[features] depth_dynamic_top_volume = true` to activate.
+        //
+        // Wiring contract: the orchestrator OWNS the Sender side of the
+        // command channels here. The Receiver side must be picked up by
+        // the depth-conn-pool refactor (separate sub-PR) which spawns:
+        //   * 1 dedicated depth-20 conn 5 (subscribes/swaps via the
+        //     `depth_20_conn5_rx` receiver)
+        //   * 5 depth-200 conns indexed 0..4 (each consumes its
+        //     `depth_200_slot_N_rx` receiver)
+        //
+        // Until that refactor lands, the orchestrator's `cmd_tx.send()`
+        // calls will fail (no receiver task) → DEPTH-DYN-02 fires on
+        // every 60s cycle inside market hours. That's the visible
+        // signal the operator uses to schedule the conn-pool refactor.
+        if config.features.depth_dynamic_top_volume {
+            tracing::info!(
+                "Wave 5 Items 4+5: depth_dynamic_top_volume feature ON — \
+                 spawning orchestrator. Receiver-side conn-pool refactor \
+                 must land for the dynamic conns to actually subscribe."
+            );
+            let depth_dyn_shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+
+            // Depth-20 conn 5 dynamic top-50 task.
+            let (d20_conn5_cmd_tx, _d20_conn5_cmd_rx) =
+                tokio::sync::mpsc::channel::<tickvault_core::websocket::DepthCommand>(4);
+            let _d20_dyn_handle =
+                tickvault_app::depth_dynamic_pipeline::spawn_depth_20_dynamic_conn5_task(
+                    config.questdb.clone(),
+                    d20_conn5_cmd_tx,
+                    std::sync::Arc::clone(&depth_dyn_shutdown),
+                );
+
+            // Depth-200 dynamic pool (5 slots). One channel per slot.
+            // The conn-pool refactor will own each slot's receiver.
+            let mut d200_cmd_senders = std::collections::HashMap::new();
+            for slot in 0..5_usize {
+                let (tx, _rx) =
+                    tokio::sync::mpsc::channel::<tickvault_core::websocket::DepthCommand>(4);
+                d200_cmd_senders.insert(slot, tx);
+            }
+            let _d200_dyn_handle =
+                tickvault_app::depth_dynamic_pipeline::spawn_depth_200_dynamic_pool_task(
+                    config.questdb.clone(),
+                    d200_cmd_senders,
+                    std::sync::Arc::clone(&depth_dyn_shutdown),
+                );
+        } else {
+            tracing::info!(
+                "Wave 5 Items 4+5: depth_dynamic_top_volume feature OFF (default) — \
+                 dynamic top-volume orchestrator NOT spawned; legacy depth pool active"
+            );
+        }
+
         // Parthiban directive (2026-04-21): no-tick-during-market-hours
         // watchdog (slow boot path). Same pattern as fast boot above.
         let slow_tick_heartbeat = tickvault_core::pipeline::no_tick_watchdog::new_tick_heartbeat();
