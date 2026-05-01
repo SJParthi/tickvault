@@ -13,6 +13,7 @@
 #![cfg_attr(test, allow(clippy::assertions_on_constants))]
 #![cfg_attr(test, allow(clippy::field_reassign_with_default))]
 
+pub mod bhavcopy_pipeline;
 pub mod boot_helpers;
 pub mod core_pinning;
 pub mod depth_bridge_state_writer;
