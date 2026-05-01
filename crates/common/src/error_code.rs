@@ -373,6 +373,16 @@ pub enum ErrorCode {
     /// keep their last-good gainer set; selector retries every 60s.
     Depth200Dyn01TopGainersEmpty,
 
+    /// Wave 5 Item 26 L1 — volume monotonicity breach at runtime. The Dhan
+    /// volume field at bytes 22-25 of the Quote/Full packet is cumulative
+    /// since session open per Ticket #5525125 (verified via the live Mon
+    /// May 4 monotonicity SELECT — see `docs/operator/track-2-monotonicity-select.md`).
+    /// If a tick arrives with `volume < last_seen_volume` for the same
+    /// `(security_id, exchange_segment)` within a single trading day, that
+    /// breaks cumulative-monotonicity invariant — either Dhan changed the
+    /// semantic mid-session (escalate to Item 26 L3 ticket) or our parser
+    /// regressed on the byte offset. Severity::High.
+    Volume01MonotonicityBreach,
     /// Wave 5 Item 13 — boot-time prev-close routing assertion failed.
     /// The subscription plan contains an instrument whose `(segment,
     /// feed_mode)` pair cannot deliver previous-day close per the
@@ -511,6 +521,8 @@ impl ErrorCode {
             Self::Depth200Dyn01TopGainersEmpty => "DEPTH-200-DYN-01",
             // Wave 5 Item 13 — prev-close routing
             Self::PrevClose03BootRoutingAssertion => "PREVCLOSE-03",
+            // Wave 5 Item 26 L1 — volume cumulative-monotonicity guard
+            Self::Volume01MonotonicityBreach => "VOLUME-MONO-01",
         }
     }
 
@@ -561,7 +573,8 @@ impl ErrorCode {
             | Self::Movers22Tf02SchedulerPanic
             | Self::CorePin01PinningFailedAtBoot
             | Self::Depth20Dyn03TopGainersEmpty
-            | Self::Depth200Dyn01TopGainersEmpty => Severity::High,
+            | Self::Depth200Dyn01TopGainersEmpty
+            | Self::Volume01MonotonicityBreach => Severity::High,
             // Medium: data pipeline correctness
             Self::InstrumentP0DuplicateSecurityId
             | Self::InstrumentP0CountConsistency
@@ -733,9 +746,8 @@ impl ErrorCode {
             | Self::CorePin02WorkerDrifted
             | Self::Depth20Dyn03TopGainersEmpty
             | Self::Depth200Dyn01TopGainersEmpty
-            | Self::PrevClose03BootRoutingAssertion => {
-                ".claude/rules/project/wave-5-error-codes.md"
-            }
+            | Self::PrevClose03BootRoutingAssertion
+            | Self::Volume01MonotonicityBreach => ".claude/rules/project/wave-5-error-codes.md",
         }
     }
 
@@ -855,6 +867,7 @@ impl ErrorCode {
             Self::Depth20Dyn03TopGainersEmpty,
             Self::Depth200Dyn01TopGainersEmpty,
             Self::PrevClose03BootRoutingAssertion,
+            Self::Volume01MonotonicityBreach,
         ]
     }
 }
@@ -1031,7 +1044,9 @@ mod tests {
         // DEPTH-200-DYN-01 (top-5 depth-200 selector).
         // 2026-05-01 (Wave 5 Item 13): bumped 96 -> 97 for
         // PREVCLOSE-03 (boot-time prev-close routing assertion).
-        assert_eq!(ErrorCode::all().len(), 97);
+        // 2026-05-01 (Wave 5 Item 26 L1): bumped 97 -> 98 for
+        // VOLUME-MONO-01 (cumulative-monotonicity breach).
+        assert_eq!(ErrorCode::all().len(), 98);
     }
 
     #[test]
@@ -1073,7 +1088,9 @@ mod tests {
                 // (Phase 7 merged top-150 selector that Wave 5 reverts).
                 || s.starts_with("CORE-PIN-")
                 || s.starts_with("DEPTH-20-DYN-")
-                || s.starts_with("DEPTH-200-DYN-");
+                || s.starts_with("DEPTH-200-DYN-")
+                // Wave 5 Item 26 L1: volume cumulative-monotonicity guard.
+                || s.starts_with("VOLUME-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }

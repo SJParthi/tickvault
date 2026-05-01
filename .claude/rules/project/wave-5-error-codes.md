@@ -154,6 +154,60 @@ boot emission in `crates/app/src/main.rs` is a follow-up (the tests pin
 the contract today; runtime emission is purely defence-in-depth for the
 case where someone bypasses the unit tests).
 
+## VOLUME-MONO-01 — cumulative volume monotonicity breach (Item 26 L1)
+
+**Trigger:** within a single IST trading day, a tick arrives for some
+`(security_id, exchange_segment)` pair where `volume[i] < volume[i-1]`.
+The Wave 5 in-memory L1 guard
+(`crates/core/src/pipeline/volume_monotonicity_guard.rs`) detects this on
+the hot path (O(1) per tick) and emits Severity::High with the violating
+delta.
+
+**Why this matters:** Dhan Ticket #5525125 + Cowork-verified evidence
+(Tracks 1, 3, 4) strongly suggest the `volume` field at bytes 22-25 of
+the Quote/Full packet is **cumulative-day total** since session open, not
+per-tick incremental. If the cumulative invariant breaks mid-session,
+either:
+1. Dhan changed the semantic without notice (escalate via Item 26 L3
+   Dhan support email — already drafted, awaiting operator Gmail send).
+2. Our parser regressed on the byte offset (run the parser unit-tests +
+   the live Mon May 4 09:45 IST monotonicity SELECT in
+   `docs/operator/track-2-monotonicity-select.md`).
+
+**App behaviour:** the guard does NOT stop the pipeline — ticks continue
+flowing, the breach is logged + counted (`tv_volume_monotonicity_breaches_total`),
+and the `last_seen` map preserves the previous high-water mark so a single
+decrease does not silently reset the baseline. Operator decides whether
+to halt.
+
+**Triage:**
+1. `mcp__tickvault-logs__tail_errors` — read the violating
+   `(security_id, segment, previous, current, delta)` tuples.
+2. Cross-check against the parser unit-tests
+   (`crates/core/src/parser/quote.rs` bytes 22-25 + `full.rs` bytes 22-25).
+   If the byte offsets are correct, the breach is Dhan-side.
+3. Run `docs/operator/track-2-monotonicity-select.md` SELECT against
+   QuestDB for the affected `(security_id, segment)` tuple over the
+   recent 30 minutes. Confirm whether the breach reproduces in QuestDB
+   (which would indicate persistent semantic change).
+4. If reproducible: trigger Item 26 L3 escalation. If not: parser bug —
+   open follow-up issue.
+
+**Auto-triage safe:** YES (Severity::High; the guard log + counter +
+audit are sufficient for the operator to act).
+
+**Source (Item 26 L1):**
+- `crates/core/src/pipeline/volume_monotonicity_guard.rs`
+- `crates/common/src/error_code.rs::Volume01MonotonicityBreach`
+
+**Item 26 L2 (NSE bhavcopy daily cross-check):** runbook captured in
+`docs/operator/track-2-monotonicity-select.md` and Item 29 fold-in;
+implementation deferred to a follow-up sub-PR.
+
+**Item 26 L3 (Dhan support email):** drafted via PR #414. Operator must
+Gmail-send the GitHub link to apihelp@dhan.co. The L3 escalation runs
+on Track 2 verdict from the Mon May 4 SELECT.
+
 ## Cross-references
 
 - `.claude/plans/active-plan-wave-5-indices-only.md` Items 4, 5, 6, 9
