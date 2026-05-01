@@ -1,9 +1,13 @@
 # Implementation Plan: Wave 5 — Indices-Only Subscription + Depth Redesign + Resilience Hardening
 
-**Status:** APPROVED-PENDING-REVIEW-FIXES
+**Status:** APPROVED
 **Date:** 2026-05-01
-**Approved by:** Parthiban (operator) — verbatim "yes approved" 2026-05-01
-**Re-approval pending:** 2 BLOCKERS (C1 Item 4 collision with merged `depth_20_dynamic_subscriber.rs`, C2 Item 16 collision with merged `Movers22TfTracker`) — see Item 18 for operator decision options.
+**Approved by:** Parthiban (operator) — verbatim "yes approved" 2026-05-01 + "whichever is recommended add everything" 2026-05-01 (defaults locked).
+**Operator decisions captured:**
+- **C1 → Option A:** adopt merged `depth_20_dynamic_subscriber.rs` design (slots 1+2 = NIFTY/BANKNIFTY mixed CE+PE ATM±24, slots 3/4/5 = 3 dynamic top-50 = 150 dynamic instruments). Item 4 rewritten below.
+- **C2 → Reuse:** Item 16 reuses already-merged `Movers22TfTracker`; Wave 5 adds 60s checkpoint + 25-tf extension only if not already wired. No new tracker struct.
+- **Q4 → Keep `22Tf` naming:** Item 19 extends merged `Movers22TfTracker` to 25 timeframes IN PLACE. The "22" number is now historical artifact. ErrorCode prefix `MOVERS-22TF-*` retained. Type names retained.
+- **All 26 non-blocker review findings (5 CRITICAL + 12 HIGH + 9 MEDIUM + 5 LOW)** are folded into the relevant item 9-box checklists; tracked in Item 18 Findings Remediation Index below.
 **Branch:** `claude/fetch-status-info-V56GN`
 **Triggering context:** Operator decision 2026-05-01: drop the 216-stock F&O subscription, focus exclusively on NIFTY/BANKNIFTY/SENSEX indices (all expiries, all strikes), redesign depth-20 + depth-200 around major-index single-side connections + dynamic top-volume gainers, wire core_affinity, fix two hot-path bugs caught by adversarial review.
 
@@ -628,10 +632,34 @@ Tick stream (parser) ──┐
 
 ### What we add to the plan
 
-- [ ] **Item 16. Movers hybrid storage strategy**
-- Files: `crates/core/src/pipeline/option_movers.rs`, `crates/core/src/pipeline/top_movers.rs`, `crates/core/src/pipeline/stock_movers.rs`, `crates/core/src/pipeline/movers_22tf_scheduler.rs`
-- Tests: `test_movers_tracker_per_tick_update_is_o1`, `test_movers_snapshot_cadence_is_60s_default`, `test_movers_api_query_reads_from_in_memory_arc`, `test_movers_restart_rehydrates_from_questdb_last_snapshot`
-- 9-box: Prom counter `tv_movers_snapshot_writes_total{table}`, gauge `tv_movers_in_memory_state_size_bytes`, alert `tv-movers-snapshot-cadence-drift` (>120s gap = writer task stalled), `MoversSnapshotPersisted` Severity::Info edge-triggered, ratchet test on per-tick allocation count.
+- [ ] **Item 16. Movers hybrid storage — REUSE existing `Movers22TfTracker` (BLOCKER C2 → Reuse)**
+
+**Decision:** Item 16 does NOT create a new tracker. The merged trunk (commit `16a7220`) already ships `Movers22TfTracker` (papaya-backed) wired into `tick_processor` (commit `c9f53a4`). Wave 5 contributes:
+- Verify that a 60s checkpoint to QuestDB is wired (per the parallel APPROVED `active-plan-movers-22tf-redesign-v2.md`). If yes → no-op verification. If no → add the checkpoint loop on Core 3 best-effort.
+- Verify atomicity: `Movers22TfTracker` internal state must use `AtomicU64` / `AtomicI64` only (per C3). If any non-atomic field exists, refactor.
+- Verify snapshot rank computation runs on Core 3 in `tokio::spawn` (per C4).
+- Verify channel between tracker and writer is bounded `mpsc::channel(8192)` drop-NEWEST (per H11).
+- Verify daily reset semantics: tracker resets at IST midnight OR cleanly carries pre-market data into the 09:15 first bucket (per H3, H9, anchor formula in Item 19).
+
+- Files: `crates/core/src/pipeline/movers_22tf_tracker.rs` (verify atomic-only), `crates/core/src/pipeline/movers_22tf_scheduler.rs` (verify Core 3), `crates/core/src/pipeline/movers_22tf_writer_state.rs` (verify channel bounded), `crates/core/src/pipeline/movers_22tf_supervisor.rs`
+- Tests:
+  - `test_movers_22tf_state_uses_atomics_only` (C3 — DHAT zero-alloc proof on per-tick update)
+  - `test_movers_22tf_snapshot_runs_on_core_3_not_core_1` (C4)
+  - `test_movers_22tf_snapshot_pin_pattern_no_torn_reads` (C5 — loom test)
+  - `test_movers_22tf_writer_channel_bounded_8192_drop_newest` (H11)
+  - `test_movers_22tf_resets_at_ist_midnight_or_anchors_to_0915` (H3, H9)
+  - `test_movers_22tf_warmup_signal_emitted_at_first_snapshot_post_boot` (H9 — `MoversTrackerReady` Severity::Info)
+  - `test_movers_22tf_daily_state_does_not_leak_across_trading_days` (H3)
+- 9-box (extending existing `MOVERS-22TF-01/02/03`):
+  - ① typed event: existing `Movers22TfWriterIlpFailed` + add `MoversTrackerReady` (Severity::Info, edge-triggered first snapshot post-boot)
+  - ② ErrorCode: existing `MOVERS-22TF-01/02/03`; no new codes
+  - ③ tracing: existing `info!(tf, snapshot_count, …)`
+  - ④ Prom: existing `tv_movers_writer_errors_total{stage,timeframe}`; add `tv_movers_warmup_complete` info gauge (1 = ready, 0 = warmup)
+  - ⑤ Grafana: existing 22-tf Operator Health panel (extends to 25 tf labels per Item 19)
+  - ⑥ Alert: existing `tv-movers-22tf-*` rules; cardinality auto-extends
+  - ⑦ Call site: existing `tick_processor` enrichment (commit `c9f53a4`); no new call site
+  - ⑧ Triage rule: existing
+  - ⑨ Ratchet: 7 tests above + DEDUP keys for `top_movers_22tf` documented as `(timeframe, bucket, rank_category, rank, security_id, segment)` per existing `movers_persistence.rs:242`
 
 ## Dhan Documentation Pin — Previous Close in Full / Quote Packets
 
@@ -791,15 +819,52 @@ The 33 findings break into:
 - **9 MEDIUMs:** same.
 - **5 LOWs:** same; some are verify-only (L1).
 
-### Status update
+### Status update — RESOLVED 2026-05-01
 
-Wave 5 plan moves from `Status: APPROVED` → `Status: APPROVED-PENDING-REVIEW-FIXES` until:
-1. Operator confirms BLOCKER C1 path (Option A vs B vs C)
-2. Operator confirms BLOCKER C2 (Item 16 reuses `Movers22TfTracker`)
-3. Items 1-17 9-box checklists are amended with the 26 non-blocker findings
-4. Item 18 itself is added as the explicit "review fixes" tracker
+Operator approved defaults verbatim "whichever is recommended add everything" 2026-05-01:
+1. **BLOCKER C1 → Option A** (adopt merged design). Item 4 rewritten above.
+2. **BLOCKER C2 → Reuse** existing `Movers22TfTracker`. Item 16 rewritten above.
+3. **Item 19 Q4 → Keep `22Tf` naming** + extend in place to 25 timeframes.
 
-Then re-approve and start Item 1 implementation.
+Plan moves back to `Status: APPROVED`. Implementation can begin.
+
+### Findings Remediation Index
+
+Each non-blocker finding mapped to its remediation site:
+
+| Finding | Severity | Source | Plan amendment site |
+|---|---|---|---|
+| C3 — papaya MoversState atomic-only | CRITICAL | hot-path | Item 16 test `test_movers_22tf_state_uses_atomics_only` |
+| C4 — BTreeSet snapshot on Core 3 | CRITICAL | hot-path | Item 6 9-box (Core 3 mapping) + Item 16 test `test_movers_22tf_snapshot_runs_on_core_3_not_core_1` |
+| C5 — snapshot vs per-tick race | CRITICAL | bug-hunt | Item 16 test `test_movers_22tf_snapshot_pin_pattern_no_torn_reads` (loom) |
+| C6 — PREVCLOSE-03 false-OK on empty cache | CRITICAL | bug-hunt | Item 13 + new ErrorCode **PREVCLOSE-04** (cache empty for instr > 5min market hours, Severity::High) |
+| C7 — subscription.scope Figment merge silent flip | CRITICAL | bug-hunt | Item 1 + new ErrorCode **CONFIG-01** (scope must be explicit in env-overlay TOML, Critical, halt boot) |
+| H1 — chaos burst pre-built array | HIGH | hot-path | Item 11 — pre-build `[ParsedTick; 1024]` + cycle via `i % 1024` |
+| H2 — depth selectors on Core 3 | HIGH | hot-path | Item 4 + Item 5 + Item 6 9-box |
+| H3 — Item 15 cache-miss fail-safe | HIGH | security | Item 15 + new ErrorCode **PREVCLOSE-05** (rehydration empty during market hours = halt OR default + suppress depth selector) |
+| H4 — core_affinity unsafe justification | HIGH | security | Item 6 — `// APPROVED: core_affinity 0.8.3 calls sched_setaffinity` comment + `cargo audit` for the dep |
+| H5 — ILP injection sanitization | HIGH | security | Item 4 + Item 5 — `test_selector_result_sanitized_before_ilp_write` |
+| H6 — IST timestamp explicit in rehydration | HIGH | security | Item 15 — pin `Utc::now() + IST_UTC_OFFSET_NANOS` + ratchet `test_prev_close_rehydration_query_uses_ist_offset` |
+| H7 — edge-trigger hysteresis | HIGH | bug-hunt | Item 4 — `test_depth_20_swap_hysteresis_3_position_min` + DEPTH-DYN-04 alert |
+| H8 — sub-4-vCPU pinning | HIGH | bug-hunt | Item 6 — read `core_affinity::get_core_ids().len()`, pin `min(N, 4)`, emit CORE-PIN-03 if N<4 (Severity::Medium) |
+| H9 — daily reset undefined | HIGH | bug-hunt | Item 16 + Item 19 — 09:15 IST anchor formula + `MoversTrackerReady` warmup signal + suppress depth selector emptiness during `[boot_ts, boot_ts + 90s]` |
+| H10 — NSE_EQ Quote downstream consumers | HIGH | bug-hunt | Item 14 — `test_no_consumer_reads_depth_for_nse_eq` |
+| H11 — channel boundedness | HIGH | bug-hunt | Item 16 — `mpsc::channel(8192)` drop-NEWEST |
+| H12 — chaos test market-hours gate | HIGH | bug-hunt | Item 11 — `#[ignore]` + `make chaos` invocation |
+| M1 — HashMap::with_capacity | MEDIUM | hot-path | Item 7 test |
+| M2 — NSE_EQ prev-close cache reuse | MEDIUM | hot-path | Item 14 9-box (forbid Mutex) |
+| M3 — bear-day page storm risk-link | MEDIUM | security | Items 4+5+15 — H3/C6/H9 cumulatively resolve |
+| M4 — top_movers_22tf DEDUP keys explicit | MEDIUM | security | Item 16 9-box: `(timeframe, bucket, rank_category, rank, security_id, segment)` per existing movers_persistence.rs:242 |
+| M5 — PREVCLOSE-03 runtime semantics | MEDIUM | security | Item 13 — boot=halt; runtime=Severity::High + last valid plan |
+| M6 — candle_aggregator workspace migration | MEDIUM | bug-hunt | Item 7 subtask "audit + migrate all call sites" |
+| M7 — counter naming + increase() | MEDIUM | bug-hunt | All 9-box checklists — counter `_total` only on counters; gauges drop suffix; `increase()` / `rate()` on Grafana |
+| M8 — single SQL query both selectors | MEDIUM | bug-hunt | Item 5 — reuse Item 4's selector result via shared `Arc<Vec<Row>>` |
+| M9 — Item 12 verify-only no-op | MEDIUM | bug-hunt | Item 12 test rename `test_option_movers_writer_narrows_naturally_under_indices_only` |
+| L1 — Depth200Dyn01 collision check | LOW | bug-hunt | Item 9 — verify before adding variant |
+| L2 — ts UTC/IST normalization | LOW | bug-hunt | Item 4 + Item 5 — `test_depth_20_query_uses_ist_offset_for_ts_freshness` |
+| L3 — Phase 2 inert guard PHASE2-02 | LOW | bug-hunt | Item 2 — under indices-only, guard instantiated + `emit_skipped()` called (NOT dropped without firing) |
+| L4 — wave-5-sub-branches.md templating | LOW | security | Item 17 — flag for review if file gains dynamic content |
+| L5 — papaya pin per-batch | LOW | hot-path | Item 16 — `test_movers_tracker_pins_papaya_once_per_batch_not_per_tick` |
 
 ## Item 19 — 25-Timeframe Movers Calculation Spec (operator requirement 2026-05-01)
 
@@ -947,26 +1012,98 @@ Each item carries the 9-box checklist per `stream-resilience.md` B8: ① typed e
 - Algorithm: group by [IDX_I, NSE_EQ, NSE_FNO+BSE_FNO]; sort each group by security_id ASC; `conn_index = i % 5`. Stable across boots.
 - 9-box: ① N/A ② N/A ③ tracing `info!(conn = i, count = n)` per conn at boot ④ `tv_main_feed_per_conn_instrument_count` gauge with `{conn}` label ⑤ Operator Health "Main feed distribution" stacked-bar panel ⑥ `tv-main-feed-conn-overload` (any conn > 4,500) ⑦ `connection_pool::distribute` ⑧ N/A ⑨ deterministic-replay test + spread test
 
-### - [ ] 4. Depth-20 5-conn split (4 single-side index + 1 top-50 gainers)
+### - [ ] 4. Depth-20 — REWRITTEN PER OPERATOR DECISION 2026-05-01 (BLOCKER C1 → Option A)
 
-- Files: `crates/core/src/websocket/depth_connection.rs`, `crates/core/src/instrument/depth_strike_selector.rs`, `crates/core/src/instrument/depth_20_top_gainers.rs` (new), `crates/app/src/main.rs`
-- Tests: `test_depth_20_conn_1_is_nifty_ce_atm_24`, `test_depth_20_conn_2_is_nifty_pe_atm_24`, `test_depth_20_conn_3_is_banknifty_ce_atm_24`, `test_depth_20_conn_4_is_banknifty_pe_atm_24`, `test_depth_20_conn_5_is_top_50_volume_gainers`, `test_depth_20_total_under_dhan_50_per_conn_cap`, `test_depth_20_excludes_sensex`
-- Top-50 selector queries `option_movers` every 60s. SQL is the canonical "Selector SQL" block above (top-volume bucket → sort by `change_pct` DESC → SENSEX-skipped → LIMIT 50). Edge-triggered swap via existing `DepthCommand::Swap20` only when the set diff is non-empty (rank-set churn, not order churn).
-- 9-box: ① `Depth20TopSetEmpty` (existing DEPTH-DYN-01 reused — fires when result < 50) + new `Depth20TopGainersSwapped` (Severity::Low, edge-triggered on rank change) ② `DEPTH-20-DYN-03` (top-50 selector empty/below capacity, severity High) ③ `error!(code = ErrorCode::Depth20Dyn03TopGainersEmpty.code_str())` ④ `tv_depth_20_top_gainers_set_size` gauge, `tv_depth_20_top_gainers_swaps_total` counter ⑤ Operator Health "Depth-20 top-50 gainers" panel ⑥ `tv-depth-20-dyn-03-empty-set` (gauge < 25 for > 5min during market hours) ⑦ `main.rs::run_depth_20_top_gainers_loop` ⑧ `.claude/triage/error-rules.yaml::depth-20-dyn-03-top-set-empty-escalate` ⑨ all 7 ratchet tests above + `test_top_50_query_filters_change_pct_positive`
+**Decision:** Adopt the already-merged `depth_20_dynamic_subscriber.rs` (commits `f3b7baa`, `29b1407`, `72028c5`, `c9f53a4`). Wave 5 contributes **verification + hardening only**; no architectural rewrite.
+
+**Final depth-20 layout:**
+
+| Conn | Underlying / source | Side | Strikes | Count |
+|---:|---|:---:|---|---:|
+| 1 | NIFTY current expiry | mixed CE+PE | ATM ±24 | 49 |
+| 2 | BANKNIFTY current expiry | mixed CE+PE | ATM ±24 | 49 |
+| 3 | Dynamic top-150 slot 1 (existing `depth_20_dynamic_subscriber.rs`) | mixed | dynamic 60s, 50/slot | 50 |
+| 4 | Dynamic top-150 slot 2 | mixed | dynamic 60s, 50/slot | 50 |
+| 5 | Dynamic top-150 slot 3 | mixed | dynamic 60s, 50/slot | 50 |
+| **Total** | | | | **248** |
+
+- Files: `crates/core/src/instrument/depth_20_dynamic_subscriber.rs` (extend, don't replace), `crates/app/src/main.rs` (wiring verification), `crates/core/src/websocket/depth_connection.rs`
+- Existing SQL stays as-is: `WHERE change_pct > 0 ORDER BY volume DESC LIMIT 150` (already in `DEPTH_20_DYNAMIC_SELECTOR_SQL`). Wave 5 does NOT change this; the operator's earlier "category=TOP_VOLUME / change_pct DESC" idea is superseded by Option A.
+- Wave 5 test additions (extending existing 50+ ratchet tests):
+  - `test_depth_20_slots_1_and_2_pinned_to_nifty_banknifty_atm_24`
+  - `test_depth_20_slots_3_4_5_use_dynamic_top_150_split_50_each`
+  - `test_depth_20_total_instrument_count_is_248`
+  - `test_depth_20_excludes_sensex_in_dynamic_slots` (BSE_FNO filter on selector result)
+  - `test_depth_20_swap_hysteresis_3_position_min` (per H7 — anti-thrash guard)
+  - `test_depth_20_dynamic_selector_runs_off_hot_path` (per C4/H2 — not on Core 0/1)
+  - `test_depth_20_dynamic_subscriber_handles_sub_4_vcpu_gracefully` (per H8)
+  - `test_depth_20_dynamic_set_sanitized_before_ilp_write` (per H5 — ILP injection guard)
+  - `test_depth_20_query_uses_ist_offset_for_ts_freshness` (per L2 — TZ normalization)
+- 9-box (extending existing wiring):
+  - ① typed event: existing `Depth20DynamicTopSetEmpty` + `Depth20DynamicSwapChannelBroken`
+  - ② ErrorCode: existing `DEPTH-DYN-01` + `DEPTH-DYN-02`; Wave 5 adds **`DEPTH-DYN-04`** (rank churn without semantic change — H7 hysteresis violation, Severity::Medium)
+  - ③ tracing: existing `info!(slot, count, …)`
+  - ④ Prom: existing `tv_depth_20_dynamic_*` gauges; add `tv_depth_20_swap_thrash_ratio` (H7); add `tv_depth_20_dynamic_set_sanitized_total` (H5)
+  - ⑤ Grafana: existing depth-flow panel (extend with Wave 5 thrash counter)
+  - ⑥ Alert: existing `tv-depth-dyn-01-top-set-empty-escalate` + `tv-depth-dyn-02-swap-channel-broken-escalate`; add `tv-depth-dyn-04-thrash` (rate > 1/min sustained 5min market hours)
+  - ⑦ Call site: existing `run_depth_20_dynamic_subscriber` in main.rs
+  - ⑧ Triage rule: existing entries + new `.claude/triage/error-rules.yaml::depth-dyn-04-thrash-suppress`
+  - ⑨ Ratchet: 9 Wave 5 additions above + extend existing 50+ tests in `depth_20_dynamic_subscriber.rs::tests`
 
 ### - [ ] 5. Depth-200 dynamic top-5 (replaces static ATM CE/PE)
 
 - Files: `crates/core/src/websocket/depth_connection.rs`, `crates/core/src/instrument/depth_200_top_gainers.rs` (new), `crates/app/src/main.rs`
 - Tests: `test_depth_200_picks_top_5_by_volume`, `test_depth_200_filters_change_pct_positive`, `test_depth_200_one_instrument_per_conn`, `test_depth_200_swap_on_rank_change`, `test_depth_200_excludes_sensex`
-- Replaces existing static `["NIFTY", "BANKNIFTY"]` ATM CE/PE config in `main.rs:2151,3113,3685`. Uses existing `DepthCommand::Swap200` path. 60s rebalance from `option_movers` using the canonical "Selector SQL" block above (top-volume bucket → sort by `change_pct` DESC → SENSEX-skipped → LIMIT 5). Edge-triggered swap on rank-set churn only.
+- Replaces existing static `["NIFTY", "BANKNIFTY"]` ATM CE/PE config in `main.rs:2151,3113,3685`. Uses existing `DepthCommand::Swap200` path. 60s rebalance: query the SAME `DEPTH_20_DYNAMIC_SELECTOR_SQL` result (Option A reuse — no separate SQL), take the top 5 NSE_FNO rows after SENSEX-skip. **Single shared `Arc<Vec<Row>>` query result feeds both Item 4 and Item 5** (per M8 — atomic snapshot guarantee).
+- Hysteresis: rank-set must change by ≥1 position to trigger swap (top-5 is small enough that any change matters; no thrash guard needed beyond the existing edge-trigger).
+- Test additions: `test_depth_200_reuses_depth_20_selector_result_no_separate_query`, `test_depth_200_excludes_sensex_takes_next_eligible`, `test_depth_200_5_conns_x_1_instrument_each`, `test_depth_200_query_uses_ist_offset_for_ts_freshness`
 - 9-box: ① new `Depth200TopGainersSwapped` (Severity::Low, edge-triggered) + reuse `Depth200SwapChannelBroken` (existing DEPTH-DYN-02) ② `DEPTH-200-DYN-01` (top-5 selector returned < 5, severity High) ③ `error!(code = ErrorCode::Depth200Dyn01TopSetEmpty.code_str())` ④ `tv_depth_200_top_gainers_set_size`, `tv_depth_200_top_gainers_swaps_total` ⑤ Operator Health "Depth-200 top-5" panel ⑥ `tv-depth-200-dyn-01-empty-set` ⑦ `main.rs::run_depth_200_top_gainers_loop` ⑧ `.claude/triage/error-rules.yaml::depth-200-dyn-01-top-set-empty-escalate` ⑨ all 5 tests above
 
-### - [ ] 6. Wire `core_affinity` — pin 4 Tokio workers to 4 vCPUs
+### - [ ] 6. Wire `core_affinity` — pin 4 Tokio workers to 4 vCPUs (Mac dev MIRRORS AWS 4-vCPU)
+
+**Operator decision 2026-05-01:** Dev Mac (M4 Pro 14 cores = 10P + 4E) MUST reproduce the AWS c7i.xlarge 4-vCPU configuration EXACTLY for parity testing. Operator verbatim: "even in our local dev macbook also reproduce the same aws 4vcpu dude okay?"
+
+**Why 4-vCPU parity matters (per `wave-4-shared-preamble.md` §6):**
+
+| Concern | Without parity | With parity |
+|---|---|---|
+| Burst chaos test (Item 11) at 200K tps | Mac has 14 cores → no preemption observed → false-OK | Mac forced to 4 cores → real preemption surfaces → catches Item 11 hot-path violations BEFORE prod |
+| Tokio scheduler behaviour | Different worker count → different work-stealing patterns | Identical scheduler shape on both |
+| Hot-path benchmarks (Criterion budgets) | 14-core baseline → faster than prod → meaningless 5% regression gate | 4-core baseline matches prod |
+| `core_affinity::set_for_current` test | Skips on N != 4 → never tested locally | Always exercised |
+| Item 11 chaos burst | Passes on dev, fails on prod | Same envelope both sides |
+
+**Implementation:**
+
+1. **Worker count:** `tokio::runtime::Builder::new_multi_thread().worker_threads(4)` UNCONDITIONALLY (not `num_cpus::get()`).
+2. **Core affinity on Mac (Darwin):** `core_affinity` 0.8.3 supports macOS via `thread_policy_set`. Pin 4 workers to 4 specific P-cores (recommend cores 0–3 = first 4 P-cores; the M4 Pro's E-cores 10–13 are unsuitable for hot-path latency).
+3. **Core affinity on Linux (AWS):** pin 4 workers to vCPUs 0–3 via `sched_setaffinity`.
+4. **Boot-time verify:** read process affinity via:
+   - Linux: `/proc/self/task/*/status` `Cpus_allowed_list`
+   - macOS: `task_info()` / `proc_pidinfo()` (or just trust `core_affinity::get_for_current`'s post-set verification)
+5. **Detection of host capability:** `core_affinity::get_core_ids().len() < 4` → `CORE-PIN-04` (Severity::Critical, halt boot — host too small for parity).
 
 - Files: `crates/app/src/main.rs`, `crates/app/src/runtime.rs` (new), `Cargo.toml` (already has core_affinity 0.8.3)
-- Tests: `test_core_affinity_actually_pinned_via_proc_status`, `test_runtime_builder_sets_worker_count_to_vcpu_count`, `test_pinning_skipped_gracefully_on_single_vcpu_host`, `test_each_worker_has_unique_cpu_set`
-- Use `tokio::runtime::Builder::new_multi_thread().worker_threads(4).on_thread_start(|| { core_affinity::set_for_current(...) })`. Read `/proc/self/task/*/status` post-boot; assert `Cpus_allowed_list` is single-cpu per worker.
-- 9-box: ① `CorePinningFailed` (Severity::High) ② `CORE-PIN-01` (pinning failed at boot, severity High), `CORE-PIN-02` (worker drifted off pinned core, severity Medium) ③ `error!(code = ErrorCode::CorePin01PinningFailedAtBoot.code_str())` ④ `tv_core_pinning_workers_pinned_total` gauge (expect = 4) ⑤ Operator Health "Core affinity" panel ⑥ `tv-core-pin-01-pinning-failed` (gauge != 4 at boot) ⑦ `main.rs::build_runtime` ⑧ `.claude/triage/error-rules.yaml::core-pin-01-pinning-failed-at-boot-escalate` ⑨ all 4 tests above + boot-time assertion
+- Tests:
+  - `test_runtime_builder_uses_worker_threads_4_unconditional` (NOT `num_cpus::get()`)
+  - `test_core_affinity_pinned_4_workers_on_linux_via_proc_status`
+  - `test_core_affinity_pinned_4_workers_on_macos_via_task_info`
+  - `test_each_worker_has_unique_cpu_set` (no two workers sharing a core)
+  - `test_e_cores_excluded_on_apple_silicon` (workers must be on P-cores 0–9, not E-cores 10–13 on M4 Pro; verify via core_id range)
+  - `test_boot_halts_when_host_has_fewer_than_4_cores` (CORE-PIN-04)
+  - `test_pinning_unsafe_call_carries_approved_comment` (H4 — source-scan ratchet)
+- 9-box:
+  - ① `CorePinningFailed` (Severity::High) + new `CorePinningHostTooSmall` (Severity::Critical, halts boot)
+  - ② `CORE-PIN-01` (pinning failed at boot, High), `CORE-PIN-02` (worker drift, Medium), `CORE-PIN-03` (sub-4-vCPU graceful continue — only used when operator opts out via `TICKVAULT_ALLOW_SUB_4_VCPU=1` env override; default = HALT not continue), **`CORE-PIN-04`** (host has < 4 cores, Critical, halt boot — Mac parity demand)
+  - ③ `error!(code = ErrorCode::CorePin04HostTooSmall.code_str())` on halt
+  - ④ Prom: `tv_core_pinning_workers_pinned` gauge (expect = 4) + `tv_core_pinning_host_core_count` info gauge — exposes whether dev Mac is correctly running with 14 cores OR forced 4
+  - ⑤ Operator Health "Core affinity" panel — single row showing "4/4 pinned, host has N cores" (info-only)
+  - ⑥ Alert: `tv-core-pin-01-pinning-failed` (existing) + `tv-core-pin-04-host-too-small`
+  - ⑦ Call site: `main.rs::build_runtime`
+  - ⑧ Triage: existing entries + `core-pin-04-host-too-small-escalate`
+  - ⑨ Ratchet: 7 tests above + boot-time assertion + H4 source-scan + H8 graceful-skip-with-env-override + C4/H2 mapping (depth selectors + movers snapshot computation must `tokio::spawn` on Core 3, NOT inherit caller's core)
+
+**Mac dev workflow note:** Devs running on M4 Pro will see only 4 of 14 cores utilized — this is BY DESIGN for parity. To temporarily disable for non-parity work, set `TICKVAULT_ALLOW_SUB_4_VCPU=1` (per CORE-PIN-03 graceful path).
 
 ### - [ ] 7. Fix CRITICAL: candle_aggregator segment-aware key (I-P1-11)
 
@@ -1038,7 +1175,7 @@ cargo test --features dhat             # zero hot-path allocations
 |---|---|---|
 | 1 | ~~Top-50 / Top-5 query — should we ALSO require `volume > 0`?~~ **ANSWERED 2026-05-01:** Selector restricted to `category = 'TOP_VOLUME'` bucket, then sorted by `change_pct` DESC, SENSEX (BSE_FNO) skipped. `volume > 0` defensive guard included. Canonical SQL pinned in "Selector SQL" section above. | (resolved) |
 | 2 | If on-day-1-boot the `option_movers` table is empty (e.g., first 60s after universe build), should depth-20 conn 5 + depth-200 5 conns: (a) skip subscribe and wait, or (b) fall back to NIFTY/BANKNIFTY ATM as today? | (a) skip + retry every 60s; INFO Telegram once |
-| 3 | core_affinity on dev Mac (typically 8-12 cores) vs AWS c7i.xlarge (4 vCPUs) — do we hard-fail boot on Mac if `vcpu_count != 4`? | No, pin to first 4; Mac is dev-only |
+| 3 | ~~core_affinity on dev Mac vs AWS c7i.xlarge — hard-fail if vcpu mismatch?~~ **ANSWERED 2026-05-01:** dev Mac MUST mirror AWS 4-vCPU exactly. Operator: "even in our local dev macbook also reproduce the same aws 4vcpu". See Item 6 Mac-parity amendment below. | (resolved) |
 
 ## Notes
 
