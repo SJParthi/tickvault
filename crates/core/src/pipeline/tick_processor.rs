@@ -1126,14 +1126,20 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                         );
                     }
                     // Wave 5 Item 15 (2026-05-01) — `previous_close` table
-                    // write for NSE_EQ Quote-packet close field REMOVED.
-                    // The in-memory `movers.update_prev_close` /
-                    // `opt_movers.update_prev_close` calls above still
-                    // serve runtime change_pct queries; on restart, the
-                    // cache is rehydrated from the latest tick of the
-                    // current trading day in `ticks` (single QuestDB
-                    // SELECT). Boot recovery for IDX_I still uses
-                    // `previous_close` table — see code-6 path below.
+                    // write for NSE_EQ Quote-packet close field REMOVED
+                    // (~99.7% ILP write cut). The in-memory
+                    // `movers.update_prev_close` / `opt_movers.update_prev_close`
+                    // calls above still serve runtime change_pct queries.
+                    // HONEST RECOVERY ENVELOPE: on mid-day restart,
+                    // NSE_EQ / NSE_FNO / BSE_FNO movers caches start
+                    // empty and are repopulated by the NEXT Quote / Full
+                    // tick that carries `day_close`. `change_pct` for
+                    // those (security_id, segment) pairs reads `0.0`
+                    // until the next tick arrives — typically <2s during
+                    // market hours, <60s in pre-open. Boot recovery for
+                    // IDX_I still uses `previous_close` table via the
+                    // code-6 path below (separate file-cache + QuestDB
+                    // path in main.rs::boot_index_prev_close_cache).
                     // Ratchet: `wave_5_prev_close_writes_idx_i_only_guard.rs`.
                 }
 
