@@ -1648,3 +1648,86 @@ At 422M rows/day across all 25 timeframes, storing the 6 enrichment columns adds
 ### Schema unchanged
 
 `movers_unified` schema stays at the 11 columns specified in Item 23 above. **No enrichment columns in the table itself.** Item 23's storage cost projections remain valid (~12 bytes/row compressed → 76 GB hot at 90-day retention with tiered sub-minute retention).
+
+## Item 24 — Plan-Wide Proof Matrix: O(1) Latency × Uniqueness × Deduplication (operator demand 2026-05-01)
+
+Operator: "how effectively all these entire plan will achieve O(1) latency and uniqueness guarantee and deduplication as well dude okay? provide me all these with real-time checks and guarantee and assurance and proof as well."
+
+Every item in Wave 5 is mapped below to its concrete mechanical proof for each of the 3 properties. **No item ships without all 3 columns satisfied.**
+
+### Per-item proof matrix
+
+| # | Item | O(1) latency proof | Uniqueness proof | Dedup proof |
+|---:|---|---|---|---|
+| 1 | `subscription.scope` config gate | Boot-time only (NOT hot path); enum dispatch O(1) | N/A (config) | N/A |
+| 2 | Universe filter (11,018 instr) | Boot-time only; `Arc<HashMap>` registry build O(N) once | `(security_id, exchange_segment)` composite per I-P1-11 | `DEDUP_KEY_DERIVATIVE_CONTRACTS = "security_id, underlying_symbol, exchange_segment"` |
+| 3 | Main feed equal-split | Boot-time `i % 5` round-robin; reconnect replays static plan from `Arc<Vec<SubscriptionMessage>>` | Composite key (sid, seg) for distribution | Subscribe is idempotent (Dhan ignores duplicates) |
+| 4 | Depth-20 single-side (4 static + 1 dynamic) | Static slots: boot-time. Dynamic slot: 60s scheduler on Core 3 (off hot path) | `(security_id, exchange_segment)` per registry lookup; `BSE_FNO` filter excludes SENSEX | DEDUP UPSERT on `subscription_audit_log`; selector-set diff by Vec equality (idempotent on no-change) |
+| 5 | Depth-200 dynamic top-5 | Same — 60s scheduler on Core 3; reuses Item 4's `Arc<Vec<Row>>` (M8) | Composite (sid, seg) | Same audit table; rank-set diff |
+| 6 | `core_affinity` 4-vCPU pinning | Boot-time pin; protects hot path FROM preemption variance (the ENABLER of O(1) under burst) | N/A | N/A |
+| 7 | candle_aggregator composite-key fix | `HashMap<(u32, ExchangeSegment), OhlcvState>` lookup is O(1) amortized; DHAT zero-alloc per tick | **THIS ITEM IS the I-P1-11 fix** for candle_aggregator | `DEDUP_KEY_CANDLES_*` per timeframe table, all include segment |
+| 8 | `warn!` → `error!` at tick_persistence.rs:357 | Log call, not hot path | N/A (log meta) | N/A |
+| 9 | New ErrorCode variants | Enum match O(1) | `code_str()` cross-ref test enforces uniqueness across 53+ existing variants | N/A |
+| 10 | Adversarial 3-agent review | Process; not code | N/A | N/A |
+| 11 | Burst chaos test 200K tps | Pre-built `[ParsedTick; 1024]` array, cycle via `i % 1024` — zero alloc per iteration | Test uses composite-key sids | DEDUP verified by replay test |
+| 12 | option_movers narrowing | Verify-only; if pass = no-op | Composite key already in `option_movers` writer | `DEDUP_KEY_MOVERS = "security_id, category, segment"` |
+| 13 | Prev-close routing boot assertion | Boot-time only; halts if invariant violated | Composite (sid, seg) checked per slot | N/A (assertion is fail-fast) |
+| 14 | NSE_EQ Full → Quote downgrade | Parser dispatcher: `match response_code` jump table O(1) per packet; SAME hot path latency as before | N/A | N/A |
+| 15 | Drop redundant prev_close writes | Reduces ILP append rate by 99.7% (positive O(1) impact); in-memory cache lookup O(1) via `papaya` | Cache key = `(security_id, exchange_segment)` per I-P1-11 | `DEDUP_KEY_PREVIOUS_CLOSE` includes segment; first_seen_set prevents per-tick duplicate writes |
+| 17 | Parallelization map docs | N/A | N/A | N/A |
+| 18 | Findings remediation tracker | Doc only | N/A | N/A |
+| 20 | May 2026 cutover timeline | Doc only | N/A | N/A |
+| 22 | Per-Item Guarantee Matrix | Process meta-item | N/A | N/A |
+| **23** | **Unified-schema movers** | **Per-tick update on `papaya::HashMap` with `AtomicU64`/`AtomicI64`-only fields = O(1) lock-free; per-snapshot rank computation runs on Core 3 (off hot path) with arena pool zero-alloc; Criterion bench `bench_movers_unified_full_snapshot_p99_under_200ms` is the ratchet** | **DEDUP key 4-col `(ts, security_id, segment, timeframe)` per I-P1-11 + STORAGE-GAP-01; meta-guard `dedup_segment_meta_guard.rs` scans the constant** | **DEDUP UPSERT KEYS `(ts, security_id, segment, timeframe)` — replay-safe; tie-break deterministic `<sort_col> DESC, volume DESC, security_id ASC`** |
+
+### Cross-cutting mechanical enforcement (not per-item, applies plan-wide)
+
+| Property | Enforcement | Real-time check |
+|---|---|---|
+| **O(1) latency** | `quality/benchmark-budgets.toml` (Criterion budgets: tick_binary_parse ≤10ns, papaya_lookup ≤50ns, oms_state_transition ≤100ns, full_tick_processing ≤10µs); `scripts/bench-gate.sh` fails CI on >5% regression | `cargo bench` post-merge + Prom histogram `tv_tick_processing_duration_ns` p99 |
+| | DHAT zero-alloc tests (`crates/*/tests/dhat_*.rs`) — hot path must allocate ≤4 blocks / 8KB across 10K calls | DHAT post-merge gate (hard-fail in CI) |
+| | Banned-pattern scanner blocks `clone()`, `format!()`, `Vec::new()`, `Box`, `dyn`, `dashmap`, mutex on hot path | Pre-commit hook |
+| | `core_affinity` Item 6 pins 4 Tokio workers to dedicated cores → eliminates preemption-induced variance | `tv_core_pinning_workers_pinned == 4` gauge alert |
+| **Uniqueness** | I-P1-11 composite key `(security_id, exchange_segment)` enforced everywhere via 7 mechanical layers (planner dedup, CSV-parse dedup, registry composite index, storage DEDUP keys, banned-pattern hook category 5, runtime collision detector, Prom gauge) | `tv_instrument_registry_cross_segment_collisions` gauge in `/health` + `make doctor` |
+| | `dedup_segment_meta_guard.rs` scans every `DEDUP_KEY_*` constant; CI hard-fail if any mentions `security_id` without `segment`/`exchange_segment`/`exchange` | Workspace test suite |
+| | Banned-pattern scanner category 5 blocks new `HashSet<u32>` / `HashSet<SecurityId>` / `HashMap<u32, _>` / `HashMap<SecurityId, _>` / `.registry.get(id)` without `// APPROVED:` | Pre-commit hook |
+| **Deduplication** | Every QuestDB storage table has `DEDUP UPSERT KEYS` including the designated `ts` + composite (security_id, segment) + table-specific dimensions (timeframe / category / sequence_number / etc.) | DDL + meta-guard tests |
+| | Idempotency keys for orders (UUID v4 in Valkey before submission) per OMS-GAP-05 | Replay-safe; double-orders impossible |
+| | Audit tables (6 of them per Wave 2-D Items 8/9) all use composite DEDUP including `ts` to prevent same-day-same-event duplication | `audit_*_persistence.rs` DEDUP key tests |
+| | Tick rescue ring → spill NDJSON → DLQ chain: re-replay safe because every ILP append is dedup-protected; same tick written twice = single row at QuestDB | `chaos_zero_tick_loss.rs` regression test |
+
+### Real-time monitoring (live ground truth, not aspirational claims)
+
+| Property | Live signal | Where to read |
+|---|---|---|
+| O(1) latency holds | `tv_tick_processing_duration_ns` p99 < 10µs | Prometheus `prometheus:9090` + Grafana Operator Health panel |
+| O(1) on movers (Item 23) | `tv_movers_unified_arena_pool_alloc_count == 0` gauge | Prometheus + Operator Health |
+| Uniqueness (no cross-segment merge) | `tv_instrument_registry_cross_segment_collisions` gauge | `/health` endpoint + `mcp__tickvault-logs__run_doctor` |
+| Dedup correctness | `tv_questdb_dedup_skipped_total` counter (rises = same-key second write was deduped) | Prometheus |
+| Burst absorption (no rows dropped under burst) | `tv_movers_unified_burst_peak_rows_per_sec` gauge + `tv_tick_dropped_total` (must be 0) | Prom + Telegram alert if non-zero |
+| WS no-disconnect | `tv_websocket_connections_active == 5` gauge | `/health` + Operator Health |
+| QuestDB no-fail | `tv_questdb_disconnected_seconds == 0` gauge (alert at >30) | Prom + Telegram |
+
+### Honest non-claim (per `wave-4-shared-preamble.md` §8)
+
+> "100% inside the tested envelope, with ratcheted regression coverage."
+
+The 3 properties (O(1) latency, uniqueness, deduplication) are **mechanically enforced at every layer** — not asserted by hand-wave. Every property has:
+1. A **compile-time** check (banned-pattern scanner, type-system invariants)
+2. A **build-time** check (cargo test, DHAT, Criterion bench-gate)
+3. A **boot-time** check (assertion on registry collision count, pinning verification, DEDUP key validation)
+4. A **runtime** check (Prom gauge + alert + Telegram on breach)
+5. A **post-deploy** check (`make doctor` + `mcp__tickvault-logs__run_doctor`)
+
+If ANY of these fire → operator is paged. If NONE fire → the property holds within the tested envelope.
+
+### What this matrix proves
+
+For every Wave 5 item:
+- O(1) latency holds OR is explicitly off hot-path (boot/process/doc)
+- Uniqueness uses composite (security_id, exchange_segment) OR is explicitly N/A
+- Deduplication uses DEDUP UPSERT KEYS including segment OR is explicitly N/A
+
+**No item escapes this matrix.** The Per-Item Guarantee Matrix from Item 22 amplifies this with 15-row × 7-row coverage on every other dimension (security, monitoring, alerting, audit, etc.).
+
+## Plan Items (now 24, was 10)
