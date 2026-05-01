@@ -1153,7 +1153,7 @@ Each item carries the 9-box checklist per `stream-resilience.md` B8: ① typed e
 - Drops Phase 2 dispatcher (09:13 IST) + Mode C live-tick ATM resolver + pre-open REST `/marketfeed/ltp` fallback to inert (no stock F&O).
 - 9-box: ① `Phase2Skipped` (new, Severity::Info, fires once at 09:13:00 explaining "no stock F&O under indices-only scope") ② N/A (no failure path) ③ tracing `info!(scope = "indices_only", count = 11018)` at boot ④ `tv_subscription_total_instruments` gauge ⑤ Operator Health "Subscription scope" panel ⑥ `tv-subscription-count-drift` (alert if `tv_subscription_total_instruments` outside 10,500..11,500) ⑦ `main.rs` boot sequence ⑧ N/A ⑨ count-pinned test
 
-### - [ ] 3. Main feed equal-split (5 × ~2,204, category-balanced round-robin)
+### - [x] 3. Main feed equal-split (5 × ~2,204, category-balanced round-robin) — pure-logic primitive SHIPPED 2026-05-01 (`subscription_distribution.rs` + 7 ratchet tests). Connection-pool wiring deferred to follow-up sub-PR.
 
 - Files: `crates/core/src/websocket/connection_pool.rs`, `crates/core/src/instrument/subscription_distribution.rs` (new)
 - Tests: `test_distribution_is_category_balanced_round_robin`, `test_same_security_id_lands_on_same_connection_across_runs`, `test_distribution_per_conn_within_5_pct_of_target`, `test_distribution_idempotent_on_replay`
