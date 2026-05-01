@@ -4,7 +4,7 @@
 **Date:** 2026-05-01
 **Approved by:** Parthiban (operator) — verbatim "yes approved" 2026-05-01 + "whichever is recommended add everything" 2026-05-01 (defaults locked).
 **Operator decisions captured:**
-- **C1 → Option A:** adopt merged `depth_20_dynamic_subscriber.rs` design (slots 1+2 = NIFTY/BANKNIFTY mixed CE+PE ATM±24, slots 3/4/5 = 3 dynamic top-50 = 150 dynamic instruments). Item 4 rewritten below.
+- **C1 → Option B (REVERSED 2026-05-01 later in session):** Operator reaffirmed original single-side 4-conn + 1 dynamic-50 design. Wave 5 RIPS the merged `depth_20_dynamic_subscriber.rs` (commits `f3b7baa`, `29b1407`, `72028c5`, `c9f53a4`) and replaces with: Conn 1 = NIFTY CE ATM±24, Conn 2 = NIFTY PE ATM±24, Conn 3 = BANKNIFTY CE ATM±24, Conn 4 = BANKNIFTY PE ATM±24, Conn 5 = top-50 dynamic. SQL changed to `category='TOP_VOLUME' ORDER BY change_pct DESC LIMIT 50` with SENSEX excluded. Total 246 instruments. Item 4 rewritten below.
 - **C2 → Reuse:** Item 16 reuses already-merged `Movers22TfTracker`; Wave 5 adds 60s checkpoint + 25-tf extension only if not already wired. No new tracker struct.
 - **Q4 → Keep `22Tf` naming:** Item 19 extends merged `Movers22TfTracker` to 25 timeframes IN PLACE. The "22" number is now historical artifact. ErrorCode prefix `MOVERS-22TF-*` retained. Type names retained.
 - **All 26 non-blocker review findings (5 CRITICAL + 12 HIGH + 9 MEDIUM + 5 LOW)** are folded into the relevant item 9-box checklists; tracked in Item 18 Findings Remediation Index below.
@@ -1113,48 +1113,82 @@ Each item carries the 9-box checklist per `stream-resilience.md` B8: ① typed e
 - Algorithm: group by [IDX_I, NSE_EQ, NSE_FNO+BSE_FNO]; sort each group by security_id ASC; `conn_index = i % 5`. Stable across boots.
 - 9-box: ① N/A ② N/A ③ tracing `info!(conn = i, count = n)` per conn at boot ④ `tv_main_feed_per_conn_instrument_count` gauge with `{conn}` label ⑤ Operator Health "Main feed distribution" stacked-bar panel ⑥ `tv-main-feed-conn-overload` (any conn > 4,500) ⑦ `connection_pool::distribute` ⑧ N/A ⑨ deterministic-replay test + spread test
 
-### - [ ] 4. Depth-20 — REWRITTEN PER OPERATOR DECISION 2026-05-01 (BLOCKER C1 → Option A)
+### - [ ] 4. Depth-20 — REVERTED TO OPERATOR ORIGINAL DESIGN 2026-05-01 (BLOCKER C1 → Option B)
 
-**Decision:** Adopt the already-merged `depth_20_dynamic_subscriber.rs` (commits `f3b7baa`, `29b1407`, `72028c5`, `c9f53a4`). Wave 5 contributes **verification + hardening only**; no architectural rewrite.
+**Decision (operator override 2026-05-01):** Operator reaffirmed original single-side design. Earlier "Option A adopt merged" decision is REVERSED. Wave 5 RIPS the merged `depth_20_dynamic_subscriber.rs` (commits `f3b7baa`, `29b1407`, `72028c5`, `c9f53a4`) and replaces with single-side 4-conn + 1 dynamic-50.
 
-**Final depth-20 layout:**
+**Final depth-20 layout (246 instruments):**
 
-| Conn | Underlying / source | Side | Strikes | Count |
+| Conn | Underlying | Side | Strikes | Count |
 |---:|---|:---:|---|---:|
-| 1 | NIFTY current expiry | mixed CE+PE | ATM ±24 | 49 |
-| 2 | BANKNIFTY current expiry | mixed CE+PE | ATM ±24 | 49 |
-| 3 | Dynamic top-150 slot 1 (existing `depth_20_dynamic_subscriber.rs`) | mixed | dynamic 60s, 50/slot | 50 |
-| 4 | Dynamic top-150 slot 2 | mixed | dynamic 60s, 50/slot | 50 |
-| 5 | Dynamic top-150 slot 3 | mixed | dynamic 60s, 50/slot | 50 |
-| **Total** | | | | **248** |
+| 1 | NIFTY current nearest expiry | **CE only** | ATM ±24 | 49 |
+| 2 | NIFTY current nearest expiry | **PE only** | ATM ±24 | 49 |
+| 3 | BANKNIFTY current nearest expiry | **CE only** | ATM ±24 | 49 |
+| 4 | BANKNIFTY current nearest expiry | **PE only** | ATM ±24 | 49 |
+| 5 | Dynamic top 50 from `option_movers` `category='TOP_VOLUME'` sorted by `change_pct DESC`, SENSEX-skipped | mixed | dynamic 60s | 50 |
+| **Total** | | | | **246** |
 
-- Files: `crates/core/src/instrument/depth_20_dynamic_subscriber.rs` (extend, don't replace), `crates/app/src/main.rs` (wiring verification), `crates/core/src/websocket/depth_connection.rs`
-- Existing SQL stays as-is: `WHERE change_pct > 0 ORDER BY volume DESC LIMIT 150` (already in `DEPTH_20_DYNAMIC_SELECTOR_SQL`). Wave 5 does NOT change this; the operator's earlier "category=TOP_VOLUME / change_pct DESC" idea is superseded by Option A.
-- Wave 5 test additions (extending existing 50+ ratchet tests):
-  - `test_depth_20_slots_1_and_2_pinned_to_nifty_banknifty_atm_24`
-  - `test_depth_20_slots_3_4_5_use_dynamic_top_150_split_50_each`
-  - `test_depth_20_total_instrument_count_is_248`
-  - `test_depth_20_excludes_sensex_in_dynamic_slots` (BSE_FNO filter on selector result)
-  - `test_depth_20_swap_hysteresis_3_position_min` (per H7 — anti-thrash guard)
-  - `test_depth_20_dynamic_selector_runs_off_hot_path` (per C4/H2 — not on Core 0/1)
-  - `test_depth_20_dynamic_subscriber_handles_sub_4_vcpu_gracefully` (per H8)
-  - `test_depth_20_dynamic_set_sanitized_before_ilp_write` (per H5 — ILP injection guard)
-  - `test_depth_20_query_uses_ist_offset_for_ts_freshness` (per L2 — TZ normalization)
-- 9-box (extending existing wiring):
-  - ① typed event: existing `Depth20DynamicTopSetEmpty` + `Depth20DynamicSwapChannelBroken`
-  - ② ErrorCode: existing `DEPTH-DYN-01` + `DEPTH-DYN-02`; Wave 5 adds **`DEPTH-DYN-04`** (rank churn without semantic change — H7 hysteresis violation, Severity::Medium)
-  - ③ tracing: existing `info!(slot, count, …)`
-  - ④ Prom: existing `tv_depth_20_dynamic_*` gauges; add `tv_depth_20_swap_thrash_ratio` (H7); add `tv_depth_20_dynamic_set_sanitized_total` (H5)
-  - ⑤ Grafana: existing depth-flow panel (extend with Wave 5 thrash counter)
-  - ⑥ Alert: existing `tv-depth-dyn-01-top-set-empty-escalate` + `tv-depth-dyn-02-swap-channel-broken-escalate`; add `tv-depth-dyn-04-thrash` (rate > 1/min sustained 5min market hours)
-  - ⑦ Call site: existing `run_depth_20_dynamic_subscriber` in main.rs
-  - ⑧ Triage rule: existing entries + new `.claude/triage/error-rules.yaml::depth-dyn-04-thrash-suppress`
-  - ⑨ Ratchet: 9 Wave 5 additions above + extend existing 50+ tests in `depth_20_dynamic_subscriber.rs::tests`
+**Selector SQL (NEW — replaces merged `DEPTH_20_DYNAMIC_SELECTOR_SQL`):**
 
-### - [ ] 5. Depth-200 dynamic top-5 (replaces static ATM CE/PE)
+```sql
+SELECT security_id, exchange_segment, underlying_symbol, change_pct, volume
+FROM option_movers
+WHERE category = 'TOP_VOLUME'
+  AND exchange_segment != 'BSE_FNO'   -- exclude SENSEX (Dhan depth NSE-only)
+  AND change_pct > 0                  -- gainers only
+  AND volume > 0                      -- defensive
+  AND ts > dateadd('s', -300, now())  -- 5m freshness; IST-normalized at writer
+ORDER BY change_pct DESC, volume DESC -- tie-break by volume for determinism
+LIMIT 50;                             -- depth-200 takes first 5 of these (shared query)
+```
 
-- Files: `crates/core/src/websocket/depth_connection.rs`, `crates/core/src/instrument/depth_200_top_gainers.rs` (new), `crates/app/src/main.rs`
-- Tests: `test_depth_200_picks_top_5_by_volume`, `test_depth_200_filters_change_pct_positive`, `test_depth_200_one_instrument_per_conn`, `test_depth_200_swap_on_rank_change`, `test_depth_200_excludes_sensex`
+- Files:
+  - `crates/core/src/instrument/depth_20_dynamic_subscriber.rs` (**REWRITE** — old SQL + 3-slot logic deleted; new SQL + 1-slot top-50 + 4 single-side static slots)
+  - `crates/core/src/instrument/depth_strike_selector.rs` (split CE-only and PE-only ATM±24 helpers)
+  - `crates/app/src/main.rs` (wiring: 4 single-side conns + 1 dynamic + 1 shared selector loop feeding both depth-20 conn 5 and depth-200 conns 1-5)
+  - `crates/core/src/websocket/depth_connection.rs`
+  - `crates/common/src/constants.rs` (`DEPTH_20_DYNAMIC_SLOT_COUNT = 1`, `DEPTH_20_DYNAMIC_SLOT_CAPACITY = 50`)
+- Tests (Wave 5, replacing old Phase 7 tests):
+  - `test_depth_20_conn_1_is_nifty_ce_atm_24`
+  - `test_depth_20_conn_2_is_nifty_pe_atm_24`
+  - `test_depth_20_conn_3_is_banknifty_ce_atm_24`
+  - `test_depth_20_conn_4_is_banknifty_pe_atm_24`
+  - `test_depth_20_conn_5_uses_top_volume_category_change_pct_desc_limit_50`
+  - `test_depth_20_total_instrument_count_is_246`
+  - `test_depth_20_conn_5_excludes_sensex_bse_fno_rows`
+  - `test_depth_20_swap_hysteresis_3_position_min` (H7 anti-thrash)
+  - `test_depth_20_dynamic_selector_runs_on_core_3_not_core_1` (C4/H2)
+  - `test_depth_20_dynamic_handles_sub_4_vcpu_gracefully` (H8)
+  - `test_depth_20_dynamic_set_sanitized_before_ilp_write` (H5)
+  - `test_depth_20_query_uses_ist_offset_for_ts_freshness` (L2)
+  - `test_depth_20_selector_result_shared_with_depth_200_via_arc_vec_row` (M8)
+- 9-box:
+  - ① typed event: keep `Depth20DynamicTopSetEmpty` (existing) + new `Depth20TopSwapped` (Severity::Low, edge-triggered on rank-set change)
+  - ② ErrorCode: keep `DEPTH-DYN-01` (top set < 50, High) + `DEPTH-DYN-02` (swap channel broken, Critical); add `DEPTH-DYN-04` (rank churn without semantic change — H7 hysteresis violation, Medium)
+  - ③ tracing: `info!(conn, side, count, …)` per static conn at boot; `info!(rank_set_diff, …)` per swap
+  - ④ Prom: `tv_depth_20_static_conns_subscribed` (expect = 4); `tv_depth_20_dynamic_set_size` (expect = 50); `tv_depth_20_swaps_total` counter; `tv_depth_20_swap_thrash_ratio` (H7); `tv_depth_20_dynamic_set_sanitized_total` (H5)
+  - ⑤ Grafana: rewrite depth-flow panel — 4 static rows + 1 dynamic row showing top-50 with change_pct
+  - ⑥ Alert: keep `tv-depth-dyn-01-top-set-empty-escalate` + `tv-depth-dyn-02-swap-channel-broken-escalate`; add `tv-depth-dyn-04-thrash`
+  - ⑦ Call site: rewritten `run_depth_20_subscriber` in main.rs (single-side static spawn + 1 dynamic loop)
+  - ⑧ Triage rule: keep + add `.claude/triage/error-rules.yaml::depth-dyn-04-thrash-suppress`
+  - ⑨ Ratchet: 13 tests above + delete the obsolete Phase 7 ratchet tests in `depth_20_dynamic_subscriber.rs::tests` (slot 3/4/5 split tests, top-150 LIMIT tests)
+
+**Blast radius note:** rip + replace is bigger than Option A. Mitigation: Item 4 sub-PR includes deletion of `DEPTH_20_DYNAMIC_SLOT_COUNT = 3` + `LIMIT 150` constants in same commit so the build stays green.
+
+### - [ ] 5. Depth-200 — Top-5 dynamic (operator original design)
+
+- Files: `crates/core/src/websocket/depth_connection.rs`, `crates/core/src/instrument/depth_200_subscriber.rs` (new — replaces merged static logic), `crates/app/src/main.rs`
+- Tests:
+  - `test_depth_200_picks_top_5_from_top_volume_category`
+  - `test_depth_200_sorts_by_change_pct_desc`
+  - `test_depth_200_excludes_sensex_bse_fno`
+  - `test_depth_200_one_instrument_per_conn`
+  - `test_depth_200_swap_on_rank_change`
+  - `test_depth_200_reuses_depth_20_selector_result_no_separate_query` (M8)
+  - `test_depth_200_query_uses_ist_offset_for_ts_freshness` (L2)
+- Replaces existing static `["NIFTY", "BANKNIFTY"]` ATM CE/PE config in `main.rs:2151,3113,3685`. Uses existing `DepthCommand::Swap200` path. **Single shared `Arc<Vec<Row>>` from Item 4's selector** — depth-200 takes rows 1-5 of the LIMIT 50 result; no separate SQL query (per M8 atomic snapshot guarantee).
+- Hysteresis: rank-set must change by ≥1 position to trigger swap (top-5 is small enough that any change matters; no thrash guard needed beyond the existing edge-trigger).
+- 9-box: same pattern as Item 4 — ErrorCode `DEPTH-DYN-01` (top set < 5, High) reused; new `Depth200TopSwapped` (Severity::Low, edge-triggered).
 - Replaces existing static `["NIFTY", "BANKNIFTY"]` ATM CE/PE config in `main.rs:2151,3113,3685`. Uses existing `DepthCommand::Swap200` path. 60s rebalance: query the SAME `DEPTH_20_DYNAMIC_SELECTOR_SQL` result (Option A reuse — no separate SQL), take the top 5 NSE_FNO rows after SENSEX-skip. **Single shared `Arc<Vec<Row>>` query result feeds both Item 4 and Item 5** (per M8 — atomic snapshot guarantee).
 - Hysteresis: rank-set must change by ≥1 position to trigger swap (top-5 is small enough that any change matters; no thrash guard needed beyond the existing edge-trigger).
 - Test additions: `test_depth_200_reuses_depth_20_selector_result_no_separate_query`, `test_depth_200_excludes_sensex_takes_next_eligible`, `test_depth_200_5_conns_x_1_instrument_each`, `test_depth_200_query_uses_ist_offset_for_ts_freshness`
