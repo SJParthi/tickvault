@@ -138,7 +138,11 @@ pub async fn ensure_movers_22tf_tables(questdb_config: &QuestDbConfig) {
         execute_ddl(&client, &base_url, &dedup_sql, &dedup_label).await;
     }
 
-    info!("movers_22tf: all 22 tables ensured");
+    info!(
+        timeframe_count = tickvault_common::mover_types::MOVERS_TIMEFRAME_COUNT,
+        "movers_22tf: all {} tables ensured",
+        tickvault_common::mover_types::MOVERS_TIMEFRAME_COUNT
+    );
 }
 
 /// Executes a DDL statement against QuestDB HTTP API. Best-effort.
