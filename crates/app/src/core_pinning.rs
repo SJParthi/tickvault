@@ -28,7 +28,7 @@
 use anyhow::Result;
 use core_affinity::CoreId;
 use tickvault_common::error_code::ErrorCode;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 /// Pinning role per the Wave 5 4-vCPU layout. Mapping to a `core_id` is
 /// done at runtime by `pin_current_thread_for(role)` so the host doesn't
@@ -165,7 +165,12 @@ pub fn pin_current_thread_for(role: WorkerRole) -> Result<()> {
             "outcome" => "failed",
         )
         .increment(1);
-        warn!(
+        // Wave 5 hostile-review fix: was `warn!` — but CorePin01 is
+        // Severity::High, and the host_too_small / core_ids_unavailable
+        // branches above already use `error!`. Splitting the same code
+        // across two log levels broke Loki→Telegram routing for the
+        // single most common failure mode (kernel rejected hint).
+        error!(
             code = ErrorCode::CorePin01PinningFailedAtBoot.code_str(),
             worker = role.label(),
             core_id = target_idx,

@@ -75,10 +75,12 @@ pub const SELECTOR_SQL_MAX_K: usize = 200;
 
 /// Lazily-initialised cache for the two production `k` values
 /// (DEPTH_20_DYNAMIC_K = 50 and DEPTH_200_DYNAMIC_K = 5). Removes the
-/// per-call `format!()` allocation flagged by the hot-path adversarial
-/// review. Lookups for these two values return a `&'static str` slice
-/// of the cached `String` (cheap clone via `to_string()` for callers
-/// that need an owned `String`).
+/// per-call `format!()` re-formatting work flagged by the hot-path
+/// adversarial review. The returned `String` is still cloned from the
+/// cached body — that allocation cannot be avoided without changing
+/// the public signature to `&'static str`. The win is the saved
+/// `format!()` call (template parse + arg substitution), not the
+/// final allocation.
 static SQL_K50: OnceLock<String> = OnceLock::new();
 static SQL_K5: OnceLock<String> = OnceLock::new();
 
@@ -106,8 +108,10 @@ fn build_selector_sql(k: usize) -> String {
 ///
 /// For the two production values (`DEPTH_20_DYNAMIC_K = 50` and
 /// `DEPTH_200_DYNAMIC_K = 5`), this returns a `String` cloned from a
-/// `OnceLock`-cached precompute — no per-call allocation on the
-/// formatter path. Other `k` values fall back to a fresh `format!()`.
+/// `OnceLock`-cached precompute — saving the per-call `format!()`
+/// template work but NOT the final clone allocation. Other `k`
+/// values fall back to a fresh `format!()`. If a future caller needs
+/// truly zero-alloc access, switch to the `selector_sql_static_*` accessors below.
 #[must_use]
 pub fn selector_sql(k: usize) -> String {
     assert!(
@@ -209,27 +213,60 @@ pub enum DepthStaticSide {
     Put,
 }
 
+impl DepthStaticSide {
+    /// Stable label for audit tables, Telegram, and Prom counter
+    /// `worker_kind` labels. Matches Dhan `OptnTp` field semantics.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Call => "CE",
+            Self::Put => "PE",
+        }
+    }
+}
+
+/// Result of `select_static_side_contracts` — the selected security_ids
+/// plus the side label they belong to. The label is preserved for the
+/// future wiring layer to stamp on Telegram events (`Depth20StaticSideSubscribed`)
+/// and `subscription_audit` rows without reaching back to the call-site
+/// to recover which side was queried.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DepthStaticSideSelection {
+    pub side: DepthStaticSide,
+    pub security_ids: Vec<u32>,
+}
+
 /// Selects ATM ± 24 contracts on one side from a sorted strike list.
 ///
-/// `sorted_strikes` is the sorted list of `(security_id, strike)` for
-/// the given side at the current expiry. `atm_index` is the position of
-/// the ATM strike in that list. Returns up to 49 security_ids — fewer
-/// at the chain edges if the ATM is closer than 24 strikes from either
-/// boundary.
+/// `sorted_strikes` is the sorted list of `(security_id, strike)` for the
+/// given `side` at the current expiry — caller MUST pre-filter to a single
+/// side per Wave 5 plan §"Item 4 single-side static conns". `atm_index`
+/// is the position of the ATM strike in that list. Returns up to 49
+/// security_ids — fewer at the chain edges if the ATM is closer than 24
+/// strikes from either boundary, plus the side label for audit-trail
+/// stamping by the future wiring layer.
 #[must_use]
-// TEST-EXEMPT: covered by 4 test_static_side_* ratchets (centred-49, low-edge, high-edge, empty).
-pub fn select_static_side_contracts(sorted_strikes: &[(u32, f64)], atm_index: usize) -> Vec<u32> {
+// TEST-EXEMPT: covered by 4 test_static_side_* ratchets (centred-49, low-edge, high-edge, empty) plus test_static_side_label_preserved.
+pub fn select_static_side_contracts(
+    sorted_strikes: &[(u32, f64)],
+    atm_index: usize,
+    side: DepthStaticSide,
+) -> DepthStaticSideSelection {
     if sorted_strikes.is_empty() {
-        return Vec::new();
+        return DepthStaticSideSelection {
+            side,
+            security_ids: Vec::new(),
+        };
     }
     let n = sorted_strikes.len();
     let half = (DEPTH_20_STATIC_PER_CONN - 1) / 2; // 24
     let lo = atm_index.saturating_sub(half);
     let hi = (atm_index.saturating_add(half)).min(n.saturating_sub(1));
-    sorted_strikes[lo..=hi]
+    let security_ids: Vec<u32> = sorted_strikes[lo..=hi]
         .iter()
         .map(|(sid, _)| *sid)
-        .collect()
+        .collect();
+    DepthStaticSideSelection { side, security_ids }
 }
 
 // ---------------------------------------------------------------------------
@@ -466,39 +503,45 @@ mod tests {
     #[test]
     fn test_static_side_atm_24_centred_returns_49_contracts() {
         let strikes = synth_strikes();
-        let out = select_static_side_contracts(&strikes, 50);
-        assert_eq!(out.len(), 49);
+        let out = select_static_side_contracts(&strikes, 50, DepthStaticSide::Call);
+        assert_eq!(out.security_ids.len(), 49);
         // ATM (index 50) at the middle.
-        assert_eq!(out[24], 10_050);
-        assert_eq!(out[0], 10_026); // ATM - 24
-        assert_eq!(out[48], 10_074); // ATM + 24
+        assert_eq!(out.security_ids[24], 10_050);
+        assert_eq!(out.security_ids[0], 10_026); // ATM - 24
+        assert_eq!(out.security_ids[48], 10_074); // ATM + 24
+        assert_eq!(out.side, DepthStaticSide::Call);
     }
 
     #[test]
     fn test_static_side_atm_near_low_edge_truncates() {
         // ATM at index 5 — only 5 strikes below available.
         let strikes = synth_strikes();
-        let out = select_static_side_contracts(&strikes, 5);
+        let out = select_static_side_contracts(&strikes, 5, DepthStaticSide::Put);
         // Window is [0, 29] = 30 strikes (5 below + ATM + 24 above).
-        assert_eq!(out.len(), 30);
-        assert_eq!(out[0], 10_000); // index 0 (clamped)
-        assert_eq!(out[5], 10_005); // ATM
+        assert_eq!(out.security_ids.len(), 30);
+        assert_eq!(out.security_ids[0], 10_000); // index 0 (clamped)
+        assert_eq!(out.security_ids[5], 10_005); // ATM
+        assert_eq!(out.side, DepthStaticSide::Put);
     }
 
     #[test]
     fn test_static_side_atm_near_high_edge_truncates() {
         let strikes = synth_strikes();
         // ATM at index 95 — only 4 strikes above available.
-        let out = select_static_side_contracts(&strikes, 95);
+        let out = select_static_side_contracts(&strikes, 95, DepthStaticSide::Call);
         // Window is [71, 99] = 29 strikes.
-        assert_eq!(out.len(), 29);
-        assert_eq!(out[24], 10_095); // ATM
-        assert_eq!(out[28], 10_099); // last
+        assert_eq!(out.security_ids.len(), 29);
+        assert_eq!(out.security_ids[24], 10_095); // ATM
+        assert_eq!(out.security_ids[28], 10_099); // last
     }
 
     #[test]
     fn test_static_side_empty_chain_returns_empty() {
-        assert!(select_static_side_contracts(&[], 0).is_empty());
+        let out = select_static_side_contracts(&[], 0, DepthStaticSide::Call);
+        assert!(out.security_ids.is_empty());
+        // Side is preserved even on empty chain so audit-trail rows
+        // can still report which conn was queried.
+        assert_eq!(out.side, DepthStaticSide::Call);
     }
 
     #[test]
@@ -506,6 +549,22 @@ mod tests {
         // Trivial pin so future renames break the build with a clear
         // test name rather than silently re-routing CE↔PE.
         assert_ne!(DepthStaticSide::Call, DepthStaticSide::Put);
+    }
+
+    #[test]
+    fn test_depth_static_side_label_is_stable() {
+        // Wire-format label used by Telegram + Prom counters.
+        assert_eq!(DepthStaticSide::Call.label(), "CE");
+        assert_eq!(DepthStaticSide::Put.label(), "PE");
+    }
+
+    #[test]
+    fn test_static_side_selection_preserves_side_under_truncation() {
+        let strikes = synth_strikes();
+        // Truncated case (low edge) — side must still propagate.
+        let out = select_static_side_contracts(&strikes, 0, DepthStaticSide::Put);
+        assert_eq!(out.side, DepthStaticSide::Put);
+        assert!(!out.security_ids.is_empty());
     }
 
     // ----------------------------------------------------------------------
