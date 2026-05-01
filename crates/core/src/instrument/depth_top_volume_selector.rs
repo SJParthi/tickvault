@@ -40,6 +40,7 @@
 //! BANKNIFTY at the current expiry.
 
 use std::collections::HashSet;
+use std::sync::OnceLock;
 
 /// Wave 5 Item 4: depth-20 conn 5 (dynamic) takes the top 50.
 pub const DEPTH_20_DYNAMIC_K: usize = 50;
@@ -64,11 +65,24 @@ pub const DEPTH_20_TOTAL_INSTRUMENTS: usize =
 /// Operator demand: don't churn depth subscriptions on noise.
 pub const DEPTH_20_SWAP_HYSTERESIS_MIN: usize = 3;
 
-/// Returns the canonical depth selector SQL with `LIMIT k`. The SQL
-/// itself is a constant (per the plan's selector spec); only the
-/// `LIMIT` differs between depth-20 (K=50) and depth-200 (K=5).
-#[must_use]
-pub fn selector_sql(k: usize) -> String {
+/// Maximum permitted `k` for `selector_sql`. Wave 5 plan pins K = 50
+/// (depth-20) and K = 5 (depth-200); 200 is a safe upper bound that
+/// also matches Dhan's per-connection cap on depth feeds. Adversarial
+/// security review (2026-05-01): bounds-check `k` before formatting
+/// to defend against future callers passing a value derived from
+/// external input.
+pub const SELECTOR_SQL_MAX_K: usize = 200;
+
+/// Lazily-initialised cache for the two production `k` values
+/// (DEPTH_20_DYNAMIC_K = 50 and DEPTH_200_DYNAMIC_K = 5). Removes the
+/// per-call `format!()` allocation flagged by the hot-path adversarial
+/// review. Lookups for these two values return a `&'static str` slice
+/// of the cached `String` (cheap clone via `to_string()` for callers
+/// that need an owned `String`).
+static SQL_K50: OnceLock<String> = OnceLock::new();
+static SQL_K5: OnceLock<String> = OnceLock::new();
+
+fn build_selector_sql(k: usize) -> String {
     format!(
         "SELECT security_id, exchange_segment, underlying_symbol, change_pct, volume \
          FROM option_movers \
@@ -80,6 +94,31 @@ pub fn selector_sql(k: usize) -> String {
          ORDER BY change_pct DESC, volume DESC \
          LIMIT {k}"
     )
+}
+
+/// Returns the canonical depth selector SQL with `LIMIT k`.
+///
+/// # Panics
+/// Panics if `k == 0` or `k > SELECTOR_SQL_MAX_K`. Both bounds catch
+/// caller-side bugs early (per the security review): `k = 0` would
+/// emit `LIMIT 0` (silently no-op); `k > 200` is outside any valid
+/// depth subscription scope.
+///
+/// For the two production values (`DEPTH_20_DYNAMIC_K = 50` and
+/// `DEPTH_200_DYNAMIC_K = 5`), this returns a `String` cloned from a
+/// `OnceLock`-cached precompute — no per-call allocation on the
+/// formatter path. Other `k` values fall back to a fresh `format!()`.
+#[must_use]
+pub fn selector_sql(k: usize) -> String {
+    assert!(
+        k > 0 && k <= SELECTOR_SQL_MAX_K,
+        "selector_sql: k must be in 1..={SELECTOR_SQL_MAX_K}, got {k}"
+    );
+    match k {
+        DEPTH_20_DYNAMIC_K => SQL_K50.get_or_init(|| build_selector_sql(k)).clone(),
+        DEPTH_200_DYNAMIC_K => SQL_K5.get_or_init(|| build_selector_sql(k)).clone(),
+        _ => build_selector_sql(k),
+    }
 }
 
 /// One row returned by the selector — keep `Copy` for zero-allocation
@@ -273,6 +312,39 @@ mod tests {
     #[test]
     fn test_selector_sql_limit_5_for_depth_200() {
         assert!(selector_sql(5).ends_with("LIMIT 5"));
+    }
+
+    /// Security ratchet (2026-05-01 adversarial review): `k = 0` MUST panic
+    /// instead of emitting `LIMIT 0`. The panic catches caller bugs early
+    /// before the SQL is shipped to QuestDB.
+    #[test]
+    #[should_panic(expected = "k must be in 1..=200")]
+    fn test_selector_sql_panics_on_k_zero() {
+        let _ = selector_sql(0);
+    }
+
+    /// Security ratchet (2026-05-01 adversarial review): `k` above
+    /// `SELECTOR_SQL_MAX_K = 200` MUST panic. Defends against future
+    /// callers that derive `k` from external input.
+    #[test]
+    #[should_panic(expected = "k must be in 1..=200")]
+    fn test_selector_sql_panics_on_k_above_max() {
+        let _ = selector_sql(SELECTOR_SQL_MAX_K + 1);
+    }
+
+    /// Hot-path ratchet (2026-05-01 adversarial review): repeated calls
+    /// with the production K=50 MUST return identical strings (the
+    /// `OnceLock` cache is functioning correctly).
+    #[test]
+    fn test_selector_sql_cached_for_production_k_values() {
+        let s1 = selector_sql(DEPTH_20_DYNAMIC_K);
+        let s2 = selector_sql(DEPTH_20_DYNAMIC_K);
+        let s3 = selector_sql(DEPTH_200_DYNAMIC_K);
+        let s4 = selector_sql(DEPTH_200_DYNAMIC_K);
+        assert_eq!(s1, s2);
+        assert_eq!(s3, s4);
+        // K=50 and K=5 produce different SQL (LIMIT differs).
+        assert_ne!(s1, s3);
     }
 
     // ----------------------------------------------------------------------
