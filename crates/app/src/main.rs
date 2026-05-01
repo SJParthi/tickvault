@@ -2683,14 +2683,36 @@ async fn main() -> Result<()> {
         if config.features.depth_dynamic_top_volume {
             tracing::info!(
                 "Wave 5 Items 4+5: depth_dynamic_top_volume feature ON — \
-                 spawning orchestrator. Receiver-side conn-pool refactor \
-                 must land for the dynamic conns to actually subscribe."
+                 spawning orchestrator + receiver-side dynamic depth-20 conn 5"
             );
             let depth_dyn_shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
 
-            // Depth-20 conn 5 dynamic top-50 task.
-            let (d20_conn5_cmd_tx, _d20_conn5_cmd_rx) =
+            // Depth-20 conn 5 dynamic top-50: orchestrator (Sender) +
+            // receiver-side WS connection (Receiver). Wave 5 commit 2.
+            //
+            // The orchestrator owns the Sender side and emits Swap20 /
+            // InitialSubscribe20 every 60s based on `option_movers`
+            // top-50 by `change_pct DESC`, SENSEX excluded. The receiver
+            // side here spawns a real depth-20 WS connection in DEFERRED
+            // mode (empty initial instruments) — the orchestrator's first
+            // cycle InitialSubscribe20 populates the SID list.
+            let (d20_conn5_cmd_tx, d20_conn5_cmd_rx) =
                 tokio::sync::mpsc::channel::<tickvault_core::websocket::DepthCommand>(4);
+
+            tickvault_app::depth_20_conn_spawner::spawn_depth_20_minimal_conn(
+                tickvault_app::depth_20_conn_spawner::Depth20MinimalConnInputs {
+                    token_handle: token_handle.clone(),
+                    ws_client_id: ws_client_id.clone(),
+                    label: "DYN-TOP50".to_string(),
+                    instruments: Vec::new(), // DEFERRED — orchestrator sends InitialSubscribe20
+                    cmd_rx: d20_conn5_cmd_rx,
+                    questdb_config: config.questdb.clone(),
+                    notifier: notifier.clone(),
+                    health_status: health_status.clone(),
+                    ws_frame_spill: ws_frame_spill.clone(),
+                },
+            );
+
             let _d20_dyn_handle =
                 tickvault_app::depth_dynamic_pipeline::spawn_depth_20_dynamic_conn5_task(
                     config.questdb.clone(),
@@ -2698,13 +2720,46 @@ async fn main() -> Result<()> {
                     std::sync::Arc::clone(&depth_dyn_shutdown),
                 );
 
-            // Depth-200 dynamic pool (5 slots). One channel per slot.
-            // The conn-pool refactor will own each slot's receiver.
+            // Depth-200 dynamic pool (5 slots). One channel + receiver
+            // depth-200 WS connection per slot. Wave 5 commit 3.
+            //
+            // The orchestrator owns Sender<DepthCommand> per slot and
+            // emits Swap200 / InitialSubscribe200 every 60s based on
+            // `option_movers` top-5 by `change_pct DESC`, SENSEX excluded.
+            // Receiver-side connections start in DEFERRED mode (sid=None)
+            // — orchestrator's first cycle InitialSubscribe200 populates
+            // each slot's contract. Initial-connect stagger spreads the
+            // 5 first-connect handshakes over 10s to avoid Dhan TCP-RST
+            // storm (per audit-findings 2026-04-24 Fix C).
             let mut d200_cmd_senders = std::collections::HashMap::new();
             for slot in 0..5_usize {
-                let (tx, _rx) =
+                let (tx, rx) =
                     tokio::sync::mpsc::channel::<tickvault_core::websocket::DepthCommand>(4);
                 d200_cmd_senders.insert(slot, tx);
+
+                // Pick correct token: SELF token if manual_self_with_renewal
+                // mode is configured, else shared TOTP/APP handle.
+                let depth200_token = match &depth_200_self_token_manager {
+                    Some(manager) => manager.handle().clone(),
+                    None => token_handle.clone(),
+                };
+                let stagger_ms = (slot as u64)
+                    .saturating_mul(tickvault_core::websocket::DEPTH_200_INITIAL_STAGGER_MS);
+                tickvault_app::depth_20_conn_spawner::spawn_depth_200_minimal_conn(
+                    tickvault_app::depth_20_conn_spawner::Depth200MinimalConnInputs {
+                        token_handle: depth200_token,
+                        ws_client_id: ws_client_id.clone(),
+                        label: format!("DYN-200-SLOT-{slot}"),
+                        exchange_segment: tickvault_common::types::ExchangeSegment::NseFno,
+                        security_id: None, // DEFERRED — orchestrator sends InitialSubscribe200
+                        cmd_rx: rx,
+                        questdb_config: config.questdb.clone(),
+                        notifier: notifier.clone(),
+                        health_status: health_status.clone(),
+                        ws_frame_spill: ws_frame_spill.clone(),
+                        initial_stagger_ms: stagger_ms,
+                    },
+                );
             }
             let _d200_dyn_handle =
                 tickvault_app::depth_dynamic_pipeline::spawn_depth_200_dynamic_pool_task(
@@ -3163,197 +3218,203 @@ async fn main() -> Result<()> {
                 tickvault_app::depth_bridge_state_writer::DepthBridgeSubscription,
             > = Vec::with_capacity(4);
 
-            for underlying in &depth_underlyings {
-                // Look up the ATM selection for this underlying.
-                let selection = depth_selections
-                    .iter()
-                    .find(|s| s.underlying_symbol == *underlying);
-
-                // Build 20-level instrument list from ATM ± 24 selection.
-                let instruments_for_underlying: Vec<
-                    tickvault_core::websocket::types::InstrumentSubscription,
-                > = if let Some(sel) = selection {
-                    sel.all_security_ids
+            // Wave 5 commit 4: when `depth_dynamic_top_volume = true` (default
+            // in `[features]`), use the new single-side static spawn (4 conns:
+            // NIFTY-CE / NIFTY-PE / BANKNIFTY-CE / BANKNIFTY-PE) + the dynamic
+            // top-volume orchestrator from commits 2+3. Otherwise fall through
+            // to the legacy 2 mixed depth-20 + 4 ATM-fixed depth-200 spawn
+            // pattern, intact for backward compat / quick rollback.
+            if !config.features.depth_dynamic_top_volume {
+                for underlying in &depth_underlyings {
+                    // Look up the ATM selection for this underlying.
+                    let selection = depth_selections
                         .iter()
-                        .take(config.subscription.twenty_depth_max_instruments)
-                        .map(|&sid| {
-                            tickvault_core::websocket::types::InstrumentSubscription::new(
-                                tickvault_common::types::ExchangeSegment::NseFno,
-                                sid,
-                            )
-                        })
-                        .collect()
-                } else {
-                    warn!(
-                        underlying,
-                        "depth: no ATM selection available — no spot price or no option chain"
-                    );
-                    Vec::new()
-                };
+                        .find(|s| s.underlying_symbol == *underlying);
 
-                // Plan item B.2 (2026-04-23): previously we skipped spawning
-                // depth connections when no instruments could be built at
-                // boot (pre-market LTPs unavailable). This produced zero
-                // depth subscriptions until next restart. Now we ALWAYS
-                // spawn — an empty instrument list puts the connection in
-                // DEFERRED mode (socket up, no subscribe sent) and the
-                // 09:13 dispatcher (real-C) sends InitialSubscribe20 once
-                // the 09:12 close is available in the preopen buffer.
-                // 200-level gets the same treatment via `Option<u32>` for
-                // the ATM CE/PE security_id below.
-                if instruments_for_underlying.is_empty() {
+                    // Build 20-level instrument list from ATM ± 24 selection.
+                    let instruments_for_underlying: Vec<
+                        tickvault_core::websocket::types::InstrumentSubscription,
+                    > = if let Some(sel) = selection {
+                        sel.all_security_ids
+                            .iter()
+                            .take(config.subscription.twenty_depth_max_instruments)
+                            .map(|&sid| {
+                                tickvault_core::websocket::types::InstrumentSubscription::new(
+                                    tickvault_common::types::ExchangeSegment::NseFno,
+                                    sid,
+                                )
+                            })
+                            .collect()
+                    } else {
+                        warn!(
+                            underlying,
+                            "depth: no ATM selection available — no spot price or no option chain"
+                        );
+                        Vec::new()
+                    };
+
+                    // Plan item B.2 (2026-04-23): previously we skipped spawning
+                    // depth connections when no instruments could be built at
+                    // boot (pre-market LTPs unavailable). This produced zero
+                    // depth subscriptions until next restart. Now we ALWAYS
+                    // spawn — an empty instrument list puts the connection in
+                    // DEFERRED mode (socket up, no subscribe sent) and the
+                    // 09:13 dispatcher (real-C) sends InitialSubscribe20 once
+                    // the 09:12 close is available in the preopen buffer.
+                    // 200-level gets the same treatment via `Option<u32>` for
+                    // the ATM CE/PE security_id below.
+                    if instruments_for_underlying.is_empty() {
+                        info!(
+                            underlying,
+                            "20-level depth: no instruments selected at boot — spawning DEFERRED connection, 09:13 dispatcher will InitialSubscribe20"
+                        );
+                    }
+
+                    // Extract ATM CE + ATM PE for 200-level depth.
+                    // 200-level = 1 instrument per connection (nearest expiry, exact ATM only).
+                    // O(1) EXEMPT: boot-time ATM lookup
+                    fn build_precise_label(
+                        underlying: &str,
+                        expiry: chrono::NaiveDate,
+                        strike: f64,
+                        side: &str,
+                    ) -> String {
+                        let strike_str = if (strike.fract()).abs() < 0.0001 {
+                            #[allow(clippy::cast_possible_truncation)]
+                            // APPROVED: strike prices fit i64
+                            {
+                                format!("{}", strike as i64)
+                            }
+                        } else {
+                            format!("{strike}")
+                        };
+                        format!("{underlying}-{}-{strike_str}-{side}", expiry.format("%b%Y"))
+                    }
+
+                    let (atm_ce, atm_pe): (Option<(u32, String)>, Option<(u32, String)>) =
+                        if let Some(sel) = selection {
+                            // CRITICAL: use the dedicated `atm_ce_security_id` /
+                            // `atm_pe_security_id` fields — NOT `.first()` on the
+                            // range vectors. `.first()` returns the LOWEST strike
+                            // in the ATM ± N band, not the ATM itself, so pairing
+                            // it with the center-strike label produced
+                            // Telegram messages like
+                            // `BANKNIFTY-Apr2026-56700-PE (SID 67481)` where the
+                            // SID actually pointed at strike 54300. See
+                            // `depth_strike_selector::DepthStrikeSelection` docs.
+                            //
+                            // LABEL POLICY: prefer the Dhan CSV `display_name`
+                            // (e.g. "BANKNIFTY 28 APR 54300 PUT") over the
+                            // synthesized `UNDERLYING-MmmYYYY-STRIKE-SIDE`
+                            // format, because it matches Dhan's own web UI
+                            // character-for-character. Fall back to the
+                            // synthesized label only if the registry lookup
+                            // didn't populate `display_name` (should not
+                            // happen for contracts present in the CSV).
+                            let ce = sel.atm_ce_security_id.map(|sid| {
+                                let label = sel.atm_ce_display_name.clone().unwrap_or_else(|| {
+                                    build_precise_label(
+                                        underlying,
+                                        sel.expiry_date,
+                                        sel.atm_strike,
+                                        "CE",
+                                    )
+                                });
+                                (sid, label)
+                            });
+                            let pe = sel.atm_pe_security_id.map(|sid| {
+                                let label = sel.atm_pe_display_name.clone().unwrap_or_else(|| {
+                                    build_precise_label(
+                                        underlying,
+                                        sel.expiry_date,
+                                        sel.atm_strike,
+                                        "PE",
+                                    )
+                                });
+                                (sid, label)
+                            });
+                            (ce, pe)
+                        } else {
+                            (None, None)
+                        };
+                    let atm_ce_sid = atm_ce.as_ref().map(|(sid, _)| *sid);
+                    let atm_pe_sid = atm_pe.as_ref().map(|(sid, _)| *sid);
+
+                    let depth_token = token_handle.clone();
+                    let depth_client_id = ws_client_id.clone();
+                    let instrument_count = instruments_for_underlying.len();
+                    let label = (*underlying).to_string();
+
+                    // PROOF: log exactly which ATM strike and security_ids are used
+                    // — include the precise contract labels so the log line can be
+                    // pasted verbatim into a Dhan support ticket.
+                    let atm_ce_label = atm_ce.as_ref().map(|(_, lbl)| lbl.as_str()).unwrap_or("-");
+                    let atm_pe_label = atm_pe.as_ref().map(|(_, lbl)| lbl.as_str()).unwrap_or("-");
                     info!(
                         underlying,
-                        "20-level depth: no instruments selected at boot — spawning DEFERRED connection, 09:13 dispatcher will InitialSubscribe20"
+                        instruments = instrument_count,
+                        atm_ce_sid = ?atm_ce_sid,
+                        atm_pe_sid = ?atm_pe_sid,
+                        atm_ce_contract = atm_ce_label,
+                        atm_pe_contract = atm_pe_label,
+                        "PROOF: spawning 20-level depth ({instrument_count} instruments) + 200-level depth (CE={atm_ce_label}, PE={atm_pe_label})"
                     );
-                }
 
-                // Extract ATM CE + ATM PE for 200-level depth.
-                // 200-level = 1 instrument per connection (nearest expiry, exact ATM only).
-                // O(1) EXEMPT: boot-time ATM lookup
-                fn build_precise_label(
-                    underlying: &str,
-                    expiry: chrono::NaiveDate,
-                    strike: f64,
-                    side: &str,
-                ) -> String {
-                    let strike_str = if (strike.fract()).abs() < 0.0001 {
-                        #[allow(clippy::cast_possible_truncation)]
-                        // APPROVED: strike prices fit i64
-                        {
-                            format!("{}", strike as i64)
+                    // O(1) EXEMPT: begin — depth connection + persistence setup at boot
+                    let (depth_tx, mut depth_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(4096);
+                    let depth_questdb = config.questdb.clone();
+                    let depth_label_recv = label.clone();
+
+                    // Spawn depth frame receiver with QuestDB persistence + OBI computation
+                    tokio::spawn(async move {
+                        // Pre-register metric handles to avoid String clone on every frame/OBI computation.
+                        let m = metrics::counter!("tv_depth_20lvl_frames_received", "underlying" => depth_label_recv.clone());
+                        let m_obi_value = metrics::gauge!("tv_obi_value", "underlying" => depth_label_recv.clone());
+                        let m_obi_computations = metrics::counter!("tv_obi_computations_total", "underlying" => depth_label_recv.clone());
+                        let m_obi_errors = metrics::counter!("tv_obi_persist_errors_total", "underlying" => depth_label_recv.clone());
+                        let mut writer =
+                            tickvault_storage::deep_depth_persistence::DeepDepthWriter::new(
+                                &depth_questdb,
+                            )
+                            .ok();
+                        if writer.is_some() {
+                            tracing::info!(
+                                underlying = depth_label_recv,
+                                "deep depth QuestDB writer connected"
+                            );
                         }
-                    } else {
-                        format!("{strike}")
-                    };
-                    format!("{underlying}-{}-{strike_str}-{side}", expiry.format("%b%Y"))
-                }
 
-                let (atm_ce, atm_pe): (Option<(u32, String)>, Option<(u32, String)>) =
-                    if let Some(sel) = selection {
-                        // CRITICAL: use the dedicated `atm_ce_security_id` /
-                        // `atm_pe_security_id` fields — NOT `.first()` on the
-                        // range vectors. `.first()` returns the LOWEST strike
-                        // in the ATM ± N band, not the ATM itself, so pairing
-                        // it with the center-strike label produced
-                        // Telegram messages like
-                        // `BANKNIFTY-Apr2026-56700-PE (SID 67481)` where the
-                        // SID actually pointed at strike 54300. See
-                        // `depth_strike_selector::DepthStrikeSelection` docs.
-                        //
-                        // LABEL POLICY: prefer the Dhan CSV `display_name`
-                        // (e.g. "BANKNIFTY 28 APR 54300 PUT") over the
-                        // synthesized `UNDERLYING-MmmYYYY-STRIKE-SIDE`
-                        // format, because it matches Dhan's own web UI
-                        // character-for-character. Fall back to the
-                        // synthesized label only if the registry lookup
-                        // didn't populate `display_name` (should not
-                        // happen for contracts present in the CSV).
-                        let ce = sel.atm_ce_security_id.map(|sid| {
-                            let label = sel.atm_ce_display_name.clone().unwrap_or_else(|| {
-                                build_precise_label(
-                                    underlying,
-                                    sel.expiry_date,
-                                    sel.atm_strike,
-                                    "CE",
-                                )
-                            });
-                            (sid, label)
-                        });
-                        let pe = sel.atm_pe_security_id.map(|sid| {
-                            let label = sel.atm_pe_display_name.clone().unwrap_or_else(|| {
-                                build_precise_label(
-                                    underlying,
-                                    sel.expiry_date,
-                                    sel.atm_strike,
-                                    "PE",
-                                )
-                            });
-                            (sid, label)
-                        });
-                        (ce, pe)
-                    } else {
-                        (None, None)
-                    };
-                let atm_ce_sid = atm_ce.as_ref().map(|(sid, _)| *sid);
-                let atm_pe_sid = atm_pe.as_ref().map(|(sid, _)| *sid);
-
-                let depth_token = token_handle.clone();
-                let depth_client_id = ws_client_id.clone();
-                let instrument_count = instruments_for_underlying.len();
-                let label = (*underlying).to_string();
-
-                // PROOF: log exactly which ATM strike and security_ids are used
-                // — include the precise contract labels so the log line can be
-                // pasted verbatim into a Dhan support ticket.
-                let atm_ce_label = atm_ce.as_ref().map(|(_, lbl)| lbl.as_str()).unwrap_or("-");
-                let atm_pe_label = atm_pe.as_ref().map(|(_, lbl)| lbl.as_str()).unwrap_or("-");
-                info!(
-                    underlying,
-                    instruments = instrument_count,
-                    atm_ce_sid = ?atm_ce_sid,
-                    atm_pe_sid = ?atm_pe_sid,
-                    atm_ce_contract = atm_ce_label,
-                    atm_pe_contract = atm_pe_label,
-                    "PROOF: spawning 20-level depth ({instrument_count} instruments) + 200-level depth (CE={atm_ce_label}, PE={atm_pe_label})"
-                );
-
-                // O(1) EXEMPT: begin — depth connection + persistence setup at boot
-                let (depth_tx, mut depth_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(4096);
-                let depth_questdb = config.questdb.clone();
-                let depth_label_recv = label.clone();
-
-                // Spawn depth frame receiver with QuestDB persistence + OBI computation
-                tokio::spawn(async move {
-                    // Pre-register metric handles to avoid String clone on every frame/OBI computation.
-                    let m = metrics::counter!("tv_depth_20lvl_frames_received", "underlying" => depth_label_recv.clone());
-                    let m_obi_value =
-                        metrics::gauge!("tv_obi_value", "underlying" => depth_label_recv.clone());
-                    let m_obi_computations = metrics::counter!("tv_obi_computations_total", "underlying" => depth_label_recv.clone());
-                    let m_obi_errors = metrics::counter!("tv_obi_persist_errors_total", "underlying" => depth_label_recv.clone());
-                    let mut writer =
-                        tickvault_storage::deep_depth_persistence::DeepDepthWriter::new(
+                        // OBI: writer + bid accumulator (per security_id).
+                        // Depth packets arrive as [Bid][Ask] pairs per instrument in each WS message.
+                        // Accumulate bid levels, compute OBI when ask arrives.
+                        let mut obi_writer = tickvault_storage::obi_persistence::ObiWriter::new(
                             &depth_questdb,
+                            &depth_label_recv,
                         )
                         .ok();
-                    if writer.is_some() {
-                        tracing::info!(
-                            underlying = depth_label_recv,
-                            "deep depth QuestDB writer connected"
-                        );
-                    }
+                        if obi_writer.is_some() {
+                            tracing::info!(
+                                underlying = depth_label_recv,
+                                "OBI QuestDB writer connected"
+                            );
+                        }
+                        // O(1) EXEMPT: begin — HashMap pre-allocated for max 50 instruments per depth connection
+                        let mut bid_accumulator: std::collections::HashMap<
+                            u32,
+                            (u8, Vec<tickvault_common::tick_types::DeepDepthLevel>),
+                        > = std::collections::HashMap::with_capacity(50);
+                        // O(1) EXEMPT: end
 
-                    // OBI: writer + bid accumulator (per security_id).
-                    // Depth packets arrive as [Bid][Ask] pairs per instrument in each WS message.
-                    // Accumulate bid levels, compute OBI when ask arrives.
-                    let mut obi_writer = tickvault_storage::obi_persistence::ObiWriter::new(
-                        &depth_questdb,
-                        &depth_label_recv,
-                    )
-                    .ok();
-                    if obi_writer.is_some() {
-                        tracing::info!(
-                            underlying = depth_label_recv,
-                            "OBI QuestDB writer connected"
-                        );
-                    }
-                    // O(1) EXEMPT: begin — HashMap pre-allocated for max 50 instruments per depth connection
-                    let mut bid_accumulator: std::collections::HashMap<
-                        u32,
-                        (u8, Vec<tickvault_common::tick_types::DeepDepthLevel>),
-                    > = std::collections::HashMap::with_capacity(50);
-                    // O(1) EXEMPT: end
+                        // H5: consecutive parse error counter for Telegram escalation.
+                        let mut consecutive_parse_errors: u32 = 0;
 
-                    // H5: consecutive parse error counter for Telegram escalation.
-                    let mut consecutive_parse_errors: u32 = 0;
-
-                    while let Some(frame) = depth_rx.recv().await {
-                        m.increment(1);
-                        let ts = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-                        // Split stacked packets: Dhan stacks multiple instrument packets
-                        // in a single WS message: [Inst1 Bid][Inst1 Ask][Inst2 Bid]...
-                        // Without splitting, only the first packet would be parsed.
-                        let packets =
+                        while let Some(frame) = depth_rx.recv().await {
+                            m.increment(1);
+                            let ts = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+                            // Split stacked packets: Dhan stacks multiple instrument packets
+                            // in a single WS message: [Inst1 Bid][Inst1 Ask][Inst2 Bid]...
+                            // Without splitting, only the first packet would be parsed.
+                            let packets =
                             match tickvault_core::parser::dispatcher::split_stacked_depth_packets(
                                 &frame,
                             ) {
@@ -3366,55 +3427,62 @@ async fn main() -> Result<()> {
                                     continue;
                                 }
                             };
-                        for packet in packets {
-                            match tickvault_core::parser::dispatcher::dispatch_deep_depth_frame(
-                                packet, ts,
-                            ) {
-                                Ok(tickvault_core::parser::types::ParsedFrame::DeepDepth {
-                                    security_id,
-                                    exchange_segment_code,
-                                    side,
-                                    levels,
-                                    message_sequence,
-                                    ..
-                                }) => {
-                                    consecutive_parse_errors = 0; // H5: reset on success
-                                    let side_str = match side {
-                                        tickvault_core::parser::deep_depth::DepthSide::Bid => "BID",
-                                        tickvault_core::parser::deep_depth::DepthSide::Ask => "ASK",
-                                    };
-                                    // Persist raw depth to QuestDB
-                                    if let Some(ref mut w) = writer
-                                        && let Err(err) = w.append_deep_depth(
-                                            security_id,
-                                            exchange_segment_code,
-                                            side_str,
-                                            &levels,
-                                            "20",
-                                            ts,
-                                            message_sequence,
-                                        )
-                                    {
-                                        // Phase 0 / Rule 5: persist failures are ERROR (route to Telegram).
-                                        tracing::error!(?err, "failed to persist 20-level depth");
-                                    }
-
-                                    // OBI accumulation: store bid, compute on ask arrival.
-                                    // Bid/ask arrive as separate packets per instrument.
-                                    // Remove bid entry after OBI computation to prevent stale data.
-                                    match side {
-                                        tickvault_core::parser::deep_depth::DepthSide::Bid => {
-                                            bid_accumulator.insert(
+                            for packet in packets {
+                                match tickvault_core::parser::dispatcher::dispatch_deep_depth_frame(
+                                    packet, ts,
+                                ) {
+                                    Ok(tickvault_core::parser::types::ParsedFrame::DeepDepth {
+                                        security_id,
+                                        exchange_segment_code,
+                                        side,
+                                        levels,
+                                        message_sequence,
+                                        ..
+                                    }) => {
+                                        consecutive_parse_errors = 0; // H5: reset on success
+                                        let side_str = match side {
+                                            tickvault_core::parser::deep_depth::DepthSide::Bid => {
+                                                "BID"
+                                            }
+                                            tickvault_core::parser::deep_depth::DepthSide::Ask => {
+                                                "ASK"
+                                            }
+                                        };
+                                        // Persist raw depth to QuestDB
+                                        if let Some(ref mut w) = writer
+                                            && let Err(err) = w.append_deep_depth(
                                                 security_id,
-                                                (exchange_segment_code, levels),
+                                                exchange_segment_code,
+                                                side_str,
+                                                &levels,
+                                                "20",
+                                                ts,
+                                                message_sequence,
+                                            )
+                                        {
+                                            // Phase 0 / Rule 5: persist failures are ERROR (route to Telegram).
+                                            tracing::error!(
+                                                ?err,
+                                                "failed to persist 20-level depth"
                                             );
                                         }
-                                        tickvault_core::parser::deep_depth::DepthSide::Ask => {
-                                            // Remove bid entry (take ownership) to prevent stale accumulation.
-                                            if let Some((seg_code, bid_levels)) =
-                                                bid_accumulator.remove(&security_id)
-                                            {
-                                                let obi_snap =
+
+                                        // OBI accumulation: store bid, compute on ask arrival.
+                                        // Bid/ask arrive as separate packets per instrument.
+                                        // Remove bid entry after OBI computation to prevent stale data.
+                                        match side {
+                                            tickvault_core::parser::deep_depth::DepthSide::Bid => {
+                                                bid_accumulator.insert(
+                                                    security_id,
+                                                    (exchange_segment_code, levels),
+                                                );
+                                            }
+                                            tickvault_core::parser::deep_depth::DepthSide::Ask => {
+                                                // Remove bid entry (take ownership) to prevent stale accumulation.
+                                                if let Some((seg_code, bid_levels)) =
+                                                    bid_accumulator.remove(&security_id)
+                                                {
+                                                    let obi_snap =
                                                     tickvault_trading::indicator::obi::compute_obi(
                                                         security_id,
                                                         seg_code,
@@ -3422,16 +3490,16 @@ async fn main() -> Result<()> {
                                                         &levels,
                                                     );
 
-                                                // Update Prometheus gauges (pre-registered, zero-clone)
-                                                m_obi_value.set(obi_snap.obi);
-                                                m_obi_computations.increment(1);
+                                                    // Update Prometheus gauges (pre-registered, zero-clone)
+                                                    m_obi_value.set(obi_snap.obi);
+                                                    m_obi_computations.increment(1);
 
-                                                // Persist OBI snapshot with separate ts and received_at.
-                                                // ts = received_at IST (for QuestDB designated timestamp).
-                                                // received_at = same value (depth has no exchange timestamp).
-                                                let ts_ist = ts.saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS);
-                                                if let Some(ref mut ow) = obi_writer {
-                                                    let obi_record = tickvault_storage::obi_persistence::ObiRecord {
+                                                    // Persist OBI snapshot with separate ts and received_at.
+                                                    // ts = received_at IST (for QuestDB designated timestamp).
+                                                    // received_at = same value (depth has no exchange timestamp).
+                                                    let ts_ist = ts.saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS);
+                                                    if let Some(ref mut ow) = obi_writer {
+                                                        let obi_record = tickvault_storage::obi_persistence::ObiRecord {
                                                         security_id,
                                                         segment_code: obi_snap.segment_code,
                                                         obi: obi_snap.obi,
@@ -3447,256 +3515,258 @@ async fn main() -> Result<()> {
                                                         spread: obi_snap.spread,
                                                         ts_nanos: ts_ist,
                                                     };
-                                                    if let Err(err) = ow.append_obi(&obi_record) {
-                                                        m_obi_errors.increment(1);
-                                                        tracing::warn!(
-                                                            ?err,
-                                                            "failed to persist OBI snapshot"
-                                                        );
+                                                        if let Err(err) = ow.append_obi(&obi_record)
+                                                        {
+                                                            m_obi_errors.increment(1);
+                                                            tracing::warn!(
+                                                                ?err,
+                                                                "failed to persist OBI snapshot"
+                                                            );
+                                                        }
                                                     }
                                                 }
+                                                // Ask without prior bid: skip silently (normal at startup
+                                                // when ask frame arrives before first bid frame).
                                             }
-                                            // Ask without prior bid: skip silently (normal at startup
-                                            // when ask frame arrives before first bid frame).
                                         }
                                     }
-                                }
-                                Ok(_) => {} // non-depth frame (shouldn't happen)
-                                Err(err) => {
-                                    // H5: Escalate persistent parse failures to ERROR (triggers Telegram).
-                                    consecutive_parse_errors =
-                                        consecutive_parse_errors.saturating_add(1);
-                                    metrics::counter!("tv_depth_parse_errors_total", "depth" => "20").increment(1);
-                                    if consecutive_parse_errors >= 5 {
-                                        tracing::error!(
-                                            ?err,
-                                            consecutive = consecutive_parse_errors,
-                                            "H5: 20-level depth parse failures persisting — {consecutive_parse_errors} consecutive errors"
-                                        );
-                                        consecutive_parse_errors = 0;
-                                    } else {
-                                        tracing::warn!(
-                                            ?err,
-                                            "failed to parse 20-level depth packet"
-                                        );
+                                    Ok(_) => {} // non-depth frame (shouldn't happen)
+                                    Err(err) => {
+                                        // H5: Escalate persistent parse failures to ERROR (triggers Telegram).
+                                        consecutive_parse_errors =
+                                            consecutive_parse_errors.saturating_add(1);
+                                        metrics::counter!("tv_depth_parse_errors_total", "depth" => "20").increment(1);
+                                        if consecutive_parse_errors >= 5 {
+                                            tracing::error!(
+                                                ?err,
+                                                consecutive = consecutive_parse_errors,
+                                                "H5: 20-level depth parse failures persisting — {consecutive_parse_errors} consecutive errors"
+                                            );
+                                            consecutive_parse_errors = 0;
+                                        } else {
+                                            tracing::warn!(
+                                                ?err,
+                                                "failed to parse 20-level depth packet"
+                                            );
+                                        }
                                     }
                                 }
                             }
                         }
-                    }
 
-                    // Flush remaining buffered records on shutdown (channel closed).
-                    // Without this, records buffered since last auto-flush are lost.
-                    if let Some(ref mut w) = writer
-                        && let Err(err) = w.flush()
-                    {
-                        // Phase 0 / Rule 5: flush failures are ERROR (route to Telegram).
-                        tracing::error!(?err, "depth writer flush on shutdown failed");
-                    }
-                    if let Some(ref mut ow) = obi_writer
-                        && let Err(err) = ow.flush()
-                    {
-                        // Phase 0 / Rule 5: flush failures are ERROR (route to Telegram).
-                        tracing::error!(?err, "OBI writer flush on shutdown failed");
-                    }
-                    tracing::info!(
-                        underlying = depth_label_recv,
-                        "depth frame receiver task exiting"
-                    );
-                });
-
-                // Spawn depth WebSocket connection with Telegram alerts + health updates
-                let d20_notifier = notifier.clone();
-                let d20_health = health_status.clone();
-                let d20_label_for_disconnect = label.clone();
-                let d20_label_for_signal = label.clone();
-                let d20_underlying_label = label.clone();
-                let d20_wal_spill = ws_frame_spill.clone();
-                // Parthiban directive (2026-04-21): wire notifier INSIDE the
-                // depth connection so DepthTwentyReconnected fires on every
-                // successful reconnect. The `d20_notifier` above is used
-                // only on task-exit for DepthTwentyDisconnected.
-                let d20_reconnect_notifier = Some(notifier.clone());
-                let (signal_tx, signal_rx) = tokio::sync::oneshot::channel::<()>();
-                // Command channel for live rebalance (unsubscribe+resubscribe, zero disconnect).
-                let (d20_cmd_tx, d20_cmd_rx) =
-                    tokio::sync::mpsc::channel::<tickvault_core::websocket::DepthCommand>(4);
-                {
-                    let senders = std::sync::Arc::clone(&depth_cmd_senders);
-                    let key = (*underlying).to_string();
-                    tokio::spawn(async move {
-                        senders.lock().await.insert(key, d20_cmd_tx);
+                        // Flush remaining buffered records on shutdown (channel closed).
+                        // Without this, records buffered since last auto-flush are lost.
+                        if let Some(ref mut w) = writer
+                            && let Err(err) = w.flush()
+                        {
+                            // Phase 0 / Rule 5: flush failures are ERROR (route to Telegram).
+                            tracing::error!(?err, "depth writer flush on shutdown failed");
+                        }
+                        if let Some(ref mut ow) = obi_writer
+                            && let Err(err) = ow.flush()
+                        {
+                            // Phase 0 / Rule 5: flush failures are ERROR (route to Telegram).
+                            tracing::error!(?err, "OBI writer flush on shutdown failed");
+                        }
+                        tracing::info!(
+                            underlying = depth_label_recv,
+                            "depth frame receiver task exiting"
+                        );
                     });
-                }
-                tokio::spawn(async move {
-                    d20_health.set_depth_20_connections(
-                        d20_health.depth_20_connections().saturating_add(1),
-                    );
 
-                    if let Err(err) = tickvault_core::websocket::run_twenty_depth_connection(
-                        depth_token,
-                        depth_client_id,
-                        instruments_for_underlying,
-                        depth_tx,
-                        d20_underlying_label,
-                        Some(signal_tx),
-                        d20_wal_spill,
-                        d20_cmd_rx,
-                        d20_reconnect_notifier,
-                    )
-                    .await
+                    // Spawn depth WebSocket connection with Telegram alerts + health updates
+                    let d20_notifier = notifier.clone();
+                    let d20_health = health_status.clone();
+                    let d20_label_for_disconnect = label.clone();
+                    let d20_label_for_signal = label.clone();
+                    let d20_underlying_label = label.clone();
+                    let d20_wal_spill = ws_frame_spill.clone();
+                    // Parthiban directive (2026-04-21): wire notifier INSIDE the
+                    // depth connection so DepthTwentyReconnected fires on every
+                    // successful reconnect. The `d20_notifier` above is used
+                    // only on task-exit for DepthTwentyDisconnected.
+                    let d20_reconnect_notifier = Some(notifier.clone());
+                    let (signal_tx, signal_rx) = tokio::sync::oneshot::channel::<()>();
+                    // Command channel for live rebalance (unsubscribe+resubscribe, zero disconnect).
+                    let (d20_cmd_tx, d20_cmd_rx) =
+                        tokio::sync::mpsc::channel::<tickvault_core::websocket::DepthCommand>(4);
                     {
-                        tracing::error!(?err, "20-level depth connection terminated");
-                        // Q5 (2026-04-23): route to Low-severity off-hours
-                        // variant when outside 09:00-15:30 IST. Same
-                        // anti-spam pattern as `WebSocketDisconnectedOffHours`
-                        // and `depth_rebalancer` stale-spot edge trigger —
-                        // a post-market boot shouldn't fire [HIGH] SMS for
-                        // an expected no-data disconnect.
-                        if tickvault_common::market_hours::is_within_market_hours_ist() {
-                            d20_notifier.notify(NotificationEvent::DepthTwentyDisconnected {
-                                underlying: d20_label_for_disconnect,
-                                reason: format!("{err}"),
-                            });
-                        } else {
-                            d20_notifier.notify(
-                                NotificationEvent::DepthTwentyDisconnectedOffHours {
+                        let senders = std::sync::Arc::clone(&depth_cmd_senders);
+                        let key = (*underlying).to_string();
+                        tokio::spawn(async move {
+                            senders.lock().await.insert(key, d20_cmd_tx);
+                        });
+                    }
+                    tokio::spawn(async move {
+                        d20_health.set_depth_20_connections(
+                            d20_health.depth_20_connections().saturating_add(1),
+                        );
+
+                        if let Err(err) = tickvault_core::websocket::run_twenty_depth_connection(
+                            depth_token,
+                            depth_client_id,
+                            instruments_for_underlying,
+                            depth_tx,
+                            d20_underlying_label,
+                            Some(signal_tx),
+                            d20_wal_spill,
+                            d20_cmd_rx,
+                            d20_reconnect_notifier,
+                        )
+                        .await
+                        {
+                            tracing::error!(?err, "20-level depth connection terminated");
+                            // Q5 (2026-04-23): route to Low-severity off-hours
+                            // variant when outside 09:00-15:30 IST. Same
+                            // anti-spam pattern as `WebSocketDisconnectedOffHours`
+                            // and `depth_rebalancer` stale-spot edge trigger —
+                            // a post-market boot shouldn't fire [HIGH] SMS for
+                            // an expected no-data disconnect.
+                            if tickvault_common::market_hours::is_within_market_hours_ist() {
+                                d20_notifier.notify(NotificationEvent::DepthTwentyDisconnected {
                                     underlying: d20_label_for_disconnect,
                                     reason: format!("{err}"),
-                                },
+                                });
+                            } else {
+                                d20_notifier.notify(
+                                    NotificationEvent::DepthTwentyDisconnectedOffHours {
+                                        underlying: d20_label_for_disconnect,
+                                        reason: format!("{err}"),
+                                    },
+                                );
+                            }
+                            d20_health.set_depth_20_connections(
+                                d20_health.depth_20_connections().saturating_sub(1),
                             );
-                        }
-                        d20_health.set_depth_20_connections(
-                            d20_health.depth_20_connections().saturating_sub(1),
-                        );
-                    }
-                });
-                // O(1) EXEMPT: end
-
-                // Telegram alert fires ONLY after first data frame received (not just subscription).
-                {
-                    let notify_label = d20_label_for_signal;
-                    let notify_sender = notifier.clone();
-                    tokio::spawn(async move {
-                        if signal_rx.await.is_ok() {
-                            notify_sender.notify(NotificationEvent::DepthTwentyConnected {
-                                underlying: notify_label,
-                            });
                         }
                     });
-                }
+                    // O(1) EXEMPT: end
 
-                // 200-level: spawn 2 connections for NIFTY + BANKNIFTY ONLY (CE ATM + PE ATM).
-                // 200-level = 1 instrument per connection. Dhan limit = 5 connections.
-                // 4 connections: NIFTY CE + NIFTY PE + BANKNIFTY CE + BANKNIFTY PE = within limit.
-                // FINNIFTY + MIDCPNIFTY use 20-level depth only (no 200-level).
-                // Dhan confirmed (Ticket #5519522): must use ATM security_id.
-                // O(1) EXEMPT: begin — boot-time 200-level depth setup (max 2 spawns per underlying)
-                // Only NIFTY + BANKNIFTY get 200-level (4 connections within Dhan's 5 limit).
-                //
-                // 2026-04-24: stagger initial connects by DEPTH_200_INITIAL_STAGGER_MS (2s)
-                // per spawn to avoid the concurrent-auth TCP-reset storm observed at
-                // 12:07:54 IST boot (all 4 connections reset within <100ms of each other).
-                if *underlying == "NIFTY" || *underlying == "BANKNIFTY" {
-                    // Plan item B.2 (2026-04-23): when boot-time ATM is
-                    // unavailable (pre-market deploy before 09:00 LTPs
-                    // arrive), spawn the 200-level connection in DEFERRED
-                    // mode with `depth200_sid = None`. The 09:13 dispatcher
-                    // (real-C) will send InitialSubscribe200 once the
-                    // 09:12 close is in the preopen buffer. Label carries
-                    // "-deferred" so Telegrams + logs reflect the state.
-                    // No ERROR-level alert here — pre-market missing ATM
-                    // is EXPECTED, not a planner bug.
-                    let atm_ce_entry: (&str, Option<u32>, String) = match atm_ce.as_ref() {
-                        Some((sid, lbl)) => ("CE", Some(*sid), lbl.clone()), // O(1) EXEMPT: boot-time
-                        None => ("CE", None, format!("{underlying}-CE-deferred")), // O(1) EXEMPT: boot-time
-                    };
-                    let atm_pe_entry: (&str, Option<u32>, String) = match atm_pe.as_ref() {
-                        Some((sid, lbl)) => ("PE", Some(*sid), lbl.clone()), // O(1) EXEMPT: boot-time
-                        None => ("PE", None, format!("{underlying}-PE-deferred")), // O(1) EXEMPT: boot-time
-                    };
-                    for opt_entry in [Some(atm_ce_entry), Some(atm_pe_entry)] {
-                        let Some((opt_label, depth200_sid, depth200_label)) = opt_entry else {
-                            continue;
+                    // Telegram alert fires ONLY after first data frame received (not just subscription).
+                    {
+                        let notify_label = d20_label_for_signal;
+                        let notify_sender = notifier.clone();
+                        tokio::spawn(async move {
+                            if signal_rx.await.is_ok() {
+                                notify_sender.notify(NotificationEvent::DepthTwentyConnected {
+                                    underlying: notify_label,
+                                });
+                            }
+                        });
+                    }
+
+                    // 200-level: spawn 2 connections for NIFTY + BANKNIFTY ONLY (CE ATM + PE ATM).
+                    // 200-level = 1 instrument per connection. Dhan limit = 5 connections.
+                    // 4 connections: NIFTY CE + NIFTY PE + BANKNIFTY CE + BANKNIFTY PE = within limit.
+                    // FINNIFTY + MIDCPNIFTY use 20-level depth only (no 200-level).
+                    // Dhan confirmed (Ticket #5519522): must use ATM security_id.
+                    // O(1) EXEMPT: begin — boot-time 200-level depth setup (max 2 spawns per underlying)
+                    // Only NIFTY + BANKNIFTY get 200-level (4 connections within Dhan's 5 limit).
+                    //
+                    // 2026-04-24: stagger initial connects by DEPTH_200_INITIAL_STAGGER_MS (2s)
+                    // per spawn to avoid the concurrent-auth TCP-reset storm observed at
+                    // 12:07:54 IST boot (all 4 connections reset within <100ms of each other).
+                    if *underlying == "NIFTY" || *underlying == "BANKNIFTY" {
+                        // Plan item B.2 (2026-04-23): when boot-time ATM is
+                        // unavailable (pre-market deploy before 09:00 LTPs
+                        // arrive), spawn the 200-level connection in DEFERRED
+                        // mode with `depth200_sid = None`. The 09:13 dispatcher
+                        // (real-C) will send InitialSubscribe200 once the
+                        // 09:12 close is in the preopen buffer. Label carries
+                        // "-deferred" so Telegrams + logs reflect the state.
+                        // No ERROR-level alert here — pre-market missing ATM
+                        // is EXPECTED, not a planner bug.
+                        let atm_ce_entry: (&str, Option<u32>, String) = match atm_ce.as_ref() {
+                            Some((sid, lbl)) => ("CE", Some(*sid), lbl.clone()), // O(1) EXEMPT: boot-time
+                            None => ("CE", None, format!("{underlying}-CE-deferred")), // O(1) EXEMPT: boot-time
                         };
+                        let atm_pe_entry: (&str, Option<u32>, String) = match atm_pe.as_ref() {
+                            Some((sid, lbl)) => ("PE", Some(*sid), lbl.clone()), // O(1) EXEMPT: boot-time
+                            None => ("PE", None, format!("{underlying}-PE-deferred")), // O(1) EXEMPT: boot-time
+                        };
+                        for opt_entry in [Some(atm_ce_entry), Some(atm_pe_entry)] {
+                            let Some((opt_label, depth200_sid, depth200_label)) = opt_entry else {
+                                continue;
+                            };
 
-                        // Q6 (2026-04-24): skip deferred spawn outside market
-                        // hours. Deferred mode (sid=None, "-deferred" label)
-                        // waits for the 09:13 IST dispatcher to provide the
-                        // real ATM SID via InitialSubscribe200. Post-market
-                        // that dispatcher won't fire again today — spawning
-                        // the loop with SID=0 just burns 60 TCP connects
-                        // against Dhan before giving up (seen in 2026-04-23
-                        // 21:20-23:13 IST boot: 4 contracts × 60 attempts =
-                        // 240 useless connects). Rule 3 from
-                        // audit-findings-2026-04-17.md: background workers
-                        // must be market-hours aware.
-                        if depth200_sid.is_none()
-                            && !tickvault_common::market_hours::is_within_market_hours_ist()
-                        {
-                            warn!(
+                            // Q6 (2026-04-24): skip deferred spawn outside market
+                            // hours. Deferred mode (sid=None, "-deferred" label)
+                            // waits for the 09:13 IST dispatcher to provide the
+                            // real ATM SID via InitialSubscribe200. Post-market
+                            // that dispatcher won't fire again today — spawning
+                            // the loop with SID=0 just burns 60 TCP connects
+                            // against Dhan before giving up (seen in 2026-04-23
+                            // 21:20-23:13 IST boot: 4 contracts × 60 attempts =
+                            // 240 useless connects). Rule 3 from
+                            // audit-findings-2026-04-17.md: background workers
+                            // must be market-hours aware.
+                            if depth200_sid.is_none()
+                                && !tickvault_common::market_hours::is_within_market_hours_ist()
+                            {
+                                warn!(
+                                    underlying,
+                                    option = opt_label,
+                                    contract = %depth200_label,
+                                    "200-level depth: skipping deferred spawn — off-market-hours boot, \
+                                     09:13 IST dispatcher won't run today. Boot during 09:00-15:30 IST to \
+                                     pick up depth-200 for this contract."
+                                );
+                                continue;
+                            }
+
+                            // 2026-04-28 — pick the right TokenHandle for depth-200.
+                            // When manual_self_with_renewal mode is on AND the SELF
+                            // token manager booted successfully, depth-200 uses the
+                            // SELF-token handle (full-depth-api.dhan.co requires
+                            // tokenConsumerType=SELF). All other WS pools keep the
+                            // shared TOTP/APP token_handle. If the manager is None
+                            // (default mode OR boot failed) we fall back to the
+                            // shared handle — depth-200 will fail with APP-token
+                            // RST as before, surfaced via existing alerts.
+                            let depth200_token = match &depth_200_self_token_manager {
+                                Some(manager) => manager.handle().clone(),
+                                None => token_handle.clone(),
+                            };
+                            let depth200_client_id = ws_client_id.clone();
+                            let depth200_segment = tickvault_common::types::ExchangeSegment::NseFno;
+
+                            // depth200_sid is Option<u32> (Item B.2): Some = ATM
+                            // available at boot, None = deferred until 09:13.
+                            let sid_log: i64 = depth200_sid.map_or(-1, i64::from);
+                            info!(
                                 underlying,
                                 option = opt_label,
+                                security_id = sid_log,
                                 contract = %depth200_label,
-                                "200-level depth: skipping deferred spawn — off-market-hours boot, \
-                                 09:13 IST dispatcher won't run today. Boot during 09:00-15:30 IST to \
-                                 pick up depth-200 for this contract."
+                                "spawning 200-level depth connection (contract={depth200_label}, sid={sid_log})"
                             );
-                            continue;
-                        }
 
-                        // 2026-04-28 — pick the right TokenHandle for depth-200.
-                        // When manual_self_with_renewal mode is on AND the SELF
-                        // token manager booted successfully, depth-200 uses the
-                        // SELF-token handle (full-depth-api.dhan.co requires
-                        // tokenConsumerType=SELF). All other WS pools keep the
-                        // shared TOTP/APP token_handle. If the manager is None
-                        // (default mode OR boot failed) we fall back to the
-                        // shared handle — depth-200 will fail with APP-token
-                        // RST as before, surfaced via existing alerts.
-                        let depth200_token = match &depth_200_self_token_manager {
-                            Some(manager) => manager.handle().clone(),
-                            None => token_handle.clone(),
-                        };
-                        let depth200_client_id = ws_client_id.clone();
-                        let depth200_segment = tickvault_common::types::ExchangeSegment::NseFno;
+                            let (tx200, mut rx200) =
+                                tokio::sync::mpsc::channel::<bytes::Bytes>(1024);
+                            let m200_label = depth200_label.clone();
+                            let depth200_questdb = config.questdb.clone(); // O(1) EXEMPT: boot clone
 
-                        // depth200_sid is Option<u32> (Item B.2): Some = ATM
-                        // available at boot, None = deferred until 09:13.
-                        let sid_log: i64 = depth200_sid.map_or(-1, i64::from);
-                        info!(
-                            underlying,
-                            option = opt_label,
-                            security_id = sid_log,
-                            contract = %depth200_label,
-                            "spawning 200-level depth connection (contract={depth200_label}, sid={sid_log})"
-                        );
-
-                        let (tx200, mut rx200) = tokio::sync::mpsc::channel::<bytes::Bytes>(1024);
-                        let m200_label = depth200_label.clone();
-                        let depth200_questdb = config.questdb.clone(); // O(1) EXEMPT: boot clone
-
-                        // Spawn 200-level depth receiver with QuestDB persistence
-                        tokio::spawn(async move {
-                            let m = metrics::counter!("tv_depth_200lvl_frames_received", "underlying" => m200_label.clone());
-                            let mut writer =
+                            // Spawn 200-level depth receiver with QuestDB persistence
+                            tokio::spawn(async move {
+                                let m = metrics::counter!("tv_depth_200lvl_frames_received", "underlying" => m200_label.clone());
+                                let mut writer =
                                 tickvault_storage::deep_depth_persistence::DeepDepthWriter::new(
                                     &depth200_questdb,
                                 )
                                 .ok();
-                            if writer.is_some() {
-                                tracing::info!(
-                                    label = m200_label,
-                                    "200-level deep depth QuestDB writer connected"
-                                );
-                            }
-                            // H5: consecutive parse error counter.
-                            let mut consecutive_parse_errors_200: u32 = 0;
+                                if writer.is_some() {
+                                    tracing::info!(
+                                        label = m200_label,
+                                        "200-level deep depth QuestDB writer connected"
+                                    );
+                                }
+                                // H5: consecutive parse error counter.
+                                let mut consecutive_parse_errors_200: u32 = 0;
 
-                            while let Some(frame) = rx200.recv().await {
-                                m.increment(1);
-                                let ts = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
-                                match tickvault_core::parser::dispatcher::dispatch_deep_depth_frame(
+                                while let Some(frame) = rx200.recv().await {
+                                    m.increment(1);
+                                    let ts = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+                                    match tickvault_core::parser::dispatcher::dispatch_deep_depth_frame(
                                     &frame, ts,
                                 ) {
                                     Ok(tickvault_core::parser::types::ParsedFrame::DeepDepth {
@@ -3753,164 +3823,236 @@ async fn main() -> Result<()> {
                                         }
                                     }
                                 }
-                            }
-                        });
-
-                        let d200_health = health_status.clone();
-                        let d200_notifier = notifier.clone();
-                        // Parthiban directive (2026-04-21): wire notifier
-                        // INSIDE the depth-200 connection so
-                        // DepthTwoHundredReconnected fires on every
-                        // successful reconnect.
-                        let d200_reconnect_notifier = Some(notifier.clone());
-                        let d200_label_for_disconnect = depth200_label.clone();
-                        let d200_label_for_signal = depth200_label.clone();
-                        // Use 0 sentinel for the Telegram/disconnect event
-                        // when deferred (pre-09:13 boot) — the event types
-                        // take u32 and the 09:13 dispatcher will log the
-                        // real sid via InitialSubscribe200 before any
-                        // disconnect notification is meaningful.
-                        let d200_sid_for_disconnect: u32 = depth200_sid.unwrap_or(0);
-                        let d200_sid_for_signal: u32 = depth200_sid.unwrap_or(0);
-                        let d200_wal_spill = ws_frame_spill.clone();
-                        // 2026-04-24 Fix C: stagger this spawn's first connect
-                        // by N × 2s where N is the 0-based spawn index.
-                        let d200_initial_stagger_ms: u64 = depth_200_spawn_index.saturating_mul(
-                            tickvault_core::websocket::DEPTH_200_INITIAL_STAGGER_MS,
-                        );
-                        depth_200_spawn_index = depth_200_spawn_index.saturating_add(1);
-                        let (d200_signal_tx, d200_signal_rx) =
-                            tokio::sync::oneshot::channel::<()>();
-                        // Command channel for live 200-level rebalance (zero disconnect).
-                        let d200_handle_key = format!("{underlying}-{opt_label}"); // e.g. "NIFTY-CE"
-                        let (d200_cmd_tx, d200_cmd_rx) = tokio::sync::mpsc::channel::<
-                            tickvault_core::websocket::DepthCommand,
-                        >(4);
-                        {
-                            let senders = std::sync::Arc::clone(&depth_cmd_senders);
-                            let key = d200_handle_key.clone();
-                            tokio::spawn(async move {
-                                senders.lock().await.insert(key, d200_cmd_tx);
+                                }
                             });
-                        }
-                        let d200_handle = tokio::spawn(async move {
-                            d200_health.set_depth_200_connections(
-                                d200_health.depth_200_connections().saturating_add(1),
-                            );
 
-                            if let Err(err) =
-                                tickvault_core::websocket::run_two_hundred_depth_connection(
-                                    depth200_token,
-                                    depth200_client_id,
-                                    depth200_segment,
-                                    // depth200_sid is already Option<u32>
-                                    // (Item B.2): None = deferred, Some =
-                                    // boot-time ATM available.
-                                    depth200_sid,
-                                    depth200_label,
-                                    tx200,
-                                    Some(d200_signal_tx),
-                                    d200_wal_spill,
-                                    d200_cmd_rx,
-                                    d200_reconnect_notifier,
-                                    d200_initial_stagger_ms,
-                                )
-                                .await
-                            {
-                                tracing::error!(
-                                    ?err,
-                                    contract = %d200_label_for_disconnect,
-                                    security_id = d200_sid_for_disconnect,
-                                    "200-level depth connection terminated"
+                            let d200_health = health_status.clone();
+                            let d200_notifier = notifier.clone();
+                            // Parthiban directive (2026-04-21): wire notifier
+                            // INSIDE the depth-200 connection so
+                            // DepthTwoHundredReconnected fires on every
+                            // successful reconnect.
+                            let d200_reconnect_notifier = Some(notifier.clone());
+                            let d200_label_for_disconnect = depth200_label.clone();
+                            let d200_label_for_signal = depth200_label.clone();
+                            // Use 0 sentinel for the Telegram/disconnect event
+                            // when deferred (pre-09:13 boot) — the event types
+                            // take u32 and the 09:13 dispatcher will log the
+                            // real sid via InitialSubscribe200 before any
+                            // disconnect notification is meaningful.
+                            let d200_sid_for_disconnect: u32 = depth200_sid.unwrap_or(0);
+                            let d200_sid_for_signal: u32 = depth200_sid.unwrap_or(0);
+                            let d200_wal_spill = ws_frame_spill.clone();
+                            // 2026-04-24 Fix C: stagger this spawn's first connect
+                            // by N × 2s where N is the 0-based spawn index.
+                            let d200_initial_stagger_ms: u64 = depth_200_spawn_index
+                                .saturating_mul(
+                                    tickvault_core::websocket::DEPTH_200_INITIAL_STAGGER_MS,
                                 );
-                                // Q5 (2026-04-23): route to Low-severity
-                                // off-hours variant when outside market
-                                // hours OR when the subscription fell
-                                // through to the deferred placeholder
-                                // (SecurityId=0). The 2026-04-23 post-
-                                // market boot fired 4× [HIGH] alerts with
-                                // SID=0 because no spot LTP arrived to
-                                // pick the ATM — pure Telegram noise.
-                                let use_off_hours_variant = d200_sid_for_disconnect == 0
+                            depth_200_spawn_index = depth_200_spawn_index.saturating_add(1);
+                            let (d200_signal_tx, d200_signal_rx) =
+                                tokio::sync::oneshot::channel::<()>();
+                            // Command channel for live 200-level rebalance (zero disconnect).
+                            let d200_handle_key = format!("{underlying}-{opt_label}"); // e.g. "NIFTY-CE"
+                            let (d200_cmd_tx, d200_cmd_rx) = tokio::sync::mpsc::channel::<
+                                tickvault_core::websocket::DepthCommand,
+                            >(4);
+                            {
+                                let senders = std::sync::Arc::clone(&depth_cmd_senders);
+                                let key = d200_handle_key.clone();
+                                tokio::spawn(async move {
+                                    senders.lock().await.insert(key, d200_cmd_tx);
+                                });
+                            }
+                            let d200_handle = tokio::spawn(async move {
+                                d200_health.set_depth_200_connections(
+                                    d200_health.depth_200_connections().saturating_add(1),
+                                );
+
+                                if let Err(err) =
+                                    tickvault_core::websocket::run_two_hundred_depth_connection(
+                                        depth200_token,
+                                        depth200_client_id,
+                                        depth200_segment,
+                                        // depth200_sid is already Option<u32>
+                                        // (Item B.2): None = deferred, Some =
+                                        // boot-time ATM available.
+                                        depth200_sid,
+                                        depth200_label,
+                                        tx200,
+                                        Some(d200_signal_tx),
+                                        d200_wal_spill,
+                                        d200_cmd_rx,
+                                        d200_reconnect_notifier,
+                                        d200_initial_stagger_ms,
+                                    )
+                                    .await
+                                {
+                                    tracing::error!(
+                                        ?err,
+                                        contract = %d200_label_for_disconnect,
+                                        security_id = d200_sid_for_disconnect,
+                                        "200-level depth connection terminated"
+                                    );
+                                    // Q5 (2026-04-23): route to Low-severity
+                                    // off-hours variant when outside market
+                                    // hours OR when the subscription fell
+                                    // through to the deferred placeholder
+                                    // (SecurityId=0). The 2026-04-23 post-
+                                    // market boot fired 4× [HIGH] alerts with
+                                    // SID=0 because no spot LTP arrived to
+                                    // pick the ATM — pure Telegram noise.
+                                    let use_off_hours_variant = d200_sid_for_disconnect == 0
                                     || !tickvault_common::market_hours::is_within_market_hours_ist(
                                     );
-                                if use_off_hours_variant {
-                                    d200_notifier.notify(
+                                    if use_off_hours_variant {
+                                        d200_notifier.notify(
                                         NotificationEvent::DepthTwoHundredDisconnectedOffHours {
                                             contract: d200_label_for_disconnect,
                                             security_id: d200_sid_for_disconnect,
                                             reason: format!("{err}"),
                                         },
                                     );
-                                } else {
-                                    d200_notifier.notify(
-                                        NotificationEvent::DepthTwoHundredDisconnected {
-                                            contract: d200_label_for_disconnect,
-                                            security_id: d200_sid_for_disconnect,
-                                            reason: format!("{err}"),
-                                        },
+                                    } else {
+                                        d200_notifier.notify(
+                                            NotificationEvent::DepthTwoHundredDisconnected {
+                                                contract: d200_label_for_disconnect,
+                                                security_id: d200_sid_for_disconnect,
+                                                reason: format!("{err}"),
+                                            },
+                                        );
+                                    }
+                                    d200_health.set_depth_200_connections(
+                                        d200_health.depth_200_connections().saturating_sub(1),
                                     );
                                 }
-                                d200_health.set_depth_200_connections(
-                                    d200_health.depth_200_connections().saturating_sub(1),
-                                );
+                            });
+                            // Store handle for rebalance abort+respawn.
+                            {
+                                let handles = std::sync::Arc::clone(&depth_200_handles);
+                                let key = d200_handle_key;
+                                tokio::spawn(async move {
+                                    handles.lock().await.insert(key, d200_handle);
+                                });
                             }
-                        });
-                        // Store handle for rebalance abort+respawn.
-                        {
-                            let handles = std::sync::Arc::clone(&depth_200_handles);
-                            let key = d200_handle_key;
-                            tokio::spawn(async move {
-                                handles.lock().await.insert(key, d200_handle);
-                            });
+                            // Telegram alert fires ONLY after first data frame received.
+                            {
+                                let notify_sender = notifier.clone();
+                                tokio::spawn(async move {
+                                    if d200_signal_rx.await.is_ok() {
+                                        notify_sender.notify(
+                                            NotificationEvent::DepthTwoHundredConnected {
+                                                contract: d200_label_for_signal,
+                                                security_id: d200_sid_for_signal,
+                                            },
+                                        );
+                                    }
+                                });
+                            }
                         }
-                        // Telegram alert fires ONLY after first data frame received.
-                        {
-                            let notify_sender = notifier.clone();
-                            tokio::spawn(async move {
-                                if d200_signal_rx.await.is_ok() {
-                                    notify_sender.notify(
-                                        NotificationEvent::DepthTwoHundredConnected {
-                                            contract: d200_label_for_signal,
-                                            security_id: d200_sid_for_signal,
-                                        },
-                                    );
-                                }
-                            });
+                        // O(1) EXEMPT: end
+                        // Push the 4 ATM SIDs we just spawned native depth-200
+                        // connections for, so the Python sidecar bridge can pick
+                        // them up via the state file and run as a guaranteed
+                        // fallback path while the native client flaps.
+                        if let Some(sid) = atm_ce_sid {
+                            depth_bridge_subs.push(
+                                tickvault_app::depth_bridge_state_writer::DepthBridgeSubscription {
+                                    security_id: sid,
+                                    segment: "NSE_FNO",
+                                    label: Some(atm_ce_label.to_string()),
+                                },
+                            );
                         }
-                    }
-                    // O(1) EXEMPT: end
-                    // Push the 4 ATM SIDs we just spawned native depth-200
-                    // connections for, so the Python sidecar bridge can pick
-                    // them up via the state file and run as a guaranteed
-                    // fallback path while the native client flaps.
-                    if let Some(sid) = atm_ce_sid {
-                        depth_bridge_subs.push(
-                            tickvault_app::depth_bridge_state_writer::DepthBridgeSubscription {
-                                security_id: sid,
-                                segment: "NSE_FNO",
-                                label: Some(atm_ce_label.to_string()),
-                            },
-                        );
-                    }
-                    if let Some(sid) = atm_pe_sid {
-                        depth_bridge_subs.push(
-                            tickvault_app::depth_bridge_state_writer::DepthBridgeSubscription {
-                                security_id: sid,
-                                segment: "NSE_FNO",
-                                label: Some(atm_pe_label.to_string()),
-                            },
-                        );
-                    }
-                } // end if NIFTY || BANKNIFTY (200-level guard)
-            }
+                        if let Some(sid) = atm_pe_sid {
+                            depth_bridge_subs.push(
+                                tickvault_app::depth_bridge_state_writer::DepthBridgeSubscription {
+                                    security_id: sid,
+                                    segment: "NSE_FNO",
+                                    label: Some(atm_pe_label.to_string()),
+                                },
+                            );
+                        }
+                    } // end if NIFTY || BANKNIFTY (200-level guard)
+                }
 
-            // After the depth-200 spawn loop completes, write the initial
-            // state file so the Python sidecar can begin streaming. Token
-            // is intentionally NOT in this file — Python falls back to
-            // data/cache/tv-token-cache (already kept fresh by the Rust
-            // TokenManager). Rebalance updates are a follow-up commit.
-            depth_bridge_state_writer.write_or_log(&ws_client_id, &depth_bridge_subs);
+                // After the depth-200 spawn loop completes, write the initial
+                // state file so the Python sidecar can begin streaming. Token
+                // is intentionally NOT in this file — Python falls back to
+                // data/cache/tv-token-cache (already kept fresh by the Rust
+                // TokenManager). Rebalance updates are a follow-up commit.
+                depth_bridge_state_writer.write_or_log(&ws_client_id, &depth_bridge_subs);
+            } else {
+                // Wave 5 single-side static depth-20 spawn (4 conns):
+                // NIFTY-CE, NIFTY-PE, BANKNIFTY-CE, BANKNIFTY-PE. ATM ± 24
+                // single-side per the planner primitive (Wave 5 commit 1).
+                // The 5th depth-20 conn (DYN-TOP50) and the 5 dynamic
+                // depth-200 conns are spawned earlier in the
+                // `depth_dynamic_top_volume` orchestrator block.
+                let single_side_plan = tickvault_app::depth_20_single_side_planner::plan_depth_20_single_side_subscriptions(
+                    depth_universe,
+                    |sym| spot_snapshot.get(sym).copied(),
+                    today,
+                );
+                let mut spawn_count: usize = 0;
+                for row in single_side_plan {
+                    let key = row.key.clone();
+                    let label = row.key.clone();
+                    let single_side_ids =
+                        tickvault_app::depth_20_single_side_planner::extract_single_side_ids(&row);
+                    let instruments: Vec<tickvault_core::websocket::types::InstrumentSubscription> =
+                        single_side_ids
+                            .into_iter()
+                            .map(|sid| {
+                                tickvault_core::websocket::types::InstrumentSubscription::new(
+                                    tickvault_common::types::ExchangeSegment::NseFno,
+                                    sid,
+                                )
+                            })
+                            .collect();
+
+                    let (cmd_tx, cmd_rx) =
+                        tokio::sync::mpsc::channel::<tickvault_core::websocket::DepthCommand>(4);
+                    // Wave 5 commit 6 (C1 fix from hostile-agent review):
+                    // register the cmd_tx SYNCHRONOUSLY (not via detached
+                    // tokio::spawn) so the 09:13 anchor dispatcher at
+                    // line ~5874 cannot race with the registration. The
+                    // legacy detached-spawn pattern at lines 3636/3903 is
+                    // gated off when single-side layout is ON, so those
+                    // race windows don't apply to Wave 5 boots. Capacity
+                    // is 4 single-side keys × 1 await = ~microseconds.
+                    depth_cmd_senders.lock().await.insert(key.clone(), cmd_tx);
+
+                    info!(
+                        underlying = %row.underlying,
+                        side = %row.side,
+                        key = %key,
+                        instruments = instruments.len(),
+                        "PROOF: Wave 5 single-side depth-20 conn — {} ({} SIDs, DEFERRED if 0)",
+                        key,
+                        instruments.len()
+                    );
+
+                    tickvault_app::depth_20_conn_spawner::spawn_depth_20_minimal_conn(
+                        tickvault_app::depth_20_conn_spawner::Depth20MinimalConnInputs {
+                            token_handle: token_handle.clone(),
+                            ws_client_id: ws_client_id.clone(),
+                            label,
+                            instruments,
+                            cmd_rx,
+                            questdb_config: config.questdb.clone(),
+                            notifier: notifier.clone(),
+                            health_status: health_status.clone(),
+                            ws_frame_spill: ws_frame_spill.clone(),
+                        },
+                    );
+                    spawn_count = spawn_count.saturating_add(1);
+                }
+                info!(
+                    spawned = spawn_count,
+                    "Wave 5: single-side static depth-20 conns spawned (legacy mixed + ATM-fixed depth-200 SKIPPED — orchestrator block already spawned 1 dynamic depth-20 + 5 dynamic depth-200)"
+                );
+            }
         }
     } else if config.subscription.enable_twenty_depth {
         info!("depth connections skipped — WebSocket connections not active");
@@ -3952,6 +4094,11 @@ async fn main() -> Result<()> {
             // independent universe handle (cloned BEFORE the rebalancer
             // takes ownership at the bottom of this block).
             let preopen_movers_universe = std::sync::Arc::clone(&universe_arc);
+            // Wave 5 commit 5: rebalance consumer needs universe to
+            // compute single-side ATM ± 24 windows for Swap20 fan-out
+            // to NIFTY-CE / NIFTY-PE / BANKNIFTY-CE / BANKNIFTY-PE
+            // depth-20 conns (operator spec 2026-05-01 Option B).
+            let rebal_consumer_universe = std::sync::Arc::clone(&universe_arc);
 
             // Rebalance event channel (watch — latest-value semantics)
             let (rebalance_tx, mut rebalance_rx) = tokio::sync::watch::channel::<
@@ -5544,6 +5691,8 @@ async fn main() -> Result<()> {
                 // were spawned earlier in boot.
                 let anchor_cmd_senders = std::sync::Arc::clone(&depth_cmd_senders);
                 let anchor_twenty_max = config.subscription.twenty_depth_max_instruments;
+                // Wave 5 commit 5: feature flag for single-side fan-out at 09:13.
+                let anchor_single_side_enabled = config.features.depth_dynamic_top_volume;
                 // Live LTPs for FINNIFTY + MIDCPNIFTY (the preopen buffer
                 // only captures NIFTY + BANKNIFTY IDX_I). At 09:13 the main
                 // feed has been streaming for ~13 min so these are present.
@@ -5688,45 +5837,116 @@ async fn main() -> Result<()> {
                     let senders = anchor_cmd_senders.lock().await;
                     for sel in &selections {
                         // 20-level InitialSubscribe.
-                        let instruments: Vec<
-                            tickvault_core::websocket::types::InstrumentSubscription,
-                        > = sel
-                            .all_security_ids
-                            .iter()
-                            .take(anchor_twenty_max)
-                            .map(|&sid| {
-                                tickvault_core::websocket::types::InstrumentSubscription::new(
-                                    tickvault_common::types::ExchangeSegment::NseFno,
-                                    sid,
-                                )
-                            })
-                            .collect::<Vec<_>>(); // O(1) EXEMPT: 4 underlyings × ~49 contracts, once per day
-                        let subscribe_messages = tickvault_core::websocket::subscription_builder::build_twenty_depth_subscription_messages(
-                            &instruments,
-                            50, // Dhan max batch size for 20-level subscribe
-                        );
-
-                        if let Some(sender) = senders.get(&sel.underlying_symbol) {
-                            let cmd = tickvault_core::websocket::DepthCommand::InitialSubscribe20 {
-                                subscribe_messages: subscribe_messages.clone(), // O(1) EXEMPT: once-per-day
-                            };
-                            if sender.send(cmd).await.is_err() {
-                                error!(
-                                    underlying = %sel.underlying_symbol,
-                                    "09:13 dispatch: InitialSubscribe20 send failed — depth receiver dropped"
+                        // Wave 5 commit 5: when single-side layout is ON
+                        // (`[features] depth_dynamic_top_volume = true`),
+                        // fan out to 4 single-side keys per pair of CE+PE
+                        // depth-20 conns. Otherwise dispatch the legacy
+                        // mixed-CE+PE single InitialSubscribe20 to a
+                        // bundled `"NIFTY"` / `"BANKNIFTY"` sender.
+                        if anchor_single_side_enabled {
+                            for (side_char, opt_label) in [('C', "CE"), ('P', "PE")] {
+                                let key = format!("{}-{}", sel.underlying_symbol, opt_label);
+                                let single_side_ids: &Vec<u32> = if side_char == 'C' {
+                                    &sel.call_security_ids
+                                } else {
+                                    &sel.put_security_ids
+                                };
+                                let instruments: Vec<
+                                    tickvault_core::websocket::types::InstrumentSubscription,
+                                > = single_side_ids
+                                    .iter()
+                                    .take(anchor_twenty_max)
+                                    .map(|&sid| {
+                                        tickvault_core::websocket::types::InstrumentSubscription::new(
+                                            tickvault_common::types::ExchangeSegment::NseFno,
+                                            sid,
+                                        )
+                                    })
+                                    .collect::<Vec<_>>(); // O(1) EXEMPT: 4 keys × ~49 contracts, once per day
+                                let subscribe_messages = tickvault_core::websocket::subscription_builder::build_twenty_depth_subscription_messages(
+                                    &instruments,
+                                    50,
                                 );
-                                m_dispatch_failed.increment(1);
-                            } else {
-                                m_dispatch_total.increment(1);
+                                if let Some(sender) = senders.get(&key) {
+                                    let cmd = tickvault_core::websocket::DepthCommand::InitialSubscribe20 {
+                                        subscribe_messages,
+                                    };
+                                    if sender.send(cmd).await.is_err() {
+                                        error!(
+                                            key = %key,
+                                            "09:13 dispatch (Wave 5): InitialSubscribe20 send failed — depth receiver dropped"
+                                        );
+                                        m_dispatch_failed.increment(1);
+                                    } else {
+                                        info!(
+                                            key = %key,
+                                            instruments = instruments.len(),
+                                            "PROOF: 09:13 dispatch InitialSubscribe20 sent to single-side key {} ({} SIDs)",
+                                            key,
+                                            instruments.len()
+                                        );
+                                        m_dispatch_total.increment(1);
+                                    }
+                                } else {
+                                    warn!(
+                                        key = %key,
+                                        "09:13 dispatch (Wave 5): no depth_cmd_sender for {key}"
+                                    );
+                                }
                             }
                         } else {
-                            warn!(
-                                underlying = %sel.underlying_symbol,
-                                "09:13 dispatch: no depth_cmd_sender registered for 20-level underlying"
+                            let instruments: Vec<
+                                tickvault_core::websocket::types::InstrumentSubscription,
+                            > = sel
+                                .all_security_ids
+                                .iter()
+                                .take(anchor_twenty_max)
+                                .map(|&sid| {
+                                    tickvault_core::websocket::types::InstrumentSubscription::new(
+                                        tickvault_common::types::ExchangeSegment::NseFno,
+                                        sid,
+                                    )
+                                })
+                                .collect::<Vec<_>>(); // O(1) EXEMPT: legacy mixed dispatch
+                            let subscribe_messages = tickvault_core::websocket::subscription_builder::build_twenty_depth_subscription_messages(
+                                &instruments,
+                                50,
                             );
+                            if let Some(sender) = senders.get(&sel.underlying_symbol) {
+                                let cmd =
+                                    tickvault_core::websocket::DepthCommand::InitialSubscribe20 {
+                                        subscribe_messages,
+                                    };
+                                if sender.send(cmd).await.is_err() {
+                                    error!(
+                                        underlying = %sel.underlying_symbol,
+                                        "09:13 dispatch (legacy): InitialSubscribe20 send failed — depth receiver dropped"
+                                    );
+                                    m_dispatch_failed.increment(1);
+                                } else {
+                                    m_dispatch_total.increment(1);
+                                }
+                            } else {
+                                warn!(
+                                    underlying = %sel.underlying_symbol,
+                                    "09:13 dispatch (legacy): no depth_cmd_sender registered for 20-level underlying"
+                                );
+                            }
                         }
 
                         // 200-level: only NIFTY + BANKNIFTY (Dhan 5-conn cap).
+                        // Wave 5 commit 6: when single-side layout is ON,
+                        // depth-200 is top-volume-driven (NOT ATM-following) —
+                        // the dynamic orchestrator at `main.rs:2722` owns the
+                        // 5 depth-200 slot senders. The 09:13 anchor would
+                        // hit `senders.get(&"NIFTY-CE")` which IS registered
+                        // (depth-20 single-side conn) and accidentally route
+                        // an InitialSubscribe200 to a depth-20 channel.
+                        // Skip the entire 200-level block under the flag so
+                        // the dynamic orchestrator handles it instead.
+                        if anchor_single_side_enabled {
+                            continue;
+                        }
                         if sel.underlying_symbol != "NIFTY" && sel.underlying_symbol != "BANKNIFTY"
                         {
                             continue;
@@ -5795,6 +6015,11 @@ async fn main() -> Result<()> {
                 // Wave 2 Item 9 (AUDIT-02) — clone QuestDB config into the
                 // rebalancer task scope so audit rows can be persisted.
                 let qcfg_for_rebalance = config.questdb.clone();
+                // Wave 5 commit 5: capture universe + feature flag for
+                // single-side Swap20 fan-out.
+                let rebal_universe = std::sync::Arc::clone(&rebal_consumer_universe);
+                let rebal_single_side_enabled = config.features.depth_dynamic_top_volume;
+                let rebal_twenty_max = config.subscription.twenty_depth_max_instruments;
                 tokio::spawn(async move {
                     while rebalance_rx.changed().await.is_ok() {
                         let event = match rebalance_rx.borrow().clone() {
@@ -5941,6 +6166,17 @@ async fn main() -> Result<()> {
                             })
                             .to_string();
 
+                            // Wave 5: when the dynamic top-volume layout is
+                            // ON, depth-200 conns are top-volume (not ATM)
+                            // — there's no `NIFTY-CE` depth-200 sender to
+                            // target. Skip Swap200 send to avoid noisy
+                            // "no cmd sender" warns. The dynamic depth-200
+                            // orchestrator handles its own swaps via
+                            // `option_movers` query every 60s.
+                            if rebal_single_side_enabled {
+                                continue;
+                            }
+
                             let senders = rebal_cmd_senders.lock().await;
                             if let Some(tx) = senders.get(&swap_key) {
                                 let cmd = tickvault_core::websocket::DepthCommand::Swap200 {
@@ -5967,6 +6203,101 @@ async fn main() -> Result<()> {
                                     key = %swap_key,
                                     "rebalance: no cmd sender for {swap_key} — 200-level not spawned?"
                                 );
+                            }
+                        }
+
+                        // --- 20-level single-side rebalance via command channel (Wave 5 commit 5) ---
+                        // Only fires when `[features] depth_dynamic_top_volume = true`
+                        // because the legacy mixed-CE+PE depth-20 spawn doesn't
+                        // register single-side keys. When flag ON, send Swap20
+                        // to each of NIFTY-CE / NIFTY-PE / BANKNIFTY-CE /
+                        // BANKNIFTY-PE depth-20 conns with the new ATM ± 24
+                        // single-side window.
+                        if rebal_single_side_enabled {
+                            let today_ist = chrono::Utc::now()
+                                .with_timezone(
+                                    &chrono::FixedOffset::east_opt(19_800).expect("IST offset"), // APPROVED: compile-time literal
+                                )
+                                .date_naive();
+                            for (side_char, opt_label) in [('C', "CE"), ('P', "PE")] {
+                                let key = format!("{ul}-{opt_label}");
+                                let sel = tickvault_core::instrument::depth_strike_selector::select_single_side_contracts(
+                                    &rebal_universe,
+                                    &ul,
+                                    side_char,
+                                    event.current_spot,
+                                    today_ist,
+                                    tickvault_core::instrument::depth_strike_selector::DEPTH_ATM_STRIKES_EACH_SIDE,
+                                );
+                                let Some(selection) = sel else {
+                                    warn!(
+                                        underlying = %ul,
+                                        side = %side_char,
+                                        spot = event.current_spot,
+                                        "rebalance: select_single_side_contracts returned None — skipping Swap20"
+                                    );
+                                    continue;
+                                };
+                                let single_side_ids: Vec<u32> = if side_char == 'C' {
+                                    selection.call_security_ids.clone()
+                                } else {
+                                    selection.put_security_ids.clone()
+                                };
+                                let instruments: Vec<
+                                    tickvault_core::websocket::types::InstrumentSubscription,
+                                > = single_side_ids
+                                    .iter()
+                                    .take(rebal_twenty_max)
+                                    .map(|&sid| {
+                                        tickvault_core::websocket::types::InstrumentSubscription::new(
+                                            tickvault_common::types::ExchangeSegment::NseFno,
+                                            sid,
+                                        )
+                                    })
+                                    .collect();
+                                let subscribe_messages = tickvault_core::websocket::subscription_builder::build_twenty_depth_subscription_messages(
+                                    &instruments,
+                                    50, // Dhan max batch size for 20-level
+                                );
+                                let unsubscribe_messages = vec![
+                                    serde_json::json!({
+                                        "RequestCode": 25,
+                                        "InstrumentCount": 0,
+                                        "InstrumentList": [],
+                                    })
+                                    .to_string(),
+                                ];
+
+                                let senders = rebal_cmd_senders.lock().await;
+                                if let Some(tx) = senders.get(&key) {
+                                    let cmd = tickvault_core::websocket::DepthCommand::Swap20 {
+                                        unsubscribe_messages,
+                                        subscribe_messages,
+                                    };
+                                    if let Err(err) = tx.send(cmd).await {
+                                        warn!(
+                                            ?err,
+                                            key = %key,
+                                            "rebalance: Swap20 command send failed"
+                                        );
+                                    } else {
+                                        info!(
+                                            underlying = %ul,
+                                            side = %side_char,
+                                            instruments = instruments.len(),
+                                            atm_strike = selection.atm_strike,
+                                            spot = event.current_spot,
+                                            "PROOF: rebalance Swap20 sent — {key} → {} SIDs (ATM={:.2}, zero disconnect)",
+                                            instruments.len(),
+                                            selection.atm_strike,
+                                        );
+                                    }
+                                } else {
+                                    warn!(
+                                        key = %key,
+                                        "rebalance: no cmd sender for {key} — single-side depth-20 not spawned?"
+                                    );
+                                }
                             }
                         }
                     }
