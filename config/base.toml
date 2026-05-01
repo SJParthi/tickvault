@@ -257,6 +257,11 @@ port = 3001
 allowed_origins = ["http://localhost:3000", "http://localhost:3001"]
 
 [subscription]
+# Wave 5 Item 1: subscription scope gate.
+# "indices_only_all_expiries" = NIFTY + BANKNIFTY + SENSEX all expiries/strikes
+#   + cash equities + IDX_I (~11,018 instruments). DEFAULT.
+# "full_universe" = legacy Wave 4 (216 stocks ATM±25 + indices, ~24,324). Escape hatch only.
+scope = "indices_only_all_expiries"
 feed_mode = "Full"
 subscribe_index_derivatives = true
 subscribe_stock_derivatives = true

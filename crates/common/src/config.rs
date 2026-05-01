@@ -779,6 +779,42 @@ impl Default for ObservabilityConfig {
     }
 }
 
+/// Subscription scope gate (Wave 5 Item 1).
+///
+/// Selects between the legacy full-universe subscription (216 stock F&O +
+/// 3 indices full chain ≈ 24,324 instruments) and the Wave 5 indices-only
+/// scope (NIFTY + BANKNIFTY + SENSEX, all expiries, all strikes; cash
+/// equities + IDX_I unchanged ≈ 11,018 instruments).
+///
+/// Default: `IndicesOnlyAllExpiries` — Wave 5 ships indices-only as the
+/// production default per `.claude/plans/active-plan-wave-5-indices-only.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubscriptionScope {
+    /// Wave 5 default — drop the 216-stock F&O block.
+    IndicesOnlyAllExpiries,
+    /// Legacy Wave 4 universe (kept as escape hatch for ops only).
+    FullUniverse,
+}
+
+impl Default for SubscriptionScope {
+    fn default() -> Self {
+        Self::IndicesOnlyAllExpiries
+    }
+}
+
+impl SubscriptionScope {
+    /// Stable string label used for tracing fields, the
+    /// `tv_subscription_scope` info-gauge, and audit rows.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::IndicesOnlyAllExpiries => "indices_only_all_expiries",
+            Self::FullUniverse => "full_universe",
+        }
+    }
+}
+
 /// Subscription planner configuration.
 ///
 /// Controls which instruments are subscribed and at what feed mode.
@@ -786,6 +822,10 @@ impl Default for ObservabilityConfig {
 /// expiry only with ATM ± N strike filtering.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SubscriptionConfig {
+    /// Wave 5 scope gate. Default = `IndicesOnlyAllExpiries`.
+    #[serde(default)]
+    pub scope: SubscriptionScope,
+
     /// Feed mode for all subscriptions. Always Full for maximum data (LTP, OI, depth).
     /// IDX_I instruments are forced to Ticker at connection level (Dhan limitation).
     /// Valid values: "Ticker", "Quote", "Full".
@@ -833,6 +873,7 @@ fn default_twenty_depth_max_instruments() -> usize {
 impl Default for SubscriptionConfig {
     fn default() -> Self {
         Self {
+            scope: SubscriptionScope::default(),
             feed_mode: "Full".to_string(),
             subscribe_index_derivatives: true,
             subscribe_stock_derivatives: true,
@@ -2050,6 +2091,73 @@ mod tests {
             ..SubscriptionConfig::default()
         };
         assert!(config.parsed_feed_mode().is_ok());
+    }
+
+    // Wave 5 Item 1 — subscription.scope config gate.
+    #[test]
+    fn test_subscription_scope_enum_indices_only_all_expiries_default() {
+        let scope = SubscriptionScope::default();
+        assert_eq!(scope, SubscriptionScope::IndicesOnlyAllExpiries);
+        assert_eq!(scope.as_str(), "indices_only_all_expiries");
+        // Pinned default carries through SubscriptionConfig::default().
+        let cfg = SubscriptionConfig::default();
+        assert_eq!(cfg.scope, SubscriptionScope::IndicesOnlyAllExpiries);
+    }
+
+    #[test]
+    fn test_subscription_scope_round_trips_via_figment() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        // Default round-trip — explicit indices_only_all_expiries.
+        let toml_default = r#"
+            [subscription]
+            scope = "indices_only_all_expiries"
+            feed_mode = "Full"
+            subscribe_index_derivatives = true
+            subscribe_stock_derivatives = true
+            subscribe_display_indices = true
+            subscribe_stock_equities = true
+            stock_atm_strikes_above = 25
+            stock_atm_strikes_below = 25
+            stock_default_atm_fallback_enabled = true
+        "#;
+        #[derive(Deserialize)]
+        struct Wrapper {
+            subscription: SubscriptionConfig,
+        }
+        let wrapper: Wrapper = Figment::new()
+            .merge(Toml::string(toml_default))
+            .extract()
+            .expect("default scope must round-trip");
+        assert_eq!(
+            wrapper.subscription.scope,
+            SubscriptionScope::IndicesOnlyAllExpiries
+        );
+
+        // Escape-hatch round-trip — full_universe.
+        let toml_full = toml_default.replace(
+            r#"scope = "indices_only_all_expiries""#,
+            r#"scope = "full_universe""#,
+        );
+        let wrapper: Wrapper = Figment::new()
+            .merge(Toml::string(&toml_full))
+            .extract()
+            .expect("full_universe scope must round-trip");
+        assert_eq!(wrapper.subscription.scope, SubscriptionScope::FullUniverse);
+        assert_eq!(wrapper.subscription.scope.as_str(), "full_universe");
+
+        // Missing scope key falls back to the Default impl (indices-only).
+        let toml_no_scope =
+            toml_default.replace("scope = \"indices_only_all_expiries\"\n            ", "");
+        let wrapper: Wrapper = Figment::new()
+            .merge(Toml::string(&toml_no_scope))
+            .extract()
+            .expect("missing scope must default");
+        assert_eq!(
+            wrapper.subscription.scope,
+            SubscriptionScope::IndicesOnlyAllExpiries
+        );
     }
 
     #[test]

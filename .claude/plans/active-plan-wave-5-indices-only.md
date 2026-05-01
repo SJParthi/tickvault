@@ -1138,7 +1138,7 @@ This is the honest envelope. Anything tighter ("guaranteed by May 31") would be 
 
 Each item carries the 9-box checklist per `stream-resilience.md` B8: ① typed event, ② ErrorCode, ③ tracing+code field, ④ Prometheus counter, ⑤ Grafana panel, ⑥ alert rule, ⑦ call site, ⑧ triage YAML rule, ⑨ ratchet test.
 
-### - [ ] 1. `subscription.scope` config gate
+### - [x] 1. `subscription.scope` config gate
 
 - Files: `crates/common/src/config.rs`, `config/base.toml`
 - Tests: `test_subscription_scope_enum_indices_only_all_expiries_default`, `test_subscription_scope_round_trips_via_figment`
