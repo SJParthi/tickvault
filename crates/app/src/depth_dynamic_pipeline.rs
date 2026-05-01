@@ -23,8 +23,10 @@
 //!   replacing the legacy pool.
 //! - **Selector is read-only.** The 60s SQL `SELECT ... FROM
 //!   option_movers WHERE category = 'TOP_VOLUME' AND change_pct > 0
-//!   AND segment != 'BSE_FNO' ORDER BY change_pct DESC LIMIT N` —
-//!   reads from QuestDB, never writes.
+//!   AND segment != 'BSE_FNO' ORDER BY volume DESC, change_pct DESC
+//!   LIMIT N` — reads from QuestDB, never writes. Operator spec
+//!   2026-05-01: VOLUME is PRIMARY sort key; change_pct DESC is the
+//!   tie-breaker.
 //! - **Swap commands are zero-disconnect.** When the rank set changes,
 //!   the orchestrator emits `DepthCommand::Swap20` /
 //!   `DepthCommand::Swap200` to the depth-connection task's command
