@@ -134,7 +134,7 @@ pub fn build_movers_query(timeframe: &str, category: MoversCategory, limit: usiz
             volume_bucket, oi_delta_bucket, \
             open_price_bucket, high_price_bucket, low_price_bucket, \
             change_pct_session, change_pct_bucket \
-         FROM movers_unified_{timeframe} \
+         FROM movers_{timeframe} \
          WHERE ts > dateadd('s', -300, now()) \
            AND segment != 'BSE_FNO' \
          ORDER BY {order} \
@@ -180,7 +180,12 @@ mod tests {
     #[test]
     fn test_build_query_includes_target_view_for_5m() {
         let sql = build_movers_query("5m", MoversCategory::TopVolumeBucket, 50);
-        assert!(sql.contains("FROM movers_unified_5m"));
+        assert!(sql.contains("FROM movers_5m"));
+        // Regression guard: must NOT reference the legacy table name. The
+        // 2026-05-01 migration drops every `movers_unified_*` mat view, so
+        // any read-path query targeting that name returns "table does not
+        // exist" at runtime.
+        assert!(!sql.contains("movers_unified_"));
     }
 
     #[test]
@@ -284,7 +289,8 @@ mod tests {
         // Pub-fn substring-match guard pin for `pub fn build_movers_query`.
         let sql = build_movers_query("1m", MoversCategory::HighestOi, 50);
         assert!(sql.starts_with("SELECT"));
-        assert!(sql.contains("FROM movers_unified_1m"));
+        assert!(sql.contains("FROM movers_1m"));
+        assert!(!sql.contains("movers_unified_"));
         assert!(sql.contains("WHERE"));
         assert!(sql.contains("ORDER BY"));
         assert!(sql.contains("LIMIT"));

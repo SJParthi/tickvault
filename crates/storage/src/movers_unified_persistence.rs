@@ -172,22 +172,48 @@ pub fn movers_view_ddl(timeframe: &str) -> String {
 
 /// Run the one-shot 2026-05-01 cleanup migration (DROP dead movers_22tf
 /// tables + DROP legacy movers_unified_* tables/views), gated by the
-/// presence of the marker table. The marker is created at the end so that
-/// crashes mid-migration replay safely (DROP IF EXISTS is idempotent).
+/// presence of the marker table.
+///
+/// **Probe correctness** (security review MEDIUM, hostile-bug-hunt H2): QuestDB
+/// `/exec` returns HTTP 200 with `{"error":"..."}` in the body for missing
+/// tables, AND HTTP 200 with `{"dataset":[[0]],...}` when the marker table
+/// exists but is empty (mid-failed migration). Naive HTTP-status check would
+/// false-positive on both cases. We instead:
+///   1. CREATE the marker table idempotently first (`IF NOT EXISTS`)
+///   2. SELECT count(*) from it
+///   3. Parse the JSON body and require `dataset[0][0] >= 1`
+/// Any deviation (HTTP error, parse failure, empty dataset, count = 0) →
+/// safe-fail to "not yet applied" → run the migration.
+///
+/// **Partial-failure safety** (hostile-bug-hunt H1): each DROP's HTTP status is
+/// observed. The marker INSERT runs ONLY if every DROP returned 2xx. Any
+/// failure short-circuits the marker write so the next boot retries (DROP
+/// IF EXISTS is idempotent so retries are safe).
 async fn run_one_shot_cleanup_migration(client: &Client, base_url: &str) {
-    // Probe the marker table. QuestDB returns rows for the dataset's columns
-    // when the table exists, and an HTTP 400 otherwise. We treat 400/error
-    // as "not yet applied" and proceed with the migration; on partial failure
-    // the next boot retries (DROP IF EXISTS is idempotent).
-    let probe_sql = format!("SELECT 1 FROM {MIGRATION_MARKER_TABLE} LIMIT 1");
-    if let Ok(resp) = client
+    // Step 0a: idempotent CREATE of the marker table. `IF NOT EXISTS` makes
+    // this safe to call every boot. DEDUP on `applied_at` prevents marker-row
+    // accumulation across re-runs (hostile-bug-hunt M1).
+    let create_marker = format!(
+        "CREATE TABLE IF NOT EXISTS {MIGRATION_MARKER_TABLE} (\
+            applied_at TIMESTAMP\
+        ) TIMESTAMP(applied_at) PARTITION BY YEAR \
+        DEDUP UPSERT KEYS(applied_at);"
+    );
+    if let Err(err) = client
         .get(base_url)
-        .query(&[("query", probe_sql.as_str())])
+        .query(&[("query", create_marker.as_str())])
         .send()
         .await
-        && resp.status().is_success()
     {
-        // Marker present → migration already applied.
+        // Boot continues — the probe below will short-circuit if CREATE
+        // failed AND the table already exists from a previous boot, or
+        // safe-fail to "not applied" and run the migration if it doesn't.
+        warn!(?err, "movers cleanup marker CREATE failed (continuing)");
+    }
+
+    // Step 0b: probe for an existing marker row. Robust against the QuestDB
+    // HTTP 200 + error-in-body and HTTP 200 + empty-dataset edge cases.
+    if marker_indicates_migration_applied(client, base_url).await {
         return;
     }
 
@@ -196,92 +222,113 @@ async fn run_one_shot_cleanup_migration(client: &Client, base_url: &str) {
         "running one-shot movers cleanup migration (2026-05-01) — DROP dead movers_22tf + DROP legacy movers_unified_*"
     );
 
+    let mut all_succeeded = true;
+
     // Step 1: DROP dead movers_22tf tables (25 names; a few overlap with
     // new mat-view names but DROP runs BEFORE CREATE in the boot DDL flow).
     for tf in LEGACY_22TF_TIMEFRAMES {
         let sql = format!("DROP TABLE IF EXISTS movers_{tf}");
-        if let Err(err) = client
-            .get(base_url)
-            .query(&[("query", sql.as_str())])
-            .send()
-            .await
-        {
-            warn!(
-                timeframe = tf,
-                ?err,
-                "DROP TABLE movers_{tf} failed (continuing)"
-            );
+        if !ddl_succeeded(client, base_url, &sql).await {
+            warn!(timeframe = tf, "DROP TABLE movers_{tf} failed (continuing)");
+            all_succeeded = false;
         }
     }
 
     // Step 2: DROP legacy movers_unified_* mat views (24 names).
     for tf in LEGACY_UNIFIED_VIEW_TIMEFRAMES {
         let sql = format!("DROP MATERIALIZED VIEW IF EXISTS movers_unified_{tf}");
-        if let Err(err) = client
-            .get(base_url)
-            .query(&[("query", sql.as_str())])
-            .send()
-            .await
-        {
+        if !ddl_succeeded(client, base_url, &sql).await {
             warn!(
                 timeframe = tf,
-                ?err,
                 "DROP MATERIALIZED VIEW movers_unified_{tf} failed (continuing)"
             );
+            all_succeeded = false;
         }
     }
 
     // Step 3: DROP legacy movers_unified_1s base.
     let drop_legacy_base = "DROP TABLE IF EXISTS movers_unified_1s";
-    if let Err(err) = client
-        .get(base_url)
-        .query(&[("query", drop_legacy_base)])
-        .send()
-        .await
-    {
-        warn!(?err, "DROP TABLE movers_unified_1s failed (continuing)");
+    if !ddl_succeeded(client, base_url, drop_legacy_base).await {
+        warn!("DROP TABLE movers_unified_1s failed (continuing)");
+        all_succeeded = false;
     }
 
-    // Step 4: create the marker table to gate subsequent boots.
-    let create_marker = format!(
-        "CREATE TABLE IF NOT EXISTS {MIGRATION_MARKER_TABLE} (\
-            applied_at TIMESTAMP\
-        ) TIMESTAMP(applied_at) PARTITION BY YEAR;"
-    );
-    if let Err(err) = client
-        .get(base_url)
-        .query(&[("query", create_marker.as_str())])
-        .send()
-        .await
-    {
+    // Step 4: write the marker row ONLY if every DROP succeeded. If any DROP
+    // failed (network blip, QuestDB hiccup) the next boot retries the whole
+    // migration — DROP IF EXISTS makes that safe.
+    if !all_succeeded {
         error!(
-            ?err,
-            "movers cleanup marker CREATE failed — migration may re-run"
+            marker = MIGRATION_MARKER_TABLE,
+            "one or more DROPs failed during movers cleanup migration — marker NOT written; next boot will retry"
         );
+        return;
     }
 
-    // Step 5: insert one marker row so the SELECT-1 probe returns success on
-    // subsequent boots.
-    let now_micros = chrono::Utc::now()
-        .timestamp_micros()
-        .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS / 1000);
+    let now_micros = chrono::Utc::now().timestamp_micros();
     let insert_marker = format!("INSERT INTO {MIGRATION_MARKER_TABLE} VALUES ({now_micros})");
-    if let Err(err) = client
-        .get(base_url)
-        .query(&[("query", insert_marker.as_str())])
-        .send()
-        .await
-    {
+    if !ddl_succeeded(client, base_url, &insert_marker).await {
         error!(
-            ?err,
-            "movers cleanup marker INSERT failed — migration may re-run"
+            marker = MIGRATION_MARKER_TABLE,
+            "movers cleanup marker INSERT failed — migration will re-run on next boot"
         );
+        return;
     }
 
     info!(
         marker = MIGRATION_MARKER_TABLE,
         "movers cleanup migration completed"
     );
+}
+
+/// Returns `true` when the QuestDB response was both HTTP 2xx AND the body
+/// does NOT contain the QuestDB `"error":` JSON marker. QuestDB's `/exec`
+/// endpoint returns HTTP 200 with `{"error":"..."}` in the body for queries
+/// against missing tables, so HTTP-status-only checks are insufficient.
+async fn ddl_succeeded(client: &Client, base_url: &str, sql: &str) -> bool {
+    match client.get(base_url).query(&[("query", sql)]).send().await {
+        Ok(resp) if resp.status().is_success() => match resp.text().await {
+            Ok(body) => !body.contains(r#""error":"#),
+            Err(_) => false,
+        },
+        _ => false,
+    }
+}
+
+/// Probe the marker table for an existing row. Returns `true` ONLY when the
+/// QuestDB response is HTTP 2xx AND the body parses to a non-empty count
+/// (`dataset[0][0] >= 1`). Any other outcome (HTTP error, parse failure,
+/// empty dataset, `"error":` in body, count = 0) safe-fails to `false` so
+/// the migration runs.
+async fn marker_indicates_migration_applied(client: &Client, base_url: &str) -> bool {
+    let probe_sql = format!("SELECT count(*) FROM {MIGRATION_MARKER_TABLE}");
+    let resp = match client
+        .get(base_url)
+        .query(&[("query", probe_sql.as_str())])
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => r,
+        _ => return false,
+    };
+    let body = match resp.text().await {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+    if body.contains(r#""error":"#) {
+        return false;
+    }
+    // Successful response shape:
+    //   {"query":"...","columns":[{"name":"count","type":"LONG"}],"timestamp":-1,"dataset":[[N]],"count":1}
+    let parsed: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    parsed
+        .get("dataset")
+        .and_then(|d| d.get(0))
+        .and_then(|row| row.get(0))
+        .and_then(serde_json::Value::as_i64)
+        .is_some_and(|count| count >= 1)
 }
 
 /// Idempotent CREATE for the base table + all 24 mat views. Called once

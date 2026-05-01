@@ -517,10 +517,12 @@ scan_movers_orphan_ddl() {
   while IFS= read -r file; do
     [ -z "$file" ] && continue
     [ ! -f "$file" ] && continue
-    # Skip the canonical helper itself + tests
+    # Skip the canonical helper itself + tests. Use exact-path matches so
+    # only the two known canonical storage modules are exempted (a rogue
+    # `crates/api/src/movers_persistence.rs` would NOT bypass the check).
     case "$file" in
-      */movers_unified_persistence.rs) continue ;;
-      */movers_persistence.rs) continue ;;
+      crates/storage/src/movers_unified_persistence.rs) continue ;;
+      crates/storage/src/movers_persistence.rs) continue ;;
       */tests/*) continue ;;
     esac
     # Find any literal CREATE TABLE IF NOT EXISTS movers_ outside the helper

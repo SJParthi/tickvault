@@ -182,8 +182,10 @@ run_check "movers" "22 movers_{T} tables in partition manager" \
 run_check "movers" "S3 lifecycle config exists for movers" \
     test -f deploy/aws/s3-lifecycle-movers-tables.json
 
-# Movers base table + materialized views (post 2026-05-01 cleanup)
-run_check "movers" "movers_unified_persistence module present" \
+# Movers base table + materialized views (post 2026-05-01 cleanup).
+# Module file kept its `_unified_` filename to minimise the rename diff —
+# the operator-visible table is `movers_1s` (not `movers_unified_1s`).
+run_check "movers" "movers persistence module (movers_1s base + 24 mat views)" \
     test -f crates/storage/src/movers_unified_persistence.rs
 
 # ---------------------------------------------------------------------------
