@@ -986,7 +986,108 @@ The merged trunk's tracker is named `Movers22TfTracker`. Operator's new spec is 
 - Default: **keep `22Tf` naming + add timeframes inside** (smaller diff, less migration cost; the "22" number is now historical artifact).
 - Alternative: rename for clarity (larger diff, requires `cargo-mutants` re-baseline + dashboard rename + `MOVERS-22TF-*` ErrorCode rename).
 
-## Plan Items (now 19, was 10)
+## Item 20 — May 2026 Cutover Timeline + AWS Deployment Plan (operator demand 2026-05-01)
+
+Operator: "our main aim why we have shortened this is to finish this live testing the max before this may end and even it should be deployed to aws instance also by this month end with all the expected design and integrated and working product. Can we do that — is that possible bro? I need guarantee and assurance dude."
+
+### Honest answer (per `wave-4-shared-preamble.md` §8)
+
+**Achievable in the 30-day window with the locked plan + foundation already on trunk.** Cannot promise literal "guaranteed deploy by 2026-05-31" — TCP, Dhan API, AWS, and live market data are external dependencies not in our control. What CAN be guaranteed inside the tested envelope:
+
+| Guarantee | Mechanical proof | Owner |
+|---|---|---|
+| Plan locked + buildable | This file, Status: APPROVED, 19 items, all 33 findings remediated | done |
+| Sub-PR split with no conflicts | Item 17 parallelization map, file-disjoint per group | done |
+| Foundation already merged | `depth_20_dynamic_subscriber.rs`, `Movers22TfTracker`, 7,250 tests, 53 ErrorCodes, aws-budget.md | done |
+| AWS budget approved | `.claude/rules/project/aws-budget.md` ₹5K/mo cap | done |
+| Implementation testable end-to-end | Item 11 chaos burst + Item 10 adversarial review + 22-test category coverage | will be done by week 3 |
+| Dry-run mandatory before live | `config/base.toml::strategy.dry_run = true` default | already enforced |
+
+### 30-day cutover schedule (calendar 2026-05-01 → 2026-05-31)
+
+| Week | Days | Items | Outcome | Risk |
+|---|---|---|---|---|
+| **W1** | May 1-7 | Sub-PR A: Items 1, 6, 7, 8, 9, 15 (Foundation + Independent fixes per Item 17 Group A+B) | All merged to wave branch; can run 5 sessions in parallel after Item 1 | Low — Items mostly small/medium, no architectural rewrites |
+| **W2** | May 8-14 | Sub-PR B start: Item 2 (universe filter), then Items 3, 4, 5 in parallel | Main feed + depth pipelines verified under indices-only scope | Medium — Item 4 collision-resolution risk (already mitigated via Option A) |
+| **W3** | May 15-21 | Sub-PR B finish: Items 12, 13, 14 + Sub-PR C: Items 16, 19, 11 | Movers + prev_close + chaos burst all green | Medium — Item 7 candle_aggregator workspace migration touches many call sites |
+| **W4** | May 22-28 | Item 10 adversarial review (3 agents) + Item 18 verification + Wave 5 final merge to main | All ratchets green; PR #410 merged | Medium — adversarial review may surface late finds; budget 2 days for fixes |
+| **W5** | May 29-31 | AWS provisioning + Dhan static IP + dry-run on c7i.xlarge | Live tickvault running on AWS in dry-run mode | High — operator-driven; Dhan IP cooldown is a 7-day landmine |
+
+### Critical path landmines
+
+| Landmine | Cost if hit | Mitigation |
+|---|---|---|
+| **Dhan static IP modification cooldown (7 days)** per `dhan/authentication.md` rule 7 | Lose 7 days = miss May 31 | Get IP RIGHT on first try; dry-run extensively against the new EIP BEFORE registering with Dhan; set both PRIMARY + SECONDARY IPs |
+| **Static IP enforcement effective April 1, 2026** | Orders from unregistered IPs REJECTED by exchange | Pre-flight check `ordersAllowed == true` from `GET /v2/ip/getIP` before market open (existing Wave 2-A wiring) |
+| **Item 7 candle_aggregator composite-key workspace migration** | 1-3 days if many call sites | Item 17 parallelization map says Group B; Item 7 marked as "audit + migrate all call sites" subtask per M6 |
+| **`core_affinity` 0.8.3 on Apple Silicon M4 Pro** (Item 6 Mac parity) | 1-2 days if `task_policy_set` doesn't behave on Darwin 14+ | Have fallback: `TICKVAULT_ALLOW_SUB_4_VCPU=1` env override + halt on `CORE-PIN-04` is already wired |
+| **Concurrent in-flight waves (Wave 3, Wave 4) merge conflicts** | 1-2 days | Per-PR-set protocol Item 17 group separation; fetch + rebase frequently |
+| **AWS provisioning operator availability** | Variable | Operator-driven; Wave 5 cannot accelerate this |
+| **Live data surprise during dry-run** (e.g., Dhan emits a packet variant our parser doesn't handle) | 1-7 days | Adversarial review (Item 10) catches most; chaos burst (Item 11) catches throughput; rest surfaces in dry-run |
+
+### What "with all the expected design and integrated and working product" means mechanically
+
+- **Expected design:** plan locked at 19 items + all 33 review findings remediated. Architecture matches `wave-4-shared-preamble.md` §2 charter.
+- **Integrated:** all 6 crates compile workspace-wide; CI green; pre-push 12 gates pass; coverage 100% per `quality/crate-coverage-thresholds.toml`.
+- **Working product:** `make doctor` 7-section pass; `make validate-automation` 30 checks pass; `mcp__tickvault-logs__list_active_alerts` returns `[]`; live tick stream observed end-to-end on c7i.xlarge with 11,018 instruments + 248 depth-20 instruments + 5 depth-200 instruments.
+
+### What is NOT in scope for May (by design — operator's "shortened" decision)
+
+- Stock F&O subscription (216 stocks × ~102 contracts = ~22K instruments) — DROPPED in Wave 5
+- Live order placement (still `dry_run = true`) — separate Phase 1 graduation
+- Real money trading — separate operator decision after dry-run validation
+- Greeks pipeline expansion beyond NIFTY/BANKNIFTY/SENSEX — stays at MAX_UNDERLYINGS=3
+- Loki + Alloy re-add (deferred per `observability-architecture.md` Phase 3 blocked on QuestDB mem trim)
+- CloudWatch CloudWatch parity (Phase 4) — deferred until AWS instance provisioned
+
+### Daily protocol during the 30-day window
+
+Per `wave-4-shared-preamble.md` §1 + `stream-resilience.md` B7 every working day:
+
+1. **Session start:** `mcp__tickvault-logs__run_doctor` + `summary_snapshot` + `list_active_alerts` (auto via SessionStart hook)
+2. **Read active plans:** session-context-brief.sh hook surfaces them
+3. **Pick item from current week's slice:** see schedule above
+4. **Spawn 3 review agents** for any item touching > 3 crates (B3)
+5. **Implement + commit + push** to wave branch
+6. **End of day:** verify wave branch CI green; if red, fix before stopping
+
+### What will be measured each week
+
+| Week | Metric | Target | Source |
+|---|---|---|---|
+| W1 end | Items merged | 6 (Sub-PR A) | git log on wave branch |
+| W2 end | Items merged | 4 more (Items 2, 3, 4, 5 = 10 total) | git log |
+| W3 end | Items merged | 6 more (Items 12, 13, 14, 16, 19, 11 = 16 total) | git log |
+| W4 end | Items merged | All 19; CI all-green; PR #410 ready to squash | gh pr view |
+| W5 end | AWS deployed | tickvault running on c7i.xlarge in dry-run; first live tick observed | `make doctor` on prod |
+
+### Honest non-promises (per Wave-4-Preamble §8)
+
+- **Cannot guarantee:** "no Dhan API change between now and May 31" (Dhan can ship breaking change anytime)
+- **Cannot guarantee:** "live tick rate stays within tested envelope" (NSE volatility days produce 200K+ tps that no chaos test fully replicates)
+- **Cannot guarantee:** "AWS region ap-south-1 has zero outages in the 30-day window" (AWS regional failures happen)
+- **Cannot guarantee:** "operator has no scheduling conflicts during W5 AWS provisioning" (operator-only task)
+- **Cannot guarantee:** "every implementation item ships in its allotted week" (review findings can extend timelines)
+
+### Probabilistic assessment
+
+Given:
+- Foundation already merged (~50% of Wave 5 = verify/harden, not greenfield)
+- 7,250 tests + 18 hooks + chaos test infrastructure already in place
+- Plan dependency-mapped per Item 17
+- Operator decisions all locked
+
+**Honest probability of "Wave 5 + AWS dry-run live by 2026-05-31": ~70-80%** assuming:
+- No Dhan API surprises
+- No AWS provisioning delays beyond 2 days
+- Operator available for AWS step in W5
+- Static IP set correctly on first try
+
+**If May 31 slips:** worst-case delay is ~1 week (June 7) due to Dhan IP cooldown. Plan stays valid; just retargets.
+
+This is the honest envelope. Anything tighter ("guaranteed by May 31") would be hallucination per Wave-4-Preamble §8.
+
+## Plan Items (now 20, was 10)
 
 Each item carries the 9-box checklist per `stream-resilience.md` B8: ① typed event, ② ErrorCode, ③ tracing+code field, ④ Prometheus counter, ⑤ Grafana panel, ⑥ alert rule, ⑦ call site, ⑧ triage YAML rule, ⑨ ratchet test.
 
