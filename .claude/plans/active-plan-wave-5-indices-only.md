@@ -2076,7 +2076,7 @@ Read-time category mappings (carry from Item 25 + verified-correct columns):
 
 ### Plan integration
 
-- [ ] **Item 27. CORRECT mat view schema with explicit bucket-vs-snapshot columns**
+- [x] **Item 27. CORRECT mat view schema with explicit bucket-vs-snapshot columns** — SHIPPED 2026-05-01 in `crates/storage/src/movers_unified_persistence.rs::movers_unified_view_ddl`. 25 ratchets pass, including `test_movers_unified_ddl_no_sum_volume_anywhere` + source-scan ratchet. Schema includes 4 snapshot columns (`last_price`, `open_interest`, `volume_cumulative`, `prev_close`), 2 bucket-incremental columns (`volume_bucket`, `oi_delta_bucket`), 3 bucket OHLC columns, and 2 change_pct flavours (`change_pct_session`, `change_pct_bucket`) with CASE WHEN guards. ALIGN TO CALENDAR WITH OFFSET '00:00' on every view. Track 2 confirmation runs Mon May 4 09:45 IST per `docs/operator/track-2-monotonicity-select.md`; if Track 2 invalidates cumulative semantic, the schema reverts (operator action).
 - Supersedes Item 25's schema (Item 25 design intent stays, columns verified-corrected)
 - Files: `crates/storage/src/movers_unified_persistence.rs` (DDL templates for 24 mat views)
 - Tests:
