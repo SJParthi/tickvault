@@ -113,19 +113,260 @@ The operator's literal demands (zero ticks lost, never disconnect, never slow/lo
 | Uniqueness + dedup | Composite `(security_id, exchange_segment)` per I-P1-11 enforced everywhere. DEDUP UPSERT KEYS on every storage table; meta-guard scans every constant. | `dedup_segment_meta_guard.rs`, `subscription_planner regression tests`, `instrument_registry by_composite`, banned-pattern category 5 | `tv_instrument_registry_cross_segment_collisions` gauge |
 | Real-time proof | 7-layer telemetry per new code path: typed event + ErrorCode + tracing+code + Prom counter + Grafana panel + alert rule + audit table. SLO-01/SLO-02 composite score @ 10s cadence. Market-open self-test @ 09:16:30 IST (SELFTEST-01/02). | `error_code_tag_guard.rs`, `error_code_rule_file_crossref.rs`, `operator_health_dashboard_guard.rs`, `resilience_sla_alert_guard.rs`, `slo_score.rs` | `mcp__tickvault-logs__run_doctor`, SLO-01/02 Telegram, MarketOpenStreamingConfirmation @ 09:15:30 |
 
-## Dhan Ping/Pong + O(1) Inside Each WS Read Loop
+## Common Runtime / Dynamic / Scalable Design (operator demand: "always make it common runtime dynamic scalable approach especially to add the stocks and its instruments later")
 
-Operator's emphasis: "respect dhan server ping pong" + "achieve O(1) latency inside every connection of its websockets."
+Goal: adding stocks (or any new underlying / segment) post-merge MUST be a config flip + universe rebuild + reconnect — **NEVER a code change**. The architecture below makes the universe data-driven from boot to runtime.
+
+| Concern | How it stays common/runtime/dynamic | What an operator does to add stocks later |
+|---|---|---|
+| Subscription scope | `subscription.scope` enum in `config/base.toml` (Item 1). Today: `IndicesOnlyAllExpiries`. Tomorrow: `IndicesPlusStocks` / `FullUniverse` / future variants. | Edit `config/base.toml` → restart. No code change. |
+| Universe filter | `subscription_planner::build_subscription_plan` reads scope enum + filters CSV by predicate. Predicate is a closure parameterised by scope — adding a scope = 1 new closure. | Implementer adds a `match` arm + filter closure for the new scope. |
+| Underlying list | NIFTY/BANKNIFTY/SENSEX hardcoded today as `FULL_CHAIN_INDEX_SYMBOLS`. Wave 5 keeps it static for these 3, but the planner reads it at runtime. | When adding stocks F&O back, edit constant + flip scope enum. |
+| Connection capacity | 5 conns × 5K cap = 25,000 max. Today 11,018 (44%). Adding 13,000 stock instruments → ~24,000 total → 48% per conn (still within 5K cap). | Capacity check in subscription_planner asserts `total ≤ MAX_TOTAL_SUBSCRIPTIONS = 25_000` at boot — fails fast if exceeded, no runtime surprise. |
+| Distribution algorithm | Category-balanced round-robin keyed on `security_id`. Adding new instruments → they slot in via `i % 5` deterministically. | Zero operator action. Algorithm is data-driven. |
+| Top-volume selector | SQL queries `option_movers` at runtime; new contracts auto-appear once the movers writer logs them. | Zero operator action. New contracts auto-rank. |
+| Depth-20 conn 5 capacity | LIMIT 50 today. If we add stocks, the same selector still produces top-50 from the (now-bigger) bucket. | Zero change — selector handles N in, 50 out. |
+| Depth-200 conn capacity | LIMIT 5 today. Fixed at 5 because Dhan caps depth-200 at 5 conns × 1 instr. | Hard ceiling — not configurable. |
+| Core affinity | Reads `vcpu_count` at boot; pins to `min(vcpu_count, 4)` workers. Adding stocks doesn't change CPU pinning topology. | Zero operator action. |
+| ErrorCode + Telegram | New events get a typed `NotificationEvent` variant + `ErrorCode` + runbook entry. Adding a new feature follows the 9-box checklist. | Standard 9-box per item, no architecture rework. |
+| Audit tables | DEDUP UPSERT KEYS already pinned per table. Adding new tables = boot-time `CREATE TABLE IF NOT EXISTS` + `ALTER TABLE ADD COLUMN IF NOT EXISTS`. | Zero operator action — schema self-heal. |
+
+**What is NOT scalable today (deferred for honesty):**
+- 5 main-feed connections is a Dhan account limit. Cannot scale up without a new Dhan account or Dhan raising the cap.
+- 5 depth-20 connections + 5 depth-200 connections — same Dhan limits.
+- AWS c7i.xlarge fixed at 4 vCPUs by `aws-budget.md`. Scaling to c7i.2xlarge (8 vCPUs) is an operator decision + budget review.
+
+## Ping/Pong Mechanism — Verified Mechanical Handling (operator demand: "respect dhan server ping pong precisely")
+
+Source-verified against `crates/core/src/websocket/connection.rs` 2026-05-01:
+
+| Step | Code line | Mechanical guarantee |
+|---|---|---|
+| Dhan server pings every 10s | per `live-market-feed.md` rule 16, `dhan-ref/03-live-market-feed-websocket.md` | External — verified by Dhan docs |
+| `WebSocketStream::next()` delivers `Message::Ping(payload)` | connection.rs:1238 | tokio-tungstenite 0.29.0 surfaces the Ping to the application layer (does NOT auto-pong on its own) |
+| App sends `Message::Pong(payload)` echoing the ping payload | connection.rs:1245 | Explicit `sink.send(Message::Pong(data))` — RFC 6455 compliant |
+| Pong send bounded by `pong_timeout_secs` | connection.rs:1243 (default 5s, config-tunable) | If TCP buffer is stuck >5s the socket is treated as dead and we trigger reconnect — no silent hang |
+| Last-message timestamp bumped on EVERY inbound frame | connection.rs:1052-1054 | Watchdog cannot false-positive during data-quiet periods because Pings keep the timer alive |
+| Server disconnects after 40s with no pong (Dhan code 806) | per `dhan-ref/03` + `connection.rs:221` | We re-detect ≤5s via watchdog, reconnect with `SubscribeRxGuard`, replay subs |
+| Server pong (when WE send a ping — we don't, but if we ever did) | connection.rs:1260 | `Message::Pong(_)` is logged + last-message bumped; no further action |
+| Manual Ping frames | BANNED per `live-market-feed.md` rule 16. We rely on server-initiated pings. | Banned-pattern scanner blocks any `Message::Ping(...)` send |
+
+**Why this is O(1) per ping:**
+- 1 frame read (kernel-driven, epoll)
+- 1 pattern match on `Message::Ping(_)`
+- 1 atomic `AtomicU64::store` for last-message timestamp
+- 1 `sink.send(Message::Pong(payload))` (bounded by `tokio::time::timeout`)
+- No allocation, no clone (the payload is moved, not copied)
+- Total: <10 µs typical, 5s hard ceiling on the timeout path
+
+**What we never do for ping/pong:**
+- No manual Ping frames (banned)
+- No payload modification (echo verbatim per RFC 6455)
+- No allocation in the Ping handler path
+- No DB lookup or registry access
+
+**Ratchet (existing, will be extended in Item 4/5):**
+- `test_pong_send_bounded_by_pong_timeout`
+- `test_last_message_timestamp_bumped_on_ping`
+- Banned-pattern scanner category 7 blocks `Message::Ping(`
+
+## Memory Management + Ring Buffer + WAL — 3-Tier Resilience Chain (operator demand: "manage memory and ring buffer wal")
+
+Verified against `crates/storage/src/tick_persistence.rs` + `crates/common/src/constants.rs:1425`:
+
+### Tier 1: Bounded ring buffer (in-memory, RAM-only)
+
+| Property | Value | Source |
+|---|---|---|
+| Capacity | 600,000 ticks | `TICK_BUFFER_CAPACITY` (constants.rs:1425) |
+| High watermark | 480,000 ticks (80%) | `TICK_BUFFER_HIGH_WATERMARK` (constants.rs:1431) |
+| Backing structure | `VecDeque<Tick>` with pre-allocated capacity | tick_persistence.rs:265 |
+| Push cost | O(1) amortised — pushes to back | VecDeque doc |
+| Drain cost | O(N) on QuestDB recovery, but N is bounded | drain runs in background |
+| Memory footprint | ~600K × ~80 bytes/tick = ~48 MB max | Bounded by capacity × Tick size |
+| Time-to-fill @ 100K tps | 6 seconds | Fill rate / capacity |
+| Time-to-fill @ 10K tps | 60 seconds | Matches QuestDB outage absorption envelope |
+| Overflow behaviour | Spill to disk file (Tier 2) | tick_persistence.rs:561 |
+| Drop behaviour | Drop happens ONLY when both ring + spill + DLQ fail simultaneously (extreme) | tick_persistence.rs:228 (DLQ counter) |
+
+### Tier 2: Disk spill file (NDJSON, persistent across restarts)
+
+| Property | Value |
+|---|---|
+| Format | NDJSON line per overflow tick (one row = one tick, every field) |
+| Path | `data/spill/ticks-YYYYMMDD.bin` (tick_persistence.rs:7680 test ref) |
+| Append cost | O(1) per tick (sequential file append, OS-buffered) |
+| Pre-flight check | `Item 9 disk-full pre-flight`: if free bytes < threshold, abort before append (no half-written rows) |
+| Recovery on restart | `recover_stale_spill_files()` reads + replays into ILP, deletes file (tick_persistence.rs:873) |
+| WAL semantics | Yes — durable, append-only, replay-safe (DEDUP UPSERT KEYS handle duplicate replay) |
+| Idempotency | DEDUP `(security_id, exchange_segment, ts, sequence_number)` makes re-replay safe |
+
+### Tier 3: DLQ (Dead Letter Queue, last-resort recoverable text)
+
+| Property | Value |
+|---|---|
+| Trigger | Both ring full AND spill write failed (e.g., disk full) |
+| Format | NDJSON with full Tick payload + error context (tick_persistence.rs:222) |
+| Path | `data/dlq/ticks-YYYYMMDD.ndjson` |
+| Counter | `tv_dlq_ticks_total` (Prom) |
+| Alert | DLQ count > 0 fires CRITICAL Telegram |
+| Recovery | Manual operator intervention (parse + re-replay) |
+
+### Memory governance (workspace-wide)
+
+| Pattern | Where | Why |
+|---|---|---|
+| All channels are bounded | `tokio::sync::mpsc::channel(N)` everywhere | No unbounded growth |
+| `VecDeque::with_capacity()` not `Vec::new()` | rescue ring + indicator snapshots | Pre-allocated, no realloc on hot path |
+| `Arc<HashMap>` for read-mostly state | InstrumentRegistry, FnoUniverse | Shared, immutable, no lock contention |
+| `papaya` concurrent map | SharedSpotPrices | Lock-free reads on hot path |
+| `Bytes` for zero-copy network buffers | tokio-tungstenite frames | Reference-counted, no clone on broadcast |
+| Stack-allocated structs | ParsedTick, OhlcvState | Zero heap, zero-alloc DHAT-pinned |
+| `secrecy::Secret<String>` | Tokens, secrets | Auto-zeroize on drop |
+| BANNED on hot path | `clone()`, `format!()`, `Vec::new()`, `Box`, `dyn` | Banned-pattern scanner blocks at commit |
+
+### What "manage memory" means in production
+
+- **Steady state:** rescue ring stays empty (drain matches inflow). Spill file does not exist.
+- **Stress:** rescue ring fills to 480K (high watermark) → emit `tv_rescue_ring_high_watermark` Prom alert. Drain accelerates.
+- **QuestDB outage ≤60s @ 10K tps:** ring absorbs entirely. Zero spill. Zero loss.
+- **QuestDB outage 60s–10min:** ring fills, spill takes over. Disk-full pre-flight gates. Recovery replays.
+- **Beyond envelope (disk full + QuestDB down):** DLQ catches as text. Operator sees CRITICAL Telegram. Recovery manual.
+
+## Extreme Burst + Memory Pressure Defence — Stock-Cascade Lesson Learned
+
+Operator's verbatim: "previously with stocks and its instruments we majorly faced the high memory issues and reconnection and disconnection many times — this affects our websockets live ticks majorly, biggest impact, shouldn't happen again."
+
+**Root cause analysis (why Wave 4 with stocks blew up):**
+
+| Failure mode | Mechanism | Wave 5 mitigation |
+|---|---|---|
+| Cardinality explosion | 24,324 instruments × 10 packets/sec/instr peak = 243K tps theoretical burst | Indices-only cuts to 11,018 — 55% reduction. Peak burst budget: ~110K tps. Ring (600K) still absorbs 5+ seconds. |
+| Per-instrument memory | Each instrument has registry entries + spot-price slot + OHLCV state across 21 timeframes | 55% fewer instruments → 55% lower steady-state memory |
+| OHLCV state map growth | `HashMap<u32, OhlcvState>` grew unbounded as stock options accumulated across expiries | Item 7: composite-key `HashMap<(u32, ExchangeSegment), OhlcvState>` + bounded by registry size |
+| Channel saturation | Single mpsc(65,536) for ALL ticks; stocks at peak filled it faster than pipeline drained | Channel capacity unchanged but inflow halved → drain catches up reliably |
+| QuestDB write amplification | Stock F&O wrote to `ticks` + every materialized view (21 timeframes × 22 movers categories × greeks) | Same per-tick cost, but 55% fewer ticks → ILP load halved |
+| Reconnect storm cascade | Ring fills → backpressure on parser → parser falls behind → activity watchdog trips → reconnect → new subs → ring still full → loop | Item 6 core_affinity isolates parser CPU. Ring drains independent of WS read loop. |
+| TCP RST from Dhan side | Stock F&O subscriptions hit Dhan's per-conn rate-limit on quote-mode aggregate updates → server forced disconnect | Indices-only stays well under per-conn 5K cap (44%); per-instrument update rate is lower for indices than stocks |
+| Watchdog false positives | 1800s order-update watchdog tripped on idle accounts | Wave 2 fix: bumped to 14400s (4h) — already shipped, persists in Wave 5 |
+
+**Wave 5 burst defence layers (cumulative):**
+
+| Layer | What it does | Hard limit | Action on breach |
+|---|---|---|---|
+| 1. Subscription scope cap | Compile-time + boot-time assertion `total ≤ MAX_TOTAL_SUBSCRIPTIONS = 25_000` | 25K | Boot fails fast before subscribing |
+| 2. Bounded SPSC channels | Every `mpsc::channel(N)` is bounded; `try_send` returns `Full` on overflow | 65,536 (parser→pipeline) | Increment `tv_tick_dropped_total`, drop the tick (last-resort) |
+| 3. Rescue ring (Tier 1) | 600,000 ticks held in RAM if QuestDB writes block | 600K = ~48 MB | Spill to disk (Tier 2) |
+| 4. Disk spill (Tier 2) | NDJSON append-only file | Disk-full pre-flight gate (Item 9 from prior wave, already shipped) | DLQ (Tier 3) |
+| 5. DLQ (Tier 3) | Last-resort recoverable text | Disk capacity | CRITICAL Telegram + manual recovery |
+| 6. High-watermark alert | Ring at 80% (480K) fires Prom alert | n/a | Operator paged before catastrophic fill |
+| 7. Container memory limit | Docker `mem_limit` per `aws-budget.md` per-service budget | 7.4 GB total (4 GB QuestDB, 1 GB Valkey, etc.; tickvault binary ~1 GB) | Linux OOM-killer; PROC-01 ErrorCode reserved (`wave-4-error-codes.md`) |
+| 8. cgroup OOM monitor | Phase 4-E1 (reserved): scrape `/sys/fs/cgroup/.../memory.events` | n/a | PROC-01 CRITICAL Telegram |
+| 9. Backpressure on parser | Parser uses `try_send` not `send().await` — never blocks WS read loop | n/a | Drop + count, never stall |
+| 10. Core affinity (Item 6) | WS read loop pinned to Core 0; ILP writer pinned to Core 2 — they cannot starve each other | n/a | If pinning fails: CORE-PIN-01 CRITICAL alert, app continues without pinning |
+
+**Why this prevents the stock-cascade pattern:**
+
+| Past failure step | Wave 5 break point |
+|---|---|
+| Step 1: Stocks F&O subscribed (24K instruments) | NOT REACHED — indices-only scope filters stock F&O out |
+| Step 2: Peak burst @ 200K+ tps overwhelms parser | Inflow halved; parser stays current |
+| Step 3: Ring fills past high-watermark | Earlier alert + `core_affinity` ensures drain task gets CPU |
+| Step 4: Activity watchdog trips on parser stall | Parser doesn't stall (Core 0 dedicated); watchdog only trips on real disconnects |
+| Step 5: Reconnect cascade across 5 conns | Even if 1 conn drops, surviving 4 absorb at 55%/conn (still under cap) |
+| Step 6: OOM kill / Docker restart | PROC-01 monitor fires CRITICAL before kill; container `mem_limit` enforces |
+| Step 7: Token expiry mid-cascade | AUTH-GAP-03 force-renewal-if-stale (Wave 2, shipped) |
+
+**Real-time burst observability (during the next live test):**
+
+| Prom counter / gauge | What it tells the operator |
+|---|---|
+| `tv_websocket_inbound_messages_per_sec{conn}` | Per-conn message rate; alerts on >2× steady-state |
+| `tv_rescue_ring_used_capacity` | Ring fill level; alert at 80% (480K) |
+| `tv_rescue_ring_high_watermark_breaches_total` | Counter — non-zero = burst pressure observed |
+| `tv_tick_dropped_total{reason}` | reasons: `channel_full`, `dlq_persisted`, `dlq_failed` |
+| `tv_spill_file_size_bytes` | Disk spill size in bytes |
+| `tv_dlq_ticks_total` | DLQ count — non-zero = catastrophic fail, page operator |
+| `tv_ws_pool_respawn_total` | Pool supervisor activity; non-zero rate = task panicking |
+| `tv_questdb_disconnected_seconds` | QuestDB write latency; alert at >30s |
+| `tv_resident_memory_bytes` (Phase 4-E3 reserved) | Process RSS; alert at 80% of cgroup limit |
+
+**Burst chaos test (Item 11 — adding now):**
+
+- [ ] **11. Stress test the burst defence chain**
+- File: `crates/storage/tests/chaos_burst_indices_only.rs` (new)
+- Synthetic: feed 200K tick/sec sustained for 10s into the parser channel; assert ring stays bounded, no DLQ writes, no parser stall
+- Verifies: bounded channels, ring high-watermark alert, drain catches up post-burst
+- Adds to existing chaos test suite alongside `chaos_questdb_docker_pause.rs`, `chaos_rescue_ring_overflow.rs`, `chaos_zero_tick_loss.rs`
+
+**Honest non-claim:**
+
+- We CANNOT promise "no OOM ever." The cgroup limit is set by Docker; if the operator deploys a wrong `mem_limit`, OOM-kill happens. PROC-01 detects + alerts, doesn't prevent.
+- We CANNOT promise "no reconnect ever." Dhan can RST. We promise: detect ≤5s, reconnect with subs preserved, audit, sleep dormant post-close.
+- We CAN promise: under the verified 11,018-instrument indices-only scope at observed peak rates (≤110K tps theoretical, typically ~30K tps), the chain absorbs without drop. Item 11 chaos test pins this envelope.
+
+## Per-Packet O(1) Timing Budget Inside Every WS Read Loop
+
+Operator demand: "achieve O(1) latency inside all the websockets and its connections."
+
+What happens for ONE binary tick frame, from kernel readv() to QuestDB ILP append:
+
+| Step | Operation | Cost | Hot-path-safe? |
+|---|---|---|---|
+| 1 | Kernel epoll wakes tokio runtime; `tokio-tungstenite` reads frame | ~1 µs (kernel + WS framing) | ✅ tokio internal |
+| 2 | `Message::Binary(bytes)` delivered via `sink.next().await` | ~50 ns | ✅ no allocation, `Bytes` is ref-counted |
+| 3 | Atomic `last_message_at.store(now_ns)` | ~5 ns (single atomic store) | ✅ |
+| 4 | Header parse: 8 fixed `from_le_bytes` reads (response code, length, segment, security_id) | ~10 ns | ✅ DHAT-pinned |
+| 5 | `match response_code { 1 => parse_index, 2 => parse_ticker, ... }` (jump table) | ~5 ns | ✅ |
+| 6 | Fixed-offset payload parse (16 / 50 / 162 bytes via `from_le_bytes`) | ~10–30 ns | ✅ DHAT-pinned, no loops |
+| 7 | Build stack-allocated `ParsedTick` struct | 0 (stack) | ✅ |
+| 8 | `papaya::HashMap::get(&(security_id, segment))` for instrument metadata | ~50 ns avg, O(1) | ✅ Item 7 fix makes this composite-key |
+| 9 | `tokio::sync::mpsc::Sender::try_send(parsed_tick)` to pipeline | ~100 ns | ✅ bounded SPSC, lock-free |
+| 10 | If channel full: increment `tv_tick_dropped_total`, return | ~10 ns | ✅ counter only |
+| 11 | If channel ok: pipeline drains in separate task (Core 1 if pinned) | (concurrent) | ✅ |
+| **Total per tick on hot path** | | **~200–250 ns** | ✅ |
+
+Then the pipeline task (Core 1) does:
+
+| Step | Operation | Cost |
+|---|---|---|
+| 12 | Receive from SPSC channel | ~50 ns |
+| 13 | Update OHLCV state in `HashMap<(u32, ExchangeSegment), OhlcvState>` (Item 7 fix) | ~80 ns avg, O(1) |
+| 14 | Emit candle if minute boundary crossed | ~200 ns (rare path) |
+| 15 | Push to ILP writer SPSC channel (Core 2 if pinned) | ~100 ns |
+
+ILP writer task (Core 2):
+
+| Step | Operation | Cost |
+|---|---|---|
+| 16 | Receive from ILP channel; build ILP line via `questdb-rs::Sender::row` | ~500 ns (sprintf-like, but bounded) |
+| 17 | TCP send (kernel-buffered) | ~5 µs avg (network-bound, not blocking parser) |
+
+**Bench-gated budgets (`quality/benchmark-budgets.toml`):**
+- `tick_binary_parse` ≤10 ns (steps 4-7)
+- `papaya_lookup` ≤50 ns (step 8)
+- `tick_pipeline_routing` ≤100 ns (steps 9-12)
+- `full_tick_processing` ≤10 µs (steps 1-17 end-to-end)
+
+**Bench-gate** in `scripts/bench-gate.sh` fails the build if any benchmark regresses by >5%. Item 6 (`core_affinity`) closes the kernel-preemption variance source.
+
+**What this is NOT:**
+- NOT a literal "every tick guaranteed <250 ns end-to-end forever." OS scheduler can preempt. Core_affinity reduces variance; doesn't eliminate it.
+- NOT zero-copy from kernel to ILP — there are 2 channel hops (parser→pipeline→ILP). The hops are ALL O(1) on a bounded channel.
+
+## Dhan Ping/Pong + O(1) Inside Each WS Read Loop (Summary Quick-Ref)
+
+Quick-reference table — see "Ping/Pong Mechanism" + "Per-Packet O(1) Timing Budget" above for full detail:
 
 | Concern | Mechanical handling | Why it stays O(1) per packet |
 |---|---|---|
-| Server ping every 10s, timeout 40s | Library-handled by `tokio-tungstenite` 0.29.0 — the `Ping` frame is auto-replied with `Pong` by the underlying `WebSocketStream`. We never write manual ping frames (banned pattern in `live-market-feed.md` rule 16). | Ping/pong is on the I/O thread, no allocation, no parsing |
-| Frame parsing | 8-byte header + fixed-offset `from_le_bytes` per packet type (16 / 50 / 162 bytes). No loops, no allocation. Parsed into `ParsedTick` stack struct. | Constant-time per packet regardless of subscription count |
-| Tick fan-out | SPSC 65,536-buffer `tokio::sync::mpsc` — `try_send` returns `Full` instead of awaiting. Hot path emits `tv_tick_dropped_total` and the rescue ring drains. | `try_send` is O(1); the channel is bounded so it never grows |
-| Subscribe/unsubscribe commands | `SubscribeRxGuard` reinstalls receiver on every read-loop exit; resubscribe replays the static plan from the in-memory `Arc<Vec<SubscriptionMessage>>`. | No DB lookup, no recompute — pre-computed at boot |
-| Activity watchdog | 5s pool watchdog tick; per-conn last-message timestamp updated atomically (`AtomicU64`). | Single atomic load per conn per 5s — O(1) per check |
-| Audit row write | `WsReconnectAuditWriter` ILP append on every reconnect; failure routes to STORAGE-GAP-03/AUDIT-03. | ILP append is non-blocking; rescue ring absorbs flushes |
-| Order-update activity | 14400s (4h) watchdog (NOT 1800s — Dhan order-update goes silent on idle accounts; 1800 caused false reconnects). | Same pool watchdog tick |
+| Server ping every 10s, timeout 40s | App-side explicit Pong reply with `pong_timeout_secs` ceiling (5s default). Bumps last-message atomic. | Pattern match + atomic store + bounded send |
+| Frame parsing | 8-byte header + fixed-offset `from_le_bytes` per packet type | Constant-time per packet regardless of subscription count |
+| Tick fan-out | SPSC 65,536-buffer `tokio::sync::mpsc` — `try_send` returns `Full` instead of awaiting | `try_send` is O(1); the channel is bounded |
+| Subscribe/unsubscribe commands | `SubscribeRxGuard` reinstalls receiver on every read-loop exit | No DB lookup, no recompute — pre-computed at boot |
+| Activity watchdog | 5s pool watchdog tick; per-conn last-message timestamp updated atomically (`AtomicU64`) | Single atomic load per conn per 5s |
+| Audit row write | `WsReconnectAuditWriter` ILP append on every reconnect; failure routes to STORAGE-GAP-03/AUDIT-03 | ILP append is non-blocking |
+| Order-update activity | 14400s (4h) watchdog (NOT 1800s) | Same pool watchdog tick |
 
 **What we never do on the read loop:**
 - No `clone()` (banned by hot-path scanner)
@@ -134,7 +375,7 @@ Operator's emphasis: "respect dhan server ping pong" + "achieve O(1) latency ins
 - No mutex acquisition (`papaya` for shared state)
 - No `dyn` dispatch (banned on hot path)
 
-**Honest non-claim:** TCP RST storms, kernel scheduler preemption, and remote-process failures CAN happen. Our envelope is: detect ≤5s, reconnect with subs preserved, audit every event, sleep dormantly post-close. Items 6 (core_affinity) closes the last preemption gap.
+**Honest non-claim:** TCP RST storms, kernel scheduler preemption, and remote-process failures CAN happen. Our envelope is: detect ≤5s, reconnect with subs preserved, audit every event, sleep dormantly post-close. Item 6 (core_affinity) closes the last preemption gap.
 
 ## Plan Items (10)
 
