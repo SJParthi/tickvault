@@ -508,7 +508,69 @@ vs c7i.xlarge 8 GB RAM (with QuestDB at 4 GB, Valkey 1 GB, others ~2 GB → tick
 - Tests: `test_nse_eq_uses_quote_mode_under_indices_only`, `test_quote_packet_close_field_matches_prev_close_lookup`
 - 9-box: Prom gauge `tv_subscription_bytes_per_sec_per_conn{conn}` — alert if any conn exceeds 5 MB/sec sustained (means we accidentally subscribed Full to cash); `FeedModeRoutingAudit` typed event at boot listing per-slot mode counts; ratchet test
 
-## Plan Items (now 14, was 10)
+## Previous Close Storage Optimization — Drop Redundant Table Writes for Quote/Full
+
+Operator question: "for full we don't need to store the day close or prev close into a separate table right dude?"
+
+**Answer: correct, with a per-segment carve-out.**
+
+### Current redundancy
+
+| Segment | Feed mode | Close field location | Currently writes to `previous_close` table? | Redundant? |
+|---|---|---|---|---|
+| IDX_I | Ticker | NOT in tick — only code-6 packet | YES (`PrevCloseSource::Code6`) | NO — only source |
+| NSE_EQ | Quote | Quote packet bytes 38-41 (rides every tick into `ticks.day_close`) | YES (`PrevCloseSource::QuoteClose`) | YES — `day_close` column in `ticks` already has it |
+| NSE_FNO + BSE_FNO | Full | Full packet bytes 50-53 (rides every tick into `ticks.day_close`) | YES (`PrevCloseSource::FullClose`) | YES — `day_close` column in `ticks` already has it |
+
+### Architecture history
+
+- Originally: `previous_close` table populated by all 3 routes
+- Then: deprecated under "day_close from Full ticks suffices" (`tick_persistence.rs:432`)
+- Then: un-deprecated under "movers writers need fast lookup on day-boundary restart" (`previous_close_persistence.rs:14-22`)
+- Wave 5: **drop Quote/Full routes; keep only IDX_I (Code6) + small in-memory cache**
+
+### Why dropping Quote + Full is safe
+
+1. The `close` value (bytes 38-41 / 50-53) is **identical for every tick within a trading day** — it's a static "previous day's close" baked into the packet. So writing it on every tick is wasteful (DEDUP UPSERT dedupes to 1 row per day, but ILP append cost is N writes).
+2. The `ticks.day_close` column already preserves this value indexed by `(security_id, exchange_segment, ts)`. A movers writer can read the LATEST tick's `day_close` field to get the previous-day close for that instrument — O(1) via the existing `Arc<HashMap>` `prev_close` in-memory cache (`prev_close_writer.rs`).
+3. The `first_seen_set` already prevents writing more than once per `(trading_date, security_id, segment)` — but the architecture still does N appends before the dedup gate. Dropping the call site removes the cost entirely.
+
+### Why IDX_I must keep the table (or its in-memory equivalent)
+
+- Ticker mode (16 bytes) has NO close field. There is no `day_close` column populated for IDX_I ticks.
+- The standalone code-6 packet arrives intermittently (often only once per day at market-open). If the app boots after that one packet has fired, there's no way to recover the value from incoming ticks.
+- Either: keep the `previous_close` table populated only for IDX_I rows (29 rows/day max), OR keep the in-memory cache via `prev_close_writer.rs` and persist to QuestDB only for restart recovery.
+- Wave 5 picks: **keep in-memory cache for IDX_I; reduce table to IDX_I-only rows for restart-recovery**.
+
+### What we add to the plan
+
+- [ ] **Item 15. Drop `previous_close` table writes for NSE_EQ + NSE_FNO + BSE_FNO**
+- Files: `crates/core/src/pipeline/prev_close_persist.rs`, `crates/storage/src/previous_close_persistence.rs`, `crates/core/src/parser/dispatcher.rs`
+- Tests: `test_prev_close_persist_skips_quote_and_full_sources`, `test_prev_close_table_only_contains_idx_i_rows`, `test_movers_writer_reads_day_close_from_ticks_via_in_memory_cache`
+- Behaviour change:
+  - Parser dispatcher: Quote (code 4) + Full (code 8) ticks STILL emit `prev_close` to the in-memory `Arc<HashMap>` cache (used by movers writers for change_pct computation in O(1))
+  - Parser dispatcher: STOP routing Quote + Full close values to `previous_close_persist::send`
+  - PrevClose (code 6) for IDX_I: continues to route to both in-memory cache AND `previous_close` table (the table is the restart-recovery source; cache is the runtime source)
+- Storage:
+  - `previous_close` table size shrinks from ~11K rows/day to ~29 rows/day (IDX_I only)
+  - ILP append rate drops by ~99.7% on the prev_close path
+  - Movers writers unchanged — they read from the in-memory cache, which still gets all 3 segments
+- Boot recovery:
+  - On startup, in-memory cache is rehydrated from `previous_close` table for IDX_I + from the latest tick per instrument for NSE_EQ + NSE_FNO + BSE_FNO (single QuestDB query: `SELECT security_id, exchange_segment, day_close FROM ticks WHERE ts >= $today_ist_midnight AND ts < $tomorrow_ist_midnight ORDER BY ts DESC LIMIT 1 PER instrument`)
+- 9-box: ErrorCode N/A (cleanup, not new failure path); Prom counter `tv_prev_close_persist_writes_total{source}` — expect `code6` only after migration; alert if any `quote_close` / `full_close` increments post-Wave-5; ratchet test at module level.
+
+### Why not delete `previous_close` table entirely?
+
+| Consideration | If we delete | If we keep IDX_I-only |
+|---|---|---|
+| IDX_I restart recovery | Need a different durable source (e.g., dedicated cache file) | Already works |
+| Movers writers | Already read in-memory cache (no table dependency) | Same |
+| Schema simplicity | -1 table | +29 rows/day, simpler change |
+| Operator audit query "what was yesterday's NIFTY close?" | Query `ticks` table for last tick of yesterday IDX_I — slower | Direct lookup, fast |
+
+**Decision: keep IDX_I-only.** Smaller change, preserves audit queries.
+
+## Plan Items (now 15, was 10)
 
 Each item carries the 9-box checklist per `stream-resilience.md` B8: ① typed event, ② ErrorCode, ③ tracing+code field, ④ Prometheus counter, ⑤ Grafana panel, ⑥ alert rule, ⑦ call site, ⑧ triage YAML rule, ⑨ ratchet test.
 
