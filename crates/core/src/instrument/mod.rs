@@ -16,6 +16,7 @@ pub mod delta_detector;
 pub mod depth_20_dynamic_subscriber;
 pub mod depth_rebalancer;
 pub mod depth_strike_selector;
+pub mod depth_top_volume_selector;
 pub mod diagnostic;
 pub mod instrument_loader;
 pub mod live_tick_atm_resolver;

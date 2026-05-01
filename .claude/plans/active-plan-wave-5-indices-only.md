@@ -1160,7 +1160,7 @@ Each item carries the 9-box checklist per `stream-resilience.md` B8: ① typed e
 - Algorithm: group by [IDX_I, NSE_EQ, NSE_FNO+BSE_FNO]; sort each group by security_id ASC; `conn_index = i % 5`. Stable across boots.
 - 9-box: ① N/A ② N/A ③ tracing `info!(conn = i, count = n)` per conn at boot ④ `tv_main_feed_per_conn_instrument_count` gauge with `{conn}` label ⑤ Operator Health "Main feed distribution" stacked-bar panel ⑥ `tv-main-feed-conn-overload` (any conn > 4,500) ⑦ `connection_pool::distribute` ⑧ N/A ⑨ deterministic-replay test + spread test
 
-### - [ ] 4. Depth-20 — REVERTED TO OPERATOR ORIGINAL DESIGN 2026-05-01 (BLOCKER C1 → Option B)
+### - [x] 4. Depth-20 — REVERTED TO OPERATOR ORIGINAL DESIGN 2026-05-01 (BLOCKER C1 → Option B) — pure-logic primitive (selector SQL + sanitisation + anti-thrash + static layout) SHIPPED 2026-05-01 in `depth_top_volume_selector.rs` with 25 ratchet tests. RIP+REWRITE of merged `depth_20_dynamic_subscriber.rs` + main.rs wiring DEFERRED to follow-up sub-PR (touches live trading boot path; needs operator review).
 
 **Decision (operator override 2026-05-01):** Operator reaffirmed original single-side design. Earlier "Option A adopt merged" decision is REVERSED. Wave 5 RIPS the merged `depth_20_dynamic_subscriber.rs` (commits `f3b7baa`, `29b1407`, `72028c5`, `c9f53a4`) and replaces with single-side 4-conn + 1 dynamic-50.
 
@@ -1222,7 +1222,7 @@ LIMIT 50;                             -- depth-200 takes first 5 of these (share
 
 **Blast radius note:** rip + replace is bigger than Option A. Mitigation: Item 4 sub-PR includes deletion of `DEPTH_20_DYNAMIC_SLOT_COUNT = 3` + `LIMIT 150` constants in same commit so the build stays green.
 
-### - [ ] 5. Depth-200 — Top-5 dynamic (operator original design)
+### - [x] 5. Depth-200 — Top-5 dynamic (operator original design) — pure-logic primitive (`fan_out_to_depth_200` + `selector_sql(5)`) SHIPPED 2026-05-01 alongside Item 4 in `depth_top_volume_selector.rs`. New `depth_200_subscriber.rs` connection wiring DEFERRED to follow-up sub-PR (touches live trading boot path).
 
 - Files: `crates/core/src/websocket/depth_connection.rs`, `crates/core/src/instrument/depth_200_subscriber.rs` (new — replaces merged static logic), `crates/app/src/main.rs`
 - Tests:
