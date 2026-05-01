@@ -32,7 +32,7 @@ use tickvault_app::boot_helpers::{
     format_cross_match_details_grouped, format_timeframe_details, format_violation_details,
     spawn_heartbeat_watchdog,
 };
-use tickvault_app::{infra, observability, trading_pipeline};
+use tickvault_app::{core_pinning, infra, observability, trading_pipeline};
 
 use std::net::SocketAddr;
 
@@ -157,6 +157,12 @@ async fn main() -> Result<()> {
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .expect("failed to install rustls CryptoProvider — cannot proceed without TLS"); // APPROVED: bootstrap — TLS mandatory, failure is fatal
+
+    // Wave 5 Item 6: pin the main thread to Core 3 ("other") so it does not
+    // share Core 0 with the WebSocket read loop (pinned later when its
+    // dedicated worker task spawns). Best-effort — failures emit
+    // CORE-PIN-01 + Telegram and the app continues without pinning.
+    core_pinning::pin_main_thread();
 
     // -----------------------------------------------------------------------
     // Step 1: Load and validate configuration
