@@ -8,6 +8,7 @@
 //! Config -> **Instrument Download -> Universe Build** -> Auth -> WebSocket
 
 pub mod bhavcopy_cross_check;
+pub mod bhavcopy_fetcher;
 pub mod binary_cache;
 pub mod boot_mode;
 pub mod csv_downloader;
