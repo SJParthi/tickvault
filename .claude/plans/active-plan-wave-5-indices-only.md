@@ -1476,7 +1476,7 @@ Operator demand 2026-05-01: "for every waves and for every blocks or for every i
 | Uniqueness + dedup | Composite `(security_id, exchange_segment)` per I-P1-11 + DEDUP UPSERT KEYS + meta-guard | item DEDUP key includes segment |
 | Real-time proof | 7-layer telemetry + SLO-01/SLO-02 @ 10s + market-open self-test @ 09:16:30 IST | item ratchet pins all 7 layers |
 
-- [ ] **Item 22. Per-item guarantee matrix template enforcement**
+- [x] **Item 22. Per-item guarantee matrix template enforcement**
 - Files: this plan file (template above); `.claude/hooks/per-item-guarantee-check.sh` (new — scans new items for matrix presence); `CLAUDE.md` (cross-reference)
 - Tests: `test_every_wave_5_item_carries_guarantee_matrix` (source-scan ratchet); `test_per_item_guarantee_check_hook_runs_on_pre_pr`
 - 9-box: N/A (process meta-item)
