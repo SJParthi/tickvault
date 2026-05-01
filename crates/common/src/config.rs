@@ -116,6 +116,13 @@ pub struct FeaturesConfig {
     pub market_open_self_test: bool,
     /// Wave 3 Item 13 — composite real-time guarantee score gauge.
     pub realtime_guarantee_score: bool,
+    /// Wave 5 Items 4+5 LIVE — depth-20 + depth-200 dynamic top-volume
+    /// subscribers. Off by default to keep the existing depth pool
+    /// behaviour unchanged until operator validates on a non-trading
+    /// day. When `true`, the orchestrator in
+    /// `crates/app/src/depth_dynamic_pipeline.rs` is spawned alongside
+    /// the existing static depth pool.
+    pub depth_dynamic_top_volume: bool,
 }
 
 impl Default for FeaturesConfig {
@@ -135,6 +142,10 @@ impl Default for FeaturesConfig {
             telegram_bucket_coalescer: true,
             market_open_self_test: true,
             realtime_guarantee_score: true,
+            // Wave 5 Items 4+5: OFF by default. Operator flips to true after
+            // validating depth-20 dynamic top-50 + depth-200 dynamic top-5
+            // wiring on a non-trading day.
+            depth_dynamic_top_volume: false,
         }
     }
 }
