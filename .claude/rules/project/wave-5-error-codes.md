@@ -114,6 +114,46 @@ same selector, smaller K).
 
 **Source (planned):** Wave 5 Item 5 — `crates/core/src/instrument/depth_200_top_gainers_selector.rs`.
 
+## PREVCLOSE-03 — boot-time prev-close routing assertion failed (Item 13)
+
+**Trigger:** at boot, the subscription plan is scanned against the per-segment
+prev-close routing matrix from `live-market-feed.md`:
+
+| Segment | Required feed mode | Where prev_close lives |
+|---|---|---|
+| IDX_I | Ticker | standalone code 6 packet |
+| NSE_EQ | Quote OR Full | bytes 38-41 (Quote) / 50-53 (Full) of the packet |
+| NSE_FNO | Full | bytes 50-53 of the Full packet |
+| BSE_FNO | Full | bytes 50-53 of the Full packet |
+
+If any subscribed instrument has a `(segment, feed_mode)` pair outside the
+allowed cell of this matrix, PREVCLOSE-03 fires Severity::Critical and the
+boot HALTS — refusing to start a pipeline that loses prev_close for half
+the universe is cheaper than recovering from a corrupted day's snapshot.
+
+**Triage:**
+
+1. The Telegram event names the offending instrument (`security_id`,
+   `display_label`) + actual feed_mode + expected feed_mode for its segment.
+2. Most common cause: operator set `[subscription] feed_mode = "Quote"` in
+   `config/base.toml`, which silently downgrades NSE_FNO + BSE_FNO from
+   Full and loses the bytes-50-53 prev_close. Set back to `"Full"`.
+3. Less common: a code-side regression where `make_derivative_instrument`
+   stamps the wrong mode. The 3 ratchet tests in
+   `subscription_planner::tests::test_idx_i_subscriptions_use_ticker_mode`,
+   `test_nse_eq_subscriptions_use_quote_or_full`, and
+   `test_nse_fno_bse_fno_subscriptions_use_full_mode` fail the build first
+   in this case.
+
+**Auto-triage safe:** NO (Severity::Critical halts boot — operator action
+required).
+
+**Source (Item 13):** the 3 unit-level ratchet tests in
+`crates/core/src/instrument/subscription_planner.rs::tests`. The runtime
+boot emission in `crates/app/src/main.rs` is a follow-up (the tests pin
+the contract today; runtime emission is purely defence-in-depth for the
+case where someone bypasses the unit tests).
+
 ## Cross-references
 
 - `.claude/plans/active-plan-wave-5-indices-only.md` Items 4, 5, 6, 9
@@ -121,4 +161,4 @@ same selector, smaller K).
 - `.claude/rules/project/per-wave-guarantee-matrix.md` (mandatory matrix)
 - `crates/common/src/error_code.rs::ErrorCode` (`CorePin01PinningFailedAtBoot`,
   `CorePin02WorkerDrifted`, `Depth20Dyn03TopGainersEmpty`,
-  `Depth200Dyn01TopGainersEmpty` variants)
+  `Depth200Dyn01TopGainersEmpty`, `PrevClose03BootRoutingAssertion` variants)

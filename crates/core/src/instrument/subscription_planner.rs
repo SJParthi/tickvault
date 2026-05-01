@@ -4091,4 +4091,162 @@ mod tests {
             "Stock OPTSTK at NEXT expiry must be subscribed after rollover"
         );
     }
+
+    // ----------------------------------------------------------------------
+    // Wave 5 Item 13 — boot-time prev-close routing assertion ratchets.
+    //
+    // Per `.claude/rules/dhan/live-market-feed.md` rule 7+8 + the
+    // `Previous-Day Close Routing` block: prev_close arrives via different
+    // packet types depending on segment. The subscription plan MUST stamp
+    // each instrument with a feed_mode that delivers prev_close for its
+    // segment, otherwise PREVCLOSE-03 fires Severity::Critical at boot:
+    //
+    //   IDX_I    → Ticker         (prev_close delivered by standalone code 6)
+    //   NSE_EQ   → Quote OR Full  (bytes 38-41 / 50-53 of Quote/Full packet)
+    //   NSE_FNO  → Full           (bytes 50-53 of Full packet)
+    //   BSE_FNO  → Full           (bytes 50-53 of Full packet)
+    //
+    // These tests verify the planner output today (default config = Full)
+    // and ratchet against future regression where someone downgrades F&O
+    // to Quote/Ticker and silently loses prev_close for half the universe.
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn test_idx_i_subscriptions_use_ticker_mode() {
+        // With Ticker config the planner's per-instrument feed_mode is
+        // Ticker — the explicit mode that carries IDX_I prev_close (via
+        // separate code 6 packet). At any other config mode, Dhan's
+        // server-side rule still returns IDX_I as code 2 (Ticker) but
+        // the client must subscribe explicitly with the Ticker request
+        // code on the IDX_I segment for code-6 prev_close to arrive.
+        let universe = make_test_universe();
+        let config = SubscriptionConfig {
+            feed_mode: "Ticker".to_string(),
+            ..SubscriptionConfig::default()
+        };
+        let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
+        let plan = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
+
+        let idx_i_count = plan
+            .registry
+            .iter()
+            .filter(|i| i.exchange_segment == ExchangeSegment::IdxI)
+            .count();
+        assert!(
+            idx_i_count > 0,
+            "test universe must produce at least one IDX_I instrument"
+        );
+
+        for inst in plan
+            .registry
+            .iter()
+            .filter(|i| i.exchange_segment == ExchangeSegment::IdxI)
+        {
+            assert_eq!(
+                inst.feed_mode,
+                FeedMode::Ticker,
+                "IDX_I instrument {} ({}) must be Ticker for prev_close routing \
+                 (code 6 packet); got {:?}. PREVCLOSE-03.",
+                inst.security_id,
+                inst.display_label,
+                inst.feed_mode
+            );
+        }
+    }
+
+    #[test]
+    fn test_nse_eq_subscriptions_use_quote_or_full() {
+        // Default config = Full. NSE_EQ MUST be Quote or Full to carry
+        // prev_close (bytes 38-41 of Quote / bytes 50-53 of Full).
+        let universe = make_test_universe();
+        let config = SubscriptionConfig::default();
+        let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
+        let plan = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
+
+        let nse_eq_count = plan
+            .registry
+            .iter()
+            .filter(|i| i.exchange_segment == ExchangeSegment::NseEquity)
+            .count();
+        assert!(
+            nse_eq_count > 0,
+            "test universe must produce at least one NSE_EQ instrument"
+        );
+
+        for inst in plan
+            .registry
+            .iter()
+            .filter(|i| i.exchange_segment == ExchangeSegment::NseEquity)
+        {
+            assert!(
+                matches!(inst.feed_mode, FeedMode::Quote | FeedMode::Full),
+                "NSE_EQ instrument {} ({}) must be Quote or Full for prev_close \
+                 (bytes 38-41 / 50-53); Ticker would lose it. Got {:?}. PREVCLOSE-03.",
+                inst.security_id,
+                inst.display_label,
+                inst.feed_mode
+            );
+        }
+    }
+
+    #[test]
+    fn test_nse_fno_bse_fno_subscriptions_use_full_mode() {
+        // Default config = Full. NSE_FNO + BSE_FNO MUST be Full to carry
+        // prev_close (bytes 50-53) AND OI (bytes 34-37) AND 5-level depth
+        // (bytes 62-161) needed by Greeks pipeline + option chain UI.
+        let universe = make_test_universe();
+        let config = SubscriptionConfig::default();
+        let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
+        let plan = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
+
+        let derivative_count = plan
+            .registry
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i.exchange_segment,
+                    ExchangeSegment::NseFno | ExchangeSegment::BseFno
+                )
+            })
+            .count();
+        assert!(
+            derivative_count > 0,
+            "test universe must produce at least one NSE_FNO / BSE_FNO instrument"
+        );
+
+        for inst in plan.registry.iter().filter(|i| {
+            matches!(
+                i.exchange_segment,
+                ExchangeSegment::NseFno | ExchangeSegment::BseFno
+            )
+        }) {
+            assert_eq!(
+                inst.feed_mode,
+                FeedMode::Full,
+                "{:?} instrument {} ({}) must be Full mode for prev_close + OI + \
+                 5-level depth; Quote/Ticker would lose them. PREVCLOSE-03.",
+                inst.exchange_segment,
+                inst.security_id,
+                inst.display_label
+            );
+        }
+    }
 }

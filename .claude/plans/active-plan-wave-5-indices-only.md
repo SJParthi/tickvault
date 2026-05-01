@@ -497,7 +497,7 @@ Operator question: "how about prev close?" Per `dhan/live-market-feed.md` rule +
 
 ### What we add to the plan
 
-- [ ] **Item 13. Boot-time prev-close routing assertion**
+- [x] **Item 13. Boot-time prev-close routing assertion**
 - File: `crates/app/src/main.rs` (boot sequence) + `crates/core/src/instrument/subscription_planner.rs`
 - Tests: `test_idx_i_subscriptions_use_ticker_mode`, `test_nse_eq_subscriptions_use_quote_or_full`, `test_nse_fno_bse_fno_subscriptions_use_full_mode`
 - ErrorCode: `PREVCLOSE-03` (new — boot-time invariant violation, Severity::Critical, halts boot)
