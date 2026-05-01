@@ -4131,6 +4131,11 @@ async fn main() -> Result<()> {
             // independent universe handle (cloned BEFORE the rebalancer
             // takes ownership at the bottom of this block).
             let preopen_movers_universe = std::sync::Arc::clone(&universe_arc);
+            // Wave 5 commit 5: rebalance consumer needs universe to
+            // compute single-side ATM ± 24 windows for Swap20 fan-out
+            // to NIFTY-CE / NIFTY-PE / BANKNIFTY-CE / BANKNIFTY-PE
+            // depth-20 conns (operator spec 2026-05-01 Option B).
+            let rebal_consumer_universe = std::sync::Arc::clone(&universe_arc);
 
             // Rebalance event channel (watch — latest-value semantics)
             let (rebalance_tx, mut rebalance_rx) = tokio::sync::watch::channel::<
@@ -5723,6 +5728,8 @@ async fn main() -> Result<()> {
                 // were spawned earlier in boot.
                 let anchor_cmd_senders = std::sync::Arc::clone(&depth_cmd_senders);
                 let anchor_twenty_max = config.subscription.twenty_depth_max_instruments;
+                // Wave 5 commit 5: feature flag for single-side fan-out at 09:13.
+                let anchor_single_side_enabled = config.features.depth_dynamic_top_volume;
                 // Live LTPs for FINNIFTY + MIDCPNIFTY (the preopen buffer
                 // only captures NIFTY + BANKNIFTY IDX_I). At 09:13 the main
                 // feed has been streaming for ~13 min so these are present.
@@ -5867,42 +5874,101 @@ async fn main() -> Result<()> {
                     let senders = anchor_cmd_senders.lock().await;
                     for sel in &selections {
                         // 20-level InitialSubscribe.
-                        let instruments: Vec<
-                            tickvault_core::websocket::types::InstrumentSubscription,
-                        > = sel
-                            .all_security_ids
-                            .iter()
-                            .take(anchor_twenty_max)
-                            .map(|&sid| {
-                                tickvault_core::websocket::types::InstrumentSubscription::new(
-                                    tickvault_common::types::ExchangeSegment::NseFno,
-                                    sid,
-                                )
-                            })
-                            .collect::<Vec<_>>(); // O(1) EXEMPT: 4 underlyings × ~49 contracts, once per day
-                        let subscribe_messages = tickvault_core::websocket::subscription_builder::build_twenty_depth_subscription_messages(
-                            &instruments,
-                            50, // Dhan max batch size for 20-level subscribe
-                        );
-
-                        if let Some(sender) = senders.get(&sel.underlying_symbol) {
-                            let cmd = tickvault_core::websocket::DepthCommand::InitialSubscribe20 {
-                                subscribe_messages: subscribe_messages.clone(), // O(1) EXEMPT: once-per-day
-                            };
-                            if sender.send(cmd).await.is_err() {
-                                error!(
-                                    underlying = %sel.underlying_symbol,
-                                    "09:13 dispatch: InitialSubscribe20 send failed — depth receiver dropped"
+                        // Wave 5 commit 5: when single-side layout is ON
+                        // (`[features] depth_dynamic_top_volume = true`),
+                        // fan out to 4 single-side keys per pair of CE+PE
+                        // depth-20 conns. Otherwise dispatch the legacy
+                        // mixed-CE+PE single InitialSubscribe20 to a
+                        // bundled `"NIFTY"` / `"BANKNIFTY"` sender.
+                        if anchor_single_side_enabled {
+                            for (side_char, opt_label) in [('C', "CE"), ('P', "PE")] {
+                                let key = format!("{}-{}", sel.underlying_symbol, opt_label);
+                                let single_side_ids: &Vec<u32> = if side_char == 'C' {
+                                    &sel.call_security_ids
+                                } else {
+                                    &sel.put_security_ids
+                                };
+                                let instruments: Vec<
+                                    tickvault_core::websocket::types::InstrumentSubscription,
+                                > = single_side_ids
+                                    .iter()
+                                    .take(anchor_twenty_max)
+                                    .map(|&sid| {
+                                        tickvault_core::websocket::types::InstrumentSubscription::new(
+                                            tickvault_common::types::ExchangeSegment::NseFno,
+                                            sid,
+                                        )
+                                    })
+                                    .collect::<Vec<_>>(); // O(1) EXEMPT: 4 keys × ~49 contracts, once per day
+                                let subscribe_messages = tickvault_core::websocket::subscription_builder::build_twenty_depth_subscription_messages(
+                                    &instruments,
+                                    50,
                                 );
-                                m_dispatch_failed.increment(1);
-                            } else {
-                                m_dispatch_total.increment(1);
+                                if let Some(sender) = senders.get(&key) {
+                                    let cmd = tickvault_core::websocket::DepthCommand::InitialSubscribe20 {
+                                        subscribe_messages,
+                                    };
+                                    if sender.send(cmd).await.is_err() {
+                                        error!(
+                                            key = %key,
+                                            "09:13 dispatch (Wave 5): InitialSubscribe20 send failed — depth receiver dropped"
+                                        );
+                                        m_dispatch_failed.increment(1);
+                                    } else {
+                                        info!(
+                                            key = %key,
+                                            instruments = instruments.len(),
+                                            "PROOF: 09:13 dispatch InitialSubscribe20 sent to single-side key {} ({} SIDs)",
+                                            key,
+                                            instruments.len()
+                                        );
+                                        m_dispatch_total.increment(1);
+                                    }
+                                } else {
+                                    warn!(
+                                        key = %key,
+                                        "09:13 dispatch (Wave 5): no depth_cmd_sender for {key}"
+                                    );
+                                }
                             }
                         } else {
-                            warn!(
-                                underlying = %sel.underlying_symbol,
-                                "09:13 dispatch: no depth_cmd_sender registered for 20-level underlying"
+                            let instruments: Vec<
+                                tickvault_core::websocket::types::InstrumentSubscription,
+                            > = sel
+                                .all_security_ids
+                                .iter()
+                                .take(anchor_twenty_max)
+                                .map(|&sid| {
+                                    tickvault_core::websocket::types::InstrumentSubscription::new(
+                                        tickvault_common::types::ExchangeSegment::NseFno,
+                                        sid,
+                                    )
+                                })
+                                .collect::<Vec<_>>(); // O(1) EXEMPT: legacy mixed dispatch
+                            let subscribe_messages = tickvault_core::websocket::subscription_builder::build_twenty_depth_subscription_messages(
+                                &instruments,
+                                50,
                             );
+                            if let Some(sender) = senders.get(&sel.underlying_symbol) {
+                                let cmd =
+                                    tickvault_core::websocket::DepthCommand::InitialSubscribe20 {
+                                        subscribe_messages,
+                                    };
+                                if sender.send(cmd).await.is_err() {
+                                    error!(
+                                        underlying = %sel.underlying_symbol,
+                                        "09:13 dispatch (legacy): InitialSubscribe20 send failed — depth receiver dropped"
+                                    );
+                                    m_dispatch_failed.increment(1);
+                                } else {
+                                    m_dispatch_total.increment(1);
+                                }
+                            } else {
+                                warn!(
+                                    underlying = %sel.underlying_symbol,
+                                    "09:13 dispatch (legacy): no depth_cmd_sender registered for 20-level underlying"
+                                );
+                            }
                         }
 
                         // 200-level: only NIFTY + BANKNIFTY (Dhan 5-conn cap).
@@ -5974,6 +6040,11 @@ async fn main() -> Result<()> {
                 // Wave 2 Item 9 (AUDIT-02) — clone QuestDB config into the
                 // rebalancer task scope so audit rows can be persisted.
                 let qcfg_for_rebalance = config.questdb.clone();
+                // Wave 5 commit 5: capture universe + feature flag for
+                // single-side Swap20 fan-out.
+                let rebal_universe = std::sync::Arc::clone(&rebal_consumer_universe);
+                let rebal_single_side_enabled = config.features.depth_dynamic_top_volume;
+                let rebal_twenty_max = config.subscription.twenty_depth_max_instruments;
                 tokio::spawn(async move {
                     while rebalance_rx.changed().await.is_ok() {
                         let event = match rebalance_rx.borrow().clone() {
@@ -6120,6 +6191,17 @@ async fn main() -> Result<()> {
                             })
                             .to_string();
 
+                            // Wave 5: when the dynamic top-volume layout is
+                            // ON, depth-200 conns are top-volume (not ATM)
+                            // — there's no `NIFTY-CE` depth-200 sender to
+                            // target. Skip Swap200 send to avoid noisy
+                            // "no cmd sender" warns. The dynamic depth-200
+                            // orchestrator handles its own swaps via
+                            // `option_movers` query every 60s.
+                            if rebal_single_side_enabled {
+                                continue;
+                            }
+
                             let senders = rebal_cmd_senders.lock().await;
                             if let Some(tx) = senders.get(&swap_key) {
                                 let cmd = tickvault_core::websocket::DepthCommand::Swap200 {
@@ -6146,6 +6228,101 @@ async fn main() -> Result<()> {
                                     key = %swap_key,
                                     "rebalance: no cmd sender for {swap_key} — 200-level not spawned?"
                                 );
+                            }
+                        }
+
+                        // --- 20-level single-side rebalance via command channel (Wave 5 commit 5) ---
+                        // Only fires when `[features] depth_dynamic_top_volume = true`
+                        // because the legacy mixed-CE+PE depth-20 spawn doesn't
+                        // register single-side keys. When flag ON, send Swap20
+                        // to each of NIFTY-CE / NIFTY-PE / BANKNIFTY-CE /
+                        // BANKNIFTY-PE depth-20 conns with the new ATM ± 24
+                        // single-side window.
+                        if rebal_single_side_enabled {
+                            let today_ist = chrono::Utc::now()
+                                .with_timezone(
+                                    &chrono::FixedOffset::east_opt(19_800).expect("IST offset"), // APPROVED: compile-time literal
+                                )
+                                .date_naive();
+                            for (side_char, opt_label) in [('C', "CE"), ('P', "PE")] {
+                                let key = format!("{ul}-{opt_label}");
+                                let sel = tickvault_core::instrument::depth_strike_selector::select_single_side_contracts(
+                                    &rebal_universe,
+                                    &ul,
+                                    side_char,
+                                    event.current_spot,
+                                    today_ist,
+                                    tickvault_core::instrument::depth_strike_selector::DEPTH_ATM_STRIKES_EACH_SIDE,
+                                );
+                                let Some(selection) = sel else {
+                                    warn!(
+                                        underlying = %ul,
+                                        side = %side_char,
+                                        spot = event.current_spot,
+                                        "rebalance: select_single_side_contracts returned None — skipping Swap20"
+                                    );
+                                    continue;
+                                };
+                                let single_side_ids: Vec<u32> = if side_char == 'C' {
+                                    selection.call_security_ids.clone()
+                                } else {
+                                    selection.put_security_ids.clone()
+                                };
+                                let instruments: Vec<
+                                    tickvault_core::websocket::types::InstrumentSubscription,
+                                > = single_side_ids
+                                    .iter()
+                                    .take(rebal_twenty_max)
+                                    .map(|&sid| {
+                                        tickvault_core::websocket::types::InstrumentSubscription::new(
+                                            tickvault_common::types::ExchangeSegment::NseFno,
+                                            sid,
+                                        )
+                                    })
+                                    .collect();
+                                let subscribe_messages = tickvault_core::websocket::subscription_builder::build_twenty_depth_subscription_messages(
+                                    &instruments,
+                                    50, // Dhan max batch size for 20-level
+                                );
+                                let unsubscribe_messages = vec![
+                                    serde_json::json!({
+                                        "RequestCode": 25,
+                                        "InstrumentCount": 0,
+                                        "InstrumentList": [],
+                                    })
+                                    .to_string(),
+                                ];
+
+                                let senders = rebal_cmd_senders.lock().await;
+                                if let Some(tx) = senders.get(&key) {
+                                    let cmd = tickvault_core::websocket::DepthCommand::Swap20 {
+                                        unsubscribe_messages,
+                                        subscribe_messages,
+                                    };
+                                    if let Err(err) = tx.send(cmd).await {
+                                        warn!(
+                                            ?err,
+                                            key = %key,
+                                            "rebalance: Swap20 command send failed"
+                                        );
+                                    } else {
+                                        info!(
+                                            underlying = %ul,
+                                            side = %side_char,
+                                            instruments = instruments.len(),
+                                            atm_strike = selection.atm_strike,
+                                            spot = event.current_spot,
+                                            "PROOF: rebalance Swap20 sent — {key} → {} SIDs (ATM={:.2}, zero disconnect)",
+                                            instruments.len(),
+                                            selection.atm_strike,
+                                        );
+                                    }
+                                } else {
+                                    warn!(
+                                        key = %key,
+                                        "rebalance: no cmd sender for {key} — single-side depth-20 not spawned?"
+                                    );
+                                }
                             }
                         }
                     }
