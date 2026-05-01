@@ -69,8 +69,12 @@ impl MoversCategory {
 
     /// Parses the wire-format string back to enum. Returns `None` on
     /// unknown input — caller HTTP-handles as 400.
+    ///
+    /// Named `parse_wire_str` (NOT `from_str`) to avoid clashing with
+    /// `std::str::FromStr::from_str` which has different semantics
+    /// (Result instead of Option).
     #[must_use]
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse_wire_str(s: &str) -> Option<Self> {
         match s {
             "highest_oi" => Some(Self::HighestOi),
             "oi_gainer" => Some(Self::OiGainer),
@@ -162,15 +166,19 @@ mod tests {
             MoversCategory::PriceLoserBucket,
         ] {
             let s = cat.as_str();
-            assert_eq!(MoversCategory::from_str(s), Some(cat), "roundtrip {s}");
+            assert_eq!(
+                MoversCategory::parse_wire_str(s),
+                Some(cat),
+                "roundtrip {s}"
+            );
         }
     }
 
     #[test]
-    fn test_category_from_str_rejects_unknown() {
-        assert_eq!(MoversCategory::from_str(""), None);
-        assert_eq!(MoversCategory::from_str("bogus"), None);
-        assert_eq!(MoversCategory::from_str("HIGHEST_OI"), None); // case-sensitive
+    fn test_parse_wire_str_rejects_unknown() {
+        assert_eq!(MoversCategory::parse_wire_str(""), None);
+        assert_eq!(MoversCategory::parse_wire_str("bogus"), None);
+        assert_eq!(MoversCategory::parse_wire_str("HIGHEST_OI"), None); // case-sensitive
     }
 
     #[test]

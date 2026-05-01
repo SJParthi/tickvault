@@ -149,14 +149,14 @@ pub fn spawn_consumer_task<W: ConsumerWriter + Send + 'static>(
                     total_dropped = total_dropped.saturating_add(1);
                 }
             }
-            if writer.pending_count() >= flush_threshold {
-                if let Err(err) = writer.flush() {
-                    warn!(
-                        timeframe = label,
-                        ?err,
-                        "movers_22tf consumer flush failed — writer will reconnect"
-                    );
-                }
+            if writer.pending_count() >= flush_threshold
+                && let Err(err) = writer.flush()
+            {
+                warn!(
+                    timeframe = label,
+                    ?err,
+                    "movers_22tf consumer flush failed — writer will reconnect"
+                );
             }
         }
 
@@ -225,6 +225,7 @@ impl ConsumerWriter for Movers22TfWriter {
 /// (production passes `|| std::time::SystemTime::now()...`).
 ///
 /// The task exits when `shutdown.load(Relaxed)` is true.
+#[allow(clippy::too_many_arguments)] // APPROVED: 9 generic + state args; refactoring to a builder adds boilerplate without clarifying the per-tf snapshot task's role.
 pub fn spawn_snapshot_task<F, I, M, N>(
     slot_idx: usize,
     cadence_secs: u64,

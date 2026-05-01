@@ -200,11 +200,10 @@ pub fn pin_current_thread_for(role: WorkerRole) -> Result<()> {
 /// `Result` without obscuring it.
 // TEST-EXEMPT: thin wrapper around pin_current_thread_for; same rationale.
 pub fn pin_main_thread() {
-    match pin_current_thread_for(WorkerRole::Other) {
-        Ok(()) => {}
-        // Inner emission is the authoritative diagnostic — see docstring.
-        Err(_) => {}
-    }
+    // Discard the Result — `pin_current_thread_for` already emits ERROR
+    // + CORE-PIN-01 + counter on failure (Loki → Telegram). Re-handling
+    // here would double-log without adding signal.
+    drop(pin_current_thread_for(WorkerRole::Other));
 }
 
 // ---------------------------------------------------------------------------

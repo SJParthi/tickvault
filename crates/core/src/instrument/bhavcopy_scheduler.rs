@@ -74,10 +74,13 @@ pub const BHAVCOPY_TRIGGER_TIME_IST: NaiveTime = match NaiveTime::from_hms_opt(1
 /// cross-check + audit insert is ~30s. 5 minutes is a generous safety net.
 pub const BHAVCOPY_PIPELINE_TIMEOUT_SECS: u64 = 300;
 
-/// IST UTC offset constructor — `+05:30` per the trading-calendar
-/// canonical helper. `unwrap` is safe at compile time.
+/// IST UTC offset constructor — `+05:30`. The argument `19_800` is well
+/// below `chrono`'s 86_400-second cap, so `east_opt` always returns
+/// `Some`. `expect` documents this static invariant.
+#[allow(clippy::expect_used)] // APPROVED: pure constant; chrono `east_opt` never returns None for `< 86_400`.
 #[must_use]
 fn ist_offset() -> FixedOffset {
+    // APPROVED: pure constant 19_800 < 86_400; `east_opt` never None.
     FixedOffset::east_opt(5 * 3600 + 30 * 60).expect("IST offset is valid")
 }
 
@@ -229,6 +232,7 @@ pub async fn unzip_csv_from_zip_body(zip_body: &[u8]) -> Result<Vec<u8>> {
 // TEST-EXEMPT: end-to-end orchestrator (HTTP fetch + unzip + parse + cross-check); each step is unit-tested in its own module; integration covered by post-market live cycle.
 pub async fn run_bhavcopy_cycle_once(
     instruments: &[DerivativeContract],
+    // APPROVED: I-P1-11 — single-segment HashMap is correct here; bhavcopy is NSE_FNO-only by URL definition + caller queries QuestDB pre-filtered.
     dhan_eod_volumes: &HashMap<u32, u64>,
     trading_date_yyyymmdd: &str,
     trading_date_iso: &str,

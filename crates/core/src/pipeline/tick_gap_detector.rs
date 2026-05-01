@@ -118,7 +118,7 @@ impl TickGapDetector {
             .collect();
         // O(n log n) where n = gap count (NOT total universe). Always
         // small in practice (< 100). Sort largest-gap-first.
-        out.sort_by(|a, b| b.2.cmp(&a.2));
+        out.sort_by_key(|t| std::cmp::Reverse(t.2));
         out
     }
 
@@ -172,11 +172,11 @@ impl TickGapDetector {
             let seg_code = key.1.binary_code();
             if heap.len() < cap {
                 heap.push(Reverse((gap, key.0, seg_code)));
-            } else if let Some(Reverse((min_gap, _, _))) = heap.peek() {
-                if gap > *min_gap {
-                    heap.pop();
-                    heap.push(Reverse((gap, key.0, seg_code)));
-                }
+            } else if let Some(Reverse((min_gap, _, _))) = heap.peek()
+                && gap > *min_gap
+            {
+                heap.pop();
+                heap.push(Reverse((gap, key.0, seg_code)));
             }
         }
         // Drain into a sorted (largest-first) Vec. `into_sorted_vec` on

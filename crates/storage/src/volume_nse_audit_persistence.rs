@@ -98,6 +98,7 @@ pub async fn ensure_volume_nse_audit_table(questdb_config: &QuestDbConfig) {
 /// wall-clock nanos; this function divides by 1_000 before embedding
 /// to stay in QuestDB's TIMESTAMP microsecond range (per the
 /// 2026-04-28 Phase 2 audit regression fix in `phase2_audit_persistence.rs`).
+#[allow(clippy::too_many_arguments)] // APPROVED: 9 audit columns + cfg per `volume_nse_audit` table DDL; refactoring into a struct adds boilerplate without clarity for a low-cardinality post-market batch writer.
 pub async fn append_volume_nse_audit_row(
     questdb_config: &QuestDbConfig,
     ts_nanos_ist: i64,
