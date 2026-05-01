@@ -301,6 +301,7 @@ pub fn classify_bhavcopy_failure(err: &anyhow::Error) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::NaiveDate;
 
     fn ist(h: u32, m: u32, s: u32) -> DateTime<FixedOffset> {
         let date = NaiveDate::from_ymd_opt(2026, 5, 4).unwrap();
