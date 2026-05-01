@@ -345,7 +345,7 @@ Operator's verbatim: "previously with stocks and its instruments we majorly face
 
 **Burst chaos test (Item 11 — adding now):**
 
-- [ ] **11. Stress test the burst defence chain**
+- [x] **11. Stress test the burst defence chain**
 - File: `crates/storage/tests/chaos_burst_indices_only.rs` (new)
 - Synthetic: feed 200K tick/sec sustained for 10s into the parser channel; assert ring stays bounded, no DLQ writes, no parser stall
 - Verifies: bounded channels, ring high-watermark alert, drain catches up post-burst
