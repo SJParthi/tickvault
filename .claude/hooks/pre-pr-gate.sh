@@ -230,6 +230,21 @@ else
 fi
 
 # ─────────────────────────────────────────────
+# Gate: per-wave guarantee matrix (every active plan must carry the
+# 15-row + 7-row matrices per .claude/rules/project/per-wave-guarantee-matrix.md)
+# ─────────────────────────────────────────────
+if [ -x "$HOOKS_DIR/per-item-guarantee-check.sh" ]; then
+  echo "  [6/6] Per-wave guarantee matrix..." >&2
+  if ! bash "$HOOKS_DIR/per-item-guarantee-check.sh" >/dev/null 2>&1; then
+    echo "  FAIL: One or more active plans missing the 15+7 row matrix." >&2
+    echo "        Run 'make wave-guarantee-check' to see which plans + how to fix." >&2
+    FAILED=1
+  else
+    echo "  PASS: Per-wave guarantee matrix" >&2
+  fi
+fi
+
+# ─────────────────────────────────────────────
 # FINAL VERDICT
 # ─────────────────────────────────────────────
 echo "" >&2

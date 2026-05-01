@@ -161,3 +161,10 @@ Each module emits idempotent `CREATE TABLE IF NOT EXISTS` + `ALTER TABLE ADD COL
 | Prom | `tv_audit_persisted_total{table}`, `tv_audit_write_failures_total{table}` |
 | Grafana | New `audit-trails.json` dashboard with 6 panels |
 | Alert | any audit write failure rate > 0.1/sec for 30s → HIGH |
+
+## Per-Wave Guarantee Matrix (cross-reference)
+
+See `.claude/rules/project/per-wave-guarantee-matrix.md` — all 15 rows of the
+100% Guarantee Matrix and all 7 rows of the Resilience Demand Matrix apply to
+every item in this plan. Mechanical enforcement via
+`.claude/hooks/per-item-guarantee-check.sh` (CI gate).

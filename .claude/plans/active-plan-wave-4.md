@@ -277,3 +277,10 @@ bash .claude/hooks/plan-verify.sh        # this plan is reference-only; verify i
 ls .claude/rules/project/wave-4-shared-preamble.md   # must exist
 ls .claude/plans/active-plan-wave-4.md               # must exist
 ```
+
+## Per-Wave Guarantee Matrix (cross-reference)
+
+See `.claude/rules/project/per-wave-guarantee-matrix.md` — all 15 rows of the
+100% Guarantee Matrix and all 7 rows of the Resilience Demand Matrix apply to
+every item in this plan. Mechanical enforcement via
+`.claude/hooks/per-item-guarantee-check.sh` (CI gate).
