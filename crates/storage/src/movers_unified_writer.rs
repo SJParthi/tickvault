@@ -1,4 +1,4 @@
-//! Wave 5 Item 25/27 Phase B — single-stream ILP writer for `movers_unified_1s`.
+//! Wave 5 Item 25/27 Phase B — single-stream ILP writer for `movers_1s`.
 //!
 //! ONE writer, ONE table. The 24 mat views auto-aggregate server-side.
 //!
@@ -25,17 +25,17 @@ use questdb::ingress::{Buffer, Sender, TimestampNanos};
 use tracing::{error, info, warn};
 
 use crate::movers_persistence::sanitize_ilp_symbol;
-use crate::movers_unified_persistence::QUESTDB_TABLE_MOVERS_UNIFIED_1S;
+use crate::movers_unified_persistence::QUESTDB_TABLE_MOVERS_1S;
 use tickvault_common::config::QuestDbConfig;
 
-/// One row in the `movers_unified_1s` base table. Mirrors the 10-column
+/// One row in the `movers_1s` base table. Mirrors the 10-column
 /// schema in `movers_unified_persistence.rs`.
 ///
 /// Built once per second per (security_id, segment) by
 /// `movers_unified_pipeline`. Copy + Send so the drain task can pass
 /// rows to the writer without heap allocation per row.
 #[derive(Debug, Clone, Copy)]
-pub struct MoversUnifiedRow {
+pub struct MoversRow {
     /// Designated timestamp — IST epoch nanoseconds. Caller passes the
     /// 1s-aligned bucket boundary.
     pub ts_nanos: i64,
@@ -87,14 +87,14 @@ pub fn segment_code_to_char(code: u8) -> char {
 /// ILP writer wrapping a `questdb::ingress::Sender` + `Buffer`.
 /// Designed to be owned by a single tokio task (the pipeline drain).
 /// NOT `Sync` — buffer mutation is not thread-safe.
-pub struct MoversUnifiedWriter {
+pub struct MoversWriter {
     sender: Option<Sender>,
     buffer: Buffer,
     pending_count: u64,
     ilp_conf_string: String,
 }
 
-impl MoversUnifiedWriter {
+impl MoversWriter {
     /// Builds an ILP `tcp::` config string + opens the connection.
     /// Errors propagate; the caller decides whether to halt boot or
     /// run with rescue-ring buffering.
@@ -105,12 +105,12 @@ impl MoversUnifiedWriter {
             port = questdb.ilp_port
         );
         let sender = Sender::from_conf(&conf_string)
-            .with_context(|| format!("MoversUnifiedWriter ILP connect to {conf_string}"))?;
+            .with_context(|| format!("MoversWriter ILP connect to {conf_string}"))?;
         let buffer = sender.new_buffer();
         info!(
             host = %questdb.host,
             port = questdb.ilp_port,
-            "MoversUnifiedWriter ILP connected"
+            "MoversWriter ILP connected"
         );
         Ok(Self {
             sender: Some(sender),
@@ -125,7 +125,7 @@ impl MoversUnifiedWriter {
     ///
     /// On encode failure (defensive — should not happen with valid input):
     /// logs ERROR + drops the row + increments the drop counter.
-    pub fn append_row(&mut self, row: &MoversUnifiedRow) -> Result<()> {
+    pub fn append_row(&mut self, row: &MoversRow) -> Result<()> {
         let result = Self::append_row_to_buffer(&mut self.buffer, row);
         match result {
             Ok(()) => {
@@ -134,7 +134,7 @@ impl MoversUnifiedWriter {
             }
             Err(err) => {
                 metrics::counter!(
-                    "tv_movers_unified_writer_dropped_total",
+                    "tv_movers_writer_dropped_total",
                     "reason" => "encode_error"
                 )
                 .increment(1);
@@ -143,7 +143,7 @@ impl MoversUnifiedWriter {
                     security_id = row.security_id,
                     segment = row.segment_char.to_string(),
                     ?err,
-                    "MoversUnifiedWriter::append_row failed — row dropped"
+                    "MoversWriter::append_row failed — row dropped"
                 );
                 Err(err)
             }
@@ -153,12 +153,12 @@ impl MoversUnifiedWriter {
     /// Pure ILP encoder — `Buffer` mutation only, no I/O. Public for
     /// tests + integration assertions.
     // TEST-EXEMPT: serialiser uses questdb::ingress::Buffer which requires a live Sender to construct, blocking pure-unit testing; covered by integration tests.
-    pub fn append_row_to_buffer(buffer: &mut Buffer, row: &MoversUnifiedRow) -> Result<()> {
+    pub fn append_row_to_buffer(buffer: &mut Buffer, row: &MoversRow) -> Result<()> {
         let segment_str: String = row.segment_char.to_string();
         let segment = sanitize_ilp_symbol(&segment_str);
 
         buffer
-            .table(QUESTDB_TABLE_MOVERS_UNIFIED_1S)
+            .table(QUESTDB_TABLE_MOVERS_1S)
             .context("table")?
             .symbol("segment", segment.as_ref())
             .context("segment")?
@@ -184,7 +184,7 @@ impl MoversUnifiedWriter {
     }
 
     /// Drains the buffer to QuestDB. On flush failure:
-    /// - increments `tv_movers_unified_writer_errors_total{stage="flush"}`
+    /// - increments `tv_movers_writer_errors_total{stage="flush"}`
     /// - logs `error!` with code `MOVERS-UNIFIED-01` (Loki → Telegram)
     /// - clears `self.sender` so the next call attempts reconnect
     pub fn flush(&mut self) -> Result<()> {
@@ -194,22 +194,21 @@ impl MoversUnifiedWriter {
         }
         let Some(sender) = self.sender.as_mut() else {
             // Reconnect — sender was dropped on previous flush failure.
-            let new_sender = Sender::from_conf(&self.ilp_conf_string).with_context(|| {
-                format!("MoversUnifiedWriter reconnect to {}", self.ilp_conf_string)
-            })?;
+            let new_sender = Sender::from_conf(&self.ilp_conf_string)
+                .with_context(|| format!("MoversWriter reconnect to {}", self.ilp_conf_string))?;
             self.sender = Some(new_sender);
             // Buffer still contains pending rows — fall through to flush.
             return self.flush();
         };
         match sender.flush(&mut self.buffer) {
             Ok(()) => {
-                metrics::counter!("tv_movers_unified_1s_rows_total").increment(pending);
+                metrics::counter!("tv_movers_1s_rows_total").increment(pending);
                 self.pending_count = 0;
                 Ok(())
             }
             Err(err) => {
                 metrics::counter!(
-                    "tv_movers_unified_writer_errors_total",
+                    "tv_movers_writer_errors_total",
                     "stage" => "flush"
                 )
                 .increment(1);
@@ -217,10 +216,10 @@ impl MoversUnifiedWriter {
                     code = "MOVERS-UNIFIED-01",
                     pending,
                     ?err,
-                    "MoversUnifiedWriter::flush failed — sender will reconnect on next call"
+                    "MoversWriter::flush failed — sender will reconnect on next call"
                 );
                 self.sender = None;
-                Err(anyhow::Error::new(err).context("MoversUnifiedWriter flush"))
+                Err(anyhow::Error::new(err).context("MoversWriter flush"))
             }
         }
     }
@@ -244,7 +243,7 @@ impl MoversUnifiedWriter {
         if let Err(err) = self.flush() {
             warn!(
                 ?err,
-                "MoversUnifiedWriter::shutdown_flush failed — pending rows may be lost"
+                "MoversWriter::shutdown_flush failed — pending rows may be lost"
             );
         }
     }
@@ -287,17 +286,17 @@ mod tests {
         // Hot-path requirement: passing rows from drain task to writer
         // must not allocate. `Copy` enforces struct-level discipline.
         fn assert_copy<T: Copy>() {}
-        assert_copy::<MoversUnifiedRow>();
+        assert_copy::<MoversRow>();
     }
 
     #[test]
     fn test_movers_unified_row_struct_size_under_100_bytes() {
         // Defensive: 10 fields ≈ 8×8 bytes scalar + 1 char + alignment
         // padding ~ 88 bytes. Catch struct bloat early.
-        let size = std::mem::size_of::<MoversUnifiedRow>();
+        let size = std::mem::size_of::<MoversRow>();
         assert!(
             size <= 96,
-            "MoversUnifiedRow size {size} bytes exceeded budget — review schema"
+            "MoversRow size {size} bytes exceeded budget — review schema"
         );
     }
 
@@ -310,7 +309,7 @@ mod tests {
             pg_port: 8812,
             ilp_port: 1, // unprivileged-rejected
         };
-        let result = MoversUnifiedWriter::connect(&cfg);
+        let result = MoversWriter::connect(&cfg);
         assert!(result.is_err());
     }
 }
