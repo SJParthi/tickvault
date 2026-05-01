@@ -302,6 +302,257 @@ pub fn spawn_depth_20_minimal_conn(inputs: Depth20MinimalConnInputs) {
     });
 }
 
+// =====================================================================
+// Depth-200 minimal connection (Wave 5 commit 3)
+// =====================================================================
+
+/// Inputs to [`spawn_depth_200_minimal_conn`].
+///
+/// Mirrors [`Depth20MinimalConnInputs`] for the 200-level depth pool.
+/// Key differences from depth-20:
+/// - Exactly 1 instrument per connection (Dhan protocol limit), so
+///   [`security_id`] is `Option<u32>` not a Vec; `None` = DEFERRED.
+/// - Carries `exchange_segment` since 200-level subscribe payload
+///   needs an explicit `ExchangeSegment` field per Dhan spec.
+/// - Carries `initial_stagger_ms` so the orchestrator can spread the
+///   5 slots' first-connect handshakes (Dhan TCP-RST storm avoidance,
+///   per audit-findings 2026-04-24 Fix C).
+///
+/// [`security_id`]: Self::security_id
+pub struct Depth200MinimalConnInputs {
+    /// Dhan JWT handle. For depth-200 specifically the operator may
+    /// configure a separate SELF-token via
+    /// `[depth_200_auth] mode = "manual_self_with_renewal"` — caller
+    /// is responsible for selecting the correct handle (typically
+    /// `depth_200_self_token_manager.handle().clone()` when set,
+    /// `token_handle.clone()` otherwise).
+    pub token_handle: TokenHandle,
+    /// Dhan client ID.
+    pub ws_client_id: String,
+    /// Connection label (e.g. `"DYN-200-SLOT-0"`).
+    pub label: String,
+    /// Exchange segment for the subscribed contract. Wave 5 dynamic
+    /// depth-200 always uses `NseFno` (BSE_FNO depth not supported by
+    /// Dhan endpoint).
+    pub exchange_segment: tickvault_common::types::ExchangeSegment,
+    /// Initial security ID. `None` = DEFERRED mode (no initial
+    /// subscribe sent — orchestrator's first cycle
+    /// `DepthCommand::InitialSubscribe200` populates).
+    pub security_id: Option<u32>,
+    /// Receiver side of the orchestrator's per-slot command channel.
+    pub cmd_rx: mpsc::Receiver<DepthCommand>,
+    /// QuestDB config — opens a separate `DeepDepthWriter`.
+    pub questdb_config: QuestDbConfig,
+    /// Notifier — fires `DepthTwoHundredConnected` on first frame and
+    /// `DepthTwoHundredDisconnected{,OffHours}` on terminate.
+    pub notifier: Arc<NotificationService>,
+    /// Health status — increments `tv_depth_200_connections`.
+    pub health_status: SharedHealthStatus,
+    /// Optional WAL spill — passes through to
+    /// `run_two_hundred_depth_connection`.
+    pub ws_frame_spill: Option<Arc<WsFrameSpill>>,
+    /// Initial-connect stagger in milliseconds (slot index ×
+    /// `DEPTH_200_INITIAL_STAGGER_MS`).
+    pub initial_stagger_ms: u64,
+}
+
+/// Spawn a minimal depth-200 WebSocket connection (3 tokio tasks).
+///
+/// Same pattern as [`spawn_depth_20_minimal_conn`]:
+/// 1. frame persistence (parse + DeepDepthWriter with depth="200"),
+/// 2. connected-signal listener,
+/// 3. WS connection runner.
+///
+/// Returns immediately — tasks run in the background. The WS task
+/// self-terminates when the connection ends.
+// TEST-EXEMPT: integration-level — spawns 3 tokio tasks against live Dhan WS endpoint + QuestDB; downstream `run_two_hundred_depth_connection` and `DeepDepthWriter` are independently tested. Compile-time field/signature ratchets in tests below.
+pub fn spawn_depth_200_minimal_conn(inputs: Depth200MinimalConnInputs) {
+    let Depth200MinimalConnInputs {
+        token_handle,
+        ws_client_id,
+        label,
+        exchange_segment,
+        security_id,
+        cmd_rx,
+        questdb_config,
+        notifier,
+        health_status,
+        ws_frame_spill,
+        initial_stagger_ms,
+    } = inputs;
+
+    // Frame channel: WS connection task -> persistence task.
+    // O(1) EXEMPT: boot-time setup; capacity 1024 mirrors the static
+    // depth-200 conns in main.rs.
+    let (frame_tx, mut frame_rx) = mpsc::channel::<Bytes>(1024);
+
+    // Connected-signal channel.
+    let (signal_tx, signal_rx) = oneshot::channel::<()>();
+
+    // -------------------------------------------------------------------
+    // Task 1: frame persistence (depth="200")
+    // -------------------------------------------------------------------
+    let label_for_recv = label.clone();
+    let questdb_for_recv = questdb_config.clone();
+    tokio::spawn(async move {
+        let frames_counter = metrics::counter!(
+            "tv_depth_200lvl_frames_received",
+            "underlying" => label_for_recv.clone()
+        );
+        let mut writer =
+            tickvault_storage::deep_depth_persistence::DeepDepthWriter::new(&questdb_for_recv).ok();
+        if writer.is_some() {
+            info!(
+                label = %label_for_recv,
+                "200-level deep depth QuestDB writer connected (minimal conn)"
+            );
+        }
+        let mut consecutive_parse_errors_200: u32 = 0;
+
+        while let Some(frame) = frame_rx.recv().await {
+            frames_counter.increment(1);
+            let ts = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+            match tickvault_core::parser::dispatcher::dispatch_deep_depth_frame(&frame, ts) {
+                Ok(tickvault_core::parser::types::ParsedFrame::DeepDepth {
+                    security_id,
+                    exchange_segment_code,
+                    side,
+                    levels,
+                    message_sequence,
+                    ..
+                }) => {
+                    consecutive_parse_errors_200 = 0;
+                    let side_str = match side {
+                        tickvault_core::parser::deep_depth::DepthSide::Bid => "BID",
+                        tickvault_core::parser::deep_depth::DepthSide::Ask => "ASK",
+                    };
+                    if let Some(ref mut w) = writer
+                        && let Err(err) = w.append_deep_depth(
+                            security_id,
+                            exchange_segment_code,
+                            side_str,
+                            &levels,
+                            "200",
+                            ts,
+                            message_sequence,
+                        )
+                    {
+                        tracing::warn!(
+                            ?err,
+                            label = %label_for_recv,
+                            "failed to persist 200-level depth (minimal conn)"
+                        );
+                    }
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    consecutive_parse_errors_200 = consecutive_parse_errors_200.saturating_add(1);
+                    metrics::counter!("tv_depth_parse_errors_total", "depth" => "200").increment(1);
+                    if consecutive_parse_errors_200 >= 5 {
+                        error!(
+                            ?err,
+                            label = %label_for_recv,
+                            consecutive = consecutive_parse_errors_200,
+                            "H5: 200-level depth parse failures persisting (minimal conn)"
+                        );
+                        consecutive_parse_errors_200 = 0;
+                    } else {
+                        tracing::warn!(
+                            ?err,
+                            label = %label_for_recv,
+                            "failed to parse 200-level depth frame (minimal conn)"
+                        );
+                    }
+                }
+            }
+        }
+
+        if let Some(ref mut w) = writer
+            && let Err(err) = w.flush()
+        {
+            error!(
+                ?err,
+                label = %label_for_recv,
+                "200-level depth writer flush on shutdown failed (minimal conn)"
+            );
+        }
+    });
+
+    // -------------------------------------------------------------------
+    // Task 2: connected-signal listener
+    // -------------------------------------------------------------------
+    {
+        let notify_label = label.clone();
+        let notify_sender = notifier.clone();
+        let notify_sid = security_id.unwrap_or(0);
+        tokio::spawn(async move {
+            if signal_rx.await.is_ok() {
+                notify_sender.notify(NotificationEvent::DepthTwoHundredConnected {
+                    contract: notify_label,
+                    security_id: notify_sid,
+                });
+            }
+        });
+    }
+
+    // -------------------------------------------------------------------
+    // Task 3: WS connection runner
+    // -------------------------------------------------------------------
+    let ws_health = health_status.clone();
+    let ws_label_for_disconnect = label.clone();
+    let ws_label_for_run = label.clone();
+    let ws_sid_for_disconnect = security_id.unwrap_or(0);
+    let ws_notifier_disconnect = notifier.clone();
+    let ws_reconnect_notifier = Some(notifier.clone());
+    tokio::spawn(async move {
+        ws_health.set_depth_200_connections(ws_health.depth_200_connections().saturating_add(1));
+
+        if let Err(err) = tickvault_core::websocket::run_two_hundred_depth_connection(
+            token_handle,
+            ws_client_id,
+            exchange_segment,
+            security_id,
+            ws_label_for_run,
+            frame_tx,
+            Some(signal_tx),
+            ws_frame_spill,
+            cmd_rx,
+            ws_reconnect_notifier,
+            initial_stagger_ms,
+        )
+        .await
+        {
+            error!(
+                ?err,
+                label = %ws_label_for_disconnect,
+                security_id = ws_sid_for_disconnect,
+                "200-level depth connection terminated (minimal conn)"
+            );
+            // Audit-findings Rule 3+4 — off-hours OR deferred (sid=0)
+            // routes to Severity::Low variant to avoid pager fatigue.
+            let use_off_hours = ws_sid_for_disconnect == 0
+                || !tickvault_common::market_hours::is_within_market_hours_ist();
+            if use_off_hours {
+                ws_notifier_disconnect.notify(
+                    NotificationEvent::DepthTwoHundredDisconnectedOffHours {
+                        contract: ws_label_for_disconnect,
+                        security_id: ws_sid_for_disconnect,
+                        reason: format!("{err}"),
+                    },
+                );
+            } else {
+                ws_notifier_disconnect.notify(NotificationEvent::DepthTwoHundredDisconnected {
+                    contract: ws_label_for_disconnect,
+                    security_id: ws_sid_for_disconnect,
+                    reason: format!("{err}"),
+                });
+            }
+            ws_health
+                .set_depth_200_connections(ws_health.depth_200_connections().saturating_sub(1));
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     // Integration-level tests for this helper require a live Dhan WS
@@ -313,7 +564,7 @@ mod tests {
     // the canonical types — catches signature drift if any imported type
     // changes shape.
 
-    use super::Depth20MinimalConnInputs;
+    use super::{Depth20MinimalConnInputs, Depth200MinimalConnInputs};
 
     #[test]
     fn test_inputs_struct_compiles_with_canonical_types() {
@@ -348,6 +599,42 @@ mod tests {
         // single entry point. Compile-fails if it's renamed.
         fn _check_pub_fn() -> fn(Depth20MinimalConnInputs) {
             super::spawn_depth_20_minimal_conn
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Depth-200 ratchets (Wave 5 commit 3)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_spawn_depth_200_minimal_conn_inputs_struct_compiles() {
+        // Compile-time only.
+        fn _assert(_: Depth200MinimalConnInputs) {}
+    }
+
+    #[test]
+    fn test_spawn_depth_200_minimal_conn_inputs_has_all_required_fields() {
+        fn _destructure(inputs: Depth200MinimalConnInputs) {
+            let Depth200MinimalConnInputs {
+                token_handle: _,
+                ws_client_id: _,
+                label: _,
+                exchange_segment: _,
+                security_id: _,
+                cmd_rx: _,
+                questdb_config: _,
+                notifier: _,
+                health_status: _,
+                ws_frame_spill: _,
+                initial_stagger_ms: _,
+            } = inputs;
+        }
+    }
+
+    #[test]
+    fn test_spawn_depth_200_minimal_conn_export_is_stable() {
+        fn _check_pub_fn() -> fn(Depth200MinimalConnInputs) {
+            super::spawn_depth_200_minimal_conn
         }
     }
 }

@@ -2759,15 +2759,46 @@ async fn main() -> Result<()> {
                     std::sync::Arc::clone(&depth_dyn_shutdown),
                 );
 
-            // Depth-200 dynamic pool (5 slots). One channel per slot.
-            // Receiver-side wiring lands in Wave 5 commit 3 — until then
-            // the rx is dropped and orchestrator Swap200 calls fail with
-            // DEPTH-DYN-02 (visible via `tv_ws_pool_respawn_total`).
+            // Depth-200 dynamic pool (5 slots). One channel + receiver
+            // depth-200 WS connection per slot. Wave 5 commit 3.
+            //
+            // The orchestrator owns Sender<DepthCommand> per slot and
+            // emits Swap200 / InitialSubscribe200 every 60s based on
+            // `option_movers` top-5 by `change_pct DESC`, SENSEX excluded.
+            // Receiver-side connections start in DEFERRED mode (sid=None)
+            // — orchestrator's first cycle InitialSubscribe200 populates
+            // each slot's contract. Initial-connect stagger spreads the
+            // 5 first-connect handshakes over 10s to avoid Dhan TCP-RST
+            // storm (per audit-findings 2026-04-24 Fix C).
             let mut d200_cmd_senders = std::collections::HashMap::new();
             for slot in 0..5_usize {
-                let (tx, _rx) =
+                let (tx, rx) =
                     tokio::sync::mpsc::channel::<tickvault_core::websocket::DepthCommand>(4);
                 d200_cmd_senders.insert(slot, tx);
+
+                // Pick correct token: SELF token if manual_self_with_renewal
+                // mode is configured, else shared TOTP/APP handle.
+                let depth200_token = match &depth_200_self_token_manager {
+                    Some(manager) => manager.handle().clone(),
+                    None => token_handle.clone(),
+                };
+                let stagger_ms = (slot as u64)
+                    .saturating_mul(tickvault_core::websocket::DEPTH_200_INITIAL_STAGGER_MS);
+                tickvault_app::depth_20_conn_spawner::spawn_depth_200_minimal_conn(
+                    tickvault_app::depth_20_conn_spawner::Depth200MinimalConnInputs {
+                        token_handle: depth200_token,
+                        ws_client_id: ws_client_id.clone(),
+                        label: format!("DYN-200-SLOT-{slot}"),
+                        exchange_segment: tickvault_common::types::ExchangeSegment::NseFno,
+                        security_id: None, // DEFERRED — orchestrator sends InitialSubscribe200
+                        cmd_rx: rx,
+                        questdb_config: config.questdb.clone(),
+                        notifier: notifier.clone(),
+                        health_status: health_status.clone(),
+                        ws_frame_spill: ws_frame_spill.clone(),
+                        initial_stagger_ms: stagger_ms,
+                    },
+                );
             }
             let _d200_dyn_handle =
                 tickvault_app::depth_dynamic_pipeline::spawn_depth_200_dynamic_pool_task(
