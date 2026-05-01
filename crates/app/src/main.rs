@@ -2627,6 +2627,18 @@ async fn main() -> Result<()> {
             .as_ref()
             .map(|h| std::sync::Arc::clone(&h.snapshot_handle));
 
+        // Wave 5 Item 25/27 Phase B — base-1s writer for `movers_unified_1s`.
+        // ONE task. Subscribes to tick_broadcast, drains in-memory state at
+        // 1Hz, ILP-appends to the base table; QuestDB auto-refreshes the 24
+        // mat views. Market-hours gated.
+        let movers_unified_shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+        let _movers_unified_handle =
+            tickvault_app::movers_unified_pipeline::spawn_movers_unified_pipeline(
+                config.questdb.clone(),
+                tick_broadcast_sender.clone(),
+                std::sync::Arc::clone(&movers_unified_shutdown),
+            );
+
         // Parthiban directive (2026-04-21): no-tick-during-market-hours
         // watchdog (slow boot path). Same pattern as fast boot above.
         let slow_tick_heartbeat = tickvault_core::pipeline::no_tick_watchdog::new_tick_heartbeat();
