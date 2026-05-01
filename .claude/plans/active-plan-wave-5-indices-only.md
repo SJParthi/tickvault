@@ -466,7 +466,7 @@ The `option_movers` + `stock_movers` writers already exist with 7 ranking catego
 
 ### Movers writers under indices-only — what we add to the plan
 
-- [ ] **Item 12. Wire option_movers selector to use Wave 5 universe filter.** No new code; verify `option_movers` writer already iterates only the subscribed instruments — if it scans ALL NSE_FNO+BSE_FNO contracts regardless of subscription, that's wasted work and should narrow.
+- [x] **Item 12. Wire option_movers selector to use Wave 5 universe filter.** No new code; verify `option_movers` writer already iterates only the subscribed instruments — if it scans ALL NSE_FNO+BSE_FNO contracts regardless of subscription, that's wasted work and should narrow.
 - File: `crates/core/src/pipeline/option_movers.rs` (verify, possibly amend)
 - Test: `test_option_movers_universe_matches_subscription_set_under_indices_only_scope`
 - 9-box: gauge `tv_option_movers_universe_size` (expect ~10,783 under indices-only); alert if >12,000 (regression to old universe)
