@@ -372,6 +372,17 @@ pub enum ErrorCode {
     /// `change_pct DESC` query. Severity::High. The 5 depth-200 conns
     /// keep their last-good gainer set; selector retries every 60s.
     Depth200Dyn01TopGainersEmpty,
+
+    /// Wave 5 Item 13 — boot-time prev-close routing assertion failed.
+    /// The subscription plan contains an instrument whose `(segment,
+    /// feed_mode)` pair cannot deliver previous-day close per the
+    /// per-segment routing matrix in `live-market-feed.md`:
+    /// IDX_I → Ticker (prev close arrives via standalone code 6),
+    /// NSE_EQ → Quote/Full (bytes 38-41 / 50-53 of the Quote/Full
+    /// packet), NSE_FNO/BSE_FNO → Full (bytes 50-53). Severity::Critical
+    /// — halts boot rather than starting a pipeline that loses
+    /// prev_close for half the universe.
+    PrevClose03BootRoutingAssertion,
 }
 
 impl ErrorCode {
@@ -498,6 +509,8 @@ impl ErrorCode {
             Self::CorePin02WorkerDrifted => "CORE-PIN-02",
             Self::Depth20Dyn03TopGainersEmpty => "DEPTH-20-DYN-03",
             Self::Depth200Dyn01TopGainersEmpty => "DEPTH-200-DYN-01",
+            // Wave 5 Item 13 — prev-close routing
+            Self::PrevClose03BootRoutingAssertion => "PREVCLOSE-03",
         }
     }
 
@@ -524,7 +537,8 @@ impl ErrorCode {
             | Self::Depth200Auth01InvalidAtBoot
             | Self::Depth200Auth02RenewalFailed
             | Self::Depth200Auth03SsmUnreachable
-            | Self::Depth20Dyn02SwapChannelBroken => Severity::Critical,
+            | Self::Depth20Dyn02SwapChannelBroken
+            | Self::PrevClose03BootRoutingAssertion => Severity::Critical,
             // Info: positive-ping / lifecycle confirmations
             Self::Selftest01Passed | Self::Slo01Healthy => Severity::Info,
             // High: composite SLO degradation summary signal
@@ -718,7 +732,10 @@ impl ErrorCode {
             Self::CorePin01PinningFailedAtBoot
             | Self::CorePin02WorkerDrifted
             | Self::Depth20Dyn03TopGainersEmpty
-            | Self::Depth200Dyn01TopGainersEmpty => ".claude/rules/project/wave-5-error-codes.md",
+            | Self::Depth200Dyn01TopGainersEmpty
+            | Self::PrevClose03BootRoutingAssertion => {
+                ".claude/rules/project/wave-5-error-codes.md"
+            }
         }
     }
 
@@ -837,6 +854,7 @@ impl ErrorCode {
             Self::CorePin02WorkerDrifted,
             Self::Depth20Dyn03TopGainersEmpty,
             Self::Depth200Dyn01TopGainersEmpty,
+            Self::PrevClose03BootRoutingAssertion,
         ]
     }
 }
@@ -1011,7 +1029,9 @@ mod tests {
         // CORE-PIN-01/02 (Tokio worker pinning) +
         // DEPTH-20-DYN-03 (top-50 depth-20 selector) +
         // DEPTH-200-DYN-01 (top-5 depth-200 selector).
-        assert_eq!(ErrorCode::all().len(), 96);
+        // 2026-05-01 (Wave 5 Item 13): bumped 96 -> 97 for
+        // PREVCLOSE-03 (boot-time prev-close routing assertion).
+        assert_eq!(ErrorCode::all().len(), 97);
     }
 
     #[test]
