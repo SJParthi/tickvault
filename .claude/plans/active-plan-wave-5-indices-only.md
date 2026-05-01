@@ -679,7 +679,7 @@ Tick stream (parser) ──┐
 
 ### What we add to the plan
 
-- [ ] **Item 16. Movers hybrid storage — REUSE existing `Movers22TfTracker` (BLOCKER C2 → Reuse)**
+- [x] **Item 16. Movers hybrid storage — REUSE existing `Movers22TfTracker` (BLOCKER C2 → Reuse)** — **SUPERSEDED 2026-05-01** by Item 25 / Item 27 (materialised-view movers redesign). No code change required; the unified-schema path absorbs Item 16's intent. See "Items 16, 19, 21, 23 — all SUPERSEDED by Item 25" table below.
 
 **Decision:** Item 16 does NOT create a new tracker. The merged trunk (commit `16a7220`) already ships `Movers22TfTracker` (papaya-backed) wired into `tick_processor` (commit `c9f53a4`). Wave 5 contributes:
 - Verify that a 60s checkpoint to QuestDB is wired (per the parallel APPROVED `active-plan-movers-22tf-redesign-v2.md`). If yes → no-op verification. If no → add the checkpoint loop on Core 3 best-effort.
@@ -1407,7 +1407,7 @@ Operator: "no top N categories for stock movers or options movers or top movers 
 
 ### Wave 5 plan amendment
 
-- [ ] **Item 21. Movers store-everything Tier A/B split-cadence**
+- [x] **Item 21. Movers store-everything Tier A/B split-cadence** — **SUPERSEDED 2026-05-01** by Item 25 / Item 27 (unified-schema movers makes Tier B unnecessary; full 11K universe at all 25 tf with tiered RETENTION instead of tiered universe). No code change required.
 - Files: `crates/storage/src/movers_22tf_persistence.rs` (DEDUP key fix, slim DDL), `crates/core/src/pipeline/movers_22tf_tracker.rs` (arena pool, full-universe ranking), `crates/core/src/pipeline/movers_22tf_scheduler.rs` (stagger + Tier A/B gating), `crates/core/src/pipeline/movers_22tf_writer_state.rs` (mpsc 65536), `crates/core/src/pipeline/movers_22tf_supervisor.rs`, `crates/common/src/constants.rs` (timeframe list extended to 25, Tier B watchlist constant `MOVERS_SUBMINUTE_WATCHLIST_SIZE = 500`), `crates/api/src/handlers/top_movers.rs` (auth decision)
 - Tests:
   - `test_movers_dedup_key_includes_category` (Mitigation 5 — meta-guard)
@@ -2012,7 +2012,7 @@ Combined = mathematical proof + regulatory cross-check + authoritative spec.
 
 ### Plan integration
 
-- [ ] **Item 26. Volume Semantic Guarantee Layer**
+- [x] **Item 26. Volume Semantic Guarantee Layer** — L1 in-memory monotonicity guard SHIPPED 2026-05-01 (`volume_monotonicity_guard.rs` + `Volume01MonotonicityBreach` ErrorCode). L2 NSE bhavcopy daily cross-check DEFERRED to follow-up sub-PR (runbook captured in `docs/operator/track-2-monotonicity-select.md`). L3 Dhan support email already drafted via PR #414, awaiting operator Gmail send.
 - Files: `crates/core/src/pipeline/volume_monotonicity_guard.rs` (new), `crates/core/src/historical/nse_volume_crosscheck.rs` (new), `crates/storage/src/nse_volume_crosscheck_persistence.rs` (new), `docs/dhan-support/2026-05-01-volume-semantic-clarification.md` (new draft)
 - Tests: 5 monotonicity-guard tests above + 4 NSE-crosscheck tests + DHAT zero-alloc
 - 9-box: ErrorCodes VOLUME-MONO-01 + VOLUME-NSE-01; Prom counters/gauges; Telegram event `VolumeSemanticBreach` (Severity::Critical); Grafana panel `Volume Adherence`; alert `tv-volume-mono-01-non-monotonic-tick`; triage rule

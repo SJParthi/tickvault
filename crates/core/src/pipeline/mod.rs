@@ -25,6 +25,7 @@ pub mod prev_close_writer;
 pub mod tick_gap_detector;
 pub mod tick_processor;
 pub mod top_movers;
+pub mod volume_monotonicity_guard;
 
 pub use candle_aggregator::CandleAggregator;
 pub use depth_sequence_tracker::{DepthSequenceTracker, SequenceOutcome};
