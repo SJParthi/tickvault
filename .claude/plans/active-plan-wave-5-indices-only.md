@@ -2086,3 +2086,140 @@ Two correct paths:
 All 15 rows + 7 resilience rows apply.
 
 ## Plan Items (now 28, was 10)
+
+## Item 29 — Cowork Verification Findings Fold-In (2026-05-01)
+
+Claude Cowork ran the 4-track verification per `.claude/plans/active-plan-wave-5-indices-only.md` Item 26 spec. **Verdict: INCONCLUSIVE on volume semantic (Tracks 1+3+4 strongly suggest cumulative but Track 2 mathematical proof was unrunnable in sandbox).**
+
+### Verified facts from Cowork (additions to Item 26 evidence base)
+
+| Fact | Source | Confidence |
+|---|---|---|
+| **6th codebase comment confirming cumulative** — `crates/common/src/tick_types.rs:31`: `pub volume: u32, /// Cumulative day volume (from Quote/Full; 0 for Ticker)` | Cowork Track 1 | High (was missed in original 5-comment list) |
+| **Wire-binary identity** with Dhan Python SDK — `process_quote()` uses `<BHBIfHIfIIIffq>` placing volume at bytes 22-25 u32, bit-identical to our `quote.rs:40` | Cowork Track 3, sha `17e64b7bae58e3a0f3b5ef4ee41969ad25524e89` of `https://github.com/dhan-oss/DhanHQ-py/blob/main/src/dhanhq/marketfeed.py` | High (parser correctness PROVEN, semantic still by convention only) |
+| **Item 28 mat-view bug is REAL and ENDOGENOUS** — `materialized_views.rs:315` aggregates `candles_1s.volume` (which `candle_aggregator.rs:46-47, 92` explicitly stores as cumulative snapshot) via `sum()` — produces 60× over-count per minute | Cowork Track 1 (independent verification) | **CONFIRMED — ship Item 28 regardless of Track 2 outcome** |
+| **NSE bhavcopy URL pattern updated 2024 to UDIFF format** — old `archives.nseindia.com/content/historical/DERIVATIVES/` returns HTTP 503; new `nsearchives.nseindia.com/content/fo/BhavCopy_NSE_FO_0_0_0_{YYYYMMDD}_F_0000.csv.zip` works with `Mozilla/5.0` UA, no auth | Cowork Track 4, live-tested 2026-04-30 bhavcopy (1.1 MB ZIP, 34 columns, `TtlTradgVol` at column 25) | High (live HTTP 200 confirmed) |
+
+### Item 26 L2 NSE bhavcopy — verified implementation recipe (replaces draft)
+
+**URL pattern (verified live):**
+- F&O: `https://nsearchives.nseindia.com/content/fo/BhavCopy_NSE_FO_0_0_0_{YYYYMMDD}_F_0000.csv.zip`
+- Cash: `https://nsearchives.nseindia.com/content/cm/BhavCopy_NSE_CM_0_0_0_{YYYYMMDD}_F_0000.csv.zip`
+
+**Mandatory `User-Agent: Mozilla/5.0`** header (NSE Akamai 403s default `curl` UA).
+
+**Column mapping (UDIFF format, 34 columns):**
+- Col 6: `FinInstrmId` — NSE internal numeric ID (NOT Dhan SecurityId)
+- Col 8: `TckrSymb` — e.g. `ABCAPITAL`
+- Col 10: `XpryDt` — ISO `YYYY-MM-DD`
+- Col 12: `StrkPric` — strike price decimal
+- Col 13: `OptnTp` — `CE` / `PE` / blank for futures
+- Col 23: `OpnIntrst` — open interest at session close
+- **Col 25: `TtlTradgVol`** — daily total volume (THIS is our cross-check target)
+- Col 26: `TtlTrfVal` — turnover (price × volume sum)
+
+**NSE → Dhan SecurityId mapping:** join on tuple `(TckrSymb, XpryDt, StrkPric, OptnTp)` against `crates/core/src/instrument/csv_parser.rs::InstrumentRecord`. Both use ISO dates + `CE`/`PE`. Tuple is unique per trading date.
+
+**Our 15:30 IST cumulative volume query:**
+```sql
+SELECT security_id, segment, last(volume) AS our_eod_volume
+FROM ticks
+WHERE ts BETWEEN ('{trading_date}'::timestamp - 86400000000L)
+             AND ('{trading_date}T15:30:00.000000Z'::timestamp)
+  AND segment = 'NSE_FNO'
+GROUP BY security_id, segment
+```
+
+**Tolerance:** start at 0.1% (10 bps). Tighter risks rounding false-positives; wider hides real undercount. Promote to 1% only if 0.1% alarms more than ~2 contracts/day.
+
+**Audit table DDL (replaces Item 26 draft):**
+```sql
+CREATE TABLE volume_nse_audit (
+  trading_date_ist DATE,
+  security_id INT,
+  segment SYMBOL,
+  ticker_symbol SYMBOL,
+  dhan_eod_volume LONG,
+  nse_eod_volume LONG,
+  diff_pct DOUBLE,
+  verdict SYMBOL,         -- 'PASS' | 'FAIL' | 'MISSING_OUR' | 'MISSING_NSE'
+  ts TIMESTAMP
+) TIMESTAMP(ts)
+PARTITION BY DAY
+DEDUP UPSERT KEYS(trading_date_ist, security_id, segment);
+```
+
+**Scheduler:** runs **16:30 IST** daily (NSE typically publishes by 16:00 IST; 30min buffer). Skip on holidays via `TradingCalendar::is_trading_day()`. Emit `NseBhavcopyCheckComplete { matched, mismatched, missing }` Telegram event.
+
+**Dual purpose:** if Dhan's volume is per-tick incremental (not cumulative) and we silently `last()` it, the bhavcopy diff would be enormous, not subtle. So this cross-check is also a **semantic check**, not just an accuracy check. Useful even with INCONCLUSIVE Track 2 verdict.
+
+**Defensive fallback:** consecutive 404s on the URL pattern = page operator (NSE may migrate format again).
+
+### Item 28 priority bump — SHIP FIRST (independent of Track 2)
+
+Item 28 (candles cascade volume bug) is **endogenous** — bug exists regardless of Dhan-side semantic. Cowork independently verified. Recommend:
+
+- **Item 28 sub-PR before Item 27** (mat view DDL)
+- Item 28 sub-PR can ship in parallel with Item 26 L2 (NSE bhavcopy)
+- Item 27 gated on Track 2 elevation to CONFIRMED
+
+### Track 2 elevation plan (operator action required)
+
+**Current blockers (per Cowork report):**
+1. Today (2026-05-01) is NSE Labour Day holiday — no live ticks
+2. Today's app boot failed 04:09:48 UTC on `DEPTH200-AUTH-01` (SELF token expired -146514 seconds = 40h ago)
+3. QuestDB not bound to localhost in Cowork sandbox (separate sandbox limitation)
+
+**Operator actions before Mon May 4 09:15 IST market open:**
+1. Refresh SELF token in SSM per `.claude/rules/project/depth-200-auth-error-codes.md` runbook
+2. Verify boot succeeds (no DEPTH200-AUTH-01 in errors.jsonl)
+3. Let app run 09:15-09:45 IST collecting ticks
+4. At 09:45 IST, run the 5-series SELECT (next subsection)
+
+### 5-series monotonicity SELECT — operator runs Mon May 4 09:45 IST
+
+```sql
+-- Series 1: NIFTY index value
+SELECT 'series_1_nifty' AS series, ts, volume
+FROM ticks WHERE security_id = 13 AND segment = 'IDX_I'
+  AND ts > '2026-05-04T09:15:00.000000Z'::timestamp
+  AND ts < '2026-05-04T09:45:00.000000Z'::timestamp
+ORDER BY ts ASC LIMIT 500;
+
+-- Series 2: BANKNIFTY index value
+SELECT 'series_2_banknifty' AS series, ts, volume
+FROM ticks WHERE security_id = 25 AND segment = 'IDX_I' ... (same pattern)
+
+-- Series 3-5: pick top-3 most-active option contracts:
+SELECT security_id, segment, count(*) AS tick_count
+FROM ticks WHERE ts > '2026-05-04T09:15:00.000000Z'
+GROUP BY security_id, segment
+ORDER BY tick_count DESC LIMIT 3;
+-- Then per series: SELECT ts, volume FROM ticks WHERE security_id = X ...
+```
+
+**Per-series verdict logic:**
+- Compute `lag(volume, 1) OVER (ORDER BY ts)` and check `volume >= lag(volume)` for every row
+- ANY row violating → series REFUTED
+- All 5 series monotonic → semantic CONFIRMED CUMULATIVE
+
+**Outcome decision matrix:**
+
+| Result | Action |
+|---|---|
+| 5/5 monotonic | Item 27 ships as designed; volume guarantee promoted from INCONCLUSIVE to CONFIRMED |
+| 1+ violations | OPEN Dhan ticket Item 26 L3 with violations attached + HALT Item 27 mat view DDL until Dhan response |
+| Insufficient ticks (low-volume contracts) | re-run with more active contracts; insufficient data ≠ refutation |
+
+### Plan integration
+
+- [ ] **Item 29. Cowork verification findings fold-in + Item 26 L2 implementation recipe**
+- Status: documentation only (no code). Updates Item 26 with verified NSE bhavcopy specifics; bumps Item 28 priority.
+- Files: this plan file (current additions); `docs/operator/track-2-monotonicity-select.md` (new, runbook for Mon May 4)
+- Tests: N/A (process item)
+
+### Per-Item Guarantee Matrix (per Item 22)
+
+All 15 + 7 rows apply via `.claude/rules/project/per-wave-guarantee-matrix.md` cross-reference.
+
+## Plan Items (now 29, was 10)
