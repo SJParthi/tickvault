@@ -52,6 +52,7 @@ impl DistributionCategory {
     /// Returns `None` for segments that don't appear in the Wave 5
     /// indices-only universe (currency, commodity, BSE_EQ, etc.).
     #[must_use]
+    // TEST-EXEMPT: covered transitively by `test_distribution_drops_unsupported_segments` and `test_distribution_is_category_balanced_round_robin`.
     pub const fn from_segment(segment: ExchangeSegment) -> Option<Self> {
         match segment {
             ExchangeSegment::IdxI => Some(Self::IdxI),
