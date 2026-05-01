@@ -16,6 +16,7 @@
 pub mod bhavcopy_pipeline;
 pub mod boot_helpers;
 pub mod core_pinning;
+pub mod depth_20_single_side_planner;
 pub mod depth_bridge_state_writer;
 pub mod depth_dynamic_pipeline;
 pub mod greeks_pipeline;
