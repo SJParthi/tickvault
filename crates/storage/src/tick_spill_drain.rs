@@ -109,7 +109,9 @@ pub async fn init(spill_path: PathBuf) -> Result<()> {
     }
     let (tx, rx) = mpsc::channel::<Vec<u8>>(CHANNEL_CAPACITY);
     spawn_drain_task(rx, spill_path).await?;
-    let _ = GLOBAL.set(GlobalHandle { tx });
+    // Idempotent: re-init in tests is fine; the OnceLock just keeps the
+    // first-set value. Production calls this exactly once at boot.
+    drop(GLOBAL.set(GlobalHandle { tx }));
     Ok(())
 }
 

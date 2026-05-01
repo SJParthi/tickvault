@@ -5055,13 +5055,13 @@ async fn main() -> Result<()> {
                     };
 
                     /// Sum of expected connections across the four pools:
-                    /// 5 main feed + 4 depth-20 (NIFTY/BANKNIFTY/FINNIFTY/MIDCPNIFTY,
-                    /// per pre-2026-04-25 universe; the post-2026-04-25 rebuild
-                    /// reduced this to 2 but the pool capacity still permits 4)
-                    /// + 2 depth-200 (NIFTY ATM CE/PE + BANKNIFTY ATM CE/PE
-                    /// — capped at 2 in the live config) + 1 order-update.
-                    /// Total = 12. Used as the `expected` divisor for
-                    /// `WS_health = active / expected`.
+                    /// Total expected websocket count = 12. Breakdown:
+                    /// 5 main feed, 4 depth-20 (NIFTY, BANKNIFTY, FINNIFTY,
+                    /// MIDCPNIFTY per pre-2026-04-25 universe; rebuild reduced
+                    /// to 2 but pool capacity still permits 4), 2 depth-200
+                    /// (NIFTY ATM CE/PE plus BANKNIFTY ATM CE/PE, capped at 2
+                    /// in live config), 1 order-update.
+                    /// Used as `expected` divisor for `WS_health = active / expected`.
                     const SLO_WS_EXPECTED_TOTAL: f64 = 12.0;
 
                     /// Tick-freshness threshold during market hours: a tick

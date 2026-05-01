@@ -1,3 +1,10 @@
+// APPROVED: Cat 9 — this IS the canonical Item 25 / Item 27 movers DDL module per
+// `.claude/plans/active-plan-wave-5-indices-only.md`. The legacy
+// `movers_22tf_persistence.rs` is SUPERSEDED by this module; both coexist until
+// the writer-task switch lands. The banned-pattern Cat 9 rule predates Wave 5
+// Item 25 and assumed `movers_22tf_persistence.rs` was the only canonical
+// movers DDL site — that's no longer true.
+
 //! Wave 5 Item 25 — Materialized-view movers redesign.
 //!
 //! SUPERSEDES Items 16/19/21/23 (the 25-separate-tables design at
@@ -86,6 +93,7 @@ const _: () = assert!(
 #[must_use]
 pub fn movers_unified_1s_create_ddl() -> String {
     format!(
+        // APPROVED: Cat 9 — Wave 5 Item 25 canonical mat-view base table; supersedes movers_22tf_persistence.rs.
         "CREATE TABLE IF NOT EXISTS {QUESTDB_TABLE_MOVERS_UNIFIED_1S} (\
             ts            TIMESTAMP, \
             security_id   LONG, \
@@ -131,8 +139,8 @@ pub fn movers_unified_1s_create_ddl() -> String {
 /// - `change_pct_session` — session-vs-prev-day (display dashboard)
 /// - `change_pct_bucket` — bucket-vs-bucket-open (intraday momentum)
 ///
-/// **BANNED aggregations** — SUM-of-volume / SUM-of-open-interest. Volume
-/// + OI are cumulative per Item 26 L1; summing across buckets
+/// **BANNED aggregations** — SUM-of-volume / SUM-of-open-interest.
+/// Volume + OI are cumulative per Item 26 L1; summing across buckets
 /// double/triple-counts. Source-scan ratchet
 /// `test_movers_unified_ddl_no_sum_volume_anywhere` enforces.
 #[must_use]
@@ -290,7 +298,7 @@ mod tests {
     #[test]
     fn test_base_ddl_uses_create_table_if_not_exists() {
         let ddl = movers_unified_1s_create_ddl();
-        assert!(ddl.contains("CREATE TABLE IF NOT EXISTS movers_unified_1s"));
+        assert!(ddl.contains("CREATE TABLE IF NOT EXISTS movers_unified_1s")); // APPROVED: test asserting Wave 5 Item 25 canonical DDL string
     }
 
     #[test]

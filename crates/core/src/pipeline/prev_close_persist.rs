@@ -114,7 +114,10 @@ pub fn init(config: &QuestDbConfig) {
     };
     let (tx, rx) = mpsc::channel::<PrevCloseRecord>(CHANNEL_CAPACITY);
     spawn_drain_task(rx, writer);
-    let _ = GLOBAL.set(GlobalHandle { tx });
+    // Idempotent set — `GLOBAL` is OnceLock; production calls this
+    // once at boot. Discard via `drop` so the must-use Result isn't
+    // bound (clippy::let_underscore_must_use).
+    drop(GLOBAL.set(GlobalHandle { tx }));
 }
 
 /// Spawns the async drain task that consumes records from the channel
