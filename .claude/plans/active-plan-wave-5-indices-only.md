@@ -555,7 +555,7 @@ vs c7i.xlarge 8 GB RAM (with QuestDB at 4 GB, Valkey 1 GB, others ~2 GB → tick
 
 ### What we add to the plan
 
-- [ ] **Item 14. NSE_EQ feed_mode downgrade Full → Quote**
+- [x] **Item 14. NSE_EQ feed_mode downgrade Full → Quote**
 - File: `crates/core/src/instrument/subscription_planner.rs`
 - Tests: `test_nse_eq_uses_quote_mode_under_indices_only`, `test_quote_packet_close_field_matches_prev_close_lookup`
 - 9-box: Prom gauge `tv_subscription_bytes_per_sec_per_conn{conn}` — alert if any conn exceeds 5 MB/sec sustained (means we accidentally subscribed Full to cash); `FeedModeRoutingAudit` typed event at boot listing per-slot mode counts; ratchet test

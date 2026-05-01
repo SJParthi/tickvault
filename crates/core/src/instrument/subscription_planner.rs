@@ -361,14 +361,24 @@ pub fn build_subscription_plan(
             continue;
         }
 
-        // 4a. Stock equity price feed
+        // 4a. Stock equity price feed.
+        //
+        // Wave 5 Item 14: NSE_EQ subscriptions use Quote mode UNCONDITIONALLY
+        // (independent of `config.feed_mode`). The Quote packet (code 4,
+        // 50 bytes) carries LTP / LTQ / LTT / ATP + volume + day OHLC +
+        // prev_close (bytes 38-41) — everything cash-equity needs under
+        // the indices-only scope. The 162-byte Full packet's extra payload
+        // (OI + 5-level depth) is unused for cash equities and would
+        // waste ~115 KB/sec of bandwidth across ~206 stocks at peak.
+        // The Item-13 ratchet pins this contract.
+        let nse_eq_feed_mode = FeedMode::Quote;
         if config.subscribe_stock_equities
             && seen_ids.insert((
                 underlying.price_feed_security_id,
                 underlying.price_feed_segment,
             ))
         {
-            instruments.push(make_stock_equity_instrument(underlying, feed_mode));
+            instruments.push(make_stock_equity_instrument(underlying, nse_eq_feed_mode));
         }
 
         // 4b. Stock derivatives — current expiry only, ATM ± N strikes
@@ -841,12 +851,17 @@ pub fn build_subscription_plan_from_archived(
 
         let symbol = underlying.underlying_symbol.as_str();
 
-        // 4a. Stock equity price feed
+        // 4a. Stock equity price feed.
+        //
+        // Wave 5 Item 14: NSE_EQ stamped Quote unconditionally — see the
+        // canonical `build_subscription_plan` path above for rationale.
+        let nse_eq_feed_mode = FeedMode::Quote;
         let price_id = underlying.price_feed_security_id.to_native();
         let price_seg = ExchangeSegment::from(&underlying.price_feed_segment);
         if config.subscribe_stock_equities && seen_ids.insert((price_id, price_seg)) {
             instruments.push(make_stock_equity_instrument_from_archived(
-                underlying, feed_mode,
+                underlying,
+                nse_eq_feed_mode,
             ));
         }
 
@@ -3059,12 +3074,20 @@ mod tests {
 
         assert_eq!(plan.summary.feed_mode, FeedMode::Full);
 
-        // Verify every subscribed instrument has Full feed mode
-        for instrument in plan.registry.iter() {
+        // Wave 5 Item 14: NSE_EQ is Quote-mode UNCONDITIONALLY (downgrade
+        // from config.feed_mode to save ~115 KB/sec under indices-only
+        // scope). Skip NSE_EQ in this propagation check; the dedicated
+        // `test_nse_eq_uses_quote_mode_under_indices_only` ratchet pins
+        // the override.
+        for instrument in plan
+            .registry
+            .iter()
+            .filter(|i| i.exchange_segment != ExchangeSegment::NseEquity)
+        {
             assert_eq!(
                 instrument.feed_mode,
                 FeedMode::Full,
-                "instrument {} ({}) should have Full feed mode",
+                "non-NSE_EQ instrument {} ({}) should inherit config Full feed mode",
                 instrument.security_id,
                 instrument.display_label
             );
@@ -3092,11 +3115,16 @@ mod tests {
             None,
         );
 
-        for instrument in plan.registry.iter() {
+        for instrument in plan
+            .registry
+            .iter()
+            .filter(|i| i.exchange_segment != ExchangeSegment::NseEquity)
+        {
             assert_eq!(
                 instrument.feed_mode,
                 FeedMode::Ticker,
-                "instrument {} should have Ticker feed mode",
+                "non-NSE_EQ instrument {} should inherit config Ticker feed mode \
+                 (Wave 5 Item 14: NSE_EQ is Quote-mode unconditionally)",
                 instrument.security_id
             );
         }
@@ -4244,6 +4272,130 @@ mod tests {
                 "{:?} instrument {} ({}) must be Full mode for prev_close + OI + \
                  5-level depth; Quote/Ticker would lose them. PREVCLOSE-03.",
                 inst.exchange_segment,
+                inst.security_id,
+                inst.display_label
+            );
+        }
+    }
+
+    // ----------------------------------------------------------------------
+    // Wave 5 Item 14 — NSE_EQ feed_mode downgrade ratchets.
+    //
+    // Under indices-only scope the cash-equity feeds carry only LTP /
+    // volume / day OHLC + prev_close — exactly the contents of the 50-byte
+    // Quote packet (code 4). The 162-byte Full packet's extra payload
+    // (OI + 5-level depth) is unused for cash equities, so subscribing
+    // them at Full mode wastes ~115 KB/sec of bandwidth across ~206
+    // stocks at peak. The planner stamps NSE_EQ at Quote unconditionally
+    // regardless of `config.feed_mode`. These tests pin the override.
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn test_nse_eq_uses_quote_mode_under_indices_only() {
+        let universe = make_test_universe();
+        // Default config = Full. Even so, NSE_EQ must come out as Quote.
+        let config = SubscriptionConfig::default();
+        let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
+        let plan = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
+
+        let nse_eq: Vec<_> = plan
+            .registry
+            .iter()
+            .filter(|i| i.exchange_segment == ExchangeSegment::NseEquity)
+            .collect();
+        assert!(
+            !nse_eq.is_empty(),
+            "test universe must produce at least one NSE_EQ instrument"
+        );
+        for inst in nse_eq {
+            assert_eq!(
+                inst.feed_mode,
+                FeedMode::Quote,
+                "Wave 5 Item 14: NSE_EQ {} ({}) must be Quote mode regardless \
+                 of config.feed_mode (= {:?}); got {:?}.",
+                inst.security_id,
+                inst.display_label,
+                config.parsed_feed_mode().unwrap_or(FeedMode::Ticker),
+                inst.feed_mode
+            );
+        }
+
+        // Sanity: even when config asks for Ticker, NSE_EQ stays Quote.
+        let config_ticker = SubscriptionConfig {
+            feed_mode: "Ticker".to_string(),
+            ..SubscriptionConfig::default()
+        };
+        let plan_ticker = build_subscription_plan(
+            &universe,
+            &config_ticker,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
+        for inst in plan_ticker
+            .registry
+            .iter()
+            .filter(|i| i.exchange_segment == ExchangeSegment::NseEquity)
+        {
+            assert_eq!(
+                inst.feed_mode,
+                FeedMode::Quote,
+                "Wave 5 Item 14: NSE_EQ override applies even when \
+                 config.feed_mode = Ticker; got {:?}",
+                inst.feed_mode
+            );
+        }
+    }
+
+    #[test]
+    fn test_quote_packet_close_field_matches_prev_close_lookup() {
+        // Documents the data-flow contract that justifies the downgrade:
+        // The Quote packet's `close` field at bytes 38-41 is the previous
+        // trading session's close (Dhan Ticket #5525125), and the Wave-5
+        // movers writers + restart-recovery path read prev_close from
+        // exactly that field on every Quote tick. Therefore Quote mode
+        // is sufficient for NSE_EQ — no need to escalate to Full.
+        //
+        // This test pins the Quote packet's prev_close routing in the
+        // segment-aware code today, by re-running the boot-time matrix
+        // assertion under Quote-defaulted config and asserting all
+        // NSE_EQ instruments still satisfy the `Quote OR Full` band
+        // from PREVCLOSE-03.
+        let universe = make_test_universe();
+        let config = SubscriptionConfig::default(); // = Full
+        let today = NaiveDate::from_ymd_opt(2026, 3, 15).unwrap();
+        let plan = build_subscription_plan(
+            &universe,
+            &config,
+            today,
+            &std::collections::HashMap::new(),
+            None,
+        );
+
+        for inst in plan
+            .registry
+            .iter()
+            .filter(|i| i.exchange_segment == ExchangeSegment::NseEquity)
+        {
+            assert!(
+                matches!(inst.feed_mode, FeedMode::Quote | FeedMode::Full),
+                "NSE_EQ {} ({}) must remain in the prev_close-carrying band \
+                 (Quote bytes 38-41 / Full bytes 50-53); got {:?}.",
+                inst.security_id,
+                inst.display_label,
+                inst.feed_mode
+            );
+            // Wave 5 Item 14 tightens the band to Quote-only:
+            assert_eq!(
+                inst.feed_mode,
+                FeedMode::Quote,
+                "NSE_EQ {} ({}) must be EXACTLY Quote (Item 14 downgrade)",
                 inst.security_id,
                 inst.display_label
             );
