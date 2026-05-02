@@ -308,24 +308,29 @@ pub fn build_subscription_plan(
     }
 
     // -----------------------------------------------------------------------
-    // 3. Index derivatives — full chain at CURRENT EXPIRY ONLY (3 indices)
+    // 3. Index derivatives — full chain at ALL future expiries (3 indices)
     //
-    // 2026-04-25: Was "all contracts for 5 major indices, no expiry filter".
-    // Reduced to current-expiry-only for the 3 full-chain indices (NIFTY,
-    // BANKNIFTY, SENSEX) to fit 25K WS capacity. Far-month index contracts
-    // are dropped — strategy doesn't trade them and they consume ~10K slots.
+    // 2026-05-02 (operator-confirmed restore of pre-2026-04-25 behavior):
+    // subscribe EVERY contract whose `expiry_date >= today` for NIFTY +
+    // BANKNIFTY + SENSEX — current weekly + next weekly + monthly + far
+    // monthly + every strike on each. Yields ~10-11K contracts vs the
+    // ~1.8K nearest-expiry-only count. Operator's intent is full chain
+    // for all live expiries so strategies have visibility across the
+    // term structure.
+    //
+    // The 25K Dhan WS cap still holds because stock F&O is OFF under
+    // `IndicesOnlyAllExpiries` scope (Wave 5 default) — index F&O
+    // ~10-11K + stock equities 209 + IDX_I ~26 = ~10.3K total, well
+    // under cap with ~14K headroom.
     //
     // Indices NEVER apply the stock rollover rule (≤1-day-to-expiry roll).
-    // Per `subscription_planner` ratchet `test_index_expiry_never_rolls_via_planner`,
-    // index strategies legitimately trade expiry-day, so we keep nearest expiry
-    // even when today equals expiry.
+    // Per ratchet `test_index_expiry_never_rolls_via_planner`, index
+    // strategies legitimately trade expiry-day, so every future expiry
+    // (including today) stays in.
     // -----------------------------------------------------------------------
     if config.subscribe_index_derivatives {
-        // Pre-pass: compute nearest expiry per full-chain index.
-        // O(N) where N = derivative contract count. One scan, no allocation
-        // beyond the small HashMap (≤3 entries).
-        let mut index_nearest_expiry: HashMap<&str, chrono::NaiveDate> =
-            HashMap::with_capacity(FULL_CHAIN_INDEX_SYMBOLS.len());
+        // Single pass: subscribe every NIFTY/BANKNIFTY/SENSEX derivative
+        // whose expiry is today or future. No nearest-expiry filter.
         for contract in universe.derivative_contracts.values() {
             let is_index = matches!(
                 contract.instrument_kind,
@@ -335,31 +340,6 @@ pub fn build_subscription_plan(
             if is_index
                 && full_chain_set.contains(contract.underlying_symbol.as_str())
                 && contract.expiry_date >= today
-            {
-                let symbol = contract.underlying_symbol.as_str();
-                index_nearest_expiry
-                    .entry(symbol)
-                    .and_modify(|e| {
-                        if contract.expiry_date < *e {
-                            *e = contract.expiry_date;
-                        }
-                    })
-                    .or_insert(contract.expiry_date);
-            }
-        }
-
-        // Subscribe pass: only contracts at the nearest expiry per index.
-        for contract in universe.derivative_contracts.values() {
-            let is_index = matches!(
-                contract.instrument_kind,
-                tickvault_common::instrument_types::DhanInstrumentKind::FutureIndex
-                    | tickvault_common::instrument_types::DhanInstrumentKind::OptionIndex
-            );
-            if is_index
-                && full_chain_set.contains(contract.underlying_symbol.as_str())
-                && index_nearest_expiry
-                    .get(contract.underlying_symbol.as_str())
-                    .is_some_and(|nearest| *nearest == contract.expiry_date)
                 && seen_ids.insert((contract.security_id, contract.exchange_segment))
             {
                 instruments.push(make_derivative_instrument(
@@ -3797,9 +3777,13 @@ mod tests {
     /// 2026-04-25 ratchet: index F&O subscribes ONLY the current (nearest)
     /// expiry. Far-month index contracts must be excluded. Build a NIFTY
     /// universe with 3 expiries (nearest, mid, far) and assert only the
-    /// nearest-expiry contracts are in the plan.
+    /// 2026-05-02 (operator-confirmed restore): all-future-expiry contracts
+    /// are in the plan. Was `test_index_derivatives_use_current_expiry_only`
+    /// pre-2026-05-02 (asserted only nearest expiry); reverted to match the
+    /// new "subscribe every future expiry of NIFTY/BANKNIFTY/SENSEX" behavior
+    /// which yields ~10-11K instruments under the indices-only scope.
     #[test]
-    fn test_index_derivatives_use_current_expiry_only() {
+    fn test_index_derivatives_subscribe_all_future_expiries() {
         let nearest = NaiveDate::from_ymd_opt(2026, 4, 30).unwrap();
         let mid = NaiveDate::from_ymd_opt(2026, 5, 28).unwrap();
         let far = NaiveDate::from_ymd_opt(2026, 6, 25).unwrap();
@@ -3896,32 +3880,34 @@ mod tests {
 
         let plan = build_subscription_plan(&universe, &config, today, &HashMap::new(), None);
 
-        // Assert: only the nearest-expiry contracts (security_ids 70000 + 70010) emitted.
+        // Assert: ALL 6 contracts (3 expiries × {future, CE}) are in the plan.
+        // Operator-confirmed 2026-05-02: every future expiry of the 3
+        // full-chain indices must be subscribed for term-structure
+        // visibility. Yields ~10-11K live contracts in production.
         let subscribed_ids: HashSet<u32> = plan.registry.iter().map(|i| i.security_id).collect();
 
-        assert!(
-            subscribed_ids.contains(&70000),
-            "Nearest-expiry NIFTY future must be subscribed"
-        );
-        assert!(
-            subscribed_ids.contains(&70010),
-            "Nearest-expiry NIFTY CE must be subscribed"
-        );
-        assert!(
-            !subscribed_ids.contains(&70001),
-            "Mid-expiry NIFTY future must NOT be subscribed (current expiry only)"
-        );
-        assert!(
-            !subscribed_ids.contains(&70002),
-            "Far-expiry NIFTY future must NOT be subscribed"
-        );
-        assert!(
-            !subscribed_ids.contains(&70011),
-            "Mid-expiry NIFTY CE must NOT be subscribed"
-        );
-        assert!(
-            !subscribed_ids.contains(&70012),
-            "Far-expiry NIFTY CE must NOT be subscribed"
+        for (label, sid) in [
+            ("Nearest-expiry NIFTY future", 70000_u32),
+            ("Mid-expiry NIFTY future", 70001),
+            ("Far-expiry NIFTY future", 70002),
+            ("Nearest-expiry NIFTY CE", 70010),
+            ("Mid-expiry NIFTY CE", 70011),
+            ("Far-expiry NIFTY CE", 70012),
+        ] {
+            assert!(
+                subscribed_ids.contains(&sid),
+                "{label} (sid={sid}) must be subscribed under all-expiries policy"
+            );
+        }
+        // Plan also includes the IDX_I price-feed (security_id 13, segment IDX_I),
+        // which is correct. Count only the F&O contracts (70000+ range).
+        let fno_count = subscribed_ids
+            .iter()
+            .filter(|&&sid| (70000..70100).contains(&sid))
+            .count();
+        assert_eq!(
+            fno_count, 6,
+            "Exactly 6 NIFTY F&O contracts (3 expiries × {{FUT, CE}}) expected, got {fno_count}"
         );
     }
 
