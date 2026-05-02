@@ -726,7 +726,7 @@ async fn main() -> Result<()> {
                     .with_thread_ids(true)
                     .with_file(true)
                     .with_line_number(true)
-                    .with_timer(ist_timer)
+                    .with_timer(ist_timer.clone())
                     .json()
                     .with_writer(std::sync::Mutex::new(file))
                     .with_filter(tracing_subscriber::filter::LevelFilter::WARN);
@@ -778,12 +778,63 @@ async fn main() -> Result<()> {
             }
         };
 
+    // 2026-05-02 — per-category log file separation.
+    //
+    // Operator-requested split of the giant `app.*` stream into 5
+    // domain-specific log directories so movers / candles / live ticks /
+    // historical / option chain logs can be tailed independently.
+    //
+    // Each layer uses `tracing_subscriber::filter::Targets` to route only
+    // messages matching the category's module prefixes (built by
+    // `observability::build_category_targets`). The targets are real
+    // module paths verified against `crates/{core,storage,trading}/src/`.
+    //
+    // Failure to init any one category appender is BEST EFFORT — the
+    // existing app.log + errors.log + errors.jsonl streams stay intact,
+    // and the missing category falls back to those general streams via
+    // the existing layers. This prevents one bad mount from blocking boot.
+    let category_layers: Vec<Box<dyn tracing_subscriber::Layer<_> + Send + Sync + 'static>> = {
+        use tracing_subscriber::Layer as _;
+        let mut layers: Vec<Box<dyn tracing_subscriber::Layer<_> + Send + Sync + 'static>> =
+            Vec::with_capacity(5);
+        for cat in tickvault_app::observability::LogCategory::all() {
+            match tickvault_app::observability::init_category_log_appender(cat.dir(), cat.prefix())
+            {
+                Ok((writer, guard)) => {
+                    Box::leak(Box::new(guard));
+                    let mut targets = tracing_subscriber::filter::Targets::new();
+                    for prefix in tickvault_app::observability::build_category_targets(cat) {
+                        targets = targets
+                            .with_target(*prefix, tracing_subscriber::filter::LevelFilter::TRACE);
+                    }
+                    let cat_fmt = tracing_subscriber::fmt::layer()
+                        .with_target(true)
+                        .with_thread_ids(true)
+                        .with_file(false)
+                        .with_line_number(false)
+                        .with_timer(ist_timer.clone())
+                        .json()
+                        .with_writer(writer)
+                        .with_filter(targets);
+                    layers.push(Box::new(cat_fmt));
+                }
+                Err(err) => {
+                    let _ = err;
+                    // Tracing not initialized yet — silent fallback.
+                    // The general app.log layer still captures these logs.
+                }
+            }
+        }
+        layers
+    };
+
     tracing_subscriber::registry()
         .with(env_filter)
         .with(fmt_boxed)
         .with(file_log_layer)
         .with(error_log_layer)
         .with(errors_jsonl_layer)
+        .with(category_layers)
         .with(otel_layer)
         .init();
 
@@ -852,6 +903,43 @@ async fn main() -> Result<()> {
                     dir = %dir.display(),
                     "app log retention sweep failed"
                 ),
+            }
+        }
+    });
+
+    // 2026-05-02 — per-category log retention sweeper. One tokio task
+    // iterates all 5 LogCategory variants every hour and deletes
+    // {prefix}.{YYYY-MM-DD-HH} files older than 168 hours (7 days),
+    // matching the existing app.* policy.
+    tokio::spawn(async {
+        use std::path::Path;
+        use std::time::Duration;
+        const SWEEP_INTERVAL_SECS: u64 = 3600;
+        const RETENTION_HOURS: u64 = 168;
+        loop {
+            tokio::time::sleep(Duration::from_secs(SWEEP_INTERVAL_SECS)).await;
+            for cat in tickvault_app::observability::LogCategory::all() {
+                let dir = Path::new(cat.dir());
+                match tickvault_app::observability::sweep_category_log_retention(
+                    dir,
+                    cat.prefix(),
+                    RETENTION_HOURS,
+                ) {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!(
+                        deleted = n,
+                        dir = %dir.display(),
+                        prefix = cat.prefix(),
+                        retention_hours = RETENTION_HOURS,
+                        "category log retention sweep"
+                    ),
+                    Err(err) => tracing::warn!(
+                        ?err,
+                        dir = %dir.display(),
+                        prefix = cat.prefix(),
+                        "category log retention sweep failed"
+                    ),
+                }
             }
         }
     });
@@ -2813,6 +2901,12 @@ async fn main() -> Result<()> {
                 // were read but silently overridden by hardcoded constants.
                 cohort_size: config.depth_20.dynamic.universe.cohort_size,
                 window_secs: config.depth_20.dynamic.universe.window_secs,
+                // 2026-05-02 — operator-requested symbol-level Telegram
+                // diff event. Registry resolves (sid, segment) → display
+                // label per I-P1-11 composite key. Notifier dispatches
+                // `DepthDynamicV2DiffApplied` events on every non-no-op cycle.
+                registry: slow_registry.clone(),
+                notifier: Some(notifier.clone()),
             };
             let d20_pipeline_handle =
                 tickvault_app::depth_dynamic_pipeline_v2::spawn_depth_dynamic_pool(
@@ -2918,6 +3012,8 @@ async fn main() -> Result<()> {
                 label: "depth-200-dynamic",
                 cohort_size: config.depth_200.dynamic.universe.cohort_size,
                 window_secs: config.depth_200.dynamic.universe.window_secs,
+                registry: slow_registry.clone(),
+                notifier: Some(notifier.clone()),
             };
             let d200_pipeline_handle =
                 tickvault_app::depth_dynamic_pipeline_v2::spawn_depth_dynamic_pool(

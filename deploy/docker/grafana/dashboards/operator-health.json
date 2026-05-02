@@ -1820,6 +1820,15 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
+          "expr": "sum by (feed) (increase(tv_depth_dynamic_heartbeat_total[5m]))",
+          "legendFormat": "{{feed}} heartbeat",
+          "refId": "D"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
           "expr": "sum by (feed) (increase(tv_depth_dynamic_diff_removes_total[5m]))",
           "legendFormat": "{{feed}} removes",
           "refId": "C"

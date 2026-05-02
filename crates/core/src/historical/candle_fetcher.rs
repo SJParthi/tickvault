@@ -914,6 +914,19 @@ async fn fetch_historical_candles_inner(
     // Per-instrument token-expired retry count
     let mut token_expired_counts: Vec<usize> = vec![0; targets.len()];
 
+    // 2026-05-02 (operator-requested): emit an INFO progress log every N
+    // processed instruments inside Wave 0 so the long silent middle of a
+    // ~18-minute fetch becomes visible. Without this, the operator sees
+    // only the start log + end log + the per-wave WARN reruns. With this
+    // they see one progress line every ~50 instruments → ~20-40 lines per
+    // run, sufficient to confirm the fetch is alive without spamming logs.
+    const PROGRESS_LOG_EVERY_N: usize = 50;
+    info!(
+        targets_total = targets.len(),
+        progress_every = PROGRESS_LOG_EVERY_N,
+        "historical fetch dispatching to Dhan REST API"
+    );
+
     // --- Wave 0 = initial pass, Waves 1..=RETRY_WAVE_MAX = retries ---
     for wave in 0..=RETRY_WAVE_MAX {
         if pending_indices.is_empty() {
@@ -979,6 +992,24 @@ async fn fetch_historical_candles_inner(
                     #[allow(clippy::cast_possible_truncation)]
                     // APPROVED: usize->u64 is lossless on 64-bit targets
                     m_fetched.increment(candle_count as u64);
+
+                    // Wave 0 progress log every PROGRESS_LOG_EVERY_N successful
+                    // instruments — bounded to ~20-40 lines per full run.
+                    if wave == 0 && instruments_fetched % PROGRESS_LOG_EVERY_N == 0 {
+                        let pct = if targets.is_empty() {
+                            0
+                        } else {
+                            (instruments_fetched.saturating_mul(100)) / targets.len()
+                        };
+                        info!(
+                            instruments_fetched,
+                            targets_total = targets.len(),
+                            total_candles,
+                            persist_failures = total_persist_failures,
+                            percent = pct,
+                            "historical fetch progress"
+                        );
+                    }
                 }
                 InstrumentFetchResult::TokenExpired => {
                     m_token_expired.increment(1);

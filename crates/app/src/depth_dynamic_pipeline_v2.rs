@@ -102,7 +102,9 @@ pub const DEFAULT_FRESHNESS_WINDOW_SECS: u32 = 60;
 /// Pipeline configuration. Constructed at boot from
 /// `config/base.toml::[depth_20.dynamic]` or
 /// `config/base.toml::[depth_200.dynamic]`.
-#[derive(Debug, Clone)]
+// Note: no `#[derive(Debug)]` because `NotificationService` does not
+// implement Debug. Custom Debug impl below skips the notifier + registry.
+#[derive(Clone)]
 pub struct PipelineConfig {
     /// QuestDB connection details (HTTP /exec endpoint).
     pub questdb: QuestDbConfig,
@@ -124,6 +126,14 @@ pub struct PipelineConfig {
     /// SQL freshness window. Threaded from
     /// `[depth_*.dynamic.universe].window_secs`.
     pub window_secs: u32,
+    /// 2026-05-02 — operator-requested symbol resolution for diff events.
+    /// When `Some(_)`, every non-no-op cycle resolves added/removed SIDs
+    /// to display labels via O(1) `get_with_segment` lookup (per I-P1-11).
+    /// `None` keeps the legacy aggregate-counts-only behaviour for tests.
+    pub registry: Option<Arc<tickvault_common::instrument_registry::InstrumentRegistry>>,
+    /// Optional notifier for the diff Telegram event. Both `registry`
+    /// and `notifier` must be `Some(_)` for the event to fire.
+    pub notifier: Option<Arc<tickvault_core::notification::NotificationService>>,
 }
 
 /// Spawns the unified all-5-dynamic depth pipeline. Drives the diff
@@ -143,7 +153,17 @@ pub fn spawn_depth_dynamic_pool(
     tokio::spawn(async move {
         info!(label = cfg.label, "depth_dynamic_pool_v2 starting");
         let mut state = DynamicSubscriptionState::new(cfg.shape);
-        let mut tick = tokio::time::interval(Duration::from_secs(RESELECT_INTERVAL_SECS));
+        // 2026-05-02 — operator-requested wall-clock alignment. Replace
+        // boot-aligned `tokio::time::interval(60s)` with `interval_at`
+        // anchored to today's 09:15:01 IST (or "now" if already past).
+        // Without this fix, a boot at 08:50:30 IST would tick at
+        // 08:51:30, 08:52:30, …, 09:14:30, then 09:15:30 — missing the
+        // critical 09:15:00→09:15:30 window where movers_1s first
+        // populates. Operator's spec: "at 09:15:01 it should be
+        // captured and started — should not wait till 09:16".
+        let first_cycle_at = compute_first_cycle_instant_today();
+        let mut tick =
+            tokio::time::interval_at(first_cycle_at, Duration::from_secs(RESELECT_INTERVAL_SECS));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         // PR-C2 follow-up (hostile-bug-hunt fix C2/M1) — rising-edge
@@ -167,6 +187,16 @@ pub fn spawn_depth_dynamic_pool(
         // stale state (large-but-bounded delta) so this is hygienic, not
         // safety-critical, but avoids spurious 250-op churn at 09:00.
         let mut last_seen_ist_day = current_ist_trading_day();
+
+        // 2026-05-02 — operator-requested two-phase cadence. First tick
+        // of each trading day fires at 09:15:01 IST (initial subscribe);
+        // every subsequent tick fires at the next :00 minute boundary
+        // (09:16:00, 09:17:00, …). `realigned_to_minute` flips true
+        // after the first in-market cycle dispatches, triggering the
+        // interval reset to the minute-boundary schedule. Reset to
+        // false on daily-rollover so tomorrow's 09:15:01 fires the
+        // special first cycle again.
+        let mut realigned_to_minute = false;
 
         // PR-C2 follow-up (hostile-bug-hunt fix L1) — off-hours sleep
         // edge-trigger. Tracks the in-market state to fire a single INFO
@@ -204,6 +234,19 @@ pub fn spawn_depth_dynamic_pool(
                     if !in_market {
                         continue;
                     }
+                    // 2026-05-02 — heartbeat counter for liveness alerting.
+                    // Increments on EVERY in-market tick (including no-op
+                    // cycles where rank-set is unchanged). Distinct from
+                    // `tv_depth_dynamic_diff_cycles_total` which only fires
+                    // on non-no-op cycles. Alert
+                    // `tv-depth-dynamic-pipeline-stalled` fires if this
+                    // counter doesn't increment for 5+ min during market
+                    // hours — meaning the orchestrator is dead.
+                    metrics::counter!(
+                        "tv_depth_dynamic_heartbeat_total",
+                        "feed" => cfg.label
+                    )
+                    .increment(1);
                     // PR-C2 follow-up H2: detect IST midnight rollover and
                     // reset state so the next diff computes against a clean
                     // baseline. Cheap (one i64 compare per 60s tick).
@@ -213,10 +256,31 @@ pub fn spawn_depth_dynamic_pool(
                             label = cfg.label,
                             previous = last_seen_ist_day,
                             current = today_ist,
-                            "depth_dynamic_pool_v2 IST midnight rollover — resetting diff state"
+                            "depth_dynamic_pool_v2 IST midnight rollover — resetting diff state \
+                             + re-aligning interval to today's 09:15:01"
                         );
                         state = DynamicSubscriptionState::new(cfg.shape);
                         last_seen_ist_day = today_ist;
+                        // 2026-05-02 — re-align the interval to today's
+                        // 09:15:01 IST so the first cycle each day fires
+                        // exactly at market open + 1s, not boot-time-aligned.
+                        // Without this, the schedule drifts off the wall
+                        // clock day-by-day (interval ticks every 60s
+                        // forever from the original start_at instant).
+                        tick = tokio::time::interval_at(
+                            compute_first_cycle_instant_today(),
+                            Duration::from_secs(RESELECT_INTERVAL_SECS),
+                        );
+                        tick.set_missed_tick_behavior(
+                            tokio::time::MissedTickBehavior::Delay,
+                        );
+                        // Reset the minute-boundary realignment flag so
+                        // tomorrow's first cycle fires at the special
+                        // 09:15:01 anchor, then re-aligns to :00 boundaries.
+                        realigned_to_minute = false;
+                        // Skip the rest of this cycle — next tick.tick()
+                        // will fire at today's 09:15:01.
+                        continue;
                     }
                     let cohort = match fetch_cohort_from_questdb(&cfg).await {
                         Ok(c) => {
@@ -348,6 +412,57 @@ pub fn spawn_depth_dynamic_pool(
                                 audit_failing = true;
                             }
                         }
+                    }
+
+                    // 2026-05-02 — operator-requested symbol-level Telegram.
+                    // Resolve each Add/Remove op's (sid, segment) →
+                    // display_label via O(1) registry lookup (per I-P1-11),
+                    // build entries, fire DepthDynamicV2DiffApplied. If
+                    // either registry or notifier is None (e.g. test
+                    // fixtures), skip silently.
+                    if let (Some(registry), Some(notifier)) =
+                        (cfg.registry.as_ref(), cfg.notifier.as_ref())
+                    {
+                        let added_entries =
+                            resolve_op_entries(&ops, registry, |op| {
+                                matches!(op, DiffOp::Add { .. })
+                            });
+                        let removed_entries =
+                            resolve_op_entries(&ops, registry, |op| {
+                                matches!(op, DiffOp::Remove { .. })
+                            });
+                        notifier.notify(
+                            tickvault_core::notification::NotificationEvent::DepthDynamicV2DiffApplied {
+                                feed: cfg.label,
+                                added: added_entries,
+                                removed: removed_entries,
+                                retained_count: stats.retained,
+                            },
+                        );
+                    }
+
+                    // 2026-05-02 — operator-requested cadence transition.
+                    // After the FIRST in-market cycle dispatches (at
+                    // 09:15:01), re-anchor the interval to the next
+                    // wall-clock minute boundary so subsequent cycles
+                    // fire at 09:16:00, 09:17:00, … instead of
+                    // 09:16:01, 09:17:01, … (the natural drift of
+                    // interval_at(09:15:01, 60s)).
+                    if !realigned_to_minute {
+                        let next_minute = compute_next_minute_boundary_instant();
+                        info!(
+                            code = "DEPTH-DYN-V2-CADENCE",
+                            label = cfg.label,
+                            "first cycle complete — re-anchoring to minute-boundary cadence"
+                        );
+                        tick = tokio::time::interval_at(
+                            next_minute,
+                            Duration::from_secs(RESELECT_INTERVAL_SECS),
+                        );
+                        tick.set_missed_tick_behavior(
+                            tokio::time::MissedTickBehavior::Delay,
+                        );
+                        realigned_to_minute = true;
                     }
                 }
             }
@@ -718,6 +833,45 @@ fn is_within_market_hours_ist() -> bool {
     (TICK_PERSIST_START_SECS_OF_DAY_IST..TICK_PERSIST_END_SECS_OF_DAY_IST).contains(&sec_of_day)
 }
 
+/// 2026-05-02 — operator-requested symbol resolution helper. Maps
+/// `DiffOp` entries (filtered by predicate) to `DepthDiffEntry` records
+/// via the instrument registry's O(1) composite-key lookup (per I-P1-11).
+/// Ops where the registry has no entry are silently dropped — defence
+/// in depth (production paths only emit IDs already in the registry).
+fn resolve_op_entries(
+    ops: &[DiffOp],
+    registry: &tickvault_common::instrument_registry::InstrumentRegistry,
+    predicate: impl Fn(&DiffOp) -> bool,
+) -> Vec<tickvault_core::notification::DepthDiffEntry> {
+    let mut out: Vec<tickvault_core::notification::DepthDiffEntry> = Vec::with_capacity(ops.len());
+    for op in ops {
+        if !predicate(op) {
+            continue;
+        }
+        let (sid, segment) = match op {
+            DiffOp::Add {
+                security_id,
+                exchange_segment,
+                ..
+            }
+            | DiffOp::Remove {
+                security_id,
+                exchange_segment,
+                ..
+            } => (*security_id, *exchange_segment),
+        };
+        if let Some(inst) = registry.get_with_segment(sid, segment) {
+            out.push(tickvault_core::notification::DepthDiffEntry {
+                security_id: sid,
+                exchange_segment: segment.as_str().to_string(),
+                display_label: inst.display_label.clone(),
+                underlying_symbol: inst.underlying_symbol.clone(),
+            });
+        }
+    }
+    out
+}
+
 /// Returns the current IST trading day as a `(year, ordinal_day)`
 /// tuple — a cheap comparable identity that rolls over at 00:00 IST.
 /// Used by the daily-reset gate (PR-C2 follow-up H2).
@@ -727,6 +881,74 @@ fn current_ist_trading_day() -> i64 {
     let now_utc = Utc::now().timestamp();
     let now_ist = now_utc.saturating_add(i64::from(IST_UTC_OFFSET_SECONDS));
     now_ist.div_euclid(i64::from(SECONDS_PER_DAY))
+}
+
+/// Wall-clock target for the FIRST selection cycle of each trading
+/// day: 09:15:01 IST. One second after market open so movers_1s has
+/// at least one populated 1-second bucket from the first F&O ticks.
+const FIRST_CYCLE_SECS_OF_DAY_IST: u32 = 9 * 3600 + 15 * 60 + 1;
+
+/// 2026-05-02 — operator-requested cadence:
+///   * Tick 1 at 09:15:01 IST (initial subscribe — uses
+///     `compute_first_cycle_instant_today`)
+///   * Tick 2 at 09:16:00 IST (first minute-aligned re-rebalance)
+///   * Tick 3 at 09:17:00 IST
+///   * Tick N at 09:14+N:00 IST
+///
+/// After the first cycle fires at 09:15:01, the interval is re-anchored
+/// to the next minute boundary so subsequent ticks land on `:00`
+/// seconds — matching the operator's stated "from 9.16.00 dynamic
+/// movement should happen" cadence.
+///
+/// Returns an Instant for the next wall-clock minute boundary
+/// (`current_second_of_minute == 0`). Always >= `Instant::now()`.
+#[inline]
+#[must_use]
+fn compute_next_minute_boundary_instant() -> tokio::time::Instant {
+    let now_utc = Utc::now().timestamp();
+    // Seconds into the current minute, in [0, 59].
+    let secs_into_minute = now_utc.rem_euclid(60);
+    // If we're EXACTLY at :00, fire 60s from now (the next :00). Avoids
+    // a zero-duration sleep that could fire mid-cycle.
+    let secs_to_boundary = if secs_into_minute == 0 {
+        60
+    } else {
+        60 - secs_into_minute
+    };
+    // APPROVED: secs_to_boundary is in [1, 60], fits u64.
+    #[allow(clippy::cast_sign_loss)]
+    let dur = Duration::from_secs(secs_to_boundary as u64);
+    tokio::time::Instant::now() + dur
+}
+
+/// 2026-05-02 — operator-requested first-cycle alignment.
+///
+/// Returns a `tokio::time::Instant` for the next 09:15:01 IST anchor
+/// point. Behaviour:
+///   * Pre-09:15:01 today → returns Instant for today's 09:15:01
+///   * Post-09:15:01 today → returns `Instant::now()` so the first
+///     `tick.tick().await` fires immediately (boot-after-market-open
+///     case, e.g. crash recovery at 11:30 IST)
+///
+/// Combined with `tokio::time::interval_at(start, 60s)`, the first
+/// selection cycle of each day fires within OS-scheduler latency
+/// (~1ms typical) of 09:15:01 IST, eliminating the up-to-60-second
+/// blind spot the legacy boot-aligned `interval(60s)` introduced.
+///
+/// Subsequent ticks fire at +60s, +120s, …; daily-rollover handler
+/// re-creates the interval to keep the alignment from drifting.
+#[inline]
+#[must_use]
+fn compute_first_cycle_instant_today() -> tokio::time::Instant {
+    let now_utc = Utc::now().timestamp();
+    let now_ist = now_utc.saturating_add(i64::from(IST_UTC_OFFSET_SECONDS));
+    let secs_into_day = now_ist.rem_euclid(i64::from(SECONDS_PER_DAY));
+    let target = i64::from(FIRST_CYCLE_SECS_OF_DAY_IST);
+    let offset_secs = (target - secs_into_day).max(0);
+    // APPROVED: offset_secs is non-negative i64 ≤ 86400, fits u64 cleanly.
+    #[allow(clippy::cast_sign_loss)]
+    let offset_dur = Duration::from_secs(offset_secs as u64);
+    tokio::time::Instant::now() + offset_dur
 }
 
 #[cfg(test)]
@@ -890,6 +1112,100 @@ mod tests {
         assert!(
             (18000..30000).contains(&day),
             "trading day epoch out of sane range: {day}"
+        );
+    }
+
+    /// 2026-05-02 — operator-requested first-cycle alignment.
+    /// Pin the constant at 09:15:01 IST.
+    #[test]
+    fn test_first_cycle_secs_of_day_ist_pinned_at_09_15_01() {
+        // 09:15:01 IST = 9*3600 + 15*60 + 1 = 33_301
+        assert_eq!(FIRST_CYCLE_SECS_OF_DAY_IST, 33_301);
+    }
+
+    /// Ratchet: the helper returns an Instant that is `Instant::now()`
+    /// or in the future. Cannot return a past-relative Instant because
+    /// `Instant + Duration` is monotone non-decreasing.
+    #[test]
+    fn test_compute_first_cycle_instant_today_never_in_the_past() {
+        let before = tokio::time::Instant::now();
+        let target = compute_first_cycle_instant_today();
+        // `before` was sampled before the helper ran; helper internally
+        // calls Instant::now() AFTER `before`, so target >= before always.
+        assert!(target >= before);
+    }
+
+    /// Ratchet: when called multiple times within the same second, the
+    /// helper must return Instants that are within ~1 second of each
+    /// other — bounding clock-skew-style drift.
+    #[test]
+    fn test_compute_first_cycle_instant_today_stable_within_call_window() {
+        let a = compute_first_cycle_instant_today();
+        let b = compute_first_cycle_instant_today();
+        let diff = if b > a {
+            b.duration_since(a)
+        } else {
+            a.duration_since(b)
+        };
+        // Two calls within milliseconds should produce Instants within 1s.
+        // (offset_secs is integer-second granularity; jitter < 1s.)
+        assert!(
+            diff.as_secs() <= 1,
+            "two consecutive calls produced Instants {diff:?} apart — expected ≤ 1s"
+        );
+    }
+
+    /// Operator-requested cadence: minute-boundary alignment AFTER the
+    /// first 09:15:01 cycle. The helper must return an Instant that is
+    /// 1..=60 seconds away from now — never zero, never more than 60.
+    #[test]
+    fn test_compute_next_minute_boundary_instant_within_one_minute_window() {
+        let before = tokio::time::Instant::now();
+        let target = compute_next_minute_boundary_instant();
+        let delta = target.saturating_duration_since(before);
+        assert!(
+            delta.as_secs() >= 1 && delta.as_secs() <= 60,
+            "next minute boundary must be 1..=60s away, got {delta:?}"
+        );
+    }
+
+    /// Ratchet: minute boundary helper aligns to wall-clock :00 seconds.
+    /// Two consecutive calls separated by < 1s must produce Instants
+    /// that target the SAME minute boundary (within sub-second jitter).
+    #[test]
+    fn test_compute_next_minute_boundary_instant_aligns_to_wall_clock() {
+        let a = compute_next_minute_boundary_instant();
+        let b = compute_next_minute_boundary_instant();
+        let diff = if b > a {
+            b.duration_since(a)
+        } else {
+            a.duration_since(b)
+        };
+        // Both calls hit the same :00 boundary unless we crossed a
+        // second boundary mid-test (rare but possible). Either way
+        // the gap is at most 1 second.
+        assert!(
+            diff.as_secs() <= 1,
+            "two consecutive minute-boundary calls produced Instants {diff:?} apart"
+        );
+    }
+
+    /// 2026-05-02 — heartbeat counter source-scan ratchet. Pins the
+    /// presence of `tv_depth_dynamic_heartbeat_total` increment in the
+    /// orchestrator. Removing it would silently disable the
+    /// `tv-depth-dynamic-pipeline-stalled` Prometheus alert (operator
+    /// would no longer get a Telegram on a dead orchestrator).
+    #[test]
+    fn test_heartbeat_counter_increment_is_present_in_orchestrator() {
+        let src = include_str!("depth_dynamic_pipeline_v2.rs");
+        assert!(
+            src.contains("\"tv_depth_dynamic_heartbeat_total\""),
+            "heartbeat counter increment must remain in spawn_depth_dynamic_pool"
+        );
+        // Must also be tagged with the feed label for per-pool isolation.
+        assert!(
+            src.contains("\"feed\" => cfg.label"),
+            "heartbeat counter must carry the feed label for per-pool isolation"
         );
     }
 

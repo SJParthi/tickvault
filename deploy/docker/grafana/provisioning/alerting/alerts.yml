@@ -842,6 +842,46 @@ groups:
       # (most-likely upstream MOVERS-02 writer failure). Operator
       # follows MOVERS-02 runbook + checks
       # `tv_movers_writer_dropped_total{stage="append"}`.
+      # 2026-05-02 — depth-dynamic pipeline_v2 liveness alert.
+      # Fires if the heartbeat counter doesn't increment for 5+ min
+      # during market hours, i.e. the orchestrator is dead. Distinct
+      # from `tv-depth-dynamic-set-size-low` which fires on stale
+      # cohort data — this one fires on dead orchestrator.
+      - uid: tv-depth-dynamic-pipeline-stalled
+        title: "PR-D: Depth-dynamic pipeline stalled (no heartbeat)"
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model:
+              expr: "sum by (feed) (increase(tv_depth_dynamic_heartbeat_total[5m]))"
+              intervalMs: 15000
+              maxDataPoints: 43200
+          - refId: B
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: lt, params: [1] }
+        noDataState: Alerting
+        execErrState: Alerting
+        for: 5m
+        annotations:
+          summary: "Depth-dynamic pipeline orchestrator stalled"
+          description: "tv_depth_dynamic_heartbeat_total has not incremented for 5+ min during market hours — the depth_dynamic_pipeline_v2 orchestrator is dead. Check tokio panic backtraces in data/logs/errors.jsonl.* and the JoinHandle panic watchdog (DEPTH-DYN-V2 logs). Operator MUST restart the app."
+        labels:
+          severity: critical
+
       - uid: tv-depth-dynamic-set-size-low
         title: "PR-D: Depth-dynamic set size below capacity"
         condition: C
