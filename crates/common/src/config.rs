@@ -831,12 +831,16 @@ impl Default for ObservabilityConfig {
 /// Subscription scope gate (Wave 5 Item 1).
 ///
 /// Selects between the legacy full-universe subscription (216 stock F&O +
-/// 3 indices full chain ≈ 24,324 instruments) and the Wave 5 indices-only
-/// scope (NIFTY + BANKNIFTY + SENSEX, all expiries, all strikes; cash
-/// equities + IDX_I unchanged ≈ 11,018 instruments).
+/// 3 indices full chain ≈ 24,324 instruments) and the indices-only scope
+/// (NIFTY + BANKNIFTY + SENSEX with ALL future expiries + every strike;
+/// cash equities + IDX_I unchanged ≈ 10-11K instruments — see
+/// `subscription_planner.rs` Section 3 for the all-expiries policy
+/// reverted on 2026-05-02 per operator's term-structure-visibility
+/// requirement). Production count varies day-to-day with weekly expiry
+/// roll + new strike addition; range observed 9.5K–11.5K.
 ///
-/// Default: `IndicesOnlyAllExpiries` — Wave 5 ships indices-only as the
-/// production default per `.claude/plans/active-plan-wave-5-indices-only.md`.
+/// Default: `IndicesOnlyAllExpiries` — production default per
+/// `.claude/plans/archive/2026-05-02-wave-5-indices-only-superseded-by-pr-c2.md`.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SubscriptionScope {
