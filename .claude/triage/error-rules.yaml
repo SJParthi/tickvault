@@ -1162,6 +1162,106 @@ rules:
       diagnose.
 
   # -----------------------------------------------------------------------
+  # Wave 5 (2026-05-01) — core_affinity pinning + dynamic top-gainer
+  # selectors + boot prev-close routing assertion + volume monotonicity
+  # -----------------------------------------------------------------------
+
+  - name: core-pin-01-pinning-failed-at-boot-escalate
+    match:
+      code: CORE-PIN-01
+    action: escalate
+    runbook_path: .claude/rules/project/wave-5-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      CORE-PIN-01 means a Tokio worker thread failed to pin to its
+      assigned core at boot — typically host has < 4 logical cores or
+      the kernel rejected `core_affinity::set_for_current`. App
+      continues without pinning; latency budgets in
+      `quality/benchmark-budgets.toml` may be missed. Operator checks
+      `nproc` and cgroup `--cpuset-cpus` policy. Severity::High; never
+      auto-action because the underlying constraint is host-level.
+
+  - name: core-pin-02-worker-drifted-silence
+    match:
+      code: CORE-PIN-02
+    action: silence
+    runbook_path: .claude/rules/project/wave-5-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      CORE-PIN-02 = a pinned Tokio worker drifted off its assigned
+      core. The 60s drift watchdog re-applies the pin automatically;
+      single drifts are recoverable. Severity::Medium. Auto-triage
+      safe per the runbook (the watchdog is the auto-fix). Operator
+      only needs to act if `tv_core_pinning_drift_total` rate >1/min
+      for 5 min, in which case the dashboard escalates separately.
+
+  - name: depth-20-dyn-03-top-gainers-empty-escalate
+    match:
+      code: DEPTH-20-DYN-03
+    action: escalate
+    runbook_path: .claude/rules/project/wave-5-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 1800
+    justification: >-
+      DEPTH-20-DYN-03 means the depth-20 conn 5 top-50 selector
+      returned < 50 contracts during market hours. Either
+      `option_movers` stale (follow MOVERS-02 runbook), universe-wide
+      bear day (< 50 NSE_FNO contracts with `change_pct > 0`), or
+      writer unhealthy. Severity::High; 30-min cooldown to avoid spam
+      during sustained low-volume periods. Conn 5 keeps the last-good
+      set until next successful query — never auto-fix.
+
+  - name: depth-200-dyn-01-top-gainers-empty-escalate
+    match:
+      code: DEPTH-200-DYN-01
+    action: escalate
+    runbook_path: .claude/rules/project/wave-5-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 1800
+    justification: >-
+      DEPTH-200-DYN-01 means the depth-200 top-5 selector returned
+      < 5 contracts during market hours. Same upstream failure modes
+      as DEPTH-20-DYN-03 (just smaller K). Each conn keeps its
+      last-good gainer set; no Swap200 is issued. Severity::High;
+      30-min cooldown.
+
+  - name: prevclose-03-boot-routing-assertion-escalate
+    match:
+      code: PREVCLOSE-03
+    action: escalate
+    runbook_path: .claude/rules/project/wave-5-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      PREVCLOSE-03 = boot-time assertion failed: a subscribed
+      instrument has a `(segment, feed_mode)` pair outside the
+      allowed cell of the prev-close routing matrix
+      (IDX_I→Ticker, NSE_EQ→Quote/Full, NSE_FNO/BSE_FNO→Full).
+      Severity::Critical — refuses to start a pipeline that loses
+      prev_close. Most common cause: operator set
+      `[subscription] feed_mode = "Quote"` in `config/base.toml`,
+      silently downgrading derivatives. Operator fixes config and
+      restarts. Never auto-action.
+
+  - name: volume-mono-01-monotonicity-breach-escalate
+    match:
+      code: VOLUME-MONO-01
+    action: escalate
+    runbook_path: .claude/rules/project/wave-5-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 600
+    justification: >-
+      VOLUME-MONO-01 = within an IST trading day a tick arrived where
+      `volume[i] < volume[i-1]` for some `(security_id, segment)` —
+      either parser bug or Dhan-side semantic change (cumulative-day
+      assumption violated). Pipeline keeps flowing; guard logs +
+      counts the breach. Operator runs the Mon May 4 09:45 IST
+      monotonicity SELECT in `docs/operator/track-2-monotonicity-select.md`
+      to determine root cause. Severity::High; 10-min cooldown.
+
+  # -----------------------------------------------------------------------
   # Phase 11 (2026-04-28) — Movers 22-TF
   # -----------------------------------------------------------------------
 
