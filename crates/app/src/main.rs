@@ -2792,12 +2792,45 @@ async fn main() -> Result<()> {
                     sids_per_conn: config.depth_20.dynamic.sids_per_conn,
                 },
                 label: "depth-20-dynamic",
+                // Security-review MEDIUM 3 fix: thread the operator's
+                // [depth_*.dynamic.universe] cohort_size + window_secs
+                // through to the pipeline. Previously these TOML fields
+                // were read but silently overridden by hardcoded constants.
+                cohort_size: config.depth_20.dynamic.universe.cohort_size,
+                window_secs: config.depth_20.dynamic.universe.window_secs,
             };
-            tickvault_app::depth_dynamic_pipeline_v2::spawn_depth_dynamic_pool(
-                d20_pipeline_cfg,
-                d20_v2_cmd_senders,
-                std::sync::Arc::clone(&v2_shutdown),
-            );
+            let d20_pipeline_handle =
+                tickvault_app::depth_dynamic_pipeline_v2::spawn_depth_dynamic_pool(
+                    d20_pipeline_cfg,
+                    d20_v2_cmd_senders,
+                    std::sync::Arc::clone(&v2_shutdown),
+                );
+            // Hostile-bug-hunt H1 fix — capture JoinHandle and detect
+            // a silent panic in the orchestrator. Mirrors the Wave 5
+            // pattern at the legacy orchestrator block (M2 watchdog).
+            tokio::spawn(async move {
+                match d20_pipeline_handle.await {
+                    Ok(()) => {
+                        tracing::info!(
+                            "depth-20-dynamic v2 orchestrator exited cleanly (shutdown signalled)"
+                        );
+                    }
+                    Err(err) if err.is_panic() => {
+                        tracing::error!(
+                            ?err,
+                            "depth-20-dynamic v2 orchestrator task PANICKED — \
+                             5 conns will stop receiving Add/Remove cmds; \
+                             operator MUST restart the app to recover"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            ?err,
+                            "depth-20-dynamic v2 orchestrator task cancelled (shutdown race)"
+                        );
+                    }
+                }
+            });
 
             // ----- Depth-200: 5 deferred minimal_conns -----
             let mut d200_v2_cmd_senders: std::collections::HashMap<
@@ -2832,9 +2865,17 @@ async fn main() -> Result<()> {
                     },
                 );
             }
-            tickvault_app::boot_smoke_test::spawn_depth_200_boot_smoke_test(std::sync::Arc::clone(
-                &v2_d200_frame_counter,
-            ));
+            // Hostile-bug-hunt smoke-test fix: SKIP `spawn_depth_200_boot_smoke_test`
+            // in v2 mode. The smoke test deadline is 60s — but in v2 the
+            // first dispatch fires at t=60s (RESELECT_INTERVAL_SECS) and
+            // the first frame typically arrives at t=62-65s (handshake +
+            // first stream frame), so the smoke test would fire DEPTH200-
+            // SMOKE-01 Critical at every clean v2 boot.
+            // Drop the v2_d200_frame_counter — pipeline_v2's own
+            // observability (`tv_depth_dynamic_set_size{feed}` gauge +
+            // alert `tv-depth-dynamic-set-size-low`) covers the same
+            // failure mode without the 60s race.
+            drop(v2_d200_frame_counter);
 
             let d200_pipeline_cfg = tickvault_app::depth_dynamic_pipeline_v2::PipelineConfig {
                 questdb: config.questdb.clone(),
@@ -2860,12 +2901,39 @@ async fn main() -> Result<()> {
                     sids_per_conn: config.depth_200.dynamic.sids_per_conn,
                 },
                 label: "depth-200-dynamic",
+                cohort_size: config.depth_200.dynamic.universe.cohort_size,
+                window_secs: config.depth_200.dynamic.universe.window_secs,
             };
-            tickvault_app::depth_dynamic_pipeline_v2::spawn_depth_dynamic_pool(
-                d200_pipeline_cfg,
-                d200_v2_cmd_senders,
-                v2_shutdown,
-            );
+            let d200_pipeline_handle =
+                tickvault_app::depth_dynamic_pipeline_v2::spawn_depth_dynamic_pool(
+                    d200_pipeline_cfg,
+                    d200_v2_cmd_senders,
+                    v2_shutdown,
+                );
+            // Hostile-bug-hunt H1 fix — capture JoinHandle for panic detection.
+            tokio::spawn(async move {
+                match d200_pipeline_handle.await {
+                    Ok(()) => {
+                        tracing::info!(
+                            "depth-200-dynamic v2 orchestrator exited cleanly (shutdown signalled)"
+                        );
+                    }
+                    Err(err) if err.is_panic() => {
+                        tracing::error!(
+                            ?err,
+                            "depth-200-dynamic v2 orchestrator task PANICKED — \
+                             5 slots will stop receiving Add/Remove cmds; \
+                             operator MUST restart the app"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            ?err,
+                            "depth-200-dynamic v2 orchestrator task cancelled (shutdown race)"
+                        );
+                    }
+                }
+            });
             tracing::info!(
                 "PR-C2 cutover: depth_dynamic_pipeline_v2 spawn complete \
                  (depth-20: {}×{} = {} SIDs; depth-200: {}×{} = {} SIDs)",
