@@ -320,12 +320,10 @@ pub fn spawn_depth_20_minimal_conn(inputs: Depth20MinimalConnInputs) {
 ///
 /// [`security_id`]: Self::security_id
 pub struct Depth200MinimalConnInputs {
-    /// Dhan JWT handle. For depth-200 specifically the operator may
-    /// configure a separate SELF-token via
-    /// `[depth_200_auth] mode = "manual_self_with_renewal"` — caller
-    /// is responsible for selecting the correct handle (typically
-    /// `depth_200_self_token_manager.handle().clone()` when set,
-    /// `token_handle.clone()` otherwise).
+    /// Dhan JWT handle. Shared TOTP/APP token — the same one used by
+    /// Live Feed, Depth-20, and Order-Update WebSockets. Per Dhan
+    /// Ticket #5610706 (2026-05-02) `wss://full-depth-api.dhan.co`
+    /// accepts both APP and SELF tokens.
     pub token_handle: TokenHandle,
     /// Dhan client ID.
     pub ws_client_id: String,
