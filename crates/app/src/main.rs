@@ -2022,6 +2022,12 @@ async fn main() -> Result<()> {
         tickvault_storage::depth_rebalance_audit_persistence::ensure_depth_rebalance_audit_table(
             &config.questdb
         ),
+        // PR-C2 (depth-dynamic redesign) — audit table for incremental
+        // diff-based resubscribe events emitted by `depth_dynamic_pipeline_v2`.
+        // Schema-self-heal pattern: idempotent CREATE-IF-NOT-EXISTS.
+        tickvault_storage::depth_dynamic_diff_audit_persistence::ensure_depth_dynamic_diff_audit_table(
+            &config.questdb
+        ),
         tickvault_storage::ws_reconnect_audit_persistence::ensure_ws_reconnect_audit_table(
             &config.questdb
         ),
