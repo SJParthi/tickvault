@@ -2607,16 +2607,31 @@ async fn main() -> Result<()> {
             .as_ref()
             .map(|h| std::sync::Arc::clone(&h.snapshot_handle));
 
-        // Wave 5 Item 25/27 Phase B — base-1s writer for `movers_unified_1s`.
+        // Wave 5 Item 25/27 Phase B — base-1s writer for `movers_1s`.
         // ONE task. Subscribes to tick_broadcast, drains in-memory state at
         // 1Hz, ILP-appends to the base table; QuestDB auto-refreshes the 24
-        // mat views. Market-hours gated.
+        // mat views. Market-hours gated. 2026-05-02 PR-B: takes the
+        // instrument registry so the drain loop can populate
+        // `exchange_segment` (precise NSE_FNO/BSE_FNO/NSE_EQ/IDX_I) and
+        // `instrument_type` (precise OPTSTK/FUTIDX/INDEX/EQUITY) on every
+        // row. Skipped if the registry is missing (subscription_plan was
+        // not built — typically a boot path that doesn't load instruments).
         let movers_unified_shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
-        let _movers_unified_handle = tickvault_app::movers_unified_pipeline::spawn_movers_pipeline(
-            config.questdb.clone(),
-            tick_broadcast_sender.clone(),
-            std::sync::Arc::clone(&movers_unified_shutdown),
-        );
+        let _movers_unified_handle = if let Some(registry) = slow_registry.as_ref() {
+            Some(
+                tickvault_app::movers_unified_pipeline::spawn_movers_pipeline(
+                    config.questdb.clone(),
+                    tick_broadcast_sender.clone(),
+                    std::sync::Arc::clone(&movers_unified_shutdown),
+                    std::sync::Arc::clone(registry),
+                ),
+            )
+        } else {
+            warn!(
+                "movers_unified_pipeline NOT spawned — slow_registry is None (subscription_plan absent)"
+            );
+            None
+        };
 
         // Wave 5 Item 26 L2 LIVE — 16:30 IST bhavcopy cross-check task.
         // Post-market only (TradingCalendar gated); reads `movers_unified_1s`

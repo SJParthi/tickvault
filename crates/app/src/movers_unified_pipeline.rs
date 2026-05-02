@@ -53,7 +53,9 @@ use tickvault_common::constants::{
     IST_UTC_OFFSET_NANOS, IST_UTC_OFFSET_SECONDS, SECONDS_PER_DAY,
     TICK_PERSIST_END_SECS_OF_DAY_IST, TICK_PERSIST_START_SECS_OF_DAY_IST,
 };
+use tickvault_common::instrument_registry::InstrumentRegistry;
 use tickvault_common::tick_types::ParsedTick;
+use tickvault_common::types::ExchangeSegment;
 use tickvault_storage::movers_unified_writer::{MoversRow, MoversWriter, segment_code_to_char};
 
 /// Drain cadence — 1 second per the plan §"Item 25" base-1s table.
@@ -92,6 +94,29 @@ fn is_within_market_hours_ist() -> bool {
     (TICK_PERSIST_START_SECS_OF_DAY_IST..TICK_PERSIST_END_SECS_OF_DAY_IST).contains(&sec_of_day)
 }
 
+/// 2026-05-02 PR-B: Resolves `(exchange_segment, instrument_type)` for a
+/// `(security_id, segment_code)` tuple via the InstrumentRegistry composite
+/// key per I-P1-11. Returns `("UNKNOWN", "UNKNOWN")` when the registry has
+/// no entry — keeps both columns non-null for downstream selectors.
+///
+/// Pure function (no I/O, no allocations). O(1) papaya `get` per call;
+/// runs on the 1s drain (cold path), not the tick processor hot path.
+#[inline]
+#[must_use]
+fn lookup_segment_and_type(
+    registry: &InstrumentRegistry,
+    security_id: u32,
+    segment_code: u8,
+) -> (&'static str, &'static str) {
+    let Some(seg) = ExchangeSegment::from_byte(segment_code) else {
+        return ("UNKNOWN", "UNKNOWN");
+    };
+    let Some(inst) = registry.get_with_segment(security_id, seg) else {
+        return (seg.as_str(), "UNKNOWN");
+    };
+    (inst.exchange_segment.as_str(), inst.instrument_type_tag())
+}
+
 /// 1s-aligned IST wall-clock timestamp in nanoseconds.
 #[inline]
 fn now_ist_aligned_to_1s_nanos() -> i64 {
@@ -114,11 +139,17 @@ fn now_ist_aligned_to_1s_nanos() -> i64 {
 /// - Every 1s: drains the map → 1 ILP append per entry → flush.
 /// - Outside market hours: skips the drain.
 /// - On `shutdown.notified()`: flushes pending + exits cleanly.
-// TEST-EXEMPT: orchestration spawner; live-tested via `cargo run`. Internal helpers `is_within_market_hours_ist`, `now_ist_aligned_to_1s_nanos`, `MoversUnifiedState::last_traded_price_or_default` are unit-tested below.
+// TEST-EXEMPT: orchestration spawner; live-tested via `cargo run`. Internal helpers `is_within_market_hours_ist`, `now_ist_aligned_to_1s_nanos`, `MoversUnifiedState::last_traded_price_or_default`, `lookup_segment_and_type` are unit-tested below.
 pub fn spawn_movers_pipeline(
     questdb: QuestDbConfig,
     tick_broadcast: broadcast::Sender<ParsedTick>,
     shutdown: Arc<Notify>,
+    // 2026-05-02 PR-B: registry handle so the drain loop can populate
+    // `exchange_segment` (precise per-exchange tag, e.g. NSE_FNO vs BSE_FNO)
+    // and `instrument_type` (precise classification, e.g. OPTSTK vs FUTIDX
+    // vs INDEX vs EQUITY) on every `movers_1s` row. Lookup is O(1) papaya
+    // get + amortised on the 1s drain cadence (cold path).
+    registry: Arc<InstrumentRegistry>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         info!("movers_pipeline starting");
@@ -223,6 +254,8 @@ pub fn spawn_movers_pipeline(
 
                     for ((security_id, segment_code), st) in &entries {
                         let segment_char = segment_code_to_char(*segment_code);
+                        let (exchange_segment, instrument_type) =
+                            lookup_segment_and_type(&registry, *security_id, *segment_code);
                         let prev_close_f64 = f64::from(st.prev_close);
                         let last_price_f64 = f64::from(st.last_traded_price_or_default());
                         let change_pct = if prev_close_f64 > 0.0 {
@@ -236,6 +269,8 @@ pub fn spawn_movers_pipeline(
                             ts_nanos,
                             security_id: *security_id,
                             segment_char,
+                            exchange_segment,
+                            instrument_type,
                             open_interest: i64::from(st.open_interest),
                             oi_delta,
                             volume: i64::from(st.volume),
@@ -367,5 +402,103 @@ mod tests {
     fn test_market_hours_gate_returns_bool() {
         // Just a smoke test — function never panics.
         let _ = is_within_market_hours_ist();
+    }
+
+    // 2026-05-02 PR-B: ratchet tests for `lookup_segment_and_type` —
+    // populates the new `exchange_segment` + `instrument_type` SYMBOL
+    // columns on `movers_1s` from the InstrumentRegistry composite key.
+
+    use tickvault_common::instrument_registry::{SubscribedInstrument, SubscriptionCategory};
+    use tickvault_common::instrument_types::DhanInstrumentKind;
+    use tickvault_common::types::FeedMode;
+
+    fn build_registry_with(items: Vec<SubscribedInstrument>) -> InstrumentRegistry {
+        InstrumentRegistry::from_instruments(items)
+    }
+
+    fn nse_fno_option_instrument(security_id: u32) -> SubscribedInstrument {
+        SubscribedInstrument {
+            security_id,
+            exchange_segment: ExchangeSegment::NseFno,
+            category: SubscriptionCategory::StockDerivative,
+            display_label: format!("TEST_OPT_{security_id}"),
+            underlying_symbol: "RELIANCE".to_string(),
+            instrument_kind: Some(DhanInstrumentKind::OptionStock),
+            expiry_date: None,
+            strike_price: None,
+            option_type: None,
+            feed_mode: FeedMode::Quote,
+        }
+    }
+
+    fn idx_i_index_instrument(security_id: u32) -> SubscribedInstrument {
+        SubscribedInstrument {
+            security_id,
+            exchange_segment: ExchangeSegment::IdxI,
+            category: SubscriptionCategory::MajorIndexValue,
+            display_label: format!("TEST_IDX_{security_id}"),
+            underlying_symbol: "NIFTY".to_string(),
+            instrument_kind: None,
+            expiry_date: None,
+            strike_price: None,
+            option_type: None,
+            feed_mode: FeedMode::Ticker,
+        }
+    }
+
+    #[test]
+    fn test_lookup_segment_and_type_returns_nse_fno_optstk_for_stock_option() {
+        let reg = build_registry_with(vec![nse_fno_option_instrument(50000)]);
+        let (seg, typ) = lookup_segment_and_type(&reg, 50000, 2);
+        assert_eq!(seg, "NSE_FNO");
+        assert_eq!(typ, "OPTSTK");
+    }
+
+    #[test]
+    fn test_lookup_segment_and_type_returns_idx_i_index_for_major_index() {
+        let reg = build_registry_with(vec![idx_i_index_instrument(13)]);
+        let (seg, typ) = lookup_segment_and_type(&reg, 13, 0);
+        assert_eq!(seg, "IDX_I");
+        assert_eq!(typ, "INDEX");
+    }
+
+    #[test]
+    fn test_lookup_segment_and_type_returns_seg_str_with_unknown_type_when_registry_misses() {
+        // Registry has only id=13 IDX_I. Looking up id=99 NSE_FNO → segment
+        // resolves but instrument doesn't, so we get the segment string with
+        // "UNKNOWN" type. Selectors can still filter by exchange_segment.
+        let reg = build_registry_with(vec![idx_i_index_instrument(13)]);
+        let (seg, typ) = lookup_segment_and_type(&reg, 99, 2);
+        assert_eq!(seg, "NSE_FNO");
+        assert_eq!(typ, "UNKNOWN");
+    }
+
+    #[test]
+    fn test_lookup_segment_and_type_returns_double_unknown_for_invalid_segment_byte() {
+        // ExchangeSegment::from_byte(6) returns None per dhan-annexure-enums
+        // (gap between MCX_COMM=5 and BSE_CURRENCY=7).
+        let reg = build_registry_with(vec![idx_i_index_instrument(13)]);
+        let (seg, typ) = lookup_segment_and_type(&reg, 13, 6);
+        assert_eq!(seg, "UNKNOWN");
+        assert_eq!(typ, "UNKNOWN");
+    }
+
+    #[test]
+    fn test_lookup_segment_and_type_disambiguates_nse_fno_from_bse_fno_per_i_p1_11() {
+        // I-P1-11 scenario: same security_id on different segments. Lookup
+        // by composite key (security_id, segment) returns the correct entry.
+        let mut bse_fno = nse_fno_option_instrument(27);
+        bse_fno.exchange_segment = ExchangeSegment::BseFno;
+        bse_fno.underlying_symbol = "SENSEX".to_string();
+        let nse_fno = nse_fno_option_instrument(27);
+        let reg = build_registry_with(vec![nse_fno, bse_fno]);
+
+        // segment_code 2 = NSE_FNO
+        let (seg_nse, _) = lookup_segment_and_type(&reg, 27, 2);
+        assert_eq!(seg_nse, "NSE_FNO");
+
+        // segment_code 8 = BSE_FNO
+        let (seg_bse, _) = lookup_segment_and_type(&reg, 27, 8);
+        assert_eq!(seg_bse, "BSE_FNO");
     }
 }
