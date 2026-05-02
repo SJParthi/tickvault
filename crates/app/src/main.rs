@@ -5261,53 +5261,89 @@ async fn main() -> Result<()> {
                     snapshot_date: _,
                     instrument_count,
                     instruments,
-                } => match ws_pool_arc.as_ref() {
-                    Some(pool) => {
-                        let cmd = tickvault_core::websocket::SubscribeCommand::AddInstruments {
-                            instruments,
-                            feed_mode: tickvault_common::types::FeedMode::Quote,
-                        };
-                        match pool.dispatch_subscribe(cmd) {
-                            Some(conn_id) => info!(
-                                target_connection = conn_id,
+                } => {
+                    if matches!(
+                        config.subscription.scope,
+                        tickvault_common::config::SubscriptionScope::IndicesOnlyAllExpiries
+                    ) {
+                        // PR-E: stale snapshot from a prior FullUniverse boot. Don't
+                        // re-dispatch its stock F&O contracts — they'd be silently
+                        // dropped by the planner anyway, but dispatching wastes a
+                        // SubscribeCommand round-trip.
+                        info!(
+                            instrument_count,
+                            scope = config.subscription.scope.as_str(),
+                            "PR-E: Phase 2 recovery snapshot dispatch SKIPPED under \
+                             IndicesOnlyAllExpiries scope (prior-boot stock F&O chain ignored)"
+                        );
+                    } else {
+                        match ws_pool_arc.as_ref() {
+                            Some(pool) => {
+                                let cmd =
+                                    tickvault_core::websocket::SubscribeCommand::AddInstruments {
+                                        instruments,
+                                        feed_mode: tickvault_common::types::FeedMode::Quote,
+                                    };
+                                match pool.dispatch_subscribe(cmd) {
+                                    Some(conn_id) => info!(
+                                        target_connection = conn_id,
+                                        instrument_count,
+                                        "Phase 2 recovery: snapshot chain dispatched to pool"
+                                    ),
+                                    None => error!(
+                                        instrument_count,
+                                        "Phase 2 recovery: dispatch_subscribe returned None — \
+                                         snapshot chain will NOT be subscribed this boot"
+                                    ),
+                                }
+                            }
+                            None => warn!(
                                 instrument_count,
-                                "Phase 2 recovery: snapshot chain dispatched to pool"
-                            ),
-                            None => error!(
-                                instrument_count,
-                                "Phase 2 recovery: dispatch_subscribe returned None — \
-                                 snapshot chain will NOT be subscribed this boot"
+                                "Phase 2 recovery: no WebSocket pool — snapshot chain not dispatched"
                             ),
                         }
                     }
-                    None => warn!(
-                        instrument_count,
-                        "Phase 2 recovery: no WebSocket pool — snapshot chain not dispatched"
-                    ),
-                },
+                }
                 tickvault_app::phase2_recovery::RecoveryAction::SkipOffHours => {
                     info!("Phase 2 recovery: skip-off-hours — scheduler NOT spawned this boot");
                 }
                 tickvault_app::phase2_recovery::RecoveryAction::RunFreshPhase2
                 | tickvault_app::phase2_recovery::RecoveryAction::WaitForScheduler => {
-                    // O1 (2026-04-17) Phase A: Phase 2 subscription scheduler.
-                    // Sleeps until 09:13 IST (or runs immediately if already past 9:13
-                    // and within market hours), then waits for NIFTY/BANKNIFTY LTPs,
-                    // then computes the stock-F&O delta from the snapshotter's
-                    // buffer and dispatches the SubscribeCommand to the pool.
-                    //
-                    // Fix #8 (2026-04-24): trigger time moved 09:12 → 09:13 per
-                    // commit 0340a7c so the 09:12-minute bucket is fully closed
-                    // before Phase 2 reads the preopen buffer. Old "09:12" text
-                    // below was stale.
-                    let phase2_spot_prices = std::sync::Arc::clone(&shared_spot_prices);
-                    let phase2_calendar_for_dyn = std::sync::Arc::clone(&trading_calendar);
-                    let phase2_calendar_for_decision = std::sync::Arc::clone(&trading_calendar);
-                    let phase2_notifier = notifier.clone();
-                    let phase2_pool = ws_pool_arc.clone();
-                    let phase2_buffer = std::sync::Arc::clone(&preopen_buffer);
-                    tokio::spawn(async move {
-                        tickvault_core::instrument::phase2_scheduler::run_phase2_scheduler(
+                    // PR-E indices-only cleanup (2026-05-02): Phase 2 dispatches
+                    // STOCK F&O subscriptions (ATM ± 25 across 216 stocks). Under
+                    // SubscriptionScope::IndicesOnlyAllExpiries (the default since
+                    // Wave 5), the planner already drops stock derivatives and
+                    // running Phase 2 would silently no-op. Skip the spawn entirely
+                    // — saves the 09:13 wakeup task + buffer cloning + REST
+                    // fallback HTTP work for nothing.
+                    if matches!(
+                        config.subscription.scope,
+                        tickvault_common::config::SubscriptionScope::IndicesOnlyAllExpiries
+                    ) {
+                        info!(
+                            scope = config.subscription.scope.as_str(),
+                            "PR-E: Phase 2 scheduler SKIPPED under IndicesOnlyAllExpiries scope \
+                             (no stock F&O subscribed → no 09:13 dispatch needed)"
+                        );
+                    } else {
+                        // O1 (2026-04-17) Phase A: Phase 2 subscription scheduler.
+                        // Sleeps until 09:13 IST (or runs immediately if already past 9:13
+                        // and within market hours), then waits for NIFTY/BANKNIFTY LTPs,
+                        // then computes the stock-F&O delta from the snapshotter's
+                        // buffer and dispatches the SubscribeCommand to the pool.
+                        //
+                        // Fix #8 (2026-04-24): trigger time moved 09:12 → 09:13 per
+                        // commit 0340a7c so the 09:12-minute bucket is fully closed
+                        // before Phase 2 reads the preopen buffer. Old "09:12" text
+                        // below was stale.
+                        let phase2_spot_prices = std::sync::Arc::clone(&shared_spot_prices);
+                        let phase2_calendar_for_dyn = std::sync::Arc::clone(&trading_calendar);
+                        let phase2_calendar_for_decision = std::sync::Arc::clone(&trading_calendar);
+                        let phase2_notifier = notifier.clone();
+                        let phase2_pool = ws_pool_arc.clone();
+                        let phase2_buffer = std::sync::Arc::clone(&preopen_buffer);
+                        tokio::spawn(async move {
+                            tickvault_core::instrument::phase2_scheduler::run_phase2_scheduler(
                             phase2_spot_prices,
                             phase2_calendar_for_decision,
                             phase2_notifier,
@@ -5331,7 +5367,8 @@ async fn main() -> Result<()> {
                             None, // PROMPT A wires the pick_completed channel.
                         )
                         .await;
-                    });
+                        });
+                    } // end else for PR-E indices-only scope skip
                 }
             }
 
