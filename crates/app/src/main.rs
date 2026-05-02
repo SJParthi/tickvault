@@ -29,7 +29,7 @@ use tickvault_app::boot_helpers::{
     CONFIG_BASE_PATH, CONFIG_LOCAL_PATH, FAST_BOOT_WINDOW_END, FAST_BOOT_WINDOW_START, IstTimer,
     check_clock_drift, compute_market_close_sleep, create_error_log_writer, effective_ws_stagger,
     format_bind_addr, format_cross_match_details_grouped, format_timeframe_details,
-    format_violation_details, spawn_heartbeat_watchdog,
+    format_violation_details, should_emit_post_market_alert, spawn_heartbeat_watchdog,
 };
 use tickvault_app::{core_pinning, infra, observability, trading_pipeline};
 
@@ -1751,6 +1751,7 @@ async fn main() -> Result<()> {
             post_market_signal,
             ws_pool_arc,
             shutdown_notify,
+            trading_calendar.clone(),
         )
         .await;
     }
@@ -6962,6 +6963,7 @@ async fn main() -> Result<()> {
         post_market_signal,
         ws_pool_arc,
         shutdown_notify,
+        trading_calendar.clone(),
     )
     .await
 }
@@ -8415,6 +8417,10 @@ async fn run_shutdown_fast(
     // during intentional teardown).
     ws_pool_arc: Option<std::sync::Arc<WebSocketConnectionPool>>,
     shutdown_notify: std::sync::Arc<tokio::sync::Notify>,
+    // 2026-05-02: gate the 15:30 Post-Market Telegram on trading-day
+    // calendar (Saturday/Sunday/holiday suppression). See
+    // `boot_helpers::should_emit_post_market_alert`.
+    trading_calendar: std::sync::Arc<TradingCalendar>,
 ) -> Result<()> {
     let mode = "LIVE";
     info!(
@@ -8442,10 +8448,27 @@ async fn run_shutdown_fast(
 
     if shutdown_reason == "market_close" {
         info!("market close reached — disconnecting WebSockets, keeping API alive");
-        notifier.notify(NotificationEvent::Custom {
-            message: "<b>Post-Market</b>\nMarket closed — WebSockets disconnected, API stays up"
-                .to_string(),
-        });
+        // 2026-05-02: suppress the Post-Market Telegram on non-trading
+        // days (Saturday / Sunday / NSE holidays) where no market open
+        // ever occurred. The 15:30 sleep is wall-clock based and fires
+        // every day; without this gate operators see misleading
+        // `[HIGH] Market closed` alerts on weekends. See
+        // boot_helpers::should_emit_post_market_alert + ratchet tests.
+        let today_ist = chrono::Utc::now()
+            .with_timezone(&tickvault_common::trading_calendar::ist_offset())
+            .date_naive();
+        if should_emit_post_market_alert(&trading_calendar, today_ist) {
+            notifier.notify(NotificationEvent::Custom {
+                message:
+                    "<b>Post-Market</b>\nMarket closed — WebSockets disconnected, API stays up"
+                        .to_string(),
+            });
+        } else {
+            info!(
+                date = %today_ist,
+                "non-trading day — suppressing Post-Market Telegram emission"
+            );
+        }
 
         // Drain buffer: let in-flight ticks (last 15:29 candle) reach the
         // tick processor channel BEFORE aborting WebSocket read loops.
