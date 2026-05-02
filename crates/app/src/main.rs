@@ -27,10 +27,9 @@
 // Modules are declared in lib.rs for coverage instrumentation.
 use tickvault_app::boot_helpers::{
     CONFIG_BASE_PATH, CONFIG_LOCAL_PATH, FAST_BOOT_WINDOW_END, FAST_BOOT_WINDOW_START, IstTimer,
-    check_clock_drift, compute_market_close_sleep, create_error_log_writer,
-    create_rolling_log_writer, effective_ws_stagger, format_bind_addr,
-    format_cross_match_details_grouped, format_timeframe_details, format_violation_details,
-    spawn_heartbeat_watchdog,
+    check_clock_drift, compute_market_close_sleep, create_error_log_writer, effective_ws_stagger,
+    format_bind_addr, format_cross_match_details_grouped, format_timeframe_details,
+    format_violation_details, spawn_heartbeat_watchdog,
 };
 use tickvault_app::{core_pinning, infra, observability, trading_pipeline};
 
@@ -672,11 +671,21 @@ async fn main() -> Result<()> {
         };
 
     // File-based JSON log layer for Alloy → Loki ingestion.
-    // Daily-rotated: data/logs/app.YYYY-MM-DD.log. Old files beyond
-    // LOG_MAX_FILES are cleaned up at boot.
+    // HOURLY-rotated via `tracing_appender::rolling::Rotation::HOURLY`:
+    //   data/logs/app.YYYY-MM-DD-HH
+    // Industry-standard chunk size: a daily file routinely exceeded
+    // 100 MB during market hours and broke `less` / `grep` / IDE
+    // ergonomics. Hourly chunks bound any single file to ~5–10 MB.
+    // The retention sweeper (below the subscriber init) deletes files
+    // older than `APP_LOG_RETENTION_HOURS` to bound disk use.
+    //
+    // The WorkerGuard MUST live for the whole process — leaking into
+    // the static binds it to program lifetime without threading it
+    // through shutdown (mirrors the errors.jsonl pattern below).
     let file_log_layer: Option<Box<dyn tracing_subscriber::Layer<_> + Send + Sync + 'static>> =
-        match create_rolling_log_writer() {
-            Some(file) => {
+        match observability::init_app_log_appender(observability::ERRORS_JSONL_DIR) {
+            Ok((writer, guard)) => {
+                Box::leak(Box::new(guard));
                 let file_fmt = tracing_subscriber::fmt::layer()
                     .with_target(true)
                     .with_thread_ids(true)
@@ -684,10 +693,17 @@ async fn main() -> Result<()> {
                     .with_line_number(false)
                     .with_timer(ist_timer.clone())
                     .json()
-                    .with_writer(std::sync::Mutex::new(file));
+                    .with_writer(writer);
                 Some(Box::new(file_fmt))
             }
-            None => None,
+            Err(err) => {
+                // Tracing isn't initialized yet, so a warn here would
+                // route nowhere visible. Stay silent and continue —
+                // boot proceeds without the rolling app log layer
+                // (stdout + errors.log + errors.jsonl still work).
+                let _ = err;
+                None
+            }
         };
 
     // Error-only file layer: data/logs/errors.log (WARN + ERROR only).
@@ -797,6 +813,35 @@ async fn main() -> Result<()> {
                     ?err,
                     dir = %dir.display(),
                     "errors.jsonl retention sweep failed"
+                ),
+            }
+        }
+    });
+
+    // Hourly retention sweeper for the rolling app log
+    // (data/logs/app.YYYY-MM-DD-HH). Keeps 7 days of files (168 hourly
+    // chunks at ~5–10 MB each = ~0.8–1.7 GB cap on disk), matching the
+    // prior daily-file retention semantic of "keep 7 daily files".
+    tokio::spawn(async {
+        use std::path::Path;
+        use std::time::Duration;
+        const SWEEP_INTERVAL_SECS: u64 = 3600;
+        const RETENTION_HOURS: u64 = 168;
+        let dir = Path::new(observability::ERRORS_JSONL_DIR);
+        loop {
+            tokio::time::sleep(Duration::from_secs(SWEEP_INTERVAL_SECS)).await;
+            match observability::sweep_app_log_retention(dir, RETENTION_HOURS) {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(
+                    deleted = n,
+                    dir = %dir.display(),
+                    retention_hours = RETENTION_HOURS,
+                    "app log retention sweep"
+                ),
+                Err(err) => tracing::warn!(
+                    ?err,
+                    dir = %dir.display(),
+                    "app log retention sweep failed"
                 ),
             }
         }
