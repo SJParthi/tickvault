@@ -194,39 +194,52 @@ const VIEW_DEFS: &[ViewDef] = &[
     },
     // Hourly from 30m — offset '00:15' so buckets start at NSE market open
     // (09:15 IST) and match Dhan's /charts/intraday interval=60 timestamps.
+    //
+    // SOURCE FIX (PR #424, 2026-05-01): the hourly view's `OFFSET '00:15'`
+    // requires source buckets that align at 15-minute boundaries. Sourcing
+    // from `candles_30m` (buckets at 00:00, 00:30, ...) cannot map to a
+    // 1h bucket starting at 00:15 — QuestDB rejects this with HTTP 500.
+    // Sourcing from `candles_15m` (buckets at 00:00, 00:15, 00:30, 00:45)
+    // gives 1h-at-00:15 a clean 4× source-bucket aggregation.
     ViewDef {
         name: "candles_1h",
-        source: "candles_30m",
+        source: "candles_15m",
         interval: "1h",
         has_tick_count: false,
         align_offset: QUESTDB_HOURLY_ALIGN_OFFSET,
     },
-    // Multi-hour from 1h
+    // Multi-hour, daily — sourced from `candles_30m` at OFFSET '00:00'.
+    // Cannot source from `candles_1h` (OFFSET '00:15'): a 2h/3h/4h/1d
+    // bucket aligned at midnight would not map cleanly to source buckets
+    // aligned at 00:15. Sourcing from 30m at 00:00 keeps each downstream
+    // bucket aligned to midnight while still aggregating from a finer
+    // grain than candles_1s.
     ViewDef {
         name: "candles_2h",
-        source: "candles_1h",
+        source: "candles_30m",
         interval: "2h",
         has_tick_count: false,
         align_offset: QUESTDB_IST_ALIGN_OFFSET,
     },
     ViewDef {
         name: "candles_3h",
-        source: "candles_1h",
+        source: "candles_30m",
         interval: "3h",
         has_tick_count: false,
         align_offset: QUESTDB_IST_ALIGN_OFFSET,
     },
     ViewDef {
         name: "candles_4h",
-        source: "candles_1h",
+        source: "candles_30m",
         interval: "4h",
         has_tick_count: false,
         align_offset: QUESTDB_IST_ALIGN_OFFSET,
     },
-    // Daily from 1h
+    // Daily, sourced from `candles_30m` at OFFSET '00:00' for the same
+    // alignment reason as 2h/3h/4h. (48× 30m source buckets per day.)
     ViewDef {
         name: "candles_1d",
-        source: "candles_1h",
+        source: "candles_30m",
         interval: "1d",
         has_tick_count: false,
         align_offset: QUESTDB_IST_ALIGN_OFFSET,
@@ -587,15 +600,13 @@ async fn drop_all_views(client: &reqwest::Client, base_url: &str) {
 /// Names of the hourly-chain views that must be rebuilt together when
 /// `candles_1h`'s alignment offset changes. Listed in reverse dependency order
 /// so children are dropped before parents.
-const HOURLY_CHAIN_VIEWS: &[&str] = &[
-    "candles_1M",
-    "candles_7d",
-    "candles_1d",
-    "candles_4h",
-    "candles_3h",
-    "candles_2h",
-    "candles_1h",
-];
+///
+/// PR #424 source-chain fix: `candles_1h` no longer has any dependents in
+/// `VIEW_DEFS` (multi-hour and daily views now source from `candles_30m` for
+/// midnight alignment, weekly/monthly source from `candles_1d`). The set is
+/// thus a single-element list — only `candles_1h` itself needs dropping when
+/// its OFFSET '00:15' alignment changes.
+const HOURLY_CHAIN_VIEWS: &[&str] = &["candles_1h"];
 
 /// Checks whether `candles_1h` still uses the old `00:00` bucket alignment.
 ///
@@ -727,6 +738,32 @@ async fn execute_ddl_check_stale(
     }
 }
 
+/// Extracts QuestDB's `error` field from a JSON response body, falling back
+/// to a length-bounded substring of the raw body when parsing fails.
+///
+/// QuestDB `/exec` responses for failed DDL look like:
+///   `{"query":"<echo>","error":"<message>","position":NN}`
+/// The query echo is often hundreds of characters long, so the 200-char
+/// truncation that previously fed `tracing::warn!` clipped before reaching
+/// the actual error message — leaving operators with HTTP status only and
+/// no clue why QuestDB rejected the DDL.
+fn extract_questdb_error(body: &str) -> String {
+    // Cheap-path: look for `"error":"` and extract the quoted string. Avoids
+    // serde_json overhead for the common failure path.
+    if let Some(start) = body.find(r#""error":""#) {
+        let after_marker = start + r#""error":""#.len();
+        if let Some(rest) = body.get(after_marker..) {
+            // Find the closing quote, respecting that QuestDB's error
+            // messages don't contain backslash-escaped quotes in practice.
+            if let Some(end) = rest.find('"') {
+                return rest[..end].to_string();
+            }
+        }
+    }
+    // Fallback: length-bounded substring so log lines stay finite.
+    body.chars().take(800).collect()
+}
+
 /// Executes a single DDL statement against QuestDB. Returns true on success.
 ///
 /// Validates BOTH HTTP status code AND response body — QuestDB can return
@@ -740,7 +777,8 @@ async fn execute_ddl(client: &reqwest::Client, base_url: &str, sql: &str, label:
                 if body.contains("\"error\"") || body.contains("\"Error\"") {
                     warn!(
                         label,
-                        body = body.chars().take(200).collect::<String>(),
+                        questdb_error = %extract_questdb_error(&body),
+                        body_prefix = %body.chars().take(200).collect::<String>(),
                         "DDL returned HTTP 200 but body contains error — treating as failure"
                     );
                     false
@@ -754,7 +792,8 @@ async fn execute_ddl(client: &reqwest::Client, base_url: &str, sql: &str, label:
                 warn!(
                     label,
                     %status,
-                    body = body.chars().take(200).collect::<String>(),
+                    questdb_error = %extract_questdb_error(&body),
+                    body_prefix = %body.chars().take(200).collect::<String>(),
                     "DDL returned non-success"
                 );
                 false
@@ -1214,11 +1253,81 @@ mod tests {
     }
 
     #[test]
-    fn test_build_view_sql_1d_from_1h() {
+    fn test_build_view_sql_1d_from_30m_for_alignment() {
+        // PR #424 source-chain fix: candles_1d previously sourced from
+        // `candles_1h` but `candles_1h` is OFFSET '00:15' aligned, which
+        // doesn't divide cleanly into a daily bucket aligned at midnight
+        // ('00:00'). Sourcing from `candles_30m` (00:00 aligned) instead
+        // gives 48× source buckets per day, fully aligned.
         let def = VIEW_DEFS.iter().find(|d| d.name == "candles_1d").unwrap();
-        assert_eq!(def.source, "candles_1h");
+        assert_eq!(
+            def.source, "candles_30m",
+            "candles_1d must source from candles_30m for clean midnight alignment"
+        );
         assert_eq!(def.interval, "1d");
         assert!(!def.has_tick_count);
+    }
+
+    #[test]
+    fn test_hourly_chain_sources_match_pr424_alignment_fix() {
+        // PR #424 fix: the hourly chain's source-table choices encode
+        // the QuestDB SAMPLE BY alignment constraint that the source's
+        // bucket boundaries must divide cleanly into the target's
+        // bucket boundaries.
+        //
+        // - candles_1h:  OFFSET '00:15' → source candles_15m (15m boundaries
+        //                divide cleanly into 1h-at-:15)
+        // - candles_2h/3h/4h/1d: OFFSET '00:00' → source candles_30m
+        //                (30m boundaries divide cleanly into 2h/3h/4h/1d-at-:00)
+        // - candles_7d: OFFSET '00:00', source candles_1d (daily-aligned)
+        // - candles_1M: OFFSET '00:00', source candles_1d (daily-aligned)
+        let expected: &[(&str, &str)] = &[
+            ("candles_1h", "candles_15m"),
+            ("candles_2h", "candles_30m"),
+            ("candles_3h", "candles_30m"),
+            ("candles_4h", "candles_30m"),
+            ("candles_1d", "candles_30m"),
+            ("candles_7d", "candles_1d"),
+            ("candles_1M", "candles_1d"),
+        ];
+        for (name, expected_source) in expected {
+            let def = VIEW_DEFS
+                .iter()
+                .find(|d| d.name == *name)
+                .unwrap_or_else(|| panic!("view {name} not found in VIEW_DEFS"));
+            assert_eq!(
+                def.source, *expected_source,
+                "{name} must source from {expected_source} (PR #424 alignment fix)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_extract_questdb_error_returns_quoted_error_field() {
+        let body = r#"{"query":"CREATE MATERIALIZED VIEW...","error":"unsupported SAMPLE BY interval","position":42}"#;
+        assert_eq!(
+            extract_questdb_error(body),
+            "unsupported SAMPLE BY interval"
+        );
+    }
+
+    #[test]
+    fn test_extract_questdb_error_falls_back_to_truncated_body_on_no_marker() {
+        let body = "<html>500 Internal Server Error</html>";
+        let extracted = extract_questdb_error(body);
+        assert_eq!(extracted, "<html>500 Internal Server Error</html>");
+    }
+
+    #[test]
+    fn test_extract_questdb_error_handles_empty_body() {
+        assert_eq!(extract_questdb_error(""), "");
+    }
+
+    #[test]
+    fn test_extract_questdb_error_caps_fallback_length() {
+        let huge = "x".repeat(2000);
+        let extracted = extract_questdb_error(&huge);
+        assert!(extracted.chars().count() <= 800);
     }
 
     #[test]

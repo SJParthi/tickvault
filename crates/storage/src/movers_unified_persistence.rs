@@ -520,13 +520,25 @@ pub async fn ensure_movers_tables_and_views(questdb_config: &QuestDbConfig) {
     // be dropped (rare but observed in PR #421's first deployment), so
     // we sanity-check that none of the LEGACY_22TF_TIMEFRAMES exist as
     // standalone TABLES (different from mat views with the same name).
-    // We compare against the new-mat-view set: any `movers_{tf}` left
-    // behind whose `tf` is in 22tf-only-set (NOT in MOVERS_VIEW_TIMEFRAMES)
-    // is definitively a stale 22tf table that the cleanup didn't drop.
+    //
+    // Two exclusions to avoid false positives:
+    //   1. Names that are now legitimate MAT VIEWS (overlap with
+    //      MOVERS_VIEW_TIMEFRAMES, e.g. 5s, 15s, 30s, 1m..1h).
+    //   2. The new BASE TABLE name `movers_1s` itself — `1s` is in the
+    //      legacy 22tf list AND is the new base table. Its presence is
+    //      EXPECTED, not a stale-table issue. (Bug fix from the live
+    //      PR #423 boot which false-flagged `1s` as stale.)
     let legacy_22tf_only: Vec<&'static str> = LEGACY_22TF_TIMEFRAMES
         .iter()
         .copied()
         .filter(|tf| !MOVERS_VIEW_TIMEFRAMES.contains(tf))
+        // Exclude the new base table's timeframe so its presence isn't
+        // misreported. The base table is named `movers_1s` per
+        // QUESTDB_TABLE_MOVERS_1S; its timeframe suffix is `1s`.
+        .filter(|tf| {
+            let name = format!("movers_{tf}");
+            name != QUESTDB_TABLE_MOVERS_1S
+        })
         .collect();
     let stale: Vec<&'static str> = legacy_22tf_only
         .iter()
@@ -813,17 +825,45 @@ mod tests {
             .filter(|tf| !MOVERS_VIEW_TIMEFRAMES.contains(tf))
             .collect();
         // From the live boot of PR #421's first deploy, these are the
-        // four 22tf names not represented in the new mat-view set:
-        //   1s (the new BASE table — not a view)
+        // five 22tf names not represented in the new mat-view set:
+        //   1s (the new BASE table — not a view, audit must exclude it)
         //   2s, 3s, 10s, 20s (sub-minute names dropped from new design)
-        // The 1s overlap is intentional: movers_1s is a TABLE in the new
-        // design (the base), not a mat view. The audit checks against
-        // mat-view names so a movers_1s table doesn't trigger a false
-        // positive.
         for expected in ["1s", "2s", "3s", "10s", "20s"] {
             assert!(
                 legacy_only.contains(&expected),
                 "legacy-22tf-only set must contain `{expected}` (got: {legacy_only:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn test_audit_excludes_base_table_name_to_avoid_false_positive() {
+        // Regression guard for the PR #423 live-boot false positive: the
+        // audit reported `movers_1s` as a "stale 22tf table" but it IS
+        // the new base table. The Fix E audit must exclude
+        // `QUESTDB_TABLE_MOVERS_1S` from the candidate stale set.
+        //
+        // Reproduce the same filter chain the audit uses, then confirm
+        // `movers_1s` is NOT in the final candidate names.
+        let candidate_names: Vec<String> = LEGACY_22TF_TIMEFRAMES
+            .iter()
+            .copied()
+            .filter(|tf| !MOVERS_VIEW_TIMEFRAMES.contains(tf))
+            .filter(|tf| {
+                let name = format!("movers_{tf}");
+                name != QUESTDB_TABLE_MOVERS_1S
+            })
+            .map(|tf| format!("movers_{tf}"))
+            .collect();
+        assert!(
+            !candidate_names.iter().any(|n| n == QUESTDB_TABLE_MOVERS_1S),
+            "audit candidate set must NOT include the new base table `{QUESTDB_TABLE_MOVERS_1S}`"
+        );
+        // Sanity: the other 22tf-only names ARE still candidates.
+        for expected_stale in ["movers_2s", "movers_3s", "movers_10s", "movers_20s"] {
+            assert!(
+                candidate_names.iter().any(|n| n == expected_stale),
+                "audit candidate set must still include `{expected_stale}` (got: {candidate_names:?})"
             );
         }
     }
