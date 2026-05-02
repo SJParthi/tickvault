@@ -396,6 +396,34 @@ mod tests {
         assert!(state.current_set().is_empty());
     }
 
+    /// Smoke-tests `len`, `is_empty`, `current_set`, `count_on`,
+    /// `conn_for` together so the pub-fn-test-guard sees a test name
+    /// containing each method substring.
+    #[test]
+    fn test_dynamic_subscription_state_accessors_len_is_empty_current_set_count_on_conn_for() {
+        let mut state = DynamicSubscriptionState::new(depth_20_shape());
+        assert!(state.is_empty());
+        assert_eq!(state.len(), 0);
+        assert!(state.current_set().is_empty());
+        assert_eq!(state.count_on(0), Some(0));
+        assert_eq!(state.count_on(99), None, "out of range conn returns None");
+        assert!(state.conn_for((1, ExchangeSegment::NseFno)).is_none());
+
+        let initial = nse_fno_keys(1..=3);
+        let _ = state.diff(&initial).unwrap();
+
+        assert!(!state.is_empty());
+        assert_eq!(state.len(), 3);
+        assert_eq!(state.current_set().len(), 3);
+        // total count across conns equals len.
+        let total: u16 = (0..5).map(|c| state.count_on(c).unwrap()).sum();
+        assert_eq!(total as usize, state.len());
+        // Every key has a conn assignment.
+        for sid in 1..=3 {
+            assert!(state.conn_for((sid, ExchangeSegment::NseFno)).is_some());
+        }
+    }
+
     #[test]
     fn test_dynamic_subscription_state_initial_diff_is_all_adds() {
         let mut state = DynamicSubscriptionState::new(depth_20_shape());
