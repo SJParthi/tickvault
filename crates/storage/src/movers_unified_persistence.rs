@@ -761,7 +761,7 @@ mod tests {
     }
 
     #[test]
-    fn test_alter_add_exchange_segment_is_idempotent_per_observability_self_heal() {
+    fn test_movers_1s_alter_add_exchange_segment_ddl_is_idempotent_per_observability_self_heal() {
         let sql = movers_1s_alter_add_exchange_segment_ddl();
         assert!(
             sql.contains("ALTER TABLE movers_1s"),
@@ -778,7 +778,7 @@ mod tests {
     }
 
     #[test]
-    fn test_alter_add_instrument_type_is_idempotent_per_observability_self_heal() {
+    fn test_movers_1s_alter_add_instrument_type_ddl_is_idempotent_per_observability_self_heal() {
         let sql = movers_1s_alter_add_instrument_type_ddl();
         assert!(
             sql.contains("ALTER TABLE movers_1s"),
