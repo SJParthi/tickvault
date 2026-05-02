@@ -73,6 +73,7 @@ pub mod calendar_persistence;
 pub mod candle_persistence;
 pub mod constituency_persistence;
 pub mod deep_depth_persistence;
+pub mod depth_dynamic_diff_audit_persistence;
 pub mod depth_rebalance_audit_persistence;
 pub mod disk_health_watcher;
 pub mod greeks_persistence;
