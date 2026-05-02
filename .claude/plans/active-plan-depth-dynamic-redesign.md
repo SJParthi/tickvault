@@ -8,57 +8,121 @@
 
 ## Design Summary
 
-### Selector logic (shared between depth-20 and depth-200)
+### Selector logic — config-driven, runtime-scalable, segment-precise
 
 **Source:** the `movers` family — `movers_1m` materialized view
-(60s bucket off the `movers_1s` base table, which covers the entire
-instrument universe with columns `ts, security_id, segment, volume,
-change_pct, last_price, prev_close, open_interest, oi_delta`).
-NOT `option_movers` (legacy per-segment table, retired by Wave 5
-Item 25/27 — the `movers_*` family is the single source of truth now).
+(60s bucket off the `movers_1s` base table). NOT `option_movers`
+(retired). The `movers_*` family is the single source of truth.
 
-**Two-stage filter:** "top-by-volume cohort first, then re-rank by
-%change DESC within the cohort, then take K". Implemented as one
-QuestDB query + Rust post-filter for SENSEX exclusion (since
-`movers_1s.segment` collapses NSE_FNO and BSE_FNO both to `D`).
+**Schema upgrade (mandatory for this redesign):** add a precise
+`exchange_segment` column to `movers_1s` so the selector can filter
+by `NSE_FNO` / `BSE_FNO` / `NSE_EQ` / `IDX_I` directly without a
+post-query InstrumentRegistry lookup. The current `segment` SYMBOL
+column (single-char `D/E/I/...`) is too coarse — `D` collapses
+NSE_FNO and BSE_FNO together, blocking any future-proof per-exchange
+include/exclude.
 
 ```sql
--- Stage 1: top-N by volume across all derivatives (D segment)
-SELECT security_id, segment, volume, change_pct
+-- Idempotent at every boot (per observability-architecture.md schema-self-heal pattern)
+ALTER TABLE movers_1s ADD COLUMN IF NOT EXISTS exchange_segment SYMBOL CAPACITY 16 NOCACHE;
+-- DEDUP key unchanged: (ts, security_id, segment) — exchange_segment is derived from segment+source
+```
+
+The 24 materialized views off `movers_1s` propagate the new column
+automatically because they project all base columns. Writer code
+in `movers_unified_pipeline.rs` populates `exchange_segment` from
+the `InstrumentRegistry` lookup at write time (one lookup per tick,
+amortised cost on a non-hot-path 1s tick).
+
+**Selector is a pure data-driven config consumer.** No hardcoded
+segment names, no `if symbol == "SENSEX"` blocks. Config drives
+everything:
+
+```toml
+# config/base.toml — all values runtime-overridable per environment
+
+[depth_20.dynamic]
+conns                 = 5         # number of WS connections
+sids_per_conn         = 50        # capacity per conn
+# total_sids = conns * sids_per_conn = 250 (asserted at boot)
+
+[depth_20.dynamic.universe]
+exchange_segments     = ["NSE_FNO"]            # include list — add "BSE_FNO" to expand
+cohort_size           = 500                    # top-N by volume before re-rank
+rerank_metric         = "change_pct_abs_desc"  # or "change_pct_desc" / "volume_desc"
+window_secs           = 60
+
+[depth_200.dynamic]
+conns                 = 5
+sids_per_conn         = 1
+
+[depth_200.dynamic.universe]
+exchange_segments     = ["NSE_FNO"]
+cohort_size           = 100
+rerank_metric         = "change_pct_abs_desc"
+window_secs           = 60
+```
+
+```sql
+-- SQL is parameterised — no hardcoded segment list
+SELECT security_id, segment, exchange_segment, volume, change_pct
 FROM movers_1m
-WHERE ts > dateadd('s', -60, now())
-  AND segment = 'D'                  -- derivatives only (no equity, no index)
+WHERE ts > dateadd('s', -:window_secs, now())
+  AND exchange_segment IN (:exchange_segments)   -- bound from config
 ORDER BY volume DESC
-LIMIT 500;                            -- top-volume cohort
+LIMIT :cohort_size;
 ```
 
 ```rust
-// Stage 2 (Rust): SENSEX exclusion via InstrumentRegistry lookup, then
-// re-rank by change_pct DESC, take K.
+// Pure-data-driven Rust stage 2 — no segment string literals, no symbol blacklists
 fn select_top_k_dynamic(
-    cohort: &[MoversRow],          // result of Stage 1 (≤ 500 rows)
-    registry: &InstrumentRegistry,
-    k: usize,                       // 250 for depth-20, 5 for depth-200
+    cohort: &[MoversRow],
+    cfg: &DynamicSelectorConfig,
 ) -> Vec<SecurityId> {
-    cohort.iter()
-        .filter(|r| {
-            // exclude BSE_FNO (SENSEX) — InstrumentRegistry composite key
-            // (security_id, segment_code) gives the real ExchangeSegment
-            registry.get_with_segment(r.security_id, r.segment)
-                .map(|inst| inst.exchange_segment == ExchangeSegment::NseFno)
-                .unwrap_or(false)
-        })
-        .sorted_by(|a, b| b.change_pct.partial_cmp(&a.change_pct).unwrap())
-        .take(k)
+    let mut ranked: Vec<&MoversRow> = cohort.iter().collect();
+    cfg.rerank_metric.sort(&mut ranked);
+    ranked.iter()
+        .take(cfg.conns * cfg.sids_per_conn)
         .map(|r| r.security_id)
         .collect()
 }
 ```
 
-**One selector module, two callers** with different `k`. SENSEX
-exclusion is by `ExchangeSegment::NseFno` filter via the registry —
-future-proof against any new BSE F&O contracts that might also land
-in the `D` segment bucket.
+**Future expansion = config flip, zero code changes:**
+
+| Future change | Config edit |
+|---|---|
+| Add SENSEX (BSE_FNO derivatives) | `exchange_segments = ["NSE_FNO", "BSE_FNO"]` |
+| Add cash-equity stocks to depth-20 dynamic | `exchange_segments = ["NSE_FNO", "NSE_EQ"]` |
+| Add index spot tickers | `exchange_segments = [..., "IDX_I"]` |
+| Switch from %-change to %-change-abs | `rerank_metric = "change_pct_abs_desc"` |
+| Increase to 6 conns × 60 SIDs (360 total) | `conns = 6, sids_per_conn = 60` (after Dhan grants more conns) |
+| Tighter window | `window_secs = 30` |
+| Wider cohort | `cohort_size = 1000` |
+
+**Asserted invariants at boot (ratchet tests + runtime panics):**
+- `conns * sids_per_conn ≤ MAX_DEPTH_20_TOTAL_SIDS` (= 250 today, raised when Dhan limits change)
+- `conns ≤ DHAN_DEPTH_20_MAX_CONNECTIONS` (= 5 per `dhan-full-market-depth` rule 3)
+- `sids_per_conn ≤ DHAN_DEPTH_20_MAX_SIDS_PER_CONN` (= 50 per rule 3)
+- `exchange_segments` non-empty + every entry resolves to a valid `ExchangeSegment` enum variant
+- `cohort_size ≥ conns * sids_per_conn` (cohort must be at least as large as final K)
+- Same set of asserts for `depth_200` block with `conns = 5, sids_per_conn = 1` ceiling.
+
+**Precise data columns required on `movers_1s` (per operator demand):**
+
+| Column | Type | Purpose |
+|---|---|---|
+| `ts` | TIMESTAMP | designated, partition key |
+| `security_id` | LONG | composite-key part 1 |
+| `segment` | SYMBOL | composite-key part 2, single-char `D/E/I/...` (legacy, kept for DEDUP) |
+| `exchange_segment` | SYMBOL | **NEW** — precise `NSE_FNO`/`BSE_FNO`/`NSE_EQ`/`IDX_I`/... — selector filter target |
+| `volume` | LONG | cumulative session volume |
+| `change_pct` | DOUBLE | %-change for re-rank |
+| `last_price` | DOUBLE | renderable LTP |
+| `prev_close` | DOUBLE | for % computation cross-check |
+| `open_interest` | LONG | for OI-based future selectors |
+| `oi_delta` | LONG | first derivative |
+| `received_at` | TIMESTAMP | wall-clock arrival, forensic |
 
 ### Incremental resubscribe (the key piece)
 
@@ -165,7 +229,7 @@ Every 60s tick:
   - Tests: `test_depth_200_60s_tick_swaps_only_the_changed_contract`
   - Tests: `test_depth_200_excludes_sensex_via_segment_filter`
 
-### PR-D: Observability + ratchets
+### PR-D: Observability + ratchets + adversarial review
 
 - [ ] **7. Per-conn diff metrics + Telegram + audit table**
   - Files: `crates/storage/src/depth_dynamic_diff_audit_persistence.rs` (NEW — DEDUP UPSERT KEYS(ts, feed, conn_idx))
@@ -183,6 +247,21 @@ Every 60s tick:
   - Files: `.claude/rules/project/wave-5-error-codes.md` (DEPTH-20-DYN-03 reworded: now applies when top-250 set has fewer than 250; DEPTH-200-DYN-01 reworded: top-5 has fewer than 5)
   - Files: `.claude/plans/archive/active-plan-wave-5-indices-only.md` (move existing Wave 5 plan after PR-C ships)
   - Tests: `error_code_rule_file_crossref` (existing meta-test; will pass once rule files updated)
+
+- [ ] **9. Adversarial 3-agent review (mandatory per `wave-4-shared-preamble.md` §3)**
+  - Spawn IN PARALLEL on the diff BEFORE opening any PR AND again AFTER green CI:
+    - `hot-path-reviewer` agent — flags any `.clone()`, `Vec::new()`, `.collect()`, `format!()`, `Box`, `dyn`, unbounded channel on the 60s diff path. Report ≤ 400 words.
+    - `security-reviewer` agent — flags secret exposure in logs/labels, ILP injection, missing `Secret<T>`, unsafe blocks, missing input sanitization. Report ≤ 400 words.
+    - `general-purpose` (hostile bug-hunt) — race conditions on `slot_assignment` map, daily-reset edge cases, market-hours gates, edge-trigger correctness, false-OK signals, integration with Wave-2-A/B SubscribeRxGuard + pool supervisor. Report ≤ 600 words.
+  - Synthesize into CRITICAL / HIGH / MEDIUM / LOW / FALSE-POSITIVE table; fix every CRITICAL+HIGH inline before merge.
+  - Tests: N/A — this is a process gate, not a code gate. Verified by PR description containing the synthesized verdict table.
+
+### Per-Item Guarantee Matrix (mandatory, applies to every item 1-9)
+
+Every item carries the 15-row + 7-row matrix from
+`.claude/rules/project/per-wave-guarantee-matrix.md`. Mechanical
+enforcement: `bash .claude/hooks/per-item-guarantee-check.sh`
+(exit 2 = block) and `make wave-guarantee-check`.
 
 ## Verification
 
