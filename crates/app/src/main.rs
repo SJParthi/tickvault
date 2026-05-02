@@ -6124,7 +6124,14 @@ async fn main() -> Result<()> {
                 let anchor_cmd_senders = std::sync::Arc::clone(&depth_cmd_senders);
                 let anchor_twenty_max = config.subscription.twenty_depth_max_instruments;
                 // Wave 5 commit 5: feature flag for single-side fan-out at 09:13.
-                let anchor_single_side_enabled = config.features.depth_dynamic_top_volume;
+                // PR-C2 follow-up (hostile-bug-hunt integration finding): when
+                // pipeline_v2 is active, the unified diff dispatcher owns all
+                // swap traffic — the 09:13 anchor's per-underlying senders
+                // (HashMap<String, _>) are empty because v2 uses
+                // HashMap<u8, _>. Setting this flag false silences the
+                // per-underlying warn flood when v2 is on.
+                let anchor_single_side_enabled = config.features.depth_dynamic_top_volume
+                    && !config.features.depth_dynamic_pipeline_v2;
                 // Live LTPs for FINNIFTY + MIDCPNIFTY (the preopen buffer
                 // only captures NIFTY + BANKNIFTY IDX_I). At 09:13 the main
                 // feed has been streaming for ~13 min so these are present.
@@ -6444,13 +6451,17 @@ async fn main() -> Result<()> {
             {
                 let rebalance_notifier = notifier.clone();
                 let rebal_cmd_senders = std::sync::Arc::clone(&depth_cmd_senders);
+                let rebal_pipeline_v2_active = config.features.depth_dynamic_pipeline_v2;
                 // Wave 2 Item 9 (AUDIT-02) — clone QuestDB config into the
                 // rebalancer task scope so audit rows can be persisted.
                 let qcfg_for_rebalance = config.questdb.clone();
                 // Wave 5 commit 5: capture universe + feature flag for
                 // single-side Swap20 fan-out.
                 let rebal_universe = std::sync::Arc::clone(&rebal_consumer_universe);
-                let rebal_single_side_enabled = config.features.depth_dynamic_top_volume;
+                // PR-C2 follow-up: silence rebalancer Swap20/Swap200 dispatch when
+                // pipeline_v2 owns the swap traffic — unused, see anchor comment above.
+                let rebal_single_side_enabled =
+                    config.features.depth_dynamic_top_volume && !rebal_pipeline_v2_active;
                 let rebal_twenty_max = config.subscription.twenty_depth_max_instruments;
                 tokio::spawn(async move {
                     while rebalance_rx.changed().await.is_ok() {
