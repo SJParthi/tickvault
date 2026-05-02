@@ -102,7 +102,9 @@ pub const DEFAULT_FRESHNESS_WINDOW_SECS: u32 = 60;
 /// Pipeline configuration. Constructed at boot from
 /// `config/base.toml::[depth_20.dynamic]` or
 /// `config/base.toml::[depth_200.dynamic]`.
-#[derive(Debug, Clone)]
+// Note: no `#[derive(Debug)]` because `NotificationService` does not
+// implement Debug. Custom Debug impl below skips the notifier + registry.
+#[derive(Clone)]
 pub struct PipelineConfig {
     /// QuestDB connection details (HTTP /exec endpoint).
     pub questdb: QuestDbConfig,
@@ -124,6 +126,14 @@ pub struct PipelineConfig {
     /// SQL freshness window. Threaded from
     /// `[depth_*.dynamic.universe].window_secs`.
     pub window_secs: u32,
+    /// 2026-05-02 — operator-requested symbol resolution for diff events.
+    /// When `Some(_)`, every non-no-op cycle resolves added/removed SIDs
+    /// to display labels via O(1) `get_with_segment` lookup (per I-P1-11).
+    /// `None` keeps the legacy aggregate-counts-only behaviour for tests.
+    pub registry: Option<Arc<tickvault_common::instrument_registry::InstrumentRegistry>>,
+    /// Optional notifier for the diff Telegram event. Both `registry`
+    /// and `notifier` must be `Some(_)` for the event to fire.
+    pub notifier: Option<Arc<tickvault_core::notification::NotificationService>>,
 }
 
 /// Spawns the unified all-5-dynamic depth pipeline. Drives the diff
@@ -389,6 +399,33 @@ pub fn spawn_depth_dynamic_pool(
                                 audit_failing = true;
                             }
                         }
+                    }
+
+                    // 2026-05-02 — operator-requested symbol-level Telegram.
+                    // Resolve each Add/Remove op's (sid, segment) →
+                    // display_label via O(1) registry lookup (per I-P1-11),
+                    // build entries, fire DepthDynamicV2DiffApplied. If
+                    // either registry or notifier is None (e.g. test
+                    // fixtures), skip silently.
+                    if let (Some(registry), Some(notifier)) =
+                        (cfg.registry.as_ref(), cfg.notifier.as_ref())
+                    {
+                        let added_entries =
+                            resolve_op_entries(&ops, registry, |op| {
+                                matches!(op, DiffOp::Add { .. })
+                            });
+                        let removed_entries =
+                            resolve_op_entries(&ops, registry, |op| {
+                                matches!(op, DiffOp::Remove { .. })
+                            });
+                        notifier.notify(
+                            tickvault_core::notification::NotificationEvent::DepthDynamicV2DiffApplied {
+                                feed: cfg.label,
+                                added: added_entries,
+                                removed: removed_entries,
+                                retained_count: stats.retained,
+                            },
+                        );
                     }
 
                     // 2026-05-02 — operator-requested cadence transition.
@@ -781,6 +818,45 @@ fn is_within_market_hours_ist() -> bool {
     let now_ist = now_utc.saturating_add(i64::from(IST_UTC_OFFSET_SECONDS));
     let sec_of_day = (now_ist.rem_euclid(i64::from(SECONDS_PER_DAY))) as u32;
     (TICK_PERSIST_START_SECS_OF_DAY_IST..TICK_PERSIST_END_SECS_OF_DAY_IST).contains(&sec_of_day)
+}
+
+/// 2026-05-02 — operator-requested symbol resolution helper. Maps
+/// `DiffOp` entries (filtered by predicate) to `DepthDiffEntry` records
+/// via the instrument registry's O(1) composite-key lookup (per I-P1-11).
+/// Ops where the registry has no entry are silently dropped — defence
+/// in depth (production paths only emit IDs already in the registry).
+fn resolve_op_entries(
+    ops: &[DiffOp],
+    registry: &tickvault_common::instrument_registry::InstrumentRegistry,
+    predicate: impl Fn(&DiffOp) -> bool,
+) -> Vec<tickvault_core::notification::DepthDiffEntry> {
+    let mut out: Vec<tickvault_core::notification::DepthDiffEntry> = Vec::with_capacity(ops.len());
+    for op in ops {
+        if !predicate(op) {
+            continue;
+        }
+        let (sid, segment) = match op {
+            DiffOp::Add {
+                security_id,
+                exchange_segment,
+                ..
+            }
+            | DiffOp::Remove {
+                security_id,
+                exchange_segment,
+                ..
+            } => (*security_id, *exchange_segment),
+        };
+        if let Some(inst) = registry.get_with_segment(sid, segment) {
+            out.push(tickvault_core::notification::DepthDiffEntry {
+                security_id: sid,
+                exchange_segment: segment.as_str().to_string(),
+                display_label: inst.display_label.clone(),
+                underlying_symbol: inst.underlying_symbol.clone(),
+            });
+        }
+    }
+    out
 }
 
 /// Returns the current IST trading day as a `(year, ordinal_day)`
