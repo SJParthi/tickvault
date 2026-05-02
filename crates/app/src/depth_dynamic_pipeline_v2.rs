@@ -70,17 +70,18 @@ use tracing::{error, info, warn};
 
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::constants::{
-    IST_UTC_OFFSET_SECONDS, SECONDS_PER_DAY, TICK_PERSIST_END_SECS_OF_DAY_IST,
-    TICK_PERSIST_START_SECS_OF_DAY_IST,
+    IST_UTC_OFFSET_NANOS, IST_UTC_OFFSET_SECONDS, SECONDS_PER_DAY,
+    TICK_PERSIST_END_SECS_OF_DAY_IST, TICK_PERSIST_START_SECS_OF_DAY_IST,
 };
 use tickvault_common::types::ExchangeSegment;
 use tickvault_core::instrument::depth_dynamic_top_volume_selector::{
-    MoverRow, SelectorConfig, SubKey, build_cohort_sql, select_top_k_dynamic,
+    MoverRow, SelectorConfig, build_cohort_sql, select_top_k_dynamic,
 };
 use tickvault_core::instrument::dynamic_subscription_state::{
-    ConnIdx, DiffOp, DynamicSubscriptionState, PoolShape,
+    ConnIdx, DiffOp, DiffStats, DynamicSubscriptionState, PoolShape,
 };
 use tickvault_core::websocket::DepthCommand;
+use tickvault_storage::depth_dynamic_diff_audit_persistence::append_depth_dynamic_diff_audit_row;
 
 /// Re-selection cadence — pinned at 60s per the operator spec
 /// (matches the legacy v1 pipeline so dashboards/alerts unchanged).
@@ -192,7 +193,27 @@ pub fn spawn_depth_dynamic_pool(
                         retained = stats.retained,
                         "depth_dynamic_pool_v2 dispatching diff ops"
                     );
+
+                    // PR-D: emit Prom counters BEFORE dispatch so the
+                    // gauge value is visible to alert rules even if a
+                    // dispatch send subsequently fails.
+                    emit_diff_metrics(cfg.label, &stats);
+
                     dispatch_ops(cfg.label, &ops, &cmd_senders, cfg.shape.sids_per_conn).await;
+
+                    // PR-D: persist one audit row per non-no-op cycle.
+                    // Best-effort — audit failure must NOT halt the
+                    // pipeline (Wave 5 audit-finding Rule 5: flush
+                    // failures route to ERROR for Telegram, but the
+                    // persist is fire-and-forget here on the cold path).
+                    if let Err(err) = persist_diff_audit(&cfg, &ops, &stats).await {
+                        error!(
+                            code = "DEPTH-DYN-V2-AUDIT-01",
+                            label = cfg.label,
+                            ?err,
+                            "depth_dynamic_pool_v2 audit row persist failed"
+                        );
+                    }
                 }
             }
         }
@@ -409,6 +430,84 @@ fn build_remove_200_message(security_id: u32, exchange_segment: ExchangeSegment)
         exchange_segment.as_str(),
         security_id
     )
+}
+
+/// PR-D: emit per-cycle Prometheus counters + gauge.
+///
+/// Counters:
+/// - `tv_depth_dynamic_diff_adds_total{feed}` — cumulative SIDs added
+/// - `tv_depth_dynamic_diff_removes_total{feed}` — cumulative SIDs removed
+/// - `tv_depth_dynamic_diff_cycles_total{feed}` — total non-no-op cycles
+///
+/// Gauge:
+/// - `tv_depth_dynamic_set_size{feed}` — current `retained + added`
+///   (the size of `next_set` after this cycle)
+///
+/// All emitted on the cold path (60s cycle). Per audit-findings Rule 12,
+/// the Grafana panels wrap these counters in `increase(...[5m])` so a
+/// process restart doesn't lie to the operator.
+fn emit_diff_metrics(label: &'static str, stats: &DiffStats) {
+    metrics::counter!(
+        "tv_depth_dynamic_diff_adds_total",
+        "feed" => label
+    )
+    .increment(stats.added as u64);
+    metrics::counter!(
+        "tv_depth_dynamic_diff_removes_total",
+        "feed" => label
+    )
+    .increment(stats.removed as u64);
+    metrics::counter!(
+        "tv_depth_dynamic_diff_cycles_total",
+        "feed" => label
+    )
+    .increment(1);
+    let set_size = (stats.retained + stats.added) as f64;
+    metrics::gauge!(
+        "tv_depth_dynamic_set_size",
+        "feed" => label
+    )
+    .set(set_size);
+}
+
+/// PR-D: persist one audit row per non-no-op cycle. Captures the
+/// removed + added SID lists so the operator can reconstruct
+/// "what changed at time T" weeks later.
+async fn persist_diff_audit(
+    cfg: &PipelineConfig,
+    ops: &[DiffOp],
+    stats: &DiffStats,
+) -> anyhow::Result<()> {
+    // Collect SID lists from the ops vector.
+    let mut removed_sids: Vec<u32> = Vec::with_capacity(stats.removed);
+    let mut added_sids: Vec<u32> = Vec::with_capacity(stats.added);
+    for op in ops {
+        match op {
+            DiffOp::Remove { security_id, .. } => removed_sids.push(*security_id),
+            DiffOp::Add { security_id, .. } => added_sids.push(*security_id),
+        }
+    }
+    // Sort for deterministic audit output (the diff itself is already
+    // deterministic but defensive).
+    removed_sids.sort_unstable();
+    added_sids.sort_unstable();
+
+    let ts_nanos_ist = Utc::now()
+        .timestamp_nanos_opt()
+        .unwrap_or(0)
+        .saturating_add(IST_UTC_OFFSET_NANOS);
+
+    append_depth_dynamic_diff_audit_row(
+        &cfg.questdb,
+        ts_nanos_ist,
+        cfg.label,
+        stats.removed as u64,
+        stats.added as u64,
+        stats.retained as u64,
+        &removed_sids,
+        &added_sids,
+    )
+    .await
 }
 
 /// Returns `true` when `now` is inside the IST market-data persist
