@@ -1262,49 +1262,9 @@ rules:
       to determine root cause. Severity::High; 10-min cooldown.
 
   # -----------------------------------------------------------------------
-  # Phase 11 (2026-04-28) — Movers 22-TF
+  # MOVERS-22TF-01/02/03 rules removed 2026-05-02 along with the dead
+  # 22-tf pipeline (PR #421). Codes no longer exist as ErrorCode variants.
   # -----------------------------------------------------------------------
-
-  - name: movers-22tf-01-writer-ilp-failed-escalate
-    match:
-      code: MOVERS-22TF-01
-    action: escalate
-    runbook_path: .claude/rules/project/movers-22tf-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 1800
-    justification: >-
-      MOVERS-22TF-01 means a Movers22TfWriter ILP append or flush
-      failed. The rescue ring buffers the row so single events are
-      recoverable; sustained failure indicates QuestDB ILP TCP port
-      issue or schema drift. 30-min cooldown to avoid Telegram spam
-      while the rescue ring catches up.
-
-  - name: movers-22tf-02-scheduler-panic-escalate
-    match:
-      code: MOVERS-22TF-02
-    action: escalate
-    runbook_path: .claude/rules/project/movers-22tf-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 60
-    justification: >-
-      MOVERS-22TF-02 means one of the 22 snapshot scheduler tasks
-      panicked. The MoversSupervisor respawns within 5s. Sustained
-      respawns indicate deterministic panic — operator must read the
-      backtrace from data/logs/errors.jsonl.*.
-
-  - name: movers-22tf-03-universe-drift-escalate
-    match:
-      code: MOVERS-22TF-03
-    action: escalate
-    runbook_path: .claude/rules/project/movers-22tf-error-codes.md
-    confidence: 1.0
-    cooldown_secs: 1800
-    justification: >-
-      MOVERS-22TF-03 means tv_movers_universe_size drifted outside
-      24,324 ± 5% during market hours. Indicates universe build
-      regression OR stale Arc<MoversTracker> snapshot. Operator runs
-      `make doctor` section 9 to compare gauges + investigates the
-      latest InstrumentBuildSuccess Telegram event.
 
   # -----------------------------------------------------------------------
   # PR-B (2026-05-02) — boot-time depth-200 smoke test
@@ -1326,3 +1286,26 @@ rules:
       Severity::Critical; never auto-action — operator decides between
       `git revert` of PR #427 (restore SELF-token workaround) and
       Dhan support escalation.
+
+  # -----------------------------------------------------------------------
+  # PR-G (2026-05-02) — Phase 2 readiness pre-flight at 09:13:01 IST
+  # -----------------------------------------------------------------------
+
+  - name: phase2-ready-01-preflight-failed-escalate
+    match:
+      code: PHASE2-READY-01
+    action: escalate
+    runbook_path: .claude/rules/project/wave-5-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      PHASE2-READY-01 = Phase 2 readiness pre-flight failed at 09:13:01
+      IST. One or more of the 11 forward-looking pre-conditions for
+      the upcoming 09:15 / 09:15:30 / 09:16:30 milestones are not met.
+      The Telegram payload names exactly which checks failed (token
+      headroom, WS pool counts, QuestDB reachability, pre-open buffer
+      coverage, Phase 2 plan quality, subscribe ack rate, rescue ring
+      health, composite SLO). Operator has ~120 seconds until NSE
+      market open to act. Severity::Critical; never auto-action —
+      operator follows the per-check runbook section in
+      wave-5-error-codes.md.
