@@ -379,14 +379,14 @@ mod tests {
     // ---- select_top_k_dynamic ----
 
     #[test]
-    fn test_select_top_k_returns_empty_when_cohort_empty() {
+    fn test_select_top_k_dynamic_returns_empty_when_cohort_empty() {
         let cfg = default_cfg(10);
         let result = select_top_k_dynamic(&[], &cfg);
         assert!(result.is_empty());
     }
 
     #[test]
-    fn test_select_top_k_returns_empty_when_k_is_zero() {
+    fn test_select_top_k_dynamic_returns_empty_when_k_is_zero() {
         let mut cfg = default_cfg(0);
         cfg.k = 0;
         let cohort = vec![row(1, "NSE_FNO", "OPTSTK", 1_000_000, 5.0)];
@@ -395,7 +395,7 @@ mod tests {
     }
 
     #[test]
-    fn test_select_top_k_returns_all_rows_when_k_exceeds_cohort_size() {
+    fn test_select_top_k_dynamic_returns_all_rows_when_k_exceeds_cohort_size() {
         let cohort = vec![
             row(1, "NSE_FNO", "OPTSTK", 1_000_000, 5.0),
             row(2, "NSE_FNO", "OPTSTK", 500_000, 8.0),
@@ -406,7 +406,7 @@ mod tests {
     }
 
     #[test]
-    fn test_select_top_k_sorts_by_change_pct_desc() {
+    fn test_select_top_k_dynamic_sorts_by_change_pct_desc() {
         // Volume order is intentionally inverse to change_pct order to
         // verify Stage 2 re-rank.
         let cohort = vec![
@@ -426,7 +426,7 @@ mod tests {
     }
 
     #[test]
-    fn test_select_top_k_breaks_ties_by_security_id_ascending() {
+    fn test_select_top_k_dynamic_breaks_ties_by_security_id_ascending() {
         let cohort = vec![
             row(99, "NSE_FNO", "OPTSTK", 1_000_000, 5.0),
             row(50, "NSE_FNO", "OPTSTK", 1_000_000, 5.0),
@@ -442,7 +442,7 @@ mod tests {
     }
 
     #[test]
-    fn test_select_top_k_filters_by_instrument_type() {
+    fn test_select_top_k_dynamic_filters_by_instrument_type() {
         let cohort = vec![
             row(1, "NSE_FNO", "OPTSTK", 1_000_000, 10.0),
             row(2, "NSE_FNO", "EQUITY", 5_000_000, 20.0), // higher change_pct but EQUITY
@@ -458,7 +458,7 @@ mod tests {
     }
 
     #[test]
-    fn test_select_top_k_filters_by_exchange_segment() {
+    fn test_select_top_k_dynamic_filters_by_exchange_segment() {
         let cohort = vec![
             row(1, "NSE_FNO", "OPTSTK", 1_000_000, 10.0),
             row(2, "BSE_FNO", "OPTSTK", 5_000_000, 20.0), // SENSEX
@@ -474,7 +474,7 @@ mod tests {
     }
 
     #[test]
-    fn test_select_top_k_handles_nan_change_pct_by_sinking_to_bottom() {
+    fn test_select_top_k_dynamic_handles_nan_change_pct_by_sinking_to_bottom() {
         let cohort = vec![
             row(1, "NSE_FNO", "OPTSTK", 1_000_000, f64::NAN),
             row(2, "NSE_FNO", "OPTSTK", 500_000, 5.0),
@@ -487,7 +487,7 @@ mod tests {
     }
 
     #[test]
-    fn test_select_top_k_is_deterministic_across_calls() {
+    fn test_select_top_k_dynamic_is_deterministic_across_calls() {
         let cohort = vec![
             row(1, "NSE_FNO", "OPTSTK", 1_000_000, 5.0),
             row(2, "NSE_FNO", "OPTSTK", 1_000_000, 5.0),
@@ -502,7 +502,7 @@ mod tests {
     }
 
     #[test]
-    fn test_select_top_k_empty_filter_lists_match_all_rows() {
+    fn test_select_top_k_dynamic_empty_filter_lists_match_all_rows() {
         let cohort = vec![
             row(1, "NSE_FNO", "OPTSTK", 1_000_000, 5.0),
             row(2, "BSE_FNO", "EQUITY", 500_000, 10.0),
@@ -518,7 +518,7 @@ mod tests {
     }
 
     #[test]
-    fn test_select_top_k_supports_4_bucket_classification_options_only() {
+    fn test_select_top_k_dynamic_supports_4_bucket_classification_options_only() {
         // Operator's classification: any option = OPTIDX|OPTSTK|OPTFUT|OPTCUR
         let cohort = vec![
             row(1, "NSE_FNO", "OPTSTK", 5_000_000, 5.0),
@@ -544,7 +544,7 @@ mod tests {
     }
 
     #[test]
-    fn test_select_top_k_panics_when_k_exceeds_max() {
+    fn test_select_top_k_dynamic_panics_when_k_exceeds_max() {
         // Defensive bound check.
         let cfg = SelectorConfig {
             instrument_types: vec![],
