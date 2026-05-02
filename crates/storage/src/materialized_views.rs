@@ -107,8 +107,8 @@ struct ViewDef {
 /// candles_1m → 2m,3m,5m
 /// candles_5m → 10m,15m
 /// candles_15m → 30m
-/// candles_30m → 1h
-/// candles_1h → 2h,3h,4h,1d
+/// candles_1s → 1h (direct — '00:15' offset requires the physical base table)
+/// candles_30m → 2h,3h,4h,1d
 /// candles_1d → 7d,1M
 const VIEW_DEFS: &[ViewDef] = &[
     // Sub-minute from 1s base
@@ -192,18 +192,22 @@ const VIEW_DEFS: &[ViewDef] = &[
         has_tick_count: false,
         align_offset: QUESTDB_IST_ALIGN_OFFSET,
     },
-    // Hourly from 30m — offset '00:15' so buckets start at NSE market open
+    // Hourly from 1s base — offset '00:15' so buckets start at NSE market open
     // (09:15 IST) and match Dhan's /charts/intraday interval=60 timestamps.
     //
-    // SOURCE FIX (PR #424, 2026-05-01): the hourly view's `OFFSET '00:15'`
-    // requires source buckets that align at 15-minute boundaries. Sourcing
-    // from `candles_30m` (buckets at 00:00, 00:30, ...) cannot map to a
-    // 1h bucket starting at 00:15 — QuestDB rejects this with HTTP 500.
-    // Sourcing from `candles_15m` (buckets at 00:00, 00:15, 00:30, 00:45)
-    // gives 1h-at-00:15 a clean 4× source-bucket aggregation.
+    // SOURCE FIX (post-PR #424, 2026-05-02): sourcing from `candles_15m`
+    // (PR #424 attempt) was rejected by QuestDB with HTTP 400 + body
+    // `"base table is not referenced in materialized view query: candles_15m"`.
+    // QuestDB's mat-view-of-mat-view only works when the target's
+    // ALIGN-TO-CALENDAR OFFSET matches the source's offset. `candles_15m`
+    // is OFFSET '00:00'; `candles_1h` overrides to '00:15', so QuestDB
+    // requires the query to reference the actual physical BASE TABLE
+    // (`candles_1s`) — not an intermediate mat-view with a different
+    // alignment. Sourcing directly from `candles_1s` (one row per second)
+    // gives each 1h-at-:15 bucket a clean 3600× aggregation.
     ViewDef {
         name: "candles_1h",
-        source: "candles_15m",
+        source: "candles_1s",
         interval: "1h",
         has_tick_count: false,
         align_offset: QUESTDB_HOURLY_ALIGN_OFFSET,
@@ -1275,14 +1279,19 @@ mod tests {
         // bucket boundaries must divide cleanly into the target's
         // bucket boundaries.
         //
-        // - candles_1h:  OFFSET '00:15' → source candles_15m (15m boundaries
-        //                divide cleanly into 1h-at-:15)
+        // - candles_1h:  OFFSET '00:15' → source candles_1s directly.
+        //                QuestDB rejects mat-view-of-mat-view when the
+        //                offsets disagree (HTTP 400, "base table is not
+        //                referenced in materialized view query: candles_15m"
+        //                observed live 2026-05-02). The base table
+        //                `candles_1s` is one-second-granular, so 1h-at-:15
+        //                aggregates a clean 3600× source rows.
         // - candles_2h/3h/4h/1d: OFFSET '00:00' → source candles_30m
         //                (30m boundaries divide cleanly into 2h/3h/4h/1d-at-:00)
         // - candles_7d: OFFSET '00:00', source candles_1d (daily-aligned)
         // - candles_1M: OFFSET '00:00', source candles_1d (daily-aligned)
         let expected: &[(&str, &str)] = &[
-            ("candles_1h", "candles_15m"),
+            ("candles_1h", "candles_1s"),
             ("candles_2h", "candles_30m"),
             ("candles_3h", "candles_30m"),
             ("candles_4h", "candles_30m"),
