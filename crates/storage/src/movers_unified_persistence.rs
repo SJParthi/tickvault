@@ -89,9 +89,21 @@ const MIGRATION_MARKER_TABLE: &str = "movers_migration_2026_05_01";
 
 /// Base table DDL — `CREATE TABLE IF NOT EXISTS` per Item 25 spec.
 ///
-/// 10-column schema:
+/// 12-column schema:
 /// - `ts` — designated timestamp (IST epoch nanos / 1000 → micros)
 /// - `security_id` (LONG) + `segment` (SYMBOL) → composite key per I-P1-11
+/// - `exchange_segment` (SYMBOL) — precise per-exchange tag (e.g., `NSE_FNO`,
+///   `BSE_FNO`, `NSE_EQ`, `IDX_I`). Disambiguates the otherwise-collapsed
+///   single-char `segment` column where `D` means both NSE_FNO and BSE_FNO.
+/// - `instrument_type` (SYMBOL) — precise instrument classification per
+///   Dhan annexure (`INDEX`, `EQUITY`, `FUTIDX`, `FUTSTK`, `FUTCOM`,
+///   `FUTCUR`, `OPTIDX`, `OPTSTK`, `OPTFUT`, `OPTCUR`). Lets selectors
+///   filter "stock options only" (`OPTSTK`), "index futures only"
+///   (`FUTIDX`), or coarse buckets like "all options"
+///   (`OPTIDX|OPTSTK|OPTFUT|OPTCUR`) without InstrumentRegistry lookups
+///   per query. Required by the depth-dynamic top-volume selector
+///   (PR-B 2026-05-02). Schema-upgrade safe via
+///   `ALTER TABLE ADD COLUMN IF NOT EXISTS` self-heal at boot.
 /// - `open_interest`, `oi_delta` (LONG) — cumulative + first-derivative
 /// - `volume` (LONG) — cumulative since session open (Item 26 L1 pin)
 /// - `last_price`, `prev_close`, `change_pct` (DOUBLE) — rendered metrics
@@ -101,18 +113,46 @@ pub fn movers_1s_create_ddl() -> String {
     format!(
         // APPROVED: Cat 9 — canonical mat-view base table.
         "CREATE TABLE IF NOT EXISTS {QUESTDB_TABLE_MOVERS_1S} (\
-            ts            TIMESTAMP, \
-            security_id   LONG, \
-            segment       SYMBOL CAPACITY 16 NOCACHE, \
-            open_interest LONG, \
-            oi_delta      LONG, \
-            volume        LONG, \
-            last_price    DOUBLE, \
-            prev_close    DOUBLE, \
-            change_pct    DOUBLE, \
-            received_at   TIMESTAMP\
+            ts               TIMESTAMP, \
+            security_id      LONG, \
+            segment          SYMBOL CAPACITY 16 NOCACHE, \
+            exchange_segment SYMBOL CAPACITY 16 NOCACHE, \
+            instrument_type  SYMBOL CAPACITY 16 NOCACHE, \
+            open_interest    LONG, \
+            oi_delta         LONG, \
+            volume           LONG, \
+            last_price       DOUBLE, \
+            prev_close       DOUBLE, \
+            change_pct       DOUBLE, \
+            received_at      TIMESTAMP\
         ) TIMESTAMP(ts) PARTITION BY DAY \
         DEDUP UPSERT KEYS({DEDUP_KEY_MOVERS_1S});"
+    )
+}
+
+/// Idempotent self-heal for the `exchange_segment` column.
+///
+/// QuestDB's `ALTER TABLE ADD COLUMN IF NOT EXISTS` is a no-op when the
+/// column already exists. Run on every boot so existing databases (which
+/// pre-date the 2026-05-02 schema upgrade) gain the column without a
+/// one-shot migration. Per `observability-architecture.md` schema
+/// self-heal pattern.
+#[must_use]
+pub fn movers_1s_alter_add_exchange_segment_ddl() -> String {
+    format!(
+        "ALTER TABLE {QUESTDB_TABLE_MOVERS_1S} \
+         ADD COLUMN IF NOT EXISTS exchange_segment SYMBOL CAPACITY 16 NOCACHE;"
+    )
+}
+
+/// Idempotent self-heal for the `instrument_type` column. Same pattern as
+/// `movers_1s_alter_add_exchange_segment_ddl` — runs every boot and is a
+/// no-op when the column already exists.
+#[must_use]
+pub fn movers_1s_alter_add_instrument_type_ddl() -> String {
+    format!(
+        "ALTER TABLE {QUESTDB_TABLE_MOVERS_1S} \
+         ADD COLUMN IF NOT EXISTS instrument_type SYMBOL CAPACITY 16 NOCACHE;"
     )
 }
 
@@ -147,6 +187,8 @@ pub fn movers_view_ddl(timeframe: &str) -> String {
          SELECT \
             security_id, \
             segment, \
+            last(exchange_segment) AS exchange_segment, \
+            last(instrument_type) AS instrument_type, \
             ts, \
             last(last_price) AS last_price, \
             last(open_interest) AS open_interest, \
@@ -445,6 +487,53 @@ pub async fn ensure_movers_tables_and_views(questdb_config: &QuestDbConfig) {
         }
     }
 
+    // Step 1b (2026-05-02 PR-B): idempotent self-heal — adds the
+    // `exchange_segment` and `instrument_type` columns to `movers_1s` for
+    // databases that pre-date this schema upgrade.
+    // `ALTER TABLE ADD COLUMN IF NOT EXISTS` is a no-op when the column
+    // exists. The mat views are DROP-then-CREATE on every boot (Step 2
+    // below), so once the base columns are in place, every view
+    // automatically projects them via the new SELECT clauses in
+    // `movers_view_ddl`. No one-shot migration script required. Per
+    // `observability-architecture.md` schema-self-heal pattern.
+    for (column, alter_sql) in [
+        (
+            "exchange_segment",
+            movers_1s_alter_add_exchange_segment_ddl(),
+        ),
+        ("instrument_type", movers_1s_alter_add_instrument_type_ddl()),
+    ] {
+        match client
+            .get(&base_url)
+            .query(&[("query", alter_sql.as_str())])
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                info!(
+                    table = QUESTDB_TABLE_MOVERS_1S,
+                    column, "movers_1s column ensured (idempotent)"
+                );
+            }
+            Ok(resp) => {
+                warn!(
+                    table = QUESTDB_TABLE_MOVERS_1S,
+                    column,
+                    status = %resp.status(),
+                    "ALTER ADD COLUMN non-2xx — continuing best-effort"
+                );
+            }
+            Err(err) => {
+                error!(
+                    table = QUESTDB_TABLE_MOVERS_1S,
+                    column,
+                    ?err,
+                    "ALTER ADD COLUMN failed (HTTP error)"
+                );
+            }
+        }
+    }
+
     // Step 2: 24 materialized views — robust loop with DROP-before-CREATE
     // (Fix B: defensive against stale state from a prior failed boot),
     // retry-once-on-failure (Fix D: 400 Bad Request can be transient on
@@ -626,21 +715,121 @@ mod tests {
     }
 
     #[test]
-    fn test_base_ddl_includes_all_ten_columns() {
+    fn test_base_ddl_includes_all_twelve_columns() {
+        // 2026-05-02 PR-B: 10 → 12 columns. Added precision tags
+        // `exchange_segment` (NSE_FNO/BSE_FNO/NSE_EQ/IDX_I) and
+        // `instrument_type` (INDEX/EQUITY/FUTIDX/FUTSTK/.../OPTSTK) for the
+        // depth-dynamic top-volume selector.
         let ddl = movers_1s_create_ddl();
         for col in [
-            "ts            TIMESTAMP",
-            "security_id   LONG",
-            "segment       SYMBOL",
-            "open_interest LONG",
-            "oi_delta      LONG",
-            "volume        LONG",
-            "last_price    DOUBLE",
-            "prev_close    DOUBLE",
-            "change_pct    DOUBLE",
-            "received_at   TIMESTAMP",
+            "ts               TIMESTAMP",
+            "security_id      LONG",
+            "segment          SYMBOL",
+            "exchange_segment SYMBOL",
+            "instrument_type  SYMBOL",
+            "open_interest    LONG",
+            "oi_delta         LONG",
+            "volume           LONG",
+            "last_price       DOUBLE",
+            "prev_close       DOUBLE",
+            "change_pct       DOUBLE",
+            "received_at      TIMESTAMP",
         ] {
             assert!(ddl.contains(col), "base DDL must declare column `{col}`");
+        }
+    }
+
+    // 2026-05-02 PR-B: ratchet tests for the new schema columns + the
+    // idempotent ALTER ADD COLUMN self-heal helpers.
+
+    #[test]
+    fn test_base_ddl_declares_exchange_segment_with_symbol_capacity() {
+        let ddl = movers_1s_create_ddl();
+        assert!(
+            ddl.contains("exchange_segment SYMBOL CAPACITY 16 NOCACHE"),
+            "exchange_segment must be SYMBOL CAPACITY 16 NOCACHE per Wave 5 schema convention"
+        );
+    }
+
+    #[test]
+    fn test_base_ddl_declares_instrument_type_with_symbol_capacity() {
+        let ddl = movers_1s_create_ddl();
+        assert!(
+            ddl.contains("instrument_type  SYMBOL CAPACITY 16 NOCACHE"),
+            "instrument_type must be SYMBOL CAPACITY 16 NOCACHE — covers all 10 InstrumentType variants + UNKNOWN fallback"
+        );
+    }
+
+    #[test]
+    fn test_alter_add_exchange_segment_is_idempotent_per_observability_self_heal() {
+        let sql = movers_1s_alter_add_exchange_segment_ddl();
+        assert!(
+            sql.contains("ALTER TABLE movers_1s"),
+            "must target movers_1s base table"
+        );
+        assert!(
+            sql.contains("ADD COLUMN IF NOT EXISTS exchange_segment"),
+            "must use ADD COLUMN IF NOT EXISTS for self-heal pattern"
+        );
+        assert!(
+            sql.contains("SYMBOL CAPACITY 16 NOCACHE"),
+            "ALTER must declare same SYMBOL type as CREATE TABLE"
+        );
+    }
+
+    #[test]
+    fn test_alter_add_instrument_type_is_idempotent_per_observability_self_heal() {
+        let sql = movers_1s_alter_add_instrument_type_ddl();
+        assert!(
+            sql.contains("ALTER TABLE movers_1s"),
+            "must target movers_1s base table"
+        );
+        assert!(
+            sql.contains("ADD COLUMN IF NOT EXISTS instrument_type"),
+            "must use ADD COLUMN IF NOT EXISTS for self-heal pattern"
+        );
+        assert!(
+            sql.contains("SYMBOL CAPACITY 16 NOCACHE"),
+            "ALTER must declare same SYMBOL type as CREATE TABLE"
+        );
+    }
+
+    #[test]
+    fn test_view_ddl_projects_exchange_segment_via_last_aggregate() {
+        // Mat views must propagate the new columns. `last(exchange_segment)`
+        // matches the per-instrument-stable nature (an instrument's exchange
+        // doesn't change mid-session).
+        let sql = movers_view_ddl("1m");
+        assert!(
+            sql.contains("last(exchange_segment) AS exchange_segment"),
+            "mat view DDL must project exchange_segment via last() aggregate"
+        );
+    }
+
+    #[test]
+    fn test_view_ddl_projects_instrument_type_via_last_aggregate() {
+        let sql = movers_view_ddl("5m");
+        assert!(
+            sql.contains("last(instrument_type) AS instrument_type"),
+            "mat view DDL must project instrument_type via last() aggregate"
+        );
+    }
+
+    #[test]
+    fn test_view_ddl_projects_new_columns_for_every_timeframe() {
+        // Belt-and-suspenders: every one of the 24 timeframes must include
+        // both new precision columns. Catches any future regression where
+        // someone duplicates the DDL for a special timeframe and forgets.
+        for tf in MOVERS_VIEW_TIMEFRAMES {
+            let sql = movers_view_ddl(tf);
+            assert!(
+                sql.contains("last(exchange_segment) AS exchange_segment"),
+                "timeframe `{tf}` must project exchange_segment"
+            );
+            assert!(
+                sql.contains("last(instrument_type) AS instrument_type"),
+                "timeframe `{tf}` must project instrument_type"
+            );
         }
     }
 
