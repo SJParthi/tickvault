@@ -1472,6 +1472,46 @@ mod tests {
         assert_eq!(counts, vec![2, 2, 1, 1, 1]);
     }
 
+    /// 2026-05-02 — pin the equal-split guarantee for the all-expiries
+    /// universe (operator confirmed ~10-11K NIFTY+BANKNIFTY+SENSEX
+    /// contracts after `subscription_planner` Section 3 revert). Asserts
+    /// that for any instrument count `N` distributed across 5 conns,
+    /// the per-conn count differs by AT MOST 1.
+    ///
+    /// This is the property the operator asked about explicitly:
+    /// "split equally across entire 5 connections". Round-robin
+    /// (`idx % num_connections`) provides this guarantee mechanically;
+    /// this test pins it for several realistic post-revert universe
+    /// sizes so a future regression away from round-robin is caught.
+    #[test]
+    fn test_pool_round_robin_split_within_one_for_all_expiries_universe() {
+        // Realistic instrument counts after the 2026-05-02 all-expiries
+        // revert. Lower bound = ~10K, upper bound = ~11.3K (+ headroom
+        // for daily strike additions).
+        for n in [10_000_usize, 10_300, 10_500, 10_900, 11_300] {
+            let pool = WebSocketConnectionPool::new(
+                make_test_token_handle(),
+                "test-client".to_string(),
+                make_test_dhan_config(),
+                make_test_ws_config(),
+                make_instruments(n),
+                FeedMode::Ticker,
+                None,
+            )
+            .unwrap_or_else(|e| panic!("pool init failed for n={n}: {e:?}"));
+            let counts: Vec<usize> = pool.health().iter().map(|h| h.subscribed_count).collect();
+            assert_eq!(counts.len(), 5, "must always be 5 conns");
+            let total: usize = counts.iter().sum();
+            assert_eq!(total, n, "no instruments dropped during distribution");
+            let max = counts.iter().max().copied().unwrap_or(0);
+            let min = counts.iter().min().copied().unwrap_or(0);
+            assert!(
+                max - min <= 1,
+                "n={n}: per-conn count must differ by at most 1, got max={max} min={min}, counts={counts:?}"
+            );
+        }
+    }
+
     #[test]
     fn test_pool_config_exceeds_max_websocket_connections_constant() {
         // MAX_WEBSOCKET_CONNECTIONS is 5. Config of 10 should be capped.
