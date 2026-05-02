@@ -253,6 +253,71 @@ change).
 `crates/common/src/error_code.rs::Depth200Smoke01NoFramesAtBoot`,
 `.claude/triage/error-rules.yaml::depth200-smoke-01-no-frames-at-boot-escalate`.
 
+## PHASE2-READY-01 — Phase 2 readiness pre-flight failed (PR-G, 2026-05-02)
+
+**Trigger:** the Phase 2 readiness pre-flight task in
+`crates/core/src/instrument/phase2_readiness_check.rs::classify_readiness`
+returned `ReadinessOutcome::Failed` at 09:13:01 IST. One or more of
+the 11 forward-looking pre-conditions for the upcoming market-open
+milestones (09:15 / 09:15:30 / 09:16:30 IST) are not met.
+Severity::Critical. Single-fire per process — fires exactly once at
+09:13:01 IST (1 second after `Phase2Complete`).
+
+**Why it exists:** before this check, the operator only learned at
+09:16:30 IST (after the market-open self-test) that something was
+wrong — by which point the market had already opened with
+broken state and ticks had been missing for ~90 seconds. This
+pre-flight buys ~120 seconds of operator-actionable warning BEFORE
+NSE opens.
+
+**The 11 checks:**
+
+| # | Check | Failure cause |
+|---|---|---|
+| 1 | `token_expiry_headroom` | Token < 4h validity → mid-session DH-901 cascade |
+| 2 | `main_feed_pool` | < 5 main feed conns → ticks won't flow at 09:15 |
+| 3 | `depth_20_pool` | < 4 depth-20 conns → depth-20 ATM±24 missing |
+| 4 | `depth_200_pool` | < 5 depth-200 conns → depth-200 frames missing |
+| 5 | `order_update_ws` | Order WS disconnected or stale heartbeat |
+| 6 | `questdb_ilp` | QuestDB unreachable or last write > 60s ago |
+| 7 | `preopen_buffer_coverage` | < 95% of F&O stocks have a 09:00–09:12 price |
+| 8 | `phase2_plan_quality` | Phase 2 added 0 stocks OR > 5% skipped |
+| 9 | `subscribe_ack_rate` | Dhan rejected one or more subscribe batches |
+| 10 | `rescue_ring_health` | Rescue ring > 10% used at 09:13 (overflow risk) |
+| 11 | `composite_slo_score` | Composite score < 0.95 (hidden upstream issue) |
+
+**Triage:**
+
+1. Read the Telegram payload — `failed: [name1, name2, ...]` plus
+   `details:` with `expected/observed` for each failing check.
+2. Each failing check name maps to a specific runbook section:
+   - `token_expiry_headroom` → `AUTH-GAP-03` runbook
+   - `main_feed_pool` / `depth_20_pool` / `depth_200_pool` →
+     `disaster-recovery.md` Scenarios 5/6
+   - `order_update_ws` → `WS-GAP-01` runbook
+   - `questdb_ilp` → `BOOT-01` / `BOOT-02` runbooks
+   - `preopen_buffer_coverage` → `depth-subscription.md` 2026-04-22
+     Updates §5 (pre-open buffer + REST fallback)
+   - `phase2_plan_quality` → `PHASE2-01` runbook
+   - `subscribe_ack_rate` → check Dhan rate-limit (DH-904) +
+     Dhan account status
+   - `rescue_ring_health` → `STORAGE-GAP-03` runbook
+   - `composite_slo_score` → `SLO-02` runbook (named the weakest
+     dimension already)
+3. Operator has ~120 seconds (until 09:15:00 IST) to act before
+   NSE opens. If the issue is not fixable in that window, the
+   operator at least KNOWS the next 4 minutes will partially fail.
+
+**Auto-triage safe:** NO (Severity::Critical). Mitigation requires
+operator decision per the failing-check-specific runbook.
+
+**Source:**
+- `crates/core/src/instrument/phase2_readiness_check.rs`
+- `crates/common/src/error_code.rs::Phase2Ready01PreflightFailed`
+- `crates/core/src/notification/events.rs::Phase2ReadinessFailed` /
+  `Phase2ReadinessPassed`
+- `.claude/triage/error-rules.yaml::phase2-ready-01-preflight-failed-escalate`
+
 ## Cross-references
 
 - `.claude/plans/active-plan-wave-5-indices-only.md` Items 4, 5, 6, 9
