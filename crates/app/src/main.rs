@@ -685,7 +685,15 @@ async fn main() -> Result<()> {
     let file_log_layer: Option<Box<dyn tracing_subscriber::Layer<_> + Send + Sync + 'static>> =
         match observability::init_app_log_appender(observability::ERRORS_JSONL_DIR) {
             Ok((writer, guard)) => {
+                use tracing_subscriber::Layer as _;
                 Box::leak(Box::new(guard));
+                // Per-target DEBUG suppression for the FILE appender only.
+                // Stdout + errors.log + errors.jsonl keep the configured
+                // global level. See `build_app_log_filter_directive` for
+                // the suppression policy and rationale.
+                let file_filter_directive =
+                    tickvault_app::boot_helpers::build_app_log_filter_directive(log_filter);
+                let file_filter = tracing_subscriber::EnvFilter::new(file_filter_directive);
                 let file_fmt = tracing_subscriber::fmt::layer()
                     .with_target(true)
                     .with_thread_ids(true)
@@ -693,7 +701,8 @@ async fn main() -> Result<()> {
                     .with_line_number(false)
                     .with_timer(ist_timer.clone())
                     .json()
-                    .with_writer(writer);
+                    .with_writer(writer)
+                    .with_filter(file_filter);
                 Some(Box::new(file_fmt))
             }
             Err(err) => {

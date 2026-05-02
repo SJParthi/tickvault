@@ -404,6 +404,65 @@ pub fn create_log_file_writer() -> Option<std::fs::File> {
     create_log_file_writer_at(APP_LOG_FILE_PATH)
 }
 
+/// Builds the EnvFilter directive string for the rolling app-log file.
+///
+/// Why this exists separately from the global `RUST_LOG`:
+///
+/// The historical-fetch + candle-aggregation paths emit hundreds of DEBUG
+/// lines per minute (`candle batch flushed to QuestDB`, `skipped invalid
+/// candles in API response`, etc.). With a global `RUST_LOG=debug` those
+/// alone produce ~7 MB/hour in `data/logs/app.YYYY-MM-DD-HH`, exceeding
+/// IDE code-insight thresholds (2.56 MB) and slowing `less` / `grep`.
+///
+/// This filter applies to the FILE appender ONLY. Stdout (when enabled)
+/// + `errors.log` + `errors.jsonl.YYYY-MM-DD-HH` keep the configured
+/// global level — DEBUG is preserved for triage at the source.
+///
+/// # Arguments
+/// * `base_level` — the user's configured `[logging] level` (`info`,
+///   `debug`, etc.). Used as the default for targets not explicitly
+///   downgraded.
+///
+/// # Returns
+/// A directive string suitable for `tracing_subscriber::EnvFilter::new()`.
+///
+/// # Suppression policy (highest-volume targets first)
+///
+/// | Target | Reason |
+/// |---|---|
+/// | `tickvault_storage::candle_persistence` | candle batch flushed (~hundreds/min during backfill) |
+/// | `tickvault_storage::tick_persistence` | similar tick flush noise |
+/// | `tickvault_core::historical::candle_fetcher` | per-API-response skipped-invalid debug |
+/// | `tickvault_core::option_chain::client` | per-request rate-limit + fetched debug |
+/// | `tickvault_core::auth::secret_manager` | per-secret SSM fetch debug |
+/// | `aws_config::profile::credentials` | already suppressed at `warn` for credential leak |
+/// | `aws_smithy_http_client` / `aws_smithy_runtime` | HTTP request/response noise |
+/// | `hyper_util::client::legacy::pool` | connection-pool internal noise |
+/// | `rustls::client` | TLS handshake DEBUG |
+///
+/// All other targets (including `tickvault_core::pipeline`,
+/// `tickvault_trading::oms`, `tickvault_core::websocket`) keep
+/// `base_level` so trading hot-path DEBUG remains in the file.
+#[must_use]
+pub fn build_app_log_filter_directive(base_level: &str) -> String {
+    // Order matters: later entries win when they overlap. We start with
+    // the user's base level and then layer per-target downgrades on top.
+    format!(
+        "{base},\
+         tickvault_storage::candle_persistence=info,\
+         tickvault_storage::tick_persistence=info,\
+         tickvault_core::historical::candle_fetcher=info,\
+         tickvault_core::option_chain::client=info,\
+         tickvault_core::auth::secret_manager=info,\
+         aws_config::profile::credentials=warn,\
+         aws_smithy_http_client=warn,\
+         aws_smithy_runtime=warn,\
+         hyper_util::client::legacy=warn,\
+         rustls::client=warn",
+        base = base_level
+    )
+}
+
 /// Opens (or creates) a log file at the given path for Alloy consumption.
 ///
 /// Creates parent directory if needed. Returns `None` if the directory
@@ -774,6 +833,78 @@ mod tests {
     use super::*;
     use std::net::SocketAddr;
     use tickvault_core::historical::cross_verify::{CrossMatchMismatch, TimeframeCoverage};
+
+    // -----------------------------------------------------------------------
+    // build_app_log_filter_directive
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_build_app_log_filter_directive_starts_with_base_level() {
+        let d = build_app_log_filter_directive("info");
+        assert!(
+            d.starts_with("info,"),
+            "directive must lead with base level: {d}"
+        );
+    }
+
+    #[test]
+    fn app_log_filter_with_debug_base_still_suppresses_noisy_targets() {
+        let d = build_app_log_filter_directive("debug");
+        assert!(d.starts_with("debug,"));
+        // The whole point: even with `debug` as the base, the chatty
+        // targets must be downgraded.
+        assert!(d.contains("tickvault_storage::candle_persistence=info"));
+        assert!(d.contains("tickvault_core::historical::candle_fetcher=info"));
+        assert!(d.contains("aws_config::profile::credentials=warn"));
+    }
+
+    #[test]
+    fn app_log_filter_parses_as_valid_envfilter_directive() {
+        // Belt-and-suspenders: the directive string must be parseable
+        // by tracing_subscriber::EnvFilter or boot will silently fall
+        // back to defaults.
+        for base in ["trace", "debug", "info", "warn", "error"] {
+            let d = build_app_log_filter_directive(base);
+            let parsed = tracing_subscriber::EnvFilter::try_new(&d);
+            assert!(
+                parsed.is_ok(),
+                "directive must parse for base={base}: {d}\nerr: {:?}",
+                parsed.err()
+            );
+        }
+    }
+
+    #[test]
+    fn app_log_filter_aws_credentials_kept_at_warn_to_prevent_credential_leak() {
+        // Regression: aws_config::profile::credentials logs the
+        // access_key_id at INFO. We MUST keep it at warn or higher
+        // in the file appender to avoid persisting that to disk.
+        for base in ["trace", "debug", "info"] {
+            let d = build_app_log_filter_directive(base);
+            assert!(
+                d.contains("aws_config::profile::credentials=warn"),
+                "base={base}: aws credentials target must be downgraded to warn: {d}"
+            );
+        }
+    }
+
+    #[test]
+    fn app_log_filter_does_not_suppress_trading_hot_path() {
+        // The trading + websocket + pipeline hot paths MUST keep the
+        // base level — operators need that DEBUG for triage.
+        let d = build_app_log_filter_directive("debug");
+        assert!(!d.contains("tickvault_trading=info"));
+        assert!(!d.contains("tickvault_core::pipeline=info"));
+        assert!(!d.contains("tickvault_core::websocket=info"));
+    }
+
+    #[test]
+    fn app_log_filter_directive_has_no_trailing_comma() {
+        // tracing-subscriber tolerates trailing commas in some versions
+        // but not all; defensive contract.
+        let d = build_app_log_filter_directive("info");
+        assert!(!d.ends_with(','), "directive must not end with comma: {d}");
+    }
 
     fn make_mismatch(
         symbol: &str,
