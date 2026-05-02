@@ -178,6 +178,16 @@ pub fn spawn_depth_dynamic_pool(
         // safety-critical, but avoids spurious 250-op churn at 09:00.
         let mut last_seen_ist_day = current_ist_trading_day();
 
+        // 2026-05-02 — operator-requested two-phase cadence. First tick
+        // of each trading day fires at 09:15:01 IST (initial subscribe);
+        // every subsequent tick fires at the next :00 minute boundary
+        // (09:16:00, 09:17:00, …). `realigned_to_minute` flips true
+        // after the first in-market cycle dispatches, triggering the
+        // interval reset to the minute-boundary schedule. Reset to
+        // false on daily-rollover so tomorrow's 09:15:01 fires the
+        // special first cycle again.
+        let mut realigned_to_minute = false;
+
         // PR-C2 follow-up (hostile-bug-hunt fix L1) — off-hours sleep
         // edge-trigger. Tracks the in-market state to fire a single INFO
         // when the loop enters off-hours sleep, and a single INFO when
@@ -241,6 +251,10 @@ pub fn spawn_depth_dynamic_pool(
                         tick.set_missed_tick_behavior(
                             tokio::time::MissedTickBehavior::Delay,
                         );
+                        // Reset the minute-boundary realignment flag so
+                        // tomorrow's first cycle fires at the special
+                        // 09:15:01 anchor, then re-aligns to :00 boundaries.
+                        realigned_to_minute = false;
                         // Skip the rest of this cycle — next tick.tick()
                         // will fire at today's 09:15:01.
                         continue;
@@ -375,6 +389,30 @@ pub fn spawn_depth_dynamic_pool(
                                 audit_failing = true;
                             }
                         }
+                    }
+
+                    // 2026-05-02 — operator-requested cadence transition.
+                    // After the FIRST in-market cycle dispatches (at
+                    // 09:15:01), re-anchor the interval to the next
+                    // wall-clock minute boundary so subsequent cycles
+                    // fire at 09:16:00, 09:17:00, … instead of
+                    // 09:16:01, 09:17:01, … (the natural drift of
+                    // interval_at(09:15:01, 60s)).
+                    if !realigned_to_minute {
+                        let next_minute = compute_next_minute_boundary_instant();
+                        info!(
+                            code = "DEPTH-DYN-V2-CADENCE",
+                            label = cfg.label,
+                            "first cycle complete — re-anchoring to minute-boundary cadence"
+                        );
+                        tick = tokio::time::interval_at(
+                            next_minute,
+                            Duration::from_secs(RESELECT_INTERVAL_SECS),
+                        );
+                        tick.set_missed_tick_behavior(
+                            tokio::time::MissedTickBehavior::Delay,
+                        );
+                        realigned_to_minute = true;
                     }
                 }
             }
@@ -761,6 +799,39 @@ fn current_ist_trading_day() -> i64 {
 /// at least one populated 1-second bucket from the first F&O ticks.
 const FIRST_CYCLE_SECS_OF_DAY_IST: u32 = 9 * 3600 + 15 * 60 + 1;
 
+/// 2026-05-02 — operator-requested cadence:
+///   * Tick 1 at 09:15:01 IST (initial subscribe — uses
+///     `compute_first_cycle_instant_today`)
+///   * Tick 2 at 09:16:00 IST (first minute-aligned re-rebalance)
+///   * Tick 3 at 09:17:00 IST
+///   * Tick N at 09:14+N:00 IST
+///
+/// After the first cycle fires at 09:15:01, the interval is re-anchored
+/// to the next minute boundary so subsequent ticks land on `:00`
+/// seconds — matching the operator's stated "from 9.16.00 dynamic
+/// movement should happen" cadence.
+///
+/// Returns an Instant for the next wall-clock minute boundary
+/// (`current_second_of_minute == 0`). Always >= `Instant::now()`.
+#[inline]
+#[must_use]
+fn compute_next_minute_boundary_instant() -> tokio::time::Instant {
+    let now_utc = Utc::now().timestamp();
+    // Seconds into the current minute, in [0, 59].
+    let secs_into_minute = now_utc.rem_euclid(60);
+    // If we're EXACTLY at :00, fire 60s from now (the next :00). Avoids
+    // a zero-duration sleep that could fire mid-cycle.
+    let secs_to_boundary = if secs_into_minute == 0 {
+        60
+    } else {
+        60 - secs_into_minute
+    };
+    // APPROVED: secs_to_boundary is in [1, 60], fits u64.
+    #[allow(clippy::cast_sign_loss)]
+    let dur = Duration::from_secs(secs_to_boundary as u64);
+    tokio::time::Instant::now() + dur
+}
+
 /// 2026-05-02 — operator-requested first-cycle alignment.
 ///
 /// Returns a `tokio::time::Instant` for the next 09:15:01 IST anchor
@@ -992,6 +1063,41 @@ mod tests {
         assert!(
             diff.as_secs() <= 1,
             "two consecutive calls produced Instants {diff:?} apart — expected ≤ 1s"
+        );
+    }
+
+    /// Operator-requested cadence: minute-boundary alignment AFTER the
+    /// first 09:15:01 cycle. The helper must return an Instant that is
+    /// 1..=60 seconds away from now — never zero, never more than 60.
+    #[test]
+    fn test_compute_next_minute_boundary_instant_within_one_minute_window() {
+        let before = tokio::time::Instant::now();
+        let target = compute_next_minute_boundary_instant();
+        let delta = target.saturating_duration_since(before);
+        assert!(
+            delta.as_secs() >= 1 && delta.as_secs() <= 60,
+            "next minute boundary must be 1..=60s away, got {delta:?}"
+        );
+    }
+
+    /// Ratchet: minute boundary helper aligns to wall-clock :00 seconds.
+    /// Two consecutive calls separated by < 1s must produce Instants
+    /// that target the SAME minute boundary (within sub-second jitter).
+    #[test]
+    fn test_compute_next_minute_boundary_instant_aligns_to_wall_clock() {
+        let a = compute_next_minute_boundary_instant();
+        let b = compute_next_minute_boundary_instant();
+        let diff = if b > a {
+            b.duration_since(a)
+        } else {
+            a.duration_since(b)
+        };
+        // Both calls hit the same :00 boundary unless we crossed a
+        // second boundary mid-test (rare but possible). Either way
+        // the gap is at most 1 second.
+        assert!(
+            diff.as_secs() <= 1,
+            "two consecutive minute-boundary calls produced Instants {diff:?} apart"
         );
     }
 
