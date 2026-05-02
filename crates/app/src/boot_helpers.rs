@@ -33,9 +33,6 @@ pub const APP_LOG_FILE_PATH: &str = "data/logs/app.log";
 /// Log directory for rotated log files.
 pub const LOG_DIRECTORY: &str = "data/logs";
 
-/// Prefix for daily-rotated app log files (`app.YYYY-MM-DD.log`).
-pub const LOG_FILE_PREFIX: &str = "app";
-
 /// Error-only log file name (WARN + ERROR only, for fast debugging).
 pub const ERROR_LOG_FILE_PATH: &str = "data/logs/errors.log";
 
@@ -440,29 +437,6 @@ pub fn create_log_file_writer_at(log_file_path: &str) -> Option<std::fs::File> {
     }
 }
 
-/// Creates a daily-rotated log file writer.
-///
-/// File pattern: `data/logs/app.YYYY-MM-DD.log`. Each boot day gets its own
-/// file, enabling easy grep by date. Old files beyond `LOG_MAX_FILES` are
-/// cleaned up automatically.
-///
-/// Falls back to the fixed `APP_LOG_FILE_PATH` if date formatting fails
-/// (should never happen — defensive only).
-// TEST-EXEMPT: cold-path boot function that creates files — covered by
-// integration tests via `create_log_file_writer_at` and manual boot verification.
-pub fn create_rolling_log_writer() -> Option<std::fs::File> {
-    let today = chrono::Utc::now()
-        .with_timezone(&ist_offset())
-        .format("%Y-%m-%d")
-        .to_string();
-    let rolling_path = format!("{LOG_DIRECTORY}/{LOG_FILE_PREFIX}.{today}.log");
-
-    // Best-effort cleanup of old rotated files.
-    cleanup_old_log_files(LOG_DIRECTORY, LOG_FILE_PREFIX, LOG_MAX_FILES);
-
-    create_log_file_writer_at(&rolling_path)
-}
-
 /// Creates (or opens) the error-only log file for fast debugging.
 ///
 /// Contains WARN + ERROR events only, giving operators a small grep-friendly
@@ -472,61 +446,6 @@ pub fn create_rolling_log_writer() -> Option<std::fs::File> {
 pub fn create_error_log_writer() -> Option<std::fs::File> {
     create_log_file_writer_at(ERROR_LOG_FILE_PATH)
 }
-
-/// Removes old daily log files beyond the retention limit.
-///
-/// Scans `log_dir` for files matching `{prefix}.YYYY-MM-DD.log`, sorts by
-/// date descending, and removes files older than `max_files` days.
-/// Best-effort — errors are printed to stderr (tracing not yet initialized).
-///
-// TEST-EXEMPT: cold-path boot function — runs once before tracing is initialized,
-// deletes old log files via std::fs. Best-effort, no side effects on failure.
-/// O(1) EXEMPT: cold path, runs once at boot before tracing is initialized.
-pub fn cleanup_old_log_files(log_dir: &str, prefix: &str, max_files: u32) {
-    let dir = std::path::Path::new(log_dir);
-    let entries = match std::fs::read_dir(dir) {
-        Ok(entries) => entries,
-        Err(_) => return, // Directory doesn't exist yet — nothing to clean.
-    };
-
-    // Collect matching log files: `{prefix}.YYYY-MM-DD.log`
-    let pattern_prefix = format!("{prefix}.");
-    let mut log_files: Vec<std::path::PathBuf> = entries
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path())
-        .filter(|path| {
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            name.starts_with(&pattern_prefix)
-                && name.ends_with(".log")
-                && name.len() == pattern_prefix.len() + "YYYY-MM-DD.log".len()
-        })
-        .collect();
-
-    // Sort descending by filename (date is embedded, lexicographic = chronological).
-    log_files.sort_unstable_by(|a, b| b.cmp(a));
-
-    // Remove files beyond the retention limit.
-    for old_file in log_files.iter().skip(max_files as usize) {
-        // O(1) EXEMPT: begin — cold path, logging bootstrap
-        #[allow(clippy::print_stderr)] // APPROVED: tracing not yet initialized at this point
-        if let Err(err) = std::fs::remove_file(old_file) {
-            eprintln!(
-                "warning: cannot remove old log file {}: {err}",
-                old_file.display()
-            );
-        }
-        // O(1) EXEMPT: end
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Log rotation constants
-// ---------------------------------------------------------------------------
-
-/// Maximum log file size in bytes (50 MB).
-pub const LOG_MAX_SIZE_BYTES: u64 = 50 * 1024 * 1024;
-/// Maximum number of rotated log files to keep.
-pub const LOG_MAX_FILES: u32 = 7;
 
 // ---------------------------------------------------------------------------
 // Clock drift check
@@ -2520,12 +2439,6 @@ mod tests {
         assert_eq!(super::CLOCK_DRIFT_THRESHOLD_SECS, 2);
     }
 
-    #[test]
-    fn test_log_rotation_configured() {
-        assert_eq!(super::LOG_MAX_SIZE_BYTES, 50 * 1024 * 1024);
-        assert_eq!(super::LOG_MAX_FILES, 7);
-    }
-
     // -----------------------------------------------------------------------
     // Clock drift constants
     // -----------------------------------------------------------------------
@@ -2542,23 +2455,6 @@ mod tests {
             super::CLOCK_DRIFT_REFERENCE_URL.starts_with("https://"),
             "clock drift reference URL must use HTTPS"
         );
-    }
-
-    // -----------------------------------------------------------------------
-    // Log rotation constants relationships
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_log_max_size_is_at_least_1mb() {
-        assert!(
-            super::LOG_MAX_SIZE_BYTES >= 1024 * 1024,
-            "max log size must be at least 1MB"
-        );
-    }
-
-    #[test]
-    fn test_log_max_files_is_at_least_one() {
-        assert!(super::LOG_MAX_FILES >= 1, "must keep at least 1 log file");
     }
 
     // -----------------------------------------------------------------------
