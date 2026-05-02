@@ -182,12 +182,24 @@ fn push_quoted_list(out: &mut String, items: &[String]) {
             out.push_str(", ");
         }
         out.push('\'');
-        // Defensive: filter out single-quote chars (SQL injection guard).
-        // Config-supplied values should be enum-like uppercase tokens
-        // (NSE_FNO, OPTSTK, etc.) but this protects against a malformed
-        // base.toml.
+        // Defensive (security-reviewer 2026-05-02 MEDIUM 1+2): SQL-quote
+        // escape (double `'` to `''`) AND filter ASCII / Latin-1 control
+        // characters. Config-supplied values are operator-controlled and
+        // should be enum-like uppercase tokens (NSE_FNO, OPTSTK, etc.) but
+        // this matches the `sanitize_audit_string` defensive standard so
+        // a malformed base.toml cannot inject SQL or wire-format chaos.
         for ch in item.chars() {
-            if ch != '\'' {
+            // Strip ASCII C0 (0x00..0x1F), DEL (0x7F), and C1 (0x80..0x9F)
+            // control characters — never legal in any ExchangeSegment /
+            // InstrumentType enum value.
+            if ch.is_control() {
+                continue;
+            }
+            if ch == '\'' {
+                // Standard SQL quote escape — doubled apostrophe.
+                out.push('\'');
+                out.push('\'');
+            } else {
                 out.push(ch);
             }
         }
@@ -375,29 +387,51 @@ mod tests {
     }
 
     #[test]
-    fn test_build_cohort_sql_strips_single_quotes_from_input() {
-        // Defensive SQL-injection guard: caller-supplied single quotes
-        // must be stripped so the SQL stays well-formed even on a
-        // malformed config file. A bare leading single quote in the
-        // input would prematurely close our wrapping quote and inject.
+    fn test_build_cohort_sql_doubles_single_quotes_per_sql_standard() {
+        // Defensive SQL-injection guard (security-reviewer 2026-05-02
+        // MEDIUM 1 fix): caller-supplied single quotes must be DOUBLED
+        // (`''`) per the standard SQL escape, NOT stripped. The previous
+        // strip-based approach was injection-safe but semantically wrong
+        // for legitimate apostrophes (e.g. an input value `O'HARA`) and
+        // diverged from `sanitize_audit_string`. With doubling, the
+        // input `'OR 1=1` becomes `''OR 1=1` inside the wrapping `'...'`
+        // → emitted as `'''OR 1=1'` — quotes balanced, injection
+        // impossible (the doubled `''` is a literal apostrophe in SQL).
         let sql = build_cohort_sql(&["'OR 1=1".to_string()], &[], 100, 60);
-        // Expected: input `'OR 1=1` becomes `OR 1=1` after stripping;
-        // wrapped in our own quotes the IN-list emits `'OR 1=1'`. The
-        // user's leading single quote is gone (no `''` double-quote),
-        // so SQL stays balanced.
+        // The SQL must contain the doubled-quote escape for the leading apostrophe.
         assert!(
-            !sql.contains("''OR 1=1"),
-            "leading single quote must be stripped (no double-quote pair), got: {sql}"
+            sql.contains("'''OR 1=1'"),
+            "input leading single quote must be doubled per SQL standard, got: {sql}"
         );
-        // Belt-and-suspenders: count of single quotes in the IN-list
-        // chunk is exactly 2 (our wrapping pair) for a single value.
+        // Quote count in the IN-list chunk must be EVEN (every quote is
+        // either wrapping or part of a doubled escape) — odd count would
+        // mean a stray closing quote and broken SQL.
         let in_list_chunk = sql.split("IN (").nth(1).unwrap_or("");
         let close_paren = in_list_chunk.find(')').unwrap_or(in_list_chunk.len());
         let chunk = &in_list_chunk[..close_paren];
         let quotes = chunk.chars().filter(|c| *c == '\'').count();
         assert_eq!(
-            quotes, 2,
-            "exactly 2 wrapping quotes for one stripped value, got: {chunk}"
+            quotes % 2,
+            0,
+            "quotes must be balanced (even count) — found {quotes} in: {chunk}"
+        );
+    }
+
+    #[test]
+    fn test_build_cohort_sql_strips_control_characters() {
+        // Security-reviewer 2026-05-02 MEDIUM 2 fix: ASCII C0 (0x00..0x1F),
+        // DEL (0x7F), and C1 (0x80..0x9F) control chars must be filtered.
+        // Operator-controlled config should never legitimately contain
+        // these in a segment / instrument-type token.
+        let evil = "NSE\nFNO\r\0\x07\x1b\x7fX".to_string();
+        let sql = build_cohort_sql(&[evil], &[], 100, 60);
+        assert!(
+            sql.contains("'NSEFNOX'"),
+            "control characters must be stripped, leaving 'NSEFNOX', got: {sql}"
+        );
+        assert!(
+            !sql.contains('\n') && !sql.contains('\r') && !sql.contains('\0'),
+            "no raw control chars must appear in the SQL, got: {sql}"
         );
     }
 

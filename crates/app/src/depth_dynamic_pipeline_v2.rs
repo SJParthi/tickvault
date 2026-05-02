@@ -90,15 +90,14 @@ const RESELECT_INTERVAL_SECS: u64 = 60;
 /// HTTP timeout for the QuestDB selector query.
 const QUESTDB_SELECT_TIMEOUT_SECS: u64 = 10;
 
-/// Stage-1 SQL cohort size — top-N-by-volume rows fetched before
-/// Stage-2 re-rank. Pinned at 500 (5× the largest K=250 used by
-/// depth-20) so the cohort always has enough rows for Stage-2 to
-/// produce a stable top-K under filter attrition.
-const COHORT_SIZE: usize = 500;
+/// Default Stage-1 cohort size if config does not set one. Matches
+/// the prior hardcoded constant and is a 5× safety margin over the
+/// largest K=250 used by depth-20.
+pub const DEFAULT_COHORT_SIZE: usize = 500;
 
-/// SQL freshness window — only consider `movers_1m` rows from the
-/// last 60 seconds. Filters stale post-market data.
-const FRESHNESS_WINDOW_SECS: u32 = 60;
+/// Default SQL freshness window if config does not set one. Filters
+/// stale post-market data.
+pub const DEFAULT_FRESHNESS_WINDOW_SECS: u32 = 60;
 
 /// Pipeline configuration. Constructed at boot from
 /// `config/base.toml::[depth_20.dynamic]` or
@@ -116,6 +115,15 @@ pub struct PipelineConfig {
     /// Conventional values: `"depth-20-dynamic"` and
     /// `"depth-200-dynamic"`.
     pub label: &'static str,
+    /// Stage-1 SQL cohort size — top-N-by-volume rows fetched before
+    /// Stage-2 re-rank. Threaded from
+    /// `[depth_*.dynamic.universe].cohort_size`. (Security-review
+    /// MEDIUM 3 fix — was previously a hardcoded constant that
+    /// silently ignored the operator's config.)
+    pub cohort_size: usize,
+    /// SQL freshness window. Threaded from
+    /// `[depth_*.dynamic.universe].window_secs`.
+    pub window_secs: u32,
 }
 
 /// Spawns the unified all-5-dynamic depth pipeline. Drives the diff
@@ -138,6 +146,14 @@ pub fn spawn_depth_dynamic_pool(
         let mut tick = tokio::time::interval(Duration::from_secs(RESELECT_INTERVAL_SECS));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+        // PR-C2 follow-up (hostile-bug-hunt fix C2/M1) — rising-edge
+        // failure gates. Each error emits ERROR (Telegram) ONLY on the
+        // rising edge; sustained failure logs at WARN (no Telegram);
+        // recovery emits INFO. Audit-findings 2026-04-17 Rule 4.
+        let mut cohort_failing = false;
+        let mut diff_failing = false;
+        let mut audit_failing = false;
+
         loop {
             tokio::select! {
                 biased;
@@ -150,14 +166,32 @@ pub fn spawn_depth_dynamic_pool(
                         continue;
                     }
                     let cohort = match fetch_cohort_from_questdb(&cfg).await {
-                        Ok(c) => c,
+                        Ok(c) => {
+                            if cohort_failing {
+                                info!(
+                                    label = cfg.label,
+                                    "depth_dynamic_pool_v2 cohort fetch RECOVERED"
+                                );
+                                cohort_failing = false;
+                            }
+                            c
+                        }
                         Err(err) => {
-                            error!(
-                                code = "DEPTH-DYN-V2-01",
-                                label = cfg.label,
-                                ?err,
-                                "depth_dynamic_pool_v2 cohort fetch failed"
-                            );
+                            if cohort_failing {
+                                warn!(
+                                    label = cfg.label,
+                                    ?err,
+                                    "depth_dynamic_pool_v2 cohort fetch still failing (rising-edge already fired)"
+                                );
+                            } else {
+                                error!(
+                                    code = "DEPTH-DYN-V2-01",
+                                    label = cfg.label,
+                                    ?err,
+                                    "depth_dynamic_pool_v2 cohort fetch failed"
+                                );
+                                cohort_failing = true;
+                            }
                             continue;
                         }
                     };
@@ -171,14 +205,32 @@ pub fn spawn_depth_dynamic_pool(
                         continue;
                     }
                     let (ops, stats) = match state.diff(&next_set) {
-                        Ok(r) => r,
+                        Ok(r) => {
+                            if diff_failing {
+                                info!(
+                                    label = cfg.label,
+                                    "depth_dynamic_pool_v2 diff RECOVERED"
+                                );
+                                diff_failing = false;
+                            }
+                            r
+                        }
                         Err(err) => {
-                            error!(
-                                code = "DEPTH-DYN-V2-02",
-                                label = cfg.label,
-                                ?err,
-                                "depth_dynamic_pool_v2 diff failed (over capacity?)"
-                            );
+                            if diff_failing {
+                                warn!(
+                                    label = cfg.label,
+                                    ?err,
+                                    "depth_dynamic_pool_v2 diff still failing (rising-edge already fired)"
+                                );
+                            } else {
+                                error!(
+                                    code = "DEPTH-DYN-V2-02",
+                                    label = cfg.label,
+                                    ?err,
+                                    "depth_dynamic_pool_v2 diff failed (over capacity?)"
+                                );
+                                diff_failing = true;
+                            }
                             continue;
                         }
                     };
@@ -202,17 +254,33 @@ pub fn spawn_depth_dynamic_pool(
                     dispatch_ops(cfg.label, &ops, &cmd_senders, cfg.shape.sids_per_conn).await;
 
                     // PR-D: persist one audit row per non-no-op cycle.
-                    // Best-effort — audit failure must NOT halt the
-                    // pipeline (Wave 5 audit-finding Rule 5: flush
-                    // failures route to ERROR for Telegram, but the
-                    // persist is fire-and-forget here on the cold path).
-                    if let Err(err) = persist_diff_audit(&cfg, &ops, &stats).await {
-                        error!(
-                            code = "DEPTH-DYN-V2-AUDIT-01",
-                            label = cfg.label,
-                            ?err,
-                            "depth_dynamic_pool_v2 audit row persist failed"
-                        );
+                    match persist_diff_audit(&cfg, &ops, &stats).await {
+                        Ok(()) => {
+                            if audit_failing {
+                                info!(
+                                    label = cfg.label,
+                                    "depth_dynamic_pool_v2 audit persist RECOVERED"
+                                );
+                                audit_failing = false;
+                            }
+                        }
+                        Err(err) => {
+                            if audit_failing {
+                                warn!(
+                                    label = cfg.label,
+                                    ?err,
+                                    "depth_dynamic_pool_v2 audit persist still failing (rising-edge already fired)"
+                                );
+                            } else {
+                                error!(
+                                    code = "DEPTH-DYN-V2-AUDIT-01",
+                                    label = cfg.label,
+                                    ?err,
+                                    "depth_dynamic_pool_v2 audit row persist failed"
+                                );
+                                audit_failing = true;
+                            }
+                        }
                     }
                 }
             }
@@ -229,8 +297,8 @@ async fn fetch_cohort_from_questdb(cfg: &PipelineConfig) -> anyhow::Result<Vec<M
     let sql = build_cohort_sql(
         &cfg.selector.exchange_segments,
         &cfg.selector.instrument_types,
-        COHORT_SIZE,
-        FRESHNESS_WINDOW_SECS,
+        cfg.cohort_size,
+        cfg.window_secs,
     );
     let url = format!("http://{}:{}/exec", cfg.questdb.host, cfg.questdb.http_port);
     let client = reqwest::Client::builder()
@@ -708,16 +776,19 @@ mod tests {
     }
 
     #[test]
-    fn test_cohort_size_is_at_least_5x_max_k() {
-        // Cohort size must be large enough to absorb Stage-2 filter
-        // attrition for the largest K (=250 for depth-20).
-        assert!(COHORT_SIZE >= 250);
+    fn test_cohort_size_default_is_at_least_5x_max_k() {
+        // Default cohort size must be large enough to absorb Stage-2
+        // filter attrition for the largest K (=250 for depth-20).
+        assert!(DEFAULT_COHORT_SIZE >= 250);
     }
 
     #[test]
-    fn test_freshness_window_secs_matches_reselect_interval() {
+    fn test_freshness_window_secs_default_matches_reselect_interval() {
         // Avoids stale rows older than one cycle.
-        assert_eq!(u64::from(FRESHNESS_WINDOW_SECS), RESELECT_INTERVAL_SECS);
+        assert_eq!(
+            u64::from(DEFAULT_FRESHNESS_WINDOW_SECS),
+            RESELECT_INTERVAL_SECS
+        );
     }
 
     // ---- dispatch_ops shape ----
