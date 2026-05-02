@@ -32,6 +32,19 @@ use tickvault_common::config::ObservabilityConfig;
 /// tailed by Alloy/Loki or by the Claude triage daemon.
 pub const ERRORS_JSONL_DIR: &str = "data/logs";
 
+/// File-name prefix for the rolling FULL-app JSON log appender.
+///
+/// Mirror of `ERRORS_JSONL_PREFIX` for the all-levels app log. `RollingFileAppender`
+/// with `Rotation::HOURLY` produces files named `app.{YYYY-MM-DD-HH}`:
+///   data/logs/app.2026-05-02-04
+///   data/logs/app.2026-05-02-05
+///   ...
+///
+/// Hourly chunks bound any single file's size for industry-standard
+/// log analysis tooling (a daily file would routinely exceed 100 MB
+/// during market hours, breaking IDE / `less` / `grep` ergonomics).
+pub const APP_LOG_PREFIX: &str = "app";
+
 /// File-name prefix for the rolling ERROR-only JSONL appender.
 ///
 /// `RollingFileAppender` with `Rotation::HOURLY` produces files named
@@ -215,6 +228,109 @@ pub fn init_errors_jsonl_appender(
     );
 
     Ok((non_blocking, guard))
+}
+
+/// Initializes the rolling all-levels app log appender (hourly).
+///
+/// Mirror of [`init_errors_jsonl_appender`] for the full app log. Returns
+/// `(NonBlocking, WorkerGuard)` for composition into the tracing
+/// subscriber. The `WorkerGuard` MUST be kept alive for the duration of
+/// the process — dropping it stops the background flush thread and can
+/// lose buffered events.
+///
+/// File on disk: `{dir}/app.{YYYY-MM-DD-HH}` rotated hourly. Replaces the
+/// previous daily-but-actually-static `app.YYYY-MM-DD.log` writer that
+/// kept the same file open for a full trading day, producing 50–100 MB
+/// single-file logs that broke standard ops tooling.
+///
+/// The caller is responsible for the retention sweep (typically a
+/// tokio task that runs every hour and deletes files older than N hours).
+/// See [`sweep_app_log_retention`].
+pub fn init_app_log_appender(
+    dir: impl Into<PathBuf>,
+) -> Result<(tracing_appender::non_blocking::NonBlocking, WorkerGuard)> {
+    let dir: PathBuf = dir.into();
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("failed to create app log directory at {}", dir.display()))?;
+
+    let appender = RollingFileAppender::new(Rotation::HOURLY, &dir, APP_LOG_PREFIX);
+    let (non_blocking, guard) = tracing_appender::non_blocking(appender);
+
+    info!(
+        dir = %dir.display(),
+        prefix = APP_LOG_PREFIX,
+        rotation = "hourly",
+        "app log appender initialized"
+    );
+
+    Ok((non_blocking, guard))
+}
+
+/// Deletes `app.YYYY-MM-DD-HH` files under `dir` whose mtime is older
+/// than `retention_hours`. Mirror of [`sweep_errors_jsonl_retention`].
+///
+/// Typical usage: tokio task that calls this every 3600s with
+/// `retention_hours = 168` (= 7 days, matching the prior daily-file
+/// retention semantic of "keep 7 daily files"). Returns the number of
+/// files deleted. Best-effort — never blocks the app.
+pub fn sweep_app_log_retention(
+    dir: &std::path::Path,
+    retention_hours: u64,
+) -> std::io::Result<usize> {
+    let now = std::time::SystemTime::now();
+    let cutoff = std::time::Duration::from_secs(retention_hours.saturating_mul(3600));
+    let mut deleted = 0usize;
+
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(err) => return Err(err),
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        // Match `app` OR `app.YYYY-MM-DD-HH` produced by the rolling
+        // appender. Skip `app.log` (legacy fixed name kept for the Alloy
+        // file mount) — owned by `infra.rs::ensure_app_log_exists`.
+        if name == "app.log" {
+            continue;
+        }
+        if !name.starts_with(APP_LOG_PREFIX) {
+            continue;
+        }
+        // Don't accidentally sweep `app_<other-prefix>` files; require
+        // the rolling-suffix dot or exact prefix match.
+        if name.len() > APP_LOG_PREFIX.len() && !name[APP_LOG_PREFIX.len()..].starts_with('.') {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let Ok(mtime) = meta.modified() else {
+            continue;
+        };
+        let Ok(age) = now.duration_since(mtime) else {
+            continue;
+        };
+        if age > cutoff {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    deleted = deleted.saturating_add(1);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        ?err,
+                        path = %path.display(),
+                        "app log retention sweep: remove_file failed"
+                    );
+                }
+            }
+        }
+    }
+    Ok(deleted)
 }
 
 /// Deletes `errors.jsonl.*` files under `dir` whose mtime is older than
@@ -782,6 +898,100 @@ mod tests {
         assert!(unrelated.exists(), "unrelated file must remain untouched");
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn init_app_log_appender_creates_directory() {
+        let tmp = std::env::temp_dir().join(format!("tv-app-log-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(!tmp.exists());
+
+        let result = init_app_log_appender(&tmp);
+        assert!(result.is_ok(), "app log appender init should succeed");
+        assert!(tmp.exists(), "init must create the directory");
+        assert!(tmp.is_dir());
+
+        drop(result);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn sweep_app_log_retention_preserves_fresh_files() {
+        let tmp = std::env::temp_dir().join(format!("tv-app-log-fresh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap_or_else(|e| panic!("create_dir_all: {e}"));
+
+        let fresh = tmp.join("app.2099-01-01-00");
+        std::fs::write(&fresh, b"fresh").unwrap_or_else(|e| panic!("write fresh: {e}"));
+
+        let deleted =
+            sweep_app_log_retention(&tmp, 168).unwrap_or_else(|e| panic!("sweep failed: {e}"));
+        assert_eq!(deleted, 0, "fresh file must not be deleted");
+        assert!(fresh.exists(), "fresh file must survive the sweep");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn sweep_app_log_retention_ignores_legacy_app_log_alloy_mount() {
+        let tmp = std::env::temp_dir().join(format!("tv-app-log-alloy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap_or_else(|e| panic!("create_dir_all: {e}"));
+
+        // The Alloy file mount target `app.log` is an `infra.rs`-owned file;
+        // the rolling sweeper MUST NOT touch it even with retention=0.
+        let alloy = tmp.join("app.log");
+        std::fs::write(&alloy, b"alloy mount").unwrap_or_else(|e| panic!("write: {e}"));
+
+        let deleted =
+            sweep_app_log_retention(&tmp, 0).unwrap_or_else(|e| panic!("sweep failed: {e}"));
+        assert_eq!(deleted, 0, "app.log must never be swept");
+        assert!(alloy.exists(), "app.log must survive the sweep");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn sweep_app_log_retention_handles_missing_dir() {
+        let tmp = std::env::temp_dir().join(format!("tv-app-log-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        let result = sweep_app_log_retention(&tmp, 168);
+        assert!(matches!(result, Ok(0)));
+    }
+
+    #[test]
+    fn sweep_app_log_retention_ignores_unrelated_files() {
+        let tmp = std::env::temp_dir().join(format!("tv-app-log-unrelated-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap_or_else(|e| panic!("create_dir_all: {e}"));
+
+        // `application.log` starts with "app" but the next char is not '.',
+        // so the rolling-suffix guard must skip it.
+        let unrelated_a = tmp.join("application.log");
+        let unrelated_b = tmp.join("errors.jsonl.2000-01-01-00");
+        std::fs::write(&unrelated_a, b"a").unwrap_or_else(|e| panic!("write: {e}"));
+        std::fs::write(&unrelated_b, b"b").unwrap_or_else(|e| panic!("write: {e}"));
+
+        let deleted =
+            sweep_app_log_retention(&tmp, 0).unwrap_or_else(|e| panic!("sweep failed: {e}"));
+        assert_eq!(
+            deleted, 0,
+            "unrelated prefixes (application, errors.jsonl) must not be swept"
+        );
+        assert!(unrelated_a.exists());
+        assert!(unrelated_b.exists());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn app_log_prefix_matches_rolling_appender_naming() {
+        // Files produced by `RollingFileAppender::new(Rotation::HOURLY, dir, "app")`
+        // are `app.YYYY-MM-DD-HH`. The sweeper's filter relies on this
+        // exact prefix; if the constant ever drifts the sweeper silently
+        // stops working.
+        assert_eq!(APP_LOG_PREFIX, "app");
     }
 
     #[test]
