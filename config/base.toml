@@ -352,3 +352,38 @@ preopen_movers = true               # Item 10 — pre-open movers 09:00-09:13
 telegram_bucket_coalescer = true    # Item 11 — Telegram bucket coalescing
 market_open_self_test = true        # Item 12 — 09:15 IST self-test
 realtime_guarantee_score = true     # Item 13 — composite SLO score gauge
+depth_dynamic_top_volume = true     # Wave 5 Items 4+5 LIVE
+# PR-C2 cutover gate — unified depth-dynamic pipeline_v2.
+# OFF by default for safe rollback. Operator flips to true after the
+# `[depth_20.dynamic]` / `[depth_200.dynamic]` blocks below are
+# validated against the unified `depth_dynamic_pipeline_v2` orchestrator.
+depth_dynamic_pipeline_v2 = false
+
+# ---------------------------------------------------------------------------
+# Depth-dynamic redesign (PR-C2) — config-driven all-5-dynamic depth pools.
+# Read by `depth_dynamic_pipeline_v2` ONLY when
+# `[features].depth_dynamic_pipeline_v2 = true`. Both blocks otherwise
+# parse cleanly but are unused at runtime.
+# ---------------------------------------------------------------------------
+
+[depth_20.dynamic]
+conns = 5                                       # capped at Dhan 5-conn limit
+sids_per_conn = 50                              # capped at Dhan 50-SIDs/conn limit
+
+[depth_20.dynamic.universe]
+exchange_segments = ["NSE_FNO"]                  # add "BSE_FNO" to widen
+instrument_types = []                            # empty = all types
+cohort_size = 500                                # Stage-1 top-volume cohort size
+rerank_metric = "change_pct_desc"                # Stage-2 sort metric
+window_secs = 60                                 # movers_1m look-back window
+
+[depth_200.dynamic]
+conns = 5
+sids_per_conn = 1
+
+[depth_200.dynamic.universe]
+exchange_segments = ["NSE_FNO"]
+instrument_types = []
+cohort_size = 100
+rerank_metric = "change_pct_desc"
+window_secs = 60

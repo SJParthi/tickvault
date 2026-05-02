@@ -2719,7 +2719,166 @@ async fn main() -> Result<()> {
         // calls will fail (no receiver task) → DEPTH-DYN-02 fires on
         // every 60s cycle inside market hours. That's the visible
         // signal the operator uses to schedule the conn-pool refactor.
-        if config.features.depth_dynamic_top_volume {
+        // PR-C2 cutover gate. When `[features].depth_dynamic_pipeline_v2 = true`,
+        // the unified pipeline_v2 path replaces BOTH the Wave 5 orchestrator
+        // block below AND the single-side static depth-20 spawn block at
+        // line ~4118. Default: false (Wave 5 path active for safe rollback).
+        let pipeline_v2_active = config.features.depth_dynamic_pipeline_v2;
+        if pipeline_v2_active {
+            tracing::info!(
+                "PR-C2 cutover: depth_dynamic_pipeline_v2 feature ON — \
+                 spawning 5×depth-20 + 5×depth-200 deferred minimal_conns + \
+                 unified spawn_depth_dynamic_pool orchestrators"
+            );
+
+            // Validate config invariants BEFORE any spawn. Halt boot on
+            // misconfiguration (per per-wave-guarantee-matrix.md row 4 +
+            // disaster-recovery.md "fail-fast at boot" rule).
+            if let Err(e) = config.depth_20.dynamic.assert_invariants(
+                "depth_20",
+                tickvault_common::constants::MAX_TWENTY_DEPTH_CONNECTIONS,
+            ) {
+                anyhow::bail!("invalid [depth_20.dynamic] config: {e}");
+            }
+            if let Err(e) = config.depth_200.dynamic.assert_invariants(
+                "depth_200",
+                tickvault_common::constants::MAX_TWO_HUNDRED_DEPTH_CONNECTIONS,
+            ) {
+                anyhow::bail!("invalid [depth_200.dynamic] config: {e}");
+            }
+
+            let v2_shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+
+            // ----- Depth-20: 5 deferred minimal_conns -----
+            let mut d20_v2_cmd_senders: std::collections::HashMap<
+                u8,
+                tokio::sync::mpsc::Sender<tickvault_core::websocket::DepthCommand>,
+            > = std::collections::HashMap::new();
+            for slot in 0..config.depth_20.dynamic.conns {
+                let (tx, rx) =
+                    tokio::sync::mpsc::channel::<tickvault_core::websocket::DepthCommand>(4);
+                d20_v2_cmd_senders.insert(slot, tx);
+                tickvault_app::depth_20_conn_spawner::spawn_depth_20_minimal_conn(
+                    tickvault_app::depth_20_conn_spawner::Depth20MinimalConnInputs {
+                        token_handle: token_handle.clone(),
+                        ws_client_id: ws_client_id.clone(),
+                        label: format!("V2-DYN-20-SLOT-{slot}"),
+                        instruments: Vec::new(), // DEFERRED — pool sends Add20
+                        cmd_rx: rx,
+                        questdb_config: config.questdb.clone(),
+                        notifier: notifier.clone(),
+                        health_status: health_status.clone(),
+                        ws_frame_spill: ws_frame_spill.clone(),
+                    },
+                );
+            }
+
+            let d20_pipeline_cfg = tickvault_app::depth_dynamic_pipeline_v2::PipelineConfig {
+                questdb: config.questdb.clone(),
+                selector:
+                    tickvault_core::instrument::depth_dynamic_top_volume_selector::SelectorConfig {
+                        instrument_types: config.depth_20.dynamic.universe.instrument_types.clone(),
+                        exchange_segments: config
+                            .depth_20
+                            .dynamic
+                            .universe
+                            .exchange_segments
+                            .clone(),
+                        k: usize::from(config.depth_20.dynamic.conns)
+                            * usize::from(config.depth_20.dynamic.sids_per_conn),
+                    },
+                shape: tickvault_core::instrument::dynamic_subscription_state::PoolShape {
+                    conns: config.depth_20.dynamic.conns,
+                    sids_per_conn: config.depth_20.dynamic.sids_per_conn,
+                },
+                label: "depth-20-dynamic",
+            };
+            tickvault_app::depth_dynamic_pipeline_v2::spawn_depth_dynamic_pool(
+                d20_pipeline_cfg,
+                d20_v2_cmd_senders,
+                std::sync::Arc::clone(&v2_shutdown),
+            );
+
+            // ----- Depth-200: 5 deferred minimal_conns -----
+            let mut d200_v2_cmd_senders: std::collections::HashMap<
+                u8,
+                tokio::sync::mpsc::Sender<tickvault_core::websocket::DepthCommand>,
+            > = std::collections::HashMap::new();
+            // PR-B (2026-05-02): boot-smoke counter shared across all 5
+            // depth-200 receivers. See `crates/app/src/boot_smoke_test.rs`.
+            let v2_d200_frame_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            for slot in 0..config.depth_200.dynamic.conns {
+                let (tx, rx) =
+                    tokio::sync::mpsc::channel::<tickvault_core::websocket::DepthCommand>(4);
+                d200_v2_cmd_senders.insert(slot, tx);
+                let stagger_ms = u64::from(slot)
+                    .saturating_mul(tickvault_core::websocket::DEPTH_200_INITIAL_STAGGER_MS);
+                tickvault_app::depth_20_conn_spawner::spawn_depth_200_minimal_conn(
+                    tickvault_app::depth_20_conn_spawner::Depth200MinimalConnInputs {
+                        token_handle: token_handle.clone(),
+                        ws_client_id: ws_client_id.clone(),
+                        label: format!("V2-DYN-200-SLOT-{slot}"),
+                        exchange_segment: tickvault_common::types::ExchangeSegment::NseFno,
+                        security_id: None, // DEFERRED — pool sends Add200
+                        cmd_rx: rx,
+                        questdb_config: config.questdb.clone(),
+                        notifier: notifier.clone(),
+                        health_status: health_status.clone(),
+                        ws_frame_spill: ws_frame_spill.clone(),
+                        initial_stagger_ms: stagger_ms,
+                        depth_200_frame_counter: Some(std::sync::Arc::clone(
+                            &v2_d200_frame_counter,
+                        )),
+                    },
+                );
+            }
+            tickvault_app::boot_smoke_test::spawn_depth_200_boot_smoke_test(std::sync::Arc::clone(
+                &v2_d200_frame_counter,
+            ));
+
+            let d200_pipeline_cfg = tickvault_app::depth_dynamic_pipeline_v2::PipelineConfig {
+                questdb: config.questdb.clone(),
+                selector:
+                    tickvault_core::instrument::depth_dynamic_top_volume_selector::SelectorConfig {
+                        instrument_types: config
+                            .depth_200
+                            .dynamic
+                            .universe
+                            .instrument_types
+                            .clone(),
+                        exchange_segments: config
+                            .depth_200
+                            .dynamic
+                            .universe
+                            .exchange_segments
+                            .clone(),
+                        k: usize::from(config.depth_200.dynamic.conns)
+                            * usize::from(config.depth_200.dynamic.sids_per_conn),
+                    },
+                shape: tickvault_core::instrument::dynamic_subscription_state::PoolShape {
+                    conns: config.depth_200.dynamic.conns,
+                    sids_per_conn: config.depth_200.dynamic.sids_per_conn,
+                },
+                label: "depth-200-dynamic",
+            };
+            tickvault_app::depth_dynamic_pipeline_v2::spawn_depth_dynamic_pool(
+                d200_pipeline_cfg,
+                d200_v2_cmd_senders,
+                v2_shutdown,
+            );
+            tracing::info!(
+                "PR-C2 cutover: depth_dynamic_pipeline_v2 spawn complete \
+                 (depth-20: {}×{} = {} SIDs; depth-200: {}×{} = {} SIDs)",
+                config.depth_20.dynamic.conns,
+                config.depth_20.dynamic.sids_per_conn,
+                usize::from(config.depth_20.dynamic.conns)
+                    * usize::from(config.depth_20.dynamic.sids_per_conn),
+                config.depth_200.dynamic.conns,
+                config.depth_200.dynamic.sids_per_conn,
+                usize::from(config.depth_200.dynamic.conns)
+                    * usize::from(config.depth_200.dynamic.sids_per_conn),
+            );
+        } else if config.features.depth_dynamic_top_volume {
             tracing::info!(
                 "Wave 5 Items 4+5: depth_dynamic_top_volume feature ON — \
                  spawning orchestrator + receiver-side dynamic depth-20 conn 5"
@@ -4114,6 +4273,16 @@ async fn main() -> Result<()> {
                 // data/cache/tv-token-cache (already kept fresh by the Rust
                 // TokenManager). Rebalance updates are a follow-up commit.
                 depth_bridge_state_writer.write_or_log(&ws_client_id, &depth_bridge_subs);
+            } else if config.features.depth_dynamic_pipeline_v2 {
+                // PR-C2 cutover: pipeline_v2 already spawned all 5 depth-20
+                // conns (deferred) + the unified spawn_depth_dynamic_pool
+                // upstream. The Wave 5 single-side static spawn block is
+                // therefore SKIPPED — it would otherwise double-spawn 4
+                // additional depth-20 conns and break the Dhan 5-conn cap.
+                tracing::info!(
+                    "PR-C2: depth-20 single-side static spawn SKIPPED \
+                     (pipeline_v2 active — all 5 depth-20 conns spawned earlier)"
+                );
             } else {
                 // Wave 5 single-side static depth-20 spawn (4 conns):
                 // NIFTY-CE, NIFTY-PE, BANKNIFTY-CE, BANKNIFTY-PE. ATM ± 24
