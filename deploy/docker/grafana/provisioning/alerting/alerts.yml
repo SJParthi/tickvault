@@ -834,6 +834,49 @@ groups:
         labels:
           severity: warning
 
+      # PR-D 2026-05-02: depth-dynamic set size below expected → WARN
+      # Fires when the new all-5-dynamic depth pipeline (PR-C1
+      # depth_dynamic_pipeline_v2) produces a `next_set` smaller than
+      # the configured pool capacity for sustained 5+ min. Indicates
+      # the upstream `movers_1m` cohort is starved of NSE_FNO rows
+      # (most-likely upstream MOVERS-02 writer failure). Operator
+      # follows MOVERS-02 runbook + checks
+      # `tv_movers_writer_dropped_total{stage="append"}`.
+      - uid: tv-depth-dynamic-set-size-low
+        title: "PR-D: Depth-dynamic set size below capacity"
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model:
+              expr: "min by (feed) (tv_depth_dynamic_set_size)"
+              intervalMs: 15000
+              maxDataPoints: 43200
+          - refId: B
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: lt, params: [5] }
+        noDataState: OK
+        execErrState: Alerting
+        for: 5m
+        annotations:
+          summary: "Depth-dynamic set size below capacity for 5+ min"
+          description: "tv_depth_dynamic_set_size < 5 (lower than depth-200 pool capacity) for 5+ min during market hours. Likely upstream movers_1m writer failure (follow MOVERS-02 runbook). Check tv_movers_writer_dropped_total{stage='append'} and movers_unified_pipeline logs."
+        labels:
+          severity: warning
+
       # S3-1: QuestDB disconnected > 30s → CRITICAL
       - uid: tv-questdb-disconnected
         title: "S3-1: QuestDB disconnected > 30s"
