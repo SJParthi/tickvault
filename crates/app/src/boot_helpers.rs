@@ -2768,7 +2768,7 @@ mod tests {
     }
 
     #[test]
-    fn test_post_market_alert_suppressed_on_saturday() {
+    fn test_should_emit_post_market_alert_suppressed_on_saturday() {
         use chrono::Datelike;
         // 2026-05-02 — the live incident date. NaiveDate weekday: Sat.
         let saturday = NaiveDate::from_ymd_opt(2026, 5, 2).unwrap();
@@ -2781,7 +2781,7 @@ mod tests {
     }
 
     #[test]
-    fn test_post_market_alert_suppressed_on_sunday() {
+    fn test_should_emit_post_market_alert_suppressed_on_sunday() {
         use chrono::Datelike;
         // 2026-05-03 — the day after the live incident.
         let sunday = NaiveDate::from_ymd_opt(2026, 5, 3).unwrap();
@@ -2794,7 +2794,7 @@ mod tests {
     }
 
     #[test]
-    fn test_post_market_alert_suppressed_on_nse_holiday() {
+    fn test_should_emit_post_market_alert_suppressed_on_nse_holiday() {
         use chrono::Datelike;
         // 2026-01-26 — Republic Day, in the test holiday list. Falls
         // on a Monday so this isolates the holiday filter from the
@@ -2809,7 +2809,7 @@ mod tests {
     }
 
     #[test]
-    fn test_post_market_alert_fires_on_normal_trading_day() {
+    fn test_should_emit_post_market_alert_fires_on_normal_trading_day() {
         use chrono::Datelike;
         // 2026-05-04 — Monday, not in the test holiday list.
         let monday = NaiveDate::from_ymd_opt(2026, 5, 4).unwrap();
