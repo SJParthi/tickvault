@@ -163,19 +163,46 @@ pub struct DrainedSummary {
 impl DrainedSummary {
     /// Renders a single Telegram-ready summary message body.
     ///
-    /// Format (deterministic, plain text — Telegram handles formatting via
-    /// the existing `<pre>` wrapping done by the dispatcher):
+    /// **Two formats** depending on whether the bucket coalesced a burst
+    /// or a single event:
+    ///
+    /// ## `count == 1` (single event — terse)
+    ///
+    /// ```text
+    /// <sample 1>
+    /// ```
+    ///
+    /// The summary wrapper is omitted because there's nothing to summarise.
+    /// The dispatcher already prefixes the severity tag (`✅ [LOW]` etc.),
+    /// so the operator sees a clean one-liner like `Auth OK — Dhan JWT
+    /// acquired` instead of a 6-line `Coalesced summary […]` envelope.
+    ///
+    /// ## `count > 1` (genuine burst — full envelope)
     ///
     /// ```text
     /// Coalesced summary [topic] count=N
-    /// Window: <first IST> .. <last IST>
-    /// Samples (up to 10):
+    /// First: <HH:MM:SS IST> — Last: <HH:MM:SS IST>
+    /// Samples:
     ///   1. <sample 1>
     ///   2. <sample 2>
     ///   ...
     /// (+M more not retained — count is authoritative)
     /// ```
+    ///
+    /// The envelope only shows up when there's actually something
+    /// coalesced — the operator's "what was suppressed?" question.
     pub fn render_message(&self) -> String {
+        // Single-event fast path: no envelope, just the sample.
+        if self.count == 1 {
+            if let Some(sample) = self.samples.first() {
+                return sample.clone();
+            }
+            // Defensive: count=1 with no samples should be impossible
+            // (Telegram02CoalescerStateInconsistency catches it
+            // separately) — fall through to the envelope rather than
+            // emit an empty message.
+        }
+
         let mut out = String::with_capacity(256);
         out.push_str("Coalesced summary [");
         out.push_str(self.topic);
@@ -533,6 +560,69 @@ mod tests {
         assert!(msg.contains("sample1"));
         assert!(msg.contains("sample2"));
         assert!(!msg.contains("not retained"));
+    }
+
+    #[test]
+    fn test_render_message_count_one_omits_envelope() {
+        // Operator complaint 2026-05-02: count=1 events were wrapped in
+        // a verbose `Coalesced summary [topic] count=1 / Samples: 1. ...`
+        // envelope when there's nothing to summarise. Single-event fast
+        // path returns just the sample body.
+        let summary = DrainedSummary {
+            topic: "AuthenticationSuccess",
+            severity: Severity::Low,
+            count: 1,
+            first_ts_ms: 1_700_000_000_000,
+            last_ts_ms: 1_700_000_000_000,
+            samples: vec!["✅ [LOW] Auth OK — Dhan JWT acquired".into()],
+            samples_capped: false,
+        };
+        let msg = summary.render_message();
+        assert_eq!(msg, "✅ [LOW] Auth OK — Dhan JWT acquired");
+        assert!(!msg.contains("Coalesced summary"));
+        assert!(!msg.contains("count="));
+        assert!(!msg.contains("Samples:"));
+        assert!(!msg.contains("First:"));
+    }
+
+    #[test]
+    fn test_render_message_count_one_with_empty_samples_falls_back_to_envelope() {
+        // Defensive: if the impossible state (count=1 + empty samples)
+        // somehow occurs, do NOT emit an empty Telegram message — fall
+        // through to the envelope so the operator at least sees `count=1
+        // [topic]`. Telegram02CoalescerStateInconsistency catches the
+        // upstream cause separately.
+        let summary = DrainedSummary {
+            topic: "Glitch",
+            severity: Severity::Low,
+            count: 1,
+            first_ts_ms: 1_700_000_000_000,
+            last_ts_ms: 1_700_000_000_000,
+            samples: vec![],
+            samples_capped: false,
+        };
+        let msg = summary.render_message();
+        assert!(msg.contains("Coalesced summary [Glitch]"));
+        assert!(msg.contains("count=1"));
+    }
+
+    #[test]
+    fn test_render_message_count_two_keeps_envelope() {
+        // Burst (count > 1) MUST keep the full envelope — that's the
+        // whole reason the coalescer exists.
+        let summary = DrainedSummary {
+            topic: "T",
+            severity: Severity::Low,
+            count: 2,
+            first_ts_ms: 1_700_000_000_000,
+            last_ts_ms: 1_700_000_010_000,
+            samples: vec!["a".into(), "b".into()],
+            samples_capped: false,
+        };
+        let msg = summary.render_message();
+        assert!(msg.contains("Coalesced summary"));
+        assert!(msg.contains("count=2"));
+        assert!(msg.contains("Samples:"));
     }
 
     #[test]
