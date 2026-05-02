@@ -889,7 +889,7 @@ fn resolve_op_entries(
         if let Some(inst) = registry.get_with_segment(sid, segment) {
             out.push(tickvault_core::notification::DepthDiffEntry {
                 security_id: sid,
-                exchange_segment: segment.as_str().to_string(),
+                exchange_segment: segment.as_str(),
                 display_label: inst.display_label.clone(),
                 underlying_symbol: inst.underlying_symbol.clone(),
             });
