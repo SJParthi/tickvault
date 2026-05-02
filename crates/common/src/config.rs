@@ -259,11 +259,12 @@ pub struct FeaturesConfig {
     /// PR-C2 cutover gate — unified depth-dynamic pipeline (5 dynamic
     /// depth-20 conns × 50 SIDs + 5 dynamic depth-200 conns × 1 SID,
     /// fed by the shared `depth_dynamic_top_volume_selector` reading
-    /// `movers_1m`). Default `false` while the cutover lands as a
-    /// reversible rollout. Operator flips on after validating against
-    /// `[depth_20.dynamic]` / `[depth_200.dynamic]` config blocks.
-    /// When `true`, the legacy "4 single-side + 1 dynamic" Wave 5
-    /// allocator is REPLACED by the unified pipeline.
+    /// `movers_1m`). Default flipped to `true` 2026-05-02 once the 3-
+    /// agent adversarial review closed (hot-path + security + hostile
+    /// bug-hunt; 12 findings, all fixed or triaged false-positive).
+    /// Operator can revert to the legacy Wave 5 allocator by flipping
+    /// this to `false` — the Wave 5 orchestrator + single-side static
+    /// spawn blocks remain in the codebase behind this gate.
     pub depth_dynamic_pipeline_v2: bool,
 }
 
@@ -295,11 +296,13 @@ impl Default for FeaturesConfig {
             // signal the operator uses to schedule the receiver-side
             // refactor sub-PR.
             depth_dynamic_top_volume: true,
-            // PR-C2 cutover: default OFF for safe rollback. Operator
-            // flips to true after the `[depth_20.dynamic]` /
-            // `[depth_200.dynamic]` config blocks are populated and
-            // validated against the unified pipeline_v2.
-            depth_dynamic_pipeline_v2: false,
+            // PR-C2 cutover: default flipped to `true` 2026-05-02 after
+            // adversarial review closed. Operator can revert to legacy
+            // Wave 5 by setting `depth_dynamic_pipeline_v2 = false` in
+            // a config override file. The Wave 5 orchestrator + single-
+            // side static spawn blocks stay in the codebase as the
+            // rollback path until production validation completes.
+            depth_dynamic_pipeline_v2: true,
         }
     }
 }
@@ -2700,11 +2703,12 @@ mod tests {
     }
 
     #[test]
-    fn test_features_config_default_pipeline_v2_off_for_safe_rollback() {
+    fn test_features_config_default_pipeline_v2_on_after_adversarial_review() {
         let cfg = FeaturesConfig::default();
-        // PR-C2 cutover ships OFF by default. Operator flips on after
-        // validating against the new config blocks.
-        assert!(!cfg.depth_dynamic_pipeline_v2);
+        // 2026-05-02 — the PR-C2 default flipped to `true` once the
+        // 3-agent adversarial review closed. Wave 5 path stays in the
+        // codebase as a rollback option behind the same flag.
+        assert!(cfg.depth_dynamic_pipeline_v2);
     }
 
     // -----------------------------------------------------------------------
