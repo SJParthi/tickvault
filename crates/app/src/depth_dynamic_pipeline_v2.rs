@@ -143,7 +143,17 @@ pub fn spawn_depth_dynamic_pool(
     tokio::spawn(async move {
         info!(label = cfg.label, "depth_dynamic_pool_v2 starting");
         let mut state = DynamicSubscriptionState::new(cfg.shape);
-        let mut tick = tokio::time::interval(Duration::from_secs(RESELECT_INTERVAL_SECS));
+        // 2026-05-02 — operator-requested wall-clock alignment. Replace
+        // boot-aligned `tokio::time::interval(60s)` with `interval_at`
+        // anchored to today's 09:15:01 IST (or "now" if already past).
+        // Without this fix, a boot at 08:50:30 IST would tick at
+        // 08:51:30, 08:52:30, …, 09:14:30, then 09:15:30 — missing the
+        // critical 09:15:00→09:15:30 window where movers_1s first
+        // populates. Operator's spec: "at 09:15:01 it should be
+        // captured and started — should not wait till 09:16".
+        let first_cycle_at = compute_first_cycle_instant_today();
+        let mut tick =
+            tokio::time::interval_at(first_cycle_at, Duration::from_secs(RESELECT_INTERVAL_SECS));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         // PR-C2 follow-up (hostile-bug-hunt fix C2/M1) — rising-edge
@@ -213,10 +223,27 @@ pub fn spawn_depth_dynamic_pool(
                             label = cfg.label,
                             previous = last_seen_ist_day,
                             current = today_ist,
-                            "depth_dynamic_pool_v2 IST midnight rollover — resetting diff state"
+                            "depth_dynamic_pool_v2 IST midnight rollover — resetting diff state \
+                             + re-aligning interval to today's 09:15:01"
                         );
                         state = DynamicSubscriptionState::new(cfg.shape);
                         last_seen_ist_day = today_ist;
+                        // 2026-05-02 — re-align the interval to today's
+                        // 09:15:01 IST so the first cycle each day fires
+                        // exactly at market open + 1s, not boot-time-aligned.
+                        // Without this, the schedule drifts off the wall
+                        // clock day-by-day (interval ticks every 60s
+                        // forever from the original start_at instant).
+                        tick = tokio::time::interval_at(
+                            compute_first_cycle_instant_today(),
+                            Duration::from_secs(RESELECT_INTERVAL_SECS),
+                        );
+                        tick.set_missed_tick_behavior(
+                            tokio::time::MissedTickBehavior::Delay,
+                        );
+                        // Skip the rest of this cycle — next tick.tick()
+                        // will fire at today's 09:15:01.
+                        continue;
                     }
                     let cohort = match fetch_cohort_from_questdb(&cfg).await {
                         Ok(c) => {
@@ -729,6 +756,41 @@ fn current_ist_trading_day() -> i64 {
     now_ist.div_euclid(i64::from(SECONDS_PER_DAY))
 }
 
+/// Wall-clock target for the FIRST selection cycle of each trading
+/// day: 09:15:01 IST. One second after market open so movers_1s has
+/// at least one populated 1-second bucket from the first F&O ticks.
+const FIRST_CYCLE_SECS_OF_DAY_IST: u32 = 9 * 3600 + 15 * 60 + 1;
+
+/// 2026-05-02 — operator-requested first-cycle alignment.
+///
+/// Returns a `tokio::time::Instant` for the next 09:15:01 IST anchor
+/// point. Behaviour:
+///   * Pre-09:15:01 today → returns Instant for today's 09:15:01
+///   * Post-09:15:01 today → returns `Instant::now()` so the first
+///     `tick.tick().await` fires immediately (boot-after-market-open
+///     case, e.g. crash recovery at 11:30 IST)
+///
+/// Combined with `tokio::time::interval_at(start, 60s)`, the first
+/// selection cycle of each day fires within OS-scheduler latency
+/// (~1ms typical) of 09:15:01 IST, eliminating the up-to-60-second
+/// blind spot the legacy boot-aligned `interval(60s)` introduced.
+///
+/// Subsequent ticks fire at +60s, +120s, …; daily-rollover handler
+/// re-creates the interval to keep the alignment from drifting.
+#[inline]
+#[must_use]
+fn compute_first_cycle_instant_today() -> tokio::time::Instant {
+    let now_utc = Utc::now().timestamp();
+    let now_ist = now_utc.saturating_add(i64::from(IST_UTC_OFFSET_SECONDS));
+    let secs_into_day = now_ist.rem_euclid(i64::from(SECONDS_PER_DAY));
+    let target = i64::from(FIRST_CYCLE_SECS_OF_DAY_IST);
+    let offset_secs = (target - secs_into_day).max(0);
+    // APPROVED: offset_secs is non-negative i64 ≤ 86400, fits u64 cleanly.
+    #[allow(clippy::cast_sign_loss)]
+    let offset_dur = Duration::from_secs(offset_secs as u64);
+    tokio::time::Instant::now() + offset_dur
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -890,6 +952,46 @@ mod tests {
         assert!(
             (18000..30000).contains(&day),
             "trading day epoch out of sane range: {day}"
+        );
+    }
+
+    /// 2026-05-02 — operator-requested first-cycle alignment.
+    /// Pin the constant at 09:15:01 IST.
+    #[test]
+    fn test_first_cycle_secs_of_day_ist_pinned_at_09_15_01() {
+        // 09:15:01 IST = 9*3600 + 15*60 + 1 = 33_301
+        assert_eq!(FIRST_CYCLE_SECS_OF_DAY_IST, 33_301);
+    }
+
+    /// Ratchet: the helper returns an Instant that is `Instant::now()`
+    /// or in the future. Cannot return a past-relative Instant because
+    /// `Instant + Duration` is monotone non-decreasing.
+    #[test]
+    fn test_compute_first_cycle_instant_today_never_in_the_past() {
+        let before = tokio::time::Instant::now();
+        let target = compute_first_cycle_instant_today();
+        // `before` was sampled before the helper ran; helper internally
+        // calls Instant::now() AFTER `before`, so target >= before always.
+        assert!(target >= before);
+    }
+
+    /// Ratchet: when called multiple times within the same second, the
+    /// helper must return Instants that are within ~1 second of each
+    /// other — bounding clock-skew-style drift.
+    #[test]
+    fn test_compute_first_cycle_instant_today_stable_within_call_window() {
+        let a = compute_first_cycle_instant_today();
+        let b = compute_first_cycle_instant_today();
+        let diff = if b > a {
+            b.duration_since(a)
+        } else {
+            a.duration_since(b)
+        };
+        // Two calls within milliseconds should produce Instants within 1s.
+        // (offset_secs is integer-second granularity; jitter < 1s.)
+        assert!(
+            diff.as_secs() <= 1,
+            "two consecutive calls produced Instants {diff:?} apart — expected ≤ 1s"
         );
     }
 
