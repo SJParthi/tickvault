@@ -431,12 +431,38 @@ pub fn spawn_depth_dynamic_pool(
                             resolve_op_entries(&ops, registry, |op| {
                                 matches!(op, DiffOp::Remove { .. })
                             });
+                        // 2026-05-02 hostile-bug-hunt HIGH fix: surface
+                        // unresolved drops as an explicit metric so a stale
+                        // registry doesn't silently mask diff churn.
+                        let unresolved =
+                            (stats.added + stats.removed)
+                                .saturating_sub(added_entries.len() + removed_entries.len());
+                        if unresolved > 0 {
+                            metrics::counter!(
+                                "tv_depth_dynamic_unresolved_lookups_total",
+                                "feed" => cfg.label
+                            )
+                            .increment(unresolved as u64);
+                            warn!(
+                                code = "DEPTH-DYN-V2-UNRESOLVED",
+                                label = cfg.label,
+                                unresolved,
+                                stats_added = stats.added,
+                                stats_removed = stats.removed,
+                                resolved_added = added_entries.len(),
+                                resolved_removed = removed_entries.len(),
+                                "registry lookup dropped diff entries — Telegram counts \
+                                 use stats; investigate if recurrent (stale registry?)"
+                            );
+                        }
                         notifier.notify(
                             tickvault_core::notification::NotificationEvent::DepthDynamicV2DiffApplied {
                                 feed: cfg.label,
                                 added: added_entries,
                                 removed: removed_entries,
                                 retained_count: stats.retained,
+                                stats_added: stats.added,
+                                stats_removed: stats.removed,
                             },
                         );
                     }
