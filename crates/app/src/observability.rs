@@ -45,6 +45,125 @@ pub const ERRORS_JSONL_DIR: &str = "data/logs";
 /// during market hours, breaking IDE / `less` / `grep` ergonomics).
 pub const APP_LOG_PREFIX: &str = "app";
 
+/// 2026-05-02 — per-category log file separation.
+///
+/// Operator-requested separation of logs into 5 domain-specific
+/// directories so movers / candles / live ticks / historical / option
+/// chain logs can be tailed independently without grep'ing the giant
+/// `app.*` stream.
+///
+/// Each category gets its own subdirectory under `data/logs/` with
+/// hourly-rotated files named `{prefix}.{YYYY-MM-DD-HH}`. The targets
+/// filter for each category is built by [`build_category_targets`].
+pub const CATEGORY_MOVERS_DIR: &str = "data/logs/movers";
+pub const CATEGORY_MOVERS_PREFIX: &str = "movers";
+pub const CATEGORY_CANDLES_DIR: &str = "data/logs/candles";
+pub const CATEGORY_CANDLES_PREFIX: &str = "candles";
+pub const CATEGORY_LIVE_TICKS_DIR: &str = "data/logs/live_ticks";
+pub const CATEGORY_LIVE_TICKS_PREFIX: &str = "live_ticks";
+pub const CATEGORY_HISTORICAL_DIR: &str = "data/logs/historical";
+pub const CATEGORY_HISTORICAL_PREFIX: &str = "historical";
+pub const CATEGORY_OPTION_CHAIN_DIR: &str = "data/logs/option_chain";
+pub const CATEGORY_OPTION_CHAIN_PREFIX: &str = "option_chain";
+
+/// Stable identifier for the 5 log categories.
+///
+/// Used by [`build_category_targets`] + the boot-time appender wiring.
+/// The `&'static str` form is what `RollingFileAppender::new` expects
+/// for the filename prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogCategory {
+    Movers,
+    Candles,
+    LiveTicks,
+    Historical,
+    OptionChain,
+}
+
+impl LogCategory {
+    #[must_use]
+    pub fn dir(self) -> &'static str {
+        match self {
+            Self::Movers => CATEGORY_MOVERS_DIR,
+            Self::Candles => CATEGORY_CANDLES_DIR,
+            Self::LiveTicks => CATEGORY_LIVE_TICKS_DIR,
+            Self::Historical => CATEGORY_HISTORICAL_DIR,
+            Self::OptionChain => CATEGORY_OPTION_CHAIN_DIR,
+        }
+    }
+
+    #[must_use]
+    pub fn prefix(self) -> &'static str {
+        match self {
+            Self::Movers => CATEGORY_MOVERS_PREFIX,
+            Self::Candles => CATEGORY_CANDLES_PREFIX,
+            Self::LiveTicks => CATEGORY_LIVE_TICKS_PREFIX,
+            Self::Historical => CATEGORY_HISTORICAL_PREFIX,
+            Self::OptionChain => CATEGORY_OPTION_CHAIN_PREFIX,
+        }
+    }
+
+    /// Every variant. Used by retention sweepers + tests.
+    #[must_use]
+    pub fn all() -> [Self; 5] {
+        [
+            Self::Movers,
+            Self::Candles,
+            Self::LiveTicks,
+            Self::Historical,
+            Self::OptionChain,
+        ]
+    }
+}
+
+/// Returns the list of `tracing` `target` prefixes routed to the given
+/// category. Each entry is a Rust module path verified against the live
+/// `crates/{core,storage,trading}/src/` tree on 2026-05-02.
+///
+/// `tracing_subscriber::filter::Targets` does prefix matching on `target`
+/// by default, so an entry like `tickvault_core::pipeline::candle_aggregator`
+/// matches that exact module's logs.
+#[must_use]
+pub fn build_category_targets(cat: LogCategory) -> &'static [&'static str] {
+    match cat {
+        LogCategory::Movers => &[
+            "tickvault_core::pipeline::mover_classifier",
+            "tickvault_core::pipeline::movers_window",
+            "tickvault_core::pipeline::option_movers",
+            "tickvault_core::pipeline::preopen_movers",
+            "tickvault_core::pipeline::top_movers",
+            "tickvault_storage::movers_persistence",
+            "tickvault_storage::movers_unified_persistence",
+            "tickvault_storage::movers_unified_query",
+            "tickvault_storage::movers_unified_writer",
+        ],
+        LogCategory::Candles => &[
+            "tickvault_core::pipeline::candle_aggregator",
+            "tickvault_storage::candle_persistence",
+            "tickvault_storage::materialized_views",
+        ],
+        LogCategory::LiveTicks => &[
+            "tickvault_core::websocket",
+            "tickvault_core::pipeline::tick_processor",
+            "tickvault_core::pipeline::tick_gap_detector",
+            "tickvault_core::pipeline::no_tick_watchdog",
+            "tickvault_core::pipeline::depth_sequence_tracker",
+            "tickvault_core::pipeline::volume_monotonicity_guard",
+            "tickvault_storage::tick_persistence",
+            "tickvault_storage::tick_spill_drain",
+        ],
+        LogCategory::Historical => &[
+            "tickvault_core::historical",
+            "tickvault_storage::historical_fetch_marker",
+        ],
+        LogCategory::OptionChain => &[
+            "tickvault_core::option_chain",
+            "tickvault_trading::greeks",
+            "tickvault_storage::greeks_persistence",
+        ],
+    }
+}
+
 /// File-name prefix for the rolling ERROR-only JSONL appender.
 ///
 /// `RollingFileAppender` with `Rotation::HOURLY` produces files named
@@ -264,6 +383,87 @@ pub fn init_app_log_appender(
     );
 
     Ok((non_blocking, guard))
+}
+
+/// 2026-05-02 — generic per-category log appender. Mirrors
+/// [`init_app_log_appender`] but parameterized over (`dir`, `prefix`)
+/// so the 5 [`LogCategory`] variants can each get their own
+/// hourly-rotated stream without code duplication.
+///
+/// File on disk: `{dir}/{prefix}.{YYYY-MM-DD-HH}` rotated hourly.
+///
+/// The caller MUST keep the `WorkerGuard` alive for the process
+/// lifetime — dropping it stops the background flush thread (same
+/// constraint as `init_app_log_appender` + `init_errors_jsonl_appender`).
+pub fn init_category_log_appender(
+    dir: impl Into<PathBuf>,
+    prefix: &'static str,
+) -> Result<(tracing_appender::non_blocking::NonBlocking, WorkerGuard)> {
+    let dir: PathBuf = dir.into();
+    std::fs::create_dir_all(&dir).with_context(|| {
+        format!(
+            "failed to create category log directory at {}",
+            dir.display()
+        )
+    })?;
+
+    let appender = RollingFileAppender::new(Rotation::HOURLY, &dir, prefix);
+    let (non_blocking, guard) = tracing_appender::non_blocking(appender);
+
+    info!(
+        dir = %dir.display(),
+        prefix,
+        rotation = "hourly",
+        "category log appender initialized"
+    );
+
+    Ok((non_blocking, guard))
+}
+
+/// Sweeps a category log directory using the same age-based mtime
+/// criterion as [`sweep_app_log_retention`]. Generic over `prefix` so
+/// the 5 categories share one implementation.
+pub fn sweep_category_log_retention(
+    dir: &std::path::Path,
+    prefix: &str,
+    retention_hours: u64,
+) -> std::io::Result<usize> {
+    let now = std::time::SystemTime::now();
+    let cutoff = std::time::Duration::from_secs(retention_hours.saturating_mul(3600));
+    let mut deleted = 0usize;
+
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(err) => return Err(err),
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        // Match `{prefix}` exactly OR `{prefix}.{anything}` produced by
+        // the rolling appender. Anything else in the dir is left alone.
+        if name != prefix && !name.starts_with(&format!("{prefix}.")) {
+            continue;
+        }
+
+        let metadata = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let modified = match metadata.modified() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let age = now.duration_since(modified).unwrap_or_default();
+        if age > cutoff && std::fs::remove_file(&path).is_ok() {
+            deleted = deleted.saturating_add(1);
+        }
+    }
+
+    Ok(deleted)
 }
 
 /// Deletes `app.YYYY-MM-DD-HH` files under `dir` whose mtime is older
@@ -1033,5 +1233,114 @@ mod tests {
             elapsed.as_millis() < 100,
             "disabled tracing should return immediately"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // 2026-05-02 — Per-category log file separation ratchets
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_log_category_all_returns_exactly_five_variants() {
+        // Operator-spec: 5 categories — movers, candles, live ticks,
+        // historical, option chain. Adding a 6th must consciously bump
+        // the array size + this assertion.
+        let all = LogCategory::all();
+        assert_eq!(all.len(), 5);
+    }
+
+    #[test]
+    fn test_log_category_dir_and_prefix_stable_for_each_variant() {
+        // Pin the on-disk paths so an accidental rename doesn't break
+        // operator runbooks or external Loki/Alloy scrape configs.
+        assert_eq!(LogCategory::Movers.dir(), "data/logs/movers");
+        assert_eq!(LogCategory::Movers.prefix(), "movers");
+        assert_eq!(LogCategory::Candles.dir(), "data/logs/candles");
+        assert_eq!(LogCategory::Candles.prefix(), "candles");
+        assert_eq!(LogCategory::LiveTicks.dir(), "data/logs/live_ticks");
+        assert_eq!(LogCategory::LiveTicks.prefix(), "live_ticks");
+        assert_eq!(LogCategory::Historical.dir(), "data/logs/historical");
+        assert_eq!(LogCategory::Historical.prefix(), "historical");
+        assert_eq!(LogCategory::OptionChain.dir(), "data/logs/option_chain");
+        assert_eq!(LogCategory::OptionChain.prefix(), "option_chain");
+    }
+
+    #[test]
+    fn test_build_category_targets_movers_includes_all_pipeline_modules() {
+        let targets = build_category_targets(LogCategory::Movers);
+        // Verified module paths against crates/core/src/pipeline/mod.rs
+        // + crates/storage/src/lib.rs on 2026-05-02. Every module that
+        // logs movers data MUST be listed.
+        let expected = [
+            "tickvault_core::pipeline::mover_classifier",
+            "tickvault_core::pipeline::movers_window",
+            "tickvault_core::pipeline::option_movers",
+            "tickvault_core::pipeline::preopen_movers",
+            "tickvault_core::pipeline::top_movers",
+            "tickvault_storage::movers_persistence",
+            "tickvault_storage::movers_unified_persistence",
+            "tickvault_storage::movers_unified_query",
+            "tickvault_storage::movers_unified_writer",
+        ];
+        for e in expected {
+            assert!(
+                targets.contains(&e),
+                "movers targets missing required module: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_category_targets_historical_routes_fetcher_and_cross_verify() {
+        let targets = build_category_targets(LogCategory::Historical);
+        assert!(targets.contains(&"tickvault_core::historical"));
+        assert!(targets.contains(&"tickvault_storage::historical_fetch_marker"));
+        // Operator's primary use case: see candle_fetcher progress logs
+        // in their own file. The `tickvault_core::historical` prefix
+        // covers `candle_fetcher` (its module path is
+        // tickvault_core::historical::candle_fetcher). Verified against
+        // crates/core/src/historical/mod.rs.
+    }
+
+    #[test]
+    fn test_build_category_targets_live_ticks_covers_websocket_and_pipeline() {
+        let targets = build_category_targets(LogCategory::LiveTicks);
+        assert!(targets.contains(&"tickvault_core::websocket"));
+        assert!(targets.contains(&"tickvault_core::pipeline::tick_processor"));
+        assert!(targets.contains(&"tickvault_storage::tick_persistence"));
+    }
+
+    #[test]
+    fn test_build_category_targets_each_variant_is_non_empty() {
+        for cat in LogCategory::all() {
+            let targets = build_category_targets(cat);
+            assert!(
+                !targets.is_empty(),
+                "category {cat:?} must route at least one module"
+            );
+        }
+    }
+
+    #[test]
+    fn test_init_category_log_appender_creates_directory_idempotent() {
+        let temp = std::env::temp_dir().join(format!("tv_cat_log_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp); // best-effort cleanup
+        let result = init_category_log_appender(&temp, "test_category");
+        assert!(result.is_ok(), "first init must succeed");
+        assert!(temp.is_dir(), "appender must have created the directory");
+        // Idempotent — second call on same dir must also succeed.
+        let _drop_first = result;
+        let result2 = init_category_log_appender(&temp, "test_category");
+        assert!(result2.is_ok(), "second init on same dir must succeed");
+        // Best-effort cleanup
+        drop(result2);
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[test]
+    fn test_sweep_category_log_retention_returns_zero_on_missing_dir() {
+        let nonexistent = std::env::temp_dir().join("definitely_not_a_real_dir_xyz");
+        let _ = std::fs::remove_dir_all(&nonexistent);
+        let deleted = sweep_category_log_retention(&nonexistent, "movers", 24).unwrap();
+        assert_eq!(deleted, 0);
     }
 }
