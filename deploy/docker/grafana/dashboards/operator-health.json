@@ -1780,6 +1780,140 @@
           ]
         }
       }
+    },
+    {
+      "type": "stat",
+      "id": 47,
+      "title": "Depth-dynamic diff: cycles + adds + removes (5m)",
+      "description": "PR-D 2026-05-02. Per-feed (depth-20-dynamic / depth-200-dynamic) counters from the all-5-dynamic depth pipeline (depth_dynamic_pipeline_v2). cycles_total = non-no-op diff cycles in 5m; adds_total = SIDs subscribed; removes_total = SIDs unsubscribed. All wrapped in increase() per audit-findings Rule 12 — raw counters lie after process restart. A spike in adds + removes during a 60s cycle = volatile rank-set churn; sustained 0 = either no rank changes (steady state) or pipeline failure (check tv_depth_dynamic_set_size).",
+      "gridPos": {
+        "h": 6,
+        "w": 12,
+        "x": 0,
+        "y": 60
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (feed) (increase(tv_depth_dynamic_diff_cycles_total[5m]))",
+          "legendFormat": "{{feed}} cycles",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (feed) (increase(tv_depth_dynamic_diff_adds_total[5m]))",
+          "legendFormat": "{{feed}} adds",
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "sum by (feed) (increase(tv_depth_dynamic_diff_removes_total[5m]))",
+          "legendFormat": "{{feed}} removes",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "unit": "none",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green"
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "background_solid",
+        "graphMode": "area",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "id": 48,
+      "title": "Depth-dynamic set size (current)",
+      "description": "PR-D 2026-05-02. Live gauge of the current top-K SID-set size per feed. Expected steady-state: depth-20-dynamic = 250, depth-200-dynamic = 5. A sustained value below capacity for 5+ min during market hours fires the tv-depth-dynamic-set-size-low alert (severity warning) — usually upstream MOVERS-02 writer failure. Note: this is a GAUGE not a counter, so it's safe to display raw (Rule 12 only applies to counters).",
+      "gridPos": {
+        "h": 6,
+        "w": 12,
+        "x": 12,
+        "y": 60
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "tv_depth_dynamic_set_size",
+          "legendFormat": "{{feed}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "unit": "none",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "red"
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "green",
+                "value": 5
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "background_solid",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        }
+      }
     }
   ]
 }
