@@ -189,6 +189,13 @@ const DEPTH_CONNECTION_PREFIX: &str = "depth-20lvl";
 /// unified 09:12 close flow, depth connections are spawned idle (socket open,
 /// authenticated, but no subscribe sent) and only start streaming after
 /// Phase 2 dispatches the initial subscription using the 09:12 index close.
+///
+/// 2026-05-02 PR-B step 3: adds `AddSubscriptions20`, `RemoveSubscriptions20`,
+/// `Add200`, `Remove200` variants for diff-based incremental rebalance. The
+/// rank-250 ↔ rank-251 case sends ONE `RemoveSubscriptions20` (single SID) +
+/// ONE `AddSubscriptions20` (single SID) on the owning conn — never the full
+/// set. The other 4 conns and the other 49 SIDs on the affected conn stay
+/// untouched. See `depth_dynamic_top_volume_selector` + `dynamic_subscription_state`.
 #[derive(Debug)]
 pub enum DepthCommand {
     /// 09:12:30 IST first subscribe for a 20-level depth connection. No
@@ -212,6 +219,28 @@ pub enum DepthCommand {
         unsubscribe_message: String,
         subscribe_message: String,
     },
+
+    /// PR-B step 3: incremental ADD on a 20-level connection. Sends RequestCode
+    /// 23 for one or more SIDs without touching the rest of the connection's
+    /// subscription set. Typically 1 SID per command but supports batches for
+    /// mass-cycle days. Zero disconnect, no unsubscribe.
+    AddSubscriptions20 { subscribe_messages: Vec<String> },
+
+    /// PR-B step 3: incremental REMOVE on a 20-level connection. Sends
+    /// RequestCode 25 for one or more SIDs without touching the rest of the
+    /// connection's subscription set. Typically 1 SID per command. Zero
+    /// disconnect, no resubscribe.
+    RemoveSubscriptions20 { unsubscribe_messages: Vec<String> },
+
+    /// PR-B step 3: incremental ADD on a 200-level connection. 200-level
+    /// caps at 1 SID per conn, so this fires when the previous SID was
+    /// already removed. Single JSON message.
+    Add200 { subscribe_message: String },
+
+    /// PR-B step 3: incremental REMOVE on a 200-level connection. 200-level
+    /// caps at 1 SID per conn, so this empties the conn (no resubscribe in
+    /// the same command). Single JSON message.
+    Remove200 { unsubscribe_message: String },
 }
 
 // Read timeout for depth connections (seconds).
@@ -666,6 +695,25 @@ async fn connect_and_run_depth(
                             }
                         }
                         info!("{prefix}: REBALANCE complete — instrument swap done");
+                    }
+                    // PR-B step 3: incremental ADD (no preceding unsubscribe).
+                    // Typical case: 1 SID added per 60s diff cycle.
+                    DepthCommand::AddSubscriptions20 { subscribe_messages } => {
+                        info!("{prefix}: DIFF ADD — {} subscribe message(s)", subscribe_messages.len());
+                        for msg in &subscribe_messages {
+                            if let Err(err) = write.send(Message::Text(msg.clone().into())).await {
+                                warn!(?err, "{prefix}: diff-add subscribe send failed");
+                            }
+                        }
+                    }
+                    // PR-B step 3: incremental REMOVE (no following resubscribe).
+                    DepthCommand::RemoveSubscriptions20 { unsubscribe_messages } => {
+                        info!("{prefix}: DIFF REMOVE — {} unsubscribe message(s)", unsubscribe_messages.len());
+                        for msg in &unsubscribe_messages {
+                            if let Err(err) = write.send(Message::Text(msg.clone().into())).await {
+                                warn!(?err, "{prefix}: diff-remove unsubscribe send failed");
+                            }
+                        }
                     }
                     // Wrong-type commands on a 20-level connection are no-ops
                     // — the Phase 2 dispatcher routes by feed type, so these
@@ -1237,6 +1285,22 @@ async fn connect_and_run_200_depth(
                         }
                         info!("{prefix}: REBALANCE complete — 200-level ATM swap done, zero disconnect");
                     }
+                    // PR-B step 3: incremental ADD on a 200-level conn (after a Remove200
+                    // freed the slot). Sends a single RequestCode 23 frame.
+                    DepthCommand::Add200 { subscribe_message } => {
+                        info!("{prefix}: DIFF ADD 200-level — single SID");
+                        if let Err(err) = write.send(Message::Text(subscribe_message.into())).await {
+                            warn!(?err, "{prefix}: diff-add 200-level subscribe failed");
+                        }
+                    }
+                    // PR-B step 3: incremental REMOVE on a 200-level conn. Empties the
+                    // conn (it stays connected awaiting a future Add200).
+                    DepthCommand::Remove200 { unsubscribe_message } => {
+                        info!("{prefix}: DIFF REMOVE 200-level — single SID");
+                        if let Err(err) = write.send(Message::Text(unsubscribe_message.into())).await {
+                            warn!(?err, "{prefix}: diff-remove 200-level unsubscribe failed");
+                        }
+                    }
                     // Wrong-type commands on a 200-level connection are no-ops
                     // — the Phase 2 dispatcher routes by feed type, so this
                     // should never fire; logging a warn! catches regressions.
@@ -1441,6 +1505,110 @@ mod tests {
         } else {
             panic!("expected InitialSubscribe200 variant");
         }
+    }
+
+    // 2026-05-02 PR-B step 3: ratchet tests for the 4 diff-based variants
+    // that enable incremental rebalance on depth-20 + depth-200 conns.
+
+    #[test]
+    fn test_depth_command_has_diff_add_remove_variants() {
+        // Pin the 4 new variants exist on the enum.
+        let _ = DepthCommand::AddSubscriptions20 {
+            subscribe_messages: vec![],
+        };
+        let _ = DepthCommand::RemoveSubscriptions20 {
+            unsubscribe_messages: vec![],
+        };
+        let _ = DepthCommand::Add200 {
+            subscribe_message: String::new(),
+        };
+        let _ = DepthCommand::Remove200 {
+            unsubscribe_message: String::new(),
+        };
+    }
+
+    #[test]
+    fn test_depth_command_add_subscriptions_20_carries_subscribe_batch() {
+        let msgs = vec![
+            "{\"RequestCode\":23,\"InstrumentCount\":1,\"InstrumentList\":[{\"ExchangeSegment\":\"NSE_FNO\",\"SecurityId\":\"50001\"}]}".to_string(),
+        ];
+        let cmd = DepthCommand::AddSubscriptions20 {
+            subscribe_messages: msgs.clone(),
+        };
+        if let DepthCommand::AddSubscriptions20 { subscribe_messages } = cmd {
+            assert_eq!(subscribe_messages, msgs);
+            assert!(subscribe_messages[0].contains("\"RequestCode\":23"));
+        } else {
+            panic!("expected AddSubscriptions20 variant");
+        }
+    }
+
+    #[test]
+    fn test_depth_command_remove_subscriptions_20_carries_unsubscribe_batch() {
+        // Per dhan-annexure-enums rule 3: UnsubscribeFullDepth = 25 (NOT 24).
+        let msgs = vec![
+            "{\"RequestCode\":25,\"InstrumentCount\":1,\"InstrumentList\":[{\"ExchangeSegment\":\"NSE_FNO\",\"SecurityId\":\"50000\"}]}".to_string(),
+        ];
+        let cmd = DepthCommand::RemoveSubscriptions20 {
+            unsubscribe_messages: msgs.clone(),
+        };
+        if let DepthCommand::RemoveSubscriptions20 {
+            unsubscribe_messages,
+        } = cmd
+        {
+            assert_eq!(unsubscribe_messages, msgs);
+            assert!(unsubscribe_messages[0].contains("\"RequestCode\":25"));
+        } else {
+            panic!("expected RemoveSubscriptions20 variant");
+        }
+    }
+
+    #[test]
+    fn test_depth_command_add_200_carries_single_subscribe_message() {
+        // 200-level uses flat JSON (no InstrumentList array) per
+        // dhan-full-market-depth rule 10.
+        let msg = "{\"RequestCode\":23,\"ExchangeSegment\":\"NSE_FNO\",\"SecurityId\":\"50001\"}"
+            .to_string();
+        let cmd = DepthCommand::Add200 {
+            subscribe_message: msg.clone(),
+        };
+        if let DepthCommand::Add200 { subscribe_message } = cmd {
+            assert_eq!(subscribe_message, msg);
+            assert!(subscribe_message.contains("\"RequestCode\":23"));
+            assert!(!subscribe_message.contains("InstrumentList"));
+        } else {
+            panic!("expected Add200 variant");
+        }
+    }
+
+    #[test]
+    fn test_depth_command_remove_200_carries_single_unsubscribe_message() {
+        let msg = "{\"RequestCode\":25,\"ExchangeSegment\":\"NSE_FNO\",\"SecurityId\":\"50000\"}"
+            .to_string();
+        let cmd = DepthCommand::Remove200 {
+            unsubscribe_message: msg.clone(),
+        };
+        if let DepthCommand::Remove200 {
+            unsubscribe_message,
+        } = cmd
+        {
+            assert_eq!(unsubscribe_message, msg);
+            assert!(unsubscribe_message.contains("\"RequestCode\":25"));
+        } else {
+            panic!("expected Remove200 variant");
+        }
+    }
+
+    #[test]
+    fn test_depth_command_diff_variants_use_correct_dhan_request_codes() {
+        // Pins Dhan annexure-enums rule 3:
+        //   FEED_REQUEST_TWENTY_DEPTH = 23 (subscribe, both 20 + 200)
+        //   FEED_UNSUBSCRIBE_TWENTY_DEPTH = 25 (unsubscribe, both 20 + 200)
+        use tickvault_common::constants::{
+            FEED_REQUEST_TWENTY_DEPTH, FEED_UNSUBSCRIBE_TWENTY_DEPTH,
+        };
+        assert_eq!(FEED_REQUEST_TWENTY_DEPTH, 23);
+        assert_eq!(FEED_UNSUBSCRIBE_TWENTY_DEPTH, 25);
     }
 
     #[test]
