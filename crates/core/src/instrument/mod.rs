@@ -23,6 +23,7 @@ pub mod depth_rebalancer;
 pub mod depth_strike_selector;
 pub mod depth_top_volume_selector;
 pub mod diagnostic;
+pub mod dynamic_subscription_state;
 pub mod instrument_loader;
 pub mod live_tick_atm_resolver;
 pub mod market_open_self_test;

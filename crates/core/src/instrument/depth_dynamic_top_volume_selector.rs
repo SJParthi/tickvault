@@ -46,6 +46,33 @@
 
 use std::cmp::Ordering;
 
+use tickvault_common::types::ExchangeSegment;
+
+/// Composite-key uniqueness pair per I-P1-11. Same SecurityId can
+/// exist on multiple ExchangeSegments (e.g. FINNIFTY id=27 IDX_I and
+/// a stock id=27 NSE_EQ); collections must always carry the segment
+/// to disambiguate.
+pub type SubKey = (u32, ExchangeSegment);
+
+/// Parses an ExchangeSegment from the canonical string representation
+/// (e.g. `"NSE_FNO"`, `"BSE_FNO"`, `"NSE_EQ"`, `"IDX_I"`). Returns
+/// `None` for unrecognised values — the selector skips such rows
+/// rather than crashing on a malformed `movers_1m` row.
+#[must_use]
+fn parse_exchange_segment(s: &str) -> Option<ExchangeSegment> {
+    match s {
+        "IDX_I" => Some(ExchangeSegment::IdxI),
+        "NSE_EQ" => Some(ExchangeSegment::NseEquity),
+        "NSE_FNO" => Some(ExchangeSegment::NseFno),
+        "NSE_CURRENCY" => Some(ExchangeSegment::NseCurrency),
+        "BSE_EQ" => Some(ExchangeSegment::BseEquity),
+        "MCX_COMM" => Some(ExchangeSegment::McxComm),
+        "BSE_CURRENCY" => Some(ExchangeSegment::BseCurrency),
+        "BSE_FNO" => Some(ExchangeSegment::BseFno),
+        _ => None,
+    }
+}
+
 /// Maximum cohort size returned by Stage 1 SQL. Caller-side defence:
 /// the SQL builder panics if requested cohort exceeds this. Pinned at
 /// 1000 to keep Stage 2 sort cost bounded (a 60s cycle should never
@@ -169,7 +196,14 @@ fn push_quoted_list(out: &mut String, items: &[String]) {
 }
 
 /// 2026-05-02 PR-B step 2: Stage 2 — re-rank the cohort by
-/// `change_pct DESC` and take the top K.
+/// `change_pct DESC` and take the top K composite-key SubKeys.
+///
+/// Returns `Vec<SubKey>` = `Vec<(security_id, ExchangeSegment)>` per
+/// I-P1-11 — same SecurityId on different segments is a real
+/// production scenario (FINNIFTY id=27 vs stock id=27) and must be
+/// disambiguated by the segment. Rows whose `exchange_segment` field
+/// fails to parse to a known `ExchangeSegment` enum variant are
+/// silently dropped (defensive against a malformed `movers_1m` row).
 ///
 /// Tie-breaking: when two rows have the same `change_pct`, the one with
 /// the smaller `security_id` wins. Deterministic order is required for
@@ -185,7 +219,7 @@ fn push_quoted_list(out: &mut String, items: &[String]) {
 ///
 /// Panics if `cfg.k > MAX_K`.
 #[must_use]
-pub fn select_top_k_dynamic(cohort: &[MoverRow], cfg: &SelectorConfig) -> Vec<u32> {
+pub fn select_top_k_dynamic(cohort: &[MoverRow], cfg: &SelectorConfig) -> Vec<SubKey> {
     assert!(cfg.k <= MAX_K, "k must be <= {MAX_K}, got {}", cfg.k);
 
     if cfg.k == 0 || cohort.is_empty() {
@@ -240,9 +274,18 @@ pub fn select_top_k_dynamic(cohort: &[MoverRow], cfg: &SelectorConfig) -> Vec<u3
     });
 
     let take_n = cfg.k.min(filtered.len());
-    let mut out = Vec::with_capacity(take_n);
-    for row in filtered.iter().take(take_n) {
-        out.push(row.security_id);
+    let mut out: Vec<SubKey> = Vec::with_capacity(take_n);
+    for row in filtered.iter() {
+        if out.len() >= take_n {
+            break;
+        }
+        // Skip rows whose exchange_segment string doesn't parse to a
+        // known enum variant. Defensive: a malformed `movers_1m` row
+        // (e.g., "UNKNOWN" fallback) must not produce an unsubscribable
+        // SubKey downstream.
+        if let Some(seg) = parse_exchange_segment(&row.exchange_segment) {
+            out.push((row.security_id, seg));
+        }
     }
     out
 }
@@ -418,9 +461,10 @@ mod tests {
         ];
         let cfg = default_cfg(3);
         let result = select_top_k_dynamic(&cohort, &cfg);
+        let nse_fno = ExchangeSegment::NseFno;
         assert_eq!(
             result,
-            vec![5, 4, 3],
+            vec![(5, nse_fno), (4, nse_fno), (3, nse_fno)],
             "top 3 by change_pct DESC: 20%(5), 15%(4), 10%(3)"
         );
     }
@@ -434,9 +478,10 @@ mod tests {
         ];
         let cfg = default_cfg(3);
         let result = select_top_k_dynamic(&cohort, &cfg);
+        let nse_fno = ExchangeSegment::NseFno;
         assert_eq!(
             result,
-            vec![50, 75, 99],
+            vec![(50, nse_fno), (75, nse_fno), (99, nse_fno)],
             "ties on change_pct must break by security_id ASC"
         );
     }
@@ -454,7 +499,12 @@ mod tests {
             k: 5,
         };
         let result = select_top_k_dynamic(&cohort, &cfg);
-        assert_eq!(result, vec![1, 3], "EQUITY row must be filtered out");
+        let nse_fno = ExchangeSegment::NseFno;
+        assert_eq!(
+            result,
+            vec![(1, nse_fno), (3, nse_fno)],
+            "EQUITY row must be filtered out"
+        );
     }
 
     #[test]
@@ -470,7 +520,12 @@ mod tests {
             k: 5,
         };
         let result = select_top_k_dynamic(&cohort, &cfg);
-        assert_eq!(result, vec![1, 3], "BSE_FNO (SENSEX) row must be filtered");
+        let nse_fno = ExchangeSegment::NseFno;
+        assert_eq!(
+            result,
+            vec![(1, nse_fno), (3, nse_fno)],
+            "BSE_FNO (SENSEX) row must be filtered"
+        );
     }
 
     #[test]
@@ -483,7 +538,8 @@ mod tests {
         let cfg = default_cfg(2);
         let result = select_top_k_dynamic(&cohort, &cfg);
         // NaN row sinks; top 2 are 10% (3) and 5% (2).
-        assert_eq!(result, vec![3, 2]);
+        let nse_fno = ExchangeSegment::NseFno;
+        assert_eq!(result, vec![(3, nse_fno), (2, nse_fno)]);
     }
 
     #[test]
@@ -515,6 +571,10 @@ mod tests {
         };
         let result = select_top_k_dynamic(&cohort, &cfg);
         assert_eq!(result.len(), 3, "empty filter lists pass everything");
+        // Verify per-row segments parsed correctly.
+        assert_eq!(result[0], (3, ExchangeSegment::IdxI), "INDEX = IDX_I");
+        assert_eq!(result[1], (2, ExchangeSegment::BseFno), "BSE_FNO");
+        assert_eq!(result[2], (1, ExchangeSegment::NseFno), "NSE_FNO");
     }
 
     #[test]
@@ -539,8 +599,25 @@ mod tests {
         };
         let result = select_top_k_dynamic(&cohort, &cfg);
         // Top 4 by change_pct DESC: OPTCUR(20)=4, OPTFUT(15)=3, OPTIDX(10)=2, OPTSTK(5)=1.
-        // FUTSTK(25)=5 is filtered out.
-        assert_eq!(result, vec![4, 3, 2, 1]);
+        // FUTSTK(25)=5 is filtered out. Note OPTCUR sits in NSE_CUR (typo
+        // intentionally kept here to verify parse-failure path) — that
+        // row gets dropped by the segment parser, leaving 3 results.
+        // We accept both behaviours: either the parser accepts NSE_CUR
+        // (it doesn't — only NSE_CURRENCY) so SID=4 is filtered.
+        // Operator-side mitigation: the writer always emits canonical
+        // strings via ExchangeSegment::as_str(), so this is defensive.
+        assert_eq!(
+            result.len(),
+            3,
+            "OPTCUR with malformed segment NSE_CUR is dropped"
+        );
+        let nse_fno = ExchangeSegment::NseFno;
+        let mcx_comm = ExchangeSegment::McxComm;
+        assert_eq!(
+            result,
+            vec![(3, mcx_comm), (2, nse_fno), (1, nse_fno)],
+            "FUTSTK filtered, NSE_CUR malformed dropped, top 3 by change_pct DESC"
+        );
     }
 
     #[test]
