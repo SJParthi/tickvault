@@ -362,6 +362,15 @@ pub enum ErrorCode {
     /// path (Ticket #5610706 reverted server-side?). Severity::Critical
     /// — operator should investigate before next market open.
     Depth200Smoke01NoFramesAtBoot,
+    /// Phase 2 readiness pre-flight failed at 09:13:01 IST. Fires
+    /// 1 second after `Phase2Complete` if any of the 11 forward-looking
+    /// pre-conditions for the 09:15 / 09:15:30 / 09:16:30 milestones
+    /// fails: token expiry headroom, main feed pool, depth-20 pool,
+    /// depth-200 pool, order update WS, QuestDB ILP, pre-open buffer
+    /// coverage, Phase 2 plan quality, subscribe ack rate, rescue ring
+    /// health, composite SLO score. Severity::Critical — operator has
+    /// ~2 minutes (until 09:15) to act before market open.
+    Phase2Ready01PreflightFailed,
     /// Wave 5 Item 13 — boot-time prev-close routing assertion failed.
     /// The subscription plan contains an instrument whose `(segment,
     /// feed_mode)` pair cannot deliver previous-day close per the
@@ -495,6 +504,7 @@ impl ErrorCode {
             // Wave 5 Item 26 L1 — volume cumulative-monotonicity guard
             Self::Volume01MonotonicityBreach => "VOLUME-MONO-01",
             Self::Depth200Smoke01NoFramesAtBoot => "DEPTH200-SMOKE-01",
+            Self::Phase2Ready01PreflightFailed => "PHASE2-READY-01",
         }
     }
 
@@ -520,7 +530,8 @@ impl ErrorCode {
             | Self::Selftest02Failed
             | Self::Depth20Dyn02SwapChannelBroken
             | Self::PrevClose03BootRoutingAssertion
-            | Self::Depth200Smoke01NoFramesAtBoot => Severity::Critical,
+            | Self::Depth200Smoke01NoFramesAtBoot
+            | Self::Phase2Ready01PreflightFailed => Severity::Critical,
             // Info: positive-ping / lifecycle confirmations
             Self::Selftest01Passed | Self::Slo01Healthy => Severity::Info,
             // High: composite SLO degradation summary signal
@@ -707,7 +718,8 @@ impl ErrorCode {
             | Self::Depth200Dyn01TopGainersEmpty
             | Self::PrevClose03BootRoutingAssertion
             | Self::Volume01MonotonicityBreach
-            | Self::Depth200Smoke01NoFramesAtBoot => ".claude/rules/project/wave-5-error-codes.md",
+            | Self::Depth200Smoke01NoFramesAtBoot
+            | Self::Phase2Ready01PreflightFailed => ".claude/rules/project/wave-5-error-codes.md",
         }
     }
 
@@ -823,6 +835,7 @@ impl ErrorCode {
             Self::PrevClose03BootRoutingAssertion,
             Self::Volume01MonotonicityBreach,
             Self::Depth200Smoke01NoFramesAtBoot,
+            Self::Phase2Ready01PreflightFailed,
         ]
     }
 }
@@ -1006,7 +1019,9 @@ mod tests {
         // along with the SELF-token manager.
         // 2026-05-02 (PR-B): bumped 92 -> 93 for DEPTH200-SMOKE-01
         // (boot-time depth-200 smoke test no-frames Critical signal).
-        assert_eq!(ErrorCode::all().len(), 93);
+        // 2026-05-02 (PR-G): bumped 93 -> 94 for PHASE2-READY-01
+        // (09:13:01 IST forward-looking pre-flight readiness check).
+        assert_eq!(ErrorCode::all().len(), 94);
     }
 
     #[test]

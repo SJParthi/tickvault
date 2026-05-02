@@ -310,6 +310,32 @@ pub enum NotificationEvent {
     /// restart). Low-noise — informational only.
     Phase2Skipped { reason: String },
 
+    /// PR-G (2026-05-02): Phase 2 readiness pre-flight PASSED at 09:13:01 IST.
+    /// All 11 forward-looking pre-conditions for the 09:15 / 09:15:30 /
+    /// 09:16:30 milestones are met. Severity::Info — single positive ping
+    /// telling the operator the next 4 minutes are pre-validated.
+    Phase2ReadinessPassed {
+        /// Number of checks that passed (always 11 on this variant).
+        checks_passed: u8,
+        /// Composite SLO score at the time of the check (0.0..=1.0).
+        slo_score: f64,
+    },
+
+    /// PR-G (2026-05-02): Phase 2 readiness pre-flight FAILED at 09:13:01 IST.
+    /// One or more pre-conditions for the upcoming market-open milestones
+    /// are not met. Severity::Critical — operator has ~2 minutes (until
+    /// 09:15) to act before market open.
+    /// `code = ErrorCode::Phase2Ready01PreflightFailed`.
+    Phase2ReadinessFailed {
+        /// Names of failing checks (e.g. `["main_feed_pool", "depth_200_pool"]`).
+        failed: Vec<String>,
+        /// Per-check `name=expected/observed` strings, in same order as
+        /// `failed`. Operator-readable; not parsed elsewhere.
+        details: Vec<String>,
+        /// Whole-number minutes until NSE market open (always 2 at 09:13:01).
+        minutes_to_market_open: u32,
+    },
+
     /// Wave 5 Item 26 L2 — NSE bhavcopy daily volume cross-check completed.
     /// Fires once at 16:30 IST after the post-market scheduler drains the
     /// bhavcopy diff into `volume_nse_audit`. Counts MUST sum to total
@@ -1276,6 +1302,35 @@ impl NotificationEvent {
             Self::Phase2Skipped { reason } => {
                 format!("<b>Phase 2 skipped</b>\n{reason}")
             }
+            Self::Phase2ReadinessPassed {
+                checks_passed,
+                slo_score,
+            } => {
+                format!(
+                    "<b>Phase 2 readiness PASSED</b>\n\
+                     {checks_passed}/11 pre-flight checks green\n\
+                     SLO score: {slo_score:.3}\n\
+                     09:15 / 09:15:30 / 09:16:30 milestones pre-validated"
+                )
+            }
+            Self::Phase2ReadinessFailed {
+                failed,
+                details,
+                minutes_to_market_open,
+            } => {
+                let failed_list = failed.join(", ");
+                let details_list = details.join("\n  ");
+                format!(
+                    "<b>Phase 2 readiness FAILED</b>\n\
+                     code: <code>PHASE2-READY-01</code>\n\
+                     failed: <code>[{failed_list}]</code>\n\
+                     details:\n  {details_list}\n\
+                     minutes_to_market_open: <code>{minutes_to_market_open}</code>\n\
+                     ACTION: read failing-check details + follow runbook \
+                     <code>.claude/rules/project/wave-5-error-codes.md</code> \
+                     before 09:15 IST"
+                )
+            }
             Self::NseBhavcopyCheckComplete {
                 matched,
                 mismatched,
@@ -1956,6 +2011,8 @@ impl NotificationEvent {
             Self::Phase2Complete { .. } => "Phase2Complete",
             Self::Phase2Failed { .. } => "Phase2Failed",
             Self::Phase2Skipped { .. } => "Phase2Skipped",
+            Self::Phase2ReadinessPassed { .. } => "Phase2ReadinessPassed",
+            Self::Phase2ReadinessFailed { .. } => "Phase2ReadinessFailed",
             Self::NseBhavcopyCheckComplete { .. } => "NseBhavcopyCheckComplete",
             Self::NseBhavcopyCheckFailed { .. } => "NseBhavcopyCheckFailed",
             Self::MidMarketBootComplete { .. } => "MidMarketBootComplete",
@@ -2104,6 +2161,8 @@ impl NotificationEvent {
             Self::Phase2Complete { .. } => Severity::Medium,
             Self::Phase2Failed { .. } => Severity::High,
             Self::Phase2Skipped { .. } => Severity::Low,
+            Self::Phase2ReadinessPassed { .. } => Severity::Info,
+            Self::Phase2ReadinessFailed { .. } => Severity::Critical,
             // Wave 5 Item 26 L2 — operator triages FAIL/MISSING_OUR rows
             // via the audit table; the summary itself is Info on the
             // happy path. The dedicated `NseBhavcopyCheckFailed` variant
