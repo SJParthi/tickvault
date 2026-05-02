@@ -298,16 +298,68 @@ fn parse_cohort_dataset(dataset: &[serde_json::Value]) -> anyhow::Result<Vec<Mov
 /// Translates `Vec<DiffOp>` into per-conn `DepthCommand` and dispatches
 /// over the registered mpsc senders.
 ///
-/// `sids_per_conn = 1` → depth-200 (uses `Add200` / `Remove200`
-/// flat-JSON commands).
-/// `sids_per_conn > 1` → depth-20 (uses `AddSubscriptions20` /
-/// `RemoveSubscriptions20` batched commands).
+/// `sids_per_conn = 1` → depth-200: emits 1 `Add200` / `Remove200` cmd
+/// per op (the Dhan flat-JSON wire format takes a single SID per
+/// frame).
+/// `sids_per_conn > 1` → depth-20: ops are GROUPED by `conn_idx` and
+/// emitted as ONE `AddSubscriptions20` + ONE `RemoveSubscriptions20`
+/// per conn per cycle. This bounds Vec allocations to ≤ 2 × `conns`
+/// per 60s cycle (= 10 for the canonical 5-conn pool) regardless of
+/// op count, addressing the hot-path-reviewer HIGH finding (per-op
+/// `vec![one_msg]` was 250-allocs/cycle worst case).
+///
+/// # Hot-path classification
+///
+/// This function runs on the 60s diff cycle inside the unified
+/// pipeline_v2 supervisor — NOT on the per-tick parser hot path.
+/// The 60s cadence + bounded ≤ 250-op/cycle upper bound make
+/// this a "warm" supervisor path; the project's hot-path bans
+/// (per `.claude/rules/project/hot-path.md`) target the per-tick
+/// parser/ILP hot path. Even so, the rebatching above keeps
+/// allocations bounded by pool shape, not op volume.
 async fn dispatch_ops(
     label: &'static str,
     ops: &[DiffOp],
     senders: &HashMap<ConnIdx, mpsc::Sender<DepthCommand>>,
     sids_per_conn: u16,
 ) {
+    if sids_per_conn == 1 {
+        // depth-200 — single-SID-per-frame wire format. One cmd per op.
+        for op in ops {
+            match op {
+                DiffOp::Remove {
+                    conn_idx,
+                    security_id,
+                    exchange_segment,
+                } => {
+                    let cmd = DepthCommand::Remove200 {
+                        unsubscribe_message: build_remove_200_message(
+                            *security_id,
+                            *exchange_segment,
+                        ),
+                    };
+                    send_or_warn(label, *conn_idx, "Remove", senders, cmd).await;
+                }
+                DiffOp::Add {
+                    conn_idx,
+                    security_id,
+                    exchange_segment,
+                } => {
+                    let cmd = DepthCommand::Add200 {
+                        subscribe_message: build_add_200_message(*security_id, *exchange_segment),
+                    };
+                    send_or_warn(label, *conn_idx, "Add", senders, cmd).await;
+                }
+            }
+        }
+        return;
+    }
+
+    // depth-20 path — group per-conn so each conn receives at most ONE
+    // batched Add cmd + ONE batched Remove cmd per cycle.
+    let conn_count = senders.len().max(1);
+    let mut adds_by_conn: HashMap<ConnIdx, Vec<String>> = HashMap::with_capacity(conn_count);
+    let mut removes_by_conn: HashMap<ConnIdx, Vec<String>> = HashMap::with_capacity(conn_count);
     for op in ops {
         match op {
             DiffOp::Remove {
@@ -315,43 +367,34 @@ async fn dispatch_ops(
                 security_id,
                 exchange_segment,
             } => {
-                let cmd = if sids_per_conn == 1 {
-                    DepthCommand::Remove200 {
-                        unsubscribe_message: build_remove_200_message(
-                            *security_id,
-                            *exchange_segment,
-                        ),
-                    }
-                } else {
-                    DepthCommand::RemoveSubscriptions20 {
-                        unsubscribe_messages: vec![build_remove_20_message(
-                            *security_id,
-                            *exchange_segment,
-                        )],
-                    }
-                };
-                send_or_warn(label, *conn_idx, "Remove", senders, cmd).await;
+                removes_by_conn
+                    .entry(*conn_idx)
+                    .or_insert_with(|| Vec::with_capacity(usize::from(sids_per_conn)))
+                    .push(build_remove_20_message(*security_id, *exchange_segment));
             }
             DiffOp::Add {
                 conn_idx,
                 security_id,
                 exchange_segment,
             } => {
-                let cmd = if sids_per_conn == 1 {
-                    DepthCommand::Add200 {
-                        subscribe_message: build_add_200_message(*security_id, *exchange_segment),
-                    }
-                } else {
-                    DepthCommand::AddSubscriptions20 {
-                        subscribe_messages: vec![build_add_20_message(
-                            *security_id,
-                            *exchange_segment,
-                        )],
-                    }
-                };
-                send_or_warn(label, *conn_idx, "Add", senders, cmd).await;
+                adds_by_conn
+                    .entry(*conn_idx)
+                    .or_insert_with(|| Vec::with_capacity(usize::from(sids_per_conn)))
+                    .push(build_add_20_message(*security_id, *exchange_segment));
             }
         }
+    }
+    for (conn_idx, msgs) in removes_by_conn {
+        let cmd = DepthCommand::RemoveSubscriptions20 {
+            unsubscribe_messages: msgs,
+        };
+        send_or_warn(label, conn_idx, "Remove", senders, cmd).await;
+    }
+    for (conn_idx, msgs) in adds_by_conn {
+        let cmd = DepthCommand::AddSubscriptions20 {
+            subscribe_messages: msgs,
+        };
+        send_or_warn(label, conn_idx, "Add", senders, cmd).await;
     }
 }
 
@@ -751,5 +794,108 @@ mod tests {
         }];
         // Should log error code DEPTH-DYN-V2-04 but not panic.
         dispatch_ops("depth-20-test", &ops, &senders, 50).await;
+    }
+
+    /// Ratchet for the hot-path-reviewer rebatch fix.
+    ///
+    /// Before the rebatch: 100 ops on the same conn would send 100
+    /// individual `AddSubscriptions20` commands (each with a
+    /// `vec![one_msg]`), wasting 100 Vec allocations per cycle.
+    ///
+    /// After the rebatch: 100 ops on the same conn must collapse to
+    /// EXACTLY ONE `AddSubscriptions20` command whose
+    /// `subscribe_messages.len() == 100`.
+    #[tokio::test]
+    async fn test_dispatch_ops_rebatches_adds_per_conn_for_depth_20() {
+        let mut senders: HashMap<ConnIdx, mpsc::Sender<DepthCommand>> = HashMap::new();
+        let (tx, mut rx) = mpsc::channel(8);
+        senders.insert(2, tx);
+
+        // 50 Add ops all targeting conn 2 — must produce 1 cmd, not 50.
+        let ops: Vec<DiffOp> = (0..50)
+            .map(|i| DiffOp::Add {
+                conn_idx: 2,
+                security_id: 60_000_u32 + i,
+                exchange_segment: ExchangeSegment::NseFno,
+            })
+            .collect();
+
+        dispatch_ops("depth-20-test", &ops, &senders, 50).await;
+
+        let cmd = rx
+            .try_recv()
+            .expect("conn 2 must receive ONE batched AddSubscriptions20");
+        match cmd {
+            DepthCommand::AddSubscriptions20 { subscribe_messages } => {
+                assert_eq!(
+                    subscribe_messages.len(),
+                    50,
+                    "rebatch must collapse 50 Add ops into ONE cmd with 50 messages"
+                );
+            }
+            other => panic!("expected AddSubscriptions20, got {other:?}"),
+        }
+        // No further commands.
+        assert!(
+            rx.try_recv().is_err(),
+            "conn 2 must NOT receive a second batched cmd"
+        );
+    }
+
+    /// Ratchet: same rebatch behaviour for Remove ops.
+    #[tokio::test]
+    async fn test_dispatch_ops_rebatches_removes_per_conn_for_depth_20() {
+        let mut senders: HashMap<ConnIdx, mpsc::Sender<DepthCommand>> = HashMap::new();
+        let (tx, mut rx) = mpsc::channel(8);
+        senders.insert(1, tx);
+
+        let ops: Vec<DiffOp> = (0..30)
+            .map(|i| DiffOp::Remove {
+                conn_idx: 1,
+                security_id: 70_000_u32 + i,
+                exchange_segment: ExchangeSegment::NseFno,
+            })
+            .collect();
+
+        dispatch_ops("depth-20-test", &ops, &senders, 50).await;
+
+        let cmd = rx
+            .try_recv()
+            .expect("conn 1 must receive ONE batched RemoveSubscriptions20");
+        match cmd {
+            DepthCommand::RemoveSubscriptions20 {
+                unsubscribe_messages,
+            } => {
+                assert_eq!(unsubscribe_messages.len(), 30);
+            }
+            other => panic!("expected RemoveSubscriptions20, got {other:?}"),
+        }
+    }
+
+    /// Ratchet: depth-200 (sids_per_conn = 1) MUST stay one-cmd-per-op
+    /// because the wire format takes a single SID per frame.
+    #[tokio::test]
+    async fn test_dispatch_ops_does_not_rebatch_for_depth_200() {
+        let mut senders: HashMap<ConnIdx, mpsc::Sender<DepthCommand>> = HashMap::new();
+        let (tx, mut rx) = mpsc::channel(8);
+        senders.insert(0, tx);
+
+        // 3 Add ops all on conn 0 — depth-200 must emit 3 separate Add200 cmds.
+        let ops: Vec<DiffOp> = (0..3)
+            .map(|i| DiffOp::Add {
+                conn_idx: 0,
+                security_id: 80_000_u32 + i,
+                exchange_segment: ExchangeSegment::NseFno,
+            })
+            .collect();
+
+        dispatch_ops("depth-200-test", &ops, &senders, 1).await;
+
+        let mut count = 0;
+        while let Ok(cmd) = rx.try_recv() {
+            assert!(matches!(cmd, DepthCommand::Add200 { .. }));
+            count += 1;
+        }
+        assert_eq!(count, 3, "depth-200 must emit 3 separate Add200 cmds");
     }
 }
