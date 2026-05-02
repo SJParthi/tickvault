@@ -234,6 +234,19 @@ pub fn spawn_depth_dynamic_pool(
                     if !in_market {
                         continue;
                     }
+                    // 2026-05-02 — heartbeat counter for liveness alerting.
+                    // Increments on EVERY in-market tick (including no-op
+                    // cycles where rank-set is unchanged). Distinct from
+                    // `tv_depth_dynamic_diff_cycles_total` which only fires
+                    // on non-no-op cycles. Alert
+                    // `tv-depth-dynamic-pipeline-stalled` fires if this
+                    // counter doesn't increment for 5+ min during market
+                    // hours — meaning the orchestrator is dead.
+                    metrics::counter!(
+                        "tv_depth_dynamic_heartbeat_total",
+                        "feed" => cfg.label
+                    )
+                    .increment(1);
                     // PR-C2 follow-up H2: detect IST midnight rollover and
                     // reset state so the next diff computes against a clean
                     // baseline. Cheap (one i64 compare per 60s tick).
@@ -1174,6 +1187,25 @@ mod tests {
         assert!(
             diff.as_secs() <= 1,
             "two consecutive minute-boundary calls produced Instants {diff:?} apart"
+        );
+    }
+
+    /// 2026-05-02 — heartbeat counter source-scan ratchet. Pins the
+    /// presence of `tv_depth_dynamic_heartbeat_total` increment in the
+    /// orchestrator. Removing it would silently disable the
+    /// `tv-depth-dynamic-pipeline-stalled` Prometheus alert (operator
+    /// would no longer get a Telegram on a dead orchestrator).
+    #[test]
+    fn test_heartbeat_counter_increment_is_present_in_orchestrator() {
+        let src = include_str!("depth_dynamic_pipeline_v2.rs");
+        assert!(
+            src.contains("\"tv_depth_dynamic_heartbeat_total\""),
+            "heartbeat counter increment must remain in spawn_depth_dynamic_pool"
+        );
+        // Must also be tagged with the feed label for per-pool isolation.
+        assert!(
+            src.contains("\"feed\" => cfg.label"),
+            "heartbeat counter must carry the feed label for per-pool isolation"
         );
     }
 
