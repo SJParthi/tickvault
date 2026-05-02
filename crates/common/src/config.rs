@@ -2612,6 +2612,12 @@ mod tests {
     }
 
     #[test]
+    fn test_assert_invariants_returns_ok_on_default() {
+        let cfg = DepthDynamicConfig::default();
+        assert!(cfg.assert_invariants("test", 5).is_ok());
+    }
+
+    #[test]
     fn test_depth_dynamic_config_rejects_zero_conns() {
         let mut cfg = DepthDynamicConfig::default();
         cfg.conns = 0;
