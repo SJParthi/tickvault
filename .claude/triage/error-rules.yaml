@@ -1205,3 +1205,24 @@ rules:
       regression OR stale Arc<MoversTracker> snapshot. Operator runs
       `make doctor` section 9 to compare gauges + investigates the
       latest InstrumentBuildSuccess Telegram event.
+
+  # -----------------------------------------------------------------------
+  # PR-B (2026-05-02) — boot-time depth-200 smoke test
+  # -----------------------------------------------------------------------
+
+  - name: depth200-smoke-01-no-frames-at-boot-escalate
+    match:
+      code: DEPTH200-SMOKE-01
+    action: escalate
+    runbook_path: .claude/rules/project/wave-5-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      DEPTH200-SMOKE-01 = boot-time depth-200 smoke test observed zero
+      frames within the 60s deadline during market hours. Most often
+      means Dhan reverted the Ticket #5610706 server-side gate (depth-200
+      rejecting APP tokens again); next-most-often the 5 SecurityIds
+      are all far-OTM and Dhan's server-side filtering drops them.
+      Severity::Critical; never auto-action — operator decides between
+      `git revert` of PR #427 (restore SELF-token workaround) and
+      Dhan support escalation.

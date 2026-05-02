@@ -352,6 +352,12 @@ pub struct Depth200MinimalConnInputs {
     /// Initial-connect stagger in milliseconds (slot index ×
     /// `DEPTH_200_INITIAL_STAGGER_MS`).
     pub initial_stagger_ms: u64,
+    /// Optional shared frame counter for the boot-time depth-200 smoke
+    /// test (PR-B). Incremented on every received frame across all 5
+    /// slots; the smoke-test task in `boot_smoke_test::run_smoke_test_loop`
+    /// polls this counter for the first ≥ 1 transition. `None` means no
+    /// smoke test is registered (boot path bypassed it, or test paths).
+    pub depth_200_frame_counter: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 
 /// Spawn a minimal depth-200 WebSocket connection (3 tokio tasks).
@@ -377,6 +383,7 @@ pub fn spawn_depth_200_minimal_conn(inputs: Depth200MinimalConnInputs) {
         health_status,
         ws_frame_spill,
         initial_stagger_ms,
+        depth_200_frame_counter,
     } = inputs;
 
     // Frame channel: WS connection task -> persistence task.
@@ -409,6 +416,12 @@ pub fn spawn_depth_200_minimal_conn(inputs: Depth200MinimalConnInputs) {
 
         while let Some(frame) = frame_rx.recv().await {
             frames_counter.increment(1);
+            // PR-B: in-process counter for the boot smoke test. `Relaxed`
+            // is sufficient — readers only care that "≥ 1 frame happened",
+            // not the exact value.
+            if let Some(counter) = &depth_200_frame_counter {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             let ts = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
             match tickvault_core::parser::dispatcher::dispatch_deep_depth_frame(&frame, ts) {
                 Ok(tickvault_core::parser::types::ParsedFrame::DeepDepth {
@@ -629,6 +642,7 @@ mod tests {
                 health_status: _,
                 ws_frame_spill: _,
                 initial_stagger_ms: _,
+                depth_200_frame_counter: _,
             } = inputs;
         }
     }
