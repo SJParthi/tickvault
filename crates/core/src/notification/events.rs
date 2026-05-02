@@ -1007,11 +1007,16 @@ pub enum NotificationEvent {
 /// Resolved from `(security_id, exchange_segment)` via the instrument
 /// registry's O(1) `get_with_segment` lookup. Preserves the composite-key
 /// uniqueness invariant per I-P1-11.
+///
+/// 2026-05-02 (hot-path-reviewer fix): `exchange_segment` is `&'static str`
+/// (not `String`) because `ExchangeSegment::as_str()` already returns a
+/// compile-time constant. Eliminates ~250 String allocations per cycle on
+/// a full reshuffle — bounded but unnecessary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DepthDiffEntry {
     pub security_id: u32,
     /// Stable SYMBOL value (`"NSE_FNO"`, `"BSE_FNO"`, etc.).
-    pub exchange_segment: String,
+    pub exchange_segment: &'static str,
     /// Human-readable contract label, e.g. `"NIFTY 23000 CE 2026-06-26"`.
     pub display_label: String,
     /// Bare underlying, e.g. `"NIFTY"`.
@@ -2385,7 +2390,7 @@ mod tests {
         // Operator-requested 2026-05-02: precise symbol + sid + segment.
         let entry = DepthDiffEntry {
             security_id: 70123,
-            exchange_segment: "NSE_FNO".to_string(),
+            exchange_segment: "NSE_FNO",
             display_label: "NIFTY 23000 CE 2026-06-26".to_string(),
             underlying_symbol: "NIFTY".to_string(),
         };
@@ -2402,7 +2407,7 @@ mod tests {
     fn test_depth_diff_entry_format_line_html_escapes_display_label() {
         let entry = DepthDiffEntry {
             security_id: 99999,
-            exchange_segment: "NSE_FNO".to_string(),
+            exchange_segment: "NSE_FNO",
             display_label: r#"</b><a href="http://attacker.com">click</a><b>"#.to_string(),
             underlying_symbol: "EVIL".to_string(),
         };
@@ -2433,7 +2438,7 @@ mod tests {
         let long = "A".repeat(200);
         let entry = DepthDiffEntry {
             security_id: 1,
-            exchange_segment: "NSE_FNO".to_string(),
+            exchange_segment: "NSE_FNO",
             display_label: long,
             underlying_symbol: "TEST".to_string(),
         };
