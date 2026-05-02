@@ -1,8 +1,8 @@
 # Implementation Plan: Depth-20 + Depth-200 All-Dynamic Top-Volume Redesign + Saturday Post-Market Gate
 
-**Status:** DRAFT
+**Status:** APPROVED (PR-A scope only; PR-B/C/D pending answers to open questions)
 **Date:** 2026-05-02
-**Approved by:** pending (Parthiban verbally approved direction; this doc captures the contract)
+**Approved by:** Parthiban — verbatim "go ahead as per the recommendation" 2026-05-02 ~10:35 IST
 **Branch:** `claude/refine-stock-selection-71PnY`
 **Triggering observation:** Live Telegram on Saturday 2026-05-02 fired `[HIGH] Post-Market: Market closed — WebSockets disconnected, API stays up` at 15:30 IST despite the day not being a trading day; same session operator approved redesign of depth-20 (4 pinned + 1 dynamic) and depth-200 (5 dynamic top-5) into a unified all-dynamic top-volume×%change-DESC selector with **incremental diff-based resubscribe** (only the changed SID gets unsubscribed/subscribed, never the full set).
 
@@ -175,12 +175,13 @@ Every 60s tick:
 
 ### PR-A: Saturday Post-Market gate (small, ship first)
 
-- [ ] **1. Gate the 15:30 IST Post-Market Telegram on `TradingCalendar::is_trading_day(today_ist)`**
-  - Files: `crates/app/src/main.rs` (the 15:30 `WebSocketDisconnected` / Post-Market emission site — exact line TBD via grep for `Post-Market` and `15:30`)
-  - Files: possibly `crates/core/src/notification/events.rs` if a new variant is needed for "post-market on non-trading-day = no-op"
-  - Tests: `test_post_market_alert_suppressed_on_saturday`
-  - Tests: `test_post_market_alert_suppressed_on_holiday`
-  - Tests: `test_post_market_alert_fires_on_trading_day_at_1530`
+- [x] **1. Gate the 15:30 IST Post-Market Telegram on `TradingCalendar::is_trading_day(today_ist)`** (shipped 2026-05-02)
+  - Files: `crates/app/src/main.rs` (`run_shutdown_fast` — added `trading_calendar` param; gate before `notifier.notify(NotificationEvent::Custom { ... Post-Market ... })`; passed from both call sites at lines 1740 + 6951)
+  - Files: `crates/app/src/boot_helpers.rs` (added pure helper `should_emit_post_market_alert(&TradingCalendar, NaiveDate) -> bool`)
+  - Tests: `test_post_market_alert_suppressed_on_saturday` ✅
+  - Tests: `test_post_market_alert_suppressed_on_sunday` ✅
+  - Tests: `test_post_market_alert_suppressed_on_nse_holiday` ✅
+  - Tests: `test_post_market_alert_fires_on_normal_trading_day` ✅
 
 ### PR-B: Shared selector module + diff-based DepthCommand variants
 
