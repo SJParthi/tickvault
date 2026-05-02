@@ -1,6 +1,6 @@
 # Implementation Plan: Depth-20 + Depth-200 All-Dynamic Top-Volume Redesign + Saturday Post-Market Gate
 
-**Status:** APPROVED (PR-A scope only; PR-B/C/D pending answers to open questions)
+**Status:** APPROVED (PR-A SHIPPED; PR-B in progress; PR-C/D approved)
 **Date:** 2026-05-02
 **Approved by:** Parthiban — verbatim "go ahead as per the recommendation" 2026-05-02 ~10:35 IST
 **Branch:** `claude/refine-stock-selection-71PnY`
@@ -301,11 +301,11 @@ python3 -c "import json; json.load(open('deploy/docker/grafana/dashboards/operat
 | 9 | Outside market hours (16:00 IST) | 60s tick suppressed via `is_within_market_hours_ist()`; no Telegram, no audit churn |
 | 10 | SENSEX (BSE_FNO derivative) appears in the top-500 `movers_1m` cohort by volume | Stage 2 registry lookup tags it as `BseFno`, filtered out; never appears in `next_set` |
 
-## Open Questions for Operator (before approval)
+## Resolved Decisions (operator approved 2026-05-02)
 
-1. **Locality preference on slot assignment:** when a conn frees a slot AND a new SID needs assignment, prefer that same conn (reduces churn) vs round-robin (better balance over time). Current draft: prefer locality. OK?
-2. **Diff Telegram cadence:** every diff = 1 Info event = up to 1/min during volatile sessions. Coalescer already buckets by topic so the operator sees a 60s summary, not per-tick spam. OK?
-3. **Wave 5 retirement:** PR-C archives `active-plan-wave-5-indices-only.md` since this redesign supersedes its depth-20 conn allocation. The Wave 5 audit table + selector files keep their names but their semantics change. OK to retire the plan doc?
+1. **Slot re-assignment = least-full strategy** (argmin over `conn.size`, tie-break by ascending `conn_idx`). At steady-state 250/250 capacity this reduces to locality (the conn that just freed becomes the unique least-full). On volatile days when many SIDs swap simultaneously, the rule provably balances incoming SIDs across conns from cycle 1. Pure round-robin (incrementing `next_conn % 5`) was rejected because it ignores capacity and forces 3-frame inter-conn moves when `next_conn` differs from the conn that freed.
+2. **Diff Telegram cadence:** Severity::Info per-diff via the existing 60s coalescer (Wave 3 Item 11 TELEGRAM-01 mechanism). Loses no forensic detail; summary-only-every-5-min rejected because it loses per-cycle granularity when something genuinely interesting happens.
+3. **Wave 5 plan archive:** retire `active-plan-wave-5-indices-only.md` to `.claude/plans/archive/` immediately after PR-C ships and the Wave 5 pinned-index allocator is removed. Wave 5 ratchet tests + audit table + ErrorCode variants are NOT retired (they continue to apply to the new design with reworded triggers).
 
 ## Per-Wave Guarantee Matrix (cross-reference)
 
