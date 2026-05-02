@@ -50,6 +50,144 @@ pub struct ApplicationConfig {
     /// 14 flags spanning Wave 1, Wave 2 and Wave 3 items.
     #[serde(default)]
     pub features: FeaturesConfig,
+    /// Depth-dynamic redesign (PR-C2): config-driven `[depth_20.dynamic]`
+    /// section. Read by `depth_dynamic_pipeline_v2` when
+    /// `features.depth_dynamic_pipeline_v2 = true`.
+    #[serde(default, rename = "depth_20")]
+    pub depth_20: Depth20RootConfig,
+    /// Depth-dynamic redesign (PR-C2): config-driven `[depth_200.dynamic]`
+    /// section.
+    #[serde(default, rename = "depth_200")]
+    pub depth_200: Depth200RootConfig,
+}
+
+/// Container for the `[depth_20.dynamic]` TOML section.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Depth20RootConfig {
+    #[serde(default)]
+    pub dynamic: DepthDynamicConfig,
+}
+
+/// Container for the `[depth_200.dynamic]` TOML section.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Depth200RootConfig {
+    #[serde(default)]
+    pub dynamic: DepthDynamicConfig,
+}
+
+/// Pipeline shape + universe config for one depth-dynamic feed
+/// (depth-20 or depth-200). Validated at boot via
+/// `DepthDynamicConfig::assert_invariants` BEFORE any spawn.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DepthDynamicConfig {
+    /// Number of WS connections in the pool. Capped at Dhan 5-conn
+    /// limit (`MAX_TWENTY_DEPTH_CONNECTIONS` /
+    /// `MAX_TWO_HUNDRED_DEPTH_CONNECTIONS`).
+    pub conns: u8,
+    /// SIDs per connection. 50 for depth-20, 1 for depth-200.
+    pub sids_per_conn: u16,
+    /// Universe filter + cohort sizing knobs.
+    pub universe: DepthDynamicUniverseConfig,
+}
+
+impl Default for DepthDynamicConfig {
+    fn default() -> Self {
+        Self {
+            conns: 5,
+            sids_per_conn: 50,
+            universe: DepthDynamicUniverseConfig::default(),
+        }
+    }
+}
+
+impl DepthDynamicConfig {
+    /// Boot-time validation. Returns `Err` describing the first
+    /// violation found. Caller halts boot if this returns `Err`.
+    pub fn assert_invariants(&self, label: &str, max_conns: usize) -> Result<()> {
+        if self.conns == 0 {
+            bail!("{label}.dynamic.conns must be > 0");
+        }
+        if usize::from(self.conns) > max_conns {
+            bail!(
+                "{label}.dynamic.conns = {} exceeds Dhan cap of {} connections",
+                self.conns,
+                max_conns
+            );
+        }
+        if self.sids_per_conn == 0 {
+            bail!("{label}.dynamic.sids_per_conn must be > 0");
+        }
+        if self.universe.exchange_segments.is_empty() {
+            bail!("{label}.dynamic.universe.exchange_segments must be non-empty");
+        }
+        if self.universe.cohort_size == 0 {
+            bail!("{label}.dynamic.universe.cohort_size must be > 0");
+        }
+        let total = usize::from(self.conns) * usize::from(self.sids_per_conn);
+        if self.universe.cohort_size < total {
+            bail!(
+                "{label}.dynamic.universe.cohort_size ({}) must be >= conns × sids_per_conn ({})",
+                self.universe.cohort_size,
+                total
+            );
+        }
+        if self.universe.window_secs == 0 {
+            bail!("{label}.dynamic.universe.window_secs must be > 0");
+        }
+        Ok(())
+    }
+
+    /// Soft check (PR-C2 follow-up H4) — returns a warning string if the
+    /// pool is under-provisioned vs the Dhan cap, otherwise `None`.
+    /// Operator may legitimately deploy `conns < cap` for testing, so
+    /// this is NOT an `Err` from `assert_invariants`. Caller logs at WARN.
+    #[must_use]
+    pub fn under_provisioned_warning(&self, label: &str, max_conns: usize) -> Option<String> {
+        if usize::from(self.conns) < max_conns {
+            Some(format!(
+                "{label}.dynamic.conns = {} is below Dhan cap of {} \
+                 — {} connection slot(s) unused; raise to {} for full capacity",
+                self.conns,
+                max_conns,
+                max_conns - usize::from(self.conns),
+                max_conns
+            ))
+        } else {
+            None
+        }
+    }
+}
+
+/// Universe filter + cohort sizing for the `movers_1m` selector.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DepthDynamicUniverseConfig {
+    /// Allowed `ExchangeSegment` enum names (e.g. `"NSE_FNO"`,
+    /// `"BSE_FNO"`). Empty → reject at boot.
+    pub exchange_segments: Vec<String>,
+    /// Allowed `InstrumentType` enum names. Empty list → no filter.
+    #[serde(default)]
+    pub instrument_types: Vec<String>,
+    /// Stage-1 cohort size — number of top-volume rows pulled from
+    /// `movers_1m` before the Stage-2 re-rank.
+    pub cohort_size: usize,
+    /// Re-rank metric. Reserved for future use; `select_top_k_dynamic`
+    /// always sorts by `change_pct DESC`.
+    #[serde(default)]
+    pub rerank_metric: String,
+    /// Look-back window (seconds) for the `movers_1m` cohort query.
+    pub window_secs: u32,
+}
+
+impl Default for DepthDynamicUniverseConfig {
+    fn default() -> Self {
+        Self {
+            exchange_segments: vec!["NSE_FNO".to_string()],
+            instrument_types: Vec::new(),
+            cohort_size: 500,
+            rerank_metric: "change_pct_desc".to_string(),
+            window_secs: 60,
+        }
+    }
 }
 
 /// Wave 1 C9 feature-flag toggles. Default = `true` for every flag (the
@@ -118,6 +256,16 @@ pub struct FeaturesConfig {
     /// `crates/app/src/depth_dynamic_pipeline.rs` is spawned alongside
     /// the existing static depth pool.
     pub depth_dynamic_top_volume: bool,
+    /// PR-C2 cutover gate — unified depth-dynamic pipeline (5 dynamic
+    /// depth-20 conns × 50 SIDs + 5 dynamic depth-200 conns × 1 SID,
+    /// fed by the shared `depth_dynamic_top_volume_selector` reading
+    /// `movers_1m`). Default flipped to `true` 2026-05-02 once the 3-
+    /// agent adversarial review closed (hot-path + security + hostile
+    /// bug-hunt; 12 findings, all fixed or triaged false-positive).
+    /// Operator can revert to the legacy Wave 5 allocator by flipping
+    /// this to `false` — the Wave 5 orchestrator + single-side static
+    /// spawn blocks remain in the codebase behind this gate.
+    pub depth_dynamic_pipeline_v2: bool,
 }
 
 impl Default for FeaturesConfig {
@@ -148,6 +296,13 @@ impl Default for FeaturesConfig {
             // signal the operator uses to schedule the receiver-side
             // refactor sub-PR.
             depth_dynamic_top_volume: true,
+            // PR-C2 cutover: default flipped to `true` 2026-05-02 after
+            // adversarial review closed. Operator can revert to legacy
+            // Wave 5 by setting `depth_dynamic_pipeline_v2 = false` in
+            // a config override file. The Wave 5 orchestrator + single-
+            // side static spawn blocks stay in the codebase as the
+            // rollback path until production validation completes.
+            depth_dynamic_pipeline_v2: true,
         }
     }
 }
@@ -1467,6 +1622,8 @@ mod tests {
             partition_retention: PartitionRetentionConfig::default(),
             movers: MoversConfig::default(),
             features: FeaturesConfig::default(),
+            depth_20: Depth20RootConfig::default(),
+            depth_200: Depth200RootConfig::default(),
         }
     }
 
@@ -2464,5 +2621,123 @@ mod tests {
         assert_eq!(cfg.stock_futures_min_volume, 1);
         assert_eq!(cfg.index_options_min_volume, 1);
         assert_eq!(cfg.stock_options_min_volume, 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // PR-C2 — DepthDynamicConfig invariants
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_depth_dynamic_config_default_passes_invariants_for_depth_20() {
+        let cfg = DepthDynamicConfig::default();
+        // Default ships as 5×50 NSE_FNO; matches Dhan depth-20 cap.
+        assert!(cfg.assert_invariants("depth_20", 5).is_ok());
+    }
+
+    #[test]
+    fn test_assert_invariants_returns_ok_on_default() {
+        let cfg = DepthDynamicConfig::default();
+        assert!(cfg.assert_invariants("test", 5).is_ok());
+    }
+
+    #[test]
+    fn test_depth_dynamic_config_rejects_zero_conns() {
+        let mut cfg = DepthDynamicConfig::default();
+        cfg.conns = 0;
+        assert!(cfg.assert_invariants("depth_20", 5).is_err());
+    }
+
+    #[test]
+    fn test_depth_dynamic_config_rejects_conns_above_cap() {
+        let mut cfg = DepthDynamicConfig::default();
+        cfg.conns = 6;
+        let err = cfg.assert_invariants("depth_20", 5).unwrap_err();
+        assert!(err.to_string().contains("exceeds Dhan cap"));
+    }
+
+    #[test]
+    fn test_depth_dynamic_config_rejects_zero_sids_per_conn() {
+        let mut cfg = DepthDynamicConfig::default();
+        cfg.sids_per_conn = 0;
+        assert!(cfg.assert_invariants("depth_20", 5).is_err());
+    }
+
+    #[test]
+    fn test_depth_dynamic_config_rejects_empty_exchange_segments() {
+        let mut cfg = DepthDynamicConfig::default();
+        cfg.universe.exchange_segments.clear();
+        let err = cfg.assert_invariants("depth_20", 5).unwrap_err();
+        assert!(err.to_string().contains("exchange_segments"));
+    }
+
+    #[test]
+    fn test_depth_dynamic_config_rejects_cohort_smaller_than_total_capacity() {
+        let mut cfg = DepthDynamicConfig::default();
+        // 5×50 = 250 SIDs needed; cohort 100 must fail.
+        cfg.universe.cohort_size = 100;
+        let err = cfg.assert_invariants("depth_20", 5).unwrap_err();
+        assert!(err.to_string().contains("cohort_size"));
+    }
+
+    #[test]
+    fn test_depth_dynamic_config_rejects_zero_window_secs() {
+        let mut cfg = DepthDynamicConfig::default();
+        cfg.universe.window_secs = 0;
+        assert!(cfg.assert_invariants("depth_20", 5).is_err());
+    }
+
+    #[test]
+    fn test_depth_dynamic_config_default_d200_shape_passes_when_overridden() {
+        let cfg = DepthDynamicConfig {
+            conns: 5,
+            sids_per_conn: 1,
+            universe: DepthDynamicUniverseConfig {
+                exchange_segments: vec!["NSE_FNO".to_string()],
+                instrument_types: Vec::new(),
+                cohort_size: 100,
+                rerank_metric: "change_pct_desc".to_string(),
+                window_secs: 60,
+            },
+        };
+        assert!(cfg.assert_invariants("depth_200", 5).is_ok());
+    }
+
+    #[test]
+    fn test_features_config_default_pipeline_v2_on_after_adversarial_review() {
+        let cfg = FeaturesConfig::default();
+        // 2026-05-02 — the PR-C2 default flipped to `true` once the
+        // 3-agent adversarial review closed. Wave 5 path stays in the
+        // codebase as a rollback option behind the same flag.
+        assert!(cfg.depth_dynamic_pipeline_v2);
+    }
+
+    // -----------------------------------------------------------------------
+    // PR-C2 follow-up H4 — under_provisioned_warning soft check
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_under_provisioned_warning_returns_none_when_at_cap() {
+        let cfg = DepthDynamicConfig::default();
+        // Default conns = 5, cap = 5 — no warning.
+        assert!(cfg.under_provisioned_warning("depth_20", 5).is_none());
+    }
+
+    #[test]
+    fn test_under_provisioned_warning_fires_when_below_cap() {
+        let mut cfg = DepthDynamicConfig::default();
+        cfg.conns = 3;
+        let warning = cfg.under_provisioned_warning("depth_20", 5).unwrap();
+        assert!(warning.contains("conns = 3"));
+        assert!(warning.contains("Dhan cap of 5"));
+        assert!(warning.contains("2 connection slot(s) unused"));
+    }
+
+    #[test]
+    fn test_under_provisioned_warning_does_not_fire_above_cap() {
+        // assert_invariants would have already rejected this; but the
+        // soft-check is well-defined and returns None, not a phantom warning.
+        let mut cfg = DepthDynamicConfig::default();
+        cfg.conns = 5;
+        assert!(cfg.under_provisioned_warning("depth_20", 5).is_none());
     }
 }

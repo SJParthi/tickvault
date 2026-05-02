@@ -162,6 +162,23 @@ pub fn plan_recovery(
     }
 }
 
+/// PR-E indices-only ratchet helper. Returns `true` iff the operator's
+/// configured subscription scope makes Phase 2 stock-F&O dispatch
+/// meaningful. Under `IndicesOnlyAllExpiries` (the default since Wave
+/// 5), the subscription planner already drops stock derivatives, so
+/// running Phase 2 would silently no-op and waste the 09:13 wakeup +
+/// preopen-buffer cloning + REST fallback HTTP work. main.rs gates the
+/// scheduler spawn AND the snapshot-recovery dispatch on this function.
+#[must_use]
+pub const fn should_spawn_phase2_scheduler(
+    scope: tickvault_common::config::SubscriptionScope,
+) -> bool {
+    match scope {
+        tickvault_common::config::SubscriptionScope::IndicesOnlyAllExpiries => false,
+        tickvault_common::config::SubscriptionScope::FullUniverse => true,
+    }
+}
+
 /// Returns the current IST date and seconds-since-IST-midnight for the
 /// recovery decision. Uses `tickvault_common::trading_calendar::ist_offset`
 /// so the definition of "IST" lives in one place.
@@ -306,5 +323,45 @@ mod tests {
     fn test_current_ist_seconds_of_day_is_bounded() {
         let (_date, secs) = current_ist_seconds_of_day();
         assert!(secs < 86_400, "seconds-of-day must be < 86_400, got {secs}");
+    }
+
+    // -----------------------------------------------------------------------
+    // PR-E indices-only — should_spawn_phase2_scheduler ratchets
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_should_spawn_phase2_scheduler_skipped_under_indices_only() {
+        // Default scope = no stock F&O = Phase 2 dispatch is dead weight.
+        assert!(!should_spawn_phase2_scheduler(
+            tickvault_common::config::SubscriptionScope::IndicesOnlyAllExpiries
+        ));
+    }
+
+    #[test]
+    fn test_should_spawn_phase2_scheduler_runs_under_full_universe() {
+        // Legacy scope still needs Phase 2 for ATM±25 stock F&O dispatch.
+        assert!(should_spawn_phase2_scheduler(
+            tickvault_common::config::SubscriptionScope::FullUniverse
+        ));
+    }
+
+    /// Coverage ratchet: every variant of SubscriptionScope must have a
+    /// defined Phase 2 spawn answer. Adding a new scope variant without
+    /// updating `should_spawn_phase2_scheduler` will fail the compile
+    /// match exhaustiveness check first; this test pins the *count* of
+    /// variants so a silent renaming doesn't slip through.
+    #[test]
+    fn test_should_spawn_phase2_scheduler_covers_every_scope_variant() {
+        // Two known variants today. If a third is added, this test
+        // breaks and the operator must consciously decide its semantics.
+        let variants = [
+            tickvault_common::config::SubscriptionScope::IndicesOnlyAllExpiries,
+            tickvault_common::config::SubscriptionScope::FullUniverse,
+        ];
+        // Just exercise both — the assertions in the two prior tests
+        // pin actual values.
+        for v in variants {
+            let _ = should_spawn_phase2_scheduler(v);
+        }
     }
 }

@@ -29,7 +29,7 @@ use tickvault_app::boot_helpers::{
     CONFIG_BASE_PATH, CONFIG_LOCAL_PATH, FAST_BOOT_WINDOW_END, FAST_BOOT_WINDOW_START, IstTimer,
     check_clock_drift, compute_market_close_sleep, create_error_log_writer, effective_ws_stagger,
     format_bind_addr, format_cross_match_details_grouped, format_timeframe_details,
-    format_violation_details, spawn_heartbeat_watchdog,
+    format_violation_details, should_emit_post_market_alert, spawn_heartbeat_watchdog,
 };
 use tickvault_app::{core_pinning, infra, observability, trading_pipeline};
 
@@ -1751,6 +1751,7 @@ async fn main() -> Result<()> {
             post_market_signal,
             ws_pool_arc,
             shutdown_notify,
+            trading_calendar.clone(),
         )
         .await;
     }
@@ -2019,6 +2020,12 @@ async fn main() -> Result<()> {
         // 90d hot → S3 IT → Glacier per `aws-budget.md`.
         tickvault_storage::phase2_audit_persistence::ensure_phase2_audit_table(&config.questdb),
         tickvault_storage::depth_rebalance_audit_persistence::ensure_depth_rebalance_audit_table(
+            &config.questdb
+        ),
+        // PR-C2 (depth-dynamic redesign) — audit table for incremental
+        // diff-based resubscribe events emitted by `depth_dynamic_pipeline_v2`.
+        // Schema-self-heal pattern: idempotent CREATE-IF-NOT-EXISTS.
+        tickvault_storage::depth_dynamic_diff_audit_persistence::ensure_depth_dynamic_diff_audit_table(
             &config.questdb
         ),
         tickvault_storage::ws_reconnect_audit_persistence::ensure_ws_reconnect_audit_table(
@@ -2606,16 +2613,31 @@ async fn main() -> Result<()> {
             .as_ref()
             .map(|h| std::sync::Arc::clone(&h.snapshot_handle));
 
-        // Wave 5 Item 25/27 Phase B — base-1s writer for `movers_unified_1s`.
+        // Wave 5 Item 25/27 Phase B — base-1s writer for `movers_1s`.
         // ONE task. Subscribes to tick_broadcast, drains in-memory state at
         // 1Hz, ILP-appends to the base table; QuestDB auto-refreshes the 24
-        // mat views. Market-hours gated.
+        // mat views. Market-hours gated. 2026-05-02 PR-B: takes the
+        // instrument registry so the drain loop can populate
+        // `exchange_segment` (precise NSE_FNO/BSE_FNO/NSE_EQ/IDX_I) and
+        // `instrument_type` (precise OPTSTK/FUTIDX/INDEX/EQUITY) on every
+        // row. Skipped if the registry is missing (subscription_plan was
+        // not built — typically a boot path that doesn't load instruments).
         let movers_unified_shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
-        let _movers_unified_handle = tickvault_app::movers_unified_pipeline::spawn_movers_pipeline(
-            config.questdb.clone(),
-            tick_broadcast_sender.clone(),
-            std::sync::Arc::clone(&movers_unified_shutdown),
-        );
+        let _movers_unified_handle = if let Some(registry) = slow_registry.as_ref() {
+            Some(
+                tickvault_app::movers_unified_pipeline::spawn_movers_pipeline(
+                    config.questdb.clone(),
+                    tick_broadcast_sender.clone(),
+                    std::sync::Arc::clone(&movers_unified_shutdown),
+                    std::sync::Arc::clone(registry),
+                ),
+            )
+        } else {
+            warn!(
+                "movers_unified_pipeline NOT spawned — slow_registry is None (subscription_plan absent)"
+            );
+            None
+        };
 
         // Wave 5 Item 26 L2 LIVE — 16:30 IST bhavcopy cross-check task.
         // Post-market only (TradingCalendar gated); reads `movers_unified_1s`
@@ -2697,7 +2719,249 @@ async fn main() -> Result<()> {
         // calls will fail (no receiver task) → DEPTH-DYN-02 fires on
         // every 60s cycle inside market hours. That's the visible
         // signal the operator uses to schedule the conn-pool refactor.
-        if config.features.depth_dynamic_top_volume {
+        // PR-C2 cutover gate. When `[features].depth_dynamic_pipeline_v2 = true`,
+        // the unified pipeline_v2 path replaces BOTH the Wave 5 orchestrator
+        // block below AND the single-side static depth-20 spawn block at
+        // line ~4118. Default: false (Wave 5 path active for safe rollback).
+        let pipeline_v2_active = config.features.depth_dynamic_pipeline_v2;
+        if pipeline_v2_active {
+            tracing::info!(
+                "PR-C2 cutover: depth_dynamic_pipeline_v2 feature ON — \
+                 spawning 5×depth-20 + 5×depth-200 deferred minimal_conns + \
+                 unified spawn_depth_dynamic_pool orchestrators"
+            );
+
+            // Validate config invariants BEFORE any spawn. Halt boot on
+            // misconfiguration (per per-wave-guarantee-matrix.md row 4 +
+            // disaster-recovery.md "fail-fast at boot" rule).
+            if let Err(e) = config.depth_20.dynamic.assert_invariants(
+                "depth_20",
+                tickvault_common::constants::MAX_TWENTY_DEPTH_CONNECTIONS,
+            ) {
+                anyhow::bail!("invalid [depth_20.dynamic] config: {e}");
+            }
+            if let Err(e) = config.depth_200.dynamic.assert_invariants(
+                "depth_200",
+                tickvault_common::constants::MAX_TWO_HUNDRED_DEPTH_CONNECTIONS,
+            ) {
+                anyhow::bail!("invalid [depth_200.dynamic] config: {e}");
+            }
+            // PR-C2 follow-up H4 — soft warning if either pool is below
+            // Dhan cap. Operator may legitimately deploy a smaller pool
+            // for testing, so this is WARN-only (not fatal).
+            if let Some(w) = config.depth_20.dynamic.under_provisioned_warning(
+                "depth_20",
+                tickvault_common::constants::MAX_TWENTY_DEPTH_CONNECTIONS,
+            ) {
+                tracing::warn!("PR-C2 H4: {w}");
+            }
+            if let Some(w) = config.depth_200.dynamic.under_provisioned_warning(
+                "depth_200",
+                tickvault_common::constants::MAX_TWO_HUNDRED_DEPTH_CONNECTIONS,
+            ) {
+                tracing::warn!("PR-C2 H4: {w}");
+            }
+
+            let v2_shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+
+            // ----- Depth-20: 5 deferred minimal_conns -----
+            let mut d20_v2_cmd_senders: std::collections::HashMap<
+                u8,
+                tokio::sync::mpsc::Sender<tickvault_core::websocket::DepthCommand>,
+            > = std::collections::HashMap::new();
+            for slot in 0..config.depth_20.dynamic.conns {
+                let (tx, rx) =
+                    tokio::sync::mpsc::channel::<tickvault_core::websocket::DepthCommand>(4);
+                d20_v2_cmd_senders.insert(slot, tx);
+                tickvault_app::depth_20_conn_spawner::spawn_depth_20_minimal_conn(
+                    tickvault_app::depth_20_conn_spawner::Depth20MinimalConnInputs {
+                        token_handle: token_handle.clone(),
+                        ws_client_id: ws_client_id.clone(),
+                        label: format!("V2-DYN-20-SLOT-{slot}"),
+                        instruments: Vec::new(), // DEFERRED — pool sends Add20
+                        cmd_rx: rx,
+                        questdb_config: config.questdb.clone(),
+                        notifier: notifier.clone(),
+                        health_status: health_status.clone(),
+                        ws_frame_spill: ws_frame_spill.clone(),
+                    },
+                );
+            }
+
+            let d20_pipeline_cfg = tickvault_app::depth_dynamic_pipeline_v2::PipelineConfig {
+                questdb: config.questdb.clone(),
+                selector:
+                    tickvault_core::instrument::depth_dynamic_top_volume_selector::SelectorConfig {
+                        instrument_types: config.depth_20.dynamic.universe.instrument_types.clone(),
+                        exchange_segments: config
+                            .depth_20
+                            .dynamic
+                            .universe
+                            .exchange_segments
+                            .clone(),
+                        k: usize::from(config.depth_20.dynamic.conns)
+                            * usize::from(config.depth_20.dynamic.sids_per_conn),
+                    },
+                shape: tickvault_core::instrument::dynamic_subscription_state::PoolShape {
+                    conns: config.depth_20.dynamic.conns,
+                    sids_per_conn: config.depth_20.dynamic.sids_per_conn,
+                },
+                label: "depth-20-dynamic",
+                // Security-review MEDIUM 3 fix: thread the operator's
+                // [depth_*.dynamic.universe] cohort_size + window_secs
+                // through to the pipeline. Previously these TOML fields
+                // were read but silently overridden by hardcoded constants.
+                cohort_size: config.depth_20.dynamic.universe.cohort_size,
+                window_secs: config.depth_20.dynamic.universe.window_secs,
+            };
+            let d20_pipeline_handle =
+                tickvault_app::depth_dynamic_pipeline_v2::spawn_depth_dynamic_pool(
+                    d20_pipeline_cfg,
+                    d20_v2_cmd_senders,
+                    std::sync::Arc::clone(&v2_shutdown),
+                );
+            // Hostile-bug-hunt H1 fix — capture JoinHandle and detect
+            // a silent panic in the orchestrator. Mirrors the Wave 5
+            // pattern at the legacy orchestrator block (M2 watchdog).
+            tokio::spawn(async move {
+                match d20_pipeline_handle.await {
+                    Ok(()) => {
+                        tracing::info!(
+                            "depth-20-dynamic v2 orchestrator exited cleanly (shutdown signalled)"
+                        );
+                    }
+                    Err(err) if err.is_panic() => {
+                        tracing::error!(
+                            ?err,
+                            "depth-20-dynamic v2 orchestrator task PANICKED — \
+                             5 conns will stop receiving Add/Remove cmds; \
+                             operator MUST restart the app to recover"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            ?err,
+                            "depth-20-dynamic v2 orchestrator task cancelled (shutdown race)"
+                        );
+                    }
+                }
+            });
+
+            // ----- Depth-200: 5 deferred minimal_conns -----
+            let mut d200_v2_cmd_senders: std::collections::HashMap<
+                u8,
+                tokio::sync::mpsc::Sender<tickvault_core::websocket::DepthCommand>,
+            > = std::collections::HashMap::new();
+            // PR-B (2026-05-02): boot-smoke counter shared across all 5
+            // depth-200 receivers. See `crates/app/src/boot_smoke_test.rs`.
+            let v2_d200_frame_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            for slot in 0..config.depth_200.dynamic.conns {
+                let (tx, rx) =
+                    tokio::sync::mpsc::channel::<tickvault_core::websocket::DepthCommand>(4);
+                d200_v2_cmd_senders.insert(slot, tx);
+                let stagger_ms = u64::from(slot)
+                    .saturating_mul(tickvault_core::websocket::DEPTH_200_INITIAL_STAGGER_MS);
+                tickvault_app::depth_20_conn_spawner::spawn_depth_200_minimal_conn(
+                    tickvault_app::depth_20_conn_spawner::Depth200MinimalConnInputs {
+                        token_handle: token_handle.clone(),
+                        ws_client_id: ws_client_id.clone(),
+                        label: format!("V2-DYN-200-SLOT-{slot}"),
+                        exchange_segment: tickvault_common::types::ExchangeSegment::NseFno,
+                        security_id: None, // DEFERRED — pool sends Add200
+                        cmd_rx: rx,
+                        questdb_config: config.questdb.clone(),
+                        notifier: notifier.clone(),
+                        health_status: health_status.clone(),
+                        ws_frame_spill: ws_frame_spill.clone(),
+                        initial_stagger_ms: stagger_ms,
+                        depth_200_frame_counter: Some(std::sync::Arc::clone(
+                            &v2_d200_frame_counter,
+                        )),
+                    },
+                );
+            }
+            // Hostile-bug-hunt smoke-test fix: SKIP `spawn_depth_200_boot_smoke_test`
+            // in v2 mode. The smoke test deadline is 60s — but in v2 the
+            // first dispatch fires at t=60s (RESELECT_INTERVAL_SECS) and
+            // the first frame typically arrives at t=62-65s (handshake +
+            // first stream frame), so the smoke test would fire DEPTH200-
+            // SMOKE-01 Critical at every clean v2 boot.
+            // Drop the v2_d200_frame_counter — pipeline_v2's own
+            // observability (`tv_depth_dynamic_set_size{feed}` gauge +
+            // alert `tv-depth-dynamic-set-size-low`) covers the same
+            // failure mode without the 60s race.
+            drop(v2_d200_frame_counter);
+
+            let d200_pipeline_cfg = tickvault_app::depth_dynamic_pipeline_v2::PipelineConfig {
+                questdb: config.questdb.clone(),
+                selector:
+                    tickvault_core::instrument::depth_dynamic_top_volume_selector::SelectorConfig {
+                        instrument_types: config
+                            .depth_200
+                            .dynamic
+                            .universe
+                            .instrument_types
+                            .clone(),
+                        exchange_segments: config
+                            .depth_200
+                            .dynamic
+                            .universe
+                            .exchange_segments
+                            .clone(),
+                        k: usize::from(config.depth_200.dynamic.conns)
+                            * usize::from(config.depth_200.dynamic.sids_per_conn),
+                    },
+                shape: tickvault_core::instrument::dynamic_subscription_state::PoolShape {
+                    conns: config.depth_200.dynamic.conns,
+                    sids_per_conn: config.depth_200.dynamic.sids_per_conn,
+                },
+                label: "depth-200-dynamic",
+                cohort_size: config.depth_200.dynamic.universe.cohort_size,
+                window_secs: config.depth_200.dynamic.universe.window_secs,
+            };
+            let d200_pipeline_handle =
+                tickvault_app::depth_dynamic_pipeline_v2::spawn_depth_dynamic_pool(
+                    d200_pipeline_cfg,
+                    d200_v2_cmd_senders,
+                    v2_shutdown,
+                );
+            // Hostile-bug-hunt H1 fix — capture JoinHandle for panic detection.
+            tokio::spawn(async move {
+                match d200_pipeline_handle.await {
+                    Ok(()) => {
+                        tracing::info!(
+                            "depth-200-dynamic v2 orchestrator exited cleanly (shutdown signalled)"
+                        );
+                    }
+                    Err(err) if err.is_panic() => {
+                        tracing::error!(
+                            ?err,
+                            "depth-200-dynamic v2 orchestrator task PANICKED — \
+                             5 slots will stop receiving Add/Remove cmds; \
+                             operator MUST restart the app"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            ?err,
+                            "depth-200-dynamic v2 orchestrator task cancelled (shutdown race)"
+                        );
+                    }
+                }
+            });
+            tracing::info!(
+                "PR-C2 cutover: depth_dynamic_pipeline_v2 spawn complete \
+                 (depth-20: {}×{} = {} SIDs; depth-200: {}×{} = {} SIDs)",
+                config.depth_20.dynamic.conns,
+                config.depth_20.dynamic.sids_per_conn,
+                usize::from(config.depth_20.dynamic.conns)
+                    * usize::from(config.depth_20.dynamic.sids_per_conn),
+                config.depth_200.dynamic.conns,
+                config.depth_200.dynamic.sids_per_conn,
+                usize::from(config.depth_200.dynamic.conns)
+                    * usize::from(config.depth_200.dynamic.sids_per_conn),
+            );
+        } else if config.features.depth_dynamic_top_volume {
             tracing::info!(
                 "Wave 5 Items 4+5: depth_dynamic_top_volume feature ON — \
                  spawning orchestrator + receiver-side dynamic depth-20 conn 5"
@@ -4092,6 +4356,16 @@ async fn main() -> Result<()> {
                 // data/cache/tv-token-cache (already kept fresh by the Rust
                 // TokenManager). Rebalance updates are a follow-up commit.
                 depth_bridge_state_writer.write_or_log(&ws_client_id, &depth_bridge_subs);
+            } else if config.features.depth_dynamic_pipeline_v2 {
+                // PR-C2 cutover: pipeline_v2 already spawned all 5 depth-20
+                // conns (deferred) + the unified spawn_depth_dynamic_pool
+                // upstream. The Wave 5 single-side static spawn block is
+                // therefore SKIPPED — it would otherwise double-spawn 4
+                // additional depth-20 conns and break the Dhan 5-conn cap.
+                tracing::info!(
+                    "PR-C2: depth-20 single-side static spawn SKIPPED \
+                     (pipeline_v2 active — all 5 depth-20 conns spawned earlier)"
+                );
             } else {
                 // Wave 5 single-side static depth-20 spawn (4 conns):
                 // NIFTY-CE, NIFTY-PE, BANKNIFTY-CE, BANKNIFTY-PE. ATM ± 24
@@ -5002,53 +5276,87 @@ async fn main() -> Result<()> {
                     snapshot_date: _,
                     instrument_count,
                     instruments,
-                } => match ws_pool_arc.as_ref() {
-                    Some(pool) => {
-                        let cmd = tickvault_core::websocket::SubscribeCommand::AddInstruments {
-                            instruments,
-                            feed_mode: tickvault_common::types::FeedMode::Quote,
-                        };
-                        match pool.dispatch_subscribe(cmd) {
-                            Some(conn_id) => info!(
-                                target_connection = conn_id,
+                } => {
+                    if !tickvault_app::phase2_recovery::should_spawn_phase2_scheduler(
+                        config.subscription.scope,
+                    ) {
+                        // PR-E: stale snapshot from a prior FullUniverse boot. Don't
+                        // re-dispatch its stock F&O contracts — they'd be silently
+                        // dropped by the planner anyway, but dispatching wastes a
+                        // SubscribeCommand round-trip.
+                        info!(
+                            instrument_count,
+                            scope = config.subscription.scope.as_str(),
+                            "PR-E: Phase 2 recovery snapshot dispatch SKIPPED under \
+                             IndicesOnlyAllExpiries scope (prior-boot stock F&O chain ignored)"
+                        );
+                    } else {
+                        match ws_pool_arc.as_ref() {
+                            Some(pool) => {
+                                let cmd =
+                                    tickvault_core::websocket::SubscribeCommand::AddInstruments {
+                                        instruments,
+                                        feed_mode: tickvault_common::types::FeedMode::Quote,
+                                    };
+                                match pool.dispatch_subscribe(cmd) {
+                                    Some(conn_id) => info!(
+                                        target_connection = conn_id,
+                                        instrument_count,
+                                        "Phase 2 recovery: snapshot chain dispatched to pool"
+                                    ),
+                                    None => error!(
+                                        instrument_count,
+                                        "Phase 2 recovery: dispatch_subscribe returned None — \
+                                         snapshot chain will NOT be subscribed this boot"
+                                    ),
+                                }
+                            }
+                            None => warn!(
                                 instrument_count,
-                                "Phase 2 recovery: snapshot chain dispatched to pool"
-                            ),
-                            None => error!(
-                                instrument_count,
-                                "Phase 2 recovery: dispatch_subscribe returned None — \
-                                 snapshot chain will NOT be subscribed this boot"
+                                "Phase 2 recovery: no WebSocket pool — snapshot chain not dispatched"
                             ),
                         }
                     }
-                    None => warn!(
-                        instrument_count,
-                        "Phase 2 recovery: no WebSocket pool — snapshot chain not dispatched"
-                    ),
-                },
+                }
                 tickvault_app::phase2_recovery::RecoveryAction::SkipOffHours => {
                     info!("Phase 2 recovery: skip-off-hours — scheduler NOT spawned this boot");
                 }
                 tickvault_app::phase2_recovery::RecoveryAction::RunFreshPhase2
                 | tickvault_app::phase2_recovery::RecoveryAction::WaitForScheduler => {
-                    // O1 (2026-04-17) Phase A: Phase 2 subscription scheduler.
-                    // Sleeps until 09:13 IST (or runs immediately if already past 9:13
-                    // and within market hours), then waits for NIFTY/BANKNIFTY LTPs,
-                    // then computes the stock-F&O delta from the snapshotter's
-                    // buffer and dispatches the SubscribeCommand to the pool.
-                    //
-                    // Fix #8 (2026-04-24): trigger time moved 09:12 → 09:13 per
-                    // commit 0340a7c so the 09:12-minute bucket is fully closed
-                    // before Phase 2 reads the preopen buffer. Old "09:12" text
-                    // below was stale.
-                    let phase2_spot_prices = std::sync::Arc::clone(&shared_spot_prices);
-                    let phase2_calendar_for_dyn = std::sync::Arc::clone(&trading_calendar);
-                    let phase2_calendar_for_decision = std::sync::Arc::clone(&trading_calendar);
-                    let phase2_notifier = notifier.clone();
-                    let phase2_pool = ws_pool_arc.clone();
-                    let phase2_buffer = std::sync::Arc::clone(&preopen_buffer);
-                    tokio::spawn(async move {
-                        tickvault_core::instrument::phase2_scheduler::run_phase2_scheduler(
+                    // PR-E indices-only cleanup (2026-05-02): Phase 2 dispatches
+                    // STOCK F&O subscriptions (ATM ± 25 across 216 stocks). Under
+                    // SubscriptionScope::IndicesOnlyAllExpiries (the default since
+                    // Wave 5), the planner already drops stock derivatives and
+                    // running Phase 2 would silently no-op. Skip the spawn entirely
+                    // — saves the 09:13 wakeup task + buffer cloning + REST
+                    // fallback HTTP work for nothing.
+                    if !tickvault_app::phase2_recovery::should_spawn_phase2_scheduler(
+                        config.subscription.scope,
+                    ) {
+                        info!(
+                            scope = config.subscription.scope.as_str(),
+                            "PR-E: Phase 2 scheduler SKIPPED under IndicesOnlyAllExpiries scope \
+                             (no stock F&O subscribed → no 09:13 dispatch needed)"
+                        );
+                    } else {
+                        // O1 (2026-04-17) Phase A: Phase 2 subscription scheduler.
+                        // Sleeps until 09:13 IST (or runs immediately if already past 9:13
+                        // and within market hours), then waits for NIFTY/BANKNIFTY LTPs,
+                        // then computes the stock-F&O delta from the snapshotter's
+                        // buffer and dispatches the SubscribeCommand to the pool.
+                        //
+                        // Fix #8 (2026-04-24): trigger time moved 09:12 → 09:13 per
+                        // commit 0340a7c so the 09:12-minute bucket is fully closed
+                        // before Phase 2 reads the preopen buffer. Old "09:12" text
+                        // below was stale.
+                        let phase2_spot_prices = std::sync::Arc::clone(&shared_spot_prices);
+                        let phase2_calendar_for_dyn = std::sync::Arc::clone(&trading_calendar);
+                        let phase2_calendar_for_decision = std::sync::Arc::clone(&trading_calendar);
+                        let phase2_notifier = notifier.clone();
+                        let phase2_pool = ws_pool_arc.clone();
+                        let phase2_buffer = std::sync::Arc::clone(&preopen_buffer);
+                        tokio::spawn(async move {
+                            tickvault_core::instrument::phase2_scheduler::run_phase2_scheduler(
                             phase2_spot_prices,
                             phase2_calendar_for_decision,
                             phase2_notifier,
@@ -5072,7 +5380,8 @@ async fn main() -> Result<()> {
                             None, // PROMPT A wires the pick_completed channel.
                         )
                         .await;
-                    });
+                        });
+                    } // end else for PR-E indices-only scope skip
                 }
             }
 
@@ -5828,7 +6137,14 @@ async fn main() -> Result<()> {
                 let anchor_cmd_senders = std::sync::Arc::clone(&depth_cmd_senders);
                 let anchor_twenty_max = config.subscription.twenty_depth_max_instruments;
                 // Wave 5 commit 5: feature flag for single-side fan-out at 09:13.
-                let anchor_single_side_enabled = config.features.depth_dynamic_top_volume;
+                // PR-C2 follow-up (hostile-bug-hunt integration finding): when
+                // pipeline_v2 is active, the unified diff dispatcher owns all
+                // swap traffic — the 09:13 anchor's per-underlying senders
+                // (HashMap<String, _>) are empty because v2 uses
+                // HashMap<u8, _>. Setting this flag false silences the
+                // per-underlying warn flood when v2 is on.
+                let anchor_single_side_enabled = config.features.depth_dynamic_top_volume
+                    && !config.features.depth_dynamic_pipeline_v2;
                 // Live LTPs for FINNIFTY + MIDCPNIFTY (the preopen buffer
                 // only captures NIFTY + BANKNIFTY IDX_I). At 09:13 the main
                 // feed has been streaming for ~13 min so these are present.
@@ -6148,13 +6464,17 @@ async fn main() -> Result<()> {
             {
                 let rebalance_notifier = notifier.clone();
                 let rebal_cmd_senders = std::sync::Arc::clone(&depth_cmd_senders);
+                let rebal_pipeline_v2_active = config.features.depth_dynamic_pipeline_v2;
                 // Wave 2 Item 9 (AUDIT-02) — clone QuestDB config into the
                 // rebalancer task scope so audit rows can be persisted.
                 let qcfg_for_rebalance = config.questdb.clone();
                 // Wave 5 commit 5: capture universe + feature flag for
                 // single-side Swap20 fan-out.
                 let rebal_universe = std::sync::Arc::clone(&rebal_consumer_universe);
-                let rebal_single_side_enabled = config.features.depth_dynamic_top_volume;
+                // PR-C2 follow-up: silence rebalancer Swap20/Swap200 dispatch when
+                // pipeline_v2 owns the swap traffic — unused, see anchor comment above.
+                let rebal_single_side_enabled =
+                    config.features.depth_dynamic_top_volume && !rebal_pipeline_v2_active;
                 let rebal_twenty_max = config.subscription.twenty_depth_max_instruments;
                 tokio::spawn(async move {
                     while rebalance_rx.changed().await.is_ok() {
@@ -6962,6 +7282,7 @@ async fn main() -> Result<()> {
         post_market_signal,
         ws_pool_arc,
         shutdown_notify,
+        trading_calendar.clone(),
     )
     .await
 }
@@ -8415,6 +8736,10 @@ async fn run_shutdown_fast(
     // during intentional teardown).
     ws_pool_arc: Option<std::sync::Arc<WebSocketConnectionPool>>,
     shutdown_notify: std::sync::Arc<tokio::sync::Notify>,
+    // 2026-05-02: gate the 15:30 Post-Market Telegram on trading-day
+    // calendar (Saturday/Sunday/holiday suppression). See
+    // `boot_helpers::should_emit_post_market_alert`.
+    trading_calendar: std::sync::Arc<TradingCalendar>,
 ) -> Result<()> {
     let mode = "LIVE";
     info!(
@@ -8442,10 +8767,27 @@ async fn run_shutdown_fast(
 
     if shutdown_reason == "market_close" {
         info!("market close reached — disconnecting WebSockets, keeping API alive");
-        notifier.notify(NotificationEvent::Custom {
-            message: "<b>Post-Market</b>\nMarket closed — WebSockets disconnected, API stays up"
-                .to_string(),
-        });
+        // 2026-05-02: suppress the Post-Market Telegram on non-trading
+        // days (Saturday / Sunday / NSE holidays) where no market open
+        // ever occurred. The 15:30 sleep is wall-clock based and fires
+        // every day; without this gate operators see misleading
+        // `[HIGH] Market closed` alerts on weekends. See
+        // boot_helpers::should_emit_post_market_alert + ratchet tests.
+        let today_ist = chrono::Utc::now()
+            .with_timezone(&tickvault_common::trading_calendar::ist_offset())
+            .date_naive();
+        if should_emit_post_market_alert(&trading_calendar, today_ist) {
+            notifier.notify(NotificationEvent::Custom {
+                message:
+                    "<b>Post-Market</b>\nMarket closed — WebSockets disconnected, API stays up"
+                        .to_string(),
+            });
+        } else {
+            info!(
+                date = %today_ist,
+                "non-trading day — suppressing Post-Market Telegram emission"
+            );
+        }
 
         // Drain buffer: let in-flight ticks (last 15:29 candle) reach the
         // tick processor channel BEFORE aborting WebSocket read loops.

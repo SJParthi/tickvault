@@ -100,6 +100,36 @@ pub struct SubscribedInstrument {
     pub feed_mode: FeedMode,
 }
 
+impl SubscribedInstrument {
+    /// Returns the precise instrument-type tag (operator-facing classification).
+    ///
+    /// Maps:
+    /// - `instrument_kind = Some(FutureIndex)` → `"FUTIDX"`
+    /// - `instrument_kind = Some(FutureStock)` → `"FUTSTK"`
+    /// - `instrument_kind = Some(OptionIndex)` → `"OPTIDX"`
+    /// - `instrument_kind = Some(OptionStock)` → `"OPTSTK"`
+    /// - `category in (MajorIndexValue, DisplayIndex)` → `"INDEX"`
+    /// - `category = StockEquity` → `"EQUITY"`
+    /// - all other (defensive) → `"UNKNOWN"`
+    ///
+    /// Used by `movers_unified_pipeline` to populate the `instrument_type`
+    /// SYMBOL column on `movers_1s` so downstream selectors (depth-20 /
+    /// depth-200 dynamic top-volume) can filter by precise classification
+    /// (`OPTSTK` only, `FUTIDX` only, etc.) without an additional registry
+    /// lookup per query.
+    #[must_use]
+    pub fn instrument_type_tag(&self) -> &'static str {
+        if let Some(kind) = self.instrument_kind {
+            return kind.as_dhan_api_string();
+        }
+        match self.category {
+            SubscriptionCategory::MajorIndexValue | SubscriptionCategory::DisplayIndex => "INDEX",
+            SubscriptionCategory::StockEquity => "EQUITY",
+            _ => "UNKNOWN",
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Instrument Registry
 // ---------------------------------------------------------------------------
@@ -588,6 +618,97 @@ mod tests {
             strike_price: None,
             option_type: None,
             feed_mode: FeedMode::Ticker,
+        }
+    }
+
+    // 2026-05-02 PR-B: ratchet tests for `instrument_type_tag` — the
+    // helper used by `movers_unified_pipeline` to populate the
+    // `instrument_type` SYMBOL column on `movers_1s`. Pins the operator's
+    // 4-bucket classification: INDEX / EQUITY / FUTIDX|FUTSTK|FUTCOM|FUTCUR
+    // / OPTIDX|OPTSTK|OPTFUT|OPTCUR.
+
+    #[test]
+    fn test_instrument_type_tag_returns_index_for_major_index_value() {
+        let inst = sample_instrument(13, SubscriptionCategory::MajorIndexValue);
+        assert_eq!(inst.instrument_type_tag(), "INDEX");
+    }
+
+    #[test]
+    fn test_instrument_type_tag_returns_index_for_display_index() {
+        let inst = sample_instrument(21, SubscriptionCategory::DisplayIndex);
+        assert_eq!(inst.instrument_type_tag(), "INDEX");
+    }
+
+    #[test]
+    fn test_instrument_type_tag_returns_equity_for_stock_equity() {
+        let inst = sample_instrument(2885, SubscriptionCategory::StockEquity);
+        assert_eq!(inst.instrument_type_tag(), "EQUITY");
+    }
+
+    #[test]
+    fn test_instrument_type_tag_returns_optstk_for_stock_option() {
+        let mut inst = sample_instrument(50000, SubscriptionCategory::StockDerivative);
+        inst.instrument_kind = Some(DhanInstrumentKind::OptionStock);
+        assert_eq!(inst.instrument_type_tag(), "OPTSTK");
+    }
+
+    #[test]
+    fn test_instrument_type_tag_returns_futstk_for_stock_future() {
+        let mut inst = sample_instrument(50001, SubscriptionCategory::StockDerivative);
+        inst.instrument_kind = Some(DhanInstrumentKind::FutureStock);
+        assert_eq!(inst.instrument_type_tag(), "FUTSTK");
+    }
+
+    #[test]
+    fn test_instrument_type_tag_returns_optidx_for_index_option() {
+        let mut inst = sample_instrument(50002, SubscriptionCategory::IndexDerivative);
+        inst.instrument_kind = Some(DhanInstrumentKind::OptionIndex);
+        assert_eq!(inst.instrument_type_tag(), "OPTIDX");
+    }
+
+    #[test]
+    fn test_instrument_type_tag_returns_futidx_for_index_future() {
+        let mut inst = sample_instrument(50003, SubscriptionCategory::IndexDerivative);
+        inst.instrument_kind = Some(DhanInstrumentKind::FutureIndex);
+        assert_eq!(inst.instrument_type_tag(), "FUTIDX");
+    }
+
+    #[test]
+    fn test_instrument_type_tag_all_seven_buckets_are_unique() {
+        // Pins the operator's 4-bucket classification: every category +
+        // instrument_kind combination produces a distinct, well-defined tag.
+        let buckets = [
+            ("INDEX", SubscriptionCategory::MajorIndexValue, None),
+            ("EQUITY", SubscriptionCategory::StockEquity, None),
+            (
+                "FUTIDX",
+                SubscriptionCategory::IndexDerivative,
+                Some(DhanInstrumentKind::FutureIndex),
+            ),
+            (
+                "FUTSTK",
+                SubscriptionCategory::StockDerivative,
+                Some(DhanInstrumentKind::FutureStock),
+            ),
+            (
+                "OPTIDX",
+                SubscriptionCategory::IndexDerivative,
+                Some(DhanInstrumentKind::OptionIndex),
+            ),
+            (
+                "OPTSTK",
+                SubscriptionCategory::StockDerivative,
+                Some(DhanInstrumentKind::OptionStock),
+            ),
+        ];
+        for (expected, cat, kind) in buckets {
+            let mut inst = sample_instrument(1, cat);
+            inst.instrument_kind = kind;
+            assert_eq!(
+                inst.instrument_type_tag(),
+                expected,
+                "category={cat:?}, kind={kind:?}"
+            );
         }
     }
 

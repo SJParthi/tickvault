@@ -21,6 +21,7 @@ pub mod depth_20_conn_spawner;
 pub mod depth_20_single_side_planner;
 pub mod depth_bridge_state_writer;
 pub mod depth_dynamic_pipeline;
+pub mod depth_dynamic_pipeline_v2;
 pub mod greeks_pipeline;
 pub mod infra;
 pub mod movers_unified_pipeline;

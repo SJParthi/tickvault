@@ -12,10 +12,10 @@
 //! - **Boot orchestration** — `load_instruments`, `build_websocket_pool`, `run_shutdown_fast`
 //! - **Persistence consumers** — `run_tick_persistence_consumer`, `run_candle_persistence_consumer`
 
-use chrono::Timelike;
+use chrono::{NaiveDate, Timelike};
 use tracing::warn;
 
-use tickvault_common::trading_calendar::ist_offset;
+use tickvault_common::trading_calendar::{TradingCalendar, ist_offset};
 use tickvault_core::historical::cross_verify::{
     CrossMatchMismatch, CrossVerificationReport, ViolationDetail,
 };
@@ -366,6 +366,22 @@ fn format_field_delta_line(f: &tickvault_core::historical::cross_verify::FieldDe
         live = render(f.live),
         delta = delta_str,
     )
+}
+
+/// Returns `true` if the post-market 15:30 IST shutdown sequence should
+/// emit a `Market closed — WebSockets disconnected, API stays up` Telegram
+/// alert.
+///
+/// The wall-clock 15:30 trigger fires unconditionally on every day because
+/// `compute_market_close_sleep` is time-of-day based, not calendar-aware.
+/// On weekends and NSE holidays where no market open ever occurred, the
+/// trigger still expires and would otherwise emit a misleading `[HIGH]
+/// Post-Market` alert. Per `audit-findings-2026-04-17.md` Rule 11
+/// (false-OK / false-HIGH suppression) and `market-hours.md` (holiday
+/// calendar checked before every trading day), suppress the emission on
+/// non-trading days.
+pub fn should_emit_post_market_alert(calendar: &TradingCalendar, date: NaiveDate) -> bool {
+    calendar.is_trading_day(date)
 }
 
 /// Computes the sleep duration until the given market close time (IST).
@@ -2718,5 +2734,90 @@ mod tests {
         assert_eq!(parsed, 0);
         assert_eq!(broadcast_count, 0);
         assert_eq!(parse_errors, 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // should_emit_post_market_alert — Saturday/holiday gate
+    // -----------------------------------------------------------------------
+    //
+    // Live observation 2026-05-02 (Saturday): the 15:30 IST shutdown
+    // trigger fired on a non-trading day because compute_market_close_sleep
+    // is wall-clock based. Operator received a misleading
+    // [HIGH] Post-Market: Market closed — WebSockets disconnected
+    // Telegram. These tests pin the gate that suppresses the emission
+    // on non-trading days.
+
+    fn build_test_calendar() -> TradingCalendar {
+        use tickvault_common::config::{NseHolidayEntry, TradingConfig};
+        let cfg = TradingConfig {
+            market_open_time: "09:00:00".to_string(),
+            market_close_time: "15:30:00".to_string(),
+            order_cutoff_time: "15:29:00".to_string(),
+            data_collection_start: "09:00:00".to_string(),
+            data_collection_end: "15:30:00".to_string(),
+            timezone: "Asia/Kolkata".to_string(),
+            max_orders_per_second: 10,
+            nse_holidays: vec![NseHolidayEntry {
+                date: "2026-01-26".to_string(),
+                name: "Republic Day".to_string(),
+            }],
+            muhurat_trading_dates: vec![],
+            nse_mock_trading_dates: vec![],
+        };
+        TradingCalendar::from_config(&cfg).expect("calendar must build from synthetic config")
+    }
+
+    #[test]
+    fn test_should_emit_post_market_alert_suppressed_on_saturday() {
+        use chrono::Datelike;
+        // 2026-05-02 — the live incident date. NaiveDate weekday: Sat.
+        let saturday = NaiveDate::from_ymd_opt(2026, 5, 2).unwrap();
+        assert_eq!(saturday.weekday(), chrono::Weekday::Sat);
+        let cal = build_test_calendar();
+        assert!(
+            !should_emit_post_market_alert(&cal, saturday),
+            "Saturday must suppress the Post-Market alert"
+        );
+    }
+
+    #[test]
+    fn test_should_emit_post_market_alert_suppressed_on_sunday() {
+        use chrono::Datelike;
+        // 2026-05-03 — the day after the live incident.
+        let sunday = NaiveDate::from_ymd_opt(2026, 5, 3).unwrap();
+        assert_eq!(sunday.weekday(), chrono::Weekday::Sun);
+        let cal = build_test_calendar();
+        assert!(
+            !should_emit_post_market_alert(&cal, sunday),
+            "Sunday must suppress the Post-Market alert"
+        );
+    }
+
+    #[test]
+    fn test_should_emit_post_market_alert_suppressed_on_nse_holiday() {
+        use chrono::Datelike;
+        // 2026-01-26 — Republic Day, in the test holiday list. Falls
+        // on a Monday so this isolates the holiday filter from the
+        // weekend filter.
+        let republic_day = NaiveDate::from_ymd_opt(2026, 1, 26).unwrap();
+        assert_eq!(republic_day.weekday(), chrono::Weekday::Mon);
+        let cal = build_test_calendar();
+        assert!(
+            !should_emit_post_market_alert(&cal, republic_day),
+            "NSE holiday must suppress the Post-Market alert"
+        );
+    }
+
+    #[test]
+    fn test_should_emit_post_market_alert_fires_on_normal_trading_day() {
+        use chrono::Datelike;
+        // 2026-05-04 — Monday, not in the test holiday list.
+        let monday = NaiveDate::from_ymd_opt(2026, 5, 4).unwrap();
+        assert_eq!(monday.weekday(), chrono::Weekday::Mon);
+        let cal = build_test_calendar();
+        assert!(
+            should_emit_post_market_alert(&cal, monday),
+            "regular trading day must fire the Post-Market alert"
+        );
     }
 }

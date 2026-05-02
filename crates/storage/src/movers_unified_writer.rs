@@ -44,6 +44,19 @@ pub struct MoversRow {
     /// Exchange segment as Dhan segment-character (`'I'`, `'E'`, `'D'`,
     /// `'B'`, `'M'`, `'C'`). Encoded to SYMBOL via `sanitize_ilp_symbol`.
     pub segment_char: char,
+    /// Precise per-exchange tag (e.g., `"NSE_FNO"`, `"BSE_FNO"`,
+    /// `"NSE_EQ"`, `"IDX_I"`). Looked up by the pipeline from
+    /// `InstrumentRegistry::get_with_segment` per I-P1-11. Falls back to
+    /// `"UNKNOWN"` when the registry has no entry — this keeps the
+    /// column non-null for downstream selectors. Static str so
+    /// `MoversRow` stays `Copy`.
+    pub exchange_segment: &'static str,
+    /// Precise instrument classification per Dhan annexure
+    /// (`"INDEX"`, `"EQUITY"`, `"FUTIDX"`, `"FUTSTK"`, `"FUTCOM"`,
+    /// `"FUTCUR"`, `"OPTIDX"`, `"OPTSTK"`, `"OPTFUT"`, `"OPTCUR"`).
+    /// Looked up alongside `exchange_segment`; falls back to
+    /// `"UNKNOWN"` for the same reason.
+    pub instrument_type: &'static str,
     /// Open interest at this 1s tick (0 for non-derivative segments).
     pub open_interest: i64,
     /// Per-1s OI delta. Caller computes from the previous-1s value.
@@ -156,12 +169,22 @@ impl MoversWriter {
     pub fn append_row_to_buffer(buffer: &mut Buffer, row: &MoversRow) -> Result<()> {
         let segment_str: String = row.segment_char.to_string();
         let segment = sanitize_ilp_symbol(&segment_str);
+        // SYMBOL columns are emitted up-front per QuestDB ILP convention
+        // (all symbols, then all numeric columns). Both `exchange_segment`
+        // and `instrument_type` are bounded enums (≤16 values each)
+        // matching the SYMBOL CAPACITY in the DDL.
+        let exchange_segment = sanitize_ilp_symbol(row.exchange_segment);
+        let instrument_type = sanitize_ilp_symbol(row.instrument_type);
 
         buffer
             .table(QUESTDB_TABLE_MOVERS_1S)
             .context("table")?
             .symbol("segment", segment.as_ref())
             .context("segment")?
+            .symbol("exchange_segment", exchange_segment.as_ref())
+            .context("exchange_segment")?
+            .symbol("instrument_type", instrument_type.as_ref())
+            .context("instrument_type")?
             .column_i64("security_id", i64::from(row.security_id))
             .context("security_id")?
             .column_i64("open_interest", row.open_interest)
@@ -290,12 +313,16 @@ mod tests {
     }
 
     #[test]
-    fn test_movers_unified_row_struct_size_under_100_bytes() {
-        // Defensive: 10 fields ≈ 8×8 bytes scalar + 1 char + alignment
-        // padding ~ 88 bytes. Catch struct bloat early.
+    fn test_movers_unified_row_struct_size_under_128_bytes() {
+        // Defensive: 10 scalars + 1 char + 2 `&'static str` (16 bytes each)
+        // + alignment padding ≤ 128 bytes. Catch struct bloat early.
+        // Drain cadence is 1 Hz (cold path), so ~120 bytes × 25K instruments
+        // = 3 MB per cycle — acceptable. Budget bumped from 96 to 128 on
+        // 2026-05-02 PR-B (added `exchange_segment` + `instrument_type`
+        // for movers selector precision).
         let size = std::mem::size_of::<MoversRow>();
         assert!(
-            size <= 96,
+            size <= 128,
             "MoversRow size {size} bytes exceeded budget — review schema"
         );
     }
