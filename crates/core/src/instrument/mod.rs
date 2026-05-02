@@ -18,6 +18,7 @@ pub mod daily_scheduler;
 pub mod delta_detector;
 pub mod depth_200_dynamic_subscriber;
 pub mod depth_20_dynamic_subscriber;
+pub mod depth_dynamic_top_volume_selector;
 pub mod depth_rebalancer;
 pub mod depth_strike_selector;
 pub mod depth_top_volume_selector;
