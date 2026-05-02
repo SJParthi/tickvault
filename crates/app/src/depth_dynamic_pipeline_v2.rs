@@ -154,6 +154,20 @@ pub fn spawn_depth_dynamic_pool(
         let mut diff_failing = false;
         let mut audit_failing = false;
 
+        // PR-C2 follow-up (hostile-bug-hunt fix H3) — positive heartbeat
+        // signal. Fires ONCE on the first non-no-op diff cycle so the
+        // operator sees a green confirmation that v2 is producing data.
+        // Audit-findings Rule 11: every error has a positive counterpart.
+        let mut emitted_first_heartbeat = false;
+
+        // PR-C2 follow-up (hostile-bug-hunt fix H2) — daily reset gate.
+        // Tracks the most recent IST trading day observed; on rollover
+        // (00:00 IST), resets `state` so cross-day rank shifts compute
+        // against a clean baseline. The diff algorithm correctly handles
+        // stale state (large-but-bounded delta) so this is hygienic, not
+        // safety-critical, but avoids spurious 250-op churn at 09:00.
+        let mut last_seen_ist_day = current_ist_trading_day();
+
         loop {
             tokio::select! {
                 biased;
@@ -164,6 +178,20 @@ pub fn spawn_depth_dynamic_pool(
                 _ = tick.tick() => {
                     if !is_within_market_hours_ist() {
                         continue;
+                    }
+                    // PR-C2 follow-up H2: detect IST midnight rollover and
+                    // reset state so the next diff computes against a clean
+                    // baseline. Cheap (one i64 compare per 60s tick).
+                    let today_ist = current_ist_trading_day();
+                    if today_ist != last_seen_ist_day {
+                        info!(
+                            label = cfg.label,
+                            previous = last_seen_ist_day,
+                            current = today_ist,
+                            "depth_dynamic_pool_v2 IST midnight rollover — resetting diff state"
+                        );
+                        state = DynamicSubscriptionState::new(cfg.shape);
+                        last_seen_ist_day = today_ist;
                     }
                     let cohort = match fetch_cohort_from_questdb(&cfg).await {
                         Ok(c) => {
@@ -245,6 +273,20 @@ pub fn spawn_depth_dynamic_pool(
                         retained = stats.retained,
                         "depth_dynamic_pool_v2 dispatching diff ops"
                     );
+
+                    // PR-C2 follow-up H3: positive heartbeat — fires ONCE on
+                    // the first non-no-op cycle. Operator's "is v2 working?"
+                    // question now has a green confirmation, not just the
+                    // absence of red errors.
+                    if !emitted_first_heartbeat {
+                        info!(
+                            code = "DEPTH-DYN-V2-LIVE",
+                            label = cfg.label,
+                            initial_set_size = stats.added,
+                            "depth_dynamic_pool_v2 first non-no-op cycle — pipeline confirmed live"
+                        );
+                        emitted_first_heartbeat = true;
+                    }
 
                     // PR-D: emit Prom counters BEFORE dispatch so the
                     // gauge value is visible to alert rules even if a
@@ -475,15 +517,33 @@ async fn send_or_warn(
 ) {
     match senders.get(&conn_idx) {
         Some(tx) => {
-            if let Err(err) = tx.send(cmd).await {
-                error!(
-                    code = "DEPTH-DYN-V2-03",
-                    label,
-                    conn_idx,
-                    op = op_kind,
-                    ?err,
-                    "depth_dynamic_pool_v2 command channel send failed (broker exited?)"
-                );
+            // PR-C2 follow-up M2 — non-blocking try_send. The orchestrator
+            // 60s tick MUST NOT block on a slow conn task (e.g. one stuck in
+            // TLS handshake at boot or a transient network freeze). The
+            // 4-deep mpsc channel is sized to absorb a single 60s burst; if
+            // it's full we drop the cmd and rely on the next 60s diff to
+            // either no-op (set unchanged) or resend the missed Add/Remove.
+            match tx.try_send(cmd) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    error!(
+                        code = "DEPTH-DYN-V2-03",
+                        label,
+                        conn_idx,
+                        op = op_kind,
+                        "depth_dynamic_pool_v2 command channel FULL — dropping cmd; \
+                         next 60s diff will resend if still needed"
+                    );
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    error!(
+                        code = "DEPTH-DYN-V2-03",
+                        label,
+                        conn_idx,
+                        op = op_kind,
+                        "depth_dynamic_pool_v2 command channel CLOSED (broker exited?)"
+                    );
+                }
             }
         }
         None => {
@@ -633,6 +693,17 @@ fn is_within_market_hours_ist() -> bool {
     (TICK_PERSIST_START_SECS_OF_DAY_IST..TICK_PERSIST_END_SECS_OF_DAY_IST).contains(&sec_of_day)
 }
 
+/// Returns the current IST trading day as a `(year, ordinal_day)`
+/// tuple — a cheap comparable identity that rolls over at 00:00 IST.
+/// Used by the daily-reset gate (PR-C2 follow-up H2).
+#[inline]
+#[must_use]
+fn current_ist_trading_day() -> i64 {
+    let now_utc = Utc::now().timestamp();
+    let now_ist = now_utc.saturating_add(i64::from(IST_UTC_OFFSET_SECONDS));
+    now_ist.div_euclid(i64::from(SECONDS_PER_DAY))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -766,6 +837,35 @@ mod tests {
     #[test]
     fn test_is_within_market_hours_ist_returns_bool() {
         let _ = is_within_market_hours_ist();
+    }
+
+    /// PR-C2 follow-up H2 ratchet — current_ist_trading_day must return
+    /// a stable comparable identity that rolls over at IST midnight.
+    /// We can't pin to a specific value without mocking the clock, but
+    /// we can assert (a) it's positive, (b) two consecutive calls within
+    /// a few millis return the same value (no rollover mid-test).
+    #[test]
+    fn test_current_ist_trading_day_is_stable_within_a_call() {
+        let a = current_ist_trading_day();
+        let b = current_ist_trading_day();
+        assert!(a > 0, "trading day epoch must be positive, got {a}");
+        assert_eq!(
+            a, b,
+            "two consecutive calls must return same day-of-epoch (no rollover mid-test)"
+        );
+    }
+
+    /// Ratchet: today's epoch-day must be within a sane window
+    /// (post-2020, pre-2050) — guards against accidentally returning
+    /// raw epoch seconds or some other unit.
+    #[test]
+    fn test_current_ist_trading_day_in_sane_decade_range() {
+        let day = current_ist_trading_day();
+        // 2020-01-01 = day 18262, 2050-01-01 = day 29220.
+        assert!(
+            (18000..30000).contains(&day),
+            "trading day epoch out of sane range: {day}"
+        );
     }
 
     // ---- Constants ----
