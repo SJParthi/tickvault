@@ -62,57 +62,74 @@ mid-session.
 **Source (planned):** Wave 5 Item 6 — drift watchdog spawned alongside
 the pin step.
 
-## DEPTH-20-DYN-03 — depth-20 dynamic conn 5 top-50 selector returned empty / sub-50
+## DEPTH-20-DYN-03 — depth-20 dynamic top-volume selector returned a sub-capacity set
 
-**Trigger:** every 60s the depth-20 dynamic selector queries
-`option_movers` filtered to `category = 'TOP_VOLUME'`, sorted by
-`change_pct DESC`, with SENSEX (BSE_FNO) rows skipped, and reads up to
-50 contracts. If the returned set has fewer than 50 contracts,
-`Depth20Dyn03TopGainersEmpty` fires with the diagnostic
-`{ returned_count, reason: "empty_after_sensex_skip" | "bucket_below_capacity" }`.
-Severity::High.
+**Trigger:** every 60s the unified depth-dynamic pipeline (`depth_dynamic_pipeline_v2`,
+introduced by the depth-dynamic redesign — supersedes the legacy "conn 5
+single-dynamic" wording) queries the `movers_1m` materialised view through
+the shared `depth_dynamic_top_volume_selector` module. The query is
+config-driven: `[depth_20.dynamic.universe]` in `config/base.toml` selects
+the cohort by `exchange_segments` (default `["NSE_FNO"]`), `cohort_size`,
+`rerank_metric`, and `window_secs`. Stage 2 ranks the cohort by the
+configured metric and takes the top `conns * sids_per_conn` (= 5 × 50 =
+250 today). If the resulting set has fewer SIDs than capacity,
+`Depth20Dyn03TopGainersEmpty` fires with diagnostic
+`{ returned_count, reason: "cohort_below_capacity" | "empty_after_segment_filter" }`.
+Severity::High. Edge-triggered (rising edge only).
 
-**Why this fires:** universe-wide bear day where < 50 NSE_FNO contracts
-have positive `change_pct`, OR the upstream `OptionMoversWriter` is
-unhealthy (follow MOVERS-02 runbook in
-`.claude/rules/project/wave-1-error-codes.md`). Outside market hours
-this is expected — the runner uses
+**Why this fires:** universe-wide bear day where the configured exchange
+segments produce fewer than 250 contracts in the cohort window, OR the
+upstream `movers_unified_pipeline` writer is unhealthy (follow MOVERS-02
+runbook in `.claude/rules/project/wave-1-error-codes.md`). Outside market
+hours this is expected — the unified pipeline uses
 `is_within_market_hours_ist()` to suppress emission.
 
-**App behaviour:** edge-triggered on rising edge only. Conn 5 keeps the
-last-good top-50 set until the next successful query. The 4 single-side
-index conns (NIFTY/BANKNIFTY CE/PE) are unaffected.
+**App behaviour:** the 5 dynamic depth-20 conns retain their previous
+`current_set` (each holding up to 50 SIDs). The diff algorithm in
+`DynamicSubscriptionState` issues no Add/Remove frames when the next
+set is empty — last-good subscriptions stay live. The new
+`tv_depth_dynamic_set_size{feed="depth-20"}` Prometheus gauge reflects
+the current size; the alert `tv-depth-dynamic-set-size-low` fires
+when it drops below 5 for 5+ minutes.
 
 **Triage:**
-1. `mcp__tickvault-logs__questdb_sql "select count(*) from option_movers where category = 'TOP_VOLUME' and ts > now() - 5m"`
-   — empty / very low count means the writer is failing.
+1. `mcp__tickvault-logs__questdb_sql "select count(*) from movers_1m where exchange_segment = 'NSE_FNO' and ts > now() - 5m"`
+   — empty / very low count means the upstream writer is failing.
 2. `tv_movers_writer_dropped_total{stage="append"}` — non-zero indicates
    schema drift or QuestDB ILP failure.
 3. If movers data is healthy, this is a market-condition signal, not a
-   bug. Do NOT relax the `change_pct` filter; Wave 5 Option B is locked.
+   bug. To widen the cohort, edit `[depth_20.dynamic.universe].cohort_size`
+   or add segments (e.g. `exchange_segments = ["NSE_FNO", "BSE_FNO"]`).
+   These are runtime-overridable per environment.
 
 **Auto-triage safe:** YES (the next 60s cycle either recovers or the
 operator follows MOVERS-02).
 
-**Source (planned):** Wave 5 Item 4 — `crates/core/src/instrument/depth_20_top_gainers_selector.rs`.
+**Source:** `crates/core/src/instrument/depth_dynamic_top_volume_selector.rs`,
+`crates/app/src/depth_dynamic_pipeline_v2.rs`.
 
-## DEPTH-200-DYN-01 — depth-200 dynamic top-5 selector returned fewer than 5
+## DEPTH-200-DYN-01 — depth-200 dynamic top-volume selector returned a sub-capacity set
 
-**Trigger:** same 60s scheduler runs the same SENSEX-skipped TOP_VOLUME
-+ `change_pct DESC` query but reads only the top 5 contracts. If the
-returned set has fewer than 5 contracts, `Depth200Dyn01TopGainersEmpty`
-fires. Severity::High. Edge-triggered.
+**Trigger:** the same unified pipeline runs depth-200 with
+`PoolShape { conns: 5, sids_per_conn: 1 }` and `[depth_200.dynamic.universe]`
+config. Stage 2 takes the top 5 from the `movers_1m` cohort. If the result
+has fewer than 5 SIDs, `Depth200Dyn01TopGainersEmpty` fires.
+Severity::High. Edge-triggered.
 
-**App behaviour:** the 5 depth-200 conns each subscribe to one contract;
-they keep their last-good gainer set until the next successful query.
-No `Swap200` command is issued.
+**App behaviour:** the 5 depth-200 conns each subscribe to one contract.
+The diff algorithm preserves the previous `current_set` when the next
+set is empty — no `RemoveSubscriptions200` is issued. The
+`tv_depth_dynamic_set_size{feed="depth-200"}` gauge reflects the current
+size.
 
-**Triage:** identical to DEPTH-20-DYN-03 above (same upstream table,
-same selector, smaller K).
+**Triage:** identical to DEPTH-20-DYN-03 above (same upstream
+`movers_1m` table, same selector module, same config-driven filter,
+smaller K).
 
 **Auto-triage safe:** YES.
 
-**Source (planned):** Wave 5 Item 5 — `crates/core/src/instrument/depth_200_top_gainers_selector.rs`.
+**Source:** `crates/core/src/instrument/depth_dynamic_top_volume_selector.rs`,
+`crates/app/src/depth_dynamic_pipeline_v2.rs`.
 
 ## PREVCLOSE-03 — boot-time prev-close routing assertion failed (Item 13)
 
