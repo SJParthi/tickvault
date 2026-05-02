@@ -298,19 +298,6 @@ pub enum ErrorCode {
     Data814InvalidRequest,
 
     // -----------------------------------------------------------------------
-    // Depth-200 SELF token (2026-04-28 — see
-    // `docs/architecture/depth-200-self-token-design.md`)
-    // -----------------------------------------------------------------------
-    /// SSM token failed validation at boot — APP type, wrong client_id,
-    /// expired, or corrupt JWT.
-    Depth200Auth01InvalidAtBoot,
-    /// `RenewToken` HTTP error / response not SELF / SSM PutParameter
-    /// failure during the 23h renewal cycle.
-    Depth200Auth02RenewalFailed,
-    /// AWS SSM unreachable — IAM, network, or KMS access issue.
-    Depth200Auth03SsmUnreachable,
-
-    // -----------------------------------------------------------------------
     // Depth-20 dynamic top-150 selector (Phase 7, 2026-04-28 — see
     // `.claude/plans/v2-architecture.md` Section I)
     // -----------------------------------------------------------------------
@@ -366,6 +353,15 @@ pub enum ErrorCode {
     /// semantic mid-session (escalate to Item 26 L3 ticket) or our parser
     /// regressed on the byte offset. Severity::High.
     Volume01MonotonicityBreach,
+    /// Boot-time depth-200 smoke test: zero frames received from
+    /// `wss://full-depth-api.dhan.co` within the smoke-test window
+    /// during market hours. Indicates the auth handshake succeeded
+    /// (no `WebSocketDisconnected` fired) but Dhan never streamed a
+    /// frame — most often a SecurityId that's far OTM (per-rule
+    /// server-side filtering) or a regression in the new APP-token
+    /// path (Ticket #5610706 reverted server-side?). Severity::Critical
+    /// — operator should investigate before next market open.
+    Depth200Smoke01NoFramesAtBoot,
     /// Wave 5 Item 13 — boot-time prev-close routing assertion failed.
     /// The subscription plan contains an instrument whose `(segment,
     /// feed_mode)` pair cannot deliver previous-day close per the
@@ -486,10 +482,6 @@ impl ErrorCode {
             Self::Data812InvalidDateFormat => "DATA-812",
             Self::Data813InvalidSecurityId => "DATA-813",
             Self::Data814InvalidRequest => "DATA-814",
-            // Depth-200 SELF token (2026-04-28)
-            Self::Depth200Auth01InvalidAtBoot => "DEPTH200-AUTH-01",
-            Self::Depth200Auth02RenewalFailed => "DEPTH200-AUTH-02",
-            Self::Depth200Auth03SsmUnreachable => "DEPTH200-AUTH-03",
             // Depth-20 dynamic top-150 selector (Phase 7, 2026-04-28)
             Self::Depth20Dyn01TopSetEmpty => "DEPTH-DYN-01",
             Self::Depth20Dyn02SwapChannelBroken => "DEPTH-DYN-02",
@@ -502,6 +494,7 @@ impl ErrorCode {
             Self::PrevClose03BootRoutingAssertion => "PREVCLOSE-03",
             // Wave 5 Item 26 L1 — volume cumulative-monotonicity guard
             Self::Volume01MonotonicityBreach => "VOLUME-MONO-01",
+            Self::Depth200Smoke01NoFramesAtBoot => "DEPTH200-SMOKE-01",
         }
     }
 
@@ -525,11 +518,9 @@ impl ErrorCode {
             | Self::Boot02DeadlineExceeded
             | Self::Boot03ClockSkewExceeded
             | Self::Selftest02Failed
-            | Self::Depth200Auth01InvalidAtBoot
-            | Self::Depth200Auth02RenewalFailed
-            | Self::Depth200Auth03SsmUnreachable
             | Self::Depth20Dyn02SwapChannelBroken
-            | Self::PrevClose03BootRoutingAssertion => Severity::Critical,
+            | Self::PrevClose03BootRoutingAssertion
+            | Self::Depth200Smoke01NoFramesAtBoot => Severity::Critical,
             // Info: positive-ping / lifecycle confirmations
             Self::Selftest01Passed | Self::Slo01Healthy => Severity::Info,
             // High: composite SLO degradation summary signal
@@ -707,11 +698,6 @@ impl ErrorCode {
             | Self::Data812InvalidDateFormat
             | Self::Data813InvalidSecurityId
             | Self::Data814InvalidRequest => ".claude/rules/dhan/annexure-enums.md",
-            Self::Depth200Auth01InvalidAtBoot
-            | Self::Depth200Auth02RenewalFailed
-            | Self::Depth200Auth03SsmUnreachable => {
-                ".claude/rules/project/depth-200-auth-error-codes.md"
-            }
             Self::Depth20Dyn01TopSetEmpty | Self::Depth20Dyn02SwapChannelBroken => {
                 ".claude/rules/project/wave-4-error-codes.md"
             }
@@ -720,7 +706,8 @@ impl ErrorCode {
             | Self::Depth20Dyn03TopGainersEmpty
             | Self::Depth200Dyn01TopGainersEmpty
             | Self::PrevClose03BootRoutingAssertion
-            | Self::Volume01MonotonicityBreach => ".claude/rules/project/wave-5-error-codes.md",
+            | Self::Volume01MonotonicityBreach
+            | Self::Depth200Smoke01NoFramesAtBoot => ".claude/rules/project/wave-5-error-codes.md",
         }
     }
 
@@ -827,9 +814,6 @@ impl ErrorCode {
             Self::Selftest02Failed,
             Self::Slo01Healthy,
             Self::Slo02Degraded,
-            Self::Depth200Auth01InvalidAtBoot,
-            Self::Depth200Auth02RenewalFailed,
-            Self::Depth200Auth03SsmUnreachable,
             Self::Depth20Dyn01TopSetEmpty,
             Self::Depth20Dyn02SwapChannelBroken,
             Self::CorePin01PinningFailedAtBoot,
@@ -838,6 +822,7 @@ impl ErrorCode {
             Self::Depth200Dyn01TopGainersEmpty,
             Self::PrevClose03BootRoutingAssertion,
             Self::Volume01MonotonicityBreach,
+            Self::Depth200Smoke01NoFramesAtBoot,
         ]
     }
 }
@@ -1000,8 +985,6 @@ mod tests {
         // (healthy recovery) + SLO-02 (degraded/critical) — composite
         // real-time guarantee score.
         // 2026-04-28 (depth-200 SELF token): bumped 84 -> 87 for
-        // DEPTH200-AUTH-01/02/03 — alternate auth path for
-        // full-depth-api.dhan.co (rejects APP, accepts SELF).
         // 2026-04-28 (Phase 7 of v3 plan): bumped 87 -> 89 for
         // DEPTH-DYN-01/02 — depth-20 dynamic top-150 selector
         // promoted from RESERVED to defined.
@@ -1018,7 +1001,12 @@ mod tests {
         // VOLUME-MONO-01 (cumulative-monotonicity breach).
         // 2026-05-01 (movers cleanup): bumped 98 -> 95 — removed
         // MOVERS-22TF-01/02/03 along with the dead 22-tf pipeline.
-        assert_eq!(ErrorCode::all().len(), 95);
+        // 2026-05-02 (depth-200 SELF token retired per Dhan Ticket
+        // #5610706): bumped 95 -> 92 — removed DEPTH200-AUTH-01/02/03
+        // along with the SELF-token manager.
+        // 2026-05-02 (PR-B): bumped 92 -> 93 for DEPTH200-SMOKE-01
+        // (boot-time depth-200 smoke test no-frames Critical signal).
+        assert_eq!(ErrorCode::all().len(), 93);
     }
 
     #[test]
@@ -1048,8 +1036,6 @@ mod tests {
                 || s.starts_with("SELFTEST-")
                 // Wave 3-D: composite real-time guarantee score
                 || s.starts_with("SLO-")
-                // 2026-04-28: depth-200 SELF token alternate auth path
-                || s.starts_with("DEPTH200-AUTH-")
                 // Phase 7 (2026-04-28): depth-20 dynamic top-150 selector
                 || s.starts_with("DEPTH-DYN-")
                 // Wave 5 (2026-05-01): core_affinity pinning + new dynamic
@@ -1060,7 +1046,9 @@ mod tests {
                 || s.starts_with("DEPTH-20-DYN-")
                 || s.starts_with("DEPTH-200-DYN-")
                 // Wave 5 Item 26 L1: volume cumulative-monotonicity guard.
-                || s.starts_with("VOLUME-");
+                || s.starts_with("VOLUME-")
+                // PR-B (2026-05-02): boot-time depth-200 smoke test.
+                || s.starts_with("DEPTH200-SMOKE-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }

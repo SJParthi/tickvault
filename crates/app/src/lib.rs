@@ -15,6 +15,7 @@
 
 pub mod bhavcopy_pipeline;
 pub mod boot_helpers;
+pub mod boot_smoke_test;
 pub mod core_pinning;
 pub mod depth_20_conn_spawner;
 pub mod depth_20_single_side_planner;
