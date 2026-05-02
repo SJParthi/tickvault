@@ -2901,6 +2901,12 @@ async fn main() -> Result<()> {
                 // were read but silently overridden by hardcoded constants.
                 cohort_size: config.depth_20.dynamic.universe.cohort_size,
                 window_secs: config.depth_20.dynamic.universe.window_secs,
+                // 2026-05-02 — operator-requested symbol-level Telegram
+                // diff event. Registry resolves (sid, segment) → display
+                // label per I-P1-11 composite key. Notifier dispatches
+                // `DepthDynamicV2DiffApplied` events on every non-no-op cycle.
+                registry: slow_registry.clone(),
+                notifier: Some(notifier.clone()),
             };
             let d20_pipeline_handle =
                 tickvault_app::depth_dynamic_pipeline_v2::spawn_depth_dynamic_pool(
@@ -3006,6 +3012,8 @@ async fn main() -> Result<()> {
                 label: "depth-200-dynamic",
                 cohort_size: config.depth_200.dynamic.universe.cohort_size,
                 window_secs: config.depth_200.dynamic.universe.window_secs,
+                registry: slow_registry.clone(),
+                notifier: Some(notifier.clone()),
             };
             let d200_pipeline_handle =
                 tickvault_app::depth_dynamic_pipeline_v2::spawn_depth_dynamic_pool(

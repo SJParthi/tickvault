@@ -971,6 +971,51 @@ pub enum NotificationEvent {
         /// Total active contracts in this slot after the swap.
         total_active: usize,
     },
+
+    /// 2026-05-02 — pipeline_v2 (PR-C2) diff cycle applied a non-no-op
+    /// rebalance. Operator-requested symbol-level visibility:
+    ///
+    /// - Listed by precise instrument label (e.g. "NIFTY 23000 CE 2026-06-26"),
+    ///   not raw SecurityId. Resolution happens via `InstrumentRegistry::
+    ///   get_with_segment(security_id, segment)` (O(1) per-op lookup).
+    /// - Severity::Low — fires every cycle that produces a change. No-op
+    ///   cycles (rank-set unchanged) emit NOTHING.
+    DepthDynamicV2DiffApplied {
+        /// `"depth-20-dynamic"` or `"depth-200-dynamic"`.
+        feed: &'static str,
+        /// Instruments newly subscribed this cycle.
+        added: Vec<DepthDiffEntry>,
+        /// Instruments unsubscribed this cycle.
+        removed: Vec<DepthDiffEntry>,
+        /// Instruments unchanged from previous cycle (silent — no frames sent).
+        retained_count: usize,
+    },
+}
+
+/// One symbol-level entry inside [`NotificationEvent::DepthDynamicV2DiffApplied`].
+/// Resolved from `(security_id, exchange_segment)` via the instrument
+/// registry's O(1) `get_with_segment` lookup. Preserves the composite-key
+/// uniqueness invariant per I-P1-11.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DepthDiffEntry {
+    pub security_id: u32,
+    /// Stable SYMBOL value (`"NSE_FNO"`, `"BSE_FNO"`, etc.).
+    pub exchange_segment: String,
+    /// Human-readable contract label, e.g. `"NIFTY 23000 CE 2026-06-26"`.
+    pub display_label: String,
+    /// Bare underlying, e.g. `"NIFTY"`.
+    pub underlying_symbol: String,
+}
+
+impl DepthDiffEntry {
+    /// Symbol + sid + segment in one Telegram-friendly line.
+    #[must_use]
+    pub fn format_line(&self) -> String {
+        format!(
+            "  • {} (sid={}, {})",
+            self.display_label, self.security_id, self.exchange_segment
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1973,6 +2018,46 @@ impl NotificationEvent {
                  subscribed: <code>{subscribed_count}</code>\n\
                  active: <code>{total_active}</code>"
             ),
+            Self::DepthDynamicV2DiffApplied {
+                feed,
+                added,
+                removed,
+                retained_count,
+            } => {
+                // Operator-requested 2026-05-02: show display_label + sid + segment.
+                // Cap per-section list at 10 entries to stay under Telegram's
+                // 4096-char message limit on volatile cycles.
+                const MAX_LINES_PER_SECTION: usize = 10;
+                let mut lines: Vec<String> = Vec::with_capacity(2 + added.len() + removed.len());
+                lines.push(format!(
+                    "<b>{feed}: diff applied</b>\nadded: <code>{}</code>  removed: <code>{}</code>  retained: <code>{}</code>",
+                    added.len(),
+                    removed.len(),
+                    retained_count
+                ));
+                if !added.is_empty() {
+                    lines.push("\n<b>➕ Added</b>".to_string());
+                    for entry in added.iter().take(MAX_LINES_PER_SECTION) {
+                        lines.push(entry.format_line());
+                    }
+                    if added.len() > MAX_LINES_PER_SECTION {
+                        lines.push(format!("  • +{} more", added.len() - MAX_LINES_PER_SECTION));
+                    }
+                }
+                if !removed.is_empty() {
+                    lines.push("\n<b>➖ Removed</b>".to_string());
+                    for entry in removed.iter().take(MAX_LINES_PER_SECTION) {
+                        lines.push(entry.format_line());
+                    }
+                    if removed.len() > MAX_LINES_PER_SECTION {
+                        lines.push(format!(
+                            "  • +{} more",
+                            removed.len() - MAX_LINES_PER_SECTION
+                        ));
+                    }
+                }
+                lines.join("\n")
+            }
         }
     }
 
@@ -2075,6 +2160,7 @@ impl NotificationEvent {
             Self::Depth20DynamicTopSetEmpty { .. } => "Depth20DynamicTopSetEmpty",
             Self::Depth20DynamicSwapChannelBroken { .. } => "Depth20DynamicSwapChannelBroken",
             Self::Depth20DynamicSwapApplied { .. } => "Depth20DynamicSwapApplied",
+            Self::DepthDynamicV2DiffApplied { .. } => "DepthDynamicV2DiffApplied",
         }
     }
 
@@ -2184,6 +2270,7 @@ impl NotificationEvent {
             Self::Depth20DynamicTopSetEmpty { .. } => Severity::High,
             Self::Depth20DynamicSwapChannelBroken { .. } => Severity::Critical,
             Self::Depth20DynamicSwapApplied { .. } => Severity::Low,
+            Self::DepthDynamicV2DiffApplied { .. } => Severity::Low,
         }
     }
 }
@@ -2211,6 +2298,21 @@ fn append_detail_lines(msg: &mut String, details: &[String], total_count: usize)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_depth_diff_entry_format_line_uses_symbol_sid_and_segment() {
+        // Operator-requested 2026-05-02: precise symbol + sid + segment.
+        let entry = DepthDiffEntry {
+            security_id: 70123,
+            exchange_segment: "NSE_FNO".to_string(),
+            display_label: "NIFTY 23000 CE 2026-06-26".to_string(),
+            underlying_symbol: "NIFTY".to_string(),
+        };
+        assert_eq!(
+            entry.format_line(),
+            "  • NIFTY 23000 CE 2026-06-26 (sid=70123, NSE_FNO)"
+        );
+    }
 
     #[test]
     fn test_severity_as_label_returns_lowercase_string() {
