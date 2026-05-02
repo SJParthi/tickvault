@@ -2786,6 +2786,13 @@ async fn main() -> Result<()> {
             );
             let mut d200_cmd_senders = std::collections::HashMap::new();
             let mut d200_dyn_spawn_count: usize = 0;
+
+            // PR-B (2026-05-02): one shared atomic counter incremented by all
+            // 5 depth-200 receivers on every frame. The boot smoke test polls
+            // this counter for the first ≥ 1 transition. See
+            // `crates/app/src/boot_smoke_test.rs` for classifier + emission.
+            let depth_200_frame_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
             for slot in 0..tickvault_common::constants::MAX_TWO_HUNDRED_DEPTH_CONNECTIONS {
                 let (tx, rx) =
                     tokio::sync::mpsc::channel::<tickvault_core::websocket::DepthCommand>(4);
@@ -2809,10 +2816,22 @@ async fn main() -> Result<()> {
                         health_status: health_status.clone(),
                         ws_frame_spill: ws_frame_spill.clone(),
                         initial_stagger_ms: stagger_ms,
+                        depth_200_frame_counter: Some(std::sync::Arc::clone(
+                            &depth_200_frame_counter,
+                        )),
                     },
                 );
                 d200_dyn_spawn_count = d200_dyn_spawn_count.saturating_add(1);
             }
+
+            // PR-B: spawn the boot-time depth-200 smoke test once all 5
+            // slots are wired. Off-hours boots produce a `Skipped` log and
+            // exit at the deadline; in-market boots emit `Passed` (Info)
+            // on the first frame or `Failed` (Critical, DEPTH200-SMOKE-01)
+            // at the deadline if zero frames arrived.
+            tickvault_app::boot_smoke_test::spawn_depth_200_boot_smoke_test(std::sync::Arc::clone(
+                &depth_200_frame_counter,
+            ));
             // H1 + M3 — runtime invariant: spawn loop emitted exactly 5 conns.
             // Saturating add means a logic bug (e.g. early break) leaves the
             // counter < 5; a duplicate spawn could push it > 5. Both fail.
