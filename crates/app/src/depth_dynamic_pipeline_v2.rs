@@ -168,6 +168,14 @@ pub fn spawn_depth_dynamic_pool(
         // safety-critical, but avoids spurious 250-op churn at 09:00.
         let mut last_seen_ist_day = current_ist_trading_day();
 
+        // PR-C2 follow-up (hostile-bug-hunt fix L1) — off-hours sleep
+        // edge-trigger. Tracks the in-market state to fire a single INFO
+        // when the loop enters off-hours sleep, and a single INFO when
+        // it wakes back up. Avoids "is the pipeline asleep or stuck?"
+        // ambiguity for the operator. Init: assume in-market until
+        // first tick proves otherwise.
+        let mut was_in_market = true;
+
         loop {
             tokio::select! {
                 biased;
@@ -176,7 +184,24 @@ pub fn spawn_depth_dynamic_pool(
                     break;
                 }
                 _ = tick.tick() => {
-                    if !is_within_market_hours_ist() {
+                    let in_market = is_within_market_hours_ist();
+                    if in_market != was_in_market {
+                        if in_market {
+                            info!(
+                                code = "DEPTH-DYN-V2-WAKE",
+                                label = cfg.label,
+                                "depth_dynamic_pool_v2 entered market hours — resuming 60s diff cycles"
+                            );
+                        } else {
+                            info!(
+                                code = "DEPTH-DYN-V2-SLEEP",
+                                label = cfg.label,
+                                "depth_dynamic_pool_v2 exited market hours — sleeping until 09:00 IST"
+                            );
+                        }
+                        was_in_market = in_market;
+                    }
+                    if !in_market {
                         continue;
                     }
                     // PR-C2 follow-up H2: detect IST midnight rollover and

@@ -136,6 +136,26 @@ impl DepthDynamicConfig {
         }
         Ok(())
     }
+
+    /// Soft check (PR-C2 follow-up H4) — returns a warning string if the
+    /// pool is under-provisioned vs the Dhan cap, otherwise `None`.
+    /// Operator may legitimately deploy `conns < cap` for testing, so
+    /// this is NOT an `Err` from `assert_invariants`. Caller logs at WARN.
+    #[must_use]
+    pub fn under_provisioned_warning(&self, label: &str, max_conns: usize) -> Option<String> {
+        if usize::from(self.conns) < max_conns {
+            Some(format!(
+                "{label}.dynamic.conns = {} is below Dhan cap of {} \
+                 — {} connection slot(s) unused; raise to {} for full capacity",
+                self.conns,
+                max_conns,
+                max_conns - usize::from(self.conns),
+                max_conns
+            ))
+        } else {
+            None
+        }
+    }
 }
 
 /// Universe filter + cohort sizing for the `movers_1m` selector.
@@ -2685,5 +2705,35 @@ mod tests {
         // PR-C2 cutover ships OFF by default. Operator flips on after
         // validating against the new config blocks.
         assert!(!cfg.depth_dynamic_pipeline_v2);
+    }
+
+    // -----------------------------------------------------------------------
+    // PR-C2 follow-up H4 — under_provisioned_warning soft check
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_under_provisioned_warning_returns_none_when_at_cap() {
+        let cfg = DepthDynamicConfig::default();
+        // Default conns = 5, cap = 5 — no warning.
+        assert!(cfg.under_provisioned_warning("depth_20", 5).is_none());
+    }
+
+    #[test]
+    fn test_under_provisioned_warning_fires_when_below_cap() {
+        let mut cfg = DepthDynamicConfig::default();
+        cfg.conns = 3;
+        let warning = cfg.under_provisioned_warning("depth_20", 5).unwrap();
+        assert!(warning.contains("conns = 3"));
+        assert!(warning.contains("Dhan cap of 5"));
+        assert!(warning.contains("2 connection slot(s) unused"));
+    }
+
+    #[test]
+    fn test_under_provisioned_warning_does_not_fire_above_cap() {
+        // assert_invariants would have already rejected this; but the
+        // soft-check is well-defined and returns None, not a phantom warning.
+        let mut cfg = DepthDynamicConfig::default();
+        cfg.conns = 5;
+        assert!(cfg.under_provisioned_warning("depth_20", 5).is_none());
     }
 }

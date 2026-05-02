@@ -2746,6 +2746,21 @@ async fn main() -> Result<()> {
             ) {
                 anyhow::bail!("invalid [depth_200.dynamic] config: {e}");
             }
+            // PR-C2 follow-up H4 — soft warning if either pool is below
+            // Dhan cap. Operator may legitimately deploy a smaller pool
+            // for testing, so this is WARN-only (not fatal).
+            if let Some(w) = config.depth_20.dynamic.under_provisioned_warning(
+                "depth_20",
+                tickvault_common::constants::MAX_TWENTY_DEPTH_CONNECTIONS,
+            ) {
+                tracing::warn!("PR-C2 H4: {w}");
+            }
+            if let Some(w) = config.depth_200.dynamic.under_provisioned_warning(
+                "depth_200",
+                tickvault_common::constants::MAX_TWO_HUNDRED_DEPTH_CONNECTIONS,
+            ) {
+                tracing::warn!("PR-C2 H4: {w}");
+            }
 
             let v2_shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
 
@@ -5262,9 +5277,8 @@ async fn main() -> Result<()> {
                     instrument_count,
                     instruments,
                 } => {
-                    if matches!(
+                    if !tickvault_app::phase2_recovery::should_spawn_phase2_scheduler(
                         config.subscription.scope,
-                        tickvault_common::config::SubscriptionScope::IndicesOnlyAllExpiries
                     ) {
                         // PR-E: stale snapshot from a prior FullUniverse boot. Don't
                         // re-dispatch its stock F&O contracts — they'd be silently
@@ -5316,9 +5330,8 @@ async fn main() -> Result<()> {
                     // running Phase 2 would silently no-op. Skip the spawn entirely
                     // — saves the 09:13 wakeup task + buffer cloning + REST
                     // fallback HTTP work for nothing.
-                    if matches!(
+                    if !tickvault_app::phase2_recovery::should_spawn_phase2_scheduler(
                         config.subscription.scope,
-                        tickvault_common::config::SubscriptionScope::IndicesOnlyAllExpiries
                     ) {
                         info!(
                             scope = config.subscription.scope.as_str(),
