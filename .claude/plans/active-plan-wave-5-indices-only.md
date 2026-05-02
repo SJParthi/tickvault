@@ -31,7 +31,7 @@ That's it. SessionStart hooks will auto-load CLAUDE.md, this plan, and the per-w
 
 **Operator pre-conditions before Mon May 4:**
 
-1. Refresh DEPTH200 SELF token in SSM per `.claude/rules/project/depth-200-auth-error-codes.md` (today's app boot failed `DEPTH200-AUTH-01`, token expired ~40h ago)
+1. ~~Refresh DEPTH200 SELF token~~ (no longer required — Dhan Ticket #5610706 retired the SELF-only gate on 2026-05-02; depth-200 reuses the shared TOTP/APP token)
 2. Send Item 26 L3 Dhan ticket via Gmail using GitHub link to `docs/dhan-support/2026-05-01-volume-semantic-clarification.md`
 
 **Implementation rules (mandatory, all in repo):**
@@ -2232,8 +2232,8 @@ Item 28 (candles cascade volume bug) is **endogenous** — bug exists regardless
 3. QuestDB not bound to localhost in Cowork sandbox (separate sandbox limitation)
 
 **Operator actions before Mon May 4 09:15 IST market open:**
-1. Refresh SELF token in SSM per `.claude/rules/project/depth-200-auth-error-codes.md` runbook
-2. Verify boot succeeds (no DEPTH200-AUTH-01 in errors.jsonl)
+1. ~~Refresh SELF token in SSM~~ (obsolete — Dhan Ticket #5610706 retired the SELF-only gate on 2026-05-02; depth-200 now uses the shared TOTP/APP token)
+2. Verify boot succeeds (no `DEPTH200-AUTH-*` codes — those variants are also retired)
 3. Let app run 09:15-09:45 IST collecting ticks
 4. At 09:45 IST, run the 5-series SELECT (next subsection)
 

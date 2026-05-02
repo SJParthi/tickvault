@@ -2300,50 +2300,13 @@ async fn main() -> Result<()> {
         credentials.client_id.expose_secret().to_string()
     };
 
-    // 2026-04-28 — depth-200 SELF token alternate auth path.
-    // When `[depth_200_auth] mode = "manual_self_with_renewal"` is set,
-    // boot a separate `Depth200SelfTokenManager` against AWS SSM at
-    // `/tickvault/<env>/dhan/depth_200_self_token`, validate the JWT is
-    // SELF-type, and use ITS TokenHandle for the depth-200 connections
-    // only. All other WebSockets keep the shared TOTP/APP `token_handle`.
-    // See `docs/architecture/depth-200-self-token-design.md` for the
-    // full design and Telegram event matrix. Default mode `"totp_app"`
-    // is a no-op — the option remains None and depth-200 reuses
-    // `token_handle.clone()` exactly as before.
-    let depth_200_self_token_manager: Option<
-        std::sync::Arc<
-            tickvault_core::auth::depth_200_self_token_manager::Depth200SelfTokenManager,
-        >,
-    > = if config.depth_200_auth.is_manual_self_mode() {
-        match tickvault_core::auth::depth_200_self_token_manager::Depth200SelfTokenManager::boot_from_ssm(
-            &config.depth_200_auth,
-            ws_client_id.clone(),
-            config.dhan.rest_api_base_url.clone(),
-            Some(notifier.clone()),
-        )
-        .await
-        {
-            Ok(manager) => {
-                let manager = std::sync::Arc::new(manager);
-                let _renewal_handle = std::sync::Arc::clone(&manager).spawn_renewal_task();
-                tracing::info!(
-                    ssm_param = %config.depth_200_auth.ssm_parameter_name,
-                    "depth-200 SELF token manager booted; renewal task spawned"
-                );
-                Some(manager)
-            }
-            Err(err) => {
-                tracing::error!(
-                    error = %err,
-                    ssm_param = %config.depth_200_auth.ssm_parameter_name,
-                    "depth-200 SELF token manager FAILED to boot — depth-200 will fall back to shared TOTP/APP handle (which Dhan rejects). Operator must paste a valid SELF JWT into SSM and restart."
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
+    // Depth-200 uses the same shared TOTP/APP `token_handle` as Live Feed,
+    // Depth-20 and Order-Update. Dhan removed the server-side `tokenConsumerType`
+    // gate on `wss://full-depth-api.dhan.co` (Ticket #5610706, 2026-05-02 —
+    // "either a SELF token or an APP token, and both should now work
+    // seamlessly for fetching the 200-level market depth data"), so the
+    // separate `Depth200SelfTokenManager` workaround is retired. Git
+    // history preserves the SELF code if Dhan ever regresses.
 
     // Step 8a: Create WebSocket pool (channel + connections, NOT yet spawned).
     // Step 9 starts tick processor BEFORE connections are spawned so frames
@@ -2778,17 +2741,21 @@ async fn main() -> Result<()> {
             );
             let mut d200_cmd_senders = std::collections::HashMap::new();
             let mut d200_dyn_spawn_count: usize = 0;
+
+            // PR-B (2026-05-02): one shared atomic counter incremented by all
+            // 5 depth-200 receivers on every frame. The boot smoke test polls
+            // this counter for the first ≥ 1 transition. See
+            // `crates/app/src/boot_smoke_test.rs` for classifier + emission.
+            let depth_200_frame_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+
             for slot in 0..tickvault_common::constants::MAX_TWO_HUNDRED_DEPTH_CONNECTIONS {
                 let (tx, rx) =
                     tokio::sync::mpsc::channel::<tickvault_core::websocket::DepthCommand>(4);
                 d200_cmd_senders.insert(slot, tx);
 
-                // Pick correct token: SELF token if manual_self_with_renewal
-                // mode is configured, else shared TOTP/APP handle.
-                let depth200_token = match &depth_200_self_token_manager {
-                    Some(manager) => manager.handle().clone(),
-                    None => token_handle.clone(),
-                };
+                // Depth-200 reuses the shared TOTP/APP token handle
+                // (Ticket #5610706 — Dhan removed the SELF-only gate).
+                let depth200_token = token_handle.clone();
                 let stagger_ms = (slot as u64)
                     .saturating_mul(tickvault_core::websocket::DEPTH_200_INITIAL_STAGGER_MS);
                 tickvault_app::depth_20_conn_spawner::spawn_depth_200_minimal_conn(
@@ -2804,10 +2771,22 @@ async fn main() -> Result<()> {
                         health_status: health_status.clone(),
                         ws_frame_spill: ws_frame_spill.clone(),
                         initial_stagger_ms: stagger_ms,
+                        depth_200_frame_counter: Some(std::sync::Arc::clone(
+                            &depth_200_frame_counter,
+                        )),
                     },
                 );
                 d200_dyn_spawn_count = d200_dyn_spawn_count.saturating_add(1);
             }
+
+            // PR-B: spawn the boot-time depth-200 smoke test once all 5
+            // slots are wired. Off-hours boots produce a `Skipped` log and
+            // exit at the deadline; in-market boots emit `Passed` (Info)
+            // on the first frame or `Failed` (Critical, DEPTH200-SMOKE-01)
+            // at the deadline if zero frames arrived.
+            tickvault_app::boot_smoke_test::spawn_depth_200_boot_smoke_test(std::sync::Arc::clone(
+                &depth_200_frame_counter,
+            ));
             // H1 + M3 — runtime invariant: spawn loop emitted exactly 5 conns.
             // Saturating add means a logic bug (e.g. early break) leaves the
             // counter < 5; a duplicate spawn could push it > 5. Both fail.
@@ -3801,19 +3780,9 @@ async fn main() -> Result<()> {
                                 continue;
                             }
 
-                            // 2026-04-28 — pick the right TokenHandle for depth-200.
-                            // When manual_self_with_renewal mode is on AND the SELF
-                            // token manager booted successfully, depth-200 uses the
-                            // SELF-token handle (full-depth-api.dhan.co requires
-                            // tokenConsumerType=SELF). All other WS pools keep the
-                            // shared TOTP/APP token_handle. If the manager is None
-                            // (default mode OR boot failed) we fall back to the
-                            // shared handle — depth-200 will fail with APP-token
-                            // RST as before, surfaced via existing alerts.
-                            let depth200_token = match &depth_200_self_token_manager {
-                                Some(manager) => manager.handle().clone(),
-                                None => token_handle.clone(),
-                            };
+                            // Depth-200 reuses the shared TOTP/APP token handle
+                            // (Ticket #5610706 — Dhan removed the SELF-only gate).
+                            let depth200_token = token_handle.clone();
                             let depth200_client_id = ws_client_id.clone();
                             let depth200_segment = tickvault_common::types::ExchangeSegment::NseFno;
 

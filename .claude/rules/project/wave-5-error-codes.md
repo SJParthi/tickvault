@@ -208,6 +208,51 @@ implementation deferred to a follow-up sub-PR.
 Gmail-send the GitHub link to apihelp@dhan.co. The L3 escalation runs
 on Track 2 verdict from the Mon May 4 SELECT.
 
+## DEPTH200-SMOKE-01 — boot-time depth-200 smoke test failed (PR-B, 2026-05-02)
+
+**Trigger:** at boot, the smoke-test task in
+`crates/app/src/boot_smoke_test.rs::run_smoke_test_loop` polls a shared
+`Arc<AtomicU64>` that all 5 dynamic depth-200 receivers increment on
+every frame. After `SMOKE_DEADLINE_SECS` (= 60s) of in-market polling
+the counter is still 0. Severity::Critical. Edge-trigger semantics:
+fires exactly once per process lifetime.
+
+**Why it exists:** post-PR #427 depth-200 reuses the shared TOTP/APP
+token (Dhan Ticket #5610706 removed the SELF-only gate). DEPTH200-SMOKE-01
+is the boot-time confirmation that the gate is still removed. If Dhan
+ever silently regresses, the operator gets a Critical signal at boot
+instead of waiting until the 09:16:30 IST market-open self-test.
+
+**Three causes, in descending likelihood:**
+
+| Cause | Diagnosis | Fix |
+|---|---|---|
+| Dhan re-enabled the SELF-only gate | `WebSocketDisconnected` events also firing for kind=depth-200 with reset reasons; `tv_websocket_connections_active{kind="depth-200"}` stays at 0 | Re-open Ticket #5610706 with Dhan support; in the meantime `git revert <sha>` of PR #427 to restore the SELF-token workaround |
+| All 5 SecurityIds far OTM (server-side filtering) | depth-200 conns show as Connected but Dhan never streams; depth-rebalancer not yet computed ATM | Wait for the 60s rebalancer cycle; smoke runs ONCE per boot, will not re-fire |
+| WS pool subscribe failed to dispatch | conns stuck in DEFERRED mode (`security_id: None` never resolved); `DEPTH-200-DYN-01` also firing | Follow DEPTH-200-DYN-01 runbook above |
+
+**Triage:**
+
+1. `mcp__tickvault-logs__prometheus_query "tv_websocket_connections_active"`
+   — if depth-200 count is 0, this is auth/handshake; follow Cause 1.
+2. `mcp__tickvault-logs__tail_errors` — search for `WebSocketDisconnected`
+   with kind=depth-200 in the boot window. If present, it's a server-side
+   reset; escalate to operator.
+3. `mcp__tickvault-logs__questdb_sql "select count(*) from option_movers
+   where category = 'TOP_VOLUME' and ts > now() - 5m"` — empty/very-low
+   means the upstream `OptionMoversWriter` isn't producing the gainer
+   set the depth-200 selector reads; this is Cause 3.
+4. If Causes 1-3 all rule out → operator inspects the depth-200 selector
+   for a logic bug that picks far-OTM SecurityIds.
+
+**Auto-triage safe:** NO (Severity::Critical). Mitigation requires
+operator decision (`git revert` vs Dhan support escalation vs config
+change).
+
+**Source:** `crates/app/src/boot_smoke_test.rs`,
+`crates/common/src/error_code.rs::Depth200Smoke01NoFramesAtBoot`,
+`.claude/triage/error-rules.yaml::depth200-smoke-01-no-frames-at-boot-escalate`.
+
 ## Cross-references
 
 - `.claude/plans/active-plan-wave-5-indices-only.md` Items 4, 5, 6, 9
