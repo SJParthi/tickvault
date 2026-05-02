@@ -136,7 +136,7 @@ Snapshot of 24K rows: ~10.5 ms (within 11 ms Criterion budget).
 | `crates/common/src/config.rs:154` | KEEP — one-line ratchet pointer |
 | Banned-pattern hook category 4 | KEEP — blocks any literal `wss://full-depth-api.dhan.co/twohundreddepth` regression |
 
-**SELF token confirmation (Parthiban 2026-04-28):** Depth-200 accepts ONLY SELF tokens. RenewToken extends a SELF token by 24h while preserving `tokenConsumerType: "SELF"`. APP tokens are silently rejected by the depth-200 server (TCP disconnects within seconds). This is enforced by `Depth200SelfTokenManager::boot_from_ssm`'s `validate_self_claims` (DEPTH200-AUTH-01..03 fire on misuse).
+**SELF token requirement RETIRED (Dhan Ticket #5610706, 2026-05-02):** `wss://full-depth-api.dhan.co` now accepts both APP and SELF tokens — *"either a SELF token or an APP token, and both should now work seamlessly for fetching the 200-level market depth data"*. Depth-200 reuses the shared TOTP/APP `TokenHandle`. The `Depth200SelfTokenManager` workaround was deleted; git history retains it if Dhan ever regresses.
 
 ## Cross-references
 

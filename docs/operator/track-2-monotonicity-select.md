@@ -13,7 +13,7 @@ suggesting Dhan's `volume` field is cumulative-day, but Track 2 — the only
 mathematical proof — was unrunnable in the sandbox because:
 
 1. NSE Labour Day holiday → no live ticks.
-2. App boot failed `DEPTH200-AUTH-01` (SELF token expired ~40h ago).
+2. App boot failed (depth-200 SELF token workaround was in place; retired 2026-05-02 per Dhan Ticket #5610706).
 3. QuestDB not bound in the Cowork sandbox.
 
 The Mon May 4 market open is the next opportunity. This runbook gives the
@@ -23,8 +23,6 @@ exact SQL + verdict logic so the operator can execute it in <5 minutes.
 
 | Check | Expected | How |
 |---|---|---|
-| DEPTH200 SELF token refreshed | yes | runbook `.claude/rules/project/depth-200-auth-error-codes.md`, then restart app |
-| Boot clean (no DEPTH200-AUTH-01) | no `DEPTH200-AUTH-01` in `data/logs/errors.jsonl.*` since restart | `grep DEPTH200-AUTH-01 data/logs/errors.jsonl.*` |
 | App alive at 09:15:30 IST | `MarketOpenStreamingConfirmation` Telegram fired | check Telegram |
 | Tick rate non-trivial by 09:45 IST | ≥ 50 K ticks captured | `select count(*) from ticks where ts > '2026-05-04T09:15:00.000000Z';` |
 
@@ -169,7 +167,6 @@ in Wave 5 ships independently.
 ## Cross-references
 
 - `.claude/plans/active-plan-wave-5-indices-only.md` Items 26 + 27 + 28 + 29
-- `.claude/rules/project/depth-200-auth-error-codes.md` (DEPTH200 token refresh)
 - `docs/dhan-support/2026-05-01-volume-semantic-clarification.md` (L3 ticket draft)
 - `crates/core/src/parser/quote.rs:40` (parser citation)
 - `crates/common/src/tick_types.rs:31` (volume field semantic comment)
