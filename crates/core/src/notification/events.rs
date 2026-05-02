@@ -983,12 +983,23 @@ pub enum NotificationEvent {
     DepthDynamicV2DiffApplied {
         /// `"depth-20-dynamic"` or `"depth-200-dynamic"`.
         feed: &'static str,
-        /// Instruments newly subscribed this cycle.
+        /// Instruments newly subscribed this cycle. May be SHORTER than
+        /// `stats_added` if registry resolution dropped an entry —
+        /// `stats_added - added.len()` = unresolved drops, surfaced in
+        /// the rendered message so the operator sees the discrepancy.
         added: Vec<DepthDiffEntry>,
-        /// Instruments unsubscribed this cycle.
+        /// Instruments unsubscribed this cycle. Same drift semantics.
         removed: Vec<DepthDiffEntry>,
         /// Instruments unchanged from previous cycle (silent — no frames sent).
         retained_count: usize,
+        /// 2026-05-02 (hostile-bug-hunt HIGH fix) — actual count of Add ops
+        /// produced by `DynamicSubscriptionState::diff()`. Renders authoritative
+        /// in Telegram so the operator sees `stats_added=5` even if registry
+        /// resolution dropped 2 entries (audit-findings 2026-04-17 Rule 11:
+        /// no false-OK accounting).
+        stats_added: usize,
+        /// Authoritative count of Remove ops from the diff state machine.
+        stats_removed: usize,
     },
 }
 
@@ -1009,13 +1020,56 @@ pub struct DepthDiffEntry {
 
 impl DepthDiffEntry {
     /// Symbol + sid + segment in one Telegram-friendly line.
+    ///
+    /// 2026-05-02 (security-reviewer HIGH fix): HTML-escape the
+    /// `display_label` and truncate at 80 chars before interpolation.
+    /// The Dhan instrument CSV is not operator-validated; a tampered
+    /// `DISPLAY_NAME` containing `</b><a href="http://attacker.com">` would
+    /// otherwise inject a clickable phishing link into the operator's
+    /// HTML-mode Telegram message. Truncation prevents 4096-char message
+    /// overflow on a 10-entry rebalance with maliciously long labels.
     #[must_use]
     pub fn format_line(&self) -> String {
         format!(
             "  • {} (sid={}, {})",
-            self.display_label, self.security_id, self.exchange_segment
+            html_escape(&truncate_display_label(&self.display_label)),
+            self.security_id,
+            self.exchange_segment
         )
     }
+}
+
+/// Maximum length of a `display_label` after which it gets truncated
+/// before interpolation into a Telegram HTML message. 80 chars covers
+/// the longest legitimate Dhan label ("BANKNIFTY 47000 PE 2026-12-25"
+/// = 28 chars, with x4 headroom for verbose labels). Pinned by ratchet.
+pub const DISPLAY_LABEL_MAX_LEN: usize = 80;
+
+/// HTML-escape the 3 reserved characters Telegram's HTML parse_mode
+/// recognises: `&`, `<`, `>`. Keeps the message both renderable AND
+/// safe from `<a href>` / `</b>` injection from a tampered Dhan CSV.
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Truncate to [`DISPLAY_LABEL_MAX_LEN`] characters at a char boundary.
+/// Adds an ellipsis if truncated.
+fn truncate_display_label(s: &str) -> String {
+    if s.chars().count() <= DISPLAY_LABEL_MAX_LEN {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(DISPLAY_LABEL_MAX_LEN).collect();
+    out.push('…');
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -2023,17 +2077,38 @@ impl NotificationEvent {
                 added,
                 removed,
                 retained_count,
+                stats_added,
+                stats_removed,
             } => {
                 // Operator-requested 2026-05-02: show display_label + sid + segment.
-                // Cap per-section list at 10 entries to stay under Telegram's
-                // 4096-char message limit on volatile cycles.
+                // 2026-05-02 hostile-bug-hunt HIGH fix: render counts from
+                // `stats_added` / `stats_removed` (authoritative diff-state
+                // machine output), not `added.len()` / `removed.len()` which
+                // could be lower if registry resolution dropped entries.
+                // Surface unresolved counts so operator sees the discrepancy.
+                // Final 4000-char overflow guard prevents Telegram 400 on
+                // pathological labels (security-reviewer MEDIUM fix).
                 const MAX_LINES_PER_SECTION: usize = 10;
+                const MAX_MESSAGE_LEN: usize = 4000;
+
+                let unresolved_added = stats_added.saturating_sub(added.len());
+                let unresolved_removed = stats_removed.saturating_sub(removed.len());
+
                 let mut lines: Vec<String> = Vec::with_capacity(2 + added.len() + removed.len());
+                let unresolved_tail = if unresolved_added + unresolved_removed > 0 {
+                    format!(
+                        "  unresolved: <code>{}</code> (registry lookup miss)",
+                        unresolved_added + unresolved_removed
+                    )
+                } else {
+                    String::new()
+                };
                 lines.push(format!(
-                    "<b>{feed}: diff applied</b>\nadded: <code>{}</code>  removed: <code>{}</code>  retained: <code>{}</code>",
-                    added.len(),
-                    removed.len(),
-                    retained_count
+                    "<b>{feed}: diff applied</b>\nadded: <code>{}</code>  removed: <code>{}</code>  retained: <code>{}</code>{}",
+                    stats_added,
+                    stats_removed,
+                    retained_count,
+                    unresolved_tail
                 ));
                 if !added.is_empty() {
                     lines.push("\n<b>➕ Added</b>".to_string());
@@ -2056,7 +2131,13 @@ impl NotificationEvent {
                         ));
                     }
                 }
-                lines.join("\n")
+                let mut joined = lines.join("\n");
+                // Defence-in-depth: enforce Telegram's 4096 hard cap.
+                if joined.chars().count() > MAX_MESSAGE_LEN {
+                    let truncated: String = joined.chars().take(MAX_MESSAGE_LEN).collect();
+                    joined = format!("{truncated}\n…(truncated to fit Telegram limit)");
+                }
+                joined
             }
         }
     }
@@ -2312,6 +2393,71 @@ mod tests {
             entry.format_line(),
             "  • NIFTY 23000 CE 2026-06-26 (sid=70123, NSE_FNO)"
         );
+    }
+
+    /// 2026-05-02 (security-reviewer HIGH fix): HTML-escape the
+    /// `display_label` so a tampered Dhan CSV cannot inject `<a href>`
+    /// or `</b>` into the operator's HTML-mode Telegram message.
+    #[test]
+    fn test_depth_diff_entry_format_line_html_escapes_display_label() {
+        let entry = DepthDiffEntry {
+            security_id: 99999,
+            exchange_segment: "NSE_FNO".to_string(),
+            display_label: r#"</b><a href="http://attacker.com">click</a><b>"#.to_string(),
+            underlying_symbol: "EVIL".to_string(),
+        };
+        let line = entry.format_line();
+        // No raw `<` or `>` from the input (legitimate `<` from format!
+        // would only appear in the angle-bracket of `</b>` etc, which
+        // is the very thing we're escaping). Easier check: ensure
+        // escaped sequences appear AND no raw `<a href` substring.
+        assert!(
+            !line.contains("<a href"),
+            "raw <a href> must not appear in rendered line: {line}"
+        );
+        assert!(
+            line.contains("&lt;a href="),
+            "escaped &lt;a href= must appear in rendered line: {line}"
+        );
+        assert!(
+            line.contains("&lt;/b&gt;"),
+            "escaped &lt;/b&gt; must appear in rendered line: {line}"
+        );
+    }
+
+    /// Truncates `display_label` at DISPLAY_LABEL_MAX_LEN chars so a
+    /// 10-entry rebalance with maliciously long labels cannot push the
+    /// full Telegram message past the 4096-char hard cap.
+    #[test]
+    fn test_depth_diff_entry_format_line_truncates_long_display_label() {
+        let long = "A".repeat(200);
+        let entry = DepthDiffEntry {
+            security_id: 1,
+            exchange_segment: "NSE_FNO".to_string(),
+            display_label: long,
+            underlying_symbol: "TEST".to_string(),
+        };
+        let line = entry.format_line();
+        // The truncation appends an ellipsis; the rendered line must
+        // contain at most DISPLAY_LABEL_MAX_LEN A's followed by …
+        let a_count = line.chars().filter(|c| *c == 'A').count();
+        assert!(
+            a_count <= DISPLAY_LABEL_MAX_LEN,
+            "display_label exceeded DISPLAY_LABEL_MAX_LEN ({DISPLAY_LABEL_MAX_LEN}) chars after truncation, got {a_count}"
+        );
+        assert!(
+            line.contains('…'),
+            "truncation marker must be present: {line}"
+        );
+    }
+
+    /// Pin DISPLAY_LABEL_MAX_LEN at 80 — covers longest legitimate
+    /// Dhan label with x4 headroom. Reducing this would reject
+    /// legitimate labels; raising it without a 4000-char overall guard
+    /// re-introduces the message-overflow risk.
+    #[test]
+    fn test_display_label_max_len_pinned_at_80() {
+        assert_eq!(DISPLAY_LABEL_MAX_LEN, 80);
     }
 
     #[test]
