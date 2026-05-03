@@ -203,28 +203,69 @@ pub struct StockMoversResponse {
 }
 
 /// `GET /api/market/stock-movers` — top stock gainers/losers/most-active from QuestDB.
+///
+/// Audit-2026-05-03 PR #448: migrated from the legacy `stock_movers`
+/// table to the canonical `movers_5s` materialized view (5-second
+/// freshness, server-pre-aggregated). Replaces 3 SQL queries against
+/// the legacy schema (with `rank`/`symbol` columns) with 3 parallel
+/// QuestDB SQL calls via the shared `movers_questdb::query_movers`
+/// helper.
+///
+/// **API contract changes:**
+/// - `rank` is now derived from the response array index (1-indexed)
+///   rather than a per-snapshot computed field stored in the table.
+/// - `symbol` is empty `""` — the legacy `stock_movers.symbol` column
+///   was populated by `StockMoversWriter` (which had `InstrumentRegistry`
+///   access at write time). The new `movers_5s` view doesn't carry
+///   `symbol`. Frontend should resolve display names via a separate
+///   lookup (e.g. `/api/quote/{security_id}` or instrument cache).
+///   A future PR may add `InstrumentRegistry` to `SharedAppState` to
+///   restore in-handler resolution.
+/// - `change` (= last_price - prev_close) is computed from the view's
+///   `last_price` + `prev_close` columns.
+///
+/// 3 parallel queries (gainers / losers / most-active) via `tokio::join!`.
 // TEST-EXEMPT: HTTP handler — requires live QuestDB for integration
 pub async fn get_stock_movers(State(state): State<SharedAppState>) -> impl IntoResponse {
-    let cfg = state.questdb_config();
-    let base_url = format!("http://{}:{}", cfg.host, cfg.http_port);
-    let client = state.questdb_http_client();
+    use crate::handlers::movers_questdb::{
+        DEFAULT_MOVERS_LIMIT, InstrumentTypeFilter, MoversSortMetric, query_movers,
+    };
 
-    let mut gainers = query_movers(client, &base_url, "GAINER").await;
-    let mut losers = query_movers(client, &base_url, "LOSER").await;
-    let mut most_active = query_movers(client, &base_url, "MOST_ACTIVE").await;
+    let questdb = state.questdb_config();
 
-    // Sort gainers by change_pct desc, losers by change_pct asc, most_active by volume desc
-    gainers.sort_by(|a, b| {
-        b.change_pct
-            .partial_cmp(&a.change_pct)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    losers.sort_by(|a, b| {
-        a.change_pct
-            .partial_cmp(&b.change_pct)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    most_active.sort_by_key(|e| std::cmp::Reverse(e.volume));
+    // 3 parallel queries against `movers_5s` filtered by `instrument_type = 'EQUITY'`.
+    let (gainers_result, losers_result, most_active_result) = tokio::join!(
+        query_movers(
+            questdb,
+            InstrumentTypeFilter::Equity,
+            MoversSortMetric::GainersByChangePct,
+            DEFAULT_MOVERS_LIMIT,
+        ),
+        query_movers(
+            questdb,
+            InstrumentTypeFilter::Equity,
+            MoversSortMetric::LosersByChangePct,
+            DEFAULT_MOVERS_LIMIT,
+        ),
+        query_movers(
+            questdb,
+            InstrumentTypeFilter::Equity,
+            MoversSortMetric::MostActiveByVolume,
+            DEFAULT_MOVERS_LIMIT,
+        ),
+    );
+
+    // Map MoverEntry → StockMoverEntry. `rank` is index+1; `symbol` is
+    // empty (frontend resolves); `change` is computed from ltp-prev_close.
+    //
+    // Audit-2026-05-03 PR #448 (security-reviewer HIGH fix): log
+    // QuestDB query failures at error! level so operator + Telegram
+    // see the failure. Legacy handler also swallowed errors silently;
+    // fixing in this migration since `unwrap_or_default()` previously
+    // returned empty Vec with no log line.
+    let gainers = mover_entries_to_stock(unwrap_or_log(gainers_result, "gainers"));
+    let losers = mover_entries_to_stock(unwrap_or_log(losers_result, "losers"));
+    let most_active = mover_entries_to_stock(unwrap_or_log(most_active_result, "most_active"));
 
     Json(StockMoversResponse {
         available: !gainers.is_empty() || !losers.is_empty() || !most_active.is_empty(),
@@ -235,74 +276,49 @@ pub async fn get_stock_movers(State(state): State<SharedAppState>) -> impl IntoR
     .into_response()
 }
 
-/// Valid stock mover categories (whitelist for SQL injection prevention).
-const VALID_STOCK_CATEGORIES: &[&str] = &["GAINER", "LOSER", "MOST_ACTIVE"];
-
-/// Queries QuestDB for stock movers of a given category.
-///
-/// # Safety (SQL injection)
-/// `category` is validated against `VALID_STOCK_CATEGORIES` whitelist.
-/// Unrecognized values return an empty Vec (no query executed).
-async fn query_movers(
-    client: &reqwest::Client,
-    base_url: &str,
-    category: &str,
-) -> Vec<StockMoverEntry> {
-    // GAP-SEC-02: whitelist validation prevents SQL injection via category interpolation
-    if !VALID_STOCK_CATEGORIES.contains(&category) {
-        return Vec::new();
-    }
-
-    let query = format!(
-        "SELECT rank, symbol, security_id, ltp, change_abs, change_pct, volume, prev_close \
-         FROM stock_movers \
-         WHERE category = '{category}' \
-         LATEST ON ts PARTITION BY security_id \
-         ORDER BY rank ASC \
-         LIMIT 30"
-    );
-
-    let exec_url = format!("{base_url}/exec");
-    let resp = match client
-        .get(&exec_url)
-        .query(&[("query", &query)])
-        .send()
-        .await
-    {
-        Ok(r) => r,
-        Err(_) => return Vec::new(),
-    };
-
-    let body: serde_json::Value = match resp.json().await {
+/// Audit-2026-05-03 PR #448 (security-reviewer HIGH fix): log a
+/// QuestDB query failure at `error!` level so the operator gets
+/// visibility (Loki ERROR routing → Telegram) instead of seeing a
+/// silent empty list. Returns empty Vec on Err — the handler still
+/// serves a JSON response with `available: false` rather than 5xx.
+fn unwrap_or_log(
+    result: anyhow::Result<Vec<tickvault_core::pipeline::top_movers::MoverEntry>>,
+    list_name: &'static str,
+) -> Vec<tickvault_core::pipeline::top_movers::MoverEntry> {
+    match result {
         Ok(v) => v,
-        Err(_) => return Vec::new(),
-    };
-
-    let rows = match body["dataset"].as_array() {
-        Some(r) => r,
-        None => return Vec::new(),
-    };
-
-    let mut entries = Vec::with_capacity(rows.len());
-    for row in rows {
-        let arr = match row.as_array() {
-            Some(a) if a.len() >= 8 => a,
-            _ => continue,
-        };
-
-        entries.push(StockMoverEntry {
-            rank: arr[0].as_i64().unwrap_or(0),
-            symbol: arr[1].as_str().unwrap_or("").to_string(),
-            security_id: arr[2].as_i64().unwrap_or(0),
-            ltp: arr[3].as_f64().unwrap_or(0.0),
-            change: arr[4].as_f64().unwrap_or(0.0),
-            change_pct: arr[5].as_f64().unwrap_or(0.0),
-            volume: arr[6].as_i64().unwrap_or(0),
-            prev_close: arr[7].as_f64().unwrap_or(0.0),
-        });
+        Err(err) => {
+            tracing::error!(
+                ?err,
+                list = list_name,
+                code = "API-MOVERS-01",
+                "QuestDB query for /api/market/stock-movers list failed"
+            );
+            Vec::new()
+        }
     }
+}
 
+/// Maps the canonical `MoverEntry` (from `movers_questdb`) to the
+/// API-stable `StockMoverEntry` shape. `rank` is 1-indexed array
+/// position; `symbol` is empty (frontend resolves).
+fn mover_entries_to_stock(
+    entries: Vec<tickvault_core::pipeline::top_movers::MoverEntry>,
+) -> Vec<StockMoverEntry> {
     entries
+        .into_iter()
+        .enumerate()
+        .map(|(idx, e)| StockMoverEntry {
+            rank: (idx + 1) as i64,
+            symbol: String::new(), // frontend resolves via separate lookup
+            security_id: i64::from(e.security_id),
+            ltp: f64::from(e.last_traded_price),
+            change: f64::from(e.last_traded_price - e.prev_close),
+            change_pct: f64::from(e.change_pct),
+            volume: i64::from(e.volume),
+            prev_close: f64::from(e.prev_close),
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
