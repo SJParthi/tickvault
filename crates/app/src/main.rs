@@ -2682,28 +2682,42 @@ async fn main() -> Result<()> {
         // not built — typically a boot path that doesn't load instruments).
         let movers_base_shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
         let _movers_base_handle = if let Some(registry) = slow_registry.as_ref() {
-            // PR #450 commit 2 (2026-05-03): empty prev_oi cache for now.
-            // Commit 3 ships the data primitives (extract_prev_oi_from_option_chain
-            // + build_prev_oi_cache_from_bhavcopy); the boot orchestrator
-            // wiring (download bhavcopy → parse → fetch option chains →
-            // merge → pass Arc) lands in PR #452 (8:15 AM ready boot
-            // orchestrator).
-            //
-            // PR #450 commit 8 hostile-bug-hunt HIGH H2 fix: emit a
-            // boot-time WARN so the operator KNOWS the OI Change column
-            // on /api/movers will compute as `current - 0 = current`
-            // until PR #452 wires the loader. This is a misleading
-            // value (false-OK signal per audit-findings Rule 11) — the
-            // WARN ensures it's not silent.
-            let prev_oi_cache: std::sync::Arc<std::collections::HashMap<(u32, u8), i64>> =
-                std::sync::Arc::new(std::collections::HashMap::new());
-            warn!(
-                code = tickvault_common::error_code::ErrorCode::PrevOi01CacheEmptyAtBoot.code_str(),
-                "prev_oi cache EMPTY at boot — /api/movers OI Change column will display \
-                 `current_OI - 0 = current_OI` until PR #452 wires the bhavcopy + \
-                 Option Chain prev_oi loader. Operators must NOT trust the OI Change \
-                 + OI Change % columns until then."
-            );
+            // PR #454 (2026-05-03): boot-time prev_oi cache loader.
+            // Wires PR #450 commit 3 primitives (bhavcopy fetch + parse
+            // + build_prev_oi_cache_from_bhavcopy) into the boot path.
+            // On success the cache is populated with yesterday's
+            // session-close OI for every NSE F&O contract we subscribe;
+            // /api/movers OI Change column displays Dhan-precise values
+            // from the very first tick. On failure (404, network
+            // timeout, unzip, parse error) the loader returns an empty
+            // cache + emits its own typed `error!` with code
+            // `PREVOI-01` (see prev_oi_loader.rs error sites). The
+            // downstream movers_pipeline then operates with
+            // `current_OI - 0 = current_OI` for OI Change — a
+            // gracefully-degraded fallback rather than a HALT.
+            let prev_oi_cache = tickvault_app::prev_oi_loader::load_prev_oi_cache_at_boot(
+                registry,
+                trading_calendar.as_ref(),
+            )
+            .await;
+            if prev_oi_cache.is_empty() {
+                // The loader's internal error sites already emitted
+                // PREVOI-01. This WARN at the spawn site documents the
+                // operational consequence — preserved per
+                // audit-findings Rule 11 (no false-OK signals).
+                warn!(
+                    code = tickvault_common::error_code::ErrorCode::PrevOi01CacheEmptyAtBoot
+                        .code_str(),
+                    "prev_oi cache EMPTY at boot — /api/movers OI Change column \
+                     will display `current_OI - 0 = current_OI` until next boot \
+                     succeeds in fetching yesterday's NSE bhavcopy."
+                );
+            } else {
+                info!(
+                    cache_size = prev_oi_cache.len(),
+                    "prev_oi cache populated — /api/movers OI Change column is Dhan-precise"
+                );
+            }
             Some(tickvault_app::movers_pipeline::spawn_movers_pipeline(
                 config.questdb.clone(),
                 tick_broadcast_sender.clone(),
