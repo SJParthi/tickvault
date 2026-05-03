@@ -40,6 +40,16 @@ pub async fn portal() -> impl IntoResponse {
     )
 }
 
+/// GET /favicon.ico — returns 204 No Content so browser auto-fetches don't
+/// hit the auth-layer fallback and emit a `GAP-SEC-01: missing Authorization`
+/// WARN per portal page load. The 204 response is cached by browsers.
+pub async fn favicon() -> impl IntoResponse {
+    (
+        StatusCode::NO_CONTENT,
+        [(header::CACHE_CONTROL, "public, max-age=86400")],
+    )
+}
+
 /// GET /portal/market-dashboard — serves the live Market Dashboard.
 // TEST-EXEMPT: static HTML serving — tested via pattern tests below
 pub async fn market_dashboard() -> impl IntoResponse {
@@ -158,6 +168,57 @@ mod tests {
     async fn test_options_chain_handler_returns_ok() {
         let response = options_chain().await.into_response();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_favicon_returns_204_no_content() {
+        // Browsers auto-fetch /favicon.ico on every portal page load.
+        // The handler MUST return 204 (not 401, not 404) so the request
+        // bypasses the auth-layer fallback that produced
+        // `WARN GAP-SEC-01: missing Authorization` once per page load.
+        let response = favicon().await.into_response();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn test_favicon_sets_cache_control_header() {
+        // 24h browser cache prevents repeat fetches per page navigation.
+        let response = favicon().await.into_response();
+        let cache_control = response
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            cache_control.contains("max-age="),
+            "favicon must set Cache-Control max-age, got: {cache_control:?}"
+        );
+    }
+
+    #[test]
+    fn test_options_chain_html_uses_adaptive_polling_cadence() {
+        // Regression: PR introducing this ratchet replaced the fixed-5s
+        // setInterval with adaptive polling that backs off to 60s on 404
+        // (typical on non-trading days / fresh boots — eliminates the
+        // 12 404s/min spam in the API log). The fast/slow constants must
+        // both remain in the HTML; the fixed `REFRESH_INTERVAL = 5000`
+        // literal must NOT regress.
+        assert!(
+            OPTIONS_CHAIN_HTML.contains("REFRESH_INTERVAL_FAST_MS"),
+            "options-chain.html must declare REFRESH_INTERVAL_FAST_MS for in-market cadence"
+        );
+        assert!(
+            OPTIONS_CHAIN_HTML.contains("REFRESH_INTERVAL_SLOW_MS"),
+            "options-chain.html must declare REFRESH_INTERVAL_SLOW_MS for 404-backoff cadence"
+        );
+        assert!(
+            !OPTIONS_CHAIN_HTML.contains("setInterval(loadOptionChain"),
+            "options-chain.html must NOT use a fixed setInterval — use scheduleNextRefresh()"
+        );
+        assert!(
+            OPTIONS_CHAIN_HTML.contains("scheduleNextRefresh"),
+            "options-chain.html must use scheduleNextRefresh() so 404 → 60s back-off works"
+        );
     }
 
     #[test]
