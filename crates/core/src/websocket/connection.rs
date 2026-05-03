@@ -1847,13 +1847,20 @@ mod tests {
             tx,
             None,
         );
-        // The cached label is a `&'static str` — pointer equality with
-        // the const array proves no heap allocation occurred.
+        // Audit-2026-05-03 H2: the cached label MUST equal the canonical
+        // value. The field type `&'static str` is itself the zero-alloc
+        // proof — no `String` wrapping is possible at compile time.
+        // Pointer equality across literals is NOT guaranteed by the Rust
+        // language (string interning is an optimization, not a contract),
+        // so value equality is the correct ratchet.
         assert_eq!(conn.connection_id_label, "2");
-        assert!(std::ptr::eq(
+        assert_eq!(conn.connection_id_label, CONNECTION_ID_LABELS[2]);
+        // Round-trip: cached label must equal the canonical lookup.
+        assert_eq!(
             conn.connection_id_label,
-            CONNECTION_ID_LABELS[2]
-        ));
+            connection_id_label_static(2),
+            "cached label must match the canonical lookup"
+        );
     }
 
     #[test]
