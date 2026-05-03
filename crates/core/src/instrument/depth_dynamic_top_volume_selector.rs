@@ -198,6 +198,16 @@ pub fn build_cohort_sql(
     sql.push_str(" AND volume >= ");
     sql.push_str(&min_liquidity_volume.to_string());
 
+    // Audit-2026-05-03 (hostile-bug-hunt H2 fix): explicit `ORDER BY
+    // volume DESC` so the defensive LIMIT below truncates LOW-liquidity
+    // rows (correct) rather than NEW rows in storage order (which would
+    // silently drop the highest-information data when min_liquidity is
+    // misconfigured low and matches > MAX_COHORT_SIZE rows). Stage 2
+    // re-ranks the kept rows by change_pct DESC anyway, so this ORDER
+    // BY only affects which rows get TRUNCATED — not the final output
+    // ordering.
+    sql.push_str(" ORDER BY volume DESC");
+
     // Defensive LIMIT to bound Stage 2 sort cost in case min_liquidity
     // is misconfigured. NOT the primary filter — the WHERE clause is.
     sql.push_str(" LIMIT ");
@@ -418,19 +428,29 @@ mod tests {
     }
 
     /// Audit-2026-05-03 ratchet: the redesigned SQL MUST use a min-volume
-    /// liquidity gate (`volume >=`), NOT the old top-N ORDER BY LIMIT.
-    /// This is the primary filter ensuring depth-subscribed contracts
-    /// are liquid enough for live trade.
+    /// liquidity gate (`AND volume >=`) as the PRIMARY filter — the
+    /// legacy top-N filtering via the cohort_size parameter is retired.
+    /// (Note: `ORDER BY volume DESC` is RE-ADDED by the H2 fix to make
+    /// the defensive `LIMIT 1000` truncate LOW-volume rows correctly,
+    /// but it's no longer the primary mechanism — `WHERE volume >=` is.)
     #[test]
-    fn test_build_cohort_sql_uses_min_volume_filter_not_top_n_order_by() {
+    fn test_build_cohort_sql_uses_min_volume_filter_as_primary_gate() {
         let sql = build_cohort_sql(&[], &[], 50_000, 60);
         assert!(
             sql.contains("AND volume >= 50000"),
             "must filter by `volume >= min_liquidity_volume`, got: {sql}"
         );
+        // The WHERE clause must come BEFORE the ORDER BY (SQL syntax
+        // + semantic correctness — filter first, then order/truncate).
+        let where_pos = sql
+            .find("AND volume >= 50000")
+            .expect("WHERE clause missing");
+        let order_pos = sql
+            .find("ORDER BY volume DESC")
+            .expect("ORDER BY (defensive) missing");
         assert!(
-            !sql.contains("ORDER BY volume DESC"),
-            "must NOT use the legacy top-N ORDER BY (retired 2026-05-03), got: {sql}"
+            where_pos < order_pos,
+            "WHERE volume >= must precede ORDER BY (filter is primary, order is defensive)"
         );
     }
 
@@ -446,6 +466,28 @@ mod tests {
         assert!(
             sql.contains(&expected),
             "must include defensive LIMIT {MAX_COHORT_SIZE}, got: {sql}"
+        );
+    }
+
+    /// Audit-2026-05-03 (hostile-bug-hunt H2 fix) ratchet: SQL MUST
+    /// include `ORDER BY volume DESC` so the defensive `LIMIT 1000`
+    /// truncates LOW-volume rows (correct) rather than dropping NEW
+    /// rows in storage order (wrong — would lose highest-information
+    /// data when min_liquidity is misconfigured low).
+    #[test]
+    fn test_build_cohort_sql_orders_by_volume_desc_for_safe_truncation() {
+        let sql = build_cohort_sql(&[], &[], TEST_MIN_VOL, 60);
+        assert!(
+            sql.contains("ORDER BY volume DESC"),
+            "ORDER BY volume DESC required so LIMIT truncates LOW-volume rows \
+             (not new rows in storage order); got: {sql}"
+        );
+        // Position check: ORDER BY must come BEFORE LIMIT
+        let order_pos = sql.find("ORDER BY volume DESC").expect("ORDER BY missing");
+        let limit_pos = sql.find("LIMIT").expect("LIMIT missing");
+        assert!(
+            order_pos < limit_pos,
+            "ORDER BY must precede LIMIT in SQL syntax"
         );
     }
 
