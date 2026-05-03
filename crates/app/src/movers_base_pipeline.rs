@@ -293,6 +293,21 @@ pub fn spawn_movers_pipeline(
                     // applies to every row in this drain. Zero alloc:
                     // returns `&'static str`.
                     let phase = current_session_phase();
+                    // Audit-2026-05-03 FIX (hostile-bug-hunt H2): the
+                    // drain's outer `is_within_market_hours_ist()` gate
+                    // covers `[09:00, 15:30)` IST — wider than the
+                    // canonical phases (PREOPEN 09:00-09:13, MARKET
+                    // 09:15-15:30). The 09:13-09:14:59 IST gap (Phase 2
+                    // dispatch window) would otherwise produce
+                    // `phase = "UNKNOWN"` rows for ~120 seconds × ~12K
+                    // instruments = ~1.4M garbage rows per trading day.
+                    // Skip the drain entirely on UNKNOWN — preserves
+                    // the legacy semantics where the gap was a no-write
+                    // window, and prevents `phase != 'UNKNOWN'`
+                    // qualifier creep in every operator query.
+                    if phase == "UNKNOWN" {
+                        continue;
+                    }
                     // O(1) EXEMPT: drain iterates the universe (~11K)
                     // once per second. Allocation budget: zero (HashMap
                     // entries are mutated in-place via .iter_mut() to
