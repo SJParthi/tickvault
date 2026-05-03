@@ -257,9 +257,15 @@ pub async fn get_stock_movers(State(state): State<SharedAppState>) -> impl IntoR
 
     // Map MoverEntry → StockMoverEntry. `rank` is index+1; `symbol` is
     // empty (frontend resolves); `change` is computed from ltp-prev_close.
-    let gainers = mover_entries_to_stock(gainers_result.unwrap_or_default());
-    let losers = mover_entries_to_stock(losers_result.unwrap_or_default());
-    let most_active = mover_entries_to_stock(most_active_result.unwrap_or_default());
+    //
+    // Audit-2026-05-03 PR #448 (security-reviewer HIGH fix): log
+    // QuestDB query failures at error! level so operator + Telegram
+    // see the failure. Legacy handler also swallowed errors silently;
+    // fixing in this migration since `unwrap_or_default()` previously
+    // returned empty Vec with no log line.
+    let gainers = mover_entries_to_stock(unwrap_or_log(gainers_result, "gainers"));
+    let losers = mover_entries_to_stock(unwrap_or_log(losers_result, "losers"));
+    let most_active = mover_entries_to_stock(unwrap_or_log(most_active_result, "most_active"));
 
     Json(StockMoversResponse {
         available: !gainers.is_empty() || !losers.is_empty() || !most_active.is_empty(),
@@ -268,6 +274,29 @@ pub async fn get_stock_movers(State(state): State<SharedAppState>) -> impl IntoR
         most_active,
     })
     .into_response()
+}
+
+/// Audit-2026-05-03 PR #448 (security-reviewer HIGH fix): log a
+/// QuestDB query failure at `error!` level so the operator gets
+/// visibility (Loki ERROR routing → Telegram) instead of seeing a
+/// silent empty list. Returns empty Vec on Err — the handler still
+/// serves a JSON response with `available: false` rather than 5xx.
+fn unwrap_or_log(
+    result: anyhow::Result<Vec<tickvault_core::pipeline::top_movers::MoverEntry>>,
+    list_name: &'static str,
+) -> Vec<tickvault_core::pipeline::top_movers::MoverEntry> {
+    match result {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::error!(
+                ?err,
+                list = list_name,
+                code = "API-MOVERS-01",
+                "QuestDB query for /api/market/stock-movers list failed"
+            );
+            Vec::new()
+        }
+    }
 }
 
 /// Maps the canonical `MoverEntry` (from `movers_questdb`) to the
