@@ -190,19 +190,38 @@ const TOP_MOVERS_ALTER_DDL_SEGMENT: &str =
 /// O(1) per character; runs at the cold ILP-build cadence (~218
 /// rows/snapshot × 60s = ~3.6 rows/sec peak), so allocation on the
 /// dirty path is acceptable.
+/// Maximum byte length for an ILP symbol value. QuestDB ILP rejects extremely
+/// long SYMBOL columns; an unbounded upstream label (e.g. a malformed mover
+/// category from a corrupted CSV row) could otherwise produce an oversized
+/// ILP row that the server accepts as garbage or rejects entirely. Audit-
+/// 2026-05-03 H3: cap at a generous 256 bytes — every legitimate symbol /
+/// category / segment / phase value is ≤ ~32 bytes today.
+const ILP_SYMBOL_MAX_BYTES: usize = 256;
+
 #[must_use]
 pub fn sanitize_ilp_symbol(input: &str) -> std::borrow::Cow<'_, str> {
-    let needs_sanitize = input
+    let needs_strip = input
         .chars()
         .any(|c| c == '\n' || c == '\r' || c == ',' || c == '=' || c.is_control());
-    if !needs_sanitize {
+    let needs_truncate = input.len() > ILP_SYMBOL_MAX_BYTES;
+    if !needs_strip && !needs_truncate {
         return std::borrow::Cow::Borrowed(input);
     }
     let cleaned: String = input
         .chars()
         .filter(|c| !(*c == '\n' || *c == '\r' || *c == ',' || *c == '=' || c.is_control()))
         .collect();
-    std::borrow::Cow::Owned(cleaned)
+    // Truncate to ILP_SYMBOL_MAX_BYTES respecting UTF-8 char boundaries.
+    let bounded = if cleaned.len() > ILP_SYMBOL_MAX_BYTES {
+        let mut end = ILP_SYMBOL_MAX_BYTES;
+        while end > 0 && !cleaned.is_char_boundary(end) {
+            end -= 1;
+        }
+        cleaned[..end].to_string()
+    } else {
+        cleaned
+    };
+    std::borrow::Cow::Owned(bounded)
 }
 
 /// Wave 3-A Item 10: idempotent ALTER for `stock_movers.phase` SYMBOL.

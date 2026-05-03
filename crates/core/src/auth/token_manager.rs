@@ -18,6 +18,7 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use secrecy::ExposeSecret;
 use tracing::{error, info, instrument, warn};
+use zeroize::Zeroizing;
 
 use tickvault_common::config::{DhanConfig, NetworkConfig, TokenConfig};
 use tickvault_common::constants::{
@@ -471,15 +472,21 @@ impl TokenManager {
     pub async fn get_user_profile(
         &self,
     ) -> Result<super::types::UserProfileResponse, ApplicationError> {
-        // Load token and extract access token string while guard is alive
-        let access_token_value = {
+        // Audit-2026-05-03 H1: wrap the raw JWT in `Zeroizing` so the
+        // intermediate plaintext String is wiped from memory when this
+        // function returns. WebSocket paths already use this pattern; the
+        // REST profile/renew paths previously held the token as a plain
+        // `String` which left a copy on the heap until the next allocation
+        // overwrote it. Matches the WS pattern from
+        // `crates/core/src/websocket/connection.rs::build_authenticated_url`.
+        let access_token_value: Zeroizing<String> = {
             let token_guard = self.token.load();
             let token_state = token_guard.as_ref().as_ref().ok_or_else(|| {
                 ApplicationError::AuthenticationFailed {
                     reason: "no access token available for profile request".to_string(),
                 }
             })?;
-            token_state.access_token().expose_secret().to_string()
+            Zeroizing::new(token_state.access_token().expose_secret().to_string())
         };
 
         let url = format!(
@@ -491,11 +498,18 @@ impl TokenManager {
         let response = self
             .http_client
             .get(&url)
-            .header("access-token", &access_token_value)
+            .header("access-token", access_token_value.as_str())
             .send()
             .await
             .map_err(|err| ApplicationError::AuthenticationFailed {
-                reason: format!("profile request failed: {err}"),
+                // Audit-2026-05-03 L4: redact any URL params from reqwest error
+                // string defensively. The profile path uses header auth (no token
+                // in URL), but the same pattern is used in `acquire_token` (line
+                // 644) for consistency — defence in depth.
+                reason: format!(
+                    "profile request failed: {}",
+                    redact_url_params(&err.to_string())
+                ),
             })?;
 
         let status = response.status();
@@ -504,7 +518,17 @@ impl TokenManager {
         if !status.is_success() {
             // B2: Log full body for debugging but redact it from the error message
             // to prevent raw API response (may contain PII) from reaching Telegram alerts.
-            warn!(status = %status, "profile request failed — response body redacted from error");
+            // Audit-2026-05-03 M1: profile failure blocks pre-market validation —
+            // must be `error!` (not `warn!`) so Loki routes to Telegram per
+            // audit-findings-2026-04-17.md Rule 5.
+            error!(
+                code = tickvault_common::error_code::ErrorCode::Dh901InvalidAuth.code_str(),
+                severity = tickvault_common::error_code::ErrorCode::Dh901InvalidAuth
+                    .severity()
+                    .as_str(),
+                status = %status,
+                "DH-901: profile request failed — response body redacted from error"
+            );
             return Err(ApplicationError::AuthenticationFailed {
                 reason: format!("profile request HTTP {status} — see server logs for details"),
             });
@@ -576,9 +600,17 @@ impl TokenManager {
             let remaining = token_state.time_until_refresh(0);
             let four_hours = Duration::from_secs(4 * 3600);
             if remaining < four_hours {
-                warn!(
+                // Audit-2026-05-03 M5: token < 4h headroom is a pre-market
+                // failure that BLOCKS trading (function returns Err). Per
+                // audit-findings-2026-04-17.md Rule 5, blocking failures
+                // MUST be `error!` not `warn!` so Loki routes to Telegram.
+                error!(
+                    code = tickvault_common::error_code::ErrorCode::AuthGapTokenExpiry.code_str(),
+                    severity = tickvault_common::error_code::ErrorCode::AuthGapTokenExpiry
+                        .severity()
+                        .as_str(),
                     remaining_secs = remaining.as_secs(),
-                    "pre-market check WARNING: token has less than 4 hours until expiry"
+                    "AUTH-GAP-01: pre-market check FAILED — token has less than 4 hours until expiry"
                 );
                 return Err(ApplicationError::AuthenticationFailed {
                     reason: format!(
@@ -696,12 +728,19 @@ impl TokenManager {
 
         let url = format!("{}{}", self.rest_api_base_url, DHAN_RENEW_TOKEN_PATH);
 
+        // Audit-2026-05-03 H1: zeroize the JWT + clientId for the renewal
+        // request so plaintext is wiped from heap when this fn returns.
+        let access_token_value: Zeroizing<String> =
+            Zeroizing::new(token_state.access_token().expose_secret().to_string());
+        let client_id_value: Zeroizing<String> =
+            Zeroizing::new(self.credentials.client_id.expose_secret().to_string());
+
         // Dhan's RenewToken is a GET with headers, not POST with body
         let response = self
             .http_client
             .get(&url)
-            .header("access-token", token_state.access_token().expose_secret())
-            .header("dhanClientId", self.credentials.client_id.expose_secret())
+            .header("access-token", access_token_value.as_str())
+            .header("dhanClientId", client_id_value.as_str())
             .send()
             .await
             .map_err(|err| ApplicationError::TokenRenewalFailed {
@@ -758,9 +797,13 @@ impl TokenManager {
         match self.try_renew_token().await {
             Ok(()) => Ok(()),
             Err(renew_err) => {
+                // Audit-2026-05-03 L3: warn lacks `code=` field. Add it for
+                // consistency with the project-wide error-code-tag convention
+                // even though `error_code_tag_guard` only enforces error-level.
                 warn!(
+                    code = tickvault_common::error_code::ErrorCode::Dh901InvalidAuth.code_str(),
                     error = %renew_err,
-                    "renewToken failed — falling back to generateAccessToken"
+                    "renewToken failed — falling back to generateAccessToken (DH-901 fallback path)"
                 );
                 self.acquire_token().await
             }
