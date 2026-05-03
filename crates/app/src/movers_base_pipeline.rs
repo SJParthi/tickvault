@@ -94,41 +94,53 @@ fn is_within_market_hours_ist() -> bool {
     (TICK_PERSIST_START_SECS_OF_DAY_IST..TICK_PERSIST_END_SECS_OF_DAY_IST).contains(&sec_of_day)
 }
 
-/// IST seconds-of-day boundaries for session phases. The market-hours
-/// `[09:00, 15:30)` window already gates the drain entirely; this helper
-/// further classifies the in-window time into PREOPEN / MARKET /
-/// POSTMARKET so the legacy `PreopenMoversTracker` semantics survive
-/// in `movers_1s.phase`.
-const PREOPEN_END_SECS_OF_DAY_IST: u32 = 9 * 3600 + 13 * 60; // 09:13:00
-// Audit-2026-05-03 (operator clarification): MARKET phase begins at
-// 09:15:01 IST — one second AFTER the exchange's 09:15:00 pre-open
-// clearing finishes. The first MARKET-tagged tick is the one that
-// arrives at or after 09:15:01. Earlier 09:15:00 boundary would have
-// included the clearing instant in MARKET, which is semantically
-// wrong (no trade at exactly 09:15:00 is yet "in MARKET").
-const MARKET_START_SECS_OF_DAY_IST: u32 = 9 * 3600 + 15 * 60 + 1; // 09:15:01
+/// PREOPEN ends + MARKET begins at 09:15:00 IST (operator clarification
+/// 2026-05-03 follow-up): the F&O opening tick at 09:15:00 must be
+/// captured in MARKET — it carries the highest-information change_pct
+/// of the day. Earlier 09:15:01 offset was over-engineering that
+/// excluded the open.
+const MARKET_START_SECS_OF_DAY_IST: u32 = 9 * 3600 + 15 * 60; // 09:15:00
+/// MARKET ends at 15:30:00 IST. Last MARKET second is 15:29:59
+/// (operator clarification 2026-05-03 — close auction is at 15:29:59;
+/// no separate POSTMARKET phase is tracked by movers).
 const MARKET_END_SECS_OF_DAY_IST: u32 = 15 * 3600 + 30 * 60; // 15:30:00
-const POSTMARKET_END_SECS_OF_DAY_IST: u32 = 15 * 3600 + 40 * 60; // 15:40:00
 
-/// Audit-2026-05-03: pure function — IST sec-of-day → session phase
-/// `&'static str`. Folds in the legacy `STOCK_MOVERS_PHASE_*` constants:
+/// Audit-2026-05-03 (operator clarification): pure function — IST
+/// sec-of-day → session phase `&'static str`.
 ///
-/// - `[09:00, 09:13)` → `"PREOPEN"`
-/// - `[09:15, 15:30)` → `"MARKET"` (gap 09:13-09:15 is no-write per
-///   existing market-hours gate; the drain doesn't reach this fn there)
-/// - `[15:30, 15:40)` → `"POSTMARKET"`
-/// - anything else → `"UNKNOWN"` (defensive — shouldn't reach drain)
+/// **2-phase model** (no POSTMARKET, no 09:13 gap):
+///
+/// - `[09:00:00, 09:15:00)` → `"PREOPEN"` — pre-open auction window.
+///   Indices + equities write rows immediately at 09:00 if ticks
+///   arrive; F&O typically has no ticks here (state HashMap stays
+///   empty for those instruments → no rows). Last PREOPEN second is
+///   09:14:59.
+/// - `[09:15:00, 15:30:00)` → `"MARKET"` — continuous trading.
+///   F&O resumes when the first F&O tick arrives at 09:15:00 (the
+///   opening tick — most informative for change_pct). Last MARKET
+///   second is 15:29:59.
+/// - anything else → `"UNKNOWN"` — drain skipped (audit-2026-05-03 H2).
+///
+/// Why no POSTMARKET (15:30-15:40):
+/// - Operator clarification 2026-05-03: post-market window not tracked
+///   by movers. Trading effectively ends at 15:29:59.
+///
+/// Why 09:15:00 as MARKET start (not 09:15:01):
+/// - Operator clarification 2026-05-03 follow-up: the F&O opening tick
+///   at 09:15:00 IS valid market data and carries the highest-
+///   information `change_pct` of the day. The earlier 09:15:01 offset
+///   was over-engineering — movers compute per-tick (not averaged), so
+///   excluding the open loses information without benefit.
+/// - Aligns with the exchange's stated 09:15:00 MARKET start.
 ///
 /// Pure, O(1), zero allocation. Returns `&'static str` for `MoversRow`.
 #[inline]
 #[must_use]
 pub fn compute_session_phase(sec_of_day: u32) -> &'static str {
-    if (TICK_PERSIST_START_SECS_OF_DAY_IST..PREOPEN_END_SECS_OF_DAY_IST).contains(&sec_of_day) {
+    if (TICK_PERSIST_START_SECS_OF_DAY_IST..MARKET_START_SECS_OF_DAY_IST).contains(&sec_of_day) {
         "PREOPEN"
     } else if (MARKET_START_SECS_OF_DAY_IST..MARKET_END_SECS_OF_DAY_IST).contains(&sec_of_day) {
         "MARKET"
-    } else if (MARKET_END_SECS_OF_DAY_IST..POSTMARKET_END_SECS_OF_DAY_IST).contains(&sec_of_day) {
-        "POSTMARKET"
     } else {
         "UNKNOWN"
     }
@@ -481,71 +493,61 @@ mod tests {
     // -----------------------------------------------------------------
 
     #[test]
-    fn test_compute_session_phase_at_0900_is_preopen() {
-        // 09:00:00 IST — boundary inclusive on PREOPEN start
+    // -----------------------------------------------------------------
+    // Final 2-phase boundary tests per operator clarification 2026-05-03:
+    // PREOPEN [09:00:00, 09:15:00) + MARKET [09:15:00, 15:30:00).
+    // No POSTMARKET. No 09:13 gap.
+    // -----------------------------------------------------------------
+    #[test]
+    fn test_compute_session_phase_at_0859_59_is_unknown() {
+        // 08:59:59 IST — outside window (drain skipped)
+        assert_eq!(compute_session_phase(8 * 3600 + 59 * 60 + 59), "UNKNOWN");
+    }
+
+    #[test]
+    fn test_compute_session_phase_at_0900_00_is_preopen_inclusive() {
+        // 09:00:00 IST — first PREOPEN second
         assert_eq!(compute_session_phase(9 * 3600), "PREOPEN");
     }
 
     #[test]
-    fn test_compute_session_phase_at_0912_is_preopen() {
-        // 09:12:59 IST — last second of PREOPEN window
-        assert_eq!(compute_session_phase(9 * 3600 + 12 * 60 + 59), "PREOPEN");
+    fn test_compute_session_phase_at_0914_59_is_preopen_last_second() {
+        // 09:14:59 IST — last PREOPEN second per operator clarification
+        assert_eq!(compute_session_phase(9 * 3600 + 14 * 60 + 59), "PREOPEN");
     }
 
     #[test]
-    fn test_compute_session_phase_at_0913_is_unknown_gap() {
-        // 09:13:00 IST — between PREOPEN and MARKET. Drain skips the
-        // entire UNKNOWN window (audit-2026-05-03 H2 fix) so no rows
-        // ever get written here.
-        assert_eq!(compute_session_phase(9 * 3600 + 13 * 60), "UNKNOWN");
+    fn test_compute_session_phase_at_0915_00_is_market_first_second() {
+        // 09:15:00 IST — first MARKET second per operator clarification
+        // 2026-05-03 follow-up. The F&O opening tick at this instant
+        // MUST be tagged MARKET (highest-information change_pct).
+        assert_eq!(compute_session_phase(9 * 3600 + 15 * 60), "MARKET");
     }
 
     #[test]
-    fn test_compute_session_phase_at_0915_00_is_unknown_per_operator_clarification() {
-        // 09:15:00 IST — operator clarification 2026-05-03: this is
-        // the exchange clearing instant, NOT yet MARKET. UNKNOWN is
-        // correct; drain skips. First MARKET tick is at 09:15:01.
-        assert_eq!(compute_session_phase(9 * 3600 + 15 * 60), "UNKNOWN");
-    }
-
-    #[test]
-    fn test_compute_session_phase_at_0915_01_is_market_per_operator_clarification() {
-        // 09:15:01 IST — operator-spec MARKET start. F&O resumes here
-        // if no pre-market ticks were received.
+    fn test_compute_session_phase_at_0915_01_is_market() {
+        // 09:15:01 IST — second MARKET second
         assert_eq!(compute_session_phase(9 * 3600 + 15 * 60 + 1), "MARKET");
     }
 
     #[test]
-    fn test_compute_session_phase_at_1500_is_market() {
-        // 15:00:00 IST — mid-market
-        assert_eq!(compute_session_phase(15 * 3600), "MARKET");
+    fn test_compute_session_phase_at_1200_is_market_midday() {
+        assert_eq!(compute_session_phase(12 * 3600), "MARKET");
     }
 
     #[test]
-    fn test_compute_session_phase_at_1529_is_market() {
-        // 15:29:59 IST — last second of MARKET
+    fn test_compute_session_phase_at_1529_59_is_market_last_second() {
+        // 15:29:59 IST — last MARKET second per operator clarification
+        // 2026-05-03 (close auction). No POSTMARKET phase.
         assert_eq!(compute_session_phase(15 * 3600 + 29 * 60 + 59), "MARKET");
     }
 
     #[test]
-    fn test_compute_session_phase_at_1530_is_postmarket() {
-        // 15:30:00 IST — POSTMARKET starts
-        assert_eq!(compute_session_phase(15 * 3600 + 30 * 60), "POSTMARKET");
-    }
-
-    #[test]
-    fn test_compute_session_phase_at_1539_is_postmarket() {
-        // 15:39:59 IST — last second of POSTMARKET
-        assert_eq!(
-            compute_session_phase(15 * 3600 + 39 * 60 + 59),
-            "POSTMARKET"
-        );
-    }
-
-    #[test]
-    fn test_compute_session_phase_at_1540_is_unknown() {
-        // 15:40:00 IST — POSTMARKET ends; outside window
-        assert_eq!(compute_session_phase(15 * 3600 + 40 * 60), "UNKNOWN");
+    fn test_compute_session_phase_at_1530_00_is_unknown_no_postmarket() {
+        // 15:30:00 IST — outside MARKET window. POSTMARKET phase
+        // explicitly removed per operator clarification 2026-05-03;
+        // no 15:30-15:40 sub-bucket tracked by movers.
+        assert_eq!(compute_session_phase(15 * 3600 + 30 * 60), "UNKNOWN");
     }
 
     #[test]
@@ -554,19 +556,31 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_session_phase_at_0859_is_unknown() {
-        // 08:59:59 IST — pre-market gate hasn't opened yet
-        assert_eq!(compute_session_phase(8 * 3600 + 59 * 60 + 59), "UNKNOWN");
-    }
-
-    #[test]
     fn test_compute_session_phase_returns_static_str_no_alloc() {
-        // Pointer comparison — both calls return the same `&'static str`
-        // pointing into `.rodata`. Proves zero allocation.
+        // The `&'static str` return type is the compile-time zero-alloc
+        // proof. This test verifies value equality across calls.
         let a = compute_session_phase(9 * 3600);
         let b = compute_session_phase(9 * 3600 + 5);
         assert_eq!(a, b);
         assert_eq!(a, "PREOPEN");
+        let c = compute_session_phase(10 * 3600);
+        assert_eq!(c, "MARKET");
+    }
+
+    /// Audit-2026-05-03 ratchet: phase model is exactly 3 distinct
+    /// values — PREOPEN, MARKET, UNKNOWN. No POSTMARKET.
+    #[test]
+    fn test_phase_model_is_exactly_three_distinct_values() {
+        let mut seen = std::collections::HashSet::new();
+        // Sample one value from each window.
+        seen.insert(compute_session_phase(9 * 3600 + 5 * 60)); // PREOPEN
+        seen.insert(compute_session_phase(12 * 3600)); // MARKET
+        seen.insert(compute_session_phase(0)); // UNKNOWN
+        assert_eq!(seen.len(), 3, "must be exactly 3 phase values");
+        assert!(seen.contains("PREOPEN"));
+        assert!(seen.contains("MARKET"));
+        assert!(seen.contains("UNKNOWN"));
+        assert!(!seen.contains("POSTMARKET"), "POSTMARKET retired");
     }
 
     // 2026-05-02 PR-B: ratchet tests for `lookup_segment_and_type` —

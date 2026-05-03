@@ -160,16 +160,24 @@ pub fn movers_1s_create_ddl() -> String {
     )
 }
 
-/// Session phase value: pre-open (09:00-09:13 IST). Folds in the legacy
-/// `STOCK_MOVERS_PHASE_PREOPEN` constant from the deleted
-/// `movers_persistence.rs` (per Audit-2026-05-03 legacy retirement).
+/// Session phase value: pre-open auction window
+/// (09:00:00–09:14:59 IST inclusive). Indices + equities write rows
+/// here when ticks arrive; F&O typically has no ticks → no rows.
+/// Folds in the legacy `STOCK_MOVERS_PHASE_PREOPEN` constant from
+/// the deleted `movers_persistence.rs` (per Audit-2026-05-03 legacy
+/// retirement).
 pub const MOVERS_PHASE_PREOPEN: &str = "PREOPEN";
 
-/// Session phase value: in-market trading window (09:15-15:30 IST).
+/// Session phase value: continuous trading window
+/// (09:15:00–15:29:59 IST inclusive). All segments. F&O joins at
+/// 09:15:00 — the opening tick is captured in MARKET per operator
+/// clarification 2026-05-03 follow-up.
 pub const MOVERS_PHASE_MARKET: &str = "MARKET";
 
-/// Session phase value: post-close auction (15:30-15:40 IST).
-pub const MOVERS_PHASE_POSTMARKET: &str = "POSTMARKET";
+// MOVERS_PHASE_POSTMARKET REMOVED (operator clarification 2026-05-03):
+// the post-15:30 window is no longer tracked by movers. Trading
+// effectively ends at 15:29:59. Any remaining 15:30-15:40 close-
+// auction monitoring would live in a separate subsystem if needed.
 
 /// Idempotent self-heal for the `exchange_segment` column.
 ///
@@ -1016,13 +1024,13 @@ mod tests {
     }
 
     #[test]
-    fn test_movers_phase_constants_pin_three_values() {
-        // Audit-2026-05-03: pin the three phase values folded in from
-        // legacy STOCK_MOVERS_PHASE_* constants. Frontend filters
-        // depend on these exact strings.
+    fn test_movers_phase_constants_pin_two_values_no_postmarket() {
+        // Audit-2026-05-03: pin the 2 phase values per operator
+        // clarification — POSTMARKET was removed (no 15:30-15:40
+        // tracking in movers). Frontend filters depend on these
+        // exact strings.
         assert_eq!(MOVERS_PHASE_PREOPEN, "PREOPEN");
         assert_eq!(MOVERS_PHASE_MARKET, "MARKET");
-        assert_eq!(MOVERS_PHASE_POSTMARKET, "POSTMARKET");
     }
 
     #[test]
