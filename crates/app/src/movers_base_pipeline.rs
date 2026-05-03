@@ -100,7 +100,13 @@ fn is_within_market_hours_ist() -> bool {
 /// POSTMARKET so the legacy `PreopenMoversTracker` semantics survive
 /// in `movers_1s.phase`.
 const PREOPEN_END_SECS_OF_DAY_IST: u32 = 9 * 3600 + 13 * 60; // 09:13:00
-const MARKET_START_SECS_OF_DAY_IST: u32 = 9 * 3600 + 15 * 60; // 09:15:00
+// Audit-2026-05-03 (operator clarification): MARKET phase begins at
+// 09:15:01 IST — one second AFTER the exchange's 09:15:00 pre-open
+// clearing finishes. The first MARKET-tagged tick is the one that
+// arrives at or after 09:15:01. Earlier 09:15:00 boundary would have
+// included the clearing instant in MARKET, which is semantically
+// wrong (no trade at exactly 09:15:00 is yet "in MARKET").
+const MARKET_START_SECS_OF_DAY_IST: u32 = 9 * 3600 + 15 * 60 + 1; // 09:15:01
 const MARKET_END_SECS_OF_DAY_IST: u32 = 15 * 3600 + 30 * 60; // 15:30:00
 const POSTMARKET_END_SECS_OF_DAY_IST: u32 = 15 * 3600 + 40 * 60; // 15:40:00
 
@@ -488,18 +494,25 @@ mod tests {
 
     #[test]
     fn test_compute_session_phase_at_0913_is_unknown_gap() {
-        // 09:13:00 IST — between PREOPEN and MARKET (drain gate
-        // `[09:00, 15:30)` still fires here, so phase tag must be
-        // sensible). Currently maps to UNKNOWN since neither window
-        // covers 09:13-09:14:59. Defensive — drain still writes the
-        // row (operator can filter `WHERE phase != 'UNKNOWN'`).
+        // 09:13:00 IST — between PREOPEN and MARKET. Drain skips the
+        // entire UNKNOWN window (audit-2026-05-03 H2 fix) so no rows
+        // ever get written here.
         assert_eq!(compute_session_phase(9 * 3600 + 13 * 60), "UNKNOWN");
     }
 
     #[test]
-    fn test_compute_session_phase_at_0915_is_market() {
-        // 09:15:00 IST — MARKET window starts
-        assert_eq!(compute_session_phase(9 * 3600 + 15 * 60), "MARKET");
+    fn test_compute_session_phase_at_0915_00_is_unknown_per_operator_clarification() {
+        // 09:15:00 IST — operator clarification 2026-05-03: this is
+        // the exchange clearing instant, NOT yet MARKET. UNKNOWN is
+        // correct; drain skips. First MARKET tick is at 09:15:01.
+        assert_eq!(compute_session_phase(9 * 3600 + 15 * 60), "UNKNOWN");
+    }
+
+    #[test]
+    fn test_compute_session_phase_at_0915_01_is_market_per_operator_clarification() {
+        // 09:15:01 IST — operator-spec MARKET start. F&O resumes here
+        // if no pre-market ticks were received.
+        assert_eq!(compute_session_phase(9 * 3600 + 15 * 60 + 1), "MARKET");
     }
 
     #[test]
