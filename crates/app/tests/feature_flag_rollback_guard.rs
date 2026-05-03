@@ -310,7 +310,7 @@ fn test_audit_tables_enabled_default_is_safe() {
 // PreopenMoversTracker + the legacy `preopen_movers` feature flag were
 // retired by Audit-2026-05-03. Pre-open snapshot semantics now live in
 // the canonical `movers_1s.phase` SYMBOL column populated by
-// `movers_base_pipeline`. Operator queries should use
+// `movers_pipeline`. Operator queries should use
 // `WHERE phase = 'PREOPEN'` against the movers_* materialized views.
 // The 3 unit tests that pinned this flag are deleted; the flag itself
 // no longer exists in `FeaturesConfig`.
