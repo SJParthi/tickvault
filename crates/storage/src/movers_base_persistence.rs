@@ -137,6 +137,21 @@ const LEGACY_RETIRE_DROP_TABLES: &[&str] = &["stock_movers", "option_movers"];
 /// - `volume` (LONG) — cumulative since session open (Item 26 L1 pin)
 /// - `last_price`, `prev_close`, `change_pct` (DOUBLE) — rendered metrics
 /// - `received_at` (TIMESTAMP) — wall-clock arrival for forensics
+///
+/// **PR #450 Dhan-parity additions (2026-05-03):**
+/// - `prev_oi` (LONG) — previous-session-close OI baseline. Sourced from
+///   NSE bhavcopy `OpnIntrst` (col 22) for NSE_FNO derivatives, and from
+///   Dhan WS PrevClose packet code 6 bytes 12-15 for IDX_I per
+///   `docs/dhan-ref/03-live-market-feed-websocket.md:384` and
+///   `.claude/rules/dhan/live-market-feed.md` rule 7. Required to compute
+///   the precise `OI Change` and `OI Change %` columns Dhan's frontend
+///   shows on Markets > Options view (per operator clarification 2026-05-03).
+///   `0` for instruments with no prev_oi available (equities/indices).
+/// - `expiry_date_ist` (TIMESTAMP — IST midnight epoch nanos) — derivative
+///   contract expiry. Populated from `InstrumentRegistry.get_with_segment(
+///   security_id, segment).expiry_date` (cold path, O(1) lookup). Enables
+///   the `?expiry=YYYY-MM-DD` filter on `/api/movers` matching Dhan's
+///   middle dropdown (May / June / July). NULL/0 for non-derivative rows.
 #[must_use]
 pub fn movers_1s_create_ddl() -> String {
     format!(
@@ -150,10 +165,12 @@ pub fn movers_1s_create_ddl() -> String {
             phase            SYMBOL CAPACITY 8 NOCACHE, \
             open_interest    LONG, \
             oi_delta         LONG, \
+            prev_oi          LONG, \
             volume           LONG, \
             last_price       DOUBLE, \
             prev_close       DOUBLE, \
             change_pct       DOUBLE, \
+            expiry_date_ist  TIMESTAMP, \
             received_at      TIMESTAMP\
         ) TIMESTAMP(ts) PARTITION BY DAY \
         DEDUP UPSERT KEYS({DEDUP_KEY_MOVERS_1S});"
@@ -202,6 +219,41 @@ pub fn movers_1s_alter_add_instrument_type_ddl() -> String {
     format!(
         "ALTER TABLE {QUESTDB_TABLE_MOVERS_1S} \
          ADD COLUMN IF NOT EXISTS instrument_type SYMBOL CAPACITY 16 NOCACHE;"
+    )
+}
+
+/// PR #450 (2026-05-03): idempotent self-heal for the `prev_oi` column.
+///
+/// Adds the previous-session-close OI baseline column to existing
+/// databases without a one-shot migration. Required for Dhan-parity
+/// `OI Change` / `OI Change %` calculations per operator clarification
+/// 2026-05-03. The column is LONG (i64) — `0` is the sentinel for
+/// instruments with no prev_oi available (equities, indices, or
+/// derivatives whose bhavcopy row was missing).
+///
+/// Per `observability-architecture.md` schema self-heal pattern.
+#[must_use]
+pub fn movers_1s_alter_add_prev_oi_ddl() -> String {
+    format!(
+        "ALTER TABLE {QUESTDB_TABLE_MOVERS_1S} \
+         ADD COLUMN IF NOT EXISTS prev_oi LONG;"
+    )
+}
+
+/// PR #450 (2026-05-03): idempotent self-heal for the `expiry_date_ist`
+/// column.
+///
+/// Adds the derivative-contract expiry column (IST midnight epoch nanos)
+/// to existing databases. Enables the `?expiry=YYYY-MM-DD` filter on
+/// `/api/movers` matching Dhan's middle dropdown (May / June / July...).
+/// NULL/0 for non-derivative rows.
+///
+/// Per `observability-architecture.md` schema self-heal pattern.
+#[must_use]
+pub fn movers_1s_alter_add_expiry_date_ist_ddl() -> String {
+    format!(
+        "ALTER TABLE {QUESTDB_TABLE_MOVERS_1S} \
+         ADD COLUMN IF NOT EXISTS expiry_date_ist TIMESTAMP;"
     )
 }
 
@@ -261,10 +313,18 @@ pub fn movers_view_ddl(timeframe: &str) -> String {
             ts, \
             last(last_price) AS last_price, \
             last(open_interest) AS open_interest, \
+            last(prev_oi) AS prev_oi, \
+            last(expiry_date_ist) AS expiry_date_ist, \
             last(volume) AS volume_cumulative, \
             last(prev_close) AS prev_close, \
             last(volume) - first(volume) AS volume_bucket, \
             last(open_interest) - first(open_interest) AS oi_delta_bucket, \
+            last(open_interest) - last(prev_oi) AS oi_change_session, \
+            CASE WHEN last(prev_oi) > 0 \
+                 THEN ((CAST(last(open_interest) AS DOUBLE) - CAST(last(prev_oi) AS DOUBLE)) \
+                       / CAST(last(prev_oi) AS DOUBLE)) * 100 \
+                 ELSE 0 \
+            END AS oi_change_pct_session, \
             first(last_price) AS open_price_bucket, \
             max(last_price) AS high_price_bucket, \
             min(last_price) AS low_price_bucket, \
@@ -700,6 +760,11 @@ pub async fn ensure_movers_tables_and_views(questdb_config: &QuestDbConfig) {
         // Audit-2026-05-03: phase column folds in legacy
         // PreopenMoversTracker semantics (PREOPEN / MARKET / POSTMARKET).
         ("phase", movers_1s_alter_add_phase_ddl()),
+        // PR #450 (2026-05-03): prev_oi baseline + expiry_date_ist for
+        // Dhan-parity OI Change / OI Change % calculations and the
+        // ?expiry=YYYY-MM-DD filter.
+        ("prev_oi", movers_1s_alter_add_prev_oi_ddl()),
+        ("expiry_date_ist", movers_1s_alter_add_expiry_date_ist_ddl()),
     ] {
         match client
             .get(&base_url)
@@ -955,9 +1020,55 @@ mod tests {
             "prev_close       DOUBLE",
             "change_pct       DOUBLE",
             "received_at      TIMESTAMP",
+            // PR #450 (2026-05-03): Dhan-parity columns
+            "prev_oi          LONG",
+            "expiry_date_ist  TIMESTAMP",
         ] {
             assert!(ddl.contains(col), "base DDL must declare column `{col}`");
         }
+    }
+
+    /// PR #450 ratchet (2026-05-03): the `prev_oi` column MUST be present
+    /// in the base CREATE TABLE DDL. Required for Dhan-parity OI Change
+    /// and OI Change % calculations on the Markets > Options view.
+    /// Sourced from NSE bhavcopy `OpnIntrst` (col 22) for NSE_FNO and
+    /// from Dhan WS PrevClose code 6 bytes 12-15 for IDX_I.
+    #[test]
+    fn test_base_ddl_declares_prev_oi_column_for_dhan_parity_oi_change() {
+        let ddl = movers_1s_create_ddl();
+        assert!(
+            ddl.contains("prev_oi          LONG"),
+            "prev_oi LONG column missing — required for Dhan-parity OI Change and OI Change %"
+        );
+    }
+
+    /// PR #450 ratchet (2026-05-03): the `expiry_date_ist` column MUST be
+    /// present in the base CREATE TABLE DDL. Required for the
+    /// `?expiry=YYYY-MM-DD` filter on `/api/movers` matching Dhan's
+    /// middle dropdown.
+    #[test]
+    fn test_base_ddl_declares_expiry_date_ist_column_for_expiry_filter() {
+        let ddl = movers_1s_create_ddl();
+        assert!(
+            ddl.contains("expiry_date_ist  TIMESTAMP"),
+            "expiry_date_ist TIMESTAMP column missing — required for ?expiry filter"
+        );
+    }
+
+    /// PR #450 ratchet (2026-05-03): the DEDUP key MUST NOT include the
+    /// new payload columns (`prev_oi`, `expiry_date_ist`). Including
+    /// payload columns in the dedup key breaks idempotency on bhavcopy
+    /// late-arrival corrections.
+    #[test]
+    fn test_dedup_key_excludes_new_pr450_payload_columns() {
+        assert!(
+            !DEDUP_KEY_MOVERS_1S.contains("prev_oi"),
+            "DEDUP key must not include prev_oi (payload column)"
+        );
+        assert!(
+            !DEDUP_KEY_MOVERS_1S.contains("expiry_date_ist"),
+            "DEDUP key must not include expiry_date_ist (payload column)"
+        );
     }
 
     // 2026-05-02 PR-B: ratchet tests for the new schema columns + the
@@ -1019,6 +1130,81 @@ mod tests {
         assert!(
             ddl.contains("SYMBOL CAPACITY 8 NOCACHE"),
             "phase column type must be SYMBOL CAPACITY 8 NOCACHE"
+        );
+    }
+
+    /// PR #450 ratchet (2026-05-03): the `prev_oi` ALTER must be
+    /// idempotent (`IF NOT EXISTS`) per the schema-self-heal pattern.
+    #[test]
+    fn test_movers_1s_alter_add_prev_oi_ddl_is_idempotent() {
+        let ddl = movers_1s_alter_add_prev_oi_ddl();
+        assert!(
+            ddl.contains("ALTER TABLE movers_1s"),
+            "must target movers_1s base table"
+        );
+        assert!(
+            ddl.contains("ADD COLUMN IF NOT EXISTS prev_oi LONG"),
+            "ALTER must be idempotent (IF NOT EXISTS) and declare LONG type"
+        );
+    }
+
+    /// PR #450 ratchet (2026-05-03): the `expiry_date_ist` ALTER must be
+    /// idempotent (`IF NOT EXISTS`) per the schema-self-heal pattern.
+    #[test]
+    fn test_movers_1s_alter_add_expiry_date_ist_ddl_is_idempotent() {
+        let ddl = movers_1s_alter_add_expiry_date_ist_ddl();
+        assert!(
+            ddl.contains("ALTER TABLE movers_1s"),
+            "must target movers_1s base table"
+        );
+        assert!(
+            ddl.contains("ADD COLUMN IF NOT EXISTS expiry_date_ist TIMESTAMP"),
+            "ALTER must be idempotent (IF NOT EXISTS) and declare TIMESTAMP type"
+        );
+    }
+
+    /// PR #450 ratchet (2026-05-03): the materialized-view DDL MUST
+    /// expose `prev_oi` and `expiry_date_ist` via `last(...)` aggregation
+    /// so frontend can read them via `/api/movers` SQL queries.
+    #[test]
+    fn test_movers_view_ddl_exposes_prev_oi_and_expiry_date_ist() {
+        let ddl = movers_view_ddl("5s");
+        assert!(
+            ddl.contains("last(prev_oi) AS prev_oi"),
+            "view must expose prev_oi via last() aggregation, got: {ddl}"
+        );
+        assert!(
+            ddl.contains("last(expiry_date_ist) AS expiry_date_ist"),
+            "view must expose expiry_date_ist via last() aggregation, got: {ddl}"
+        );
+    }
+
+    /// PR #450 ratchet (2026-05-03): the materialized-view DDL MUST
+    /// compute Dhan-precise `oi_change_session` (= current_OI - prev_OI)
+    /// directly in SQL. Replaces the legacy intra-bucket
+    /// `oi_delta_bucket` for the operator-facing OI Change column.
+    #[test]
+    fn test_movers_view_ddl_computes_oi_change_session_from_prev_oi() {
+        let ddl = movers_view_ddl("5s");
+        assert!(
+            ddl.contains("last(open_interest) - last(prev_oi) AS oi_change_session"),
+            "view must compute Dhan-precise oi_change_session = current_OI - prev_OI, got: {ddl}"
+        );
+    }
+
+    /// PR #450 ratchet (2026-05-03): the materialized-view DDL MUST
+    /// guard `oi_change_pct_session` against divide-by-zero when
+    /// `prev_oi` is 0 (sentinel for "no baseline available").
+    #[test]
+    fn test_movers_view_ddl_guards_oi_change_pct_against_zero_prev_oi() {
+        let ddl = movers_view_ddl("5s");
+        assert!(
+            ddl.contains("CASE WHEN last(prev_oi) > 0"),
+            "view must guard oi_change_pct against zero prev_oi, got: {ddl}"
+        );
+        assert!(
+            ddl.contains("AS oi_change_pct_session"),
+            "view must expose oi_change_pct_session, got: {ddl}"
         );
     }
 
