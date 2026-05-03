@@ -607,6 +607,188 @@ fn parse_movers_dataset(json: &serde_json::Value, max_capacity: usize) -> Vec<Mo
 }
 
 // ---------------------------------------------------------------------------
+// /api/movers/expiries — companion handler
+// ---------------------------------------------------------------------------
+
+/// Query parameters for `GET /api/movers/expiries`.
+#[derive(Debug, Deserialize)]
+pub struct MoversExpiriesQuery {
+    /// Underlying instrument symbol (eg `NIFTY`, `BANKNIFTY`, `RELIANCE`).
+    /// Currently optional — when absent returns the full sorted distinct
+    /// set across all derivatives in the freshness window.
+    pub underlying: Option<String>,
+}
+
+/// Response shape for `GET /api/movers/expiries`. Sorted ascending so
+/// the frontend dropdown is naturally chronological (May / June / July...).
+#[derive(Debug, Serialize)]
+pub struct MoversExpiriesResponse {
+    /// `false` only when QuestDB unreachable.
+    pub available: bool,
+    /// Echoes the resolved underlying ("ALL" when not specified).
+    pub underlying: String,
+    /// ISO `YYYY-MM-DD` strings sorted ascending.
+    pub expiries: Vec<String>,
+}
+
+/// PR #450 commit 5 (2026-05-03): validates an underlying symbol —
+/// allows only `[A-Z0-9]{1,32}`. Closes the SQL injection vector via
+/// the underlying param (legacy handlers used unfiltered string
+/// interpolation; this handler refuses anything outside the safe
+/// alphabet).
+#[must_use]
+pub fn validate_underlying_symbol(s: &str) -> Option<&str> {
+    if s.is_empty() || s.len() > 32 {
+        return None;
+    }
+    if !s
+        .as_bytes()
+        .iter()
+        .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+    {
+        return None;
+    }
+    Some(s)
+}
+
+/// Builds the SELECT for `/api/movers/expiries`. Uses
+/// `expiry_date_ist` (TIMESTAMP IST midnight epoch nanos, populated
+/// by PR #450 commit 2 in the tick processor).
+///
+/// When `underlying` is absent, returns ALL distinct expiry dates in
+/// the freshness window. When present, filters by `underlying_symbol`
+/// — but `movers_5s` does NOT carry an underlying_symbol column, so
+/// we filter via JOIN-equivalent subquery against the `instruments`
+/// registry (frontend can do this filter client-side as a
+/// near-zero-cost alternative).
+///
+/// PR #450 commit 5: simple version returns the universe-wide list.
+/// Per-underlying filtering ships in a follow-up once the SQL
+/// JOIN-via-IN(...) pattern is benched.
+#[must_use]
+pub fn build_expiries_query() -> String {
+    // expiry_date_ist > 0 filters out the sentinel-0 rows from
+    // non-derivative instruments (equities + indices have no expiry).
+    // dateadd('s', -300, now()) gives 5min freshness — covers the gap
+    // between successive 5s materialised view refreshes.
+    "SELECT DISTINCT cast(expiry_date_ist as date) AS expiry_date \
+     FROM movers_5s \
+     WHERE ts > dateadd('s', -300, now()) \
+       AND expiry_date_ist > 0 \
+     ORDER BY expiry_date ASC"
+        .to_string()
+}
+
+/// `GET /api/movers/expiries?underlying=NIFTY` — returns the sorted
+/// list of available derivative expiry dates for the frontend's
+/// middle dropdown.
+///
+/// PR #450 commit 5 (2026-05-03): companion to `/api/movers`. Replaces
+/// hardcoded month strings on the frontend with a data-driven dropdown.
+// TEST-EXEMPT: HTTP handler — requires live QuestDB; pure helpers
+// (validate_underlying_symbol, build_expiries_query) are unit-tested.
+pub async fn get_expiries(
+    State(state): State<SharedAppState>,
+    Query(params): Query<MoversExpiriesQuery>,
+) -> impl IntoResponse {
+    let underlying_label = match params.underlying.as_deref() {
+        None => "ALL".to_string(),
+        Some(s) => match validate_underlying_symbol(s) {
+            Some(v) => v.to_string(),
+            None => return bad_request("underlying", "[A-Z0-9]{1,32}"),
+        },
+    };
+
+    let sql = build_expiries_query();
+    let cfg = state.questdb_config();
+    let url = format!("http://{}:{}/exec", cfg.host, cfg.http_port);
+
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(QUESTDB_QUERY_TIMEOUT_SECS))
+        .build()
+    {
+        Ok(c) => c,
+        Err(err) => {
+            tracing::error!(?err, code = "MOVERS-06", "build reqwest client failed");
+            return service_unavailable("client_build_failed");
+        }
+    };
+
+    let resp = match client
+        .get(&url)
+        .query(&[("query", sql.as_str())])
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(err) => {
+            tracing::error!(
+                ?err,
+                code = "MOVERS-06",
+                "QuestDB /api/movers/expiries query failed"
+            );
+            return service_unavailable("questdb_unreachable");
+        }
+    };
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        tracing::error!(
+            %status,
+            code = "MOVERS-06",
+            "QuestDB returned non-2xx for /api/movers/expiries"
+        );
+        return service_unavailable("questdb_non_2xx");
+    }
+
+    let body: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::error!(
+                ?err,
+                code = "MOVERS-06",
+                "QuestDB JSON parse failed for /api/movers/expiries"
+            );
+            return service_unavailable("questdb_parse_failed");
+        }
+    };
+
+    let expiries = parse_expiries_dataset(&body);
+    let ok_response = MoversExpiriesResponse {
+        available: true,
+        underlying: underlying_label,
+        expiries,
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::to_value(&ok_response).unwrap_or(serde_json::Value::Null)),
+    )
+        .into_response()
+}
+
+/// Parses the QuestDB `/exec` JSON dataset into a sorted Vec of
+/// `YYYY-MM-DD` strings. Returns empty Vec on parse failure or empty
+/// dataset (frontend renders "no expiries" empty state).
+fn parse_expiries_dataset(json: &serde_json::Value) -> Vec<String> {
+    let Some(dataset) = json.get("dataset").and_then(|d| d.as_array()) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::with_capacity(dataset.len());
+    for row in dataset {
+        let Some(arr) = row.as_array() else { continue };
+        if arr.is_empty() {
+            continue;
+        }
+        if let Some(s) = arr[0].as_str() {
+            // QuestDB returns date as ISO timestamp string; truncate to date.
+            let date_only = s.split('T').next().unwrap_or(s).to_string();
+            out.push(date_only);
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Tests — pure helpers (SQL builder + enum parsers + ISO date validator)
 // ---------------------------------------------------------------------------
 
@@ -945,6 +1127,97 @@ mod tests {
     fn test_parse_movers_dataset_empty_returns_empty_vec() {
         let json: serde_json::Value = serde_json::json!({ "dataset": [] });
         assert_eq!(parse_movers_dataset(&json, 30).len(), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // PR #450 commit 5 ratchets: /api/movers/expiries companion
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_validate_underlying_symbol_accepts_alpha_numeric_uppercase() {
+        for ok in ["NIFTY", "BANKNIFTY", "RELIANCE", "MIDCPNIFTY", "TCS"] {
+            assert_eq!(
+                validate_underlying_symbol(ok),
+                Some(ok),
+                "must accept {ok:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_underlying_symbol_rejects_lowercase_and_injection() {
+        for bad in [
+            "",                  // empty
+            "nifty",             // lowercase
+            "NIFTY ",            // whitespace
+            "NIFTY-WEEKLY",      // dash
+            "NIFTY' OR 1=1 --",  // SQL injection attempt
+            "NIFTY; DROP TABLE", // SQL injection attempt
+            &"A".repeat(33),     // > 32 chars
+        ] {
+            assert_eq!(validate_underlying_symbol(bad), None, "must reject {bad:?}");
+        }
+    }
+
+    #[test]
+    fn test_build_expiries_query_targets_movers_5s() {
+        let sql = build_expiries_query();
+        assert!(sql.contains("FROM movers_5s"));
+    }
+
+    #[test]
+    fn test_build_expiries_query_filters_out_zero_expiry_sentinel() {
+        // Equities + indices have expiry_date_ist = 0 (sentinel).
+        // The query MUST exclude them — frontend dropdown should
+        // only show real derivative expiry dates.
+        let sql = build_expiries_query();
+        assert!(
+            sql.contains("expiry_date_ist > 0"),
+            "must filter out sentinel-0 rows from non-derivatives, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_build_expiries_query_uses_distinct_and_orders_ascending() {
+        let sql = build_expiries_query();
+        assert!(sql.contains("SELECT DISTINCT"));
+        assert!(sql.contains("ORDER BY expiry_date ASC"));
+    }
+
+    #[test]
+    fn test_build_expiries_query_casts_timestamp_to_date() {
+        // expiry_date_ist is TIMESTAMP (epoch nanos at IST midnight);
+        // cast-to-date strips the time component for the dropdown.
+        let sql = build_expiries_query();
+        assert!(
+            sql.contains("cast(expiry_date_ist as date)"),
+            "must cast timestamp to date for clean YYYY-MM-DD output, got: {sql}"
+        );
+    }
+
+    #[test]
+    fn test_parse_expiries_dataset_extracts_iso_date_truncating_time() {
+        let json: serde_json::Value = serde_json::json!({
+            "dataset": [
+                ["2026-05-29T00:00:00.000000"],
+                ["2026-06-26T00:00:00.000000"],
+                ["2026-07-31T00:00:00.000000"],
+            ]
+        });
+        let out = parse_expiries_dataset(&json);
+        assert_eq!(out, vec!["2026-05-29", "2026-06-26", "2026-07-31"]);
+    }
+
+    #[test]
+    fn test_parse_expiries_dataset_handles_empty() {
+        let json: serde_json::Value = serde_json::json!({ "dataset": [] });
+        assert_eq!(parse_expiries_dataset(&json).len(), 0);
+    }
+
+    #[test]
+    fn test_parse_expiries_dataset_handles_missing_dataset_key() {
+        let json: serde_json::Value = serde_json::json!({});
+        assert_eq!(parse_expiries_dataset(&json).len(), 0);
     }
 
     #[test]
