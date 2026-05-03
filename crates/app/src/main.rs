@@ -5539,17 +5539,14 @@ async fn main() -> Result<()> {
                         token_remaining_secs = token_secs,
                         "PROOF: market-open readiness confirmation fired @ 09:14:00 IST"
                     );
-                    readiness_notifier.notify(
-                        NotificationEvent::MarketOpenReadinessConfirmation {
-                            main_feed_active: main_active,
-                            main_feed_total:
-                                tickvault_common::constants::MAX_WEBSOCKET_CONNECTIONS,
-                            depth_20_active: d20,
-                            depth_200_active: d200,
-                            order_update_active: oms,
-                            token_remaining_secs: token_secs,
-                        },
-                    );
+                    readiness_notifier.notify(NotificationEvent::MarketOpenReadinessConfirmation {
+                        main_feed_active: main_active,
+                        main_feed_total: tickvault_common::constants::MAX_WEBSOCKET_CONNECTIONS,
+                        depth_20_active: d20,
+                        depth_200_active: d200,
+                        order_update_active: oms,
+                        token_remaining_secs: token_secs,
+                    });
                 });
             }
 
@@ -7243,13 +7240,13 @@ async fn main() -> Result<()> {
     // Audit Finding #9 (2026-05-03): gated on `cfg.api.auto_open_portal`
     // so AWS / headless deployments can disable the spurious browser
     // shell-out. Default `true` preserves the local-dev experience.
-    if cfg.api.auto_open_portal {
+    if config.api.auto_open_portal {
         tokio::spawn(async {
             crate::infra::open_in_browser("http://localhost:3001/portal/options-chain").await;
         });
     } else {
         info!(
-            "skipping portal auto-open (api.auto_open_portal = false;              expected on AWS / headless deploy)"
+            "skipping portal auto-open (api.auto_open_portal = false; expected on AWS / headless deploy)"
         );
     }
 
@@ -7311,9 +7308,7 @@ async fn main() -> Result<()> {
                     .await
                 {
                     Ok(true) => {
-                        info!(
-                            "token sweep: renewed stale token (< 4h headroom)"
-                        );
+                        info!("token sweep: renewed stale token (< 4h headroom)");
                         metrics::counter!(
                             "tv_token_sweep_renewals_total",
                             "result" => "renewed"

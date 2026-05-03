@@ -3060,7 +3060,7 @@ mod tests {
         let _ = result;
     }
 
-        #[tokio::test]
+    #[tokio::test]
     async fn test_force_renewal_attempts_renewal_unconditionally() {
         // No HTTP server in test → renewal will fail with a network
         // error. The contract under test is that the call ATTEMPTS the

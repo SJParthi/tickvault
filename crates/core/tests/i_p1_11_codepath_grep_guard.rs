@@ -30,8 +30,7 @@ const ENFORCEMENT_FILES: &[&str] = &[
 
 fn read(rel: &str) -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel);
-    fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
+    fs::read_to_string(&path).unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
 }
 
 #[test]
@@ -51,9 +50,8 @@ fn i_p1_11_appears_in_every_enforcement_file_not_just_docs() {
 fn i_p1_11_appears_in_security_id_uniqueness_rule_doc() {
     // Sanity: the rule doc itself must still cite I-P1-11. Catches an
     // accidental rename of the identifier in the source-of-truth doc.
-    let path =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.claude/rules/project/security-id-uniqueness.md");
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../.claude/rules/project/security-id-uniqueness.md");
     let text = fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
     assert!(

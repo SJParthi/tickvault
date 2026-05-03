@@ -18,9 +18,7 @@
 //! so any future step that adds its own timeout cannot reintroduce the
 //! conflict.
 
-use tickvault_common::constants::{
-    BOOT_DEADLINE_SECS, BOOT_TIMEOUT_SECS, TOKEN_INIT_TIMEOUT_SECS,
-};
+use tickvault_common::constants::{BOOT_DEADLINE_SECS, BOOT_TIMEOUT_SECS, TOKEN_INIT_TIMEOUT_SECS};
 
 #[test]
 fn token_init_timeout_does_not_exceed_umbrella_boot_timeout() {

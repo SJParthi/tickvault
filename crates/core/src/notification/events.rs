@@ -4447,8 +4447,8 @@ mod tests {
 
     #[test]
     fn test_market_open_readiness_confirmation_variant_name_is_stable() {
-        // ratchet: variant_name is on the wire (Telegram/audit), so it
-        // must be stable. Catches accidental rename.
+        // ratchet: variant Debug-format is on the wire (Telegram/audit),
+        // so it must be stable. Catches accidental rename.
         let ev = NotificationEvent::MarketOpenReadinessConfirmation {
             main_feed_active: 5,
             main_feed_total: 5,
@@ -4457,7 +4457,11 @@ mod tests {
             order_update_active: true,
             token_remaining_secs: 0,
         };
-        assert_eq!(ev.variant_name(), "MarketOpenReadinessConfirmation");
+        let dbg = format!("{ev:?}");
+        assert!(
+            dbg.starts_with("MarketOpenReadinessConfirmation"),
+            "variant debug-name must remain MarketOpenReadinessConfirmation; got: {dbg}"
+        );
     }
 
     #[test]
