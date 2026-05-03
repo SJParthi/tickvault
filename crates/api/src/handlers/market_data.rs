@@ -377,16 +377,22 @@ pub enum OptionMoverCategory {
 impl OptionMoverCategory {
     /// Parses the wire-format string (case-insensitive). Returns `None`
     /// on unknown input — handler emits 400.
+    ///
+    /// PR #449 hostile-bug-hunt C1 fix: accepts BOTH singular
+    /// (`OI_GAINER`) and plural (`OI_GAINERS`) forms because the
+    /// `markets-options.html` portal sends the plural variant via
+    /// `data-filter="oi_gainers"`. Without the alias, 4 of 7
+    /// dashboard tabs would return HTTP 400.
     #[must_use]
     pub fn parse_wire_str(s: &str) -> Option<Self> {
         match s.to_uppercase().as_str() {
             "HIGHEST_OI" => Some(Self::HighestOi),
-            "OI_GAINER" => Some(Self::OiGainer),
-            "OI_LOSER" => Some(Self::OiLoser),
+            "OI_GAINER" | "OI_GAINERS" => Some(Self::OiGainer),
+            "OI_LOSER" | "OI_LOSERS" => Some(Self::OiLoser),
             "TOP_VOLUME" => Some(Self::TopVolume),
             "TOP_VALUE" => Some(Self::TopValue),
-            "PRICE_GAINER" => Some(Self::PriceGainer),
-            "PRICE_LOSER" => Some(Self::PriceLoser),
+            "PRICE_GAINER" | "PRICE_GAINERS" => Some(Self::PriceGainer),
+            "PRICE_LOSER" | "PRICE_LOSERS" => Some(Self::PriceLoser),
             _ => None,
         }
     }
@@ -674,6 +680,32 @@ mod tests {
             "PRICE_LOSER",
         ];
         assert_eq!(valid.len(), 7);
+    }
+
+    /// PR #449 hostile-bug-hunt C1 ratchet: every literal string used
+    /// by `data-filter="..."` in `crates/api/static/markets-options.html`
+    /// MUST parse via `OptionMoverCategory::parse_wire_str`. The portal
+    /// sends the value verbatim as `?category=<filter>`. Regression of
+    /// the alias map causes 4 of 7 tabs to silently fall back to cached
+    /// data with no error visible to the operator.
+    #[test]
+    fn test_option_mover_category_accepts_frontend_data_filter_literals() {
+        let frontend_literals = [
+            "highest_oi",    // line 720
+            "oi_gainers",    // line 721 — plural
+            "oi_losers",     // line 722 — plural
+            "top_volume",    // line 723
+            "top_value",     // line 724
+            "price_gainers", // line 725 — plural
+            "price_losers",  // line 726 — plural
+        ];
+        for literal in frontend_literals {
+            assert!(
+                OptionMoverCategory::parse_wire_str(literal).is_some(),
+                "frontend data-filter literal {literal:?} MUST be \
+                 accepted by parse_wire_str — see markets-options.html",
+            );
+        }
     }
 
     #[test]
