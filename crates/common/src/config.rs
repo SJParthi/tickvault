@@ -241,8 +241,6 @@ pub struct FeaturesConfig {
     pub tick_gap_detector_60s_coalesce: bool,
     /// Wave 2 Item 9 — 6 audit tables (subscribe/disconnect/depth/etc).
     pub audit_tables_enabled: bool,
-    /// Wave 3 Item 10 — pre-open movers snapshot during 09:00-09:13 IST.
-    pub preopen_movers: bool,
     /// Wave 3 Item 11 — Telegram bucket-coalescer + dispatcher hardening.
     pub telegram_bucket_coalescer: bool,
     /// Wave 3 Item 12 — market-open self-test at 09:15 IST.
@@ -281,7 +279,6 @@ impl Default for FeaturesConfig {
             fast_boot_60s_deadline: true,
             tick_gap_detector_60s_coalesce: true,
             audit_tables_enabled: true,
-            preopen_movers: true,
             telegram_bucket_coalescer: true,
             market_open_self_test: true,
             realtime_guarantee_score: true,

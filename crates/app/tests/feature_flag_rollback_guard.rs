@@ -52,7 +52,7 @@ const EXPECTED_FLAGS: [&str; 14] = [
     "fast_boot_60s_deadline",
     "tick_gap_detector_60s_coalesce",
     "audit_tables_enabled",
-    "preopen_movers",
+    // "preopen_movers" retired 2026-05-03 (functionality folded into movers_1s.phase).
     "telegram_bucket_coalescer",
     "market_open_self_test",
     "realtime_guarantee_score",
@@ -304,25 +304,16 @@ fn test_audit_tables_enabled_default_is_safe() {
 }
 
 // ---------------------------------------------------------------------------
-// Item 10 — preopen_movers (Wave 3)
+// Item 10 — preopen_movers (Wave 3) — RETIRED 2026-05-03
 // ---------------------------------------------------------------------------
-
-#[test]
-fn test_preopen_movers_off_disables_path() {
-    let cfg = parse_features("preopen_movers = false");
-    assert!(!cfg.preopen_movers);
-}
-
-#[test]
-fn test_preopen_movers_on_enables_path() {
-    let cfg = parse_features("preopen_movers = true");
-    assert!(cfg.preopen_movers);
-}
-
-#[test]
-fn test_preopen_movers_default_is_safe() {
-    assert_default_is_true(|c| c.preopen_movers, "preopen_movers");
-}
+//
+// PreopenMoversTracker + the legacy `preopen_movers` feature flag were
+// retired by Audit-2026-05-03. Pre-open snapshot semantics now live in
+// the canonical `movers_1s.phase` SYMBOL column populated by
+// `movers_base_pipeline`. Operator queries should use
+// `WHERE phase = 'PREOPEN'` against the movers_* materialized views.
+// The 3 unit tests that pinned this flag are deleted; the flag itself
+// no longer exists in `FeaturesConfig`.
 
 // ---------------------------------------------------------------------------
 // Item 11 — telegram_bucket_coalescer (Wave 3)
@@ -406,7 +397,7 @@ fn test_all_features_default_to_true_no_silent_drift() {
     assert!(d.fast_boot_60s_deadline);
     assert!(d.tick_gap_detector_60s_coalesce);
     assert!(d.audit_tables_enabled);
-    assert!(d.preopen_movers);
+    // d.preopen_movers retired 2026-05-03 — assertion removed.
     assert!(d.telegram_bucket_coalescer);
     assert!(d.market_open_self_test);
     assert!(d.realtime_guarantee_score);
@@ -522,7 +513,7 @@ fn test_config_base_toml_lists_every_feature_flag() {
         "fast_boot_60s_deadline",
         "tick_gap_detector_60s_coalesce",
         "audit_tables_enabled",
-        "preopen_movers",
+        // "preopen_movers" retired 2026-05-03 — folded into movers_1s.phase.
         "telegram_bucket_coalescer",
         "market_open_self_test",
         "realtime_guarantee_score",
