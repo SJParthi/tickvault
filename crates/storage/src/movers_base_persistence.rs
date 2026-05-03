@@ -1024,9 +1024,34 @@ mod tests {
     }
 
     #[test]
-    fn test_legacy_unified_view_timeframes_match_new_views() {
-        // The pre-rename mat-view timeframes are identical to the new set.
-        assert_eq!(LEGACY_UNIFIED_VIEW_TIMEFRAMES, MOVERS_VIEW_TIMEFRAMES);
+    fn test_legacy_unified_view_timeframes_are_subset_of_new_views() {
+        // Audit-2026-05-03: the canonical mat-view set added `10s`. The
+        // legacy `movers_unified_*` drop list still reflects what existed
+        // pre-rename (24 entries, no `10s` — `movers_unified_10s` never
+        // existed in QuestDB). Assert subset relation: every legacy entry
+        // MUST be in the new set so the DROP migration is well-formed.
+        // Strict equality no longer holds because the new set is a strict
+        // superset post-`10s` addition.
+        for legacy_tf in LEGACY_UNIFIED_VIEW_TIMEFRAMES {
+            assert!(
+                MOVERS_VIEW_TIMEFRAMES.contains(legacy_tf),
+                "LEGACY_UNIFIED_VIEW_TIMEFRAMES contains `{legacy_tf}` \
+                 not present in MOVERS_VIEW_TIMEFRAMES — drop list drift"
+            );
+        }
+        // The new set has exactly ONE more entry than the legacy set:
+        // the `10s` mat view added in Audit-2026-05-03.
+        assert_eq!(
+            MOVERS_VIEW_TIMEFRAMES.len(),
+            LEGACY_UNIFIED_VIEW_TIMEFRAMES.len() + 1,
+            "new mat-view set should be exactly +1 (the new `10s` view) \
+             vs legacy unified drop list"
+        );
+        let new_only: Vec<&&str> = MOVERS_VIEW_TIMEFRAMES
+            .iter()
+            .filter(|tf| !LEGACY_UNIFIED_VIEW_TIMEFRAMES.contains(tf))
+            .collect();
+        assert_eq!(new_only, vec![&"10s"], "the only new entry must be `10s`");
     }
 
     #[test]
@@ -1045,16 +1070,24 @@ mod tests {
             .copied()
             .filter(|tf| !MOVERS_VIEW_TIMEFRAMES.contains(tf))
             .collect();
-        // From the live boot of PR #421's first deploy, these are the
-        // five 22tf names not represented in the new mat-view set:
-        //   1s (the new BASE table — not a view, audit must exclude it)
-        //   2s, 3s, 10s, 20s (sub-minute names dropped from new design)
-        for expected in ["1s", "2s", "3s", "10s", "20s"] {
+        // Audit-2026-05-03: `10s` was promoted to the canonical mat-view
+        // set, so it is no longer in the "legacy-22tf-only" subset. The
+        // remaining 4 names (1s, 2s, 3s, 20s) are still legacy-only:
+        //   1s (the new BASE table — not a view, audit must exclude it
+        //       via the QUESTDB_TABLE_MOVERS_1S filter)
+        //   2s, 3s, 20s (sub-minute names dropped from canonical design)
+        for expected in ["1s", "2s", "3s", "20s"] {
             assert!(
                 legacy_only.contains(&expected),
                 "legacy-22tf-only set must contain `{expected}` (got: {legacy_only:?})"
             );
         }
+        // Negative pin: `10s` is canonical, NOT legacy-only.
+        assert!(
+            !legacy_only.contains(&"10s"),
+            "legacy-22tf-only set MUST NOT contain `10s` after Audit-2026-05-03 \
+             promoted it to the canonical mat-view set"
+        );
     }
 
     #[test]
@@ -1080,13 +1113,23 @@ mod tests {
             !candidate_names.iter().any(|n| n == QUESTDB_TABLE_MOVERS_1S),
             "audit candidate set must NOT include the new base table `{QUESTDB_TABLE_MOVERS_1S}`"
         );
-        // Sanity: the other 22tf-only names ARE still candidates.
-        for expected_stale in ["movers_2s", "movers_3s", "movers_10s", "movers_20s"] {
+        // Audit-2026-05-03: `10s` was promoted to canonical, so
+        // `movers_10s` is no longer a stale-table candidate. The other
+        // legacy-only sub-minute names (2s, 3s, 20s) still are.
+        for expected_stale in ["movers_2s", "movers_3s", "movers_20s"] {
             assert!(
                 candidate_names.iter().any(|n| n == expected_stale),
                 "audit candidate set must still include `{expected_stale}` (got: {candidate_names:?})"
             );
         }
+        // Negative pin: `movers_10s` MUST NOT be in the audit candidate
+        // set after the promotion — otherwise the cleanup migration
+        // would attempt to DROP the new canonical mat view.
+        assert!(
+            !candidate_names.iter().any(|n| n == "movers_10s"),
+            "audit candidate set MUST NOT include `movers_10s` after Audit-2026-05-03 \
+             promoted it to the canonical mat-view set"
+        );
     }
 
     #[test]
