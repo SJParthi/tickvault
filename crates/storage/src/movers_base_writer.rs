@@ -25,8 +25,8 @@ use questdb::ingress::{Buffer, Sender, TimestampNanos};
 use tracing::{error, info, warn};
 
 use crate::movers_base_persistence::QUESTDB_TABLE_MOVERS_1S;
-use crate::movers_persistence::sanitize_ilp_symbol;
 use tickvault_common::config::QuestDbConfig;
+use tickvault_common::sanitize::sanitize_ilp_symbol;
 
 /// One row in the `movers_1s` base table. Mirrors the 10-column
 /// schema in `movers_base_persistence.rs`.
