@@ -123,6 +123,14 @@ pub fn build_router_with_auth(
             "/api/movers",
             axum::routing::get(handlers::movers::get_movers),
         )
+        // PR #450 commit 5 (2026-05-03): companion expiries route —
+        // returns sorted list of available derivative expiry dates so
+        // the frontend can populate Dhan's middle dropdown
+        // (May / June / July ...) data-driven instead of hardcoded.
+        .route(
+            "/api/movers/expiries",
+            axum::routing::get(handlers::movers::get_expiries),
+        )
         .route(
             "/api/instruments/diagnostic",
             axum::routing::get(handlers::instruments::instrument_diagnostic),
