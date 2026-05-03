@@ -129,7 +129,7 @@ crates/
 | `handlers/health.rs` | `GET /health` — health check |
 | `handlers/quote.rs` | `GET /api/quote/{security_id}` — latest tick |
 | `handlers/stats.rs` | `GET /api/stats` — QuestDB table counts |
-| `handlers/top_movers.rs` | `GET /api/top-movers` — gainers/losers/most active |
+| `handlers/movers.rs` | `GET /api/movers` — Dhan-parity unified movers endpoint (7 categories × 4 instrument-types × NSE/BSE × expiry filter); `GET /api/movers/expiries` — sorted available derivative expiry dates for the frontend dropdown |
 | `handlers/instruments.rs` | `POST /api/instruments/rebuild`, `GET /api/instruments/diagnostic` |
 | `handlers/index_constituency.rs` | `GET /api/index-constituency`, `GET /api/index-constituency/{index_name}`, `GET /api/stock-indices/{symbol}` |
 | `handlers/option_chain.rs` | `GET /api/option-chain`, `GET /api/pcr` — option chain + PCR from QuestDB |

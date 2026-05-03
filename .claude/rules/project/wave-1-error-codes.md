@@ -146,3 +146,33 @@ that morning's pre-open spread is lost.
 **Source:**
 - `crates/core/src/pipeline/preopen_movers.rs::PreopenMoversTracker::compute_and_persist_snapshot`
 - `crates/storage/src/movers_persistence.rs::StockMoversWriter::append_stock_mover_with_phase`
+
+## PREVOI-01 — prev_oi cache empty at boot
+
+**Trigger:** PR #450 commit 6 (2026-05-03) wires the boot-time
+`spawn_movers_pipeline` call with an empty `Arc<HashMap<(u32, u8), i64>>`
+because the actual bhavcopy + Option Chain prev_oi loader is deferred
+to PR #452 (8:15 AM ready boot orchestrator). Until that orchestrator
+ships, the new unified `/api/movers` endpoint's `OI Change` and
+`OI Change %` columns compute as `current_OI - 0 = current_OI` —
+a misleading value.
+
+**Severity:** Medium (`error_code.rs` — fires a single boot-time WARN
+gated to once-per-process per Wave-4 charter Rule 11 "no false-OK
+signals").
+
+**Triage:**
+1. Verify the WARN appears in `data/logs/errors.jsonl.*` ONCE per
+   process boot — not per-row, not per-tick.
+2. Operators MUST NOT trust the OI Change / OI Change % columns on
+   `/api/movers` until PR #452 ships.
+3. Once PR #452 lands the bhavcopy + Option Chain loader, this
+   warning disappears (cache is populated before
+   `spawn_movers_pipeline` is invoked).
+
+**Auto-triage safe:** YES (visibility-only WARN, no operator action
+required during the PR #452 transition window).
+
+**Source:** `crates/app/src/main.rs::spawn_movers_pipeline` boot
+wiring + `crates/core/src/option_chain/prev_oi.rs::extract_prev_oi_from_option_chain`
++ `crates/core/src/instrument/bhavcopy_cross_check.rs::build_prev_oi_cache_from_bhavcopy`.

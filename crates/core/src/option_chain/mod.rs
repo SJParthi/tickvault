@@ -11,4 +11,8 @@
 //! Requires both `access-token` AND `client-id` headers.
 
 pub mod client;
+// PR #450 commit 3 (2026-05-03): pure helpers to extract `previous_oi`
+// from Option Chain REST responses for the unified /api/movers
+// Dhan-parity OI Change calculations.
+pub mod prev_oi;
 pub mod types;

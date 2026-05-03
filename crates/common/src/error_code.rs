@@ -188,6 +188,13 @@ pub enum ErrorCode {
     Movers02OptionPersistFailed,
     /// MOVERS-03: pre-open movers snapshot persistence failed.
     Movers03PreopenPersistFailed,
+    /// PREVOI-01: prev_oi cache empty at boot — `/api/movers` OI Change
+    /// column will display `current_OI - 0 = current_OI` until PR #452
+    /// boot orchestrator wires the bhavcopy + Option Chain prev_oi loader.
+    /// Severity::Medium — operator-visible WARN per Wave-4 charter Rule 11
+    /// (no false-OK signals); the WARN is gated to fire ONCE at boot
+    /// rather than per-row. PR #450 commit 8b adversarial-review fix.
+    PrevOi01CacheEmptyAtBoot,
 
     // -----------------------------------------------------------------------
     // Wave 2 — resilience (Items 5–9)
@@ -442,6 +449,7 @@ impl ErrorCode {
             Self::Movers01StockPersistFailed => "MOVERS-01",
             Self::Movers02OptionPersistFailed => "MOVERS-02",
             Self::Movers03PreopenPersistFailed => "MOVERS-03",
+            Self::PrevOi01CacheEmptyAtBoot => "PREVOI-01",
             // Wave 2
             Self::WsGap04PostCloseSleep => "WS-GAP-04",
             Self::WsGap05PoolRespawn => "WS-GAP-05",
@@ -590,6 +598,7 @@ impl ErrorCode {
             | Self::Movers01StockPersistFailed
             | Self::Movers02OptionPersistFailed
             | Self::Movers03PreopenPersistFailed
+            | Self::PrevOi01CacheEmptyAtBoot
             | Self::WsGap06TickGapSummary
             | Self::Audit01Phase2WriteFailed
             | Self::Audit02DepthRebalanceWriteFailed
@@ -662,7 +671,8 @@ impl ErrorCode {
             | Self::PrevClose02FirstSeenInconsistency
             | Self::Movers01StockPersistFailed
             | Self::Movers02OptionPersistFailed
-            | Self::Movers03PreopenPersistFailed => ".claude/rules/project/wave-1-error-codes.md",
+            | Self::Movers03PreopenPersistFailed
+            | Self::PrevOi01CacheEmptyAtBoot => ".claude/rules/project/wave-1-error-codes.md",
             Self::WsGap04PostCloseSleep
             | Self::WsGap05PoolRespawn
             | Self::WsGap06TickGapSummary
@@ -805,6 +815,7 @@ impl ErrorCode {
             Self::Movers01StockPersistFailed,
             Self::Movers02OptionPersistFailed,
             Self::Movers03PreopenPersistFailed,
+            Self::PrevOi01CacheEmptyAtBoot,
             Self::WsGap04PostCloseSleep,
             Self::WsGap05PoolRespawn,
             Self::WsGap06TickGapSummary,
@@ -1021,7 +1032,10 @@ mod tests {
         // (boot-time depth-200 smoke test no-frames Critical signal).
         // 2026-05-02 (PR-G): bumped 93 -> 94 for PHASE2-READY-01
         // (09:13:01 IST forward-looking pre-flight readiness check).
-        assert_eq!(ErrorCode::all().len(), 94);
+        // 2026-05-03 (PR #450 commit 8b adversarial-review HIGH H1 fix):
+        // bumped 94 -> 95 for PREVOI-01 (prev_oi cache empty at boot
+        // WARN — typed enum replaces ad-hoc `code = "PREVOI-01"` string).
+        assert_eq!(ErrorCode::all().len(), 95);
     }
 
     #[test]
@@ -1063,7 +1077,9 @@ mod tests {
                 // Wave 5 Item 26 L1: volume cumulative-monotonicity guard.
                 || s.starts_with("VOLUME-")
                 // PR-B (2026-05-02): boot-time depth-200 smoke test.
-                || s.starts_with("DEPTH200-SMOKE-");
+                || s.starts_with("DEPTH200-SMOKE-")
+                // PR #450 commit 8b (2026-05-03): prev_oi cache state.
+                || s.starts_with("PREVOI-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }

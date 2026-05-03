@@ -180,6 +180,52 @@ fn lookup_segment_and_type(
     (inst.exchange_segment.as_str(), inst.instrument_type_tag())
 }
 
+/// PR #450 (2026-05-03): Resolves the IST-midnight epoch nanoseconds of a
+/// derivative contract's expiry date via the InstrumentRegistry composite
+/// key per I-P1-11. Returns `0` for non-derivative rows (no expiry) or
+/// when the registry has no entry.
+///
+/// Pure function. O(1) papaya `get` + `NaiveDate → i64` conversion.
+/// Cold path (1s drain), not the tick processor hot path.
+///
+/// # Hostile-bug-hunt CRITICAL C1 fix (PR #450 commit 8 review)
+///
+/// chrono `and_utc()` interprets the `NaiveDateTime` as UTC, returning
+/// UTC-midnight epoch nanos. The Dhan instrument-master `expiry_date`
+/// is IST — so we MUST add `IST_UTC_OFFSET_NANOS` (5h30m) to recover
+/// the IST-midnight epoch nanos. Without this offset, the
+/// `?expiry=2026-05-29` filter on `/api/movers` matches contracts
+/// expiring 2026-05-28 because the stored value is 5.5h before the
+/// intended IST midnight.
+#[inline]
+#[must_use]
+fn lookup_expiry_date_ist_nanos(
+    registry: &InstrumentRegistry,
+    security_id: u32,
+    segment_code: u8,
+) -> i64 {
+    let Some(seg) = ExchangeSegment::from_byte(segment_code) else {
+        return 0;
+    };
+    let Some(inst) = registry.get_with_segment(security_id, seg) else {
+        return 0;
+    };
+    let Some(date) = inst.expiry_date else {
+        return 0;
+    };
+    // Convert NaiveDate → IST midnight epoch nanoseconds.
+    // The date is already IST per Dhan instrument-master convention,
+    // so we treat midnight-of-that-date as IST midnight, not UTC.
+    let utc_midnight_nanos = date
+        .and_hms_opt(0, 0, 0)
+        .and_then(|dt| dt.and_utc().timestamp_nanos_opt())
+        .unwrap_or(0);
+    if utc_midnight_nanos == 0 {
+        return 0;
+    }
+    utc_midnight_nanos.saturating_add(IST_UTC_OFFSET_NANOS)
+}
+
 /// 1s-aligned IST wall-clock timestamp in nanoseconds.
 #[inline]
 fn now_ist_aligned_to_1s_nanos() -> i64 {
@@ -213,6 +259,18 @@ pub fn spawn_movers_pipeline(
     // vs INDEX vs EQUITY) on every `movers_1s` row. Lookup is O(1) papaya
     // get + amortised on the 1s drain cadence (cold path).
     registry: Arc<InstrumentRegistry>,
+    // PR #450 (2026-05-03): previous-session-close OI cache, keyed by
+    // (security_id, exchange_segment_code) per I-P1-11 composite key.
+    // Populated at boot by the bhavcopy `prev_oi` loader (commit 3 of
+    // PR #450). Sentinel `0` when key is missing (eg. equities/indices
+    // or first-day-of-listing). Required for Dhan-parity OI Change /
+    // OI Change % calculations on the unified /api/movers endpoint.
+    //
+    // Uses arc-swap-style Arc<HashMap> for lock-free O(1) reads on the
+    // 1s drain. The cache is loaded ONCE per trading day (boot or
+    // post-market refresh) and never mutated mid-session, so plain
+    // Arc<HashMap> is sufficient — no need for papaya/RwLock.
+    prev_oi_cache: Arc<HashMap<(u32, u8), i64>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         info!("movers_pipeline starting");
@@ -348,6 +406,22 @@ pub fn spawn_movers_pipeline(
                         };
                         let oi_delta = i64::from(st.open_interest)
                             .saturating_sub(i64::from(st.prev_oi_at_last_drain));
+                        // PR #450 (2026-05-03): O(1) cache lookup for
+                        // prev-session-close OI baseline. Sentinel 0 for
+                        // missing keys (equities/indices/first-day).
+                        // Required for Dhan-parity OI Change column.
+                        let prev_oi = prev_oi_cache
+                            .get(&(*security_id, *segment_code))
+                            .copied()
+                            .unwrap_or(0);
+                        // PR #450 (2026-05-03): O(1) registry lookup for
+                        // derivative expiry → IST midnight epoch nanos.
+                        // Sentinel 0 for non-derivative rows.
+                        let expiry_date_ist_nanos = lookup_expiry_date_ist_nanos(
+                            &registry,
+                            *security_id,
+                            *segment_code,
+                        );
                         let row = MoversRow {
                             ts_nanos,
                             security_id: *security_id,
@@ -357,10 +431,12 @@ pub fn spawn_movers_pipeline(
                             phase,
                             open_interest: i64::from(st.open_interest),
                             oi_delta,
+                            prev_oi,
                             volume: i64::from(st.volume),
                             last_price: last_price_f64,
                             prev_close: prev_close_f64,
                             change_pct,
+                            expiry_date_ist_nanos,
                             // Use the tick's actual wall-clock arrival
                             // for forensics; `ts` (designated timestamp)
                             // carries the 1s-aligned bucket boundary.
@@ -486,6 +562,69 @@ mod tests {
     fn test_market_hours_gate_returns_bool() {
         // Just a smoke test — function never panics.
         let _ = is_within_market_hours_ist();
+    }
+
+    /// PR #450 commit 2 ratchet (2026-05-03): `lookup_expiry_date_ist_nanos`
+    /// MUST return `0` for non-derivative segments (no expiry concept).
+    /// Defensive — caller stores `0` in the row's `expiry_date_ist_nanos`.
+    #[test]
+    fn test_lookup_expiry_date_ist_nanos_returns_zero_for_unknown_segment_byte() {
+        let reg = build_registry_with(vec![]);
+        let nanos = lookup_expiry_date_ist_nanos(&reg, 12345, 99 /* invalid */);
+        assert_eq!(nanos, 0, "unknown segment byte must yield 0 nanos");
+    }
+
+    /// PR #450 commit 2 ratchet (2026-05-03): `lookup_expiry_date_ist_nanos`
+    /// MUST return `0` when the registry has no entry for the composite
+    /// `(security_id, exchange_segment)` key. Per I-P1-11 we use
+    /// `get_with_segment` not bare `get(security_id)`.
+    #[test]
+    fn test_lookup_expiry_date_ist_nanos_returns_zero_when_registry_misses() {
+        let reg = build_registry_with(vec![]);
+        // segment_code 2 = NSE_FNO; no instrument inserted.
+        let nanos = lookup_expiry_date_ist_nanos(&reg, 12345, 2);
+        assert_eq!(nanos, 0, "registry miss must yield 0 nanos");
+    }
+
+    /// PR #450 commit 2 ratchet (2026-05-03): `lookup_expiry_date_ist_nanos`
+    /// MUST return EXACT IST-midnight epoch nanos for a derivative
+    /// instrument's expiry_date. Hostile-bug-hunt CRITICAL C1
+    /// (commit 8 review): the bug was that chrono's `and_utc()`
+    /// returned UTC-midnight, off by 5h30m from intended IST midnight.
+    /// This ratchet pins the EXACT numeric value to prevent
+    /// regression.
+    #[test]
+    fn test_lookup_expiry_date_ist_nanos_returns_exact_ist_midnight_not_utc_midnight() {
+        let mut inst = nse_fno_option_instrument(50000);
+        inst.expiry_date = chrono::NaiveDate::from_ymd_opt(2026, 5, 29);
+        let reg = build_registry_with(vec![inst]);
+        let nanos = lookup_expiry_date_ist_nanos(&reg, 50000, 2);
+
+        // Expected IST midnight 2026-05-29 in UTC = 2026-05-28 18:30 UTC.
+        // chrono's NaiveDate(2026-05-29).and_hms(0,0,0).and_utc() returns
+        // UTC-midnight = 2026-05-29 00:00:00 UTC. We add IST_UTC_OFFSET_NANOS
+        // (5h30m = 19_800_000_000_000_000 nanos) so the stored value
+        // represents IST midnight as a UTC instant.
+        let expected_utc_midnight_2026_05_29 = chrono::NaiveDate::from_ymd_opt(2026, 5, 29)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp_nanos_opt()
+            .unwrap();
+        let expected = expected_utc_midnight_2026_05_29 + IST_UTC_OFFSET_NANOS;
+        assert_eq!(
+            nanos, expected,
+            "must return IST midnight (UTC midnight + 5h30m offset), \
+             got {nanos}, expected {expected}"
+        );
+        // Sanity: the difference between IST-midnight-stored and
+        // UTC-midnight is exactly the IST offset.
+        assert_eq!(
+            nanos - expected_utc_midnight_2026_05_29,
+            IST_UTC_OFFSET_NANOS,
+            "delta from UTC midnight must equal IST offset (5h30m)"
+        );
     }
 
     // -----------------------------------------------------------------
