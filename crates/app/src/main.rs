@@ -2085,7 +2085,12 @@ async fn main() -> Result<()> {
         tickvault_storage::constituency_persistence::ensure_constituency_table(&config.questdb),
         tickvault_storage::materialized_views::ensure_candle_views(&config.questdb),
         ensure_greeks_tables(&config.questdb),
-        tickvault_storage::movers_persistence::ensure_movers_tables(&config.questdb),
+        // Audit-2026-05-03: legacy `ensure_movers_tables` (stock_movers +
+        // option_movers DDL creators) RETIRED — their writers are
+        // disabled (passing None to run_tick_processor) and the tables
+        // are DROPed by `run_one_shot_legacy_retire_migration_2026_05_03`
+        // inside `ensure_movers_tables_and_views` below. Keeping the
+        // CREATE call would race with the DROP migration on every boot.
         // Wave 5 Item 25 + 27 — single `movers_1s` base table + 24 materialized
         // views (`movers_{10s..1h}`). Idempotent CREATE-IF-NOT-EXISTS. The DDL
         // also issues a one-shot DROP for the legacy `movers_22tf_*` tables
@@ -2632,38 +2637,21 @@ async fn main() -> Result<()> {
         // O(1) EXEMPT: cold path — build inline Greeks computer once at startup.
         let greeks_enricher = build_inline_greeks_enricher(&config, &subscription_plan);
 
-        // Create stock movers QuestDB writer (cold path, best-effort)
-        let stock_movers_writer =
-            match tickvault_storage::movers_persistence::StockMoversWriter::new(&config.questdb) {
-                Ok(w) => {
-                    info!("QuestDB stock movers writer connected");
-                    Some(w)
-                }
-                Err(err) => {
-                    warn!(
-                        ?err,
-                        "stock movers writer unavailable — movers will not be persisted"
-                    );
-                    None
-                }
-            };
-
-        // Create option movers tracker + QuestDB writer
+        // Audit-2026-05-03: legacy `StockMoversWriter` + `OptionMoversWriter`
+        // RETIRED. Their target tables (`stock_movers` + `option_movers`)
+        // are subsumed by the canonical `movers_1s` + 25 mat views
+        // populated by `movers_base_pipeline`. Frontend queries should
+        // filter by `instrument_type` against the `movers_*` views
+        // instead of reading the legacy per-category tables.
+        // Passing `None` preserves the `run_tick_processor` signature
+        // for tests + future restoration; the writer code itself is
+        // queued for full deletion in PR #445 alongside API migration.
+        let stock_movers_writer: Option<tickvault_storage::movers_persistence::StockMoversWriter> =
+            None;
         let option_movers_tracker = Some(tickvault_core::pipeline::OptionMoversTracker::new());
-        let option_movers_writer =
-            match tickvault_storage::movers_persistence::OptionMoversWriter::new(&config.questdb) {
-                Ok(w) => {
-                    info!("QuestDB option movers writer connected");
-                    Some(w)
-                }
-                Err(err) => {
-                    warn!(
-                        ?err,
-                        "option movers writer unavailable — option movers will not be persisted"
-                    );
-                    None
-                }
-            };
+        let option_movers_writer: Option<
+            tickvault_storage::movers_persistence::OptionMoversWriter,
+        > = None;
 
         // O(1) EXEMPT: cold path — clone registry once for tick processor enrichment.
         let slow_registry = subscription_plan
