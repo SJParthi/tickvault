@@ -112,6 +112,13 @@ const MIGRATION_MARKER_TABLE: &str = "movers_migration_2026_05_01";
 ///   per query. Required by the depth-dynamic top-volume selector
 ///   (PR-B 2026-05-02). Schema-upgrade safe via
 ///   `ALTER TABLE ADD COLUMN IF NOT EXISTS` self-heal at boot.
+/// - `phase` (SYMBOL) — session phase tag: `"PREOPEN"` (09:00-09:13 IST
+///   pre-open phase), `"MARKET"` (09:15-15:30 IST in-session), or
+///   `"POSTMARKET"` (15:30-15:40 IST close auction). Added by the
+///   2026-05-03 legacy retirement to fold the legacy `PreopenMoversTracker`
+///   functionality into the canonical `movers_1s` pipeline. Frontend
+///   filters with `WHERE phase = 'PREOPEN' AND instrument_type = 'EQUITY'`
+///   to reproduce the legacy pre-open snapshot view.
 /// - `open_interest`, `oi_delta` (LONG) — cumulative + first-derivative
 /// - `volume` (LONG) — cumulative since session open (Item 26 L1 pin)
 /// - `last_price`, `prev_close`, `change_pct` (DOUBLE) — rendered metrics
@@ -126,6 +133,7 @@ pub fn movers_1s_create_ddl() -> String {
             segment          SYMBOL CAPACITY 16 NOCACHE, \
             exchange_segment SYMBOL CAPACITY 16 NOCACHE, \
             instrument_type  SYMBOL CAPACITY 16 NOCACHE, \
+            phase            SYMBOL CAPACITY 8 NOCACHE, \
             open_interest    LONG, \
             oi_delta         LONG, \
             volume           LONG, \
@@ -137,6 +145,17 @@ pub fn movers_1s_create_ddl() -> String {
         DEDUP UPSERT KEYS({DEDUP_KEY_MOVERS_1S});"
     )
 }
+
+/// Session phase value: pre-open (09:00-09:13 IST). Folds in the legacy
+/// `STOCK_MOVERS_PHASE_PREOPEN` constant from the deleted
+/// `movers_persistence.rs` (per Audit-2026-05-03 legacy retirement).
+pub const MOVERS_PHASE_PREOPEN: &str = "PREOPEN";
+
+/// Session phase value: in-market trading window (09:15-15:30 IST).
+pub const MOVERS_PHASE_MARKET: &str = "MARKET";
+
+/// Session phase value: post-close auction (15:30-15:40 IST).
+pub const MOVERS_PHASE_POSTMARKET: &str = "POSTMARKET";
 
 /// Idempotent self-heal for the `exchange_segment` column.
 ///
@@ -161,6 +180,26 @@ pub fn movers_1s_alter_add_instrument_type_ddl() -> String {
     format!(
         "ALTER TABLE {QUESTDB_TABLE_MOVERS_1S} \
          ADD COLUMN IF NOT EXISTS instrument_type SYMBOL CAPACITY 16 NOCACHE;"
+    )
+}
+
+/// Audit-2026-05-03: idempotent self-heal for the `phase` column.
+///
+/// Folds the legacy `PreopenMoversTracker` functionality into the
+/// canonical `movers_1s` pipeline. Pre-existing databases (which were
+/// created before this column landed) gain the column on next boot
+/// without any one-shot migration. Per `observability-architecture.md`
+/// schema self-heal pattern.
+///
+/// Capacity is 8 (vs 16 for other SYMBOL columns) because `phase` has
+/// only 3 possible values (`PREOPEN`, `MARKET`, `POSTMARKET`) — sized
+/// to fit comfortably with headroom for future phases (e.g. lunch
+/// halt) without wasting memory.
+#[must_use]
+pub fn movers_1s_alter_add_phase_ddl() -> String {
+    format!(
+        "ALTER TABLE {QUESTDB_TABLE_MOVERS_1S} \
+         ADD COLUMN IF NOT EXISTS phase SYMBOL CAPACITY 8 NOCACHE;"
     )
 }
 
@@ -511,6 +550,9 @@ pub async fn ensure_movers_tables_and_views(questdb_config: &QuestDbConfig) {
             movers_1s_alter_add_exchange_segment_ddl(),
         ),
         ("instrument_type", movers_1s_alter_add_instrument_type_ddl()),
+        // Audit-2026-05-03: phase column folds in legacy
+        // PreopenMoversTracker semantics (PREOPEN / MARKET / POSTMARKET).
+        ("phase", movers_1s_alter_add_phase_ddl()),
     ] {
         match client
             .get(&base_url)
@@ -807,6 +849,40 @@ mod tests {
             sql.contains("SYMBOL CAPACITY 16 NOCACHE"),
             "ALTER must declare same SYMBOL type as CREATE TABLE"
         );
+    }
+
+    #[test]
+    fn test_movers_1s_create_ddl_includes_phase_column() {
+        // Audit-2026-05-03 ratchet: schema MUST declare `phase` SYMBOL.
+        let ddl = movers_1s_create_ddl();
+        assert!(
+            ddl.contains("phase            SYMBOL CAPACITY 8 NOCACHE"),
+            "movers_1s_create_ddl must declare phase SYMBOL CAPACITY 8 NOCACHE — \
+             folded in from legacy PreopenMoversTracker"
+        );
+    }
+
+    #[test]
+    fn test_movers_1s_alter_add_phase_ddl_is_idempotent_per_observability_self_heal() {
+        let ddl = movers_1s_alter_add_phase_ddl();
+        assert!(
+            ddl.contains("ADD COLUMN IF NOT EXISTS phase"),
+            "ALTER must be idempotent (IF NOT EXISTS)"
+        );
+        assert!(
+            ddl.contains("SYMBOL CAPACITY 8 NOCACHE"),
+            "phase column type must be SYMBOL CAPACITY 8 NOCACHE"
+        );
+    }
+
+    #[test]
+    fn test_movers_phase_constants_pin_three_values() {
+        // Audit-2026-05-03: pin the three phase values folded in from
+        // legacy STOCK_MOVERS_PHASE_* constants. Frontend filters
+        // depend on these exact strings.
+        assert_eq!(MOVERS_PHASE_PREOPEN, "PREOPEN");
+        assert_eq!(MOVERS_PHASE_MARKET, "MARKET");
+        assert_eq!(MOVERS_PHASE_POSTMARKET, "POSTMARKET");
     }
 
     #[test]
