@@ -95,6 +95,20 @@ const LEGACY_22TF_TIMEFRAMES: &[&str] = &[
 /// Marker-table name. Existence guards the one-shot migration.
 const MIGRATION_MARKER_TABLE: &str = "movers_migration_2026_05_01";
 
+/// Audit-2026-05-03 marker — guards the one-shot DROP of the legacy
+/// `stock_movers` + `option_movers` tables. These were written by
+/// `StockMoversWriter` + `OptionMoversWriter` (since-retired by this
+/// PR) and are now subsumed by the canonical `movers_1s` + 25 mat
+/// views. Operator queries should filter by `instrument_type` against
+/// the `movers_*` views; the dropped tables become read-error after
+/// migration runs (which is the desired stale-query alarm).
+const LEGACY_RETIRE_MARKER_TABLE: &str = "movers_legacy_retire_2026_05_03";
+
+/// Audit-2026-05-03: legacy table names dropped by the retirement
+/// migration. Pinned + tested against the prior writer DDL so a future
+/// rename / restore cannot silently miss either table.
+const LEGACY_RETIRE_DROP_TABLES: &[&str] = &["stock_movers", "option_movers"];
+
 /// Base table DDL — `CREATE TABLE IF NOT EXISTS` per Item 25 spec.
 ///
 /// 12-column schema:
@@ -370,6 +384,106 @@ async fn run_one_shot_cleanup_migration(client: &Client, base_url: &str) {
     );
 }
 
+/// Audit-2026-05-03 — one-shot DROP of legacy `stock_movers` +
+/// `option_movers` tables.
+///
+/// Mirrors the marker-gate pattern of
+/// `run_one_shot_movers_cleanup_migration_2026_05_01`. Idempotent:
+/// the marker table is created once, and re-runs of this function on
+/// subsequent boots short-circuit. `DROP TABLE IF EXISTS` makes the
+/// DROP itself safe-to-retry on transient QuestDB failures.
+///
+/// Why a separate marker (vs reusing `MIGRATION_MARKER_TABLE`):
+///
+/// - The 2026-05-01 marker may already be present on databases that
+///   booted prior to this PR; reusing it would mean the new DROPs
+///   never run.
+/// - Keeping the markers granular makes operator forensics easier:
+///   `SELECT name FROM tables() WHERE name LIKE 'movers_%migration%'`
+///   shows exactly which retirement waves a given DB has applied.
+pub async fn run_one_shot_legacy_retire_migration_2026_05_03(client: &Client, base_url: &str) {
+    // Step 0: ensure marker table exists (idempotent — QuestDB returns
+    // success for `CREATE TABLE IF NOT EXISTS` even when the table is
+    // already there).
+    let marker_ddl = format!(
+        "CREATE TABLE IF NOT EXISTS {LEGACY_RETIRE_MARKER_TABLE} (applied_at TIMESTAMP) \
+         TIMESTAMP(applied_at) PARTITION BY YEAR;"
+    );
+    if let Err(err) = client.post(base_url).body(marker_ddl).send().await {
+        warn!(
+            ?err,
+            "legacy-retire marker CREATE failed (continuing) — will retry next boot"
+        );
+    }
+
+    // Step 0b: probe the marker table for an existing applied row.
+    if marker_indicates_legacy_retire_applied(client, base_url).await {
+        return;
+    }
+
+    info!(
+        marker = LEGACY_RETIRE_MARKER_TABLE,
+        tables = ?LEGACY_RETIRE_DROP_TABLES,
+        "running one-shot legacy-movers retirement migration (Audit-2026-05-03) — \
+         DROP stock_movers + option_movers"
+    );
+
+    let mut all_succeeded = true;
+    for table in LEGACY_RETIRE_DROP_TABLES {
+        let sql = format!("DROP TABLE IF EXISTS {table}");
+        if !ddl_succeeded(client, base_url, &sql).await {
+            warn!(table, "DROP TABLE {table} failed (continuing)");
+            all_succeeded = false;
+        }
+    }
+
+    if !all_succeeded {
+        error!(
+            marker = LEGACY_RETIRE_MARKER_TABLE,
+            "one or more legacy-retire DROPs failed — marker NOT written; \
+             next boot will retry"
+        );
+        return;
+    }
+
+    let now_micros = chrono::Utc::now().timestamp_micros();
+    let insert_marker = format!("INSERT INTO {LEGACY_RETIRE_MARKER_TABLE} VALUES ({now_micros})");
+    if !ddl_succeeded(client, base_url, &insert_marker).await {
+        error!(
+            marker = LEGACY_RETIRE_MARKER_TABLE,
+            "legacy-retire marker INSERT failed — migration will re-run on next boot"
+        );
+        return;
+    }
+
+    info!(
+        marker = LEGACY_RETIRE_MARKER_TABLE,
+        "legacy-movers retirement migration completed"
+    );
+}
+
+/// Probe helper for the legacy-retire marker. Mirrors
+/// `marker_indicates_migration_applied` but checks the new marker table.
+async fn marker_indicates_legacy_retire_applied(client: &Client, base_url: &str) -> bool {
+    let probe = format!("SELECT count() AS c FROM {LEGACY_RETIRE_MARKER_TABLE}");
+    match client
+        .get(base_url)
+        .query(&[("query", probe.as_str())])
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            let body = resp.text().await.unwrap_or_default();
+            // QuestDB returns dataset format `[[N]]` — present + parseable
+            // means the marker row exists.
+            body.contains("\"dataset\":[[")
+                && !body.contains("\"dataset\":[[0]]")
+                && !body.contains("\"error\"")
+        }
+        _ => false,
+    }
+}
+
 /// Returns `true` when the QuestDB response was both HTTP 2xx AND the body
 /// does NOT contain the QuestDB `"error":` JSON marker. QuestDB's `/exec`
 /// endpoint returns HTTP 200 with `{"error":"..."}` in the body for queries
@@ -508,6 +622,13 @@ pub async fn ensure_movers_tables_and_views(questdb_config: &QuestDbConfig) {
     // 25 dead `movers_22tf` tables + the legacy `movers_unified_*` objects.
     // Idempotent on subsequent boots.
     run_one_shot_cleanup_migration(&client, &base_url).await;
+
+    // Step 0b: Audit-2026-05-03 — one-shot DROP of legacy `stock_movers`
+    // + `option_movers` tables. Their writers (StockMoversWriter +
+    // OptionMoversWriter) were retired in this PR; the `movers_1s` +
+    // 25 mat views fully cover their query surface via
+    // `instrument_type` + `phase` columns. Marker-gated, idempotent.
+    run_one_shot_legacy_retire_migration_2026_05_03(&client, &base_url).await;
 
     // Step 1: base table.
     let create_base = movers_1s_create_ddl();
@@ -1133,6 +1254,40 @@ mod tests {
     #[test]
     fn test_migration_marker_name_pinned() {
         assert_eq!(MIGRATION_MARKER_TABLE, "movers_migration_2026_05_01");
+    }
+
+    /// Audit-2026-05-03 ratchet: separate marker for the legacy-retire
+    /// migration. Pin the name so a future rename can't silently make
+    /// the migration run twice (would attempt to DROP an
+    /// already-dropped table — `IF EXISTS` makes it safe but noisy).
+    #[test]
+    fn test_legacy_retire_marker_name_pinned() {
+        assert_eq!(
+            LEGACY_RETIRE_MARKER_TABLE,
+            "movers_legacy_retire_2026_05_03"
+        );
+    }
+
+    /// Audit-2026-05-03 ratchet: drop list MUST exactly match the
+    /// legacy writer outputs. Adding a third table to drop without
+    /// updating both the const + this test = build break.
+    #[test]
+    fn test_legacy_retire_drop_tables_pinned_to_two() {
+        assert_eq!(LEGACY_RETIRE_DROP_TABLES.len(), 2);
+        assert!(LEGACY_RETIRE_DROP_TABLES.contains(&"stock_movers"));
+        assert!(LEGACY_RETIRE_DROP_TABLES.contains(&"option_movers"));
+    }
+
+    /// Audit-2026-05-03 ratchet: the legacy-retire marker MUST NOT
+    /// share a name with the existing 2026-05-01 cleanup marker.
+    /// Sharing would mean the new migration never runs on databases
+    /// that already booted prior to this PR.
+    #[test]
+    fn test_legacy_retire_marker_distinct_from_2026_05_01_marker() {
+        assert_ne!(
+            LEGACY_RETIRE_MARKER_TABLE, MIGRATION_MARKER_TABLE,
+            "markers must be distinct so the new DROP runs on existing DBs"
+        );
     }
 
     #[test]
