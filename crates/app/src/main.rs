@@ -5481,6 +5481,75 @@ async fn main() -> Result<()> {
                 }
             }
 
+            // Audit Finding #5 (2026-05-03): Pre-market positive readiness
+            // ping at 09:14:00 IST — exactly 60s before the NSE opening bell.
+            // Closes the false-OK gap from audit-findings-2026-04-17.md
+            // Rule 11: previously the operator had ZERO positive signals
+            // before the bell, only the post-open 09:15:30 confirmation.
+            // Severity::Info — never pages, only confirms readiness.
+            //
+            // Audit-findings Rule 3: market-hours-aware. Trading day check +
+            // late-start past 09:14:00 → skip silently.
+            {
+                let readiness_notifier = notifier.clone();
+                let readiness_health = health_status.clone();
+                let readiness_calendar = std::sync::Arc::clone(&trading_calendar);
+                tokio::spawn(async move {
+                    use chrono::{FixedOffset, NaiveTime, TimeZone, Utc};
+                    use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
+                    let Some(ist_offset) = FixedOffset::east_opt(IST_UTC_OFFSET_SECONDS) else {
+                        return;
+                    };
+                    let now_ist = ist_offset.from_utc_datetime(&Utc::now().naive_utc());
+                    let today_ist = now_ist.date_naive();
+                    if !readiness_calendar.is_trading_day(today_ist) {
+                        info!("market-open readiness: skipping (non-trading day)");
+                        return;
+                    }
+                    let Some(target) = NaiveTime::from_hms_opt(9, 14, 0) else {
+                        return;
+                    };
+                    let now_time = now_ist.time();
+                    if now_time >= target {
+                        // Mid-session boot past 09:14:00 — skip silently per
+                        // 09:15:30 heartbeat precedent (audit-findings Rule 3).
+                        debug!(
+                            now = %now_time,
+                            "market-open readiness: skipping (past 09:14:00 — mid-session boot)"
+                        );
+                        return;
+                    }
+                    let secs_until = (target - now_time).num_seconds().max(0) as u64;
+                    info!(
+                        secs_until,
+                        "market-open readiness: sleeping until 09:14:00 IST"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_secs(secs_until)).await;
+
+                    let main_active = readiness_health.websocket_connections() as usize;
+                    let d20 = readiness_health.depth_20_connections() as usize;
+                    let d200 = readiness_health.depth_200_connections() as usize;
+                    let oms = readiness_health.order_update_connected();
+                    let token_secs = readiness_health.token_remaining_secs();
+                    info!(
+                        main_feed = main_active,
+                        depth_20 = d20,
+                        depth_200 = d200,
+                        order_update = oms,
+                        token_remaining_secs = token_secs,
+                        "PROOF: market-open readiness confirmation fired @ 09:14:00 IST"
+                    );
+                    readiness_notifier.notify(NotificationEvent::MarketOpenReadinessConfirmation {
+                        main_feed_active: main_active,
+                        main_feed_total: tickvault_common::constants::MAX_WEBSOCKET_CONNECTIONS,
+                        depth_20_active: d20,
+                        depth_200_active: d200,
+                        order_update_active: oms,
+                        token_remaining_secs: token_secs,
+                    });
+                });
+            }
+
             // Plan item #5 (2026-04-22): Market-open streaming confirmation
             // Telegram. Fires once per trading day at 09:15:30 IST with the
             // count of active feeds. Answers Parthiban's "how do I know if
@@ -7167,9 +7236,19 @@ async fn main() -> Result<()> {
 
     // Auto-open Portal and Market Dashboard in browser (API server now ready).
     // Best-effort: non-blocking, logged on failure.
-    tokio::spawn(async {
-        crate::infra::open_in_browser("http://localhost:3001/portal/options-chain").await;
-    });
+    //
+    // Audit Finding #9 (2026-05-03): gated on `cfg.api.auto_open_portal`
+    // so AWS / headless deployments can disable the spurious browser
+    // shell-out. Default `true` preserves the local-dev experience.
+    if config.api.auto_open_portal {
+        tokio::spawn(async {
+            crate::infra::open_in_browser("http://localhost:3001/portal/options-chain").await;
+        });
+    } else {
+        info!(
+            "skipping portal auto-open (api.auto_open_portal = false; expected on AWS / headless deploy)"
+        );
+    }
 
     let api_handle = tokio::spawn(async move {
         if let Err(err) = axum::serve(listener, router).await {
@@ -7200,8 +7279,93 @@ async fn main() -> Result<()> {
     info!("mid-session profile watchdog spawned (15-min cadence, market-hours only)");
 
     // -----------------------------------------------------------------------
+    // Step 12b: Spawn periodic token-sweep (Audit Finding #6, 2026-05-03)
+    // -----------------------------------------------------------------------
+    // The primary `renewal_loop` sleeps until refresh window and uses
+    // retry+circuit-breaker, but if the circuit breaker halts the loop,
+    // there is no automatic recovery. The token-sweep is a parallel
+    // safety-net: every TOKEN_SWEEP_INTERVAL_SECS (4h) it calls
+    // `force_renewal_if_stale(TOKEN_SWEEP_STALENESS_THRESHOLD_SECS)`
+    // which renews iff < 4h headroom remains. Independent of the primary
+    // loop — keeps trying even if the loop has halted.
+    {
+        let sweep_token_manager = std::sync::Arc::clone(&token_manager);
+        tokio::spawn(async move {
+            use std::time::Duration;
+            use tickvault_common::constants::{
+                TOKEN_SWEEP_INTERVAL_SECS, TOKEN_SWEEP_STALENESS_THRESHOLD_SECS,
+            };
+            let interval = Duration::from_secs(TOKEN_SWEEP_INTERVAL_SECS);
+            info!(
+                interval_secs = TOKEN_SWEEP_INTERVAL_SECS,
+                threshold_secs = TOKEN_SWEEP_STALENESS_THRESHOLD_SECS,
+                "token sweep task started (Audit Finding #6 — backstop for renewal_loop)"
+            );
+            loop {
+                tokio::time::sleep(interval).await;
+                match sweep_token_manager
+                    .force_renewal_if_stale(TOKEN_SWEEP_STALENESS_THRESHOLD_SECS)
+                    .await
+                {
+                    Ok(true) => {
+                        info!("token sweep: renewed stale token (< 4h headroom)");
+                        metrics::counter!(
+                            "tv_token_sweep_renewals_total",
+                            "result" => "renewed"
+                        )
+                        .increment(1);
+                    }
+                    Ok(false) => {
+                        debug!("token sweep: token still fresh, no action");
+                        metrics::counter!(
+                            "tv_token_sweep_renewals_total",
+                            "result" => "fresh"
+                        )
+                        .increment(1);
+                    }
+                    Err(err) => {
+                        // The renewal_loop's own retry+circuit-breaker
+                        // path will pick this up. We just record the
+                        // failure for observability.
+                        warn!(
+                            error = %err,
+                            "token sweep: force_renewal_if_stale failed (renewal_loop retries independently)"
+                        );
+                        metrics::counter!(
+                            "tv_token_sweep_renewals_total",
+                            "result" => "failed"
+                        )
+                        .increment(1);
+                    }
+                }
+            }
+        });
+    }
+    info!("token sweep spawned (4h cadence, parallel safety-net to renewal_loop)");
+
+    // -----------------------------------------------------------------------
     // Boot duration check — alert if boot exceeded BOOT_TIMEOUT_SECS
     // -----------------------------------------------------------------------
+    // Audit Finding #7 (2026-05-03) — per-step boot timeout strategy:
+    //
+    // Umbrella deadline: `BOOT_TIMEOUT_SECS` (120s) — the global check
+    // immediately below alerts CRITICAL if total boot exceeds this.
+    //
+    // Per-step deadlines (each must be <= umbrella):
+    //   - Step 6 (Dhan auth):  TOKEN_INIT_TIMEOUT_SECS (90s)
+    //   - Step 7 (QuestDB):    BOOT_DEADLINE_SECS (60s)
+    //
+    // Pinned by `crates/common/tests/boot_timeout_consistency_guard.rs`
+    // — that test fails the build if any per-step timeout exceeds the
+    // umbrella, preventing the false-positive alert pattern the audit
+    // caught (TOKEN_INIT was 300s while umbrella was 120s, so umbrella
+    // would page mid-Dhan-auth).
+    //
+    // Wave-6 W6-3 backlog: wrap each remaining boot step (1-5, 8-14)
+    // in `tokio::time::timeout` with named per-step alerts so the
+    // umbrella alert can name WHICH step blew, not just "boot took too
+    // long". Today the umbrella is the only signal for steps without
+    // their own timeout.
     let boot_elapsed = boot_start.elapsed();
     // 2026-04-24 fix: gate the boot deadline CRITICAL alert on market
     // hours. Post-market boots are legitimately slower because index

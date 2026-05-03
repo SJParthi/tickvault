@@ -255,6 +255,12 @@ build_window_end = "15:30:00"
 host = "0.0.0.0"
 port = 3001
 allowed_origins = ["http://localhost:3000", "http://localhost:3001"]
+# Audit Finding #9 (2026-05-03): on boot, auto-open the Options Chain
+# portal at http://localhost:3001/portal/options-chain in the operator's
+# browser. Default true for local dev. Set false on AWS / headless
+# deployments where there is no browser and the spurious xdg-open call
+# only adds noise to the logs.
+auto_open_portal = true
 
 [subscription]
 # Wave 5 Item 1: subscription scope gate.

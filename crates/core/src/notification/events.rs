@@ -241,6 +241,25 @@ pub enum NotificationEvent {
         order_update_active: bool,
     },
 
+    /// Audit Finding #5 (2026-05-03): pre-market positive-readiness ping.
+    /// Fires once per trading day at 09:14:00 IST — exactly 1 minute
+    /// before the NSE opening bell. Reports current subscription counts
+    /// + token expiry headroom so the operator has a positive "we are
+    /// READY for the open" signal, not just the existing 09:15:30
+    /// post-open confirmation. Closes the false-OK gap from
+    /// audit-findings-2026-04-17.md Rule 11. Severity = Info so it never
+    /// pages — it is purely a positive signal. Edge-trigger: fires
+    /// exactly once per trading day, never on mid-session boot past
+    /// 09:14:00 IST.
+    MarketOpenReadinessConfirmation {
+        main_feed_active: usize,
+        main_feed_total: usize,
+        depth_20_active: usize,
+        depth_200_active: usize,
+        order_update_active: bool,
+        token_remaining_secs: u64,
+    },
+
     /// Plan item C (2026-04-22, visibility version): once-per-day audit
     /// trail of what NIFTY + BANKNIFTY 09:12 closes were used as the
     /// authoritative anchor for the day's depth ATM. The 60s depth
@@ -1315,6 +1334,26 @@ impl NotificationEvent {
                      Action: check pool watchdog, token validity, Dhan status."
                 )
             }
+            Self::MarketOpenReadinessConfirmation {
+                main_feed_active,
+                main_feed_total,
+                depth_20_active,
+                depth_200_active,
+                order_update_active,
+                token_remaining_secs,
+            } => {
+                let oms = if *order_update_active { "1/1" } else { "0/1" };
+                let token_hours = *token_remaining_secs as f64 / 3600.0;
+                format!(
+                    "<b>READY for market open @ 09:14:00 IST</b>\n\
+                     Main feed: {main_feed_active}/{main_feed_total}\n\
+                     Depth-20: {depth_20_active}/4\n\
+                     Depth-200: {depth_200_active}/4\n\
+                     Order updates: {oms}\n\
+                     Token headroom: {token_hours:.1}h\n\
+                     Bell rings in 60s."
+                )
+            }
             Self::MarketOpenDepthAnchor {
                 underlying,
                 close_0912,
@@ -2174,6 +2213,7 @@ impl NotificationEvent {
             Self::DepthIndexLtpTimeout { .. } => "DepthIndexLtpTimeout",
             Self::MarketOpenStreamingConfirmation { .. } => "MarketOpenStreamingConfirmation",
             Self::MarketOpenStreamingFailed { .. } => "MarketOpenStreamingFailed",
+            Self::MarketOpenReadinessConfirmation { .. } => "MarketOpenReadinessConfirmation",
             Self::MarketOpenDepthAnchor { .. } => "MarketOpenDepthAnchor",
             Self::DepthUnderlyingMissing { .. } => "DepthUnderlyingMissing",
             Self::DepthSpotPriceStale { .. } => "DepthSpotPriceStale",
@@ -2318,6 +2358,7 @@ impl NotificationEvent {
             Self::WebSocketPoolHalt { .. } => Severity::High,
             Self::MarketOpenStreamingConfirmation { .. } => Severity::Info,
             Self::MarketOpenStreamingFailed { .. } => Severity::High,
+            Self::MarketOpenReadinessConfirmation { .. } => Severity::Info,
             Self::MarketOpenDepthAnchor { .. } => Severity::Info,
             Self::SelfTestPassed { .. } => Severity::Info,
             Self::SelfTestDegraded { .. } => Severity::High,
@@ -4337,6 +4378,109 @@ mod tests {
         assert!(
             msg.contains("Order updates: 0/1"),
             "must show OMS disconnected when active=false; got: {msg}"
+        );
+    }
+
+    // -- MarketOpenReadinessConfirmation (audit Finding #5, 2026-05-03) ----
+
+    #[test]
+    fn test_market_open_readiness_confirmation_severity_is_info() {
+        // Audit Finding #5 (2026-05-03): pre-market positive-readiness
+        // ping at 09:14:00 IST. Severity::Info — never pages, only
+        // confirms the system is ready 60s before the bell. Severity
+        // ratchet so a future change cannot silently escalate this to
+        // High and turn it into a noisy pager event.
+        let ev = NotificationEvent::MarketOpenReadinessConfirmation {
+            main_feed_active: 5,
+            main_feed_total: 5,
+            depth_20_active: 4,
+            depth_200_active: 4,
+            order_update_active: true,
+            token_remaining_secs: 8 * 3600,
+        };
+        assert_eq!(ev.severity(), Severity::Info);
+    }
+
+    #[test]
+    fn test_market_open_readiness_confirmation_includes_subscription_counts() {
+        let ev = NotificationEvent::MarketOpenReadinessConfirmation {
+            main_feed_active: 5,
+            main_feed_total: 5,
+            depth_20_active: 4,
+            depth_200_active: 4,
+            order_update_active: true,
+            token_remaining_secs: 8 * 3600,
+        };
+        let msg = ev.to_message();
+        assert!(msg.contains("READY for market open"), "got: {msg}");
+        assert!(msg.contains("09:14:00 IST"), "got: {msg}");
+        assert!(msg.contains("Main feed: 5/5"), "got: {msg}");
+        assert!(msg.contains("Depth-20: 4/4"), "got: {msg}");
+        assert!(msg.contains("Depth-200: 4/4"), "got: {msg}");
+        assert!(msg.contains("Order updates: 1/1"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_market_open_readiness_confirmation_shows_token_headroom_in_hours() {
+        // Token expiry headroom must be human-readable (hours, 1 decimal),
+        // not raw seconds. Operator should see "Token headroom: 8.0h" not
+        // "Token headroom: 28800". Catches future regressions where the
+        // formatter forgets to convert seconds → hours.
+        let ev = NotificationEvent::MarketOpenReadinessConfirmation {
+            main_feed_active: 5,
+            main_feed_total: 5,
+            depth_20_active: 4,
+            depth_200_active: 4,
+            order_update_active: true,
+            token_remaining_secs: 8 * 3600 + 1800, // 8.5 hours
+        };
+        let msg = ev.to_message();
+        assert!(
+            msg.contains("Token headroom: 8.5h"),
+            "must format token headroom as hours with 1 decimal; got: {msg}"
+        );
+        assert!(
+            !msg.contains("30600"),
+            "must NOT show raw seconds; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_market_open_readiness_confirmation_variant_name_is_stable() {
+        // ratchet: variant Debug-format is on the wire (Telegram/audit),
+        // so it must be stable. Catches accidental rename.
+        let ev = NotificationEvent::MarketOpenReadinessConfirmation {
+            main_feed_active: 5,
+            main_feed_total: 5,
+            depth_20_active: 4,
+            depth_200_active: 4,
+            order_update_active: true,
+            token_remaining_secs: 0,
+        };
+        let dbg = format!("{ev:?}");
+        assert!(
+            dbg.starts_with("MarketOpenReadinessConfirmation"),
+            "variant debug-name must remain MarketOpenReadinessConfirmation; got: {dbg}"
+        );
+    }
+
+    #[test]
+    fn test_market_open_readiness_confirmation_mentions_60s_to_bell() {
+        // Operator-facing wording: the 09:14:00 ping is 60s before the
+        // 09:15:00 NSE opening bell. Pin this in the message so reviewers
+        // know why the time is 09:14 not 09:15.
+        let ev = NotificationEvent::MarketOpenReadinessConfirmation {
+            main_feed_active: 5,
+            main_feed_total: 5,
+            depth_20_active: 4,
+            depth_200_active: 4,
+            order_update_active: true,
+            token_remaining_secs: 8 * 3600,
+        };
+        let msg = ev.to_message();
+        assert!(
+            msg.contains("60s") || msg.contains("Bell rings"),
+            "must explain why 09:14 not 09:15; got: {msg}"
         );
     }
 
