@@ -380,9 +380,15 @@ conns = 5                                       # capped at Dhan 5-conn limit
 sids_per_conn = 50                              # capped at Dhan 50-SIDs/conn limit
 
 [depth_20.dynamic.universe]
-exchange_segments = ["NSE_FNO"]                  # add "BSE_FNO" to widen
-instrument_types = []                            # empty = all types
-cohort_size = 500                                # Stage-1 top-volume cohort size
+# Operator spec (2026-05-03): depth-20 must subscribe ONLY index options
+# (CE/PE on NIFTY + BANKNIFTY). SENSEX is excluded entirely (BSE_FNO not
+# in segment list — Dhan depth endpoint unsupported). Stock options,
+# stock futures, index futures, equities, and indices are NOT eligible
+# — depth bandwidth is reserved for the most actively-traded index
+# option contracts only.
+exchange_segments = ["NSE_FNO"]                  # SENSEX excluded (BSE_FNO out)
+instrument_types = ["OPTIDX"]                    # ONLY index options (no OPTSTK/FUTIDX/FUTSTK/EQUITY/INDEX)
+cohort_size = 500                                # Stage-1 top-volume cohort size (selector takes top 250 = 5×50)
 rerank_metric = "change_pct_desc"                # Stage-2 sort metric
 window_secs = 60                                 # movers_1m look-back window
 
@@ -391,8 +397,10 @@ conns = 5
 sids_per_conn = 1
 
 [depth_200.dynamic.universe]
-exchange_segments = ["NSE_FNO"]
-instrument_types = []
-cohort_size = 100
+# Operator spec (2026-05-03): same procedure as depth-20 but capped at
+# top 5 (5 conns × 1 SID each). Index options only, NIFTY/BANKNIFTY only.
+exchange_segments = ["NSE_FNO"]                  # SENSEX excluded (BSE_FNO out)
+instrument_types = ["OPTIDX"]                    # ONLY index options
+cohort_size = 100                                # Stage-1 cohort (selector takes top 5)
 rerank_metric = "change_pct_desc"
 window_secs = 60

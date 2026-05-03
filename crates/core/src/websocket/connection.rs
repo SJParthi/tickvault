@@ -304,6 +304,40 @@ pub struct WebSocketConnection {
     /// run loop `.take()` the receiver once at startup without making the
     /// constructor signature heavier.
     subscribe_cmd_rx: tokio::sync::Mutex<Option<mpsc::Receiver<SubscribeCommand>>>,
+
+    /// Audit-2026-05-03 H2: pre-allocated `&'static str` label for the
+    /// `tv_websocket_connections_active` + `tv_websocket_reconnections_total`
+    /// metrics. Resolved via `connection_id_label_static()` against the
+    /// `CONNECTION_ID_LABELS` const-array indexed by `connection_id`
+    /// (range `0..MAX_WEBSOCKET_CONNECTIONS = 5`). Zero allocation —
+    /// the label points into the binary's read-only `.rodata` section.
+    /// Previously each `run()` invocation called
+    /// `self.connection_id.to_string()` TWICE which heap-allocated a fresh
+    /// `String` for an integer 0..5. This field eliminates that alloc
+    /// from the run-loop entry path entirely.
+    connection_id_label: &'static str,
+}
+
+/// Audit-2026-05-03 H2: static lookup for connection-id labels used by
+/// metrics. Indexed by `ConnectionId as usize`. Capacity matches
+/// `MAX_WEBSOCKET_CONNECTIONS = 5`. A 6th entry `"unknown"` covers the
+/// degenerate case where a future regression bumps `ConnectionId` past
+/// the cap — defensive, never hit in practice.
+const CONNECTION_ID_LABELS: [&str; 6] = ["0", "1", "2", "3", "4", "unknown"];
+
+/// Returns the `&'static str` metric label for a given `ConnectionId`.
+/// Pure function, no I/O, no allocation. O(1) array index.
+#[inline]
+#[must_use]
+fn connection_id_label_static(id: ConnectionId) -> &'static str {
+    let idx = id as usize;
+    if idx < CONNECTION_ID_LABELS.len() - 1 {
+        CONNECTION_ID_LABELS[idx]
+    } else {
+        // Last slot is the defensive fallback; never reached at the
+        // current MAX_WEBSOCKET_CONNECTIONS=5 cap.
+        CONNECTION_ID_LABELS[CONNECTION_ID_LABELS.len() - 1]
+    }
 }
 
 impl WebSocketConnection {
@@ -365,6 +399,12 @@ impl WebSocketConnection {
             watchdog_notify: Arc::new(tokio::sync::Notify::new()),
             // O1-B: subscribe command channel installed lazily via builder.
             subscribe_cmd_rx: tokio::sync::Mutex::new(None),
+            // Audit-2026-05-03 H2: resolve the static label ONCE at
+            // construction. `connection_id_label_static` is a pure O(1)
+            // const-array index — zero heap allocation, label points to
+            // `.rodata`. Previously the `run()` loop called
+            // `self.connection_id.to_string()` which heap-allocated.
+            connection_id_label: connection_id_label_static(connection_id),
         }
     }
 
@@ -455,9 +495,19 @@ impl WebSocketConnection {
     /// Returns only on non-reconnectable errors or exhausted retries.
     #[instrument(skip_all, fields(conn_id = self.connection_id))]
     pub async fn run(&self) -> Result<(), WebSocketError> {
-        // O(1) EXEMPT: begin — metric handles grabbed once before loop, not per-message
-        let m_conn_active = metrics::gauge!("tv_websocket_connections_active", "connection_id" => self.connection_id.to_string());
-        let m_reconnections = metrics::counter!("tv_websocket_reconnections_total", "connection_id" => self.connection_id.to_string());
+        // O(1) EXEMPT: begin — metric handles grabbed once before loop, not per-message.
+        // Audit-2026-05-03 H2: label is a `&'static str` pointing into
+        // `.rodata` via the `CONNECTION_ID_LABELS` const-array. Zero heap
+        // allocation on `run()` entry; previously `self.connection_id.to_string()`
+        // allocated a fresh `String` per metric handle (2 allocs per run).
+        let m_conn_active = metrics::gauge!(
+            "tv_websocket_connections_active",
+            "connection_id" => self.connection_id_label,
+        );
+        let m_reconnections = metrics::counter!(
+            "tv_websocket_reconnections_total",
+            "connection_id" => self.connection_id_label,
+        );
         // O(1) EXEMPT: end
 
         loop {
@@ -1762,6 +1812,48 @@ mod tests {
             None,
         );
         assert_eq!(conn.connection_id(), 3);
+    }
+
+    /// Audit-2026-05-03 H2 ratchet: `connection_id_label_static` MUST
+    /// return the canonical `&'static str` for every valid ConnectionId
+    /// 0..MAX_WEBSOCKET_CONNECTIONS, AND fall back to "unknown" past
+    /// the cap. Pinning this prevents a future commit from re-introducing
+    /// `to_string()` on the run-loop entry path.
+    #[test]
+    fn test_h2_connection_id_label_static_zero_alloc_lookup() {
+        // Canonical labels for the 5 supported connection ids.
+        assert_eq!(connection_id_label_static(0), "0");
+        assert_eq!(connection_id_label_static(1), "1");
+        assert_eq!(connection_id_label_static(2), "2");
+        assert_eq!(connection_id_label_static(3), "3");
+        assert_eq!(connection_id_label_static(4), "4");
+        // Defensive fallback for ids past MAX_WEBSOCKET_CONNECTIONS=5.
+        assert_eq!(connection_id_label_static(5), "unknown");
+        assert_eq!(connection_id_label_static(99), "unknown");
+        assert_eq!(connection_id_label_static(u8::MAX), "unknown");
+    }
+
+    #[test]
+    fn test_h2_connection_caches_static_label_at_construction() {
+        let (tx, _rx) = mpsc::channel(100);
+        let conn = WebSocketConnection::new(
+            2,
+            make_test_token_handle(),
+            "test-client".to_string(),
+            make_test_dhan_config(),
+            make_test_ws_config(),
+            vec![],
+            FeedMode::Full,
+            tx,
+            None,
+        );
+        // The cached label is a `&'static str` — pointer equality with
+        // the const array proves no heap allocation occurred.
+        assert_eq!(conn.connection_id_label, "2");
+        assert!(std::ptr::eq(
+            conn.connection_id_label,
+            CONNECTION_ID_LABELS[2]
+        ));
     }
 
     #[test]

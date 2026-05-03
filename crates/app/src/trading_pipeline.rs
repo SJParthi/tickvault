@@ -629,7 +629,31 @@ async fn run_trading_pipeline(
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        debug!(skipped, "order update receiver lagged");
+                        // Audit-2026-05-03 M4: previously a silent debug! drop.
+                        // Order-fill events skipped here mean the OMS state
+                        // machine MISSES TRADED/CANCELLED transitions, which
+                        // propagates to risk + reconciliation as ghost orders.
+                        // Now mirrors the pre-trade-tick Lagged escalation
+                        // pattern at line 589-611: counter increment + ERROR
+                        // routing to Telegram for sustained lag.
+                        metrics::counter!("tv_order_update_receiver_lagged_total")
+                            .increment(skipped);
+                        if skipped >= TRADING_PIPELINE_LAG_ERROR_THRESHOLD {
+                            error!(
+                                skipped,
+                                threshold = TRADING_PIPELINE_LAG_ERROR_THRESHOLD,
+                                "OMS-GAP-02: order update receiver SEVERE lag — \
+                                 >1k order events skipped in one recv cycle; \
+                                 fills/cancels likely missed — reconciliation \
+                                 will detect ghost orders"
+                            );
+                        } else {
+                            warn!(
+                                skipped,
+                                "order update receiver lagged — skipped events, \
+                                 OMS state may diverge until next reconciliation"
+                            );
+                        }
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         info!("order update broadcast closed");

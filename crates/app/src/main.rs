@@ -2091,7 +2091,7 @@ async fn main() -> Result<()> {
         // also issues a one-shot DROP for the legacy `movers_22tf_*` tables
         // (deleted 2026-05-01) and the legacy `movers_unified_*` names (renamed
         // to `movers_*` 2026-05-01).
-        tickvault_storage::movers_unified_persistence::ensure_movers_tables_and_views(
+        tickvault_storage::movers_base_persistence::ensure_movers_tables_and_views(
             &config.questdb,
         ),
         tickvault_storage::indicator_snapshot_persistence::ensure_indicator_snapshot_table(
@@ -2710,25 +2710,23 @@ async fn main() -> Result<()> {
         // `instrument_type` (precise OPTSTK/FUTIDX/INDEX/EQUITY) on every
         // row. Skipped if the registry is missing (subscription_plan was
         // not built — typically a boot path that doesn't load instruments).
-        let movers_unified_shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
-        let _movers_unified_handle = if let Some(registry) = slow_registry.as_ref() {
-            Some(
-                tickvault_app::movers_unified_pipeline::spawn_movers_pipeline(
-                    config.questdb.clone(),
-                    tick_broadcast_sender.clone(),
-                    std::sync::Arc::clone(&movers_unified_shutdown),
-                    std::sync::Arc::clone(registry),
-                ),
-            )
+        let movers_base_shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+        let _movers_base_handle = if let Some(registry) = slow_registry.as_ref() {
+            Some(tickvault_app::movers_base_pipeline::spawn_movers_pipeline(
+                config.questdb.clone(),
+                tick_broadcast_sender.clone(),
+                std::sync::Arc::clone(&movers_base_shutdown),
+                std::sync::Arc::clone(registry),
+            ))
         } else {
             warn!(
-                "movers_unified_pipeline NOT spawned — slow_registry is None (subscription_plan absent)"
+                "movers_base_pipeline NOT spawned — slow_registry is None (subscription_plan absent)"
             );
             None
         };
 
         // Wave 5 Item 26 L2 LIVE — 16:30 IST bhavcopy cross-check task.
-        // Post-market only (TradingCalendar gated); reads `movers_unified_1s`
+        // Post-market only (TradingCalendar gated); reads `movers_1s`
         // for our captured EOD volumes, downloads NSE bhavcopy ZIP via
         // `unzip` shell, parses, cross-checks with 0.1% tolerance, writes
         // audit rows to `volume_nse_audit`, emits Telegram summary.

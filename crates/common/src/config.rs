@@ -2747,6 +2747,68 @@ mod tests {
         assert!(cfg.depth_dynamic_pipeline_v2);
     }
 
+    /// Ratchet for operator-spec 2026-05-03: depth-20 + depth-200 dynamic
+    /// universe MUST be limited to index options on NSE_FNO. No stock
+    /// options, no futures, no equities, no indices — depth bandwidth
+    /// is reserved for the most actively-traded NIFTY/BANKNIFTY option
+    /// contracts. SENSEX is excluded by virtue of `BSE_FNO` being absent
+    /// from `exchange_segments`.
+    ///
+    /// This test parses the actual production `config/base.toml` and
+    /// fails the build if anyone flips `instrument_types` back to `[]`
+    /// (which would silently re-admit OPTSTK / FUTIDX / FUTSTK / EQUITY
+    /// / INDEX into the depth cohort).
+    #[test]
+    fn test_base_toml_depth_20_and_200_locked_to_optidx_only_per_operator_spec() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        #[derive(Deserialize)]
+        struct Wrapper {
+            depth_20: Depth20Wrapper,
+            depth_200: Depth200Wrapper,
+        }
+        #[derive(Deserialize)]
+        struct Depth20Wrapper {
+            dynamic: DepthDynamicConfig,
+        }
+        #[derive(Deserialize)]
+        struct Depth200Wrapper {
+            dynamic: DepthDynamicConfig,
+        }
+
+        let cfg: Wrapper = Figment::new()
+            .merge(Toml::file("../../config/base.toml"))
+            .extract()
+            .expect("config/base.toml must parse");
+
+        // Depth-20: NSE_FNO + OPTIDX only.
+        assert_eq!(
+            cfg.depth_20.dynamic.universe.exchange_segments,
+            vec!["NSE_FNO".to_string()],
+            "depth_20.dynamic.universe.exchange_segments must be exactly [\"NSE_FNO\"] — \
+             SENSEX (BSE_FNO) excluded per operator spec 2026-05-03",
+        );
+        assert_eq!(
+            cfg.depth_20.dynamic.universe.instrument_types,
+            vec!["OPTIDX".to_string()],
+            "depth_20.dynamic.universe.instrument_types must be exactly [\"OPTIDX\"] — \
+             only index options eligible for depth-20 per operator spec 2026-05-03",
+        );
+
+        // Depth-200: same restriction.
+        assert_eq!(
+            cfg.depth_200.dynamic.universe.exchange_segments,
+            vec!["NSE_FNO".to_string()],
+            "depth_200.dynamic.universe.exchange_segments must be exactly [\"NSE_FNO\"]",
+        );
+        assert_eq!(
+            cfg.depth_200.dynamic.universe.instrument_types,
+            vec!["OPTIDX".to_string()],
+            "depth_200.dynamic.universe.instrument_types must be exactly [\"OPTIDX\"]",
+        );
+    }
+
     // -----------------------------------------------------------------------
     // PR-C2 follow-up H4 — under_provisioned_warning soft check
     // -----------------------------------------------------------------------
