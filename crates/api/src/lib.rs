@@ -95,6 +95,17 @@ pub fn build_router_with_auth(
             "/health",
             axum::routing::get(handlers::health::health_check),
         )
+        // Browsers auto-fetch /favicon.ico on every portal page load. Without
+        // an explicit handler, axum's merge of public + protected routers
+        // routes unmatched paths through the protected router's auth-layer
+        // fallback, producing a `WARN GAP-SEC-01: missing Authorization`
+        // entry per page load. Returning 204 No Content here short-circuits
+        // before that fallback. Browsers cache the empty response, so the
+        // request usually fires once per session.
+        .route(
+            "/favicon.ico",
+            axum::routing::get(handlers::static_file::favicon),
+        )
         .route("/api/stats", axum::routing::get(handlers::stats::get_stats))
         .route(
             "/api/quote/{security_id}",

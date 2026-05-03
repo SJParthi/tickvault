@@ -829,8 +829,16 @@
         const API_URL = '/api';
         const API_OPTION_CHAIN_PATH = '/api/option-chain';
         const API_PCR_PATH = '/api/pcr';
-        const REFRESH_INTERVAL = 5000;
+        // Refresh cadence — adaptive. FAST is the in-market polling rate; SLOW
+        // kicks in when the backend returns 404 (no greeks data yet — typical
+        // on non-trading days, fresh boots, or off-hours) so we don't generate
+        // 12 404s/min in the API logs. The page returns to FAST as soon as
+        // any 200 response arrives.
+        const REFRESH_INTERVAL_FAST_MS = 5000;
+        const REFRESH_INTERVAL_SLOW_MS = 60000;
         const LOT_SIZE = 65;
+        let currentRefreshIntervalMs = REFRESH_INTERVAL_FAST_MS;
+        let refreshTimerId = null;
 
         let currentUnderlying = 'NIFTY';
         let currentExpiry = '2026-04-13';
@@ -849,9 +857,24 @@
         document.addEventListener('DOMContentLoaded', () => {
             setupEventListeners();
             loadOptionChain();
-            setInterval(loadOptionChain, REFRESH_INTERVAL);
+            scheduleNextRefresh();
             updateConnectionStatus();
         });
+
+        function scheduleNextRefresh() {
+            if (refreshTimerId !== null) clearTimeout(refreshTimerId);
+            refreshTimerId = setTimeout(async () => {
+                await loadOptionChain();
+                scheduleNextRefresh();
+            }, currentRefreshIntervalMs);
+        }
+
+        function setRefreshInterval(ms) {
+            if (ms === currentRefreshIntervalMs) return;
+            currentRefreshIntervalMs = ms;
+            // Reschedule the next tick at the new cadence.
+            scheduleNextRefresh();
+        }
 
         function setupEventListeners() {
             document.getElementById('nextExpiryBtn').addEventListener('click', toggleExpiryDropdown);
@@ -877,14 +900,29 @@
         async function loadOptionChain() {
             try {
                 const response = await fetch(`${API_URL}/option-chain?underlying=${currentUnderlying}&expiry=${currentExpiry}`);
-                const result = await response.json();
 
-                if (result.error) {
+                // 404 = greeks pipeline hasn't populated dhan_option_chain_raw yet
+                // (non-trading day, fresh boot, off-hours). Slow the polling
+                // cadence so the API log isn't dominated by 404s. The page
+                // returns to fast polling as soon as a 200 arrives.
+                if (response.status === 404) {
+                    setRefreshInterval(REFRESH_INTERVAL_SLOW_MS);
                     showNoData();
                     updateConnectionStatus(false);
                     return;
                 }
 
+                const result = await response.json();
+
+                if (result.error) {
+                    setRefreshInterval(REFRESH_INTERVAL_SLOW_MS);
+                    showNoData();
+                    updateConnectionStatus(false);
+                    return;
+                }
+
+                // Successful 200 — back to fast in-market cadence.
+                setRefreshInterval(REFRESH_INTERVAL_FAST_MS);
                 optionChainData = result.data;
                 spotPrice = result.data.spot_price;
                 populateExpiryTabs(result.data.available_expiries);
@@ -892,6 +930,10 @@
                 loadPCR();
                 updateConnectionStatus(true);
             } catch (error) {
+                // Network error — also back off (the next 60s poll won't fix
+                // the underlying connectivity issue, but at least the page
+                // doesn't hammer the server).
+                setRefreshInterval(REFRESH_INTERVAL_SLOW_MS);
                 console.error('Failed to load option chain:', error);
                 updateConnectionStatus(false);
             }
