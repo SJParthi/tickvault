@@ -93,7 +93,7 @@ pub const MAX_K: usize = 250;
 pub struct MoverRow {
     pub security_id: u32,
     /// Precise per-exchange tag (e.g., `"NSE_FNO"`, `"BSE_FNO"`,
-    /// `"NSE_EQ"`, `"IDX_I"`). Populated by `movers_unified_pipeline`
+    /// `"NSE_EQ"`, `"IDX_I"`). Populated by `movers_base_pipeline`
     /// from the InstrumentRegistry composite-key lookup per I-P1-11.
     pub exchange_segment: String,
     /// Precise instrument-type classification (`"INDEX"`, `"EQUITY"`,
@@ -103,7 +103,7 @@ pub struct MoverRow {
     /// Cumulative session volume.
     pub volume: i64,
     /// `((last_price - prev_close) / prev_close) × 100` per Dhan
-    /// option-chain formula. Computed by `movers_unified_pipeline`.
+    /// option-chain formula. Computed by `movers_base_pipeline`.
     pub change_pct: f64,
 }
 

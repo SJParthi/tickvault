@@ -24,7 +24,7 @@ pub mod depth_dynamic_pipeline;
 pub mod depth_dynamic_pipeline_v2;
 pub mod greeks_pipeline;
 pub mod infra;
-pub mod movers_unified_pipeline;
+pub mod movers_base_pipeline;
 pub mod movers_v2_pipeline;
 pub mod observability;
 pub mod phase2_recovery;
