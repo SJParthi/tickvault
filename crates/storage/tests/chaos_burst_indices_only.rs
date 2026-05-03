@@ -59,6 +59,10 @@ const WAVE_5_PEAK_TPS: usize = 110_180;
 const WAVE_5_QUESTDB_OUTAGE_TOLERANCE_SECS: usize = 5;
 
 #[test]
+#[allow(
+    clippy::assertions_on_constants,
+    reason = "compile-time constant ratchet — assertion IS the test"
+)]
 fn test_chaos_burst_envelope_constants_match_wave_5_plan() {
     // The plan's hard cap.
     assert_eq!(
@@ -110,6 +114,10 @@ fn test_chaos_burst_rescue_ring_absorbs_5s_questdb_outage_at_peak_tps() {
 }
 
 #[test]
+#[allow(
+    clippy::assertions_on_constants,
+    reason = "compile-time constant ratchet — assertion IS the test"
+)]
 fn test_chaos_burst_high_watermark_alert_fires_before_overflow() {
     // The high-watermark is the level at which the operator gets paged
     // ("ring at 80% capacity"). It MUST be strictly below capacity so
@@ -153,6 +161,10 @@ fn test_chaos_burst_synthetic_200k_row_vecdeque_bounded_no_panic() {
 }
 
 #[test]
+#[allow(
+    clippy::assertions_on_constants,
+    reason = "compile-time constant ratchet — assertion IS the test"
+)]
 fn test_chaos_burst_invariant_documentation_complete() {
     // Documentation ratchet: ensure the named constants the plan cites
     // are reachable + non-zero. Trivial today but pins regression where

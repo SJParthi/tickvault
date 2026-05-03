@@ -193,14 +193,14 @@ impl DrainedSummary {
     /// coalesced — the operator's "what was suppressed?" question.
     pub fn render_message(&self) -> String {
         // Single-event fast path: no envelope, just the sample.
-        if self.count == 1 {
-            if let Some(sample) = self.samples.first() {
-                return sample.clone();
-            }
-            // Defensive: count=1 with no samples should be impossible
-            // (Telegram02CoalescerStateInconsistency catches it
-            // separately) — fall through to the envelope rather than
-            // emit an empty message.
+        // Defensive: count=1 with no samples should be impossible
+        // (Telegram02CoalescerStateInconsistency catches it
+        // separately) — fall through to the envelope rather than
+        // emit an empty message.
+        if self.count == 1
+            && let Some(sample) = self.samples.first()
+        {
+            return sample.clone();
         }
 
         let mut out = String::with_capacity(256);

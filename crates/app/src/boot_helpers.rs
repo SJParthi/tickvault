@@ -430,8 +430,8 @@ pub fn create_log_file_writer() -> Option<std::fs::File> {
 /// alone produce ~7 MB/hour in `data/logs/app.YYYY-MM-DD-HH`, exceeding
 /// IDE code-insight thresholds (2.56 MB) and slowing `less` / `grep`.
 ///
-/// This filter applies to the FILE appender ONLY. Stdout (when enabled)
-/// + `errors.log` + `errors.jsonl.YYYY-MM-DD-HH` keep the configured
+/// This filter applies to the FILE appender ONLY. Stdout (when enabled),
+/// `errors.log`, and `errors.jsonl.YYYY-MM-DD-HH` keep the configured
 /// global level — DEBUG is preserved for triage at the source.
 ///
 /// # Arguments

@@ -179,8 +179,8 @@ fn make_preopen_tick(
 // ---------------------------------------------------------------------------
 
 /// Wave-3-A Item 10 e2e: a tracker snapshot of 3 stocks + 2 indices
-/// + SENSEX-as-unavailable persists end-to-end through the live ILP
-/// wire path with zero drops.
+/// (plus SENSEX-as-unavailable) persists end-to-end through the live
+/// ILP wire path with zero drops.
 #[test]
 fn test_preopen_movers_e2e_snapshot_persists_phase_preopen_to_questdb() {
     let server = FakeQuestDb::start_ephemeral();
@@ -200,11 +200,11 @@ fn test_preopen_movers_e2e_snapshot_persists_phase_preopen_to_questdb() {
     // boot-time disk-cache seed in main.rs uses the same call).
     tracker.update_from_tick(&make_preopen_tick(2885, 1, 2_500.50, 2_490.00));
     tracker.update_from_tick(&make_preopen_tick(1594, 1, 1_485.75, 1_500.00));
-    tracker.update_from_tick(&make_preopen_tick(11536, 1, 3_750.00, 3_720.00));
+    tracker.update_from_tick(&make_preopen_tick(11536, 1, 3_750.0, 3_720.0));
     tracker.seed_prev_close(13, ExchangeSegment::IdxI, 24_500.0);
     tracker.seed_prev_close(25, ExchangeSegment::IdxI, 52_000.0);
-    tracker.update_from_tick(&make_preopen_tick(13, 0, 24_625.50, 0.0));
-    tracker.update_from_tick(&make_preopen_tick(25, 0, 51_780.00, 0.0));
+    tracker.update_from_tick(&make_preopen_tick(13, 0, 24_625.5, 0.0));
+    tracker.update_from_tick(&make_preopen_tick(25, 0, 51_780.0, 0.0));
 
     let snap = tracker.compute_snapshot();
 

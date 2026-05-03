@@ -92,10 +92,10 @@ fn five_other_audit_rules_keep_their_5y_expiration() {
         if prefix == "order_audit/" {
             continue;
         }
-        if let Some(exp) = r.get("Expiration") {
-            if exp["Days"].as_i64() == Some(1825) {
-                count_with_5y_expiration += 1;
-            }
+        if let Some(exp) = r.get("Expiration")
+            && exp["Days"].as_i64() == Some(1825)
+        {
+            count_with_5y_expiration += 1;
         }
     }
     assert_eq!(

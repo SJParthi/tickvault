@@ -177,9 +177,9 @@ pub fn movers_1s_alter_add_instrument_type_ddl() -> String {
 /// divide-by-zero on freshly-listed contracts).
 ///
 /// **BANNED aggregations** — SUM of volume / SUM of open_interest. Volume
-/// + OI are cumulative per Item 26 L1; summing across buckets
+/// and OI are cumulative per Item 26 L1; summing across buckets
 /// double/triple-counts. Source-scan ratchet
-/// `test_movers_ddl_no_sum_volume_anywhere` enforces.
+/// `test_movers_ddl_no_sum_volume_anywhere` enforces this.
 #[must_use]
 pub fn movers_view_ddl(timeframe: &str) -> String {
     format!(
@@ -224,6 +224,7 @@ pub fn movers_view_ddl(timeframe: &str) -> String {
 ///   1. CREATE the marker table idempotently first (`IF NOT EXISTS`)
 ///   2. SELECT count(*) from it
 ///   3. Parse the JSON body and require `dataset[0][0] >= 1`
+///
 /// Any deviation (HTTP error, parse failure, empty dataset, count = 0) →
 /// safe-fail to "not yet applied" → run the migration.
 ///

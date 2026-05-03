@@ -2646,29 +2646,36 @@ mod tests {
 
     #[test]
     fn test_depth_dynamic_config_rejects_zero_conns() {
-        let mut cfg = DepthDynamicConfig::default();
-        cfg.conns = 0;
+        let cfg = DepthDynamicConfig {
+            conns: 0,
+            ..DepthDynamicConfig::default()
+        };
         assert!(cfg.assert_invariants("depth_20", 5).is_err());
     }
 
     #[test]
     fn test_depth_dynamic_config_rejects_conns_above_cap() {
-        let mut cfg = DepthDynamicConfig::default();
-        cfg.conns = 6;
+        let cfg = DepthDynamicConfig {
+            conns: 6,
+            ..DepthDynamicConfig::default()
+        };
         let err = cfg.assert_invariants("depth_20", 5).unwrap_err();
         assert!(err.to_string().contains("exceeds Dhan cap"));
     }
 
     #[test]
     fn test_depth_dynamic_config_rejects_zero_sids_per_conn() {
-        let mut cfg = DepthDynamicConfig::default();
-        cfg.sids_per_conn = 0;
+        let cfg = DepthDynamicConfig {
+            sids_per_conn: 0,
+            ..DepthDynamicConfig::default()
+        };
         assert!(cfg.assert_invariants("depth_20", 5).is_err());
     }
 
     #[test]
     fn test_depth_dynamic_config_rejects_empty_exchange_segments() {
         let mut cfg = DepthDynamicConfig::default();
+        // .clear() is a method call, not a field reassign — no clippy lint.
         cfg.universe.exchange_segments.clear();
         let err = cfg.assert_invariants("depth_20", 5).unwrap_err();
         assert!(err.to_string().contains("exchange_segments"));
@@ -2676,17 +2683,27 @@ mod tests {
 
     #[test]
     fn test_depth_dynamic_config_rejects_cohort_smaller_than_total_capacity() {
-        let mut cfg = DepthDynamicConfig::default();
         // 5×50 = 250 SIDs needed; cohort 100 must fail.
-        cfg.universe.cohort_size = 100;
+        let cfg = DepthDynamicConfig {
+            universe: DepthDynamicUniverseConfig {
+                cohort_size: 100,
+                ..DepthDynamicConfig::default().universe
+            },
+            ..DepthDynamicConfig::default()
+        };
         let err = cfg.assert_invariants("depth_20", 5).unwrap_err();
         assert!(err.to_string().contains("cohort_size"));
     }
 
     #[test]
     fn test_depth_dynamic_config_rejects_zero_window_secs() {
-        let mut cfg = DepthDynamicConfig::default();
-        cfg.universe.window_secs = 0;
+        let cfg = DepthDynamicConfig {
+            universe: DepthDynamicUniverseConfig {
+                window_secs: 0,
+                ..DepthDynamicConfig::default().universe
+            },
+            ..DepthDynamicConfig::default()
+        };
         assert!(cfg.assert_invariants("depth_20", 5).is_err());
     }
 
@@ -2728,8 +2745,10 @@ mod tests {
 
     #[test]
     fn test_under_provisioned_warning_fires_when_below_cap() {
-        let mut cfg = DepthDynamicConfig::default();
-        cfg.conns = 3;
+        let cfg = DepthDynamicConfig {
+            conns: 3,
+            ..DepthDynamicConfig::default()
+        };
         let warning = cfg.under_provisioned_warning("depth_20", 5).unwrap();
         assert!(warning.contains("conns = 3"));
         assert!(warning.contains("Dhan cap of 5"));
@@ -2740,8 +2759,10 @@ mod tests {
     fn test_under_provisioned_warning_does_not_fire_above_cap() {
         // assert_invariants would have already rejected this; but the
         // soft-check is well-defined and returns None, not a phantom warning.
-        let mut cfg = DepthDynamicConfig::default();
-        cfg.conns = 5;
+        let cfg = DepthDynamicConfig {
+            conns: 5,
+            ..DepthDynamicConfig::default()
+        };
         assert!(cfg.under_provisioned_warning("depth_20", 5).is_none());
     }
 }

@@ -35,8 +35,8 @@ use tracing::{error, info};
 /// Deadline (seconds) for receiving the first depth-200 frame at boot.
 ///
 /// Dhan's depth-200 connections handshake within ~5–10s. Subscribe ack
-/// + first frame typically within another 5s. 60s gives a comfortable
-/// margin without holding back the boot summary too long.
+/// and first frame typically arrive within another 5s. 60s gives a
+/// comfortable margin without holding back the boot summary too long.
 pub const SMOKE_DEADLINE_SECS: u64 = 60;
 
 /// Poll interval (seconds) for the smoke test loop.
@@ -209,6 +209,10 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::modulo_one,
+        reason = "poll-interval ratchet — assertion stays meaningful if interval ever changes from 1"
+    )]
     fn smoke_poll_interval_divides_deadline_cleanly() {
         // Defensive: if the interval doesn't divide, the loop's
         // `saturating_div` rounds down and could exit slightly early.
