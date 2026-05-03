@@ -1,17 +1,18 @@
 // APPROVED: Cat 9 — this IS the canonical movers DDL module per
 // `.claude/plans/active-plan-movers-cleanup.md` (2026-05-01). The legacy
 // `movers_22tf_persistence.rs` was DELETED in this same plan; the file name
-// `movers_unified_persistence.rs` is preserved internally to keep the diff
+// `movers_base_persistence.rs` is preserved internally to keep the diff
 // surgical, but every operator-visible identifier and DDL string now uses
 // the unsuffixed `movers_*` form.
 
-//! Movers base table + 24 materialized views.
+//! Movers base table + 25 materialized views.
 //!
 //! - **Base table** `movers_1s` — single TABLE, 1 Hz cadence, ONE ILP
 //!   writer task in the app.
-//! - **24 materialized views** `movers_{5s,15s,30s,1m,...,1d}` — created at
+//! - **25 materialized views** `movers_{5s,10s,15s,30s,1m,...,1d}` — created at
 //!   boot via `CREATE MATERIALIZED VIEW IF NOT EXISTS`, incrementally
-//!   refreshed server-side by QuestDB.
+//!   refreshed server-side by QuestDB. The `10s` view was added by
+//!   Audit-2026-05-03 for sub-15s movers granularity.
 //! - **DEDUP** on the base: `(ts, security_id, segment)`. Views inherit
 //!   uniqueness via `SAMPLE BY` semantics.
 //!
@@ -53,15 +54,22 @@ pub const DEDUP_KEY_MOVERS_1S: &str = "ts, security_id, segment";
 /// HTTP timeout for DDL probes.
 const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 
-/// The 24 materialized-view timeframes derived from the 1s base.
+/// The 25 materialized-view timeframes derived from the 1s base.
 /// Order is fixed; tests pin both the count and the exact list.
+///
+/// Audit-2026-05-03: added `10s` (between `5s` and `15s`) per operator
+/// spec coverage requirement — finer granularity for sub-15s movers
+/// shifts. Additive, non-destructive: existing QuestDB mat views from
+/// the 24-set are preserved, the new `movers_10s` view is created on
+/// next boot via the standard `CREATE MATERIALIZED VIEW IF NOT EXISTS`
+/// idempotent self-heal (Phase 2 / I-P1-08 schema-upgrade pattern).
 pub const MOVERS_VIEW_TIMEFRAMES: &[&str] = &[
-    "5s", "15s", "30s", "1m", "2m", "3m", "4m", "5m", "6m", "7m", "8m", "9m", "10m", "11m", "12m",
-    "13m", "14m", "15m", "30m", "1h", "2h", "3h", "4h", "1d",
+    "5s", "10s", "15s", "30s", "1m", "2m", "3m", "4m", "5m", "6m", "7m", "8m", "9m", "10m", "11m",
+    "12m", "13m", "14m", "15m", "30m", "1h", "2h", "3h", "4h", "1d",
 ];
 
 /// Pinned count — must equal `MOVERS_VIEW_TIMEFRAMES.len()`.
-pub const MOVERS_VIEW_COUNT: usize = 24;
+pub const MOVERS_VIEW_COUNT: usize = 25;
 
 const _: () = assert!(
     MOVERS_VIEW_TIMEFRAMES.len() == MOVERS_VIEW_COUNT,
@@ -439,10 +447,10 @@ async fn marker_indicates_migration_applied(client: &Client, base_url: &str) -> 
         .is_some_and(|count| count >= 1)
 }
 
-/// Idempotent CREATE for the base table + all 24 mat views. Called once
+/// Idempotent CREATE for the base table + all 25 mat views. Called once
 /// at boot from `main.rs`. Per the schema-self-heal pattern in
 /// `observability-architecture.md` — tolerates partial state from
-/// previous boots.
+/// previous boots. Audit-2026-05-03: count bumped 24 → 25 (added `10s`).
 ///
 /// On any DDL failure: emits `error!` (Loki routes to Telegram via
 /// MOVERS-UNIFIED-05 — wiring deferred).
@@ -535,7 +543,7 @@ pub async fn ensure_movers_tables_and_views(questdb_config: &QuestDbConfig) {
         }
     }
 
-    // Step 2: 24 materialized views — robust loop with DROP-before-CREATE
+    // Step 2: 25 materialized views — robust loop with DROP-before-CREATE
     // (Fix B: defensive against stale state from a prior failed boot),
     // retry-once-on-failure (Fix D: 400 Bad Request can be transient on
     // QuestDB during high-concurrency boot DDL), and structured error-body
@@ -652,18 +660,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_view_count_is_24() {
-        assert_eq!(MOVERS_VIEW_COUNT, 24);
-        assert_eq!(MOVERS_VIEW_TIMEFRAMES.len(), 24);
+    fn test_view_count_is_25() {
+        // Audit-2026-05-03: bumped from 24 → 25 (added "10s" between "5s" and "15s").
+        assert_eq!(MOVERS_VIEW_COUNT, 25);
+        assert_eq!(MOVERS_VIEW_TIMEFRAMES.len(), 25);
     }
 
     #[test]
     fn test_view_timeframes_match_plan_exact_order() {
+        // Audit-2026-05-03: 25-entry list with "10s" inserted at index 1
+        // for sub-15s movers granularity. Order is fixed.
         let expected = [
-            "5s", "15s", "30s", "1m", "2m", "3m", "4m", "5m", "6m", "7m", "8m", "9m", "10m", "11m",
-            "12m", "13m", "14m", "15m", "30m", "1h", "2h", "3h", "4h", "1d",
+            "5s", "10s", "15s", "30s", "1m", "2m", "3m", "4m", "5m", "6m", "7m", "8m", "9m", "10m",
+            "11m", "12m", "13m", "14m", "15m", "30m", "1h", "2h", "3h", "4h", "1d",
         ];
         assert_eq!(MOVERS_VIEW_TIMEFRAMES, &expected);
+    }
+
+    /// Audit-2026-05-03 ratchet: ensure `10s` is present and positioned
+    /// between `5s` and `15s` for monotone-ascending semantics.
+    #[test]
+    fn test_view_timeframes_includes_10s_between_5s_and_15s() {
+        let pos_5s = MOVERS_VIEW_TIMEFRAMES
+            .iter()
+            .position(|t| *t == "5s")
+            .expect("5s missing");
+        let pos_10s = MOVERS_VIEW_TIMEFRAMES
+            .iter()
+            .position(|t| *t == "10s")
+            .expect("10s missing — Audit-2026-05-03 mat-view coverage gap");
+        let pos_15s = MOVERS_VIEW_TIMEFRAMES
+            .iter()
+            .position(|t| *t == "15s")
+            .expect("15s missing");
+        assert!(pos_5s < pos_10s);
+        assert!(pos_10s < pos_15s);
     }
 
     #[test]
@@ -818,7 +849,7 @@ mod tests {
 
     #[test]
     fn test_view_ddl_projects_new_columns_for_every_timeframe() {
-        // Belt-and-suspenders: every one of the 24 timeframes must include
+        // Belt-and-suspenders: every one of the 25 timeframes must include
         // both new precision columns. Catches any future regression where
         // someone duplicates the DDL for a special timeframe and forgets.
         for tf in MOVERS_VIEW_TIMEFRAMES {
@@ -926,7 +957,7 @@ mod tests {
 
     #[test]
     fn test_movers_ddl_no_sum_volume_source_scan() {
-        let src = include_str!("movers_unified_persistence.rs");
+        let src = include_str!("movers_base_persistence.rs");
         let prod_src = src
             .split_once("\n#[cfg(test)]\nmod tests {")
             .map(|(p, _)| p)
@@ -993,9 +1024,34 @@ mod tests {
     }
 
     #[test]
-    fn test_legacy_unified_view_timeframes_match_new_views() {
-        // The pre-rename mat-view timeframes are identical to the new set.
-        assert_eq!(LEGACY_UNIFIED_VIEW_TIMEFRAMES, MOVERS_VIEW_TIMEFRAMES);
+    fn test_legacy_unified_view_timeframes_are_subset_of_new_views() {
+        // Audit-2026-05-03: the canonical mat-view set added `10s`. The
+        // legacy `movers_unified_*` drop list still reflects what existed
+        // pre-rename (24 entries, no `10s` — `movers_unified_10s` never
+        // existed in QuestDB). Assert subset relation: every legacy entry
+        // MUST be in the new set so the DROP migration is well-formed.
+        // Strict equality no longer holds because the new set is a strict
+        // superset post-`10s` addition.
+        for legacy_tf in LEGACY_UNIFIED_VIEW_TIMEFRAMES {
+            assert!(
+                MOVERS_VIEW_TIMEFRAMES.contains(legacy_tf),
+                "LEGACY_UNIFIED_VIEW_TIMEFRAMES contains `{legacy_tf}` \
+                 not present in MOVERS_VIEW_TIMEFRAMES — drop list drift"
+            );
+        }
+        // The new set has exactly ONE more entry than the legacy set:
+        // the `10s` mat view added in Audit-2026-05-03.
+        assert_eq!(
+            MOVERS_VIEW_TIMEFRAMES.len(),
+            LEGACY_UNIFIED_VIEW_TIMEFRAMES.len() + 1,
+            "new mat-view set should be exactly +1 (the new `10s` view) \
+             vs legacy unified drop list"
+        );
+        let new_only: Vec<&&str> = MOVERS_VIEW_TIMEFRAMES
+            .iter()
+            .filter(|tf| !LEGACY_UNIFIED_VIEW_TIMEFRAMES.contains(tf))
+            .collect();
+        assert_eq!(new_only, vec![&"10s"], "the only new entry must be `10s`");
     }
 
     #[test]
@@ -1014,16 +1070,24 @@ mod tests {
             .copied()
             .filter(|tf| !MOVERS_VIEW_TIMEFRAMES.contains(tf))
             .collect();
-        // From the live boot of PR #421's first deploy, these are the
-        // five 22tf names not represented in the new mat-view set:
-        //   1s (the new BASE table — not a view, audit must exclude it)
-        //   2s, 3s, 10s, 20s (sub-minute names dropped from new design)
-        for expected in ["1s", "2s", "3s", "10s", "20s"] {
+        // Audit-2026-05-03: `10s` was promoted to the canonical mat-view
+        // set, so it is no longer in the "legacy-22tf-only" subset. The
+        // remaining 4 names (1s, 2s, 3s, 20s) are still legacy-only:
+        //   1s (the new BASE table — not a view, audit must exclude it
+        //       via the QUESTDB_TABLE_MOVERS_1S filter)
+        //   2s, 3s, 20s (sub-minute names dropped from canonical design)
+        for expected in ["1s", "2s", "3s", "20s"] {
             assert!(
                 legacy_only.contains(&expected),
                 "legacy-22tf-only set must contain `{expected}` (got: {legacy_only:?})"
             );
         }
+        // Negative pin: `10s` is canonical, NOT legacy-only.
+        assert!(
+            !legacy_only.contains(&"10s"),
+            "legacy-22tf-only set MUST NOT contain `10s` after Audit-2026-05-03 \
+             promoted it to the canonical mat-view set"
+        );
     }
 
     #[test]
@@ -1049,13 +1113,23 @@ mod tests {
             !candidate_names.iter().any(|n| n == QUESTDB_TABLE_MOVERS_1S),
             "audit candidate set must NOT include the new base table `{QUESTDB_TABLE_MOVERS_1S}`"
         );
-        // Sanity: the other 22tf-only names ARE still candidates.
-        for expected_stale in ["movers_2s", "movers_3s", "movers_10s", "movers_20s"] {
+        // Audit-2026-05-03: `10s` was promoted to canonical, so
+        // `movers_10s` is no longer a stale-table candidate. The other
+        // legacy-only sub-minute names (2s, 3s, 20s) still are.
+        for expected_stale in ["movers_2s", "movers_3s", "movers_20s"] {
             assert!(
                 candidate_names.iter().any(|n| n == expected_stale),
                 "audit candidate set must still include `{expected_stale}` (got: {candidate_names:?})"
             );
         }
+        // Negative pin: `movers_10s` MUST NOT be in the audit candidate
+        // set after the promotion — otherwise the cleanup migration
+        // would attempt to DROP the new canonical mat view.
+        assert!(
+            !candidate_names.iter().any(|n| n == "movers_10s"),
+            "audit candidate set MUST NOT include `movers_10s` after Audit-2026-05-03 \
+             promoted it to the canonical mat-view set"
+        );
     }
 
     #[test]
@@ -1080,8 +1154,8 @@ mod tests {
         // Fix C's post-verify loop iterates MOVERS_VIEW_TIMEFRAMES; the
         // count drives the operator-visible "missing X of N" log. Pin
         // the invariant so a future timeframe addition can't silently
-        // skew the audit.
+        // skew the audit. Audit-2026-05-03: bumped from 24 → 25.
         assert_eq!(MOVERS_VIEW_TIMEFRAMES.len(), MOVERS_VIEW_COUNT);
-        assert_eq!(MOVERS_VIEW_COUNT, 24);
+        assert_eq!(MOVERS_VIEW_COUNT, 25);
     }
 }

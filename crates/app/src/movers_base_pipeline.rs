@@ -56,7 +56,7 @@ use tickvault_common::constants::{
 use tickvault_common::instrument_registry::InstrumentRegistry;
 use tickvault_common::tick_types::ParsedTick;
 use tickvault_common::types::ExchangeSegment;
-use tickvault_storage::movers_unified_writer::{MoversRow, MoversWriter, segment_code_to_char};
+use tickvault_storage::movers_base_writer::{MoversRow, MoversWriter, segment_code_to_char};
 
 /// Drain cadence — 1 second per the plan §"Item 25" base-1s table.
 const DRAIN_INTERVAL_MS: u64 = 1_000;
@@ -128,7 +128,7 @@ fn now_ist_aligned_to_1s_nanos() -> i64 {
     (raw / 1_000_000_000) * 1_000_000_000
 }
 
-/// Spawns the movers_unified base-1s writer task. Returns the
+/// Spawns the movers base-1s writer task. Returns the
 /// `JoinHandle` for the supervisor to keep alive.
 ///
 /// Behavior:

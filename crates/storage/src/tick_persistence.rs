@@ -8,7 +8,9 @@
 //! - `ticks` — every tick stored with security_id, segment, OHLCV, OI, etc.
 //!
 //! # Idempotency
-//! DEDUP UPSERT KEYS on `(ts, security_id)` prevent duplicate ticks on reconnect.
+//! DEDUP UPSERT KEYS on `(ts, security_id, segment)` prevent duplicate ticks
+//! on reconnect AND prevent cross-segment collision (STORAGE-GAP-01 + I-P1-11:
+//! same `security_id` is reused by Dhan across `IDX_I` / `NSE_EQ` / `NSE_FNO`).
 //!
 //! # Error Handling & Zero-Tick-Loss Guarantee
 //! On QuestDB failure, ticks are held in a bounded ring buffer
@@ -44,9 +46,22 @@ use tickvault_common::tick_types::{MarketDepthLevel, ParsedTick};
 /// Timeout for QuestDB DDL HTTP requests.
 const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 
-/// DEDUP UPSERT KEY for the `ticks` table.
-/// STORAGE-GAP-01: Must include segment to prevent cross-segment collision
-/// (same security_id can exist on NSE_EQ and BSE_EQ).
+/// DEDUP UPSERT KEY columns for the `ticks` table — the columns that come
+/// AFTER `ts` in the actual `UPSERT KEYS(...)` clause. The DDL builder at
+/// `setup_tick_tables` formats this as
+/// `ALTER TABLE ticks DEDUP ENABLE UPSERT KEYS(ts, {DEDUP_KEY_TICKS})`,
+/// producing the full key `(ts, security_id, segment)`.
+///
+/// **Why `segment` is mandatory** (STORAGE-GAP-01 + I-P1-11):
+/// Dhan reuses the same numeric `security_id` across exchange segments
+/// (e.g. `security_id = 13` is `NIFTY` on `IDX_I` AND a stock on `NSE_EQ`).
+/// Without `segment` in the key, two LEGITIMATELY DISTINCT ticks at the same
+/// `ts` would silently UPSERT each other and one segment's data would be lost.
+/// The composite `(ts, security_id, segment)` is the ONLY uniqueness
+/// guarantee — `security_id` alone is NOT unique.
+///
+/// Enforced by `dedup_segment_meta_guard.rs` (workspace-wide constant scan)
+/// + `test_tick_dedup_key_includes_segment` (STORAGE-GAP-01 integration test).
 const DEDUP_KEY_TICKS: &str = "security_id, segment";
 
 /// Returns the DEDUP UPSERT KEY string for the ticks table.

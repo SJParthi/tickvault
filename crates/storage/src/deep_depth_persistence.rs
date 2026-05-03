@@ -77,10 +77,27 @@ pub async fn ensure_deep_depth_table(questdb_config: &QuestDbConfig) {
         questdb_config.host, questdb_config.http_port
     );
 
-    let client = Client::builder()
+    // Audit-2026-05-03 M3: TLS-init failure on the bounded HTTP client
+    // previously fell back to `Client::new()` SILENTLY, leaving the boot
+    // path with a default-config client (no timeout, possibly different
+    // TLS stack). Now we log ERROR before falling back so Loki routes
+    // the failure to Telegram per audit-findings-2026-04-17.md Rule 5.
+    let client = match Client::builder()
         .timeout(Duration::from_secs(QUESTDB_DDL_TIMEOUT_SECS))
         .build()
-        .unwrap_or_else(|_| Client::new());
+    {
+        Ok(c) => c,
+        Err(err) => {
+            error!(
+                ?err,
+                "deep_depth DDL: TLS-configured HTTP client build failed — \
+                 falling back to default Client::new() (no timeout). \
+                 Boot will continue but DDL may hang on slow/broken QuestDB. \
+                 Investigate TLS provider + system roots."
+            );
+            Client::new()
+        }
+    };
 
     execute_ddl(
         &client,
