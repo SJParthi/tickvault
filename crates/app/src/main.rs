@@ -2698,7 +2698,7 @@ async fn main() -> Result<()> {
             let prev_oi_cache: std::sync::Arc<std::collections::HashMap<(u32, u8), i64>> =
                 std::sync::Arc::new(std::collections::HashMap::new());
             warn!(
-                code = "PREVOI-01",
+                code = tickvault_common::error_code::ErrorCode::PrevOi01CacheEmptyAtBoot.code_str(),
                 "prev_oi cache EMPTY at boot — /api/movers OI Change column will display \
                  `current_OI - 0 = current_OI` until PR #452 wires the bhavcopy + \
                  Option Chain prev_oi loader. Operators must NOT trust the OI Change \
