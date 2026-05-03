@@ -2709,11 +2709,20 @@ async fn main() -> Result<()> {
         // not built — typically a boot path that doesn't load instruments).
         let movers_base_shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
         let _movers_base_handle = if let Some(registry) = slow_registry.as_ref() {
+            // PR #450 commit 2 (2026-05-03): empty prev_oi cache for now.
+            // Commit 3 will wire in the bhavcopy-loaded cache populating
+            // (security_id, segment) → prev-session-close OI for all
+            // NSE_FNO derivatives. Empty Arc<HashMap> means OI Change
+            // computes as `current - 0 = current` for now (Dhan-precise
+            // values arrive once commit 3 ships the loader).
+            let prev_oi_cache: std::sync::Arc<std::collections::HashMap<(u32, u8), i64>> =
+                std::sync::Arc::new(std::collections::HashMap::new());
             Some(tickvault_app::movers_base_pipeline::spawn_movers_pipeline(
                 config.questdb.clone(),
                 tick_broadcast_sender.clone(),
                 std::sync::Arc::clone(&movers_base_shutdown),
                 std::sync::Arc::clone(registry),
+                prev_oi_cache,
             ))
         } else {
             warn!(

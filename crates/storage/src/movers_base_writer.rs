@@ -77,6 +77,19 @@ pub struct MoversRow {
     /// Zero when `prev_close <= 0` (defensive — mat views recompute
     /// with a `CASE WHEN prev_close > 0` guard).
     pub change_pct: f64,
+    /// PR #450 (2026-05-03): previous-session-close OI baseline.
+    /// Required for Dhan-parity `OI Change` and `OI Change %` columns
+    /// shown on Markets > Options view.
+    /// Source for NSE_FNO derivatives: NSE bhavcopy `OpnIntrst` (col 22)
+    /// loaded into the `prev_oi_cache` at boot.
+    /// Source for IDX_I: Dhan WS PrevClose packet code 6 bytes 12-15.
+    /// Sentinel `0` for instruments with no prev_oi (equities/indices).
+    pub prev_oi: i64,
+    /// PR #450 (2026-05-03): derivative-contract expiry as IST midnight
+    /// epoch nanoseconds. Enables `?expiry=YYYY-MM-DD` filter on the
+    /// new `/api/movers` endpoint matching Dhan's middle dropdown.
+    /// `0` for non-derivative rows (equities + indices).
+    pub expiry_date_ist_nanos: i64,
     /// Wall-clock arrival timestamp (IST nanoseconds, set by the
     /// pipeline at drain time).
     pub received_at_nanos: i64,
@@ -200,6 +213,8 @@ impl MoversWriter {
             .context("open_interest")?
             .column_i64("oi_delta", row.oi_delta)
             .context("oi_delta")?
+            .column_i64("prev_oi", row.prev_oi)
+            .context("prev_oi")?
             .column_i64("volume", row.volume)
             .context("volume")?
             .column_f64("last_price", row.last_price)
@@ -208,6 +223,11 @@ impl MoversWriter {
             .context("prev_close")?
             .column_f64("change_pct", row.change_pct)
             .context("change_pct")?
+            .column_ts(
+                "expiry_date_ist",
+                TimestampNanos::new(row.expiry_date_ist_nanos),
+            )
+            .context("expiry_date_ist")?
             .column_ts("received_at", TimestampNanos::new(row.received_at_nanos))
             .context("received_at")?
             .at(TimestampNanos::new(row.ts_nanos))
@@ -322,16 +342,22 @@ mod tests {
     }
 
     #[test]
-    fn test_movers_unified_row_struct_size_under_128_bytes() {
-        // Defensive: 10 scalars + 1 char + 2 `&'static str` (16 bytes each)
-        // + alignment padding ≤ 128 bytes. Catch struct bloat early.
-        // Drain cadence is 1 Hz (cold path), so ~120 bytes × 25K instruments
-        // = 3 MB per cycle — acceptable. Budget bumped from 96 to 128 on
-        // 2026-05-02 PR-B (added `exchange_segment` + `instrument_type`
-        // for movers selector precision).
+    fn test_movers_unified_row_struct_size_under_160_bytes() {
+        // Defensive: scalars + 1 char + 3 `&'static str` (16 bytes each)
+        // + alignment padding ≤ 160 bytes. Catch struct bloat early.
+        // Drain cadence is 1 Hz (cold path), so ~150 bytes × 25K instruments
+        // = ~4 MB per cycle — acceptable.
+        // Budget bump history:
+        //   96  → 128 (PR-B 2026-05-02): added `exchange_segment` +
+        //                                 `instrument_type` for selector precision.
+        //   128 → 160 (PR #450 2026-05-03): added `prev_oi` (i64) +
+        //                                   `expiry_date_ist_nanos` (i64) for
+        //                                   Dhan-parity OI Change /
+        //                                   OI Change % calculations and
+        //                                   ?expiry filter on /api/movers.
         let size = std::mem::size_of::<MoversRow>();
         assert!(
-            size <= 128,
+            size <= 160,
             "MoversRow size {size} bytes exceeded budget — review schema"
         );
     }
