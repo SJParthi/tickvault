@@ -134,7 +134,7 @@ pub fn build_category_targets(cat: LogCategory) -> &'static [&'static str] {
             "tickvault_storage::movers_persistence",
             "tickvault_storage::movers_base_persistence",
             "tickvault_storage::movers_base_query",
-            "tickvault_storage::movers_base_writer",
+            "tickvault_storage::movers_writer",
         ],
         LogCategory::Candles => &[
             "tickvault_core::pipeline::candle_aggregator",
@@ -1277,7 +1277,7 @@ mod tests {
             "tickvault_storage::movers_persistence",
             "tickvault_storage::movers_base_persistence",
             "tickvault_storage::movers_base_query",
-            "tickvault_storage::movers_base_writer",
+            "tickvault_storage::movers_writer",
         ];
         for e in expected {
             assert!(

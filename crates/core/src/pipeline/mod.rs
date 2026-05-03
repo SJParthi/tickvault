@@ -16,7 +16,7 @@ pub mod no_tick_watchdog;
 pub mod option_movers;
 // `preopen_movers` retired 2026-05-03 — its functionality (phase=PREOPEN
 // rows during 09:00-09:13 IST) was folded into the canonical
-// `movers_1s.phase` SYMBOL column populated by `movers_base_pipeline`.
+// `movers_1s.phase` SYMBOL column populated by `movers_pipeline`.
 // The legacy `stock_movers` table it wrote into is dropped by the
 // one-shot migration in `movers_base_persistence`.
 pub mod prev_close_persist;

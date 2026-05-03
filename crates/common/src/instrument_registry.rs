@@ -112,7 +112,7 @@ impl SubscribedInstrument {
     /// - `category = StockEquity` → `"EQUITY"`
     /// - all other (defensive) → `"UNKNOWN"`
     ///
-    /// Used by `movers_base_pipeline` to populate the `instrument_type`
+    /// Used by `movers_pipeline` to populate the `instrument_type`
     /// SYMBOL column on `movers_1s` so downstream selectors (depth-20 /
     /// depth-200 dynamic top-volume) can filter by precise classification
     /// (`OPTSTK` only, `FUTIDX` only, etc.) without an additional registry
@@ -622,7 +622,7 @@ mod tests {
     }
 
     // 2026-05-02 PR-B: ratchet tests for `instrument_type_tag` — the
-    // helper used by `movers_base_pipeline` to populate the
+    // helper used by `movers_pipeline` to populate the
     // `instrument_type` SYMBOL column on `movers_1s`. Pins the operator's
     // 4-bucket classification: INDEX / EQUITY / FUTIDX|FUTSTK|FUTCOM|FUTCUR
     // / OPTIDX|OPTSTK|OPTFUT|OPTCUR.

@@ -2648,7 +2648,7 @@ async fn main() -> Result<()> {
         // Audit-2026-05-03: legacy `StockMoversWriter` + `OptionMoversWriter`
         // RETIRED. Their target tables (`stock_movers` + `option_movers`)
         // are subsumed by the canonical `movers_1s` + 25 mat views
-        // populated by `movers_base_pipeline`. Frontend queries should
+        // populated by `movers_pipeline`. Frontend queries should
         // filter by `instrument_type` against the `movers_*` views
         // instead of reading the legacy per-category tables.
         // Passing `None` preserves the `run_tick_processor` signature
@@ -2667,7 +2667,7 @@ async fn main() -> Result<()> {
             .map(|p| std::sync::Arc::new(p.registry.clone()));
 
         // PR #450 commit 6 (2026-05-03): V2 movers pipeline DELETED.
-        // Superseded by movers_base_pipeline (below) which writes
+        // Superseded by movers_pipeline (below) which writes
         // movers_1s + 25 mat views — read via the new unified
         // /api/movers handler.
 
@@ -2704,7 +2704,7 @@ async fn main() -> Result<()> {
                  Option Chain prev_oi loader. Operators must NOT trust the OI Change \
                  + OI Change % columns until then."
             );
-            Some(tickvault_app::movers_base_pipeline::spawn_movers_pipeline(
+            Some(tickvault_app::movers_pipeline::spawn_movers_pipeline(
                 config.questdb.clone(),
                 tick_broadcast_sender.clone(),
                 std::sync::Arc::clone(&movers_base_shutdown),
@@ -2712,9 +2712,7 @@ async fn main() -> Result<()> {
                 prev_oi_cache,
             ))
         } else {
-            warn!(
-                "movers_base_pipeline NOT spawned — slow_registry is None (subscription_plan absent)"
-            );
+            warn!("movers_pipeline NOT spawned — slow_registry is None (subscription_plan absent)");
             None
         };
 
@@ -4593,7 +4591,7 @@ async fn main() -> Result<()> {
             // Audit-2026-05-03: legacy `preopen_movers_universe` clone
             // removed — PreopenMoversTracker retired, its phase=PREOPEN
             // snapshot semantics now live in `movers_1s.phase` populated
-            // by `movers_base_pipeline`.
+            // by `movers_pipeline`.
             // Wave 5 commit 5: rebalance consumer needs universe to
             // compute single-side ATM ± 24 windows for Swap20 fan-out
             // to NIFTY-CE / NIFTY-PE / BANKNIFTY-CE / BANKNIFTY-PE
