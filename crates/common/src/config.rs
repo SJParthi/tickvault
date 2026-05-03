@@ -148,6 +148,24 @@ impl DepthDynamicConfig {
                  audit-2026-05-03 operator clarification"
             );
         }
+        // Audit-2026-05-03 PR #447 — hostile-bug-hunt M2 fix: cap
+        // `min_liquidity_volume` at `i64::MAX as u64` to prevent the
+        // operator-misconfig path where a value > QuestDB LONG range
+        // produces a structurally-unsatisfiable SQL predicate
+        // (`volume >= 18446744073709551615`) → zero-row cohort EVERY
+        // cycle → `next_set` empty forever → silent depth-subscription
+        // outage. The QuestDB `volume` column is a LONG (i64) so any
+        // value above `i64::MAX` cannot match a real row.
+        const MAX_LIQUIDITY_VOLUME: u64 = i64::MAX as u64;
+        if self.universe.min_liquidity_volume > MAX_LIQUIDITY_VOLUME {
+            bail!(
+                "{label}.dynamic.universe.min_liquidity_volume = {} exceeds QuestDB LONG range cap of {} \
+                 — values above i64::MAX produce a structurally-unsatisfiable SQL predicate \
+                 → zero-row cohort forever. Typical floors are 10_000-100_000.",
+                self.universe.min_liquidity_volume,
+                MAX_LIQUIDITY_VOLUME,
+            );
+        }
         if self.universe.window_secs == 0 {
             bail!("{label}.dynamic.universe.window_secs must be > 0");
         }
@@ -198,7 +216,17 @@ pub struct DepthDynamicUniverseConfig {
     /// fall back to `default_min_liquidity_volume()` rather than
     /// failing figment deserialisation. Audit-2026-05-03
     /// security-reviewer LOW #2 — defensive hardening.
-    #[serde(default = "default_min_liquidity_volume")]
+    ///
+    /// Audit-2026-05-03 PR #447 — hostile-bug-hunt M1 fix: also
+    /// accept the legacy field name `cohort_size` via `serde(alias)`.
+    /// Operators with pre-#445 environment override files (which had
+    /// `cohort_size = 500`) will now have that value parsed into
+    /// `min_liquidity_volume = 500` instead of silently falling back
+    /// to the default. The boot-time `assert_invariants` will then
+    /// catch the unrealistically-low value (< MIN_LIQUIDITY_VOLUME_FLOOR
+    /// after the threshold check) and bail with a clear error pointing
+    /// the operator to the new field name + valid range.
+    #[serde(default = "default_min_liquidity_volume", alias = "cohort_size")]
     pub min_liquidity_volume: u64,
     /// Re-rank metric. Reserved for future use; `select_top_k_dynamic`
     /// always sorts by `change_pct DESC`.
@@ -2758,6 +2786,71 @@ mod tests {
             ..DepthDynamicConfig::default()
         };
         assert!(cfg.assert_invariants("depth_20", 5).is_ok());
+    }
+
+    /// Audit-2026-05-03 PR #447 (hostile-bug-hunt M1 fix) ratchet:
+    /// the `cohort_size` legacy field name MUST still parse via
+    /// `serde(alias)` so pre-#445 environment override files don't
+    /// silently fall back to the default. The aliased value lands in
+    /// `min_liquidity_volume` and goes through `assert_invariants`.
+    #[test]
+    fn test_depth_dynamic_universe_config_accepts_legacy_cohort_size_via_alias() {
+        use figment::Figment;
+        use figment::providers::{Format, Toml};
+
+        // Operator has a stale config with `cohort_size = 100_000`
+        // (pre-#445 naming). Should parse into min_liquidity_volume.
+        let toml = r#"
+            exchange_segments = ["NSE_FNO"]
+            cohort_size = 100000
+            window_secs = 60
+        "#;
+        let cfg: DepthDynamicUniverseConfig = Figment::new()
+            .merge(Toml::string(toml))
+            .extract()
+            .expect("legacy cohort_size alias must parse");
+        assert_eq!(
+            cfg.min_liquidity_volume, 100_000,
+            "cohort_size value must land in min_liquidity_volume via serde alias"
+        );
+    }
+
+    /// Audit-2026-05-03 PR #447 (hostile-bug-hunt M2 fix) ratchet:
+    /// `min_liquidity_volume` MUST be capped at `i64::MAX as u64`
+    /// because the QuestDB `volume` column is LONG (i64) — values
+    /// above this produce a structurally-unsatisfiable SQL predicate.
+    #[test]
+    fn test_depth_dynamic_config_rejects_min_liquidity_volume_above_i64_max() {
+        let cfg = DepthDynamicConfig {
+            universe: DepthDynamicUniverseConfig {
+                // u64::MAX is ~2x i64::MAX — must reject
+                min_liquidity_volume: u64::MAX,
+                ..DepthDynamicConfig::default().universe
+            },
+            ..DepthDynamicConfig::default()
+        };
+        let err = cfg.assert_invariants("depth_20", 5).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exceeds QuestDB LONG range cap"),
+            "must reject u64::MAX with explicit error, got: {msg}"
+        );
+    }
+
+    /// Boundary test: i64::MAX as u64 (exactly the cap) MUST be accepted.
+    #[test]
+    fn test_depth_dynamic_config_accepts_min_liquidity_volume_at_i64_max() {
+        let cfg = DepthDynamicConfig {
+            universe: DepthDynamicUniverseConfig {
+                min_liquidity_volume: i64::MAX as u64,
+                ..DepthDynamicConfig::default().universe
+            },
+            ..DepthDynamicConfig::default()
+        };
+        assert!(
+            cfg.assert_invariants("depth_20", 5).is_ok(),
+            "i64::MAX boundary must be acceptable"
+        );
     }
 
     /// Audit-2026-05-03: redesign retired the `cohort_size` field +
