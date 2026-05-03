@@ -158,11 +158,11 @@ pub fn spawn_depth_dynamic_pool(
         let mut state = DynamicSubscriptionState::new(cfg.shape);
         // 2026-05-02 — operator-requested wall-clock alignment. Replace
         // boot-aligned `tokio::time::interval(60s)` with `interval_at`
-        // anchored to today's 09:15:01 IST (or "now" if already past).
+        // anchored to today's 09:15:00 IST (or "now" if already past).
         // Without this fix, a boot at 08:50:30 IST would tick at
         // 08:51:30, 08:52:30, …, 09:14:30, then 09:15:30 — missing the
         // critical 09:15:00→09:15:30 window where movers_1s first
-        // populates. Operator's spec: "at 09:15:01 it should be
+        // populates. Operator's spec: "at 09:15:00 it should be
         // captured and started — should not wait till 09:16".
         let first_cycle_at = compute_first_cycle_instant_today();
         let mut tick =
@@ -192,12 +192,12 @@ pub fn spawn_depth_dynamic_pool(
         let mut last_seen_ist_day = current_ist_trading_day();
 
         // 2026-05-02 — operator-requested two-phase cadence. First tick
-        // of each trading day fires at 09:15:01 IST (initial subscribe);
+        // of each trading day fires at 09:15:00 IST (initial subscribe);
         // every subsequent tick fires at the next :00 minute boundary
         // (09:16:00, 09:17:00, …). `realigned_to_minute` flips true
         // after the first in-market cycle dispatches, triggering the
         // interval reset to the minute-boundary schedule. Reset to
-        // false on daily-rollover so tomorrow's 09:15:01 fires the
+        // false on daily-rollover so tomorrow's 09:15:00 fires the
         // special first cycle again.
         let mut realigned_to_minute = false;
 
@@ -260,12 +260,12 @@ pub fn spawn_depth_dynamic_pool(
                             previous = last_seen_ist_day,
                             current = today_ist,
                             "depth_dynamic_pool_v2 IST midnight rollover — resetting diff state \
-                             + re-aligning interval to today's 09:15:01"
+                             + re-aligning interval to today's 09:15:00"
                         );
                         state = DynamicSubscriptionState::new(cfg.shape);
                         last_seen_ist_day = today_ist;
                         // 2026-05-02 — re-align the interval to today's
-                        // 09:15:01 IST so the first cycle each day fires
+                        // 09:15:00 IST so the first cycle each day fires
                         // exactly at market open + 1s, not boot-time-aligned.
                         // Without this, the schedule drifts off the wall
                         // clock day-by-day (interval ticks every 60s
@@ -279,10 +279,10 @@ pub fn spawn_depth_dynamic_pool(
                         );
                         // Reset the minute-boundary realignment flag so
                         // tomorrow's first cycle fires at the special
-                        // 09:15:01 anchor, then re-aligns to :00 boundaries.
+                        // 09:15:00 anchor, then re-aligns to :00 boundaries.
                         realigned_to_minute = false;
                         // Skip the rest of this cycle — next tick.tick()
-                        // will fire at today's 09:15:01.
+                        // will fire at today's 09:15:00.
                         continue;
                     }
                     let cohort = match fetch_cohort_from_questdb(&cfg).await {
@@ -472,11 +472,11 @@ pub fn spawn_depth_dynamic_pool(
 
                     // 2026-05-02 — operator-requested cadence transition.
                     // After the FIRST in-market cycle dispatches (at
-                    // 09:15:01), re-anchor the interval to the next
+                    // 09:15:00), re-anchor the interval to the next
                     // wall-clock minute boundary so subsequent cycles
                     // fire at 09:16:00, 09:17:00, … instead of
                     // 09:16:01, 09:17:01, … (the natural drift of
-                    // interval_at(09:15:01, 60s)).
+                    // interval_at(09:15:00, 60s)).
                     if !realigned_to_minute {
                         let next_minute = compute_next_minute_boundary_instant();
                         info!(
@@ -915,20 +915,20 @@ fn current_ist_trading_day() -> i64 {
 /// Wall-clock target for the FIRST selection cycle of each trading
 /// day: 09:15:00 IST per operator clarification 2026-05-03.
 ///
-/// Earlier 09:15:01 was over-engineering — movers compute per-tick
+/// Earlier 09:15:00 was over-engineering — movers compute per-tick
 /// (not averaged), so the F&O opening tick at 09:15:00 IS the highest-
 /// information `change_pct` of the day and MUST be captured. Aligns
 /// with the exchange's stated MARKET start (09:15:00).
 const FIRST_CYCLE_SECS_OF_DAY_IST: u32 = 9 * 3600 + 15 * 60;
 
-/// 2026-05-02 — operator-requested cadence:
-///   * Tick 1 at 09:15:01 IST (initial subscribe — uses
-///     `compute_first_cycle_instant_today`)
+/// Operator-requested cadence (audit-2026-05-03 boundary update):
+///   * Tick 1 at 09:15:00 IST (initial subscribe — uses
+///     `compute_first_cycle_instant_today`). Captures F&O opening tick.
 ///   * Tick 2 at 09:16:00 IST (first minute-aligned re-rebalance)
 ///   * Tick 3 at 09:17:00 IST
 ///   * Tick N at 09:14+N:00 IST
 ///
-/// After the first cycle fires at 09:15:01, the interval is re-anchored
+/// After the first cycle fires at 09:15:00, the interval is re-anchored
 /// to the next minute boundary so subsequent ticks land on `:00`
 /// seconds — matching the operator's stated "from 9.16.00 dynamic
 /// movement should happen" cadence.
@@ -956,16 +956,16 @@ fn compute_next_minute_boundary_instant() -> tokio::time::Instant {
 
 /// 2026-05-02 — operator-requested first-cycle alignment.
 ///
-/// Returns a `tokio::time::Instant` for the next 09:15:01 IST anchor
+/// Returns a `tokio::time::Instant` for the next 09:15:00 IST anchor
 /// point. Behaviour:
-///   * Pre-09:15:01 today → returns Instant for today's 09:15:01
-///   * Post-09:15:01 today → returns `Instant::now()` so the first
+///   * Pre-09:15:00 today → returns Instant for today's 09:15:00
+///   * Post-09:15:00 today → returns `Instant::now()` so the first
 ///     `tick.tick().await` fires immediately (boot-after-market-open
 ///     case, e.g. crash recovery at 11:30 IST)
 ///
 /// Combined with `tokio::time::interval_at(start, 60s)`, the first
 /// selection cycle of each day fires within OS-scheduler latency
-/// (~1ms typical) of 09:15:01 IST, eliminating the up-to-60-second
+/// (~1ms typical) of 09:15:00 IST, eliminating the up-to-60-second
 /// blind spot the legacy boot-aligned `interval(60s)` introduced.
 ///
 /// Subsequent ticks fire at +60s, +120s, …; daily-rollover handler
@@ -1149,7 +1149,7 @@ mod tests {
     }
 
     /// Audit-2026-05-03 (operator clarification): first cycle pinned
-    /// at 09:15:00 IST (was 09:15:01). The F&O opening tick MUST be
+    /// at 09:15:00 IST (was 09:15:00). The F&O opening tick MUST be
     /// captured — it carries the highest-information change_pct of
     /// the day. Aligns with movers MARKET start (09:15:00) and the
     /// exchange's stated MARKET window boundary.
@@ -1192,7 +1192,7 @@ mod tests {
     }
 
     /// Operator-requested cadence: minute-boundary alignment AFTER the
-    /// first 09:15:01 cycle. The helper must return an Instant that is
+    /// first 09:15:00 cycle. The helper must return an Instant that is
     /// 1..=60 seconds away from now — never zero, never more than 60.
     #[test]
     fn test_compute_next_minute_boundary_instant_within_one_minute_window() {
