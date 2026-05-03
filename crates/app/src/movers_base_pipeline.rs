@@ -94,6 +94,51 @@ fn is_within_market_hours_ist() -> bool {
     (TICK_PERSIST_START_SECS_OF_DAY_IST..TICK_PERSIST_END_SECS_OF_DAY_IST).contains(&sec_of_day)
 }
 
+/// IST seconds-of-day boundaries for session phases. The market-hours
+/// `[09:00, 15:30)` window already gates the drain entirely; this helper
+/// further classifies the in-window time into PREOPEN / MARKET /
+/// POSTMARKET so the legacy `PreopenMoversTracker` semantics survive
+/// in `movers_1s.phase`.
+const PREOPEN_END_SECS_OF_DAY_IST: u32 = 9 * 3600 + 13 * 60; // 09:13:00
+const MARKET_START_SECS_OF_DAY_IST: u32 = 9 * 3600 + 15 * 60; // 09:15:00
+const MARKET_END_SECS_OF_DAY_IST: u32 = 15 * 3600 + 30 * 60; // 15:30:00
+const POSTMARKET_END_SECS_OF_DAY_IST: u32 = 15 * 3600 + 40 * 60; // 15:40:00
+
+/// Audit-2026-05-03: pure function — IST sec-of-day → session phase
+/// `&'static str`. Folds in the legacy `STOCK_MOVERS_PHASE_*` constants:
+///
+/// - `[09:00, 09:13)` → `"PREOPEN"`
+/// - `[09:15, 15:30)` → `"MARKET"` (gap 09:13-09:15 is no-write per
+///   existing market-hours gate; the drain doesn't reach this fn there)
+/// - `[15:30, 15:40)` → `"POSTMARKET"`
+/// - anything else → `"UNKNOWN"` (defensive — shouldn't reach drain)
+///
+/// Pure, O(1), zero allocation. Returns `&'static str` for `MoversRow`.
+#[inline]
+#[must_use]
+pub fn compute_session_phase(sec_of_day: u32) -> &'static str {
+    if (TICK_PERSIST_START_SECS_OF_DAY_IST..PREOPEN_END_SECS_OF_DAY_IST).contains(&sec_of_day) {
+        "PREOPEN"
+    } else if (MARKET_START_SECS_OF_DAY_IST..MARKET_END_SECS_OF_DAY_IST).contains(&sec_of_day) {
+        "MARKET"
+    } else if (MARKET_END_SECS_OF_DAY_IST..POSTMARKET_END_SECS_OF_DAY_IST).contains(&sec_of_day) {
+        "POSTMARKET"
+    } else {
+        "UNKNOWN"
+    }
+}
+
+/// Wall-clock-driven phase resolver. Calls `Utc::now()` and routes
+/// through `compute_session_phase`.
+#[inline]
+#[must_use]
+fn current_session_phase() -> &'static str {
+    let now_utc = Utc::now().timestamp();
+    let now_ist = now_utc.saturating_add(i64::from(IST_UTC_OFFSET_SECONDS));
+    let sec_of_day = (now_ist.rem_euclid(i64::from(SECONDS_PER_DAY))) as u32;
+    compute_session_phase(sec_of_day)
+}
+
 /// 2026-05-02 PR-B: Resolves `(exchange_segment, instrument_type)` for a
 /// `(security_id, segment_code)` tuple via the InstrumentRegistry composite
 /// key per I-P1-11. Returns `("UNKNOWN", "UNKNOWN")` when the registry has
@@ -243,6 +288,11 @@ pub fn spawn_movers_pipeline(
                     let ts_nanos = now_ist_aligned_to_1s_nanos();
 
                     let mut written = 0_u64;
+                    // Audit-2026-05-03: resolve session phase ONCE per
+                    // drain cycle (1s cadence) — pure function call,
+                    // applies to every row in this drain. Zero alloc:
+                    // returns `&'static str`.
+                    let phase = current_session_phase();
                     // O(1) EXEMPT: drain iterates the universe (~11K)
                     // once per second. Allocation budget: zero (HashMap
                     // entries are mutated in-place via .iter_mut() to
@@ -271,6 +321,7 @@ pub fn spawn_movers_pipeline(
                             segment_char,
                             exchange_segment,
                             instrument_type,
+                            phase,
                             open_interest: i64::from(st.open_interest),
                             oi_delta,
                             volume: i64::from(st.volume),
@@ -402,6 +453,92 @@ mod tests {
     fn test_market_hours_gate_returns_bool() {
         // Just a smoke test — function never panics.
         let _ = is_within_market_hours_ist();
+    }
+
+    // -----------------------------------------------------------------
+    // Audit-2026-05-03: compute_session_phase ratchets
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_compute_session_phase_at_0900_is_preopen() {
+        // 09:00:00 IST — boundary inclusive on PREOPEN start
+        assert_eq!(compute_session_phase(9 * 3600), "PREOPEN");
+    }
+
+    #[test]
+    fn test_compute_session_phase_at_0912_is_preopen() {
+        // 09:12:59 IST — last second of PREOPEN window
+        assert_eq!(compute_session_phase(9 * 3600 + 12 * 60 + 59), "PREOPEN");
+    }
+
+    #[test]
+    fn test_compute_session_phase_at_0913_is_unknown_gap() {
+        // 09:13:00 IST — between PREOPEN and MARKET (drain gate
+        // `[09:00, 15:30)` still fires here, so phase tag must be
+        // sensible). Currently maps to UNKNOWN since neither window
+        // covers 09:13-09:14:59. Defensive — drain still writes the
+        // row (operator can filter `WHERE phase != 'UNKNOWN'`).
+        assert_eq!(compute_session_phase(9 * 3600 + 13 * 60), "UNKNOWN");
+    }
+
+    #[test]
+    fn test_compute_session_phase_at_0915_is_market() {
+        // 09:15:00 IST — MARKET window starts
+        assert_eq!(compute_session_phase(9 * 3600 + 15 * 60), "MARKET");
+    }
+
+    #[test]
+    fn test_compute_session_phase_at_1500_is_market() {
+        // 15:00:00 IST — mid-market
+        assert_eq!(compute_session_phase(15 * 3600), "MARKET");
+    }
+
+    #[test]
+    fn test_compute_session_phase_at_1529_is_market() {
+        // 15:29:59 IST — last second of MARKET
+        assert_eq!(compute_session_phase(15 * 3600 + 29 * 60 + 59), "MARKET");
+    }
+
+    #[test]
+    fn test_compute_session_phase_at_1530_is_postmarket() {
+        // 15:30:00 IST — POSTMARKET starts
+        assert_eq!(compute_session_phase(15 * 3600 + 30 * 60), "POSTMARKET");
+    }
+
+    #[test]
+    fn test_compute_session_phase_at_1539_is_postmarket() {
+        // 15:39:59 IST — last second of POSTMARKET
+        assert_eq!(
+            compute_session_phase(15 * 3600 + 39 * 60 + 59),
+            "POSTMARKET"
+        );
+    }
+
+    #[test]
+    fn test_compute_session_phase_at_1540_is_unknown() {
+        // 15:40:00 IST — POSTMARKET ends; outside window
+        assert_eq!(compute_session_phase(15 * 3600 + 40 * 60), "UNKNOWN");
+    }
+
+    #[test]
+    fn test_compute_session_phase_at_midnight_is_unknown() {
+        assert_eq!(compute_session_phase(0), "UNKNOWN");
+    }
+
+    #[test]
+    fn test_compute_session_phase_at_0859_is_unknown() {
+        // 08:59:59 IST — pre-market gate hasn't opened yet
+        assert_eq!(compute_session_phase(8 * 3600 + 59 * 60 + 59), "UNKNOWN");
+    }
+
+    #[test]
+    fn test_compute_session_phase_returns_static_str_no_alloc() {
+        // Pointer comparison — both calls return the same `&'static str`
+        // pointing into `.rodata`. Proves zero allocation.
+        let a = compute_session_phase(9 * 3600);
+        let b = compute_session_phase(9 * 3600 + 5);
+        assert_eq!(a, b);
+        assert_eq!(a, "PREOPEN");
     }
 
     // 2026-05-02 PR-B: ratchet tests for `lookup_segment_and_type` —
