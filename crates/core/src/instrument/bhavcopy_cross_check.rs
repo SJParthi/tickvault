@@ -203,6 +203,89 @@ pub fn build_dhan_lookup(instruments: &[DerivativeContract]) -> HashMap<Bhavcopy
     map
 }
 
+/// PR #450 commit 3 (2026-05-03): builds the `prev_oi` cache for the
+/// new unified `/api/movers` endpoint. Maps each NSE bhavcopy row's
+/// `OpnIntrst` (col 22, session-close OI) to the corresponding Dhan
+/// SecurityId via the existing `build_dhan_lookup`, then keys by
+/// composite `(security_id, exchange_segment_code)` per I-P1-11.
+///
+/// **Why this exists:** Dhan's UI columns "OI Change" + "OI Change %"
+/// (visible on EVERY tab of Markets > Options view) require
+/// `current_OI − prev_session_OI`. Per `.claude/rules/dhan/live-market-feed.md`
+/// rule 7, Dhan's WS PrevClose packet (code 6) emits prev-day-OI ONLY
+/// for IDX_I — NOT for NSE_FNO derivatives. Per
+/// `docs/dhan-ref/11-market-quote-rest.md:144-169`, the
+/// `/v2/marketfeed/quote` REST endpoint also doesn't carry it. The
+/// canonical free Dhan-parity source is the NSE bhavcopy
+/// `OpnIntrst` column at session close (already wired via
+/// `bhavcopy_fetcher.rs` for the volume cross-check).
+///
+/// # Returns
+///
+/// `HashMap<(SecurityId, exchange_segment_code), prev_session_oi_i64>`
+/// — sentinel `0` is NOT inserted (the consumer treats absence as 0).
+///
+/// # Bhavcopy → Dhan resolution
+///
+/// Reuses `build_dhan_lookup` for the (TckrSymb, XpryDt, StrkPric,
+/// OptnTp) → SecurityId mapping. Bhavcopy rows whose tuple does not
+/// match any of our subscribed `DerivativeContract` entries are
+/// silently SKIPPED — they're contracts we don't track.
+///
+/// # exchange_segment_code mapping
+///
+/// All NSE F&O derivatives carry segment code `2` (NseFno) per the
+/// Dhan annexure. BseFno would be `8` but the bhavcopy fetcher is
+/// scoped to NSE-only today, so every row resolves to `2`.
+///
+/// # Hot path
+///
+/// O(N + M) where N = bhavcopy row count (~200K) and M = derivative
+/// contract count (~22K). Cold path — runs ONCE at boot per trading
+/// day. The resulting `Arc<HashMap>` is consumed by
+/// `spawn_movers_pipeline` as the `prev_oi_cache` argument and read
+/// O(1) lock-free per 1s-drain row.
+#[must_use]
+pub fn build_prev_oi_cache_from_bhavcopy(
+    rows: &[BhavcopyRow],
+    instruments: &[DerivativeContract],
+) -> HashMap<(u32, u8), i64> {
+    let lookup = build_dhan_lookup(instruments);
+    // Build a secondary index from SecurityId → exchange_segment_code
+    // so we don't iterate the contract vector per bhavcopy row.
+    // O(M) once.
+    let mut sid_to_seg: HashMap<u32, u8> = HashMap::with_capacity(instruments.len());
+    for inst in instruments {
+        // ExchangeSegment::binary_code() returns the canonical Dhan code
+        // (NseFno=2, BseFno=8 etc.) per docs/dhan-ref/08-annexure-enums.md.
+        sid_to_seg.insert(inst.security_id, inst.exchange_segment.binary_code());
+    }
+    let mut out: HashMap<(u32, u8), i64> = HashMap::with_capacity(rows.len());
+    for row in rows {
+        let key: BhavcopyTupleKey = (
+            row.tckr_symb.clone(),
+            row.xpry_dt.clone(),
+            row.strk_pric.map(|v| format!("{v:.6}")),
+            row.optn_tp.clone(),
+        );
+        let Some(&security_id) = lookup.get(&key) else {
+            continue; // not in our subscribed universe — skip
+        };
+        let segment_code = sid_to_seg
+            .get(&security_id)
+            .copied()
+            .unwrap_or(2 /* NseFno default */);
+        // Bhavcopy `OpnIntrst` is non-negative per NSE schema; defensive
+        // clamp to 0 if a future schema migration ever ships negative.
+        let prev_oi = row.opn_intrst.max(0);
+        // Idempotent insert: if the same composite key appears twice
+        // in the bhavcopy (shouldn't happen per NSE format), the
+        // last-wins semantic is acceptable — values would be identical.
+        out.insert((security_id, segment_code), prev_oi);
+    }
+    out
+}
+
 /// Parse a single CSV row (already split into fields) into a `BhavcopyRow`.
 /// Returns `Err` if the column count is wrong or any required numeric
 /// field fails to parse.
@@ -843,5 +926,119 @@ mod tests {
     fn test_build_dhan_lookup_handles_empty_input() {
         let lookup = build_dhan_lookup(&[]);
         assert!(lookup.is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // PR #450 commit 3 (2026-05-03): build_prev_oi_cache_from_bhavcopy
+    // ratchets — Dhan-parity OI Change baseline source for NSE_FNO
+    // derivatives (free, T+1, no Dhan API quota).
+    // -----------------------------------------------------------------
+
+    fn nifty_jun_25000_ce(security_id: u32) -> DerivativeContract {
+        DerivativeContract {
+            security_id,
+            underlying_symbol: "NIFTY".to_string(),
+            instrument_kind: tickvault_common::instrument_types::DhanInstrumentKind::OptionIndex,
+            exchange_segment: tickvault_common::types::ExchangeSegment::NseFno,
+            expiry_date: chrono::NaiveDate::from_ymd_opt(2026, 6, 26).unwrap(),
+            strike_price: 25_000.0,
+            option_type: Some(tickvault_common::types::OptionType::Call),
+            lot_size: 25,
+            tick_size: 0.05,
+            symbol_name: "NIFTY-Jun2026-25000-CE".to_string(),
+            display_name: "NIFTY 26 JUN 25000 CALL".to_string(),
+        }
+    }
+
+    fn nifty_jun_future(security_id: u32) -> DerivativeContract {
+        DerivativeContract {
+            security_id,
+            underlying_symbol: "NIFTY".to_string(),
+            instrument_kind: tickvault_common::instrument_types::DhanInstrumentKind::FutureIndex,
+            exchange_segment: tickvault_common::types::ExchangeSegment::NseFno,
+            expiry_date: chrono::NaiveDate::from_ymd_opt(2026, 6, 26).unwrap(),
+            strike_price: 0.0,
+            option_type: None,
+            lot_size: 25,
+            tick_size: 0.05,
+            symbol_name: "NIFTY-Jun2026-FUT".to_string(),
+            display_name: "NIFTY JUN FUT".to_string(),
+        }
+    }
+
+    fn bhavcopy_row(
+        tckr_symb: &str,
+        xpry_dt: &str,
+        strk: Option<f64>,
+        optn: Option<&str>,
+        opn_intrst: i64,
+    ) -> BhavcopyRow {
+        BhavcopyRow {
+            tckr_symb: tckr_symb.to_string(),
+            xpry_dt: xpry_dt.to_string(),
+            strk_pric: strk,
+            optn_tp: optn.map(|s| s.to_string()),
+            opn_intrst,
+            ttl_tradg_vol: 0,
+            ttl_trf_val: 0.0,
+        }
+    }
+
+    /// PR #450 commit 3 ratchet: builds cache keyed by composite
+    /// `(security_id, exchange_segment_code)` per I-P1-11 — NEVER
+    /// `security_id` alone.
+    #[test]
+    fn test_build_prev_oi_cache_keys_by_composite_per_i_p1_11() {
+        let contracts = vec![nifty_jun_25000_ce(101), nifty_jun_future(102)];
+        let rows = vec![
+            bhavcopy_row("NIFTY", "2026-06-26", Some(25000.0), Some("CE"), 50_000),
+            bhavcopy_row("NIFTY", "2026-06-26", None, None, 80_000), // future
+        ];
+        let cache = build_prev_oi_cache_from_bhavcopy(&rows, &contracts);
+        assert_eq!(cache.len(), 2);
+        // NseFno = segment code 2 per docs/dhan-ref/08-annexure-enums.md
+        assert_eq!(cache.get(&(101, 2)), Some(&50_000));
+        assert_eq!(cache.get(&(102, 2)), Some(&80_000));
+    }
+
+    /// PR #450 commit 3 ratchet: bhavcopy rows that don't match any
+    /// of our subscribed `DerivativeContract` entries are silently
+    /// SKIPPED (universe scope filter).
+    #[test]
+    fn test_build_prev_oi_cache_skips_rows_outside_subscribed_universe() {
+        let contracts = vec![nifty_jun_25000_ce(101)];
+        let rows = vec![
+            bhavcopy_row("NIFTY", "2026-06-26", Some(25000.0), Some("CE"), 50_000),
+            // Not in our universe → skip
+            bhavcopy_row("BANKNIFTY", "2026-06-26", Some(54000.0), Some("PE"), 99_999),
+            bhavcopy_row("RELIANCE", "2026-06-26", None, None, 88_888),
+        ];
+        let cache = build_prev_oi_cache_from_bhavcopy(&rows, &contracts);
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.get(&(101, 2)), Some(&50_000));
+    }
+
+    /// PR #450 commit 3 ratchet: defensive negative-OI clamp.
+    /// Bhavcopy schema is non-negative per NSE format but we clamp
+    /// to 0 for forward-compat.
+    #[test]
+    fn test_build_prev_oi_cache_clamps_negative_to_zero() {
+        let contracts = vec![nifty_jun_25000_ce(101)];
+        let rows = vec![bhavcopy_row(
+            "NIFTY",
+            "2026-06-26",
+            Some(25000.0),
+            Some("CE"),
+            -100, // defensive — should clamp
+        )];
+        let cache = build_prev_oi_cache_from_bhavcopy(&rows, &contracts);
+        assert_eq!(cache.get(&(101, 2)), Some(&0));
+    }
+
+    /// PR #450 commit 3 ratchet: empty inputs return empty cache, not error.
+    #[test]
+    fn test_build_prev_oi_cache_empty_inputs_return_empty_cache() {
+        let cache = build_prev_oi_cache_from_bhavcopy(&[], &[]);
+        assert!(cache.is_empty());
     }
 }
