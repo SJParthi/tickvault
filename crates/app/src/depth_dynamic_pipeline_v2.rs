@@ -90,10 +90,12 @@ const RESELECT_INTERVAL_SECS: u64 = 60;
 /// HTTP timeout for the QuestDB selector query.
 const QUESTDB_SELECT_TIMEOUT_SECS: u64 = 10;
 
-/// Default Stage-1 cohort size if config does not set one. Matches
-/// the prior hardcoded constant and is a 5× safety margin over the
-/// largest K=250 used by depth-20.
-pub const DEFAULT_COHORT_SIZE: usize = 500;
+/// Audit-2026-05-03: default minimum cumulative session volume floor
+/// for the redesigned Stage 1 liquidity gate. Replaces the legacy
+/// `DEFAULT_COHORT_SIZE = 500`. Operators calibrate per-environment;
+/// 10_000 is a defensive floor that excludes truly illiquid contracts
+/// while admitting the typical NIFTY/BANKNIFTY option chain volumes.
+pub const DEFAULT_MIN_LIQUIDITY_VOLUME: u64 = 10_000;
 
 /// Default SQL freshness window if config does not set one. Filters
 /// stale post-market data.
@@ -117,12 +119,13 @@ pub struct PipelineConfig {
     /// Conventional values: `"depth-20-dynamic"` and
     /// `"depth-200-dynamic"`.
     pub label: &'static str,
-    /// Stage-1 SQL cohort size — top-N-by-volume rows fetched before
-    /// Stage-2 re-rank. Threaded from
-    /// `[depth_*.dynamic.universe].cohort_size`. (Security-review
-    /// MEDIUM 3 fix — was previously a hardcoded constant that
-    /// silently ignored the operator's config.)
-    pub cohort_size: usize,
+    /// Audit-2026-05-03 (operator clarification): liquidity gate for
+    /// Stage 1 SQL. Replaces the legacy `cohort_size` top-N parameter.
+    /// Only contracts with `volume >= min_liquidity_volume` qualify
+    /// for Stage 2 ranking — guarantees liquidity for live-trade
+    /// depth subscriptions. Threaded from
+    /// `[depth_*.dynamic.universe].min_liquidity_volume`.
+    pub min_liquidity_volume: u64,
     /// SQL freshness window. Threaded from
     /// `[depth_*.dynamic.universe].window_secs`.
     pub window_secs: u32,
@@ -505,7 +508,7 @@ async fn fetch_cohort_from_questdb(cfg: &PipelineConfig) -> anyhow::Result<Vec<M
     let sql = build_cohort_sql(
         &cfg.selector.exchange_segments,
         &cfg.selector.instrument_types,
-        cfg.cohort_size,
+        cfg.min_liquidity_volume,
         cfg.window_secs,
     );
     let url = format!("http://{}:{}/exec", cfg.questdb.host, cfg.questdb.http_port);
@@ -910,9 +913,13 @@ fn current_ist_trading_day() -> i64 {
 }
 
 /// Wall-clock target for the FIRST selection cycle of each trading
-/// day: 09:15:01 IST. One second after market open so movers_1s has
-/// at least one populated 1-second bucket from the first F&O ticks.
-const FIRST_CYCLE_SECS_OF_DAY_IST: u32 = 9 * 3600 + 15 * 60 + 1;
+/// day: 09:15:00 IST per operator clarification 2026-05-03.
+///
+/// Earlier 09:15:01 was over-engineering — movers compute per-tick
+/// (not averaged), so the F&O opening tick at 09:15:00 IS the highest-
+/// information `change_pct` of the day and MUST be captured. Aligns
+/// with the exchange's stated MARKET start (09:15:00).
+const FIRST_CYCLE_SECS_OF_DAY_IST: u32 = 9 * 3600 + 15 * 60;
 
 /// 2026-05-02 — operator-requested cadence:
 ///   * Tick 1 at 09:15:01 IST (initial subscribe — uses
@@ -1141,12 +1148,15 @@ mod tests {
         );
     }
 
-    /// 2026-05-02 — operator-requested first-cycle alignment.
-    /// Pin the constant at 09:15:01 IST.
+    /// Audit-2026-05-03 (operator clarification): first cycle pinned
+    /// at 09:15:00 IST (was 09:15:01). The F&O opening tick MUST be
+    /// captured — it carries the highest-information change_pct of
+    /// the day. Aligns with movers MARKET start (09:15:00) and the
+    /// exchange's stated MARKET window boundary.
     #[test]
-    fn test_first_cycle_secs_of_day_ist_pinned_at_09_15_01() {
-        // 09:15:01 IST = 9*3600 + 15*60 + 1 = 33_301
-        assert_eq!(FIRST_CYCLE_SECS_OF_DAY_IST, 33_301);
+    fn test_first_cycle_secs_of_day_ist_pinned_at_09_15_00_per_operator_clarification() {
+        // 09:15:00 IST = 9*3600 + 15*60 = 33_300
+        assert_eq!(FIRST_CYCLE_SECS_OF_DAY_IST, 33_300);
     }
 
     /// Ratchet: the helper returns an Instant that is `Instant::now()`
@@ -1242,11 +1252,17 @@ mod tests {
         assert_eq!(RESELECT_INTERVAL_SECS, 60);
     }
 
+    /// Audit-2026-05-03 ratchet: default min-volume floor must be
+    /// strictly positive (zero would bypass the liquidity gate).
+    /// Replaces the legacy `test_cohort_size_default_is_at_least_5x_max_k`.
     #[test]
-    fn test_cohort_size_default_is_at_least_5x_max_k() {
-        // Default cohort size must be large enough to absorb Stage-2
-        // filter attrition for the largest K (=250 for depth-20).
-        assert!(DEFAULT_COHORT_SIZE >= 250);
+    fn test_default_min_liquidity_volume_is_positive_floor() {
+        assert!(
+            DEFAULT_MIN_LIQUIDITY_VOLUME > 0,
+            "default min_liquidity_volume must reject illiquid contracts"
+        );
+        // Pin the specific value to make config-drift detectable.
+        assert_eq!(DEFAULT_MIN_LIQUIDITY_VOLUME, 10_000);
     }
 
     #[test]

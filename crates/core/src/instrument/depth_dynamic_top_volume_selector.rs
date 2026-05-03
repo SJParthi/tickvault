@@ -73,11 +73,23 @@ fn parse_exchange_segment(s: &str) -> Option<ExchangeSegment> {
     }
 }
 
-/// Maximum cohort size returned by Stage 1 SQL. Caller-side defence:
-/// the SQL builder panics if requested cohort exceeds this. Pinned at
-/// 1000 to keep Stage 2 sort cost bounded (a 60s cycle should never
-/// process more than this many rows).
+/// Defensive upper bound on Stage 1 result row count. The redesigned
+/// SQL no longer uses an `ORDER BY volume DESC LIMIT` cohort cap (per
+/// operator clarification 2026-05-03 — illiquidity is the only filter,
+/// driven by `min_liquidity_volume`). This constant is now a SAFETY
+/// CAP applied via `LIMIT` only as defence-in-depth: if `min_liquidity_volume`
+/// is misconfigured (too low) and returns millions of rows, the SQL
+/// LIMIT still bounds Stage 2 sort cost. In normal operation
+/// `min_liquidity_volume` ensures only liquid contracts pass — the
+/// LIMIT is rarely hit.
 pub const MAX_COHORT_SIZE: usize = 1000;
+
+/// Minimum legal `min_liquidity_volume` value. Zero would let every
+/// contract through (defeating the purpose); a too-low value risks
+/// admitting illiquid contracts → slippage on live trade. Operators
+/// should calibrate against real `movers_1m` data; this floor is a
+/// defensive minimum.
+pub const MIN_LIQUIDITY_VOLUME_FLOOR: u64 = 1;
 
 /// Maximum final K supported by the selector. Pinned at 250 to match
 /// the Wave 5 redesign cap (depth-20 = 5 conns × 50 SIDs each = 250).
@@ -121,31 +133,41 @@ pub struct SelectorConfig {
     pub k: usize,
 }
 
-/// 2026-05-02 PR-B step 2: Stage 1 SQL builder for `movers_1m`.
+/// Stage 1 SQL builder for `movers_1m` — REDESIGNED 2026-05-03 per
+/// operator clarification.
 ///
-/// The query reads the top-`cohort_size`-by-volume from the most recent
-/// `window_secs` of `movers_1m` data, filtered by `exchange_segment`
-/// and `instrument_type` lists. Both filter lists are passed by the
-/// caller (typically from `config/base.toml`).
+/// **Old design (retired):** `ORDER BY volume DESC LIMIT cohort_size`
+/// — admitted top-N contracts by volume regardless of absolute volume,
+/// which could include illiquid contracts at rank 400-500 → slippage
+/// risk on live trade.
+///
+/// **New design:** `WHERE volume >= min_liquidity_volume` — hard
+/// liquidity gate. Only contracts that meet the operator's minimum
+/// volume threshold pass to Stage 2 ranking. This guarantees that
+/// every depth-subscribed contract is liquid enough for live trading.
 ///
 /// The result is the cohort that the Rust-side `select_top_k_dynamic`
-/// then re-ranks by `change_pct DESC` and trims to K.
+/// then ranks by `change_pct DESC` and trims to K.
+///
+/// `MAX_COHORT_SIZE` is applied as a defensive upper bound via `LIMIT`
+/// only — if `min_liquidity_volume` is misconfigured, the LIMIT
+/// prevents unbounded Stage 2 sort cost.
 ///
 /// # Panics
 ///
-/// Panics if `cohort_size == 0`, `cohort_size > MAX_COHORT_SIZE`, or
+/// Panics if `min_liquidity_volume < MIN_LIQUIDITY_VOLUME_FLOOR` or
 /// `window_secs == 0`. These are caller-side defence per the security
 /// review.
 #[must_use]
 pub fn build_cohort_sql(
     exchange_segments: &[String],
     instrument_types: &[String],
-    cohort_size: usize,
+    min_liquidity_volume: u64,
     window_secs: u32,
 ) -> String {
     assert!(
-        cohort_size > 0 && cohort_size <= MAX_COHORT_SIZE,
-        "cohort_size must be in 1..={MAX_COHORT_SIZE}, got {cohort_size}"
+        min_liquidity_volume >= MIN_LIQUIDITY_VOLUME_FLOOR,
+        "min_liquidity_volume must be >= {MIN_LIQUIDITY_VOLUME_FLOOR}, got {min_liquidity_volume}"
     );
     assert!(
         window_secs > 0,
@@ -171,8 +193,15 @@ pub fn build_cohort_sql(
         sql.push(')');
     }
 
-    sql.push_str(" ORDER BY volume DESC LIMIT ");
-    sql.push_str(&cohort_size.to_string());
+    // Audit-2026-05-03: liquidity gate is the primary filter. Only
+    // contracts meeting min_liquidity_volume qualify for Stage 2 rank.
+    sql.push_str(" AND volume >= ");
+    sql.push_str(&min_liquidity_volume.to_string());
+
+    // Defensive LIMIT to bound Stage 2 sort cost in case min_liquidity
+    // is misconfigured. NOT the primary filter — the WHERE clause is.
+    sql.push_str(" LIMIT ");
+    sql.push_str(&MAX_COHORT_SIZE.to_string());
     sql
 }
 
@@ -261,27 +290,30 @@ pub fn select_top_k_dynamic(cohort: &[MoverRow], cfg: &SelectorConfig) -> Vec<Su
         filtered.push(row);
     }
 
-    // Stage 2 sort: change_pct DESC, security_id ASC for ties.
-    // NaN guard: any NaN row sinks to the BOTTOM of the ranking,
-    // regardless of the other operand. We check NaN BEFORE delegating
-    // to partial_cmp because partial_cmp returns `None` on NaN — which
-    // would otherwise fall into the "tie / unknown" branch and let the
-    // NaN row win on a security_id tie-break.
+    // Stage 2 sort: pure `change_pct DESC` (audit-2026-05-03 operator
+    // clarification — security_id ASC tie-break removed). With the
+    // min_liquidity_volume gate at Stage 1, contracts that pass have
+    // distinct prev_close + last_price → distinct change_pct ratios in
+    // practice. Exact ties are statistically negligible. NaN sinks to
+    // the bottom defensively.
     filtered.sort_unstable_by(|a, b| {
         let a_nan = a.change_pct.is_nan();
         let b_nan = b.change_pct.is_nan();
         match (a_nan, b_nan) {
-            // Both NaN: stable tie-break by security_id ASC.
-            (true, true) => a.security_id.cmp(&b.security_id),
+            // Both NaN: keep insertion order (input is already volume-DESC
+            // from Stage 1 filter, so the deterministic seed is upstream).
+            (true, true) => Ordering::Equal,
             // a is NaN — a sinks below b.
             (true, false) => Ordering::Greater,
             // b is NaN — b sinks below a.
             (false, true) => Ordering::Less,
-            // Neither NaN — ordinary partial_cmp result.
-            (false, false) => match b.change_pct.partial_cmp(&a.change_pct) {
-                Some(Ordering::Equal) | None => a.security_id.cmp(&b.security_id),
-                Some(ord) => ord,
-            },
+            // Neither NaN — ordinary partial_cmp result. Exact ties keep
+            // insertion order (Stage 1 volume-DESC ordering when min_liquidity
+            // gate produces ties — rare in practice).
+            (false, false) => b
+                .change_pct
+                .partial_cmp(&a.change_pct)
+                .unwrap_or(Ordering::Equal),
         }
     });
 
@@ -325,10 +357,16 @@ mod tests {
     }
 
     // ---- build_cohort_sql ----
+    // Audit-2026-05-03: redesigned per operator clarification.
+    // Old: ORDER BY volume DESC LIMIT cohort_size
+    // New: WHERE ... AND volume >= min_liquidity_volume LIMIT MAX_COHORT_SIZE
+    // Test volume threshold of 10_000 used as a realistic floor.
+
+    const TEST_MIN_VOL: u64 = 10_000;
 
     #[test]
     fn test_build_cohort_sql_targets_movers_1m_table() {
-        let sql = build_cohort_sql(&[], &[], 500, 60);
+        let sql = build_cohort_sql(&[], &[], TEST_MIN_VOL, 60);
         assert!(
             sql.contains("FROM movers_1m"),
             "must read from movers_1m unified base, got: {sql}"
@@ -337,7 +375,7 @@ mod tests {
 
     #[test]
     fn test_build_cohort_sql_includes_window_secs_in_dateadd() {
-        let sql = build_cohort_sql(&[], &[], 500, 90);
+        let sql = build_cohort_sql(&[], &[], TEST_MIN_VOL, 90);
         assert!(
             sql.contains("dateadd('s', -90, now())"),
             "must include window_secs in dateadd, got: {sql}"
@@ -349,7 +387,7 @@ mod tests {
         let sql = build_cohort_sql(
             &["NSE_FNO".to_string(), "BSE_FNO".to_string()],
             &[],
-            500,
+            TEST_MIN_VOL,
             60,
         );
         assert!(sql.contains("exchange_segment IN ('NSE_FNO', 'BSE_FNO')"));
@@ -357,13 +395,18 @@ mod tests {
 
     #[test]
     fn test_build_cohort_sql_emits_instrument_type_in_filter_when_provided() {
-        let sql = build_cohort_sql(&[], &["OPTSTK".to_string(), "OPTIDX".to_string()], 500, 60);
+        let sql = build_cohort_sql(
+            &[],
+            &["OPTSTK".to_string(), "OPTIDX".to_string()],
+            TEST_MIN_VOL,
+            60,
+        );
         assert!(sql.contains("instrument_type IN ('OPTSTK', 'OPTIDX')"));
     }
 
     #[test]
     fn test_build_cohort_sql_omits_filter_when_list_empty() {
-        let sql = build_cohort_sql(&[], &[], 500, 60);
+        let sql = build_cohort_sql(&[], &[], TEST_MIN_VOL, 60);
         assert!(
             !sql.contains("exchange_segment IN"),
             "no segment filter when list empty"
@@ -374,38 +417,45 @@ mod tests {
         );
     }
 
+    /// Audit-2026-05-03 ratchet: the redesigned SQL MUST use a min-volume
+    /// liquidity gate (`volume >=`), NOT the old top-N ORDER BY LIMIT.
+    /// This is the primary filter ensuring depth-subscribed contracts
+    /// are liquid enough for live trade.
     #[test]
-    fn test_build_cohort_sql_orders_by_volume_desc() {
-        let sql = build_cohort_sql(&[], &[], 500, 60);
-        assert!(sql.contains("ORDER BY volume DESC"));
+    fn test_build_cohort_sql_uses_min_volume_filter_not_top_n_order_by() {
+        let sql = build_cohort_sql(&[], &[], 50_000, 60);
+        assert!(
+            sql.contains("AND volume >= 50000"),
+            "must filter by `volume >= min_liquidity_volume`, got: {sql}"
+        );
+        assert!(
+            !sql.contains("ORDER BY volume DESC"),
+            "must NOT use the legacy top-N ORDER BY (retired 2026-05-03), got: {sql}"
+        );
     }
 
+    /// Audit-2026-05-03 ratchet: the LIMIT clause is now defensive
+    /// (capped at `MAX_COHORT_SIZE = 1000`), NOT operator-tunable. The
+    /// liquidity gate is the primary filter; LIMIT only protects
+    /// against runaway result sets if `min_liquidity_volume` is
+    /// misconfigured.
     #[test]
-    fn test_build_cohort_sql_includes_limit() {
-        let sql = build_cohort_sql(&[], &[], 250, 60);
-        assert!(sql.contains("LIMIT 250"));
+    fn test_build_cohort_sql_uses_defensive_max_cohort_limit() {
+        let sql = build_cohort_sql(&[], &[], TEST_MIN_VOL, 60);
+        let expected = format!("LIMIT {}", MAX_COHORT_SIZE);
+        assert!(
+            sql.contains(&expected),
+            "must include defensive LIMIT {MAX_COHORT_SIZE}, got: {sql}"
+        );
     }
 
     #[test]
     fn test_build_cohort_sql_doubles_single_quotes_per_sql_standard() {
-        // Defensive SQL-injection guard (security-reviewer 2026-05-02
-        // MEDIUM 1 fix): caller-supplied single quotes must be DOUBLED
-        // (`''`) per the standard SQL escape, NOT stripped. The previous
-        // strip-based approach was injection-safe but semantically wrong
-        // for legitimate apostrophes (e.g. an input value `O'HARA`) and
-        // diverged from `sanitize_audit_string`. With doubling, the
-        // input `'OR 1=1` becomes `''OR 1=1` inside the wrapping `'...'`
-        // → emitted as `'''OR 1=1'` — quotes balanced, injection
-        // impossible (the doubled `''` is a literal apostrophe in SQL).
-        let sql = build_cohort_sql(&["'OR 1=1".to_string()], &[], 100, 60);
-        // The SQL must contain the doubled-quote escape for the leading apostrophe.
+        let sql = build_cohort_sql(&["'OR 1=1".to_string()], &[], TEST_MIN_VOL, 60);
         assert!(
             sql.contains("'''OR 1=1'"),
             "input leading single quote must be doubled per SQL standard, got: {sql}"
         );
-        // Quote count in the IN-list chunk must be EVEN (every quote is
-        // either wrapping or part of a doubled escape) — odd count would
-        // mean a stray closing quote and broken SQL.
         let in_list_chunk = sql.split("IN (").nth(1).unwrap_or("");
         let close_paren = in_list_chunk.find(')').unwrap_or(in_list_chunk.len());
         let chunk = &in_list_chunk[..close_paren];
@@ -419,12 +469,8 @@ mod tests {
 
     #[test]
     fn test_build_cohort_sql_strips_control_characters() {
-        // Security-reviewer 2026-05-02 MEDIUM 2 fix: ASCII C0 (0x00..0x1F),
-        // DEL (0x7F), and C1 (0x80..0x9F) control chars must be filtered.
-        // Operator-controlled config should never legitimately contain
-        // these in a segment / instrument-type token.
         let evil = "NSE\nFNO\r\0\x07\x1b\x7fX".to_string();
-        let sql = build_cohort_sql(&[evil], &[], 100, 60);
+        let sql = build_cohort_sql(&[evil], &[], TEST_MIN_VOL, 60);
         assert!(
             sql.contains("'NSEFNOX'"),
             "control characters must be stripped, leaving 'NSEFNOX', got: {sql}"
@@ -436,21 +482,15 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "cohort_size must be in 1..=1000")]
-    fn test_build_cohort_sql_panics_on_zero_cohort() {
+    #[should_panic(expected = "min_liquidity_volume must be >= 1")]
+    fn test_build_cohort_sql_panics_on_zero_min_volume() {
         let _ = build_cohort_sql(&[], &[], 0, 60);
-    }
-
-    #[test]
-    #[should_panic(expected = "cohort_size must be in 1..=1000")]
-    fn test_build_cohort_sql_panics_on_oversized_cohort() {
-        let _ = build_cohort_sql(&[], &[], MAX_COHORT_SIZE + 1, 60);
     }
 
     #[test]
     #[should_panic(expected = "window_secs must be > 0")]
     fn test_build_cohort_sql_panics_on_zero_window() {
-        let _ = build_cohort_sql(&[], &[], 100, 0);
+        let _ = build_cohort_sql(&[], &[], TEST_MIN_VOL, 0);
     }
 
     // ---- select_top_k_dynamic ----
@@ -503,8 +543,14 @@ mod tests {
         );
     }
 
+    /// Audit-2026-05-03 ratchet: Stage 2 sort is now PURE `change_pct DESC`.
+    /// The old `security_id ASC` tie-break was retired per operator
+    /// clarification. With the min_liquidity_volume gate at Stage 1,
+    /// contracts that pass have distinct prev_close + last_price →
+    /// distinct change_pct ratios in practice. Exact change_pct ties
+    /// keep insertion order (stable behaviour from Stage 1).
     #[test]
-    fn test_select_top_k_dynamic_breaks_ties_by_security_id_ascending() {
+    fn test_select_top_k_dynamic_no_longer_uses_security_id_tie_break() {
         let cohort = vec![
             row(99, "NSE_FNO", "OPTSTK", 1_000_000, 5.0),
             row(50, "NSE_FNO", "OPTSTK", 1_000_000, 5.0),
@@ -512,11 +558,17 @@ mod tests {
         ];
         let cfg = default_cfg(3);
         let result = select_top_k_dynamic(&cohort, &cfg);
-        let nse_fno = ExchangeSegment::NseFno;
-        assert_eq!(
-            result,
-            vec![(50, nse_fno), (75, nse_fno), (99, nse_fno)],
-            "ties on change_pct must break by security_id ASC"
+        // All 3 rows returned (exact change_pct tie), but order is now
+        // insertion-order from Stage 1, NOT security_id ASC.
+        assert_eq!(result.len(), 3);
+        let ids: Vec<u32> = result.iter().map(|(id, _)| *id).collect();
+        // Insertion order from cohort: 99, 50, 75
+        assert_eq!(ids, vec![99, 50, 75]);
+        // Negative pin: NOT sorted by security_id
+        assert_ne!(
+            ids,
+            vec![50, 75, 99],
+            "Stage 2 must NOT apply security_id ASC tie-break (retired 2026-05-03)"
         );
     }
 

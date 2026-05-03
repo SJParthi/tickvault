@@ -391,8 +391,12 @@ sids_per_conn = 50                              # capped at Dhan 50-SIDs/conn li
 # option contracts only.
 exchange_segments = ["NSE_FNO"]                  # SENSEX excluded (BSE_FNO out)
 instrument_types = ["OPTIDX"]                    # ONLY index options (no OPTSTK/FUTIDX/FUTSTK/EQUITY/INDEX)
-cohort_size = 500                                # Stage-1 top-volume cohort size (selector takes top 250 = 5×50)
-rerank_metric = "change_pct_desc"                # Stage-2 sort metric
+# Audit-2026-05-03 redesign: replaced legacy `cohort_size = 500` (top-N
+# by volume) with a min-volume liquidity gate — guarantees every
+# depth-subscribed contract is liquid enough for live trade. Operators
+# calibrate against real movers_1m data; 10_000 is a defensive floor.
+min_liquidity_volume = 10000                     # Stage-1 liquidity gate (cumulative session volume floor)
+rerank_metric = "change_pct_desc"                # Stage-2 sort metric (pure change_pct DESC, no security_id tie-break)
 window_secs = 60                                 # movers_1m look-back window
 
 [depth_200.dynamic]
@@ -404,6 +408,6 @@ sids_per_conn = 1
 # top 5 (5 conns × 1 SID each). Index options only, NIFTY/BANKNIFTY only.
 exchange_segments = ["NSE_FNO"]                  # SENSEX excluded (BSE_FNO out)
 instrument_types = ["OPTIDX"]                    # ONLY index options
-cohort_size = 100                                # Stage-1 cohort (selector takes top 5)
+min_liquidity_volume = 10000                     # Stage-1 liquidity gate (same threshold as depth_20)
 rerank_metric = "change_pct_desc"
 window_secs = 60
