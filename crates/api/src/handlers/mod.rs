@@ -14,4 +14,5 @@ pub mod option_chain;
 pub mod quote;
 pub mod static_file;
 pub mod stats;
-pub mod top_movers;
+// top_movers handler DELETED in PR #450 commit 6b — replaced by
+// unified /api/movers handler in commit 4.
