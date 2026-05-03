@@ -2710,13 +2710,27 @@ async fn main() -> Result<()> {
         let movers_base_shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
         let _movers_base_handle = if let Some(registry) = slow_registry.as_ref() {
             // PR #450 commit 2 (2026-05-03): empty prev_oi cache for now.
-            // Commit 3 will wire in the bhavcopy-loaded cache populating
-            // (security_id, segment) → prev-session-close OI for all
-            // NSE_FNO derivatives. Empty Arc<HashMap> means OI Change
-            // computes as `current - 0 = current` for now (Dhan-precise
-            // values arrive once commit 3 ships the loader).
+            // Commit 3 ships the data primitives (extract_prev_oi_from_option_chain
+            // + build_prev_oi_cache_from_bhavcopy); the boot orchestrator
+            // wiring (download bhavcopy → parse → fetch option chains →
+            // merge → pass Arc) lands in PR #452 (8:15 AM ready boot
+            // orchestrator).
+            //
+            // PR #450 commit 8 hostile-bug-hunt HIGH H2 fix: emit a
+            // boot-time WARN so the operator KNOWS the OI Change column
+            // on /api/movers will compute as `current - 0 = current`
+            // until PR #452 wires the loader. This is a misleading
+            // value (false-OK signal per audit-findings Rule 11) — the
+            // WARN ensures it's not silent.
             let prev_oi_cache: std::sync::Arc<std::collections::HashMap<(u32, u8), i64>> =
                 std::sync::Arc::new(std::collections::HashMap::new());
+            warn!(
+                code = "PREVOI-01",
+                "prev_oi cache EMPTY at boot — /api/movers OI Change column will display \
+                 `current_OI - 0 = current_OI` until PR #452 wires the bhavcopy + \
+                 Option Chain prev_oi loader. Operators must NOT trust the OI Change \
+                 + OI Change % columns until then."
+            );
             Some(tickvault_app::movers_base_pipeline::spawn_movers_pipeline(
                 config.questdb.clone(),
                 tick_broadcast_sender.clone(),

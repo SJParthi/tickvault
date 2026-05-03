@@ -95,10 +95,21 @@ pub fn extract_prev_oi_from_option_chain(
 }
 
 /// Merges a per-underlying prev_oi cache into a global accumulator.
-/// Idempotent — re-merging the same underlying overwrites with the
-/// fresher value (last-wins). Callers should iterate underlyings in
-/// priority order (most-watched first) so retry/partial-fetch
-/// scenarios degrade gracefully.
+///
+/// **Semantics: LAST-WINS** — `HashMap::insert` overwrites on collision,
+/// so the LAST `merge_prev_oi_cache` call's values shadow earlier ones.
+///
+/// **Required call order for the PR #450 boot tier hierarchy:**
+/// 1. Tier 3 (lowest priority): bhavcopy bulk merge first
+/// 2. Tier 2 (medium): Historical Data REST merge (if used)
+/// 3. Tier 1 (highest priority — Dhan-canonical): Option Chain REST
+///    `previous_oi` merge LAST so its values win on collision.
+///
+/// Hostile-bug-hunt MEDIUM M1 (commit 8 review) fix: the prior
+/// docstring said "iterate most-watched FIRST" — opposite of the
+/// actual `HashMap::insert` last-wins semantic. The corrected
+/// guidance is documented above and pinned by
+/// `test_merge_prev_oi_cache_last_wins_on_collision`.
 pub fn merge_prev_oi_cache(
     accumulator: &mut HashMap<(u32, u8), i64>,
     incremental: HashMap<(u32, u8), i64>,
