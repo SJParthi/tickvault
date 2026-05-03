@@ -568,17 +568,24 @@ mod tests {
         // a verbose `Coalesced summary [topic] count=1 / Samples: 1. ...`
         // envelope when there's nothing to summarise. Single-event fast
         // path returns just the sample body.
+        // 2026-05-03 fix: samples are stored UNPREFIXED — the dispatcher's
+        // `deliver_summaries` adds the severity tag exactly once on drain.
+        // Storing the prefixed string here caused the duplicate
+        // `✅ [LOW] ✅ [LOW]` Telegram bug observed by Parthiban.
         let summary = DrainedSummary {
             topic: "AuthenticationSuccess",
             severity: Severity::Low,
             count: 1,
             first_ts_ms: 1_700_000_000_000,
             last_ts_ms: 1_700_000_000_000,
-            samples: vec!["✅ [LOW] Auth OK — Dhan JWT acquired".into()],
+            samples: vec!["Auth OK — Dhan JWT acquired".into()],
             samples_capped: false,
         };
         let msg = summary.render_message();
-        assert_eq!(msg, "✅ [LOW] Auth OK — Dhan JWT acquired");
+        assert_eq!(msg, "Auth OK — Dhan JWT acquired");
+        // The severity tag must NOT be in the rendered body — it is added
+        // by the dispatcher when sending to Telegram.
+        assert!(!msg.contains("[LOW]"));
         assert!(!msg.contains("Coalesced summary"));
         assert!(!msg.contains("count="));
         assert!(!msg.contains("Samples:"));
@@ -623,6 +630,49 @@ mod tests {
         assert!(msg.contains("Coalesced summary"));
         assert!(msg.contains("count=2"));
         assert!(msg.contains("Samples:"));
+    }
+
+    #[test]
+    fn test_end_to_end_no_double_prefix_on_coalesced_telegram_body() {
+        // Regression guard for the 2026-05-03 operator-visible bug:
+        //   ✅ [LOW] ✅ [LOW] Auth OK — Dhan JWT acquired
+        //
+        // Simulates the full pipeline a Severity::Low event takes through
+        // the production dispatcher:
+        //   1. dispatch_immediate computes `body = event.to_message()`
+        //      (NO severity tag).
+        //   2. coalescer.observe stores `body` in the bucket.
+        //   3. drain_mature returns DrainedSummary.
+        //   4. deliver_summaries renders
+        //      `format!("{} {}", severity.tag(), summary.render_message())`.
+        //
+        // The final Telegram body MUST contain the `[LOW]` tag exactly
+        // ONCE. Two occurrences = the bug is back.
+        let c = TelegramCoalescer::new(CoalescerConfig {
+            window: Duration::from_millis(5),
+            flush_interval: Duration::from_millis(2),
+        });
+        let unprefixed_body = "Auth OK — Dhan JWT acquired".to_string();
+        c.observe("AuthenticationSuccess", Severity::Low, || {
+            unprefixed_body.clone()
+        });
+        std::thread::sleep(Duration::from_millis(15));
+        let drained = c.drain_mature();
+        assert_eq!(drained.len(), 1);
+        let summary = &drained[0];
+
+        // Mirror deliver_summaries' format! call.
+        let final_body = format!("{} {}", summary.severity.tag(), summary.render_message());
+        let low_count = final_body.matches("[LOW]").count();
+        assert_eq!(
+            low_count, 1,
+            "expected exactly one [LOW] tag in final Telegram body, got {low_count}: {final_body:?}"
+        );
+        assert!(final_body.starts_with("✅ [LOW] "));
+        assert!(final_body.contains("Auth OK"));
+        // And the inner sample must NOT have the tag (regression guard
+        // for the upstream bug at the source).
+        assert!(!summary.samples[0].contains("[LOW]"));
     }
 
     #[test]

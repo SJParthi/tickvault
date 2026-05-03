@@ -321,7 +321,13 @@ impl NotificationService {
                 // Parthiban workflow: any [HIGH] / [CRITICAL] message goes
                 // straight to Claude Code for debugging.
                 let topic = event.topic();
-                let message = format!("{} {}", severity.tag(), event.to_message());
+                // Render the body WITHOUT the severity tag — the prefix is
+                // added exactly once by either (a) `deliver_summaries` on
+                // drain (coalesced path) or (b) the bypass branch below.
+                // Storing the prefixed string in the coalescer caused the
+                // duplicate `✅ [LOW] ✅ [LOW]` Telegram bug observed by
+                // Parthiban on 2026-05-03 (drain re-prepended the tag).
+                let body = event.to_message();
 
                 // Wave 3-B Item 11: bucket-coalesce Severity::Low and
                 // Severity::Info events. Bypass everything else (Critical,
@@ -330,7 +336,7 @@ impl NotificationService {
                 // the same call covers both branches; we only short-circuit
                 // when it returns `Coalesced`.
                 if let Some(coalescer) = self.coalescer.as_ref() {
-                    let decision = coalescer.observe(topic, severity, || message.clone());
+                    let decision = coalescer.observe(topic, severity, || body.clone());
                     if matches!(decision, CoalesceDecision::Coalesced) {
                         metrics::counter!(
                             "tv_telegram_dispatched_total",
@@ -349,6 +355,11 @@ impl NotificationService {
                     "coalesced" => "false",
                 )
                 .increment(1);
+
+                // Bypass path: prefix the body with the severity tag once.
+                // (The coalesced path applies the same prefix in
+                // `deliver_summaries` on drain.)
+                let message = format!("{} {}", severity.tag(), body);
 
                 // Always: Telegram. Messages > 4000 chars get split into
                 // ordered chunks per Telegram's 4096-char hard limit so
