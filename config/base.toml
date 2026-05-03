@@ -354,7 +354,10 @@ ws_depth_ou_sleep_until_open = true # Item 6  — depth + OU idle-sleep
 fast_boot_60s_deadline = true       # Item 7  — 60s deadline + degraded mode
 tick_gap_detector_60s_coalesce = true # Item 8 — 60s alert coalescing
 audit_tables_enabled = true         # Item 9  — 6 audit tables
-preopen_movers = true               # Item 10 — pre-open movers 09:00-09:13
+# Item 10 (preopen_movers) RETIRED 2026-05-03 — pre-open snapshot semantics
+# folded into the canonical `movers_1s.phase` SYMBOL column; operator
+# queries should now use `WHERE phase = 'PREOPEN'` against the movers_*
+# materialized views instead of the dropped `stock_movers` table.
 telegram_bucket_coalescer = true    # Item 11 — Telegram bucket coalescing
 market_open_self_test = true        # Item 12 — 09:15 IST self-test
 realtime_guarantee_score = true     # Item 13 — composite SLO score gauge
