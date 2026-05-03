@@ -19,15 +19,15 @@
 //! - A synthetic 200K-row VecDeque (the rescue ring's underlying type)
 //!   absorbs without panic — bounded memory, FIFO eviction.
 //! - The Wave 5 envelope numbers (11,018 instruments × ~10 pkts/sec ≈
-//!   ~110K tps) fit comfortably under the 600K ring capacity at >5s
-//!   QuestDB outage tolerance.
+//!   ~110K tps) fit comfortably under the 2M ring capacity (PR #452
+//!   bumped from 600K, 2026-05-03) at >18s QuestDB outage tolerance.
 //!
 //! What this test does NOT do:
 //! - Spin up a real QuestDB / parser / WS pipeline. The full burst test
 //!   requires Docker QuestDB + replay harness — see
 //!   `chaos_questdb_full_session.rs` for the integration path.
 //! - Promise "no drops ever". The honest envelope acknowledges that
-//!   beyond ~600K queued rows + spill capacity + DLQ, OS resources can
+//!   beyond ~2M queued rows + spill capacity + DLQ, OS resources can
 //!   exhaust. PROC-01 + RESOURCE-01..03 cover those.
 //!
 //! Run cost: ~10 ms. No Docker, no network, no root.
@@ -55,7 +55,7 @@ const WAVE_5_PEAK_TPS: usize = 110_180;
 /// Worst-case QuestDB outage the rescue ring should absorb without
 /// dropping a single row, per the plan's "≤60s outage absorbed" SLA.
 /// Result: 110,180 × 5 = 550,900 ticks queued at 5-second outage; the
-/// 600K ring covers it with 49,100 headroom.
+/// 2M ring (PR #452, was 600K) covers it with ~1.4M headroom.
 const WAVE_5_QUESTDB_OUTAGE_TOLERANCE_SECS: usize = 5;
 
 #[test]

@@ -1328,7 +1328,7 @@ async fn main() -> Result<()> {
                 .map(|p| std::sync::Arc::new(p.registry.clone()));
 
             // CRITICAL: Use new_disconnected() instead of None — ticks buffer in
-            // ring buffer (600K) + disk spill immediately, even before QuestDB connects.
+            // ring buffer (2M, PR #452 bumped from 600K) + disk spill immediately, even before QuestDB connects.
             // Without this, the only persistence path is the broadcast cold-path consumer,
             // which CAN drop ticks on lag (broadcast::Lagged). With new_disconnected(),
             // the hot-path writer buffers ALL ticks and drains when QuestDB is ready.
@@ -8153,7 +8153,7 @@ async fn run_tick_persistence_consumer(
                 // C2: CRITICAL — ticks permanently lost due to broadcast lag.
                 // This fires ERROR log → Loki → Telegram alert automatically.
                 // Root cause: QuestDB ILP flush is slower than tick ingestion rate.
-                // Defense: broadcast capacity 262K + tick writer ring buffer 600K + disk spill.
+                // Defense: broadcast capacity 262K + tick writer ring buffer 2M (PR #452) + disk spill.
                 error!(
                     skipped,
                     "CRITICAL: cold-path tick persistence lagged — {} ticks permanently lost",
