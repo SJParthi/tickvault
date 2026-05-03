@@ -35,12 +35,12 @@ ringbuf = "0.4.8"
 
 # ---- Section 4: Database & Cache ----
 questdb-rs = { version = "6.1.0", features = ["chrono_timestamp"] }
-redis = { version = "1.2.0", features = ["tokio-comp", "connection-manager"] }
+redis = { version = "1.2.1", features = ["tokio-comp", "connection-manager"] }
 deadpool-redis = "0.23.0"
 
 # ---- Section 5: Observability — Metrics ----
-metrics = "0.24.3"
-metrics-exporter-prometheus = "0.18.1"
+metrics = "0.24.5"
+metrics-exporter-prometheus = "0.18.3"
 hdrhistogram = "7.5.4"
 quanta = "0.12.6"
 
@@ -124,7 +124,7 @@ zeroize = { version = "1.8.2", features = ["derive"] }
 # ---- Section 14: TLS — Crypto Provider for rustls ----
 # Both tokio-tungstenite and reqwest depend on rustls 0.23+, which requires
 # an explicit CryptoProvider. We use aws-lc-rs (already in the dep tree).
-rustls = { version = "0.23.39", default-features = false, features = ["aws_lc_rs"] }
+rustls = { version = "0.23.40", default-features = false, features = ["aws_lc_rs"] }
 rustls-native-certs = "0.8.3"
 
 # ---- Section 11: AWS SDK ----
