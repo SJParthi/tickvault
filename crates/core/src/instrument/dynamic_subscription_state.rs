@@ -244,7 +244,7 @@ impl DynamicSubscriptionState {
             .copied()
             .filter(|key| !self.slot_assignment.contains_key(key))
             .collect();
-        to_add.sort_unstable_by(|a, b| (a.0, a.1.binary_code()).cmp(&(b.0, b.1.binary_code())));
+        to_add.sort_unstable_by_key(|key| (key.0, key.1.binary_code()));
         let added_count = to_add.len();
         for key in to_add {
             let (security_id, exchange_segment) = key;

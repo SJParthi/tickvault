@@ -995,7 +995,7 @@ async fn fetch_historical_candles_inner(
 
                     // Wave 0 progress log every PROGRESS_LOG_EVERY_N successful
                     // instruments — bounded to ~20-40 lines per full run.
-                    if wave == 0 && instruments_fetched % PROGRESS_LOG_EVERY_N == 0 {
+                    if wave == 0 && instruments_fetched.is_multiple_of(PROGRESS_LOG_EVERY_N) {
                         let pct = if targets.is_empty() {
                             0
                         } else {

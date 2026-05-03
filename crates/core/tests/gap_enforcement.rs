@@ -1224,10 +1224,14 @@ mod i_p0_06_emergency_download {
     fn test_i_p0_06_emergency_download_uses_critical_log() {
         let source = include_str!("../src/instrument/instrument_loader.rs");
 
-        // Must have CRITICAL log when all caches miss during market hours
+        // Must have CRITICAL log when the rkyv cache is corrupt during
+        // market hours. (The fresh-clone / first-boot branch is WARN by
+        // design — that's the expected emergency-download path, not an
+        // operational concern. See instrument_loader.rs:298-313 for the
+        // two-tier rationale.)
         assert!(
-            source.contains("CRITICAL: no instrument cache available during market hours"),
-            "I-P0-06: instrument_loader.rs must log CRITICAL when caches miss during market hours"
+            source.contains("CRITICAL: rkyv cache corrupt during market hours"),
+            "I-P0-06: instrument_loader.rs must log CRITICAL when rkyv cache is corrupt during market hours"
         );
 
         // Must have CRITICAL log when emergency download also fails
