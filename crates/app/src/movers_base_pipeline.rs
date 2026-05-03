@@ -187,6 +187,16 @@ fn lookup_segment_and_type(
 ///
 /// Pure function. O(1) papaya `get` + `NaiveDate → i64` conversion.
 /// Cold path (1s drain), not the tick processor hot path.
+///
+/// # Hostile-bug-hunt CRITICAL C1 fix (PR #450 commit 8 review)
+///
+/// chrono `and_utc()` interprets the `NaiveDateTime` as UTC, returning
+/// UTC-midnight epoch nanos. The Dhan instrument-master `expiry_date`
+/// is IST — so we MUST add `IST_UTC_OFFSET_NANOS` (5h30m) to recover
+/// the IST-midnight epoch nanos. Without this offset, the
+/// `?expiry=2026-05-29` filter on `/api/movers` matches contracts
+/// expiring 2026-05-28 because the stored value is 5.5h before the
+/// intended IST midnight.
 #[inline]
 #[must_use]
 fn lookup_expiry_date_ist_nanos(
@@ -204,10 +214,16 @@ fn lookup_expiry_date_ist_nanos(
         return 0;
     };
     // Convert NaiveDate → IST midnight epoch nanoseconds.
-    // The date is already IST per Dhan instrument-master convention.
-    date.and_hms_opt(0, 0, 0)
+    // The date is already IST per Dhan instrument-master convention,
+    // so we treat midnight-of-that-date as IST midnight, not UTC.
+    let utc_midnight_nanos = date
+        .and_hms_opt(0, 0, 0)
         .and_then(|dt| dt.and_utc().timestamp_nanos_opt())
-        .unwrap_or(0)
+        .unwrap_or(0);
+    if utc_midnight_nanos == 0 {
+        return 0;
+    }
+    utc_midnight_nanos.saturating_add(IST_UTC_OFFSET_NANOS)
 }
 
 /// 1s-aligned IST wall-clock timestamp in nanoseconds.
@@ -571,22 +587,43 @@ mod tests {
     }
 
     /// PR #450 commit 2 ratchet (2026-05-03): `lookup_expiry_date_ist_nanos`
-    /// MUST return a positive epoch-nanos value for a derivative
-    /// instrument with an expiry_date set in the registry. Pins that
-    /// the NaiveDate→epoch conversion fires correctly.
+    /// MUST return EXACT IST-midnight epoch nanos for a derivative
+    /// instrument's expiry_date. Hostile-bug-hunt CRITICAL C1
+    /// (commit 8 review): the bug was that chrono's `and_utc()`
+    /// returned UTC-midnight, off by 5h30m from intended IST midnight.
+    /// This ratchet pins the EXACT numeric value to prevent
+    /// regression.
     #[test]
-    fn test_lookup_expiry_date_ist_nanos_returns_positive_for_derivative_with_expiry() {
-        // Construct an OPTSTK on NSE_FNO (segment_code 2) with an
-        // explicit 2026-05-29 expiry. The default helper sets
-        // expiry_date = None which would yield 0 (the zero-case is
-        // covered by the registry-miss test above).
+    fn test_lookup_expiry_date_ist_nanos_returns_exact_ist_midnight_not_utc_midnight() {
         let mut inst = nse_fno_option_instrument(50000);
         inst.expiry_date = chrono::NaiveDate::from_ymd_opt(2026, 5, 29);
         let reg = build_registry_with(vec![inst]);
         let nanos = lookup_expiry_date_ist_nanos(&reg, 50000, 2);
-        assert!(
-            nanos > 0,
-            "derivative with expiry_date must yield positive nanos, got {nanos}"
+
+        // Expected IST midnight 2026-05-29 in UTC = 2026-05-28 18:30 UTC.
+        // chrono's NaiveDate(2026-05-29).and_hms(0,0,0).and_utc() returns
+        // UTC-midnight = 2026-05-29 00:00:00 UTC. We add IST_UTC_OFFSET_NANOS
+        // (5h30m = 19_800_000_000_000_000 nanos) so the stored value
+        // represents IST midnight as a UTC instant.
+        let expected_utc_midnight_2026_05_29 = chrono::NaiveDate::from_ymd_opt(2026, 5, 29)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp_nanos_opt()
+            .unwrap();
+        let expected = expected_utc_midnight_2026_05_29 + IST_UTC_OFFSET_NANOS;
+        assert_eq!(
+            nanos, expected,
+            "must return IST midnight (UTC midnight + 5h30m offset), \
+             got {nanos}, expected {expected}"
+        );
+        // Sanity: the difference between IST-midnight-stored and
+        // UTC-midnight is exactly the IST offset.
+        assert_eq!(
+            nanos - expected_utc_midnight_2026_05_29,
+            IST_UTC_OFFSET_NANOS,
+            "delta from UTC midnight must equal IST offset (5h30m)"
         );
     }
 

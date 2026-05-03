@@ -519,11 +519,12 @@ pub async fn get_movers(
         category: category.as_wire_str().to_string(),
         entries,
     };
-    (
-        StatusCode::OK,
-        Json(serde_json::to_value(&ok_response).unwrap_or(serde_json::Value::Null)),
-    )
-        .into_response()
+    // PR #450 commit 8 security-review MEDIUM-2 fix: axum::Json
+    // serialises directly via Serialize impl. The previous
+    // serde_json::to_value(...).unwrap_or(Value::Null) silently
+    // returned {available: null} HTTP 200 on serialization failure —
+    // a false-OK signal that violates audit-findings Rule 11.
+    (StatusCode::OK, Json(ok_response)).into_response()
 }
 
 fn bad_request(field: &str, accepts: &str) -> axum::response::Response {
@@ -759,11 +760,8 @@ pub async fn get_expiries(
         underlying: underlying_label,
         expiries,
     };
-    (
-        StatusCode::OK,
-        Json(serde_json::to_value(&ok_response).unwrap_or(serde_json::Value::Null)),
-    )
-        .into_response()
+    // PR #450 commit 8 security-review MEDIUM-2 fix: same as get_movers.
+    (StatusCode::OK, Json(ok_response)).into_response()
 }
 
 /// Parses the QuestDB `/exec` JSON dataset into a sorted Vec of
