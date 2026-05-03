@@ -1562,11 +1562,51 @@ pub const GRACEFUL_SHUTDOWN_TIMEOUT_SECS: u64 = 10;
 
 /// Maximum time to wait for initial token acquisition at startup (seconds).
 /// Prevents indefinite hang if Dhan API is unreachable on boot.
-pub const TOKEN_INIT_TIMEOUT_SECS: u64 = 300;
+///
+/// Audit Finding #7 (2026-05-03): MUST be `<= BOOT_TIMEOUT_SECS` so the
+/// umbrella boot deadline cannot fire BEFORE this step has had a chance
+/// to complete. The previous value (300s) exceeded the umbrella (120s)
+/// — umbrella would alert at 120s while Dhan auth was still trying.
+/// Pinned by `crates/common/tests/boot_timeout_consistency_guard.rs`.
+///
+/// Observed real-world Dhan auth latency: ~0.4s on a healthy network
+/// (verified in 2026-05-03 boot logs). 90s gives 200x headroom for
+/// network blips while still respecting the umbrella.
+pub const TOKEN_INIT_TIMEOUT_SECS: u64 = 90;
 
 /// Maximum consecutive renewal circuit-breaker cycles before the renewal loop
 /// halts and raises a critical alert. Prevents infinite retry with expired token.
 pub const TOKEN_RENEWAL_MAX_CIRCUIT_BREAKER_CYCLES: u32 = 5;
+
+/// Audit Finding #6 (2026-05-03): periodic token-sweep cadence.
+///
+/// The primary `renewal_loop` sleeps until the per-token refresh window
+/// (typically about 23h after issuance) and retries with exponential
+/// backoff plus circuit breaker. After
+/// `TOKEN_RENEWAL_MAX_CIRCUIT_BREAKER_CYCLES` consecutive failures the
+/// loop HALTS and the token will eventually expire, leaving a gap with
+/// no automatic recovery on a 24h+ uptime session.
+///
+/// The token-sweep task closes this gap. Every `TOKEN_SWEEP_INTERVAL_SECS`
+/// seconds it calls `force_renewal_if_stale(threshold_secs = 14400)`
+/// which renews if there is less than 4h headroom remaining. Even if
+/// the primary loop has halted, the sweep keeps trying because each
+/// call is independent and uses the same retry-with-backoff path.
+///
+/// Cadence: 4h (14_400s). Pinned to match the
+/// `force_renewal_if_stale` threshold so the worst case is one full
+/// sweep cycle (4h) of staleness on top of the 4h threshold, giving
+/// 8h total worst-case before forced renewal.
+pub const TOKEN_SWEEP_INTERVAL_SECS: u64 = 4 * 3600;
+
+/// Audit Finding #6 (2026-05-03): token-sweep staleness threshold.
+///
+/// Passed to `force_renewal_if_stale(threshold_secs)`. If the loaded
+/// token has fewer seconds of validity left than this, the sweep
+/// triggers a renewal. 4h aligns with the existing WS-wake call sites
+/// (main feed, depth, order update) so behaviour is uniform across all
+/// renewal triggers.
+pub const TOKEN_SWEEP_STALENESS_THRESHOLD_SECS: i64 = 4 * 3600;
 
 // DELETED: FRAME_SEND_TIMEOUT_SECS and FRAME_BACKPRESSURE_TIMEOUT_SECS
 // Removed per P1.3 — WS readers use non-blocking try_send() + WAL spill,

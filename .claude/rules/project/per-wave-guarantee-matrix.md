@@ -60,10 +60,15 @@ When any plan / PR / commit body uses the phrase "100% guarantee", it MUST be
 qualified exactly:
 
 > "100% inside the tested envelope, with ratcheted regression coverage:
-> ≤60s QuestDB outage absorbed by rescue→spill→DLQ; ≤600K rescue ring
-> capacity; bench-gated O(1) hot path; composite-key uniqueness;
-> chaos-tested 70h sleep/wake. Beyond the envelope, DLQ NDJSON catches
-> every payload as recoverable text."
+> ≤60s QuestDB outage absorbed by rescue→spill→DLQ; ≤600,000-tick ring
+> buffer capacity (constant `TICK_BUFFER_CAPACITY`,
+> `crates/common/src/constants.rs`, ratcheted by
+> `crates/storage/tests/zero_tick_loss_alert_guard.rs`); bench-gated
+> O(1) hot path; composite-key uniqueness; chaos-tested 65h Fri 16:00
+> IST → Mon 09:00 IST weekend sleep/wake
+> (`crates/core/tests/ws_sleep_resilience.rs`). Beyond the envelope,
+> DLQ NDJSON catches every payload as recoverable text. Outstanding
+> (Wave-6): >65h holiday-weekend dormant sleep test (W6-2)."
 
 Promising literal "WebSocket never disconnects" or "QuestDB never fails"
 without the envelope qualifier = REJECT IN REVIEW.

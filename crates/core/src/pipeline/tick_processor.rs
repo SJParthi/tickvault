@@ -501,6 +501,7 @@ fn persist_option_movers_snapshot(
                             ot,
                             inst.strike_price.unwrap_or(0.0),
                             inst.expiry_date
+                                // O(1) EXEMPT: cold path (stock-movers snapshot, max 180 rows / minute).
                                 .map(|d| d.format("%Y-%m-%d").to_string())
                                 .unwrap_or_default(),
                         )
@@ -508,6 +509,7 @@ fn persist_option_movers_snapshot(
                 let (contract_name, underlying, option_type_str, strike, expiry_str) =
                     match enriched {
                         Some((cn, ul, ot, st, ex)) => (cn, ul, ot, st, ex),
+                        // O(1) EXEMPT: cold path — `String::new()` is empty-string sentinel.
                         None => ("", "", "", 0.0, String::new()),
                     };
 
@@ -638,12 +640,14 @@ fn persist_option_movers_full_snapshot(
                         ot,
                         inst.strike_price.unwrap_or(0.0),
                         inst.expiry_date
+                            // O(1) EXEMPT: cold path (option-movers snapshot, max 140 rows / minute).
                             .map(|d| d.format("%Y-%m-%d").to_string())
                             .unwrap_or_default(),
                     )
                 });
             let (contract_name, underlying, option_type_str, strike, expiry_str) = match enriched {
                 Some((cn, ul, ot, st, ex)) => (cn, ul, ot, st, ex),
+                // O(1) EXEMPT: cold path — `String::new()` is empty-string sentinel.
                 None => ("", "", "", 0.0, String::new()),
             };
             const SPOT_PRICE_NOT_AVAILABLE: f64 = 0.0;

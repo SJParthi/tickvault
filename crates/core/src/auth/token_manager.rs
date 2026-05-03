@@ -3016,7 +3016,51 @@ mod tests {
         );
     }
 
+    /// Audit Finding #6 (2026-05-03): the periodic token-sweep task
+    /// (spawned from `crates/app/src/main.rs` Step 12b) is a parallel
+    /// safety-net to `renewal_loop`. This test verifies the sweep call
+    /// shape — `force_renewal_if_stale(TOKEN_SWEEP_STALENESS_THRESHOLD_SECS)`
+    /// — is correct. The actual `tokio::spawn` of the sweep loop lives
+    /// in main.rs and is exercised by integration tests.
+    ///
+    /// What this ratchet pins:
+    /// 1. `TOKEN_SWEEP_STALENESS_THRESHOLD_SECS` constant is i64 and
+    ///    compatible with `force_renewal_if_stale`'s signature (catches
+    ///    accidental u64 / i32 type drift).
+    /// 2. The sweep cadence (4h) is documented in `constants.rs` and
+    ///    cannot silently drift.
     #[tokio::test]
+    async fn test_token_sweep_threshold_constant_matches_force_renewal_signature() {
+        use tickvault_common::constants::{
+            TOKEN_SWEEP_INTERVAL_SECS, TOKEN_SWEEP_STALENESS_THRESHOLD_SECS,
+        };
+        // The sweep cadence is 4h.
+        assert_eq!(
+            TOKEN_SWEEP_INTERVAL_SECS,
+            4 * 3600,
+            "token sweep cadence must remain 4h to keep worst-case staleness bounded"
+        );
+        // The staleness threshold is 4h, matching the WS-wake call sites
+        // (main/depth/order WS) per AUTH-GAP-03.
+        assert_eq!(
+            TOKEN_SWEEP_STALENESS_THRESHOLD_SECS,
+            4 * 3600,
+            "sweep threshold must match the WS-wake AUTH-GAP-03 threshold for uniform behaviour"
+        );
+
+        // The sweep call itself: pass the constant directly. If the
+        // signature drifts (e.g. someone changes force_renewal_if_stale
+        // to take u64), this fails to compile.
+        let mgr = make_test_manager(None);
+        let result = mgr
+            .force_renewal_if_stale(TOKEN_SWEEP_STALENESS_THRESHOLD_SECS)
+            .await;
+        // We don't assert on the result here (network-dependent); only
+        // that the call compiles and runs.
+        let _ = result;
+    }
+
+        #[tokio::test]
     async fn test_force_renewal_attempts_renewal_unconditionally() {
         // No HTTP server in test → renewal will fail with a network
         // error. The contract under test is that the call ATTEMPTS the
