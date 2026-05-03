@@ -405,11 +405,23 @@ pub async fn run_one_shot_legacy_retire_migration_2026_05_03(client: &Client, ba
     // Step 0: ensure marker table exists (idempotent — QuestDB returns
     // success for `CREATE TABLE IF NOT EXISTS` even when the table is
     // already there).
+    //
+    // Audit-2026-05-03 FIX (security-reviewer MED): use GET `/exec` with
+    // `query=` parameter — the QuestDB `/exec` endpoint contract.
+    // Earlier draft used `client.post(base_url).body(marker_ddl)` which
+    // silently fails (the server does NOT read DDL from POST body) →
+    // marker never created → DROP would re-run every boot. Matches the
+    // proven 2026-05-01 cleanup-migration call pattern at line 309.
     let marker_ddl = format!(
         "CREATE TABLE IF NOT EXISTS {LEGACY_RETIRE_MARKER_TABLE} (applied_at TIMESTAMP) \
          TIMESTAMP(applied_at) PARTITION BY YEAR;"
     );
-    if let Err(err) = client.post(base_url).body(marker_ddl).send().await {
+    if let Err(err) = client
+        .get(base_url)
+        .query(&[("query", marker_ddl.as_str())])
+        .send()
+        .await
+    {
         warn!(
             ?err,
             "legacy-retire marker CREATE failed (continuing) — will retry next boot"
@@ -623,12 +635,19 @@ pub async fn ensure_movers_tables_and_views(questdb_config: &QuestDbConfig) {
     // Idempotent on subsequent boots.
     run_one_shot_cleanup_migration(&client, &base_url).await;
 
-    // Step 0b: Audit-2026-05-03 — one-shot DROP of legacy `stock_movers`
-    // + `option_movers` tables. Their writers (StockMoversWriter +
-    // OptionMoversWriter) were retired in this PR; the `movers_1s` +
-    // 25 mat views fully cover their query surface via
-    // `instrument_type` + `phase` columns. Marker-gated, idempotent.
-    run_one_shot_legacy_retire_migration_2026_05_03(&client, &base_url).await;
+    // Step 0b: Audit-2026-05-03 — DEFERRED to PR #445.
+    //
+    // The DROP migration `run_one_shot_legacy_retire_migration_2026_05_03`
+    // is implemented + tested in this file but DELIBERATELY NOT WIRED
+    // into the boot fan-out yet. Reason (per 3-agent adversarial review
+    // 2026-05-03 Finding C1): `crates/api/src/handlers/market_data.rs`
+    // routes `/api/stock-movers` (line 258) and `/api/option-movers`
+    // (line 380) still query the legacy `stock_movers` + `option_movers`
+    // tables directly. Dropping the tables before the API handlers are
+    // migrated to query `movers_1m` (with `instrument_type` + `phase`
+    // filters) would cause silent 5xx on those endpoints after the
+    // first post-merge boot. PR #445 migrates the API handlers AND
+    // wires the DROP migration in the same change.
 
     // Step 1: base table.
     let create_base = movers_1s_create_ddl();

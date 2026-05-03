@@ -208,8 +208,8 @@
     },
     {
       "type": "stat",
-      "title": "Pre-open movers persisted (24h)",
-      "description": "Wave 3-A Item 10. Rows persisted to stock_movers with phase=PREOPEN during the 09:00-09:13 IST window. Expected ~218 rows per snapshot (216 stocks + NIFTY + BANKNIFTY) every 60s for ~13 minutes = ~2,800 rows per trading day. Wrapped in increase() per audit-findings Rule 12 so the panel doesn't lie after a process restart.",
+      "title": "Pre-open movers persisted (24h) — RETIRED 2026-05-03",
+      "description": "RETIRED 2026-05-03 by PR #444 — PreopenMoversTracker subsystem deleted; phase=PREOPEN rows now live in `movers_1s.phase`. Use QuestDB `SELECT count() FROM movers_1s WHERE phase='PREOPEN' AND ts > now() - INTERVAL '24 hours'` instead. The Prometheus metric `tv_preopen_movers_total` was emitted by the deleted writer and will read zero forever — `vector(0)` keeps the panel green by intent until follow-up PR repoints to a canonical metric.",
       "id": 8,
       "gridPos": {
         "h": 5,
@@ -227,8 +227,8 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum(increase(tv_preopen_movers_total[24h]))",
-          "legendFormat": "rows persisted",
+          "expr": "vector(0)",
+          "legendFormat": "RETIRED — see panel description",
           "refId": "A"
         }
       ],
@@ -271,8 +271,8 @@
     },
     {
       "type": "stat",
-      "title": "Pre-open movers persist errors (24h)",
-      "description": "MOVERS-03 \u2014 pre-open movers append/flush failures (broken out by stage label). Any non-zero value during 09:00-09:13 IST means the audit trail for this morning's pre-open spread is partially lost. Runbook: .claude/rules/project/wave-1-error-codes.md#movers-03",
+      "title": "Pre-open movers persist errors (24h) \u2014 RETIRED 2026-05-03",
+      "description": "RETIRED 2026-05-03 by PR #444 \u2014 PreopenMoversTracker subsystem deleted; persist errors now route through canonical `tv_movers_writer_dropped_total` for the unified `movers_1s` writer. The metric `tv_preopen_movers_persist_errors_total` is no longer emitted. `vector(0)` keeps the panel green until a follow-up PR repoints the alert to the canonical writer error metric.",
       "id": 9,
       "gridPos": {
         "h": 5,
@@ -290,8 +290,8 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum by (stage) (increase(tv_preopen_movers_persist_errors_total[24h]))",
-          "legendFormat": "{{stage}}",
+          "expr": "vector(0)",
+          "legendFormat": "RETIRED — see panel description",
           "refId": "A"
         }
       ],
