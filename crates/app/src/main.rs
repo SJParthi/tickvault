@@ -1807,15 +1807,24 @@ async fn main() -> Result<()> {
         });
 
         // --- Background: Historical candle fetch ---
+        // PR #449 (operator clarification 2026-05-03): historical fetch
+        // is gated behind `features.historical_fetch_enabled`. Defaults
+        // to OFF until broker-traded source (PR #455 Groww) lands.
         let post_market_signal = std::sync::Arc::new(tokio::sync::Notify::new());
-        if let Some(ref tm) = token_manager {
-            spawn_historical_candle_fetch(
-                &subscription_plan,
-                &config,
-                tm,
-                &notifier,
-                std::sync::Arc::clone(&post_market_signal),
-                is_trading,
+        if config.features.historical_fetch_enabled {
+            if let Some(ref tm) = token_manager {
+                spawn_historical_candle_fetch(
+                    &subscription_plan,
+                    &config,
+                    tm,
+                    &notifier,
+                    std::sync::Arc::clone(&post_market_signal),
+                    is_trading,
+                );
+            }
+        } else {
+            info!(
+                "historical candle fetch DISABLED (features.historical_fetch_enabled = false, PR #449)"
             );
         }
 
@@ -6387,16 +6396,26 @@ async fn main() -> Result<()> {
 
     // -----------------------------------------------------------------------
     // Step 9.5: Background historical candle fetch (cold path — never blocks live)
+    // PR #449 (operator clarification 2026-05-03): gated behind
+    // `features.historical_fetch_enabled`. Defaults to OFF until broker-
+    // traded source (PR #455 Groww) lands. Verify + cross-match inside
+    // `spawn_historical_candle_fetch` are also skipped when disabled.
     // -----------------------------------------------------------------------
     let post_market_signal = std::sync::Arc::new(tokio::sync::Notify::new());
-    spawn_historical_candle_fetch(
-        &subscription_plan,
-        &config,
-        &token_manager,
-        &notifier,
-        std::sync::Arc::clone(&post_market_signal),
-        is_trading,
-    );
+    if config.features.historical_fetch_enabled {
+        spawn_historical_candle_fetch(
+            &subscription_plan,
+            &config,
+            &token_manager,
+            &notifier,
+            std::sync::Arc::clone(&post_market_signal),
+            is_trading,
+        );
+    } else {
+        info!(
+            "historical candle fetch DISABLED (features.historical_fetch_enabled = false, PR #449)"
+        );
+    }
 
     // -----------------------------------------------------------------------
     // Step 9.6: Background greeks pipeline (option chain fetch → compute → persist)
