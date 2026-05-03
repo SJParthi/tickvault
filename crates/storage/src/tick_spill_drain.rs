@@ -233,13 +233,12 @@ mod tests {
 
         // Wait a short window for the async write to complete.
         for _ in 0..50 {
-            if path.exists() {
-                if let Ok(contents) = tokio::fs::read(&path).await
-                    && contents == payload
-                {
-                    let _ = tokio::fs::remove_file(&path).await;
-                    return;
-                }
+            if path.exists()
+                && let Ok(contents) = tokio::fs::read(&path).await
+                && contents == payload
+            {
+                let _ = tokio::fs::remove_file(&path).await;
+                return;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }

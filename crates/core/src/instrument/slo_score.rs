@@ -400,7 +400,7 @@ mod tests {
         let outcome = evaluate_slo_score(&inputs);
         match outcome {
             SloOutcome::Critical { score, weakest } => {
-                assert!(score >= 0.0 && score <= 1.0, "score {score} out of range");
+                assert!((0.0..=1.0).contains(&score), "score {score} out of range");
                 assert_eq!(score, 0.0);
                 // Tied at 0.0 — declaration-order tie-break gives qdb first.
                 assert_eq!(weakest, "qdb_health");

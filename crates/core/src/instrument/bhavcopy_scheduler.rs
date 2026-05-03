@@ -49,7 +49,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, FixedOffset, NaiveTime, Utc};
+use chrono::{DateTime, FixedOffset, NaiveTime, Timelike, Utc};
 use tokio::process::Command;
 use tracing::info;
 
@@ -465,7 +465,3 @@ mod tests {
         assert_eq!(classify_bhavcopy_failure(&err), "csv_not_utf8");
     }
 }
-
-// `chrono::Timelike` is required for `.hour()` etc. on NaiveTime —
-// import shadow at module scope to avoid leaking into doctests.
-use chrono::Timelike;
