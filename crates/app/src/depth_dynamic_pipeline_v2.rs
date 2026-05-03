@@ -90,10 +90,12 @@ const RESELECT_INTERVAL_SECS: u64 = 60;
 /// HTTP timeout for the QuestDB selector query.
 const QUESTDB_SELECT_TIMEOUT_SECS: u64 = 10;
 
-/// Default Stage-1 cohort size if config does not set one. Matches
-/// the prior hardcoded constant and is a 5× safety margin over the
-/// largest K=250 used by depth-20.
-pub const DEFAULT_COHORT_SIZE: usize = 500;
+/// Audit-2026-05-03: default minimum cumulative session volume floor
+/// for the redesigned Stage 1 liquidity gate. Replaces the legacy
+/// `DEFAULT_COHORT_SIZE = 500`. Operators calibrate per-environment;
+/// 10_000 is a defensive floor that excludes truly illiquid contracts
+/// while admitting the typical NIFTY/BANKNIFTY option chain volumes.
+pub const DEFAULT_MIN_LIQUIDITY_VOLUME: u64 = 10_000;
 
 /// Default SQL freshness window if config does not set one. Filters
 /// stale post-market data.
@@ -117,12 +119,13 @@ pub struct PipelineConfig {
     /// Conventional values: `"depth-20-dynamic"` and
     /// `"depth-200-dynamic"`.
     pub label: &'static str,
-    /// Stage-1 SQL cohort size — top-N-by-volume rows fetched before
-    /// Stage-2 re-rank. Threaded from
-    /// `[depth_*.dynamic.universe].cohort_size`. (Security-review
-    /// MEDIUM 3 fix — was previously a hardcoded constant that
-    /// silently ignored the operator's config.)
-    pub cohort_size: usize,
+    /// Audit-2026-05-03 (operator clarification): liquidity gate for
+    /// Stage 1 SQL. Replaces the legacy `cohort_size` top-N parameter.
+    /// Only contracts with `volume >= min_liquidity_volume` qualify
+    /// for Stage 2 ranking — guarantees liquidity for live-trade
+    /// depth subscriptions. Threaded from
+    /// `[depth_*.dynamic.universe].min_liquidity_volume`.
+    pub min_liquidity_volume: u64,
     /// SQL freshness window. Threaded from
     /// `[depth_*.dynamic.universe].window_secs`.
     pub window_secs: u32,
@@ -155,11 +158,11 @@ pub fn spawn_depth_dynamic_pool(
         let mut state = DynamicSubscriptionState::new(cfg.shape);
         // 2026-05-02 — operator-requested wall-clock alignment. Replace
         // boot-aligned `tokio::time::interval(60s)` with `interval_at`
-        // anchored to today's 09:15:01 IST (or "now" if already past).
+        // anchored to today's 09:15:00 IST (or "now" if already past).
         // Without this fix, a boot at 08:50:30 IST would tick at
         // 08:51:30, 08:52:30, …, 09:14:30, then 09:15:30 — missing the
         // critical 09:15:00→09:15:30 window where movers_1s first
-        // populates. Operator's spec: "at 09:15:01 it should be
+        // populates. Operator's spec: "at 09:15:00 it should be
         // captured and started — should not wait till 09:16".
         let first_cycle_at = compute_first_cycle_instant_today();
         let mut tick =
@@ -189,12 +192,12 @@ pub fn spawn_depth_dynamic_pool(
         let mut last_seen_ist_day = current_ist_trading_day();
 
         // 2026-05-02 — operator-requested two-phase cadence. First tick
-        // of each trading day fires at 09:15:01 IST (initial subscribe);
+        // of each trading day fires at 09:15:00 IST (initial subscribe);
         // every subsequent tick fires at the next :00 minute boundary
         // (09:16:00, 09:17:00, …). `realigned_to_minute` flips true
         // after the first in-market cycle dispatches, triggering the
         // interval reset to the minute-boundary schedule. Reset to
-        // false on daily-rollover so tomorrow's 09:15:01 fires the
+        // false on daily-rollover so tomorrow's 09:15:00 fires the
         // special first cycle again.
         let mut realigned_to_minute = false;
 
@@ -257,12 +260,12 @@ pub fn spawn_depth_dynamic_pool(
                             previous = last_seen_ist_day,
                             current = today_ist,
                             "depth_dynamic_pool_v2 IST midnight rollover — resetting diff state \
-                             + re-aligning interval to today's 09:15:01"
+                             + re-aligning interval to today's 09:15:00"
                         );
                         state = DynamicSubscriptionState::new(cfg.shape);
                         last_seen_ist_day = today_ist;
                         // 2026-05-02 — re-align the interval to today's
-                        // 09:15:01 IST so the first cycle each day fires
+                        // 09:15:00 IST so the first cycle each day fires
                         // exactly at market open + 1s, not boot-time-aligned.
                         // Without this, the schedule drifts off the wall
                         // clock day-by-day (interval ticks every 60s
@@ -276,10 +279,10 @@ pub fn spawn_depth_dynamic_pool(
                         );
                         // Reset the minute-boundary realignment flag so
                         // tomorrow's first cycle fires at the special
-                        // 09:15:01 anchor, then re-aligns to :00 boundaries.
+                        // 09:15:00 anchor, then re-aligns to :00 boundaries.
                         realigned_to_minute = false;
                         // Skip the rest of this cycle — next tick.tick()
-                        // will fire at today's 09:15:01.
+                        // will fire at today's 09:15:00.
                         continue;
                     }
                     let cohort = match fetch_cohort_from_questdb(&cfg).await {
@@ -469,11 +472,11 @@ pub fn spawn_depth_dynamic_pool(
 
                     // 2026-05-02 — operator-requested cadence transition.
                     // After the FIRST in-market cycle dispatches (at
-                    // 09:15:01), re-anchor the interval to the next
+                    // 09:15:00), re-anchor the interval to the next
                     // wall-clock minute boundary so subsequent cycles
                     // fire at 09:16:00, 09:17:00, … instead of
                     // 09:16:01, 09:17:01, … (the natural drift of
-                    // interval_at(09:15:01, 60s)).
+                    // interval_at(09:15:00, 60s)).
                     if !realigned_to_minute {
                         let next_minute = compute_next_minute_boundary_instant();
                         info!(
@@ -505,7 +508,7 @@ async fn fetch_cohort_from_questdb(cfg: &PipelineConfig) -> anyhow::Result<Vec<M
     let sql = build_cohort_sql(
         &cfg.selector.exchange_segments,
         &cfg.selector.instrument_types,
-        cfg.cohort_size,
+        cfg.min_liquidity_volume,
         cfg.window_secs,
     );
     let url = format!("http://{}:{}/exec", cfg.questdb.host, cfg.questdb.http_port);
@@ -910,18 +913,22 @@ fn current_ist_trading_day() -> i64 {
 }
 
 /// Wall-clock target for the FIRST selection cycle of each trading
-/// day: 09:15:01 IST. One second after market open so movers_1s has
-/// at least one populated 1-second bucket from the first F&O ticks.
-const FIRST_CYCLE_SECS_OF_DAY_IST: u32 = 9 * 3600 + 15 * 60 + 1;
+/// day: 09:15:00 IST per operator clarification 2026-05-03.
+///
+/// Earlier 09:15:00 was over-engineering — movers compute per-tick
+/// (not averaged), so the F&O opening tick at 09:15:00 IS the highest-
+/// information `change_pct` of the day and MUST be captured. Aligns
+/// with the exchange's stated MARKET start (09:15:00).
+const FIRST_CYCLE_SECS_OF_DAY_IST: u32 = 9 * 3600 + 15 * 60;
 
-/// 2026-05-02 — operator-requested cadence:
-///   * Tick 1 at 09:15:01 IST (initial subscribe — uses
-///     `compute_first_cycle_instant_today`)
+/// Operator-requested cadence (audit-2026-05-03 boundary update):
+///   * Tick 1 at 09:15:00 IST (initial subscribe — uses
+///     `compute_first_cycle_instant_today`). Captures F&O opening tick.
 ///   * Tick 2 at 09:16:00 IST (first minute-aligned re-rebalance)
 ///   * Tick 3 at 09:17:00 IST
 ///   * Tick N at 09:14+N:00 IST
 ///
-/// After the first cycle fires at 09:15:01, the interval is re-anchored
+/// After the first cycle fires at 09:15:00, the interval is re-anchored
 /// to the next minute boundary so subsequent ticks land on `:00`
 /// seconds — matching the operator's stated "from 9.16.00 dynamic
 /// movement should happen" cadence.
@@ -949,16 +956,16 @@ fn compute_next_minute_boundary_instant() -> tokio::time::Instant {
 
 /// 2026-05-02 — operator-requested first-cycle alignment.
 ///
-/// Returns a `tokio::time::Instant` for the next 09:15:01 IST anchor
+/// Returns a `tokio::time::Instant` for the next 09:15:00 IST anchor
 /// point. Behaviour:
-///   * Pre-09:15:01 today → returns Instant for today's 09:15:01
-///   * Post-09:15:01 today → returns `Instant::now()` so the first
+///   * Pre-09:15:00 today → returns Instant for today's 09:15:00
+///   * Post-09:15:00 today → returns `Instant::now()` so the first
 ///     `tick.tick().await` fires immediately (boot-after-market-open
 ///     case, e.g. crash recovery at 11:30 IST)
 ///
 /// Combined with `tokio::time::interval_at(start, 60s)`, the first
 /// selection cycle of each day fires within OS-scheduler latency
-/// (~1ms typical) of 09:15:01 IST, eliminating the up-to-60-second
+/// (~1ms typical) of 09:15:00 IST, eliminating the up-to-60-second
 /// blind spot the legacy boot-aligned `interval(60s)` introduced.
 ///
 /// Subsequent ticks fire at +60s, +120s, …; daily-rollover handler
@@ -1141,12 +1148,15 @@ mod tests {
         );
     }
 
-    /// 2026-05-02 — operator-requested first-cycle alignment.
-    /// Pin the constant at 09:15:01 IST.
+    /// Audit-2026-05-03 (operator clarification): first cycle pinned
+    /// at 09:15:00 IST (was 09:15:00). The F&O opening tick MUST be
+    /// captured — it carries the highest-information change_pct of
+    /// the day. Aligns with movers MARKET start (09:15:00) and the
+    /// exchange's stated MARKET window boundary.
     #[test]
-    fn test_first_cycle_secs_of_day_ist_pinned_at_09_15_01() {
-        // 09:15:01 IST = 9*3600 + 15*60 + 1 = 33_301
-        assert_eq!(FIRST_CYCLE_SECS_OF_DAY_IST, 33_301);
+    fn test_first_cycle_secs_of_day_ist_pinned_at_09_15_00_per_operator_clarification() {
+        // 09:15:00 IST = 9*3600 + 15*60 = 33_300
+        assert_eq!(FIRST_CYCLE_SECS_OF_DAY_IST, 33_300);
     }
 
     /// Ratchet: the helper returns an Instant that is `Instant::now()`
@@ -1182,7 +1192,7 @@ mod tests {
     }
 
     /// Operator-requested cadence: minute-boundary alignment AFTER the
-    /// first 09:15:01 cycle. The helper must return an Instant that is
+    /// first 09:15:00 cycle. The helper must return an Instant that is
     /// 1..=60 seconds away from now — never zero, never more than 60.
     #[test]
     fn test_compute_next_minute_boundary_instant_within_one_minute_window() {
@@ -1242,11 +1252,17 @@ mod tests {
         assert_eq!(RESELECT_INTERVAL_SECS, 60);
     }
 
+    /// Audit-2026-05-03 ratchet: default min-volume floor must be
+    /// strictly positive (zero would bypass the liquidity gate).
+    /// Replaces the legacy `test_cohort_size_default_is_at_least_5x_max_k`.
     #[test]
-    fn test_cohort_size_default_is_at_least_5x_max_k() {
-        // Default cohort size must be large enough to absorb Stage-2
-        // filter attrition for the largest K (=250 for depth-20).
-        assert!(DEFAULT_COHORT_SIZE >= 250);
+    fn test_default_min_liquidity_volume_is_positive_floor() {
+        assert!(
+            DEFAULT_MIN_LIQUIDITY_VOLUME > 0,
+            "default min_liquidity_volume must reject illiquid contracts"
+        );
+        // Pin the specific value to make config-drift detectable.
+        assert_eq!(DEFAULT_MIN_LIQUIDITY_VOLUME, 10_000);
     }
 
     #[test]

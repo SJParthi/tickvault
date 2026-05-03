@@ -2881,11 +2881,13 @@ async fn main() -> Result<()> {
                     sids_per_conn: config.depth_20.dynamic.sids_per_conn,
                 },
                 label: "depth-20-dynamic",
-                // Security-review MEDIUM 3 fix: thread the operator's
-                // [depth_*.dynamic.universe] cohort_size + window_secs
-                // through to the pipeline. Previously these TOML fields
-                // were read but silently overridden by hardcoded constants.
-                cohort_size: config.depth_20.dynamic.universe.cohort_size,
+                // Audit-2026-05-03 redesign: thread the operator's
+                // [depth_*.dynamic.universe] min_liquidity_volume +
+                // window_secs through to the pipeline. The legacy
+                // cohort_size top-N param was retired — only liquid
+                // contracts (volume >= min_liquidity_volume) qualify
+                // for depth subscription per operator clarification.
+                min_liquidity_volume: config.depth_20.dynamic.universe.min_liquidity_volume,
                 window_secs: config.depth_20.dynamic.universe.window_secs,
                 // 2026-05-02 — operator-requested symbol-level Telegram
                 // diff event. Registry resolves (sid, segment) → display
@@ -2996,7 +2998,8 @@ async fn main() -> Result<()> {
                     sids_per_conn: config.depth_200.dynamic.sids_per_conn,
                 },
                 label: "depth-200-dynamic",
-                cohort_size: config.depth_200.dynamic.universe.cohort_size,
+                // Audit-2026-05-03: same min-volume liquidity gate as depth-20.
+                min_liquidity_volume: config.depth_200.dynamic.universe.min_liquidity_volume,
                 window_secs: config.depth_200.dynamic.universe.window_secs,
                 registry: slow_registry.clone(),
                 notifier: Some(notifier.clone()),

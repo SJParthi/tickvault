@@ -117,18 +117,35 @@ impl DepthDynamicConfig {
         if self.sids_per_conn == 0 {
             bail!("{label}.dynamic.sids_per_conn must be > 0");
         }
+        // Audit-2026-05-03 (hostile-bug-hunt H1 fix): validate the
+        // product `conns × sids_per_conn` against the selector's
+        // `MAX_K = 250` cap at BOOT, not at the first 60s tick.
+        // Without this check, an operator who sets `sids_per_conn = 100`
+        // (k = 5×100 = 500 > MAX_K) would boot cleanly and then the app
+        // would PANIC at the first selector cycle during market hours.
+        // Mirrors the runtime assert in
+        // `crates/core/src/instrument/depth_dynamic_top_volume_selector.rs::select_top_k_dynamic`.
+        const MAX_K_SELECTOR: usize = 250;
+        let total_k = usize::from(self.conns) * usize::from(self.sids_per_conn);
+        if total_k > MAX_K_SELECTOR {
+            bail!(
+                "{label}.dynamic: conns ({}) × sids_per_conn ({}) = {} exceeds selector cap of {} \
+                 — set conns/sids_per_conn so the product is <= {}",
+                self.conns,
+                self.sids_per_conn,
+                total_k,
+                MAX_K_SELECTOR,
+                MAX_K_SELECTOR,
+            );
+        }
         if self.universe.exchange_segments.is_empty() {
             bail!("{label}.dynamic.universe.exchange_segments must be non-empty");
         }
-        if self.universe.cohort_size == 0 {
-            bail!("{label}.dynamic.universe.cohort_size must be > 0");
-        }
-        let total = usize::from(self.conns) * usize::from(self.sids_per_conn);
-        if self.universe.cohort_size < total {
+        if self.universe.min_liquidity_volume == 0 {
             bail!(
-                "{label}.dynamic.universe.cohort_size ({}) must be >= conns × sids_per_conn ({})",
-                self.universe.cohort_size,
-                total
+                "{label}.dynamic.universe.min_liquidity_volume must be > 0 \
+                 — set to a realistic floor (e.g. 10_000 contracts) per \
+                 audit-2026-05-03 operator clarification"
             );
         }
         if self.universe.window_secs == 0 {
@@ -167,9 +184,22 @@ pub struct DepthDynamicUniverseConfig {
     /// Allowed `InstrumentType` enum names. Empty list → no filter.
     #[serde(default)]
     pub instrument_types: Vec<String>,
-    /// Stage-1 cohort size — number of top-volume rows pulled from
-    /// `movers_1m` before the Stage-2 re-rank.
-    pub cohort_size: usize,
+    /// Audit-2026-05-03 (operator clarification): minimum cumulative
+    /// session volume required for a contract to qualify for depth
+    /// subscription. Replaces the legacy `cohort_size` top-N param —
+    /// liquidity is now the primary filter (was rank-by-volume), so
+    /// every depth-subscribed contract is liquid enough for live
+    /// trading. Operators calibrate against real `movers_1m` data;
+    /// typical floors: 10_000-100_000 contracts depending on liquidity
+    /// regime. Must be `>= 1`.
+    ///
+    /// `serde(default)` so partial environment overrides
+    /// (e.g. `[depth_20.dynamic.universe]` block omitting this field)
+    /// fall back to `default_min_liquidity_volume()` rather than
+    /// failing figment deserialisation. Audit-2026-05-03
+    /// security-reviewer LOW #2 — defensive hardening.
+    #[serde(default = "default_min_liquidity_volume")]
+    pub min_liquidity_volume: u64,
     /// Re-rank metric. Reserved for future use; `select_top_k_dynamic`
     /// always sorts by `change_pct DESC`.
     #[serde(default)]
@@ -178,12 +208,20 @@ pub struct DepthDynamicUniverseConfig {
     pub window_secs: u32,
 }
 
+/// Audit-2026-05-03 security-reviewer LOW #2: serde-default helper for
+/// `min_liquidity_volume` so partial environment overrides fall back
+/// to the canonical 10_000 floor rather than failing deserialisation.
+/// Mirrors the value in `impl Default for DepthDynamicUniverseConfig`.
+fn default_min_liquidity_volume() -> u64 {
+    10_000
+}
+
 impl Default for DepthDynamicUniverseConfig {
     fn default() -> Self {
         Self {
             exchange_segments: vec!["NSE_FNO".to_string()],
             instrument_types: Vec::new(),
-            cohort_size: 500,
+            min_liquidity_volume: default_min_liquidity_volume(),
             rerank_metric: "change_pct_desc".to_string(),
             window_secs: 60,
         }
@@ -2693,18 +2731,50 @@ mod tests {
         assert!(err.to_string().contains("exchange_segments"));
     }
 
+    /// Audit-2026-05-03 (hostile-bug-hunt H1 fix) ratchet: boot-time
+    /// validation MUST reject any `conns × sids_per_conn > MAX_K (250)`.
+    /// Without this gate, the selector's runtime `assert!` would fire
+    /// at the first 60s tick during market hours — process-aborting.
     #[test]
-    fn test_depth_dynamic_config_rejects_cohort_smaller_than_total_capacity() {
-        // 5×50 = 250 SIDs needed; cohort 100 must fail.
+    fn test_depth_dynamic_config_rejects_total_k_above_selector_max() {
+        // 5 × 100 = 500 > MAX_K (250) → must fail at boot
+        let cfg = DepthDynamicConfig {
+            conns: 5,
+            sids_per_conn: 100,
+            ..DepthDynamicConfig::default()
+        };
+        let err = cfg.assert_invariants("depth_20", 5).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("exceeds selector cap"));
+        assert!(msg.contains("500"));
+    }
+
+    #[test]
+    fn test_depth_dynamic_config_accepts_total_k_at_selector_max() {
+        // 5 × 50 = 250 = MAX_K → must pass
+        let cfg = DepthDynamicConfig {
+            conns: 5,
+            sids_per_conn: 50,
+            ..DepthDynamicConfig::default()
+        };
+        assert!(cfg.assert_invariants("depth_20", 5).is_ok());
+    }
+
+    /// Audit-2026-05-03: redesign retired the `cohort_size` field +
+    /// the "must be >= conns × sids_per_conn" invariant (no longer
+    /// meaningful with a min-volume gate). New invariant: zero
+    /// `min_liquidity_volume` is rejected.
+    #[test]
+    fn test_depth_dynamic_config_rejects_zero_min_liquidity_volume() {
         let cfg = DepthDynamicConfig {
             universe: DepthDynamicUniverseConfig {
-                cohort_size: 100,
+                min_liquidity_volume: 0,
                 ..DepthDynamicConfig::default().universe
             },
             ..DepthDynamicConfig::default()
         };
         let err = cfg.assert_invariants("depth_20", 5).unwrap_err();
-        assert!(err.to_string().contains("cohort_size"));
+        assert!(err.to_string().contains("min_liquidity_volume"));
     }
 
     #[test]
@@ -2727,7 +2797,7 @@ mod tests {
             universe: DepthDynamicUniverseConfig {
                 exchange_segments: vec!["NSE_FNO".to_string()],
                 instrument_types: Vec::new(),
-                cohort_size: 100,
+                min_liquidity_volume: 10_000,
                 rerank_metric: "change_pct_desc".to_string(),
                 window_secs: 60,
             },
