@@ -9,7 +9,10 @@ use axum::Json;
 use axum::extract::State;
 use tickvault_api::handlers::health::{HealthResponse, health_check};
 use tickvault_api::handlers::stats::{StatsResponse, get_stats};
-use tickvault_api::handlers::top_movers::{TopMoversResponse, get_top_movers};
+// PR #450 commit 6b (2026-05-03): top_movers handler DELETED — the
+// /api/top-movers route is gone (replaced by unified /api/movers in
+// commit 4) and the panic-safety tests for the legacy handler are
+// removed below.
 use tickvault_api::state::{SharedAppState, SystemHealthStatus};
 use tickvault_common::config::{DhanConfig, InstrumentConfig, QuestDbConfig};
 
@@ -134,75 +137,10 @@ fn no_panic_health_response_serialization() {
     assert!(json.contains("healthy"));
 }
 
-// ---------------------------------------------------------------------------
-// Must NOT panic: /api/top-movers with empty/no snapshot
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn no_panic_top_movers_empty_snapshot() {
-    let state = make_test_state(test_questdb_config_unreachable());
-    let Json(result) = get_top_movers(State(state)).await;
-    assert!(!result.available);
-    assert!(result.equity_gainers.is_empty());
-    assert!(result.equity_losers.is_empty());
-    assert!(result.equity_most_active.is_empty());
-    assert!(result.index_gainers.is_empty());
-    assert!(result.index_losers.is_empty());
-    assert!(result.index_most_active.is_empty());
-    assert_eq!(result.total_tracked, 0);
-}
-
-#[tokio::test]
-async fn no_panic_top_movers_with_populated_snapshot() {
-    use tickvault_core::pipeline::top_movers::{MoverEntry, TopMoversSnapshot};
-
-    let snapshot = TopMoversSnapshot {
-        equity_gainers: vec![MoverEntry {
-            security_id: u32::MAX,
-            exchange_segment_code: 255,
-            last_traded_price: f32::MAX,
-            prev_close: 0.0,
-            change_pct: f32::INFINITY,
-            volume: u32::MAX,
-        }],
-        equity_losers: vec![MoverEntry {
-            security_id: 0,
-            exchange_segment_code: 0,
-            last_traded_price: 0.0,
-            prev_close: 0.0,
-            change_pct: f32::NEG_INFINITY,
-            volume: 0,
-        }],
-        equity_most_active: vec![MoverEntry {
-            security_id: 1,
-            exchange_segment_code: 2,
-            last_traded_price: f32::NAN,
-            prev_close: 0.0,
-            change_pct: f32::NAN,
-            volume: 1,
-        }],
-        index_gainers: Vec::new(),
-        index_losers: Vec::new(),
-        index_most_active: Vec::new(),
-        total_tracked: usize::MAX,
-    };
-
-    let shared = Arc::new(RwLock::new(Some(snapshot)));
-    let state = SharedAppState::new(
-        test_questdb_config_unreachable(),
-        test_dhan_config(),
-        test_instrument_config(),
-        shared,
-        empty_constituency(),
-        Arc::new(SystemHealthStatus::new()),
-    );
-
-    let Json(result) = get_top_movers(State(state)).await;
-    assert!(result.available);
-    assert_eq!(result.equity_gainers.len(), 1);
-    assert_eq!(result.equity_losers.len(), 1);
-    assert_eq!(result.equity_most_active.len(), 1);
-}
+// PR #450 commit 6b (2026-05-03): /api/top-movers panic-safety tests
+// DELETED. The legacy handler (TopMoversResponse / get_top_movers) is
+// removed — superseded by the unified /api/movers handler in commit 4
+// which has its own panic-safety surface in handlers/movers.rs tests.
 
 // ---------------------------------------------------------------------------
 // Must NOT panic: /api/stats with unreachable QuestDB
@@ -235,7 +173,9 @@ async fn no_panic_stats_with_zero_port() {
 }
 
 // ---------------------------------------------------------------------------
-// Must NOT panic: StatsResponse and TopMoversResponse serialization
+// Must NOT panic: StatsResponse serialization
+// (TopMoversResponse serialization test deleted — handler removed
+// in PR #450 commit 6b)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -250,22 +190,6 @@ fn no_panic_stats_response_serialization_extreme_values() {
     };
     let json = serde_json::to_string(&stats).unwrap();
     assert!(!json.is_empty());
-}
-
-#[test]
-fn no_panic_top_movers_response_serialization_empty() {
-    let resp = TopMoversResponse {
-        available: false,
-        equity_gainers: Vec::new(),
-        equity_losers: Vec::new(),
-        equity_most_active: Vec::new(),
-        index_gainers: Vec::new(),
-        index_losers: Vec::new(),
-        index_most_active: Vec::new(),
-        total_tracked: 0,
-    };
-    let json = serde_json::to_string(&resp).unwrap();
-    assert!(json.contains("\"available\":false"));
 }
 
 // ---------------------------------------------------------------------------
