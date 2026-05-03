@@ -14,7 +14,11 @@ pub mod mover_classifier;
 pub mod movers_window;
 pub mod no_tick_watchdog;
 pub mod option_movers;
-pub mod preopen_movers;
+// `preopen_movers` retired 2026-05-03 — its functionality (phase=PREOPEN
+// rows during 09:00-09:13 IST) was folded into the canonical
+// `movers_1s.phase` SYMBOL column populated by `movers_base_pipeline`.
+// The legacy `stock_movers` table it wrote into is dropped by the
+// one-shot migration in `movers_base_persistence`.
 pub mod prev_close_persist;
 pub mod prev_close_writer;
 pub mod tick_gap_detector;
@@ -25,9 +29,8 @@ pub mod volume_monotonicity_guard;
 pub use candle_aggregator::CandleAggregator;
 pub use depth_sequence_tracker::{DepthSequenceTracker, SequenceOutcome};
 pub use option_movers::{OptionMoversTracker, SharedOptionMoversSnapshot};
-pub use preopen_movers::{
-    MoverEntry as PreopenMoverEntry, PreopenMoversTracker, PreopenPhase, UnavailableSymbol,
-};
+// `preopen_movers` re-export retired 2026-05-03 along with the module —
+// `phase=PREOPEN` rows now live in `movers_1s.phase`.
 pub use tick_gap_detector::{
     SharedTickGapDetector, TICK_GAP_COALESCE_WINDOW_SECS_DEFAULT, TICK_GAP_THRESHOLD_SECS_DEFAULT,
     TickGapDetector, TickGapKey,

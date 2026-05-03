@@ -26,6 +26,81 @@
 /// and well below QuestDB's 32 KiB STRING limit.
 pub const MAX_AUDIT_STR_LEN: usize = 1024;
 
+/// Hard cap on any SYMBOL value written via QuestDB ILP. Audit-2026-05-03
+/// H3: every legitimate symbol/category/segment/phase value is ≤ ~32
+/// bytes today; 256 bytes is generous and well below QuestDB ILP's
+/// implicit limits. Caps prevent an unbounded upstream label (e.g. a
+/// malformed CSV row, hostile payload) from producing an oversized ILP
+/// row that the server accepts as garbage or rejects entirely.
+pub const ILP_SYMBOL_MAX_BYTES: usize = 256;
+
+/// Canonical ILP SYMBOL sanitiser — single source of truth for every
+/// movers/audit/persistence writer that calls `Buffer::symbol(...)` or
+/// `Buffer::column_str(...)` on potentially untrusted input.
+///
+/// Three guarantees:
+///
+/// 1. **Strip ILP-structural delimiters**: `\n`, `\r`, `,`, `=`, plus
+///    every ASCII control character. The upstream `questdb-rs` crate
+///    rejects some of these but the precise rejected-character set has
+///    drifted across library versions; strip defensively before they
+///    reach the buffer.
+///
+/// 2. **UTF-8-safe length cap** at `ILP_SYMBOL_MAX_BYTES`. Truncates at
+///    the last char boundary ≤ the cap so multi-byte UTF-8 sequences
+///    (e.g. `é`, `😀`) are never split mid-codepoint.
+///
+/// 3. **Borrow-friendly**: returns `Cow::Borrowed(input)` on the common
+///    clean+within-cap path (zero allocation). `Cow::Owned(_)` only when
+///    sanitisation actually happened.
+///
+/// Pure function, O(n) over input length, runs at the cold ILP-build
+/// cadence (typically ≤ a few dozen rows/second) so allocation on the
+/// dirty path is acceptable.
+///
+/// # Examples
+///
+/// ```
+/// use tickvault_common::sanitize::sanitize_ilp_symbol;
+///
+/// // Clean input is borrowed (zero alloc).
+/// let clean = "NIFTY";
+/// match sanitize_ilp_symbol(clean) {
+///     std::borrow::Cow::Borrowed(s) => assert_eq!(s, "NIFTY"),
+///     std::borrow::Cow::Owned(_) => panic!("clean input should not allocate"),
+/// }
+///
+/// // Embedded comma is stripped.
+/// let dirty = "RELIANCE,INDUSTRIES";
+/// let out = sanitize_ilp_symbol(dirty);
+/// assert_eq!(out, "RELIANCEINDUSTRIES");
+/// ```
+#[must_use]
+pub fn sanitize_ilp_symbol(input: &str) -> std::borrow::Cow<'_, str> {
+    let needs_strip = input
+        .chars()
+        .any(|c| c == '\n' || c == '\r' || c == ',' || c == '=' || c.is_control());
+    let needs_truncate = input.len() > ILP_SYMBOL_MAX_BYTES;
+    if !needs_strip && !needs_truncate {
+        return std::borrow::Cow::Borrowed(input);
+    }
+    let cleaned: String = input
+        .chars()
+        .filter(|c| !(*c == '\n' || *c == '\r' || *c == ',' || *c == '=' || c.is_control()))
+        .collect();
+    // Truncate to ILP_SYMBOL_MAX_BYTES respecting UTF-8 char boundaries.
+    let bounded = if cleaned.len() > ILP_SYMBOL_MAX_BYTES {
+        let mut end = ILP_SYMBOL_MAX_BYTES;
+        while end > 0 && !cleaned.is_char_boundary(end) {
+            end -= 1;
+        }
+        cleaned[..end].to_string()
+    } else {
+        cleaned
+    };
+    std::borrow::Cow::Owned(bounded)
+}
+
 /// Centralised audit-string sanitiser. Every audit-table writer
 /// (`*_audit_persistence.rs`) MUST funnel free-text columns through this
 /// helper before SQL interpolation.
@@ -644,5 +719,96 @@ mod tests {
         assert!(out.contains("''"), "quote doubled");
         assert!(!out.contains(';'), "semicolons stripped");
         assert!(!out.contains("--"), "comment markers stripped");
+    }
+
+    // -----------------------------------------------------------------
+    // sanitize_ilp_symbol (Audit-2026-05-03 H3 — canonical ILP sanitiser)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn test_sanitize_ilp_symbol_clean_input_borrows_zero_alloc() {
+        let clean = "NIFTY";
+        match sanitize_ilp_symbol(clean) {
+            std::borrow::Cow::Borrowed(s) => assert_eq!(s, "NIFTY"),
+            std::borrow::Cow::Owned(_) => panic!("clean input must not allocate"),
+        }
+    }
+
+    #[test]
+    fn test_sanitize_ilp_symbol_strips_newline() {
+        let out = sanitize_ilp_symbol("NIFTY\n50");
+        assert_eq!(out, "NIFTY50");
+    }
+
+    #[test]
+    fn test_sanitize_ilp_symbol_strips_carriage_return() {
+        let out = sanitize_ilp_symbol("BANK\rNIFTY");
+        assert_eq!(out, "BANKNIFTY");
+    }
+
+    #[test]
+    fn test_sanitize_ilp_symbol_strips_comma() {
+        let out = sanitize_ilp_symbol("RELIANCE,INDUSTRIES");
+        assert_eq!(out, "RELIANCEINDUSTRIES");
+    }
+
+    #[test]
+    fn test_sanitize_ilp_symbol_strips_equals() {
+        let out = sanitize_ilp_symbol("a=b=c");
+        assert_eq!(out, "abc");
+    }
+
+    #[test]
+    fn test_sanitize_ilp_symbol_strips_control_chars() {
+        let out = sanitize_ilp_symbol("a\x00b\x07c\x1fd");
+        assert_eq!(out, "abcd");
+    }
+
+    #[test]
+    fn test_sanitize_ilp_symbol_preserves_unicode() {
+        let clean = "ETF—NIFTY50";
+        let out = sanitize_ilp_symbol(clean);
+        assert_eq!(out, "ETF—NIFTY50");
+    }
+
+    #[test]
+    fn test_sanitize_ilp_symbol_empty_string_borrowed() {
+        let out = sanitize_ilp_symbol("");
+        match out {
+            std::borrow::Cow::Borrowed(s) => assert_eq!(s, ""),
+            std::borrow::Cow::Owned(_) => panic!("empty input must not allocate"),
+        }
+    }
+
+    #[test]
+    fn test_sanitize_ilp_symbol_caps_at_max_bytes() {
+        let huge = "x".repeat(ILP_SYMBOL_MAX_BYTES * 2);
+        let out = sanitize_ilp_symbol(&huge);
+        assert_eq!(out.len(), ILP_SYMBOL_MAX_BYTES);
+    }
+
+    #[test]
+    fn test_sanitize_ilp_symbol_cap_truncation_respects_utf8_boundary() {
+        // Build a string of 4-byte characters (😀 = U+1F600). If the
+        // truncation cap fell mid-multi-byte sequence, the resulting
+        // String would panic on UTF-8 validation. Verify it doesn't.
+        let mut input = String::new();
+        for _ in 0..(ILP_SYMBOL_MAX_BYTES * 2 / 4) {
+            input.push('😀');
+        }
+        let out = sanitize_ilp_symbol(&input);
+        // Output is valid UTF-8 (no panic), and bytes ≤ cap.
+        assert!(out.len() <= ILP_SYMBOL_MAX_BYTES);
+        // Every char must still be 😀 (4 bytes each).
+        for ch in out.chars() {
+            assert_eq!(ch, '😀');
+        }
+    }
+
+    #[test]
+    fn test_ilp_symbol_max_bytes_is_256() {
+        // Pin the constant so a future "let's bump to 1KB" PR is
+        // forced to update tests + dashboards together.
+        assert_eq!(ILP_SYMBOL_MAX_BYTES, 256);
     }
 }
