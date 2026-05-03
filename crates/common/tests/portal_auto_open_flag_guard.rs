@@ -40,11 +40,8 @@ fn portal_auto_open_grep_guard_in_main() {
     // Pin the gate site in main.rs. If a future refactor removes the
     // `if cfg.api.auto_open_portal {` guard, this test fails — catching
     // the regression before it ships to AWS.
-    let main = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../app/src/main.rs"
-    ))
-    .expect("crates/app/src/main.rs must exist");
+    let main = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../app/src/main.rs"))
+        .expect("crates/app/src/main.rs must exist");
     assert!(
         main.contains("cfg.api.auto_open_portal"),
         "main.rs must gate the portal browser-open on \
@@ -62,10 +59,7 @@ fn portal_auto_open_grep_guard_in_main() {
 
 #[test]
 fn config_base_toml_documents_the_flag() {
-    let toml_path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../config/base.toml"
-    );
+    let toml_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/base.toml");
     let toml = std::fs::read_to_string(toml_path).expect("config/base.toml must exist");
     assert!(
         toml.contains("auto_open_portal"),

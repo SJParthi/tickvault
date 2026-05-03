@@ -24,15 +24,12 @@
 use std::fs;
 use std::path::PathBuf;
 
-const PREAMBLE_PATH: &str =
-    "../../.claude/rules/project/wave-4-shared-preamble.md";
-const MATRIX_PATH: &str =
-    "../../.claude/rules/project/per-wave-guarantee-matrix.md";
+const PREAMBLE_PATH: &str = "../../.claude/rules/project/wave-4-shared-preamble.md";
+const MATRIX_PATH: &str = "../../.claude/rules/project/per-wave-guarantee-matrix.md";
 
 fn read(rel: &str) -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel);
-    fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
+    fs::read_to_string(&path).unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
 }
 
 #[test]
