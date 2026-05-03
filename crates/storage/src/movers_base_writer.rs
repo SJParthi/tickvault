@@ -57,6 +57,11 @@ pub struct MoversRow {
     /// Looked up alongside `exchange_segment`; falls back to
     /// `"UNKNOWN"` for the same reason.
     pub instrument_type: &'static str,
+    /// Audit-2026-05-03: session phase tag — `"PREOPEN"` (09:00-09:13 IST),
+    /// `"MARKET"` (09:15-15:30 IST), or `"POSTMARKET"` (15:30-15:40 IST).
+    /// Folds in the legacy `PreopenMoversTracker` / `STOCK_MOVERS_PHASE_*`
+    /// semantics. Pipeline drain computes from current IST time.
+    pub phase: &'static str,
     /// Open interest at this 1s tick (0 for non-derivative segments).
     pub open_interest: i64,
     /// Per-1s OI delta. Caller computes from the previous-1s value.
@@ -175,6 +180,8 @@ impl MoversWriter {
         // matching the SYMBOL CAPACITY in the DDL.
         let exchange_segment = sanitize_ilp_symbol(row.exchange_segment);
         let instrument_type = sanitize_ilp_symbol(row.instrument_type);
+        // Audit-2026-05-03: phase folded in from legacy PreopenMoversTracker.
+        let phase = sanitize_ilp_symbol(row.phase);
 
         buffer
             .table(QUESTDB_TABLE_MOVERS_1S)
@@ -185,6 +192,8 @@ impl MoversWriter {
             .context("exchange_segment")?
             .symbol("instrument_type", instrument_type.as_ref())
             .context("instrument_type")?
+            .symbol("phase", phase.as_ref())
+            .context("phase")?
             .column_i64("security_id", i64::from(row.security_id))
             .context("security_id")?
             .column_i64("open_interest", row.open_interest)
