@@ -960,7 +960,12 @@ function loadData() {
         })
         .then(function(d) {
             if (d && d.available) {
-                var list = d[currentFilter] || d.highest_oi || [];
+                /* PR #449 hostile-bug-hunt C2 fix: backend returns
+                   { available, category, entries } flat. Legacy
+                   d[currentFilter] / d.highest_oi keys never existed
+                   on the new response shape and would always fall
+                   through to []. Read d.entries directly. */
+                var list = d.entries || [];
                 var mapped = list.map(function(o) {
                     return {
                         name: o.contract_name || o.name,

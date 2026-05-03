@@ -330,6 +330,25 @@ pub struct FeaturesConfig {
     /// this to `false` — the Wave 5 orchestrator + single-side static
     /// spawn blocks remain in the codebase behind this gate.
     pub depth_dynamic_pipeline_v2: bool,
+    /// PR #449 (operator clarification 2026-05-03): kill-switch for the
+    /// entire historical fetch + cross-verification + pre-warmup
+    /// subsystem. Defaults to `false`.
+    ///
+    /// Operator rationale: Dhan's 1-minute historical candles are
+    /// NSE-exchange-wide aggregates (NOT broker-traded), so cross-
+    /// verification against our broker-traded live ticks produces
+    /// false-positive volume mismatches. Until we migrate the
+    /// historical source to a broker-traded feed (Groww API — held
+    /// in PR #455), the entire historical pipeline (fetch + verify
+    /// + cross-match + pre-warmup) is disabled.
+    ///
+    /// When `false` (default), main.rs skips:
+    /// - `spawn_historical_candle_fetch` (fast + slow boot paths)
+    /// - `verify_candle_integrity`
+    /// - `cross_match_historical_vs_live`
+    ///
+    /// Live tick persistence + materialised views are unaffected.
+    pub historical_fetch_enabled: bool,
 }
 
 impl Default for FeaturesConfig {
@@ -366,6 +385,9 @@ impl Default for FeaturesConfig {
             // side static spawn blocks stay in the codebase as the
             // rollback path until production validation completes.
             depth_dynamic_pipeline_v2: true,
+            // PR #449 operator kill-switch: OFF until broker-traded
+            // historical source (PR #455 Groww) lands.
+            historical_fetch_enabled: false,
         }
     }
 }
@@ -2905,6 +2927,27 @@ mod tests {
         // 3-agent adversarial review closed. Wave 5 path stays in the
         // codebase as a rollback option behind the same flag.
         assert!(cfg.depth_dynamic_pipeline_v2);
+    }
+
+    /// Ratchet for PR #449 (operator clarification 2026-05-03):
+    /// historical fetch + cross-verification + pre-warmup is OFF
+    /// by default. Re-enabling requires either an explicit operator
+    /// override in `config/base.toml` OR migrating the historical
+    /// source to a broker-traded feed (Groww API per PR #455).
+    ///
+    /// Flipping this to `true` re-introduces the broker-vs-NSE
+    /// 1-min volume false-positive cross-match storm. Do not flip
+    /// without operator approval.
+    #[test]
+    fn test_features_config_historical_fetch_disabled_by_default_pr449() {
+        let cfg = FeaturesConfig::default();
+        assert!(
+            !cfg.historical_fetch_enabled,
+            "historical_fetch_enabled MUST default to false per PR #449 \
+             operator clarification — Dhan 1-min historical is NSE-wide \
+             not broker-traded, causing cross-verify false positives. \
+             Re-enable only after migrating to a broker-traded source."
+        );
     }
 
     /// Ratchet for operator-spec 2026-05-03: depth-20 + depth-200 dynamic

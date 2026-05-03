@@ -359,45 +359,139 @@ pub struct OptionMoversResponse {
     pub entries: Vec<OptionMoverEntry>,
 }
 
+/// Audit-2026-05-03 PR #449: typed enum for option mover categories.
+/// Replaces the legacy `&str` parameter that was injection-validated
+/// only by a `Vec::contains` whitelist — type system now closes the
+/// vector entirely. Each variant maps to an `ORDER BY` clause body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OptionMoverCategory {
+    HighestOi,
+    OiGainer,
+    OiLoser,
+    TopVolume,
+    TopValue,
+    PriceGainer,
+    PriceLoser,
+}
+
+impl OptionMoverCategory {
+    /// Parses the wire-format string (case-insensitive). Returns `None`
+    /// on unknown input — handler emits 400.
+    ///
+    /// PR #449 hostile-bug-hunt C1 fix: accepts BOTH singular
+    /// (`OI_GAINER`) and plural (`OI_GAINERS`) forms because the
+    /// `markets-options.html` portal sends the plural variant via
+    /// `data-filter="oi_gainers"`. Without the alias, 4 of 7
+    /// dashboard tabs would return HTTP 400.
+    #[must_use]
+    pub fn parse_wire_str(s: &str) -> Option<Self> {
+        match s.to_uppercase().as_str() {
+            "HIGHEST_OI" => Some(Self::HighestOi),
+            "OI_GAINER" | "OI_GAINERS" => Some(Self::OiGainer),
+            "OI_LOSER" | "OI_LOSERS" => Some(Self::OiLoser),
+            "TOP_VOLUME" => Some(Self::TopVolume),
+            "TOP_VALUE" => Some(Self::TopValue),
+            "PRICE_GAINER" | "PRICE_GAINERS" => Some(Self::PriceGainer),
+            "PRICE_LOSER" | "PRICE_LOSERS" => Some(Self::PriceLoser),
+            _ => None,
+        }
+    }
+
+    /// Wire-format string for the `category` field in the response.
+    #[must_use]
+    pub const fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::HighestOi => "HIGHEST_OI",
+            Self::OiGainer => "OI_GAINER",
+            Self::OiLoser => "OI_LOSER",
+            Self::TopVolume => "TOP_VOLUME",
+            Self::TopValue => "TOP_VALUE",
+            Self::PriceGainer => "PRICE_GAINER",
+            Self::PriceLoser => "PRICE_LOSER",
+        }
+    }
+
+    /// SQL `ORDER BY` clause body using `movers_5s` view-aliased
+    /// columns. The view aggregates per-second base via `last()` /
+    /// `first()` and exposes `volume_cumulative` (= `last(volume)`)
+    /// and `change_pct_session` (= guarded change_pct).
+    #[must_use]
+    pub const fn order_by_clause(self) -> &'static str {
+        match self {
+            Self::HighestOi => "open_interest DESC",
+            Self::OiGainer => "oi_delta DESC",
+            Self::OiLoser => "oi_delta ASC",
+            Self::TopVolume => "volume_cumulative DESC",
+            Self::TopValue => "(last_price * volume_cumulative) DESC",
+            Self::PriceGainer => "change_pct_session DESC",
+            Self::PriceLoser => "change_pct_session ASC",
+        }
+    }
+}
+
 /// `GET /api/market/option-movers?category=top_volume` — top options from QuestDB.
+///
+/// Audit-2026-05-03 PR #449: migrated from the legacy `option_movers`
+/// table to the canonical `movers_5s` materialized view. Replaces the
+/// SQL string-interpolation pattern (security-reviewer CRITICAL from
+/// PR #448) with a typed `OptionMoverCategory` enum that closes the
+/// injection vector at the type system.
+///
+/// **API contract changes (frontend-visible):**
+/// - `rank` is derived from response array index (1-indexed)
+/// - `contract_name`, `underlying`, `option_type`, `strike`, `expiry`,
+///   `spot_price`, `oi_change_pct` are EMPTY/ZERO — the legacy
+///   `option_movers` table populated these via `OptionMoversWriter`
+///   which had instrument-registry access at write time. The new
+///   `movers_5s` view doesn't carry them. Frontend should resolve
+///   contract details via a separate `/api/instruments/{security_id}`
+///   lookup.
+/// - `change` (= ltp - prev_close) is computed.
+/// - `oi_change` reads from the view's `oi_delta` (per-bucket OI delta).
+/// - All other fields map directly from `movers_5s` columns.
 // TEST-EXEMPT: HTTP handler — requires live QuestDB for integration
 pub async fn get_option_movers(
     State(state): State<SharedAppState>,
     Query(params): Query<OptionMoversQuery>,
 ) -> impl IntoResponse {
+    // Validate category via typed enum.
+    let category_str = params.category.unwrap_or_else(|| "TOP_VOLUME".to_string());
+    let category = match OptionMoverCategory::parse_wire_str(&category_str) {
+        Some(c) => c,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "invalid category",
+                    "valid": [
+                        "highest_oi", "oi_gainer", "oi_loser",
+                        "top_volume", "top_value",
+                        "price_gainer", "price_loser",
+                    ],
+                })),
+            )
+                .into_response();
+        }
+    };
+
     let cfg = state.questdb_config();
     let base_url = format!("http://{}:{}", cfg.host, cfg.http_port);
     let client = state.questdb_http_client();
 
-    let category = params.category.unwrap_or_else(|| "TOP_VOLUME".to_string());
-    let category_upper = category.to_uppercase();
-
-    // Validate category
-    let valid_categories = [
-        "HIGHEST_OI",
-        "OI_GAINER",
-        "OI_LOSER",
-        "TOP_VOLUME",
-        "TOP_VALUE",
-        "PRICE_GAINER",
-        "PRICE_LOSER",
-    ];
-    if !valid_categories.contains(&category_upper.as_str()) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "invalid category, valid: highest_oi, oi_gainer, oi_loser, top_volume, top_value, price_gainer, price_loser"})),
-        )
-            .into_response();
-    }
-
+    // Audit-2026-05-03 PR #449: query against `movers_5s` filtered by
+    // `instrument_type IN ('OPTIDX', 'OPTSTK')` (both option types).
+    // No SQL string interpolation of user input — `category` is a
+    // typed enum returning a `&'static str` ORDER BY clause.
     let query = format!(
-        "SELECT rank, contract_name, underlying, option_type, strike, expiry, \
-         spot_price, ltp, change, change_pct, oi, oi_change, oi_change_pct, volume \
-         FROM option_movers \
-         WHERE category = '{category_upper}' \
+        "SELECT security_id, exchange_segment, last_price, prev_close, \
+                change_pct_session, volume_cumulative, open_interest, oi_delta \
+         FROM movers_5s \
+         WHERE ts > dateadd('s', -30, now()) \
+           AND instrument_type IN ('OPTIDX', 'OPTSTK') \
          LATEST ON ts PARTITION BY security_id \
-         ORDER BY rank ASC \
-         LIMIT 30"
+         ORDER BY {order_by} \
+         LIMIT 30",
+        order_by = category.order_by_clause(),
     );
 
     let exec_url = format!("{base_url}/exec");
@@ -408,7 +502,12 @@ pub async fn get_option_movers(
         .await
     {
         Ok(r) => r,
-        Err(_) => {
+        Err(err) => {
+            tracing::error!(
+                ?err,
+                code = "API-MOVERS-02",
+                "QuestDB query for /api/market/option-movers failed"
+            );
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({"error": "QuestDB unreachable"})),
@@ -419,7 +518,12 @@ pub async fn get_option_movers(
 
     let body: serde_json::Value = match resp.json().await {
         Ok(v) => v,
-        Err(_) => {
+        Err(err) => {
+            tracing::error!(
+                ?err,
+                code = "API-MOVERS-02",
+                "Failed to parse QuestDB JSON response for /api/market/option-movers"
+            );
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "failed to parse response"})),
@@ -431,35 +535,40 @@ pub async fn get_option_movers(
     let rows = body["dataset"].as_array();
     let mut entries = Vec::new();
 
+    // Audit-2026-05-03 PR #449: row schema from `movers_5s` query
+    // (8 columns): security_id, exchange_segment, last_price,
+    // prev_close, change_pct_session, volume_cumulative,
+    // open_interest, oi_delta. Skip rows with fewer columns.
     if let Some(rows) = rows {
         for row in rows {
             let arr = match row.as_array() {
-                Some(a) if a.len() >= 14 => a,
+                Some(a) if a.len() >= 8 => a,
                 _ => continue,
             };
-
+            let last_price = arr[2].as_f64().unwrap_or(0.0);
+            let prev_close = arr[3].as_f64().unwrap_or(0.0);
             entries.push(OptionMoverEntry {
-                rank: arr[0].as_i64().unwrap_or(0),
-                contract_name: arr[1].as_str().unwrap_or("").to_string(),
-                underlying: arr[2].as_str().unwrap_or("").to_string(),
-                option_type: arr[3].as_str().unwrap_or("").to_string(),
-                strike: arr[4].as_f64().unwrap_or(0.0),
-                expiry: arr[5].as_str().unwrap_or("").to_string(),
-                spot_price: arr[6].as_f64().unwrap_or(0.0),
-                ltp: arr[7].as_f64().unwrap_or(0.0),
-                change: arr[8].as_f64().unwrap_or(0.0),
-                change_pct: arr[9].as_f64().unwrap_or(0.0),
-                oi: arr[10].as_i64().unwrap_or(0),
-                oi_change: arr[11].as_i64().unwrap_or(0),
-                oi_change_pct: arr[12].as_f64().unwrap_or(0.0),
-                volume: arr[13].as_i64().unwrap_or(0),
+                rank: (entries.len() + 1) as i64,
+                contract_name: String::new(), // frontend resolves
+                underlying: String::new(),    // frontend resolves
+                option_type: String::new(),   // frontend resolves
+                strike: 0.0,                  // frontend resolves
+                expiry: String::new(),        // frontend resolves
+                spot_price: 0.0,              // frontend resolves
+                ltp: last_price,
+                change: last_price - prev_close,
+                change_pct: arr[4].as_f64().unwrap_or(0.0),
+                oi: arr[6].as_i64().unwrap_or(0),
+                oi_change: arr[7].as_i64().unwrap_or(0),
+                oi_change_pct: 0.0, // no prev_oi baseline in view
+                volume: arr[5].as_i64().unwrap_or(0),
             });
         }
     }
 
     Json(OptionMoversResponse {
         available: !entries.is_empty(),
-        category: category_upper,
+        category: category.as_wire_str().to_string(),
         entries,
     })
     .into_response()
@@ -571,6 +680,32 @@ mod tests {
             "PRICE_LOSER",
         ];
         assert_eq!(valid.len(), 7);
+    }
+
+    /// PR #449 hostile-bug-hunt C1 ratchet: every literal string used
+    /// by `data-filter="..."` in `crates/api/static/markets-options.html`
+    /// MUST parse via `OptionMoverCategory::parse_wire_str`. The portal
+    /// sends the value verbatim as `?category=<filter>`. Regression of
+    /// the alias map causes 4 of 7 tabs to silently fall back to cached
+    /// data with no error visible to the operator.
+    #[test]
+    fn test_option_mover_category_accepts_frontend_data_filter_literals() {
+        let frontend_literals = [
+            "highest_oi",    // line 720
+            "oi_gainers",    // line 721 — plural
+            "oi_losers",     // line 722 — plural
+            "top_volume",    // line 723
+            "top_value",     // line 724
+            "price_gainers", // line 725 — plural
+            "price_losers",  // line 726 — plural
+        ];
+        for literal in frontend_literals {
+            assert!(
+                OptionMoverCategory::parse_wire_str(literal).is_some(),
+                "frontend data-filter literal {literal:?} MUST be \
+                 accepted by parse_wire_str — see markets-options.html",
+            );
+        }
     }
 
     #[test]
