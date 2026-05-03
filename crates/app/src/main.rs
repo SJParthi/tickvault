@@ -2602,12 +2602,11 @@ async fn main() -> Result<()> {
         info!("slow-boot observability consumer started");
     }
 
-    // Plan item G1 (2026-04-22): V2 snapshot handle declared OUTSIDE the
-    // processor scope so the api server (Step 11, far below) can read it.
-    // Populated inside the processor branch when the registry is available.
-    let mut movers_v2_snapshot_handle: Option<
-        tickvault_core::pipeline::top_movers::SharedMoversSnapshotV2,
-    > = None;
+    // PR #450 commit 6 (2026-05-03): V2 snapshot handle DELETED.
+    // The legacy /api/movers (V2) route + handler + in-memory
+    // MoversTrackerV2 + V2 pipeline are gone. The new unified
+    // /api/movers handler (commit 4) reads from the canonical
+    // movers_1s + 25 mat views via QuestDB SQL.
 
     // Plan item H (2026-04-25): SharedSpotPrices map shared between movers
     // (Premium/Discount routing) + depth ATM selection. Created OUTSIDE the
@@ -2667,36 +2666,10 @@ async fn main() -> Result<()> {
             .as_ref()
             .map(|p| std::sync::Arc::new(p.registry.clone()));
 
-        // Plan item G1+G2 (2026-04-22): spawn MoversTrackerV2 pipeline alongside
-        // the legacy TopMoversTracker + OptionMoversTracker. The V2 tracker
-        // produces a single 6-bucket snapshot consumed by /api/movers and
-        // persisted to the unified top_movers QuestDB table.
-        //
-        // Safe parallel operation: both trackers read the same tick broadcast
-        // — they are independent consumers. Legacy trackers continue writing
-        // stock_movers + option_movers tables for back-compat (plan D2).
-        // Dedicated shutdown notifier for the V2 movers pipeline. Awakened
-        // by the graceful-shutdown path (below) via a cloned Arc.
-        //
-        // Plan item H (2026-04-25): SharedSpotPrices was created above (outside
-        // the processor scope). Movers Premium/Discount routing reads from the
-        // same map populated by the spot updater task in Step 8c.0 below.
-        let movers_v2_shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
-        let movers_v2_handles = if let Some(registry) = slow_registry.as_ref() {
-            Some(tickvault_app::movers_v2_pipeline::spawn_movers_v2_pipeline(
-                std::sync::Arc::clone(registry),
-                tick_broadcast_sender.clone(),
-                config.questdb.clone(),
-                config.movers.clone(),
-                std::sync::Arc::clone(&shared_spot_prices_for_movers),
-                std::sync::Arc::clone(&movers_v2_shutdown),
-            ))
-        } else {
-            None
-        };
-        movers_v2_snapshot_handle = movers_v2_handles
-            .as_ref()
-            .map(|h| std::sync::Arc::clone(&h.snapshot_handle));
+        // PR #450 commit 6 (2026-05-03): V2 movers pipeline DELETED.
+        // Superseded by movers_base_pipeline (below) which writes
+        // movers_1s + 25 mat views — read via the new unified
+        // /api/movers handler.
 
         // Wave 5 Item 25/27 Phase B — base-1s writer for `movers_1s`.
         // ONE task. Subscribes to tick_broadcast, drains in-memory state at
@@ -6693,13 +6666,9 @@ async fn main() -> Result<()> {
         health_status,
     );
 
-    // Plan item G1 (2026-04-22): swap in the V2 movers snapshot handle if the
-    // pipeline was spawned. Pre-G1 or when no registry is available the
-    // handler returns `available=false` so the endpoint is safe to call.
-    let api_state = match movers_v2_snapshot_handle.clone() {
-        Some(h) => api_state.with_movers_snapshot_v2(h),
-        None => api_state,
-    };
+    // PR #450 commit 6 (2026-05-03): V2 snapshot api_state plumbing
+    // DELETED. The new unified /api/movers handler reads QuestDB
+    // SQL directly — no in-memory snapshot needed.
 
     // 2026-04-25 security audit (PR #357): API bearer token sourced from AWS
     // SSM Parameter Store ONLY — `/tickvault/<env>/api/bearer-token`. Same
