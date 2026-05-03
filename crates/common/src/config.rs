@@ -759,6 +759,7 @@ pub struct ApiConfig {
     pub auto_open_portal: bool,
 }
 
+// TEST-EXEMPT: trivial serde default returning the constant true; covered indirectly by portal_auto_open_flag_guard.rs.
 pub fn default_auto_open_portal() -> bool {
     true
 }
