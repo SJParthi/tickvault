@@ -12,7 +12,9 @@ use axum::extract::State;
 use serde::Serialize;
 use tracing::warn;
 
-use crate::handlers::movers_questdb::{DEFAULT_MOVERS_LIMIT, MoversSortMetric, query_movers};
+use crate::handlers::movers_questdb::{
+    DEFAULT_MOVERS_LIMIT, InstrumentTypeFilter, MoversSortMetric, query_movers,
+};
 use crate::state::SharedAppState;
 use tickvault_core::pipeline::top_movers::MoverEntry;
 
@@ -64,37 +66,37 @@ pub async fn get_top_movers(State(state): State<SharedAppState>) -> Json<TopMove
     ) = tokio::join!(
         query_movers(
             questdb,
-            "EQUITY",
+            InstrumentTypeFilter::Equity,
             MoversSortMetric::GainersByChangePct,
             DEFAULT_MOVERS_LIMIT
         ),
         query_movers(
             questdb,
-            "EQUITY",
+            InstrumentTypeFilter::Equity,
             MoversSortMetric::LosersByChangePct,
             DEFAULT_MOVERS_LIMIT
         ),
         query_movers(
             questdb,
-            "EQUITY",
+            InstrumentTypeFilter::Equity,
             MoversSortMetric::MostActiveByVolume,
             DEFAULT_MOVERS_LIMIT
         ),
         query_movers(
             questdb,
-            "INDEX",
+            InstrumentTypeFilter::Index,
             MoversSortMetric::GainersByChangePct,
             DEFAULT_MOVERS_LIMIT
         ),
         query_movers(
             questdb,
-            "INDEX",
+            InstrumentTypeFilter::Index,
             MoversSortMetric::LosersByChangePct,
             DEFAULT_MOVERS_LIMIT
         ),
         query_movers(
             questdb,
-            "INDEX",
+            InstrumentTypeFilter::Index,
             MoversSortMetric::MostActiveByVolume,
             DEFAULT_MOVERS_LIMIT
         ),
