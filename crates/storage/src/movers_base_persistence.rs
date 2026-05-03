@@ -643,19 +643,18 @@ pub async fn ensure_movers_tables_and_views(questdb_config: &QuestDbConfig) {
     // Idempotent on subsequent boots.
     run_one_shot_cleanup_migration(&client, &base_url).await;
 
-    // Step 0b: Audit-2026-05-03 — DEFERRED to PR #445.
+    // Step 0b: Audit-2026-05-03 — WIRED in PR #449.
     //
     // The DROP migration `run_one_shot_legacy_retire_migration_2026_05_03`
-    // is implemented + tested in this file but DELIBERATELY NOT WIRED
-    // into the boot fan-out yet. Reason (per 3-agent adversarial review
-    // 2026-05-03 Finding C1): `crates/api/src/handlers/market_data.rs`
-    // routes `/api/stock-movers` (line 258) and `/api/option-movers`
-    // (line 380) still query the legacy `stock_movers` + `option_movers`
-    // tables directly. Dropping the tables before the API handlers are
-    // migrated to query `movers_1m` (with `instrument_type` + `phase`
-    // filters) would cause silent 5xx on those endpoints after the
-    // first post-merge boot. PR #445 migrates the API handlers AND
-    // wires the DROP migration in the same change.
+    // is now safe to wire because:
+    // - PR #446 migrated `/api/top-movers` to QuestDB SQL against `movers_5s`
+    // - PR #448 migrated `/api/market/stock-movers` to `movers_5s`
+    // - PR #449 (this PR) migrated `/api/market/option-movers` to `movers_5s`
+    //
+    // No production code reads the legacy `stock_movers` / `option_movers`
+    // tables anymore. Marker-gated, idempotent — runs ONCE per database
+    // then short-circuits on subsequent boots.
+    run_one_shot_legacy_retire_migration_2026_05_03(&client, &base_url).await;
 
     // Step 1: base table.
     let create_base = movers_1s_create_ddl();
