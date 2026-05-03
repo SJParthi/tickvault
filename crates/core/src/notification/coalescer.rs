@@ -633,6 +633,49 @@ mod tests {
     }
 
     #[test]
+    fn test_end_to_end_no_double_prefix_on_coalesced_telegram_body() {
+        // Regression guard for the 2026-05-03 operator-visible bug:
+        //   ✅ [LOW] ✅ [LOW] Auth OK — Dhan JWT acquired
+        //
+        // Simulates the full pipeline a Severity::Low event takes through
+        // the production dispatcher:
+        //   1. dispatch_immediate computes `body = event.to_message()`
+        //      (NO severity tag).
+        //   2. coalescer.observe stores `body` in the bucket.
+        //   3. drain_mature returns DrainedSummary.
+        //   4. deliver_summaries renders
+        //      `format!("{} {}", severity.tag(), summary.render_message())`.
+        //
+        // The final Telegram body MUST contain the `[LOW]` tag exactly
+        // ONCE. Two occurrences = the bug is back.
+        let c = TelegramCoalescer::new(CoalescerConfig {
+            window: Duration::from_millis(5),
+            flush_interval: Duration::from_millis(2),
+        });
+        let unprefixed_body = "Auth OK — Dhan JWT acquired".to_string();
+        c.observe("AuthenticationSuccess", Severity::Low, || {
+            unprefixed_body.clone()
+        });
+        std::thread::sleep(Duration::from_millis(15));
+        let drained = c.drain_mature();
+        assert_eq!(drained.len(), 1);
+        let summary = &drained[0];
+
+        // Mirror deliver_summaries' format! call.
+        let final_body = format!("{} {}", summary.severity.tag(), summary.render_message());
+        let low_count = final_body.matches("[LOW]").count();
+        assert_eq!(
+            low_count, 1,
+            "expected exactly one [LOW] tag in final Telegram body, got {low_count}: {final_body:?}"
+        );
+        assert!(final_body.starts_with("✅ [LOW] "));
+        assert!(final_body.contains("Auth OK"));
+        // And the inner sample must NOT have the tag (regression guard
+        // for the upstream bug at the source).
+        assert!(!summary.samples[0].contains("[LOW]"));
+    }
+
+    #[test]
     fn test_format_ist_ms_handles_midnight_boundary() {
         // 2026-01-01 00:00:00 UTC = 05:30:00 IST
         let ms = 1_767_225_600_000;
