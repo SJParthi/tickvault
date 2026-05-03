@@ -568,17 +568,24 @@ mod tests {
         // a verbose `Coalesced summary [topic] count=1 / Samples: 1. ...`
         // envelope when there's nothing to summarise. Single-event fast
         // path returns just the sample body.
+        // 2026-05-03 fix: samples are stored UNPREFIXED — the dispatcher's
+        // `deliver_summaries` adds the severity tag exactly once on drain.
+        // Storing the prefixed string here caused the duplicate
+        // `✅ [LOW] ✅ [LOW]` Telegram bug observed by Parthiban.
         let summary = DrainedSummary {
             topic: "AuthenticationSuccess",
             severity: Severity::Low,
             count: 1,
             first_ts_ms: 1_700_000_000_000,
             last_ts_ms: 1_700_000_000_000,
-            samples: vec!["✅ [LOW] Auth OK — Dhan JWT acquired".into()],
+            samples: vec!["Auth OK — Dhan JWT acquired".into()],
             samples_capped: false,
         };
         let msg = summary.render_message();
-        assert_eq!(msg, "✅ [LOW] Auth OK — Dhan JWT acquired");
+        assert_eq!(msg, "Auth OK — Dhan JWT acquired");
+        // The severity tag must NOT be in the rendered body — it is added
+        // by the dispatcher when sending to Telegram.
+        assert!(!msg.contains("[LOW]"));
         assert!(!msg.contains("Coalesced summary"));
         assert!(!msg.contains("count="));
         assert!(!msg.contains("Samples:"));
