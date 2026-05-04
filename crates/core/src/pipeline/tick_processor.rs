@@ -27,7 +27,6 @@ use tickvault_storage::tick_persistence::{
     DepthPersistenceWriter, TickLifecycle, TickPersistenceWriter,
 };
 
-use tickvault_common::market_hours::now_ist_secs_of_day;
 use tickvault_common::tick_types::MarketDepthLevel;
 
 use crate::pipeline::tick_enricher::TickEnricher;
@@ -1022,18 +1021,20 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
         m_frames.increment(1);
         let received_at_nanos = current_received_at_nanos();
 
-        // 29-tf engine Phase 2.7 perf fix (hot-path agent C2): hoist
-        // the wall-clock read OUT of the per-tick branch. Each frame
-        // typically produces 1-30 ticks that all share the same
-        // `now_ist_secs_of_day` — caching at frame granularity bounds
-        // staleness to ~5ms, well within the 15-minute phase boundary
-        // tolerance. Only computed when an enricher is attached so
-        // the legacy (no-enricher) path pays zero cost.
-        let frame_now_ist_secs: u32 = if tick_enricher.is_some() {
-            now_ist_secs_of_day()
-        } else {
-            0 // unused when no enricher
-        };
+        // 29-tf engine Phase 2.10 (hostile bug-hunt M1 fix): phase
+        // classification now uses `tick.exchange_timestamp` (Dhan-source
+        // IST epoch seconds for THIS tick) instead of the wall-clock
+        // `now_ist_secs_of_day()`. Network-arrival jitter at the
+        // 09:14:59 ↔ 09:15:00 boundary previously misclassified ~10-30
+        // ticks/day (a tick stamped 09:14:59 IST that arrived at
+        // 09:15:01 IST got phase=OPEN instead of PREOPEN). The
+        // exchange_timestamp is the data-time, which is the correct
+        // basis for phase classification — not the receive time.
+        //
+        // Note: Phase 2.7's wall-clock hoist is preserved for the
+        // empty-frame fallback below; per-tick computation now uses
+        // tick.exchange_timestamp directly which is already in ParsedTick
+        // (no syscall, just a modulo).
 
         // Parse the binary frame
         let parsed = match dispatch_frame(&raw_frame, received_at_nanos) {
@@ -1260,7 +1261,10 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     super::tick_enricher::EnrichedTickFlags,
                     TickLifecycle,
                 )> = tick_enricher.as_ref().map(|enricher| {
-                    let enriched = enricher.enrich_tick(&tick, frame_now_ist_secs);
+                    // Phase 2.10 M1 fix: per-tick exchange_timestamp drives
+                    // phase classification (not wall-clock arrival).
+                    let tick_secs_of_day = tick.exchange_timestamp % 86_400;
+                    let enriched = enricher.enrich_tick(&tick, tick_secs_of_day);
                     let life = TickLifecycle {
                         volume_delta: enriched.volume_delta,
                         prev_day_close: enriched.prev_day_close,
@@ -1470,9 +1474,11 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     // hot-path semantics are uniform across packet types.
                     if let Some(ref mut writer) = tick_writer {
                         let result = if let Some(ref enricher) = tick_enricher {
-                            // Phase 2.7 perf fix (hot-path agent C2): use the
-                            // frame-level cached `frame_now_ist_secs`.
-                            let enriched = enricher.enrich_tick(&tick, frame_now_ist_secs);
+                            // Phase 2.10 M1 fix: per-tick exchange_timestamp
+                            // drives phase classification (not wall-clock
+                            // arrival). Mirrors the Quote-arm site above.
+                            let tick_secs_of_day = tick.exchange_timestamp % 86_400;
+                            let enriched = enricher.enrich_tick(&tick, tick_secs_of_day);
                             let life = TickLifecycle {
                                 volume_delta: enriched.volume_delta,
                                 prev_day_close: enriched.prev_day_close,
