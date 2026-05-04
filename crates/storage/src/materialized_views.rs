@@ -74,9 +74,31 @@ const CANDLES_1S_CREATE_DDL: &str = "\
         gamma DOUBLE,\
         theta DOUBLE,\
         vega DOUBLE,\
+        volume_cum_day_at_end LONG,\
+        prev_day_close DOUBLE,\
+        prev_day_oi LONG,\
+        phase SYMBOL,\
         ts TIMESTAMP\
     ) TIMESTAMP(ts) PARTITION BY DAY WAL\
 ";
+
+/// Phase 1 lifecycle columns added to the `candles_1s` base table by the
+/// 29-timeframes-engine plan (`active-plan-29-tf-and-movers-deletion.md`).
+///
+/// Pairs of `(column_name, questdb_type)`. Same idempotent ALTER pattern as
+/// the Greeks columns. Sit empty after Phase 1 — Phase 2 wires the producer
+/// (the Rust `CandleAggregator` projects them from the new tick columns).
+///
+/// Note: the candles version carries `volume_cum_day_at_end` (last cumulative
+/// tick volume in the bar) — the analog of ticks' `volume_delta`. The names
+/// differ deliberately: `ticks.volume_delta` is per-tick increment;
+/// `candles_1s.volume_cum_day_at_end` is the cum-day total at bar close.
+const CANDLES_1S_PHASE1_LIFECYCLE_COLUMNS: &[(&str, &str)] = &[
+    ("volume_cum_day_at_end", "LONG"),
+    ("prev_day_close", "DOUBLE"),
+    ("prev_day_oi", "LONG"),
+    ("phase", "SYMBOL"),
+];
 
 // ---------------------------------------------------------------------------
 // Materialized View Definitions
@@ -324,6 +346,13 @@ fn build_view_sql(def: &ViewDef) -> String {
         ""
     };
 
+    // Phase 1 lifecycle columns (29-timeframes engine plan): every matview
+    // projects the 4 new columns via `last(...)` so the cum-day volume,
+    // frozen prev-day-close/OI and phase are visible at every TF without
+    // a JOIN. Source must be a base table or matview that already carries
+    // these columns — `CANDLES_1S_PHASE1_LIFECYCLE_COLUMNS` declares them
+    // on `candles_1s`, and rebuilding the matview chain in dependency
+    // order propagates them through every downstream view.
     format!(
         "CREATE MATERIALIZED VIEW IF NOT EXISTS {name} AS \
          SELECT ts, security_id, segment, \
@@ -331,7 +360,11 @@ fn build_view_sql(def: &ViewDef) -> String {
          min(low) AS low, last(close) AS close, \
          sum(volume) AS volume, last(oi) AS oi{tick_count}, \
          last(iv) AS iv, last(delta) AS delta, last(gamma) AS gamma, \
-         last(theta) AS theta, last(vega) AS vega \
+         last(theta) AS theta, last(vega) AS vega, \
+         last(volume_cum_day_at_end) AS volume_cum_day_at_end, \
+         last(prev_day_close) AS prev_day_close, \
+         last(prev_day_oi) AS prev_day_oi, \
+         last(phase) AS phase \
          FROM {source} \
          SAMPLE BY {interval} \
          ALIGN TO CALENDAR WITH OFFSET '{offset}'",
@@ -396,12 +429,31 @@ pub async fn ensure_candle_views(questdb_config: &QuestDbConfig) {
     // column returns a non-fatal error that we safely ignore.
     ensure_greeks_columns_on_table(&client, &base_url, QUESTDB_TABLE_CANDLES_1S).await;
 
-    // Step 4: Drop materialized views if they lack Greeks columns.
-    // Views created before Greeks were added cannot be ALTERed — they must be
-    // dropped and recreated. We probe the first view (candles_5s) for the 'iv'
-    // column. If absent, drop all 18 views so Step 5 recreates them with Greeks.
-    if views_missing_greeks(&client, &base_url).await {
-        info!("materialized views lack Greeks columns — dropping for recreation");
+    // Step 3b: Add Phase 1 lifecycle columns to candles_1s (29-timeframes plan).
+    // Same idempotent ALTER pattern. Columns sit empty until Phase 2 populates
+    // them — Phase 1 only widens the schema.
+    ensure_phase1_lifecycle_columns_on_table(&client, &base_url, QUESTDB_TABLE_CANDLES_1S).await;
+
+    // Step 4: Drop materialized views if they lack required columns.
+    // Views created before Greeks/Phase1 cannot be ALTERed — they must be
+    // dropped and recreated. Three probes:
+    //   (a) `views_missing_greeks` — check candles_5s for `iv`.
+    //   (b) `views_missing_phase1_columns` — check candles_5s for `phase`.
+    //   (c) `base_missing_phase1_columns` — check candles_1s itself for
+    //       `phase`. Closes the silent-ALTER gap (the brownfield ALTER
+    //       loop discards each `Result` via `drop(...)` per the established
+    //       Greeks pattern; probing only views would miss the case where
+    //       the base ALTER dropped but a previous boot's views still exist).
+    // If any probe fires, drop all 18 views so Step 5 recreates them with
+    // the wide schema.
+    if views_missing_greeks(&client, &base_url).await
+        || views_missing_phase1_columns(&client, &base_url).await
+        || base_missing_phase1_columns(&client, &base_url).await
+    {
+        info!(
+            "materialized views or candles_1s base lack Greeks / Phase 1 \
+             lifecycle columns — dropping views for recreation"
+        );
         drop_all_views(&client, &base_url).await;
     }
 
@@ -544,6 +596,107 @@ async fn ensure_greeks_columns_on_table(
         table = table_name,
         "Greeks columns ensured (idempotent ADD COLUMN)"
     );
+}
+
+/// Adds the 4 Phase 1 lifecycle columns (29-timeframes engine plan) to a table
+/// if they are missing.
+///
+/// Mirrors the Greeks helper. Mixed types: LONG / DOUBLE / LONG / SYMBOL.
+/// Idempotent — QuestDB rejects adding an already-existing column with a
+/// non-fatal error that we safely ignore.
+async fn ensure_phase1_lifecycle_columns_on_table(
+    client: &reqwest::Client,
+    base_url: &str,
+    table_name: &str,
+) {
+    for (col, ty) in CANDLES_1S_PHASE1_LIFECYCLE_COLUMNS {
+        // Double-quoted identifiers — defence-in-depth even though the
+        // current callers pass compile-time constants only.
+        let alter_sql = format!("ALTER TABLE \"{table_name}\" ADD COLUMN \"{col}\" {ty}");
+        drop(
+            client
+                .get(base_url)
+                .query(&[("query", &alter_sql)])
+                .send()
+                .await,
+        );
+    }
+    info!(
+        table = table_name,
+        "Phase 1 lifecycle columns ensured (idempotent ADD COLUMN)"
+    );
+}
+
+/// Checks whether the `candles_1s` BASE TABLE is missing the Phase 1
+/// lifecycle column `phase` (29-timeframes engine plan).
+///
+/// Defends against the silent-ALTER scenario flagged by the hostile
+/// review: the brownfield ALTER loop discards each `Result` via `drop(...)`
+/// per the established Greeks pattern. If a network blip drops the
+/// `phase` ALTER on `candles_1s`, the matview probe (`views_missing_phase1_columns`,
+/// which queries `candles_5s`) cannot detect it because views still exist
+/// from a previous boot. Probing the base table directly closes the gap:
+/// if `candles_1s` itself lacks `phase`, we must rebuild matviews so a
+/// future Phase 2 writer doesn't ILP into a missing column.
+///
+/// Returns `true` when the base table needs Phase 1 lifecycle columns
+/// (and therefore views also need recreation). Failed probe → `false`.
+async fn base_missing_phase1_columns(client: &reqwest::Client, base_url: &str) -> bool {
+    let probe_sql = "SHOW COLUMNS FROM candles_1s";
+    match client
+        .get(base_url)
+        .query(&[("query", probe_sql)])
+        .send()
+        .await
+    {
+        Ok(response) => {
+            if response.status().is_success() {
+                let body = response.text().await.unwrap_or_default();
+                // Match the column name as a quoted JSON token to avoid
+                // false-positives from substrings like `prev_phase`.
+                if !body.contains("\"phase\"") {
+                    return true;
+                }
+            }
+            false
+        }
+        Err(_) => false,
+    }
+}
+
+/// Checks whether existing materialized views are missing the Phase 1
+/// lifecycle column `phase` (29-timeframes engine plan).
+///
+/// Mirrors `views_missing_greeks` — probes `candles_5s` and looks for
+/// the `phase` column in the `SHOW COLUMNS` response. We probe `phase`
+/// (the last column added) because if it is present, the other three
+/// must also be present (they were added together in this PR).
+///
+/// Returns `true` when views need recreation. Failed probe → `false`
+/// (Step 5's `CREATE ... IF NOT EXISTS` handles missing views directly).
+async fn views_missing_phase1_columns(client: &reqwest::Client, base_url: &str) -> bool {
+    let probe_sql = "SHOW COLUMNS FROM candles_5s";
+    match client
+        .get(base_url)
+        .query(&[("query", probe_sql)])
+        .send()
+        .await
+    {
+        Ok(response) => {
+            if response.status().is_success() {
+                let body = response.text().await.unwrap_or_default();
+                // If candles_5s exists but does not have a `phase` column,
+                // the views need recreation. Match `"phase"` as a quoted JSON
+                // token so we don't accidentally match `phase` substrings
+                // elsewhere in the response.
+                if !body.contains("\"phase\"") {
+                    return true;
+                }
+            }
+            false
+        }
+        Err(_) => false,
+    }
 }
 
 /// Checks whether existing materialized views are missing Greeks columns.
@@ -1026,6 +1179,95 @@ mod tests {
             CANDLES_1S_CREATE_DDL.contains("segment SYMBOL"),
             "candles_1s DDL must have segment SYMBOL column"
         );
+    }
+
+    /// Phase 1 ratchet (29-timeframes engine plan): the four lifecycle columns
+    /// MUST appear in the candles_1s base-table DDL so a fresh QuestDB volume
+    /// gets the wide schema directly. Pins the QuestDB type per column so any
+    /// future drift fails the build.
+    #[test]
+    fn test_candles_1s_ddl_has_phase1_lifecycle_columns() {
+        assert!(
+            CANDLES_1S_CREATE_DDL.contains("volume_cum_day_at_end LONG"),
+            "candles_1s DDL must declare volume_cum_day_at_end LONG (cum-day total at bar close)"
+        );
+        assert!(
+            CANDLES_1S_CREATE_DDL.contains("prev_day_close DOUBLE"),
+            "candles_1s DDL must declare prev_day_close DOUBLE (frozen per trading day)"
+        );
+        assert!(
+            CANDLES_1S_CREATE_DDL.contains("prev_day_oi LONG"),
+            "candles_1s DDL must declare prev_day_oi LONG (frozen per trading day)"
+        );
+        assert!(
+            CANDLES_1S_CREATE_DDL.contains("phase SYMBOL"),
+            "candles_1s DDL must declare phase SYMBOL"
+        );
+    }
+
+    /// Phase 1 ratchet: the Phase 1 lifecycle column constant MUST list exactly
+    /// the four columns in the order the schema-self-heal helper iterates them.
+    #[test]
+    fn test_candles_1s_phase1_lifecycle_column_constant_is_pinned() {
+        let pairs: Vec<(&str, &str)> = CANDLES_1S_PHASE1_LIFECYCLE_COLUMNS.to_vec();
+        assert_eq!(
+            pairs,
+            vec![
+                ("volume_cum_day_at_end", "LONG"),
+                ("prev_day_close", "DOUBLE"),
+                ("prev_day_oi", "LONG"),
+                ("phase", "SYMBOL"),
+            ],
+            "CANDLES_1S_PHASE1_LIFECYCLE_COLUMNS pinned to the plan-locked \
+             column list — drift would split the brownfield ALTER chain from \
+             the greenfield CREATE"
+        );
+    }
+
+    /// Phase 1 ratchet: every entry in `CANDLES_1S_PHASE1_LIFECYCLE_COLUMNS`
+    /// must also appear in the CREATE DDL with the same QuestDB type.
+    #[test]
+    fn test_candles_1s_phase1_lifecycle_columns_match_create_ddl() {
+        for (col, ty) in CANDLES_1S_PHASE1_LIFECYCLE_COLUMNS {
+            let needle = format!("{} {}", col, ty);
+            assert!(
+                CANDLES_1S_CREATE_DDL.contains(&needle),
+                "CANDLES_1S_CREATE_DDL must contain '{}' so fresh tables \
+                 match the brownfield ALTER schema",
+                needle
+            );
+        }
+    }
+
+    /// Phase 1 ratchet: every materialized view MUST project the four
+    /// lifecycle columns via `last(...)`. Without this projection downstream
+    /// queries (the future `/api/movers` v2 SELECT) cannot read the columns
+    /// at any TF other than `1s`.
+    #[test]
+    fn test_build_view_sql_projects_phase1_lifecycle_columns() {
+        for def in VIEW_DEFS {
+            let sql = build_view_sql(def);
+            assert!(
+                sql.contains("last(volume_cum_day_at_end) AS volume_cum_day_at_end"),
+                "view {} must project last(volume_cum_day_at_end)",
+                def.name
+            );
+            assert!(
+                sql.contains("last(prev_day_close) AS prev_day_close"),
+                "view {} must project last(prev_day_close)",
+                def.name
+            );
+            assert!(
+                sql.contains("last(prev_day_oi) AS prev_day_oi"),
+                "view {} must project last(prev_day_oi)",
+                def.name
+            );
+            assert!(
+                sql.contains("last(phase) AS phase"),
+                "view {} must project last(phase)",
+                def.name
+            );
+        }
     }
 
     #[test]
@@ -1749,6 +1991,83 @@ mod tests {
         let base_url = build_questdb_exec_url("127.0.0.1", port);
         let result = views_missing_greeks(&client, &base_url).await;
         assert!(result, "should return true when iv column is absent");
+    }
+
+    /// Phase 1 ratchet (29-timeframes engine plan): base-table probe must
+    /// return `true` when `candles_1s` lacks the `phase` column. Defends
+    /// against the silent-ALTER scenario where `drop(client.send().await)`
+    /// swallows a network/HTTP failure.
+    #[tokio::test]
+    async fn test_base_missing_phase1_columns_returns_true_when_phase_absent() {
+        let response_without_phase = "HTTP/1.1 200 OK\r\nContent-Length: 70\r\n\r\n{\"columns\":[{\"name\":\"ts\"},{\"name\":\"security_id\"},{\"name\":\"close\"},{\"name\":\"iv\"}]}";
+        let port = spawn_mock_http_server(response_without_phase).await;
+        tokio::task::yield_now().await;
+        let client = reqwest::Client::new();
+        let base_url = build_questdb_exec_url("127.0.0.1", port);
+        let result = base_missing_phase1_columns(&client, &base_url).await;
+        assert!(
+            result,
+            "should return true when candles_1s lacks the phase column"
+        );
+    }
+
+    /// Phase 1 ratchet: base-table probe returns `false` when `phase`
+    /// is already present (no rebuild needed).
+    #[tokio::test]
+    async fn test_base_missing_phase1_columns_returns_false_when_phase_present() {
+        let response_with_phase = "HTTP/1.1 200 OK\r\nContent-Length: 81\r\n\r\n{\"columns\":[{\"name\":\"ts\"},{\"name\":\"security_id\"},{\"name\":\"close\"},{\"name\":\"phase\"}]}";
+        let port = spawn_mock_http_server(response_with_phase).await;
+        tokio::task::yield_now().await;
+        let client = reqwest::Client::new();
+        let base_url = build_questdb_exec_url("127.0.0.1", port);
+        let result = base_missing_phase1_columns(&client, &base_url).await;
+        assert!(
+            !result,
+            "should return false when candles_1s already has the phase column"
+        );
+    }
+
+    /// Phase 1 ratchet: probe is robust to network failure — returns
+    /// `false` on unreachable host (the next boot's idempotent ALTER
+    /// will retry, so a one-shot transient won't block startup).
+    #[tokio::test]
+    async fn test_base_missing_phase1_columns_returns_false_on_unreachable() {
+        let client = reqwest::Client::new();
+        let base_url = "http://127.0.0.1:1/exec";
+        let result = base_missing_phase1_columns(&client, base_url).await;
+        assert!(!result);
+    }
+
+    /// Phase 1 ratchet: HTTP 400 (view/table doesn't exist) returns
+    /// `false`. Step 1 / Step 5 handle the missing-table case via
+    /// `CREATE ... IF NOT EXISTS`.
+    #[tokio::test]
+    async fn test_base_missing_phase1_columns_returns_false_on_non_success() {
+        let port = spawn_mock_http_server(MOCK_HTTP_400).await;
+        tokio::task::yield_now().await;
+        let client = reqwest::Client::new();
+        let base_url = build_questdb_exec_url("127.0.0.1", port);
+        let result = base_missing_phase1_columns(&client, &base_url).await;
+        assert!(!result);
+    }
+
+    /// Phase 1 ratchet: the substring probe `"\"phase\""` does NOT
+    /// false-positive on column names that contain `phase` as a
+    /// non-quoted substring (e.g. `prev_phase`).
+    #[tokio::test]
+    async fn test_base_missing_phase1_columns_no_false_positive_on_substring() {
+        // Body contains `"prev_phase"` but no standalone `"phase"`.
+        let response = "HTTP/1.1 200 OK\r\nContent-Length: 73\r\n\r\n{\"columns\":[{\"name\":\"ts\"},{\"name\":\"security_id\"},{\"name\":\"prev_phase\"}]}";
+        let port = spawn_mock_http_server(response).await;
+        tokio::task::yield_now().await;
+        let client = reqwest::Client::new();
+        let base_url = build_questdb_exec_url("127.0.0.1", port);
+        let result = base_missing_phase1_columns(&client, &base_url).await;
+        assert!(
+            result,
+            "must return true (rebuild needed) when phase is missing — \
+             prev_phase substring should NOT false-match"
+        );
     }
 
     #[tokio::test]
