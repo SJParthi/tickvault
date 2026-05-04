@@ -34,7 +34,8 @@ Net code change: **~700 LoC less, 2 tables less, 7 ErrorCodes less, 1 unified en
 | L7 | Config-driven from day 1: timeframes, movers categories, segments, metrics, phases. Adding any new one = TOML edit, no code change. Ratchets enforce. | session 2026-05-04 |
 | L8 | Honest 100% envelope wording per `wave-4-shared-preamble.md` Section 8 in plan + every PR body. No literal "never". | session 2026-05-04 |
 | L9 | RAM = trading speed only. DB = ALWAYS source of truth for replay/audit. Both written every tick. No data loss path. | session 2026-05-04 |
-| L10 | 15 NEW bulletproofing additions (forensic snapshot, mmap spill, cache-line align, etc. — see §7). | session 2026-05-04 |
+| L10 | 13 NEW bulletproofing additions (forensic snapshot, mmap spill, cache-line align, etc. — see §7). NO forced rotation, NO subscribe-noop heartbeat — zero deliberate disconnects per L11. | session 2026-05-04 |
+| L11 | **ZERO deliberate disconnects.** Code MUST NOT initiate any disconnect on a healthy socket. Only Dhan-side / network-side disconnects are recovered (reactive). Banned: forced rotation, voluntary connection cycling, voluntary unsubscribe-then-resubscribe on healthy connections. Activity watchdog (passive detection) stays. | session 2026-05-04 |
 
 ---
 
@@ -219,7 +220,7 @@ direction = "desc"
 | **Phase 1: Schema widen** (additive ALTER + matview rebuild) | `ALTER TABLE ticks ADD COLUMN IF NOT EXISTS` x4; matviews rebuilt with new schema during off-hours; old movers tables UNTOUCHED | ZERO — new columns sit empty if writer not deployed | matview rebuild verified on at least 1 trading day |
 | **Phase 2: Populate new columns** (dual-write) | Tick parser stamps `prev_day_close` (first-seen) + `prev_day_oi` (boot cache) + `phase`; matview captures them; old movers tables ALSO still being written | ZERO — old path unchanged | 7 trading days of populated columns + zero parser errors |
 | **Phase 3: Add in-memory engines + parity test** (shadow mode) | `CandleEngine<TF>` + `MoversEngine` deployed; `/api/movers` switched to candles SELECT; ratchet test compares RAM vs new SELECT vs old movers tables — all three must agree | ZERO — strategy still reads old tables; new engines shadow-deployed | 7 trading days green-streak across all 3 ratchet axes |
-| **Phase 4: Cutover + delete** | Strategy reads `MoversEngine` (RAM); old movers tables + writers + 4 ErrorCodes + runbooks DELETED | LOW — revert single PR; data still in `ticks` for replay | post-deploy: 30 trading days of monitoring before declaring "done" |
+| **Phase 4: Cutover + delete** | Strategy reads `MoversEngine` (RAM); old movers tables + writers + 4 ErrorCodes + runbooks DELETED | LOW — revert single PR; data still in `ticks` for replay | **14 trading days** of green-streak ratchet parity (RAM ≡ DB ≡ legacy) before merge; post-deploy: 30 trading days monitoring before declaring "done" |
 
 ---
 
@@ -236,12 +237,14 @@ direction = "desc"
 | 7 | Aggressive TCP keepalive (1s/5s) | detect dead conn <10s | socket option set on connect | `test_tcp_keepalive_set` |
 | 8 | DNS round-robin Dhan endpoint IPs | failover on IP route degradation | `tokio_dns_lookup_all` + retry next | `test_dns_failover_to_secondary_ip` |
 | 9 | Dual-stack IPv4 + IPv6 (Happy Eyeballs RFC 8305) | one stack down → other works | `tokio::net::TcpStream::connect` with both families | `test_happy_eyeballs_fallback` |
-| 10 | Forced WS conn age rotation (every 4h, BEFORE Dhan kills) | beat Dhan's silent LB rotation | per-conn timer; rotate one at a time, subs preserved via `SubscribeRxGuard` | `test_forced_rotation_preserves_subs` |
-| 11 | Active "subscribe-noop" heartbeat every 30s | prove liveness, detect silent socket | scheduled task per conn | `test_silent_socket_detected_in_30s` |
-| 12 | Per-conn forensic 60s ring of events | one-line "why did it die" | `arrayvec::ArrayVec<EventLog, 1000>` per conn | `test_forensic_ring_captures_pre_disconnect_60s` |
-| 13 | Pre-disconnect snapshot dumped to JSON on every RST | rules in/out our code as cause | snapshot of ring depth, QuestDB state, mem, CPU, net at moment of RST | `test_snapshot_written_on_disconnect` |
-| 14 | On-demand replay from spill (`make replay-spill-last-60s`) | test recovery without waiting for real failure | tool reads spill NDJSON, re-injects into pipeline | `test_replay_spill_produces_identical_output` |
-| 15 | Chaos test: synthetic Dhan RST flood (Friday CI) | proves bounded recovery weekly | `chaos_dhan_rst_flood.rs` injects RST every 30s for 5min | weekly CI run |
+| 10 | Per-conn forensic 60s ring of events | one-line "why did it die" | `arrayvec::ArrayVec<EventLog, 1000>` per conn | `test_forensic_ring_captures_pre_disconnect_60s` |
+| 11 | Pre-disconnect snapshot dumped to JSON on every RST | rules in/out our code as cause | snapshot of ring depth, QuestDB state, mem, CPU, net at moment of RST | `test_snapshot_written_on_disconnect` |
+| 12 | On-demand replay from spill (`make replay-spill-last-60s`) | test recovery without waiting for real failure | tool reads spill NDJSON, re-injects into pipeline | `test_replay_spill_produces_identical_output` |
+| 13 | Chaos test: synthetic Dhan RST flood (Friday CI) | proves bounded recovery weekly | `chaos_dhan_rst_flood.rs` injects RST every 30s for 5min | weekly CI run |
+
+**REMOVED (per L11 — zero deliberate disconnects):**
+- ~~Forced WS conn age rotation every 4h~~ — banned: deliberate disconnects violate L11
+- ~~Active subscribe-noop heartbeat every 30s~~ — banned: deliberate work on socket violates L11. Activity watchdog (passive) at 50s already detects silent sockets without any voluntary work.
 
 ---
 
@@ -410,15 +413,17 @@ Plus the 7-row resilience demand matrix from `per-wave-guarantee-matrix.md`.
 
 ---
 
-## 15. Open questions to operator (CONFIRM before code starts)
+## 15. Open questions — ALL LOCKED (no questions remain)
 
-| # | Question | Default if no answer |
-|---|---|---|
-| Q1 | Confirm 29 timeframes list exact (1s/3s/5s/10s/15s/30s, 1m..15m by 1m, 30m, 1h, 2h, 3h, 4h, 1d, 1w, 1mo)? Or trim to standard (1m, 2m, 3m, 5m, 10m, 15m, no 4m/6m/7m/8m/9m/11m/12m/13m/14m)? | use the full list as you specified |
-| Q2 | Forced WS conn rotation interval = 4h. OK or different (2h / 6h / 12h)? | 4h |
-| Q3 | Sub-second timeframe retention = 7d. Acceptable disk cost? | 7d (configurable per `[timeframes.retention]`) |
-| Q4 | Phase 4 deletion gated by 7 trading days OR 14 trading days of green-streak? | 7 trading days |
-| Q5 | Greenlight to start Phase 1 (additive ALTER) on a feature branch? | wait for explicit Y |
+Per operator charter (2026-05-04): defaults locked at maximum-guarantee-within-envelope. No further questions until §16 status checkpoint.
+
+| # | Question | LOCKED ANSWER | Rationale |
+|---|---|---|---|
+| Q1 | Timeframes list | full 29 (1s/3s/5s/10s/15s/30s, 1m..15m by 1m, 30m, 1h, 2h, 3h, 4h, 1d, 1w, 1mo) | maximum coverage |
+| Q2 | Forced WS rotation | **DELETED** — banned by L11 | zero deliberate disconnects |
+| Q3 | Sub-second retention | 7d hot EBS → 365d S3 Standard → 5y Glacier Deep Archive | longest fit inside `aws-budget.md` ₹5K/mo cap; SEBI 5y satisfied |
+| Q4 | Phase 4 deletion gate | **14 trading days** green-streak ratchet parity | covers ≥1 expiry day + monthly rollover; maximum guarantee per charter |
+| Q5 | Phase 1 start | auto-start when operator says "go" — no further confirmation needed | charter §1 demands automation |
 
 ---
 
