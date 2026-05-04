@@ -3366,18 +3366,42 @@ async fn main() -> Result<()> {
         }
         boot_ordering_gate.mark_engines_ready();
         boot_ordering_gate.mark_replay_completed();
+        // Phase 2.9 H1 fix (hostile bug-hunt): the BootOrderingGate was
+        // previously informational — a failed authorization logged ERROR
+        // but boot continued, so the WS subscribe still went out with
+        // potentially stale state. The H4 fix in Phase 2.8 (skip
+        // `mark_oi_cache_loaded` on Err) means this branch will fire
+        // when QuestDB candles_1d is unreachable. Treating it as a
+        // panic gives binary-level L14 enforcement: the process refuses
+        // to subscribe with an unhealthy state.
+        //
+        // We use `std::process::exit(1)` rather than `panic!` so the
+        // exit cleanly skips destructors that might try to flush partial
+        // state. systemd / docker restart policy handles the recovery
+        // loop. The 30s prev_oi_cache timeout caps the worst-case wait
+        // before this fires.
         if !boot_ordering_gate.try_authorize_subscribe() {
             tracing::error!(
+                code = tickvault_common::error_code::ErrorCode::Phase2Ready01PreflightFailed.code_str(),
                 readiness = ?boot_ordering_gate.readiness(),
                 "L14 boot-ordering gate refused to authorize subscribe — \
-                 defence-in-depth assertion; should be unreachable since \
-                 all 3 prerequisites are marked above"
+                 prev_oi_cache load likely failed (see PREVCLOSE-01 above). \
+                 HARD-FAIL: process::exit(1) so systemd/docker restart \
+                 the boot rather than subscribe with unhealthy state."
             );
+            metrics::counter!("tv_l14_boot_authorization_refused_total").increment(1);
+            // Allow tests to exercise this branch without killing the
+            // test runner — gated on TICKVAULT_BOOT_DRY_RUN env var
+            // which production never sets.
+            if std::env::var("TICKVAULT_BOOT_DRY_RUN").is_err() {
+                std::process::exit(1);
+            }
         } else {
             tracing::info!(
                 "L14 boot-ordering gate authorized subscribe (Phase 2.6: \
                  prev_oi_cache loaded, engines ready, replay completed)"
             );
+            metrics::counter!("tv_l14_boot_authorization_total").increment(1);
         }
         // Reference the gate so it isn't optimized out — future commits
         // can pass `boot_ordering_gate.clone()` into the WS subscribe
