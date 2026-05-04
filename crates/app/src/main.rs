@@ -1364,6 +1364,24 @@ async fn main() -> Result<()> {
                 .await;
             });
             info!("FAST BOOT COMPLETE — tick processor started, ticks flowing (in-memory)");
+            // Phase 2.12 (hostile L1 fix): emit a boot-mode gauge so
+            // operators can chart fast/slow boot history. Fast boot
+            // intentionally passes None for tick_enricher (recovery
+            // path, no enrichment) — the gauge value 0 makes the
+            // missing lifecycle columns visible vs slow boot's value 1.
+            metrics::gauge!(
+                "tv_lifecycle_enricher_attached",
+                "boot_mode" => "fast"
+            )
+            .set(0.0);
+            info!(
+                boot_mode = "fast",
+                enricher_attached = false,
+                "BOOT MODE: fast (recovery path) — lifecycle columns will NOT be \
+                 populated this session; volume_delta/prev_day_close/prev_day_oi/phase \
+                 default to 0/0.0/0/PREMARKET. Operator: this is the expected fast-boot \
+                 contract; full lifecycle attaches on the next slow-boot restart."
+            );
             Some(handle)
         } else {
             info!("tick processor skipped — no frame source available");
@@ -3459,6 +3477,27 @@ async fn main() -> Result<()> {
         });
         info!(
             "tick processor started (with candle aggregation + top movers + option movers + trading broadcast)"
+        );
+        // Phase 2.12 (hostile L1 fix): boot-mode gauge for slow boot.
+        // value=1 indicates the lifecycle enricher is attached and the
+        // 4 ticks-table lifecycle columns will be populated this
+        // session. Operators can chart the time series:
+        //   tv_lifecycle_enricher_attached{boot_mode="slow"} 1
+        // → operator sees mode-switch (fast↔slow) in Prometheus
+        // history independent of the boot log.
+        metrics::gauge!(
+            "tv_lifecycle_enricher_attached",
+            "boot_mode" => "slow"
+        )
+        .set(1.0);
+        info!(
+            boot_mode = "slow",
+            enricher_attached = true,
+            "BOOT MODE: slow (production path) — TickEnricher attached, \
+             prev_oi_cache loaded, BootOrderingGate authorized, midnight \
+             rollover + periodic refresh tasks spawned. Lifecycle columns \
+             (volume_delta, prev_day_close, prev_day_oi, phase) will be \
+             populated for every live tick this session."
         );
         // Pipeline-active wiring (slow boot): mirror the fast-boot flip
         // above so the System Overview "Pipeline Status" tile reads
