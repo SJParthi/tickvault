@@ -81,7 +81,12 @@ pub mod historical_fetch_marker;
 pub mod indicator_snapshot_persistence;
 pub mod instrument_persistence;
 pub mod materialized_views;
-pub mod movers_base_persistence;
+// PR #457 (2026-05-04): legacy `movers_persistence` (StockMoversWriter +
+// OptionMoversWriter) DELETED — writers became unused after PR #449
+// DROP-migrated their target tables. The canonical `movers_persistence`
+// module (writes `movers_1s` base + 25 mat-views, source of truth for
+// the unified `/api/movers` endpoint per PR #450) is renamed to
+// `movers_persistence` to take its place.
 pub mod movers_persistence;
 pub mod movers_unified_query;
 pub mod movers_writer;

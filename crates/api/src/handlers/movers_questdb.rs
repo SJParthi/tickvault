@@ -6,7 +6,7 @@
 //!
 //! # Audit-2026-05-03 (hostile bug-hunt CRITICAL fixes)
 //!
-//! The `movers_5s` mat view (defined in `movers_base_persistence.rs::movers_view_ddl`)
+//! The `movers_5s` mat view (defined in `movers_persistence.rs::movers_view_ddl`)
 //! aggregates the per-second base via `last()` / `first()` per bucket
 //! and exposes the renamed columns:
 //! - `volume` (base) → `volume_cumulative` (view) — cumulative session total

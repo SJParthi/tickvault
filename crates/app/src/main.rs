@@ -2096,7 +2096,7 @@ async fn main() -> Result<()> {
         // also issues a one-shot DROP for the legacy `movers_22tf_*` tables
         // (deleted 2026-05-01) and the legacy `movers_unified_*` names (renamed
         // to `movers_*` 2026-05-01).
-        tickvault_storage::movers_base_persistence::ensure_movers_tables_and_views(
+        tickvault_storage::movers_persistence::ensure_movers_tables_and_views(
             &config.questdb,
         ),
         tickvault_storage::indicator_snapshot_persistence::ensure_indicator_snapshot_table(

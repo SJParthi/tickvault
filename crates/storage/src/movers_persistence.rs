@@ -1,2489 +1,1604 @@
-//! QuestDB ILP persistence for top movers snapshots (stocks + options).
-//!
-//! Persists 1-minute ranked snapshots of gainers, losers, most active (stocks)
-//! and Highest OI, OI Gainers/Losers, Top Volume/Value, Price Gainers/Losers (options).
-//!
-//! # Tables Written
-//! - `stock_movers` — top 20 gainers, losers, most active per minute
-//! - `option_movers` — top 20 per 7 categories per minute
-//!
-//! # Idempotency
-//! DEDUP UPSERT KEYS on `(ts, security_id, category, segment)` prevent
-//! duplicates on restart. `segment` is required because the same
-//! `security_id` exists across `IDX_I` / `NSE_EQ` / `NSE_FNO` — see audit
-//! gaps DB-3/DB-4.
-//!
-//! # Error Handling (DB-6/DB-7)
-//! Movers persistence is cold-path observability data, NOT critical path.
-//! Reconnect attempts are throttled to one per
-//! `MOVERS_RECONNECT_THROTTLE_SECS` (30s) to prevent tight reconnect loops
-//! when QuestDB flaps. Every dropped batch is counted via
-//! `rows_dropped_total` + `tv_{stock,option}_movers_dropped_total` +
-//! `tv_{stock,option}_movers_flush_failures_total` and logged at ERROR
-//! level so the Telegram alert path fires.
+// APPROVED: Cat 9 — this IS the canonical movers DDL module per
+// `.claude/plans/active-plan-movers-cleanup.md` (2026-05-01). The legacy
+// `movers_22tf_persistence.rs` was DELETED in this same plan; the file name
+// `movers_persistence.rs` is preserved internally to keep the diff
+// surgical, but every operator-visible identifier and DDL string now uses
+// the unsuffixed `movers_*` form.
 
-use std::collections::VecDeque;
-use std::time::{Duration, Instant};
+//! Movers base table + 25 materialized views.
+//!
+//! - **Base table** `movers_1s` — single TABLE, 1 Hz cadence, ONE ILP
+//!   writer task in the app.
+//! - **25 materialized views** `movers_{5s,10s,15s,30s,1m,...,1d}` — created at
+//!   boot via `CREATE MATERIALIZED VIEW IF NOT EXISTS`, incrementally
+//!   refreshed server-side by QuestDB. The `10s` view was added by
+//!   Audit-2026-05-03 for sub-15s movers granularity.
+//! - **DEDUP** on the base: `(ts, security_id, segment)`. Views inherit
+//!   uniqueness via `SAMPLE BY` semantics.
+//!
+//! # 2026-05-01 cleanup migration (one-shot)
+//!
+//! Boot also runs a one-shot DROP migration (gated by the marker table
+//! `movers_migration_2026_05_01`) that removes:
+//! - 25 dead `movers_{1s..1h}` tables created by the deleted
+//!   `movers_22tf_persistence` module.
+//! - The pre-rename `movers_unified_1s` base table.
+//! - The pre-rename 24 `movers_unified_{5s..1d}` materialized views.
+//!
+//! After the migration runs once, the marker is inserted and subsequent
+//! boots are no-ops.
+//!
+//! # Why mat views (not tables)
+//!
+//! Per-timeframe rankings (top-50 by change_pct, etc.) are read-time
+//! queries against the right mat view. The aggregation is `last()` /
+//! `first()` of the per-second base — pure SQL, no Rust ranking. The
+//! deleted 25-tables design duplicated work in Rust; this design
+//! delegates aggregation to QuestDB.
 
-use anyhow::{Context, Result};
-use questdb::ingress::{Buffer, ProtocolVersion, Sender, TimestampNanos};
+use std::time::Duration;
+
 use reqwest::Client;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 use tickvault_common::config::QuestDbConfig;
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
+/// QuestDB base table name. ONE physical table; everything else is a view.
+pub const QUESTDB_TABLE_MOVERS_1S: &str = "movers_1s";
 
-/// QuestDB table name for stock movers (gainers, losers, most active).
-/// Plan item C (2026-04-22): unified 6-bucket movers table name.
-/// Written by the V2 movers writer once per second during market hours.
-pub const QUESTDB_TABLE_TOP_MOVERS: &str = "top_movers";
+/// DEDUP UPSERT KEY for the base — composite `(ts, security_id, segment)`.
+/// Views inherit uniqueness from the base via SAMPLE BY semantics.
+/// I-P1-11 + STORAGE-GAP-01: includes `segment` per the workspace meta-guard.
+pub const DEDUP_KEY_MOVERS_1S: &str = "ts, security_id, segment";
 
-pub const QUESTDB_TABLE_STOCK_MOVERS: &str = "stock_movers";
-
-/// QuestDB table name for option movers (7 categories).
-pub const QUESTDB_TABLE_OPTION_MOVERS: &str = "option_movers";
-
-/// DEDUP UPSERT KEY for movers tables.
-///
-/// Compound key: `(ts, security_id, category, segment)` prevents duplicate entries
-/// on restart/reconnect AND prevents cross-segment collision.
-///
-/// **Why `segment` is required** (audit gap DB-3/DB-4, ticket 2026-04-15):
-/// The same `security_id` is reused by Dhan across exchange segments. For
-/// example, `security_id = 13` is `NIFTY` in both `IDX_I` (index) and `NSE_EQ`
-/// (equity — no such instrument in real life, but the collision exists at the
-/// schema level and has been observed for other IDs like 25 / BANKNIFTY). If
-/// `segment` is omitted from the DEDUP key, two legitimate distinct movers
-/// rows in the same 1-minute snapshot bucket will silently UPSERT each other.
-/// Both DDL schemas (`stock_movers`, `option_movers`) declare `segment SYMBOL`
-/// — the DEDUP key must reference every column that contributes to row identity.
-///
-/// Enforced by `test_dedup_key_movers_includes_segment` +
-/// `test_dedup_key_movers_matches_ddl_identity_columns`.
-const DEDUP_KEY_MOVERS: &str = "security_id, category, segment";
-
-/// Timeout for QuestDB DDL HTTP requests.
+/// HTTP timeout for DDL probes.
 const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
 
-/// Flush batch size for movers (much smaller than ticks — max 20×10 = 200 rows per snapshot).
-const MOVERS_FLUSH_BATCH_SIZE: usize = 250;
+/// The 25 materialized-view timeframes derived from the 1s base.
+/// Order is fixed; tests pin both the count and the exact list.
+///
+/// Audit-2026-05-03: added `10s` (between `5s` and `15s`) per operator
+/// spec coverage requirement — finer granularity for sub-15s movers
+/// shifts. Additive, non-destructive: existing QuestDB mat views from
+/// the 24-set are preserved, the new `movers_10s` view is created on
+/// next boot via the standard `CREATE MATERIALIZED VIEW IF NOT EXISTS`
+/// idempotent self-heal (Phase 2 / I-P1-08 schema-upgrade pattern).
+pub const MOVERS_VIEW_TIMEFRAMES: &[&str] = &[
+    "5s", "10s", "15s", "30s", "1m", "2m", "3m", "4m", "5m", "6m", "7m", "8m", "9m", "10m", "11m",
+    "12m", "13m", "14m", "15m", "30m", "1h", "2h", "3h", "4h", "1d",
+];
 
-/// Minimum interval between reconnect attempts when QuestDB is down.
-///
-/// Audit gap DB-6: the previous flush path called `Sender::from_conf`
-/// on every failed batch with zero backoff, creating a tight reconnect
-/// loop when QuestDB flapped. Caps reconnect attempts at one per 30s
-/// per writer, matching the pattern used by `LiveCandleWriter` and
-/// `IndicatorSnapshotWriter`.
-const MOVERS_RECONNECT_THROTTLE_SECS: u64 = 30;
+/// Pinned count — must equal `MOVERS_VIEW_TIMEFRAMES.len()`.
+pub const MOVERS_VIEW_COUNT: usize = 25;
 
-/// Capacity of the in-memory rescue ring for movers writers (DB-2).
-///
-/// Movers are emitted at ~200 rows/min max (20 entries × 10 categories).
-/// A 5,000-entry ring covers ~25 minutes of snapshot backlog — comfortably
-/// longer than any routine QuestDB restart. At ~200 bytes per stock
-/// record and ~280 bytes per option record, the per-writer footprint is
-/// ~1 MB stock + ~1.4 MB option = 2.4 MB total — bounded and affordable.
-const MOVERS_RESCUE_RING_CAPACITY: usize = 5_000;
+const _: () = assert!(
+    MOVERS_VIEW_TIMEFRAMES.len() == MOVERS_VIEW_COUNT,
+    "MOVERS_VIEW_TIMEFRAMES length must equal MOVERS_VIEW_COUNT"
+);
 
-/// Flush interval for movers (60 seconds — aligned with snapshot interval).
-/// Used by future flush_if_needed() implementation.
-#[allow(dead_code)] // APPROVED: will be used when flush_if_needed() is wired
-const MOVERS_FLUSH_INTERVAL_MS: u64 = 65_000;
+/// Pre-rename mat-view timeframes (the old `movers_unified_*` set). Used by
+/// the one-shot 2026-05-01 cleanup migration to DROP the old objects.
+const LEGACY_UNIFIED_VIEW_TIMEFRAMES: &[&str] = &[
+    "5s", "15s", "30s", "1m", "2m", "3m", "4m", "5m", "6m", "7m", "8m", "9m", "10m", "11m", "12m",
+    "13m", "14m", "15m", "30m", "1h", "2h", "3h", "4h", "1d",
+];
 
-// ---------------------------------------------------------------------------
-// DDL
-// ---------------------------------------------------------------------------
+/// Dead `movers_22tf` table names (the deleted 25-table design). Used by the
+/// one-shot 2026-05-01 cleanup migration to DROP the orphan tables. NOTE:
+/// `movers_1s` overlaps with the new base name — the migration runs ONLY
+/// once per database (marker-gated) so the new base table is never dropped.
+const LEGACY_22TF_TIMEFRAMES: &[&str] = &[
+    "1s", "2s", "3s", "5s", "10s", "15s", "20s", "30s", "1m", "2m", "3m", "4m", "5m", "6m", "7m",
+    "8m", "9m", "10m", "11m", "12m", "13m", "14m", "15m", "30m", "1h",
+];
 
-/// DDL for the `stock_movers` table.
-///
-/// Stores 1-minute snapshots of top 20 gainers, losers, most active stocks.
-/// Partitioned by DAY (one partition per trading day, ~60×3×20 = 3600 rows/day).
-const STOCK_MOVERS_CREATE_DDL: &str = "\
-    CREATE TABLE IF NOT EXISTS stock_movers (\
-        category SYMBOL,\
-        security_id LONG,\
-        segment SYMBOL,\
-        symbol SYMBOL,\
-        ltp DOUBLE,\
-        prev_close DOUBLE,\
-        change_abs DOUBLE,\
-        change_pct DOUBLE,\
-        volume LONG,\
-        rank INT,\
-        phase SYMBOL,\
-        ts TIMESTAMP\
-    ) TIMESTAMP(ts) PARTITION BY DAY WAL\
-";
+/// Marker-table name. Existence guards the one-shot migration.
+const MIGRATION_MARKER_TABLE: &str = "movers_migration_2026_05_01";
 
-/// Plan item C (2026-04-22): DDL for the unified 6-bucket `top_movers` table.
-///
-/// Replaces `stock_movers` + `option_movers` with a single schema keyed by
-/// `(bucket, rank_category, rank, ts)`. One partition per trading day (SEBI
-/// 5-year retention via lifecycle tiers). WAL + DEDUP means repeated writes
-/// of the same rank row within the same second collapse to the latest.
-///
-/// # Bucket values (plan A1 wire strings)
-/// `indices` / `stocks` / `index_futures` / `stock_futures` /
-/// `index_options` / `stock_options`
-///
-/// # Rank category values (plan A2 wire strings)
-/// `gainers` / `losers` / `most_active` / `top_oi` / `oi_buildup` /
-/// `oi_unwind` / `top_value`
-///
-/// # Row volume
-/// At 1 Hz persistence cadence with 20 ranks per bucket per category
-/// across six buckets (3 categories × 2 price buckets + 7 × 4 derivative
-/// buckets = 134 rows/sec × 21_600 market seconds/day ≈ 2.9M rows/day).
-const TOP_MOVERS_CREATE_DDL: &str = "\
-    CREATE TABLE IF NOT EXISTS top_movers (\
-        timeframe SYMBOL,\
-        bucket SYMBOL,\
-        rank_category SYMBOL,\
-        rank INT,\
-        security_id LONG,\
-        segment SYMBOL,\
-        symbol SYMBOL,\
-        underlying SYMBOL,\
-        expiry STRING,\
-        strike DOUBLE,\
-        option_type SYMBOL,\
-        ltp DOUBLE,\
-        prev_close DOUBLE,\
-        change_pct DOUBLE,\
-        volume LONG,\
-        value DOUBLE,\
-        oi LONG,\
-        prev_oi LONG,\
-        oi_change_pct DOUBLE,\
-        ts TIMESTAMP\
-    ) TIMESTAMP(ts) PARTITION BY DAY WAL\
-";
+/// Audit-2026-05-03 marker — guards the one-shot DROP of the legacy
+/// `stock_movers` + `option_movers` tables. These were written by
+/// `StockMoversWriter` + `OptionMoversWriter` (since-retired by this
+/// PR) and are now subsumed by the canonical `movers_1s` + 25 mat
+/// views. Operator queries should filter by `instrument_type` against
+/// the `movers_*` views; the dropped tables become read-error after
+/// migration runs (which is the desired stale-query alarm).
+const LEGACY_RETIRE_MARKER_TABLE: &str = "movers_legacy_retire_2026_05_03";
 
-/// Idempotent self-heal DDL: ALTER TABLE ADD COLUMN IF NOT EXISTS for the
-/// two columns added 2026-04-25 (`timeframe`, `segment`). Pre-existing
-/// QuestDB deployments built on the previous schema get auto-migrated at
-/// boot without DROP. QuestDB ignores ADDs that already exist, so running
-/// every boot is free.
-const TOP_MOVERS_ALTER_DDL_TIMEFRAME: &str =
-    "ALTER TABLE top_movers ADD COLUMN IF NOT EXISTS timeframe SYMBOL";
-const TOP_MOVERS_ALTER_DDL_SEGMENT: &str =
-    "ALTER TABLE top_movers ADD COLUMN IF NOT EXISTS segment SYMBOL";
+/// Audit-2026-05-03: legacy table names dropped by the retirement
+/// migration. Pinned + tested against the prior writer DDL so a future
+/// rename / restore cannot silently miss either table.
+const LEGACY_RETIRE_DROP_TABLES: &[&str] = &["stock_movers", "option_movers"];
 
-/// Wave-3-A Item 10 + adversarial-review LOW #6: sanitize an ILP SYMBOL
-/// value before it is written to QuestDB.
+/// Base table DDL — `CREATE TABLE IF NOT EXISTS` per Item 25 spec.
 ///
-/// The InfluxDB Line Protocol uses `\n`, `\r`, `,`, `=`, and space as
-/// structural delimiters. Although the upstream `questdb-rs` crate
-/// validates symbol values, the precise rejected-character set has
-/// drifted across library versions and a future upgrade could re-open
-/// the injection vector. Strip every control character + the four
-/// structural delimiters defensively before they reach the buffer.
+/// 12-column schema:
+/// - `ts` — designated timestamp (IST epoch nanos / 1000 → micros)
+/// - `security_id` (LONG) + `segment` (SYMBOL) → composite key per I-P1-11
+/// - `exchange_segment` (SYMBOL) — precise per-exchange tag (e.g., `NSE_FNO`,
+///   `BSE_FNO`, `NSE_EQ`, `IDX_I`). Disambiguates the otherwise-collapsed
+///   single-char `segment` column where `D` means both NSE_FNO and BSE_FNO.
+/// - `instrument_type` (SYMBOL) — precise instrument classification per
+///   Dhan annexure (`INDEX`, `EQUITY`, `FUTIDX`, `FUTSTK`, `FUTCOM`,
+///   `FUTCUR`, `OPTIDX`, `OPTSTK`, `OPTFUT`, `OPTCUR`). Lets selectors
+///   filter "stock options only" (`OPTSTK`), "index futures only"
+///   (`FUTIDX`), or coarse buckets like "all options"
+///   (`OPTIDX|OPTSTK|OPTFUT|OPTCUR`) without InstrumentRegistry lookups
+///   per query. Required by the depth-dynamic top-volume selector
+///   (PR-B 2026-05-02). Schema-upgrade safe via
+///   `ALTER TABLE ADD COLUMN IF NOT EXISTS` self-heal at boot.
+/// - `phase` (SYMBOL) — session phase tag: `"PREOPEN"` (09:00-09:13 IST
+///   pre-open phase), `"MARKET"` (09:15-15:30 IST in-session), or
+///   `"POSTMARKET"` (15:30-15:40 IST close auction). Added by the
+///   2026-05-03 legacy retirement to fold the legacy `PreopenMoversTracker`
+///   functionality into the canonical `movers_1s` pipeline. Frontend
+///   filters with `WHERE phase = 'PREOPEN' AND instrument_type = 'EQUITY'`
+///   to reproduce the legacy pre-open snapshot view.
+/// - `open_interest`, `oi_delta` (LONG) — cumulative + first-derivative
+/// - `volume` (LONG) — cumulative since session open (Item 26 L1 pin)
+/// - `last_price`, `prev_close`, `change_pct` (DOUBLE) — rendered metrics
+/// - `received_at` (TIMESTAMP) — wall-clock arrival for forensics
 ///
-/// This is a borrow-friendly helper: returns `Cow::Borrowed(input)` if
-/// the input is already clean (zero allocation on the common path) and
-/// `Cow::Owned(_)` only when sanitisation actually happened.
-///
-/// O(1) per character; runs at the cold ILP-build cadence (~218
-/// rows/snapshot × 60s = ~3.6 rows/sec peak), so allocation on the
-/// dirty path is acceptable.
-/// Maximum byte length for an ILP symbol value. QuestDB ILP rejects extremely
-/// long SYMBOL columns; an unbounded upstream label (e.g. a malformed mover
-/// category from a corrupted CSV row) could otherwise produce an oversized
-/// ILP row that the server accepts as garbage or rejects entirely. Audit-
-/// 2026-05-03 H3: cap at a generous 256 bytes — every legitimate symbol /
-/// category / segment / phase value is ≤ ~32 bytes today.
-const ILP_SYMBOL_MAX_BYTES: usize = 256;
-
+/// **PR #450 Dhan-parity additions (2026-05-03):**
+/// - `prev_oi` (LONG) — previous-session-close OI baseline. Sourced from
+///   NSE bhavcopy `OpnIntrst` (col 22) for NSE_FNO derivatives, and from
+///   Dhan WS PrevClose packet code 6 bytes 12-15 for IDX_I per
+///   `docs/dhan-ref/03-live-market-feed-websocket.md:384` and
+///   `.claude/rules/dhan/live-market-feed.md` rule 7. Required to compute
+///   the precise `OI Change` and `OI Change %` columns Dhan's frontend
+///   shows on Markets > Options view (per operator clarification 2026-05-03).
+///   `0` for instruments with no prev_oi available (equities/indices).
+/// - `expiry_date_ist` (TIMESTAMP — IST midnight epoch nanos) — derivative
+///   contract expiry. Populated from `InstrumentRegistry.get_with_segment(
+///   security_id, segment).expiry_date` (cold path, O(1) lookup). Enables
+///   the `?expiry=YYYY-MM-DD` filter on `/api/movers` matching Dhan's
+///   middle dropdown (May / June / July). NULL/0 for non-derivative rows.
 #[must_use]
-pub fn sanitize_ilp_symbol(input: &str) -> std::borrow::Cow<'_, str> {
-    let needs_strip = input
-        .chars()
-        .any(|c| c == '\n' || c == '\r' || c == ',' || c == '=' || c.is_control());
-    let needs_truncate = input.len() > ILP_SYMBOL_MAX_BYTES;
-    if !needs_strip && !needs_truncate {
-        return std::borrow::Cow::Borrowed(input);
+pub fn movers_1s_create_ddl() -> String {
+    format!(
+        // APPROVED: Cat 9 — canonical mat-view base table.
+        "CREATE TABLE IF NOT EXISTS {QUESTDB_TABLE_MOVERS_1S} (\
+            ts               TIMESTAMP, \
+            security_id      LONG, \
+            segment          SYMBOL CAPACITY 16 NOCACHE, \
+            exchange_segment SYMBOL CAPACITY 16 NOCACHE, \
+            instrument_type  SYMBOL CAPACITY 16 NOCACHE, \
+            phase            SYMBOL CAPACITY 8 NOCACHE, \
+            open_interest    LONG, \
+            oi_delta         LONG, \
+            prev_oi          LONG, \
+            volume           LONG, \
+            last_price       DOUBLE, \
+            prev_close       DOUBLE, \
+            change_pct       DOUBLE, \
+            expiry_date_ist  TIMESTAMP, \
+            received_at      TIMESTAMP\
+        ) TIMESTAMP(ts) PARTITION BY DAY \
+        DEDUP UPSERT KEYS({DEDUP_KEY_MOVERS_1S});"
+    )
+}
+
+/// Session phase value: pre-open auction window
+/// (09:00:00–09:14:59 IST inclusive). Indices + equities write rows
+/// here when ticks arrive; F&O typically has no ticks → no rows.
+/// Folds in the legacy `STOCK_MOVERS_PHASE_PREOPEN` constant from
+/// the deleted `movers_persistence.rs` (per Audit-2026-05-03 legacy
+/// retirement).
+pub const MOVERS_PHASE_PREOPEN: &str = "PREOPEN";
+
+/// Session phase value: continuous trading window
+/// (09:15:00–15:29:59 IST inclusive). All segments. F&O joins at
+/// 09:15:00 — the opening tick is captured in MARKET per operator
+/// clarification 2026-05-03 follow-up.
+pub const MOVERS_PHASE_MARKET: &str = "MARKET";
+
+// MOVERS_PHASE_POSTMARKET REMOVED (operator clarification 2026-05-03):
+// the post-15:30 window is no longer tracked by movers. Trading
+// effectively ends at 15:29:59. Any remaining 15:30-15:40 close-
+// auction monitoring would live in a separate subsystem if needed.
+
+/// Idempotent self-heal for the `exchange_segment` column.
+///
+/// QuestDB's `ALTER TABLE ADD COLUMN IF NOT EXISTS` is a no-op when the
+/// column already exists. Run on every boot so existing databases (which
+/// pre-date the 2026-05-02 schema upgrade) gain the column without a
+/// one-shot migration. Per `observability-architecture.md` schema
+/// self-heal pattern.
+#[must_use]
+pub fn movers_1s_alter_add_exchange_segment_ddl() -> String {
+    format!(
+        "ALTER TABLE {QUESTDB_TABLE_MOVERS_1S} \
+         ADD COLUMN IF NOT EXISTS exchange_segment SYMBOL CAPACITY 16 NOCACHE;"
+    )
+}
+
+/// Idempotent self-heal for the `instrument_type` column. Same pattern as
+/// `movers_1s_alter_add_exchange_segment_ddl` — runs every boot and is a
+/// no-op when the column already exists.
+#[must_use]
+pub fn movers_1s_alter_add_instrument_type_ddl() -> String {
+    format!(
+        "ALTER TABLE {QUESTDB_TABLE_MOVERS_1S} \
+         ADD COLUMN IF NOT EXISTS instrument_type SYMBOL CAPACITY 16 NOCACHE;"
+    )
+}
+
+/// PR #450 (2026-05-03): idempotent self-heal for the `prev_oi` column.
+///
+/// Adds the previous-session-close OI baseline column to existing
+/// databases without a one-shot migration. Required for Dhan-parity
+/// `OI Change` / `OI Change %` calculations per operator clarification
+/// 2026-05-03. The column is LONG (i64) — `0` is the sentinel for
+/// instruments with no prev_oi available (equities, indices, or
+/// derivatives whose bhavcopy row was missing).
+///
+/// Per `observability-architecture.md` schema self-heal pattern.
+#[must_use]
+pub fn movers_1s_alter_add_prev_oi_ddl() -> String {
+    format!(
+        "ALTER TABLE {QUESTDB_TABLE_MOVERS_1S} \
+         ADD COLUMN IF NOT EXISTS prev_oi LONG;"
+    )
+}
+
+/// PR #450 (2026-05-03): idempotent self-heal for the `expiry_date_ist`
+/// column.
+///
+/// Adds the derivative-contract expiry column (IST midnight epoch nanos)
+/// to existing databases. Enables the `?expiry=YYYY-MM-DD` filter on
+/// `/api/movers` matching Dhan's middle dropdown (May / June / July...).
+/// NULL/0 for non-derivative rows.
+///
+/// Per `observability-architecture.md` schema self-heal pattern.
+#[must_use]
+pub fn movers_1s_alter_add_expiry_date_ist_ddl() -> String {
+    format!(
+        "ALTER TABLE {QUESTDB_TABLE_MOVERS_1S} \
+         ADD COLUMN IF NOT EXISTS expiry_date_ist TIMESTAMP;"
+    )
+}
+
+/// Audit-2026-05-03: idempotent self-heal for the `phase` column.
+///
+/// Folds the legacy `PreopenMoversTracker` functionality into the
+/// canonical `movers_1s` pipeline. Pre-existing databases (which were
+/// created before this column landed) gain the column on next boot
+/// without any one-shot migration. Per `observability-architecture.md`
+/// schema self-heal pattern.
+///
+/// Capacity is 8 (vs 16 for other SYMBOL columns) because `phase` has
+/// only 3 possible values (`PREOPEN`, `MARKET`, `POSTMARKET`) — sized
+/// to fit comfortably with headroom for future phases (e.g. lunch
+/// halt) without wasting memory.
+#[must_use]
+pub fn movers_1s_alter_add_phase_ddl() -> String {
+    format!(
+        "ALTER TABLE {QUESTDB_TABLE_MOVERS_1S} \
+         ADD COLUMN IF NOT EXISTS phase SYMBOL CAPACITY 8 NOCACHE;"
+    )
+}
+
+/// Materialized-view DDL for one timeframe.
+///
+/// **Snapshot columns** (cumulative since session open, last-tick semantics):
+/// - `last_price` — close-tick price for this bucket
+/// - `open_interest` — OI at bucket close
+/// - `volume_cumulative` — cumulative session volume at bucket close
+/// - `prev_close` — previous-day close (per-instrument constant during session)
+///
+/// **Bucket-incremental columns** (work via cumulative monotonicity per
+/// Item 26 L1 — `volume` is monotonic non-decreasing within a session,
+/// so `last - first` recovers per-bucket increment):
+/// - `volume_bucket` — `last(volume) - first(volume)`
+/// - `oi_delta_bucket` — `last(oi) - first(oi)` (signed)
+///
+/// **Bucket OHLC** (intra-bucket price action): `open_price_bucket`,
+/// `high_price_bucket`, `low_price_bucket`; close = `last_price`.
+///
+/// **Two change_pct flavours** (CASE-WHEN guards prev_close > 0 to avoid
+/// divide-by-zero on freshly-listed contracts).
+///
+/// **BANNED aggregations** — SUM of volume / SUM of open_interest. Volume
+/// and OI are cumulative per Item 26 L1; summing across buckets
+/// double/triple-counts. Source-scan ratchet
+/// `test_movers_ddl_no_sum_volume_anywhere` enforces this.
+#[must_use]
+pub fn movers_view_ddl(timeframe: &str) -> String {
+    format!(
+        "CREATE MATERIALIZED VIEW IF NOT EXISTS movers_{timeframe} AS \
+         SELECT \
+            security_id, \
+            segment, \
+            last(exchange_segment) AS exchange_segment, \
+            last(instrument_type) AS instrument_type, \
+            ts, \
+            last(last_price) AS last_price, \
+            last(open_interest) AS open_interest, \
+            last(prev_oi) AS prev_oi, \
+            last(expiry_date_ist) AS expiry_date_ist, \
+            last(volume) AS volume_cumulative, \
+            last(prev_close) AS prev_close, \
+            last(volume) - first(volume) AS volume_bucket, \
+            last(open_interest) - first(open_interest) AS oi_delta_bucket, \
+            last(open_interest) - last(prev_oi) AS oi_change_session, \
+            CASE WHEN last(prev_oi) > 0 \
+                 THEN ((CAST(last(open_interest) AS DOUBLE) - CAST(last(prev_oi) AS DOUBLE)) \
+                       / CAST(last(prev_oi) AS DOUBLE)) * 100 \
+                 ELSE 0 \
+            END AS oi_change_pct_session, \
+            first(last_price) AS open_price_bucket, \
+            max(last_price) AS high_price_bucket, \
+            min(last_price) AS low_price_bucket, \
+            CASE WHEN last(prev_close) > 0 \
+                 THEN ((last(last_price) - last(prev_close)) / last(prev_close)) * 100 \
+                 ELSE 0 \
+            END AS change_pct_session, \
+            CASE WHEN first(last_price) > 0 \
+                 THEN ((last(last_price) - first(last_price)) / first(last_price)) * 100 \
+                 ELSE 0 \
+            END AS change_pct_bucket \
+         FROM {QUESTDB_TABLE_MOVERS_1S} \
+         SAMPLE BY {timeframe} ALIGN TO CALENDAR WITH OFFSET '00:00';"
+    )
+}
+
+/// Run the one-shot 2026-05-01 cleanup migration (DROP dead movers_22tf
+/// tables + DROP legacy movers_unified_* tables/views), gated by the
+/// presence of the marker table.
+///
+/// **Probe correctness** (security review MEDIUM, hostile-bug-hunt H2): QuestDB
+/// `/exec` returns HTTP 200 with `{"error":"..."}` in the body for missing
+/// tables, AND HTTP 200 with `{"dataset":[[0]],...}` when the marker table
+/// exists but is empty (mid-failed migration). Naive HTTP-status check would
+/// false-positive on both cases. We instead:
+///   1. CREATE the marker table idempotently first (`IF NOT EXISTS`)
+///   2. SELECT count(*) from it
+///   3. Parse the JSON body and require `dataset[0][0] >= 1`
+///
+/// Any deviation (HTTP error, parse failure, empty dataset, count = 0) →
+/// safe-fail to "not yet applied" → run the migration.
+///
+/// **Partial-failure safety** (hostile-bug-hunt H1): each DROP's HTTP status is
+/// observed. The marker INSERT runs ONLY if every DROP returned 2xx. Any
+/// failure short-circuits the marker write so the next boot retries (DROP
+/// IF EXISTS is idempotent so retries are safe).
+async fn run_one_shot_cleanup_migration(client: &Client, base_url: &str) {
+    // Step 0a: idempotent CREATE of the marker table. `IF NOT EXISTS` makes
+    // this safe to call every boot. DEDUP on `applied_at` prevents marker-row
+    // accumulation across re-runs (hostile-bug-hunt M1).
+    let create_marker = format!(
+        "CREATE TABLE IF NOT EXISTS {MIGRATION_MARKER_TABLE} (\
+            applied_at TIMESTAMP\
+        ) TIMESTAMP(applied_at) PARTITION BY YEAR \
+        DEDUP UPSERT KEYS(applied_at);"
+    );
+    if let Err(err) = client
+        .get(base_url)
+        .query(&[("query", create_marker.as_str())])
+        .send()
+        .await
+    {
+        // Boot continues — the probe below will short-circuit if CREATE
+        // failed AND the table already exists from a previous boot, or
+        // safe-fail to "not applied" and run the migration if it doesn't.
+        warn!(?err, "movers cleanup marker CREATE failed (continuing)");
     }
-    let cleaned: String = input
-        .chars()
-        .filter(|c| !(*c == '\n' || *c == '\r' || *c == ',' || *c == '=' || c.is_control()))
-        .collect();
-    // Truncate to ILP_SYMBOL_MAX_BYTES respecting UTF-8 char boundaries.
-    let bounded = if cleaned.len() > ILP_SYMBOL_MAX_BYTES {
-        let mut end = ILP_SYMBOL_MAX_BYTES;
-        while end > 0 && !cleaned.is_char_boundary(end) {
-            end -= 1;
+
+    // Step 0b: probe for an existing marker row. Robust against the QuestDB
+    // HTTP 200 + error-in-body and HTTP 200 + empty-dataset edge cases.
+    if marker_indicates_migration_applied(client, base_url).await {
+        return;
+    }
+
+    info!(
+        marker = MIGRATION_MARKER_TABLE,
+        "running one-shot movers cleanup migration (2026-05-01) — DROP dead movers_22tf + DROP legacy movers_unified_*"
+    );
+
+    let mut all_succeeded = true;
+
+    // Step 1: DROP dead movers_22tf tables (25 names; a few overlap with
+    // new mat-view names but DROP runs BEFORE CREATE in the boot DDL flow).
+    for tf in LEGACY_22TF_TIMEFRAMES {
+        let sql = format!("DROP TABLE IF EXISTS movers_{tf}");
+        if !ddl_succeeded(client, base_url, &sql).await {
+            warn!(timeframe = tf, "DROP TABLE movers_{tf} failed (continuing)");
+            all_succeeded = false;
         }
-        cleaned[..end].to_string()
-    } else {
-        cleaned
+    }
+
+    // Step 2: DROP legacy movers_unified_* mat views (24 names).
+    for tf in LEGACY_UNIFIED_VIEW_TIMEFRAMES {
+        let sql = format!("DROP MATERIALIZED VIEW IF EXISTS movers_unified_{tf}");
+        if !ddl_succeeded(client, base_url, &sql).await {
+            warn!(
+                timeframe = tf,
+                "DROP MATERIALIZED VIEW movers_unified_{tf} failed (continuing)"
+            );
+            all_succeeded = false;
+        }
+    }
+
+    // Step 3: DROP legacy movers_unified_1s base.
+    let drop_legacy_base = "DROP TABLE IF EXISTS movers_unified_1s";
+    if !ddl_succeeded(client, base_url, drop_legacy_base).await {
+        warn!("DROP TABLE movers_unified_1s failed (continuing)");
+        all_succeeded = false;
+    }
+
+    // Step 4: write the marker row ONLY if every DROP succeeded. If any DROP
+    // failed (network blip, QuestDB hiccup) the next boot retries the whole
+    // migration — DROP IF EXISTS makes that safe.
+    if !all_succeeded {
+        error!(
+            marker = MIGRATION_MARKER_TABLE,
+            "one or more DROPs failed during movers cleanup migration — marker NOT written; next boot will retry"
+        );
+        return;
+    }
+
+    let now_micros = chrono::Utc::now().timestamp_micros();
+    let insert_marker = format!("INSERT INTO {MIGRATION_MARKER_TABLE} VALUES ({now_micros})");
+    if !ddl_succeeded(client, base_url, &insert_marker).await {
+        error!(
+            marker = MIGRATION_MARKER_TABLE,
+            "movers cleanup marker INSERT failed — migration will re-run on next boot"
+        );
+        return;
+    }
+
+    info!(
+        marker = MIGRATION_MARKER_TABLE,
+        "movers cleanup migration completed"
+    );
+}
+
+/// Audit-2026-05-03 — one-shot DROP of legacy `stock_movers` +
+/// `option_movers` tables.
+///
+/// Mirrors the marker-gate pattern of
+/// `run_one_shot_movers_cleanup_migration_2026_05_01`. Idempotent:
+/// the marker table is created once, and re-runs of this function on
+/// subsequent boots short-circuit. `DROP TABLE IF EXISTS` makes the
+/// DROP itself safe-to-retry on transient QuestDB failures.
+///
+/// Why a separate marker (vs reusing `MIGRATION_MARKER_TABLE`):
+///
+/// - The 2026-05-01 marker may already be present on databases that
+///   booted prior to this PR; reusing it would mean the new DROPs
+///   never run.
+/// - Keeping the markers granular makes operator forensics easier:
+///   `SELECT name FROM tables() WHERE name LIKE 'movers_%migration%'`
+///   shows exactly which retirement waves a given DB has applied.
+pub async fn run_one_shot_legacy_retire_migration_2026_05_03(client: &Client, base_url: &str) {
+    // Step 0: ensure marker table exists (idempotent — QuestDB returns
+    // success for `CREATE TABLE IF NOT EXISTS` even when the table is
+    // already there).
+    //
+    // Audit-2026-05-03 FIX (security-reviewer MED): use GET `/exec` with
+    // `query=` parameter — the QuestDB `/exec` endpoint contract.
+    // Earlier draft used `client.post(base_url).body(marker_ddl)` which
+    // silently fails (the server does NOT read DDL from POST body) →
+    // marker never created → DROP would re-run every boot. Matches the
+    // proven 2026-05-01 cleanup-migration call pattern at line 309.
+    let marker_ddl = format!(
+        "CREATE TABLE IF NOT EXISTS {LEGACY_RETIRE_MARKER_TABLE} (applied_at TIMESTAMP) \
+         TIMESTAMP(applied_at) PARTITION BY YEAR;"
+    );
+    if let Err(err) = client
+        .get(base_url)
+        .query(&[("query", marker_ddl.as_str())])
+        .send()
+        .await
+    {
+        warn!(
+            ?err,
+            "legacy-retire marker CREATE failed (continuing) — will retry next boot"
+        );
+    }
+
+    // Step 0b: probe the marker table for an existing applied row.
+    if marker_indicates_legacy_retire_applied(client, base_url).await {
+        return;
+    }
+
+    info!(
+        marker = LEGACY_RETIRE_MARKER_TABLE,
+        tables = ?LEGACY_RETIRE_DROP_TABLES,
+        "running one-shot legacy-movers retirement migration (Audit-2026-05-03) — \
+         DROP stock_movers + option_movers"
+    );
+
+    let mut all_succeeded = true;
+    for table in LEGACY_RETIRE_DROP_TABLES {
+        let sql = format!("DROP TABLE IF EXISTS {table}");
+        if !ddl_succeeded(client, base_url, &sql).await {
+            warn!(table, "DROP TABLE {table} failed (continuing)");
+            all_succeeded = false;
+        }
+    }
+
+    if !all_succeeded {
+        error!(
+            marker = LEGACY_RETIRE_MARKER_TABLE,
+            "one or more legacy-retire DROPs failed — marker NOT written; \
+             next boot will retry"
+        );
+        return;
+    }
+
+    let now_micros = chrono::Utc::now().timestamp_micros();
+    let insert_marker = format!("INSERT INTO {LEGACY_RETIRE_MARKER_TABLE} VALUES ({now_micros})");
+    if !ddl_succeeded(client, base_url, &insert_marker).await {
+        error!(
+            marker = LEGACY_RETIRE_MARKER_TABLE,
+            "legacy-retire marker INSERT failed — migration will re-run on next boot"
+        );
+        return;
+    }
+
+    info!(
+        marker = LEGACY_RETIRE_MARKER_TABLE,
+        "legacy-movers retirement migration completed"
+    );
+}
+
+/// Probe helper for the legacy-retire marker. Mirrors
+/// `marker_indicates_migration_applied` but checks the new marker table.
+async fn marker_indicates_legacy_retire_applied(client: &Client, base_url: &str) -> bool {
+    let probe = format!("SELECT count() AS c FROM {LEGACY_RETIRE_MARKER_TABLE}");
+    match client
+        .get(base_url)
+        .query(&[("query", probe.as_str())])
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            let body = resp.text().await.unwrap_or_default();
+            // QuestDB returns dataset format `[[N]]` — present + parseable
+            // means the marker row exists.
+            body.contains("\"dataset\":[[")
+                && !body.contains("\"dataset\":[[0]]")
+                && !body.contains("\"error\"")
+        }
+        _ => false,
+    }
+}
+
+/// Returns `true` when the QuestDB response was both HTTP 2xx AND the body
+/// does NOT contain the QuestDB `"error":` JSON marker. QuestDB's `/exec`
+/// endpoint returns HTTP 200 with `{"error":"..."}` in the body for queries
+/// against missing tables, so HTTP-status-only checks are insufficient.
+async fn ddl_succeeded(client: &Client, base_url: &str, sql: &str) -> bool {
+    run_ddl(client, base_url, sql).await.success
+}
+
+/// QuestDB DDL response triage. Captures the structured outcome so callers
+/// can log the body verbatim on failure (essential for diagnosing `400 Bad
+/// Request` returns where the error message is in the body, not the status).
+struct DdlOutcome {
+    /// True when HTTP 2xx AND no `"error":` key in body — i.e. QuestDB
+    /// actually executed the DDL.
+    success: bool,
+    /// Best-effort copy of the response body (HTTP error message OR JSON
+    /// `{"error":"..."}` content). Empty on transport errors.
+    body: String,
+    /// HTTP status code as string for log fields. `transport_err` if the
+    /// request never reached QuestDB.
+    status: String,
+}
+
+/// Run a DDL statement against QuestDB's `/exec` endpoint and return a
+/// triaged `DdlOutcome`. Replaces the boolean `ddl_succeeded` for sites
+/// that need to log the actual error body (Fix A from PR #421 follow-up).
+async fn run_ddl(client: &Client, base_url: &str, sql: &str) -> DdlOutcome {
+    match client.get(base_url).query(&[("query", sql)]).send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            let status_str = status.to_string();
+            let body = resp.text().await.unwrap_or_default();
+            let success = status.is_success() && !body.contains(r#""error":"#);
+            DdlOutcome {
+                success,
+                body,
+                status: status_str,
+            }
+        }
+        Err(err) => DdlOutcome {
+            success: false,
+            body: format!("transport_err: {err}"),
+            status: "transport_err".to_string(),
+        },
+    }
+}
+
+/// List every `tables()` row whose `table_name` starts with `prefix`. Used
+/// by the post-migration audit (Fix E) and the post-CREATE verification
+/// (Fix C) to confirm physical state matches what the DDL responses said.
+///
+/// Returns an empty `Vec` on any QuestDB-side error so the caller's audit
+/// safe-fails to "no rows present" — the audit then reports "0 of N
+/// expected" which is itself a useful signal.
+async fn query_table_names_with_prefix(
+    client: &Client,
+    base_url: &str,
+    prefix: &str,
+) -> Vec<String> {
+    let sql = format!("SELECT table_name FROM tables() WHERE table_name LIKE '{prefix}%'");
+    let outcome = run_ddl(client, base_url, &sql).await;
+    if !outcome.success {
+        return Vec::new();
+    }
+    let parsed: serde_json::Value = match serde_json::from_str(&outcome.body) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
     };
-    std::borrow::Cow::Owned(bounded)
-}
-
-/// Wave 3-A Item 10: idempotent ALTER for `stock_movers.phase` SYMBOL.
-///
-/// Differentiates pre-open (09:00-09:13 IST) snapshot rows from in-market
-/// rows. Values: `"PREOPEN"` (live pre-open data), `"PREOPEN_UNAVAILABLE"`
-/// (SENSEX/BSE which is not in the pre-open feed), `"MARKET"` (default for
-/// existing in-market writes via `append_stock_mover`).
-///
-/// `phase` is intentionally NOT in `DEDUP_KEY_MOVERS`: a single
-/// (security_id, segment, ts) row should not have two phases coexisting —
-/// the same row should replace itself if accidentally written twice with
-/// different phases (the latest write wins).
-const STOCK_MOVERS_ALTER_DDL_PHASE: &str =
-    "ALTER TABLE stock_movers ADD COLUMN IF NOT EXISTS phase SYMBOL";
-
-/// Wire constant for the default in-market phase. Existing
-/// `append_stock_mover` callers route through this value so historic
-/// rows remain query-compatible after the ALTER.
-pub const STOCK_MOVERS_PHASE_MARKET: &str = "MARKET";
-
-/// Wave 3-A Item 10: pre-open phase value for live pre-open snapshot rows.
-pub const STOCK_MOVERS_PHASE_PREOPEN: &str = "PREOPEN";
-
-/// Wave 3-A Item 10: pre-open phase value for instruments that are NOT in
-/// the pre-open feed (SENSEX / BSE). These rows are emitted with zeroed
-/// price columns + this phase so the dashboard can prove "we KNEW it was
-/// not available, we did not silently skip" — distinguishes "no data" from
-/// "feed broken".
-pub const STOCK_MOVERS_PHASE_PREOPEN_UNAVAILABLE: &str = "PREOPEN_UNAVAILABLE";
-
-/// DEDUP key for `top_movers`. Includes `timeframe` so the same rank
-/// position at the same second across DIFFERENT timeframes (1m vs 5m
-/// rankings) does not collide. Includes `security_id` + `segment` so
-/// I-P1-11 cross-segment id collisions (e.g. NIFTY id=13 IDX_I vs an
-/// NSE_EQ id=13) are kept as distinct rows.
-const DEDUP_KEY_TOP_MOVERS: &str = "timeframe, bucket, rank_category, rank, security_id, segment";
-
-/// DDL for the `option_movers` table.
-///
-/// Stores 1-minute snapshots of top 20 per 7 option categories.
-/// Partitioned by DAY (one partition per trading day, ~60×7×20 = 8400 rows/day).
-const OPTION_MOVERS_CREATE_DDL: &str = "\
-    CREATE TABLE IF NOT EXISTS option_movers (\
-        category SYMBOL,\
-        security_id LONG,\
-        segment SYMBOL,\
-        contract_name SYMBOL,\
-        underlying SYMBOL,\
-        option_type SYMBOL,\
-        strike DOUBLE,\
-        expiry SYMBOL,\
-        spot_price DOUBLE,\
-        ltp DOUBLE,\
-        change DOUBLE,\
-        change_pct DOUBLE,\
-        oi LONG,\
-        oi_change LONG,\
-        oi_change_pct DOUBLE,\
-        volume LONG,\
-        value DOUBLE,\
-        rank INT,\
-        ts TIMESTAMP\
-    ) TIMESTAMP(ts) PARTITION BY DAY WAL\
-";
-
-// ---------------------------------------------------------------------------
-// Rescue-ring records (DB-2)
-// ---------------------------------------------------------------------------
-
-/// A buffered stock mover entry, kept in an in-memory FIFO rescue ring
-/// so it can be re-sent to QuestDB after a flush failure or reconnect.
-/// Stored verbatim so the re-send path is byte-identical to the original.
-/// `Clone` (not `Copy`) because of the owned `String` fields — acceptable
-/// because this writer is cold path (1 row/sec max, see movers flow rate
-/// in `MOVERS_RESCUE_RING_CAPACITY` comment).
-#[derive(Clone)]
-struct BufferedStockMover {
-    ts_nanos: i64,
-    category: String,
-    rank: i32,
-    security_id: u32,
-    segment: String,
-    symbol: String,
-    ltp: f64,
-    prev_close: f64,
-    change_pct: f64,
-    volume: i64,
-    /// Wave 3-A Item 10: snapshot phase. Defaults to `STOCK_MOVERS_PHASE_MARKET`
-    /// for in-market writes; pre-open writes set `STOCK_MOVERS_PHASE_PREOPEN`
-    /// or `STOCK_MOVERS_PHASE_PREOPEN_UNAVAILABLE` (SENSEX).
-    phase: String,
-}
-
-/// A buffered option mover entry — same rationale as `BufferedStockMover`.
-#[derive(Clone)]
-struct BufferedOptionMover {
-    ts_nanos: i64,
-    category: String,
-    rank: i32,
-    security_id: u32,
-    segment: String,
-    contract_name: String,
-    underlying: String,
-    option_type: String,
-    strike: f64,
-    expiry: String,
-    spot_price: f64,
-    ltp: f64,
-    change: f64,
-    change_pct: f64,
-    oi: i64,
-    oi_change: i64,
-    oi_change_pct: f64,
-    volume: i64,
-    value: f64,
-}
-
-// ---------------------------------------------------------------------------
-// Stock Movers Writer
-// ---------------------------------------------------------------------------
-
-/// Batched writer for stock movers snapshots to QuestDB via ILP.
-///
-/// # Resilience (DB-6/DB-7)
-/// - Reconnect attempts throttled to one per `MOVERS_RECONNECT_THROTTLE_SECS` (30s).
-/// - Dropped batches are counted and logged at ERROR level (Telegram alert fires).
-/// - No in-memory rescue ring yet — DB-2 will add one in a separate commit.
-pub struct StockMoversWriter {
-    sender: Option<Sender>,
-    buffer: Buffer,
-    pending_count: usize,
-    ilp_conf_string: String,
-    /// Earliest time at which the next reconnect attempt is allowed. DB-6.
-    next_reconnect_allowed: Instant,
-    /// Total rows dropped (never written to QuestDB). DB-7.
-    rows_dropped_total: u64,
-    /// Bounded FIFO rescue ring for flush-failure replay. DB-2.
-    rescue_ring: VecDeque<BufferedStockMover>,
-}
-
-impl StockMoversWriter {
-    /// Creates a new stock movers writer connected to QuestDB via ILP TCP.
-    pub fn new(config: &QuestDbConfig) -> Result<Self> {
-        let conf_string = config.build_ilp_conf_string();
-        let sender = Sender::from_conf(&conf_string)
-            .context("failed to connect to QuestDB for stock movers")?;
-        let buffer = sender.new_buffer();
-
-        Ok(Self {
-            sender: Some(sender),
-            buffer,
-            pending_count: 0,
-            ilp_conf_string: conf_string,
-            next_reconnect_allowed: Instant::now(),
-            rows_dropped_total: 0,
-            rescue_ring: VecDeque::with_capacity(MOVERS_RESCUE_RING_CAPACITY),
+    parsed
+        .get("dataset")
+        .and_then(|d| d.as_array())
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| row.get(0).and_then(|c| c.as_str()).map(String::from))
+                .collect()
         })
-    }
-
-    /// Current rescue ring occupancy (for tests + observability). DB-2.
-    pub fn rescue_ring_len(&self) -> usize {
-        self.rescue_ring.len()
-    }
-
-    /// Pushes a stock mover into the rescue ring, evicting the oldest
-    /// entry if the ring is full. Overflow routes through `record_drop`
-    /// + `tv_stock_movers_ring_overflow_total` metric. DB-2.
-    fn push_to_rescue_ring(&mut self, row: BufferedStockMover) {
-        if self.rescue_ring.len() >= MOVERS_RESCUE_RING_CAPACITY {
-            self.rescue_ring.pop_front();
-            let err = anyhow::anyhow!(
-                "stock movers rescue ring full at capacity {} — oldest row evicted",
-                MOVERS_RESCUE_RING_CAPACITY
-            );
-            self.record_drop(1, "ring_overflow", &err);
-            metrics::counter!("tv_stock_movers_ring_overflow_total").increment(1);
-        }
-        self.rescue_ring.push_back(row);
-    }
-
-    /// Total rows dropped since startup (never persisted to QuestDB).
-    pub fn rows_dropped_total(&self) -> u64 {
-        self.rows_dropped_total
-    }
-
-    /// Records a dropped batch — increments counter + metric + ERROR log. DB-7.
-    fn record_drop(&mut self, count: usize, reason: &'static str, err: &anyhow::Error) {
-        let dropped = u64::try_from(count).unwrap_or(u64::MAX);
-        self.rows_dropped_total = self.rows_dropped_total.saturating_add(dropped);
-        metrics::counter!("tv_stock_movers_dropped_total").absolute(self.rows_dropped_total);
-        metrics::counter!("tv_stock_movers_flush_failures_total").increment(1);
-        error!(
-            ?err,
-            dropped_rows = count,
-            total_dropped = self.rows_dropped_total,
-            reason,
-            "stock movers batch dropped — data loss (cold-path observability)"
-        );
-    }
-
-    fn reconnect_allowed_now(&self) -> bool {
-        Instant::now() >= self.next_reconnect_allowed
-    }
-
-    fn bump_reconnect_throttle(&mut self) {
-        self.next_reconnect_allowed =
-            Instant::now() + Duration::from_secs(MOVERS_RECONNECT_THROTTLE_SECS);
-    }
-
-    /// Writes a `BufferedStockMover` into an ILP `Buffer`. Single source
-    /// of truth for column order + rounding policy — both live append
-    /// and rescue drain call this helper. DB-2.
-    // TEST-EXEMPT: ILP buffer append — requires live QuestDB, tested via ensure_movers_tables integration
-    fn append_stock_row_to_buffer(buffer: &mut Buffer, row: &BufferedStockMover) -> Result<()> {
-        let change_abs = ((row.ltp - row.prev_close) * 100.0).round() / 100.0;
-        let ts = TimestampNanos::new(row.ts_nanos);
-        // Adversarial-review LOW #6: defensively sanitise every SYMBOL
-        // value before passing to ILP. Cow::Borrowed on the common path
-        // (no allocation when input is already clean).
-        let category = sanitize_ilp_symbol(&row.category);
-        let segment = sanitize_ilp_symbol(&row.segment);
-        let symbol = sanitize_ilp_symbol(&row.symbol);
-        let phase = sanitize_ilp_symbol(&row.phase);
-        buffer
-            .table(QUESTDB_TABLE_STOCK_MOVERS)
-            .context("table")?
-            .symbol("category", category.as_ref())
-            .context("category")?
-            .symbol("segment", segment.as_ref())
-            .context("segment")?
-            .symbol("symbol", symbol.as_ref())
-            .context("symbol")?
-            .symbol("phase", phase.as_ref())
-            .context("phase")?
-            .column_i64("security_id", i64::from(row.security_id))
-            .context("security_id")?
-            .column_f64("ltp", row.ltp)
-            .context("ltp")?
-            .column_f64("prev_close", row.prev_close)
-            .context("prev_close")?
-            .column_f64("change_abs", change_abs)
-            .context("change_abs")?
-            .column_f64("change_pct", row.change_pct)
-            .context("change_pct")?
-            .column_i64("volume", row.volume)
-            .context("volume")?
-            .column_i64("rank", i64::from(row.rank))
-            .context("rank")?
-            .at(ts)
-            .context("timestamp")?;
-        Ok(())
-    }
-
-    /// Appends a single stock mover entry to the ILP buffer.
-    ///
-    /// # Arguments
-    /// * `ts_nanos` — snapshot timestamp (IST epoch nanoseconds)
-    /// * `category` — "GAINER", "LOSER", or "MOST_ACTIVE"
-    /// * `rank` — 1-based rank within category
-    /// * `security_id` — Dhan security ID
-    /// * `segment` — exchange segment string ("NSE_EQ", "NSE_FNO", etc.)
-    /// * `symbol` — human-readable symbol name
-    /// * `ltp` — last traded price
-    /// * `prev_close` — previous day close price
-    /// * `change_pct` — percentage change
-    /// * `volume` — day volume
-    #[allow(clippy::too_many_arguments)]
-    // APPROVED: 10 params — each maps to a QuestDB column, no abstraction reduces this
-    pub fn append_stock_mover(
-        &mut self,
-        ts_nanos: i64,
-        category: &str,
-        rank: i32,
-        security_id: u32,
-        segment: &str,
-        symbol: &str,
-        ltp: f64,
-        prev_close: f64,
-        change_pct: f64,
-        volume: i64,
-    ) -> Result<()> {
-        // In-market default: phase = "MARKET". Pre-open callers must use
-        // `append_stock_mover_with_phase` directly.
-        self.append_stock_mover_with_phase(
-            ts_nanos,
-            category,
-            rank,
-            security_id,
-            segment,
-            symbol,
-            ltp,
-            prev_close,
-            change_pct,
-            volume,
-            STOCK_MOVERS_PHASE_MARKET,
-        )
-    }
-
-    /// Wave 3-A Item 10: append a stock mover row with an explicit `phase`
-    /// label. Used by the pre-open movers tracker to differentiate
-    /// 09:00-09:13 IST snapshot rows from in-market rows.
-    ///
-    /// `phase` values are pinned by `STOCK_MOVERS_PHASE_*` constants:
-    /// - `MARKET` — default in-market writes (delegated from
-    ///   `append_stock_mover`).
-    /// - `PREOPEN` — pre-open snapshot row with live data.
-    /// - `PREOPEN_UNAVAILABLE` — pre-open row for an instrument NOT in the
-    ///   pre-open feed (SENSEX/BSE). Price columns are zeroed; the row
-    ///   exists so the dashboard can prove the absence is intentional.
-    #[allow(clippy::too_many_arguments)]
-    // APPROVED: 11 params — each maps to a QuestDB column or schema label, no abstraction reduces this without obscuring the call site.
-    // TEST-EXEMPT: ILP buffer append requires a live QuestDB connection; the existing `append_stock_mover` path (which delegates here with phase=MARKET) is exercised by every in-market integration test.
-    pub fn append_stock_mover_with_phase(
-        &mut self,
-        ts_nanos: i64,
-        category: &str,
-        rank: i32,
-        security_id: u32,
-        segment: &str,
-        symbol: &str,
-        ltp: f64,
-        prev_close: f64,
-        change_pct: f64,
-        volume: i64,
-        phase: &str,
-    ) -> Result<()> {
-        // Round all f64 values to 2dp to prevent IEEE 754 artifacts in QuestDB.
-        let row = BufferedStockMover {
-            ts_nanos,
-            category: category.to_string(),
-            rank,
-            security_id,
-            segment: segment.to_string(),
-            symbol: symbol.to_string(),
-            ltp: (ltp * 100.0).round() / 100.0,
-            prev_close: (prev_close * 100.0).round() / 100.0,
-            change_pct: (change_pct * 100.0).round() / 100.0,
-            volume,
-            phase: phase.to_string(),
-        };
-
-        // DB-2: push to rescue ring BEFORE the ILP buffer. If the ring
-        // overflows, the oldest row is evicted and counted as a drop.
-        self.push_to_rescue_ring(row.clone());
-
-        // Then append to the current in-flight ILP batch.
-        Self::append_stock_row_to_buffer(&mut self.buffer, &row)?;
-
-        self.pending_count = self.pending_count.saturating_add(1);
-
-        if self.pending_count >= MOVERS_FLUSH_BATCH_SIZE
-            && let Err(err) = self.flush()
-        {
-            error!(?err, "stock movers auto-flush failed at batch boundary");
-        }
-
-        Ok(())
-    }
-
-    /// Drains the stock movers rescue ring by rebuilding a fresh ILP
-    /// batch (oldest first) and flushing it. Called after a successful
-    /// reconnect. DB-2.
-    fn drain_rescue_ring_to_sender(&mut self) -> Result<()> {
-        if self.rescue_ring.is_empty() {
-            return Ok(());
-        }
-        let drained = self.rescue_ring.len();
-        info!(
-            buffered = drained,
-            "draining stock movers rescue ring after reconnect"
-        );
-
-        let sender = self
-            .sender
-            .as_mut()
-            .context("sender required for stock movers rescue drain")?;
-        let mut rescue_buffer = Buffer::new(ProtocolVersion::V1);
-        for row in self.rescue_ring.iter() {
-            Self::append_stock_row_to_buffer(&mut rescue_buffer, row)?;
-        }
-        sender
-            .flush(&mut rescue_buffer)
-            .context("flush stock movers rescue batch to QuestDB")?;
-        self.rescue_ring.clear();
-        info!(drained, "stock movers rescue ring drained after reconnect");
-        Ok(())
-    }
-
-    /// Flushes buffered rows to QuestDB.
-    ///
-    /// DB-6/DB-7: reconnect attempts throttled to 1 per
-    /// `MOVERS_RECONNECT_THROTTLE_SECS` (30s). Every drop path routes
-    /// through `record_drop` (metric + ERROR log).
-    pub fn flush(&mut self) -> Result<()> {
-        if self.pending_count == 0 && self.rescue_ring.is_empty() {
-            return Ok(());
-        }
-
-        // Reconnect path — throttled. On throttle closed, rows stay in
-        // the rescue ring (DB-2) so no data is lost.
-        if self.sender.is_none() {
-            if !self.reconnect_allowed_now() {
-                self.buffer.clear();
-                self.pending_count = 0;
-                debug!(
-                    ring_depth = self.rescue_ring.len(),
-                    "stock movers flush deferred — reconnect throttled, \
-                     rows retained in rescue ring"
-                );
-                return Ok(());
-            }
-            self.bump_reconnect_throttle();
-            match Sender::from_conf(&self.ilp_conf_string) {
-                Ok(s) => {
-                    info!("stock movers writer reconnected to QuestDB");
-                    self.sender = Some(s);
-                }
-                Err(err) => {
-                    let wrapped = anyhow::Error::from(err);
-                    warn!(
-                        ?wrapped,
-                        ring_depth = self.rescue_ring.len(),
-                        "stock movers reconnect failed — rows retained in \
-                         rescue ring; will retry after throttle window"
-                    );
-                    self.buffer.clear();
-                    self.pending_count = 0;
-                    return Ok(());
-                }
-            }
-        }
-
-        // Connected. Drain the rescue ring FIRST so oldest rows land at
-        // QuestDB before the in-flight batch. DB-2.
-        if !self.rescue_ring.is_empty()
-            && let Err(err) = self.drain_rescue_ring_to_sender()
-        {
-            self.sender = None;
-            self.buffer.clear();
-            self.pending_count = 0;
-            warn!(
-                ?err,
-                ring_depth = self.rescue_ring.len(),
-                "stock movers rescue drain failed — will retry on next flush"
-            );
-            return Ok(());
-        }
-
-        if self.pending_count == 0 {
-            return Ok(());
-        }
-        let sender = self
-            .sender
-            .as_mut()
-            .context("stock movers sender present after reconnect branch")?;
-        let count = self.pending_count;
-        if let Err(err) = sender.flush(&mut self.buffer) {
-            let wrapped = anyhow::Error::from(err);
-            // Rows are still in the rescue ring — don't record_drop.
-            self.sender = None;
-            self.buffer.clear();
-            self.pending_count = 0;
-            warn!(
-                ?wrapped,
-                count,
-                ring_depth = self.rescue_ring.len(),
-                "stock movers flush failed — rows retained in rescue ring"
-            );
-            return Ok(());
-        }
-
-        // Pop the successfully-flushed rows from the ring.
-        for _ in 0..count {
-            self.rescue_ring.pop_front();
-        }
-        self.pending_count = 0;
-        debug!(flushed_rows = count, "stock movers flushed to QuestDB");
-        Ok(())
-    }
-
-    /// Returns a mutable reference to the ILP buffer (for external row building).
-    // TEST-EXEMPT: trivial accessor, returns &mut Buffer
-    pub fn buffer_mut(&mut self) -> &mut Buffer {
-        &mut self.buffer
-    }
+        .unwrap_or_default()
 }
 
-// ---------------------------------------------------------------------------
-// Option Movers Writer
-// ---------------------------------------------------------------------------
-
-/// Batched writer for option movers snapshots to QuestDB via ILP.
-pub struct OptionMoversWriter {
-    sender: Option<Sender>,
-    buffer: Buffer,
-    pending_count: usize,
-    ilp_conf_string: String,
-    /// Earliest time at which the next reconnect attempt is allowed. DB-6.
-    next_reconnect_allowed: Instant,
-    /// Total rows dropped (never written to QuestDB). DB-7.
-    rows_dropped_total: u64,
-    /// Bounded FIFO rescue ring for flush-failure replay. DB-2.
-    rescue_ring: VecDeque<BufferedOptionMover>,
+/// Probe the marker table for an existing row. Returns `true` ONLY when the
+/// QuestDB response is HTTP 2xx AND the body parses to a non-empty count
+/// (`dataset[0][0] >= 1`). Any other outcome (HTTP error, parse failure,
+/// empty dataset, `"error":` in body, count = 0) safe-fails to `false` so
+/// the migration runs.
+async fn marker_indicates_migration_applied(client: &Client, base_url: &str) -> bool {
+    let probe_sql = format!("SELECT count(*) FROM {MIGRATION_MARKER_TABLE}");
+    let resp = match client
+        .get(base_url)
+        .query(&[("query", probe_sql.as_str())])
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => r,
+        _ => return false,
+    };
+    let body = match resp.text().await {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+    if body.contains(r#""error":"#) {
+        return false;
+    }
+    // Successful response shape:
+    //   {"query":"...","columns":[{"name":"count","type":"LONG"}],"timestamp":-1,"dataset":[[N]],"count":1}
+    let parsed: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    parsed
+        .get("dataset")
+        .and_then(|d| d.get(0))
+        .and_then(|row| row.get(0))
+        .and_then(serde_json::Value::as_i64)
+        .is_some_and(|count| count >= 1)
 }
 
-impl OptionMoversWriter {
-    /// Creates a new option movers writer connected to QuestDB via ILP TCP.
-    pub fn new(config: &QuestDbConfig) -> Result<Self> {
-        let conf_string = config.build_ilp_conf_string();
-        let sender = Sender::from_conf(&conf_string)
-            .context("failed to connect to QuestDB for option movers")?;
-        let buffer = sender.new_buffer();
-
-        Ok(Self {
-            sender: Some(sender),
-            buffer,
-            pending_count: 0,
-            ilp_conf_string: conf_string,
-            next_reconnect_allowed: Instant::now(),
-            rows_dropped_total: 0,
-            rescue_ring: VecDeque::with_capacity(MOVERS_RESCUE_RING_CAPACITY),
-        })
-    }
-
-    /// Current rescue ring occupancy (for tests + observability). DB-2.
-    pub fn rescue_ring_len(&self) -> usize {
-        self.rescue_ring.len()
-    }
-
-    /// Pushes an option mover into the rescue ring, evicting the oldest
-    /// entry if the ring is full. Overflow routes through `record_drop`
-    /// + `tv_option_movers_ring_overflow_total` metric. DB-2.
-    fn push_to_rescue_ring(&mut self, row: BufferedOptionMover) {
-        if self.rescue_ring.len() >= MOVERS_RESCUE_RING_CAPACITY {
-            self.rescue_ring.pop_front();
-            let err = anyhow::anyhow!(
-                "option movers rescue ring full at capacity {} — oldest row evicted",
-                MOVERS_RESCUE_RING_CAPACITY
-            );
-            self.record_drop(1, "ring_overflow", &err);
-            metrics::counter!("tv_option_movers_ring_overflow_total").increment(1);
-        }
-        self.rescue_ring.push_back(row);
-    }
-
-    /// Total rows dropped since startup (never persisted to QuestDB).
-    pub fn rows_dropped_total(&self) -> u64 {
-        self.rows_dropped_total
-    }
-
-    /// Records a dropped batch — increments counter + metric + ERROR log. DB-7.
-    fn record_drop(&mut self, count: usize, reason: &'static str, err: &anyhow::Error) {
-        let dropped = u64::try_from(count).unwrap_or(u64::MAX);
-        self.rows_dropped_total = self.rows_dropped_total.saturating_add(dropped);
-        metrics::counter!("tv_option_movers_dropped_total").absolute(self.rows_dropped_total);
-        metrics::counter!("tv_option_movers_flush_failures_total").increment(1);
-        error!(
-            ?err,
-            dropped_rows = count,
-            total_dropped = self.rows_dropped_total,
-            reason,
-            "option movers batch dropped — data loss (cold-path observability)"
-        );
-    }
-
-    fn reconnect_allowed_now(&self) -> bool {
-        Instant::now() >= self.next_reconnect_allowed
-    }
-
-    fn bump_reconnect_throttle(&mut self) {
-        self.next_reconnect_allowed =
-            Instant::now() + Duration::from_secs(MOVERS_RECONNECT_THROTTLE_SECS);
-    }
-
-    /// Writes a `BufferedOptionMover` into an ILP `Buffer`. Single source
-    /// of truth for column order + rounding. DB-2.
-    // TEST-EXEMPT: ILP buffer append — requires live QuestDB, tested via ensure_movers_tables integration
-    fn append_option_row_to_buffer(buffer: &mut Buffer, row: &BufferedOptionMover) -> Result<()> {
-        let ts = TimestampNanos::new(row.ts_nanos);
-        buffer
-            .table(QUESTDB_TABLE_OPTION_MOVERS)
-            .context("table")?
-            .symbol("category", &row.category)
-            .context("category")?
-            .symbol("segment", &row.segment)
-            .context("segment")?
-            .symbol("contract_name", &row.contract_name)
-            .context("contract_name")?
-            .symbol("underlying", &row.underlying)
-            .context("underlying")?
-            .symbol("option_type", &row.option_type)
-            .context("option_type")?
-            .symbol("expiry", &row.expiry)
-            .context("expiry")?
-            .column_i64("security_id", i64::from(row.security_id))
-            .context("security_id")?
-            .column_f64("strike", row.strike)
-            .context("strike")?
-            .column_f64("spot_price", row.spot_price)
-            .context("spot_price")?
-            .column_f64("ltp", row.ltp)
-            .context("ltp")?
-            .column_f64("change", row.change)
-            .context("change")?
-            .column_f64("change_pct", row.change_pct)
-            .context("change_pct")?
-            .column_i64("oi", row.oi)
-            .context("oi")?
-            .column_i64("oi_change", row.oi_change)
-            .context("oi_change")?
-            .column_f64("oi_change_pct", row.oi_change_pct)
-            .context("oi_change_pct")?
-            .column_i64("volume", row.volume)
-            .context("volume")?
-            .column_f64("value", row.value)
-            .context("value")?
-            .column_i64("rank", i64::from(row.rank))
-            .context("rank")?
-            .at(ts)
-            .context("timestamp")?;
-        Ok(())
-    }
-
-    /// Appends a single option mover entry to the ILP buffer.
-    ///
-    /// # Arguments
-    /// * `ts_nanos` — snapshot timestamp (IST epoch nanoseconds)
-    /// * `category` — "HIGHEST_OI", "OI_GAINER", "OI_LOSER", "TOP_VOLUME", "TOP_VALUE", "PRICE_GAINER", "PRICE_LOSER"
-    /// * `rank` — 1-based rank within category
-    #[allow(clippy::too_many_arguments)]
-    // APPROVED: 17 params — each maps to a QuestDB column, no abstraction reduces this
-    pub fn append_option_mover(
-        &mut self,
-        ts_nanos: i64,
-        category: &str,
-        rank: i32,
-        security_id: u32,
-        segment: &str,
-        contract_name: &str,
-        underlying: &str,
-        option_type: &str,
-        strike: f64,
-        expiry: &str,
-        spot_price: f64,
-        ltp: f64,
-        change: f64,
-        change_pct: f64,
-        oi: i64,
-        oi_change: i64,
-        oi_change_pct: f64,
-        volume: i64,
-        value: f64,
-    ) -> Result<()> {
-        // Round all f64 values to 2dp to prevent IEEE 754 artifacts in QuestDB.
-        let row = BufferedOptionMover {
-            ts_nanos,
-            category: category.to_string(),
-            rank,
-            security_id,
-            segment: segment.to_string(),
-            contract_name: contract_name.to_string(),
-            underlying: underlying.to_string(),
-            option_type: option_type.to_string(),
-            strike: (strike * 100.0).round() / 100.0,
-            expiry: expiry.to_string(),
-            spot_price: (spot_price * 100.0).round() / 100.0,
-            ltp: (ltp * 100.0).round() / 100.0,
-            change: (change * 100.0).round() / 100.0,
-            change_pct: (change_pct * 100.0).round() / 100.0,
-            oi,
-            oi_change,
-            oi_change_pct: (oi_change_pct * 100.0).round() / 100.0,
-            volume,
-            value: (value * 100.0).round() / 100.0,
-        };
-
-        // DB-2: push to rescue ring before ILP buffer.
-        self.push_to_rescue_ring(row.clone());
-
-        Self::append_option_row_to_buffer(&mut self.buffer, &row)?;
-
-        self.pending_count = self.pending_count.saturating_add(1);
-
-        if self.pending_count >= MOVERS_FLUSH_BATCH_SIZE
-            && let Err(err) = self.flush()
-        {
-            error!(?err, "option movers auto-flush failed at batch boundary");
-        }
-
-        Ok(())
-    }
-
-    /// Drains the option movers rescue ring by rebuilding a fresh ILP
-    /// batch (oldest first) and flushing it. DB-2.
-    fn drain_rescue_ring_to_sender(&mut self) -> Result<()> {
-        if self.rescue_ring.is_empty() {
-            return Ok(());
-        }
-        let drained = self.rescue_ring.len();
-        info!(
-            buffered = drained,
-            "draining option movers rescue ring after reconnect"
-        );
-
-        let sender = self
-            .sender
-            .as_mut()
-            .context("sender required for option movers rescue drain")?;
-        let mut rescue_buffer = Buffer::new(ProtocolVersion::V1);
-        for row in self.rescue_ring.iter() {
-            Self::append_option_row_to_buffer(&mut rescue_buffer, row)?;
-        }
-        sender
-            .flush(&mut rescue_buffer)
-            .context("flush option movers rescue batch to QuestDB")?;
-        self.rescue_ring.clear();
-        info!(drained, "option movers rescue ring drained after reconnect");
-        Ok(())
-    }
-
-    /// Flushes buffered rows to QuestDB.
-    ///
-    /// DB-2/DB-6/DB-7: rescue-ring drain-on-reconnect + pop-on-success
-    /// + retain-on-failure. See `StockMoversWriter::flush` for the
-    ///   identical contract.
-    pub fn flush(&mut self) -> Result<()> {
-        if self.pending_count == 0 && self.rescue_ring.is_empty() {
-            return Ok(());
-        }
-
-        // Reconnect path — throttled.
-        if self.sender.is_none() {
-            if !self.reconnect_allowed_now() {
-                self.buffer.clear();
-                self.pending_count = 0;
-                debug!(
-                    ring_depth = self.rescue_ring.len(),
-                    "option movers flush deferred — reconnect throttled, \
-                     rows retained in rescue ring"
-                );
-                return Ok(());
-            }
-            self.bump_reconnect_throttle();
-            match Sender::from_conf(&self.ilp_conf_string) {
-                Ok(s) => {
-                    info!("option movers writer reconnected to QuestDB");
-                    self.sender = Some(s);
-                }
-                Err(err) => {
-                    let wrapped = anyhow::Error::from(err);
-                    warn!(
-                        ?wrapped,
-                        ring_depth = self.rescue_ring.len(),
-                        "option movers reconnect failed — rows retained in \
-                         rescue ring; will retry after throttle window"
-                    );
-                    self.buffer.clear();
-                    self.pending_count = 0;
-                    return Ok(());
-                }
-            }
-        }
-
-        // Drain rescue ring first (oldest first).
-        if !self.rescue_ring.is_empty()
-            && let Err(err) = self.drain_rescue_ring_to_sender()
-        {
-            self.sender = None;
-            self.buffer.clear();
-            self.pending_count = 0;
-            warn!(
-                ?err,
-                ring_depth = self.rescue_ring.len(),
-                "option movers rescue drain failed — will retry on next flush"
-            );
-            return Ok(());
-        }
-
-        if self.pending_count == 0 {
-            return Ok(());
-        }
-        let sender = self
-            .sender
-            .as_mut()
-            .context("option movers sender present after reconnect branch")?;
-        let count = self.pending_count;
-        if let Err(err) = sender.flush(&mut self.buffer) {
-            let wrapped = anyhow::Error::from(err);
-            self.sender = None;
-            self.buffer.clear();
-            self.pending_count = 0;
-            warn!(
-                ?wrapped,
-                count,
-                ring_depth = self.rescue_ring.len(),
-                "option movers flush failed — rows retained in rescue ring"
-            );
-            return Ok(());
-        }
-
-        for _ in 0..count {
-            self.rescue_ring.pop_front();
-        }
-        self.pending_count = 0;
-        debug!(flushed_rows = count, "option movers flushed to QuestDB");
-        Ok(())
-    }
-}
-
-// ---------------------------------------------------------------------------
-// TopMoversV2Writer — Plan item C2 (2026-04-22)
-// ---------------------------------------------------------------------------
-
-/// A single row destined for the unified `top_movers` table.
+/// Idempotent CREATE for the base table + all 25 mat views. Called once
+/// at boot from `main.rs`. Per the schema-self-heal pattern in
+/// `observability-architecture.md` — tolerates partial state from
+/// previous boots. Audit-2026-05-03: count bumped 24 → 25 (added `10s`).
 ///
-/// One snapshot fans out into up to ~680 rows per timeframe; with 15
-/// timeframes that is ~10,200 rows per minute peak. Each row is fully
-/// self-describing — the writer performs NO registry lookups (the caller
-/// assembles `symbol`, `underlying`, `expiry`, `strike`, and `option_type`
-/// from the `InstrumentRegistry` before calling `append`). This keeps the
-/// writer side-effect-free for unit testing without a QuestDB instance.
-///
-/// `timeframe` (added 2026-04-25) selects which of the 15 rolling-window
-/// rankings (1m..15m) this row belongs to. `segment` (added 2026-04-25)
-/// disambiguates cross-segment `security_id` collisions per I-P1-11 (e.g.
-/// FINNIFTY id=27 IDX_I vs an NSE_EQ id=27).
-#[derive(Debug, Clone)]
-pub struct TopMoverRow {
-    pub ts_nanos: i64,
-    pub timeframe: &'static str,
-    pub bucket: String,
-    pub rank_category: String,
-    pub rank: i32,
-    pub security_id: u32,
-    pub segment: &'static str,
-    pub symbol: String,
-    pub underlying: Option<String>,
-    pub expiry: Option<String>,
-    pub strike: Option<f64>,
-    pub option_type: Option<String>,
-    pub ltp: f64,
-    pub prev_close: f64,
-    pub change_pct: f64,
-    pub volume: i64,
-    pub value: f64,
-    pub oi: i64,
-    pub prev_oi: i64,
-    pub oi_change_pct: f64,
-}
-
-/// Unified ILP writer for the 6-bucket `top_movers` table.
-///
-/// Mirrors the stock/option writers (rescue ring + throttled reconnect +
-/// ERROR-level drop logging per Rule 5 in `audit-findings-2026-04-17.md`),
-/// but emits to a single schema keyed by `(bucket, rank_category, rank)`.
-///
-/// # Cadence
-/// Written once per `persistence_cadence_secs` (default 1 Hz) during market
-/// hours. Market-hours gating happens at the caller (Rule 3).
-///
-/// # Row volume
-/// At 1 Hz with the default top-20 × 7-category × 4-derivative-bucket fan-out
-/// this is ~134 rows/sec peak = ~2.9M rows per 6hr trading day. QuestDB WAL
-/// + DEDUP handles this comfortably.
-pub struct TopMoversV2Writer {
-    sender: Option<Sender>,
-    buffer: Buffer,
-    pending_count: usize,
-    ilp_conf_string: String,
-    next_reconnect_allowed: Instant,
-    rows_dropped_total: u64,
-    rescue_ring: VecDeque<TopMoverRow>,
-    rows_written_total: u64,
-}
-
-impl TopMoversV2Writer {
-    /// Creates a new writer connected to QuestDB via ILP.
-    pub fn new(config: &QuestDbConfig) -> Result<Self> {
-        let conf_string = config.build_ilp_conf_string();
-        let sender = Sender::from_conf(&conf_string)
-            .context("failed to connect to QuestDB for top_movers v2")?;
-        let buffer = sender.new_buffer();
-        Ok(Self {
-            sender: Some(sender),
-            buffer,
-            pending_count: 0,
-            ilp_conf_string: conf_string,
-            next_reconnect_allowed: Instant::now(),
-            rows_dropped_total: 0,
-            rescue_ring: VecDeque::with_capacity(MOVERS_RESCUE_RING_CAPACITY),
-            rows_written_total: 0,
-        })
-    }
-
-    /// Total rows successfully flushed to QuestDB. Cold-path diagnostic.
-    // TEST-EXEMPT: trivial getter covered by test_top_mover_row_drops_are_tracked_on_zero_flush_path
-    pub fn rows_written_total(&self) -> u64 {
-        self.rows_written_total
-    }
-
-    /// Current rescue ring occupancy. Cold-path diagnostic.
-    // TEST-EXEMPT: trivial getter covered by test_top_mover_row_drops_are_tracked_on_zero_flush_path
-    pub fn rescue_ring_len(&self) -> usize {
-        self.rescue_ring.len()
-    }
-
-    /// Total rows dropped since startup (never persisted to QuestDB).
-    // TEST-EXEMPT: trivial getter covered by test_top_mover_row_drops_are_tracked_on_zero_flush_path
-    pub fn rows_dropped_total(&self) -> u64 {
-        self.rows_dropped_total
-    }
-
-    fn reconnect_allowed_now(&self) -> bool {
-        Instant::now() >= self.next_reconnect_allowed
-    }
-
-    fn bump_reconnect_throttle(&mut self) {
-        self.next_reconnect_allowed =
-            Instant::now() + Duration::from_secs(MOVERS_RECONNECT_THROTTLE_SECS);
-    }
-
-    fn record_drop(&mut self, count: usize, reason: &'static str, err: &anyhow::Error) {
-        let dropped = u64::try_from(count).unwrap_or(u64::MAX);
-        self.rows_dropped_total = self.rows_dropped_total.saturating_add(dropped);
-        metrics::counter!("tv_movers_dropped_total").absolute(self.rows_dropped_total);
-        metrics::counter!("tv_movers_flush_failures_total").increment(1);
-        error!(
-            ?err,
-            dropped_rows = count,
-            total_dropped = self.rows_dropped_total,
-            reason,
-            "top_movers v2 batch dropped — data loss (cold-path observability)"
-        );
-    }
-
-    fn push_to_rescue_ring(&mut self, row: TopMoverRow) {
-        if self.rescue_ring.len() >= MOVERS_RESCUE_RING_CAPACITY {
-            self.rescue_ring.pop_front();
-            let err = anyhow::anyhow!(
-                "top_movers v2 rescue ring full at capacity {} — oldest row evicted",
-                MOVERS_RESCUE_RING_CAPACITY
-            );
-            self.record_drop(1, "ring_overflow", &err);
-            metrics::counter!("tv_movers_ring_overflow_total").increment(1);
-        }
-        self.rescue_ring.push_back(row);
-    }
-
-    /// Single source of truth for ILP column order + rounding policy.
-    /// Both the live append and the rescue-drain path call this helper.
-    fn append_row_to_buffer(buffer: &mut Buffer, row: &TopMoverRow) -> Result<()> {
-        let ts = TimestampNanos::new(row.ts_nanos);
-        let mut b = buffer
-            .table(QUESTDB_TABLE_TOP_MOVERS)
-            .context("table")?
-            .symbol("timeframe", row.timeframe)
-            .context("timeframe")?
-            .symbol("bucket", &row.bucket)
-            .context("bucket")?
-            .symbol("rank_category", &row.rank_category)
-            .context("rank_category")?
-            .symbol("segment", row.segment)
-            .context("segment")?
-            .symbol("symbol", &row.symbol)
-            .context("symbol")?;
-        if let Some(ref u) = row.underlying {
-            b = b.symbol("underlying", u).context("underlying")?;
-        }
-        if let Some(ref ot) = row.option_type {
-            b = b.symbol("option_type", ot).context("option_type")?;
-        }
-        let b = b
-            .column_i64("rank", i64::from(row.rank))
-            .context("rank")?
-            .column_i64("security_id", i64::from(row.security_id))
-            .context("security_id")?;
-        let b = if let Some(ref e) = row.expiry {
-            b.column_str("expiry", e).context("expiry")?
-        } else {
-            b
-        };
-        let b = if let Some(s) = row.strike {
-            b.column_f64("strike", (s * 100.0).round() / 100.0)
-                .context("strike")?
-        } else {
-            b
-        };
-        b.column_f64("ltp", (row.ltp * 100.0).round() / 100.0)
-            .context("ltp")?
-            .column_f64("prev_close", (row.prev_close * 100.0).round() / 100.0)
-            .context("prev_close")?
-            .column_f64("change_pct", (row.change_pct * 100.0).round() / 100.0)
-            .context("change_pct")?
-            .column_i64("volume", row.volume)
-            .context("volume")?
-            .column_f64("value", (row.value * 100.0).round() / 100.0)
-            .context("value")?
-            .column_i64("oi", row.oi)
-            .context("oi")?
-            .column_i64("prev_oi", row.prev_oi)
-            .context("prev_oi")?
-            .column_f64("oi_change_pct", (row.oi_change_pct * 100.0).round() / 100.0)
-            .context("oi_change_pct")?
-            .at(ts)
-            .context("timestamp")?;
-        Ok(())
-    }
-
-    /// Appends a single top-mover row to the in-flight ILP buffer.
-    /// Auto-flushes when the batch boundary is reached.
-    pub fn append_row(&mut self, row: TopMoverRow) -> Result<()> {
-        // Push to rescue ring BEFORE the ILP buffer — if the ILP append fails
-        // downstream, the row is still replayable.
-        self.push_to_rescue_ring(row.clone());
-        Self::append_row_to_buffer(&mut self.buffer, &row)?;
-        self.pending_count = self.pending_count.saturating_add(1);
-
-        if self.pending_count >= MOVERS_FLUSH_BATCH_SIZE
-            && let Err(err) = self.flush()
-        {
-            error!(?err, "top_movers v2 auto-flush failed at batch boundary");
-        }
-        Ok(())
-    }
-
-    fn drain_rescue_ring_to_sender(&mut self) -> Result<()> {
-        if self.rescue_ring.is_empty() {
-            return Ok(());
-        }
-        let drained = self.rescue_ring.len();
-        info!(
-            buffered = drained,
-            "draining top_movers v2 rescue ring after reconnect"
-        );
-        let sender = self
-            .sender
-            .as_mut()
-            .context("sender required for top_movers v2 rescue drain")?;
-        let mut rescue_buffer = Buffer::new(ProtocolVersion::V1);
-        for row in self.rescue_ring.iter() {
-            Self::append_row_to_buffer(&mut rescue_buffer, row)?;
-        }
-        sender
-            .flush(&mut rescue_buffer)
-            .context("top_movers v2 rescue flush")?;
-        self.rescue_ring.clear();
-        Ok(())
-    }
-
-    /// Flushes the pending ILP batch to QuestDB. Throttled reconnect on failure.
-    pub fn flush(&mut self) -> Result<()> {
-        if self.pending_count == 0 && self.rescue_ring.is_empty() {
-            return Ok(());
-        }
-
-        if self.sender.is_none() {
-            if !self.reconnect_allowed_now() {
-                self.buffer.clear();
-                self.pending_count = 0;
-                debug!(
-                    ring_depth = self.rescue_ring.len(),
-                    "top_movers v2 flush deferred — reconnect throttled, \
-                     rows retained in rescue ring"
-                );
-                return Ok(());
-            }
-            self.bump_reconnect_throttle();
-            match Sender::from_conf(&self.ilp_conf_string) {
-                Ok(s) => {
-                    info!("top_movers v2 writer reconnected to QuestDB");
-                    self.sender = Some(s);
-                }
-                Err(err) => {
-                    let wrapped = anyhow::Error::from(err);
-                    warn!(
-                        ?wrapped,
-                        ring_depth = self.rescue_ring.len(),
-                        "top_movers v2 reconnect failed — rows retained in \
-                         rescue ring; will retry after throttle window"
-                    );
-                    self.buffer.clear();
-                    self.pending_count = 0;
-                    return Ok(());
-                }
-            }
-        }
-
-        if !self.rescue_ring.is_empty()
-            && let Err(err) = self.drain_rescue_ring_to_sender()
-        {
-            self.sender = None;
-            self.buffer.clear();
-            self.pending_count = 0;
-            warn!(
-                ?err,
-                ring_depth = self.rescue_ring.len(),
-                "top_movers v2 rescue drain failed — will retry on next flush"
-            );
-            return Ok(());
-        }
-
-        if self.pending_count == 0 {
-            return Ok(());
-        }
-        let sender = self
-            .sender
-            .as_mut()
-            .context("top_movers v2 sender present after reconnect branch")?;
-        let count = self.pending_count;
-        if let Err(err) = sender.flush(&mut self.buffer) {
-            let wrapped = anyhow::Error::from(err);
-            self.sender = None;
-            self.buffer.clear();
-            self.pending_count = 0;
-            warn!(
-                ?wrapped,
-                count,
-                ring_depth = self.rescue_ring.len(),
-                "top_movers v2 flush failed — rows retained in rescue ring"
-            );
-            return Ok(());
-        }
-
-        for _ in 0..count {
-            self.rescue_ring.pop_front();
-        }
-        let flushed = u64::try_from(count).unwrap_or(u64::MAX);
-        self.rows_written_total = self.rows_written_total.saturating_add(flushed);
-        metrics::counter!("tv_movers_rows_written_total").increment(flushed);
-        self.pending_count = 0;
-        debug!(
-            flushed_rows = count,
-            total_written = self.rows_written_total,
-            "top_movers v2 flushed to QuestDB"
-        );
-        Ok(())
-    }
-}
-
-// ---------------------------------------------------------------------------
-// DDL Setup
-// ---------------------------------------------------------------------------
-
-/// Creates the `stock_movers` and `option_movers` tables with DEDUP UPSERT KEYS.
-///
-/// Idempotent — safe to call on every startup.
-pub async fn ensure_movers_tables(questdb_config: &QuestDbConfig) {
+/// On any DDL failure: emits `error!` (Loki routes to Telegram via
+/// MOVERS-UNIFIED-05 — wiring deferred).
+// TEST-EXEMPT: requires running QuestDB; tested via boot integration.
+pub async fn ensure_movers_tables_and_views(questdb_config: &QuestDbConfig) {
     let base_url = format!(
         "http://{}:{}/exec",
         questdb_config.host, questdb_config.http_port
     );
-
     let client = Client::builder()
         .timeout(Duration::from_secs(QUESTDB_DDL_TIMEOUT_SECS))
         .build()
         .unwrap_or_else(|_| Client::new());
 
-    // Create stock_movers table
-    execute_ddl(&client, &base_url, STOCK_MOVERS_CREATE_DDL, "stock_movers").await;
+    // Step 0: one-shot cleanup migration (gated by marker table). DROPs the
+    // 25 dead `movers_22tf` tables + the legacy `movers_unified_*` objects.
+    // Idempotent on subsequent boots.
+    run_one_shot_cleanup_migration(&client, &base_url).await;
 
-    // Wave 3-A Item 10: idempotent ALTER ADD COLUMN IF NOT EXISTS for `phase`.
-    // QuestDB ignores ADDs that already exist, so this is safe to run every boot.
-    // Existing pre-`phase` deployments self-heal at the next boot.
-    execute_ddl(
-        &client,
-        &base_url,
-        STOCK_MOVERS_ALTER_DDL_PHASE,
-        "stock_movers ADD COLUMN phase",
-    )
-    .await;
+    // Step 0b: Audit-2026-05-03 — WIRED in PR #449.
+    //
+    // The DROP migration `run_one_shot_legacy_retire_migration_2026_05_03`
+    // is now safe to wire because:
+    // - PR #446 migrated `/api/top-movers` to QuestDB SQL against `movers_5s`
+    // - PR #448 migrated `/api/market/stock-movers` to `movers_5s`
+    // - PR #449 (this PR) migrated `/api/market/option-movers` to `movers_5s`
+    //
+    // No production code reads the legacy `stock_movers` / `option_movers`
+    // tables anymore. Marker-gated, idempotent — runs ONCE per database
+    // then short-circuits on subsequent boots.
+    run_one_shot_legacy_retire_migration_2026_05_03(&client, &base_url).await;
 
-    // Enable DEDUP on stock_movers
-    let dedup_sql = format!(
-        "ALTER TABLE {} DEDUP ENABLE UPSERT KEYS(ts, {})",
-        QUESTDB_TABLE_STOCK_MOVERS, DEDUP_KEY_MOVERS
-    );
-    execute_ddl(&client, &base_url, &dedup_sql, "stock_movers DEDUP").await;
+    // Step 1: base table.
+    let create_base = movers_1s_create_ddl();
+    match client
+        .get(&base_url)
+        .query(&[("query", create_base.as_str())])
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            info!(
+                table = QUESTDB_TABLE_MOVERS_1S,
+                "movers_1s base table ready"
+            );
+        }
+        Ok(resp) => {
+            warn!(table = QUESTDB_TABLE_MOVERS_1S, status = %resp.status(), "DDL non-2xx — continuing best-effort");
+        }
+        Err(err) => {
+            error!(
+                table = QUESTDB_TABLE_MOVERS_1S,
+                ?err,
+                "movers_1s base table DDL failed — table may already exist"
+            );
+        }
+    }
 
-    // Create option_movers table
-    execute_ddl(
-        &client,
-        &base_url,
-        OPTION_MOVERS_CREATE_DDL,
-        "option_movers",
-    )
-    .await;
-
-    // Enable DEDUP on option_movers
-    let dedup_sql = format!(
-        "ALTER TABLE {} DEDUP ENABLE UPSERT KEYS(ts, {})",
-        QUESTDB_TABLE_OPTION_MOVERS, DEDUP_KEY_MOVERS
-    );
-    execute_ddl(&client, &base_url, &dedup_sql, "option_movers DEDUP").await;
-
-    // Plan item C (2026-04-22): unified 6-bucket top_movers table.
-    execute_ddl(&client, &base_url, TOP_MOVERS_CREATE_DDL, "top_movers").await;
-    // Plan item I (2026-04-25): self-heal ADD COLUMN IF NOT EXISTS for the
-    // two columns added 2026-04-25. Pre-existing deployments built on the
-    // 2026-04-22 schema get auto-migrated at boot; QuestDB ignores ADDs
-    // that already exist, so running every boot is free. Pattern lifted
-    // from observability-architecture.md schema self-heal.
-    execute_ddl(
-        &client,
-        &base_url,
-        TOP_MOVERS_ALTER_DDL_TIMEFRAME,
-        "top_movers ADD COLUMN timeframe",
-    )
-    .await;
-    execute_ddl(
-        &client,
-        &base_url,
-        TOP_MOVERS_ALTER_DDL_SEGMENT,
-        "top_movers ADD COLUMN segment",
-    )
-    .await;
-    let top_dedup_sql = format!(
-        "ALTER TABLE {} DEDUP ENABLE UPSERT KEYS(ts, {})",
-        QUESTDB_TABLE_TOP_MOVERS, DEDUP_KEY_TOP_MOVERS
-    );
-    execute_ddl(&client, &base_url, &top_dedup_sql, "top_movers DEDUP").await;
-
-    info!("movers tables setup complete (stock_movers + option_movers + top_movers)");
-}
-
-/// Executes a DDL statement against QuestDB HTTP API. Best-effort.
-async fn execute_ddl(client: &Client, base_url: &str, sql: &str, label: &str) {
-    match client.get(base_url).query(&[("query", sql)]).send().await {
-        Ok(response) => {
-            if response.status().is_success() {
-                info!("{label} DDL executed successfully");
-            } else {
-                let status = response.status();
-                let body = response.text().await.unwrap_or_default();
+    // Step 1b (2026-05-02 PR-B): idempotent self-heal — adds the
+    // `exchange_segment` and `instrument_type` columns to `movers_1s` for
+    // databases that pre-date this schema upgrade.
+    // `ALTER TABLE ADD COLUMN IF NOT EXISTS` is a no-op when the column
+    // exists. The mat views are DROP-then-CREATE on every boot (Step 2
+    // below), so once the base columns are in place, every view
+    // automatically projects them via the new SELECT clauses in
+    // `movers_view_ddl`. No one-shot migration script required. Per
+    // `observability-architecture.md` schema-self-heal pattern.
+    for (column, alter_sql) in [
+        (
+            "exchange_segment",
+            movers_1s_alter_add_exchange_segment_ddl(),
+        ),
+        ("instrument_type", movers_1s_alter_add_instrument_type_ddl()),
+        // Audit-2026-05-03: phase column folds in legacy
+        // PreopenMoversTracker semantics (PREOPEN / MARKET / POSTMARKET).
+        ("phase", movers_1s_alter_add_phase_ddl()),
+        // PR #450 (2026-05-03): prev_oi baseline + expiry_date_ist for
+        // Dhan-parity OI Change / OI Change % calculations and the
+        // ?expiry=YYYY-MM-DD filter.
+        ("prev_oi", movers_1s_alter_add_prev_oi_ddl()),
+        ("expiry_date_ist", movers_1s_alter_add_expiry_date_ist_ddl()),
+    ] {
+        match client
+            .get(&base_url)
+            .query(&[("query", alter_sql.as_str())])
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                info!(
+                    table = QUESTDB_TABLE_MOVERS_1S,
+                    column, "movers_1s column ensured (idempotent)"
+                );
+            }
+            Ok(resp) => {
                 warn!(
-                    %status,
-                    body = body.chars().take(200).collect::<String>(),
-                    "{label} DDL returned non-success"
+                    table = QUESTDB_TABLE_MOVERS_1S,
+                    column,
+                    status = %resp.status(),
+                    "ALTER ADD COLUMN non-2xx — continuing best-effort"
+                );
+            }
+            Err(err) => {
+                error!(
+                    table = QUESTDB_TABLE_MOVERS_1S,
+                    column,
+                    ?err,
+                    "ALTER ADD COLUMN failed (HTTP error)"
                 );
             }
         }
-        Err(err) => {
-            warn!(?err, "{label} DDL request failed");
+    }
+
+    // Step 2: 25 materialized views — robust loop with DROP-before-CREATE
+    // (Fix B: defensive against stale state from a prior failed boot),
+    // retry-once-on-failure (Fix D: 400 Bad Request can be transient on
+    // QuestDB during high-concurrency boot DDL), and structured error-body
+    // logging (Fix A: the original WARN only carried the HTTP status, not
+    // the actual reason QuestDB rejected the DDL).
+    let mut created = 0;
+    for &tf in MOVERS_VIEW_TIMEFRAMES {
+        // Fix B: drop any stale object with this name first. DROP MAT VIEW
+        // IF EXISTS is idempotent and returns OK on missing names. Then
+        // also DROP TABLE IF EXISTS for the same name — handles the case
+        // where a legacy `movers_22tf` table with this name (e.g.
+        // `movers_5s`, `movers_15s`) survived the cleanup migration.
+        let drop_view_sql = format!("DROP MATERIALIZED VIEW IF EXISTS movers_{tf}");
+        let _ = run_ddl(&client, &base_url, &drop_view_sql).await;
+        let drop_table_sql = format!("DROP TABLE IF EXISTS movers_{tf}");
+        let _ = run_ddl(&client, &base_url, &drop_table_sql).await;
+
+        // Try CREATE, then once-retry on failure.
+        let sql = movers_view_ddl(tf);
+        let mut outcome = run_ddl(&client, &base_url, &sql).await;
+        if !outcome.success {
+            // Fix D: a single retry handles transient QuestDB-side state.
+            outcome = run_ddl(&client, &base_url, &sql).await;
+        }
+
+        if outcome.success {
+            created += 1;
+        } else {
+            // Fix A: log the response body so the operator can see WHY
+            // QuestDB rejected the DDL. Uses `error!` (Loki → Telegram)
+            // because a missing mat view is a real coverage gap that
+            // breaks downstream queries, not a routine warning.
+            error!(
+                timeframe = tf,
+                status = %outcome.status,
+                body = %outcome.body,
+                "movers mat-view CREATE failed after retry — view missing"
+            );
         }
     }
-}
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+    info!(
+        created,
+        total = MOVERS_VIEW_COUNT,
+        "movers materialized views ensured"
+    );
+
+    // Fix C: post-CREATE verification. Query the QuestDB metadata table
+    // to confirm physical state matches what the DDL responses claimed.
+    // If any expected mat view is missing, log ERROR with the gap list so
+    // the operator knows EXACTLY which timeframes are absent (instead of
+    // just a count discrepancy buried in INFO).
+    let actual = query_table_names_with_prefix(&client, &base_url, "movers_").await;
+    let mut missing: Vec<&'static str> = Vec::new();
+    for &tf in MOVERS_VIEW_TIMEFRAMES {
+        let expected = format!("movers_{tf}");
+        if !actual.iter().any(|name| name == &expected) {
+            missing.push(tf);
+        }
+    }
+    if !missing.is_empty() {
+        error!(
+            missing_count = missing.len(),
+            missing_timeframes = ?missing,
+            actual_count = actual.len(),
+            "movers post-CREATE verification: views missing — read-path queries WILL fail for these timeframes"
+        );
+    }
+
+    // Fix E: post-migration legacy-table audit. The DROP IF EXISTS path
+    // returns `{"ddl":"OK"}` even when the underlying table object can't
+    // be dropped (rare but observed in PR #421's first deployment), so
+    // we sanity-check that none of the LEGACY_22TF_TIMEFRAMES exist as
+    // standalone TABLES (different from mat views with the same name).
+    //
+    // Two exclusions to avoid false positives:
+    //   1. Names that are now legitimate MAT VIEWS (overlap with
+    //      MOVERS_VIEW_TIMEFRAMES, e.g. 5s, 15s, 30s, 1m..1h).
+    //   2. The new BASE TABLE name `movers_1s` itself — `1s` is in the
+    //      legacy 22tf list AND is the new base table. Its presence is
+    //      EXPECTED, not a stale-table issue. (Bug fix from the live
+    //      PR #423 boot which false-flagged `1s` as stale.)
+    let legacy_22tf_only: Vec<&'static str> = LEGACY_22TF_TIMEFRAMES
+        .iter()
+        .copied()
+        .filter(|tf| !MOVERS_VIEW_TIMEFRAMES.contains(tf))
+        // Exclude the new base table's timeframe so its presence isn't
+        // misreported. The base table is named `movers_1s` per
+        // QUESTDB_TABLE_MOVERS_1S; its timeframe suffix is `1s`.
+        .filter(|tf| {
+            let name = format!("movers_{tf}");
+            name != QUESTDB_TABLE_MOVERS_1S
+        })
+        .collect();
+    let stale: Vec<&'static str> = legacy_22tf_only
+        .iter()
+        .copied()
+        .filter(|tf| {
+            let name = format!("movers_{tf}");
+            actual.iter().any(|n| n == &name)
+        })
+        .collect();
+    if !stale.is_empty() {
+        error!(
+            stale_count = stale.len(),
+            stale_timeframes = ?stale,
+            "movers post-migration audit: legacy 22tf tables still present — manual `DROP TABLE` required"
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // -----------------------------------------------------------------------
-    // Wave-3-A LOW #6 — sanitize_ilp_symbol
-    // -----------------------------------------------------------------------
-
     #[test]
-    fn test_sanitize_ilp_symbol_clean_input_borrows_zero_alloc() {
-        let clean = "RELIANCE";
-        let out = sanitize_ilp_symbol(clean);
-        // Borrowed variant — pointer equality with input.
-        assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
-        assert_eq!(out, "RELIANCE");
+    fn test_view_count_is_25() {
+        // Audit-2026-05-03: bumped from 24 → 25 (added "10s" between "5s" and "15s").
+        assert_eq!(MOVERS_VIEW_COUNT, 25);
+        assert_eq!(MOVERS_VIEW_TIMEFRAMES.len(), 25);
     }
 
     #[test]
-    fn test_sanitize_ilp_symbol_strips_newline() {
-        let dirty = "RELIANCE\nmalicious_table";
-        let out = sanitize_ilp_symbol(dirty);
-        assert!(matches!(out, std::borrow::Cow::Owned(_)));
-        assert_eq!(out, "RELIANCEmalicious_table");
+    fn test_view_timeframes_match_plan_exact_order() {
+        // Audit-2026-05-03: 25-entry list with "10s" inserted at index 1
+        // for sub-15s movers granularity. Order is fixed.
+        let expected = [
+            "5s", "10s", "15s", "30s", "1m", "2m", "3m", "4m", "5m", "6m", "7m", "8m", "9m", "10m",
+            "11m", "12m", "13m", "14m", "15m", "30m", "1h", "2h", "3h", "4h", "1d",
+        ];
+        assert_eq!(MOVERS_VIEW_TIMEFRAMES, &expected);
+    }
+
+    /// Audit-2026-05-03 ratchet: ensure `10s` is present and positioned
+    /// between `5s` and `15s` for monotone-ascending semantics.
+    #[test]
+    fn test_view_timeframes_includes_10s_between_5s_and_15s() {
+        let pos_5s = MOVERS_VIEW_TIMEFRAMES
+            .iter()
+            .position(|t| *t == "5s")
+            .expect("5s missing");
+        let pos_10s = MOVERS_VIEW_TIMEFRAMES
+            .iter()
+            .position(|t| *t == "10s")
+            .expect("10s missing — Audit-2026-05-03 mat-view coverage gap");
+        let pos_15s = MOVERS_VIEW_TIMEFRAMES
+            .iter()
+            .position(|t| *t == "15s")
+            .expect("15s missing");
+        assert!(pos_5s < pos_10s);
+        assert!(pos_10s < pos_15s);
     }
 
     #[test]
-    fn test_sanitize_ilp_symbol_strips_carriage_return_comma_equals_control() {
-        let dirty = "BAD,SYM\r=1\x07X";
-        let out = sanitize_ilp_symbol(dirty);
-        assert_eq!(out, "BADSYM1X");
+    fn test_dedup_key_includes_segment_per_i_p1_11() {
+        // I-P1-11 + STORAGE-GAP-01: composite key MUST include segment.
+        assert!(DEDUP_KEY_MOVERS_1S.contains("security_id"));
+        assert!(DEDUP_KEY_MOVERS_1S.contains("segment"));
+        assert!(DEDUP_KEY_MOVERS_1S.contains("ts"));
     }
 
     #[test]
-    fn test_sanitize_ilp_symbol_preserves_unicode_and_normal_chars() {
-        let clean = "NIFTY-Jun2026-25000-CE";
-        let out = sanitize_ilp_symbol(clean);
-        assert_eq!(out, clean);
-        assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
-    }
-
-    #[test]
-    fn test_sanitize_ilp_symbol_empty_string_is_borrowed() {
-        let out = sanitize_ilp_symbol("");
-        assert_eq!(out, "");
-        assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
-    }
-
-    // -----------------------------------------------------------------------
-    // DDL content validation
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_stock_movers_ddl_contains_required_columns() {
-        assert!(STOCK_MOVERS_CREATE_DDL.contains("category SYMBOL"));
-        assert!(STOCK_MOVERS_CREATE_DDL.contains("security_id LONG"));
-        assert!(STOCK_MOVERS_CREATE_DDL.contains("segment SYMBOL"));
-        assert!(STOCK_MOVERS_CREATE_DDL.contains("symbol SYMBOL"));
-        assert!(STOCK_MOVERS_CREATE_DDL.contains("ltp DOUBLE"));
-        assert!(STOCK_MOVERS_CREATE_DDL.contains("prev_close DOUBLE"));
-        assert!(STOCK_MOVERS_CREATE_DDL.contains("change_abs DOUBLE"));
-        assert!(STOCK_MOVERS_CREATE_DDL.contains("change_pct DOUBLE"));
-        assert!(STOCK_MOVERS_CREATE_DDL.contains("volume LONG"));
-        assert!(STOCK_MOVERS_CREATE_DDL.contains("rank INT"));
-        assert!(STOCK_MOVERS_CREATE_DDL.contains("ts TIMESTAMP"));
-    }
-
-    #[test]
-    fn test_stock_movers_ddl_has_partition_and_wal() {
-        assert!(STOCK_MOVERS_CREATE_DDL.contains("PARTITION BY DAY"));
-        assert!(STOCK_MOVERS_CREATE_DDL.contains("WAL"));
-        assert!(STOCK_MOVERS_CREATE_DDL.contains("TIMESTAMP(ts)"));
-    }
-
-    #[test]
-    fn test_stock_movers_ddl_is_idempotent() {
-        assert!(STOCK_MOVERS_CREATE_DDL.contains("IF NOT EXISTS"));
-    }
-
-    #[test]
-    fn test_option_movers_ddl_contains_required_columns() {
-        assert!(OPTION_MOVERS_CREATE_DDL.contains("category SYMBOL"));
-        assert!(OPTION_MOVERS_CREATE_DDL.contains("security_id LONG"));
-        assert!(OPTION_MOVERS_CREATE_DDL.contains("segment SYMBOL"));
-        assert!(OPTION_MOVERS_CREATE_DDL.contains("contract_name SYMBOL"));
-        assert!(OPTION_MOVERS_CREATE_DDL.contains("underlying SYMBOL"));
-        assert!(OPTION_MOVERS_CREATE_DDL.contains("option_type SYMBOL"));
-        assert!(OPTION_MOVERS_CREATE_DDL.contains("strike DOUBLE"));
-        assert!(OPTION_MOVERS_CREATE_DDL.contains("expiry SYMBOL"));
-        assert!(OPTION_MOVERS_CREATE_DDL.contains("spot_price DOUBLE"));
-        assert!(OPTION_MOVERS_CREATE_DDL.contains("ltp DOUBLE"));
-        assert!(OPTION_MOVERS_CREATE_DDL.contains("change DOUBLE"));
-        assert!(OPTION_MOVERS_CREATE_DDL.contains("change_pct DOUBLE"));
-        assert!(OPTION_MOVERS_CREATE_DDL.contains("oi LONG"));
-        assert!(OPTION_MOVERS_CREATE_DDL.contains("oi_change LONG"));
-        assert!(OPTION_MOVERS_CREATE_DDL.contains("oi_change_pct DOUBLE"));
-        assert!(OPTION_MOVERS_CREATE_DDL.contains("volume LONG"));
-        assert!(OPTION_MOVERS_CREATE_DDL.contains("value DOUBLE"));
-        assert!(OPTION_MOVERS_CREATE_DDL.contains("rank INT"));
-        assert!(OPTION_MOVERS_CREATE_DDL.contains("ts TIMESTAMP"));
-    }
-
-    #[test]
-    fn test_option_movers_ddl_has_partition_and_wal() {
-        assert!(OPTION_MOVERS_CREATE_DDL.contains("PARTITION BY DAY"));
-        assert!(OPTION_MOVERS_CREATE_DDL.contains("WAL"));
-        assert!(OPTION_MOVERS_CREATE_DDL.contains("TIMESTAMP(ts)"));
-    }
-
-    #[test]
-    fn test_option_movers_ddl_is_idempotent() {
-        assert!(OPTION_MOVERS_CREATE_DDL.contains("IF NOT EXISTS"));
-    }
-
-    // -----------------------------------------------------------------------
-    // DEDUP key validation
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_dedup_key_includes_security_id() {
-        assert!(DEDUP_KEY_MOVERS.contains("security_id"));
-    }
-
-    #[test]
-    fn test_dedup_key_includes_category() {
-        assert!(DEDUP_KEY_MOVERS.contains("category"));
-    }
-
-    // DB-3/DB-4: Cross-segment collision prevention.
-    // Must include `segment` because the same security_id exists across
-    // `IDX_I` / `NSE_EQ` / `NSE_FNO` with different real-world meanings.
-    // Dropping this test is equivalent to re-introducing silent data corruption.
-    #[test]
-    fn test_dedup_key_movers_includes_segment() {
-        assert!(
-            DEDUP_KEY_MOVERS.contains("segment"),
-            "DEDUP_KEY_MOVERS must include `segment` — same security_id exists \
-             across IDX_I/NSE_EQ/NSE_FNO and would collide otherwise (audit DB-3/DB-4). \
-             Got: {DEDUP_KEY_MOVERS}"
-        );
-    }
-
-    /// Both stock_movers and option_movers share the same DEDUP constant,
-    /// so both tables MUST apply the same identity-column set. This test
-    /// pins the constant format and will fail loudly if anyone re-orders or
-    /// drops a column — forcing a conscious review.
-    #[test]
-    fn test_dedup_key_movers_exact_format() {
+    fn test_dedup_key_is_3_col_no_timeframe() {
+        let cols: Vec<_> = DEDUP_KEY_MOVERS_1S.split(',').collect();
         assert_eq!(
-            DEDUP_KEY_MOVERS, "security_id, category, segment",
-            "DEDUP_KEY_MOVERS regression — changing this string silently \
-             corrupts data; update the test only after the DDL and migration \
-             are confirmed safe."
+            cols.len(),
+            3,
+            "DEDUP must be 3-col (ts, security_id, segment)"
+        );
+        assert!(!DEDUP_KEY_MOVERS_1S.contains("timeframe"));
+    }
+
+    #[test]
+    fn test_base_table_name_is_movers_1s() {
+        // Wave 5 / 2026-05-01 rename: movers_unified_1s → movers_1s.
+        assert_eq!(QUESTDB_TABLE_MOVERS_1S, "movers_1s");
+    }
+
+    #[test]
+    fn test_base_ddl_uses_create_table_if_not_exists() {
+        let ddl = movers_1s_create_ddl();
+        assert!(ddl.contains("CREATE TABLE IF NOT EXISTS movers_1s")); // APPROVED: test asserting canonical DDL string
+    }
+
+    #[test]
+    fn test_base_ddl_partitions_by_day() {
+        let ddl = movers_1s_create_ddl();
+        assert!(ddl.contains("PARTITION BY DAY"));
+    }
+
+    #[test]
+    fn test_base_ddl_designates_ts_as_timestamp() {
+        let ddl = movers_1s_create_ddl();
+        assert!(ddl.contains("TIMESTAMP(ts)"));
+    }
+
+    #[test]
+    fn test_base_ddl_includes_dedup_upsert_keys() {
+        let ddl = movers_1s_create_ddl();
+        assert!(ddl.contains("DEDUP UPSERT KEYS(ts, security_id, segment)"));
+    }
+
+    #[test]
+    fn test_base_ddl_includes_all_twelve_columns() {
+        // 2026-05-02 PR-B: 10 → 12 columns. Added precision tags
+        // `exchange_segment` (NSE_FNO/BSE_FNO/NSE_EQ/IDX_I) and
+        // `instrument_type` (INDEX/EQUITY/FUTIDX/FUTSTK/.../OPTSTK) for the
+        // depth-dynamic top-volume selector.
+        let ddl = movers_1s_create_ddl();
+        for col in [
+            "ts               TIMESTAMP",
+            "security_id      LONG",
+            "segment          SYMBOL",
+            "exchange_segment SYMBOL",
+            "instrument_type  SYMBOL",
+            "open_interest    LONG",
+            "oi_delta         LONG",
+            "volume           LONG",
+            "last_price       DOUBLE",
+            "prev_close       DOUBLE",
+            "change_pct       DOUBLE",
+            "received_at      TIMESTAMP",
+            // PR #450 (2026-05-03): Dhan-parity columns
+            "prev_oi          LONG",
+            "expiry_date_ist  TIMESTAMP",
+        ] {
+            assert!(ddl.contains(col), "base DDL must declare column `{col}`");
+        }
+    }
+
+    /// PR #450 ratchet (2026-05-03): the `prev_oi` column MUST be present
+    /// in the base CREATE TABLE DDL. Required for Dhan-parity OI Change
+    /// and OI Change % calculations on the Markets > Options view.
+    /// Sourced from NSE bhavcopy `OpnIntrst` (col 22) for NSE_FNO and
+    /// from Dhan WS PrevClose code 6 bytes 12-15 for IDX_I.
+    #[test]
+    fn test_base_ddl_declares_prev_oi_column_for_dhan_parity_oi_change() {
+        let ddl = movers_1s_create_ddl();
+        assert!(
+            ddl.contains("prev_oi          LONG"),
+            "prev_oi LONG column missing — required for Dhan-parity OI Change and OI Change %"
         );
     }
 
-    /// Cross-check: every column referenced in DEDUP_KEY_MOVERS MUST appear
-    /// in both the stock_movers and option_movers DDLs. Prevents the class
-    /// of bug where DEDUP lists a column the table doesn't even have.
+    /// PR #450 ratchet (2026-05-03): the `expiry_date_ist` column MUST be
+    /// present in the base CREATE TABLE DDL. Required for the
+    /// `?expiry=YYYY-MM-DD` filter on `/api/movers` matching Dhan's
+    /// middle dropdown.
     #[test]
-    fn test_dedup_key_movers_columns_exist_in_both_ddls() {
-        for col in DEDUP_KEY_MOVERS.split(',').map(|s| s.trim()) {
+    fn test_base_ddl_declares_expiry_date_ist_column_for_expiry_filter() {
+        let ddl = movers_1s_create_ddl();
+        assert!(
+            ddl.contains("expiry_date_ist  TIMESTAMP"),
+            "expiry_date_ist TIMESTAMP column missing — required for ?expiry filter"
+        );
+    }
+
+    /// PR #450 ratchet (2026-05-03): the DEDUP key MUST NOT include the
+    /// new payload columns (`prev_oi`, `expiry_date_ist`). Including
+    /// payload columns in the dedup key breaks idempotency on bhavcopy
+    /// late-arrival corrections.
+    #[test]
+    fn test_dedup_key_excludes_new_pr450_payload_columns() {
+        assert!(
+            !DEDUP_KEY_MOVERS_1S.contains("prev_oi"),
+            "DEDUP key must not include prev_oi (payload column)"
+        );
+        assert!(
+            !DEDUP_KEY_MOVERS_1S.contains("expiry_date_ist"),
+            "DEDUP key must not include expiry_date_ist (payload column)"
+        );
+    }
+
+    // 2026-05-02 PR-B: ratchet tests for the new schema columns + the
+    // idempotent ALTER ADD COLUMN self-heal helpers.
+
+    #[test]
+    fn test_base_ddl_declares_exchange_segment_with_symbol_capacity() {
+        let ddl = movers_1s_create_ddl();
+        assert!(
+            ddl.contains("exchange_segment SYMBOL CAPACITY 16 NOCACHE"),
+            "exchange_segment must be SYMBOL CAPACITY 16 NOCACHE per Wave 5 schema convention"
+        );
+    }
+
+    #[test]
+    fn test_base_ddl_declares_instrument_type_with_symbol_capacity() {
+        let ddl = movers_1s_create_ddl();
+        assert!(
+            ddl.contains("instrument_type  SYMBOL CAPACITY 16 NOCACHE"),
+            "instrument_type must be SYMBOL CAPACITY 16 NOCACHE — covers all 10 InstrumentType variants + UNKNOWN fallback"
+        );
+    }
+
+    #[test]
+    fn test_movers_1s_alter_add_exchange_segment_ddl_is_idempotent_per_observability_self_heal() {
+        let sql = movers_1s_alter_add_exchange_segment_ddl();
+        assert!(
+            sql.contains("ALTER TABLE movers_1s"),
+            "must target movers_1s base table"
+        );
+        assert!(
+            sql.contains("ADD COLUMN IF NOT EXISTS exchange_segment"),
+            "must use ADD COLUMN IF NOT EXISTS for self-heal pattern"
+        );
+        assert!(
+            sql.contains("SYMBOL CAPACITY 16 NOCACHE"),
+            "ALTER must declare same SYMBOL type as CREATE TABLE"
+        );
+    }
+
+    #[test]
+    fn test_movers_1s_create_ddl_includes_phase_column() {
+        // Audit-2026-05-03 ratchet: schema MUST declare `phase` SYMBOL.
+        let ddl = movers_1s_create_ddl();
+        assert!(
+            ddl.contains("phase            SYMBOL CAPACITY 8 NOCACHE"),
+            "movers_1s_create_ddl must declare phase SYMBOL CAPACITY 8 NOCACHE — \
+             folded in from legacy PreopenMoversTracker"
+        );
+    }
+
+    #[test]
+    fn test_movers_1s_alter_add_phase_ddl_is_idempotent_per_observability_self_heal() {
+        let ddl = movers_1s_alter_add_phase_ddl();
+        assert!(
+            ddl.contains("ADD COLUMN IF NOT EXISTS phase"),
+            "ALTER must be idempotent (IF NOT EXISTS)"
+        );
+        assert!(
+            ddl.contains("SYMBOL CAPACITY 8 NOCACHE"),
+            "phase column type must be SYMBOL CAPACITY 8 NOCACHE"
+        );
+    }
+
+    /// PR #450 ratchet (2026-05-03): the `prev_oi` ALTER must be
+    /// idempotent (`IF NOT EXISTS`) per the schema-self-heal pattern.
+    #[test]
+    fn test_movers_1s_alter_add_prev_oi_ddl_is_idempotent() {
+        let ddl = movers_1s_alter_add_prev_oi_ddl();
+        assert!(
+            ddl.contains("ALTER TABLE movers_1s"),
+            "must target movers_1s base table"
+        );
+        assert!(
+            ddl.contains("ADD COLUMN IF NOT EXISTS prev_oi LONG"),
+            "ALTER must be idempotent (IF NOT EXISTS) and declare LONG type"
+        );
+    }
+
+    /// PR #450 ratchet (2026-05-03): the `expiry_date_ist` ALTER must be
+    /// idempotent (`IF NOT EXISTS`) per the schema-self-heal pattern.
+    #[test]
+    fn test_movers_1s_alter_add_expiry_date_ist_ddl_is_idempotent() {
+        let ddl = movers_1s_alter_add_expiry_date_ist_ddl();
+        assert!(
+            ddl.contains("ALTER TABLE movers_1s"),
+            "must target movers_1s base table"
+        );
+        assert!(
+            ddl.contains("ADD COLUMN IF NOT EXISTS expiry_date_ist TIMESTAMP"),
+            "ALTER must be idempotent (IF NOT EXISTS) and declare TIMESTAMP type"
+        );
+    }
+
+    /// PR #450 ratchet (2026-05-03): the materialized-view DDL MUST
+    /// expose `prev_oi` and `expiry_date_ist` via `last(...)` aggregation
+    /// so frontend can read them via `/api/movers` SQL queries.
+    #[test]
+    fn test_movers_view_ddl_exposes_prev_oi_and_expiry_date_ist() {
+        let ddl = movers_view_ddl("5s");
+        assert!(
+            ddl.contains("last(prev_oi) AS prev_oi"),
+            "view must expose prev_oi via last() aggregation, got: {ddl}"
+        );
+        assert!(
+            ddl.contains("last(expiry_date_ist) AS expiry_date_ist"),
+            "view must expose expiry_date_ist via last() aggregation, got: {ddl}"
+        );
+    }
+
+    /// PR #450 ratchet (2026-05-03): the materialized-view DDL MUST
+    /// compute Dhan-precise `oi_change_session` (= current_OI - prev_OI)
+    /// directly in SQL. Replaces the legacy intra-bucket
+    /// `oi_delta_bucket` for the operator-facing OI Change column.
+    #[test]
+    fn test_movers_view_ddl_computes_oi_change_session_from_prev_oi() {
+        let ddl = movers_view_ddl("5s");
+        assert!(
+            ddl.contains("last(open_interest) - last(prev_oi) AS oi_change_session"),
+            "view must compute Dhan-precise oi_change_session = current_OI - prev_OI, got: {ddl}"
+        );
+    }
+
+    /// PR #450 ratchet (2026-05-03): the materialized-view DDL MUST
+    /// guard `oi_change_pct_session` against divide-by-zero when
+    /// `prev_oi` is 0 (sentinel for "no baseline available").
+    #[test]
+    fn test_movers_view_ddl_guards_oi_change_pct_against_zero_prev_oi() {
+        let ddl = movers_view_ddl("5s");
+        assert!(
+            ddl.contains("CASE WHEN last(prev_oi) > 0"),
+            "view must guard oi_change_pct against zero prev_oi, got: {ddl}"
+        );
+        assert!(
+            ddl.contains("AS oi_change_pct_session"),
+            "view must expose oi_change_pct_session, got: {ddl}"
+        );
+    }
+
+    #[test]
+    fn test_movers_phase_constants_pin_two_values_no_postmarket() {
+        // Audit-2026-05-03: pin the 2 phase values per operator
+        // clarification — POSTMARKET was removed (no 15:30-15:40
+        // tracking in movers). Frontend filters depend on these
+        // exact strings.
+        assert_eq!(MOVERS_PHASE_PREOPEN, "PREOPEN");
+        assert_eq!(MOVERS_PHASE_MARKET, "MARKET");
+    }
+
+    #[test]
+    fn test_movers_1s_alter_add_instrument_type_ddl_is_idempotent_per_observability_self_heal() {
+        let sql = movers_1s_alter_add_instrument_type_ddl();
+        assert!(
+            sql.contains("ALTER TABLE movers_1s"),
+            "must target movers_1s base table"
+        );
+        assert!(
+            sql.contains("ADD COLUMN IF NOT EXISTS instrument_type"),
+            "must use ADD COLUMN IF NOT EXISTS for self-heal pattern"
+        );
+        assert!(
+            sql.contains("SYMBOL CAPACITY 16 NOCACHE"),
+            "ALTER must declare same SYMBOL type as CREATE TABLE"
+        );
+    }
+
+    #[test]
+    fn test_view_ddl_projects_exchange_segment_via_last_aggregate() {
+        // Mat views must propagate the new columns. `last(exchange_segment)`
+        // matches the per-instrument-stable nature (an instrument's exchange
+        // doesn't change mid-session).
+        let sql = movers_view_ddl("1m");
+        assert!(
+            sql.contains("last(exchange_segment) AS exchange_segment"),
+            "mat view DDL must project exchange_segment via last() aggregate"
+        );
+    }
+
+    #[test]
+    fn test_view_ddl_projects_instrument_type_via_last_aggregate() {
+        let sql = movers_view_ddl("5m");
+        assert!(
+            sql.contains("last(instrument_type) AS instrument_type"),
+            "mat view DDL must project instrument_type via last() aggregate"
+        );
+    }
+
+    #[test]
+    fn test_view_ddl_projects_new_columns_for_every_timeframe() {
+        // Belt-and-suspenders: every one of the 25 timeframes must include
+        // both new precision columns. Catches any future regression where
+        // someone duplicates the DDL for a special timeframe and forgets.
+        for tf in MOVERS_VIEW_TIMEFRAMES {
+            let sql = movers_view_ddl(tf);
             assert!(
-                STOCK_MOVERS_CREATE_DDL.contains(col),
-                "DEDUP column `{col}` is missing from STOCK_MOVERS_CREATE_DDL"
+                sql.contains("last(exchange_segment) AS exchange_segment"),
+                "timeframe `{tf}` must project exchange_segment"
             );
             assert!(
-                OPTION_MOVERS_CREATE_DDL.contains(col),
-                "DEDUP column `{col}` is missing from OPTION_MOVERS_CREATE_DDL"
-            );
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Table name constants
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_table_names_are_stable() {
-        assert_eq!(QUESTDB_TABLE_STOCK_MOVERS, "stock_movers");
-        assert_eq!(QUESTDB_TABLE_OPTION_MOVERS, "option_movers");
-    }
-
-    // -----------------------------------------------------------------------
-    // Flush batch size validation
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_movers_flush_batch_size_reasonable() {
-        // Max per snapshot: 20 entries × 10 categories = 200 rows
-        assert!(MOVERS_FLUSH_BATCH_SIZE >= 200);
-        assert!(MOVERS_FLUSH_BATCH_SIZE <= 1000);
-    }
-
-    #[test]
-    fn test_movers_flush_interval_aligns_with_snapshot() {
-        // Must be > 60s (snapshot interval) to avoid premature flush
-        assert!(MOVERS_FLUSH_INTERVAL_MS >= 60_000);
-    }
-
-    // -----------------------------------------------------------------------
-    // Writer construction (unit tests — no QuestDB needed)
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_stock_movers_writer_invalid_host() {
-        let config = QuestDbConfig {
-            host: "nonexistent-host-99999".to_string(),
-            http_port: 9000,
-            ilp_port: 9009,
-            pg_port: 8812,
-        };
-        // Construction may succeed (lazy connect) or fail — both are valid
-        let _result = StockMoversWriter::new(&config);
-    }
-
-    #[test]
-    fn test_option_movers_writer_invalid_host() {
-        let config = QuestDbConfig {
-            host: "nonexistent-host-99999".to_string(),
-            http_port: 9000,
-            ilp_port: 9009,
-            pg_port: 8812,
-        };
-        let _result = OptionMoversWriter::new(&config);
-    }
-
-    // -----------------------------------------------------------------------
-    // DDL timeout validation
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_ddl_timeout_reasonable() {
-        assert!(QUESTDB_DDL_TIMEOUT_SECS >= 5);
-        assert!(QUESTDB_DDL_TIMEOUT_SECS <= 30);
-    }
-
-    // -----------------------------------------------------------------------
-    // Stock mover change_abs calculation
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_change_abs_calculated_correctly() {
-        let ltp = 150.0_f64;
-        let prev_close = 145.0_f64;
-        let change_abs = ltp - prev_close;
-        assert!((change_abs - 5.0).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn test_change_abs_negative_when_price_drops() {
-        let ltp = 140.0_f64;
-        let prev_close = 145.0_f64;
-        let change_abs = ltp - prev_close;
-        assert!(change_abs < 0.0);
-        assert!((change_abs - (-5.0)).abs() < f64::EPSILON);
-    }
-
-    // -----------------------------------------------------------------------
-    // Category string constants validation
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_stock_mover_categories_are_valid() {
-        let categories = ["GAINER", "LOSER", "MOST_ACTIVE"];
-        for cat in &categories {
-            assert!(!cat.is_empty());
-            assert!(cat.chars().all(|c| c.is_ascii_uppercase() || c == '_'));
-        }
-    }
-
-    #[test]
-    fn test_option_mover_categories_are_valid() {
-        let categories = [
-            "HIGHEST_OI",
-            "OI_GAINER",
-            "OI_LOSER",
-            "TOP_VOLUME",
-            "TOP_VALUE",
-            "PRICE_GAINER",
-            "PRICE_LOSER",
-        ];
-        assert_eq!(categories.len(), 7);
-        for cat in &categories {
-            assert!(!cat.is_empty());
-            assert!(cat.chars().all(|c| c.is_ascii_uppercase() || c == '_'));
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // DB-6 + DB-7: reconnect throttle + drop counter (movers)
-    // -----------------------------------------------------------------------
-
-    /// Shared bound check — reconnect throttle must be non-zero to prevent
-    /// tight reconnect loops (audit gap DB-6).
-    #[test]
-    fn test_db6_movers_reconnect_throttle_nonzero_and_bounded() {
-        assert!(
-            MOVERS_RECONNECT_THROTTLE_SECS >= 1,
-            "throttle must be >= 1s"
-        );
-        assert!(
-            MOVERS_RECONNECT_THROTTLE_SECS <= 300,
-            "throttle must be <= 5min"
-        );
-    }
-
-    /// `StockMoversWriter::record_drop` must saturate-add into
-    /// `rows_dropped_total` and increment the counter by exactly the
-    /// dropped-row count (DB-7).
-    #[test]
-    fn test_db7_stock_movers_record_drop_increments_counter() {
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            http_port: 9000,
-            ilp_port: 9009,
-            pg_port: 8812,
-        };
-        let mut writer = match StockMoversWriter::new(&config) {
-            Ok(w) => w,
-            Err(_) => StockMoversWriter {
-                sender: None,
-                buffer: questdb::ingress::Buffer::new(questdb::ingress::ProtocolVersion::V1),
-                pending_count: 0,
-                ilp_conf_string: config.build_ilp_conf_string(),
-                next_reconnect_allowed: Instant::now(),
-                rows_dropped_total: 0,
-                rescue_ring: VecDeque::new(),
-            },
-        };
-        assert_eq!(writer.rows_dropped_total(), 0);
-        let err = anyhow::anyhow!("synthetic flush failure");
-        writer.record_drop(100, "test", &err);
-        assert_eq!(writer.rows_dropped_total(), 100);
-        writer.record_drop(200, "test", &err);
-        assert_eq!(writer.rows_dropped_total(), 300);
-    }
-
-    /// Same contract for `OptionMoversWriter`.
-    #[test]
-    fn test_db7_option_movers_record_drop_increments_counter() {
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            http_port: 9000,
-            ilp_port: 9009,
-            pg_port: 8812,
-        };
-        let mut writer = match OptionMoversWriter::new(&config) {
-            Ok(w) => w,
-            Err(_) => OptionMoversWriter {
-                sender: None,
-                buffer: questdb::ingress::Buffer::new(questdb::ingress::ProtocolVersion::V1),
-                pending_count: 0,
-                ilp_conf_string: config.build_ilp_conf_string(),
-                next_reconnect_allowed: Instant::now(),
-                rows_dropped_total: 0,
-                rescue_ring: VecDeque::new(),
-            },
-        };
-        assert_eq!(writer.rows_dropped_total(), 0);
-        let err = anyhow::anyhow!("synthetic flush failure");
-        writer.record_drop(50, "test", &err);
-        assert_eq!(writer.rows_dropped_total(), 50);
-    }
-
-    /// Throttle blocks within window (DB-6).
-    #[test]
-    fn test_db6_stock_movers_reconnect_throttle_blocks_within_window() {
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            http_port: 9000,
-            ilp_port: 9009,
-            pg_port: 8812,
-        };
-        let mut writer = match StockMoversWriter::new(&config) {
-            Ok(w) => w,
-            Err(_) => StockMoversWriter {
-                sender: None,
-                buffer: questdb::ingress::Buffer::new(questdb::ingress::ProtocolVersion::V1),
-                pending_count: 0,
-                ilp_conf_string: config.build_ilp_conf_string(),
-                next_reconnect_allowed: Instant::now(),
-                rows_dropped_total: 0,
-                rescue_ring: VecDeque::new(),
-            },
-        };
-        assert!(writer.reconnect_allowed_now());
-        writer.bump_reconnect_throttle();
-        assert!(
-            !writer.reconnect_allowed_now(),
-            "after bump, stock movers writer must block reconnect within throttle window"
-        );
-    }
-
-    /// Same for option movers.
-    #[test]
-    fn test_db6_option_movers_reconnect_throttle_blocks_within_window() {
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            http_port: 9000,
-            ilp_port: 9009,
-            pg_port: 8812,
-        };
-        let mut writer = match OptionMoversWriter::new(&config) {
-            Ok(w) => w,
-            Err(_) => OptionMoversWriter {
-                sender: None,
-                buffer: questdb::ingress::Buffer::new(questdb::ingress::ProtocolVersion::V1),
-                pending_count: 0,
-                ilp_conf_string: config.build_ilp_conf_string(),
-                next_reconnect_allowed: Instant::now(),
-                rows_dropped_total: 0,
-                rescue_ring: VecDeque::new(),
-            },
-        };
-        assert!(writer.reconnect_allowed_now());
-        writer.bump_reconnect_throttle();
-        assert!(!writer.reconnect_allowed_now());
-    }
-
-    /// Stock movers counter must saturate at u64::MAX on overflow.
-    #[test]
-    fn test_db7_stock_movers_record_drop_saturates() {
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            http_port: 9000,
-            ilp_port: 9009,
-            pg_port: 8812,
-        };
-        let mut writer = match StockMoversWriter::new(&config) {
-            Ok(w) => w,
-            Err(_) => StockMoversWriter {
-                sender: None,
-                buffer: questdb::ingress::Buffer::new(questdb::ingress::ProtocolVersion::V1),
-                pending_count: 0,
-                ilp_conf_string: config.build_ilp_conf_string(),
-                next_reconnect_allowed: Instant::now(),
-                rows_dropped_total: 0,
-                rescue_ring: VecDeque::new(),
-            },
-        };
-        writer.rows_dropped_total = u64::MAX - 1;
-        let err = anyhow::anyhow!("overflow");
-        writer.record_drop(100, "overflow", &err);
-        assert_eq!(writer.rows_dropped_total(), u64::MAX);
-    }
-
-    /// Pub-fn coverage: `StockMoversWriter::rows_dropped_total()` getter
-    /// on a freshly-constructed writer returns zero.
-    #[test]
-    fn test_db7_stock_movers_rows_dropped_total_starts_zero() {
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            http_port: 9000,
-            ilp_port: 9009,
-            pg_port: 8812,
-        };
-        let writer = match StockMoversWriter::new(&config) {
-            Ok(w) => w,
-            Err(_) => StockMoversWriter {
-                sender: None,
-                buffer: questdb::ingress::Buffer::new(questdb::ingress::ProtocolVersion::V1),
-                pending_count: 0,
-                ilp_conf_string: config.build_ilp_conf_string(),
-                next_reconnect_allowed: Instant::now(),
-                rows_dropped_total: 0,
-                rescue_ring: VecDeque::new(),
-            },
-        };
-        assert_eq!(writer.rows_dropped_total(), 0);
-    }
-
-    /// Pub-fn coverage: `OptionMoversWriter::rows_dropped_total()` getter
-    /// on a freshly-constructed writer returns zero.
-    #[test]
-    fn test_db7_option_movers_rows_dropped_total_starts_zero() {
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            http_port: 9000,
-            ilp_port: 9009,
-            pg_port: 8812,
-        };
-        let writer = match OptionMoversWriter::new(&config) {
-            Ok(w) => w,
-            Err(_) => OptionMoversWriter {
-                sender: None,
-                buffer: questdb::ingress::Buffer::new(questdb::ingress::ProtocolVersion::V1),
-                pending_count: 0,
-                ilp_conf_string: config.build_ilp_conf_string(),
-                next_reconnect_allowed: Instant::now(),
-                rows_dropped_total: 0,
-                rescue_ring: VecDeque::new(),
-            },
-        };
-        assert_eq!(writer.rows_dropped_total(), 0);
-    }
-
-    // -----------------------------------------------------------------------
-    // DB-2: rescue ring (movers)
-    // -----------------------------------------------------------------------
-
-    fn synth_stock_writer() -> StockMoversWriter {
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            http_port: 9000,
-            ilp_port: 9009,
-            pg_port: 8812,
-        };
-        StockMoversWriter {
-            sender: None,
-            buffer: questdb::ingress::Buffer::new(questdb::ingress::ProtocolVersion::V1),
-            pending_count: 0,
-            ilp_conf_string: config.build_ilp_conf_string(),
-            next_reconnect_allowed: Instant::now(),
-            rows_dropped_total: 0,
-            rescue_ring: VecDeque::with_capacity(MOVERS_RESCUE_RING_CAPACITY),
-        }
-    }
-
-    fn synth_option_writer() -> OptionMoversWriter {
-        let config = QuestDbConfig {
-            host: "127.0.0.1".to_string(),
-            http_port: 9000,
-            ilp_port: 9009,
-            pg_port: 8812,
-        };
-        OptionMoversWriter {
-            sender: None,
-            buffer: questdb::ingress::Buffer::new(questdb::ingress::ProtocolVersion::V1),
-            pending_count: 0,
-            ilp_conf_string: config.build_ilp_conf_string(),
-            next_reconnect_allowed: Instant::now(),
-            rows_dropped_total: 0,
-            rescue_ring: VecDeque::with_capacity(MOVERS_RESCUE_RING_CAPACITY),
-        }
-    }
-
-    fn mk_stock_row(ts_nanos: i64) -> BufferedStockMover {
-        BufferedStockMover {
-            ts_nanos,
-            category: "GAINER".to_string(),
-            rank: 1,
-            security_id: 1,
-            segment: "NSE_EQ".to_string(),
-            symbol: "RELIANCE".to_string(),
-            ltp: 100.0,
-            prev_close: 99.0,
-            change_pct: 1.0,
-            volume: 100_000,
-            phase: STOCK_MOVERS_PHASE_MARKET.to_string(),
-        }
-    }
-
-    fn mk_option_row(ts_nanos: i64) -> BufferedOptionMover {
-        BufferedOptionMover {
-            ts_nanos,
-            category: "HIGHEST_OI".to_string(),
-            rank: 1,
-            security_id: 1,
-            segment: "NSE_FNO".to_string(),
-            contract_name: "NIFTY-Jun2026-28500-CE".to_string(),
-            underlying: "NIFTY".to_string(),
-            option_type: "CE".to_string(),
-            strike: 28500.0,
-            expiry: "2026-06-26".to_string(),
-            spot_price: 28550.0,
-            ltp: 150.0,
-            change: 5.0,
-            change_pct: 3.4,
-            oi: 100_000,
-            oi_change: 1_000,
-            oi_change_pct: 1.0,
-            volume: 50_000,
-            value: 7_500_000.0,
-        }
-    }
-
-    #[test]
-    fn test_db2_movers_rescue_ring_capacity_is_bounded() {
-        assert!(MOVERS_RESCUE_RING_CAPACITY >= 500);
-        assert!(MOVERS_RESCUE_RING_CAPACITY <= 50_000);
-    }
-
-    #[test]
-    fn test_db2_stock_rescue_ring_len_starts_zero_and_increments() {
-        let mut writer = synth_stock_writer();
-        assert_eq!(writer.rescue_ring_len(), 0);
-        writer.push_to_rescue_ring(mk_stock_row(1));
-        assert_eq!(writer.rescue_ring_len(), 1);
-        writer.push_to_rescue_ring(mk_stock_row(2));
-        assert_eq!(writer.rescue_ring_len(), 2);
-    }
-
-    #[test]
-    fn test_db2_option_rescue_ring_len_starts_zero_and_increments() {
-        let mut writer = synth_option_writer();
-        assert_eq!(writer.rescue_ring_len(), 0);
-        writer.push_to_rescue_ring(mk_option_row(1));
-        assert_eq!(writer.rescue_ring_len(), 1);
-    }
-
-    #[test]
-    fn test_db2_stock_rescue_ring_is_fifo() {
-        let mut writer = synth_stock_writer();
-        writer.push_to_rescue_ring(mk_stock_row(100));
-        writer.push_to_rescue_ring(mk_stock_row(200));
-        writer.push_to_rescue_ring(mk_stock_row(300));
-        let a = writer.rescue_ring.pop_front().unwrap();
-        let b = writer.rescue_ring.pop_front().unwrap();
-        let c = writer.rescue_ring.pop_front().unwrap();
-        assert_eq!(a.ts_nanos, 100);
-        assert_eq!(b.ts_nanos, 200);
-        assert_eq!(c.ts_nanos, 300);
-    }
-
-    #[test]
-    fn test_db2_option_rescue_ring_is_fifo() {
-        let mut writer = synth_option_writer();
-        writer.push_to_rescue_ring(mk_option_row(100));
-        writer.push_to_rescue_ring(mk_option_row(200));
-        let first = writer.rescue_ring.pop_front().unwrap();
-        let second = writer.rescue_ring.pop_front().unwrap();
-        assert_eq!(first.ts_nanos, 100);
-        assert_eq!(second.ts_nanos, 200);
-    }
-
-    #[test]
-    fn test_db2_stock_rescue_ring_overflow_evicts_oldest_and_counts_drop() {
-        let mut writer = synth_stock_writer();
-        // Pre-fill to capacity directly (bypass push_to_rescue_ring so
-        // we don't run the overflow check N times during setup).
-        for i in 0..MOVERS_RESCUE_RING_CAPACITY {
-            writer
-                .rescue_ring
-                .push_back(mk_stock_row(i64::try_from(i).unwrap_or(i64::MAX)));
-        }
-        assert_eq!(writer.rescue_ring_len(), MOVERS_RESCUE_RING_CAPACITY);
-        assert_eq!(writer.rows_dropped_total(), 0);
-
-        // Push one more — oldest (ts=0) must be evicted.
-        writer.push_to_rescue_ring(mk_stock_row(i64::MAX));
-        assert_eq!(writer.rescue_ring_len(), MOVERS_RESCUE_RING_CAPACITY);
-        assert_eq!(writer.rows_dropped_total(), 1);
-        assert_eq!(writer.rescue_ring.back().unwrap().ts_nanos, i64::MAX);
-        assert_eq!(writer.rescue_ring.front().unwrap().ts_nanos, 1);
-    }
-
-    #[test]
-    fn test_db2_option_rescue_ring_overflow_evicts_oldest_and_counts_drop() {
-        let mut writer = synth_option_writer();
-        for i in 0..MOVERS_RESCUE_RING_CAPACITY {
-            writer
-                .rescue_ring
-                .push_back(mk_option_row(i64::try_from(i).unwrap_or(i64::MAX)));
-        }
-        assert_eq!(writer.rescue_ring_len(), MOVERS_RESCUE_RING_CAPACITY);
-        assert_eq!(writer.rows_dropped_total(), 0);
-        writer.push_to_rescue_ring(mk_option_row(i64::MAX));
-        assert_eq!(writer.rescue_ring_len(), MOVERS_RESCUE_RING_CAPACITY);
-        assert_eq!(writer.rows_dropped_total(), 1);
-    }
-
-    #[test]
-    fn test_db2_buffered_stock_row_size_is_bounded() {
-        let size = std::mem::size_of::<BufferedStockMover>();
-        assert!(
-            size <= 160,
-            "BufferedStockMover size is {size} bytes — if this grows, \
-             re-tune MOVERS_RESCUE_RING_CAPACITY"
-        );
-    }
-
-    #[test]
-    fn test_db2_buffered_option_row_size_is_bounded() {
-        let size = std::mem::size_of::<BufferedOptionMover>();
-        assert!(
-            size <= 320,
-            "BufferedOptionMover size is {size} bytes — if this grows, \
-             re-tune MOVERS_RESCUE_RING_CAPACITY"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // Plan item C3 (2026-04-22): top_movers DDL ratchet tests.
-    // These lock the schema shape — once the writer ships, column renames
-    // become breaking changes across the SEBI 5-year retention window.
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn test_top_movers_ddl_exists_and_names_table() {
-        assert!(
-            TOP_MOVERS_CREATE_DDL.contains("top_movers"),
-            "top_movers DDL must reference the table name"
-        );
-    }
-
-    #[test]
-    fn test_top_movers_ddl_has_required_columns() {
-        let required_columns = [
-            "bucket SYMBOL",
-            "rank_category SYMBOL",
-            "rank INT",
-            "security_id LONG",
-            "symbol SYMBOL",
-            "underlying SYMBOL",
-            "expiry STRING",
-            "strike DOUBLE",
-            "option_type SYMBOL",
-            "ltp DOUBLE",
-            "prev_close DOUBLE",
-            "change_pct DOUBLE",
-            "volume LONG",
-            "value DOUBLE",
-            "oi LONG",
-            "prev_oi LONG",
-            "oi_change_pct DOUBLE",
-            "ts TIMESTAMP",
-        ];
-        for col in required_columns {
-            assert!(
-                TOP_MOVERS_CREATE_DDL.contains(col),
-                "top_movers DDL missing required column `{col}`"
+                sql.contains("last(instrument_type) AS instrument_type"),
+                "timeframe `{tf}` must project instrument_type"
             );
         }
     }
 
     #[test]
-    fn test_top_movers_ddl_is_partitioned_by_day() {
+    fn test_view_ddl_uses_create_materialized_view_if_not_exists() {
+        let sql = movers_view_ddl("5m");
+        assert!(sql.starts_with("CREATE MATERIALIZED VIEW IF NOT EXISTS movers_5m"));
+    }
+
+    #[test]
+    fn test_view_ddl_uses_sample_by() {
+        let sql = movers_view_ddl("1m");
+        assert!(sql.contains("SAMPLE BY 1m"));
+    }
+
+    #[test]
+    fn test_movers_oi_delta_via_last_minus_first() {
+        let sql = movers_view_ddl("5m");
         assert!(
-            TOP_MOVERS_CREATE_DDL.contains("PARTITION BY DAY"),
-            "top_movers must partition by day (SEBI 5-year retention)"
+            sql.contains("last(open_interest) - first(open_interest) AS oi_delta_bucket"),
+            "oi_delta_bucket must be `last - first`, got: {sql}"
         );
     }
 
     #[test]
-    fn test_top_movers_ddl_is_wal_enabled() {
+    fn test_movers_volume_bucket_via_last_minus_first() {
+        let sql = movers_view_ddl("5m");
         assert!(
-            TOP_MOVERS_CREATE_DDL.contains("WAL"),
-            "top_movers must be WAL for append-only durability"
+            sql.contains("last(volume) - first(volume) AS volume_bucket"),
+            "volume_bucket must be `last - first`, got: {sql}"
         );
     }
 
     #[test]
-    fn test_top_movers_ddl_designated_ts_is_ts() {
+    fn test_movers_change_pct_uses_case_when_prev_close_positive() {
+        let sql = movers_view_ddl("1h");
         assert!(
-            TOP_MOVERS_CREATE_DDL.contains("TIMESTAMP(ts)"),
-            "top_movers designated timestamp must be `ts`"
+            sql.contains("CASE WHEN last(prev_close) > 0"),
+            "change_pct_session must guard prev_close > 0, got: {sql}"
+        );
+        assert!(
+            sql.contains("CASE WHEN first(last_price) > 0"),
+            "change_pct_bucket must guard first(last_price) > 0, got: {sql}"
+        );
+        assert!(sql.contains("AS change_pct_session"));
+        assert!(sql.contains("AS change_pct_bucket"));
+    }
+
+    #[test]
+    fn test_movers_all_24_views_have_align_to_calendar_with_offset() {
+        for tf in MOVERS_VIEW_TIMEFRAMES {
+            let sql = movers_view_ddl(tf);
+            assert!(
+                sql.contains("ALIGN TO CALENDAR WITH OFFSET '00:00'"),
+                "tf {tf} missing ALIGN TO CALENDAR offset"
+            );
+        }
+    }
+
+    #[test]
+    fn test_movers_includes_bucket_ohlc_columns() {
+        let sql = movers_view_ddl("5m");
+        assert!(sql.contains("first(last_price) AS open_price_bucket"));
+        assert!(sql.contains("max(last_price) AS high_price_bucket"));
+        assert!(sql.contains("min(last_price) AS low_price_bucket"));
+    }
+
+    #[test]
+    fn test_movers_volume_cumulative_uses_last() {
+        let sql = movers_view_ddl("5m");
+        assert!(
+            sql.contains("last(volume) AS volume_cumulative"),
+            "volume_cumulative must use last() of the cumulative base"
         );
     }
 
     #[test]
-    fn test_top_movers_table_name_constant_matches_ddl() {
+    fn test_movers_ddl_no_sum_volume_anywhere() {
+        // Volume is cumulative per Item 26 L1; summing across buckets
+        // double/triple-counts.
+        for tf in MOVERS_VIEW_TIMEFRAMES {
+            let sql = movers_view_ddl(tf);
+            assert!(
+                !sql.contains("sum(volume)"),
+                "tf {tf}: BANNED `sum(volume)` appeared: {sql}"
+            );
+            assert!(
+                !sql.contains("sum(open_interest)"),
+                "tf {tf}: BANNED `sum(open_interest)` appeared"
+            );
+        }
+    }
+
+    #[test]
+    fn test_movers_ddl_no_sum_volume_source_scan() {
+        let src = include_str!("movers_persistence.rs");
+        let prod_src = src
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .map(|(p, _)| p)
+            .unwrap_or(src);
+        assert!(
+            !prod_src.contains("sum(volume)"),
+            "BANNED `sum(volume)` found in production source"
+        );
+        assert!(
+            !prod_src.contains("sum(open_interest)"),
+            "BANNED `sum(open_interest)` found in production source"
+        );
+    }
+
+    #[test]
+    fn test_view_ddl_reads_from_movers_1s_base_table() {
+        let sql = movers_view_ddl("5m");
+        assert!(sql.contains("FROM movers_1s"));
+    }
+
+    #[test]
+    fn test_view_ddl_for_every_timeframe_starts_with_create_materialized() {
+        for tf in MOVERS_VIEW_TIMEFRAMES {
+            let sql = movers_view_ddl(tf);
+            assert!(
+                sql.starts_with("CREATE MATERIALIZED VIEW IF NOT EXISTS"),
+                "tf {tf}: not mat-view DDL"
+            );
+            assert!(
+                sql.contains(&format!("movers_{tf}")),
+                "tf {tf}: view name mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn test_movers_1s_create_ddl_returns_non_empty_string() {
+        let ddl = movers_1s_create_ddl();
+        assert!(!ddl.is_empty());
+        assert!(ddl.contains(QUESTDB_TABLE_MOVERS_1S));
+    }
+
+    #[test]
+    fn test_movers_view_ddl_includes_timeframe_in_view_name() {
+        let sql = movers_view_ddl("30m");
+        assert!(sql.contains("movers_30m"));
+        assert!(sql.contains("SAMPLE BY 30m"));
+    }
+
+    #[test]
+    fn test_each_timeframe_produces_distinct_ddl() {
+        let mut seen = std::collections::HashSet::new();
+        for tf in MOVERS_VIEW_TIMEFRAMES {
+            let sql = movers_view_ddl(tf);
+            assert!(seen.insert(sql), "tf {tf} produced duplicate DDL");
+        }
+        assert_eq!(seen.len(), MOVERS_VIEW_COUNT);
+    }
+
+    #[test]
+    fn test_legacy_22tf_timeframes_count_is_25() {
+        // Pinned: the deleted 22tf design had 25 standalone tables.
+        assert_eq!(LEGACY_22TF_TIMEFRAMES.len(), 25);
+    }
+
+    #[test]
+    fn test_legacy_unified_view_timeframes_are_subset_of_new_views() {
+        // Audit-2026-05-03: the canonical mat-view set added `10s`. The
+        // legacy `movers_unified_*` drop list still reflects what existed
+        // pre-rename (24 entries, no `10s` — `movers_unified_10s` never
+        // existed in QuestDB). Assert subset relation: every legacy entry
+        // MUST be in the new set so the DROP migration is well-formed.
+        // Strict equality no longer holds because the new set is a strict
+        // superset post-`10s` addition.
+        for legacy_tf in LEGACY_UNIFIED_VIEW_TIMEFRAMES {
+            assert!(
+                MOVERS_VIEW_TIMEFRAMES.contains(legacy_tf),
+                "LEGACY_UNIFIED_VIEW_TIMEFRAMES contains `{legacy_tf}` \
+                 not present in MOVERS_VIEW_TIMEFRAMES — drop list drift"
+            );
+        }
+        // The new set has exactly ONE more entry than the legacy set:
+        // the `10s` mat view added in Audit-2026-05-03.
         assert_eq!(
-            QUESTDB_TABLE_TOP_MOVERS, "top_movers",
-            "table name constant must match DDL"
+            MOVERS_VIEW_TIMEFRAMES.len(),
+            LEGACY_UNIFIED_VIEW_TIMEFRAMES.len() + 1,
+            "new mat-view set should be exactly +1 (the new `10s` view) \
+             vs legacy unified drop list"
+        );
+        let new_only: Vec<&&str> = MOVERS_VIEW_TIMEFRAMES
+            .iter()
+            .filter(|tf| !LEGACY_UNIFIED_VIEW_TIMEFRAMES.contains(tf))
+            .collect();
+        assert_eq!(new_only, vec![&"10s"], "the only new entry must be `10s`");
+    }
+
+    #[test]
+    fn test_migration_marker_name_pinned() {
+        assert_eq!(MIGRATION_MARKER_TABLE, "movers_migration_2026_05_01");
+    }
+
+    /// Audit-2026-05-03 ratchet: separate marker for the legacy-retire
+    /// migration. Pin the name so a future rename can't silently make
+    /// the migration run twice (would attempt to DROP an
+    /// already-dropped table — `IF EXISTS` makes it safe but noisy).
+    #[test]
+    fn test_legacy_retire_marker_name_pinned() {
+        assert_eq!(
+            LEGACY_RETIRE_MARKER_TABLE,
+            "movers_legacy_retire_2026_05_03"
+        );
+    }
+
+    /// Audit-2026-05-03 ratchet: drop list MUST exactly match the
+    /// legacy writer outputs. Adding a third table to drop without
+    /// updating both the const + this test = build break.
+    #[test]
+    fn test_legacy_retire_drop_tables_pinned_to_two() {
+        assert_eq!(LEGACY_RETIRE_DROP_TABLES.len(), 2);
+        assert!(LEGACY_RETIRE_DROP_TABLES.contains(&"stock_movers"));
+        assert!(LEGACY_RETIRE_DROP_TABLES.contains(&"option_movers"));
+    }
+
+    /// Audit-2026-05-03 ratchet: the legacy-retire marker MUST NOT
+    /// share a name with the existing 2026-05-01 cleanup marker.
+    /// Sharing would mean the new migration never runs on databases
+    /// that already booted prior to this PR.
+    #[test]
+    fn test_legacy_retire_marker_distinct_from_2026_05_01_marker() {
+        assert_ne!(
+            LEGACY_RETIRE_MARKER_TABLE, MIGRATION_MARKER_TABLE,
+            "markers must be distinct so the new DROP runs on existing DBs"
         );
     }
 
     #[test]
-    fn test_top_movers_dedup_key_covers_bucket_category_rank() {
-        // All three are required so different buckets / categories / ranks
-        // within the same second do NOT collide. Matches the plan C spec.
-        assert!(DEDUP_KEY_TOP_MOVERS.contains("bucket"));
-        assert!(DEDUP_KEY_TOP_MOVERS.contains("rank_category"));
-        assert!(DEDUP_KEY_TOP_MOVERS.contains("rank"));
-    }
-
-    // -----------------------------------------------------------------------
-    // Plan items C, D, I (2026-04-25): timeframe + segment columns + DEDUP
-    // + ALTER self-heal. Catches accidental schema reverts.
-    // -----------------------------------------------------------------------
-
-    /// Item C.1: the DDL declares a `timeframe SYMBOL` column. Without
-    /// this, every snapshot row would have a NULL timeframe and the 15
-    /// timeframes (1m..15m) cannot be distinguished at query time.
-    #[test]
-    fn test_top_movers_ddl_contains_timeframe_column() {
-        assert!(
-            TOP_MOVERS_CREATE_DDL.contains("timeframe SYMBOL"),
-            "top_movers DDL must declare a `timeframe SYMBOL` column"
-        );
-    }
-
-    /// Item C.2: the DDL declares a `segment SYMBOL` column. Required for
-    /// I-P1-11 cross-segment composite key (e.g. id=27 IDX_I vs NSE_EQ).
-    #[test]
-    fn test_top_movers_ddl_contains_segment_column() {
-        assert!(
-            TOP_MOVERS_CREATE_DDL.contains("segment SYMBOL"),
-            "top_movers DDL must declare a `segment SYMBOL` column for I-P1-11"
-        );
-    }
-
-    /// Item C.3: DEDUP key includes `timeframe` so 1m and 5m rows at the
-    /// same second do not collide.
-    #[test]
-    fn test_top_movers_dedup_key_includes_timeframe() {
-        assert!(
-            DEDUP_KEY_TOP_MOVERS.contains("timeframe"),
-            "DEDUP_KEY_TOP_MOVERS must include `timeframe` — without it, \
-             snapshots from different timeframes at the same second collide"
-        );
-    }
-
-    /// Item C.4: DEDUP key includes `security_id` AND `segment`. Per
-    /// I-P1-11, `security_id` alone is not unique — Dhan reuses ids
-    /// across segments (e.g. FINNIFTY id=27 IDX_I + a stock id=27 NSE_EQ).
-    #[test]
-    fn test_top_movers_dedup_key_includes_security_id_and_segment() {
-        assert!(
-            DEDUP_KEY_TOP_MOVERS.contains("security_id"),
-            "DEDUP_KEY_TOP_MOVERS must include `security_id` for I-P1-11"
-        );
-        assert!(
-            DEDUP_KEY_TOP_MOVERS.contains("segment"),
-            "DEDUP_KEY_TOP_MOVERS must include `segment` for I-P1-11"
-        );
-    }
-
-    /// Item I.1: ALTER DDL for the new `timeframe` column uses
-    /// `IF NOT EXISTS` so it is safe to run on every boot. Without this
-    /// idempotency, pre-2026-04-25 deployments would crash at boot.
-    #[test]
-    fn test_top_movers_alter_ddl_timeframe_is_idempotent() {
-        assert!(
-            TOP_MOVERS_ALTER_DDL_TIMEFRAME.contains("ADD COLUMN IF NOT EXISTS"),
-            "ALTER for `timeframe` must use ADD COLUMN IF NOT EXISTS"
-        );
-        assert!(
-            TOP_MOVERS_ALTER_DDL_TIMEFRAME.contains("timeframe SYMBOL"),
-            "ALTER must declare the new column type as SYMBOL"
-        );
-    }
-
-    /// Item I.2: ALTER DDL for the new `segment` column is also
-    /// idempotent for the same reason as I.1.
-    #[test]
-    fn test_top_movers_alter_ddl_segment_is_idempotent() {
-        assert!(
-            TOP_MOVERS_ALTER_DDL_SEGMENT.contains("ADD COLUMN IF NOT EXISTS"),
-            "ALTER for `segment` must use ADD COLUMN IF NOT EXISTS"
-        );
-        assert!(
-            TOP_MOVERS_ALTER_DDL_SEGMENT.contains("segment SYMBOL"),
-            "ALTER must declare the new column type as SYMBOL"
-        );
-    }
-
-    /// Item D.4: TopMoverRow has dedicated `timeframe` and `segment`
-    /// fields. Catches accidental field removal in a refactor.
-    #[test]
-    fn test_top_mover_row_has_timeframe_and_segment_fields() {
-        let row = sample_price_row();
-        // If either field name is removed by a future refactor, this
-        // ceases to compile — the test is a compile-time ratchet too.
-        assert_eq!(row.timeframe, "1m");
-        assert_eq!(row.segment, "NSE_EQ");
-    }
-
-    // -----------------------------------------------------------------------
-    // Plan item C2 (2026-04-22): TopMoverRow wire shape ratchets
-    // -----------------------------------------------------------------------
-
-    fn sample_derivative_row() -> TopMoverRow {
-        TopMoverRow {
-            ts_nanos: 1_700_000_000_000_000_000,
-            timeframe: "1m",
-            bucket: "index_options".to_string(),
-            rank_category: "top_oi".to_string(),
-            rank: 1,
-            security_id: 49_081,
-            segment: "NSE_FNO",
-            symbol: "NIFTY 25000 CE 28-APR".to_string(),
-            underlying: Some("NIFTY".to_string()),
-            expiry: Some("2026-04-28".to_string()),
-            strike: Some(25_000.0),
-            option_type: Some("CE".to_string()),
-            ltp: 162.15,
-            prev_close: 290.30,
-            change_pct: -44.14,
-            volume: 122_023_330,
-            value: 19_786_775_434.5,
-            oi: 8_017_880,
-            prev_oi: 4_673_565,
-            oi_change_pct: 71.56,
-        }
-    }
-
-    fn sample_price_row() -> TopMoverRow {
-        TopMoverRow {
-            ts_nanos: 1_700_000_000_000_000_000,
-            timeframe: "1m",
-            bucket: "stocks".to_string(),
-            rank_category: "gainers".to_string(),
-            rank: 1,
-            security_id: 1_333,
-            segment: "NSE_EQ",
-            symbol: "RELIANCE".to_string(),
-            underlying: None,
-            expiry: None,
-            strike: None,
-            option_type: None,
-            ltp: 1_368.10,
-            prev_close: 1_265.30,
-            change_pct: 8.12,
-            volume: 6_551_573,
-            value: 8_963_200_000.0,
-            oi: 0,
-            prev_oi: 0,
-            oi_change_pct: 0.0,
-        }
-    }
-
-    #[test]
-    fn test_top_mover_row_fields_match_ddl_columns() {
-        // Every field referenced in append_row_to_buffer MUST be present in
-        // the DDL column list.
-        let required = [
-            "bucket",
-            "rank_category",
-            "rank",
-            "security_id",
-            "symbol",
-            "underlying",
-            "expiry",
-            "strike",
-            "option_type",
-            "ltp",
-            "prev_close",
-            "change_pct",
-            "volume",
-            "value",
-            "oi",
-            "prev_oi",
-            "oi_change_pct",
-            "ts",
-        ];
-        for col in required {
+    fn test_legacy_22tf_only_set_excludes_new_view_timeframes() {
+        // Fix E audit logic depends on this set: "names that exist ONLY
+        // in the dead 22tf list, NOT in the new mat-view list". If both
+        // sets share a name, that name is legitimately a new mat view
+        // and shouldn't be flagged as a stale 22tf table by the audit.
+        let legacy_only: Vec<&'static str> = LEGACY_22TF_TIMEFRAMES
+            .iter()
+            .copied()
+            .filter(|tf| !MOVERS_VIEW_TIMEFRAMES.contains(tf))
+            .collect();
+        // Audit-2026-05-03: `10s` was promoted to the canonical mat-view
+        // set, so it is no longer in the "legacy-22tf-only" subset. The
+        // remaining 4 names (1s, 2s, 3s, 20s) are still legacy-only:
+        //   1s (the new BASE table — not a view, audit must exclude it
+        //       via the QUESTDB_TABLE_MOVERS_1S filter)
+        //   2s, 3s, 20s (sub-minute names dropped from canonical design)
+        for expected in ["1s", "2s", "3s", "20s"] {
             assert!(
-                TOP_MOVERS_CREATE_DDL.contains(col),
-                "DDL missing column `{col}` that the V2 writer emits"
+                legacy_only.contains(&expected),
+                "legacy-22tf-only set must contain `{expected}` (got: {legacy_only:?})"
             );
         }
-    }
-
-    #[test]
-    fn test_top_mover_row_derivative_vs_price_optional_fields() {
-        let deriv = sample_derivative_row();
-        assert!(deriv.underlying.is_some());
-        assert!(deriv.expiry.is_some());
-        assert!(deriv.strike.is_some());
-        assert!(deriv.option_type.is_some());
-        assert!(deriv.oi > 0);
-
-        let price = sample_price_row();
-        assert!(price.underlying.is_none());
-        assert!(price.expiry.is_none());
-        assert!(price.strike.is_none());
-        assert!(price.option_type.is_none());
-        // Price buckets emit oi=0 rather than omitting — DDL column is NOT NULL-able.
-        assert_eq!(price.oi, 0);
-        assert_eq!(price.oi_change_pct, 0.0);
-    }
-
-    #[test]
-    fn test_top_mover_row_append_to_buffer_fresh_questdb_buffer() {
-        // Structural test: verify append_row_to_buffer does not panic for
-        // both a derivative row (with all optional fields populated) and
-        // a price row (with all optional fields None). We cannot flush to
-        // QuestDB without a live instance — this just exercises the column
-        // ordering + symbol/str conversions.
-        let mut buffer = Buffer::new(ProtocolVersion::V1);
-        TopMoversV2Writer::append_row_to_buffer(&mut buffer, &sample_derivative_row())
-            .expect("derivative row should append cleanly");
-        TopMoversV2Writer::append_row_to_buffer(&mut buffer, &sample_price_row())
-            .expect("price row should append cleanly");
-        // Buffer should now contain two line-protocol rows. len_bytes > 0.
+        // Negative pin: `10s` is canonical, NOT legacy-only.
         assert!(
-            !buffer.is_empty(),
-            "buffer must have content after two appends"
+            !legacy_only.contains(&"10s"),
+            "legacy-22tf-only set MUST NOT contain `10s` after Audit-2026-05-03 \
+             promoted it to the canonical mat-view set"
         );
     }
 
     #[test]
-    fn test_top_mover_row_drops_are_tracked_on_zero_flush_path() {
-        // Without constructing a real Sender we cannot test the full flush,
-        // but we can at least verify the public getters are exposed and zero
-        // after a fresh construction attempt failure (we don't try to connect).
-        // This is a compile-time + default-state ratchet: changes to
-        // `rows_dropped_total` or `rescue_ring_len` must remain observable.
-        fn assert_observable<T: Sized>(_: &T) {}
-        // No actual Writer construction — the getters are method signatures
-        // whose visibility is asserted below via `fn pointer` coercions.
-        let rows_dropped: fn(&TopMoversV2Writer) -> u64 = TopMoversV2Writer::rows_dropped_total;
-        let rescue_len: fn(&TopMoversV2Writer) -> usize = TopMoversV2Writer::rescue_ring_len;
-        let rows_written: fn(&TopMoversV2Writer) -> u64 = TopMoversV2Writer::rows_written_total;
-        assert_observable(&rows_dropped);
-        assert_observable(&rescue_len);
-        assert_observable(&rows_written);
+    fn test_audit_excludes_base_table_name_to_avoid_false_positive() {
+        // Regression guard for the PR #423 live-boot false positive: the
+        // audit reported `movers_1s` as a "stale 22tf table" but it IS
+        // the new base table. The Fix E audit must exclude
+        // `QUESTDB_TABLE_MOVERS_1S` from the candidate stale set.
+        //
+        // Reproduce the same filter chain the audit uses, then confirm
+        // `movers_1s` is NOT in the final candidate names.
+        let candidate_names: Vec<String> = LEGACY_22TF_TIMEFRAMES
+            .iter()
+            .copied()
+            .filter(|tf| !MOVERS_VIEW_TIMEFRAMES.contains(tf))
+            .filter(|tf| {
+                let name = format!("movers_{tf}");
+                name != QUESTDB_TABLE_MOVERS_1S
+            })
+            .map(|tf| format!("movers_{tf}"))
+            .collect();
+        assert!(
+            !candidate_names.iter().any(|n| n == QUESTDB_TABLE_MOVERS_1S),
+            "audit candidate set must NOT include the new base table `{QUESTDB_TABLE_MOVERS_1S}`"
+        );
+        // Audit-2026-05-03: `10s` was promoted to canonical, so
+        // `movers_10s` is no longer a stale-table candidate. The other
+        // legacy-only sub-minute names (2s, 3s, 20s) still are.
+        for expected_stale in ["movers_2s", "movers_3s", "movers_20s"] {
+            assert!(
+                candidate_names.iter().any(|n| n == expected_stale),
+                "audit candidate set must still include `{expected_stale}` (got: {candidate_names:?})"
+            );
+        }
+        // Negative pin: `movers_10s` MUST NOT be in the audit candidate
+        // set after the promotion — otherwise the cleanup migration
+        // would attempt to DROP the new canonical mat view.
+        assert!(
+            !candidate_names.iter().any(|n| n == "movers_10s"),
+            "audit candidate set MUST NOT include `movers_10s` after Audit-2026-05-03 \
+             promoted it to the canonical mat-view set"
+        );
     }
 
     #[test]
-    fn test_top_movers_rescue_ring_capacity_shared_with_legacy_writers() {
-        // The V2 writer MUST reuse the same capacity constant as the legacy
-        // stock/option writers so operational tuning stays in one place.
-        assert_eq!(MOVERS_RESCUE_RING_CAPACITY, 5_000);
+    fn test_ddl_outcome_struct_carries_status_and_body() {
+        // Pub-fn substring-match guard pin for `DdlOutcome`. The Fix A
+        // contract is "log status + body verbatim on failure"; this
+        // ratchets the struct shape so a future cleanup that strips
+        // either field would break the build.
+        let outcome = DdlOutcome {
+            success: false,
+            status: "400 Bad Request".to_string(),
+            body: r#"{"error":"unsupported SAMPLE BY interval"}"#.to_string(),
+        };
+        assert!(!outcome.success);
+        assert_eq!(outcome.status, "400 Bad Request");
+        assert!(outcome.body.contains("error"));
+        assert!(outcome.body.contains("SAMPLE BY"));
     }
 
     #[test]
-    fn test_top_movers_batch_size_matches_legacy_writers() {
-        // Must reuse the same batch-size constant — auto-flush boundary
-        // behaviour is identical across the three writers.
-        assert_eq!(MOVERS_FLUSH_BATCH_SIZE, 250);
+    fn test_view_count_invariant_holds_against_new_mat_view_set() {
+        // Fix C's post-verify loop iterates MOVERS_VIEW_TIMEFRAMES; the
+        // count drives the operator-visible "missing X of N" log. Pin
+        // the invariant so a future timeframe addition can't silently
+        // skew the audit. Audit-2026-05-03: bumped from 24 → 25.
+        assert_eq!(MOVERS_VIEW_TIMEFRAMES.len(), MOVERS_VIEW_COUNT);
+        assert_eq!(MOVERS_VIEW_COUNT, 25);
     }
 }

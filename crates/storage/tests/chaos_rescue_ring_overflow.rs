@@ -22,7 +22,13 @@ use std::time::Instant;
 
 use tickvault_common::config::QuestDbConfig;
 use tickvault_storage::indicator_snapshot_persistence::IndicatorSnapshotWriter;
-use tickvault_storage::movers_persistence::{OptionMoversWriter, StockMoversWriter};
+// PR #457 (2026-05-04): legacy `StockMoversWriter` + `OptionMoversWriter`
+// imports DELETED — the legacy `stock_movers` + `option_movers` tables
+// were DROP-migrated by PR #449 and the writers became unused. The
+// canonical `MoversBaseWriter` (which writes the `movers_1s` base table
+// powering all 25 mat-views) has its own rescue-ring chaos coverage in
+// `crates/storage/tests/movers_persistence_*.rs`.
+// use tickvault_storage::movers_persistence::{OptionMoversWriter, StockMoversWriter};
 
 fn unreachable_config() -> QuestDbConfig {
     QuestDbConfig {
@@ -66,33 +72,11 @@ fn test_chaos_indicator_snapshot_ring_overflow_no_panic() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Stock movers rescue ring
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_chaos_stock_movers_ring_overflow_no_panic() {
-    let config = unreachable_config();
-    let result = StockMoversWriter::new(&config);
-    assert!(
-        result.is_err(),
-        "StockMoversWriter::new on unreachable host must return Err, not panic"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Option movers rescue ring
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_chaos_option_movers_ring_overflow_no_panic() {
-    let config = unreachable_config();
-    let result = OptionMoversWriter::new(&config);
-    assert!(
-        result.is_err(),
-        "OptionMoversWriter::new on unreachable host must return Err, not panic"
-    );
-}
+// PR #457 (2026-05-04): test_chaos_stock_movers_ring_overflow_no_panic
+// + test_chaos_option_movers_ring_overflow_no_panic REMOVED. The
+// legacy `StockMoversWriter` + `OptionMoversWriter` are deleted in
+// this PR. The canonical `MoversBaseWriter` rescue-ring chaos coverage
+// lives in `crates/storage/tests/movers_persistence_*.rs`.
 
 // ---------------------------------------------------------------------------
 // Accessor contract: rows_dropped_total starts at zero
@@ -116,14 +100,9 @@ fn test_chaos_all_writers_drop_count_starts_zero_if_constructable() {
         assert_eq!(w.rows_dropped_total(), 0);
         assert_eq!(w.rescue_ring_len(), 0);
     }
-    if let Ok(w) = StockMoversWriter::new(&config) {
-        assert_eq!(w.rows_dropped_total(), 0);
-        assert_eq!(w.rescue_ring_len(), 0);
-    }
-    if let Ok(w) = OptionMoversWriter::new(&config) {
-        assert_eq!(w.rows_dropped_total(), 0);
-        assert_eq!(w.rescue_ring_len(), 0);
-    }
+    // PR #457: StockMoversWriter / OptionMoversWriter blocks removed —
+    // the writers are deleted alongside the legacy stock_movers /
+    // option_movers tables. Coverage moved to MoversBaseWriter tests.
 }
 
 // ---------------------------------------------------------------------------
@@ -145,19 +124,6 @@ fn test_chaos_writer_construction_does_not_block_on_unreachable_host() {
         "IndicatorSnapshotWriter::new on unreachable host took {elapsed:?} — must not block"
     );
 
-    let start = Instant::now();
-    let _result = StockMoversWriter::new(&config);
-    let elapsed = start.elapsed();
-    assert!(
-        elapsed.as_secs() < 5,
-        "StockMoversWriter::new on unreachable host took {elapsed:?} — must not block"
-    );
-
-    let start = Instant::now();
-    let _result = OptionMoversWriter::new(&config);
-    let elapsed = start.elapsed();
-    assert!(
-        elapsed.as_secs() < 5,
-        "OptionMoversWriter::new on unreachable host took {elapsed:?} — must not block"
-    );
+    // PR #457: StockMoversWriter / OptionMoversWriter timing blocks
+    // removed alongside the writer types.
 }

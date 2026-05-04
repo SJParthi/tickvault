@@ -132,7 +132,7 @@ pub fn build_category_targets(cat: LogCategory) -> &'static [&'static str] {
             "tickvault_core::pipeline::option_movers",
             "tickvault_core::pipeline::top_movers",
             "tickvault_storage::movers_persistence",
-            "tickvault_storage::movers_base_persistence",
+            "tickvault_storage::movers_persistence",
             "tickvault_storage::movers_base_query",
             "tickvault_storage::movers_writer",
         ],
@@ -1275,7 +1275,7 @@ mod tests {
             "tickvault_core::pipeline::option_movers",
             "tickvault_core::pipeline::top_movers",
             "tickvault_storage::movers_persistence",
-            "tickvault_storage::movers_base_persistence",
+            "tickvault_storage::movers_persistence",
             "tickvault_storage::movers_base_query",
             "tickvault_storage::movers_writer",
         ];

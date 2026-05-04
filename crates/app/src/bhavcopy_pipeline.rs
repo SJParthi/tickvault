@@ -53,7 +53,7 @@ use tickvault_core::instrument::bhavcopy_scheduler::{
 };
 use tickvault_core::notification::events::NotificationEvent;
 use tickvault_core::notification::service::NotificationService;
-use tickvault_storage::movers_base_persistence::QUESTDB_TABLE_MOVERS_1S;
+use tickvault_storage::movers_persistence::QUESTDB_TABLE_MOVERS_1S;
 use tickvault_storage::volume_nse_audit_persistence::{
     append_volume_nse_audit_row, ensure_volume_nse_audit_table,
 };
