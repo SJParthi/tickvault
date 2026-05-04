@@ -1276,10 +1276,51 @@ const TICKS_CREATE_DDL: &str = "\
         gamma DOUBLE,\
         theta DOUBLE,\
         vega DOUBLE,\
+        volume_delta LONG,\
+        prev_day_close DOUBLE,\
+        prev_day_oi LONG,\
+        phase SYMBOL,\
         received_at TIMESTAMP,\
         ts TIMESTAMP\
     ) TIMESTAMP(ts) PARTITION BY HOUR WAL\
 ";
+
+/// Phase 1 lifecycle columns added to the `ticks` table by the
+/// 29-timeframes-engine plan (`active-plan-29-tf-and-movers-deletion.md`).
+///
+/// Columns sit empty after Phase 1 — Phase 2 wires the populating writers
+/// (`prev_day_close` first-seen stamper, `prev_day_oi` boot cache,
+/// `volume_delta` per-tick derivation, `phase` pure-fn classifier).
+///
+/// Layout pairs `(column_name, questdb_type)`. The schema-self-heal helper
+/// runs `ALTER TABLE ticks ADD COLUMN <name> <type>` for each row at boot;
+/// QuestDB rejects already-existing columns with a non-fatal error that the
+/// caller safely ignores, making the loop idempotent across restarts.
+///
+/// **Greenfield/brownfield column-order divergence (intentional):**
+/// fresh `CREATE TABLE` lists these columns BEFORE `received_at, ts`. A
+/// brownfield (existing) database picks them up via `ALTER ADD COLUMN`,
+/// which appends at the END — so `received_at, ts` precede the new
+/// columns physically.
+///
+/// This is intentional and SAFE because:
+/// (a) ILP writes name columns explicitly (`build_tick_row` etc.) — never
+/// positional;
+/// (b) SELECT/SQL queries name columns explicitly — never positional;
+/// (c) DEDUP UPSERT KEYS reference column names, not positions;
+/// (d) materialized view DDL projects columns by name via `last(col)`.
+///
+/// The greenfield order is preferred only because it groups lifecycle
+/// columns together visually; the divergence does not affect behavior.
+/// Test `test_ticks_phase1_lifecycle_columns_match_create_ddl` asserts
+/// each (name, type) pair appears in the CREATE DDL; positional order
+/// is deliberately NOT pinned.
+pub(crate) const TICKS_PHASE1_LIFECYCLE_COLUMNS: &[(&str, &str)] = &[
+    ("volume_delta", "LONG"),
+    ("prev_day_close", "DOUBLE"),
+    ("prev_day_oi", "LONG"),
+    ("phase", "SYMBOL"),
+];
 
 /// Creates the `ticks` table (if not exists) and enables DEDUP UPSERT KEYS.
 ///
@@ -1402,7 +1443,29 @@ pub async fn ensure_tick_table_dedup_keys(questdb_config: &QuestDbConfig) {
     }
     info!("ticks table Greeks columns ensured (idempotent ADD COLUMN)");
 
-    info!("ticks table setup complete (DDL + DEDUP UPSERT KEYS + Greeks migration)");
+    // Step 4: Add Phase 1 lifecycle columns (29-timeframes engine plan).
+    // Columns sit empty until Phase 2 populates them; Phase 1 only widens the
+    // schema. Same idempotent ALTER pattern as Greeks above. Identifiers are
+    // double-quoted (defence-in-depth — these are compile-time `&'static str`
+    // constants today, but the pattern shouldn't rely on call-site discipline).
+    for (col, ty) in TICKS_PHASE1_LIFECYCLE_COLUMNS {
+        let alter_sql = format!(
+            "ALTER TABLE \"{}\" ADD COLUMN \"{}\" {}",
+            QUESTDB_TABLE_TICKS, col, ty
+        );
+        drop(
+            client
+                .get(&base_url)
+                .query(&[("query", &alter_sql)])
+                .send()
+                .await,
+        );
+    }
+    info!("ticks table Phase 1 lifecycle columns ensured (idempotent ADD COLUMN)");
+
+    info!(
+        "ticks table setup complete (DDL + DEDUP UPSERT KEYS + Greeks + Phase 1 lifecycle migration)"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -3216,6 +3279,66 @@ mod tests {
         assert!(TICKS_CREATE_DDL.contains("gamma DOUBLE"));
         assert!(TICKS_CREATE_DDL.contains("theta DOUBLE"));
         assert!(TICKS_CREATE_DDL.contains("vega DOUBLE"));
+    }
+
+    /// Phase 1 ratchet (29-timeframes engine plan): the four lifecycle columns
+    /// MUST appear in the `ticks` DDL so a fresh QuestDB volume gets the wide
+    /// schema directly, not via boot-time ALTER. This pins the column types so
+    /// a future drift to the wrong storage type fails the build.
+    #[test]
+    fn test_ticks_ddl_has_phase1_lifecycle_columns() {
+        assert!(
+            TICKS_CREATE_DDL.contains("volume_delta LONG"),
+            "ticks DDL must declare volume_delta LONG (per-tick incremental volume)"
+        );
+        assert!(
+            TICKS_CREATE_DDL.contains("prev_day_close DOUBLE"),
+            "ticks DDL must declare prev_day_close DOUBLE (frozen per trading day)"
+        );
+        assert!(
+            TICKS_CREATE_DDL.contains("prev_day_oi LONG"),
+            "ticks DDL must declare prev_day_oi LONG (frozen per trading day)"
+        );
+        assert!(
+            TICKS_CREATE_DDL.contains("phase SYMBOL"),
+            "ticks DDL must declare phase SYMBOL (PREMARKET/PREOPEN/OPEN/POSTAUCTION/CLOSED)"
+        );
+    }
+
+    /// Phase 1 ratchet: the lifecycle column constant MUST list exactly the
+    /// four columns described in the plan, in the order the schema-self-heal
+    /// helper iterates them. Drift here = unmigrated brownfield databases.
+    #[test]
+    fn test_ticks_phase1_lifecycle_column_constant_is_pinned() {
+        let pairs: Vec<(&str, &str)> = TICKS_PHASE1_LIFECYCLE_COLUMNS.to_vec();
+        assert_eq!(
+            pairs,
+            vec![
+                ("volume_delta", "LONG"),
+                ("prev_day_close", "DOUBLE"),
+                ("prev_day_oi", "LONG"),
+                ("phase", "SYMBOL"),
+            ],
+            "TICKS_PHASE1_LIFECYCLE_COLUMNS pinned to the plan-locked column \
+             list — drift would split the brownfield ALTER chain from the \
+             greenfield CREATE"
+        );
+    }
+
+    /// Phase 1 ratchet: every entry in `TICKS_PHASE1_LIFECYCLE_COLUMNS` must
+    /// also appear in the CREATE DDL with the same QuestDB type — otherwise a
+    /// fresh table and an ALTERed table diverge.
+    #[test]
+    fn test_ticks_phase1_lifecycle_columns_match_create_ddl() {
+        for (col, ty) in TICKS_PHASE1_LIFECYCLE_COLUMNS {
+            let needle = format!("{} {}", col, ty);
+            assert!(
+                TICKS_CREATE_DDL.contains(&needle),
+                "TICKS_CREATE_DDL must contain '{}' so fresh tables match \
+                 the brownfield ALTER schema",
+                needle
+            );
+        }
     }
 
     #[tokio::test]
