@@ -124,7 +124,9 @@ fn tick_persistence_emits_spill_dropped_total_with_reason_label() {
 fn tick_persistence_buffer_capacity_is_at_least_one_lakh() {
     // TICK_BUFFER_CAPACITY must stay above 100K to absorb normal market
     // bursts without spill-to-disk. The exact floor is 100_000; current
-    // value is 600_000 per the docstring. Checked via constant reference
+    // value is 2_000_000 per the docstring (PR #452 2026-05-03 bumped
+    // 600_000 → 2_000_000 for extreme memory pressure handling within
+    // the c7i.xlarge 600 MB OS budget). Checked via constant reference
     // in source.
     let common_constants = load_text("crates/common/src/constants.rs");
 

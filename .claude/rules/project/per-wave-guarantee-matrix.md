@@ -46,7 +46,7 @@ checklist or in a dedicated "Per-Item Guarantee Matrix" subsection:
 
 | Demand | Honest envelope | Per-item proof |
 |---|---|---|
-| Zero ticks lost | Bounded zero loss inside chaos envelope: ring 600K → spill NDJSON → DLQ | item must not introduce new tick-drop path |
+| Zero ticks lost | Bounded zero loss inside chaos envelope: ring 2M → spill NDJSON → DLQ | item must not introduce new tick-drop path |
 | WS never disconnects | DETECT ≤5s, reconnect with `SubscribeRxGuard`, sleep-until-open post-close | item must not break SubscribeRxGuard or pool watchdog |
 | Never slow/locked/hanged | DHAT ≤4 alloc blocks/8KB across 10K calls; Criterion p99 ≤100ns; tick-gap >30s Telegram; core_affinity Core 0 | item must not add hot-path allocation |
 | QuestDB never fails | ABSORB via 3-tier rescue→spill→DLQ + schema self-heal | item must not break self-heal |
@@ -60,12 +60,12 @@ When any plan / PR / commit body uses the phrase "100% guarantee", it MUST be
 qualified exactly:
 
 > "100% inside the tested envelope, with ratcheted regression coverage:
-> ≤60s QuestDB outage absorbed by rescue→spill→DLQ; ≤600,000-tick ring
-> buffer capacity (constant `TICK_BUFFER_CAPACITY`,
+> ≤60s QuestDB outage absorbed by rescue→spill→DLQ;
+> ≤2,000,000-tick ring buffer capacity (constant `TICK_BUFFER_CAPACITY`,
 > `crates/common/src/constants.rs`, ratcheted by
 > `crates/storage/tests/zero_tick_loss_alert_guard.rs`); bench-gated
-> O(1) hot path; composite-key uniqueness; chaos-tested 65h Fri 16:00
-> IST → Mon 09:00 IST weekend sleep/wake
+> O(1) hot path; composite-key uniqueness;
+> chaos-tested 65h Fri 16:00 IST → Mon 09:00 IST weekend sleep/wake
 > (`crates/core/tests/ws_sleep_resilience.rs`). Beyond the envelope,
 > DLQ NDJSON catches every payload as recoverable text. Outstanding
 > (Wave-6): >65h holiday-weekend dormant sleep test (W6-2)."
