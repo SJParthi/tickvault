@@ -7,8 +7,13 @@
 //! the §8 prior wording cited "≤600K rescue ring capacity" and
 //! "chaos-tested 70h sleep/wake" without locatable code/test evidence.
 //!
+//! 2026-05-03 (PR #452): rescue ring capacity bumped 600K → 2M (224 MB
+//! pre-allocated VecDeque) per operator-spec'd extreme memory pressure
+//! handling. Wording in `wave-4-shared-preamble.md` + `per-wave-guarantee-matrix.md`
+//! updated to "2,000,000-tick" in tandem.
+//!
 //! After investigation:
-//! - `TICK_BUFFER_CAPACITY = 600_000` exists in
+//! - `TICK_BUFFER_CAPACITY = 2_000_000` exists in
 //!   `crates/common/src/constants.rs` and is ratcheted by
 //!   `crates/storage/tests/zero_tick_loss_alert_guard.rs`.
 //! - The 65h Fri 16:00 → Mon 09:00 IST weekend sleep/wake test
@@ -50,16 +55,17 @@ fn section8_does_not_claim_unproven_70h_chaos() {
 }
 
 #[test]
-fn section8_keeps_600k_rescue_ring_claim_with_evidence_pointer() {
+fn section8_keeps_2m_rescue_ring_claim_with_evidence_pointer() {
     for (label, path) in [("preamble", PREAMBLE_PATH), ("matrix", MATRIX_PATH)] {
         let text = read(path);
-        // The 600_000-tick ring buffer claim must remain because it IS
-        // proven, AND it must cite the constant + ratchet test so
-        // future readers can verify the proof in one grep.
+        // PR #452 (2026-05-03): rescue ring bumped 600K → 2M. The
+        // claim must cite the constant + ratchet test so future
+        // readers can verify the proof in one grep.
         assert!(
-            text.contains("600,000-tick ring buffer capacity"),
-            "{label} ({path}) must keep the proven 600,000-tick ring \
-             buffer capacity claim with the new precise wording."
+            text.contains("2,000,000-tick ring buffer capacity"),
+            "{label} ({path}) must keep the proven 2,000,000-tick ring \
+             buffer capacity claim (PR #452 bumped 600K → 2M for \
+             extreme memory pressure handling)."
         );
         assert!(
             text.contains("`TICK_BUFFER_CAPACITY`"),
@@ -69,7 +75,7 @@ fn section8_keeps_600k_rescue_ring_claim_with_evidence_pointer() {
         assert!(
             text.contains("zero_tick_loss_alert_guard.rs"),
             "{label} ({path}) must cite the ratchet test that pins the \
-             600,000 value."
+             2,000,000 value."
         );
     }
 }
