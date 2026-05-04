@@ -4096,6 +4096,23 @@ async fn main() -> Result<()> {
                     // only on task-exit for DepthTwentyDisconnected.
                     let d20_reconnect_notifier = Some(notifier.clone());
                     let (signal_tx, signal_rx) = tokio::sync::oneshot::channel::<()>();
+                    // PR #460 (2026-05-04): truthful-emit pattern. Shared flag
+                    // between the signal-rx waiter (which increments the
+                    // counter ONLY when the connection emits its first data
+                    // frame) and the connection-runner task (which decrements
+                    // ONLY if the increment had previously happened). The
+                    // legacy "increment at spawn / decrement on Err" pattern
+                    // produced false-OK signals: a task stuck in handshake
+                    // for 30s reported as connected, and the Telegram showed
+                    // "Depth-20: 5/5" before any Dhan handshake completed.
+                    // Now the counter reflects truth: only TRULY-streaming
+                    // connections count.
+                    let d20_truly_connected =
+                        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let d20_truly_connected_for_signal =
+                        std::sync::Arc::clone(&d20_truly_connected);
+                    let d20_truly_connected_for_exit = std::sync::Arc::clone(&d20_truly_connected);
+                    let d20_health_for_signal = d20_health.clone();
                     // Command channel for live rebalance (unsubscribe+resubscribe, zero disconnect).
                     let (d20_cmd_tx, d20_cmd_rx) =
                         tokio::sync::mpsc::channel::<tickvault_core::websocket::DepthCommand>(4);
@@ -4107,9 +4124,8 @@ async fn main() -> Result<()> {
                         });
                     }
                     tokio::spawn(async move {
-                        d20_health.set_depth_20_connections(
-                            d20_health.depth_20_connections().saturating_add(1),
-                        );
+                        // PR #460: NO increment-on-spawn. Counter is gated on
+                        // signal_rx firing (= first data frame received).
 
                         if let Err(err) = tickvault_core::websocket::run_twenty_depth_connection(
                             depth_token,
@@ -4144,6 +4160,14 @@ async fn main() -> Result<()> {
                                     },
                                 );
                             }
+                        }
+                        // PR #460: decrement on EVERY task exit (Ok or Err)
+                        // BUT only if we had previously incremented (signal
+                        // fired). Avoids underflow when a task exits before
+                        // ever reaching Connected (e.g. handshake timeout).
+                        if d20_truly_connected_for_exit
+                            .swap(false, std::sync::atomic::Ordering::AcqRel)
+                        {
                             d20_health.set_depth_20_connections(
                                 d20_health.depth_20_connections().saturating_sub(1),
                             );
@@ -4157,6 +4181,25 @@ async fn main() -> Result<()> {
                         let notify_sender = notifier.clone();
                         tokio::spawn(async move {
                             if signal_rx.await.is_ok() {
+                                // PR #460 (2026-05-04): truthful-emit. The
+                                // signal fires AFTER the connection emits
+                                // its first data frame — that's the only
+                                // truthful "Depth-20 connection is live"
+                                // signal Dhan gives us. Increment the
+                                // counter HERE, not at task spawn. Compare-
+                                // and-swap on the shared flag protects
+                                // against double-increment if `signal_rx`
+                                // somehow fires twice (it cannot — oneshot —
+                                // but the CAS makes the contract explicit).
+                                if !d20_truly_connected_for_signal
+                                    .swap(true, std::sync::atomic::Ordering::AcqRel)
+                                {
+                                    d20_health_for_signal.set_depth_20_connections(
+                                        d20_health_for_signal
+                                            .depth_20_connections()
+                                            .saturating_add(1),
+                                    );
+                                }
                                 notify_sender.notify(NotificationEvent::DepthTwentyConnected {
                                     underlying: notify_label,
                                 });
@@ -4351,6 +4394,18 @@ async fn main() -> Result<()> {
                             depth_200_spawn_index = depth_200_spawn_index.saturating_add(1);
                             let (d200_signal_tx, d200_signal_rx) =
                                 tokio::sync::oneshot::channel::<()>();
+                            // PR #460 (2026-05-04): truthful-emit pattern for
+                            // depth-200 (mirror of depth-20 above). Counter
+                            // is gated on signal_rx firing (= first data
+                            // frame received). Shared flag prevents double-
+                            // increment / decrement-without-increment.
+                            let d200_truly_connected =
+                                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                            let d200_truly_connected_for_signal =
+                                std::sync::Arc::clone(&d200_truly_connected);
+                            let d200_truly_connected_for_exit =
+                                std::sync::Arc::clone(&d200_truly_connected);
+                            let d200_health_for_signal = d200_health.clone();
                             // Command channel for live 200-level rebalance (zero disconnect).
                             let d200_handle_key = format!("{underlying}-{opt_label}"); // e.g. "NIFTY-CE"
                             let (d200_cmd_tx, d200_cmd_rx) = tokio::sync::mpsc::channel::<
@@ -4364,9 +4419,8 @@ async fn main() -> Result<()> {
                                 });
                             }
                             let d200_handle = tokio::spawn(async move {
-                                d200_health.set_depth_200_connections(
-                                    d200_health.depth_200_connections().saturating_add(1),
-                                );
+                                // PR #460: NO increment-on-spawn. Counter is
+                                // gated on d200_signal_rx firing.
 
                                 if let Err(err) =
                                     tickvault_core::websocket::run_two_hundred_depth_connection(
@@ -4421,6 +4475,13 @@ async fn main() -> Result<()> {
                                             },
                                         );
                                     }
+                                }
+                                // PR #460: decrement on EVERY task exit (Ok
+                                // or Err) but ONLY if we had previously
+                                // incremented (signal fired).
+                                if d200_truly_connected_for_exit
+                                    .swap(false, std::sync::atomic::Ordering::AcqRel)
+                                {
                                     d200_health.set_depth_200_connections(
                                         d200_health.depth_200_connections().saturating_sub(1),
                                     );
@@ -4439,6 +4500,19 @@ async fn main() -> Result<()> {
                                 let notify_sender = notifier.clone();
                                 tokio::spawn(async move {
                                     if d200_signal_rx.await.is_ok() {
+                                        // PR #460: truthful-emit. Increment
+                                        // counter ONLY when first data frame
+                                        // arrives (signal fires). CAS prevents
+                                        // double-increment.
+                                        if !d200_truly_connected_for_signal
+                                            .swap(true, std::sync::atomic::Ordering::AcqRel)
+                                        {
+                                            d200_health_for_signal.set_depth_200_connections(
+                                                d200_health_for_signal
+                                                    .depth_200_connections()
+                                                    .saturating_add(1),
+                                            );
+                                        }
                                         notify_sender.notify(
                                             NotificationEvent::DepthTwoHundredConnected {
                                                 contract: d200_label_for_signal,
