@@ -1022,6 +1022,19 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
         m_frames.increment(1);
         let received_at_nanos = current_received_at_nanos();
 
+        // 29-tf engine Phase 2.7 perf fix (hot-path agent C2): hoist
+        // the wall-clock read OUT of the per-tick branch. Each frame
+        // typically produces 1-30 ticks that all share the same
+        // `now_ist_secs_of_day` — caching at frame granularity bounds
+        // staleness to ~5ms, well within the 15-minute phase boundary
+        // tolerance. Only computed when an enricher is attached so
+        // the legacy (no-enricher) path pays zero cost.
+        let frame_now_ist_secs: u32 = if tick_enricher.is_some() {
+            now_ist_secs_of_day()
+        } else {
+            0 // unused when no enricher
+        };
+
         // Parse the binary frame
         let parsed = match dispatch_frame(&raw_frame, received_at_nanos) {
             Ok(frame) => frame,
@@ -1233,27 +1246,40 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     enricher.enrich(&mut tick);
                 }
 
+                // 29-tf engine Phase 2.7 (hostile bug-hunt CRITICAL C2 fix):
+                // run the lifecycle enricher ONCE per tick BEFORE both the
+                // VOLUME-MONO-01 guard and the persistence branch. The
+                // enricher's `volume_is_first_seen` + `phase` flags must
+                // suppress the monotonicity check when (a) it's the first
+                // tick of the day for this instrument or (b) phase != OPEN.
+                // Without this gate, IST midnight rollover fires ~24,300
+                // false VOLUME-MONO-01 alerts at 09:15 IST every trading
+                // day (per L13).
+                let lifecycle_for_tick: Option<(
+                    bool,
+                    super::tick_enricher::EnrichedTickFlags,
+                    TickLifecycle,
+                )> = tick_enricher.as_ref().map(|enricher| {
+                    let enriched = enricher.enrich_tick(&tick, frame_now_ist_secs);
+                    let life = TickLifecycle {
+                        volume_delta: enriched.volume_delta,
+                        prev_day_close: enriched.prev_day_close,
+                        prev_day_oi: enriched.prev_day_oi,
+                        phase: enriched.phase as u8,
+                    };
+                    let flags = super::tick_enricher::EnrichedTickFlags {
+                        volume_is_first_seen: enriched.volume_is_first_seen,
+                        volume_is_regression: enriched.volume_is_regression,
+                        phase: enriched.phase,
+                    };
+                    (enriched.volume_is_first_seen, flags, life)
+                });
+
                 // Persist tick to QuestDB — ingestion gate above already verified
                 // [09:00, 15:30) IST and today's date. This block only handles
                 // QuestDB write errors (connection down, buffer full, etc.).
-                //
-                // 29-tf engine Phase 2.5: when `tick_enricher` is `Some`, run
-                // the tick through it to populate the four lifecycle columns
-                // (`volume_delta`, `prev_day_close`, `prev_day_oi`, `phase`)
-                // and persist via `append_tick_enriched`. The wall-clock read
-                // is per-tick so phase-boundary crossings are caught
-                // immediately. Falls through to `append_tick` (defaulted
-                // lifecycle values) when no enricher attached.
                 if let Some(ref mut writer) = tick_writer {
-                    let result = if let Some(ref enricher) = tick_enricher {
-                        let now_ist_secs = now_ist_secs_of_day();
-                        let enriched = enricher.enrich_tick(&tick, now_ist_secs);
-                        let life = TickLifecycle {
-                            volume_delta: enriched.volume_delta,
-                            prev_day_close: enriched.prev_day_close,
-                            prev_day_oi: enriched.prev_day_oi,
-                            phase: enriched.phase as u8,
-                        };
+                    let result = if let Some((_, _, life)) = lifecycle_for_tick {
                         writer.append_tick_enriched(&tick, life)
                     } else {
                         writer.append_tick(&tick)
@@ -1313,19 +1339,31 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                 }
 
                 // Wave 5 Item 26 L1 — volume monotonicity guard.
-                // O(1) per tick. Silent unless Dhan breaks its
-                // cumulative-since-session-open semantic; on breach
-                // emits ERROR `VOLUME-MONO-01` + Prom counter.
-                // IDX_I (segment 0) ticks have `volume == 0` (Ticker
-                // mode), so the guard sees a single 0-baseline and
-                // never flags. NSE_EQ / NSE_FNO / BSE_FNO ticks
-                // carry the cumulative session volume from Dhan's
-                // Quote / Full packets.
-                let _ = volume_monotonicity_guard.observe(
-                    tick.security_id,
-                    tick.exchange_segment_code,
-                    tick.volume,
-                );
+                //
+                // 29-tf engine Phase 2.7 (hostile bug-hunt CRITICAL C2 fix):
+                // when the lifecycle enricher is attached, suppress the
+                // monotonicity check on (a) the FIRST tick of the day for
+                // this instrument (Dhan legitimately resets the cumulative
+                // counter to ~0 at session open) and (b) any phase other
+                // than OPEN (PREMARKET / PREOPEN / POSTAUCTION / CLOSED
+                // ticks aren't subject to the live-trading invariant). Per
+                // L13: this prevents ~24,300 false breach alerts at IST
+                // 09:15 every trading day. When no enricher is attached
+                // (legacy / fast boot), the guard runs unconditionally.
+                let suppress_monotonicity = match lifecycle_for_tick {
+                    Some((_, flags, _)) => {
+                        flags.volume_is_first_seen
+                            || flags.phase != tickvault_common::phase::Phase::Open
+                    }
+                    None => false,
+                };
+                if !suppress_monotonicity {
+                    let _ = volume_monotonicity_guard.observe(
+                        tick.security_id,
+                        tick.exchange_segment_code,
+                        tick.volume,
+                    );
+                }
 
                 trace!(
                     security_id = tick.security_id,
@@ -1432,8 +1470,9 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     // hot-path semantics are uniform across packet types.
                     if let Some(ref mut writer) = tick_writer {
                         let result = if let Some(ref enricher) = tick_enricher {
-                            let now_ist_secs = now_ist_secs_of_day();
-                            let enriched = enricher.enrich_tick(&tick, now_ist_secs);
+                            // Phase 2.7 perf fix (hot-path agent C2): use the
+                            // frame-level cached `frame_now_ist_secs`.
+                            let enriched = enricher.enrich_tick(&tick, frame_now_ist_secs);
                             let life = TickLifecycle {
                                 volume_delta: enriched.volume_delta,
                                 prev_day_close: enriched.prev_day_close,

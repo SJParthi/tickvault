@@ -80,7 +80,10 @@ impl VolumeDeltaTracker {
     /// Records a tick's cumulative volume and returns the per-tick
     /// incremental delta plus regression / first-seen flags.
     ///
-    /// O(1), lock-free, zero-alloc.
+    /// O(1), lock-free, zero-alloc — Phase 2.7 perf fix (hot-path agent
+    /// CRITICAL C1): single papaya `insert` returns the prior value as
+    /// `Option<&V>`, halving the hash probes from 2 (legacy
+    /// get + insert) to 1.
     #[inline]
     pub fn record_tick(
         &self,
@@ -90,15 +93,11 @@ impl VolumeDeltaTracker {
     ) -> DeltaOutcome {
         let key = (security_id, segment_code);
         let guard = self.inner.guard();
-        let prev = self.inner.get(&key, &guard).copied();
-        // Update the baseline for the next tick. Using `insert` (not
-        // `try_insert`) — the SPSC consumer guarantees single-thread
-        // access on the hot path, so we accept overwrite semantics.
-        self.inner.insert(key, current_volume, &guard);
-
-        match prev {
+        // Single atomic replace — returns the prior value if present,
+        // `None` on first insert. One hash probe instead of two.
+        match self.inner.insert(key, current_volume, &guard) {
             Some(p) => {
-                let delta = i64::from(current_volume) - i64::from(p);
+                let delta = i64::from(current_volume) - i64::from(*p);
                 DeltaOutcome {
                     delta,
                     is_regression: delta < 0,
