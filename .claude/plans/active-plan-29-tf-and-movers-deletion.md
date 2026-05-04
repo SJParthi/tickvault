@@ -36,19 +36,35 @@ Net code change: **~700 LoC less, 2 tables less, 7 ErrorCodes less, 1 unified en
 | L9 | RAM = trading speed only. DB = ALWAYS source of truth for replay/audit. Both written every tick. No data loss path. | session 2026-05-04 |
 | L10 | 13 NEW bulletproofing additions (forensic snapshot, mmap spill, cache-line align, etc. — see §7). NO forced rotation, NO subscribe-noop heartbeat — zero deliberate disconnects per L11. | session 2026-05-04 |
 | L11 | **ZERO deliberate disconnects.** Code MUST NOT initiate any disconnect on a healthy socket. Only Dhan-side / network-side disconnects are recovered (reactive). Banned: forced rotation, voluntary connection cycling, voluntary unsubscribe-then-resubscribe on healthy connections. Activity watchdog (passive detection) stays. | session 2026-05-04 |
+| L12 | **Cascade timeframe design.** Hot path touches ONLY the `1s` engine on every tick. When `1s` engine seals a bar, the sealed bar cascades into `3s`/`5s`/`1m`/...`1mo` engines via background SPSC consumer. Result: per-tick budget = 1 atomic store path (≤200ns achievable), NOT 29. Hot-path agent CRITICAL C2 fix. | session 2026-05-04 |
+| L13 | **IST midnight reset invariant.** `last_seen[security]` map (volume_delta calculator) + `prev_day_close` first-seen stamper + `prev_oi_cache` ALL reset/reload at IST midnight in a single atomic phase transition. VOLUME-MONO-01 monotonicity check is SUPPRESSED during PREMARKET phase to prevent the day-rollover negative-delta blow-up across 25K instruments. Hostile bug-hunt CRITICAL C3 fix. | session 2026-05-04 |
+| L14 | **Strict cold-boot ordering invariant.** Boot sequence MUST complete in this order before WS subscribe fires: (1) `prev_oi_cache` loaded from `candles_1d` yesterday, (2) `CandleEngine` and `MoversEngine` instantiated and ready, (3) historical replay of last 5 min ticks from `ticks` table, (4) THEN Dhan WS subscribe. Ratchet test pins each gate. Hostile bug-hunt CRITICAL C4 fix. | session 2026-05-04 |
 
 ---
 
-## 2. The architecture
+## 2. The architecture (CASCADE design — corrected per hot-path agent CRITICAL C2)
+
+**Hot path touches ONE engine (`1s`). Coarser timeframes derived OFF hot path.**
 
 ```
                      Every Dhan tick
                             │
+                            ▼
+                   ┌────────────────┐
+                   │ 1s CandleEngine│ ← ONLY engine on hot path
+                   │ (atomic OHLCV) │   ≤200ns per tick
+                   └────────┬───────┘
+                            │ on bar seal (every 1s)
+                            ▼
+              SPSC channel (off hot path)
+                            │
        ┌────────────────────┼────────────────────┐
        ▼                    ▼                    ▼
-   29 RAM                ticks            derivative_contracts
-   sticky notes          table            (already exists — symbol,
-   (1 per timeframe)     (raw + 4 NEW      strike, expiry, underlying)
+   28 derived           ticks table       derivative_contracts
+   engines              (raw + 4 NEW       (already exists)
+   (3s,5s,...,1mo)      cols)
+   cascaded from
+   sealed 1s bars
        │                  cols)               │
        │                    │                 │
        │                    ▼                 │
@@ -80,6 +96,21 @@ pub const FORMULA_CHANGE_PCT_SQL: &str =
 ---
 
 ## 3. Column design
+
+### IST midnight reset semantics (per L13 + hostile bug-hunt CRITICAL C3)
+
+At IST midnight (00:00:00.000 IST), a single atomic phase transition runs:
+
+| Step | Action | Why |
+|---|---|---|
+| 1 | Snapshot `last_seen[security]` map → discard | yesterday's cumulative volumes invalid |
+| 2 | Reload `prev_oi_cache` from `candles_1d` (yesterday's row) | new "previous day OI" baseline |
+| 3 | Reset `prev_day_close` first-seen stamper | new trading day = stamp on first tick |
+| 4 | Set phase = PREMARKET | until 09:00 IST |
+| 5 | **VOLUME-MONO-01 SUPPRESSED until phase reaches OPEN** | first ticks of new day legitimately reset Dhan's cumulative counter to ~0 |
+| 6 | Engine state TTL sweep — drop entries with no tick for >7 days | prevents F&O expiry leak (hostile bug-hunt HIGH H7) |
+
+Single-thread owns the rollover: `MidnightRolloverTask` runs in the tick-processor SPSC consumer (no race across threads).
 
 ### `ticks` table (4 NEW columns, additive ALTER)
 
@@ -147,6 +178,10 @@ for tf in config.timeframes.enabled {
 
 ## 5. `/api/movers` — single SQL, all 7 categories
 
+**Security note (per security-reviewer HIGH H4):** the `ORDER BY` column is NOT raw-string interpolated from TOML. Config category names map to a `MoversCategory` enum at parse time; the enum's `order_by_clause()` returns a `&'static str` whitelist literal. TOML edits cannot inject SQL. See `crates/api/src/handlers/movers.rs::MoversCategory` (existing pattern, replicated here).
+
+**Composite-key note (per security-reviewer LOW + I-P1-11):** `LATEST ON ts PARTITION BY security_id, exchange_segment` — composite key is mandatory; `security_id` alone causes cross-segment SecurityId collision (NSE_FNO/BSE_FNO).
+
 ```sql
 WITH latest AS (
   SELECT c.security_id, c.exchange_segment,
@@ -213,24 +248,25 @@ direction = "desc"
 
 ---
 
-## 6. The 4-phase rollout (no big-bang, each phase its own PR)
+## 6. The 5-phase rollout (per hostile bug-hunt CRITICAL C5: no big-bang DROP)
 
 | Phase | Ships | Risk if rolled back | Gate before next phase |
 |---|---|---|---|
 | **Phase 1: Schema widen** (additive ALTER + matview rebuild) | `ALTER TABLE ticks ADD COLUMN IF NOT EXISTS` x4; matviews rebuilt with new schema during off-hours; old movers tables UNTOUCHED | ZERO — new columns sit empty if writer not deployed | matview rebuild verified on at least 1 trading day |
-| **Phase 2: Populate new columns** (dual-write) | Tick parser stamps `prev_day_close` (first-seen) + `prev_day_oi` (boot cache) + `phase`; matview captures them; old movers tables ALSO still being written | ZERO — old path unchanged | 7 trading days of populated columns + zero parser errors |
-| **Phase 3: Add in-memory engines + parity test** (shadow mode) | `CandleEngine<TF>` + `MoversEngine` deployed; `/api/movers` switched to candles SELECT; ratchet test compares RAM vs new SELECT vs old movers tables — all three must agree | ZERO — strategy still reads old tables; new engines shadow-deployed | 7 trading days green-streak across all 3 ratchet axes |
-| **Phase 4: Cutover + delete** | Strategy reads `MoversEngine` (RAM); old movers tables + writers + 4 ErrorCodes + runbooks DELETED | LOW — revert single PR; data still in `ticks` for replay | **14 trading days** of green-streak ratchet parity (RAM ≡ DB ≡ legacy) before merge; post-deploy: 30 trading days monitoring before declaring "done" |
+| **Phase 2: Populate new columns** (dual-write) | Tick parser stamps `prev_day_close` (first-seen) + `prev_day_oi` (boot cache) + `phase` + `volume_delta` (with IST midnight reset per L13); matview captures them; old movers tables ALSO still being written | ZERO — old path unchanged | 7 trading days of populated columns + zero parser errors |
+| **Phase 3: Add in-memory engines + parity test** (shadow mode) | `CandleEngine<1s>` + 28 derived engines (cascade per L12) + `MoversEngine` deployed; `/api/movers` v2 SELECT exposed alongside v1; ratchet test compares RAM vs new SELECT vs old movers tables — all three must agree | ZERO — strategy still reads old tables; new engines shadow-deployed | 14 trading days green-streak across all 3 ratchet axes |
+| **Phase 4a: Read-path flip + 24h soak** | Strategy reads `MoversEngine` (RAM); `/api/movers?v=1` STILL backed by old tables; `?v=2` backed by new SELECT. Old movers writers KEEP RUNNING. Operator dashboards verified on v2 schema. **24h soak with both paths live.** | LOW — revert read-path PR; old data still being written; no DROP yet | 14 trading days post-flip, no v1/v2 disagreement, no operator regression |
+| **Phase 4b: Writer + table deletion** | Old movers writers DELETED; `DROP TABLE stock_movers, option_movers`; 4 ErrorCodes + runbooks deleted; `/api/movers?v=1` shim returns 410 Gone with migration message | LOW — `?v=2` always working; data still in `ticks` for replay | post-deploy: 30 trading days monitoring before declaring "done" |
 
 ---
 
-## 7. NEW: 15 bulletproofing additions for O(1) + memory burst + WS resilience
+## 7. 12 bulletproofing additions (was 13; bump arena DELETED per hot-path CRITICAL C1)
 
 | # | Addition | What it solves | Mechanism | Ratchet |
 |---|---|---|---|---|
 | 1 | Cache-line align hot atomics (`#[repr(align(64))]`) | false-sharing slowdown under burst | `MoverState` + `CandleState` aligned | `test_atomic_alignment_64_bytes` |
-| 2 | Pre-allocated bump arena per tick (recycled) | zero-alloc even on burst | `bumpalo::Bump` reset per tick | DHAT extended |
-| 3 | `mmap`'d tick spill file | OS page cache handles 10x burst | `memmap2` crate, fixed file size | `chaos_burst_10x.rs` |
+| ~~2~~ | ~~Bump arena~~ DELETED per hot-path CRITICAL C1 — fixed-size atomics + papaya don't allocate; arena was dead weight | n/a | n/a | n/a |
+| 3 | `mmap`'d tick spill file with **boot-time `MADV_WILLNEED` pre-fault** (per hot-path HIGH H2) | OS page cache handles 10x burst; pre-fault prevents page-fault syscalls on hot path | `memmap2` crate, fixed 2GB file, sequential touch at boot, **wrap-with-DLQ on overflow + CRITICAL alert** (per hostile bug-hunt CRITICAL C6) | `chaos_burst_10x.rs` + `test_mmap_pre_fault_at_boot` |
 | 4 | Per-subsystem memory ceiling + alert at 80% | catches drift before OOM | `tv_subsystem_memory_bytes` gauge + Prom alert | `resilience_sla_alert_guard.rs` extension |
 | 5 | OOM-protect parser thread (`oom_score_adj=-1000`) | parser last to die under pressure | systemd unit + boot log assertion | `test_oom_score_set_at_boot` |
 | 6 | `core_affinity` pin WS-read + parser to cores | deterministic latency, no jitter | already in Wave 5 (CORE-PIN-01) | already pinned |
@@ -270,13 +306,22 @@ direction = "desc"
 | `test_tcp_keepalive_set_to_1s_5s` | `crates/core/tests/tcp_keepalive.rs` | socket options set on connect |
 | `test_dns_failover_to_secondary_ip` | `crates/core/tests/dns_failover.rs` | second IP tried if first fails |
 | `test_happy_eyeballs_fallback_v6_to_v4` | `crates/core/tests/happy_eyeballs.rs` | RFC 8305 |
-| `test_forced_rotation_every_4h_preserves_subs` | `crates/core/tests/forced_rotation.rs` | subs survive scheduled rotation |
-| `test_silent_socket_detected_in_30s` | `crates/core/tests/silent_socket.rs` | noop heartbeat detects |
 | `test_forensic_ring_captures_pre_disconnect_60s` | `crates/core/tests/forensic_ring.rs` | last 60s of events available on RST |
 | `test_snapshot_written_on_disconnect` | `crates/core/tests/disconnect_snapshot.rs` | JSON dumped to `data/logs/disconnect-forensics.*.json` |
 | `test_replay_spill_produces_identical_output` | `crates/storage/tests/spill_replay.rs` | re-injection from spill = original pipeline output |
 | `chaos_dhan_rst_flood` | `crates/core/tests/chaos_dhan_rst_flood.rs` | weekly CI: 5min RST every 30s — bounded recovery |
 | `chaos_burst_10x_traffic` | `crates/core/tests/chaos_burst_10x.rs` | 10x normal tick rate — mmap spill absorbs |
+| `test_cascade_only_1s_engine_touched_on_tick` | `crates/trading/tests/cascade_hot_path_guard.rs` | hot-path C2 fix: per-tick path touches `1s` only; coarser TFs derived off-path. Source-grep + DHAT prove no `CandleEngine<3s/5s/.../1mo>::on_tick` call site exists in `tick_processor.rs`. |
+| `test_midnight_rollover_atomic_phase_transition` | `crates/core/tests/midnight_rollover.rs` | hostile C3 fix: at IST 00:00:00, `last_seen` cleared, `prev_oi_cache` reloaded, phase=PREMARKET, VOLUME-MONO-01 suppressed atomically. Property test: cross-thread tick at 23:59:59.999 vs 00:00:00.001 stamps the correct trading_date. |
+| `test_boot_ordering_invariant_pre_oi_before_subscribe` | `crates/app/tests/boot_order_guard.rs` | hostile C4 fix: subscribe MUST NOT fire until (1) `prev_oi_cache` loaded, (2) engines ready, (3) historical replay complete. Test injects WS subscribe at each phase, asserts blocked until all 3 gates green. |
+| `test_phase4a_24h_soak_dual_path_parity` | `crates/api/tests/phase_4a_soak_guard.rs` | hostile C5 fix: during 24h soak, `?v=1` and `?v=2` MUST return identical top-K. Build fails if disagreement detected over 100 simulated requests. |
+| `test_mmap_spill_overflow_wraps_with_dlq` | `crates/storage/tests/mmap_spill_overflow.rs` | hostile C6 fix: when 2GB mmap fills, oldest entries wrap into DLQ NDJSON, Prometheus counter `tv_spill_wrap_total` increments, CRITICAL alert fires. NO crash, NO silent loss, NO blocking. |
+| `test_movers_category_allowlist_enum` | `crates/api/tests/movers_allowlist.rs` | security H4 fix: TOML `order_by = "(SELECT ...)"` rejected at parse time; only enum-whitelisted columns reach SQL. |
+| `test_forensic_snapshot_sanitizes_dhan_strings` | `crates/core/tests/forensic_sanitize.rs` | security H5 fix: Dhan disconnect reason strings + QuestDB error bodies pass through `sanitize_audit_string` before NDJSON write. CRLF injection rejected. |
+| `test_engine_state_ttl_drops_expired_contracts` | `crates/trading/tests/engine_ttl.rs` | hostile H7 fix: `MoverState` entries with no tick for >7 days dropped on weekly sweep. F&O expiry leak prevented. |
+| `test_packet_semantic_drift_hourly_sanity_check` | `crates/core/tests/packet_drift_guard.rs` | hostile H9 fix: hourly sanity sweep across N≥100 SIDs verifies `volume` is cumulative-monotonic. If Dhan flips semantics mid-session, CRITICAL alert fires within 1h. |
+| `test_parity_ratchet_2s_tolerance_window` | `crates/trading/tests/movers_parity.rs` (extended) | hostile H6 fix: minute-boundary parity test allows 2s lag between RAM seal and matview seal. No flake. |
+| `test_forensic_snapshot_edge_triggered_coalesced` | `crates/core/tests/forensic_edge_trigger.rs` | hostile H5 fix: 5 RSTs in <1s emit 1 coalesced snapshot + count, NOT 5 separate files. |
 
 **Total: 25 new ratchet tests + extensions to 4 existing meta-guards.**
 
@@ -287,14 +332,20 @@ direction = "desc"
 > "100% inside the tested envelope, with ratcheted regression coverage:
 > ≤60s QuestDB outage absorbed by rescue→spill→DLQ;
 > ≤2,000,000-tick ring buffer capacity (constant `TICK_BUFFER_CAPACITY`);
-> ≤10x traffic burst absorbed by mmap'd spill (chaos-tested);
-> bench-gated O(1) hot path (≤200ns per tick across 29 timeframes);
-> RAM≡DB formula parity enforced by build-time + boot-time + runtime ratchets;
-> composite-key uniqueness `(security_id, exchange_segment)`;
+> ≤10x traffic burst absorbed by 2GB mmap'd spill with `MADV_WILLNEED` pre-fault, wrap-with-DLQ on overflow (chaos-tested);
+> bench-gated O(1) hot path (≤200ns per tick on the `1s` engine; coarser TFs derived off-path via cascade per L12);
+> RAM ≡ DB formula parity enforced by build-time + boot-time + runtime ratchets with 2s tolerance window for matview-seal lag;
+> composite-key uniqueness `(security_id, exchange_segment)` enforced in tick storage, candle DEDUP, registry, and `LATEST ON` SQL;
+> IST midnight rollover atomic phase transition (clears `last_seen` map, reloads `prev_oi_cache`, suppresses VOLUME-MONO-01 during PREMARKET) per L13;
+> strict cold-boot ordering: cache → engines → historical replay → THEN subscribe per L14;
+> 5-phase rollout (Phase 4a 24h soak before Phase 4b DROP) prevents in-flight `?v=1` request failures;
+> F&O expiry leak prevented via 7-day TTL sweep on engine state;
+> Dhan packet semantic drift detected hourly across N≥100 SIDs (cumulative-monotonicity sanity);
 > chaos-tested 65h Fri 16:00 IST → Mon 09:00 IST weekend sleep/wake;
 > chaos-tested Dhan RST flood weekly in CI.
 > Beyond the envelope, DLQ NDJSON catches every payload as recoverable text.
-> Live proof: Telegram alerts on 2026-05-04 show 5/5 disconnect at 12:55 IST detected + auto-recovered + zero tick loss + depth swaps continued normally."
+> Live proof: Telegram alerts on 2026-05-04 show 5/5 disconnect at 12:55 IST detected + auto-recovered + zero tick loss + depth swaps continued normally.
+> Adversarial review: 3 agents (hot-path-reviewer + security-reviewer + general-purpose hostile bug-hunt) reviewed plan v1; all 6 CRITICAL + 11 HIGH findings folded into v2 (this plan)."
 
 ---
 
