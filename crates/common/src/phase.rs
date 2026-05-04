@@ -115,8 +115,34 @@ impl Phase {
 /// `_segment` is currently unused (NSE/BSE share boundaries today) but
 /// reserved so adding MCX commodity hours = extend the match without a
 /// signature change.
+///
+/// **Hot-path note:** when called from the tick enricher with a binary
+/// `exchange_segment_code` (u8), prefer `compute_phase_by_segment_code`
+/// to avoid the `ExchangeSegment::from_byte` enum conversion. Phase
+/// 2.13 fix (hot-path agent M2): the conversion was dead work since
+/// this function ignores the segment today.
 #[inline]
 pub fn compute_phase(now_ist_secs_of_day: u32, _segment: ExchangeSegment) -> Phase {
+    compute_phase_inner(now_ist_secs_of_day)
+}
+
+/// Hot-path-friendly variant: takes the binary segment code (u8) from
+/// `ParsedTick::exchange_segment_code` directly, avoiding the enum
+/// conversion. Behaviour is identical to `compute_phase` today
+/// (segment-agnostic). Phase 2.13 hot-path M2 fix.
+///
+/// `_segment_code` is reserved for future MCX commodity-hours support;
+/// for now it's ignored, matching `compute_phase`'s contract.
+#[inline]
+pub fn compute_phase_by_segment_code(now_ist_secs_of_day: u32, _segment_code: u8) -> Phase {
+    compute_phase_inner(now_ist_secs_of_day)
+}
+
+/// Shared boundary logic for both `compute_phase` and
+/// `compute_phase_by_segment_code`. Single source of truth — drift
+/// between the two public entry points is mechanically impossible.
+#[inline(always)]
+fn compute_phase_inner(now_ist_secs_of_day: u32) -> Phase {
     if now_ist_secs_of_day < TICK_PERSIST_START_SECS_OF_DAY_IST {
         Phase::Premarket
     } else if now_ist_secs_of_day < NSE_OPEN_SECS_OF_DAY_IST {
@@ -323,5 +349,60 @@ mod tests {
              updating QuestDB SYMBOL expectations and the matview rebuild \
              probe `views_missing_phase1_columns`"
         );
+    }
+
+    /// Phase 2.13 ratchet: name-matched explicit test for the new
+    /// `compute_phase_by_segment_code` public entry point. Verifies the
+    /// hot-path-friendly variant matches `compute_phase` for every IST
+    /// minute boundary across the day (1440 samples).
+    #[test]
+    fn test_compute_phase_by_segment_code_matches_legacy_compute_phase() {
+        // NSE_EQ binary code = 1 per Dhan annexure mapping.
+        for minute in 0..(24 * 60_u32) {
+            let secs = minute * 60;
+            let legacy = compute_phase(secs, ExchangeSegment::NseEquity);
+            let by_code = compute_phase_by_segment_code(secs, 1);
+            assert_eq!(legacy, by_code, "drift at minute {minute}");
+        }
+    }
+
+    /// Phase 2.13 ratchet: `compute_phase_by_segment_code` returns the
+    /// correct Phase for each canonical IST boundary.
+    #[test]
+    fn test_compute_phase_by_segment_code_boundaries_pinned() {
+        // 00:00 = PREMARKET
+        assert_eq!(compute_phase_by_segment_code(0, 1), Phase::Premarket);
+        // 09:00 = PREOPEN
+        assert_eq!(compute_phase_by_segment_code(9 * 3600, 1), Phase::Preopen);
+        // 09:15 = OPEN
+        assert_eq!(
+            compute_phase_by_segment_code(9 * 3600 + 15 * 60, 1),
+            Phase::Open
+        );
+        // 15:30 = POSTAUCTION
+        assert_eq!(
+            compute_phase_by_segment_code(15 * 3600 + 30 * 60, 1),
+            Phase::PostAuction
+        );
+        // 15:40 = CLOSED
+        assert_eq!(
+            compute_phase_by_segment_code(15 * 3600 + 40 * 60, 1),
+            Phase::Closed
+        );
+    }
+
+    /// Phase 2.13 ratchet: unknown segment codes (e.g. the gap at 6,
+    /// 99, 255) MUST NOT panic — they degrade to the segment-agnostic
+    /// behaviour matching `compute_phase`'s contract.
+    #[test]
+    fn test_compute_phase_by_segment_code_unknown_codes_do_not_panic() {
+        let secs_open = 9 * 3600 + 30 * 60;
+        for code in [6_u8, 99, 100, 200, 255] {
+            assert_eq!(
+                compute_phase_by_segment_code(secs_open, code),
+                Phase::Open,
+                "unknown code {code} must classify per the secs-of-day input only"
+            );
+        }
     }
 }
