@@ -288,8 +288,15 @@ fn unwrap_or_log(
     match result {
         Ok(v) => v,
         Err(err) => {
+            // PR #455 (2026-05-04) MEDIUM-fix: `?err` Debug formatter
+            // can embed wrapped reqwest URL (containing internal
+            // QuestDB host:port) when anyhow's chain wraps a
+            // reqwest::Error. Use Display (`%err`) which only shows
+            // the top error message — no URL leak. Loss of wrapped
+            // chain context is acceptable; the explicit `code` field
+            // + list name are enough for triage.
             tracing::error!(
-                ?err,
+                error = %err,
                 list = list_name,
                 code = "API-MOVERS-01",
                 "QuestDB query for /api/market/stock-movers list failed"
@@ -503,8 +510,12 @@ pub async fn get_option_movers(
     {
         Ok(r) => r,
         Err(err) => {
+            // PR #455 (2026-05-04) MEDIUM-fix: strip URL from reqwest error
+            // before formatting (Display embeds URL containing internal
+            // QuestDB host:port).
+            let err = err.without_url();
             tracing::error!(
-                ?err,
+                error = %err,
                 code = "API-MOVERS-02",
                 "QuestDB query for /api/market/option-movers failed"
             );
@@ -519,8 +530,10 @@ pub async fn get_option_movers(
     let body: serde_json::Value = match resp.json().await {
         Ok(v) => v,
         Err(err) => {
+            // PR #455: same URL redaction.
+            let err = err.without_url();
             tracing::error!(
-                ?err,
+                error = %err,
                 code = "API-MOVERS-02",
                 "Failed to parse QuestDB JSON response for /api/market/option-movers"
             );
