@@ -5,7 +5,7 @@
 //! # Hot-path budget
 //!
 //! Called once-per-second per (security_id, segment) from the
-//! `movers_base_pipeline` drain task — NOT per tick. ~24K instruments
+//! `movers_pipeline` drain task — NOT per tick. ~24K instruments
 //! × 1Hz = ~24K rows/sec, well within QuestDB ILP throughput envelope.
 //!
 //! `append_row` itself does no heap allocation beyond the `Buffer`'s
@@ -32,7 +32,7 @@ use tickvault_common::sanitize::sanitize_ilp_symbol;
 /// schema in `movers_base_persistence.rs`.
 ///
 /// Built once per second per (security_id, segment) by
-/// `movers_base_pipeline`. Copy + Send so the drain task can pass
+/// `movers_pipeline`. Copy + Send so the drain task can pass
 /// rows to the writer without heap allocation per row.
 #[derive(Debug, Clone, Copy)]
 pub struct MoversRow {
@@ -289,7 +289,7 @@ impl MoversWriter {
     }
 
     /// Shutdown helper — calls `flush` once with a timeout window.
-    /// Used by `movers_base_pipeline` on graceful drop.
+    /// Used by `movers_pipeline` on graceful drop.
     // TEST-EXEMPT: thin wrapper around flush() with timeout; flush is integration-tested.
     pub fn shutdown_flush(&mut self, _timeout: Duration) {
         if let Err(err) = self.flush() {

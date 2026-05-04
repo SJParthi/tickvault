@@ -56,7 +56,7 @@ use tickvault_common::constants::{
 use tickvault_common::instrument_registry::InstrumentRegistry;
 use tickvault_common::tick_types::ParsedTick;
 use tickvault_common::types::ExchangeSegment;
-use tickvault_storage::movers_base_writer::{MoversRow, MoversWriter, segment_code_to_char};
+use tickvault_storage::movers_writer::{MoversRow, MoversWriter, segment_code_to_char};
 
 /// Drain cadence — 1 second per the plan §"Item 25" base-1s table.
 const DRAIN_INTERVAL_MS: u64 = 1_000;

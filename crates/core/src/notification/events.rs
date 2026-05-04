@@ -118,6 +118,41 @@ impl DepthRebalanceLevels {
     }
 }
 
+/// Which boot path was used to bring the WebSocket pool online.
+///
+/// Per operator policy 2026-05-04 + `boot_helpers::should_fast_boot`:
+/// - `Slow` is the DEFAULT path. Used pre-09:00 IST AND post-15:30 IST,
+///   AND mid-market when the auth/instrument cache is missing. Runs the
+///   full sequential init (auth → instrument master → QuestDB → universe
+///   → WS pool).
+/// - `Fast` is the EMERGENCY path. Used ONLY between 09:00–15:30 IST when
+///   a valid auth token cache + binary instrument cache are present.
+///   Skips ~30s of init by trusting the on-disk cache; intended for
+///   mid-market crash recovery so ticks resume flowing fast.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootPathLabel {
+    Slow,
+    Fast,
+}
+
+impl BootPathLabel {
+    /// Human-readable label for the Telegram message.
+    pub const fn human(self) -> &'static str {
+        match self {
+            Self::Slow => "Normal start (full init)",
+            Self::Fast => "Mid-market crash recovery (cached init)",
+        }
+    }
+
+    /// Short label for compact contexts.
+    pub const fn short(self) -> &'static str {
+        match self {
+            Self::Slow => "slow",
+            Self::Fast => "fast",
+        }
+    }
+}
+
 /// All events that produce a Telegram alert.
 ///
 /// Adding a new event: add a variant here, add its message arm in
@@ -182,14 +217,59 @@ pub enum NotificationEvent {
     /// Token renewal failed — background task will retry.
     TokenRenewalFailed { attempts: u32, reason: String },
 
-    /// WebSocket connection established.
-    WebSocketConnected { connection_index: usize },
+    /// WebSocket connection truly established — fires only when the
+    /// connection's state in `pool.health()` has transitioned to
+    /// `Connected` (TLS handshake done, subscribe acked, first frame
+    /// received). The fields carry per-connection capacity utilisation
+    /// and ping/pong heartbeat freshness so an operator sees subscription
+    /// + liveness without opening Grafana.
+    ///
+    /// PR #458 (2026-05-04): the pre-existing payload was just
+    /// `{ connection_index }` and was emitted from a tight loop right
+    /// after `pool.spawn_handles()` returned — i.e., before any actual
+    /// handshake had completed. That was a false-OK. The new payload
+    /// + emit gating makes this a truthful per-connection signal.
+    WebSocketConnected {
+        connection_index: usize,
+        subscribed_count: usize,
+        capacity: usize,
+        last_activity_secs_ago: Option<u32>,
+    },
 
-    /// Aggregate summary of the live-market-feed pool after spawn.
-    /// Emitted once per boot path so operators survive Telegram rate-limit
-    /// drops of the per-connection `WebSocketConnected` events.
-    /// `total` is the expected count (== connected on healthy boot).
-    WebSocketPoolOnline { connected: usize, total: usize },
+    /// Aggregate pool-online summary — fires on rising-edge when ALL
+    /// spawned connections have actually reached `Connected` state.
+    /// Carries the per-connection breakdown so the operator sees pool
+    /// capacity utilisation + heartbeat liveness at a glance.
+    ///
+    /// `boot_path` distinguishes pre-9am normal slow boot from the
+    /// mid-market crash-recovery fast boot (per operator intent
+    /// 2026-05-04: slow boot is the default, fast boot is reserved for
+    /// emergency restart between 09:00–15:30 IST when cache is valid).
+    ///
+    /// `per_connection[i] = (subscribed_count, capacity, last_activity_secs_ago)`
+    /// indexed by `connection_index`. Length == `total`.
+    WebSocketPoolOnline {
+        connected: usize,
+        total: usize,
+        per_connection: Vec<(usize, usize, Option<u32>)>,
+        boot_path: BootPathLabel,
+        boot_wall_clock_secs: f64,
+    },
+
+    /// Aggregate pool-degraded summary — fires when only a subset of
+    /// connections reached `Connected` after the per-conn deadline.
+    /// `stuck[i] = (connection_index, state_label)` describes each
+    /// non-Connected slot. Replaces the pre-existing
+    /// `WebSocketPoolDegraded { down_secs }` for the boot-time path
+    /// (the watchdog still emits the pre-existing variant for
+    /// mid-session pool-down events).
+    WebSocketPoolPartialAfterDeadline {
+        connected: usize,
+        total: usize,
+        per_connection: Vec<(usize, usize, Option<u32>)>,
+        stuck: Vec<(usize, String)>,
+        boot_path: BootPathLabel,
+    },
 
     /// Pool-level CRITICAL alert: every connection has been down longer than
     /// `POOL_DEGRADED_ALERT_SECS` (default 60). One alert per down-cycle.
@@ -242,13 +322,13 @@ pub enum NotificationEvent {
     },
 
     /// Audit Finding #5 (2026-05-03): pre-market positive-readiness ping.
-    /// Fires once per trading day at 09:14:00 IST — exactly 1 minute
-    /// before the NSE opening bell. Reports current subscription counts
-    /// + token expiry headroom so the operator has a positive "we are
+    /// Fires once per trading day at 09:14:00 IST (exactly 1 minute
+    /// before the NSE opening bell). Reports current subscription counts
+    /// and token expiry headroom so the operator has a positive "we are
     /// READY for the open" signal, not just the existing 09:15:30
     /// post-open confirmation. Closes the false-OK gap from
     /// audit-findings-2026-04-17.md Rule 11. Severity = Info so it never
-    /// pages — it is purely a positive signal. Edge-trigger: fires
+    /// pages (it is purely a positive signal). Edge-trigger: fires
     /// exactly once per trading day, never on mid-session boot past
     /// 09:14:00 IST.
     MarketOpenReadinessConfirmation {
@@ -1202,6 +1282,153 @@ fn render_cross_match_failed(
     out
 }
 
+/// Formats a `usize` with comma thousand separators for human-readable
+/// Telegram messages (e.g. `24324` -> `"24,324"`).
+fn format_with_commas(n: usize) -> String {
+    let s = n.to_string();
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+    let mut out = String::with_capacity(len + len / 3);
+    for (i, byte) in bytes.iter().enumerate() {
+        if i > 0 && (len - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(*byte as char);
+    }
+    out
+}
+
+/// Formats the per-connection ping/pong heartbeat freshness for the
+/// `WebSocketConnected` Telegram payload.
+///
+/// `last_activity_secs_ago` is `None` when no inbound frame has been
+/// seen yet on this socket — render an explicit "no data yet" message
+/// rather than a misleading "0s ago".
+fn format_ping_freshness(secs: Option<u32>) -> String {
+    match secs {
+        None => "—".to_string(),
+        Some(0..=10) => format!("{}s ago ✓", secs.unwrap_or(0)),
+        // 11–30s: still alive (Dhan pings @10s; library auto-pongs)
+        Some(s @ 11..=30) => format!("{s}s ago ⚠"),
+        // > 30s: ping/pong watchdog will fire shortly
+        Some(s) => format!("{s}s ago ❌"),
+    }
+}
+
+/// Renders the WebSocket pool-online (HEALTHY) Telegram message in the
+/// Tier-2 human-readable format. Single message at boot — eye instantly
+/// catches the verdict, then per-feed breakdown for at-a-glance status.
+fn format_pool_online_message(
+    connected: usize,
+    total: usize,
+    per_connection: &[(usize, usize, Option<u32>)],
+    boot_path: BootPathLabel,
+    boot_wall_clock_secs: f64,
+) -> String {
+    let total_subscribed: usize = per_connection.iter().map(|(s, _, _)| *s).sum();
+    let total_capacity: usize = per_connection.iter().map(|(_, c, _)| *c).sum();
+    let pool_pct = if total_capacity == 0 {
+        0.0
+    } else {
+        (total_subscribed as f64 / total_capacity as f64) * 100.0
+    };
+    let mut out = String::new();
+    out.push_str("<b>✅ TickVault is live and ready to trade</b>\n\n");
+    out.push_str(&format!(
+        "📡 All {connected} of {total} market-data feeds connected\n"
+    ));
+    out.push_str(&format!(
+        "📊 Tracking {sub} instruments out of {cap} max ({pct:.0}% full)\n\n",
+        sub = format_with_commas(total_subscribed),
+        cap = format_with_commas(total_capacity),
+        pct = pool_pct,
+    ));
+    out.push_str("Per feed:\n");
+    for (idx, (sub, cap, last)) in per_connection.iter().enumerate() {
+        let display = idx.saturating_add(1);
+        let pct = if *cap == 0 {
+            0.0
+        } else {
+            (*sub as f64 / *cap as f64) * 100.0
+        };
+        let pct_label = if (pct - 100.0).abs() < f64::EPSILON {
+            "full".to_string()
+        } else {
+            format!("{pct:.0}% full")
+        };
+        let ping = format_ping_freshness(*last);
+        out.push_str(&format!(
+            "  Feed {display}: tracking {sub_fmt} instruments ({pct_label}) — last update {ping}\n",
+            sub_fmt = format_with_commas(*sub),
+        ));
+    }
+    out.push_str("\n💚 Heartbeat healthy on all feeds (Dhan pings every 10s, auto-pong)\n");
+    out.push_str(&format!(
+        "⏱️ Boot took {boot_wall_clock_secs:.1} seconds — {path}\n",
+        path = boot_path.human(),
+    ));
+    out.push_str("\nYou're good to go.");
+    out
+}
+
+/// Renders the WebSocket pool-degraded Telegram message in the Tier-2
+/// human-readable format. Includes per-slot stuck reason + retry plan.
+fn format_pool_partial_message(
+    connected: usize,
+    total: usize,
+    per_connection: &[(usize, usize, Option<u32>)],
+    stuck: &[(usize, String)],
+    boot_path: BootPathLabel,
+) -> String {
+    let total_subscribed: usize = per_connection.iter().map(|(s, _, _)| *s).sum();
+    let total_capacity: usize = per_connection.iter().map(|(_, c, _)| *c).sum();
+    let pool_pct = if total_capacity == 0 {
+        0.0
+    } else {
+        (total_subscribed as f64 / total_capacity as f64) * 100.0
+    };
+    let stuck_count = stuck.len();
+    let mut out = String::new();
+    out.push_str("<b>⚠️ TickVault is partially online — needs your attention</b>\n\n");
+    out.push_str(&format!(
+        "📡 {connected} of {total} market-data feeds connected ({stuck_count} stuck)\n"
+    ));
+    out.push_str(&format!(
+        "📊 Tracking {sub} instruments out of {cap} max ({pct:.0}%)\n\n",
+        sub = format_with_commas(total_subscribed),
+        cap = format_with_commas(total_capacity),
+        pct = pool_pct,
+    ));
+    out.push_str("Working feeds:\n");
+    let stuck_idxs: std::collections::HashSet<usize> = stuck.iter().map(|(i, _)| *i).collect();
+    for (idx, (sub, cap, last)) in per_connection.iter().enumerate() {
+        if stuck_idxs.contains(&idx) {
+            continue;
+        }
+        let display = idx.saturating_add(1);
+        let pct = if *cap == 0 {
+            0.0
+        } else {
+            (*sub as f64 / *cap as f64) * 100.0
+        };
+        let ping = format_ping_freshness(*last);
+        out.push_str(&format!(
+            "  Feed {display}: tracking {sub_fmt} instruments ({pct:.0}% full) — last update {ping}\n",
+            sub_fmt = format_with_commas(*sub),
+        ));
+    }
+    out.push_str("\nBroken feeds:\n");
+    for (idx, reason) in stuck {
+        let display = idx.saturating_add(1);
+        out.push_str(&format!("  Feed {display}: {reason}\n"));
+    }
+    out.push_str(&format!(
+        "\n🔄 The system will keep retrying every 5 seconds.\n   Boot path: {path}",
+        path = boot_path.human(),
+    ));
+    out
+}
+
 impl NotificationEvent {
     /// Formats the event as a Telegram message.
     ///
@@ -1273,17 +1500,49 @@ impl NotificationEvent {
                     redact_url_params(reason)
                 )
             }
-            Self::WebSocketConnected { connection_index } => {
-                // UX fix 2026-04-17: display as 1-indexed (WebSocket 1/5)
-                // so operators read a natural 1..N range instead of 0..N-1.
-                // Internal `connection_index` stays 0-based (array index).
+            Self::WebSocketConnected {
+                connection_index,
+                subscribed_count,
+                capacity,
+                last_activity_secs_ago,
+            } => {
+                // 1-indexed for human readability (Feed 1..N).
                 let display = connection_index.saturating_add(1);
                 let total = tickvault_common::constants::MAX_WEBSOCKET_CONNECTIONS;
-                format!("<b>WebSocket {display}/{total} connected</b>")
+                let pct = if *capacity == 0 {
+                    0.0
+                } else {
+                    (*subscribed_count as f64 / *capacity as f64) * 100.0
+                };
+                let ping = format_ping_freshness(*last_activity_secs_ago);
+                format!(
+                    "<b>📡 Feed {display}/{total} is now live</b>\n  \
+                     Tracking {sub} of {cap} instruments ({pct:.0}% full)\n  \
+                     Last update {ping}",
+                    sub = format_with_commas(*subscribed_count),
+                    cap = format_with_commas(*capacity),
+                )
             }
-            Self::WebSocketPoolOnline { connected, total } => {
-                format!("<b>WS pool online:</b> {connected}/{total} connected")
-            }
+            Self::WebSocketPoolOnline {
+                connected,
+                total,
+                per_connection,
+                boot_path,
+                boot_wall_clock_secs,
+            } => format_pool_online_message(
+                *connected,
+                *total,
+                per_connection,
+                *boot_path,
+                *boot_wall_clock_secs,
+            ),
+            Self::WebSocketPoolPartialAfterDeadline {
+                connected,
+                total,
+                per_connection,
+                stuck,
+                boot_path,
+            } => format_pool_partial_message(*connected, *total, per_connection, stuck, *boot_path),
             Self::WebSocketPoolDegraded { down_secs } => {
                 format!(
                     "<b>WS POOL DEGRADED</b>\nAll connections down for {down_secs}s. \
@@ -2207,6 +2466,7 @@ impl NotificationEvent {
             Self::TokenRenewalFailed { .. } => "TokenRenewalFailed",
             Self::WebSocketConnected { .. } => "WebSocketConnected",
             Self::WebSocketPoolOnline { .. } => "WebSocketPoolOnline",
+            Self::WebSocketPoolPartialAfterDeadline { .. } => "WebSocketPoolPartialAfterDeadline",
             Self::WebSocketPoolDegraded { .. } => "WebSocketPoolDegraded",
             Self::WebSocketPoolRecovered { .. } => "WebSocketPoolRecovered",
             Self::WebSocketPoolHalt { .. } => "WebSocketPoolHalt",
@@ -2353,6 +2613,7 @@ impl NotificationEvent {
             Self::CircuitBreakerClosed => Severity::Medium,
             Self::WebSocketConnected { .. } => Severity::Low,
             Self::WebSocketPoolOnline { .. } => Severity::Medium,
+            Self::WebSocketPoolPartialAfterDeadline { .. } => Severity::High,
             Self::WebSocketPoolDegraded { .. } => Severity::High,
             Self::WebSocketPoolRecovered { .. } => Severity::Medium,
             Self::WebSocketPoolHalt { .. } => Severity::High,
@@ -2919,12 +3180,23 @@ mod tests {
     #[test]
     fn test_websocket_connected_includes_index() {
         // UX fix 2026-04-17: display is 1-indexed (connection_index=2 → "3/5")
+        // PR #458 (2026-05-04): payload now includes subscribed/capacity/ping.
         let event = NotificationEvent::WebSocketConnected {
             connection_index: 2,
+            subscribed_count: 5_000,
+            capacity: 5_000,
+            last_activity_secs_ago: Some(2),
         };
         let msg = event.to_message();
         assert!(msg.contains("3"), "1-indexed display: 2 -> 3; got: {msg}");
-        assert!(msg.contains("connected"));
+        assert!(
+            msg.contains("Feed"),
+            "Tier-2 wording uses 'Feed'; got: {msg}"
+        );
+        assert!(
+            msg.contains("5,000"),
+            "comma-formatted subscribed count required; got: {msg}"
+        );
     }
 
     #[test]
@@ -3742,6 +4014,9 @@ mod tests {
     fn test_ws_connected_severity() {
         let event = NotificationEvent::WebSocketConnected {
             connection_index: 0,
+            subscribed_count: 5_000,
+            capacity: 5_000,
+            last_activity_secs_ago: Some(1),
         };
         assert_eq!(event.severity(), Severity::Low);
     }

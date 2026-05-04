@@ -36,12 +36,19 @@ use figment::Figment;
 use figment::providers::{Format, Toml};
 use tickvault_common::config::{ApplicationConfig, FeaturesConfig};
 
-/// Canonical list of all 14 C9 feature-flag names. Source of truth used
+/// Canonical list of all 16 C9 feature-flag names. Source of truth used
 /// by the drift-prevention meta-tests below — if any flag is renamed
 /// in `FeaturesConfig` or `config/base.toml`, this list MUST be updated
 /// too. The cross-check tests guarantee no silent drift between the
 /// three definitions (struct fields ↔ TOML keys ↔ this list).
-const EXPECTED_FLAGS: [&str; 14] = [
+///
+/// PR #458 (2026-05-04): array length corrected from `14` to `16`.
+/// PR #444 (2026-05-03) retired `preopen_movers` (decrement to 13) but
+/// PRs #449/#450 added `depth_dynamic_top_volume`,
+/// `depth_dynamic_pipeline_v2`, `historical_fetch_enabled` (back up
+/// to 16) without updating this list — pre-existing drift that
+/// blocked the build when the test harness compiled this file.
+const EXPECTED_FLAGS: [&str; 16] = [
     "hotpath_async_writers",
     "phase2_emit_guard",
     "stock_movers_full_universe",
@@ -56,6 +63,9 @@ const EXPECTED_FLAGS: [&str; 14] = [
     "telegram_bucket_coalescer",
     "market_open_self_test",
     "realtime_guarantee_score",
+    "depth_dynamic_top_volume",
+    "depth_dynamic_pipeline_v2",
+    "historical_fetch_enabled",
 ];
 
 // ---------------------------------------------------------------------------
@@ -310,7 +320,7 @@ fn test_audit_tables_enabled_default_is_safe() {
 // PreopenMoversTracker + the legacy `preopen_movers` feature flag were
 // retired by Audit-2026-05-03. Pre-open snapshot semantics now live in
 // the canonical `movers_1s.phase` SYMBOL column populated by
-// `movers_base_pipeline`. Operator queries should use
+// `movers_pipeline`. Operator queries should use
 // `WHERE phase = 'PREOPEN'` against the movers_* materialized views.
 // The 3 unit tests that pinned this flag are deleted; the flag itself
 // no longer exists in `FeaturesConfig`.

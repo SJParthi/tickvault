@@ -24,10 +24,15 @@ pub mod depth_dynamic_pipeline;
 pub mod depth_dynamic_pipeline_v2;
 pub mod greeks_pipeline;
 pub mod infra;
-pub mod movers_base_pipeline;
+pub mod movers_pipeline;
+// PR #454 (2026-05-03): boot-time prev_oi cache loader. Wires
+// bhavcopy → cache extraction (PR #450 commit 3 primitives) into
+// the boot path so /api/movers OI Change column is Dhan-precise
+// from the first tick.
+pub mod prev_oi_loader;
 // movers_v2_pipeline DELETED in PR #450 commit 6 — V2 in-memory tracker
 // superseded by canonical movers_1s + 25 mat views populated via
-// movers_base_pipeline.
+// movers_pipeline.
 pub mod observability;
 pub mod phase2_recovery;
 pub mod trading_pipeline;

@@ -1328,7 +1328,7 @@ async fn main() -> Result<()> {
                 .map(|p| std::sync::Arc::new(p.registry.clone()));
 
             // CRITICAL: Use new_disconnected() instead of None — ticks buffer in
-            // ring buffer (600K) + disk spill immediately, even before QuestDB connects.
+            // ring buffer (2M, PR #452 bumped from 600K) + disk spill immediately, even before QuestDB connects.
             // Without this, the only persistence path is the broadcast cold-path consumer,
             // which CAN drop ticks on lag (broadcast::Lagged). With new_disconnected(),
             // the hot-path writer buffers ALL ticks and drains when QuestDB is ready.
@@ -1408,7 +1408,14 @@ async fn main() -> Result<()> {
             // FAST BOOT parity with slow boot (main.rs ~1760):
             // emit per-connection + aggregate Telegram alerts so an operator
             // can see the pool came up after a crash-recovery restart.
-            emit_websocket_connected_alerts(&fast_notifier, handles.len()).await;
+            // PR #458: now polls pool.health() for truthful state.
+            emit_websocket_connected_alerts(
+                &fast_notifier,
+                &pool_arc,
+                tickvault_core::notification::events::BootPathLabel::Fast,
+                boot_start,
+            )
+            .await;
             (handles, Some(pool_arc))
         } else {
             (Vec::new(), None)
@@ -2648,7 +2655,7 @@ async fn main() -> Result<()> {
         // Audit-2026-05-03: legacy `StockMoversWriter` + `OptionMoversWriter`
         // RETIRED. Their target tables (`stock_movers` + `option_movers`)
         // are subsumed by the canonical `movers_1s` + 25 mat views
-        // populated by `movers_base_pipeline`. Frontend queries should
+        // populated by `movers_pipeline`. Frontend queries should
         // filter by `instrument_type` against the `movers_*` views
         // instead of reading the legacy per-category tables.
         // Passing `None` preserves the `run_tick_processor` signature
@@ -2667,7 +2674,7 @@ async fn main() -> Result<()> {
             .map(|p| std::sync::Arc::new(p.registry.clone()));
 
         // PR #450 commit 6 (2026-05-03): V2 movers pipeline DELETED.
-        // Superseded by movers_base_pipeline (below) which writes
+        // Superseded by movers_pipeline (below) which writes
         // movers_1s + 25 mat views — read via the new unified
         // /api/movers handler.
 
@@ -2682,29 +2689,52 @@ async fn main() -> Result<()> {
         // not built — typically a boot path that doesn't load instruments).
         let movers_base_shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
         let _movers_base_handle = if let Some(registry) = slow_registry.as_ref() {
-            // PR #450 commit 2 (2026-05-03): empty prev_oi cache for now.
-            // Commit 3 ships the data primitives (extract_prev_oi_from_option_chain
-            // + build_prev_oi_cache_from_bhavcopy); the boot orchestrator
-            // wiring (download bhavcopy → parse → fetch option chains →
-            // merge → pass Arc) lands in PR #452 (8:15 AM ready boot
-            // orchestrator).
-            //
-            // PR #450 commit 8 hostile-bug-hunt HIGH H2 fix: emit a
-            // boot-time WARN so the operator KNOWS the OI Change column
-            // on /api/movers will compute as `current - 0 = current`
-            // until PR #452 wires the loader. This is a misleading
-            // value (false-OK signal per audit-findings Rule 11) — the
-            // WARN ensures it's not silent.
-            let prev_oi_cache: std::sync::Arc<std::collections::HashMap<(u32, u8), i64>> =
-                std::sync::Arc::new(std::collections::HashMap::new());
-            warn!(
-                code = tickvault_common::error_code::ErrorCode::PrevOi01CacheEmptyAtBoot.code_str(),
-                "prev_oi cache EMPTY at boot — /api/movers OI Change column will display \
-                 `current_OI - 0 = current_OI` until PR #452 wires the bhavcopy + \
-                 Option Chain prev_oi loader. Operators must NOT trust the OI Change \
-                 + OI Change % columns until then."
-            );
-            Some(tickvault_app::movers_base_pipeline::spawn_movers_pipeline(
+            // PR #454 (2026-05-03): boot-time prev_oi cache loader.
+            // Wires PR #450 commit 3 primitives (bhavcopy fetch + parse
+            // + build_prev_oi_cache_from_bhavcopy) into the boot path.
+            // On success the cache is populated with yesterday's
+            // session-close OI for every NSE F&O contract we subscribe;
+            // /api/movers OI Change column displays Dhan-precise values
+            // from the very first tick. On failure (404, network
+            // timeout, unzip, parse error) the loader returns an empty
+            // cache + emits its own typed `error!` with code
+            // `PREVOI-01` (see prev_oi_loader.rs error sites). The
+            // downstream movers_pipeline then operates with
+            // `current_OI - 0 = current_OI` for OI Change — a
+            // gracefully-degraded fallback rather than a HALT.
+            // PR #456 (2026-05-04): boot calls the OVERLAY variant
+            // which runs bhavcopy first, then layers Dhan-canonical
+            // Option Chain `previous_oi` for NIFTY/BANKNIFTY/SENSEX
+            // on top (last-wins). Total boot cost: ~5-6 min bhavcopy
+            // + ~18s overlay (3 underlyings × 2 calls × 3s rate-limit).
+            let prev_oi_cache =
+                tickvault_app::prev_oi_loader::load_prev_oi_cache_at_boot_with_overlay(
+                    registry,
+                    trading_calendar.as_ref(),
+                    token_handle.clone(),
+                    ws_client_id.clone(),
+                    config.dhan.rest_api_base_url.clone(),
+                )
+                .await;
+            if prev_oi_cache.is_empty() {
+                // The loader's internal error sites already emitted
+                // PREVOI-01. This WARN at the spawn site documents the
+                // operational consequence — preserved per
+                // audit-findings Rule 11 (no false-OK signals).
+                warn!(
+                    code = tickvault_common::error_code::ErrorCode::PrevOi01CacheEmptyAtBoot
+                        .code_str(),
+                    "prev_oi cache EMPTY at boot — /api/movers OI Change column \
+                     will display `current_OI - 0 = current_OI` until next boot \
+                     succeeds in fetching yesterday's NSE bhavcopy."
+                );
+            } else {
+                info!(
+                    cache_size = prev_oi_cache.len(),
+                    "prev_oi cache populated — /api/movers OI Change column is Dhan-precise"
+                );
+            }
+            Some(tickvault_app::movers_pipeline::spawn_movers_pipeline(
                 config.questdb.clone(),
                 tick_broadcast_sender.clone(),
                 std::sync::Arc::clone(&movers_base_shutdown),
@@ -2712,9 +2742,7 @@ async fn main() -> Result<()> {
                 prev_oi_cache,
             ))
         } else {
-            warn!(
-                "movers_base_pipeline NOT spawned — slow_registry is None (subscription_plan absent)"
-            );
+            warn!("movers_pipeline NOT spawned — slow_registry is None (subscription_plan absent)");
             None
         };
 
@@ -3308,7 +3336,14 @@ async fn main() -> Result<()> {
         );
         // FAST BOOT parity: helper emits per-connection + aggregate Telegram
         // alerts on BOTH boot paths (main.rs ~830 for FAST BOOT, here for slow).
-        emit_websocket_connected_alerts(&notifier, handles.len()).await;
+        // PR #458: now polls pool.health() for truthful state.
+        emit_websocket_connected_alerts(
+            &notifier,
+            &pool_arc,
+            tickvault_core::notification::events::BootPathLabel::Slow,
+            boot_start,
+        )
+        .await;
         (handles, Some(pool_arc))
     } else {
         (Vec::new(), None)
@@ -4061,6 +4096,23 @@ async fn main() -> Result<()> {
                     // only on task-exit for DepthTwentyDisconnected.
                     let d20_reconnect_notifier = Some(notifier.clone());
                     let (signal_tx, signal_rx) = tokio::sync::oneshot::channel::<()>();
+                    // PR #460 (2026-05-04): truthful-emit pattern. Shared flag
+                    // between the signal-rx waiter (which increments the
+                    // counter ONLY when the connection emits its first data
+                    // frame) and the connection-runner task (which decrements
+                    // ONLY if the increment had previously happened). The
+                    // legacy "increment at spawn / decrement on Err" pattern
+                    // produced false-OK signals: a task stuck in handshake
+                    // for 30s reported as connected, and the Telegram showed
+                    // "Depth-20: 5/5" before any Dhan handshake completed.
+                    // Now the counter reflects truth: only TRULY-streaming
+                    // connections count.
+                    let d20_truly_connected =
+                        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    let d20_truly_connected_for_signal =
+                        std::sync::Arc::clone(&d20_truly_connected);
+                    let d20_truly_connected_for_exit = std::sync::Arc::clone(&d20_truly_connected);
+                    let d20_health_for_signal = d20_health.clone();
                     // Command channel for live rebalance (unsubscribe+resubscribe, zero disconnect).
                     let (d20_cmd_tx, d20_cmd_rx) =
                         tokio::sync::mpsc::channel::<tickvault_core::websocket::DepthCommand>(4);
@@ -4072,9 +4124,8 @@ async fn main() -> Result<()> {
                         });
                     }
                     tokio::spawn(async move {
-                        d20_health.set_depth_20_connections(
-                            d20_health.depth_20_connections().saturating_add(1),
-                        );
+                        // PR #460: NO increment-on-spawn. Counter is gated on
+                        // signal_rx firing (= first data frame received).
 
                         if let Err(err) = tickvault_core::websocket::run_twenty_depth_connection(
                             depth_token,
@@ -4109,6 +4160,14 @@ async fn main() -> Result<()> {
                                     },
                                 );
                             }
+                        }
+                        // PR #460: decrement on EVERY task exit (Ok or Err)
+                        // BUT only if we had previously incremented (signal
+                        // fired). Avoids underflow when a task exits before
+                        // ever reaching Connected (e.g. handshake timeout).
+                        if d20_truly_connected_for_exit
+                            .swap(false, std::sync::atomic::Ordering::AcqRel)
+                        {
                             d20_health.set_depth_20_connections(
                                 d20_health.depth_20_connections().saturating_sub(1),
                             );
@@ -4122,6 +4181,25 @@ async fn main() -> Result<()> {
                         let notify_sender = notifier.clone();
                         tokio::spawn(async move {
                             if signal_rx.await.is_ok() {
+                                // PR #460 (2026-05-04): truthful-emit. The
+                                // signal fires AFTER the connection emits
+                                // its first data frame — that's the only
+                                // truthful "Depth-20 connection is live"
+                                // signal Dhan gives us. Increment the
+                                // counter HERE, not at task spawn. Compare-
+                                // and-swap on the shared flag protects
+                                // against double-increment if `signal_rx`
+                                // somehow fires twice (it cannot — oneshot —
+                                // but the CAS makes the contract explicit).
+                                if !d20_truly_connected_for_signal
+                                    .swap(true, std::sync::atomic::Ordering::AcqRel)
+                                {
+                                    d20_health_for_signal.set_depth_20_connections(
+                                        d20_health_for_signal
+                                            .depth_20_connections()
+                                            .saturating_add(1),
+                                    );
+                                }
                                 notify_sender.notify(NotificationEvent::DepthTwentyConnected {
                                     underlying: notify_label,
                                 });
@@ -4316,6 +4394,18 @@ async fn main() -> Result<()> {
                             depth_200_spawn_index = depth_200_spawn_index.saturating_add(1);
                             let (d200_signal_tx, d200_signal_rx) =
                                 tokio::sync::oneshot::channel::<()>();
+                            // PR #460 (2026-05-04): truthful-emit pattern for
+                            // depth-200 (mirror of depth-20 above). Counter
+                            // is gated on signal_rx firing (= first data
+                            // frame received). Shared flag prevents double-
+                            // increment / decrement-without-increment.
+                            let d200_truly_connected =
+                                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                            let d200_truly_connected_for_signal =
+                                std::sync::Arc::clone(&d200_truly_connected);
+                            let d200_truly_connected_for_exit =
+                                std::sync::Arc::clone(&d200_truly_connected);
+                            let d200_health_for_signal = d200_health.clone();
                             // Command channel for live 200-level rebalance (zero disconnect).
                             let d200_handle_key = format!("{underlying}-{opt_label}"); // e.g. "NIFTY-CE"
                             let (d200_cmd_tx, d200_cmd_rx) = tokio::sync::mpsc::channel::<
@@ -4329,9 +4419,8 @@ async fn main() -> Result<()> {
                                 });
                             }
                             let d200_handle = tokio::spawn(async move {
-                                d200_health.set_depth_200_connections(
-                                    d200_health.depth_200_connections().saturating_add(1),
-                                );
+                                // PR #460: NO increment-on-spawn. Counter is
+                                // gated on d200_signal_rx firing.
 
                                 if let Err(err) =
                                     tickvault_core::websocket::run_two_hundred_depth_connection(
@@ -4386,6 +4475,13 @@ async fn main() -> Result<()> {
                                             },
                                         );
                                     }
+                                }
+                                // PR #460: decrement on EVERY task exit (Ok
+                                // or Err) but ONLY if we had previously
+                                // incremented (signal fired).
+                                if d200_truly_connected_for_exit
+                                    .swap(false, std::sync::atomic::Ordering::AcqRel)
+                                {
                                     d200_health.set_depth_200_connections(
                                         d200_health.depth_200_connections().saturating_sub(1),
                                     );
@@ -4404,6 +4500,19 @@ async fn main() -> Result<()> {
                                 let notify_sender = notifier.clone();
                                 tokio::spawn(async move {
                                     if d200_signal_rx.await.is_ok() {
+                                        // PR #460: truthful-emit. Increment
+                                        // counter ONLY when first data frame
+                                        // arrives (signal fires). CAS prevents
+                                        // double-increment.
+                                        if !d200_truly_connected_for_signal
+                                            .swap(true, std::sync::atomic::Ordering::AcqRel)
+                                        {
+                                            d200_health_for_signal.set_depth_200_connections(
+                                                d200_health_for_signal
+                                                    .depth_200_connections()
+                                                    .saturating_add(1),
+                                            );
+                                        }
                                         notify_sender.notify(
                                             NotificationEvent::DepthTwoHundredConnected {
                                                 contract: d200_label_for_signal,
@@ -4593,7 +4702,7 @@ async fn main() -> Result<()> {
             // Audit-2026-05-03: legacy `preopen_movers_universe` clone
             // removed — PreopenMoversTracker retired, its phase=PREOPEN
             // snapshot semantics now live in `movers_1s.phase` populated
-            // by `movers_base_pipeline`.
+            // by `movers_pipeline`.
             // Wave 5 commit 5: rebalance consumer needs universe to
             // compute single-side ATM ± 24 windows for Swap20 fan-out
             // to NIFTY-CE / NIFTY-PE / BANKNIFTY-CE / BANKNIFTY-PE
@@ -7248,44 +7357,109 @@ async fn spawn_websocket_connections(
     handles
 }
 
-/// Stagger in milliseconds between per-connection `WebSocketConnected` events.
-/// Telegram rate-limits bursts of identical-from messages; spacing the emits
-/// avoids silent drops. A 5-connection pool at 150 ms adds ~750 ms to boot,
-/// which is negligible against the 15-step boot budget.
-const WS_CONNECTED_ALERT_STAGGER_MS: u64 = 150;
+/// Per-connection deadline for the truthful boot-time emit. If a slot
+/// has not transitioned to `Connected` within this window after
+/// `pool.spawn_handles()` returned, it is reported in the
+/// `WebSocketPoolPartialAfterDeadline` event with its current state as
+/// the stuck reason.
+const WS_BOOT_PER_CONN_DEADLINE_SECS: u64 = 30;
+
+/// Polling interval inside the truthful emit loop. 250ms gives sub-second
+/// freshness for state transitions without burning CPU.
+const WS_BOOT_POLL_INTERVAL_MS: u64 = 250;
 
 /// Emits per-connection `WebSocketConnected` Telegram events plus a single
-/// aggregate `WebSocketPoolOnline` summary. Called from BOTH boot paths
-/// (FAST BOOT and slow boot) so an operator sees the same signal regardless
-/// of which path ran.
+/// aggregate `WebSocketPoolOnline` summary — but ONLY when each connection
+/// has actually reached `ConnectionState::Connected` per `pool.health()`,
+/// not merely "task spawned". Called from BOTH boot paths (FAST BOOT and
+/// slow boot) so an operator sees the same truthful signal regardless of
+/// which path ran.
 ///
-/// Why the summary: when 5 per-connection events fire in a tight loop,
-/// Telegram can drop individual messages (observed live on 2026-04-17 —
-/// only 3 of 5 arrived). The aggregate is delivered with a small stagger
-/// after the individuals so even if all per-connection drops happen, a
-/// single "N/total online" message still reaches the operator chat.
+/// PR #458 (2026-05-04): the legacy version emitted both events
+/// immediately after `pool.spawn_handles()` returned, using `handle_count`
+/// for both `connected` and `total` — a false-OK when handshake had not
+/// yet completed. The rewrite polls `pool.health()` every 250ms for up
+/// to 30s per slot and emits the per-connection event only on the rising
+/// edge of `Connected`. The aggregate `WebSocketPoolOnline` fires only
+/// when ALL slots are `Connected`; otherwise
+/// `WebSocketPoolPartialAfterDeadline` fires with the stuck-slot
+/// breakdown.
 async fn emit_websocket_connected_alerts(
     notifier: &std::sync::Arc<NotificationService>,
-    handle_count: usize,
+    pool: &std::sync::Arc<WebSocketConnectionPool>,
+    boot_path: tickvault_core::notification::events::BootPathLabel,
+    boot_start: std::time::Instant,
 ) {
-    if handle_count == 0 {
+    let healths_initial = pool.health();
+    let total = healths_initial.len();
+    if total == 0 {
         return;
     }
-    for i in 0..handle_count {
-        notifier.notify(NotificationEvent::WebSocketConnected {
-            connection_index: i,
-        });
-        if i + 1 < handle_count {
-            tokio::time::sleep(std::time::Duration::from_millis(
-                WS_CONNECTED_ALERT_STAGGER_MS,
-            ))
-            .await;
+    let capacity = tickvault_common::constants::MAX_INSTRUMENTS_PER_WEBSOCKET_CONNECTION;
+    let mut emitted_per_conn = vec![false; total];
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(WS_BOOT_PER_CONN_DEADLINE_SECS);
+
+    while std::time::Instant::now() < deadline {
+        let healths = pool.health();
+        for h in &healths {
+            let i = h.connection_id as usize;
+            if i >= total || emitted_per_conn[i] {
+                continue;
+            }
+            if h.state == tickvault_core::websocket::types::ConnectionState::Connected {
+                emitted_per_conn[i] = true;
+                notifier.notify(NotificationEvent::WebSocketConnected {
+                    connection_index: i,
+                    subscribed_count: h.subscribed_count,
+                    capacity,
+                    last_activity_secs_ago: h.last_activity_secs_ago,
+                });
+            }
+        }
+        if emitted_per_conn.iter().all(|v| *v) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(WS_BOOT_POLL_INTERVAL_MS)).await;
+    }
+
+    // Final snapshot — derive aggregate truth from pool.health(), NOT
+    // from the spawn count.
+    let healths_final = pool.health();
+    let mut per_connection: Vec<(usize, usize, Option<u32>)> = vec![(0, capacity, None); total];
+    let mut connected_count = 0usize;
+    let mut stuck: Vec<(usize, String)> = Vec::new();
+    for h in &healths_final {
+        let i = h.connection_id as usize;
+        if i >= total {
+            continue;
+        }
+        per_connection[i] = (h.subscribed_count, capacity, h.last_activity_secs_ago);
+        if h.state == tickvault_core::websocket::types::ConnectionState::Connected {
+            connected_count = connected_count.saturating_add(1);
+        } else {
+            stuck.push((i, format!("state={}", h.state)));
         }
     }
-    notifier.notify(NotificationEvent::WebSocketPoolOnline {
-        connected: handle_count,
-        total: handle_count,
-    });
+    let boot_wall_clock_secs = boot_start.elapsed().as_secs_f64();
+
+    if connected_count == total {
+        notifier.notify(NotificationEvent::WebSocketPoolOnline {
+            connected: connected_count,
+            total,
+            per_connection,
+            boot_path,
+            boot_wall_clock_secs,
+        });
+    } else {
+        notifier.notify(NotificationEvent::WebSocketPoolPartialAfterDeadline {
+            connected: connected_count,
+            total,
+            per_connection,
+            stuck,
+            boot_path,
+        });
+    }
 }
 
 /// S4-T1a: Background pool health watchdog.
@@ -8155,7 +8329,7 @@ async fn run_tick_persistence_consumer(
                 // C2: CRITICAL — ticks permanently lost due to broadcast lag.
                 // This fires ERROR log → Loki → Telegram alert automatically.
                 // Root cause: QuestDB ILP flush is slower than tick ingestion rate.
-                // Defense: broadcast capacity 262K + tick writer ring buffer 600K + disk spill.
+                // Defense: broadcast capacity 262K + tick writer ring buffer 2M (PR #452) + disk spill.
                 error!(
                     skipped,
                     "CRITICAL: cold-path tick persistence lagged — {} ticks permanently lost",
