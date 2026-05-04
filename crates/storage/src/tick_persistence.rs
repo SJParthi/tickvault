@@ -680,8 +680,14 @@ impl TickPersistenceWriter {
     /// - Fields: `ts_ms`, `reason`, `security_id`, `segment`, `ltt`, `ltp`,
     ///   `ltq`, `volume`, `atp`, `buy_qty`, `sell_qty`, `open`, `close`,
     ///   `high`, `low`, `oi`.
+    /// Phase 2.14 security MEDIUM fix: `reason` MUST be `&'static str`
+    /// (compile-time literal). The type system rejects any runtime
+    /// string at the call site, so the NDJSON line cannot carry
+    /// unescaped `"` or `\` chars that would corrupt the audit log
+    /// during recovery. All current callers use literals — this is a
+    /// no-op runtime change that hardens the compile-time contract.
     #[rustfmt::skip]
-    fn write_to_dlq(&mut self, tick: &ParsedTick, reason: &str) {
+    fn write_to_dlq(&mut self, tick: &ParsedTick, reason: &'static str) {
         // Lazy-open DLQ file on first failure.
         if self.dlq_writer.is_none() && let Err(err) = self.open_dlq_file() {
             error!(?err, security_id = tick.security_id, reason, "CRITICAL: DLQ open failed — tick PERMANENTLY LOST");
