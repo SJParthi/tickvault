@@ -3352,6 +3352,27 @@ async fn main() -> Result<()> {
         // dispatcher to gate the actual frame send.
         drop(std::sync::Arc::clone(&boot_ordering_gate));
 
+        // 29-tf engine Phase 2.7 (hostile bug-hunt CRITICAL C1 fix):
+        // spawn the IST midnight rollover task. Without this, the
+        // volume_delta tracker accumulates baselines across day
+        // boundaries and the first ~24,300 ticks at 09:15 IST on
+        // Day N+1 trigger false VOLUME-MONO-01 alerts (per L13).
+        //
+        // The task sleeps until next IST 00:00:00, performs the
+        // atomic phase transition (clear volume baselines + clear
+        // prev_day_close stamps + reload prev_oi_cache from
+        // candles_1d), then loops. Cancelable via the JoinHandle
+        // returned by spawn_midnight_rollover_task.
+        let _midnight_rollover_handle =
+            tickvault_core::pipeline::tick_enricher::spawn_midnight_rollover_task(
+                std::sync::Arc::clone(&tick_enricher),
+                config.questdb.clone(),
+            );
+        tracing::info!(
+            "midnight rollover task spawned (Phase 2.7 — L13 atomic state \
+             transition at IST 00:00:00 every trading day)"
+        );
+
         let handle = tokio::spawn(async move {
             run_tick_processor(
                 receiver,

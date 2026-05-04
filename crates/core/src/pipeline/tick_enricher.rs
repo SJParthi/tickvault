@@ -46,6 +46,20 @@ use crate::pipeline::prev_day_close_stamper::PrevDayCloseStamper;
 use crate::pipeline::prev_oi_cache::PrevOiCache;
 use crate::pipeline::volume_delta_tracker::{DeltaOutcome, VolumeDeltaTracker};
 
+/// Lightweight flag bundle extracted from `EnrichedTick` so callers
+/// can pass the suppression/state signals around without holding the
+/// `'a` lifetime borrow on `ParsedTick`. Used by the tick-processor
+/// hot loop to gate VOLUME-MONO-01 (Phase 2.7 hostile-bug-hunt
+/// CRITICAL C2 fix).
+///
+/// All three fields are `Copy`; the struct is `Copy` itself.
+#[derive(Clone, Copy, Debug)]
+pub struct EnrichedTickFlags {
+    pub volume_is_first_seen: bool,
+    pub volume_is_regression: bool,
+    pub phase: Phase,
+}
+
 /// Output of `enrich_tick`. Bundles the original tick with the four
 /// Phase 2 lifecycle values plus regression flags from VOLUME-MONO-01.
 #[derive(Clone, Copy, Debug)]
@@ -162,6 +176,60 @@ impl TickEnricher {
             "tick_enricher rollover for new day: volume_delta + prev_day_close cleared (prev_oi_cache reload is caller responsibility)"
         );
     }
+}
+
+/// Spawns the IST-midnight rollover task per L13 (29-tf engine plan).
+///
+/// At each IST 00:00:00 boundary the task:
+///   1. Calls `enricher.rollover_for_new_day()` — clears
+///      volume_delta baselines + prev_day_close stamps.
+///   2. Calls `enricher.prev_oi_cache.load_from_questdb(&questdb_config)` —
+///      reloads yesterday's OI baseline from the just-closed `candles_1d`
+///      partition.
+///   3. Sleeps until the next IST midnight.
+///
+/// Phase 2.7 hostile bug-hunt CRITICAL C1 fix: without this task
+/// wired into the slow boot sequence, the volume_delta tracker
+/// accumulates baselines across day boundaries and the first ~24,300
+/// ticks at 09:15 IST on Day N+1 trigger false VOLUME-MONO-01 alerts.
+///
+/// O(1) per IST midnight (1 sweep + 1 HTTP call + 86,400 idle
+/// seconds). Cancelable by dropping the returned `JoinHandle`.
+pub fn spawn_midnight_rollover_task(
+    enricher: std::sync::Arc<TickEnricher>,
+    questdb_config: tickvault_common::config::QuestDbConfig,
+) -> tokio::task::JoinHandle<()> {
+    use tickvault_common::market_hours::secs_until_next_ist_midnight;
+
+    tokio::spawn(async move {
+        loop {
+            let secs = secs_until_next_ist_midnight();
+            tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+
+            // L13 step 1 + 3: clear local enricher state.
+            enricher.rollover_for_new_day();
+            metrics::counter!("tv_midnight_rollover_total").increment(1);
+
+            // L13 step 2: reload prev_oi_cache from yesterday's candles_1d.
+            // QuestDB's daily candle for the just-closed day is finalized
+            // at the partition boundary; the LATEST ON ts query returns
+            // the last_oi value of that candle.
+            match enricher
+                .prev_oi_cache
+                .load_from_questdb(&questdb_config)
+                .await
+            {
+                Ok(count) => info!(
+                    entries = count,
+                    "midnight rollover: prev_oi_cache reloaded from candles_1d (L13 step 2)"
+                ),
+                Err(err) => tracing::warn!(
+                    ?err,
+                    "midnight rollover: prev_oi_cache reload failed; enricher continues with previous cache state (graceful degradation)"
+                ),
+            }
+        }
+    })
 }
 
 #[cfg(test)]
