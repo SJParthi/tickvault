@@ -23,6 +23,7 @@ pub mod prev_close_persist;
 pub mod prev_close_writer;
 pub mod prev_day_close_stamper;
 pub mod prev_oi_cache;
+pub mod tick_enricher;
 pub mod tick_gap_detector;
 pub mod tick_processor;
 pub mod top_movers;
