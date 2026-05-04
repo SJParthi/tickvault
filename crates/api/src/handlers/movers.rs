@@ -480,7 +480,12 @@ pub async fn get_movers(
     {
         Ok(c) => c,
         Err(err) => {
-            tracing::error!(?err, code = "MOVERS-04", "build reqwest client failed");
+            // PR #455 (2026-05-04) MEDIUM-fix: `?err` Debug formatter
+            // embeds reqwest URL (containing internal QuestDB host:port)
+            // in Loki structured logs. Use `.without_url()` to strip
+            // the URL before formatting via Display.
+            let err = err.without_url();
+            tracing::error!(error = %err, code = "MOVERS-04", "build reqwest client failed");
             return service_unavailable("client_build_failed");
         }
     };
@@ -493,7 +498,9 @@ pub async fn get_movers(
     {
         Ok(r) => r,
         Err(err) => {
-            tracing::error!(?err, code = "MOVERS-04", "QuestDB /exec request failed");
+            // PR #455: same URL redaction as above.
+            let err = err.without_url();
+            tracing::error!(error = %err, code = "MOVERS-04", "QuestDB /exec request failed");
             return service_unavailable("questdb_unreachable");
         }
     };
@@ -507,7 +514,9 @@ pub async fn get_movers(
     let body: serde_json::Value = match resp.json().await {
         Ok(v) => v,
         Err(err) => {
-            tracing::error!(?err, code = "MOVERS-05", "QuestDB JSON parse failed");
+            // PR #455: same URL redaction.
+            let err = err.without_url();
+            tracing::error!(error = %err, code = "MOVERS-05", "QuestDB JSON parse failed");
             return service_unavailable("questdb_parse_failed");
         }
     };
@@ -710,7 +719,9 @@ pub async fn get_expiries(
     {
         Ok(c) => c,
         Err(err) => {
-            tracing::error!(?err, code = "MOVERS-06", "build reqwest client failed");
+            // PR #455: see movers.rs:483 fix — strip URL from reqwest error.
+            let err = err.without_url();
+            tracing::error!(error = %err, code = "MOVERS-06", "build reqwest client failed");
             return service_unavailable("client_build_failed");
         }
     };
@@ -723,8 +734,10 @@ pub async fn get_expiries(
     {
         Ok(r) => r,
         Err(err) => {
+            // PR #455: same URL redaction.
+            let err = err.without_url();
             tracing::error!(
-                ?err,
+                error = %err,
                 code = "MOVERS-06",
                 "QuestDB /api/movers/expiries query failed"
             );
@@ -745,8 +758,10 @@ pub async fn get_expiries(
     let body: serde_json::Value = match resp.json().await {
         Ok(v) => v,
         Err(err) => {
+            // PR #455: same URL redaction.
+            let err = err.without_url();
             tracing::error!(
-                ?err,
+                error = %err,
                 code = "MOVERS-06",
                 "QuestDB JSON parse failed for /api/movers/expiries"
             );
