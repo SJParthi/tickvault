@@ -242,13 +242,13 @@ pub enum NotificationEvent {
     },
 
     /// Audit Finding #5 (2026-05-03): pre-market positive-readiness ping.
-    /// Fires once per trading day at 09:14:00 IST — exactly 1 minute
-    /// before the NSE opening bell. Reports current subscription counts
-    /// + token expiry headroom so the operator has a positive "we are
+    /// Fires once per trading day at 09:14:00 IST (exactly 1 minute
+    /// before the NSE opening bell). Reports current subscription counts
+    /// and token expiry headroom so the operator has a positive "we are
     /// READY for the open" signal, not just the existing 09:15:30
     /// post-open confirmation. Closes the false-OK gap from
     /// audit-findings-2026-04-17.md Rule 11. Severity = Info so it never
-    /// pages — it is purely a positive signal. Edge-trigger: fires
+    /// pages (it is purely a positive signal). Edge-trigger: fires
     /// exactly once per trading day, never on mid-session boot past
     /// 09:14:00 IST.
     MarketOpenReadinessConfirmation {
@@ -1309,11 +1309,13 @@ impl NotificationEvent {
                 order_update_active,
             } => {
                 let oms = if *order_update_active { "1/1" } else { "0/1" };
+                let d20_total = tickvault_common::constants::MAX_TWENTY_DEPTH_CONNECTIONS;
+                let d200_total = tickvault_common::constants::MAX_TWO_HUNDRED_DEPTH_CONNECTIONS;
                 format!(
                     "<b>Streaming live @ 09:15:30 IST</b>\n\
                      Main feed: {main_feed_active}/{main_feed_total}\n\
-                     Depth-20: {depth_20_active}/4\n\
-                     Depth-200: {depth_200_active}/4\n\
+                     Depth-20: {depth_20_active}/{d20_total}\n\
+                     Depth-200: {depth_200_active}/{d200_total}\n\
                      Order updates: {oms}"
                 )
             }
@@ -1325,11 +1327,13 @@ impl NotificationEvent {
                 order_update_active,
             } => {
                 let oms = if *order_update_active { "1/1" } else { "0/1" };
+                let d20_total = tickvault_common::constants::MAX_TWENTY_DEPTH_CONNECTIONS;
+                let d200_total = tickvault_common::constants::MAX_TWO_HUNDRED_DEPTH_CONNECTIONS;
                 format!(
                     "<b>MARKET OPEN STREAMING FAILED @ 09:15:30 IST</b>\n\
                      Main feed: {main_feed_active}/{main_feed_total} — NO CONNECTIONS\n\
-                     Depth-20: {depth_20_active}/4\n\
-                     Depth-200: {depth_200_active}/4\n\
+                     Depth-20: {depth_20_active}/{d20_total}\n\
+                     Depth-200: {depth_200_active}/{d200_total}\n\
                      Order updates: {oms}\n\
                      Action: check pool watchdog, token validity, Dhan status."
                 )
@@ -1344,11 +1348,13 @@ impl NotificationEvent {
             } => {
                 let oms = if *order_update_active { "1/1" } else { "0/1" };
                 let token_hours = *token_remaining_secs as f64 / 3600.0;
+                let d20_total = tickvault_common::constants::MAX_TWENTY_DEPTH_CONNECTIONS;
+                let d200_total = tickvault_common::constants::MAX_TWO_HUNDRED_DEPTH_CONNECTIONS;
                 format!(
                     "<b>READY for market open @ 09:14:00 IST</b>\n\
                      Main feed: {main_feed_active}/{main_feed_total}\n\
-                     Depth-20: {depth_20_active}/4\n\
-                     Depth-200: {depth_200_active}/4\n\
+                     Depth-20: {depth_20_active}/{d20_total}\n\
+                     Depth-200: {depth_200_active}/{d200_total}\n\
                      Order updates: {oms}\n\
                      Token headroom: {token_hours:.1}h\n\
                      Bell rings in 60s."
@@ -4356,8 +4362,8 @@ mod tests {
         let msg = ev.to_message();
         assert!(msg.contains("Streaming live"), "got: {msg}");
         assert!(msg.contains("Main feed: 5/5"), "got: {msg}");
-        assert!(msg.contains("Depth-20: 4/4"), "got: {msg}");
-        assert!(msg.contains("Depth-200: 4/4"), "got: {msg}");
+        assert!(msg.contains("Depth-20: 4/5"), "got: {msg}");
+        assert!(msg.contains("Depth-200: 4/5"), "got: {msg}");
         assert!(msg.contains("Order updates: 1/1"), "got: {msg}");
         assert!(
             msg.contains("09:15:30"),
@@ -4415,8 +4421,8 @@ mod tests {
         assert!(msg.contains("READY for market open"), "got: {msg}");
         assert!(msg.contains("09:14:00 IST"), "got: {msg}");
         assert!(msg.contains("Main feed: 5/5"), "got: {msg}");
-        assert!(msg.contains("Depth-20: 4/4"), "got: {msg}");
-        assert!(msg.contains("Depth-200: 4/4"), "got: {msg}");
+        assert!(msg.contains("Depth-20: 4/5"), "got: {msg}");
+        assert!(msg.contains("Depth-200: 4/5"), "got: {msg}");
         assert!(msg.contains("Order updates: 1/1"), "got: {msg}");
     }
 
