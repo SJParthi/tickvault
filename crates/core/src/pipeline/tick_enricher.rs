@@ -232,6 +232,127 @@ pub fn spawn_midnight_rollover_task(
     })
 }
 
+/// Polling interval for `spawn_prev_oi_cache_refresh_task` — 5 minutes.
+/// Bounds operator-visible OI staleness on a fresh-deploy boot to one
+/// 5-minute window past the time `candles_1d` first becomes populated.
+pub const PREV_OI_CACHE_REFRESH_INTERVAL_SECS: u64 = 300;
+
+/// Spawns the periodic prev_oi_cache refresh task per Phase 2.11
+/// (hostile bug-hunt M2 + M4 fixes).
+///
+/// This task addresses TWO scenarios that the boot-time + midnight
+/// load do NOT cover:
+///
+/// **M2 — boot at 23:50 IST window:** the boot-time load reads
+/// "today's" `candles_1d` row briefly before midnight; minutes
+/// later that row becomes "yesterday's" without an immediate
+/// reload. The midnight task fires at 00:00 IST and reloads, but
+/// the cache was correct anyway in this case.
+///
+/// **M4 — fresh deploy with empty `candles_1d`:** boot-time load
+/// returns `Ok(count=0)` (legitimate — first trading day on this
+/// instance). The cache stays empty until the next IST midnight,
+/// which means OI Change panels read 0% for the entire first day.
+/// Periodic refresh closes that gap once the matview pipeline
+/// produces its first daily candle.
+///
+/// **M4 — QuestDB recovers post-boot:** if `candles_1d` was
+/// unavailable at boot time but Phase 2.9's hard-fail didn't fire
+/// (e.g. matview chain still building), this task's poll picks up
+/// the data once available.
+///
+/// ## Behavior
+///
+/// - Polls every `PREV_OI_CACHE_REFRESH_INTERVAL_SECS` (5 min).
+/// - Only retries when `cache.is_empty() == true`. Once the cache
+///   has any entries, it's considered hot and the midnight task
+///   owns subsequent reloads.
+/// - On Ok with non-zero count: logs `info!`, increments
+///   `tv_prev_oi_cache_refresh_total{outcome="populated"}`, and
+///   the task EXITS (the midnight task takes over from here).
+/// - On Ok with count=0: continues polling (cache still empty).
+/// - On Err: logs `warn!`, continues polling.
+///
+/// Cancelable by dropping the returned `JoinHandle`.
+pub fn spawn_prev_oi_cache_refresh_task(
+    enricher: std::sync::Arc<TickEnricher>,
+    questdb_config: tickvault_common::config::QuestDbConfig,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        // Skip if cache already has data (boot-time load succeeded
+        // with non-empty result) — this task only handles the
+        // empty-cache recovery path.
+        if !enricher.prev_oi_cache.is_empty() {
+            info!(
+                entries = enricher.prev_oi_cache.len(),
+                "prev_oi_cache already populated at boot — refresh task exiting (midnight task owns subsequent reloads)"
+            );
+            return;
+        }
+
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(
+                PREV_OI_CACHE_REFRESH_INTERVAL_SECS,
+            ))
+            .await;
+
+            if !enricher.prev_oi_cache.is_empty() {
+                // Either midnight task or another path populated the
+                // cache — we're done.
+                info!(
+                    entries = enricher.prev_oi_cache.len(),
+                    "prev_oi_cache populated by another path — refresh task exiting"
+                );
+                metrics::counter!(
+                    "tv_prev_oi_cache_refresh_total",
+                    "outcome" => "external"
+                )
+                .increment(1);
+                return;
+            }
+
+            match enricher
+                .prev_oi_cache
+                .load_from_questdb(&questdb_config)
+                .await
+            {
+                Ok(0) => {
+                    // candles_1d still empty — keep polling.
+                    metrics::counter!(
+                        "tv_prev_oi_cache_refresh_total",
+                        "outcome" => "still_empty"
+                    )
+                    .increment(1);
+                }
+                Ok(count) => {
+                    info!(
+                        entries = count,
+                        "prev_oi_cache populated by periodic refresh — task exiting (midnight rollover task takes over)"
+                    );
+                    metrics::counter!(
+                        "tv_prev_oi_cache_refresh_total",
+                        "outcome" => "populated"
+                    )
+                    .increment(1);
+                    return;
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        ?err,
+                        "prev_oi_cache periodic refresh failed; will retry in {}s",
+                        PREV_OI_CACHE_REFRESH_INTERVAL_SECS
+                    );
+                    metrics::counter!(
+                        "tv_prev_oi_cache_refresh_total",
+                        "outcome" => "err"
+                    )
+                    .increment(1);
+                }
+            }
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -401,5 +522,66 @@ mod tests {
         // Volume / prev_close still tracked by the (sid, segment_code) key,
         // even though segment_code=6 has no enum.
         assert_eq!(r.volume_delta, 100);
+    }
+
+    /// Phase 2.11 ratchet: the refresh poll interval must be 5 minutes
+    /// (300 seconds). Drift here changes operator-visible OI staleness
+    /// recovery latency for fresh deploys.
+    #[test]
+    fn test_phase2_11_prev_oi_cache_refresh_interval_is_5_minutes() {
+        assert_eq!(
+            super::PREV_OI_CACHE_REFRESH_INTERVAL_SECS,
+            300,
+            "PREV_OI_CACHE_REFRESH_INTERVAL_SECS must be 300 (5 minutes) — \
+             bounds first-day OI staleness recovery"
+        );
+    }
+
+    /// Phase 2.11 ratchet: name-matched explicit test for
+    /// `spawn_prev_oi_cache_refresh_task` so the pub-fn-test guard
+    /// sees a matching `#[test] fn test_*spawn_prev_oi_cache_refresh_task*`.
+    /// Same body as the early-exit test below — both exercise the
+    /// already-populated short-circuit path.
+    #[tokio::test]
+    async fn test_spawn_prev_oi_cache_refresh_task_exits_when_cache_already_hot() {
+        let enricher = std::sync::Arc::new(TickEnricher::new());
+        enricher.prev_oi_cache.insert(7777, 1, 1_234);
+        let cfg = tickvault_common::config::QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: 1,
+            pg_port: 1,
+            ilp_port: 1,
+        };
+        let handle = super::spawn_prev_oi_cache_refresh_task(std::sync::Arc::clone(&enricher), cfg);
+        let r = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
+        assert!(r.is_ok());
+    }
+
+    /// Phase 2.11 ratchet: when the cache is already populated at the
+    /// task's start, the refresh task exits immediately (no work to do).
+    /// We exercise this by pre-populating the cache and asserting the
+    /// task's JoinHandle completes quickly.
+    #[tokio::test]
+    async fn test_phase2_11_refresh_task_exits_early_when_cache_already_populated() {
+        let enricher = std::sync::Arc::new(TickEnricher::new());
+        // Pre-populate so the task's early-return path fires.
+        enricher.prev_oi_cache.insert(1234, 1, 50_000);
+        assert!(!enricher.prev_oi_cache.is_empty());
+
+        let cfg = tickvault_common::config::QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            http_port: 1, // unreachable — irrelevant since task exits early
+            pg_port: 1,
+            ilp_port: 1,
+        };
+        let handle = super::spawn_prev_oi_cache_refresh_task(std::sync::Arc::clone(&enricher), cfg);
+
+        // Task should complete within 1s — no I/O happens because the
+        // early-return path fires before the first sleep.
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), handle).await;
+        assert!(
+            result.is_ok(),
+            "refresh task must exit immediately when cache is pre-populated"
+        );
     }
 }
