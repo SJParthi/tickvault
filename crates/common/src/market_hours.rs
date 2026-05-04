@@ -74,11 +74,37 @@ pub fn is_within_market_hours_ist() -> bool {
     if TEST_FORCE_IN_MARKET_HOURS.load(std::sync::atomic::Ordering::Relaxed) {
         return true;
     }
-    let now_utc_secs = chrono::Utc::now().timestamp();
-    let sec_of_day = now_utc_secs
-        .saturating_add(i64::from(IST_UTC_OFFSET_SECONDS))
-        .rem_euclid(i64::from(SECONDS_PER_DAY)) as u32;
+    let sec_of_day = now_ist_secs_of_day();
     (TICK_PERSIST_START_SECS_OF_DAY_IST..TICK_PERSIST_END_SECS_OF_DAY_IST).contains(&sec_of_day)
+}
+
+/// Returns the current IST seconds-of-day in `[0, 86400)` from
+/// `chrono::Utc::now()`. Used by the tick enricher (Phase 2 / 29-tf
+/// engine plan) to classify each tick into the trading-day phase
+/// without each consumer rolling its own clock + offset arithmetic.
+///
+/// O(1) — single `Utc::now()` call (vDSO clock_gettime on Linux,
+/// ~50ns) + integer math. The vDSO-based clock read is hot-path-safe
+/// for our latency budget; we deliberately do NOT cache because the
+/// phase boundaries (09:00, 09:15, 15:30, 15:40 IST) can land
+/// mid-batch and a stale cache would mis-classify ticks at the
+/// boundary.
+///
+/// # Test override
+/// When `TEST_FORCE_IN_MARKET_HOURS` is set, returns 09:30 IST
+/// (33000) — a deterministic in-market sec-of-day so tests get
+/// repeatable phase classification regardless of wall clock.
+#[allow(clippy::cast_possible_truncation)] // APPROVED: rem_euclid against SECONDS_PER_DAY (=86400) fits u32
+#[inline]
+pub fn now_ist_secs_of_day() -> u32 {
+    if TEST_FORCE_IN_MARKET_HOURS.load(std::sync::atomic::Ordering::Relaxed) {
+        // Deterministic 09:30 IST for tests — within OPEN phase.
+        return 9 * 3600 + 30 * 60;
+    }
+    let now_utc_secs = chrono::Utc::now().timestamp();
+    now_utc_secs
+        .saturating_add(i64::from(IST_UTC_OFFSET_SECONDS))
+        .rem_euclid(i64::from(SECONDS_PER_DAY)) as u32
 }
 
 /// Returns the number of seconds until the next `TICK_PERSIST_START_SECS_OF_DAY_IST`
@@ -195,5 +221,26 @@ mod tests {
         // while CI runs this test, we can't deterministically assert > 0
         // — but `secs_until_next_open_returns_zero_during_market_hours`
         // covers that direction.
+    }
+
+    /// Phase 2 ratchet: `now_ist_secs_of_day` returns a value in
+    /// `[0, 86400)`. The wall-clock reading itself is non-deterministic
+    /// in CI but the bound is invariant.
+    #[test]
+    fn test_now_ist_secs_of_day_is_bounded() {
+        let s = now_ist_secs_of_day();
+        assert!(s < 86400, "secs-of-day must be < 86400, got {s}");
+    }
+
+    /// Phase 2 ratchet: when `TEST_FORCE_IN_MARKET_HOURS` is set, the
+    /// helper returns the deterministic 09:30 IST value so tick-enricher
+    /// integration tests see a stable OPEN-phase classification
+    /// regardless of when CI runs.
+    #[test]
+    fn test_now_ist_secs_of_day_test_override_returns_open_phase() {
+        set_test_force_in_market_hours(true);
+        let s = now_ist_secs_of_day();
+        set_test_force_in_market_hours(false);
+        assert_eq!(s, 9 * 3600 + 30 * 60, "test override must return 09:30 IST");
     }
 }
