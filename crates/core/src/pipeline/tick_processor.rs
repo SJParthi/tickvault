@@ -23,9 +23,14 @@ use tickvault_common::constants::{
 use tickvault_common::tick_types::{GreeksEnricher, ParsedTick};
 
 use tickvault_storage::candle_persistence::LiveCandleWriter;
-use tickvault_storage::tick_persistence::{DepthPersistenceWriter, TickPersistenceWriter};
+use tickvault_storage::tick_persistence::{
+    DepthPersistenceWriter, TickLifecycle, TickPersistenceWriter,
+};
 
+use tickvault_common::market_hours::now_ist_secs_of_day;
 use tickvault_common::tick_types::MarketDepthLevel;
+
+use crate::pipeline::tick_enricher::TickEnricher;
 
 /// Returns `true` if all 5 depth levels have finite bid/ask prices.
 ///
@@ -800,6 +805,18 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
     // disables the heartbeat (used by unit tests that do not spawn
     // the watchdog). See `crate::pipeline::no_tick_watchdog`.
     tick_heartbeat: Option<std::sync::Arc<std::sync::atomic::AtomicI64>>,
+    // 29-tf engine plan Phase 2.5: optional Phase 2 lifecycle
+    // enricher. When `Some`, every tick that reaches persistence is
+    // run through `TickEnricher::enrich_tick(tick, now_ist_secs)` to
+    // populate the four lifecycle columns (`volume_delta`,
+    // `prev_day_close`, `prev_day_oi`, `phase`) and is written via
+    // `append_tick_enriched`. When `None`, falls through to the
+    // legacy `append_tick` path which writes default lifecycle
+    // values (compatible with spill replay + tests). The boot driver
+    // (`crates/app/src/main.rs`) is responsible for loading the
+    // `prev_oi_cache` and marking the `BootOrderingGate` ready
+    // before attaching the enricher here — see L14.
+    tick_enricher: Option<std::sync::Arc<TickEnricher>>,
 ) {
     // Grab metric handles once before the hot loop — O(1) per tick after this.
     // These are no-ops if no metrics recorder is installed (e.g., in tests).
@@ -1219,8 +1236,29 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                 // Persist tick to QuestDB — ingestion gate above already verified
                 // [09:00, 15:30) IST and today's date. This block only handles
                 // QuestDB write errors (connection down, buffer full, etc.).
+                //
+                // 29-tf engine Phase 2.5: when `tick_enricher` is `Some`, run
+                // the tick through it to populate the four lifecycle columns
+                // (`volume_delta`, `prev_day_close`, `prev_day_oi`, `phase`)
+                // and persist via `append_tick_enriched`. The wall-clock read
+                // is per-tick so phase-boundary crossings are caught
+                // immediately. Falls through to `append_tick` (defaulted
+                // lifecycle values) when no enricher attached.
                 if let Some(ref mut writer) = tick_writer {
-                    match writer.append_tick(&tick) {
+                    let result = if let Some(ref enricher) = tick_enricher {
+                        let now_ist_secs = now_ist_secs_of_day();
+                        let enriched = enricher.enrich_tick(&tick, now_ist_secs);
+                        let life = TickLifecycle {
+                            volume_delta: enriched.volume_delta,
+                            prev_day_close: enriched.prev_day_close,
+                            prev_day_oi: enriched.prev_day_oi,
+                            phase: enriched.phase as u8,
+                        };
+                        writer.append_tick_enriched(&tick, life)
+                    } else {
+                        writer.append_tick(&tick)
+                    };
+                    match result {
                         Ok(()) => {
                             m_ticks_persisted.increment(1);
                         }
@@ -1386,8 +1424,27 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
 
                     // Persist tick to QuestDB — ingestion gate above already verified
                     // [09:00, 15:30) IST and today's date.
+                    //
+                    // 29-tf engine Phase 2.5: same enricher branch as the
+                    // earlier persistence site — keeps both Quote and Full
+                    // packet paths populating the lifecycle columns
+                    // identically. Two call sites mirror each other so the
+                    // hot-path semantics are uniform across packet types.
                     if let Some(ref mut writer) = tick_writer {
-                        match writer.append_tick(&tick) {
+                        let result = if let Some(ref enricher) = tick_enricher {
+                            let now_ist_secs = now_ist_secs_of_day();
+                            let enriched = enricher.enrich_tick(&tick, now_ist_secs);
+                            let life = TickLifecycle {
+                                volume_delta: enriched.volume_delta,
+                                prev_day_close: enriched.prev_day_close,
+                                prev_day_oi: enriched.prev_day_oi,
+                                phase: enriched.phase as u8,
+                            };
+                            writer.append_tick_enriched(&tick, life)
+                        } else {
+                            writer.append_tick(&tick)
+                        };
+                        match result {
                             Ok(()) => {
                                 m_ticks_persisted.increment(1);
                             }
@@ -2127,6 +2184,7 @@ mod tests {
             option_movers_writer,
             None, // instrument_registry — not needed in tests
             None, // tick_heartbeat — watchdog not exercised in tests
+            None, // tick_enricher — Phase 2.5 enricher unused by these tests; legacy append_tick path covers them
         )
         .await;
     }
