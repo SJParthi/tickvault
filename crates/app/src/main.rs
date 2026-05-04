@@ -2695,11 +2695,20 @@ async fn main() -> Result<()> {
             // downstream movers_pipeline then operates with
             // `current_OI - 0 = current_OI` for OI Change — a
             // gracefully-degraded fallback rather than a HALT.
-            let prev_oi_cache = tickvault_app::prev_oi_loader::load_prev_oi_cache_at_boot(
-                registry,
-                trading_calendar.as_ref(),
-            )
-            .await;
+            // PR #456 (2026-05-04): boot calls the OVERLAY variant
+            // which runs bhavcopy first, then layers Dhan-canonical
+            // Option Chain `previous_oi` for NIFTY/BANKNIFTY/SENSEX
+            // on top (last-wins). Total boot cost: ~5-6 min bhavcopy
+            // + ~18s overlay (3 underlyings × 2 calls × 3s rate-limit).
+            let prev_oi_cache =
+                tickvault_app::prev_oi_loader::load_prev_oi_cache_at_boot_with_overlay(
+                    registry,
+                    trading_calendar.as_ref(),
+                    token_handle.clone(),
+                    ws_client_id.clone(),
+                    config.dhan.rest_api_base_url.clone(),
+                )
+                .await;
             if prev_oi_cache.is_empty() {
                 // The loader's internal error sites already emitted
                 // PREVOI-01. This WARN at the spawn site documents the
