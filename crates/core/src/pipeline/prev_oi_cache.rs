@@ -33,7 +33,7 @@ use std::time::Duration;
 
 use papaya::HashMap;
 use reqwest::Client;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use tickvault_common::config::QuestDbConfig;
 
@@ -44,6 +44,17 @@ type CacheKey = (u32, u8);
 
 /// HTTP timeout for the QuestDB `/exec` query that loads the cache.
 const PREV_OI_LOAD_TIMEOUT_SECS: u64 = 30;
+
+/// Phase 2.15 security MEDIUM fix: maximum response body size accepted
+/// from QuestDB's `/exec` endpoint when loading prev_oi_cache. Defends
+/// against a misconfigured QuestDB or matview-chain expansion that
+/// could return an unbounded body and OOM the loader.
+///
+/// 25K instruments × ~30 bytes/row = ~750 KB typical. 5 MB gives 6×
+/// headroom for legitimate growth (e.g. when row format expands or
+/// the universe grows). Anything larger is treated as a malformed
+/// response and rejected with `LoadError::ResponseTooLarge`.
+pub const PREV_OI_CACHE_MAX_RESPONSE_BYTES: u64 = 5 * 1024 * 1024;
 
 /// Lock-free cache of yesterday's closing OI per `(security_id, segment)`.
 ///
@@ -195,7 +206,44 @@ impl PrevOiCache {
             });
         }
 
+        // Phase 2.15 security MEDIUM fix (defence-in-depth): bound the
+        // response body size before allocating a String. QuestDB is an
+        // internal trusted service today, so a hostile response is
+        // improbable; but a misconfigured QuestDB or matview chain
+        // expanded to more rows could return an unbounded body. Cap at
+        // PREV_OI_CACHE_MAX_RESPONSE_BYTES (= 5 MB). 25K instruments ×
+        // ~30 bytes each = ~750 KB — 5 MB gives 6× headroom. Beyond
+        // that, we treat as a malformed response and return Err.
+        let content_length = response.content_length();
+        if let Some(len) = content_length
+            && len > PREV_OI_CACHE_MAX_RESPONSE_BYTES
+        {
+            warn!(
+                content_length = len,
+                limit = PREV_OI_CACHE_MAX_RESPONSE_BYTES,
+                "prev_oi_cache response body exceeds bound — refusing to allocate; \
+                 cache stays in current state, gate stays AwaitingOiCache"
+            );
+            return Err(LoadError::ResponseTooLarge {
+                bytes: len,
+                limit: PREV_OI_CACHE_MAX_RESPONSE_BYTES,
+            });
+        }
         let body = response.text().await.map_err(LoadError::HttpRequest)?;
+        // Even if Content-Length wasn't set (HTTP chunked), reject
+        // post-hoc if the body slipped past the limit.
+        if (body.len() as u64) > PREV_OI_CACHE_MAX_RESPONSE_BYTES {
+            warn!(
+                body_bytes = body.len(),
+                limit = PREV_OI_CACHE_MAX_RESPONSE_BYTES,
+                "prev_oi_cache body exceeds bound (no Content-Length set) — \
+                 rejecting parse to prevent unbounded allocation"
+            );
+            return Err(LoadError::ResponseTooLarge {
+                bytes: body.len() as u64,
+                limit: PREV_OI_CACHE_MAX_RESPONSE_BYTES,
+            });
+        }
         let entries = parse_questdb_dataset(&body)?;
         let count = entries.len();
 
@@ -300,6 +348,13 @@ pub enum LoadError {
     MalformedSegment,
     #[error("unknown segment string in QuestDB row")]
     UnknownSegment,
+    /// Phase 2.15 security MEDIUM fix: response body exceeded the
+    /// `PREV_OI_CACHE_MAX_RESPONSE_BYTES` bound (5 MB). Treated as a
+    /// malformed/hostile response — cache stays in current state, the
+    /// gate stays AwaitingOiCache (Phase 2.9 behaviour), and operator
+    /// gets a typed error with diagnostic context.
+    #[error("QuestDB response body too large: {bytes} bytes > {limit} bytes limit")]
+    ResponseTooLarge { bytes: u64, limit: u64 },
 }
 
 #[cfg(test)]
