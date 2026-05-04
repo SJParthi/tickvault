@@ -381,6 +381,50 @@ impl TickPersistenceWriter {
         Ok(())
     }
 
+    /// Like `append_tick` but writes the four Phase 2 lifecycle columns
+    /// from the supplied `TickLifecycle` carrier (29-tf engine plan).
+    ///
+    /// Used by the SPSC tick processor after `TickEnricher::enrich_tick`
+    /// produced the lifecycle values. Spill replay continues to call
+    /// `append_tick` (defaults the lifecycle columns to 0/PREMARKET) —
+    /// the enricher state can't be reconstructed from disk, and zero
+    /// lifecycle data is preferable to fabricated values.
+    ///
+    /// O(1) — same characteristics as `append_tick`. The `TickLifecycle`
+    /// carrier is `Copy`, no heap allocation.
+    pub fn append_tick_enriched(&mut self, tick: &ParsedTick, life: TickLifecycle) -> Result<()> {
+        if self.sender.is_none() {
+            match self.try_reconnect_on_error() {
+                Ok(()) => {
+                    self.drain_tick_buffer();
+                }
+                Err(_) => {
+                    // Buffer the raw tick — lifecycle values lost on this
+                    // path. Acceptable: this only fires when QuestDB is
+                    // unreachable AND ring buffer drain hasn't recovered.
+                    self.buffer_tick(*tick);
+                    return Ok(());
+                }
+            }
+        }
+
+        build_tick_row_enriched(&mut self.buffer, tick, life)?;
+
+        self.in_flight.push(*tick);
+        self.pending_count = self.pending_count.saturating_add(1);
+
+        if self.pending_count >= TICK_FLUSH_BATCH_SIZE
+            && let Err(err) = self.force_flush()
+        {
+            error!(
+                ?err,
+                "tick auto-flush failed (enriched path) — in-flight ticks rescued to ring buffer"
+            );
+        }
+
+        Ok(())
+    }
+
     /// Flushes the buffer if enough time has elapsed since the last flush.
     ///
     /// Call this periodically (e.g., after each batch of frames) to ensure
@@ -1194,8 +1238,17 @@ fn build_tick_row(buffer: &mut Buffer, tick: &ParsedTick) -> Result<()> {
     buffer
         .table(QUESTDB_TABLE_TICKS)
         .context("table name")?
+        // QuestDB ILP requires ALL symbols before any column_*. Both
+        // `segment` and `phase` are SYMBOL columns — group them at the
+        // top of the row. Phase 2 lifecycle column (29-tf engine plan):
+        // legacy `append_tick` callers write PHASE=PREMARKET as the
+        // safe default. Spill replay restores ticks via this path —
+        // the enricher state is gone after a restart, so the lifecycle
+        // values are unrecoverable; defaults are preferable to fabrication.
         .symbol("segment", segment_code_to_str(tick.exchange_segment_code))
         .context("segment")?
+        .symbol("phase", PHASE_DEFAULT_STR)
+        .context("phase")?
         .column_i64("security_id", i64::from(tick.security_id))
         .context("security_id")?
         .column_f64("ltp", f32_to_f64_clean(tick.last_traded_price))
@@ -1232,6 +1285,128 @@ fn build_tick_row(buffer: &mut Buffer, tick: &ParsedTick) -> Result<()> {
         .context("theta")?
         .column_f64("vega", tick.vega)
         .context("vega")?
+        .column_i64("volume_delta", 0_i64)
+        .context("volume_delta")?
+        .column_f64("prev_day_close", 0.0_f64)
+        .context("prev_day_close")?
+        .column_i64("prev_day_oi", 0_i64)
+        .context("prev_day_oi")?
+        .column_ts("received_at", received_nanos)
+        .context("received_at")?
+        .at(ts_nanos)
+        .context("designated timestamp")?;
+
+    Ok(())
+}
+
+/// SYMBOL string written when a tick is appended without explicit
+/// enrichment. PREMARKET is the safest default — formulas.rs treats
+/// `prev_day_close <= 0` as "no prior baseline" and returns 0.0 pct.
+const PHASE_DEFAULT_STR: &str = "PREMARKET";
+
+/// Lifecycle values produced by `crates/core/src/pipeline/tick_enricher.rs`
+/// (29-tf engine plan, Phase 2). Carried into ILP via
+/// `append_tick_enriched` so we don't have to widen the fixed-size
+/// `ParsedTick` spill record.
+///
+/// All fields are `Copy`, zero-allocation. Construction is hot-path-safe.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TickLifecycle {
+    /// Per-tick incremental volume. `0` for the first tick of the day.
+    /// Negative values during PHASE=OPEN trigger VOLUME-MONO-01.
+    pub volume_delta: i64,
+    /// Frozen prev-day close. `0.0` until the enricher's first-seen
+    /// stamper fires.
+    pub prev_day_close: f32,
+    /// Boot-loaded prev-day OI. `0` if the instrument has no prior-day
+    /// `candles_1d` row (new listing, fresh deploy).
+    pub prev_day_oi: i64,
+    /// Phase as `repr(u8)` of `tickvault_common::phase::Phase`. Mapped
+    /// to its canonical SYMBOL string by `phase_code_to_str`.
+    pub phase: u8,
+}
+
+/// Map `Phase::as u8` to the canonical SYMBOL string written into
+/// QuestDB. Bounded 5-entry dictionary. Unknown codes map to
+/// PREMARKET as a safe default — out-of-range values would indicate
+/// a producer bug rather than a routing decision.
+#[inline]
+fn phase_code_to_str(code: u8) -> &'static str {
+    match code {
+        0 => "PREMARKET",
+        1 => "PREOPEN",
+        2 => "OPEN",
+        3 => "POSTAUCTION",
+        4 => "CLOSED",
+        _ => "PREMARKET",
+    }
+}
+
+/// Build an ILP row including the Phase 2 lifecycle columns. Mirrors
+/// `build_tick_row` exactly except it sources the 4 lifecycle values
+/// from the supplied `TickLifecycle` carrier rather than writing
+/// defaults.
+fn build_tick_row_enriched(
+    buffer: &mut Buffer,
+    tick: &ParsedTick,
+    life: TickLifecycle,
+) -> Result<()> {
+    let ts_nanos =
+        TimestampNanos::new(i64::from(tick.exchange_timestamp).saturating_mul(1_000_000_000));
+    let received_nanos =
+        TimestampNanos::new(tick.received_at_nanos.saturating_add(IST_UTC_OFFSET_NANOS));
+
+    buffer
+        .table(QUESTDB_TABLE_TICKS)
+        .context("table name")?
+        // ILP wire requires symbols before columns. `segment` and
+        // `phase` are both SYMBOL columns; group them up front.
+        .symbol("segment", segment_code_to_str(tick.exchange_segment_code))
+        .context("segment")?
+        .symbol("phase", phase_code_to_str(life.phase))
+        .context("phase")?
+        .column_i64("security_id", i64::from(tick.security_id))
+        .context("security_id")?
+        .column_f64("ltp", f32_to_f64_clean(tick.last_traded_price))
+        .context("ltp")?
+        .column_f64("open", f32_to_f64_clean(tick.day_open))
+        .context("open")?
+        .column_f64("high", f32_to_f64_clean(tick.day_high))
+        .context("high")?
+        .column_f64("low", f32_to_f64_clean(tick.day_low))
+        .context("low")?
+        .column_f64("close", f32_to_f64_clean(tick.day_close))
+        .context("close")?
+        .column_i64("volume", i64::from(tick.volume))
+        .context("volume")?
+        .column_i64("oi", i64::from(tick.open_interest))
+        .context("oi")?
+        .column_f64("avg_price", f32_to_f64_clean(tick.average_traded_price))
+        .context("avg_price")?
+        .column_i64("last_trade_qty", i64::from(tick.last_trade_quantity))
+        .context("last_trade_qty")?
+        .column_i64("total_buy_qty", i64::from(tick.total_buy_quantity))
+        .context("total_buy_qty")?
+        .column_i64("total_sell_qty", i64::from(tick.total_sell_quantity))
+        .context("total_sell_qty")?
+        .column_i64("exchange_timestamp", i64::from(tick.exchange_timestamp))
+        .context("exchange_timestamp")?
+        .column_f64("iv", tick.iv)
+        .context("iv")?
+        .column_f64("delta", tick.delta)
+        .context("delta")?
+        .column_f64("gamma", tick.gamma)
+        .context("gamma")?
+        .column_f64("theta", tick.theta)
+        .context("theta")?
+        .column_f64("vega", tick.vega)
+        .context("vega")?
+        .column_i64("volume_delta", life.volume_delta)
+        .context("volume_delta")?
+        .column_f64("prev_day_close", f32_to_f64_clean(life.prev_day_close))
+        .context("prev_day_close")?
+        .column_i64("prev_day_oi", life.prev_day_oi)
+        .context("prev_day_oi")?
         .column_ts("received_at", received_nanos)
         .context("received_at")?
         .at(ts_nanos)
@@ -3339,6 +3514,166 @@ mod tests {
                 needle
             );
         }
+    }
+
+    /// Phase 2 ratchet: `phase_code_to_str` maps the 5 canonical Phase
+    /// repr-u8 codes to their SYMBOL strings exactly. Drift here breaks
+    /// the QuestDB SYMBOL dictionary contract (5 distinct values).
+    #[test]
+    fn test_phase_code_to_str_pinned() {
+        assert_eq!(phase_code_to_str(0), "PREMARKET");
+        assert_eq!(phase_code_to_str(1), "PREOPEN");
+        assert_eq!(phase_code_to_str(2), "OPEN");
+        assert_eq!(phase_code_to_str(3), "POSTAUCTION");
+        assert_eq!(phase_code_to_str(4), "CLOSED");
+    }
+
+    /// Phase 2 ratchet: out-of-range codes safely default to PREMARKET
+    /// rather than panic. A producer bug would surface as the safe
+    /// default in the SYMBOL dictionary.
+    #[test]
+    fn test_phase_code_to_str_unknown_defaults_premarket() {
+        assert_eq!(phase_code_to_str(5), "PREMARKET");
+        assert_eq!(phase_code_to_str(99), "PREMARKET");
+        assert_eq!(phase_code_to_str(255), "PREMARKET");
+    }
+
+    /// Phase 2 ratchet: `TickLifecycle` defaults match the legacy
+    /// `append_tick` path (volume_delta=0, prev_day_close=0.0,
+    /// prev_day_oi=0, phase=PREMARKET). Drift means an unenriched
+    /// fallback no longer matches the documented contract.
+    #[test]
+    fn test_tick_lifecycle_default_is_zero_premarket() {
+        let life = TickLifecycle::default();
+        assert_eq!(life.volume_delta, 0);
+        assert_eq!(life.prev_day_close, 0.0);
+        assert_eq!(life.prev_day_oi, 0);
+        assert_eq!(life.phase, 0);
+        assert_eq!(phase_code_to_str(life.phase), "PREMARKET");
+    }
+
+    /// Phase 2 ratchet: build_tick_row_enriched serializes ALL four
+    /// lifecycle columns into the ILP buffer. Verifies by string match
+    /// against the buffer's wire-format output.
+    #[test]
+    fn test_build_tick_row_enriched_writes_all_lifecycle_columns() {
+        use questdb::ingress::{Buffer, ProtocolVersion};
+        let mut buf = Buffer::new(ProtocolVersion::V1);
+        let tick = ParsedTick {
+            security_id: 1234,
+            exchange_segment_code: 1,
+            exchange_timestamp: 1_700_000_000,
+            received_at_nanos: 1_700_000_000_000_000_000,
+            ..ParsedTick::default()
+        };
+        let life = TickLifecycle {
+            volume_delta: 42,
+            prev_day_close: 100.5,
+            prev_day_oi: 999_999,
+            phase: 2, // OPEN
+        };
+        build_tick_row_enriched(&mut buf, &tick, life).unwrap();
+        let wire = String::from_utf8_lossy(buf.as_bytes()).to_string();
+        assert!(
+            wire.contains("volume_delta=42i"),
+            "wire missing volume_delta: {}",
+            wire
+        );
+        assert!(
+            wire.contains("prev_day_close=100.5"),
+            "wire missing prev_day_close: {}",
+            wire
+        );
+        assert!(
+            wire.contains("prev_day_oi=999999i"),
+            "wire missing prev_day_oi: {}",
+            wire
+        );
+        assert!(
+            wire.contains("phase=OPEN"),
+            "wire missing phase=OPEN symbol: {}",
+            wire
+        );
+    }
+
+    /// Phase 2 ratchet (name-matched to `append_tick_enriched`): the
+    /// disconnected writer path is exercised — sender=None, attempt
+    /// fails, the tick is buffered. This proves the enriched path
+    /// follows the same ring-buffer rescue semantics as `append_tick`,
+    /// not a parallel branch that could lose ticks.
+    #[test]
+    fn test_append_tick_enriched_disconnected_buffers_tick() {
+        let cfg = QuestDbConfig {
+            host: "127.0.0.1".to_string(),
+            // Port 1 is reserved/unreachable — guarantees connect failure.
+            http_port: 1,
+            pg_port: 1,
+            ilp_port: 1,
+        };
+        let mut writer = TickPersistenceWriter::new_disconnected(&cfg);
+        let tick = ParsedTick {
+            security_id: 4242,
+            exchange_segment_code: 1,
+            volume: 12_345,
+            day_close: 99.5,
+            exchange_timestamp: 1_700_000_000,
+            received_at_nanos: 1_700_000_000_000_000_000,
+            ..ParsedTick::default()
+        };
+        let life = TickLifecycle {
+            volume_delta: 100,
+            prev_day_close: 99.0,
+            prev_day_oi: 5_000,
+            phase: 2, // OPEN
+        };
+        let res = writer.append_tick_enriched(&tick, life);
+        // append_tick_enriched silently buffers when QuestDB is unreachable.
+        assert!(res.is_ok(), "enriched append must succeed (buffered)");
+        assert_eq!(
+            writer.buffered_tick_count(),
+            1,
+            "enriched path must rescue to ring buffer on connect failure"
+        );
+    }
+
+    /// Phase 2 ratchet: legacy `build_tick_row` path emits default
+    /// lifecycle columns (volume_delta=0, prev_day_close=0,
+    /// prev_day_oi=0, phase=PREMARKET) when called without enrichment.
+    /// This is the spill-replay contract: ticks restored from disk
+    /// have no enricher state and degrade to defaults gracefully.
+    #[test]
+    fn test_build_tick_row_legacy_path_emits_default_lifecycle_columns() {
+        use questdb::ingress::{Buffer, ProtocolVersion};
+        let mut buf = Buffer::new(ProtocolVersion::V1);
+        let tick = ParsedTick {
+            security_id: 1234,
+            exchange_segment_code: 1,
+            exchange_timestamp: 1_700_000_000,
+            received_at_nanos: 1_700_000_000_000_000_000,
+            ..ParsedTick::default()
+        };
+        build_tick_row(&mut buf, &tick).unwrap();
+        let wire = String::from_utf8_lossy(buf.as_bytes()).to_string();
+        assert!(
+            wire.contains("volume_delta=0i"),
+            "legacy path must default volume_delta=0: {}",
+            wire
+        );
+        assert!(
+            wire.contains("prev_day_close=0.0"),
+            "legacy path must default prev_day_close=0.0: {}",
+            wire
+        );
+        assert!(
+            wire.contains("prev_day_oi=0i"),
+            "legacy path must default prev_day_oi=0: {}",
+            wire
+        );
+        assert!(
+            wire.contains("phase=PREMARKET"),
+            "legacy path must default phase=PREMARKET: {}",
+            wire
+        );
     }
 
     #[tokio::test]
