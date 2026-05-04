@@ -1418,17 +1418,39 @@ pub const TICK_FLUSH_INTERVAL_MS: u64 = 1000;
 /// Holds ticks in memory when QuestDB is down, drains on recovery.
 ///
 /// Sized for 25K instruments (5 WS connections × 5,000 each):
-/// - 600,000 ticks × ~112 bytes = ~64MB RAM
-/// - At 10K ticks/sec (realistic peak) = 60 seconds before disk spill
-/// - At 25K ticks/sec (extreme peak) = 24 seconds before disk spill
+/// - 2,000,000 ticks × ~112 bytes = ~224 MB RAM (pre-allocated at boot
+///   via `VecDeque::with_capacity` in `tick_persistence.rs`)
+/// - At 10K ticks/sec (realistic peak) = 200 seconds (3m20s) before disk spill
+/// - At 25K ticks/sec (extreme peak) = 80 seconds before disk spill
 /// - Full-day QuestDB outage: disk spill handles overflow (~23 GB for 10K/sec)
-pub const TICK_BUFFER_CAPACITY: usize = 600_000;
+///
+/// **Memory budget audit (2026-05-03 PR #452):** AWS c7i.xlarge has
+/// 8 GB total. Per `aws-budget.md` the Docker containers consume
+/// 7.4 GB (QuestDB 4G + Valkey 1G + Prometheus 512M + Grafana 1G +
+/// Alertmanager 256M + Traefik 512M + Valkey-exporter 128M),
+/// leaving ~600 MB for OS + tickvault binary. The 224 MB ring fits
+/// comfortably with ~376 MB margin for the rest of the binary + OS.
+///
+/// **Why 2M (not 4.5M)**: operator-confirmed cap on c7i.xlarge —
+/// 4.5M / 504 MB ring would leave only ~96 MB for OS + rest of
+/// binary, too tight. Operator chose Option B (2M / 224 MB) over
+/// Option A (1M / 112 MB) for higher outage-survival headroom while
+/// staying within the c7i.xlarge envelope. Bumping to c7i.2xlarge
+/// (16 GB) would cost an extra ₹2,478/mo per `aws-budget.md` and
+/// is explicitly out of scope per "NEVER provision a larger
+/// instance than c7i.xlarge without Parthiban's approval".
+///
+/// **Bump history:**
+/// - 600K → 2M (PR #452, 2026-05-03): operator-spec'd extreme
+///   memory pressure handling. 233% capacity increase. ~3.3× outage
+///   survival window before disk spill kicks in.
+pub const TICK_BUFFER_CAPACITY: usize = 2_000_000;
 
 /// High watermark threshold for tick ring buffer (80% of capacity).
 /// When buffer occupancy exceeds this, a WARN-level alert fires once
 /// to signal imminent disk spill. Triggers Telegram via Loki ERROR rule.
-/// 80% of 600,000 = 480,000 ticks.
-pub const TICK_BUFFER_HIGH_WATERMARK: usize = TICK_BUFFER_CAPACITY * 4 / 5; // 480,000
+/// 80% of 2,000,000 = 1,600,000 ticks.
+pub const TICK_BUFFER_HIGH_WATERMARK: usize = TICK_BUFFER_CAPACITY * 4 / 5; // 1,600,000
 
 /// Minimum free disk space (bytes) to log a warning before spill write.
 /// 100 MB — below this, a WARN fires on each spill open to alert operator
