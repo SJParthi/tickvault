@@ -78,6 +78,27 @@ pub fn is_within_market_hours_ist() -> bool {
     (TICK_PERSIST_START_SECS_OF_DAY_IST..TICK_PERSIST_END_SECS_OF_DAY_IST).contains(&sec_of_day)
 }
 
+/// Returns the number of seconds until the next IST midnight
+/// (00:00:00 IST). Returns a value in `(0, 86400]`.
+///
+/// O(1). Used by the Phase 2 midnight rollover task (29-tf engine
+/// plan, L13) to schedule the atomic state transition that clears
+/// `volume_delta` baselines, resets `prev_day_close` stamps, and
+/// reloads `prev_oi_cache` from yesterday's `candles_1d`.
+///
+/// # Test override
+/// When `TEST_FORCE_IN_MARKET_HOURS` is set, returns 1 — a tiny
+/// deterministic value so tests don't sleep for hours.
+#[allow(clippy::cast_possible_truncation)] // APPROVED: rem_euclid against SECONDS_PER_DAY (=86400) fits u32, then u32 → u64 widening
+#[inline]
+pub fn secs_until_next_ist_midnight() -> u64 {
+    if TEST_FORCE_IN_MARKET_HOURS.load(std::sync::atomic::Ordering::Relaxed) {
+        return 1;
+    }
+    let sec_of_day = u64::from(now_ist_secs_of_day());
+    u64::from(SECONDS_PER_DAY) - sec_of_day
+}
+
 /// Returns the current IST seconds-of-day in `[0, 86400)` from
 /// `chrono::Utc::now()`. Used by the tick enricher (Phase 2 / 29-tf
 /// engine plan) to classify each tick into the trading-day phase
@@ -242,5 +263,29 @@ mod tests {
         let s = now_ist_secs_of_day();
         set_test_force_in_market_hours(false);
         assert_eq!(s, 9 * 3600 + 30 * 60, "test override must return 09:30 IST");
+    }
+
+    /// Phase 2.7 ratchet (hostile bug-hunt CRITICAL C1 fix): the
+    /// midnight-rollover scheduler MUST return a positive value (the
+    /// rollover tick fires AFTER the boundary, never before) and
+    /// MUST NOT exceed 24h.
+    #[test]
+    fn test_secs_until_next_ist_midnight_is_bounded() {
+        let s = secs_until_next_ist_midnight();
+        assert!(s > 0, "secs_until_next_ist_midnight must be positive");
+        assert!(
+            s <= 86400,
+            "secs_until_next_ist_midnight must be <= 24h, got {s}"
+        );
+    }
+
+    /// Phase 2.7 ratchet: test override returns 1 so the rollover
+    /// scheduler test exercises the loop without a 24h sleep.
+    #[test]
+    fn test_secs_until_next_ist_midnight_test_override() {
+        set_test_force_in_market_hours(true);
+        let s = secs_until_next_ist_midnight();
+        set_test_force_in_market_hours(false);
+        assert_eq!(s, 1, "test override must return 1s");
     }
 }
