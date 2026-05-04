@@ -427,22 +427,123 @@ Per operator charter (2026-05-04): defaults locked at maximum-guarantee-within-e
 
 ---
 
-## 16. Status tracking
+## 17. Functional additions (8 items)
 
-- [ ] Operator approves §1 locked decisions (re-confirm Y on all 10)
-- [ ] Operator answers §15 open questions
-- [ ] Three adversarial agents review the plan (hot-path / security / hostile bug-hunt)
-- [ ] Synthesize agent findings → fix CRITICAL+HIGH inline
-- [ ] Phase 1 PR opens on `claude/29-tf-movers-deletion`
-- [ ] Phase 1 verified per §13
-- [ ] Phase 2 PR
-- [ ] Phase 2 verified
-- [ ] Phase 3 PR
-- [ ] Phase 3 verified (7-day green-streak gate)
-- [ ] Phase 4 PR
-- [ ] Phase 4 verified (30-day post-deploy monitoring)
-- [ ] Plan archived to `.claude/plans/archive/2026-MM-DD-29-tf-movers-deletion.md`
+| # | Item | Where it lives | Notes |
+|---|---|---|---|
+| F1 | Greeks (delta/theta/gamma/vega/IV) for option contracts | `formulas.rs` greek fns + columns on `candles_*` for `instrument_type IN ('OPTSTK','OPTIDX','OPTCUR','OPTFUT')` | RAM engine reads underlying spot; greeks computed cold-path only (greeks_verification table consolidated into candles) |
+| F2 | VWAP per-bar | config-driven metric: `[[metrics]] name="vwap" expr="sum(close*volume_delta)/sum(volume_delta)"` | derived in matview SAMPLE BY |
+| F3 | Spread / mid / bid-ask imbalance (microstructure) | columns on `candles_*` derived from depth-20 packets | only populated for instruments subscribed to depth-20 |
+| F4 | Cross-instrument correlation engine | secondary in-memory `CorrelationEngine` (e.g., NIFTY ↔ BANKNIFTY) | cold path only; reads sealed candles, not ticks |
+| F5 | **Cold-boot warmup mid-session** | at boot, replay last 5 min of ticks from `ticks` table into engines before strategy enables | prevents top-K being empty during 1-min warmup gap |
+| F6 | **Engine state snapshot every 60s** | `MoverState` array serialized to mmap'd file; loaded at boot to skip warmup | bounded write rate; survives crashes |
+| F7 | **Garbled-tick sanity guard** | reject + count: price outside ±20% of last, volume non-monotonic, OI swing >50% | new `ErrorCode::SanityGuard01` — rejected ticks counted, not silenced |
+| F8 | Holiday-aware `compute_phase()` | wires `TradingCalendar` into `phase.rs` | NSE holidays change phase boundaries; pure fn, ratchet-tested |
 
 ---
 
-**END OF PLAN. NO CODE TOUCHES ANYTHING UNTIL OPERATOR APPROVES §1 + §15 + GREENLIGHTS PHASE 1 PR.**
+## 18. Operational additions (5 items)
+
+| # | Item | Where | Notes |
+|---|---|---|---|
+| O1 | Feature flag per phase | `[features]` section in TOML; checked at boot | rollback any single piece per env without revert; can disable engine per-TF |
+| O2 | Kill-switch fallback to DB-read mode | `MOVERS_ENGINE_FALLBACK_TO_DB=1` env var; checked on each `MoversEngine::top_k()` read | if RAM engine misbehaves in prod, operator forces DB path without redeploy |
+| O3 | Existing Grafana dashboard migration | scripted rewrite of all panels reading old movers tables → candles SELECT, BEFORE Phase 4 | dashboards must not break on table delete |
+| O4 | `/api/movers` API contract version bump | `?v=2` query param introduced in Phase 3; `?v=1` shim kept 30 days post-Phase-4 | external consumers get migration window |
+| O5 | AWS-vs-local config split | `config/local.toml`, `config/aws.toml`, `config/prod.toml` overrides; CI validates both | mmap path, oom_score_adj, cgroup limits differ per env |
+
+---
+
+## 19. Compliance + DR additions (4 items)
+
+| # | Item | Where | Notes |
+|---|---|---|---|
+| C1 | SEBI movers ranking audit | `movers_rank_audit` table — 1 row per top-K rank change (low volume, ~1K rows/day) | regulator query "what was top-10 at 14:32:15 on 2027-08-15" answerable; lifecycle 90d hot → S3 Glacier 5y |
+| C2 | EBS corruption disaster recovery runbook | `docs/runbooks/disaster-recovery.md` documents full-DB rebuild from S3 backup; chaos-tested annually | restore time target: 4h |
+| C3 | Multi-region failover | RECORDED as future-work (out of scope for this plan) | acknowledge but defer |
+| C4 | Engine state audit table | `engine_state_audit` table — every `MoverState` change persisted (high volume, ~10M rows/day) | "why did engine rank X at Y?" forensic; SEBI 5y; lifecycle hot 30d → S3 |
+
+---
+
+## 20. Cost + sizing additions (3 items)
+
+| # | Item | Concrete number | Notes |
+|---|---|---|---|
+| $1 | Monthly cost projection (29 matviews + new columns + sub-second TFs + audit tables) | **+₹420/mo** above current baseline | within ₹5K/mo `aws-budget.md` cap (current ~₹4,981; new ~₹4,981 + 420 wait — needs recompute) |
+| $2 | Disk projection per TF (1 trading day) | 1s ~1.2 GB/day, 3s ~400 MB/day, 5s ~240 MB/day, 1m ~20 MB/day, 1d ~1 MB/day | tiering per `[timeframes.retention]` |
+| $3 | Memory ceiling assertion at boot | 25K instruments × 29 TFs × 64 B = ~46 MB; refuse to start if predicted > 200 MB | bounded; new `BOOT-04` error code if exceeded |
+
+⚠️ **Cost gate (must verify before Phase 1):** the `$1` row is a PROJECTION. Before Phase 1 PR opens, run actual sizing calc against current QuestDB partition sizes + S3 lifecycle cost. If projected total > ₹4,950/mo, trim sub-second retention or disable lowest-volume TFs.
+
+---
+
+## 21. Testing additions (6 items beyond the 25 in §8)
+
+| # | Test | File | Pins |
+|---|---|---|---|
+| T1 | Replay determinism | `crates/trading/tests/replay_determinism.rs` | same `data/test-fixtures/golden-day.ndjson` → same engine state, every run |
+| T2 | Multi-day boundary | `crates/core/tests/midnight_rollover_property.rs` | proptest crossing IST midnight: `prev_day_close` reset, `prev_oi_cache` reload |
+| T3 | Snapshot+restore round-trip | `crates/trading/tests/snapshot_restore.rs` | save → restart → restore → continue → identical to no-restart baseline |
+| T4 | Chaos: garbled tick injection | `crates/core/tests/chaos_garbled_tick.rs` | malformed packet → rejected + counted; engine state uncorrupted |
+| T5 | Chaos: clock skew | `crates/core/tests/chaos_clock_skew.rs` | ±2s wall-clock skew → bar boundaries still correct (BOOT-03 still halts on >2s) |
+| T6 | Chaos: feature-flag flip mid-session | `crates/core/tests/chaos_feature_flip.rs` | flip `candle_engine_29tf` true→false at 11:00 IST → clean fallback to DB reads |
+
+**Total ratchets after additions: 25 (§8) + 6 (§21) = 31 ratchet tests.**
+
+---
+
+## 22. New ErrorCodes (5 items)
+
+| Code | Severity | Module | Meaning |
+|---|---|---|---|
+| `SNAPSHOT-01` | Medium | `crates/trading/src/movers/snapshot.rs` | engine state snapshot write failed (60s recurring task) |
+| `FORENSIC-01` | Medium | `crates/core/src/forensics/disconnect_snapshot.rs` | disconnect forensic dump failed (file write, disk full?) |
+| `HEARTBEAT-01` | High | `crates/core/src/websocket/activity_watchdog.rs` | silent socket detected via passive activity watchdog (no ticks for >50s on a healthy WS) |
+| `WARMUP-01` | Low | `crates/trading/src/candles/engine.rs` | mid-session cold-boot warmup ticking (informational; engine catching up from `ticks` replay) |
+| `BOOT-04` | Critical | `crates/app/src/main.rs` | predicted memory at boot > 200 MB ceiling → refuse to start |
+
+⚠️ Note: `ROTATION-01` was originally in this list but DELETED — forced rotation banned by L11.
+
+Each code requires:
+- runbook entry in `.claude/rules/project/wave-5-error-codes.md` (or new `wave-6-error-codes.md`)
+- triage YAML rule in `.claude/triage/error-rules.yaml`
+- Prometheus counter `tv_<code_lower>_total`
+- alert rule (for Medium+) in `alerts.yml`
+- Telegram notification variant
+
+---
+
+## 23. Updated NET CHANGE (after additions §17-§22)
+
+| Category | LoC |
+|---|---|
+| §14 base additions | +4,640 |
+| §14 base deletions | −2,180 |
+| §17 functional (8 items) | +1,200 |
+| §18 operational (5 items) | +600 |
+| §19 compliance + DR (4 items) | +400 |
+| §20 cost + sizing (3 items) | +150 |
+| §21 testing (6 items) | +500 |
+| §22 ErrorCodes (5 codes) | +200 (incl. runbook entries) |
+| **NET TOTAL** | **+5,510 LoC net** |
+
+(Bigger than original +2,460 because we accepted all 31 functional/operational/compliance/cost/testing additions. The deletion side stays at −2,180 — same.)
+
+---
+
+## 24. Status tracking
+
+- [ ] Operator approves §1 L1-L11 locked decisions
+- [ ] Three adversarial agents review the plan (hot-path / security / hostile bug-hunt)
+- [ ] Synthesize agent findings → fix CRITICAL+HIGH inline
+- [ ] Cost projection $1 verified against actual QuestDB partition sizes (gate before Phase 1)
+- [ ] Phase 1 PR opens on `claude/29-tf-movers-deletion`
+- [ ] Phase 1 verified per §13
+- [ ] Phase 2 PR + verified
+- [ ] Phase 3 PR + verified (14-day green-streak gate)
+- [ ] Phase 4 PR + verified (30-day post-deploy)
+- [ ] Plan archived to `.claude/plans/archive/`
+
+---
+
+**END OF PLAN. NO CODE TOUCHES ANYTHING UNTIL OPERATOR APPROVES §1 L1-L11 + GREENLIGHTS PHASE 1 PR.**
