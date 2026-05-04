@@ -1272,8 +1272,9 @@ async fn main() -> Result<()> {
         let shutdown_notify = std::sync::Arc::new(tokio::sync::Notify::new());
 
         // --- Tick processor: start BEFORE WS connections spawn ---
-        let shared_movers: tickvault_core::pipeline::SharedTopMoversSnapshot =
-            std::sync::Arc::new(std::sync::RwLock::new(None));
+        // PR #457 (2026-05-04): legacy `shared_movers:
+        // SharedTopMoversSnapshot` Arc removed — `/api/movers` reads
+        // the `movers_5s` mat-view directly (PR #450).
 
         // Tick broadcast for trading pipeline (cold path consumer).
         // A2: Use constant capacity (65536) to absorb high-volatility bursts without lagging.
@@ -1752,7 +1753,6 @@ async fn main() -> Result<()> {
             config.questdb.clone(),
             config.dhan.clone(),
             config.instrument.clone(),
-            shared_movers.clone(),
             bg_shared_constituency,
             health_status,
         );
@@ -1835,7 +1835,7 @@ async fn main() -> Result<()> {
             otel_provider,
             &notifier,
             &config,
-            shared_movers,
+            // PR #457: shared_movers arg removed
             post_market_signal,
             ws_pool_arc,
             shutdown_notify,
@@ -2559,8 +2559,9 @@ async fn main() -> Result<()> {
     // -----------------------------------------------------------------------
     // Step 9: Spawn tick processor FIRST (before WS connections send frames)
     // -----------------------------------------------------------------------
-    let shared_movers: tickvault_core::pipeline::SharedTopMoversSnapshot =
-        std::sync::Arc::new(std::sync::RwLock::new(None));
+    // PR #457 (2026-05-04): legacy `shared_movers:
+    // SharedTopMoversSnapshot` Arc removed (slow-boot path) — same
+    // reason as the fast-boot path above.
 
     // Tick broadcast: fan-out parsed ticks to the trading pipeline (cold path consumer).
     // A2: Use constant capacity (65536) to absorb bursts without lagging cold-path consumers.
@@ -6646,7 +6647,6 @@ async fn main() -> Result<()> {
         config.questdb.clone(),
         config.dhan.clone(),
         config.instrument.clone(),
-        shared_movers.clone(),
         shared_constituency.clone(),
         health_status,
     );
@@ -6990,7 +6990,7 @@ async fn main() -> Result<()> {
         otel_provider,
         &notifier,
         &config,
-        shared_movers,
+        // PR #457: shared_movers arg removed
         post_market_signal,
         ws_pool_arc,
         shutdown_notify,
@@ -8439,7 +8439,9 @@ async fn run_shutdown_fast(
     otel_provider: Option<opentelemetry_sdk::trace::SdkTracerProvider>,
     notifier: &std::sync::Arc<NotificationService>,
     config: &ApplicationConfig,
-    shared_movers: tickvault_core::pipeline::SharedTopMoversSnapshot,
+    // PR #457 (2026-05-04): legacy `shared_movers:
+    // SharedTopMoversSnapshot` parameter REMOVED — see PR #457 in
+    // `crates/api/src/state.rs` constructor docstring.
     post_market_signal: std::sync::Arc<tokio::sync::Notify>,
     // S4-T1b: shared pool handle + shutdown notifier. `ws_pool_arc` is
     // None when no WebSocket pool was spawned (e.g., historical-replay
@@ -8659,7 +8661,7 @@ async fn run_shutdown_fast(
 
     // 7. Flush OpenTelemetry.
     drop(otel_provider);
-    drop(shared_movers);
+    // PR #457: drop(shared_movers) removed — Arc deleted from boot.
 
     info!("tickvault stopped");
     Ok(())

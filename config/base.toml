@@ -370,6 +370,10 @@ depth_dynamic_top_volume = true     # Wave 5 Items 4+5 LIVE
 # dynamic) — both code paths remain in the codebase as a rollback
 # option pending production validation.
 depth_dynamic_pipeline_v2 = true
+# PR #449 — kill-switch for the historical fetch + cross-verification +
+# pre-warmup subsystem. Default `false` until we migrate the historical
+# source from Dhan (NSE-aggregate) to a broker-traded feed.
+historical_fetch_enabled = false
 
 # ---------------------------------------------------------------------------
 # Depth-dynamic redesign (PR-C2) — config-driven all-5-dynamic depth pools.

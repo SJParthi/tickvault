@@ -350,9 +350,7 @@ mod tests {
                 csv_download_timeout_secs: 120,
                 build_window_start: "08:25:00".to_string(),
                 build_window_end: "08:55:00".to_string(),
-            },
-            std::sync::Arc::new(std::sync::RwLock::new(None)),
-            std::sync::Arc::new(std::sync::RwLock::new(None)),
+            },            std::sync::Arc::new(std::sync::RwLock::new(None)),
             std::sync::Arc::new(state::SystemHealthStatus::new()),
         );
         // Production-style call: SecretString → from_token → build_router_with_auth.
@@ -389,9 +387,7 @@ mod tests {
                 csv_download_timeout_secs: 120,
                 build_window_start: "08:25:00".to_string(),
                 build_window_end: "08:55:00".to_string(),
-            },
-            std::sync::Arc::new(std::sync::RwLock::new(None)),
-            std::sync::Arc::new(std::sync::RwLock::new(None)),
+            },            std::sync::Arc::new(std::sync::RwLock::new(None)),
             std::sync::Arc::new(state::SystemHealthStatus::new()),
         );
         // dry_run=true → TV_API_TOKEN not needed
@@ -425,9 +421,7 @@ mod tests {
                 csv_download_timeout_secs: 120,
                 build_window_start: "08:25:00".to_string(),
                 build_window_end: "08:55:00".to_string(),
-            },
-            std::sync::Arc::new(std::sync::RwLock::new(None)),
-            std::sync::Arc::new(std::sync::RwLock::new(None)),
+            },            std::sync::Arc::new(std::sync::RwLock::new(None)),
             std::sync::Arc::new(state::SystemHealthStatus::new()),
         );
         let origins = vec![
@@ -472,9 +466,7 @@ mod tests {
                 csv_download_timeout_secs: 120,
                 build_window_start: "08:25:00".to_string(),
                 build_window_end: "08:55:00".to_string(),
-            },
-            std::sync::Arc::new(std::sync::RwLock::new(None)),
-            std::sync::Arc::new(std::sync::RwLock::new(None)),
+            },            std::sync::Arc::new(std::sync::RwLock::new(None)),
             std::sync::Arc::new(state::SystemHealthStatus::new()),
         );
         let router = build_router(state, &[], true);
@@ -527,9 +519,7 @@ mod tests {
                 csv_download_timeout_secs: 120,
                 build_window_start: "08:25:00".to_string(),
                 build_window_end: "08:55:00".to_string(),
-            },
-            std::sync::Arc::new(std::sync::RwLock::new(None)),
-            std::sync::Arc::new(std::sync::RwLock::new(None)),
+            },            std::sync::Arc::new(std::sync::RwLock::new(None)),
             std::sync::Arc::new(state::SystemHealthStatus::new()),
         );
         let router = build_router(state, &[], true);
@@ -578,9 +568,7 @@ mod tests {
                 csv_download_timeout_secs: 120,
                 build_window_start: "08:25:00".to_string(),
                 build_window_end: "08:55:00".to_string(),
-            },
-            std::sync::Arc::new(std::sync::RwLock::new(None)),
-            std::sync::Arc::new(std::sync::RwLock::new(None)),
+            },            std::sync::Arc::new(std::sync::RwLock::new(None)),
             std::sync::Arc::new(state::SystemHealthStatus::new()),
         );
         let origins = vec!["http://localhost:3000".to_string()];
@@ -619,9 +607,7 @@ mod tests {
                 csv_download_timeout_secs: 120,
                 build_window_start: "08:25:00".to_string(),
                 build_window_end: "08:55:00".to_string(),
-            },
-            std::sync::Arc::new(std::sync::RwLock::new(None)),
-            std::sync::Arc::new(std::sync::RwLock::new(None)),
+            },            std::sync::Arc::new(std::sync::RwLock::new(None)),
             std::sync::Arc::new(state::SystemHealthStatus::new()),
         );
         let router = build_router(state, &[], true);

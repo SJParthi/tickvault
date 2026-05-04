@@ -265,9 +265,7 @@ mod tests {
                 csv_download_timeout_secs: 1,
                 build_window_start: "00:00:00".to_string(),
                 build_window_end: "23:59:59".to_string(),
-            },
-            std::sync::Arc::new(std::sync::RwLock::new(None)),
-            std::sync::Arc::new(std::sync::RwLock::new(None)),
+            },            std::sync::Arc::new(std::sync::RwLock::new(None)),
             std::sync::Arc::new(crate::state::SystemHealthStatus::new()),
         )
     }
@@ -391,9 +389,7 @@ mod tests {
                 csv_download_timeout_secs: 1,
                 build_window_start: "00:00:00".to_string(),
                 build_window_end: "23:59:59".to_string(),
-            },
-            std::sync::Arc::new(std::sync::RwLock::new(None)),
-            std::sync::Arc::new(std::sync::RwLock::new(None)),
+            },            std::sync::Arc::new(std::sync::RwLock::new(None)),
             std::sync::Arc::new(crate::state::SystemHealthStatus::new()),
         );
 

@@ -56,9 +56,10 @@ fn test_instrument_config() -> InstrumentConfig {
     }
 }
 
-fn empty_snapshot() -> tickvault_core::pipeline::top_movers::SharedTopMoversSnapshot {
-    Arc::new(RwLock::new(None))
-}
+// PR #457 (2026-05-04): empty_snapshot() helper removed — the
+// SharedTopMoversSnapshot type is gone with the legacy in-memory
+// `TopMoversTracker` (the new /api/movers endpoint reads QuestDB
+// `movers_5s` directly per PR #450).
 
 fn empty_constituency() -> tickvault_api::state::SharedConstituencyMap {
     Arc::new(RwLock::new(None))
@@ -69,7 +70,6 @@ fn make_test_state(questdb: QuestDbConfig) -> SharedAppState {
         questdb,
         test_dhan_config(),
         test_instrument_config(),
-        empty_snapshot(),
         empty_constituency(),
         Arc::new(SystemHealthStatus::new()),
     )
@@ -203,7 +203,7 @@ fn no_panic_shared_app_state_construction() {
     let _ = state.questdb_config();
     let _ = state.dhan_config();
     let _ = state.instrument_config();
-    let _ = state.top_movers_snapshot();
+    // PR #457: state.top_movers_snapshot() accessor removed
     let _ = state.constituency_map();
 }
 

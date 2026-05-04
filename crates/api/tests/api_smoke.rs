@@ -37,9 +37,7 @@ fn test_state() -> SharedAppState {
             csv_download_timeout_secs: 30,
             build_window_start: "06:00:00".to_string(),
             build_window_end: "09:15:00".to_string(),
-        },
-        std::sync::Arc::new(std::sync::RwLock::new(None)),
-        std::sync::Arc::new(std::sync::RwLock::new(None)),
+        },        std::sync::Arc::new(std::sync::RwLock::new(None)),
         std::sync::Arc::new(SystemHealthStatus::new()),
     )
 }

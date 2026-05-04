@@ -8,7 +8,6 @@ const QUESTDB_HTTP_CLIENT_TIMEOUT_SECS: u64 = 10;
 
 use tickvault_common::config::{DhanConfig, InstrumentConfig, QuestDbConfig};
 use tickvault_common::instrument_types::IndexConstituencyMap;
-use tickvault_core::pipeline::top_movers::SharedTopMoversSnapshot;
 
 /// Shared handle to the index constituency map (Arc<RwLock<Option<...>>>).
 pub type SharedConstituencyMap = Arc<RwLock<Option<IndexConstituencyMap>>>;
@@ -260,11 +259,11 @@ struct AppStateInner {
     instrument_config: InstrumentConfig,
     /// Concurrency guard: prevents concurrent instrument rebuilds.
     rebuild_in_progress: AtomicBool,
-    /// Shared top movers snapshot from the tick pipeline.
-    top_movers_snapshot: SharedTopMoversSnapshot,
     // PR #450 commit 6 (2026-05-03): movers_snapshot_v2 field DELETED.
-    // The legacy /api/movers (V2) handler + in-memory tracker are gone.
-    // The new unified /api/movers handler reads QuestDB SQL directly.
+    // PR #457 (2026-05-04): legacy `top_movers_snapshot:
+    // SharedTopMoversSnapshot` field DELETED — the in-memory
+    // `TopMoversTracker` was removed when `/api/movers` migrated to
+    // read the `movers_5s` materialised view directly (PR #450).
     /// Shared index constituency map.
     constituency_map: SharedConstituencyMap,
     /// Subsystem health status for the `/health` endpoint.
@@ -276,11 +275,17 @@ struct AppStateInner {
 
 impl SharedAppState {
     /// Creates new shared state.
+    ///
+    /// PR #457 (2026-05-04): the `top_movers_snapshot:
+    /// SharedTopMoversSnapshot` parameter was removed when the legacy
+    /// in-memory `TopMoversTracker` was deleted. Callers should drop
+    /// the corresponding constructor argument; nothing in the API
+    /// layer reads from the old snapshot since `/api/movers` migrated
+    /// to QuestDB SQL in PR #450.
     pub fn new(
         questdb_config: QuestDbConfig,
         dhan_config: DhanConfig,
         instrument_config: InstrumentConfig,
-        top_movers_snapshot: SharedTopMoversSnapshot,
         constituency_map: SharedConstituencyMap,
         health_status: SharedHealthStatus,
     ) -> Self {
@@ -299,7 +304,6 @@ impl SharedAppState {
                 dhan_config,
                 instrument_config,
                 rebuild_in_progress: AtomicBool::new(false),
-                top_movers_snapshot,
                 constituency_map,
                 health_status,
                 questdb_http_client,
@@ -338,13 +342,10 @@ impl SharedAppState {
         &self.inner.rebuild_in_progress
     }
 
-    /// Returns the shared top movers snapshot handle.
-    pub fn top_movers_snapshot(&self) -> &SharedTopMoversSnapshot {
-        &self.inner.top_movers_snapshot
-    }
-
     // PR #450 commit 6 (2026-05-03): movers_snapshot_v2() accessor
     // DELETED. The new unified /api/movers handler reads QuestDB SQL.
+    // PR #457 (2026-05-04): top_movers_snapshot() accessor DELETED
+    // alongside the field — see PR #457 docstring on `new()`.
 
     /// Returns the shared index constituency map handle.
     pub fn constituency_map(&self) -> &SharedConstituencyMap {
@@ -389,9 +390,9 @@ mod tests {
         }
     }
 
-    fn empty_snapshot() -> SharedTopMoversSnapshot {
-        std::sync::Arc::new(std::sync::RwLock::new(None))
-    }
+    // PR #457 (2026-05-04): empty_snapshot() helper REMOVED — the
+    // SharedTopMoversSnapshot type it returned is gone with the
+    // legacy in-memory tracker.
 
     fn empty_constituency() -> SharedConstituencyMap {
         std::sync::Arc::new(std::sync::RwLock::new(None))
@@ -413,7 +414,6 @@ mod tests {
             config,
             test_dhan_config(),
             test_instrument_config(),
-            empty_snapshot(),
             empty_constituency(),
             test_health_status(),
         );
@@ -436,7 +436,6 @@ mod tests {
             config,
             test_dhan_config(),
             test_instrument_config(),
-            empty_snapshot(),
             empty_constituency(),
             test_health_status(),
         );
@@ -583,7 +582,6 @@ mod tests {
             },
             test_dhan_config(),
             test_instrument_config(),
-            empty_snapshot(),
             empty_constituency(),
             test_health_status(),
         );
@@ -602,7 +600,6 @@ mod tests {
             },
             test_dhan_config(),
             test_instrument_config(),
-            empty_snapshot(),
             empty_constituency(),
             test_health_status(),
         );
@@ -620,7 +617,6 @@ mod tests {
             },
             test_dhan_config(),
             test_instrument_config(),
-            empty_snapshot(),
             empty_constituency(),
             test_health_status(),
         );
@@ -647,7 +643,6 @@ mod tests {
             },
             test_dhan_config(),
             test_instrument_config(),
-            empty_snapshot(),
             empty_constituency(),
             health,
         );
@@ -655,24 +650,11 @@ mod tests {
         assert_eq!(state.health_status().websocket_connections(), 2);
     }
 
-    #[test]
-    fn test_shared_app_state_top_movers_snapshot_accessor() {
-        let state = SharedAppState::new(
-            QuestDbConfig {
-                host: "test".to_string(),
-                http_port: 9000,
-                pg_port: 8812,
-                ilp_port: 9009,
-            },
-            test_dhan_config(),
-            test_instrument_config(),
-            empty_snapshot(),
-            empty_constituency(),
-            test_health_status(),
-        );
-        let snapshot = state.top_movers_snapshot();
-        assert!(snapshot.read().unwrap().is_none());
-    }
+    // PR #457 (2026-05-04): test_shared_app_state_top_movers_snapshot_accessor
+    // REMOVED — the accessor + field it exercised are gone with the
+    // legacy in-memory tracker. The new unified /api/movers handler
+    // reads QuestDB SQL directly (PR #450); coverage for that path
+    // lives in `movers_questdb.rs` integration tests.
 
     #[test]
     fn test_shared_app_state_constituency_map_accessor() {
@@ -685,7 +667,6 @@ mod tests {
             },
             test_dhan_config(),
             test_instrument_config(),
-            empty_snapshot(),
             empty_constituency(),
             test_health_status(),
         );

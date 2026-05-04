@@ -39,7 +39,6 @@ fn test_state() -> SharedAppState {
             build_window_end: "09:15:00".to_string(),
         },
         std::sync::Arc::new(std::sync::RwLock::new(None)),
-        std::sync::Arc::new(std::sync::RwLock::new(None)),
         std::sync::Arc::new(SystemHealthStatus::new()),
     )
 }
@@ -61,19 +60,30 @@ async fn test_get_stats_returns_200() {
 }
 
 /// `GET /api/top-movers` must return 200 (handler returns `available: false`
-/// when the snapshot is empty — never errors).
+/// PR #450 retired `/api/top-movers` in favour of `/api/movers` (the
+/// unified Dhan-parity endpoint reading `movers_5s` mat-view directly).
+/// PR #457 (2026-05-04): test updated to hit the new route. Returns
+/// 400 on missing `category` query param, but the route resolves
+/// (no 404), which is what this smoke check verifies.
 #[tokio::test]
-async fn test_get_top_movers_returns_200() {
+async fn test_get_movers_route_exists() {
     let router = build_router(test_state(), &[], true);
     let request = Request::builder()
-        .uri("/api/top-movers")
+        .uri("/api/movers")
         .body(Body::empty())
         .expect("request build should succeed"); // APPROVED: test-only
     let response = router
         .oneshot(request)
         .await
         .expect("router should respond"); // APPROVED: test-only
-    assert_eq!(response.status(), StatusCode::OK);
+    // Route is registered (must not be 404). 400 is acceptable —
+    // missing `category` query param is the documented error path.
+    assert_ne!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "/api/movers must be registered after PR #450 retirement of \
+         /api/top-movers"
+    );
 }
 
 /// `GET /api/index-constituency` must return 200 (handler returns
