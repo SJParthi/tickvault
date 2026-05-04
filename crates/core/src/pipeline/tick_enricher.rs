@@ -38,9 +38,8 @@
 
 use tracing::info;
 
-use tickvault_common::phase::{Phase, compute_phase};
+use tickvault_common::phase::{Phase, compute_phase_by_segment_code};
 use tickvault_common::tick_types::ParsedTick;
-use tickvault_common::types::ExchangeSegment;
 
 use crate::pipeline::prev_day_close_stamper::PrevDayCloseStamper;
 use crate::pipeline::prev_oi_cache::PrevOiCache;
@@ -141,9 +140,11 @@ impl TickEnricher {
         // Previous-day OI (boot-loaded; defaults to 0 if missing).
         let prev_day_oi = self.prev_oi_cache.get(sid, seg).unwrap_or(0);
 
-        // Trading-day phase (pure-fn classifier).
-        let segment_enum = ExchangeSegment::from_byte(seg).unwrap_or(ExchangeSegment::IdxI);
-        let phase = compute_phase(now_ist_secs_of_day, segment_enum);
+        // Trading-day phase (pure-fn classifier). Phase 2.13 hot-path
+        // M2 fix: use the segment-code variant directly to skip the
+        // dead `ExchangeSegment::from_byte().unwrap_or(IdxI)` conversion
+        // (the enum result was ignored by compute_phase anyway).
+        let phase = compute_phase_by_segment_code(now_ist_secs_of_day, seg);
 
         EnrichedTick {
             tick,
