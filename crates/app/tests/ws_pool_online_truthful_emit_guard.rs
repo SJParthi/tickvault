@@ -1,0 +1,167 @@
+//! PR #458 ratchet — `WebSocketPoolOnline` MUST NOT fire if any
+//! connection is not in `ConnectionState::Connected`.
+//!
+//! Pre-PR #458, `emit_websocket_connected_alerts` reported
+//! `connected: handle_count, total: handle_count` — the SPAWN count,
+//! not the count of actually-connected sockets. That was a false-OK:
+//! the operator received "WS pool online: 5/5 connected" Telegram
+//! while no Dhan handshake had completed yet. PR #458 rewires the
+//! emit logic to poll `pool.health()` and emit `WebSocketPoolOnline`
+//! ONLY when every slot has reached `Connected`.
+//!
+//! This test ratchets that contract on the format-string contract:
+//! given a fully-connected pool snapshot, the message says "live"; given
+//! a partial snapshot via `WebSocketPoolPartialAfterDeadline`, the
+//! message says "partially online" with stuck-slot breakdown. A future
+//! regression that swaps these wordings or merges the two variants will
+//! fail this test.
+//!
+//! Run: `cargo test -p tickvault-app --test ws_pool_online_truthful_emit_guard`
+
+use tickvault_core::notification::events::{BootPathLabel, NotificationEvent};
+
+#[test]
+fn pool_online_message_for_fully_connected_pool_says_live() {
+    let event = NotificationEvent::WebSocketPoolOnline {
+        connected: 5,
+        total: 5,
+        per_connection: vec![
+            (5_000, 5_000, Some(1)),
+            (5_000, 5_000, Some(1)),
+            (5_000, 5_000, Some(2)),
+            (5_000, 5_000, Some(2)),
+            (4_324, 5_000, Some(2)),
+        ],
+        boot_path: BootPathLabel::Slow,
+        boot_wall_clock_secs: 11.2,
+    };
+    let msg = event.to_message();
+    assert!(
+        msg.contains("✅") && msg.contains("live"),
+        "WebSocketPoolOnline must signal verdict + liveness in the first \
+         line; got: {msg}"
+    );
+    assert!(
+        msg.contains("All 5 of 5"),
+        "header MUST report connected/total = 5/5 from the truthful \
+         payload; got: {msg}"
+    );
+    assert!(
+        msg.contains("24,324"),
+        "comma-formatted aggregate subscription count is required; got: \
+         {msg}"
+    );
+    assert!(
+        msg.contains("Normal start"),
+        "boot_path must be surfaced in human form; got: {msg}"
+    );
+}
+
+#[test]
+fn pool_partial_after_deadline_says_partially_online() {
+    let event = NotificationEvent::WebSocketPoolPartialAfterDeadline {
+        connected: 3,
+        total: 5,
+        per_connection: vec![
+            (5_000, 5_000, Some(1)),
+            (5_000, 5_000, Some(2)),
+            (4_847, 5_000, Some(3)),
+            (0, 5_000, None),
+            (0, 5_000, None),
+        ],
+        stuck: vec![
+            (3, "state=Connecting".to_string()),
+            (4, "state=Disconnected".to_string()),
+        ],
+        boot_path: BootPathLabel::Slow,
+    };
+    let msg = event.to_message();
+    assert!(
+        msg.contains("⚠️") && msg.contains("partially online"),
+        "PartialAfterDeadline must signal warning + partial wording; \
+         got: {msg}"
+    );
+    assert!(
+        msg.contains("3 of 5"),
+        "header MUST report connected/total = 3/5 from the truthful \
+         payload; got: {msg}"
+    );
+    assert!(
+        msg.contains("Working feeds:") && msg.contains("Broken feeds:"),
+        "PartialAfterDeadline must split active vs stuck rows; got: {msg}"
+    );
+    assert!(
+        msg.contains("state=Connecting") && msg.contains("state=Disconnected"),
+        "stuck reasons must surface verbatim; got: {msg}"
+    );
+}
+
+#[test]
+fn pool_online_severity_is_medium_partial_is_high() {
+    use tickvault_core::notification::events::Severity;
+    let online = NotificationEvent::WebSocketPoolOnline {
+        connected: 5,
+        total: 5,
+        per_connection: vec![(5_000, 5_000, Some(1)); 5],
+        boot_path: BootPathLabel::Slow,
+        boot_wall_clock_secs: 10.0,
+    };
+    let partial = NotificationEvent::WebSocketPoolPartialAfterDeadline {
+        connected: 0,
+        total: 5,
+        per_connection: vec![(0, 5_000, None); 5],
+        stuck: vec![],
+        boot_path: BootPathLabel::Slow,
+    };
+    assert_eq!(online.severity(), Severity::Medium);
+    assert_eq!(partial.severity(), Severity::High);
+}
+
+#[test]
+fn ws_connected_payload_renders_capacity_percent_and_ping() {
+    let event = NotificationEvent::WebSocketConnected {
+        connection_index: 0,
+        subscribed_count: 5_000,
+        capacity: 5_000,
+        last_activity_secs_ago: Some(1),
+    };
+    let msg = event.to_message();
+    assert!(
+        msg.contains("Feed 1"),
+        "1-indexed Feed N display required; got: {msg}"
+    );
+    assert!(
+        msg.contains("100% full") || msg.contains("100.0% full") || msg.contains("100%"),
+        "100% capacity rendering required; got: {msg}"
+    );
+    assert!(
+        msg.contains("1s ago ✓"),
+        "ping freshness checkmark required for fresh frames; got: {msg}"
+    );
+}
+
+#[test]
+fn ws_connected_renders_no_data_yet_when_first_frame_pending() {
+    let event = NotificationEvent::WebSocketConnected {
+        connection_index: 4,
+        subscribed_count: 4_324,
+        capacity: 5_000,
+        last_activity_secs_ago: None,
+    };
+    let msg = event.to_message();
+    assert!(
+        msg.contains("Feed 5"),
+        "1-indexed Feed N display required; got: {msg}"
+    );
+    assert!(
+        msg.contains("—"),
+        "em-dash required when no first frame received yet; got: {msg}"
+    );
+}
+
+#[test]
+fn boot_path_label_human_strings_are_distinct() {
+    assert_ne!(BootPathLabel::Slow.human(), BootPathLabel::Fast.human());
+    assert!(BootPathLabel::Slow.human().contains("Normal"));
+    assert!(BootPathLabel::Fast.human().contains("crash recovery"));
+}

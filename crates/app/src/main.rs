@@ -1408,7 +1408,14 @@ async fn main() -> Result<()> {
             // FAST BOOT parity with slow boot (main.rs ~1760):
             // emit per-connection + aggregate Telegram alerts so an operator
             // can see the pool came up after a crash-recovery restart.
-            emit_websocket_connected_alerts(&fast_notifier, handles.len()).await;
+            // PR #458: now polls pool.health() for truthful state.
+            emit_websocket_connected_alerts(
+                &fast_notifier,
+                &pool_arc,
+                tickvault_core::notification::events::BootPathLabel::Fast,
+                boot_start,
+            )
+            .await;
             (handles, Some(pool_arc))
         } else {
             (Vec::new(), None)
@@ -3329,7 +3336,14 @@ async fn main() -> Result<()> {
         );
         // FAST BOOT parity: helper emits per-connection + aggregate Telegram
         // alerts on BOTH boot paths (main.rs ~830 for FAST BOOT, here for slow).
-        emit_websocket_connected_alerts(&notifier, handles.len()).await;
+        // PR #458: now polls pool.health() for truthful state.
+        emit_websocket_connected_alerts(
+            &notifier,
+            &pool_arc,
+            tickvault_core::notification::events::BootPathLabel::Slow,
+            boot_start,
+        )
+        .await;
         (handles, Some(pool_arc))
     } else {
         (Vec::new(), None)
@@ -7269,44 +7283,109 @@ async fn spawn_websocket_connections(
     handles
 }
 
-/// Stagger in milliseconds between per-connection `WebSocketConnected` events.
-/// Telegram rate-limits bursts of identical-from messages; spacing the emits
-/// avoids silent drops. A 5-connection pool at 150 ms adds ~750 ms to boot,
-/// which is negligible against the 15-step boot budget.
-const WS_CONNECTED_ALERT_STAGGER_MS: u64 = 150;
+/// Per-connection deadline for the truthful boot-time emit. If a slot
+/// has not transitioned to `Connected` within this window after
+/// `pool.spawn_handles()` returned, it is reported in the
+/// `WebSocketPoolPartialAfterDeadline` event with its current state as
+/// the stuck reason.
+const WS_BOOT_PER_CONN_DEADLINE_SECS: u64 = 30;
+
+/// Polling interval inside the truthful emit loop. 250ms gives sub-second
+/// freshness for state transitions without burning CPU.
+const WS_BOOT_POLL_INTERVAL_MS: u64 = 250;
 
 /// Emits per-connection `WebSocketConnected` Telegram events plus a single
-/// aggregate `WebSocketPoolOnline` summary. Called from BOTH boot paths
-/// (FAST BOOT and slow boot) so an operator sees the same signal regardless
-/// of which path ran.
+/// aggregate `WebSocketPoolOnline` summary — but ONLY when each connection
+/// has actually reached `ConnectionState::Connected` per `pool.health()`,
+/// not merely "task spawned". Called from BOTH boot paths (FAST BOOT and
+/// slow boot) so an operator sees the same truthful signal regardless of
+/// which path ran.
 ///
-/// Why the summary: when 5 per-connection events fire in a tight loop,
-/// Telegram can drop individual messages (observed live on 2026-04-17 —
-/// only 3 of 5 arrived). The aggregate is delivered with a small stagger
-/// after the individuals so even if all per-connection drops happen, a
-/// single "N/total online" message still reaches the operator chat.
+/// PR #458 (2026-05-04): the legacy version emitted both events
+/// immediately after `pool.spawn_handles()` returned, using `handle_count`
+/// for both `connected` and `total` — a false-OK when handshake had not
+/// yet completed. The rewrite polls `pool.health()` every 250ms for up
+/// to 30s per slot and emits the per-connection event only on the rising
+/// edge of `Connected`. The aggregate `WebSocketPoolOnline` fires only
+/// when ALL slots are `Connected`; otherwise
+/// `WebSocketPoolPartialAfterDeadline` fires with the stuck-slot
+/// breakdown.
 async fn emit_websocket_connected_alerts(
     notifier: &std::sync::Arc<NotificationService>,
-    handle_count: usize,
+    pool: &std::sync::Arc<WebSocketConnectionPool>,
+    boot_path: tickvault_core::notification::events::BootPathLabel,
+    boot_start: std::time::Instant,
 ) {
-    if handle_count == 0 {
+    let healths_initial = pool.health();
+    let total = healths_initial.len();
+    if total == 0 {
         return;
     }
-    for i in 0..handle_count {
-        notifier.notify(NotificationEvent::WebSocketConnected {
-            connection_index: i,
-        });
-        if i + 1 < handle_count {
-            tokio::time::sleep(std::time::Duration::from_millis(
-                WS_CONNECTED_ALERT_STAGGER_MS,
-            ))
-            .await;
+    let capacity = tickvault_common::constants::MAX_INSTRUMENTS_PER_WEBSOCKET_CONNECTION;
+    let mut emitted_per_conn = vec![false; total];
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(WS_BOOT_PER_CONN_DEADLINE_SECS);
+
+    while std::time::Instant::now() < deadline {
+        let healths = pool.health();
+        for h in &healths {
+            let i = h.connection_id as usize;
+            if i >= total || emitted_per_conn[i] {
+                continue;
+            }
+            if h.state == tickvault_core::websocket::types::ConnectionState::Connected {
+                emitted_per_conn[i] = true;
+                notifier.notify(NotificationEvent::WebSocketConnected {
+                    connection_index: i,
+                    subscribed_count: h.subscribed_count,
+                    capacity,
+                    last_activity_secs_ago: h.last_activity_secs_ago,
+                });
+            }
+        }
+        if emitted_per_conn.iter().all(|v| *v) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(WS_BOOT_POLL_INTERVAL_MS)).await;
+    }
+
+    // Final snapshot — derive aggregate truth from pool.health(), NOT
+    // from the spawn count.
+    let healths_final = pool.health();
+    let mut per_connection: Vec<(usize, usize, Option<u32>)> = vec![(0, capacity, None); total];
+    let mut connected_count = 0usize;
+    let mut stuck: Vec<(usize, String)> = Vec::new();
+    for h in &healths_final {
+        let i = h.connection_id as usize;
+        if i >= total {
+            continue;
+        }
+        per_connection[i] = (h.subscribed_count, capacity, h.last_activity_secs_ago);
+        if h.state == tickvault_core::websocket::types::ConnectionState::Connected {
+            connected_count = connected_count.saturating_add(1);
+        } else {
+            stuck.push((i, format!("state={}", h.state)));
         }
     }
-    notifier.notify(NotificationEvent::WebSocketPoolOnline {
-        connected: handle_count,
-        total: handle_count,
-    });
+    let boot_wall_clock_secs = boot_start.elapsed().as_secs_f64();
+
+    if connected_count == total {
+        notifier.notify(NotificationEvent::WebSocketPoolOnline {
+            connected: connected_count,
+            total,
+            per_connection,
+            boot_path,
+            boot_wall_clock_secs,
+        });
+    } else {
+        notifier.notify(NotificationEvent::WebSocketPoolPartialAfterDeadline {
+            connected: connected_count,
+            total,
+            per_connection,
+            stuck,
+            boot_path,
+        });
+    }
 }
 
 /// S4-T1a: Background pool health watchdog.

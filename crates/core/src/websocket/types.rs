@@ -333,6 +333,16 @@ pub struct ConnectionHealth {
     pub subscribed_count: usize,
     /// Total reconnections since startup.
     pub total_reconnections: u64,
+    /// Seconds since the most recent inbound frame on this connection
+    /// (binary / ping / pong / text). `None` if no frames have been
+    /// received yet on the current socket. Surfaced in the
+    /// `WebSocketConnected` + `WebSocketPoolOnline` Telegram payloads
+    /// so an operator can confirm ping/pong heartbeat liveness without
+    /// opening Grafana. Dhan pings every 10s + tokio-tungstenite
+    /// auto-pongs, so a healthy socket stays in the [0, 10] band.
+    /// Values > 30 indicate a silent socket — the per-connection
+    /// activity watchdog will fire shortly after.
+    pub last_activity_secs_ago: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -776,6 +786,7 @@ mod tests {
             state: ConnectionState::Connected,
             subscribed_count: 500,
             total_reconnections: 3,
+            last_activity_secs_ago: None,
         };
         let cloned = health.clone();
         assert_eq!(cloned.connection_id, 2);
@@ -791,6 +802,7 @@ mod tests {
             state: ConnectionState::Disconnected,
             subscribed_count: 0,
             total_reconnections: 0,
+            last_activity_secs_ago: None,
         };
         assert_eq!(health.connection_id, 0);
         assert_eq!(health.state, ConnectionState::Disconnected);
@@ -1058,6 +1070,7 @@ mod tests {
             state: ConnectionState::Reconnecting,
             subscribed_count: 1000,
             total_reconnections: 7,
+            last_activity_secs_ago: None,
         };
         let debug = format!("{health:?}");
         assert!(debug.contains("ConnectionHealth"));
@@ -1246,11 +1259,13 @@ mod tests {
             state: ConnectionState::Reconnecting,
             subscribed_count: 5000,
             total_reconnections: 99,
+            last_activity_secs_ago: Some(7),
         };
         assert_eq!(health.connection_id, 4);
         assert_eq!(health.state, ConnectionState::Reconnecting);
         assert_eq!(health.subscribed_count, 5000);
         assert_eq!(health.total_reconnections, 99);
+        assert_eq!(health.last_activity_secs_ago, Some(7));
     }
 
     #[test]
@@ -1260,6 +1275,7 @@ mod tests {
             state: ConnectionState::Connecting,
             subscribed_count: 100,
             total_reconnections: 1,
+            last_activity_secs_ago: None,
         };
         let cloned = original.clone();
         assert_eq!(cloned.connection_id, original.connection_id);
