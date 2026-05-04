@@ -3315,23 +3315,55 @@ async fn main() -> Result<()> {
         );
         let tick_enricher =
             std::sync::Arc::new(tickvault_core::pipeline::tick_enricher::TickEnricher::new());
-        match tick_enricher
+        // Phase 2.8 H4 fix: only mark the gate ready on Ok. On Err the
+        // gate stays in `AwaitingOiCache` and `try_authorize_subscribe`
+        // refuses authorization — the operator gets a typed ERROR
+        // (PREVCLOSE-01) and Telegram, not a False-OK. Loading
+        // graceful-degrades on truly empty candles_1d (Ok with
+        // count=0), only flagging the actual QuestDB-unreachable /
+        // schema-broken cases as failures.
+        let oi_cache_load_succeeded = match tick_enricher
             .prev_oi_cache
             .load_from_questdb(&config.questdb)
             .await
         {
-            Ok(count) => tracing::info!(
-                entries = count,
-                "prev_oi_cache loaded for tick enricher (Phase 2.6 production attach)"
-            ),
-            Err(err) => tracing::warn!(
-                ?err,
-                "prev_oi_cache load failed; enricher continues with empty cache \
-                 (prev_day_oi=0 default → formulas return 0.0 pct, graceful \
-                 degradation per L14)"
-            ),
+            Ok(count) => {
+                tracing::info!(
+                    entries = count,
+                    "prev_oi_cache loaded for tick enricher (Phase 2.6 production attach)"
+                );
+                metrics::counter!("tv_prev_oi_cache_load_total", "outcome" => "ok").increment(1);
+                if count == 0 {
+                    // Phase 2.8 H3 partial fix: emit a Prom counter +
+                    // structured WARN so an empty candles_1d doesn't
+                    // silently produce 0% OI changes for the day. The
+                    // gate still authorizes (count=0 is valid for fresh
+                    // deploy / first trading day), but operator sees
+                    // the diagnostic.
+                    metrics::counter!("tv_prev_oi_cache_empty_total").increment(1);
+                    tracing::warn!(
+                        "prev_oi_cache loaded zero entries — fresh deploy or candles_1d \
+                         empty for the prior trading day. OI Change panels will read 0% \
+                         until the next IST midnight rollover repopulates the cache."
+                    );
+                }
+                true
+            }
+            Err(err) => {
+                tracing::error!(
+                    code = tickvault_common::error_code::ErrorCode::PrevClose01IlpFailed.code_str(),
+                    ?err,
+                    "prev_oi_cache load FAILED — boot ordering gate stays \
+                     AwaitingOiCache, subscribe will not be authorized this boot. \
+                     Investigate QuestDB candles_1d availability."
+                );
+                metrics::counter!("tv_prev_oi_cache_load_total", "outcome" => "err").increment(1);
+                false
+            }
+        };
+        if oi_cache_load_succeeded {
+            boot_ordering_gate.mark_oi_cache_loaded();
         }
-        boot_ordering_gate.mark_oi_cache_loaded();
         boot_ordering_gate.mark_engines_ready();
         boot_ordering_gate.mark_replay_completed();
         if !boot_ordering_gate.try_authorize_subscribe() {

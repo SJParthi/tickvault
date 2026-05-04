@@ -1327,9 +1327,21 @@ pub struct TickLifecycle {
 }
 
 /// Map `Phase::as u8` to the canonical SYMBOL string written into
-/// QuestDB. Bounded 5-entry dictionary. Unknown codes map to
-/// PREMARKET as a safe default — out-of-range values would indicate
-/// a producer bug rather than a routing decision.
+/// QuestDB. Bounded 6-entry dictionary including the explicit
+/// "UNKNOWN" sentinel.
+///
+/// Phase 2.8 H2 fix (hostile bug-hunt drift hazard): out-of-range
+/// codes return "UNKNOWN" — NOT "PREMARKET". The previous default-to-
+/// PREMARKET behavior silently mislabeled future Phase variants
+/// (e.g. a hypothetical `Phase::Halted = 5`) as PREMARKET, masking
+/// a producer bug as legitimate data. The "UNKNOWN" string is its
+/// own SYMBOL value so dashboards and audits can detect the drift
+/// immediately. Operators see "UNKNOWN" in the panel and trace the
+/// bug; they don't see "PREMARKET" and assume nothing's wrong.
+///
+/// A producer-side counter `tv_phase_code_unknown_total` is
+/// incremented on every UNKNOWN return so the drift surfaces in
+/// metrics + alerts independently of QuestDB.
 #[inline]
 fn phase_code_to_str(code: u8) -> &'static str {
     match code {
@@ -1338,7 +1350,14 @@ fn phase_code_to_str(code: u8) -> &'static str {
         2 => "OPEN",
         3 => "POSTAUCTION",
         4 => "CLOSED",
-        _ => "PREMARKET",
+        _ => {
+            // Increment a counter on the UNKNOWN path so the drift
+            // surfaces in metrics regardless of where the bad code
+            // came from. The counter creation is idempotent — first
+            // call registers, later calls just increment.
+            metrics::counter!("tv_phase_code_unknown_total").increment(1);
+            "UNKNOWN"
+        }
     }
 }
 
@@ -3528,14 +3547,23 @@ mod tests {
         assert_eq!(phase_code_to_str(4), "CLOSED");
     }
 
-    /// Phase 2 ratchet: out-of-range codes safely default to PREMARKET
-    /// rather than panic. A producer bug would surface as the safe
-    /// default in the SYMBOL dictionary.
+    /// Phase 2.8 H2 ratchet (drift hazard): out-of-range codes return
+    /// "UNKNOWN" — NOT "PREMARKET". The old default-to-PREMARKET
+    /// behavior silently mislabeled future variants (e.g. hypothetical
+    /// `Phase::Halted = 5`) as healthy PREMARKET, masking the bug.
+    /// "UNKNOWN" is its own SYMBOL string so dashboards + audits can
+    /// detect the drift; the producer-side
+    /// `tv_phase_code_unknown_total` counter increments on every
+    /// UNKNOWN return.
     #[test]
-    fn test_phase_code_to_str_unknown_defaults_premarket() {
-        assert_eq!(phase_code_to_str(5), "PREMARKET");
-        assert_eq!(phase_code_to_str(99), "PREMARKET");
-        assert_eq!(phase_code_to_str(255), "PREMARKET");
+    fn test_phase_code_to_str_unknown_returns_unknown_not_premarket() {
+        assert_eq!(
+            phase_code_to_str(5),
+            "UNKNOWN",
+            "code 5 must NOT silently map to PREMARKET — H2 fix"
+        );
+        assert_eq!(phase_code_to_str(99), "UNKNOWN");
+        assert_eq!(phase_code_to_str(255), "UNKNOWN");
     }
 
     /// Phase 2 ratchet: `TickLifecycle` defaults match the legacy

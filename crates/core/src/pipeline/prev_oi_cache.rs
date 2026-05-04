@@ -33,7 +33,7 @@ use std::time::Duration;
 
 use papaya::HashMap;
 use reqwest::Client;
-use tracing::{info, warn};
+use tracing::{error, info};
 
 use tickvault_common::config::QuestDbConfig;
 
@@ -176,16 +176,20 @@ impl PrevOiCache {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            warn!(
+            // Phase 2.8 H4 fix (security/hostile review): on failure
+            // we do NOT mark loaded=true. Without that flag the
+            // BootOrderingGate stays in `AwaitingOiCache`, which the
+            // caller logs as ERROR + Telegram. Treating this as
+            // "loaded with empty cache" was the False-OK class bug
+            // flagged by the adversarial review — operator never
+            // saw a signal that QuestDB candles_1d failed to load.
+            error!(
+                code = tickvault_common::error_code::ErrorCode::PrevClose01IlpFailed.code_str(),
                 %status,
                 body = body.chars().take(200).collect::<String>(),
-                "prev_oi_cache load returned non-success — cache stays empty"
+                "prev_oi_cache load returned non-success — gate stays AwaitingOiCache; \
+                 operator must investigate before next subscribe"
             );
-            // Mark loaded=true even on empty/error so the boot gate
-            // doesn't block forever. The downstream lookup returns None
-            // → NULL OI → 0.0 pct change. Graceful degradation.
-            self.loaded
-                .store(true, std::sync::atomic::Ordering::Release);
             return Err(LoadError::QuestDbError {
                 status: status.as_u16(),
             });
@@ -259,19 +263,37 @@ fn segment_str_to_code(s: &str) -> Option<u8> {
     }
 }
 
-/// Errors that can arise during cache load. The boot-ordering gate (L14)
-/// treats every variant as graceful degradation (cache stays empty,
-/// boot continues) — these errors only surface in metrics/logs.
+/// Errors that can arise during cache load.
+///
+/// Phase 2.8 security HIGH fix: the `Display` form of `reqwest::Error`
+/// includes the full URL with any query params. While this code uses
+/// the internal QuestDB endpoint (no secrets in the URL), the pattern
+/// is defence-in-depth — if a future commit reuses this struct's
+/// `Display` for an authenticated endpoint (Dhan REST, auth.dhan.co)
+/// the bearer token in the URL would leak into Loki + Telegram. The
+/// new `Display` form embeds `reqwest::Error::status()` only — never
+/// `{0}` of the inner error. The full underlying error is still
+/// available via `#[source]` for structured logging that opts into it
+/// explicitly.
 #[derive(Debug, thiserror::Error)]
 pub enum LoadError {
-    #[error("failed to build HTTP client: {0}")]
-    HttpClient(reqwest::Error),
-    #[error("HTTP request to QuestDB failed: {0}")]
-    HttpRequest(reqwest::Error),
+    #[error("failed to build HTTP client (reqwest internal error)")]
+    HttpClient(#[source] reqwest::Error),
+    #[error(
+        "HTTP request to QuestDB failed: kind={} status={:?}",
+        if .0.is_timeout() { "timeout" }
+        else if .0.is_connect() { "connect" }
+        else if .0.is_request() { "request" }
+        else if .0.is_body() { "body" }
+        else if .0.is_decode() { "decode" }
+        else { "other" },
+        .0.status()
+    )]
+    HttpRequest(#[source] reqwest::Error),
     #[error("QuestDB returned non-success status {status}")]
     QuestDbError { status: u16 },
-    #[error("failed to parse QuestDB response JSON: {0}")]
-    JsonParse(serde_json::Error),
+    #[error("failed to parse QuestDB response JSON")]
+    JsonParse(#[source] serde_json::Error),
     #[error("malformed security_id in QuestDB row")]
     MalformedSecurityId,
     #[error("malformed segment in QuestDB row")]
