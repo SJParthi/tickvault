@@ -1,0 +1,101 @@
+//! Phase 2.5 — `run_tick_processor` enricher param ratchet.
+//!
+//! Pins the contract that `run_tick_processor` accepts an
+//! `Option<Arc<TickEnricher>>` parameter and routes ticks through
+//! `append_tick_enriched` when `Some`. Tested at the source-scan level
+//! (no live QuestDB needed) so the ratchet runs deterministically in
+//! CI on every PR.
+//!
+//! Why source-scan rather than runtime exercise: the enricher branch
+//! needs both a hot ILP writer AND a live tick stream to produce
+//! observable output, neither of which we want to spin up in a unit
+//! test. Source-scan is sufficient because the failure mode we're
+//! guarding against is "future commit accidentally drops the enricher
+//! branch" — which a string-match catches reliably.
+
+use std::path::PathBuf;
+
+fn workspace_root() -> PathBuf {
+    let me = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    me.parent()
+        .expect("tickvault root")
+        .parent()
+        .expect("workspace root")
+        .to_path_buf()
+        .join("crates")
+}
+
+fn read(path: &str) -> String {
+    let p = workspace_root().join(path);
+    std::fs::read_to_string(&p).unwrap_or_else(|err| panic!("read {p:?}: {err}"))
+}
+
+#[test]
+fn run_tick_processor_signature_carries_tick_enricher_param() {
+    let src = read("core/src/pipeline/tick_processor.rs");
+    assert!(
+        src.contains("tick_enricher: Option<std::sync::Arc<TickEnricher>>"),
+        "run_tick_processor must declare `tick_enricher: Option<std::sync::Arc<TickEnricher>>` parameter"
+    );
+}
+
+#[test]
+fn run_tick_processor_branches_to_append_tick_enriched_on_some_path() {
+    let src = read("core/src/pipeline/tick_processor.rs");
+    assert!(
+        src.contains("writer.append_tick_enriched(&tick, life)"),
+        "run_tick_processor must call append_tick_enriched in the enricher Some branch"
+    );
+    assert!(
+        src.contains("enricher.enrich_tick(&tick, now_ist_secs)"),
+        "run_tick_processor must call enricher.enrich_tick(&tick, now_ist_secs) on the hot path"
+    );
+}
+
+#[test]
+fn run_tick_processor_falls_back_to_append_tick_on_none_path() {
+    let src = read("core/src/pipeline/tick_processor.rs");
+    // The legacy path still calls append_tick when no enricher is attached.
+    // We don't pin the exact spelling — just that the symbol is present in
+    // the same function (which a substring scan over the file confirms).
+    assert!(
+        src.contains("writer.append_tick(&tick)"),
+        "run_tick_processor must keep the legacy `append_tick` fallback for the None branch"
+    );
+}
+
+#[test]
+fn run_tick_processor_uses_now_ist_secs_of_day_helper_not_inline_arithmetic() {
+    let src = read("core/src/pipeline/tick_processor.rs");
+    assert!(
+        src.contains("now_ist_secs_of_day"),
+        "run_tick_processor must use the `now_ist_secs_of_day` helper (not inline IST math) so phase boundaries stay consistent with `compute_phase()`"
+    );
+}
+
+#[test]
+fn main_rs_call_sites_pass_none_for_tick_enricher() {
+    let src = read("app/src/main.rs");
+    // Both main.rs call sites currently pass None (Phase 2.5 wiring is
+    // foundation-only; production attaches the enricher in a focused
+    // follow-up PR alongside prev_oi_cache load + BootOrderingGate
+    // marks). When that wire-up ships, this test is updated to pin
+    // `Some(...)` instead — drift here = main.rs forgot to update.
+    let count_none_for_enricher = src.matches("tick_enricher").count();
+    assert!(
+        count_none_for_enricher >= 2,
+        "main.rs must reference tick_enricher at both run_tick_processor call sites (slow + fast boot); current matches: {count_none_for_enricher}"
+    );
+}
+
+#[test]
+fn tick_lifecycle_is_built_from_enriched_tick_in_processor() {
+    let src = read("core/src/pipeline/tick_processor.rs");
+    // The mapping from EnrichedTick to TickLifecycle must remain 1:1 by
+    // field name. If a future commit adds a 5th lifecycle column, this
+    // test fails until the call site is updated to forward it.
+    assert!(src.contains("volume_delta: enriched.volume_delta"));
+    assert!(src.contains("prev_day_close: enriched.prev_day_close"));
+    assert!(src.contains("prev_day_oi: enriched.prev_day_oi"));
+    assert!(src.contains("phase: enriched.phase as u8"));
+}

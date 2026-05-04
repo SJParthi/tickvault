@@ -1359,6 +1359,7 @@ async fn main() -> Result<()> {
                     None, // option_movers_writer — created in slow boot only
                     fast_registry,
                     Some(fast_tick_heartbeat),
+                    None, // tick_enricher — Phase 2.5 wiring deferred until prev_oi_cache + boot ordering gate land in slow boot
                 )
                 .await;
             });
@@ -3301,6 +3302,7 @@ async fn main() -> Result<()> {
                 option_movers_writer,
                 slow_registry,
                 Some(slow_tick_heartbeat),
+                None, // tick_enricher — Phase 2.5 helper landed; production wire-up deferred until prev_oi_cache load + BootOrderingGate are added to the slow-boot sequence (next sub-PR). When None, append_tick uses default lifecycle values (PREMARKET/0/0.0/0).
             )
             .await;
         });
