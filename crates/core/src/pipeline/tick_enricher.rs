@@ -1,0 +1,337 @@
+//! Tick enrichment orchestrator.
+//!
+//! Sits between the parser and the persistence writer. Computes the four
+//! Phase 2 lifecycle values for every tick:
+//!
+//! | Output | Source |
+//! |---|---|
+//! | `volume_delta` | `VolumeDeltaTracker::record_tick(sid, seg, current_volume)` |
+//! | `prev_day_close` | `PrevDayCloseStamper::get_or_stamp(sid, seg, packet.day_close)` |
+//! | `prev_day_oi` | `PrevOiCache::get(sid, seg)` (boot-loaded from candles_1d) |
+//! | `phase` | `compute_phase(now_ist_secs_of_day, segment)` pure fn |
+//!
+//! ## IST midnight rollover (L13)
+//!
+//! `MidnightRolloverTask::run_once()` performs the atomic phase transition
+//! described in the plan §3:
+//!
+//! 1. Snapshot `last_seen[security]` map → discard
+//!    (`VolumeDeltaTracker::clear_for_new_day`).
+//! 2. Reload `prev_oi_cache` from `candles_1d`
+//!    (`PrevOiCache::load_from_questdb`).
+//! 3. Reset `prev_day_close` first-seen stamper
+//!    (`PrevDayCloseStamper::clear_for_new_day`).
+//! 4. Set phase = PREMARKET (handled by `compute_phase` automatically
+//!    once the wall clock crosses 00:00:00 IST).
+//! 5. VOLUME-MONO-01 SUPPRESSED until phase reaches OPEN — caller logic
+//!    (not enforced here; the consumer of `EnrichedTick` decides).
+//! 6. Engine state TTL sweep — drop entries with no tick for >7 days
+//!    (deferred to a follow-up commit; this enricher handles 1–4 today).
+//!
+//! ## Hot-path guarantee
+//!
+//! `enrich_tick` is O(1) per call. Two papaya `get` calls (cache + stamper),
+//! one papaya `insert` (delta tracker), one branch-on-int (phase). Zero
+//! allocation, no syscalls, no time-of-day call (caller passes
+//! `now_ist_secs_of_day` so the wall-clock read is shared across the
+//! batch — typically once per processor loop iteration).
+
+use tracing::info;
+
+use tickvault_common::phase::{Phase, compute_phase};
+use tickvault_common::tick_types::ParsedTick;
+use tickvault_common::types::ExchangeSegment;
+
+use crate::pipeline::prev_day_close_stamper::PrevDayCloseStamper;
+use crate::pipeline::prev_oi_cache::PrevOiCache;
+use crate::pipeline::volume_delta_tracker::{DeltaOutcome, VolumeDeltaTracker};
+
+/// Output of `enrich_tick`. Bundles the original tick with the four
+/// Phase 2 lifecycle values plus regression flags from VOLUME-MONO-01.
+#[derive(Clone, Copy, Debug)]
+pub struct EnrichedTick<'a> {
+    pub tick: &'a ParsedTick,
+    /// Per-tick incremental volume (signed — can be negative on a
+    /// day rollover before VOLUME-MONO-01 suppression kicks in).
+    pub volume_delta: i64,
+    /// Frozen previous-day close. Equals `tick.day_close` for the first
+    /// tick of the day; subsequent ticks reuse the stamped value.
+    /// `0.0` when no valid candidate has been observed yet (Ticker
+    /// packet only — no prev_close field).
+    pub prev_day_close: f32,
+    /// Boot-loaded previous-day OI from `candles_1d`. `0` when the
+    /// instrument has no prior-day record (new listing, fresh deploy).
+    pub prev_day_oi: i64,
+    /// Trading-day phase computed from `now_ist_secs_of_day`.
+    pub phase: Phase,
+    /// `true` when `volume_delta < 0`. Caller (the writer) decides
+    /// whether to escalate VOLUME-MONO-01 — the rule is to suppress
+    /// during PREMARKET/PREOPEN, escalate during OPEN.
+    pub volume_is_regression: bool,
+    /// `true` when this is the first tick of the day for this
+    /// instrument. Caller suppresses VOLUME-MONO-01 on `is_first_seen`
+    /// regardless of phase.
+    pub volume_is_first_seen: bool,
+}
+
+/// Tick enricher — owns the four state holders that combine to produce
+/// the Phase 2 lifecycle columns.
+///
+/// Cloneable: each field is internally Arc-shared, so cloning is cheap
+/// and produces independent handles that operate on the same state.
+/// Multiple consumers (the tick processor + the midnight rollover task)
+/// hold their own clone.
+#[derive(Clone, Default)]
+pub struct TickEnricher {
+    pub prev_oi_cache: PrevOiCache,
+    pub prev_day_close_stamper: PrevDayCloseStamper,
+    pub volume_delta_tracker: VolumeDeltaTracker,
+}
+
+impl TickEnricher {
+    /// Constructs an enricher with empty/unloaded state. The caller MUST
+    /// call `prev_oi_cache.load_from_questdb` and verify
+    /// `is_loaded()` before subscribe fires (boot-ordering gate L14).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Enrich a single tick with the four lifecycle values.
+    ///
+    /// O(1), zero-alloc, hot-path-safe.
+    ///
+    /// `now_ist_secs_of_day` should be precomputed once per processor
+    /// loop (or once per batch) so this fn is a pure transformation
+    /// of `(tick, time)`. The caller owns the wall-clock read.
+    #[inline]
+    pub fn enrich_tick<'a>(
+        &self,
+        tick: &'a ParsedTick,
+        now_ist_secs_of_day: u32,
+    ) -> EnrichedTick<'a> {
+        let sid = tick.security_id;
+        let seg = tick.exchange_segment_code;
+
+        // Volume delta (record + classify).
+        let DeltaOutcome {
+            delta,
+            is_regression,
+            is_first_seen,
+        } = self.volume_delta_tracker.record_tick(sid, seg, tick.volume);
+
+        // Previous-day close (first-seen stamp).
+        let prev_day_close = self
+            .prev_day_close_stamper
+            .get_or_stamp(sid, seg, tick.day_close);
+
+        // Previous-day OI (boot-loaded; defaults to 0 if missing).
+        let prev_day_oi = self.prev_oi_cache.get(sid, seg).unwrap_or(0);
+
+        // Trading-day phase (pure-fn classifier).
+        let segment_enum = ExchangeSegment::from_byte(seg).unwrap_or(ExchangeSegment::IdxI);
+        let phase = compute_phase(now_ist_secs_of_day, segment_enum);
+
+        EnrichedTick {
+            tick,
+            volume_delta: delta,
+            prev_day_close,
+            prev_day_oi,
+            phase,
+            volume_is_regression: is_regression,
+            volume_is_first_seen: is_first_seen,
+        }
+    }
+
+    /// IST midnight rollover. Call once when the wall clock crosses
+    /// 00:00:00 IST. Performs steps 1–3 of L13 atomically (single
+    /// thread). Step 2 (prev_oi_cache reload from candles_1d) is
+    /// invoked by the caller — pass through `prev_oi_cache.load_from_questdb`.
+    ///
+    /// Step 4 (phase=PREMARKET) is implicit — `compute_phase` will return
+    /// `Phase::Premarket` automatically once the clock crosses midnight.
+    /// Step 5 (VOLUME-MONO-01 suppression) is enforced by the caller
+    /// based on `enriched.phase` + `enriched.volume_is_first_seen`.
+    /// Step 6 (TTL sweep) is a follow-on enhancement (engine state
+    /// expiry), not implemented here.
+    pub fn rollover_for_new_day(&self) {
+        // Step 1: clear last_seen volume baselines.
+        self.volume_delta_tracker.clear_for_new_day();
+        // Step 3: clear prev_day_close stamps.
+        self.prev_day_close_stamper.clear_for_new_day();
+        info!(
+            "tick_enricher rollover for new day: volume_delta + prev_day_close cleared (prev_oi_cache reload is caller responsibility)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_tick(security_id: u32, segment_code: u8, volume: u32, day_close: f32) -> ParsedTick {
+        ParsedTick {
+            security_id,
+            exchange_segment_code: segment_code,
+            volume,
+            day_close,
+            ..ParsedTick::default()
+        }
+    }
+
+    /// Pre-open seconds-of-day (09:00 IST = 32400). Used in test fixtures
+    /// without depending on the exact constant module.
+    const TEST_PREOPEN_SECS: u32 = 9 * 3600;
+    /// Continuous-trading seconds-of-day (09:30 IST).
+    const TEST_OPEN_SECS: u32 = 9 * 3600 + 30 * 60;
+    /// Pre-market seconds-of-day (07:00 IST).
+    const TEST_PREMARKET_SECS: u32 = 7 * 3600;
+
+    #[test]
+    fn test_enrich_tick_first_call_marks_first_seen() {
+        let e = TickEnricher::new();
+        let t = make_tick(1234, 1, 5_000, 100.0);
+        let r = e.enrich_tick(&t, TEST_OPEN_SECS);
+        assert!(r.volume_is_first_seen);
+        assert_eq!(r.volume_delta, 5_000);
+        assert!(!r.volume_is_regression);
+        assert_eq!(r.prev_day_close, 100.0);
+        // No prev_oi loaded — defaults to 0.
+        assert_eq!(r.prev_day_oi, 0);
+        assert_eq!(r.phase, Phase::Open);
+    }
+
+    #[test]
+    fn test_enrich_tick_second_call_returns_increment() {
+        let e = TickEnricher::new();
+        let t1 = make_tick(1234, 1, 5_000, 100.0);
+        e.enrich_tick(&t1, TEST_OPEN_SECS);
+
+        let t2 = make_tick(1234, 1, 7_500, 105.0); // day_close changed but stamper holds 100.0
+        let r = e.enrich_tick(&t2, TEST_OPEN_SECS);
+        assert!(!r.volume_is_first_seen);
+        assert_eq!(r.volume_delta, 2_500);
+        assert!(!r.volume_is_regression);
+        // First-seen stamp held — second tick's day_close ignored.
+        assert_eq!(r.prev_day_close, 100.0);
+    }
+
+    #[test]
+    fn test_enrich_tick_regression_flag() {
+        let e = TickEnricher::new();
+        let t1 = make_tick(1, 1, 100_000, 50.0);
+        e.enrich_tick(&t1, TEST_OPEN_SECS);
+        // Cumulative volume regression.
+        let t2 = make_tick(1, 1, 50_000, 50.0);
+        let r = e.enrich_tick(&t2, TEST_OPEN_SECS);
+        assert!(r.volume_is_regression);
+        assert_eq!(r.volume_delta, -50_000);
+    }
+
+    #[test]
+    fn test_enrich_tick_uses_prev_oi_cache() {
+        let e = TickEnricher::new();
+        e.prev_oi_cache.insert(99, 2, 12_345_678);
+        let t = make_tick(99, 2, 1, 100.0);
+        let r = e.enrich_tick(&t, TEST_OPEN_SECS);
+        assert_eq!(r.prev_day_oi, 12_345_678);
+    }
+
+    #[test]
+    fn test_enrich_tick_phase_routes_correctly() {
+        let e = TickEnricher::new();
+        let t = make_tick(1, 1, 1, 100.0);
+        assert_eq!(
+            e.enrich_tick(&t, TEST_PREMARKET_SECS).phase,
+            Phase::Premarket
+        );
+        assert_eq!(e.enrich_tick(&t, TEST_PREOPEN_SECS).phase, Phase::Preopen);
+        assert_eq!(e.enrich_tick(&t, TEST_OPEN_SECS).phase, Phase::Open);
+    }
+
+    /// I-P1-11 ratchet: same security_id under different segments
+    /// enriches independently — the volume_delta tracker, stamper,
+    /// and OI cache all use the composite key.
+    #[test]
+    fn test_enrich_tick_composite_key_isolation() {
+        let e = TickEnricher::new();
+        e.prev_oi_cache.insert(13, 0, 1_000_000); // NIFTY IDX_I
+        e.prev_oi_cache.insert(13, 1, 50_000); // hypothetical NSE_EQ same id
+
+        let t_idx = make_tick(13, 0, 1_000, 22500.0);
+        let t_eq = make_tick(13, 1, 100, 1500.0);
+        let r_idx = e.enrich_tick(&t_idx, TEST_OPEN_SECS);
+        let r_eq = e.enrich_tick(&t_eq, TEST_OPEN_SECS);
+
+        assert_eq!(r_idx.prev_day_oi, 1_000_000);
+        assert_eq!(r_eq.prev_day_oi, 50_000);
+        assert_eq!(r_idx.prev_day_close, 22500.0);
+        assert_eq!(r_eq.prev_day_close, 1500.0);
+        // Both first-seen for the volume tracker.
+        assert!(r_idx.volume_is_first_seen);
+        assert!(r_eq.volume_is_first_seen);
+    }
+
+    /// L13 step 1 + step 3: midnight rollover clears volume baselines
+    /// and prev_day_close stamps. Step 2 (OI reload) is caller's
+    /// responsibility — verified separately in prev_oi_cache tests.
+    #[test]
+    fn test_rollover_for_new_day_clears_volume_and_close_stamps() {
+        let e = TickEnricher::new();
+        let t = make_tick(1, 1, 5_000, 100.0);
+        e.enrich_tick(&t, TEST_OPEN_SECS);
+        assert!(!e.volume_delta_tracker.is_empty());
+        assert!(!e.prev_day_close_stamper.is_empty());
+
+        e.rollover_for_new_day();
+
+        assert!(
+            e.volume_delta_tracker.is_empty(),
+            "volume tracker must be empty after rollover (L13 step 1)"
+        );
+        assert!(
+            e.prev_day_close_stamper.is_empty(),
+            "prev_day_close stamper must be empty after rollover (L13 step 3)"
+        );
+
+        // Next tick of the new day starts fresh.
+        let t_new = make_tick(1, 1, 50, 105.0);
+        let r = e.enrich_tick(&t_new, TEST_PREMARKET_SECS);
+        assert!(r.volume_is_first_seen, "post-rollover tick is first-seen");
+        assert_eq!(r.prev_day_close, 105.0, "new prev_day_close stamps");
+        assert_eq!(r.phase, Phase::Premarket);
+    }
+
+    #[test]
+    fn test_clone_shares_state() {
+        let e1 = TickEnricher::new();
+        let e2 = e1.clone();
+        let t = make_tick(42, 1, 1_000, 200.0);
+        e1.enrich_tick(&t, TEST_OPEN_SECS);
+        // Clone sees the same state.
+        assert_eq!(e2.volume_delta_tracker.get_last_seen(42, 1), Some(1_000));
+        assert_eq!(e2.prev_day_close_stamper.get(42, 1), Some(200.0));
+    }
+
+    #[test]
+    fn test_new_returns_empty_state() {
+        // pub-fn-test guard name match.
+        let e = TickEnricher::new();
+        assert!(e.volume_delta_tracker.is_empty());
+        assert!(e.prev_day_close_stamper.is_empty());
+        assert!(!e.prev_oi_cache.is_loaded());
+    }
+
+    #[test]
+    fn test_enrich_tick_unknown_segment_falls_back_safely() {
+        // Code 6 has no enum variant per dhan-ref/08-annexure-enums.md.
+        // Should fall back to IdxI for phase computation rather than
+        // panic.
+        let e = TickEnricher::new();
+        let t = make_tick(1, 6, 100, 50.0);
+        let r = e.enrich_tick(&t, TEST_OPEN_SECS);
+        assert_eq!(r.phase, Phase::Open);
+        // Volume / prev_close still tracked by the (sid, segment_code) key,
+        // even though segment_code=6 has no enum.
+        assert_eq!(r.volume_delta, 100);
+    }
+}
