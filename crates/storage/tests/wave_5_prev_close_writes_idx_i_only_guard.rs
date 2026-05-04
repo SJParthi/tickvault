@@ -95,26 +95,10 @@ fn test_prev_close_table_only_contains_idx_i_rows() {
     );
 }
 
-#[test]
-fn test_movers_writer_reads_day_close_from_ticks_via_in_memory_cache() {
-    // Source-scan: the in-memory cache update on the Quote/Full paths
-    // is preserved. `update_prev_close` calls on `top_movers` /
-    // `option_movers` are the runtime-cache hand-off; if these get
-    // deleted, the movers writer's change_pct computation breaks.
-    let src = tick_processor_source();
-    let movers_updates = src.matches("movers.update_prev_close").count();
-    let opt_movers_updates = src.matches("opt_movers.update_prev_close").count();
-    assert!(
-        movers_updates >= 2,
-        "Wave 5 Item 15: `top_movers.update_prev_close` must appear on \
-         BOTH the Quote + Full code paths (≥2 occurrences) so the \
-         in-memory cache stays fed for change_pct queries. Found \
-         {movers_updates}."
-    );
-    assert!(
-        opt_movers_updates >= 2,
-        "Wave 5 Item 15: `option_movers.update_prev_close` must appear \
-         on BOTH the Quote + Full code paths (≥2 occurrences). Found \
-         {opt_movers_updates}."
-    );
-}
+// PR #457 (2026-05-04): test_movers_writer_reads_day_close_from_ticks_via_in_memory_cache
+// REMOVED. The legacy in-memory `top_movers` / `option_movers` trackers
+// have been deleted in this PR — the unified `/api/movers` endpoint
+// reads `movers_5s` mat-view directly (PR #450), and the per-tick
+// `update_prev_close` cache hand-off no longer exists. Wave 5 Item 15's
+// invariant is now enforced by the QuestDB `movers_1s` ILP path which
+// has its own coverage in `crates/storage/tests/movers_persistence_*.rs`.

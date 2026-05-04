@@ -22,7 +22,10 @@ use tickvault_core::parser::dispatch_frame;
 use tickvault_core::parser::dispatcher::dispatch_deep_depth_frame;
 use tickvault_core::parser::types::ParsedFrame;
 use tickvault_core::pipeline::candle_aggregator::CandleAggregator;
-use tickvault_core::pipeline::top_movers::TopMoversTracker;
+// PR #457 (2026-05-04): TopMoversTracker import removed alongside the
+// 3 movers-specific proptests below. The legacy in-memory tracker is
+// gone — the unified /api/movers endpoint reads `movers_5s` mat-view
+// directly (PR #450).
 use tickvault_core::websocket::subscription_builder::build_subscription_messages;
 use tickvault_core::websocket::types::InstrumentSubscription;
 
@@ -534,94 +537,12 @@ proptest! {
     }
 }
 
-// ===========================================================================
-// 23. Top movers — change_pct computation correct for random prices
-// ===========================================================================
-
-proptest! {
-    #[test]
-    fn proptest_top_movers_change_pct_correct(
-        ltp in 0.01_f32..100_000.0,
-        prev_close in 0.01_f32..100_000.0,
-    ) {
-        let mut tracker = TopMoversTracker::new();
-        // Segment 1 = NSE_EQ — TopMoversTracker rejects derivatives (segment 2)
-        let tick = make_tick(42, 1, ltp, prev_close, 1000, 1_700_000_000);
-        tracker.update(&tick);
-
-        let snapshot = tracker.compute_snapshot();
-        prop_assert_eq!(snapshot.total_tracked, 1);
-
-        // Compute expected change_pct
-        let expected_pct = ((ltp - prev_close) / prev_close) * 100.0;
-
-        // The security should appear in either gainers, losers, or most_active
-        let all_entries: Vec<_> = snapshot
-            .equity_gainers
-            .iter()
-            .chain(snapshot.equity_losers.iter())
-            .chain(snapshot.equity_most_active.iter())
-            .filter(|e| e.security_id == 42)
-            .collect();
-
-        // Must be in most_active at minimum
-        let in_most_active = snapshot.equity_most_active.iter().any(|e| e.security_id == 42);
-        prop_assert!(in_most_active, "security should be in most_active");
-
-        // Verify change_pct matches if in any list
-        if let Some(entry) = all_entries.first() {
-            let diff = (entry.change_pct - expected_pct).abs();
-            prop_assert!(
-                diff < 0.01,
-                "change_pct mismatch: got {}, expected {}",
-                entry.change_pct,
-                expected_pct,
-            );
-        }
-    }
-}
-
-// ===========================================================================
-// 24. Top movers — skip ticks with zero/negative/NaN day_close
-// ===========================================================================
-
-proptest! {
-    #[test]
-    fn proptest_top_movers_skip_invalid_prev_close(
-        ltp in 0.01_f32..100_000.0,
-        invalid_close in prop_oneof![Just(0.0_f32), Just(-1.0_f32), Just(f32::NAN)],
-    ) {
-        let mut tracker = TopMoversTracker::new();
-        // Segment 1 = NSE_EQ — TopMoversTracker rejects derivatives (segment 2)
-        let tick = make_tick(42, 1, ltp, invalid_close, 1000, 1_700_000_000);
-        tracker.update(&tick);
-
-        prop_assert_eq!(tracker.tracked_count(), 0);
-    }
-}
-
-// ===========================================================================
-// 25. Top movers — multiple securities are tracked independently
-// ===========================================================================
-
-proptest! {
-    #[test]
-    fn proptest_top_movers_multiple_securities(
-        count in 1_usize..50,
-        ltp in 0.01_f32..50_000.0,
-        prev_close in 0.01_f32..50_000.0,
-    ) {
-        let mut tracker = TopMoversTracker::new();
-
-        for i in 0..count {
-            // Segment 1 = NSE_EQ — TopMoversTracker rejects derivatives (segment 2)
-            let tick = make_tick(i as u32 + 1, 1, ltp, prev_close, 1000 * (i as u32 + 1), 1_700_000_000);
-            tracker.update(&tick);
-        }
-
-        prop_assert_eq!(tracker.tracked_count(), count);
-    }
-}
+// PR #457 (2026-05-04): proptests 23, 24, 25 (movers change_pct, invalid
+// prev_close, multi-securities) DELETED. They exercised the legacy
+// in-memory `TopMoversTracker` which is removed in this PR. Coverage
+// for the new `movers_5s` mat-view + `/api/movers` endpoint lives in
+// `crates/api/src/handlers/movers_questdb.rs` integration tests
+// against a real QuestDB instance (PR #450).
 
 // ===========================================================================
 // 26. Deep depth — dispatch_deep_depth_frame with valid bid/ask packets
