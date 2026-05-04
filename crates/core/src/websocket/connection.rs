@@ -283,6 +283,15 @@ pub struct WebSocketConnection {
     /// *forward progress*, not absolute values.
     activity_counter: Arc<AtomicU64>,
 
+    /// Wall-clock UTC epoch seconds of the most recent inbound frame
+    /// (binary / ping / pong / text). Stored as `i64` so a `0` sentinel
+    /// distinguishes "never seen a frame" from "frame at epoch 0".
+    /// Read by `health()` to surface ping/pong heartbeat liveness in
+    /// the `WebSocketConnected` Telegram payload. Bumped on every
+    /// inbound frame in the read loop alongside `activity_counter`.
+    /// O(1) per tick: single relaxed atomic store.
+    last_activity_at_epoch_secs: Arc<std::sync::atomic::AtomicI64>,
+
     /// STAGE-C.3: Notify handle the activity watchdog fires when it has
     /// observed no forward progress on `activity_counter` for longer than
     /// its threshold. The read loop awaits this in `tokio::select!` and
@@ -396,6 +405,7 @@ impl WebSocketConnection {
             shutdown_notify: Arc::new(tokio::sync::Notify::new()),
             wal_spill: None,
             activity_counter: Arc::new(AtomicU64::new(0)),
+            last_activity_at_epoch_secs: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             watchdog_notify: Arc::new(tokio::sync::Notify::new()),
             // O1-B: subscribe command channel installed lazily via builder.
             subscribe_cmd_rx: tokio::sync::Mutex::new(None),
@@ -481,11 +491,25 @@ impl WebSocketConnection {
     /// Returns a health snapshot for monitoring.
     #[allow(clippy::expect_used)] // APPROVED: lock poison is unrecoverable
     pub fn health(&self) -> ConnectionHealth {
+        // Compute "seconds since last inbound frame" from the wall-clock
+        // delta. `0` sentinel = no frame ever received → return None so
+        // the Telegram formatter can render "—" instead of a misleading
+        // "1714..." (epoch). On wall-clock skew where last > now, clamp
+        // to 0s rather than overflow.
+        let last_at = self.last_activity_at_epoch_secs.load(Ordering::Relaxed);
+        let last_activity_secs_ago = if last_at == 0 {
+            None
+        } else {
+            let now = chrono::Utc::now().timestamp();
+            let delta = now.saturating_sub(last_at);
+            Some(delta.clamp(0, u32::MAX as i64) as u32)
+        };
         ConnectionHealth {
             connection_id: self.connection_id,
             state: *self.state.lock().expect("state lock poisoned"), // APPROVED: lock poison is unrecoverable
             subscribed_count: self.instruments.len(),
             total_reconnections: self.total_reconnections.load(Ordering::Acquire),
+            last_activity_secs_ago,
         }
     }
 
@@ -1117,7 +1141,13 @@ impl WebSocketConnection {
                 // chrono::Utc::now().timestamp() is a clock_gettime
                 // syscall (~20ns) — acceptable on this path; the
                 // downstream parse + dispatch is ~10 μs anyway.
-                m_last_frame_epoch.set(chrono::Utc::now().timestamp() as f64);
+                let now_secs = chrono::Utc::now().timestamp();
+                m_last_frame_epoch.set(now_secs as f64);
+                // Bump the connection-local timestamp so health() can
+                // surface "last frame N seconds ago" in Telegram payloads
+                // for ping/pong heartbeat liveness.
+                self.last_activity_at_epoch_secs
+                    .store(now_secs, Ordering::Relaxed);
             }
 
             match frame_result {

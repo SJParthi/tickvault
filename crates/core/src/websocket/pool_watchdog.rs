@@ -195,6 +195,7 @@ mod tests {
             state,
             subscribed_count: 0,
             total_reconnections: 0,
+            last_activity_secs_ago: None,
         }
     }
 

@@ -1371,6 +1371,9 @@ mod tests {
         });
         service.notify(NotificationEvent::WebSocketConnected {
             connection_index: 0,
+            subscribed_count: 5_000,
+            capacity: 5_000,
+            last_activity_secs_ago: Some(1),
         });
         service.notify(NotificationEvent::WebSocketDisconnected {
             connection_index: 1,
@@ -1945,6 +1948,9 @@ mod tests {
         let service = NotificationService::disabled();
         service.notify(NotificationEvent::WebSocketConnected {
             connection_index: 0,
+            subscribed_count: 5_000,
+            capacity: 5_000,
+            last_activity_secs_ago: Some(1),
         });
         service.notify(NotificationEvent::WebSocketDisconnected {
             connection_index: 0,
