@@ -7,6 +7,7 @@
 //! → `CandleAggregator` → 1s OHLCV candles
 //! → `TopMoversTracker` → ranked gainers/losers/most-active snapshots
 
+pub mod boot_ordering_gate;
 pub mod candle_aggregator;
 pub mod depth_sequence_tracker;
 pub mod first_seen_set;
