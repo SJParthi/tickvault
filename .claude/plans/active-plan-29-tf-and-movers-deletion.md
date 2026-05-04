@@ -505,9 +505,13 @@ Per operator charter (2026-05-04): defaults locked at maximum-guarantee-within-e
 |---|---|---|---|
 | Q1 | Timeframes list | full 29 (1s/3s/5s/10s/15s/30s, 1m..15m by 1m, 30m, 1h, 2h, 3h, 4h, 1d, 1w, 1mo) | maximum coverage |
 | Q2 | Forced WS rotation | **DELETED** — banned by L11 | zero deliberate disconnects |
-| Q3 | Sub-second retention | 7d hot EBS → 365d S3 Standard → 5y Glacier Deep Archive | longest fit inside `aws-budget.md` ₹5K/mo cap; SEBI 5y satisfied |
-| Q4 | Phase 4 deletion gate | **14 trading days** green-streak ratchet parity | covers ≥1 expiry day + monthly rollover; maximum guarantee per charter |
 | Q5 | Phase 1 start | auto-start when operator says "go" — no further confirmation needed | charter §1 demands automation |
+
+> **2026-05-04 update:** Q3 (sub-second retention tiering) and Q4 (Phase 4
+> deletion gate at 14 trading days) removed from this table per operator
+> direction. Both are deferred — the retention policy will be re-decided
+> alongside the Phase 4 deletion criteria when those phases land. Phase 1
+> ships independently of either.
 
 ---
 
