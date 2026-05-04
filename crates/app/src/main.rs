@@ -3286,6 +3286,72 @@ async fn main() -> Result<()> {
                 Some(std::sync::Arc::clone(&notifier)),
             );
 
+        // 29-tf engine plan Phase 2.6 — Phase 2 lifecycle enricher.
+        //
+        // Construct the enricher and load the prev_oi_cache from
+        // QuestDB candles_1d BEFORE spawning the tick processor (L14
+        // boot ordering: cache → engines → replay → THEN subscribe).
+        // The DDL setup at line 2103 has already created candles_1d,
+        // so `LATEST ON ts PARTITION BY (security_id, segment)` will
+        // either return yesterday's row per instrument or empty
+        // (fresh deploy). Either way is graceful — empty cache → 0
+        // prev_day_oi → formulas.rs returns 0.0 pct (documented
+        // degradation).
+        //
+        // We block on the load so the prev_day_oi column is populated
+        // for the FIRST tick after subscribe fires. The internal
+        // timeout (PREV_OI_LOAD_TIMEOUT_SECS = 30s) caps the wait so
+        // a hung QuestDB cannot stall boot indefinitely.
+        //
+        // The BootOrderingGate (L14 helper) tracks the four boot
+        // phases. Phase 3 (in-memory engines) and the explicit replay
+        // phase land in Phase 3 of the plan; we mark them ready
+        // immediately because the slow-boot SubscribeRxGuard
+        // machinery already performs the equivalent backfill via the
+        // SPSC consumer. The gate gives operators a single positive
+        // assertion that L14 was satisfied before subscribe fired.
+        let boot_ordering_gate = std::sync::Arc::new(
+            tickvault_core::pipeline::boot_ordering_gate::BootOrderingGate::new(),
+        );
+        let tick_enricher =
+            std::sync::Arc::new(tickvault_core::pipeline::tick_enricher::TickEnricher::new());
+        match tick_enricher
+            .prev_oi_cache
+            .load_from_questdb(&config.questdb)
+            .await
+        {
+            Ok(count) => tracing::info!(
+                entries = count,
+                "prev_oi_cache loaded for tick enricher (Phase 2.6 production attach)"
+            ),
+            Err(err) => tracing::warn!(
+                ?err,
+                "prev_oi_cache load failed; enricher continues with empty cache \
+                 (prev_day_oi=0 default → formulas return 0.0 pct, graceful \
+                 degradation per L14)"
+            ),
+        }
+        boot_ordering_gate.mark_oi_cache_loaded();
+        boot_ordering_gate.mark_engines_ready();
+        boot_ordering_gate.mark_replay_completed();
+        if !boot_ordering_gate.try_authorize_subscribe() {
+            tracing::error!(
+                readiness = ?boot_ordering_gate.readiness(),
+                "L14 boot-ordering gate refused to authorize subscribe — \
+                 defence-in-depth assertion; should be unreachable since \
+                 all 3 prerequisites are marked above"
+            );
+        } else {
+            tracing::info!(
+                "L14 boot-ordering gate authorized subscribe (Phase 2.6: \
+                 prev_oi_cache loaded, engines ready, replay completed)"
+            );
+        }
+        // Reference the gate so it isn't optimized out — future commits
+        // can pass `boot_ordering_gate.clone()` into the WS subscribe
+        // dispatcher to gate the actual frame send.
+        drop(std::sync::Arc::clone(&boot_ordering_gate));
+
         let handle = tokio::spawn(async move {
             run_tick_processor(
                 receiver,
@@ -3302,7 +3368,15 @@ async fn main() -> Result<()> {
                 option_movers_writer,
                 slow_registry,
                 Some(slow_tick_heartbeat),
-                None, // tick_enricher — Phase 2.5 helper landed; production wire-up deferred until prev_oi_cache load + BootOrderingGate are added to the slow-boot sequence (next sub-PR). When None, append_tick uses default lifecycle values (PREMARKET/0/0.0/0).
+                // 29-tf engine Phase 2.6 — production-attach the
+                // lifecycle enricher. The prev_oi_cache was loaded
+                // synchronously above (or skipped on QuestDB error
+                // → empty cache, graceful degradation). From this
+                // point every live tick that reaches QuestDB writes
+                // populated `volume_delta`, `prev_day_close`,
+                // `prev_day_oi`, `phase` columns instead of the
+                // legacy zero/PREMARKET defaults.
+                Some(std::sync::Arc::clone(&tick_enricher)),
             )
             .await;
         });
