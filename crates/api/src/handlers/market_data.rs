@@ -282,9 +282,9 @@ pub async fn get_stock_movers(State(state): State<SharedAppState>) -> impl IntoR
 /// silent empty list. Returns empty Vec on Err — the handler still
 /// serves a JSON response with `available: false` rather than 5xx.
 fn unwrap_or_log(
-    result: anyhow::Result<Vec<tickvault_core::pipeline::top_movers::MoverEntry>>,
+    result: anyhow::Result<Vec<crate::handlers::movers_questdb::MoverEntry>>,
     list_name: &'static str,
-) -> Vec<tickvault_core::pipeline::top_movers::MoverEntry> {
+) -> Vec<crate::handlers::movers_questdb::MoverEntry> {
     match result {
         Ok(v) => v,
         Err(err) => {
@@ -310,7 +310,7 @@ fn unwrap_or_log(
 /// API-stable `StockMoverEntry` shape. `rank` is 1-indexed array
 /// position; `symbol` is empty (frontend resolves).
 fn mover_entries_to_stock(
-    entries: Vec<tickvault_core::pipeline::top_movers::MoverEntry>,
+    entries: Vec<crate::handlers::movers_questdb::MoverEntry>,
 ) -> Vec<StockMoverEntry> {
     entries
         .into_iter()

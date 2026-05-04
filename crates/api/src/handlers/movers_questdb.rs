@@ -34,7 +34,35 @@ use serde_json::Value;
 use std::time::Duration;
 
 use tickvault_common::config::QuestDbConfig;
-use tickvault_core::pipeline::top_movers::MoverEntry;
+
+/// One ranked mover row from the QuestDB SQL helper.
+///
+/// Moved from `crates/core/src/pipeline/top_movers.rs` to here in
+/// PR #457 (2026-05-04) when the legacy in-memory `TopMoversTracker`
+/// + `MoversTrackerV2` and the entire `pipeline/top_movers.rs` +
+/// `pipeline/option_movers.rs` modules were deleted. The struct
+/// itself stays — it's the canonical row shape consumed by both
+/// the `/api/market/stock-movers` and `/api/market/option-movers`
+/// REST handlers from PR #448 + PR #449.
+///
+/// `Copy` because the row is small POD; consumers (`market_data.rs`)
+/// take `Vec<MoverEntry>` and pass entries by value.
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub struct MoverEntry {
+    /// Dhan security identifier.
+    pub security_id: u32,
+    /// Exchange segment code per `docs/dhan-ref/08-annexure-enums.md`.
+    pub exchange_segment_code: u8,
+    /// Last traded price.
+    pub last_traded_price: f32,
+    /// Previous close price (from PrevClose packets / Quote+Full
+    /// `close` field per Ticket #5525125).
+    pub prev_close: f32,
+    /// Percentage change from previous close.
+    pub change_pct: f32,
+    /// Cumulative volume.
+    pub volume: u32,
+}
 
 /// Audit-2026-05-03 (hostile bug-hunt H2): typed enum replaces the
 /// `&str` parameter that previously accepted any string with no
