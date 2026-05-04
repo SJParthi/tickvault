@@ -3429,6 +3429,29 @@ async fn main() -> Result<()> {
              transition at IST 00:00:00 every trading day)"
         );
 
+        // Phase 2.11 (hostile bug-hunt M2 + M4 fix): periodic
+        // prev_oi_cache refresh task. Covers two scenarios that
+        // boot-time load + midnight rollover do NOT cover:
+        //   (a) Fresh deploy with empty `candles_1d` — boot returned
+        //       Ok(count=0), cache stays empty until next midnight,
+        //       OI Change panels read 0% all day. Refresh polls every
+        //       5min until candles_1d gets populated.
+        //   (b) QuestDB matview chain still building post-boot —
+        //       Phase 2.9 hard-fail only fires on outright load
+        //       failure, not on empty result. Refresh covers the
+        //       gap if the matview catches up after boot.
+        // Self-exits once cache becomes non-empty; midnight task
+        // takes over from there.
+        let _prev_oi_refresh_handle =
+            tickvault_core::pipeline::tick_enricher::spawn_prev_oi_cache_refresh_task(
+                std::sync::Arc::clone(&tick_enricher),
+                config.questdb.clone(),
+            );
+        tracing::info!(
+            "prev_oi_cache periodic refresh task spawned (Phase 2.11 — \
+             5min poll for fresh-deploy / matview-catchup recovery)"
+        );
+
         let handle = tokio::spawn(async move {
             run_tick_processor(
                 receiver,
