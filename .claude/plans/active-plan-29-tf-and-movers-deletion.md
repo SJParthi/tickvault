@@ -176,7 +176,40 @@ for tf in config.timeframes.enabled {
 
 ---
 
-## 5. `/api/movers` — single SQL, all 7 categories
+## 5. `/api/movers` — single SQL, all 7 categories (security-hardened)
+
+### Security gate (per security agent HIGH H4 + H11)
+
+**ORDER BY column is NEVER interpolated raw from TOML.** TOML config supplies a category NAME; the name is mapped through a Rust allowlist enum to a static-string ORDER BY clause.
+
+```rust
+// crates/common/src/movers_category.rs
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MoversCategory {
+    TopVolume, PriceGainers, PriceLosers,
+    OiGainers, OiLosers, HighestOi, TopValue,
+}
+
+impl MoversCategory {
+    /// Returns a STATIC string — no interpolation, no injection surface.
+    pub const fn order_by_clause(self) -> &'static str {
+        match self {
+            Self::TopVolume    => "volume DESC",
+            Self::PriceGainers => "change_pct DESC",
+            Self::PriceLosers  => "change_pct ASC",
+            Self::OiGainers    => "oi_change_pct DESC",
+            Self::OiLosers     => "oi_change_pct ASC",
+            Self::HighestOi    => "oi DESC",
+            Self::TopValue     => "(close * volume) DESC",
+        }
+    }
+}
+```
+
+**TOML `[[movers.categories]]` schema deserializes to `MoversCategory` enum** — unknown name = boot fails. Operator CANNOT inject SQL via config.
+
+### The query itself
 
 **Security note (per security-reviewer HIGH H4):** the `ORDER BY` column is NOT raw-string interpolated from TOML. Config category names map to a `MoversCategory` enum at parse time; the enum's `order_by_clause()` returns a `&'static str` whitelist literal. TOML edits cannot inject SQL. See `crates/api/src/handlers/movers.rs::MoversCategory` (existing pattern, replicated here).
 
