@@ -1303,8 +1303,10 @@ async fn main() -> Result<()> {
 
         let processor_handle = if let Some(receiver) = pool_receiver {
             let candle_agg = Some(tickvault_core::pipeline::CandleAggregator::new());
-            let movers = Some(tickvault_core::pipeline::TopMoversTracker::new());
-            let snapshot_handle = Some(shared_movers.clone());
+            // PR #457 commit 2/N: legacy `TopMoversTracker` + `shared_movers`
+            // snapshot construction removed — `/api/movers` reads `movers_5s`
+            // mat-view directly (PR #450). `fast_registry` was only consumed
+            // by the now-removed instrument_registry param.
             let tick_broadcast_for_processor = Some(fast_tick_broadcast_sender.clone());
 
             // Parthiban directive (2026-04-21): no-tick-during-market-hours
@@ -1321,11 +1323,6 @@ async fn main() -> Result<()> {
 
             // O(1) EXEMPT: cold path — build inline Greeks computer once at startup.
             let greeks_enricher = build_inline_greeks_enricher(&config, &subscription_plan);
-
-            // O(1) EXEMPT: cold path — clone registry once for tick processor enrichment.
-            let fast_registry = subscription_plan
-                .as_ref()
-                .map(|p| std::sync::Arc::new(p.registry.clone()));
 
             // CRITICAL: Use new_disconnected() instead of None — ticks buffer in
             // ring buffer (600K) + disk spill immediately, even before QuestDB connects.
@@ -1351,13 +1348,7 @@ async fn main() -> Result<()> {
                     tick_broadcast_for_processor,
                     candle_agg,
                     None, // live_candle_writer — QuestDB reconnects in background
-                    movers,
-                    snapshot_handle,
                     greeks_enricher,
-                    None, // stock_movers_writer — created in slow boot only
-                    None, // option_movers — created in slow boot only
-                    None, // option_movers_writer — created in slow boot only
-                    fast_registry,
                     Some(fast_tick_heartbeat),
                 )
                 .await;
@@ -2638,28 +2629,16 @@ async fn main() -> Result<()> {
                     None
                 }
             };
-        let movers = Some(tickvault_core::pipeline::TopMoversTracker::new());
-        let snapshot_handle = Some(shared_movers.clone());
+        // PR #457 commit 2/N: legacy `TopMoversTracker` + snapshot_handle +
+        // `StockMoversWriter` + `OptionMoversTracker` + `OptionMoversWriter`
+        // local construction REMOVED. The unified `/api/movers` endpoint
+        // reads the `movers_5s` materialised view directly (PR #450); the
+        // `movers_pipeline` (writes the `movers_1s` base + 25 mat views)
+        // remains active and uses `slow_registry` directly below.
         let tick_broadcast_for_processor = Some(tick_broadcast_sender.clone());
 
         // O(1) EXEMPT: cold path — build inline Greeks computer once at startup.
         let greeks_enricher = build_inline_greeks_enricher(&config, &subscription_plan);
-
-        // Audit-2026-05-03: legacy `StockMoversWriter` + `OptionMoversWriter`
-        // RETIRED. Their target tables (`stock_movers` + `option_movers`)
-        // are subsumed by the canonical `movers_1s` + 25 mat views
-        // populated by `movers_pipeline`. Frontend queries should
-        // filter by `instrument_type` against the `movers_*` views
-        // instead of reading the legacy per-category tables.
-        // Passing `None` preserves the `run_tick_processor` signature
-        // for tests + future restoration; the writer code itself is
-        // queued for full deletion in PR #445 alongside API migration.
-        let stock_movers_writer: Option<tickvault_storage::movers_persistence::StockMoversWriter> =
-            None;
-        let option_movers_tracker = Some(tickvault_core::pipeline::OptionMoversTracker::new());
-        let option_movers_writer: Option<
-            tickvault_storage::movers_persistence::OptionMoversWriter,
-        > = None;
 
         // O(1) EXEMPT: cold path — clone registry once for tick processor enrichment.
         let slow_registry = subscription_plan
@@ -3277,13 +3256,7 @@ async fn main() -> Result<()> {
                 tick_broadcast_for_processor,
                 candle_agg,
                 live_candle_writer,
-                movers,
-                snapshot_handle,
                 greeks_enricher,
-                stock_movers_writer,
-                option_movers_tracker,
-                option_movers_writer,
-                slow_registry,
                 Some(slow_tick_heartbeat),
             )
             .await;
