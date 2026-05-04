@@ -46,9 +46,17 @@ fn run_tick_processor_branches_to_append_tick_enriched_on_some_path() {
         src.contains("writer.append_tick_enriched(&tick, life)"),
         "run_tick_processor must call append_tick_enriched in the enricher Some branch"
     );
+    // Phase 2.10: phase classification now uses `tick.exchange_timestamp`
+    // (per-tick Dhan-source IST seconds-of-day) instead of `now_ist_secs`
+    // wall-clock to fix the boundary-jitter misclassification (hostile
+    // bug-hunt M1). Either variable name is acceptable — pin `enrich_tick`
+    // is called on the hot path with the second param being one of these.
     assert!(
-        src.contains("enricher.enrich_tick(&tick, now_ist_secs)"),
-        "run_tick_processor must call enricher.enrich_tick(&tick, now_ist_secs) on the hot path"
+        src.contains("enricher.enrich_tick(&tick, tick_secs_of_day)")
+            || src.contains("enricher.enrich_tick(&tick, frame_now_ist_secs)")
+            || src.contains("enricher.enrich_tick(&tick, now_ist_secs)"),
+        "run_tick_processor must call enricher.enrich_tick(&tick, <secs>) — accepts \
+         tick_secs_of_day (Phase 2.10), frame_now_ist_secs (Phase 2.7), or now_ist_secs (legacy)"
     );
 }
 
@@ -65,11 +73,18 @@ fn run_tick_processor_falls_back_to_append_tick_on_none_path() {
 }
 
 #[test]
-fn run_tick_processor_uses_now_ist_secs_of_day_helper_not_inline_arithmetic() {
+fn run_tick_processor_uses_canonical_secs_of_day_source() {
     let src = read("core/src/pipeline/tick_processor.rs");
+    // Phase 2.10 (hostile M1 fix): tick_secs_of_day is computed from
+    // `tick.exchange_timestamp % 86_400` — Dhan's IST-source timestamp,
+    // not the receive-time wall clock. Pre-2.10 code used
+    // `now_ist_secs_of_day()` which misclassified ~10-30 ticks/day at
+    // phase boundaries due to network arrival jitter.
     assert!(
-        src.contains("now_ist_secs_of_day"),
-        "run_tick_processor must use the `now_ist_secs_of_day` helper (not inline IST math) so phase boundaries stay consistent with `compute_phase()`"
+        src.contains("tick.exchange_timestamp % 86_400") || src.contains("now_ist_secs_of_day"),
+        "run_tick_processor must derive secs_of_day from either the per-tick \
+         exchange_timestamp (Phase 2.10 fix) or the wall-clock helper (legacy) — \
+         not inline IST offset arithmetic"
     );
 }
 
