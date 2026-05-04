@@ -242,13 +242,13 @@ pub enum NotificationEvent {
     },
 
     /// Audit Finding #5 (2026-05-03): pre-market positive-readiness ping.
-    /// Fires once per trading day at 09:14:00 IST — exactly 1 minute
-    /// before the NSE opening bell. Reports current subscription counts
-    /// + token expiry headroom so the operator has a positive "we are
+    /// Fires once per trading day at 09:14:00 IST (exactly 1 minute
+    /// before the NSE opening bell). Reports current subscription counts
+    /// and token expiry headroom so the operator has a positive "we are
     /// READY for the open" signal, not just the existing 09:15:30
     /// post-open confirmation. Closes the false-OK gap from
     /// audit-findings-2026-04-17.md Rule 11. Severity = Info so it never
-    /// pages — it is purely a positive signal. Edge-trigger: fires
+    /// pages (it is purely a positive signal). Edge-trigger: fires
     /// exactly once per trading day, never on mid-session boot past
     /// 09:14:00 IST.
     MarketOpenReadinessConfirmation {

@@ -38,12 +38,12 @@ use tickvault_common::config::QuestDbConfig;
 /// One ranked mover row from the QuestDB SQL helper.
 ///
 /// Moved from `crates/core/src/pipeline/top_movers.rs` to here in
-/// PR #457 (2026-05-04) when the legacy in-memory `TopMoversTracker`
-/// + `MoversTrackerV2` and the entire `pipeline/top_movers.rs` +
+/// PR #457 (2026-05-04) when the legacy in-memory `TopMoversTracker`,
+/// `MoversTrackerV2`, and the entire `pipeline/top_movers.rs` and
 /// `pipeline/option_movers.rs` modules were deleted. The struct
 /// itself stays — it's the canonical row shape consumed by both
 /// the `/api/market/stock-movers` and `/api/market/option-movers`
-/// REST handlers from PR #448 + PR #449.
+/// REST handlers from PR #448 and PR #449.
 ///
 /// `Copy` because the row is small POD; consumers (`market_data.rs`)
 /// take `Vec<MoverEntry>` and pass entries by value.
