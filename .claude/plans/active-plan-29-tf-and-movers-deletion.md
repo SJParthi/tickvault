@@ -558,10 +558,10 @@ Per operator charter (2026-05-04): defaults locked at maximum-guarantee-within-e
 - [x] Phase 3 commit 5 PR (PR #488 — MERGED) — parity framework (`compare_bars` + `sweep_parity` + `ParityReport`) + 28 read accessors on `CascadeFanout` + framework-validation harness (8 always-on tests) + `make parity-soak`. Adversarial 2 HIGH + 2 MEDIUM fixed inline. NaN canonicalization, ±0.0 canonicalization, I-P1-11 layout pin, `is_clean_with_coverage` false-OK guard.
 - [ ] Phase 3 verified — 14 trading days green-streak ratchet parity (gate per §6 row 3)
 
-### Phase 4 — read-flip + table deletion (NOT STARTED — gated on Phase 3 verification)
+### Phase 4 — read-flip + table deletion (4a CODE-DORMANT; awaiting soaks)
 
-- [ ] Phase 4a PR — strategy reads `MoversEngine` (RAM); `/api/movers?v=2` exposed alongside v1
-- [ ] Phase 4a verified — 24h dual-path soak with v1↔v2 parity ratchet
+- [x] Phase 4a PR (PR #490 — MERGED) — DORMANT `/api/movers/v2` scaffold reading from `CascadeFanout`. Three independent dormancy gates (config flag default false → `cascade_fanout: None` → route-not-registered → 503-on-bug). Adversarial 2 HIGH + 2 MEDIUM fixed inline. 13 handler unit tests + safety ratchet pinning the flag default. **Behaviour change: ZERO on a default boot.**
+- [ ] Phase 4a verified — operator clears Phase 3 (14-day soak) → flips `config.api.movers_v2_enabled = true` → 24h dual-path v1↔v2 parity soak per §6 row 4
 - [ ] Phase 4b PR — DELETE old movers writers + `DROP TABLE stock_movers, option_movers` + retire 7 ErrorCodes
 - [ ] Phase 4b verified — 30 trading days post-deploy clean (gate per §6 row 4)
 
@@ -569,12 +569,12 @@ Per operator charter (2026-05-04): defaults locked at maximum-guarantee-within-e
 
 - [ ] Plan archived to `.claude/plans/archive/2026-MM-DD-29-tf-movers-deletion.md`
 
-### Counts (refreshed 2026-05-05 post-#488)
+### Counts (refreshed 2026-05-05 post-#490)
 
-- **PRs merged:** 22 (20 production + 2 plan housekeeping). Phase 3 contribution: #482 + #484 + #485 + #486 + #488.
+- **PRs merged:** 24 (21 production + 3 plan housekeeping). Phase 3 contribution: #482 + #484 + #485 + #486 + #488. Phase 4 contribution: #490 (dormant scaffold).
 - **PRs in flight:** 0
-- **Adversarial findings closed inline:** 8 CRITICAL + 15 HIGH + 10 MEDIUM + L4 e2e gap (Phase 3.5 added 2H + 2M)
-- **Ratchet tests added across the plan:** ≥195 (Phase 3.5 added 18 unit + 8 framework + 3 cascade_fanout = 29)
+- **Adversarial findings closed inline:** 8 CRITICAL + 17 HIGH + 12 MEDIUM + L4 e2e gap (Phase 4a added 2H + 2M)
+- **Ratchet tests added across the plan:** ≥210 (Phase 4a added 13 handler + 1 safety + 1 cross-check = 15)
 
 ### Gates remaining (real-world soak — physically required by §6)
 
