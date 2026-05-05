@@ -1923,6 +1923,121 @@
           "fields": ""
         }
       }
+    },
+    {
+      "type": "timeseries",
+      "id": 49,
+      "title": "28-TF Cascade — Bars sealed/sec (rate)",
+      "description": "Phase 3 9-box closure (PR §6 Phase 3). Per-second rate of 1s bars sealed (tv_candle_cascade_bars_sealed_total) and downstream derived seals across all 28 derived TFs (tv_candle_cascade_fanout_derived_seals_total). Steady-state expectation: bars_sealed ≈ active_instruments / 60 (since each instrument seals ~once/sec); derived_seals ≈ bars_sealed × (28 / 60) on average because finer TFs (3s, 5s) seal more often than coarser TFs (1mo).",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 66
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "rate(tv_candle_cascade_bars_sealed_total[1m])",
+          "legendFormat": "1s bars sealed/sec",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "rate(tv_candle_cascade_fanout_derived_seals_total[1m])",
+          "legendFormat": "derived TF seals/sec (28-engine fanout)",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "ops"
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "id": 50,
+      "title": "28-TF Cascade — Lag + respawn (24h)",
+      "description": "Phase 3 9-box closure. tv_candle_cascade_lag_total = bars dropped because the 1s seal queue backed up (capacity miss). tv_candle_cascade_respawn_total = supervisor respawns of the cascade task (panic / unexpected exit). Both should be 0 in steady state. ANY non-zero value in the last 24h is a regression worth investigating; the tv-candle-cascade-lag and tv-candle-cascade-respawn alerts page the operator immediately.",
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 66
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "increase(tv_candle_cascade_lag_total[24h])",
+          "legendFormat": "lag (24h)",
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prometheus"
+          },
+          "expr": "increase(tv_candle_cascade_respawn_total[24h])",
+          "legendFormat": "respawn (24h)",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "unit": "none",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green"
+              },
+              {
+                "color": "orange",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 5
+              }
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "background_solid",
+        "graphMode": "none",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        }
+      }
     }
   ]
 }

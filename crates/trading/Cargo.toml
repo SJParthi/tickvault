@@ -43,5 +43,9 @@ harness = false
 name = "obi"
 harness = false
 
+[[bench]]
+name = "cascade_fanout"
+harness = false
+
 [package.metadata.cargo-machete]
 ignored = ["anyhow", "chrono", "chrono-tz", "tickvault-common", "governor", "jaeckel", "loom", "metrics", "secrecy", "serde", "thiserror", "tokio", "tracing", "uuid"]

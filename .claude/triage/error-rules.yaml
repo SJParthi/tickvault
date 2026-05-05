@@ -1309,3 +1309,40 @@ rules:
       market open to act. Severity::Critical; never auto-action —
       operator follows the per-check runbook section in
       wave-5-error-codes.md.
+
+  # -----------------------------------------------------------------------
+  # Phase 3 9-box closure (PR §6 Phase 3) — cascade lag + respawn
+  # -----------------------------------------------------------------------
+
+  - name: cascade-lag-rising-escalate
+    match:
+      message_substring: "candle cascade lag"
+    action: escalate
+    runbook_path: .claude/rules/project/wave-5-error-codes.md
+    confidence: 0.9
+    cooldown_secs: 60
+    justification: >-
+      tv_candle_cascade_lag_total rising means the 28-TF fanout's 1s
+      seal pipeline is at capacity and dropping sealed bars. Indicates
+      either (a) downstream parity / matview write stalled, blocking
+      the fanout from draining, or (b) misconfiguration of the cascade
+      bucketing where finer TFs back up. Severity::High; never
+      auto-action — operator inspects cascade.rs:53 metric counters
+      vs the bench budget cascade_fanout_feed_sealed_1s_bar (5µs in
+      quality/benchmark-budgets.toml).
+
+  - name: cascade-respawn-detected-escalate
+    match:
+      message_substring: "cascade supervisor respawn"
+    action: escalate
+    runbook_path: .claude/rules/project/wave-5-error-codes.md
+    confidence: 1.0
+    cooldown_secs: 0
+    justification: >-
+      tv_candle_cascade_respawn_total increment means the cascade task
+      panicked or returned unexpectedly and the supervisor (cascade.rs:182+)
+      respawned it. Per WS-GAP-05 supervisor pattern this is recoverable
+      in isolation, but a panic LOOP indicates a deterministic crash
+      bug that no respawn can heal. Severity::High; operator inspects
+      data/logs/errors.jsonl.* for the panic backtrace immediately
+      preceding the respawn.

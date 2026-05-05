@@ -40,6 +40,9 @@ parse_questdb_dataset_json_150_rows = 1000000 # <1ms — JSON parsing for 150-ro
 # Trading crate — OMS
 oms_state_transition     = 100          # <100ns — matches oms/state_transition
 
+# Trading crate — 28-TF CascadeFanout (Phase 3 9-box closure)
+cascade_fanout_feed_sealed_1s_bar = 5000  # <5µs per call. 28 × papaya pin/get + uncontended mutex ≈ 1.7µs measured; 3× headroom for noisy CI runners. At ~24K seals/sec peak this caps fanout work at ~12% of one core.
+
 # Trading crate — OBI (Order Book Imbalance)
 obi_compute              = 1000         # <1μs = 1000ns — matches obi_compute_20_levels, obi_compute_with_wall (measured: ~297ns)
 
