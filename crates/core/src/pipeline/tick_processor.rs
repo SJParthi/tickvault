@@ -95,9 +95,10 @@ pub fn init_prev_close_cache_dir() -> std::io::Result<()> {
 /// instrument master at boot.
 const CANARY_UNDERLYINGS: &[(u32, &str)] = &[(13, "NIFTY"), (25, "BANKNIFTY"), (51, "SENSEX")];
 
-/// Movers persist window start: 09:15:00 IST = 33300 seconds of day.
-/// Movers snapshots only persisted during market hours [09:15, 15:30).
-const MOVERS_PERSIST_START_SECS_OF_DAY_IST: u32 = 33_300;
+// Phase 4b (2026-05-05): `MOVERS_PERSIST_START_SECS_OF_DAY_IST`
+// constant DELETED — only used by the now-removed legacy
+// stock_movers / option_movers persist call block. Unified
+// movers_pipeline manages its own cadence in app crate.
 
 // ---------------------------------------------------------------------------
 // O(1) Market Hours Persist Window
@@ -315,376 +316,6 @@ fn utc_nanos_to_ist_epoch_secs(received_at_nanos: i64) -> u32 {
         .saturating_add(i64::from(IST_UTC_OFFSET_SECONDS)) as u32
 }
 
-/// Persists a stock movers snapshot to QuestDB (cold path, best-effort).
-///
-/// Writes top 20 gainers, losers, and most active as separate rows.
-/// Each row tagged with category + rank for easy Grafana queries.
-/// Symbol names enriched from InstrumentRegistry O(1) lookups.
-fn persist_stock_movers_snapshot(
-    writer: &mut tickvault_storage::movers_persistence::StockMoversWriter,
-    snapshot: &super::top_movers::TopMoversSnapshot,
-    ts_nanos: i64,
-    registry: &Option<std::sync::Arc<tickvault_common::instrument_registry::InstrumentRegistry>>,
-) {
-    if snapshot.equity_gainers.is_empty()
-        && snapshot.equity_losers.is_empty()
-        && snapshot.index_gainers.is_empty()
-    {
-        debug!(
-            total_tracked = snapshot.total_tracked,
-            "empty movers snapshot — no gainers/losers/most_active to persist"
-        );
-        return;
-    }
-
-    // O(1) EXEMPT: cold path — registry lookup per entry (max 60 lookups per snapshot).
-    // I-P1-11: segment-aware lookup — Dhan reuses security_id across segments
-    // (e.g. NIFTY IDX_I id=13 vs some NSE_EQ id=13). Using the legacy get(id)
-    // would return the wrong-segment entry and write a wrong symbol to the
-    // movers table. Segment byte comes from the MoverEntry header byte 3.
-    let lookup_symbol = |security_id: u32, segment_code: u8| -> &str {
-        let segment = match tickvault_common::types::ExchangeSegment::from_byte(segment_code) {
-            Some(s) => s,
-            None => return "",
-        };
-        registry
-            .as_ref()
-            .and_then(|r| r.get_with_segment(security_id, segment))
-            .map(|inst| inst.display_label.as_str())
-            .unwrap_or("")
-    };
-
-    let f32_clean = tickvault_storage::tick_persistence_testing::f32_to_f64_clean_pub;
-
-    let persist_entries =
-        |writer: &mut tickvault_storage::movers_persistence::StockMoversWriter,
-         entries: &[super::top_movers::MoverEntry],
-         category: &str| {
-            for (i, entry) in entries.iter().enumerate() {
-                let symbol = lookup_symbol(entry.security_id, entry.exchange_segment_code);
-                let prev_close = f32_clean(entry.prev_close);
-                let ltp = f32_clean(entry.last_traded_price);
-                let change_pct = f32_clean(entry.change_pct);
-                drop(writer.append_stock_mover(
-                    ts_nanos,
-                    category,
-                    (i as i32).saturating_add(1),
-                    entry.security_id,
-                    tickvault_common::segment::segment_code_to_str(entry.exchange_segment_code),
-                    symbol,
-                    ltp,
-                    prev_close,
-                    change_pct,
-                    i64::from(entry.volume),
-                ));
-            }
-        };
-
-    persist_entries(writer, &snapshot.equity_gainers, "EQUITY_GAINER");
-    persist_entries(writer, &snapshot.equity_losers, "EQUITY_LOSER");
-    persist_entries(writer, &snapshot.equity_most_active, "EQUITY_MOST_ACTIVE");
-    persist_entries(writer, &snapshot.index_gainers, "INDEX_GAINER");
-    persist_entries(writer, &snapshot.index_losers, "INDEX_LOSER");
-    persist_entries(writer, &snapshot.index_most_active, "INDEX_MOST_ACTIVE");
-
-    // Best-effort flush
-    drop(writer.flush());
-}
-
-/// Wave 1 Item 2 — persists EVERY tracked equity and index entry as a
-/// single `EQUITY_ALL` / `INDEX_ALL` category. Operators can then
-/// query `select count(*) from stock_movers where ts > now()-1h` and
-/// see the full universe rolling forward (~239 × 720 ≈ 172 K rows/h)
-/// instead of just the top-N gainers/losers.
-///
-/// Cold path — runs alongside the existing `persist_stock_movers_snapshot`
-/// every 5 s during market hours. Composite key
-/// `(security_id, exchange_segment, ts)` is honored by the QuestDB
-/// DEDUP UPSERT KEY so reconnect / restart bursts within the same
-/// 5-second tick collapse to one row.
-fn persist_stock_movers_full_snapshot(
-    writer: &mut tickvault_storage::movers_persistence::StockMoversWriter,
-    equity_all: &[super::top_movers::MoverEntry],
-    index_all: &[super::top_movers::MoverEntry],
-    ts_nanos: i64,
-    registry: &Option<std::sync::Arc<tickvault_common::instrument_registry::InstrumentRegistry>>,
-) {
-    if equity_all.is_empty() && index_all.is_empty() {
-        return;
-    }
-
-    // Same registry-lookup pattern as `persist_stock_movers_snapshot`:
-    // I-P1-11 segment-aware lookup so cross-segment id collisions
-    // don't write the wrong symbol.
-    // O(1) EXEMPT: cold path — registry lookup per entry; bounded by
-    // the universe size (~270 entries per snapshot).
-    let lookup_symbol = |security_id: u32, segment_code: u8| -> &str {
-        let segment = match tickvault_common::types::ExchangeSegment::from_byte(segment_code) {
-            Some(s) => s,
-            None => return "",
-        };
-        registry
-            .as_ref()
-            .and_then(|r| r.get_with_segment(security_id, segment))
-            .map(|inst| inst.display_label.as_str())
-            .unwrap_or("")
-    };
-
-    let f32_clean = tickvault_storage::tick_persistence_testing::f32_to_f64_clean_pub;
-
-    let persist_all = |writer: &mut tickvault_storage::movers_persistence::StockMoversWriter,
-                       entries: &[super::top_movers::MoverEntry],
-                       category: &str| {
-        for (i, entry) in entries.iter().enumerate() {
-            let symbol = lookup_symbol(entry.security_id, entry.exchange_segment_code);
-            let prev_close = f32_clean(entry.prev_close);
-            let ltp = f32_clean(entry.last_traded_price);
-            let change_pct = f32_clean(entry.change_pct);
-            drop(writer.append_stock_mover(
-                ts_nanos,
-                category,
-                (i as i32).saturating_add(1),
-                entry.security_id,
-                tickvault_common::segment::segment_code_to_str(entry.exchange_segment_code),
-                symbol,
-                ltp,
-                prev_close,
-                change_pct,
-                i64::from(entry.volume),
-            ));
-        }
-    };
-
-    persist_all(writer, equity_all, "EQUITY_ALL");
-    persist_all(writer, index_all, "INDEX_ALL");
-
-    // Best-effort flush.
-    drop(writer.flush());
-}
-
-/// Persists an option movers snapshot to QuestDB (cold path, best-effort).
-///
-/// Writes top 20 entries per category (7 categories × 20 = 140 rows max).
-/// Contract metadata enriched from InstrumentRegistry O(1) lookups.
-fn persist_option_movers_snapshot(
-    writer: &mut tickvault_storage::movers_persistence::OptionMoversWriter,
-    snapshot: &super::option_movers::OptionMoversSnapshot,
-    ts_nanos: i64,
-    registry: &Option<std::sync::Arc<tickvault_common::instrument_registry::InstrumentRegistry>>,
-) {
-    let f32_clean = tickvault_storage::tick_persistence_testing::f32_to_f64_clean_pub;
-
-    // O(1) EXEMPT: cold path — registry lookup per entry (max 140 lookups per snapshot).
-    let persist_category =
-        |writer: &mut tickvault_storage::movers_persistence::OptionMoversWriter,
-         entries: &[super::option_movers::OptionMoverEntry],
-         category: &str| {
-            for (i, entry) in entries.iter().enumerate() {
-                // Enrich from registry — O(1) lookup on cold path, flattened with and_then
-                // I-P1-11: segment-aware lookup (see lookup_symbol for rationale).
-                let seg_for_lookup = tickvault_common::types::ExchangeSegment::from_byte(
-                    entry.exchange_segment_code,
-                );
-                let enriched = seg_for_lookup
-                    .and_then(|seg| {
-                        registry
-                            .as_ref()
-                            .and_then(|reg| reg.get_with_segment(entry.security_id, seg))
-                    })
-                    .map(|inst| {
-                        let ot = inst
-                            .option_type
-                            .map(|ot| match ot {
-                                tickvault_common::types::OptionType::Call => "CE",
-                                tickvault_common::types::OptionType::Put => "PE",
-                            })
-                            .unwrap_or("");
-                        (
-                            inst.display_label.as_str(),
-                            inst.underlying_symbol.as_str(),
-                            ot,
-                            inst.strike_price.unwrap_or(0.0),
-                            inst.expiry_date
-                                // O(1) EXEMPT: cold path (stock-movers snapshot, max 180 rows / minute).
-                                .map(|d| d.format("%Y-%m-%d").to_string())
-                                .unwrap_or_default(),
-                        )
-                    });
-                let (contract_name, underlying, option_type_str, strike, expiry_str) =
-                    match enriched {
-                        Some((cn, ul, ot, st, ex)) => (cn, ul, ot, st, ex),
-                        // O(1) EXEMPT: cold path — `String::new()` is empty-string sentinel.
-                        None => ("", "", "", 0.0, String::new()),
-                    };
-
-                // Spot price: look up underlying's LTP from registry
-                // (Not available from registry — registry is static metadata.
-                //  Spot price requires live tick data. Use 0.0 for now;
-                //  the dashboard API enriches from QuestDB at query time.)
-                // Spot price not available from static registry — enriched at query time.
-                const SPOT_PRICE_NOT_AVAILABLE: f64 = 0.0;
-                let spot_price = SPOT_PRICE_NOT_AVAILABLE;
-
-                drop(writer.append_option_mover(
-                    ts_nanos,
-                    category,
-                    (i as i32).saturating_add(1),
-                    entry.security_id,
-                    tickvault_common::segment::segment_code_to_str(entry.exchange_segment_code),
-                    contract_name,
-                    underlying,
-                    option_type_str,
-                    strike,
-                    &expiry_str,
-                    spot_price,
-                    f32_clean(entry.ltp),
-                    f32_clean(entry.change),
-                    f32_clean(entry.change_pct),
-                    i64::from(entry.oi),
-                    entry.oi_change,
-                    f32_clean(entry.oi_change_pct),
-                    i64::from(entry.volume),
-                    entry.value,
-                ));
-            }
-        };
-
-    // Split each category into OPTION_* and FUTURE_* with independent rankings.
-    // Registry lookup: option_type Some(CE/PE) = option, None = future.
-    // O(1) EXEMPT: cold path — runs every 60s, max 7 categories × 20 entries each.
-    let split_persist = |writer: &mut tickvault_storage::movers_persistence::OptionMoversWriter,
-                         entries: &[super::option_movers::OptionMoverEntry],
-                         base_cat: &str| {
-        let (opts, futs): (Vec<_>, Vec<_>) = entries.iter().cloned().partition(|e| {
-            // I-P1-11: segment-aware lookup so CE/PE classification works
-            // even when id collides with an index/equity in a different segment.
-            let seg = tickvault_common::types::ExchangeSegment::from_byte(e.exchange_segment_code);
-            seg.and_then(|s| {
-                registry
-                    .as_ref()
-                    .and_then(|r| r.get_with_segment(e.security_id, s))
-            })
-            .and_then(|inst| inst.option_type)
-            .is_some()
-        });
-        // O(1) EXEMPT: format! on cold path (7 calls per snapshot)
-        let opt_cat = format!("OPTION_{base_cat}");
-        let fut_cat = format!("FUTURE_{base_cat}");
-        persist_category(writer, &opts, &opt_cat);
-        persist_category(writer, &futs, &fut_cat);
-    };
-
-    split_persist(writer, &snapshot.highest_oi, "HIGHEST_OI");
-    split_persist(writer, &snapshot.oi_gainers, "OI_GAINER");
-    split_persist(writer, &snapshot.oi_losers, "OI_LOSER");
-    split_persist(writer, &snapshot.top_volume, "TOP_VOLUME");
-    split_persist(writer, &snapshot.top_value, "TOP_VALUE");
-    split_persist(writer, &snapshot.price_gainers, "PRICE_GAINER");
-    split_persist(writer, &snapshot.price_losers, "PRICE_LOSER");
-
-    drop(writer.flush());
-}
-
-/// Wave 1 Item 3 — persists EVERY tracked option contract entry as a
-/// single `OPTION_ALL` / `FUTURE_ALL` category. Operators can then
-/// answer "what was BANKNIFTY-Jun26-50000-CE doing at 11:23 IST?"
-/// without depending on whether the contract was in the top-N at that
-/// snapshot.
-///
-/// Cold path — runs alongside the existing `persist_option_movers_snapshot`
-/// every 5 s during market hours starting at 09:15:00 IST.
-fn persist_option_movers_full_snapshot(
-    writer: &mut tickvault_storage::movers_persistence::OptionMoversWriter,
-    entries: &[super::option_movers::OptionMoverEntry],
-    ts_nanos: i64,
-    registry: &Option<std::sync::Arc<tickvault_common::instrument_registry::InstrumentRegistry>>,
-) {
-    if entries.is_empty() {
-        return;
-    }
-    let f32_clean = tickvault_storage::tick_persistence_testing::f32_to_f64_clean_pub;
-
-    // Same registry-enrichment + OPTION/FUTURE split pattern as
-    // `persist_option_movers_snapshot`, applied to the full entry list.
-    // O(1) EXEMPT: cold path — bounded by ~22 K entries per snapshot.
-    let (opts, futs): (Vec<_>, Vec<_>) = entries.iter().cloned().partition(|e| {
-        let seg = tickvault_common::types::ExchangeSegment::from_byte(e.exchange_segment_code);
-        seg.and_then(|s| {
-            registry
-                .as_ref()
-                .and_then(|r| r.get_with_segment(e.security_id, s))
-        })
-        .and_then(|inst| inst.option_type)
-        .is_some()
-    });
-
-    let persist_full = |writer: &mut tickvault_storage::movers_persistence::OptionMoversWriter,
-                        items: &[super::option_movers::OptionMoverEntry],
-                        category: &str| {
-        for (i, entry) in items.iter().enumerate() {
-            let seg_for_lookup =
-                tickvault_common::types::ExchangeSegment::from_byte(entry.exchange_segment_code);
-            let enriched = seg_for_lookup
-                .and_then(|seg| {
-                    registry
-                        .as_ref()
-                        .and_then(|reg| reg.get_with_segment(entry.security_id, seg))
-                })
-                .map(|inst| {
-                    let ot = inst
-                        .option_type
-                        .map(|ot| match ot {
-                            tickvault_common::types::OptionType::Call => "CE",
-                            tickvault_common::types::OptionType::Put => "PE",
-                        })
-                        .unwrap_or("");
-                    (
-                        inst.display_label.as_str(),
-                        inst.underlying_symbol.as_str(),
-                        ot,
-                        inst.strike_price.unwrap_or(0.0),
-                        inst.expiry_date
-                            // O(1) EXEMPT: cold path (option-movers snapshot, max 140 rows / minute).
-                            .map(|d| d.format("%Y-%m-%d").to_string())
-                            .unwrap_or_default(),
-                    )
-                });
-            let (contract_name, underlying, option_type_str, strike, expiry_str) = match enriched {
-                Some((cn, ul, ot, st, ex)) => (cn, ul, ot, st, ex),
-                // O(1) EXEMPT: cold path — `String::new()` is empty-string sentinel.
-                None => ("", "", "", 0.0, String::new()),
-            };
-            const SPOT_PRICE_NOT_AVAILABLE: f64 = 0.0;
-            drop(writer.append_option_mover(
-                ts_nanos,
-                category,
-                (i as i32).saturating_add(1),
-                entry.security_id,
-                tickvault_common::segment::segment_code_to_str(entry.exchange_segment_code),
-                contract_name,
-                underlying,
-                option_type_str,
-                strike,
-                &expiry_str,
-                SPOT_PRICE_NOT_AVAILABLE,
-                f32_clean(entry.ltp),
-                f32_clean(entry.change),
-                f32_clean(entry.change_pct),
-                i64::from(entry.oi),
-                entry.oi_change,
-                f32_clean(entry.oi_change_pct),
-                i64::from(entry.volume),
-                entry.value,
-            ));
-        }
-    };
-
-    persist_full(writer, &opts, "OPTION_ALL");
-    persist_full(writer, &futs, "FUTURE_ALL");
-
-    drop(writer.flush());
-}
-
 // ---------------------------------------------------------------------------
 // O(1) Tick Deduplication Ring Buffer
 // ---------------------------------------------------------------------------
@@ -792,10 +423,22 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
     mut top_movers: Option<super::top_movers::TopMoversTracker>,
     shared_snapshot: Option<crate::pipeline::top_movers::SharedTopMoversSnapshot>,
     mut greeks_enricher: Option<G>,
-    mut stock_movers_writer: Option<tickvault_storage::movers_persistence::StockMoversWriter>,
+    // Phase 4b (2026-05-05): `stock_movers_writer` + `option_movers_writer`
+    // params DELETED. Both legacy writers were retired in the
+    // 2026-05-03 audit and the underlying `movers_persistence` module
+    // was removed. Movers persistence is now exclusively
+    // `MoversWriter` (movers_1s base table) populated by
+    // `movers_pipeline` outside the tick processor hot loop.
     mut option_movers: Option<super::option_movers::OptionMoversTracker>,
-    mut option_movers_writer: Option<tickvault_storage::movers_persistence::OptionMoversWriter>,
-    instrument_registry: Option<
+    // Phase 4b (2026-05-05): `instrument_registry` was previously
+    // consumed by the deleted persist_*_movers_snapshot helpers for
+    // O(1) symbol lookup at write time. With those helpers gone and
+    // the writer types deleted, the registry is unused inside the
+    // tick processor. Kept in the signature with a leading `_` so
+    // the existing call sites (which still pass `None`) compile
+    // unchanged. The unified `movers_pipeline` task owns its own
+    // registry handle.
+    _instrument_registry: Option<
         std::sync::Arc<tickvault_common::instrument_registry::InstrumentRegistry>,
     >,
     // Shared heartbeat for the no-tick watchdog (Parthiban directive
@@ -863,9 +506,11 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
     let mut stale_day_filtered: u64 = 0;
     let mut last_flush_check = Instant::now();
     let mut last_snapshot_check = Instant::now();
-    let mut last_movers_persist = Instant::now();
-    let mut movers_persist_count: u64 = 0;
-    let m_movers_persisted = counter!("tv_movers_snapshots_persisted_total");
+    // Phase 4b (2026-05-05): `last_movers_persist` + `movers_persist_count`
+    // + `m_movers_persisted` DELETED — they were the timing/count state
+    // for the legacy `stock_movers` / `option_movers` writers retired
+    // alongside `movers_persistence`. Movers persistence cadence is
+    // now owned by the unified `movers_pipeline` task.
     let m_ticks_persisted = counter!("tv_ticks_persisted_total");
 
     // Index prev_close file cache — survives mid-day restarts.
@@ -1941,77 +1586,6 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                 last_snapshot_check = Instant::now();
             }
 
-            // Persist stock movers snapshot every 60 seconds during market hours
-            // [09:15, 15:30) IST. Uses wall-clock time (not exchange timestamp)
-            // since movers are a computed aggregate, not a raw tick.
-            if last_movers_persist.elapsed().as_secs() >= 60 {
-                let persist_ist_secs = utc_nanos_to_ist_secs_of_day(received_at_nanos);
-                let in_movers_window = (MOVERS_PERSIST_START_SECS_OF_DAY_IST
-                    ..TICK_PERSIST_END_SECS_OF_DAY_IST)
-                    .contains(&persist_ist_secs)
-                    && is_today_ist(
-                        utc_nanos_to_ist_epoch_secs(received_at_nanos),
-                        today_ist_day_number,
-                    );
-                if in_movers_window
-                    && let Some(ref mut movers) = top_movers
-                    && let Some(ref mut writer) = stock_movers_writer
-                {
-                    let snapshot = movers.compute_snapshot();
-                    let ts_nanos = received_at_nanos
-                        .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS);
-                    persist_stock_movers_snapshot(
-                        writer,
-                        &snapshot,
-                        ts_nanos,
-                        &instrument_registry,
-                    );
-                    // Wave 1 Item 2 — also persist EVERY tracked entry
-                    // as EQUITY_ALL / INDEX_ALL so the operator query
-                    // `select count(*) from stock_movers where ts > now()-1h`
-                    // returns the full universe (~239 stocks + ~30
-                    // indices) rather than just the top-N.
-                    let (equity_all, index_all) = movers.compute_full_entries();
-                    persist_stock_movers_full_snapshot(
-                        writer,
-                        &equity_all,
-                        &index_all,
-                        ts_nanos,
-                        &instrument_registry,
-                    );
-                    movers_persist_count = movers_persist_count.saturating_add(1);
-                    m_movers_persisted.increment(1);
-                }
-                // Also persist option movers in the same 1-minute window
-                if in_movers_window
-                    && let Some(ref mut opt_movers) = option_movers
-                    && let Some(ref mut opt_writer) = option_movers_writer
-                {
-                    let opt_snapshot = opt_movers.compute_snapshot();
-                    let ts_nanos = received_at_nanos
-                        .saturating_add(tickvault_common::constants::IST_UTC_OFFSET_NANOS);
-                    persist_option_movers_snapshot(
-                        opt_writer,
-                        &opt_snapshot,
-                        ts_nanos,
-                        &instrument_registry,
-                    );
-                    // Wave 1 Item 3 — also persist EVERY tracked option
-                    // contract as OPTION_ALL / FUTURE_ALL so the operator
-                    // can query the full ~22 K NSE_FNO universe per
-                    // snapshot rather than just the top-N per category.
-                    let full_entries = opt_movers.compute_full_entries();
-                    persist_option_movers_full_snapshot(
-                        opt_writer,
-                        &full_entries,
-                        ts_nanos,
-                        &instrument_registry,
-                    );
-                }
-
-                last_movers_persist = Instant::now();
-            }
-
             // M6: Channel backpressure — sample occupancy every flush cycle (~100ms).
             // O(1): mpsc::Receiver::len() is an atomic load.
             m_channel_occupancy.set(frame_receiver.len() as f64);
@@ -2067,19 +1641,11 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
         );
     }
 
-    // Flush movers writers to ensure no pending rows are lost.
-    if let Some(ref mut writer) = stock_movers_writer
-        && let Err(err) = writer.flush()
-    {
-        // Phase 0 / Rule 5: flush failures are ERROR (route to Telegram).
-        error!(?err, "stock movers flush on shutdown failed");
-    }
-    if let Some(ref mut writer) = option_movers_writer
-        && let Err(err) = writer.flush()
-    {
-        // Phase 0 / Rule 5: flush failures are ERROR (route to Telegram).
-        error!(?err, "option movers flush on shutdown failed");
-    }
+    // Phase 4b (2026-05-05): legacy `stock_movers` / `option_movers`
+    // writers DELETED. Their flush-on-shutdown branches removed.
+    // Movers persistence is now exclusively the responsibility of
+    // `MoversWriter` (movers_1s base table) populated by the unified
+    // `movers_pipeline` task spawned from main.rs.
 
     // Log final top movers state
     if let Some(ref movers) = top_movers {
@@ -2200,6 +1766,12 @@ mod tests {
     /// A5: Test helper — calls `run_tick_processor` with `NoopGreeksEnricher`
     /// as the concrete type parameter (no Greeks in tests). Avoids turbofish
     /// on every test call site.
+    // Phase 4b (2026-05-05): `stock_movers_writer` + `option_movers_writer`
+    // params DELETED from `run_test_tick_processor` — both legacy
+    // writer types are gone with the `movers_persistence` module
+    // removal. Test call sites that previously passed `None` for
+    // these positions should drop those `None`s; this keeps the
+    // wrapper minimal.
     #[allow(clippy::too_many_arguments)]
     async fn run_test_tick_processor(
         frame_receiver: mpsc::Receiver<bytes::Bytes>,
@@ -2210,9 +1782,7 @@ mod tests {
         live_candle_writer: Option<LiveCandleWriter>,
         top_movers: Option<crate::pipeline::top_movers::TopMoversTracker>,
         shared_snapshot: Option<crate::pipeline::top_movers::SharedTopMoversSnapshot>,
-        stock_movers_writer: Option<tickvault_storage::movers_persistence::StockMoversWriter>,
         option_movers: Option<crate::pipeline::option_movers::OptionMoversTracker>,
-        option_movers_writer: Option<tickvault_storage::movers_persistence::OptionMoversWriter>,
     ) {
         run_tick_processor::<tickvault_common::tick_types::NoopGreeksEnricher>(
             frame_receiver,
@@ -2224,9 +1794,7 @@ mod tests {
             top_movers,
             shared_snapshot,
             None,
-            stock_movers_writer,
             option_movers,
-            option_movers_writer,
             None, // instrument_registry — not needed in tests
             None, // tick_heartbeat — watchdog not exercised in tests
             None, // tick_enricher — Phase 2.5 enricher unused by these tests; legacy append_tick path covers them
@@ -2289,10 +1857,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
 
         let handle = tokio::spawn(async move {
-            run_test_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None, None,
-            )
-            .await;
+            run_test_tick_processor(frame_rx, None, None, None, None, None, None, None, None).await;
         });
 
         // Send a valid ticker frame
@@ -2312,10 +1877,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
 
         let handle = tokio::spawn(async move {
-            run_test_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None, None,
-            )
-            .await;
+            run_test_tick_processor(frame_rx, None, None, None, None, None, None, None, None).await;
         });
 
         // Send a too-short frame
@@ -2343,10 +1905,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
 
         let handle = tokio::spawn(async move {
-            run_test_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None, None,
-            )
-            .await;
+            run_test_tick_processor(frame_rx, None, None, None, None, None, None, None, None).await;
         });
 
         // Send a ticker frame with LTP=0.0 — should be filtered (not crash)
@@ -2364,10 +1923,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
 
         let handle = tokio::spawn(async move {
-            run_test_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None, None,
-            )
-            .await;
+            run_test_tick_processor(frame_rx, None, None, None, None, None, None, None, None).await;
         });
 
         // Send a ticker frame with LTT=0 (epoch 1970) — should be filtered
@@ -2385,10 +1941,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
 
         let handle = tokio::spawn(async move {
-            run_test_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None, None,
-            )
-            .await;
+            run_test_tick_processor(frame_rx, None, None, None, None, None, None, None, None).await;
         });
 
         // Send junk tick first (LTP=0)
@@ -2410,10 +1963,7 @@ mod tests {
         let (frame_tx, frame_rx) = mpsc::channel(100);
 
         let handle = tokio::spawn(async move {
-            run_test_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None, None,
-            )
-            .await;
+            run_test_tick_processor(frame_rx, None, None, None, None, None, None, None, None).await;
         });
 
         // Close immediately
@@ -2437,10 +1987,7 @@ mod tests {
     async fn test_tick_processor_handles_oi_update() {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_test_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None, None,
-            )
-            .await;
+            run_test_tick_processor(frame_rx, None, None, None, None, None, None, None, None).await;
         });
         let frame = make_packet(RESPONSE_CODE_OI, OI_PACKET_SIZE);
         frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
@@ -2453,10 +2000,7 @@ mod tests {
     async fn test_tick_processor_handles_previous_close() {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_test_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None, None,
-            )
-            .await;
+            run_test_tick_processor(frame_rx, None, None, None, None, None, None, None, None).await;
         });
         let frame = make_packet(RESPONSE_CODE_PREVIOUS_CLOSE, PREVIOUS_CLOSE_PACKET_SIZE);
         frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
@@ -2469,10 +2013,7 @@ mod tests {
     async fn test_tick_processor_handles_market_status() {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_test_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None, None,
-            )
-            .await;
+            run_test_tick_processor(frame_rx, None, None, None, None, None, None, None, None).await;
         });
         let frame = make_packet(RESPONSE_CODE_MARKET_STATUS, MARKET_STATUS_PACKET_SIZE);
         frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
@@ -2485,10 +2026,7 @@ mod tests {
     async fn test_tick_processor_handles_disconnect() {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_test_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None, None,
-            )
-            .await;
+            run_test_tick_processor(frame_rx, None, None, None, None, None, None, None, None).await;
         });
         let mut frame = make_packet(RESPONSE_CODE_DISCONNECT, DISCONNECT_PACKET_SIZE);
         // Set disconnect code to 807 (AccessTokenExpired)
@@ -2503,10 +2041,7 @@ mod tests {
     async fn test_tick_processor_handles_full_quote() {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_test_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None, None,
-            )
-            .await;
+            run_test_tick_processor(frame_rx, None, None, None, None, None, None, None, None).await;
         });
         // Full quote packet with valid LTP and timestamp
         let mut frame = make_packet(RESPONSE_CODE_FULL, FULL_QUOTE_PACKET_SIZE);
@@ -2527,10 +2062,7 @@ mod tests {
         // After 100, the warn! is suppressed; the processor still continues.
         let (frame_tx, frame_rx) = mpsc::channel(200);
         let handle = tokio::spawn(async move {
-            run_test_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None, None,
-            )
-            .await;
+            run_test_tick_processor(frame_rx, None, None, None, None, None, None, None, None).await;
         });
 
         for _ in 0..105 {
@@ -2557,10 +2089,7 @@ mod tests {
         // checks `if let Some(ref mut writer)` and falls through.
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_test_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None, None,
-            )
-            .await;
+            run_test_tick_processor(frame_rx, None, None, None, None, None, None, None, None).await;
         });
 
         // Send a valid tick so frames_processed > 0
@@ -2579,10 +2108,7 @@ mod tests {
         // Exercise the periodic flush check by sending frames with a gap > 100ms.
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_test_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None, None,
-            )
-            .await;
+            run_test_tick_processor(frame_rx, None, None, None, None, None, None, None, None).await;
         });
 
         // Send first valid tick
@@ -2606,10 +2132,7 @@ mod tests {
         // Send > 10 junk ticks to exercise the `if junk_ticks_filtered <= 10` boundary.
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_test_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None, None,
-            )
-            .await;
+            run_test_tick_processor(frame_rx, None, None, None, None, None, None, None, None).await;
         });
 
         for _ in 0..15 {
@@ -2626,10 +2149,7 @@ mod tests {
     async fn test_tick_processor_negative_ltp_filtered() {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_test_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None, None,
-            )
-            .await;
+            run_test_tick_processor(frame_rx, None, None, None, None, None, None, None, None).await;
         });
 
         // LTP = -1.0 should be filtered as junk
@@ -2647,10 +2167,7 @@ mod tests {
         // multiple code paths in a single run.
         let (frame_tx, frame_rx) = mpsc::channel(200);
         let handle = tokio::spawn(async move {
-            run_test_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None, None,
-            )
-            .await;
+            run_test_tick_processor(frame_rx, None, None, None, None, None, None, None, None).await;
         });
 
         // Parse error (too short)
@@ -2715,10 +2232,7 @@ mod tests {
         // Send previous_close then market_status in sequence.
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_test_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None, None,
-            )
-            .await;
+            run_test_tick_processor(frame_rx, None, None, None, None, None, None, None, None).await;
         });
 
         let prev_close = make_packet(RESPONSE_CODE_PREVIOUS_CLOSE, PREVIOUS_CLOSE_PACKET_SIZE);
@@ -2740,10 +2254,7 @@ mod tests {
         // Full quote with LTP=0 should be filtered as junk.
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_test_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None, None,
-            )
-            .await;
+            run_test_tick_processor(frame_rx, None, None, None, None, None, None, None, None).await;
         });
 
         let mut frame = make_packet(RESPONSE_CODE_FULL, FULL_QUOTE_PACKET_SIZE);
@@ -2763,10 +2274,7 @@ mod tests {
         // Full quote with valid LTP and timestamp should be processed.
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_test_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None, None,
-            )
-            .await;
+            run_test_tick_processor(frame_rx, None, None, None, None, None, None, None, None).await;
         });
 
         let mut frame = make_packet(RESPONSE_CODE_FULL, FULL_QUOTE_PACKET_SIZE);
@@ -2785,10 +2293,7 @@ mod tests {
         // Send many valid frames rapidly to verify periodic flush check runs.
         let (frame_tx, frame_rx) = mpsc::channel(500);
         let handle = tokio::spawn(async move {
-            run_test_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None, None,
-            )
-            .await;
+            run_test_tick_processor(frame_rx, None, None, None, None, None, None, None, None).await;
         });
 
         // Send 50 valid frames
@@ -2817,10 +2322,7 @@ mod tests {
         // Unknown response code (99) should be counted as a parse error.
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_test_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None, None,
-            )
-            .await;
+            run_test_tick_processor(frame_rx, None, None, None, None, None, None, None, None).await;
         });
 
         let mut buf = vec![0u8; 8];
@@ -2930,8 +2432,6 @@ mod tests {
                 None,
                 None,
                 None,
-                None,
-                None,
             )
             .await;
         });
@@ -2974,8 +2474,6 @@ mod tests {
             run_test_tick_processor(
                 frame_rx,
                 Some(writer),
-                None,
-                None,
                 None,
                 None,
                 None,
@@ -3038,10 +2536,7 @@ mod tests {
         // Depth data must still be persisted — it must NOT be filtered as junk.
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_test_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None, None,
-            )
-            .await;
+            run_test_tick_processor(frame_rx, None, None, None, None, None, None, None, None).await;
         });
 
         // Send a Market Depth frame with valid LTP but no timestamp
@@ -3061,10 +2556,7 @@ mod tests {
         // Market Depth with LTP=0.0 is truly junk — should be filtered.
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_test_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None, None,
-            )
-            .await;
+            run_test_tick_processor(frame_rx, None, None, None, None, None, None, None, None).await;
         });
 
         let frame = make_market_depth_frame(13, 0.0);
@@ -3113,8 +2605,6 @@ mod tests {
                 frame_rx,
                 Some(tick_writer),
                 Some(depth_writer),
-                None,
-                None,
                 None,
                 None,
                 None,
@@ -3276,10 +2766,7 @@ mod tests {
     async fn test_tick_processor_nan_ltp_filtered() {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_test_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None, None,
-            )
-            .await;
+            run_test_tick_processor(frame_rx, None, None, None, None, None, None, None, None).await;
         });
         let frame = make_ticker_frame(13, f32::NAN, today_ist_epoch_at(10, 0, 0));
         frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
@@ -3292,10 +2779,7 @@ mod tests {
     async fn test_tick_processor_positive_infinity_ltp_filtered() {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_test_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None, None,
-            )
-            .await;
+            run_test_tick_processor(frame_rx, None, None, None, None, None, None, None, None).await;
         });
         let frame = make_ticker_frame(13, f32::INFINITY, today_ist_epoch_at(10, 0, 0));
         frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
@@ -3308,10 +2792,7 @@ mod tests {
     async fn test_tick_processor_negative_infinity_ltp_filtered() {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_test_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None, None,
-            )
-            .await;
+            run_test_tick_processor(frame_rx, None, None, None, None, None, None, None, None).await;
         });
         let frame = make_ticker_frame(13, f32::NEG_INFINITY, today_ist_epoch_at(10, 0, 0));
         frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
@@ -3324,10 +2805,7 @@ mod tests {
     async fn test_tick_processor_nan_ltp_full_quote_filtered() {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_test_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None, None,
-            )
-            .await;
+            run_test_tick_processor(frame_rx, None, None, None, None, None, None, None, None).await;
         });
         let mut frame = make_packet(RESPONSE_CODE_FULL, FULL_QUOTE_PACKET_SIZE);
         frame[TICKER_OFFSET_LTP..TICKER_OFFSET_LTP + 4].copy_from_slice(&f32::NAN.to_le_bytes());
@@ -3343,10 +2821,7 @@ mod tests {
     async fn test_tick_processor_infinity_ltp_full_quote_filtered() {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_test_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None, None,
-            )
-            .await;
+            run_test_tick_processor(frame_rx, None, None, None, None, None, None, None, None).await;
         });
         let mut frame = make_packet(RESPONSE_CODE_FULL, FULL_QUOTE_PACKET_SIZE);
         frame[TICKER_OFFSET_LTP..TICKER_OFFSET_LTP + 4]
@@ -3363,10 +2838,7 @@ mod tests {
     async fn test_tick_processor_nan_ltp_market_depth_filtered() {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_test_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None, None,
-            )
-            .await;
+            run_test_tick_processor(frame_rx, None, None, None, None, None, None, None, None).await;
         });
         let frame = make_market_depth_frame(13, f32::NAN);
         frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
@@ -3379,10 +2851,7 @@ mod tests {
     async fn test_tick_processor_infinity_ltp_market_depth_filtered() {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_test_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None, None,
-            )
-            .await;
+            run_test_tick_processor(frame_rx, None, None, None, None, None, None, None, None).await;
         });
         let frame = make_market_depth_frame(13, f32::INFINITY);
         frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
@@ -3400,10 +2869,7 @@ mod tests {
         // Send the same tick twice — second should be dedup-filtered.
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_test_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None, None,
-            )
-            .await;
+            run_test_tick_processor(frame_rx, None, None, None, None, None, None, None, None).await;
         });
         let frame = make_ticker_frame(13, 24500.0, today_ist_epoch_at(10, 0, 0));
         frame_tx
@@ -3421,10 +2887,7 @@ mod tests {
         // Same security, different timestamp — both should pass dedup.
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_test_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None, None,
-            )
-            .await;
+            run_test_tick_processor(frame_rx, None, None, None, None, None, None, None, None).await;
         });
         frame_tx
             .send(bytes::Bytes::from(make_ticker_frame(
@@ -3450,10 +2913,7 @@ mod tests {
         // Same security+timestamp, different LTP — both should pass (price update).
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_test_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None, None,
-            )
-            .await;
+            run_test_tick_processor(frame_rx, None, None, None, None, None, None, None, None).await;
         });
         frame_tx
             .send(bytes::Bytes::from(make_ticker_frame(
@@ -3481,10 +2941,7 @@ mod tests {
         // Different security, same timestamp+LTP — both should pass.
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_test_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None, None,
-            )
-            .await;
+            run_test_tick_processor(frame_rx, None, None, None, None, None, None, None, None).await;
         });
         frame_tx
             .send(bytes::Bytes::from(make_ticker_frame(
@@ -3512,10 +2969,7 @@ mod tests {
         // Send 100 identical ticks — only first should pass dedup.
         let (frame_tx, frame_rx) = mpsc::channel(200);
         let handle = tokio::spawn(async move {
-            run_test_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None, None,
-            )
-            .await;
+            run_test_tick_processor(frame_rx, None, None, None, None, None, None, None, None).await;
         });
         let frame = make_ticker_frame(13, 24500.0, today_ist_epoch_at(10, 0, 0));
         for _ in 0..100 {
@@ -3534,10 +2988,7 @@ mod tests {
         // Junk ticks (LTP=0) are filtered BEFORE dedup — dedup never sees them.
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_test_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None, None,
-            )
-            .await;
+            run_test_tick_processor(frame_rx, None, None, None, None, None, None, None, None).await;
         });
         // Send junk tick
         frame_tx
@@ -3567,10 +3018,7 @@ mod tests {
         // Send the same Full Quote twice — second should be dedup-filtered.
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_test_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None, None,
-            )
-            .await;
+            run_test_tick_processor(frame_rx, None, None, None, None, None, None, None, None).await;
         });
         let mut frame = make_packet(RESPONSE_CODE_FULL, FULL_QUOTE_PACKET_SIZE);
         frame[TICKER_OFFSET_LTP..TICKER_OFFSET_LTP + 4].copy_from_slice(&24500.0_f32.to_le_bytes());
@@ -3592,10 +3040,7 @@ mod tests {
         // Two identical depth frames should BOTH be processed (not deduplicated).
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_test_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None, None,
-            )
-            .await;
+            run_test_tick_processor(frame_rx, None, None, None, None, None, None, None, None).await;
         });
         let frame = make_market_depth_frame(13, 24500.0);
         frame_tx
@@ -3620,10 +3065,7 @@ mod tests {
         // So subnormal passes through — this is correct (it's a valid f32).
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_test_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None, None,
-            )
-            .await;
+            run_test_tick_processor(frame_rx, None, None, None, None, None, None, None, None).await;
         });
         let subnormal: f32 = f32::MIN_POSITIVE / 2.0;
         let frame = make_ticker_frame(13, subnormal, today_ist_epoch_at(10, 0, 0));
@@ -3638,10 +3080,7 @@ mod tests {
         // -0.0 is == 0.0 in IEEE 754, so -0.0 <= 0.0 is true → filtered.
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_test_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None, None,
-            )
-            .await;
+            run_test_tick_processor(frame_rx, None, None, None, None, None, None, None, None).await;
         });
         let frame = make_ticker_frame(13, -0.0, today_ist_epoch_at(10, 0, 0));
         frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
@@ -3654,10 +3093,7 @@ mod tests {
     async fn test_tick_processor_max_u32_security_id_processed() {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_test_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None, None,
-            )
-            .await;
+            run_test_tick_processor(frame_rx, None, None, None, None, None, None, None, None).await;
         });
         // u32::MAX security_id with valid LTP and timestamp
         let mut frame = make_ticker_frame(0, 24500.0, today_ist_epoch_at(10, 0, 0));
@@ -3672,10 +3108,7 @@ mod tests {
     async fn test_tick_processor_minimum_valid_timestamp_accepted() {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_test_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None, None,
-            )
-            .await;
+            run_test_tick_processor(frame_rx, None, None, None, None, None, None, None, None).await;
         });
         // Exact minimum valid timestamp — should pass
         let frame = make_ticker_frame(13, 24500.0, MINIMUM_VALID_EXCHANGE_TIMESTAMP);
@@ -3689,10 +3122,7 @@ mod tests {
     async fn test_tick_processor_timestamp_one_below_minimum_filtered() {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_test_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None, None,
-            )
-            .await;
+            run_test_tick_processor(frame_rx, None, None, None, None, None, None, None, None).await;
         });
         let frame = make_ticker_frame(
             13,
@@ -3710,10 +3140,7 @@ mod tests {
         // Send one of every packet type in rapid succession.
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_test_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None, None,
-            )
-            .await;
+            run_test_tick_processor(frame_rx, None, None, None, None, None, None, None, None).await;
         });
 
         // 1. Index Ticker (code 1)
@@ -3794,10 +3221,7 @@ mod tests {
         // Tick B should pass because LTP differs.
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_test_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None, None,
-            )
-            .await;
+            run_test_tick_processor(frame_rx, None, None, None, None, None, None, None, None).await;
         });
         let frame_a = make_ticker_frame(13, 24500.0, today_ist_epoch_at(10, 0, 0));
         frame_tx
@@ -3817,10 +3241,7 @@ mod tests {
         // Comprehensive mixed sequence: valid → duplicate → junk → NaN → valid
         let (frame_tx, frame_rx) = mpsc::channel(200);
         let handle = tokio::spawn(async move {
-            run_test_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None, None,
-            )
-            .await;
+            run_test_tick_processor(frame_rx, None, None, None, None, None, None, None, None).await;
         });
 
         // Valid tick
@@ -3905,10 +3326,7 @@ mod tests {
     async fn test_tick_processor_depth_nan_bid_price_filtered() {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_test_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None, None,
-            )
-            .await;
+            run_test_tick_processor(frame_rx, None, None, None, None, None, None, None, None).await;
         });
         let frame = make_market_depth_frame_with_nan_bid(13, 24500.0);
         frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
@@ -3921,10 +3339,7 @@ mod tests {
     async fn test_tick_processor_depth_inf_ask_price_filtered() {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_test_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None, None,
-            )
-            .await;
+            run_test_tick_processor(frame_rx, None, None, None, None, None, None, None, None).await;
         });
         let frame = make_market_depth_frame_with_inf_ask(13, 24500.0);
         frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
@@ -3941,10 +3356,7 @@ mod tests {
     async fn test_tick_processor_previous_close_nan_filtered() {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_test_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None, None,
-            )
-            .await;
+            run_test_tick_processor(frame_rx, None, None, None, None, None, None, None, None).await;
         });
         let mut buf = make_packet(RESPONSE_CODE_PREVIOUS_CLOSE, PREVIOUS_CLOSE_PACKET_SIZE);
         buf[8..12].copy_from_slice(&f32::NAN.to_le_bytes());
@@ -3959,10 +3371,7 @@ mod tests {
     async fn test_tick_processor_previous_close_infinity_filtered() {
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_test_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None, None,
-            )
-            .await;
+            run_test_tick_processor(frame_rx, None, None, None, None, None, None, None, None).await;
         });
         let mut buf = make_packet(RESPONSE_CODE_PREVIOUS_CLOSE, PREVIOUS_CLOSE_PACKET_SIZE);
         buf[8..12].copy_from_slice(&f32::INFINITY.to_le_bytes());
@@ -4762,8 +4171,6 @@ mod tests {
                 None,
                 None,
                 None,
-                None,
-                None,
             )
             .await;
         });
@@ -4801,8 +4208,6 @@ mod tests {
                 None,
                 Some(top_movers),
                 Some(shared_snapshot),
-                None,
-                None,
                 None,
             )
             .await;
@@ -4842,8 +4247,6 @@ mod tests {
                 Some(top_movers),
                 None,
                 None,
-                None,
-                None,
             )
             .await;
         });
@@ -4881,8 +4284,6 @@ mod tests {
                 None,
                 None,
                 Some(top_movers),
-                None,
-                None,
                 None,
                 None,
             )
@@ -4941,10 +4342,7 @@ mod tests {
         let _guard = tracing::subscriber::set_default(SinkSubscriber);
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_test_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None, None,
-            )
-            .await;
+            run_test_tick_processor(frame_rx, None, None, None, None, None, None, None, None).await;
         });
         frame_tx
             .send(bytes::Bytes::from(vec![0u8; 4]))
@@ -4961,10 +4359,7 @@ mod tests {
         let _guard = tracing::subscriber::set_default(SinkSubscriber);
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_test_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None, None,
-            )
-            .await;
+            run_test_tick_processor(frame_rx, None, None, None, None, None, None, None, None).await;
         });
         let frame = make_ticker_frame(13, 0.0, today_ist_epoch_at(10, 0, 0));
         frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
@@ -4979,10 +4374,7 @@ mod tests {
         let _guard = tracing::subscriber::set_default(SinkSubscriber);
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_test_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None, None,
-            )
-            .await;
+            run_test_tick_processor(frame_rx, None, None, None, None, None, None, None, None).await;
         });
         let mut frame = make_packet(RESPONSE_CODE_FULL, FULL_QUOTE_PACKET_SIZE);
         frame[TICKER_OFFSET_LTP..TICKER_OFFSET_LTP + 4].copy_from_slice(&0.0_f32.to_le_bytes());
@@ -5000,10 +4392,7 @@ mod tests {
         let _guard = tracing::subscriber::set_default(SinkSubscriber);
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_test_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None, None,
-            )
-            .await;
+            run_test_tick_processor(frame_rx, None, None, None, None, None, None, None, None).await;
         });
         // Build a Full packet with bid > ask at level 0 to trigger crossed market
         let mut frame = make_packet(RESPONSE_CODE_FULL, FULL_QUOTE_PACKET_SIZE);
@@ -5041,10 +4430,7 @@ mod tests {
         let _guard = tracing::subscriber::set_default(SinkSubscriber);
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_test_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None, None,
-            )
-            .await;
+            run_test_tick_processor(frame_rx, None, None, None, None, None, None, None, None).await;
         });
         let mut frame = make_packet(RESPONSE_CODE_DISCONNECT, DISCONNECT_PACKET_SIZE);
         frame[8..10].copy_from_slice(&805u16.to_le_bytes());
@@ -5060,10 +4446,7 @@ mod tests {
         let _guard = tracing::subscriber::set_default(SinkSubscriber);
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_test_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None, None,
-            )
-            .await;
+            run_test_tick_processor(frame_rx, None, None, None, None, None, None, None, None).await;
         });
         let frame = make_packet(RESPONSE_CODE_OI, OI_PACKET_SIZE);
         frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
@@ -5078,10 +4461,7 @@ mod tests {
         let _guard = tracing::subscriber::set_default(SinkSubscriber);
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_test_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None, None,
-            )
-            .await;
+            run_test_tick_processor(frame_rx, None, None, None, None, None, None, None, None).await;
         });
         let frame = make_packet(RESPONSE_CODE_MARKET_STATUS, MARKET_STATUS_PACKET_SIZE);
         frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
@@ -5096,10 +4476,7 @@ mod tests {
         let _guard = tracing::subscriber::set_default(SinkSubscriber);
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_test_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None, None,
-            )
-            .await;
+            run_test_tick_processor(frame_rx, None, None, None, None, None, None, None, None).await;
         });
         let frame = make_ticker_frame(13, 24500.0, today_ist_epoch_at(10, 0, 0));
         frame_tx.send(bytes::Bytes::from(frame)).await.unwrap();
@@ -5114,10 +4491,7 @@ mod tests {
         let _guard = tracing::subscriber::set_default(SinkSubscriber);
         let (frame_tx, frame_rx) = mpsc::channel(100);
         let handle = tokio::spawn(async move {
-            run_test_tick_processor(
-                frame_rx, None, None, None, None, None, None, None, None, None, None,
-            )
-            .await;
+            run_test_tick_processor(frame_rx, None, None, None, None, None, None, None, None).await;
         });
         // Build a PrevClose packet with valid previous_close price
         let mut frame = make_packet(RESPONSE_CODE_PREVIOUS_CLOSE, PREVIOUS_CLOSE_PACKET_SIZE);
