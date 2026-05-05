@@ -69,7 +69,7 @@ Once Step 2's 30-day window is clean:
 
 Once Step 3's PR merges:
 
-1. Move `.claude/plans/active-plan-29-tf-and-movers-deletion.md` to `.claude/plans/archive/2026-MM-DD-29-tf-movers-deletion.md`
+1. Move the active plan file (`.claude/plans/active-plan-29-tf-and-movers-deletion.md`) into `.claude/plans/archive/` under a date-stamped name (operator picks the `YYYY-MM-DD` prefix at archive time, e.g. `2026-06-15-29-tf-movers-deletion.md`)
 2. Update `CLAUDE.md` `## CURRENT CONTEXT` if it referenced the active plan
 3. Tag the merge commit `phase-4b-complete-YYYY-MM-DD`
 
