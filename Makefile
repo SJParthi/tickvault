@@ -10,7 +10,7 @@
         health status open grafana questdb jaeger prometheus traefik alloy loki \
         obs obs-verify obs-restart obs-open \
         logs app-pid \
-        audit coverage bench geiger typos quality doc bootstrap scoped-check full-qa \
+        audit coverage bench geiger typos quality doc bootstrap scoped-check full-qa parity-soak \
         dispatch dispatch-readonly dispatch-status dispatch-logs dispatch-check dispatch-audit \
 
 # ---- Configuration ----
@@ -103,6 +103,17 @@ test: ## Run all tests
 
 scoped-check: ## Run tests ONLY for crates touched by current diff (see .claude/rules/project/testing-scope.md)
 	@bash .claude/hooks/scoped-test-runner.sh
+
+parity-soak: ## Run the 29-tf parity harness framework validation (Phase 3 commit 5)
+	@echo "🔬 Running parity harness framework validation..."
+	@echo "   The live 14-trading-day RAM≡DB soak is operator-driven (Phase 4a wiring)."
+	@echo "   This target runs the synthetic-data harness validation that ratchets"
+	@echo "   the comparison framework on every commit."
+	@echo "   See: .claude/plans/active-plan-29-tf-and-movers-deletion.md §6 row 3"
+	@echo ""
+	cargo test -p tickvault-trading --test parity_soak_harness -- --nocapture
+	@echo ""
+	@echo "  ✅ Parity harness framework validation completed"
 
 full-qa: ## Force full workspace tests (overrides scoped-check)
 	@FULL_QA=1 bash .claude/hooks/scoped-test-runner.sh

@@ -290,6 +290,143 @@ impl CascadeFanout {
         }
     }
 
+    // ────────────────────────────────────────────────────────────────
+    // Read-only accessors for the 28 derived engines (Phase 3 commit 5).
+    //
+    // Each method returns `Option<Bar>` for the (security_id, segment)
+    // pair, by `Copy`. No mutation surface is exposed — callers cannot
+    // reach `on_sealed_bar` through these accessors. This is the
+    // intended consumption path for the parity test harness, the
+    // future `/api/movers?v=2` endpoint (Phase 4a), and any trading
+    // bot read of in-RAM candle state.
+    //
+    // 28 named methods is mechanically simpler than a single
+    // `latest(timeframe_name: &str)` + match — the latter would either
+    // return an `enum BarRef<...>` (boilerplate) or use `dyn`
+    // (banned on hot path). Per-TF named methods compile down to
+    // one papaya pin/get + one Mutex lock per call (~60ns).
+    //
+    // Off the per-tick hot path (called by /api/movers + parity tests).
+    // ────────────────────────────────────────────────────────────────
+
+    /// Read-only accessor for `Tf3s` engine state.
+    pub fn latest_3s(&self, security_id: u32, segment_code: u8) -> Option<Bar> {
+        self.tf3s.latest(security_id, segment_code)
+    }
+    /// Read-only accessor for `Tf5s` engine state.
+    pub fn latest_5s(&self, security_id: u32, segment_code: u8) -> Option<Bar> {
+        self.tf5s.latest(security_id, segment_code)
+    }
+    /// Read-only accessor for `Tf10s` engine state.
+    pub fn latest_10s(&self, security_id: u32, segment_code: u8) -> Option<Bar> {
+        self.tf10s.latest(security_id, segment_code)
+    }
+    /// Read-only accessor for `Tf15s` engine state.
+    pub fn latest_15s(&self, security_id: u32, segment_code: u8) -> Option<Bar> {
+        self.tf15s.latest(security_id, segment_code)
+    }
+    /// Read-only accessor for `Tf30s` engine state.
+    pub fn latest_30s(&self, security_id: u32, segment_code: u8) -> Option<Bar> {
+        self.tf30s.latest(security_id, segment_code)
+    }
+    /// Read-only accessor for `Tf1m` engine state.
+    pub fn latest_1m(&self, security_id: u32, segment_code: u8) -> Option<Bar> {
+        self.tf1m.latest(security_id, segment_code)
+    }
+    /// Read-only accessor for `Tf2m` engine state.
+    pub fn latest_2m(&self, security_id: u32, segment_code: u8) -> Option<Bar> {
+        self.tf2m.latest(security_id, segment_code)
+    }
+    /// Read-only accessor for `Tf3m` engine state.
+    pub fn latest_3m(&self, security_id: u32, segment_code: u8) -> Option<Bar> {
+        self.tf3m.latest(security_id, segment_code)
+    }
+    /// Read-only accessor for `Tf4m` engine state.
+    pub fn latest_4m(&self, security_id: u32, segment_code: u8) -> Option<Bar> {
+        self.tf4m.latest(security_id, segment_code)
+    }
+    /// Read-only accessor for `Tf5m` engine state.
+    pub fn latest_5m(&self, security_id: u32, segment_code: u8) -> Option<Bar> {
+        self.tf5m.latest(security_id, segment_code)
+    }
+    /// Read-only accessor for `Tf6m` engine state.
+    pub fn latest_6m(&self, security_id: u32, segment_code: u8) -> Option<Bar> {
+        self.tf6m.latest(security_id, segment_code)
+    }
+    /// Read-only accessor for `Tf7m` engine state.
+    pub fn latest_7m(&self, security_id: u32, segment_code: u8) -> Option<Bar> {
+        self.tf7m.latest(security_id, segment_code)
+    }
+    /// Read-only accessor for `Tf8m` engine state.
+    pub fn latest_8m(&self, security_id: u32, segment_code: u8) -> Option<Bar> {
+        self.tf8m.latest(security_id, segment_code)
+    }
+    /// Read-only accessor for `Tf9m` engine state.
+    pub fn latest_9m(&self, security_id: u32, segment_code: u8) -> Option<Bar> {
+        self.tf9m.latest(security_id, segment_code)
+    }
+    /// Read-only accessor for `Tf10m` engine state.
+    pub fn latest_10m(&self, security_id: u32, segment_code: u8) -> Option<Bar> {
+        self.tf10m.latest(security_id, segment_code)
+    }
+    /// Read-only accessor for `Tf11m` engine state.
+    pub fn latest_11m(&self, security_id: u32, segment_code: u8) -> Option<Bar> {
+        self.tf11m.latest(security_id, segment_code)
+    }
+    /// Read-only accessor for `Tf12m` engine state.
+    pub fn latest_12m(&self, security_id: u32, segment_code: u8) -> Option<Bar> {
+        self.tf12m.latest(security_id, segment_code)
+    }
+    /// Read-only accessor for `Tf13m` engine state.
+    pub fn latest_13m(&self, security_id: u32, segment_code: u8) -> Option<Bar> {
+        self.tf13m.latest(security_id, segment_code)
+    }
+    /// Read-only accessor for `Tf14m` engine state.
+    pub fn latest_14m(&self, security_id: u32, segment_code: u8) -> Option<Bar> {
+        self.tf14m.latest(security_id, segment_code)
+    }
+    /// Read-only accessor for `Tf15m` engine state.
+    pub fn latest_15m(&self, security_id: u32, segment_code: u8) -> Option<Bar> {
+        self.tf15m.latest(security_id, segment_code)
+    }
+    /// Read-only accessor for `Tf30m` engine state.
+    pub fn latest_30m(&self, security_id: u32, segment_code: u8) -> Option<Bar> {
+        self.tf30m.latest(security_id, segment_code)
+    }
+    /// Read-only accessor for `Tf1h` engine state.
+    pub fn latest_1h(&self, security_id: u32, segment_code: u8) -> Option<Bar> {
+        self.tf1h.latest(security_id, segment_code)
+    }
+    /// Read-only accessor for `Tf2h` engine state.
+    pub fn latest_2h(&self, security_id: u32, segment_code: u8) -> Option<Bar> {
+        self.tf2h.latest(security_id, segment_code)
+    }
+    /// Read-only accessor for `Tf3h` engine state.
+    pub fn latest_3h(&self, security_id: u32, segment_code: u8) -> Option<Bar> {
+        self.tf3h.latest(security_id, segment_code)
+    }
+    /// Read-only accessor for `Tf4h` engine state.
+    pub fn latest_4h(&self, security_id: u32, segment_code: u8) -> Option<Bar> {
+        self.tf4h.latest(security_id, segment_code)
+    }
+    /// Read-only accessor for `Tf1d` engine state.
+    /// **WARN — calendar-approximate (see `Tf1d` docstring).** SEBI-canonical
+    /// truth is the QuestDB matview. Use this only for trading-bot speed reads
+    /// where ±UTC-offset drift is acceptable.
+    pub fn latest_1d(&self, security_id: u32, segment_code: u8) -> Option<Bar> {
+        self.tf1d.latest(security_id, segment_code)
+    }
+    /// Read-only accessor for `Tf1w` engine state.
+    /// **WARN — calendar-approximate.** See `latest_1d` for context.
+    pub fn latest_1w(&self, security_id: u32, segment_code: u8) -> Option<Bar> {
+        self.tf1w.latest(security_id, segment_code)
+    }
+    /// Read-only accessor for `Tf1mo` engine state.
+    /// **WARN — calendar-approximate.** See `latest_1d` for context.
+    pub fn latest_1mo(&self, security_id: u32, segment_code: u8) -> Option<Bar> {
+        self.tf1mo.latest(security_id, segment_code)
+    }
+
     /// Forces every derived engine in every map to seal its open bar.
     /// Used at IST midnight rollover (per L13). Returns the total
     /// count of bars that were sealed across all 28 derived engines.
@@ -486,5 +623,76 @@ mod tests {
     fn force_seal_all_explicit_name_match() {
         let fanout = CascadeFanout::new();
         let _ = fanout.force_seal_all();
+    }
+
+    /// Phase 3 commit 5: assert every TF read accessor returns Some(bar)
+    /// after one sealed 1s bar is fed. Mirrors the propagation test but
+    /// uses the public read accessors instead of the `pub(crate)` fields.
+    #[test]
+    fn every_latest_accessor_returns_state_after_first_seal() {
+        let fanout = CascadeFanout::new();
+        let bar = make_sealed_1s_bar(7777, 2, 1_000);
+        fanout.feed_sealed_1s_bar(&bar);
+        let assertions: [(&str, Option<Bar>); DERIVED_ENGINE_COUNT] = [
+            ("latest_3s", fanout.latest_3s(7777, 2)),
+            ("latest_5s", fanout.latest_5s(7777, 2)),
+            ("latest_10s", fanout.latest_10s(7777, 2)),
+            ("latest_15s", fanout.latest_15s(7777, 2)),
+            ("latest_30s", fanout.latest_30s(7777, 2)),
+            ("latest_1m", fanout.latest_1m(7777, 2)),
+            ("latest_2m", fanout.latest_2m(7777, 2)),
+            ("latest_3m", fanout.latest_3m(7777, 2)),
+            ("latest_4m", fanout.latest_4m(7777, 2)),
+            ("latest_5m", fanout.latest_5m(7777, 2)),
+            ("latest_6m", fanout.latest_6m(7777, 2)),
+            ("latest_7m", fanout.latest_7m(7777, 2)),
+            ("latest_8m", fanout.latest_8m(7777, 2)),
+            ("latest_9m", fanout.latest_9m(7777, 2)),
+            ("latest_10m", fanout.latest_10m(7777, 2)),
+            ("latest_11m", fanout.latest_11m(7777, 2)),
+            ("latest_12m", fanout.latest_12m(7777, 2)),
+            ("latest_13m", fanout.latest_13m(7777, 2)),
+            ("latest_14m", fanout.latest_14m(7777, 2)),
+            ("latest_15m", fanout.latest_15m(7777, 2)),
+            ("latest_30m", fanout.latest_30m(7777, 2)),
+            ("latest_1h", fanout.latest_1h(7777, 2)),
+            ("latest_2h", fanout.latest_2h(7777, 2)),
+            ("latest_3h", fanout.latest_3h(7777, 2)),
+            ("latest_4h", fanout.latest_4h(7777, 2)),
+            ("latest_1d", fanout.latest_1d(7777, 2)),
+            ("latest_1w", fanout.latest_1w(7777, 2)),
+            ("latest_1mo", fanout.latest_1mo(7777, 2)),
+        ];
+        for (name, latest) in assertions {
+            assert!(
+                latest.is_some(),
+                "{name} returned None after sealed 1s bar — accessor or fanout call missing"
+            );
+        }
+    }
+
+    #[test]
+    fn every_latest_accessor_returns_none_for_unknown_key() {
+        let fanout = CascadeFanout::new();
+        // No bars fed yet — all accessors must return None.
+        assert!(fanout.latest_3s(0, 0).is_none());
+        assert!(fanout.latest_30m(0, 0).is_none());
+        assert!(fanout.latest_1h(0, 0).is_none());
+        assert!(fanout.latest_1d(0, 0).is_none());
+        assert!(fanout.latest_1mo(0, 0).is_none());
+    }
+
+    #[test]
+    fn latest_accessors_isolate_cross_segment_collisions() {
+        // I-P1-11: same security_id different segment must NOT collide.
+        let fanout = CascadeFanout::new();
+        let bar_seg0 = make_sealed_1s_bar(27, 0, 1_000);
+        let mut bar_seg1 = make_sealed_1s_bar(27, 1, 1_000);
+        bar_seg1.close = 555.0;
+        fanout.feed_sealed_1s_bar(&bar_seg0);
+        fanout.feed_sealed_1s_bar(&bar_seg1);
+        let seg0 = fanout.latest_30m(27, 0).expect("seg 0 present");
+        let seg1 = fanout.latest_30m(27, 1).expect("seg 1 present");
+        assert_ne!(seg0.close, seg1.close, "I-P1-11 isolation broken");
     }
 }
