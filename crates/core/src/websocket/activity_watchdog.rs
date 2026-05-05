@@ -74,6 +74,29 @@ pub const WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS: u64 = 50;
 ///   truly-dead-socket detection via the read loop's `Err(..)` branch).
 pub const WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS: u64 = 14400;
 
+/// Watchdog threshold for depth WebSocket connections in DEFERRED mode
+/// (waiting for `InitialSubscribe20` or `InitialSubscribe200` from the
+/// 09:13 dispatcher / cohort selector). A deferred conn has zero
+/// subscriptions, so Dhan sends zero data frames. The activity counter
+/// is fed only by data frames (not protocol pings), so the standard 50s
+/// threshold trips every cycle and reconnects perpetually.
+///
+/// Live incident 2026-05-05 14:05–14:08 IST: all 5 depth-200 deferred
+/// slots fired the watchdog every ~50s (`depth-200-V2-DYN-200-SLOT-{0..4}-deferred`),
+/// causing a reconnect storm that flapped tick_freshness and triggered
+/// SLO-02 CRITICAL pages every ~3 minutes. Root cause: cohort selector
+/// (`DEPTH-DYN-V2-01`) was failing 400 Bad Request → InitialSubscribe
+/// never dispatched → conns stayed deferred → watchdog mis-fired.
+///
+/// Fix: deferred conns use the 4h threshold (matching order-update WS,
+/// which is silent for similar reasons). TCP-RST on truly dead sockets
+/// is still caught via the read loop's `Err(..)` branch. Once the
+/// dispatcher fires `InitialSubscribe20/200` and frames start flowing,
+/// the conn transitions out of deferred mode in the next reconnect
+/// cycle (passing `security_id != 0` for depth-200 or non-empty
+/// instruments for depth-20).
+pub const WATCHDOG_THRESHOLD_DEPTH_DEFERRED_SECS: u64 = 14400;
+
 /// Per-connection activity watchdog.
 ///
 /// Construct with [`ActivityWatchdog::new`], share the [`Arc<AtomicU64>`]
@@ -413,6 +436,10 @@ mod tests {
         // so the watchdog is purely a half-open-socket backstop.
         assert_eq!(WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS, 50);
         assert_eq!(WATCHDOG_THRESHOLD_ORDER_UPDATE_SECS, 14400);
+        // 2026-05-05: deferred-mode depth conns use the 4h threshold
+        // (matches order-update). Live incident: depth-200 deferred slots
+        // reconnect-stormed at 50s threshold every cycle.
+        assert_eq!(WATCHDOG_THRESHOLD_DEPTH_DEFERRED_SECS, 14400);
     }
 
     // -----------------------------------------------------------------------
