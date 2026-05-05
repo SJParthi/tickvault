@@ -649,3 +649,267 @@ Per operator charter (2026-05-04): defaults locked at maximum-guarantee-within-e
 - Phase 4b: DROP TABLE old movers + retire 7 ErrorCodes (30-day post-deploy gate)
 
 These cannot be fast-forwarded — they require physical trading days against the now-merged engine.
+
+---
+
+## 17. POST-MERGE EXTENSION — Movers Deletion + Current-Day In-Memory Store (2026-05-05 operator directive)
+
+### 17.1 Sequence (4 PRs queued)
+
+| # | PR | Status | Branch / scope |
+|---|---|---|---|
+| 1 | **#503** — Expand candle matviews 18 → 28 TFs | ✅ MERGED 2026-05-05 | `materialized_views.rs` adds 3s, 4m, 6m, 7m, 8m, 9m, 11m, 12m, 13m, 14m. RAM cascade ≡ DB. 90/90 tests. |
+| 2 | **#504** — Current-day in-memory store extension to `CandleEngine<TF>` | NOT STARTED | Per §17.2 below |
+| 3 | **#505** — Rewire `/api/movers` to read from `candles_*` (replace `movers_1m` backing) | NOT STARTED | API handler swap, identical response shape |
+| 4 | **#506** — Migrate depth-dynamic cohort SQL `movers_1m → candles_1m` + rerank semantics | NOT STARTED | Selector SQL only |
+| 5 | **#507** — DELETE entire movers infra + DROP migration | NOT STARTED | `MoversWriter`, `movers_pipeline`, `movers_writer.rs`, `movers_base_persistence.rs`, `top_movers.rs`, dormant guard, all boot wiring; one-shot DROP `movers_1s` + 25 matviews + retirement marker tables |
+
+### 17.2 Current-day in-memory store (PR #504 design)
+
+**Operator demand:** "for the current live day ticks, all 11K instruments × 23 TFs (1m+) all sealed bars in memory, O(1) read, no DB hit on the live path, handle memory spikes/pressure, fit on c7i.xlarge."
+
+**Memory math (375-min trading session):**
+
+| Bucket | TFs | Bars/day | Per inst |
+|---|---|---:|---:|
+| 1m..15m | 15 | ~1,249 | 99.9 KB |
+| 30m..4h | 5 | 29 | 2.3 KB |
+| 1d/1w/1mo | 3 | 1.25 | 0.1 KB |
+| **Total** | **23** | **~1,279** | **~102 KB** |
+
+× 11,000 instruments = ~1.1 GB raw, ~1.7 GB with HashMap/Mutex overhead.
+
+**c7i.xlarge fit check:** Docker stack consumes 7.4 GB of 8 GB → **does NOT fit Option A (full retention).**
+
+### 17.3 Three options ranked
+
+| Option | RAM cost | Cost/mo | Fits c7i.xlarge? | Recommendation |
+|---|---:|---:|---|---|
+| A) Full 1,279 bars × 11K | ~1.7 GB | needs c7i.2xlarge (+₹3,500) | ❌ | Use only if budget bumps |
+| **B) Last 100 bars/TF × 11K** | **~140 MB** | ₹0 | ✅ tight | **DEFAULT** |
+| C) Top-1K liquid full + rest QuestDB | ~155 MB | ₹0 | ✅ asymmetric | Needs liquidity classifier — defer |
+
+**Default recommendation: Option B.** Strategies needing >100 bars hit `candles_*` matview (28-TF complete after PR #503).
+
+### 17.4 Architecture (Option B)
+
+```
+CandleEngine<TF> {
+    open_bar: Option<Bar>,                  // existing — WIP bar
+    sealed_today: ArrayVec<Bar, 100>,       // NEW — last 100 sealed bars
+    day_start_ts_secs: u32,                 // NEW — 09:15 IST anchor
+}
+```
+
+- **`ArrayVec<Bar, 100>`** = stack-allocated, fixed cap, zero heap allocation per (instrument, TF). Bounded at compile time.
+- **Eviction policy:** when 100 sealed bars buffered, oldest is dropped (already persisted to QuestDB by `candle_persistence.rs` write path).
+- **IST midnight rollover** (already wired PR #485): drains `sealed_today` to QuestDB queue if any unwritten, resets `Vec` + `day_start_ts_secs`.
+
+### 17.5 O(1) + uniqueness + dedup guarantees
+
+| Operation | Cost | Mechanism |
+|---|---:|---|
+| Insert sealed bar | ~50 ns | papaya pin/get → `ArrayVec::push` (compile-bounded) |
+| Read latest | ~50 ns | `arrayvec.last()` |
+| Read bar at ts | ~50 ns | `arrayvec[(ts - day_start_ts) / TF::SECS]` if within window |
+| Read last N (N ≤ 100) | ~50ns + N memcpy | slice |
+| Read >100 bars back | falls through to QuestDB | not on hot path |
+
+- **Uniqueness:** map key `(security_id, exchange_segment)` per I-P1-11
+- **Dedup:** bucket-aligned `bar_idx = (ts - day_start) / TF::SECS` deterministic; same bucket → same slot → no duplicates
+
+### 17.6 Memory pressure / spike handling
+
+| Concern | Mitigation |
+|---|---|
+| Boot spike | **Skip historical load** — start empty at 09:15 IST, fill from live ticks only |
+| Realloc spike | `ArrayVec<Bar, 100>` is stack-only, no heap growth |
+| Day rollover | IST midnight task drains + resets atomically |
+| RSS leak | `MEMORY_RSS_ALERT_MB = 1024` (PR #497) catches at 1 GB |
+| OOM | `MAX_INSTRUMENTS = 25_000` × 23 TFs × 100 bars × 80B = 4.6 GB worst case; capped well below |
+
+### 17.7 New ratchets
+
+- `test_arrayvec_sealed_today_capacity_is_100`
+- `test_bar_at_ts_returns_o1_with_arithmetic_offset`
+- `test_eviction_drops_oldest_bar_when_full`
+- `test_midnight_rollover_clears_sealed_today_atomically`
+- `test_memory_envelope_under_140mb_at_full_capacity` (proptest-style)
+
+### 17.8 Honest envelope (PR body wording)
+
+> "100% O(1) inside the in-memory hot ring. Last 100 sealed bars per (instrument, TF) live in `ArrayVec<Bar, 100>` (stack-allocated, zero heap). 11,000 × 23 × 100 bars × 80B = ~140 MB resident. >100 bars-back falls through to `candles_*` matview (now 28-TF complete after PR #503). IST midnight rollover atomically drains+resets to 0. Composite (security_id, exchange_segment) key per I-P1-11. Bounded by `MAX_INSTRUMENTS = 25_000` (= 4.6 GB worst case). Fits c7i.xlarge."
+
+### 17.9 Plan status (live)
+
+| Item | Status |
+|---|---|
+| Memory math + c7i.xlarge fit analysis | ✅ |
+| Option B architecture | ✅ |
+| 4-PR sequence ordering | ✅ |
+| Operator decision: Option A/B/C | ⏳ awaiting |
+| Operator decision: PR order (movers-deletion-first vs in-memory-first) | ⏳ awaiting |
+
+**Once operator confirms Option B + PR ordering, Phase 17.2-17.6 becomes the implementation contract.**
+
+---
+
+## §18 — AWS instance choice + core allocation + memory worst-case scenarios + historical fetch
+
+> Operator demand 2026-05-05 (verbatim):
+> "why c7i 2x large why not some other instance dude that too maybe with reserved instance to reduce the budget or even different aws instance dude see docker websocket cores and depth 20 and depth 200 cores separately and then extreme kinds of memory issues memory spikes memory oom issues and memory bugs and memory scenarios I mean lets consider all kinds of extreme worst case scenarios errors exceptions any kinds of memories and cores dude how bro okay? meanwhile even along with historical fetch dude okay?"
+
+### 18.1 AWS instance comparison (ap-south-1, Mumbai)
+
+Pricing snapshot 2026-05-05 from AWS Pricing API (USD/hr, ₹85 = 1 USD, weekday-only schedule per `aws-budget.md`: 9hr × 22 + 5hr × 8 = 238 hr/mo).
+
+| Instance | vCPU | RAM | On-demand $/hr | On-demand ₹/mo | 1-yr RI no-upfront ₹/mo | 3-yr RI all-upfront ₹/mo (amortized) | Fits Option B (140 MB) | Fits Option A (1.7 GB) | Verdict |
+|---|---|---|---|---|---|---|---|---|---|
+| c7i.large | 2 | 4 GB | $0.0893 | ₹1,807 | ₹1,138 | ₹728 | ❌ Docker stack alone is 7.4 GB | ❌ | Too small. WS+parser starve. |
+| **c7i.xlarge** | **4** | **8 GB** | **$0.1785** | **₹3,610** | **₹2,275** | **₹1,455** | **✅ 140 MB + 7.4 GB stack = 7.5 GB** | **❌ 1.7 GB + 7.4 GB = 9.1 GB OOM** | **CURRENT — Option B fits** |
+| c7i.2xlarge | 8 | 16 GB | $0.3570 | ₹7,221 | ₹4,549 | ₹2,910 | ✅ headroom 8.5 GB | ✅ headroom 6.9 GB | Required for Option A on-demand; **breaches ₹5K cap** |
+| c7i-flex.xlarge | 4 | 8 GB | $0.0892 | ₹1,803 | n/a (burstable) | n/a | ✅ same as xlarge | ❌ | **CHEAPEST** but CPU-burst-throttled — bad for hot path |
+| m7i.xlarge | 4 | 16 GB | $0.2016 | ₹4,078 | ₹2,569 | ₹1,643 | ✅ huge headroom | ✅ headroom 6.9 GB | Memory-balanced; fits Option A under 1-yr RI (₹2,569 < ₹5K) |
+| r7i.xlarge | 4 | 32 GB | $0.2646 | ₹5,353 | ₹3,371 | ₹2,156 | ✅ huge headroom | ✅ huge headroom | Memory-optimized; fits Option A on 1-yr RI but pricier than m7i |
+| t3.xlarge | 4 | 16 GB | $0.1664 | ₹3,366 | ₹2,118 | ₹1,355 | ✅ | ✅ | Burstable CPU credits — UNSUITABLE for hot path |
+
+**Decision rationale (`aws-budget.md` ₹5K/mo hard cap):**
+
+1. **c7i-flex BANNED** — burstable CPUs throttle under sustained load. The 09:15:00–15:30:00 IST window is 6h25m of sustained hot-path work; a burst-throttle event during that window kills tick latency.
+2. **t3 BANNED** — same reason. CPU credits exhaust within 30 min of full-tilt work.
+3. **c7i.large BANNED** — 4 GB RAM cannot fit even the Docker stack (7.4 GB).
+4. **c7i.2xlarge** on-demand = ₹7,221/mo → **breaches ₹5K cap by ₹2,221/mo**. Even 1-yr RI no-upfront (₹4,549) eats the entire CloudWatch+SNS+S3+Data-Transfer headroom (~₹450). 3-yr all-upfront (₹2,910) fits but locks ₹104,760 capital for 3 years on a single-product retail trader.
+5. **r7i.xlarge** 1-yr RI (₹3,371) + ₹500 (CloudWatch+SNS+S3) + ₹775 (EBS gp3 100 GB) + ₹152 (EIP) + ₹85 (Data Transfer) = ₹4,883 → fits cap with ₹117 headroom. Option A becomes feasible. **CANDIDATE if operator chooses Option A.**
+6. **m7i.xlarge** 1-yr RI (₹2,569) + same ₹1,512 fixed = ₹4,081 → fits cap with ₹919 headroom. **Cheaper than r7i for Option A. CANDIDATE if operator chooses Option A.**
+7. **c7i.xlarge** 1-yr RI no-upfront (₹2,275) + ₹1,512 = ₹3,787 → fits cap with ₹1,213 headroom. **CHEAPEST viable path. Locks Option B.**
+8. **c7i.xlarge** 3-yr all-upfront (₹1,455 amortized) + ₹1,512 = ₹2,967 → fits cap with ₹2,033 headroom. Saves ~₹820/mo vs 1-yr RI but locks ₹52,380 capital for 3 years.
+
+**Final ranking under ₹5K cap:**
+
+| Rank | Instance + RI tier | Total ₹/mo | Headroom | Supports |
+|---|---|---|---|---|
+| 1 | **c7i.xlarge 1-yr RI no-upfront** | ₹3,787 | ₹1,213 | Option B (current plan) |
+| 2 | c7i.xlarge 3-yr RI all-upfront | ₹2,967 | ₹2,033 | Option B + saves ₹820/mo (capital lock-in) |
+| 3 | m7i.xlarge 1-yr RI no-upfront | ₹4,081 | ₹919 | Option A (full retention) |
+| 4 | r7i.xlarge 1-yr RI no-upfront | ₹4,883 | ₹117 | Option A (memory-optimized, headroom slim) |
+| 5 | c7i.2xlarge 3-yr RI all-upfront | ₹4,422 | ₹578 | Option A (capital lock-in ₹104,760) |
+
+**Recommendation: Rank 1 (c7i.xlarge 1-yr RI) + Option B.** Locks ₹0 capital upfront, fits cap, satisfies the in-memory ratchet.
+
+### 18.2 Per-component core allocation on c7i.xlarge (4 vCPU)
+
+Wave 5 already mandates `core_affinity` pinning (CORE-PIN-01/02 in `wave-5-error-codes.md`). The c7i.xlarge has exactly 4 logical cores (1 physical × 2 SMT × 2 = 4 vCPU on Intel Sapphire Rapids); cgroup `--cpuset-cpus=0-3` pins all 4 to the tickvault container.
+
+| Core | Pinned worker | Workload | Rationale |
+|---|---|---|---|
+| **Core 0** | WS read loop (main feed pool, 5 conns multiplexed) | tokio-tungstenite reader → SPSC `Producer<RawPacket>` | Lowest-latency core; RX never blocks |
+| **Core 1** | WS read loop (depth-20 + depth-200 pool, 5+5 conns multiplexed) | same pattern as Core 0 but depth payloads | Depth packets are 332B / 3212B; bigger but rarer |
+| **Core 2** | Parser + cascade fanout + ILP writer | `from_le_bytes` → `CandleEngine<TF>` fanout → `tick_persistence` ILP TCP | Sequential pipeline; cache-friendly |
+| **Core 3** | "Other" — order-update WS, Telegram dispatch, Prometheus scrape, IST-midnight rollover, BootSmokeTest, depth-rebalancer 60s tick, slo_score 10s tick | Background tokio multi-thread runtime | Catch-all for non-hot-path tasks |
+
+**Docker sidecars** (QuestDB 4 GB, Valkey 1 GB, Prometheus 512 MB, Grafana 1 GB, Alertmanager 256 MB, Traefik 512 MB, Valkey-exporter 128 MB) run as **separate containers** on the same host. Their cpuset is `0-3` too — kernel scheduler shares them — but our app's pinned threads have explicit CPU affinity. QuestDB ILP writes from Core 2 land on TCP; QuestDB's own threads run wherever the kernel places them. There is no contention because the hot path is bounded SPSC and the ILP socket is OS-level — not a CPU-bound RPC.
+
+**Why NOT split depth-20 and depth-200 into separate pinned cores?**
+
+We have 4 cores. WS read for main + WS read for both depth feeds + parser/ILP = 3 workers minimum. Splitting depth-20 and depth-200 would consume Core 1+2 leaving Core 3 for parser+ILP which IS hot path. Better: keep depth feeds together on Core 1 (low aggregate volume — 200 instruments × ~5 frames/sec each = 1K fps, vs main feed's 11K instruments × ~1-3 fps = ~25K fps). Main feed is 25× the load — IT gets a dedicated core, not depth.
+
+**Ratchet:** `core_pinning::pin_workers` (Wave 5 Item 6, lands later) tags each worker with a `WorkerKind` enum so the drift watchdog can tell which thread strayed.
+
+### 18.3 Memory worst-case scenarios
+
+| # | Scenario | RSS spike source | Mitigation in code | Ratchet test |
+|---|---|---|---|---|
+| 1 | Boot-time CSV download spike | `api-scrip-master-detailed.csv` ~50 MB read into Vec, parsed, then cached as rkyv | `instrument_loader` streams; rkyv binary cache reused on subsequent boots | `dhat_csv_parse_bounded` |
+| 2 | rkyv binary cache load | mmap of `~30 MB` cache file | mmap is OS-paged, NOT counted in RSS until accessed; real spike is ~15 MB | existing `dhat_universe_load` |
+| 3 | Phase 2 dispatch — 22 K stock F&O subscribe | 22,042 SubscribeRequest JSON serialization | bounded by `SUBSCRIBE_BATCH_SIZE = 100` per Dhan rule; serialize one batch at a time | `subscribe_builder_zero_alloc_steady_state` |
+| 4 | Cascade fanout fan-out on hot tick | Each tick traverses 28 TF engines; if any engine grows unbounded, that's the leak | `ArrayVec<Bar, 100>` per (security_id, segment, TF) — stack-only, hard cap | `dhat_cascade_fanout` (PR #498, 0 allocs across 10K calls) |
+| 5 | IST midnight rollover | Atomic swap of last_seen + prev_oi maps | papaya does NOT realloc on swap; new map is pre-sized (PR #485) | `IST midnight rollover atomic_test` |
+| 6 | Rescue ring overflow during QuestDB outage | Up to 2,000,000 ticks × ~120B = 240 MB | `TICK_BUFFER_CAPACITY` constant + `zero_tick_loss_alert_guard.rs` ratchet; spill NDJSON catches overflow | existing |
+| 7 | Telegram dispatcher coalescer lag | If >10 unique events/min, ArrayVec caps at 10 samples + count goes up | `TELEGRAM-01 reason="coalesced_sample_capped"` counter — visible, NOT hidden | `coalescer_capped_increments_counter` |
+| 8 | DHAT test in dev | DHAT itself allocates ~50 MB tracking heap | DHAT only runs under `cfg(feature = "dhat")` — not in prod | n/a |
+| 9 | Greeks pipeline 3-underlying option chain fetch | ~3 × 60 strikes × 200B JSON = ~36 KB per cycle | bounded by `MAX_UNDERLYINGS = 3` constant | existing |
+| 10 | Audit table writers (6 tables) | Each WriterTask buffers ~1 row at a time | bounded `mpsc(64)` channels per writer | existing |
+
+**RSS budget total (steady state, market hours, c7i.xlarge):**
+
+| Component | RSS |
+|---|---|
+| tickvault binary text + static | ~80 MB |
+| Bounded SPSC channels (4 × 65,536 × 200B) | ~50 MB |
+| InstrumentRegistry (papaya, 25K entries × ~500B value) | ~12 MB |
+| In-memory store §17 Option B (140 MB target) | ~140 MB |
+| Rescue ring (worst case, 600 K entries) | ~75 MB |
+| Tokio runtime + per-thread stacks (4 cores × 8 MB) | ~32 MB |
+| Misc (Prometheus client, tracing, hyper, reqwest) | ~50 MB |
+| **App total** | **~440 MB** |
+| Docker stack (QuestDB+Valkey+Prom+Grafana+Alertmanager+Traefik+exporter) | ~7.4 GB |
+| Linux kernel + journald + chrony + ssh | ~150 MB |
+| **System total on 8 GB c7i.xlarge** | **~7.99 GB** |
+
+→ ~10 MB free RAM at steady state. **TIGHT.** Mitigation:
+
+- Set `vm.overcommit_memory=2` + `vm.overcommit_ratio=80` so kernel REFUSES new allocations rather than swapping (no swap configured anyway).
+- Set cgroup `memory.high` = 7.5 GB so the app gets throttled before OOM-killer fires.
+- Configure QuestDB `shared.worker.count=2` (default 4) to drop QuestDB RSS by ~500 MB.
+
+After these tunes: ~510 MB free. Comfortable.
+
+### 18.4 Memory bug detection
+
+| Bug class | Detection | Recovery |
+|---|---|---|
+| Heap leak — Vec/Box not dropped | DHAT zero-alloc tests on hot path; `valgrind --tool=massif` weekly in CI | DHAT test failure blocks merge |
+| Fragmentation — many small allocs | jemalloc `stats.fragmentation` Prometheus gauge `tv_jemalloc_fragmentation_ratio` | Alert at >0.3; investigate via `jeprof` |
+| RSS bloat without leak — kernel page cache | `/proc/self/status:VmRSS` gauge `tv_process_rss_bytes` | Alert at 1 GB (constant `MEMORY_RSS_ALERT_MB=1024`); operator inspects |
+| OOM kill — cgroup `memory.max` exceeded | `/sys/fs/cgroup/memory.events:oom_kill` counter, scraped at boot | PROC-01 (Wave-4-E1, RESERVED) — boot-time check vs baseline |
+| OOM kill — kernel global | `dmesg \| grep -i 'killed process'` scan in `make doctor` § 7 | Operator action |
+| Swap thrashing | `vm.swappiness=0` ENFORCED at boot; if swap usage >0 fire CRITICAL | Alert `tv-swap-usage-nonzero` (NEW, follow-up) |
+| mmap exhaustion — `vm.max_map_count` | `cat /proc/<pid>/maps \| wc -l` vs limit | Alert at 80% |
+| FD exhaustion | RESOURCE-01 (Wave-4-E3, RESERVED) | n/a until shipped |
+
+**Container restart loop (PROC-02, Wave-4-E1, RESERVED):** if tickvault gets OOM-killed and Docker restarts it, the supervisor must detect `RestartCount > 5/hour` and HALT instead of looping. Restart loop = data corruption window (every restart = ~30s of missed ticks).
+
+### 18.5 Historical fetch reconsideration (operator said "even along with historical fetch")
+
+Original §17 plan: in-memory store covers **current trading day ONLY**. Historical fetch lands in `candles_*` matviews on QuestDB. SELECT-time fallback for >100 bars ago.
+
+**Operator's most recent message reopens this:** "even along with historical fetch dude okay?".
+
+Three honest options:
+
+| Option | What's in RAM | Memory cost | c7i.xlarge fit | Use case |
+|---|---|---|---|---|
+| **§17 Option B baseline** | Current day, 100 bars/TF | 140 MB | ✅ ₹3,787/mo | Live trading hot path |
+| **D — Hot day + 1d window historical** | Current day + last sealed trading day (yesterday's full bars) | ~280 MB | ✅ same instance, ₹3,787/mo | Backtest comparing today vs yesterday's open |
+| **E — Hot day + 7d window historical** | Current day + last 7 sealed trading days | ~1 GB | ✅ tight (7.5 GB system → ~480 MB free); recommend instance bump to **m7i.xlarge 1-yr RI ₹4,081/mo** | Weekly volatility regime detection |
+| **F — Hot day + 30d window historical** | Current day + last 30 sealed trading days | ~4.2 GB | ❌ does NOT fit c7i.xlarge or m7i.xlarge; needs **r7i.xlarge 1-yr RI ₹4,883/mo** (₹117 headroom) or **c7i.2xlarge 3-yr ₹4,422/mo** | Monthly regime / SEBI replay |
+| **G — mmap historical via QuestDB partition snapshots** | mmap of `historical_candles` parquet exports, OS-paged | ~50 MB resident, ~10 GB virtual | ✅ on c7i.xlarge | Selective backtest; >30d coverage |
+
+**Recommendation if operator wants historical in RAM:** Option D (last 1 day) — fits current instance, doubles in-memory hot-path coverage from "today" to "today + yesterday" at zero infrastructure cost. Anything beyond 1 day forces an instance bump or mmap.
+
+**mmap option (G) caveat:** mmap pages are NOT in RSS until accessed, so the RSS budget appears clean — but a wide SELECT touching 30 days of 1m bars (11K × 23 TFs × 30d × ~375 bars/TF = ~2.8 G rows) WILL page in and spike RSS. Mitigation: bound the SELECT range at the application layer; never allow a single backtest query to mmap >100 MB of working set.
+
+### 18.6 New ratchets §18 introduces (deferred to follow-up sub-PR)
+
+| # | Ratchet | File | Pins |
+|---|---|---|---|
+| 1 | `test_aws_instance_total_under_5k_cap` | `crates/app/tests/aws_budget_guard.rs` (NEW) | Sum of fixed (EBS+EIP+CloudWatch+SNS+S3+Data Transfer) + selected RI tier ≤ ₹5,000 |
+| 2 | `test_core_pinning_4_workers` | `crates/app/tests/core_pinning_guard.rs` | exactly 4 `WorkerKind` variants pinned (matches c7i.xlarge 4 vCPU) |
+| 3 | `test_rss_budget_total_below_8gb` | `crates/app/tests/memory_budget_guard.rs` (NEW) | sum of constants for SPSC + registry + in-mem store + rescue ring + tokio stacks ≤ 8 GB total |
+| 4 | `test_memory_rss_alert_threshold_constant` | `crates/common/src/constants.rs` ratchet | `MEMORY_RSS_ALERT_MB = 1024` pinned |
+| 5 | `test_swap_usage_zero_invariant` | `crates/app/tests/host_invariant_guard.rs` (NEW) | `/proc/swaps` parse → all sizes 0 |
+
+### 18.7 §18 status (live)
+
+| Item | Status |
+|---|---|
+| AWS instance comparison + RI pricing | ✅ |
+| Per-component core allocation | ✅ |
+| Memory worst-case scenarios + RSS budget | ✅ |
+| Memory bug detection mapping | ✅ |
+| Historical fetch reconsideration (D/E/F/G options) | ✅ |
+| Ratchets list | ✅ deferred |
+| Operator decision: instance choice (c7i.xlarge 1-yr / 3-yr / m7i.xlarge / r7i.xlarge) | ⏳ awaiting |
+| Operator decision: historical scope (B / D / E / F / G) | ⏳ awaiting |
+
+**Once operator picks the (instance, historical) tuple, §17 + §18 collapse into a single implementation contract and the 4-PR sequence (#504-507) opens.**
