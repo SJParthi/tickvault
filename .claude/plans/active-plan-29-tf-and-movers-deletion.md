@@ -549,12 +549,13 @@ Per operator charter (2026-05-04): defaults locked at maximum-guarantee-within-e
 - [x] Plan housekeeping PR (PR #467) — drop Q3 + Q4 from §15
 - [ ] Phase 2 verified — 7 trading days of populated columns + zero parser errors (gate per §6 row 2; awaiting live boot proof)
 
-### Phase 3 — in-memory engines + parity (IN PROGRESS)
+### Phase 3 — in-memory engines + parity (CODE-COMPLETE; awaiting soak)
 
 - [x] Phase 3 commit 1 PR (PR #482 — MERGED) — generic `CandleEngine<TF>` + 7 concrete TF marker types + 21 unit tests
-- [ ] Phase 3 commit 2 PR — wire `CandleEngine<Tf1s>` into `tick_processor.rs` SPSC consumer hot path (L12: only 1s engine on hot path)
-- [ ] Phase 3 commit 3 PR — 28-engine cascade SPSC plumbing (sealed 1s bars → 3s/5s/.../1mo derived engines off the hot path)
-- [ ] Phase 3 commit 4 PR — parity tests against live `candles_*` matviews (gated on 7-trading-day soak per §6 row 3)
+- [x] Phase 3 commit 2 PR (PR #484 — MERGED) — `CandleEngineMap` per-instrument lookup wrapper (papaya + per-instrument Mutex, 25K pre-sized capacity, 14 unit tests)
+- [x] Phase 3 commit 3 PR (PR #485 — MERGED) — wire `CandleEngine<Tf1s>` into the tick consumer via existing `tick_broadcast` channel; supervisor respawn loop; IST midnight rollover task; lag coalescing; 14 unit tests + 4 source-scan ratchets. Adversarial 4 HIGH fixed inline.
+- [x] Phase 3 commit 4 PR (PR #486 — MERGED) — 22 missing TF markers (Tf3s, Tf10s, Tf2m..Tf14m, Tf30m, Tf1h..Tf4h, Tf1d, Tf1w, Tf1mo) + 28-engine `CascadeFanout` + fanout-aware midnight rollover (legacy 1s-only DELETED). Adversarial 1 CRITICAL + 4 HIGH fixed inline. 7 source-scan ratchets total.
+- [ ] Phase 3 commit 5 PR — parity tests against live `candles_*` matviews (gated on 7-trading-day soak per §6 row 3)
 - [ ] Phase 3 verified — 14 trading days green-streak ratchet parity (gate per §6 row 3)
 
 ### Phase 4 — read-flip + table deletion (NOT STARTED — gated on Phase 3 verification)
@@ -568,12 +569,12 @@ Per operator charter (2026-05-04): defaults locked at maximum-guarantee-within-e
 
 - [ ] Plan archived to `.claude/plans/archive/2026-MM-DD-29-tf-movers-deletion.md`
 
-### Counts
+### Counts (refreshed 2026-05-05)
 
-- **PRs merged:** 18 (16 production + 2 plan housekeeping/prep)
+- **PRs merged:** 21 (19 production + 2 plan housekeeping/prep). Phase 3 contribution: #482 + #484 + #485 + #486.
 - **PRs in flight:** 0
-- **Adversarial findings closed inline:** 6 CRITICAL + 5 HIGH + 5 MEDIUM + L4 e2e gap (pre-impl + production-diff agent passes combined)
-- **Ratchet tests added across the plan:** ≥160 (unit + source-scan + runtime e2e + parity)
+- **Adversarial findings closed inline:** 7 CRITICAL + 13 HIGH + 8 MEDIUM + L4 e2e gap (pre-impl + production-diff agent passes combined; Phase 3 commits 3+4 added 1C + 8H + 3M)
+- **Ratchet tests added across the plan:** ≥175 (Phase 3.3 + 3.4 added 14 + 14 + 11 = 39 unit/integration + 7 source-scan)
 
 ### Gates remaining (real-world soak — physically required by §6)
 
@@ -585,4 +586,11 @@ Per operator charter (2026-05-04): defaults locked at maximum-guarantee-within-e
 
 ---
 
-**Plan status (2026-05-05):** Phase 1 + Phase 2 + 11 follow-on hardening sub-PRs + Phase 3 commit 1 (CandleEngine foundation) are MERGED to main. Phase 3 commits 2–4 + Phase 4 are pending; Phase 3 commit 4 + Phase 4 are gated on real-world soak per §6.
+**Plan status (2026-05-05 — refreshed):** Phase 1 + Phase 2 + 11 follow-on hardening sub-PRs + **Phase 3 commits 1, 2, 3, 4** are all MERGED to main. The 29-TF in-memory cascade is functionally complete: every WebSocket tick advances the 1s engine on the hot path, every sealed 1s bar fans out to all 28 derived engines (3s through 1mo), supervisor respawns the cascade on panic, IST midnight rollover seals all 29 engines atomically. Tf1d/Tf1w/Tf1mo carry explicit "calendar-approximate, NOT for trading signals" warnings (RAM is for speed; QuestDB matview is canonical truth).
+
+**Remaining work — gated on real-world soak per §6:**
+- Phase 3 commit 5: parity tests vs live `candles_*` matviews (14-day soak gate)
+- Phase 4a: read-flip + `/api/movers?v=2` (24h dual-path soak gate)
+- Phase 4b: DROP TABLE old movers + retire 7 ErrorCodes (30-day post-deploy gate)
+
+These cannot be fast-forwarded — they require physical trading days against the now-merged engine.
