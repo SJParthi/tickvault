@@ -538,8 +538,8 @@ async fn fetch_cohort_from_questdb(cfg: &PipelineConfig) -> anyhow::Result<Vec<M
 /// 1. `security_id` (LONG)
 /// 2. `exchange_segment` (SYMBOL)
 /// 3. `instrument_type` (SYMBOL)
-/// 4. `volume` (LONG)
-/// 5. `change_pct` (DOUBLE)
+/// 4. `volume_cumulative` (LONG) — last(volume) in `movers_1m`
+/// 5. `change_pct_session` (DOUBLE) — vs prev_close in `movers_1m`
 ///
 /// Rows with malformed columns are silently skipped (defensive).
 fn parse_cohort_dataset(dataset: &[serde_json::Value]) -> anyhow::Result<Vec<MoverRow>> {

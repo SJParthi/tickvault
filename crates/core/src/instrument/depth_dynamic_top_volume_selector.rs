@@ -74,7 +74,7 @@ fn parse_exchange_segment(s: &str) -> Option<ExchangeSegment> {
 }
 
 /// Defensive upper bound on Stage 1 result row count. The redesigned
-/// SQL no longer uses an `ORDER BY volume DESC LIMIT` cohort cap (per
+/// SQL no longer uses an `ORDER BY volume_cumulative DESC LIMIT` cohort cap (per
 /// operator clarification 2026-05-03 — illiquidity is the only filter,
 /// driven by `min_liquidity_volume`). This constant is now a SAFETY
 /// CAP applied via `LIMIT` only as defence-in-depth: if `min_liquidity_volume`
@@ -136,7 +136,7 @@ pub struct SelectorConfig {
 /// Stage 1 SQL builder for `movers_1m` — REDESIGNED 2026-05-03 per
 /// operator clarification.
 ///
-/// **Old design (retired):** `ORDER BY volume DESC LIMIT cohort_size`
+/// **Old design (retired):** `ORDER BY volume_cumulative DESC LIMIT cohort_size`
 /// — admitted top-N contracts by volume regardless of absolute volume,
 /// which could include illiquid contracts at rank 400-500 → slippage
 /// risk on live trade.
@@ -175,8 +175,17 @@ pub fn build_cohort_sql(
     );
 
     let mut sql = String::with_capacity(512);
+    // 2026-05-05 fix DEPTH-DYN-V2-01: use the matview's actual column
+    // names. `movers_1m` is built from `movers_1s` via SAMPLE BY and
+    // exposes `volume_cumulative` (last(volume)) + `change_pct_session`
+    // (vs prev_close), NOT `volume` + `change_pct`. The previous SELECT
+    // referenced non-existent columns and QuestDB returned 400 Bad
+    // Request on every cohort fetch, leaving the depth-200 dispatcher
+    // unable to assign SIDs → conns stayed deferred forever → reconnect
+    // storm (PR #499 caps the symptom; this fixes the root cause).
     sql.push_str(
-        "SELECT security_id, exchange_segment, instrument_type, volume, change_pct \
+        "SELECT security_id, exchange_segment, instrument_type, \
+                volume_cumulative, change_pct_session \
          FROM movers_1m WHERE ts > dateadd('s', -",
     );
     sql.push_str(&window_secs.to_string());
@@ -195,18 +204,18 @@ pub fn build_cohort_sql(
 
     // Audit-2026-05-03: liquidity gate is the primary filter. Only
     // contracts meeting min_liquidity_volume qualify for Stage 2 rank.
-    sql.push_str(" AND volume >= ");
+    sql.push_str(" AND volume_cumulative >= ");
     sql.push_str(&min_liquidity_volume.to_string());
 
     // Audit-2026-05-03 (hostile-bug-hunt H2 fix): explicit `ORDER BY
-    // volume DESC` so the defensive LIMIT below truncates LOW-liquidity
-    // rows (correct) rather than NEW rows in storage order (which would
-    // silently drop the highest-information data when min_liquidity is
-    // misconfigured low and matches > MAX_COHORT_SIZE rows). Stage 2
-    // re-ranks the kept rows by change_pct DESC anyway, so this ORDER
-    // BY only affects which rows get TRUNCATED — not the final output
-    // ordering.
-    sql.push_str(" ORDER BY volume DESC");
+    // volume_cumulative DESC` so the defensive LIMIT below truncates
+    // LOW-liquidity rows (correct) rather than NEW rows in storage
+    // order (which would silently drop the highest-information data
+    // when min_liquidity is misconfigured low and matches >
+    // MAX_COHORT_SIZE rows). Stage 2 re-ranks the kept rows by
+    // change_pct_session DESC anyway, so this ORDER BY only affects
+    // which rows get TRUNCATED — not the final output ordering.
+    sql.push_str(" ORDER BY volume_cumulative DESC");
 
     // Defensive LIMIT to bound Stage 2 sort cost in case min_liquidity
     // is misconfigured. NOT the primary filter — the WHERE clause is.
@@ -368,7 +377,7 @@ mod tests {
 
     // ---- build_cohort_sql ----
     // Audit-2026-05-03: redesigned per operator clarification.
-    // Old: ORDER BY volume DESC LIMIT cohort_size
+    // Old: ORDER BY volume_cumulative DESC LIMIT cohort_size
     // New: WHERE ... AND volume >= min_liquidity_volume LIMIT MAX_COHORT_SIZE
     // Test volume threshold of 10_000 used as a realistic floor.
 
@@ -430,23 +439,23 @@ mod tests {
     /// Audit-2026-05-03 ratchet: the redesigned SQL MUST use a min-volume
     /// liquidity gate (`AND volume >=`) as the PRIMARY filter — the
     /// legacy top-N filtering via the cohort_size parameter is retired.
-    /// (Note: `ORDER BY volume DESC` is RE-ADDED by the H2 fix to make
+    /// (Note: `ORDER BY volume_cumulative DESC` is RE-ADDED by the H2 fix to make
     /// the defensive `LIMIT 1000` truncate LOW-volume rows correctly,
     /// but it's no longer the primary mechanism — `WHERE volume >=` is.)
     #[test]
     fn test_build_cohort_sql_uses_min_volume_filter_as_primary_gate() {
         let sql = build_cohort_sql(&[], &[], 50_000, 60);
         assert!(
-            sql.contains("AND volume >= 50000"),
+            sql.contains("AND volume_cumulative >= 50000"),
             "must filter by `volume >= min_liquidity_volume`, got: {sql}"
         );
         // The WHERE clause must come BEFORE the ORDER BY (SQL syntax
         // + semantic correctness — filter first, then order/truncate).
         let where_pos = sql
-            .find("AND volume >= 50000")
+            .find("AND volume_cumulative >= 50000")
             .expect("WHERE clause missing");
         let order_pos = sql
-            .find("ORDER BY volume DESC")
+            .find("ORDER BY volume_cumulative DESC")
             .expect("ORDER BY (defensive) missing");
         assert!(
             where_pos < order_pos,
@@ -470,7 +479,7 @@ mod tests {
     }
 
     /// Audit-2026-05-03 (hostile-bug-hunt H2 fix) ratchet: SQL MUST
-    /// include `ORDER BY volume DESC` so the defensive `LIMIT 1000`
+    /// include `ORDER BY volume_cumulative DESC` so the defensive `LIMIT 1000`
     /// truncates LOW-volume rows (correct) rather than dropping NEW
     /// rows in storage order (wrong — would lose highest-information
     /// data when min_liquidity is misconfigured low).
@@ -478,12 +487,14 @@ mod tests {
     fn test_build_cohort_sql_orders_by_volume_desc_for_safe_truncation() {
         let sql = build_cohort_sql(&[], &[], TEST_MIN_VOL, 60);
         assert!(
-            sql.contains("ORDER BY volume DESC"),
-            "ORDER BY volume DESC required so LIMIT truncates LOW-volume rows \
+            sql.contains("ORDER BY volume_cumulative DESC"),
+            "ORDER BY volume_cumulative DESC required so LIMIT truncates LOW-volume rows \
              (not new rows in storage order); got: {sql}"
         );
         // Position check: ORDER BY must come BEFORE LIMIT
-        let order_pos = sql.find("ORDER BY volume DESC").expect("ORDER BY missing");
+        let order_pos = sql
+            .find("ORDER BY volume_cumulative DESC")
+            .expect("ORDER BY missing");
         let limit_pos = sql.find("LIMIT").expect("LIMIT missing");
         assert!(
             order_pos < limit_pos,
@@ -759,5 +770,40 @@ mod tests {
         let cohort: Vec<MoverRow> = Vec::new();
         let result = std::panic::catch_unwind(|| select_top_k_dynamic(&cohort, &cfg));
         assert!(result.is_err());
+    }
+
+    /// 2026-05-05 fix DEPTH-DYN-V2-01 regression: the SQL MUST select
+    /// `volume_cumulative` and `change_pct_session` (the actual
+    /// columns in `movers_1m`), not `volume` / `change_pct` which do
+    /// not exist in the matview and caused QuestDB to return 400 Bad
+    /// Request on every cohort fetch in production. Live evidence:
+    /// boot log 2026-05-05 14:04:20.085 IST.
+    #[test]
+    fn test_build_cohort_sql_uses_matview_column_names_not_base_table_names() {
+        let sql = build_cohort_sql(&[], &[], TEST_MIN_VOL, 60);
+        // Must reference the matview's actual columns
+        assert!(
+            sql.contains("volume_cumulative"),
+            "SELECT must use matview column `volume_cumulative` (last(volume) in movers_1m), got: {sql}"
+        );
+        assert!(
+            sql.contains("change_pct_session"),
+            "SELECT must use matview column `change_pct_session` (vs prev_close), got: {sql}"
+        );
+        // Must NOT reference plain `volume` or `change_pct` (those
+        // columns do not exist in `movers_1m` — the matview SAMPLE BY
+        // aggregates produce `volume_cumulative` etc.). Use word
+        // boundaries via " volume " / "volume," / "volume DESC"
+        // patterns to avoid false-matching `volume_cumulative`.
+        assert!(
+            !sql.contains(" volume ") && !sql.contains(",volume,") && !sql.contains(", volume,"),
+            "SELECT must not reference plain `volume` (use volume_cumulative); got: {sql}"
+        );
+        assert!(
+            !sql.contains("change_pct,")
+                && !sql.contains(", change_pct ")
+                && !sql.contains("change_pct\n"),
+            "SELECT must not reference plain `change_pct` (use change_pct_session); got: {sql}"
+        );
     }
 }
