@@ -21,8 +21,10 @@
 //! (parity tests against live `candles_*` matviews) is gated on the
 //! 7-day soak per plan §6.
 
+pub mod cascade;
 pub mod engine;
 pub mod engine_map;
 
+pub use cascade::{run_cascade_1s, run_midnight_rollover_task, spawn_supervised_cascade_1s};
 pub use engine::{Bar, CandleEngine, Tf1m, Tf1s, Tf5m, Tf5s, Tf15m, Tf15s, Tf30s, Timeframe};
 pub use engine_map::CandleEngineMap;

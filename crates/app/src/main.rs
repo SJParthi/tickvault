@@ -2628,6 +2628,43 @@ async fn main() -> Result<()> {
         info!("slow-boot observability consumer started");
     }
 
+    // 29-tf engine Phase 3 commit 3: spawn the 1s candle cascade
+    // consumer. Subscribes to the same tick broadcast as persistence +
+    // observability and feeds an in-memory `CandleEngineMap<Tf1s>`
+    // (per plan L12: only the 1s engine sits on the per-tick path —
+    // 28 derived engines + their rtrb SPSC arrive in commit 4).
+    //
+    // Lives entirely off the persistence hot path: the broadcast
+    // channel fans every tick to all subscribers in parallel, so a
+    // slow cascade NEVER blocks tick persistence. Lag is reported via
+    // `tv_candle_cascade_lag_total`.
+    //
+    // Three tasks form the cascade subsystem (per adversarial review):
+    // 1. Supervisor (H3 fix) — re-spawns the cascade on panic/exit.
+    // 2. Midnight rollover (L13 + H1 fix) — seals open bars at IST 00:00
+    //    so day-N state never fuses into day-(N+1)'s first bar.
+    // 3. Lag coalescing (H2 fix, in cascade.rs) — Telegram errors
+    //    rate-limited to 1 per 60s window per task lifetime.
+    let candle_engine_map_1s: std::sync::Arc<
+        tickvault_trading::candles::CandleEngineMap<tickvault_trading::candles::Tf1s>,
+    > = std::sync::Arc::new(tickvault_trading::candles::CandleEngineMap::new());
+    {
+        let supervisor_sender = tick_broadcast_sender.clone();
+        let supervisor_map = std::sync::Arc::clone(&candle_engine_map_1s);
+        tokio::spawn(async move {
+            tickvault_trading::candles::spawn_supervised_cascade_1s(
+                supervisor_sender,
+                supervisor_map,
+            )
+            .await;
+        });
+        let rollover_map = std::sync::Arc::clone(&candle_engine_map_1s);
+        tokio::spawn(async move {
+            tickvault_trading::candles::run_midnight_rollover_task(rollover_map).await;
+        });
+        info!("29-tf candle cascade 1s consumer + supervisor + midnight rollover started");
+    }
+
     // PR #450 commit 6 (2026-05-03): V2 snapshot handle DELETED.
     // The legacy /api/movers (V2) route + handler + in-memory
     // MoversTrackerV2 + V2 pipeline are gone. The new unified
