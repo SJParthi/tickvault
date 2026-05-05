@@ -63,6 +63,45 @@ fn main_rs_spawns_midnight_rollover_task() {
 }
 
 #[test]
+fn main_rs_constructs_cascade_fanout_for_28_derived_tfs() {
+    let src = read_main();
+    assert!(
+        src.contains("tickvault_trading::candles::CascadeFanout"),
+        "main.rs MUST construct the 28-TF CascadeFanout (Phase 3 commit 4) \
+         so derived engine state (3s, 5s, ..., 1mo) advances on every \
+         sealed 1s bar (per plan §2 cascade design)"
+    );
+    assert!(
+        src.contains("cascade_fanout"),
+        "main.rs MUST keep the `cascade_fanout` binding so future \
+         consumers (RAM /api/movers reader, IST midnight rollover) can \
+         clone the same fanout"
+    );
+}
+
+#[test]
+fn main_rs_passes_fanout_to_supervised_cascade() {
+    let src = read_main();
+    assert!(
+        src.contains("Some(supervisor_fanout)"),
+        "main.rs MUST pass `Some(fanout)` (not `None`) to \
+         `spawn_supervised_cascade_1s` so sealed 1s bars cascade \
+         into all 28 derived engines"
+    );
+}
+
+#[test]
+fn main_rs_uses_fanout_aware_midnight_rollover() {
+    let src = read_main();
+    assert!(
+        src.contains("run_midnight_rollover_task_with_fanout"),
+        "main.rs MUST use the fanout-aware midnight rollover \
+         (`run_midnight_rollover_task_with_fanout`) so all 28 derived \
+         engines are sealed at IST 00:00, not just the 1s engine"
+    );
+}
+
+#[test]
 fn main_rs_keeps_candle_engine_map_arc_for_future_consumers() {
     let src = read_main();
     // The Arc<CandleEngineMap<Tf1s>> binding is reused by future
