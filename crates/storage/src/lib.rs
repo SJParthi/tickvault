@@ -82,7 +82,12 @@ pub mod indicator_snapshot_persistence;
 pub mod instrument_persistence;
 pub mod materialized_views;
 pub mod movers_base_persistence;
-pub mod movers_persistence;
+// Phase 4b (2026-05-05): `movers_persistence` (StockMoversWriter +
+// OptionMoversWriter) DELETED. Both writers were retired in the
+// 2026-05-03 audit (main.rs:2728) and confirmed dormant by the
+// `movers_writer_dormant_guard` ratchet shipped in PR #493.
+// Operator-driven `DROP TABLE stock_movers, option_movers` lives
+// in `docs/runbooks/phase-4b-movers-cleanup.md` Step 1.
 pub mod movers_unified_query;
 pub mod movers_writer;
 pub mod obi_persistence;
