@@ -25,6 +25,7 @@ pub mod cascade;
 pub mod cascade_fanout;
 pub mod engine;
 pub mod engine_map;
+pub mod parity;
 
 pub use cascade::{
     run_cascade_1s, run_midnight_rollover_task_with_fanout, spawn_supervised_cascade_1s,
@@ -36,3 +37,4 @@ pub use engine::{
     Tf15s, Tf30m, Tf30s, Timeframe,
 };
 pub use engine_map::CandleEngineMap;
+pub use parity::{InstrumentKey, ParityMismatch, ParityReport, compare_bars, sweep_parity};
