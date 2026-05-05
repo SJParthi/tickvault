@@ -649,3 +649,105 @@ Per operator charter (2026-05-04): defaults locked at maximum-guarantee-within-e
 - Phase 4b: DROP TABLE old movers + retire 7 ErrorCodes (30-day post-deploy gate)
 
 These cannot be fast-forwarded — they require physical trading days against the now-merged engine.
+
+---
+
+## 17. POST-MERGE EXTENSION — Movers Deletion + Current-Day In-Memory Store (2026-05-05 operator directive)
+
+### 17.1 Sequence (4 PRs queued)
+
+| # | PR | Status | Branch / scope |
+|---|---|---|---|
+| 1 | **#503** — Expand candle matviews 18 → 28 TFs | ✅ MERGED 2026-05-05 | `materialized_views.rs` adds 3s, 4m, 6m, 7m, 8m, 9m, 11m, 12m, 13m, 14m. RAM cascade ≡ DB. 90/90 tests. |
+| 2 | **#504** — Current-day in-memory store extension to `CandleEngine<TF>` | NOT STARTED | Per §17.2 below |
+| 3 | **#505** — Rewire `/api/movers` to read from `candles_*` (replace `movers_1m` backing) | NOT STARTED | API handler swap, identical response shape |
+| 4 | **#506** — Migrate depth-dynamic cohort SQL `movers_1m → candles_1m` + rerank semantics | NOT STARTED | Selector SQL only |
+| 5 | **#507** — DELETE entire movers infra + DROP migration | NOT STARTED | `MoversWriter`, `movers_pipeline`, `movers_writer.rs`, `movers_base_persistence.rs`, `top_movers.rs`, dormant guard, all boot wiring; one-shot DROP `movers_1s` + 25 matviews + retirement marker tables |
+
+### 17.2 Current-day in-memory store (PR #504 design)
+
+**Operator demand:** "for the current live day ticks, all 11K instruments × 23 TFs (1m+) all sealed bars in memory, O(1) read, no DB hit on the live path, handle memory spikes/pressure, fit on c7i.xlarge."
+
+**Memory math (375-min trading session):**
+
+| Bucket | TFs | Bars/day | Per inst |
+|---|---|---:|---:|
+| 1m..15m | 15 | ~1,249 | 99.9 KB |
+| 30m..4h | 5 | 29 | 2.3 KB |
+| 1d/1w/1mo | 3 | 1.25 | 0.1 KB |
+| **Total** | **23** | **~1,279** | **~102 KB** |
+
+× 11,000 instruments = ~1.1 GB raw, ~1.7 GB with HashMap/Mutex overhead.
+
+**c7i.xlarge fit check:** Docker stack consumes 7.4 GB of 8 GB → **does NOT fit Option A (full retention).**
+
+### 17.3 Three options ranked
+
+| Option | RAM cost | Cost/mo | Fits c7i.xlarge? | Recommendation |
+|---|---:|---:|---|---|
+| A) Full 1,279 bars × 11K | ~1.7 GB | needs c7i.2xlarge (+₹3,500) | ❌ | Use only if budget bumps |
+| **B) Last 100 bars/TF × 11K** | **~140 MB** | ₹0 | ✅ tight | **DEFAULT** |
+| C) Top-1K liquid full + rest QuestDB | ~155 MB | ₹0 | ✅ asymmetric | Needs liquidity classifier — defer |
+
+**Default recommendation: Option B.** Strategies needing >100 bars hit `candles_*` matview (28-TF complete after PR #503).
+
+### 17.4 Architecture (Option B)
+
+```
+CandleEngine<TF> {
+    open_bar: Option<Bar>,                  // existing — WIP bar
+    sealed_today: ArrayVec<Bar, 100>,       // NEW — last 100 sealed bars
+    day_start_ts_secs: u32,                 // NEW — 09:15 IST anchor
+}
+```
+
+- **`ArrayVec<Bar, 100>`** = stack-allocated, fixed cap, zero heap allocation per (instrument, TF). Bounded at compile time.
+- **Eviction policy:** when 100 sealed bars buffered, oldest is dropped (already persisted to QuestDB by `candle_persistence.rs` write path).
+- **IST midnight rollover** (already wired PR #485): drains `sealed_today` to QuestDB queue if any unwritten, resets `Vec` + `day_start_ts_secs`.
+
+### 17.5 O(1) + uniqueness + dedup guarantees
+
+| Operation | Cost | Mechanism |
+|---|---:|---|
+| Insert sealed bar | ~50 ns | papaya pin/get → `ArrayVec::push` (compile-bounded) |
+| Read latest | ~50 ns | `arrayvec.last()` |
+| Read bar at ts | ~50 ns | `arrayvec[(ts - day_start_ts) / TF::SECS]` if within window |
+| Read last N (N ≤ 100) | ~50ns + N memcpy | slice |
+| Read >100 bars back | falls through to QuestDB | not on hot path |
+
+- **Uniqueness:** map key `(security_id, exchange_segment)` per I-P1-11
+- **Dedup:** bucket-aligned `bar_idx = (ts - day_start) / TF::SECS` deterministic; same bucket → same slot → no duplicates
+
+### 17.6 Memory pressure / spike handling
+
+| Concern | Mitigation |
+|---|---|
+| Boot spike | **Skip historical load** — start empty at 09:15 IST, fill from live ticks only |
+| Realloc spike | `ArrayVec<Bar, 100>` is stack-only, no heap growth |
+| Day rollover | IST midnight task drains + resets atomically |
+| RSS leak | `MEMORY_RSS_ALERT_MB = 1024` (PR #497) catches at 1 GB |
+| OOM | `MAX_INSTRUMENTS = 25_000` × 23 TFs × 100 bars × 80B = 4.6 GB worst case; capped well below |
+
+### 17.7 New ratchets
+
+- `test_arrayvec_sealed_today_capacity_is_100`
+- `test_bar_at_ts_returns_o1_with_arithmetic_offset`
+- `test_eviction_drops_oldest_bar_when_full`
+- `test_midnight_rollover_clears_sealed_today_atomically`
+- `test_memory_envelope_under_140mb_at_full_capacity` (proptest-style)
+
+### 17.8 Honest envelope (PR body wording)
+
+> "100% O(1) inside the in-memory hot ring. Last 100 sealed bars per (instrument, TF) live in `ArrayVec<Bar, 100>` (stack-allocated, zero heap). 11,000 × 23 × 100 bars × 80B = ~140 MB resident. >100 bars-back falls through to `candles_*` matview (now 28-TF complete after PR #503). IST midnight rollover atomically drains+resets to 0. Composite (security_id, exchange_segment) key per I-P1-11. Bounded by `MAX_INSTRUMENTS = 25_000` (= 4.6 GB worst case). Fits c7i.xlarge."
+
+### 17.9 Plan status (live)
+
+| Item | Status |
+|---|---|
+| Memory math + c7i.xlarge fit analysis | ✅ |
+| Option B architecture | ✅ |
+| 4-PR sequence ordering | ✅ |
+| Operator decision: Option A/B/C | ⏳ awaiting |
+| Operator decision: PR order (movers-deletion-first vs in-memory-first) | ⏳ awaiting |
+
+**Once operator confirms Option B + PR ordering, Phase 17.2-17.6 becomes the implementation contract.**
