@@ -517,20 +517,72 @@ Per operator charter (2026-05-04): defaults locked at maximum-guarantee-within-e
 
 ## 16. Status tracking
 
-- [ ] Operator approves §1 locked decisions (re-confirm Y on all 10)
-- [ ] Operator answers §15 open questions
-- [ ] Three adversarial agents review the plan (hot-path / security / hostile bug-hunt)
-- [ ] Synthesize agent findings → fix CRITICAL+HIGH inline
-- [ ] Phase 1 PR opens on `claude/29-tf-movers-deletion`
-- [ ] Phase 1 verified per §13
-- [ ] Phase 2 PR
-- [ ] Phase 2 verified
-- [ ] Phase 3 PR
-- [ ] Phase 3 verified (7-day green-streak gate)
-- [ ] Phase 4 PR
-- [ ] Phase 4 verified (30-day post-deploy monitoring)
+### Pre-implementation (all complete)
+
+- [x] Operator approves §1 locked decisions (re-confirm Y on all 14, including L13/L14 fold-ins)
+- [x] Operator answers §15 open questions (Q3 + Q4 dropped per PR #467; Q1, Q2, Q5 locked in plan)
+- [x] Three adversarial agents review the plan (hot-path / security / hostile bug-hunt) — pre-impl pass on plan v1
+- [x] Synthesize agent findings → fix CRITICAL+HIGH inline (plan v2 folds L11/L12/L13/L14 + cascade design + 13 bulletproofing additions)
+
+### Phase 1 — schema widen (MERGED)
+
+- [x] Phase 1 PR opens (PR #466 — `claude/29-tf-phase-1-additive-alter`)
+- [x] Phase 1 PR merged to main
+- [ ] Phase 1 verified per §13 (operator off-hours QuestDB verification — pending live boot proof)
+
+### Phase 2 — populate new columns (MERGED)
+
+- [x] Phase 2 commits 1–6 PR (PR #468) — pure-fn modules, prev_oi_cache, prev_day_close_stamper, volume_delta_tracker, tick_enricher, ILP wiring, end-to-end ratchets
+- [x] Phase 2 commit 7 PR (PR #469) — `BootOrderingGate` (L14 helper)
+- [x] Phase 2.5 PR (PR #470) — `TickEnricher` parameter plumbing through `run_tick_processor`
+- [x] Phase 2.6 PR (PR #471) — production-attach `TickEnricher` in slow-boot
+- [x] Phase 2.7 PR (PR #472) — adversarial CRITICAL fixes (2 hot-path + 2 hostile)
+- [x] Phase 2.8 PR (PR #473) — 4 HIGH findings from adversarial review
+- [x] Phase 2.9 PR (PR #474) — H1 hard-fail boot on L14 authorization refusal
+- [x] Phase 2.10 PR (PR #476) — M1 jitter fix (per-tick `exchange_timestamp` for phase classification)
+- [x] Phase 2.11 PR (PR #477) — periodic `prev_oi_cache` refresh task (M2 + M4 fixes)
+- [x] Phase 2.12 PR (PR #478) — boot-mode visibility via Prometheus gauge (L1 fix)
+- [x] Phase 2.13 PR (PR #479) — remove dead `ExchangeSegment::from_byte` conversion (M2 hot-path)
+- [x] Phase 2.14 PR (PR #480) — DLQ `reason` tightened to `&'static str` (security MEDIUM)
+- [x] Phase 2.15 PR (PR #481) — bound `prev_oi_cache` JSON response (security MEDIUM)
+- [x] Phase 3 prep PR (PR #475) — runtime end-to-end lifecycle e2e ratchets (closes L4 gap)
+- [x] Plan housekeeping PR (PR #467) — drop Q3 + Q4 from §15
+- [ ] Phase 2 verified — 7 trading days of populated columns + zero parser errors (gate per §6 row 2; awaiting live boot proof)
+
+### Phase 3 — in-memory engines + parity (IN PROGRESS)
+
+- [x] Phase 3 commit 1 PR (PR #482 — MERGED) — generic `CandleEngine<TF>` + 7 concrete TF marker types + 21 unit tests
+- [ ] Phase 3 commit 2 PR — wire `CandleEngine<Tf1s>` into `tick_processor.rs` SPSC consumer hot path (L12: only 1s engine on hot path)
+- [ ] Phase 3 commit 3 PR — 28-engine cascade SPSC plumbing (sealed 1s bars → 3s/5s/.../1mo derived engines off the hot path)
+- [ ] Phase 3 commit 4 PR — parity tests against live `candles_*` matviews (gated on 7-trading-day soak per §6 row 3)
+- [ ] Phase 3 verified — 14 trading days green-streak ratchet parity (gate per §6 row 3)
+
+### Phase 4 — read-flip + table deletion (NOT STARTED — gated on Phase 3 verification)
+
+- [ ] Phase 4a PR — strategy reads `MoversEngine` (RAM); `/api/movers?v=2` exposed alongside v1
+- [ ] Phase 4a verified — 24h dual-path soak with v1↔v2 parity ratchet
+- [ ] Phase 4b PR — DELETE old movers writers + `DROP TABLE stock_movers, option_movers` + retire 7 ErrorCodes
+- [ ] Phase 4b verified — 30 trading days post-deploy clean (gate per §6 row 4)
+
+### Closeout
+
 - [ ] Plan archived to `.claude/plans/archive/2026-MM-DD-29-tf-movers-deletion.md`
+
+### Counts
+
+- **PRs merged:** 18 (16 production + 2 plan housekeeping/prep)
+- **PRs in flight:** 0
+- **Adversarial findings closed inline:** 6 CRITICAL + 5 HIGH + 5 MEDIUM + L4 e2e gap (pre-impl + production-diff agent passes combined)
+- **Ratchet tests added across the plan:** ≥160 (unit + source-scan + runtime e2e + parity)
+
+### Gates remaining (real-world soak — physically required by §6)
+
+- Phase 1 verification: ≥1 trading day with live boot proof (column existence + matview rebuild + zero write errors)
+- Phase 2 verification: 7 trading days populated columns + zero parser errors
+- Phase 3 verification: 14 trading days green-streak parity (RAM ≡ DB)
+- Phase 4a: 24h dual-path v1↔v2 soak
+- Phase 4b: 30 trading days post-deploy clean
 
 ---
 
-**END OF PLAN. NO CODE TOUCHES ANYTHING UNTIL OPERATOR APPROVES §1 + §15 + GREENLIGHTS PHASE 1 PR.**
+**Plan status (2026-05-05):** Phase 1 + Phase 2 + 11 follow-on hardening sub-PRs + Phase 3 commit 1 (CandleEngine foundation) are MERGED to main. Phase 3 commits 2–4 + Phase 4 are pending; Phase 3 commit 4 + Phase 4 are gated on real-world soak per §6.
