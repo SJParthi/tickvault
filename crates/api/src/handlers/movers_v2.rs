@@ -170,9 +170,15 @@ pub async fn get_movers_v2(
         params.segment_code,
     );
 
+    // Live count via the per-TF len() accessor added in the Phase 4a
+    // follow-up (closes the H1 deferred work). Returns Some(N) only
+    // for known timeframes; unknown timeframe → None (omitted from
+    // JSON via `serde(skip_serializing_if = Option::is_none)`).
+    let instruments_in_ram = ram_count_for_timeframe(fanout, &params.timeframe);
+
     let response = MoversV2Response {
         timeframe: params.timeframe.clone(),
-        instruments_in_ram: None,
+        instruments_in_ram,
         bar: bar_opt.as_ref().map(MoversV2Bar::from),
         source: "phase4a-dormant-scaffold",
     };
@@ -191,6 +197,52 @@ pub async fn get_movers_v2(
             })),
         )
             .into_response(),
+    }
+}
+
+/// Pure helper — returns `Some(N)` where N is the count of
+/// `(security_id, segment_code)` pairs the cascade fanout currently
+/// holds for the requested timeframe. `None` for unknown timeframe.
+///
+/// Uses the per-TF `len_<tf>()` accessors on `CascadeFanout` (Phase
+/// 4a follow-up). Closes the H1 deferred work in PR #490 where the
+/// scaffold returned a hardcoded `None` because `pub(crate)` field
+/// visibility blocked the api crate from reaching the inner `len()`.
+pub fn ram_count_for_timeframe(
+    fanout: &tickvault_trading::candles::CascadeFanout,
+    timeframe: &str,
+) -> Option<usize> {
+    use tickvault_trading::candles::CascadeFanout;
+    match timeframe {
+        "3s" => Some(CascadeFanout::len_3s(fanout)),
+        "5s" => Some(CascadeFanout::len_5s(fanout)),
+        "10s" => Some(CascadeFanout::len_10s(fanout)),
+        "15s" => Some(CascadeFanout::len_15s(fanout)),
+        "30s" => Some(CascadeFanout::len_30s(fanout)),
+        "1m" => Some(CascadeFanout::len_1m(fanout)),
+        "2m" => Some(CascadeFanout::len_2m(fanout)),
+        "3m" => Some(CascadeFanout::len_3m(fanout)),
+        "4m" => Some(CascadeFanout::len_4m(fanout)),
+        "5m" => Some(CascadeFanout::len_5m(fanout)),
+        "6m" => Some(CascadeFanout::len_6m(fanout)),
+        "7m" => Some(CascadeFanout::len_7m(fanout)),
+        "8m" => Some(CascadeFanout::len_8m(fanout)),
+        "9m" => Some(CascadeFanout::len_9m(fanout)),
+        "10m" => Some(CascadeFanout::len_10m(fanout)),
+        "11m" => Some(CascadeFanout::len_11m(fanout)),
+        "12m" => Some(CascadeFanout::len_12m(fanout)),
+        "13m" => Some(CascadeFanout::len_13m(fanout)),
+        "14m" => Some(CascadeFanout::len_14m(fanout)),
+        "15m" => Some(CascadeFanout::len_15m(fanout)),
+        "30m" => Some(CascadeFanout::len_30m(fanout)),
+        "1h" => Some(CascadeFanout::len_1h(fanout)),
+        "2h" => Some(CascadeFanout::len_2h(fanout)),
+        "3h" => Some(CascadeFanout::len_3h(fanout)),
+        "4h" => Some(CascadeFanout::len_4h(fanout)),
+        "1d" => Some(CascadeFanout::len_1d(fanout)),
+        "1w" => Some(CascadeFanout::len_1w(fanout)),
+        "1mo" => Some(CascadeFanout::len_1mo(fanout)),
+        _ => None,
     }
 }
 
@@ -440,6 +492,39 @@ mod tests {
     fn snapshot_for_timeframe_explicit_name_match() {
         let fanout = CascadeFanout::new();
         let _ = snapshot_for_timeframe(&fanout, "1m", None, None);
+    }
+
+    #[test]
+    fn ram_count_for_timeframe_unknown_returns_none() {
+        let fanout = CascadeFanout::new();
+        assert!(ram_count_for_timeframe(&fanout, "bogus_tf").is_none());
+    }
+
+    #[test]
+    fn ram_count_for_timeframe_returns_zero_on_empty_fanout() {
+        let fanout = CascadeFanout::new();
+        assert_eq!(ram_count_for_timeframe(&fanout, "1m"), Some(0));
+        assert_eq!(ram_count_for_timeframe(&fanout, "30m"), Some(0));
+        assert_eq!(ram_count_for_timeframe(&fanout, "1d"), Some(0));
+    }
+
+    #[test]
+    fn ram_count_for_timeframe_advances_after_seed() {
+        let fanout = CascadeFanout::new();
+        let bar = make_sealed_1s_bar(1234, 1, 1_000);
+        fanout.feed_sealed_1s_bar(&bar);
+        assert_eq!(ram_count_for_timeframe(&fanout, "1m"), Some(1));
+        assert_eq!(ram_count_for_timeframe(&fanout, "1h"), Some(1));
+        // Different security_id NOT seeded → 1m count is still 1.
+        let bar2 = make_sealed_1s_bar(5678, 1, 1_000);
+        fanout.feed_sealed_1s_bar(&bar2);
+        assert_eq!(ram_count_for_timeframe(&fanout, "1m"), Some(2));
+    }
+
+    #[test]
+    fn ram_count_for_timeframe_explicit_name_match() {
+        let fanout = CascadeFanout::new();
+        let _ = ram_count_for_timeframe(&fanout, "1m");
     }
 
     #[test]
