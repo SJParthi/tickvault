@@ -79,9 +79,10 @@ Severity::High. Edge-triggered (rising edge only).
 
 **Why this fires:** universe-wide bear day where the configured exchange
 segments produce fewer than 250 contracts in the cohort window, OR the
-upstream `movers_unified_pipeline` writer is unhealthy (follow MOVERS-02
-runbook in `.claude/rules/project/wave-1-error-codes.md`). Outside market
-hours this is expected — the unified pipeline uses
+upstream `movers_unified_pipeline` writer is unhealthy. Check
+`tv_movers_writer_dropped_total` + `movers_pipeline` task logs. Phase
+4b (2026-05-05) retired the legacy MOVERS-02 runbook reference here.
+Outside market hours this is expected — the unified pipeline uses
 `is_within_market_hours_ist()` to suppress emission.
 
 **App behaviour:** the 5 dynamic depth-20 conns retain their previous
@@ -103,7 +104,8 @@ when it drops below 5 for 5+ minutes.
    These are runtime-overridable per environment.
 
 **Auto-triage safe:** YES (the next 60s cycle either recovers or the
-operator follows MOVERS-02).
+operator inspects the unified `movers_pipeline` task and `MoversWriter`
+metrics; the legacy MOVERS-02 code retired in Phase 4b).
 
 **Source:** `crates/core/src/instrument/depth_dynamic_top_volume_selector.rs`,
 `crates/app/src/depth_dynamic_pipeline_v2.rs`.

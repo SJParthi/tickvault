@@ -182,12 +182,12 @@ pub enum ErrorCode {
     PrevClose01IlpFailed,
     /// PREVCLOSE-02: first_seen_set inconsistency (reserved for future use).
     PrevClose02FirstSeenInconsistency,
-    /// MOVERS-01: stock movers persistence failed.
-    Movers01StockPersistFailed,
-    /// MOVERS-02: option movers persistence failed.
-    Movers02OptionPersistFailed,
-    /// MOVERS-03: pre-open movers snapshot persistence failed.
-    Movers03PreopenPersistFailed,
+    // Phase 4b cleanup (2026-05-05): MOVERS-01 / MOVERS-02 / MOVERS-03
+    // variants RETIRED. Their backing writers (StockMoversWriter,
+    // OptionMoversWriter) were deleted in PR #494 along with the
+    // `stock_movers` / `option_movers` table-bound persist code.
+    // Movers persistence is now exclusively `MoversWriter`
+    // (movers_1s + 25 mat views) populated by `movers_pipeline`.
     /// PREVOI-01: prev_oi cache empty at boot — `/api/movers` OI Change
     /// column will display `current_OI - 0 = current_OI` until PR #452
     /// boot orchestrator wires the bhavcopy + Option Chain prev_oi loader.
@@ -446,9 +446,7 @@ impl ErrorCode {
             Self::Phase202EmitGuardDropped => "PHASE2-02",
             Self::PrevClose01IlpFailed => "PREVCLOSE-01",
             Self::PrevClose02FirstSeenInconsistency => "PREVCLOSE-02",
-            Self::Movers01StockPersistFailed => "MOVERS-01",
-            Self::Movers02OptionPersistFailed => "MOVERS-02",
-            Self::Movers03PreopenPersistFailed => "MOVERS-03",
+            // Phase 4b cleanup (2026-05-05): MOVERS-01/02/03 retired.
             Self::PrevOi01CacheEmptyAtBoot => "PREVOI-01",
             // Wave 2
             Self::WsGap04PostCloseSleep => "WS-GAP-04",
@@ -595,9 +593,6 @@ impl ErrorCode {
             | Self::Phase201DispatchFailed
             | Self::PrevClose01IlpFailed
             | Self::PrevClose02FirstSeenInconsistency
-            | Self::Movers01StockPersistFailed
-            | Self::Movers02OptionPersistFailed
-            | Self::Movers03PreopenPersistFailed
             | Self::PrevOi01CacheEmptyAtBoot
             | Self::WsGap06TickGapSummary
             | Self::Audit01Phase2WriteFailed
@@ -669,9 +664,6 @@ impl ErrorCode {
             | Self::Phase202EmitGuardDropped
             | Self::PrevClose01IlpFailed
             | Self::PrevClose02FirstSeenInconsistency
-            | Self::Movers01StockPersistFailed
-            | Self::Movers02OptionPersistFailed
-            | Self::Movers03PreopenPersistFailed
             | Self::PrevOi01CacheEmptyAtBoot => ".claude/rules/project/wave-1-error-codes.md",
             Self::WsGap04PostCloseSleep
             | Self::WsGap05PoolRespawn
@@ -812,9 +804,6 @@ impl ErrorCode {
             Self::Phase202EmitGuardDropped,
             Self::PrevClose01IlpFailed,
             Self::PrevClose02FirstSeenInconsistency,
-            Self::Movers01StockPersistFailed,
-            Self::Movers02OptionPersistFailed,
-            Self::Movers03PreopenPersistFailed,
             Self::PrevOi01CacheEmptyAtBoot,
             Self::WsGap04PostCloseSleep,
             Self::WsGap05PoolRespawn,
@@ -1035,7 +1024,10 @@ mod tests {
         // 2026-05-03 (PR #450 commit 8b adversarial-review HIGH H1 fix):
         // bumped 94 -> 95 for PREVOI-01 (prev_oi cache empty at boot
         // WARN — typed enum replaces ad-hoc `code = "PREVOI-01"` string).
-        assert_eq!(ErrorCode::all().len(), 95);
+        // 2026-05-05 (Phase 4b cleanup): bumped 95 -> 92 — retired
+        // MOVERS-01/02/03 alongside StockMoversWriter +
+        // OptionMoversWriter deletion in PR #494.
+        assert_eq!(ErrorCode::all().len(), 92);
     }
 
     #[test]
