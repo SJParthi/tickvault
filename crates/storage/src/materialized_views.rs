@@ -510,25 +510,32 @@ pub async fn ensure_candle_views(questdb_config: &QuestDbConfig) {
     // them — Phase 1 only widens the schema.
     ensure_phase1_lifecycle_columns_on_table(&client, &base_url, QUESTDB_TABLE_CANDLES_1S).await;
 
-    // Step 4: Drop materialized views if they lack required columns.
+    // Step 4: Drop materialized views if they lack required columns OR if any
+    // expected view is missing entirely from the catalogue.
+    //
     // Views created before Greeks/Phase1 cannot be ALTERed — they must be
-    // dropped and recreated. Three probes:
+    // dropped and recreated. Four probes (any one firing → full drop+recreate):
     //   (a) `views_missing_greeks` — check candles_5s for `iv`.
     //   (b) `views_missing_phase1_columns` — check candles_5s for `phase`.
-    //   (c) `base_missing_phase1_columns` — check candles_1s itself for
-    //       `phase`. Closes the silent-ALTER gap (the brownfield ALTER
-    //       loop discards each `Result` via `drop(...)` per the established
-    //       Greeks pattern; probing only views would miss the case where
-    //       the base ALTER dropped but a previous boot's views still exist).
-    // If any probe fires, drop all 18 views so Step 5 recreates them with
-    // the wide schema.
+    //   (c) `base_missing_phase1_columns` — check candles_1s for `phase`.
+    //   (d) `any_view_missing_or_lacks_iv` (PR #505 orphan-state fix) — iterate
+    //       ALL 28 view names; if any view is absent OR exists but lacks `iv`,
+    //       force a full drop+recreate. Closes the gap where boot-1 partial
+    //       failure leaves a subset of views with iv (e.g. candles_5s) while
+    //       newer TFs (4m/6m/7m/8m/9m/11m/12m/13m/14m) are absent or
+    //       schema-mismatched. The previous probe-just-candles_5s heuristic
+    //       returned false in that state and IF NOT EXISTS subsequently failed
+    //       with "Invalid column: iv" against orphan view definitions.
+    // If any probe fires, drop all 28 views so Step 5 recreates them clean.
     if views_missing_greeks(&client, &base_url).await
         || views_missing_phase1_columns(&client, &base_url).await
         || base_missing_phase1_columns(&client, &base_url).await
+        || any_view_missing_or_lacks_iv(&client, &base_url).await
     {
         info!(
             "materialized views or candles_1s base lack Greeks / Phase 1 \
-             lifecycle columns — dropping views for recreation"
+             lifecycle columns, OR one or more of the 28 expected views is \
+             missing/orphan — dropping all views for clean recreation"
         );
         drop_all_views(&client, &base_url).await;
     }
@@ -806,6 +813,53 @@ async fn views_missing_greeks(client: &reqwest::Client, base_url: &str) -> bool 
         }
         Err(_) => false,
     }
+}
+
+/// PR #505 orphan-state probe: returns `true` if ANY of the 28 expected
+/// materialized views is absent from the QuestDB catalogue OR exists but lacks
+/// the `iv` Greeks column.
+///
+/// Closes the gap where `views_missing_greeks` (which probes only
+/// `candles_5s`) returned false even when downstream views were absent or
+/// schema-mismatched. Live evidence: 2026-05-05 boot-2 logs showed
+/// `candles_4m`, `_6m`, `_7m`, `_8m`, `_9m`, `_11m`, `_12m`, `_13m`, `_14m`
+/// fail `CREATE MATERIALIZED VIEW IF NOT EXISTS` with "Invalid column: iv"
+/// because boot-1 left orphan view definitions without `iv`. With this
+/// probe, any orphan triggers a full drop+recreate cycle in Step 4.
+///
+/// Probe strategy: `SHOW COLUMNS FROM <view>` for every view in `VIEW_DEFS`.
+///   - HTTP 200 + body contains `iv` → view OK.
+///   - HTTP 200 + body lacks `iv` → schema-mismatched orphan → return true.
+///   - HTTP non-200 (typically 400 "table does not exist") → view absent → return true.
+///   - Network error → conservative: return false so we don't loop drop+create
+///     on a flaky QuestDB.
+async fn any_view_missing_or_lacks_iv(client: &reqwest::Client, base_url: &str) -> bool {
+    for def in VIEW_DEFS {
+        // SAFETY: def.name is from compile-time constants, not user input.
+        let probe_sql = format!("SHOW COLUMNS FROM {}", def.name);
+        let response = match client
+            .get(base_url)
+            .query(&[("query", &probe_sql)])
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            // Conservative on network/transport error: DO NOT trigger drop+recreate.
+            Err(_) => return false,
+        };
+
+        if !response.status().is_success() {
+            // 400 "table does not exist" → view absent → orphan-state path.
+            return true;
+        }
+
+        let body = response.text().await.unwrap_or_default();
+        if !body.contains("iv") {
+            // View exists but lacks iv column → orphan-state path.
+            return true;
+        }
+    }
+    false
 }
 
 /// Drops all 28 materialized views in reverse dependency order.
@@ -2336,5 +2390,85 @@ mod tests {
         let client = reqwest::Client::new();
         let base_url = build_questdb_exec_url("127.0.0.1", port);
         verify_views_exist(&client, &base_url).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // PR #505 orphan-state ratchet: any_view_missing_or_lacks_iv
+    // -----------------------------------------------------------------------
+
+    /// Returns true when ANY view's SHOW COLUMNS returns HTTP 400
+    /// ("table does not exist") — orphan / absent-view path.
+    #[tokio::test]
+    async fn test_any_view_missing_or_lacks_iv_returns_true_on_400() {
+        let port = spawn_mock_http_server(MOCK_HTTP_400).await;
+        tokio::task::yield_now().await;
+        let client = reqwest::Client::new();
+        let base_url = build_questdb_exec_url("127.0.0.1", port);
+        let result = any_view_missing_or_lacks_iv(&client, &base_url).await;
+        assert!(
+            result,
+            "should return true when SHOW COLUMNS returns 400 for any view"
+        );
+    }
+
+    /// Returns true when SHOW COLUMNS succeeds but the body lacks `iv` —
+    /// schema-mismatched orphan view. This is the EXACT scenario from
+    /// the 2026-05-05 boot-2 logs (candles_4m exists in catalogue but
+    /// lacks iv).
+    #[tokio::test]
+    async fn test_any_view_missing_or_lacks_iv_returns_true_when_iv_absent() {
+        let response_without_iv = "HTTP/1.1 200 OK\r\nContent-Length: 66\r\n\r\n{\"columns\":[{\"name\":\"ts\"},{\"name\":\"security_id\"},{\"name\":\"open\"}]}";
+        let port = spawn_mock_http_server(response_without_iv).await;
+        tokio::task::yield_now().await;
+        let client = reqwest::Client::new();
+        let base_url = build_questdb_exec_url("127.0.0.1", port);
+        let result = any_view_missing_or_lacks_iv(&client, &base_url).await;
+        assert!(
+            result,
+            "should return true when any view body lacks iv column"
+        );
+    }
+
+    /// Returns false when every view's SHOW COLUMNS body contains `iv` —
+    /// healthy steady-state path (skip drop+recreate).
+    #[tokio::test]
+    async fn test_any_view_missing_or_lacks_iv_returns_false_when_all_have_iv() {
+        let response_with_iv = "HTTP/1.1 200 OK\r\nContent-Length: 81\r\n\r\n{\"columns\":[{\"name\":\"ts\"},{\"name\":\"security_id\"},{\"name\":\"iv\"},{\"name\":\"delta\"}]}";
+        let port = spawn_mock_http_server(response_with_iv).await;
+        tokio::task::yield_now().await;
+        let client = reqwest::Client::new();
+        let base_url = build_questdb_exec_url("127.0.0.1", port);
+        let result = any_view_missing_or_lacks_iv(&client, &base_url).await;
+        assert!(
+            !result,
+            "should return false when every view body contains iv"
+        );
+    }
+
+    /// Returns false on network error (conservative — avoid drop+create
+    /// loop on a flaky QuestDB).
+    #[tokio::test]
+    async fn test_any_view_missing_or_lacks_iv_returns_false_on_unreachable() {
+        let client = reqwest::Client::new();
+        let base_url = "http://127.0.0.1:1/exec";
+        let result = any_view_missing_or_lacks_iv(&client, base_url).await;
+        assert!(
+            !result,
+            "should return false on network error to avoid drop loop"
+        );
+    }
+
+    /// Source-scan ratchet: the new probe MUST be wired into Step 4 of
+    /// `ensure_candle_views`. Prevents silent regression where someone
+    /// adds the function but forgets to call it.
+    #[test]
+    fn test_any_view_missing_or_lacks_iv_is_wired_into_ensure_candle_views() {
+        let path = format!("{}/src/materialized_views.rs", env!("CARGO_MANIFEST_DIR"));
+        let source = std::fs::read_to_string(&path).expect("read self");
+        assert!(
+            source.contains("any_view_missing_or_lacks_iv(&client, &base_url).await"),
+            "PR #505: any_view_missing_or_lacks_iv must be called from \
+             ensure_candle_views Step 4 (orphan-state guard)"
+        );
     }
 }
