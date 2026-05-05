@@ -28,11 +28,19 @@ use tickvault_common::sanitize::sanitize_audit_string;
 pub const QUESTDB_TABLE_VOLUME_NSE_AUDIT: &str = "volume_nse_audit";
 
 /// DEDUP UPSERT KEY for `volume_nse_audit` — composite
-/// `(trading_date_ist, security_id, segment)` per Wave 5 plan §"Item 26
+/// `(ts, trading_date_ist, security_id, segment)` per Wave 5 plan §"Item 26
 /// L2 NSE bhavcopy — verified implementation recipe". Includes `segment`
 /// so the `dedup_segment_meta_guard.rs` meta-guard is satisfied
 /// (I-P1-11 + STORAGE-GAP-01).
-pub const DEDUP_KEY_VOLUME_NSE_AUDIT: &str = "trading_date_ist, security_id, segment";
+///
+/// 2026-05-05 fix: QuestDB requires the designated timestamp column
+/// (`ts`) to appear in `DEDUP UPSERT KEYS`. Without it, the CREATE TABLE
+/// DDL returns 400 Bad Request and the table is never created. Live
+/// evidence: boot log 2026-05-05 14:04:20.067 IST. Same pattern as
+/// every other working audit table in the workspace
+/// (`depth_rebalance_audit`, `phase2_audit`, etc.) — they all include
+/// `ts` in their DEDUP KEYS.
+pub const DEDUP_KEY_VOLUME_NSE_AUDIT: &str = "ts, trading_date_ist, security_id, segment";
 
 /// HTTP timeout for DDL probes + INSERT round-trips.
 const QUESTDB_DDL_TIMEOUT_SECS: u64 = 10;
@@ -167,6 +175,20 @@ mod tests {
         assert!(DEDUP_KEY_VOLUME_NSE_AUDIT.contains("security_id"));
         assert!(DEDUP_KEY_VOLUME_NSE_AUDIT.contains("segment"));
         assert!(DEDUP_KEY_VOLUME_NSE_AUDIT.contains("trading_date_ist"));
+    }
+
+    /// 2026-05-05 regression: QuestDB requires the designated timestamp
+    /// column (`ts`) to appear in `DEDUP UPSERT KEYS`. Without it, the
+    /// CREATE TABLE DDL returns 400 Bad Request. Live evidence: boot log
+    /// 2026-05-05 14:04:20.067 IST `DDL non-2xx — table=volume_nse_audit,
+    /// status=400 Bad Request`. Pin `ts` in the key to prevent regression.
+    #[test]
+    fn test_dedup_key_volume_nse_audit_includes_ts_per_questdb_constraint() {
+        assert!(
+            DEDUP_KEY_VOLUME_NSE_AUDIT.starts_with("ts"),
+            "QuestDB requires designated timestamp `ts` to appear in DEDUP UPSERT KEYS — \
+             without it, CREATE TABLE returns 400. Got: {DEDUP_KEY_VOLUME_NSE_AUDIT}"
+        );
     }
 
     #[test]
