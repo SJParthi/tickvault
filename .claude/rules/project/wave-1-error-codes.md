@@ -94,59 +94,6 @@ needing another rule-file edit.
 
 **Source:** `crates/core/src/pipeline/first_seen_set.rs`
 
-## MOVERS-01 — stock movers persistence failed
-
-**Trigger:** `persist_stock_movers_full_snapshot` (Wave 1 Item 2) or
-the existing `persist_stock_movers_snapshot` hit a `flush()` error.
-
-**Triage:**
-1. Check QuestDB health — ILP write requires the TCP port (default
-   9009) reachable.
-2. `select count(*) from stock_movers where ts > now() - 5m` should
-   return ≥ 540 rows (60 snapshots × 9 categories) during market
-   hours; lower means writes are failing silently.
-
-**Source:** `crates/storage/src/movers_persistence.rs::StockMoversWriter::flush`
-
-## MOVERS-02 — option movers persistence failed
-
-**Trigger:** `persist_option_movers_full_snapshot` (Wave 1 Item 3) or
-the existing `persist_option_movers_snapshot` hit an error during
-the per-snapshot write loop.
-
-**Triage:** same as MOVERS-01, but the table is `option_movers` and
-the expected row rate is much higher (~22 K contracts × 12 snapshots/min
-= ~264 K rows/min during market hours).
-
-**Source:** `crates/storage/src/movers_persistence.rs::OptionMoversWriter::flush`
-
-## MOVERS-03 — pre-open movers snapshot persistence failed
-
-**Trigger:** `PreopenMoversTracker::compute_and_persist_snapshot`
-(Wave 3 Item 10) appended a row to `StockMoversWriter` with
-`phase = "PREOPEN"` (or `"PREOPEN_UNAVAILABLE"` for SENSEX) but the
-underlying ILP append or flush failed. Severity::Medium — pre-open
-movers are observability data, not safety-critical, but a persistence
-failure during the 09:00-09:13 IST window means the audit trail for
-that morning's pre-open spread is lost.
-
-**Triage:**
-1. Check `tv_preopen_movers_persist_errors_total{stage="append"|"flush"}`
-   in Prometheus — `append` means a column rejected the value (schema
-   drift on the new `phase` column?), `flush` means the ILP TCP
-   connection dropped.
-2. `select count(*) from stock_movers where phase = 'PREOPEN' and ts > now() - 1h`
-   should be roughly `(216 stocks + 2 indices) × ceil(window_seconds / 60)`
-   on a normal day; sharp drops indicate writer failure.
-3. SENSEX `phase = 'PREOPEN_UNAVAILABLE'` rows are EXPECTED — they are
-   not errors.
-4. If the failure persists across snapshots, run `make doctor` to
-   confirm QuestDB ILP TCP port (default 9009) is reachable.
-
-**Source:**
-- `crates/core/src/pipeline/preopen_movers.rs::PreopenMoversTracker::compute_and_persist_snapshot`
-- `crates/storage/src/movers_persistence.rs::StockMoversWriter::append_stock_mover_with_phase`
-
 ## PREVOI-01 — prev_oi cache empty at boot
 
 **Trigger:** PR #450 commit 6 (2026-05-03) wires the boot-time
