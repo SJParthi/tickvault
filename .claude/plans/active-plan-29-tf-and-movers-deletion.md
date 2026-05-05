@@ -558,23 +558,27 @@ Per operator charter (2026-05-04): defaults locked at maximum-guarantee-within-e
 - [x] Phase 3 commit 5 PR (PR #488 — MERGED) — parity framework (`compare_bars` + `sweep_parity` + `ParityReport`) + 28 read accessors on `CascadeFanout` + framework-validation harness (8 always-on tests) + `make parity-soak`. Adversarial 2 HIGH + 2 MEDIUM fixed inline. NaN canonicalization, ±0.0 canonicalization, I-P1-11 layout pin, `is_clean_with_coverage` false-OK guard.
 - [ ] Phase 3 verified — 14 trading days green-streak ratchet parity (gate per §6 row 3)
 
-### Phase 4 — read-flip + table deletion (4a CODE-DORMANT; awaiting soaks)
+### Phase 4 — read-flip + table deletion (CODE-COMPLETE; awaiting operator soaks)
 
-- [x] Phase 4a PR (PR #490 — MERGED) — DORMANT `/api/movers/v2` scaffold reading from `CascadeFanout`. Three independent dormancy gates (config flag default false → `cascade_fanout: None` → route-not-registered → 503-on-bug). Adversarial 2 HIGH + 2 MEDIUM fixed inline. 13 handler unit tests + safety ratchet pinning the flag default. **Behaviour change: ZERO on a default boot.**
+- [x] Phase 4a PR (PR #490 — MERGED) — DORMANT `/api/movers/v2` scaffold reading from `CascadeFanout`. Three independent dormancy gates. 13 handler unit tests + safety ratchet. **Behaviour change: ZERO on a default boot.**
+- [x] Phase 4a follow-up (PR #492 — MERGED) — 28 per-TF `len_<tf>()` accessors closing the H1 deferred work; truthful `instruments_in_ram` count.
+- [x] Phase 4b safety net (PR #493 — MERGED) — operator runbook (`docs/runbooks/phase-4b-movers-cleanup.md`) + writer-resurrection ratchet preventing accidental re-instantiation during soak.
+- [x] Phase 4b deletion (PR #494 — MERGED) — DELETED ~4,000 LoC of dead code: `movers_persistence.rs` (StockMoversWriter + OptionMoversWriter) + 4 persist helpers in tick_processor + V2 snapshot serializer + 17 test fixture call sites + writer params from `run_tick_processor` signature. **No runtime behaviour change.**
+- [x] Phase 4b ErrorCode retirement (PR #495 — MERGED) — retired `MOVERS-01/02/03` enum variants + rule-file mentions; catalogue size 95→92.
 - [ ] Phase 4a verified — operator clears Phase 3 (14-day soak) → flips `config.api.movers_v2_enabled = true` → 24h dual-path v1↔v2 parity soak per §6 row 4
-- [ ] Phase 4b PR — DELETE old movers writers + `DROP TABLE stock_movers, option_movers` + retire 7 ErrorCodes
-- [ ] Phase 4b verified — 30 trading days post-deploy clean (gate per §6 row 4)
+- [ ] Phase 4b verified — operator runs `DROP TABLE stock_movers, option_movers` per runbook Step 1 → 30 trading days post-deploy clean (gate per §6 row 4)
 
 ### Closeout
 
 - [ ] Plan archived to `.claude/plans/archive/2026-MM-DD-29-tf-movers-deletion.md`
 
-### Counts (refreshed 2026-05-05 post-#490)
+### Counts (refreshed 2026-05-05 post-#495)
 
-- **PRs merged:** 24 (21 production + 3 plan housekeeping). Phase 3 contribution: #482 + #484 + #485 + #486 + #488. Phase 4 contribution: #490 (dormant scaffold).
+- **PRs merged:** 28 (24 production + 4 plan housekeeping/cleanup). Phase 3: #482, #484, #485, #486, #488. Phase 4: #490 (dormant scaffold), #492 (len accessors), #493 (safety net), #494 (deletion ~4K LoC), #495 (ErrorCode retirement). Tracker housekeeping: #483, #487, #489, #491, this PR.
 - **PRs in flight:** 0
-- **Adversarial findings closed inline:** 8 CRITICAL + 17 HIGH + 12 MEDIUM + L4 e2e gap (Phase 4a added 2H + 2M)
-- **Ratchet tests added across the plan:** ≥210 (Phase 4a added 13 handler + 1 safety + 1 cross-check = 15)
+- **Adversarial findings closed inline:** 8 CRITICAL + 17 HIGH + 12 MEDIUM + L4 e2e gap
+- **Ratchet tests added across the plan:** ≥215 (this PR contributes a tracker doc edit only)
+- **Net code change:** +210 LoC (Phase 4a wiring) - 4,108 LoC (Phase 4b deletion) = **~3,900 LoC less than start**
 
 ### Gates remaining (real-world soak — physically required by §6)
 
