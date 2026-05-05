@@ -536,20 +536,28 @@ pub const MIN_FREE_DISK_PERCENT: u64 = 5;
 
 /// Memory RSS threshold in MB before alerting.
 ///
-/// **2026-05-05 bump (512 → 768 MB):** the original 512 MB threshold
-/// was set before two memory-allocating commits landed:
+/// **2026-05-05 bump (512 → 1024 MB / 1 GB):** the original 512 MB
+/// threshold was set before three memory-allocating commits landed:
 /// - PR #453 bumped the tick rescue ring 600K → 2M (+150 MB).
 /// - Phase 3.4 (PR #486) added the 28-engine `CascadeFanout`
 ///   (28 papaya maps × 25K capacity ≈ +45 MB).
+/// - Phase 2 lifecycle stamping (Phase 2.x) added prev_oi_cache +
+///   prev_close_stamper (~+35 MB at full universe).
 ///
 /// Plausible steady-state footprint post-PR #494 (Phase 4b deletion):
 /// rescue ring (~224 MB) + fanout (~45 MB) + 1s engine (~3 MB) +
-/// prev_oi_cache + prev_close_stamper (~35 MB) + WS/ILP buffers
-/// (~30 MB) + tokio/tracing/binary (~100 MB) ≈ 437 MB. With the
-/// natural variance from instrument-master CSV parse + papaya
-/// rehash bursts, observed RSS lands at 550-650 MB on a healthy
-/// boot. 768 MB gives 100-200 MB headroom before paging.
-pub const MEMORY_RSS_ALERT_MB: u64 = 768;
+/// prev_oi/prev_close stampers (~35 MB) + WS/ILP buffers (~30 MB) +
+/// tokio/tracing/standard runtime (~100 MB) ≈ ~437 MB. With
+/// instrument-master CSV parse + papaya rehash bursts at boot,
+/// observed RSS lands at 550-650 MB on a healthy boot.
+///
+/// **1 GB headroom (operator directive 2026-05-05):** gives ~400 MB
+/// margin above observed steady-state for live-data growth across
+/// the full trading session (instrument churn, depth book growth,
+/// option chain refresh) without false-positive Telegram pages.
+/// Above 1 GB indicates a real leak or regression worth
+/// investigating — not normal operation.
+pub const MEMORY_RSS_ALERT_MB: u64 = 1024;
 
 /// Checks available disk space and returns the free percentage.
 ///
@@ -2173,10 +2181,11 @@ mod tests {
 
     #[test]
     fn test_memory_rss_threshold() {
-        // 2026-05-05: bumped 512 → 768 to give 100-200 MB headroom
-        // post tick-rescue-ring expansion (PR #453) + CascadeFanout
-        // (PR #486). See `MEMORY_RSS_ALERT_MB` docstring.
-        assert_eq!(super::MEMORY_RSS_ALERT_MB, 768);
+        // 2026-05-05: bumped 512 → 1024 MB (1 GB) per operator
+        // directive. Gives ~400 MB margin above observed steady-state
+        // (~550-650 MB) for live-session growth. See
+        // `MEMORY_RSS_ALERT_MB` docstring for the footprint table.
+        assert_eq!(super::MEMORY_RSS_ALERT_MB, 1024);
     }
 
     #[test]
