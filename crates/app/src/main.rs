@@ -2648,21 +2648,38 @@ async fn main() -> Result<()> {
     let candle_engine_map_1s: std::sync::Arc<
         tickvault_trading::candles::CandleEngineMap<tickvault_trading::candles::Tf1s>,
     > = std::sync::Arc::new(tickvault_trading::candles::CandleEngineMap::new());
+    // Phase 3 commit 4: 28-TF cascade fanout. Built once at boot, cloned
+    // into every consumer. Trading bot reads RAM directly via
+    // `cascade_fanout.tf<n>m.latest(security_id, segment_code)`.
+    let cascade_fanout: tickvault_trading::candles::CascadeFanout =
+        tickvault_trading::candles::CascadeFanout::new();
     {
         let supervisor_sender = tick_broadcast_sender.clone();
         let supervisor_map = std::sync::Arc::clone(&candle_engine_map_1s);
+        let supervisor_fanout = cascade_fanout.clone();
         tokio::spawn(async move {
             tickvault_trading::candles::spawn_supervised_cascade_1s(
                 supervisor_sender,
                 supervisor_map,
+                Some(supervisor_fanout),
             )
             .await;
         });
         let rollover_map = std::sync::Arc::clone(&candle_engine_map_1s);
+        let rollover_fanout = cascade_fanout.clone();
         tokio::spawn(async move {
-            tickvault_trading::candles::run_midnight_rollover_task(rollover_map).await;
+            // L13: seal both the 1s engine map AND every derived
+            // fanout engine at IST midnight so day-N state never
+            // fuses into day-(N+1)'s first bar across the 29-TF set.
+            tickvault_trading::candles::run_midnight_rollover_task_with_fanout(
+                rollover_map,
+                Some(rollover_fanout),
+            )
+            .await;
         });
-        info!("29-tf candle cascade 1s consumer + supervisor + midnight rollover started");
+        info!(
+            "29-tf candle cascade started: 1s engine + 28-TF fanout + supervisor + midnight rollover"
+        );
     }
 
     // PR #450 commit 6 (2026-05-03): V2 snapshot handle DELETED.
