@@ -9,6 +9,7 @@ const QUESTDB_HTTP_CLIENT_TIMEOUT_SECS: u64 = 10;
 use tickvault_common::config::{DhanConfig, InstrumentConfig, QuestDbConfig};
 use tickvault_common::instrument_types::IndexConstituencyMap;
 use tickvault_core::pipeline::top_movers::SharedTopMoversSnapshot;
+use tickvault_trading::candles::CascadeFanout;
 
 /// Shared handle to the index constituency map (Arc<RwLock<Option<...>>>).
 pub type SharedConstituencyMap = Arc<RwLock<Option<IndexConstituencyMap>>>;
@@ -272,6 +273,13 @@ struct AppStateInner {
     /// Shared HTTP client for QuestDB queries (connection pooling + keep-alive).
     /// Reused across all handler invocations instead of creating per-request.
     questdb_http_client: reqwest::Client,
+    /// Phase 4a (2026-05-05) — DORMANT BY DEFAULT. The 29-TF in-RAM
+    /// `CascadeFanout` handle, set by main.rs ONLY when
+    /// `config.api.movers_v2_enabled == true`. When `None`, the
+    /// `/api/movers?v=2` route is NOT registered (route gating
+    /// happens in `lib.rs`). When `Some`, the v2 handler reads OHLCV
+    /// from RAM via the 28 read accessors per active-plan §6 row 3.
+    cascade_fanout: Option<Arc<CascadeFanout>>,
 }
 
 impl SharedAppState {
@@ -303,8 +311,62 @@ impl SharedAppState {
                 constituency_map,
                 health_status,
                 questdb_http_client,
+                cascade_fanout: None,
             }),
         }
+    }
+
+    /// Phase 4a constructor — variant of `new()` that ALSO installs
+    /// the 29-TF `CascadeFanout` handle so the dormant
+    /// `/api/movers?v=2` handler can read OHLCV from RAM instead of
+    /// QuestDB matviews. Called by main.rs ONLY when
+    /// `config.api.movers_v2_enabled == true`. When the flag is
+    /// `false`, the regular `new()` is used and `cascade_fanout()`
+    /// returns `None`, which causes `lib.rs` to skip the v2 route
+    /// registration entirely.
+    // 7 args matches the existing `new()` plus the Phase 4a
+    // optional CascadeFanout. Refactoring into a builder would
+    // require touching every call site; the symmetry between
+    // `new()` and `new_with_cascade_fanout()` keeps the boot wiring
+    // legible.
+    // APPROVED: parallels `new()` arg shape; builder rewrite blocked on Phase 4b cleanup.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_cascade_fanout(
+        questdb_config: QuestDbConfig,
+        dhan_config: DhanConfig,
+        instrument_config: InstrumentConfig,
+        top_movers_snapshot: SharedTopMoversSnapshot,
+        constituency_map: SharedConstituencyMap,
+        health_status: SharedHealthStatus,
+        cascade_fanout: Arc<CascadeFanout>,
+    ) -> Self {
+        let questdb_http_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(
+                QUESTDB_HTTP_CLIENT_TIMEOUT_SECS,
+            ))
+            .pool_max_idle_per_host(4)
+            .build()
+            .unwrap_or_default();
+        Self {
+            inner: Arc::new(AppStateInner {
+                questdb_config,
+                dhan_config,
+                instrument_config,
+                rebuild_in_progress: AtomicBool::new(false),
+                top_movers_snapshot,
+                constituency_map,
+                health_status,
+                questdb_http_client,
+                cascade_fanout: Some(cascade_fanout),
+            }),
+        }
+    }
+
+    /// Returns the 29-TF `CascadeFanout` handle if Phase 4a is
+    /// enabled. Used by the v2 movers handler + by `lib.rs` to gate
+    /// route registration.
+    pub fn cascade_fanout(&self) -> Option<&Arc<CascadeFanout>> {
+        self.inner.cascade_fanout.as_ref()
     }
 
     // PR #450 commit 6 (2026-05-03): with_movers_snapshot_v2 builder

@@ -640,6 +640,7 @@ async fn run_trading_pipeline(
                             .increment(skipped);
                         if skipped >= TRADING_PIPELINE_LAG_ERROR_THRESHOLD {
                             error!(
+                                code = tickvault_common::error_code::ErrorCode::OmsGapReconciliation.code_str(),
                                 skipped,
                                 threshold = TRADING_PIPELINE_LAG_ERROR_THRESHOLD,
                                 "OMS-GAP-02: order update receiver SEVERE lag — \
