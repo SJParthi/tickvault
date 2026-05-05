@@ -427,6 +427,102 @@ impl CascadeFanout {
         self.tf1mo.latest(security_id, segment_code)
     }
 
+    // ────────────────────────────────────────────────────────────────
+    // Per-TF len() accessors — Phase 4a follow-up (closes the H1 fix
+    // deferred in PR #490). Each method returns the count of
+    // `(security_id, segment_code)` pairs currently held in the
+    // corresponding derived engine map. Used by the live parity
+    // runner + the v2 movers endpoint to surface a truthful
+    // "instruments_in_ram" count instead of a hardcoded zero.
+    //
+    // O(1) per call (papaya `len()` is lock-free), 28 named methods.
+    // ────────────────────────────────────────────────────────────────
+
+    pub fn len_3s(&self) -> usize {
+        self.tf3s.len()
+    }
+    pub fn len_5s(&self) -> usize {
+        self.tf5s.len()
+    }
+    pub fn len_10s(&self) -> usize {
+        self.tf10s.len()
+    }
+    pub fn len_15s(&self) -> usize {
+        self.tf15s.len()
+    }
+    pub fn len_30s(&self) -> usize {
+        self.tf30s.len()
+    }
+    pub fn len_1m(&self) -> usize {
+        self.tf1m.len()
+    }
+    pub fn len_2m(&self) -> usize {
+        self.tf2m.len()
+    }
+    pub fn len_3m(&self) -> usize {
+        self.tf3m.len()
+    }
+    pub fn len_4m(&self) -> usize {
+        self.tf4m.len()
+    }
+    pub fn len_5m(&self) -> usize {
+        self.tf5m.len()
+    }
+    pub fn len_6m(&self) -> usize {
+        self.tf6m.len()
+    }
+    pub fn len_7m(&self) -> usize {
+        self.tf7m.len()
+    }
+    pub fn len_8m(&self) -> usize {
+        self.tf8m.len()
+    }
+    pub fn len_9m(&self) -> usize {
+        self.tf9m.len()
+    }
+    pub fn len_10m(&self) -> usize {
+        self.tf10m.len()
+    }
+    pub fn len_11m(&self) -> usize {
+        self.tf11m.len()
+    }
+    pub fn len_12m(&self) -> usize {
+        self.tf12m.len()
+    }
+    pub fn len_13m(&self) -> usize {
+        self.tf13m.len()
+    }
+    pub fn len_14m(&self) -> usize {
+        self.tf14m.len()
+    }
+    pub fn len_15m(&self) -> usize {
+        self.tf15m.len()
+    }
+    pub fn len_30m(&self) -> usize {
+        self.tf30m.len()
+    }
+    pub fn len_1h(&self) -> usize {
+        self.tf1h.len()
+    }
+    pub fn len_2h(&self) -> usize {
+        self.tf2h.len()
+    }
+    pub fn len_3h(&self) -> usize {
+        self.tf3h.len()
+    }
+    pub fn len_4h(&self) -> usize {
+        self.tf4h.len()
+    }
+    pub fn len_1d(&self) -> usize {
+        self.tf1d.len()
+    }
+    pub fn len_1w(&self) -> usize {
+        self.tf1w.len()
+    }
+    pub fn len_1mo(&self) -> usize {
+        self.tf1mo.len()
+    }
+
     /// Forces every derived engine in every map to seal its open bar.
     /// Used at IST midnight rollover (per L13). Returns the total
     /// count of bars that were sealed across all 28 derived engines.
@@ -623,6 +719,63 @@ mod tests {
     fn force_seal_all_explicit_name_match() {
         let fanout = CascadeFanout::new();
         let _ = fanout.force_seal_all();
+    }
+
+    #[test]
+    fn len_accessors_return_zero_on_empty_fanout() {
+        let fanout = CascadeFanout::new();
+        assert_eq!(fanout.len_3s(), 0);
+        assert_eq!(fanout.len_5s(), 0);
+        assert_eq!(fanout.len_30s(), 0);
+        assert_eq!(fanout.len_1m(), 0);
+        assert_eq!(fanout.len_30m(), 0);
+        assert_eq!(fanout.len_1h(), 0);
+        assert_eq!(fanout.len_4h(), 0);
+        assert_eq!(fanout.len_1d(), 0);
+        assert_eq!(fanout.len_1w(), 0);
+        assert_eq!(fanout.len_1mo(), 0);
+    }
+
+    #[test]
+    fn len_accessors_advance_after_feed_sealed_1s_bar() {
+        // After ONE sealed 1s bar fed for ONE instrument, every
+        // derived engine map holds exactly 1 entry.
+        let fanout = CascadeFanout::new();
+        let bar = make_sealed_1s_bar(1234, 1, 1_000);
+        fanout.feed_sealed_1s_bar(&bar);
+        // Spot-check across the second / minute / hour / day / month spectrum.
+        assert_eq!(fanout.len_3s(), 1);
+        assert_eq!(fanout.len_30s(), 1);
+        assert_eq!(fanout.len_1m(), 1);
+        assert_eq!(fanout.len_30m(), 1);
+        assert_eq!(fanout.len_1h(), 1);
+        assert_eq!(fanout.len_1d(), 1);
+        assert_eq!(fanout.len_1mo(), 1);
+    }
+
+    #[test]
+    fn len_accessors_isolate_cross_segment_collisions_per_i_p1_11() {
+        // Same security_id, different segment → 2 distinct entries
+        // in every derived engine map.
+        let fanout = CascadeFanout::new();
+        let bar_seg0 = make_sealed_1s_bar(27, 0, 1_000);
+        let bar_seg1 = make_sealed_1s_bar(27, 1, 1_000);
+        fanout.feed_sealed_1s_bar(&bar_seg0);
+        fanout.feed_sealed_1s_bar(&bar_seg1);
+        assert_eq!(fanout.len_1m(), 2, "I-P1-11 isolation broken on len_1m");
+        assert_eq!(fanout.len_30m(), 2, "I-P1-11 isolation broken on len_30m");
+    }
+
+    #[test]
+    fn len_accessor_explicit_name_match_3s() {
+        let f = CascadeFanout::new();
+        let _ = f.len_3s();
+    }
+
+    #[test]
+    fn len_accessor_explicit_name_match_1mo() {
+        let f = CascadeFanout::new();
+        let _ = f.len_1mo();
     }
 
     /// Phase 3 commit 5: assert every TF read accessor returns Some(bar)
