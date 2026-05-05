@@ -14,6 +14,7 @@
 //! Trading engine: O(1) indicators, FSM strategies, OMS, Greeks, and risk controls.
 //!
 //! # Modules
+//! - `candles` — In-memory `CandleEngine<TF>` (29-timeframes plan, Phase 3)
 //! - `greeks` — Options Greeks engine: Black-Scholes, IV solver, PCR, Buildup classification
 //! - `indicator` — O(1) per-tick indicator engine (EMA, RSI, MACD, ATR, Bollinger, etc.)
 //! - `strategy` — FSM-based strategy evaluator with declarative conditions
@@ -23,6 +24,7 @@
 //! # Pipeline Position
 //! ParsedTick → **IndicatorEngine → GreeksEngine → StrategyEvaluator** → OMS → Risk → Execute → Persist
 
+pub mod candles;
 pub mod greeks;
 pub mod indicator;
 pub mod oms;
