@@ -842,11 +842,36 @@ pub struct ApiConfig {
     /// `xdg-open`/`open` shell-out only adds noise to the logs.
     #[serde(default = "default_auto_open_portal")]
     pub auto_open_portal: bool,
+
+    /// **Phase 4a (2026-05-05) — DORMANT BY DEFAULT.** When `true`,
+    /// expose `/api/movers?v=2` reading OHLCV from the in-RAM
+    /// 29-TF `CascadeFanout` instead of the QuestDB `stock_movers` /
+    /// `option_movers` tables.
+    ///
+    /// **MUST stay `false`** until the operator has cleared the
+    /// 14-trading-day live RAM≡DB parity soak per active-plan §6
+    /// row 3. Flipping this on prematurely means serving users
+    /// unverified candle data.
+    ///
+    /// The default is `false` so the v2 route is NOT registered at
+    /// startup unless the operator has explicitly enabled it. Phase
+    /// 4b deletes the v1 movers tables only AFTER 30 trading days of
+    /// post-deploy clean operation per §6 row 4.
+    #[serde(default = "default_movers_v2_enabled")]
+    pub movers_v2_enabled: bool,
 }
 
 // TEST-EXEMPT: trivial serde default returning the constant true; covered indirectly by portal_auto_open_flag_guard.rs.
 pub fn default_auto_open_portal() -> bool {
     true
+}
+
+/// Phase 4a default — `false` so the dormant `/api/movers?v=2`
+/// route stays UNREGISTERED until the operator clears the 14-day
+/// soak gate per active-plan §6 row 3. Pinned by
+/// `test_default_movers_v2_enabled_is_false_for_safety`.
+pub fn default_movers_v2_enabled() -> bool {
+    false
 }
 
 fn default_allowed_origins() -> Vec<String> {
@@ -1714,6 +1739,7 @@ mod tests {
                 port: 3001,
                 allowed_origins: default_allowed_origins(),
                 auto_open_portal: default_auto_open_portal(),
+                movers_v2_enabled: default_movers_v2_enabled(),
             },
             subscription: SubscriptionConfig::default(),
             notification: NotificationConfig::default(),
@@ -3044,5 +3070,20 @@ mod tests {
             ..DepthDynamicConfig::default()
         };
         assert!(cfg.under_provisioned_warning("depth_20", 5).is_none());
+    }
+
+    /// Phase 4a (active-plan §6 row 3) — the v2 movers endpoint MUST
+    /// stay dormant by default. Flipping it to `true` without the
+    /// 14-day RAM≡DB parity soak first means serving users
+    /// unverified candle data. This ratchet pins the default at
+    /// `false` so a future config refactor cannot silently flip it.
+    #[test]
+    fn test_default_movers_v2_enabled_is_false_for_safety() {
+        assert!(
+            !default_movers_v2_enabled(),
+            "movers_v2_enabled MUST default to false until the 14-day \
+             RAM=DB parity soak per active-plan §6 row 3 has been \
+             cleared by the operator"
+        );
     }
 }

@@ -7035,14 +7035,48 @@ async fn main() -> Result<()> {
     // -----------------------------------------------------------------------
     // Step 11: Start axum API server
     // -----------------------------------------------------------------------
-    let api_state = SharedAppState::new(
-        config.questdb.clone(),
-        config.dhan.clone(),
-        config.instrument.clone(),
-        shared_movers.clone(),
-        shared_constituency.clone(),
-        health_status,
-    );
+    // Phase 4a (2026-05-05) — DORMANT BY DEFAULT (active-plan §6 row 3).
+    // When `config.api.movers_v2_enabled` is `true` AND the cascade
+    // fanout was constructed earlier in slow-boot, install the fanout
+    // handle on AppState so the v2 movers route can be registered by
+    // `build_router_with_auth`. Default flag is `false`, so this branch
+    // is normally skipped and the v2 endpoint stays unregistered.
+    let api_state = if config.api.movers_v2_enabled {
+        // Hostile review M1 fix (2026-05-05): elevated to `warn!` so
+        // the operator sees an explicit signal in the audit trail
+        // every time the dormant flag is flipped on. `error!` would
+        // page Telegram on every boot which is too aggressive for a
+        // valid operator-driven flag flip; `warn!` strikes the right
+        // balance — visible in errors.log + summary.md but does not
+        // route to Telegram unless coalesced.
+        warn!(
+            phase4a_movers_v2_enabled = true,
+            "Phase 4a movers_v2_enabled = true — installing CascadeFanout \
+             on AppState. The /api/movers/v2 route will be registered. \
+             Operator MUST have cleared the 14-day RAM=DB parity soak \
+             (active-plan §6 row 3) before flipping this flag. If you \
+             see this without having cleared the soak gate, set \
+             config.api.movers_v2_enabled = false and restart."
+        );
+        SharedAppState::new_with_cascade_fanout(
+            config.questdb.clone(),
+            config.dhan.clone(),
+            config.instrument.clone(),
+            shared_movers.clone(),
+            shared_constituency.clone(),
+            health_status,
+            std::sync::Arc::new(cascade_fanout.clone()),
+        )
+    } else {
+        SharedAppState::new(
+            config.questdb.clone(),
+            config.dhan.clone(),
+            config.instrument.clone(),
+            shared_movers.clone(),
+            shared_constituency.clone(),
+            health_status,
+        )
+    };
 
     // PR #450 commit 6 (2026-05-03): V2 snapshot api_state plumbing
     // DELETED. The new unified /api/movers handler reads QuestDB

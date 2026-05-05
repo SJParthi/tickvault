@@ -219,8 +219,28 @@ pub fn build_router_with_auth(
             axum::routing::get(handlers::debug::spill_status),
         );
 
-    public_routes
-        .merge(protected_routes)
+    // Phase 4a (2026-05-05) — DORMANT BY DEFAULT.
+    // Register `/api/movers/v2` ONLY when AppState was constructed via
+    // `new_with_cascade_fanout()` AND `config.api.movers_v2_enabled` was
+    // `true` at boot. With the default config flag (false), main.rs
+    // calls the regular `new()` constructor → `cascade_fanout()` returns
+    // `None` → the v2 route is NOT registered → the route does not
+    // exist on the running server (404 instead of any response).
+    //
+    // We use a separate `/api/movers/v2` path rather than a `?v=2` query
+    // parameter on `/api/movers` because axum routes by path not query;
+    // mounting v2 alongside v1 keeps both reachable for the 24h dual-path
+    // soak per active-plan §6 row 4.
+    let routes = public_routes.merge(protected_routes);
+    let routes = if state.cascade_fanout().is_some() {
+        routes.route(
+            "/api/movers/v2",
+            axum::routing::get(handlers::movers_v2::get_movers_v2),
+        )
+    } else {
+        routes
+    };
+    routes
         .layer(axum::middleware::from_fn(request_tracing))
         .layer(cors)
         .with_state(state)

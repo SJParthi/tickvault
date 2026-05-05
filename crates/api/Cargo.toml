@@ -9,6 +9,12 @@ license.workspace = true
 tickvault-common = { path = "../common" }
 tickvault-core = { path = "../core" }
 tickvault-storage = { path = "../storage" }
+# Phase 4a (2026-05-05): the dormant /api/movers?v=2 handler reads
+# OHLCV from the in-RAM 29-TF CascadeFanout which lives in
+# tickvault-trading. Promoted from [dev-dependencies] to
+# [dependencies] for production wiring. The actual route + handler
+# stays gated behind config.api.movers_v2_enabled (default false).
+tickvault-trading = { path = "../trading" }
 tokio = { workspace = true }
 axum = { workspace = true }
 tower = { workspace = true }
@@ -31,7 +37,6 @@ secrecy = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
-tickvault-trading = { path = "../trading" }
 
 [package.metadata.cargo-machete]
 ignored = ["anyhow", "chrono", "tickvault-storage", "thiserror", "tower"]
