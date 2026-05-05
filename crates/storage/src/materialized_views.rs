@@ -1,6 +1,6 @@
 //! QuestDB materialized views for multi-timeframe candle aggregation.
 //!
-//! Creates the `candles_1s` base table and 18 materialized views covering
+//! Creates the `candles_1s` base table and 28 materialized views covering
 //! timeframes from 5 seconds to 1 month. Live WebSocket data arrives as IST
 //! epoch seconds (stored directly). Historical REST data arrives as UTC epoch
 //! seconds (+19800s offset applied at persistence). Both result in IST-based
@@ -122,18 +122,31 @@ struct ViewDef {
     align_offset: &'static str,
 }
 
-/// All 18 materialized views ordered by dependency chain.
+/// All 28 materialized views ordered by dependency chain.
 ///
 /// Each view aggregates from its `source` — the dependency chain is:
-/// candles_1s → 5s,10s,15s,30s,1m
-/// candles_1m → 2m,3m,5m
+/// candles_1s → 3s,5s,10s,15s,30s,1m
+/// candles_1m → 2m,3m,4m,5m,6m,7m,8m,9m,11m,12m,13m,14m
 /// candles_5m → 10m,15m
 /// candles_15m → 30m
 /// candles_1s → 1h (direct — '00:15' offset requires the physical base table)
 /// candles_30m → 2h,3h,4h,1d
 /// candles_1d → 7d,1M
+///
+/// 2026-05-05 expansion: added 10 missing TFs so the QuestDB matview set
+/// matches the in-RAM 28-TF `CascadeFanout` exactly (per operator
+/// directive: "1s, 3s, 5s, 10s, 15s, 30s, 1 minute till 15 minute
+/// sequentially, 30m, 1h, 2h, 3h, 4h, 1d, 1w, 1mo"). Added: 3s, 4m, 6m,
+/// 7m, 8m, 9m, 11m, 12m, 13m, 14m = 10 new derived matviews.
 const VIEW_DEFS: &[ViewDef] = &[
     // Sub-minute from 1s base
+    ViewDef {
+        name: "candles_3s",
+        source: "candles_1s",
+        interval: "3s",
+        has_tick_count: true,
+        align_offset: QUESTDB_IST_ALIGN_OFFSET,
+    },
     ViewDef {
         name: "candles_5s",
         source: "candles_1s",
@@ -185,9 +198,72 @@ const VIEW_DEFS: &[ViewDef] = &[
         align_offset: QUESTDB_IST_ALIGN_OFFSET,
     },
     ViewDef {
+        name: "candles_4m",
+        source: "candles_1m",
+        interval: "4m",
+        has_tick_count: false,
+        align_offset: QUESTDB_IST_ALIGN_OFFSET,
+    },
+    ViewDef {
         name: "candles_5m",
         source: "candles_1m",
         interval: "5m",
+        has_tick_count: false,
+        align_offset: QUESTDB_IST_ALIGN_OFFSET,
+    },
+    ViewDef {
+        name: "candles_6m",
+        source: "candles_1m",
+        interval: "6m",
+        has_tick_count: false,
+        align_offset: QUESTDB_IST_ALIGN_OFFSET,
+    },
+    ViewDef {
+        name: "candles_7m",
+        source: "candles_1m",
+        interval: "7m",
+        has_tick_count: false,
+        align_offset: QUESTDB_IST_ALIGN_OFFSET,
+    },
+    ViewDef {
+        name: "candles_8m",
+        source: "candles_1m",
+        interval: "8m",
+        has_tick_count: false,
+        align_offset: QUESTDB_IST_ALIGN_OFFSET,
+    },
+    ViewDef {
+        name: "candles_9m",
+        source: "candles_1m",
+        interval: "9m",
+        has_tick_count: false,
+        align_offset: QUESTDB_IST_ALIGN_OFFSET,
+    },
+    ViewDef {
+        name: "candles_11m",
+        source: "candles_1m",
+        interval: "11m",
+        has_tick_count: false,
+        align_offset: QUESTDB_IST_ALIGN_OFFSET,
+    },
+    ViewDef {
+        name: "candles_12m",
+        source: "candles_1m",
+        interval: "12m",
+        has_tick_count: false,
+        align_offset: QUESTDB_IST_ALIGN_OFFSET,
+    },
+    ViewDef {
+        name: "candles_13m",
+        source: "candles_1m",
+        interval: "13m",
+        has_tick_count: false,
+        align_offset: QUESTDB_IST_ALIGN_OFFSET,
+    },
+    ViewDef {
+        name: "candles_14m",
+        source: "candles_1m",
+        interval: "14m",
         has_tick_count: false,
         align_offset: QUESTDB_IST_ALIGN_OFFSET,
     },
@@ -380,7 +456,7 @@ fn build_view_sql(def: &ViewDef) -> String {
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Creates the `candles_1s` base table and all 18 materialized views.
+/// Creates the `candles_1s` base table and all 28 materialized views.
 ///
 /// Idempotent — safe to call every startup. Logs warnings on failure
 /// and continues (best-effort). QuestDB must be reachable for views
@@ -732,7 +808,7 @@ async fn views_missing_greeks(client: &reqwest::Client, base_url: &str) -> bool 
     }
 }
 
-/// Drops all 18 materialized views in reverse dependency order.
+/// Drops all 28 materialized views in reverse dependency order.
 ///
 /// Reverse order ensures child views are dropped before their parents.
 /// `DROP MATERIALIZED VIEW IF EXISTS` is idempotent.
@@ -751,7 +827,7 @@ async fn drop_all_views(client: &reqwest::Client, base_url: &str) {
             "dropped materialized view for Greeks migration"
         );
     }
-    info!("all 18 materialized views dropped for Greeks migration");
+    info!("all 28 materialized views dropped for Greeks migration");
 }
 
 /// Names of the hourly-chain views that must be rebuilt together when
@@ -986,11 +1062,64 @@ mod tests {
     }
 
     #[test]
-    fn view_defs_has_18_views() {
+    fn view_defs_has_28_views() {
         assert_eq!(
             VIEW_DEFS.len(),
-            18,
-            "must have 18 materialized views (5s through 1M)"
+            28,
+            "must have 28 materialized views matching the 28-TF in-RAM CascadeFanout: \
+             3s/5s/10s/15s/30s + 1m..15m + 30m/1h/2h/3h/4h + 1d/7d/1M"
+        );
+    }
+
+    /// 2026-05-05 ratchet: pin every one of the 28 specific TF names so a
+    /// future regression dropping any single one fails the build. The 28
+    /// names mirror the in-RAM `CascadeFanout` engines exactly per the
+    /// operator directive ("1s, 3s, 5s, 10s, 15s, 30s then starting 1
+    /// minute till 15 minute sequentially incrementing it as one so 1
+    /// till 15 right then 30m and 1h, 2h, 3h, 4h, 1d, 1w, 1month").
+    #[test]
+    fn view_defs_covers_all_28_tfs_matching_ram_cascade_fanout() {
+        let names: Vec<&str> = VIEW_DEFS.iter().map(|v| v.name).collect();
+        let expected = [
+            "candles_3s",
+            "candles_5s",
+            "candles_10s",
+            "candles_15s",
+            "candles_30s",
+            "candles_1m",
+            "candles_2m",
+            "candles_3m",
+            "candles_4m",
+            "candles_5m",
+            "candles_6m",
+            "candles_7m",
+            "candles_8m",
+            "candles_9m",
+            "candles_10m",
+            "candles_11m",
+            "candles_12m",
+            "candles_13m",
+            "candles_14m",
+            "candles_15m",
+            "candles_30m",
+            "candles_1h",
+            "candles_2h",
+            "candles_3h",
+            "candles_4h",
+            "candles_1d",
+            "candles_7d",
+            "candles_1M",
+        ];
+        for tf in expected {
+            assert!(
+                names.contains(&tf),
+                "missing matview {tf} (must mirror CascadeFanout 28-TF set); current: {names:?}"
+            );
+        }
+        assert_eq!(
+            names.len(),
+            expected.len(),
+            "view count drifted from the 28-TF set"
         );
     }
 
@@ -1012,7 +1141,11 @@ mod tests {
     #[test]
     fn build_view_sql_includes_ist_offset() {
         // IST-as-UTC data: offset '00:00' since midnight "UTC" IS midnight IST.
-        let def = &VIEW_DEFS[0]; // candles_5s
+        // Lookup by name to be robust against insertion order changes.
+        let def = VIEW_DEFS
+            .iter()
+            .find(|v| v.name == "candles_5s")
+            .expect("candles_5s present");
         let sql = build_view_sql(def);
         assert!(sql.contains("ALIGN TO CALENDAR WITH OFFSET '00:00'"));
         assert!(sql.contains("SAMPLE BY 5s"));
@@ -1124,7 +1257,12 @@ mod tests {
 
     #[test]
     fn build_view_sql_without_tick_count() {
-        let def = &VIEW_DEFS[5]; // candles_2m — no tick_count
+        // Lookup by name (was index-based; insertion-order-fragile).
+        let def = VIEW_DEFS
+            .iter()
+            .find(|v| v.name == "candles_2m")
+            .expect("candles_2m present");
+        assert!(!def.has_tick_count);
         let sql = build_view_sql(def);
         assert!(!sql.contains("tick_count"));
     }
@@ -1341,8 +1479,8 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_view_count_is_18() {
-        assert_eq!(view_count(), 18);
+    fn test_view_count_is_28() {
+        assert_eq!(view_count(), 28);
     }
 
     #[test]
@@ -1417,12 +1555,13 @@ mod tests {
 
     #[test]
     fn test_build_view_sql_minute_plus_views_no_tick_count() {
-        // Views from index 5 onward (2m, 3m, ...) do NOT have tick_count
-        for def in &VIEW_DEFS[5..] {
+        // 2m+ views do NOT have tick_count. Filter by the flag rather
+        // than positional index (was index-based; brittle to ordering).
+        for def in VIEW_DEFS.iter().filter(|v| !v.has_tick_count) {
             let sql = build_view_sql(def);
             assert!(
                 !sql.contains("tick_count"),
-                "minute+ view {} must NOT have tick_count",
+                "view {} must NOT have tick_count",
                 def.name
             );
         }
@@ -1771,7 +1910,7 @@ mod tests {
             ilp_port: port,
         };
         // Exercises success path: create table (line 307), DEDUP (310-311),
-        // all 18 view DDLs (315-319), final info log (322-325)
+        // all 28 view DDLs (315-319), final info log (322-325)
         ensure_candle_views(&config).await;
     }
 
