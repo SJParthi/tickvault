@@ -172,8 +172,8 @@ use super::tls::{build_websocket_tls_connector, build_websocket_tls_connector_no
 use super::types::{InstrumentSubscription, WebSocketError};
 use crate::auth::TokenHandle;
 use crate::websocket::activity_watchdog::{
-    ActivityWatchdog, WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS, build_heartbeat_gauge,
-    spawn_with_panic_notify,
+    ActivityWatchdog, WATCHDOG_THRESHOLD_DEPTH_DEFERRED_SECS,
+    WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS, build_heartbeat_gauge, spawn_with_panic_notify,
 };
 use crate::websocket::subscription_builder::build_twenty_depth_subscription_messages;
 
@@ -632,11 +632,26 @@ async fn connect_and_run_depth(
     // the outer reconnect loop kicks in.
     let activity_counter = Arc::new(AtomicU64::new(0));
     let watchdog_notify = Arc::new(tokio::sync::Notify::new());
-    let watchdog_label = format!("depth-20-{underlying_label}"); // O(1) EXEMPT: one alloc per connect cycle
+    // 2026-05-05: depth-20 deferred-mode (instruments.is_empty() == true)
+    // gets the 4h threshold — Dhan sends zero data frames to a conn with
+    // no subscriptions, and the activity counter is fed only by data
+    // frames (not protocol pings), so the standard 50s threshold trips
+    // every cycle. Live incident: depth-200 (same code path) reconnect
+    // storm at 14:05–14:08 IST flapped tick_freshness → SLO-02 CRITICAL.
+    let watchdog_threshold_secs = if subscription_messages.is_empty() {
+        WATCHDOG_THRESHOLD_DEPTH_DEFERRED_SECS
+    } else {
+        WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS
+    };
+    let watchdog_label = if subscription_messages.is_empty() {
+        format!("depth-20-{underlying_label}-deferred") // O(1) EXEMPT: one alloc per connect cycle
+    } else {
+        format!("depth-20-{underlying_label}") // O(1) EXEMPT: one alloc per connect cycle
+    };
     let watchdog = ActivityWatchdog::new(
         watchdog_label.clone(),
         Arc::clone(&activity_counter),
-        Duration::from_secs(WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS),
+        Duration::from_secs(watchdog_threshold_secs),
         Arc::clone(&watchdog_notify),
     );
     // WS-1: panic-safe watchdog spawn — see activity_watchdog::spawn_with_panic_notify.
@@ -652,8 +667,8 @@ async fn connect_and_run_depth(
     // O(1) EXEMPT: cold path, one per dead socket.
     let make_watchdog_err = || WebSocketError::WatchdogFired {
         label: watchdog_label.clone(),
-        silent_secs: WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS,
-        threshold_secs: WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS,
+        silent_secs: watchdog_threshold_secs,
+        threshold_secs: watchdog_threshold_secs,
     };
 
     let loop_result: Result<(), WebSocketError> = loop {
@@ -1232,6 +1247,17 @@ async fn connect_and_run_200_depth(
     // Plan item B (2026-04-23): `security_id == 0` = DEFERRED sentinel
     // (outer caller passed `None`). Label differentiates so a fired
     // watchdog alert is unambiguous about what hasn't been subscribed.
+    // 2026-05-05: deferred conns get the 4h threshold — Dhan sends zero
+    // data frames without a subscribe, and the activity counter is fed
+    // only by data frames (not protocol pings). Live incident 14:05–
+    // 14:08 IST: all 5 depth-200 deferred slots reconnect-stormed every
+    // 50s, flapping tick_freshness and pinging SLO-02 CRITICAL. TCP-RST
+    // on truly dead sockets is still caught via read loop's Err branch.
+    let watchdog_threshold_secs = if security_id == 0 {
+        WATCHDOG_THRESHOLD_DEPTH_DEFERRED_SECS
+    } else {
+        WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS
+    };
     let watchdog_label = if security_id == 0 {
         format!("depth-200-{label}-deferred") // O(1) EXEMPT: one alloc per connect cycle
     } else {
@@ -1240,7 +1266,7 @@ async fn connect_and_run_200_depth(
     let watchdog = ActivityWatchdog::new(
         watchdog_label.clone(),
         Arc::clone(&activity_counter),
-        Duration::from_secs(WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS),
+        Duration::from_secs(watchdog_threshold_secs),
         Arc::clone(&watchdog_notify),
     );
     // WS-1: panic-safe watchdog spawn — see activity_watchdog::spawn_with_panic_notify.
@@ -1253,8 +1279,8 @@ async fn connect_and_run_200_depth(
     // O(1) EXEMPT: cold path, one per dead socket.
     let make_watchdog_err = || WebSocketError::WatchdogFired {
         label: watchdog_label.clone(),
-        silent_secs: WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS,
-        threshold_secs: WATCHDOG_THRESHOLD_LIVE_AND_DEPTH_SECS,
+        silent_secs: watchdog_threshold_secs,
+        threshold_secs: watchdog_threshold_secs,
     };
 
     let loop_result: Result<(), WebSocketError> = loop {
