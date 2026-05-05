@@ -49,8 +49,11 @@ with edge-triggered semantics (rising-edge fire only).
 
 **Triage:**
 1. `mcp__tickvault-logs__questdb_sql "select count(*) from option_movers where ts > now() - 5m"`
-   — empty / very low count means upstream `OptionMoversWriter` is
-   unhealthy; follow MOVERS-02 runbook.
+   — empty / very low count means the upstream unified
+   `MoversWriter` (movers_1s + 25 mat views) is unhealthy. Check
+   `tv_movers_writer_dropped_total` and the `movers_pipeline` task
+   logs. Phase 4b (2026-05-05) retired the legacy MOVERS-02 code +
+   the `OptionMoversWriter` it referenced.
 2. Outside market hours this is expected. The boot-wired runner uses
    `is_within_market_hours_ist()` to suppress emission outside
    `[09:00, 15:30] IST`.
