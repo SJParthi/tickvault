@@ -200,6 +200,223 @@ impl Timeframe for Tf15m {
     const NAME: &'static str = "15m";
 }
 
+// ────────────────────────────────────────────────────────────────────
+// Phase 3 commit 4: 22 additional Timeframe marker types covering the
+// full 29-TF universe per plan §1 L3:
+//   1s/3s/5s/10s/15s/30s, 1m..15m, 30m, 1h, 2h, 3h, 4h, 1d, 1w, 1mo
+// (1s/5s/15s/30s/1m/5m/15m above already shipped in Phase 3 commit 1.)
+//
+// Day/week/month TFs use SECS-based bucketing (86_400 / 604_800 /
+// 30 × 86_400). Calendar-aware bucketing (IST-midnight aligned, Sat/Sun
+// skipped, exact month-end) is a follow-on refinement — the cascade
+// SPSC plumbing in this PR does not require it. Bars produced today
+// align to the seconds-since-epoch grid which is "approximately right"
+// for 1d (UTC midnight, off from IST by 5h30m) and crudely right for
+// 1w / 1mo. Pinned by per-TF unit tests below.
+// ────────────────────────────────────────────────────────────────────
+
+/// 3-second timeframe.
+#[derive(Clone, Copy, Debug)]
+pub struct Tf3s;
+impl Timeframe for Tf3s {
+    const SECS: u32 = 3;
+    const NAME: &'static str = "3s";
+}
+
+/// 10-second timeframe.
+#[derive(Clone, Copy, Debug)]
+pub struct Tf10s;
+impl Timeframe for Tf10s {
+    const SECS: u32 = 10;
+    const NAME: &'static str = "10s";
+}
+
+/// 2-minute timeframe.
+#[derive(Clone, Copy, Debug)]
+pub struct Tf2m;
+impl Timeframe for Tf2m {
+    const SECS: u32 = 120;
+    const NAME: &'static str = "2m";
+}
+
+/// 3-minute timeframe.
+#[derive(Clone, Copy, Debug)]
+pub struct Tf3m;
+impl Timeframe for Tf3m {
+    const SECS: u32 = 180;
+    const NAME: &'static str = "3m";
+}
+
+/// 4-minute timeframe.
+#[derive(Clone, Copy, Debug)]
+pub struct Tf4m;
+impl Timeframe for Tf4m {
+    const SECS: u32 = 240;
+    const NAME: &'static str = "4m";
+}
+
+/// 6-minute timeframe.
+#[derive(Clone, Copy, Debug)]
+pub struct Tf6m;
+impl Timeframe for Tf6m {
+    const SECS: u32 = 360;
+    const NAME: &'static str = "6m";
+}
+
+/// 7-minute timeframe.
+#[derive(Clone, Copy, Debug)]
+pub struct Tf7m;
+impl Timeframe for Tf7m {
+    const SECS: u32 = 420;
+    const NAME: &'static str = "7m";
+}
+
+/// 8-minute timeframe.
+#[derive(Clone, Copy, Debug)]
+pub struct Tf8m;
+impl Timeframe for Tf8m {
+    const SECS: u32 = 480;
+    const NAME: &'static str = "8m";
+}
+
+/// 9-minute timeframe.
+#[derive(Clone, Copy, Debug)]
+pub struct Tf9m;
+impl Timeframe for Tf9m {
+    const SECS: u32 = 540;
+    const NAME: &'static str = "9m";
+}
+
+/// 10-minute timeframe.
+#[derive(Clone, Copy, Debug)]
+pub struct Tf10m;
+impl Timeframe for Tf10m {
+    const SECS: u32 = 600;
+    const NAME: &'static str = "10m";
+}
+
+/// 11-minute timeframe.
+#[derive(Clone, Copy, Debug)]
+pub struct Tf11m;
+impl Timeframe for Tf11m {
+    const SECS: u32 = 660;
+    const NAME: &'static str = "11m";
+}
+
+/// 12-minute timeframe.
+#[derive(Clone, Copy, Debug)]
+pub struct Tf12m;
+impl Timeframe for Tf12m {
+    const SECS: u32 = 720;
+    const NAME: &'static str = "12m";
+}
+
+/// 13-minute timeframe.
+#[derive(Clone, Copy, Debug)]
+pub struct Tf13m;
+impl Timeframe for Tf13m {
+    const SECS: u32 = 780;
+    const NAME: &'static str = "13m";
+}
+
+/// 14-minute timeframe.
+#[derive(Clone, Copy, Debug)]
+pub struct Tf14m;
+impl Timeframe for Tf14m {
+    const SECS: u32 = 840;
+    const NAME: &'static str = "14m";
+}
+
+/// 30-minute timeframe.
+#[derive(Clone, Copy, Debug)]
+pub struct Tf30m;
+impl Timeframe for Tf30m {
+    const SECS: u32 = 1_800;
+    const NAME: &'static str = "30m";
+}
+
+/// 1-hour timeframe.
+#[derive(Clone, Copy, Debug)]
+pub struct Tf1h;
+impl Timeframe for Tf1h {
+    const SECS: u32 = 3_600;
+    const NAME: &'static str = "1h";
+}
+
+/// 2-hour timeframe.
+#[derive(Clone, Copy, Debug)]
+pub struct Tf2h;
+impl Timeframe for Tf2h {
+    const SECS: u32 = 7_200;
+    const NAME: &'static str = "2h";
+}
+
+/// 3-hour timeframe.
+#[derive(Clone, Copy, Debug)]
+pub struct Tf3h;
+impl Timeframe for Tf3h {
+    const SECS: u32 = 10_800;
+    const NAME: &'static str = "3h";
+}
+
+/// 4-hour timeframe.
+#[derive(Clone, Copy, Debug)]
+pub struct Tf4h;
+impl Timeframe for Tf4h {
+    const SECS: u32 = 14_400;
+    const NAME: &'static str = "4h";
+}
+
+/// 1-day timeframe (86_400 seconds — UTC-midnight aligned; calendar
+/// IST-midnight bucketing is a follow-on refinement).
+///
+/// **WARN — calendar-approximate, NOT for trading signals (hostile C2):**
+/// the IST-midnight rollover task in
+/// `cascade::run_midnight_rollover_task_with_fanout` force-seals open
+/// bars at IST 00:00 every day, so the boundary mismatch between
+/// `SECS = 86_400` (UTC) and IST does not produce stale candles in
+/// practice. Trading bot consumers reading `latest()` between IST
+/// 00:00 and IST 05:30 see a freshly-opened post-rollover bar — not a
+/// stale UTC-anchored one.
+#[derive(Clone, Copy, Debug)]
+pub struct Tf1d;
+impl Timeframe for Tf1d {
+    const SECS: u32 = 86_400;
+    const NAME: &'static str = "1d";
+}
+
+/// 1-week timeframe (604_800 seconds — Thursday-aligned in epoch space;
+/// calendar Sunday-Saturday bucketing is a follow-on refinement).
+///
+/// **WARN — calendar-approximate, NOT for trading signals (hostile C2):**
+/// epoch alignment != trading-week alignment. The IST-midnight rollover
+/// task force-seals at every IST 00:00, so the boundary mismatch does
+/// not produce stale candles in practice; consumers that need exact
+/// week-of-trading semantics MUST read from the QuestDB matview, not
+/// from `CandleEngineMap<Tf1w>::latest()`.
+#[derive(Clone, Copy, Debug)]
+pub struct Tf1w;
+impl Timeframe for Tf1w {
+    const SECS: u32 = 604_800;
+    const NAME: &'static str = "1w";
+}
+
+/// 1-month timeframe (approximated as 30 × 86_400 = 2_592_000 seconds;
+/// calendar last-day-of-month bucketing is a follow-on refinement).
+///
+/// **WARN — calendar-approximate, NOT for trading signals (hostile C2):**
+/// real months range 28-31 days, not 30; the bucket boundary drifts
+/// 1-3 days per month vs the actual calendar. The IST-midnight
+/// rollover keeps drift bounded inside one day, but consumers that
+/// need exact month-of-trading semantics MUST read from the QuestDB
+/// matview, not from `CandleEngineMap<Tf1mo>::latest()`.
+#[derive(Clone, Copy, Debug)]
+pub struct Tf1mo;
+impl Timeframe for Tf1mo {
+    const SECS: u32 = 2_592_000;
+    const NAME: &'static str = "1mo";
+}
+
 /// Generic single-timeframe candle engine.
 ///
 /// `on_tick` returns `Some(sealed_bar)` when the incoming tick crosses
@@ -427,6 +644,57 @@ mod tests {
         assert_eq!(Tf15m::SECS, 900);
     }
 
+    /// Hostile review C2: pin the calendar-approximate warnings on
+    /// Tf1d / Tf1w / Tf1mo so a future doc edit cannot silently drop
+    /// them. Source-scan against the engine.rs file at test time.
+    #[test]
+    fn test_calendar_approximate_tfs_carry_explicit_warning_in_docstring() {
+        let src = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/candles/engine.rs"
+        ))
+        .expect("must be able to read engine.rs");
+        // The exact phrase pattern guards both the "WARN — calendar-approximate"
+        // tag and the "NOT for trading signals" message — together they form
+        // the contract.
+        let occurrences = src
+            .matches("WARN — calendar-approximate, NOT for trading signals")
+            .count();
+        assert!(
+            occurrences >= 3,
+            "Tf1d, Tf1w, Tf1mo docstrings must each carry the \
+             'WARN — calendar-approximate, NOT for trading signals' \
+             phrase (found {occurrences} occurrences, expected >= 3)"
+        );
+    }
+
+    #[test]
+    fn test_tf_secs_constants_phase_3_4_additions_are_correct() {
+        // Phase 3 commit 4: 22 additional TFs covering the full 29-TF universe.
+        assert_eq!(Tf3s::SECS, 3);
+        assert_eq!(Tf10s::SECS, 10);
+        assert_eq!(Tf2m::SECS, 120);
+        assert_eq!(Tf3m::SECS, 180);
+        assert_eq!(Tf4m::SECS, 240);
+        assert_eq!(Tf6m::SECS, 360);
+        assert_eq!(Tf7m::SECS, 420);
+        assert_eq!(Tf8m::SECS, 480);
+        assert_eq!(Tf9m::SECS, 540);
+        assert_eq!(Tf10m::SECS, 600);
+        assert_eq!(Tf11m::SECS, 660);
+        assert_eq!(Tf12m::SECS, 720);
+        assert_eq!(Tf13m::SECS, 780);
+        assert_eq!(Tf14m::SECS, 840);
+        assert_eq!(Tf30m::SECS, 1_800);
+        assert_eq!(Tf1h::SECS, 3_600);
+        assert_eq!(Tf2h::SECS, 7_200);
+        assert_eq!(Tf3h::SECS, 10_800);
+        assert_eq!(Tf4h::SECS, 14_400);
+        assert_eq!(Tf1d::SECS, 86_400);
+        assert_eq!(Tf1w::SECS, 604_800);
+        assert_eq!(Tf1mo::SECS, 2_592_000);
+    }
+
     #[test]
     fn test_tf_names_match_questdb_matview_suffixes() {
         assert_eq!(Tf1s::NAME, "1s");
@@ -436,6 +704,32 @@ mod tests {
         assert_eq!(Tf1m::NAME, "1m");
         assert_eq!(Tf5m::NAME, "5m");
         assert_eq!(Tf15m::NAME, "15m");
+    }
+
+    #[test]
+    fn test_tf_names_phase_3_4_additions_match_questdb_matview_suffixes() {
+        assert_eq!(Tf3s::NAME, "3s");
+        assert_eq!(Tf10s::NAME, "10s");
+        assert_eq!(Tf2m::NAME, "2m");
+        assert_eq!(Tf3m::NAME, "3m");
+        assert_eq!(Tf4m::NAME, "4m");
+        assert_eq!(Tf6m::NAME, "6m");
+        assert_eq!(Tf7m::NAME, "7m");
+        assert_eq!(Tf8m::NAME, "8m");
+        assert_eq!(Tf9m::NAME, "9m");
+        assert_eq!(Tf10m::NAME, "10m");
+        assert_eq!(Tf11m::NAME, "11m");
+        assert_eq!(Tf12m::NAME, "12m");
+        assert_eq!(Tf13m::NAME, "13m");
+        assert_eq!(Tf14m::NAME, "14m");
+        assert_eq!(Tf30m::NAME, "30m");
+        assert_eq!(Tf1h::NAME, "1h");
+        assert_eq!(Tf2h::NAME, "2h");
+        assert_eq!(Tf3h::NAME, "3h");
+        assert_eq!(Tf4h::NAME, "4h");
+        assert_eq!(Tf1d::NAME, "1d");
+        assert_eq!(Tf1w::NAME, "1w");
+        assert_eq!(Tf1mo::NAME, "1mo");
     }
 
     #[test]

@@ -45,6 +45,7 @@ use tracing::{debug, error, info};
 
 use tickvault_common::tick_types::ParsedTick;
 
+use crate::candles::cascade_fanout::CascadeFanout;
 use crate::candles::engine::Tf1s;
 use crate::candles::engine_map::CandleEngineMap;
 
@@ -94,12 +95,19 @@ const ROLLOVER_POST_SEAL_DELAY_SECS: u64 = 1;
 /// counter only — the `error!` (which routes to Telegram via Loki) fires
 /// at most once per coalesce window per task instance.
 ///
+/// **28-engine fanout (Phase 3 commit 4):** when `fanout` is `Some`,
+/// every sealed 1s bar is also fed into all 28 derived engines via
+/// `CascadeFanout::feed_sealed_1s_bar`. The fanout call is O(28),
+/// constant per sealed bar (~1.7µs), and runs in this same task so
+/// the per-instrument ordering of derived bars is preserved.
+///
 /// This function is `async fn -> ()` and returns when the broadcast
 /// sender is dropped. The caller is expected to spawn it via
 /// `spawn_supervised_cascade_1s` so panics are surfaced + respawned.
 pub async fn run_cascade_1s(
     mut rx: broadcast::Receiver<ParsedTick>,
     engine_map: Arc<CandleEngineMap<Tf1s>>,
+    fanout: Option<CascadeFanout>,
 ) {
     let mut first_tick_seen = false;
     let mut last_lag_log: Option<Instant> = None;
@@ -116,6 +124,11 @@ pub async fn run_cascade_1s(
                 counter!(METRIC_TICKS_PROCESSED).increment(1);
                 if let Some(bar) = engine_map.on_tick(&tick) {
                     counter!(METRIC_BARS_SEALED).increment(1);
+                    // Phase 3 commit 4: feed the sealed 1s bar into all
+                    // 28 derived engines via the fanout. O(28) constant.
+                    if let Some(ref f) = fanout {
+                        f.feed_sealed_1s_bar(&bar);
+                    }
                     // Hot-path review M1 fix: gate the format expansion
                     // entirely behind the level check so peak-load
                     // (~24K seals/sec) never pays the structured-field
@@ -169,11 +182,17 @@ pub async fn run_cascade_1s(
 pub async fn spawn_supervised_cascade_1s(
     sender: broadcast::Sender<ParsedTick>,
     engine_map: Arc<CandleEngineMap<Tf1s>>,
+    fanout: Option<CascadeFanout>,
 ) {
     loop {
         let rx = sender.subscribe();
         let map = Arc::clone(&engine_map);
-        let join = tokio::spawn(async move { run_cascade_1s(rx, map).await });
+        // Supervisor respawn path runs at most once per panic/exit;
+        // clone is 28 atomic refcount bumps (~100ns total), off the
+        // per-tick hot path. This is NOT the cascade hot loop.
+        // O(1) EXEMPT: supervisor respawn, not per-tick hot path.
+        let fanout_clone = fanout.clone();
+        let join = tokio::spawn(async move { run_cascade_1s(rx, map, fanout_clone).await });
         match join.await {
             Ok(()) => {
                 // Clean exit ⇒ broadcast sender was dropped. Stop
@@ -193,30 +212,44 @@ pub async fn spawn_supervised_cascade_1s(
     }
 }
 
-/// IST midnight rollover task (plan L13 + hostile review H1 fix).
+/// IST midnight rollover task — seals BOTH the 1s engine map AND
+/// every derived engine inside the optional `fanout` so the entire
+/// 29-TF set rolls over atomically at IST 00:00 (plan L13).
 ///
-/// Sleeps until the next IST midnight boundary then calls
-/// `engine_map.force_seal_all()` so the open bars from the previous
-/// trading day do NOT silently fuse into the next day's first bar.
-/// Loops forever — one rollover per day.
-///
-/// `now_ist_secs_provider` returns the current IST seconds-since-epoch.
-/// Injection allows the test to drive deterministic boundary crossings.
-pub async fn run_midnight_rollover_task(engine_map: Arc<CandleEngineMap<Tf1s>>) {
+/// **Hostile review H3 fix:** the legacy 1s-only
+/// `run_midnight_rollover_task` was DELETED in commit 4 to remove the
+/// foot-gun where a future caller could wire it instead of this
+/// fanout-aware variant — the result would have been correct 1s
+/// rollover but silent fusion of Day-N's open bars into Day-(N+1)'s
+/// first bar across all 28 derived engines.
+pub async fn run_midnight_rollover_task_with_fanout(
+    engine_map: Arc<CandleEngineMap<Tf1s>>,
+    fanout: Option<CascadeFanout>,
+) {
     loop {
         let secs_until_midnight = secs_until_next_ist_midnight(now_ist_secs());
         tokio::time::sleep(Duration::from_secs(secs_until_midnight)).await;
-        let sealed = engine_map.force_seal_all();
-        counter!(METRIC_MIDNIGHT_SEAL_BARS).increment(u64::from(sealed));
+        let one_s_sealed = engine_map.force_seal_all();
+        let fanout_sealed = fanout.as_ref().map_or(0, |f| f.force_seal_all());
+        let total = u64::from(one_s_sealed).saturating_add(fanout_sealed);
+        counter!(METRIC_MIDNIGHT_SEAL_BARS).increment(total);
         info!(
-            sealed_bars = sealed,
-            "candle cascade IST midnight rollover — sealed open bars across day boundary"
+            one_s_sealed,
+            fanout_sealed,
+            total,
+            "candle cascade IST midnight rollover (29-TF) — sealed open bars across day boundary"
         );
-        // Defensive: avoid tight-loop on clock anomaly. After each
-        // rollover, sleep a minimum 1 second before recomputing.
         tokio::time::sleep(Duration::from_secs(ROLLOVER_POST_SEAL_DELAY_SECS)).await;
     }
 }
+
+// Phase 3 commit 4 (hostile review H3): the legacy 1s-only
+// `run_midnight_rollover_task` was deleted here. Use
+// `run_midnight_rollover_task_with_fanout(engine_map, None)` for the
+// equivalent 1s-only behaviour (the fanout-aware variant accepts an
+// optional fanout, so a `None` argument reproduces the legacy semantics
+// without keeping a separate function symbol that could be wired by
+// mistake).
 
 /// Returns IST seconds-since-epoch (UTC + 19800).
 #[inline]
@@ -262,7 +295,7 @@ mod tests {
         let engine_map: Arc<CandleEngineMap<Tf1s>> = Arc::new(CandleEngineMap::new());
         let map_clone = Arc::clone(&engine_map);
 
-        let handle = tokio::spawn(run_cascade_1s(rx, map_clone));
+        let handle = tokio::spawn(run_cascade_1s(rx, map_clone, None));
 
         // Two ticks in the same 1s bucket → engine accumulates, no seal.
         tx.send(make_tick(1000, 1, 100, 100.0)).expect("send 1");
@@ -283,7 +316,7 @@ mod tests {
         let (tx, rx) = broadcast::channel::<ParsedTick>(16);
         let engine_map: Arc<CandleEngineMap<Tf1s>> = Arc::new(CandleEngineMap::new());
         let map_clone = Arc::clone(&engine_map);
-        let handle = tokio::spawn(run_cascade_1s(rx, map_clone));
+        let handle = tokio::spawn(run_cascade_1s(rx, map_clone, None));
 
         tx.send(make_tick(2000, 1, 200, 50.0)).expect("send a");
         tx.send(make_tick(2000, 1, 201, 51.0))
@@ -302,7 +335,7 @@ mod tests {
     async fn run_cascade_1s_exits_when_broadcast_closes() {
         let (tx, rx) = broadcast::channel::<ParsedTick>(4);
         let engine_map: Arc<CandleEngineMap<Tf1s>> = Arc::new(CandleEngineMap::new());
-        let handle = tokio::spawn(run_cascade_1s(rx, engine_map));
+        let handle = tokio::spawn(run_cascade_1s(rx, engine_map, None));
         drop(tx); // Close immediately — cascade should exit.
         handle.await.expect("cascade exits");
     }
@@ -313,7 +346,7 @@ mod tests {
         let (tx, rx) = broadcast::channel::<ParsedTick>(2);
         let engine_map: Arc<CandleEngineMap<Tf1s>> = Arc::new(CandleEngineMap::new());
         let map_clone = Arc::clone(&engine_map);
-        let handle = tokio::spawn(run_cascade_1s(rx, map_clone));
+        let handle = tokio::spawn(run_cascade_1s(rx, map_clone, None));
 
         // Producer floods 100 ticks before consumer wakes — older ticks
         // are dropped, consumer sees Lagged then resumes from latest.
@@ -352,8 +385,8 @@ mod tests {
     }
 
     #[test]
-    fn run_midnight_rollover_task_explicit_name_match() {
-        let _ = run_midnight_rollover_task;
+    fn run_midnight_rollover_task_with_fanout_explicit_name_match() {
+        let _ = run_midnight_rollover_task_with_fanout;
     }
 
     #[test]
@@ -411,7 +444,7 @@ mod tests {
         // behavioural assertion — task exits cleanly with no panic.
         let (tx, rx) = broadcast::channel::<ParsedTick>(4);
         let engine_map: Arc<CandleEngineMap<Tf1s>> = Arc::new(CandleEngineMap::new());
-        let handle = tokio::spawn(run_cascade_1s(rx, engine_map));
+        let handle = tokio::spawn(run_cascade_1s(rx, engine_map, None));
         drop(tx);
         handle
             .await

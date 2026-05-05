@@ -121,6 +121,39 @@ impl<TF: Timeframe + 'static> CandleEngineMap<TF> {
         engine.on_tick(tick)
     }
 
+    /// Folds a sealed bar (typically from a finer-grained TF cascade)
+    /// into the engine for this instrument. Mirrors `on_tick` but uses
+    /// the per-instrument engine's `on_sealed_bar` method so the
+    /// derived TF aggregates from already-sealed input bars instead of
+    /// raw ticks.
+    ///
+    /// Used by `CascadeFanout::feed_sealed_1s_bar` (Phase 3 commit 4)
+    /// to feed every derived engine in the 28-TF set.
+    ///
+    /// O(1), lock-free outer (papaya), uncontended mutex inner.
+    #[inline]
+    pub fn on_sealed_bar(&self, bar: &Bar) -> Option<Bar> {
+        let key = (bar.security_id, bar.exchange_segment_code);
+        let guard = self.inner.guard();
+        if let Some(engine_arc) = self.inner.get(&key, &guard) {
+            let mut engine = match engine_arc.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            return engine.on_sealed_bar(bar);
+        }
+        let new_engine = Arc::new(Mutex::new(CandleEngine::<TF>::new()));
+        let inserted_arc = match self.inner.try_insert(key, Arc::clone(&new_engine), &guard) {
+            Ok(_) => new_engine,
+            Err(occupied) => Arc::clone(occupied.current),
+        };
+        let mut engine = match inserted_arc.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        engine.on_sealed_bar(bar)
+    }
+
     /// Returns the latest open bar for an instrument, or `None` if
     /// the engine has not seen a tick yet.
     ///

@@ -22,9 +22,17 @@
 //! 7-day soak per plan §6.
 
 pub mod cascade;
+pub mod cascade_fanout;
 pub mod engine;
 pub mod engine_map;
 
-pub use cascade::{run_cascade_1s, run_midnight_rollover_task, spawn_supervised_cascade_1s};
-pub use engine::{Bar, CandleEngine, Tf1m, Tf1s, Tf5m, Tf5s, Tf15m, Tf15s, Tf30s, Timeframe};
+pub use cascade::{
+    run_cascade_1s, run_midnight_rollover_task_with_fanout, spawn_supervised_cascade_1s,
+};
+pub use cascade_fanout::{CascadeFanout, DERIVED_ENGINE_COUNT};
+pub use engine::{
+    Bar, CandleEngine, Tf1d, Tf1h, Tf1m, Tf1mo, Tf1s, Tf1w, Tf2h, Tf2m, Tf3h, Tf3m, Tf3s, Tf4h,
+    Tf4m, Tf5m, Tf5s, Tf6m, Tf7m, Tf8m, Tf9m, Tf10m, Tf10s, Tf11m, Tf12m, Tf13m, Tf14m, Tf15m,
+    Tf15s, Tf30m, Tf30s, Timeframe,
+};
 pub use engine_map::CandleEngineMap;
