@@ -4,12 +4,51 @@
 > **Scope:** Any file touching main WebSocket connection pool, subscription planning, or instrument distribution.
 > **Ground truth:** `docs/dhan-ref/03-live-market-feed-websocket.md`, `docs/dhan-ref/08-annexure-enums.md`
 
+## 2026-05-05 Update — Wave 5 default scope = `indices_only_all_expiries`
+
+The default `[subscription] scope` in `config/base.toml:270` is
+`indices_only_all_expiries`. Stock F&O is NOT subscribed; index F&O
+expands to ALL expiries (not just the current one) so the universe
+math is different from the older `FullUniverse`-era doc below.
+
+### Wave 5 indices-only universe (LIVE DEFAULT, ~11K instruments)
+
+| Slot | Subscription | Mode | Count |
+|---|---|---|---|
+| Index values IDX_I | NIFTY=13, BANKNIFTY=25, SENSEX=51 | Ticker | 3 |
+| Display indices | sectoral + INDIA VIX | Ticker | ~26 |
+| Cash equities NSE_EQ | one per F&O stock | Quote/Full | ~216 |
+| Index F&O — **all expiries** (NIFTY + BANKNIFTY + SENSEX) | every weekly + monthly + far-month chain | Quote/Full | ~10,789 |
+| Stock F&O | **gated off** under indices-only scope | — | 0 |
+| **TOTAL** | verified live 2026-05-05 | | **~11,034** ≤ 25,000 |
+
+Rationale: Wave 5 narrowed the trading universe to the 3 indices
+because (a) the greeks pipeline runs on those 3 underlyings only
+(`MAX_UNDERLYINGS = 3`), (b) depth-20/200 dynamic feeds operate on
+NIFTY + BANKNIFTY exclusively, and (c) ~11K instruments fits
+comfortably under `MEMORY_RSS_ALERT_MB = 1024 MB`. Phase 2 scheduler
+is intentionally NOT spawned (`phase2_recovery::should_spawn_phase2_scheduler`
+returns false). SLO-02 phase2_health dimension is pinned to 1.0 in
+the SLO scheduler when this scope is active (live operator incident
+2026-05-05 13:14 IST: composite = 0 / weakest = phase2_health was a
+false-CRITICAL).
+
+### LEGACY (pre-Wave-5) `FullUniverse` scope (~24K instruments)
+
+Retained for documentation only — describes the scope when
+`[subscription] scope = "full_universe"` (the operator deliberately
+flips the config). NOTE: under FullUniverse the live-tick ATM resolver
+(`live_tick_atm_resolver::resolve_stock_atm_from_live_ticks`) is
+defined but NOT wired into boot orchestration, so mid-day FullUniverse
+boots after 09:13 IST will under-fill stock F&O ATM±25 — see
+disaster-recovery Scenario 1. Wiring the resolver is a separate PR.
+
 ## 2026-04-25 Updates — F&O Universe Rebuild (3-index policy + 4-mode boot)
 
 Mandatory for any new subscription/boot work. Shipped on branch
 `claude/build-fno-universe-Tlb9d`:
 
-### Subscription scope (the new universe)
+### Subscription scope (the FullUniverse universe — see Wave-5 update above)
 
 | Slot | Subscription | Mode | Count |
 |---|---|---|---|
@@ -18,7 +57,7 @@ Mandatory for any new subscription/boot work. Shipped on branch
 | Cash equities NSE_EQ | one per F&O stock | Quote/Full | ~216 |
 | Index F&O — full current expiry | NIFTY + BANKNIFTY + SENSEX | Quote/Full | ~2,037 |
 | Stock F&O — ATM±25 of current expiry | 216 stocks × 51 CE + 51 PE + 1 FUT | Quote/Full | ~22,042 |
-| **TOTAL** | verified live 2026-04-25 | | **~24,324** ≤ 25,000 |
+| **TOTAL (FullUniverse)** | verified live 2026-04-25 | | **~24,324** ≤ 25,000 |
 
 ### What changed vs pre-2026-04-25
 

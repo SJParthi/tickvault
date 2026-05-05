@@ -5714,6 +5714,17 @@ async fn main() -> Result<()> {
                 let slo_notifier = notifier.clone();
                 let slo_health = health_status.clone();
                 let slo_qcfg = config.questdb.clone();
+                // 2026-05-05: under indices-only scope Phase 2 is intentionally
+                // not spawned (per `phase2_recovery::should_spawn_phase2_scheduler`),
+                // so `phase2_outcome_today_is_complete` always returns None,
+                // the wall-clock + boot grace expire, and phase2_health drops
+                // to 0.0 → composite zeroes → SLO-02 false-CRITICAL pages.
+                // Live operator alert 13:14 IST 2026-05-05. Pin phase2_health
+                // to 1.0 when Phase 2 is gated by config.
+                let phase2_scheduler_enabled =
+                    tickvault_app::phase2_recovery::should_spawn_phase2_scheduler(
+                        config.subscription.scope,
+                    );
                 tokio::spawn(async move {
                     use std::time::{Duration, Instant};
                     use tickvault_common::constants::{
@@ -5934,7 +5945,14 @@ async fn main() -> Result<()> {
                             .saturating_add(IST_UTC_OFFSET_NANOS);
                         let today_date_ist =
                             now_ist_nanos - now_ist_nanos.rem_euclid(86_400_000_000_000);
-                        let phase2_health = if !in_market {
+                        let phase2_health = if !phase2_scheduler_enabled {
+                            // Indices-only scope (PR-E): Phase 2 deliberately
+                            // not spawned. Pin to 1.0 so the multiplicative
+                            // composite isn't zeroed by an irrelevant
+                            // dimension. Same semantic as `!in_market` —
+                            // by-design, not degraded.
+                            1.0
+                        } else if !in_market {
                             1.0
                         } else if secs_of_day < SLO_PHASE2_TRIGGER_SECS_OF_DAY_IST {
                             // Pre-trigger: no outcome yet, do not penalize.

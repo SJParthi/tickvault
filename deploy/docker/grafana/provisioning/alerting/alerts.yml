@@ -1421,3 +1421,82 @@ groups:
         labels:
           severity: high
 
+
+      # Phase 3 9-box closure: cascade lag (queue capacity miss).
+      # tv_candle_cascade_lag_total increments when the 1s seal pipeline
+      # backs up and a sealed bar is dropped. Should be 0 in steady
+      # state. Rising rate indicates the fanout is falling behind the
+      # 1s seal rate (likely due to upstream stall or misconfiguration).
+      - uid: tv-candle-cascade-lag
+        title: "Phase 3 cascade lag — sealed bar dropped"
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model:
+              expr: 'rate(tv_candle_cascade_lag_total[5m])'
+              intervalMs: 15000
+              maxDataPoints: 43200
+          - refId: B
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: gt, params: [0.0] }
+        noDataState: OK
+        execErrState: Alerting
+        for: 1m
+        annotations:
+          summary: "tv_candle_cascade_lag_total rising — 1s seal pipeline backing up"
+          description: "rate(tv_candle_cascade_lag_total[5m]) > 0 for 1m. The 28-TF cascade fanout is dropping sealed 1s bars because the queue is at capacity. Check tv_candle_cascade_ticks_processed_total rate vs tv_candle_cascade_bars_sealed_total rate to identify the bottleneck. Runbook: .claude/rules/project/wave-5-error-codes.md (CASCADE — TBD; for now inspect cascade.rs:53 metric constants and engine_map.rs hot path)."
+        labels:
+          severity: high
+
+      # Phase 3 9-box closure: cascade supervisor respawned the task.
+      # tv_candle_cascade_respawn_total increments when the cascade task
+      # exits unexpectedly (panic / unexpected return) and the
+      # supervisor respawns it. Should be 0 in steady state.
+      - uid: tv-candle-cascade-respawn
+        title: "Phase 3 cascade supervisor respawn — task exited unexpectedly"
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 86400, to: 0 }
+            datasourceUid: prometheus
+            model:
+              expr: 'increase(tv_candle_cascade_respawn_total[24h])'
+              intervalMs: 15000
+              maxDataPoints: 43200
+          - refId: B
+            relativeTimeRange: { from: 86400, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            relativeTimeRange: { from: 86400, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: gt, params: [0.0] }
+        noDataState: OK
+        execErrState: Alerting
+        for: 1m
+        annotations:
+          summary: "tv_candle_cascade_respawn_total > 0 in last 24h"
+          description: "The cascade supervisor (cascade.rs:182+) respawned the 28-TF fanout task. Repeated respawns indicate a panic loop. Inspect data/logs/errors.jsonl.* for the panic backtrace immediately preceding the respawn event."
+        labels:
+          severity: high
