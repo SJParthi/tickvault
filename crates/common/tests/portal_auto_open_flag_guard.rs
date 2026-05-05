@@ -27,6 +27,7 @@ fn auto_open_portal_can_be_disabled() {
         port: 3001,
         allowed_origins: vec![],
         auto_open_portal: false,
+        movers_v2_enabled: false,
     };
     assert!(
         !cfg.auto_open_portal,
