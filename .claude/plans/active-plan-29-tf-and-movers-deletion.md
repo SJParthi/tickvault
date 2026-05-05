@@ -1,6 +1,6 @@
 # Active Plan: 29-Timeframes Engine + Movers Deletion + Bulletproof Resilience
 
-**Status:** DRAFT (awaiting operator approval before any code change)
+**Status:** IN_PROGRESS (Phases 1–4 code-complete via 28 PRs #483–#497 merged 2026-05-04..05; remaining items are operator wall-clock soaks per §6 + §13)
 **Date:** 2026-05-04
 **Branch (proposed):** `claude/29-tf-movers-deletion`
 **Authority chain:** `CLAUDE.md` > `.claude/rules/project/per-wave-guarantee-matrix.md` > `.claude/rules/project/stream-resilience.md` > this file
@@ -295,6 +295,32 @@ direction = "desc"
 
 ## 7. 12 bulletproofing additions (was 13; bump arena DELETED per hot-path CRITICAL C1)
 
+> **2026-05-05 scope reconciliation (audit verdict).** During execution
+> of Phases 1–4 (PRs #483–#497) the §7 bulletproofing items were
+> **descoped from this plan** without an explicit "DEFERRED" annotation
+> at the time. Reconciliation against `origin/main` HEAD `e24c0d1`:
+>
+> | # | Status on main | Notes |
+> |---|---|---|
+> | 1 | DEFERRED | atomic align ratchet not present; trading workload didn't surface false-sharing |
+> | 2 | DELETED | per C1 |
+> | 3 | DEFERRED | tick spill exists (`STORAGE-GAP-03` runbook) but `mmap` + MADV_WILLNEED + wrap-with-DLQ not shipped |
+> | 4 | DEFERRED | `MEMORY_RSS_ALERT_MB = 1024` global gauge shipped (PR #497) but per-subsystem ceiling not |
+> | 5 | DEFERRED | OOM score adj not wired |
+> | 6 | SHIPPED | Wave 5 CORE-PIN-01 covers WS-read + parser |
+> | 7 | DEFERRED | TCP keepalive not yet set on connect |
+> | 8 | DEFERRED | DNS round-robin not implemented |
+> | 9 | DEFERRED | Happy Eyeballs not implemented |
+> | 10 | DEFERRED | per-conn 60s forensic ring not built |
+> | 11 | DEFERRED | pre-disconnect JSON snapshot not built |
+> | 12 | DEFERRED | replay-spill tool not built |
+> | 13 | DEFERRED | chaos RST-flood weekly CI not added |
+>
+> Recommendation: open a follow-up Wave-6 plan that lifts the DEFERRED
+> items above with explicit prioritization. The §6 Phase 1–4 scope is
+> code-complete and is what the merged PRs deliver; the §7/§8 ambitions
+> were over-scoped at draft time and should not block the §6 archive.
+
 | # | Addition | What it solves | Mechanism | Ratchet |
 |---|---|---|---|---|
 | 1 | Cache-line align hot atomics (`#[repr(align(64))]`) | false-sharing slowdown under burst | `MoverState` + `CandleState` aligned | `test_atomic_alignment_64_bytes` |
@@ -318,6 +344,31 @@ direction = "desc"
 ---
 
 ## 8. Ratchet tests (full enumeration — every test fails build on regression)
+
+> **2026-05-05 scope reconciliation (audit verdict).** During execution
+> the §8 ratchet enumeration was partially shipped — many tests landed
+> under different paths (e.g. `parity_soak_harness.rs`,
+> `candle_cascade_wiring_guard.rs`, `boot_ordering_gate` modules,
+> `dedup_segment_meta_guard.rs`) and a 9-box closure follow-up
+> (this PR) shipped:
+> * `crates/trading/tests/dhat_cascade_fanout.rs` — DHAT zero-alloc
+>   for `CascadeFanout::feed_sealed_1s_bar` (10,000 calls × 100
+>   instruments, 0 allocations measured).
+> * `crates/trading/benches/cascade_fanout.rs` — Criterion bench;
+>   measured 1.16µs/call vs 5µs budget in
+>   `quality/benchmark-budgets.toml`.
+> * Operator-health Grafana panels for `tv_candle_cascade_*`.
+> * Two new alert rules in `alerts.yml`:
+>   `tv-candle-cascade-lag` + `tv-candle-cascade-respawn`.
+> * Two new triage YAML rules under `cascade-lag-rising-escalate`
+>   and `cascade-respawn-detected-escalate`.
+>
+> The §7-deferred ratchets (`atomic_align.rs`, `tcp_keepalive.rs`,
+> `dns_failover.rs`, `happy_eyeballs.rs`, `forensic_ring.rs`,
+> `disconnect_snapshot.rs`, `spill_replay.rs`,
+> `chaos_dhan_rst_flood.rs`, `chaos_burst_10x.rs`,
+> `mmap_spill_overflow.rs`) move to the Wave-6 backlog with the
+> §7 items they pin.
 
 | Test | File | What it pins |
 |---|---|---|
