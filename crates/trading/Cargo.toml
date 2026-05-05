@@ -23,6 +23,7 @@ reqwest = { workspace = true }
 secrecy = { workspace = true }
 metrics = { workspace = true }
 jaeckel = { workspace = true }
+papaya = { workspace = true }
 loom = { workspace = true, optional = true }
 
 [features]

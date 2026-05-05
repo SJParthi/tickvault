@@ -22,5 +22,7 @@
 //! 7-day soak per plan §6.
 
 pub mod engine;
+pub mod engine_map;
 
 pub use engine::{Bar, CandleEngine, Tf1m, Tf1s, Tf5m, Tf5s, Tf15m, Tf15s, Tf30s, Timeframe};
+pub use engine_map::CandleEngineMap;

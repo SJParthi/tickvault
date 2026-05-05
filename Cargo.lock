@@ -4304,6 +4304,7 @@ dependencies = [
  "loom",
  "metrics",
  "notify",
+ "papaya",
  "proptest",
  "reqwest 0.13.3",
  "secrecy",
