@@ -183,6 +183,38 @@ pub async fn unzip_csv_from_zip_body(zip_body: &[u8]) -> Result<Vec<u8>> {
     use std::process::Stdio;
     use tokio::io::AsyncWriteExt;
 
+    // PREVOI-01 fix (2026-05-05): NSE bhavcopy sometimes returns an HTML
+    // error page, an empty body, or bot-protection content with HTTP 200.
+    // `unzip` exits immediately on garbage input, and the parent's
+    // `write_all` then fails with `Broken pipe (os error 32)` — a
+    // misleading symptom for what's really a malformed-body bug.
+    //
+    // Validate the ZIP local-file-header magic (`PK\x03\x04`) or
+    // empty-archive marker (`PK\x05\x06`) BEFORE piping to unzip so the
+    // operator gets an actionable error mentioning the actual bytes.
+    // Live evidence: prev_oi_loader 14:04:04.940 IST 2026-05-05 boot.
+    if zip_body.len() < 4 {
+        anyhow::bail!(
+            "bhavcopy ZIP body too short ({} bytes) — NSE likely returned an empty body or 200 with no content; \
+             expected a ZIP starting with `PK\\x03\\x04`",
+            zip_body.len()
+        );
+    }
+    let magic = &zip_body[..4];
+    let is_zip = magic == [0x50, 0x4B, 0x03, 0x04] || magic == [0x50, 0x4B, 0x05, 0x06];
+    if !is_zip {
+        // Surface up to 200 bytes for diagnostics — usually enough to see
+        // an HTML `<!DOCTYPE html>` or a known NSE error page header.
+        let preview_len = zip_body.len().min(200);
+        let preview = String::from_utf8_lossy(&zip_body[..preview_len]);
+        anyhow::bail!(
+            "bhavcopy ZIP body has wrong magic bytes (got {:02X?}, expected `PK\\x03\\x04` or `PK\\x05\\x06`). \
+             NSE likely returned a non-ZIP response (HTML error page, bot-protection challenge, or maintenance \
+             page). First {preview_len} bytes: {preview:?}",
+            magic
+        );
+    }
+
     let mut child = Command::new("unzip")
         .args(["-p", "-"])
         .stdin(Stdio::piped())
@@ -193,10 +225,23 @@ pub async fn unzip_csv_from_zip_body(zip_body: &[u8]) -> Result<Vec<u8>> {
 
     {
         let mut stdin = child.stdin.take().context("unzip stdin pipe missing")?;
-        stdin
-            .write_all(zip_body)
-            .await
-            .context("write zip body to unzip stdin")?;
+        // PREVOI-01 fix: if unzip exits early (e.g. zip is structurally
+        // invalid past the magic check), `write_all` returns BrokenPipe.
+        // Drop stdin and let `wait_with_output` surface the real stderr —
+        // don't propagate the misleading BrokenPipe as the root error.
+        if let Err(write_err) = stdin.write_all(zip_body).await {
+            drop(stdin);
+            let output = child
+                .wait_with_output()
+                .await
+                .context("await unzip output after stdin write failed")?;
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!(
+                "write to unzip stdin failed ({write_err}) — unzip exited with {:?}, stderr: {}",
+                output.status.code(),
+                stderr.trim()
+            );
+        }
         // Drop closes stdin so unzip emits stdout + exits.
     }
 
@@ -463,5 +508,49 @@ mod tests {
     fn test_classify_failure_recognises_csv_utf8_breakage() {
         let err = anyhow::anyhow!("CSV body is not valid UTF-8");
         assert_eq!(classify_bhavcopy_failure(&err), "csv_not_utf8");
+    }
+
+    /// PREVOI-01 regression: empty body must fail with a clear message
+    /// BEFORE the misleading BrokenPipe from `unzip -p -`. Live evidence:
+    /// 2026-05-05 14:04:04.940 IST.
+    #[tokio::test]
+    async fn test_unzip_csv_from_empty_body_returns_clear_error() {
+        let result = unzip_csv_from_zip_body(&[]).await;
+        let err = result.expect_err("empty body must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("ZIP body too short") && msg.contains("0 bytes"),
+            "expected clear empty-body error, got: {msg}"
+        );
+    }
+
+    /// PREVOI-01 regression: HTML error page (NSE bot-protection) must
+    /// fail with a clear "wrong magic bytes" message that includes the
+    /// HTML preview, NOT a BrokenPipe.
+    #[tokio::test]
+    async fn test_unzip_csv_from_html_body_returns_clear_error() {
+        let html_body = b"<!DOCTYPE html><html><body>Access denied</body></html>";
+        let result = unzip_csv_from_zip_body(html_body).await;
+        let err = result.expect_err("html body must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("wrong magic bytes")
+                && msg.contains("non-ZIP response")
+                && msg.contains("DOCTYPE"),
+            "expected clear non-ZIP error with HTML preview, got: {msg}"
+        );
+    }
+
+    /// PREVOI-01 regression: a body shorter than 4 bytes must fail
+    /// before any subprocess work.
+    #[tokio::test]
+    async fn test_unzip_csv_from_short_body_returns_clear_error() {
+        let result = unzip_csv_from_zip_body(b"PK").await;
+        let err = result.expect_err("short body must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("ZIP body too short") && msg.contains("2 bytes"),
+            "expected clear short-body error, got: {msg}"
+        );
     }
 }
