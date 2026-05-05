@@ -1354,9 +1354,13 @@ async fn main() -> Result<()> {
                     movers,
                     snapshot_handle,
                     greeks_enricher,
-                    None, // stock_movers_writer — created in slow boot only
+                    // Phase 4b (2026-05-05): stock_movers_writer +
+                    // option_movers_writer params DELETED from
+                    // run_tick_processor. Movers persistence is now
+                    // exclusively the unified MoversWriter
+                    // (movers_1s + 25 mat views) populated by
+                    // movers_pipeline.
                     None, // option_movers — created in slow boot only
-                    None, // option_movers_writer — created in slow boot only
                     fast_registry,
                     Some(fast_tick_heartbeat),
                     None, // tick_enricher — Phase 2.5 wiring deferred until prev_oi_cache + boot ordering gate land in slow boot
@@ -2725,21 +2729,15 @@ async fn main() -> Result<()> {
         // O(1) EXEMPT: cold path — build inline Greeks computer once at startup.
         let greeks_enricher = build_inline_greeks_enricher(&config, &subscription_plan);
 
-        // Audit-2026-05-03: legacy `StockMoversWriter` + `OptionMoversWriter`
-        // RETIRED. Their target tables (`stock_movers` + `option_movers`)
-        // are subsumed by the canonical `movers_1s` + 25 mat views
-        // populated by `movers_pipeline`. Frontend queries should
-        // filter by `instrument_type` against the `movers_*` views
-        // instead of reading the legacy per-category tables.
-        // Passing `None` preserves the `run_tick_processor` signature
-        // for tests + future restoration; the writer code itself is
-        // queued for full deletion in PR #445 alongside API migration.
-        let stock_movers_writer: Option<tickvault_storage::movers_persistence::StockMoversWriter> =
-            None;
+        // Phase 4b (2026-05-05): legacy `StockMoversWriter` +
+        // `OptionMoversWriter` bindings DELETED. Both writer types
+        // were retired in the 2026-05-03 audit and the underlying
+        // `movers_persistence` module was removed in this PR. The
+        // `run_tick_processor` signature no longer accepts the two
+        // writer params. Movers persistence is exclusively the
+        // unified `MoversWriter` (movers_1s + 25 mat views)
+        // populated by `movers_pipeline`.
         let option_movers_tracker = Some(tickvault_core::pipeline::OptionMoversTracker::new());
-        let option_movers_writer: Option<
-            tickvault_storage::movers_persistence::OptionMoversWriter,
-        > = None;
 
         // O(1) EXEMPT: cold path — clone registry once for tick processor enrichment.
         let slow_registry = subscription_plan
@@ -3535,9 +3533,7 @@ async fn main() -> Result<()> {
                 movers,
                 snapshot_handle,
                 greeks_enricher,
-                stock_movers_writer,
                 option_movers_tracker,
-                option_movers_writer,
                 slow_registry,
                 Some(slow_tick_heartbeat),
                 // 29-tf engine Phase 2.6 — production-attach the
