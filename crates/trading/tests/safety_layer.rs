@@ -431,6 +431,9 @@ mod alert_routing {
             (
                 NotificationEvent::WebSocketConnected {
                     connection_index: 0,
+                    subscribed_count: 0,
+                    capacity: 5_000,
+                    last_activity_secs_ago: None,
                 },
                 Severity::Low,
             ),

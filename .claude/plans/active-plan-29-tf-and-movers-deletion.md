@@ -555,7 +555,7 @@ Per operator charter (2026-05-04): defaults locked at maximum-guarantee-within-e
 - [x] Phase 3 commit 2 PR (PR #484 — MERGED) — `CandleEngineMap` per-instrument lookup wrapper (papaya + per-instrument Mutex, 25K pre-sized capacity, 14 unit tests)
 - [x] Phase 3 commit 3 PR (PR #485 — MERGED) — wire `CandleEngine<Tf1s>` into the tick consumer via existing `tick_broadcast` channel; supervisor respawn loop; IST midnight rollover task; lag coalescing; 14 unit tests + 4 source-scan ratchets. Adversarial 4 HIGH fixed inline.
 - [x] Phase 3 commit 4 PR (PR #486 — MERGED) — 22 missing TF markers (Tf3s, Tf10s, Tf2m..Tf14m, Tf30m, Tf1h..Tf4h, Tf1d, Tf1w, Tf1mo) + 28-engine `CascadeFanout` + fanout-aware midnight rollover (legacy 1s-only DELETED). Adversarial 1 CRITICAL + 4 HIGH fixed inline. 7 source-scan ratchets total.
-- [ ] Phase 3 commit 5 PR — parity tests against live `candles_*` matviews (gated on 7-trading-day soak per §6 row 3)
+- [x] Phase 3 commit 5 PR (PR #488 — MERGED) — parity framework (`compare_bars` + `sweep_parity` + `ParityReport`) + 28 read accessors on `CascadeFanout` + framework-validation harness (8 always-on tests) + `make parity-soak`. Adversarial 2 HIGH + 2 MEDIUM fixed inline. NaN canonicalization, ±0.0 canonicalization, I-P1-11 layout pin, `is_clean_with_coverage` false-OK guard.
 - [ ] Phase 3 verified — 14 trading days green-streak ratchet parity (gate per §6 row 3)
 
 ### Phase 4 — read-flip + table deletion (NOT STARTED — gated on Phase 3 verification)
@@ -569,12 +569,12 @@ Per operator charter (2026-05-04): defaults locked at maximum-guarantee-within-e
 
 - [ ] Plan archived to `.claude/plans/archive/2026-MM-DD-29-tf-movers-deletion.md`
 
-### Counts (refreshed 2026-05-05)
+### Counts (refreshed 2026-05-05 post-#488)
 
-- **PRs merged:** 21 (19 production + 2 plan housekeeping/prep). Phase 3 contribution: #482 + #484 + #485 + #486.
+- **PRs merged:** 22 (20 production + 2 plan housekeeping). Phase 3 contribution: #482 + #484 + #485 + #486 + #488.
 - **PRs in flight:** 0
-- **Adversarial findings closed inline:** 7 CRITICAL + 13 HIGH + 8 MEDIUM + L4 e2e gap (pre-impl + production-diff agent passes combined; Phase 3 commits 3+4 added 1C + 8H + 3M)
-- **Ratchet tests added across the plan:** ≥175 (Phase 3.3 + 3.4 added 14 + 14 + 11 = 39 unit/integration + 7 source-scan)
+- **Adversarial findings closed inline:** 8 CRITICAL + 15 HIGH + 10 MEDIUM + L4 e2e gap (Phase 3.5 added 2H + 2M)
+- **Ratchet tests added across the plan:** ≥195 (Phase 3.5 added 18 unit + 8 framework + 3 cascade_fanout = 29)
 
 ### Gates remaining (real-world soak — physically required by §6)
 
