@@ -59,6 +59,89 @@ pub struct ApplicationConfig {
     /// section.
     #[serde(default, rename = "depth_200")]
     pub depth_200: Depth200RootConfig,
+    /// Wave-5 in-memory store §K-L8 (PR #504c) — runtime-tunable
+    /// timeframe list driving the in-memory `CascadeFanout`. Default
+    /// is the 21-TF set per L6 (drops 1s/3s/5s/10s/15s/30s seconds
+    /// engines per L7).
+    #[serde(default)]
+    pub engine: EngineConfig,
+}
+
+/// Container for the `[engine.timeframes]` TOML section. L8 pins the
+/// "TF list source" to `config/base.toml`, so this struct exists to
+/// give downstream code a stable handle to the configured set without
+/// duplicating it in code (`tickvault_app::metrics_catalog::Tf::ALL`
+/// already enumerates the 21 TFs at compile time; this section pins the
+/// runtime override / documentation surface).
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct EngineConfig {
+    #[serde(default)]
+    pub timeframes: TimeframesConfig,
+}
+
+/// Wave-5 §K-L6 / L7 / L8 — the canonical list of operator-facing
+/// timeframes driven by the in-memory `CascadeFanout`. The default
+/// matches `tickvault_app::metrics_catalog::Tf::ALL` exactly (21 entries,
+/// no seconds-resolution engines).
+#[derive(Debug, Clone, Deserialize)]
+pub struct TimeframesConfig {
+    /// 21 entries by default per L6: 1m..15m + 30m + 1h..4h + 1d.
+    /// Operator may override per environment but the ratchet
+    /// `test_engine_timeframes_default_excludes_seconds` blocks any
+    /// re-introduction of the seconds-level engines (L7).
+    #[serde(default = "TimeframesConfig::default_list")]
+    pub list: Vec<String>,
+}
+
+impl Default for TimeframesConfig {
+    fn default() -> Self {
+        Self {
+            list: Self::default_list(),
+        }
+    }
+}
+
+impl TimeframesConfig {
+    /// L6 — 21 timeframes, ordered ascending. Mirrors the compile-time
+    /// `tickvault_app::metrics_catalog::Tf::ALL` list shipped in #504a
+    /// (the catalog stays the wire-format source of truth; this list
+    /// is the runtime-tunable mirror for documentation + future config
+    /// overrides).
+    #[must_use]
+    pub fn default_list() -> Vec<String> {
+        vec![
+            "1m".to_string(),
+            "2m".to_string(),
+            "3m".to_string(),
+            "4m".to_string(),
+            "5m".to_string(),
+            "6m".to_string(),
+            "7m".to_string(),
+            "8m".to_string(),
+            "9m".to_string(),
+            "10m".to_string(),
+            "11m".to_string(),
+            "12m".to_string(),
+            "13m".to_string(),
+            "14m".to_string(),
+            "15m".to_string(),
+            "30m".to_string(),
+            "1h".to_string(),
+            "2h".to_string(),
+            "3h".to_string(),
+            "4h".to_string(),
+            "1d".to_string(),
+        ]
+    }
+
+    /// Returns `true` if the configured list contains a seconds-level
+    /// timeframe. L7 explicitly retired all seconds engines; the
+    /// ratchet `test_engine_timeframes_default_excludes_seconds`
+    /// asserts this returns `false` for the default config.
+    #[must_use]
+    pub fn contains_seconds_tf(&self) -> bool {
+        self.list.iter().any(|tf| tf.ends_with('s'))
+    }
 }
 
 /// Container for the `[depth_20.dynamic]` TOML section.
@@ -1785,6 +1868,7 @@ mod tests {
             features: FeaturesConfig::default(),
             depth_20: Depth20RootConfig::default(),
             depth_200: Depth200RootConfig::default(),
+            engine: EngineConfig::default(),
         }
     }
 
@@ -2415,6 +2499,61 @@ mod tests {
         assert_eq!(config.telegram_api_base_url, "https://api.telegram.org");
         assert_eq!(config.send_timeout_ms, 10_000);
         assert!(!config.sns_enabled);
+    }
+
+    // --- Wave-5 §K-L6/L7/L8 (PR #504c) ratchets -----------------------
+
+    #[test]
+    fn test_engine_timeframes_default_is_21_entries_per_l6() {
+        let cfg = TimeframesConfig::default();
+        assert_eq!(
+            cfg.list.len(),
+            21,
+            "L6 pins 21 timeframes — drift in the runtime list \
+             would silently desync from `metrics_catalog::Tf::ALL`."
+        );
+    }
+
+    #[test]
+    fn test_engine_timeframes_default_excludes_seconds_per_l7() {
+        let cfg = TimeframesConfig::default();
+        assert!(
+            !cfg.contains_seconds_tf(),
+            "L7 retired all seconds-resolution timeframes \
+             (1s/3s/5s/10s/15s/30s) — the default list MUST NOT \
+             contain any. Got: {:?}",
+            cfg.list,
+        );
+    }
+
+    #[test]
+    fn test_engine_timeframes_default_matches_canonical_set() {
+        // Exact-match the L6 list so a future commit cannot silently
+        // re-order or substitute a TF.
+        let cfg = TimeframesConfig::default();
+        let expected: Vec<&str> = vec![
+            "1m", "2m", "3m", "4m", "5m", "6m", "7m", "8m", "9m", "10m", "11m", "12m", "13m",
+            "14m", "15m", "30m", "1h", "2h", "3h", "4h", "1d",
+        ];
+        assert_eq!(cfg.list, expected, "L6 timeframe list drifted");
+    }
+
+    #[test]
+    fn test_engine_timeframes_contains_seconds_tf_helper_detects_30s() {
+        let cfg = TimeframesConfig {
+            list: vec!["30s".to_string(), "1m".to_string()],
+        };
+        assert!(
+            cfg.contains_seconds_tf(),
+            "helper must detect the seconds suffix on `30s`"
+        );
+    }
+
+    #[test]
+    fn test_engine_config_default_inherits_l6_timeframes() {
+        let engine = EngineConfig::default();
+        assert_eq!(engine.timeframes.list.len(), 21);
+        assert!(!engine.timeframes.contains_seconds_tf());
     }
 
     #[test]

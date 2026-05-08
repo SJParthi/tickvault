@@ -54,8 +54,8 @@ use std::sync::Arc;
 use metrics::counter;
 
 use crate::candles::engine::{
-    Bar, Tf1d, Tf1h, Tf1mo, Tf1w, Tf2h, Tf2m, Tf3h, Tf3m, Tf3s, Tf4h, Tf4m, Tf5m, Tf5s, Tf6m, Tf7m,
-    Tf8m, Tf9m, Tf10m, Tf10s, Tf11m, Tf12m, Tf13m, Tf14m, Tf15m, Tf15s, Tf30m, Tf30s,
+    Bar, Tf1d, Tf1h, Tf1mo, Tf1w, Tf2h, Tf2m, Tf3h, Tf3m, Tf4h, Tf4m, Tf5m, Tf6m, Tf7m, Tf8m, Tf9m,
+    Tf10m, Tf11m, Tf12m, Tf13m, Tf14m, Tf15m, Tf30m,
 };
 use crate::candles::engine_map::CandleEngineMap;
 
@@ -66,19 +66,20 @@ pub const METRIC_FANOUT_BARS_PROCESSED: &str = "tv_candle_cascade_fanout_bars_pr
 /// 1s seal rate to verify the cascade is alive.
 pub const METRIC_FANOUT_DERIVED_SEALS: &str = "tv_candle_cascade_fanout_derived_seals_total";
 
-/// Holds the 28 derived candle engine maps and fans every sealed 1s bar
+/// Holds the 23 derived candle engine maps and fans every sealed 1s bar
 /// into all of them.
+///
+/// **Wave-5 §K-L7 (PR #504c)** — the 5 seconds-level derived engines
+/// (`tf3s`, `tf5s`, `tf10s`, `tf15s`, `tf30s`) were retired because no
+/// downstream consumer reads them; raw ticks already provide sub-minute
+/// resolution. This collapses the cascade from 28 → 23 derived engines
+/// and removes ~8 MB of RAM (5 papaya maps × 25K capacity).
 ///
 /// Cloneable: every internal `Arc<CandleEngineMap<TF>>` shares state
 /// across clones, so multiple consumers (the cascade task + the trading
 /// bot reader + the IST midnight rollover task) can hold their own
 /// `CascadeFanout` clone.
 pub struct CascadeFanout {
-    pub(crate) tf3s: Arc<CandleEngineMap<Tf3s>>,
-    pub(crate) tf5s: Arc<CandleEngineMap<Tf5s>>,
-    pub(crate) tf10s: Arc<CandleEngineMap<Tf10s>>,
-    pub(crate) tf15s: Arc<CandleEngineMap<Tf15s>>,
-    pub(crate) tf30s: Arc<CandleEngineMap<Tf30s>>,
     pub(crate) tf1m: Arc<CandleEngineMap<crate::candles::engine::Tf1m>>,
     pub(crate) tf2m: Arc<CandleEngineMap<Tf2m>>,
     pub(crate) tf3m: Arc<CandleEngineMap<Tf3m>>,
@@ -105,7 +106,7 @@ pub struct CascadeFanout {
 }
 
 impl Default for CascadeFanout {
-    /// **Memory cost:** allocates ~45 MB at construction (28 papaya maps
+    /// **Memory cost:** allocates ~37 MB at construction (23 papaya maps
     /// each pre-sized for 25,000 instruments). Call ONCE at boot — do
     /// NOT use in test setup, derive macros, or `unwrap_or_default()`
     /// without understanding the footprint.
@@ -117,11 +118,6 @@ impl Default for CascadeFanout {
 impl Clone for CascadeFanout {
     fn clone(&self) -> Self {
         Self {
-            tf3s: Arc::clone(&self.tf3s),
-            tf5s: Arc::clone(&self.tf5s),
-            tf10s: Arc::clone(&self.tf10s),
-            tf15s: Arc::clone(&self.tf15s),
-            tf30s: Arc::clone(&self.tf30s),
             tf1m: Arc::clone(&self.tf1m),
             tf2m: Arc::clone(&self.tf2m),
             tf3m: Arc::clone(&self.tf3m),
@@ -149,20 +145,18 @@ impl Clone for CascadeFanout {
     }
 }
 
-/// Number of derived timeframes the fanout drives. Pinned by
-/// `count_derived_engines` test below — must equal 28.
-pub const DERIVED_ENGINE_COUNT: usize = 28;
+/// Number of derived timeframes the fanout drives.
+///
+/// **Wave-5 §K-L7 (PR #504c)** dropped the 5 seconds-level engines
+/// (`tf3s`/`tf5s`/`tf10s`/`tf15s`/`tf30s`); was 28, now 23. Pinned by
+/// `count_derived_engines` test below.
+pub const DERIVED_ENGINE_COUNT: usize = 23;
 
 impl CascadeFanout {
-    /// Constructs an empty fanout with all 28 derived engine maps.
+    /// Constructs an empty fanout with all 23 derived engine maps.
     /// Each map pre-allocates capacity for the F&O universe.
     pub fn new() -> Self {
         Self {
-            tf3s: Arc::new(CandleEngineMap::new()),
-            tf5s: Arc::new(CandleEngineMap::new()),
-            tf10s: Arc::new(CandleEngineMap::new()),
-            tf15s: Arc::new(CandleEngineMap::new()),
-            tf30s: Arc::new(CandleEngineMap::new()),
             tf1m: Arc::new(CandleEngineMap::new()),
             tf2m: Arc::new(CandleEngineMap::new()),
             tf3m: Arc::new(CandleEngineMap::new()),
@@ -192,30 +186,16 @@ impl CascadeFanout {
     /// Feeds a sealed 1s bar into every derived engine map. Called by
     /// the cascade task on every successful 1s seal.
     ///
-    /// O(28) per call — constant, not dependent on universe size. Each
-    /// per-map step is O(1) (papaya pin/get + uncontended mutex).
-    /// Increments `tv_candle_cascade_fanout_derived_seals_total` for
-    /// every derived engine that itself emitted a sealed bar (a
-    /// downstream cascade event).
+    /// **Wave-5 §K-L7 (PR #504c)**: O(23) per call (was O(28) before
+    /// the seconds-engine retirement). Each per-map step is O(1)
+    /// (papaya pin/get + uncontended mutex). Increments
+    /// `tv_candle_cascade_fanout_derived_seals_total` for every derived
+    /// engine that itself emitted a sealed bar (a downstream cascade
+    /// event).
     #[inline]
     pub fn feed_sealed_1s_bar(&self, bar: &Bar) {
         counter!(METRIC_FANOUT_BARS_PROCESSED).increment(1);
         let mut derived_seals = 0_u64;
-        if self.tf3s.on_sealed_bar(bar).is_some() {
-            derived_seals += 1;
-        }
-        if self.tf5s.on_sealed_bar(bar).is_some() {
-            derived_seals += 1;
-        }
-        if self.tf10s.on_sealed_bar(bar).is_some() {
-            derived_seals += 1;
-        }
-        if self.tf15s.on_sealed_bar(bar).is_some() {
-            derived_seals += 1;
-        }
-        if self.tf30s.on_sealed_bar(bar).is_some() {
-            derived_seals += 1;
-        }
         if self.tf1m.on_sealed_bar(bar).is_some() {
             derived_seals += 1;
         }
@@ -309,26 +289,9 @@ impl CascadeFanout {
     // Off the per-tick hot path (called by /api/movers + parity tests).
     // ────────────────────────────────────────────────────────────────
 
-    /// Read-only accessor for `Tf3s` engine state.
-    pub fn latest_3s(&self, security_id: u32, segment_code: u8) -> Option<Bar> {
-        self.tf3s.latest(security_id, segment_code)
-    }
-    /// Read-only accessor for `Tf5s` engine state.
-    pub fn latest_5s(&self, security_id: u32, segment_code: u8) -> Option<Bar> {
-        self.tf5s.latest(security_id, segment_code)
-    }
-    /// Read-only accessor for `Tf10s` engine state.
-    pub fn latest_10s(&self, security_id: u32, segment_code: u8) -> Option<Bar> {
-        self.tf10s.latest(security_id, segment_code)
-    }
-    /// Read-only accessor for `Tf15s` engine state.
-    pub fn latest_15s(&self, security_id: u32, segment_code: u8) -> Option<Bar> {
-        self.tf15s.latest(security_id, segment_code)
-    }
-    /// Read-only accessor for `Tf30s` engine state.
-    pub fn latest_30s(&self, security_id: u32, segment_code: u8) -> Option<Bar> {
-        self.tf30s.latest(security_id, segment_code)
-    }
+    // L7 (PR #504c) — `latest_3s` / `_5s` / `_10s` / `_15s` / `_30s`
+    // accessors RETIRED with their backing engines.
+
     /// Read-only accessor for `Tf1m` engine state.
     pub fn latest_1m(&self, security_id: u32, segment_code: u8) -> Option<Bar> {
         self.tf1m.latest(security_id, segment_code)
@@ -438,21 +401,9 @@ impl CascadeFanout {
     // O(1) per call (papaya `len()` is lock-free), 28 named methods.
     // ────────────────────────────────────────────────────────────────
 
-    pub fn len_3s(&self) -> usize {
-        self.tf3s.len()
-    }
-    pub fn len_5s(&self) -> usize {
-        self.tf5s.len()
-    }
-    pub fn len_10s(&self) -> usize {
-        self.tf10s.len()
-    }
-    pub fn len_15s(&self) -> usize {
-        self.tf15s.len()
-    }
-    pub fn len_30s(&self) -> usize {
-        self.tf30s.len()
-    }
+    // L7 (PR #504c) — `len_3s` / `_5s` / `_10s` / `_15s` / `_30s`
+    // accessors RETIRED with their backing engines.
+
     pub fn len_1m(&self) -> usize {
         self.tf1m.len()
     }
@@ -525,16 +476,12 @@ impl CascadeFanout {
 
     /// Forces every derived engine in every map to seal its open bar.
     /// Used at IST midnight rollover (per L13). Returns the total
-    /// count of bars that were sealed across all 28 derived engines.
+    /// count of bars that were sealed across all 23 derived engines.
     ///
-    /// O(N × 28) over instruments — runs once per day. Not hot path.
+    /// **Wave-5 §K-L7 (PR #504c)**: O(N × 23) (was 28 before the
+    /// seconds-engine retirement). Runs once per day. Not hot path.
     pub fn force_seal_all(&self) -> u64 {
         let mut total = 0_u64;
-        total += u64::from(self.tf3s.force_seal_all());
-        total += u64::from(self.tf5s.force_seal_all());
-        total += u64::from(self.tf10s.force_seal_all());
-        total += u64::from(self.tf15s.force_seal_all());
-        total += u64::from(self.tf30s.force_seal_all());
         total += u64::from(self.tf1m.force_seal_all());
         total += u64::from(self.tf2m.force_seal_all());
         total += u64::from(self.tf3m.force_seal_all());
@@ -591,34 +538,29 @@ mod tests {
     }
 
     #[test]
-    fn count_derived_engines_is_exactly_28() {
-        // Plan §1 L3: 29 timeframes total. 1s is the hot-path engine,
-        // the other 28 are derived. Pin the count.
-        assert_eq!(DERIVED_ENGINE_COUNT, 28);
+    fn count_derived_engines_is_exactly_23() {
+        // Wave-5 §K-L7 (PR #504c): the 5 seconds-level engines were
+        // retired. 23 derived engines remain (was 28).
+        assert_eq!(DERIVED_ENGINE_COUNT, 23);
     }
 
     #[test]
     fn cascade_fanout_new_returns_empty_maps() {
         let fanout = CascadeFanout::new();
-        assert_eq!(fanout.tf3s.len(), 0);
+        assert_eq!(fanout.tf1m.len(), 0);
         assert_eq!(fanout.tf30m.len(), 0);
         assert_eq!(fanout.tf1mo.len(), 0);
     }
 
     #[test]
     fn feed_sealed_1s_bar_propagates_to_every_derived_engine() {
-        // Hostile review H2 fix: assert ALL 28 derived engines (not a
+        // Hostile review H2 fix: assert ALL 23 derived engines (not a
         // representative subset) — a buggy edit that drops any one
         // `on_sealed_bar` call must fail this test, not pass silently.
         let fanout = CascadeFanout::new();
         let bar = make_sealed_1s_bar(1234, 1, 1_000);
         fanout.feed_sealed_1s_bar(&bar);
         let assertions: [(&str, Option<Bar>); DERIVED_ENGINE_COUNT] = [
-            ("tf3s", fanout.tf3s.latest(1234, 1)),
-            ("tf5s", fanout.tf5s.latest(1234, 1)),
-            ("tf10s", fanout.tf10s.latest(1234, 1)),
-            ("tf15s", fanout.tf15s.latest(1234, 1)),
-            ("tf30s", fanout.tf30s.latest(1234, 1)),
             ("tf1m", fanout.tf1m.latest(1234, 1)),
             ("tf2m", fanout.tf2m.latest(1234, 1)),
             ("tf3m", fanout.tf3m.latest(1234, 1)),
@@ -660,19 +602,20 @@ mod tests {
         bar_seg2.close = 999.0;
         fanout.feed_sealed_1s_bar(&bar_seg1);
         fanout.feed_sealed_1s_bar(&bar_seg2);
-        let seg1 = fanout.tf3s.latest(27, 0).expect("seg 0 present");
-        let seg2 = fanout.tf3s.latest(27, 1).expect("seg 1 present");
+        let seg1 = fanout.tf1m.latest(27, 0).expect("seg 0 present");
+        let seg2 = fanout.tf1m.latest(27, 1).expect("seg 1 present");
         assert_ne!(seg1.close, seg2.close);
     }
 
     #[test]
-    fn force_seal_all_returns_count_across_all_28_engines() {
+    fn force_seal_all_returns_count_across_all_23_engines() {
         let fanout = CascadeFanout::new();
         let bar = make_sealed_1s_bar(42, 1, 1_000);
         fanout.feed_sealed_1s_bar(&bar);
-        // 28 derived engines × 1 instrument × 1 open bar each = 28 seals.
+        // 23 derived engines × 1 instrument × 1 open bar each = 23 seals
+        // (Wave-5 §K-L7: was 28 before seconds-engine retirement).
         let total = fanout.force_seal_all();
-        assert_eq!(total, 28);
+        assert_eq!(total, 23);
     }
 
     #[test]
@@ -729,9 +672,7 @@ mod tests {
     #[test]
     fn len_accessors_return_zero_on_empty_fanout() {
         let fanout = CascadeFanout::new();
-        assert_eq!(fanout.len_3s(), 0);
-        assert_eq!(fanout.len_5s(), 0);
-        assert_eq!(fanout.len_30s(), 0);
+        // L7 (PR #504c): no seconds-level engines anymore.
         assert_eq!(fanout.len_1m(), 0);
         assert_eq!(fanout.len_30m(), 0);
         assert_eq!(fanout.len_1h(), 0);
@@ -748,9 +689,8 @@ mod tests {
         let fanout = CascadeFanout::new();
         let bar = make_sealed_1s_bar(1234, 1, 1_000);
         fanout.feed_sealed_1s_bar(&bar);
-        // Spot-check across the second / minute / hour / day / month spectrum.
-        assert_eq!(fanout.len_3s(), 1);
-        assert_eq!(fanout.len_30s(), 1);
+        // Spot-check across the minute / hour / day / month spectrum
+        // (seconds-level engines retired in L7).
         assert_eq!(fanout.len_1m(), 1);
         assert_eq!(fanout.len_30m(), 1);
         assert_eq!(fanout.len_1h(), 1);
@@ -771,10 +711,13 @@ mod tests {
         assert_eq!(fanout.len_30m(), 2, "I-P1-11 isolation broken on len_30m");
     }
 
+    // L7 (PR #504c): `len_accessor_explicit_name_match_3s` retired
+    // alongside its backing engine. Keep the `_1mo` smoke test as the
+    // floor / ceiling of the timeframe spectrum.
     #[test]
-    fn len_accessor_explicit_name_match_3s() {
+    fn len_accessor_explicit_name_match_1m() {
         let f = CascadeFanout::new();
-        let _ = f.len_3s();
+        let _ = f.len_1m();
     }
 
     #[test]
@@ -792,11 +735,7 @@ mod tests {
         let bar = make_sealed_1s_bar(7777, 2, 1_000);
         fanout.feed_sealed_1s_bar(&bar);
         let assertions: [(&str, Option<Bar>); DERIVED_ENGINE_COUNT] = [
-            ("latest_3s", fanout.latest_3s(7777, 2)),
-            ("latest_5s", fanout.latest_5s(7777, 2)),
-            ("latest_10s", fanout.latest_10s(7777, 2)),
-            ("latest_15s", fanout.latest_15s(7777, 2)),
-            ("latest_30s", fanout.latest_30s(7777, 2)),
+            // L7 (PR #504c): seconds-level latest accessors retired.
             ("latest_1m", fanout.latest_1m(7777, 2)),
             ("latest_2m", fanout.latest_2m(7777, 2)),
             ("latest_3m", fanout.latest_3m(7777, 2)),
@@ -833,7 +772,8 @@ mod tests {
     fn every_latest_accessor_returns_none_for_unknown_key() {
         let fanout = CascadeFanout::new();
         // No bars fed yet — all accessors must return None.
-        assert!(fanout.latest_3s(0, 0).is_none());
+        // L7 (PR #504c): seconds-level accessors retired.
+        assert!(fanout.latest_1m(0, 0).is_none());
         assert!(fanout.latest_30m(0, 0).is_none());
         assert!(fanout.latest_1h(0, 0).is_none());
         assert!(fanout.latest_1d(0, 0).is_none());
