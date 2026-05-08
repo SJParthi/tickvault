@@ -2427,6 +2427,32 @@ mod tests {
     }
 
     #[test]
+    fn test_default_metrics_bind_addr_is_loopback() {
+        // L123 (Wave-5 plan §AA, SEC-H1): the helper used by
+        // `#[serde(default)]` MUST return a loopback address so that
+        // configs that omit `metrics_bind_addr` do not silently
+        // expose `/metrics` on `0.0.0.0`.
+        let addr = ObservabilityConfig::default_metrics_bind_addr();
+        assert!(
+            addr.is_loopback(),
+            "L123: default metrics bind must be loopback, got {addr}"
+        );
+        assert_eq!(addr, std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    }
+
+    #[test]
+    fn test_observability_config_default_metrics_bind_addr_is_loopback() {
+        // Mirror the field-level default in the full struct's
+        // `Default` impl so future changes to `default()` cannot drift
+        // away from the L123 contract.
+        let config = ObservabilityConfig::default();
+        assert!(
+            config.metrics_bind_addr.is_loopback(),
+            "Default ObservabilityConfig must bind metrics to loopback (L123)"
+        );
+    }
+
+    #[test]
     fn test_historical_data_config_default() {
         let config = HistoricalDataConfig::default();
         assert!(config.enabled);
