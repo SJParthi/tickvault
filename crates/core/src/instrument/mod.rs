@@ -25,7 +25,6 @@ pub mod depth_top_volume_selector;
 pub mod diagnostic;
 pub mod dynamic_subscription_state;
 pub mod instrument_loader;
-pub mod live_tick_atm_resolver;
 pub mod market_open_self_test;
 pub mod phase2_delta;
 pub mod phase2_emit_guard;

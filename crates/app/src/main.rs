@@ -3738,48 +3738,34 @@ async fn main() -> Result<()> {
         let spot_prices_updater = std::sync::Arc::clone(&shared_spot_prices);
         let mut spot_rx = tick_broadcast_sender.subscribe();
 
-        // 2026-04-25: Spot updater now also captures NSE_EQ cash-equity LTPs
-        // for the 216 F&O stocks. This is the LIVE-tick source consumed by
-        // the Mode C live-tick ATM resolver (mid-market boots). Index lookup
-        // includes only the 3 full-chain indices (NIFTY/BANKNIFTY/SENSEX);
-        // FINNIFTY/MIDCPNIFTY were dropped 2026-04-25.
-        let index_lookup =
-            tickvault_core::instrument::live_tick_atm_resolver::build_full_chain_index_lookup();
-        // Build NSE_EQ stock lookup from the F&O universe: price_feed_security_id → underlying_symbol.
-        // APPROVED: I-P1-11 — `stock_lookup_map` is single-segment NSE_EQ by construction (only F&O stock underlyings inserted).
-        let stock_lookup_map: std::collections::HashMap<u32, String> = slow_boot_universe
-            .as_ref()
-            .map(|u| {
-                u.underlyings
-                    .values()
-                    .filter(|ul| {
-                        matches!(
-                            ul.kind,
-                            tickvault_common::instrument_types::UnderlyingKind::Stock
-                        ) && matches!(
-                            ul.price_feed_segment,
-                            tickvault_common::types::ExchangeSegment::NseEquity
-                        )
-                    })
-                    .map(|ul| (ul.price_feed_security_id, ul.underlying_symbol.clone()))
-                    .collect()
-            })
-            .unwrap_or_default();
+        // Wave-5 indices-only scope (PR #509): only IDX_I (NIFTY/BANKNIFTY/SENSEX)
+        // spot prices are needed downstream — depth rebalancer + greeks. The
+        // legacy `live_tick_atm_resolver` helpers (`build_full_chain_index_lookup`
+        // + `classify_tick_for_spot_update` + `partition_resolved_and_stragglers`)
+        // were stock-F&O ATM resolution scaffolding and are dead under
+        // indices-only. The IDX_I lookup is inlined here; stock LTP capture is
+        // dropped entirely.
+        // APPROVED: I-P1-11 — `index_lookup` is single-segment IDX_I by construction.
+        let index_lookup: std::collections::HashMap<u32, &'static str> = {
+            let mut m = std::collections::HashMap::with_capacity(3);
+            m.insert(13_u32, "NIFTY");
+            m.insert(25_u32, "BANKNIFTY");
+            m.insert(51_u32, "SENSEX");
+            m
+        };
+        const IDX_I_SEGMENT_CODE: u8 = 0;
 
-        let cash_equity_count = stock_lookup_map.len();
         tokio::spawn(async move {
             loop {
                 match spot_rx.recv().await {
                     Ok(tick) => {
-                        if let Some(sym) =
-                            tickvault_core::instrument::live_tick_atm_resolver::classify_tick_for_spot_update(
-                                tick.security_id,
-                                tick.exchange_segment_code,
-                                tick.last_traded_price,
-                                &index_lookup,
-                                &stock_lookup_map,
-                            )
-                        {
+                        if tick.exchange_segment_code != IDX_I_SEGMENT_CODE {
+                            continue;
+                        }
+                        if tick.last_traded_price <= 0.0 || !tick.last_traded_price.is_finite() {
+                            continue;
+                        }
+                        if let Some(sym) = index_lookup.get(&tick.security_id).copied() {
                             tickvault_core::instrument::depth_rebalancer::update_spot_price(
                                 &spot_prices_updater,
                                 sym,
@@ -3794,8 +3780,7 @@ async fn main() -> Result<()> {
             }
         });
         info!(
-            cash_equities = cash_equity_count,
-            "spot price updater started — capturing index + cash-equity LTPs (Mode C live-tick ATM source)"
+            "spot price updater started — capturing IDX_I LTPs (NIFTY/BANKNIFTY/SENSEX) for depth + greeks"
         );
     }
 
