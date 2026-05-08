@@ -1,6 +1,6 @@
 # Design Plan: In-Memory Store (§17) + AWS Instance Re-evaluation (§18 v2)
 
-**Status:** DRAFT v5 — 46 design decisions LOCKED 2026-05-08 (L1–L46 in §K + §Q). 2 open verification gates (`OPEN-VERIFY-1`, `OPEN-VERIFY-2`). No implementation contract until both gates close + operator approves §K/§Q → APPROVED status.
+**Status:** DRAFT v6 — 52 design decisions LOCKED 2026-05-08 (L1–L52 across §K + §Q + §R). 2 open verification gates (`OPEN-VERIFY-1`, `OPEN-VERIFY-2`). No implementation contract until both gates close + operator approves all sections → APPROVED status.
 **Date:** 2026-05-07
 **Authors:** Parthiban (architect), Claude (builder)
 **Branch:** to-be-created on operator approval
@@ -559,4 +559,153 @@ PR-C2 (live wire cutover) of `active-plan-depth-dynamic-redesign.md` is **pendin
 
 ---
 
-**End of DRAFT v5.** Awaiting OPEN-VERIFY-1 + OPEN-VERIFY-2 closure for APPROVED status.
+## §R) Dead-code removal + table-drop guarantee (NEW 2026-05-08)
+
+Operator demand 2026-05-08: "ensure dead code removal and table drops precisely with guarantee — nothing left behind."
+
+### Locked principles — L47–L52
+
+| # | Locked | Detail |
+|---|---|---|
+| **L47** | Every removed item has a mechanical guard | banned-pattern hook prevents re-introduction; commit blocked at pre-commit gate |
+| **L48** | Every dropped table has a runtime ratchet | test scans codebase + DDL for any reference to dropped table; build fails if found |
+| **L49** | Every retired ErrorCode has a cross-ref guard | `error_code_rule_file_crossref.rs` + `error_code_tag_guard.rs` both must accept the deletion |
+| **L50** | Every removed Prom metric has a dashboard cleanup | Grafana JSON files scanned for orphaned references; CI fails if found |
+| **L51** | Operator runbook + verification SQL | step-by-step `DROP TABLE` commands + post-drop `SELECT count(*) FROM tables() WHERE name = ...` verification |
+| **L52** | Audit trail for the cleanup | each dropped item logged in `cleanup_audit_log` table with `(ts, item_kind, item_name, sha_of_removing_pr)` for SEBI traceability |
+
+### §R.1 — Complete inventory of dead code to remove (in PR #509)
+
+| File / module | Reason | Action | Verification |
+|---|---|---|---|
+| `crates/core/src/instrument/live_tick_atm_resolver.rs` | Stock F&O ATM resolution; dead under indices-only | DELETE entirely | `test_live_tick_atm_resolver_file_does_not_exist` |
+| `crates/core/src/instrument/preopen_rest_fallback.rs` | Stock F&O pre-open close fallback; dead under static universe | DELETE entirely | `test_preopen_rest_fallback_file_does_not_exist` |
+| `crates/core/src/instrument/preopen_price_buffer.rs` | Stock F&O 09:00-09:12 buffer; dead under static universe | DELETE entirely | `test_preopen_price_buffer_file_does_not_exist` |
+| `crates/core/src/instrument/boot_mode.rs::detect_boot_mode` | 4-mode resolver; only `is_within_market_hours_ist` is needed | SIMPLIFY — keep only the helper function; delete `BootMode` enum + `detect_boot_mode` + `MidMarketBootComplete` event | `test_boot_mode_enum_does_not_exist` |
+| `crates/core/src/instrument/phase2_dispatcher.rs` (if separate) | Phase 2 subscription dispatcher; readiness check stays | DELETE dispatcher; KEEP only `phase2_readiness_check.rs` | `test_phase2_dispatcher_file_does_not_exist` |
+| `crates/app/src/main.rs` boot wiring | calls to deleted resolvers | REMOVE corresponding boot calls; keep readiness check spawn | `test_main_does_not_call_live_tick_atm_resolver` |
+| 1s engine in `CandleEngineMap` | seconds TFs dropped | REMOVE `1s` from `[engine.timeframes].list`; `CascadeFanout` no longer instantiates 1s engine | `test_no_seconds_engines_in_cascade` |
+| 3s/5s/10s/15s/30s engines | seconds TFs dropped | same as above | same |
+| Phase2 unified dispatcher hand-off (if any code path) | no dispatcher under static | confirm by grep — should be zero refs | `test_no_phase2_dispatcher_call_in_main` |
+| `Bar` struct fields removed (none) | All 5 new fields are ADDS, no removals | n/a | n/a |
+| `MoversEngine` struct (if present in any file) | replaced by `candle_storage.top_n_by` | confirm absent — should never have been a struct | `test_no_movers_engine_struct_in_codebase` |
+
+### §R.2 — Tables to DROP (QuestDB)
+
+| Table | Reason | When | Operator runbook step |
+|---|---|---|---|
+| `stock_movers` | Phase 4b — replaced by RAM | PR #507 | `DROP TABLE IF EXISTS stock_movers` (after 30-day clean window per existing runbook) |
+| `option_movers` | Phase 4b — replaced by RAM | PR #507 | `DROP TABLE IF EXISTS option_movers` (same window) |
+| `candles_1s` materialized view | seconds TF dropped | PR #504c | `DROP MATERIALIZED VIEW IF EXISTS candles_1s` |
+| `candles_3s` matview | same | PR #504c | same |
+| `candles_5s` matview | same | PR #504c | same |
+| `candles_10s` matview | same | PR #504c | same |
+| `candles_15s` matview | same | PR #504c | same |
+| `candles_30s` matview | same | PR #504c | same |
+| `movers_1s` matview (if exists) | already DROPPED at Phase 4b | confirm | `SELECT count(*) FROM tables() WHERE name LIKE 'movers%'` should return 0 |
+| `movers_5s` ... `movers_1d` matviews | already DROPPED at Phase 4b | confirm | same |
+
+### §R.3 — Verification SQL (mandatory in operator runbook)
+
+```sql
+-- After all DROPs, these queries MUST return zero rows:
+SELECT count(*) FROM tables() WHERE name = 'stock_movers';      -- expect: 0
+SELECT count(*) FROM tables() WHERE name = 'option_movers';     -- expect: 0
+SELECT count(*) FROM tables() WHERE name LIKE 'movers%';        -- expect: 0
+SELECT count(*) FROM tables() WHERE name LIKE 'candles_1s%';    -- expect: 0
+SELECT count(*) FROM tables() WHERE name LIKE 'candles_3s%';    -- expect: 0
+SELECT count(*) FROM tables() WHERE name LIKE 'candles_5s%';    -- expect: 0
+SELECT count(*) FROM tables() WHERE name LIKE 'candles_10s%';   -- expect: 0
+SELECT count(*) FROM tables() WHERE name LIKE 'candles_15s%';   -- expect: 0
+SELECT count(*) FROM tables() WHERE name LIKE 'candles_30s%';   -- expect: 0
+
+-- Surviving candles matviews (21 expected):
+SELECT name FROM tables() WHERE name LIKE 'candles_%' ORDER BY name;
+-- expect: candles_1d, candles_1h, candles_1m, candles_2m, ..., candles_15m, candles_30m, candles_2h, candles_3h, candles_4h
+```
+
+### §R.4 — Mechanical guards (banned-pattern hook additions)
+
+Add to `.claude/hooks/banned-pattern-scanner.sh` category 7 (NEW):
+
+| Pattern | Block reason | Where |
+|---|---|---|
+| `MoversEngine\s*\{` (struct definition) | replaced by query method on candle storage | any prod `*.rs` |
+| `OptionMoversWriter\b\|StockMoversWriter\b` | deleted at PR #494 | any prod `*.rs` |
+| `live_tick_atm_resolver\b` | deleted at PR #509 | any prod `*.rs` |
+| `preopen_rest_fallback\b` | deleted at PR #509 | any prod `*.rs` |
+| `BootMode::(PreMarket\|MidPreMarket\|MidMarket\|PostMarket)` | enum dropped | any prod `*.rs` |
+| `detect_boot_mode\s*\(` | function dropped | any prod `*.rs` |
+| `Phase2Dispatcher\b` | dispatcher dropped | any prod `*.rs` |
+| `"1s"\|"3s"\|"5s"\|"10s"\|"15s"\|"30s"` in `[engine.timeframes]` context | seconds TFs dropped | `config/*.toml` |
+| `candles_1s\b\|candles_3s\b\|candles_5s\b\|candles_10s\b\|candles_15s\b\|candles_30s\b` | matview names dropped | any `*.rs`, `*.sql`, `*.json` |
+| `stock_movers\b\|option_movers\b` (writes only — reads in audit/migration scripts allowed under `// APPROVED:` comment) | tables dropped | any prod `*.rs`, `*.sql` |
+
+### §R.5 — Ratchet tests (mandatory in PR #509 + #504c + #507)
+
+| Test | What it asserts | File |
+|---|---|---|
+| `test_live_tick_atm_resolver_deleted` | file does not exist | `crates/core/tests/static_universe_cleanup_guard.rs` |
+| `test_preopen_rest_fallback_deleted` | file does not exist | same |
+| `test_preopen_price_buffer_deleted` | file does not exist | same |
+| `test_boot_mode_enum_deleted` | grep returns no match | same |
+| `test_phase2_dispatcher_deleted` | file does not exist | same |
+| `test_no_seconds_engines_in_cascade` | `CascadeFanout::engines()` does not contain 1s/3s/5s/10s/15s/30s | `crates/trading/tests/cascade_seconds_dropped_guard.rs` |
+| `test_no_movers_engine_struct` | grep `crates/**/src` returns no `pub struct MoversEngine` | `crates/storage/tests/no_movers_engine_guard.rs` |
+| `test_dropped_tables_not_referenced` | scan all `.rs` + `.sql` + `.json` for `stock_movers`/`option_movers`; only `// APPROVED:` annotated lines pass | `crates/storage/tests/dropped_tables_reference_guard.rs` |
+| `test_dropped_matviews_not_in_ddl` | scan storage DDL strings for `candles_1s`/`3s`/`5s`/`10s`/`15s`/`30s`; expect 0 | `crates/storage/tests/dropped_matviews_ddl_guard.rs` |
+| `test_grafana_dashboards_no_orphan_metrics` | scan `deploy/docker/grafana/dashboards/*.json` for `tv_movers_writer_*`/`candles_1s_*` panels; expect 0 | `crates/storage/tests/grafana_orphan_metric_guard.rs` |
+| `test_error_code_movers_retired` | `MOVERS-01`/`02`/`03` not in `ErrorCode` enum | already exists in `crates/common/src/error_code.rs` ratchet |
+
+### §R.6 — Operator runbook (NEW file)
+
+A new runbook `docs/runbooks/dead-code-and-tables-removal.md` will land alongside PR #509 with:
+- Step-by-step DROP commands in execution order
+- Pre-conditions (Phase 4a/4b clean window confirmation)
+- Verification SELECTs after each DROP
+- Rollback plan (none — DROPs are irreversible; backups via S3 archive of partitions taken in `s3_archive` Wave 2 Item 9.4)
+- 30-day post-DROP clean-window confirmation gate (per existing `phase-4b-movers-cleanup.md`)
+
+### §R.7 — Cleanup audit log table (NEW)
+
+```sql
+CREATE TABLE IF NOT EXISTS cleanup_audit_log (
+    ts TIMESTAMP,
+    item_kind SYMBOL CAPACITY 16,           -- 'table_drop' | 'matview_drop' | 'file_delete' | 'metric_remove' | 'errorcode_retire' | 'guard_add'
+    item_name SYMBOL CAPACITY 256,
+    pr_sha SYMBOL CAPACITY 64,
+    operator_initials SYMBOL CAPACITY 8,
+    notes STRING
+) timestamp(ts) PARTITION BY MONTH WAL DEDUP UPSERT KEYS(ts, item_kind, item_name);
+```
+
+Every cleanup PR (#504c, #507, #509) writes one row per dropped item to this table at deploy time. SEBI-relevant trail.
+
+### §R.8 — Updated PR sequence (cleanup-aware)
+
+| # | PR | Cleanup scope |
+|---|---|---|
+| #504a | observability prereq | none — adds `tv_subsystem_memory_bytes` |
+| #504b | schema + struct | none — adds 5 new Bar fields |
+| #504c | TF list config | **DROP `candles_1s/3s/5s/10s/15s/30s` matviews + remove seconds engines from CascadeFanout + add ratchet `test_no_seconds_engines_in_cascade`** |
+| #504d | in-memory store | none — adds tick + bar storage |
+| #504e | % stamping | none |
+| #505 | read flip | none — adds REST wrapper |
+| #507 | Phase 4b drops | **DROP `stock_movers` + `option_movers` per existing operator runbook + add `test_dropped_tables_not_referenced`** |
+| #508 | AWS deploy | none — infra commit |
+| **#509 (NEW)** | **static-universe cleanup** | **DELETE `live_tick_atm_resolver.rs` + `preopen_rest_fallback.rs` + `preopen_price_buffer.rs` + simplify `boot_mode.rs` + remove main.rs boot calls + add 5 ratchet tests + banned-pattern category 7** |
+
+### What this guarantees
+
+| Goal | Mechanism |
+|---|---|
+| Every dead file deleted | per-file ratchet test asserts non-existence |
+| Every dropped table gone | post-DROP SELECT verification + ratchet scanning DDL |
+| No re-introduction possible | banned-pattern category 7 blocks at pre-commit gate |
+| No dangling Prom/Grafana refs | dashboard scanner ratchet |
+| SEBI audit trail | `cleanup_audit_log` table per item |
+| Operator can verify | runbook with SQL post-drop verification |
+
+---
+
+**End of DRAFT v6.** Awaiting OPEN-VERIFY-1 + OPEN-VERIFY-2 closure for APPROVED status.
