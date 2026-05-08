@@ -45,8 +45,10 @@ pub mod consumer;
 pub mod prev_day_cache;
 pub mod reset_scheduler;
 pub mod tick_storage;
+pub mod top_n;
 
 pub use consumer::run_tick_storage_consumer;
 pub use prev_day_cache::PrevDayCache;
 pub use reset_scheduler::{run_tick_storage_daily_reset, secs_until_next_market_open_ist};
 pub use tick_storage::{DEFAULT_PER_INSTRUMENT_CAPACITY, TickStorage};
+pub use top_n::{Category, Scope, TopNQuery, top_n_by_bars};
