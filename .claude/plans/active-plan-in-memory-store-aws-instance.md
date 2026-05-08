@@ -1,6 +1,6 @@
 # Design Plan: In-Memory Store (§17) + AWS Instance Re-evaluation (§18 v2)
 
-**Status:** DRAFT v3 — 33 design decisions LOCKED 2026-05-08 (L1–L33 in §K). 2 open verification gates (`OPEN-VERIFY-1`, `OPEN-VERIFY-2`). No implementation contract until both gates close + operator approves §K → APPROVED status.
+**Status:** DRAFT v4 — 36 design decisions LOCKED 2026-05-08 (L1–L36 in §K). 2 open verification gates (`OPEN-VERIFY-1`, `OPEN-VERIFY-2`). No implementation contract until both gates close + operator approves §K → APPROVED status.
 **Date:** 2026-05-07
 **Authors:** Parthiban (architect), Claude (builder)
 **Branch:** to-be-created on operator approval
@@ -378,12 +378,15 @@ If we move to ARM, the ratchet bench numbers must be re-baselined and the claim 
 
 | # | Locked | Detail |
 |---|---|---|
-| L28 | Top-N calculation primitive | `MoversEngine.top_k_filtered(filters, sort_key, n) -> Vec<Bar>` — no hard cap on N (operator-controlled per call) |
-| L29 | Filter dimensions | **Segment** (NSE_EQ, NSE_FNO, IDX_I, BSE_EQ, BSE_FNO), **Instrument type** (Index, Stock, Equity, F&O futures, F&O options), **Expiry** (date or month label, e.g. "26 MAY", "26 JUN"), **Option type** (CE / PE / nil), **Underlying** (NIFTY, BANKNIFTY, SENSEX, ...), **Strike range** (e.g. ATM±25) |
-| L30 | Filter composition | All filters compose with logical AND. Operator can request any combination, e.g. `(segment=NSE_FNO, expiry=2026-05-29, option_type=CE, sort_key=VolumeDesc, n=20)` |
-| L31 | No N restriction | N can be 10, 100, 250 (depth-20 cohort), 500, 1000, or any value ≤ universe size. Latency scales linearly with universe size, not N. Total cost: ~50 µs per call regardless of N. |
-| L32 | Composite ranking (two-stage) | `top_k_then_sort(primary_filter, k, secondary_sort, n)` — operator's exact pattern: top-K by primary metric (e.g. volume), re-rank within cohort by secondary (e.g. close_pct_from_prev_day) |
-| L33 | Reuse for depth-20 / depth-200 | Same `top_k_filtered` machinery: depth-20 = `top_k_filtered(NSE_FNO, VolumeDesc, 250)`; depth-200 = same with n=5 |
+| L28 | Top-N calculation primitive | **Method on candle storage map**: `candle_storage.top_n_by(category, expiry, scope, n) -> Vec<Bar>`. **No separate `MoversEngine` struct.** No hard cap on N. |
+| L29 | Filter dimensions (Dhan-parity, 3 only) | (1) **Category** = sort field + direction (7 values mapping to Dhan UI tabs); (2) **Expiry** = date label (e.g. "26 MAY", "26 JUN", "26 JUL"); (3) **Scope** = mutually-exclusive 5-way enum (All / Index / Stock / NSE / BSE). **DROPPED:** option type (CE/PE), underlying, strike range — Dhan UI doesn't filter on these, neither do we. |
+| L30 | 7 categories → (sort_field, direction) | Highest OI: `open_interest DESC` / OI Gainers: `oi_pct_from_prev_day DESC` / OI Losers: `oi_pct_from_prev_day ASC` / Top Volume: `cumulative_volume DESC` / Top Value: `(close × cumulative_volume) DESC` / Price Gainers: `close_pct_from_prev_day DESC` / Price Losers: `close_pct_from_prev_day ASC` |
+| L31 | Scope enum mapping | `All` = no filter / `Index` = instrument_type IN (Index, IndexFuture, IndexOption) / `Stock` = instrument_type IN (Equity, StockFuture, StockOption) / `NSE` = segment IN (NSE_EQ, NSE_FNO, IDX_I) / `BSE` = segment IN (BSE_EQ, BSE_FNO) |
+| L32 | No N restriction | N is operator-controlled per call. Latency ~50 µs scales linearly with universe size, not N. |
+| L33 | Composite ranking (two-stage, optional) | For depth-dynamic cohort selection: primary filter (top-K by volume) → secondary sort (by close_pct_from_prev_day) — implemented as compose of two `top_n_by` calls when needed |
+| L34 | Reuse for depth-20 / depth-200 | Same `candle_storage.top_n_by` method: depth-20 = `top_n_by(category=TopVolume, expiry=current, scope=NSE, n=250)`; depth-200 = same with n=5. **No separate selector code.** |
+| L35 | NO `MoversEngine` abstraction | Architecture has only **TWO** in-memory data structures: (a) **tick map** `papaya<(security_id, exchange_segment), Vec<ParsedTick>>`, (b) **candle map** per TF `papaya<(security_id, exchange_segment), CandleEngineMap<TF>>`. Top-N is a query method on (b). **No separate movers engine, no separate writer, no separate aggregation pipeline.** |
+| L36 | `/api/movers/v2` endpoint | URL stays for Dhan UI parity. Internally a ~30 LoC handler: parse query params (category, expiry, scope, n) → call `candle_storage.top_n_by(...)` → serialize bars to JSON. **No business logic — just a thin REST wrapper.** |
 
 ## §N) Static-subscribe model — what we DROPPED from the design
 
@@ -408,7 +411,7 @@ The shift to static universe + indices-only scope retires several design element
 | 3 | **#504c** TF list config | `[engine.timeframes]` array + remove seconds engines | crates/trading, config, app |
 | 4 | **#504d** In-memory store | Tick ring (full day) + bar storage per (instrument, TF) + IST 09:15 reset | crates/trading, app |
 | 5 | **#504e** % stamping at seal | close_pct, oi_pct, volume_pct computed in `seal_bar` | crates/trading |
-| 6 | **#505** Read flip | `/api/movers/v2` reads `MoversEngine` façade; `top_k_filtered` API supporting filter dimensions L29 | crates/api, trading |
+| 6 | **#505** Read flip | `/api/movers/v2` is a ~30 LoC REST wrapper calling `candle_storage.top_n_by(category, expiry, scope, n)`. **No separate `MoversEngine` struct.** 7 categories × 3 expiry × 5 scope (Dhan UI parity per L29) | crates/api, trading |
 | 7 | **#507** Phase 4b drops | `DROP TABLE stock_movers, option_movers` (operator runbook gate) | runbook, sql |
 | 8 | **#508** AWS deploy | Terraform `instance_type = c8g.xlarge` + Docker mem_limits per L2 + ARM AMI + aarch64 cross-compile CI + bench-budget re-baseline + OS tunes per L4 | deploy/aws/terraform, deploy/docker, .github/workflows |
 | 9 | **#509** Static-universe cleanup | DELETE live-tick-atm-resolver, mid-market boot mode resolver beyond simple market-hours check, REST `/marketfeed/ltp` fallback, pre-open buffer ATM-strike machinery | crates/core/instrument |
@@ -417,4 +420,56 @@ PR #506 (cohort SQL migration) — KILLED per L14 (depth-dynamic reads from RAM 
 
 ---
 
-**End of DRAFT v3.** Awaiting OPEN-VERIFY-1 + OPEN-VERIFY-2 closure for APPROVED status.
+## §P) Architecture simplification — only TWO data structures (NEW 2026-05-08)
+
+Operator clarification 2026-05-08: "remove all movers related infrastructure entirely. We have ticks and candles alone — that's it."
+
+The system has **exactly two in-memory data structures**:
+
+| # | Structure | Type | Holds | Reset |
+|---|---|---|---|---|
+| 1 | **Tick map** | `papaya::HashMap<(security_id, exchange_segment), Vec<ParsedTick>>` | full day raw ticks per instrument | 09:15 IST |
+| 2 | **Candle map (per TF)** | `papaya::HashMap<(security_id, exchange_segment), CandleEngineMap<TF>>` × 21 TFs | full day sealed bars per (instrument, TF) with all 5 % fields | 09:15 IST |
+
+**Everything else is a query method on these two structures.**
+
+| Old concept | New reality |
+|---|---|
+| `MoversEngine` separate struct | DELETED — top-N is `candle_storage.top_n_by(...)` method |
+| `stock_movers` / `option_movers` QuestDB tables | DROPPED at Phase 4b |
+| `OptionMoversWriter` / `StockMoversWriter` | DELETED PR #494 |
+| `movers_1s` / `movers_1m` matviews | DROPPED at Phase 4b |
+| Movers aggregation pipeline | NONE — reads happen at query time |
+| Depth-dynamic separate selector | DELETED — calls `candle_storage.top_n_by(category=TopVolume, scope=NSE, n=250)` |
+| `/api/movers/v2` business logic | ~30 LoC REST wrapper — no logic, just query forwarding |
+
+### Filter dimensions match Dhan UI exactly (3, not 6)
+
+| Dim | Values | Source in Dhan UI |
+|---|---|---|
+| **Category** | 7 enum values: HighestOI / OIGainers / OILosers / TopVolume / TopValue / PriceGainers / PriceLosers | top tab buttons |
+| **Expiry** | date label, e.g. "26 MAY", "26 JUN", "26 JUL" | top-right dropdown |
+| **Scope** | 5 mutually-exclusive: All / Index / Stock / NSE / BSE | far-right dropdown |
+
+**Dropped from earlier draft (Dhan UI doesn't filter on these, neither do we):**
+
+| Dropped | Why |
+|---|---|
+| Option type (CE/PE/nil) | not in Dhan UI |
+| Underlying (NIFTY / BANKNIFTY / SENSEX) | not in Dhan UI as a primary filter |
+| Strike range (ATM±25) | not in Dhan UI as a query filter (it's a subscription concept, not a display filter) |
+
+### What this delivers
+
+| Goal | How achieved |
+|---|---|
+| Movers infra removed entirely | only ticks + candles in memory; no separate engine; no separate writer; no separate matviews |
+| Operator's "ticks and candles alone" demand | satisfied literally — just two data structures |
+| Dhan UI parity | exact match on category × expiry × scope filter dimensions |
+| Top-N latency | ~50 µs regardless of N (linear in universe size) |
+| Depth-dynamic cohort | reuses same `candle_storage.top_n_by` — no separate selector code |
+| Architectural simplification vs prior `MoversEngine` design | drops a struct, drops a façade, drops a separate file |
+
+---
+
+**End of DRAFT v4.** Awaiting OPEN-VERIFY-1 + OPEN-VERIFY-2 closure for APPROVED status.
