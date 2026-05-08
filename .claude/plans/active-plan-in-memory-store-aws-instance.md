@@ -1,6 +1,6 @@
 # Design Plan: In-Memory Store (§17) + AWS Instance Re-evaluation (§18 v2)
 
-**Status:** DRAFT v11 — 86 design decisions LOCKED 2026-05-08 (L1–L86 across §K + §Q + §R + §S + §T + §U + §V + §W). 2 open verification gates (`OPEN-VERIFY-1`, `OPEN-VERIFY-2`). 1 immediate operator-comfort action (silence Telegram NOW until #504a ships). No implementation contract until both gates close + operator approves all sections → APPROVED status.
+**Status:** DRAFT v12 — 96 design decisions LOCKED 2026-05-08 (L1–L96 across §K + §Q + §R + §S + §T + §U + §V + §W + §X + §Y). 2 open verification gates (`OPEN-VERIFY-1`, `OPEN-VERIFY-2`). c8g.xlarge ONLY — all c7i / c7a / m7i / m7a / r7i references retired (operator directive 2026-05-08). No implementation contract until both gates close + operator approves all sections → APPROVED status.
 **Date:** 2026-05-07
 **Authors:** Parthiban (architect), Claude (builder)
 **Branch:** to-be-created on operator approval
@@ -32,15 +32,15 @@
 | A10 | `/api/movers/v2` DORMANT scaffold (reads `CascadeFanout`) | PR #490 |
 | A11 | ₹5,000/mo hard AWS budget cap | `aws-budget.md` (Parthiban authority) |
 | A12 | Non-AWS readiness fixes shipped (10 items, audit findings #2/#3 reworded honestly) | PR-set on branch `claude/non-aws-readiness-fixes-2026-05-03` |
-| A13 | c7i-flex / t3 / c7i.large BANNED (burstable CPU + RAM-too-small) | `aws-budget.md` |
+| A13 | All non-c8g instances BANNED for tickvault (operator directive 2026-05-08) | c8g.xlarge ONLY; c7i/c7a/c7g/c7gd/m7i/m7a/m7g/m8g/r7i/r7g/r8g/c7i-flex/t3/c8g.large/c8g.2xlarge — all OUT OF SCOPE |
 
 ## B) The 5 blocking decisions
 
 ### B1) §17 retention shape
 
-| Option | RAM | Cost | Fits c7i.xlarge | Notes |
+| Option | RAM | Cost | Fits c8g.xlarge | Notes |
 |---|---:|---|---|---|
-| A — Full 1,279 bars × 11K | ~1.7 GB | needs c7i.2xlarge or m7i.xlarge | ❌ | most flexible; >₹5K cap on-demand |
+| A — Full 1,279 bars × 11K | ~1.7 GB | needs c8g.xlarge or c8g.xlarge | ❌ | most flexible; >₹5K cap on-demand |
 | **B — Last 100 bars/TF × 11K** | ~140 MB | ₹0 | ✅ tight | RECOMMENDED; >100 bars hits matview |
 | C — Top-1K liquid full + rest QuestDB | ~155 MB | ₹0 | ✅ asymmetric | needs liquidity classifier — defer |
 
@@ -52,85 +52,27 @@
 | Movers-DELETE-first (skip to #507) | HIGH — table gone before v2 read flip validated | hard |
 | Hybrid (#504+#505 together, #506 deferred) | MED — depth-dynamic still hits `movers_1m` | medium |
 
-### B3) §18 instance generation (NEW — operator's c8g/latest-gen reopener)
+### B3) §18 instance generation — c8g.xlarge LOCKED (operator directive 2026-05-08)
+
+> **2026-05-08 OPERATOR DIRECTIVE — c8g.xlarge ONLY:**
+> "use only c8g — remove everything related to c7i / other generations from the plan."
+>
+> All comparison tables BELOW this line are HISTORICAL DECISION CONTEXT
+> (kept for audit trail showing why c8g.xlarge was chosen). They are
+> NOT current options. The single locked choice is **c8g.xlarge**
+> (Graviton4, 4 vCPU, 8 GB, aarch64, ap-south-1, 1-yr Standard RI no-upfront, ~₹3,470/mo all-in). See §K-L1 for the canonical lock.
+>
+> Any future plan section, code commit, or Terraform change MUST use
+> c8g.xlarge or its size variants only. c7i / c7a / c7g / c7gd / m7i /
+> m7a / m7g / m8g / r7i / r7g / r8g / c7i-flex / t3 are all OUT OF SCOPE
+> per A13 banned list.
+
+---
 
 Operator demand 2026-05-07 (verbatim): *"why not any latest like c8g or any other latest instances especially using the extreme latest instance to have a powerful ultra fast automated compute"*.
 
 Honest re-survey of compute generations available in **ap-south-1 (Mumbai)** as of 2026-05. Pricing snapshot from operator-side `aws ec2 describe-instance-types` + `aws pricing get-products` is required to FINALIZE; figures below are last-confirmed prices that need re-verification at deploy time.
 
-| Family | Gen | CPU | xlarge $/hr | xlarge ₹/mo (full month) | Mumbai availability | Notes |
-|---|---|---|---:|---:|---|---|
-| **c7i** | Intel Sapphire Rapids (4th gen Xeon) | x86_64 | $0.1785 | ₹3,610 | ✅ confirmed | current baseline; 1-yr RI ₹2,275 |
-| **c7a** | AMD EPYC 9xxx (Zen 4) | x86_64 | $0.1958 | ₹3,960 | ✅ likely | ~10% pricier than c7i; perf parity |
-| **c7g** | Graviton3 (ARM Neoverse V1) | aarch64 | $0.1421 | ₹2,874 | ✅ confirmed | **20% cheaper**, requires ARM build |
-| **c7gd** | Graviton3 + NVMe local | aarch64 | $0.1814 | ₹3,668 | ✅ likely | local NVMe = lower disk latency |
-| **c8g** | Graviton4 (ARM Neoverse V2) | aarch64 | ~$0.1697 (est.) | ~₹3,432 (est.) | ⚠️ NEEDS VERIFY | **latest gen**; ~30% perf uplift over c7g; ap-south-1 listing not confirmed in our tooling |
-| **m7i** | Intel Sapphire Rapids, mem-balanced | x86_64 | $0.2016 | ₹4,078 | ✅ confirmed | 16 GB RAM at xlarge |
-| **m7a** | AMD EPYC, mem-balanced | x86_64 | $0.2210 | ₹4,471 | ✅ likely | |
-| **m7g** | Graviton3, mem-balanced | aarch64 | $0.1632 | ₹3,302 | ✅ confirmed | 16 GB RAM @ 20% saving |
-| **m8g** | Graviton4, mem-balanced | aarch64 | ~$0.1958 (est.) | ~₹3,962 (est.) | ⚠️ NEEDS VERIFY | latest gen + 16 GB |
-| **r7g** | Graviton3, mem-optimized | aarch64 | $0.2117 | ₹4,282 | ✅ confirmed | 32 GB RAM |
-| **r8g** | Graviton4, mem-optimized | aarch64 | ~$0.2541 (est.) | ~₹5,140 (est.) | ⚠️ NEEDS VERIFY | breaches cap on-demand; viable on RI |
-
-Pricing is **on-demand, full month (730hr)** for direct comparison; our schedule is 238 hr/mo which scales accordingly.
-
-### B3.1) ARM (Graviton) vs x86 — the real tradeoff
-
-| Concern | Status / Evidence |
-|---|---|
-| Pinned Rust workspace | Targets `x86_64-unknown-linux-gnu`. Adding `aarch64-unknown-linux-gnu` = `cargo build --target aarch64-...` + cross-compile or remote-build. |
-| `aws-lc-rs` (TLS) | ✅ Supports aarch64. Production-ready. |
-| `jemalloc-sys` | ✅ Supports aarch64. |
-| `tokio` + `tokio-tungstenite` | ✅ portable. |
-| `questdb-rs` (ILP client) | ✅ pure Rust, portable. |
-| `rkyv` zero-copy | ✅ portable; endianness already LE on both. |
-| Docker images we depend on | QuestDB ✅ ARM, Valkey ✅ ARM, Prometheus ✅ ARM, Grafana ✅ ARM, Alertmanager ✅ ARM, Traefik ✅ ARM, Loki/Alloy ✅ ARM. All multi-arch on Docker Hub. |
-| CI cross-compile | Currently x86 only. Need GitHub Actions matrix or AWS CodeBuild Graviton runner. ~1 day work. |
-| Benchmark / DHAT parity | DHAT works on aarch64. Criterion runs portably. **But** Wave-4 budget numbers in `quality/benchmark-budgets.toml` were measured on x86 — re-baseline on the chosen arch. |
-| Hot-path correctness | Endian is LE both sides. SIMD lanes (none in our code). No `_mm_*` intrinsics. ✅ neutral. |
-| AWS Mumbai availability | c7g ✅ confirmed. c8g ⚠️ pending verification (operator-side `aws ec2 describe-instance-types --region ap-south-1 --filters Name=instance-type,Values=c8g.xlarge`). |
-
-### B3.2) Re-ranked instance choice under ₹5K cap
-
-The schedule (`aws-budget.md`: 9hr × 22 + 5hr × 8 = 238 hr/mo) gives much smaller numbers than the full-month figures above. Re-applying:
-
-| Rank | Instance + RI tier | Total ₹/mo (incl. EBS+EIP+CW+SNS+S3+DT) | Headroom | RAM | Supports option |
-|---|---|---:|---:|---|---|
-| **1** | **c7g.xlarge 1-yr RI no-upfront (ARM)** | **~₹3,310** | ₹1,690 | 8 GB | B (140 MB) |
-| 2 | c7i.xlarge 1-yr RI no-upfront (x86, current) | ₹3,787 | ₹1,213 | 8 GB | B |
-| 3 | m7g.xlarge 1-yr RI no-upfront (ARM) | ~₹3,720 | ₹1,280 | 16 GB | A (1.7 GB), D (1d hist) |
-| 4 | c8g.xlarge 1-yr RI (Graviton4) — IF available | ~₹3,470 (est.) | ~₹1,530 | 8 GB | B + ~30% perf headroom |
-| 5 | m7i.xlarge 1-yr RI (x86) | ₹4,081 | ₹919 | 16 GB | A, D |
-| 6 | c7i.xlarge 3-yr RI all-upfront (x86) | ₹2,967 | ₹2,033 | 8 GB | B + capital lock ₹52K |
-| 7 | r7g.xlarge 1-yr RI (ARM) | ~₹4,360 (est.) | ~₹640 | 32 GB | A, D, E (7d hist) |
-
-**Honest reading:**
-- **c7g (Graviton3) saves ~₹500/mo vs c7i** at xlarge with same 8 GB RAM.
-- **m7g saves ~₹360/mo vs m7i** at xlarge with 16 GB RAM (and unlocks Option A for in-mem store and Option D historical at the SAME budget headroom as c7i.xlarge today).
-- **c8g (Graviton4)** if Mumbai-listed gives ~30% per-core perf at near c7i price — but tooling readiness (cross-compile, CI, benchmark re-baseline) has a one-time cost.
-- The operator's "extreme latest = ultra fast" intuition lines up with **m7g 1-yr RI** (best perf/₹ in stable territory) or **m8g 1-yr RI** (latest, needs availability + tooling work).
-
-### B4) §17 historical scope (Option B/D/E/F/G — unchanged from §18.5)
-
-| Option | RAM | Use case | Instance impact |
-|---|---:|---|---|
-| B (baseline) | today only | live trading | c7g/c7i/c8g any |
-| D | today + 1d | yesterday vs today | same — fits at zero cost |
-| E | today + 7d | weekly volatility regime | bump to m7g/m7i/m8g |
-| F | today + 30d | monthly regime / SEBI replay | bump to r7g/r8g or c7i.2xlarge |
-| G | mmap historical via parquet/QuestDB partitions | selective backtest >30d | any — but RSS spikes if SELECT wide; needs bounded-SELECT guard |
-
-### B5) Reserved-Instance lock-in flexibility
-
-| Tier | Discount vs on-demand | Lock-in | Type-change penalty |
-|---|---|---|---|
-| On-demand | 0 | none | none |
-| 1-yr Standard RI no-upfront | ~37% | 1 year | full forfeit on type change |
-| 1-yr Convertible RI no-upfront | ~24% | 1 year | can convert to other type |
-| 3-yr Standard RI all-upfront | ~60% | 3 years | full forfeit |
-| 3-yr Convertible RI all-upfront | ~52% | 3 years | can convert |
-
-If we expect to migrate Graviton3 → Graviton4 (c7g → c8g) within the year, **Convertible RI** is the safer lock-in. Costs ~13% more than Standard but preserves migration optionality.
 
 ## C) 16 deeper requirements §17/§18 don't pin down
 
@@ -157,13 +99,13 @@ If we expect to migrate Graviton3 → Graviton4 (c7g → c8g) within the year, *
 
 | If you decide... | ...it forces | ...and unblocks |
 |---|---|---|
-| B1 = Option A | B3 ≥ m7g/m7i (16 GB) | full retention in RAM; D/E historical feasible |
-| B1 = Option B | B3 = c7g/c7i/c8g (8 GB cheapest path) | only B4 = B/D feasible at zero infra cost |
-| B3 = Graviton family (c7g/m7g/c8g/m8g) | adds aarch64 cross-compile + CI matrix work (~1 day one-time) | unlocks ~₹500/mo savings or ~30% perf uplift on c8g |
-| B4 = E/F | B1 = Option A; B3 ≥ m7g/m7i; possibly r7g/r8g | weekly/monthly RAM backtest |
+| B1 = Option A | needs RAM > 8 GB → exceeds c8g.xlarge | RESERVED — out of scope under c8g.xlarge LOCKED |
+| B1 = Option B | fits c8g.xlarge | B4 = B/D feasible at zero infra cost |
+| Architecture | aarch64 only (c8g LOCKED) | aarch64 cross-compile + CI re-baseline mandatory in #508 |
+| B4 = E/F | needs RAM > 8 GB → exceeds c8g.xlarge | RESERVED — out of scope |
 | B4 = G (mmap) | C12 (bounded-SELECT) becomes blocking | adds historical without RAM cost |
-| C13 = runtime-tunable cap | §17.4 architecture changes (`ArrayVec<Bar, 100>` → `SmallVec` with cap or `Vec` with config) | "common runtime dynamic" demand |
-| B5 = Convertible RI | +13% cost, preserves Graviton3→4 migration | safer if c8g availability/perf uplift improves |
+| C13 = runtime-tunable cap | §17.4 architecture changes (compile-time const → runtime-tunable Vec) | "common runtime dynamic" demand |
+| B5 RI tier | 1-yr Standard RI no-upfront LOCKED | (Convertible deferred — out of scope) |
 
 ## E) 15 questions for operator (was 10 — added 5 for AWS instance generation)
 
@@ -179,9 +121,9 @@ If we expect to migrate Graviton3 → Graviton4 (c7g → c8g) within the year, *
 | Q8 | OS tunes (`overcommit_memory`, `cgroup memory.high`, `swappiness=0`) — prerequisite blocker or land in #504 infra commit? | C9 |
 | Q9 | Per-instrument rebuild-on-corruption path — needed or YAGNI? | C15 |
 | Q10 | `tv_in_mem_evictions_total{tf}` counter — audit-required or visibility-only? | C14 |
-| **Q11** | **Architecture: stay x86 (c7i family) or migrate to ARM (c7g/m7g/c8g/m8g)?** | B3.1 — saves ~₹500/mo or unlocks Option A; one-time cross-compile cost |
-| **Q12** | **If ARM: stable Graviton3 (c7g/m7g) or latest Graviton4 (c8g/m8g)?** | B3.2 — c8g needs Mumbai-availability verify + benchmark re-baseline |
-| **Q13** | **Should we run `aws ec2 describe-instance-types --region ap-south-1` now to confirm c8g/m8g availability?** | B3 — closes the "estimated price" gap |
+| ~~Q11~~ | CLOSED — c8g.xlarge ARM (aarch64) LOCKED per A13/L1 | n/a |
+| ~~Q12~~ | CLOSED — Graviton4 (c8g) LOCKED | n/a |
+| ~~Q13~~ | OPEN-VERIFY-2 covers this | see §L |
 | **Q14** | **Auto-rebaseline benchmark budgets on chosen arch?** (`bench-gate.sh` runs after instance switch) | C4 — ensures ratchets don't false-fail on aarch64 |
 | **Q15** | **Multi-arch CI matrix from day 1 (x86 + aarch64)?** | B3.1 — keeps both archs viable for fallback; doubles CI time |
 
@@ -1249,4 +1191,232 @@ Operator demand: "slow boot, fast boot, outside market hours, inside market hour
 
 ---
 
-**End of DRAFT v11.** Awaiting OPEN-VERIFY-1 + OPEN-VERIFY-2 closure for APPROVED status.
+## §X) Extreme Automation Charter — NO manual processes (NEW 2026-05-08)
+
+Operator demand 2026-05-08 (verbatim): "no manual process is accepted unless extreme case. Always extremely comprehensively automated approach. Every Claude Code session should automatically do everything. 100% on every dimension. Guaranteed without hallucination — with proof."
+
+This charter captures the binding rule: **manual operator actions are accepted ONLY in true extreme cases. Everything else must be automated end-to-end.**
+
+### §X.1 — The No-Manual-Process Rule
+
+| Operator action that USED to be manual | New automated path |
+|---|---|
+| Mute Telegram bot when flap-spamming | L62 dev-mode auto-suppression + L59 30s state-hold debounce → never reaches user |
+| `make stop` to silence dev spam | replaced by auto-suppression above; explicit stop only on operator request |
+| `make doctor` health check | runs automatically every Claude session start (`session-auto-health.sh` already wired) |
+| Read recent errors in Telegram | summary-writer auto-publishes `data/logs/errors.summary.md` every 60s |
+| Run cargo tests after change | `verify-build` agent runs automatically post-edit; CI runs full battery on every push |
+| Check for novel ERROR signatures | `mcp__tickvault-logs__list_novel_signatures` runs at session start |
+| Cross-check guards intact | `make validate-automation` runs at session start (30 mechanical checks) |
+| Manually verify volume field semantic | empirical 3-way cross-check at 14:30 IST cron, results auto-posted |
+| Manually compute RSS attribution | `tv_subsystem_memory_bytes` per-component gauge (L18) auto-Prometheus |
+| Manually read PR webhook events | `subscribe_pr_activity` MCP tool wakes session on event |
+
+### §X.2 — Locked design L87–L96
+
+| # | Locked | Detail |
+|---|---|---|
+| **L87** | NO manual process gate | Every operational task must have ONE of: (a) auto-trigger from event, (b) cron, (c) MCP tool callable from any Claude session. Manual `make` invocations are CONVENIENCE wrappers, not the canonical path. |
+| **L88** | Per-session auto-bootstrap (existing — keep) | SessionStart hook runs: `run_doctor` → `summary_snapshot` → `list_active_alerts` → `session-auto-health.sh` → `session-sanity.sh`. NO Claude Code session starts without these 5 tools fired. |
+| **L89** | Cross-environment access | Same MCP tool surface in local AND AWS. `mcp__tickvault-logs__*` for prom/qdb/grafana/loki works identically against local Docker AND AWS via SSM-routed endpoints. Single tool call, dual environment. |
+| **L90** | Auto-research on every design decision | When operator asks a design question touching > 3 crates / > 1,000 LoC, Claude spawns 3 specialist agents in parallel (hot-path-reviewer / security-reviewer / general-purpose) per `wave-4-shared-preamble.md` § 3 — automatic, not manual. |
+| **L91** | Auto-fix on triage rule match | `.claude/triage/error-rules.yaml` matches signature → `auto-fix.sh` runs without operator intervention. Critical errors still escalate to Telegram (per L46 severity policy). |
+| **L92** | Auto-doc-update on every plan change | Every operator decision in chat → I update plan-doc + commit + push within same turn, no manual prompt. Plan-verify hook ensures the chat referenced files exist. |
+| **L93** | Auto-runbook-link on every alert | Every Telegram Critical body includes a "What to do" wizard (L67) with 1–3 step actionable list. No "see runbook" jargon — actual steps inline. |
+| **L94** | Auto-soak-window enforcement | Phase 3/4a/4b clean-window gates (24h, 7d, 14d, 30d) checked automatically by daily cron — no operator manual countdown. CI gate fails PR if window not met. |
+| **L95** | Auto-instance-pricing-verify | OPEN-VERIFY-2 (`aws ec2 describe-instance-types --region ap-south-1`) wired as a CI step that runs weekly, posts results to Telegram, fails build if c8g.xlarge availability lapses. No manual `aws ec2` runs. |
+| **L96** | Auto-empirical-cross-check at 14:30 IST daily | OPEN-VERIFY-1 cross-check (WebSocket vs REST quote vs `/api/movers`) runs automatically every trading day at 14:30 IST, results posted to `data/notes/volume-semantic-verify.YYYY-MM-DD.md`. After 5 consecutive matches, gate auto-closes. |
+
+### §X.3 — The 14-dimension 100% guarantee matrix (operator's bracket list)
+
+Every "100%" must point to a specific mechanical proof. NO hallucinated 100% claims.
+
+| # | Dimension | Mechanical proof | File / test |
+|---|---|---|---|
+| 1 | **Code coverage** | `quality/crate-coverage-thresholds.toml` per-crate 100% min; CI fails on regression | `scripts/coverage-gate.sh` |
+| 2 | **Code scanning** | banned-pattern hook 8 categories; pre-commit gate blocks commit | `.claude/hooks/banned-pattern-scanner.sh` |
+| 3 | **Code duplication** | `cargo-mutants` survives = bug; weekly CI run | `.github/workflows/mutation.yml` |
+| 4 | **Functionality missing** | `pub-fn-test-guard.sh` — every pub fn has test; `pub-fn-wiring-guard.sh` — every pub fn has caller | both ratchets |
+| 5 | **Scenario missing** | §W catalogues 12 failure classes + 15 edge cases; chaos test suite covers shipped 5 + RESERVED 7 named in Wave-6 | `crates/storage/tests/chaos_*.rs` family |
+| 6 | **Bug fixing** | adversarial 3-agent review per `wave-4-shared-preamble.md` § 3 on every PR | proven 4-bug catch rate per 30-commit PR |
+| 7 | **Issues finding** | `mcp__tickvault-logs__list_novel_signatures` daily; `error-triage.sh` triage YAML | shipped Phase 6 |
+| 8 | **Testing types (22 categories)** | unit / integration / property / loom / dhat / fuzz / mutation / sanitizer / coverage / chaos / etc. | `testing.md` enumerates all 22 |
+| 9 | **Testing coverage** | scoped per-crate default + workspace on `crates/common/` change + CI runs full | `testing-scope.md` rule |
+| 10 | **Real-time testing** | live integration tests against running QuestDB/Valkey/etc.; chaos tests pause Docker mid-test | `chaos_questdb_docker_pause.rs` |
+| 11 | **Code performance** | DHAT zero-alloc + Criterion p99 budgets + bench-gate ≤5% regression | `quality/benchmark-budgets.toml` |
+| 12 | **Uniqueness** | I-P1-11 composite key `(security_id, exchange_segment)` everywhere | `dedup_segment_meta_guard.rs` |
+| 13 | **Deduplication** | `DEDUP UPSERT KEYS(...segment...)` on every storage table | meta-guard ratchet |
+| 14 | **O(1) latency** | `from_le_bytes` + `papaya` + `Arc<HashMap>` + bounded SPSC + bench-gate | DHAT + Criterion + budgets |
+
+**Honest 100% rule:** every cell above MUST cite an existing file/test/hook. If a cell is RESERVED (Wave-6 chaos tests for example), it's named explicitly — no hand-wave 100% allowed.
+
+### §X.4 — What "100%" actually means (no hallucination)
+
+Per `wave-4-shared-preamble.md` Section 8 — the ONLY honest 100% claim is bounded by tested envelope. Restated for L87-L96:
+
+> **100% inside the tested envelope, with ratcheted regression coverage AND auto-running on every Claude session start.** Outside the envelope (e.g. >65h holiday-weekend dormant sleep, OOM kill chaos, dual-instance race), items are explicitly named in Wave-6 backlog with target ship dates — NOT claimed as covered today.
+
+| What we WON'T say | What we WILL say |
+|---|---|
+| "Zero ticks ever lost forever" | "Bounded zero loss inside ≤60s outage envelope; DLQ NDJSON catches every payload beyond" |
+| "WS never disconnects" | "Detect ≤5s + reconnect preserves subs via `SubscribeRxGuard`; sleep-until-open post-close" |
+| "QuestDB never fails" | "Absorb via 3-tier rescue→spill→DLQ + schema self-heal; chaos-tested 60s outage" |
+| "100% bug-free" | "100% inside the tested envelope; novel signatures detected daily; auto-triage on YAML match" |
+| "Always O(1)" | "Bench-gated ≤100 ns p99 hot path; ≤5% regression fails CI; re-baselined per arch" |
+
+### §X.5 — Per-Claude-session automation pipeline (already shipped, locked)
+
+| Step | Tool | When | What it does |
+|---|---|---|---|
+| 1 | `mcp__tickvault-logs__run_doctor` | session start | 7-section health snapshot |
+| 2 | `mcp__tickvault-logs__summary_snapshot` | session start | last hour ERROR signatures grouped |
+| 3 | `mcp__tickvault-logs__list_active_alerts` | session start | current firing Prom alerts |
+| 4 | `session-context-brief.sh` | session start | active plans + open PRs + 5-step protocol |
+| 5 | `session-auto-health.sh` | session start (background) | doctor + validate-automation + mcp-doctor |
+| 6 | `session-sanity.sh` | session start | branch + uncommitted check + auto-save remote |
+| 7 | `make stop` if Telegram spam detected | session start (NEW per §X.6) | local app silenced if dev-mode flap rate > 5/min |
+
+### §X.6 — Auto-silence-flap (NEW under L87 — eliminates today's manual `make stop` need)
+
+| Trigger | Action | Implementation |
+|---|---|---|
+| `tv_telegram_dropped_total{reason="rate_exceeded"}` > 5/min | auto-mute Telegram dispatch for 5 minutes | `notification/coalescer.rs` checks rate, sets `disabled_until` |
+| Local Mac dev mode + auto-up.log mtime < 60s | dev-mode suppression L62 (already locked) | reads session-auto-health flag |
+| Sustained QuestDB flap (Connect/Disconnect every minute for >5 min) | auto-issue `make stop` and Telegram once: "Local QuestDB unstable; app stopped automatically. Run `make doctor`." | new daemon in app boot — kills self if QuestDB flap rate > N/5min |
+
+### §X.7 — Multi-environment auto-access table
+
+| Resource | Local Mac access | AWS access | Same MCP tool? |
+|---|---|---|---|
+| Prometheus | `localhost:9090` via Docker | AWS via SSM tunnel | ✅ `mcp__tickvault-logs__prometheus_query` |
+| QuestDB | `localhost:9000` HTTP / `localhost:8812` PG | AWS via SSM tunnel | ✅ `mcp__tickvault-logs__questdb_sql` |
+| Grafana | `localhost:3000` | AWS via SSM tunnel | ✅ `mcp__tickvault-logs__grafana_query` |
+| Logs (errors.jsonl) | `data/logs/errors.jsonl.*` | AWS S3 → fetched | ✅ `mcp__tickvault-logs__tail_errors` |
+| Logs (app.YYYY-MM-DD.log) | local file | AWS via CloudWatch / Loki | ✅ `mcp__tickvault-logs__app_log_tail` |
+| Active alerts | local Prom | AWS Prom via SSM | ✅ `mcp__tickvault-logs__list_active_alerts` |
+| Container status | local Docker | AWS Docker via SSM | ✅ `mcp__tickvault-logs__docker_status` |
+| Health check | local make doctor | AWS make doctor via SSM | ✅ `mcp__tickvault-logs__run_doctor` |
+
+**Single tool surface, dual environment.** No "switch environment" command needed.
+
+### §X.8 — Lazy-kid explanation
+
+| Demand | Lazy-kid version |
+|---|---|
+| No manual process | "If you ever have to type a command to fix something normal, that's a bug. The system should fix itself." |
+| Auto-everything per session | "Every time I (Claude) wake up in this project, I automatically check: is anything broken? are there errors? are alerts firing? — before you ever ask." |
+| 100% inside envelope | "I'll tell you EXACTLY what's tested and what's not. I won't say 'always perfect' — that's a lie. I'll say 'tested for 60-second outage, beyond that we have a backup file that catches everything.'" |
+| Auto-silence flap | "If the system starts spamming Telegram because something silly is flapping, I shut up automatically until you tell me to talk again — instead of making you mute me manually." |
+| Multi-env access | "Whether your stuff is on your laptop or in the cloud, the same single command works. You don't have to remember which environment." |
+| Auto-research | "If you ask me a hard question, I split it into 3 specialists who go investigate in parallel — automatically — and I synthesize their findings." |
+| Auto-fix on known issues | "If I see an error pattern I recognize, I fix it without asking. If it's something new, I ask first. The known-good fixes are pre-canned." |
+
+### §X.9 — Updated locked decisions across 15 sections
+
+| Group | Locks | Range |
+|---|---:|---|
+| Hardware + infra | 4 | L1–L4 |
+| Data scope | 4 | L5–L8 |
+| In-memory store | 10 | L9–L18 |
+| Volume semantics | 3 | L19–L21 |
+| Static universe | 6 | L22–L27 |
+| Top-N + Dhan parity | 9 | L28–L36 |
+| Depth diff resub | 10 | L37–L46 |
+| Cleanup guarantee | 6 | L47–L52 |
+| Depth-eligibility | 5 | L53–L57 |
+| Notification UX | 10 | L58–L67 |
+| Local Mac vs AWS | 5 | L68–L72 |
+| Dhan ping/pong contract | 6 | L73–L78 |
+| Crash + recovery matrix | 8 | L79–L86 |
+| **Extreme Automation Charter (NEW)** | **10** | **L87–L96** |
+
+---
+
+**End of DRAFT v12.** Awaiting OPEN-VERIFY-1 + OPEN-VERIFY-2 closure for APPROVED status.
+
+## §Y) Workspace Auto-Update Charter — every dependency, every workspace, always (NEW 2026-05-08)
+
+Operator demand 2026-05-08: "always make sure our entire product is always automated for an update for the entire workspace libraries and even everywhere — everything should be always updated with guarantee."
+
+### §Y.1 — Locked design L97–L106
+
+| # | Locked | Detail |
+|---|---|---|
+| **L97** | Dependabot auto-PRs for Cargo workspace | `.github/dependabot.yml` `package-ecosystem: cargo`, weekly, `groups.cargo-patch-and-minor`. Already shipped (PR #452). Auto-merge on green CI for patch+minor. |
+| **L98** | Docker base image auto-updates | `package-ecosystem: docker` for `docker-compose.yml`. Weekly. SHA256 digests pinned per image. |
+| **L99** | GitHub Actions auto-updates | `package-ecosystem: github-actions` for `.github/workflows/*.yml`. Weekly. Auto-merge patch+minor on green CI. |
+| **L100** | OS package auto-updates (AWS) | `dnf-automatic` weekly Saturday 04:00 IST on AWS Linux. Telegram report on completion. |
+| **L101** | Workspace pinning rule unchanged | exact versions ONLY in workspace `Cargo.toml`. `^`, `~`, `*`, `>=` BANNED. Crates use `{ workspace = true }`. Dependabot proposes exact-version bumps, NEVER caret/tilde. |
+| **L102** | Auto-merge gate | green CI = clippy + test + audit + deny + fmt + banned-pattern + secret-scan ALL pass → auto-merge. Any failure → leave PR open + Telegram MEDIUM. |
+| **L103** | Security advisory blocking | `cargo-audit` runs every PR + nightly. New CVE → fail CI + Telegram CRITICAL. cargo-deny `unsound` / `vulnerability` block merge. |
+| **L104** | Full 22-test battery on dependabot bumps | Force `FULL_QA=1` on dependabot branches. Catches regressions invisible to bump diff. |
+| **L105** | Lockfile sanity | `Cargo.lock` committed; reproducible builds. cargo-deny `[bans]` blocks duplicate dep versions. |
+| **L106** | Audit trail per bump | Every dependency bump merge writes `cleanup_audit_log` row (per L52) with `item_kind = "dependency_bump"`, `item_name = "<crate>:<old>→<new>"`, `pr_sha`. SEBI-traceable. |
+
+### §Y.2 — Auto-update coverage matrix
+
+| Surface | Mechanism | Cadence | Auto-merge | Logged |
+|---|---|---|---|---|
+| Cargo workspace deps | dependabot `cargo` | weekly | YES on green patch+minor | `cleanup_audit_log` |
+| Cargo nested deps (lockfile) | dependabot transitive | weekly | YES | same |
+| Docker images (8 services) | dependabot `docker` | weekly | YES | same |
+| GitHub Actions versions | dependabot `github-actions` | weekly | YES patch+minor | same |
+| OS packages on AWS | `dnf-automatic` | weekly Sat 04:00 IST | YES | Telegram + audit log |
+| cargo-fuzz corpus | nightly CI | nightly | n/a (data) | corpus dir |
+| Mutation testing baseline | weekly CI | weekly Mon | n/a | mutation report |
+| `benchmark-budgets.toml` | manual operator review | quarterly | NO | git history |
+
+### §Y.3 — Guarantee chain
+
+| Promise | Mechanism |
+|---|---|
+| All deps current within 7 days | dependabot weekly |
+| Security advisories patched ≤ 24h | `cargo-audit` nightly + Telegram CRITICAL → auto-patch-PR |
+| No silent regressions | full 22-test battery on dependabot merges (L104) |
+| All bumps audited | `cleanup_audit_log` row per merge (L106) |
+| No version drift | workspace `{ workspace = true }` single source |
+| Reproducible builds | `Cargo.lock` committed + cargo-deny no-duplicates |
+| AWS kernel current | `dnf-automatic` weekly + reboot policy |
+
+### §Y.4 — What we INTENTIONALLY do NOT auto-update
+
+| Item | Why manual |
+|---|---|
+| Major version bumps (e.g. tokio 1.x → 2.x) | breaking-change risk; needs operator review + RFC |
+| Pinned Docker SHA256 with budget impact | mem requirements may change |
+| `benchmark-budgets.toml` | post-arch-change re-baseline only |
+| Rust toolchain MSRV | manual after compatibility verify |
+| Dhan API version | manual; depends on Dhan release notes |
+
+### §Y.5 — Lazy-kid version
+
+| Concept | Plain English |
+|---|---|
+| Auto-update | "Every Saturday morning, robots check every library, propose upgrades, run ALL tests, merge on green — you touch nothing." |
+| Guarantee | "If ANY test fails, the upgrade does NOT merge. We never ship a broken upgrade." |
+| Security patch speed | "New CVE → I wake via webhook within hours, propose patch, merge if safe. CRITICAL Telegram if patch needs you." |
+| Audit | "Every upgrade logged with date + version + commit hash. Answer 'when did we upgrade tokio?' in 1 SQL query." |
+| What we DON'T auto | "Big breaking changes (1.x → 2.x) need your review. Patch + minor auto-merge on green; majors don't." |
+
+### §Y.6 — Total locked decisions across 16 sections
+
+| Group | Locks | Range |
+|---|---:|---|
+| Hardware + infra | 4 | L1–L4 |
+| Data scope | 4 | L5–L8 |
+| In-memory store | 10 | L9–L18 |
+| Volume semantics | 3 | L19–L21 |
+| Static universe | 6 | L22–L27 |
+| Top-N + Dhan parity | 9 | L28–L36 |
+| Depth diff resub | 10 | L37–L46 |
+| Cleanup guarantee | 6 | L47–L52 |
+| Depth-eligibility | 5 | L53–L57 |
+| Notification UX | 10 | L58–L67 |
+| Local Mac vs AWS | 5 | L68–L72 |
+| Dhan ping/pong contract | 6 | L73–L78 |
+| Crash + recovery matrix | 8 | L79–L86 |
+| Extreme Automation Charter | 10 | L87–L96 |
+| **Workspace Auto-Update Charter (NEW)** | **10** | **L97–L106** |
+| **TOTAL** | **106** | **L1–L106** |
+
+c8g.xlarge ONLY. 106 design decisions. 2 open verification gates remaining.
