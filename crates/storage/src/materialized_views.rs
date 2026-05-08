@@ -1,6 +1,6 @@
 //! QuestDB materialized views for multi-timeframe candle aggregation.
 //!
-//! Creates the `candles_1s` base table and 28 materialized views covering
+//! Creates the `candles_1s` base table and 16 materialized views covering
 //! timeframes from 5 seconds to 1 month. Live WebSocket data arrives as IST
 //! epoch seconds (stored directly). Historical REST data arrives as UTC epoch
 //! seconds (+19800s offset applied at persistence). Both result in IST-based
@@ -155,22 +155,24 @@ struct ViewDef {
     align_offset: &'static str,
 }
 
-/// All 28 materialized views ordered by dependency chain.
+/// All 16 materialized views ordered by dependency chain (post PR #517).
 ///
 /// Each view aggregates from its `source` — the dependency chain is:
 /// candles_1s → 3s,5s,10s,15s,30s,1m
-/// candles_1m → 2m,3m,4m,5m,6m,7m,8m,9m,11m,12m,13m,14m
-/// candles_5m → 10m,15m
+/// candles_1m → 5m
+/// candles_5m → 15m
 /// candles_15m → 30m
 /// candles_1s → 1h (direct — '00:15' offset requires the physical base table)
 /// candles_30m → 2h,3h,4h,1d
 /// candles_1d → 7d,1M
 ///
-/// 2026-05-05 expansion: added 10 missing TFs so the QuestDB matview set
-/// matches the in-RAM 28-TF `CascadeFanout` exactly (per operator
-/// directive: "1s, 3s, 5s, 10s, 15s, 30s, 1 minute till 15 minute
-/// sequentially, 30m, 1h, 2h, 3h, 4h, 1d, 1w, 1mo"). Added: 3s, 4m, 6m,
-/// 7m, 8m, 9m, 11m, 12m, 13m, 14m = 10 new derived matviews.
+/// PR #517 (Wave-5 TF reduction, 2026-05-08): retired the 12 sub-15m
+/// timeframes (2m/3m/4m/6m/7m/8m/9m/10m/11m/12m/13m/14m). The matview
+/// set now mirrors the 16-TF retained surface: 5 sub-minute (3s, 5s,
+/// 10s, 15s, 30s) + 1m + 5m + 15m + 30m + 1h/2h/3h/4h + 1d/7d/1M.
+/// Re-introduction of any retired TF is blocked by
+/// `view_defs_does_not_contain_retired_pr517_views` and the
+/// `tf_symmetry_guard` integration ratchet.
 const VIEW_DEFS: &[ViewDef] = &[
     // Sub-minute from 1s base
     ViewDef {
@@ -215,96 +217,13 @@ const VIEW_DEFS: &[ViewDef] = &[
         has_tick_count: true,
         align_offset: QUESTDB_IST_ALIGN_OFFSET,
     },
-    // Minute-level from 1m
-    ViewDef {
-        name: "candles_2m",
-        source: "candles_1m",
-        interval: "2m",
-        has_tick_count: false,
-        align_offset: QUESTDB_IST_ALIGN_OFFSET,
-    },
-    ViewDef {
-        name: "candles_3m",
-        source: "candles_1m",
-        interval: "3m",
-        has_tick_count: false,
-        align_offset: QUESTDB_IST_ALIGN_OFFSET,
-    },
-    ViewDef {
-        name: "candles_4m",
-        source: "candles_1m",
-        interval: "4m",
-        has_tick_count: false,
-        align_offset: QUESTDB_IST_ALIGN_OFFSET,
-    },
+    // Minute-level — PR #517 retains only candles_5m (sourced from 1m)
+    // and candles_15m (sourced from 5m). 2m/3m/4m/6m..14m and 10m were
+    // retired; see PR517_RETIRED_MATERIALIZED_VIEWS below.
     ViewDef {
         name: "candles_5m",
         source: "candles_1m",
         interval: "5m",
-        has_tick_count: false,
-        align_offset: QUESTDB_IST_ALIGN_OFFSET,
-    },
-    ViewDef {
-        name: "candles_6m",
-        source: "candles_1m",
-        interval: "6m",
-        has_tick_count: false,
-        align_offset: QUESTDB_IST_ALIGN_OFFSET,
-    },
-    ViewDef {
-        name: "candles_7m",
-        source: "candles_1m",
-        interval: "7m",
-        has_tick_count: false,
-        align_offset: QUESTDB_IST_ALIGN_OFFSET,
-    },
-    ViewDef {
-        name: "candles_8m",
-        source: "candles_1m",
-        interval: "8m",
-        has_tick_count: false,
-        align_offset: QUESTDB_IST_ALIGN_OFFSET,
-    },
-    ViewDef {
-        name: "candles_9m",
-        source: "candles_1m",
-        interval: "9m",
-        has_tick_count: false,
-        align_offset: QUESTDB_IST_ALIGN_OFFSET,
-    },
-    ViewDef {
-        name: "candles_11m",
-        source: "candles_1m",
-        interval: "11m",
-        has_tick_count: false,
-        align_offset: QUESTDB_IST_ALIGN_OFFSET,
-    },
-    ViewDef {
-        name: "candles_12m",
-        source: "candles_1m",
-        interval: "12m",
-        has_tick_count: false,
-        align_offset: QUESTDB_IST_ALIGN_OFFSET,
-    },
-    ViewDef {
-        name: "candles_13m",
-        source: "candles_1m",
-        interval: "13m",
-        has_tick_count: false,
-        align_offset: QUESTDB_IST_ALIGN_OFFSET,
-    },
-    ViewDef {
-        name: "candles_14m",
-        source: "candles_1m",
-        interval: "14m",
-        has_tick_count: false,
-        align_offset: QUESTDB_IST_ALIGN_OFFSET,
-    },
-    // Multi-minute from 5m
-    ViewDef {
-        name: "candles_10m",
-        source: "candles_5m",
-        interval: "10m",
         has_tick_count: false,
         align_offset: QUESTDB_IST_ALIGN_OFFSET,
     },
@@ -501,7 +420,7 @@ fn build_view_sql(def: &ViewDef) -> String {
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Creates the `candles_1s` base table and all 28 materialized views.
+/// Creates the `candles_1s` base table and all 16 materialized views (post PR #517).
 ///
 /// Idempotent — safe to call every startup. Logs warnings on failure
 /// and continues (best-effort). QuestDB must be reachable for views
@@ -571,14 +490,14 @@ pub async fn ensure_candle_views(questdb_config: &QuestDbConfig) {
     //   (b) `views_missing_phase1_columns` — check candles_5s for `phase`.
     //   (c) `base_missing_phase1_columns` — check candles_1s for `phase`.
     //   (d) `any_view_missing_or_lacks_iv` (PR #505 orphan-state fix) — iterate
-    //       ALL 28 view names; if any view is absent OR exists but lacks `iv`,
-    //       force a full drop+recreate. Closes the gap where boot-1 partial
-    //       failure leaves a subset of views with iv (e.g. candles_5s) while
-    //       newer TFs (4m/6m/7m/8m/9m/11m/12m/13m/14m) are absent or
-    //       schema-mismatched. The previous probe-just-candles_5s heuristic
-    //       returned false in that state and IF NOT EXISTS subsequently failed
-    //       with "Invalid column: iv" against orphan view definitions.
-    // If any probe fires, drop all 28 views so Step 5 recreates them clean.
+    //       ALL 16 view names (post PR #517); if any view is absent OR exists
+    //       but lacks `iv`, force a full drop+recreate. Closes the gap where
+    //       a partial-failure boot leaves a subset of views with iv (e.g.
+    //       candles_5s) while newer TFs are absent or schema-mismatched.
+    //       The previous probe-just-candles_5s heuristic returned false in
+    //       that state and IF NOT EXISTS subsequently failed with "Invalid
+    //       column: iv" against orphan view definitions.
+    // If any probe fires, drop all 16 views so Step 5 recreates them clean.
     if views_missing_greeks(&client, &base_url).await
         || views_missing_phase1_columns(&client, &base_url).await
         || base_missing_phase1_columns(&client, &base_url).await
@@ -587,7 +506,7 @@ pub async fn ensure_candle_views(questdb_config: &QuestDbConfig) {
     {
         info!(
             "materialized views or candles_1s base lack Greeks / Phase 1 \
-             lifecycle / Wave-5 % columns, OR one or more of the 28 expected \
+             lifecycle / Wave-5 % columns, OR one or more of the 16 expected \
              views is missing/orphan — dropping all views for clean recreation"
         );
         drop_all_views(&client, &base_url).await;
@@ -604,6 +523,12 @@ pub async fn ensure_candle_views(questdb_config: &QuestDbConfig) {
         );
         drop_hourly_chain_views(&client, &base_url).await;
     }
+
+    // Step 4c (PR #517): drop the 12 retired sub-15m materialized views
+    // so QuestDB instances upgraded across the boundary don't keep stale
+    // orphan views. `IF EXISTS` makes this safe on greenfield deployments
+    // and idempotent on every subsequent boot.
+    drop_pr517_retired_views(&client, &base_url).await;
 
     // Step 5: Create materialized views in dependency order.
     let mut created_count: u32 = 0;
@@ -931,9 +856,9 @@ async fn views_missing_greeks(client: &reqwest::Client, base_url: &str) -> bool 
     }
 }
 
-/// PR #505 orphan-state probe: returns `true` if ANY of the 28 expected
-/// materialized views is absent from the QuestDB catalogue OR exists but lacks
-/// the `iv` Greeks column.
+/// PR #505 orphan-state probe: returns `true` if ANY of the 16 expected
+/// materialized views (post PR #517) is absent from the QuestDB catalogue
+/// OR exists but lacks the `iv` Greeks column.
 ///
 /// Closes the gap where `views_missing_greeks` (which probes only
 /// `candles_5s`) returned false even when downstream views were absent or
@@ -978,7 +903,7 @@ async fn any_view_missing_or_lacks_iv(client: &reqwest::Client, base_url: &str) 
     false
 }
 
-/// Drops all 28 materialized views in reverse dependency order.
+/// Drops all 16 materialized views in reverse dependency order (post PR #517).
 ///
 /// Reverse order ensures child views are dropped before their parents.
 /// `DROP MATERIALIZED VIEW IF EXISTS` is idempotent.
@@ -997,7 +922,7 @@ async fn drop_all_views(client: &reqwest::Client, base_url: &str) {
             "dropped materialized view for Greeks migration"
         );
     }
-    info!("all 28 materialized views dropped for Greeks migration");
+    info!("all 16 materialized views dropped for Greeks migration");
 }
 
 /// Names of the hourly-chain views that must be rebuilt together when
@@ -1010,6 +935,29 @@ async fn drop_all_views(client: &reqwest::Client, base_url: &str) {
 /// thus a single-element list — only `candles_1h` itself needs dropping when
 /// its OFFSET '00:15' alignment changes.
 const HOURLY_CHAIN_VIEWS: &[&str] = &["candles_1h"];
+
+/// PR #517 (Wave-5 TF reduction): the 12 sub-15m timeframes retired in
+/// favour of the 9-TF operator-facing surface (1m + 5m + 15m + 30m +
+/// 1h..4h + 1d). On boot, `drop_pr517_retired_views` issues
+/// `DROP MATERIALIZED VIEW IF EXISTS` for each so QuestDB instances
+/// upgraded across PR #517 don't keep stale orphan views around. Order
+/// is reverse-dependency-ish: candles_10m sources from candles_5m so
+/// it must drop before any further chain churn; the others all source
+/// from candles_1m (no internal ordering required among them).
+const PR517_RETIRED_MATERIALIZED_VIEWS: &[&str] = &[
+    "candles_10m",
+    "candles_2m",
+    "candles_3m",
+    "candles_4m",
+    "candles_6m",
+    "candles_7m",
+    "candles_8m",
+    "candles_9m",
+    "candles_11m",
+    "candles_12m",
+    "candles_13m",
+    "candles_14m",
+];
 
 /// Checks whether `candles_1h` still uses the old `00:00` bucket alignment.
 ///
@@ -1069,6 +1017,28 @@ async fn drop_hourly_chain_views(client: &reqwest::Client, base_url: &str) {
     info!(
         view_count = HOURLY_CHAIN_VIEWS.len(),
         "hourly-chain views dropped for 00:15 realignment"
+    );
+}
+
+/// PR #517 (Wave-5 TF reduction): drops the 12 retired sub-15m
+/// materialized views so QuestDB instances upgraded across the
+/// boundary don't keep stale orphan views. `IF EXISTS` is idempotent
+/// — safe to call on greenfield deployments and on every boot.
+async fn drop_pr517_retired_views(client: &reqwest::Client, base_url: &str) {
+    for name in PR517_RETIRED_MATERIALIZED_VIEWS {
+        let drop_sql = format!("DROP MATERIALIZED VIEW IF EXISTS {name}");
+        drop(
+            client
+                .get(base_url)
+                .query(&[("query", &drop_sql)])
+                .send()
+                .await,
+        );
+        debug!(view = name, "dropped PR #517 retired sub-15m view");
+    }
+    info!(
+        view_count = PR517_RETIRED_MATERIALIZED_VIEWS.len(),
+        "PR #517 retired sub-15m views dropped"
     );
 }
 
@@ -1232,23 +1202,21 @@ mod tests {
     }
 
     #[test]
-    fn view_defs_has_28_views() {
+    fn view_defs_has_16_views() {
         assert_eq!(
             VIEW_DEFS.len(),
-            28,
-            "must have 28 materialized views matching the 28-TF in-RAM CascadeFanout: \
-             3s/5s/10s/15s/30s + 1m..15m + 30m/1h/2h/3h/4h + 1d/7d/1M"
+            16,
+            "must have 16 materialized views matching the 16-TF in-RAM CascadeFanout post PR #517: \
+             3s/5s/10s/15s/30s + 1m + 5m + 15m + 30m + 1h/2h/3h/4h + 1d/7d/1M"
         );
     }
 
-    /// 2026-05-05 ratchet: pin every one of the 28 specific TF names so a
-    /// future regression dropping any single one fails the build. The 28
-    /// names mirror the in-RAM `CascadeFanout` engines exactly per the
-    /// operator directive ("1s, 3s, 5s, 10s, 15s, 30s then starting 1
-    /// minute till 15 minute sequentially incrementing it as one so 1
-    /// till 15 right then 30m and 1h, 2h, 3h, 4h, 1d, 1w, 1month").
+    /// PR #517 (Wave-5 TF reduction, 2026-05-08) ratchet: pin every one of
+    /// the 16 specific TF names so a future regression dropping any single
+    /// one fails the build. The 16 names mirror the in-RAM `CascadeFanout`
+    /// engines exactly post the 12 sub-15m retirements (was 28 pre-PR #517).
     #[test]
-    fn view_defs_covers_all_28_tfs_matching_ram_cascade_fanout() {
+    fn view_defs_covers_all_16_tfs_matching_ram_cascade_fanout() {
         let names: Vec<&str> = VIEW_DEFS.iter().map(|v| v.name).collect();
         let expected = [
             "candles_3s",
@@ -1257,19 +1225,7 @@ mod tests {
             "candles_15s",
             "candles_30s",
             "candles_1m",
-            "candles_2m",
-            "candles_3m",
-            "candles_4m",
             "candles_5m",
-            "candles_6m",
-            "candles_7m",
-            "candles_8m",
-            "candles_9m",
-            "candles_10m",
-            "candles_11m",
-            "candles_12m",
-            "candles_13m",
-            "candles_14m",
             "candles_15m",
             "candles_30m",
             "candles_1h",
@@ -1283,14 +1239,32 @@ mod tests {
         for tf in expected {
             assert!(
                 names.contains(&tf),
-                "missing matview {tf} (must mirror CascadeFanout 28-TF set); current: {names:?}"
+                "missing matview {tf} (must mirror CascadeFanout 16-TF set); current: {names:?}"
             );
         }
         assert_eq!(
             names.len(),
             expected.len(),
-            "view count drifted from the 28-TF set"
+            "view count drifted from the 16-TF set"
         );
+    }
+
+    /// PR #517 ratchet: every retired sub-15m TF MUST stay out of
+    /// `VIEW_DEFS`. Re-introducing one requires coordinated updates to
+    /// the 4 surfaces (config, metrics_catalog, cascade_fanout,
+    /// VIEW_DEFS) per `tf_symmetry_guard`.
+    #[test]
+    fn view_defs_does_not_contain_retired_pr517_views() {
+        let names: Vec<&str> = VIEW_DEFS.iter().map(|v| v.name).collect();
+        for retired in PR517_RETIRED_MATERIALIZED_VIEWS {
+            assert!(
+                !names.contains(retired),
+                "retired matview {retired} reappeared in VIEW_DEFS — \
+                 PR #517 retired the 12 sub-15m timeframes; re-add via \
+                 coordinated PR (config + cascade engine + matview DDL + \
+                 enum + symmetry ratchet)."
+            );
+        }
     }
 
     #[test]
@@ -1428,10 +1402,12 @@ mod tests {
     #[test]
     fn build_view_sql_without_tick_count() {
         // Lookup by name (was index-based; insertion-order-fragile).
+        // PR #517 retired candles_2m; use candles_5m for the
+        // has_tick_count=false probe.
         let def = VIEW_DEFS
             .iter()
-            .find(|v| v.name == "candles_2m")
-            .expect("candles_2m present");
+            .find(|v| v.name == "candles_5m")
+            .expect("candles_5m present");
         assert!(!def.has_tick_count);
         let sql = build_view_sql(def);
         assert!(!sql.contains("tick_count"));
@@ -1703,8 +1679,8 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_view_count_is_28() {
-        assert_eq!(view_count(), 28);
+    fn test_view_count_is_16() {
+        assert_eq!(view_count(), 16);
     }
 
     #[test]
@@ -2002,16 +1978,24 @@ mod tests {
     }
 
     #[test]
-    fn test_view_chain_2m_3m_5m_from_1m() {
-        let minute_views = ["candles_2m", "candles_3m", "candles_5m"];
-        for name in &minute_views {
-            let def = VIEW_DEFS.iter().find(|d| d.name == *name).unwrap();
-            assert_eq!(
-                def.source, "candles_1m",
-                "minute view {} must source from candles_1m",
-                name
-            );
-        }
+    fn test_view_chain_5m_15m_from_1m_and_5m() {
+        // PR #517 retained chain: candles_1m → candles_5m → candles_15m.
+        let def_5m = VIEW_DEFS
+            .iter()
+            .find(|d| d.name == "candles_5m")
+            .expect("candles_5m present");
+        assert_eq!(
+            def_5m.source, "candles_1m",
+            "candles_5m must source from candles_1m"
+        );
+        let def_15m = VIEW_DEFS
+            .iter()
+            .find(|d| d.name == "candles_15m")
+            .expect("candles_15m present");
+        assert_eq!(
+            def_15m.source, "candles_5m",
+            "candles_15m must source from candles_5m"
+        );
     }
 
     #[test]
@@ -2134,7 +2118,7 @@ mod tests {
             ilp_port: port,
         };
         // Exercises success path: create table (line 307), DEDUP (310-311),
-        // all 28 view DDLs (315-319), final info log (322-325)
+        // all 16 view DDLs (315-319), final info log (322-325)
         ensure_candle_views(&config).await;
     }
 
