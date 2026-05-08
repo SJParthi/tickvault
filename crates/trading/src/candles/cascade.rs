@@ -48,6 +48,7 @@ use tickvault_common::tick_types::ParsedTick;
 use crate::candles::cascade_fanout::CascadeFanout;
 use crate::candles::engine::Tf1s;
 use crate::candles::engine_map::CandleEngineMap;
+use crate::in_mem::PrevDayCache;
 
 /// Prometheus counter — every tick the cascade processed.
 pub const METRIC_TICKS_PROCESSED: &str = "tv_candle_cascade_ticks_processed_total";
@@ -101,6 +102,16 @@ const ROLLOVER_POST_SEAL_DELAY_SECS: u64 = 1;
 /// constant per sealed bar (~1.7µs), and runs in this same task so
 /// the per-instrument ordering of derived bars is preserved.
 ///
+/// **F1 (Wave-5 §K-L13 / #504e follow-up):** when `pct_cache` is
+/// `Some`, the seal-time pct stamping path is enabled. The 1s engine
+/// uses `on_tick_with_pct` (instead of `on_tick`) and the fanout uses
+/// `feed_sealed_1s_bar_with_pct` (instead of `feed_sealed_1s_bar`),
+/// so every sealed Bar carries the 5 frozen-per-day % fields populated
+/// from the cache. The cache may be empty at boot — in that case the
+/// stamping falls back to 0.0 % fields without dropping any seal,
+/// matching the `on_*_with_pct` div-by-zero policy. The boot-time
+/// loader that populates the cache lands in F2.
+///
 /// This function is `async fn -> ()` and returns when the broadcast
 /// sender is dropped. The caller is expected to spawn it via
 /// `spawn_supervised_cascade_1s` so panics are surfaced + respawned.
@@ -108,6 +119,7 @@ pub async fn run_cascade_1s(
     mut rx: broadcast::Receiver<ParsedTick>,
     engine_map: Arc<CandleEngineMap<Tf1s>>,
     fanout: Option<CascadeFanout>,
+    pct_cache: Option<Arc<PrevDayCache>>,
 ) {
     let mut first_tick_seen = false;
     let mut last_lag_log: Option<Instant> = None;
@@ -118,16 +130,27 @@ pub async fn run_cascade_1s(
                     first_tick_seen = true;
                     info!(
                         engine_count = engine_map.len(),
+                        pct_cache_wired = pct_cache.is_some(),
                         "candle cascade 1s task active — first tick observed"
                     );
                 }
                 counter!(METRIC_TICKS_PROCESSED).increment(1);
-                if let Some(bar) = engine_map.on_tick(&tick) {
+                let sealed_bar = match &pct_cache {
+                    Some(cache) => engine_map.on_tick_with_pct(&tick, cache),
+                    None => engine_map.on_tick(&tick),
+                };
+                if let Some(bar) = sealed_bar {
                     counter!(METRIC_BARS_SEALED).increment(1);
                     // Phase 3 commit 4: feed the sealed 1s bar into all
                     // 28 derived engines via the fanout. O(28) constant.
+                    // F1: when `pct_cache` is wired, use the stamping
+                    // variant so every derived engine's sealed bar
+                    // carries the 5 % fields populated from the cache.
                     if let Some(ref f) = fanout {
-                        f.feed_sealed_1s_bar(&bar);
+                        match &pct_cache {
+                            Some(cache) => f.feed_sealed_1s_bar_with_pct(&bar, cache),
+                            None => f.feed_sealed_1s_bar(&bar),
+                        }
                     }
                     // Hot-path review M1 fix: gate the format expansion
                     // entirely behind the level check so peak-load
@@ -183,6 +206,7 @@ pub async fn spawn_supervised_cascade_1s(
     sender: broadcast::Sender<ParsedTick>,
     engine_map: Arc<CandleEngineMap<Tf1s>>,
     fanout: Option<CascadeFanout>,
+    pct_cache: Option<Arc<PrevDayCache>>,
 ) {
     loop {
         let rx = sender.subscribe();
@@ -192,7 +216,11 @@ pub async fn spawn_supervised_cascade_1s(
         // per-tick hot path. This is NOT the cascade hot loop.
         // O(1) EXEMPT: supervisor respawn, not per-tick hot path.
         let fanout_clone = fanout.clone();
-        let join = tokio::spawn(async move { run_cascade_1s(rx, map, fanout_clone).await });
+        let pct_cache_clone = pct_cache.as_ref().map(Arc::clone);
+        let join =
+            tokio::spawn(
+                async move { run_cascade_1s(rx, map, fanout_clone, pct_cache_clone).await },
+            );
         match join.await {
             Ok(()) => {
                 // Clean exit ⇒ broadcast sender was dropped. Stop
@@ -295,7 +323,7 @@ mod tests {
         let engine_map: Arc<CandleEngineMap<Tf1s>> = Arc::new(CandleEngineMap::new());
         let map_clone = Arc::clone(&engine_map);
 
-        let handle = tokio::spawn(run_cascade_1s(rx, map_clone, None));
+        let handle = tokio::spawn(run_cascade_1s(rx, map_clone, None, None));
 
         // Two ticks in the same 1s bucket → engine accumulates, no seal.
         tx.send(make_tick(1000, 1, 100, 100.0)).expect("send 1");
@@ -316,7 +344,7 @@ mod tests {
         let (tx, rx) = broadcast::channel::<ParsedTick>(16);
         let engine_map: Arc<CandleEngineMap<Tf1s>> = Arc::new(CandleEngineMap::new());
         let map_clone = Arc::clone(&engine_map);
-        let handle = tokio::spawn(run_cascade_1s(rx, map_clone, None));
+        let handle = tokio::spawn(run_cascade_1s(rx, map_clone, None, None));
 
         tx.send(make_tick(2000, 1, 200, 50.0)).expect("send a");
         tx.send(make_tick(2000, 1, 201, 51.0))
@@ -335,7 +363,7 @@ mod tests {
     async fn run_cascade_1s_exits_when_broadcast_closes() {
         let (tx, rx) = broadcast::channel::<ParsedTick>(4);
         let engine_map: Arc<CandleEngineMap<Tf1s>> = Arc::new(CandleEngineMap::new());
-        let handle = tokio::spawn(run_cascade_1s(rx, engine_map, None));
+        let handle = tokio::spawn(run_cascade_1s(rx, engine_map, None, None));
         drop(tx); // Close immediately — cascade should exit.
         handle.await.expect("cascade exits");
     }
@@ -346,7 +374,7 @@ mod tests {
         let (tx, rx) = broadcast::channel::<ParsedTick>(2);
         let engine_map: Arc<CandleEngineMap<Tf1s>> = Arc::new(CandleEngineMap::new());
         let map_clone = Arc::clone(&engine_map);
-        let handle = tokio::spawn(run_cascade_1s(rx, map_clone, None));
+        let handle = tokio::spawn(run_cascade_1s(rx, map_clone, None, None));
 
         // Producer floods 100 ticks before consumer wakes — older ticks
         // are dropped, consumer sees Lagged then resumes from latest.
@@ -438,13 +466,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_cascade_1s_uses_with_pct_path_when_cache_wired() {
+        // F1 ratchet: with `pct_cache = Some(...)` the cascade
+        // exercises the `_with_pct` engine variants. The cache is
+        // empty here, so the stamped fields fall back to 0.0 — the
+        // important assertion is that the seal STILL happens (the
+        // `on_tick_with_pct` short-circuit returns `None` only when
+        // the underlying `on_tick` returns `None`, never because of
+        // a cache miss). Regression block for any future change that
+        // accidentally drops the seal on cache miss.
+        let (tx, rx) = broadcast::channel::<ParsedTick>(16);
+        let engine_map: Arc<CandleEngineMap<Tf1s>> = Arc::new(CandleEngineMap::new());
+        let fanout = CascadeFanout::new();
+        let pct_cache = Arc::new(PrevDayCache::new());
+        let map_clone = Arc::clone(&engine_map);
+        let fanout_clone = fanout.clone();
+        let cache_clone = Arc::clone(&pct_cache);
+        let handle = tokio::spawn(run_cascade_1s(
+            rx,
+            map_clone,
+            Some(fanout_clone),
+            Some(cache_clone),
+        ));
+
+        // Two ticks crossing a 1s bucket → 1s engine seals → fanout
+        // feeds derived engines via `_with_pct` path.
+        tx.send(make_tick(8000, 1, 4_000, 100.0)).expect("send 1");
+        tx.send(make_tick(8000, 1, 4_001, 101.0))
+            .expect("send 2 crosses bucket");
+        drop(tx);
+        handle.await.expect("cascade exits");
+
+        // 1s engine has post-seal latest at the new bucket.
+        let latest_1s = engine_map.latest(8000, 1).expect("post-seal latest");
+        assert_eq!(latest_1s.bucket_start_ist_secs, 4_001);
+
+        // Derived engine 1m must have observed the sealed 1s bar via
+        // the `_with_pct` path (cache empty → unstamped, but seal
+        // still propagates).
+        assert!(
+            fanout.tf1m.latest(8000, 1).is_some(),
+            "tf1m must observe seal even when pct_cache is empty"
+        );
+    }
+
+    #[tokio::test]
     async fn run_cascade_1s_no_started_log_when_broadcast_closes_immediately() {
         // False-OK guard: the "task active" log must NOT fire if the
         // broadcast is closed before any tick arrives. This is a
         // behavioural assertion — task exits cleanly with no panic.
         let (tx, rx) = broadcast::channel::<ParsedTick>(4);
         let engine_map: Arc<CandleEngineMap<Tf1s>> = Arc::new(CandleEngineMap::new());
-        let handle = tokio::spawn(run_cascade_1s(rx, engine_map, None));
+        let handle = tokio::spawn(run_cascade_1s(rx, engine_map, None, None));
         drop(tx);
         handle
             .await

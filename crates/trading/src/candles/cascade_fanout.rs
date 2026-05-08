@@ -20,6 +20,7 @@ use metrics::counter;
 
 use crate::candles::engine::{Bar, Tf1d, Tf1h, Tf1mo, Tf1w, Tf2h, Tf3h, Tf4h, Tf5m, Tf15m, Tf30m};
 use crate::candles::engine_map::CandleEngineMap;
+use crate::in_mem::PrevDayCache;
 
 /// Prometheus counter — every sealed 1s bar that the fanout processed.
 pub const METRIC_FANOUT_BARS_PROCESSED: &str = "tv_candle_cascade_fanout_bars_processed_total";
@@ -125,6 +126,62 @@ impl CascadeFanout {
             derived_seals += 1;
         }
         if self.tf1mo.on_sealed_bar(bar).is_some() {
+            derived_seals += 1;
+        }
+        if derived_seals > 0 {
+            counter!(METRIC_FANOUT_DERIVED_SEALS).increment(derived_seals);
+        }
+    }
+
+    /// F1 (Wave-5 §K-L13 / #504e follow-up): pct-stamping variant of
+    /// [`feed_sealed_1s_bar`].
+    ///
+    /// Calls [`CandleEngineMap::on_sealed_bar_with_pct`] on every derived
+    /// engine so any sealed Bar that pops out of the derived seal chain
+    /// carries the 5 frozen-per-day % fields populated from `pct_cache`.
+    /// Falls back to unstamped bars (with 0.0 % fields) when the cache
+    /// has no entry for the instrument — see `on_sealed_bar_with_pct`
+    /// for the div-by-zero policy.
+    ///
+    /// Hot-path budget: the `pct_cache` lookup runs at most once per
+    /// derived engine per sealed source bar. Per-tick budget unchanged
+    /// — this method runs on the seal path, not the per-tick path.
+    /// Counter semantics are identical to [`feed_sealed_1s_bar`].
+    #[inline]
+    pub fn feed_sealed_1s_bar_with_pct(&self, bar: &Bar, pct_cache: &PrevDayCache) {
+        counter!(METRIC_FANOUT_BARS_PROCESSED).increment(1);
+        let mut derived_seals = 0_u64;
+        if self.tf1m.on_sealed_bar_with_pct(bar, pct_cache).is_some() {
+            derived_seals += 1;
+        }
+        if self.tf5m.on_sealed_bar_with_pct(bar, pct_cache).is_some() {
+            derived_seals += 1;
+        }
+        if self.tf15m.on_sealed_bar_with_pct(bar, pct_cache).is_some() {
+            derived_seals += 1;
+        }
+        if self.tf30m.on_sealed_bar_with_pct(bar, pct_cache).is_some() {
+            derived_seals += 1;
+        }
+        if self.tf1h.on_sealed_bar_with_pct(bar, pct_cache).is_some() {
+            derived_seals += 1;
+        }
+        if self.tf2h.on_sealed_bar_with_pct(bar, pct_cache).is_some() {
+            derived_seals += 1;
+        }
+        if self.tf3h.on_sealed_bar_with_pct(bar, pct_cache).is_some() {
+            derived_seals += 1;
+        }
+        if self.tf4h.on_sealed_bar_with_pct(bar, pct_cache).is_some() {
+            derived_seals += 1;
+        }
+        if self.tf1d.on_sealed_bar_with_pct(bar, pct_cache).is_some() {
+            derived_seals += 1;
+        }
+        if self.tf1w.on_sealed_bar_with_pct(bar, pct_cache).is_some() {
+            derived_seals += 1;
+        }
+        if self.tf1mo.on_sealed_bar_with_pct(bar, pct_cache).is_some() {
             derived_seals += 1;
         }
         if derived_seals > 0 {
@@ -286,6 +343,63 @@ mod tests {
         for (name, latest) in assertions {
             assert!(latest.is_some(), "{name} did not receive the sealed 1s bar");
         }
+    }
+
+    #[test]
+    fn feed_sealed_1s_bar_with_pct_propagates_to_every_derived_engine() {
+        // F1 ratchet: the pct-stamping fanout method MUST reach every
+        // derived engine, just like its non-stamping sibling. Mirrors
+        // `feed_sealed_1s_bar_propagates_to_every_derived_engine` so a
+        // future regression dropping a `tf_*.on_sealed_bar_with_pct(...)`
+        // call from the body fails the build.
+        let fanout = CascadeFanout::new();
+        let cache = PrevDayCache::new();
+        let bar = make_sealed_1s_bar(4321, 1, 2_000);
+        fanout.feed_sealed_1s_bar_with_pct(&bar, &cache);
+        let assertions: [(&str, Option<Bar>); DERIVED_ENGINE_COUNT] = [
+            ("tf1m", fanout.tf1m.latest(4321, 1)),
+            ("tf5m", fanout.tf5m.latest(4321, 1)),
+            ("tf15m", fanout.tf15m.latest(4321, 1)),
+            ("tf30m", fanout.tf30m.latest(4321, 1)),
+            ("tf1h", fanout.tf1h.latest(4321, 1)),
+            ("tf2h", fanout.tf2h.latest(4321, 1)),
+            ("tf3h", fanout.tf3h.latest(4321, 1)),
+            ("tf4h", fanout.tf4h.latest(4321, 1)),
+            ("tf1d", fanout.tf1d.latest(4321, 1)),
+            ("tf1w", fanout.tf1w.latest(4321, 1)),
+            ("tf1mo", fanout.tf1mo.latest(4321, 1)),
+        ];
+        for (name, latest) in assertions {
+            assert!(
+                latest.is_some(),
+                "{name} did not receive the pct-stamped sealed 1s bar"
+            );
+        }
+    }
+
+    #[test]
+    fn feed_sealed_1s_bar_with_pct_falls_back_when_cache_empty() {
+        // F1 ratchet: when the prev-day cache has no entry for the
+        // instrument, the fanout MUST still propagate the unstamped bar
+        // (returning 0.0 for the % fields per the
+        // `on_sealed_bar_with_pct` div-by-zero policy) rather than
+        // dropping the seal.
+        let fanout = CascadeFanout::new();
+        let cache = PrevDayCache::new();
+        let bar = make_sealed_1s_bar(7777, 1, 3_000);
+        fanout.feed_sealed_1s_bar_with_pct(&bar, &cache);
+        assert!(
+            fanout.tf1m.latest(7777, 1).is_some(),
+            "tf1m must observe the seal even on cache miss"
+        );
+    }
+
+    #[test]
+    fn feed_sealed_1s_bar_with_pct_explicit_name_match() {
+        let fanout = CascadeFanout::new();
+        let cache = PrevDayCache::new();
+        let bar = make_sealed_1s_bar(1, 1, 1);
+        fanout.feed_sealed_1s_bar_with_pct(&bar, &cache);
     }
 
     #[test]
