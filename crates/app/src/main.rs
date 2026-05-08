@@ -2748,11 +2748,21 @@ async fn main() -> Result<()> {
         let supervisor_sender = tick_broadcast_sender.clone();
         let supervisor_map = std::sync::Arc::clone(&candle_engine_map_1s);
         let supervisor_fanout = cascade_fanout.clone();
+        // F1 (Wave-5 §K-L13 / #504e follow-up): wire the existing
+        // `prev_day_cache` (constructed at line ~663) into the
+        // cascade so every sealed Bar carries the 5 frozen-per-day
+        // % fields. The cache is empty at boot today (F2 will add
+        // the boot-time loader); the `on_*_with_pct` div-by-zero
+        // policy means an empty cache produces 0.0 % fields without
+        // dropping any seal — so wiring this in advance is benign
+        // until F2 lands.
+        let supervisor_pct_cache = std::sync::Arc::clone(&prev_day_cache);
         tokio::spawn(async move {
             tickvault_trading::candles::spawn_supervised_cascade_1s(
                 supervisor_sender,
                 supervisor_map,
                 Some(supervisor_fanout),
+                Some(supervisor_pct_cache),
             )
             .await;
         });
