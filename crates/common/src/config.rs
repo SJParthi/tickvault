@@ -65,6 +65,52 @@ pub struct ApplicationConfig {
     /// engines per L7).
     #[serde(default)]
     pub engine: EngineConfig,
+    /// Wave-5 in-memory store §K-L10 (PR #504d) — runtime-tunable
+    /// per-instrument tick capacity for `TickStorage`. Default 5_000
+    /// covers the busiest contract's daily tick count without
+    /// triggering Vec realloc.
+    #[serde(default)]
+    pub in_mem: InMemConfig,
+}
+
+/// Container for the `[in_mem]` TOML section (Wave-5 §K-L10, PR #504d).
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct InMemConfig {
+    #[serde(default)]
+    pub tick_storage: TickStorageConfig,
+}
+
+/// `[in_mem.tick_storage]` — runtime-tunable TickStorage settings.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TickStorageConfig {
+    /// Pre-allocated `Vec<ParsedTick>` capacity per `(security_id,
+    /// exchange_segment)` key on first push. Sized to cover the
+    /// busiest contract's daily tick count without forcing a Vec
+    /// realloc (`tv_in_mem_tick_storage_realloc_total` increments on
+    /// overflow). Setting this to 0 falls back to the compile-time
+    /// default (`DEFAULT_PER_INSTRUMENT_CAPACITY = 5_000`) inside
+    /// `TickStorage::new` so a misconfigured TOML cannot trigger
+    /// 1-byte-realloc-per-tick.
+    #[serde(default = "TickStorageConfig::default_per_instrument_capacity")]
+    pub per_instrument_capacity: usize,
+}
+
+impl TickStorageConfig {
+    /// Default capacity = 5_000 per L10 sizing analysis (mirrors the
+    /// trading crate constant `DEFAULT_PER_INSTRUMENT_CAPACITY`).
+    /// Pinned by `test_tick_storage_default_per_instrument_capacity`.
+    #[must_use]
+    pub const fn default_per_instrument_capacity() -> usize {
+        5_000
+    }
+}
+
+impl Default for TickStorageConfig {
+    fn default() -> Self {
+        Self {
+            per_instrument_capacity: Self::default_per_instrument_capacity(),
+        }
+    }
 }
 
 /// Container for the `[engine.timeframes]` TOML section. L8 pins the
@@ -1869,6 +1915,7 @@ mod tests {
             depth_20: Depth20RootConfig::default(),
             depth_200: Depth200RootConfig::default(),
             engine: EngineConfig::default(),
+            in_mem: InMemConfig::default(),
         }
     }
 
@@ -2554,6 +2601,23 @@ mod tests {
         let engine = EngineConfig::default();
         assert_eq!(engine.timeframes.list.len(), 21);
         assert!(!engine.timeframes.contains_seconds_tf());
+    }
+
+    // --- Wave-5 §K-L10 (PR #504d) ratchets ---------------------------
+
+    #[test]
+    fn test_tick_storage_default_per_instrument_capacity_is_5k() {
+        // L10 + sizing analysis pin: 5_000 covers the busiest contract.
+        // Drift requires plan amend.
+        let cfg = TickStorageConfig::default();
+        assert_eq!(cfg.per_instrument_capacity, 5_000);
+        assert_eq!(TickStorageConfig::default_per_instrument_capacity(), 5_000);
+    }
+
+    #[test]
+    fn test_in_mem_config_default_inherits_l10_tick_storage() {
+        let cfg = InMemConfig::default();
+        assert_eq!(cfg.tick_storage.per_instrument_capacity, 5_000);
     }
 
     #[test]
