@@ -1,6 +1,6 @@
 # Design Plan: In-Memory Store (§17) + AWS Instance Re-evaluation (§18 v2)
 
-**Status:** DRAFT — discussion only, no implementation contract until operator answers Q1–Q15.
+**Status:** DRAFT v2 — 14 design decisions LOCKED 2026-05-08 (L1–L14 in §K). 1 open verification gate (`OPEN-VERIFY-1`). No implementation contract until verification gate closes + operator approves §K → APPROVED status.
 **Date:** 2026-05-07
 **Authors:** Parthiban (architect), Claude (builder)
 **Branch:** to-be-created on operator approval
@@ -241,4 +241,126 @@ If we move to ARM, the ratchet bench numbers must be re-baselined and the claim 
 
 ---
 
-**End of DRAFT.** Awaiting operator answers to Q1–Q15 before APPROVED status.
+## §J) Operator answers (Q1–Q15 collapsed 2026-05-08)
+
+| Question | Answer |
+|---|---|
+| Q1 (consumer N) | Per-bar % fields collapse this — `MoversEngine` is a sort over latest-bar map; no fixed N |
+| Q2 (cold-boot mid-market) | Full-day RAM populated as ticks arrive; first 0–105 min after boot reads RAM with growing-window data |
+| Q3 (runtime-tunable cap) | YES — TF list is `config/base.toml [engine.timeframes]` boot-time array (hot-reload deferred) |
+| Q4 (historical scope) | Current trading day only in RAM; historical via QuestDB matview (NOT on live trading path) |
+| Q5 (RI tier) | 1-yr Standard RI (operator confirmed in §K-L1 as floor for cost) |
+| Q6 (PR ordering) | Sequential #504 → 505 → 507 (PR #506 KILLED — see §K-L14) |
+| Q7 (Wave-4-E1 reserved) | Deferred follow-up — `tv_subsystem_memory_bytes` to ship as #504 prereq instead (§K-L18) |
+| Q8 (OS tunes) | Land in #504 deploy commit (`vm.swappiness=0`, cgroup `memory.high`) |
+| Q9 (corruption rebuild) | YAGNI — rebuild on next IST midnight rollover or app restart |
+| Q10 (eviction counter) | YES — `tv_in_mem_evictions_total{tf}` (§K-L18 observability bundle) |
+| Q11 (ARM yes/no) | YES — Graviton4 |
+| Q12 (Graviton3 vs 4) | Graviton4 (c8g family) |
+| Q13 (Mumbai availability verify) | OPEN — operator to run `aws ec2 describe-instance-types --region ap-south-1` before Terraform commit |
+| Q14 (benchmark re-baseline) | YES — `quality/benchmark-budgets.toml` re-baselined on aarch64 in #504 boot smoke commit |
+| Q15 (multi-arch CI) | aarch64 only at first (saves CI minutes); add x86 matrix in Wave-6 if fallback needed |
+
+## §K) Locked design decisions (L1–L18, 2026-05-08)
+
+### Hardware + infrastructure
+
+| # | Locked | Detail |
+|---|---|---|
+| L1 | AWS instance | **c8g.xlarge** (Graviton4, 4 vCPU, 8 GB), 1-yr Standard RI no-upfront, ap-south-1 (Mumbai). Architecture = aarch64. |
+| L2 | Docker memory budget (Trim Path A) | QuestDB 4G→2G, Valkey 1G→384M, Grafana 1G→512M, Prometheus 512M→256M, Alertmanager 256M, Traefik 512M, Valkey-exporter 128M. **Total ~3.5 GB.** |
+| L3 | Free RAM after Docker + OS for app | ~4.35 GB (8 GB − 3.5 GB Docker − 0.15 GB OS) |
+| L4 | OS tunes (#504 commit) | `vm.swappiness=0`, `vm.overcommit_memory=2`, cgroup `memory.high=7.5G` |
+
+### Data scope
+
+| # | Locked | Detail |
+|---|---|---|
+| L5 | Subscribed universe (Wave 5 default) | 3 indices IDX_I + ~26 display indices + ~216 cash equities + ~10,789 index F&O = **~11,034 instruments** |
+| L6 | Timeframes (NEW — drop seconds) | **21 TFs**: 1m, 2m, 3m, 4m, 5m, 6m, 7m, 8m, 9m, 10m, 11m, 12m, 13m, 14m, 15m, 30m, 1h, 2h, 3h, 4h, 1d |
+| L7 | Dropped TFs | 1s, 3s, 5s, 10s, 15s, 30s — DELETED (no consumer; raw ticks already provide sub-minute) |
+| L8 | TF list source | `config/base.toml [engine.timeframes].list` — runtime-tunable boot-time array |
+
+### In-memory store
+
+| # | Locked | Detail |
+|---|---|---|
+| L9 | Full current-day RAM scope | ALL ticks + ALL bars across all 21 TFs for ALL ~11K instruments |
+| L10 | Tick storage | `papaya<(security_id, exchange_segment), Vec<ParsedTick>>` — full day, IST 09:15 reset, ~880 MB |
+| L11 | Bar storage | `papaya<(security_id, exchange_segment), CandleEngineMap<TF>>` per-TF, full day, 21 TFs, ~1.21 GB |
+| L12 | New per-Bar fields | `cumulative_volume` (running daily sum at seal), `close_pct_from_prev_day`, `prev_day_oi`, `oi_pct_from_prev_day`, `volume_pct_from_prev_day` (5 new fields) |
+| L13 | % field stamping | At bar SEAL only (NOT per tick); on-demand `~50 µs` scan for between-seal "right now" % queries |
+
+### Pipeline + APIs
+
+| # | Locked | Detail |
+|---|---|---|
+| L14 | Movers replacement | `MoversEngine` becomes ~50 LoC façade over latest-bar map; **PR #506 cohort SQL migration KILLED**; depth-dynamic selector reads `MoversEngine.top_k_by(VolumeDesc, 250)` |
+| L15 | DB write cadence | Continuous ILP for ticks (current architecture, no change); seal-time write for bars |
+| L16 | Trading-path reads | RAM only — never touch DB |
+| L17 | 1s engine | DELETED — ticks feed minute engines directly |
+
+### Observability prerequisites
+
+| # | Locked | Detail |
+|---|---|---|
+| L18 | `tv_subsystem_memory_bytes` | NEW Prometheus gauge per-component (rescue ring, tick map, bar map per-TF, registry, baseline) — ships as #504 PREREQ so we can prove RAM cap holds in real-time |
+
+### Volume semantic + reset window
+
+| # | Locked | Detail |
+|---|---|---|
+| L19 | Volume field interpretation | Quote bytes 22-25 + Full bytes 22-25 = `u32` LE = cumulative day volume (running sum since 09:15 IST). Confirmed by `live-market-feed.md` rules 8+10 + draft Dhan support `2026-05-01-volume-semantic-clarification.md` Q1-Q5 |
+| L20 | Cumulative volume reset | 09:15 IST market open (matches Dhan wire semantic exactly) |
+| L21 | `MoversEngine` Top Volume ranking | Sort by `cumulative_volume` field on latest bar DESC. **Until OPEN-VERIFY-1 closes, this is "best-effort matched to Dhan's `/api/movers` UI" — not bit-for-bit guaranteed** |
+
+## §L) OPEN verification gate (must close before §K becomes APPROVED)
+
+| # | Gate | Action | Owner | Blocker for |
+|---|---|---|---|---|
+| **OPEN-VERIFY-1** | Confirm Dhan's `/api/movers` "Top Volume" ranks by the same cumulative-since-09:15 field | (a) Send `docs/dhan-support/2026-05-01-volume-semantic-clarification.md` to `apihelp@dhan.co` with Q6 added (UI movers source mapping); (b) live test 09:14:55/09:15:00/09:15:30 IST tomorrow capturing volume field for one liquid instrument; (c) cross-check `/v2/marketfeed/quote` REST volume vs WebSocket Quote vs UI Top Volume rank for same instrument at 14:30 IST | Operator (Gmail) + Claude (live test setup) | full APPROVED status of §K-L21 |
+| **OPEN-VERIFY-2** | Confirm Mumbai availability + lock real prices for c8g.xlarge | `aws ec2 describe-instance-types --region ap-south-1 --filters Name=instance-type,Values=c8g.xlarge` from operator AWS account; lock 1-yr Standard RI quote | Operator | Terraform commit in #504 |
+
+## §M) Implementation contract (after §L gates close)
+
+### PR sequence
+
+| # | PR | Scope |
+|---|---|---|
+| 1 | **#504a** prerequisite — Observability | Implement `tv_subsystem_memory_bytes` per-component gauge; add Grafana panel; add `tv_in_mem_evictions_total{tf}` counter; add `tv-rss-per-subsystem-high` alert |
+| 2 | **#504b** schema + struct | Add 5 new Bar fields (cumulative_volume, close_pct, prev_day_oi, oi_pct, volume_pct); ALTER candles_* matviews; add new fields to ILP writer |
+| 3 | **#504c** TF list config | `config/base.toml [engine.timeframes]` array; remove 1s/3s/5s/10s/15s/30s engines from `CascadeFanout`; ratchet test for TOML-driven TF list |
+| 4 | **#504d** in-memory store | Tick ring per instrument (full day); bar storage per (instrument, TF); IST 09:15 reset wiring; runtime-tunable cap |
+| 5 | **#504e** % stamping at seal | `close_pct_from_prev_day`, `oi_pct_from_prev_day`, `volume_pct_from_prev_day` computed in `seal_bar` path |
+| 6 | **#505** read flip | `/api/movers/v2` reads `MoversEngine` (façade over latest-bar map); 7 sort categories supported |
+| 7 | **#506** ~~cohort SQL migration~~ | **KILLED — depth-dynamic selector reads RAM directly per L14** |
+| 8 | **#507** Phase 4b drops | DROP `stock_movers` + `option_movers` tables (already wired dormant); 30-day clean window per `docs/runbooks/phase-4b-movers-cleanup.md` |
+| 9 | **#508** AWS deploy | Terraform `instance_type = c8g.xlarge`; Docker mem_limits per L2; ARM AMI; aarch64 cross-compile CI; bench-budget re-baseline |
+
+### 7-layer observability per new component (mandatory)
+
+| Component | Prom counter | Prom gauge | Tracing span | Loki log | Telegram | Grafana panel | Audit table |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| Tick ring per instrument | drops, evictions | size in bytes | ✅ | ✅ | on RSS alert | NEW panel | n/a (live data) |
+| Bar storage per TF | seals, ticks-fed | bars-resident, bytes | ✅ | ✅ | on cap breach | NEW panel | n/a |
+| `MoversEngine` | top-K queries served | latency p99 | ✅ | ✅ | on swap-error | NEW panel | n/a |
+| % field stamping | bars stamped | latency p99 | ✅ | ✅ | n/a | n/a | n/a |
+| `tv_subsystem_memory_bytes` | n/a | per-component RSS | n/a | ✅ at threshold | ✅ HIGH MEMORY | NEW panel | n/a |
+
+### Honest 100% claim (refreshed for c8g.xlarge + ARM)
+
+> 100% inside the tested envelope, with ratcheted regression coverage:
+> ≤60s QuestDB outage absorbed by rescue→spill→DLQ;
+> ≤2,000,000-tick ring buffer capacity;
+> bench-gated O(1) hot path **(re-baselined on aarch64 c8g.xlarge in PR #508)**;
+> composite-key uniqueness;
+> chaos-tested 65h Fri 16:00 IST → Mon 09:00 IST weekend sleep/wake;
+> **per-subsystem RSS accounting via `tv_subsystem_memory_bytes`**;
+> **full-day in-memory store sized at ≤2.1 GB on 11,034 instruments × 21 TFs (`test_in_mem_store_total_under_2_5gb` ratchet)**;
+> **volume field semantic confirmed by Dhan support ticket #2026-05-01-volume-semantic-clarification (cumulative since 09:15 IST, monotonic, resets at 09:15 IST next day)**.
+> Beyond the envelope, DLQ NDJSON catches every payload as recoverable text.
+> Outstanding: Wave-6 (>65h holiday-weekend dormant sleep test), OPEN-VERIFY-1 (`/api/movers` UI Top Volume mapping confirmation).
+
+---
+
+**End of DRAFT v2.** Awaiting OPEN-VERIFY-1 + OPEN-VERIFY-2 closure for APPROVED status.
