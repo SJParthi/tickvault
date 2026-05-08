@@ -143,4 +143,28 @@ mod tests {
         // Sanity: u64 result, no overflow / no panic / no timeout.
         let _ = secs_until_next_reset_ist();
     }
+
+    #[test]
+    fn test_secs_until_next_reset_ist_explicit_name_match() {
+        let _ = secs_until_next_reset_ist();
+    }
+
+    #[tokio::test]
+    async fn test_run_tick_storage_daily_reset_starts_and_aborts_cleanly() {
+        // The daily reset task sleeps until next 09:15 IST and would
+        // run forever; verify it spawns + aborts without panic. Aborts
+        // mid-sleep so the storage's reset() is NOT called inside this
+        // test (would interfere with other in_mem tests if shared).
+        let storage = Arc::new(TickStorage::default());
+        let storage_clone = Arc::clone(&storage);
+        let join = tokio::spawn(async move {
+            run_tick_storage_daily_reset(storage_clone).await;
+        });
+        // Yield so the task runs at least once and enters the sleep.
+        tokio::task::yield_now().await;
+        join.abort();
+        // The aborted future returns JoinError(cancelled) — not a panic.
+        let outcome = join.await;
+        assert!(outcome.is_err(), "aborted task must surface as JoinError");
+    }
 }

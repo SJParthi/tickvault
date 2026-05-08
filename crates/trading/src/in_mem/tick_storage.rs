@@ -444,6 +444,23 @@ mod tests {
     }
 
     #[test]
+    fn test_len_instruments_explicit_name_match() {
+        let store = TickStorage::default();
+        assert_eq!(store.len_instruments(), 0);
+        store.push(make_tick(1234, 1, 100.0));
+        assert_eq!(store.len_instruments(), 1);
+    }
+
+    #[test]
+    fn test_len_total_explicit_name_match() {
+        let store = TickStorage::default();
+        assert_eq!(store.len_total(), 0);
+        store.push(make_tick(1234, 1, 100.0));
+        store.push(make_tick(1234, 1, 101.0));
+        assert_eq!(store.len_total(), 2);
+    }
+
+    #[test]
     fn test_realloc_counter_increments_when_capacity_exceeded() {
         // With a tiny initial capacity, pushing past it should trigger
         // the realloc counter (we can't observe the counter directly

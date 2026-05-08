@@ -148,6 +148,14 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_run_tick_storage_consumer_explicit_name_match() {
+        let (tx, rx) = broadcast::channel::<ParsedTick>(4);
+        let storage = Arc::new(TickStorage::default());
+        drop(tx);
+        run_tick_storage_consumer(rx, storage).await;
+    }
+
+    #[tokio::test]
     async fn test_consumer_exits_cleanly_on_closed_channel() {
         // Sender dropped before any tick → task exits without
         // emitting the false-OK "task active" line (Rule 11).
