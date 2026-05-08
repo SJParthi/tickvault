@@ -41,6 +41,8 @@ use papaya::HashMap;
 use tickvault_common::tick_types::ParsedTick;
 
 use crate::candles::engine::{Bar, CandleEngine, Timeframe};
+use crate::candles::pct_stamping::stamp_bar_pct_fields;
+use crate::in_mem::PrevDayCache;
 
 /// Composite key per I-P1-11.
 type EngineKey = (u32, u8);
@@ -121,6 +123,28 @@ impl<TF: Timeframe + 'static> CandleEngineMap<TF> {
         engine.on_tick(tick)
     }
 
+    /// Wave-5 §K-L13 (#504e): variant of `on_tick` that stamps the 5
+    /// frozen-per-day % fields onto the returned sealed bar before
+    /// returning it.
+    ///
+    /// The `pct_cache` lookup is on the SEAL path (not per-tick), so
+    /// the lookup cost (~30 ns papaya pin + get) is amortised across
+    /// the bucket interval (1 second for `Tf1s` = ~30 ns / 25_000_000
+    /// ticks/sec hot-path budget — negligible).
+    ///
+    /// Falls back to the unstamped bar if the cache has no entry for
+    /// the instrument (newly listed contract, T+0 listing day) — the
+    /// `stamp_bar_pct_fields` div-by-zero policy returns `0.0` for
+    /// the % fields, so the caller never sees `NaN`.
+    #[inline]
+    pub fn on_tick_with_pct(&self, tick: &ParsedTick, pct_cache: &PrevDayCache) -> Option<Bar> {
+        let mut sealed = self.on_tick(tick)?;
+        if let Some(refs) = pct_cache.lookup(sealed.security_id, sealed.exchange_segment_code) {
+            stamp_bar_pct_fields(&mut sealed, refs);
+        }
+        Some(sealed)
+    }
+
     /// Folds a sealed bar (typically from a finer-grained TF cascade)
     /// into the engine for this instrument. Mirrors `on_tick` but uses
     /// the per-instrument engine's `on_sealed_bar` method so the
@@ -152,6 +176,20 @@ impl<TF: Timeframe + 'static> CandleEngineMap<TF> {
             Err(poisoned) => poisoned.into_inner(),
         };
         engine.on_sealed_bar(bar)
+    }
+
+    /// Wave-5 §K-L13 (#504e): variant of `on_sealed_bar` that stamps
+    /// the 5 frozen-per-day % fields onto the returned sealed bar.
+    ///
+    /// Same div-by-zero policy as `on_tick_with_pct`: missing cache
+    /// entry → `0.0` % fields, never `NaN`.
+    #[inline]
+    pub fn on_sealed_bar_with_pct(&self, bar: &Bar, pct_cache: &PrevDayCache) -> Option<Bar> {
+        let mut sealed = self.on_sealed_bar(bar)?;
+        if let Some(refs) = pct_cache.lookup(sealed.security_id, sealed.exchange_segment_code) {
+            stamp_bar_pct_fields(&mut sealed, refs);
+        }
+        Some(sealed)
     }
 
     /// Returns the latest open bar for an instrument, or `None` if
@@ -207,6 +245,7 @@ impl<TF: Timeframe + 'static> CandleEngineMap<TF> {
 mod tests {
     use super::*;
     use crate::candles::engine::{Tf1s, Tf5s};
+    use crate::candles::pct_stamping::PrevDayRefs;
 
     fn make_tick(security_id: u32, segment_code: u8, ts_ist_secs: u32, ltp: f32) -> ParsedTick {
         ParsedTick {
@@ -217,6 +256,105 @@ mod tests {
             exchange_timestamp: ts_ist_secs,
             ..ParsedTick::default()
         }
+    }
+
+    /// Wave-5 §K-L13 (#504e) ratchet: `on_tick_with_pct` stamps the 5
+    /// frozen-per-day % fields on the returned sealed bar when the
+    /// cache has an entry for the instrument.
+    #[test]
+    fn test_on_tick_with_pct_stamps_returned_sealed_bar() {
+        let map = CandleEngineMap::<Tf1s>::new();
+        let cache = PrevDayCache::new();
+        cache.insert(
+            1234,
+            1,
+            PrevDayRefs {
+                prev_day_close: 100.0,
+                prev_day_oi: 0,
+                prev_day_total_volume: 0,
+            },
+        );
+        // First tick — opens the bar (no seal yet).
+        assert!(
+            map.on_tick_with_pct(&make_tick(1234, 1, 1000, 100.0), &cache)
+                .is_none()
+        );
+        // Second tick crosses the 1s boundary → seal returned with stamping.
+        let sealed = map
+            .on_tick_with_pct(&make_tick(1234, 1, 1001, 105.0), &cache)
+            .expect("seal expected at boundary");
+        assert_eq!(sealed.prev_day_close, 100.0);
+        assert_eq!(sealed.close_pct_from_prev_day, 0.0); // close was 100 (last in-bucket tick)
+        // The boundary-crossing tick OPENS the next bucket; the SEALED bar's
+        // close stays at 100.0 (the last tick BEFORE the boundary).
+    }
+
+    #[test]
+    fn test_on_tick_with_pct_returns_unstamped_when_cache_miss() {
+        let map = CandleEngineMap::<Tf1s>::new();
+        let cache = PrevDayCache::new(); // empty
+        assert!(
+            map.on_tick_with_pct(&make_tick(9999, 7, 2000, 100.0), &cache)
+                .is_none()
+        );
+        let sealed = map
+            .on_tick_with_pct(&make_tick(9999, 7, 2001, 105.0), &cache)
+            .expect("seal expected at boundary");
+        // Cache miss → 0.0 default fields (per L13 div-by-zero policy).
+        assert_eq!(sealed.prev_day_close, 0.0);
+        assert_eq!(sealed.close_pct_from_prev_day, 0.0);
+    }
+
+    #[test]
+    fn test_on_sealed_bar_with_pct_stamps_returned_sealed_bar() {
+        // Feeds a sealed 1s bar into a 5s engine; the 5s seal returns
+        // (when crossing the 5s boundary) with the % fields stamped.
+        let map_5s = CandleEngineMap::<Tf5s>::new();
+        let cache = PrevDayCache::new();
+        cache.insert(
+            1234,
+            1,
+            PrevDayRefs {
+                prev_day_close: 100.0,
+                prev_day_oi: 1_000_000,
+                prev_day_total_volume: 10_000_000,
+            },
+        );
+        // Build a synthetic 1s sealed bar.
+        let bar1 = Bar {
+            bucket_start_ist_secs: 1000,
+            bucket_end_ist_secs: 1001,
+            open: 100.0,
+            high: 101.0,
+            low: 99.0,
+            close: 100.5,
+            volume: 50,
+            volume_cum_day_at_end: 200_000,
+            oi: 1_500_000,
+            tick_count: 5,
+            security_id: 1234,
+            exchange_segment_code: 1,
+            sealed: true,
+            prev_day_close: 0.0,
+            prev_day_oi: 0,
+            close_pct_from_prev_day: 0.0,
+            oi_pct_from_prev_day: 0.0,
+            volume_pct_from_prev_day: 0.0,
+        };
+        // First call opens the 5s bucket — no seal returned.
+        assert!(map_5s.on_sealed_bar_with_pct(&bar1, &cache).is_none());
+        // Build a second bar that crosses the 5s boundary → seal returned.
+        let mut bar2 = bar1;
+        bar2.bucket_start_ist_secs = 1005;
+        bar2.bucket_end_ist_secs = 1006;
+        let sealed = map_5s
+            .on_sealed_bar_with_pct(&bar2, &cache)
+            .expect("5s seal expected at boundary");
+        assert_eq!(sealed.prev_day_close, 100.0);
+        assert_eq!(sealed.prev_day_oi, 1_000_000);
+        // The 5s bar's `oi` came from bar1.oi = 1_500_000.
+        // % vs prev_day_oi 1_000_000 = +50%.
+        assert_eq!(sealed.oi_pct_from_prev_day, 50.0);
     }
 
     #[test]

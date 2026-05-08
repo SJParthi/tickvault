@@ -654,6 +654,33 @@ async fn main() -> Result<()> {
         config.in_mem.tick_storage.per_instrument_capacity,
     ));
 
+    // L13 (Wave-5 #504e): construct the prev-day reference cache.
+    // Empty at boot — the bhavcopy + option-chain loaders populate it
+    // before the cascade starts emitting sealed bars (boot-time
+    // loader lands in a follow-up small wiring PR; the data structure
+    // ships here so the seal-stamping path
+    // `CandleEngineMap::on_tick_with_pct` has its lookup target).
+    let prev_day_cache = std::sync::Arc::new(tickvault_trading::in_mem::PrevDayCache::new());
+
+    // L18 / #504a: register the `registry` source closure for the
+    // prev-day cache. The same component label captures both the
+    // instrument registry (legacy) AND prev-day refs since both are
+    // per-instrument metadata frozen for the trading session.
+    {
+        let cache_for_sampler = std::sync::Arc::clone(&prev_day_cache);
+        if let Err(err) = subsystem_memory_sampler.register_source("registry", move || {
+            #[allow(clippy::cast_precision_loss)] // APPROVED: byte count fits f64 mantissa
+            Some(cache_for_sampler.estimated_bytes() as f64)
+        }) {
+            tracing::error!(
+                err,
+                "L18 / #504a: failed to register prev_day_cache memory source — \
+                 component gauge will stay NaN; investigate the subsystem_memory \
+                 sampler state"
+            );
+        }
+    }
+
     // L18 / #504a contract: register the `tick_storage` source closure
     // with the subsystem_memory sampler. The sampler runs every 10s and
     // calls `estimated_bytes()` to update
