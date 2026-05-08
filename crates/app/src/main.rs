@@ -31,7 +31,7 @@ use tickvault_app::boot_helpers::{
     format_bind_addr, format_cross_match_details_grouped, format_timeframe_details,
     format_violation_details, should_emit_post_market_alert, spawn_heartbeat_watchdog,
 };
-use tickvault_app::{core_pinning, infra, observability, trading_pipeline};
+use tickvault_app::{core_pinning, infra, observability, subsystem_memory, trading_pipeline};
 
 use std::net::SocketAddr;
 
@@ -628,6 +628,23 @@ async fn main() -> Result<()> {
     // would allocate (Principle #1 violation). Must run post-install
     // because handles created pre-install resolve to a no-op counter.
     tickvault_core::parser::prewarm_dispatcher_counters();
+
+    // L18 (revised) + L121-L130 (Wave-5 in-memory-store plan §AA):
+    // register the per-subsystem memory gauges, the sampler heartbeat,
+    // and the market-hours-active quiet-hours gate. The sampler task
+    // wakes every `subsystem_memory::SAMPLER_INTERVAL_SECS` seconds
+    // (10s, aligned with the Prom scrape window) and writes whichever
+    // component sources have been registered. For #504a no source is
+    // registered yet — gauges stay `f64::NAN` (L124) until #504d wires
+    // the in-memory store; the alert's `unless absent_over_time(...)`
+    // clause filters NaN entries out so this does not page the operator.
+    let subsystem_memory_handles =
+        std::sync::Arc::new(subsystem_memory::SubsystemMemoryHandles::register());
+    let subsystem_memory_sampler =
+        std::sync::Arc::new(subsystem_memory::SubsystemMemorySampler::new(
+            std::sync::Arc::clone(&subsystem_memory_handles),
+        ));
+    let _subsystem_memory_sampler_join = std::sync::Arc::clone(&subsystem_memory_sampler).spawn();
 
     // -----------------------------------------------------------------------
     // Step 3: Initialize structured logging + OpenTelemetry tracing layer
@@ -7323,7 +7340,10 @@ async fn main() -> Result<()> {
 
             // Per-category last-alert timestamps for dedup.
             let mut last_disk_alert: Option<Instant> = None;
-            let mut last_memory_alert: Option<Instant> = None;
+            // L122: `last_memory_alert` was retired alongside
+            // `MEMORY_RSS_ALERT_MB`. The per-component memory alert is
+            // managed by Prometheus over `tv_subsystem_memory_estimated_bytes`,
+            // not by this in-process cooldown.
             let mut last_spill_alert: Option<Instant> = None;
             let mut last_docker_alert: Option<Instant> = None;
 
@@ -7356,18 +7376,14 @@ async fn main() -> Result<()> {
                         ),
                     });
                 }
-                // Memory RSS check
-                if let Some(rss_mb) = infra::check_memory_rss()
-                    && rss_mb > infra::MEMORY_RSS_ALERT_MB
-                    && should_alert(&mut last_memory_alert, cooldown)
-                {
-                    health_notifier.notify(NotificationEvent::Custom {
-                        message: format!(
-                            "WARNING: HIGH MEMORY — RSS {rss_mb} MB exceeds threshold. \
-                             Consider investigating memory usage."
-                        ),
-                    });
-                }
+                // Memory RSS — legacy `MEMORY_RSS_ALERT_MB > 1024` alert
+                // RETIRED 2026-05-08 per L122 (Wave-5 plan §AA / BUG-C2)
+                // because the in-memory-store design (~2.31 GB total) would
+                // breach the 1 GB threshold instantly with zero diagnostic
+                // signal. Replaced by the per-component
+                // `tv-rss-per-subsystem-high` Prometheus alert over
+                // `tv_subsystem_memory_estimated_bytes{component=...}`
+                // (registered by `subsystem_memory::SubsystemMemoryHandles`).
                 // C2: Spill file size check — export metric + alert if large.
                 let spill_bytes = infra::check_spill_file_size();
                 if spill_bytes > 500 * 1024 * 1024 && should_alert(&mut last_spill_alert, cooldown)

@@ -931,6 +931,21 @@ impl Default for NotificationConfig {
 /// Traces are exported via OTLP gRPC to Jaeger.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ObservabilityConfig {
+    /// Bind address for the Prometheus metrics HTTP endpoint.
+    ///
+    /// Default `127.0.0.1` (loopback only) per the Wave-5 in-memory-store
+    /// plan §AA / L123 (review-fold finding SEC-H1): the new
+    /// `tv_subsystem_memory_estimated_bytes{component}` gauge would
+    /// otherwise be reachable from any peer in the VPC over `0.0.0.0`,
+    /// leaking the trading-universe size and per-subsystem footprint to
+    /// non-Prometheus scrapers.
+    ///
+    /// Operators that scrape from a sidecar in the same pod / network
+    /// namespace (the current AWS plan) keep loopback. Production
+    /// scenarios that need a different bind address (e.g. dedicated
+    /// scrape network) override this field per environment.
+    #[serde(default = "ObservabilityConfig::default_metrics_bind_addr")]
+    pub metrics_bind_addr: std::net::IpAddr,
     /// Port for the Prometheus metrics HTTP endpoint served by the application.
     pub metrics_port: u16,
     /// OTLP gRPC endpoint for trace export (e.g., tv-jaeger:4317).
@@ -941,9 +956,25 @@ pub struct ObservabilityConfig {
     pub tracing_enabled: bool,
 }
 
+impl ObservabilityConfig {
+    /// Default bind for the Prometheus `/metrics` HTTP listener.
+    ///
+    /// Pinned to loopback `127.0.0.1` (L123) so that the new
+    /// per-subsystem memory gauge is not exposed to anything outside
+    /// the local network namespace by default. The reconciliation
+    /// ratchet (`test_default_metrics_bind_is_loopback`) fails the
+    /// build if anyone changes this without updating the alert /
+    /// dashboard / disaster-recovery docs.
+    #[must_use]
+    pub fn default_metrics_bind_addr() -> std::net::IpAddr {
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+    }
+}
+
 impl Default for ObservabilityConfig {
     fn default() -> Self {
         Self {
+            metrics_bind_addr: Self::default_metrics_bind_addr(),
             metrics_port: 9091,
             otlp_endpoint: "http://tv-jaeger:4317".to_string(), // APPROVED: Docker DNS hostname for OTLP collector
             metrics_enabled: true,
