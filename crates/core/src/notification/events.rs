@@ -469,26 +469,10 @@ pub enum NotificationEvent {
         trading_date_ist: String,
     },
 
-    /// 2026-04-25: Mid-market cold start completed. Fires once when the app
-    /// boots between 09:13 and 15:30 IST and the live-tick ATM resolver +
-    /// REST fallback + QuestDB-prev-close chain has resolved (or skipped)
-    /// every F&O stock. Counts MUST sum to the F&O stock universe size.
-    /// Severity::Info.
-    MidMarketBootComplete {
-        /// Stocks resolved via live cash-equity tick (primary path).
-        stocks_live_tick: usize,
-        /// Stocks resolved via REST `/v2/marketfeed/ltp` fallback (stragglers).
-        stocks_rest: usize,
-        /// Stocks resolved via QuestDB previous close (last-resort fallback).
-        stocks_quest_db: usize,
-        /// Stocks skipped for the day (no LTP from any source).
-        stocks_skipped: usize,
-        /// Total subscribed instruments after Phase 2 dispatch.
-        total_subscribed: usize,
-        /// Wall-clock latency from boot to fully subscribed (millis).
-        latency_ms: u64,
-    },
-
+    // `MidMarketBootComplete` retired in PR #509c (Wave-5 §R.1) — the
+    // 4-mode boot resolver was deleted under indices-only scope. Use
+    // `MarketOpenStreamingConfirmation` for the once-per-day market-open
+    // positive heartbeat.
     /// WebSocket disconnected (unexpected, will reconnect).
     WebSocketDisconnected {
         connection_index: usize,
@@ -1759,22 +1743,6 @@ impl NotificationEvent {
                      No audit rows produced — investigate before next trading day."
                 )
             }
-            Self::MidMarketBootComplete {
-                stocks_live_tick,
-                stocks_rest,
-                stocks_quest_db,
-                stocks_skipped,
-                total_subscribed,
-                latency_ms,
-            } => {
-                format!(
-                    "<b>Mid-market boot complete</b>\n\
-                     Live-tick: {stocks_live_tick} | REST: {stocks_rest} | \
-                     QuestDB: {stocks_quest_db} | Skipped: {stocks_skipped}\n\
-                     Total subscribed: {total_subscribed}\n\
-                     Boot latency: {latency_ms} ms"
-                )
-            }
             Self::WebSocketDisconnected {
                 connection_index,
                 reason,
@@ -2486,7 +2454,6 @@ impl NotificationEvent {
             Self::Phase2ReadinessFailed { .. } => "Phase2ReadinessFailed",
             Self::NseBhavcopyCheckComplete { .. } => "NseBhavcopyCheckComplete",
             Self::NseBhavcopyCheckFailed { .. } => "NseBhavcopyCheckFailed",
-            Self::MidMarketBootComplete { .. } => "MidMarketBootComplete",
             Self::WebSocketDisconnected { .. } => "WebSocketDisconnected",
             Self::WebSocketDisconnectedOffHours { .. } => "WebSocketDisconnectedOffHours",
             Self::WebSocketReconnected { .. } => "WebSocketReconnected",
@@ -2643,7 +2610,6 @@ impl NotificationEvent {
             // is High (per audit-findings Rule 11 — no false-OK class).
             Self::NseBhavcopyCheckComplete { .. } => Severity::Info,
             Self::NseBhavcopyCheckFailed { .. } => Severity::High,
-            Self::MidMarketBootComplete { .. } => Severity::Info,
             Self::DepthTwentyConnected { .. } => Severity::Low,
             Self::DepthTwoHundredConnected { .. } => Severity::Low,
             Self::OrderUpdateConnected => Severity::Low,
@@ -4774,49 +4740,7 @@ mod tests {
         );
     }
 
-    /// 2026-04-25 ratchet: mid-market boot completion event has Info
-    /// severity (no operator wake-up) and surfaces the resolution-source
-    /// breakdown so operators can audit which fallback was used.
-    #[test]
-    fn test_midmarket_boot_complete_severity_is_info() {
-        let ev = NotificationEvent::MidMarketBootComplete {
-            stocks_live_tick: 200,
-            stocks_rest: 14,
-            stocks_quest_db: 1,
-            stocks_skipped: 1,
-            total_subscribed: 24_310,
-            latency_ms: 30_500,
-        };
-        assert_eq!(ev.severity(), Severity::Info);
-    }
-
-    #[test]
-    fn test_midmarket_boot_complete_message_lists_every_resolution_source() {
-        let ev = NotificationEvent::MidMarketBootComplete {
-            stocks_live_tick: 200,
-            stocks_rest: 14,
-            stocks_quest_db: 1,
-            stocks_skipped: 1,
-            total_subscribed: 24_310,
-            latency_ms: 30_500,
-        };
-        let msg = ev.to_message();
-        assert!(
-            msg.contains("Live-tick"),
-            "message must label live-tick path"
-        );
-        assert!(msg.contains("REST"), "message must label REST fallback");
-        assert!(
-            msg.contains("QuestDB"),
-            "message must label QuestDB fallback"
-        );
-        assert!(msg.contains("Skipped"), "message must label skipped count");
-        assert!(
-            msg.contains("24310") || msg.contains("24,310"),
-            "message must include total_subscribed; got: {msg}"
-        );
-        assert!(msg.contains("30500"), "message must include latency_ms");
-    }
+    // `test_midmarket_boot_complete_*` retired in PR #509c — variant deleted.
 
     /// Regression: 2026-04-28 — `RealtimeGuaranteeCritical` body contained
     /// the literal phrase `(< 0.80)` which Telegram HTML parse mode treats
