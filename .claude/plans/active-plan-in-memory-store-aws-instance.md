@@ -1,6 +1,6 @@
 # Design Plan: In-Memory Store (§17) + AWS Instance Re-evaluation (§18 v2)
 
-**Status:** DRAFT v12 — 96 design decisions LOCKED 2026-05-08 (L1–L96 across §K + §Q + §R + §S + §T + §U + §V + §W + §X + §Y). 2 open verification gates (`OPEN-VERIFY-1`, `OPEN-VERIFY-2`). c8g.xlarge ONLY — all c7i / c7a / m7i / m7a / r7i references retired (operator directive 2026-05-08). No implementation contract until both gates close + operator approves all sections → APPROVED status.
+**Status:** DRAFT v13 — 120 design decisions LOCKED 2026-05-08 (L1-L120 across 17 sections). 2 open verification gates (OPEN-VERIFY-1, OPEN-VERIFY-2). c8g.xlarge ONLY. All discussion topics now have explicit plan coverage. No implementation contract until both gates close + operator approves all sections -> APPROVED status.
 **Date:** 2026-05-07
 **Authors:** Parthiban (architect), Claude (builder)
 **Branch:** to-be-created on operator approval
@@ -1420,3 +1420,109 @@ Operator demand 2026-05-08: "always make sure our entire product is always autom
 | **TOTAL** | **106** | **L1–L106** |
 
 c8g.xlarge ONLY. 106 design decisions. 2 open verification gates remaining.
+
+## §Z) Gap closure — all discussed items locked (NEW 2026-05-08)
+
+Operator directive 2026-05-08: "09:14 IST live test schedule + everything else from the gap list is needed in our plan."
+
+This section locks every item that was discussed in the design session but had not yet received an explicit L-number. **No hallucinated coverage** — each item below maps to a specific implementation file or explicit defer-with-Wave-6-pointer.
+
+### §Z.1 — Locked design L107–L120
+
+| # | Locked | Detail |
+|---|---|---|
+| **L107** | OPEN-VERIFY-1(b) automated 09:14 IST live test | Daily cron `09 09 * * 1-5 IST` (i.e. 09:14 IST Mon–Fri, configured via systemd timer / GitHub Actions IST cron). Subscribes to ONE liquid contract (e.g. NIFTY ATM call current expiry), captures `volume` field at T-30s / T-5s / T+0s / T+30s / T+60s relative to 09:15:00 IST, writes capture to `data/notes/volume-semantic-verify.YYYY-MM-DD.md`. After 5 consecutive matches (volume = 0 at T-30s + T-5s, increments thereafter), gate auto-closes. Implementation: `scripts/openverify1b-cron.sh` + `crates/app/tests/openverify1b_capture.rs` (NEW). |
+| **L108** | Q6 addition to Dhan support email | Append to `docs/dhan-support/2026-05-01-volume-semantic-clarification.md` Question 6: *"Does the `/api/movers` web UI 'Top Volume' tab rank instruments by the same cumulative-day-volume field exposed in the Live Market Feed Quote/Full packet (bytes 22–25, u32 LE)? If different, what is the source field?"* Operator clicks Send via Gmail to `apihelp@dhan.co`. |
+| **L109** | Indicator engine read pattern | Indicators (RSI/EMA/MACD/SMA/BB via yata) compute ON DEMAND by reading the latest N bars from candle storage map per (instrument, TF). NO separate indicator persistence, NO indicator-snapshot table writes during live trading. `IndicatorEngine` becomes a thin wrapper: `compute_indicator(security_id, segment, tf, indicator_kind, n_bars) → f64` reads RAM, returns. Latency O(N) bars × fixed indicator cost ~10–50 µs per call. **Backtest path** uses the same primitive over historical matview data. |
+| **L110** | Strategy evaluator read pattern | Strategy FSM evaluator (TOML-configured per `crates/trading/src/strategy/`) reads ONLY from candle storage map + tick map + indicator engine. NEVER touches QuestDB on live decision path. Strategy reads happen at bar seal events (pull-on-seal model) — the strategy evaluator is a `BarSealedEvent` subscriber. |
+| **L111** | Order-update WS unchanged under new architecture | Order-update WebSocket (`wss://api-order-update.dhan.co`, JSON) is independent of in-memory store changes. Existing OMS state machine + reconciliation continues to work. The new in-memory store does NOT change order-update flow. Reaffirmed by ratchet: `test_order_update_ws_unaffected_by_inmem_store_changes`. |
+| **L112** | Wave-6 chaos tests reaffirmed (named, scoped, deferred) | The 7 outstanding Wave-6 chaos tests are EXPLICITLY named in `wave-6-backlog.md` with target dates: PROC-01 OOM kill detection, PROC-02 restart loop, RESOURCE-01 disk full, CASCADE-01 triple-failure, RESILIENCE-01 dual-instance, RESILIENCE-02 mid-rebalance, W6-2 >65h holiday-weekend dormant sleep. Honest-100% claim (§U.7, §W.7) calls each one out by name. Not blocking for #504a–#510 ship. |
+| **L113** | PR #510 non-technical-user readability audit | Post-#504a deploy: operator reviews EVERY `Critical` Telegram template (per L65 registry) for plain-English clarity. Audit produces a `docs/operator/telegram-template-uat-2026-MM-DD.md` sign-off doc. Acceptance: at least 1 non-technical-user reviewer (e.g. spouse, co-trader) confirms each template is readable without explanation. Acts as the L67 "what-to-do" wizard validation. |
+| **L114** | Convertible RI as future option (NOT current lock) | §J Q5 locked **1-yr Standard RI no-upfront** as the current cost-optimal choice. **L114 reaffirms:** Convertible RI (~13% premium vs Standard) is a documented future option if Wave-6 proves c8g.xlarge is too small (e.g. operator wants Option A full-retention or Option E/F historical). Decision gate: 6 months post-deploy review of RSS trends + cohort capacity utilization. Operator must explicitly opt-in to Convertible at the next RI renewal. Default stays Standard. |
+| **L115** | Sanity sweep on L-numbers (in-doc) | Every locked decision MUST carry a unique `**L<N>**` bold marker in the plan doc. Plan-verify hook extended (`plan-verify.sh`) to scan for: (a) duplicate L-numbers, (b) skipped numbers (e.g. L42 missing between L41 and L43), (c) any `Locked` row without bold marker. Fails commit if any condition triggered. |
+| **L116** | Local Docker auto-up state observability | The auto-up script (referenced in every SessionStart hook) writes its state to `data/logs/auto-up.YYYY-MM-DD-HHMM.log`. NEW MCP tool `mcp__tickvault-logs__autoup_status` returns `{ profile, prom, qdb, graf, api, last_attempt_at, success }` — Claude can self-check whether local infra is up before answering "is the system healthy?" |
+| **L117** | Phase 4a/4b soak gate auto-tracking | Daily cron at 17:00 IST (post-market) checks: (a) days since Phase 4a deploy commit, (b) days since Phase 4b drop commit, (c) any `tv_movers_persist_errors_total` > 0, (d) any cleanup_audit_log entries with `errored=true`. Posts daily soak-gate status to `data/notes/phase-4-soak-progress.YYYY-MM-DD.md`. After 24h Phase 4a clean window expires → auto-Telegram "Phase 4a soak complete, safe to proceed with Phase 4b drop". |
+| **L118** | Plan-doc CHANGELOG section | NEW §AA at the bottom of plan: `## §AA) CHANGELOG` — every Draft version (v1 through v12) listed with date, commit sha, summary of changes. Operator can audit "what changed between v8 and v9?" in seconds without git diff. |
+| **L119** | "Discussion topics covered" cross-reference table | Already present in chat as the discussion-topic-vs-plan-section map. Locks: this table MUST be regenerated and committed to plan as `§AB) Discussion-Topic Coverage Map` whenever a new section is added. Mechanical guard: plan-verify.sh fails if §AB is older than the most-recent §<X> addition. |
+| **L120** | Honest 100% claim is the SINGLE source of truth on guarantees | Verbatim wording lives in §W.7 (latest refresh). Every PR description that mentions "100% guarantee" MUST cite §W.7 verbatim or include a delta clearly stating "additional guarantee X added by this PR". CI ratchet `test_pr_body_uses_honest_envelope_wording` scans every PR opened against the repo. |
+
+### §Z.2 — 09:14 IST live test cron — full spec (L107)
+
+```bash
+# scripts/openverify1b-cron.sh
+# Runs 09:13:30 IST Mon-Fri (allows 30s setup before 09:14:00 capture)
+# crontab: 13 9 * * 1-5  IST  (TZ=Asia/Kolkata)
+
+#!/bin/bash
+set -euo pipefail
+TODAY=$(date -u +%Y-%m-%d)
+OUTPUT="data/notes/volume-semantic-verify.${TODAY}.md"
+
+# Subscribe to one liquid contract via dedicated short-lived WS connection
+# (separate from main feed pool — does not impact production subscriptions)
+cargo run --release --bin openverify1b_capture -- \
+    --security-id 41747 \
+    --segment NSE_FNO \
+    --capture-windows "T-30,T-5,T+0,T+30,T+60" \
+    --reference-time "09:15:00 IST" \
+    --output "$OUTPUT"
+
+# Auto-update gate status
+if scripts/check-volume-monotonicity.sh "$OUTPUT"; then
+    echo "OPEN-VERIFY-1(b) PASS for $TODAY ($(scripts/count-passes.sh) consecutive)" \
+        | tee -a data/notes/openverify1b-progress.log
+    if [[ $(scripts/count-passes.sh) -ge 5 ]]; then
+        echo "OPEN-VERIFY-1(b) GATE CLOSED — 5 consecutive matches"
+        scripts/post-telegram.sh "✅ OPEN-VERIFY-1(b) gate auto-closed after 5 matches"
+    fi
+else
+    scripts/post-telegram.sh "⚠️ OPEN-VERIFY-1(b) MISMATCH on $TODAY — review $OUTPUT"
+fi
+```
+
+### §Z.3 — Capture windows + expected behavior
+
+| Window | Time | Expected `volume` field | Reasoning |
+|---|---|---:|---|
+| T-30 | 09:14:30 IST | **0** | pre-open / no continuous trading yet |
+| T-5 | 09:14:55 IST | **0** | still pre-market |
+| T+0 | 09:15:00 IST | **0 → first non-zero** | exact session-open instant; first tick should land |
+| T+30 | 09:15:30 IST | small positive (e.g. 100s–1000s) | first 30 sec of trading volume |
+| T+60 | 09:16:00 IST | larger positive | full 1-min cumulative |
+
+If T-30 or T-5 is non-zero → field includes pre-open volume (UNEXPECTED; would invalidate L20).
+If T+0 is still 0 at 09:15:01 → tick stream delayed (Dhan-side issue; capture again next day).
+If T+60 < T+30 → monotonicity violated (CRITICAL).
+
+### §Z.4 — Gate-close criteria
+
+| Match count | State | Action |
+|---|---|---|
+| 0 | initial | gate OPEN |
+| 1–4 | accumulating | gate OPEN, log progress |
+| ≥ 5 consecutive matches | criteria met | gate AUTO-CLOSED → `OPEN-VERIFY-1` resolved → `§K-L21` upgraded from "best-effort" to "confirmed" |
+| Any single mismatch | reset | gate OPEN, counter back to 0, Telegram MEDIUM |
+
+### §Z.5 — Total locked decisions across 17 sections (final)
+
+| Group | Locks | Range |
+|---|---:|---|
+| Hardware + infra | 4 | L1–L4 |
+| Data scope | 4 | L5–L8 |
+| In-memory store | 10 | L9–L18 |
+| Volume semantics | 3 | L19–L21 |
+| Static universe | 6 | L22–L27 |
+| Top-N + Dhan parity | 9 | L28–L36 |
+| Depth diff resub | 10 | L37–L46 |
+| Cleanup guarantee | 6 | L47–L52 |
+| Depth-eligibility | 5 | L53–L57 |
+| Notification UX | 10 | L58–L67 |
+| Local Mac vs AWS | 5 | L68–L72 |
+| Dhan ping/pong contract | 6 | L73–L78 |
+| Crash + recovery matrix | 8 | L79–L86 |
+| Extreme Automation Charter | 10 | L87–L96 |
+| Workspace Auto-Update Charter | 10 | L97–L106 |
+| **Gap closure (NEW §Z)** | **14** | **L107–L120** |
+| **TOTAL** | **120** | **L1–L120** |
+
+c8g.xlarge ONLY. 120 design decisions locked. **All discussion topics now have explicit plan coverage.** Awaiting OPEN-VERIFY-1 + OPEN-VERIFY-2 closure for APPROVED status.
