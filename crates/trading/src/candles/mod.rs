@@ -26,6 +26,7 @@ pub mod cascade_fanout;
 pub mod engine;
 pub mod engine_map;
 pub mod parity;
+pub mod pct_stamping;
 
 pub use cascade::{
     run_cascade_1s, run_midnight_rollover_task_with_fanout, spawn_supervised_cascade_1s,
@@ -38,3 +39,6 @@ pub use engine::{
 };
 pub use engine_map::CandleEngineMap;
 pub use parity::{InstrumentKey, ParityMismatch, ParityReport, compare_bars, sweep_parity};
+pub use pct_stamping::{
+    PrevDayRefs, compute_close_pct, compute_oi_pct, compute_volume_pct, stamp_bar_pct_fields,
+};
