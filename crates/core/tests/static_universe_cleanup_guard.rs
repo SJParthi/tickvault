@@ -67,3 +67,42 @@ fn test_no_pub_mod_preopen_rest_fallback_in_instrument_mod() {
          (file was deleted in PR #509)."
     );
 }
+
+#[test]
+fn test_boot_mode_file_does_not_exist() {
+    let path = workspace_root().join("crates/core/src/instrument/boot_mode.rs");
+    assert!(
+        !path.exists(),
+        "boot_mode.rs MUST be deleted under indices-only scope (PR #509). \
+         Found at {}. The 4-mode resolver (PreMarket/MidPreMarket/MidMarket/PostMarket) \
+         is dead — see plan §R.1 row 4. Market-hours gating now lives in \
+         depth_rebalancer::is_within_market_hours_ist + tick_processor::is_within_persist_window.",
+        path.display()
+    );
+}
+
+#[test]
+fn test_no_pub_mod_boot_mode_in_instrument_mod() {
+    let path = workspace_root().join("crates/core/src/instrument/mod.rs");
+    let src =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {}", path.display(), e));
+    assert!(
+        !src.contains("pub mod boot_mode"),
+        "instrument/mod.rs MUST NOT declare `pub mod boot_mode` (deleted in PR #509)."
+    );
+}
+
+#[test]
+fn test_mid_market_boot_complete_event_retired() {
+    let path = workspace_root().join("crates/core/src/notification/events.rs");
+    let src =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {}", path.display(), e));
+    // Only the retirement-comment marker should remain; the variant body,
+    // match arms, and emit sites must all be gone.
+    let occurrences = src.matches("MidMarketBootComplete").count();
+    assert_eq!(
+        occurrences, 1,
+        "MidMarketBootComplete should appear exactly once (the retirement-comment marker). \
+         Found {occurrences} occurrences — variant body/match arms/tests likely re-introduced."
+    );
+}
