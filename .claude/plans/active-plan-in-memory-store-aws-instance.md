@@ -1,6 +1,6 @@
 # Design Plan: In-Memory Store (§17) + AWS Instance Re-evaluation (§18 v2)
 
-**Status:** DRAFT v6 — 52 design decisions LOCKED 2026-05-08 (L1–L52 across §K + §Q + §R). 2 open verification gates (`OPEN-VERIFY-1`, `OPEN-VERIFY-2`). No implementation contract until both gates close + operator approves all sections → APPROVED status.
+**Status:** DRAFT v7 — 57 design decisions LOCKED 2026-05-08 (L1–L57 across §K + §Q + §R + §S). 2 open verification gates (`OPEN-VERIFY-1`, `OPEN-VERIFY-2`). No implementation contract until both gates close + operator approves all sections → APPROVED status.
 **Date:** 2026-05-07
 **Authors:** Parthiban (architect), Claude (builder)
 **Branch:** to-be-created on operator approval
@@ -708,4 +708,62 @@ Every cleanup PR (#504c, #507, #509) writes one row per dropped item to this tab
 
 ---
 
-**End of DRAFT v6.** Awaiting OPEN-VERIFY-1 + OPEN-VERIFY-2 closure for APPROVED status.
+## §S) Depth-eligibility filter — exclude BSE / SENSEX (NEW 2026-05-08)
+
+Operator catch 2026-05-08: "for depth-20 + depth-200 we need to exclude SENSEX because Dhan doesn't support it."
+
+**Confirmed.** Per `.claude/rules/dhan/full-market-depth.md` rule 13:
+> "Only NSE segments valid. NSE_EQ and NSE_FNO only. BSE, MCX, Currency are NOT available for Full Market Depth. Reject at subscription build time — do not send and wait for error."
+
+SENSEX is `BSE_FNO` → not eligible for depth. NIFTY + BANKNIFTY F&O are `NSE_FNO` → eligible.
+
+### Locked design — L53–L57
+
+| # | Locked | Detail |
+|---|---|---|
+| **L53** | Depth-eligible segment set | **EXACTLY `{NSE_FNO}`** for our current scope. NSE_EQ technically allowed by Dhan but we don't depth-subscribe equities (no use case). IDX_I, BSE_*, MCX_*, NSE_CURRENCY → NOT eligible. |
+| **L54** | Depth cohort filter (override of L34 scope) | Depth-20 + depth-200 cohort = `candle_storage.top_n_by(category=TopVolume, expiry=current, segments=[NSE_FNO], n=K)`. **NOT scope=NSE** (which would include IDX_I + NSE_EQ); explicit `segments=[NSE_FNO]` only. |
+| **L55** | SENSEX explicit exclusion | SENSEX index F&O contracts are `BSE_FNO`, automatically filtered out by L54. Add explicit ratchet test confirming SENSEX SIDs never appear in depth-20 or depth-200 cohort. |
+| **L56** | Pre-subscription validation | At every depth `Add` frame build, validate `segment ∈ {NSE_FNO}` before serializing JSON. Mismatch → log Critical + skip frame + audit row. Defence-in-depth (cohort filter L54 should never let it through, but guard anyway). |
+| **L57** | Observability | Prom counter `tv_depth_cohort_segment_excluded_total{segment, feed}` increments any time a non-NSE_FNO SID would have been in the cohort but was filtered out. Edge-trigger Telegram **Severity::Medium** if non-zero (means cohort filter is doing work — likely a config or universe-shape bug). |
+
+### What this means concretely
+
+| Underlying | Index segment | F&O segment | Subscribed to main feed? | Depth-20 eligible? | Depth-200 eligible? |
+|---|---|---|---|---|---|
+| NIFTY (id=13) | IDX_I | NSE_FNO | ✅ | ✅ via NSE_FNO options | ✅ |
+| BANKNIFTY (id=25) | IDX_I | NSE_FNO | ✅ | ✅ | ✅ |
+| **SENSEX (id=51)** | **IDX_I** | **BSE_FNO** | ✅ | ❌ **EXCLUDED** | ❌ **EXCLUDED** |
+
+So the depth-20 top-250 cohort comes only from NIFTY + BANKNIFTY F&O contracts (typically ~6,000 active option strikes × 2 underlyings ≈ 12K contracts → top-250 by volume). Depth-200 top-5 same — only NIFTY + BANKNIFTY ATM options.
+
+### Ratchet tests (mandatory in #504d)
+
+| Test | What it asserts |
+|---|---|
+| `test_depth_cohort_only_nse_fno` | `candle_storage.top_n_by(...)` for depth feeds returns ZERO entries with `segment != NSE_FNO` |
+| `test_sensex_never_in_depth_cohort` | scenario test: populate candle store with NIFTY+BANKNIFTY+SENSEX bars; depth-20 cohort never includes any SENSEX SID |
+| `test_depth_subscription_builder_rejects_bse` | feeding a BSE_FNO SID to `build_depth_subscribe_message` returns Err |
+| `test_depth_subscription_builder_rejects_idx_i` | same for IDX_I (depth not meaningful for indices) |
+| `test_tv_depth_cohort_segment_excluded_metric_emitted` | when cohort source contains BSE/IDX_I, metric increments with correct `{segment}` label |
+
+### Banned-pattern category 7 addition
+
+Add to `.claude/hooks/banned-pattern-scanner.sh`:
+
+| Pattern | Block reason |
+|---|---|
+| any depth subscribe message construction with `BSE_*` or `IDX_I` or `MCX_COMM` or `NSE_CURRENCY` segment | Dhan rejects; pre-empts at commit-time |
+
+### Why the existing `scope=NSE` (L31) was almost right but not enough
+
+| Filter dim | What it includes | What it excludes |
+|---|---|---|
+| L31 `Scope::NSE` | NSE_EQ + NSE_FNO + IDX_I | BSE_*, MCX_*, NSE_CURRENCY |
+| **L54 explicit `segments=[NSE_FNO]`** | NSE_FNO ONLY | IDX_I (no depth on indices), NSE_EQ (we don't use), all BSE, MCX, currency |
+
+`/api/movers` keeps the broader `Scope::NSE` filter (L31) — it shows top movers across NSE_EQ + NSE_FNO + IDX_I (matches Dhan UI's "NSE" dropdown). But **depth feeds need the tighter `segments=[NSE_FNO]` filter** for correctness.
+
+---
+
+**End of DRAFT v7.** Awaiting OPEN-VERIFY-1 + OPEN-VERIFY-2 closure for APPROVED status.
