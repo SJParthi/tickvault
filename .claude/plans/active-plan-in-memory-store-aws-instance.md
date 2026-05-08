@@ -1,6 +1,6 @@
 # Design Plan: In-Memory Store (§17) + AWS Instance Re-evaluation (§18 v2)
 
-**Status:** DRAFT v7 — 57 design decisions LOCKED 2026-05-08 (L1–L57 across §K + §Q + §R + §S). 2 open verification gates (`OPEN-VERIFY-1`, `OPEN-VERIFY-2`). No implementation contract until both gates close + operator approves all sections → APPROVED status.
+**Status:** DRAFT v8 — 67 design decisions LOCKED 2026-05-08 (L1–L67 across §K + §Q + §R + §S + §T). 2 open verification gates (`OPEN-VERIFY-1`, `OPEN-VERIFY-2`). No implementation contract until both gates close + operator approves all sections → APPROVED status.
 **Date:** 2026-05-07
 **Authors:** Parthiban (architect), Claude (builder)
 **Branch:** to-be-created on operator approval
@@ -766,4 +766,138 @@ Add to `.claude/hooks/banned-pattern-scanner.sh`:
 
 ---
 
-**End of DRAFT v7.** Awaiting OPEN-VERIFY-1 + OPEN-VERIFY-2 closure for APPROVED status.
+## §T) Telegram notification UX overhaul (NEW 2026-05-08)
+
+Operator complaint 2026-05-08: live Telegram screenshots showed `[CRITICAL] REAL-TIME GUARANTEE SCORE CRITICAL` firing every minute alongside `[INFO] Coalesced summary [RealtimeGuaranteeHealthy]` — clear flap-driven spam. Even as a developer it's unreadable; for a non-technical user it's useless.
+
+### Three bugs identified (locked findings)
+
+| # | Bug | Evidence | Fix |
+|---|---|---|---|
+| **B1** | SLO-02 fires on every `Critical` tick, not strictly rising edge | 10:25 two identical CRITICAL back-to-back | edge-trigger guard in `slo_score.rs::evaluate_slo_score` — only fire if `prev_state != Critical`; ratchet test |
+| **B2** | 30-sec QuestDB blip triggers full Critical alert | 10:23/10:25/10:28/10:29 same flap | state-hold debounce: require ≥ N consecutive cycles in same state before firing; ratchet test |
+| **B3** | Message body unintelligible for non-technical user | "Weakest dimension: qdb_health / Code: SLO-02" | smart message template — plain English headline + auto-recovery hint + technical footer |
+
+### Locked design — L58–L67
+
+| # | Locked | Detail |
+|---|---|---|
+| **L58** | Edge-triggered (strict) | SLO scheduler MUST track `previous_outcome`. Fire SLO-02 ONLY when `previous_outcome != Critical && current == Critical`. Same for SLO-01 (only fire on `previous != Healthy && current == Healthy`). No "fire while still in same state" allowed. |
+| **L59** | State-hold debounce | Require **N consecutive cycles in target state** before firing. For SLO scheduler at 10s cadence: N=3 → 30 sec sustained Critical before SLO-02 fires; N=3 → 30 sec sustained Healthy before SLO-01 recovery fires. Configurable via `[notification.debounce]` TOML. |
+| **L60** | Hysteresis bands | Critical entry threshold = 0.80 (existing); Healthy exit threshold = 0.95 (existing); add Degraded band [0.80, 0.95) where neither alert fires (silent). Prevents jitter at boundary. |
+| **L61** | Per-cause severity policy | `qdb_health` weakest **outside market hours** = downgrade Critical → Low (informational); during market hours = full Critical. Same for `ws_health`, `tick_freshness`, `phase2_health`. Implemented as severity-rewrite at emit time. |
+| **L62** | Dev-mode suppression | If `TICKVAULT_PROFILE=local` AND local Docker services are auto-bouncing (auto-up.log mtime < 60s), downgrade ALL Telegram from Critical/High → Low for 5 minutes. Prevents the exact spam you saw on local Mac. |
+| **L63** | Smart message template | Body: **plain English headline** + **auto-recovery hint** + **technical footer**. Example: <br/>`⚠️ QuestDB temporarily unreachable. System is buffering data — no action needed unless this persists > 5 min during market hours. (SLO-02, qdb_health=0)` <br/>vs current: `Composite score: 0.000 / Weakest: qdb_health / Code: SLO-02 / Action: see runbook ...` |
+| **L64** | Quiet hours | Outside market hours (15:30 IST → 09:00 IST + weekends + holidays), all severity ≤ High → downgrade to Low (logged, no Telegram). Critical still pages. |
+| **L65** | Per-event template registry | `crates/core/src/notification/templates.rs` — one template per `NotificationEvent` variant, reviewed for non-technical clarity. Template ratchet test ensures every variant has a template. |
+| **L66** | Telegram footer convention | Every message ends with one technical-detail line in *italics* readable but ignorable for non-technical users. Example: `_(SLO-02 / dimension: qdb_health / score: 0.000 / runbook: wave-3-d)_`. |
+| **L67** | Notification "what to do" wizard | Each Critical alert includes a 1–3 step "what to do" list at the top: 1) `make doctor`, 2) check Docker, 3) restart if persists. Stored in `templates.rs` per event variant. |
+
+### Comparison: what current Telegram looks like vs new template
+
+#### Current (the spam you saw)
+
+```
+🚨 [CRITICAL] REAL-TIME GUARANTEE SCORE CRITICAL
+Composite score: 0.000 (below 0.80).
+Weakest dimension: qdb_health
+Code: SLO-02
+Action: see runbook .claude/rules/project/wave-3-d-error-codes.md
+```
+
+#### New (lazy-kid + non-technical-user friendly)
+
+```
+⚠️ QuestDB temporarily unreachable
+
+What's happening:
+  System is buffering all incoming ticks safely.
+  No data loss — buffer can hold 60+ seconds.
+
+What to do:
+  1. Wait 30 seconds. Auto-recovery is normal.
+  2. If still down after 5 min during market hours,
+     run: make doctor
+  3. If doctor red, restart: make docker-up
+
+Has this happened before today: 0 times.
+Started: 10:25:00 IST (sustained 30s)
+
+_(SLO-02 / dimension: qdb_health / score: 0.000)_
+```
+
+### Notification policy matrix (per cause × per condition)
+
+| Cause | In-market | Off-market | Dev mode | Boot phase |
+|---|---|---|---|---|
+| QuestDB blip < 30 s | Low (silent) | Low | Low | Low |
+| QuestDB down 30 s – 5 min | Low coalesced | Low coalesced | Low | Low |
+| QuestDB down > 5 min in-market | **Critical** with template | High | Low (suppressed dev) | Critical |
+| WS pool one conn drops | Low | Low | Low | Low |
+| WS pool all conns drop | **Critical** | High | Low | Critical |
+| Token < 4h to expiry | High at boot, Critical at < 1h | Low | Low | Critical |
+| Phase 2 readiness check fails | **Critical** | n/a | Low | Critical |
+| RSS > 80% of cap | High | Low | Low | High |
+| OOM kill detected | **Critical** | **Critical** | High | **Critical** |
+| Tick gap > 30 s during market | High coalesced | n/a | Low | n/a |
+| Cohort below capacity | High edge-trigger | Low | Low | Low |
+| Depth diff applied | Low coalesced | Low | Low | Low |
+
+**Rule:** any item in non-Critical column does NOT page operator. Only Critical column triggers the immediate-fire path; everything else is summary/coalesced/silent.
+
+### Ratchet tests (mandatory in #504a observability prereq)
+
+| Test | What it asserts |
+|---|---|
+| `test_slo_02_strictly_edge_triggered` | feeding `[Critical, Critical, Critical]` to scheduler emits ONE Telegram, not three |
+| `test_slo_01_recovery_strictly_edge_triggered` | same for healthy recovery |
+| `test_state_hold_debounce_30s` | 20-sec Critical blip emits NO Telegram; 35-sec Critical emits one |
+| `test_dev_mode_suppression_active_when_docker_bouncing` | session-start-hook flag suppresses Critical → Low for 5 min |
+| `test_every_notification_event_variant_has_template` | enum exhaustiveness check; template registry has entry per variant |
+| `test_template_includes_what_to_do_section` | scan all template strings; require `What to do:` substring on Critical templates |
+| `test_template_includes_technical_footer` | scan all templates; require italicised footer with code |
+| `test_quiet_hours_downgrade_high_to_low_outside_market_hours` | feed High event at 16:00 IST → routed as Low |
+
+### How this scales for non-technical users
+
+| Persona | What they see |
+|---|---|
+| **Operator (you)** | full template — headline + what-to-do + footer; can act |
+| **Co-trader (non-technical)** | reads the headline + first 1–2 lines of "What to do"; understands "wait 30 seconds" without knowing what SLO is |
+| **Auditor / SEBI reviewer** | technical footer (code, dimension, score) sufficient for audit trail |
+| **Dev investigating** | footer + code + runbook reference — zero info loss vs current |
+
+### Coalescing (existing, stays)
+
+| Layer | Cadence | Purpose |
+|---|---|---|
+| Per-topic 60s coalescer (Wave 3 Item 11) | 60 s | dedupe rapid-fire same-topic events |
+| State-hold debounce (NEW L59) | N=3 cycles (30 s at 10s scheduler) | suppress flap-induced state transitions |
+| Quiet hours downgrade (NEW L64) | continuous | route off-market noise to logs |
+| Dev-mode suppression (NEW L62) | 5-min window after auto-up | suppress local-infra-bounce noise |
+
+These compose with logical AND — an event must pass ALL of: not-flapping, in-market, not-dev-bouncing → before reaching Telegram as Critical.
+
+### Implementation scope additions to PR sequence
+
+| PR | Adds |
+|---|---|
+| #504a | template registry + 8 ratchet tests + state-hold debounce + per-cause severity policy + smart template format |
+| #504d | dev-mode suppression hook (reads session-auto-health flag) |
+| #508 (deploy) | quiet-hours config defaults |
+| **NEW PR #510** | non-technical-user readability audit — review every Critical template for plain English; operator UAT |
+
+### What this gives the operator
+
+| Goal | Mechanism |
+|---|---|
+| No flap-driven spam | L59 30-sec state-hold debounce |
+| One alert per real incident | L58 strict edge-trigger |
+| Useful for non-technical users | L63 plain-English template + L67 what-to-do wizard |
+| Quiet at night | L64 quiet hours |
+| Quiet during dev infra bounce | L62 dev-mode suppression |
+| Full audit trail kept | L66 technical footer + Loki ERROR routing unchanged |
+
+---
+
+**End of DRAFT v8.** Awaiting OPEN-VERIFY-1 + OPEN-VERIFY-2 closure for APPROVED status.
