@@ -1,6 +1,6 @@
 # Design Plan: In-Memory Store (§17) + AWS Instance Re-evaluation (§18 v2)
 
-**Status:** DRAFT v2 — 14 design decisions LOCKED 2026-05-08 (L1–L14 in §K). 1 open verification gate (`OPEN-VERIFY-1`). No implementation contract until verification gate closes + operator approves §K → APPROVED status.
+**Status:** DRAFT v3 — 33 design decisions LOCKED 2026-05-08 (L1–L33 in §K). 2 open verification gates (`OPEN-VERIFY-1`, `OPEN-VERIFY-2`). No implementation contract until both gates close + operator approves §K → APPROVED status.
 **Date:** 2026-05-07
 **Authors:** Parthiban (architect), Claude (builder)
 **Branch:** to-be-created on operator approval
@@ -363,4 +363,58 @@ If we move to ARM, the ratchet bench numbers must be re-baselined and the claim 
 
 ---
 
-**End of DRAFT v2.** Awaiting OPEN-VERIFY-1 + OPEN-VERIFY-2 closure for APPROVED status.
+### Static universe simplification (NEW 2026-05-08)
+
+| # | Locked | Detail |
+|---|---|---|
+| L22 | Static-subscribe universe principle | Subscribe ONCE at boot for the full Wave 5 universe (~11K instruments). NEVER re-subscribe based on pre-open data. No 09:00/09:08/09:12 IST subscription gates. |
+| L23 | Trading window precise | **09:15:00 IST (inclusive) → 15:30:00 IST (exclusive)**. Tick capture starts at 09:15:00 IST when Dhan stream begins. After 15:30:00 IST, no new ticks expected; tick processing path drains the buffer. |
+| L24 | Boot timing requirement | All reference data (`prev_day_close`, `prev_day_oi`, `prev_day_total_volume`, instrument master, JWT token, WS pool, ILP socket, in-memory store init) READY before 09:15:00 IST. Boot complete by 09:00:00 IST gives 15-min headroom. |
+| L25 | Phase 2 readiness check (simplified role) | Stays at 09:13:01 IST as positive operator visibility signal (PHASE2-READY-01). NO LONGER drives subscription planning under indices-only scope. Pre-open buffer + REST fallback + 09:13 dispatch machinery becomes dormant under Wave 5. |
+| L26 | Pre-market window observability | Capture data starting whenever Dhan emits it (typically 09:14:30 onward). Pre-open auction prices flow via existing pre-open buffer wiring as informational; not used for subscription planning. |
+| L27 | Post-market window | Tick stream stops at 15:30:00 IST. Persist any in-flight rescue ring entries; in-memory store remains queryable for end-of-day backtests until app restart. |
+
+### Top-K filter dimensions (NEW 2026-05-08)
+
+| # | Locked | Detail |
+|---|---|---|
+| L28 | Top-N calculation primitive | `MoversEngine.top_k_filtered(filters, sort_key, n) -> Vec<Bar>` — no hard cap on N (operator-controlled per call) |
+| L29 | Filter dimensions | **Segment** (NSE_EQ, NSE_FNO, IDX_I, BSE_EQ, BSE_FNO), **Instrument type** (Index, Stock, Equity, F&O futures, F&O options), **Expiry** (date or month label, e.g. "26 MAY", "26 JUN"), **Option type** (CE / PE / nil), **Underlying** (NIFTY, BANKNIFTY, SENSEX, ...), **Strike range** (e.g. ATM±25) |
+| L30 | Filter composition | All filters compose with logical AND. Operator can request any combination, e.g. `(segment=NSE_FNO, expiry=2026-05-29, option_type=CE, sort_key=VolumeDesc, n=20)` |
+| L31 | No N restriction | N can be 10, 100, 250 (depth-20 cohort), 500, 1000, or any value ≤ universe size. Latency scales linearly with universe size, not N. Total cost: ~50 µs per call regardless of N. |
+| L32 | Composite ranking (two-stage) | `top_k_then_sort(primary_filter, k, secondary_sort, n)` — operator's exact pattern: top-K by primary metric (e.g. volume), re-rank within cohort by secondary (e.g. close_pct_from_prev_day) |
+| L33 | Reuse for depth-20 / depth-200 | Same `top_k_filtered` machinery: depth-20 = `top_k_filtered(NSE_FNO, VolumeDesc, 250)`; depth-200 = same with n=5 |
+
+## §N) Static-subscribe model — what we DROPPED from the design
+
+The shift to static universe + indices-only scope retires several design elements:
+
+| Dropped element | Rationale | What replaces it |
+|---|---|---|
+| 09:00–09:12 IST pre-open buffer for STOCK F&O ATM strike resolution | Stock F&O is gated OFF under Wave 5 indices-only scope. No ATM resolution needed for static universe. | nothing — instruments are pre-known |
+| Phase 2 dispatch at 09:13:01 IST (subscription dispatcher) | No subscription planning needed at 09:13. The full universe is already subscribed since boot. | Phase 2 readiness check stays as observability/visibility ping (PHASE2-READY-01) |
+| REST `/marketfeed/ltp` fallback at 09:12:55 | Was a belt-and-suspenders for stock F&O pre-open close discovery. N/A under static universe. | nothing |
+| Mid-market boot mode resolver (live-tick ATM resolver) | Was for mid-day boot under stock F&O scope. Indices-only static doesn't need it. | static subscribe at boot regardless of clock |
+| Pre-open buffer 09:00–09:12 widened window | Original purpose: capture stock pre-open closes for F&O ATM math. | dormant code; can be deleted in future cleanup PR |
+
+**These were correct designs for the prior stock-F&O-included universe. Under Wave 5 indices-only static universe, they become dead weight.** A separate cleanup PR after #504 lands can DELETE the dormant code (live-tick-atm-resolver, mid-market boot mode detection beyond simple `is_within_market_hours`, REST `/marketfeed/ltp` fallback module).
+
+## §O) Updated PR sequence under static-universe simplification
+
+| # | PR | Scope | Touches |
+|---|---|---|---|
+| 1 | **#504a** Observability prereq | `tv_subsystem_memory_bytes` per-component gauge + Grafana panel + alert | crates/app, observability |
+| 2 | **#504b** Schema + struct | 5 new Bar fields + ALTER candles_* matviews + ILP writer | crates/storage, common |
+| 3 | **#504c** TF list config | `[engine.timeframes]` array + remove seconds engines | crates/trading, config, app |
+| 4 | **#504d** In-memory store | Tick ring (full day) + bar storage per (instrument, TF) + IST 09:15 reset | crates/trading, app |
+| 5 | **#504e** % stamping at seal | close_pct, oi_pct, volume_pct computed in `seal_bar` | crates/trading |
+| 6 | **#505** Read flip | `/api/movers/v2` reads `MoversEngine` façade; `top_k_filtered` API supporting filter dimensions L29 | crates/api, trading |
+| 7 | **#507** Phase 4b drops | `DROP TABLE stock_movers, option_movers` (operator runbook gate) | runbook, sql |
+| 8 | **#508** AWS deploy | Terraform `instance_type = c8g.xlarge` + Docker mem_limits per L2 + ARM AMI + aarch64 cross-compile CI + bench-budget re-baseline + OS tunes per L4 | deploy/aws/terraform, deploy/docker, .github/workflows |
+| 9 | **#509** Static-universe cleanup | DELETE live-tick-atm-resolver, mid-market boot mode resolver beyond simple market-hours check, REST `/marketfeed/ltp` fallback, pre-open buffer ATM-strike machinery | crates/core/instrument |
+
+PR #506 (cohort SQL migration) — KILLED per L14 (depth-dynamic reads from RAM `MoversEngine`).
+
+---
+
+**End of DRAFT v3.** Awaiting OPEN-VERIFY-1 + OPEN-VERIFY-2 closure for APPROVED status.
