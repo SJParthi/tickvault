@@ -287,6 +287,11 @@ send_timeout_ms = 10000
 sns_enabled = false
 
 [observability]
+# L123 (Wave-5 in-memory-store plan §AA, SEC-H1): bind the Prometheus
+# `/metrics` listener to loopback by default so the per-subsystem memory
+# gauge is not exposed to any peer in the VPC. Override per-environment
+# only if a dedicated scrape network is in use.
+metrics_bind_addr = "127.0.0.1"
 metrics_port = 9091
 otlp_endpoint = "http://tv-jaeger:4317"
 metrics_enabled = true

@@ -26,7 +26,11 @@ Rationale: Wave 5 narrowed the trading universe to the 3 indices
 because (a) the greeks pipeline runs on those 3 underlyings only
 (`MAX_UNDERLYINGS = 3`), (b) depth-20/200 dynamic feeds operate on
 NIFTY + BANKNIFTY exclusively, and (c) ~11K instruments fits
-comfortably under `MEMORY_RSS_ALERT_MB = 1024 MB`. Phase 2 scheduler
+comfortably under the per-component `tv-rss-per-subsystem-high`
+Prometheus alert (Wave-5 plan §AA L122, retired the legacy
+`MEMORY_RSS_ALERT_MB = 1024 MB` 2026-05-08 because the in-memory-store
+design exceeds it by design — see `crates/app/src/subsystem_memory.rs`).
+Phase 2 scheduler
 is intentionally NOT spawned (`phase2_recovery::should_spawn_phase2_scheduler`
 returns false). SLO-02 phase2_health dimension is pinned to 1.0 in
 the SLO scheduler when this scope is active (live operator incident

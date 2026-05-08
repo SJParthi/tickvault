@@ -33,6 +33,8 @@ pub mod prev_oi_loader;
 // movers_v2_pipeline DELETED in PR #450 commit 6 — V2 in-memory tracker
 // superseded by canonical movers_1s + 25 mat views populated via
 // movers_pipeline.
+pub mod metrics_catalog;
 pub mod observability;
 pub mod phase2_recovery;
+pub mod subsystem_memory;
 pub mod trading_pipeline;

@@ -2038,6 +2038,100 @@
           "fields": ""
         }
       }
+    },
+    {
+      "type": "timeseries",
+      "id": 51,
+      "title": "Subsystem memory estimate (Wave-5 L18)",
+      "description": "Per-component RAM estimate (tv_subsystem_memory_estimated_bytes{component}). HYBRID len()*size_of sampled every 10s by the subsystem_memory task — NOT raw RSS (process_resident_memory_bytes is the canonical kernel measure). Sum across components reconciles within +/-5% of process RSS via the test_subsystem_memory_sums_within_5pct_of_process_rss ratchet. Components init to NaN (L124); the alert tv-rss-per-subsystem-high uses unless absent_over_time(...) so unregistered components do not page. Replaces the legacy MEMORY_RSS_ALERT_MB single-process gauge retired 2026-05-08 (L122 / BUG-C2).",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 74 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "tv_subsystem_memory_estimated_bytes",
+          "legendFormat": "{{component}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "unit": "bytes",
+          "decimals": 0
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "id": 52,
+      "title": "Subsystem memory sampler heartbeat (L125)",
+      "description": "Seconds since the subsystem_memory sampler task last refreshed gauges. Healthy <= 10s (one sample interval). Alert fires at >30s (3x interval) gated by tv_market_hours_active==1. If this stays high, the per-component values on the panel above are STALE and not trustworthy.",
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 82 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "time() - tv_subsystem_memory_sampler_last_update_seconds",
+          "legendFormat": "secs since last sample",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "unit": "s",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green" },
+              { "color": "orange", "value": 15 },
+              { "color": "red", "value": 30 }
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "background_solid",
+        "graphMode": "none",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "" }
+      }
+    },
+    {
+      "type": "stat",
+      "id": 53,
+      "title": "Market-hours active gate (L129)",
+      "description": "1.0 during 09:00-15:30 IST, 0.0 otherwise. Quiet-hours gate used by tv-rss-per-subsystem-high and tv-subsystem-memory-sampler-stale — those alerts only fire when this gauge == 1.",
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 82 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "tv_market_hours_active",
+          "legendFormat": "active",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "unit": "none",
+          "decimals": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "blue" },
+              { "color": "green", "value": 1 }
+            ]
+          }
+        }
+      },
+      "options": {
+        "colorMode": "background_solid",
+        "graphMode": "none",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "" }
+      }
     }
   ]
 }
