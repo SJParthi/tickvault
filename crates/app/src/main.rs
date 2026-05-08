@@ -8882,6 +8882,10 @@ async fn run_candle_persistence_consumer(
                         c.gamma,
                         c.theta,
                         c.vega,
+                        // Wave-5 §K-L12 (#504b): % fields default to 0.0.
+                        0.0,
+                        0.0,
+                        0.0,
                     );
                 }
                 aggregator.clear_completed();
@@ -8926,6 +8930,10 @@ async fn run_candle_persistence_consumer(
                     c.gamma,
                     c.theta,
                     c.vega,
+                    // Wave-5 §K-L12 (#504b): % fields default to 0.0.
+                    0.0,
+                    0.0,
+                    0.0,
                 ) {
                     warn!(?err, "cold-path candle write failed");
                     break;

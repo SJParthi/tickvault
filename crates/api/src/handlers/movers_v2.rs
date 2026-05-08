@@ -133,6 +133,11 @@ impl From<&tickvault_trading::candles::Bar> for MoversV2Bar {
             oi: bar.oi,
             tick_count: bar.tick_count,
             sealed: bar.sealed,
+            // L12 (Wave-5 #504b) added 5 frozen-per-day reference fields
+            // to `Bar`. Surfacing them on the wire `MoversV2Bar` is the
+            // job of #505 (read flip / `/api/movers/v2` response schema)
+            // — this PR keeps the response shape unchanged so /api/movers
+            // consumers see no behaviour change until the explicit cutover.
         }
     }
 }
@@ -342,6 +347,11 @@ mod tests {
             security_id,
             exchange_segment_code: segment_code,
             sealed: true,
+            prev_day_close: 0.0,
+            prev_day_oi: 0,
+            close_pct_from_prev_day: 0.0,
+            oi_pct_from_prev_day: 0.0,
+            volume_pct_from_prev_day: 0.0,
         }
     }
 

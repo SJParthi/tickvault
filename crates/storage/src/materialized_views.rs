@@ -58,6 +58,12 @@ const DEDUP_KEY_CANDLES_1S: &str = "security_id, segment";
 ///
 /// This is the base table that all materialized views aggregate from.
 /// Built by Rust's `CandleAggregator` → ILP flush.
+///
+/// **Wave-5 in-memory store §K-L12 (PR #504b)** added the three % fields
+/// `close_pct_from_prev_day`, `oi_pct_from_prev_day`,
+/// `volume_pct_from_prev_day`. They sit empty after #504b — #504e wires
+/// the seal-time stamping that populates them. Idempotent ALTER for
+/// existing deployments lives in `CANDLES_1S_WAVE5_PCT_COLUMNS`.
 const CANDLES_1S_CREATE_DDL: &str = "\
     CREATE TABLE IF NOT EXISTS candles_1s (\
         segment SYMBOL,\
@@ -78,6 +84,9 @@ const CANDLES_1S_CREATE_DDL: &str = "\
         prev_day_close DOUBLE,\
         prev_day_oi LONG,\
         phase SYMBOL,\
+        close_pct_from_prev_day DOUBLE,\
+        oi_pct_from_prev_day DOUBLE,\
+        volume_pct_from_prev_day DOUBLE,\
         ts TIMESTAMP\
     ) TIMESTAMP(ts) PARTITION BY DAY WAL\
 ";
@@ -98,6 +107,30 @@ const CANDLES_1S_PHASE1_LIFECYCLE_COLUMNS: &[(&str, &str)] = &[
     ("prev_day_close", "DOUBLE"),
     ("prev_day_oi", "LONG"),
     ("phase", "SYMBOL"),
+];
+
+/// Wave-5 in-memory store §K-L12 — 3 frozen-per-day **% fields** added to
+/// `candles_1s` by PR #504b.
+///
+/// Same idempotent ALTER pattern as `CANDLES_1S_PHASE1_LIFECYCLE_COLUMNS`
+/// (sub-millisecond cost on existing deployments because `ALTER TABLE
+/// ADD COLUMN IF NOT EXISTS` is a no-op when the column already exists).
+///
+/// **Why these are NEW columns even though `prev_day_close` /
+/// `prev_day_oi` already exist:** the % fields cache the value of
+/// `(close - prev_day_close) / prev_day_close * 100` (and the OI / volume
+/// analogues) at SEAL time per L13, so consumers can sort by `oi_pct`
+/// without recomputing for every read on the hot path. `previous_close`
+/// and `prev_day_oi` carry the absolute baselines; the 3 columns below
+/// carry the change-vs-baseline percentages.
+///
+/// Matches the 3 new fields on `tickvault_trading::candles::Bar` shipped
+/// in this PR. The producer (`CandleAggregator` / `seal_bar`) wires the
+/// stamping in PR #504e per L13.
+const CANDLES_1S_WAVE5_PCT_COLUMNS: &[(&str, &str)] = &[
+    ("close_pct_from_prev_day", "DOUBLE"),
+    ("oi_pct_from_prev_day", "DOUBLE"),
+    ("volume_pct_from_prev_day", "DOUBLE"),
 ];
 
 // ---------------------------------------------------------------------------
@@ -423,12 +456,21 @@ fn build_view_sql(def: &ViewDef) -> String {
     };
 
     // Phase 1 lifecycle columns (29-timeframes engine plan): every matview
-    // projects the 4 new columns via `last(...)` so the cum-day volume,
-    // frozen prev-day-close/OI and phase are visible at every TF without
-    // a JOIN. Source must be a base table or matview that already carries
-    // these columns — `CANDLES_1S_PHASE1_LIFECYCLE_COLUMNS` declares them
-    // on `candles_1s`, and rebuilding the matview chain in dependency
-    // order propagates them through every downstream view.
+    // projects the 4 lifecycle columns via `last(...)` so the cum-day
+    // volume, frozen prev-day-close/OI and phase are visible at every TF
+    // without a JOIN.
+    //
+    // Wave-5 §K-L12 (PR #504b): 3 additional `last(...)` projections for
+    // the change-vs-prev-day percentages (`close_pct_from_prev_day`,
+    // `oi_pct_from_prev_day`, `volume_pct_from_prev_day`). They sit empty
+    // until the producer (`CandleAggregator` seal-time stamping) lands
+    // in #504e per L13.
+    //
+    // Source must be a base table or matview that already carries
+    // these columns — `CANDLES_1S_PHASE1_LIFECYCLE_COLUMNS` +
+    // `CANDLES_1S_WAVE5_PCT_COLUMNS` declare them on `candles_1s`, and
+    // rebuilding the matview chain in dependency order propagates them
+    // through every downstream view.
     format!(
         "CREATE MATERIALIZED VIEW IF NOT EXISTS {name} AS \
          SELECT ts, security_id, segment, \
@@ -440,7 +482,10 @@ fn build_view_sql(def: &ViewDef) -> String {
          last(volume_cum_day_at_end) AS volume_cum_day_at_end, \
          last(prev_day_close) AS prev_day_close, \
          last(prev_day_oi) AS prev_day_oi, \
-         last(phase) AS phase \
+         last(phase) AS phase, \
+         last(close_pct_from_prev_day) AS close_pct_from_prev_day, \
+         last(oi_pct_from_prev_day) AS oi_pct_from_prev_day, \
+         last(volume_pct_from_prev_day) AS volume_pct_from_prev_day \
          FROM {source} \
          SAMPLE BY {interval} \
          ALIGN TO CALENDAR WITH OFFSET '{offset}'",
@@ -510,6 +555,13 @@ pub async fn ensure_candle_views(questdb_config: &QuestDbConfig) {
     // them — Phase 1 only widens the schema.
     ensure_phase1_lifecycle_columns_on_table(&client, &base_url, QUESTDB_TABLE_CANDLES_1S).await;
 
+    // Step 3c: Add Wave-5 % fields to candles_1s (in-memory store §K-L12,
+    // PR #504b). Same idempotent ALTER pattern. The 3 columns
+    // `close_pct_from_prev_day`, `oi_pct_from_prev_day`,
+    // `volume_pct_from_prev_day` sit empty until #504e wires the
+    // seal-time stamping per L13.
+    ensure_wave5_pct_columns_on_table(&client, &base_url, QUESTDB_TABLE_CANDLES_1S).await;
+
     // Step 4: Drop materialized views if they lack required columns OR if any
     // expected view is missing entirely from the catalogue.
     //
@@ -531,11 +583,12 @@ pub async fn ensure_candle_views(questdb_config: &QuestDbConfig) {
         || views_missing_phase1_columns(&client, &base_url).await
         || base_missing_phase1_columns(&client, &base_url).await
         || any_view_missing_or_lacks_iv(&client, &base_url).await
+        || views_missing_wave5_pct_columns(&client, &base_url).await
     {
         info!(
             "materialized views or candles_1s base lack Greeks / Phase 1 \
-             lifecycle columns, OR one or more of the 28 expected views is \
-             missing/orphan — dropping all views for clean recreation"
+             lifecycle / Wave-5 % columns, OR one or more of the 28 expected \
+             views is missing/orphan — dropping all views for clean recreation"
         );
         drop_all_views(&client, &base_url).await;
     }
@@ -710,6 +763,38 @@ async fn ensure_phase1_lifecycle_columns_on_table(
     );
 }
 
+/// Adds the 3 Wave-5 % fields (`close_pct_from_prev_day`,
+/// `oi_pct_from_prev_day`, `volume_pct_from_prev_day`) to a table if
+/// they are missing.
+///
+/// Same idempotent ALTER pattern as `ensure_phase1_lifecycle_columns_on_table`.
+/// The columns are seeded empty by #504b — the producer that populates
+/// them at SEAL time lands in #504e per L13.
+///
+/// Mechanical contract: the 3 column names + DOUBLE type pinned by
+/// `test_candles_1s_wave5_pct_columns_pinned_to_locked_schema` so a
+/// regression cannot drift them.
+async fn ensure_wave5_pct_columns_on_table(
+    client: &reqwest::Client,
+    base_url: &str,
+    table_name: &str,
+) {
+    for (col, ty) in CANDLES_1S_WAVE5_PCT_COLUMNS {
+        let alter_sql = format!("ALTER TABLE \"{table_name}\" ADD COLUMN \"{col}\" {ty}");
+        drop(
+            client
+                .get(base_url)
+                .query(&[("query", &alter_sql)])
+                .send()
+                .await,
+        );
+    }
+    info!(
+        table = table_name,
+        "Wave-5 % columns ensured (idempotent ADD COLUMN)"
+    );
+}
+
 /// Checks whether the `candles_1s` BASE TABLE is missing the Phase 1
 /// lifecycle column `phase` (29-timeframes engine plan).
 ///
@@ -773,6 +858,37 @@ async fn views_missing_phase1_columns(client: &reqwest::Client, base_url: &str) 
                 // token so we don't accidentally match `phase` substrings
                 // elsewhere in the response.
                 if !body.contains("\"phase\"") {
+                    return true;
+                }
+            }
+            false
+        }
+        Err(_) => false,
+    }
+}
+
+/// Wave-5 §K-L12 (PR #504b): checks whether existing materialized views
+/// are missing the new `close_pct_from_prev_day` column.
+///
+/// Mirrors `views_missing_phase1_columns` — probes `candles_5s` (the
+/// first downstream view) and treats absence of any one of the 3 new
+/// % columns as a "needs recreate" signal. We probe the first column
+/// only because all 3 are added together in `build_view_sql`.
+///
+/// Returns `true` when matviews need recreation. Failed probe → `false`
+/// (Step 5's `CREATE ... IF NOT EXISTS` handles missing views directly).
+async fn views_missing_wave5_pct_columns(client: &reqwest::Client, base_url: &str) -> bool {
+    let probe_sql = "SHOW COLUMNS FROM candles_5s";
+    match client
+        .get(base_url)
+        .query(&[("query", probe_sql)])
+        .send()
+        .await
+    {
+        Ok(response) => {
+            if response.status().is_success() {
+                let body = response.text().await.unwrap_or_default();
+                if !body.contains("\"close_pct_from_prev_day\"") {
                     return true;
                 }
             }
@@ -1459,6 +1575,60 @@ mod tests {
                 "view {} must project last(phase)",
                 def.name
             );
+        }
+    }
+
+    // --- Wave-5 §K-L12 (PR #504b) ratchets -----------------------------
+
+    /// PR #504b ratchet: the 3 % columns MUST appear in the CREATE DDL
+    /// so greenfield deployments include them without needing the
+    /// brownfield ALTER pass.
+    #[test]
+    fn test_candles_1s_ddl_has_wave5_pct_columns() {
+        for (col, ty) in CANDLES_1S_WAVE5_PCT_COLUMNS {
+            let needle = format!("{col} {ty}");
+            assert!(
+                CANDLES_1S_CREATE_DDL.contains(&needle),
+                "candles_1s DDL must declare `{needle}` (Wave-5 §K-L12 / #504b)"
+            );
+        }
+    }
+
+    /// PR #504b ratchet: the constant array pins the exact 3 columns +
+    /// types so a future commit cannot silently drop one or change a
+    /// type.
+    #[test]
+    fn test_candles_1s_wave5_pct_columns_pinned_to_locked_schema() {
+        let pairs: Vec<(&str, &str)> = CANDLES_1S_WAVE5_PCT_COLUMNS.to_vec();
+        assert_eq!(
+            pairs,
+            vec![
+                ("close_pct_from_prev_day", "DOUBLE"),
+                ("oi_pct_from_prev_day", "DOUBLE"),
+                ("volume_pct_from_prev_day", "DOUBLE"),
+            ],
+            "CANDLES_1S_WAVE5_PCT_COLUMNS pinned to the L12 locked list — \
+             drift between the brownfield ALTER and the greenfield CREATE \
+             produces silently divergent schemas across deployments."
+        );
+    }
+
+    /// PR #504b ratchet: every materialized view MUST project the 3 new
+    /// % columns via `last(...)`. Without this, downstream SELECTs
+    /// (`/api/movers` after #505) cannot sort by `oi_pct_from_prev_day`
+    /// at any TF other than `1s`.
+    #[test]
+    fn test_build_view_sql_projects_wave5_pct_columns() {
+        for def in VIEW_DEFS {
+            let sql = build_view_sql(def);
+            for (col, _ty) in CANDLES_1S_WAVE5_PCT_COLUMNS {
+                let needle = format!("last({col}) AS {col}");
+                assert!(
+                    sql.contains(&needle),
+                    "view {name} must project `{needle}` (#504b)",
+                    name = def.name,
+                );
+            }
         }
     }
 
