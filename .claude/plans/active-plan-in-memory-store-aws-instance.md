@@ -1,6 +1,6 @@
 # Design Plan: In-Memory Store (§17) + AWS Instance Re-evaluation (§18 v2)
 
-**Status:** APPROVED v1 — 120 design decisions LOCKED 2026-05-08 (L1-L120 across 17 sections). Operator approval 2026-05-08 "go ahead dude". c8g.xlarge ONLY. Implementation begins with PR #504a (observability prereq). 2 open verification gates remain in parallel: OPEN-VERIFY-1 (auto-closing via L107 09:14 IST cron over 5 trading days) and OPEN-VERIFY-2 (operator-side aws ec2 describe-instance-types verify).
+**Status:** APPROVED v2 — 130 design decisions LOCKED 2026-05-08 (L1-L130 across 18 sections). 3-agent adversarial review passed (§AA): 2 CRITICAL + 6 HIGH findings folded into revised L18 + new locks L121-L130. c8g.xlarge ONLY. Code for #504a writes against the revised lock set. 2 open verification gates parallel: OPEN-VERIFY-1 (auto-closing via L107 09:14 IST cron) + OPEN-VERIFY-2 (operator-side aws ec2 describe-instance-types verify).
 **Date:** 2026-05-07
 **Authors:** Parthiban (architect), Claude (builder)
 **Branch:** to-be-created on operator approval
@@ -1526,3 +1526,102 @@ If T+60 < T+30 → monotonicity violated (CRITICAL).
 | **TOTAL** | **120** | **L1–L120** |
 
 c8g.xlarge ONLY. 120 design decisions locked. **All discussion topics now have explicit plan coverage.** Awaiting OPEN-VERIFY-1 + OPEN-VERIFY-2 closure for APPROVED status.
+
+## §AA) 3-Agent Adversarial Review Verdict — #504a observability prereq (2026-05-08)
+
+Per `wave-4-shared-preamble.md` § 3: spawn 3 specialist agents in parallel BEFORE code; fix every CRITICAL + HIGH inline.
+
+### §AA.1 — Combined verdict table
+
+| Agent | Severity | ID | Finding | Required fix |
+|---|---|---|---|---|
+| hot-path | **CRITICAL** | HOT-C1 | Per-allocation `AtomicUsize` would breach 100ns p99 budget at 25K ticks/sec | **Reject option (b) entirely.** Use HYBRID lazy `len() × size_of` at scrape (10s cadence). |
+| hot-path | **CRITICAL** | HOT-C2 | `format!()` for TF labels in `metrics::counter!()` = banned-pattern hit | Use `&'static str` constants `"1m"/"5m"/"15m"/"30m"/"60m"/"1d"` matched via static enum. |
+| bug-hunt | **CRITICAL** | BUG-C1 | New gauge sums to ~2.45 GB but existing `process_resident_memory_bytes` will report a different number (kernel measure). 3 sources of truth → operator confusion → honest-100% claim breaks | Either (a) require `tv_subsystem_memory_bytes` to sum within ±5% of `process_resident_memory_bytes` via runtime ratchet, OR (b) rename to `tv_subsystem_memory_estimated_bytes` and downgrade L18 claim from "RSS accounting" to "target budget tracking" |
+| bug-hunt | **CRITICAL** | BUG-C2 | Existing `MEMORY_RSS_ALERT_MB=1024` (from PR #497) will fire INSTANTLY post-deploy — design's per-subsystem total ~2.31 GB exceeds 1024 MB. Operator gets paged TWICE for one event | Retire `MEMORY_RSS_ALERT_MB` legacy threshold in SAME PR as #504a; consolidate into the new per-component alert |
+| security | **HIGH** | SEC-H1 | `/metrics` endpoint binds `0.0.0.0:9091` with NO AUTH — exposes per-component RSS to any peer in VPC; new gauge values reveal trading universe size | Bind metrics listener to `127.0.0.1` only; add `metrics_bind_addr: IpAddr` config field; default `127.0.0.1` for prod |
+| security | HIGH | SEC-H2 | Traefik dashboard `:8080 insecure: true` (pre-existing) | Pre-existing — acknowledge; not blocker for #504a but document |
+| hot-path | HIGH | HOT-H1 | Per-call `metrics::counter!()` with dynamic args = ~30 ns hashmap lookup × 5 TFs × 25K/sec = bench-budget risk | Cache `Counter` handle once at boot via `register_counter!`; call `.increment(1)` on cached handle |
+| bug-hunt | HIGH | BUG-H3 | Gauges emitted before `instrument_registry` constructed = `0 MB` reads "OK" or "uninitialized" — false-OK class | Initialize all 7 component gauges to `f64::NAN`; sampler overwrites to real number; alerts use `unless absent_over_time(...)` |
+| bug-hunt | HIGH | BUG-H4 | Sampler task hang → gauge stays last-known forever; operator reads stale value as live | Add `tv_subsystem_memory_sampler_last_update_seconds` heartbeat gauge; alert if `time() - last_update > 30s` |
+| bug-hunt | HIGH | BUG-H5 | `{tf}` label cardinality fine today but design opens floodgate; future `{tf, security_id}` = 231K series Prom OOM | Lock cardinality contract via ratchet test on `metrics_catalog.rs` enumerating exact label set; reject any addition without explicit approval |
+| bug-hunt | HIGH | BUG-H6 | Dashboard rename not guarded — `operator-health.json` JSON references metric name; no test pins JSON ↔ catalog | Add `dashboard_metric_name_pinned_guard.rs` ratchet failing build if metric in JSON not in `metrics_catalog.rs` or vice versa |
+| security | MED | SEC-M1 | TF label cardinality attack if `tf` value derived from external data | `tf` MUST come from compile-time enum match; ratchet test asserts allowed values |
+| security | MED | SEC-M3 | Component label names leak architecture | Use coarse names (`registry`, `cache`, `pipeline`) not precise subsystem names |
+| bug-hunt | MED | BUG-M7 | papaya MVCC swap during scrape — sampler reads `len()` before swap, gauge `set()` after | Sampler holds `Arc<Map>` snapshot for ENTIRE computation; no re-deref |
+| bug-hunt | MED | BUG-M8 | Counter resets on restart; raw value misleads | Grafana panels MUST wrap counter in `increase(...[5m])` per audit-findings Rule 12; ratchet `dashboard_increase_wrapper_guard.rs` |
+| bug-hunt | MED | BUG-M9 | `tv_jemalloc_fragmentation_ratio` referenced in design but does NOT exist in codebase | Either ship in #504a OR remove from L18 design language |
+| bug-hunt | MED | BUG-M10 | Alert at 80% budget breach naturally triggers at IST midnight (rebuild) | Alert expr must include market-hours gate `tv_market_hours_active == 1` |
+| bug-hunt | LOW | BUG-L13 | First sample of `tv_in_mem_evictions_total{tf="1m"}` exists but `tf="5m"` etc. don't until first seal — `sum by (tf)` silently misses | Initialize all 21 TF labels to `0.0` at boot |
+
+### §AA.2 — Revised L18 design (replaces L18 from §K)
+
+**OLD L18:** `tv_subsystem_memory_bytes` per-component RSS gauge.
+
+**NEW L18 (revised):** `tv_subsystem_memory_estimated_bytes` per-component **target budget tracking** (NOT raw RSS measurement, which is what `process_resident_memory_bytes` already does).
+
+| Property | Value |
+|---|---|
+| Metric name | `tv_subsystem_memory_estimated_bytes{component}` |
+| Component labels (coarse, per SEC-M3) | `rescue_ring` / `tick_storage` / `bar_storage` / `registry` / `runtime` / `binary_static` / `papaya_overhead` |
+| Measurement strategy | HYBRID per HOT-M1 — `len() × size_of` lazy at 10s scrape; **NO hot-path AtomicUsize** |
+| Init value | `f64::NAN` (per BUG-H3) |
+| Sampler heartbeat | `tv_subsystem_memory_sampler_last_update_seconds` separate gauge |
+| Reconciliation ratchet | `test_subsystem_memory_sums_within_5pct_of_process_rss` runs at boot + scrape interval |
+| Counter handle | Cached at boot per HOT-H1 |
+| TF label values | Static `&'static str` constants per HOT-C2 + SEC-M1 |
+| /metrics bind | `127.0.0.1` (per SEC-H1) — ObservabilityConfig new `metrics_bind_addr` field |
+| Legacy `MEMORY_RSS_ALERT_MB` | RETIRED in same PR (per BUG-C2) — consolidated into per-component alert |
+| Alert | `tv-rss-per-subsystem-high` with `and on() tv_market_hours_active == 1` gate (per BUG-M10) |
+
+### §AA.3 — Locks added L121–L130 (review-induced)
+
+| # | Locked | Source |
+|---|---|---|
+| **L121** | Metric renamed `tv_subsystem_memory_bytes` → `tv_subsystem_memory_estimated_bytes` | BUG-C1 |
+| **L122** | `MEMORY_RSS_ALERT_MB=1024` legacy threshold RETIRED in #504a (not deferred) | BUG-C2 |
+| **L123** | Bind `/metrics` to `127.0.0.1`; new `ObservabilityConfig.metrics_bind_addr` | SEC-H1 |
+| **L124** | All 7 component gauges init to `f64::NAN`; alerts use `unless absent_over_time(...)` | BUG-H3 |
+| **L125** | Sampler heartbeat gauge `tv_subsystem_memory_sampler_last_update_seconds`; alert if `time() - last_update > 30s` | BUG-H4 |
+| **L126** | Cardinality contract ratchet — `metrics_catalog.rs` enumerates allowed labels; reject `{tf, security_id}` etc. | BUG-H5 |
+| **L127** | Dashboard ↔ catalog ratchet — `dashboard_metric_name_pinned_guard.rs` | BUG-H6 |
+| **L128** | TF labels are `&'static str` matched from compile-time enum; ratchet pins allowed values | HOT-C2 + SEC-M1 |
+| **L129** | Alert expression includes `and on() tv_market_hours_active == 1` quiet-hours gate | BUG-M10 |
+| **L130** | Drop `tv_jemalloc_fragmentation_ratio` reference from L18 design (does not exist; deferred to Wave-6 with explicit name) | BUG-M9 |
+
+### §AA.4 — Implementation gates (must pass for #504a to merge)
+
+| Gate | Check |
+|---|---|
+| 1 | `test_subsystem_memory_sums_within_5pct_of_process_rss` ratchet passes |
+| 2 | Banned-pattern scan: zero `format!()` / `String` allocations in metric label paths |
+| 3 | `dhat_*` ratchets: zero hot-path allocations introduced |
+| 4 | Bench budgets: `tick_pipeline_routing` p99 ≤ 100 ns unchanged |
+| 5 | Sampler heartbeat metric registered + tested |
+| 6 | `/metrics` bind config field tested with default `127.0.0.1` in prod |
+| 7 | Legacy `MEMORY_RSS_ALERT_MB` removed; consolidated alert tested |
+| 8 | NaN init + `unless absent_over_time` alert tested |
+| 9 | Dashboard ↔ catalog ratchet green |
+| 10 | Cardinality contract ratchet green |
+
+All 10 gates run automatically in CI before merge.
+
+### §AA.5 — Total locks across 18 sections (final post-review)
+
+| Group | Locks | Range |
+|---|---:|---|
+| §K hardware/scope/in-mem/volume/static/Top-N | 36 | L1–L36 |
+| §Q depth diff resub | 10 | L37–L46 |
+| §R cleanup guarantee | 6 | L47–L52 |
+| §S depth-eligibility | 5 | L53–L57 |
+| §T notification UX | 10 | L58–L67 |
+| §U Local Mac vs AWS | 5 | L68–L72 |
+| §V Dhan ping/pong contract | 6 | L73–L78 |
+| §W crash + recovery matrix | 8 | L79–L86 |
+| §X automation charter | 10 | L87–L96 |
+| §Y workspace auto-update | 10 | L97–L106 |
+| §Z gap closure | 14 | L107–L120 |
+| **§AA review verdict (NEW)** | **10** | **L121–L130** |
+| **TOTAL** | **130** | **L1–L130** |
+
+c8g.xlarge ONLY. 130 locked decisions. **Code for #504a will be written ONLY against the revised L18 + L121–L130 lock set.**
