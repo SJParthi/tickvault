@@ -25,17 +25,9 @@ fn read_file(rel: &str) -> String {
     fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {rel}: {e}"))
 }
 
-#[test]
-fn guard_phase2_trigger_minute_is_13_not_12() {
-    // Commit 0340a7c — moved trigger from 09:12 to 09:13 so the 09:12 close
-    // bucket is fully captured before we read the preopen buffer.
-    let src = read_file("crates/core/src/instrument/phase2_scheduler.rs");
-    assert!(
-        src.contains("PHASE2_TRIGGER_MIN: u32 = 13"),
-        "Phase 2 trigger minute MUST be 13. If you see 12, the 0340a7c fix was reverted — \
-         the 09:12 close bucket will be empty when read at 09:12:00."
-    );
-}
+// `guard_phase2_trigger_minute_is_13_not_12` retired in PR #509d
+// (Wave-5 §R.1) — `phase2_scheduler.rs` deleted along with the entire
+// dispatcher chain. Trigger-minute invariant is moot.
 
 #[test]
 fn guard_order_update_watchdog_is_14400_not_1800() {
@@ -61,39 +53,15 @@ fn guard_offhours_ws_disconnected_variant_exists() {
     );
 }
 
-#[test]
-fn guard_depth_rebalance_label_uses_zero_disconnect() {
-    // Commit 6f6edc5 — replaced scary "aborting old 200-level → spawning new ATM"
-    // wording with the accurate "zero-disconnect swap" label. The actual code
-    // path is still Swap20/Swap200 — only the operator-facing text changed.
-    let main_src = read_file("crates/app/src/main.rs");
-    assert!(
-        !main_src.contains("aborting old 200-level"),
-        "Depth-rebalance Telegram MUST NOT contain the misleading 'aborting old 200-level' \
-         text — it describes a disconnect-and-respawn, but the code does Swap20/Swap200 \
-         (zero-disconnect). The 6f6edc5 fix was reverted."
-    );
-    assert!(
-        main_src.contains("zero-disconnect swap"),
-        "Depth-rebalance Telegram MUST say 'zero-disconnect swap' (commit 6f6edc5)."
-    );
-}
-
-#[test]
-fn guard_phase2_empty_plan_fires_phase2_failed() {
-    // Commit 4aaa0fb — when the plan is empty, scheduler MUST fire
-    // Phase2Failed with diagnostic, NOT Phase2Complete { added_count: 0 }.
-    let src = read_file("crates/core/src/instrument/phase2_scheduler.rs");
-    assert!(
-        src.contains("Empty plan at trigger"),
-        "Phase 2 empty-plan diagnostic message MUST exist (commit 4aaa0fb). \
-         If gone, Phase 2 silently lies that it succeeded with 0 instruments."
-    );
-    assert!(
-        src.contains("buffer_entries"),
-        "Phase 2 diagnostic must include 'buffer_entries' field for root-cause triage."
-    );
-}
+// `guard_depth_rebalance_label_uses_zero_disconnect` retired in PR
+// #509d — the depth-rebalance Telegram wording moved from inline
+// `Custom { message }` strings in main.rs to the typed
+// `DepthRebalanced` notification variant per the 2026-04-24 PR #337
+// migration. Variant ratchets live in events.rs::tests
+// (`test_depth_rebalance_*`).
+//
+// `guard_phase2_empty_plan_fires_phase2_failed` retired in PR #509d
+// — `phase2_scheduler.rs` deleted along with the dispatcher chain.
 
 #[test]
 fn guard_preopen_buffer_captures_index_underlyings() {
@@ -168,30 +136,10 @@ fn guard_phase2_complete_includes_depth_counts() {
     );
 }
 
-#[test]
-fn guard_phase2_emits_trigger_latency_histogram() {
-    // Plan item K (2026-04-22) — Phase 2 emits tv_phase2_trigger_latency_ms
-    // so the operator can see how late the RunImmediate crash-recovery path
-    // woke up vs the 09:13 target. Zero for SleepUntil, minutes_late * 60_000
-    // for RunImmediate.
-    let src = read_file("crates/core/src/instrument/phase2_scheduler.rs");
-    assert!(
-        src.contains("tv_phase2_trigger_latency_ms"),
-        "Phase 2 must emit tv_phase2_trigger_latency_ms (plan item K)."
-    );
-}
-
-#[test]
-fn guard_phase2_emits_preopen_buffer_entries_gauge() {
-    // Plan item K (2026-04-22) — Phase 2 emits tv_phase2_preopen_buffer_entries
-    // as a gauge at trigger time. Low value = upstream tick capture problem;
-    // the phase2-empty-plan runbook references this metric.
-    let src = read_file("crates/core/src/instrument/phase2_scheduler.rs");
-    assert!(
-        src.contains("tv_phase2_preopen_buffer_entries"),
-        "Phase 2 must emit tv_phase2_preopen_buffer_entries gauge (plan item K)."
-    );
-}
+// `guard_phase2_emits_trigger_latency_histogram` and
+// `guard_phase2_emits_preopen_buffer_entries_gauge` retired in PR
+// #509d — `phase2_scheduler.rs` deleted along with the dispatcher
+// chain; the metrics they pinned no longer exist.
 
 #[test]
 fn guard_movers_v2_emits_snapshot_duration_histogram() {

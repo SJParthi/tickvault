@@ -5050,7 +5050,6 @@ async fn main() -> Result<()> {
             // Pre-clone universe handles for the snapshotter + Phase 2
             // delta computation BEFORE the rebalancer takes ownership.
             let snapshotter_universe = std::sync::Arc::clone(&universe_arc);
-            let phase2_universe = std::sync::Arc::clone(&universe_arc);
             let stock_ltps_universe = std::sync::Arc::clone(&universe_arc);
             // Plan item C (2026-04-22, visibility version): the 09:13 IST
             // depth-anchor task needs its own universe handle to look up
@@ -5346,65 +5345,18 @@ async fn main() -> Result<()> {
                 }
                 tickvault_app::phase2_recovery::RecoveryAction::RunFreshPhase2
                 | tickvault_app::phase2_recovery::RecoveryAction::WaitForScheduler => {
-                    // PR-E indices-only cleanup (2026-05-02): Phase 2 dispatches
-                    // STOCK F&O subscriptions (ATM ± 25 across 216 stocks). Under
-                    // SubscriptionScope::IndicesOnlyAllExpiries (the default since
-                    // Wave 5), the planner already drops stock derivatives and
-                    // running Phase 2 would silently no-op. Skip the spawn entirely
-                    // — saves the 09:13 wakeup task + buffer cloning + REST
-                    // fallback HTTP work for nothing.
-                    if !tickvault_app::phase2_recovery::should_spawn_phase2_scheduler(
-                        config.subscription.scope,
-                    ) {
-                        info!(
-                            scope = config.subscription.scope.as_str(),
-                            "PR-E: Phase 2 scheduler SKIPPED under IndicesOnlyAllExpiries scope \
-                             (no stock F&O subscribed → no 09:13 dispatch needed)"
-                        );
-                    } else {
-                        // O1 (2026-04-17) Phase A: Phase 2 subscription scheduler.
-                        // Sleeps until 09:13 IST (or runs immediately if already past 9:13
-                        // and within market hours), then waits for NIFTY/BANKNIFTY LTPs,
-                        // then computes the stock-F&O delta from the snapshotter's
-                        // buffer and dispatches the SubscribeCommand to the pool.
-                        //
-                        // Fix #8 (2026-04-24): trigger time moved 09:12 → 09:13 per
-                        // commit 0340a7c so the 09:12-minute bucket is fully closed
-                        // before Phase 2 reads the preopen buffer. Old "09:12" text
-                        // below was stale.
-                        let phase2_spot_prices = std::sync::Arc::clone(&shared_spot_prices);
-                        let phase2_calendar_for_dyn = std::sync::Arc::clone(&trading_calendar);
-                        let phase2_calendar_for_decision = std::sync::Arc::clone(&trading_calendar);
-                        let phase2_notifier = notifier.clone();
-                        let phase2_pool = ws_pool_arc.clone();
-                        let phase2_buffer = std::sync::Arc::clone(&preopen_buffer);
-                        tokio::spawn(async move {
-                            tickvault_core::instrument::phase2_scheduler::run_phase2_scheduler(
-                            phase2_spot_prices,
-                            phase2_calendar_for_decision,
-                            phase2_notifier,
-                            phase2_pool,
-                            Some(
-                                tickvault_core::instrument::phase2_scheduler::Phase2InstrumentsSource::Dynamic {
-                                    buffer: phase2_buffer,
-                                    universe: phase2_universe,
-                                    calendar: phase2_calendar_for_dyn,
-                                    strikes_each_side: 25,
-                                    // Phase 2 live-LTP fallback (2026-04-23):
-                                    // pass the continuously-updated stock LTP
-                                    // map so a late-start / crash-recovery
-                                    // Phase 2 run can subscribe stock F&O
-                                    // even when the 09:08–09:12 preopen
-                                    // window was missed.
-                                    live_stock_ltps: Some(std::sync::Arc::clone(&live_stock_ltps)),
-                                },
-                            ),
-                            tickvault_common::types::FeedMode::Quote,
-                            None, // PROMPT A wires the pick_completed channel.
-                        )
-                        .await;
-                        });
-                    } // end else for PR-E indices-only scope skip
+                    // PR #509d (Wave-5 §R.1): the Phase 2 dispatcher chain
+                    // (`phase2_scheduler` + `phase2_delta` + `phase2_emit_guard`)
+                    // is RETIRED entirely. Under the indices-only scope the
+                    // dispatcher would silently no-op anyway; under any future
+                    // scope re-enabling stock F&O, dispatch will go through a
+                    // newer in-memory-cascade-driven path, not the legacy
+                    // 09:13 IST scheduler.
+                    info!(
+                        scope = config.subscription.scope.as_str(),
+                        "Phase 2 scheduler RETIRED (#509d) — legacy 09:13 IST dispatcher \
+                         removed; readiness check still runs at 09:13:01 IST"
+                    );
                 }
             }
 
@@ -5806,25 +5758,16 @@ async fn main() -> Result<()> {
                 let slo_notifier = notifier.clone();
                 let slo_health = health_status.clone();
                 let slo_qcfg = config.questdb.clone();
-                // 2026-05-05: under indices-only scope Phase 2 is intentionally
-                // not spawned (per `phase2_recovery::should_spawn_phase2_scheduler`),
-                // so `phase2_outcome_today_is_complete` always returns None,
-                // the wall-clock + boot grace expire, and phase2_health drops
-                // to 0.0 → composite zeroes → SLO-02 false-CRITICAL pages.
-                // Live operator alert 13:14 IST 2026-05-05. Pin phase2_health
-                // to 1.0 when Phase 2 is gated by config.
-                let phase2_scheduler_enabled =
-                    tickvault_app::phase2_recovery::should_spawn_phase2_scheduler(
-                        config.subscription.scope,
-                    );
+                // PR #509d (Wave-5 §R.1): the Phase 2 dispatcher chain is
+                // retired. The phase2_health SLO dimension is permanently
+                // pinned to 1.0 inside the score loop — see comment there.
                 tokio::spawn(async move {
                     use std::time::{Duration, Instant};
                     use tickvault_common::constants::{
-                        IST_UTC_OFFSET_NANOS, IST_UTC_OFFSET_SECONDS, SECONDS_PER_DAY,
-                        TICK_PERSIST_END_SECS_OF_DAY_IST, TICK_PERSIST_START_SECS_OF_DAY_IST,
+                        IST_UTC_OFFSET_SECONDS, SECONDS_PER_DAY, TICK_PERSIST_END_SECS_OF_DAY_IST,
+                        TICK_PERSIST_START_SECS_OF_DAY_IST,
                     };
                     use tickvault_common::error_code::ErrorCode;
-                    use tickvault_core::instrument::phase2_emit_guard::phase2_outcome_today_is_complete;
                     use tickvault_core::instrument::slo_score::{
                         SloInputs, SloOutcome, evaluate_slo_score,
                     };
@@ -5851,39 +5794,9 @@ async fn main() -> Result<()> {
                     /// by the post-sleep WebSocket wake path (AUTH-GAP-03).
                     const SLO_TOKEN_HEADROOM_THRESHOLD_SECS: u64 = 4 * 3600;
 
-                    /// IST seconds-of-day at which Phase 2 dispatcher fires
-                    /// (09:13:00). Before this, Phase2_health is pinned to
-                    /// `1.0` because no outcome has been recorded yet.
-                    const SLO_PHASE2_TRIGGER_SECS_OF_DAY_IST: u32 = 9 * 3600 + 13 * 60;
-
-                    /// Grace window after the 09:13:00 trigger during which
-                    /// `phase2_outcome_today_is_complete == None` is treated
-                    /// as "still computing" rather than "Phase 2 never
-                    /// fired". Adversarial review (general-purpose, 2026-04-28
-                    /// HIGH #2): without this, the SLO scheduler tick that
-                    /// fires at exactly 09:13:00 — before the dispatcher
-                    /// has finished — would incorrectly produce
-                    /// `phase2_health = 0.0` and page CRITICAL. 60 seconds
-                    /// is comfortably longer than the typical Phase 2
-                    /// dispatch latency (~30s on the slowest day).
-                    const SLO_PHASE2_GRACE_SECS: u32 = 60;
-
-                    /// Boot-relative grace window for mid-market starts.
-                    /// When the app boots after 09:13:00 IST (e.g. crash-
-                    /// recovery or operator restart), Phase 2 dispatches
-                    /// immediately ("late-start path") but still takes
-                    /// ~30s to complete. Without this grace the SLO
-                    /// scheduler's first tick after boot would observe
-                    /// `phase2_outcome == None`, fall past the wall-clock
-                    /// grace (which expired hours ago at 09:14), and
-                    /// page SLO-02 CRITICAL with weakest=phase2_health.
-                    /// Live incident 2026-04-28 14:18 IST proved this:
-                    /// CRITICAL fired at 14:18:24, recovered to SLO-01
-                    /// Healthy at 14:18:34 (10s later) once Phase 2
-                    /// completed. Same magnitude as the wall-clock grace
-                    /// (60s) — Phase 2 dispatch latency is independent
-                    /// of when boot happened.
-                    const SLO_PHASE2_BOOT_GRACE_SECS: u64 = 60;
+                    // PR #509d: SLO_PHASE2_* grace constants retired with the
+                    // dispatcher chain. phase2_health is pinned to 1.0
+                    // unconditionally below.
 
                     /// Uniform boot-relative grace covering ALL six SLO
                     /// dimensions (ws_health, qdb_health, tick_freshness,
@@ -6031,57 +5944,13 @@ async fn main() -> Result<()> {
                         let spill_health = if spill_delta == 0 { 1.0 } else { 0.0 };
 
                         // ---- Phase2_health -------------------------------
-                        let now_ist_nanos = chrono::Utc::now()
-                            .timestamp_nanos_opt()
-                            .unwrap_or(0)
-                            .saturating_add(IST_UTC_OFFSET_NANOS);
-                        let today_date_ist =
-                            now_ist_nanos - now_ist_nanos.rem_euclid(86_400_000_000_000);
-                        let phase2_health = if !phase2_scheduler_enabled {
-                            // Indices-only scope (PR-E): Phase 2 deliberately
-                            // not spawned. Pin to 1.0 so the multiplicative
-                            // composite isn't zeroed by an irrelevant
-                            // dimension. Same semantic as `!in_market` —
-                            // by-design, not degraded.
-                            1.0
-                        } else if !in_market {
-                            1.0
-                        } else if secs_of_day < SLO_PHASE2_TRIGGER_SECS_OF_DAY_IST {
-                            // Pre-trigger: no outcome yet, do not penalize.
-                            1.0
-                        } else {
-                            match phase2_outcome_today_is_complete(today_date_ist) {
-                                Some(true) => 1.0,
-                                Some(false) => 0.0,
-                                None => {
-                                    // Post-trigger but no record — could be
-                                    // "still dispatching" (within grace) or
-                                    // "Phase 2 never fired" (past grace).
-                                    // Two grace windows pin to 1.0:
-                                    //   1. Wall-clock grace at the 09:13:00
-                                    //      trigger (handles normal-boot race).
-                                    //   2. Boot-relative grace (handles
-                                    //      mid-market boot late-start path —
-                                    //      live incident 2026-04-28 14:18 IST
-                                    //      where Phase 2 dispatch took ~10s
-                                    //      after boot but the wall-clock
-                                    //      grace had already expired hours
-                                    //      ago at 09:14). Falsely paged
-                                    //      SLO-02 CRITICAL until the boot
-                                    //      grace was added here.
-                                    let in_wallclock_grace = secs_of_day
-                                        < SLO_PHASE2_TRIGGER_SECS_OF_DAY_IST
-                                            + SLO_PHASE2_GRACE_SECS;
-                                    let in_boot_grace = scheduler_boot_at.elapsed().as_secs()
-                                        < SLO_PHASE2_BOOT_GRACE_SECS;
-                                    if in_wallclock_grace || in_boot_grace {
-                                        1.0
-                                    } else {
-                                        0.0
-                                    }
-                                }
-                            }
-                        };
+                        // PR #509d (Wave-5 §R.1): the legacy Phase 2 dispatcher
+                        // was retired. The phase2_health SLO dimension is
+                        // permanently pinned to 1.0 — the dispatcher chain no
+                        // longer exists, there is no outcome to consult.
+                        // Future scope re-enabling stock F&O will introduce a
+                        // new dispatch path with its own health dimension.
+                        let phase2_health = 1.0_f64;
 
                         let inputs = SloInputs {
                             ws_health,
