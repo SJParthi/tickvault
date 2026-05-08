@@ -219,11 +219,11 @@ pub fn ram_count_for_timeframe(
 ) -> Option<usize> {
     use tickvault_trading::candles::CascadeFanout;
     match timeframe {
-        "3s" => Some(CascadeFanout::len_3s(fanout)),
-        "5s" => Some(CascadeFanout::len_5s(fanout)),
-        "10s" => Some(CascadeFanout::len_10s(fanout)),
-        "15s" => Some(CascadeFanout::len_15s(fanout)),
-        "30s" => Some(CascadeFanout::len_30s(fanout)),
+        // L7 (PR #504c): seconds-level engines (3s/5s/10s/15s/30s) RETIRED.
+        // A query for them returns `None` (unknown timeframe) so the
+        // handler's `serde(skip_serializing_if = Option::is_none)`
+        // omits the field entirely — operator gets "unknown TF",
+        // not a hardcoded zero.
         "1m" => Some(CascadeFanout::len_1m(fanout)),
         "2m" => Some(CascadeFanout::len_2m(fanout)),
         "3m" => Some(CascadeFanout::len_3m(fanout)),
@@ -275,11 +275,11 @@ pub fn snapshot_for_timeframe(
     // soak set.
     type AccessorFn = fn(&CascadeFanout, u32, u8) -> Option<tickvault_trading::candles::Bar>;
     let accessor: Option<AccessorFn> = match timeframe {
-        "3s" => Some(CascadeFanout::latest_3s),
-        "5s" => Some(CascadeFanout::latest_5s),
-        "10s" => Some(CascadeFanout::latest_10s),
-        "15s" => Some(CascadeFanout::latest_15s),
-        "30s" => Some(CascadeFanout::latest_30s),
+        // L7 (PR #504c): seconds-level engines RETIRED. An explicit
+        // request for `3s`/`5s`/`10s`/`15s`/`30s` falls through to
+        // the default arm and returns `None` (the caller's response
+        // shape carries the timeframe string verbatim, so the operator
+        // sees a typo / retired-TF immediately).
         "1m" => Some(CascadeFanout::latest_1m),
         "2m" => Some(CascadeFanout::latest_2m),
         "3m" => Some(CascadeFanout::latest_3m),
@@ -419,24 +419,21 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_for_timeframe_handles_all_28_derived_tfs() {
-        // Sanity ratchet: every derived TF in the 29-TF universe MUST
-        // map to an accessor function. If a future refactor deletes a
-        // TF, the match arm in `snapshot_for_timeframe` would fail to
-        // compile (compile-time guarantee). This test covers the
-        // string→accessor table by exercising each TF name.
+    fn snapshot_for_timeframe_handles_all_23_derived_tfs() {
+        // Sanity ratchet: every derived TF in the cascade MUST map to
+        // an accessor function. Wave-5 §K-L7 (PR #504c) retired the 5
+        // seconds-level engines; the cascade now has 23 derived TFs
+        // (was 28).
         //
         // Hostile review M2 fix: cross-check the count against
-        // `DERIVED_ENGINE_COUNT` so adding a 30th TF (e.g. Tf45m)
-        // FAILS this test until both the constant AND the local list
-        // are updated together. Hardcoded `28` would have stayed
-        // green silently.
+        // `DERIVED_ENGINE_COUNT` so adding a 24th TF FAILS this test
+        // until both the constant AND the local list are updated
+        // together. Hardcoded numbers would have stayed green silently.
         use tickvault_trading::candles::DERIVED_ENGINE_COUNT;
         let fanout = CascadeFanout::new();
         let tfs = [
-            "3s", "5s", "10s", "15s", "30s", "1m", "2m", "3m", "4m", "5m", "6m", "7m", "8m", "9m",
-            "10m", "11m", "12m", "13m", "14m", "15m", "30m", "1h", "2h", "3h", "4h", "1d", "1w",
-            "1mo",
+            "1m", "2m", "3m", "4m", "5m", "6m", "7m", "8m", "9m", "10m", "11m", "12m", "13m",
+            "14m", "15m", "30m", "1h", "2h", "3h", "4h", "1d", "1w", "1mo",
         ];
         assert_eq!(
             tfs.len(),
@@ -444,7 +441,7 @@ mod tests {
             "TF accessor list (len={}) drifted from DERIVED_ENGINE_COUNT (={DERIVED_ENGINE_COUNT}). \
              Adding a new TF requires updating BOTH the constant in \
              cascade_fanout.rs AND this list + the match arm in \
-             snapshot_for_timeframe. See active-plan §1 L3.",
+             snapshot_for_timeframe. See active-plan §K-L6 / L7.",
             tfs.len()
         );
         for tf in tfs {
@@ -452,6 +449,38 @@ mod tests {
             // Empty fanout -> always (0, None) for each TF.
             assert_eq!(count, 0);
             assert!(bar.is_none(), "TF {tf} returned a bar from empty fanout");
+        }
+    }
+
+    /// Wave-5 §K-L7 (PR #504c) ratchet: the 5 seconds-level TFs MUST
+    /// return `None` from `snapshot_for_timeframe` (their backing
+    /// engines + accessors were retired with this PR).
+    #[test]
+    fn snapshot_for_timeframe_returns_none_for_retired_seconds_tfs() {
+        let fanout = CascadeFanout::new();
+        for tf in ["3s", "5s", "10s", "15s", "30s"] {
+            let (count, bar) = snapshot_for_timeframe(&fanout, tf, Some(1), Some(1));
+            assert_eq!(
+                count, 0,
+                "retired TF `{tf}` must report 0 instruments (not a hardcoded fake)"
+            );
+            assert!(bar.is_none(), "retired TF `{tf}` must return None bar (L7)");
+        }
+    }
+
+    /// Wave-5 §K-L7 (PR #504c) ratchet: `ram_count_for_timeframe` must
+    /// return `None` for retired seconds-level TFs so the response's
+    /// `serde(skip_serializing_if = Option::is_none)` omits the field
+    /// entirely (operator sees absence-of-field, not a hardcoded zero).
+    #[test]
+    fn ram_count_for_timeframe_returns_none_for_retired_seconds_tfs() {
+        let fanout = CascadeFanout::new();
+        for tf in ["3s", "5s", "10s", "15s", "30s"] {
+            assert_eq!(
+                ram_count_for_timeframe(&fanout, tf),
+                None,
+                "retired TF `{tf}` must return None (L7)"
+            );
         }
     }
 
