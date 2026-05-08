@@ -239,8 +239,16 @@ pub fn init_metrics(config: &ObservabilityConfig) -> Result<()> {
         return Ok(());
     }
 
+    // L123 (Wave-5 plan §AA, SEC-H1): bind to the configured address
+    // (default `127.0.0.1` per `ObservabilityConfig::default_metrics_bind_addr`).
+    // Previously hard-coded to `0.0.0.0` which exposed
+    // `tv_subsystem_memory_estimated_bytes` (and every other gauge) to
+    // any peer in the VPC.
     PrometheusBuilder::new()
-        .with_http_listener(([0, 0, 0, 0], config.metrics_port))
+        .with_http_listener(std::net::SocketAddr::new(
+            config.metrics_bind_addr,
+            config.metrics_port,
+        ))
         // Force every `*_duration_ns` histogram to render as a Prometheus
         // histogram (with `_bucket` series) instead of the exporter's
         // default summary. Grafana's `histogram_quantile(rate(*_bucket))`
@@ -257,6 +265,7 @@ pub fn init_metrics(config: &ObservabilityConfig) -> Result<()> {
         .context("failed to install Prometheus metrics exporter")?;
 
     info!(
+        bind_addr = %config.metrics_bind_addr,
         port = config.metrics_port,
         "Prometheus metrics exporter started"
     );
@@ -597,6 +606,8 @@ mod tests {
 
     fn disabled_config() -> ObservabilityConfig {
         ObservabilityConfig {
+            metrics_bind_addr:
+                tickvault_common::config::ObservabilityConfig::default_metrics_bind_addr(),
             metrics_port: 0,
             otlp_endpoint: String::new(),
             metrics_enabled: false,
@@ -693,6 +704,31 @@ mod tests {
     }
 
     #[test]
+    fn default_observability_config_binds_to_loopback_per_l123() {
+        // L123 / SEC-H1: the new per-component memory gauge must NOT
+        // be reachable from any peer in the VPC by default. Anyone
+        // changing this default must update the alert / dashboard /
+        // disaster-recovery docs in the same PR.
+        let config = ObservabilityConfig::default();
+        assert_eq!(
+            config.metrics_bind_addr,
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            "L123: default metrics bind must be 127.0.0.1 (loopback)"
+        );
+    }
+
+    #[test]
+    fn default_metrics_bind_addr_helper_returns_loopback() {
+        // L123 ratchet: the helper used by `#[serde(default)]` must
+        // return loopback so config files that omit `metrics_bind_addr`
+        // inherit the safe default.
+        assert!(
+            ObservabilityConfig::default_metrics_bind_addr().is_loopback(),
+            "default_metrics_bind_addr() must return a loopback address"
+        );
+    }
+
+    #[test]
     fn default_observability_config_has_valid_port() {
         let config = ObservabilityConfig::default();
         assert!(
@@ -717,6 +753,8 @@ mod tests {
     #[test]
     fn enabled_config_can_be_constructed() {
         let config = ObservabilityConfig {
+            metrics_bind_addr:
+                tickvault_common::config::ObservabilityConfig::default_metrics_bind_addr(),
             metrics_port: 9091,
             otlp_endpoint: "http://localhost:4317".to_string(),
             metrics_enabled: true,
@@ -736,6 +774,8 @@ mod tests {
     #[test]
     fn init_metrics_disabled_tracing_enabled_only_metrics_returns_ok() {
         let config = ObservabilityConfig {
+            metrics_bind_addr:
+                tickvault_common::config::ObservabilityConfig::default_metrics_bind_addr(),
             metrics_port: 0,
             otlp_endpoint: "http://localhost:4317".to_string(),
             metrics_enabled: false,
@@ -749,6 +789,8 @@ mod tests {
     #[test]
     fn init_tracing_disabled_metrics_enabled_returns_none() {
         let config = ObservabilityConfig {
+            metrics_bind_addr:
+                tickvault_common::config::ObservabilityConfig::default_metrics_bind_addr(),
             metrics_port: 9091,
             otlp_endpoint: "http://localhost:4317".to_string(),
             metrics_enabled: true,
@@ -765,6 +807,8 @@ mod tests {
         // (tonic/OTLP connects lazily, not at build time).
         // Requires tokio runtime because tonic::Channel::new needs it.
         let config = ObservabilityConfig {
+            metrics_bind_addr:
+                tickvault_common::config::ObservabilityConfig::default_metrics_bind_addr(),
             metrics_port: 0,
             otlp_endpoint: "http://nonexistent-host:99999".to_string(),
             metrics_enabled: false,
@@ -782,6 +826,8 @@ mod tests {
     #[test]
     fn observability_config_clone() {
         let config = ObservabilityConfig {
+            metrics_bind_addr:
+                tickvault_common::config::ObservabilityConfig::default_metrics_bind_addr(),
             metrics_port: 9091,
             otlp_endpoint: "http://test:4317".to_string(),
             metrics_enabled: true,
@@ -828,6 +874,8 @@ mod tests {
     #[test]
     fn metrics_disabled_tracing_disabled_both_return_ok_none() {
         let config = ObservabilityConfig {
+            metrics_bind_addr:
+                tickvault_common::config::ObservabilityConfig::default_metrics_bind_addr(),
             metrics_port: 0,
             otlp_endpoint: String::new(),
             metrics_enabled: false,
@@ -842,6 +890,8 @@ mod tests {
     #[test]
     fn config_with_custom_port_preserves_value() {
         let config = ObservabilityConfig {
+            metrics_bind_addr:
+                tickvault_common::config::ObservabilityConfig::default_metrics_bind_addr(),
             metrics_port: 9999,
             otlp_endpoint: "http://custom:4317".to_string(),
             metrics_enabled: false,
@@ -854,6 +904,8 @@ mod tests {
     #[test]
     fn config_with_port_zero_is_valid_when_disabled() {
         let config = ObservabilityConfig {
+            metrics_bind_addr:
+                tickvault_common::config::ObservabilityConfig::default_metrics_bind_addr(),
             metrics_port: 0,
             otlp_endpoint: String::new(),
             metrics_enabled: false,
@@ -872,6 +924,8 @@ mod tests {
         // OTLP exporter connects lazily — build should succeed even with
         // unreachable endpoints. This exercises the full pipeline build.
         let config = ObservabilityConfig {
+            metrics_bind_addr:
+                tickvault_common::config::ObservabilityConfig::default_metrics_bind_addr(),
             metrics_port: 0,
             otlp_endpoint: "http://127.0.0.1:4317".to_string(),
             metrics_enabled: false,
@@ -890,6 +944,8 @@ mod tests {
     #[tokio::test]
     async fn init_tracing_enabled_returns_some() {
         let config = ObservabilityConfig {
+            metrics_bind_addr:
+                tickvault_common::config::ObservabilityConfig::default_metrics_bind_addr(),
             metrics_port: 0,
             otlp_endpoint: "http://localhost:4317".to_string(),
             metrics_enabled: false,
@@ -948,6 +1004,8 @@ mod tests {
     #[test]
     fn config_partial_eq_via_field_comparison() {
         let c1 = ObservabilityConfig {
+            metrics_bind_addr:
+                tickvault_common::config::ObservabilityConfig::default_metrics_bind_addr(),
             metrics_port: 9091,
             otlp_endpoint: "http://test:4317".to_string(),
             metrics_enabled: true,
@@ -970,6 +1028,8 @@ mod tests {
         // Port 0 means the OS picks an available port, but PrometheusBuilder
         // requires an explicit port. Use a high ephemeral port.
         let config = ObservabilityConfig {
+            metrics_bind_addr:
+                tickvault_common::config::ObservabilityConfig::default_metrics_bind_addr(),
             metrics_port: 19_091,
             otlp_endpoint: String::new(),
             metrics_enabled: true,
@@ -988,6 +1048,8 @@ mod tests {
         // After the first successful install (in any test), subsequent
         // installs should return an error (not panic).
         let config = ObservabilityConfig {
+            metrics_bind_addr:
+                tickvault_common::config::ObservabilityConfig::default_metrics_bind_addr(),
             metrics_port: 19_092,
             otlp_endpoint: String::new(),
             metrics_enabled: true,
@@ -1004,6 +1066,8 @@ mod tests {
         // to bind a port. The test would fail if it tried to bind port 0
         // and left a dangling listener.
         let config = ObservabilityConfig {
+            metrics_bind_addr:
+                tickvault_common::config::ObservabilityConfig::default_metrics_bind_addr(),
             metrics_port: 0,
             otlp_endpoint: String::new(),
             metrics_enabled: false,
@@ -1218,6 +1282,8 @@ mod tests {
     #[test]
     fn disabled_tracing_short_circuits() {
         let config = ObservabilityConfig {
+            metrics_bind_addr:
+                tickvault_common::config::ObservabilityConfig::default_metrics_bind_addr(),
             metrics_port: 0,
             otlp_endpoint: String::new(),
             metrics_enabled: false,

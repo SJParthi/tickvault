@@ -534,30 +534,16 @@ pub async fn enforce_clock_skew_at_boot(
 /// Minimum free disk space percentage before alerting.
 pub const MIN_FREE_DISK_PERCENT: u64 = 5;
 
-/// Memory RSS threshold in MB before alerting.
-///
-/// **2026-05-05 bump (512 → 1024 MB / 1 GB):** the original 512 MB
-/// threshold was set before three memory-allocating commits landed:
-/// - PR #453 bumped the tick rescue ring 600K → 2M (+150 MB).
-/// - Phase 3.4 (PR #486) added the 28-engine `CascadeFanout`
-///   (28 papaya maps × 25K capacity ≈ +45 MB).
-/// - Phase 2 lifecycle stamping (Phase 2.x) added prev_oi_cache +
-///   prev_close_stamper (~+35 MB at full universe).
-///
-/// Plausible steady-state footprint post-PR #494 (Phase 4b deletion):
-/// rescue ring (~224 MB) + fanout (~45 MB) + 1s engine (~3 MB) +
-/// prev_oi/prev_close stampers (~35 MB) + WS/ILP buffers (~30 MB) +
-/// tokio/tracing/standard runtime (~100 MB) ≈ ~437 MB. With
-/// instrument-master CSV parse + papaya rehash bursts at boot,
-/// observed RSS lands at 550-650 MB on a healthy boot.
-///
-/// **1 GB headroom (operator directive 2026-05-05):** gives ~400 MB
-/// margin above observed steady-state for live-data growth across
-/// the full trading session (instrument churn, depth book growth,
-/// option chain refresh) without false-positive Telegram pages.
-/// Above 1 GB indicates a real leak or regression worth
-/// investigating — not normal operation.
-pub const MEMORY_RSS_ALERT_MB: u64 = 1024;
+// `MEMORY_RSS_ALERT_MB` (legacy 1 GB single-process gauge alert,
+// PR #497) was RETIRED 2026-05-08 per the Wave-5 in-memory-store
+// plan §AA / L122. The legacy threshold would fire instantly under
+// the new ~2.31 GB in-memory-store design AND give zero diagnostic
+// signal (BUG-C2). It has been superseded by the per-component
+// alert `tv-rss-per-subsystem-high` over the
+// `tv_subsystem_memory_estimated_bytes{component}` gauge defined in
+// `crate::subsystem_memory`. The catalog ratchet
+// (`crate::metrics_catalog::tests`) blocks any code path from
+// re-introducing the constant under the old name.
 
 /// Checks available disk space and returns the free percentage.
 ///
@@ -604,6 +590,13 @@ pub fn check_disk_space() -> Option<u64> {
 /// Reads current process RSS from `/proc/self/status` (Linux) or `ps` (macOS).
 ///
 /// Returns RSS in MB, or `None` on failure. Best-effort — does not block boot.
+///
+/// **2026-05-08 (L122)**: the legacy ERROR-on-threshold path was removed
+/// in favour of the per-component `tv-rss-per-subsystem-high` Prometheus
+/// alert (defined in `subsystem_memory`). This helper is retained as a
+/// pure read so the periodic-task loop can publish RSS for the
+/// reconciliation ratchet against
+/// `tv_subsystem_memory_estimated_bytes{component=...}`.
 pub fn check_memory_rss() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
@@ -611,15 +604,7 @@ pub fn check_memory_rss() -> Option<u64> {
         for line in status.lines() {
             if line.starts_with("VmRSS:") {
                 let kb: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
-                let mb = kb / 1024;
-                if mb > MEMORY_RSS_ALERT_MB {
-                    tracing::error!(
-                        rss_mb = mb,
-                        threshold_mb = MEMORY_RSS_ALERT_MB,
-                        "HIGH MEMORY USAGE — RSS exceeds threshold"
-                    );
-                }
-                return Some(mb);
+                return Some(kb / 1024);
             }
         }
         None
@@ -634,15 +619,7 @@ pub fn check_memory_rss() -> Option<u64> {
             .ok()?;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let kb: u64 = stdout.trim().parse().ok()?;
-        let mb = kb / 1024;
-        if mb > MEMORY_RSS_ALERT_MB {
-            tracing::error!(
-                rss_mb = mb,
-                threshold_mb = MEMORY_RSS_ALERT_MB,
-                "HIGH MEMORY USAGE — RSS exceeds threshold"
-            );
-        }
-        Some(mb)
+        Some(kb / 1024)
     }
 
     #[cfg(not(unix))]
@@ -2180,12 +2157,32 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_memory_rss_threshold() {
-        // 2026-05-05: bumped 512 → 1024 MB (1 GB) per operator
-        // directive. Gives ~400 MB margin above observed steady-state
-        // (~550-650 MB) for live-session growth. See
-        // `MEMORY_RSS_ALERT_MB` docstring for the footprint table.
-        assert_eq!(super::MEMORY_RSS_ALERT_MB, 1024);
+    fn test_memory_rss_alert_constant_was_retired_per_l122() {
+        // L122 (Wave-5 plan §AA): the legacy `MEMORY_RSS_ALERT_MB`
+        // single-process threshold was retired in favour of the
+        // per-component `tv-rss-per-subsystem-high` Prometheus alert.
+        // This test pins the absence — `cargo build` will fail this
+        // assertion if anyone re-introduces the constant under the
+        // old name. Match the actual declaration line (start of line
+        // after trim, then the const decl) so the literal substring
+        // in this test body does NOT self-trip.
+        let infra_src = include_str!("infra.rs");
+        let banned_decl_prefix = "pub const MEMORY_";
+        let banned_full = "RSS_ALERT_MB";
+        let mut hit = false;
+        for line in infra_src.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with(banned_decl_prefix) && trimmed.contains(banned_full) {
+                hit = true;
+                break;
+            }
+        }
+        assert!(
+            !hit,
+            "L122: legacy `pub const MEMORY_(RSS_ALERT_MB)` declaration \
+             must NOT reappear in infra.rs — use the per-component alert \
+             defined over `tv_subsystem_memory_estimated_bytes` instead."
+        );
     }
 
     #[test]
@@ -2263,7 +2260,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Constants: MIN_FREE_DISK_PERCENT and MEMORY_RSS_ALERT_MB relationships
+    // Constants: MIN_FREE_DISK_PERCENT — `MEMORY_RSS_ALERT_MB` retired (L122)
     // -----------------------------------------------------------------------
 
     #[test]
@@ -2271,14 +2268,6 @@ mod tests {
         assert!(
             super::MIN_FREE_DISK_PERCENT > 0 && super::MIN_FREE_DISK_PERCENT < 50,
             "threshold must be between 1% and 49%"
-        );
-    }
-
-    #[test]
-    fn test_memory_threshold_in_valid_range() {
-        assert!(
-            super::MEMORY_RSS_ALERT_MB >= 128 && super::MEMORY_RSS_ALERT_MB <= 8192,
-            "RSS alert threshold must be between 128MB and 8GB"
         );
     }
 

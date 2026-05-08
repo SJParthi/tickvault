@@ -1500,3 +1500,108 @@ groups:
           description: "The cascade supervisor (cascade.rs:182+) respawned the 28-TF fanout task. Repeated respawns indicate a panic loop. Inspect data/logs/errors.jsonl.* for the panic backtrace immediately preceding the respawn event."
         labels:
           severity: high
+
+  # ===========================================================================
+  # tv-subsystem-memory — Wave-5 in-memory-store plan §AA, L18 / L121–L130
+  #
+  # Replaces the legacy `MEMORY_RSS_ALERT_MB > 1024` single-process alert
+  # (retired in PR #504a per L122 / BUG-C2): the in-memory-store design
+  # exceeds 1 GB by design, so the legacy threshold paged instantly with
+  # zero diagnostic signal. The two alerts below provide:
+  #
+  #   1. Per-component breach detection — operator sees which component
+  #      blew its budget, not just "RSS too high".
+  #   2. Sampler-stale detection — if the sampler tokio task hangs or
+  #      panics, the gauge values would freeze at last-known and silently
+  #      mislead the operator. The heartbeat alert catches that within 60s.
+  #
+  # Both alerts are GATED by `tv_market_hours_active == 1` (L129) so they
+  # only page during 09:00–15:30 IST. Outside-market drift is routed to
+  # the daily summary, not Telegram (audit-findings Rule 4 + 11).
+  # ===========================================================================
+  - orgId: 1
+    name: tv-subsystem-memory
+    folder: tickvault
+    interval: 1m
+    rules:
+      # L18 (revised) + L124 + L129: per-component RSS estimate breach.
+      # Threshold 1.5e9 bytes (~1.43 GiB) is the per-component ceiling
+      # for the largest design components (`bar_storage`, `tick_storage`).
+      # The `unless absent_over_time(...)` clause filters out components
+      # that have not yet had a source registered (L124 NaN-init); the
+      # `and on() tv_market_hours_active == 1` gate suppresses pages
+      # outside market hours.
+      - uid: tv-rss-per-subsystem-high
+        title: "L18 — per-subsystem memory exceeds budget"
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model:
+              expr: "(tv_subsystem_memory_estimated_bytes > 1.5e9) unless absent_over_time(tv_subsystem_memory_estimated_bytes[5m]) and on() tv_market_hours_active == 1"
+              intervalMs: 15000
+              maxDataPoints: 43200
+          - refId: B
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: gt, params: [0] }
+        noDataState: OK
+        execErrState: Alerting
+        for: 5m
+        annotations:
+          summary: "Per-subsystem memory > 1.5 GB on at least one component"
+          description: "tv_subsystem_memory_estimated_bytes{component=...} exceeded 1.5 GB during market hours. Inspect /metrics for the offending {component} label and follow the Wave-5 in-memory-store runbook (.claude/plans/active-plan-in-memory-store-aws-instance.md §M). The legacy MEMORY_RSS_ALERT_MB single-process gauge was retired 2026-05-08 per L122."
+        labels:
+          severity: high
+
+      # L125: sampler heartbeat freshness. If the sampler task hangs the
+      # heartbeat gauge stops advancing and `time() - heartbeat` grows
+      # without bound. Threshold 30s = 3× the 10s sampler cadence.
+      # Quiet-hours gate matches L129 — outside market hours we don't
+      # care if the sampler dropped a tick.
+      - uid: tv-subsystem-memory-sampler-stale
+        title: "L125 — subsystem memory sampler stale (>30s no update)"
+        condition: C
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model:
+              expr: "(time() - tv_subsystem_memory_sampler_last_update_seconds > 30) and on() tv_market_hours_active == 1"
+              intervalMs: 15000
+              maxDataPoints: 43200
+          - refId: B
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: reduce
+              expression: A
+              reducer: last
+          - refId: C
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: gt, params: [0] }
+        noDataState: OK
+        execErrState: Alerting
+        for: 1m
+        annotations:
+          summary: "L125: subsystem memory sampler not advancing (>30s)"
+          description: "The subsystem_memory sampler task in crates/app/src/subsystem_memory.rs has not refreshed tv_subsystem_memory_sampler_last_update_seconds for >30s. Likely cause: sampler task panicked (check data/logs/errors.jsonl.*) or sources mutex poisoned. Per-component gauge values are STALE and MUST NOT be trusted until this clears."
+        labels:
+          severity: high
