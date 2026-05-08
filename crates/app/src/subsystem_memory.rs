@@ -565,6 +565,72 @@ mod tests {
     }
 
     #[test]
+    fn test_increment_eviction_does_not_panic() {
+        let h = SubsystemMemoryHandles::register();
+        for tf in Tf::ALL {
+            h.increment_eviction(tf);
+        }
+    }
+
+    #[test]
+    fn test_set_component_does_not_panic_for_catalog_label() {
+        let h = SubsystemMemoryHandles::register();
+        for &c in ALLOWED_SUBSYSTEM_COMPONENTS {
+            h.set_component(c, 1024.0);
+        }
+    }
+
+    #[test]
+    fn test_touch_heartbeat_accepts_unix_seconds() {
+        // L125: heartbeat is a UNIX-seconds gauge updated every tick.
+        // Sanity-check the API: the function must not panic on a
+        // realistic value and must accept a `f64` so subsecond
+        // precision is preserved.
+        let h = SubsystemMemoryHandles::register();
+        h.touch_heartbeat(1_700_000_000.123_f64);
+    }
+
+    #[test]
+    fn test_set_market_hours_active_accepts_both_values() {
+        // L129 quiet-hours gate is a 0/1 gauge. The wrapper takes a
+        // `bool` so the conversion is centralised — assert both
+        // branches execute without panic.
+        let h = SubsystemMemoryHandles::register();
+        h.set_market_hours_active(true);
+        h.set_market_hours_active(false);
+    }
+
+    #[test]
+    fn test_sampler_register_source_rejects_unknown() {
+        // Mirror the pub-fn name in the test name so the workspace
+        // ratchet maps fn -> test by single-line grep.
+        let handles = Arc::new(SubsystemMemoryHandles::register());
+        let sampler = SubsystemMemorySampler::new(handles);
+        assert!(sampler.register_source("not_a_component", || None).is_err());
+    }
+
+    #[test]
+    fn test_sampler_sample_once_runs_without_sources_registered() {
+        // Sampler must tolerate the boot state where no sources are
+        // wired (this is exactly #504a's shipping configuration).
+        let handles = Arc::new(SubsystemMemoryHandles::register());
+        let sampler = SubsystemMemorySampler::new(handles);
+        sampler.sample_once(1_700_000_000.0, true);
+    }
+
+    #[tokio::test]
+    async fn test_sampler_spawn_returns_running_join_handle() {
+        // Smoke-test the `spawn()` API: the returned `JoinHandle` is
+        // alive immediately after spawn, and aborting it terminates
+        // the task cleanly.
+        let handles = Arc::new(SubsystemMemoryHandles::register());
+        let sampler = Arc::new(SubsystemMemorySampler::new(handles));
+        let join = Arc::clone(&sampler).spawn();
+        assert!(!join.is_finished(), "sampler task must be running");
+        join.abort();
+    }
+
+    #[test]
     fn unix_now_secs_returns_recent_value() {
         let now = unix_now_secs_f64();
         // 2026 is around 1.77e9; sanity-check the helper isn't broken.
