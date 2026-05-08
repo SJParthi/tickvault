@@ -1,6 +1,6 @@
 # Design Plan: In-Memory Store (§17) + AWS Instance Re-evaluation (§18 v2)
 
-**Status:** DRAFT v4 — 36 design decisions LOCKED 2026-05-08 (L1–L36 in §K). 2 open verification gates (`OPEN-VERIFY-1`, `OPEN-VERIFY-2`). No implementation contract until both gates close + operator approves §K → APPROVED status.
+**Status:** DRAFT v5 — 46 design decisions LOCKED 2026-05-08 (L1–L46 in §K + §Q). 2 open verification gates (`OPEN-VERIFY-1`, `OPEN-VERIFY-2`). No implementation contract until both gates close + operator approves §K/§Q → APPROVED status.
 **Date:** 2026-05-07
 **Authors:** Parthiban (architect), Claude (builder)
 **Branch:** to-be-created on operator approval
@@ -472,4 +472,91 @@ The system has **exactly two in-memory data structures**:
 
 ---
 
-**End of DRAFT v4.** Awaiting OPEN-VERIFY-1 + OPEN-VERIFY-2 closure for APPROVED status.
+## §Q) Depth-20 + Depth-200 dynamic resubscribe (diff-based, NEW 2026-05-08)
+
+Operator clarification 2026-05-08: "every 1 minute resubscribe — but ONLY the instruments that move OUT or IN of the top-N. Never resubscribe the whole cohort every cycle."
+
+### Locked design — L37–L46
+
+| # | Locked | Detail |
+|---|---|---|
+| **L37** | Re-evaluation cadence | **Once per 1m bar seal** — same trigger as candle seal. NOT a separate 60s wall-clock timer. Aligns naturally with the candle pipeline; no new clocks. |
+| **L38** | Trigger source | At each `CandleEngine<1m>::seal_bar()` completion, the cascade emits a `BarSealedEvent`. The depth-cohort recomputer subscribes to this event and runs once per minute. |
+| **L39** | Diff algorithm | `to_remove = current_set − new_set`; `to_add = new_set − current_set`. Empty diff = NO-OP (no wire frames sent). |
+| **L40** | Cohort source | `candle_storage.top_n_by(category=TopVolume, expiry=current, scope=NSE, n=K)` — same primitive as `/api/movers`. K=250 for depth-20, K=5 for depth-200. |
+| **L41** | SID → connection allocation | **Sticky allocation.** Each connection maintains its own `current_set`. (a) For removed SIDs: send `RemoveSubscription` frame on the connection that currently owns the SID. (b) For added SIDs: send `AddSubscription` frame on the least-loaded connection (fewest current SIDs). This minimizes churn — SIDs only move when they exit the cohort. |
+| **L42** | Per-connection diff frame batching | All adds/removes for a single connection go into ONE frame batch (Dhan max 100 SIDs per JSON message per WS-GAP-02). Worst case 250 SIDs spread across 5 conns = 50 SIDs per conn, 1 frame each. |
+| **L43** | Empty cohort handling | If `top_n_by` returns < K SIDs (e.g. early market hours, bear day), keep current subscriptions live (no removes). Edge-trigger Telegram **Severity::High** `DEPTH-DYN-V2-01 cohort_below_capacity` — but only on rising edge, not every cycle. |
+| **L44** | Channel-broken handling | If `DepthCommand::AddSubscriptions20`/`RemoveSubscriptions20`/`Add200`/`Remove200` send fails (receiver task exited): Critical Telegram `DEPTH-DYN-02 swap_channel_broken`; pool supervisor (`respawn_dead_connections_loop`, WS-GAP-05) re-spawns within 5s. |
+| **L45** | Audit | Each cycle writes one row to `depth_dynamic_diff_audit` table with `(ts, feed, adds_count, removes_count, current_set_size, target_set_size, latency_ms)` + DEDUP UPSERT KEYS `(ts, feed)`. SEBI-relevant. |
+| **L46** | Telegram severity policy | Routine cycle (any non-zero diff): **Severity::Low** coalesced via 60s coalescer (Wave 3 Item 11). Empty diff: no Telegram. Cohort-empty / channel-broken: **Severity::High/Critical** edge-triggered. |
+
+### What lands on the wire — typical and worst case
+
+| Scenario | Frames sent per cycle (across all 5 conns) | Wire impact |
+|---|---:|---|
+| Steady state, no churn | 0 | NO-OP (no frames at all) |
+| Typical morning (5–20 SIDs churn) | 5–20 add + 5–20 remove = 10–40 | minimal; ~5 ms total wire time |
+| High churn (50 SIDs change between minutes) | 50 add + 50 remove = 100 | ~10 ms total |
+| Worst case (full cohort change, all 250 swap) | 250 + 250 = 500 | ~50 ms; rare, only on volume regime shifts |
+| Cold boot first cycle | 250 add (no removes) | ~25 ms |
+
+### Why this beats "resubscribe everything every minute"
+
+| Approach | Frames/cycle | Wire time | Dhan rate-limit risk |
+|---|---:|---|---|
+| Full re-subscribe of all 250 SIDs each minute | 500 (250 unsub + 250 sub) | ~50 ms | within limits but wasteful |
+| **Diff-based (this design)** | typically 10–40 | ~5 ms | well within limits, ~10× less wire churn |
+
+### Existing wiring (already designed in `active-plan-depth-dynamic-redesign.md`)
+
+| Component | Status |
+|---|---|
+| `DepthCommand::Add/RemoveSubscriptions20` enum variants | ✅ shipped (PR-B/C1 of depth-dynamic redesign) |
+| `DepthCommand::Add/RemoveSubscriptions200` | ✅ shipped |
+| `DynamicSubscriptionState` diff state machine | ✅ shipped |
+| `depth_dynamic_pipeline_v2` dead-code scaffold | ✅ shipped |
+| `depth_dynamic_diff_audit` table DDL | ✅ shipped |
+| `tv_depth_dynamic_diff_adds_total{feed}` Prom counter | ✅ shipped |
+| `tv_depth_dynamic_diff_removes_total{feed}` | ✅ shipped |
+| `tv_depth_dynamic_set_size{feed}` gauge | ✅ shipped |
+| `tv-depth-dynamic-set-size-low` Prom alert | ✅ shipped |
+| Grafana panels 47+48 (operator-health) | ✅ shipped |
+| **Cutover to live wire (PR-C2)** | ⏳ PENDING operator approval |
+
+### Sequence (1m bar seal → diff → wire)
+
+```
+T+0.000 ms — 1m bar seals (e.g. 09:16:00 IST)
+T+0.005 ms — BarSealedEvent fires
+T+0.010 ms — depth_dynamic_pipeline_v2 receives event
+T+0.060 ms — candle_storage.top_n_by(TopVolume, NSE_FNO, current_expiry, 250) returns new_set
+T+0.080 ms — DynamicSubscriptionState computes to_add (~10 SIDs) + to_remove (~10 SIDs)
+T+0.085 ms — for each connection, dispatch AddSubscriptions20 / RemoveSubscriptions20 frames
+T+0.090 ms — connection read-loop's select! receives DepthCommand and serializes to JSON
+T+0.150 ms — TLS write completes, Dhan ACKs
+T+5.000 ms — Dhan starts streaming for new SIDs; old SIDs stop
+T+0.000 ms (next minute, 09:17:00 IST) — cycle repeats
+```
+
+### What this gives us
+
+| Goal | Mechanism |
+|---|---|
+| Resub only SIDs moving IN/OUT | diff algorithm L39, sticky allocation L41 |
+| 1-minute cadence | 1m bar seal trigger L37/L38 |
+| Zero unnecessary wire churn | L39 empty-diff NO-OP |
+| Safety on cohort empty | L43 + Severity::High edge-triggered |
+| Safety on channel broken | L44 + supervisor respawn within 5s |
+| SEBI audit trail | L45 `depth_dynamic_diff_audit` table |
+| Operator visibility | L46 Severity policy + 7-layer observability |
+
+### Blocking gate
+
+PR-C2 (live wire cutover) of `active-plan-depth-dynamic-redesign.md` is **pending operator approval** because it touches `crates/app/src/main.rs` boot sequence. Folding this into PR #504d (in-memory store) means:
+- L37–L46 land as part of the in-memory store wiring
+- PR-C2 of the prior redesign plan becomes obsolete (rolled into #504d)
+
+---
+
+**End of DRAFT v5.** Awaiting OPEN-VERIFY-1 + OPEN-VERIFY-2 closure for APPROVED status.
