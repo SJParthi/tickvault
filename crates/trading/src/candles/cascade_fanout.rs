@@ -284,10 +284,7 @@ mod tests {
             ("tf1mo", fanout.tf1mo.latest(1234, 1)),
         ];
         for (name, latest) in assertions {
-            assert!(
-                latest.is_some(),
-                "{name} did not receive the sealed 1s bar"
-            );
+            assert!(latest.is_some(), "{name} did not receive the sealed 1s bar");
         }
     }
 

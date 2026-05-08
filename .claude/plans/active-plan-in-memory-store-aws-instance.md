@@ -219,17 +219,17 @@ If we move to ARM, the ratchet bench numbers must be re-baselined and the claim 
 | # | Locked | Detail |
 |---|---|---|
 | L5 | Subscribed universe (Wave 5 default) | 3 indices IDX_I + ~26 display indices + ~216 cash equities + ~10,789 index F&O = **~11,034 instruments** |
-| L6 | Timeframes (NEW — drop seconds) | **21 TFs**: 1m, 2m, 3m, 4m, 5m, 6m, 7m, 8m, 9m, 10m, 11m, 12m, 13m, 14m, 15m, 30m, 1h, 2h, 3h, 4h, 1d |
-| L7 | Dropped TFs | 1s, 3s, 5s, 10s, 15s, 30s — DELETED (no consumer; raw ticks already provide sub-minute) |
-| L8 | TF list source | `config/base.toml [engine.timeframes].list` — runtime-tunable boot-time array |
+| L6 | Timeframes (PR #517 reduction) | **9 TFs**: 1m, 5m, 15m, 30m, 1h, 2h, 3h, 4h, 1d (was 21 TFs pre-PR #517 — 12 sub-15m timeframes retired 2026-05-08) |
+| L7 | Dropped TFs | 1s, 3s, 5s, 10s, 15s, 30s (Wave-5 §K-L7); plus 2m, 3m, 4m, 6m, 7m, 8m, 9m, 10m, 11m, 12m, 13m, 14m (PR #517) — DELETED (no consumer; raw ticks already provide sub-minute, and the 5m/15m/30m chain covers the remaining minute granularity) |
+| L8 | TF list source | `config/base.toml [engine.timeframes].list` — runtime-tunable boot-time array, defaults to the 9-TF PR #517 set |
 
 ### In-memory store
 
 | # | Locked | Detail |
 |---|---|---|
-| L9 | Full current-day RAM scope | ALL ticks + ALL bars across all 21 TFs for ALL ~11K instruments |
+| L9 | Full current-day RAM scope | ALL ticks + ALL bars across all 9 TFs for ALL ~11K instruments |
 | L10 | Tick storage | `papaya<(security_id, exchange_segment), Vec<ParsedTick>>` — full day, IST 09:15 reset, ~880 MB |
-| L11 | Bar storage | `papaya<(security_id, exchange_segment), CandleEngineMap<TF>>` per-TF, full day, 21 TFs, ~1.21 GB |
+| L11 | Bar storage | `papaya<(security_id, exchange_segment), CandleEngineMap<TF>>` per-TF, full day, 9 TFs (PR #517), ~1.21 GB |
 | L12 | New per-Bar fields | `cumulative_volume` (running daily sum at seal), `close_pct_from_prev_day`, `prev_day_oi`, `oi_pct_from_prev_day`, `volume_pct_from_prev_day` (5 new fields) |
 | L13 | % field stamping | At bar SEAL only (NOT per tick); on-demand `~50 µs` scan for between-seal "right now" % queries |
 
@@ -298,7 +298,7 @@ If we move to ARM, the ratchet bench numbers must be re-baselined and the claim 
 > composite-key uniqueness;
 > chaos-tested 65h Fri 16:00 IST → Mon 09:00 IST weekend sleep/wake;
 > **per-subsystem RSS accounting via `tv_subsystem_memory_bytes`**;
-> **full-day in-memory store sized at ≤2.1 GB on 11,034 instruments × 21 TFs (`test_in_mem_store_total_under_2_5gb` ratchet)**;
+> **full-day in-memory store sized at ≤2.1 GB on 11,034 instruments × 9 TFs (`test_in_mem_store_total_under_2_5gb` ratchet)**;
 > **volume field semantic confirmed by Dhan support ticket #2026-05-01-volume-semantic-clarification (cumulative since 09:15 IST, monotonic, resets at 09:15 IST next day)**.
 > Beyond the envelope, DLQ NDJSON catches every payload as recoverable text.
 > Outstanding: Wave-6 (>65h holiday-weekend dormant sleep test), OPEN-VERIFY-1 (`/api/movers` UI Top Volume mapping confirmation).
@@ -371,7 +371,7 @@ The system has **exactly two in-memory data structures**:
 | # | Structure | Type | Holds | Reset |
 |---|---|---|---|---|
 | 1 | **Tick map** | `papaya::HashMap<(security_id, exchange_segment), Vec<ParsedTick>>` | full day raw ticks per instrument | 09:15 IST |
-| 2 | **Candle map (per TF)** | `papaya::HashMap<(security_id, exchange_segment), CandleEngineMap<TF>>` × 21 TFs | full day sealed bars per (instrument, TF) with all 5 % fields | 09:15 IST |
+| 2 | **Candle map (per TF)** | `papaya::HashMap<(security_id, exchange_segment), CandleEngineMap<TF>>` × 9 TFs | full day sealed bars per (instrument, TF) with all 5 % fields | 09:15 IST |
 
 **Everything else is a query method on these two structures.**
 
@@ -934,7 +934,7 @@ This is the honest 100% claim per `wave-4-shared-preamble.md` §8 — restated w
 > composite-key uniqueness;
 > chaos-tested 65h Fri 16:00 IST → Mon 09:00 IST weekend sleep/wake;
 > per-subsystem RSS accounting via `tv_subsystem_memory_bytes`;
-> full-day in-memory store sized at ~2.1 GB on 11K instruments × 21 TFs;
+> full-day in-memory store sized at ~2.1 GB on 11K instruments × 9 TFs;
 > volume field semantic confirmed by Dhan support 2026-05-01-volume-semantic-clarification (cumulative since 09:15 IST, monotonic, resets at 09:15 IST next day);
 > Telegram notifications edge-triggered + 30s state-hold debounced + dev-mode suppressed (no flap spam);
 > WS disconnect classified by cause (`tv_websocket_disconnect_cause_total{cause}`), reconnect preserves subs via `SubscribeRxGuard`, post-close sleep-until-open + supervisor respawn ≤ 5s.
@@ -1156,7 +1156,7 @@ Operator demand: "slow boot, fast boot, outside market hours, inside market hour
 > composite-key uniqueness;
 > chaos-tested 65h Fri 16:00 IST → Mon 09:00 IST weekend sleep/wake;
 > per-subsystem RSS accounting via `tv_subsystem_memory_bytes`;
-> full-day in-memory store (~2.1 GB on 11K instruments × 21 TFs);
+> full-day in-memory store (~2.1 GB on 11K instruments × 9 TFs);
 > volume field semantic confirmed by Dhan support 2026-05-01;
 > Telegram notifications edge-triggered + 30s state-hold debounced + dev-mode suppressed;
 > WS disconnect classified by cause; `SubscribeRxGuard` preserves subs across reconnect;

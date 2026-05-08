@@ -27,8 +27,7 @@ use tickvault_common::config::TimeframesConfig;
 
 /// PR #517 canonical TF set, ordered ascending. Re-add a TF here ONLY
 /// after coordinated updates to the 4 surfaces above.
-const PR517_CANONICAL_TF_SET: &[&str] =
-    &["1m", "5m", "15m", "30m", "1h", "2h", "3h", "4h", "1d"];
+const PR517_CANONICAL_TF_SET: &[&str] = &["1m", "5m", "15m", "30m", "1h", "2h", "3h", "4h", "1d"];
 
 #[test]
 fn timeframes_config_default_matches_pr517_canonical_set() {
