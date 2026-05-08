@@ -106,3 +106,73 @@ fn test_mid_market_boot_complete_event_retired() {
          Found {occurrences} occurrences — variant body/match arms/tests likely re-introduced."
     );
 }
+
+#[test]
+fn test_phase2_scheduler_file_does_not_exist() {
+    let path = workspace_root().join("crates/core/src/instrument/phase2_scheduler.rs");
+    assert!(
+        !path.exists(),
+        "phase2_scheduler.rs MUST be deleted (PR #509d). The 09:13 IST stock-F&O \
+         dispatcher is retired under indices-only scope. See plan §R.1 row 5."
+    );
+}
+
+#[test]
+fn test_phase2_delta_file_does_not_exist() {
+    let path = workspace_root().join("crates/core/src/instrument/phase2_delta.rs");
+    assert!(
+        !path.exists(),
+        "phase2_delta.rs MUST be deleted (PR #509d). Stock-F&O ATM-delta \
+         computation is dead under indices-only scope."
+    );
+}
+
+#[test]
+fn test_phase2_emit_guard_file_does_not_exist() {
+    let path = workspace_root().join("crates/core/src/instrument/phase2_emit_guard.rs");
+    assert!(
+        !path.exists(),
+        "phase2_emit_guard.rs MUST be deleted (PR #509d). The Phase 2 \
+         emit-guard belonged to the retired dispatcher chain."
+    );
+}
+
+#[test]
+fn test_no_pub_mod_phase2_dispatcher_in_instrument_mod() {
+    let path = workspace_root().join("crates/core/src/instrument/mod.rs");
+    let src =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {}", path.display(), e));
+    assert!(
+        !src.contains("pub mod phase2_scheduler"),
+        "instrument/mod.rs MUST NOT declare `pub mod phase2_scheduler` (deleted in PR #509d)."
+    );
+    assert!(
+        !src.contains("pub mod phase2_delta"),
+        "instrument/mod.rs MUST NOT declare `pub mod phase2_delta` (deleted in PR #509d)."
+    );
+    assert!(
+        !src.contains("pub mod phase2_emit_guard"),
+        "instrument/mod.rs MUST NOT declare `pub mod phase2_emit_guard` (deleted in PR #509d)."
+    );
+}
+
+#[test]
+fn test_phase2_readiness_check_kept() {
+    let path = workspace_root().join("crates/core/src/instrument/phase2_readiness_check.rs");
+    assert!(
+        path.exists(),
+        "phase2_readiness_check.rs MUST remain (PR #509d KEEPS this file). \
+         The 09:13:01 IST pre-flight readiness check is retained per plan §R.1 row 5."
+    );
+}
+
+#[test]
+fn test_run_phase2_scheduler_not_called_in_main() {
+    let path = workspace_root().join("crates/app/src/main.rs");
+    let src =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {}", path.display(), e));
+    assert!(
+        !src.contains("run_phase2_scheduler("),
+        "main.rs MUST NOT call `run_phase2_scheduler(` — dispatcher retired in PR #509d."
+    );
+}
