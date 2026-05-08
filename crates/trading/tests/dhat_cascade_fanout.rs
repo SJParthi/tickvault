@@ -31,6 +31,11 @@ fn bar_at(bucket_start: u32, security_id: u32) -> Bar {
         security_id,
         exchange_segment_code: 2, // NSE_FNO
         sealed: true,
+        prev_day_close: 0.0,
+        prev_day_oi: 0,
+        close_pct_from_prev_day: 0.0,
+        oi_pct_from_prev_day: 0.0,
+        volume_pct_from_prev_day: 0.0,
     }
 }
 

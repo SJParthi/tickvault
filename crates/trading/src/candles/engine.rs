@@ -80,6 +80,39 @@ pub struct Bar {
     /// `true` once the bar has been sealed (the next tick crossed a
     /// boundary). A non-sealed bar is the open bar still accumulating.
     pub sealed: bool,
+    // -----------------------------------------------------------------
+    // Wave-5 in-memory store §K-L12 — frozen-per-day reference fields.
+    //
+    // Source-of-truth: `previous_close` cache (PR #466) +
+    // `prev_oi_loader` (PR #454). Sourced once per (security_id, segment)
+    // at boot, frozen for the trading day, copied into every Bar at seal
+    // so /api/movers can compute % vs prev day without an additional JOIN.
+    //
+    // PR #504b ships the fields with default `0.0` / `0` values. The
+    // populator (boot-time copy from `previous_close` + `prev_oi_loader`
+    // caches into the engine's per-instrument context) lands in #504d
+    // alongside the in-memory store wiring. The % computation at seal
+    // (close_pct, oi_pct, volume_pct) lands in #504e per L13.
+    /// Previous trading day's close price for this `(security_id,
+    /// exchange_segment)`. Frozen at IST 00:00 by the bhavcopy loader.
+    /// `0.0` until the boot wiring in #504d populates the cache.
+    pub prev_day_close: f64,
+    /// Previous trading day's last open interest (only meaningful for
+    /// derivatives — `0` for IDX_I and equities). Frozen at IST 00:00.
+    /// `0` until the boot wiring in #504d populates the cache.
+    pub prev_day_oi: i64,
+    /// `(close - prev_day_close) / prev_day_close * 100`. Stamped at
+    /// SEAL only per L13 (NOT per tick); on-demand `~50 µs` scan
+    /// computes "right now" % between seals. `0.0` until #504e populates.
+    pub close_pct_from_prev_day: f64,
+    /// `(oi - prev_day_oi) / prev_day_oi * 100`. Same SEAL-only stamping
+    /// as `close_pct_from_prev_day`. `0.0` until #504e populates.
+    pub oi_pct_from_prev_day: f64,
+    /// `(volume_cum_day_at_end - prev_day_total_volume) / prev_day_total_volume
+    /// * 100`. Note: the prev-day volume baseline source is
+    /// `previous_close::prev_day_total_volume` (PR #466), distinct from
+    /// `prev_day_oi`. Stamped at SEAL only. `0.0` until #504e populates.
+    pub volume_pct_from_prev_day: f64,
 }
 
 impl Bar {
@@ -106,6 +139,13 @@ impl Bar {
             security_id,
             exchange_segment_code,
             sealed: false,
+            // L12 Wave-5: defaults until #504d wires the source caches
+            // and #504e stamps the % values at seal.
+            prev_day_close: 0.0,
+            prev_day_oi: 0,
+            close_pct_from_prev_day: 0.0,
+            oi_pct_from_prev_day: 0.0,
+            volume_pct_from_prev_day: 0.0,
         }
     }
 }
@@ -633,6 +673,59 @@ mod tests {
         }
     }
 
+    // -- Wave-5 §K-L12 (PR #504b) Bar-struct-shape ratchets ---------------
+
+    /// PR #504b ratchet: a fresh-open `Bar` must have all 5 Wave-5 fields
+    /// initialized to zero. Anyone who removes the field from
+    /// `Bar::new_open_at` would otherwise leave them un-initialized
+    /// (or worse, accidentally re-purpose them).
+    #[test]
+    fn test_bar_new_open_at_zero_inits_wave5_pct_fields() {
+        let b = Bar::new_open_at(0, 60, 1, 1);
+        assert_eq!(b.prev_day_close, 0.0);
+        assert_eq!(b.prev_day_oi, 0);
+        assert_eq!(b.close_pct_from_prev_day, 0.0);
+        assert_eq!(b.oi_pct_from_prev_day, 0.0);
+        assert_eq!(b.volume_pct_from_prev_day, 0.0);
+    }
+
+    /// PR #504b ratchet: the new % fields are `f64` (not `f32`) — keeps
+    /// parity with the QuestDB DDL (`DOUBLE`) and the matview
+    /// `last(...)` projection types. A drift to `f32` would silently
+    /// degrade precision on the wire.
+    ///
+    /// Compile-time check: passes a `f64` constant through the field.
+    /// If the field type ever changes, this fails to compile (or
+    /// triggers a noisy lossy-conversion warning).
+    #[test]
+    fn test_bar_wave5_pct_fields_are_f64() {
+        let b = Bar {
+            bucket_start_ist_secs: 0,
+            bucket_end_ist_secs: 60,
+            open: 0.0,
+            high: 0.0,
+            low: 0.0,
+            close: 0.0,
+            volume: 0,
+            volume_cum_day_at_end: 0,
+            oi: 0,
+            tick_count: 0,
+            security_id: 1,
+            exchange_segment_code: 1,
+            sealed: false,
+            prev_day_close: 1.234_567_890_123_456_e10,
+            prev_day_oi: 0,
+            close_pct_from_prev_day: 1.234_567_890_123_456_e10,
+            oi_pct_from_prev_day: 1.234_567_890_123_456_e10,
+            volume_pct_from_prev_day: 1.234_567_890_123_456_e10,
+        };
+        // f64 retains the magnitude precisely; f32 would silently round.
+        assert!((b.prev_day_close - 1.234_567_890_123_456_e10).abs() < 1.0);
+        assert!((b.close_pct_from_prev_day - 1.234_567_890_123_456_e10).abs() < 1.0);
+        assert!((b.oi_pct_from_prev_day - 1.234_567_890_123_456_e10).abs() < 1.0);
+        assert!((b.volume_pct_from_prev_day - 1.234_567_890_123_456_e10).abs() < 1.0);
+    }
+
     #[test]
     fn test_tf_secs_constants_are_correct() {
         assert_eq!(Tf1s::SECS, 1);
@@ -865,6 +958,11 @@ mod tests {
             security_id: 1234,
             exchange_segment_code: 1,
             sealed: true,
+            prev_day_close: 0.0,
+            prev_day_oi: 0,
+            close_pct_from_prev_day: 0.0,
+            oi_pct_from_prev_day: 0.0,
+            volume_pct_from_prev_day: 0.0,
         };
         let result = e.on_sealed_bar(&input);
         assert!(result.is_none());
@@ -891,6 +989,11 @@ mod tests {
             security_id: 1234,
             exchange_segment_code: 1,
             sealed: true,
+            prev_day_close: 0.0,
+            prev_day_oi: 0,
+            close_pct_from_prev_day: 0.0,
+            oi_pct_from_prev_day: 0.0,
+            volume_pct_from_prev_day: 0.0,
         };
         e.on_sealed_bar(&bar1);
         bar1.bucket_start_ist_secs = 1010;
@@ -928,6 +1031,11 @@ mod tests {
             security_id: 1234,
             exchange_segment_code: 1,
             sealed: true,
+            prev_day_close: 0.0,
+            prev_day_oi: 0,
+            close_pct_from_prev_day: 0.0,
+            oi_pct_from_prev_day: 0.0,
+            volume_pct_from_prev_day: 0.0,
         };
         e.on_sealed_bar(&bar1);
         // Bucket [960, 1020). Now feed a bar at 1020 — different bucket.
@@ -945,6 +1053,11 @@ mod tests {
             security_id: 1234,
             exchange_segment_code: 1,
             sealed: true,
+            prev_day_close: 0.0,
+            prev_day_oi: 0,
+            close_pct_from_prev_day: 0.0,
+            oi_pct_from_prev_day: 0.0,
+            volume_pct_from_prev_day: 0.0,
         };
         let sealed = e
             .on_sealed_bar(&bar2)

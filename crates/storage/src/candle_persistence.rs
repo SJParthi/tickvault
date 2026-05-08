@@ -377,6 +377,14 @@ const LIVE_CANDLE_RECONNECT_THROTTLE_SECS: u64 = 30;
 
 /// A buffered candle waiting to be written to QuestDB after recovery.
 /// Fixed-size, Copy — no allocation on push.
+///
+/// **Wave-5 §K-L12 (PR #504b)** added the 3 frozen-per-day % fields. They
+/// are NOT serialized to the on-disk spill (`serialize_candle` keeps the
+/// 76-byte record layout for backward compatibility with in-flight spill
+/// files at upgrade time). On deserialize they round-trip as `0.0`,
+/// which matches #504b's "ships the fields with default values"
+/// semantics — the actual seal-time stamping lands in #504e and can
+/// revisit the spill format if non-zero values need durability.
 #[derive(Clone, Copy)]
 struct BufferedCandle {
     security_id: u32,
@@ -393,6 +401,13 @@ struct BufferedCandle {
     gamma: f64,
     theta: f64,
     vega: f64,
+    /// Wave-5 §K-L12: change-vs-prev-day percentage. NOT persisted to spill.
+    close_pct_from_prev_day: f64,
+    /// Wave-5 §K-L12: OI change-vs-prev-day percentage. NOT persisted to spill.
+    oi_pct_from_prev_day: f64,
+    /// Wave-5 §K-L12: cumulative volume change-vs-prev-day percentage.
+    /// NOT persisted to spill.
+    volume_pct_from_prev_day: f64,
 }
 
 /// Fixed record size for disk-spilled candles: 76 bytes per candle (36 + 5×8 Greeks).
@@ -450,6 +465,12 @@ fn deserialize_candle(buf: &[u8; CANDLE_SPILL_RECORD_SIZE]) -> BufferedCandle {
         vega: f64::from_le_bytes([
             buf[68], buf[69], buf[70], buf[71], buf[72], buf[73], buf[74], buf[75],
         ]),
+        // L12 (Wave-5 #504b): NOT in the on-disk spill format (76 bytes
+        // preserved for backward compatibility). Round-trip as 0.0;
+        // #504e revisits if non-zero values need durability.
+        close_pct_from_prev_day: 0.0,
+        oi_pct_from_prev_day: 0.0,
+        volume_pct_from_prev_day: 0.0,
     }
 }
 
@@ -531,7 +552,7 @@ impl LiveCandleWriter {
     ///
     /// # Performance
     /// O(1) — single ILP row append + conditional flush.
-    #[allow(clippy::too_many_arguments)] // APPROVED: ILP row requires all OHLCV+meta+Greeks columns
+    #[allow(clippy::too_many_arguments)] // APPROVED: ILP row requires all OHLCV+meta+Greeks+Wave5-pct columns
     pub fn append_candle(
         &mut self,
         security_id: u32,
@@ -548,6 +569,12 @@ impl LiveCandleWriter {
         gamma: f64,
         theta: f64,
         vega: f64,
+        // Wave-5 §K-L12 (PR #504b) — frozen-per-day % fields. Stamped at
+        // SEAL by `CandleEngine::seal_bar` (#504e). #504b ships them as
+        // `0.0` defaults; #504e wires the actual computation.
+        close_pct_from_prev_day: f64,
+        oi_pct_from_prev_day: f64,
+        volume_pct_from_prev_day: f64,
     ) -> Result<()> {
         // If disconnected, try reconnect (throttled) then buffer on failure.
         if self.sender.is_none() {
@@ -571,6 +598,9 @@ impl LiveCandleWriter {
                 gamma,
                 theta,
                 vega,
+                close_pct_from_prev_day,
+                oi_pct_from_prev_day,
+                volume_pct_from_prev_day,
             });
             return Ok(());
         }
@@ -595,6 +625,12 @@ impl LiveCandleWriter {
             .and_then(|b| b.column_f64("gamma", gamma))
             .and_then(|b| b.column_f64("theta", theta))
             .and_then(|b| b.column_f64("vega", vega))
+            // Wave-5 §K-L12 (#504b): emit the 3 new % columns. Values
+            // come from the caller; #504b passes 0.0 for all three.
+            // #504e wires the seal-time stamping that fills them in.
+            .and_then(|b| b.column_f64("close_pct_from_prev_day", close_pct_from_prev_day))
+            .and_then(|b| b.column_f64("oi_pct_from_prev_day", oi_pct_from_prev_day))
+            .and_then(|b| b.column_f64("volume_pct_from_prev_day", volume_pct_from_prev_day))
             .and_then(|b| b.at(ts_nanos))
         {
             warn!(?err, "live candle ILP buffer error — buffering candle");
@@ -613,6 +649,9 @@ impl LiveCandleWriter {
                 gamma,
                 theta,
                 vega,
+                close_pct_from_prev_day,
+                oi_pct_from_prev_day,
+                volume_pct_from_prev_day,
             };
             self.buffer_candle(candle);
             return Ok(());
@@ -634,6 +673,9 @@ impl LiveCandleWriter {
             gamma,
             theta,
             vega,
+            close_pct_from_prev_day,
+            oi_pct_from_prev_day,
+            volume_pct_from_prev_day,
         };
         self.in_flight.push(candle);
         self.pending_count = self.pending_count.saturating_add(1);
@@ -795,6 +837,13 @@ impl LiveCandleWriter {
             .and_then(|b| b.column_f64("gamma", c.gamma))
             .and_then(|b| b.column_f64("theta", c.theta))
             .and_then(|b| b.column_f64("vega", c.vega))
+            // Wave-5 §K-L12 (#504b): emit the 3 new % columns. On rescue
+            // ring drain the values are whatever the original write
+            // carried; on disk-spill drain they are 0.0 (the spill
+            // record format keeps 76 bytes for backward compatibility).
+            .and_then(|b| b.column_f64("close_pct_from_prev_day", c.close_pct_from_prev_day))
+            .and_then(|b| b.column_f64("oi_pct_from_prev_day", c.oi_pct_from_prev_day))
+            .and_then(|b| b.column_f64("volume_pct_from_prev_day", c.volume_pct_from_prev_day))
             .and_then(|b| b.at(ts_nanos))
             .context("build candle ILP row")?;
         Ok(())
@@ -1688,6 +1737,9 @@ mod tests {
                 f64::NAN,
                 f64::NAN,
                 f64::NAN,
+                0.0,
+                0.0,
+                0.0,
             )
             .unwrap();
         assert_eq!(writer.pending_count, 1);
@@ -1752,6 +1804,9 @@ mod tests {
                 f64::NAN,
                 f64::NAN,
                 f64::NAN,
+                0.0,
+                0.0,
+                0.0,
             )
             .unwrap();
         assert_eq!(writer.pending_count, 1);
@@ -1908,6 +1963,9 @@ mod tests {
             f64::NAN,
             f64::NAN,
             f64::NAN,
+            0.0,
+            0.0,
+            0.0,
         );
         assert!(
             result.is_ok(),
@@ -1949,6 +2007,9 @@ mod tests {
                     f64::NAN,
                     f64::NAN,
                     f64::NAN,
+                    0.0,
+                    0.0,
+                    0.0,
                 )
                 .unwrap();
         }
@@ -2005,6 +2066,9 @@ mod tests {
                     f64::NAN,
                     f64::NAN,
                     f64::NAN,
+                    0.0,
+                    0.0,
+                    0.0,
                 )
                 .unwrap();
         }
@@ -2028,6 +2092,9 @@ mod tests {
                 f64::NAN,
                 f64::NAN,
                 f64::NAN,
+                0.0,
+                0.0,
+                0.0,
             )
             .unwrap();
         // Ring buffer stays at capacity.
@@ -2098,6 +2165,9 @@ mod tests {
                 f64::NAN,
                 f64::NAN,
                 f64::NAN,
+                0.0,
+                0.0,
+                0.0,
             )
             .unwrap();
         assert_eq!(writer.pending_count, 1, "should be in ILP buffer");
@@ -2141,6 +2211,9 @@ mod tests {
                 f64::NAN,
                 f64::NAN,
                 f64::NAN,
+                0.0,
+                0.0,
+                0.0,
             )
             .unwrap();
 
@@ -2168,6 +2241,9 @@ mod tests {
                 f64::NAN,
                 f64::NAN,
                 f64::NAN,
+                0.0,
+                0.0,
+                0.0,
             )
             .unwrap();
         assert_eq!(
@@ -2204,6 +2280,9 @@ mod tests {
             gamma: f64::NAN,
             theta: f64::NAN,
             vega: f64::NAN,
+            close_pct_from_prev_day: 0.0,
+            oi_pct_from_prev_day: 0.0,
+            volume_pct_from_prev_day: 0.0,
         };
         let c2 = c; // Copy
         assert_eq!(c.security_id, c2.security_id, "BufferedCandle must be Copy");
@@ -2332,6 +2411,9 @@ mod tests {
                     gamma: f64::NAN,
                     theta: f64::NAN,
                     vega: f64::NAN,
+                    close_pct_from_prev_day: 0.0,
+                    oi_pct_from_prev_day: 0.0,
+                    volume_pct_from_prev_day: 0.0,
                 };
                 bw.write_all(&serialize_candle(&candle)).unwrap();
             }
@@ -2422,6 +2504,9 @@ mod tests {
             gamma: f64::NAN,
             theta: f64::NAN,
             vega: f64::NAN,
+            close_pct_from_prev_day: 0.0,
+            oi_pct_from_prev_day: 0.0,
+            volume_pct_from_prev_day: 0.0,
         }
     }
 
@@ -2447,6 +2532,9 @@ mod tests {
             gamma: f64::NAN,
             theta: f64::NAN,
             vega: f64::NAN,
+            close_pct_from_prev_day: 0.0,
+            oi_pct_from_prev_day: 0.0,
+            volume_pct_from_prev_day: 0.0,
         };
 
         let bytes = serialize_candle(&candle);
@@ -2492,6 +2580,9 @@ mod tests {
             gamma: f64::NAN,
             theta: f64::NAN,
             vega: f64::NAN,
+            close_pct_from_prev_day: 0.0,
+            oi_pct_from_prev_day: 0.0,
+            volume_pct_from_prev_day: 0.0,
         };
         let restored_zero = deserialize_candle(&serialize_candle(&candle_zero));
         assert_eq!(restored_zero.security_id, 0);
@@ -2513,6 +2604,9 @@ mod tests {
             gamma: f64::NAN,
             theta: f64::NAN,
             vega: f64::NAN,
+            close_pct_from_prev_day: 0.0,
+            oi_pct_from_prev_day: 0.0,
+            volume_pct_from_prev_day: 0.0,
         };
         let restored_max = deserialize_candle(&serialize_candle(&candle_max));
         assert_eq!(restored_max.security_id, u32::MAX);
@@ -2565,6 +2659,9 @@ mod tests {
                     f64::NAN,
                     f64::NAN,
                     f64::NAN,
+                    0.0,
+                    0.0,
+                    0.0,
                 )
                 .unwrap();
         }
@@ -2600,6 +2697,9 @@ mod tests {
                     f64::NAN,
                     f64::NAN,
                     f64::NAN,
+                    0.0,
+                    0.0,
+                    0.0,
                 )
                 .unwrap();
         }
@@ -2690,6 +2790,9 @@ mod tests {
                     f64::NAN,
                     f64::NAN,
                     f64::NAN,
+                    0.0,
+                    0.0,
+                    0.0,
                 )
                 .unwrap();
         }
@@ -2953,6 +3056,9 @@ mod tests {
                     gamma: f64::NAN,
                     theta: f64::NAN,
                     vega: f64::NAN,
+                    close_pct_from_prev_day: 0.0,
+                    oi_pct_from_prev_day: 0.0,
+                    volume_pct_from_prev_day: 0.0,
                 };
                 bw.write_all(&serialize_candle(&candle)).unwrap();
             }
@@ -3128,6 +3234,9 @@ mod tests {
                     f64::NAN,
                     f64::NAN,
                     f64::NAN,
+                    0.0,
+                    0.0,
+                    0.0,
                 )
                 .unwrap();
         }
@@ -3355,6 +3464,9 @@ mod tests {
                 f64::NAN,
                 f64::NAN,
                 f64::NAN,
+                0.0,
+                0.0,
+                0.0,
             )
             .unwrap();
         assert!(writer.pending_count > 0);
@@ -3499,6 +3611,9 @@ mod tests {
             f64::NAN,
             f64::NAN,
             f64::NAN,
+            0.0,
+            0.0,
+            0.0,
         );
         assert!(result.is_ok());
         assert_eq!(writer.buffered_candle_count(), 1);
@@ -3543,6 +3658,9 @@ mod tests {
                     f64::NAN,
                     f64::NAN,
                     f64::NAN,
+                    0.0,
+                    0.0,
+                    0.0,
                 )
                 .unwrap();
         }
@@ -3594,6 +3712,9 @@ mod tests {
                     f64::NAN,
                     f64::NAN,
                     f64::NAN,
+                    0.0,
+                    0.0,
+                    0.0,
                 )
                 .unwrap();
         }
@@ -3624,6 +3745,9 @@ mod tests {
                 f64::NAN,
                 f64::NAN,
                 f64::NAN,
+                0.0,
+                0.0,
+                0.0,
             )
             .unwrap();
         writer.force_flush_internal();
@@ -3680,6 +3804,9 @@ mod tests {
                 gamma: f64::NAN,
                 theta: f64::NAN,
                 vega: f64::NAN,
+                close_pct_from_prev_day: 0.0,
+                oi_pct_from_prev_day: 0.0,
+                volume_pct_from_prev_day: 0.0,
             });
         }
         assert_eq!(writer.buffered_candle_count(), CANDLE_BUFFER_CAPACITY);
@@ -3745,6 +3872,9 @@ mod tests {
                     gamma: f64::NAN,
                     theta: f64::NAN,
                     vega: f64::NAN,
+                    close_pct_from_prev_day: 0.0,
+                    oi_pct_from_prev_day: 0.0,
+                    volume_pct_from_prev_day: 0.0,
                 };
                 use std::io::Write as _;
                 file.write_all(&serialize_candle(&candle)).unwrap();
@@ -3874,6 +4004,9 @@ mod tests {
                     f64::NAN,
                     f64::NAN,
                     f64::NAN,
+                    0.0,
+                    0.0,
+                    0.0,
                 )
                 .unwrap();
         }
@@ -3919,6 +4052,9 @@ mod tests {
                 f64::NAN,
                 f64::NAN,
                 f64::NAN,
+                0.0,
+                0.0,
+                0.0,
             )
             .unwrap();
         assert!(writer.pending_count > 0);
@@ -4173,6 +4309,9 @@ mod tests {
                     f64::NAN,
                     f64::NAN,
                     f64::NAN,
+                    0.0,
+                    0.0,
+                    0.0,
                 )
                 .unwrap();
         }
@@ -4225,6 +4364,9 @@ mod tests {
                     f64::NAN,
                     f64::NAN,
                     f64::NAN,
+                    0.0,
+                    0.0,
+                    0.0,
                 )
                 .unwrap();
         }
@@ -4713,6 +4855,9 @@ mod tests {
             gamma: f64::NAN,
             theta: f64::NAN,
             vega: f64::NAN,
+            close_pct_from_prev_day: 0.0,
+            oi_pct_from_prev_day: 0.0,
+            volume_pct_from_prev_day: 0.0,
         };
         let buf = serialize_candle(&candle);
         let restored = deserialize_candle(&buf);
@@ -4741,6 +4886,9 @@ mod tests {
             gamma: f64::NAN,
             theta: f64::NAN,
             vega: f64::NAN,
+            close_pct_from_prev_day: 0.0,
+            oi_pct_from_prev_day: 0.0,
+            volume_pct_from_prev_day: 0.0,
         };
         let buf = serialize_candle(&candle);
         let restored = deserialize_candle(&buf);
@@ -4772,6 +4920,9 @@ mod tests {
             gamma: f64::NAN,
             theta: f64::NAN,
             vega: f64::NAN,
+            close_pct_from_prev_day: 0.0,
+            oi_pct_from_prev_day: 0.0,
+            volume_pct_from_prev_day: 0.0,
         };
         let buf = serialize_candle(&candle);
         assert_eq!(buf.len(), CANDLE_SPILL_RECORD_SIZE);
@@ -4962,6 +5113,9 @@ mod tests {
             gamma: f64::NAN,
             theta: f64::NAN,
             vega: f64::NAN,
+            close_pct_from_prev_day: 0.0,
+            oi_pct_from_prev_day: 0.0,
+            volume_pct_from_prev_day: 0.0,
         };
         let copied = candle;
         assert_eq!(copied.security_id, 42);
@@ -4992,6 +5146,9 @@ mod tests {
             gamma: f64::NAN,
             theta: f64::NAN,
             vega: f64::NAN,
+            close_pct_from_prev_day: 0.0,
+            oi_pct_from_prev_day: 0.0,
+            volume_pct_from_prev_day: 0.0,
         };
         assert_eq!(candle.security_id, 0);
         assert_eq!(candle.timestamp_secs, 0);
@@ -5075,6 +5232,9 @@ mod tests {
             f64::NAN,
             f64::NAN,
             f64::NAN,
+            0.0,
+            0.0,
+            0.0,
         );
         assert!(
             result.is_ok(),
@@ -5124,6 +5284,9 @@ mod tests {
                     f64::NAN,
                     f64::NAN,
                     f64::NAN,
+                    0.0,
+                    0.0,
+                    0.0,
                 )
                 .unwrap();
         }
@@ -5688,6 +5851,9 @@ mod tests {
             gamma: f64::NAN,
             theta: f64::NAN,
             vega: f64::NAN,
+            close_pct_from_prev_day: 0.0,
+            oi_pct_from_prev_day: 0.0,
+            volume_pct_from_prev_day: 0.0,
         };
         writer.in_flight.push(c);
         writer.pending_count = 1;
@@ -5736,6 +5902,9 @@ mod tests {
             gamma: f64::NAN,
             theta: f64::NAN,
             vega: f64::NAN,
+            close_pct_from_prev_day: 0.0,
+            oi_pct_from_prev_day: 0.0,
+            volume_pct_from_prev_day: 0.0,
         };
         writer.in_flight.push(c);
         writer.pending_count = 1;
@@ -5791,6 +5960,9 @@ mod tests {
                 gamma: f64::NAN,
                 theta: f64::NAN,
                 vega: f64::NAN,
+                close_pct_from_prev_day: 0.0,
+                oi_pct_from_prev_day: 0.0,
+                volume_pct_from_prev_day: 0.0,
             });
         }
         assert_eq!(writer.candle_buffer.len(), 5);
@@ -5844,6 +6016,9 @@ mod tests {
                 gamma: f64::NAN,
                 theta: f64::NAN,
                 vega: f64::NAN,
+                close_pct_from_prev_day: 0.0,
+                oi_pct_from_prev_day: 0.0,
+                volume_pct_from_prev_day: 0.0,
             });
         }
 
@@ -5880,6 +6055,9 @@ mod tests {
                 gamma: f64::NAN,
                 theta: f64::NAN,
                 vega: f64::NAN,
+                close_pct_from_prev_day: 0.0,
+                oi_pct_from_prev_day: 0.0,
+                volume_pct_from_prev_day: 0.0,
             });
         }
 
@@ -5934,6 +6112,9 @@ mod tests {
                     gamma: f64::NAN,
                     theta: f64::NAN,
                     vega: f64::NAN,
+                    close_pct_from_prev_day: 0.0,
+                    oi_pct_from_prev_day: 0.0,
+                    volume_pct_from_prev_day: 0.0,
                 };
                 let record = serialize_candle(&c);
                 use std::io::Write as _;
@@ -6040,6 +6221,9 @@ mod tests {
                 gamma: f64::NAN,
                 theta: f64::NAN,
                 vega: f64::NAN,
+                close_pct_from_prev_day: 0.0,
+                oi_pct_from_prev_day: 0.0,
+                volume_pct_from_prev_day: 0.0,
             };
             let record = serialize_candle(&c);
             std::fs::write(&spill_path, record).unwrap();
@@ -6086,6 +6270,9 @@ mod tests {
                 gamma: f64::NAN,
                 theta: f64::NAN,
                 vega: f64::NAN,
+                close_pct_from_prev_day: 0.0,
+                oi_pct_from_prev_day: 0.0,
+                volume_pct_from_prev_day: 0.0,
             };
             let record = serialize_candle(&c);
             std::fs::write(&spill_path, record).unwrap();
@@ -6187,6 +6374,9 @@ mod tests {
                 gamma: f64::NAN,
                 theta: f64::NAN,
                 vega: f64::NAN,
+                close_pct_from_prev_day: 0.0,
+                oi_pct_from_prev_day: 0.0,
+                volume_pct_from_prev_day: 0.0,
             };
             let record = serialize_candle(&c);
             std::fs::write(&stale_path, record).unwrap();
@@ -6273,6 +6463,9 @@ mod tests {
                 gamma: f64::NAN,
                 theta: f64::NAN,
                 vega: f64::NAN,
+                close_pct_from_prev_day: 0.0,
+                oi_pct_from_prev_day: 0.0,
+                volume_pct_from_prev_day: 0.0,
             });
         }
 
@@ -6342,6 +6535,9 @@ mod tests {
             gamma: f64::NAN,
             theta: f64::NAN,
             vega: f64::NAN,
+            close_pct_from_prev_day: 0.0,
+            oi_pct_from_prev_day: 0.0,
+            volume_pct_from_prev_day: 0.0,
         }
     }
 
@@ -6372,6 +6568,9 @@ mod tests {
                     f64::NAN,
                     f64::NAN,
                     f64::NAN,
+                    0.0,
+                    0.0,
+                    0.0,
                 )
                 .unwrap();
         }

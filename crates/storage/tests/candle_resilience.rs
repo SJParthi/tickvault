@@ -63,6 +63,9 @@ fn test_candle_writer_cold_start_buffers_candles() {
                 0.0,               // gamma
                 0.0,               // theta
                 0.0,               // vega
+                0.0,
+                0.0,
+                0.0,
             )
             .expect("append_candle must not fail even when disconnected");
     }
@@ -97,6 +100,9 @@ fn test_candle_writer_cold_start_zero_drops() {
                 0.01,
                 -0.03,
                 0.15,
+                0.0,
+                0.0,
+                0.0,
             )
             .expect("append must not fail");
     }
@@ -139,6 +145,9 @@ fn test_recovery_ordering_ring_before_spill() {
                 0.0,
                 0.0,
                 0.0,
+                0.0,
+                0.0,
+                0.0,
             )
             .expect("append must not fail");
     }
@@ -158,6 +167,9 @@ fn test_recovery_ordering_ring_before_spill() {
                 100.0 + i as f32,
                 1000,
                 10,
+                0.0,
+                0.0,
+                0.0,
                 0.0,
                 0.0,
                 0.0,
@@ -213,6 +225,9 @@ fn test_reconnect_revalidates_schema() {
             0.0,
             0.0,
             0.0,
+            0.0,
+            0.0,
+            0.0,
         )
         .expect("append must succeed on disconnected writer");
 
@@ -250,6 +265,9 @@ fn test_disconnected_writer_fresh_buffer_does_not_corrupt() {
                     100.5,
                     1000,
                     10,
+                    0.0,
+                    0.0,
+                    0.0,
                     0.0,
                     0.0,
                     0.0,

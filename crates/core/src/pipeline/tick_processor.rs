@@ -1539,6 +1539,12 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                                 c.gamma,
                                 c.theta,
                                 c.vega,
+                                // Wave-5 §K-L12 (#504b): % fields default
+                                // to 0.0 — #504e wires the seal-time
+                                // stamping that fills them in.
+                                0.0,
+                                0.0,
+                                0.0,
                             ) {
                                 // Never break — remaining candles must still be processed.
                                 // Rate-limit: warn first 100, then every 1000th.
@@ -1629,6 +1635,10 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     c.gamma,
                     c.theta,
                     c.vega,
+                    // Wave-5 §K-L12 (#504b): % fields default to 0.0.
+                    0.0,
+                    0.0,
+                    0.0,
                 ));
             }
             cw.flush_on_shutdown();
