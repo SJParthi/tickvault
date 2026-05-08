@@ -1,7 +1,7 @@
 # Design Plan: In-Memory Store (§17) + AWS Instance Re-evaluation (§18 v2)
 
-**Status:** APPROVED v2 — 130 design decisions LOCKED 2026-05-08 (L1-L130 across 18 sections). 3-agent adversarial review passed (§AA): 2 CRITICAL + 6 HIGH findings folded into revised L18 + new locks L121-L130. c8g.xlarge ONLY. Code for #504a writes against the revised lock set. 2 open verification gates parallel: OPEN-VERIFY-1 (auto-closing via L107 09:14 IST cron) + OPEN-VERIFY-2 (operator-side aws ec2 describe-instance-types verify).
-**Date:** 2026-05-07
+**Status:** IN_PROGRESS (APPROVED v2 — 130 design decisions LOCKED 2026-05-08, L1-L130 across 18 sections; 3-agent adversarial review passed §AA: 2 CRITICAL + 6 HIGH folded into revised L18 + new locks L121-L130; c8g.xlarge ONLY). **§O PR sequence: 4 of 9 logical PRs MERGED (#504a, #504b, #504c, #509a-d), 1 IN FLIGHT (#517 auto-merge SQUASH armed), 4 REMAINING (#504d, #504e, #505 read-flip, #507 Phase 4b drops, #508 AWS deploy).** See §O for the live status table.
+**Date:** 2026-05-07 (status last refreshed 2026-05-08)
 **Authors:** Parthiban (architect), Claude (builder)
 **Branch:** to-be-created on operator approval
 **Supersedes:** `.claude/plans/active-plan-29-tf-and-movers-deletion.md` §17 + §18 (when this lands as plan revision).
@@ -346,19 +346,50 @@ The shift to static universe + indices-only scope retires several design element
 
 ## §O) Updated PR sequence under static-universe simplification
 
-| # | PR | Scope | Touches |
-|---|---|---|---|
-| 1 | **#504a** Observability prereq | `tv_subsystem_memory_bytes` per-component gauge + Grafana panel + alert | crates/app, observability |
-| 2 | **#504b** Schema + struct | 5 new Bar fields + ALTER candles_* matviews + ILP writer | crates/storage, common |
-| 3 | **#504c** TF list config | `[engine.timeframes]` array + remove seconds engines | crates/trading, config, app |
-| 4 | **#504d** In-memory store | Tick ring (full day) + bar storage per (instrument, TF) + IST 09:15 reset | crates/trading, app |
-| 5 | **#504e** % stamping at seal | close_pct, oi_pct, volume_pct computed in `seal_bar` | crates/trading |
-| 6 | **#505** Read flip | `/api/movers/v2` is a ~30 LoC REST wrapper calling `candle_storage.top_n_by(category, expiry, scope, n)`. **No separate `MoversEngine` struct.** 7 categories × 3 expiry × 5 scope (Dhan UI parity per L29) | crates/api, trading |
-| 7 | **#507** Phase 4b drops | `DROP TABLE stock_movers, option_movers` (operator runbook gate) | runbook, sql |
-| 8 | **#508** AWS deploy | Terraform `instance_type = c8g.xlarge` + Docker mem_limits per L2 + ARM AMI + aarch64 cross-compile CI + bench-budget re-baseline + OS tunes per L4 | deploy/aws/terraform, deploy/docker, .github/workflows |
-| 9 | **#509** Static-universe cleanup | DELETE live-tick-atm-resolver, mid-market boot mode resolver beyond simple market-hours check, REST `/marketfeed/ltp` fallback, pre-open buffer ATM-strike machinery | crates/core/instrument |
+**Status as of 2026-05-08:** GitHub PR numbers vary from the §O logical labels. The mapping below cites the actual merged GitHub PR number for each logical PR. Look at the **Status** column to see what's done vs in-flight vs remaining.
+
+| # | Logical PR | Scope | Touches | Status (2026-05-08) |
+|---|---|---|---|---|
+| 1 | **#504a** Observability prereq | `tv_subsystem_memory_bytes` per-component gauge + Grafana panel + alert | crates/app, observability | ✅ MERGED as GitHub PR #507 (commit `de6f7ff`) |
+| 2 | **#504b** Schema + struct | 5 new Bar fields + ALTER candles_* matviews + ILP writer | crates/storage, common | ✅ MERGED as GitHub PR #508 (commit `d6902a8`) |
+| 3 | **#504c** TF list config | `[engine.timeframes]` array + remove seconds engines | crates/trading, config, app | ✅ MERGED as GitHub PR #509 (commit `5a9ecf6`) |
+| 3a | **#517** TF reduction (Wave-5 follow-up) | retire 12 sub-15m TFs (21→9) symmetrically across 4 surfaces (config + metrics_catalog + cascade_fanout + matview DDL) + tf_symmetry_guard ratchet | crates/common, crates/trading, crates/app, crates/storage, crates/api | 🔄 IN FLIGHT — GitHub PR #517 undrafted, auto-merge SQUASH armed, awaits CI green |
+| 4 | **#504d** In-memory store | Tick ring (full day) + bar storage per (instrument, TF) + IST 09:15 reset | crates/trading, app | ❌ REMAINING |
+| 5 | **#504e** % stamping at seal | close_pct, oi_pct, volume_pct computed in `seal_bar` | crates/trading | ❌ REMAINING |
+| 6 | **#505** Read flip | `/api/movers/v2` is a ~30 LoC REST wrapper calling `candle_storage.top_n_by(category, expiry, scope, n)`. **No separate `MoversEngine` struct.** 7 categories × 3 expiry × 5 scope (Dhan UI parity per L29) | crates/api, trading | ❌ REMAINING |
+| 7 | **#507** Phase 4b drops | `DROP TABLE stock_movers, option_movers` (operator runbook gate) | runbook, sql | ❌ REMAINING |
+| 8 | **#508** AWS deploy | Terraform `instance_type = c8g.xlarge` + Docker mem_limits per L2 + ARM AMI + aarch64 cross-compile CI + bench-budget re-baseline + OS tunes per L4 | deploy/aws/terraform, deploy/docker, .github/workflows | ❌ REMAINING |
+| 9 | **#509** Static-universe cleanup | DELETE live-tick-atm-resolver, mid-market boot mode resolver beyond simple market-hours check, REST `/marketfeed/ltp` fallback, pre-open buffer ATM-strike machinery | crates/core/instrument | ✅ MERGED in 4 sub-PRs: #509a (PR #513, `271e5be`), #509b (PR #514, `dc79b96`), #509c (PR #515, `2674696`), #509d (PR #516, `99cafaa`) |
 
 PR #506 (cohort SQL migration) — KILLED per L14 (depth-dynamic reads from RAM `MoversEngine`).
+
+### Recently merged (2026-05-04 → 2026-05-08)
+
+| GitHub PR # | Commit | Logical PR | Net effect |
+|---|---|---|---|
+| #507 | `de6f7ff` | #504a | per-component memory estimated gauge + heartbeat (L121-L130 review-fold) |
+| #508 | `d6902a8` | #504b | 5 frozen-per-day Bar fields + ALTER candles_* matviews + ILP writer (Wave-5 §K-L12) |
+| #509 | `5a9ecf6` | #504c | `[engine.timeframes]` config + retire 5 seconds-level cascade engines (Wave-5 §K-L7/L8) |
+| #513 | `271e5be` | #509a | delete `live_tick_atm_resolver` indices-only cleanup |
+| #514 | `dc79b96` | #509b | delete `preopen_rest_fallback` dead module |
+| #515 | `2674696` | #509c | delete `boot_mode` + retire `MidMarketBootComplete` event |
+| #516 | `99cafaa` | #509d | retire phase2 dispatcher chain (Wave-5 §R.1 row 5) |
+
+### In flight (auto-merge armed)
+
+| GitHub PR # | Branch | Logical PR | Net effect |
+|---|---|---|---|
+| #517 | `claude/timeframes-9tf-full-retirement` | (Wave-5 follow-up between #504c and #504d) | retire 12 sub-15m TFs (21→9) symmetrically; **VIEW_DEFS 28→16**, `Tf::ALL` 21→9, `default_list` 21→9, `CascadeFanout` 23→11 derived engines; new `PR517_RETIRED_MATERIALIZED_VIEWS` + `drop_pr517_retired_views` boot wiring; new `tf_symmetry_guard` cross-crate ratchet (4 tests); plan §K-L6/L7/L8 + 4 cross-references updated to "9 TFs" |
+
+### Remaining work (in dependency order)
+
+| Order | Logical PR | Why next | Blocked on |
+|---|---|---|---|
+| 1 | **#504d** In-memory store | tick ring + bar storage are the foundation #504e + #505 read off | #517 merge (clean main start) |
+| 2 | **#504e** % stamping at seal | depends on #504d Bar storage being live | #504d |
+| 3 | **#505** Read flip | `/api/movers/v2` REST wrapper requires `candle_storage.top_n_by` from #504d/#504e | #504d + #504e |
+| 4 | **#507** Phase 4b drops | DROP `stock_movers` + `option_movers` only safe AFTER #505 read flip is live in prod | #505 + operator runbook gate |
+| 5 | **#508** AWS deploy | Terraform c8g.xlarge + ARM AMI + aarch64 CI; ships only AFTER full RAM store + read-flip verified locally | #504d + #504e + #505 + #507 |
 
 ---
 
