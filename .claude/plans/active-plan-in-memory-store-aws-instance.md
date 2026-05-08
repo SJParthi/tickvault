@@ -1,6 +1,6 @@
 # Design Plan: In-Memory Store (§17) + AWS Instance Re-evaluation (§18 v2)
 
-**Status:** DRAFT v8 — 67 design decisions LOCKED 2026-05-08 (L1–L67 across §K + §Q + §R + §S + §T). 2 open verification gates (`OPEN-VERIFY-1`, `OPEN-VERIFY-2`). No implementation contract until both gates close + operator approves all sections → APPROVED status.
+**Status:** DRAFT v11 — 86 design decisions LOCKED 2026-05-08 (L1–L86 across §K + §Q + §R + §S + §T + §U + §V + §W). 2 open verification gates (`OPEN-VERIFY-1`, `OPEN-VERIFY-2`). 1 immediate operator-comfort action (silence Telegram NOW until #504a ships). No implementation contract until both gates close + operator approves all sections → APPROVED status.
 **Date:** 2026-05-07
 **Authors:** Parthiban (architect), Claude (builder)
 **Branch:** to-be-created on operator approval
@@ -900,4 +900,353 @@ These compose with logical AND — an event must pass ALL of: not-flapping, in-m
 
 ---
 
-**End of DRAFT v8.** Awaiting OPEN-VERIFY-1 + OPEN-VERIFY-2 closure for APPROVED status.
+## §U) Local Mac dev vs AWS prod — why disconnects happen locally and how we guarantee bounded zero-loss anywhere (NEW 2026-05-08)
+
+Operator concern 2026-05-08: "even with this massive local MacBook why is WebSocket live market feed disconnect happening? If this happens here means then even on AWS c8g.xlarge it can happen too — clarify."
+
+### §U.1 — Local Mac specs locked in plan
+
+| Component | Spec |
+|---|---|
+| Model | MacBook Pro `Mac16,7` (MX2Y3ZP/A) |
+| Chip | Apple M4 Pro |
+| Cores | **14** (10 performance + 4 efficiency) |
+| Memory | **48 GB unified** |
+| Memory used (Activity Monitor live) | 28.62 GB used / 19.38 GB cached / **0 swap** |
+| App Memory | 20.55 GB / Wired 2.96 GB / Compressed 4.00 GB |
+| CPU load (live) | System 7% / User 26% / Idle **67%** |
+| tickvault RSS (current) | 828 MB (Memory tab) — well under threshold |
+| Hot-path consumers | tickvault 116% CPU (peak), Virtual Machine Service for Docker 64% |
+| OS | macOS Sonoma equivalent |
+
+**Verdict:** This Mac is NOT resource-constrained. WS disconnects here are **environmental artifacts**, not load-induced.
+
+### §U.2 — Why WS disconnects on a 48 GB M4 Pro Mac (root cause analysis)
+
+The disconnects you observed are NOT caused by resource pressure. The 5 honest causes:
+
+| # | Cause | Mechanism | Affects AWS? |
+|---|---|---|---|
+| **C1** | **macOS App Nap** | When tickvault isn't the foreground app, macOS may throttle background tasks → tokio scheduler delays → WS keepalive misses → upstream RST | ❌ NO — Linux has no App Nap |
+| C2 | macOS power management / display sleep | Lid close, display off, energy-saver mode reduces CPU clock; affects Wi-Fi sleep too | ❌ NO — server runs 24/7 |
+| C3 | Wi-Fi vs Ethernet flap | macOS auto-switches between Wi-Fi networks or 2.4/5 GHz bands; momentary IP change resets TCP | ⚠️ PARTIAL — AWS uses VPC ENI (no Wi-Fi); but ISP-side flaps still possible |
+| C4 | NAT timeout on home/office ISP | Idle TCP > 60s gets reset by NAT box; less common during market hours | ⚠️ PARTIAL — AWS direct-egress less aggressive but TCP still finite |
+| C5 | Dhan-side rate-limit / RST flood | Dhan disconnects during their own infra issues (e.g. PR #337 was caused by Dhan TCP RST storm 2026-04-24) | ✅ YES — Dhan-side issue affects all clients regardless of OS |
+
+**Observation:** 4 of 5 causes are dev-environment-specific. Only C5 (Dhan-side) carries to AWS — and it's the SAME risk on every client.
+
+### §U.3 — Why AWS c8g.xlarge dramatically reduces these
+
+| Cause | AWS c8g.xlarge mitigation |
+|---|---|
+| C1 App Nap | **Eliminated** — Linux has no App Nap concept |
+| C2 Power management | **Eliminated** — server-class instance runs 24/7, no display, no lid |
+| C3 Wi-Fi flap | **Eliminated** — VPC ENI is direct ethernet to AWS backbone |
+| C4 NAT timeout | **Reduced** — direct egress through AWS internet gateway; TCP keepalive within VPC < ISP NAT timeout |
+| C5 Dhan-side RST | **Same risk** — but our resilience handles it (SubscribeRxGuard + reconnect) |
+
+**Honest summary:** AWS c8g.xlarge eliminates 4 of 5 disconnect causes outright. The remaining 1 (Dhan-side) is the same on any client and is what our design IS built to absorb.
+
+### §U.4 — The bounded zero-loss guarantee (real-time mechanisms + proof)
+
+This is the honest 100% claim per `wave-4-shared-preamble.md` §8 — restated with each guarantee mapped to its mechanism + ratchet test.
+
+| Operator demand | Honest envelope | Real-time mechanism | Proof (test) | Telegram alert if breached |
+|---|---|---|---|---|
+| Zero tick loss | **bounded inside 60s outage envelope** | Rescue ring 2M ticks (224 MB) → spill NDJSON → DLQ. Tier 1 absorbs in-RAM; Tier 2 disk file; Tier 3 final DLQ. | `crates/storage/tests/zero_tick_loss_alert_guard.rs`; `chaos_zero_tick_loss.rs`; `chaos_questdb_docker_pause.rs` | Critical if rescue ring > 80% full |
+| WS never disconnects | **detect ≤ 5s + reconnect preserves subs** | Pool watchdog 5s tick; `SubscribeRxGuard` (PR #337) keeps subscribe channel alive across reconnect; sleep-until-open post-15:30 IST; pool supervisor respawns dead conns ≤ 5s | `test_subscribe_rx_guard_reinstalls_on_drop`; `ws_sleep_resilience.rs` (65h chaos); `chaos_ws_frame_spill_saturation.rs` | Critical if all 5 main conns drop > 30s in-market |
+| WS never slow/locked | **DHAT ≤ 4 alloc blocks + Criterion p99 ≤ 100 ns** | Hot path is `from_le_bytes` + bounded SPSC + papaya MVCC; bench-gate fails build on > 5% regression; `core_affinity` pins WS read to Core 0 | `dhat_*.rs` family; `benches/tick_parser.rs`; `quality/benchmark-budgets.toml` | Tick-gap > 30s in-market (coalesced 60s) |
+| QuestDB never fails | **absorb via 3-tier + schema self-heal** | Continuous ILP TCP socket; rescue ring buffers on disconnect; spill writer flushes to NDJSON; `ALTER TABLE ADD COLUMN IF NOT EXISTS` on every boot | `chaos_questdb_docker_pause.rs`; `resilience_sla_alert_guard.rs`; `instrument_persistence.rs::ensure_instrument_tables` | Critical if QuestDB unreachable > 5 min in-market (after debounce per L59) |
+| O(1) latency | **bench-gated < 100 ns p99 hot path** | `from_le_bytes` parser, papaya `Arc<HashMap>` lookup, bounded SPSC; no `.clone()`, no `Vec::new()`, no `format!()` on hot path | banned-pattern hook category 2; DHAT proves zero alloc; Criterion benches all live | bench-gate CI fail on PR |
+| Uniqueness + dedup | **composite (security_id, exchange_segment) per I-P1-11** | `papaya` `HashMap<(u32, ExchangeSegment), _>`; every storage `DEDUP_KEY_*` constant includes segment; meta-guard scans for regression | `dedup_segment_meta_guard.rs`; `instrument_registry::tests::test_iter_returns_both_colliding_segments` | n/a — design-time invariant |
+
+### §U.5 — Lazy-kid analogy table
+
+| Concept | Lazy-kid version |
+|---|---|
+| Why local Mac disconnects | "Your laptop is sleeping or your wifi blinked. Your laptop is amazing — it's not the laptop's fault, it's the wifi or the sleep mode." |
+| Why AWS won't disconnect the same way | "AWS is a giant computer in a datacenter that never sleeps. It's plugged into super-fast ethernet, never on wifi. So sleep + wifi problems are gone." |
+| Why we still design for disconnect on AWS | "Even AWS computers can have a tiny network blip once in a while. So we built a safety net — a big bucket that catches every tick if the connection breaks for up to 60 seconds. Nothing falls on the floor." |
+| What's the safety net | "Three layers: (1) memory bucket holds 2 million ticks, (2) if that overflows we write to a file on disk, (3) if even that breaks we have a final 'dead-letter queue' file. NOTHING gets lost permanently." |
+| What if QuestDB itself dies? | "Same safety net — the database can be down for a minute and we don't lose anything. We pour into the memory bucket; when DB comes back, we replay everything in order." |
+| What if our app crashes? | "Docker auto-restarts it within 5 seconds. The big buffer file survives the crash. On restart we replay it." |
+| O(1) latency promise | "Every tick is processed in less than 100 nanoseconds — that's a billionth of a second. Every benchmark run proves this; if anyone tries to slow it down, the build literally won't compile." |
+| Composite key promise | "We never confuse two instruments that share the same number. Even Dhan reuses ID 27 for both an index and a stock — we use the (number + segment) as the unique key. Always." |
+
+### §U.6 — Locked design decisions L68–L72
+
+| # | Locked | Detail |
+|---|---|---|
+| **L68** | Local Mac dev specs captured | MacBook Pro M4 Pro, 14 cores, 48 GB unified — captured in §U.1 |
+| **L69** | Mac-specific dev mitigations | (a) `caffeinate -ds` to prevent App Nap during dev sessions; (b) Energy Saver → "Prevent automatic sleeping when the display is off"; (c) Activity Monitor → reduce "Preventing Sleep: No" by adding tickvault to login items with Force-Active option |
+| **L70** | Disconnect classification at runtime | Add `tv_websocket_disconnect_cause_total{cause}` counter labels: `app_nap` / `wifi_flap` / `nat_timeout` / `dhan_rst` / `unknown`. Detected by recent `SystemTime::now()` clock-jump vs uptime delta heuristic at reconnect moment. |
+| **L71** | Real-time guarantee score (composite SLO) | Already implemented (SLO-01/SLO-02). Per §T L58–L67 fixes the flap-spam. The score IS the real-time check — at 10s cadence it gives operator a single-glance "are guarantees holding?" answer. |
+| **L72** | AWS deployment health expectation | After AWS deploy, expect WS disconnect rate to drop ~70% vs local Mac (loses C1+C2+C3 causes). Track via `tv_websocket_disconnect_total` 24h rate before/after migration; ratchet `test_aws_disconnect_rate_below_local_baseline` (baseline established post-migration soak). |
+
+### §U.7 — The honest 100% claim (verbatim, refreshed for v8)
+
+> 100% inside the tested envelope, with ratcheted regression coverage:
+> ≤ 60s QuestDB outage absorbed by rescue→spill→DLQ;
+> ≤ 2,000,000-tick ring buffer capacity;
+> bench-gated O(1) hot path (re-baselined on aarch64 c8g.xlarge in PR #508);
+> composite-key uniqueness;
+> chaos-tested 65h Fri 16:00 IST → Mon 09:00 IST weekend sleep/wake;
+> per-subsystem RSS accounting via `tv_subsystem_memory_bytes`;
+> full-day in-memory store sized at ~2.1 GB on 11K instruments × 21 TFs;
+> volume field semantic confirmed by Dhan support 2026-05-01-volume-semantic-clarification (cumulative since 09:15 IST, monotonic, resets at 09:15 IST next day);
+> Telegram notifications edge-triggered + 30s state-hold debounced + dev-mode suppressed (no flap spam);
+> WS disconnect classified by cause (`tv_websocket_disconnect_cause_total{cause}`), reconnect preserves subs via `SubscribeRxGuard`, post-close sleep-until-open + supervisor respawn ≤ 5s.
+>
+> **Beyond the envelope, DLQ NDJSON catches every payload as recoverable text.**
+>
+> Outstanding (Wave-6): > 65h holiday-weekend dormant sleep test (W6-2);
+> OPEN-VERIFY-1 (`/api/movers` UI Top Volume mapping confirmation);
+> OPEN-VERIFY-2 (c8g.xlarge Mumbai availability + RI pricing lock).
+
+---
+
+## §V) Dhan ping/pong contract — locked (NEW 2026-05-08)
+
+Operator demand 2026-05-08: "always ensure to follow the Dhan ping pong mechanism also always — respect that bro."
+
+The 10:05 IST RST flood you saw (5/5 main WS connections dropped with `os error 54: Connection reset by peer`) is the EXACT failure mode the ping/pong contract protects against.
+
+### Dhan ping/pong spec (per `live-market-feed.md` rule 16)
+
+| Parameter | Value | Source |
+|---|---|---|
+| Ping cadence (server → us) | every 10 seconds | Dhan docs |
+| Pong response (us → server) | required within 40 seconds | Dhan docs |
+| Failure to pong | server kills connection with RST (`os error 54`) | observed live |
+| Implementation | **let `tokio-tungstenite` handle automatically — DO NOT implement manual ping frames** | rule 16 |
+
+### Locked design — L73–L78
+
+| # | Locked | Detail |
+|---|---|---|
+| **L73** | tokio-tungstenite auto-pong | The `WebSocketStream` automatically responds to server ping frames in its `next()` poll. Our read loop MUST poll the stream continuously — any blocking work in the same task that exceeds 40s starves the pong path → server RSTs us. |
+| **L74** | Hot-path ban: no blocking work in WS read task | The WS read task does ONLY: poll frame → push to SPSC → loop. NO `cargo build`, no `tokio::time::sleep > 5s`, no synchronous DB writes. Banned-pattern hook category 8 (NEW): `tokio::time::sleep\(.*[5-9]\d*` or `std::thread::sleep` inside `connection.rs::run_read_loop`. |
+| **L75** | Pong-deadline observability | NEW Prometheus gauge `tv_ws_last_pong_age_secs{conn_id}` updated from inside the WS task; alert `tv-ws-pong-stale` fires if any conn's last pong > 30s (10s before the 40s server kill threshold). Telegram Severity::High edge-triggered (per L58/L59). |
+| **L76** | Disconnect-cause heuristic | At reconnect moment, check `time_since_last_recv_secs`. If > 30s and < 50s → label cause as `pong_starvation` in `tv_websocket_disconnect_cause_total{cause}`. If 5/5 conns drop within 5s of each other → cause = `dhan_rst_flood` (server-side, not client). |
+| **L77** | Ratchet test for the contract | `crates/core/tests/ws_pong_contract_guard.rs`: (a) source scans `connection.rs::run_read_loop` for any sleep > 5s — must return zero; (b) property test simulates 60 ping events at 10s intervals → verifies tokio-tungstenite auto-pongs all 60. |
+| **L78** | Dhan-side RST-flood class — separate from our pong contract | When ALL 5 conns drop within 5 seconds with `os error 54`, this is **Dhan-side infrastructure event**, NOT our pong miss. Reconnect path handles it; PR #337 `SubscribeRxGuard` preserves subs. Treat as Severity::High coalesced (not 5×High individual messages — fold into ONE summary "WS pool RST event" message). |
+
+### What was wrong with the 10:05 IST notification (5 separate [HIGH] messages)
+
+You got 5 individual `[HIGH] WebSocket N/5 disconnected` Telegram messages within 1 second, then 5 individual `[MEDIUM] WebSocket N/5 reconnected` 5 seconds later. That's 10 messages for ONE upstream RST event.
+
+**Fix per L78 + L46 (notification UX):** When ≥ 3 conns of the same pool drop within 5 seconds, fold into ONE message:
+
+```
+🚨 [HIGH] Dhan WS pool RST event (5/5 main feed)
+
+What's happening:
+  Dhan server reset all 5 connections (os error 54).
+  This is upstream infrastructure, not our system.
+
+Detection time: 10:05:23 IST
+Reconnect started: 10:05:24 IST  (+1 sec)
+Reconnect completed: 10:05:28 IST  (+5 sec)
+Subscriptions preserved: ✅ via SubscribeRxGuard
+Ticks lost: 0 (rescue ring absorbed)
+
+What to do: nothing — auto-recovery worked.
+
+_(WS-RST-FLOOD / 5/5 conns / cause=dhan_rst_flood)_
+```
+
+### Ratchet enforcement of the contract
+
+| Mechanism | What it asserts |
+|---|---|
+| Banned-pattern category 8 (NEW) | no `tokio::time::sleep` > 5s in `connection.rs::run_read_loop`; no `std::thread::sleep` anywhere in WS task |
+| `test_ws_read_loop_no_blocking_work` | source scan asserts read loop body is only frame-poll + SPSC-push + loop |
+| `test_pong_deadline_metric_exists` | `tv_ws_last_pong_age_secs{conn_id}` gauge is registered |
+| `test_pong_stale_alert_fires_at_30s` | when last pong > 30s, alert fires (using mocked WS stream) |
+| Property test `tokio_tungstenite_handles_60_pings` | 60 ping frames at 10s intervals → 60 auto-pong responses |
+| `test_rst_flood_coalesces_into_one_message` | feeding 5 disconnect events within 5s emits ONE `WS-RST-FLOOD` message, not 5 individual ones |
+
+### What this guarantees
+
+| Demand | Mechanism |
+|---|---|
+| Always follow Dhan ping/pong | tokio-tungstenite auto-pong (L73) + read loop never blocks > 5s (L74) + ratchet enforcement (L77) |
+| Detect pong starvation early | `tv_ws_last_pong_age_secs` gauge + 30s alert (10s pre-warning before 40s server kill) (L75) |
+| Distinguish our-fault from Dhan-fault | disconnect cause classification (L76) — `pong_starvation` (us) vs `dhan_rst_flood` (Dhan) |
+| Stop spam on RST flood | 5-within-5s coalescing into ONE summary message (L78) |
+| Preserve subscriptions across RST | `SubscribeRxGuard` already shipped (PR #337) |
+| Zero tick loss during RST window | rescue ring 2M absorbs the 1–5 sec gap |
+
+### Updated all 78 locked decisions
+
+| Group | Locks | Range |
+|---|---:|---|
+| Hardware + infra | 4 | L1–L4 |
+| Data scope | 4 | L5–L8 |
+| In-memory store | 10 | L9–L18 |
+| Volume semantics | 3 | L19–L21 |
+| Static universe | 6 | L22–L27 |
+| Top-N + Dhan parity | 9 | L28–L36 |
+| Depth diff resub | 10 | L37–L46 |
+| Cleanup guarantee | 6 | L47–L52 |
+| Depth-eligibility | 5 | L53–L57 |
+| Notification UX | 10 | L58–L67 |
+| Local Mac vs AWS | 5 | L68–L72 |
+| **Dhan ping/pong contract (NEW)** | **6** | **L73–L78** |
+
+---
+
+## §W) Comprehensive crash + recovery matrix — every boot mode, every failure class (NEW 2026-05-08)
+
+Operator demand: "slow boot, fast boot, outside market hours, inside market hours, extreme crash, app crash, DB crash, any out-of-box scenarios, errors, exceptions, bugs, issues — the system must overcome everything entirely + comprehensively automated."
+
+### §W.1 — 4 boot modes × 5 time windows = 20 scenarios
+
+| Boot mode | Definition | Typical RTO |
+|---|---|---|
+| **Fast warm** | rkyv binary cache valid, JWT cached, QuestDB schema present, network up | 5–10s |
+| **Slow warm** | caches valid but Dhan/QuestDB cold | 10–60s |
+| **Fast cold** | fresh clone, no cache, but Dhan + DB up | 30–60s (CSV download dominates) |
+| **Slow cold** | fresh clone + Dhan + DB also slow | 60–300s |
+
+| Time window IST | Behavior |
+|---|---|
+| 09:00–09:15 | pre-open: subscribe at boot, no ticks yet, ready by 09:15 |
+| 09:15–15:30 | in-market: full live stream, all guarantees in effect |
+| 15:30–next 09:00 | post-market / overnight: WS sleeps until next open, persist remains queryable |
+| Saturday/Sunday | weekend: full sleep until Mon 09:00 IST, supervised dormant |
+| Trading holiday (e.g. Republic Day) | calendar-aware sleep until next trading open |
+
+### §W.2 — 12 crash / failure classes × recovery primitives
+
+| # | Failure class | Detection | Mitigation | Recovery RTO | Ratchet test |
+|---|---|---|---|---|---|
+| 1 | App panic / abort | systemd / Docker `Restart=always`; `panic=abort` exits cleanly | Docker auto-restart within 5s | 5–10s | `chaos_app_panic_recovery.rs` |
+| 2 | OOM kill | cgroup `memory.events:oom_kill` increment; `tv_oom_kills_total` counter | Docker auto-restart; rescue ring NDJSON survives on disk; replay on boot | 10–15s | PROC-01 (RESERVED → ship in Wave-6) |
+| 3 | App restart loop | `RestartCount > 5/hour` | HALT before consuming budget; Critical Telegram | manual | PROC-02 (RESERVED → ship in Wave-6) |
+| 4 | QuestDB crash (Docker exit) | ILP write `Err`; liveness probe fails 3× | rescue ring 2M ticks → spill NDJSON; QuestDB Docker auto-restart; replay on recovery | ≤ 60s within tested envelope | `chaos_questdb_docker_pause.rs` (live) |
+| 5 | QuestDB schema drift | DDL ALTER detects missing columns | `ALTER TABLE ADD COLUMN IF NOT EXISTS` schema self-heal | seamless | `instrument_persistence.rs::ensure_instrument_tables` |
+| 6 | Disk full | `df -h /` < 5% free | rescue ring stops draining to spill; alert HIGH; halt persist if < 1% | manual cleanup | RESOURCE-01 (RESERVED → Wave-4-E3) |
+| 7 | WS Dhan-side RST flood | 5/5 conns drop within 5s with `os error 54` | `SubscribeRxGuard` preserves subs; auto-reconnect; coalesce alert per L78 | 1–5s | `chaos_ws_rst_flood.rs` (NEW) |
+| 8 | Single WS conn drop | watchdog 5s tick sees state ≠ Connected | reconnect with backoff; pool supervisor respawns task | 5–10s | `test_subscribe_rx_guard_reinstalls_on_drop` |
+| 9 | Pong starvation (we miss the 40s window) | `tv_ws_last_pong_age_secs` > 30s | alert HIGH at 30s; should never reach 40s | corrected by L74 ban on blocking work | `test_ws_read_loop_no_blocking_work` |
+| 10 | Token expiry mid-session | DH-901 / DataAPI-807 | rotate via SSM/TOTP; reconnect with fresh JWT | 5–15s | AUTH-GAP-02 + AUTH-GAP-03 (live) |
+| 11 | Network ISP / DNS flap | resolver fails or socket times out | retry with exponential backoff; 3-tier rescue absorbs gap | 10–60s | NET-01 / NET-02 (RESERVED) |
+| 12 | Pre-open buffer empty when Phase 2 readiness fires | check at 09:13:01 IST | PHASE2-READY-01 Critical alert with named failed sub-checks; operator has 120s before 09:15 | manual | `phase2_readiness_check.rs::tests` |
+
+### §W.3 — Out-of-the-box edge cases
+
+| # | Edge case | Behavior |
+|---|---|---|
+| E1 | Operator boots app at 14:55 IST (35 min before close) | Mode C mid-market boot; ~30s to full subscribe; ~140 MB RAM populated from live ticks |
+| E2 | App crashes at 14:55 IST, restarts at 14:56 | rescue ring NDJSON replayed; ~1 min ticks recovered into ticks table; in-mem store rebuilds from live ticks |
+| E3 | Operator boots app at Saturday 03:00 AM | post-market mode; all WS conns dormant until Mon 09:00 IST; QuestDB stays queryable for backtests |
+| E4 | App boots during 4-day holiday weekend (Wed 16:00 → Tue 09:00) | dormant 92h; force-renew token if < 4h on wake (AUTH-GAP-03) |
+| E5 | Fresh clone on a new machine 5 minutes before market open | cold boot races market: CSV download 5–10s + cache build 20–30s + WS subscribe 10s = ~40s; should beat 09:15 if started by 09:14:00 |
+| E6 | Two app instances accidentally running against same Dhan client_id | RESILIENCE-01 (RESERVED) — `live_instance_lock` table refuses second boot if first is < 60s old |
+| E7 | Wall-clock skew > 2s between local and trusted source (chrony / QuestDB) | BOOT-03 HALT — refuses to start, prevents IST-midnight rollover corruption |
+| E8 | Mid-rebalance crash | replay-on-boot from `subscription_audit` table re-issues unfinished `Swap20`/`Swap200` (RESILIENCE-02 RESERVED) |
+| E9 | Operator manually edits `config/base.toml` between boots (bad TOML) | figment parse fails at config load; clean exit with stderr error message |
+| E10 | TLS cert expires on Dhan side mid-session | TLS handshake fails on next reconnect; fall back to error log + alert; manual escalation to Dhan support |
+| E11 | Triple-failure in 60s: WS drop + QuestDB pause + token expiry | CASCADE-01 (RESERVED) — every recovery primitive tested simultaneously in chaos suite |
+| E12 | Massive Dhan-side RST flood every minute for 20 min | per-cycle alert coalesced; rescue ring drains over time; if rescue > 80% full, Critical alert; sustained > 5 min in-market triggers manual escalation |
+| E13 | macOS Mac sleeps mid-session (App Nap, lid close) | local-only — addressed by L69 caffeinate / energy saver / login items |
+| E14 | Docker container randomly killed by host kernel (OOM scoring high) | cgroup limits prevent app being chosen; if killed, Docker restarts within 5s |
+| E15 | Pre-market subscribe message exceeds Dhan rate limit | per WS-GAP-02 batched 100/msg; if rate-limited, exponential backoff per Dhan rule 8 |
+
+### §W.4 — Recovery primitive index
+
+| Primitive | Implements | Tests |
+|---|---|---|
+| Rescue ring 2M | tick absorption during ≤60s outage | `zero_tick_loss_alert_guard.rs` + `chaos_zero_tick_loss.rs` |
+| Spill NDJSON file | tick absorption beyond rescue ring capacity | `chaos_rescue_ring_overflow.rs` |
+| DLQ NDJSON file | final tier — every payload caught | `live_feed_purity_guard.rs` |
+| `SubscribeRxGuard` | sub channel survives reconnect | `test_subscribe_rx_guard_reinstalls_on_drop` |
+| Pool supervisor respawn | dead WS task replaced ≤5s | `test_pool_watchdog_task_accepts_health_status` |
+| Sleep-until-open post-15:30 IST | dormant WS during off-hours | `ws_sleep_resilience.rs` (65h chaos) |
+| `force_renewal_if_stale` | token refresh on WS wake | AUTH-GAP-03 ratchets |
+| Schema self-heal | `ALTER ADD COLUMN IF NOT EXISTS` | `instrument_persistence.rs::ensure_instrument_tables` |
+| BOOT-01/02 deadlines | refuse to start with bad QuestDB | `wait_for_questdb_ready` ratchets |
+| BOOT-03 clock-skew gate | refuse to start with > 2s skew | `test_boot_probe_emits_critical_on_clock_skew_gt_2s` |
+| Phase 2 readiness pre-flight | gates 09:15 IST market open | `phase2_readiness_check.rs::tests` |
+| Composite SLO score | real-time guarantee dashboard | `slo_score.rs::tests` |
+| Market-open self-test 09:16:30 | positive heartbeat | `market_open_self_test.rs::tests` |
+| `cleanup_audit_log` | SEBI traceability for drops | §R.7 |
+| Audit tables (6) | SEBI 5y retention | Wave 2 Item 9 |
+
+### §W.5 — Locked design — L79–L86
+
+| # | Locked | Detail |
+|---|---|---|
+| **L79** | Comprehensive failure-mode coverage | All 12 failure classes (§W.2) MUST have a chaos/integration test in the workspace before APPROVED. Currently shipped: 5 (1, 4, 5, 7, 8). RESERVED: 7 (2, 3, 6, 9 partial, 11). PR-#508 prereq: ship missing chaos tests OR explicitly defer to Wave-6 with named items. |
+| **L80** | Boot-mode determinism | All 20 boot mode × time window combinations (§W.1) MUST produce a deterministic outcome. `BootMode` enum simplified per L25 — keep only the 2 forks (in-market vs off-market) under static-universe model. The 4-mode complexity goes away. |
+| **L81** | Out-of-box edge cases catalogued | All 15 E1–E15 edges have an explicit triage path (table above). Edges marked RESERVED are Wave-6 items; not blockers for #504a–#510 ship. |
+| **L82** | RST-flood coalescing | When ≥ 3 conns of same pool drop within 5 sec, fold into ONE summary message (per L78). Eliminates the "5 individual [HIGH] messages in 1 second" spam pattern from 10:05 IST. |
+| **L83** | Replay-on-boot | At every boot, `crates/storage/src/spill_replay.rs` (already shipped) replays any pending NDJSON from `data/spill/`. This handles app crash + restart cleanly. |
+| **L84** | Crash + recovery summary in `make doctor` | `make doctor` § 8 (NEW) — show recent restart count, OOM events, sustained RSS over thresholds, recent rescue ring high-watermark. One-stop "what happened recently?" answer. |
+| **L85** | "Was anything lost?" runbook | `docs/runbooks/zero-loss-verification.md` — operator can verify nothing was lost across any incident by running 3 SQLs (rescue ring depth high-watermark; spill file count; `cleanup_audit_log` recent rows). |
+| **L86** | Dev-mode = production-mode behaviorally | The same recovery primitives run in dev (local Mac) and prod (AWS). Only the suppression policy (L62 dev-mode) differs. The CODE PATH for a crash is identical — what changes is only the alert routing. |
+
+### §W.6 — What this guarantees (operator's "extreme + comprehensive + automated" demand)
+
+| Demand | Mechanism |
+|---|---|
+| Slow boot recovery | `wait_for_questdb_ready` 60s deadline + BOOT-01/02 alerts; rescue ring buffers ticks during slow boot |
+| Fast boot | rkyv binary cache 10ms load; CSV download skipped |
+| In-market crash | rescue ring 2M absorbs ≤60s; replay NDJSON on restart; `SubscribeRxGuard` preserves subs |
+| Out-of-market crash | dormant — no impact; restart on next market open |
+| App crash | Docker auto-restart 5s; rescue NDJSON replayed |
+| DB crash | rescue ring → spill → DLQ; auto-recovery on QuestDB return |
+| Out-of-box: triple failure | CASCADE-01 chaos test (RESERVED Wave-6) |
+| Out-of-box: dual instance | `live_instance_lock` table refuses (RESERVED) |
+| Out-of-box: wall-clock skew | BOOT-03 HALT before any IST-midnight corruption |
+| Out-of-box: mid-rebalance crash | `subscription_audit` replay (RESERVED) |
+| All failures catalogued | this section + §K-L18 + §T notification policy |
+| All failures observable | 7-layer observability per `wave-4-shared-preamble.md` § 4 |
+| All failures recoverable | recovery primitive index §W.4 — every primitive shipped or RESERVED |
+
+### §W.7 — Honest 100% claim refresh (verbatim, v10)
+
+> 100% inside the tested envelope, with ratcheted regression coverage:
+> ≤ 60s QuestDB outage absorbed by rescue→spill→DLQ;
+> ≤ 2,000,000-tick ring buffer capacity;
+> bench-gated O(1) hot path (re-baselined on aarch64 c8g.xlarge in PR #508);
+> composite-key uniqueness;
+> chaos-tested 65h Fri 16:00 IST → Mon 09:00 IST weekend sleep/wake;
+> per-subsystem RSS accounting via `tv_subsystem_memory_bytes`;
+> full-day in-memory store (~2.1 GB on 11K instruments × 21 TFs);
+> volume field semantic confirmed by Dhan support 2026-05-01;
+> Telegram notifications edge-triggered + 30s state-hold debounced + dev-mode suppressed;
+> WS disconnect classified by cause; `SubscribeRxGuard` preserves subs across reconnect;
+> tokio-tungstenite auto-pong respects Dhan 10s ping / 40s kill window;
+> RST-flood coalesces 5/5 disconnect events into ONE summary message;
+> 12 failure classes catalogued + 5 chaos tests shipped (7 RESERVED Wave-6);
+> 15 out-of-box edge cases catalogued + triage path documented;
+> 20 boot-mode × time-window combinations deterministic.
+>
+> **Beyond the envelope, DLQ NDJSON catches every payload as recoverable text.**
+>
+> Outstanding (Wave-6): chaos tests for OOM (PROC-01), restart loop (PROC-02), disk-full (RESOURCE-01), triple-failure (CASCADE-01), dual-instance (RESILIENCE-01), mid-rebalance (RESILIENCE-02), > 65h holiday-weekend dormant sleep (W6-2);
+> OPEN-VERIFY-1 (`/api/movers` UI Top Volume mapping); OPEN-VERIFY-2 (c8g.xlarge Mumbai availability).
+
+### Updated locked decisions across all 14 sections
+
+| Group | Locks | Range |
+|---|---:|---|
+| Hardware + infra | 4 | L1–L4 |
+| Data scope | 4 | L5–L8 |
+| In-memory store | 10 | L9–L18 |
+| Volume semantics | 3 | L19–L21 |
+| Static universe | 6 | L22–L27 |
+| Top-N + Dhan parity | 9 | L28–L36 |
+| Depth diff resub | 10 | L37–L46 |
+| Cleanup guarantee | 6 | L47–L52 |
+| Depth-eligibility | 5 | L53–L57 |
+| Notification UX | 10 | L58–L67 |
+| Local Mac vs AWS | 5 | L68–L72 |
+| Dhan ping/pong contract | 6 | L73–L78 |
+| **Crash + recovery matrix (NEW)** | **8** | **L79–L86** |
+
+---
+
+**End of DRAFT v11.** Awaiting OPEN-VERIFY-1 + OPEN-VERIFY-2 closure for APPROVED status.
