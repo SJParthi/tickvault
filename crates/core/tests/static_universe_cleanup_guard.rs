@@ -44,3 +44,26 @@ fn test_no_pub_mod_live_tick_atm_resolver_in_instrument_mod() {
          (file was deleted in PR #509)."
     );
 }
+
+#[test]
+fn test_preopen_rest_fallback_file_does_not_exist() {
+    let path = workspace_root().join("crates/core/src/instrument/preopen_rest_fallback.rs");
+    assert!(
+        !path.exists(),
+        "preopen_rest_fallback.rs MUST be deleted under indices-only scope (PR #509). \
+         Found at {}. Stock F&O REST fallback is dead — see plan §R.1.",
+        path.display()
+    );
+}
+
+#[test]
+fn test_no_pub_mod_preopen_rest_fallback_in_instrument_mod() {
+    let path = workspace_root().join("crates/core/src/instrument/mod.rs");
+    let src =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {}", path.display(), e));
+    assert!(
+        !src.contains("pub mod preopen_rest_fallback"),
+        "instrument/mod.rs MUST NOT declare `pub mod preopen_rest_fallback` \
+         (file was deleted in PR #509)."
+    );
+}
