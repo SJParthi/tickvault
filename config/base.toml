@@ -437,3 +437,12 @@ list = [
   "1h", "2h", "3h", "4h",
   "1d",
 ]
+
+# Wave-5 in-memory store §K-L10 (PR #504d) — runtime-tunable
+# per-instrument tick storage. The default `per_instrument_capacity`
+# (5_000) covers the busiest contract's daily tick count without
+# forcing a Vec realloc. Operators on lower-volume universes can
+# trim this to save RAM (Linux lazy-page allocation means reserved
+# but unused capacity does not count against RSS).
+[in_mem.tick_storage]
+per_instrument_capacity = 5000

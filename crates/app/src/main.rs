@@ -644,6 +644,49 @@ async fn main() -> Result<()> {
         std::sync::Arc::new(subsystem_memory::SubsystemMemorySampler::new(
             std::sync::Arc::clone(&subsystem_memory_handles),
         ));
+
+    // L10 (Wave-5 #504d): construct the in-RAM tick ring. Per
+    // `[in_mem.tick_storage].per_instrument_capacity` config (default
+    // 5_000), each new (security_id, segment) key reserves that many
+    // tick slots on first push so steady-state pushes hit the
+    // no-realloc path.
+    let tick_storage = std::sync::Arc::new(tickvault_trading::in_mem::TickStorage::new(
+        config.in_mem.tick_storage.per_instrument_capacity,
+    ));
+
+    // L18 / #504a contract: register the `tick_storage` source closure
+    // with the subsystem_memory sampler. The sampler runs every 10s and
+    // calls `estimated_bytes()` to update
+    // `tv_subsystem_memory_estimated_bytes{component="tick_storage"}`.
+    {
+        let storage_for_sampler = std::sync::Arc::clone(&tick_storage);
+        if let Err(err) = subsystem_memory_sampler.register_source("tick_storage", move || {
+            // L18: lazy `len() x size_of` — NOT raw RSS. Reports actual
+            // resident bytes (Linux lazy-page allocation excludes
+            // reserved-but-unused Vec capacity).
+            #[allow(clippy::cast_precision_loss)]
+            // APPROVED: byte count fits f64 mantissa for any realistic universe
+            Some(storage_for_sampler.estimated_bytes() as f64)
+        }) {
+            tracing::error!(
+                err,
+                "L18 / #504a: failed to register tick_storage memory source — \
+                 component gauge will stay NaN; investigate the subsystem_memory \
+                 sampler state"
+            );
+        }
+    }
+
+    // L10 reset task: drain the tick ring at IST 09:15 daily so day-N
+    // ticks never bleed into day-(N+1)'s session. Sleep-based, not
+    // poll-based — audit-findings Rule 3 (market-hours-aware tokio task).
+    let _tick_storage_reset_join = {
+        let storage_for_reset = std::sync::Arc::clone(&tick_storage);
+        tokio::spawn(async move {
+            tickvault_trading::in_mem::run_tick_storage_daily_reset(storage_for_reset).await;
+        })
+    };
+
     let _subsystem_memory_sampler_join = std::sync::Arc::clone(&subsystem_memory_sampler).spawn();
 
     // -----------------------------------------------------------------------
@@ -2700,6 +2743,26 @@ async fn main() -> Result<()> {
         });
         info!(
             "29-tf candle cascade started: 1s engine + 28-TF fanout + supervisor + midnight rollover"
+        );
+    }
+
+    // L10 (Wave-5 #504d): tick_storage broadcast consumer. Subscribes
+    // to the same `tick_broadcast_sender` used by the cascade so every
+    // tick lands in the in-RAM ring without coupling the tick_processor
+    // hot path to TickStorage's lock latency.
+    {
+        let tick_storage_rx = tick_broadcast_sender.subscribe();
+        let storage_for_consumer = std::sync::Arc::clone(&tick_storage);
+        tokio::spawn(async move {
+            tickvault_trading::in_mem::run_tick_storage_consumer(
+                tick_storage_rx,
+                storage_for_consumer,
+            )
+            .await;
+        });
+        info!(
+            per_instrument_capacity = config.in_mem.tick_storage.per_instrument_capacity,
+            "L10 tick_storage broadcast consumer spawned + IST 09:15 reset task running"
         );
     }
 
