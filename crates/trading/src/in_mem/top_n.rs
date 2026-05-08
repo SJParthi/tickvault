@@ -524,4 +524,48 @@ mod tests {
         let _price_gainers = Category::PriceGainers;
         let _price_losers = Category::PriceLosers;
     }
+
+    #[test]
+    fn test_sort_by_category_orders_in_place_for_each_category() {
+        // Direct exercise of the `sort_by_category` helper independently
+        // of the filter half. Confirms the per-category comparator
+        // chosen in the match arm is applied to the slice.
+        let mk = |close: f64, oi: i64, vol: i64, oi_pct: f64, close_pct: f64| {
+            let mut b = make_bar(1, 1, close, oi, vol);
+            b.oi_pct_from_prev_day = oi_pct;
+            b.close_pct_from_prev_day = close_pct;
+            b
+        };
+
+        let mut bars = vec![
+            mk(100.0, 10, 1000, 1.0, 5.0),
+            mk(200.0, 30, 5000, 9.0, -3.0),
+            mk(50.0, 20, 2000, -2.0, 7.0),
+        ];
+
+        sort_by_category(&mut bars, Category::HighestOI);
+        assert_eq!(bars[0].oi, 30);
+        assert_eq!(bars[2].oi, 10);
+
+        sort_by_category(&mut bars, Category::TopVolume);
+        assert_eq!(bars[0].volume_cum_day_at_end, 5000);
+
+        sort_by_category(&mut bars, Category::OIGainers);
+        assert_eq!(bars[0].oi_pct_from_prev_day, 9.0);
+
+        sort_by_category(&mut bars, Category::OILosers);
+        assert_eq!(bars[0].oi_pct_from_prev_day, -2.0);
+
+        sort_by_category(&mut bars, Category::PriceGainers);
+        assert_eq!(bars[0].close_pct_from_prev_day, 7.0);
+
+        sort_by_category(&mut bars, Category::PriceLosers);
+        assert_eq!(bars[0].close_pct_from_prev_day, -3.0);
+
+        sort_by_category(&mut bars, Category::TopValue);
+        assert!(
+            bars[0].close * (bars[0].volume_cum_day_at_end as f64)
+                >= bars[1].close * (bars[1].volume_cum_day_at_end as f64)
+        );
+    }
 }
