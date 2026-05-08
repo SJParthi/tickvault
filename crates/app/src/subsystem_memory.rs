@@ -449,12 +449,22 @@ mod tests {
     // ownership / type shape, not the wire-level emit.
 
     #[test]
-    fn handles_register_initializes_all_21_tf_eviction_counters() {
+    fn handles_register_initializes_all_9_tf_eviction_counters() {
+        // PR #517 (Wave-5 TF reduction, 2026-05-08) reduced the
+        // operator-facing TF set from 21 → 9. The assertion mirrors
+        // `Tf::ALL.len()` so any future symmetric resize (per
+        // `tf_symmetry_guard`) doesn't silently drift.
         let h = SubsystemMemoryHandles::register();
         assert_eq!(
             h.eviction_counters.len(),
-            21,
+            Tf::ALL.len(),
             "BUG-L13: every TF must be pre-warmed at boot"
+        );
+        assert_eq!(
+            Tf::ALL.len(),
+            9,
+            "PR #517 pinned the operator-facing TF count at 9; \
+             a drift here is a `tf_symmetry_guard` regression."
         );
         for tf in Tf::ALL {
             assert!(
