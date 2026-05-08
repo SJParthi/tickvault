@@ -110,19 +110,7 @@ pub const ALLOWED_SUBSYSTEM_COMPONENTS: &[&str] = &[
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Tf {
     M1,
-    M2,
-    M3,
-    M4,
     M5,
-    M6,
-    M7,
-    M8,
-    M9,
-    M10,
-    M11,
-    M12,
-    M13,
-    M14,
     M15,
     M30,
     H1,
@@ -133,23 +121,13 @@ pub enum Tf {
 }
 
 impl Tf {
-    /// All 21 timeframes, ordered ascending. Used by the boot-time
+    /// All 9 timeframes, ordered ascending. PR #517 (Wave-5 TF reduction)
+    /// retired the 12 sub-15-minute non-canonical timeframes
+    /// (M2/M3/M4/M6/M7/M8/M9/M10/M11/M12/M13/M14). Used by the boot-time
     /// counter pre-warm (BUG-L13) and by the cardinality ratchet.
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 9] = [
         Self::M1,
-        Self::M2,
-        Self::M3,
-        Self::M4,
         Self::M5,
-        Self::M6,
-        Self::M7,
-        Self::M8,
-        Self::M9,
-        Self::M10,
-        Self::M11,
-        Self::M12,
-        Self::M13,
-        Self::M14,
         Self::M15,
         Self::M30,
         Self::H1,
@@ -166,19 +144,7 @@ impl Tf {
     pub const fn as_static_str(self) -> &'static str {
         match self {
             Self::M1 => "1m",
-            Self::M2 => "2m",
-            Self::M3 => "3m",
-            Self::M4 => "4m",
             Self::M5 => "5m",
-            Self::M6 => "6m",
-            Self::M7 => "7m",
-            Self::M8 => "8m",
-            Self::M9 => "9m",
-            Self::M10 => "10m",
-            Self::M11 => "11m",
-            Self::M12 => "12m",
-            Self::M13 => "13m",
-            Self::M14 => "14m",
             Self::M15 => "15m",
             Self::M30 => "30m",
             Self::H1 => "1h",
@@ -194,8 +160,8 @@ impl Tf {
 /// Pinned by the ratchet so adding an entry without updating the
 /// enum (or vice versa) fails the build.
 #[must_use]
-pub fn allowed_tf_labels() -> [&'static str; 21] {
-    let mut out: [&'static str; 21] = [""; 21];
+pub fn allowed_tf_labels() -> [&'static str; 9] {
+    let mut out: [&'static str; 9] = [""; 9];
     let mut i = 0;
     while i < Tf::ALL.len() {
         out[i] = Tf::ALL[i].as_static_str();
@@ -283,12 +249,15 @@ mod tests {
     }
 
     #[test]
-    fn tf_enum_has_exactly_21_variants_per_l6() {
-        // L6 (plan): 21 TFs after seconds-engine retirement (L7).
+    fn tf_enum_has_exactly_9_variants_per_pr517() {
+        // PR #517 (Wave-5 TF reduction): 21 → 9 TFs. Retired the 12 sub-15-
+        // minute non-canonical timeframes (M2/M3/M4/M6/M7/M8/M9/M10/M11/
+        // M12/M13/M14). The active ladder is now 1m / 5m / 15m / 30m /
+        // 1h / 2h / 3h / 4h / 1d.
         assert_eq!(
             Tf::ALL.len(),
-            21,
-            "L6 pins 21 timeframes — seconds engines (L7) were retired."
+            9,
+            "PR #517 pins 9 timeframes after the sub-15m retirement."
         );
     }
 
@@ -298,33 +267,36 @@ mod tests {
         for tf in Tf::ALL {
             assert!(set.insert(tf.as_static_str()), "duplicate TF label");
         }
-        assert_eq!(set.len(), 21);
+        assert_eq!(set.len(), 9);
     }
 
     #[test]
     fn tf_static_str_values_are_canonical_pinned_set() {
-        // L128 ratchet — pin the EXACT set so an unsanctioned addition
-        // (e.g. someone re-introduces "30s") fails this test.
-        let expected: HashSet<&'static str> = [
-            "1m", "2m", "3m", "4m", "5m", "6m", "7m", "8m", "9m", "10m", "11m", "12m", "13m",
-            "14m", "15m", "30m", "1h", "2h", "3h", "4h", "1d",
-        ]
-        .into_iter()
-        .collect();
+        // PR #517 ratchet — pin the EXACT set so an unsanctioned addition
+        // (e.g. someone re-introduces "2m" or "30s") fails this test.
+        let expected: HashSet<&'static str> =
+            ["1m", "5m", "15m", "30m", "1h", "2h", "3h", "4h", "1d"]
+                .into_iter()
+                .collect();
         let actual: HashSet<&'static str> = allowed_tf_labels().into_iter().collect();
-        assert_eq!(actual, expected, "L128: TF label set drifted");
+        assert_eq!(actual, expected, "PR #517: TF label set drifted");
     }
 
     #[test]
-    fn tf_seconds_engines_are_banned_per_l7() {
-        // L7 explicitly retired 1s/3s/5s/10s/15s/30s. The ratchet
-        // ensures none of those ever sneak back in.
-        for banned in ["1s", "3s", "5s", "10s", "15s", "30s"] {
+    fn tf_retired_engines_are_banned() {
+        // L7 retired 1s/3s/5s/10s/15s/30s. PR #517 retired 2m/3m/4m/6m/7m/
+        // 8m/9m/10m/11m/12m/13m/14m. The ratchet ensures none ever sneak
+        // back in.
+        for banned in [
+            "1s", "3s", "5s", "10s", "15s", "30s", "2m", "3m", "4m", "6m", "7m", "8m", "9m", "10m",
+            "11m", "12m", "13m", "14m",
+        ] {
             for &allowed in &allowed_tf_labels() {
                 assert_ne!(
                     allowed, banned,
-                    "L7: seconds-resolution timeframe {banned} is RETIRED — \
-                     do not re-introduce."
+                    "Retired timeframe {banned} MUST NOT reappear — re-add via \
+                     coordinated PR (config + cascade engine + matview DDL + \
+                     enum + symmetry ratchet)."
                 );
             }
         }
