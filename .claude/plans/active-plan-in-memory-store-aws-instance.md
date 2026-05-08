@@ -1,6 +1,6 @@
 # Design Plan: In-Memory Store (§17) + AWS Instance Re-evaluation (§18 v2)
 
-**Status:** DRAFT v13 — 120 design decisions LOCKED 2026-05-08 (L1-L120 across 17 sections). 2 open verification gates (OPEN-VERIFY-1, OPEN-VERIFY-2). c8g.xlarge ONLY. All discussion topics now have explicit plan coverage. No implementation contract until both gates close + operator approves all sections -> APPROVED status.
+**Status:** APPROVED v1 — 120 design decisions LOCKED 2026-05-08 (L1-L120 across 17 sections). Operator approval 2026-05-08 "go ahead dude". c8g.xlarge ONLY. Implementation begins with PR #504a (observability prereq). 2 open verification gates remain in parallel: OPEN-VERIFY-1 (auto-closing via L107 09:14 IST cron over 5 trading days) and OPEN-VERIFY-2 (operator-side aws ec2 describe-instance-types verify).
 **Date:** 2026-05-07
 **Authors:** Parthiban (architect), Claude (builder)
 **Branch:** to-be-created on operator approval
