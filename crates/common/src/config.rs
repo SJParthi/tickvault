@@ -117,8 +117,8 @@ impl Default for TickStorageConfig {
 /// "TF list source" to `config/base.toml`, so this struct exists to
 /// give downstream code a stable handle to the configured set without
 /// duplicating it in code (`tickvault_app::metrics_catalog::Tf::ALL`
-/// already enumerates the 21 TFs at compile time; this section pins the
-/// runtime override / documentation surface).
+/// already enumerates the 9 TFs at compile time post PR #517; this
+/// section pins the runtime override / documentation surface).
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct EngineConfig {
     #[serde(default)]
@@ -127,14 +127,17 @@ pub struct EngineConfig {
 
 /// Wave-5 §K-L6 / L7 / L8 — the canonical list of operator-facing
 /// timeframes driven by the in-memory `CascadeFanout`. The default
-/// matches `tickvault_app::metrics_catalog::Tf::ALL` exactly (21 entries,
-/// no seconds-resolution engines).
+/// matches `tickvault_app::metrics_catalog::Tf::ALL` exactly (9 entries
+/// post PR #517, no seconds-resolution engines, no sub-15m engines
+/// other than 1m + 5m).
 #[derive(Debug, Clone, Deserialize)]
 pub struct TimeframesConfig {
-    /// 21 entries by default per L6: 1m..15m + 30m + 1h..4h + 1d.
+    /// 9 entries by default per PR #517: 1m + 5m + 15m + 30m + 1h..4h + 1d.
     /// Operator may override per environment but the ratchet
     /// `test_engine_timeframes_default_excludes_seconds` blocks any
-    /// re-introduction of the seconds-level engines (L7).
+    /// re-introduction of the seconds-level engines (L7), and the
+    /// `tf_symmetry_guard` blocks any re-introduction of the 12 sub-15m
+    /// timeframes retired by PR #517.
     #[serde(default = "TimeframesConfig::default_list")]
     pub list: Vec<String>,
 }
@@ -148,28 +151,17 @@ impl Default for TimeframesConfig {
 }
 
 impl TimeframesConfig {
-    /// L6 — 21 timeframes, ordered ascending. Mirrors the compile-time
-    /// `tickvault_app::metrics_catalog::Tf::ALL` list shipped in #504a
-    /// (the catalog stays the wire-format source of truth; this list
-    /// is the runtime-tunable mirror for documentation + future config
-    /// overrides).
+    /// PR #517 — 9 timeframes, ordered ascending. Mirrors the compile-time
+    /// `tickvault_app::metrics_catalog::Tf::ALL` list (the catalog stays
+    /// the wire-format source of truth; this list is the runtime-tunable
+    /// mirror for documentation + future config overrides). PR #517
+    /// retired the 12 sub-15m timeframes (2m..14m) — they are blocked
+    /// from re-introduction by `tf_symmetry_guard`.
     #[must_use]
     pub fn default_list() -> Vec<String> {
         vec![
             "1m".to_string(),
-            "2m".to_string(),
-            "3m".to_string(),
-            "4m".to_string(),
             "5m".to_string(),
-            "6m".to_string(),
-            "7m".to_string(),
-            "8m".to_string(),
-            "9m".to_string(),
-            "10m".to_string(),
-            "11m".to_string(),
-            "12m".to_string(),
-            "13m".to_string(),
-            "14m".to_string(),
             "15m".to_string(),
             "30m".to_string(),
             "1h".to_string(),
@@ -2551,12 +2543,12 @@ mod tests {
     // --- Wave-5 §K-L6/L7/L8 (PR #504c) ratchets -----------------------
 
     #[test]
-    fn test_engine_timeframes_default_is_21_entries_per_l6() {
+    fn test_engine_timeframes_default_is_9_entries_per_pr517() {
         let cfg = TimeframesConfig::default();
         assert_eq!(
             cfg.list.len(),
-            21,
-            "L6 pins 21 timeframes — drift in the runtime list \
+            9,
+            "PR #517 pins 9 timeframes (was 21 in L6) — drift in the runtime list \
              would silently desync from `metrics_catalog::Tf::ALL`."
         );
     }
@@ -2575,14 +2567,11 @@ mod tests {
 
     #[test]
     fn test_engine_timeframes_default_matches_canonical_set() {
-        // Exact-match the L6 list so a future commit cannot silently
-        // re-order or substitute a TF.
+        // Exact-match the PR #517 list so a future commit cannot
+        // silently re-order or substitute a TF.
         let cfg = TimeframesConfig::default();
-        let expected: Vec<&str> = vec![
-            "1m", "2m", "3m", "4m", "5m", "6m", "7m", "8m", "9m", "10m", "11m", "12m", "13m",
-            "14m", "15m", "30m", "1h", "2h", "3h", "4h", "1d",
-        ];
-        assert_eq!(cfg.list, expected, "L6 timeframe list drifted");
+        let expected: Vec<&str> = vec!["1m", "5m", "15m", "30m", "1h", "2h", "3h", "4h", "1d"];
+        assert_eq!(cfg.list, expected, "PR #517 timeframe list drifted");
     }
 
     #[test]
@@ -2597,9 +2586,9 @@ mod tests {
     }
 
     #[test]
-    fn test_engine_config_default_inherits_l6_timeframes() {
+    fn test_engine_config_default_inherits_pr517_timeframes() {
         let engine = EngineConfig::default();
-        assert_eq!(engine.timeframes.list.len(), 21);
+        assert_eq!(engine.timeframes.list.len(), 9);
         assert!(!engine.timeframes.contains_seconds_tf());
     }
 
