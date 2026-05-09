@@ -1328,17 +1328,12 @@ async fn stress_market_depth_500_rows() {
 // 5. MATERIALIZED VIEW EXISTENCE — all 18 views queryable
 // =========================================================================
 
-/// All materialized view names that must exist.
+/// All materialized view names that must exist. Mirrors the 9-TF
+/// canonical set in `tickvault_app::metrics_catalog::Tf::ALL` after the
+/// 2026-05-09 TF-reduction follow-up to PR #517 (28→16→9 over two PRs).
 const MATERIALIZED_VIEWS: &[&str] = &[
-    "candles_5s",
-    "candles_10s",
-    "candles_15s",
-    "candles_30s",
     "candles_1m",
-    "candles_2m",
-    "candles_3m",
     "candles_5m",
-    "candles_10m",
     "candles_15m",
     "candles_30m",
     "candles_1h",
@@ -1346,8 +1341,6 @@ const MATERIALIZED_VIEWS: &[&str] = &[
     "candles_3h",
     "candles_4h",
     "candles_1d",
-    "candles_7d",
-    "candles_1M",
 ];
 
 #[tokio::test]
