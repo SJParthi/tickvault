@@ -1,6 +1,6 @@
 # Implementation Plan: Wave-1-3 Live Hotfixes (4 bugs caught at 12:49 IST 2026-04-28)
 
-**Status:** PARTIALLY-VERIFIED (items 1-5, 6, 7, 9, 10 shipped; item 8 Docker/Grafana deferred to follow-up commit)
+**Status:** VERIFIED (items 1-7, 9, 10 shipped; item 8 CANCELLED 2026-05-09 — superseded by Rust depth-200 path after Dhan ticket #5610706)
 **Date:** 2026-04-28
 **Approved by:** Parthiban (operator) — verbatim "fix everything"
 **Branch:** `claude/verify-waves-status-HQP6A`
@@ -58,13 +58,19 @@
   - Tests: test_counters_increment_on_frame_parse
   - Tests: test_state_version_gauge_tracks_reloads
 
-- [ ] **8. Docker compose service + Grafana panel + Prometheus alert rule for the bridge**
-  - Files: deploy/docker/docker-compose.yml
-  - Files: deploy/docker/prometheus/alerts.yml
-  - Files: deploy/docker/prometheus/prometheus.yml
-  - Files: deploy/docker/grafana/dashboards/depth-200-bridge.json
-  - Tests: test_alerts_yml_contains_depth_200_bridge_rules
-  - Tests: test_prometheus_yml_scrapes_depth_200_bridge
+- [x] **8. Docker compose service + Grafana panel + Prometheus alert rule for the bridge — CANCELLED 2026-05-09**
+  - Status: SUPERSEDED. Per Dhan ticket #5610706 (2026-05-02) the SELF-only
+    token gate that caused TCP resets on concurrent depth-200 subscribes was
+    removed. The Rust depth-200 client now streams cleanly using the shared
+    TOTP/APP token; boot-time verification via the `DEPTH200-SMOKE-01`
+    ratchet (`crates/app/src/boot_smoke_test.rs`) confirms frame arrival
+    within 60 s and alerts if it ever regresses.
+  - The Python sidecar (`scripts/depth_200_bridge.py`) is retained as a
+    manual-only fallback. Header in `scripts/depth_200_bridge_README.md`
+    flags it as legacy / not-wired. No Docker / Prometheus / Grafana
+    wiring will be added.
+  - Operator approval: 2026-05-09 — "go ahead with our rust approach
+    itself as dhan stated as of now since the jwt will work".
 
 - [x] **9. Disk-full pre-flight check before tick spill writes** (closes single highest-risk hole in zero-loss chain)
   - Files: crates/storage/src/tick_persistence.rs
