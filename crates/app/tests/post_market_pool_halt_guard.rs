@@ -154,11 +154,19 @@ fn boot_deadline_alert_is_market_hours_gated() {
     // surrounding context comment).
     let window_start = timeout_idx.saturating_sub(800);
     let window = &src[window_start..timeout_idx];
+    // Wave-Holiday-Gate (2026-05-09) upgraded the call to
+    // `is_within_trading_session_ist()` which folds in the weekend
+    // check. Either gate satisfies the ratchet — what matters is that
+    // SOME market-hours/trading-session check sits in front of the
+    // CRITICAL `error!` so off-hours boots don't page.
     assert!(
-        window.contains("is_within_market_hours_ist()"),
+        window.contains("is_within_market_hours_ist()")
+            || window.contains("is_within_trading_session_ist()"),
         "boot deadline alert must be market-hours gated. The 120s budget \
          is the wrong yardstick for a post-market operator-test boot \
-         (index LTPs never arrive after 15:30 IST). Window scanned:\n{window}"
+         (index LTPs never arrive after 15:30 IST). Expected one of \
+         `is_within_market_hours_ist()` or `is_within_trading_session_ist()` \
+         in the window. Window scanned:\n{window}"
     );
     assert!(
         window.contains("in_market_hours"),
