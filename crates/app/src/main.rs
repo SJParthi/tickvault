@@ -2873,17 +2873,16 @@ async fn main() -> Result<()> {
         // for every NSE row from tomorrow's run until a follow-up PR
         // migrates that query to a non-movers source. Operator has
         // explicitly opted into this trade-off ("skip bhavcopy").
-        if let Some(registry) = slow_registry.as_ref() {
-            // PR #454 (2026-05-03): boot-time prev_oi cache loader.
-            // PR #456 (2026-05-04): boot calls the OVERLAY variant
-            // which runs bhavcopy first, then layers Dhan-canonical
-            // Option Chain `previous_oi` for NIFTY/BANKNIFTY/SENSEX
-            // on top (last-wins). The cache is consumed by the
-            // F2 PrevDayCache loader below + the tick enricher.
+        if let Some(_registry) = slow_registry.as_ref() {
+            // 2026-05-09: prev_oi loader simplified to overlay-only.
+            // Wave-5 indices-only scope subscribes only NIFTY /
+            // BANKNIFTY / SENSEX derivatives — exactly the 3
+            // underlyings the Option Chain REST overlay covers. The
+            // bhavcopy fetch + macOS `unzip` shell-out (recurring
+            // PREVOI-01 broken-pipe failures on macOS Info-ZIP 6.00)
+            // is retired per operator directive.
             let prev_oi_cache =
                 tickvault_app::prev_oi_loader::load_prev_oi_cache_at_boot_with_overlay(
-                    registry,
-                    trading_calendar.as_ref(),
                     token_handle.clone(),
                     ws_client_id.clone(),
                     config.dhan.rest_api_base_url.clone(),
@@ -2893,14 +2892,15 @@ async fn main() -> Result<()> {
                 warn!(
                     code = tickvault_common::error_code::ErrorCode::PrevOi01CacheEmptyAtBoot
                         .code_str(),
-                    "prev_oi cache EMPTY at boot — downstream consumers will see \
-                     `current_OI - 0 = current_OI` until next boot succeeds in \
-                     fetching yesterday's NSE bhavcopy."
+                    "prev_oi cache EMPTY at boot — Option Chain overlay returned \
+                     zero entries for NIFTY/BANKNIFTY/SENSEX; downstream consumers \
+                     will see `current_OI - 0 = current_OI` until next boot."
                 );
             } else {
                 info!(
                     cache_size = prev_oi_cache.len(),
-                    "prev_oi cache populated — downstream OI Change is Dhan-precise"
+                    "prev_oi cache populated via Option Chain overlay — \
+                     downstream OI Change is Dhan-precise"
                 );
             }
             // F2 (Wave-5 §K-L13 / #504e follow-up): populate the
@@ -7745,6 +7745,19 @@ async fn emit_websocket_connected_alerts(
             per_connection,
             boot_path,
             boot_wall_clock_secs,
+        });
+    } else if !tickvault_common::market_hours::is_within_market_hours_ist() {
+        // 2026-05-09: off-hours boot — non-connected slots are
+        // expected (Deferred). Dhan resets idle pre-/post-market
+        // sockets, so the WebSocket pool intentionally waits until
+        // the next 09:00 IST. Route to Severity::Low so the operator
+        // gets a single ✅ ping instead of the false `[HIGH] 0/N
+        // feeds connected (N stuck)` alarm.
+        let deferred = total.saturating_sub(connected_count);
+        notifier.notify(NotificationEvent::WebSocketPoolDeferredOffHours {
+            deferred,
+            total,
+            boot_path,
         });
     } else {
         notifier.notify(NotificationEvent::WebSocketPoolPartialAfterDeadline {
