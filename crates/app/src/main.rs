@@ -1451,12 +1451,11 @@ async fn main() -> Result<()> {
                     movers,
                     snapshot_handle,
                     greeks_enricher,
-                    // Phase 4b (2026-05-05): stock_movers_writer +
-                    // option_movers_writer params DELETED from
-                    // run_tick_processor. Movers persistence is now
-                    // exclusively the unified MoversWriter
-                    // (movers_1s + 25 mat views) populated by
-                    // movers_pipeline.
+                    // 2026-05-09 PR 5c.5-final: movers infrastructure
+                    // RETIRED — `movers_1s` base + 25 matviews dropped,
+                    // `MoversWriter` / `movers_pipeline` deleted.
+                    // Operator directive: "only ticks and our 9 needed
+                    // candle timeframes are available".
                     None, // option_movers — created in slow boot only
                     fast_registry,
                     Some(fast_tick_heartbeat),
@@ -2221,20 +2220,12 @@ async fn main() -> Result<()> {
         tickvault_storage::constituency_persistence::ensure_constituency_table(&config.questdb),
         tickvault_storage::materialized_views::ensure_candle_views(&config.questdb),
         ensure_greeks_tables(&config.questdb),
-        // Audit-2026-05-03: legacy `ensure_movers_tables` (stock_movers +
-        // option_movers DDL creators) RETIRED — their writers are
-        // disabled (passing None to run_tick_processor) and the tables
-        // are DROPed by `run_one_shot_legacy_retire_migration_2026_05_03`
-        // inside `ensure_movers_tables_and_views` below. Keeping the
-        // CREATE call would race with the DROP migration on every boot.
-        // Wave 5 Item 25 + 27 — single `movers_1s` base table + 24 materialized
-        // views (`movers_{10s..1h}`). Idempotent CREATE-IF-NOT-EXISTS. The DDL
-        // also issues a one-shot DROP for the legacy `movers_22tf_*` tables
-        // (deleted 2026-05-01) and the legacy `movers_unified_*` names (renamed
-        // to `movers_*` 2026-05-01).
-        tickvault_storage::movers_base_persistence::ensure_movers_tables_and_views(
-            &config.questdb,
-        ),
+        // 2026-05-09 PR 5c.5-final (Bug 3 — movers retirement): the
+        // `movers_1s` base table + 25 `movers_*` materialized views are
+        // RETIRED. Operator directive: "only ticks and our 9 needed
+        // candle timeframes are available". The DROP for these objects
+        // now lives in `ensure_candle_views` (Step 4e —
+        // `drop_bug3_retired_views`). No CREATE call here.
         tickvault_storage::indicator_snapshot_persistence::ensure_indicator_snapshot_table(
             &config.questdb
         ),
@@ -2856,14 +2847,11 @@ async fn main() -> Result<()> {
         // O(1) EXEMPT: cold path — build inline Greeks computer once at startup.
         let greeks_enricher = build_inline_greeks_enricher(&config, &subscription_plan);
 
-        // Phase 4b (2026-05-05): legacy `StockMoversWriter` +
-        // `OptionMoversWriter` bindings DELETED. Both writer types
-        // were retired in the 2026-05-03 audit and the underlying
-        // `movers_persistence` module was removed in this PR. The
-        // `run_tick_processor` signature no longer accepts the two
-        // writer params. Movers persistence is exclusively the
-        // unified `MoversWriter` (movers_1s + 25 mat views)
-        // populated by `movers_pipeline`.
+        // 2026-05-09 PR 5c.5-final: movers infrastructure RETIRED.
+        // `MoversWriter` / `movers_pipeline` / `movers_base_persistence`
+        // modules deleted. The in-memory `OptionMoversTracker` /
+        // `TopMoversTracker` are unaffected — they feed the depth-
+        // dynamic cohort selector via `Bar` snapshots, not QuestDB.
         let option_movers_tracker = Some(tickvault_core::pipeline::OptionMoversTracker::new());
 
         // O(1) EXEMPT: cold path — clone registry once for tick processor enrichment.
@@ -2871,40 +2859,27 @@ async fn main() -> Result<()> {
             .as_ref()
             .map(|p| std::sync::Arc::new(p.registry.clone()));
 
-        // PR #450 commit 6 (2026-05-03): V2 movers pipeline DELETED.
-        // Superseded by movers_pipeline (below) which writes
-        // movers_1s + 25 mat views — read via the new unified
-        // /api/movers handler.
-
-        // Wave 5 Item 25/27 Phase B — base-1s writer for `movers_1s`.
-        // ONE task. Subscribes to tick_broadcast, drains in-memory state at
-        // 1Hz, ILP-appends to the base table; QuestDB auto-refreshes the 24
-        // mat views. Market-hours gated. 2026-05-02 PR-B: takes the
-        // instrument registry so the drain loop can populate
-        // `exchange_segment` (precise NSE_FNO/BSE_FNO/NSE_EQ/IDX_I) and
-        // `instrument_type` (precise OPTSTK/FUTIDX/INDEX/EQUITY) on every
-        // row. Skipped if the registry is missing (subscription_plan was
-        // not built — typically a boot path that doesn't load instruments).
-        let movers_base_shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
-        let _movers_base_handle = if let Some(registry) = slow_registry.as_ref() {
+        // 2026-05-09 PR 5c.5-final — movers infrastructure RETIRED.
+        // The `movers_writer` + `movers_base_persistence` modules and
+        // the `movers_pipeline` orchestrator are deleted in this commit.
+        // Operator directive: only `ticks` and the 9 cascade-fed
+        // candle timeframes remain in QuestDB. The block below preserves
+        // the prev_oi / prev_day cache loaders (consumed by the cascade
+        // seal-time pct-stamping path + the tick enricher) but no longer
+        // drives any QuestDB-backed movers writer.
+        //
+        // Operator note: bhavcopy 16:30 IST cross-check (also reads
+        // `movers_1s`) is left intact — it will report `MISSING_OUR`
+        // for every NSE row from tomorrow's run until a follow-up PR
+        // migrates that query to a non-movers source. Operator has
+        // explicitly opted into this trade-off ("skip bhavcopy").
+        if let Some(registry) = slow_registry.as_ref() {
             // PR #454 (2026-05-03): boot-time prev_oi cache loader.
-            // Wires PR #450 commit 3 primitives (bhavcopy fetch + parse
-            // + build_prev_oi_cache_from_bhavcopy) into the boot path.
-            // On success the cache is populated with yesterday's
-            // session-close OI for every NSE F&O contract we subscribe;
-            // /api/movers OI Change column displays Dhan-precise values
-            // from the very first tick. On failure (404, network
-            // timeout, unzip, parse error) the loader returns an empty
-            // cache + emits its own typed `error!` with code
-            // `PREVOI-01` (see prev_oi_loader.rs error sites). The
-            // downstream movers_pipeline then operates with
-            // `current_OI - 0 = current_OI` for OI Change — a
-            // gracefully-degraded fallback rather than a HALT.
             // PR #456 (2026-05-04): boot calls the OVERLAY variant
             // which runs bhavcopy first, then layers Dhan-canonical
             // Option Chain `previous_oi` for NIFTY/BANKNIFTY/SENSEX
-            // on top (last-wins). Total boot cost: ~5-6 min bhavcopy
-            // + ~18s overlay (3 underlyings × 2 calls × 3s rate-limit).
+            // on top (last-wins). The cache is consumed by the
+            // F2 PrevDayCache loader below + the tick enricher.
             let prev_oi_cache =
                 tickvault_app::prev_oi_loader::load_prev_oi_cache_at_boot_with_overlay(
                     registry,
@@ -2915,21 +2890,17 @@ async fn main() -> Result<()> {
                 )
                 .await;
             if prev_oi_cache.is_empty() {
-                // The loader's internal error sites already emitted
-                // PREVOI-01. This WARN at the spawn site documents the
-                // operational consequence — preserved per
-                // audit-findings Rule 11 (no false-OK signals).
                 warn!(
                     code = tickvault_common::error_code::ErrorCode::PrevOi01CacheEmptyAtBoot
                         .code_str(),
-                    "prev_oi cache EMPTY at boot — /api/movers OI Change column \
-                     will display `current_OI - 0 = current_OI` until next boot \
-                     succeeds in fetching yesterday's NSE bhavcopy."
+                    "prev_oi cache EMPTY at boot — downstream consumers will see \
+                     `current_OI - 0 = current_OI` until next boot succeeds in \
+                     fetching yesterday's NSE bhavcopy."
                 );
             } else {
                 info!(
                     cache_size = prev_oi_cache.len(),
-                    "prev_oi cache populated — /api/movers OI Change column is Dhan-precise"
+                    "prev_oi cache populated — downstream OI Change is Dhan-precise"
                 );
             }
             // F2 (Wave-5 §K-L13 / #504e follow-up): populate the
@@ -2939,34 +2910,24 @@ async fn main() -> Result<()> {
             // loaded `prev_oi_cache` (immediately above). Best-effort
             // — on QuestDB unreachable / SELECT failure the loader
             // emits PREVCLOSE-04 and the cascade falls back to 0.0
-            // pct fields per the div-by-zero policy. Spawned as a
-            // detached task so boot continues immediately; the
-            // cascade reads see freshly-populated entries as soon as
-            // the loader inserts them (papaya is concurrent-safe).
-            {
-                let f2_questdb = config.questdb.clone();
-                let f2_cache = std::sync::Arc::clone(&prev_day_cache);
-                let f2_prev_oi = std::sync::Arc::clone(&prev_oi_cache);
-                tokio::spawn(async move {
-                    tickvault_app::prev_day_cache_loader::populate_and_log(
-                        &f2_questdb,
-                        &f2_cache,
-                        &f2_prev_oi,
-                    )
-                    .await;
-                });
-            }
-            Some(tickvault_app::movers_pipeline::spawn_movers_pipeline(
-                config.questdb.clone(),
-                tick_broadcast_sender.clone(),
-                std::sync::Arc::clone(&movers_base_shutdown),
-                std::sync::Arc::clone(registry),
-                prev_oi_cache,
-            ))
+            // pct fields per the div-by-zero policy.
+            let f2_questdb = config.questdb.clone();
+            let f2_cache = std::sync::Arc::clone(&prev_day_cache);
+            let f2_prev_oi = std::sync::Arc::clone(&prev_oi_cache);
+            tokio::spawn(async move {
+                tickvault_app::prev_day_cache_loader::populate_and_log(
+                    &f2_questdb,
+                    &f2_cache,
+                    &f2_prev_oi,
+                )
+                .await;
+            });
         } else {
-            warn!("movers_pipeline NOT spawned — slow_registry is None (subscription_plan absent)");
-            None
-        };
+            warn!(
+                "prev_oi cache loader NOT spawned — slow_registry is None \
+                 (subscription_plan absent)"
+            );
+        }
 
         // Wave 5 Item 26 L2 LIVE — 16:30 IST bhavcopy cross-check task.
         // Post-market only (TradingCalendar gated); reads `movers_1s`
@@ -5101,10 +5062,11 @@ async fn main() -> Result<()> {
             // depth-anchor task needs its own universe handle to look up
             // option chains for ATM strike derivation.
             let depth_anchor_universe = std::sync::Arc::clone(&universe_arc);
-            // Audit-2026-05-03: legacy `preopen_movers_universe` clone
-            // removed — PreopenMoversTracker retired, its phase=PREOPEN
-            // snapshot semantics now live in `movers_1s.phase` populated
-            // by `movers_pipeline`.
+            // 2026-05-09 PR 5c.5-final: movers QuestDB infrastructure
+            // retired. `PreopenMoversTracker` phase=PREOPEN semantics
+            // are no longer materialised to QuestDB; the in-memory
+            // tracker chain still drives in-process depth-dynamic
+            // cohort selection.
             // Wave 5 commit 5: rebalance consumer needs universe to
             // compute single-side ATM ± 24 windows for Swap20 fan-out
             // to NIFTY-CE / NIFTY-PE / BANKNIFTY-CE / BANKNIFTY-PE

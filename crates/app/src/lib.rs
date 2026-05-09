@@ -24,22 +24,23 @@ pub mod depth_dynamic_pipeline;
 pub mod depth_dynamic_pipeline_v2;
 pub mod greeks_pipeline;
 pub mod infra;
-pub mod movers_pipeline;
+// 2026-05-09 PR 5c.5-final (Bug 3 — movers retirement): the
+// `movers_pipeline` orchestrator is DELETED. Operator directive:
+// "only ticks and our 9 needed candle timeframes are available".
+// The 25 `movers_*` matviews + `movers_1s` base table are dropped at
+// boot by `materialized_views::drop_bug3_retired_views`.
 // PR #454 (2026-05-03): boot-time prev_oi cache loader. Wires
-// bhavcopy → cache extraction (PR #450 commit 3 primitives) into
-// the boot path so /api/movers OI Change column is Dhan-precise
-// from the first tick.
+// bhavcopy → cache extraction primitives into the boot path so the
+// in-memory cache (consumed by the cascade seal-time pct-stamping
+// path + tick enricher) is Dhan-precise from the first tick.
 pub mod prev_oi_loader;
 // F2 (Wave-5 #504e follow-up) — boot-time loader for `PrevDayCache`
 // so the cascade seal-time pct-stamping path (PR #520 / F1) sees
 // non-zero `prev_day_close` values from QuestDB's `previous_close`
 // table on cold boot.
-pub mod prev_day_cache_loader;
-// movers_v2_pipeline DELETED in PR #450 commit 6 — V2 in-memory tracker
-// superseded by canonical movers_1s + 25 mat views populated via
-// movers_pipeline.
 pub mod metrics_catalog;
 pub mod observability;
 pub mod phase2_recovery;
+pub mod prev_day_cache_loader;
 pub mod subsystem_memory;
 pub mod trading_pipeline;

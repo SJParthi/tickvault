@@ -53,10 +53,18 @@ use tickvault_core::instrument::bhavcopy_scheduler::{
 };
 use tickvault_core::notification::events::NotificationEvent;
 use tickvault_core::notification::service::NotificationService;
-use tickvault_storage::movers_base_persistence::QUESTDB_TABLE_MOVERS_1S;
 use tickvault_storage::volume_nse_audit_persistence::{
     append_volume_nse_audit_row, ensure_volume_nse_audit_table,
 };
+
+// 2026-05-09 PR 5c.5-final: `movers_1s` table is RETIRED. The bhavcopy
+// 16:30 IST cross-check still references it by string literal so the
+// SELECT continues to compile, but the query will return zero rows
+// from this commit forward (the table is dropped at boot by
+// `drop_bug3_retired_views`). Operator opted into this behaviour
+// ("skip bhavcopy" — accept MISSING_OUR for every NSE row until a
+// follow-up PR migrates this query to a non-movers source).
+const QUESTDB_TABLE_MOVERS_1S: &str = "movers_1s";
 
 /// HTTP timeout for QuestDB EOD volume query — generous since the
 /// SELECT against `movers_1s` filters by 30-min window.

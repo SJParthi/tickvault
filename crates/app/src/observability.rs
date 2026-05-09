@@ -131,10 +131,6 @@ pub fn build_category_targets(cat: LogCategory) -> &'static [&'static str] {
             "tickvault_core::pipeline::movers_window",
             "tickvault_core::pipeline::option_movers",
             "tickvault_core::pipeline::top_movers",
-            "tickvault_storage::movers_persistence",
-            "tickvault_storage::movers_base_persistence",
-            "tickvault_storage::movers_base_query",
-            "tickvault_storage::movers_writer",
         ],
         LogCategory::Candles => &[
             "tickvault_core::pipeline::candle_aggregator",
@@ -1335,15 +1331,15 @@ mod tests {
         // Verified module paths against crates/core/src/pipeline/mod.rs
         // + crates/storage/src/lib.rs on 2026-05-02. Every module that
         // logs movers data MUST be listed.
+        // 2026-05-09 PR 5c.5-final: storage-side movers modules
+        // (`movers_persistence`, `movers_base_persistence`,
+        // `movers_base_query`, `movers_writer`) are DELETED. Only the
+        // in-memory pipeline modules remain.
         let expected = [
             "tickvault_core::pipeline::mover_classifier",
             "tickvault_core::pipeline::movers_window",
             "tickvault_core::pipeline::option_movers",
             "tickvault_core::pipeline::top_movers",
-            "tickvault_storage::movers_persistence",
-            "tickvault_storage::movers_base_persistence",
-            "tickvault_storage::movers_base_query",
-            "tickvault_storage::movers_writer",
         ];
         for e in expected {
             assert!(
