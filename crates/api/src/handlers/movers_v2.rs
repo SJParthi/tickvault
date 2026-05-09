@@ -174,6 +174,18 @@ pub struct MoversV2Bar {
     pub oi: i64,
     pub tick_count: u32,
     pub sealed: bool,
+    /// 2026-05-09 PR 5b1.5 — prev-day reference + seal-time pct
+    /// stamping (added in PR #520 F1). Frontend dashboards expect
+    /// `change_pct` as a single derived field; exposing both
+    /// `prev_day_close` and the pre-computed `close_pct_from_prev_day`
+    /// lets clients render the column without a second QuestDB hop
+    /// for `previous_close` rows. Equivalent fields exist on the
+    /// underlying `Bar`; this is pure additive plumbing.
+    pub prev_day_close: f64,
+    pub prev_day_oi: i64,
+    pub close_pct_from_prev_day: f64,
+    pub oi_pct_from_prev_day: f64,
+    pub volume_pct_from_prev_day: f64,
 }
 
 impl From<&tickvault_trading::candles::Bar> for MoversV2Bar {
@@ -191,6 +203,11 @@ impl From<&tickvault_trading::candles::Bar> for MoversV2Bar {
             oi: bar.oi,
             tick_count: bar.tick_count,
             sealed: bar.sealed,
+            prev_day_close: bar.prev_day_close,
+            prev_day_oi: bar.prev_day_oi,
+            close_pct_from_prev_day: bar.close_pct_from_prev_day,
+            oi_pct_from_prev_day: bar.oi_pct_from_prev_day,
+            volume_pct_from_prev_day: bar.volume_pct_from_prev_day,
         }
     }
 }
@@ -478,6 +495,29 @@ mod tests {
         assert_eq!(v2.volume, bar.volume);
         assert_eq!(v2.tick_count, bar.tick_count);
         assert_eq!(v2.sealed, bar.sealed);
+    }
+
+    /// 2026-05-09 PR 5b1.5 ratchet — prev-day reference + seal-time
+    /// pct fields MUST propagate from `Bar` to `MoversV2Bar`. PR 5b2
+    /// (frontend migration) needs `change_pct` to render the
+    /// gainers/losers % column without a second QuestDB hop for
+    /// `previous_close` rows. The pct fields are computed at
+    /// seal-time by `seal_with_pct` (PR #520 F1) so the API response
+    /// can hand them off untouched.
+    #[test]
+    fn movers_v2_bar_propagates_prev_day_and_pct_fields() {
+        let mut bar = make_sealed_1s_bar(13, 0, 1_000);
+        bar.prev_day_close = 95.0;
+        bar.prev_day_oi = 150;
+        bar.close_pct_from_prev_day = 5.79;
+        bar.oi_pct_from_prev_day = 33.33;
+        bar.volume_pct_from_prev_day = 12.5;
+        let v2 = MoversV2Bar::from(&bar);
+        assert!((v2.prev_day_close - 95.0).abs() < f64::EPSILON);
+        assert_eq!(v2.prev_day_oi, 150);
+        assert!((v2.close_pct_from_prev_day - 5.79).abs() < f64::EPSILON);
+        assert!((v2.oi_pct_from_prev_day - 33.33).abs() < f64::EPSILON);
+        assert!((v2.volume_pct_from_prev_day - 12.5).abs() < f64::EPSILON);
     }
 
     /// 2026-05-09 PR 5b1 ratchet — identity fields MUST propagate
