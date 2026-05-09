@@ -332,8 +332,14 @@ fn no_tick_watchdog_module_exists() {
         src.contains("NO_TICK_THRESHOLD_SECS"),
         "no_tick_watchdog must expose a tuneable threshold constant."
     );
+    // PR #523 (2026-05-09 holiday-gate fix) renamed the helper from
+    // `is_within_market_hours_ist` (time-of-day only) to
+    // `is_within_trading_session_ist` (weekday + time-of-day). Accept either
+    // name so older branches continue to pass; production source must use
+    // the trading-session variant per audit-findings Rule 3.
     assert!(
-        src.contains("is_within_market_hours_ist()"),
+        src.contains("is_within_trading_session_ist()")
+            || src.contains("is_within_market_hours_ist()"),
         "no_tick_watchdog must use the shared market-hours helper \
          (Rule 3) — never poll alerts post-market."
     );

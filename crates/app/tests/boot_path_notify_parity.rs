@@ -74,25 +74,64 @@ fn emit_websocket_connected_alerts_helper_is_defined() {
 }
 
 #[test]
-fn summary_event_emitted_after_per_connection_loop() {
+fn summary_event_emitted_inside_helper() {
+    // 2026-05-09: per-connection `WebSocketConnected` emission was removed
+    // (it duplicated `WebSocketPoolOnline` and produced two Telegrams ~60s
+    // apart at boot — see fn docstring of `emit_websocket_connected_alerts`).
+    // The aggregate `WebSocketPoolOnline` (Severity::Medium) is now the
+    // single source of truth for boot success.
     let src = main_rs_source();
-    // Inside the helper body, the summary event must follow the loop.
     let helper_start = src
         .find("async fn emit_websocket_connected_alerts(")
         .expect("helper must exist");
-    // Grab a generous window of the helper body.
     let end = helper_start.saturating_add(4000).min(src.len());
     let body = &src[helper_start..end];
-    let loop_idx = body
-        .find("NotificationEvent::WebSocketConnected")
-        .expect("helper must emit per-connection events");
-    let summary_idx = body.find("NotificationEvent::WebSocketPoolOnline").expect(
-        "helper must emit a WebSocketPoolOnline summary event so operators \
-         survive Telegram rate-limit drops of individual events",
-    );
     assert!(
-        summary_idx > loop_idx,
-        "`WebSocketPoolOnline` summary must be emitted AFTER the per-connection \
-         loop so the aggregate reflects the full attempt."
+        body.contains("NotificationEvent::WebSocketPoolOnline"),
+        "helper must emit `WebSocketPoolOnline` aggregate event so operators \
+         get a single non-duplicate boot-complete signal"
     );
+}
+
+/// 2026-05-09 ratchet — block a regression that re-introduces per-connection
+/// `WebSocketConnected` emission inside the boot helper. The aggregate
+/// `WebSocketPoolOnline` (which carries the same per-feed breakdown in its
+/// `per_connection` payload) is the single source of truth for boot success.
+/// Re-introducing per-connection emission resurrects the duplicate Telegram
+/// bug observed on 2026-05-09 (12:07 PM "TickVault is live" + 12:08 PM
+/// "WebSocketConnected x5" coalesced summary).
+#[test]
+fn per_connection_websocket_connected_must_not_be_emitted_in_boot_helper() {
+    let src = main_rs_source();
+    let helper_start = src
+        .find("async fn emit_websocket_connected_alerts(")
+        .expect("helper must exist");
+    // Find the END of the helper by locating the next `async fn` or `fn` at
+    // module scope after the helper opens. Fall back to a generous window.
+    let after_open = &src[helper_start..];
+    // The helper body should fit in well under 6000 chars; take that.
+    let end_offset = 6000.min(after_open.len());
+    let body = &after_open[..end_offset];
+
+    // It is fine for the body to mention `WebSocketConnected` in a comment
+    // (e.g., the rationale in the docstring). Reject only `notify(...)`-shaped
+    // call sites.
+    let banned_patterns = [
+        "notify(NotificationEvent::WebSocketConnected",
+        "notify(tickvault_core::notification::events::NotificationEvent::WebSocketConnected",
+    ];
+    for pat in &banned_patterns {
+        assert!(
+            !body.contains(pat),
+            "regression: `emit_websocket_connected_alerts` must NOT emit \
+             per-connection `WebSocketConnected` events. The aggregate \
+             `WebSocketPoolOnline` covers this signal. Two Telegrams at boot \
+             (12:07 'TickVault is live' + 12:08 'WebSocketConnected x5') \
+             confused operators on 2026-05-09; this guard prevents the \
+             regression. If you NEED per-connection visibility, emit a new \
+             dedicated variant — do NOT reuse `WebSocketConnected` (which \
+             stays Low / coalesced for post-boot use cases). Banned pattern: \
+             `{pat}`."
+        );
+    }
 }
