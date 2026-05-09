@@ -58,6 +58,7 @@ use tracing::{info, warn};
 
 use tickvault_common::config::QuestDbConfig;
 use tickvault_common::error_code::ErrorCode;
+use tickvault_common::market_hours::is_within_trading_session_ist;
 use tickvault_common::segment::segment_str_to_code;
 use tickvault_trading::candles::pct_stamping::PrevDayRefs;
 use tickvault_trading::in_mem::PrevDayCache;
@@ -282,17 +283,30 @@ pub async fn populate_and_log(
     match populate_prev_day_cache_at_boot(questdb_config, cache, prev_oi_cache).await {
         Ok(outcome) => {
             if outcome.rows_inserted == 0 {
-                // False-OK Rule 11: zero inserts is a degraded signal,
-                // NOT success — page so the operator can investigate
-                // why `previous_close` is empty.
-                warn!(
-                    code = ErrorCode::PrevClose04CacheEmptyAtBoot.code_str(),
-                    skipped_unknown_segment = outcome.skipped_unknown_segment,
-                    skipped_malformed = outcome.skipped_malformed,
-                    "F2 PrevDayCache loader: previous_close table is empty — \
-                     cascade seal-time pct stamping will fall back to 0.0 \
-                     until live ticks repopulate the table"
-                );
+                // Off-hours / weekend / holiday: empty `previous_close`
+                // is expected (no live ticks have populated it yet for
+                // today), so emit `info!` to avoid Telegram noise. During
+                // a trading session the same condition is genuinely
+                // degraded — escalate via `warn!` + PREVCLOSE-04 so the
+                // operator investigates per Rule 11.
+                if is_within_trading_session_ist() {
+                    warn!(
+                        code = ErrorCode::PrevClose04CacheEmptyAtBoot.code_str(),
+                        skipped_unknown_segment = outcome.skipped_unknown_segment,
+                        skipped_malformed = outcome.skipped_malformed,
+                        "F2 PrevDayCache loader: previous_close table is empty — \
+                         cascade seal-time pct stamping will fall back to 0.0 \
+                         until live ticks repopulate the table"
+                    );
+                } else {
+                    info!(
+                        skipped_unknown_segment = outcome.skipped_unknown_segment,
+                        skipped_malformed = outcome.skipped_malformed,
+                        "F2 PrevDayCache loader: previous_close table is empty \
+                         (off-hours / weekend boot — expected; cascade pct \
+                         fields will fall back to 0.0 until next session)"
+                    );
+                }
             } else {
                 info!(
                     rows_inserted = outcome.rows_inserted,
