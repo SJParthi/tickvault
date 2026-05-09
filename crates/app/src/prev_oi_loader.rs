@@ -1,67 +1,56 @@
-//! PR #454 (2026-05-03) — boot-time `prev_oi` cache loader.
+//! Boot-time `prev_oi` cache loader (Option Chain REST overlay only).
 //!
-//! Wires the bhavcopy → cache extraction pipeline (built in PR #450
-//! commit 3) into the boot path so the new unified `/api/movers`
-//! endpoint's `OI Change` and `OI Change %` columns display
-//! Dhan-precise values from the very first tick.
+//! Builds the previous-session-close OI cache consumed by the unified
+//! `/api/movers` endpoint and the tick enricher's `OI Change` / `OI
+//! Change %` columns.
 //!
-//! # Why this exists
+//! # 2026-05-09 simplification — bhavcopy step retired
 //!
-//! PR #450 commit 3 shipped two pure data-extraction functions:
-//! - `crates/core/src/instrument/bhavcopy_cross_check.rs::build_prev_oi_cache_from_bhavcopy`
-//! - `crates/core/src/option_chain/prev_oi.rs::extract_prev_oi_from_option_chain`
+//! Up to PR #454 / #456 the boot path fetched yesterday's NSE F&O
+//! bhavcopy ZIP, shelled out to the macOS `unzip` binary, parsed the
+//! CSV, then layered an Option Chain REST overlay for
+//! NIFTY/BANKNIFTY/SENSEX on top. Two reasons motivated dropping the
+//! bhavcopy step:
 //!
-//! But the boot orchestrator (`main.rs::spawn_movers_pipeline` call site)
-//! was wired with `Arc::new(HashMap::new())` — empty cache. The
-//! `PREVOI-01` boot-time WARN flagged this as a known transition gap.
+//! 1. **macOS Info-ZIP 6.00 (April 2009) is unreliable on stdin pipes.**
+//!    Live boot 2026-05-09 20:57:24 IST emitted `PREVOI-01: write to
+//!    unzip stdin failed (Broken pipe)`. The shell-out was a recurring
+//!    failure mode with no clean fix short of pulling in a Rust ZIP
+//!    crate (operator declined: "why zip jsut avoid that").
+//! 2. **Wave-5 indices-only scope makes bhavcopy redundant.** The
+//!    overlay covers NIFTY/BANKNIFTY/SENSEX in ~18s and that is the
+//!    full universe under `[subscription] scope = "indices_only_…"`.
+//!    Live evidence from the same boot: `bhavcopy_size=0,
+//!    overlay_added_or_overrode=866, final_cache_size=866` —
+//!    overlay alone produced complete coverage.
 //!
-//! This module closes the gap with the simplest correct implementation:
-//! fetch yesterday's NSE bhavcopy at boot, parse, and build the cache.
-//!
-//! # Why bhavcopy first (not Option Chain REST)
-//!
-//! Per `.claude/rules/dhan/option-chain.md` rule 4 the Dhan Option Chain
-//! REST endpoint is rate-limited at **1 unique request every 3 seconds**.
-//! Loading prev_oi for our 219 (underlying, expiry) pairs serially would
-//! take ~11 minutes — fits before 08:15 IST IF started by 08:00. The
-//! bhavcopy approach is FREE (no Dhan quota), takes ~5-6 minutes total
-//! (download ~5min + parse ~5s + cache build ~1s), and covers ALL NSE
-//! F&O including futures (Option Chain returns options only).
-//!
-//! Future work (separate PR): Option Chain REST overlay for the most-
-//! watched contracts (NIFTY/BANKNIFTY/SENSEX) to override bhavcopy's
-//! T+1 staleness with Dhan-canonical values for the highest-traffic
-//! underlyings.
+//! The function preserves its public name (`load_prev_oi_cache_at_boot_with_overlay`)
+//! and signature shape but no longer touches `bhavcopy_fetcher`,
+//! `bhavcopy_scheduler::unzip_csv_from_zip_body`, or
+//! `bhavcopy_cross_check::build_prev_oi_cache_from_bhavcopy`. Those
+//! still ship for the 16:30 IST `bhavcopy_pipeline.rs` cycle (operator
+//! hold).
 //!
 //! # Failure mode
 //!
-//! On any failure (404 / network timeout / unzip / parse error) the
-//! function returns `Arc::new(HashMap::new())` (empty cache) and emits
-//! a typed `error!` with `code = ErrorCode::PrevOi01CacheEmptyAtBoot`.
-//! This preserves the existing PREVOI-01 contract — `/api/movers` will
-//! display `current_OI - 0 = current_OI` for OI Change until the next
-//! boot succeeds.
+//! On any per-underlying overlay failure (rate-limit / network / auth)
+//! the function logs a WARN and continues with the next underlying. If
+//! all 3 fail the returned cache is empty; downstream consumers treat
+//! absence as 0 (`current_OI - 0 = current_OI`).
 //!
 //! # Hot path
 //!
 //! Cold path. Runs ONCE at boot. The resulting `Arc<HashMap>` is consumed
-//! by `spawn_movers_pipeline` and read O(1) lock-free per 1s drain.
+//! by the unified movers pipeline and read O(1) lock-free per drain.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use chrono::{Datelike, NaiveDate, Utc};
-use tracing::{error, info, warn};
+use chrono::{Datelike, NaiveDate};
+use tracing::{info, warn};
 
 use tickvault_common::error_code::ErrorCode;
-use tickvault_common::instrument_registry::InstrumentRegistry;
-use tickvault_common::instrument_types::DerivativeContract;
 use tickvault_common::trading_calendar::TradingCalendar;
-use tickvault_core::instrument::bhavcopy_cross_check::{
-    build_prev_oi_cache_from_bhavcopy, parse_bhavcopy_csv,
-};
-use tickvault_core::instrument::bhavcopy_fetcher::{BhavcopySegment, fetch_bhavcopy_zip};
-use tickvault_core::instrument::bhavcopy_scheduler::unzip_csv_from_zip_body;
 
 /// Computes the most recent trading day strictly before `today` IST.
 ///
@@ -97,164 +86,8 @@ pub fn format_yyyymmdd(date: NaiveDate) -> String {
     format!("{:04}{:02}{:02}", date.year(), date.month(), date.day())
 }
 
-/// Loads the previous-session-close OI cache from yesterday's NSE
-/// bhavcopy at boot.
-///
-/// Returns `Arc<HashMap<(security_id, exchange_segment_code), prev_oi_i64>>`
-/// keyed by the I-P1-11 composite key. On any failure, returns an
-/// empty `Arc<HashMap>` (consumer treats absence as 0, so OI Change
-/// gracefully degrades to `current_OI - 0`).
-///
-/// # Steps
-///
-/// 1. Compute most-recent prior trading day (skip weekends/holidays)
-/// 2. HTTP-fetch the NSE F&O bhavcopy ZIP for that date (3-attempt
-///    backoff — see `fetch_bhavcopy_zip`)
-/// 3. Unzip via shell-out (`unzip_csv_from_zip_body`)
-/// 4. Parse CSV → `Vec<BhavcopyRow>`
-/// 5. Build cache via `build_prev_oi_cache_from_bhavcopy` (which
-///    resolves bhavcopy `(TckrSymb, XpryDt, StrkPric, OptnTp)` tuples
-///    against our `DerivativeContract` vector to obtain Dhan
-///    SecurityIds, then keys by `(security_id, segment_code)` per
-///    I-P1-11)
-/// 6. Wrap in `Arc` and return.
-///
-/// # Error handling
-///
-/// All steps log + return empty cache on failure. The boot proceeds
-/// with degraded OI Change column rather than HALT — operator visibility
-/// via the `PREVOI-01` WARN that the empty-cache path emits at the
-/// downstream `spawn_movers_pipeline` call site.
-pub async fn load_prev_oi_cache_at_boot(
-    registry: &InstrumentRegistry,
-    calendar: &TradingCalendar,
-) -> Arc<HashMap<(u32, u8), i64>> {
-    let today_utc = Utc::now().date_naive();
-    let Some(prior_trading_day) = most_recent_prior_trading_day(today_utc, calendar) else {
-        error!(
-            code = ErrorCode::PrevOi01CacheEmptyAtBoot.code_str(),
-            "prev_oi loader could not find a prior trading day within 14 days — \
-             returning empty cache; OI Change column will display current_OI"
-        );
-        return Arc::new(HashMap::new());
-    };
-    let yyyymmdd = format_yyyymmdd(prior_trading_day);
-
-    info!(
-        prior_trading_day = %prior_trading_day,
-        yyyymmdd,
-        "prev_oi loader: fetching NSE bhavcopy for prior trading day"
-    );
-
-    // Step 2: fetch ZIP
-    let zip_body = match fetch_bhavcopy_zip(BhavcopySegment::Fno, &yyyymmdd).await {
-        Ok(b) => b,
-        Err(err) => {
-            error!(
-                code = ErrorCode::PrevOi01CacheEmptyAtBoot.code_str(),
-                yyyymmdd,
-                ?err,
-                "prev_oi loader: bhavcopy ZIP fetch failed — returning empty cache"
-            );
-            return Arc::new(HashMap::new());
-        }
-    };
-
-    // Step 3: unzip
-    let csv_bytes = match unzip_csv_from_zip_body(&zip_body).await {
-        Ok(b) => b,
-        Err(err) => {
-            error!(
-                code = ErrorCode::PrevOi01CacheEmptyAtBoot.code_str(),
-                ?err,
-                "prev_oi loader: unzip failed — returning empty cache"
-            );
-            return Arc::new(HashMap::new());
-        }
-    };
-    let csv_str = match std::str::from_utf8(&csv_bytes) {
-        Ok(s) => s,
-        Err(err) => {
-            error!(
-                code = ErrorCode::PrevOi01CacheEmptyAtBoot.code_str(),
-                ?err,
-                "prev_oi loader: bhavcopy CSV not UTF-8 — returning empty cache"
-            );
-            return Arc::new(HashMap::new());
-        }
-    };
-
-    // Step 4: parse
-    let nse_rows = match parse_bhavcopy_csv(csv_str) {
-        Ok(rows) => rows,
-        Err(err) => {
-            error!(
-                code = ErrorCode::PrevOi01CacheEmptyAtBoot.code_str(),
-                ?err,
-                "prev_oi loader: bhavcopy CSV parse failed — returning empty cache"
-            );
-            return Arc::new(HashMap::new());
-        }
-    };
-
-    // Step 5: build cache. Construct `DerivativeContract` rows from
-    // the registry's `SubscribedInstrument` entries that have all
-    // derivative-specific fields populated. Per I-P1-11 the registry
-    // iter exposes BOTH segments of cross-segment SID collisions.
-    let derivatives: Vec<DerivativeContract> = registry
-        .iter()
-        .filter_map(|sub| {
-            // Only derivative contracts have all four optional fields.
-            let kind = sub.instrument_kind?;
-            let expiry = sub.expiry_date?;
-            // Strike is 0.0 for futures; option_type is None for futures.
-            // Both forms are accepted by build_dhan_lookup.
-            let strike = sub.strike_price.unwrap_or(0.0);
-            let option_type = sub.option_type;
-            Some(DerivativeContract {
-                security_id: sub.security_id,
-                underlying_symbol: sub.underlying_symbol.clone(),
-                instrument_kind: kind,
-                exchange_segment: sub.exchange_segment,
-                expiry_date: expiry,
-                strike_price: strike,
-                option_type,
-                lot_size: 0,    // not used by build_prev_oi_cache_from_bhavcopy
-                tick_size: 0.0, // not used
-                symbol_name: sub.display_label.clone(),
-                display_name: sub.display_label.clone(),
-            })
-        })
-        .collect();
-
-    if derivatives.is_empty() {
-        warn!(
-            code = ErrorCode::PrevOi01CacheEmptyAtBoot.code_str(),
-            "prev_oi loader: registry has zero derivative contracts — \
-             cache will be empty (subscription_plan absent or registry not built yet)"
-        );
-        return Arc::new(HashMap::new());
-    }
-
-    let cache = build_prev_oi_cache_from_bhavcopy(&nse_rows, &derivatives);
-    let cache_size = cache.len();
-
-    info!(
-        cache_size,
-        bhavcopy_rows = nse_rows.len(),
-        derivative_contracts = derivatives.len(),
-        "prev_oi loader: bhavcopy cache built successfully — \
-         /api/movers OI Change column will display Dhan-precise values \
-         (Option Chain REST overlay disabled at this call site; use \
-         load_prev_oi_cache_at_boot_with_overlay to add Dhan-canonical \
-         override for NIFTY/BANKNIFTY/SENSEX top 3)"
-    );
-
-    Arc::new(cache)
-}
-
 // ---------------------------------------------------------------------------
-// PR #456 (2026-05-04) — Option Chain REST overlay for top 3 underlyings
+// Option Chain REST overlay (sole source post 2026-05-09 simplification)
 // ---------------------------------------------------------------------------
 
 /// The 3 most-watched index F&O underlyings — `(symbol, scrip_id, options_segment_code)`.
@@ -276,32 +109,28 @@ const TOP_3_OVERLAY_INDICES: &[(&str, u64, u8)] = &[
     ("SENSEX", 51, 8),    // BSE_FNO options
 ];
 
-/// Loads the prev_oi cache from bhavcopy AND applies the Option Chain
-/// REST overlay for NIFTY/BANKNIFTY/SENSEX.
+/// Loads the prev_oi cache solely from the Dhan Option Chain REST
+/// overlay for NIFTY/BANKNIFTY/SENSEX.
 ///
 /// Sequence:
-/// 1. Bhavcopy fetch + parse (calls `load_prev_oi_cache_at_boot`)
+/// 1. Start with empty accumulator.
 /// 2. For each of the top 3 underlyings: fetch nearest expiry + chain,
 ///    extract `previous_oi`, MERGE INTO accumulator (last-wins per
-///    `merge_prev_oi_cache` semantics — Option Chain values override
-///    bhavcopy on collision because Dhan-canonical > T+1 NSE static).
+///    `merge_prev_oi_cache` semantics).
 ///
-/// # Why an overlay (not replacement)
+/// # Why overlay-only (no bhavcopy)
 ///
-/// Option Chain REST has a 1-req/3-sec rate limit per
-/// `.claude/rules/dhan/option-chain.md` rule 4. Loading prev_oi for
-/// our full 219 (underlying, expiry) universe would take ~11 minutes.
-/// The overlay covers the 3 highest-traffic indices in ~18 seconds
-/// (3 underlyings × 2 calls × 3s rate-limit), giving operators
-/// Dhan-canonical values for the contracts that matter most while
-/// bhavcopy provides T+1 baseline for the rest.
+/// Wave-5 indices-only scope subscribes only NIFTY/BANKNIFTY/SENSEX
+/// derivatives — exactly the 3 underlyings the overlay covers. The
+/// bhavcopy fetch + macOS `unzip` shell-out (retired 2026-05-09 per
+/// operator directive "why zip jsut avoid that") added complexity
+/// and a recurring `PREVOI-01` failure mode without expanding coverage.
 ///
 /// # Failure handling
 ///
 /// Per-underlying try; one failure (404 / network timeout / unauth)
-/// does NOT abort the others. Bhavcopy values remain authoritative
-/// when overlay fails. Logged at WARN, not ERROR — degradation is
-/// graceful (T+1 staleness for the affected underlying).
+/// does NOT abort the others. Logged at WARN — degradation is
+/// graceful (cache misses fall back to `current_OI - 0`).
 ///
 /// # Arguments
 ///
@@ -309,20 +138,13 @@ const TOP_3_OVERLAY_INDICES: &[(&str, u64, u8)] = &[
 /// boot, plain `String` here per project convention — sensitive bits
 /// stay in the `TokenHandle`).
 pub async fn load_prev_oi_cache_at_boot_with_overlay(
-    registry: &InstrumentRegistry,
-    calendar: &TradingCalendar,
     token_handle: tickvault_core::auth::token_manager::TokenHandle,
     client_id: String,
     rest_api_base_url: String,
 ) -> Arc<HashMap<(u32, u8), i64>> {
-    // Step 1: bhavcopy baseline (existing function).
-    let bhavcopy_cache = load_prev_oi_cache_at_boot(registry, calendar).await;
-    let bhavcopy_size = bhavcopy_cache.len();
+    let mut accumulator: HashMap<(u32, u8), i64> = HashMap::new();
 
-    // Strip Arc to mutate; we'll re-wrap at the end.
-    let mut accumulator: HashMap<(u32, u8), i64> = (*bhavcopy_cache).clone();
-
-    // Step 2: Option Chain overlay.
+    // Option Chain REST overlay — sole prev_oi source.
     let mut chain_client = match tickvault_core::option_chain::client::OptionChainClient::new(
         token_handle,
         client_id,
@@ -423,12 +245,11 @@ pub async fn load_prev_oi_cache_at_boot_with_overlay(
     }
 
     info!(
-        bhavcopy_size,
-        overlay_added_or_overrode = overlay_total,
+        overlay_added = overlay_total,
         overlay_underlyings_succeeded,
         overlay_underlyings_total = TOP_3_OVERLAY_INDICES.len(),
         final_cache_size = accumulator.len(),
-        "prev_oi cache: bhavcopy + Option Chain overlay complete"
+        "prev_oi cache: Option Chain overlay complete (bhavcopy step retired 2026-05-09)"
     );
 
     Arc::new(accumulator)
@@ -558,6 +379,48 @@ mod tests {
             assert_eq!(
                 scrip, expected[i].1,
                 "{sym} scrip_id must match VALIDATION_MUST_EXIST_INDICES"
+            );
+        }
+    }
+
+    /// 2026-05-09 ratchet: the boot-time prev_oi loader MUST NOT
+    /// reference the bhavcopy fetch / unzip / parse pipeline. The
+    /// macOS Info-ZIP 6.00 stdin-pipe failure mode (`PREVOI-01:
+    /// Broken pipe`) is retired by construction — re-introducing
+    /// these symbols re-introduces the bug. Operator directive
+    /// 2026-05-09: "why zip jsut avoid that".
+    ///
+    /// Source-scan guard. Reads the module's own source file and
+    /// asserts none of the bhavcopy-step symbols appear anywhere
+    /// outside the historical doc comment.
+    #[test]
+    fn test_prev_oi_loader_source_does_not_reference_bhavcopy_pipeline() {
+        // `CARGO_MANIFEST_DIR` is the absolute path to the crate root
+        // (`crates/app/`); join with the source-relative path of THIS
+        // file. Avoids the cwd-vs-workspace-root mismatch between
+        // `cargo test -p tickvault-app` (cwd = crate root) and
+        // `cargo test --workspace` (cwd = workspace root).
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let path = format!("{manifest_dir}/src/prev_oi_loader.rs");
+        let src = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("prev_oi_loader.rs readable at {path}: {e}"));
+        // Build needles at runtime via fragment concatenation so this
+        // test file itself does NOT contain the joined banned-symbol
+        // literals (otherwise the scan would trip on its own source).
+        let needles: [String; 5] = [
+            format!("{}{}{}", "unzip", "_csv_from_zip_body", "("),
+            format!("{}{}{}", "fetch", "_bhavcopy_zip", "("),
+            format!("{}{}{}", "build_prev_oi_cache", "_from_bhavcopy", "("),
+            format!("{}{}{}", "parse", "_bhavcopy_csv", "("),
+            format!("{}{}", "Bhavcopy", "Segment::Fno"),
+        ];
+        for needle in &needles {
+            assert!(
+                !src.contains(needle),
+                "prev_oi_loader.rs MUST NOT reference `{needle}` — \
+                 the boot-time bhavcopy step is retired (2026-05-09). \
+                 Re-introducing it brings back the macOS unzip stdin-pipe \
+                 PREVOI-01 broken-pipe failure mode."
             );
         }
     }

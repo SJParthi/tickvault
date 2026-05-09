@@ -47,16 +47,22 @@ pub const APP_LOG_PREFIX: &str = "app";
 
 /// 2026-05-02 — per-category log file separation.
 ///
-/// Operator-requested separation of logs into 5 domain-specific
-/// directories so movers / candles / live ticks / historical / option
-/// chain logs can be tailed independently without grep'ing the giant
+/// Operator-requested separation of logs into domain-specific
+/// directories so candles / live ticks / historical / option chain
+/// logs can be tailed independently without grep'ing the giant
 /// `app.*` stream.
 ///
 /// Each category gets its own subdirectory under `data/logs/` with
 /// hourly-rotated files named `{prefix}.{YYYY-MM-DD-HH}`. The targets
 /// filter for each category is built by [`build_category_targets`].
-pub const CATEGORY_MOVERS_DIR: &str = "data/logs/movers";
-pub const CATEGORY_MOVERS_PREFIX: &str = "movers";
+///
+/// 2026-05-09 — `LogCategory::Movers` retired (operator directive
+/// "Also retire LogCategory::Movers" after the QuestDB movers
+/// infrastructure was dropped in PR #539). The 4 RAM-tracker tracing
+/// targets (`mover_classifier`, `movers_window`, `option_movers`,
+/// `top_movers`) are now folded into `LogCategory::LiveTicks`. The
+/// existing on-disk `data/logs/movers/` directory is orphaned;
+/// operator deletes manually.
 pub const CATEGORY_CANDLES_DIR: &str = "data/logs/candles";
 pub const CATEGORY_CANDLES_PREFIX: &str = "candles";
 pub const CATEGORY_LIVE_TICKS_DIR: &str = "data/logs/live_ticks";
@@ -66,14 +72,13 @@ pub const CATEGORY_HISTORICAL_PREFIX: &str = "historical";
 pub const CATEGORY_OPTION_CHAIN_DIR: &str = "data/logs/option_chain";
 pub const CATEGORY_OPTION_CHAIN_PREFIX: &str = "option_chain";
 
-/// Stable identifier for the 5 log categories.
+/// Stable identifier for the log categories.
 ///
 /// Used by [`build_category_targets`] + the boot-time appender wiring.
 /// The `&'static str` form is what `RollingFileAppender::new` expects
 /// for the filename prefix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogCategory {
-    Movers,
     Candles,
     LiveTicks,
     Historical,
@@ -84,7 +89,6 @@ impl LogCategory {
     #[must_use]
     pub fn dir(self) -> &'static str {
         match self {
-            Self::Movers => CATEGORY_MOVERS_DIR,
             Self::Candles => CATEGORY_CANDLES_DIR,
             Self::LiveTicks => CATEGORY_LIVE_TICKS_DIR,
             Self::Historical => CATEGORY_HISTORICAL_DIR,
@@ -95,7 +99,6 @@ impl LogCategory {
     #[must_use]
     pub fn prefix(self) -> &'static str {
         match self {
-            Self::Movers => CATEGORY_MOVERS_PREFIX,
             Self::Candles => CATEGORY_CANDLES_PREFIX,
             Self::LiveTicks => CATEGORY_LIVE_TICKS_PREFIX,
             Self::Historical => CATEGORY_HISTORICAL_PREFIX,
@@ -105,9 +108,8 @@ impl LogCategory {
 
     /// Every variant. Used by retention sweepers + tests.
     #[must_use]
-    pub fn all() -> [Self; 5] {
+    pub fn all() -> [Self; 4] {
         [
-            Self::Movers,
             Self::Candles,
             Self::LiveTicks,
             Self::Historical,
@@ -126,17 +128,16 @@ impl LogCategory {
 #[must_use]
 pub fn build_category_targets(cat: LogCategory) -> &'static [&'static str] {
     match cat {
-        LogCategory::Movers => &[
-            "tickvault_core::pipeline::mover_classifier",
-            "tickvault_core::pipeline::movers_window",
-            "tickvault_core::pipeline::option_movers",
-            "tickvault_core::pipeline::top_movers",
-        ],
         LogCategory::Candles => &[
             "tickvault_core::pipeline::candle_aggregator",
             "tickvault_storage::candle_persistence",
             "tickvault_storage::materialized_views",
         ],
+        // 2026-05-09: the 4 RAM-tracker targets formerly under
+        // `LogCategory::Movers` (mover_classifier, movers_window,
+        // option_movers, top_movers) are folded into LiveTicks since
+        // they run inline with the tick processor and the QuestDB
+        // movers infrastructure was retired in PR #539.
         LogCategory::LiveTicks => &[
             "tickvault_core::websocket",
             "tickvault_core::pipeline::tick_processor",
@@ -144,6 +145,10 @@ pub fn build_category_targets(cat: LogCategory) -> &'static [&'static str] {
             "tickvault_core::pipeline::no_tick_watchdog",
             "tickvault_core::pipeline::depth_sequence_tracker",
             "tickvault_core::pipeline::volume_monotonicity_guard",
+            "tickvault_core::pipeline::mover_classifier",
+            "tickvault_core::pipeline::movers_window",
+            "tickvault_core::pipeline::option_movers",
+            "tickvault_core::pipeline::top_movers",
             "tickvault_storage::tick_persistence",
             "tickvault_storage::tick_spill_drain",
         ],
@@ -1301,20 +1306,19 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_log_category_all_returns_exactly_five_variants() {
-        // Operator-spec: 5 categories — movers, candles, live ticks,
-        // historical, option chain. Adding a 6th must consciously bump
-        // the array size + this assertion.
+    fn test_log_category_all_returns_exactly_four_variants() {
+        // 2026-05-09: 4 categories — candles, live ticks, historical,
+        // option chain. The 5th (`Movers`) was retired alongside the
+        // QuestDB movers infrastructure (PR #539) — its 4 RAM-tracker
+        // tracing targets are now folded into LiveTicks.
         let all = LogCategory::all();
-        assert_eq!(all.len(), 5);
+        assert_eq!(all.len(), 4);
     }
 
     #[test]
     fn test_log_category_dir_and_prefix_stable_for_each_variant() {
         // Pin the on-disk paths so an accidental rename doesn't break
         // operator runbooks or external Loki/Alloy scrape configs.
-        assert_eq!(LogCategory::Movers.dir(), "data/logs/movers");
-        assert_eq!(LogCategory::Movers.prefix(), "movers");
         assert_eq!(LogCategory::Candles.dir(), "data/logs/candles");
         assert_eq!(LogCategory::Candles.prefix(), "candles");
         assert_eq!(LogCategory::LiveTicks.dir(), "data/logs/live_ticks");
@@ -1325,16 +1329,15 @@ mod tests {
         assert_eq!(LogCategory::OptionChain.prefix(), "option_chain");
     }
 
+    /// 2026-05-09 ratchet: the 4 RAM-tracker tracing targets that
+    /// formerly routed to `LogCategory::Movers` MUST now route to
+    /// `LogCategory::LiveTicks`. Operator directive after the PR #539
+    /// QuestDB movers infrastructure retirement: "Also retire
+    /// LogCategory::Movers". Blocks regression to a separate movers
+    /// category.
     #[test]
-    fn test_build_category_targets_movers_includes_all_pipeline_modules() {
-        let targets = build_category_targets(LogCategory::Movers);
-        // Verified module paths against crates/core/src/pipeline/mod.rs
-        // + crates/storage/src/lib.rs on 2026-05-02. Every module that
-        // logs movers data MUST be listed.
-        // 2026-05-09 PR 5c.5-final: storage-side movers modules
-        // (`movers_persistence`, `movers_base_persistence`,
-        // `movers_base_query`, `movers_writer`) are DELETED. Only the
-        // in-memory pipeline modules remain.
+    fn test_build_category_targets_live_ticks_includes_movers_ram_tracker_targets() {
+        let targets = build_category_targets(LogCategory::LiveTicks);
         let expected = [
             "tickvault_core::pipeline::mover_classifier",
             "tickvault_core::pipeline::movers_window",
@@ -1344,7 +1347,8 @@ mod tests {
         for e in expected {
             assert!(
                 targets.contains(&e),
-                "movers targets missing required module: {e}"
+                "post-2026-05-09 LiveTicks targets MUST include {e} \
+                 (formerly under retired LogCategory::Movers)"
             );
         }
     }

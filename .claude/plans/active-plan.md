@@ -1,109 +1,91 @@
-# Implementation Plan: Wave-1-3 Live Hotfixes (4 bugs caught at 12:49 IST 2026-04-28)
+# Implementation Plan: Boot Telegram Hygiene + PREVOI-01 Avoidance + Movers Log Retire
 
-**Status:** VERIFIED (items 1-7, 9, 10 shipped; item 8 CANCELLED 2026-05-09 — superseded by Rust depth-200 path after Dhan ticket #5610706)
-**Date:** 2026-04-28
-**Approved by:** Parthiban (operator) — verbatim "fix everything"
-**Branch:** `claude/verify-waves-status-HQP6A`
-**Triggering incident:** Live observation at 12:49 IST 2026-04-28: boot_audit DDL failed, phase2_audit insert failed (nanos→micros), SLO-02 Telegram 400 Bad Request, Grafana false-healthy.
+**Status:** VERIFIED
+**Date:** 2026-05-09
+**Approved by:** Parthiban — "FIx and implement everyhtign", "why zip jsut avoid that", "Also retire LogCategory::Movers"
+**Branch:** `claude/migrate-bhavcopy-pipeline-uj00F`
+**Triggering incidents (live boot 2026-05-09 20:57:03 IST):**
+1. `[ERROR] PREVOI-01 prev_oi loader: unzip failed — Broken pipe` — macOS Info-ZIP 6.00 stdin pipe failure
+2. `[HIGH] TickVault is partially online — 0 of 5 market-data feeds connected (5 stuck)` Telegram during pre-market boot when all 5 conns are correctly DEFERRED waiting for 09:00 IST
+3. Operator confusion that `data/logs/movers/` directory still exists post-PR-#539 retirement
 
 ## Plan Items
 
-- [x] **1. Add `ts` to DEDUP keys for boot_audit + selftest_audit** (fixes AUDIT-04 + missing selftest writes)
-  - Files: crates/storage/src/boot_audit_persistence.rs
-  - Files: crates/storage/src/selftest_audit_persistence.rs
-  - Tests: test_dedup_key_includes_designated_timestamp
+- [x] **1. Strip boot-time bhavcopy step from prev_oi loader** (avoids PREVOI-01 entirely)
+  - Files: `crates/app/src/prev_oi_loader.rs`
+  - Behaviour change: `load_prev_oi_cache_at_boot_with_overlay` starts with empty `HashMap` and runs ONLY the Option Chain REST overlay. Live boot 20:57:40 IST proved overlay alone produced 866 entries covering NIFTY/BANKNIFTY/SENSEX (= full Wave-5 indices-only scope).
+  - Delete: `pub async fn load_prev_oi_cache_at_boot` (no remaining external callers)
+  - Delete imports: `unzip_csv_from_zip_body`, `fetch_bhavcopy_zip`, `parse_bhavcopy_csv`, `build_prev_oi_cache_from_bhavcopy`, `BhavcopySegment`
+  - Keep: `unzip_csv_from_zip_body` in `bhavcopy_scheduler.rs` (still used by 16:30 IST `bhavcopy_pipeline.rs` cycle, on hold per operator)
+  - Keep: `ErrorCode::PrevOi01CacheLoaderUnzipFailed` (remains valid for 16:30 cycle)
+  - Tests: `test_load_prev_oi_cache_at_boot_with_overlay_skips_bhavcopy_step` — asserts only the overlay path runs
+  - Tests: `test_prev_oi_loader_imports_no_longer_reference_bhavcopy_unzip` — source-scan ratchet
 
-- [x] **2. Convert nanos to micros in all 6 audit INSERTs** (fixes AUDIT-01 across the family)
-  - Files: crates/storage/src/boot_audit_persistence.rs
-  - Files: crates/storage/src/selftest_audit_persistence.rs
-  - Files: crates/storage/src/phase2_audit_persistence.rs
-  - Files: crates/storage/src/ws_reconnect_audit_persistence.rs
-  - Files: crates/storage/src/depth_rebalance_audit_persistence.rs
-  - Files: crates/storage/src/order_audit_persistence.rs
-  - Tests: test_insert_sql_uses_microseconds_not_nanoseconds
+- [x] **2. Off-hours gate on partial-online Telegram** (avoids false `[HIGH]` alarm)
+  - Files: `crates/app/src/main.rs` (boot final-snapshot block ~7720-7757)
+  - Files: `crates/core/src/notification/events.rs` (add typed variant or dispatch flag)
+  - Behaviour change: when `connected != total` AND `!is_within_market_hours_ist()`, emit `WebSocketPoolDeferredOffHours { deferred, total, boot_path }` as Severity::Low instead of `WebSocketPoolPartialAfterDeadline` (Severity::High).
+  - Wording (Severity::Low): "✅ Boot complete — {deferred}/{total} main feeds DEFERRED until 09:00 IST (Dhan resets idle pre-market sockets; this is by design)"
+  - In-market path unchanged — partial-after-deadline keeps firing High.
+  - Tests: `test_partial_pool_off_hours_emits_low_severity_deferred_event`
+  - Tests: `test_partial_pool_in_market_hours_keeps_high_severity` (regression block)
+  - Tests: `test_deferred_off_hours_event_is_immediate_low_severity` (Telegram dispatch policy)
 
-- [x] **3. Strip raw `<` from RealtimeGuaranteeCritical body** (fixes TELEGRAM-01 mid-batch failures)
-  - Files: crates/core/src/notification/events.rs
-  - Tests: test_realtime_guarantee_critical_body_has_no_unescaped_html_brackets
-  - Tests: test_realtime_guarantee_degraded_body_has_no_unescaped_html_brackets
-  - Tests: test_realtime_guarantee_healthy_body_has_no_unescaped_html_brackets
-
-- [x] **4. Add HTTP health probe for Grafana** (fixes false-healthy at boot)
-  - Files: crates/app/src/infra.rs
-  - Tests: test_grafana_health_probe_polls_api_health_endpoint
-
-- [x] **5. Python depth-200 sidecar bridge v0** (replaces / supplements Rust depth-200 client which Dhan resets on ATM/expiry-day)
-  - Files: scripts/depth_200_bridge.py
-  - Files: scripts/depth_200_bridge_requirements.txt
-  - Files: scripts/depth_200_bridge_README.md
-  - Files: scripts/test_depth_200_bridge.py
-  - Tests: test_parses_bid_frame_into_levels
-  - Tests: test_parses_ask_frame
-  - Tests: test_disconnect_frame_returns_none
-  - Tests: test_zero_priced_levels_are_skipped
-  - Tests: test_ilp_line_format_matches_questdb_schema
-  - Tests: test_levels_are_one_indexed
-
-- [x] **6. Rust DepthBridgeStateWriter** (writes data/depth-200-bridge/state.json atomically at boot + on rebalance Swap200)
-  - Files: crates/app/src/depth_bridge_state_writer.rs
-  - Files: crates/app/src/main.rs
-  - Tests: test_atomic_write_via_tempfile_rename
-  - Tests: test_version_monotonic_increment
-  - Tests: test_state_writer_wired_at_boot_and_rebalance
-
-- [x] **7. Prometheus metrics endpoint in Python bridge** (frames_total, reconnects_total, ilp_writes_total, state_reloads_total, active_subs, state_version)
-  - Files: scripts/depth_200_bridge.py
-  - Files: scripts/test_depth_200_bridge.py
-  - Tests: test_metrics_endpoint_serves_prometheus_format
-  - Tests: test_counters_increment_on_frame_parse
-  - Tests: test_state_version_gauge_tracks_reloads
-
-- [x] **8. Docker compose service + Grafana panel + Prometheus alert rule for the bridge — CANCELLED 2026-05-09**
-  - Status: SUPERSEDED. Per Dhan ticket #5610706 (2026-05-02) the SELF-only
-    token gate that caused TCP resets on concurrent depth-200 subscribes was
-    removed. The Rust depth-200 client now streams cleanly using the shared
-    TOTP/APP token; boot-time verification via the `DEPTH200-SMOKE-01`
-    ratchet (`crates/app/src/boot_smoke_test.rs`) confirms frame arrival
-    within 60 s and alerts if it ever regresses.
-  - The Python sidecar (`scripts/depth_200_bridge.py`) is retained as a
-    manual-only fallback. Header in `scripts/depth_200_bridge_README.md`
-    flags it as legacy / not-wired. No Docker / Prometheus / Grafana
-    wiring will be added.
-  - Operator approval: 2026-05-09 — "go ahead with our rust approach
-    itself as dhan stated as of now since the jwt will work".
-
-- [x] **9. Disk-full pre-flight check before tick spill writes** (closes single highest-risk hole in zero-loss chain)
-  - Files: crates/storage/src/tick_persistence.rs
-  - Tests: test_spill_aborts_when_free_bytes_below_threshold
-
-- [x] **10. Lift depth-200 60-attempt cap** (use WS-GAP-04 sleep gate pattern — never give up in-market, sleep until next open out-of-market)
-  - Files: crates/core/src/websocket/depth_connection.rs
-  - Tests: test_depth_200_never_gives_up_in_market_hours
-  - Tests: test_depth_200_sleeps_until_next_open_after_close
-
-## Verification
-
-```bash
-cargo check -p tickvault-storage -p tickvault-core -p tickvault-app
-cargo test -p tickvault-storage --lib
-cargo test -p tickvault-core --lib notification::events
-cargo test -p tickvault-app --lib infra
-```
-
-All commands pass on commit. 38 audit-module + 3 SLO-body + 1 Grafana-probe tests green.
+- [x] **3. Retire `LogCategory::Movers`** (operator confusion + dead category post-#539)
+  - Files: `crates/app/src/observability.rs`
+  - Delete: `LogCategory::Movers` enum variant + `CATEGORY_MOVERS_DIR` const + match arms in `dir()`, `prefix()`, `build_category_targets()`
+  - Merge: 4 tracing targets (`mover_classifier`, `movers_window`, `option_movers`, `top_movers`) into `LogCategory::LiveTicks` target list
+  - Update: `LogCategory::iter()` if present, plus any `for cat in LogCategory::iter()` loops at boot
+  - Update: existing tests `LogCategory::Movers.dir()` / `.prefix()` / `build_category_targets(LogCategory::Movers)` must be deleted; replace with one regression test asserting the 4 targets land under `LiveTicks`
+  - On-disk `data/logs/movers/` directory becomes orphaned; operator removes manually (ratchet does NOT clean filesystem state)
+  - Tests: `test_log_category_movers_variant_is_retired_and_targets_live_under_live_ticks`
+  - Tests: `test_log_category_iter_no_longer_includes_movers`
 
 ## Scenarios
 
 | # | Scenario | Expected |
-|---|----------|----------|
-| 1 | Boot at 12:49 IST | `boot_audit` DDL returns 200; `audit table ready` log emitted |
-| 2 | Phase 2 dispatch at 12:50 | `phase2_audit` row inserted, no "timestamp beyond 9999-12-31" |
-| 3 | SLO score crosses 0.80 | Telegram message delivered (no 400 Bad Request from `<` in body) |
-| 4 | Cold boot, Grafana takes 8s to serve HTTP | App waits for HTTP-200 from `/api/health` before logging "service is healthy" |
+|---|---|---|
+| 1 | Off-hours boot (Sat 20:57 IST) | No `[HIGH]` partial-online Telegram. Single `[LOW] Boot complete — 5/5 deferred until 09:00 IST` instead. PREVOI-01 does NOT fire. |
+| 2 | In-market boot, 1 conn fails after deadline | Existing `[HIGH] TickVault partially online — 4/5 connected (1 stuck)` keeps firing — regression test pins this. |
+| 3 | Greeks pipeline starts post-#539 | RAM trackers (`option_movers`, `top_movers`) keep emitting; their log lines now route to `data/logs/live_ticks.YYYY-MM-DD.log` instead of a separate movers log file. |
+| 4 | 16:30 IST bhavcopy cycle (still on hold) | `unzip_csv_from_zip_body` remains compilable + callable; volume_nse_audit cross-check operator placeholder unchanged. |
 
-## Per-Wave Guarantee Matrix (cross-reference)
+## 15-Row + 7-Row Guarantee Matrix
 
-See `.claude/rules/project/per-wave-guarantee-matrix.md` — all 15 rows of the
-100% Guarantee Matrix and all 7 rows of the Resilience Demand Matrix apply to
-every item in this plan. Mechanical enforcement via
-`.claude/hooks/per-item-guarantee-check.sh` (CI gate).
+Per `.claude/rules/project/per-wave-guarantee-matrix.md`:
+
+| Demand | Mechanical proof |
+|---|---|
+| 100% code coverage | Each item ships a unit + a source-scan ratchet; FULL_QA=1 covers integration |
+| 100% audit coverage | No new audit table needed; existing boot_audit captures the partial-online state |
+| 100% testing | 22 categories — unit + source-scan + Telegram-formatter property tests |
+| 100% code checks | banned-pattern + pub-fn-test + plan-verify gates run |
+| 100% perf | No hot-path changes |
+| 100% monitoring | Counters `tv_telegram_dropped_total`, `tv_websocket_connections_active` already wired |
+| 100% logging | All paths use `tracing` macros |
+| 100% alerting | Off-hours deferred event = Low (informational only — no Prom alert by design) |
+| 100% security | No external input handling changes |
+| 100% security hardening | Removes one shell-out (unzip) from boot path = attack-surface reduction |
+| 100% bugs fixing | Pre-impl + post-impl 3-agent adversarial review |
+| 100% scenarios covering | 4 scenarios above + ratchet tests |
+| 100% functionalities covering | Every retired pub fn deletion verified by missing call sites (pub-fn-wiring guard) |
+| 100% code review | hot-path + security + general-purpose agents on diff |
+| 100% extreme check | All ratchets fail build on regression |
+
+| Resilience demand | Honest envelope |
+|---|---|
+| Zero ticks lost | Unchanged — no tick-path edit |
+| WS never disconnects | Improvement — off-hours deferral is now correctly classified, no false alarm |
+| Never slow/locked | Unchanged — no hot-path edit |
+| QuestDB never fails | Unchanged |
+| O(1) latency | Unchanged |
+| Uniqueness + dedup | Unchanged |
+| Real-time proof | New `WebSocketPoolDeferredOffHours` event + ratchets pin the wording |
+
+## Honest 100% Claim
+
+100% inside the tested envelope, with ratcheted regression coverage:
+- Off-hours deferred main-feed conns no longer trip a HIGH Telegram (test pinned).
+- Boot-time PREVOI-01 unzip path retired entirely (deleted code cannot fail).
+- `LogCategory::Movers` retired (variant deletion = compile-time guarantee).
+Beyond the envelope: 16:30 IST bhavcopy cross-check still depends on macOS unzip; that's on operator hold and not in scope for this plan.

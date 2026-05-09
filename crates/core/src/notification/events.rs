@@ -309,6 +309,26 @@ pub enum NotificationEvent {
         boot_path: BootPathLabel,
     },
 
+    /// Off-hours boot-complete confirmation — fires when the per-conn
+    /// deadline elapses outside `[09:00, 15:30) IST` and not all
+    /// connections reached `Connected`. The non-connected slots are
+    /// expected (`Deferred`) — Dhan resets idle pre-/post-market sockets,
+    /// so the WebSocket pool intentionally waits until the next market
+    /// open before opening any TCP connection. Severity::Low because
+    /// this is by design, not a fault.
+    ///
+    /// 2026-05-09 (operator complaint): the pre-2026-05-09 path emitted
+    /// `WebSocketPoolPartialAfterDeadline` (Severity::High) at every
+    /// Saturday/Sunday/holiday boot, paging the operator with a false
+    /// `[HIGH] 0/5 feeds connected` alarm despite the connections being
+    /// correctly DEFERRED. This variant routes that scenario to a
+    /// single Severity::Low ✅ ping instead.
+    WebSocketPoolDeferredOffHours {
+        deferred: usize,
+        total: usize,
+        boot_path: BootPathLabel,
+    },
+
     /// Pool-level CRITICAL alert: every connection has been down longer than
     /// `POOL_DEGRADED_ALERT_SECS` (default 60). One alert per down-cycle.
     /// Fired by the pool watchdog on `WatchdogVerdict::Degraded`.
@@ -1565,6 +1585,18 @@ impl NotificationEvent {
                 stuck,
                 boot_path,
             } => format_pool_partial_message(*connected, *total, per_connection, stuck, *boot_path),
+            Self::WebSocketPoolDeferredOffHours {
+                deferred,
+                total,
+                boot_path,
+            } => format!(
+                "<b>✅ Boot complete — {deferred}/{total} main feeds DEFERRED until 09:00 IST</b>\n\n\
+                 📡 Outside [09:00, 15:30) IST. Dhan resets idle pre-/post-market sockets, \
+                 so the WebSocket pool intentionally waits for the next market open before \
+                 opening any TCP connection.\n  \
+                 Boot path: {path}",
+                path = boot_path.human(),
+            ),
             Self::WebSocketPoolDegraded { down_secs } => {
                 format!(
                     "<b>WS POOL DEGRADED</b>\nAll connections down for {down_secs}s. \
@@ -2473,6 +2505,7 @@ impl NotificationEvent {
             Self::WebSocketConnected { .. } => "WebSocketConnected",
             Self::WebSocketPoolOnline { .. } => "WebSocketPoolOnline",
             Self::WebSocketPoolPartialAfterDeadline { .. } => "WebSocketPoolPartialAfterDeadline",
+            Self::WebSocketPoolDeferredOffHours { .. } => "WebSocketPoolDeferredOffHours",
             Self::WebSocketPoolDegraded { .. } => "WebSocketPoolDegraded",
             Self::WebSocketPoolRecovered { .. } => "WebSocketPoolRecovered",
             Self::WebSocketPoolHalt { .. } => "WebSocketPoolHalt",
@@ -2622,6 +2655,7 @@ impl NotificationEvent {
             // controlled separately via `dispatch_policy()`.
             Self::WebSocketPoolOnline { .. } => Severity::Low,
             Self::WebSocketPoolPartialAfterDeadline { .. } => Severity::High,
+            Self::WebSocketPoolDeferredOffHours { .. } => Severity::Low,
             Self::WebSocketPoolDegraded { .. } => Severity::High,
             Self::WebSocketPoolRecovered { .. } => Severity::Medium,
             Self::WebSocketPoolHalt { .. } => Severity::High,
@@ -2713,6 +2747,7 @@ impl NotificationEvent {
             Self::AuthenticationSuccess
             | Self::InstrumentBuildSuccess { .. }
             | Self::WebSocketPoolOnline { .. }
+            | Self::WebSocketPoolDeferredOffHours { .. }
             | Self::Phase2Complete { .. }
             | Self::DepthTwentyConnected { .. }
             | Self::DepthTwoHundredConnected { .. }
@@ -4223,6 +4258,56 @@ mod tests {
                 event.topic()
             );
         }
+    }
+
+    /// 2026-05-09 off-hours-gate ratchet (operator complaint): an
+    /// off-hours boot used to fire `[HIGH] TickVault is partially
+    /// online — 0/5 feeds connected (5 stuck)` because the boot-time
+    /// `WebSocketPoolPartialAfterDeadline` (Severity::High) emitter
+    /// did not gate on market hours. The new
+    /// `WebSocketPoolDeferredOffHours` variant replaces it
+    /// outside `[09:00, 15:30) IST` and MUST be Severity::Low +
+    /// DispatchPolicy::Immediate (single ✅ ping, no coalesce).
+    /// Blocks regression to the false-HIGH alarm.
+    #[test]
+    fn test_pool_deferred_off_hours_is_immediate_low_not_high() {
+        let event = NotificationEvent::WebSocketPoolDeferredOffHours {
+            deferred: 5,
+            total: 5,
+            boot_path: BootPathLabel::Slow,
+        };
+        assert_eq!(
+            event.severity(),
+            Severity::Low,
+            "off-hours boot deferred MUST render green ✅ [LOW] — \
+             pre-2026-05-09 it incorrectly fired [HIGH] partial-online"
+        );
+        assert_eq!(
+            event.dispatch_policy(),
+            DispatchPolicy::Immediate,
+            "off-hours boot deferred is a boot-success milestone — \
+             must ship instantly alongside the other 7 immediate events"
+        );
+        assert_eq!(event.topic(), "WebSocketPoolDeferredOffHours");
+        let body = event.to_message();
+        assert!(
+            body.contains("DEFERRED") || body.contains("deferred") || body.contains("until 09:00"),
+            "body must explain WHY the connections are not yet up: {body}"
+        );
+        // Negative ratchet: the partial-after-deadline (in-market) variant
+        // MUST keep firing High so genuine in-market faults still page.
+        let in_market = NotificationEvent::WebSocketPoolPartialAfterDeadline {
+            connected: 4,
+            total: 5,
+            per_connection: vec![(0, 5000, None); 5],
+            stuck: vec![(4, "Disconnected".to_string())],
+            boot_path: BootPathLabel::Slow,
+        };
+        assert_eq!(
+            in_market.severity(),
+            Severity::High,
+            "in-market partial pool MUST stay High — regression block"
+        );
     }
 
     #[test]
