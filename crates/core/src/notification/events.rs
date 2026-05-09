@@ -2700,10 +2700,23 @@ impl NotificationEvent {
     /// the full rationale (operator complaint 2026-05-09).
     pub fn dispatch_policy(&self) -> DispatchPolicy {
         match self {
+            // Boot-success milestones — operator's at-a-glance "is the
+            // boot OK?" Telegram pings. PR #526 added the first 4
+            // (Auth/Instruments/PoolOnline/Phase2Complete). PR #6
+            // (2026-05-09 operator request) added the 3 per-WS connect
+            // events so depth-20 / depth-200 / order-update successful
+            // handshakes ship as instant green ✅ pings instead of
+            // coalescing for 60s. Rationale: the Saturday mock-session
+            // boot showed `WebSocketConnected x5` arriving 60s after
+            // `TickVault is live` — operator needs each WS surface to
+            // confirm in real time, not as a delayed batch.
             Self::AuthenticationSuccess
             | Self::InstrumentBuildSuccess { .. }
             | Self::WebSocketPoolOnline { .. }
-            | Self::Phase2Complete { .. } => DispatchPolicy::Immediate,
+            | Self::Phase2Complete { .. }
+            | Self::DepthTwentyConnected { .. }
+            | Self::DepthTwoHundredConnected { .. }
+            | Self::OrderUpdateConnected => DispatchPolicy::Immediate,
             _ => DispatchPolicy::Default,
         }
     }
@@ -4168,6 +4181,46 @@ mod tests {
             assert!(
                 event.severity().tag().contains("[LOW]"),
                 "tag drift detected"
+            );
+        }
+    }
+
+    /// 2026-05-09 PR 6 ratchet (operator request): every per-WS connect
+    /// event MUST render green ✅ [LOW] AND ship immediately. Pre-this-PR
+    /// these events used `DispatchPolicy::Default` → 60s coalesce, so the
+    /// operator's Saturday boot showed `WebSocketConnected x5` arriving
+    /// 60s after `TickVault is live`. Each WS surface now confirms in
+    /// real time. Blocks regression to the coalesced-by-default pattern.
+    #[test]
+    fn test_per_ws_connect_events_are_immediate_low() {
+        let events = [
+            NotificationEvent::DepthTwentyConnected {
+                underlying: "NIFTY".to_string(),
+            },
+            NotificationEvent::DepthTwoHundredConnected {
+                contract: "NIFTY-Jun2026-25000-CE".to_string(),
+                security_id: 12345,
+            },
+            NotificationEvent::OrderUpdateConnected,
+        ];
+        for event in events {
+            assert_eq!(
+                event.dispatch_policy(),
+                DispatchPolicy::Immediate,
+                "{} must request immediate dispatch (operator request 2026-05-09 — \
+                 per-WS connect should not coalesce 60s alongside the boot summary)",
+                event.topic()
+            );
+            assert_eq!(
+                event.severity(),
+                Severity::Low,
+                "{} must render green ✅ [LOW] (success ping)",
+                event.topic()
+            );
+            assert!(
+                event.severity().tag().contains("[LOW]"),
+                "tag drift detected for {}",
+                event.topic()
             );
         }
     }
