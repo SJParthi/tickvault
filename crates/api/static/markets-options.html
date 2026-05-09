@@ -951,34 +951,57 @@ function switchFilter(filter) {
     loadData();
 }
 
-/* ===== DATA FETCHING ===== */
+/* ===== DATA FETCHING =====
+ * 2026-05-09 PR 5b2: migrated from `/api/market/option-movers` to the
+ * unified `/api/movers/v2` endpoint backed by the in-RAM 29-TF
+ * CascadeFanout. The legacy `currentFilter` value (`top_volume`,
+ * `oi_gainers`, etc.) maps directly to V2's `category` query param
+ * after a small label-translation table.
+ *
+ * Field mapping V2-bar -> row:
+ *   bar.security_id              -> row.name (rendered as "SID-{id}"
+ *                                    until InstrumentRegistry plumb-in)
+ *   bar.close                    -> row.ltp
+ *   bar.close - prev_day_close   -> row.change
+ *   bar.close_pct_from_prev_day  -> row.change_pct
+ *   bar.oi                       -> row.oi
+ *   bar.oi - prev_day_oi         -> row.oi_change
+ *   bar.oi_pct_from_prev_day     -> row.oi_change_pct
+ *   bar.volume                   -> row.volume
+ * `spot` is no longer supplied (legacy field came from a JOIN against
+ * the underlying); callers should resolve via `/api/quote/{security_id}`
+ * if needed.
+ */
+function mapV2OptionBarToRow(b) {
+    var ltp = b.close || 0;
+    var prevClose = b.prev_day_close || 0;
+    var prevOi = b.prev_day_oi || 0;
+    var oi = b.oi || 0;
+    return {
+        name: 'SID-' + b.security_id,
+        security_id: b.security_id,
+        spot: 0,
+        ltp: ltp,
+        change: (ltp && prevClose) ? (ltp - prevClose) : 0,
+        change_pct: b.close_pct_from_prev_day || 0,
+        oi: oi,
+        oi_change: oi - prevOi,
+        oi_change_pct: b.oi_pct_from_prev_day || 0,
+        volume: b.volume || 0
+    };
+}
+
 function loadData() {
-    fetch('/api/market/option-movers?category=' + currentFilter)
+    var url = '/api/movers/v2?category=' + currentFilter +
+              '&scope=index&n=20&timeframe=1m';
+    fetch(url)
         .then(function(r) {
             if (!r.ok) throw new Error('HTTP ' + r.status);
             return r.json();
         })
         .then(function(d) {
-            if (d && d.available) {
-                /* PR #449 hostile-bug-hunt C2 fix: backend returns
-                   { available, category, entries } flat. Legacy
-                   d[currentFilter] / d.highest_oi keys never existed
-                   on the new response shape and would always fall
-                   through to []. Read d.entries directly. */
-                var list = d.entries || [];
-                var mapped = list.map(function(o) {
-                    return {
-                        name: o.contract_name || o.name,
-                        spot: o.spot_price || o.spot,
-                        ltp: o.ltp,
-                        change: o.change,
-                        change_pct: o.change_pct,
-                        oi: o.oi,
-                        oi_change: o.oi_change,
-                        oi_change_pct: o.oi_change_pct,
-                        volume: o.volume
-                    };
-                });
+            if (d && Array.isArray(d.bars) && d.bars.length > 0) {
+                var mapped = d.bars.map(mapV2OptionBarToRow);
                 if (mapped.length > 0) {
                     renderOptionsTable(sortByFilter(mapped, currentFilter));
                     return;

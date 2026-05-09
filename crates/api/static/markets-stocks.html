@@ -948,27 +948,43 @@ function switchFilter(filter) {
     loadData();
 }
 
-/* ===== DATA FETCHING ===== */
+/* ===== DATA FETCHING =====
+ * 2026-05-09 PR 5b2: migrated from `/api/market/stock-movers` (V1
+ * SQL against `movers_5s` matview) to `/api/movers/v2`. The V2
+ * endpoint reads bars directly from the in-RAM 29-TF CascadeFanout.
+ * Field mapping:
+ *   bar.security_id              -> row.security_id
+ *   bar.close                    -> row.ltp (last sealed close)
+ *   bar.close - prev_day_close   -> row.change
+ *   bar.close_pct_from_prev_day  -> row.change_pct (seal-time stamped)
+ *   bar.volume                   -> row.volume
+ * `symbol` is not yet supplied by V2 (resolves to "SID-{id}" until a
+ * future PR plumbs InstrumentRegistry into the V2 response).
+ */
 function loadData() {
-    fetch('/api/market/stock-movers')
+    var category = showGainers ? 'price_gainers' : 'price_losers';
+    var url = '/api/movers/v2?category=' + category +
+              '&scope=stock&n=20&timeframe=1m';
+    fetch(url)
         .then(function(r) {
             if (!r.ok) throw new Error('HTTP ' + r.status);
             return r.json();
         })
         .then(function(d) {
-            if (d && d.available) {
-                var key = showGainers ? 'gainers' : 'losers';
-                var list = d[key] || [];
-                /* Map API fields to our display format */
-                var mapped = list.map(function(s) {
-                    var valueCr = (s.ltp && s.volume) ? ((s.ltp * s.volume) / 10000000) : 0;
+            if (d && Array.isArray(d.bars) && d.bars.length > 0) {
+                var mapped = d.bars.map(function(b) {
+                    var ltp = b.close || 0;
+                    var prev = b.prev_day_close || 0;
+                    var change = (ltp && prev) ? (ltp - prev) : 0;
+                    var changePct = b.close_pct_from_prev_day || 0;
+                    var valueCr = (ltp && b.volume) ? ((ltp * b.volume) / 10000000) : 0;
                     return {
-                        symbol: s.symbol || ('SID-' + s.security_id),
-                        ltp: s.ltp,
-                        change: s.change,
-                        change_pct: s.change_pct,
+                        symbol: 'SID-' + b.security_id,
+                        ltp: ltp,
+                        change: change,
+                        change_pct: changePct,
                         value_cr: valueCr,
-                        volume: s.volume
+                        volume: b.volume || 0
                     };
                 });
                 if (mapped.length > 0) {
