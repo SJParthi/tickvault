@@ -503,6 +503,12 @@ pub async fn ensure_candle_views(questdb_config: &QuestDbConfig) {
     // matview chain now mirrors it exactly. Idempotent on every boot.
     drop_tf_reduction_retired_views(&client, &base_url).await;
 
+    // Step 4e (2026-05-09 PR 5c.5-final — Bug 3 movers retirement):
+    // drop the 25 retired `movers_*` matviews AND the `movers_1s` base
+    // table. Operator directive: "only ticks and our 9 needed candle
+    // timeframes are available". Idempotent on every boot.
+    drop_bug3_retired_views(&client, &base_url).await;
+
     // Step 5: Create materialized views in dependency order.
     let mut created_count: u32 = 0;
     for def in VIEW_DEFS {
@@ -1060,6 +1066,79 @@ async fn drop_tf_reduction_retired_views(client: &reqwest::Client, base_url: &st
     info!(
         view_count = TF_REDUCTION_RETIRED_MATERIALIZED_VIEWS.len(),
         "TF-reduction retired views dropped (5 sub-minute + 7d + 1M)"
+    );
+}
+
+/// 2026-05-09 PR 5c.5-final (Bug 3 — movers retirement): the entire
+/// `movers_1s` base table + 25 `movers_*` materialized views are
+/// retired. Operator directive: "only ticks and our 9 needed candle
+/// timeframes are available". On boot, `drop_bug3_retired_views`
+/// issues `DROP MATERIALIZED VIEW IF EXISTS` for each of the 25 views
+/// AND `DROP TABLE IF EXISTS movers_1s` so QuestDB instances upgraded
+/// across this commit don't keep stale orphan objects.
+///
+/// Idempotent — safe on greenfield deployments and on every boot.
+const BUG3_RETIRED_MATERIALIZED_VIEWS: &[&str] = &[
+    "movers_5s",
+    "movers_10s",
+    "movers_15s",
+    "movers_30s",
+    "movers_1m",
+    "movers_2m",
+    "movers_3m",
+    "movers_4m",
+    "movers_5m",
+    "movers_6m",
+    "movers_7m",
+    "movers_8m",
+    "movers_9m",
+    "movers_10m",
+    "movers_11m",
+    "movers_12m",
+    "movers_13m",
+    "movers_14m",
+    "movers_15m",
+    "movers_30m",
+    "movers_1h",
+    "movers_2h",
+    "movers_3h",
+    "movers_4h",
+    "movers_1d",
+];
+
+/// 2026-05-09 PR 5c.5-final: drops the 25 retired `movers_*` matviews
+/// AND the `movers_1s` base table so QuestDB instances upgraded across
+/// this commit don't keep stale orphan objects. `IF EXISTS` is
+/// idempotent — safe on greenfield deployments and on every boot.
+async fn drop_bug3_retired_views(client: &reqwest::Client, base_url: &str) {
+    // Drop matviews FIRST (they depend on the base table).
+    for name in BUG3_RETIRED_MATERIALIZED_VIEWS {
+        let drop_sql = format!("DROP MATERIALIZED VIEW IF EXISTS {name}");
+        drop(
+            client
+                .get(base_url)
+                .query(&[("query", &drop_sql)])
+                .send()
+                .await,
+        );
+        debug!(view = name, "dropped Bug 3 retired movers matview");
+    }
+    // Then drop the base table.
+    let drop_base_sql = "DROP TABLE IF EXISTS movers_1s";
+    drop(
+        client
+            .get(base_url)
+            .query(&[("query", drop_base_sql)])
+            .send()
+            .await,
+    );
+    debug!(
+        table = "movers_1s",
+        "dropped Bug 3 retired movers base table"
+    );
+    info!(
+        view_count = BUG3_RETIRED_MATERIALIZED_VIEWS.len(),
+        "Bug 3 retired movers infrastructure dropped (25 matviews + movers_1s base)"
     );
 }
 
