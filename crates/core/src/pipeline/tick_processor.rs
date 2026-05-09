@@ -506,6 +506,24 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
     let mut stale_day_filtered: u64 = 0;
     let mut last_flush_check = Instant::now();
     let mut last_snapshot_check = Instant::now();
+    // 2026-05-09 diagnostic ratchet (mock-trading-day blackhole investigation):
+    // emit the filter-counter snapshot at INFO every 60 s so the operator
+    // can see WHICH gate (`stale_day_filtered` / `outside_hours_filtered` /
+    // `dedup_filtered` / `junk_ticks_filtered`) is consuming all ticks
+    // when QuestDB shows zero rows. Pre-this-change the only surface was
+    // the Prometheus counters, which the operator's QuestDB / Grafana
+    // dashboards do not expose. Without this log line, "ticks not flowing
+    // on Saturday mock session" required a code dive to diagnose.
+    let mut last_filter_stats_log = Instant::now();
+    let mut last_logged_stale_day: u64 = 0;
+    let mut last_logged_outside_hours: u64 = 0;
+    let mut last_logged_dedup: u64 = 0;
+    let mut last_logged_junk: u64 = 0;
+    let mut last_logged_persisted: u64 = 0;
+    // Local mirror of `m_ticks_persisted` Prometheus counter so the
+    // 60s periodic stats log can show the persisted-vs-filtered ratio
+    // without scraping Prometheus.
+    let mut ticks_persisted: u64 = 0;
     // Phase 4b (2026-05-05): `last_movers_persist` + `movers_persist_count`
     // + `m_movers_persisted` DELETED — they were the timing/count state
     // for the legacy `stock_movers` / `option_movers` writers retired
@@ -936,6 +954,7 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                     match result {
                         Ok(()) => {
                             m_ticks_persisted.increment(1);
+                            ticks_persisted = ticks_persisted.saturating_add(1);
                         }
                         Err(err) => {
                             storage_errors = storage_errors.saturating_add(1);
@@ -1137,6 +1156,7 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                         match result {
                             Ok(()) => {
                                 m_ticks_persisted.increment(1);
+                                ticks_persisted = ticks_persisted.saturating_add(1);
                             }
                             Err(err) => {
                                 storage_errors = storage_errors.saturating_add(1);
@@ -1476,6 +1496,50 @@ pub async fn run_tick_processor<G: GreeksEnricher>(
                 day_close_updates = day_close_baseline_count,
                 "PROOF: day_close baselines set from Full packet ticks (should be >> 0 for all instruments)"
             );
+        }
+
+        // 2026-05-09 diagnostic: every 60 s emit a snapshot of the
+        // filter counters at INFO so the operator can see, without
+        // scraping Prometheus, where ticks are going. Logs the deltas
+        // since the last emit (rates) plus the absolute totals. Skips
+        // the emit when ALL deltas are zero so the log isn't spammed
+        // pre-09:00 / post-15:30 IST when the pipeline is idle by
+        // design. Without this line, "ticks not flowing on Saturday
+        // mock session" took a code dive to triage.
+        if last_filter_stats_log.elapsed().as_secs() >= 60 {
+            let stale_day_delta = stale_day_filtered.saturating_sub(last_logged_stale_day);
+            let outside_hours_delta =
+                outside_hours_filtered.saturating_sub(last_logged_outside_hours);
+            let dedup_delta = dedup_filtered.saturating_sub(last_logged_dedup);
+            let junk_delta = junk_ticks_filtered.saturating_sub(last_logged_junk);
+            let persisted_delta = ticks_persisted.saturating_sub(last_logged_persisted);
+            let activity_in_window = stale_day_delta
+                .saturating_add(outside_hours_delta)
+                .saturating_add(dedup_delta)
+                .saturating_add(junk_delta)
+                .saturating_add(persisted_delta);
+            if activity_in_window > 0 {
+                info!(
+                    target: "tickvault_core::pipeline::tick_processor::periodic_stats",
+                    persisted_delta,
+                    stale_day_delta,
+                    outside_hours_delta,
+                    dedup_delta,
+                    junk_delta,
+                    persisted_total = ticks_persisted,
+                    stale_day_total = stale_day_filtered,
+                    outside_hours_total = outside_hours_filtered,
+                    dedup_total = dedup_filtered,
+                    junk_total = junk_ticks_filtered,
+                    "tick processor periodic stats — last 60s deltas + totals (use this to triage 'no ticks in QuestDB' on mock-session days)"
+                );
+                last_logged_stale_day = stale_day_filtered;
+                last_logged_outside_hours = outside_hours_filtered;
+                last_logged_dedup = dedup_filtered;
+                last_logged_junk = junk_ticks_filtered;
+                last_logged_persisted = ticks_persisted;
+            }
+            last_filter_stats_log = Instant::now();
         }
 
         // Periodic flush check (every ~100ms worth of frames)
