@@ -58,7 +58,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
-use tickvault_common::market_hours::is_within_market_hours_ist;
+use tickvault_common::market_hours::is_within_trading_session_ist;
 use tracing::{error, info};
 
 use crate::notification::NotificationService;
@@ -116,7 +116,10 @@ async fn run_watchdog_loop(heartbeat: Arc<AtomicI64>, notifier: Option<Arc<Notif
         interval.tick().await;
         let now_secs = chrono::Utc::now().timestamp();
         let last_tick_secs = heartbeat.load(Ordering::Relaxed);
-        let in_hours = is_within_market_hours_ist();
+        // Wave-Holiday-Gate (2026-05-09): trading-session gate (weekday
+        // + market-hours) replaces the legacy time-of-day-only gate.
+        // Saturday/Sunday boots no longer false-fire CRITICAL.
+        let in_hours = is_within_trading_session_ist();
         let verdict = evaluate_heartbeat(now_secs, last_tick_secs, in_hours, &state);
         apply_verdict(verdict, &mut state, notifier.as_ref());
     }
