@@ -7685,22 +7685,29 @@ const WS_BOOT_PER_CONN_DEADLINE_SECS: u64 = 30;
 /// freshness for state transitions without burning CPU.
 const WS_BOOT_POLL_INTERVAL_MS: u64 = 250;
 
-/// Emits per-connection `WebSocketConnected` Telegram events plus a single
-/// aggregate `WebSocketPoolOnline` summary — but ONLY when each connection
-/// has actually reached `ConnectionState::Connected` per `pool.health()`,
-/// not merely "task spawned". Called from BOTH boot paths (FAST BOOT and
-/// slow boot) so an operator sees the same truthful signal regardless of
-/// which path ran.
+/// Polls `pool.health()` every 250ms for up to 30s per slot until each
+/// connection reaches `ConnectionState::Connected`, then emits a single
+/// aggregate `WebSocketPoolOnline` summary (or
+/// `WebSocketPoolPartialAfterDeadline` if any slot remained stuck). Called
+/// from BOTH boot paths (FAST BOOT and slow boot) so an operator sees the
+/// same truthful signal regardless of which path ran.
 ///
-/// PR #458 (2026-05-04): the legacy version emitted both events
+/// PR #458 (2026-05-04): the legacy version emitted both per-connection
+/// `WebSocketConnected` events AND the aggregate `WebSocketPoolOnline`
 /// immediately after `pool.spawn_handles()` returned, using `handle_count`
 /// for both `connected` and `total` — a false-OK when handshake had not
 /// yet completed. The rewrite polls `pool.health()` every 250ms for up
-/// to 30s per slot and emits the per-connection event only on the rising
-/// edge of `Connected`. The aggregate `WebSocketPoolOnline` fires only
-/// when ALL slots are `Connected`; otherwise
-/// `WebSocketPoolPartialAfterDeadline` fires with the stuck-slot
-/// breakdown.
+/// to 30s per slot.
+///
+/// 2026-05-09 (this branch): the per-connection `WebSocketConnected`
+/// emission was removed because it duplicates the aggregate
+/// `WebSocketPoolOnline` (which carries the same per-feed breakdown in
+/// its `per_connection` payload). The two events fired ~60s apart at boot
+/// because `WebSocketConnected` is `Severity::Low` (coalesced 60s) and
+/// `WebSocketPoolOnline` is `Severity::Medium` (immediate dispatch),
+/// producing visible duplicate signal on operator's Telegram. The
+/// aggregate `WebSocketPoolOnline` is the single source of truth for boot
+/// success; `WebSocketReconnected` covers post-boot reconnect transitions.
 async fn emit_websocket_connected_alerts(
     notifier: &std::sync::Arc<NotificationService>,
     pool: &std::sync::Arc<WebSocketConnectionPool>,
@@ -7713,7 +7720,12 @@ async fn emit_websocket_connected_alerts(
         return;
     }
     let capacity = tickvault_common::constants::MAX_INSTRUMENTS_PER_WEBSOCKET_CONNECTION;
-    let mut emitted_per_conn = vec![false; total];
+    // Bookkeeping array: tracks which slots have reached Connected at least
+    // once during the polling window. We no longer emit a per-connection
+    // `WebSocketConnected` event here — see fn docstring for rationale.
+    // The array is still used to drive the early-exit condition once all
+    // slots have transitioned to Connected.
+    let mut connected_seen = vec![false; total];
     let deadline =
         std::time::Instant::now() + std::time::Duration::from_secs(WS_BOOT_PER_CONN_DEADLINE_SECS);
 
@@ -7721,20 +7733,14 @@ async fn emit_websocket_connected_alerts(
         let healths = pool.health();
         for h in &healths {
             let i = h.connection_id as usize;
-            if i >= total || emitted_per_conn[i] {
+            if i >= total || connected_seen[i] {
                 continue;
             }
             if h.state == tickvault_core::websocket::types::ConnectionState::Connected {
-                emitted_per_conn[i] = true;
-                notifier.notify(NotificationEvent::WebSocketConnected {
-                    connection_index: i,
-                    subscribed_count: h.subscribed_count,
-                    capacity,
-                    last_activity_secs_ago: h.last_activity_secs_ago,
-                });
+                connected_seen[i] = true;
             }
         }
-        if emitted_per_conn.iter().all(|v| *v) {
+        if connected_seen.iter().all(|v| *v) {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(WS_BOOT_POLL_INTERVAL_MS)).await;
