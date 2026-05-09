@@ -111,26 +111,16 @@ pub fn build_router_with_auth(
             "/api/quote/{security_id}",
             axum::routing::get(handlers::quote::get_quote),
         )
-        // PR #450 (2026-05-03): unified Dhan-parity /api/movers route
-        // — single dynamic endpoint with 6 query params matching Dhan's
-        // Markets > Options frontend. Replaces both legacy routes:
-        //   - /api/top-movers (PR #446 — 9-bucket NSE_EQ-only)
-        //   - /api/movers (V2 — in-memory MoversTrackerV2 snapshot)
-        // The legacy handlers will be deleted in commit 6 of PR #450
-        // (only the V2 handler is freed by removing this route here;
-        // /api/top-movers route is freed below).
-        .route(
-            "/api/movers",
-            axum::routing::get(handlers::movers::get_movers),
-        )
-        // PR #450 commit 5 (2026-05-03): companion expiries route —
-        // returns sorted list of available derivative expiry dates so
-        // the frontend can populate Dhan's middle dropdown
-        // (May / June / July ...) data-driven instead of hardcoded.
-        .route(
-            "/api/movers/expiries",
-            axum::routing::get(handlers::movers::get_expiries),
-        )
+        // 2026-05-09 cleanup (PR 5a): the V1 `/api/movers` and
+        // `/api/movers/expiries` routes have been removed. The unified
+        // V2 endpoint `/api/movers/v2` (registered conditionally below
+        // when AppState carries `cascade_fanout`) is the single source
+        // of truth for the Dhan-parity movers UI. The V1 handlers had
+        // zero frontend consumers (verified by grepping
+        // `crates/api/static/`). The V1 SQL-backed implementation
+        // queried `movers_*` matviews — that infrastructure is being
+        // retired in subsequent PRs (5b/c/d) to match plan §P operator
+        // directive: "ticks and candles alone".
         .route(
             "/api/instruments/diagnostic",
             axum::routing::get(handlers::instruments::instrument_diagnostic),
