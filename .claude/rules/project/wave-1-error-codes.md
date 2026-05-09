@@ -123,3 +123,55 @@ required during the PR #452 transition window).
 **Source:** `crates/app/src/main.rs::spawn_movers_pipeline` boot
 wiring + `crates/core/src/option_chain/prev_oi.rs::extract_prev_oi_from_option_chain`
 + `crates/core/src/instrument/bhavcopy_cross_check.rs::build_prev_oi_cache_from_bhavcopy`.
+
+## PREVCLOSE-04 — F2 PrevDayCache boot loader degraded
+
+**Trigger:** F2 (Wave-5 §K-L13 / #504e follow-up, 2026-05-08) wires
+`crates/app/src/prev_day_cache_loader.rs::populate_prev_day_cache_at_boot`
+into the boot path so the cascade seal-time pct-stamping path
+(PR #520 / F1) sees non-zero `prev_day_close` values from QuestDB's
+`previous_close` table on cold boot. Two failure modes both surface
+as `PREVCLOSE-04`:
+
+1. **QuestDB unreachable** — the boot SELECT against `previous_close`
+   failed (network timeout, table corruption, /exec returns non-2xx).
+   Emitted at `error!` level so Loki routes to Telegram.
+2. **`previous_close` empty** — the table has zero rows for the last
+   7 trading days (lookback window pinned by
+   `QUESTDB_LOOKBACK_DAYS = 7`). Fresh deployment, or an outage
+   during the previous trading session that prevented
+   `PreviousCloseWriter::append_prev_close` writes. Emitted at
+   `warn!` level — degraded but expected on a brand-new deployment.
+
+**App behaviour:** the cascade seal-time pct-stamping path falls
+back to `0.0` for the 3 % fields (`close_pct_from_prev_day`,
+`oi_pct_from_prev_day`, `volume_pct_from_prev_day`) per the
+`compute_*_pct` div-by-zero policy. No tick is dropped, no seal is
+lost — operator simply sees zero-valued % columns until the next
+boot succeeds in reading `previous_close`.
+
+**Severity:** Medium. Visibility WARN/ERROR for the operator;
+NOT a boot-halt. The downstream read path is safe by construction.
+
+**Triage:**
+
+1. `mcp__tickvault-logs__questdb_sql "select count(*) from previous_close where ts > dateadd('d', -7, now())"`
+   — 0 rows means the table is empty; either the previous session's
+   `PreviousCloseWriter` never wrote (check for `PREVCLOSE-01`
+   ILP failures) or the QuestDB partition was dropped.
+2. `mcp__tickvault-logs__run_doctor` to confirm QuestDB health.
+3. If the table has rows but the loader still fails: inspect the
+   `error!` payload — the truncated body field carries the QuestDB
+   `/exec` HTTP body (200 char cap).
+4. After remediation, restart the app — the loader runs once at
+   boot, no in-process retry. The next boot will pick up any rows
+   that have since been written.
+
+**Auto-triage safe:** YES (visibility-only WARN/ERROR; the cascade
+fallback prevents data corruption).
+
+**Source:**
+- `crates/app/src/prev_day_cache_loader.rs::populate_prev_day_cache_at_boot`
+- `crates/common/src/error_code.rs::PrevClose04CacheEmptyAtBoot`
+- Boot wiring: `crates/app/src/main.rs` (after the
+  `prev_oi cache populated` log).
