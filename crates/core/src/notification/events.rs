@@ -77,6 +77,44 @@ impl Severity {
     }
 }
 
+/// Dispatch policy for a notification event — separates "urgency-of-display"
+/// (the Severity color/tag) from "should-this-bypass-the-coalescer".
+///
+/// Pre-2026-05-09 the coalescer made the bypass decision purely from
+/// `Severity` (Critical/High/Medium → bypass, Low/Info → coalesce). That
+/// conflated TWO orthogonal axes:
+///
+/// * **Color** — operator's at-a-glance urgency cue. Boot-success events
+///   ("✅ TickVault is live") want green = `Severity::Low`.
+/// * **Routing** — should this message be sent immediately, or batched
+///   into a 60-second coalesced summary. Boot-success events want
+///   immediate dispatch so the operator sees the boot sequence in real
+///   time, not a minute later.
+///
+/// PR #523 (2026-05-09 holiday-gate fix) bumped `AuthenticationSuccess` +
+/// `InstrumentBuildSuccess` from `Low` → `Medium` to force immediate
+/// dispatch. The side effect: those messages turned amber 🔵 even though
+/// they were boot-success pings. Operator complained 2026-05-09:
+/// "why MEDIUM when this is first fresh clone first fresh run app and
+/// first fresh docker run, this should be low green right when this is
+/// successful".
+///
+/// This enum is the fix: events declare their dispatch policy independently
+/// of severity. Boot-success events render as `Severity::Low` (green ✅)
+/// AND set `DispatchPolicy::Immediate` so they bypass the coalescer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchPolicy {
+    /// Bypass the coalescer — dispatch immediately regardless of severity.
+    /// Used for boot-success milestones and other events where freshness
+    /// matters more than batching.
+    Immediate,
+    /// Use the severity-based default routing:
+    /// `Critical/High/Medium` → immediate, `Low/Info` → coalesce.
+    /// This is the catch-all for events that don't have a specific
+    /// freshness requirement.
+    Default,
+}
+
 /// Which depth levels participate in a routine rebalance swap.
 ///
 /// `TwentyOnly` — the underlying has only a 20-level feed (FINNIFTY,
@@ -2579,7 +2617,10 @@ impl NotificationEvent {
             Self::ShutdownInitiated => Severity::Medium,
             Self::CircuitBreakerClosed => Severity::Medium,
             Self::WebSocketConnected { .. } => Severity::Low,
-            Self::WebSocketPoolOnline { .. } => Severity::Medium,
+            // 2026-05-09: demoted Medium → Low so the boot-success summary
+            // renders as ✅ [LOW] (green). Immediate dispatch is now
+            // controlled separately via `dispatch_policy()`.
+            Self::WebSocketPoolOnline { .. } => Severity::Low,
             Self::WebSocketPoolPartialAfterDeadline { .. } => Severity::High,
             Self::WebSocketPoolDegraded { .. } => Severity::High,
             Self::WebSocketPoolRecovered { .. } => Severity::Medium,
@@ -2599,7 +2640,9 @@ impl NotificationEvent {
             Self::DepthSpotPriceStale { .. } => Severity::High,
             Self::Phase2Started { .. } => Severity::Medium,
             Self::Phase2RunImmediate { .. } => Severity::Medium,
-            Self::Phase2Complete { .. } => Severity::Medium,
+            // 2026-05-09: demoted Medium → Low so Phase 2 success renders
+            // as ✅ [LOW] (green). Immediate dispatch via `dispatch_policy()`.
+            Self::Phase2Complete { .. } => Severity::Low,
             Self::Phase2Failed { .. } => Severity::High,
             Self::Phase2Skipped { .. } => Severity::Low,
             Self::Phase2ReadinessPassed { .. } => Severity::Info,
@@ -2624,8 +2667,14 @@ impl NotificationEvent {
             // — i.e. WebSocketPoolOnline (Medium, immediate) was arriving
             // BEFORE Auth/Instruments (Low, drained 60s later). Promoting
             // these two to Medium restores the natural boot ordering.
-            Self::AuthenticationSuccess => Severity::Medium,
-            Self::InstrumentBuildSuccess { .. } => Severity::Medium,
+            // 2026-05-09: PR #523 had bumped these two to Medium specifically
+            // to force immediate dispatch (they used to coalesce 60s as Low,
+            // breaking the boot-Telegram ordering). With the new
+            // `DispatchPolicy::Immediate` mechanism the severity stays Low
+            // (green ✅) AND the message ships immediately. Operator's
+            // 2026-05-09 complaint resolved.
+            Self::AuthenticationSuccess => Severity::Low,
+            Self::InstrumentBuildSuccess { .. } => Severity::Low,
             Self::BootHealthCheck { .. } => Severity::Low,
             Self::StartupComplete { .. } => Severity::Info,
             Self::ShutdownComplete => Severity::Info,
@@ -2633,6 +2682,29 @@ impl NotificationEvent {
             Self::Depth20DynamicSwapChannelBroken { .. } => Severity::Critical,
             Self::Depth20DynamicSwapApplied { .. } => Severity::Low,
             Self::DepthDynamicV2DiffApplied { .. } => Severity::Low,
+        }
+    }
+
+    /// Returns the dispatch policy for this event — independent of severity.
+    ///
+    /// Most events return `DispatchPolicy::Default` so the coalescer falls
+    /// back to severity-based routing (Critical/High/Medium → immediate;
+    /// Low/Info → 60s coalescer window).
+    ///
+    /// A small set of boot-success events return
+    /// `DispatchPolicy::Immediate` so they bypass the coalescer regardless
+    /// of their `Severity::Low` color. This preserves the boot-Telegram
+    /// ordering operators expect (Auth → Instruments → TickVault is live →
+    /// Phase 2 complete) without forcing the messages to render in amber
+    /// `[MEDIUM]` instead of green `[LOW]`. See `DispatchPolicy` doc for
+    /// the full rationale (operator complaint 2026-05-09).
+    pub fn dispatch_policy(&self) -> DispatchPolicy {
+        match self {
+            Self::AuthenticationSuccess
+            | Self::InstrumentBuildSuccess { .. }
+            | Self::WebSocketPoolOnline { .. }
+            | Self::Phase2Complete { .. } => DispatchPolicy::Immediate,
+            _ => DispatchPolicy::Default,
         }
     }
 }
@@ -3966,18 +4038,21 @@ mod tests {
     }
 
     #[test]
-    fn test_instrument_build_success_severity() {
-        // Wave-Holiday-Gate (2026-05-09): bumped Low → Medium so the
-        // boot-milestone signal dispatches immediately instead of
-        // coalescing in the 60s Low window. Restores natural boot
-        // ordering — Auth + Instruments OK arrive BEFORE the
-        // "ready to trade" Medium summary.
+    fn test_instrument_build_success_severity_and_dispatch() {
+        // 2026-05-09 (PR #523 → this PR): the Wave-Holiday-Gate fix
+        // had bumped this severity Low → Medium to force immediate
+        // dispatch through the coalescer. That made the message render
+        // amber 🔵 instead of green ✅ — operator complaint 2026-05-09.
+        // The new `DispatchPolicy` mechanism decouples color from
+        // routing: severity is back to Low (green) AND dispatch policy
+        // is `Immediate` (bypasses coalescer).
         let event = NotificationEvent::InstrumentBuildSuccess {
             source: "primary".to_string(),
             derivative_count: 100,
             underlying_count: 10,
         };
-        assert_eq!(event.severity(), Severity::Medium);
+        assert_eq!(event.severity(), Severity::Low);
+        assert_eq!(event.dispatch_policy(), DispatchPolicy::Immediate);
     }
 
     #[test]
@@ -4038,13 +4113,63 @@ mod tests {
     }
 
     #[test]
-    fn test_auth_success_severity() {
-        // Wave-Holiday-Gate (2026-05-09): bumped Low → Medium for the
-        // same reason as InstrumentBuildSuccess (boot ordering).
+    fn test_auth_success_severity_and_dispatch() {
+        // 2026-05-09: see `test_instrument_build_success_severity_and_dispatch`
+        // for the full rationale. Severity is Low (green ✅), dispatch
+        // policy is `Immediate` (bypasses coalescer).
         assert_eq!(
             NotificationEvent::AuthenticationSuccess.severity(),
-            Severity::Medium
+            Severity::Low
         );
+        assert_eq!(
+            NotificationEvent::AuthenticationSuccess.dispatch_policy(),
+            DispatchPolicy::Immediate
+        );
+    }
+
+    /// Default dispatch policy returns `Default` — exercised here so the
+    /// `pub fn dispatch_policy` has dedicated test coverage. Most events
+    /// fall through to this arm; the coalescer applies the severity-based
+    /// routing fallback in that case.
+    #[test]
+    fn test_dispatch_policy_default_returns_default() {
+        let event = NotificationEvent::TokenRenewed;
+        assert_eq!(event.dispatch_policy(), DispatchPolicy::Default);
+    }
+
+    /// 2026-05-09 ratchet — assert that every event with
+    /// `DispatchPolicy::Immediate` AND `Severity::Low` retains the green
+    /// ✅ tag. Pre-this-PR these events were force-bumped to Medium for
+    /// immediate dispatch, which broke the color contract. This test
+    /// blocks regression to the old severity-overloads-routing pattern.
+    #[test]
+    fn test_immediate_dispatch_low_severity_events_render_green_tag() {
+        let events = [
+            NotificationEvent::AuthenticationSuccess,
+            NotificationEvent::InstrumentBuildSuccess {
+                source: "primary".to_string(),
+                derivative_count: 100,
+                underlying_count: 10,
+            },
+        ];
+        for event in events {
+            assert_eq!(
+                event.dispatch_policy(),
+                DispatchPolicy::Immediate,
+                "{} must request immediate dispatch",
+                event.topic()
+            );
+            assert_eq!(
+                event.severity(),
+                Severity::Low,
+                "{} must render green ✅ [LOW] (color decoupled from routing)",
+                event.topic()
+            );
+            assert!(
+                event.severity().tag().contains("[LOW]"),
+                "tag drift detected"
+            );
+        }
     }
 
     #[test]
