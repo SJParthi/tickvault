@@ -3150,6 +3150,11 @@ async fn main() -> Result<()> {
                 // `DepthDynamicV2DiffApplied` events on every non-no-op cycle.
                 registry: slow_registry.clone(),
                 notifier: Some(notifier.clone()),
+                // 2026-05-09 PR 5c.2 — RAM-first cohort fetch via the
+                // in-RAM CascadeFanout. Falls back to the legacy
+                // `movers_1m` SQL path automatically when the snapshot
+                // is empty (early boot before the cascade is primed).
+                cascade: Some(std::sync::Arc::new(cascade_fanout.clone())),
             };
             let d20_pipeline_handle =
                 tickvault_app::depth_dynamic_pipeline_v2::spawn_depth_dynamic_pool(
@@ -3258,6 +3263,11 @@ async fn main() -> Result<()> {
                 window_secs: config.depth_200.dynamic.universe.window_secs,
                 registry: slow_registry.clone(),
                 notifier: Some(notifier.clone()),
+                // 2026-05-09 PR 5c.2 — RAM-first cohort fetch via the
+                // in-RAM CascadeFanout. Falls back to the legacy
+                // `movers_1m` SQL path automatically when the snapshot
+                // is empty (early boot before the cascade is primed).
+                cascade: Some(std::sync::Arc::new(cascade_fanout.clone())),
             };
             let d200_pipeline_handle =
                 tickvault_app::depth_dynamic_pipeline_v2::spawn_depth_dynamic_pool(
