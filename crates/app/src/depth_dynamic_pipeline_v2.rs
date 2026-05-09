@@ -532,6 +532,103 @@ async fn fetch_cohort_from_questdb(cfg: &PipelineConfig) -> anyhow::Result<Vec<M
     parse_cohort_dataset(dataset)
 }
 
+/// 2026-05-09 PR 5c.1 — RAM-backed Stage-1 cohort fetcher (additive,
+/// not yet wired). Replaces the QuestDB SQL path against `movers_1m`
+/// with a direct read over an in-RAM `Vec<Bar>` slice (typically the
+/// caller's `CascadeFanout::snapshot_1m()` output).
+///
+/// **Why a separate function (Option B per `active-plan-movers-cleanup-5b-5c-5d.md`):**
+/// `Bar` carries `security_id` + `exchange_segment_code` but NOT
+/// `instrument_type`. The `instrument_type` filter is essential —
+/// today's default config restricts the cohort to `["OPTIDX"]`
+/// (index-option contracts only). To preserve that semantic without
+/// expanding `Bar` (which would touch the cascade hot path), this
+/// function performs a per-row `InstrumentRegistry::get_with_segment`
+/// lookup. The lookup is O(1) via the registry's `papaya` map and the
+/// cohort caps at `MAX_COHORT_SIZE` rows, so total cost stays bounded.
+///
+/// **Equivalence to `build_cohort_sql`:** same filter set in the same
+/// order:
+/// 1. Time window — N/A in RAM (caller passes a fresh snapshot).
+/// 2. `exchange_segment` filter — applied via `Bar.exchange_segment_code`.
+/// 3. `instrument_type` filter — applied via registry lookup.
+/// 4. `volume_cumulative >= min_liquidity_volume` — applied via
+///    `Bar.volume`.
+/// 5. ORDER BY `volume_cumulative` DESC, LIMIT `MAX_COHORT_SIZE` —
+///    applied as in-place sort + truncate.
+///
+/// **Returns** `Vec<MoverRow>` shape-identical to
+/// `fetch_cohort_from_questdb` so Stage-2 (`select_top_k_dynamic`)
+/// is unchanged.
+///
+/// **Status:** dormant — not yet called from
+/// `run_depth_dynamic_pipeline_v2`. Wire-up + writer deletion come in
+/// PR 5c.2 once this function has CI-green tests pinning the
+/// equivalence to the SQL path.
+#[must_use]
+pub fn fetch_cohort_from_ram(
+    bars: &[tickvault_trading::candles::Bar],
+    registry: &tickvault_common::instrument_registry::InstrumentRegistry,
+    exchange_segments: &[String],
+    instrument_types: &[String],
+    min_liquidity_volume: u64,
+    max_cohort_size: usize,
+) -> Vec<MoverRow> {
+    if bars.is_empty() || max_cohort_size == 0 {
+        return Vec::new();
+    }
+    // Pre-allocate capacity bounded by the smaller of bars.len() and
+    // max_cohort_size — cold path (60s cadence), bounded ≤ ~500 rows.
+    let cap = bars.len().min(max_cohort_size);
+    let mut out: Vec<MoverRow> = Vec::with_capacity(cap);
+
+    for bar in bars {
+        // Liquidity gate first — cheapest filter, fails fast.
+        if (bar.volume as u64) < min_liquidity_volume {
+            continue;
+        }
+        // Resolve segment code → ExchangeSegment enum → string label.
+        // Falls back to skip on unknown code (defensive — should never
+        // happen for a Bar produced by the cascade).
+        let Some(seg_enum) = ExchangeSegment::from_byte(bar.exchange_segment_code) else {
+            continue;
+        };
+        let seg_label = seg_enum.as_str();
+        if !exchange_segments.is_empty() && !exchange_segments.iter().any(|s| s == seg_label) {
+            continue;
+        }
+        // Composite-key registry lookup per I-P1-11 (security_id alone
+        // is not unique across segments).
+        let Some(record) = registry.get_with_segment(bar.security_id, seg_enum) else {
+            continue;
+        };
+        // `instrument_type_tag()` returns the "OPTIDX"/"FUTSTK"/etc.
+        // labels used by `movers_pipeline` / `build_cohort_sql`, NOT
+        // `DhanInstrumentKind::as_str()` which returns "OptionIndex".
+        // Equivalence to the SQL filter requires the tag form.
+        let kind_label = record.instrument_type_tag();
+        if !instrument_types.is_empty() && !instrument_types.iter().any(|s| s == kind_label) {
+            continue;
+        }
+        // change_pct comes from PR 5b1.5's seal-time stamp on Bar.
+        out.push(MoverRow {
+            security_id: bar.security_id,
+            exchange_segment: seg_label.to_string(),
+            instrument_type: kind_label.to_string(),
+            volume: bar.volume,
+            change_pct: bar.close_pct_from_prev_day,
+        });
+    }
+
+    // ORDER BY volume DESC. Stable sort preserves insertion order for
+    // equal-volume rows.
+    out.sort_by(|a, b| b.volume.cmp(&a.volume));
+    if out.len() > max_cohort_size {
+        out.truncate(max_cohort_size);
+    }
+    out
+}
+
 /// Parses a QuestDB `/exec` response dataset into `Vec<MoverRow>`.
 ///
 /// Expected column order (matches `build_cohort_sql`):
@@ -1424,6 +1521,184 @@ mod tests {
             }
             other => panic!("expected RemoveSubscriptions20, got {other:?}"),
         }
+    }
+
+    // ---- 2026-05-09 PR 5c.1 — fetch_cohort_from_ram ratchets ----
+    //
+    // The new RAM-backed cohort fetcher must produce the same shape +
+    // semantics as the legacy `fetch_cohort_from_questdb` SQL path.
+    // These tests pin the contract so PR 5c.2 (the actual call-site
+    // swap) lands without behavioural drift.
+
+    fn make_test_bar(
+        security_id: u32,
+        segment_code: u8,
+        volume: i64,
+        change_pct: f64,
+    ) -> tickvault_trading::candles::Bar {
+        tickvault_trading::candles::Bar {
+            bucket_start_ist_secs: 33_000,
+            bucket_end_ist_secs: 33_001,
+            open: 100.0,
+            high: 101.0,
+            low: 99.0,
+            close: 100.5,
+            volume,
+            volume_cum_day_at_end: volume,
+            oi: 0,
+            tick_count: 1,
+            security_id,
+            exchange_segment_code: segment_code,
+            sealed: true,
+            prev_day_close: 100.0,
+            prev_day_oi: 0,
+            close_pct_from_prev_day: change_pct,
+            oi_pct_from_prev_day: 0.0,
+            volume_pct_from_prev_day: 0.0,
+        }
+    }
+
+    fn make_optidx_subscribed(
+        security_id: u32,
+        segment: ExchangeSegment,
+    ) -> tickvault_common::instrument_registry::SubscribedInstrument {
+        use chrono::NaiveDate;
+        use tickvault_common::instrument_registry::SubscribedInstrument;
+        use tickvault_common::instrument_types::DhanInstrumentKind;
+        use tickvault_common::types::{FeedMode, OptionType};
+        SubscribedInstrument {
+            security_id,
+            exchange_segment: segment,
+            category: tickvault_common::instrument_registry::SubscriptionCategory::IndexDerivative,
+            display_label: format!("OPT-{security_id}"),
+            underlying_symbol: "NIFTY".to_string(),
+            instrument_kind: Some(DhanInstrumentKind::OptionIndex),
+            expiry_date: Some(NaiveDate::from_ymd_opt(2026, 5, 29).unwrap()),
+            strike_price: Some(25_000.0),
+            option_type: Some(OptionType::Call),
+            feed_mode: FeedMode::Quote,
+        }
+    }
+
+    #[test]
+    fn test_fetch_cohort_from_ram_empty_input_returns_empty() {
+        let registry = tickvault_common::instrument_registry::InstrumentRegistry::empty();
+        let out = fetch_cohort_from_ram(
+            &[],
+            &registry,
+            &["NSE_FNO".to_string()],
+            &["OPTIDX".to_string()],
+            100,
+            500,
+        );
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn test_fetch_cohort_from_ram_zero_max_size_returns_empty() {
+        let registry = tickvault_common::instrument_registry::InstrumentRegistry::empty();
+        let bars = vec![make_test_bar(123, 2, 10_000, 5.0)];
+        let out = fetch_cohort_from_ram(
+            &bars,
+            &registry,
+            &["NSE_FNO".to_string()],
+            &["OPTIDX".to_string()],
+            100,
+            0,
+        );
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn test_fetch_cohort_from_ram_filters_by_min_liquidity() {
+        let inst = make_optidx_subscribed(123, ExchangeSegment::NseFno);
+        let registry =
+            tickvault_common::instrument_registry::InstrumentRegistry::from_instruments(vec![inst]);
+        let bars = vec![
+            make_test_bar(123, 2, 50, 5.0),        // below min_liquidity
+            make_test_bar(124, 2, 1_000_000, 3.0), // above
+        ];
+        let out = fetch_cohort_from_ram(
+            &bars,
+            &registry,
+            &["NSE_FNO".to_string()],
+            &["OPTIDX".to_string()],
+            100, // min_liquidity_volume
+            500,
+        );
+        // 124 not registered so also drops; 123 below threshold so drops.
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn test_fetch_cohort_from_ram_filters_by_exchange_segment() {
+        let inst = make_optidx_subscribed(123, ExchangeSegment::IdxI);
+        let registry =
+            tickvault_common::instrument_registry::InstrumentRegistry::from_instruments(vec![inst]);
+        let bars = vec![make_test_bar(123, 0, 1_000_000, 5.0)]; // IDX_I = 0
+        let out_fno = fetch_cohort_from_ram(
+            &bars,
+            &registry,
+            &["NSE_FNO".to_string()],
+            &[], // any instrument_type
+            1,
+            500,
+        );
+        assert!(
+            out_fno.is_empty(),
+            "IDX_I bar must be filtered out by NSE_FNO segment filter"
+        );
+        let out_idx = fetch_cohort_from_ram(&bars, &registry, &["IDX_I".to_string()], &[], 1, 500);
+        assert_eq!(out_idx.len(), 1);
+    }
+
+    #[test]
+    fn test_fetch_cohort_from_ram_emits_optidx_tag_not_dhan_kind_string() {
+        // Ratchet: kind label must use `instrument_type_tag()` ("OPTIDX")
+        // NOT `DhanInstrumentKind::as_str()` ("OptionIndex"). The legacy
+        // SQL path in `build_cohort_sql` filters on the tag form, so the
+        // RAM path MUST match for filter equivalence.
+        let inst = make_optidx_subscribed(123, ExchangeSegment::NseFno);
+        let registry =
+            tickvault_common::instrument_registry::InstrumentRegistry::from_instruments(vec![inst]);
+        let bars = vec![make_test_bar(123, 2, 1_000_000, 5.0)];
+        let out = fetch_cohort_from_ram(
+            &bars,
+            &registry,
+            &["NSE_FNO".to_string()],
+            &["OPTIDX".to_string()], // tag form, not "OptionIndex"
+            1,
+            500,
+        );
+        assert_eq!(out.len(), 1, "OPTIDX tag MUST match — got: {out:?}");
+        assert_eq!(out[0].instrument_type, "OPTIDX");
+    }
+
+    #[test]
+    fn test_fetch_cohort_from_ram_sorts_volume_desc_and_truncates() {
+        let inst1 = make_optidx_subscribed(101, ExchangeSegment::NseFno);
+        let inst2 = make_optidx_subscribed(102, ExchangeSegment::NseFno);
+        let inst3 = make_optidx_subscribed(103, ExchangeSegment::NseFno);
+        let registry =
+            tickvault_common::instrument_registry::InstrumentRegistry::from_instruments(vec![
+                inst1, inst2, inst3,
+            ]);
+        let bars = vec![
+            make_test_bar(101, 2, 1_000, 5.0),
+            make_test_bar(102, 2, 3_000, 4.0),
+            make_test_bar(103, 2, 2_000, 6.0),
+        ];
+        let out = fetch_cohort_from_ram(
+            &bars,
+            &registry,
+            &[],
+            &["OPTIDX".to_string()],
+            100,
+            2, // truncate
+        );
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].security_id, 102, "highest volume first");
+        assert_eq!(out[1].security_id, 103, "second-highest volume next");
     }
 
     /// Ratchet: depth-200 (sids_per_conn = 1) MUST stay one-cmd-per-op
