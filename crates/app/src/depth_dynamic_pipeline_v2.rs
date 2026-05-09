@@ -75,7 +75,7 @@ use tickvault_common::constants::{
 };
 use tickvault_common::types::ExchangeSegment;
 use tickvault_core::instrument::depth_dynamic_top_volume_selector::{
-    MoverRow, SelectorConfig, build_cohort_sql, select_top_k_dynamic,
+    MAX_COHORT_SIZE, MoverRow, SelectorConfig, build_cohort_sql, select_top_k_dynamic,
 };
 use tickvault_core::instrument::dynamic_subscription_state::{
     ConnIdx, DiffOp, DiffStats, DynamicSubscriptionState, PoolShape,
@@ -137,6 +137,16 @@ pub struct PipelineConfig {
     /// Optional notifier for the diff Telegram event. Both `registry`
     /// and `notifier` must be `Some(_)` for the event to fire.
     pub notifier: Option<Arc<tickvault_core::notification::NotificationService>>,
+    /// 2026-05-09 PR 5c.2 — optional in-RAM `CascadeFanout` reference.
+    /// When `Some(_)` AND `registry` is also `Some(_)`, the cohort
+    /// fetcher reads bars directly from the in-RAM cascade (via
+    /// `fetch_cohort_from_ram`) instead of issuing the SQL query
+    /// against the `movers_1m` matview. Falls back to the legacy SQL
+    /// path when this is `None` (test fixtures, dormant deployments).
+    /// Set to `Some(_)` from `main.rs` once `CascadeFanout` is
+    /// initialised; the writer + matview chain can then be retired
+    /// in a follow-up PR.
+    pub cascade: Option<Arc<tickvault_trading::candles::CascadeFanout>>,
 }
 
 /// Spawns the unified all-5-dynamic depth pipeline. Drives the diff
@@ -285,7 +295,45 @@ pub fn spawn_depth_dynamic_pool(
                         // will fire at today's 09:15:00.
                         continue;
                     }
-                    let cohort = match fetch_cohort_from_questdb(&cfg).await {
+                    // 2026-05-09 PR 5c.2 — RAM-first cohort fetch. Reads
+                    // top-volume cohort from the in-RAM CascadeFanout
+                    // when `cascade` is wired (see `PipelineConfig`); the
+                    // SQL fallback applies when (a) cascade is None or
+                    // (b) RAM returns an empty cohort (early boot before
+                    // the cascade is primed). The fallback preserves
+                    // production safety while we soak the RAM path.
+                    let ram_cohort: Option<Vec<MoverRow>> =
+                        if let (Some(cascade), Some(reg)) =
+                            (cfg.cascade.as_ref(), cfg.registry.as_ref())
+                        {
+                            let bars = cascade.snapshot_1m();
+                            let rows = fetch_cohort_from_ram(
+                                &bars,
+                                reg.as_ref(),
+                                &cfg.selector.exchange_segments,
+                                &cfg.selector.instrument_types,
+                                cfg.min_liquidity_volume,
+                                MAX_COHORT_SIZE,
+                            );
+                            if rows.is_empty() {
+                                None
+                            } else {
+                                Some(rows)
+                            }
+                        } else {
+                            None
+                        };
+                    let cohort = if let Some(rows) = ram_cohort {
+                        if cohort_failing {
+                            info!(
+                                label = cfg.label,
+                                "depth_dynamic_pool_v2 cohort fetch RECOVERED (via RAM)"
+                            );
+                            cohort_failing = false;
+                        }
+                        rows
+                    } else {
+                    match fetch_cohort_from_questdb(&cfg).await {
                         Ok(c) => {
                             if cohort_failing {
                                 info!(
@@ -314,6 +362,7 @@ pub fn spawn_depth_dynamic_pool(
                             }
                             continue;
                         }
+                    }
                     };
                     let next_set = select_top_k_dynamic(&cohort, &cfg.selector);
                     if next_set.is_empty() {
