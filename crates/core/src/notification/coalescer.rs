@@ -177,20 +177,24 @@ impl DrainedSummary {
     /// so the operator sees a clean one-liner like `Auth OK — Dhan JWT
     /// acquired` instead of a 6-line `Coalesced summary […]` envelope.
     ///
-    /// ## `count > 1` (genuine burst — full envelope)
+    /// ## `count > 1` (genuine burst — terse envelope, 2026-05-09)
     ///
     /// ```text
-    /// Coalesced summary [topic] count=N
-    /// First: <HH:MM:SS IST> — Last: <HH:MM:SS IST>
-    /// Samples:
-    ///   1. <sample 1>
-    ///   2. <sample 2>
-    ///   ...
-    /// (+M more not retained — count is authoritative)
+    /// <topic> x<N>
+    /// <sample 1>
+    /// <sample 2>
+    /// ...
+    /// (+M more)
     /// ```
     ///
-    /// The envelope only shows up when there's actually something
-    /// coalesced — the operator's "what was suppressed?" question.
+    /// The 2026-05-09 operator complaint ("I don't need this coalesced
+    /// summary extra words") drove the redesign: drop the
+    /// `Coalesced summary [...] count=N` preamble, drop the
+    /// `First: ... — Last: ...` line, drop the `Samples:` keyword.
+    /// The operator already sees the severity tag (`✅ [LOW]` etc.)
+    /// from the dispatcher, so the topic + multiplier in one short
+    /// line is enough envelope. Burst windows are 60 s by default —
+    /// timestamps add little signal at that granularity.
     pub fn render_message(&self) -> String {
         // Single-event fast path: no envelope, just the sample.
         // Defensive: count=1 with no samples should be impossible
@@ -204,45 +208,21 @@ impl DrainedSummary {
         }
 
         let mut out = String::with_capacity(256);
-        out.push_str("Coalesced summary [");
         out.push_str(self.topic);
-        out.push_str("] count=");
+        out.push_str(" x");
         out.push_str(&self.count.to_string());
-        out.push('\n');
-        out.push_str("First: ");
-        out.push_str(&format_ist_ms(self.first_ts_ms));
-        out.push_str(" — Last: ");
-        out.push_str(&format_ist_ms(self.last_ts_ms));
-        out.push('\n');
-        out.push_str("Samples:");
-        for (idx, sample) in self.samples.iter().enumerate() {
-            out.push_str("\n  ");
-            out.push_str(&(idx + 1).to_string());
-            out.push_str(". ");
+        for sample in &self.samples {
+            out.push('\n');
             out.push_str(sample);
         }
         if self.samples_capped {
             let capped = self.count.saturating_sub(self.samples.len() as u64);
             out.push_str("\n(+");
             out.push_str(&capped.to_string());
-            out.push_str(" more not retained — count is authoritative)");
+            out.push_str(" more)");
         }
         out
     }
-}
-
-/// Renders a millisecond UTC timestamp as `HH:MM:SS IST` (no allocation
-/// of date — operator only needs the time-of-day for a 60s window).
-fn format_ist_ms(ms: u64) -> String {
-    // IST = UTC + 5h30m. Compute seconds-of-day in IST without bringing in chrono.
-    const IST_OFFSET_SECS: u64 = 5 * 3600 + 30 * 60;
-    let total_secs = ms / 1000;
-    let ist_secs = total_secs.saturating_add(IST_OFFSET_SECS);
-    let sec_of_day = ist_secs % 86_400;
-    let h = sec_of_day / 3600;
-    let m = (sec_of_day % 3600) / 60;
-    let s = sec_of_day % 60;
-    format!("{h:02}:{m:02}:{s:02} IST")
 }
 
 /// Telegram bucket coalescer.
@@ -483,10 +463,13 @@ mod tests {
         assert!(!s.samples_capped);
 
         let msg = s.render_message();
-        assert!(msg.contains("count=3"));
-        assert!(msg.contains("DepthRebalanced"));
+        // Wave-Holiday-Gate (2026-05-09): terse format — no preamble,
+        // no IST timestamp line, no "Samples:" keyword.
+        assert!(msg.contains("DepthRebalanced x3"));
         assert!(msg.contains("rebal #0"));
-        assert!(msg.contains("IST"));
+        assert!(!msg.contains("Coalesced summary"));
+        assert!(!msg.contains("Samples:"));
+        assert!(!msg.contains("First:"));
     }
 
     #[test]
@@ -516,8 +499,11 @@ mod tests {
         assert!(s.samples_capped);
 
         let msg = s.render_message();
-        assert!(msg.contains("count=25"));
-        assert!(msg.contains("(+15 more not retained"));
+        // Wave-Holiday-Gate (2026-05-09): terse format — `<topic> x<count>`
+        // with `(+M more)` suffix when sample list is capped.
+        assert!(msg.contains("Spammy x25"));
+        assert!(msg.contains("(+15 more)"));
+        assert!(!msg.contains("not retained"));
     }
 
     #[test]
@@ -556,10 +542,12 @@ mod tests {
             samples_capped: false,
         };
         let msg = summary.render_message();
-        assert!(msg.contains("count=2"));
+        // Wave-Holiday-Gate (2026-05-09): terse format — `<topic> x<count>`.
+        assert!(msg.contains("X x2"));
         assert!(msg.contains("sample1"));
         assert!(msg.contains("sample2"));
         assert!(!msg.contains("not retained"));
+        assert!(!msg.contains("Coalesced summary"));
     }
 
     #[test]
@@ -609,14 +597,22 @@ mod tests {
             samples_capped: false,
         };
         let msg = summary.render_message();
-        assert!(msg.contains("Coalesced summary [Glitch]"));
-        assert!(msg.contains("count=1"));
+        // Wave-Holiday-Gate (2026-05-09): degenerate-state fallback now
+        // also uses the terse format so the operator never sees the
+        // legacy verbose preamble. The `<topic> x1` body still tells
+        // them which event lost its sample.
+        assert_eq!(msg, "Glitch x1");
+        assert!(!msg.contains("Coalesced summary"));
+        assert!(!msg.contains("Samples:"));
     }
 
     #[test]
-    fn test_render_message_count_two_keeps_envelope() {
-        // Burst (count > 1) MUST keep the full envelope — that's the
-        // whole reason the coalescer exists.
+    fn test_render_message_count_two_uses_terse_envelope() {
+        // Wave-Holiday-Gate (2026-05-09): operator complaint
+        // "I clearly told you I don't need this coalesced summary extra
+        // words" — the count > 1 envelope is now terse. No
+        // "Coalesced summary" preamble, no "First/Last" timestamp line,
+        // no "Samples:" keyword.
         let summary = DrainedSummary {
             topic: "T",
             severity: Severity::Low,
@@ -627,9 +623,13 @@ mod tests {
             samples_capped: false,
         };
         let msg = summary.render_message();
-        assert!(msg.contains("Coalesced summary"));
-        assert!(msg.contains("count=2"));
-        assert!(msg.contains("Samples:"));
+        assert!(msg.contains("T x2"));
+        assert!(msg.contains("a"));
+        assert!(msg.contains("b"));
+        assert!(!msg.contains("Coalesced summary"));
+        assert!(!msg.contains("count="));
+        assert!(!msg.contains("Samples:"));
+        assert!(!msg.contains("First:"));
     }
 
     #[test]
@@ -673,14 +673,6 @@ mod tests {
         // And the inner sample must NOT have the tag (regression guard
         // for the upstream bug at the source).
         assert!(!summary.samples[0].contains("[LOW]"));
-    }
-
-    #[test]
-    fn test_format_ist_ms_handles_midnight_boundary() {
-        // 2026-01-01 00:00:00 UTC = 05:30:00 IST
-        let ms = 1_767_225_600_000;
-        let s = format_ist_ms(ms);
-        assert!(s.ends_with(" IST"), "got {s}");
     }
 
     #[test]

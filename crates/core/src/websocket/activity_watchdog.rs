@@ -31,7 +31,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use tickvault_common::market_hours::is_within_market_hours_ist;
+use tickvault_common::market_hours::is_within_trading_session_ist;
 use tokio::sync::Notify;
 // NOTE: Use `tokio::time::Instant` instead of `std::time::Instant` so the
 // watchdog honours the paused clock in `#[tokio::test(start_paused = true)]`.
@@ -179,7 +179,10 @@ impl ActivityWatchdog {
                 //   is truly dead) will trigger reconnect via the normal
                 //   error path; we just do not use the watchdog to drive
                 //   reconnect when the server is intentionally quiet.
-                if is_within_market_hours_ist() {
+                // Wave-Holiday-Gate (2026-05-09): trading-session gate
+                // (weekday + market-hours) so Saturday/Sunday boots no
+                // longer false-page on Dhan-server idle TCP resets.
+                if is_within_trading_session_ist() {
                     error!(
                         label = %self.label,
                         threshold_secs = self.threshold.as_secs(),
@@ -423,7 +426,7 @@ mod tests {
     /// paused-clock tests that set the test-force override.
     #[test]
     fn test_is_within_market_hours_ist_returns_bool() {
-        let _ = super::is_within_market_hours_ist();
+        let _ = super::is_within_trading_session_ist();
     }
 
     #[test]

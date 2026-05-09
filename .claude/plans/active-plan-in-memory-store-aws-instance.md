@@ -1,6 +1,6 @@
 # Design Plan: In-Memory Store (§17) + AWS Instance Re-evaluation (§18 v2)
 
-**Status:** IN_PROGRESS (APPROVED v2 — 130 design decisions LOCKED 2026-05-08, L1-L130 across 18 sections; 3-agent adversarial review passed §AA: 2 CRITICAL + 6 HIGH folded into revised L18 + new locks L121-L130; c8g.xlarge ONLY). **§O PR sequence: 8 of 9 logical PRs MERGED (#504a/b/c/d/e + #505 primitives + #509a-d + #517 follow-up); 3 deferred follow-ups remaining (F1 cascade seal-site swap to `_with_pct`, F2 PrevDayCache boot loader, F3 `/api/movers/v2` handler refactor + `snapshot_m`); then §O #508 AWS deploy.** See §O for the live status table.
+**Status:** IN_PROGRESS (APPROVED v2 — 130 design decisions LOCKED 2026-05-08, L1-L130 across 18 sections; 3-agent adversarial review passed §AA: 2 CRITICAL + 6 HIGH folded into revised L18 + new locks L121-L130; c8g.xlarge ONLY). **§O PR sequence: 8 of 9 logical PRs MERGED + 3 deferred follow-ups MERGED 2026-05-09 (F1 PR #520 / F2 PR #521 / F3 PR #522). ONLY §O #508 AWS deploy REMAINS, deferred per operator (`skip AWS`).** See §O for the live status table.
 **Date:** 2026-05-07 (status last refreshed 2026-05-08 post #517 merge)
 **Authors:** Parthiban (architect), Claude (builder)
 **Branch:** to-be-created on operator approval
@@ -346,7 +346,7 @@ The shift to static universe + indices-only scope retires several design element
 
 ## §O) Updated PR sequence under static-universe simplification
 
-**Status as of 2026-05-08 (post #517 merge):** GitHub PR numbers vary from §O logical labels. The mapping below cites the actual merged GitHub PR number for each logical PR. **8 of 9 logical PRs MERGED, 1 REMAINING (#508 AWS deploy).** Plus follow-ups noted below.
+**Status as of 2026-05-09 (post F1/F2/F3 merges, PRs #520/#521/#522):** GitHub PR numbers vary from §O logical labels. The mapping below cites the actual merged GitHub PR number for each logical PR. **8 of 9 logical PRs MERGED + all 3 deferred follow-ups MERGED. ONLY #508 AWS deploy REMAINS — deferred per operator instruction `skip AWS` (2026-05-09 session).**
 
 | # | Logical PR | Scope | Touches | Status |
 |---|---|---|---|---|
@@ -378,6 +378,9 @@ PR #506 (cohort SQL migration) — KILLED per L14 (depth-dynamic reads from RAM 
 | #515 | `2674696` | #509c | delete `boot_mode` + retire `MidMarketBootComplete` event |
 | #516 | `99cafaa` | #509d | retire phase2 dispatcher chain (Wave-5 §R.1 row 5) |
 | #517 | `60d3194` | (Wave-5 follow-up) | retire 12 sub-15m TFs (21→9) symmetrically; **VIEW_DEFS 28→16**, `Tf::ALL` 21→9, `default_list` 21→9, `CascadeFanout` 23→11 derived engines; new `PR517_RETIRED_MATERIALIZED_VIEWS` + `drop_pr517_retired_views` boot wiring; new `tf_symmetry_guard` cross-crate ratchet (4 tests) |
+| #520 | `1d8ac00` | F1 #504e | cascade seal-site swap to `_with_pct` engine variants — `seal_bar` now emits stamped bars |
+| #521 | `340ea70` | F2 #504e | boot-time `PrevDayCache` loader from `previous_close` (PREVCLOSE-04 WARN on empty rows) |
+| #522 | `55bebcb` | F3 #505 | `/api/movers/v2` REST handler refactor + `CascadeFanout::snapshot_m` accessor |
 
 ### Deferred follow-ups carried forward from #511/#512
 
@@ -385,18 +388,28 @@ The two primitives merged thin — they ship the pure-logic surface but NOT the 
 
 | # | Logical | Source PR body says | Why deferred | Blocked on |
 |---|---|---|---|---|
-| F1 | **#504e cascade seal-site swap** | "Cascade seal-site swap to `_with_pct` engine variants" (PR #511 deferred list) | PR #511 shipped only the primitives + `PrevDayCache` data structure; the `seal_bar` call sites still emit `Bar` without the 3 % fields populated | `CascadeFanout` per-engine wire-up — no parallel work to wait on |
-| F2 | **#504e PrevDayCache boot loader** | "Boot-time `PrevDayCache` loader" (PR #511 deferred list) | PR #511 shipped the data structure; boot-time loading from `candles_1d` previous-IST-day is not yet wired | follow-up to F1 (boot loader feeds the seal-site stamper) |
-| F3 | **#505 `/api/movers/v2` handler refactor** | "`/api/movers/v2` handler refactor" + "`CascadeFanout::snapshot_m()` accessor" (PR #512 deferred list) | PR #512 shipped the pure top-N filter+sort primitive only; the REST handler still uses the legacy per-tick movers writer path | F1+F2 (handler reads stamped bars; without F1/F2 the % columns are zero) |
+| F1 | **#504e cascade seal-site swap** | "Cascade seal-site swap to `_with_pct` engine variants" (PR #511 deferred list) | ✅ MERGED — GitHub PR #520 (`1d8ac00`, 2026-05-09); the `seal_bar` call sites now emit `Bar` with the 3 % fields populated via `CascadeFanout::seal_with_pct` | n/a |
+| F2 | **#504e PrevDayCache boot loader** | "Boot-time `PrevDayCache` loader" (PR #511 deferred list) | ✅ MERGED — GitHub PR #521 (`340ea70`, 2026-05-09); cold-boot reads previous-IST-day `previous_close` table into `PrevDayCache` so F1 stamping has non-zero `prev_day_close` (PREVCLOSE-04 fires at warn level on degraded boot) | n/a |
+| F3 | **#505 `/api/movers/v2` handler refactor** | "`/api/movers/v2` handler refactor" + "`CascadeFanout::snapshot_m()` accessor" (PR #512 deferred list) | ✅ MERGED — GitHub PR #522 (`55bebcb`, 2026-05-09); REST handler now reads stamped bars via `CascadeFanout::snapshot_m` and the new `top_n_by_bars` primitive | n/a |
 
 ### Remaining work (in dependency order)
 
-| Order | Item | Why next | Blocked on |
-|---|---|---|---|
-| 1 | **F1** #504e cascade seal-site swap | populates the 3 % fields on every sealed Bar; without it F2 + F3 read zeros | nothing — primitives already merged |
-| 2 | **F2** #504e PrevDayCache boot loader | feeds F1 with prev-day close + OI on cold boot | F1 |
-| 3 | **F3** #505 `/api/movers/v2` handler refactor + `snapshot_m` accessor | flips the operator-facing read path to RAM | F1 + F2 |
-| 4 | **§O #508** AWS deploy | Terraform c8g.xlarge + ARM AMI + aarch64 CI; ships only AFTER full RAM read-flip verified locally | F1 + F2 + F3 |
+| Order | Item | Why next | Blocked on | Status |
+|---|---|---|---|---|
+| 1 | **F1** #504e cascade seal-site swap | populates the 3 % fields on every sealed Bar | n/a | ✅ MERGED 2026-05-09 (PR #520) |
+| 2 | **F2** #504e PrevDayCache boot loader | feeds F1 with prev-day close + OI on cold boot | n/a | ✅ MERGED 2026-05-09 (PR #521) |
+| 3 | **F3** #505 `/api/movers/v2` handler refactor + `snapshot_m` accessor | flips the operator-facing read path to RAM | n/a | ✅ MERGED 2026-05-09 (PR #522) |
+| 4 | **§O #508** AWS deploy | Terraform c8g.xlarge + ARM AMI + aarch64 CI; ships only AFTER full RAM read-flip verified locally | n/a (F1/F2/F3 all green) | ⏸ DEFERRED per operator (`skip AWS`, 2026-05-09 session) |
+
+### What "100 %" of §O actually means right now (operator's guarantee + assurance question, 2026-05-09)
+
+| Operator demand | Literal English | Honest engineering proof |
+|---|---|---|
+| Is in-memory store fully done? | "Is everything done?" | YES for the local code path. `papaya::HashMap` tick map + 9-TF candle map both ship; daily 09:15 IST reset wired (PR #510); seal-time pct stamping wired (PR #520); boot-time prev-day cache wired (PR #521); `/api/movers/v2` reads RAM (PR #522). |
+| Is anything still RAM-cold? | "Will % columns ever be zero?" | Only on the very first boot of a fresh deployment when `previous_close` table has no rows for the lookback window — PREVCLOSE-04 fires WARN at boot, % columns degrade to 0.0 by spec until first session writes. After day 1, every boot finds rows and stamping is fully populated. |
+| Where can I see the proof? | "Show me the receipts" | PRs #520 / #521 / #522 git log + tests; `crates/trading/src/in_mem/prev_day_cache.rs` tests; `crates/api/src/handlers/movers_v2.rs` tests; PREVCLOSE-04 runbook in `wave-1-error-codes.md`. |
+| What's NOT done? | "Anything I should know?" | (1) §O #508 AWS deploy — operator chose to skip. (2) AWS-side observability parity (Phase 4 from `observability-architecture.md`) waits on instance provision. Both are operator-blocked, not code-blocked. |
+| Real-time check? | "How do I verify live?" | `mcp__tickvault-logs__questdb_sql "select count(*) from previous_close where ts > dateadd('d', -7, now())"` — non-zero rows → cold-boot loader works. `curl localhost:3001/api/movers/v2?…` → returns stamped % columns from RAM. |
 
 ---
 

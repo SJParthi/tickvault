@@ -2616,8 +2616,16 @@ impl NotificationEvent {
             Self::OrderUpdateAuthenticated => Severity::Medium,
             Self::TokenRenewed => Severity::Low,
             Self::IpVerificationSuccess { .. } => Severity::Low,
-            Self::AuthenticationSuccess => Severity::Low,
-            Self::InstrumentBuildSuccess { .. } => Severity::Low,
+            // Wave-Holiday-Gate (2026-05-09): bumped from Low → Medium so
+            // these once-per-boot positive signals dispatch immediately
+            // (Low coalesces in 60s window). Operator's 2026-05-09 complaint:
+            // "before instruments and jwt fetch itself first message live
+            // is connected and the message is showing I can't understand"
+            // — i.e. WebSocketPoolOnline (Medium, immediate) was arriving
+            // BEFORE Auth/Instruments (Low, drained 60s later). Promoting
+            // these two to Medium restores the natural boot ordering.
+            Self::AuthenticationSuccess => Severity::Medium,
+            Self::InstrumentBuildSuccess { .. } => Severity::Medium,
             Self::BootHealthCheck { .. } => Severity::Low,
             Self::StartupComplete { .. } => Severity::Info,
             Self::ShutdownComplete => Severity::Info,

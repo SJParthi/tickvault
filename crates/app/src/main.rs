@@ -324,6 +324,16 @@ async fn main() -> Result<()> {
                 if total_silent == 0 {
                     continue;
                 }
+                // Wave-Holiday-Gate (2026-05-09): suppress WS-GAP-06
+                // emission on Saturday/Sunday boots (and outside
+                // market hours). NSE doesn't stream on weekends, so
+                // every IDX_I tracker reports >30s silence — the
+                // ERROR storm in the operator's 2026-05-09 logs was
+                // 60+ false positives. Inside trading session, the
+                // alert remains live.
+                if !tickvault_common::market_hours::is_within_trading_session_ist() {
+                    continue;
+                }
                 metrics::counter!("tv_tick_gap_summary_total").increment(1);
                 metrics::gauge!("tv_tick_gap_instruments_silent").set(total_silent as f64);
                 let top: Vec<(u32, &'static str, u64)> = gaps
@@ -3886,20 +3896,12 @@ async fn main() -> Result<()> {
             const MANDATORY_WAIT_POST_MARKET_SECS: u64 = 10; // 10 s — off-hours boot
             const OPTIONAL_WAIT_SECS: u64 = 30;
 
-            // Off-hours = outside 09:00-15:30 IST using the same constants
-            // as tick_persistence + depth_rebalancer so market-hours logic
-            // stays DRY across the codebase.
-            let is_market_hours = {
-                use tickvault_common::constants::{
-                    IST_UTC_OFFSET_SECONDS, SECONDS_PER_DAY, TICK_PERSIST_END_SECS_OF_DAY_IST,
-                    TICK_PERSIST_START_SECS_OF_DAY_IST,
-                };
-                let now_utc = chrono::Utc::now().timestamp();
-                let now_ist = now_utc.saturating_add(i64::from(IST_UTC_OFFSET_SECONDS));
-                let sec_of_day = now_ist.rem_euclid(i64::from(SECONDS_PER_DAY)) as u32;
-                (TICK_PERSIST_START_SECS_OF_DAY_IST..TICK_PERSIST_END_SECS_OF_DAY_IST)
-                    .contains(&sec_of_day)
-            };
+            // Wave-Holiday-Gate (2026-05-09): trading-session gate
+            // (weekday + market-hours). Saturday/Sunday boots no longer
+            // hit the 5-minute hard cap looking for index LTPs that
+            // cannot arrive — they fall through to the 10s best-effort
+            // wait, the same as off-hours weekday boots.
+            let is_market_hours = tickvault_common::market_hours::is_within_trading_session_ist();
             let mandatory_wait_secs = if is_market_hours {
                 MANDATORY_WAIT_MARKET_HOURS_SECS
             } else {
@@ -5797,10 +5799,7 @@ async fn main() -> Result<()> {
                 // pinned to 1.0 inside the score loop — see comment there.
                 tokio::spawn(async move {
                     use std::time::{Duration, Instant};
-                    use tickvault_common::constants::{
-                        IST_UTC_OFFSET_SECONDS, SECONDS_PER_DAY, TICK_PERSIST_END_SECS_OF_DAY_IST,
-                        TICK_PERSIST_START_SECS_OF_DAY_IST,
-                    };
+                    use tickvault_common::constants::{IST_UTC_OFFSET_SECONDS, SECONDS_PER_DAY};
                     use tickvault_common::error_code::ErrorCode;
                     use tickvault_core::instrument::slo_score::{
                         SloInputs, SloOutcome, evaluate_slo_score,
@@ -5870,9 +5869,13 @@ async fn main() -> Result<()> {
                     /// `[09:00, 16:00)` IST. Off-hours we relax 3 of 6
                     /// dimensions to avoid false-positive pages on
                     /// by-design idle state.
-                    fn is_within_market_hours_ist(now_ist_secs_of_day: u32) -> bool {
-                        (TICK_PERSIST_START_SECS_OF_DAY_IST..TICK_PERSIST_END_SECS_OF_DAY_IST)
-                            .contains(&now_ist_secs_of_day)
+                    // Wave-Holiday-Gate (2026-05-09): delegate to the
+                    // canonical helper so weekend boots no longer drive
+                    // the SLO score to 0.0 via tick_freshness/ws_health.
+                    // The legacy `secs_of_day` argument is unused now;
+                    // call sites pass it but the helper ignores it.
+                    fn is_within_market_hours_ist(_now_ist_secs_of_day: u32) -> bool {
+                        tickvault_common::market_hours::is_within_trading_session_ist()
                     }
 
                     let mut interval =
@@ -7265,7 +7268,10 @@ async fn main() -> Result<()> {
     // log INFO + emit a metric but do NOT page the operator. Ratchet:
     // crates/app/tests/post_market_pool_halt_guard.rs.
     if boot_elapsed.as_secs() > tickvault_common::constants::BOOT_TIMEOUT_SECS {
-        let in_market_hours = tickvault_common::market_hours::is_within_market_hours_ist();
+        // Wave-Holiday-Gate (2026-05-09): trading-session gate replaces
+        // the legacy time-of-day-only gate. Saturday/Sunday boots are
+        // legitimately slower (no LTPs ever) — suppress the CRITICAL.
+        let in_market_hours = tickvault_common::market_hours::is_within_trading_session_ist();
         if in_market_hours {
             error!(
                 elapsed_secs = boot_elapsed.as_secs(),

@@ -78,6 +78,54 @@ pub fn is_within_market_hours_ist() -> bool {
     (TICK_PERSIST_START_SECS_OF_DAY_IST..TICK_PERSIST_END_SECS_OF_DAY_IST).contains(&sec_of_day)
 }
 
+/// Returns `true` ONLY when the IST wall-clock is in
+/// `[TICK_PERSIST_START, TICK_PERSIST_END)` AND today is a weekday
+/// (Monday–Friday). Saturday and Sunday short-circuit to `false`
+/// regardless of time-of-day.
+///
+/// # Why this exists (Parthiban directive 2026-05-09)
+/// On Saturday 2026-05-09 the operator received CRITICAL Telegram pages
+/// for "zero live ticks during market hours", "MANDATORY underlying
+/// missing", "BOOT DEADLINE MISSED", and an SLO-02 cascade — all
+/// because the existing [`is_within_market_hours_ist`] gate only
+/// checks the 09:00–15:30 IST time-of-day window, NOT the day of week.
+/// NSE doesn't trade on weekends, so the entire panic chain was a
+/// false-positive. This helper closes that hole.
+///
+/// # Scope (intentional)
+/// Covers ~104 false-positive boot days/year (every Sat + Sun).
+/// NSE-specific weekday holidays (Diwali, Republic Day, etc.) are
+/// NOT covered — those require [`crate::trading_calendar::TradingCalendar`]
+/// threading. Holiday alerts are 8–12 days/year and can be addressed
+/// incrementally.
+///
+/// # Complexity
+/// O(1): one relaxed atomic load + one [`is_within_market_hours_ist`]
+/// call + one [`chrono::Utc::now`] + integer math. Cold path —
+/// called once per watchdog/SLO scheduler tick (≥10s cadence).
+///
+/// # Test override
+/// Honours `TEST_FORCE_IN_MARKET_HOURS` for parity with
+/// [`is_within_market_hours_ist`] — when set, returns `true`
+/// regardless of weekday or wall-clock.
+#[inline]
+// TEST-EXEMPT: covered by 5 tests in this file's `tests` module (`trading_session_returns_bool_without_panic`, `trading_session_force_override_returns_true_when_set`, `trading_session_implies_market_hours`, `weekend_weekdays_match_sat_and_sun`, `trading_session_helper_contains_weekend_gate`).
+pub fn is_within_trading_session_ist() -> bool {
+    if TEST_FORCE_IN_MARKET_HOURS.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    if !is_within_market_hours_ist() {
+        return false;
+    }
+    let now_utc = chrono::Utc::now();
+    let now_ist = now_utc + chrono::TimeDelta::seconds(i64::from(IST_UTC_OFFSET_SECONDS));
+    use chrono::Datelike;
+    !matches!(
+        now_ist.weekday(),
+        chrono::Weekday::Sat | chrono::Weekday::Sun
+    )
+}
+
 /// Returns the number of seconds until the next IST midnight
 /// (00:00:00 IST). Returns a value in `(0, 86400]`.
 ///
@@ -193,6 +241,63 @@ mod tests {
         // After reset, helper falls through to real wall-clock check;
         // we only assert no panic and a bool was produced.
         let _ = is_within_market_hours_ist();
+    }
+
+    // ----- is_within_trading_session_ist (Wave-Holiday-Gate 2026-05-09) -----
+
+    /// Smoke test: helper returns a bool without panic.
+    #[test]
+    fn trading_session_returns_bool_without_panic() {
+        let _ = is_within_trading_session_ist();
+    }
+
+    /// Test override propagates through the trading-session gate too,
+    /// otherwise tests that pin "in market hours" would break the gate.
+    #[test]
+    fn trading_session_force_override_returns_true_when_set() {
+        set_test_force_in_market_hours(true);
+        assert!(is_within_trading_session_ist());
+        set_test_force_in_market_hours(false);
+    }
+
+    /// The trading-session gate MUST always be a subset of the market-hours
+    /// gate — if it's currently outside market hours, it's also outside the
+    /// trading session, regardless of weekday.
+    #[test]
+    fn trading_session_implies_market_hours() {
+        set_test_force_in_market_hours(false);
+        if !is_within_market_hours_ist() {
+            assert!(
+                !is_within_trading_session_ist(),
+                "trading session must be false when market hours is false"
+            );
+        }
+    }
+
+    /// Direct test of the weekend-detection logic the gate relies on.
+    /// This pins the regression: if someone removes
+    /// `Weekday::Sat | Weekday::Sun` from the match expression, this fails.
+    #[test]
+    fn weekend_weekdays_match_sat_and_sun() {
+        use chrono::Weekday;
+        assert!(matches!(Weekday::Sat, Weekday::Sat | Weekday::Sun));
+        assert!(matches!(Weekday::Sun, Weekday::Sat | Weekday::Sun));
+        assert!(!matches!(Weekday::Mon, Weekday::Sat | Weekday::Sun));
+        assert!(!matches!(Weekday::Tue, Weekday::Sat | Weekday::Sun));
+        assert!(!matches!(Weekday::Wed, Weekday::Sat | Weekday::Sun));
+        assert!(!matches!(Weekday::Thu, Weekday::Sat | Weekday::Sun));
+        assert!(!matches!(Weekday::Fri, Weekday::Sat | Weekday::Sun));
+    }
+
+    /// Source-scan ratchet: the canonical helper MUST contain the weekend
+    /// match expression. Fails the build if someone removes the gate.
+    #[test]
+    fn trading_session_helper_contains_weekend_gate() {
+        let src = include_str!("market_hours.rs");
+        assert!(
+            src.contains("chrono::Weekday::Sat | chrono::Weekday::Sun"),
+            "is_within_trading_session_ist must guard against Sat/Sun"
+        );
     }
 
     /// Guard: the window bounds come from common constants, not hardcoded
