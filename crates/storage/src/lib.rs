@@ -81,21 +81,14 @@ pub mod historical_fetch_marker;
 pub mod indicator_snapshot_persistence;
 pub mod instrument_persistence;
 pub mod materialized_views;
-pub mod movers_base_persistence;
-// Phase 4b (2026-05-05): `movers_persistence` (StockMoversWriter +
-// OptionMoversWriter) DELETED. Both writers were retired in the
-// 2026-05-03 audit (main.rs:2728) and confirmed dormant by the
-// `movers_writer_dormant_guard` ratchet shipped in PR #493.
-// Operator-driven `DROP TABLE stock_movers, option_movers` lives
-// in `docs/runbooks/phase-4b-movers-cleanup.md` Step 1.
-// 2026-05-09 PR 5c.4-narrow: `movers_unified_query` module deleted —
-// it was the SQL helper backing `fetch_cohort_from_questdb`, retired
-// in PR 5c.3-narrow (PR #537). No remaining callers. The
-// `movers_writer` module stays for now (still populates `movers_*`
-// matviews); deletion sequenced for a future PR once the operator
-// confirms RAM cohort path is healthy via the
-// `tv_depth_dynamic_cohort_source_total` counter.
-pub mod movers_writer;
+// 2026-05-09 PR 5c.5-final (Bug 3 — movers retirement): the
+// `movers_base_persistence` + `movers_writer` modules are DELETED.
+// Operator directive: "only ticks and our 9 needed candle timeframes
+// are available". The 25 `movers_*` matviews + the `movers_1s` base
+// table are dropped at boot by
+// `materialized_views::drop_bug3_retired_views`. All historical
+// movers infrastructure (Phase 4b's StockMoversWriter / OptionMoversWriter,
+// PR 5c.4-narrow's movers_unified_query helper) is fully retired.
 pub mod obi_persistence;
 pub mod order_audit_persistence;
 pub mod partition_manager;
