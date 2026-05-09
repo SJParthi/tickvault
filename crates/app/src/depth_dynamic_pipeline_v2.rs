@@ -331,8 +331,27 @@ pub fn spawn_depth_dynamic_pool(
                             );
                             cohort_failing = false;
                         }
+                        // 2026-05-09 PR 5c.2.5 — observability: emit a
+                        // counter labelled by source so the operator
+                        // can verify in Grafana that RAM is producing
+                        // healthy cohorts (vs falling through to SQL).
+                        // Once `ram_total >> sql_total` over a soak
+                        // window, PR 5c.3 can safely delete the SQL
+                        // fallback + writer infrastructure.
+                        metrics::counter!(
+                            "tv_depth_dynamic_cohort_source_total",
+                            "label" => cfg.label,
+                            "source" => "ram",
+                        )
+                        .increment(1);
                         rows
                     } else {
+                    metrics::counter!(
+                        "tv_depth_dynamic_cohort_source_total",
+                        "label" => cfg.label,
+                        "source" => "sql",
+                    )
+                    .increment(1);
                     match fetch_cohort_from_questdb(&cfg).await {
                         Ok(c) => {
                             if cohort_failing {
