@@ -1,6 +1,6 @@
 //! QuestDB materialized views for multi-timeframe candle aggregation.
 //!
-//! Creates the `candles_1s` base table and 16 materialized views covering
+//! Creates the `candles_1s` base table and 9 materialized views covering
 //! timeframes from 5 seconds to 1 month. Live WebSocket data arrives as IST
 //! epoch seconds (stored directly). Historical REST data arrives as UTC epoch
 //! seconds (+19800s offset applied at persistence). Both result in IST-based
@@ -155,61 +155,39 @@ struct ViewDef {
     align_offset: &'static str,
 }
 
-/// All 16 materialized views ordered by dependency chain (post PR #517).
+/// All 9 materialized views ordered by dependency chain
+/// (post the 2026-05-09 TF-reduction follow-up to PR #517).
 ///
 /// Each view aggregates from its `source` — the dependency chain is:
-/// candles_1s → 3s,5s,10s,15s,30s,1m
+/// candles_1s → 1m
 /// candles_1m → 5m
 /// candles_5m → 15m
 /// candles_15m → 30m
 /// candles_1s → 1h (direct — '00:15' offset requires the physical base table)
-/// candles_30m → 2h,3h,4h,1d
-/// candles_1d → 7d,1M
+/// candles_30m → 2h, 3h, 4h, 1d
 ///
-/// PR #517 (Wave-5 TF reduction, 2026-05-08): retired the 12 sub-15m
-/// timeframes (2m/3m/4m/6m/7m/8m/9m/10m/11m/12m/13m/14m). The matview
-/// set now mirrors the 16-TF retained surface: 5 sub-minute (3s, 5s,
-/// 10s, 15s, 30s) + 1m + 5m + 15m + 30m + 1h/2h/3h/4h + 1d/7d/1M.
+/// History:
+/// - Pre-PR #517: 28 matviews (every TF from 3s to 1M).
+/// - PR #517 (2026-05-08): 28 → 16 — retired the 12 sub-15m TFs
+///   (2m/3m/4m/6m/7m/8m/9m/10m/11m/12m/13m/14m).
+/// - 2026-05-09 follow-up (this commit): 16 → 9 — retired the 5
+///   sub-minute matviews (3s/5s/10s/15s/30s) and the 2 long-tail
+///   matviews (7d/1M) because they no longer have any in-RAM cascade
+///   engine reader. The 9-TF set now mirrors `Tf::ALL` exactly:
+///   1m + 5m + 15m + 30m + 1h + 2h + 3h + 4h + 1d.
+///
 /// Re-introduction of any retired TF is blocked by
-/// `view_defs_does_not_contain_retired_pr517_views` and the
+/// `view_defs_does_not_contain_retired_pr517_views`,
+/// `view_defs_does_not_contain_tf_reduction_retired_views`, and the
 /// `tf_symmetry_guard` integration ratchet.
 const VIEW_DEFS: &[ViewDef] = &[
-    // Sub-minute from 1s base
-    ViewDef {
-        name: "candles_3s",
-        source: "candles_1s",
-        interval: "3s",
-        has_tick_count: true,
-        align_offset: QUESTDB_IST_ALIGN_OFFSET,
-    },
-    ViewDef {
-        name: "candles_5s",
-        source: "candles_1s",
-        interval: "5s",
-        has_tick_count: true,
-        align_offset: QUESTDB_IST_ALIGN_OFFSET,
-    },
-    ViewDef {
-        name: "candles_10s",
-        source: "candles_1s",
-        interval: "10s",
-        has_tick_count: true,
-        align_offset: QUESTDB_IST_ALIGN_OFFSET,
-    },
-    ViewDef {
-        name: "candles_15s",
-        source: "candles_1s",
-        interval: "15s",
-        has_tick_count: true,
-        align_offset: QUESTDB_IST_ALIGN_OFFSET,
-    },
-    ViewDef {
-        name: "candles_30s",
-        source: "candles_1s",
-        interval: "30s",
-        has_tick_count: true,
-        align_offset: QUESTDB_IST_ALIGN_OFFSET,
-    },
+    // 2026-05-09 TF reduction (Wave-5 §K-L7 follow-up): retired the 5
+    // sub-minute matviews (candles_3s/5s/10s/15s/30s) — they no longer
+    // had any reader after Wave-5 retired the seconds-level cascade
+    // engines (`tickvault_app::metrics_catalog::Tf::ALL` is the canonical
+    // 9-TF set: 1m + 5m + 15m + 30m + 1h + 2h + 3h + 4h + 1d). The base
+    // table `candles_1s` remains as the live-tick cascade source. The
+    // sub-minute matview drop is wired in `drop_tf_reduction_retired_views`.
     ViewDef {
         name: "candles_1m",
         source: "candles_1s",
@@ -298,22 +276,10 @@ const VIEW_DEFS: &[ViewDef] = &[
         has_tick_count: false,
         align_offset: QUESTDB_IST_ALIGN_OFFSET,
     },
-    // Weekly from 1d
-    ViewDef {
-        name: "candles_7d",
-        source: "candles_1d",
-        interval: "7d",
-        has_tick_count: false,
-        align_offset: QUESTDB_IST_ALIGN_OFFSET,
-    },
-    // Monthly from 1d
-    ViewDef {
-        name: "candles_1M",
-        source: "candles_1d",
-        interval: "1M",
-        has_tick_count: false,
-        align_offset: QUESTDB_IST_ALIGN_OFFSET,
-    },
+    // 2026-05-09 TF reduction: candles_7d and candles_1M retired because
+    // no in-RAM cascade engine reads them. The boot DDL drops them via
+    // `drop_tf_reduction_retired_views`. Re-introduction is blocked by
+    // `view_defs_does_not_contain_tf_reduction_retired_views`.
 ];
 
 // ---------------------------------------------------------------------------
@@ -420,7 +386,7 @@ fn build_view_sql(def: &ViewDef) -> String {
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Creates the `candles_1s` base table and all 16 materialized views (post PR #517).
+/// Creates the `candles_1s` base table and all 9 materialized views (post PR #517).
 ///
 /// Idempotent — safe to call every startup. Logs warnings on failure
 /// and continues (best-effort). QuestDB must be reachable for views
@@ -490,14 +456,14 @@ pub async fn ensure_candle_views(questdb_config: &QuestDbConfig) {
     //   (b) `views_missing_phase1_columns` — check candles_5s for `phase`.
     //   (c) `base_missing_phase1_columns` — check candles_1s for `phase`.
     //   (d) `any_view_missing_or_lacks_iv` (PR #505 orphan-state fix) — iterate
-    //       ALL 16 view names (post PR #517); if any view is absent OR exists
+    //       ALL 9 view names (post PR #517); if any view is absent OR exists
     //       but lacks `iv`, force a full drop+recreate. Closes the gap where
     //       a partial-failure boot leaves a subset of views with iv (e.g.
     //       candles_5s) while newer TFs are absent or schema-mismatched.
     //       The previous probe-just-candles_5s heuristic returned false in
     //       that state and IF NOT EXISTS subsequently failed with "Invalid
     //       column: iv" against orphan view definitions.
-    // If any probe fires, drop all 16 views so Step 5 recreates them clean.
+    // If any probe fires, drop all 9 views so Step 5 recreates them clean.
     if views_missing_greeks(&client, &base_url).await
         || views_missing_phase1_columns(&client, &base_url).await
         || base_missing_phase1_columns(&client, &base_url).await
@@ -529,6 +495,13 @@ pub async fn ensure_candle_views(questdb_config: &QuestDbConfig) {
     // orphan views. `IF EXISTS` makes this safe on greenfield deployments
     // and idempotent on every subsequent boot.
     drop_pr517_retired_views(&client, &base_url).await;
+
+    // Step 4d (2026-05-09 TF-reduction follow-up): drop the 7 matviews
+    // that were retained by PR #517 but no longer have an in-RAM cascade
+    // engine reader after Wave-5 §K-L7 (5 sub-minute: 3s/5s/10s/15s/30s
+    // + 2 long-tail: 7d/1M). `Tf::ALL` is the canonical 9-TF set; the
+    // matview chain now mirrors it exactly. Idempotent on every boot.
+    drop_tf_reduction_retired_views(&client, &base_url).await;
 
     // Step 5: Create materialized views in dependency order.
     let mut created_count: u32 = 0;
@@ -768,7 +741,7 @@ async fn base_missing_phase1_columns(client: &reqwest::Client, base_url: &str) -
 /// Returns `true` when views need recreation. Failed probe → `false`
 /// (Step 5's `CREATE ... IF NOT EXISTS` handles missing views directly).
 async fn views_missing_phase1_columns(client: &reqwest::Client, base_url: &str) -> bool {
-    let probe_sql = "SHOW COLUMNS FROM candles_5s";
+    let probe_sql = "SHOW COLUMNS FROM candles_1m";
     match client
         .get(base_url)
         .query(&[("query", probe_sql)])
@@ -803,7 +776,7 @@ async fn views_missing_phase1_columns(client: &reqwest::Client, base_url: &str) 
 /// Returns `true` when matviews need recreation. Failed probe → `false`
 /// (Step 5's `CREATE ... IF NOT EXISTS` handles missing views directly).
 async fn views_missing_wave5_pct_columns(client: &reqwest::Client, base_url: &str) -> bool {
-    let probe_sql = "SHOW COLUMNS FROM candles_5s";
+    let probe_sql = "SHOW COLUMNS FROM candles_1m";
     match client
         .get(base_url)
         .query(&[("query", probe_sql)])
@@ -833,7 +806,7 @@ async fn views_missing_wave5_pct_columns(client: &reqwest::Client, base_url: &st
 /// or if the probe fails (in which case `CREATE ... IF NOT EXISTS` in Step 5
 /// handles it).
 async fn views_missing_greeks(client: &reqwest::Client, base_url: &str) -> bool {
-    let probe_sql = "SHOW COLUMNS FROM candles_5s";
+    let probe_sql = "SHOW COLUMNS FROM candles_1m";
     match client
         .get(base_url)
         .query(&[("query", probe_sql)])
@@ -903,7 +876,7 @@ async fn any_view_missing_or_lacks_iv(client: &reqwest::Client, base_url: &str) 
     false
 }
 
-/// Drops all 16 materialized views in reverse dependency order (post PR #517).
+/// Drops all 9 materialized views in reverse dependency order (post PR #517).
 ///
 /// Reverse order ensures child views are dropped before their parents.
 /// `DROP MATERIALIZED VIEW IF EXISTS` is idempotent.
@@ -922,7 +895,7 @@ async fn drop_all_views(client: &reqwest::Client, base_url: &str) {
             "dropped materialized view for Greeks migration"
         );
     }
-    info!("all 16 materialized views dropped for Greeks migration");
+    info!("all 9 materialized views dropped for Greeks migration");
 }
 
 /// Names of the hourly-chain views that must be rebuilt together when
@@ -957,6 +930,29 @@ const PR517_RETIRED_MATERIALIZED_VIEWS: &[&str] = &[
     "candles_12m",
     "candles_13m",
     "candles_14m",
+];
+
+/// 2026-05-09 TF reduction follow-up (Wave-5 §K-L7 completion): drop
+/// the 5 sub-minute matviews and 2 long-tail matviews (7d + 1M) that
+/// no longer have any in-RAM cascade engine reader. The canonical
+/// 9-TF set (`Tf::ALL`) is 1m + 5m + 15m + 30m + 1h + 2h + 3h + 4h +
+/// 1d. The base table `candles_1s` remains; only the matview chain
+/// shrinks. On boot, `drop_tf_reduction_retired_views` issues
+/// `DROP MATERIALIZED VIEW IF EXISTS` for each so QuestDB instances
+/// upgraded across this commit don't keep stale orphan views.
+///
+/// Order: `candles_7d` and `candles_1M` source from `candles_1d`, so
+/// they must drop BEFORE any future change to `candles_1d`. The 5
+/// sub-minute views all source directly from `candles_1s` — no
+/// internal ordering required.
+const TF_REDUCTION_RETIRED_MATERIALIZED_VIEWS: &[&str] = &[
+    "candles_3s",
+    "candles_5s",
+    "candles_10s",
+    "candles_15s",
+    "candles_30s",
+    "candles_7d",
+    "candles_1M",
 ];
 
 /// Checks whether `candles_1h` still uses the old `00:00` bucket alignment.
@@ -1039,6 +1035,31 @@ async fn drop_pr517_retired_views(client: &reqwest::Client, base_url: &str) {
     info!(
         view_count = PR517_RETIRED_MATERIALIZED_VIEWS.len(),
         "PR #517 retired sub-15m views dropped"
+    );
+}
+
+/// 2026-05-09 TF reduction follow-up: drops the 7 newly-retired
+/// matviews (5 sub-minute + 7d + 1M) so QuestDB instances upgraded
+/// across this commit don't keep stale orphan views. `IF EXISTS` is
+/// idempotent — safe on greenfield deployments and on every boot.
+async fn drop_tf_reduction_retired_views(client: &reqwest::Client, base_url: &str) {
+    for name in TF_REDUCTION_RETIRED_MATERIALIZED_VIEWS {
+        let drop_sql = format!("DROP MATERIALIZED VIEW IF EXISTS {name}");
+        drop(
+            client
+                .get(base_url)
+                .query(&[("query", &drop_sql)])
+                .send()
+                .await,
+        );
+        debug!(
+            view = name,
+            "dropped TF-reduction retired view (sub-minute / long-tail)"
+        );
+    }
+    info!(
+        view_count = TF_REDUCTION_RETIRED_MATERIALIZED_VIEWS.len(),
+        "TF-reduction retired views dropped (5 sub-minute + 7d + 1M)"
     );
 }
 
@@ -1202,28 +1223,26 @@ mod tests {
     }
 
     #[test]
-    fn view_defs_has_16_views() {
+    fn view_defs_has_9_views() {
         assert_eq!(
             VIEW_DEFS.len(),
-            16,
-            "must have 16 materialized views matching the 16-TF in-RAM CascadeFanout post PR #517: \
-             3s/5s/10s/15s/30s + 1m + 5m + 15m + 30m + 1h/2h/3h/4h + 1d/7d/1M"
+            9,
+            "must have exactly 9 materialized views matching the canonical \
+             9-TF set in `tickvault_app::metrics_catalog::Tf::ALL` (Wave-5 §K-L7 \
+             follow-up, 2026-05-09): 1m + 5m + 15m + 30m + 1h + 2h + 3h + 4h + 1d. \
+             The 5 sub-minute matviews (3s/5s/10s/15s/30s) and 2 long-tail \
+             matviews (7d/1M) were retired because no in-RAM cascade engine \
+             reads them anymore."
         );
     }
 
-    /// PR #517 (Wave-5 TF reduction, 2026-05-08) ratchet: pin every one of
-    /// the 16 specific TF names so a future regression dropping any single
-    /// one fails the build. The 16 names mirror the in-RAM `CascadeFanout`
-    /// engines exactly post the 12 sub-15m retirements (was 28 pre-PR #517).
+    /// 2026-05-09 ratchet: pin every one of the 9 specific TF names so a
+    /// future regression dropping any single one fails the build. The 9
+    /// names mirror the in-RAM `Tf::ALL` set exactly.
     #[test]
-    fn view_defs_covers_all_16_tfs_matching_ram_cascade_fanout() {
+    fn view_defs_covers_all_9_tfs_matching_ram_cascade_fanout() {
         let names: Vec<&str> = VIEW_DEFS.iter().map(|v| v.name).collect();
         let expected = [
-            "candles_3s",
-            "candles_5s",
-            "candles_10s",
-            "candles_15s",
-            "candles_30s",
             "candles_1m",
             "candles_5m",
             "candles_15m",
@@ -1233,19 +1252,17 @@ mod tests {
             "candles_3h",
             "candles_4h",
             "candles_1d",
-            "candles_7d",
-            "candles_1M",
         ];
         for tf in expected {
             assert!(
                 names.contains(&tf),
-                "missing matview {tf} (must mirror CascadeFanout 16-TF set); current: {names:?}"
+                "missing matview {tf} (must mirror Tf::ALL 9-TF set); current: {names:?}"
             );
         }
         assert_eq!(
             names.len(),
             expected.len(),
-            "view count drifted from the 16-TF set"
+            "view count drifted from the 9-TF set; current: {names:?}"
         );
     }
 
@@ -1261,6 +1278,26 @@ mod tests {
                 !names.contains(retired),
                 "retired matview {retired} reappeared in VIEW_DEFS — \
                  PR #517 retired the 12 sub-15m timeframes; re-add via \
+                 coordinated PR (config + cascade engine + matview DDL + \
+                 enum + symmetry ratchet)."
+            );
+        }
+    }
+
+    /// 2026-05-09 TF-reduction follow-up ratchet: every newly-retired
+    /// matview (5 sub-minute + 7d + 1M) MUST stay out of `VIEW_DEFS`.
+    /// Re-introducing one requires coordinated updates to the 4 surfaces
+    /// (config, metrics_catalog, cascade_fanout, VIEW_DEFS) per
+    /// `tf_symmetry_guard`.
+    #[test]
+    fn view_defs_does_not_contain_tf_reduction_retired_views() {
+        let names: Vec<&str> = VIEW_DEFS.iter().map(|v| v.name).collect();
+        for retired in TF_REDUCTION_RETIRED_MATERIALIZED_VIEWS {
+            assert!(
+                !names.contains(retired),
+                "retired matview {retired} reappeared in VIEW_DEFS — \
+                 the 2026-05-09 TF reduction retired all 5 sub-minute \
+                 matviews and the 7d + 1M long-tail matviews. Re-add via \
                  coordinated PR (config + cascade engine + matview DDL + \
                  enum + symmetry ratchet)."
             );
@@ -1286,15 +1323,17 @@ mod tests {
     fn build_view_sql_includes_ist_offset() {
         // IST-as-UTC data: offset '00:00' since midnight "UTC" IS midnight IST.
         // Lookup by name to be robust against insertion order changes.
+        // Pin uses `candles_1m` (the smallest retained matview after the
+        // 2026-05-09 TF reduction; `candles_5s` was retired in this commit).
         let def = VIEW_DEFS
             .iter()
-            .find(|v| v.name == "candles_5s")
-            .expect("candles_5s present");
+            .find(|v| v.name == "candles_1m")
+            .expect("candles_1m present");
         let sql = build_view_sql(def);
         assert!(sql.contains("ALIGN TO CALENDAR WITH OFFSET '00:00'"));
-        assert!(sql.contains("SAMPLE BY 5s"));
+        assert!(sql.contains("SAMPLE BY 1m"));
         assert!(sql.contains("FROM candles_1s"));
-        assert!(sql.contains("candles_5s"));
+        assert!(sql.contains("candles_1m"));
     }
 
     /// Cross-verification regression (2026-04-23).
@@ -1394,7 +1433,12 @@ mod tests {
 
     #[test]
     fn build_view_sql_with_tick_count() {
-        let def = &VIEW_DEFS[0]; // candles_5s has tick_count
+        // candles_1m is the first matview in `VIEW_DEFS` after the
+        // 2026-05-09 TF reduction (sub-minute matviews retired). It
+        // still has `has_tick_count: true` because it sources from
+        // candles_1s.
+        let def = &VIEW_DEFS[0];
+        assert_eq!(def.name, "candles_1m", "VIEW_DEFS[0] drift detected");
         let sql = build_view_sql(def);
         assert!(sql.contains("sum(tick_count)"));
     }
@@ -1679,8 +1723,9 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn test_view_count_is_16() {
-        assert_eq!(view_count(), 16);
+    fn test_view_count_is_9() {
+        // 2026-05-09 TF reduction: 16 → 9 matviews (mirrors `Tf::ALL`).
+        assert_eq!(view_count(), 9);
     }
 
     #[test]
@@ -1708,7 +1753,7 @@ mod tests {
 
     #[test]
     fn test_validate_dependency_order_with_wrong_base() {
-        // If base table is not candles_1s, first view (candles_5s from candles_1s) fails
+        // If base table is not candles_1s, first view (candles_1m from candles_1s) fails
         assert!(!validate_dependency_order("wrong_table"));
     }
 
@@ -1741,13 +1786,22 @@ mod tests {
     }
 
     #[test]
-    fn test_build_view_sql_sub_minute_views_have_tick_count() {
-        // First 5 views (5s, 10s, 15s, 30s, 1m) have tick_count
-        for def in &VIEW_DEFS[..5] {
+    fn test_build_view_sql_views_with_tick_count_aggregate_it() {
+        // 2026-05-09 TF reduction: only `candles_1m` retains
+        // `has_tick_count: true` (it's the only matview sourced
+        // directly from `candles_1s`). Filter by the flag rather than
+        // positional index for robustness.
+        let with_tick_count: Vec<&ViewDef> =
+            VIEW_DEFS.iter().filter(|v| v.has_tick_count).collect();
+        assert!(
+            !with_tick_count.is_empty(),
+            "at least one VIEW_DEFS entry must have has_tick_count=true"
+        );
+        for def in with_tick_count {
             let sql = build_view_sql(def);
             assert!(
                 sql.contains("sum(tick_count)"),
-                "sub-minute view {} must aggregate tick_count",
+                "view {} (has_tick_count=true) must aggregate tick_count",
                 def.name
             );
         }
@@ -1869,16 +1923,14 @@ mod tests {
         //                aggregates a clean 3600× source rows.
         // - candles_2h/3h/4h/1d: OFFSET '00:00' → source candles_30m
         //                (30m boundaries divide cleanly into 2h/3h/4h/1d-at-:00)
-        // - candles_7d: OFFSET '00:00', source candles_1d (daily-aligned)
-        // - candles_1M: OFFSET '00:00', source candles_1d (daily-aligned)
+        //
+        // 2026-05-09 TF reduction: candles_7d and candles_1M retired.
         let expected: &[(&str, &str)] = &[
             ("candles_1h", "candles_1s"),
             ("candles_2h", "candles_30m"),
             ("candles_3h", "candles_30m"),
             ("candles_4h", "candles_30m"),
             ("candles_1d", "candles_30m"),
-            ("candles_7d", "candles_1d"),
-            ("candles_1M", "candles_1d"),
         ];
         for (name, expected_source) in expected {
             let def = VIEW_DEFS
@@ -1921,10 +1973,15 @@ mod tests {
     }
 
     #[test]
-    fn test_build_view_sql_monthly_from_1d() {
-        let def = VIEW_DEFS.iter().find(|d| d.name == "candles_1M").unwrap();
-        assert_eq!(def.source, "candles_1d");
-        assert_eq!(def.interval, "1M");
+    fn test_build_view_sql_daily_from_30m() {
+        // 2026-05-09 TF reduction: replaces the prior
+        // `test_build_view_sql_monthly_from_1d`. candles_1M retired
+        // (no in-RAM cascade engine reads it). candles_1d is now the
+        // longest-period matview and sources from candles_30m for the
+        // alignment reason described in `VIEW_DEFS` doc-comment.
+        let def = VIEW_DEFS.iter().find(|d| d.name == "candles_1d").unwrap();
+        assert_eq!(def.source, "candles_30m");
+        assert_eq!(def.interval, "1d");
     }
 
     #[test]
@@ -1959,22 +2016,18 @@ mod tests {
     }
 
     #[test]
-    fn test_view_chain_5s_to_1m_all_from_1s() {
-        let sub_minute = [
-            "candles_5s",
-            "candles_10s",
-            "candles_15s",
-            "candles_30s",
-            "candles_1m",
-        ];
-        for name in &sub_minute {
-            let def = VIEW_DEFS.iter().find(|d| d.name == *name).unwrap();
-            assert_eq!(
-                def.source, "candles_1s",
-                "sub-minute view {} must source from candles_1s",
-                name
-            );
-        }
+    fn test_candles_1m_sources_from_1s() {
+        // 2026-05-09 TF reduction: the 5 sub-minute matviews
+        // (candles_3s/5s/10s/15s/30s) were retired. Only `candles_1m`
+        // sources directly from `candles_1s` now.
+        let def = VIEW_DEFS
+            .iter()
+            .find(|d| d.name == "candles_1m")
+            .expect("candles_1m present");
+        assert_eq!(
+            def.source, "candles_1s",
+            "candles_1m must source from candles_1s"
+        );
     }
 
     #[test]
@@ -2118,7 +2171,7 @@ mod tests {
             ilp_port: port,
         };
         // Exercises success path: create table (line 307), DEDUP (310-311),
-        // all 16 view DDLs (315-319), final info log (322-325)
+        // all 9 view DDLs (315-319), final info log (322-325)
         ensure_candle_views(&config).await;
     }
 
