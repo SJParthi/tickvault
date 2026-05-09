@@ -150,6 +150,20 @@ pub struct MoversV2Response {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct MoversV2Bar {
+    /// 2026-05-09 PR 5b1 — instrument identity composite key per
+    /// audit-findings I-P1-11. Both `security_id` AND
+    /// `exchange_segment_code` are required because `security_id`
+    /// alone is NOT unique across exchange segments (Dhan reuses
+    /// numeric ids across IDX_I / NSE_EQ / NSE_FNO — see
+    /// `.claude/rules/project/security-id-uniqueness.md`).
+    /// Without these the operator-facing dashboards cannot render
+    /// rows; their inclusion is the prerequisite that unblocks the
+    /// PR 5b2 frontend migration documented in
+    /// `.claude/plans/active-plan-movers-cleanup-5b-5c-5d.md`.
+    pub security_id: u32,
+    /// Exchange segment numeric code (0=IDX_I, 1=NSE_EQ, 2=NSE_FNO,
+    /// 8=BSE_FNO, etc.) — see `tickvault_common::types::ExchangeSegment`.
+    pub exchange_segment_code: u8,
     pub bucket_start_ist_secs: u32,
     pub bucket_end_ist_secs: u32,
     pub open: f64,
@@ -165,6 +179,8 @@ pub struct MoversV2Bar {
 impl From<&tickvault_trading::candles::Bar> for MoversV2Bar {
     fn from(bar: &tickvault_trading::candles::Bar) -> Self {
         Self {
+            security_id: bar.security_id,
+            exchange_segment_code: bar.exchange_segment_code,
             bucket_start_ist_secs: bar.bucket_start_ist_secs,
             bucket_end_ist_secs: bar.bucket_end_ist_secs,
             open: bar.open,
@@ -462,6 +478,33 @@ mod tests {
         assert_eq!(v2.volume, bar.volume);
         assert_eq!(v2.tick_count, bar.tick_count);
         assert_eq!(v2.sealed, bar.sealed);
+    }
+
+    /// 2026-05-09 PR 5b1 ratchet — identity fields MUST propagate
+    /// from `Bar` to `MoversV2Bar`. PR 5b2 (frontend migration) is
+    /// blocked without these fields because static dashboards need
+    /// `(security_id, exchange_segment_code)` to render rows. This
+    /// test pins the propagation per-segment (audit-findings I-P1-11
+    /// — `security_id` alone is NOT unique across segments).
+    #[test]
+    fn movers_v2_bar_propagates_identity_fields_per_i_p1_11() {
+        // Distinct `(security_id, exchange_segment_code)` pairs: same
+        // numeric id 27 across two segments must round-trip without
+        // collision in the API response struct.
+        let bar_idx = make_sealed_1s_bar(27, 0, 1_000); // IDX_I
+        let bar_eq = make_sealed_1s_bar(27, 1, 2_000); // NSE_EQ
+        let v2_idx = MoversV2Bar::from(&bar_idx);
+        let v2_eq = MoversV2Bar::from(&bar_eq);
+        assert_eq!(v2_idx.security_id, 27);
+        assert_eq!(v2_idx.exchange_segment_code, 0);
+        assert_eq!(v2_eq.security_id, 27);
+        assert_eq!(v2_eq.exchange_segment_code, 1);
+        // Composite key disambiguates them — confirmation that the
+        // PR 5b2 frontend migration can rely on identity fields.
+        assert_ne!(
+            (v2_idx.security_id, v2_idx.exchange_segment_code),
+            (v2_eq.security_id, v2_eq.exchange_segment_code),
+        );
     }
 
     #[test]
