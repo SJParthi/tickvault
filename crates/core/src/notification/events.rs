@@ -3967,12 +3967,17 @@ mod tests {
 
     #[test]
     fn test_instrument_build_success_severity() {
+        // Wave-Holiday-Gate (2026-05-09): bumped Low → Medium so the
+        // boot-milestone signal dispatches immediately instead of
+        // coalescing in the 60s Low window. Restores natural boot
+        // ordering — Auth + Instruments OK arrive BEFORE the
+        // "ready to trade" Medium summary.
         let event = NotificationEvent::InstrumentBuildSuccess {
             source: "primary".to_string(),
             derivative_count: 100,
             underlying_count: 10,
         };
-        assert_eq!(event.severity(), Severity::Low);
+        assert_eq!(event.severity(), Severity::Medium);
     }
 
     #[test]
@@ -4034,9 +4039,11 @@ mod tests {
 
     #[test]
     fn test_auth_success_severity() {
+        // Wave-Holiday-Gate (2026-05-09): bumped Low → Medium for the
+        // same reason as InstrumentBuildSuccess (boot ordering).
         assert_eq!(
             NotificationEvent::AuthenticationSuccess.severity(),
-            Severity::Low
+            Severity::Medium
         );
     }
 
