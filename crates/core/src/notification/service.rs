@@ -329,22 +329,35 @@ impl NotificationService {
                 // Parthiban on 2026-05-03 (drain re-prepended the tag).
                 let body = event.to_message();
 
+                // 2026-05-09: dispatch policy is now decoupled from
+                // severity. Boot-success events (Auth/Instruments/PoolOnline/
+                // Phase2Complete) carry `Severity::Low` (green ✅) AND
+                // `DispatchPolicy::Immediate` so they ship immediately AND
+                // render green. See `DispatchPolicy` doc in events.rs for
+                // the rationale (operator complaint 2026-05-09).
+                let force_immediate = matches!(
+                    event.dispatch_policy(),
+                    super::events::DispatchPolicy::Immediate
+                );
+
                 // Wave 3-B Item 11: bucket-coalesce Severity::Low and
-                // Severity::Info events. Bypass everything else (Critical,
-                // High, Medium → immediate dispatch). The coalescer's
-                // `observe` returns `Bypass` for Critical/High/Medium so
-                // the same call covers both branches; we only short-circuit
-                // when it returns `Coalesced`.
-                if let Some(coalescer) = self.coalescer.as_ref() {
-                    let decision = coalescer.observe(topic, severity, || body.clone());
-                    if matches!(decision, CoalesceDecision::Coalesced) {
-                        metrics::counter!(
-                            "tv_telegram_dispatched_total",
-                            "severity" => severity.as_label(),
-                            "coalesced" => "true",
-                        )
-                        .increment(1);
-                        return;
+                // Severity::Info events UNLESS the event explicitly
+                // requested `DispatchPolicy::Immediate`. Bypass for
+                // Critical/High/Medium remains driven by severity inside
+                // the coalescer's `observe` (we don't even call it when
+                // `force_immediate` is set).
+                if !force_immediate {
+                    if let Some(coalescer) = self.coalescer.as_ref() {
+                        let decision = coalescer.observe(topic, severity, || body.clone());
+                        if matches!(decision, CoalesceDecision::Coalesced) {
+                            metrics::counter!(
+                                "tv_telegram_dispatched_total",
+                                "severity" => severity.as_label(),
+                                "coalesced" => "true",
+                            )
+                            .increment(1);
+                            return;
+                        }
                     }
                 }
                 // Bypass / coalescer disabled: this dispatch counts as a

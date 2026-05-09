@@ -97,8 +97,13 @@ fn pool_partial_after_deadline_says_partially_online() {
 }
 
 #[test]
-fn pool_online_severity_is_medium_partial_is_high() {
-    use tickvault_core::notification::events::Severity;
+fn pool_online_severity_is_low_partial_is_high() {
+    // 2026-05-09: WebSocketPoolOnline demoted Medium → Low so the boot
+    // success summary renders green ✅. Dispatch is still immediate via
+    // the new `DispatchPolicy::Immediate` mechanism (decoupled from
+    // severity color). The partial-after-deadline event stays High
+    // because it IS a degraded state requiring operator attention.
+    use tickvault_core::notification::events::{DispatchPolicy, Severity};
     let online = NotificationEvent::WebSocketPoolOnline {
         connected: 5,
         total: 5,
@@ -113,7 +118,8 @@ fn pool_online_severity_is_medium_partial_is_high() {
         stuck: vec![],
         boot_path: BootPathLabel::Slow,
     };
-    assert_eq!(online.severity(), Severity::Medium);
+    assert_eq!(online.severity(), Severity::Low);
+    assert_eq!(online.dispatch_policy(), DispatchPolicy::Immediate);
     assert_eq!(partial.severity(), Severity::High);
 }
 
