@@ -75,7 +75,7 @@ use tickvault_common::constants::{
 };
 use tickvault_common::types::ExchangeSegment;
 use tickvault_core::instrument::depth_dynamic_top_volume_selector::{
-    MAX_COHORT_SIZE, MoverRow, SelectorConfig, build_cohort_sql, select_top_k_dynamic,
+    MAX_COHORT_SIZE, MoverRow, SelectorConfig, select_top_k_dynamic,
 };
 use tickvault_core::instrument::dynamic_subscription_state::{
     ConnIdx, DiffOp, DiffStats, DynamicSubscriptionState, PoolShape,
@@ -87,8 +87,9 @@ use tickvault_storage::depth_dynamic_diff_audit_persistence::append_depth_dynami
 /// (matches the legacy v1 pipeline so dashboards/alerts unchanged).
 const RESELECT_INTERVAL_SECS: u64 = 60;
 
-/// HTTP timeout for the QuestDB selector query.
-const QUESTDB_SELECT_TIMEOUT_SECS: u64 = 10;
+// QUESTDB_SELECT_TIMEOUT_SECS removed in PR 5c.3 — the SQL fallback
+// path was retired so the HTTP timeout has no caller. Re-add if a
+// future PR resurrects a SQL-backed query for any reason.
 
 /// Audit-2026-05-03: default minimum cumulative session volume floor
 /// for the redesigned Stage 1 liquidity gate. Replaces the legacy
@@ -295,14 +296,20 @@ pub fn spawn_depth_dynamic_pool(
                         // will fire at today's 09:15:00.
                         continue;
                     }
-                    // 2026-05-09 PR 5c.2 — RAM-first cohort fetch. Reads
-                    // top-volume cohort from the in-RAM CascadeFanout
-                    // when `cascade` is wired (see `PipelineConfig`); the
-                    // SQL fallback applies when (a) cascade is None or
-                    // (b) RAM returns an empty cohort (early boot before
-                    // the cascade is primed). The fallback preserves
-                    // production safety while we soak the RAM path.
-                    let ram_cohort: Option<Vec<MoverRow>> =
+                    // 2026-05-09 PR 5c.3-narrow — RAM-only cohort fetch.
+                    // The SQL fallback (`fetch_cohort_from_questdb`) was
+                    // removed in this PR; the writer + matview chain
+                    // becomes orphan but remains intact (full deletion
+                    // sequenced for PR 5c.4 / 5d). Failure mode: when
+                    // `cascade`/`registry` are unwired OR the RAM
+                    // snapshot returns an empty cohort, this cycle is
+                    // skipped and the previous subscription set is
+                    // retained. Operator visibility is via the existing
+                    // counter `tv_depth_dynamic_cohort_source_total`
+                    // (now emits `source="ram"` exclusively when
+                    // healthy) and the downstream warn `selector
+                    // returned empty next_set — keeping previous`.
+                    let cohort: Vec<MoverRow> =
                         if let (Some(cascade), Some(reg)) =
                             (cfg.cascade.as_ref(), cfg.registry.as_ref())
                         {
@@ -316,73 +323,42 @@ pub fn spawn_depth_dynamic_pool(
                                 MAX_COHORT_SIZE,
                             );
                             if rows.is_empty() {
-                                None
+                                if !cohort_failing {
+                                    error!(
+                                        code = "DEPTH-DYN-V2-01",
+                                        label = cfg.label,
+                                        "depth_dynamic_pool_v2 cohort fetch failed (RAM empty — SQL fallback retired in PR 5c.3)"
+                                    );
+                                    cohort_failing = true;
+                                }
+                                continue;
                             } else {
-                                Some(rows)
+                                if cohort_failing {
+                                    info!(
+                                        label = cfg.label,
+                                        "depth_dynamic_pool_v2 cohort fetch RECOVERED (via RAM)"
+                                    );
+                                    cohort_failing = false;
+                                }
+                                metrics::counter!(
+                                    "tv_depth_dynamic_cohort_source_total",
+                                    "label" => cfg.label,
+                                    "source" => "ram",
+                                )
+                                .increment(1);
+                                rows
                             }
                         } else {
-                            None
-                        };
-                    let cohort = if let Some(rows) = ram_cohort {
-                        if cohort_failing {
-                            info!(
-                                label = cfg.label,
-                                "depth_dynamic_pool_v2 cohort fetch RECOVERED (via RAM)"
-                            );
-                            cohort_failing = false;
-                        }
-                        // 2026-05-09 PR 5c.2.5 — observability: emit a
-                        // counter labelled by source so the operator
-                        // can verify in Grafana that RAM is producing
-                        // healthy cohorts (vs falling through to SQL).
-                        // Once `ram_total >> sql_total` over a soak
-                        // window, PR 5c.3 can safely delete the SQL
-                        // fallback + writer infrastructure.
-                        metrics::counter!(
-                            "tv_depth_dynamic_cohort_source_total",
-                            "label" => cfg.label,
-                            "source" => "ram",
-                        )
-                        .increment(1);
-                        rows
-                    } else {
-                    metrics::counter!(
-                        "tv_depth_dynamic_cohort_source_total",
-                        "label" => cfg.label,
-                        "source" => "sql",
-                    )
-                    .increment(1);
-                    match fetch_cohort_from_questdb(&cfg).await {
-                        Ok(c) => {
-                            if cohort_failing {
-                                info!(
-                                    label = cfg.label,
-                                    "depth_dynamic_pool_v2 cohort fetch RECOVERED"
-                                );
-                                cohort_failing = false;
-                            }
-                            c
-                        }
-                        Err(err) => {
-                            if cohort_failing {
-                                warn!(
-                                    label = cfg.label,
-                                    ?err,
-                                    "depth_dynamic_pool_v2 cohort fetch still failing (rising-edge already fired)"
-                                );
-                            } else {
+                            if !cohort_failing {
                                 error!(
                                     code = "DEPTH-DYN-V2-01",
                                     label = cfg.label,
-                                    ?err,
-                                    "depth_dynamic_pool_v2 cohort fetch failed"
+                                    "depth_dynamic_pool_v2 cohort fetch failed (cascade/registry unwired — boot sequencing bug)"
                                 );
                                 cohort_failing = true;
                             }
                             continue;
-                        }
-                    }
-                    };
+                        };
                     let next_set = select_top_k_dynamic(&cohort, &cfg.selector);
                     if next_set.is_empty() {
                         warn!(
@@ -568,38 +544,6 @@ pub fn spawn_depth_dynamic_pool(
     })
 }
 
-/// Stage-1 fetcher: queries `movers_1m` for the top-volume cohort.
-///
-/// Returns `Vec<MoverRow>` ordered by volume DESC (Stage-2 re-ranks
-/// by change_pct DESC).
-async fn fetch_cohort_from_questdb(cfg: &PipelineConfig) -> anyhow::Result<Vec<MoverRow>> {
-    let sql = build_cohort_sql(
-        &cfg.selector.exchange_segments,
-        &cfg.selector.instrument_types,
-        cfg.min_liquidity_volume,
-        cfg.window_secs,
-    );
-    let url = format!("http://{}:{}/exec", cfg.questdb.host, cfg.questdb.http_port);
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(QUESTDB_SELECT_TIMEOUT_SECS))
-        .build()?;
-    let resp = client
-        .get(&url)
-        .query(&[("query", sql.as_str())])
-        .send()
-        .await?;
-    if !resp.status().is_success() {
-        anyhow::bail!("QuestDB cohort selector non-2xx: {}", resp.status());
-    }
-    let json: serde_json::Value = resp.json().await?;
-    let dataset = json
-        .get("dataset")
-        .and_then(|d| d.as_array())
-        .ok_or_else(|| anyhow::anyhow!("QuestDB response missing dataset"))?;
-
-    parse_cohort_dataset(dataset)
-}
-
 /// 2026-05-09 PR 5c.1 — RAM-backed Stage-1 cohort fetcher (additive,
 /// not yet wired). Replaces the QuestDB SQL path against `movers_1m`
 /// with a direct read over an in-RAM `Vec<Bar>` slice (typically the
@@ -695,48 +639,6 @@ pub fn fetch_cohort_from_ram(
         out.truncate(max_cohort_size);
     }
     out
-}
-
-/// Parses a QuestDB `/exec` response dataset into `Vec<MoverRow>`.
-///
-/// Expected column order (matches `build_cohort_sql`):
-/// 1. `security_id` (LONG)
-/// 2. `exchange_segment` (SYMBOL)
-/// 3. `instrument_type` (SYMBOL)
-/// 4. `volume_cumulative` (LONG) — last(volume) in `movers_1m`
-/// 5. `change_pct_session` (DOUBLE) — vs prev_close in `movers_1m`
-///
-/// Rows with malformed columns are silently skipped (defensive).
-fn parse_cohort_dataset(dataset: &[serde_json::Value]) -> anyhow::Result<Vec<MoverRow>> {
-    let mut rows: Vec<MoverRow> = Vec::with_capacity(dataset.len());
-    for row in dataset {
-        let cols = match row.as_array() {
-            Some(c) if c.len() >= 5 => c,
-            _ => continue,
-        };
-        let security_id = match cols[0].as_i64().and_then(|v| u32::try_from(v).ok()) {
-            Some(id) => id,
-            None => continue,
-        };
-        let exchange_segment = match cols[1].as_str() {
-            Some(s) => s.to_string(),
-            None => continue,
-        };
-        let instrument_type = match cols[2].as_str() {
-            Some(s) => s.to_string(),
-            None => continue,
-        };
-        let volume = cols[3].as_i64().unwrap_or(0);
-        let change_pct = cols[4].as_f64().unwrap_or(0.0);
-        rows.push(MoverRow {
-            security_id,
-            exchange_segment,
-            instrument_type,
-            volume,
-            change_pct,
-        });
-    }
-    Ok(rows)
 }
 
 /// Translates `Vec<DiffOp>` into per-conn `DepthCommand` and dispatches
@@ -1218,66 +1120,6 @@ mod tests {
         let msg = build_add_200_message(13, idx_i());
         assert!(msg.contains(r#""ExchangeSegment":"IDX_I""#));
     }
-
-    // ---- parse_cohort_dataset ----
-
-    #[test]
-    fn test_parse_cohort_dataset_parses_valid_rows() {
-        let dataset = serde_json::json!([
-            [50000_i64, "NSE_FNO", "OPTSTK", 1_000_000_i64, 5.5_f64],
-            [50001_i64, "NSE_FNO", "OPTSTK", 800_000_i64, 4.2_f64],
-        ]);
-        let rows = parse_cohort_dataset(dataset.as_array().unwrap()).unwrap();
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].security_id, 50000);
-        assert_eq!(rows[0].exchange_segment, "NSE_FNO");
-        assert_eq!(rows[0].instrument_type, "OPTSTK");
-        assert_eq!(rows[0].volume, 1_000_000);
-        assert!((rows[0].change_pct - 5.5).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn test_parse_cohort_dataset_skips_short_rows() {
-        let dataset = serde_json::json!([
-            [50000_i64, "NSE_FNO"],                                 // too short
-            [50001_i64, "NSE_FNO", "OPTSTK", 800_000_i64, 4.2_f64], // valid
-        ]);
-        let rows = parse_cohort_dataset(dataset.as_array().unwrap()).unwrap();
-        assert_eq!(rows.len(), 1, "short row dropped, valid kept");
-        assert_eq!(rows[0].security_id, 50001);
-    }
-
-    #[test]
-    fn test_parse_cohort_dataset_skips_rows_with_invalid_security_id() {
-        let dataset = serde_json::json!([
-            ["not_a_number", "NSE_FNO", "OPTSTK", 800_000_i64, 4.2_f64], // bad security_id
-            [-1_i64, "NSE_FNO", "OPTSTK", 800_000_i64, 4.2_f64],         // negative
-            [50001_i64, "NSE_FNO", "OPTSTK", 800_000_i64, 4.2_f64],      // valid
-        ]);
-        let rows = parse_cohort_dataset(dataset.as_array().unwrap()).unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].security_id, 50001);
-    }
-
-    #[test]
-    fn test_parse_cohort_dataset_handles_empty_dataset() {
-        let dataset = serde_json::json!([]);
-        let rows = parse_cohort_dataset(dataset.as_array().unwrap()).unwrap();
-        assert!(rows.is_empty());
-    }
-
-    #[test]
-    fn test_parse_cohort_dataset_defaults_volume_and_change_pct_when_missing() {
-        // Defensive: QuestDB returning JSON null on a numeric column
-        // shouldn't crash the selector. Default to 0.
-        let dataset = serde_json::json!([[50000_i64, "NSE_FNO", "OPTSTK", null, null],]);
-        let rows = parse_cohort_dataset(dataset.as_array().unwrap()).unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].volume, 0);
-        assert!((rows[0].change_pct - 0.0).abs() < f64::EPSILON);
-    }
-
-    // ---- is_within_market_hours_ist (smoke) ----
 
     #[test]
     fn test_is_within_market_hours_ist_returns_bool() {
