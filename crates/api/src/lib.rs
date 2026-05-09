@@ -154,14 +154,13 @@ pub fn build_router_with_auth(
             "/api/market/indices",
             axum::routing::get(handlers::market_data::get_indices),
         )
-        .route(
-            "/api/market/stock-movers",
-            axum::routing::get(handlers::market_data::get_stock_movers),
-        )
-        .route(
-            "/api/market/option-movers",
-            axum::routing::get(handlers::market_data::get_option_movers),
-        )
+        // 2026-05-09 PR 5b2: legacy `/api/market/stock-movers` and
+        // `/api/market/option-movers` routes deleted. The 3 static
+        // dashboards (markets-stocks.html, markets-options.html,
+        // market-dashboard.html) now consume `/api/movers/v2`
+        // (in-RAM CascadeFanout reads — no `movers_*` matview
+        // dependency). Backing handlers + `movers_questdb.rs` deleted
+        // in the same commit.
         .route(
             "/portal/market-dashboard",
             axum::routing::get(handlers::static_file::market_dashboard),

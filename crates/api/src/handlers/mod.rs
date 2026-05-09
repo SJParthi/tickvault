@@ -5,19 +5,15 @@ pub mod health;
 pub mod index_constituency;
 pub mod instruments;
 pub mod market_data;
-// 2026-05-09 cleanup (PR 5a): the V1 `movers` handler module
-// (`/api/movers` + `/api/movers/expiries`) was removed because no
-// frontend consumes it (verified by grepping `crates/api/static/`).
-// The unified `/api/movers/v2` endpoint in `movers_v2.rs` is the
-// single source of truth.
-//
-// `movers_questdb` is RETAINED — `market_data::get_stock_movers`
-// (routed at `/api/market/stock-movers`, consumed by static
-// `markets-stocks.html` + `market-dashboard.html`) imports
-// `query_movers` + helper enums from this module. Its deletion is
-// scheduled for PR 5b/c after the static frontends migrate to
-// `/api/movers/v2`.
-pub mod movers_questdb;
+// 2026-05-09 cleanup (PR 5b2): both `movers` (V1 handler) and
+// `movers_questdb` (V1 SQL helper) modules deleted. The 3 static
+// dashboards (`markets-stocks.html`, `markets-options.html`,
+// `market-dashboard.html`) now consume `/api/movers/v2` (in-RAM
+// CascadeFanout reads — no `movers_*` matview dependency).
+// `market_data::get_stock_movers` + `get_option_movers` were the
+// last consumers of `movers_questdb` and are also deleted in this
+// commit. Plan reference:
+// `.claude/plans/active-plan-movers-cleanup-5b-5c-5d.md`.
 // Phase 4a (2026-05-05): NEW dormant /api/movers?v=2 handler reading
 // OHLCV from the in-RAM 29-TF CascadeFanout. Distinct from the old
 // movers_v2 module deleted in PR #450 commit 6 (that used

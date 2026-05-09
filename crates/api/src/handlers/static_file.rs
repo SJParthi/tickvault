@@ -258,9 +258,12 @@ mod tests {
 
     #[test]
     fn test_market_dashboard_html_contains_api_endpoints() {
+        // 2026-05-09 PR 5b2: stock-movers + option-movers fetches were
+        // migrated from `/api/market/*` (V1 SQL handlers, deleted) to
+        // `/api/movers/v2` (in-RAM CascadeFanout). Indices fetch is
+        // unchanged.
         assert!(MARKET_DASHBOARD_HTML.contains("/api/market/indices"));
-        assert!(MARKET_DASHBOARD_HTML.contains("/api/market/stock-movers"));
-        assert!(MARKET_DASHBOARD_HTML.contains("/api/market/option-movers"));
+        assert!(MARKET_DASHBOARD_HTML.contains("/api/movers/v2"));
     }
 
     #[test]

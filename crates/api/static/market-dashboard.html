@@ -925,42 +925,68 @@
             }).join('');
         }
 
-        // ============ FETCH DATA ============
+        // ============ FETCH DATA =============================================
+        // 2026-05-09 PR 5b2: migrated from `/api/market/stock-movers` to the
+        // unified `/api/movers/v2` endpoint backed by the in-RAM 29-TF
+        // CascadeFanout. Three parallel calls fetch price_gainers,
+        // price_losers, and top_volume; downstream merge mirrors the legacy
+        // mode-dependent ordering (rise-fall vs recovery).
+        // Field mapping: see markets-stocks.html for the canonical V2-bar
+        // -> row schema. `symbol` resolves to "SID-{id}" until a future PR
+        // plumbs InstrumentRegistry into the V2 response.
+        function mapV2BarToRow(b) {
+            const ltp = b.close || 0;
+            const prev = b.prev_day_close || 0;
+            const change = (ltp && prev) ? (ltp - prev) : 0;
+            const changePct = b.close_pct_from_prev_day || 0;
+            return {
+                symbol: 'SID-' + b.security_id,
+                security_id: b.security_id,
+                ltp: ltp,
+                change: change,
+                change_pct: changePct,
+                volume: b.volume || 0
+            };
+        }
+
+        async function fetchV2Category(category, scope, n) {
+            const url = '/api/movers/v2?category=' + category +
+                        '&scope=' + (scope || 'stock') +
+                        '&n=' + (n || 20) + '&timeframe=1m';
+            const resp = await fetch(url);
+            if (!resp.ok) return [];
+            const data = await resp.json();
+            return Array.isArray(data.bars) ? data.bars.map(mapV2BarToRow) : [];
+        }
+
         async function fetchStockMovers() {
             try {
-                const resp = await fetch('/api/market/stock-movers');
-                if (!resp.ok) throw new Error('API error: ' + resp.status);
-                const data = await resp.json();
-                stockData = data;
+                const [gainers, losers, mostActive] = await Promise.all([
+                    fetchV2Category('price_gainers', 'stock', 20),
+                    fetchV2Category('price_losers', 'stock', 20),
+                    fetchV2Category('top_volume', 'stock', 20)
+                ]);
+                stockData = { gainers: gainers, losers: losers, most_active: mostActive };
 
-                // Combine all available data, prioritizing based on mode
+                // Mode-dependent ordering preserved verbatim from the legacy
+                // path (only the source has changed).
                 let displayData = [];
                 if (currentMode === 'rise-fall') {
-                    // Show gainers first, then most_active, then losers
-                    displayData = [
-                        ...(data.gainers || []),
-                        ...(data.most_active || []),
-                        ...(data.losers || [])
-                    ];
+                    displayData = [...gainers, ...mostActive, ...losers];
                 } else {
-                    // Recovery mode - show losers first, then most_active, then gainers
-                    displayData = [
-                        ...(data.losers || []),
-                        ...(data.most_active || []),
-                        ...(data.gainers || [])
-                    ];
+                    displayData = [...losers, ...mostActive, ...gainers];
                 }
-                // De-duplicate by symbol
+                // De-duplicate by security_id (legacy used symbol; V2 returns
+                // SID-{id} placeholder so security_id is the unambiguous key).
                 const seen = new Set();
                 displayData = displayData.filter(item => {
-                    if (seen.has(item.symbol)) return false;
-                    seen.add(item.symbol);
+                    if (seen.has(item.security_id)) return false;
+                    seen.add(item.security_id);
                     return true;
                 });
 
                 renderTable(displayData);
 
-                // Update timestamp
                 const now = new Date();
                 document.getElementById('data-timestamp').textContent =
                     'Updated ' + now.toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
@@ -973,22 +999,25 @@
                             Failed to load data. Retrying...
                         </td>
                     </tr>`;
-                // Retry after 3 seconds
                 setTimeout(fetchStockMovers, 3000);
             }
         }
 
-        // Stub fetcher for /api/market/option-movers — the Options tab is wired to
-        // the backend endpoint but the render path is minimal until the full
-        // options UI is designed. This function exists so the dashboard reference
-        // to the endpoint is real, not aspirational. See tickvault session 8
-        // "more-thorough-check" commit for context.
+        // 2026-05-09 PR 5b2: option-movers fetcher now hits `/api/movers/v2`
+        // with `scope=index` (option contracts on indices). Returns a raw
+        // V2 response so downstream consumers can render however they like.
         async function fetchOptionMovers(category) {
             try {
                 const cat = category || 'top_volume';
-                const resp = await fetch(`/api/market/option-movers?category=${cat}`);
+                const url = '/api/movers/v2?category=' + cat +
+                            '&scope=index&n=20&timeframe=1m';
+                const resp = await fetch(url);
                 if (!resp.ok) return null;
-                return await resp.json();
+                const data = await resp.json();
+                if (data && Array.isArray(data.bars)) {
+                    data.movers = data.bars.map(mapV2BarToRow);
+                }
+                return data;
             } catch (err) {
                 console.error('Failed to fetch option movers:', err);
                 return null;
