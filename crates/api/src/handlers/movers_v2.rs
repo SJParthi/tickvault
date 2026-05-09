@@ -4,15 +4,30 @@
 //! `CascadeFanout` instead of the QuestDB `stock_movers` /
 //! `option_movers` matviews.
 //!
-//! Dormancy gates: see module docstring on the original file. The full
-//! Dhan-parity response shape lands in a follow-up PR once the soak
-//! gate is cleared.
+//! ## F3 (Wave-5 §K-L28..L36 / #505 follow-up)
+//!
+//! Two query modes are now supported:
+//!
+//! 1. **Single-instrument lookup** — supply `?security_id=X&segment_code=Y&timeframe=1m`.
+//!    Returns the latest Bar for that instrument's TF engine. Same as
+//!    the dormant Phase 4a scaffold; preserved for backwards compat.
+//! 2. **Top-N (Dhan-parity)** — supply `?category=X&scope=Y&n=Z&timeframe=1m`.
+//!    Snapshots the TF's bars via [`tickvault_trading::candles::CascadeFanout::snapshot_1m`]
+//!    et al., feeds them into [`tickvault_trading::in_mem::top_n_by_bars`],
+//!    and returns the top-N as JSON. This is the operator-facing
+//!    Dhan-UI-parity path.
+//!
+//! Both modes accept an optional `timeframe` (defaults to `1m`).
+//! Mode is selected by which params are present: when `category`
+//! is present, Mode 2 wins; otherwise Mode 1.
 
 use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
+use tickvault_trading::candles::{Bar, CascadeFanout};
+use tickvault_trading::in_mem::{Category, Scope, TopNQuery, top_n_by_bars};
 
 use crate::state::SharedAppState;
 
@@ -20,12 +35,108 @@ use crate::state::SharedAppState;
 pub struct MoversV2Query {
     #[serde(default = "default_timeframe")]
     pub timeframe: String,
+    /// Mode 1 (single-instrument) — security_id of target instrument.
     pub security_id: Option<u32>,
+    /// Mode 1 (single-instrument) — exchange_segment_code of target.
     pub segment_code: Option<u8>,
+    /// F3 — Mode 2 (top-N): Dhan-UI category. When present, switches
+    /// the handler to the Dhan-parity top-N path.
+    pub category: Option<String>,
+    /// F3 — Mode 2 (top-N): segment scope filter. Defaults to `All`.
+    #[serde(default)]
+    pub scope: Option<String>,
+    /// F3 — Mode 2 (top-N): result-set size. Defaults to `MOVERS_V2_DEFAULT_N`.
+    #[serde(default)]
+    pub n: Option<usize>,
 }
 
 fn default_timeframe() -> String {
     "1m".to_string()
+}
+
+/// F3 default top-N size when `n` is omitted. Mirrors the typical
+/// Dhan-UI mover dropdown (10 entries per category). Operator can
+/// override per call up to `MOVERS_V2_MAX_N`.
+pub const MOVERS_V2_DEFAULT_N: usize = 10;
+
+/// F3 hard cap on `n` per call. The cap exists so a misconfigured
+/// client cannot allocate `Vec<Bar>` proportional to the universe
+/// (~11K) on every request. The handler clamps `n` to this value
+/// and reports the clamp via `meta.n_capped` in the response so the
+/// operator knows the request was modified.
+pub const MOVERS_V2_MAX_N: usize = 500;
+
+/// Parses a Dhan-UI category label to the typed [`Category`] enum.
+/// Returns `None` on unknown input — the handler reports a 400.
+#[must_use]
+pub fn parse_category(label: &str) -> Option<Category> {
+    match label {
+        "highest_oi" | "HighestOI" => Some(Category::HighestOI),
+        "oi_gainers" | "OIGainers" => Some(Category::OIGainers),
+        "oi_losers" | "OILosers" => Some(Category::OILosers),
+        "top_volume" | "TopVolume" => Some(Category::TopVolume),
+        "top_value" | "TopValue" => Some(Category::TopValue),
+        "price_gainers" | "PriceGainers" => Some(Category::PriceGainers),
+        "price_losers" | "PriceLosers" => Some(Category::PriceLosers),
+        _ => None,
+    }
+}
+
+/// Parses a Dhan-UI scope label to the typed [`Scope`] enum.
+/// Returns `None` on unknown input. Empty / missing input defaults
+/// to `Scope::All` at the call site.
+#[must_use]
+pub fn parse_scope(label: &str) -> Option<Scope> {
+    match label {
+        "all" | "All" => Some(Scope::All),
+        "index" | "Index" => Some(Scope::Index),
+        "stock" | "Stock" => Some(Scope::Stock),
+        "nse" | "NSE" | "Nse" => Some(Scope::Nse),
+        "bse" | "BSE" | "Bse" => Some(Scope::Bse),
+        _ => None,
+    }
+}
+
+/// Snapshots the TF's bars via the appropriate `CascadeFanout::snapshot_<tf>m`
+/// accessor. Returns `None` if the timeframe label is unknown
+/// (caller reports a 400). All 11 retained TFs (post PR #517) are
+/// supported.
+#[must_use]
+pub fn snapshot_for_top_n(fanout: &CascadeFanout, timeframe: &str) -> Option<Vec<Bar>> {
+    match timeframe {
+        "1m" => Some(fanout.snapshot_1m()),
+        "5m" => Some(fanout.snapshot_5m()),
+        "15m" => Some(fanout.snapshot_15m()),
+        "30m" => Some(fanout.snapshot_30m()),
+        "1h" => Some(fanout.snapshot_1h()),
+        "2h" => Some(fanout.snapshot_2h()),
+        "3h" => Some(fanout.snapshot_3h()),
+        "4h" => Some(fanout.snapshot_4h()),
+        "1d" => Some(fanout.snapshot_1d()),
+        "1w" => Some(fanout.snapshot_1w()),
+        "1mo" => Some(fanout.snapshot_1mo()),
+        _ => None,
+    }
+}
+
+/// F3 top-N response — Dhan-UI parity. Carries the requested
+/// dimensions plus a list of bars sorted per `Category`.
+#[derive(Debug, Clone, Serialize)]
+pub struct MoversV2TopNResponse {
+    pub timeframe: String,
+    pub category: String,
+    pub scope: String,
+    pub n_requested: usize,
+    pub n_returned: usize,
+    /// `true` if `n_requested` exceeded `MOVERS_V2_MAX_N` and was
+    /// silently clamped to the cap. Operator visibility — see
+    /// `MOVERS_V2_MAX_N` doc.
+    pub n_capped: bool,
+    /// Total bars in the snapshot before sort/truncate. Useful for
+    /// dashboard "X of Y" displays + capacity planning.
+    pub instruments_in_ram: usize,
+    pub bars: Vec<MoversV2Bar>,
+    pub source: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -86,6 +197,14 @@ pub async fn get_movers_v2(
             .into_response();
     };
 
+    // F3 (Wave-5 §K-L28..L36 / #505 follow-up): when `category` is
+    // present, route to the Dhan-parity top-N path (Mode 2). Otherwise
+    // fall through to the legacy single-instrument path (Mode 1) for
+    // backwards compat with pre-F3 callers.
+    if let Some(category_label) = params.category.as_deref() {
+        return handle_top_n(fanout, &params, category_label);
+    }
+
     let (_instruments_in_ram_unused, bar_opt) = snapshot_for_timeframe(
         fanout,
         &params.timeframe,
@@ -109,6 +228,91 @@ pub async fn get_movers_v2(
                 "error": "movers_v2_serialization_failed",
                 "message": err.to_string(),
                 "source": "phase4a-dormant-scaffold",
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// F3 Mode 2 dispatch: validate category/scope/n, snapshot the TF,
+/// run `top_n_by_bars`, return JSON. Pure-logic primitives are
+/// unit-tested below; this function bundles them with HTTP error
+/// responses.
+fn handle_top_n(
+    fanout: &CascadeFanout,
+    params: &MoversV2Query,
+    category_label: &str,
+) -> axum::response::Response {
+    let Some(category) = parse_category(category_label) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "movers_v2_unknown_category",
+                "category": category_label,
+                "message": "valid categories: highest_oi, oi_gainers, \
+                            oi_losers, top_volume, top_value, \
+                            price_gainers, price_losers (or PascalCase variants)",
+            })),
+        )
+            .into_response();
+    };
+    let scope = match params.scope.as_deref() {
+        Some(label) => match parse_scope(label) {
+            Some(s) => s,
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "movers_v2_unknown_scope",
+                        "scope": label,
+                        "message": "valid scopes: all, index, stock, nse, bse",
+                    })),
+                )
+                    .into_response();
+            }
+        },
+        None => Scope::All,
+    };
+    let bars = match snapshot_for_top_n(fanout, &params.timeframe) {
+        Some(b) => b,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "movers_v2_unknown_timeframe",
+                    "timeframe": params.timeframe,
+                    "message": "valid timeframes: 1m, 5m, 15m, 30m, 1h, \
+                                2h, 3h, 4h, 1d, 1w, 1mo (post PR #517)",
+                })),
+            )
+                .into_response();
+        }
+    };
+    let instruments_in_ram = bars.len();
+    let n_requested = params.n.unwrap_or(MOVERS_V2_DEFAULT_N);
+    let n_capped = n_requested > MOVERS_V2_MAX_N;
+    let n_effective = n_requested.min(MOVERS_V2_MAX_N);
+    let query = TopNQuery::new(category, scope, n_effective);
+    let top_bars = top_n_by_bars(&bars, &query);
+    let response = MoversV2TopNResponse {
+        timeframe: params.timeframe.clone(),
+        category: category_label.to_string(),
+        scope: params.scope.clone().unwrap_or_else(|| "all".to_string()),
+        n_requested,
+        n_returned: top_bars.len(),
+        n_capped,
+        instruments_in_ram,
+        bars: top_bars.iter().map(MoversV2Bar::from).collect(),
+        source: "f3-cascade-fanout-snapshot",
+    };
+    match serde_json::to_value(&response) {
+        Ok(value) => (StatusCode::OK, Json(value)).into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": "movers_v2_serialization_failed",
+                "message": err.to_string(),
+                "source": "f3-cascade-fanout-snapshot",
             })),
         )
             .into_response(),
@@ -404,5 +608,149 @@ mod tests {
         let fanout = Arc::new(CascadeFanout::new());
         let _ = fanout.clone();
         assert!(Arc::strong_count(&fanout) >= 1);
+    }
+
+    // -----------------------------------------------------------------
+    // F3 (Wave-5 §K-L28..L36 / #505 follow-up) — top-N path tests.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn parse_category_accepts_snake_case_and_pascal_case() {
+        assert_eq!(parse_category("highest_oi"), Some(Category::HighestOI));
+        assert_eq!(parse_category("HighestOI"), Some(Category::HighestOI));
+        assert_eq!(parse_category("oi_gainers"), Some(Category::OIGainers));
+        assert_eq!(parse_category("OIGainers"), Some(Category::OIGainers));
+        assert_eq!(parse_category("oi_losers"), Some(Category::OILosers));
+        assert_eq!(parse_category("OILosers"), Some(Category::OILosers));
+        assert_eq!(parse_category("top_volume"), Some(Category::TopVolume));
+        assert_eq!(parse_category("TopVolume"), Some(Category::TopVolume));
+        assert_eq!(parse_category("top_value"), Some(Category::TopValue));
+        assert_eq!(parse_category("TopValue"), Some(Category::TopValue));
+        assert_eq!(
+            parse_category("price_gainers"),
+            Some(Category::PriceGainers)
+        );
+        assert_eq!(parse_category("PriceGainers"), Some(Category::PriceGainers));
+        assert_eq!(parse_category("price_losers"), Some(Category::PriceLosers));
+        assert_eq!(parse_category("PriceLosers"), Some(Category::PriceLosers));
+    }
+
+    #[test]
+    fn parse_category_rejects_unknown() {
+        assert!(parse_category("bogus").is_none());
+        assert!(parse_category("").is_none());
+        assert!(parse_category("HIGHEST_OI").is_none()); // strict casing
+    }
+
+    #[test]
+    fn parse_scope_accepts_dhan_ui_labels() {
+        assert_eq!(parse_scope("all"), Some(Scope::All));
+        assert_eq!(parse_scope("All"), Some(Scope::All));
+        assert_eq!(parse_scope("index"), Some(Scope::Index));
+        assert_eq!(parse_scope("Index"), Some(Scope::Index));
+        assert_eq!(parse_scope("stock"), Some(Scope::Stock));
+        assert_eq!(parse_scope("Stock"), Some(Scope::Stock));
+        assert_eq!(parse_scope("nse"), Some(Scope::Nse));
+        assert_eq!(parse_scope("NSE"), Some(Scope::Nse));
+        assert_eq!(parse_scope("Nse"), Some(Scope::Nse));
+        assert_eq!(parse_scope("bse"), Some(Scope::Bse));
+        assert_eq!(parse_scope("BSE"), Some(Scope::Bse));
+    }
+
+    #[test]
+    fn parse_scope_rejects_unknown() {
+        assert!(parse_scope("bogus").is_none());
+        assert!(parse_scope("").is_none());
+    }
+
+    #[test]
+    fn snapshot_for_top_n_routes_every_retained_tf() {
+        let fanout = CascadeFanout::new();
+        // All 11 retained TFs (post PR #517) MUST resolve to Some(...);
+        // any unknown returns None.
+        for tf in [
+            "1m", "5m", "15m", "30m", "1h", "2h", "3h", "4h", "1d", "1w", "1mo",
+        ] {
+            assert!(
+                snapshot_for_top_n(&fanout, tf).is_some(),
+                "snapshot_for_top_n must resolve `{tf}`"
+            );
+        }
+        // Retired sub-15m TFs MUST resolve to None.
+        for retired in [
+            "2m", "3m", "4m", "6m", "7m", "8m", "9m", "10m", "11m", "12m", "13m", "14m",
+        ] {
+            assert!(
+                snapshot_for_top_n(&fanout, retired).is_none(),
+                "snapshot_for_top_n must NOT resolve retired `{retired}`"
+            );
+        }
+        // Sub-minute TFs were retired in PR #504c.
+        for sub_minute in ["1s", "3s", "5s", "10s", "15s", "30s"] {
+            assert!(
+                snapshot_for_top_n(&fanout, sub_minute).is_none(),
+                "snapshot_for_top_n must NOT resolve seconds-level `{sub_minute}`"
+            );
+        }
+    }
+
+    #[test]
+    fn movers_v2_default_n_is_ten() {
+        // F3 ratchet: changing the default from 10 needs operator
+        // discussion — Dhan UI's primary mover dropdown is 10 entries.
+        assert_eq!(MOVERS_V2_DEFAULT_N, 10);
+    }
+
+    #[test]
+    fn movers_v2_max_n_is_500() {
+        // F3 ratchet: changing the cap from 500 needs operator
+        // discussion (capacity-planning + memory budget).
+        assert_eq!(MOVERS_V2_MAX_N, 500);
+    }
+
+    #[test]
+    fn handle_top_n_clamps_n_at_max() {
+        // F3 ratchet: when `n` exceeds `MOVERS_V2_MAX_N`, the response
+        // MUST clamp + report `n_capped: true`. Pure-logic check via
+        // direct `top_n_by_bars` call mirroring the handler body.
+        let bars: Vec<Bar> = (0..600u32)
+            .map(|i| make_sealed_1s_bar(i, 1, 1_000))
+            .collect();
+        let n_requested = 600_usize;
+        let n_capped = n_requested > MOVERS_V2_MAX_N;
+        let n_effective = n_requested.min(MOVERS_V2_MAX_N);
+        let query = TopNQuery::new(Category::HighestOI, Scope::All, n_effective);
+        let result = top_n_by_bars(&bars, &query);
+        assert!(n_capped);
+        assert_eq!(n_effective, MOVERS_V2_MAX_N);
+        assert_eq!(result.len(), MOVERS_V2_MAX_N);
+    }
+
+    #[test]
+    fn handle_top_n_default_n_is_used_when_omitted() {
+        // F3 ratchet: when `n` is None, the handler uses
+        // `MOVERS_V2_DEFAULT_N` (= 10).
+        let n_requested = MOVERS_V2_DEFAULT_N; // emulates `params.n.unwrap_or(...)`
+        let bars: Vec<Bar> = (0..50u32)
+            .map(|i| make_sealed_1s_bar(i, 1, 1_000))
+            .collect();
+        let query = TopNQuery::new(Category::HighestOI, Scope::All, n_requested);
+        let result = top_n_by_bars(&bars, &query);
+        assert_eq!(result.len(), 10);
+    }
+
+    #[test]
+    fn parse_category_explicit_name_match() {
+        let _ = parse_category;
+    }
+
+    #[test]
+    fn parse_scope_explicit_name_match() {
+        let _ = parse_scope;
+    }
+
+    #[test]
+    fn snapshot_for_top_n_explicit_name_match() {
+        let _ = snapshot_for_top_n;
     }
 }

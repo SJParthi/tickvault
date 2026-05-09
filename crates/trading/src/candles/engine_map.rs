@@ -229,6 +229,43 @@ impl<TF: Timeframe + 'static> CandleEngineMap<TF> {
         count
     }
 
+    /// F3 (Wave-5 §K-L28..L36 / #505 follow-up): snapshot the
+    /// `latest()` Bar from every engine in the map. Returns a `Vec`
+    /// sized to the active instrument count.
+    ///
+    /// Iteration order is whatever papaya's
+    /// [`papaya::HashMap::iter`] yields — the caller MUST NOT depend
+    /// on a stable order. Callers that need a sorted result
+    /// (`/api/movers/v2`) sort the returned Vec via [`crate::in_mem::top_n_by_bars`].
+    ///
+    /// **Cold path.** Called from `/api/movers/v2` (≥1s between
+    /// calls) and the depth-dynamic selector (1 call/min per L37).
+    /// O(N) over the active universe (~11K instruments) — single
+    /// `Vec::with_capacity(len())` allocation, bounded.
+    ///
+    /// **Locking.** Acquires the per-engine `Mutex` briefly to call
+    /// `latest()`. Each lock is held for ~10 ns; concurrent
+    /// `on_tick`/`on_sealed_bar` callers see negligible contention
+    /// at the cold-path call rate.
+    ///
+    /// Engines whose `latest()` returns `None` (zero ticks observed
+    /// yet for that key) are skipped.
+    #[must_use]
+    pub fn snapshot_latest_bars(&self) -> Vec<Bar> {
+        let guard = self.inner.guard();
+        let mut bars: Vec<Bar> = Vec::with_capacity(self.inner.len());
+        for (_key, engine_arc) in self.inner.iter(&guard) {
+            let engine = match engine_arc.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if let Some(bar) = engine.latest() {
+                bars.push(bar);
+            }
+        }
+        bars
+    }
+
     /// Returns the number of instruments with active engines.
     /// Useful for Prometheus gauge `tv_candle_engine_<tf>_active_instruments`.
     pub fn len(&self) -> usize {
@@ -481,6 +518,60 @@ mod tests {
     #[test]
     fn test_new_explicit_name_match() {
         let _: CandleEngineMap<Tf1s> = CandleEngineMap::new();
+    }
+
+    /// F3 ratchet (Wave-5 §K-L28..L36 / #505 follow-up): every
+    /// instrument that has observed at least one tick MUST appear
+    /// in the snapshot result. Engines with no `latest()` (no tick
+    /// yet) are skipped. Order is unspecified — the caller sorts.
+    #[test]
+    fn test_snapshot_latest_bars_returns_one_per_active_engine() {
+        let map: CandleEngineMap<Tf1s> = CandleEngineMap::new();
+        // Three instruments, one tick each into the same 1s bucket.
+        // (No bucket-crossing → no seal → `latest()` returns the
+        // open bar, which is what /api/movers/v2 wants.)
+        assert!(map.on_tick(&make_tick(13, 0, 1_000, 100.0)).is_none());
+        assert!(map.on_tick(&make_tick(1333, 1, 1_000, 200.0)).is_none());
+        assert!(map.on_tick(&make_tick(4321, 2, 1_000, 300.0)).is_none());
+
+        let snap = map.snapshot_latest_bars();
+        assert_eq!(snap.len(), 3);
+
+        let mut closes: Vec<f64> = snap.iter().map(|b| b.close).collect();
+        closes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        assert_eq!(closes, vec![100.0, 200.0, 300.0]);
+    }
+
+    /// F3 ratchet: a fresh empty map snapshots to an empty Vec
+    /// without panicking.
+    #[test]
+    fn test_snapshot_latest_bars_returns_empty_on_empty_map() {
+        let map: CandleEngineMap<Tf1s> = CandleEngineMap::new();
+        assert!(map.snapshot_latest_bars().is_empty());
+    }
+
+    /// F3 ratchet: cross-segment uniqueness per I-P1-11 — same
+    /// `security_id` on different segments must produce TWO entries
+    /// in the snapshot, not one. Mirrors the existing
+    /// `cascade_fanout::feed_sealed_1s_bar_isolates_cross_segment_collisions`
+    /// pattern at the snapshot level.
+    #[test]
+    fn test_snapshot_latest_bars_isolates_cross_segment_collisions() {
+        let map: CandleEngineMap<Tf1s> = CandleEngineMap::new();
+        // Same security_id (27) on two different segments — the
+        // composite key `(security_id, exchange_segment_code)` MUST
+        // keep them distinct.
+        assert!(map.on_tick(&make_tick(27, 0, 1_000, 18_500.0)).is_none()); // IDX_I FINNIFTY-style
+        assert!(map.on_tick(&make_tick(27, 1, 1_000, 1_234.0)).is_none()); // NSE_EQ collision
+        let snap = map.snapshot_latest_bars();
+        assert_eq!(snap.len(), 2, "I-P1-11: cross-segment IDs must be distinct");
+    }
+
+    /// F3 ratchet — pub-fn-test guard explicit name match.
+    #[test]
+    fn test_snapshot_latest_bars_explicit_name_match() {
+        let m: CandleEngineMap<Tf1s> = CandleEngineMap::new();
+        let _ = m.snapshot_latest_bars();
     }
 
     use crate::candles::engine::Tf1m;

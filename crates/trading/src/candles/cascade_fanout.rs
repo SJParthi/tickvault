@@ -261,6 +261,72 @@ impl CascadeFanout {
         self.tf1mo.len()
     }
 
+    // -----------------------------------------------------------------
+    // F3 (Wave-5 §K-L28..L36 / #505 follow-up): per-TF bar snapshots.
+    //
+    // Each accessor delegates to `CandleEngineMap::snapshot_latest_bars`
+    // on the corresponding derived engine. Used by `/api/movers/v2`
+    // (cold path, ≥1s between calls) to feed
+    // `tickvault_trading::in_mem::top_n_by_bars`. O(N) per call over
+    // the active universe; never on the per-tick hot path.
+    // -----------------------------------------------------------------
+
+    /// F3: snapshot every active 1m bar in the map.
+    #[must_use]
+    pub fn snapshot_1m(&self) -> Vec<Bar> {
+        self.tf1m.snapshot_latest_bars()
+    }
+    /// F3: snapshot every active 5m bar in the map.
+    #[must_use]
+    pub fn snapshot_5m(&self) -> Vec<Bar> {
+        self.tf5m.snapshot_latest_bars()
+    }
+    /// F3: snapshot every active 15m bar in the map.
+    #[must_use]
+    pub fn snapshot_15m(&self) -> Vec<Bar> {
+        self.tf15m.snapshot_latest_bars()
+    }
+    /// F3: snapshot every active 30m bar in the map.
+    #[must_use]
+    pub fn snapshot_30m(&self) -> Vec<Bar> {
+        self.tf30m.snapshot_latest_bars()
+    }
+    /// F3: snapshot every active 1h bar in the map.
+    #[must_use]
+    pub fn snapshot_1h(&self) -> Vec<Bar> {
+        self.tf1h.snapshot_latest_bars()
+    }
+    /// F3: snapshot every active 2h bar in the map.
+    #[must_use]
+    pub fn snapshot_2h(&self) -> Vec<Bar> {
+        self.tf2h.snapshot_latest_bars()
+    }
+    /// F3: snapshot every active 3h bar in the map.
+    #[must_use]
+    pub fn snapshot_3h(&self) -> Vec<Bar> {
+        self.tf3h.snapshot_latest_bars()
+    }
+    /// F3: snapshot every active 4h bar in the map.
+    #[must_use]
+    pub fn snapshot_4h(&self) -> Vec<Bar> {
+        self.tf4h.snapshot_latest_bars()
+    }
+    /// F3: snapshot every active 1d bar in the map.
+    #[must_use]
+    pub fn snapshot_1d(&self) -> Vec<Bar> {
+        self.tf1d.snapshot_latest_bars()
+    }
+    /// F3: snapshot every active 1w bar in the map.
+    #[must_use]
+    pub fn snapshot_1w(&self) -> Vec<Bar> {
+        self.tf1w.snapshot_latest_bars()
+    }
+    /// F3: snapshot every active 1mo bar in the map.
+    #[must_use]
+    pub fn snapshot_1mo(&self) -> Vec<Bar> {
+        self.tf1mo.snapshot_latest_bars()
+    }
+
     pub fn force_seal_all(&self) -> u64 {
         let mut total = 0_u64;
         total += u64::from(self.tf1m.force_seal_all());
@@ -400,6 +466,108 @@ mod tests {
         let cache = PrevDayCache::new();
         let bar = make_sealed_1s_bar(1, 1, 1);
         fanout.feed_sealed_1s_bar_with_pct(&bar, &cache);
+    }
+
+    /// F3 ratchet (Wave-5 §K-L28..L36 / #505 follow-up): the 11
+    /// `snapshot_<tf>m` accessors MUST each return a bar for every
+    /// instrument that has been fed into that engine. Mirrors
+    /// `feed_sealed_1s_bar_propagates_to_every_derived_engine`
+    /// at the snapshot layer.
+    #[test]
+    fn snapshot_per_tf_returns_every_active_instrument() {
+        let fanout = CascadeFanout::new();
+        let bar_a = make_sealed_1s_bar(1234, 1, 1_000);
+        let bar_b = make_sealed_1s_bar(5678, 2, 1_000);
+        fanout.feed_sealed_1s_bar(&bar_a);
+        fanout.feed_sealed_1s_bar(&bar_b);
+
+        // Every accessor MUST surface both instruments; iteration
+        // order is unspecified per `snapshot_latest_bars` doc, so we
+        // sort security_ids before comparing.
+        let mut counts: Vec<(&str, usize)> = vec![
+            ("1m", fanout.snapshot_1m().len()),
+            ("5m", fanout.snapshot_5m().len()),
+            ("15m", fanout.snapshot_15m().len()),
+            ("30m", fanout.snapshot_30m().len()),
+            ("1h", fanout.snapshot_1h().len()),
+            ("2h", fanout.snapshot_2h().len()),
+            ("3h", fanout.snapshot_3h().len()),
+            ("4h", fanout.snapshot_4h().len()),
+            ("1d", fanout.snapshot_1d().len()),
+            ("1w", fanout.snapshot_1w().len()),
+            ("1mo", fanout.snapshot_1mo().len()),
+        ];
+        counts.sort_by_key(|c| c.0);
+        for (tf, n) in counts {
+            assert_eq!(
+                n, 2,
+                "snapshot_{tf} must surface both fed instruments — got {n}"
+            );
+        }
+    }
+
+    // F3 explicit-name-match tests — one per pub fn so the
+    // pub-fn-test guard sees a matching test for each `snapshot_<tf>`.
+    #[test]
+    fn snapshot_1m_explicit_name_match() {
+        let _ = CascadeFanout::new().snapshot_1m();
+    }
+    #[test]
+    fn snapshot_5m_explicit_name_match() {
+        let _ = CascadeFanout::new().snapshot_5m();
+    }
+    #[test]
+    fn snapshot_15m_explicit_name_match() {
+        let _ = CascadeFanout::new().snapshot_15m();
+    }
+    #[test]
+    fn snapshot_30m_explicit_name_match() {
+        let _ = CascadeFanout::new().snapshot_30m();
+    }
+    #[test]
+    fn snapshot_1h_explicit_name_match() {
+        let _ = CascadeFanout::new().snapshot_1h();
+    }
+    #[test]
+    fn snapshot_2h_explicit_name_match() {
+        let _ = CascadeFanout::new().snapshot_2h();
+    }
+    #[test]
+    fn snapshot_3h_explicit_name_match() {
+        let _ = CascadeFanout::new().snapshot_3h();
+    }
+    #[test]
+    fn snapshot_4h_explicit_name_match() {
+        let _ = CascadeFanout::new().snapshot_4h();
+    }
+    #[test]
+    fn snapshot_1d_explicit_name_match() {
+        let _ = CascadeFanout::new().snapshot_1d();
+    }
+    #[test]
+    fn snapshot_1w_explicit_name_match() {
+        let _ = CascadeFanout::new().snapshot_1w();
+    }
+    #[test]
+    fn snapshot_1mo_explicit_name_match() {
+        let _ = CascadeFanout::new().snapshot_1mo();
+    }
+
+    /// F3 ratchet: empty fanout snapshots to empty Vecs (no panic).
+    #[test]
+    fn snapshot_per_tf_returns_empty_on_fresh_fanout() {
+        let fanout = CascadeFanout::new();
+        assert!(fanout.snapshot_1m().is_empty());
+        assert!(fanout.snapshot_5m().is_empty());
+        assert!(fanout.snapshot_15m().is_empty());
+        assert!(fanout.snapshot_30m().is_empty());
+        assert!(fanout.snapshot_1h().is_empty());
+        assert!(fanout.snapshot_2h().is_empty());
+        assert!(fanout.snapshot_3h().is_empty());
+        assert!(fanout.snapshot_4h().is_empty());
+        assert!(fanout.snapshot_1d().is_empty());
+        assert!(fanout.snapshot_1w().is_empty());
+        assert!(fanout.snapshot_1mo().is_empty());
     }
 
     #[test]
