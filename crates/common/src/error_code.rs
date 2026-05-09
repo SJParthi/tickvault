@@ -388,6 +388,16 @@ pub enum ErrorCode {
     /// — halts boot rather than starting a pipeline that loses
     /// prev_close for half the universe.
     PrevClose03BootRoutingAssertion,
+    /// PREVCLOSE-04: F2 boot-time `PrevDayCache` loader could not
+    /// populate the cache. Either the QuestDB `previous_close` table
+    /// is empty (fresh deployment, no prior trading session) or the
+    /// SELECT failed outright. The cascade seal-time pct stamping
+    /// (PR #520 / F1) falls back to `0.0` for the 3 % fields per the
+    /// `compute_*_pct` div-by-zero policy until the next boot
+    /// succeeds in reading `previous_close`. Severity::Medium —
+    /// degraded but not catastrophic; ratchet for visibility, not
+    /// boot-halt.
+    PrevClose04CacheEmptyAtBoot,
 }
 
 impl ErrorCode {
@@ -507,6 +517,8 @@ impl ErrorCode {
             Self::Depth200Dyn01TopGainersEmpty => "DEPTH-200-DYN-01",
             // Wave 5 Item 13 — prev-close routing
             Self::PrevClose03BootRoutingAssertion => "PREVCLOSE-03",
+            // F2 (Wave-5 #504e follow-up) — PrevDayCache boot loader
+            Self::PrevClose04CacheEmptyAtBoot => "PREVCLOSE-04",
             // Wave 5 Item 26 L1 — volume cumulative-monotonicity guard
             Self::Volume01MonotonicityBreach => "VOLUME-MONO-01",
             Self::Depth200Smoke01NoFramesAtBoot => "DEPTH200-SMOKE-01",
@@ -594,6 +606,7 @@ impl ErrorCode {
             | Self::PrevClose01IlpFailed
             | Self::PrevClose02FirstSeenInconsistency
             | Self::PrevOi01CacheEmptyAtBoot
+            | Self::PrevClose04CacheEmptyAtBoot
             | Self::WsGap06TickGapSummary
             | Self::Audit01Phase2WriteFailed
             | Self::Audit02DepthRebalanceWriteFailed
@@ -664,7 +677,8 @@ impl ErrorCode {
             | Self::Phase202EmitGuardDropped
             | Self::PrevClose01IlpFailed
             | Self::PrevClose02FirstSeenInconsistency
-            | Self::PrevOi01CacheEmptyAtBoot => ".claude/rules/project/wave-1-error-codes.md",
+            | Self::PrevOi01CacheEmptyAtBoot
+            | Self::PrevClose04CacheEmptyAtBoot => ".claude/rules/project/wave-1-error-codes.md",
             Self::WsGap04PostCloseSleep
             | Self::WsGap05PoolRespawn
             | Self::WsGap06TickGapSummary
@@ -805,6 +819,7 @@ impl ErrorCode {
             Self::PrevClose01IlpFailed,
             Self::PrevClose02FirstSeenInconsistency,
             Self::PrevOi01CacheEmptyAtBoot,
+            Self::PrevClose04CacheEmptyAtBoot,
             Self::WsGap04PostCloseSleep,
             Self::WsGap05PoolRespawn,
             Self::WsGap06TickGapSummary,
@@ -1027,7 +1042,10 @@ mod tests {
         // 2026-05-05 (Phase 4b cleanup): bumped 95 -> 92 — retired
         // MOVERS-01/02/03 alongside StockMoversWriter +
         // OptionMoversWriter deletion in PR #494.
-        assert_eq!(ErrorCode::all().len(), 92);
+        // 2026-05-08 (F2 / Wave-5 #504e follow-up): bumped 92 -> 93
+        // for PREVCLOSE-04 (PrevDayCache boot loader empty / failed
+        // — degraded cascade pct-stamping fallback signal).
+        assert_eq!(ErrorCode::all().len(), 93);
     }
 
     #[test]

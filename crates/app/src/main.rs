@@ -2922,6 +2922,30 @@ async fn main() -> Result<()> {
                     "prev_oi cache populated — /api/movers OI Change column is Dhan-precise"
                 );
             }
+            // F2 (Wave-5 §K-L13 / #504e follow-up): populate the
+            // `PrevDayCache` consumed by the cascade seal-time pct-
+            // stamping path (PR #520 / F1). Reads `prev_close` from
+            // QuestDB's `previous_close` table and merges the boot-
+            // loaded `prev_oi_cache` (immediately above). Best-effort
+            // — on QuestDB unreachable / SELECT failure the loader
+            // emits PREVCLOSE-04 and the cascade falls back to 0.0
+            // pct fields per the div-by-zero policy. Spawned as a
+            // detached task so boot continues immediately; the
+            // cascade reads see freshly-populated entries as soon as
+            // the loader inserts them (papaya is concurrent-safe).
+            {
+                let f2_questdb = config.questdb.clone();
+                let f2_cache = std::sync::Arc::clone(&prev_day_cache);
+                let f2_prev_oi = std::sync::Arc::clone(&prev_oi_cache);
+                tokio::spawn(async move {
+                    tickvault_app::prev_day_cache_loader::populate_and_log(
+                        &f2_questdb,
+                        &f2_cache,
+                        &f2_prev_oi,
+                    )
+                    .await;
+                });
+            }
             Some(tickvault_app::movers_pipeline::spawn_movers_pipeline(
                 config.questdb.clone(),
                 tick_broadcast_sender.clone(),

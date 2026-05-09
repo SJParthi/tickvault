@@ -30,6 +30,11 @@ pub mod movers_pipeline;
 // the boot path so /api/movers OI Change column is Dhan-precise
 // from the first tick.
 pub mod prev_oi_loader;
+// F2 (Wave-5 #504e follow-up) — boot-time loader for `PrevDayCache`
+// so the cascade seal-time pct-stamping path (PR #520 / F1) sees
+// non-zero `prev_day_close` values from QuestDB's `previous_close`
+// table on cold boot.
+pub mod prev_day_cache_loader;
 // movers_v2_pipeline DELETED in PR #450 commit 6 — V2 in-memory tracker
 // superseded by canonical movers_1s + 25 mat views populated via
 // movers_pipeline.
