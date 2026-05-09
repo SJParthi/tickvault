@@ -1,4 +1,27 @@
-# Depth-200 Python Sidecar Bridge
+# Depth-200 Python Sidecar Bridge — LEGACY / MANUAL FALLBACK ONLY
+
+> **Status (2026-05-09): SUPERSEDED by the Rust depth-200 client.**
+>
+> Per Dhan ticket #5610706 (resolved 2026-05-02), the SELF-only token
+> gate that previously caused TCP resets when ≥4 ATM contracts
+> subscribed concurrently has been removed server-side. The Rust
+> client (`crates/core/src/websocket/depth_connection.rs`) now reuses
+> the shared TOTP/APP token and streams depth-200 cleanly. Boot-time
+> verification: `DEPTH200-SMOKE-01` ratchet
+> (`crates/app/src/boot_smoke_test.rs`) confirms frame arrival within
+> 60 s; alert fires if it ever regresses.
+>
+> **This Python sidecar is retained as a manual-only fallback** for
+> the case where Dhan re-introduces a server-side regression and the
+> Rust client cannot recover within an operator-acceptable window.
+> It is **not** wired into `docker-compose.yml`, **not** scraped by
+> Prometheus, and **not** monitored by Grafana. Active-plan.md item 8
+> (Docker + Grafana + alert wiring) is therefore CANCELLED.
+>
+> **Do not run this bridge alongside the Rust client during normal
+> operation** — both writers target `deep_market_depth` and although
+> DEDUP keys handle overlap, running two sources doubles ILP load and
+> complicates SEBI audit reconstruction.
 
 Production fallback for 200-level depth streaming when the Rust client
 hits Dhan-side resets (chronic on expiry-day with ≥4 ATM contracts
