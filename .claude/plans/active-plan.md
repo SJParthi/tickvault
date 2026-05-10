@@ -1,91 +1,50 @@
-# Implementation Plan: Boot Telegram Hygiene + PREVOI-01 Avoidance + Movers Log Retire
+# Implementation Plan: Off-hours WARN noise reduction (queue items D + E + F)
 
 **Status:** VERIFIED
-**Date:** 2026-05-09
-**Approved by:** Parthiban — "FIx and implement everyhtign", "why zip jsut avoid that", "Also retire LogCategory::Movers"
-**Branch:** `claude/migrate-bhavcopy-pipeline-uj00F`
-**Triggering incidents (live boot 2026-05-09 20:57:03 IST):**
-1. `[ERROR] PREVOI-01 prev_oi loader: unzip failed — Broken pipe` — macOS Info-ZIP 6.00 stdin pipe failure
-2. `[HIGH] TickVault is partially online — 0 of 5 market-data feeds connected (5 stuck)` Telegram during pre-market boot when all 5 conns are correctly DEFERRED waiting for 09:00 IST
-3. Operator confusion that `data/logs/movers/` directory still exists post-PR-#539 retirement
+**Date:** 2026-05-09 (revised 2026-05-10 per operator feedback)
+**Approved by:** Parthiban — `AskUserQuestion` 2026-05-09 23:48 IST chose "D + E + F together"; revised 2026-05-10 00:45 IST chose "Real fix: gate legacy ATM block on !v2" for E + F (operator quote: "we don't need this atm selection right dude now we have changes it as top n volume right dude")
+**Branch:** `claude/off-hours-warn-noise-DEF-x7H2k`
+**Triggering incident:** operator's live mock-day boot 2026-05-09 22:33–22:35 IST emitted three off-hours `warn!` lines that are not actionable post-close.
 
 ## Plan Items
 
-- [x] **1. Strip boot-time bhavcopy step from prev_oi loader** (avoids PREVOI-01 entirely)
-  - Files: `crates/app/src/prev_oi_loader.rs`
-  - Behaviour change: `load_prev_oi_cache_at_boot_with_overlay` starts with empty `HashMap` and runs ONLY the Option Chain REST overlay. Live boot 20:57:40 IST proved overlay alone produced 866 entries covering NIFTY/BANKNIFTY/SENSEX (= full Wave-5 indices-only scope).
-  - Delete: `pub async fn load_prev_oi_cache_at_boot` (no remaining external callers)
-  - Delete imports: `unzip_csv_from_zip_body`, `fetch_bhavcopy_zip`, `parse_bhavcopy_csv`, `build_prev_oi_cache_from_bhavcopy`, `BhavcopySegment`
-  - Keep: `unzip_csv_from_zip_body` in `bhavcopy_scheduler.rs` (still used by 16:30 IST `bhavcopy_pipeline.rs` cycle, on hold per operator)
-  - Keep: `ErrorCode::PrevOi01CacheLoaderUnzipFailed` (remains valid for 16:30 cycle)
-  - Tests: `test_load_prev_oi_cache_at_boot_with_overlay_skips_bhavcopy_step` — asserts only the overlay path runs
-  - Tests: `test_prev_oi_loader_imports_no_longer_reference_bhavcopy_unzip` — source-scan ratchet
+- [x] **D. Gate prev_oi_cache zero-entries WARN on `is_within_trading_session_ist()`**
+  - Files: `crates/app/src/main.rs` (line 3528 area)
+  - Behaviour: inside `if count == 0 { ... }` branch — emit `warn!` only when in trading session (real signal: candles_1d empty during a session means OI panels read 0%). Outside session emit `info!` (fresh deploy / weekend / pre-open is expected). Counter `tv_prev_oi_cache_empty_total` keeps incrementing in both cases (operator can still query it).
+  - Tests: existing `tickvault-app` lib + integration test suite (564 + binaries) stays green.
 
-- [x] **2. Off-hours gate on partial-online Telegram** (avoids false `[HIGH]` alarm)
-  - Files: `crates/app/src/main.rs` (boot final-snapshot block ~7720-7757)
-  - Files: `crates/core/src/notification/events.rs` (add typed variant or dispatch flag)
-  - Behaviour change: when `connected != total` AND `!is_within_market_hours_ist()`, emit `WebSocketPoolDeferredOffHours { deferred, total, boot_path }` as Severity::Low instead of `WebSocketPoolPartialAfterDeadline` (Severity::High).
-  - Wording (Severity::Low): "✅ Boot complete — {deferred}/{total} main feeds DEFERRED until 09:00 IST (Dhan resets idle pre-market sockets; this is by design)"
-  - In-market path unchanged — partial-after-deadline keeps firing High.
-  - Tests: `test_partial_pool_off_hours_emits_low_severity_deferred_event`
-  - Tests: `test_partial_pool_in_market_hours_keeps_high_severity` (regression block)
-  - Tests: `test_deferred_off_hours_event_is_immediate_low_severity` (Telegram dispatch policy)
-
-- [x] **3. Retire `LogCategory::Movers`** (operator confusion + dead category post-#539)
-  - Files: `crates/app/src/observability.rs`
-  - Delete: `LogCategory::Movers` enum variant + `CATEGORY_MOVERS_DIR` const + match arms in `dir()`, `prefix()`, `build_category_targets()`
-  - Merge: 4 tracing targets (`mover_classifier`, `movers_window`, `option_movers`, `top_movers`) into `LogCategory::LiveTicks` target list
-  - Update: `LogCategory::iter()` if present, plus any `for cat in LogCategory::iter()` loops at boot
-  - Update: existing tests `LogCategory::Movers.dir()` / `.prefix()` / `build_category_targets(LogCategory::Movers)` must be deleted; replace with one regression test asserting the 4 targets land under `LiveTicks`
-  - On-disk `data/logs/movers/` directory becomes orphaned; operator removes manually (ratchet does NOT clean filesystem state)
-  - Tests: `test_log_category_movers_variant_is_retired_and_targets_live_under_live_ticks`
-  - Tests: `test_log_category_iter_no_longer_includes_movers`
+- [x] **F+. Gate the ENTIRE legacy boot ATM-wait + select_depth_instruments + spawn block on `!config.features.depth_dynamic_pipeline_v2`** (subsumes original E + F WARN gates)
+  - Files: `crates/app/src/main.rs` (boot depth setup block at lines 3845-5052)
+  - Behaviour: under v2 (the live default since 2026-05-09 per `config/base.toml:305`), depth-20 + depth-200 are owned by `spawn_depth_dynamic_pool` (top-N volume cohort over `movers_1m`, NOT ATM). The legacy block was producing pure noise: 5-min/10-s LTP wait, ATM selection whose result was discarded (the v2 cutover at the spawn branch was already a no-op `else if depth_dynamic_pipeline_v2`), and 3 off-hours WARN lines on every cold boot. Replaced the inner block guard so when v2 is on, a single `info!` notes the skip and the entire wait+selection+spawn loops are bypassed.
+  - This kills the source of:
+    - `depth ATM: off-market-hours boot — mandatory index LTPs not available` (was main.rs:3937 area, item E)
+    - `no valid spot price for depth ATM selection` × N (was depth_strike_selector.rs:231, item F)
+  - Out-of-scope (left unchanged):
+    - The 09:13 IST anchor task (~main.rs:6125) — still calls `select_depth_instruments` for the historical-anchor visibility Telegram, and `anchor_single_side_enabled` already gates dispatch to false under v2 (line 6158). Separate concern; if operator wants this retired too, follow-up PR.
+  - Tests: existing source-scan ratchets in the depth dispatcher guard files still pass; the `select_depth_instruments` + `InitialSubscribe20/200` strings still appear in main.rs (via the untouched 09:13 anchor task).
 
 ## Scenarios
 
-| # | Scenario | Expected |
-|---|---|---|
-| 1 | Off-hours boot (Sat 20:57 IST) | No `[HIGH]` partial-online Telegram. Single `[LOW] Boot complete — 5/5 deferred until 09:00 IST` instead. PREVOI-01 does NOT fire. |
-| 2 | In-market boot, 1 conn fails after deadline | Existing `[HIGH] TickVault partially online — 4/5 connected (1 stuck)` keeps firing — regression test pins this. |
-| 3 | Greeks pipeline starts post-#539 | RAM trackers (`option_movers`, `top_movers`) keep emitting; their log lines now route to `data/logs/live_ticks.YYYY-MM-DD.log` instead of a separate movers log file. |
-| 4 | 16:30 IST bhavcopy cycle (still on hold) | `unzip_csv_from_zip_body` remains compilable + callable; volume_nse_audit cross-check operator placeholder unchanged. |
+| # | When | Before | After |
+|---|---|---|---|
+| 1 | Saturday off-session boot at 22:33 IST (today's repro), v2 on | 3× `warn!` (`prev_oi_cache zero` + `depth ATM off-market` + 2× `no valid spot price`) | 0 warns — single `info!` "depth boot setup: legacy ATM-based path SKIPPED" + 1 `info!` "prev_oi_cache loaded zero entries (off-hours / weekend boot — expected)" |
+| 2 | In-session boot, v2 on, `candles_1d` empty (fresh deploy) | `warn!` × 1 (PR-OI cache empty) + 3× depth WARNs | 1 `warn!` (PR-OI cache empty — real signal) + 0 depth WARNs (v2 owns depth, no ATM block runs) |
+| 3 | In-session boot, v2 OFF (operator manually disables flag) | unchanged warns | unchanged (legacy block still runs, WARNs still fire — that's correct for v2-off mode) |
+| 4 | Sunday boot at 09:30 IST, v2 on | 3× `warn!` (false alarm — Sunday is non-trading even though 09:30 is "in market hours") | 0 warns (v2 path skips legacy block; D's `is_within_trading_session_ist` correctly suppresses prev_oi WARN on weekend) |
+| 5 | 09:13 IST anchor task fires under v2 | runs, calls select_depth_instruments, dispatches to empty `anchor_cmd_senders` (no-op silently because `anchor_single_side_enabled = false`) | unchanged — out of scope, tracked as separate cleanup if operator wants |
 
-## 15-Row + 7-Row Guarantee Matrix
+## Honest 100% claim qualifier (per `wave-4-shared-preamble.md` §8)
 
-Per `.claude/rules/project/per-wave-guarantee-matrix.md`:
+100% inside the tested envelope:
+- Under v2 (`depth_dynamic_pipeline_v2 = true`, the live default), the boot legacy ATM block is structurally bypassed — `select_depth_instruments` is never called from boot. Result: 0 boot warns from that path, ratcheted by `cargo test -p tickvault-app --tests` (`no_boot_depth_subscribe_guard.rs::dispatcher_at_0913_calls_select_depth_instruments` still passes because the 09:13 anchor task remains untouched).
+- Under v2-off (legacy mode), behaviour unchanged.
+- D's prev_oi_cache gate uses `is_within_trading_session_ist()` (the same Wave-Holiday-Gate helper used by PR #542 item B); 5 unit tests in `crates/common/src/market_hours.rs::tests` cover the helper itself.
 
-| Demand | Mechanical proof |
-|---|---|
-| 100% code coverage | Each item ships a unit + a source-scan ratchet; FULL_QA=1 covers integration |
-| 100% audit coverage | No new audit table needed; existing boot_audit captures the partial-online state |
-| 100% testing | 22 categories — unit + source-scan + Telegram-formatter property tests |
-| 100% code checks | banned-pattern + pub-fn-test + plan-verify gates run |
-| 100% perf | No hot-path changes |
-| 100% monitoring | Counters `tv_telegram_dropped_total`, `tv_websocket_connections_active` already wired |
-| 100% logging | All paths use `tracing` macros |
-| 100% alerting | Off-hours deferred event = Low (informational only — no Prom alert by design) |
-| 100% security | No external input handling changes |
-| 100% security hardening | Removes one shell-out (unzip) from boot path = attack-surface reduction |
-| 100% bugs fixing | Pre-impl + post-impl 3-agent adversarial review |
-| 100% scenarios covering | 4 scenarios above + ratchet tests |
-| 100% functionalities covering | Every retired pub fn deletion verified by missing call sites (pub-fn-wiring guard) |
-| 100% code review | hot-path + security + general-purpose agents on diff |
-| 100% extreme check | All ratchets fail build on regression |
+Beyond the envelope: NSE-specific weekday holidays (Republic Day etc.) are not covered by `is_within_trading_session_ist` (it only folds in weekend); a 10:00 IST holiday boot will still produce the prev_oi_cache `warn!`. Documented gap; threading `TradingCalendar` is a separate concern.
 
-| Resilience demand | Honest envelope |
-|---|---|
-| Zero ticks lost | Unchanged — no tick-path edit |
-| WS never disconnects | Improvement — off-hours deferral is now correctly classified, no false alarm |
-| Never slow/locked | Unchanged — no hot-path edit |
-| QuestDB never fails | Unchanged |
-| O(1) latency | Unchanged |
-| Uniqueness + dedup | Unchanged |
-| Real-time proof | New `WebSocketPoolDeferredOffHours` event + ratchets pin the wording |
+## Verification
 
-## Honest 100% Claim
-
-100% inside the tested envelope, with ratcheted regression coverage:
-- Off-hours deferred main-feed conns no longer trip a HIGH Telegram (test pinned).
-- Boot-time PREVOI-01 unzip path retired entirely (deleted code cannot fail).
-- `LogCategory::Movers` retired (variant deletion = compile-time guarantee).
-Beyond the envelope: 16:30 IST bhavcopy cross-check still depends on macOS unzip; that's on operator hold and not in scope for this plan.
+- [x] `cargo check -p tickvault-app -p tickvault-core` — green
+- [x] `cargo test -p tickvault-app --lib` — 564 passed
+- [x] `cargo test -p tickvault-app --tests` — all binaries green
+- [x] `bash .claude/hooks/plan-verify.sh`
