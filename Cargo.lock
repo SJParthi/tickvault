@@ -4305,6 +4305,7 @@ dependencies = [
  "metrics",
  "notify",
  "papaya",
+ "parking_lot",
  "proptest",
  "reqwest 0.13.3",
  "secrecy",

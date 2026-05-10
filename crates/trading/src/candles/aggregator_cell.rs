@@ -1,0 +1,614 @@
+//! Wave 6 Sub-PR #1 item 1.1 — per-instrument multi-TF cell type.
+//!
+//! Each subscribed `(security_id, exchange_segment)` instrument owns
+//! exactly one [`AggregatorCell`], which contains 9 `Mutex<LiveCandleState>`
+//! slots indexed by [`TfIndex::as_ordinal`]. Hot-path tick consumption
+//! locks ONE slot at a time; the boundary timer's seal path locks the
+//! same slot to drain + reset.
+//!
+//! Per the locked design decisions in
+//! `.claude/plans/active-plan-aggregator-direct-flush-rehydrate.md`:
+//!
+//! - **L-C2** — `parking_lot::Mutex` per TF slot (operator-approved
+//!   alternative to `crossbeam_utils::AtomicCell` because
+//!   `LiveCandleState` is ~64 bytes which exceeds AtomicCell's 16-byte
+//!   lock-free threshold; AtomicCell would spin-lock internally
+//!   anyway). `parking_lot::Mutex` is ~30 ns uncontended on Linux.
+//! - **L-C3** — late-tick discard (timestamp before bucket-start of
+//!   the cell's open bucket) is signalled via [`ConsumeOutcome::DiscardLate`]
+//!   so the caller can `error!(code = AGGREGATOR-LATE-01, ...)` per
+//!   `error_level_meta_guard.rs` Rule 5. NO silent merge across
+//!   buckets.
+//! - **L-H7** — bucket alignment derived from `tick.exchange_timestamp`
+//!   (IST epoch seconds, NEVER `Utc::now()`).
+//! - **L-H12** — caller propagates `Option<exchange_segment_code>`
+//!   for I-P1-11 safety; this module does NOT do segment lookups.
+//! - **L-M19** — eager pre-population at boot via
+//!   [`AggregatorCell::empty`] from the `InstrumentRegistry` composite
+//!   key iter so first-tick has zero allocation.
+//!
+//! ## What this module ships
+//!
+//! - [`LiveCandleState`] — `Copy` data struct (≤ 96 bytes) with full
+//!   Wave-5 OHLCV+OI+tick_count + 3 pct-stamping fields.
+//! - [`AggregatorCell`] — per-instrument wrapper with 9
+//!   `Mutex<LiveCandleState>` slots.
+//! - [`ConsumeOutcome`] — explicit enum result for `consume_tick`:
+//!   `Updated` (folded into open bucket), `Sealed { sealed_state }`
+//!   (tick crossed boundary; previous bucket sealed AND new bucket
+//!   opened with this tick), `DiscardLate` (tick belongs to a bucket
+//!   already sealed; caller logs AGGREGATOR-LATE-01 + counter).
+//!
+//! ## What this module does NOT yet ship
+//!
+//! - The `papaya::HashMap<(u32, u8), Arc<AggregatorCell>>` aggregator
+//!   container — Sub-PR #1 next commit.
+//! - The `ShadowBarWriter` ring → spill → DLQ writer — item 1.2.
+//! - The boundary-timer task — item 1.3.
+//! - The tick-processor fan-in — item 1.4.
+//! - The Wave-5 prev-day pct cache lookup at seal — item 1.5
+//!   (this module exposes the 3 pct fields on `LiveCandleState`; the
+//!   STAMPING happens in the seal-time writer that reads
+//!   `Arc<HashMap<(u32,u8), PrevDayRefs>>`).
+//! - DHAT zero-alloc + Criterion bench — item 1.6.
+//! - Per-minute heartbeat + audit-table writer — items 1.8, 1.9.
+
+use std::sync::Arc;
+
+use parking_lot::Mutex;
+
+use tickvault_common::tick_types::ParsedTick;
+
+use crate::candles::TfIndex;
+
+// ---------------------------------------------------------------------------
+// LiveCandleState — Copy data struct
+// ---------------------------------------------------------------------------
+
+/// In-memory OHLCV+OI accumulator state for a single (instrument, TF)
+/// open bucket.
+///
+/// `Copy` so the seal path can drain the slot via
+/// `mem::replace(&mut *guard, LiveCandleState::empty(new_bucket_start))`
+/// without allocating. Tests below pin the size to ≤ 96 bytes so a
+/// future field addition that bloats the struct flags up immediately.
+///
+/// Per locked decision **L-H7** the `bucket_start_ist_secs` field is
+/// derived from `tick.exchange_timestamp` (the WS LTT field — already
+/// IST epoch seconds), NEVER from `Utc::now()`. The caller computes
+/// it via `TfIndex::bucket_start(tick.exchange_timestamp)` before
+/// calling [`AggregatorCell::consume_tick`].
+///
+/// Field semantics match the existing
+/// `crates/trading/src/candles/engine.rs::Bar`. The 3 Wave-5 pct
+/// fields stay 0.0 until the seal-time writer stamps them from the
+/// in-memory `prev_day_cache` (locked decision L-H6).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LiveCandleState {
+    /// Bucket-open IST epoch second (aligned to TF boundary).
+    /// `0` means "slot never opened" — the empty/initial state.
+    pub bucket_start_ist_secs: u32,
+    /// Open price of this bucket (first tick's `last_traded_price`).
+    pub open: f64,
+    /// Running high.
+    pub high: f64,
+    /// Running low.
+    pub low: f64,
+    /// Close (last tick's `last_traded_price`).
+    pub close: f64,
+    /// **Incremental** volume within this bucket — `tick.volume - bucket_start_cumulative`.
+    pub volume: u64,
+    /// Cumulative-volume snapshot at bucket-open. Set ONCE per bucket
+    /// open, reused on every subsequent tick to derive incremental
+    /// `volume`. Item 28 (Wave 5) pattern carried over.
+    pub bucket_start_cumulative: u64,
+    /// Open Interest snapshot from the latest tick.
+    pub oi: i64,
+    /// Number of ticks folded into this bucket.
+    pub tick_count: u32,
+    /// `close - prev_day.close` / `prev_day.close` * 100.0. Stamped at
+    /// seal time per locked decision L-H6.
+    pub close_pct_from_prev_day: f64,
+    /// `oi - prev_day.oi` / `prev_day.oi` * 100.0. Stamped at seal time.
+    pub oi_pct_from_prev_day: f64,
+    /// `volume / prev_day.volume * 100.0`. Stamped at seal time.
+    pub volume_pct_from_prev_day: f64,
+}
+
+impl LiveCandleState {
+    /// Empty/initial state — `bucket_start_ist_secs == 0` flags the
+    /// "never opened" sentinel. Used by [`AggregatorCell::empty`] for
+    /// eager pre-population at boot per locked decision L-M19.
+    #[inline]
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self {
+            bucket_start_ist_secs: 0,
+            open: 0.0,
+            high: f64::NEG_INFINITY,
+            low: f64::INFINITY,
+            close: 0.0,
+            volume: 0,
+            bucket_start_cumulative: 0,
+            oi: 0,
+            tick_count: 0,
+            close_pct_from_prev_day: 0.0,
+            oi_pct_from_prev_day: 0.0,
+            volume_pct_from_prev_day: 0.0,
+        }
+    }
+
+    /// Returns `true` if this slot has never been ticked (the boot
+    /// state). [`Self::bucket_start_ist_secs`] is the cheap check.
+    #[inline]
+    #[must_use]
+    pub const fn is_uninitialised(&self) -> bool {
+        self.bucket_start_ist_secs == 0
+    }
+
+    /// Constructs the initial state from a tick that just opened a
+    /// new bucket. `bucket_start` MUST equal
+    /// `TfIndex::bucket_start(tick.exchange_timestamp)`; the caller
+    /// owns that math because the cell type is TF-agnostic.
+    ///
+    /// `bucket_start_cumulative` is the cumulative volume snapshot at
+    /// the start of THIS bucket (carried over from the previously
+    /// sealed bucket so inter-bucket volume is preserved). On the
+    /// session's very first tick, pass `0`.
+    #[inline]
+    fn from_first_tick(tick: &ParsedTick, bucket_start: u32, bucket_start_cumulative: u64) -> Self {
+        let price = f64::from(tick.last_traded_price);
+        let cumulative = u64::from(tick.volume);
+        Self {
+            bucket_start_ist_secs: bucket_start,
+            open: price,
+            high: price,
+            low: price,
+            close: price,
+            volume: cumulative.saturating_sub(bucket_start_cumulative),
+            bucket_start_cumulative,
+            oi: i64::from(tick.open_interest),
+            tick_count: 1,
+            close_pct_from_prev_day: 0.0,
+            oi_pct_from_prev_day: 0.0,
+            volume_pct_from_prev_day: 0.0,
+        }
+    }
+
+    /// Folds an in-bucket tick into the running state. Caller has
+    /// already verified the tick belongs to THIS bucket (i.e.
+    /// `TfIndex::bucket_start(tick.exchange_timestamp) == self.bucket_start_ist_secs`).
+    #[inline]
+    fn fold_in_bucket(&mut self, tick: &ParsedTick) {
+        let price = f64::from(tick.last_traded_price);
+        if price > self.high {
+            self.high = price;
+        }
+        if price < self.low {
+            self.low = price;
+        }
+        self.close = price;
+        // Item 28 carry-over: incremental volume from bucket start.
+        // saturating_sub guards against rare out-of-order tick where
+        // current cumulative < bucket-start.
+        self.volume = u64::from(tick.volume).saturating_sub(self.bucket_start_cumulative);
+        self.oi = i64::from(tick.open_interest);
+        self.tick_count = self.tick_count.saturating_add(1);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ConsumeOutcome — explicit result of consume_tick
+// ---------------------------------------------------------------------------
+
+/// Result of folding one tick into one TF slot.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ConsumeOutcome {
+    /// Tick was folded into the existing open bucket; nothing to seal.
+    Updated,
+    /// Tick crossed the TF boundary: the previous bucket has been
+    /// drained out of the slot (returned in `sealed_state`) and the
+    /// slot has been re-initialised to a new bucket containing this
+    /// tick.
+    ///
+    /// Caller MUST persist `sealed_state` to the corresponding shadow
+    /// table. Direct-flush at seal per item 1.4.
+    Sealed {
+        /// The state of the bucket that just closed.
+        sealed_state: LiveCandleState,
+    },
+    /// Tick belongs to a bucket that's STRICTLY OLDER than the one
+    /// the slot has open (i.e. `TfIndex::bucket_start(tick.exchange_timestamp)
+    /// < self.bucket_start_ist_secs`). Caller MUST emit
+    /// `error!(code = AGGREGATOR-LATE-01, ...)` + increment
+    /// `tv_aggregator_late_tick_total{action="discard"}` per locked
+    /// decision L-C3. NO silent merge.
+    DiscardLate,
+}
+
+// ---------------------------------------------------------------------------
+// AggregatorCell — per-instrument 9-TF wrapper
+// ---------------------------------------------------------------------------
+
+/// Per-instrument multi-timeframe candle state.
+///
+/// Layout: `[Mutex<LiveCandleState>; 9]` indexed by
+/// [`TfIndex::as_ordinal`]. The `Arc` is exposed to callers because
+/// the planned aggregator container is
+/// `papaya::HashMap<(u32, u8), Arc<AggregatorCell>>` per locked
+/// decision L-C2 — papaya is read-mostly so we share `Arc`s into
+/// every `pin().get()` site.
+///
+/// Each slot is independently lock-able; the hot-path tick consume
+/// path locks ONE slot per tick, the boundary timer's seal path
+/// locks the same slot to seal it. Contention is naturally bounded
+/// to (instrument × TF), and each (instrument × TF × second) sees
+/// at most a handful of ticks.
+#[derive(Debug)]
+pub struct AggregatorCell {
+    slots: [Mutex<LiveCandleState>; 9],
+}
+
+impl AggregatorCell {
+    /// Empty/uninitialised cell — every slot is
+    /// `LiveCandleState::empty()`. Boot path eagerly pre-populates
+    /// one of these per `(security_id, exchange_segment)` from the
+    /// `InstrumentRegistry::iter()` composite-key iter per locked
+    /// decision L-M19.
+    #[must_use]
+    pub fn empty() -> Arc<Self> {
+        Arc::new(Self {
+            slots: std::array::from_fn(|_| Mutex::new(LiveCandleState::empty())),
+        })
+    }
+
+    /// Reads the current open state of the given TF slot.
+    /// Lock-acquire-then-copy; the returned value is a snapshot — the
+    /// underlying slot may change concurrently after this call.
+    /// Used by the read-side trading bot snapshots and by tests.
+    #[must_use]
+    pub fn snapshot(&self, tf: TfIndex) -> LiveCandleState {
+        *self.slots[tf.as_ordinal()].lock()
+    }
+
+    /// Folds a single tick into the given TF's open bucket. Returns
+    /// the [`ConsumeOutcome`] explaining what happened.
+    ///
+    /// `bucket_start_cumulative` is the cumulative volume snapshot at
+    /// the start of the NEW bucket if we cross a boundary. The caller
+    /// computes this from the per-instrument cumulative tracker (the
+    /// last close-out cumulative becomes the next bucket's start).
+    /// Pass `0` on the session's very first tick.
+    pub fn consume_tick(
+        &self,
+        tf: TfIndex,
+        tick: &ParsedTick,
+        bucket_start_cumulative: u64,
+    ) -> ConsumeOutcome {
+        let bucket_start = tf.bucket_start(tick.exchange_timestamp);
+        let mut guard = self.slots[tf.as_ordinal()].lock();
+
+        // First-ever tick for this slot — open the bucket.
+        if guard.is_uninitialised() {
+            *guard = LiveCandleState::from_first_tick(tick, bucket_start, bucket_start_cumulative);
+            return ConsumeOutcome::Updated;
+        }
+
+        // In-bucket tick — fold and return.
+        if bucket_start == guard.bucket_start_ist_secs {
+            guard.fold_in_bucket(tick);
+            return ConsumeOutcome::Updated;
+        }
+
+        // Tick belongs to a strictly newer bucket — seal the current
+        // one and open the new bucket.
+        if bucket_start > guard.bucket_start_ist_secs {
+            let sealed_state = std::mem::replace(
+                &mut *guard,
+                LiveCandleState::from_first_tick(tick, bucket_start, bucket_start_cumulative),
+            );
+            return ConsumeOutcome::Sealed { sealed_state };
+        }
+
+        // Tick belongs to an older bucket — late arrival. Drop with
+        // diagnostic per L-C3.
+        ConsumeOutcome::DiscardLate
+    }
+
+    /// Force-seals the open bucket regardless of whether a new tick
+    /// arrived. Used by the boundary-timer task at IST midnight to
+    /// flush all 9 TFs even if no tick crosses the boundary in the
+    /// next minute (e.g. illiquid contracts post-15:30).
+    ///
+    /// Returns `Some(sealed_state)` if the slot held a non-empty
+    /// bucket; `None` if the slot was uninitialised. Caller persists
+    /// the returned state to the corresponding shadow table.
+    pub fn force_seal(&self, tf: TfIndex) -> Option<LiveCandleState> {
+        let mut guard = self.slots[tf.as_ordinal()].lock();
+        if guard.is_uninitialised() {
+            return None;
+        }
+        let sealed_state = std::mem::replace(&mut *guard, LiveCandleState::empty());
+        Some(sealed_state)
+    }
+}
+
+// Compile-time size assertion — bumping this requires updating the
+// per-instrument RAM budget in `aws-budget.md`.
+const _: () = assert!(
+    std::mem::size_of::<LiveCandleState>() <= 96,
+    "LiveCandleState exceeded 96-byte budget — every new field bloats per-instrument RAM by 9× (one slot per TF). Either shrink the new field or update aws-budget.md and bump this assertion."
+);
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tickvault_common::tick_types::ParsedTick;
+
+    fn mk_tick(secs: u32, price: f32, volume: u32, oi: u32) -> ParsedTick {
+        let mut t = ParsedTick::default();
+        t.exchange_timestamp = secs;
+        t.last_traded_price = price;
+        t.volume = volume;
+        t.open_interest = oi;
+        t
+    }
+
+    #[test]
+    fn test_live_candle_state_size_is_within_budget() {
+        // 96-byte budget is pinned by the const _ assert above; this
+        // runtime test makes the contract grep-able.
+        assert!(std::mem::size_of::<LiveCandleState>() <= 96);
+    }
+
+    #[test]
+    fn test_live_candle_state_empty_is_uninitialised() {
+        let s = LiveCandleState::empty();
+        assert!(s.is_uninitialised());
+        assert_eq!(s.bucket_start_ist_secs, 0);
+        assert_eq!(s.open, 0.0);
+        assert_eq!(s.tick_count, 0);
+    }
+
+    #[test]
+    fn test_live_candle_state_empty_high_low_sentinels_neg_inf_pos_inf() {
+        // High starts at -inf, low at +inf, so the first real tick
+        // always sets both correctly via `>`/`<` comparisons in
+        // fold_in_bucket without a special-case.
+        let s = LiveCandleState::empty();
+        assert_eq!(s.high, f64::NEG_INFINITY);
+        assert_eq!(s.low, f64::INFINITY);
+    }
+
+    #[test]
+    fn test_snapshot_returns_independent_copy_per_tf() {
+        // The snapshot accessor must (1) return the value of the
+        // requested TF slot ONLY, (2) return a `Copy` so callers can
+        // hold it across other operations without keeping the lock,
+        // (3) be safe to call repeatedly. Pinned here in addition to
+        // the implicit coverage in every test_consume_*/test_force_seal_*
+        // assertion below.
+        let cell = AggregatorCell::empty();
+        cell.consume_tick(TfIndex::M1, &mk_tick(1_716_000_900, 100.0, 50, 1_000), 0);
+        let snap_a = cell.snapshot(TfIndex::M1);
+        let snap_b = cell.snapshot(TfIndex::M1);
+        assert_eq!(snap_a, snap_b);
+        // Distinct TFs must NOT share state.
+        let snap_m5 = cell.snapshot(TfIndex::M5);
+        assert!(snap_m5.is_uninitialised());
+        // Mutating the cell after the first snapshot must NOT mutate
+        // the previously-returned snapshot (Copy semantics).
+        cell.consume_tick(TfIndex::M1, &mk_tick(1_716_000_915, 105.0, 60, 1_010), 0);
+        let snap_after = cell.snapshot(TfIndex::M1);
+        assert_eq!(snap_a.close, 100.0); // snap_a is a stale copy by design
+        assert_eq!(snap_after.close, 105.0);
+        assert_ne!(snap_a, snap_after);
+    }
+
+    #[test]
+    fn test_aggregator_cell_empty_all_slots_uninitialised() {
+        let cell = AggregatorCell::empty();
+        for tf in TfIndex::ALL {
+            assert!(
+                cell.snapshot(tf).is_uninitialised(),
+                "{} not empty",
+                tf.display_name()
+            );
+        }
+    }
+
+    #[test]
+    fn test_consume_tick_first_tick_opens_bucket() {
+        let cell = AggregatorCell::empty();
+        let tick = mk_tick(1_716_000_900, 100.0, 50, 1_000);
+        let outcome = cell.consume_tick(TfIndex::M1, &tick, 0);
+        assert_eq!(outcome, ConsumeOutcome::Updated);
+        let s = cell.snapshot(TfIndex::M1);
+        assert!(!s.is_uninitialised());
+        assert_eq!(s.bucket_start_ist_secs, 1_716_000_900); // already aligned
+        assert_eq!(s.open, 100.0);
+        assert_eq!(s.high, 100.0);
+        assert_eq!(s.low, 100.0);
+        assert_eq!(s.close, 100.0);
+        assert_eq!(s.volume, 50);
+        assert_eq!(s.oi, 1_000);
+        assert_eq!(s.tick_count, 1);
+    }
+
+    #[test]
+    fn test_consume_tick_in_bucket_tick_folds_high_low_close_volume() {
+        let cell = AggregatorCell::empty();
+        // Bucket-aligned t=1716000900 (divisible by 60).
+        cell.consume_tick(TfIndex::M1, &mk_tick(1_716_000_900, 100.0, 50, 1_000), 0);
+        // Same bucket: t=1716000915 still floors to 1716000900.
+        let outcome = cell.consume_tick(TfIndex::M1, &mk_tick(1_716_000_915, 105.0, 75, 1_010), 0);
+        assert_eq!(outcome, ConsumeOutcome::Updated);
+        let s = cell.snapshot(TfIndex::M1);
+        assert_eq!(s.bucket_start_ist_secs, 1_716_000_900);
+        assert_eq!(s.open, 100.0); // unchanged
+        assert_eq!(s.high, 105.0);
+        assert_eq!(s.low, 100.0);
+        assert_eq!(s.close, 105.0);
+        assert_eq!(s.volume, 75); // 75 - 0 (bucket_start_cumulative)
+        assert_eq!(s.oi, 1_010);
+        assert_eq!(s.tick_count, 2);
+    }
+
+    #[test]
+    fn test_consume_tick_low_updates_when_tick_below_open() {
+        let cell = AggregatorCell::empty();
+        cell.consume_tick(TfIndex::M1, &mk_tick(1_716_000_900, 100.0, 50, 0), 0);
+        let _ = cell.consume_tick(TfIndex::M1, &mk_tick(1_716_000_915, 95.0, 60, 0), 0);
+        let s = cell.snapshot(TfIndex::M1);
+        assert_eq!(s.low, 95.0);
+        assert_eq!(s.high, 100.0); // unchanged
+    }
+
+    #[test]
+    fn test_consume_tick_boundary_crossing_seals_previous_bucket() {
+        let cell = AggregatorCell::empty();
+        // Bucket A: 1716000900..1716000960
+        cell.consume_tick(TfIndex::M1, &mk_tick(1_716_000_900, 100.0, 50, 1_000), 0);
+        cell.consume_tick(TfIndex::M1, &mk_tick(1_716_000_930, 105.0, 70, 1_005), 0);
+        // Bucket B: 1716000960..1716001020 — first tick crosses.
+        // Pass bucket_start_cumulative=70 (the last cumulative from bucket A).
+        let outcome = cell.consume_tick(TfIndex::M1, &mk_tick(1_716_000_961, 102.0, 80, 1_010), 70);
+        let sealed_state = match outcome {
+            ConsumeOutcome::Sealed { sealed_state } => sealed_state,
+            other => panic!("expected Sealed, got {other:?}"),
+        };
+        // Bucket A as sealed:
+        assert_eq!(sealed_state.bucket_start_ist_secs, 1_716_000_900);
+        assert_eq!(sealed_state.open, 100.0);
+        assert_eq!(sealed_state.high, 105.0);
+        assert_eq!(sealed_state.low, 100.0);
+        assert_eq!(sealed_state.close, 105.0);
+        assert_eq!(sealed_state.volume, 70);
+        assert_eq!(sealed_state.tick_count, 2);
+
+        // Slot now holds bucket B with this tick:
+        let s = cell.snapshot(TfIndex::M1);
+        assert_eq!(s.bucket_start_ist_secs, 1_716_000_960);
+        assert_eq!(s.open, 102.0);
+        assert_eq!(s.close, 102.0);
+        assert_eq!(s.tick_count, 1);
+        assert_eq!(s.volume, 10); // 80 - 70 (bucket_start_cumulative)
+    }
+
+    #[test]
+    fn test_consume_tick_late_tick_returns_discard_late() {
+        let cell = AggregatorCell::empty();
+        // Open bucket at t=1716001000 (aligned to 60s boundary).
+        let aligned_now = 1_716_001_000_u32 - (1_716_001_000_u32 % 60);
+        cell.consume_tick(TfIndex::M1, &mk_tick(aligned_now + 30, 100.0, 50, 0), 0);
+        // Late tick belongs to the PREVIOUS bucket.
+        let late = mk_tick(aligned_now - 5, 99.0, 40, 0);
+        let outcome = cell.consume_tick(TfIndex::M1, &late, 0);
+        assert_eq!(outcome, ConsumeOutcome::DiscardLate);
+        // Slot state unchanged after the discard.
+        let s = cell.snapshot(TfIndex::M1);
+        assert_eq!(s.tick_count, 1);
+        assert_eq!(s.close, 100.0);
+    }
+
+    #[test]
+    fn test_consume_tick_distinct_tfs_isolated() {
+        // A tick that crosses the M1 boundary should NOT cross the H1
+        // boundary (because 60 boundaries fit in one hour). The cell
+        // must independently track per-TF state.
+        let cell = AggregatorCell::empty();
+        let aligned = 1_716_001_000_u32 - (1_716_001_000_u32 % 3_600);
+        // Open M1 + H1 at t=aligned+30:
+        cell.consume_tick(TfIndex::M1, &mk_tick(aligned + 30, 100.0, 50, 0), 0);
+        cell.consume_tick(TfIndex::H1, &mk_tick(aligned + 30, 100.0, 50, 0), 0);
+        // Cross M1 boundary at t=aligned+90 (still inside the same H1):
+        let outcome_m1 = cell.consume_tick(TfIndex::M1, &mk_tick(aligned + 90, 102.0, 60, 0), 50);
+        let outcome_h1 = cell.consume_tick(TfIndex::H1, &mk_tick(aligned + 90, 102.0, 60, 0), 0);
+        assert!(matches!(outcome_m1, ConsumeOutcome::Sealed { .. }));
+        assert_eq!(outcome_h1, ConsumeOutcome::Updated);
+    }
+
+    #[test]
+    fn test_force_seal_returns_some_when_initialised() {
+        let cell = AggregatorCell::empty();
+        cell.consume_tick(TfIndex::M1, &mk_tick(1_716_000_900, 100.0, 50, 0), 0);
+        let sealed = cell.force_seal(TfIndex::M1);
+        assert!(sealed.is_some());
+        let s = sealed.expect("just asserted some");
+        assert_eq!(s.bucket_start_ist_secs, 1_716_000_900);
+        assert_eq!(s.tick_count, 1);
+        // Slot is now empty again.
+        assert!(cell.snapshot(TfIndex::M1).is_uninitialised());
+    }
+
+    #[test]
+    fn test_force_seal_returns_none_when_uninitialised() {
+        let cell = AggregatorCell::empty();
+        // Nothing consumed.
+        assert!(cell.force_seal(TfIndex::M1).is_none());
+        assert!(cell.force_seal(TfIndex::D1).is_none());
+    }
+
+    #[test]
+    fn test_force_seal_only_affects_one_slot() {
+        let cell = AggregatorCell::empty();
+        cell.consume_tick(TfIndex::M1, &mk_tick(1_716_000_900, 100.0, 50, 0), 0);
+        cell.consume_tick(TfIndex::M5, &mk_tick(1_716_000_900, 100.0, 50, 0), 0);
+        // Seal M1 only.
+        cell.force_seal(TfIndex::M1);
+        assert!(cell.snapshot(TfIndex::M1).is_uninitialised());
+        assert!(!cell.snapshot(TfIndex::M5).is_uninitialised());
+    }
+
+    #[test]
+    fn test_volume_uses_bucket_start_cumulative() {
+        // bucket_start_cumulative is critical for correct incremental
+        // volume across bucket boundaries (Item 28 carry-over).
+        let cell = AggregatorCell::empty();
+        // Open bucket A with cumulative volume = 1000.
+        cell.consume_tick(TfIndex::M1, &mk_tick(1_716_000_900, 100.0, 1_050, 0), 1_000);
+        let s = cell.snapshot(TfIndex::M1);
+        assert_eq!(s.volume, 50, "incremental from 1000 baseline = 1050 - 1000");
+        assert_eq!(s.bucket_start_cumulative, 1_000);
+    }
+
+    #[test]
+    fn test_pct_fields_default_zero_until_seal_time_stamp() {
+        // The 3 Wave-5 pct fields stay 0.0 until the seal-time writer
+        // stamps them from the prev_day cache (locked decision L-H6).
+        let cell = AggregatorCell::empty();
+        cell.consume_tick(TfIndex::M1, &mk_tick(1_716_000_900, 100.0, 50, 1_000), 0);
+        let s = cell.snapshot(TfIndex::M1);
+        assert_eq!(s.close_pct_from_prev_day, 0.0);
+        assert_eq!(s.oi_pct_from_prev_day, 0.0);
+        assert_eq!(s.volume_pct_from_prev_day, 0.0);
+    }
+
+    #[test]
+    fn test_aggregator_cell_is_send_sync_for_arc_sharing() {
+        // The papaya HashMap stores Arc<AggregatorCell> per locked
+        // decision L-C2. parking_lot::Mutex<T> requires T: Send for
+        // the lock guards to cross threads; the array itself must be
+        // Send + Sync. This test pins those bounds at compile time —
+        // if a future field reverts the bound (e.g. !Send Rc),
+        // compilation fails immediately.
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<AggregatorCell>();
+        assert_send_sync::<Arc<AggregatorCell>>();
+    }
+
+    #[test]
+    fn test_consume_outcome_is_copy_for_zero_alloc_callers() {
+        // Hot-path callers in the next commit will pattern-match on
+        // ConsumeOutcome and forward sealed_state to the shadow
+        // writer's ring buffer. The Copy bound lets that happen
+        // without cloning.
+        fn assert_copy<T: Copy>() {}
+        assert_copy::<ConsumeOutcome>();
+        assert_copy::<LiveCandleState>();
+    }
+}
