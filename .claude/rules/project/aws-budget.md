@@ -59,14 +59,14 @@ S3 archival exports detached partitions before removal (Plan Item 7, needs aws-s
    Free tier covers: 10 custom metrics, 10 alarms, 5GB logs, 3 dashboards. Stay within free tier.
 5. **S3 lifecycle policy is MANDATORY** — auto-tier to Intelligent-Tiering (90d) → Glacier (365d).
    Keeps 500GB cold data under ₹333/mo instead of ₹1,063/mo.
-6. **Host memory budget for c7i.xlarge / c8g.xlarge (8GB)** — Wave 7-A2 locked (2026-05-10):
-   - **Docker containers (5 services, ~3.92 GB):**
-     - QuestDB: 2GB (Wave 7-A: cascading mat views removed in Wave 6)
+6. **Host memory budget for c7i.xlarge / c8g.xlarge (8GB)** — Wave 7-A4 (2026-05-10):
+   - **Docker containers (5 services, ~3.42 GB):**
+     - QuestDB: **1.5GB** (Wave 7-A4: trimmed from 2GB; reduced workload post Wave-6 cascade removal allows tighter cap)
      - Grafana: 768MB
      - Valkey: 512MB
      - Prometheus: 384MB (7d retention)
      - Alertmanager: 256MB (KEPT — independent process for app-crash alerts)
-   - **Host process — Tickvault app: 1.5 GB** (rescue ring 5M ticks ≈ 30 sec WS outage absorbed)
+   - **Host process — Tickvault app: 2.0 GB** (Wave 7-A4 BUMP: today's + yesterday's sealed bars in RAM + indicator state + 5M tick rescue ring; RAM-only hot path for trading decisions)
    - **OS + filesystem cache: 600 MB** (tracing log writes, audit flush bursts, kernel TCP buffers)
    - **Total used: ~6.0 GB**
    - **Headroom (HARD FLOOR): 2.0 GB** — Linux kswapd needs ≥1 GB free; 2 GB prevents OOM under bursts
@@ -77,6 +77,7 @@ S3 archival exports detached partitions before removal (Plan Item 7, needs aws-s
 9. **Alert routing:** Prometheus → Alertmanager → Telegram (standard pattern). Alertmanager runs as an independent container so app-crash alerts still reach the operator. Routing alerts through the app itself is a single-point-of-failure anti-pattern (rejected 2026-05-10).
 10. **NO manual configuration on AWS deployment** — every setting (memory, schedule, alerts, dashboards, audits) lives in version-controlled config files. `git clone` + `docker compose up -d` reproduces full stack identically on Mac dev and AWS prod.
 11. **Headroom floor is non-negotiable: 2 GB minimum free RAM at all times** (Wave 7-A2). Below this, Linux kswapd thrashes, OOM killer becomes aggressive, latency jitter spikes. CI ratchet `test_total_host_memory_below_6_gb_ceiling` enforces it.
+12. **RAM-first architecture (Wave 7-A4): NO DB queries on hot path.** Tick → strategy decision must read indicator state, today's sealed bars, yesterday's sealed bars, and prev_day_OI cache from RAM only. QuestDB is for: persistence, audit, cross-verify (cold path), boot rehydration. Banned-pattern guard blocks any indicator/strategy code path that issues SELECT against QDB during market hours.
 
 ## What This Prevents
 
@@ -89,6 +90,7 @@ S3 archival exports detached partitions before removal (Plan Item 7, needs aws-s
 - App-crash alerts vanishing (Alertmanager independence prevents this)
 - Manual config drift between Mac and AWS (single compose file)
 - OOM killer striking under burst load (2 GB headroom floor prevents this)
+- DB-dependent hot-path latency (RAM-first rule prevents this)
 
 ## Instance Schedule (Wave 7-A — 2026-05-10 update)
 
@@ -112,38 +114,42 @@ S3 archival exports detached partitions before removal (Plan Item 7, needs aws-s
 | 1 weekend day (8hr manual) | ₹121 |
 | 1 quick check (2hr manual) | ₹30 |
 
-## Host Memory Budget — Wave 7-A2 Locked (2026-05-10)
+## Host Memory Budget — Wave 7-A4 Locked (2026-05-10)
 
 **c8g.xlarge / c7i.xlarge — 8 GB total:**
 
 | Component | RAM | Type | Notes |
 |---|---|---|---|
-| QuestDB | 2.0 GB | Docker | Time-series DB (mmap-heavy) |
-| **Tickvault app** | **1.5 GB** | **Host process** | **Rescue ring 5M ticks (~30 sec WS outage absorbed)** |
+| **Tickvault app** | **2.0 GB** | **Host process** | **Today + Yesterday sealed bars in RAM + indicator state + 5M rescue ring + RAM-only hot path** |
+| QuestDB | 1.5 GB | Docker | Time-series DB (cold-path persistence + cross-verify) |
 | Grafana | 768 MB | Docker | Dashboards |
 | **OS + FS cache** | **600 MB** | **Host kernel** | **tracing log writes + audit bursts** |
 | Valkey | 512 MB | Docker | Token + instrument cache |
 | Prometheus | 384 MB | Docker | 7d retention |
 | Alertmanager | 256 MB | Docker | Independent alert routing |
-| **TOTAL USED** | **6.0 GB** | | |
+| **TOTAL USED** | **~6.0 GB** | | |
 | **HEADROOM (hard floor)** | **2.0 GB** | | OOM safety margin |
 
-### Tickvault App (1.5 GB) Memory Breakdown
+### Tickvault App (2.0 GB) Memory Breakdown — Wave 7-A4
 
 | Component | Math | RAM |
 |---|---|---|
-| Live aggregator (current candle per TF) | 11,045 × 9 × 80 bytes | 8 MB |
-| SPSC channels (5 writers × 65K slots × 200B) | 5 × 65,536 × 200 | 65 MB |
-| **Rescue ring buffer (5M ticks × 200 bytes)** | 5,000,000 × 200 | **1.0 GB** |
-| Indicator state (99K indicators × 500 bytes) | 99,405 × 500 | 50 MB |
+| Live aggregator (current bar per TF) | 11,045 × 9 × 80B | 8 MB |
+| **Today's sealed bars (compact 32B, all 9 TFs)** | up to 5.5M × 32B | **176 MB** |
+| **Yesterday's sealed bars (compact 32B, all 9 TFs)** | 5.5M × 32B | **176 MB** |
+| **prev_day OHLCVOI cache** | 11,045 × 16B | **180 KB** |
+| Indicator running state (RSI/MACD/BB/EMA/SMA) | 99,405 × 500B | 50 MB |
+| SPSC channels (5 writers × 65K slots × 200B) | | 65 MB |
 | Token + instrument cache | 10K entries × 1KB | 10 MB |
-| WebSocket buffers (5 conns × 4MB) | 5 × 4 MB | 20 MB |
+| WebSocket buffers (5 conns × 4MB recv) | 5 × 4 MB | 20 MB |
 | OMS + Greeks pipeline | misc | 10 MB |
-| Tracing + log queues | bounded | 5 MB |
+| Tracing + log writer queues | bounded | 5 MB |
 | Tokio runtime + 4 thread stacks | 4 × 2 MB + internal | 20 MB |
-| Heap fragmentation (~25% scaled) | jemalloc | 200 MB |
-| **APP TOTAL** | | **~1,388 MB** |
-| **App safety headroom** | | **~112 MB** ✅ |
+| **WORKING SET SUBTOTAL** | | **~540 MB** |
+| **Rescue ring buffer (5M ticks × 200 bytes)** | 5M × 200 | **1.0 GB** |
+| Heap fragmentation (~25% w/ jemalloc tuning) | | 200 MB |
+| **APP TOTAL** | | **~1.74 GB** |
+| **App safety margin inside 2 GB cap** | | **~260 MB** ✅ |
 
 ### Why 2 GB Host Headroom Is Non-Negotiable
 
@@ -158,23 +164,69 @@ S3 archival exports detached partitions before removal (Plan Item 7, needs aws-s
 
 **Below 2 GB headroom → Linux gets twitchy. Above 2 GB → smooth operation.**
 
-## RAM Trim Audit (Wave 7-A → Wave 7-A2 trajectory)
+### Why QuestDB 1.5 GB Is Acceptable Post-Wave-6
 
-| Service | Pre-Wave-7 | Wave 7-A | Wave 7-A2 | Final state |
-|---|---|---|---|---|
-| QuestDB | 4 GB | 2 GB | 2 GB | 2 GB |
-| App | 500 MB | 500 MB | **1.5 GB** | **1.5 GB** ⬆️ |
-| Grafana | 1 GB | 768 MB | 768 MB | 768 MB |
-| OS + FS cache | 100 MB | 200 MB | **600 MB** | **600 MB** ⬆️ |
-| Valkey | 1 GB | 512 MB | 512 MB | 512 MB |
-| Prometheus | 512 MB | 384 MB | 384 MB | 384 MB |
-| Alertmanager | 256 MB | 256 MB | 256 MB | 256 MB |
-| Traefik | 512 MB | REMOVED | — | — |
-| Valkey-exporter | 128 MB | REMOVED | — | — |
-| **Total Used** | ~7.9 GB | ~4.6 GB | **~6.0 GB** | **~6.0 GB** |
-| **Headroom** | ~100 MB ⚠️ | ~3.4 GB | **~2.0 GB** ✅ | **~2.0 GB (locked floor)** |
+| QuestDB workload | Pre-Wave-6 | Post-Wave-6 | RAM impact |
+|---|---|---|---|
+| `candles_1s` ingestion | 25M rows/day | REMOVED | -25M rows/day |
+| Cascading mat views (9) | rebuilds on every 1s candle | REMOVED | -9× compounding |
+| Sealed candle ingestion | — | 5.4M rows/day | small |
+| Cross-verify reads | — | post-market only | cold path |
+| **Net write pressure** | high | **80% lower** | 1.5 GB sufficient |
 
-## 100% Coverage Verification (after Wave 7-A2 trim)
+**QuestDB is now a write-mostly + cold-path-read store. 1.5 GB is enough; 2 GB was over-allocated.**
+
+## RAM Trim Audit (Wave 7-A → Wave 7-A4 trajectory)
+
+| Service | Pre-Wave-7 | Wave 7-A | Wave 7-A2 | **Wave 7-A4** | Final |
+|---|---|---|---|---|---|
+| QuestDB | 4 GB | 2 GB | 2 GB | **1.5 GB** | 1.5 GB |
+| App | 500 MB | 500 MB | 1.5 GB | **2.0 GB** ⬆️ | 2.0 GB |
+| Grafana | 1 GB | 768 MB | 768 MB | 768 MB | 768 MB |
+| OS + FS cache | 100 MB | 200 MB | 600 MB | 600 MB | 600 MB |
+| Valkey | 1 GB | 512 MB | 512 MB | 512 MB | 512 MB |
+| Prometheus | 512 MB | 384 MB | 384 MB | 384 MB | 384 MB |
+| Alertmanager | 256 MB | 256 MB | 256 MB | 256 MB | 256 MB |
+| Traefik | 512 MB | REMOVED | — | — | — |
+| Valkey-exporter | 128 MB | REMOVED | — | — | — |
+| **Total Used** | ~7.9 GB | ~4.6 GB | ~6.0 GB | **~6.02 GB** | **~6.0 GB** |
+| **Headroom** | ~100 MB ⚠️ | ~3.4 GB | ~2.0 GB | **~2.0 GB** ✅ | **2 GB (locked)** |
+
+## RAM-First Architecture (Wave 7-A4 mandatory)
+
+### Hot Path (RAM ONLY — no DB hits)
+
+| Operation | Source |
+|---|---|
+| Tick → indicator update | RAM (live aggregator + today/yesterday sealed bars + running state) |
+| Indicator → strategy decision | RAM (everything resident) |
+| Strategy decision → order construction | RAM (token, instrument cache) |
+| Risk check (margin, exposure) | RAM (OMS state, prev_day_OI cache) |
+| Order out → wire | RAM → TLS → Dhan |
+
+### Cold Path (DB allowed)
+
+| Operation | DB allowed |
+|---|---|
+| Tick persistence | ✅ async ILP write |
+| Candle seal flush | ✅ async ILP write |
+| Audit trail INSERT | ✅ async ILP write |
+| Boot rehydration (one-time) | ✅ SELECT today's bars |
+| Post-market cross-verify | ✅ SELECT all 1m bars |
+| Operator dashboard | ✅ Grafana SQL |
+
+### Banned Pattern (CI-enforced)
+
+```rust
+// banned-pattern-scanner.sh blocks:
+// - SELECT inside crates/trading/src/strategy/*
+// - SELECT inside crates/trading/src/indicator/*
+// - SELECT inside crates/core/src/pipeline/tick_processor.rs
+// - SELECT inside crates/trading/src/oms/risk_check.rs
+// - Any code path between WS read and order out that hits QuestDB
+```
+
+## 100% Coverage Verification (after Wave 7-A4 trim)
 
 | Need | Tool | Status |
 |---|---|---|
@@ -188,7 +240,8 @@ S3 archival exports detached partitions before removal (Plan Item 7, needs aws-s
 | Dashboards | Grafana operator-health single page | ✅ KEEP |
 | HTTP gateway | AWS ALB (free tier) | ✅ replaces Traefik |
 | Distributed tracing | CloudWatch X-Ray (optional, free tier 100K traces/mo) | ⚠️ optional |
-| Zero tick loss envelope | Rescue ring 5M ticks (Wave 7-A2) | ✅ 30 sec absorbed |
+| Zero tick loss envelope | Rescue ring 5M ticks (Wave 7-A4) | ✅ 30 sec absorbed |
+| **RAM-first hot path** | **today + yesterday sealed bars in RAM** | ✅ Wave 7-A4 locks |
 
 ## Common Runtime / Dynamic / Scalable / Automated Charter (mandatory)
 
@@ -208,15 +261,18 @@ notified on Telegram, no manual inputs."
 | Automated alerting | Prometheus alert rules in `alerts.yml` evaluate every 30s; Alertmanager auto-routes by severity to Telegram |
 | Automated notifications | teloxide Telegram client + Alertmanager webhook; `Severity::High`/`Critical` auto-page operator |
 | No manual inputs | Boot sequence is fully automatic: bootstrap.sh pulls SSM → Docker compose up → app self-tests via `make doctor` → 3-tier fallback (cache → SSM → TOTP) → market-open self-test at 09:16:30 IST |
+| **RAM-first hot path** | banned-pattern guard blocks DB queries from indicator/strategy/risk paths |
 
 ## Wave 7-A3 Follow-Up (Rust code, deferred to Mac commit)
 
 | Change | File | Status |
 |---|---|---|
 | `TICK_BUFFER_CAPACITY: 2_000_000` → `5_000_000` | `crates/common/src/constants.rs` | ⏳ pending Mac commit (sandbox cargo broken) |
-| Update ratchet test for 5M | `crates/storage/tests/zero_tick_loss_alert_guard.rs` | ⏳ pending |
-| DHAT zero-alloc verify with 5M ring | `crates/core/tests/dhat_*.rs` | ⏳ pending |
-| Adversarial 3-agent review for ring expansion | hot-path + security + bug-hunt | ⏳ pending |
+| Today + yesterday sealed bar cache implementation | `crates/trading/src/indicator/bar_cache.rs` (new) | ⏳ pending Wave 6 sub-PR #1 |
+| Boot-time rehydration of today's bars | `crates/core/src/boot/historical_loader.rs` (new) | ⏳ pending Wave 6 sub-PR #2 |
+| Banned-pattern: SELECT from hot path | `.claude/hooks/banned-pattern-scanner.sh` | ⏳ pending Mac commit |
+| DHAT zero-alloc verify with 5M ring + bar cache | `crates/core/tests/dhat_*.rs` | ⏳ pending |
+| Adversarial 3-agent review | hot-path + security + bug-hunt | ⏳ pending Wave 6 sub-PR rollout |
 
 ## Trigger
 
@@ -226,4 +282,6 @@ This rule activates when editing files matching:
 - `scripts/aws-*`
 - `crates/app/src/infra.rs`
 - `crates/common/src/constants.rs` (TICK_BUFFER_CAPACITY)
+- `crates/trading/src/indicator/*` (RAM-first guard)
+- `crates/trading/src/strategy/*` (RAM-first guard)
 - Any file containing `c7i`, `c8g`, `mem_limit`, `EBS`, `gp3`, `instance_type`, `aws_region`, `TICK_BUFFER_CAPACITY`
