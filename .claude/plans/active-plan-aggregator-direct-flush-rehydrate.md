@@ -195,6 +195,46 @@ Wait for ALL THREE reports. Synthesize into verdict table: CRITICAL / HIGH / MED
 > **Pre-impl 3-agent verdict (2026-05-10):** 4 CRITICAL + 11 HIGH + 5 MEDIUM + 2 LOW + 1 FALSE-POSITIVE.
 > Operator unblocked impl with all fixes folded in. Locked design decisions
 > below override the original abstract bullets.
+>
+> ### 📍 Resumption checkpoint (for the next Claude Code session)
+>
+> If this session ends and a new session resumes Sub-PR #1, START HERE.
+>
+> | Field | Value |
+> |---|---|
+> | **Branch** | `claude/aggregator-engine-pN23a` |
+> | **Latest commit** | `facf163` — `feat(wave-6/aggregator): Sub-PR #1 foundation — plan locks, ErrorCodes, shadow DEDUP keys, H11 precursor` |
+> | **PR** | [#551](https://github.com/SJParthi/tickvault/pull/551) — ready for review (flipped from draft 2026-05-10) |
+> | **PR base** | `main` (rebase if main has moved) |
+>
+> **What landed in commit `facf163` (foundation slice):**
+>
+> - Plan revised with all 22 locked design decisions (L-C1..L-L22)
+> - 6 new `ErrorCode` variants in `crates/common/src/error_code.rs` (count 93 → 99): AGGREGATOR-DROP-01 / AGGREGATOR-LATE-01 / AGGREGATOR-SEAL-01 / AGGREGATOR-HB-01 / BOUNDARY-01 / AGGREGATOR-AUDIT-01
+> - `wave-6-error-codes.md` runbook stub created (cross-ref test passes)
+> - H11 precursor fix at `crates/storage/src/candle_persistence.rs:636` (`warn!` → `error!` with `code = ErrorCode::AggregatorSeal01IlpFailed.code_str()`)
+> - `crates/storage/src/shadow_persistence.rs` (NEW, ~340 LoC): 9 candle-shadow DEDUP keys + 1 audit-table DEDUP key (all I-P1-11 composite, all contain `exchange_segment` literal); idempotent DDL emitter `ensure_shadow_candle_tables()` with WIRING-EXEMPT marker pending the engine commit
+> - `crates/storage/tests/dedup_segment_meta_guard.rs` ratchet bumped `>= 7` → `>= 22`
+> - 3 unrelated plans (`active-plan-{in-memory-store,movers-cleanup,non-aws-readiness}*.md`) got `per-wave-guarantee-matrix.md` cross-reference subsections — `per-item-guarantee-check.sh` was failing on these BEFORE this commit; now 21 PASS / 0 FAIL
+>
+> **Verified GREEN at commit `facf163`:** common (758 unit tests), storage (shadow_persistence 6 tests, dedup_segment_meta_guard 4 tests, error_code_rule_file_crossref 3 tests), `cargo fmt --check`, `cargo clippy` on changed files (0 warnings), all 8 pre-push gates, all 21 active plans pass guarantee-matrix hook.
+>
+> **Pre-existing failures NOT touched** (verified via `git stash` cycle; not introduced by this branch): `tick_persistence.rs:683-688` clippy doc-comment warnings, `portal_auto_open_flag_guard::config_base_toml_documents_the_flag`.
+>
+> **What's still pending in Sub-PR #1** (to land in follow-up commits on this branch BEFORE merge, or in a new branch off the merged PR #551):
+>
+> - **Item 1.1** — `Arc<[AtomicCell<LiveCandleState>; 9]>` per `(security_id, segment)` in `papaya::HashMap`, eagerly pre-populated at boot from `InstrumentRegistry::iter()` (composite-key)
+> - **Item 1.2** — Ring → spill → DLQ writer for sealed candles in a new `ShadowCandleWriter` struct, mirroring `tick_persistence.rs::TickPersistenceWriter` (600K capacity, watermark, `data/spill/seals-YYYYMMDD.bin`, NDJSON DLQ)
+> - **Item 1.3** — Boundary timer (IST midnight ONLY — Muhurat deferred per L-C4), `trading_date_ist` derived from `exchange_timestamp` (NEVER `Utc::now()` per L-H7), missed-boundary catch-up via BOUNDARY-01
+> - **Item 1.4** — Direct-flush at seal to all 9 `candles_*_shadow` tables; wire `ensure_shadow_candle_tables()` into `crates/app/src/main.rs` boot sequence (removes the WIRING-EXEMPT marker)
+> - **Item 1.5** — Wave-5 pct-stamping at seal: in-memory `Arc<HashMap<(u32,u8), PrevDayRefs>>` populated via existing `prev_day_cache_loader::populate_prev_day_cache_at_boot()`, refreshed at IST-midnight boundary, PREVCLOSE-04 once-per-boot WARN if empty (L-H14)
+> - **Item 1.6** — DHAT zero-alloc test + Criterion benches (split p99 budgets per L-H8: `consume_tick_no_seal ≤ 100ns`, `consume_tick_with_seal ≤ 1µs`); add to `quality/benchmark-budgets.toml`
+> - **Item 1.7** — Property tests `proptest` for 1m × N → Nm rollup correctness across all 9 TFs
+> - **Item 1.8** — Per-minute heartbeat `NotificationEvent::AggregatorMinuteSealBurst` (Severity::Info, edge-coalesced 60s) per L-H15
+> - **Item 1.9** — `aggregator_seal_audit` table writer (DDL already in `shadow_persistence.rs`; needs `AggregatorSealAuditWriter::append`) per L-M16
+> - **7-layer observability** — 14 Prom metrics + 5 alert rules + Grafana panels + Telegram event variants + audit table writer
+> - **20+ ratchet tests + 6 chaos tests** (per plan §"Ratchet Tests Added (20+)" and §"Chaos Tests Added (6)")
+> - **Post-impl 3-agent adversarial review** on the diff (hot-path-reviewer + security-reviewer + general-purpose hostile bug-hunt)
 
 ### Locked design decisions (per pre-impl 3-agent review)
 
@@ -528,7 +568,7 @@ All wired into `crates/storage/tests/resilience_sla_alert_guard.rs` ratchet.
 
 | Sub-PR | Boxes done | Status |
 |---|---|---|
-| #1 Aggregator engine | 0/12 | 🔴 not started |
+| #1 Aggregator engine | ~3/12 | 🟡 foundation slice landed in commit `facf163` (PR [#551](https://github.com/SJParthi/tickvault/pull/551), ready for review). Hot-path engine + ring/spill/DLQ + boundary timer + observability + tests pending. See "📍 Resumption checkpoint" subsection above. |
 | #2 Rehydration | 0/12 | 🔴 not started |
 | #3 Post-market 1m fetch + cross-verify + self-heal | 0/12 | 🔴 not started |
 | #4 Promotion | 0/12 | 🔴 not started |
