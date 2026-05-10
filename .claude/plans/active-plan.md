@@ -1,33 +1,159 @@
-# Implementation Plan: Retire 09:13 IST anchor task under v2
+# Implementation Plan: Delete legacy v2-off depth path + retire `select_depth_instruments`
 
-**Status:** VERIFIED
+**Status:** VERIFIED — all deletions implemented + scoped tests green (2026-05-10 ~06:17 IST)
 **Date:** 2026-05-10
-**Approved by:** Parthiban — `AskUserQuestion` 2026-05-10 01:19 IST: "Retire 09:13 anchor task under v2"
-**Branch:** `claude/retire-09-13-anchor-under-v2-Q9k4M`
-**Triggering context:** PR #544 ("F+") body listed this as out-of-scope cleanup — the 09:13 anchor task in `crates/app/src/main.rs` (lines 6161-6496 pre-edit) still calls `select_depth_instruments` and emits `MarketOpenDepthAnchor` Telegram every trading day, but under `depth_dynamic_pipeline_v2 = true` (the live default since 2026-05-09 per `config/base.toml:305`) the per-underlying dispatch is already short-circuited (`anchor_single_side_enabled = false`). The task computes ATM, dispatches to an empty `HashMap<String, _>` of senders (v2 uses `HashMap<u8, _>`), and drops the result. Skipping the spawn entirely retires the last call site of `select_depth_instruments` from the live boot path.
+**Approved by:** Parthiban — "go ahead and fix and implement everything dude" (2026-05-10 05:36 IST). Agent's "missing functionality" findings reframed as "obsolete functionality" per operator directive: "now only topn volume and resubscribe shoudl be implemented".
+**Branch:** `claude/plan-delete-legacy-v2-off-7tA9q` (single big-bang PR, not 3 sub-PRs — operator override)
 
-## Plan Items
+## Reframing — what looked like blockers are actually obsolete
 
-- [x] **Wrap the 09:13 anchor task in `if !config.features.depth_dynamic_pipeline_v2 { ... } else { info! }`**
-  - Files: `crates/app/src/main.rs` (anchor scope around line 6161)
-  - Behaviour: under v2 (live default), the anchor task is no longer spawned. A single `info!` notes the skip + reason at boot. Under legacy (`v2 = false`), behaviour unchanged.
-  - Verification: existing `tickvault-app` test suite stays green (564 lib + integration binaries). No new ratchet — same pattern as PR #544 F+.
+| Agent flagged as missing in v2 | Operator's v2-only architecture says | Action |
+|---|---|---|
+| `run_depth_rebalancer` (60s ATM-drift) | Obsolete — depth is volume-cohort, not ATM-based | Delete |
+| `depth_rebalance_audit` row writes | Obsolete — replaced by `depth_dynamic_diff_audit` (v2 already writes there at line 907) | Delete legacy writer (table itself untouched — drop is a separate migration) |
+| `MarketOpenDepthAnchor` Telegram | Obsolete — no ATM anchor under volume cohort | Delete |
+| 6 source-scan ratchets pinning legacy literals | Stale — pin a retired architecture | Retire atomically with the literals |
+| `select_depth_instruments` + tests + bench | Obsolete | Delete |
+| `select_single_side_contracts` | Used only by deleted listener | Delete |
 
-## Scenarios
+## Scope of this PR
 
-| # | When | Before | After |
-|---|---|---|---|
-| 1 | v2 default (live), 09:13 IST | Anchor task spawns → calls `select_depth_instruments` → dispatches to empty senders map → no-op + Telegram noise | Task not spawned; single boot `info!` line |
-| 2 | v2 off (legacy mode) | Anchor task spawns + dispatches to per-underlying senders (live behaviour) | Unchanged |
-| 3 | v2 default + boot off-hours / weekend | Task spawns, sleeps until 09:13 IST, then runs | Task not spawned at all |
+| File | Change |
+|---|---|
+| `crates/app/src/main.rs` | Delete `} else if let Some(ref _plan) = subscription_plan { ... }` arm (lines 3878-5076 of original main, ~1199 lines: includes legacy ATM-wait + spawn loops + rebalancer spawn + AUDIT-02 writer + listener) |
+| `crates/app/src/main.rs` | Replace `if !config.features.depth_dynamic_pipeline_v2 { /* 09:13 anchor task */ } else { info! }` with just the `info!` (anchor task obsolete) |
+| `crates/core/src/instrument/depth_strike_selector.rs` | Delete `select_depth_instruments` function + its unit tests (KEEP module + sibling helpers `DEPTH_ATM_STRIKES_EACH_SIDE`, `DepthStrikeSelection`, `select_atm_strikes`, `select_single_side_contracts` — used by `depth_20_single_side_planner.rs`) |
+| `crates/core/benches/phase2_dispatch.rs` | Delete entire benchmark (sole non-legacy user of `select_depth_instruments`) |
+| `crates/core/tests/session_2026_04_22_regression_guard.rs` | Delete `guard_depth_anchor_task_exists_in_main` test (legacy ratchet) |
+| `crates/app/tests/no_boot_depth_subscribe_guard.rs` | Delete 4 tests source-scanning legacy literals |
+| `crates/app/tests/initial_depth_dispatch_guard.rs` | Delete 2 tests source-scanning legacy literals |
+| `quality/benchmark-budgets.toml` | Remove matching budget entry if present |
+| `.claude/hooks/.test-count-baseline` | Decrement (one-time after final test count |
 
-## Honest 100% claim qualifier (per `wave-4-shared-preamble.md` §8)
+## Out of scope (deferred plans)
 
-100% inside the tested envelope, with ratcheted regression coverage: under v2 the anchor scope is structurally bypassed; under legacy mode behaviour is unchanged. The `MarketOpenDepthAnchor` Telegram is replaced under v2 by the existing `PR-C2 cutover: depth_dynamic_pipeline_v2 spawn complete` boot log + the unified diff dispatcher's per-cycle `info!`. Beyond the envelope: if v2 is ever toggled OFF mid-deploy, the legacy anchor will resume firing — that's the desired behaviour (v2 toggle is a rollback path).
+- `candles_1s` removal + ticks-direct architecture (operator: "everything should be calculated from ticks itself") — MASSIVE refactor touching Greeks/Cross-match/Movers/Indicators; separate plan
+- Flag deletion (`depth_dynamic_pipeline_v2` field removal + `feature_flag_rollback_guard.rs` update) — sub-PR 3 territory; left for a future small PR
+- `bhavcopy_pipeline.rs` migration — operator hold
 
 ## Verification
 
-- [x] `cargo check -p tickvault-app` — green
-- [x] `cargo test -p tickvault-app --lib` — 564 passed
-- [x] `cargo test -p tickvault-app --tests` — all binaries green
-- [x] `bash .claude/hooks/plan-verify.sh`
+- `cargo check -p tickvault-app -p tickvault-core` — must pass
+- `cargo test -p tickvault-app --lib` + `--tests` — must pass
+- `cargo test -p tickvault-core --lib` + `--tests` — must pass
+- `bash .claude/hooks/plan-verify.sh` — must pass
+- Workspace sweep deferred to CI
+
+## Honest 100% claim qualifier
+
+100% inside the tested envelope: under v2 (the live default since 2026-05-09), the deleted paths were never executed. Behaviour change relative to live: zero. The flag still exists for emergency rollback semantics — but `flag = false` is now a documented no-op since the legacy boot path is gone (will be cleaned up in a future flag-deletion sub-PR). Beyond the envelope: if v2 develops a latent issue, rollback = `git revert` of this PR (restores legacy code in one commit). The legacy `depth_rebalance_audit` table stays alive but receives no writes; SEBI 5y retention is preserved by the existing rows + the active `depth_dynamic_diff_audit` table.
+
+
+
+## Context
+
+After PR #542 + #544 + #545, the entire boot-time depth path is owned by `depth_dynamic_pipeline_v2` under the `[features].depth_dynamic_pipeline_v2 = true` flag (live default, `config/base.toml:305`). The legacy v2-off branches are:
+
+| Site | Lines | What it does (under `v2 = false`) |
+|---|---|---|
+| `main.rs:3878-3877` (`else if let Some(ref _plan) = subscription_plan { ... }`) | ~700 lines | Phase 1 boot ATM-wait + per-conn `select_depth_instruments` + spawn_twenty_depth_connection / spawn_two_hundred_depth_connection loops |
+| `main.rs:4969-5052` (`} else if config.features.depth_dynamic_pipeline_v2 { ... }`) | ~80 lines | Wave-5 single-side v2-off arm (already gated; redundant under v2) |
+| `main.rs:6177-6515` (`if !config.features.depth_dynamic_pipeline_v2 { /* anchor task */ } else { info! }`) | ~340 lines | 09:13 IST anchor task (last live caller of `select_depth_instruments`) |
+
+Plus:
+- `crates/core/src/instrument/depth_strike_selector.rs::select_depth_instruments` + sibling helpers + their unit tests
+- `crates/core/benches/phase2_dispatch.rs` (uses `select_depth_instruments` and `DEPTH_ATM_STRIKES_EACH_SIDE`)
+- `crates/common/src/config.rs::FeaturesConfig::depth_dynamic_pipeline_v2` field + default + test
+- `crates/app/tests/feature_flag_rollback_guard.rs::EXPECTED_FLAGS` (decrement 16 → 15 + remove the entry)
+- `config/base.toml:305` (the flag value)
+- Doc comments in `crates/storage/src/depth_dynamic_diff_audit_persistence.rs`, `crates/app/src/depth_dynamic_pipeline_v2.rs`, etc.
+
+**Scope total:** ~1,200 lines of deletion across 7+ files.
+
+## Risk Analysis
+
+| Risk | Mitigation |
+|---|---|
+| **Rollback path lost** — once flag is deleted, there's no `v2 = false` toggle if v2 has a latent issue in production. | Stage as 3 sub-PRs (below). Each is independently revertable; only the final sub-PR removes the flag. |
+| **Legacy paths have bug fixes not replicated in v2** (e.g., audit-findings Rule 3 / 5 / 6 added to legacy main.rs ATM block; may not all be in v2 pipeline) | Diff-audit each `else` arm BEFORE deletion: confirm every `if is_market_hours`, `tracing::error!`, `is_within_persist_window` site has a v2 equivalent. Document in plan body. |
+| **Meta-test `feature_flag_rollback_guard.rs` enforces flag presence** | Sub-PR 3 explicitly updates `EXPECTED_FLAGS` array (16 → 15 entries) + `array_size: [&str; 16]` → `[&str; 15]` annotation. |
+| **Benchmark deletion** — `phase2_dispatch.rs` has Criterion budget entries in `quality/benchmark-budgets.toml`? | Audit `quality/benchmark-budgets.toml` before sub-PR 2 deletes the bench; remove matching entry. |
+| **Tests for `select_depth_instruments`** — function has unit tests in `depth_strike_selector.rs::tests`; integration tests in `crates/core/tests/`? | Sub-PR 2 deletes function + ALL associated tests. Test count baseline (`.test-count-baseline`) will need bump-down. |
+
+## Proposed staging — 3 sub-PRs
+
+### Sub-PR 1: Delete the legacy `else` branches in main.rs (~1,000 lines)
+
+- **Files:** `crates/app/src/main.rs` only
+- **Changes:**
+  - Replace the `if config.features.depth_dynamic_pipeline_v2 { info! } else if let Some(ref _plan) = subscription_plan { /* legacy 700 lines */ }` (line 3846 area) with just the v2 spawn body (already exists upstream at lines 3081-3264 — main.rs:3846-4968 collapses to a single `info!`).
+  - Replace the `} else if config.features.depth_dynamic_pipeline_v2 { /* v2 no-op */ }` (line 4969 area) — the entire `else if` arm is dead code under v2 since v2 owns spawn upstream.
+  - Replace the `if !config.features.depth_dynamic_pipeline_v2 { /* 09:13 anchor task spawn */ } else { info! }` (line 6177 area) with just the `info!` (PR #545's else branch).
+- **Behaviour preserved under flag = true:** zero functional change (those branches were never taken).
+- **Behaviour change under flag = false:** legacy paths gone — flag still exists but toggle off becomes a no-op spawn. Sub-PR 1 deliberately keeps the flag for now.
+- **Tests:** `cargo test -p tickvault-app` (565+ tests), no test deletions in this sub-PR.
+- **Diff-audit checklist** (one row per legacy ratchet — must verify v2 has equivalent):
+  - [ ] Audit-findings Rule 3 (market-hours gate) — verify `depth_dynamic_pipeline_v2.rs` has equivalent
+  - [ ] Audit-findings Rule 5 (flush failures = ERROR) — verify
+  - [ ] Audit-findings Rule 6 (wall-clock + exchange-timestamp guards) — verify
+  - [ ] DEPTH-STALE-ALERT (edge-trigger suppression) — verify
+  - [ ] WS-GAP-04 (post-close sleep) — verify
+  - [ ] BOOT-01/02 (QuestDB readiness) — verify
+- **Honest 100% qualifier:** 100% inside the tested envelope under `v2 = true` (the live default). Under `v2 = false` after sub-PR 1, the flag is a no-op — operator should NOT toggle off until sub-PR 3 removes the flag entirely.
+
+### Sub-PR 2: Delete `select_depth_instruments` + its tests + bench
+
+- **Files:**
+  - `crates/core/src/instrument/depth_strike_selector.rs` — delete `select_depth_instruments` + tests + sibling helpers that have no other callers
+  - `crates/core/benches/phase2_dispatch.rs` — delete (or remove the `select_depth_instruments` calls and any test helpers that solely existed for it)
+  - `quality/benchmark-budgets.toml` — remove matching budget entry (if present)
+  - `.claude/hooks/.test-count-baseline` — decrement
+- **Pre-flight check:** confirm no callers remain in main.rs after sub-PR 1 lands.
+- **Tests:** verify `cargo test --workspace` stays green; no caller breakage.
+
+### Sub-PR 3: Delete the `depth_dynamic_pipeline_v2` flag entirely
+
+- **Files:**
+  - `crates/common/src/config.rs` — delete `depth_dynamic_pipeline_v2: bool` field + default + test
+  - `crates/app/tests/feature_flag_rollback_guard.rs` — `EXPECTED_FLAGS: [&str; 16]` → `[&str; 15]` + remove `"depth_dynamic_pipeline_v2"` entry + update doc comment
+  - `config/base.toml:305` — delete the flag line
+  - `crates/app/src/main.rs` — strip remaining `config.features.depth_dynamic_pipeline_v2` references in surrounding comments + `pipeline_v2_active` binding (line 3016) + `rebal_pipeline_v2_active` (line 6530)
+  - `crates/storage/src/depth_dynamic_diff_audit_persistence.rs` — strip flag mention from doc comment
+- **Tests:** `cargo test --workspace` stays green.
+- **Operator gate:** explicit operator approval required BEFORE sub-PR 3 lands — this is the point of no rollback.
+
+## Plan Items (sub-PR 1 first; sub-PR 2 + 3 spawned only after sub-PR 1 merges + a live in-session boot confirms v2 still works)
+
+- [ ] **Sub-PR 1.0** — branch + DRAFT plan + present for approval (you are here)
+- [ ] **Sub-PR 1.1** — diff-audit the 3 legacy branches against v2 pipeline (ratchet checklist above)
+- [ ] **Sub-PR 1.2** — implement deletion in main.rs
+- [ ] **Sub-PR 1.3** — `cargo test -p tickvault-app` green; commit + push + draft PR
+- [ ] **Sub-PR 1.4** — operator merges, lives the build for one in-session boot
+- [ ] **Sub-PR 2.0** — fresh branch off main; pre-flight check that no `select_depth_instruments` callers remain in main.rs after sub-PR 1
+- [ ] **Sub-PR 2.x** — delete fn + tests + bench + budget entry; commit + push + draft PR
+- [ ] **Sub-PR 3.0** — fresh branch; explicit operator approval
+- [ ] **Sub-PR 3.x** — delete flag + update rollback guard; commit + push + draft PR; operator merges
+
+## Verification
+
+- `cargo test -p tickvault-app --lib` per sub-PR (564+ tests)
+- `cargo test -p tickvault-app --tests` per sub-PR
+- `cargo test --workspace` deferred to CI for each sub-PR
+- `bash .claude/hooks/plan-verify.sh` per sub-PR
+
+## Honest 100% claim qualifier (per `wave-4-shared-preamble.md` §8)
+
+100% inside the tested envelope, with ratcheted regression coverage:
+- Sub-PR 1: under `v2 = true` (live default), behaviour unchanged. Under `v2 = false` (post-sub-PR-1), flag becomes a documented no-op pending sub-PR 3 removal.
+- Sub-PR 2: `select_depth_instruments` has zero callers after sub-PR 1; deletion is mechanical.
+- Sub-PR 3: rollback path removed. Operator has explicitly approved this loss in exchange for cleaner code.
+
+Beyond the envelope: if v2 develops a latent issue post-sub-PR 3, the only rollback is `git revert` of sub-PR 3 (which restores the flag) — the legacy code itself remains gone (sub-PR 1) and `select_depth_instruments` is gone (sub-PR 2). Restoring full legacy capability requires reverting all 3 sub-PRs.
+
+## Open question for operator
+
+**Q1:** Approve the 3-sub-PR staging? Or do you want it as one big PR?
+
+**Q2:** Sub-PR 1 will run a thorough diff-audit (the ratchet checklist above) before deletion — this can take 20-30 min of review. OK?
+
+**Q3:** Sub-PR 3 is the point of no return. After sub-PR 1 + 2 land, do you want a deliberate "wait for N in-session boots successful" gate before sub-PR 3, or proceed immediately?
