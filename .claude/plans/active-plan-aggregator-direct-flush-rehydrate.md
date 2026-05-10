@@ -192,17 +192,51 @@ Wait for ALL THREE reports. Synthesize into verdict table: CRITICAL / HIGH / MED
 
 ## 🏗️ Sub-PR #1 — Aggregator Engine
 
-| # | Item | Detail |
-|---|---|---|
-| 1.1 | RAM-based 9-TF aggregator | `[LiveCandle; 9]` array per `(security_id, exchange_segment)` in `papaya::HashMap` |
-| 1.2 | Bounded mpsc channel | capacity 65,536, drop-newest policy |
-| 1.3 | Boundary timer | IST midnight + Diwali Muhurat (17:30-18:30 IST) inclusion via `TradingCalendar` |
-| 1.4 | Direct-flush at seal | sealed candle → 9 shadow tables via DEDUP UPSERT KEYS `(ts, security_id, exchange_segment)` |
-| 1.5 | Wave-5 pct-stamping at seal | reads `previous_day` for `close_pct_from_prev_day`, `oi_pct_from_prev_day`, `volume_pct_from_prev_day` |
-| 1.6 | DHAT zero-alloc + Criterion p99 ≤100ns | hot-path budgets pinned in `quality/benchmark-budgets.toml` |
-| 1.7 | Property tests for aggregation | proptest: 1m × 5 → 5m, 1m × 15 → 15m, etc. (all 9 TFs) |
+> **Pre-impl 3-agent verdict (2026-05-10):** 4 CRITICAL + 11 HIGH + 5 MEDIUM + 2 LOW + 1 FALSE-POSITIVE.
+> Operator unblocked impl with all fixes folded in. Locked design decisions
+> below override the original abstract bullets.
 
-**Done matrix:** 🔴 0/12
+### Locked design decisions (per pre-impl 3-agent review)
+
+| Lock | Decision | Replaces |
+|---|---|---|
+| **L-C1** | **Ring→spill→DLQ pattern** for sealed candles, mirroring `tick_persistence.rs` (`SEAL_BUFFER_CAPACITY = 600_000`, watermark, ring spill to `data/spill/seals-YYYYMMDD.bin`, NDJSON DLQ on dual failure). NOT a simple bounded mpsc with drop-newest. The IST-midnight burst of ~99K seals MUST NOT silently drop. | item 1.2 (bounded mpsc 65,536 drop-newest) |
+| **L-C2** | **`AtomicCell<LiveCandleState>`-per-TF** stored eagerly in `papaya::HashMap<(u32,u8), Arc<[AtomicCell<LiveCandleState>; 9]>>`. Lock-free hot-path mutation. Pre-populated at boot from `InstrumentRegistry::iter()` (composite key) BEFORE WS subscribe. NO `Mutex`, NO `compute()`-closure overhead, NO `unsafe`. | item 1.1 ambiguous "papaya holds `[LiveCandle;9]`" |
+| **L-C3** | **Late ticks discarded with `error!` + counter** `tv_aggregator_late_tick_total{action="discard"}`. NO silent merge across buckets. `seal_in_progress` epoch fence per cell. ErrorCode `AGGREGATOR-LATE-01`. | item 1.1/1.3 silent on race |
+| **L-C4** | **Muhurat code + ratchet test #5 DEFERRED to Wave 7** (AWS auto-stop 17:30 IST hard-conflicts with Muhurat 17:30–18:30; needs EventBridge override + ratchet test #5 removed from Sub-PR #1). Plan tracker line 482 backlog updated. | item 1.3 Muhurat clause + ratchet test #5 |
+| **L-H6** | Wave-5 pct-stamping reads in-memory `Arc<HashMap<(u32,u8), PrevDayRefs>>` populated at boot via `prev_day_cache_loader::populate_prev_day_cache_at_boot()` (existing PREVCLOSE-04 path). Refreshed at IST-midnight boundary timer. NEVER QuestDB read on hot path. PREVCLOSE-04 fires once-per-process if cache empty. | unspecified sync vs async |
+| **L-H7** | Boundary timer derives `trading_date_ist` from `(exchange_timestamp + IST_OFFSET).date()` (the WS LTT field), NOT `Utc::now()`. tokio `Instant` only for sleep duration. Missed-boundary detection (`last_seen_minute < expected_minute - 1`) → BOUNDARY-01 catch-up seal. | wall-clock dependence + DST risk |
+| **L-H8** | Two budget rows: `consume_tick_no_seal ≤ 100ns p99` (fast path), `consume_tick_with_seal ≤ 1µs p99` (cold path). | single conflated p99 budget |
+| **L-H9** | Dropped-seal log uses `error!(code = ErrorCode::AggregatorDrop01.code_str(), ...)` per `error_level_meta_guard.rs` Rule 5. | unspecified |
+| **L-H10** | All 9 `DEDUP_KEY_CANDLES_*M_SHADOW` constants live in `crates/storage/src/shadow_persistence.rs` (so existing `dedup_segment_meta_guard.rs` scans them). Each contains literal substring `exchange_segment`. Meta-guard `len() >= 7` bumped to `>= 16`. | undefined location |
+| **L-H11** | Pre-condition fix: `candle_persistence.rs:636` `warn!` → `error!` with `code` field BEFORE shadow writer is modeled on this file. | existing bug carry-over |
+| **L-H12** | Aggregator seal path propagates `Option<u8>` for segment. Unknown segment → `None` pct, fall back to `0.0` per PREVCLOSE-04. NEVER substitutes `0u8` (which would map to IDX_I and silently look up NIFTY/BANKNIFTY pct → 2026-04-17 I-P1-11 bug class). | bug class re-introduction risk |
+| **L-H13** | Boundary-fire gated by `is_within_market_hours_ist()` AND per-cell `tick_count > 0` check. NO empty seals after 15:30 close polluting shadow tables overnight. | nightly 99K zero-volume rows |
+| **L-H14** | PREVCLOSE-04 once-per-boot WARN gate (using `Once` or atomic boot flag) when `prev_day_cache.is_empty()` at first seal. | silent 0.0 stamping |
+| **L-H15** | Per-minute aggregator heartbeat: `NotificationEvent::AggregatorMinuteSealBurst { seals_emitted, seals_dropped }` (Severity::Info, edge-coalesced 60s) — positive false-OK avoidance signal. | no positive signal until PR3 |
+| **L-M16** | Sub-PR #1 ships `aggregator_seal_audit` table NOW (not deferred to PR3). DEDUP UPSERT KEYS `(trading_date_ist, security_id, exchange_segment, timeframe, candle_ts)`. Box 10 of 12-box matrix turns GREEN for PR1. | "audit deferred to PR3" risk |
+| **L-M17** | `#[instrument(skip_all, level = "trace")]` on hot-path entry, with the `tracing` static `LevelFilter` at the binary level set to `info` so trace-level spans are compile-time disabled (zero alloc). DHAT test asserts. | tracing alloc conflict |
+| **L-M18** | Drop alert `tv-multi-tf-writer-dropping`: `for: 5m` AND midnight-suppression window (00:00–00:01 IST excluded via `absent_over_time` recording rule). | nightly burst false-pages |
+| **L-M19** | Cell array eagerly pre-populated at boot via `InstrumentRegistry::iter()` (composite-key iteration). Ratchet test `test_aggregator_zero_alloc_on_first_tick` uses DHAT. | first-tick alloc spike risk |
+| **L-M20** | All free-text ILP `STRING` columns (e.g. `last_error` in retry queue, symbol display labels) pass through `sanitize_audit_string` (added to `crates/common/src/sanitize.rs` if not present). All `Buffer::symbol(...)` calls pass through `sanitize_ilp_symbol`. Negative fuzz test added. | ILP injection risk |
+| **L-L21** | Branch retained at system-assigned `claude/aggregator-engine-pN23a` (system git rules override plan). Plan branch name `claude/wave-6-pr1-multi-tf-aggregator` is informational only. | branch mismatch |
+| **L-L22** | Per-item 12-box stickers added under each item (1.1–1.8) below in addition to the wave-level sticker. | misleading hook signal |
+
+### Items (revised)
+
+| # | Item | Detail | Box |
+|---|---|---|---|
+| 1.1 | RAM-based 9-TF aggregator (L-C2) | `Arc<[AtomicCell<LiveCandleState>; 9]>` per `(security_id, exchange_segment)` in `papaya::HashMap`. Eager pre-populate at boot from registry composite-key iter. Lock-free mutation. | 🔴 0/12 |
+| 1.2 | Ring→spill→DLQ for sealed candles (L-C1) | `SEAL_BUFFER_CAPACITY = 600_000`, fixed-record disk spill `data/spill/seals-YYYYMMDD.bin`, NDJSON DLQ on dual failure. ErrorCode `AGGREGATOR-DROP-01` `error!`. | 🔴 0/12 |
+| 1.3 | Boundary timer — IST midnight only (L-C4 deferred Muhurat) | Exchange-ts derived `trading_date_ist` (L-H7). Missed-boundary catch-up via BOUNDARY-01. Market-hours + tick_count gate (L-H13). | 🔴 0/12 |
+| 1.4 | Direct-flush at seal | 9 shadow tables `candles_{1m,5m,15m,30m,1h,2h,3h,4h,1d}_shadow` with DEDUP UPSERT KEYS `(ts, security_id, exchange_segment)` (L-H10). | 🔴 0/12 |
+| 1.5 | Wave-5 pct-stamping (in-memory L-H6) | Hot-path read of `Arc<HashMap<(u32,u8), PrevDayRefs>>`. Boot-load via `prev_day_cache_loader`. Once-per-boot WARN if empty (L-H14). | 🔴 0/12 |
+| 1.6 | DHAT + Criterion budgets (L-H8 split) | `consume_tick_no_seal ≤ 100ns p99` + `consume_tick_with_seal ≤ 1µs p99` in `quality/benchmark-budgets.toml`. | 🔴 0/12 |
+| 1.7 | Property tests | proptest 1m × N → Nm, all 9 TFs covered. | 🔴 0/12 |
+| 1.8 | Per-minute heartbeat (L-H15) | `AggregatorMinuteSealBurst` (Info, coalesced 60s) — positive signal. | 🔴 0/12 |
+| 1.9 | Aggregator seal audit table (L-M16) | `aggregator_seal_audit` — DEDUP UPSERT KEYS `(trading_date_ist, security_id, exchange_segment, timeframe, candle_ts)`. | 🔴 0/12 |
+
+**Wave-level done matrix:** 🔴 0/12
 
 ---
 
@@ -437,7 +471,7 @@ All wired into `crates/storage/tests/resilience_sla_alert_guard.rs` ratchet.
 | 2 | `test_bounded_channel_capacity` | mpsc cap = 65536 |
 | 3 | `test_drop_newest_policy` | overflow drops newest, preserves order |
 | 4 | `test_boundary_timer_at_ist_midnight` | seal fires at 00:00 IST exactly |
-| 5 | `test_muhurat_session_inclusion` | 17:30-18:30 IST seals ON Diwali Muhurat day |
+| 5 | _(deferred to Wave 7)_ | originally `test_muhurat_session_inclusion` — see Wave 7 backlog |
 | 6 | `test_rehydrate_before_ws_subscribe` | boot order race-free |
 | 7 | `test_rehydration_fail_closed_halt` | 3 retry exhaustion = HALT |
 | 8 | `test_buffer_gate_drains_in_order` | FIFO during gate-flip |
@@ -486,6 +520,7 @@ All wired into `crates/storage/tests/resilience_sla_alert_guard.rs` ratchet.
 | Bhavcopy triangulation (NSE+BSE 4-file fetch) | 1m fetch covers all primary needs; bhavcopy = nice-to-have 3rd source |
 | BSE_EQ if added to subscription universe | Currently not subscribed; fetcher already segment-agnostic |
 | NSE indices bhavcopy (`ind_close_all`) | Dhan WS code-6 already covers IDX_I prev_close + prev_OI |
+| **Muhurat session boundary inclusion (deferred from Sub-PR #1 L-C4)** | AWS auto-stop 17:30 IST hard-conflicts with Muhurat 17:30–18:30. Needs EventBridge override + Muhurat-aware `TradingCalendar` boundary code + ratchet test (originally Sub-PR #1 ratchet #5). Once-a-year event, low risk to defer. |
 
 ---
 
