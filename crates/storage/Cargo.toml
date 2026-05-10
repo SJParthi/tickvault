@@ -7,6 +7,13 @@ license.workspace = true
 
 [dependencies]
 tickvault-common = { path = "../common" }
+# Wave 6 Sub-PR #1 item 1.2c (2026-05-10): storage-side conversion
+# `From<&BufferedSeal> for SerializedSeal` needs the trading-side
+# `BufferedSeal` + `TfIndex` types. The dep edge `trading ← storage`
+# is architecturally allowed per CLAUDE.md "Dependency flow:
+# common ← core ← trading ← storage ← api ← app"; this is just
+# wiring it.
+tickvault-trading = { path = "../trading" }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
