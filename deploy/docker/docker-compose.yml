@@ -6,12 +6,18 @@
 #
 # Wave 7-A trim (2026-05-10) — see .claude/rules/project/aws-budget.md:
 #   QuestDB 2GB + Valkey 512MB + Prometheus 384MB + Grafana 768MB
-#   + App ~500MB + OS ~200MB = ~3.7GB total. ~4.3GB headroom on 8GB.
+#   + Alertmanager 256MB + App ~500MB + OS ~200MB = ~4.0GB total.
+#   ~4.0GB headroom on 8GB.
 #
 # REMOVED in Wave 7-A:
 #   - Traefik    -> AWS ALB free tier (HTTPS termination)
-#   - Alertmanager -> app /webhook/prometheus -> teloxide direct
 #   - valkey-exporter -> not queried; remove
+#
+# KEPT in Wave 7-A (operator decision 2026-05-10):
+#   - Alertmanager -> independent process safety. If app crashes during
+#     market hours, Alertmanager still routes Prometheus alerts to Telegram.
+#     Routing the webhook through the app itself is a single-point-of-failure
+#     anti-pattern (app dead = no alert). 256MB is cheap insurance.
 #
 # Already removed (pre-Wave-7-A):
 #   - Loki + Alloy + Jaeger -> saves ~2.5GB. Profile-gated for opt-in dev use.
@@ -209,17 +215,42 @@ services:
       - tv-network
 
   # ---------------------------------------------------------------------------
-  # Wave 7-A REMOVED: tv-alertmanager (prom/alertmanager)
-  # Replacement: Prometheus alerts route directly to the tickvault app's
-  #              /webhook/prometheus endpoint, which dispatches Telegram via
-  #              the in-process teloxide client. One less hop, one less
-  #              container, one less point of failure.
-  # Code change required (Wave 7-B follow-up):
-  #   - Add crates/api/src/handlers/prometheus_webhook.rs
-  #   - Wire /webhook/prometheus into crates/api/src/lib.rs
-  #   - Update prometheus.yml alerting.alertmanagers to point at
-  #     http://host.docker.internal:3001/webhook/prometheus
+  # Alertmanager — Alert Routing (Prometheus → Telegram)
+  # KEPT in Wave 7-A: operator decision 2026-05-10. Independent process is
+  # critical for "app crashed" alert routing. Routing the alert webhook through
+  # the app itself = single-point-of-failure (app dead = no alert).
+  # 256MB is cheap insurance.
+  # Pinned: prom/alertmanager:v0.32.0
   # ---------------------------------------------------------------------------
+  tv-alertmanager:
+    image: prom/alertmanager:v0.32.0@sha256:fe1f57b89ec7b94928746e61d9924cafd3674c688e3c7c3ad9600d8ef5da6cf9
+    container_name: tv-alertmanager
+    hostname: tv-alertmanager
+    restart: unless-stopped
+    mem_limit: 256m
+    cpus: 0.25
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "127.0.0.1:9093:9093"
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+      - "--storage.path=/alertmanager"
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9093/-/healthy || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - tv-network
 
   # ---------------------------------------------------------------------------
   # Loki + Alloy + Jaeger — REMOVED for memory budget. Saves ~2.5GB RAM.
