@@ -49,16 +49,11 @@ scrape_configs:
           service: "questdb"
     metrics_path: "/metrics"
 
-  # Traefik metrics (via dedicated metrics entrypoint)
-  - job_name: "tv-traefik"
-    static_configs:
-      - targets: ["tv-traefik:8082"]
-        labels:
-          service: "traefik"
-
-  # Loki REMOVED — saves RAM (per AWS budget). CloudWatch Logs replaces.
-  # Alloy REMOVED — log collector not needed without Loki.
-  # Jaeger REMOVED — distributed tracing disabled. CloudWatch Logs replaces.
+  # Wave 7-A removed (per .claude/rules/project/aws-budget.md):
+  #   tv-traefik         -> AWS ALB free tier replaces HTTPS termination
+  #   tv-valkey          -> valkey-exporter sidecar removed (not queried)
+  #   Loki / Alloy       -> CloudWatch Logs replaces log aggregation
+  #   Jaeger             -> CloudWatch Logs replaces distributed tracing
 
   # Grafana metrics
   - job_name: "tv-grafana"
@@ -66,12 +61,4 @@ scrape_configs:
       - targets: ["tv-grafana:3000"]
         labels:
           service: "grafana"
-    metrics_path: "/metrics"
-
-  # Valkey metrics (via redis_exporter sidecar on :9121)
-  - job_name: "tv-valkey"
-    static_configs:
-      - targets: ["tv-valkey-exporter:9121"]
-        labels:
-          service: "valkey"
     metrics_path: "/metrics"

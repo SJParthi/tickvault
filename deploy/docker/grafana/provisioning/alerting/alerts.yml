@@ -85,40 +85,10 @@ groups:
         labels:
           severity: critical
 
-      - uid: tv-high-error-rate
-        title: "High Traefik Error Rate"
-        condition: C
-        data:
-          - refId: A
-            relativeTimeRange: { from: 300, to: 0 }
-            datasourceUid: prometheus
-            model:
-              expr: "sum(rate(traefik_entrypoint_requests_total{code=~\"5..\"}[5m])) / sum(rate(traefik_entrypoint_requests_total[5m])) > 0.05"
-              intervalMs: 15000
-              maxDataPoints: 43200
-          - refId: B
-            relativeTimeRange: { from: 300, to: 0 }
-            datasourceUid: __expr__
-            model:
-              type: reduce
-              expression: A
-              reducer: last
-          - refId: C
-            relativeTimeRange: { from: 300, to: 0 }
-            datasourceUid: __expr__
-            model:
-              type: threshold
-              expression: B
-              conditions:
-                - evaluator: { type: gt, params: [0] }
-        noDataState: OK
-        execErrState: Alerting
-        for: 5m
-        annotations:
-          summary: "Traefik 5xx error rate above 5%"
-          description: "More than 5% of Traefik requests are returning 5xx errors over the last 5 minutes."
-        labels:
-          severity: warning
+      # Wave 7-A: tv-high-error-rate (Traefik 5xx) alert removed.
+      # Traefik was retired (replaced by AWS ALB free tier). The
+      # `traefik_entrypoint_requests_total` series no longer exists, so this
+      # alert was firing NoData -> OK silently but cluttered Grafana's UI.
 
   - orgId: 1
     name: tickvault
@@ -127,19 +97,21 @@ groups:
     rules:
       - uid: tickvault-down
         title: "Application Down"
-        # Boot sequence is ~37s (CryptoProvider → Config → SSM → JWT → DDL →
-        # universe build → WebSocket pool). Scrape interval is 15s. Old
-        # `for: 1m` + `noDataState: Alerting` fired during every cold start
-        # before the first successful scrape landed. 5 minutes is the smallest
-        # window that covers a clean boot + 1-2 missed scrapes without paging
-        # the operator on every restart.
+        # Wave 7-A market-hours gate: only page when app is down DURING
+        # IST 09:15-15:30 Mon-Fri. Off-hours / weekend / dev cycles must
+        # not trip this critical alert. Implemented inline via hour() +
+        # minute() + day_of_week() so it works without recording rules.
+        # IST 09:15 = UTC 03:45, IST 15:30 = UTC 10:00.
         condition: C
         data:
           - refId: A
             relativeTimeRange: { from: 300, to: 0 }
             datasourceUid: prometheus
             model:
-              expr: "up{job=\"tickvault\"} == 0"
+              expr: |
+                up{job="tickvault"} == 0
+                and on() (((hour() == 3 and minute() >= 45) or (hour() >= 4 and hour() < 10))
+                         and (day_of_week() >= 1 and day_of_week() <= 5))
               intervalMs: 15000
               maxDataPoints: 43200
           - refId: B
@@ -211,13 +183,16 @@ groups:
 
       - uid: tv-no-ticks
         title: "No Ticks Received"
+        # Wave 7-A: gate on tv_pipeline_active == 1 so this critical alert
+        # only fires when the app SAYS its pipeline is up but no ticks are
+        # flowing. Off-hours / app-not-running silently goes OK.
         condition: C
         data:
           - refId: A
             relativeTimeRange: { from: 300, to: 0 }
             datasourceUid: prometheus
             model:
-              expr: "rate(tv_ticks_processed_total[5m]) == 0"
+              expr: "rate(tv_ticks_processed_total[5m]) == 0 and tv_pipeline_active == 1"
               intervalMs: 15000
               maxDataPoints: 43200
           - refId: B
@@ -235,12 +210,12 @@ groups:
               expression: B
               conditions:
                 - evaluator: { type: lt, params: [1] }
-        noDataState: Alerting
+        noDataState: OK
         execErrState: Alerting
         for: 5m
         annotations:
           summary: "No ticks received for 5 minutes"
-          description: "Tick processing rate has been zero for 5+ minutes. Market data feed may be dead."
+          description: "Tick processing rate has been zero for 5+ minutes while pipeline is active."
         labels:
           severity: critical
 
@@ -351,13 +326,16 @@ groups:
 
       - uid: tv-websocket-disconnect
         title: "WebSocket Disconnected"
+        # Wave 7-A: gate on tv_pipeline_active == 1 — when the app is
+        # intentionally not running (off-hours, dev cycle), the metric
+        # is absent and we fall to noDataState=OK below.
         condition: C
         data:
           - refId: A
             relativeTimeRange: { from: 300, to: 0 }
             datasourceUid: prometheus
             model:
-              expr: "tv_websocket_connections_active == 0"
+              expr: "tv_websocket_connections_active == 0 and tv_pipeline_active == 1"
               intervalMs: 15000
               maxDataPoints: 43200
           - refId: B
@@ -375,77 +353,31 @@ groups:
               expression: B
               conditions:
                 - evaluator: { type: lt, params: [1] }
-        noDataState: NoData
+        noDataState: OK
         execErrState: Alerting
         for: 2m
         annotations:
           summary: "All WebSocket connections lost"
-          description: "No active WebSocket connections to Dhan feed for 2+ minutes. Market data is stale."
+          description: "No active WebSocket connections to Dhan feed for 2+ minutes while pipeline is active."
         labels:
           severity: critical
 
-  # -- Loki-based log alerts (GAP-1 fix: ERROR logs → Telegram) ---------------
-  - orgId: 1
-    name: tv-log-alerts
-    folder: tickvault
-    interval: 1m
-    rules:
-      - uid: tv-error-logs
-        title: "Application ERROR Logs Detected"
-        # Three changes vs the previous version:
-        #   1. Use Loki's parsed `level` label (`| json | level=~"ERROR|FATAL"`)
-        #      instead of a raw substring match on the JSON line. The old
-        #      `|~ "\"level\":\"(ERROR|FATAL)\""` regex was correct in spirit
-        #      but fragile against any future field whose value contains the
-        #      literal token `"level":"ERROR"` (e.g. a serialized error
-        #      object). Parsing the JSON makes the match unambiguous.
-        #   2. WARN-level retries (auth transient backoff, etc.) are NOT
-        #      matched — only true ERROR/FATAL.
-        #   3. `for: 3m` (was 1m, originally 0m). Rationale: the count window
-        #      is `[2m]`, so ERROR lines from a PRIOR (now-exited) tickvault
-        #      process age out of the count within 2 minutes. Requiring the
-        #      condition to hold for 3 consecutive minutes makes it
-        #      mechanically impossible for stale-from-prior-run logs to page
-        #      after a fresh boot. Genuine sustained errors still alert —
-        #      they just need to be present for 3 minutes (already implied
-        #      by "sustained" semantics). Operator-observed false positive
-        #      on 2026-04-26 20:28 IST: clean boot at 20:27:44, alert fired
-        #      at 20:28 from a prior run's residual ERROR lines still in the
-        #      2m Loki window. JSONL sink + summary_writer were both empty
-        #      for the live process — confirming this was a stale-window
-        #      artifact, not a real error.
-        condition: C
-        data:
-          - refId: A
-            relativeTimeRange: { from: 120, to: 0 }
-            datasourceUid: loki
-            model:
-              expr: "count_over_time({job=\"tv-docker\", container=\"tickvault\"} | json | level=~\"ERROR|FATAL\" [2m])"
-              intervalMs: 15000
-              maxDataPoints: 43200
-          - refId: B
-            relativeTimeRange: { from: 120, to: 0 }
-            datasourceUid: __expr__
-            model:
-              type: reduce
-              expression: A
-              reducer: last
-          - refId: C
-            relativeTimeRange: { from: 120, to: 0 }
-            datasourceUid: __expr__
-            model:
-              type: threshold
-              expression: B
-              conditions:
-                - evaluator: { type: gt, params: [0] }
-        noDataState: OK
-        execErrState: Alerting
-        for: 3m
-        annotations:
-          summary: "ERROR/FATAL logs detected in tickvault"
-          description: "Application produced ERROR or FATAL logs sustained for 3+ minutes (window: last 2 minutes). WARN-level transient retries are excluded. Stale logs from a prior process cannot trigger this alert — the count window is shorter than the for-duration. Check Grafana Logs dashboard for details."
-        labels:
-          severity: critical
+  # Wave 7-A: tv-log-alerts group (the Loki-sourced `tv-error-logs` rule)
+  # was removed with the rest of the Loki/Alloy stack. Because the alert
+  # query targets `datasourceUid: loki` and `execErrState: Alerting`, the
+  # Grafana evaluator was firing CRITICAL on every cycle once the Loki
+  # datasource went away — which is the "Application ERROR Logs Detected"
+  # Telegram alert seen in the original incident screenshots.
+  #
+  # Replacement signal:
+  # - `data/logs/errors.jsonl.YYYY-MM-DD-HH` continues to be the canonical
+  #   ERROR-level structured log stream (sink #4 in
+  #   `.claude/rules/project/observability-architecture.md`).
+  # - On AWS the journald collector ships these to CloudWatch Logs, where
+  #   a metric filter on `level=ERROR|FATAL` drives the same alert via
+  #   CloudWatch Alarms -> SNS -> Telegram.
+  # - Locally, `mcp__tickvault-logs__tail_errors` and `summary_snapshot`
+  #   surface the same data without needing a Loki container.
 
   # ----------------------------------------------------------------------
   # E2: Zero-tick-loss alert group

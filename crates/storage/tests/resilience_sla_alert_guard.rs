@@ -19,8 +19,14 @@
 //! - HighWebSocketReconnectRate — reconnect loop detection
 //! - WebSocketBackpressure — SPSC channel lagging → ticks queued
 //! - QuestDbDown — ILP writer unable to reach QuestDB
-//! - ValkeyDown — cache fallback active
 //! - HighValkeyErrorRate — cache errors exceed threshold
+//!
+//! Wave 7-A removed the ValkeyDown alert (per `.claude/rules/project/aws-budget.md`):
+//! the `valkey-exporter` sidecar that emitted `up{job="tv-valkey"}` was
+//! retired since no panel queried it. Container-level liveness is covered
+//! by the Docker healthcheck on `tv-valkey` which restarts the container
+//! if Valkey becomes unresponsive. Cache errors at the app level still
+//! page via `HighValkeyErrorRate` (`tv_valkey_errors_total`).
 //!
 //! Together these cover every layer of the three-tier resilience
 //! story — network -> WebSocket pool -> storage -> cache.
@@ -51,7 +57,8 @@ const REQUIRED_ALERT_NAMES: &[&str] = &[
     "HighWebSocketReconnectRate",
     "WebSocketBackpressure",
     "QuestDbDown",
-    "ValkeyDown",
+    // Wave 7-A: ValkeyDown removed — Docker healthcheck on tv-valkey
+    // covers container liveness; valkey-exporter sidecar was retired.
     "HighValkeyErrorRate",
     // Defense-in-depth auth + IP + collision alerts (added 2026-04-18
     // so these fire without needing the opt-in Loki profile)
@@ -116,18 +123,11 @@ fn questdb_down_alert_uses_correct_metric() {
     );
 }
 
-#[test]
-fn valkey_down_alert_uses_correct_metric() {
-    let text = load_alerts_yaml();
-    let start = text
-        .find("- alert: ValkeyDown")
-        .unwrap_or_else(|| panic!("ValkeyDown alert missing"));
-    let block: String = text[start..].chars().take(1200).collect();
-    assert!(
-        block.contains("up{") && (block.contains("valkey") || block.contains("tv-valkey")),
-        "ValkeyDown rule must reference the valkey up metric"
-    );
-}
+// Wave 7-A: valkey_down_alert_uses_correct_metric test removed.
+// The ValkeyDown alert was retired together with the valkey-exporter
+// sidecar (see crate-doc comment above). The retained HighValkeyErrorRate
+// alert reads the app-emitted `tv_valkey_errors_total` metric directly,
+// so no scrape-target up{} expression is needed for cache health.
 
 #[test]
 fn every_resilience_alert_has_severity_label() {

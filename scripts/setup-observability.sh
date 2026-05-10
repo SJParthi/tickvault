@@ -18,11 +18,12 @@
 #   11. Validate Grafana dashboards are loaded
 #   12. Validate Grafana alert rules are provisioned
 #   13. Validate Prometheus recording + alert rules loaded
-#   14. Validate Traefik routes are configured
-#   15. Validate Jaeger OTLP endpoints are accepting traces
-#   16. Validate Loki is accepting logs via Alloy
-#   17. Print full status report
-#   18. Auto-open all dashboards in browser
+#   14. Print full status report
+#   15. Auto-open all dashboards in browser
+#
+# Wave 7-A: Traefik, Loki, Alloy, Jaeger, valkey-exporter were REMOVED to
+# fit the 8GB c7i.xlarge AWS budget. AWS ALB (free tier) replaces Traefik
+# for HTTPS termination; CloudWatch Logs replaces Loki/Jaeger.
 #
 # Usage:
 #   ./scripts/setup-observability.sh              # full setup + open browser
@@ -290,9 +291,9 @@ else
         docker compose -f "${COMPOSE_FILE}" ps --all 2>&1 || true
         echo ""
         info "Recent container logs (last 30 lines per failed service):"
-        # Loki, Alloy, Jaeger removed per aws-budget.md (saves 2.5GB RAM).
+        # Wave 7-A removed: Traefik, valkey-exporter, Loki, Alloy, Jaeger.
         # Keep in sync with docker-compose.yml services.
-        for svc in tv-questdb tv-valkey tv-valkey-exporter tv-prometheus tv-alertmanager tv-grafana tv-traefik; do
+        for svc in tv-questdb tv-valkey tv-prometheus tv-alertmanager tv-grafana; do
             STATUS=$(docker inspect --format='{{.State.Status}}' "$svc" 2>/dev/null || echo "not_found")
             if [ "$STATUS" != "running" ]; then
                 echo -e "  ${RED}--- ${svc} (${STATUS}) ---${NC}"
@@ -322,8 +323,7 @@ wait_for_http "QuestDB"         "http://localhost:9000/exec?query=SELECT%201" 12
 wait_for_http "Prometheus"      "http://localhost:9090/-/healthy"    30 || HEALTH_FAIL=$((HEALTH_FAIL + 1))
 wait_for_http "Grafana"         "http://localhost:3000/api/health"  45 || HEALTH_FAIL=$((HEALTH_FAIL + 1))
 wait_for_http "Alertmanager"    "http://localhost:9093/-/healthy"    30 || HEALTH_FAIL=$((HEALTH_FAIL + 1))
-wait_for_http "Traefik"         "http://localhost:8080/api/rawdata" 20 || HEALTH_FAIL=$((HEALTH_FAIL + 1))
-wait_for_http "Traefik Metrics" "http://localhost:8082/metrics"     20 || HEALTH_FAIL=$((HEALTH_FAIL + 1))
+# Wave 7-A: Traefik removed (AWS ALB free tier replaces). No more health-wait here.
 
 if [ "$HEALTH_FAIL" -gt 0 ]; then
     warn "$HEALTH_FAIL services slow to start (may still be initializing)"
@@ -361,8 +361,8 @@ DS_JSON=$(curl -sf --max-time 5 "http://localhost:3000/api/datasources" \
     -H "Authorization: Basic ${GRAFANA_AUTH}" 2>/dev/null || echo "")
 if [ -n "$DS_JSON" ] && [ "$DS_JSON" != "[]" ]; then
     DS_COUNT=$(echo "$DS_JSON" | { grep -o '"name"' || true; } | wc -l | tr -d ' ')
-    # Check each expected datasource
-    for ds in Prometheus Loki Jaeger QuestDB; do
+    # Check each expected datasource (Loki + Jaeger removed in Wave 7-A)
+    for ds in Prometheus QuestDB; do
         if echo "$DS_JSON" | grep -q "\"name\":\"${ds}\""; then
             info "  ${ds}: provisioned"
         else
@@ -380,8 +380,8 @@ DASH_JSON=$(curl -sf --max-time 5 "http://localhost:3000/api/search?type=dash-db
     -H "Authorization: Basic ${GRAFANA_AUTH}" 2>/dev/null || echo "")
 if [ -n "$DASH_JSON" ] && [ "$DASH_JSON" != "[]" ]; then
     DASH_COUNT=$(echo "$DASH_JSON" | { grep -o '"uid"' || true; } | wc -l | tr -d ' ')
-    # Check for expected dashboards by UID
-    for uid in tv-system-overview tv-traefik tv-logs; do
+    # Check for expected dashboards by UID (tv-traefik dashboard retired in Wave 7-A)
+    for uid in tv-system-overview tv-logs; do
         DASH_TITLE=$(echo "$DASH_JSON" | { grep -o "\"uid\":\"${uid}\"[^}]*\"title\":\"[^\"]*\"" || true; } | { grep -o '"title":"[^"]*"' || true; } | head -1)
         if [ -n "$DASH_TITLE" ]; then
             info "  ${uid}: loaded"
@@ -466,70 +466,15 @@ else
     warn "Could not query Prometheus rules API"
 fi
 
-# ---- Step 15: Traefik routes ----
-step "Validating Traefik dynamic routes"
-TRAEFIK_ROUTERS=$(curl -sf --max-time 5 "http://localhost:8080/api/http/routers" 2>/dev/null || echo "")
-if [ -n "$TRAEFIK_ROUTERS" ]; then
-    ROUTER_COUNT=$(echo "$TRAEFIK_ROUTERS" | { grep -o '"name"' || true; } | wc -l | tr -d ' ')
-    info "HTTP routers: ${ROUTER_COUNT}"
-    # Check for expected routes
-    for route in grafana prometheus questdb; do
-        if echo "$TRAEFIK_ROUTERS" | grep -qi "$route"; then
-            info "  /${route}: routed"
-        else
-            warn "  /${route}: not found"
-        fi
-    done
-    ok "Dynamic routing configured"
-else
-    warn "Could not query Traefik API"
-fi
-
-# ---- Step 16: Jaeger OTLP ----
-step "Validating Jaeger OTLP endpoints"
-# Check OTLP HTTP endpoint
-OTLP_HTTP_OK=false
-if curl -sf --max-time 3 -X POST "http://localhost:4318/v1/traces" \
-    -H "Content-Type: application/json" \
-    -d '{"resourceSpans":[]}' > /dev/null 2>&1; then
-    OTLP_HTTP_OK=true
-    info "OTLP HTTP (:4318): accepting traces"
-else
-    # Some Jaeger versions return 400 for empty payload but that means it's listening
-    HTTP_CODE=$(curl -sf --max-time 3 -o /dev/null -w "%{http_code}" -X POST "http://localhost:4318/v1/traces" \
-        -H "Content-Type: application/json" \
-        -d '{"resourceSpans":[]}' 2>/dev/null || echo "000")
-    if [ "$HTTP_CODE" != "000" ]; then
-        OTLP_HTTP_OK=true
-        info "OTLP HTTP (:4318): listening (HTTP ${HTTP_CODE})"
-    else
-        warn "OTLP HTTP (:4318): not reachable"
-    fi
-fi
-
-# Check OTLP gRPC port is open
-if timeout 3 bash -c 'cat < /dev/null > /dev/tcp/localhost/4317' 2>/dev/null; then
-    info "OTLP gRPC (:4317): port open"
-    ok "Jaeger OTLP endpoints ready"
-else
-    if [ "$OTLP_HTTP_OK" = true ]; then
-        ok "Jaeger OTLP HTTP ready (gRPC may need a moment)"
-    else
-        warn "Jaeger OTLP endpoints not yet reachable"
-    fi
-fi
-
-# ---- Step 17: Log pipeline (Loki + Alloy removed per aws-budget.md) ----
-# Loki and Alloy were removed to save 2.5GB RAM on the c7i.xlarge budget.
-# Logs are now read directly via `docker logs tickvault --tail 100 -f`
-# locally, and via CloudWatch journald collection on AWS (see
-# user-data.sh.tftpl). This step is intentionally a no-op — kept so
-# step numbering matches prior runbook references.
+# ---- Wave 7-A removed steps (Traefik routes, Jaeger OTLP, Loki/Alloy log pipeline) ----
+# Traefik         -> AWS ALB free tier replaces HTTPS termination
+# Jaeger          -> CloudWatch Logs replaces distributed tracing
+# Loki + Alloy    -> `docker logs tickvault` locally; CloudWatch journald on AWS
 step "Log pipeline (Loki + Alloy removed — see aws-budget.md)"
 info "Local: docker logs tickvault --tail 100 -f"
 info "AWS:   CloudWatch Logs /tickvault/<env>/system via journald"
 
-# ---- Step 18: Summary + auto-open ----
+# ---- Final report ----
 step "Final report"
 
 echo ""
@@ -541,13 +486,7 @@ echo -e "  ${BOLD}Service URLs:${NC}"
 echo -e "    ${CYAN}Grafana${NC}         http://localhost:3000"
 echo -e "    ${CYAN}Prometheus${NC}      http://localhost:9090"
 echo -e "    ${CYAN}Alertmanager${NC}    http://localhost:9093"
-echo -e "    ${CYAN}Traefik${NC}         http://localhost:8080"
 echo -e "    ${CYAN}QuestDB${NC}         http://localhost:9000"
-echo ""
-echo -e "  ${BOLD}Traefik Unified Routes:${NC}"
-echo -e "    ${CYAN}All Services${NC}    http://localhost/grafana"
-echo -e "                    http://localhost/prometheus"
-echo -e "                    http://localhost/questdb"
 echo ""
 echo -e "  ${BOLD}Grafana Credentials:${NC}"
 echo -e "    User: ${TV_GRAFANA_ADMIN_USER}"
@@ -561,10 +500,8 @@ if [ "$OPEN_BROWSER" = true ] && [ "$FAIL" -eq 0 ]; then
     sleep 0.5
     open_url "http://localhost:9090/targets"
     sleep 0.5
-    open_url "http://localhost:8080"
-    sleep 0.5
     open_url "http://localhost:9000"
-    echo -e "  ${GREEN}Opened: Grafana, Prometheus, Traefik, QuestDB${NC}"
+    echo -e "  ${GREEN}Opened: Grafana, Prometheus, QuestDB${NC}"
 fi
 
 echo ""

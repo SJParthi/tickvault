@@ -77,7 +77,8 @@ print_section "docker stack"
 if ! command -v docker >/dev/null 2>&1; then
     printf "[SKIP] %-14s docker CLI not installed\n" "docker"
 else
-    for service in tv-questdb tv-valkey tv-prometheus tv-grafana tv-traefik tv-alertmanager tv-valkey-exporter; do
+    # Wave 7-A: tv-traefik + tv-valkey-exporter removed (see .claude/rules/project/aws-budget.md).
+    for service in tv-questdb tv-valkey tv-prometheus tv-grafana tv-alertmanager; do
         run_check "docker" "$service running" \
             bash -c "docker compose -f deploy/docker/docker-compose.yml ps --services --filter status=running | grep -q '^${service}$'"
     done
