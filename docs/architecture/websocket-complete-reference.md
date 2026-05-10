@@ -265,17 +265,22 @@ liveness check (along with Dhan's server-side 40s pong timeout).
 - No multi-hour sleep — connections simply stop after retry cap
 - Market-hours sleep was removed (2026-04-09); retry cap added (2026-04-16)
 
-### 4.10 Boot-Time ATM Selection
+### 4.10 Dynamic Top-N Volume Cohort (live default since 2026-05-09)
 
-At boot, depth connections WAIT up to 30s for the first index LTP from the
-main Live Market Feed WebSocket. The spot price is captured in `SharedSpotPrices`
-(RwLock HashMap) by a tick broadcast subscriber. Once available:
-1. `select_depth_instruments()` finds nearest expiry ≥ today
-2. Binary search on sorted option chain finds ATM strike closest to spot
-3. 20-level: ATM ± 24 strikes = 49 instruments per underlying
-4. 200-level: ATM CE + ATM PE (1 instrument per connection)
+Depth subscriptions are owned by `depth_dynamic_pipeline_v2`. Both pools
+spawn at boot in DEFERRED mode (no initial subscribe). Every 60s the
+unified diff dispatcher reads the top-N volume cohort from the
+`movers_1m` materialised view and emits Add/Remove diff frames:
 
-See `.claude/rules/project/depth-subscription.md` for full ATM selection rules.
+- **Depth-20:** 5 conns × 50 SIDs/conn = 250 SIDs (top-N of cohort)
+- **Depth-200:** 5 conns × 1 SID/conn = 5 SIDs (top 5 of cohort)
+
+The legacy boot-time ATM-selection path (waited up to 30s for index
+LTPs, then computed ATM ± 24 strikes per underlying) was retired with
+PRs #544/#545/#546. Boot-time ATM/anchor logic is GONE — depth is
+volume-cohort-only. See `.claude/rules/project/depth-subscription.md`
+for the full subscription rules and DEPTH-20-DYN-03 / DEPTH-200-DYN-01
+runbooks for empty-cohort handling.
 
 ---
 

@@ -67,17 +67,3 @@ fn test_depth_20_dispatcher_wired_at_0913() {
          FINNIFTY / MIDCPNIFTY stay idle forever."
     );
 }
-
-// -----------------------------------------------------------------------
-// Plan ratchet: `test_three_dispatches_use_single_snapshot`
-//
-// Proves the three dispatches all read from the SAME preopen buffer +
-// spot-prices sources rather than taking independent reads that could
-// drift. The 09:13 dispatcher task reads the buffer exactly once via
-// `preopen_price_buffer::snapshot(&anchor_buffer).await`, then builds
-// `selections = select_depth_instruments(..., &spot_map, ...)` a single
-// time and iterates the result to fire BOTH `InitialSubscribe20` and
-// `InitialSubscribe200`. Phase 2 main-feed reads from the same
-// immutable buffer (the window closes at 09:12 IST — see Fix #1 for
-// the widened 09:00-09:12 window). No drift possible.
-// -----------------------------------------------------------------------

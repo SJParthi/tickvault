@@ -398,25 +398,6 @@ pub enum NotificationEvent {
         token_remaining_secs: u64,
     },
 
-    /// Plan item C (2026-04-22, visibility version): once-per-day audit
-    /// trail of what NIFTY + BANKNIFTY 09:12 closes were used as the
-    /// authoritative anchor for the day's depth ATM. The 60s depth
-    /// rebalancer is what actually keeps depth subscribed to the right
-    /// strikes during the session — this Telegram is for operator
-    /// visibility into "what 09:12 close grounded today's depth" so
-    /// drift complaints can be cross-checked against a known anchor.
-    /// Severity = Info (no wake-ups).
-    MarketOpenDepthAnchor {
-        /// "NIFTY" or "BANKNIFTY"
-        underlying: String,
-        /// 09:12 close from the preopen buffer (or backtracked 09:11/10/09/08).
-        close_0912: Option<f64>,
-        /// Strike price of the ATM contract derived from `close_0912`.
-        atm_strike: Option<f64>,
-        /// Source minute: 4 = 09:12, 3 = 09:11, ..., 0 = 09:08, None = no data.
-        source_minute_slot: Option<usize>,
-    },
-
     /// Option C (2026-04-17): Depth setup dropped a specific underlying —
     /// the grace window expired without a valid spot price OR the option
     /// chain was missing. Complements `DepthIndexLtpTimeout` which fires
@@ -1667,33 +1648,6 @@ impl NotificationEvent {
                      Bell rings in 60s."
                 )
             }
-            Self::MarketOpenDepthAnchor {
-                underlying,
-                close_0912,
-                atm_strike,
-                source_minute_slot,
-            } => {
-                let close_str = close_0912
-                    .map(|p| format!("{p:.2}"))
-                    .unwrap_or_else(|| "N/A".to_string());
-                let atm_str = atm_strike
-                    .map(|s| format!("{s:.2}"))
-                    .unwrap_or_else(|| "N/A".to_string());
-                let source_str = match source_minute_slot {
-                    Some(4) => "09:12 close",
-                    Some(3) => "09:11 close (backtrack)",
-                    Some(2) => "09:10 close (backtrack)",
-                    Some(1) => "09:09 close (backtrack)",
-                    Some(0) => "09:08 close (backtrack)",
-                    _ => "no preopen tick",
-                };
-                format!(
-                    "<b>Depth anchor: {underlying} @ 09:13 IST</b>\n\
-                     Close: {close_str}\n\
-                     ATM strike: {atm_str}\n\
-                     Source: {source_str}"
-                )
-            }
             Self::DepthIndexLtpTimeout { waited_secs } => {
                 format!(
                     "<b>Depth ATM timeout</b>\nWaited {waited_secs}s for index LTPs \
@@ -2513,7 +2467,6 @@ impl NotificationEvent {
             Self::MarketOpenStreamingConfirmation { .. } => "MarketOpenStreamingConfirmation",
             Self::MarketOpenStreamingFailed { .. } => "MarketOpenStreamingFailed",
             Self::MarketOpenReadinessConfirmation { .. } => "MarketOpenReadinessConfirmation",
-            Self::MarketOpenDepthAnchor { .. } => "MarketOpenDepthAnchor",
             Self::DepthUnderlyingMissing { .. } => "DepthUnderlyingMissing",
             Self::DepthSpotPriceStale { .. } => "DepthSpotPriceStale",
             Self::Phase2Started { .. } => "Phase2Started",
@@ -2662,7 +2615,6 @@ impl NotificationEvent {
             Self::MarketOpenStreamingConfirmation { .. } => Severity::Info,
             Self::MarketOpenStreamingFailed { .. } => Severity::High,
             Self::MarketOpenReadinessConfirmation { .. } => Severity::Info,
-            Self::MarketOpenDepthAnchor { .. } => Severity::Info,
             Self::SelfTestPassed { .. } => Severity::Info,
             Self::SelfTestDegraded { .. } => Severity::High,
             Self::RealtimeGuaranteeHealthy { .. } => Severity::Info,

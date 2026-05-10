@@ -4952,29 +4952,17 @@ async fn main() -> Result<()> {
             // Audit-findings Rule 3: market-hours-aware. Trading-day check
             // + skip if past 09:13.
             //
-            // PR-C2 cutover follow-up (2026-05-10, queued from PR #544): under
-            // `depth_dynamic_pipeline_v2 = true` (the live default), the depth
-            // pools are owned end-to-end by `spawn_depth_dynamic_pool` —
-            // `anchor_cmd_senders` (HashMap<String, _>) is empty because v2
-            // uses HashMap<u8, _>, and `anchor_single_side_enabled` already
-            // short-circuits the per-symbol dispatch to a no-op. Spawning the
-            // task at all under v2 still computes ATM via
-            // `select_depth_instruments`, emits the once-per-day
-            // MarketOpenDepthAnchor Telegram, and then drops the result on the
-            // floor. Skipping the task entirely under v2 removes the dead
-            // computation + retires the last call site of
-            // `select_depth_instruments` from the live boot path. The
-            // historical anchor visibility is replaced by the dynamic pool's
-            // own boot logs (`PR-C2 cutover: depth_dynamic_pipeline_v2 spawn
-            // complete`). Operator confirmed via AskUserQuestion 2026-05-10.
+            // 09:13 IST anchor task RETIRED — depth_dynamic_pipeline_v2 owns
+            // depth-20 + depth-200 dispatch via the unified diff dispatcher
+            // (top-N volume cohort over movers_1m, refreshed every 60s with
+            // diff-only Add/Remove). Anchor visibility comes from the dynamic
+            // pool's own boot logs (`PR-C2 cutover: depth_dynamic_pipeline_v2
+            // spawn complete`).
             info!(
                 "09:13 IST anchor task RETIRED — depth_dynamic_pipeline_v2 \
                  owns depth-20 + depth-200 dispatch via the unified diff \
                  dispatcher (top-N volume cohort over movers_1m, refreshed \
-                 every 60s with diff-only Add/Remove). Legacy per-underlying \
-                 anchor (which would have called select_depth_instruments + \
-                 emitted MarketOpenDepthAnchor) was retired with the legacy \
-                 v2-off arms in the volume-cohort-only refactor."
+                 every 60s with diff-only Add/Remove)."
             );
 
             // L1: Listen for rebalance events → Telegram alert + send swap commands (zero disconnect).
