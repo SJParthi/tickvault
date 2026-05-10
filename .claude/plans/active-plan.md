@@ -1,9 +1,54 @@
 # Implementation Plan: Delete legacy v2-off depth path + retire `select_depth_instruments`
 
-**Status:** DRAFT — awaiting approval
+**Status:** VERIFIED — all deletions implemented + scoped tests green (2026-05-10 ~06:17 IST)
 **Date:** 2026-05-10
-**Approved by:** _pending_
-**Branch:** `claude/<TBD>` (will branch off main after approval)
+**Approved by:** Parthiban — "go ahead and fix and implement everything dude" (2026-05-10 05:36 IST). Agent's "missing functionality" findings reframed as "obsolete functionality" per operator directive: "now only topn volume and resubscribe shoudl be implemented".
+**Branch:** `claude/plan-delete-legacy-v2-off-7tA9q` (single big-bang PR, not 3 sub-PRs — operator override)
+
+## Reframing — what looked like blockers are actually obsolete
+
+| Agent flagged as missing in v2 | Operator's v2-only architecture says | Action |
+|---|---|---|
+| `run_depth_rebalancer` (60s ATM-drift) | Obsolete — depth is volume-cohort, not ATM-based | Delete |
+| `depth_rebalance_audit` row writes | Obsolete — replaced by `depth_dynamic_diff_audit` (v2 already writes there at line 907) | Delete legacy writer (table itself untouched — drop is a separate migration) |
+| `MarketOpenDepthAnchor` Telegram | Obsolete — no ATM anchor under volume cohort | Delete |
+| 6 source-scan ratchets pinning legacy literals | Stale — pin a retired architecture | Retire atomically with the literals |
+| `select_depth_instruments` + tests + bench | Obsolete | Delete |
+| `select_single_side_contracts` | Used only by deleted listener | Delete |
+
+## Scope of this PR
+
+| File | Change |
+|---|---|
+| `crates/app/src/main.rs` | Delete `} else if let Some(ref _plan) = subscription_plan { ... }` arm (lines 3878-5076 of original main, ~1199 lines: includes legacy ATM-wait + spawn loops + rebalancer spawn + AUDIT-02 writer + listener) |
+| `crates/app/src/main.rs` | Replace `if !config.features.depth_dynamic_pipeline_v2 { /* 09:13 anchor task */ } else { info! }` with just the `info!` (anchor task obsolete) |
+| `crates/core/src/instrument/depth_strike_selector.rs` | Delete `select_depth_instruments` function + its unit tests (KEEP module + sibling helpers `DEPTH_ATM_STRIKES_EACH_SIDE`, `DepthStrikeSelection`, `select_atm_strikes`, `select_single_side_contracts` — used by `depth_20_single_side_planner.rs`) |
+| `crates/core/benches/phase2_dispatch.rs` | Delete entire benchmark (sole non-legacy user of `select_depth_instruments`) |
+| `crates/core/tests/session_2026_04_22_regression_guard.rs` | Delete `guard_depth_anchor_task_exists_in_main` test (legacy ratchet) |
+| `crates/app/tests/no_boot_depth_subscribe_guard.rs` | Delete 4 tests source-scanning legacy literals |
+| `crates/app/tests/initial_depth_dispatch_guard.rs` | Delete 2 tests source-scanning legacy literals |
+| `quality/benchmark-budgets.toml` | Remove matching budget entry if present |
+| `.claude/hooks/.test-count-baseline` | Decrement (one-time after final test count |
+
+## Out of scope (deferred plans)
+
+- `candles_1s` removal + ticks-direct architecture (operator: "everything should be calculated from ticks itself") — MASSIVE refactor touching Greeks/Cross-match/Movers/Indicators; separate plan
+- Flag deletion (`depth_dynamic_pipeline_v2` field removal + `feature_flag_rollback_guard.rs` update) — sub-PR 3 territory; left for a future small PR
+- `bhavcopy_pipeline.rs` migration — operator hold
+
+## Verification
+
+- `cargo check -p tickvault-app -p tickvault-core` — must pass
+- `cargo test -p tickvault-app --lib` + `--tests` — must pass
+- `cargo test -p tickvault-core --lib` + `--tests` — must pass
+- `bash .claude/hooks/plan-verify.sh` — must pass
+- Workspace sweep deferred to CI
+
+## Honest 100% claim qualifier
+
+100% inside the tested envelope: under v2 (the live default since 2026-05-09), the deleted paths were never executed. Behaviour change relative to live: zero. The flag still exists for emergency rollback semantics — but `flag = false` is now a documented no-op since the legacy boot path is gone (will be cleaned up in a future flag-deletion sub-PR). Beyond the envelope: if v2 develops a latent issue, rollback = `git revert` of this PR (restores legacy code in one commit). The legacy `depth_rebalance_audit` table stays alive but receives no writes; SEBI 5y retention is preserved by the existing rows + the active `depth_dynamic_diff_audit` table.
+
+
 
 ## Context
 

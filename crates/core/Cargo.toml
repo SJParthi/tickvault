@@ -74,10 +74,6 @@ name = "ws_reader_frame_handle"
 harness = false
 
 [[bench]]
-name = "phase2_dispatch"
-harness = false
-
-[[bench]]
 name = "prev_close_writer"
 harness = false
 

@@ -58,18 +58,11 @@ fn test_market_open_heartbeat_skip_is_debug_not_info() {
     );
 }
 
-#[test]
-fn test_depth_anchor_skip_is_debug_not_info() {
-    let src = read_file("crates/app/src/main.rs");
-    assert!(
-        !src.contains("info!(\n                            now = %now_time,\n                            \"depth-anchor: skipping (past 09:13:00"),
-        "2026-04-24 regression: depth-anchor skip log re-promoted to INFO. Should be DEBUG on mid-session boot."
-    );
-    assert!(
-        src.contains("depth-anchor: skipping (past 09:13:00 — expected on mid-session boot)"),
-        "2026-04-24 regression: depth-anchor skip message missing or rewritten."
-    );
-}
+// `test_depth_anchor_skip_is_debug_not_info` retired with the legacy
+// 09:13 anchor task in the v2-only refactor (PR <TBD>). The pinned
+// literal "depth-anchor: skipping (past 09:13:00..." lived inside
+// the deleted anchor task body; under v2 the anchor is structurally
+// absent so the skip log no longer exists.
 
 #[test]
 fn test_depth_rebalancer_market_hours_gate_present() {
@@ -157,22 +150,14 @@ fn test_instrument_build_success_event_is_emitted_on_both_boot_paths() {
     );
 }
 
-#[test]
-fn test_depth_200_main_rs_increments_spawn_counter() {
-    let src = read_file("crates/app/src/main.rs");
-    assert!(
-        src.contains("depth_200_spawn_index"),
-        "2026-04-24 regression: depth_200_spawn_index counter missing. \
-         Without it every 200-depth spawn would receive stagger=0 and the \
-         concurrent-auth reset storm would return."
-    );
-    assert!(
-        src.contains("DEPTH_200_INITIAL_STAGGER_MS"),
-        "2026-04-24 regression: DEPTH_200_INITIAL_STAGGER_MS not referenced \
-         from the spawn site. Check that the stagger_ms value is passed to \
-         run_two_hundred_depth_connection."
-    );
-}
+// `test_depth_200_main_rs_increments_spawn_counter` retired with the
+// legacy spawn loop in the v2-only refactor (PR <TBD>). The literal
+// `depth_200_spawn_index` lived inside the deleted legacy `else if`
+// arm. Under v2 the depth-200 spawn is owned by `depth_dynamic_pipeline_v2.rs`
+// which uses its own staggering scheme (see `200-level depth: staggering
+// initial connect to avoid concurrent-auth reset` log + the
+// `DEPTH_200_INITIAL_STAGGER_MS` constant referenced from the v2
+// spawn block at main.rs:3166 / :3389).
 
 #[test]
 fn test_per_instrument_stall_poller_is_wired() {
