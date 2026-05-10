@@ -155,6 +155,25 @@ impl SealAbsorptionPipeline {
         }
     }
 
+    /// Rescue path for a seal that left the ring (was popped by the
+    /// writer task) but FAILED to flush via ILP. Walks the SAME
+    /// tier-2 → tier-3 cascade as ring overflow, BYPASSING the ring
+    /// (the seal was already drained from there).
+    ///
+    /// Used by the future writer task slice (item 1.2f.3+) when
+    /// `ShadowCandleWriter::flush()` returns `Err`. The popped seals
+    /// have already left the ring so we do NOT want to re-buffer them
+    /// (would invert FIFO order); instead we walk straight to disk
+    /// spill, escalating to DLQ then `Dropped` if the lower tiers
+    /// also fail.
+    ///
+    /// Returns the same [`SubmitOutcome`] enum as [`Self::submit`] —
+    /// `Buffered` is impossible (we skip the ring), so the caller
+    /// will only ever observe `Spilled` / `DlqWritten` / `Dropped`.
+    pub fn rescue_in_flight(&self, seal: BufferedSeal, now_unix_secs: i64) -> SubmitOutcome {
+        self.escalate_evicted(seal, now_unix_secs)
+    }
+
     /// Tier 2 + tier 3 escalation chain for an evicted seal.
     fn escalate_evicted(&self, evicted: BufferedSeal, now_unix_secs: i64) -> SubmitOutcome {
         let serialised = SerializedSeal::from(&evicted);
