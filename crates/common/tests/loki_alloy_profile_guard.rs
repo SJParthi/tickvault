@@ -168,24 +168,22 @@ fn loki_ruler_points_at_alertmanager() {
 }
 
 #[test]
-fn compose_preserves_eight_default_services() {
-    // The original stack had 7 services (after Loki+Alloy removal).
-    // Our profile-gated re-add MUST keep the default profile count at 7
-    // — if it jumps to 9, someone forgot `profiles:` on the new services.
-    //
-    // We count occurrences of container_name: tv-* that are NOT on
-    // a service with profiles: set. Heuristic: after each `tv-*:`
-    // service line, scan ~30 lines for `profiles:`. If missing, the
-    // service starts with the default profile.
+fn compose_preserves_five_default_services() {
+    // Wave 7-A trim (per `.claude/rules/project/aws-budget.md`):
+    // the default profile MUST contain exactly 5 services after the
+    // Traefik + valkey-exporter removal:
+    //   tv-questdb, tv-valkey, tv-prometheus, tv-alertmanager, tv-grafana.
+    // Loki + Alloy + Jaeger remain profile-gated for opt-in dev use.
+    // If this list changes, also update REQUIRED_CONTAINERS in
+    // scripts/ensure-ready.sh and the per-service health-wait list in
+    // scripts/setup-observability.sh.
     let src = load_text(COMPOSE);
     let default_profile_services: Vec<&str> = [
         "tv-questdb:",
         "tv-valkey:",
-        "tv-valkey-exporter:",
         "tv-prometheus:",
         "tv-alertmanager:",
         "tv-grafana:",
-        "tv-traefik:",
     ]
     .iter()
     .filter(|s| src.contains(*s))
@@ -193,8 +191,8 @@ fn compose_preserves_eight_default_services() {
     .collect();
     assert_eq!(
         default_profile_services.len(),
-        7,
-        "Expected exactly 7 default-profile services, found {:?}",
+        5,
+        "Expected exactly 5 default-profile services, found {:?}",
         default_profile_services
     );
 }

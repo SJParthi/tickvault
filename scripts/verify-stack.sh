@@ -80,11 +80,10 @@ echo -e "${CYAN}[1/5]${NC} Container Status"
 check_container "tv-questdb"
 check_container "tv-valkey"
 check_container "tv-prometheus"
-check_container "tv-loki"
-check_container "tv-alloy"
-check_container "tv-jaeger"
+check_container "tv-alertmanager"
 check_container "tv-grafana"
-check_container "tv-traefik"
+# Wave 7-A removed: tv-traefik / tv-loki / tv-alloy / tv-jaeger / tv-valkey-exporter
+# (see .claude/rules/project/aws-budget.md).
 echo ""
 
 # --- HTTP Health Checks ------------------------------------------------------
@@ -92,7 +91,7 @@ echo -e "${CYAN}[2/5]${NC} HTTP Health Checks"
 check_http "QuestDB" "http://localhost:9000"
 check_http "Prometheus" "http://localhost:9090/-/healthy"
 check_http "Grafana" "http://localhost:3000/api/health"
-check_http "Jaeger UI" "http://localhost:16686"
+check_http "Alertmanager" "http://localhost:9093/-/healthy"
 check_http "Traefik Dashboard" "http://localhost:8080/api/rawdata"
 check_http "Traefik Metrics" "http://localhost:8082/metrics"
 check_http "Alloy UI" "http://localhost:12345" "false"
