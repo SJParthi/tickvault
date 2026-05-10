@@ -75,11 +75,10 @@ REQUIRED_CONTAINERS=(
     "tv-questdb"
     "tv-valkey"
     "tv-prometheus"
+    "tv-alertmanager"
     "tv-grafana"
-    "tv-loki"
-    "tv-alloy"
-    "tv-jaeger"
-    "tv-traefik"
+    # Wave 7-A removed: tv-traefik (AWS ALB free tier), tv-valkey-exporter
+    # (not queried), tv-loki + tv-alloy + tv-jaeger (CloudWatch Logs).
 )
 
 MAX_WAIT=90

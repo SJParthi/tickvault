@@ -22,11 +22,7 @@ groups:
       - record: dlt:tick_latency_p99:1m
         expr: histogram_quantile(0.99, rate(tv_tick_processing_duration_ns_bucket[1m]))
 
-      - record: dlt:traefik_request_rate:5m
-        expr: sum(rate(traefik_entrypoint_requests_total[5m])) by (entrypoint)
-
-      - record: dlt:traefik_error_rate:5m
-        expr: sum(rate(traefik_entrypoint_requests_total{code=~"5.."}[5m])) by (entrypoint)
+      # Wave 7-A: Traefik recording rules removed (Traefik replaced by AWS ALB).
 
   # -- Zero-touch dashboard recording rules ----------------------------------
   # Pre-aggregate the expensive queries that the 5 Grafana dashboards use.
@@ -102,14 +98,7 @@ groups:
           summary: "Prometheus TSDB compaction failures"
           description: "Prometheus has had {{ $value }} compaction failures in the last hour."
 
-      - alert: LokiHighIngestionRate
-        expr: rate(loki_distributor_bytes_received_total[5m]) > 10485760
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Loki ingestion rate > 10MB/s"
-          description: "Loki is ingesting {{ $value | humanize1024 }}B/s, which may cause ingestion limits to be hit."
+      # Wave 7-A: LokiHighIngestionRate alert removed (Loki replaced by CloudWatch Logs).
 
       - alert: ServiceFlapping
         expr: changes(up[15m]) > 2
@@ -122,23 +111,35 @@ groups:
 
   - name: tickvault-alerts
     rules:
+      # Market-hours gate (IST 09:15–15:30, Mon–Fri):
+      #   IST = UTC+05:30, so IST 09:15 = UTC 03:45, IST 15:30 = UTC 10:00.
+      #   day_of_week(): Sunday=0, Monday=1 ... Saturday=6.
+      # We keep the gate inline on each app-data alert so off-hours dev /
+      # bootstrap / weekend runs do not page the operator.
+
       - alert: ApplicationDown
-        expr: up{job="tickvault"} == 0
+        expr: |
+          up{job="tickvault"} == 0
+          and on() (((hour() == 3 and minute() >= 45) or (hour() >= 4 and hour() < 10))
+                   and (day_of_week() >= 1 and day_of_week() <= 5))
         for: 1m
         labels:
           severity: critical
         annotations:
-          summary: "tickvault is DOWN"
-          description: "The trading application has been unreachable for 1+ minute."
+          summary: "tickvault is DOWN (during market hours)"
+          description: "The trading application has been unreachable for 1+ minute during IST market hours."
 
       - alert: WebSocketDisconnected
-        expr: tv_websocket_connections_active == 0
+        expr: |
+          tv_websocket_connections_active == 0
+          and on() (((hour() == 3 and minute() >= 45) or (hour() >= 4 and hour() < 10))
+                   and (day_of_week() >= 1 and day_of_week() <= 5))
         for: 2m
         labels:
           severity: critical
         annotations:
-          summary: "All WebSocket connections lost"
-          description: "No active feed connections. Market data is stale."
+          summary: "All WebSocket connections lost (during market hours)"
+          description: "No active feed connections during IST market hours. Market data is stale."
 
       - alert: HighTickLatency
         expr: dlt:tick_latency_p99:1m > 1000000
@@ -150,13 +151,16 @@ groups:
           description: "p99 tick processing latency is {{ $value }}ns, exceeding 1ms budget."
 
       - alert: PipelineStopped
-        expr: tv_pipeline_active == 0
+        # Only meaningful when the app target is up. If the app isn't running
+        # the ApplicationDown alert covers it (and that one is market-hour
+        # gated). This avoids paging on every dev cycle.
+        expr: tv_pipeline_active == 0 and up{job="tickvault"} == 1
         for: 1m
         labels:
           severity: critical
         annotations:
           summary: "Tick pipeline is STOPPED"
-          description: "The tick processing pipeline has been inactive for 1+ minute."
+          description: "The tick processing pipeline has been inactive for 1+ minute while the app is up."
 
       - alert: HighParseErrorRate
         expr: rate(tv_parse_errors_total[5m]) > 1
@@ -231,13 +235,15 @@ groups:
           description: "{{ $value }} depth snapshots spilled to disk."
 
       - alert: NoTicksReceived
-        expr: dlt:tick_rate:1m == 0
+        # Gate on pipeline_active=1 so off-hours / boot / app-not-running
+        # never trips this critical-severity alert.
+        expr: dlt:tick_rate:1m == 0 and tv_pipeline_active == 1
         for: 5m
         labels:
           severity: critical
         annotations:
           summary: "No ticks received for 5 minutes"
-          description: "Tick processing rate has been zero for 5 minutes during market hours."
+          description: "Tick processing rate has been zero for 5 minutes while pipeline is active."
 
       - alert: HighHistoricalFetchErrors
         expr: increase(tv_historical_api_errors_total[10m]) > 5
@@ -257,14 +263,7 @@ groups:
           summary: "Frequent WebSocket reconnections"
           description: "WebSocket reconnecting at {{ $value }}/sec. Network instability or Dhan server issues."
 
-      - alert: HighTraefik4xxRate
-        expr: sum(rate(traefik_entrypoint_requests_total{code=~"4.."}[5m])) / (sum(rate(traefik_entrypoint_requests_total[5m])) + 1e-10) > 0.10
-        for: 5m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Traefik 4xx error rate above 10%"
-          description: "More than 10% of requests are returning 4xx client errors."
+      # Wave 7-A: HighTraefik4xxRate alert removed (Traefik replaced by AWS ALB).
 
       - alert: HighJunkTickRate
         expr: rate(tv_junk_ticks_filtered_total[5m]) > 10
@@ -404,25 +403,12 @@ groups:
           summary: "Application memory > 2GB"
           description: "Process RSS is {{ $value | humanize1024 }}B. Possible memory leak."
 
-      # Valkey (cache) down
-      - alert: ValkeyDown
-        expr: up{job="tv-valkey"} == 0
-        for: 30s
-        labels:
-          severity: warning
-        annotations:
-          summary: "Valkey cache is DOWN"
-          description: "Valkey is unreachable. App continues without cache (degraded performance)."
+      # Wave 7-A: ValkeyDown alert removed (valkey-exporter retired; the
+      # tv-valkey container has its own Docker healthcheck which restarts
+      # the container if Valkey becomes unresponsive).
 
-      # Alloy (log collector) down — explains empty Logs dashboard
-      - alert: AlloyDown
-        expr: up{job="tv-alloy"} == 0
-        for: 2m
-        labels:
-          severity: warning
-        annotations:
-          summary: "Alloy log collector is DOWN"
-          description: "Alloy is not scraping logs. Grafana Logs dashboard will be empty."
+      # Wave 7-A: AlloyDown alert removed (Alloy + Loki retired; CloudWatch
+      # Logs replaces log aggregation).
 
       # 20-level depth connection down (per underlying)
       - alert: Depth20Disconnected
