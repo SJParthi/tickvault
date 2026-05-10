@@ -2254,6 +2254,12 @@ async fn main() -> Result<()> {
         tickvault_storage::boot_audit_persistence::ensure_boot_audit_table(&config.questdb),
         tickvault_storage::selftest_audit_persistence::ensure_selftest_audit_table(&config.questdb),
         tickvault_storage::order_audit_persistence::ensure_order_audit_table(&config.questdb),
+        // Wave 6 Sub-PR #1 item 1.4a — shadow candle tables (9 timeframes)
+        // + aggregator_seal_audit forensic table. The future writer task
+        // (item 1.4b) writes sealed candles into these tables; the boot
+        // DDL must run first so the ILP writes don't 404. Idempotent
+        // CREATE TABLE IF NOT EXISTS — safe to call on every boot.
+        tickvault_storage::shadow_persistence::ensure_shadow_candle_tables(&config.questdb),
     );
 
     // Wave 2 Item 9 — boot audit row for the QuestDB readiness step.
