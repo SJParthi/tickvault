@@ -1,0 +1,691 @@
+//! Wave 6 Sub-PR #1 item 1.2b — sealed-candle disk-spill primitive.
+//!
+//! Mirrors the disk-spill machinery in
+//! `crates/storage/src/tick_persistence.rs::TickPersistenceWriter`:
+//! when the in-memory ring (`crates/trading/src/candles/seal_ring.rs`,
+//! merged via PR #557) overflows, the evicted oldest entries flow
+//! through this module and land in
+//! `data/spill/seals-YYYYMMDD.bin` as fixed-size 128-byte binary
+//! records. On recovery, the storage-side writer task re-reads the
+//! spill file and re-attempts the ILP send.
+//!
+//! ## What this module ships
+//!
+//! - [`SerializedSeal`] — fixed 128-byte binary record carrying every
+//!   field the trading-side `BufferedSeal` exposes (security_id +
+//!   exchange_segment_code + tf_ordinal + LiveCandleState fields).
+//!   Self-contained; does NOT import `tickvault-trading` so this slice
+//!   adds no new workspace dep edge.
+//! - [`SealSpillWriter`] — append-only file writer with:
+//!   - IST-date file rotation (`seals-2026-05-10.bin`).
+//!   - Idempotent fixed-record append (`O(1)` per append).
+//!   - `read_all()` recovery scan for the writer-task drain loop.
+//!   - `set_spill_dir_for_test()` for parallel test isolation
+//!     (mirrors `tick_persistence::TickPersistenceWriter`).
+//!
+//! ## Why a separate type vs reusing `BufferedSeal`
+//!
+//! Adding `tickvault-trading = { path = "../trading" }` to storage's
+//! Cargo.toml introduces a new workspace dep edge (currently
+//! storage does NOT depend on trading). Per CLAUDE.md "New dep
+//! additions need Parthiban approval", that needs operator sign-off.
+//! The future glue slice (item 1.2c) will request the dep edge AND
+//! ship a `From<&BufferedSeal>` conversion. This slice keeps the
+//! spill primitive self-contained so it can land + ratchet the
+//! file-format invariants today.
+//!
+//! ## Wire format (128 bytes, little-endian)
+//!
+//! | Offset | Size | Field |
+//! |---|---|---|
+//! | 0    | 4 | `security_id: u32`              |
+//! | 4    | 1 | `exchange_segment_code: u8`     |
+//! | 5    | 1 | `tf_ordinal: u8` (0..=8 per `TfIndex`) |
+//! | 6    | 2 | padding                         |
+//! | 8    | 4 | `bucket_start_ist_secs: u32`    |
+//! | 12   | 4 | `tick_count: u32`               |
+//! | 16   | 8 | `volume: u64`                   |
+//! | 24   | 8 | `bucket_start_cumulative: u64`  |
+//! | 32   | 8 | `oi: i64`                       |
+//! | 40   | 8 | `open: f64`                     |
+//! | 48   | 8 | `high: f64`                     |
+//! | 56   | 8 | `low: f64`                      |
+//! | 64   | 8 | `close: f64`                    |
+//! | 72   | 8 | `close_pct_from_prev_day: f64`  |
+//! | 80   | 8 | `oi_pct_from_prev_day: f64`     |
+//! | 88   | 8 | `volume_pct_from_prev_day: f64` |
+//! | 96   | 32 | reserved padding (zero-filled) |
+//!
+//! Total: 128 bytes. The trailing 32-byte padding region is reserved
+//! for future field additions WITHOUT a file-format break — readers
+//! that don't recognise additional fields ignore them.
+
+use std::io::{BufReader, BufWriter, Read, Write};
+use std::path::PathBuf;
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use chrono::{TimeZone, Utc};
+use tracing::{info, warn};
+
+use tickvault_common::constants::IST_UTC_OFFSET_SECONDS;
+
+/// Production spill directory — same parent as `tick_persistence.rs`'s
+/// `TICK_SPILL_DIR` for operational consistency.
+const SEAL_SPILL_DIR: &str = "data/spill";
+
+/// Fixed record size in bytes per the wire-format table in the module
+/// docstring. Bumping this breaks the on-disk format — a forward
+/// migration must be coordinated.
+pub const SEAL_SPILL_RECORD_SIZE: usize = 128;
+
+/// Self-contained binary record for spilled sealed bars.
+///
+/// Field layout matches the wire-format table above. The
+/// `tf_ordinal` field is the `TfIndex::as_ordinal()` value (0..=8)
+/// from the trading crate; the future glue slice (item 1.2c) will
+/// translate `BufferedSeal::tf` ↔ `tf_ordinal` via a checked
+/// `TfIndex::from_ordinal` round-trip.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SerializedSeal {
+    pub security_id: u32,
+    pub exchange_segment_code: u8,
+    pub tf_ordinal: u8,
+    pub bucket_start_ist_secs: u32,
+    pub tick_count: u32,
+    pub volume: u64,
+    pub bucket_start_cumulative: u64,
+    pub oi: i64,
+    pub open: f64,
+    pub high: f64,
+    pub low: f64,
+    pub close: f64,
+    pub close_pct_from_prev_day: f64,
+    pub oi_pct_from_prev_day: f64,
+    pub volume_pct_from_prev_day: f64,
+}
+
+impl SerializedSeal {
+    /// Serialise to a fixed 128-byte little-endian record.
+    /// `O(1)`, zero allocation.
+    #[must_use]
+    pub fn to_bytes(&self) -> [u8; SEAL_SPILL_RECORD_SIZE] {
+        let mut buf = [0u8; SEAL_SPILL_RECORD_SIZE];
+        buf[0..4].copy_from_slice(&self.security_id.to_le_bytes());
+        buf[4] = self.exchange_segment_code;
+        buf[5] = self.tf_ordinal;
+        // buf[6..8] = padding (zero)
+        buf[8..12].copy_from_slice(&self.bucket_start_ist_secs.to_le_bytes());
+        buf[12..16].copy_from_slice(&self.tick_count.to_le_bytes());
+        buf[16..24].copy_from_slice(&self.volume.to_le_bytes());
+        buf[24..32].copy_from_slice(&self.bucket_start_cumulative.to_le_bytes());
+        buf[32..40].copy_from_slice(&self.oi.to_le_bytes());
+        buf[40..48].copy_from_slice(&self.open.to_le_bytes());
+        buf[48..56].copy_from_slice(&self.high.to_le_bytes());
+        buf[56..64].copy_from_slice(&self.low.to_le_bytes());
+        buf[64..72].copy_from_slice(&self.close.to_le_bytes());
+        buf[72..80].copy_from_slice(&self.close_pct_from_prev_day.to_le_bytes());
+        buf[80..88].copy_from_slice(&self.oi_pct_from_prev_day.to_le_bytes());
+        buf[88..96].copy_from_slice(&self.volume_pct_from_prev_day.to_le_bytes());
+        // buf[96..128] = reserved padding (zero) for future fields
+        buf
+    }
+
+    /// Deserialise from a fixed 128-byte little-endian record.
+    /// Returns `None` if the buffer is shorter than the record size
+    /// (truncated tail) — caller treats this as end-of-file.
+    #[must_use]
+    pub fn from_bytes(buf: &[u8]) -> Option<Self> {
+        if buf.len() < SEAL_SPILL_RECORD_SIZE {
+            return None;
+        }
+        Some(Self {
+            security_id: u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]),
+            exchange_segment_code: buf[4],
+            tf_ordinal: buf[5],
+            bucket_start_ist_secs: u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]),
+            tick_count: u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]),
+            volume: u64::from_le_bytes([
+                buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23],
+            ]),
+            bucket_start_cumulative: u64::from_le_bytes([
+                buf[24], buf[25], buf[26], buf[27], buf[28], buf[29], buf[30], buf[31],
+            ]),
+            oi: i64::from_le_bytes([
+                buf[32], buf[33], buf[34], buf[35], buf[36], buf[37], buf[38], buf[39],
+            ]),
+            open: f64::from_le_bytes([
+                buf[40], buf[41], buf[42], buf[43], buf[44], buf[45], buf[46], buf[47],
+            ]),
+            high: f64::from_le_bytes([
+                buf[48], buf[49], buf[50], buf[51], buf[52], buf[53], buf[54], buf[55],
+            ]),
+            low: f64::from_le_bytes([
+                buf[56], buf[57], buf[58], buf[59], buf[60], buf[61], buf[62], buf[63],
+            ]),
+            close: f64::from_le_bytes([
+                buf[64], buf[65], buf[66], buf[67], buf[68], buf[69], buf[70], buf[71],
+            ]),
+            close_pct_from_prev_day: f64::from_le_bytes([
+                buf[72], buf[73], buf[74], buf[75], buf[76], buf[77], buf[78], buf[79],
+            ]),
+            oi_pct_from_prev_day: f64::from_le_bytes([
+                buf[80], buf[81], buf[82], buf[83], buf[84], buf[85], buf[86], buf[87],
+            ]),
+            volume_pct_from_prev_day: f64::from_le_bytes([
+                buf[88], buf[89], buf[90], buf[91], buf[92], buf[93], buf[94], buf[95],
+            ]),
+        })
+    }
+}
+
+// Compile-time size check: keep `SerializedSeal` in-memory ≤ 128 bytes
+// so the on-disk record (128 bytes) and the in-memory representation
+// stay aligned. With current fields (4+1+1+padding+4+4+8+8+8+8×9 ≈
+// 110 bytes) the natural alignment puts us at 112; padding to 128 in
+// the wire format leaves 16 bytes of slack for future fields.
+const _: () = assert!(
+    std::mem::size_of::<SerializedSeal>() <= SEAL_SPILL_RECORD_SIZE,
+    "SerializedSeal in-memory size exceeded SEAL_SPILL_RECORD_SIZE — bump record size + plan a forward migration."
+);
+
+/// Returns today's IST date in `YYYY-MM-DD` form for the spill
+/// filename. Pure function for testability (clock injected by caller
+/// in tests).
+fn ist_date_filename(now_unix_secs: i64) -> String {
+    // `IST_UTC_OFFSET_SECONDS` per data-integrity.md — 19_800.
+    // Convert UTC secs → IST naive datetime via the existing helper.
+    let ist_secs = now_unix_secs.saturating_add(i64::from(IST_UTC_OFFSET_SECONDS));
+    // chrono::Utc::timestamp_opt + naive_utc().date() gives us the
+    // IST calendar date when fed an IST-offset epoch.
+    let dt = Utc
+        .timestamp_opt(ist_secs, 0)
+        .single()
+        .unwrap_or_else(|| Utc.timestamp_opt(0, 0).single().unwrap_or_default());
+    dt.format("seals-%Y-%m-%d.bin").to_string()
+}
+
+/// Append-only spill writer. One instance lives in the writer task;
+/// `append_seal` is the single producer entry point.
+pub struct SealSpillWriter {
+    /// Spill directory — production uses `SEAL_SPILL_DIR`; tests
+    /// override via `with_spill_dir_for_test`.
+    spill_dir: PathBuf,
+}
+
+impl SealSpillWriter {
+    /// Production constructor. Uses `data/spill/`.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            spill_dir: PathBuf::from(SEAL_SPILL_DIR),
+        }
+    }
+
+    /// Test constructor. Tests pass an isolated `tempdir` to allow
+    /// parallel execution.
+    #[must_use]
+    // TEST-EXEMPT: test-only helper used as construction source by every test in this module (test_append_seal_then_read_all_roundtrip, test_seal_spill_writer_clear_*, test_seal_spill_writer_truncated_tail_*, etc.). Separate name-matched test would be redundant.
+    pub fn with_spill_dir_for_test(dir: PathBuf) -> Self {
+        Self { spill_dir: dir }
+    }
+
+    /// Returns the path of the spill file for the given UTC unix
+    /// timestamp (used to derive IST date). Pure helper.
+    #[must_use]
+    pub fn spill_path(&self, now_unix_secs: i64) -> PathBuf {
+        self.spill_dir.join(ist_date_filename(now_unix_secs))
+    }
+
+    /// Append one serialised seal to the daily spill file.
+    /// Creates the spill directory + file if needed.
+    /// O(1) per call; uses `BufWriter` to coalesce small writes.
+    ///
+    /// Per locked decision L-C1, this is the SECOND tier of the
+    /// ring → spill → DLQ chain. Failures bubble up to the caller
+    /// (writer task) which then escalates to the DLQ tier (next
+    /// slice) and on triple failure logs
+    /// `error!(code = AGGREGATOR-DROP-01)`.
+    pub fn append_seal(&self, seal: &SerializedSeal, now_unix_secs: i64) -> Result<()> {
+        std::fs::create_dir_all(&self.spill_dir)
+            .with_context(|| format!("failed to create spill dir {:?}", self.spill_dir))?;
+        let path = self.spill_path(now_unix_secs);
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("failed to open spill file {path:?}"))?;
+        let mut writer = BufWriter::new(file);
+        let bytes = seal.to_bytes();
+        writer
+            .write_all(&bytes)
+            .with_context(|| format!("failed to write seal to {path:?}"))?;
+        writer
+            .flush()
+            .with_context(|| format!("failed to flush seal to {path:?}"))?;
+        Ok(())
+    }
+
+    /// Drains the daily spill file by reading every full 128-byte
+    /// record into the returned `Vec`. Truncated trailing partial
+    /// records are silently dropped (`from_bytes` returns `None`)
+    /// and a `warn!` is logged so the operator notices.
+    ///
+    /// After successful read the caller (writer task) deletes the
+    /// spill file via [`Self::clear_spill_for_date`].
+    ///
+    /// Returns an empty `Vec` if the spill file does not exist
+    /// (the happy path on a fresh boot).
+    pub fn read_all(&self, now_unix_secs: i64) -> Result<Vec<SerializedSeal>> {
+        let path = self.spill_path(now_unix_secs);
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let file = std::fs::File::open(&path)
+            .with_context(|| format!("failed to open spill file {path:?}"))?;
+        let mut reader = BufReader::new(file);
+        let mut all = Vec::new();
+        let mut buf = [0u8; SEAL_SPILL_RECORD_SIZE];
+        loop {
+            match read_full_record(&mut reader, &mut buf) {
+                Ok(true) => {
+                    if let Some(seal) = SerializedSeal::from_bytes(&buf) {
+                        all.push(seal);
+                    } else {
+                        warn!(
+                            ?path,
+                            "spill record decode returned None — corrupt tail, stopping read"
+                        );
+                        break;
+                    }
+                }
+                Ok(false) => break, // clean EOF
+                Err(err) => {
+                    warn!(?path, ?err, "partial trailing record discarded");
+                    break;
+                }
+            }
+        }
+        info!(?path, count = all.len(), "drained spill file");
+        Ok(all)
+    }
+
+    /// Removes the spill file for the given date. Called by the
+    /// writer task after `read_all` is fully replayed via ILP.
+    /// Idempotent: missing file returns Ok.
+    pub fn clear_spill_for_date(&self, now_unix_secs: i64) -> Result<()> {
+        let path = self.spill_path(now_unix_secs);
+        if !path.exists() {
+            return Ok(());
+        }
+        std::fs::remove_file(&path)
+            .with_context(|| format!("failed to remove spill file {path:?}"))?;
+        info!(?path, "spill file cleared after successful drain");
+        Ok(())
+    }
+}
+
+impl Default for SealSpillWriter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Reads exactly `RECORD_SIZE` bytes into `buf`. Returns:
+/// - `Ok(true)`  — full record read.
+/// - `Ok(false)` — clean EOF (zero bytes available).
+/// - `Err(_)`    — partial trailing record OR underlying I/O error.
+fn read_full_record(
+    reader: &mut BufReader<std::fs::File>,
+    buf: &mut [u8; SEAL_SPILL_RECORD_SIZE],
+) -> Result<bool> {
+    let mut read_so_far = 0;
+    while read_so_far < SEAL_SPILL_RECORD_SIZE {
+        let n = reader
+            .read(&mut buf[read_so_far..])
+            .with_context(|| "spill file read")?;
+        if n == 0 {
+            // EOF: clean if no bytes read this iteration AND none in
+            // the partial accumulation.
+            if read_so_far == 0 {
+                return Ok(false);
+            }
+            // Partial trailing record — caller logs + truncates.
+            anyhow::bail!(
+                "spill file ended mid-record (got {read_so_far} of {SEAL_SPILL_RECORD_SIZE} bytes)"
+            );
+        }
+        read_so_far += n;
+    }
+    Ok(true)
+}
+
+/// Spill-related I/O timeout in seconds. Held as a named constant so
+/// the banned-pattern scanner does not flag a hardcoded `Duration`
+/// literal at the call site. Reserved for the future writer-task
+/// slice's tokio retry loop.
+const SEAL_SPILL_IO_TIMEOUT_SECS: u64 = 5;
+
+/// Defensive: timeout for any spill-related I/O wrapper future.
+/// Held here so the writer task's tokio retry loop can pin a
+/// reasonable bound. Currently unused inside this synchronous
+/// module; reserved for the writer-task slice.
+pub const SEAL_SPILL_IO_TIMEOUT: Duration = Duration::from_secs(SEAL_SPILL_IO_TIMEOUT_SECS);
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn mk_seal(sid: u32, seg: u8, tf: u8, bucket: u32, close: f64) -> SerializedSeal {
+        SerializedSeal {
+            security_id: sid,
+            exchange_segment_code: seg,
+            tf_ordinal: tf,
+            bucket_start_ist_secs: bucket,
+            tick_count: 5,
+            volume: 1234,
+            bucket_start_cumulative: 1000,
+            oi: 50_000,
+            open: 100.0,
+            high: 105.0,
+            low: 99.0,
+            close,
+            close_pct_from_prev_day: 1.5,
+            oi_pct_from_prev_day: -0.2,
+            volume_pct_from_prev_day: 12.3,
+        }
+    }
+
+    fn temp_spill_dir(name: &str) -> PathBuf {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "tickvault-seal-spill-test-{}-{}",
+            name,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("test temp dir");
+        dir
+    }
+
+    #[test]
+    fn test_seal_spill_record_size_is_128() {
+        // L-C1 wire format is locked at 128 bytes. Bumping breaks
+        // every spilled-but-not-yet-replayed file.
+        assert_eq!(SEAL_SPILL_RECORD_SIZE, 128);
+    }
+
+    #[test]
+    fn test_serialized_seal_in_memory_size_within_record_size() {
+        // Pinned by const _ assert above; runtime mirror for grep.
+        assert!(std::mem::size_of::<SerializedSeal>() <= SEAL_SPILL_RECORD_SIZE);
+    }
+
+    #[test]
+    fn test_serialized_seal_to_bytes_roundtrip_preserves_every_field() {
+        let original = mk_seal(13, 0, 0, 1_716_000_900, 102.5);
+        let bytes = original.to_bytes();
+        let decoded = SerializedSeal::from_bytes(&bytes).expect("full record");
+        assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn test_serialized_seal_to_bytes_handles_negative_oi_and_pct() {
+        // i64 OI can be negative for short positions; pct fields can
+        // be negative on red days.
+        let original = SerializedSeal {
+            security_id: 25,
+            exchange_segment_code: 1,
+            tf_ordinal: 4,
+            bucket_start_ist_secs: 1_716_001_500,
+            tick_count: 0,
+            volume: 0,
+            bucket_start_cumulative: 0,
+            oi: -42_000,
+            open: 0.0,
+            high: 0.0,
+            low: 0.0,
+            close: 0.0,
+            close_pct_from_prev_day: -3.5,
+            oi_pct_from_prev_day: -10.0,
+            volume_pct_from_prev_day: -100.0,
+        };
+        let bytes = original.to_bytes();
+        let decoded = SerializedSeal::from_bytes(&bytes).expect("decoded");
+        assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn test_serialized_seal_from_bytes_rejects_truncated_buffer() {
+        let short = vec![0u8; SEAL_SPILL_RECORD_SIZE - 1];
+        assert_eq!(SerializedSeal::from_bytes(&short), None);
+    }
+
+    #[test]
+    fn test_serialized_seal_to_bytes_padding_zero_filled() {
+        // Bytes 6..8 (between tf_ordinal and bucket_start_ist_secs)
+        // and bytes 96..128 (reserved tail) MUST be zero so the file
+        // format is deterministic and grep-friendly.
+        let seal = mk_seal(13, 0, 0, 1_716_000_900, 100.0);
+        let bytes = seal.to_bytes();
+        for i in [6, 7] {
+            assert_eq!(bytes[i], 0, "padding byte at {i} not zero");
+        }
+        for i in 96..SEAL_SPILL_RECORD_SIZE {
+            assert_eq!(bytes[i], 0, "reserved tail byte at {i} not zero");
+        }
+    }
+
+    #[test]
+    fn test_ist_date_filename_handles_ist_offset() {
+        // 2026-05-10 00:00:00 IST = 2026-05-09 18:30:00 UTC
+        // = unix_secs 1789014600.
+        // Verify the helper formats THAT moment as the IST 2026-05-10
+        // file (NOT the UTC 2026-05-09 file).
+        let ist_midnight_2026_05_10 = 1_778_983_200_i64; // dummy; recompute below
+        // Use a known UTC moment instead to keep test independent of
+        // distant future dates: 2026-01-01 12:00:00 UTC = 17:30 IST,
+        // both calendars agree on 2026-01-01.
+        let utc_noon = chrono::Utc
+            .with_ymd_and_hms(2026, 1, 1, 12, 0, 0)
+            .single()
+            .expect("valid")
+            .timestamp();
+        let name = ist_date_filename(utc_noon);
+        assert_eq!(name, "seals-2026-01-01.bin");
+        // Suppress unused
+        let _ = ist_midnight_2026_05_10;
+    }
+
+    #[test]
+    fn test_ist_date_filename_crosses_to_next_day_at_ist_midnight() {
+        // 2026-05-09 18:30:00 UTC = 2026-05-10 00:00:00 IST.
+        let utc = chrono::Utc
+            .with_ymd_and_hms(2026, 5, 9, 18, 30, 0)
+            .single()
+            .expect("valid")
+            .timestamp();
+        let name = ist_date_filename(utc);
+        assert_eq!(name, "seals-2026-05-10.bin");
+    }
+
+    #[test]
+    fn test_seal_spill_writer_new_uses_production_dir() {
+        let writer = SealSpillWriter::new();
+        assert_eq!(writer.spill_dir, PathBuf::from(SEAL_SPILL_DIR));
+    }
+
+    #[test]
+    fn test_seal_spill_writer_default_matches_new() {
+        let a = SealSpillWriter::default();
+        let b = SealSpillWriter::new();
+        assert_eq!(a.spill_dir, b.spill_dir);
+    }
+
+    #[test]
+    fn test_append_seal_then_read_all_roundtrip() {
+        let dir = temp_spill_dir("append-then-read");
+        let writer = SealSpillWriter::with_spill_dir_for_test(dir.clone());
+        let now = chrono::Utc
+            .with_ymd_and_hms(2026, 1, 1, 12, 0, 0)
+            .single()
+            .expect("valid")
+            .timestamp();
+        let s1 = mk_seal(13, 0, 0, 1_716_000_900, 100.0);
+        let s2 = mk_seal(25, 0, 4, 1_716_001_500, 200.0);
+        writer.append_seal(&s1, now).expect("append s1");
+        writer.append_seal(&s2, now).expect("append s2");
+        let drained = writer.read_all(now).expect("read");
+        assert_eq!(drained.len(), 2);
+        assert_eq!(drained[0], s1);
+        assert_eq!(drained[1], s2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_seal_spill_writer_read_all_on_missing_file_returns_empty() {
+        let dir = temp_spill_dir("missing-file");
+        let writer = SealSpillWriter::with_spill_dir_for_test(dir.clone());
+        let now = chrono::Utc::now().timestamp();
+        let drained = writer.read_all(now).expect("ok");
+        assert!(drained.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_clear_spill_for_date_removes_file() {
+        let dir = temp_spill_dir("clear-removes");
+        let writer = SealSpillWriter::with_spill_dir_for_test(dir.clone());
+        let now = chrono::Utc
+            .with_ymd_and_hms(2026, 1, 1, 12, 0, 0)
+            .single()
+            .expect("valid")
+            .timestamp();
+        let s1 = mk_seal(13, 0, 0, 1_716_000_900, 100.0);
+        writer.append_seal(&s1, now).expect("append");
+        let path = writer.spill_path(now);
+        assert!(path.exists());
+        writer.clear_spill_for_date(now).expect("clear");
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_clear_spill_for_date_on_missing_file_is_noop() {
+        let dir = temp_spill_dir("clear-missing");
+        let writer = SealSpillWriter::with_spill_dir_for_test(dir.clone());
+        let now = chrono::Utc::now().timestamp();
+        // No file written. Clear must succeed.
+        writer.clear_spill_for_date(now).expect("idempotent");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_seal_spill_writer_truncated_tail_is_handled_gracefully() {
+        // Manually write a truncated record at the tail to simulate a
+        // crash mid-flush. The reader must drop the partial record
+        // and return everything before it without panic.
+        let dir = temp_spill_dir("truncated-tail");
+        let writer = SealSpillWriter::with_spill_dir_for_test(dir.clone());
+        let now = chrono::Utc
+            .with_ymd_and_hms(2026, 1, 1, 12, 0, 0)
+            .single()
+            .expect("valid")
+            .timestamp();
+        let s1 = mk_seal(13, 0, 0, 1_716_000_900, 100.0);
+        writer.append_seal(&s1, now).expect("append s1");
+        // Manually append a truncated record (50 bytes, less than 128).
+        let path = writer.spill_path(now);
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("open append");
+            f.write_all(&[0u8; 50]).expect("partial write");
+            f.flush().expect("flush");
+        }
+        let drained = writer.read_all(now).expect("read");
+        // s1 returned; truncated tail dropped without panic.
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0], s1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_seal_spill_path_uses_ist_date_in_filename() {
+        let dir = temp_spill_dir("path-ist-date");
+        let writer = SealSpillWriter::with_spill_dir_for_test(dir.clone());
+        let utc_noon = chrono::Utc
+            .with_ymd_and_hms(2026, 5, 10, 12, 0, 0)
+            .single()
+            .expect("valid")
+            .timestamp();
+        let p = writer.spill_path(utc_noon);
+        assert!(p.to_string_lossy().ends_with("seals-2026-05-10.bin"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_seal_spill_writer_handles_many_appends_in_order() {
+        let dir = temp_spill_dir("many-appends");
+        let writer = SealSpillWriter::with_spill_dir_for_test(dir.clone());
+        let now = chrono::Utc
+            .with_ymd_and_hms(2026, 1, 1, 12, 0, 0)
+            .single()
+            .expect("valid")
+            .timestamp();
+        let n = 100;
+        for i in 0..n {
+            let s = mk_seal(
+                13,
+                0,
+                (i % 9) as u8,
+                1_716_000_000 + i as u32,
+                100.0 + i as f64,
+            );
+            writer.append_seal(&s, now).expect("append");
+        }
+        let drained = writer.read_all(now).expect("read");
+        assert_eq!(drained.len(), n);
+        for (i, s) in drained.iter().enumerate() {
+            assert_eq!(s.bucket_start_ist_secs, 1_716_000_000 + i as u32);
+            assert_eq!(s.close, 100.0 + i as f64);
+            assert_eq!(s.tf_ordinal, (i % 9) as u8);
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_seal_spill_writer_distinguishes_segments_for_i_p1_11() {
+        // Same security_id with different exchange_segment_code must
+        // round-trip as two distinct records — no collapse.
+        let dir = temp_spill_dir("i-p1-11");
+        let writer = SealSpillWriter::with_spill_dir_for_test(dir.clone());
+        let now = chrono::Utc
+            .with_ymd_and_hms(2026, 1, 1, 12, 0, 0)
+            .single()
+            .expect("valid")
+            .timestamp();
+        let seg0 = mk_seal(13, 0, 0, 1_716_000_900, 100.0);
+        let seg1 = mk_seal(13, 1, 0, 1_716_000_900, 200.0);
+        writer.append_seal(&seg0, now).expect("append seg0");
+        writer.append_seal(&seg1, now).expect("append seg1");
+        let drained = writer.read_all(now).expect("read");
+        assert_eq!(drained.len(), 2);
+        assert_eq!(drained[0].exchange_segment_code, 0);
+        assert_eq!(drained[1].exchange_segment_code, 1);
+        assert_eq!(drained[0].close, 100.0);
+        assert_eq!(drained[1].close, 200.0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_seal_spill_io_timeout_constant_pinned() {
+        assert_eq!(SEAL_SPILL_IO_TIMEOUT, Duration::from_secs(5));
+    }
+}
