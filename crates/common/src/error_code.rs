@@ -398,6 +398,45 @@ pub enum ErrorCode {
     /// degraded but not catastrophic; ratchet for visibility, not
     /// boot-halt.
     PrevClose04CacheEmptyAtBoot,
+
+    // -----------------------------------------------------------------------
+    // Wave 6 — Multi-TF aggregator + direct-flush + rehydrate
+    // (`.claude/plans/active-plan-aggregator-direct-flush-rehydrate.md` PR1)
+    // -----------------------------------------------------------------------
+    /// AGGREGATOR-DROP-01: a sealed candle was dropped after the ring
+    /// buffer (`SEAL_BUFFER_CAPACITY`), the disk spill, AND the NDJSON
+    /// DLQ all refused the row. The only silent-data-loss path for the
+    /// aggregator. Severity::Critical — by definition the host is OOM
+    /// AND out of disk AND `data/dlq/` unwritable.
+    AggregatorDrop01,
+    /// AGGREGATOR-LATE-01: a tick arrived after its 1-minute bucket
+    /// already sealed. Discarded with `error!` + counter (NOT silently
+    /// merged across buckets — that would shift data across
+    /// timestamps). Severity::High — typically clock drift or slow
+    /// consumer.
+    AggregatorLate01,
+    /// AGGREGATOR-SEAL-01: seal-time ILP write to one of the 9
+    /// `candles_*_shadow` tables failed; the row was caught by the
+    /// ring buffer. Severity::Medium — data is buffered, not lost.
+    /// Also covers the H11 precursor fix at
+    /// `crates/storage/src/candle_persistence.rs::flush_buffer`.
+    AggregatorSeal01IlpFailed,
+    /// AGGREGATOR-HB-01: per-minute seal-burst heartbeat emitted after
+    /// each minute boundary completes. Severity::Info — positive
+    /// false-OK-avoidance signal per `audit-findings-2026-04-17.md`
+    /// Rule 11.
+    AggregatorHb01Heartbeat,
+    /// BOUNDARY-01: boundary timer detected one or more skipped minute
+    /// boundaries (OS scheduler preemption, clock slew, slow consumer)
+    /// and walked forward sealing each missed bucket from the in-cell
+    /// state. Severity::Medium — late but correct. Repeated firing
+    /// within a minute window indicates wall-clock instability;
+    /// escalate to BOOT-03 territory.
+    Boundary01CatchupSeal,
+    /// AGGREGATOR-AUDIT-01: `aggregator_seal_audit` table write failed.
+    /// Audit tables are SEBI-relevant forensic records; write failures
+    /// must surface immediately. Severity::Medium.
+    AggregatorAudit01WriteFailed,
 }
 
 impl ErrorCode {
@@ -523,6 +562,13 @@ impl ErrorCode {
             Self::Volume01MonotonicityBreach => "VOLUME-MONO-01",
             Self::Depth200Smoke01NoFramesAtBoot => "DEPTH200-SMOKE-01",
             Self::Phase2Ready01PreflightFailed => "PHASE2-READY-01",
+            // Wave 6 — Multi-TF aggregator
+            Self::AggregatorDrop01 => "AGGREGATOR-DROP-01",
+            Self::AggregatorLate01 => "AGGREGATOR-LATE-01",
+            Self::AggregatorSeal01IlpFailed => "AGGREGATOR-SEAL-01",
+            Self::AggregatorHb01Heartbeat => "AGGREGATOR-HB-01",
+            Self::Boundary01CatchupSeal => "BOUNDARY-01",
+            Self::AggregatorAudit01WriteFailed => "AGGREGATOR-AUDIT-01",
         }
     }
 
@@ -549,9 +595,12 @@ impl ErrorCode {
             | Self::Depth20Dyn02SwapChannelBroken
             | Self::PrevClose03BootRoutingAssertion
             | Self::Depth200Smoke01NoFramesAtBoot
-            | Self::Phase2Ready01PreflightFailed => Severity::Critical,
+            | Self::Phase2Ready01PreflightFailed
+            | Self::AggregatorDrop01 => Severity::Critical,
             // Info: positive-ping / lifecycle confirmations
-            Self::Selftest01Passed | Self::Slo01Healthy => Severity::Info,
+            Self::Selftest01Passed | Self::Slo01Healthy | Self::AggregatorHb01Heartbeat => {
+                Severity::Info
+            }
             // High: composite SLO degradation summary signal
             Self::Slo02Degraded => Severity::High,
             // High: regulatory / order / risk / rate-limit
@@ -572,7 +621,8 @@ impl ErrorCode {
             | Self::CorePin01PinningFailedAtBoot
             | Self::Depth20Dyn03TopGainersEmpty
             | Self::Depth200Dyn01TopGainersEmpty
-            | Self::Volume01MonotonicityBreach => Severity::High,
+            | Self::Volume01MonotonicityBreach
+            | Self::AggregatorLate01 => Severity::High,
             // Medium: data pipeline correctness
             Self::InstrumentP0DuplicateSecurityId
             | Self::InstrumentP0CountConsistency
@@ -617,7 +667,10 @@ impl ErrorCode {
             | Self::StorageGap03AuditWriteFailed
             | Self::StorageGap04S3ArchiveFailed
             | Self::Telegram01Dropped
-            | Self::CorePin02WorkerDrifted => Severity::Medium,
+            | Self::CorePin02WorkerDrifted
+            | Self::AggregatorSeal01IlpFailed
+            | Self::Boundary01CatchupSeal
+            | Self::AggregatorAudit01WriteFailed => Severity::Medium,
             // Low: scheduler / field coverage / trading-day / Dhan other
             Self::InstrumentP1DailyScheduler
             | Self::InstrumentP1DeltaFieldCoverage
@@ -736,6 +789,12 @@ impl ErrorCode {
             | Self::Volume01MonotonicityBreach
             | Self::Depth200Smoke01NoFramesAtBoot
             | Self::Phase2Ready01PreflightFailed => ".claude/rules/project/wave-5-error-codes.md",
+            Self::AggregatorDrop01
+            | Self::AggregatorLate01
+            | Self::AggregatorSeal01IlpFailed
+            | Self::AggregatorHb01Heartbeat
+            | Self::Boundary01CatchupSeal
+            | Self::AggregatorAudit01WriteFailed => ".claude/rules/project/wave-6-error-codes.md",
         }
     }
 
@@ -851,6 +910,13 @@ impl ErrorCode {
             Self::Volume01MonotonicityBreach,
             Self::Depth200Smoke01NoFramesAtBoot,
             Self::Phase2Ready01PreflightFailed,
+            // Wave 6 — Multi-TF aggregator (Sub-PR #1)
+            Self::AggregatorDrop01,
+            Self::AggregatorLate01,
+            Self::AggregatorSeal01IlpFailed,
+            Self::AggregatorHb01Heartbeat,
+            Self::Boundary01CatchupSeal,
+            Self::AggregatorAudit01WriteFailed,
         ]
     }
 }
@@ -1045,7 +1111,11 @@ mod tests {
         // 2026-05-08 (F2 / Wave-5 #504e follow-up): bumped 92 -> 93
         // for PREVCLOSE-04 (PrevDayCache boot loader empty / failed
         // — degraded cascade pct-stamping fallback signal).
-        assert_eq!(ErrorCode::all().len(), 93);
+        // 2026-05-10 (Wave 6 Sub-PR #1 — multi-TF aggregator): bumped
+        // 93 -> 99 for AGGREGATOR-DROP-01, AGGREGATOR-LATE-01,
+        // AGGREGATOR-SEAL-01, AGGREGATOR-HB-01, BOUNDARY-01,
+        // AGGREGATOR-AUDIT-01.
+        assert_eq!(ErrorCode::all().len(), 99);
     }
 
     #[test]
@@ -1089,7 +1159,10 @@ mod tests {
                 // PR-B (2026-05-02): boot-time depth-200 smoke test.
                 || s.starts_with("DEPTH200-SMOKE-")
                 // PR #450 commit 8b (2026-05-03): prev_oi cache state.
-                || s.starts_with("PREVOI-");
+                || s.starts_with("PREVOI-")
+                // Wave 6 Sub-PR #1: multi-TF aggregator + boundary timer.
+                || s.starts_with("AGGREGATOR-")
+                || s.starts_with("BOUNDARY-");
             assert!(has_known_prefix, "unexpected code prefix: {s}");
         }
     }
