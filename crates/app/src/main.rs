@@ -3527,17 +3527,32 @@ async fn main() -> Result<()> {
                 metrics::counter!("tv_prev_oi_cache_load_total", "outcome" => "ok").increment(1);
                 if count == 0 {
                     // Phase 2.8 H3 partial fix: emit a Prom counter +
-                    // structured WARN so an empty candles_1d doesn't
+                    // structured signal so an empty candles_1d doesn't
                     // silently produce 0% OI changes for the day. The
                     // gate still authorizes (count=0 is valid for fresh
                     // deploy / first trading day), but operator sees
                     // the diagnostic.
+                    //
+                    // Wave-Holiday-Gate (2026-05-09): only escalate to
+                    // `warn!` (Loki → Telegram) inside the trading
+                    // session — outside it (off-hours, weekend, holiday
+                    // boots) an empty cache is the expected state, not
+                    // a signal of degradation. Same noise-reduction
+                    // pattern as PR #542 item B (PREVCLOSE-04).
                     metrics::counter!("tv_prev_oi_cache_empty_total").increment(1);
-                    tracing::warn!(
-                        "prev_oi_cache loaded zero entries — fresh deploy or candles_1d \
-                         empty for the prior trading day. OI Change panels will read 0% \
-                         until the next IST midnight rollover repopulates the cache."
-                    );
+                    if tickvault_common::market_hours::is_within_trading_session_ist() {
+                        tracing::warn!(
+                            "prev_oi_cache loaded zero entries — fresh deploy or candles_1d \
+                             empty for the prior trading day. OI Change panels will read 0% \
+                             until the next IST midnight rollover repopulates the cache."
+                        );
+                    } else {
+                        tracing::info!(
+                            "prev_oi_cache loaded zero entries (off-hours / weekend boot — \
+                             expected; OI Change panels will read 0% until live ticks \
+                             populate candles_1d during the next trading session)"
+                        );
+                    }
                 }
                 true
             }
@@ -3828,7 +3843,39 @@ async fn main() -> Result<()> {
 
     // O(1) EXEMPT: begin — boot-time depth connection setup
     if should_connect_ws && config.subscription.enable_twenty_depth {
-        if let Some(ref _plan) = subscription_plan {
+        if config.features.depth_dynamic_pipeline_v2 {
+            // PR-C2 cutover (live default since 2026-05-09): under v2 the
+            // depth-20 + depth-200 pools are owned by `spawn_depth_dynamic_pool`
+            // in `depth_dynamic_pipeline_v2.rs`. That pool spawned 5×depth-20
+            // (50 SIDs/conn) + 5×depth-200 (1 SID/conn) at boot in DEFERRED
+            // mode and refills the SID set every 60s from the top-N volume
+            // cohort over `movers_1m`. ATM is no longer used for depth.
+            //
+            // The legacy boot block below (mandatory/optional LTP wait,
+            // `select_depth_instruments`, per-conn spawn loops) was producing
+            // pure noise under v2:
+            //   - 5-min in-session / 10-s off-hours wait for index LTPs that
+            //     v2 doesn't need
+            //   - `select_depth_instruments` ATM selection whose result was
+            //     thrown away (the spawn branch at the v2 cutover was
+            //     already an `else if depth_dynamic_pipeline_v2` no-op)
+            //   - 3 off-hours WARN log lines on every cold boot:
+            //       * "depth ATM: off-market-hours boot — mandatory index LTPs not available"
+            //       * "no valid spot price for depth ATM selection" × 2 (NIFTY, BANKNIFTY)
+            //
+            // Skipping the block entirely is safe because the v2 spawn loop
+            // upstream (lines ~3081-3264) already created every depth conn
+            // we need, and the 09:13 IST anchor task downstream (lines
+            // ~6125+) handles InitialSubscribe dispatch. Operator confirmed
+            // the cutover via AskUserQuestion 2026-05-10.
+            info!(
+                "depth boot setup: legacy ATM-based path SKIPPED — \
+                 depth_dynamic_pipeline_v2 owns depth-20 + depth-200 \
+                 (5×50 + 5×1 = 255 SIDs via top-N volume cohort over \
+                 movers_1m); skipping boot-time index-LTP wait + \
+                 select_depth_instruments + per-conn spawn loops"
+            );
+        } else if let Some(ref _plan) = subscription_plan {
             // 2026-04-25: Reduced from 4 to 2. FINNIFTY + MIDCPNIFTY were
             // dropped to free 25K main-feed WS capacity for stock F&O ATM±25.
             // 20-level depth only on NIFTY + BANKNIFTY now; SENSEX is BSE
