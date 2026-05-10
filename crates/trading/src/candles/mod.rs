@@ -22,6 +22,7 @@
 //! 7-day soak per plan §6.
 
 pub mod aggregator_cell;
+pub mod boundary_calc;
 pub mod cascade;
 pub mod cascade_fanout;
 pub mod engine;
